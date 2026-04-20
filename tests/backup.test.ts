@@ -197,6 +197,10 @@ describe("v2.1 Phase 2c — importRelayState", () => {
     await expect(importRelayState(tamperedArchive, { force: true })).rejects.toThrow(/schema_version/i);
   });
 
+  // v2.1 Phase 8 (CI-fix): 15s timeout because this test runs TWO full import
+  // cycles back-to-back (first rejects via daemon-probe, second force-restores
+  // including safety-backup → extract → integrity-check → atomic swap). Slow
+  // CI disks push wall-clock over the 5s default.
   it("(6) refuses when /health probe responds; force=true bypasses", async () => {
     await seedDb();
     const { exportRelayState, importRelayState } = await import("../src/backup.js");
@@ -228,7 +232,7 @@ describe("v2.1 Phase 2c — importRelayState", () => {
       if (prevPort === undefined) delete process.env.RELAY_HTTP_PORT;
       else process.env.RELAY_HTTP_PORT = prevPort;
     }
-  });
+  }, 15000);
 
   it("(7) rejects corrupted archive (missing manifest) and leaves current DB untouched", async () => {
     await seedDb();
