@@ -35,6 +35,8 @@ import {
   RotateTokenSchema,
   RotateTokenAdminSchema,
   RevokeTokenSchema,
+  GetStandupSchema,
+  ExpandCapabilitiesSchema,
 } from "./types.js";
 import {
   handleRegisterAgent,
@@ -43,6 +45,7 @@ import {
   handleRotateToken,
   handleRotateTokenAdmin,
   handleRevokeToken,
+  handleExpandCapabilities,
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
 import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents } from "./db.js";
@@ -97,6 +100,7 @@ import {
   handleListChannels,
 } from "./tools/channels.js";
 import { handleSetStatus, handleHealthCheck } from "./tools/status.js";
+import { handleGetStandup } from "./tools/standup.js";
 import { VERSION } from "./version.js";
 
 export function createServer(): Server {
@@ -135,7 +139,7 @@ export function createServer(): Server {
       {
         name: "spawn_agent",
         description:
-          "Spawn a new Claude Code terminal pre-configured as a relay agent. Opens a new iTerm2/Terminal.app window with RELAY_AGENT_NAME/ROLE/CAPABILITIES set. The SessionStart hook auto-registers the agent on startup. Optionally queue an initial_message that the new agent sees on arrival. macOS only.",
+          "Spawn a new Claude Code terminal pre-configured as a relay agent. Opens a new iTerm2/Terminal.app window with RELAY_AGENT_NAME/ROLE/CAPABILITIES set. The SessionStart hook auto-registers the agent on startup. Optionally queue an initial_message that the new agent sees on arrival. v2.1.4: optional brief_file_path threads a durable task-brief file path into the KICKSTART prompt so respawned agents read canonical scope from disk (not inbox messages that can read as injection). macOS only.",
         inputSchema: zodToJsonSchema(SpawnAgentSchema),
       },
       {
@@ -253,6 +257,17 @@ export function createServer(): Server {
         name: "revoke_token",
         description: "v2.1 Phase 4b.1 v2: revoke another agent's token (admin capability required). Transitions the target row to auth_state='recovery_pending' (if issue_recovery=true, returns a one-time recovery_token the operator hands off out-of-band; re-register via register_agent with recovery_token transitions back to active) or 'revoked' (terminal — only unregister_agent + register_agent can reuse the name). The original token_hash is preserved for forensic correlation; the state gate — not the hash — enforces rejection.",
         inputSchema: zodToJsonSchema(RevokeTokenSchema),
+      },
+      // v2.1.4 — observation + lifecycle
+      {
+        name: "get_standup",
+        description: "v2.1.4 (I12): one-shot team-status synthesis for orchestrators. Pure read-only. Given a window (`since: '15m' | '1h' | '3h' | '1d' | ISO`), returns active_agents + message_activity + task_state + rule-based observation bullets — all computed server-side so the caller burns near-zero tokens. No LLM on the relay side; observations are hand-rolled heuristics. Use instead of polling discover_agents + get_messages + get_tasks and synthesizing in-LLM.",
+        inputSchema: zodToJsonSchema(GetStandupSchema),
+      },
+      {
+        name: "expand_capabilities",
+        description: "v2.1.4 (I11): self-managed ADDITIVE capability expansion. Closes the v1.7.1 immutability gap for agents that hook-registered with a narrow cap set and later need more. Caller presents their token; request MUST be a superset of current caps (reductions rejected with REDUCTION_NOT_ALLOWED — those still need unregister + re-register). Requesting already-held caps with no new additions rejects with NO_OP_EXPANSION.",
+        inputSchema: zodToJsonSchema(ExpandCapabilitiesSchema),
       },
     ],
   }));
@@ -380,6 +395,10 @@ export function createServer(): Server {
         return handleRotateTokenAdmin(RotateTokenAdminSchema.parse(args));
       case "revoke_token":
         return handleRevokeToken(RevokeTokenSchema.parse(args));
+      case "get_standup":
+        return handleGetStandup(GetStandupSchema.parse(args));
+      case "expand_capabilities":
+        return handleExpandCapabilities(ExpandCapabilitiesSchema.parse(args));
       default:
         return {
           content: [

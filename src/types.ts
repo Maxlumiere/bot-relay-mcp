@@ -67,6 +67,12 @@ const SPAWN_CWD_PATTERN = /^\/[A-Za-z0-9_./ -]+$/;
 // Disallow any of these anywhere in cwd — even if the base pattern lets them through
 const SPAWN_CWD_FORBIDDEN = /[`;$&|<>"'*?\n\r\t\0]/;
 
+// v2.1.4 (I10): brief_file_path allowlist mirrors SPAWN_CWD_PATTERN. Absolute
+// POSIX path, no shell metacharacters, no control chars. Zod boundary is the
+// primary defense; the shell script + handler also validate existence / size.
+const SPAWN_BRIEF_PATH_PATTERN = /^\/[A-Za-z0-9_./ -]+$/;
+const SPAWN_BRIEF_PATH_FORBIDDEN = SPAWN_CWD_FORBIDDEN;
+
 export const SpawnAgentSchema = z.object({
   name: z.string()
     .min(1).max(64)
@@ -88,6 +94,12 @@ export const SpawnAgentSchema = z.object({
     .optional()
     .describe("Absolute path working directory for the new terminal. Defaults to user's home."),
   initial_message: z.string().max(10000).optional().describe("Optional message to queue for the new agent before it spawns. It will see this on session start."),
+  brief_file_path: z.string()
+    .max(1024)
+    .regex(SPAWN_BRIEF_PATH_PATTERN, "brief_file_path must be an absolute POSIX path matching [A-Za-z0-9_./ -] (no shell metachars)")
+    .refine((v) => !SPAWN_BRIEF_PATH_FORBIDDEN.test(v), "brief_file_path contains a forbidden character (shell metachar or control char)")
+    .optional()
+    .describe("v2.1.4 (I10): absolute path to a task-brief file the spawned agent should read FIRST. The relay validates that the file exists at spawn time, is readable, and is <=10KB. When set, the default KICKSTART prompt appends a sentence telling the agent to read this file as the canonical source for its task scope — trust-anchored fix for respawned-agent context loss (inbox messages are not durable). macOS only for v2.1.4; Linux/Windows drivers ignore (no KICKSTART on those platforms yet)."),
   agent_token: AgentTokenField,
 });
 
@@ -174,6 +186,56 @@ export const SetStatusSchema = z.object({
 export const HealthCheckSchema = z.object({
   agent_token: AgentTokenField,
 });
+
+/**
+ * v2.1.4 (I12): server-side team-status synthesis for orchestrators.
+ *
+ * `since` accepts either a duration string (`"15m"`, `"1h"`, `"3h"`, `"1d"`) or
+ * an ISO8601 timestamp. Duration shorthand mirrors common standup intervals;
+ * ISO is the escape hatch for finer control.
+ *
+ * `filter` narrows the synthesis window. `include_offline` defaults false so
+ * the default view is "who's currently active." Set true for post-mortems.
+ *
+ * This is a READ-ONLY tool. No mutations. No LLM. Observation bullets are
+ * hand-rolled heuristics in the handler.
+ */
+export const GetStandupSchema = z.object({
+  since: z.string().min(1).describe(
+    "Window start: either a duration string ('15m' | '1h' | '3h' | '1d') or an ISO8601 timestamp. Duration shorthands: m=minutes, h=hours, d=days."
+  ),
+  filter: z
+    .object({
+      agents: z.array(z.string().min(1)).optional().describe("Restrict to these agent names."),
+      roles: z.array(z.string().min(1)).optional().describe("Restrict to these roles."),
+      include_offline: z.boolean().default(false).describe("Include agents with agent_status='offline' in active_agents."),
+    })
+    .optional(),
+  agent_token: AgentTokenField,
+});
+
+export type GetStandupInput = z.infer<typeof GetStandupSchema>;
+
+/**
+ * v2.1.4 (I11): self-managed additive capability expansion. Closes the v1.7.1
+ * cap-immutability gap for agents that hook-registered with a narrow set and
+ * later need more caps, without forcing full unregister + re-register.
+ *
+ * Semantics: caller presents their token (resolved from any of arg / header /
+ * env as usual). `new_capabilities` MUST be a superset of the agent's current
+ * caps. Reductions are rejected (REDUCTION_NOT_ALLOWED) — operator ceremony
+ * preserved for the destructive path. No-ops are rejected explicitly
+ * (NO_OP_EXPANSION) so callers don't accidentally double-submit.
+ */
+export const ExpandCapabilitiesSchema = z.object({
+  agent_name: z.string().min(1).max(64).describe("Your agent name. Must match the row your token authenticates to."),
+  new_capabilities: z.array(
+    z.string().min(1).max(64)
+  ).min(1).describe("The full new capability set. Must be a superset of the agent's current caps — additive only."),
+  agent_token: AgentTokenField,
+});
+
+export type ExpandCapabilitiesInput = z.infer<typeof ExpandCapabilitiesSchema>;
 
 export const UpdateTaskSchema = z.object({
   task_id: z.string().min(1).describe("Task ID to update"),

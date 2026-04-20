@@ -320,3 +320,112 @@ describe("spawn-agent.sh — v2.1.2 plug-and-play defaults", () => {
     expect(r.stdout).not.toContain("rm -rf");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v2.1.4 (I10): brief_file_path — durable task-brief pointer
+// ---------------------------------------------------------------------------
+describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
+  function writeBrief(name: string, contents: string): string {
+    const p = path.join(
+      path.join("/tmp", `relay-brief-${process.pid}-${name}`)
+    );
+    fs.writeFileSync(p, contents, "utf8");
+    return p;
+  }
+
+  it("default spawn with valid brief path embeds the pointer sentence in KICKSTART", async () => {
+    const brief = writeBrief("ok", "# Task brief\n\nDo the thing.");
+    try {
+      // Token is empty (arg 5) — brief_file_path is arg 6.
+      const r = await runSpawn(["builder-1", "builder", "", "/tmp", "", brief]);
+      expect(r.code).toBe(0);
+      // The default KICKSTART is still present
+      expect(r.stdout).toContain("mcp__bot-relay__get_messages");
+      // The brief-pointer sentence is appended. The KICKSTART is wrapped by
+      // printf %q as a bash $'...' ANSI-C quoted string (because it contains
+      // apostrophes), so the literal phrase appears verbatim inside that
+      // wrapper — no backslash escapes for spaces.
+      expect(r.stdout).toContain("Your full brief lives at");
+      expect(r.stdout).toContain(`\`${brief}\``);
+      expect(r.stdout).toContain("canonical source");
+    } finally {
+      try { fs.unlinkSync(brief); } catch {}
+    }
+  });
+
+  it("non-existent brief path rejects with exit 2", async () => {
+    const ghost = `/tmp/relay-brief-ghost-${process.pid}-does-not-exist.md`;
+    const r = await runSpawn(["builder-1", "builder", "", "/tmp", "", ghost]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("does not exist");
+  });
+
+  it("path-injection attempt rejects with exit 2", async () => {
+    const r = await runSpawn([
+      "builder-1",
+      "builder",
+      "",
+      "/tmp",
+      "",
+      "/tmp/$(whoami).md",
+    ]);
+    expect(r.code).toBe(2);
+    expect(r.stderr.toLowerCase()).toMatch(/brief_file_path|metachar|allowlist/);
+    expect(r.stdout).not.toContain("whoami");
+  });
+
+  it("relative brief path rejects with exit 2", async () => {
+    const r = await runSpawn([
+      "builder-1",
+      "builder",
+      "",
+      "/tmp",
+      "",
+      "./brief.md",
+    ]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("absolute path");
+  });
+
+  it("oversized brief (>10KB) rejects with exit 2", async () => {
+    const big = writeBrief("big", "x".repeat(10241));
+    try {
+      const r = await runSpawn(["builder-1", "builder", "", "/tmp", "", big]);
+      expect(r.code).toBe(2);
+      expect(r.stderr).toContain("10240 bytes");
+    } finally {
+      try { fs.unlinkSync(big); } catch {}
+    }
+  });
+
+  it("RELAY_SPAWN_NO_KICKSTART=1 + brief_file_path → no brief pointer in CMD (no-kickstart wins)", async () => {
+    const brief = writeBrief("nokickstart", "# brief");
+    try {
+      const r = await runSpawnWithEnv(
+        ["builder-1", "builder", "", "/tmp", "", brief],
+        { RELAY_SPAWN_NO_KICKSTART: "1" }
+      );
+      expect(r.code).toBe(0);
+      expect(r.stdout).not.toContain("Your full brief lives at");
+      expect(r.stdout).not.toContain("mcp__bot-relay__get_messages");
+    } finally {
+      try { fs.unlinkSync(brief); } catch {}
+    }
+  });
+
+  it("RELAY_SPAWN_KICKSTART override + brief_file_path → override wins, no brief pointer", async () => {
+    const brief = writeBrief("override", "# brief");
+    try {
+      const r = await runSpawnWithEnv(
+        ["builder-1", "builder", "", "/tmp", "", brief],
+        { RELAY_SPAWN_KICKSTART: "customPromptFromOperator" }
+      );
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("customPromptFromOperator");
+      // Operator override is preserved verbatim — we do NOT silently append.
+      expect(r.stdout).not.toContain("Your full brief lives at");
+    } finally {
+      try { fs.unlinkSync(brief); } catch {}
+    }
+  });
+});

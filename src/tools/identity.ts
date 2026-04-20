@@ -14,6 +14,7 @@ import {
   sendMessage,
   logAudit,
   ConcurrentUpdateError,
+  expandAgentCapabilities,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { log } from "../logger.js";
@@ -28,6 +29,7 @@ import type {
   RotateTokenInput,
   RotateTokenAdminInput,
   RevokeTokenInput,
+  ExpandCapabilitiesInput,
 } from "../types.js";
 
 export function handleRegisterAgent(input: RegisterAgentInput) {
@@ -729,4 +731,77 @@ export function handleDiscoverAgents(input: DiscoverAgentsInput) {
       },
     ],
   };
+}
+
+/**
+ * v2.1.4 (I11) — self-managed additive cap expansion.
+ *
+ * Dispatcher has already authenticated the caller by token (no explicit caller
+ * field → token-resolution path) AND verified `agent_name` matches the authed
+ * row (the explicit `agent_name` field routes through enforceAuth's
+ * explicit-caller branch). That means by the time we're in the handler, the
+ * caller proved they own the row. All that remains is the additive-only +
+ * no-op policy, which lives in `expandAgentCapabilities`.
+ */
+export function handleExpandCapabilities(input: ExpandCapabilitiesInput) {
+  try {
+    const { added, current } = expandAgentCapabilities(input.agent_name, input.new_capabilities);
+    logAudit(
+      input.agent_name,
+      "expand_capabilities",
+      `added=${added.join(",")}`,
+      true,
+      null,
+      currentContext().transport,
+      { agent: input.agent_name, added, new_current: current }
+    );
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              agent: input.agent_name,
+              added,
+              capabilities: current,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    let code: string = ERROR_CODES.INTERNAL;
+    let friendly = msg;
+    if (msg === "NOT_FOUND") {
+      code = ERROR_CODES.NOT_FOUND;
+      friendly = `Agent "${input.agent_name}" not found.`;
+    } else if (msg === "REDUCTION_NOT_ALLOWED") {
+      code = ERROR_CODES.REDUCTION_NOT_ALLOWED;
+      friendly =
+        `new_capabilities must be a SUPERSET of the agent's current caps — additive only. ` +
+        `To reduce caps, operator must unregister_agent + register_agent.`;
+    } else if (msg === "NO_OP_EXPANSION") {
+      code = ERROR_CODES.NO_OP_EXPANSION;
+      friendly =
+        `new_capabilities is already a subset of current caps — nothing to add. ` +
+        `Include at least one NEW cap.`;
+    }
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            { success: false, error: friendly, error_code: code },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
 }
