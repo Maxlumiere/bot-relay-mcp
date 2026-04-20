@@ -38,7 +38,14 @@ function cleanup() {
 beforeEach(() => cleanup());
 afterEach(() => cleanup());
 
-describe("spawn_agent tool", () => {
+// v2.1 Phase 8 (CI-fix): these tests assert macOS-specific dispatcher behavior
+// (shells to bin/spawn-agent.sh). The cross-platform spawn drivers are tested
+// platform-agnostically in tests/spawn-drivers.test.ts (53 mock tests covering
+// Linux + Windows). On non-darwin CI runners, the Linux driver probes for
+// gnome-terminal / konsole / xterm / tmux — none installed on bare Ubuntu —
+// and the dispatcher returns success=false before the mocked spawn fires.
+// Skip on non-darwin to keep this file as the macOS-integration checkpoint.
+describe.skipIf(os.platform() !== "darwin")("spawn_agent tool", () => {
   it("returns success and calls the spawn script", () => {
     const result = parseResult(
       handleSpawnAgent({
