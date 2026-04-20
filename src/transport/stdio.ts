@@ -5,28 +5,48 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "../server.js";
-import { unregisterAgent, getAgentSessionId } from "../db.js";
+import { markAgentOffline, getAgentSessionId, logAudit } from "../db.js";
 import { log } from "../logger.js";
 
 /**
- * v2.0 final (#1) + v2.0.1 (Codex HIGH 1) + v2.0.2: auto-unregister on terminal
- * close, scoped to THIS process's session_id so a stale shutdown cannot wipe a
- * fresh session that a new terminal just registered under the same agent name.
+ * v2.0 final (#1) + v2.0.1 (Codex HIGH 1) + v2.0.2: auto-offline on terminal
+ * close, scoped to THIS process's session_id so a stale shutdown cannot
+ * clobber a fresh session that a new terminal just registered under the same
+ * agent name.
+ *
+ * v2.1.3 (I9 fix): changed from DELETE to mark-offline. Operator-visible
+ * agent identity (token_hash, capabilities, description, auth_state) is NO
+ * LONGER destroyed when a Claude Code terminal closes. The agents row is
+ * preserved; only `session_id` clears (so the next terminal bootstraps
+ * cleanly) and `agent_status` flips to 'offline'. Subsequent
+ * `register_agent` with the same RELAY_AGENT_NAME + existing
+ * RELAY_AGENT_TOKEN resumes through the standard active-state re-register
+ * CAS path — zero operator ceremony, zero lost identity.
+ *
+ * The concurrent-instance-wipe protection from v2.0.1 HIGH 1 is preserved:
+ * the CAS predicate still pins session_id, so if a sibling terminal rotated
+ * the session between our SIGINT capture and this call, we no-op instead of
+ * clearing their fresh session.
  *
  * Flow:
  *   1. At server start we capture our agent's current session_id. If the
  *      SessionStart hook pre-registered, that value is set. Otherwise it is
- *      null until a future register_agent call rotates a session (re-capture
- *      on-the-fly is deferred to v2.1).
- *   2. At SIGINT/SIGTERM, if we have a captured session_id we CAS-delete with
- *      it. If a concurrent terminal rotated the session in the meantime, the
- *      CAS misses and we exit cleanly. If we never captured one, we no-op:
- *      this process cannot safely identify its own session, so deleting by
- *      name alone would risk wiping someone else's fresh session (HIGH 1
- *      regression that the v2.0.1 fallback chain re-introduced).
+ *      null until a future register_agent call rotates a session.
+ *   2. At SIGINT/SIGTERM, if we have a captured session_id we CAS-mark
+ *      offline with it. If a concurrent terminal rotated the session in the
+ *      meantime, the CAS misses and we exit cleanly. If we never captured
+ *      one, we no-op: this process cannot safely identify its own session,
+ *      so acting by name alone would risk clobbering someone else's session
+ *      (HIGH 1 regression that the v2.0.1 fallback chain re-introduced).
  *
  * Hard kills (SIGKILL) still fall through to the dead-agent purge (#2) +
- * the health monitor.
+ * the health monitor. A crashed terminal leaves session_id populated until
+ * the 30-day purge or until the next terminal with that name re-registers.
+ *
+ * Audit trail: v2.1.3 closes the forensic gap — this path now writes an
+ * audit_log entry with tool='stdio.auto_offline' + signal + captured
+ * session_id. Previously the DELETE-on-SIGINT path bypassed the dispatcher
+ * and left no trace.
  */
 let capturedSessionId: string | null = null;
 
@@ -53,9 +73,14 @@ export function getCapturedSessionId(): string | null {
 }
 
 /**
- * Pure logic for the SIGINT/SIGTERM auto-unregister. Exported so tests can
- * exercise the three branches (null/mismatch/match) without spawning a
- * process and sending real signals.
+ * Pure logic for the SIGINT/SIGTERM auto-offline path. Exported so tests
+ * can exercise the three branches (null / mismatch / match) without
+ * spawning a process and sending real signals.
+ *
+ * v2.1.3 (I9 fix): renamed semantically from "unregister" to "mark offline."
+ * The export name `performAutoUnregister` is retained for back-compat with
+ * existing test imports + the index.ts signal wiring; the new semantics
+ * are "mark this session offline, preserving agent identity."
  */
 export function performAutoUnregister(
   name: string | undefined,
@@ -65,21 +90,38 @@ export function performAutoUnregister(
   if (!name || name === "default") return;
   if (!capturedSid) {
     log.debug(
-      `[stdio] auto-unregister skipped for "${name}" — no captured session_id (process can't safely identify its own session)`,
+      `[stdio] auto-offline skipped for "${name}" — no captured session_id (process can't safely identify its own session)`,
     );
     return;
   }
   try {
-    const removed = unregisterAgent(name, capturedSid);
-    if (removed) {
-      log.info(`[stdio] auto-unregistered agent "${name}" (session=${capturedSid}) on ${signal}`);
+    const { changed } = markAgentOffline(name, capturedSid);
+    if (changed) {
+      log.info(`[stdio] marked agent "${name}" offline (session=${capturedSid}) on ${signal}`);
+      // v2.1.3: close the forensic gap. SIGINT-triggered state changes
+      // now write an audit_log entry even though this path bypasses the
+      // MCP dispatcher. Source='stdio' distinguishes from dispatcher calls.
+      try {
+        logAudit(
+          name,
+          "stdio.auto_offline",
+          `signal=${signal}`,
+          true,
+          null,
+          "stdio",
+          { signal, captured_session_id: capturedSid },
+        );
+      } catch (auditErr) {
+        // Audit write failure MUST NOT block the exit path. Log + continue.
+        log.warn(`[stdio] auto-offline audit_log write failed for "${name}":`, auditErr);
+      }
     } else {
       log.debug(
-        `[stdio] auto-unregister skipped for "${name}" — session_id mismatch (${capturedSid}) or already unregistered`,
+        `[stdio] auto-offline skipped for "${name}" — session_id mismatch (${capturedSid}) or row already offline`,
       );
     }
   } catch (err) {
-    log.warn(`[stdio] auto-unregister failed for "${name}":`, err);
+    log.warn(`[stdio] auto-offline failed for "${name}":`, err);
   }
 }
 

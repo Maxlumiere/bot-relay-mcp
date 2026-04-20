@@ -526,7 +526,30 @@ export function createServer(): Server {
       // state === "active"
       const token = resolveToken(args);
       const result = authenticateAgent(claimedName, token, existing.token_hash, state);
-      if (!result.ok) return authError(result.reason!);
+      if (!result.ok) {
+        // v2.1.3 I5: when the active row has a live session_id, a different
+        // caller presenting a wrong (or missing) token is almost certainly
+        // a name-collision attempt (two concurrent terminals claiming the
+        // same RELAY_AGENT_NAME), not an honest token mismatch. Surface a
+        // distinct error code so operators get the right remediation hint
+        // (stop the holding terminal OR run `relay recover`) instead of a
+        // generic AUTH_FAILED they might attribute to a token drift.
+        //
+        // When session_id IS NULL (row is offline, e.g. after a prior
+        // terminal's SIGINT marked it offline per v2.1.3 I9 fix), the
+        // generic AUTH_FAILED is correct — the name is re-claimable, but
+        // only by someone presenting the existing token_hash's valid token.
+        if (existing.session_id) {
+          return authError(
+            `Agent "${claimedName}" is currently held by a live session (session_id=${existing.session_id}). ` +
+            `Another terminal appears to be registered under this name. Resolution paths: ` +
+            `(a) close the holding terminal and let it mark the row offline on exit (v2.1.3+ preserves token_hash), then re-register; or ` +
+            `(b) run "bin/relay recover ${claimedName} --yes" to force-release the name (destroys the row + audit_log entry), then re-register fresh.`,
+            ERROR_CODES.NAME_COLLISION_ACTIVE
+          );
+        }
+        return authError(result.reason!);
+      }
       return null;
     }
 

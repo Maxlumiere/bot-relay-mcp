@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { sendMessage, getMessages, broadcastMessage, runHealthMonitorTick } from "../db.js";
+import { sendMessage, getMessages, broadcastMessage, runHealthMonitorTick, SenderNotRegisteredError } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
+import { ERROR_CODES } from "../error-codes.js";
 import type { SendMessageInput, GetMessagesInput, BroadcastInput } from "../types.js";
 
 /** v2.0 beta: lazy health piggyback on get_messages. See tools/tasks.ts for rationale. */
@@ -22,30 +23,56 @@ function runHealthMonitor(triggeredBy: string): void {
 }
 
 export function handleSendMessage(input: SendMessageInput) {
-  const message = sendMessage(input.from, input.to, input.content, input.priority);
-  fireWebhooks("message.sent", input.from, input.to, {
-    content: input.content,
-    message_id: message.id,
-  });
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(
+  try {
+    const message = sendMessage(input.from, input.to, input.content, input.priority);
+    fireWebhooks("message.sent", input.from, input.to, {
+      content: input.content,
+      message_id: message.id,
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              message_id: message.id,
+              from: message.from_agent,
+              to: message.to_agent,
+              priority: message.priority,
+              note: `Message sent to "${message.to_agent}"`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (err: any) {
+    // v2.1.3 (I9 bonus): surface SENDER_NOT_REGISTERED so callers can
+    // re-register + retry instead of silently succeeding with a frozen
+    // last_seen on a ghost row.
+    if (err instanceof SenderNotRegisteredError) {
+      return {
+        content: [
           {
-            success: true,
-            message_id: message.id,
-            from: message.from_agent,
-            to: message.to_agent,
-            priority: message.priority,
-            note: `Message sent to "${message.to_agent}"`,
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error: err.message,
+                error_code: ERROR_CODES.SENDER_NOT_REGISTERED,
+              },
+              null,
+              2
+            ),
           },
-          null,
-          2
-        ),
-      },
-    ],
-  };
+        ],
+        isError: true,
+      };
+    }
+    throw err;
+  }
 }
 
 export function handleGetMessages(input: GetMessagesInput) {

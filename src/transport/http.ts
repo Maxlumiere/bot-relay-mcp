@@ -382,6 +382,14 @@ export function startHttpServer(port: number, host: string): Server {
     log.info(`  Health check: GET http://${host}:${port}/health`);
     log.info(`  Dashboard:    GET http://${host}:${port}/`);
     if (config.http_secret) log.info(`  Auth: required (Bearer token or X-Relay-Secret header)`);
+    // v2.1.3 (I16): clarify the stdio/http process boundary so operators
+    // don't misattribute post-restart symptoms. Restarting THIS daemon
+    // never affects Claude Code stdio MCP clients — they each run their
+    // own `node dist/index.js` process. Only `"type":"http"` MCP clients
+    // pointed at this URL lose their connection across a restart.
+    log.info(
+      `  NOTE: stdio MCP clients (each Claude Code terminal with "type":"stdio" in ~/.claude.json spawns its own server process) are process-independent from this daemon. Restarting this daemon does NOT affect them; operator /mcp reconnect is only needed for "type":"http" MCP clients pointed at ${host}:${port}. See docs/transport-architecture.md.`
+    );
   });
 
   return server;

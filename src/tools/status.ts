@@ -15,8 +15,27 @@ import { currentContext } from "../request-context.js";
 /** Process-start wall clock — captured at module load so health_check can report uptime. */
 const PROCESS_STARTED_AT = Date.now();
 
+/**
+ * v2.1.3 (I6): map legacy enum values to the widened v2_5 enum. Keeps
+ * pre-v2.1.3 clients working without a protocol_version MAJOR bump.
+ */
+const LEGACY_SET_STATUS_MAP: Record<string, "idle" | "working" | "blocked" | "waiting_user" | "offline"> = {
+  online: "idle",
+  busy: "working",
+  away: "blocked",
+  idle: "idle",
+  working: "working",
+  blocked: "blocked",
+  waiting_user: "waiting_user",
+  offline: "offline",
+};
+
+const EXEMPT_FROM_REASSIGN = new Set(["working", "blocked", "waiting_user"]);
+
 export function handleSetStatus(input: SetStatusInput) {
-  const updated = setAgentStatus(input.agent_name, input.status);
+  // Normalize legacy → new. Zod has already restricted to the known set.
+  const normalized = LEGACY_SET_STATUS_MAP[input.status];
+  const updated = setAgentStatus(input.agent_name, normalized);
   if (!updated) {
     return {
       content: [
@@ -40,10 +59,11 @@ export function handleSetStatus(input: SetStatusInput) {
           {
             success: true,
             agent: input.agent_name,
-            status: input.status,
-            note: input.status === "busy" || input.status === "away"
-              ? `Status set to "${input.status}" — health monitor will not reassign your tasks.`
-              : `Status set to "${input.status}".`,
+            status: normalized,
+            ...(input.status !== normalized ? { status_normalized_from: input.status } : {}),
+            note: EXEMPT_FROM_REASSIGN.has(normalized)
+              ? `Status set to "${normalized}" — health monitor will not reassign your tasks.`
+              : `Status set to "${normalized}".`,
           },
           null,
           2

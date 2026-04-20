@@ -22,6 +22,12 @@
  *   2.1.0  — v2.1 sweep (Stop hook, legacy migration bypass, backup/restore,
  *            dashboard auth, webhook hardening fields, spawn token
  *            passthrough, etc.). All additive — no breaking changes.
+ *   2.1.1  — v2.1.3 (I6): agent_status enum widened from
+ *            (online|busy|away|offline) to (idle|working|blocked|waiting_user|
+ *            stale|offline). Legacy input values still accepted and mapped.
+ *            New error codes: SENDER_NOT_REGISTERED, NAME_COLLISION_ACTIVE.
+ *            Additive — old clients that hardcode the 4 old values on the
+ *            output side will need to widen their pattern-matches.
  *
  * Surfaced via `register_agent` + `health_check` response payloads so any
  * client can introspect compatibility before issuing tool calls. The relay
@@ -32,4 +38,4 @@
  * This file is intentionally the sole authoritative source — the drift-grep
  * in scripts/pre-publish-check.sh allowlists it alongside src/version.ts.
  */
-export const PROTOCOL_VERSION: string = "2.1.0";
+export const PROTOCOL_VERSION: string = "2.1.1";
