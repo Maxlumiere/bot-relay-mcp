@@ -1,0 +1,83 @@
+#!/usr/bin/env node
+/**
+ * bot-relay-mcp unified CLI (v2.1 Phase 4h).
+ *
+ * Subcommands:
+ *   relay doctor              Diagnostic sweep of local install state.
+ *                             --remote <url> probes a remote hub instead (v2.1 Phase 7r).
+ *   relay init [options]      First-run setup (interactive unless --yes).
+ *   relay test                Fresh-install self-check (throwaway relay).
+ *   relay generate-hooks      Emit Claude Code hook JSON for settings.json.
+ *   relay backup [--output]   Snapshot the DB + config into a tar.gz archive.
+ *   relay restore PATH        Restore from a tar.gz archive.
+ *   relay recover NAME        Clear an agent's registration so it can re-bootstrap
+ *                             (filesystem-gated, for lost-token recovery).
+ *   relay re-encrypt          Rotate at-rest encryption keys across all encrypted
+ *                             columns (v2.1 Phase 4b.3). See docs/key-rotation.md.
+ *   relay pair HUB_URL        Register with a remote bot-relay-mcp hub + emit an
+ *                             MCP client config snippet (v2.1 Phase 7r).
+ *   relay help                Show this message.
+ *
+ * Phase 2c's bin/relay-backup + bin/relay-restore are absorbed into
+ * `relay backup` / `relay restore`. Scripts that called the old names
+ * should switch to the unified entry.
+ */
+
+const SUBCOMMANDS = {
+  doctor: "../dist/cli/doctor.js",
+  init: "../dist/cli/init.js",
+  test: "../dist/cli/test.js",
+  "generate-hooks": "../dist/cli/generate-hooks.js",
+  backup: "../dist/cli/backup.js",
+  restore: "../dist/cli/restore.js",
+  recover: "../dist/cli/recover.js",
+  "re-encrypt": "../dist/cli/re-encrypt.js",
+  pair: "../dist/cli/pair.js",
+};
+
+function printHelp() {
+  process.stdout.write(
+    "bot-relay-mcp — unified CLI\n\n" +
+      "Usage: relay <subcommand> [options]\n\n" +
+      "Subcommands:\n" +
+      "  doctor           Diagnostic sweep of the local install (or --remote URL).\n" +
+      "  init             First-run setup (interactive; --yes for non-interactive).\n" +
+      "  test             Fresh-install self-check against a throwaway relay.\n" +
+      "  generate-hooks   Emit Claude Code hook JSON to merge into settings.json.\n" +
+      "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
+      "  restore PATH     Restore from a tar.gz archive.\n" +
+      "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +
+      "  re-encrypt       Rotate at-rest encryption keys across all encrypted columns.\n" +
+      "  pair HUB_URL     Register with a remote hub + emit MCP client config.\n" +
+      "  help             Show this message.\n\n" +
+      "Run `relay <subcommand> --help` for per-subcommand details.\n"
+  );
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.length === 0 || argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h") {
+    printHelp();
+    process.exit(0);
+  }
+
+  const sub = argv[0];
+  const rest = argv.slice(1);
+  const modulePath = SUBCOMMANDS[sub];
+  if (!modulePath) {
+    process.stderr.write(`relay: unknown subcommand "${sub}"\n\n`);
+    printHelp();
+    process.exit(1);
+  }
+
+  try {
+    const mod = await import(modulePath);
+    const code = await mod.run(rest);
+    process.exit(typeof code === "number" ? code : 0);
+  } catch (err) {
+    process.stderr.write(`relay ${sub}: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  }
+}
+
+main();
