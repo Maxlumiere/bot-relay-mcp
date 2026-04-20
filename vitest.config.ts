@@ -21,5 +21,10 @@ export default defineConfig({
       "tests/chaos.test.ts",
       "tests/cross-version.test.ts",
     ],
+    // v2.1 Phase 8 (CI-fix): CI disk + network are meaningfully slower than
+    // local macOS. Webhook-firing tests, HTTP-probe tests, and file-IO-heavy
+    // tests occasionally cross the 5s default. Dev loops stay at 5s (catches
+    // real perf regressions); CI gets 15s headroom.
+    testTimeout: process.env.CI ? 15000 : 5000,
   },
 });
