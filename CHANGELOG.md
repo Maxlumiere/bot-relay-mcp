@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.1.1 — 2026-04-20 (CI portability patches, no functional changes)
+
+Test-only + CI-plumbing fixes that surfaced when v2.1.0 published to public GitHub and exercised the Ubuntu CI matrix (Node 18 / 20 / 22) for the first time. Zero runtime behavior changes — the relay, protocol, auth, encryption, and MCP contract are identical to v2.1.0.
+
+- **spawn.test.ts** — skip on non-darwin platforms. The test asserts macOS-specific dispatcher behavior (shells to `bin/spawn-agent.sh`); cross-platform coverage lives in `tests/spawn-drivers.test.ts`. On bare Ubuntu CI runners, the Linux driver probes for `gnome-terminal / konsole / xterm / tmux` — none installed — and the dispatcher short-circuits before the mocked `child_process.spawn` is reached. Now skipped with clear rationale comment.
+- **backup.test.ts (6)** — explicit 15s timeout on the daemon-probe + forced-restore test. CI disk IO is slower than local macOS; the back-to-back import cycles (safety-backup → extract → integrity-check → atomic swap) exceed the 5s vitest default. Local runs unaffected.
+- **vitest.config.ts** — env-gated `testTimeout`: 15s on CI (`process.env.CI`), 5s locally. Webhook-firing tests, HTTP-probe tests, and file-IO-heavy tests occasionally cross 5s on GitHub Actions runners; dev loops stay at 5s to catch real perf regressions.
+- **scripts/smoke-25-tools.sh** — `cli:backup` smoke assertion now dumps tar entries + relay stdout on failure. Diagnostic-only; catches intermittent CI flakes with actionable context instead of "tarball missing manifest or relay.db" alone.
+- **.github/workflows/ci.yml** — cosmetic: smoke job renamed `22-tool` → `25-tool` (the underlying script was renamed in Phase 5a; workflow label wasn't updated at the time).
+
+No src/ changes. No test assertion weakening. No protocol changes. Same 670 tests under `--full`; same binaries.
+
 ## v2.1.0 — 2026-04-19 (architecturally complete, all 14 Codex findings closed)
 
 The v2.1 arc — 28 phases across 5 calendar weeks — closed the remaining architectural gaps surfaced by Codex's mid-sweep design audit. 14 of 14 Codex findings closed. 25 MCP tools. 8 unified-CLI subcommands. Schema version 5 with idempotent migration chain from any prior shape.
