@@ -1,0 +1,73 @@
+{
+  "name": "bot-relay-mcp",
+  "version": "2.1.0",
+  "description": "MCP server for AI coding agent terminal-to-terminal communication. Local-first, SQLite-backed, webhook-integrated.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "bot-relay-mcp": "dist/index.js",
+    "relay": "bin/relay"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "hooks",
+    "roles",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "dev": "tsc --watch",
+    "prepublishOnly": "bash scripts/pre-publish-check.sh"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "agent-communication",
+    "multi-agent",
+    "ai",
+    "model-context-protocol",
+    "agent-relay",
+    "cursor",
+    "cline"
+  ],
+  "homepage": "https://github.com/Maxlumiere/bot-relay-mcp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Maxlumiere/bot-relay-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Maxlumiere/bot-relay-mcp/issues"
+  },
+  "license": "MIT",
+  "author": "Lumiere Ventures <contact@lumiereventures.co>",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "~1.29.0",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^11.9.1",
+    "express": "^5.2.1",
+    "uuid": "^11.1.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  },
+  "optionalDependencies": {
+    "sql.js": "^1.14.1"
+  },
+  "overrides": {
+    "hono": ">=4.12.14"
+  }
+}

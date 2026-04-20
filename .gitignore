@@ -1,0 +1,39 @@
+# Dependencies + build output
+node_modules/
+dist/
+
+# Local DB + data files
+*.db
+*.db-wal
+*.db-shm
+
+# Claude Code per-install settings (contain user-specific tool permissions + paths)
+.claude/
+
+# Environment files (defensive — no .env currently tracked but exclude if ever added)
+.env
+.env.*
+!.env.example
+
+# Internal development artifacts (not for public consumption)
+audit-findings/
+devlog/
+history/
+BUILD-SUMMARY.md
+v2-build-prompt.md
+plug-and-play-retro.md
+HANDOFF.md
+CLAUDE.md
+
+# macOS + editor noise
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs + coverage + tmp
+*.log
+coverage/
+.nyc_output/
+tmp/
