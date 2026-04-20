@@ -333,7 +333,11 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
     return p;
   }
 
-  it("default spawn with valid brief path embeds the pointer sentence in KICKSTART", async () => {
+  // v2.1.4 scope: brief_file_path KICKSTART wiring is macOS-only. Linux/Windows
+  // accept the arg for signature parity but don't embed the pointer sentence in
+  // KICKSTART until v2.2 cross-platform harmonization. Skip this assertion on
+  // non-darwin runners (CI catches everything else in the describe block).
+  it.skipIf(process.platform !== "darwin")("default spawn with valid brief path embeds the pointer sentence in KICKSTART", async () => {
     const brief = writeBrief("ok", "# Task brief\n\nDo the thing.");
     try {
       // Token is empty (arg 5) — brief_file_path is arg 6.
