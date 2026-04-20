@@ -32,6 +32,12 @@ import type { AddressInfo } from "net";
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-4p-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
 process.env.RELAY_DB_PATH = TEST_DB_PATH;
+// v2.1.3 I8: scrub inherited RELAY_AGENT_* env vars so isolated tests
+// do not auth against a parent-shell spawn-agent.sh token.
+delete process.env.RELAY_AGENT_TOKEN;
+delete process.env.RELAY_AGENT_NAME;
+delete process.env.RELAY_AGENT_ROLE;
+delete process.env.RELAY_AGENT_CAPABILITIES;
 // Opt-in private webhooks so we can point at a 127.0.0.1 receiver in-test.
 process.env.RELAY_ALLOW_PRIVATE_WEBHOOKS = "1";
 

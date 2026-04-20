@@ -122,11 +122,52 @@ export const PostTaskSchema = z.object({
   agent_token: AgentTokenField,
 });
 
-export const AgentStatusEnum = z.enum(["online", "busy", "away", "offline"]);
+/**
+ * v2.1.3 (I6) — agent_status enum widened from (online | busy | away | offline)
+ * to (idle | working | blocked | waiting_user | stale | offline). Legacy values
+ * stay accepted on input and map to the new enum:
+ *   online → idle
+ *   busy   → working
+ *   away   → blocked
+ *   offline → offline (unchanged)
+ *
+ * `stale` is RESERVED for relay auto-transitions only (agents shouldn't
+ * self-declare stale — it's an observation-layer signal). The Zod schema
+ * accepts it in `AgentStatusEnum` for completeness of the read-side type,
+ * but `SetStatusInputEnum` excludes it for writes.
+ */
+export const AgentStatusEnum = z.enum([
+  "idle",
+  "working",
+  "blocked",
+  "waiting_user",
+  "stale",
+  "offline",
+]);
+
+/** v2.1.3 — union accepted by set_status: new values + legacy aliases. */
+export const SetStatusInputEnum = z.enum([
+  // new
+  "idle",
+  "working",
+  "blocked",
+  "waiting_user",
+  "offline",
+  // legacy (back-compat, normalized in handler)
+  "online",
+  "busy",
+  "away",
+]);
 
 export const SetStatusSchema = z.object({
   agent_name: z.string().min(1).describe("Your agent name"),
-  status: AgentStatusEnum.describe("Operational status — online (default), busy (exempts you from health-monitor task reassignment), away (soft-busy), offline (graceful shutdown)."),
+  status: SetStatusInputEnum.describe(
+    "Operational status — v2.1.3 widened enum: " +
+    "idle (default active state), working (actively executing a task; exempts from health-monitor reassignment), " +
+    "blocked (cannot proceed; also exempt), waiting_user (paused pending operator input), " +
+    "offline (graceful shutdown). Legacy aliases still accepted: online→idle, busy→working, away→blocked. " +
+    "`stale` is relay-computed, not agent-settable."
+  ),
   agent_token: AgentTokenField,
 });
 
@@ -350,8 +391,15 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
   status: "online" | "stale" | "offline";
   /** v1.7: whether the agent has a token (false = legacy pre-v1.7 agent) */
   has_token: boolean;
-  /** v2.0 final: agent-controlled operational status (different from presence). */
-  agent_status: "online" | "busy" | "away" | "offline";
+  /**
+   * v2.0 final: agent-controlled operational status (different from presence).
+   * v2.1.3 (I6): enum widened — idle (default active), working, blocked,
+   * waiting_user, stale (relay-computed from last_seen), offline. The value
+   * surfaced here is the HYBRID: relay overrides a stored active-state
+   * (idle/working/blocked/waiting_user) with 'stale' at 5 min + 'offline' at
+   * 30 min of last_seen silence.
+   */
+  agent_status: "idle" | "working" | "blocked" | "waiting_user" | "stale" | "offline";
   /** v2.0 final: optional description. */
   description: string | null;
   /** v2.0 final: current session_id (UUID, rotates on re-register). */

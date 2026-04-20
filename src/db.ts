@@ -73,10 +73,58 @@ function computeStatus(lastSeen: string): "online" | "stale" | "offline" {
   return "offline";
 }
 
+/**
+ * v2.1.3 (I6) — agent_status auto-transition thresholds. Kept in sync with
+ * docs/agent-status-lifecycle.md. Relay overrides a stored active-state
+ * (idle/working/blocked/waiting_user) based on last_seen age.
+ */
+const AGENT_STATUS_STALE_MINUTES = 5;
+const AGENT_STATUS_OFFLINE_MINUTES = 30;
+
+const LEGACY_STATUS_MAP: Record<string, string> = {
+  online: "idle",
+  busy: "working",
+  away: "blocked",
+};
+
+function normalizeStoredAgentStatus(raw: string | null | undefined): string {
+  const lower = (raw ?? "idle").toLowerCase();
+  return LEGACY_STATUS_MAP[lower] ?? lower;
+}
+
+/**
+ * v2.1.3 (I6) — derive the observed agent_status from the stored declared
+ * state + last_seen age. Active declared states (idle/working/blocked/
+ * waiting_user) get overridden to 'stale' after 5 min and 'offline' after
+ * 30 min of silence. Declared 'offline' is always offline. 'stale' (rare —
+ * only via direct DB write) upgrades to 'offline' at the 30-min threshold.
+ */
+function deriveAgentStatus(
+  storedRaw: string | null | undefined,
+  lastSeen: string
+): AgentWithStatus["agent_status"] {
+  const stored = normalizeStoredAgentStatus(storedRaw);
+  const minutes = (Date.now() - new Date(lastSeen).getTime()) / 60_000;
+
+  if (stored === "offline") return "offline";
+  if (minutes >= AGENT_STATUS_OFFLINE_MINUTES) return "offline";
+  if (stored === "stale") return minutes >= AGENT_STATUS_OFFLINE_MINUTES ? "offline" : "stale";
+  if (minutes >= AGENT_STATUS_STALE_MINUTES) return "stale";
+
+  // Active declared state. Validate against the known set; fall back to
+  // 'idle' for unrecognized legacy or drift values.
+  if (
+    stored === "idle" ||
+    stored === "working" ||
+    stored === "blocked" ||
+    stored === "waiting_user"
+  ) {
+    return stored;
+  }
+  return "idle";
+}
+
 function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
-  const rawStatus = (row.agent_status ?? "online").toLowerCase();
-  const agentStatus: AgentWithStatus["agent_status"] =
-    rawStatus === "busy" || rawStatus === "away" || rawStatus === "offline" ? rawStatus : "online";
   return {
     id: row.id,
     name: row.name,
@@ -86,7 +134,7 @@ function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
     created_at: row.created_at,
     status: computeStatus(row.last_seen),
     has_token: !!row.token_hash,
-    agent_status: agentStatus,
+    agent_status: deriveAgentStatus(row.agent_status, row.last_seen),
     description: row.description ?? null,
     session_id: row.session_id ?? null,
   };
@@ -124,6 +172,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_2(_db);
   migrateSchemaToV2_3(_db);
   migrateSchemaToV2_4(_db);
+  migrateSchemaToV2_5(_db);
   purgeOldRecords(_db);
 }
 
@@ -151,6 +200,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_2(_db);
   migrateSchemaToV2_3(_db);
   migrateSchemaToV2_4(_db);
+  migrateSchemaToV2_5(_db);
   purgeOldRecords(_db);
 
   return _db;
@@ -347,6 +397,9 @@ function initSchema(db: CompatDatabase): void {
  * v2.1 Phase 4b.3 bumped 4 → 5 alongside the reencryption_progress table
  * (new table only, no column changes; version bump is a semantic marker
  * so backup/restore flag the post-rotation shape explicitly).
+ * v2.1.3 (I6) bumped 6 → 7 alongside migrateSchemaToV2_5 (agent_status enum
+ *   widened + legacy value remap: online→idle, busy→working, away→blocked).
+ *
  * v2.1 Phase 7q bumped 5 → 6 alongside migrateSchemaToV2_4 (agents.visibility
  * column reserved for v2.3 hub federation, mailbox + agent_cursor tables
  * reserved for Phase 4s v2.2 delivery-seq protocol). All additions empty /
@@ -355,7 +408,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -807,6 +860,36 @@ function migrateSchemaToV2_4(db: CompatDatabase): void {
   }
 }
 
+/**
+ * v2.1.3 (I6) — agent_status enum widening.
+ *
+ * The column has no CHECK constraint (the v2_0 ALTER just set a DEFAULT), so
+ * no table rebuild is required. This migration is a pure data remap:
+ *   online  → idle
+ *   busy    → working
+ *   away    → blocked
+ *   offline → offline (unchanged)
+ *   any other value (waiting_user, stale, idle, working, blocked) → unchanged
+ *
+ * Idempotent: the WHERE clauses match zero rows on a DB that's already been
+ * migrated. Schema version bumps 6 → 7.
+ *
+ * Read-side auto-transition (idle/working/blocked/waiting_user → stale at
+ * 5 min → offline at 30 min of last_seen silence) is a DERIVED value in
+ * toAgentWithStatus / deriveAgentStatus, not a stored mutation. No
+ * background sweep needed; no writes on read.
+ *
+ * The `stale` and `waiting_user` values are permitted in the stored column
+ * (agents can self-declare waiting_user via set_status; stale is reserved
+ * for relay but the schema doesn't police it). No CHECK constraint means
+ * no table rebuild needed for the widening.
+ */
+function migrateSchemaToV2_5(db: CompatDatabase): void {
+  db.prepare("UPDATE agents SET agent_status = 'idle' WHERE agent_status = 'online'").run();
+  db.prepare("UPDATE agents SET agent_status = 'working' WHERE agent_status = 'busy'").run();
+  db.prepare("UPDATE agents SET agent_status = 'blocked' WHERE agent_status = 'away'").run();
+}
+
 function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -1006,10 +1089,11 @@ export function checkAndRecordRateLimit(
 // --- Agent operations ---
 
 // ---------------------------------------------------------------------------
-// v2.1 Phase 7q — sanctioned internal mutation helpers for the agents table.
+// v2.1 Phase 7q (+ v2.1.3 addition) — sanctioned internal mutation helpers
+// for the agents table.
 //
 // Every non-lifecycle caller that needs to DELETE / UPDATE the agents table
-// (or its sidecar `agent_capabilities`) MUST go through one of these three
+// (or its sidecar `agent_capabilities`) MUST go through one of these four
 // helpers. The pre-publish drift-grep guard in scripts/pre-publish-check.sh
 // rejects any raw `UPDATE agents` / `DELETE FROM agents` / `UPDATE|DELETE
 // agent_capabilities` token outside src/db.ts (or a line carrying an explicit
@@ -1169,6 +1253,51 @@ export function updateAgentMetadata(
 }
 
 /**
+ * v2.1.3 — sanctioned offline transition for a stdio terminal that is
+ * exiting (SIGINT / SIGTERM).
+ *
+ * Replaces the v2.0.1 Codex HIGH 1 DELETE-on-SIGINT path. Preserves the
+ * agent row + token_hash + capabilities + description + auth_state so a
+ * subsequent Claude Code terminal with the same RELAY_AGENT_NAME can
+ * re-register through the existing active-state path with its existing
+ * token — no operator ceremony, no lost identity, no webhook noise.
+ *
+ * CAS predicate: `name = ? AND session_id = ?`. A concurrent terminal
+ * that rotated session_id between our SIGINT capture and this call wins
+ * the race — CAS returns `{ changed: false }` and we no-op. This is the
+ * exact concurrent-instance-wipe protection the v2.0.1 HIGH 1 fix
+ * shipped; it remains intact because the new semantic is "clear MY
+ * session identity, not someone else's."
+ *
+ * Mutations on CAS hit:
+ *   - session_id = NULL           (bootstrap-ready for next terminal)
+ *   - agent_status = 'offline'    (declared lifecycle state)
+ *   - busy_expires_at = NULL      (offline overrides busy shield)
+ *
+ * Deliberately preserved:
+ *   - token_hash / auth_state / capabilities / agent_capabilities
+ *   - description / role / created_at / managed / visibility
+ *   - last_seen (carries the "when was the agent truly active" signal;
+ *     the offline marker lives on agent_status now)
+ *
+ * Callers: `performAutoUnregister` in src/transport/stdio.ts. No other
+ * callers expected. Explicit `unregister_agent` MCP tool + `relay recover`
+ * CLI continue to route through `unregisterAgent` / `teardownAgent` (they
+ * are deliberate operator actions with delete semantics).
+ */
+export function markAgentOffline(
+  name: string,
+  expectedSessionId: string
+): { changed: boolean } {
+  const db = getDb();
+  const r = db.prepare(
+    "UPDATE agents SET session_id = NULL, agent_status = 'offline', busy_expires_at = NULL " +
+    "WHERE name = ? AND session_id = ?"
+  ).run(name, expectedSessionId);
+  return { changed: r.changes === 1 };
+}
+
+/**
  * Register (or re-register) an agent.
  *
  * v1.7 behavior:
@@ -1323,7 +1452,8 @@ export function registerAgent(
     // thereafter (same rule as capabilities per v1.7.1). Default 0.
     const managed = options.managed ? 1 : 0;
     db.prepare(
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, description, agent_status, managed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?)"
+      // v2.1.3 (I6): default agent_status is now 'idle' (was 'online').
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, description, agent_status, managed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?)"
     ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, description, managed);
 
     // v2.0: populate normalized agent_capabilities table.
@@ -1342,7 +1472,7 @@ export function registerAgent(
       token_hash,
       session_id,
       description,
-      agent_status: "online",
+      agent_status: "idle", // v2.1.3 (I6)
       managed,
     });
   }
@@ -1677,21 +1807,56 @@ export function getAgentSessionId(name: string): string | null {
 }
 
 /**
- * v2.0 final (#26): set the agent's operational status.
- *  - online (default): normal operation, eligible for health-monitor reassignment
- *  - busy: signals "I'm working, don't reassign my tasks" — health monitor skips
- *  - away: soft-busy, same treatment as busy
- *  - offline: graceful shutdown signal; pairs with auto-unregister
+ * v2.0 final (#26) + v2.1.3 (I6): set the agent's operational status.
+ *  - idle (default): normal active state, eligible for health-monitor reassignment
+ *  - working: actively executing — health monitor skips reassignment
+ *  - blocked: cannot proceed (missing input / dependency) — health monitor skips
+ *  - waiting_user: paused pending operator input — health monitor skips
+ *  - offline: graceful shutdown signal
+ *
+ * `stale` is NOT a valid set_status value — it is a relay-computed observation
+ * (deriveAgentStatus flips idle/working/blocked/waiting_user → stale after 5 min
+ * of last_seen silence, → offline after 30 min). Callers may pass it directly
+ * at the db layer for testing; production code should avoid it.
  *
  * Returns true if the agent existed and the status was updated.
  */
-export function setAgentStatus(name: string, status: "online" | "busy" | "away" | "offline"): boolean {
-  const db = getDb();
-  // v2.0.1 (Codex HIGH 2): busy/away gets a TTL (default 240 min). Online/offline
-  // clears the expiry. Without a TTL a crashed agent's shield would persist
-  // until the 30-day dead-agent purge.
+/** Accepted by setAgentStatus — new v2.1.3 enum plus legacy aliases. */
+type SetStatusValue =
+  | "idle"
+  | "working"
+  | "blocked"
+  | "waiting_user"
+  | "stale"
+  | "offline"
+  // legacy aliases — normalized internally to idle/working/blocked
+  | "online"
+  | "busy"
+  | "away";
+
+const LEGACY_SET_STATUS_NORMALIZE: Record<string, "idle" | "working" | "blocked" | "waiting_user" | "stale" | "offline"> = {
+  online: "idle",
+  busy: "working",
+  away: "blocked",
+  idle: "idle",
+  working: "working",
+  blocked: "blocked",
+  waiting_user: "waiting_user",
+  stale: "stale",
+  offline: "offline",
+};
+
+export function setAgentStatus(name: string, status: SetStatusValue): boolean {
+  // v2.1.3 (I6): normalize legacy aliases. Callers at the db layer (tests,
+  // scripts, handlers that bypass the tool-handler normalization) can pass
+  // either enum.
+  const normalized = LEGACY_SET_STATUS_NORMALIZE[status] ?? "idle";
+  // v2.0.1 (Codex HIGH 2) + v2.1.3: the busy_expires_at TTL applies to states
+  // that exempt the agent from health-monitor reassignment (working / blocked /
+  // waiting_user). Without a TTL a crashed agent's shield would persist until
+  // the 30-day dead-agent purge. Offline / idle / stale clear the expiry.
   let expiresAt: string | null = null;
-  if (status === "busy" || status === "away") {
+  if (normalized === "working" || normalized === "blocked" || normalized === "waiting_user") {
     const ttlMinutes = parseInt(process.env.RELAY_BUSY_TTL_MINUTES || "240", 10);
     const ttlMs = (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : 240) * 60 * 1000;
     expiresAt = new Date(Date.now() + ttlMs).toISOString();
@@ -1699,7 +1864,7 @@ export function setAgentStatus(name: string, status: "online" | "busy" | "away" 
   // v2.1 Phase 7q: route through the sanctioned updateAgentMetadata helper
   // so every non-auth-state field write lands in one place.
   return updateAgentMetadata(name, {
-    agent_status: status,
+    agent_status: normalized,
     busy_expires_at: expiresAt,
   });
 }
@@ -1772,6 +1937,42 @@ export function sendMessage(
   priority: string
 ): MessageRecord {
   const db = getDb();
+
+  // v2.1.3 (I9 bonus): verify the sender row exists BEFORE inserting. Pre-
+  // v2.1.3 this call relied on `touchAgent(from)` silently no-op'ing when
+  // the row was missing + INSERTing the message anyway. That path masked
+  // the curl-wedge symptom during the 2026-04-20 multi-agent session: a
+  // curl-fallback sender whose row had been deleted mid-session got
+  // successful-looking responses with last_seen frozen. Now we surface a
+  // typed error the dispatcher classifies as SENDER_NOT_REGISTERED.
+  //
+  // The dispatcher already verifies the from-agent exists at auth time,
+  // but this defense-in-depth check catches the narrow race where a
+  // sibling process (SIGINT / recover CLI / unregister tool) deletes the
+  // sender row between dispatcher auth and handler write.
+  //
+  // Exception: "system" is the well-known sentinel for relay-authored
+  // messages (spawn initial_message, future system push notifications).
+  // It is intentionally not a registered agent — the sentinel just marks
+  // "this message came from the infrastructure, not an agent." No
+  // touchAgent + no sender check for system.
+  if (from === "system") {
+    const id = uuidv4();
+    const timestamp = now();
+    const encContent = encryptContent(content);
+    db.prepare(
+      "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
+    ).run(id, from, to, encContent, priority, timestamp);
+    return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
+  }
+
+  const senderExists = db
+    .prepare("SELECT 1 FROM agents WHERE name = ?")
+    .get(from) as { 1: number } | undefined;
+  if (!senderExists) {
+    throw new SenderNotRegisteredError(from);
+  }
+
   touchAgent(from);
 
   const id = uuidv4();
@@ -1962,6 +2163,28 @@ export class ConcurrentUpdateError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ConcurrentUpdateError";
+  }
+}
+
+/**
+ * v2.1.3 — thrown by sendMessage (and any future sender-originating write)
+ * when the named sender row does not exist at write time. Surfaces the
+ * silent-UPDATE path the predecessor session hit during the post-recover
+ * curl wedge: auth had previously passed, but the row was deleted between
+ * dispatcher verify and handler INSERT — the old code path INSERTed the
+ * message anyway and the sender's last_seen silently stayed frozen.
+ *
+ * Classified as `SENDER_NOT_REGISTERED` by handleSendMessage; caller should
+ * re-register the sender name and retry.
+ */
+export class SenderNotRegisteredError extends Error {
+  constructor(name: string) {
+    super(
+      `Sender "${name}" is not a registered agent. Call register_agent before sending messages. ` +
+      `(This error surfaces the silent-UPDATE path fixed in v2.1.3 — pre-v2.1.3 sendMessage would ` +
+      `silently insert with last_seen never bumping when the sender row was missing.)`
+    );
+    this.name = "SenderNotRegisteredError";
   }
 }
 
@@ -2311,7 +2534,12 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
             SELECT name FROM agents
              WHERE last_seen < ?
                AND (
-                 agent_status NOT IN ('busy','away')
+                 -- v2.1.3 (I6): new exempt-from-requeue statuses are
+                 -- working / blocked / waiting_user. Legacy 'busy' / 'away'
+                 -- are kept for belt-and-suspenders (post-migration they
+                 -- should not exist, but an older peer process on the same
+                 -- DB could still write them).
+                 agent_status NOT IN ('working','blocked','waiting_user','busy','away')
                  OR busy_expires_at IS NULL
                  OR busy_expires_at < ?
                )
@@ -2333,7 +2561,12 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
             SELECT name FROM agents
              WHERE last_seen < ?
                AND (
-                 agent_status NOT IN ('busy','away')
+                 -- v2.1.3 (I6): new exempt-from-requeue statuses are
+                 -- working / blocked / waiting_user. Legacy 'busy' / 'away'
+                 -- are kept for belt-and-suspenders (post-migration they
+                 -- should not exist, but an older peer process on the same
+                 -- DB could still write them).
+                 agent_status NOT IN ('working','blocked','waiting_user','busy','away')
                  OR busy_expires_at IS NULL
                  OR busy_expires_at < ?
                )
@@ -2364,7 +2597,12 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
             SELECT name FROM agents
              WHERE last_seen < ?
                AND (
-                 agent_status NOT IN ('busy','away')
+                 -- v2.1.3 (I6): new exempt-from-requeue statuses are
+                 -- working / blocked / waiting_user. Legacy 'busy' / 'away'
+                 -- are kept for belt-and-suspenders (post-migration they
+                 -- should not exist, but an older peer process on the same
+                 -- DB could still write them).
+                 agent_status NOT IN ('working','blocked','waiting_user','busy','away')
                  OR busy_expires_at IS NULL
                  OR busy_expires_at < ?
                )

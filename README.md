@@ -224,6 +224,8 @@ Three transport modes:
 
 All transports share the same SQLite database. Stdio agents and HTTP clients see the same world.
 
+**Process-boundary reminder (v2.1.3):** stdio MCP clients and the HTTP daemon are **separate processes**. Each Claude Code terminal with `"type":"stdio"` in `~/.claude.json` spawns its own `node dist/index.js` child. Restarting the `:3777` HTTP daemon never affects stdio clients — their own child processes are untouched. Operator `/mcp` reconnect is only needed after restart for `"type":"http"` MCP clients pointed at the daemon URL. See [`docs/transport-architecture.md`](./docs/transport-architecture.md) for the full topology + post-restart operator checklist.
+
 ### n8n integration example
 
 Trigger a Claude Code agent from an n8n workflow:

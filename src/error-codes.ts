@@ -33,6 +33,13 @@ export const ERROR_CODES = {
   CAP_DENIED: "CAP_DENIED",
   /** spawn_agent / register_agent where a row with that name already exists. */
   NAME_COLLISION: "NAME_COLLISION",
+  /** v2.1.3 — register_agent blocked because an active row with this name is
+   * held by a different session and the caller's token does not match. */
+  NAME_COLLISION_ACTIVE: "NAME_COLLISION_ACTIVE",
+  /** v2.1.3 — send_message from an agent whose row no longer exists (e.g.
+   * deleted by relay recover / unregister_agent between dispatcher auth and
+   * handler write). Caller should re-register before retrying. */
+  SENDER_NOT_REGISTERED: "SENDER_NOT_REGISTERED",
 
   // Resource lookup ---------------------------------------------------------
   /** Task / message / channel / agent / webhook not found. */

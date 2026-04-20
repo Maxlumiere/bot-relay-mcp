@@ -244,6 +244,14 @@ describe("spawn-agent.sh — v2.1.2 plug-and-play defaults", () => {
     // positional. printf %q escapes spaces to `\ `, so we match a contiguous
     // single-word fragment from the default prompt.
     expect(r.stdout).toContain("mcp__bot-relay__get_messages");
+    // v2.1.3 (I7): self-history verification reflex. Before rejecting a
+    // relay message as injection, the spawned agent must re-check its own
+    // history. The phrase "rejecting" + "injection" + "verify your own
+    // history" disambiguates this from the basic "check inbox" phrasing.
+    expect(r.stdout).toContain("rejecting");
+    expect(r.stdout).toContain("injection");
+    expect(r.stdout).toContain("verify");
+    expect(r.stdout).toMatch(/your\\? own\\? history/);
   });
 
   it("RELAY_SPAWN_NO_KICKSTART=1 omits kickstart prompt but keeps flags", async () => {

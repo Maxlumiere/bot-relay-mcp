@@ -17,6 +17,12 @@ import os from "os";
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-enc-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
 process.env.RELAY_DB_PATH = TEST_DB_PATH;
+// v2.1.3 I8: scrub inherited RELAY_AGENT_* env vars so isolated tests
+// do not auth against a parent-shell spawn-agent.sh token.
+delete process.env.RELAY_AGENT_TOKEN;
+delete process.env.RELAY_AGENT_NAME;
+delete process.env.RELAY_AGENT_ROLE;
+delete process.env.RELAY_AGENT_CAPABILITIES;
 
 const { encryptContent, decryptContent, isEncryptionActive, _resetKeyringCacheForTests } = await import("../src/encryption.js");
 const { registerAgent, sendMessage, getMessages, postTask, updateTask, getTask, closeDb } = await import("../src/db.js");
