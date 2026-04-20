@@ -608,6 +608,15 @@ Full install requirements per platform + manual smoke-test checklists + troubles
 
 **Env-var propagation** is minimal by default (principle of least authority): system essentials + anything prefixed `RELAY_*`. Secrets like `AWS_SECRET_ACCESS_KEY` are NOT passed to spawned agents unless explicitly prefixed.
 
+**Plug-and-play defaults (v2.1.2):** spawned terminals are configured for autonomous work out of the box — they auto-pull mail from their inbox on first turn instead of idling, run with `--permission-mode bypassPermissions` so they don't ask the operator to approve every tool call, get an iTerm2 / session-picker title set to the agent name, and run at `--effort high` to cap token spend (parent terminals doing strategic work may use `xhigh`; spawned children doing mechanical work shouldn't inherit it). Every default has an env override for the rare case the legacy behavior is wanted:
+
+| Default | Env override | Notes |
+|---|---|---|
+| Kickstart prompt sent as positional arg | `RELAY_SPAWN_KICKSTART="custom"` / `RELAY_SPAWN_NO_KICKSTART=1` | The default tells the spawned agent to pull `get_messages` and act on inbox. |
+| `--permission-mode bypassPermissions` | `RELAY_SPAWN_PERMISSION_MODE=<mode>` | Allowlist: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. |
+| `--name <agent>` | `RELAY_SPAWN_DISPLAY_NAME="custom"` | Shows up as the iTerm2 tab + Claude Code session title. |
+| `--effort high` | `RELAY_SPAWN_EFFORT=<level>` | Allowlist: `low`, `medium`, `high`, `xhigh`, `max`. |
+
 ## Layer 2: Managed Agents (v1.10)
 
 Agents that are NOT Claude Code terminals — Python daemons, Node workers, Hermes/Ollama integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 25 MCP tools (v2.1), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
