@@ -54,8 +54,18 @@ export interface SpawnDriver {
    * the new agent. Drivers thread it into buildChildEnv; macOS additionally
    * embeds it as a CLI arg so the shell wrapper can export it into the
    * osascript-spawned window (which does not inherit child_process.spawn env).
+   *
+   * v2.1.4 (I10): optional `briefFilePath` is the absolute path to a durable
+   * task brief the spawned agent should read FIRST. macOS passes it as arg 6
+   * to bin/spawn-agent.sh; Linux/Windows drivers ignore (no KICKSTART wired
+   * on those platforms — documented limitation).
    */
-  buildCommand(input: SpawnAgentInput, ctx: DriverContext, token?: string): SpawnCommand;
+  buildCommand(
+    input: SpawnAgentInput,
+    ctx: DriverContext,
+    token?: string,
+    briefFilePath?: string
+  ): SpawnCommand;
 }
 
 export type SupportedPlatform = "darwin" | "linux" | "win32";

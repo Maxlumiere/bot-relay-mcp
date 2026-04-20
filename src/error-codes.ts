@@ -40,6 +40,14 @@ export const ERROR_CODES = {
    * deleted by relay recover / unregister_agent between dispatcher auth and
    * handler write). Caller should re-register before retrying. */
   SENDER_NOT_REGISTERED: "SENDER_NOT_REGISTERED",
+  /** v2.1.4 (I11) — expand_capabilities called with a new_capabilities list
+   * that would REMOVE one of the agent's existing caps. This tool is additive-
+   * only; operators must unregister + re-register for reductions. */
+  REDUCTION_NOT_ALLOWED: "REDUCTION_NOT_ALLOWED",
+  /** v2.1.4 (I11) — expand_capabilities called with a new_capabilities list
+   * that is a subset of the current caps (no new caps to add). Returned
+   * explicitly so callers notice and don't silently churn. */
+  NO_OP_EXPANSION: "NO_OP_EXPANSION",
 
   // Resource lookup ---------------------------------------------------------
   /** Task / message / channel / agent / webhook not found. */

@@ -33,14 +33,26 @@ export const macosDriver: SpawnDriver = {
     return true;
   },
 
-  buildCommand(input: SpawnAgentInput, _ctx: DriverContext, token?: string): SpawnCommand {
+  buildCommand(
+    input: SpawnAgentInput,
+    _ctx: DriverContext,
+    token?: string,
+    briefFilePath?: string
+  ): SpawnCommand {
     const capsStr = input.capabilities.join(",");
     const cwd = normalizeCwd(input.cwd || process.env.HOME || "/", "darwin");
     // v2.1 Phase 4j: only pass the token through the CLI-arg channel when its
     // shape is valid. The shell script re-validates, but dropping bad tokens
     // here keeps the argv clean + the script's CLI signature stable.
+    //
+    // v2.1.4 (I10): brief_file_path is arg 6. If present, we must also push
+    // arg 5 (token) even when invalid-shape — use empty string as placeholder
+    // so positional ordering stays stable in bin/spawn-agent.sh.
     const args = [input.name, input.role, capsStr, cwd];
-    if (isValidTokenShape(token)) args.push(token);
+    const hasValidToken = isValidTokenShape(token);
+    const hasBrief = typeof briefFilePath === "string" && briefFilePath.length > 0;
+    if (hasValidToken || hasBrief) args.push(hasValidToken ? (token as string) : "");
+    if (hasBrief) args.push(briefFilePath as string);
     return {
       exec: SPAWN_SCRIPT,
       args,

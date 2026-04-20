@@ -15,6 +15,7 @@
  *   3. RELAY_TERMINAL_APP allowlist gating.
  */
 import { randomBytes } from "crypto";
+import fs from "fs";
 import type { SupportedPlatform } from "./types.js";
 
 /**
@@ -163,6 +164,59 @@ export function normalizeCwd(rawCwd: string, platform: SupportedPlatform): strin
 const TOKEN_SHAPE_RE = /^[A-Za-z0-9_=.-]{8,128}$/;
 export function isValidTokenShape(raw: string | undefined | null): raw is string {
   return typeof raw === "string" && TOKEN_SHAPE_RE.test(raw);
+}
+
+/**
+ * v2.1.4 (I10): validate a brief_file_path input — absolute, allowlist-matched,
+ * exists, readable, <=10KB. Zod has already done the regex+char check at the
+ * MCP boundary; this helper adds the filesystem-side invariants that cannot
+ * be expressed in a Zod schema.
+ *
+ * Throws typed Error on any failure. Returns the canonical (as-passed) path
+ * string on success — we deliberately do NOT realpath-resolve here; the
+ * literal string is what spawn-agent.sh will embed into the KICKSTART
+ * prompt, and keeping that equal to what the caller typed is the right UX.
+ *
+ * Size cap: 10240 bytes. Briefs larger than that should live in a repo
+ * path the agent reads with its own Read tool at session start; 10KB is
+ * enough for task scope + key constraints.
+ */
+export const BRIEF_FILE_MAX_BYTES = 10240;
+
+export function validateBriefPath(raw: string): { path: string } {
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new Error("brief_file_path must be a non-empty string");
+  }
+  if (!raw.startsWith("/")) {
+    throw new Error(`brief_file_path must be an absolute path (starts with /); got "${raw}"`);
+  }
+  // Allowlist — defense-in-depth even though Zod already checked.
+  if (!/^\/[A-Za-z0-9_./ -]+$/.test(raw)) {
+    throw new Error(
+      `brief_file_path contains characters outside the allowlist [A-Za-z0-9_./ -]: "${raw}"`
+    );
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(raw);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`brief_file_path does not exist or is not accessible: "${raw}" (${msg})`);
+  }
+  if (!stat.isFile()) {
+    throw new Error(`brief_file_path is not a regular file: "${raw}"`);
+  }
+  if (stat.size > BRIEF_FILE_MAX_BYTES) {
+    throw new Error(
+      `brief_file_path exceeds max size ${BRIEF_FILE_MAX_BYTES} bytes (got ${stat.size}): "${raw}"`
+    );
+  }
+  try {
+    fs.accessSync(raw, fs.constants.R_OK);
+  } catch {
+    throw new Error(`brief_file_path is not readable: "${raw}"`);
+  }
+  return { path: raw };
 }
 
 export function buildChildEnv(

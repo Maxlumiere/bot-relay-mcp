@@ -1298,6 +1298,75 @@ export function markAgentOffline(
 }
 
 /**
+ * v2.1.4 (I11) — sanctioned additive cap expansion.
+ *
+ * Rules enforced here (belt + handler-layer suspenders):
+ *   1. Agent row must exist. Missing → throws "NOT_FOUND" (handler maps).
+ *   2. `newCapabilities` must be a SUPERSET of the current caps. Any cap in
+ *      the current set missing from the request is a reduction attempt →
+ *      throws "REDUCTION_NOT_ALLOWED".
+ *   3. If the diff (new \ current) is empty → throws "NO_OP_EXPANSION".
+ *   4. Otherwise: single transaction writes the union to agents.capabilities
+ *      (JSON column) AND inserts the missing caps into agent_capabilities.
+ *
+ * Why both columns: `agents.capabilities` is the legacy JSON surface read by
+ * the registerAgent + discover paths. `agent_capabilities` is the v2.0-normalized
+ * sidecar used by post_task_auto routing. Both must stay consistent — same
+ * two-column discipline registerAgent uses at bootstrap.
+ *
+ * No CAS on the JSON column. Concurrent expand_capabilities on the same row
+ * is vanishingly rare (the caller must hold the agent's own token) and the
+ * worst-case outcome of a race is "one of the two concurrent expansions gets
+ * re-applied"; the result is still a superset of the starting set.
+ *
+ * Throws typed string errors (matching ERROR_CODES) so the handler can map
+ * them to structured responses.
+ */
+export function expandAgentCapabilities(
+  name: string,
+  newCapabilities: string[]
+): { added: string[]; current: string[] } {
+  const db = getDb();
+  const row = db.prepare("SELECT capabilities FROM agents WHERE name = ?").get(name) as
+    | { capabilities: string }
+    | undefined;
+  if (!row) {
+    throw new Error("NOT_FOUND");
+  }
+  let currentCaps: string[];
+  try {
+    currentCaps = JSON.parse(row.capabilities) as string[];
+  } catch {
+    currentCaps = [];
+  }
+  const currentSet = new Set(currentCaps);
+  const requestedSet = new Set(newCapabilities);
+  // Reduction check: every current cap must appear in the request.
+  for (const c of currentSet) {
+    if (!requestedSet.has(c)) {
+      throw new Error("REDUCTION_NOT_ALLOWED");
+    }
+  }
+  const added = newCapabilities.filter((c) => !currentSet.has(c));
+  if (added.length === 0) {
+    throw new Error("NO_OP_EXPANSION");
+  }
+  const unionCaps = Array.from(new Set([...currentCaps, ...newCapabilities]));
+  const unionJson = JSON.stringify(unionCaps);
+  const tx = db.transaction(() => {
+    db.prepare("UPDATE agents SET capabilities = ? WHERE name = ?").run(unionJson, name);
+    const insert = db.prepare(
+      "INSERT OR IGNORE INTO agent_capabilities (agent_name, capability) VALUES (?, ?)"
+    );
+    for (const cap of added) {
+      insert.run(name, cap);
+    }
+  });
+  tx();
+  return { added, current: unionCaps };
+}
+
+/**
  * Register (or re-register) an agent.
  *
  * v1.7 behavior:
@@ -1913,6 +1982,44 @@ export function touchAgent(name: string): void {
   // actions on that task (accept, heartbeat, complete/reject/cancel on the
   // same row). An agent cannot keep an abandoned task alive by doing unrelated
   // work — the lease is a per-task liveness signal, not a per-agent one.
+}
+
+/**
+ * v2.1.4 (I12): read-only query for `get_standup`. Returns all messages whose
+ * `created_at >= sinceIso`, newest first, decrypted. Unlike `getMessages` this
+ * does NOT touch the read_by_session column — standup is observation, not
+ * consumption.
+ */
+export function getMessagesInWindow(sinceIso: string, limit: number = 1000): MessageRecord[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      "SELECT * FROM messages WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?"
+    )
+    .all(sinceIso, limit) as MessageRecord[];
+  return rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content }));
+}
+
+/**
+ * v2.1.4 (I12): read-only query for `get_standup`. Returns all tasks whose
+ * `updated_at >= sinceIso` OR whose status is still active (queued / posted /
+ * accepted). The standup reports completed_in_window separately from
+ * queued/blocked, so we pull a superset and let the caller partition.
+ * Descriptions + results decrypted at read.
+ */
+export function getTasksInWindow(sinceIso: string, limit: number = 1000): TaskRecord[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      "SELECT * FROM tasks WHERE updated_at >= ? OR status IN ('queued', 'posted', 'accepted') " +
+        "ORDER BY updated_at DESC LIMIT ?"
+    )
+    .all(sinceIso, limit) as TaskRecord[];
+  return rows.map((r) => ({
+    ...r,
+    description: decryptContent(r.description) ?? r.description,
+    result: r.result ? decryptContent(r.result) ?? r.result : null,
+  }));
 }
 
 export function getAgents(role?: string): AgentWithStatus[] {

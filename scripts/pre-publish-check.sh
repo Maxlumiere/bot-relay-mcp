@@ -113,6 +113,7 @@ sanctioned_helper_guard() {
     echo "  - applyAuthStateTransition(name, ...)  — CAS UPDATE on auth_state + related fields" >&2
     echo "  - updateAgentMetadata(name, fields)    — UPDATE last_seen / agent_status / busy_expires_at" >&2
     echo "  - markAgentOffline(name, sessionId)    — CAS offline transition on stdio SIGINT/SIGTERM (v2.1.3)" >&2
+    echo "  - expandAgentCapabilities(name, caps)  — additive cap expansion (v2.1.4)" >&2
     echo "" >&2
     echo "If you genuinely need a one-off, append '// ALLOWLIST: <reason>' to the line." >&2
     return 1

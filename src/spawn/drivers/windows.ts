@@ -54,7 +54,17 @@ export const windowsDriver: SpawnDriver = {
     return pickSubDriver(ctx) !== null;
   },
 
-  buildCommand(input: SpawnAgentInput, ctx: DriverContext, token?: string): SpawnCommand {
+  buildCommand(
+    input: SpawnAgentInput,
+    ctx: DriverContext,
+    token?: string,
+    _briefFilePath?: string
+  ): SpawnCommand {
+    // v2.1.4 (I10): briefFilePath is accepted for signature parity but not
+    // wired. Windows drivers (wt / powershell / cmd) do not inject a KICKSTART
+    // prompt today — they just launch claude. Same v2.2 cross-platform
+    // harmonization track as the Linux driver.
+    void _briefFilePath;
     const sub = pickSubDriver(ctx);
     if (!sub) {
       throw new Error(

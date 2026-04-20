@@ -94,7 +94,8 @@ export function buildSpawnCommand(
   input: SpawnAgentInput,
   token?: string,
   ctx?: DriverContext,
-  platformTag: SupportedPlatform | NodeJS.Platform = process.platform
+  platformTag: SupportedPlatform | NodeJS.Platform = process.platform,
+  briefFilePath?: string
 ): SpawnCommand {
   const platform = platformTag as SupportedPlatform;
   const effectiveCtx = ctx ?? defaultDriverContext(platform);
@@ -109,9 +110,9 @@ export function buildSpawnCommand(
     // so the caller sees the exact "no emulator found" / "binary missing" text.
     // canHandle returning false + buildCommand throwing is intentional — the
     // driver knows its fallback chain best.
-    return driver.buildCommand(input, effectiveCtx, token);
+    return driver.buildCommand(input, effectiveCtx, token, briefFilePath);
   }
-  return driver.buildCommand(input, effectiveCtx, token);
+  return driver.buildCommand(input, effectiveCtx, token, briefFilePath);
 }
 
 /**
@@ -124,11 +125,12 @@ export function spawnAgent(
   input: SpawnAgentInput,
   token?: string,
   ctx?: DriverContext,
-  platformTag: SupportedPlatform | NodeJS.Platform = process.platform
+  platformTag: SupportedPlatform | NodeJS.Platform = process.platform,
+  briefFilePath?: string
 ): SpawnDispatchResult {
   let cmd: SpawnCommand;
   try {
-    cmd = buildSpawnCommand(input, token, ctx, platformTag);
+    cmd = buildSpawnCommand(input, token, ctx, platformTag, briefFilePath);
   } catch (err) {
     return {
       ok: false,

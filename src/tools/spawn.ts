@@ -8,6 +8,7 @@ import { fireWebhooks } from "../webhooks.js";
 import { log } from "../logger.js";
 import type { SpawnAgentInput } from "../types.js";
 import { spawnAgent } from "../spawn/dispatcher.js";
+import { validateBriefPath } from "../spawn/validation.js";
 import { ERROR_CODES } from "../error-codes.js";
 
 /**
@@ -25,6 +26,37 @@ import { ERROR_CODES } from "../error-codes.js";
  * operator must unregister the existing one first.
  */
 export function handleSpawnAgent(input: SpawnAgentInput) {
+  // v2.1.4 (I10): validate brief_file_path BEFORE any side effect. Zod has
+  // already done the regex/char check; this adds the filesystem-side
+  // invariants (exists, readable, size cap) that can't live in the schema.
+  // Validation failure returns a structured VALIDATION error and stops here
+  // — no pre-register, no driver dispatch.
+  let validatedBriefPath: string | undefined;
+  if (typeof input.brief_file_path === "string" && input.brief_file_path.length > 0) {
+    try {
+      validatedBriefPath = validateBriefPath(input.brief_file_path).path;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error: msg,
+                error_code: ERROR_CODES.VALIDATION,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
   // v2.1 Phase 4j (1/3): name-collision check before any side effect.
   const existing = getAgentAuthData(input.name);
   if (existing) {
@@ -92,7 +124,14 @@ export function handleSpawnAgent(input: SpawnAgentInput) {
   // v1.9: dispatch to the platform-appropriate driver. macOS still shells
   // out to bin/spawn-agent.sh (preserving v1.6.x hardening). Linux and
   // Windows use native TS drivers. v2.1 Phase 4j: token flows through.
-  const result = spawnAgent(input, plaintextToken ?? undefined);
+  // v2.1.4 (I10): validatedBriefPath also flows through (macOS only today).
+  const result = spawnAgent(
+    input,
+    plaintextToken ?? undefined,
+    undefined,
+    process.platform,
+    validatedBriefPath
+  );
 
   if (!result.ok) {
     // v2.1 Phase 4j (3/3): rollback the pre-register — don't leak phantoms.
@@ -157,6 +196,7 @@ export function handleSpawnAgent(input: SpawnAgentInput) {
               : null,
             note: `Spawning agent "${input.name}" (role: ${input.role}) via ${result.driverName} on ${result.platform}. Pre-registered parent-side with token passthrough.`,
             has_initial_message: !!input.initial_message,
+            brief_file_path: validatedBriefPath ?? null,
           },
           null,
           2

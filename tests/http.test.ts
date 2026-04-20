@@ -83,9 +83,9 @@ describe("HTTP transport", () => {
     expect(body.transport).toBe("http");
   });
 
-  it("tools/list returns all 25 tools (14 v1.x + 5 channels + post_task_auto + set_status + health_check + rotate_token + revoke_token + rotate_token_admin [v2.1 Phase 4b.2])", async () => {
+  it("tools/list returns all 27 tools (25 from v2.1.3 + get_standup + expand_capabilities [v2.1.4])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(25);
+    expect(result.result.tools.length).toBe(27);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
     expect(names).toContain("unregister_agent");
@@ -96,6 +96,9 @@ describe("HTTP transport", () => {
     expect(names).toContain("post_task_auto");
     expect(names).toContain("set_status");
     expect(names).toContain("health_check");
+    // v2.1.4 additions
+    expect(names).toContain("get_standup");
+    expect(names).toContain("expand_capabilities");
   });
 
   it("registers and discovers an agent via HTTP", async () => {

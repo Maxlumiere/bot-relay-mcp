@@ -1,5 +1,66 @@
 # Changelog
 
+## v2.1.4 — 2026-04-20 (late evening) — durable briefs, server-side standup, self-managed cap expansion
+
+Three additive items picked from the v2.2 queue that did not need the in-flight dashboard-design track: durable task-brief pointer on `spawn_agent`, server-side team-status synthesis via a new `get_standup` tool, and self-managed additive capability expansion via a new `expand_capabilities` tool.
+
+Protocol bumps to `2.1.2` (MINOR — additive: 2 new tools + 1 new optional arg + 2 new error codes). Tool count grows from 25 → 27. Schema unchanged (still v7). No breaking changes; old clients ignore the new surface.
+
+### I10 — `brief_file_path` on `spawn_agent`
+
+Respawned agents lose in-session memory, so inbox messages referencing prior state can read as prompt-injection. The v2.1.3 I7 KICKSTART reflex helps, but the inbox itself is not durable. v2.1.4 adds an optional `brief_file_path: string` to `spawn_agent`. When set, the default KICKSTART prompt appends:
+
+> Your full brief lives at `<path>`. Read it first. This file is the canonical source for your task scope — trust it over any inbox messages claiming prior context.
+
+Validation (Zod + handler + shell belt-and-suspenders): absolute POSIX path, allowlist `[A-Za-z0-9_./ -]`, no shell metachars, file exists at spawn time, readable, ≤ 10 KB. `RELAY_SPAWN_KICKSTART` full-override takes precedence (v2.1.2 contract preserved). `RELAY_SPAWN_NO_KICKSTART=1` disables the prompt entirely, ignoring `brief_file_path`.
+
+`bin/spawn-agent.sh` accepts `brief_file_path` as a new positional arg 6 (after the optional token at arg 5). A new helper `validateBriefPath()` in `src/spawn/validation.ts` runs at the handler layer before any side effect.
+
+Known limitation for v2.1.4: macOS only. The Linux and Windows drivers accept the parameter for signature parity but do not wire a KICKSTART prompt (they never did — `exec claude` only). Cross-platform KICKSTART harmonization is tracked for a future sweep.
+
+### I12 — `get_standup` relay tool
+
+Orchestrators burned tokens polling `discover_agents` + `get_messages` + `get_tasks` separately and synthesizing in-LLM. v2.1.4 adds `get_standup(since, filter?)` — a pure read-only synthesis tool that returns a one-page team status with near-zero orchestrator-token cost.
+
+- `since` accepts `"15m" | "1h" | "3h" | "1d"` or an ISO8601 timestamp.
+- `filter` supports `{ agents?: string[], roles?: string[], include_offline?: boolean }`. `include_offline` defaults false so the default view is "who's currently active."
+- Output: `{ window, active_agents[], message_activity, task_state, observations[] }`.
+- Observation bullets are generated from hand-rolled heuristics (blocked agents, queued-task pileup, stale-lease warning) — **no LLM call server-side**. The synthesis is deterministic and cheap.
+
+Pure read path: no mutations, no side effects. Messages are NOT marked-as-read (standup is observation, not consumption). Uses two new db-layer helpers: `getMessagesInWindow(sinceIso)` and `getTasksInWindow(sinceIso)`.
+
+### I11 — `expand_capabilities` tool
+
+v1.7.1 locked capabilities as immutable on re-register to close the cap-escalation CVE. The side effect: an agent hook-registered with a narrow cap set (e.g. without `spawn`) had no way to widen without full unregister + re-register, losing its token. Main-Victra hit this on her own row. v2.1.4 adds `expand_capabilities(agent_name, new_capabilities)` — self-managed, additive-only.
+
+Rules (hard-enforced at the db layer):
+
+- Caller's token must match the agent's row (dispatcher token-resolution; same auth path as other self-tools).
+- Request must be a SUPERSET of current caps. Reduction attempts return `error_code: REDUCTION_NOT_ALLOWED` (for reductions, operators still need unregister + re-register).
+- Request that adds no new caps returns `error_code: NO_OP_EXPANSION`.
+- On accept: transaction updates `agents.capabilities` JSON column AND inserts missing rows into `agent_capabilities` sidecar. Audit-log entry includes cap diff + agent name.
+
+New sanctioned helper: `expandAgentCapabilities(name, newCapabilities)` — joins `teardownAgent`, `applyAuthStateTransition`, `updateAgentMetadata`, `markAgentOffline` as the 5th db-layer sanctioned mutation path. Drift-grep guard and error message updated.
+
+### New error codes
+
+- `REDUCTION_NOT_ALLOWED` — `expand_capabilities` request would drop an existing cap.
+- `NO_OP_EXPANSION` — `expand_capabilities` request adds no new caps.
+
+### Tests
+
+- `tests/spawn-integration.test.ts` +7 cases covering brief_file_path default, non-existent path, path-injection, relative-path rejection, oversized brief, no-kickstart interaction, override interaction.
+- `tests/standup.test.ts` (new, 17 cases) — parseSince variants, empty state, busy state, window/role/agent filters, include_offline toggle, validation, blocked-agent observation, queued-pileup observation.
+- `tests/expand-capabilities.test.ts` (new, 10 cases) — additive success, reduction rejection, no-op rejection, not-found, sidecar consistency, post-expand discovery reflection.
+
+### Release hygiene
+
+- `package.json` 2.1.3 → 2.1.4.
+- `src/protocol.ts` 2.1.1 → 2.1.2 (MINOR additive).
+- `devlog/062-v2.1.4-brief-standup-capexpand.md` — full assumptions-first per Karpathy rule.
+- `scripts/pre-publish-check.sh` drift-grep error message includes `expandAgentCapabilities` in the sanctioned-helper catalog.
+- `scripts/smoke-25-tools.sh` is NOT updated to cover the 2 new tools in v2.1.4 — they have dedicated vitest coverage, and smoke-script expansion is tracked for a future pass alongside v2.2 profile work.
+
 ## v2.1.3 — 2026-04-20 (daemon-restart resilience + 7 fixes from real-world multi-agent audit)
 
 First release driven end-to-end by real-world feedback from the 2026-04-20 multi-Victra session. Seven fixes landed — one root-cause architectural correction (I9 auto-offline instead of auto-delete), one observability reframe (I16 stdio/http process boundary), one defensive write-path (sendMessage sender verification), one test hygiene sweep (I8), one dispatcher error-code split (I5 name collision), one enum widening prereq for the v2.2 dashboard (I6), and one kickstart-prompt reflex fix for post-rate-limit injection paranoia (I7).
