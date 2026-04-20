@@ -536,14 +536,16 @@ BACKUP_PATH="$SMOKE_TMP/backup.tar.gz"
 if OUT=$("$RELAY_BIN" backup --output "$BACKUP_PATH" 2>&1); then
   if [ -s "$BACKUP_PATH" ]; then
     # tarball must contain manifest.json + relay.db at top level.
-    if tar -tzf "$BACKUP_PATH" 2>/dev/null | grep -q 'manifest.json' \
-       && tar -tzf "$BACKUP_PATH" 2>/dev/null | grep -q 'relay.db'; then
+    TAR_ENTRIES=$(tar -tzf "$BACKUP_PATH" 2>&1 | tr '\n' ',')
+    if printf '%s' "$TAR_ENTRIES" | grep -q 'manifest.json' \
+       && printf '%s' "$TAR_ENTRIES" | grep -q 'relay.db'; then
       record pass "cli:backup" "tarball present w/ manifest.json + relay.db"
     else
-      record fail "cli:backup" "tarball missing manifest or relay.db"
+      # v2.1 Phase 8 (CI-debug): dump what tar -tzf actually returned + what relay stdout was
+      record fail "cli:backup" "tarball missing manifest or relay.db — tar entries: [$TAR_ENTRIES] — relay stdout: [$OUT]"
     fi
   else
-    record fail "cli:backup" "output file empty/missing"
+    record fail "cli:backup" "output file empty/missing — relay stdout: [$OUT]"
   fi
 else
   record fail "cli:backup" "non-zero exit: $OUT"
