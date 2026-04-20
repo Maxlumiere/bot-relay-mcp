@@ -209,3 +209,106 @@ describe("spawn-agent.sh integration — attack payloads blocked", () => {
     expect(r.stdout).toContain("CMD=");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v2.1.2: spawn-agent.sh plug-and-play defaults
+// ---------------------------------------------------------------------------
+// Helper that runs the spawn script with an optional env override map on top
+// of the standard dry-run env. Mirrors runSpawn but lets us flip the new
+// RELAY_SPAWN_* knobs without sharing state across tests.
+function runSpawnWithEnv(
+  args: string[],
+  env: Record<string, string>,
+): Promise<SpawnResult> {
+  return new Promise((resolve, reject) => {
+    const child = cp.spawn(SCRIPT, args, {
+      env: { ...process.env, RELAY_SPAWN_DRY_RUN: "1", ...env },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.on("exit", (code) => resolve({ code, stdout, stderr }));
+    child.on("error", reject);
+  });
+}
+
+describe("spawn-agent.sh — v2.1.2 plug-and-play defaults", () => {
+  it("default invocation includes kickstart + bypassPermissions + --name + --effort high", async () => {
+    const r = await runSpawn(["builder-1", "builder", "", "/tmp"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("--permission-mode bypassPermissions");
+    expect(r.stdout).toContain("--effort high");
+    expect(r.stdout).toContain("--name builder-1");
+    // Default kickstart phrase must reach the claude invocation as a
+    // positional. printf %q escapes spaces to `\ `, so we match a contiguous
+    // single-word fragment from the default prompt.
+    expect(r.stdout).toContain("mcp__bot-relay__get_messages");
+  });
+
+  it("RELAY_SPAWN_NO_KICKSTART=1 omits kickstart prompt but keeps flags", async () => {
+    const r = await runSpawnWithEnv(["builder-1", "builder", "", "/tmp"], {
+      RELAY_SPAWN_NO_KICKSTART: "1",
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).not.toContain("mcp__bot-relay__get_messages");
+    expect(r.stdout).toContain("--permission-mode bypassPermissions");
+    expect(r.stdout).toContain("--effort high");
+    expect(r.stdout).toContain("--name builder-1");
+  });
+
+  it("RELAY_SPAWN_KICKSTART overrides the default prompt verbatim", async () => {
+    const r = await runSpawnWithEnv(["builder-1", "builder", "", "/tmp"], {
+      RELAY_SPAWN_KICKSTART: "doSomethingSpecific",
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).not.toContain("mcp__bot-relay__get_messages");
+    expect(r.stdout).toContain("doSomethingSpecific");
+  });
+
+  it("RELAY_SPAWN_PERMISSION_MODE=default restores interactive ask-everything", async () => {
+    const r = await runSpawnWithEnv(["builder-1", "builder", "", "/tmp"], {
+      RELAY_SPAWN_PERMISSION_MODE: "default",
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("--permission-mode default");
+    expect(r.stdout).not.toContain("--permission-mode bypassPermissions");
+  });
+
+  it("invalid RELAY_SPAWN_PERMISSION_MODE rejects with exit 2", async () => {
+    const r = await runSpawnWithEnv(["builder-1", "builder", "", "/tmp"], {
+      RELAY_SPAWN_PERMISSION_MODE: "evilmode; rm -rf /",
+    });
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("invalid RELAY_SPAWN_PERMISSION_MODE");
+    // Attack payload must not have leaked into the assembled command.
+    expect(r.stdout).not.toContain("rm -rf");
+  });
+
+  it("RELAY_SPAWN_DISPLAY_NAME overrides the --name value", async () => {
+    const r = await runSpawnWithEnv(["builder-1", "builder", "", "/tmp"], {
+      RELAY_SPAWN_DISPLAY_NAME: "medical-phase3",
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("--name medical-phase3");
+    expect(r.stdout).not.toContain("--name builder-1");
+  });
+
+  it("RELAY_SPAWN_EFFORT=medium passes --effort medium", async () => {
+    const r = await runSpawnWithEnv(["builder-1", "builder", "", "/tmp"], {
+      RELAY_SPAWN_EFFORT: "medium",
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("--effort medium");
+    expect(r.stdout).not.toContain("--effort high");
+  });
+
+  it("invalid RELAY_SPAWN_EFFORT rejects with exit 2", async () => {
+    const r = await runSpawnWithEnv(["builder-1", "builder", "", "/tmp"], {
+      RELAY_SPAWN_EFFORT: "ultraturbo; rm -rf /",
+    });
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("invalid RELAY_SPAWN_EFFORT");
+    expect(r.stdout).not.toContain("rm -rf");
+  });
+});

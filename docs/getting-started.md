@@ -113,6 +113,8 @@ From your primary terminal:
 
 A new iTerm2 window opens, already registered, already carrying the instruction. It gets to work without you touching it.
 
+As of v2.1.2, the spawned terminal is plug-and-play out of the box: it auto-pulls its inbox on the first turn (no manual "check your messages" prompt needed), runs with `--permission-mode bypassPermissions` so it doesn't pause for approval on every tool call, has its iTerm2 / session-picker title set to the agent's name, and runs at `--effort high` to cap token spend on mechanical work. Override any default per-spawn by setting `RELAY_SPAWN_KICKSTART`, `RELAY_SPAWN_NO_KICKSTART=1`, `RELAY_SPAWN_PERMISSION_MODE`, `RELAY_SPAWN_DISPLAY_NAME`, or `RELAY_SPAWN_EFFORT` in the parent terminal's environment.
+
 ## Step 7 — Dashboard
 
 Start the relay in HTTP mode:

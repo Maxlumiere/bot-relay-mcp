@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.1.2 — 2026-04-20 (spawn-agent.sh plug-and-play fixes)
+
+Four `bin/spawn-agent.sh`-only fixes surfaced during the first real-world multi-agent dispatch session. No `src/` changes, no schema change, no protocol change, no MCP tool surface change. Existing 670 tests still pass; `tests/spawn-integration.test.ts` grows by 8 tests covering the new defaults, env overrides, and rejection of injected payloads.
+
+The intent in every fix: a relay-spawned terminal exists to do work autonomously, so its defaults should match that intent out of the box. The previous defaults assumed a human at the keyboard.
+
+- **Auto-kickstart prompt** — spawned terminals now receive a default positional prompt (`Check your relay inbox via mcp__bot-relay__get_messages …`) so they auto-pull pending mail and act on it instead of idling at the `>` prompt. Override per-spawn with `RELAY_SPAWN_KICKSTART="custom prompt"`; disable entirely with `RELAY_SPAWN_NO_KICKSTART=1`.
+- **`--permission-mode bypassPermissions` by default** — spawned agents no longer ask the operator to approve every Bash, Edit, or MCP call. Override via `RELAY_SPAWN_PERMISSION_MODE=<mode>` (allowlisted: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`). Setting `default` restores the interactive ask-everything behavior.
+- **`--name <agent>` by default** — spawned terminals' iTerm2 / Terminal.app titles + Claude Code session-picker labels now show the agent name, so multiple parallel spawn windows are visually distinguishable. Override via `RELAY_SPAWN_DISPLAY_NAME="custom title"`.
+- **`--effort high` by default** — children doing mechanical drafting / scoping / research no longer inherit the parent terminal's `xhigh` (or whatever the operator's global default is) and burn tokens unnecessarily. Override via `RELAY_SPAWN_EFFORT=<level>` (allowlisted: `low`, `medium`, `high`, `xhigh`, `max`).
+
+All five new env vars are validated against an allowlist before reaching the assembled command — invalid values exit 2 with a clear error and never embed in the AppleScript-escaped command. Both rejection paths have adversarial test coverage.
+
+No runtime behavior changes for callers that don't spawn agents. Live `:3777` daemon `/health` still reports `{"protocol_version":"2.1.0"}`; only `version` bumps to `2.1.2`.
+
 ## v2.1.1 — 2026-04-20 (CI portability patches, no functional changes)
 
 Test-only + CI-plumbing fixes that surfaced when v2.1.0 published to public GitHub and exercised the Ubuntu CI matrix (Node 18 / 20 / 22) for the first time. Zero runtime behavior changes — the relay, protocol, auth, encryption, and MCP contract are identical to v2.1.0.
