@@ -1,5 +1,74 @@
 # Changelog
 
+## v2.1.7 — 2026-04-21 — security hardening (external review: Steph + Codex)
+
+Focused security patch from external review. Steph (Maxime's wife's primary AI) surfaced four findings during a LAN-deployment review; Codex's follow-up dual-model audit added five more. v2.1.7 ships fixes for the HIGH and MEDIUM items; one MEDIUM (webhook DNS fast-flip TOCTOU) is deferred to v2.1.8, and two LOW items are documented in SECURITY.md. No tool surface change — protocol unchanged at `2.1.3`.
+
+### HIGH — IPv6 prefix bypass → real CIDR matching (Codex)
+
+Pre-v2.1.7 `src/url-safety.ts` classified link-local via `startsWith('fe80:')`, missing `fe90::`, `fea0::`, and `feb0::` (all in `fe80::/10`). Codex demonstrated a monkey-patched `dns.lookup` returning `fe90::1` passed webhook validation and fired a request at a link-local address on the operator's network segment. Replaced every string-prefix check with `ipInCidr()` calls against real IPv6 CIDR boundaries. Blocked ranges now: `::1/128`, `::/128`, `fe80::/10`, `fc00::/7`, `ff00::/8`, `::ffff:0:0/96`, `64:ff9b::/96`, `2001::/23`, `2001:db8::/32`.
+
+### HIGH — Dashboard secret layering (Codex)
+
+`authMiddleware` ran before `dashboardAuthCheck` and enforced `RELAY_HTTP_SECRET` unconditionally, so operators who set `RELAY_DASHBOARD_SECRET` alone (expecting dashboard-only-secret isolation) silently got rejected with 401. The enumerated dashboard routes (`/`, `/dashboard`, `/api/snapshot`, `/api/keyring`) now bypass `authMiddleware`, letting `dashboardAuthCheck` apply its own secret independently. `/mcp` is explicitly NOT in the bypass list — its HTTP-secret gate stays intact.
+
+### HIGH — `/mcp` Host-header check (Steph)
+
+`dashboardHostCheck` was wired per-route on dashboard paths only, leaving `/mcp` accepting any Host header. Renamed `dashboardHostCheck` → `httpHostCheck` and applied it globally via `app.use(...)` before `authMiddleware`, so DNS-rebinding attempts get a 421 Misdirected Request regardless of HTTP-secret state (and 421 is distinct from 401/403 so browsers/curl don't retry auth handshakes). New canonical env var `RELAY_HTTP_ALLOWED_HOSTS`; legacy `RELAY_DASHBOARD_HOSTS` preserved as a backward-compat alias. Operators can now also supply hostname-only entries (previously required exact `host:port`) — cleaner UX for random-port bind scenarios. `/health` remains exempt.
+
+### MEDIUM — SameSite cookie + CSRF double-submit infra (Steph)
+
+`dashboardAuthCheck` now (re-)issues two cookies on every successful auth:
+
+- `relay_dashboard_auth`: HttpOnly + SameSite=Strict + Path=/ (+ Secure when `RELAY_TLS_ENABLED=1`)
+- `relay_csrf`: SameSite=Strict + Path=/ (NOT HttpOnly — dashboard JS must read it to set the `X-Relay-CSRF` request header)
+
+New middleware `csrfCheck` enforces the double-submit pattern on unsafe methods (POST/PUT/DELETE/PATCH) against `/api/*`: cookie + header must be present AND match under constant-time compare. v2.1.7 ships with no state-changing `/api/*` endpoints — the middleware is infrastructure so v2.2's dashboard endpoints inherit CSRF coverage safe-by-construction. Token derivation: `HMAC-SHA256(dashboard_secret, per-process-random-salt)` — stateless, daemon-restart rotates.
+
+### MEDIUM — Per-IP HTTP rate + concurrent cap (Steph)
+
+Pre-v2.1.7 rate limits bucketed by `agent_name` on the tool-call path; an anonymous flood exhausted Express middleware + JSON-parse CPU before auth fired. New pre-auth middleware `rateLimitCheck`:
+
+- Fixed-window request-rate cap (default **200 req/min per IP**, env `RELAY_HTTP_RATE_LIMIT_PER_MINUTE`)
+- Concurrent in-flight request cap (default **10 per IP**, env `RELAY_HTTP_MAX_CONCURRENT_PER_IP`)
+- Skips `/health` (monitors stay unblocked)
+- 429 Too Many Requests + `Retry-After` header on exceed
+- No new deps — ~40-line custom middleware keyed on the resolved source IP (same `extractSourceIp` path as XFF-aware rate limits)
+
+### LOW — Documentation items
+
+- **Audit preview retention (Steph):** `audit_log.params_summary` retains 40-char plaintext previews for the audit retention window. Documented in SECURITY.md § "Known residual behavior" with operator-side sanitization guidance; server-side regex scrubbing tracked as v2.1.8 candidate.
+- **Keyring reload semantics (Codex):** `RELAY_ENCRYPTION_KEYRING_PATH` contents are cached at first read; updating the file without restarting the daemon does not reload. Documented in SECURITY.md; `RELAY_ENCRYPTION_KEYRING_WATCH=1` reload flag tracked for v2.2.
+
+### DEFERRED to v2.1.8 — webhook DNS fast-flip TOCTOU (Codex)
+
+`validateWebhookUrl()` re-resolves the hostname at fire time, but the subsequent `fetch(url, ...)` re-resolves again at the socket layer. Sub-second-TTL authoritative DNS can flip between the two resolutions. Closing this requires pinning fetch to the validated IP while preserving TLS/SNI on the hostname — Undici per-request dispatcher with `connect.lookup` is the clean mechanism, but introducing a direct `undici` dep + rewriting both webhook fire paths is larger than the v2.1.7 patch envelope. Inline code comment + SECURITY.md note track the residual gap.
+
+### Out of v2.1.7 — shared IP classifier (Codex)
+
+Codex noted URL-safety CIDR logic and HTTP-transport XFF classification are adjacent but separately implemented. Consolidation into a single `src/ip-classifier.ts` module is a v2.2 refactor candidate alongside the `src/db.ts` / `src/server.ts` size reduction work already on the v2.2 roadmap.
+
+### Hall of Fame
+
+External reviewers credited in SECURITY.md:
+
+- **Steph** — LAN-deployment security review (original four findings).
+- **Codex** — dual-model audit (five additional findings including the concrete IPv6 SSRF).
+
+### Tests
+
+- `tests/v2-1-7-security-patch.test.ts` +28 cases across all five shipped items plus regression guards for the Codex `fe90::1` exploit, the `::ffff:127.0.0.1` mapped-form path, and cross-env interaction between `RELAY_HTTP_SECRET` and `RELAY_DASHBOARD_SECRET`.
+- `tests/load-smoke.test.ts` — default `P99_LATENCY_MS` bumped from 500 to 750 to absorb the new middleware stack; env override preserved.
+- 807 default tests all pass (779 prior + 28 new); `--full` gate 10/10 PASS (load-smoke + chaos + cross-version all green).
+
+### Release hygiene
+
+- `package.json` 2.1.6 → 2.1.7.
+- `src/protocol.ts` stays at `2.1.3` (no tool surface change; all items are HTTP-layer hardening + DB-layer helper updates).
+- `devlog/065-v2.1.7-security-patch.md` — assumptions-first per Karpathy rule.
+- `SECURITY.md` v2.1.7 section + Hall of Fame + known residuals.
+- Pre-publish `--full`: PASS 10/10.
+
 ## v2.1.6 — 2026-04-21 — inbox hygiene
 
 Small patch release focused on one recurring operator pain point: when an agent name is reused (operator runs `relay recover` then re-registers, or an agent row survives SIGINT via `markAgentOffline`), the new session's `get_messages(status='all')` surfaces historical mail from prior session lives. ~2 minutes of reasoning burned on every fresh spawn to filter noise from the current dispatch — observed twice on 2026-04-21.

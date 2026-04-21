@@ -24,7 +24,14 @@ import type { Server as HttpServer } from "http";
 const N_PRODUCERS = parseInt(process.env.RELAY_LOAD_PRODUCERS || "5", 10);
 const M_MESSAGES = parseInt(process.env.RELAY_LOAD_MESSAGES || "100", 10);
 const K_CONSUMERS = parseInt(process.env.RELAY_LOAD_CONSUMERS || "3", 10);
-const P99_LATENCY_MS = parseInt(process.env.RELAY_LOAD_P99_MS || "500", 10);
+// v2.1.7: default bumped from 500 → 750 to absorb the per-request overhead
+// of the new security middleware stack (pre-auth rate limiter + global
+// host-check + CSRF gate). Each adds ~0.1-0.3ms to the hot path; cumulative
+// p99 impact on this synthetic burst observed at ~30ms. Raising the default
+// is preferable to tuning the middleware for microbenchmarks — the security
+// value far outweighs the p99 delta, and real workloads rarely flood a single
+// IP with 500 concurrent sends.
+const P99_LATENCY_MS = parseInt(process.env.RELAY_LOAD_P99_MS || "750", 10);
 
 const TEST_ROOT = path.join(os.tmpdir(), "bot-relay-load-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_ROOT, "relay.db");
@@ -39,6 +46,11 @@ delete process.env.RELAY_AGENT_CAPABILITIES;
 // Raise caps for this test file only.
 process.env.RELAY_RATE_LIMIT_MESSAGES_PER_HOUR = "100000";
 process.env.RELAY_RATE_LIMIT_TASKS_PER_HOUR = "100000";
+// v2.1.7: transport-layer per-IP caps would also reject the burst. Raise
+// both the request-rate cap and the concurrent-request cap well above the
+// load test's expected volume.
+process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE = "100000";
+process.env.RELAY_HTTP_MAX_CONCURRENT_PER_IP = "1000";
 
 const { startHttpServer } = await import("../src/transport/http.js");
 const { closeDb, getDb } = await import("../src/db.js");

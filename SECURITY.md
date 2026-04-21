@@ -1,7 +1,54 @@
 # Security Policy
 
 **Project:** bot-relay-mcp
-**Last updated:** 2026-04-19 (v2.1.0)
+**Last updated:** 2026-04-21 (v2.1.7)
+
+---
+
+## v2.1.7 external review (external reviewer credit — Steph + Codex)
+
+On 2026-04-21, an external security review by Steph (Maxime's wife's primary AI) surfaced four hardening gaps; Codex's follow-up audit added five more. v2.1.7 ships fixes for the HIGH and MEDIUM items inline; the two LOW items are documented in this file; the one MEDIUM (webhook TOCTOU on DNS fast-flip) is deferred to v2.1.8 per the scope envelope. Changes:
+
+- **HIGH — IPv6 prefix bypass in `src/url-safety.ts`.** Pre-v2.1.7 code used `startsWith('fe80:')` for link-local classification, missing the remaining 6 prefixes in `fe80::/10` (fe90::, fea0::, etc.). Codex demonstrated a monkey-patched `dns.lookup` returning `fe90::1` passed validation and let a webhook fire against a link-local address. Replaced every prefix check with real IPv6 CIDR matching via `src/cidr.ts`. Now blocks: `::1/128`, `::/128`, `fe80::/10`, `fc00::/7`, `ff00::/8`, `::ffff:0:0/96`, `64:ff9b::/96`, `2001::/23`.
+- **HIGH — Dashboard secret layering.** `authMiddleware` (RELAY_HTTP_SECRET) ran ahead of `dashboardAuthCheck` and blocked requests lacking the HTTP secret before the dashboard-specific auth ever ran. Operators expecting dashboard-only-secret isolation silently got stronger auth than intended. Fixed: authMiddleware now skips the four enumerated dashboard routes (`/`, `/dashboard`, `/api/snapshot`, `/api/keyring`) so `dashboardAuthCheck` can enforce `RELAY_DASHBOARD_SECRET` independently.
+- **HIGH — `/mcp` Host-header check.** Pre-v2.1.7 the DNS-rebinding defense was wired per-route on dashboard paths only. `/mcp` accepted any Host header, exposing agents to browser-based rebinding attacks. Fixed: `httpHostCheck` is now applied globally (including `/mcp` POST/GET), skipping `/health` only. New canonical env var `RELAY_HTTP_ALLOWED_HOSTS`; `RELAY_DASHBOARD_HOSTS` preserved as a backward-compat alias.
+- **MEDIUM — SameSite + CSRF.** `relay_dashboard_auth` cookie is now re-issued by `dashboardAuthCheck` with `HttpOnly; SameSite=Strict; Path=/` (and `Secure` when `RELAY_TLS_ENABLED=1`). A companion `relay_csrf` cookie (NOT HttpOnly — dashboard JS reads it) carries a per-process HMAC-SHA256 double-submit token; unsafe methods (POST/PUT/DELETE/PATCH) on `/api/*` require a matching `X-Relay-CSRF` header. v2.1.7 has no state-changing endpoints to exercise this today — the middleware is infrastructure so v2.2's dashboard state-changing endpoints are safe-by-construction.
+- **MEDIUM — Per-IP HTTP rate limits.** Pre-v2.1.7 rate limiting was per-tool-call keyed on agent_name; an anonymous flood could exhaust Express middleware before auth fired. Added a pre-auth per-IP fixed-window counter (default 200 req/min) + per-IP concurrent-request cap (default 10). `/health` excluded. Tuning via `RELAY_HTTP_RATE_LIMIT_PER_MINUTE` + `RELAY_HTTP_MAX_CONCURRENT_PER_IP`. 429 + `Retry-After`.
+- **LOW — Audit log content preview (now documented).** See "Known residual behavior" below.
+- **LOW — Keyring cache reload (now documented).** See "Known residual behavior" below.
+- **DEFERRED to v2.1.8 — Webhook TOCTOU on DNS fast-flip.** `src/webhooks.ts` re-validates the URL at fire time (DNS-rebinding defense), but native fetch re-resolves the hostname when opening the socket. A fast-flip authoritative DNS response can bypass the re-validation. Closing this requires pinning fetch to the validated IP while preserving TLS/SNI on the hostname (Undici per-request dispatcher with `connect.lookup`). A direct `undici` dep + rewrite of the webhook fire path is larger than the v2.1.7 envelope and is scheduled for v2.1.8. Exploitation requires attacker control of an authoritative nameserver with sub-second TTL + precise timing; not trivial at scale.
+
+### Hall of Fame
+
+v2.1.7 hardening landed thanks to:
+
+- **Steph** — external review that flagged the original four items (/mcp Host-check, SameSite+CSRF, per-IP rate limits, audit preview retention doc).
+- **Codex** (dual-model audit) — five additional findings including the concrete IPv6 prefix-bypass SSRF.
+
+Reporters who prefer attribution here can request entries as part of the disclosure flow.
+
+---
+
+## Known residual behavior (v2.1.7)
+
+### Audit log content preview (`audit_log.params_summary`)
+
+The dispatcher records a 40-char preview of `content` + other string args in the plaintext `params_summary` column (full body is separately in the encrypted `params_json`). The preview persists for the configured audit retention window (default 90 days, env `RELAY_AUDIT_LOG_RETENTION_DAYS`). If the operator's workload routes secrets through message content (tokens, API keys, emails), those appear in previews for up to 90 days.
+
+Mitigation (operator-side):
+- Sanitize sensitive content at the application layer before calling `send_message` / `post_task` (the relay cannot know what is "secret" in your domain).
+- Shorten `RELAY_AUDIT_LOG_RETENTION_DAYS` if your compliance posture demands it (1 day is valid; 0 disables audit purging).
+- For forensic depth, the `params_json` column stays encrypted with your keyring — decrypt out-of-band only when needed.
+
+Future server-side regex scrubbing of known secret shapes is tracked as a v2.1.8 candidate.
+
+### Encryption keyring cache reload
+
+`src/encryption.ts` caches the parsed keyring at first read, keyed on the `RELAY_ENCRYPTION_KEYRING` / `RELAY_ENCRYPTION_KEYRING_PATH` env value. In-place edits to the keyring file contents do NOT auto-reload — the daemon continues using the cached keyring until restart. This is intentional: detecting file content change mid-operation would complicate the re-encryption state machine.
+
+Operational implication: key rotation must pair a file edit with a daemon restart. `relay re-encrypt` is designed around this — operators run the rotation command on a paused daemon, then bring it back up.
+
+A future `RELAY_ENCRYPTION_KEYRING_WATCH=1` opt-in reload flag is a v2.2 candidate.
 
 This document describes the threat model bot-relay-mcp defends against, the mechanisms that enforce those defenses, and — crucially — what the project does NOT protect. It closes with the vulnerability-disclosure process.
 
@@ -106,11 +153,13 @@ Out-of-band token handoff is the human authorization moment. Recovery tokens cur
 
 ---
 
-## DNS-rebinding defense (Phase 4e)
+## DNS-rebinding defense (Phase 4e + v2.1.7)
 
-Webhook targets are re-validated at fire time: `validateWebhookUrl` re-resolves the hostname and re-runs the SSRF check against every resolved IP. If a previously-safe hostname now resolves to a private IP or a cloud-metadata address, the webhook is terminally refused (no retry — feeding an attacker controlling DNS wastes bandwidth).
+Webhook targets are re-validated at fire time: `validateWebhookUrl` re-resolves the hostname and re-runs the SSRF check against every resolved IP. If a previously-safe hostname now resolves to a private IP or a cloud-metadata address, the webhook is terminally refused (no retry — feeding an attacker controlling DNS wastes bandwidth). v2.1.7 replaces IPv6 string-prefix checks with real CIDR matching (see Item 5 in v2.1.7 review above); pre-v2.1.7 clients that relied on the `fe80:` string-prefix should re-audit their webhook targets for any link-local IPv6 they depended on seeing blocked.
 
-The dashboard enforces a Host-header allowlist (default loopback-hostname-only, override via `RELAY_DASHBOARD_HOSTS`) so an external attacker can't use DNS rebinding to reach `127.0.0.1:3777` through a browser.
+**Residual TOCTOU (v2.1.7):** native fetch re-resolves hostname when opening the socket, so sub-second-TTL authoritative DNS flips can still bypass the fire-time check. Closing this via Undici per-request dispatcher `connect.lookup` pinning is scheduled for v2.1.8.
+
+Every HTTP route (dashboard + `/mcp`) now enforces a Host-header allowlist (default loopback-hostname-only, override via `RELAY_HTTP_ALLOWED_HOSTS` — `RELAY_DASHBOARD_HOSTS` preserved as the v2.1 alias) so an external attacker can't use DNS rebinding to reach `127.0.0.1:3777` through a browser. Pre-v2.1.7 this gate was dashboard-only, leaving `/mcp` exposed — see Item 1 above.
 
 See `src/url-safety.ts`, `src/dashboard.ts`, `src/transport/http.ts`.
 
