@@ -3,10 +3,24 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { sendMessage, getMessages, broadcastMessage, runHealthMonitorTick, SenderNotRegisteredError } from "../db.js";
+import {
+  sendMessage,
+  getMessages,
+  getMessagesSummary,
+  broadcastMessage,
+  runHealthMonitorTick,
+  SenderNotRegisteredError,
+  getAgentSessionStart,
+} from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { ERROR_CODES } from "../error-codes.js";
-import type { SendMessageInput, GetMessagesInput, BroadcastInput } from "../types.js";
+import { parseSince } from "./standup.js";
+import type {
+  SendMessageInput,
+  GetMessagesInput,
+  GetMessagesSummaryInput,
+  BroadcastInput,
+} from "../types.js";
 
 /** v2.0 beta: lazy health piggyback on get_messages. See tools/tasks.ts for rationale. */
 function runHealthMonitor(triggeredBy: string): void {
@@ -75,9 +89,73 @@ export function handleSendMessage(input: SendMessageInput) {
   }
 }
 
+/**
+ * v2.1.6: resolve the `since` arg to an ISO lower bound for SQL filtering, or
+ * null when the caller explicitly opts out ("all" / null) and no bound should
+ * be applied. Throws a caller-facing error for malformed inputs so the caller
+ * gets a VALIDATION error code instead of a 500.
+ *
+ * Accepts (per spec):
+ *   - duration shorthand: "15m" | "1h" | "24h" | "3d" (via parseSince)
+ *   - ISO8601 timestamp (via parseSince)
+ *   - "session_start" — agent's last register_agent timestamp (session_started_at)
+ *   - "all" | null — disable filter (preserves pre-v2.1.6 behavior)
+ */
+function resolveSinceBound(
+  since: string | null | undefined,
+  agentName: string
+): string | null {
+  if (since === null || since === undefined) return null;
+  if (since === "all") return null;
+  if (since === "session_start") {
+    const started = getAgentSessionStart(agentName);
+    // Unknown agent OR legacy row (never re-registered post-v2.1.6) → no
+    // session anchor exists, so treat as an unfiltered read instead of
+    // inventing a bound. Callers wanting a time floor can pass a duration.
+    return started ?? null;
+  }
+  const ms = parseSince(since);
+  return new Date(ms).toISOString();
+}
+
+function filterBySince<T extends { created_at: string }>(
+  rows: T[],
+  sinceIso: string | null
+): T[] {
+  if (!sinceIso) return rows;
+  return rows.filter((r) => r.created_at >= sinceIso);
+}
+
 export function handleGetMessages(input: GetMessagesInput) {
   runHealthMonitor("get_messages");
-  const messages = getMessages(input.agent_name, input.status, input.limit);
+  // v2.1.6: since filter is applied AFTER the DB fetch (which mirrors the
+  // pre-v2.1.6 session-read mutation + priority ordering). We over-fetch
+  // intentionally — the `limit` is the display cap for the caller; the time
+  // filter is a secondary narrowing applied in memory. For 24h default on a
+  // healthy relay this is effectively no-op; for reused-name replay scenarios
+  // it trims the returned set + hides noise without affecting the underlying
+  // read-by-session state the DB layer already maintains.
+  let sinceIso: string | null;
+  try {
+    sinceIso = resolveSinceBound(input.since, input.agent_name);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            { success: false, error: msg, error_code: ERROR_CODES.VALIDATION },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+  const raw = getMessages(input.agent_name, input.status, input.limit);
+  const messages = filterBySince(raw, sinceIso);
   return {
     content: [
       {
@@ -88,6 +166,74 @@ export function handleGetMessages(input: GetMessagesInput) {
             count: messages.length,
             agent: input.agent_name,
             filter: input.status,
+            since: input.since ?? null,
+            since_bound: sinceIso,
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+/**
+ * v2.1.6 — lightweight inbox preview. Pure read (no read_by_session mutation,
+ * no touchAgent). Returns only {id, from_agent, priority, status, created_at,
+ * content_preview} with content truncated at 100 chars. Supports the same
+ * `since` + `status` filters as get_messages.
+ *
+ * Use case: orchestrators + dashboards that want to scan an inbox cheaply
+ * without burning tokens on full bodies. Caller expands chosen IDs via
+ * get_messages.
+ */
+const SUMMARY_PREVIEW_MAX = 100;
+
+export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
+  let sinceIso: string | null;
+  try {
+    sinceIso = resolveSinceBound(input.since, input.agent_name);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            { success: false, error: msg, error_code: ERROR_CODES.VALIDATION },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+  const rows = getMessagesSummary(input.agent_name, input.status, input.limit, sinceIso);
+  const summaries = rows.map((r) => ({
+    id: r.id,
+    from_agent: r.from_agent,
+    priority: r.priority,
+    status: r.status,
+    created_at: r.created_at,
+    content_preview:
+      r.content.length > SUMMARY_PREVIEW_MAX
+        ? r.content.slice(0, SUMMARY_PREVIEW_MAX)
+        : r.content,
+    content_truncated: r.content.length > SUMMARY_PREVIEW_MAX,
+  }));
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            summaries,
+            count: summaries.length,
+            agent: input.agent_name,
+            filter: input.status,
+            since: input.since ?? null,
+            since_bound: sinceIso,
           },
           null,
           2

@@ -1,5 +1,70 @@
 # Changelog
 
+## v2.1.6 — 2026-04-21 — inbox hygiene
+
+Small patch release focused on one recurring operator pain point: when an agent name is reused (operator runs `relay recover` then re-registers, or an agent row survives SIGINT via `markAgentOffline`), the new session's `get_messages(status='all')` surfaces historical mail from prior session lives. ~2 minutes of reasoning burned on every fresh spawn to filter noise from the current dispatch — observed twice on 2026-04-21.
+
+Protocol bumps to `2.1.3` (MINOR — one additive tool + one optional arg). Tool count grows from 27 → 28. Schema migrates v7 → v8 (adds `agents.session_started_at` to anchor the `session_start` sentinel).
+
+### `get_messages` gains `since` filter
+
+New optional `since: string` field on `get_messages`. Same grammar as `get_standup`:
+
+- duration shorthand: `"15m"` | `"1h"` | `"24h"` | `"3d"`
+- ISO8601 timestamp
+- `"session_start"` sentinel — anchors on the agent's last `register_agent` timestamp (`agents.session_started_at`, new column)
+- `"all"` or explicit `null` — disables the filter (preserves pre-v2.1.6 unlimited behavior)
+- default: `"24h"` — cuts the stale-backlog tax for reused names while leaving an escape hatch for cross-session handoff
+
+Pure read-path. No mutation to `read_by_session`. Backward-compatible: callers that omit `since` at the MCP boundary get the 24h default via Zod; direct-handler tests (pre-v2.1.6 shape) receive `undefined` which the handler treats as unfiltered.
+
+### New tool: `get_messages_summary`
+
+Lightweight inbox preview for orchestrators + dashboards. Returns one entry per message with `{id, from_agent, priority, status, created_at, content_preview, content_truncated}` where `content_preview` is the first 100 characters of the decrypted body. Same `since` + `status` filter surface as `get_messages`. Does NOT mark messages read (pure observation). Intended flow: scan summaries → expand selected IDs via `get_messages`.
+
+Ships on all three platforms (pure SQL + dispatcher, platform-agnostic).
+
+### New CLI: `relay purge-history <agent-name>`
+
+Operator-driven clean slate for reused agent names. Deletes every message + task where the agent is sender OR recipient in a single transaction. Preserves the agent row itself (`relay recover` handles row deletion) and the `audit_log` entries (forensic record).
+
+- Idempotent — second run on a clean history reports "Nothing to purge."
+- Writes a `purge-history.cli` entry to `audit_log` with the operator username + deleted counts.
+- Prompts `[y/N]` unless `--yes`. `--dry-run` shows counts without committing.
+- Same filesystem-gated trust model as `relay recover` (FS access = operator authority).
+
+Runs on macOS + Linux + Windows (pure Node CLI).
+
+### Kickstart prompt updates
+
+The default KICKSTART embedded in spawned terminals picks up one extra sentence (macOS bash script + Linux/Windows TS drivers all at parity):
+
+> If you see more than 5 inbox messages on first pull, you may be a reused agent name inheriting prior-session backlog — filter aggressively, focus on the most recent messages addressed to you by main-victra or other active orchestrators, and consider calling get_messages with `since='session_start'` or `since='1h'` to narrow the window.
+
+`RELAY_SPAWN_KICKSTART` full-override is still honored verbatim; `RELAY_SPAWN_NO_KICKSTART=1` still suppresses entirely.
+
+### Schema migration (v7 → v8)
+
+`migrateSchemaToV2_6` adds one nullable column:
+
+- `agents.session_started_at TEXT` — ISO timestamp updated by `registerAgent` in lockstep with `session_id` rotation. NULL on pre-v2.1.6 rows until the agent next calls `register_agent`; the `session_start` sentinel treats NULL as "no anchor known → skip the filter" rather than inventing a bound.
+
+Additive + idempotent. No data backfill.
+
+### Tests
+
+- `tests/v2-1-6-inbox-hygiene.test.ts` +17 cases: `since` filter (backward-compat, explicit bound, `session_start` anchor, `all` pass-through, Zod default, VALIDATION on malformed), `get_messages_summary` (round-trip, 100-char truncation, short-content no-truncate flag, `since` parity, Zod shape), `relay purge-history` CLI (yes-flag deletes both directions, audit entry, `--dry-run` no-op, idempotent, db-helper unit), kickstart nudge (bash + Linux + Windows drivers).
+- Updated `tests/http.test.ts` (27 → 28 tools) and `tests/v2-1-schema-info.test.ts` / `tests/v2-1-3-agent-status-enum.test.ts` (schema v7 → v8).
+
+779 tests default + 7 opt-in under `--full`. Pre-publish gate PASS 10/10.
+
+### Release hygiene
+
+- `package.json` 2.1.5 → 2.1.6.
+- `src/protocol.ts` 2.1.2 → 2.1.3.
+- `devlog/064-v2.1.6-inbox-hygiene.md` — assumptions-first per Karpathy rule.
+- Canonical spec: `audit-findings/v2.1.6-inbox-hygiene-spec.md`.
+
 ## v2.1.5 — 2026-04-21 — `brief_file_path` cross-platform completion
 
 Completes v2.1.4's `brief_file_path` wire to the Linux + Windows spawn drivers. macOS behavior unchanged — the bash-script path (`bin/spawn-agent.sh`) was already wired in v2.1.4. No protocol change, no schema change, no new tools. Patch release.

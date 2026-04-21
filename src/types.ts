@@ -111,10 +111,44 @@ export const SendMessageSchema = z.object({
   agent_token: AgentTokenField,
 });
 
+/**
+ * v2.1.6: optional `since` filter. Same grammar as `/standup`'s since arg —
+ * duration shorthand ("15m" | "1h" | "24h" | "3d"), an ISO8601 timestamp, the
+ * literal "session_start" sentinel (messages since the agent's current
+ * session registered), OR "all" / null to preserve pre-v2.1.6 unlimited
+ * behavior. Default is "24h" — keeps reused agent names from inheriting the
+ * full inbox backlog while leaving an escape hatch for cross-session handoff.
+ */
+const GetMessagesSinceField = z
+  .union([z.string().min(1), z.null()])
+  .optional()
+  .default("24h")
+  .describe(
+    "v2.1.6: time-window filter. Accepts duration ('15m'|'1h'|'24h'|'3d'), " +
+      "ISO8601 timestamp, 'session_start' sentinel, or 'all'/null to disable. " +
+      "Default '24h' trims stale backlog when an agent name is reused."
+  );
+
 export const GetMessagesSchema = z.object({
   agent_name: z.string().min(1).describe("Your agent name"),
   status: z.enum(["pending", "read", "all"]).default("pending").describe("Filter by status"),
   limit: z.number().int().min(1).max(100).default(20).describe("Max messages to return"),
+  since: GetMessagesSinceField,
+  agent_token: AgentTokenField,
+});
+
+/**
+ * v2.1.6: lightweight inbox preview. Same filter surface as GetMessages but
+ * returns only message headers + a 100-char content_preview. Does NOT mark
+ * messages read (pure observation). Intended for orchestrators or dashboards
+ * that want to scan an inbox cheaply + call get_messages only for IDs they
+ * want to expand.
+ */
+export const GetMessagesSummarySchema = z.object({
+  agent_name: z.string().min(1).describe("Your agent name"),
+  status: z.enum(["pending", "read", "all"]).default("pending").describe("Filter by status"),
+  limit: z.number().int().min(1).max(100).default(20).describe("Max message summaries to return"),
+  since: GetMessagesSinceField,
   agent_token: AgentTokenField,
 });
 
@@ -377,6 +411,7 @@ export type UnregisterAgentInput = z.infer<typeof UnregisterAgentSchema>;
 export type SpawnAgentInput = z.infer<typeof SpawnAgentSchema>;
 export type SendMessageInput = z.infer<typeof SendMessageSchema>;
 export type GetMessagesInput = z.infer<typeof GetMessagesSchema>;
+export type GetMessagesSummaryInput = z.infer<typeof GetMessagesSummarySchema>;
 export type BroadcastInput = z.infer<typeof BroadcastSchema>;
 export type PostTaskInput = z.infer<typeof PostTaskSchema>;
 export type PostTaskAutoInput = z.infer<typeof PostTaskAutoSchema>;

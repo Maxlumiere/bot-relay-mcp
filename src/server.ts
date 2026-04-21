@@ -16,6 +16,7 @@ import {
   SpawnAgentSchema,
   SendMessageSchema,
   GetMessagesSchema,
+  GetMessagesSummarySchema,
   BroadcastSchema,
   PostTaskSchema,
   PostTaskAutoSchema,
@@ -55,7 +56,7 @@ import { currentContext, requestContext } from "./request-context.js";
 import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
 import { ZodError } from "zod";
 import { authenticateAgent, verifyToken, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive } from "./auth.js";
-import { handleSendMessage, handleGetMessages, handleBroadcast } from "./tools/messaging.js";
+import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleBroadcast } from "./tools/messaging.js";
 import { handlePostTask, handlePostTaskAuto, handleUpdateTask, handleGetTasks, handleGetTask } from "./tools/tasks.js";
 import { handleRegisterWebhook, handleListWebhooks, handleDeleteWebhook } from "./tools/webhooks.js";
 import { processDueWebhookRetries } from "./webhooks.js";
@@ -151,8 +152,14 @@ export function createServer(): Server {
       {
         name: "get_messages",
         description:
-          "Check your mailbox for messages. Returns messages addressed to you, newest first. Pending messages are automatically marked as read.",
+          "Check your mailbox for messages. Returns messages addressed to you, newest first. Pending messages are automatically marked as read. v2.1.6: optional `since` trims stale backlog (default '24h'; pass 'all' or null for the pre-v2.1.6 unlimited behavior).",
         inputSchema: zodToJsonSchema(GetMessagesSchema),
+      },
+      {
+        name: "get_messages_summary",
+        description:
+          "v2.1.6: lightweight inbox preview. Same filter surface as get_messages (status + since) but returns only message headers + a 100-char content_preview. Does NOT mark messages read — pure observation. Use to scan an inbox cheaply then expand chosen IDs via get_messages.",
+        inputSchema: zodToJsonSchema(GetMessagesSummarySchema),
       },
       {
         name: "broadcast",
@@ -356,6 +363,8 @@ export function createServer(): Server {
         return handleSendMessage(SendMessageSchema.parse(args));
       case "get_messages":
         return handleGetMessages(GetMessagesSchema.parse(args));
+      case "get_messages_summary":
+        return handleGetMessagesSummary(GetMessagesSummarySchema.parse(args));
       case "broadcast":
         return handleBroadcast(BroadcastSchema.parse(args));
       case "post_task":
