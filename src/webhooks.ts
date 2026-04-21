@@ -135,6 +135,16 @@ async function deliverWebhook(
   // hostname and re-run the all-IPs SSRF check. Register-time validation is
   // not enough — an attacker controlling DNS can flip the record between
   // register and fire.
+  //
+  // v2.1.7 Item 7 (Codex): residual TOCTOU between this validate and the
+  // `fetch(url, ...)` below. Native fetch re-resolves the hostname at the
+  // socket layer, so fast-flip authoritative DNS (sub-second TTL) can still
+  // land the connection on a different IP. Closing this requires pinning
+  // fetch to the validated IP while preserving TLS/SNI on the hostname —
+  // Undici's per-request dispatcher with a custom `connect.lookup` is the
+  // mechanism, but introducing a direct undici dep + cutting over both
+  // webhook fire paths is larger than the v2.1.7 patch envelope. DEFERRED
+  // to v2.1.8. Tracked in CHANGELOG and SECURITY.md "Known residual gaps".
   const safety = await validateWebhookUrl(url);
   if (!safety.ok) {
     const reason = `DNS rebinding refusal at fire time: ${safety.reason}`;
