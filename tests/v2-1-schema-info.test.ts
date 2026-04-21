@@ -137,7 +137,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(6, 7)).not.toThrow();
     // v2.1.6 registered 7→8 (migrateSchemaToV2_6: session_started_at column).
     expect(() => applyMigration(7, 8)).not.toThrow();
-    expect(() => applyMigration(8, 9)).toThrow(/no migration registered|8→9/);
+    // v2.2.0 registered 8→9 (migrateSchemaToV2_7: terminal_title_ref column).
+    expect(() => applyMigration(8, 9)).not.toThrow();
+    expect(() => applyMigration(9, 10)).toThrow(/no migration registered|9→10/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

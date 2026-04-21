@@ -225,7 +225,14 @@ export function buildChildEnv(
   capabilities: string[],
   platform: SupportedPlatform,
   parentEnv: NodeJS.ProcessEnv = process.env,
-  token?: string | null
+  token?: string | null,
+  /**
+   * v2.2.0: window title the child terminal should advertise to the relay on
+   * register. Defaults to the agent name when omitted. Flows through the
+   * hook's register_agent call so the dashboard click-to-focus driver can
+   * look up the live window by title.
+   */
+  terminalTitle?: string | null
 ): Record<string, string> {
   const out: Record<string, string> = {};
 
@@ -252,6 +259,14 @@ export function buildChildEnv(
   out.RELAY_AGENT_NAME = name;
   out.RELAY_AGENT_ROLE = role;
   out.RELAY_AGENT_CAPABILITIES = capabilities.join(",");
+  // v2.2.0: RELAY_TERMINAL_TITLE is read by the SessionStart hook and passed
+  // to register_agent so the dashboard click-to-focus driver can look up
+  // the live window. Defaults to the agent name (matches the bash script's
+  // `--name $Q_DISPLAY` default).
+  out.RELAY_TERMINAL_TITLE =
+    typeof terminalTitle === "string" && terminalTitle.length > 0
+      ? terminalTitle
+      : name;
 
   // v2.1 Phase 4j: explicit child token override. The parent pre-registered
   // the child and captured the plaintext token once — propagate it so the
