@@ -173,6 +173,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_3(_db);
   migrateSchemaToV2_4(_db);
   migrateSchemaToV2_5(_db);
+  migrateSchemaToV2_6(_db);
   purgeOldRecords(_db);
 }
 
@@ -201,6 +202,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_3(_db);
   migrateSchemaToV2_4(_db);
   migrateSchemaToV2_5(_db);
+  migrateSchemaToV2_6(_db);
   purgeOldRecords(_db);
 
   return _db;
@@ -400,6 +402,10 @@ function initSchema(db: CompatDatabase): void {
  * v2.1.3 (I6) bumped 6 → 7 alongside migrateSchemaToV2_5 (agent_status enum
  *   widened + legacy value remap: online→idle, busy→working, away→blocked).
  *
+ * v2.1.6 bumped 7 → 8 alongside migrateSchemaToV2_6 (agents.session_started_at
+ * nullable column, anchors the `session_start` sentinel in the `since` filter
+ * on get_messages / get_messages_summary).
+ *
  * v2.1 Phase 7q bumped 5 → 6 alongside migrateSchemaToV2_4 (agents.visibility
  * column reserved for v2.3 hub federation, mailbox + agent_cursor tables
  * reserved for Phase 4s v2.2 delivery-seq protocol). All additions empty /
@@ -408,7 +414,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -446,6 +452,8 @@ export function applyMigration(from: number, to: number): void {
   if (from === 3 && to === 4) return;
   if (from === 4 && to === 5) return;
   if (from === 5 && to === 6) return;
+  if (from === 6 && to === 7) return;
+  if (from === 7 && to === 8) return;
   throw new Error(
     `no migration registered for schema_version ${from}→${to}. ` +
     `Register a handler in src/db.ts applyMigration and update CURRENT_SCHEMA_VERSION.`
@@ -888,6 +896,26 @@ function migrateSchemaToV2_5(db: CompatDatabase): void {
   db.prepare("UPDATE agents SET agent_status = 'idle' WHERE agent_status = 'online'").run();
   db.prepare("UPDATE agents SET agent_status = 'working' WHERE agent_status = 'busy'").run();
   db.prepare("UPDATE agents SET agent_status = 'blocked' WHERE agent_status = 'away'").run();
+}
+
+/**
+ * v2.1.6 — add `agents.session_started_at` as the anchor for the
+ * `session_start` sentinel in the new `since` filter on get_messages /
+ * get_messages_summary. Nullable so pre-v2.1.6 rows that were registered
+ * before this column existed fall through to an unfiltered read (cannot
+ * invent a plausible anchor). Set by registerAgent alongside session_id.
+ *
+ * Additive + idempotent. No data backfill — the tool handler treats NULL as
+ * "no anchor known; skip the filter" (documented behavior, prevents surprise
+ * empty inboxes for agents that haven't re-registered since the upgrade).
+ */
+function migrateSchemaToV2_6(db: CompatDatabase): void {
+  const agentCols = db
+    .prepare("PRAGMA table_info(agents)")
+    .all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "session_started_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN session_started_at TEXT");
+  }
 }
 
 function purgeOldRecords(db: CompatDatabase): void {
@@ -1485,12 +1513,15 @@ export function registerAgent(
       options.expectedRecoveryHash !== undefined
         ? options.expectedRecoveryHash
         : existing.recovery_token_hash ?? null;
+    // v2.1.6: session_started_at is rotated in lockstep with session_id. The
+    // new timestamp anchors the `session_start` sentinel on subsequent
+    // get_messages / get_messages_summary calls from this session.
     const r = db.prepare(
-      "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, description = ?, " +
+      "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ? " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
-      role, timestamp, newHash, session_id, newDescription,
+      role, timestamp, newHash, session_id, timestamp, newDescription,
       newAuthState, newRecoveryHash, newRevokedAt,
       name, existingState, existing.token_hash, casRecoveryHash
     );
@@ -1522,8 +1553,9 @@ export function registerAgent(
     const managed = options.managed ? 1 : 0;
     db.prepare(
       // v2.1.3 (I6): default agent_status is now 'idle' (was 'online').
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, description, agent_status, managed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, description, managed);
+      // v2.1.6: session_started_at = timestamp for first-register anchor.
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description, managed);
 
     // v2.0: populate normalized agent_capabilities table.
     const insertCap = db.prepare("INSERT OR IGNORE INTO agent_capabilities (agent_name, capability) VALUES (?, ?)");
@@ -2145,6 +2177,109 @@ export function getMessages(
 
   // v1.7: decrypt content field on read (safe-no-op for plaintext rows)
   return rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content }));
+}
+
+/**
+ * v2.1.6 — inbox-summary helper. Mirrors the priority + status ordering of
+ * getMessages but:
+ *   1. does NOT mutate read_by_session (pure observation),
+ *   2. accepts an optional `sinceIso` lower bound so SQL can pre-filter by
+ *      created_at — cheaper than the handler-layer filter when the caller
+ *      cares only about recent mail,
+ *   3. decrypts content so the handler can slice a preview at the boundary.
+ *
+ * Intended for get_messages_summary. Keeps the handler thin + keeps the
+ * read-path-purity contract that getMessagesInWindow established in v2.1.4.
+ */
+export function getMessagesSummary(
+  agentName: string,
+  status: string,
+  limit: number,
+  sinceIso: string | null
+): MessageRecord[] {
+  const db = getDb();
+
+  const agentRow = db
+    .prepare("SELECT session_id FROM agents WHERE name = ?")
+    .get(agentName) as { session_id: string | null } | undefined;
+  const currentSession = agentRow?.session_id ?? null;
+
+  const priorityOrder =
+    `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
+
+  const sinceClause = sinceIso ? "AND created_at >= ?" : "";
+  const params: unknown[] = [agentName];
+
+  let sql: string;
+  if (status === "all") {
+    sql = `SELECT * FROM messages WHERE to_agent = ? ${sinceClause} ${priorityOrder}`;
+    if (sinceIso) params.push(sinceIso);
+  } else if (status === "read") {
+    sql = `SELECT * FROM messages WHERE to_agent = ?
+       AND read_by_session IS NOT NULL
+       AND read_by_session = ?
+       ${sinceClause}
+       ${priorityOrder}`;
+    params.push(currentSession ?? "");
+    if (sinceIso) params.push(sinceIso);
+  } else {
+    // "pending" — never read OR read by a different session
+    sql = `SELECT * FROM messages WHERE to_agent = ?
+       AND (read_by_session IS NULL OR read_by_session != ?)
+       ${sinceClause}
+       ${priorityOrder}`;
+    params.push(currentSession ?? "");
+    if (sinceIso) params.push(sinceIso);
+  }
+  params.push(limit);
+
+  const rows = db.prepare(sql).all(...(params as any[])) as MessageRecord[];
+  return rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content }));
+}
+
+/**
+ * v2.1.6 — return the ISO timestamp at which the agent's current session
+ * started (last register_agent call). NULL for unknown agents OR for rows
+ * registered before v2.1.6 added the column — handler treats NULL as
+ * "no anchor; skip the filter" so we never invent a bound.
+ */
+export function getAgentSessionStart(agentName: string): string | null {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT session_started_at FROM agents WHERE name = ?")
+    .get(agentName) as { session_started_at: string | null } | undefined;
+  return row?.session_started_at ?? null;
+}
+
+/**
+ * v2.1.6 — operator-driven clean slate for reused agent names. Deletes every
+ * message + task where the agent is sender OR recipient. Preserves the agent
+ * row itself (use `relay recover` for that). Does NOT touch audit_log
+ * entries (forensic record) or channel membership.
+ *
+ * Idempotent: running against an agent with no history returns zero counts.
+ * Wrapped in a single transaction so partial failures don't leave half-purged
+ * state.
+ */
+export function purgeAgentHistory(agentName: string): {
+  messages_deleted: number;
+  tasks_deleted: number;
+} {
+  const db = getDb();
+  let messagesDeleted = 0;
+  let tasksDeleted = 0;
+  const tx = db.transaction(() => {
+    const m = db
+      .prepare("DELETE FROM messages WHERE from_agent = ? OR to_agent = ?")
+      .run(agentName, agentName);
+    messagesDeleted = m.changes;
+    const t = db
+      .prepare("DELETE FROM tasks WHERE from_agent = ? OR to_agent = ?")
+      .run(agentName, agentName);
+    tasksDeleted = t.changes;
+  });
+  tx();
+  return { messages_deleted: messagesDeleted, tasks_deleted: tasksDeleted };
 }
 
 export function broadcastMessage(

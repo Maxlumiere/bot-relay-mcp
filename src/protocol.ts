@@ -28,6 +28,11 @@
  *            New error codes: SENDER_NOT_REGISTERED, NAME_COLLISION_ACTIVE.
  *            Additive — old clients that hardcode the 4 old values on the
  *            output side will need to widen their pattern-matches.
+ *   2.1.3  — v2.1.6 inbox hygiene: new additive tool `get_messages_summary`
+ *            (lightweight inbox preview with 100-char content_preview + same
+ *            since/status filters as get_messages). `get_messages` gains
+ *            optional `since` arg (default "24h"; "all" or explicit null
+ *            preserves pre-v2.1.6 unlimited behavior).
  *
  * Surfaced via `register_agent` + `health_check` response payloads so any
  * client can introspect compatibility before issuing tool calls. The relay
@@ -38,4 +43,4 @@
  * This file is intentionally the sole authoritative source — the drift-grep
  * in scripts/pre-publish-check.sh allowlists it alongside src/version.ts.
  */
-export const PROTOCOL_VERSION: string = "2.1.2";
+export const PROTOCOL_VERSION: string = "2.1.3";
