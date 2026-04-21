@@ -11,6 +11,7 @@ import { ERROR_CODES } from "../error-codes.js";
 import { authenticateAgent, verifyToken } from "../auth.js";
 import type { AuthStateInput } from "../auth.js";
 import { currentContext } from "../request-context.js";
+import { broadcastDashboardEvent } from "../transport/websocket.js";
 
 /** Process-start wall clock — captured at module load so health_check can report uptime. */
 const PROCESS_STARTED_AT = Date.now();
@@ -36,6 +37,21 @@ export function handleSetStatus(input: SetStatusInput) {
   // Normalize legacy → new. Zod has already restricted to the known set.
   const normalized = LEGACY_SET_STATUS_MAP[input.status];
   const updated = setAgentStatus(input.agent_name, normalized);
+  if (updated) {
+    // v2.2.0 Phase 2: agent state change → fan out to dashboard WebSocket
+    // clients. set_status does NOT fire a webhook (internal state, not a
+    // third-party-delivery event), so broadcast directly. Rate-limited +
+    // never-throw inside the dashboard broadcast helper; safe here.
+    // v2.2.0 Codex audit H4: metadata-only — no status body. Clients
+    // refetch /api/snapshot to get the new agent_status; this push is
+    // just the "something changed" signal.
+    broadcastDashboardEvent({
+      event: "agent.state_changed",
+      entity_id: input.agent_name,
+      ts: new Date().toISOString(),
+      kind: "set_status",
+    });
+  }
   if (!updated) {
     return {
       content: [

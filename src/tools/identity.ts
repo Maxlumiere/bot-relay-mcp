@@ -58,6 +58,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     {
       description: input.description,
       managed: input.managed,
+      terminal_title_ref: input.terminal_title_ref,
       expectedRecoveryHash,
     }
   );

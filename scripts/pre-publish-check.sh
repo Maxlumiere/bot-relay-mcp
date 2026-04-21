@@ -123,6 +123,37 @@ sanctioned_helper_guard() {
 }
 step "sanctioned-helper guard (no raw agents mutations)" sanctioned_helper_guard || exit 1
 
+# --- 5c. IP-classifier consolidation guard (v2.2.0 Phase 5 / Codex Item 9) ---
+# Classification CIDR literals (like "127.0.0.0/8", "fe80::/10") belong in
+# src/ip-classifier.ts only. src/cidr.ts has the low-level matcher + a few
+# CIDR examples in doc comments, so it's also allowlisted. Every other src/
+# file MUST import from src/ip-classifier.ts instead of hardcoding ranges.
+#
+# The regex matches `"<v4>/<prefix>"` or `"<v6ish>/<prefix>"`. Tests + doc
+# strings in other files are allowed via the `// CIDR-ALLOWLIST: <reason>`
+# comment escape hatch.
+ip_classifier_guard() {
+  local hits
+  hits=$(grep -rnE '"[0-9a-fA-F:.]+/[0-9]+"' "$PROJECT_ROOT/src" \
+    --include='*.ts' \
+    | grep -v "^$PROJECT_ROOT/src/ip-classifier\.ts:" \
+    | grep -v "^$PROJECT_ROOT/src/cidr\.ts:" \
+    | grep -v "// CIDR-ALLOWLIST:" \
+    | grep -vE ':\s*(//|\*)' \
+    || true)
+  if [ -n "$hits" ]; then
+    echo "CIDR literals detected in src/ outside the allowed classifier files:" >&2
+    echo "$hits" >&2
+    echo "" >&2
+    echo "Fix: add the range to src/ip-classifier.ts + call isBlockedForSsrf / classifyIp." >&2
+    echo "If you genuinely need a one-off, append '// CIDR-ALLOWLIST: <reason>' to the line." >&2
+    return 1
+  fi
+  echo "No CIDR literals outside src/ip-classifier.ts + src/cidr.ts — classifier consolidated"
+  return 0
+}
+step "ip-classifier guard (no duplicate CIDR logic)" ip_classifier_guard || exit 1
+
 # --- 6. 25-tool + CLI smoke against an isolated relay (v2.1 Phase 5a) ---
 # Inline cleanup (no RETURN trap) — simpler + avoids set-u pitfalls around
 # deferred variable lookup in trap strings.

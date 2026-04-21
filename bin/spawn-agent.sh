@@ -205,6 +205,11 @@ Q_CAPS=$(printf '%q' "$CAPS")
 Q_CWD=$(printf '%q' "$CWD")
 
 CMD="export RELAY_AGENT_NAME=$Q_NAME; export RELAY_AGENT_ROLE=$Q_ROLE; export RELAY_AGENT_CAPABILITIES=$Q_CAPS;"
+# v2.2.0: RELAY_TERMINAL_TITLE flows to the SessionStart hook, which passes
+# it to register_agent. The dashboard click-to-focus driver uses the stored
+# title_ref to find + raise this window. Defaults to $DISPLAY_NAME (same
+# string claude --name uses for the tab title) so the DB value matches the
+# live window title without extra operator config.
 # v2.1 Phase 4j: when a token is provided, export it into the child's shell
 # so the spawned agent is authenticated from its first tool call.
 if [ -n "$TOKEN" ]; then
@@ -241,6 +246,11 @@ Q_PERM=$(printf '%q' "$PERMISSION_MODE")
 #     research / scoping don't need it. Override via RELAY_SPAWN_EFFORT.
 DISPLAY_NAME="${RELAY_SPAWN_DISPLAY_NAME:-$NAME}"
 Q_DISPLAY=$(printf '%q' "$DISPLAY_NAME")
+# v2.2.0: append RELAY_TERMINAL_TITLE export now that DISPLAY_NAME is resolved.
+# The SessionStart hook passes the value through to register_agent so the
+# dashboard click-to-focus driver can look up this window. $DISPLAY_NAME is
+# also what `claude --name` uses for the tab title — both are the same string.
+CMD="$CMD export RELAY_TERMINAL_TITLE=$Q_DISPLAY;"
 EFFORT="${RELAY_SPAWN_EFFORT:-high}"
 case "$EFFORT" in
   low|medium|high|xhigh|max) ;;

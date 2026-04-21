@@ -38,6 +38,11 @@ fi
 AGENT_NAME="${RELAY_AGENT_NAME:-default}"
 AGENT_ROLE="${RELAY_AGENT_ROLE:-user}"
 AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
+# v2.2.0: window title for the dashboard click-to-focus driver. Defaults to
+# the agent name when the spawn chain didn't set it (e.g. manual terminal
+# registrations). Empty → register_agent omits the field and the agent's
+# focus button stays disabled in the UI per the graceful-degrade contract.
+RELAY_TERMINAL_TITLE_VALUE="${RELAY_TERMINAL_TITLE:-}"
 DB_PATH="${RELAY_DB_PATH:-$HOME/.bot-relay/relay.db}"
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
@@ -214,7 +219,7 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   REG_BODY=$(curl -s -m 4 -w "\nHTTP_STATUS:%{http_code}\n" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}}}}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}}}}" \
     2>&1)
   # If $RELAY_HOOK_DEBUG is set, print the full response for troubleshooting.
   # Otherwise swallow silently — non-200 means the server refused (stale

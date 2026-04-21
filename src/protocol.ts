@@ -33,6 +33,13 @@
  *            since/status filters as get_messages). `get_messages` gains
  *            optional `since` arg (default "24h"; "all" or explicit null
  *            preserves pre-v2.1.6 unlimited behavior).
+ *   2.2.0  — v2.2.0 core dashboard observability. Additive: `register_agent`
+ *            accepts optional `terminal_title_ref` (dashboard click-to-focus
+ *            key), `discover_agents` + `/api/snapshot` surface the field,
+ *            new HTTP endpoints `POST /api/focus-terminal` + WebSocket
+ *            `/dashboard/ws`, new `content_preview` / `description_preview`
+ *            / `result_preview` fields on `/api/snapshot`. No breaking
+ *            changes — old clients ignore the new surface.
  *
  * Surfaced via `register_agent` + `health_check` response payloads so any
  * client can introspect compatibility before issuing tool calls. The relay
@@ -43,4 +50,4 @@
  * This file is intentionally the sole authoritative source — the drift-grep
  * in scripts/pre-publish-check.sh allowlists it alongside src/version.ts.
  */
-export const PROTOCOL_VERSION: string = "2.1.3";
+export const PROTOCOL_VERSION: string = "2.2.0";

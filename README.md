@@ -16,6 +16,22 @@ bot-relay-mcp gives AI coding agents and external systems a way to coordinate.
 
 Everything reads and writes the same SQLite file at `~/.bot-relay/relay.db`. There is no cloud, no daemon you have to install, no service mesh.
 
+## Why not just use Claude Agent Teams?
+
+Fair question. Claude Code v2.1.32 shipped Agent Teams — native multi-agent coordination inside Claude. If your setup is Claude-only and stays that way, use it. It's the right tool.
+
+bot-relay-mcp solves a different problem: coordination across a heterogeneous LLM stack. The tools your agents run on probably aren't all Claude. You might have Claude Code terminals for architecture work, Codex or Cursor on a different repo, an n8n workflow firing webhooks, a background Python process polling results, a Telegram bot forwarding alerts. Agent Teams coordinates Claude with Claude. bot-relay-mcp coordinates whatever speaks MCP (or plain HTTP) with whatever else does.
+
+Three things it does that a vendor-native solution can't:
+
+- **LLM-agnostic.** Any MCP client — Claude Code, Cursor, Cline, Zed — registers and talks to any other. Non-MCP systems join over the HTTP+SSE transport with optional Bearer auth. No client is privileged.
+- **Self-hosted.** Everything lives in a single SQLite file on your machine. No cloud account, no control plane, no vendor lock-in. The HTTP daemon is optional; stdio-only works offline.
+- **Federation-bound (v2.3 roadmap).** Hub/edge federation is on the locked plan so multiple self-hosted relays can mesh without collapsing into one shared namespace. Teams of teams, across orgs, without routing through someone else's service.
+
+It's also a durable bus, not an in-process coordinator. Messages, tasks, and channels survive individual agent sessions — restart a terminal, spawn a fresh one, come back tomorrow; the state is still there.
+
+If your stack is Claude-only and stays that way, use Agent Teams. If it isn't, or if you want a self-hosted bus that survives individual sessions, that's what bot-relay-mcp is for.
+
 ## Quick Start (30 seconds)
 
 Once published to npm, setup is a single config entry — no cloning, no compiling, no absolute paths.

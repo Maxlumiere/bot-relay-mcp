@@ -137,6 +137,7 @@ function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
     agent_status: deriveAgentStatus(row.agent_status, row.last_seen),
     description: row.description ?? null,
     session_id: row.session_id ?? null,
+    terminal_title_ref: row.terminal_title_ref ?? null,
   };
 }
 
@@ -174,6 +175,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_4(_db);
   migrateSchemaToV2_5(_db);
   migrateSchemaToV2_6(_db);
+  migrateSchemaToV2_7(_db);
   purgeOldRecords(_db);
 }
 
@@ -203,6 +205,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_4(_db);
   migrateSchemaToV2_5(_db);
   migrateSchemaToV2_6(_db);
+  migrateSchemaToV2_7(_db);
   purgeOldRecords(_db);
 
   return _db;
@@ -406,6 +409,10 @@ function initSchema(db: CompatDatabase): void {
  * nullable column, anchors the `session_start` sentinel in the `since` filter
  * on get_messages / get_messages_summary).
  *
+ * v2.2.0 bumped 8 → 9 alongside migrateSchemaToV2_7 (agents.terminal_title_ref
+ * nullable column, used by the dashboard's click-to-focus driver to find the
+ * agent's live terminal window across iTerm2 / wmctrl / AppActivate).
+ *
  * v2.1 Phase 7q bumped 5 → 6 alongside migrateSchemaToV2_4 (agents.visibility
  * column reserved for v2.3 hub federation, mailbox + agent_cursor tables
  * reserved for Phase 4s v2.2 delivery-seq protocol). All additions empty /
@@ -414,7 +421,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -454,6 +461,7 @@ export function applyMigration(from: number, to: number): void {
   if (from === 5 && to === 6) return;
   if (from === 6 && to === 7) return;
   if (from === 7 && to === 8) return;
+  if (from === 8 && to === 9) return;
   throw new Error(
     `no migration registered for schema_version ${from}→${to}. ` +
     `Register a handler in src/db.ts applyMigration and update CURRENT_SCHEMA_VERSION.`
@@ -915,6 +923,24 @@ function migrateSchemaToV2_6(db: CompatDatabase): void {
     .all() as Array<{ name: string }>;
   if (!agentCols.some((c) => c.name === "session_started_at")) {
     db.exec("ALTER TABLE agents ADD COLUMN session_started_at TEXT");
+  }
+}
+
+/**
+ * v2.2.0 — add `agents.terminal_title_ref` for the dashboard's click-to-focus
+ * driver. Captured at register_agent time from `RELAY_TERMINAL_TITLE` (set
+ * by the spawn chain). Nullable — legacy rows + agents that register without
+ * the env var fall through to a disabled focus button in the UI per the
+ * spec's graceful-degrade contract.
+ *
+ * Additive + idempotent. No data backfill.
+ */
+function migrateSchemaToV2_7(db: CompatDatabase): void {
+  const agentCols = db
+    .prepare("PRAGMA table_info(agents)")
+    .all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "terminal_title_ref")) {
+    db.exec("ALTER TABLE agents ADD COLUMN terminal_title_ref TEXT");
   }
 }
 
@@ -1420,6 +1446,8 @@ export function registerAgent(
   options: {
     description?: string;
     managed?: boolean;
+    /** v2.2.0: window title for the dashboard click-to-focus driver. Mutable on re-register. */
+    terminal_title_ref?: string | null;
     /**
      * v2.1 Phase 7p HIGH #2: when set, pins the CAS predicate to exactly this
      * recovery_token_hash value (on the recovery_pending → active transition).
@@ -1516,12 +1544,21 @@ export function registerAgent(
     // v2.1.6: session_started_at is rotated in lockstep with session_id. The
     // new timestamp anchors the `session_start` sentinel on subsequent
     // get_messages / get_messages_summary calls from this session.
+    // v2.2.0: terminal_title_ref is mutable on re-register — if caller passes
+    // an explicit value it replaces the stored one; if omitted (undefined)
+    // the prior value is preserved. Passing explicit null clears it.
+    const newTitleRef =
+      options.terminal_title_ref !== undefined
+        ? options.terminal_title_ref
+        : existing.terminal_title_ref ?? null;
     const r = db.prepare(
       "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
+      "terminal_title_ref = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ? " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
       role, timestamp, newHash, session_id, timestamp, newDescription,
+      newTitleRef,
       newAuthState, newRecoveryHash, newRevokedAt,
       name, existingState, existing.token_hash, casRecoveryHash
     );
@@ -1538,6 +1575,7 @@ export function registerAgent(
       token_hash: newHash,
       session_id,
       description: newDescription,
+      terminal_title_ref: newTitleRef,
       auth_state: newAuthState,
       recovery_token_hash: newRecoveryHash,
       revoked_at: newRevokedAt,
@@ -1551,11 +1589,13 @@ export function registerAgent(
     // v2.1 Phase 4b.2: managed flag captured at first registration + immutable
     // thereafter (same rule as capabilities per v1.7.1). Default 0.
     const managed = options.managed ? 1 : 0;
+    const titleRef = options.terminal_title_ref ?? null;
     db.prepare(
       // v2.1.3 (I6): default agent_status is now 'idle' (was 'online').
       // v2.1.6: session_started_at = timestamp for first-register anchor.
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description, managed);
+      // v2.2.0: terminal_title_ref captured on first register (may be null).
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed, terminal_title_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description, managed, titleRef);
 
     // v2.0: populate normalized agent_capabilities table.
     const insertCap = db.prepare("INSERT OR IGNORE INTO agent_capabilities (agent_name, capability) VALUES (?, ?)");
@@ -1575,6 +1615,7 @@ export function registerAgent(
       description,
       agent_status: "idle", // v2.1.3 (I6)
       managed,
+      terminal_title_ref: titleRef,
     });
   }
 

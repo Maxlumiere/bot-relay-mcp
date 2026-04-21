@@ -8,6 +8,15 @@ import { randomUUID, timingSafeEqual, createHmac, randomBytes } from "crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "../server.js";
 import { renderDashboard, snapshotApi, keyringApi } from "../dashboard.js";
+import { focusTerminal } from "../focus/dispatcher.js";
+import { FocusTerminalSchema } from "../types.js";
+import { getDb } from "../db.js";
+import { attachDashboardWs } from "./websocket.js";
+import {
+  checkHostHeader,
+  checkOrigin,
+  parseHostAllowlist,
+} from "./boundary-checks.js";
 import { loadConfig } from "../config.js";
 import { log } from "../logger.js";
 import { requestContext } from "../request-context.js";
@@ -29,23 +38,9 @@ import type { Server } from "http";
  * is the "real" client IP. This is the leftmost-untrusted-hop rule from
  * RFC 7239 §7.4.
  */
-export /**
- * Match an Origin header against an allowlist pattern.
- * Supported forms:
- *   - exact: "http://localhost" matches only that exact origin
- *   - port glob: "http://localhost:*" matches any port
- *   - host glob (future): "https://*.example.com" — NOT supported yet, keep simple
- */
-function matchesOrigin(origin: string, pattern: string): boolean {
-  if (pattern === origin) return true;
-  if (pattern.endsWith(":*")) {
-    const prefix = pattern.slice(0, -1); // drop the trailing *
-    // origin must start with prefix and then have a port number (digits) followed by end or a path
-    const remainder = origin.slice(prefix.length);
-    return origin.startsWith(prefix) && /^\d+(\/.*)?$/.test(remainder);
-  }
-  return false;
-}
+// v2.2.0 Codex audit H3: `matchesOrigin` + Host-header parsing moved to
+// `src/transport/boundary-checks.ts` as pure functions so the WebSocket
+// upgrade handler + the HTTP middleware chain share one implementation.
 
 /**
  * Constant-time string equality on UTF-8 byte content. Returns false on any
@@ -122,6 +117,10 @@ const DASHBOARD_ROUTES_BYPASSING_HTTP_SECRET: ReadonlySet<string> = new Set([
   "/dashboard",
   "/api/snapshot",
   "/api/keyring",
+  // v2.2.0 Codex audit H1: dashboard click-to-focus POST must traverse
+  // dashboardAuthCheck (not authMiddleware's HTTP-secret gate). The
+  // dashboard JS sends auth via cookie, not Authorization header.
+  "/api/focus-terminal",
 ]);
 
 /**
@@ -359,19 +358,20 @@ export function startHttpServer(port: number, host: string): Server {
     });
   });
 
-  // v1.7: CORS / Origin allow-list check for dashboard routes.
-  // A request with an Origin header outside the allowlist is 403'd. Requests
-  // without an Origin header (non-browser callers like curl) are allowed.
+  // v1.7 + v2.2.0 Codex H3: Origin check delegates to the shared helper
+  // in boundary-checks.ts. Pure function returns {ok, origin?, reason?};
+  // this middleware wraps the result into an Express response + echoes
+  // Access-Control-Allow-Origin on allow.
   const originCheck = (req: Request, res: Response, next: NextFunction) => {
-    const origin = req.headers.origin;
-    if (!origin) return next(); // non-browser caller
-    const allowed = config.allowed_dashboard_origins.some((pattern) => matchesOrigin(origin, pattern));
-    if (!allowed) {
-      res.status(403).json({ error: "Origin not allowed", origin });
+    const r = checkOrigin(req.headers.origin, config.allowed_dashboard_origins);
+    if (!r.ok) {
+      res.status(403).json({ error: "Origin not allowed", origin: r.origin });
       return;
     }
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
+    if (r.origin) {
+      res.setHeader("Access-Control-Allow-Origin", r.origin);
+      res.setHeader("Vary", "Origin");
+    }
     next();
   };
 
@@ -396,47 +396,18 @@ export function startHttpServer(port: number, host: string): Server {
   // /health is excluded: monitors often probe with a plain IP:port Host and
   // rejecting them adds no security (endpoint is read-only + surfaces nothing
   // sensitive).
-  const hostAllowlistOverride: Set<string> | null = (() => {
-    // v2.1.7: canonical env var. Falls back to the pre-v2.1.7 name for
-    // existing deployments — documented in SECURITY.md + HANDOFF.md.
-    const raw =
-      process.env.RELAY_HTTP_ALLOWED_HOSTS ?? process.env.RELAY_DASHBOARD_HOSTS;
-    if (!raw || !raw.trim()) return null;
-    return new Set(raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
-  })();
-  const DEFAULT_LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-  // Strip port from a Host header for hostname-only comparison.
-  // Handles both `host:port` and bracketed IPv6 `[::1]:port`.
-  const hostnameOnly = (hostHeader: string): string => {
-    const bracket = hostHeader.match(/^\[([^\]]+)\](?::\d+)?$/);
-    if (bracket) return `[${bracket[1]}]`;
-    const idx = hostHeader.lastIndexOf(":");
-    return idx === -1 ? hostHeader : hostHeader.slice(0, idx);
-  };
+  // v2.1.7 + v2.2.0 Codex H3: Host-header check delegates to the shared
+  // helper in boundary-checks.ts. Parse the allowlist once at startup
+  // (env override captured for the lifetime of this process); the
+  // per-request path is a pure function call.
+  const hostAllowlistOverride = parseHostAllowlist(process.env);
   const httpHostCheck = (req: Request, res: Response, next: NextFunction) => {
     if (req.path === "/health") return next();
-    const hostHeader = (req.headers.host || "").toLowerCase();
-    let allowed = false;
-    if (hostAllowlistOverride) {
-      // v2.1.7 refinement: operators often write `RELAY_HTTP_ALLOWED_HOSTS=
-      // dashboard.example.com` without a port (port is selected by the bind,
-      // not by policy). Accept EITHER full `host:port` verbatim match OR a
-      // hostname-only entry matching the stripped Host hostname. Strict
-      // operators can still pin to exact host:port by including the port.
-      if (hostAllowlistOverride.has(hostHeader)) {
-        allowed = true;
-      } else {
-        const hname = hostnameOnly(hostHeader);
-        if (hostAllowlistOverride.has(hname)) allowed = true;
-      }
-    } else {
-      // Default: strip port, accept if hostname is a loopback literal.
-      allowed = DEFAULT_LOOPBACK_HOSTNAMES.has(hostnameOnly(hostHeader));
-    }
-    if (!allowed) {
+    const r = checkHostHeader(req.headers.host, hostAllowlistOverride);
+    if (!r.ok) {
       res.status(421).json({
         error: "Misdirected Request",
-        host: hostHeader,
+        host: r.host,
         hint:
           "This relay does not serve this Host. Set RELAY_HTTP_ALLOWED_HOSTS=<comma-list> " +
           "(or the legacy alias RELAY_DASHBOARD_HOSTS) to allow it.",
@@ -554,6 +525,14 @@ export function startHttpServer(port: number, host: string): Server {
   const csrfCheck = (req: Request, res: Response, next: NextFunction) => {
     if (!UNSAFE_METHODS.has(req.method)) return next();
     if (!req.path.startsWith("/api/")) return next();
+    // v2.2.0: CSRF is meaningful only when a cookie-based dashboard session
+    // exists. In loopback dev mode (no RELAY_DASHBOARD_SECRET + no
+    // RELAY_HTTP_SECRET) dashboardAuthCheck skips auth entirely and never
+    // issues the relay_csrf cookie, so there is no session to protect —
+    // skip the check. The instant an operator sets either secret, CSRF
+    // re-activates on state-changing endpoints.
+    const dashboardSecret = process.env.RELAY_DASHBOARD_SECRET || loadConfig().http_secret || null;
+    if (!dashboardSecret) return next();
     const cookieHeader = req.headers.cookie;
     let cookieToken: string | null = null;
     if (typeof cookieHeader === "string") {
@@ -585,6 +564,49 @@ export function startHttpServer(port: number, host: string): Server {
   // v2.1 Phase 4b.3: keyring info endpoint. Returns current + known key_ids
   // + per-column legacy-row counts. NEVER exposes raw keys.
   app.get("/api/keyring", dashboardAuthCheck, originCheck, keyringApi);
+
+  // v2.2.0 Phase 1: dashboard click-to-focus endpoint. Looks up the agent's
+  // terminal_title_ref then dispatches to the platform focus driver
+  // (osascript iTerm2 / wmctrl / PowerShell AppActivate). csrfCheck gates
+  // the POST via the v2.1.7 double-submit infrastructure — the first
+  // state-changing /api/* endpoint exercises the CSRF surface end-to-end.
+  app.post("/api/focus-terminal", dashboardAuthCheck, originCheck, async (req: Request, res: Response) => {
+    const parsed = FocusTerminalSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        raised: false,
+        error: "invalid request body",
+        detail: parsed.error.issues.map((i) => i.message),
+      });
+      return;
+    }
+    const { agent_name } = parsed.data;
+    let row: { terminal_title_ref: string | null } | undefined;
+    try {
+      row = getDb()
+        .prepare("SELECT terminal_title_ref FROM agents WHERE name = ?")
+        .get(agent_name) as { terminal_title_ref: string | null } | undefined;
+    } catch (err) {
+      log.error("[focus] DB lookup failed:", err);
+      res.status(500).json({ raised: false, reason: "internal error — see server log" });
+      return;
+    }
+    if (!row) {
+      res.status(404).json({ raised: false, reason: `agent "${agent_name}" not registered` });
+      return;
+    }
+    if (!row.terminal_title_ref) {
+      res.status(409).json({
+        raised: false,
+        reason:
+          `agent "${agent_name}" has no terminal_title_ref — spawn via bin/spawn-agent.sh ` +
+          `or re-register with the terminal_title_ref field to enable focus.`,
+      });
+      return;
+    }
+    const result = await focusTerminal(row.terminal_title_ref);
+    res.status(result.raised ? 200 : 409).json(result);
+  });
 
   // Stateless MCP endpoint — new transport + server per request
   app.post("/mcp", async (req: Request, res: Response) => {
@@ -645,6 +667,11 @@ export function startHttpServer(port: number, host: string): Server {
       `  NOTE: stdio MCP clients (each Claude Code terminal with "type":"stdio" in ~/.claude.json spawns its own server process) are process-independent from this daemon. Restarting this daemon does NOT affect them; operator /mcp reconnect is only needed for "type":"http" MCP clients pointed at ${host}:${port}. See docs/transport-architecture.md.`
     );
   });
+
+  // v2.2.0 Phase 2: attach the dashboard WebSocket server to the running
+  // http.Server. Hijacks only /dashboard/ws upgrades; every other upgrade
+  // path is left untouched. Auth is checked inside attachDashboardWs.
+  attachDashboardWs(server);
 
   return server;
 }

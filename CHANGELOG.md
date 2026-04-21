@@ -1,5 +1,123 @@
 # Changelog
 
+## v2.2.0 — 2026-04-21 — core dashboard observability (+ bundled webhook TOCTOU fix + IP-classifier consolidation)
+
+v2.2.0 is the first MINOR release in the 2.x line. Focus: operator-facing dashboard. Ships core observability (Phases 1-3 of the dashboard spec) plus two bundled fixes from the v2.1.7 audit — the webhook DNS TOCTOU (Item 7, deferred) and the IP-classifier consolidation (Item 9, v2.2 candidate). v2.2.1 polish items (themes / custom-paste / inline send / kill / set-status) ship in a separate cycle.
+
+Protocol bumps `2.1.3 → 2.2.0` (MINOR — new HTTP endpoint + new WebSocket endpoint + additive `terminal_title_ref` field on `register_agent` / `discover_agents` + new `*_preview` fields on `/api/snapshot`). No breaking changes. Schema migrates `v8 → v9`.
+
+### ⚠ Policy change for operators — `/api/snapshot` now returns decrypted content previews
+
+Pre-v2.2.0, `/api/snapshot` returned the raw at-rest-encrypted `content` / `description` / `result` fields verbatim so a dashboard-auth failure could not leak plaintext (see v2.1 Phase 4d design note in `src/dashboard.ts`). v2.2.0 **adds** `content_preview` / `description_preview` / `result_preview` fields alongside the raw encrypted ones — 100-char decrypted previews rendered by the new reactive dashboard.
+
+Narrow scope of the expansion:
+- Raw `content` / `description` / `result` stay as ciphertext in the response for clients that want the on-disk form.
+- Preview fields are new sibling keys; they do NOT replace the raw fields.
+- The dashboard remains gated by `dashboardAuthCheck` + `originCheck` + `httpHostCheck` (plus CSRF on state-changing endpoints). Any caller who can reach the previews can already call `get_messages` with the same decrypted result — the preview is equivalent surface.
+- If your deployment is loopback-only with no dashboard secret (dev-mode default), the previews are only reachable from the same machine's local processes — the same trust boundary `get_messages` already assumes.
+
+**If your threat model relies on `/api/snapshot` NEVER decrypting at rest** (e.g. you shipped a custom audit pipeline that pointed at it), set `RELAY_DASHBOARD_SECRET` to gate the endpoint, or stop scraping it and use `get_messages` directly.
+
+### Platform validation status (read before deploying to Linux or Windows)
+
+v2.2.0 introduces three platform-specific click-to-focus drivers. Validation coverage at ship time is **not symmetric across platforms**:
+
+- **macOS** — end-to-end validated. Full unit + integration test coverage (~90 tests across the v2.2.0 phase suites + 9 Codex-patch regressions). iTerm2 raise verified manually at ship ceremony.
+- **Linux** — code paths covered by command-construction tests (mocked spawn for `wmctrl -a`). **Not E2E-verified on a real Linux box at ship.** Architecture mirrors macOS; behavioral-divergence risk judged low. `wmctrl` is detected at startup; the focus endpoint graceful-degrades (409 with install hint) when absent.
+- **Windows** — code paths covered by command-construction tests (mocked spawn for PowerShell `WScript.Shell.AppActivate`). **Not E2E-verified on a real Windows box at ship.** Same low-risk assessment. Native to Windows; no extra install required.
+
+Non-focus surfaces (the dashboard UI, WebSocket push, bundled security fixes) are pure server-side TS / Node and ship at full parity across all three platforms.
+
+If you operate on Linux or Windows and observe a focus-driver issue, please open an issue at https://github.com/Maxlumiere/bot-relay-mcp/issues with your distro / Windows version + the `/api/focus-terminal` response body. Operator validation closes this gap until automated cross-platform CI lands in a future v2.2.x.
+
+### Phase 1 — click-to-focus foundation
+
+- Schema v9 (`migrateSchemaToV2_7`) adds `agents.terminal_title_ref TEXT` nullable column. `registerAgent` writes it on INSERT + mutable-on-re-register update path.
+- `RegisterAgentSchema` accepts optional `terminal_title_ref` (allowlist `[A-Za-z0-9_.\- ]`, 1-100 chars — safe for interpolation into osascript / wmctrl / PowerShell).
+- Spawn chain threads `RELAY_TERMINAL_TITLE` through `bin/spawn-agent.sh` + `src/spawn/validation.ts buildChildEnv` (Linux + Windows drivers) + `hooks/check-relay.sh` so every spawned terminal self-registers with its window title.
+- New `src/focus/` directory with a platform dispatcher + three drivers:
+  - **macOS** — osascript tells iTerm2 to select the first session whose name matches the stored title_ref.
+  - **Linux** — `wmctrl -a <title>` (requires `wmctrl` package; graceful-degrade with install hint when missing).
+  - **Windows** — PowerShell `WScript.Shell.AppActivate(<title>)` (native, no extra install).
+- New `POST /api/focus-terminal` endpoint gated by `dashboardAuthCheck` + `originCheck` + the v2.1.7 CSRF infra. 404 on unknown agent, 409 on NULL title_ref (graceful degrade with operator hint), 200 on raised.
+
+### Phase 2 — WebSocket push layer
+
+- New `ws@^8.20.0` dep (runtime) + `@types/ws` (dev). Zero transitive runtime deps.
+- `src/transport/websocket.ts` attaches to the running `http.Server` and hijacks `upgrade` events on `/dashboard/ws` only.
+- Auth mirrors `dashboardAuthCheck`: `RELAY_DASHBOARD_SECRET` (or `RELAY_HTTP_SECRET` fallback) for remote clients; loopback peer permitted with no secret. Secret channels: `?auth=<secret>` query, `Cookie: relay_dashboard_auth=<secret>`, `Sec-WebSocket-Protocol: bearer.<secret>` (programmatic escape hatch).
+- Broadcast taxonomy (collapsed from the webhook event enum):
+  - `agent.state_changed` — `set_status` + `agent.unregistered/spawned/health_timeout`
+  - `message.sent` — `message.sent` + `message.broadcast`
+  - `task.transitioned` — all `task.*` lifecycle webhooks collapse to one stream
+  - `channel.posted` — `channel.message_posted`
+- Rate-limit: 1 broadcast per 500ms per `(event_type, entity_id)` tuple. Trailing broadcasts in the window are dropped (not queued) — operators get eventually-consistent state via `/api/snapshot` + the next real transition.
+- Hello frame on connect (`{event:"dashboard.hello", ts}`) lets clients confirm auth+open; `setImmediate` defers the first frame one tick so client listeners have time to attach.
+- Wired into `fireWebhooks` + direct from `handleSetStatus`. NEVER throws — bad client socket cannot take down the webhook pipeline.
+
+### Phase 3 — frontend rewrite
+
+- `src/dashboard.ts` rewritten: vanilla JS (no framework, no bundler, no build step). ~200-line inline IIFE.
+- CSS grid with `--cards-per-row` custom property; top-right toggle (2/3/4). localStorage persists user prefs across reloads (cards-per-row, role filter, status filter, since filter).
+- Filter bar: role (text), status (enum), since (time window) — all aria-labeled.
+- Agent cards: state badge (`idle`/`working`/`blocked`/`waiting_user`/`stale`/`offline`), role, last-seen relative time. Click / Enter / Space opens the focused-agent panel.
+- Recent messages timeline as `<button class="msg-row" aria-expanded="…">` rows inside `<ul role="list">`. Click toggles `aria-expanded` → reveals the full body (ARIA-compliant accordion).
+- Focused-agent panel: bottom placement. Shows title_ref + status + recent-message count + "Raise terminal" button (disabled when title_ref null). Button POSTs to `/api/focus-terminal`; success briefly shows `raised <platform>` in the connection pill.
+- WebSocket connection to `/dashboard/ws` with exponential backoff (1s → 30s cap) on close. Safety-net poll of `/api/snapshot` every 10s regardless of WS state.
+- Every push event triggers a full `/api/snapshot` re-fetch — server is source of truth, push is a "something changed" signal (simpler than diff-merging; same effective latency).
+- `/api/snapshot` gains `content_preview` / `description_preview` / `result_preview` fields (100-char decrypted). Narrow expansion of the v2.1 Phase 4d encryption-policy: the dashboard is behind dashboardAuthCheck + originCheck + httpHostCheck, so any reachable caller is by definition authorized to call `get_messages`.
+
+### Phase 4 — webhook DNS TOCTOU fix (bundled v2.1.7 Item 7)
+
+- New `src/webhook-delivery.ts` — `deliverPinnedPost(url, pinnedIp, headers, body, timeoutMs)` delivers over Node's built-in `http`/`https` modules with the TCP connection pinned to a validated IP.
+- TLS SNI + certificate validation anchor on the URL hostname (`servername` option); `Host:` header carries the URL hostname so vhost routing works.
+- Both webhook fire sites (`deliverWebhook` + `retryOne`) now use it. `validateWebhookUrl` → capture first safe IP → `deliverPinnedPost`. Closes the race a fast-flip authoritative DNS server could previously exploit between validate + socket open.
+- No new dependencies — stdlib `http` + `https` modules already separate "where to connect" from "what to present in SNI / Host header".
+
+**Behavior change — redirect handling preserves POST across all 3xx codes (post-audit Codex note).** Pre-v2.2.0 behavior was native `fetch()` (which internally follows up to 20 redirects with spec-defined method rewriting: 301/302/303 downgrade POST → GET, 307/308 preserve). v2.2.0's stdlib `deliverPinnedPost` follows up to **5** 3xx hops and **preserves POST + body across all of them** — including 301/302/303 where the RFCs SHOULD downgrade. Rationale: webhook consumers configuring a 301/302 on their endpoint almost certainly want the POST forwarded to the final URL, not a silent method rewrite to GET that arrives with no body. Every redirect target is re-validated via `validateWebhookUrl` (full SSRF re-gate, re-pinning to the new target's validated IP) so unsafe redirects still terminate. If your webhook consumer strictly relies on 303 semantics downgrading POST → GET, configure the final endpoint directly instead of redirecting.
+
+### Phase 5 — IP-classifier consolidation (bundled v2.1.7 Item 9)
+
+- New `src/ip-classifier.ts` — single source of truth for IP classification CIDRs. IPv4 hand-rolled octet checks in `src/url-safety.ts` migrated to real CIDR matching via `src/cidr.ts` for consistency with IPv6.
+- Exports `classifyIp`, `classifyIPv4`, `classifyIPv6`, `isBlockedForSsrf` (alias). All existing IPv6/IPv4 tests in `tests/cidr.test.ts` and `tests/url-safety.test.ts` pass unchanged.
+- New pre-publish drift guard: rejects hardcoded CIDR literals anywhere in `src/` outside `ip-classifier.ts` + `cidr.ts`. Escape hatch: `// CIDR-ALLOWLIST: <reason>` comment for one-offs.
+
+### Phase 6 — release prep
+
+- `--full` dashboard smoke (`tests/v2-2-0-full-dashboard-smoke.test.ts`): one server, every surface in one flow — health, /dashboard HTML, /api/snapshot with preview fields, /api/focus-terminal 404 + 409 paths, WS hello, TOCTOU-pinned delivery round-trip.
+- `package.json` 2.1.7 → 2.2.0.
+- `src/protocol.ts` 2.1.3 → 2.2.0 (MINOR additive).
+- `devlog/066-v2.2.0-dashboard-and-bundled-fixes.md` — assumptions-first.
+
+### ⚠ Security patches from Codex pre-ship audit (applied before release)
+
+Codex dual-model audit of the v2.2.0 build returned PATCH-THEN-SHIP with 4 HIGH + 1 MEDIUM + 2 LOW findings. All patched in ~45 min before the final SHIP verdict. Surfaces tightened since the original Phase 1-5 build described above:
+
+- **`/api/focus-terminal` now on the `DASHBOARD_ROUTES_BYPASSING_HTTP_SECRET` allowlist** — previously blocked by the global `authMiddleware` when `RELAY_HTTP_SECRET` was set. Click-to-focus now works under any authentication configuration, not just loopback-no-secret dev mode.
+- **Dashboard frontend forwards `X-Relay-CSRF` header** on `/api/focus-terminal` POST, sourced from the `relay_csrf` cookie via a new `csrfHeader()` helper. Pattern reused by any future state-changing endpoint from the dashboard.
+- **Shared Host + Origin boundary helpers in `src/transport/boundary-checks.ts`** — the HTTP middleware chain and the WebSocket upgrade handler both import from one module. WS upgrade now emits `421` on bad Host and `403` on bad Origin, BEFORE the auth check. Closes a DNS-rebinding / cross-origin gap on `/dashboard/ws` that existed in the initial Phase 2 build.
+- **Dashboard WebSocket broadcast payloads trimmed to metadata only** (`{event, entity_id, ts, kind?}`). Raw webhook `data` + plaintext `message.sent content` are no longer pushed over the socket; clients refetch `/api/snapshot` when they need full detail. Minimizes blast-radius for a dashboard-auth failure.
+- **Webhook redirect-following (post-audit MEDIUM)** — `deliverPinnedPost` follows up to 5 3xx hops. **Each redirect target is re-validated via the full `validateWebhookUrl` (SSRF re-gate) and re-pinned to a validated IP.** Unsafe redirects terminate with a stable reason. POST is preserved across **all 3xx codes (301 / 302 / 303 in addition to 307 / 308)** — a webhook-oriented choice that differs from RFC strict expectations for 301/302/303. If your webhook target intentionally relies on the RFC behavior (POST → GET on 301/302/303), configure it to respond 307/308 instead.
+
+Re-audit verdict: SHIP. Execution evidence: `tests/v2-2-0-codex-patches.test.ts` (9 new regression cases) passed end-to-end in a targeted Vitest run on the Codex side. Full `--full` pre-publish gate: 11/11 PASS.
+
+### Hall of Fame
+
+v2.2.0 ships two Codex v2.1.7 audit findings alongside the dashboard core:
+
+- **Codex** — v2.2 spec split (core vs polish), IP-classifier consolidation, TOCTOU Undici recommendation (implemented via stdlib `http`/`https` pinning — same effect, no new dep).
+- **Steph** — underlying class of TOCTOU vulnerability flagged in the v2.1.7 review that this release closes.
+
+### Tests
+
+- **896 default tests pass** (887 Phase 1-6 total + 9 Codex-patch regressions in `tests/v2-2-0-codex-patches.test.ts`). Net new vs v2.1.7: +51 tests covering Phase 1 (19) + Phase 2 (9) + Phase 3 (9) + Phase 4 (5) + Phase 5 (37) + Phase 6 dashboard smoke (1) + Codex patches (9), minus some test-hygiene merges.
+- 3 existing assertion updates for schema v8 → v9 (`tests/v2-1-3-agent-status-enum.test.ts` + `tests/v2-1-schema-info.test.ts`).
+- `--full` gate 11/11 PASS: tsc + vitest + npm audit + build + drift-grep + sanctioned-helper + **new ip-classifier drift guard** + 25-tool smoke + remote-pair smoke + load + chaos + cross-version.
+
+### Out of scope for v2.2.0 (deferred to v2.2.1)
+
+Themes (catppuccin / dark / light), custom-paste theme JSON + `set_dashboard_theme` MCP tool, inline send-message form, inline kill-agent + `/api/kill-agent`, inline set-status dropdown + `/api/set-status`. These require more design iteration than the core observability layer; shipping the operator-facing foundation first lets the polish pass be informed by real usage.
+
 ## v2.1.7 — 2026-04-21 — security hardening (external review: Steph + Codex)
 
 Focused security patch from external review. Steph (Maxime's wife's primary AI) surfaced four findings during a LAN-deployment review; Codex's follow-up dual-model audit added five more. v2.1.7 ships fixes for the HIGH and MEDIUM items; one MEDIUM (webhook DNS fast-flip TOCTOU) is deferred to v2.1.8, and two LOW items are documented in SECURITY.md. No tool surface change — protocol unchanged at `2.1.3`.

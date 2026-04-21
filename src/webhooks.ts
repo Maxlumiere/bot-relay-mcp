@@ -18,6 +18,8 @@ import { log } from "./logger.js";
 import type { WebhookEvent } from "./types.js";
 import { VERSION } from "./version.js";
 import { validateWebhookUrl } from "./url-safety.js";
+import { broadcastDashboardEvent, type DashboardEvent } from "./transport/websocket.js";
+import { deliverPinnedPost } from "./webhook-delivery.js";
 
 export interface WebhookPayload {
   event: WebhookEvent;
@@ -87,6 +89,62 @@ export function deriveIdempotencyKey(
 }
 
 /**
+ * v2.2.0 Phase 2: map a webhook event onto the coarser dashboard event
+ * taxonomy + broadcast. Mapping:
+ *   - message.sent / message.broadcast   → message.sent
+ *   - task.* (all lifecycle transitions) → task.transitioned
+ *   - channel.message_posted              → channel.posted
+ *   - agent.* (state-impacting)           → agent.state_changed
+ *   - webhook.delivery_failed             → NOT broadcast (operator concern,
+ *                                            not something a dashboard user
+ *                                            watches for)
+ *
+ * v2.2.0 Codex audit H4: broadcasts are METADATA-ONLY. No body content,
+ * no raw webhook payload — the client treats pushes as "refetch" signals
+ * and ignores the body anyway. The `kind` field carries the
+ * underlying webhook event name for clients that want to render a
+ * one-word activity tag without looking up details.
+ *
+ * Fire-and-forget. broadcastDashboardEvent rate-limits + swallows errors.
+ */
+function emitDashboardBroadcast(
+  event: WebhookEvent,
+  fromAgent: string,
+  toAgent: string,
+  data: Partial<WebhookPayload>
+): void {
+  let dashEvent: DashboardEvent["event"] | null = null;
+  let entityId = "";
+
+  if (event === "message.sent" || event === "message.broadcast") {
+    dashEvent = "message.sent";
+    entityId = (data.message_id as string | undefined) ?? `${fromAgent}->${toAgent}`;
+  } else if (event.startsWith("task.")) {
+    dashEvent = "task.transitioned";
+    entityId =
+      (data.task_id as string | undefined) ??
+      (data.task?.id as string | undefined) ??
+      `${fromAgent}->${toAgent}`;
+  } else if (event === "channel.message_posted") {
+    dashEvent = "channel.posted";
+    entityId = (data.channel_name as string | undefined) ?? `${fromAgent}->${toAgent}`;
+  } else if (event === "agent.unregistered" || event === "agent.spawned" || event === "agent.health_timeout") {
+    dashEvent = "agent.state_changed";
+    entityId = fromAgent || toAgent || "unknown";
+  } else {
+    // webhook.delivery_failed + '*' never broadcast.
+    return;
+  }
+
+  broadcastDashboardEvent({
+    event: dashEvent,
+    entity_id: entityId,
+    ts: new Date().toISOString(),
+    kind: event,
+  });
+}
+
+/**
  * Fire webhooks matching the event. Fire-and-forget with timeout.
  * Never throws — errors are logged to webhook_delivery_log.
  */
@@ -96,6 +154,14 @@ export function fireWebhooks(
   toAgent: string,
   data: Partial<WebhookPayload>
 ): void {
+  // v2.2.0 Phase 2: every fireWebhooks call ALSO fans out to connected
+  // dashboard WebSocket clients (if any). Mapped to the coarser dashboard
+  // event taxonomy — five task.* webhook events collapse to one
+  // task.transitioned dashboard event so the frontend renders a single
+  // lifecycle stream per task. Broadcast is rate-limited + never-throw
+  // inside broadcastDashboardEvent; safe to call unconditionally.
+  emitDashboardBroadcast(event, fromAgent, toAgent, data);
+
   const webhooks = getWebhooksForEvent(event, fromAgent, toAgent);
   if (webhooks.length === 0) return;
 
@@ -136,15 +202,13 @@ async function deliverWebhook(
   // not enough — an attacker controlling DNS can flip the record between
   // register and fire.
   //
-  // v2.1.7 Item 7 (Codex): residual TOCTOU between this validate and the
-  // `fetch(url, ...)` below. Native fetch re-resolves the hostname at the
-  // socket layer, so fast-flip authoritative DNS (sub-second TTL) can still
-  // land the connection on a different IP. Closing this requires pinning
-  // fetch to the validated IP while preserving TLS/SNI on the hostname —
-  // Undici's per-request dispatcher with a custom `connect.lookup` is the
-  // mechanism, but introducing a direct undici dep + cutting over both
-  // webhook fire paths is larger than the v2.1.7 patch envelope. DEFERRED
-  // to v2.1.8. Tracked in CHANGELOG and SECURITY.md "Known residual gaps".
+  // v2.2.0 Phase 4 (bundled v2.1.7 Item 7 from Codex): the validate call
+  // below returns the resolved IPs AS OF THIS MOMENT. `deliverPinnedPost`
+  // connects DIRECTLY to one of those IPs without a second DNS lookup,
+  // closing the TOCTOU window a fast-flip authoritative nameserver could
+  // previously exploit between validation and socket open. TLS SNI +
+  // certificate validation still anchor on the URL hostname via the
+  // `servername` option on https.request (see src/webhook-delivery.ts).
   const safety = await validateWebhookUrl(url);
   if (!safety.ok) {
     const reason = `DNS rebinding refusal at fire time: ${safety.reason}`;
@@ -153,9 +217,15 @@ async function deliverWebhook(
     logWebhookDelivery(webhookId, event, payloadStr, null, reason);
     return;
   }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const pinnedIp = safety.resolvedIps && safety.resolvedIps.length > 0 ? safety.resolvedIps[0] : null;
+  if (!pinnedIp) {
+    // Shouldn't happen — validateWebhookUrl returns ok only if it resolved
+    // at least one IP. Defensive belt-and-suspenders.
+    const reason = "no validated IP to pin for delivery (internal error)";
+    log.warn(`[webhook] ${reason} url=${url}`);
+    logWebhookDelivery(webhookId, event, payloadStr, null, reason);
+    return;
+  }
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -171,30 +241,27 @@ async function deliverWebhook(
     headers["X-Relay-Signature"] = hmac(payloadStr, secret);
   }
 
-  // Pre-log: record the attempt BEFORE the fetch fires so a process crash
+  // Pre-log: record the attempt BEFORE the delivery fires so a process crash
   // mid-delivery still leaves a trail. Status starts as "in-flight" (-1).
   logWebhookDelivery(webhookId, event, payloadStr, -1, "in-flight (process exited?)");
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: payloadStr,
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    // v2.0 final: non-2xx is a failure → schedule retry. 2xx → log success
-    // with a terminal row so /dashboard can distinguish delivered vs pending.
-    if (res.status < 200 || res.status >= 300) {
-      scheduleWebhookRetry(webhookId, event, payloadStr, `HTTP ${res.status}`);
-    } else {
-      logWebhookDelivery(webhookId, event, payloadStr, res.status, null);
-    }
-  } catch (err) {
-    clearTimeout(timer);
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    log.warn(`[webhook] delivery error url=${url}: ${errorMsg}`); // stderr keeps full
-    scheduleWebhookRetry(webhookId, event, payloadStr, errorMsg);
+  const res = await deliverPinnedPost({
+    url,
+    pinnedIp,
+    headers,
+    body: payloadStr,
+    timeoutMs,
+  });
+  if (res.error) {
+    log.warn(`[webhook] delivery error url=${url} pinned=${pinnedIp}: ${res.error}`);
+    scheduleWebhookRetry(webhookId, event, payloadStr, res.error);
+    return;
+  }
+  const status = res.statusCode ?? 0;
+  if (status < 200 || status >= 300) {
+    scheduleWebhookRetry(webhookId, event, payloadStr, `HTTP ${status}`);
+  } else {
+    logWebhookDelivery(webhookId, event, payloadStr, status, null);
   }
 }
 
@@ -230,12 +297,21 @@ async function retryOne(
   webhookId: string,
   timeoutMs: number
 ): Promise<void> {
-  // v2.1 Phase 4e (A): same DNS re-check on retry. Terminal refusal — no
-  // further retries; attacker controls DNS, we stop feeding them.
+  // v2.1 Phase 4e (A) + v2.2.0 Phase 4: re-validate DNS on every retry
+  // (attacker-controlled nameserver could flip between attempts) AND pin
+  // the TCP connection to the re-validated IP so native fetch can't
+  // silently re-resolve at socket open.
   const safety = await validateWebhookUrl(url);
   if (!safety.ok) {
     const reason = `DNS rebinding refusal on retry: ${safety.reason}`;
     log.warn(`[webhook-retry] ${reason} url=${url}`); // stderr keeps the full detail
+    terminateWebhookRetry(logId, reason);
+    return;
+  }
+  const pinnedIp = safety.resolvedIps && safety.resolvedIps.length > 0 ? safety.resolvedIps[0] : null;
+  if (!pinnedIp) {
+    const reason = "no validated IP to pin for retry (internal error)";
+    log.warn(`[webhook-retry] ${reason} url=${url}`);
     terminateWebhookRetry(logId, reason);
     return;
   }
@@ -251,8 +327,6 @@ async function retryOne(
     // block the retry.
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "User-Agent": `bot-relay-mcp/${VERSION}`,
@@ -264,21 +338,20 @@ async function retryOne(
   if (deliveryId) headers["X-Relay-Delivery-Id"] = deliveryId;
   if (secret) headers["X-Relay-Signature"] = hmac(payloadStr, secret);
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: payloadStr,
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    const ok = res.status >= 200 && res.status < 300;
-    recordWebhookRetryOutcome(logId, ok, res.status, ok ? null : `HTTP ${res.status}`);
-    log.debug(`[webhook-retry] log=${logId} url=${url} → ${res.status} ${ok ? "(delivered)" : "(will retry or terminal)"}`);
-  } catch (err) {
-    clearTimeout(timer);
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    recordWebhookRetryOutcome(logId, false, null, errorMsg);
-    log.debug(`[webhook-retry] log=${logId} url=${url} → error: ${errorMsg}`);
+  const res = await deliverPinnedPost({
+    url,
+    pinnedIp,
+    headers,
+    body: payloadStr,
+    timeoutMs,
+  });
+  if (res.error) {
+    recordWebhookRetryOutcome(logId, false, null, res.error);
+    log.debug(`[webhook-retry] log=${logId} url=${url} pinned=${pinnedIp} → error: ${res.error}`);
+    return;
   }
+  const status = res.statusCode ?? 0;
+  const ok = status >= 200 && status < 300;
+  recordWebhookRetryOutcome(logId, ok, status, ok ? null : `HTTP ${status}`);
+  log.debug(`[webhook-retry] log=${logId} url=${url} pinned=${pinnedIp} → ${status} ${ok ? "(delivered)" : "(will retry or terminal)"}`);
 }

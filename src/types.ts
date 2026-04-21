@@ -35,11 +35,34 @@ const payloadField = (fieldName: string) =>
  */
 const AgentTokenField = z.string().optional().describe("Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header.");
 
+/**
+ * v2.2.0: terminal_title_ref captures the window title the agent's terminal
+ * was spawned with (typically the same as `--name` on the claude launcher).
+ * The dashboard's click-to-focus driver uses this to look up the target
+ * window across macOS iTerm2 / Linux wmctrl / Windows AppActivate. Allowlist
+ * matches the rest of the spawn-identity surface (no shell metachars, no
+ * control characters) so the title can be safely interpolated into
+ * osascript / wmctrl / PowerShell commands without quote gymnastics.
+ */
+const TERMINAL_TITLE_REF_PATTERN = /^[A-Za-z0-9_.\- ]+$/;
+const TerminalTitleRefField = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(TERMINAL_TITLE_REF_PATTERN, "terminal_title_ref must match [A-Za-z0-9_.- ] (letters, digits, dot, dash, underscore, space)")
+  .optional()
+  .describe(
+    "v2.2.0: window title the agent's terminal was spawned with. Used by the " +
+      "dashboard's click-to-focus driver. Typically equals the agent's `--name`. " +
+      "Mutable on re-register (updates to reflect the current session's title)."
+  );
+
 export const RegisterAgentSchema = z.object({
   name: z.string().min(1).max(64).describe("Human-readable agent name"),
   role: z.string().min(1).max(64).describe("Agent role (e.g. orchestrator, builder, ops)"),
   capabilities: z.array(z.string()).describe("List of capabilities"),
   description: z.string().max(512).optional().describe("v2.0: optional human-readable description (max 512 chars). Shown in discover_agents + dashboard. Mutable on re-register — if omitted, previous value preserved."),
+  terminal_title_ref: TerminalTitleRefField,
   agent_token: AgentTokenField,
   recovery_token: z.string().min(1).optional().describe("v2.1 Phase 4b.1 v2: required when re-registering an agent whose auth_state is 'recovery_pending'. Obtained from the revoker's revoke_token response (shown ONCE) and handed off to the operator out-of-band."),
   managed: z.boolean().default(false).describe("v2.1 Phase 4b.2: true = agent is a Managed Agent wrapper that can parse push-token messages + self-update its local config on rotation. false (default) = Claude Code terminal or equivalent (restart-required on rotation). Immutable after first registration — change requires unregister + fresh register."),
@@ -403,6 +426,16 @@ export const DeleteWebhookSchema = z.object({
   agent_token: AgentTokenField,
 });
 
+/**
+ * v2.2.0: dashboard click-to-focus request body. Sent by the dashboard JS to
+ * POST /api/focus-terminal. Validated at the HTTP layer before dispatching
+ * to the platform focus driver.
+ */
+export const FocusTerminalSchema = z.object({
+  agent_name: z.string().min(1).max(64).describe("Name of the agent whose terminal window should come to the front"),
+});
+export type FocusTerminalInput = z.infer<typeof FocusTerminalSchema>;
+
 // --- TypeScript types ---
 
 export type RegisterAgentInput = z.infer<typeof RegisterAgentSchema>;
@@ -480,6 +513,10 @@ export interface AgentRecord {
   rotation_grace_expires_at?: string | null;
   /** v2.1 Phase 4b.2: bcrypt hash of pre-rotation token. Populated iff state=rotation_grace; allows the old token to auth alongside the new token during the grace window. */
   previous_token_hash?: string | null;
+  /** v2.1.6: ISO timestamp of the agent's current session start (last register_agent). NULL on rows registered before v2.1.6. */
+  session_started_at?: string | null;
+  /** v2.2.0: window title the agent's terminal was spawned with. Used by the dashboard's click-to-focus driver. NULL on rows spawned before v2.2.0 or rows that did not thread the value through the register call. */
+  terminal_title_ref?: string | null;
 }
 
 export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "token_hash" | "session_id" | "agent_status" | "description"> {
@@ -501,6 +538,8 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
   description: string | null;
   /** v2.0 final: current session_id (UUID, rotates on re-register). */
   session_id: string | null;
+  /** v2.2.0: window title the agent's terminal was spawned with (NULL if legacy). */
+  terminal_title_ref: string | null;
 }
 
 export interface MessageRecord {
