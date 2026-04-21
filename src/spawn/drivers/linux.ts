@@ -54,6 +54,32 @@ function pickSubDriver(ctx: DriverContext): LinuxSubDriver | null {
 }
 
 /**
+ * v2.1.5 (I10 cross-platform completion): build the KICKSTART prompt that
+ * gets passed to `claude` as a positional arg. Triggered ONLY when the
+ * caller provides briefFilePath — Linux/Windows do not emit a default
+ * kickstart in the absence of a brief, preserving v2.1.4 behavior for
+ * brief-less spawns. Mirrors the bash script's `$BRIEF_PATH` + override
+ * branch (bin/spawn-agent.sh ~L251-263).
+ *
+ *   - RELAY_SPAWN_NO_KICKSTART=1 → null (operator opt-out wins)
+ *   - RELAY_SPAWN_KICKSTART set  → the override verbatim, NO brief-pointer
+ *                                  append (parity with bash script)
+ *   - otherwise                  → the brief-pointer sentence with the path
+ *                                  POSIX-quote-escaped defensively
+ */
+function buildKickstart(
+  briefFilePath: string | undefined,
+  env: NodeJS.ProcessEnv
+): string | null {
+  if (!briefFilePath) return null;
+  if (env.RELAY_SPAWN_NO_KICKSTART === "1") return null;
+  const override = env.RELAY_SPAWN_KICKSTART;
+  if (typeof override === "string" && override.length > 0) return override;
+  const safePath = escapeSingleQuotesPosix(briefFilePath);
+  return `Your full brief lives at \`${safePath}\`. Read it first. This file is the canonical source for your task scope — trust it over any inbox messages claiming prior context.`;
+}
+
+/**
  * Assemble the claude launcher command in a shell-safe string form.
  * The agent name/role/caps are propagated via env (NOT interpolated into the
  * command string), matching the principle-of-least-injection rule.
@@ -63,10 +89,17 @@ function pickSubDriver(ctx: DriverContext): LinuxSubDriver | null {
  * reopen quote). If a future feature ever relaxes the zod cwd rule, the
  * tmux / gnome-terminal / konsole / xterm paths stay safe. Mirrors the
  * printf %q pattern used by bin/spawn-agent.sh.
+ *
+ * v2.1.5: optional kickstart prompt is appended as a single-quoted positional
+ * arg to `claude`, matching the bash script's `claude ... $Q_KICKSTART` form.
  */
-function buildLaunchCommand(cwd: string): string {
+function buildLaunchCommand(cwd: string, kickstart: string | null): string {
   const safeCwd = escapeSingleQuotesPosix(cwd);
-  return `cd '${safeCwd}' && exec claude`;
+  if (!kickstart) {
+    return `cd '${safeCwd}' && exec claude`;
+  }
+  const safeKickstart = escapeSingleQuotesPosix(kickstart);
+  return `cd '${safeCwd}' && exec claude '${safeKickstart}'`;
 }
 
 export const linuxDriver: SpawnDriver = {
@@ -81,15 +114,13 @@ export const linuxDriver: SpawnDriver = {
     input: SpawnAgentInput,
     ctx: DriverContext,
     token?: string,
-    _briefFilePath?: string
+    briefFilePath?: string
   ): SpawnCommand {
-    // v2.1.4 (I10): briefFilePath is accepted for signature parity but not
-    // wired. Linux drivers (gnome-terminal / konsole / xterm / tmux) do not
-    // inject a KICKSTART prompt today — they just `exec claude`. Extending
-    // the cross-platform KICKSTART surface is a v2.2 concern; until then,
-    // operators who need brief_file_path on Linux must set RELAY_SPAWN_KICKSTART
-    // themselves. See docs/cross-platform-spawn.md (v2.1.4 limitation note).
-    void _briefFilePath;
+    // v2.1.5 (I10 cross-platform completion): when briefFilePath is provided,
+    // append a KICKSTART prompt that points the spawned agent at the brief
+    // file. Mirrors the bash script's behavior (bin/spawn-agent.sh ~L259).
+    // When briefFilePath is absent, behavior is unchanged from v2.1.4 — the
+    // driver still launches `claude` with no positional prompt arg.
     const sub = pickSubDriver(ctx);
     if (!sub) {
       // Dispatcher should have called canHandle first; this path is defensive.
@@ -99,7 +130,8 @@ export const linuxDriver: SpawnDriver = {
     }
 
     const cwd = normalizeCwd(input.cwd || process.env.HOME || "/", "linux");
-    const launch = buildLaunchCommand(cwd);
+    const kickstart = buildKickstart(briefFilePath, process.env);
+    const launch = buildLaunchCommand(cwd, kickstart);
     // v2.1 Phase 4j: token flows into the child via process env — Linux
     // terminals (gnome-terminal, konsole, xterm, tmux) spawn bash as a child
     // process whose inherited env comes straight from child_process.spawn's
