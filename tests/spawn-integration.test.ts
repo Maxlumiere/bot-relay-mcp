@@ -333,10 +333,11 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
     return p;
   }
 
-  // v2.1.4 scope: brief_file_path KICKSTART wiring is macOS-only. Linux/Windows
-  // accept the arg for signature parity but don't embed the pointer sentence in
-  // KICKSTART until v2.2 cross-platform harmonization. Skip this assertion on
-  // non-darwin runners (CI catches everything else in the describe block).
+  // v2.1.5: brief_file_path KICKSTART now wired into Linux + Windows drivers
+  // too (see tests/spawn-drivers.test.ts for TS-level coverage). This integration
+  // test still asserts against bin/spawn-agent.sh stdout, which is the macOS path
+  // — keep it macOS-only at the assertion level (the bash script doesn't run on
+  // Linux/Windows runners). Linux/Windows assertions live in spawn-drivers.test.ts.
   it.skipIf(process.platform !== "darwin")("default spawn with valid brief path embeds the pointer sentence in KICKSTART", async () => {
     const brief = writeBrief("ok", "# Task brief\n\nDo the thing.");
     try {

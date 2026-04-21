@@ -14,7 +14,7 @@
  * there is no CI infrastructure for those platforms. See
  * docs/cross-platform-spawn.md.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { linuxDriver } from "../src/spawn/drivers/linux.js";
 import { windowsDriver } from "../src/spawn/drivers/windows.js";
 import { macosDriver } from "../src/spawn/drivers/macos.js";
@@ -511,5 +511,186 @@ describe("tmux session-name collision safety (v1.9.1 Blocker 3)", () => {
     // The agent name "dupe" should NOT appear in gnome-terminal args
     // (session suffix is tmux-specific).
     expect(gcmd.args.some((a) => a.includes("dupe-"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v2.1.5 (I10 cross-platform completion) — brief_file_path KICKSTART wiring
+//
+// macOS coverage lives in tests/spawn-integration.test.ts (real-subprocess
+// against bin/spawn-agent.sh). These TS-level tests assert the Linux + Windows
+// drivers' buildCommand output embeds the brief-pointer sentence (or honors
+// the operator's RELAY_SPAWN_KICKSTART / RELAY_SPAWN_NO_KICKSTART env vars)
+// when briefFilePath is provided.
+//
+// The fixed brief-pointer phrase that should appear verbatim in the launch
+// command when no operator override is set:
+const BRIEF_POINTER_PHRASE = "Your full brief lives at";
+const BRIEF_TRUST_PHRASE = "canonical source for your task scope";
+// ---------------------------------------------------------------------------
+describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion)", () => {
+  // Snapshot/restore the three env vars the driver reads. Any test that
+  // mutates process.env must clean up so suite ordering stays stable.
+  let originalNoKick: string | undefined;
+  let originalKick: string | undefined;
+  beforeEach(() => {
+    originalNoKick = process.env.RELAY_SPAWN_NO_KICKSTART;
+    originalKick = process.env.RELAY_SPAWN_KICKSTART;
+    delete process.env.RELAY_SPAWN_NO_KICKSTART;
+    delete process.env.RELAY_SPAWN_KICKSTART;
+  });
+  afterEach(() => {
+    if (originalNoKick === undefined) delete process.env.RELAY_SPAWN_NO_KICKSTART;
+    else process.env.RELAY_SPAWN_NO_KICKSTART = originalNoKick;
+    if (originalKick === undefined) delete process.env.RELAY_SPAWN_KICKSTART;
+    else process.env.RELAY_SPAWN_KICKSTART = originalKick;
+  });
+
+  // --- Linux driver ---
+
+  describe("linux", () => {
+    const briefPath = "/tmp/relay-brief-test.md";
+
+    it("brief_file_path → kickstart sentence appears in bash -lc launch arg", () => {
+      const ctx = makeCtx(["gnome-terminal"]);
+      const cmd = linuxDriver.buildCommand(baseInput(), ctx, undefined, briefPath);
+      const launch = cmd.args[cmd.args.length - 1];
+      expect(launch).toContain("exec claude '");
+      expect(launch).toContain(BRIEF_POINTER_PHRASE);
+      expect(launch).toContain(BRIEF_TRUST_PHRASE);
+      expect(launch).toContain(`\`${briefPath}\``);
+    });
+
+    it("brief_file_path appears across all sub-drivers (gnome-terminal, konsole, xterm, tmux)", () => {
+      for (const sub of ["gnome-terminal", "konsole", "xterm", "tmux"]) {
+        const ctx = makeCtx([sub]);
+        const cmd = linuxDriver.buildCommand(baseInput(), ctx, undefined, briefPath);
+        // For gnome-terminal/konsole/xterm, launch is the LAST arg (after -lc).
+        // For tmux, the launch is wrapped inside a bash -lc string in args[4].
+        const wholeCmd = cmd.args.join(" ");
+        expect(wholeCmd).toContain(BRIEF_POINTER_PHRASE);
+        expect(wholeCmd).toContain(briefPath);
+      }
+    });
+
+    it("brief_file_path + RELAY_SPAWN_NO_KICKSTART=1 → no kickstart appended (operator opt-out wins)", () => {
+      process.env.RELAY_SPAWN_NO_KICKSTART = "1";
+      const ctx = makeCtx(["gnome-terminal"]);
+      const cmd = linuxDriver.buildCommand(baseInput(), ctx, undefined, briefPath);
+      const launch = cmd.args[cmd.args.length - 1];
+      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).not.toContain(BRIEF_POINTER_PHRASE);
+      expect(launch).not.toContain(briefPath);
+    });
+
+    it("brief_file_path + RELAY_SPAWN_KICKSTART=custom → custom verbatim, brief-pointer NOT appended", () => {
+      process.env.RELAY_SPAWN_KICKSTART = "do the custom thing";
+      const ctx = makeCtx(["gnome-terminal"]);
+      const cmd = linuxDriver.buildCommand(baseInput(), ctx, undefined, briefPath);
+      const launch = cmd.args[cmd.args.length - 1];
+      expect(launch).toContain("exec claude 'do the custom thing'");
+      expect(launch).not.toContain(BRIEF_POINTER_PHRASE);
+      expect(launch).not.toContain(briefPath);
+    });
+
+    it("NO brief_file_path → behavior unchanged (no kickstart, plain `exec claude`)", () => {
+      const ctx = makeCtx(["gnome-terminal"]);
+      const cmd = linuxDriver.buildCommand(baseInput(), ctx);
+      const launch = cmd.args[cmd.args.length - 1];
+      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).not.toContain(BRIEF_POINTER_PHRASE);
+    });
+
+    it("NO brief_file_path + RELAY_SPAWN_KICKSTART set → still no kickstart (trigger is brief_file_path)", () => {
+      // v2.1.5 tight scope: RELAY_SPAWN_KICKSTART alone does NOT enable a
+      // KICKSTART on Linux — the trigger is brief_file_path. This preserves
+      // v2.1.4 brief-less spawn behavior unchanged.
+      process.env.RELAY_SPAWN_KICKSTART = "ignored without brief";
+      const ctx = makeCtx(["gnome-terminal"]);
+      const cmd = linuxDriver.buildCommand(baseInput(), ctx);
+      const launch = cmd.args[cmd.args.length - 1];
+      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).not.toContain("ignored without brief");
+    });
+  });
+
+  // --- Windows driver ---
+
+  describe("windows", () => {
+    const briefPath = "/tmp/relay-brief-test.md";
+
+    it("(wt) brief_file_path → kickstart appended as positional arg after `claude`", () => {
+      const ctx = makeCtx(["wt.exe"]);
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
+      // wt -d <cwd> claude <kickstart>
+      expect(cmd.args[0]).toBe("-d");
+      expect(cmd.args[2]).toBe("claude");
+      expect(cmd.args[3]).toContain(BRIEF_POINTER_PHRASE);
+      expect(cmd.args[3]).toContain(briefPath);
+    });
+
+    it("(powershell) brief_file_path → kickstart embedded as PS single-quoted arg in -Command", () => {
+      const ctx = makeCtx(["powershell.exe"]);
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
+      const inner = cmd.args[2];
+      expect(inner).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude '.+'/);
+      expect(inner).toContain(BRIEF_POINTER_PHRASE);
+      expect(inner).toContain(briefPath);
+    });
+
+    it("(cmd) brief_file_path → kickstart embedded as doublequoted arg in /K cmdline", () => {
+      const ctx = makeCtx(["cmd.exe"]);
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
+      expect(cmd.args[0]).toBe("/K");
+      expect(cmd.args[1]).toContain('cd /D "C:\\work" && claude "');
+      expect(cmd.args[1]).toContain(BRIEF_POINTER_PHRASE);
+      expect(cmd.args[1]).toContain(briefPath);
+    });
+
+    it("brief_file_path + RELAY_SPAWN_NO_KICKSTART=1 → no kickstart on any sub-driver", () => {
+      process.env.RELAY_SPAWN_NO_KICKSTART = "1";
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]), undefined, briefPath);
+      expect(wtCmd.args).toEqual(["-d", "C:\\work", "claude"]);
+      const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]), undefined, briefPath);
+      expect(psCmd.args[2]).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude$/);
+      expect(psCmd.args[2]).not.toContain(BRIEF_POINTER_PHRASE);
+      const cmdCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["cmd.exe"]), undefined, briefPath);
+      expect(cmdCmd.args[1]).toBe('cd /D "C:\\work" && claude');
+    });
+
+    it("brief_file_path + RELAY_SPAWN_KICKSTART=custom → custom verbatim, brief-pointer NOT appended", () => {
+      process.env.RELAY_SPAWN_KICKSTART = "custom-windows-prompt";
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]), undefined, briefPath);
+      expect(wtCmd.args[3]).toBe("custom-windows-prompt");
+      expect(wtCmd.args.join(" ")).not.toContain(BRIEF_POINTER_PHRASE);
+      const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]), undefined, briefPath);
+      expect(psCmd.args[2]).toContain("claude 'custom-windows-prompt'");
+      expect(psCmd.args[2]).not.toContain(BRIEF_POINTER_PHRASE);
+    });
+
+    it("NO brief_file_path → behavior unchanged across all sub-drivers", () => {
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]));
+      expect(wtCmd.args).toEqual(["-d", "C:\\work", "claude"]);
+      const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]));
+      expect(psCmd.args[2]).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude$/);
+      const cmdCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["cmd.exe"]));
+      expect(cmdCmd.args[1]).toBe('cd /D "C:\\work" && claude');
+    });
+
+    it("(defense-in-depth) PS kickstart with embedded single quote is doubled (`'` → `''`)", () => {
+      process.env.RELAY_SPAWN_KICKSTART = "it's a test";
+      const ctx = makeCtx(["powershell.exe"]);
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
+      // PS-doubling: it''s
+      expect(cmd.args[2]).toContain("'it''s a test'");
+    });
+
+    it("(defense-in-depth) cmd kickstart with embedded `\"` is doubled and `%` is doubled", () => {
+      process.env.RELAY_SPAWN_KICKSTART = 'say "hi" 100%';
+      const ctx = makeCtx(["cmd.exe"]);
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
+      // " → "" and % → %%
+      expect(cmd.args[1]).toContain('claude "say ""hi"" 100%%"');
+    });
   });
 });
