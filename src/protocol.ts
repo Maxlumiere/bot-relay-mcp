@@ -40,6 +40,14 @@
  *            `/dashboard/ws`, new `content_preview` / `description_preview`
  *            / `result_preview` fields on `/api/snapshot`. No breaking
  *            changes — old clients ignore the new surface.
+ *   2.2.1  — v2.2.1 bug sweep + dashboard polish. Additive: `register_agent`
+ *            gains optional `force` boolean (default false — escape hatch
+ *            for the new active-name collision gate); `get_messages`
+ *            response gains optional `hint` field; new MCP tool
+ *            `set_dashboard_theme({mode, custom_json?})`; new HTTP
+ *            endpoints `POST /api/send-message` / `/api/kill-agent` /
+ *            `/api/set-status`; `/api/snapshot` surfaces
+ *            `dashboard_prefs`. All additive — no breaking changes.
  *
  * Surfaced via `register_agent` + `health_check` response payloads so any
  * client can introspect compatibility before issuing tool calls. The relay
@@ -50,4 +58,4 @@
  * This file is intentionally the sole authoritative source — the drift-grep
  * in scripts/pre-publish-check.sh allowlists it alongside src/version.ts.
  */
-export const PROTOCOL_VERSION: string = "2.2.0";
+export const PROTOCOL_VERSION: string = "2.2.1";

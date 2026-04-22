@@ -250,11 +250,13 @@ describe("v2.1 Phase 2b — legacy-row register_agent migration bypass", () => {
     expect(wrongPath.authError).toBe(true);
 
     // With the token → accepted (normal hashed-row re-register).
+    // v2.2.1 B2: force=true to bypass active-name collision gate.
     const rightPath = await callTool("register_agent", {
       name: "legacy-d",
       role: "r",
       capabilities: [],
       agent_token: firstToken,
+      force: true,
     });
     expect(rightPath.success).toBe(true);
   });

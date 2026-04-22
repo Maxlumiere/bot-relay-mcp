@@ -273,9 +273,11 @@ describe("§4.2 unmanaged agent flow", () => {
     expect(getAgentAuthData("u-5")?.managed).toBe(0);
     // Re-register with managed=true. Existing row preserves managed=0
     // (same rule as capabilities per v1.7.1).
+    // v2.2.1 B2: active-row re-register now requires force=true; test
+    // exercises managed-immutability semantic, independent of collision.
     const r = await rpc(
       "register_agent",
-      { name: "u-5", role: "r", capabilities: [], managed: true },
+      { name: "u-5", role: "r", capabilities: [], managed: true, force: true },
       tok
     );
     expect(r.success).toBe(true);
@@ -455,9 +457,10 @@ describe("§4.4 race + edge matrix", () => {
     const tok = await register("r-5", [], true);
     expect(getAgentAuthData("r-5")?.managed).toBe(1);
     // Re-register with managed=false — v2.1.x immutability preserves =1.
+    // v2.2.1 B2: force=true to bypass active-name collision gate.
     const r = await rpc(
       "register_agent",
-      { name: "r-5", role: "r", capabilities: [], managed: false },
+      { name: "r-5", role: "r", capabilities: [], managed: false, force: true },
       tok
     );
     expect(r.success).toBe(true);

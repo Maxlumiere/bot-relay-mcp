@@ -176,6 +176,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_5(_db);
   migrateSchemaToV2_6(_db);
   migrateSchemaToV2_7(_db);
+  migrateSchemaToV2_8(_db);
   purgeOldRecords(_db);
 }
 
@@ -206,6 +207,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_5(_db);
   migrateSchemaToV2_6(_db);
   migrateSchemaToV2_7(_db);
+  migrateSchemaToV2_8(_db);
   purgeOldRecords(_db);
 
   return _db;
@@ -413,6 +415,10 @@ function initSchema(db: CompatDatabase): void {
  * nullable column, used by the dashboard's click-to-focus driver to find the
  * agent's live terminal window across iTerm2 / wmctrl / AppActivate).
  *
+ * v2.2.1 bumped 9 → 10 alongside migrateSchemaToV2_8 (dashboard_prefs
+ * single-row table holding the server-side default theme for the v2.2.1
+ * set_dashboard_theme MCP tool).
+ *
  * v2.1 Phase 7q bumped 5 → 6 alongside migrateSchemaToV2_4 (agents.visibility
  * column reserved for v2.3 hub federation, mailbox + agent_cursor tables
  * reserved for Phase 4s v2.2 delivery-seq protocol). All additions empty /
@@ -421,7 +427,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -462,6 +468,7 @@ export function applyMigration(from: number, to: number): void {
   if (from === 6 && to === 7) return;
   if (from === 7 && to === 8) return;
   if (from === 8 && to === 9) return;
+  if (from === 9 && to === 10) return;
   throw new Error(
     `no migration registered for schema_version ${from}→${to}. ` +
     `Register a handler in src/db.ts applyMigration and update CURRENT_SCHEMA_VERSION.`
@@ -942,6 +949,72 @@ function migrateSchemaToV2_7(db: CompatDatabase): void {
   if (!agentCols.some((c) => c.name === "terminal_title_ref")) {
     db.exec("ALTER TABLE agents ADD COLUMN terminal_title_ref TEXT");
   }
+}
+
+/**
+ * v2.2.1 P1 — `dashboard_prefs` single-row table storing the server-side
+ * default theme for the dashboard. Each client reads this on first
+ * connect if localStorage has no theme selection yet. Mutations via the
+ * new `set_dashboard_theme` MCP tool.
+ *
+ * Shape: same single-row CHECK(id=1) pattern as `schema_info`.
+ *   - theme: one of "catppuccin" | "dark" | "light" | "custom"
+ *   - custom_json: JSON string of custom-theme tokens (populated only
+ *     when theme="custom"). Shape validated by the Zod schema at the
+ *     tool layer; DB stores the pre-validated JSON string.
+ *   - updated_at: ISO timestamp of the last write.
+ *
+ * Additive + idempotent. No data backfill — the table is seeded with
+ * {theme:"catppuccin", custom_json:null} on first migration run.
+ */
+function migrateSchemaToV2_8(db: CompatDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dashboard_prefs (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      theme TEXT NOT NULL DEFAULT 'catppuccin'
+        CHECK (theme IN ('catppuccin', 'dark', 'light', 'custom')),
+      custom_json TEXT,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  const nowIso = now();
+  db.prepare(
+    "INSERT OR IGNORE INTO dashboard_prefs (id, theme, custom_json, updated_at) VALUES (1, 'catppuccin', NULL, ?)"
+  ).run(nowIso);
+}
+
+export interface DashboardPrefs {
+  theme: "catppuccin" | "dark" | "light" | "custom";
+  custom_json: string | null;
+  updated_at: string;
+}
+
+/** v2.2.1: read the server-side default dashboard theme. */
+export function getDashboardPrefs(): DashboardPrefs {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT theme, custom_json, updated_at FROM dashboard_prefs WHERE id = 1")
+    .get() as DashboardPrefs | undefined;
+  // Defensive: if the row is somehow missing (shouldn't happen post-migration),
+  // fall back to the hard default.
+  return row ?? { theme: "catppuccin", custom_json: null, updated_at: now() };
+}
+
+/**
+ * v2.2.1: write the server-side default dashboard theme. `custom_json` must
+ * be a pre-serialized JSON string when theme='custom'; null otherwise. The
+ * tool-layer Zod schema validates the JSON shape before this is called.
+ */
+export function setDashboardPrefs(
+  theme: DashboardPrefs["theme"],
+  custom_json: string | null
+): DashboardPrefs {
+  const db = getDb();
+  const nowIso = now();
+  db.prepare(
+    "UPDATE dashboard_prefs SET theme = ?, custom_json = ?, updated_at = ? WHERE id = 1"
+  ).run(theme, custom_json, nowIso);
+  return { theme, custom_json, updated_at: nowIso };
 }
 
 function purgeOldRecords(db: CompatDatabase): void {
@@ -1449,6 +1522,16 @@ export function registerAgent(
     /** v2.2.0: window title for the dashboard click-to-focus driver. Mutable on re-register. */
     terminal_title_ref?: string | null;
     /**
+     * v2.2.1 B2: `force` flag IS exposed on the MCP surface (see
+     * RegisterAgentSchema in src/types.ts). Collision enforcement policy
+     * lives at the HANDLER layer (handleRegisterAgent), not the DB
+     * layer — direct db.registerAgent callers (tests, relay recover
+     * internals, migrations) bypass the collision check by design.
+     * Default false → handler rejects active-row re-registers with
+     * NAME_COLLISION_ACTIVE unless caller explicitly opts in.
+     */
+    force?: boolean;
+    /**
      * v2.1 Phase 7p HIGH #2: when set, pins the CAS predicate to exactly this
      * recovery_token_hash value (on the recovery_pending → active transition).
      * The dispatcher stores its verified hash here so a concurrent admin
@@ -1476,17 +1559,21 @@ export function registerAgent(
 
   if (existing) {
     // v2.0.1 (Codex MEDIUM 5): warn when we're about to overwrite an ONLINE
-    // session. Two concurrent terminals with the same RELAY_AGENT_NAME will
-    // silently race — the second register rotates session_id and the first
-    // terminal loses its read-state continuity. Full multi-session support
-    // is deferred to v2.1; for now the warn makes the limitation visible.
+    // session. Two concurrent terminals with the same RELAY_AGENT_NAME
+    // silently race — pre-v2.2.1 this rotated session_id + dropped mail
+    // on the losing terminal. v2.2.1 B2 adds a hard-reject at the HANDLER
+    // layer (handleRegisterAgent → isActiveCollision) so MCP-dispatched
+    // callers get NAME_COLLISION_ACTIVE; direct db.registerAgent callers
+    // (tests, internal helpers, relay recover) bypass. The warn below
+    // preserves observability on the legacy path + is harmless on the
+    // enforced path (won't fire because the handler rejects first).
     const ageMinutes = (Date.now() - new Date(existing.last_seen).getTime()) / 60_000;
-    if (ageMinutes < 10 && existing.session_id) {
+    if (ageMinutes < 10 && existing.session_id && !options.force) {
       log.warn(
         `[register] agent "${name}" had an online session (${existing.session_id}) ` +
         `within the last 10 minutes. Its session is being rotated to a new UUID by this register call. ` +
         `If you intended to run two concurrent terminals as "${name}", give them distinct RELAY_AGENT_NAME values — ` +
-        `session state cannot be shared across concurrent instances with the same name (v2.0 limitation).`
+        `session state cannot be shared across concurrent instances with the same name.`
       );
     }
     // v2.1 Phase 4b.1 v2: state-branched re-register. Source state dictates
@@ -2468,6 +2555,49 @@ export class SenderNotRegisteredError extends Error {
       `silently insert with last_seen never bumping when the sender row was missing.)`
     );
     this.name = "SenderNotRegisteredError";
+  }
+}
+
+/**
+ * v2.2.1 B2: raised by `handleRegisterAgent` (NOT `registerAgent` — the
+ * collision check lives at the handler layer, not the DB layer) when a
+ * second session tries to claim a name that's still actively held by a
+ * different online session. Pre-v2.2.1 this was a silent warn + session_id
+ * rotation — whichever terminal polled `get_messages` first drained the
+ * mailbox; the other got zero and no error. Caught in the wild
+ * 2026-04-21 during the v2.2.0 ship ceremony (see
+ * `memory/feedback_scoped_victra_names.md`).
+ *
+ * The class is kept in db.ts for shared visibility + type-safe catch
+ * blocks, but is thrown ONLY from the handler. Direct db.registerAgent
+ * callers (tests, relay recover internals, migrations) never encounter
+ * it because they bypass the collision check by design.
+ *
+ * The handler maps this to `NAME_COLLISION_ACTIVE` (same error code used
+ * by the v2.1.3 I5 token-mismatch-on-active-row path — "this name is
+ * actively held" is the same concept; only the trigger differs).
+ *
+ * Escape hatches (MCP surface):
+ *   - `force: true` field on register_agent — exposed in
+ *     RegisterAgentSchema, documented in src/types.ts as the
+ *     operator-opt-in override.
+ *   - `relay recover <name>` CLI — force-releases the row at the DB
+ *     layer so the next register is a clean bootstrap.
+ */
+export class NameCollisionActiveError extends Error {
+  public readonly existingSessionId: string;
+  public readonly lastSeen: string;
+  constructor(name: string, existingSessionId: string, lastSeen: string) {
+    super(
+      `Agent "${name}" is already registered and online on another session (session_id=${existingSessionId}, last_seen=${lastSeen}). ` +
+      `Two terminals running under the same name will race on get_messages and silently drop mail. Resolution paths: ` +
+      `(a) scope your name (e.g. "${name}-mcp", "${name}-outreach", "${name}-build") so each terminal has a distinct identity; ` +
+      `(b) close the holding terminal and let it mark the row offline on exit (v2.1.3+ markAgentOffline); or ` +
+      `(c) run "bin/relay recover ${name} --yes" to force-release the row + re-register fresh.`
+    );
+    this.name = "NameCollisionActiveError";
+    this.existingSessionId = existingSessionId;
+    this.lastSeen = lastSeen;
   }
 }
 

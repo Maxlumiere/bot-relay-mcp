@@ -66,6 +66,18 @@ export const RegisterAgentSchema = z.object({
   agent_token: AgentTokenField,
   recovery_token: z.string().min(1).optional().describe("v2.1 Phase 4b.1 v2: required when re-registering an agent whose auth_state is 'recovery_pending'. Obtained from the revoker's revoke_token response (shown ONCE) and handed off to the operator out-of-band."),
   managed: z.boolean().default(false).describe("v2.1 Phase 4b.2: true = agent is a Managed Agent wrapper that can parse push-token messages + self-update its local config on rotation. false (default) = Claude Code terminal or equivalent (restart-required on rotation). Immutable after first registration — change requires unregister + fresh register."),
+  /**
+   * v2.2.1 B2: bypass the duplicate-name active-session collision check.
+   * Default false → re-register on an actively-held name returns
+   * NAME_COLLISION_ACTIVE (forces operators to scope names distinctly, which
+   * kills the get_messages mailbox-drain race when two terminals share a
+   * RELAY_AGENT_NAME + token). Operators who genuinely need to force a
+   * takeover (e.g. previous session crashed + they can't wait for
+   * staleness or run `relay recover`) can pass force=true explicitly.
+   * Undocumented on the public tool description — it's an escape hatch,
+   * not a feature.
+   */
+  force: z.boolean().default(false).optional(),
 });
 
 export const DiscoverAgentsSchema = z.object({
@@ -435,6 +447,83 @@ export const FocusTerminalSchema = z.object({
   agent_name: z.string().min(1).max(64).describe("Name of the agent whose terminal window should come to the front"),
 });
 export type FocusTerminalInput = z.infer<typeof FocusTerminalSchema>;
+
+/**
+ * v2.2.1 P2: dashboard inline-action request bodies. Each proxies to the
+ * matching MCP tool (send_message / unregister_agent / set_status) but
+ * is gated by the dashboard auth surface (dashboardAuthCheck + origin +
+ * CSRF) instead of agent-level tokens. Rationale: the dashboard operator
+ * is by definition trusted once they've authenticated with the dashboard
+ * secret — they're running the relay. We don't layer additional
+ * agent-token auth on top; that would require every dashboard user to
+ * also have an admin-cap agent token, which defeats the "operator
+ * dashboard" semantic.
+ */
+export const ApiSendMessageSchema = z.object({
+  from: z.string().min(1).max(64).describe("Sender agent name (must be a registered agent)"),
+  to: z.string().min(1).max(64).describe("Recipient agent name"),
+  content: payloadField("content"),
+  priority: z.enum(["normal", "high"]).default("normal"),
+});
+export type ApiSendMessageInput = z.infer<typeof ApiSendMessageSchema>;
+
+export const ApiKillAgentSchema = z.object({
+  name: z.string().min(1).max(64).describe("Agent name to unregister"),
+});
+export type ApiKillAgentInput = z.infer<typeof ApiKillAgentSchema>;
+
+export const ApiSetStatusSchema = z.object({
+  agent_name: z.string().min(1).max(64).describe("Target agent"),
+  agent_status: z.enum(["idle", "working", "blocked", "waiting_user", "offline"]).describe("New status"),
+});
+export type ApiSetStatusInput = z.infer<typeof ApiSetStatusSchema>;
+
+/**
+ * v2.2.1 P1 — theme shape for the dashboard's `custom` mode + the
+ * set_dashboard_theme MCP tool.
+ *
+ * The 13 tokens below mirror the CSS custom properties declared in
+ * `src/dashboard-styles.ts` :root selector. A theme object MUST set every
+ * token; partial themes are rejected at the Zod boundary so the dashboard
+ * never ends up with a mix-of-themes visual (e.g. dark backgrounds + light
+ * tag colors). Each token is a CSS color string — no format validation
+ * beyond "non-empty string" because CSS accepts many forms (#hex,
+ * rgb(), hsl(), color()).
+ */
+const THEME_TOKEN_FIELD = z.string().min(1).max(64);
+export const CustomThemeSchema = z.object({
+  bg: THEME_TOKEN_FIELD,
+  panel: THEME_TOKEN_FIELD,
+  "panel-2": THEME_TOKEN_FIELD,
+  border: THEME_TOKEN_FIELD,
+  text: THEME_TOKEN_FIELD,
+  muted: THEME_TOKEN_FIELD,
+  accent: THEME_TOKEN_FIELD,
+  online: THEME_TOKEN_FIELD,
+  stale: THEME_TOKEN_FIELD,
+  offline: THEME_TOKEN_FIELD,
+  critical: THEME_TOKEN_FIELD,
+  high: THEME_TOKEN_FIELD,
+  normal: THEME_TOKEN_FIELD,
+  low: THEME_TOKEN_FIELD,
+});
+export type CustomTheme = z.infer<typeof CustomThemeSchema>;
+
+export const SetDashboardThemeSchema = z
+  .object({
+    mode: z.enum(["catppuccin", "dark", "light", "custom"]).describe(
+      "Theme mode. catppuccin is the default; dark/light are tool-neutral; custom requires custom_json."
+    ),
+    custom_json: CustomThemeSchema.optional().describe(
+      "Required when mode='custom'. JSON object with all 13 CSS-token fields (bg, panel, panel-2, border, text, muted, accent, online, stale, offline, critical, high, normal, low)."
+    ),
+    agent_token: AgentTokenField,
+  })
+  .refine(
+    (v) => v.mode !== "custom" || v.custom_json !== undefined,
+    { message: "mode='custom' requires custom_json with all 13 token fields" }
+  );
+export type SetDashboardThemeInput = z.infer<typeof SetDashboardThemeSchema>;
 
 // --- TypeScript types ---
 

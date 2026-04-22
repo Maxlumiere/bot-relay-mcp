@@ -489,10 +489,12 @@ describe("First-run UX", () => {
   it("retro #29 — agent description field round-trips through discover_agents", async () => {
     const tok = await register("desc-1", []);
     // Re-register with a description.
+    // v2.2.1 B2: force=true to bypass active-name collision gate on re-register.
     const r = await rpc("register_agent", {
       name: "desc-1", role: "r", capabilities: [],
       description: "test agent description for retro check",
       agent_token: tok,
+      force: true,
     });
     expect(r.success).toBe(true);
     const d = await rpc("discover_agents", {}, tok);

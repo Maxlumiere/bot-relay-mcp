@@ -4,9 +4,10 @@
 // See LICENSE for full terms.
 
 import type { Request, Response } from "express";
-import { getAgents, listWebhooks, getDb } from "./db.js";
+import { getAgents, listWebhooks, getDb, getDashboardPrefs } from "./db.js";
 import { getKeyringInfo, decryptContent } from "./encryption.js";
 import type { MessageRecord, TaskRecord } from "./types.js";
+import { DASHBOARD_BASE_STYLES, DASHBOARD_THEMES } from "./dashboard-styles.js";
 
 /**
  * v2.2.0 Phase 3: decrypt + truncate a content field for dashboard display.
@@ -144,6 +145,17 @@ export function snapshotApi(_req: Request, res: Response): void {
       result_preview: previewField(t.result),
     }));
 
+    // v2.2.1 P1: surface the server-side default theme alongside the rest
+    // of the snapshot. The dashboard client reads it on first connect when
+    // localStorage has no theme selection yet; localStorage beats default
+    // for repeat visits.
+    let dashboardPrefs;
+    try {
+      dashboardPrefs = getDashboardPrefs();
+    } catch {
+      dashboardPrefs = { theme: "catppuccin", custom_json: null, updated_at: null };
+    }
+
     res.json({
       timestamp: new Date().toISOString(),
       agents,
@@ -151,6 +163,7 @@ export function snapshotApi(_req: Request, res: Response): void {
       messages: messagesWithPreview,
       active_tasks: tasksWithPreview,
       recent_completions: completionsWithPreview,
+      dashboard_prefs: dashboardPrefs,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -186,194 +199,9 @@ const DASHBOARD_HTML = `<!doctype html>
     - aria-expanded on each message row toggles with the body
     - Filter bar is a proper form with label-associated inputs
 -->
+<!-- v2.2.1 P3: CSS extracted to src/dashboard-styles.ts so themes (P1) + inline-action UI slot in without pushing this file past 1000 LOC. Both strings are interpolated into the <style> block below at response-build time. -->
 <style>
-  :root {
-    --bg: #0f1115;
-    --panel: #171a21;
-    --panel-2: #1d212a;
-    --border: #2a2f3b;
-    --text: #e4e6eb;
-    --muted: #8a92a3;
-    --accent: #2D6A4F;
-    --online: #4ade80;
-    --stale: #fbbf24;
-    --offline: #6b7280;
-    --critical: #ef4444;
-    --high: #f97316;
-    --normal: #60a5fa;
-    --low: #9ca3af;
-    --cards-per-row: 3;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    line-height: 1.4;
-  }
-  header {
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  header h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
-  header .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  main { padding: 24px; display: grid; gap: 24px; grid-template-columns: 2fr 1fr; max-width: 1400px; }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
-  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  .controls select, .controls input {
-    background: var(--panel-2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 4px 8px;
-    font-size: 12px;
-  }
-  .controls label { color: var(--muted); font-size: 12px; display: inline-flex; gap: 6px; align-items: center; }
-  .agents-grid {
-    display: grid;
-    grid-template-columns: repeat(var(--cards-per-row), minmax(0, 1fr));
-    gap: 12px;
-    padding: 16px;
-  }
-  .agent-card {
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-    cursor: pointer;
-    transition: transform 0.1s, border-color 0.1s;
-  }
-  .agent-card:hover { border-color: var(--accent); transform: translateY(-1px); }
-  .agent-card.focused { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-  .agent-card .name { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
-  .agent-card .role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
-  .agent-card .state { margin-top: 8px; font-size: 12px; }
-  .agent-card .seen { color: var(--muted); font-size: 11px; margin-top: 4px; font-variant-numeric: tabular-nums; }
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 11px;
-    padding: 2px 6px;
-    border-radius: 10px;
-    text-transform: lowercase;
-  }
-  .badge-idle { background: rgba(74,222,128,0.15); color: var(--online); }
-  .badge-working { background: rgba(96,165,250,0.15); color: var(--normal); }
-  .badge-blocked { background: rgba(251,191,36,0.15); color: var(--stale); }
-  .badge-waiting_user { background: rgba(251,191,36,0.15); color: var(--stale); }
-  .badge-stale { background: rgba(251,191,36,0.15); color: var(--stale); }
-  .badge-offline { background: rgba(107,114,128,0.15); color: var(--offline); }
-  .msg-list { list-style: none; padding: 0; margin: 0; }
-  .msg-row {
-    display: block;
-    width: 100%;
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid var(--border);
-    color: var(--text);
-    text-align: left;
-    padding: 10px 16px;
-    font-size: 13px;
-    cursor: pointer;
-    font-family: inherit;
-  }
-  .msg-row:hover { background: var(--panel-2); }
-  .msg-row:last-child { border-bottom: none; }
-  .msg-row[aria-expanded="true"] .msg-full { display: block; }
-  .msg-full { display: none; margin-top: 6px; color: var(--muted); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
-  .focused-agent {
-    margin: 0 24px 24px;
-    padding: 16px;
-    background: var(--panel);
-    border: 1px solid var(--accent);
-    border-radius: 10px;
-    display: none;
-  }
-  .focused-agent.visible { display: block; }
-  .focused-agent h3 { margin: 0 0 12px 0; font-size: 14px; }
-  .focused-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
-  .focused-actions button {
-    background: var(--panel-2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 12px;
-    cursor: pointer;
-    font-family: inherit;
-  }
-  .focused-actions button:hover:not(:disabled) { border-color: var(--accent); }
-  .focused-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .conn-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-size: 11px;
-    background: var(--panel-2);
-    color: var(--muted);
-  }
-  .conn-pill .conn-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--offline); }
-  .conn-pill.live .conn-dot { background: var(--online); }
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-  }
-  .panel h2 {
-    margin: 0;
-    padding: 12px 16px;
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-    border-bottom: 1px solid var(--border);
-    background: var(--panel-2);
-  }
-  .panel-body { padding: 8px 0; max-height: 420px; overflow-y: auto; }
-  .row {
-    padding: 10px 16px;
-    border-bottom: 1px solid var(--border);
-    font-size: 13px;
-  }
-  .row:last-child { border-bottom: none; }
-  .row-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  .row-title { font-weight: 500; }
-  .row-meta { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .row-body { color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-word; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-  .status-online { background: var(--online); }
-  .status-stale { background: var(--stale); }
-  .status-offline { background: var(--offline); }
-  .tag {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.02em;
-    margin-right: 6px;
-  }
-  .tag-critical { background: rgba(239,68,68,0.15); color: var(--critical); }
-  .tag-high { background: rgba(249,115,22,0.15); color: var(--high); }
-  .tag-normal { background: rgba(96,165,250,0.15); color: var(--normal); }
-  .tag-low { background: rgba(156,163,175,0.15); color: var(--low); }
-  .tag-posted { background: rgba(96,165,250,0.15); color: var(--normal); }
-  .tag-accepted { background: rgba(251,191,36,0.15); color: var(--stale); }
-  .tag-completed { background: rgba(74,222,128,0.15); color: var(--online); }
-  .tag-rejected { background: rgba(239,68,68,0.15); color: var(--critical); }
-  .tag-pending { background: rgba(96,165,250,0.15); color: var(--normal); }
-  .tag-read { background: rgba(156,163,175,0.15); color: var(--low); }
-  .empty { padding: 24px 16px; text-align: center; color: var(--muted); font-size: 13px; }
-  code { font-family: "SF Mono", Monaco, Menlo, monospace; font-size: 11px; }
+${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
 </style>
 </head>
 <body>
@@ -381,6 +209,15 @@ const DASHBOARD_HTML = `<!doctype html>
   <h1>bot-relay dashboard</h1>
   <div class="controls">
     <span id="conn-pill" class="conn-pill" title="WebSocket connection to /dashboard/ws"><span class="conn-dot"></span><span id="conn-label">connecting…</span></span>
+    <label>
+      <span>theme</span>
+      <select id="theme-toggle" aria-label="Dashboard theme">
+        <option value="catppuccin" selected>catppuccin</option>
+        <option value="dark">dark</option>
+        <option value="light">light</option>
+        <option value="custom">custom</option>
+      </select>
+    </label>
     <label>
       <span>cards/row</span>
       <select id="cards-per-row-toggle" aria-label="Cards per row">
@@ -459,7 +296,14 @@ const DASHBOARD_HTML = `<!doctype html>
   function savePrefs(p) {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(p)); } catch (_e) {}
   }
-  const prefs = Object.assign({ cardsPerRow: 3, role: '', status: 'all', since: '24h' }, loadPrefs());
+  // v2.2.1 P1: theme field added. Default 'catppuccin' unless the server-
+  // side /api/snapshot.dashboard_prefs override lands first (fetchSnapshot
+  // applies it when our prefs.theme is still the initial default). Once
+  // the operator flips the dropdown, localStorage beats the server default.
+  const prefs = Object.assign(
+    { cardsPerRow: 3, role: '', status: 'all', since: '24h', theme: 'catppuccin', customJson: null, themeSetByOperator: false },
+    loadPrefs()
+  );
 
   // Apply persisted prefs immediately so the first render uses them.
   document.documentElement.style.setProperty('--cards-per-row', String(prefs.cardsPerRow));
@@ -467,6 +311,30 @@ const DASHBOARD_HTML = `<!doctype html>
   document.getElementById('filter-role').value = prefs.role;
   document.getElementById('filter-status').value = prefs.status;
   document.getElementById('filter-since').value = prefs.since;
+  document.getElementById('theme-toggle').value = prefs.theme;
+
+  // v2.2.1 P1: apply the selected theme to <html> via data-theme (for
+  // named themes) or inline --* custom properties (for pasted custom).
+  function applyTheme(theme, customJson) {
+    const root = document.documentElement;
+    if (theme === 'custom' && customJson) {
+      root.setAttribute('data-theme', 'custom');
+      // Clear any prior inline tokens, then set the custom ones.
+      const TOKENS = ['bg','panel','panel-2','border','text','muted','accent','online','stale','offline','critical','high','normal','low'];
+      for (const t of TOKENS) root.style.removeProperty('--' + t);
+      try {
+        const obj = typeof customJson === 'string' ? JSON.parse(customJson) : customJson;
+        for (const t of TOKENS) {
+          if (obj && typeof obj[t] === 'string') root.style.setProperty('--' + t, obj[t]);
+        }
+      } catch (_e) { /* silently fall back to catppuccin */ }
+    } else {
+      root.setAttribute('data-theme', theme);
+      const TOKENS = ['bg','panel','panel-2','border','text','muted','accent','online','stale','offline','critical','high','normal','low'];
+      for (const t of TOKENS) root.style.removeProperty('--' + t);
+    }
+  }
+  applyTheme(prefs.theme, prefs.customJson);
 
   // ---------- helpers ----------
   function fmtTime(iso) {
@@ -616,6 +484,20 @@ const DASHBOARD_HTML = `<!doctype html>
       const res = await fetch('/api/snapshot', { credentials: 'same-origin' });
       if (!res.ok) throw new Error('snapshot ' + res.status);
       snapshot = await res.json();
+      // v2.2.1 P1: if the operator hasn't picked a theme yet this session
+      // (localStorage has no operator-set flag), adopt the server default.
+      if (!prefs.themeSetByOperator && snapshot.dashboard_prefs && snapshot.dashboard_prefs.theme) {
+        const serverTheme = snapshot.dashboard_prefs.theme;
+        const serverCustom = snapshot.dashboard_prefs.custom_json;
+        let customParsed = null;
+        if (serverCustom) {
+          try { customParsed = JSON.parse(serverCustom); } catch (_e) { /* ignore */ }
+        }
+        prefs.theme = serverTheme;
+        prefs.customJson = customParsed;
+        document.getElementById('theme-toggle').value = serverTheme;
+        applyTheme(serverTheme, customParsed);
+      }
       renderAll();
     } catch (e) {
       document.getElementById('updated').textContent = 'relay offline';
@@ -663,6 +545,38 @@ const DASHBOARD_HTML = `<!doctype html>
   document.getElementById('cards-per-row-toggle').addEventListener('change', (e) => {
     prefs.cardsPerRow = parseInt(e.target.value, 10) || 3;
     document.documentElement.style.setProperty('--cards-per-row', String(prefs.cardsPerRow));
+    savePrefs(prefs);
+  });
+
+  // v2.2.1 P1: theme dropdown. Operator selection beats server-default
+  // from here on — mark themeSetByOperator so fetchSnapshot doesn't
+  // overwrite with the server value on next poll.
+  document.getElementById('theme-toggle').addEventListener('change', (e) => {
+    const mode = e.target.value;
+    prefs.theme = mode;
+    prefs.themeSetByOperator = true;
+    if (mode === 'custom') {
+      // Prompt for a JSON paste. Keep it inline (prompt() is crude but
+      // zero-chrome). A richer UI is v2.2.2.
+      const raw = prompt('Paste a custom theme JSON with 13 color tokens (bg, panel, panel-2, border, text, muted, accent, online, stale, offline, critical, high, normal, low):', prefs.customJson ? prefs.customJson : '');
+      if (raw !== null && raw.trim().length > 0) {
+        try {
+          const parsed = JSON.parse(raw);
+          prefs.customJson = parsed;
+          applyTheme('custom', parsed);
+        } catch (_err) {
+          alert('Invalid JSON — keeping previous theme.');
+          e.target.value = prefs.theme === 'custom' ? 'custom' : 'catppuccin';
+          return;
+        }
+      } else {
+        // Cancelled — revert the dropdown.
+        e.target.value = prefs.theme === 'custom' ? 'custom' : 'catppuccin';
+        return;
+      }
+    } else {
+      applyTheme(mode, null);
+    }
     savePrefs(prefs);
   });
   document.getElementById('filter-role').addEventListener('input', (e) => {

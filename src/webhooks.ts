@@ -217,8 +217,8 @@ async function deliverWebhook(
     logWebhookDelivery(webhookId, event, payloadStr, null, reason);
     return;
   }
-  const pinnedIp = safety.resolvedIps && safety.resolvedIps.length > 0 ? safety.resolvedIps[0] : null;
-  if (!pinnedIp) {
+  const validatedIps = safety.resolvedIps ?? [];
+  if (validatedIps.length === 0) {
     // Shouldn't happen — validateWebhookUrl returns ok only if it resolved
     // at least one IP. Defensive belt-and-suspenders.
     const reason = "no validated IP to pin for delivery (internal error)";
@@ -226,6 +226,7 @@ async function deliverWebhook(
     logWebhookDelivery(webhookId, event, payloadStr, null, reason);
     return;
   }
+  const pinnedIp = validatedIps[0];
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -248,6 +249,7 @@ async function deliverWebhook(
   const res = await deliverPinnedPost({
     url,
     pinnedIp,
+    pinnedIps: validatedIps, // v2.2.1 B5: load-balanced-target failover
     headers,
     body: payloadStr,
     timeoutMs,
@@ -308,13 +310,14 @@ async function retryOne(
     terminateWebhookRetry(logId, reason);
     return;
   }
-  const pinnedIp = safety.resolvedIps && safety.resolvedIps.length > 0 ? safety.resolvedIps[0] : null;
-  if (!pinnedIp) {
+  const retryValidatedIps = safety.resolvedIps ?? [];
+  if (retryValidatedIps.length === 0) {
     const reason = "no validated IP to pin for retry (internal error)";
     log.warn(`[webhook-retry] ${reason} url=${url}`);
     terminateWebhookRetry(logId, reason);
     return;
   }
+  const pinnedIp = retryValidatedIps[0];
 
   // Extract the stored delivery_id from the payload body so the retry header
   // matches what recipients already know (dedup stability across retries).
@@ -341,6 +344,7 @@ async function retryOne(
   const res = await deliverPinnedPost({
     url,
     pinnedIp,
+    pinnedIps: retryValidatedIps, // v2.2.1 B5: same failover on retries
     headers,
     body: payloadStr,
     timeoutMs,

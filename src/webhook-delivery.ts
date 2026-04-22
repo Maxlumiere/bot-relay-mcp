@@ -48,7 +48,24 @@ export interface DeliveryResult {
 
 export interface DeliveryInput {
   url: string;
+  /**
+   * Pre-validated IP to connect to. When the caller has multiple safe IPs
+   * (DNS returned more than one A/AAAA record for a load-balanced target)
+   * use `pinnedIps` instead to get v2.2.1 B5 failover.
+   */
   pinnedIp: string;
+  /**
+   * v2.2.1 B5: full list of validated IPs from `validateWebhookUrl`. When
+   * provided, `deliverPinnedPost` tries each in order on connect failure
+   * or timeout (max 3 attempts) — recovers load-balanced-target failover
+   * that native fetch's internal round-robin previously handled. Each
+   * attempt re-uses SNI + Host on the URL hostname; only the connect IP
+   * rotates.
+   *
+   * If both `pinnedIp` and `pinnedIps` are set, `pinnedIps` wins. If only
+   * `pinnedIp` is set (pre-B5 callers), behavior is unchanged.
+   */
+  pinnedIps?: string[];
   headers: Record<string, string>;
   body: string;
   timeoutMs: number;
@@ -74,10 +91,68 @@ const MAX_REDIRECTS = 5;
  *   (private ranges, cloud metadata, etc.) terminate the delivery.
  * - Never throws — any failure surfaces as `{ statusCode: null, error }`.
  */
+/**
+ * v2.2.1 B5: max attempts across validated IPs for a single hop. Cap at 3
+ * so the failover window is bounded; load-balanced targets with 10+ IPs
+ * don't cause a long retry-storm on total outage.
+ */
+const MAX_IP_ATTEMPTS = 3;
+
+/**
+ * v2.2.1 B5: try the current hop against a list of IPs in order. Returns
+ * on the first non-error, non-connect-failure response. Connect-failure
+ * and timeout errors trigger failover to the next IP; other errors (TLS
+ * cert rejection, server-side 5xx, etc.) return immediately because they
+ * aren't fixed by connecting to a sibling replica.
+ */
+async function sendWithIpFailover(input: DeliveryInput): Promise<SingleResult> {
+  const ips =
+    input.pinnedIps && input.pinnedIps.length > 0
+      ? input.pinnedIps
+      : [input.pinnedIp];
+  const attempts = Math.min(ips.length, MAX_IP_ATTEMPTS);
+  let lastResult: SingleResult = {
+    statusCode: null,
+    bodyText: "",
+    error: "no IPs supplied for delivery",
+  };
+  for (let i = 0; i < attempts; i++) {
+    const attempt = await sendOnce({
+      ...input,
+      pinnedIp: ips[i],
+    });
+    lastResult = attempt;
+    if (!attempt.error && attempt.statusCode !== null) {
+      // Got a real HTTP response — success OR server-side error. Either
+      // way, no point trying sibling replicas; the server heard us.
+      return attempt;
+    }
+    // v2.2.1 post-audit (Codex): ONLY retry on clearly pre-connect
+    // failures. ECONNRESET used to be on this list but is ambiguous for
+    // POST — the peer may have accepted the request body before
+    // resetting, so retrying risks at-least-once delivery (duplicate
+    // webhooks). Duplicate webhooks are worse than rare one-shot reset
+    // losses for operator-run self-hosted tooling (the caller's whole
+    // threat model for webhook delivery is "fire-and-forget, best
+    // effort"). Pre-connect errors (refused, unreachable, timeouts, DNS
+    // retry hints) are safe to retry — the peer never saw the body.
+    const err = (attempt.error ?? "").toLowerCase();
+    const retryable =
+      err.includes("econnrefused") ||
+      err.includes("ehostunreach") ||
+      err.includes("enetunreach") ||
+      err.includes("etimedout") ||
+      err.includes("timed out") ||
+      err.includes("eai_again");
+    if (!retryable) return attempt; // TLS / ECONNRESET / DNS error / etc. — don't loop
+  }
+  return lastResult;
+}
+
 export async function deliverPinnedPost(input: DeliveryInput): Promise<DeliveryResult> {
   let current: DeliveryInput = input;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const res = await sendOnce(current);
+    const res = await sendWithIpFailover(current);
     if (res.error || res.statusCode === null) return res;
     // Only treat 3xx WITH a Location header as a redirect. Others (304
     // Not Modified, etc.) fall through as terminal responses.
@@ -116,8 +191,8 @@ export async function deliverPinnedPost(input: DeliveryInput): Promise<DeliveryR
         error: `redirect refused (hop ${hop + 1} → ${nextUrl}): ${safety.reason}`,
       };
     }
-    const nextPin = safety.resolvedIps && safety.resolvedIps.length > 0 ? safety.resolvedIps[0] : null;
-    if (!nextPin) {
+    const nextIps = safety.resolvedIps ?? [];
+    if (nextIps.length === 0) {
       return {
         statusCode: null,
         bodyText: "",
@@ -130,9 +205,12 @@ export async function deliverPinnedPost(input: DeliveryInput): Promise<DeliveryR
     // (matching fetch's behavior for webhook-style flows — operators
     // configuring a 301/302 on a webhook target almost certainly want the
     // POST forwarded, not a silent method rewrite).
+    // v2.2.1 B5: propagate the full validated IP list to the next hop so
+    // the redirect target's load-balanced replicas also get failover.
     current = {
       url: nextUrl,
-      pinnedIp: nextPin,
+      pinnedIp: nextIps[0],
+      pinnedIps: nextIps,
       headers: current.headers,
       body: current.body,
       timeoutMs: current.timeoutMs,

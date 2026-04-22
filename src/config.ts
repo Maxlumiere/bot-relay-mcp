@@ -79,6 +79,26 @@ export class InvalidConfigError extends Error {
   }
 }
 
+/**
+ * v2.2.1 L2 (Codex audit): return the set of keys actually present in the
+ * config file (if any). Used by `src/cli.ts applyCliToEnv` to label
+ * config-file-won values as source="config" in the startup log instead of
+ * mislabeling them as "default". Returns empty set when no file exists or
+ * parse fails — safe to treat as "no keys overridden at the file layer."
+ */
+export function readConfigFileKeys(): Set<string> {
+  const configPath = getConfigPath();
+  if (!fs.existsSync(configPath)) return new Set();
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj === "object") return new Set(Object.keys(obj));
+  } catch {
+    /* swallow; caller treats empty set as no-file-override */
+  }
+  return new Set();
+}
+
 export function loadConfig(): RelayConfig {
   const configPath = getConfigPath();
   let fileConfig: Partial<RelayConfig> = {};

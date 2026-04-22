@@ -38,6 +38,7 @@ import {
   RevokeTokenSchema,
   GetStandupSchema,
   ExpandCapabilitiesSchema,
+  SetDashboardThemeSchema,
 } from "./types.js";
 import {
   handleRegisterAgent,
@@ -102,6 +103,7 @@ import {
 } from "./tools/channels.js";
 import { handleSetStatus, handleHealthCheck } from "./tools/status.js";
 import { handleGetStandup } from "./tools/standup.js";
+import { handleSetDashboardTheme } from "./tools/dashboard.js";
 import { VERSION } from "./version.js";
 
 export function createServer(): Server {
@@ -152,7 +154,7 @@ export function createServer(): Server {
       {
         name: "get_messages",
         description:
-          "Check your mailbox for messages. Returns messages addressed to you, newest first. Pending messages are automatically marked as read. v2.1.6: optional `since` trims stale backlog (default '24h'; pass 'all' or null for the pre-v2.1.6 unlimited behavior).",
+          "Check your mailbox for messages. Returns messages addressed to you, newest first. Pending messages are automatically marked as read. v2.1.6: optional `since` trims stale backlog (default '24h'; pass 'all' or null for the pre-v2.1.6 unlimited behavior). v2.2.1: when status='pending' AND count=0 AND since<24h, response includes a `hint` field nudging toward since='all' — the `since` filter trims both pending AND read mail, so a narrow window can hide older pending work.",
         inputSchema: zodToJsonSchema(GetMessagesSchema),
       },
       {
@@ -275,6 +277,12 @@ export function createServer(): Server {
         name: "expand_capabilities",
         description: "v2.1.4 (I11): self-managed ADDITIVE capability expansion. Closes the v1.7.1 immutability gap for agents that hook-registered with a narrow cap set and later need more. Caller presents their token; request MUST be a superset of current caps (reductions rejected with REDUCTION_NOT_ALLOWED — those still need unregister + re-register). Requesting already-held caps with no new additions rejects with NO_OP_EXPANSION.",
         inputSchema: zodToJsonSchema(ExpandCapabilitiesSchema),
+      },
+      {
+        name: "set_dashboard_theme",
+        description:
+          "v2.2.1: set the server-side default dashboard theme. Modes: 'catppuccin' (default Mocha palette) | 'dark' (tool-neutral) | 'light' (tool-neutral) | 'custom' (requires custom_json with all 13 CSS tokens). Newly-connecting dashboard clients read this on first visit only — each client's localStorage preference beats the server default locally (path-1 client-only design). No WebSocket push; already-connected dashboards surface the change on full reload.",
+        inputSchema: zodToJsonSchema(SetDashboardThemeSchema),
       },
     ],
   }));
@@ -408,6 +416,8 @@ export function createServer(): Server {
         return handleGetStandup(GetStandupSchema.parse(args));
       case "expand_capabilities":
         return handleExpandCapabilities(ExpandCapabilitiesSchema.parse(args));
+      case "set_dashboard_theme":
+        return handleSetDashboardTheme(SetDashboardThemeSchema.parse(args));
       default:
         return {
           content: [
