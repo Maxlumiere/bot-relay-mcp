@@ -92,7 +92,12 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
     expect(r.status).toBe(0);
     expect(fs.existsSync(TEST_CONFIG_PATH)).toBe(true);
     const cfg = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8"));
-    expect(cfg.transport).toBe("both");
+    // v2.3.0 Part B.1 — `relay init --yes` with no explicit --profile
+    // now defaults to the `solo` profile, whose transport is "stdio"
+    // (pre-v2.3.0 default was "both"). Operators who want the prior
+    // behavior pass --transport=both or --profile=team explicitly.
+    expect(cfg.transport).toBe("stdio");
+    expect(cfg.profile).toBe("solo");
     expect(cfg.http_port).toBe(3777);
     expect(cfg.http_secret).toBeTruthy();
     expect(cfg.http_secret.length).toBeGreaterThan(20);
