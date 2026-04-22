@@ -1,5 +1,50 @@
 # Changelog
 
+## v2.2.3 — 2026-04-22 — Node 18 webhook-timeout hotfix + CI green-gate
+
+Hotfix release. CI has been red on Node 18 since v2.2.1 — both `tests/v2-2-1-bug-sweep.test.ts (B5.1)` and `tests/v2-2-1-codex-patches.test.ts (B5n.2)` timed out at 15s. v2.2.1 + v2.2.2 shipped to npm anyway because the local pre-publish gate didn't run the CI matrix. This release (a) patches the underlying webhook-delivery behavior, (b) adds a systemic guard so we can't ship another CI-red commit, and (c) seeds permanent regression coverage for the Node 18 failure mode.
+
+**Protocol bump `2.2.2 → 2.2.3` (PATCH)**. No API surface change — only delivery-layer behavior.
+
+### Root cause
+
+`sendOnce()` in `src/webhook-delivery.ts` used `req.setTimeout(timeoutMs, handler)`, which is a **socket-level** timeout — it only fires once a TCP socket exists. The B5 test fixture pins to `0.0.0.1` (an invalid-route loopback address) to force a connect refusal. On Node 20/22 the kernel rejects this immediately, `req.on("error")` fires, the failover loop advances. **On Node 18 the kernel sits in `EINPROGRESS` indefinitely** — no socket → `req.setTimeout` never fires → `req.on("error")` never fires → the Promise from `sendOnce` never resolves → the test times out at the vitest 15s harness limit. Real webhook delivery to a misrouted load-balanced target on Node 18 would block the whole failover loop until the process died.
+
+### Fix
+
+- **`src/webhook-delivery.ts` `sendOnce`**: adds a **hard JS `setTimeout`** that fires regardless of socket state. Set up right after `let settled = false;`, before `const req = requester(...)`. The hard timer resolves the Promise with a `timeout` error + destroys `req` when it fires. Every existing `settled = true` path (res.on("end"), res.on("error"), req.on("error"), req.setTimeout callback) gains a `clearTimeout(hardTimer)` so we don't double-resolve. The socket-level `req.setTimeout` stays in place for the "socket connected but stalled mid-stream" case — the hard timer is belt + suspenders.
+
+### Systemic fix — GitHub CI green-gate
+
+`scripts/pre-publish-check.sh` gains a new step after the 25-tool smoke: `GitHub CI green-gate`. Probes `gh run list --commit HEAD` for the current HEAD's CI conclusion. Behavior:
+
+- `success` → PASS.
+- `failure` / `cancelled` / `timed_out` / `action_required` → **FAIL** (refuses to publish).
+- `in_progress` / `queued` / `waiting` / `pending` → WARN (still running, proceed at own risk).
+- `no-run` → WARN (HEAD not pushed yet).
+- gh CLI absent → SKIP with a console notice (no hard block on tooling absence).
+
+This closes the "local gate green, CI red" loophole that let v2.2.1 + v2.2.2 ship with known-red matrix tests.
+
+### Tests
+
+- `tests/v2-2-2-regression-from-released-bugs.test.ts` — case `(7) sendOnce hard-timer fires even when no socket exists (Node 18 EINPROGRESS)`. Pins to `0.0.0.1` with `timeoutMs=400ms`; asserts the call completes within 8× timeoutMs wall-clock and resolves with `statusCode=null + error`. Guard against re-landing the socket-only timeout.
+- `tests/v2-2-1-bug-sweep.test.ts (B5.1)` + `tests/v2-2-1-codex-patches.test.ts (B5n.2)` — previously Node 18 red, now green on all three runtimes.
+
+**Total: 1009 tests pass** (1008 v2.2.2 baseline + 1 new case (7) regression).
+
+### Release hygiene
+
+- `package.json` 2.2.2 → 2.2.3.
+- `src/protocol.ts` 2.2.2 → 2.2.3.
+- `tests/v2-2-0-full-dashboard-smoke.test.ts` — version pins bumped to 2.2.3.
+- `devlog/069-v2.2.3-node-18-hotfix.md` — assumptions-first.
+
+### Hall of Fame
+
+- **Maxime (public-facing CI failure, 2026-04-22):** caught the red badge + correctly escalated.
+- **Main-victra (root-cause diagnosis):** socket-level vs JS-level timer distinction + Node 18 EINPROGRESS behavior + prescribed fix + CI green-gate design.
+
 ## v2.2.2 — 2026-04-22 — defense-in-depth + dashboard UX polish + CLI ergonomics + 3 bundled bugs
 
 v2.2.2 bundles 11 items across four buckets: two server-side defense-in-depth touches (A1/A2), five dashboard UX polish items (B1-B5), one CLI ergonomics addition (C1), and three bundled bugs surfaced during the ship cycle itself (BUG1/BUG2/BUG3). One release, one Codex audit, one ship ceremony. Protocol bumps `2.2.1 → 2.2.2` (MINOR — additive endpoints + `get_messages.peek` parameter + agent_status enum widening with `abandoned` and `closed`). No breaking changes.

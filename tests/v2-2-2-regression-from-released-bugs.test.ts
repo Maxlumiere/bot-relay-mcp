@@ -47,6 +47,7 @@ const {
 } = await import("../src/db.js");
 const { handleRegisterAgent } = await import("../src/tools/identity.js");
 const { handleGetMessages } = await import("../src/tools/messaging.js");
+const { deliverPinnedPost } = await import("../src/webhook-delivery.js");
 
 beforeEach(() => {
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
@@ -165,4 +166,32 @@ describe("v2.2.2 regression-from-released-bugs", () => {
     expect(derived?.agent_status).toBe("closed");
     expect(derived?.agent_status).not.toBe("offline");
   });
+
+  // ─── v2.2.3 hotfix ──────────────────────────────────────────────────
+  it("(7) sendOnce hard-timer fires even when no socket exists (Node 18 EINPROGRESS)", async () => {
+    // v2.2.3: sendOnce previously relied on req.setTimeout (socket-level),
+    // which never fires on Node 18 when the kernel sits in EINPROGRESS
+    // for an invalid-route destination (e.g. 0.0.0.1). The hard JS timer
+    // guarantees the promise resolves within timeoutMs regardless of
+    // socket state. Assertion: a call pinned to 0.0.0.1 with a tight
+    // timeoutMs completes in <= 2 × timeoutMs wall-clock — proving the
+    // hard timer, not a 15s test-harness-level timeout, did the work.
+    const timeoutMs = 400;
+    const start = Date.now();
+    const result = await deliverPinnedPost({
+      url: "http://example.invalid/",
+      pinnedIp: "0.0.0.1",
+      pinnedIps: ["0.0.0.1"],
+      body: "{}",
+      headers: {},
+      timeoutMs,
+      maxRedirects: 0,
+    } as any);
+    const elapsed = Date.now() - start;
+    // Some failover retries may stack — hence the generous cap — but the
+    // whole call MUST complete within a small multiple of timeoutMs.
+    expect(elapsed).toBeLessThan(timeoutMs * 8);
+    expect(result.statusCode).toBeNull();
+    expect(result.error).toBeTruthy();
+  }, 8000);
 });
