@@ -351,6 +351,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
   <div id="focused-body"></div>
   <div class="focused-actions">
     <button id="btn-focus-terminal" type="button" title="Raise the agent's OS terminal window">📱 Raise terminal</button>
+    <button id="btn-wake-agent" type="button" title="Touch the filesystem marker for this agent (ambient wake)">🔔 Wake agent</button>
     <button id="btn-close-focused" type="button">Close</button>
   </div>
 </section>
@@ -1067,6 +1068,35 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
       pill.classList.add('live');
       setTimeout(() => { label.textContent = prev || 'live'; }, 1600);
     } catch (_e) { /* swallow; status pill remains */ }
+  });
+
+  // v2.3.0 Part C.5 — wake-agent button. Touches the filesystem marker
+  // so ambient-wake clients watching the marker path get a low-latency
+  // nudge. No-op when RELAY_FILESYSTEM_MARKERS is off on the daemon —
+  // the server returns markers_enabled:false + an informative note.
+  document.getElementById('btn-wake-agent').addEventListener('click', async () => {
+    if (!focusedAgent) return;
+    try {
+      const res = await fetch('/api/wake-agent', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: Object.assign(
+          { 'Content-Type': 'application/json' },
+          csrfHeader(),
+        ),
+        body: JSON.stringify({ agent_name: focusedAgent }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const btn = document.getElementById('btn-wake-agent');
+      const origLabel = btn.textContent;
+      if (data.markers_enabled) {
+        btn.textContent = '🔔 Woke ' + focusedAgent;
+      } else {
+        btn.textContent = '🔔 Markers disabled';
+        btn.title = data.note || 'Set RELAY_FILESYSTEM_MARKERS=1 on the daemon to enable wake.';
+      }
+      setTimeout(() => { btn.textContent = origLabel; }, 1800);
+    } catch (_e) { /* swallow */ }
   });
 
   // v2.2.2 A2: operator-identity indicator + setter. Reads the current

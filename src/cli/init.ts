@@ -31,6 +31,20 @@ function defaultConfigPath(): string {
   return process.env.RELAY_CONFIG_PATH || path.join(defaultBotRelayDir(), "config.json");
 }
 
+/**
+ * v2.3.0 Part B.1 — profiles shape the defaults, tool visibility, and
+ * logging surface. `solo` (the default) is a minimal single-machine
+ * setup with channels/webhooks/admin tools hidden. `team` enables the
+ * full multi-agent + channels + webhooks surface. `ci` is a minimal
+ * stdio-only + warn-level-log profile for CI runners.
+ *
+ * Frozen list here is authoritative for surface-shaping (see
+ * src/server.ts filterToolsByProfile). New profiles = new entry here +
+ * bundle list in applyProfileDefaults + test coverage.
+ */
+export type Profile = "solo" | "team" | "ci";
+export const VALID_PROFILES: readonly Profile[] = ["solo", "team", "ci"] as const;
+
 interface ParsedArgs {
   yes: boolean;
   force: boolean;
@@ -39,6 +53,7 @@ interface ParsedArgs {
   port?: number;
   transport?: string;
   secret?: string;
+  profile?: Profile;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -52,12 +67,77 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === "--port") out.port = parseInt(argv[++i], 10);
     else if (a === "--transport") out.transport = argv[++i];
     else if (a === "--secret") out.secret = argv[++i];
-    else {
+    else if (a === "--profile") {
+      const v = argv[++i];
+      if (!v || !(VALID_PROFILES as readonly string[]).includes(v)) {
+        process.stderr.write(`--profile: expected one of ${VALID_PROFILES.join("/")}, got "${v}"\n`);
+        throw new Error("invalid --profile");
+      }
+      out.profile = v as Profile;
+    } else if (a.startsWith("--profile=")) {
+      const v = a.slice("--profile=".length);
+      if (!(VALID_PROFILES as readonly string[]).includes(v)) {
+        process.stderr.write(`--profile: expected one of ${VALID_PROFILES.join("/")}, got "${v}"\n`);
+        throw new Error("invalid --profile");
+      }
+      out.profile = v as Profile;
+    } else {
       process.stderr.write(`Unknown argument: ${a}\n`);
       throw new Error("unknown arg");
     }
   }
   return out;
+}
+
+/**
+ * Profile-specific defaults applied on top of the base config. Per the
+ * v2.2/v2.3 federation design memo: profiles shape the SURFACE (visible
+ * tools, CLI subcommands), not just env defaults.
+ *
+ * Bundles determine which MCP tools are surfaced (see server.ts). The
+ * `tool_visibility` block lets profiles carve further inside a bundle
+ * (e.g. a `team` profile could re-enable admin tools that `solo` hid).
+ */
+export interface ProfileConfig {
+  transport: string;
+  feature_bundles: string[];
+  tool_visibility: { hidden: string[] };
+  logging_level: string;
+  agent_abandon_days: number;
+  dashboard_enabled: boolean;
+}
+
+export function applyProfileDefaults(profile: Profile): ProfileConfig {
+  switch (profile) {
+    case "team":
+      return {
+        transport: "http",
+        feature_bundles: ["core", "channels", "webhooks", "admin", "managed-agents"],
+        tool_visibility: { hidden: [] },
+        logging_level: "info",
+        agent_abandon_days: 7,
+        dashboard_enabled: true,
+      };
+    case "ci":
+      return {
+        transport: "stdio",
+        feature_bundles: ["core"],
+        tool_visibility: { hidden: [] },
+        logging_level: "warn",
+        agent_abandon_days: 1,
+        dashboard_enabled: false,
+      };
+    case "solo":
+    default:
+      return {
+        transport: "stdio",
+        feature_bundles: ["core"],
+        tool_visibility: { hidden: [] },
+        logging_level: "info",
+        agent_abandon_days: 30,
+        dashboard_enabled: true,
+      };
+  }
 }
 
 async function promptWithDefault(rl: readline.Interface, q: string, def: string): Promise<string> {
@@ -82,7 +162,10 @@ export async function run(argv: string[]): Promise<number> {
         "  --install-hooks    Also install Claude Code hooks to ~/.claude/settings.json.\n" +
         "  --port N           HTTP port (default 3777).\n" +
         "  --transport X      stdio | http | both (default both).\n" +
-        "  --secret STRING    HTTP secret (random 32-byte base64 if omitted).\n"
+        "  --secret STRING    HTTP secret (random 32-byte base64 if omitted).\n" +
+        "  --profile X        solo (default) | team | ci. Shapes tool visibility,\n" +
+        "                     feature bundles, logging level, and abandon threshold.\n" +
+        "                     See docs/profiles.md.\n"
     );
     return 0;
   }
@@ -95,7 +178,12 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
-  let transport = args.transport ?? "both";
+  // v2.3.0 Part B.1 — profile defaults. Applied BEFORE flag overrides so
+  // explicit --transport / --port still win. `solo` is the default when
+  // neither --profile nor a prompt-time answer is provided.
+  const profile: Profile = args.profile ?? "solo";
+  const profileDefaults = applyProfileDefaults(profile);
+  let transport = args.transport ?? profileDefaults.transport;
   let port = args.port ?? 3777;
   let secret = args.secret ?? crypto.randomBytes(32).toString("base64url");
   let wantHooks = args.installHooks;
@@ -134,6 +222,15 @@ export async function run(argv: string[]): Promise<number> {
     rate_limit_tasks_per_hour: 200,
     rate_limit_spawns_per_hour: 50,
     trusted_proxies: [],
+    // v2.3.0 Part B: profile + surface-shape fields. Consumed by
+    // src/server.ts filterToolsByProfile (tools/list filter) and by
+    // src/config.ts for operator-visible defaults.
+    profile,
+    feature_bundles: profileDefaults.feature_bundles,
+    tool_visibility: profileDefaults.tool_visibility,
+    logging_level: profileDefaults.logging_level,
+    agent_abandon_days: profileDefaults.agent_abandon_days,
+    dashboard_enabled: profileDefaults.dashboard_enabled,
   };
   fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2));
   ensureSecureFile(configPath, 0o600);

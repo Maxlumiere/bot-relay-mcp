@@ -164,6 +164,17 @@ const GetMessagesSinceField = z
       "Default '24h' trims stale backlog when an agent name is reused."
   );
 
+/**
+ * v2.3.0 Part C.3 — peek_inbox_version. Cheap non-mutating observation
+ * of the agent's mailbox. Pair with get_messages(since_seq=...) in a
+ * later release for efficient cursor-based drain.
+ */
+export const PeekInboxVersionSchema = z.object({
+  agent_name: z.string().min(1).max(64).describe("The agent whose mailbox to observe"),
+  agent_token: AgentTokenField,
+});
+export type PeekInboxVersionInput = z.infer<typeof PeekInboxVersionSchema>;
+
 export const GetMessagesSchema = z.object({
   agent_name: z.string().min(1).describe("Your agent name"),
   status: z.enum(["pending", "read", "all"]).default("pending").describe("Filter by status"),
@@ -507,6 +518,17 @@ export const ApiKillAgentSchema = z.object({
 });
 export type ApiKillAgentInput = z.infer<typeof ApiKillAgentSchema>;
 
+/**
+ * v2.3.0 Part C.5 — dashboard wake-agent inline-action endpoint.
+ * POST /api/wake-agent {agent_name}. Touches the filesystem marker
+ * (when RELAY_FILESYSTEM_MARKERS=1) so a client watching that path
+ * receives a low-latency wake signal.
+ */
+export const ApiWakeAgentSchema = z.object({
+  agent_name: z.string().min(1).max(64).describe("Target agent to wake"),
+});
+export type ApiWakeAgentInput = z.infer<typeof ApiWakeAgentSchema>;
+
 export const ApiSetStatusSchema = z.object({
   agent_name: z.string().min(1).max(64).describe("Target agent"),
   agent_status: z.enum(["idle", "working", "blocked", "waiting_user", "offline"]).describe("New status"),
@@ -692,6 +714,17 @@ export interface MessageRecord {
   created_at: string;
   /** v2.0 final: session that read this message. Null = unread. Used for session-aware read receipts (#6). */
   read_by_session?: string | null;
+  /**
+   * v2.3.0 Part C — per-recipient monotonic sequence assigned at first
+   * observation. Null until the recipient reads the message for the
+   * first time. Stable across later reads.
+   */
+  seq?: number | null;
+  /**
+   * v2.3.0 Part C — mailbox epoch snapshotted at delivery time. Lets
+   * the recipient detect a backup/restore vs. a genuine new message.
+   */
+  epoch?: string | null;
 }
 
 export interface TaskRecord {

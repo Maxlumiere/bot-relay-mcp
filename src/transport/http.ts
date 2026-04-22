@@ -15,7 +15,9 @@ import {
   ApiKillAgentSchema,
   ApiSetStatusSchema,
   ApiDashboardThemeSchema,
+  ApiWakeAgentSchema,
 } from "../types.js";
+import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
 import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs } from "../db.js";
 import { verifyToken } from "../auth.js";
 import { fireWebhooks } from "../webhooks.js";
@@ -135,6 +137,8 @@ const DASHBOARD_ROUTES_BYPASSING_HTTP_SECRET: ReadonlySet<string> = new Set([
   // + origin still apply.
   "/api/send-message",
   "/api/kill-agent",
+  // v2.3.0 Part C.5 — dashboard wake-agent inline-action endpoint.
+  "/api/wake-agent",
   "/api/set-status",
   // v2.2.2 A2: per-human operator identity cookie endpoints.
   "/api/operator-identity",
@@ -985,6 +989,89 @@ export function startHttpServer(port: number, host: string): Server {
         false,
         err instanceof Error ? err.message : String(err),
         { target_agent_name: parsed.data.name, error_code: "INTERNAL" }
+      );
+      res.status(500).json({ success: false, error: "internal error" });
+    }
+  });
+
+  // v2.3.0 Part C.5 — POST /api/wake-agent. Touches the filesystem
+  // marker for the target agent, giving ambient-wake clients a low-
+  // latency nudge. No-op when RELAY_FILESYSTEM_MARKERS is off (the
+  // dashboard JS greys the button in that case; the endpoint also
+  // returns a structured `markers_enabled: false` so a scripted caller
+  // knows nothing happened). Audit-logged as dashboard.wake_agent.
+  app.post("/api/wake-agent", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+    const parsed = ApiWakeAgentSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logDashboardAudit(
+        req,
+        "wake_agent",
+        null,
+        "body=invalid",
+        false,
+        "invalid request body",
+        { event: "validation_failed" },
+      );
+      res.status(400).json({
+        success: false,
+        error: "invalid request body",
+        detail: parsed.error.issues.map((i) => i.message),
+      });
+      return;
+    }
+    const enabled = markersEnabled();
+    if (!enabled) {
+      logDashboardAudit(
+        req,
+        "wake_agent",
+        parsed.data.agent_name,
+        `target=${parsed.data.agent_name} markers_enabled=false`,
+        true,
+        null,
+        { target_agent_name: parsed.data.agent_name, markers_enabled: false },
+      );
+      res.status(200).json({
+        success: true,
+        agent_name: parsed.data.agent_name,
+        markers_enabled: false,
+        note:
+          "RELAY_FILESYSTEM_MARKERS is not set — wake is a no-op. " +
+          "Set the env var and restart the daemon to enable the marker path.",
+      });
+      return;
+    }
+    try {
+      touchMarker(parsed.data.agent_name);
+      const path = markerPath(parsed.data.agent_name);
+      logDashboardAudit(
+        req,
+        "wake_agent",
+        parsed.data.agent_name,
+        `target=${parsed.data.agent_name} marker_path=${path ?? "<invalid>"}`,
+        true,
+        null,
+        {
+          target_agent_name: parsed.data.agent_name,
+          markers_enabled: true,
+          marker_path: path,
+        },
+      );
+      res.status(200).json({
+        success: true,
+        agent_name: parsed.data.agent_name,
+        markers_enabled: true,
+        marker_path: path,
+      });
+    } catch (err) {
+      log.error("[api/wake-agent]", err);
+      logDashboardAudit(
+        req,
+        "wake_agent",
+        parsed.data.agent_name,
+        `target=${parsed.data.agent_name}`,
+        false,
+        err instanceof Error ? err.message : String(err),
+        { target_agent_name: parsed.data.agent_name, error_code: "INTERNAL" },
       );
       res.status(500).json({ success: false, error: "internal error" });
     }
