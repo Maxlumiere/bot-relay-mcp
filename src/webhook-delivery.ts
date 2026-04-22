@@ -266,6 +266,27 @@ function sendOnce(input: DeliveryInput): Promise<SingleResult> {
     };
     const requester = isHttps ? https.request : http.request;
     let settled = false;
+    // v2.2.3 hotfix (Node 18): req.setTimeout is a SOCKET-level timer —
+    // it only fires once a TCP socket exists. On Node 18, pinning to an
+    // invalid-route address (e.g. 0.0.0.1 in the B5 test fixture) leaves
+    // the kernel in EINPROGRESS indefinitely, the socket never
+    // materializes, req.setTimeout never fires, req.on("error") never
+    // fires, and sendOnce hangs until GC. Real webhook delivery to a
+    // misrouted load-balanced target would block the whole failover loop.
+    // Fix: hard JS timer that fires regardless of socket state. Belt +
+    // suspenders alongside req.setTimeout (the socket-level timer is
+    // still useful when a socket DID connect but then stalled). Every
+    // settled-path clears this hard timer so we don't double-resolve.
+    const hardTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { req.destroy(new Error("timeout")); } catch { /* ignore */ }
+      resolve({
+        statusCode: null,
+        bodyText: "",
+        error: `request timed out after ${input.timeoutMs}ms`,
+      });
+    }, input.timeoutMs);
     const req = requester(opts, (res: IncomingMessage) => {
       const chunks: Buffer[] = [];
       const loc = res.headers.location;
@@ -274,6 +295,7 @@ function sendOnce(input: DeliveryInput): Promise<SingleResult> {
       res.on("end", () => {
         if (settled) return;
         settled = true;
+        clearTimeout(hardTimer);
         resolve({
           statusCode: res.statusCode ?? null,
           bodyText: Buffer.concat(chunks).toString("utf8"),
@@ -283,6 +305,7 @@ function sendOnce(input: DeliveryInput): Promise<SingleResult> {
       res.on("error", (err) => {
         if (settled) return;
         settled = true;
+        clearTimeout(hardTimer);
         resolve({
           statusCode: null,
           bodyText: "",
@@ -293,16 +316,20 @@ function sendOnce(input: DeliveryInput): Promise<SingleResult> {
     req.on("error", (err) => {
       if (settled) return;
       settled = true;
+      clearTimeout(hardTimer);
       resolve({
         statusCode: null,
         bodyText: "",
         error: err.message,
       });
     });
-    // Spec §Phase 4 timeout parity with the prior AbortController path.
+    // Spec §Phase 4 socket-level timeout parity with the prior
+    // AbortController path. Kept alongside the v2.2.3 hard JS timer for
+    // the "socket connected but stalled mid-stream" case.
     req.setTimeout(input.timeoutMs, () => {
       if (settled) return;
       settled = true;
+      clearTimeout(hardTimer);
       try {
         req.destroy(new Error("timeout"));
       } catch {
