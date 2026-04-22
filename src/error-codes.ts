@@ -89,6 +89,15 @@ export const ERROR_CODES = {
   /** v2.1 Phase 2c — restore refused while relay daemon appears to be running. */
   DAEMON_RUNNING: "DAEMON_RUNNING",
 
+  // v2.3.0 Part B.2 — surface shaping -------------------------------------
+  /**
+   * The requested tool exists in the codebase but is hidden by the active
+   * profile's feature_bundles / tool_visibility. Returned from tools/call;
+   * the MCP tools/list response already omits hidden tools. Response
+   * includes a `hint` pointing at the profile that would expose the tool.
+   */
+  TOOL_NOT_AVAILABLE: "TOOL_NOT_AVAILABLE",
+
   // Fallback ----------------------------------------------------------------
   /** Unexpected failure. Should be rare; indicates an actual bug. */
   INTERNAL: "INTERNAL",
