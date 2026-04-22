@@ -219,6 +219,52 @@ smoke_25_isolated() {
 }
 step "25-tool + CLI smoke (isolated relay)" smoke_25_isolated || exit 1
 
+# --- 6b. GitHub CI green-gate (v2.2.3) ---
+# Query GitHub for the CI conclusion of the current HEAD. Blocks shipping a
+# commit whose CI is known-red (the pre-v2.2.3 failure mode where local
+# native-Node gate was green but the matrix on Node 18/20/22 was red). Graceful
+# skip when gh CLI isn't installed, when HEAD hasn't been pushed, or when the
+# run is still in flight — this is a guard against KNOWN-red, not a hard gate.
+ci_green_gate() {
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "  SKIP  gh CLI not installed — cannot probe CI; manual check required"
+    return 0
+  fi
+  local head_sha
+  head_sha=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")
+  if [ -z "$head_sha" ]; then
+    echo "  SKIP  could not resolve HEAD — cannot probe CI"
+    return 0
+  fi
+  local ci_status
+  ci_status=$(gh run list --commit "$head_sha" --limit 1 --json conclusion,status \
+    --jq 'if length == 0 then "no-run" else .[0].conclusion // .[0].status // "unknown" end' 2>/dev/null || echo "unknown")
+  case "$ci_status" in
+    success)
+      echo "  CI conclusion=success for $head_sha"
+      return 0
+      ;;
+    failure|cancelled|timed_out|action_required)
+      echo "  FAIL  GitHub CI conclusion=$ci_status for $head_sha — refusing to publish."
+      echo "        Fix CI before shipping. Run: gh run view --log-failed"
+      return 1
+      ;;
+    in_progress|queued|waiting|pending)
+      echo "  WARN  GitHub CI still running (status=$ci_status) for $head_sha — proceed at own risk"
+      return 0
+      ;;
+    no-run)
+      echo "  WARN  GitHub has no run for $head_sha (not pushed?) — proceed at own risk"
+      return 0
+      ;;
+    *)
+      echo "  WARN  GitHub CI status unknown ($ci_status) for $head_sha — proceed at own risk"
+      return 0
+      ;;
+  esac
+}
+step "GitHub CI green-gate" ci_green_gate || exit 1
+
 # --- 7. (--full only) load / chaos / cross-version — Phase 5b ---
 # These run a subset of tests/*.test.ts files that are NOT included in the
 # default vitest run (they spawn subprocesses, produce load, or take 30-60s).
