@@ -87,6 +87,34 @@ export const DASHBOARD_BASE_STYLES = `
   .agent-card .role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
   .agent-card .state { margin-top: 8px; font-size: 12px; }
   .agent-card .seen { color: var(--muted); font-size: 11px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .agent-card { position: relative; }
+  .agent-card .card-resize {
+    position: absolute; right: 2px; bottom: 2px;
+    width: 14px; height: 14px;
+    cursor: nwse-resize;
+    color: var(--muted);
+    font-size: 11px; line-height: 14px; text-align: center;
+    user-select: none;
+    opacity: 0;
+    transition: opacity 0.1s;
+  }
+  .agent-card:hover .card-resize { opacity: 0.7; }
+  .agent-card .card-resize:hover { opacity: 1; color: var(--accent); }
+  .agent-card .card-reset {
+    position: absolute; right: 2px; top: 2px;
+    width: 16px; height: 16px;
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-size: 12px; line-height: 16px;
+    cursor: pointer;
+    padding: 0;
+    border-radius: 3px;
+    opacity: 0;
+    transition: opacity 0.1s;
+  }
+  .agent-card[data-resized="1"] .card-reset { opacity: 0.7; }
+  .agent-card .card-reset:hover { opacity: 1; background: var(--panel); color: var(--critical); }
   .badge {
     display: inline-flex;
     align-items: center;
@@ -102,6 +130,8 @@ export const DASHBOARD_BASE_STYLES = `
   .badge-waiting_user { background: rgba(251,191,36,0.15); color: var(--stale); }
   .badge-stale { background: rgba(251,191,36,0.15); color: var(--stale); }
   .badge-offline { background: rgba(107,114,128,0.15); color: var(--offline); }
+  .badge-closed { background: rgba(107,114,128,0.12); color: var(--offline); text-decoration: line-through; }
+  .badge-abandoned { background: rgba(107,114,128,0.1); color: var(--muted); font-style: italic; }
   .msg-list { list-style: none; padding: 0; margin: 0; }
   .msg-row {
     display: block;

@@ -154,7 +154,7 @@ export function createServer(): Server {
       {
         name: "get_messages",
         description:
-          "Check your mailbox for messages. Returns messages addressed to you, newest first. Pending messages are automatically marked as read. v2.1.6: optional `since` trims stale backlog (default '24h'; pass 'all' or null for the pre-v2.1.6 unlimited behavior). v2.2.1: when status='pending' AND count=0 AND since<24h, response includes a `hint` field nudging toward since='all' — the `since` filter trims both pending AND read mail, so a narrow window can hide older pending work.",
+          "Check your mailbox for messages. Returns messages addressed to you, newest first. Pending messages are automatically marked as read. v2.1.6: optional `since` trims stale backlog (default '24h'; pass 'all' or null for the pre-v2.1.6 unlimited behavior). v2.2.1: when status='pending' AND count=0 AND since<24h, response includes a `hint` field nudging toward since='all' — the `since` filter trims both pending AND read mail, so a narrow window can hide older pending work. v2.2.2: optional `peek` (default false) skips the mark-as-read side effect so repeated status='pending' polls by the same session return the same rows — use for orchestrator inbox surveys that must not consume mail.",
         inputSchema: zodToJsonSchema(GetMessagesSchema),
       },
       {

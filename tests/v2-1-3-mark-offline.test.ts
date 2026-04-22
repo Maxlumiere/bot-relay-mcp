@@ -107,11 +107,11 @@ describe("v2.1.3 round-trip — re-register after markAgentOffline resumes clean
     const sidA = r1.agent.session_id!;
     const tokenHash = getAgentAuthData("respawn")?.token_hash;
 
-    // Terminal closes → SIGINT path marks offline.
+    // Terminal closes → SIGINT path marks closed (v2.2.2 BUG2 — was 'offline' pre-BUG2).
     performAutoUnregister("respawn", sidA, "SIGTERM");
 
     const offlineRow = getAgentAuthData("respawn");
-    expect(offlineRow?.agent_status).toBe("offline");
+    expect(offlineRow?.agent_status).toBe("closed");
     expect(offlineRow?.session_id).toBeNull();
 
     // Fresh terminal with same name re-registers. registerAgent takes the
@@ -138,11 +138,11 @@ describe("v2.1.3 audit-log forensic trail", () => {
 
     performAutoUnregister("forensic-target", sid, "SIGINT");
 
-    const entries = getAuditLog("forensic-target", "stdio.auto_offline", 10);
+    const entries = getAuditLog("forensic-target", "stdio.auto_close", 10);
     expect(entries.length).toBeGreaterThanOrEqual(1);
     const latest = entries[0];
     expect(latest.agent_name).toBe("forensic-target");
-    expect(latest.tool).toBe("stdio.auto_offline");
+    expect(latest.tool).toBe("stdio.auto_close");
     expect(latest.success).toBe(1);
     expect(latest.source).toBe("stdio");
     expect(latest.params_summary).toBe("signal=SIGINT");
@@ -159,7 +159,7 @@ describe("v2.1.3 audit-log forensic trail", () => {
 
     performAutoUnregister("no-log", sidA, "SIGTERM");
 
-    const entries = getAuditLog("no-log", "stdio.auto_offline", 10);
+    const entries = getAuditLog("no-log", "stdio.auto_close", 10);
     expect(entries.length).toBe(0);
   });
 });

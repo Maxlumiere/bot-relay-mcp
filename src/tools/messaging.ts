@@ -154,7 +154,7 @@ export function handleGetMessages(input: GetMessagesInput) {
       isError: true,
     };
   }
-  const raw = getMessages(input.agent_name, input.status, input.limit);
+  const raw = getMessages(input.agent_name, input.status, input.limit, input.peek ?? false);
   const messages = filterBySince(raw, sinceIso);
 
   // v2.2.1 B4: if the caller asked for `pending` + got zero results + the

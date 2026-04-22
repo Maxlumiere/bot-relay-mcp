@@ -14,8 +14,10 @@ import {
   ApiSendMessageSchema,
   ApiKillAgentSchema,
   ApiSetStatusSchema,
+  ApiDashboardThemeSchema,
 } from "../types.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs } from "../db.js";
+import { verifyToken } from "../auth.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "./websocket.js";
 import { attachDashboardWs } from "./websocket.js";
@@ -134,6 +136,12 @@ const DASHBOARD_ROUTES_BYPASSING_HTTP_SECRET: ReadonlySet<string> = new Set([
   "/api/send-message",
   "/api/kill-agent",
   "/api/set-status",
+  // v2.2.2 A2: per-human operator identity cookie endpoints.
+  "/api/operator-identity",
+  // v2.2.2 B1: rich custom-theme modal POSTs here instead of calling
+  // the MCP set_dashboard_theme tool directly (no agent_token needed —
+  // dashboardAuthCheck + origin/CSRF cover it).
+  "/api/dashboard-theme",
 ]);
 
 /**
@@ -631,15 +639,30 @@ export function startHttpServer(port: number, host: string): Server {
   // review can distinguish operator-initiated mutations from agent-
   // initiated ones.
   //
-  // Operator identity sourced from `RELAY_DASHBOARD_OPERATOR` env var,
-  // falling back to the conventional "dashboard-user" sentinel. Operators
-  // who want per-human attribution can set the env var (or a future enhancement
-  // can parse the cookie). Never throws; audit failure is logged + the
-  // underlying endpoint still returns its normal result.
-  function dashboardOperatorIdentity(): string {
+  // Operator identity precedence (v2.2.2 A2):
+  //   1. `relay_operator_identity` cookie (per-human, set via POST
+  //      /api/operator-identity by the dashboard setup form)
+  //   2. `RELAY_DASHBOARD_OPERATOR` env var (deployment-wide default)
+  //   3. "dashboard-user" sentinel
+  // The cookie is NOT HttpOnly (dashboard JS must read it to show the
+  // current identity in the setup form), SameSite=Lax so a direct GET
+  // from a bookmark still carries it, and gets the Secure flag only
+  // when TLS is on. 90-day expiry, renewed on each POST.
+  function dashboardOperatorIdentity(req?: Request): string {
+    if (req) {
+      const cookieHeader = req.headers.cookie;
+      if (typeof cookieHeader === "string") {
+        const match = cookieHeader.match(/(?:^|;\s*)relay_operator_identity=([^;]+)/);
+        if (match) {
+          const v = decodeURIComponent(match[1]);
+          if (v && v.length > 0 && v.length <= 64) return v;
+        }
+      }
+    }
     return process.env.RELAY_DASHBOARD_OPERATOR || "dashboard-user";
   }
   function logDashboardAudit(
+    req: Request | null,
     tool: string,
     onBehalfOf: string | null,
     paramsSummary: string,
@@ -648,7 +671,7 @@ export function startHttpServer(port: number, host: string): Server {
     structured: Record<string, unknown>
   ): void {
     try {
-      const operator = dashboardOperatorIdentity();
+      const operator = dashboardOperatorIdentity(req ?? undefined);
       logAudit(
         onBehalfOf,
         tool,
@@ -671,6 +694,95 @@ export function startHttpServer(port: number, host: string): Server {
     }
   }
 
+  // v2.2.2 A2: per-human operator identity via cookie.
+  //
+  //   GET /api/operator-identity  → { identity, source, env_set }
+  //   POST /api/operator-identity with { identity } → sets/renews cookie
+  //
+  // The cookie beats RELAY_DASHBOARD_OPERATOR in the audit-log operator
+  // marker so a shared deployment (one daemon, multiple humans) can still
+  // attribute every mutation to the individual who ran it.
+  app.get("/api/operator-identity", dashboardAuthCheck, (req: Request, res: Response) => {
+    const env = process.env.RELAY_DASHBOARD_OPERATOR || null;
+    const cookieHeader = req.headers.cookie;
+    let cookieVal: string | null = null;
+    if (typeof cookieHeader === "string") {
+      const m = cookieHeader.match(/(?:^|;\s*)relay_operator_identity=([^;]+)/);
+      if (m) cookieVal = decodeURIComponent(m[1]);
+    }
+    const resolved = dashboardOperatorIdentity(req);
+    const source: "cookie" | "env" | "default" =
+      cookieVal && cookieVal.length > 0 ? "cookie" : env ? "env" : "default";
+    res.status(200).json({
+      identity: resolved,
+      source,
+      env_set: !!env,
+      cookie_value: cookieVal,
+    });
+  });
+  app.post("/api/operator-identity", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+    const raw = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>).identity : undefined;
+    // Clearing is an explicit empty-string or null — resets to env/default.
+    if (raw === "" || raw === null) {
+      // Expire immediately — client cookie jar removes the value.
+      const expired =
+        `relay_operator_identity=; Path=/; Max-Age=0; SameSite=Lax` +
+        (process.env.RELAY_TLS_ENABLED === "1" ? "; Secure" : "");
+      const existing = res.getHeader("Set-Cookie");
+      if (existing === undefined) res.setHeader("Set-Cookie", [expired]);
+      else if (Array.isArray(existing)) res.setHeader("Set-Cookie", [...existing, expired]);
+      else res.setHeader("Set-Cookie", [String(existing), expired]);
+      logDashboardAudit(
+        req,
+        "set_operator_identity",
+        null,
+        "identity=<cleared>",
+        true,
+        null,
+        { cleared: true }
+      );
+      res.status(200).json({ success: true, cleared: true, identity: dashboardOperatorIdentity(req) });
+      return;
+    }
+    if (typeof raw !== "string") {
+      res.status(400).json({ success: false, error: "identity must be a string (pass '' to clear)" });
+      return;
+    }
+    const identity = raw.trim();
+    // Allow a conservative identity charset: letters, digits, dot, dash,
+    // underscore, space, @. Length capped at 64 (matches audit marker width).
+    if (identity.length === 0 || identity.length > 64 || !/^[A-Za-z0-9._@ -]+$/.test(identity)) {
+      res.status(400).json({
+        success: false,
+        error: "identity must be 1-64 chars of letters/digits/.-_@/space",
+      });
+      return;
+    }
+    const secureFlag = process.env.RELAY_TLS_ENABLED === "1" ? "; Secure" : "";
+    const ninetyDays = 60 * 60 * 24 * 90;
+    // SameSite=Lax (not Strict): top-level navigation from a bookmark /
+    // link must still carry the operator identity for audit attribution.
+    // Not HttpOnly: dashboard JS reads the cookie to show the current
+    // identity in the setup form.
+    const setCookie =
+      `relay_operator_identity=${encodeURIComponent(identity)}` +
+      `; Path=/; Max-Age=${ninetyDays}; SameSite=Lax${secureFlag}`;
+    const existing = res.getHeader("Set-Cookie");
+    if (existing === undefined) res.setHeader("Set-Cookie", [setCookie]);
+    else if (Array.isArray(existing)) res.setHeader("Set-Cookie", [...existing, setCookie]);
+    else res.setHeader("Set-Cookie", [String(existing), setCookie]);
+    logDashboardAudit(
+      req,
+      "set_operator_identity",
+      null,
+      `identity=${identity}`,
+      true,
+      null,
+      { new_identity: identity }
+    );
+    res.status(200).json({ success: true, identity });
+  });
+
   // v2.2.1 P2: three inline-action endpoints the dashboard posts to. All
   // gated by dashboardAuthCheck + originCheck + csrfCheck (when a secret
   // is configured). Operator-level auth — the dashboard secret IS the
@@ -683,6 +795,7 @@ export function startHttpServer(port: number, host: string): Server {
     const parsed = ApiSendMessageSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
+        req,
         "send_message",
         null,
         `body=invalid`,
@@ -697,6 +810,58 @@ export function startHttpServer(port: number, host: string): Server {
       });
       return;
     }
+    // v2.2.2 A1 — Option (b) defense-in-depth. If the caller supplied a
+    // from_agent_token (body field or X-From-Agent-Token header), verify
+    // it against the from-agent's stored token_hash. Match → audit
+    // records `from_authenticated: true`. Mismatch → 403 + audit entry.
+    // Absent → audit records `from_authenticated: false` (Option (a)
+    // audit-only model, unchanged from v2.2.1).
+    const headerFromToken = req.headers["x-from-agent-token"];
+    const fromAgentToken: string | null =
+      (typeof parsed.data.from_agent_token === "string" && parsed.data.from_agent_token.length > 0
+        ? parsed.data.from_agent_token
+        : typeof headerFromToken === "string" && headerFromToken.length > 0
+          ? headerFromToken
+          : null);
+    let fromAuthenticated = false;
+    if (fromAgentToken) {
+      const fromRow = getAgentAuthData(parsed.data.from);
+      if (!fromRow || !fromRow.token_hash) {
+        logDashboardAudit(
+          req,
+          "send_message",
+          parsed.data.from,
+          `from=${parsed.data.from} to=${parsed.data.to}`,
+          false,
+          "from_agent_token present but from-agent has no token_hash",
+          { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED" }
+        );
+        res.status(403).json({
+          success: false,
+          error: `Agent "${parsed.data.from}" has no token hash (legacy or unregistered). Cannot verify from_agent_token.`,
+          error_code: "AUTH_FAILED",
+        });
+        return;
+      }
+      if (!verifyToken(fromAgentToken, fromRow.token_hash)) {
+        logDashboardAudit(
+          req,
+          "send_message",
+          parsed.data.from,
+          `from=${parsed.data.from} to=${parsed.data.to}`,
+          false,
+          "from_agent_token verification failed",
+          { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED" }
+        );
+        res.status(403).json({
+          success: false,
+          error: `from_agent_token does not match the stored token for "${parsed.data.from}".`,
+          error_code: "AUTH_FAILED",
+        });
+        return;
+      }
+      fromAuthenticated = true;
+    }
     try {
       const msg = sendMessage(parsed.data.from, parsed.data.to, parsed.data.content, parsed.data.priority);
       fireWebhooks("message.sent", parsed.data.from, parsed.data.to, {
@@ -704,12 +869,13 @@ export function startHttpServer(port: number, host: string): Server {
         message_id: msg.id,
       });
       logDashboardAudit(
+        req,
         "send_message",
         parsed.data.from,
-        `from=${parsed.data.from} to=${parsed.data.to} message_id=${msg.id} priority=${parsed.data.priority}`,
+        `from=${parsed.data.from} to=${parsed.data.to} message_id=${msg.id} priority=${parsed.data.priority} from_authenticated=${fromAuthenticated}`,
         true,
         null,
-        { from_agent: parsed.data.from, to_agent: parsed.data.to, message_id: msg.id, priority: parsed.data.priority }
+        { from_agent: parsed.data.from, to_agent: parsed.data.to, message_id: msg.id, priority: parsed.data.priority, from_authenticated: fromAuthenticated }
       );
       res.status(200).json({
         success: true,
@@ -721,6 +887,7 @@ export function startHttpServer(port: number, host: string): Server {
     } catch (err) {
       if (err instanceof SenderNotRegisteredError) {
         logDashboardAudit(
+          req,
           "send_message",
           parsed.data.from,
           `from=${parsed.data.from} to=${parsed.data.to}`,
@@ -733,6 +900,7 @@ export function startHttpServer(port: number, host: string): Server {
       }
       log.error("[api/send-message]", err);
       logDashboardAudit(
+        req,
         "send_message",
         parsed.data.from,
         `from=${parsed.data.from} to=${parsed.data.to}`,
@@ -752,6 +920,7 @@ export function startHttpServer(port: number, host: string): Server {
     const confirm = req.headers["x-relay-confirm"];
     if (confirm !== "yes") {
       logDashboardAudit(
+        req,
         "unregister_agent",
         null,
         "confirmation_missing",
@@ -769,6 +938,7 @@ export function startHttpServer(port: number, host: string): Server {
     const parsed = ApiKillAgentSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
+        req,
         "unregister_agent",
         null,
         "body=invalid",
@@ -789,6 +959,7 @@ export function startHttpServer(port: number, host: string): Server {
         fireWebhooks("agent.unregistered", parsed.data.name, parsed.data.name, {});
       }
       logDashboardAudit(
+        req,
         "unregister_agent",
         parsed.data.name,
         `target=${parsed.data.name} removed=${removed}`,
@@ -807,6 +978,7 @@ export function startHttpServer(port: number, host: string): Server {
     } catch (err) {
       log.error("[api/kill-agent]", err);
       logDashboardAudit(
+        req,
         "unregister_agent",
         parsed.data.name,
         `target=${parsed.data.name}`,
@@ -824,6 +996,7 @@ export function startHttpServer(port: number, host: string): Server {
     const parsed = ApiSetStatusSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
+        req,
         "set_status",
         null,
         "body=invalid",
@@ -842,6 +1015,7 @@ export function startHttpServer(port: number, host: string): Server {
       const updated = setAgentStatus(parsed.data.agent_name, parsed.data.agent_status);
       if (!updated) {
         logDashboardAudit(
+          req,
           "set_status",
           parsed.data.agent_name,
           `target=${parsed.data.agent_name} status=${parsed.data.agent_status}`,
@@ -866,6 +1040,7 @@ export function startHttpServer(port: number, host: string): Server {
         kind: "set_status",
       });
       logDashboardAudit(
+        req,
         "set_status",
         parsed.data.agent_name,
         `target=${parsed.data.agent_name} status=${parsed.data.agent_status}`,
@@ -881,12 +1056,80 @@ export function startHttpServer(port: number, host: string): Server {
     } catch (err) {
       log.error("[api/set-status]", err);
       logDashboardAudit(
+        req,
         "set_status",
         parsed.data.agent_name,
         `target=${parsed.data.agent_name}`,
         false,
         err instanceof Error ? err.message : String(err),
         { target_agent_name: parsed.data.agent_name, error_code: "INTERNAL" }
+      );
+      res.status(500).json({ success: false, error: "internal error" });
+    }
+  });
+
+  // v2.2.2 B1: dashboard-side theme persistence. Mirrors the MCP tool
+  // `set_dashboard_theme` (which takes an agent_token) but skips the
+  // agent check — dashboardAuthCheck + CSRF + origin + host cover it.
+  // Success broadcasts dashboard.theme_changed over WS so other tabs
+  // can optionally refetch; the current dashboard.ts reads server
+  // prefs only on first-visit via /api/snapshot so this is forward-
+  // looking.
+  app.post("/api/dashboard-theme", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+    const parsed = ApiDashboardThemeSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logDashboardAudit(
+        req,
+        "set_dashboard_theme",
+        null,
+        "body=invalid",
+        false,
+        "invalid request body",
+        { event: "validation_failed" }
+      );
+      res.status(400).json({
+        success: false,
+        error: "invalid request body",
+        detail: parsed.error.issues.map((i) => i.message),
+      });
+      return;
+    }
+    try {
+      const customJson =
+        parsed.data.mode === "custom" && parsed.data.custom_json
+          ? JSON.stringify(parsed.data.custom_json)
+          : null;
+      const prefs = setDashboardPrefs(parsed.data.mode, customJson);
+      logDashboardAudit(
+        req,
+        "set_dashboard_theme",
+        null,
+        `mode=${parsed.data.mode}${parsed.data.mode === "custom" ? " (custom)" : ""}`,
+        true,
+        null,
+        { mode: parsed.data.mode, has_custom: parsed.data.mode === "custom" }
+      );
+      broadcastDashboardEvent({
+        event: "dashboard.theme_changed",
+        entity_id: parsed.data.mode,
+        ts: new Date().toISOString(),
+        kind: "set_dashboard_theme",
+      });
+      res.status(200).json({
+        success: true,
+        theme: prefs.theme,
+        updated_at: prefs.updated_at,
+      });
+    } catch (err) {
+      log.error("[api/dashboard-theme]", err);
+      logDashboardAudit(
+        req,
+        "set_dashboard_theme",
+        null,
+        `mode=${parsed.data.mode}`,
+        false,
+        err instanceof Error ? err.message : String(err),
+        { mode: parsed.data.mode, error_code: "INTERNAL" }
       );
       res.status(500).json({ success: false, error: "internal error" });
     }

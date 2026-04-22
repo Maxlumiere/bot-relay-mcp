@@ -1,5 +1,64 @@
 # Changelog
 
+## v2.2.2 — 2026-04-22 — defense-in-depth + dashboard UX polish + CLI ergonomics + 3 bundled bugs
+
+v2.2.2 bundles 11 items across four buckets: two server-side defense-in-depth touches (A1/A2), five dashboard UX polish items (B1-B5), one CLI ergonomics addition (C1), and three bundled bugs surfaced during the ship cycle itself (BUG1/BUG2/BUG3). One release, one Codex audit, one ship ceremony. Protocol bumps `2.2.1 → 2.2.2` (MINOR — additive endpoints + `get_messages.peek` parameter + agent_status enum widening with `abandoned` and `closed`). No breaking changes.
+
+### Part A — server-side defense-in-depth
+
+- **A1 — `/api/send-message` optional `from_agent_token`.** The dashboard endpoint previously trusted the dashboard secret alone — any operator could send-as any agent with no per-agent verification. v2.2.2 adds a *defense-in-depth* path: callers may supply `from_agent_token` in the body OR `X-From-Agent-Token` header. When present, the server verifies against the from-agent's stored `token_hash` and records `from_authenticated: true` in the audit log. When absent, behavior is unchanged (v2.2.1 Option (a) audit-only model); the audit entry records `from_authenticated: false` so incident review can distinguish operator-impersonation from token-verified sends. Mismatch → `403 AUTH_FAILED` + audit `success=0`.
+- **A2 — per-human operator identity cookie.** New `relay_operator_identity` cookie (SameSite=Lax, 90-day, not HttpOnly so the dashboard JS can read it). Precedence: cookie > `RELAY_DASHBOARD_OPERATOR` env > `"dashboard-user"` default. New endpoints: `GET /api/operator-identity` (reports resolved identity + source) and `POST /api/operator-identity` with `{identity}` to set/renew, or `{identity: ""}` to clear. Dashboard header ships a button that shows the current identity and opens a `prompt()` to change it. Audit log entries from state-changing dashboard endpoints (`send_message`, `kill-agent`, `set-status`, `set_operator_identity`, `set_dashboard_theme`) now carry the per-human identity in `operator_identity`.
+
+### Part B — dashboard UX polish
+
+- **B1 — rich custom-theme `<dialog>`.** Replaces the `prompt()` JSON-paste flow with a native `<dialog>` modal: 14 color pickers (one per CSS token), live preview pane, paste-JSON fallback for operators who already have a theme file. Save applies locally + persists server-side via new `POST /api/dashboard-theme` + broadcasts `dashboard.theme_changed` to open WS clients. Cancel reverts cleanly (snapshot taken on open). Closes on Escape + click-outside (native `<dialog>` semantics).
+- **B2 — per-card resize with snap-to-grid-column.** Bottom-right corner drag on any agent card resizes that card by integer col/row spans (max 4×3), snapping to the computed grid-column width. Per-agent-name state persists in localStorage `bot-relay-card-sizes-v1`, LRU-capped at 50 entries so retired agents don't accumulate forever. Top-right × button resets a single card's sizing.
+- **B3 — abandoned agent status + hide toggle + `relay purge-agents` CLI.** New `agent_status: "abandoned"` surfaced by `deriveAgentStatus` when `last_seen` > `RELAY_AGENT_ABANDON_DAYS` (default 7). Distinct from `offline` so dashboards can hide retired terminals by default. Dashboard adds a "show abandoned" checkbox (default off) + the existing status filter dropdown gets an `abandoned` option. Data preserved — operators prune via the new `relay purge-agents [--abandoned-since=N] [--apply]` subcommand: dry-run by default, `--apply` commits, one audit-log entry per deleted row (`purge-agents.cli`). Messages + tasks are NOT touched (use `relay purge-history` separately). New sanctioned-helper pair in `db.ts` — `listAgentsOlderThan` + `deleteAgentIfAbandoned` — so the CLI passes the drift-grep guard.
+- **B4 — agent-card sort toggle.** New `sort` dropdown in the filter bar: `status` (active-first: working → blocked → waiting_user → idle → stale → offline → abandoned; default), `role`, `last seen` (most-recent first), `name`. Persists in localStorage.
+- **B5 — message search bar.** Search input above the messages timeline. Case-insensitive substring match over `content_preview` + `from_agent` + `to_agent`. 200 ms debounce, empty shows all, last query persisted.
+
+### Part C — CLI ergonomics
+
+- **C1 — `relay open [--url <u>]`.** Opens the dashboard URL in the default browser. Auto-detects host + port from config (`$RELAY_HTTP_HOST`, `$RELAY_HTTP_PORT`, or `~/.bot-relay/config.json`). Platform routing: `darwin` → `open`, `win32` → `cmd.exe /c start "" <url>`, `linux` → `$BROWSER` when set else `xdg-open`. Daemon-down is a warning (prints actionable hint), not a hard failure — the browser still opens.
+
+### Part D — bundled bugs (discovered during the v2.2.2 ship cycle)
+
+- **BUG1 — `get_messages` read-mark race on repeated pending polls.** Pre-v2.2.2 `getMessages(agent, 'pending', ...)` SELECTed pending messages + immediately UPDATEd them to `read_by_session = currentSession`. A second pending poll from the same session excluded those rows because they now matched their own session id — orchestrators that surveyed their own inbox on a polling interval lost visibility of real pending mail the moment they looked at it once. Fix: new optional `peek: boolean` field on `GetMessagesSchema` (default false). Threaded into `getMessages(agentName, status, limit, peek)`: when true, the mark-as-read UPDATE is skipped. Default behavior unchanged — single-shot workers still consume-once. Tool description expanded to document the orchestrator-polling use case.
+- **BUG2 — intentional-terminal-close `closed` agent_status.** Pre-v2.2.2 SIGINT/SIGTERM from a stdio terminal set `agent_status='offline'`, indistinguishable from a network drop. v2.2.2 adds a new enum value `closed` (relay-computed, not user-settable via `set_status`) with a sanctioned helper `closeAgentSession(name, expectedSessionId)` mirroring `markAgentOffline` but writing `'closed'`. `performAutoUnregister` prefers the new helper + falls back to `markAgentOffline` on helper-level failure; audit entry tool name is `stdio.auto_close` (vs `stdio.auto_offline`). Auto-promotes to `abandoned` via the existing `RELAY_AGENT_ABANDON_DAYS` chain. Dashboard adds `closed` to the status filter dropdown + a `.badge-closed` style (muted with line-through).
+- **BUG3 — regression-from-released-bugs suite.** New `tests/v2-2-2-regression-from-released-bugs.test.ts` with one permanent case per bug discovered in the v2.1.x → v2.2.x arc that made it to an operator's hands. Top-of-file pattern doc explains when to add a new entry. 6 seeded cases: (1) CLI flag parsing, (2) daemon non-TTY guard, (3) `since`-filter trap + hint, (4) NAME_COLLISION_ACTIVE + `force=true`, (5) BUG1 read-mark race, (6) BUG2 closed status. File grows with every release cycle.
+
+### Tests
+
+- `tests/v2-2-2-defense-in-depth.test.ts` (A1) — 4 cases.
+- `tests/v2-2-2-operator-identity.test.ts` (A2) — 7 cases.
+- `tests/v2-2-2-theme-dialog.test.ts` (B1) — 6 cases.
+- `tests/v2-2-2-card-resize.test.ts` (B2) — 5 cases.
+- `tests/v2-2-2-abandoned-agents.test.ts` (B3) — 8 cases.
+- `tests/v2-2-2-sort-and-search.test.ts` (B4+B5) — 2 cases.
+- `tests/v2-2-2-cli-open.test.ts` (C1) — 6 cases.
+- `tests/v2-2-2-bug1-get-messages-peek.test.ts` (BUG1) — 4 cases.
+- `tests/v2-2-2-bug2-closed-status.test.ts` (BUG2) — 3 cases.
+- `tests/v2-2-2-regression-from-released-bugs.test.ts` (BUG3) — 6 cases.
+
+Test-fixture adjustments (v2.2.2 BUG2 semantic change — SIGINT path now `closed` not `offline`):
+
+- `tests/v2-0-2-audit-fix.test.ts` — capturedSid-match case expects `agent_status='closed'`.
+- `tests/v2-1-3-mark-offline.test.ts` — round-trip test expects `'closed'`; audit entries tagged `stdio.auto_close`.
+- `tests/v2-1-3-name-collision.test.ts` — `(d)` offline-row re-register test expects `'closed'` (semantics preserved; only the label changed).
+
+**Total: 1008 tests pass** (995 after the original 8 items + 13 new BUG1/BUG2/BUG3 regressions).
+
+### Release hygiene
+
+- `package.json` 2.2.1 → 2.2.2.
+- `src/protocol.ts` 2.2.1 → 2.2.2.
+- `devlog/068-v2.2.2-consolidated-bundle.md` — assumptions-first.
+
+### Hall of Fame
+
+- **Operator (Maxime, 2026-04-22):** surfaced the abandoned-agents UX pain after v2.2.1 ship filled the dashboard with retired spawns (B3), and requested the per-human identity cookie so the shared-daemon audit log could tell humans apart (A2).
+- **Codex pre-ship audit (v2.2.1):** flagged the dashboard-secret-impersonation risk as a defense-in-depth gap → A1.
+
 ## v2.2.1 — 2026-04-21 — consolidated bug-sweep + dashboard polish
 
 v2.2.1 bundles 6 bug fixes (caught during v2.2.0 ship + operator use) with 5 dashboard polish items queued from the v2.2 locked spec. One release, one Codex audit, one ship ceremony. Protocol bumps `2.2.0 → 2.2.1` (MINOR — additive `set_dashboard_theme` tool + new `/api/send-message`/`/api/kill-agent`/`/api/set-status` endpoints + optional `force` field on `register_agent` + optional `hint` field on `get_messages`). No breaking changes. Schema migrates `v9 → v10`.
