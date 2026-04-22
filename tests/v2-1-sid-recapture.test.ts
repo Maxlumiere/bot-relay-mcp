@@ -90,12 +90,16 @@ describe("v2.1 Phase 4f.1 — capturedSessionId re-capture", () => {
 
     // Re-register via handler — carries the agent_token for auth path, and
     // rotates the session_id.
+    // v2.2.1 B2: force=true to bypass active-name collision gate; this
+    // test exercises the captureSessionId re-capture semantic, which is
+    // independent of the collision policy.
     const resp = runWith("stdio", () =>
       handleRegisterAgent({
         name: "rotator",
         role: "r",
         capabilities: [],
         agent_token: token,
+        force: true,
       } as any)
     );
     const body = parseResult(resp);

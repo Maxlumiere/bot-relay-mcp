@@ -156,6 +156,31 @@ export function handleGetMessages(input: GetMessagesInput) {
   }
   const raw = getMessages(input.agent_name, input.status, input.limit);
   const messages = filterBySince(raw, sinceIso);
+
+  // v2.2.1 B4: if the caller asked for `pending` + got zero results + the
+  // `since` window is narrow (parsed + < 24h), emit a `hint` nudging them
+  // to widen the window. Common operator confusion pre-v2.2.1: "my
+  // pending message from 25min ago doesn't show up with since='15m'" →
+  // false-ghost-session diagnosis. The hint makes the bounded-filter
+  // semantic visible instead of silently hiding mail.
+  //
+  // Fires ONLY when all three conditions hold:
+  //   - status === "pending"
+  //   - returned count === 0
+  //   - sinceIso != null (a bound was applied) AND bound is < 24h ago
+  // When since="all" or since=null the bound is absent → no hint.
+  let hint: string | undefined;
+  if (input.status === "pending" && messages.length === 0 && sinceIso) {
+    const boundAgeMs = Date.now() - new Date(sinceIso).getTime();
+    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+    if (boundAgeMs >= 0 && boundAgeMs < twentyFourHoursMs) {
+      hint =
+        "Narrow `since` window may hide older pending messages. " +
+        "Try since='24h' or since='all' to check for stale-but-pending work " +
+        "(the `since` filter trims both pending AND read mail).";
+    }
+  }
+
   return {
     content: [
       {
@@ -168,6 +193,7 @@ export function handleGetMessages(input: GetMessagesInput) {
             filter: input.status,
             since: input.since ?? null,
             since_bound: sinceIso,
+            ...(hint ? { hint } : {}),
           },
           null,
           2

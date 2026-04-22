@@ -176,14 +176,18 @@ describe("§5.1 state × op matrix — active row", () => {
     expect(r.success).toBe(false);
   });
 
-  it("(2.2) register_agent (valid token) on active → metadata refresh, hash preserved", async () => {
+  it("(2.2) register_agent (valid token + force) on active → metadata refresh, hash preserved", async () => {
     const tok = await register("act-2", ["broadcast"]);
     const preHash = getAgentAuthData("act-2")?.token_hash;
+    // v2.2.1 B2: re-register on actively-held name requires force=true
+    // (otherwise NAME_COLLISION_ACTIVE). Test preserves original
+    // auth-state semantic — add force to reach the re-register branch.
     const r = await rpc("register_agent", {
       name: "act-2",
       role: "r2",
       capabilities: ["broadcast"],
       agent_token: tok,
+      force: true,
     });
     expect(r.success).toBe(true);
     expect(getAgentAuthData("act-2")?.token_hash).toBe(preHash);

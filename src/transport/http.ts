@@ -9,8 +9,15 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createServer } from "../server.js";
 import { renderDashboard, snapshotApi, keyringApi } from "../dashboard.js";
 import { focusTerminal } from "../focus/dispatcher.js";
-import { FocusTerminalSchema } from "../types.js";
-import { getDb } from "../db.js";
+import {
+  FocusTerminalSchema,
+  ApiSendMessageSchema,
+  ApiKillAgentSchema,
+  ApiSetStatusSchema,
+} from "../types.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit } from "../db.js";
+import { fireWebhooks } from "../webhooks.js";
+import { broadcastDashboardEvent } from "./websocket.js";
 import { attachDashboardWs } from "./websocket.js";
 import {
   checkHostHeader,
@@ -121,6 +128,12 @@ const DASHBOARD_ROUTES_BYPASSING_HTTP_SECRET: ReadonlySet<string> = new Set([
   // dashboardAuthCheck (not authMiddleware's HTTP-secret gate). The
   // dashboard JS sends auth via cookie, not Authorization header.
   "/api/focus-terminal",
+  // v2.2.1 P2: the three inline-action endpoints (send-message / kill-agent
+  // / set-status) ride the same dashboardAuthCheck path. csrfCheck + host
+  // + origin still apply.
+  "/api/send-message",
+  "/api/kill-agent",
+  "/api/set-status",
 ]);
 
 /**
@@ -606,6 +619,277 @@ export function startHttpServer(port: number, host: string): Server {
     }
     const result = await focusTerminal(row.terminal_title_ref);
     res.status(result.raised ? 200 : 409).json(result);
+  });
+
+  // v2.2.1 M1 (Codex audit) — shared audit-trail helper for the three
+  // inline-action endpoints. Pre-M1 each endpoint called the DB function
+  // directly; the MCP dispatcher's logAudit entry path was bypassed, so a
+  // dashboard operator spoofing a send_message as any `from` agent had no
+  // forensic trail pointing at WHO (the operator) vs WHAT (the on-behalf-
+  // of agent). Every dashboard-routed call now audits with
+  // `via_dashboard: true` + an `operator_identity` marker so incident
+  // review can distinguish operator-initiated mutations from agent-
+  // initiated ones.
+  //
+  // Operator identity sourced from `RELAY_DASHBOARD_OPERATOR` env var,
+  // falling back to the conventional "dashboard-user" sentinel. Operators
+  // who want per-human attribution can set the env var (or a future enhancement
+  // can parse the cookie). Never throws; audit failure is logged + the
+  // underlying endpoint still returns its normal result.
+  function dashboardOperatorIdentity(): string {
+    return process.env.RELAY_DASHBOARD_OPERATOR || "dashboard-user";
+  }
+  function logDashboardAudit(
+    tool: string,
+    onBehalfOf: string | null,
+    paramsSummary: string,
+    success: boolean,
+    error: string | null,
+    structured: Record<string, unknown>
+  ): void {
+    try {
+      const operator = dashboardOperatorIdentity();
+      logAudit(
+        onBehalfOf,
+        tool,
+        `operator=${operator} ${paramsSummary}`,
+        success,
+        error,
+        "dashboard",
+        {
+          ...structured,
+          via_dashboard: true,
+          operator_identity: operator,
+          on_behalf_of: onBehalfOf,
+        }
+      );
+    } catch (err) {
+      // Audit is best-effort — a DB hiccup on logAudit MUST NOT block the
+      // endpoint response. The dashboard operator has no visibility into
+      // this failure beyond what's already in the server log.
+      log.warn(`[api/dashboard-audit] failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // v2.2.1 P2: three inline-action endpoints the dashboard posts to. All
+  // gated by dashboardAuthCheck + originCheck + csrfCheck (when a secret
+  // is configured). Operator-level auth — the dashboard secret IS the
+  // admin identity. No additional agent_token required.
+  //
+  // POST /api/send-message — proxy to db.sendMessage. `from` must be an
+  // existing registered agent; any already-existing dispatcher checks on
+  // SENDER_NOT_REGISTERED surface through.
+  app.post("/api/send-message", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+    const parsed = ApiSendMessageSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logDashboardAudit(
+        "send_message",
+        null,
+        `body=invalid`,
+        false,
+        "invalid request body",
+        { event: "validation_failed" }
+      );
+      res.status(400).json({
+        success: false,
+        error: "invalid request body",
+        detail: parsed.error.issues.map((i) => i.message),
+      });
+      return;
+    }
+    try {
+      const msg = sendMessage(parsed.data.from, parsed.data.to, parsed.data.content, parsed.data.priority);
+      fireWebhooks("message.sent", parsed.data.from, parsed.data.to, {
+        content: parsed.data.content,
+        message_id: msg.id,
+      });
+      logDashboardAudit(
+        "send_message",
+        parsed.data.from,
+        `from=${parsed.data.from} to=${parsed.data.to} message_id=${msg.id} priority=${parsed.data.priority}`,
+        true,
+        null,
+        { from_agent: parsed.data.from, to_agent: parsed.data.to, message_id: msg.id, priority: parsed.data.priority }
+      );
+      res.status(200).json({
+        success: true,
+        message_id: msg.id,
+        from: msg.from_agent,
+        to: msg.to_agent,
+        priority: msg.priority,
+      });
+    } catch (err) {
+      if (err instanceof SenderNotRegisteredError) {
+        logDashboardAudit(
+          "send_message",
+          parsed.data.from,
+          `from=${parsed.data.from} to=${parsed.data.to}`,
+          false,
+          err.message,
+          { from_agent: parsed.data.from, to_agent: parsed.data.to, error_code: "SENDER_NOT_REGISTERED" }
+        );
+        res.status(400).json({ success: false, error: err.message, error_code: "SENDER_NOT_REGISTERED" });
+        return;
+      }
+      log.error("[api/send-message]", err);
+      logDashboardAudit(
+        "send_message",
+        parsed.data.from,
+        `from=${parsed.data.from} to=${parsed.data.to}`,
+        false,
+        err instanceof Error ? err.message : String(err),
+        { from_agent: parsed.data.from, to_agent: parsed.data.to, error_code: "INTERNAL" }
+      );
+      res.status(500).json({ success: false, error: "internal error" });
+    }
+  });
+
+  // POST /api/kill-agent — proxy to db.unregisterAgent. Requires
+  // `X-Relay-Confirm: yes` header as a double-check (dashboard JS sends
+  // it after a confirm() dialog). Operator-level auth suffices; no
+  // per-caller admin-cap check (the dashboard secret IS the admin).
+  app.post("/api/kill-agent", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+    const confirm = req.headers["x-relay-confirm"];
+    if (confirm !== "yes") {
+      logDashboardAudit(
+        "unregister_agent",
+        null,
+        "confirmation_missing",
+        false,
+        "X-Relay-Confirm header missing",
+        { event: "confirmation_required" }
+      );
+      res.status(428).json({
+        success: false,
+        error: "confirmation required",
+        hint: 'POST again with `X-Relay-Confirm: yes` to proceed. This endpoint is destructive — the target agent row is removed.',
+      });
+      return;
+    }
+    const parsed = ApiKillAgentSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logDashboardAudit(
+        "unregister_agent",
+        null,
+        "body=invalid",
+        false,
+        "invalid request body",
+        { event: "validation_failed" }
+      );
+      res.status(400).json({
+        success: false,
+        error: "invalid request body",
+        detail: parsed.error.issues.map((i) => i.message),
+      });
+      return;
+    }
+    try {
+      const removed = unregisterAgent(parsed.data.name);
+      if (removed) {
+        fireWebhooks("agent.unregistered", parsed.data.name, parsed.data.name, {});
+      }
+      logDashboardAudit(
+        "unregister_agent",
+        parsed.data.name,
+        `target=${parsed.data.name} removed=${removed}`,
+        true,
+        null,
+        { target_agent_name: parsed.data.name, removed }
+      );
+      res.status(200).json({
+        success: true,
+        removed,
+        agent_name: parsed.data.name,
+        note: removed
+          ? `Agent "${parsed.data.name}" unregistered.`
+          : `Agent "${parsed.data.name}" was not registered (no-op).`,
+      });
+    } catch (err) {
+      log.error("[api/kill-agent]", err);
+      logDashboardAudit(
+        "unregister_agent",
+        parsed.data.name,
+        `target=${parsed.data.name}`,
+        false,
+        err instanceof Error ? err.message : String(err),
+        { target_agent_name: parsed.data.name, error_code: "INTERNAL" }
+      );
+      res.status(500).json({ success: false, error: "internal error" });
+    }
+  });
+
+  // POST /api/set-status — proxy to db.setAgentStatus. Operator chooses
+  // the agent + new status. No token check; dashboard auth suffices.
+  app.post("/api/set-status", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+    const parsed = ApiSetStatusSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logDashboardAudit(
+        "set_status",
+        null,
+        "body=invalid",
+        false,
+        "invalid request body",
+        { event: "validation_failed" }
+      );
+      res.status(400).json({
+        success: false,
+        error: "invalid request body",
+        detail: parsed.error.issues.map((i) => i.message),
+      });
+      return;
+    }
+    try {
+      const updated = setAgentStatus(parsed.data.agent_name, parsed.data.agent_status);
+      if (!updated) {
+        logDashboardAudit(
+          "set_status",
+          parsed.data.agent_name,
+          `target=${parsed.data.agent_name} status=${parsed.data.agent_status}`,
+          false,
+          "agent not registered",
+          { target_agent_name: parsed.data.agent_name, error_code: "NOT_FOUND" }
+        );
+        res.status(404).json({
+          success: false,
+          error: `Agent "${parsed.data.agent_name}" is not registered.`,
+        });
+        return;
+      }
+      // v2.2.1 L1 (Codex audit): broadcast agent state-change to connected
+      // dashboards. Pre-L1 the endpoint skipped this, leaving the UI
+      // up to 10s stale until the safety-net /api/snapshot poll. Mirrors
+      // the MCP set_status handler's direct broadcast path.
+      broadcastDashboardEvent({
+        event: "agent.state_changed",
+        entity_id: parsed.data.agent_name,
+        ts: new Date().toISOString(),
+        kind: "set_status",
+      });
+      logDashboardAudit(
+        "set_status",
+        parsed.data.agent_name,
+        `target=${parsed.data.agent_name} status=${parsed.data.agent_status}`,
+        true,
+        null,
+        { target_agent_name: parsed.data.agent_name, agent_status: parsed.data.agent_status }
+      );
+      res.status(200).json({
+        success: true,
+        agent_name: parsed.data.agent_name,
+        agent_status: parsed.data.agent_status,
+      });
+    } catch (err) {
+      log.error("[api/set-status]", err);
+      logDashboardAudit(
+        "set_status",
+        parsed.data.agent_name,
+        `target=${parsed.data.agent_name}`,
+        false,
+        err instanceof Error ? err.message : String(err),
+        { target_agent_name: parsed.data.agent_name, error_code: "INTERNAL" }
+      );
+      res.status(500).json({ success: false, error: "internal error" });
+    }
   });
 
   // Stateless MCP endpoint — new transport + server per request

@@ -83,60 +83,16 @@ afterEach(() => {
   delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
-/**
- * Connect and start buffering messages immediately so the test doesn't race
- * the hello frame. Returns a tuple {ws, nextMessage()} where nextMessage
- * pulls from the internal queue (and waits if empty).
- */
+// v2.2.1 P4: shared helper extracted to tests/_helpers/ws.ts. The local
+// wrapper below preserves the port-capture-in-closure pattern the rest of
+// this file already uses so the existing test call-sites don't have to
+// pass port on every call.
+import { connectWs as baseConnectWs } from "./_helpers/ws.js";
 async function connectWs(
   urlPath: string,
   subprotocols?: string[]
 ): Promise<{ ws: WebSocket; nextMessage: (timeoutMs?: number) => Promise<string> }> {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${urlPath}`, subprotocols);
-  const queue: string[] = [];
-  let pendingResolve: ((v: string) => void) | null = null;
-  ws.on("message", (data: Buffer) => {
-    const s = data.toString("utf8");
-    if (pendingResolve) {
-      pendingResolve(s);
-      pendingResolve = null;
-    } else {
-      queue.push(s);
-    }
-  });
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      ws.terminate();
-      reject(new Error("ws connect timeout"));
-    }, 2000);
-    ws.once("open", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-    ws.once("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-    ws.once("unexpected-response", (_req, res) => {
-      clearTimeout(timer);
-      reject(new Error(`ws rejected: HTTP ${res.statusCode}`));
-    });
-  });
-  return {
-    ws,
-    nextMessage: (timeoutMs = 1500) =>
-      new Promise((resolve, reject) => {
-        if (queue.length > 0) {
-          resolve(queue.shift()!);
-          return;
-        }
-        const timer = setTimeout(() => reject(new Error("ws message timeout")), timeoutMs);
-        pendingResolve = (s) => {
-          clearTimeout(timer);
-          resolve(s);
-        };
-      }),
-  };
+  return baseConnectWs(port, urlPath, subprotocols);
 }
 
 describe("v2.2.0 Phase 2 — WebSocket handshake", () => {

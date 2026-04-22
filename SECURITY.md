@@ -42,6 +42,16 @@ Mitigation (operator-side):
 
 Future server-side regex scrubbing of known secret shapes is tracked as a v2.1.8 candidate.
 
+### CSRF is skipped on loopback-dev permissive mode (v2.2.1)
+
+The v2.1.7 CSRF double-submit middleware (`csrfCheck` in `src/transport/http.ts`) enforces on `POST /api/*` only when a dashboard-auth secret is configured (`RELAY_DASHBOARD_SECRET` or `RELAY_HTTP_SECRET` as fallback). In the default loopback-dev posture — no secret set, `dashboardAuthCheck` short-circuits on a 127.0.0.1 peer — CSRF is skipped because there is no cookie-based session to protect.
+
+v2.2.0 shipped the first state-changing `/api/*` endpoint (`/api/focus-terminal`). v2.2.1 adds three more (`/api/send-message`, `/api/kill-agent`, `/api/set-status`). Concrete implication for loopback-dev mode: a JavaScript page loaded from ANY origin served on the same machine (local webserver, another browser tab, a dev sandbox) can POST to these endpoints with cookies+credentials `same-origin` and fire state-changing requests. The Host-header + Origin checks still apply — a page served from `http://127.0.0.1:8080/foo.html` targeting `/api/kill-agent` on `127.0.0.1:3777` counts as a cross-origin browser request and gets a 403 from `originCheck` (`allowed_dashboard_origins` defaults to `localhost`/`127.0.0.1` on any port, so an attacker-chosen path under that same origin pattern IS allowed — a real foot-gun).
+
+**Mitigation for operators running the relay on a multi-user machine OR a machine that runs a local web server for unrelated projects:** set `RELAY_DASHBOARD_SECRET` to a random string. That activates the full CSRF + auth gate. The `allowed_dashboard_origins` config knob can also be tightened to exact origins (drop the glob).
+
+Single-user dev laptops running no other local webservers aren't meaningfully exposed — the only browser context that can reach `127.0.0.1:3777` is the operator's own dashboard, which they trust by construction. Setting a secret is still the cheap belt-and-suspenders.
+
 ### Encryption keyring cache reload
 
 `src/encryption.ts` caches the parsed keyring at first read, keyed on the `RELAY_ENCRYPTION_KEYRING` / `RELAY_ENCRYPTION_KEYRING_PATH` env value. In-place edits to the keyring file contents do NOT auto-reload — the daemon continues using the cached keyring until restart. This is intentional: detecting file content change mid-operation would complicate the re-encryption state machine.

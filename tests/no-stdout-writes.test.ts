@@ -35,7 +35,12 @@ describe("stdout discipline (stdio MCP safety)", () => {
   // a JSON-RPC parser. src/cli/* + src/config.ts (stderr-only startup warn)
   // are allowlisted; everything else stays under the discipline so the stdio
   // MCP transport (src/transport/stdio.ts) can't be accidentally corrupted.
-  const ALLOWED_PREFIXES = ["cli/", "config.ts"];
+  //
+  // v2.2.1 B1: src/index.ts + src/cli.ts added for --help/--version CLI
+  // output. Both write to stdout ONLY before the stdio MCP transport has
+  // connected (process.exit(0) after --help/--version), so they cannot
+  // corrupt the JSON-RPC channel.
+  const ALLOWED_PREFIXES = ["cli/", "config.ts", "cli.ts", "index.ts"];
   function allowed(relPath: string): boolean {
     return ALLOWED_PREFIXES.some((p) => relPath === p || relPath.startsWith(p));
   }

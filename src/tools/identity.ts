@@ -15,6 +15,7 @@ import {
   logAudit,
   ConcurrentUpdateError,
   expandAgentCapabilities,
+  NameCollisionActiveError,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { log } from "../logger.js";
@@ -45,6 +46,61 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     | "recovery_pending"
     | null;
 
+  // v2.2.1 B2: hard-reject re-registration against an actively-held name.
+  // Pre-v2.2.1 this silently rotated session_id and dropped mail on the
+  // losing terminal (shared-token race). The check is handler-layer, not
+  // DB-layer, so internal callers (tests, relay recover, migrations) still
+  // call db.registerAgent directly without collision protection. Operators
+  // who need to take over a stuck session can either:
+  //   (a) wait for the row to go stale (5min at last_seen),
+  //   (b) run `relay recover <name>` to force-release, or
+  //   (c) pass `force: true` to register_agent (undocumented escape hatch).
+  // See memory/feedback_scoped_victra_names.md for the bug's history.
+  //
+  // Exemptions:
+  //   - auth_state recovery_pending: admin-approved re-take-over via
+  //     recovery_token, not a concurrent-session race.
+  //   - auth_state legacy_bootstrap: pre-v1.7 rows being migrated; no token
+  //     exists yet, by definition no concurrent session.
+  //   - force=true: explicit operator opt-in.
+  const ACTIVE_STATES = new Set(["idle", "working", "blocked", "waiting_user", "online", "busy"]);
+  const SESSION_TIMEOUT_SEC = 120; // matches the legacy warn window's tight lower bound
+  const EXEMPT_AUTH_STATES = new Set(["recovery_pending", "legacy_bootstrap"]);
+  if (!input.force && preRow && !EXEMPT_AUTH_STATES.has(preRow.auth_state ?? "active")) {
+    const ageSec = (Date.now() - new Date(preRow.last_seen).getTime()) / 1000;
+    const isActivelyHeld =
+      preRow.session_id != null &&
+      ageSec < SESSION_TIMEOUT_SEC &&
+      ACTIVE_STATES.has(preRow.agent_status ?? "idle");
+    if (isActivelyHeld) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error:
+                  `Agent "${input.name}" is already registered and online on another session ` +
+                  `(session_id=${preRow.session_id}, last_seen=${preRow.last_seen}). ` +
+                  `Two terminals running under the same name will race on get_messages and silently drop mail. ` +
+                  `Resolution: (a) scope your name (e.g. "${input.name}-mcp", "${input.name}-outreach") so each terminal has a distinct identity; ` +
+                  `(b) close the holding terminal and let it mark the row offline on exit; or ` +
+                  `(c) run "relay recover ${input.name} --yes" to force-release + re-register fresh.`,
+                error_code: ERROR_CODES.NAME_COLLISION_ACTIVE,
+                existing_session_id: preRow.session_id,
+                existing_last_seen: preRow.last_seen,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
   // v2.1 Phase 7p HIGH #2: plumb the dispatcher-verified recovery hash through
   // to the db layer so the CAS anchors on the hash the CALLER's ticket was
   // verified against — not on a fresh SELECT, which could miss an admin reissue
@@ -60,6 +116,10 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
       managed: input.managed,
       terminal_title_ref: input.terminal_title_ref,
       expectedRecoveryHash,
+      // v2.2.1 B2: when force=true the db-layer warn is also suppressed to
+      // keep the escape-hatch path quiet. `force` never reaches the DB
+      // beyond this.
+      force: input.force === true,
     }
   );
 

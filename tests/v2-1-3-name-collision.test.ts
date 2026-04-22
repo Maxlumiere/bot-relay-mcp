@@ -107,7 +107,7 @@ describe("v2.1.3 I5 — NAME_COLLISION_ACTIVE on live session + wrong token", ()
     expect(body2.error).toMatch(/relay recover/i);
   });
 
-  it("(b) token-match re-register on live-session row → succeeds (legitimate owner)", async () => {
+  it("(b) token-match re-register on live-session row WITHOUT force → NAME_COLLISION_ACTIVE (v2.2.1 B2)", async () => {
     const first = await mcpCall("tools/call", {
       name: "register_agent",
       arguments: { name: "collider-2", role: "r", capabilities: [] },
@@ -116,15 +116,37 @@ describe("v2.1.3 I5 — NAME_COLLISION_ACTIVE on live session + wrong token", ()
     const token = body1.agent_token;
     expect(token).toBeTruthy();
 
-    // Same owner re-registering with the valid token.
+    // v2.2.1 B2 change: re-registering an actively-held name WITHOUT
+    // force:true now returns NAME_COLLISION_ACTIVE regardless of whether
+    // the caller presents a valid token. Rationale: two terminals with
+    // the same token+name silently race on get_messages and drop mail.
+    // Operators must scope names distinctly OR pass force:true to take
+    // over explicitly.
     const reRegister = await mcpCall("tools/call", {
       name: "register_agent",
       arguments: { name: "collider-2", role: "r", capabilities: [], agent_token: token },
     });
     const body2 = parseEnvelope(reRegister);
+    expect(body2.success).toBe(false);
+    expect(body2.error_code).toBe(ERROR_CODES.NAME_COLLISION_ACTIVE);
+    expect(body2.existing_session_id).toBe(body1.agent.session_id);
+  });
+
+  it("(b2) same-owner re-register WITH force=true → succeeds + rotates session_id (v2.2.1 B2 escape hatch)", async () => {
+    const first = await mcpCall("tools/call", {
+      name: "register_agent",
+      arguments: { name: "collider-2b", role: "r", capabilities: [] },
+    });
+    const body1 = parseEnvelope(first);
+    const token = body1.agent_token;
+
+    const reRegister = await mcpCall("tools/call", {
+      name: "register_agent",
+      arguments: { name: "collider-2b", role: "r", capabilities: [], agent_token: token, force: true },
+    });
+    const body2 = parseEnvelope(reRegister);
     expect(body2.success).toBe(true);
-    expect(body2.agent.name).toBe("collider-2");
-    // session_id rotates on legitimate re-register.
+    expect(body2.agent.name).toBe("collider-2b");
     expect(body2.agent.session_id).not.toBe(body1.agent.session_id);
   });
 

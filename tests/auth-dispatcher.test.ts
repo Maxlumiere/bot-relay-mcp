@@ -298,8 +298,11 @@ describe("register_agent re-registration auth (v1.7.1)", () => {
     expect(body.auth_error).toBe(true);
   });
 
-  it("(iv) re-register with CORRECT token allowed BUT caps unchanged", async () => {
+  it("(iv) re-register with CORRECT token + force allowed BUT caps unchanged", async () => {
     const tok = await register("rr-caps-locked", ["build"]);
+    // v2.2.1 B2: re-register on an actively-held name requires force=true.
+    // This test exercises caps-immutability semantic, unaffected by the new
+    // collision gate; add force to reach the re-register path.
     const resp = await mcpCall("tools/call", {
       name: "register_agent",
       arguments: {
@@ -307,6 +310,7 @@ describe("register_agent re-registration auth (v1.7.1)", () => {
         role: "deployer",
         capabilities: ["spawn", "tasks"], // attempt to grant herself spawn
         agent_token: tok,
+        force: true,
       },
     });
     const body = JSON.parse(resp.result.content[0].text);

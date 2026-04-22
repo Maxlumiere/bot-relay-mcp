@@ -1,5 +1,80 @@
 # Changelog
 
+## v2.2.1 — 2026-04-21 — consolidated bug-sweep + dashboard polish
+
+v2.2.1 bundles 6 bug fixes (caught during v2.2.0 ship + operator use) with 5 dashboard polish items queued from the v2.2 locked spec. One release, one Codex audit, one ship ceremony. Protocol bumps `2.2.0 → 2.2.1` (MINOR — additive `set_dashboard_theme` tool + new `/api/send-message`/`/api/kill-agent`/`/api/set-status` endpoints + optional `force` field on `register_agent` + optional `hint` field on `get_messages`). No breaking changes. Schema migrates `v9 → v10`.
+
+### Part A — bug sweep
+
+- **B1 — CLI parser (Option A).** `node dist/index.js --transport=http --port=3777` no longer silently ignores the flags. New `src/cli.ts` with a tight allowlist (`--transport`, `--port`, `--host`, `--config`, `--help`, `--version`). Precedence: CLI > env > config file > default. Unknown flags fast-fail with `exit(2) + clear message`. Startup source-log emits one line showing which layer won for each knob.
+- **B2 — duplicate-name register race.** Two Claude Code terminals running under the same `RELAY_AGENT_NAME` + shared token previously silently rotated `session_id` and one terminal's mailbox reads silently dropped mail. `register_agent` now hard-rejects with `NAME_COLLISION_ACTIVE` when the existing row's `session_id` is set, `agent_status` is active, and `last_seen` is within 120s. Escape hatch: `force: true` on the register call. Exempt: `recovery_pending` + `legacy_bootstrap` auth states (admin-approved flows). Tests that legitimately exercise re-register flows now pass `force: true` to reach the re-register branch.
+- **B3 — daemon non-TTY fallback.** `node dist/index.js` in a non-TTY context (Claude Code bash sandbox, systemd service with no pty) now `exit(3)` with an actionable message pointing at `RELAY_TRANSPORT=http`. Was previously a silent exit-on-stdin-close. Escape hatch: `RELAY_SKIP_TTY_CHECK=1` for test harnesses piping MCP deliberately.
+- **B4 — `get_messages` since UX hint.** `status='pending' + count=0 + since < 24h` now surfaces a `hint` field: `"Narrow since window may hide older pending messages. Try since='24h' or since='all'..."`. Caught during v2.2.0 ship-ceremony debug when a 25-min-old pending message was hidden by `since='15m'` and triggered a false ghost-session diagnosis.
+- **B5 — multi-IP DNS round-robin.** `deliverPinnedPost` now accepts `pinnedIps: string[]` and tries each IP in order on connect-refused / timeout / ECONNRESET (max 3 attempts). Load-balanced webhook targets regain the failover-across-replicas semantic that native `fetch()`'s internal round-robin used to provide. Non-retryable errors (TLS, server 5xx) don't loop — they return immediately.
+- **B6 — Stop hook payload docs.** New `docs/hook-payload-format.md` consolidates Claude Code 2.1.x hook payload shapes (SessionStart / Stop / PostToolUse / PreToolUse / UserPromptSubmit) with minimal reader templates in Node + bash. Cross-linked from `docs/hooks.md`. Captured during Phase F build when the Stop-hook stdin-JSON format wasn't obvious from existing SessionStart patterns.
+
+### Part B — dashboard polish
+
+- **P1 — themes + `set_dashboard_theme` MCP tool.** New MCP tool `set_dashboard_theme({mode, custom_json?})`. Modes: `catppuccin` (default Mocha palette) / `dark` (tool-neutral) / `light` (tool-neutral) / `custom` (14-token JSON paste). Server-side default stored in new `dashboard_prefs` single-row table (schema v10 via `migrateSchemaToV2_8`). Dashboard client reads default on first connect; localStorage beats server default for repeat visits (**path-1 client-only design**). No WebSocket push of theme changes — operators reload to surface server-side updates on already-connected dashboards. Tool count 28 → 29.
+- **P2 — three inline `/api/*` endpoints.** `POST /api/send-message` (body `{from, to, content, priority?}`), `POST /api/kill-agent` (body `{name}` + `X-Relay-Confirm: yes` header), `POST /api/set-status` (body `{agent_name, agent_status}`). All three gated by the v2.1.7 CSRF + rate-limit + host-check infra. Trust model: dashboard access = operator-level trust; no additional agent-token check (same pattern as admin panels). 
+- **P3 — CSS extraction.** `src/dashboard-styles.ts` new file exports `DASHBOARD_BASE_STYLES` + `DASHBOARD_THEMES`. `src/dashboard.ts` dropped from 749 → 575 LOC. Themes land as `[data-theme="…"]` selectors in the same module so color-surface changes stay in one place. No new route (single-HTML-response model preserved).
+- **P4 — WS test helper extraction.** `tests/_helpers/ws.ts` new shared helper exports `connectWs(port, urlPath, subprotocols?)` with the eager-queue hello-frame-race handling. `tests/v2-2-0-phase-2-websocket.test.ts` delegates to it; new v2.2.1 WS tests import from there.
+- **P5 — SECURITY.md CSRF loopback-dev callout.** Added a "Known residual behavior" paragraph documenting that CSRF is skipped in loopback-dev mode (no secret + loopback peer) and what that implies now that state-changing `/api/*` endpoints actually exist. Operators on multi-user machines or machines running unrelated local webservers should set `RELAY_DASHBOARD_SECRET` to activate the full CSRF + auth gate.
+
+### Schema migration (v9 → v10)
+
+`migrateSchemaToV2_8` adds the `dashboard_prefs` table:
+
+```
+CREATE TABLE dashboard_prefs (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  theme TEXT NOT NULL DEFAULT 'catppuccin'
+    CHECK (theme IN ('catppuccin', 'dark', 'light', 'custom')),
+  custom_json TEXT,
+  updated_at TEXT NOT NULL
+);
+```
+
+Single-row (CHECK id=1), seeded with `{theme:'catppuccin', custom_json:null}` on first migration. Additive + idempotent — no data backfill.
+
+### ⚠ Security patches from Codex pre-ship audit
+
+Codex's dual-model audit of the v2.2.1 diff returned PATCH-THEN-SHIP. Patches landed inline (not deferred) before the ship ceremony:
+
+- **M1 (MEDIUM) — inline `/api/*` endpoints bypassed audit/attribution.** `/api/send-message`, `/api/kill-agent`, `/api/set-status` previously went directly to the DB functions, skipping the MCP dispatcher's `logAudit` + verified-caller attribution. A dashboard-secret holder could spoof a `send_message` as any registered `from` agent with no relay record pointing at the operator. Fix: new `logDashboardAudit()` helper in `src/transport/http.ts` wraps every call path with `source='dashboard'` + `via_dashboard: true` + `operator_identity` (sourced from `RELAY_DASHBOARD_OPERATOR` env var, fallback `"dashboard-user"`). Audit entries now record BOTH the operator AND the on-behalf-of agent for forensic replay. Failure paths (validation rejects, SENDER_NOT_REGISTERED, internal errors) also audit with `success=0` + error string.
+- **L1 (LOW) — `/api/set-status` missing WS broadcast.** MCP `set_status` fan-outs to connected dashboards via `broadcastDashboardEvent`; the HTTP endpoint skipped that step, leaving connected UIs up to 10s stale until the safety-net `/api/snapshot` poll. Fix: added the same `agent.state_changed` broadcast to the HTTP path.
+- **L2 (LOW) — CLI parser drift.** Three sub-fixes: (a) `--help` / `--version` now win over unknown-flag errors so `node dist/index.js --bogus --help` still prints usage instead of exiting 2 silently; (b) `applyCliToEnv()` widens source tracking from `"cli" | "env" | "default"` to `"cli" | "env" | "config" | "default"` — pre-L2 config-file-won values were mislabeled `default` in the startup log; (c) `src/config.ts` gains a small `readConfigFileKeys()` helper so `src/index.ts` can pass file-layer keys into the source classifier. +6 regression tests.
+- **B2 doc drift — stale `force` flag comments.** `src/db.ts` had comments claiming `force` was NOT on the MCP surface AND implying DB-layer hard-reject semantics. Neither was accurate post-v2.2.1 (the `force` flag IS a Zod field on RegisterAgentSchema; enforcement moved to the handler layer). Comments replaced with an accurate one-liner pointing at `handleRegisterAgent`.
+
+### Behavior change (post-Codex): ECONNRESET no longer retries
+
+The v2.2.1 B5 multi-IP round-robin helper previously retried across sibling replicas on ECONNRESET. Codex flagged this as an at-least-once delivery hazard: ECONNRESET is ambiguous for POST (the peer may have accepted the request body before resetting), so retrying risks **duplicate webhooks**. Duplicate webhooks are worse than rare one-shot reset losses for operator-run self-hosted tooling (the whole threat model assumes fire-and-forget best effort).
+
+Pre-patch retryable set: ECONNREFUSED + ETIMEDOUT + EHOSTUNREACH + ENETUNREACH + ECONNRESET + EAI_AGAIN. Post-patch: ECONNREFUSED + EHOSTUNREACH + ENETUNREACH + ETIMEDOUT + EAI_AGAIN (all clearly pre-connect failures; peer never saw the body). ECONNRESET now returns immediately with the error surfaced to the caller — `scheduleWebhookRetry` still applies at the outer layer per its own retry policy, so legit retries happen with full `delivery_id`-based dedup semantics.
+
+### Tests
+
+- `tests/v2-2-1-bug-sweep.test.ts` +24 cases (B1 × 12, B2 × 3, B3 × 2, B4 × 4, B5 × 3).
+- `tests/v2-2-1-polish.test.ts` +22 cases (P1 × 7, P2 × 10, P3/P4/P5 × 5 artifact checks).
+- Existing test updates (schema v10, tool count 29, v2.2.1 version pin): `tests/v2-1-3-agent-status-enum.test.ts`, `tests/v2-1-schema-info.test.ts`, `tests/http.test.ts`, `tests/v2-2-0-full-dashboard-smoke.test.ts`.
+- Test fixtures that legitimately re-register an active agent (valid token but no scope-change intent) updated to pass `force: true`: `tests/auth-dispatcher.test.ts`, `tests/phase-4b-1-v2.test.ts`, `tests/phase-4b-2-inherited-token.test.ts`, `tests/regression-plug-and-play.test.ts`, `tests/v2-1-3-name-collision.test.ts`, `tests/v2-1-legacy-migration.test.ts`, `tests/v2-1-sid-recapture.test.ts`.
+
+- `tests/v2-2-1-codex-patches.test.ts` +14 cases (M1 × 5, L1 × 1, L2 × 6, B5n × 2).
+
+**Total: 957 tests pass** (897 v2.2.0 baseline + 46 new v2.2.1 bug-sweep+polish + 14 new Codex-patch regressions). Pre-publish `--full` gate: **11/11 PASS** both pre-audit and post-audit.
+
+### Release hygiene
+
+- `package.json` 2.2.0 → 2.2.1.
+- `src/protocol.ts` 2.2.0 → 2.2.1.
+- `devlog/067-v2.2.1-consolidated-bug-sweep-and-polish.md` — assumptions-first.
+
+### Hall of Fame
+
+- **Operator surfacing (Maxime, 2026-04-21 evening):** CLI-args-silently-ignored (B1), `since` filter hiding pending (B4), daemon non-TTY silent exit (B3) — all caught during v2.2.0 ship ceremony.
+- **Codex (v2.2.0 audit):** duplicate-name race pattern context via `memory/feedback_scoped_victra_names.md` (B2), multi-IP round-robin note (B5).
+- **Phase F discovery (2026-04-21):** Claude Code 2.1.x Stop-hook stdin JSON payload format (B6).
+
 ## v2.2.0 — 2026-04-21 — core dashboard observability (+ bundled webhook TOCTOU fix + IP-classifier consolidation)
 
 v2.2.0 is the first MINOR release in the 2.x line. Focus: operator-facing dashboard. Ships core observability (Phases 1-3 of the dashboard spec) plus two bundled fixes from the v2.1.7 audit — the webhook DNS TOCTOU (Item 7, deferred) and the IP-classifier consolidation (Item 9, v2.2 candidate). v2.2.1 polish items (themes / custom-paste / inline send / kill / set-status) ship in a separate cycle.

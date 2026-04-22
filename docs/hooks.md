@@ -2,6 +2,8 @@
 
 Hooks let Claude Code terminals automatically check the relay for messages without being asked. This turns the relay from "pull-only" into something closer to push-based communication.
 
+**Writing a new hook?** See [`hook-payload-format.md`](./hook-payload-format.md) for the exact JSON payload Claude Code 2.1.x passes on stdin per event type (SessionStart / Stop / PostToolUse / PreToolUse / UserPromptSubmit), plus minimal reader templates in Node + bash.
+
 ## How it works
 
 Claude Code supports `SessionStart` hooks — shell commands that run when a terminal opens or resumes. The hook's stdout is injected directly into Claude's context, so the agent sees any pending messages immediately.
