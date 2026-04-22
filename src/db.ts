@@ -80,6 +80,19 @@ function computeStatus(lastSeen: string): "online" | "stale" | "offline" {
  */
 const AGENT_STATUS_STALE_MINUTES = 5;
 const AGENT_STATUS_OFFLINE_MINUTES = 30;
+/**
+ * v2.2.2 B3 — abandoned threshold. Agents that have been offline (no
+ * re-register, no set_status refresh) for longer than this get
+ * surfaced as `agent_status: "abandoned"` in snapshots. The raw DB
+ * row is left alone — operators prune via `relay purge-agents`.
+ * Overridable via RELAY_AGENT_ABANDON_DAYS (integer days).
+ */
+function getAgentAbandonMinutes(): number {
+  const raw = process.env.RELAY_AGENT_ABANDON_DAYS;
+  const n = raw ? parseInt(raw, 10) : 7;
+  const days = Number.isFinite(n) && n > 0 ? n : 7;
+  return days * 24 * 60;
+}
 
 const LEGACY_STATUS_MAP: Record<string, string> = {
   online: "idle",
@@ -105,7 +118,16 @@ function deriveAgentStatus(
 ): AgentWithStatus["agent_status"] {
   const stored = normalizeStoredAgentStatus(storedRaw);
   const minutes = (Date.now() - new Date(lastSeen).getTime()) / 60_000;
+  const abandonMinutes = getAgentAbandonMinutes();
 
+  // v2.2.2 B3: abandoned-state promotion. Offline / closed for
+  // >=7-days (default) agents surface as "abandoned" so dashboards
+  // can hide them by default.
+  if (minutes >= abandonMinutes) return "abandoned";
+  if (stored === "abandoned") return "abandoned";
+  // v2.2.2 BUG2: stored 'closed' state (set by SIGINT handler) wins
+  // over age-based promotions below the abandoned threshold.
+  if (stored === "closed") return "closed";
   if (stored === "offline") return "offline";
   if (minutes >= AGENT_STATUS_OFFLINE_MINUTES) return "offline";
   if (stored === "stale") return minutes >= AGENT_STATUS_OFFLINE_MINUTES ? "offline" : "stale";
@@ -1425,6 +1447,35 @@ export function markAgentOffline(
 }
 
 /**
+ * v2.2.2 BUG2 — sanctioned closed-session transition for a stdio
+ * terminal that is shutting down *intentionally* (SIGINT / SIGTERM).
+ *
+ * Supersedes the `markAgentOffline` call previously used by
+ * `performAutoUnregister`. Same CAS predicate (`name = ? AND
+ * session_id = ?`) — a concurrent terminal that rotated session_id
+ * between our SIGINT capture and this call wins the race. Difference:
+ * sets `agent_status = 'closed'` instead of `'offline'` so dashboards
+ * can distinguish retired-by-intent terminals from
+ * offline-but-might-return. Preserved fields are identical (token_hash,
+ * auth_state, capabilities, last_seen, …).
+ *
+ * Auto-promotion to `abandoned` still fires at RELAY_AGENT_ABANDON_DAYS
+ * via deriveAgentStatus (age-based), so closed terminals don't linger
+ * visible forever — they follow the same retirement arc as offline.
+ */
+export function closeAgentSession(
+  name: string,
+  expectedSessionId: string
+): { changed: boolean } {
+  const db = getDb();
+  const r = db.prepare(
+    "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL " +
+    "WHERE name = ? AND session_id = ?"
+  ).run(name, expectedSessionId);
+  return { changed: r.changes === 1 };
+}
+
+/**
  * v2.1.4 (I11) — sanctioned additive cap expansion.
  *
  * Rules enforced here (belt + handler-layer suspenders):
@@ -2256,7 +2307,8 @@ export function sendMessage(
 export function getMessages(
   agentName: string,
   status: string,
-  limit: number
+  limit: number,
+  peek = false
 ): MessageRecord[] {
   const db = getDb();
   // No touchAgent here — observation is not liveness (v1.3 presence fix)
@@ -2295,7 +2347,14 @@ export function getMessages(
 
   // Mark messages as read by THIS session. The old binary `status` column
   // remains populated for back-compat readers but is no longer authoritative.
-  if (rows.length > 0 && currentSession && status !== "read") {
+  //
+  // v2.2.2 BUG1 — when `peek=true`, skip the mark-as-read UPDATE so
+  // repeated `status='pending'` polls by the same session return the
+  // same messages. Necessary for orchestrator-polling use cases where
+  // one session surveys its own inbox without consuming it. Default
+  // stays `peek=false` so consume-once semantics are preserved for
+  // single-shot workers (v2.0 final #6).
+  if (!peek && rows.length > 0 && currentSession && status !== "read") {
     const ids = rows.map((r) => r.id);
     const placeholders = ids.map(() => "?").join(",");
     db.prepare(
@@ -2408,6 +2467,35 @@ export function purgeAgentHistory(agentName: string): {
   });
   tx();
   return { messages_deleted: messagesDeleted, tasks_deleted: tasksDeleted };
+}
+
+/**
+ * v2.2.2 B3 — list agents whose last_seen is older than the given
+ * ISO-timestamp cutoff. Used by `relay purge-agents` to gather
+ * deletion candidates before asking for operator confirmation.
+ */
+export function listAgentsOlderThan(cutoffIso: string): AgentRecord[] {
+  const db = getDb();
+  return db
+    .prepare(
+      "SELECT * FROM agents WHERE last_seen < ? ORDER BY last_seen ASC"
+    )
+    .all(cutoffIso) as AgentRecord[];
+}
+
+/**
+ * v2.2.2 B3 — delete a single agent row if (and only if) its
+ * last_seen is still older than the cutoff. Returns true when the
+ * DELETE landed, false when the row moved (operator came back, race)
+ * or was already gone. Sanctioned-helper home for raw `DELETE FROM
+ * agents` so `relay purge-agents` passes the drift-grep guard.
+ */
+export function deleteAgentIfAbandoned(name: string, cutoffIso: string): boolean {
+  const db = getDb();
+  const r = db
+    .prepare("DELETE FROM agents WHERE name = ? AND last_seen < ?")
+    .run(name, cutoffIso);
+  return r.changes > 0;
 }
 
 export function broadcastMessage(

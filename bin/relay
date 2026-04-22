@@ -15,6 +15,11 @@
  *   relay purge-history NAME  Delete every message + task where the agent is
  *                             sender or recipient (v2.1.6, for reused names).
  *                             Preserves the agent row itself.
+ *   relay purge-agents        Prune agent rows with last_seen > N days (v2.2.2;
+ *     [--abandoned-since=N]   dry-run by default, --apply to commit). Messages
+ *     [--apply]               + tasks are preserved (see purge-history).
+ *   relay open [--url U]      Open the dashboard in the default browser
+ *                             (v2.2.2; auto-detects host+port from config).
  *   relay re-encrypt          Rotate at-rest encryption keys across all encrypted
  *                             columns (v2.1 Phase 4b.3). See docs/key-rotation.md.
  *   relay pair HUB_URL        Register with a remote bot-relay-mcp hub + emit an
@@ -35,6 +40,8 @@ const SUBCOMMANDS = {
   restore: "../dist/cli/restore.js",
   recover: "../dist/cli/recover.js",
   "purge-history": "../dist/cli/purge-history.js",
+  "purge-agents": "../dist/cli/purge-agents.js",
+  open: "../dist/cli/open.js",
   "re-encrypt": "../dist/cli/re-encrypt.js",
   pair: "../dist/cli/pair.js",
 };
@@ -52,6 +59,8 @@ function printHelp() {
       "  restore PATH     Restore from a tar.gz archive.\n" +
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +
       "  purge-history NAME  Delete every message + task where the agent is sender or recipient.\n" +
+      "  purge-agents     Prune agent rows with last_seen > N days (dry-run; --apply commits).\n" +
+      "  open [--url U]   Open the dashboard in the default browser.\n" +
       "  re-encrypt       Rotate at-rest encryption keys across all encrypted columns.\n" +
       "  pair HUB_URL     Register with a remote hub + emit MCP client config.\n" +
       "  help             Show this message.\n\n" +

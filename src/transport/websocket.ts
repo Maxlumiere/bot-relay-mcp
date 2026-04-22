@@ -65,7 +65,12 @@ import {
  */
 export interface DashboardEvent {
   /** High-level event name broadcast to dashboard clients. Stable wire format. */
-  event: "agent.state_changed" | "message.sent" | "task.transitioned" | "channel.posted";
+  event:
+    | "agent.state_changed"
+    | "message.sent"
+    | "task.transitioned"
+    | "channel.posted"
+    | "dashboard.theme_changed";
   /** Primary entity id used for the rate-limit coalesce key. */
   entity_id: string;
   /** ISO timestamp of the event — always stamped server-side so clients can order. */

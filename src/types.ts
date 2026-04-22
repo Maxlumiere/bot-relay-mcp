@@ -169,6 +169,18 @@ export const GetMessagesSchema = z.object({
   status: z.enum(["pending", "read", "all"]).default("pending").describe("Filter by status"),
   limit: z.number().int().min(1).max(100).default(20).describe("Max messages to return"),
   since: GetMessagesSinceField,
+  /**
+   * v2.2.2 BUG1 — when true, do NOT mark returned messages as read-by-
+   * this-session. Repeated calls with `status='pending'` continue to
+   * return the same rows until the caller either requests without
+   * peek OR another session marks them read. Default false preserves
+   * v2.0 consume-once semantics for single-shot workers. Intended for
+   * orchestrators that survey their own inbox on a polling interval
+   * without consuming it (Victra's get_messages pattern).
+   */
+  peek: z.boolean().optional().default(false).describe(
+    "When true, skip the mark-as-read side effect so repeated status='pending' polls return the same messages. Default false (consume-once)."
+  ),
   agent_token: AgentTokenField,
 });
 
@@ -224,6 +236,19 @@ export const AgentStatusEnum = z.enum([
   "waiting_user",
   "stale",
   "offline",
+  // v2.2.2 B3: relay-computed terminal state for agents that have been
+  // offline for RELAY_AGENT_ABANDON_DAYS (default 7) without
+  // re-registering. Distinct from `offline` so dashboards can hide
+  // retired terminals by default while keeping the row around for the
+  // operator's `relay purge-agents` sweep.
+  "abandoned",
+  // v2.2.2 BUG2: intentional-terminal-close state. Written by the
+  // SIGINT/SIGTERM stdio handler (closeAgentSession helper) when the
+  // operator deliberately shuts a terminal. Distinct from `offline`
+  // (which can be network drop / sleep / transient) so dashboards can
+  // show retired-by-intent sessions differently. Auto-promotes to
+  // `abandoned` via the existing RELAY_AGENT_ABANDON_DAYS chain.
+  "closed",
 ]);
 
 /** v2.1.3 — union accepted by set_status: new values + legacy aliases. */
@@ -464,6 +489,16 @@ export const ApiSendMessageSchema = z.object({
   to: z.string().min(1).max(64).describe("Recipient agent name"),
   content: payloadField("content"),
   priority: z.enum(["normal", "high"]).default("normal"),
+  /**
+   * v2.2.2 A1 — Option (b) defense-in-depth. Optional: when present, the
+   * server verifies against the from-agent's stored token_hash + the
+   * audit-log entry records `from_authenticated: true`. When absent, the
+   * v2.2.1 Option (a) audit-only model applies: dashboard-secret gate is
+   * the only check + `from_authenticated: false` is recorded so incident
+   * review can distinguish operator-impersonation from token-verified
+   * sends. Also acceptable via `X-From-Agent-Token` header.
+   */
+  from_agent_token: z.string().min(8).max(128).optional(),
 });
 export type ApiSendMessageInput = z.infer<typeof ApiSendMessageSchema>;
 
@@ -524,6 +559,22 @@ export const SetDashboardThemeSchema = z
     { message: "mode='custom' requires custom_json with all 13 token fields" }
   );
 export type SetDashboardThemeInput = z.infer<typeof SetDashboardThemeSchema>;
+
+/**
+ * v2.2.2 B1 — same shape as SetDashboardThemeSchema but without the MCP
+ * agent_token field (the dashboard POST endpoint is gated by
+ * dashboardAuthCheck + originCheck + csrfCheck, not by agent auth).
+ */
+export const ApiDashboardThemeSchema = z
+  .object({
+    mode: z.enum(["catppuccin", "dark", "light", "custom"]),
+    custom_json: CustomThemeSchema.optional(),
+  })
+  .refine(
+    (v) => v.mode !== "custom" || v.custom_json !== undefined,
+    { message: "mode='custom' requires custom_json with all 14 token fields" }
+  );
+export type ApiDashboardThemeInput = z.infer<typeof ApiDashboardThemeSchema>;
 
 // --- TypeScript types ---
 
@@ -622,7 +673,7 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
    * (idle/working/blocked/waiting_user) with 'stale' at 5 min + 'offline' at
    * 30 min of last_seen silence.
    */
-  agent_status: "idle" | "working" | "blocked" | "waiting_user" | "stale" | "offline";
+  agent_status: "idle" | "working" | "blocked" | "waiting_user" | "stale" | "offline" | "abandoned" | "closed";
   /** v2.0 final: optional description. */
   description: string | null;
   /** v2.0 final: current session_id (UUID, rotates on re-register). */

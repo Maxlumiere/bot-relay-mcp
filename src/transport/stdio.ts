@@ -5,7 +5,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "../server.js";
-import { markAgentOffline, getAgentSessionId, logAudit } from "../db.js";
+import { markAgentOffline, closeAgentSession, getAgentSessionId, logAudit } from "../db.js";
 import { log } from "../logger.js";
 
 /**
@@ -95,29 +95,41 @@ export function performAutoUnregister(
     return;
   }
   try {
-    const { changed } = markAgentOffline(name, capturedSid);
+    // v2.2.2 BUG2: prefer closeAgentSession (agent_status='closed') over
+    // markAgentOffline so dashboards can distinguish "operator killed
+    // the terminal" from "network dropped / sleep / transient". Fall
+    // back to markAgentOffline only on helper-level failure.
+    let transition: "closed" | "offline" = "closed";
+    let changed = false;
+    try {
+      ({ changed } = closeAgentSession(name, capturedSid));
+    } catch (closeErr) {
+      log.warn(`[stdio] closeAgentSession failed for "${name}" — falling back to offline:`, closeErr);
+      transition = "offline";
+      ({ changed } = markAgentOffline(name, capturedSid));
+    }
     if (changed) {
-      log.info(`[stdio] marked agent "${name}" offline (session=${capturedSid}) on ${signal}`);
+      log.info(`[stdio] marked agent "${name}" ${transition} (session=${capturedSid}) on ${signal}`);
       // v2.1.3: close the forensic gap. SIGINT-triggered state changes
       // now write an audit_log entry even though this path bypasses the
       // MCP dispatcher. Source='stdio' distinguishes from dispatcher calls.
       try {
         logAudit(
           name,
-          "stdio.auto_offline",
+          transition === "closed" ? "stdio.auto_close" : "stdio.auto_offline",
           `signal=${signal}`,
           true,
           null,
           "stdio",
-          { signal, captured_session_id: capturedSid },
+          { signal, captured_session_id: capturedSid, transition },
         );
       } catch (auditErr) {
         // Audit write failure MUST NOT block the exit path. Log + continue.
-        log.warn(`[stdio] auto-offline audit_log write failed for "${name}":`, auditErr);
+        log.warn(`[stdio] auto-${transition} audit_log write failed for "${name}":`, auditErr);
       }
     } else {
       log.debug(
-        `[stdio] auto-offline skipped for "${name}" — session_id mismatch (${capturedSid}) or row already offline`,
+        `[stdio] auto-${transition} skipped for "${name}" — session_id mismatch (${capturedSid}) or row already ${transition}`,
       );
     }
   } catch (err) {

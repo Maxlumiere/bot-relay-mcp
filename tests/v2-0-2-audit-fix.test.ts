@@ -73,7 +73,7 @@ describe("v2.0.2 — SIGINT auto-offline honours capturedSessionId contract", ()
     expect(getAgents().find((a) => a.name === "ghost-agent")).toBeUndefined();
   });
 
-  it("capturedSid matches DB → row is PRESERVED but marked offline (v2.1.3 semantic)", () => {
+  it("capturedSid matches DB → row is PRESERVED but marked closed (v2.2.2 BUG2 semantic; pre-BUG2 was 'offline')", () => {
     const r = registerAgent("solo-stdio", "r", ["tasks"]);
     const sid = r.agent.session_id!;
     const tokenHashBefore = getAgentAuthData("solo-stdio")?.token_hash;
@@ -84,10 +84,13 @@ describe("v2.0.2 — SIGINT auto-offline honours capturedSessionId contract", ()
     // v2.1.3: row is preserved (not deleted). session_id is cleared. Token
     // hash and capabilities stay intact so a new terminal with the same
     // RELAY_AGENT_TOKEN can resume via the active-state re-register path.
+    // v2.2.2 BUG2: the intentional-terminal-close transition now lands on
+    // agent_status='closed' (not 'offline') so dashboards can distinguish
+    // retired-by-intent from network-drop.
     const row = getAgentAuthData("solo-stdio");
     expect(row).toBeTruthy();
     expect(row?.session_id).toBeNull();
-    expect(row?.agent_status).toBe("offline");
+    expect(row?.agent_status).toBe("closed");
     expect(row?.token_hash).toBe(tokenHashBefore);
     expect(row?.auth_state).toBe("active");
   });
