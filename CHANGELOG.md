@@ -1,5 +1,82 @@
 # Changelog
 
+## v2.3.0 — 2026-04-22 — systemic bug-finding + profiles + Phase 4s ambient wake
+
+### ⚠ Codex pre-ship audit patches (applied 2026-04-23)
+
+Codex's dual-model audit of the v2.3.0 diff returned PATCH-THEN-SHIP. Two HIGH findings in Part C (Phase 4s ambient wake); Parts A + B cleared. Patches landed on the same PR #2 verify branch before the ship ceremony.
+
+- **HIGH #1 — atomic seq assignment race.** Pre-patch `getMessages` snapshotted `mailbox.next_seq` outside the transaction, then blindly incremented `next` for every candidate even when the `UPDATE ... WHERE seq IS NULL` no-op'd because another reader had already claimed the row. Two overlapping cross-process drains could stamp the same seq onto different messages. Fix: mailbox row is now read INSIDE the transaction; `next` advances ONLY when `UPDATE.changes === 1`; mailbox.next_seq persists the actual claim count, not the candidate count; transaction runs as BEGIN IMMEDIATE via better-sqlite3's `.immediate()` modifier so cross-process readers serialize at tx start. Rows claimed by another reader during our tx are re-hydrated via a targeted SELECT so the caller sees consistent seqs. (`src/db.ts`.)
+- **HIGH #2 — peek_inbox_version didn't surface new unread mail.** Pre-patch the response exposed `last_seq` as the watch field, but seq is assigned at DELIVERY time so `last_seq` only advances when the agent CALLS `get_messages` — defeating the point of the lightweight control-plane peek. Fix: new `total_unread_count` field computed via `SELECT COUNT(*) FROM messages WHERE to_agent = ? AND seq IS NULL`. Advances on every `send_message`. `docs/ambient-wake.md` promoted to watch-signal; `last_seq` demoted to read-cursor-across-reconnects.
+
+### Tests (patch round)
+
+- `tests/v2-3-0-ambient-wake.test.ts` +4 cases (C.3.4, C.3.5, HIGH1.1, HIGH1.2).
+- `tests/v2-3-0-property-based-query.test.ts` +2 fast-check properties (P7 seq uniqueness under overlap, P8 send→peek control-plane visibility). P7 runs fresh-DB per iteration for isolation.
+
+**Total after patches: 1048 tests pass** (1042 pre-patch + 6 new regressions).
+
+
+
+v2.3.0 is the first MINOR release since v2.2.0. Three bundled parts: (A) systemic bug-finding infrastructure — property-based tests + a live consistency probe; (B) profiles + surface shaping via `relay init --profile={solo,team,ci}`; (C) Phase 4s ambient-wake model — mailbox table + per-recipient monotonic seq + new `peek_inbox_version` MCP tool + filesystem marker fallback + dashboard wake button. Schema v10 → v11. Tool count 29 → 30. Protocol `2.2.3 → 2.3.0`.
+
+### Part A — systemic bug-finding infrastructure
+
+- **A.1 — property-based tests** (`tests/v2-3-0-property-based-query.test.ts`). 6 `fast-check` properties assert invariants that must hold regardless of input shape: (P1) send-then-peek returns exactly once, (P2) peek is non-mutating across repeated calls, (P3) consume-once drains, (P4) status-partition sums correctly, (P5) limit respected, (P6) round-trip content identity. Default gate runs 30 iterations per property (~180 scenarios); `FAST_CHECK_FULL=1` bumps to 200 (~1200) for the `--full` gate. New devDependency: `fast-check`.
+- **A.2 — live consistency probe** (`src/transport/consistency-probe.ts`). Sampling observer that runs inside the daemon when `RELAY_CONSISTENCY_PROBE=1`. Every Nth `get_messages` call (configurable via `RELAY_CONSISTENCY_PROBE_RATE`, default 100), a parallel raw-SQL SUPERSET query runs against `messages.to_agent`; if SQL sees pending rows the MCP path dropped, a structured warning lands on stderr with the missing IDs. Off by default. Never throws, never blocks, pure observation. Designed to catch the v2.2.1 drops-pending class of bug automatically in any environment the probe is on. 4 regression tests.
+- **A.3 — traffic-replay harness** — **deferred to v2.3.1** per the brief's explicit escape hatch. A.1 + A.2 deliver the bulk of the bug-finding value; the replay harness adds marginal coverage for the token cost of more test surface. Revisit when we have a reproducible bug that A.1 + A.2 can't surface deterministically.
+
+### Part B — profiles + surface shaping
+
+- **B.1 — `relay init --profile={solo,team,ci}`**. Profiles shape the surface, not just defaults. `solo` (default): stdio transport, core bundle only, info logs, 30-day abandon threshold. `team`: http transport, all feature bundles, 7-day abandon. `ci`: stdio, core only, warn logs, dashboard disabled, 1-day abandon. Explicit flags (`--transport`, `--port`) still win over profile defaults.
+- **B.2 — surface-shaping filter in `src/server.ts`**. New `TOOL_BUNDLES` map + `isToolVisible` + `resolveSurfaceShape` helpers. `tools/list` now filters by the active profile's `feature_bundles` + `tool_visibility.hidden`. Calls to a hidden tool return `TOOL_NOT_AVAILABLE` with a hint naming the profile that would expose it. `health_check` + `discover_agents` are always visible (diagnostic/routing primitives). New error code `TOOL_NOT_AVAILABLE` in the stable error-code catalog.
+- **B.3 — docs + tests**. `docs/profiles.md` with per-profile settings + bundle table + TOOL_NOT_AVAILABLE error-shape reference. README pointer. 10 tests covering init writes, visibility filter, hidden-override, and a drift guard that asserts every registered tool has a bundle mapping.
+
+### Part C — Phase 4s ambient wake
+
+- **C.1 — schema v10 → v11 migration** (`migrateSchemaToV2_9`). Phase 7q's reserved `mailbox` + `agent_cursor` stub tables are wired up: `mailbox` gets `agent_name` + `created_at` columns + unique index on agent_name; `agent_cursor` gets `agent_name` + `updated_at`. `messages` gets `seq INTEGER` + `epoch TEXT` columns. Index on `(to_agent, seq)` for cursor-based drain. Additive + idempotent.
+- **C.2 — delivery-time seq assignment**. `getMessages` now atomically looks up the recipient's `mailbox` row and assigns `seq` + `epoch` to every returned message where `seq IS NULL`. Single transaction wraps the increment + UPDATEs. Per Codex Q9 (2026-04-19): seq reflects the order the RECIPIENT saw messages, not send order. `sendMessage` is untouched.
+- **C.3 — new MCP tool `peek_inbox_version`** (`src/tools/peek-inbox-version.ts`). Pure observation: returns `{mailbox_id, epoch, last_seq, total_messages_count}`. No mutation, no read-mark side effect. Tool count 29 → 30. `core` feature bundle — visible in every profile.
+- **C.4 — filesystem marker fallback** (`src/filesystem-marker.ts`). Opt-in via `RELAY_FILESYSTEM_MARKERS=1`. Daemon touches `~/.bot-relay/marker/<agent_name>.touch` on every delivery; shell clients can `fs.watch()` + call `peek_inbox_version` on change. HINT only, non-authoritative — SQLite remains the truth. Cross-platform (macOS/Linux/Windows). Path sanitized against traversal.
+- **C.5 — dashboard wake-agent button**. 🔔 Wake agent button in the focused-agent panel. POST `/api/wake-agent {agent_name}` touches the marker + writes a `wake_agent` audit entry. When markers are disabled on the daemon, the endpoint returns `markers_enabled: false` + a hint — the button shows a disabled state instead of lying.
+- **C.6 — tests + docs**. 13 ambient-wake tests covering schema migration, monotonic seq, epoch rotation, marker opt-in/off/sanitization, wake endpoint round-trip, and audit-log payload shape. `docs/ambient-wake.md` with the full model + shell/Claude Code/Python integration sketches + backward-compatibility notes.
+
+### Schema notes
+
+- `CURRENT_SCHEMA_VERSION` bumped 10 → 11.
+- `messages.seq` + `messages.epoch` are NULL for pre-v2.3.0 rows; assigned on first read by the v2.3.0 delivery-time path. No backfill required.
+- Epoch is TEXT (UUID) per Codex Q9 locked design. Rotates explicitly on `rotateMailboxEpoch` (called from backup/restore in future phases); does NOT rotate on every daemon restart.
+- Phase 7q's `mailbox` / `agent_cursor` stub tables from schema v6 are expanded additively — no table rebuild.
+
+### Tests
+
+- `tests/v2-3-0-property-based-query.test.ts` (A.1) — 6 properties × 30 iterations default.
+- `tests/v2-3-0-consistency-probe.test.ts` (A.2) — 4 cases.
+- `tests/v2-3-0-profiles.test.ts` (B) — 10 cases.
+- `tests/v2-3-0-ambient-wake.test.ts` (C) — 13 cases.
+
+Test-fixture bumps for version/tool-count drift:
+
+- `tests/v2-1-schema-info.test.ts` — `applyMigration(10, 11)` no-op + raise pivot to `11 → 12`.
+- `tests/v2-1-3-agent-status-enum.test.ts` — schema version pin 10 → 11.
+- `tests/http.test.ts` — tools/list count 29 → 30 + `peek_inbox_version` presence assertion.
+- `tests/v2-2-0-full-dashboard-smoke.test.ts` — version pins bumped to 2.3.0.
+
+**Total: 1042 tests pass** (1009 v2.2.3 baseline + 33 new v2.3.0).
+
+### Release hygiene
+
+- `package.json` 2.2.3 → 2.3.0.
+- `src/protocol.ts` 2.2.3 → 2.3.0.
+- New files: `src/cli/init.ts` profile section, `src/transport/consistency-probe.ts`, `src/tools/peek-inbox-version.ts`, `src/filesystem-marker.ts`, `docs/profiles.md`, `docs/ambient-wake.md`.
+- `devlog/070-v2.3.0-consolidated-bundle.md` — assumptions-first.
+
+### Hall of Fame
+
+- **Maxime** — the "find bugs at scale without slowing speed" directive after the v2.2.1 get_messages-drops-pending incident that drove Part A. Also "stack as much as possible in one go" — that's what Part A + B + C together deliver.
+- **Codex (2026-04-19 Prompt B + Q9 reviews)** — the mailbox/seq-at-delivery-time/epoch-as-UUID design locked in Phase 4s. Also the event-sourcing-not-CRDT architectural correction that shapes v3+.
+- **The 2026-04-22 four-release sprint** (v2.2.0 → v2.2.1 → v2.2.2 → v2.2.3, all in one day) — every bug that surfaced became a seed for Part A's permanent prevention infrastructure.
+
 ## v2.2.3 — 2026-04-22 — Node 18 webhook-timeout hotfix + CI green-gate
 
 Hotfix release. CI has been red on Node 18 since v2.2.1 — both `tests/v2-2-1-bug-sweep.test.ts (B5.1)` and `tests/v2-2-1-codex-patches.test.ts (B5n.2)` timed out at 15s. v2.2.1 + v2.2.2 shipped to npm anyway because the local pre-publish gate didn't run the CI matrix. This release (a) patches the underlying webhook-delivery behavior, (b) adds a systemic guard so we can't ship another CI-red commit, and (c) seeds permanent regression coverage for the Node 18 failure mode.

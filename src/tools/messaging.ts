@@ -15,6 +15,7 @@ import {
 import { fireWebhooks } from "../webhooks.js";
 import { ERROR_CODES } from "../error-codes.js";
 import { parseSince } from "./standup.js";
+import { sampleGetMessagesConsistency } from "../transport/consistency-probe.js";
 import type {
   SendMessageInput,
   GetMessagesInput,
@@ -156,6 +157,22 @@ export function handleGetMessages(input: GetMessagesInput) {
   }
   const raw = getMessages(input.agent_name, input.status, input.limit, input.peek ?? false);
   const messages = filterBySince(raw, sinceIso);
+  // v2.3.0 Part A.2 — live consistency probe. Off by default; when
+  // enabled via RELAY_CONSISTENCY_PROBE=1, samples every Nth call and
+  // logs a stderr warning if a raw SQL superset query sees pending
+  // messages that the MCP path dropped (v2.2.1-style bug class).
+  // Never throws, never blocks — pure observation.
+  try {
+    sampleGetMessagesConsistency({
+      agentName: input.agent_name,
+      status: input.status,
+      limit: input.limit,
+      peek: input.peek ?? false,
+      mcpResult: raw,
+    });
+  } catch {
+    /* probe guarantees no-throw but defensive */
+  }
 
   // v2.2.1 B4: if the caller asked for `pending` + got zero results + the
   // `since` window is narrow (parsed + < 24h), emit a `hint` nudging them

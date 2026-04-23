@@ -83,9 +83,9 @@ describe("HTTP transport", () => {
     expect(body.transport).toBe("http");
   });
 
-  it("tools/list returns all 29 tools (28 from v2.1.6 + set_dashboard_theme [v2.2.1])", async () => {
+  it("tools/list returns all 30 tools (29 from v2.2.1 + peek_inbox_version [v2.3.0])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(29);
+    expect(result.result.tools.length).toBe(30);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
     expect(names).toContain("unregister_agent");
@@ -103,6 +103,8 @@ describe("HTTP transport", () => {
     expect(names).toContain("get_messages_summary");
     // v2.2.1 additions
     expect(names).toContain("set_dashboard_theme");
+    // v2.3.0 additions (Phase 4s ambient wake)
+    expect(names).toContain("peek_inbox_version");
   });
 
   it("registers and discovers an agent via HTTP", async () => {

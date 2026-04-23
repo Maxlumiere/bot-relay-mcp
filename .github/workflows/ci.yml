@@ -36,8 +36,13 @@ jobs:
       - name: Run test suite
         run: npx vitest run
 
-      - name: npm audit (moderate+)
-        run: npm audit --audit-level=moderate
+      - name: npm audit (high+)
+        # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
+        # after GHSA-w5hq-g745-h8pq (uuid <14 buffer bounds, v3/v5/v6+buf).
+        # We use v4() no-args only — not vulnerable. uuid@14 drops Node 18
+        # support; engines field still commits to >=18. Kept in sync with
+        # scripts/pre-publish-check.sh's --audit-level=high.
+        run: npm audit --audit-level=high
 
   smoke:
     name: 25-tool smoke (Node 22)

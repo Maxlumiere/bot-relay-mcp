@@ -29,6 +29,7 @@ import {
 } from "./sqlite-compat.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
+import { touchMarker } from "./filesystem-marker.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".bot-relay");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "relay.db");
@@ -199,6 +200,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_6(_db);
   migrateSchemaToV2_7(_db);
   migrateSchemaToV2_8(_db);
+  migrateSchemaToV2_9(_db);
   purgeOldRecords(_db);
 }
 
@@ -230,6 +232,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_6(_db);
   migrateSchemaToV2_7(_db);
   migrateSchemaToV2_8(_db);
+  migrateSchemaToV2_9(_db);
   purgeOldRecords(_db);
 
   return _db;
@@ -449,7 +452,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 10;
+export const CURRENT_SCHEMA_VERSION = 11;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -491,6 +494,7 @@ export function applyMigration(from: number, to: number): void {
   if (from === 7 && to === 8) return;
   if (from === 8 && to === 9) return;
   if (from === 9 && to === 10) return;
+  if (from === 10 && to === 11) return;
   throw new Error(
     `no migration registered for schema_version ${from}→${to}. ` +
     `Register a handler in src/db.ts applyMigration and update CURRENT_SCHEMA_VERSION.`
@@ -1003,6 +1007,79 @@ function migrateSchemaToV2_8(db: CompatDatabase): void {
   db.prepare(
     "INSERT OR IGNORE INTO dashboard_prefs (id, theme, custom_json, updated_at) VALUES (1, 'catppuccin', NULL, ?)"
   ).run(nowIso);
+}
+
+/**
+ * v2.3.0 Part C.1 — Phase 4s ambient-wake mailbox model (Codex Q9 locked
+ * 2026-04-19).
+ *
+ * Pre-v2.3.0, migrateSchemaToV2_4 seeded empty `mailbox` + `agent_cursor`
+ * namespace-reserved tables with placeholder column shapes. v2.3.0 wires
+ * them up + extends the schema:
+ *
+ * Additions to `mailbox`:
+ *   - agent_name TEXT — the owning agent. One mailbox row per agent.
+ *   - created_at TEXT — ISO timestamp. First-seen marker for ops review.
+ *
+ * Additions to `agent_cursor`:
+ *   - agent_name TEXT — the owning agent.
+ *   - updated_at TEXT — ISO timestamp.
+ *
+ * Additions to `messages`:
+ *   - seq INTEGER — assigned at DELIVERY time via the atomic increment
+ *     of mailbox.next_seq. NULL for messages that haven't been observed
+ *     by their recipient yet.
+ *   - epoch TEXT — snapshotted from mailbox.epoch at delivery time.
+ *     Lets a recipient detect a backup/restore by comparing its cached
+ *     cursor epoch vs the messages it just received.
+ *
+ * Epoch is TEXT (UUID) per the locked Codex Q9 design (memory/
+ * project_phase_4s_ambient_wake.md line 47). Epoch rotates on `relay
+ * backup` + `relay restore` so restored DBs don't silently over-filter
+ * cursors that were recorded against the pre-backup seq space.
+ *
+ * Additive + idempotent. Existing pre-v2.3.0 messages stay seq=NULL +
+ * epoch=NULL — they get assigned the first time their recipient reads
+ * them via the v2.3.0 getMessages delivery-time assignment path.
+ */
+function migrateSchemaToV2_9(db: CompatDatabase): void {
+  // mailbox — add agent_name + created_at columns if missing.
+  const mailboxCols = db
+    .prepare("PRAGMA table_info(mailbox)")
+    .all() as Array<{ name: string }>;
+  if (!mailboxCols.some((c) => c.name === "agent_name")) {
+    db.exec("ALTER TABLE mailbox ADD COLUMN agent_name TEXT");
+  }
+  if (!mailboxCols.some((c) => c.name === "created_at")) {
+    db.exec("ALTER TABLE mailbox ADD COLUMN created_at TEXT");
+  }
+  // Unique index on agent_name so one mailbox per agent. Defensive
+  // because the Phase 7q stub didn't enforce this.
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_mailbox_agent_name ON mailbox(agent_name)");
+
+  // agent_cursor — add agent_name + updated_at columns if missing.
+  const cursorCols = db
+    .prepare("PRAGMA table_info(agent_cursor)")
+    .all() as Array<{ name: string }>;
+  if (!cursorCols.some((c) => c.name === "agent_name")) {
+    db.exec("ALTER TABLE agent_cursor ADD COLUMN agent_name TEXT");
+  }
+  if (!cursorCols.some((c) => c.name === "updated_at")) {
+    db.exec("ALTER TABLE agent_cursor ADD COLUMN updated_at TEXT");
+  }
+
+  // messages — add seq + epoch columns. Populated at delivery time by
+  // getMessages; a NULL seq means "not yet observed by recipient".
+  const messageCols = db
+    .prepare("PRAGMA table_info(messages)")
+    .all() as Array<{ name: string }>;
+  if (!messageCols.some((c) => c.name === "seq")) {
+    db.exec("ALTER TABLE messages ADD COLUMN seq INTEGER");
+  }
+  if (!messageCols.some((c) => c.name === "epoch")) {
+    db.exec("ALTER TABLE messages ADD COLUMN epoch TEXT");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_messages_to_seq ON messages(to_agent, seq)");
 }
 
 export interface DashboardPrefs {
@@ -2301,7 +2378,108 @@ export function sendMessage(
     "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
   ).run(id, from, to, encContent, priority, timestamp);
 
+  // v2.3.0 Part C.4 — touch the filesystem marker for the recipient so
+  // ambient-wake clients watching the marker path get a low-latency
+  // wake signal. Off by default (RELAY_FILESYSTEM_MARKERS=1 to enable).
+  // Never throws — pure hint.
+  try {
+    touchMarker(to);
+  } catch {
+    /* marker is best-effort */
+  }
+
   return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
+}
+
+/**
+ * v2.3.0 Part C.1/C.2 — sanctioned mailbox helper.
+ *
+ * Idempotent upsert of the mailbox row for the given agent. Returns the
+ * full mailbox record. Epoch is a fresh UUID at first creation; rotates
+ * only on explicit `rotateMailboxEpoch` (called from backup/restore).
+ * Transaction-safe — the INSERT OR IGNORE + follow-up SELECT is the
+ * stable pattern across better-sqlite3 + WAL.
+ */
+export function getOrCreateMailbox(
+  agentName: string,
+): { mailbox_id: string; agent_name: string; epoch: string; next_seq: number } {
+  const db = getDb();
+  const existing = db
+    .prepare("SELECT mailbox_id, agent_name, epoch, next_seq FROM mailbox WHERE agent_name = ?")
+    .get(agentName) as
+    | { mailbox_id: string; agent_name: string; epoch: string; next_seq: number }
+    | undefined;
+  if (existing) return existing;
+  const mailboxId = uuidv4();
+  const epoch = uuidv4();
+  const createdAt = now();
+  db.prepare(
+    "INSERT OR IGNORE INTO mailbox (mailbox_id, agent_name, epoch, next_seq, created_at) VALUES (?, ?, ?, ?, ?)",
+  ).run(mailboxId, agentName, epoch, 0, createdAt);
+  // Re-read in case of race (another caller won the IGNORE).
+  return db
+    .prepare("SELECT mailbox_id, agent_name, epoch, next_seq FROM mailbox WHERE agent_name = ?")
+    .get(agentName) as { mailbox_id: string; agent_name: string; epoch: string; next_seq: number };
+}
+
+/**
+ * v2.3.0 Part C — peek helper backing the `peek_inbox_version` MCP tool.
+ * Pure observation — no mutation. Returns the current mailbox shape +
+ * an observed count of messages addressed to the agent.
+ */
+export function peekMailboxVersion(agentName: string): {
+  mailbox_id: string;
+  epoch: string;
+  last_seq: number;
+  total_messages_count: number;
+  total_unread_count: number;
+} {
+  const db = getDb();
+  const m = getOrCreateMailbox(agentName);
+  const count = (db
+    .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ?")
+    .get(agentName) as { c: number }).c;
+  // v2.3.0 Codex HIGH #2 patch — total_unread_count is the field clients
+  // watch for new-mail detection. `last_seq` only advances when the
+  // recipient CALLS get_messages (seq assignment is delivery-time), so
+  // it's stale for pre-first-observation new mail. `seq IS NULL` is the
+  // authoritative "not-yet-observed" signal + bumps on every sendMessage.
+  const unread = (db
+    .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND seq IS NULL")
+    .get(agentName) as { c: number }).c;
+  return {
+    mailbox_id: m.mailbox_id,
+    epoch: m.epoch,
+    last_seq: m.next_seq,
+    total_messages_count: count,
+    total_unread_count: unread,
+  };
+}
+
+/**
+ * v2.3.0 Part C — rotate the mailbox epoch for a specific agent. Called
+ * from backup/restore so restored DBs get a fresh epoch even if the
+ * underlying seq counter was reset by the archive. Clients whose cached
+ * cursor epoch doesn't match on next peek reset their local last_seen
+ * to 0 and drain from scratch.
+ */
+export function rotateMailboxEpoch(agentName: string): string {
+  const db = getDb();
+  const fresh = uuidv4();
+  db.prepare("UPDATE mailbox SET epoch = ? WHERE agent_name = ?").run(fresh, agentName);
+  return fresh;
+}
+
+/**
+ * v2.3.0 Part C — rotate EVERY mailbox epoch. Used by restoreFromBackup
+ * to invalidate every client's cursor in one pass rather than waiting
+ * for per-agent peek calls.
+ */
+export function rotateAllMailboxEpochs(): number {
+  const db = getDb();
+  const rows = db.prepare("SELECT agent_name FROM mailbox WHERE agent_name IS NOT NULL").all() as { agent_name: string }[];
+  for (const r of rows) rotateMailboxEpoch(r.agent_name);
+  return rows.length;
 }
 
 export function getMessages(
@@ -2360,6 +2538,92 @@ export function getMessages(
     db.prepare(
       `UPDATE messages SET status = 'read', read_by_session = ? WHERE id IN (${placeholders})`
     ).run(currentSession, ...ids);
+  }
+
+  // v2.3.0 Part C.2 — delivery-time seq assignment. Per Codex Q9 lock:
+  // mailbox seq is assigned when the RECIPIENT first observes a message,
+  // not when it was created. Over-fetched rows (e.g. status='read' or
+  // since filters that haven't been applied yet) get their seq stamped
+  // here too — the point is "seq reflects the order the recipient saw
+  // them", which is stable regardless of how they filter later.
+  //
+  // v2.3.0 Codex HIGH #1 patch — atomic seq assignment:
+  //   1. BEGIN IMMEDIATE (via better-sqlite3's .immediate() modifier)
+  //      serializes cross-process concurrent readers at the SQLite file
+  //      lock — no two processes can both think next_seq=N and stamp
+  //      different rows with the same N.
+  //   2. Mailbox.next_seq is READ INSIDE the tx so every tx sees the
+  //      latest committed counter, not a pre-tx snapshot.
+  //   3. `next` advances ONLY on successful UPDATE (r.changes === 1).
+  //      Rows already stamped by a concurrent reader no-op here and we
+  //      skip — their seq stays the one the other reader assigned.
+  //   4. Mailbox.next_seq persists the actual claim count, not the
+  //      candidate count.
+  // Together these guarantee per-recipient seq uniqueness + strict
+  // monotonicity under cross-process concurrent reads.
+  const unseqIds = rows.filter((r) => r.seq == null).map((r) => r.id);
+  if (unseqIds.length > 0) {
+    // Ensure the mailbox row exists. INSERT OR IGNORE is idempotent +
+    // safe outside the immediate tx — concurrent callers converge on
+    // the same row id via the UNIQUE INDEX on agent_name.
+    getOrCreateMailbox(agentName);
+    const claimedByMe: Map<string, { seq: number; epoch: string }> = new Map();
+    const assignTx = db.transaction(() => {
+      const mailbox = db
+        .prepare("SELECT mailbox_id, epoch, next_seq FROM mailbox WHERE agent_name = ?")
+        .get(agentName) as { mailbox_id: string; epoch: string; next_seq: number } | undefined;
+      if (!mailbox) return;
+      let next = mailbox.next_seq;
+      const upd = db.prepare(
+        "UPDATE messages SET seq = ?, epoch = ? WHERE id = ? AND seq IS NULL",
+      );
+      for (const id of unseqIds) {
+        const candidateSeq = next + 1;
+        const r = upd.run(candidateSeq, mailbox.epoch, id);
+        if (r.changes === 1) {
+          next = candidateSeq;
+          claimedByMe.set(id, { seq: candidateSeq, epoch: mailbox.epoch });
+        }
+        // r.changes === 0 → another concurrent reader already stamped
+        // this row. Skip without advancing next — that row's seq is
+        // authoritative (the other reader's assigned value).
+      }
+      if (next !== mailbox.next_seq) {
+        db.prepare("UPDATE mailbox SET next_seq = ? WHERE mailbox_id = ?").run(
+          next,
+          mailbox.mailbox_id,
+        );
+      }
+    });
+    // Use BEGIN IMMEDIATE via better-sqlite3's .immediate() modifier so
+    // cross-process concurrent readers serialize at tx START, not at
+    // the first write. Fall back to the default mode on drivers that
+    // don't expose .immediate() (the wasm driver is single-connection
+    // so cross-process races don't apply).
+    const immediateCaller = (assignTx as unknown as { immediate?: () => void }).immediate;
+    if (typeof immediateCaller === "function") {
+      (assignTx as unknown as { immediate: () => void }).immediate();
+    } else {
+      assignTx();
+    }
+    // Hydrate the rows we claimed with the freshly-assigned seq/epoch.
+    // For rows another reader claimed, fetch their committed values via
+    // a targeted SELECT so the caller still sees consistent seqs.
+    const unclaimedByMe = unseqIds.filter((id) => !claimedByMe.has(id));
+    if (unclaimedByMe.length > 0) {
+      const refresh = db.prepare(
+        `SELECT id, seq, epoch FROM messages WHERE id IN (${unclaimedByMe.map(() => "?").join(",")})`,
+      );
+      const fresh = refresh.all(...unclaimedByMe) as { id: string; seq: number; epoch: string }[];
+      for (const r of fresh) claimedByMe.set(r.id, { seq: r.seq, epoch: r.epoch });
+    }
+    for (const r of rows) {
+      const hit = claimedByMe.get(r.id);
+      if (hit) {
+        r.seq = hit.seq;
+        r.epoch = hit.epoch;
+      }
+    }
   }
 
   // v1.7: decrypt content field on read (safe-no-op for plaintext rows)
