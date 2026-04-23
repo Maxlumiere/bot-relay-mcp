@@ -97,12 +97,40 @@ The asterisk marks the currently-active instance. `--json` emits machine-readabl
 
 ## Lock-file semantics
 
-Only **one daemon per instance_id** may run at a time. On start, the daemon writes its PID to `<instance_dir>/instance.pid`. A second daemon attempting to use the same `instance_id`:
+Only **one daemon per instance_id** may run at a time. On start, the daemon atomically creates `<instance_dir>/instance.pid` via `openSync(..., 'wx')` and writes its PID.
 
-- If the PID in the file is alive → **refuses to start** with a clear error + guidance.
-- If the PID in the file is dead (stale file, prior crash) → reclaims the lock + logs a warning.
+### When the lock is already held
+
+- **Live holder** (PID in the file is alive) → the new daemon **refuses to start** with a clear error + the holder's PID.
+- **Dead holder, cross-user, or unreadable file** → the new daemon **refuses to start** and prints manual-cleanup instructions:
+
+  ```
+  instance "<id>" has a stale pidfile (PID <n>, not alive).
+  Run `rm <path>` after confirming no daemon is alive, then retry.
+  ```
+
+The operator confirms no daemon is actually running + removes the pidfile manually.
 
 Two daemons with DIFFERENT `instance_id`s coexist freely — each holds its own lock.
+
+### Why auto-reclaim was removed (v2.4.0 SECURITY hardening)
+
+An earlier v2.4.0 iteration auto-reclaimed stale pidfiles (dead PID → `unlink` + retry). Codex's re-audit reproduced a TOCTOU race:
+
+1. Initial `instance.pid` contains PID 999999 (stale).
+2. Process A: atomic open fails EEXIST → reads PID → probes dead → **pauses** just before the unlink.
+3. Process B: same path → unlinks → wins atomic open → writes its **live** PID.
+4. Process A resumes → unlinks B's live pidfile → wins atomic open → writes its own PID.
+5. Both A and B believe they hold the lock. Invariant violated.
+
+The auto-reclaim path cannot be made safe under concurrent acquisition without an atomic "test-and-replace this specific prior content" primitive, which POSIX `fs` doesn't provide. Auto-reclaim is deferred to v2.5+ with a proper primitive (fcntl lock on the open fd, or a directory-based lock) and a regression mirroring Codex's exact schedule. For v2.4.0, we fail-closed on every EEXIST — slow UX, provably safe.
+
+### Manual-cleanup workflow
+
+1. The daemon refuses to start and prints the stale pidfile path.
+2. Verify no daemon is alive: `ps -p <pid>` (the PID is in the error message).
+3. If confirmed dead: `rm <path>` (the `rm` command is in the error message verbatim).
+4. Retry the daemon.
 
 ## Coexistence guarantees
 

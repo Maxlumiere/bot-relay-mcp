@@ -243,15 +243,30 @@ export function resolveInstanceConfigPath(): string {
  * callable; fail-closed when another daemon holds the lock for the
  * same instance_id.
  *
- * v2.4.0 Codex HIGH #1 patch — atomic create-or-fail. The prior
- * check-then-write pattern (existsSync → readFileSync → kill(0) →
- * writeFileSync) had a race where two daemons spawning at the same
- * time both saw "no lock file" and both wrote. Switched to
- * `openSync(..., 'wx')` which fails with EEXIST at the syscall level
- * if the file already exists. On EEXIST we then inspect the existing
- * holder: live PID → refuse; stale PID → `unlinkSync + retry`
- * (bounded by a single retry to avoid infinite loops under pathological
- * concurrency). Cross-platform — `'wx'` works on every Node platform.
+ * v2.4.0 Codex HIGH #1 patch (initial): atomic create-or-fail via
+ * `openSync(..., 'wx')`. Closed the original "both daemons write"
+ * race.
+ *
+ * v2.4.0 Codex HIGH #1 patch R2 (fail-closed, SECURITY hardening):
+ * Codex re-audit reproduced a NEW TOCTOU in the R1 stale-PID reclaim
+ * path:
+ *   1. Initial pidfile contains PID 999999 (stale / dead).
+ *   2. Process A: wx → EEXIST → read pid=999999 → probe ESRCH → about to unlink.
+ *   3. Process A pauses (scheduler preemption) just before unlink.
+ *   4. Process B: wx → EEXIST → read pid=999999 → probe ESRCH → unlink → wx succeeds → writes its live PID.
+ *   5. Process A resumes → unlinks B's LIVE pidfile → wx succeeds → writes its own PID.
+ *   6. Both A and B believe they hold the lock. Invariant violated.
+ *
+ * The auto-reclaim path cannot be made safe without an atomic "test
+ * AND replace a specific prior content" primitive, which POSIX fs
+ * doesn't provide. Deferred to v2.5+ with a proper primitive (fcntl
+ * lock on the open fd, or a directory-based lock) + a regression
+ * mirroring the exact Codex schedule.
+ *
+ * For v2.4.0: **fail-closed on every EEXIST**, regardless of PID
+ * liveness. Operator manually removes the stale pidfile after
+ * confirming no daemon is alive. "Slow UX, fast ship, provably safe."
+ * Cross-platform.
  */
 export function acquireInstanceLock(
   instanceId: string,
@@ -262,74 +277,68 @@ export function acquireInstanceLock(
   const pidFile = path.join(dir, "instance.pid");
   const myPid = String(process.pid);
 
-  // One-shot atomic create. On EEXIST we inspect + possibly reclaim
-  // + retry ONCE. Second failure → the other holder is authoritative.
-  let attempts = 0;
-  while (true) {
-    attempts += 1;
+  try {
+    const fd = fs.openSync(pidFile, "wx", 0o600);
     try {
-      const fd = fs.openSync(pidFile, "wx", 0o600);
-      try {
-        fs.writeSync(fd, myPid);
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      // Success — we're the exclusive holder.
-      break;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw err; // some other filesystem error — surface it
-      }
-      if (attempts > 1) {
-        // We already reclaimed once and another caller sniped us.
-        // Fail-closed; they can rerun.
-        throw new Error(
-          `instance "${instanceId}" is already running (racing for the lock).`,
-        );
-      }
-      // Inspect existing holder.
-      let pid = -1;
-      try {
-        const raw = fs.readFileSync(pidFile, "utf-8").trim();
-        pid = parseInt(raw, 10);
-      } catch {
-        // Read failed — treat as reclaimable.
-      }
-      if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) {
+      fs.writeSync(fd, myPid);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw err; // some other filesystem error — surface it
+    }
+    // EEXIST — a pidfile is already in place. Read the holder + probe
+    // liveness for a BETTER error message, but NEVER auto-reclaim.
+    // The R1 unlink-on-stale path has a TOCTOU race Codex reproduced:
+    // a concurrent acquirer can slip in between our probe + our
+    // unlink, and we'd delete THEIR live pidfile. Fail-closed.
+    let holderDesc = "unknown holder";
+    let holderAlive: boolean | "unknown" = "unknown";
+    try {
+      const raw = fs.readFileSync(pidFile, "utf-8").trim();
+      const pid = parseInt(raw, 10);
+      if (Number.isFinite(pid) && pid > 0) {
+        holderDesc = `PID ${pid}`;
         try {
           process.kill(pid, 0);
-          // Alive → refuse.
-          throw new Error(
-            `instance "${instanceId}" is already running (PID ${pid}). ` +
-            `Stop that daemon first, or use a distinct --instance-id.`,
-          );
+          holderAlive = true;
         } catch (probeErr) {
-          if ((probeErr as NodeJS.ErrnoException).code === "ESRCH") {
-            // Dead — reclaim.
-            log.warn(
-              `[instance] reclaiming stale PID file for ${instanceId} (PID ${pid} dead)`,
-            );
-          } else if ((probeErr as Error).message?.includes("is already running")) {
-            throw probeErr;
-          }
-          // Other kill() error paths (EPERM etc.) — treat conservatively
-          // as "cannot prove dead" and refuse.
-          else if ((probeErr as NodeJS.ErrnoException).code === "EPERM") {
-            throw new Error(
-              `instance "${instanceId}" appears to be running as another user (PID ${pid}). ` +
-              `Cannot signal; refusing to reclaim.`,
-            );
-          }
+          const code = (probeErr as NodeJS.ErrnoException).code;
+          if (code === "ESRCH") holderAlive = false;
+          else if (code === "EPERM") holderAlive = "unknown"; // cross-user
         }
       }
-      // Reclaim: unlink + loop once. If the unlink races with a
-      // concurrent sniper our next `wx` will hit EEXIST and exit via
-      // the attempts>1 branch.
-      try {
-        fs.unlinkSync(pidFile);
-      } catch { /* best-effort */ }
+    } catch {
+      /* unreadable file — leave holderDesc/holderAlive at defaults */
     }
+    if (holderAlive === true) {
+      throw new Error(
+        `instance "${instanceId}" is already running (${holderDesc}). ` +
+        `Stop that daemon first, or use a distinct --instance-id.`,
+      );
+    }
+    if (holderAlive === false) {
+      log.warn(
+        `[instance] stale pidfile detected for ${instanceId} (${holderDesc} not running). ` +
+        `Auto-reclaim is DISABLED in v2.4.0 (security hardening). ` +
+        `Run: rm "${pidFile}" after confirming no daemon is alive, then retry.`,
+      );
+      throw new Error(
+        `instance "${instanceId}" has a stale pidfile (${holderDesc}, not alive). ` +
+        `Run \`rm "${pidFile}"\` after confirming no daemon is alive, then retry. ` +
+        `Auto-reclaim was removed in v2.4.0 because the unlink step had a TOCTOU ` +
+        `race under concurrent acquisition (see docs/multi-instance.md).`,
+      );
+    }
+    // holderAlive === "unknown" — cross-user EPERM or unreadable file.
+    // Fail-closed.
+    throw new Error(
+      `instance "${instanceId}" has a pidfile whose holder liveness cannot be determined ` +
+      `(${holderDesc}; cross-user EPERM or unreadable). Refusing to acquire. ` +
+      `Investigate + manually clean up.`,
+    );
   }
 
   const release = () => {
