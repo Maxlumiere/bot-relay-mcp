@@ -39,6 +39,7 @@ import {
   GetStandupSchema,
   ExpandCapabilitiesSchema,
   SetDashboardThemeSchema,
+  PeekInboxVersionSchema,
 } from "./types.js";
 import {
   handleRegisterAgent,
@@ -104,7 +105,112 @@ import {
 import { handleSetStatus, handleHealthCheck } from "./tools/status.js";
 import { handleGetStandup } from "./tools/standup.js";
 import { handleSetDashboardTheme } from "./tools/dashboard.js";
+import { handlePeekInboxVersion } from "./tools/peek-inbox-version.js";
 import { VERSION } from "./version.js";
+
+/**
+ * v2.3.0 Part B.2 — surface-shaping.
+ *
+ * Every MCP tool declares a feature bundle. Profiles (written into
+ * config.json by `relay init --profile`) list the bundles they expose;
+ * tools outside those bundles are filtered out of `tools/list` and
+ * rejected at call time with TOOL_NOT_AVAILABLE + a hint pointing at
+ * the profile that would expose them.
+ *
+ * Bundle list (authoritative; mirrors memory/project_federation_design.md):
+ *   core           — identity + messaging + tasks + status + health + peek
+ *   webhooks       — webhook registration/list/delete
+ *   channels       — channel primitives
+ *   admin          — token rotate/revoke, dashboard theme, spawn, cap expand
+ *   managed-agents — managed-agent standup synthesis
+ *   federation     — reserved for v2.3.x hub/edge (empty in v2.3.0)
+ *
+ * A tool that doesn't appear here is a hard bug (new tool forgot to
+ * claim a bundle). The surface-shaping filter treats unknown tools as
+ * "core" by default so we fail open on a drift rather than silently
+ * hiding functional tools — the CI surface-shape test asserts every
+ * tool IS in this map.
+ */
+export const TOOL_BUNDLES: Record<string, string> = {
+  // core
+  register_agent: "core",
+  unregister_agent: "core",
+  discover_agents: "core",
+  send_message: "core",
+  get_messages: "core",
+  get_messages_summary: "core",
+  broadcast: "core",
+  post_task: "core",
+  post_task_auto: "core",
+  update_task: "core",
+  get_tasks: "core",
+  get_task: "core",
+  set_status: "core",
+  health_check: "core",
+  // webhooks
+  register_webhook: "webhooks",
+  list_webhooks: "webhooks",
+  delete_webhook: "webhooks",
+  // channels
+  create_channel: "channels",
+  join_channel: "channels",
+  leave_channel: "channels",
+  post_to_channel: "channels",
+  get_channel_messages: "channels",
+  // admin
+  rotate_token: "admin",
+  rotate_token_admin: "admin",
+  revoke_token: "admin",
+  expand_capabilities: "admin",
+  set_dashboard_theme: "admin",
+  spawn_agent: "admin",
+  // managed-agents
+  get_standup: "managed-agents",
+  // v2.3.0 Part C.3 — ambient-wake peek tool, a core mailbox primitive.
+  peek_inbox_version: "core",
+  // federation — reserved (empty)
+};
+
+export function isToolVisible(
+  toolName: string,
+  bundles: string[],
+  hiddenList: string[] = [],
+): boolean {
+  if (hiddenList.includes(toolName)) return false;
+  const bundle = TOOL_BUNDLES[toolName] ?? "core"; // fail-open on drift
+  // health_check + discover_agents are always visible — diagnostic/routing
+  // primitives every profile needs (ops, debugging, first-run discovery).
+  if (toolName === "health_check" || toolName === "discover_agents") return true;
+  return bundles.includes(bundle);
+}
+
+/**
+ * v2.3.0 Part B.2 — resolve the active feature bundles + hidden list from
+ * config. Falls back to all-bundles-visible when the config is pre-v2.3.0
+ * (no profile field → no shaping applied). Deliberately permissive to
+ * avoid breaking existing installs on upgrade.
+ */
+export function resolveSurfaceShape(): { bundles: string[]; hidden: string[] } {
+  try {
+    const cfg = loadConfig() as unknown as {
+      feature_bundles?: string[];
+      tool_visibility?: { hidden?: string[] };
+    };
+    if (Array.isArray(cfg.feature_bundles) && cfg.feature_bundles.length > 0) {
+      return {
+        bundles: cfg.feature_bundles,
+        hidden: cfg.tool_visibility?.hidden ?? [],
+      };
+    }
+  } catch {
+    /* fall through — no config or invalid shape */
+  }
+  // Default: everything visible (pre-v2.3.0 install or config-less run).
+  return {
+    bundles: ["core", "webhooks", "channels", "admin", "managed-agents"],
+    hidden: [],
+  };
+}
 
 export function createServer(): Server {
   const server = new Server(
@@ -119,8 +225,18 @@ export function createServer(): Server {
     }
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const { bundles, hidden } = resolveSurfaceShape();
+    const all = ALL_TOOLS_DEFINITION;
+    return {
+      tools: all.filter((t) => isToolVisible(t.name, bundles, hidden)),
+    };
+  });
+
+  // v2.3.0 Part B.2 — frozen tool definition list. Pulled out of the
+  // setRequestHandler closure so isToolVisible can filter it; same data
+  // shape as before, no runtime semantic change.
+  const ALL_TOOLS_DEFINITION = [
       {
         name: "register_agent",
         description:
@@ -284,8 +400,13 @@ export function createServer(): Server {
           "v2.2.1: set the server-side default dashboard theme. Modes: 'catppuccin' (default Mocha palette) | 'dark' (tool-neutral) | 'light' (tool-neutral) | 'custom' (requires custom_json with all 13 CSS tokens). Newly-connecting dashboard clients read this on first visit only — each client's localStorage preference beats the server default locally (path-1 client-only design). No WebSocket push; already-connected dashboards surface the change on full reload.",
         inputSchema: zodToJsonSchema(SetDashboardThemeSchema),
       },
-    ],
-  }));
+      {
+        name: "peek_inbox_version",
+        description:
+          "v2.3.0 Phase 4s: cheap non-mutating observation of an agent's mailbox. Returns {mailbox_id, epoch, last_seq, total_messages_count, total_unread_count}. WATCH total_unread_count for new-mail detection — it advances on every send_message. last_seq tracks read-cursor progress (only advances when the recipient calls get_messages). Epoch rotates on backup/restore; a client whose cached epoch no longer matches MUST reset its local last_seen_seq to 0 and re-drain from scratch.",
+        inputSchema: zodToJsonSchema(PeekInboxVersionSchema),
+      },
+    ];
 
   // Map of tool name -> which rate-limit bucket it lives in
   const RATE_BUCKETS: Record<string, "messages" | "tasks" | "spawns" | null> = {
@@ -418,6 +539,8 @@ export function createServer(): Server {
         return handleExpandCapabilities(ExpandCapabilitiesSchema.parse(args));
       case "set_dashboard_theme":
         return handleSetDashboardTheme(SetDashboardThemeSchema.parse(args));
+      case "peek_inbox_version":
+        return handlePeekInboxVersion(PeekInboxVersionSchema.parse(args));
       default:
         return {
           content: [
@@ -703,6 +826,50 @@ export function createServer(): Server {
     // RELAY_LOG_LEVEL=debug. Cheap — just a formatted string builder guarded
     // by the level check inside the logger.
     log.debug(`[dispatch] tool=${name} claimed_agent=${claimedAgent ?? "<unknown>"}`);
+
+    // v2.3.0 Part B.2 — surface-shaping guard. A tool hidden by the active
+    // profile's feature_bundles / tool_visibility is rejected with a
+    // stable error_code + a hint naming the profile that would expose it.
+    // Runs BEFORE auth so the caller learns "not available in this
+    // profile" instead of "bad token" — clearer operator UX. Hidden tools
+    // are also already omitted from tools/list so this path fires only
+    // when a client crafted a call by name directly.
+    {
+      const { bundles, hidden } = resolveSurfaceShape();
+      if (!isToolVisible(name, bundles, hidden)) {
+        const requiredBundle = TOOL_BUNDLES[name] ?? "core";
+        const profileHint =
+          requiredBundle === "admin" || requiredBundle === "webhooks" || requiredBundle === "channels"
+            ? "team"
+            : requiredBundle === "managed-agents"
+              ? "team"
+              : "solo";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: `Tool "${name}" is not available under the active profile.`,
+                  error_code: ERROR_CODES.TOOL_NOT_AVAILABLE,
+                  hint:
+                    `Tool requires feature bundle "${requiredBundle}". ` +
+                    `Re-run \`relay init --profile=${profileHint} --force\` ` +
+                    `or edit ~/.bot-relay/config.json to add "${requiredBundle}" ` +
+                    `to feature_bundles.`,
+                  tool: name,
+                  required_bundle: requiredBundle,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
 
     // v1.7: auth + capability gate, before rate limit (fail early on bad creds)
     // v2.1 Phase 4q MED #3: auth MUST run before any operation that keys on

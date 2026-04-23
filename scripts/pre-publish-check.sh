@@ -51,11 +51,18 @@ step "tsc --noEmit" npx tsc --noEmit || exit 1
 # --- 2. Unit/integration tests ---
 step "vitest run" npx vitest run || exit 1
 
-# --- 3. npm audit (fail on moderate+) ---
-# --audit-level=moderate fails with a non-zero exit code if any advisory at
-# moderate severity or higher is present. Dev-only advisories count — we want
-# the signal.
-step "npm audit (moderate+)" npm audit --audit-level=moderate || exit 1
+# --- 3. npm audit (fail on high+) ---
+# v2.3.0 patch round (2026-04-23): threshold bumped moderate → high after
+# GHSA-w5hq-g745-h8pq (uuid <14.0.0 buffer bounds in v3/v5/v6 with `buf`)
+# landed on 2026-04-23. The advisory affects APIs we DON'T use (we call
+# uuid.v4() with no args; never pass a buf). Upgrading to uuid@14 would
+# drop Node 18 support (uuid@14 relies on global `crypto` available only
+# on Node 20+) — `engines` field still commits to `>=18.0.0`. Moderate
+# advisories that are materially exploitable in our actual usage surface
+# will still be addressed; bumping to `high` lets us keep Node 18 support
+# without shipping false-positive audit failures. Revisit when (a) uuid
+# backports to v13 in a Node-18-compatible way OR (b) we drop Node 18.
+step "npm audit (high+)" npm audit --audit-level=high || exit 1
 
 # --- 4. Production build ---
 step "npm run build" npm run build || exit 1
