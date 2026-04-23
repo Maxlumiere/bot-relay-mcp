@@ -1,5 +1,61 @@
 # Changelog
 
+## v2.4.0 — 2026-04-23 — traffic replay + per-instance isolation + MCP prompts/resources split
+
+Three bundled parts per the v2.4.0 consolidated brief, dispatched the moment v2.3.0 shipped:
+
+- **Part D** — A.3 traffic-replay harness (deferred from v2.3.0 at the brief's explicit escape-hatch).
+- **Part E** — per-instance local isolation (per `memory/project_federation_design.md` v2.2 roadmap, re-slotted to v2.4 since v2.3 took profiles + ambient-wake bandwidth).
+- **Part F** — MCP prompts + resources split (the federation memo's "tools/resources/prompts split more aggressively" recommendation).
+
+Schema unchanged (v11 stays). Tool count unchanged (30 stays — prompts + resources are separate MCP capabilities, not tools). CLI subcommands 11 → 13 (`relay list-instances` + `relay use-instance`). Protocol `2.3.0 → 2.4.0`.
+
+### Part D — traffic-replay harness
+
+- **D.1 — `src/transport/traffic-recorder.ts`**. Env-gated via `RELAY_RECORD_TRAFFIC=<path>`. Records every MCP tool call as a JSONL line (`{ts, tool, args, response, transport, source_ip}`). `fsync`-per-write for durability. Sensitive fields (`agent_token`, `plaintext_token`, `recovery_token`, `http_secret`, `password`, `secret`) redacted at capture time. 1 GB safety cap — disables capture when log exceeds that + logs a warn. Never throws.
+- **D.2 — `scripts/replay-relay-traffic.ts`**. CLI: `npx tsx scripts/replay-relay-traffic.ts <log.jsonl>`. Spins an isolated relay, re-issues every recorded call, compares responses. Volatile fields (UUIDs, timestamps, tokens, seq/epoch) normalized to `<volatile>` sentinels; prose-embedded UUIDs + ISO timestamps normalized to `<uuid>` / `<iso>`. Exit 0 on full parity, 1 on any divergence. Internal `_requestHandlers` accessor on the MCP server routes through the same dispatch path as the live stdio/http transports.
+- **D.3 — tests + docs**. 8 cases in `tests/v2-4-0-traffic-replay.test.ts` covering record disable/enable, redaction, 1 GB cap, replay parity, divergence detection, volatile-field normalization, end-to-end recorded-then-replayed round-trip. `docs/traffic-replay.md` explains when to use + when NOT to.
+
+### Part E — per-instance local isolation
+
+Per Codex federation design memo: isolation unit is `instance_id` (UUID), NOT per-$USER. v2.4.0 supports COEXISTENCE of multiple daemons on the same machine; cross-instance messaging is still out of scope (v2.5+ federation territory).
+
+- **E.1 — `src/instance.ts`**. Instance-ID model: UUID per instance, `~/.bot-relay/instances/<id>/` subdir with `instance.json` metadata, `relay.db`, `config.json`, `instance.pid` lock. Path-traversal guard on `instance_id` (`/^[A-Za-z0-9._-]+$/`). `RELAY_HOME` env-override for test harnesses. Lock file pattern: `acquireInstanceLock` with PID liveness check (ESRCH → stale, reclaim + warn). `resolveInstanceDbPath()` returns per-instance path in multi-instance mode, falls back to legacy `~/.bot-relay/relay.db` otherwise. Symlink-or-file active-instance pointer (lstat-aware, handles dangling symlinks). Wired into `src/db.ts getDbPath` — `RELAY_DB_PATH` still wins as explicit override; otherwise per-instance path; otherwise legacy flat layout.
+- **E.2 — two-instance coexistence**. 12 tests in `tests/v2-4-0-per-instance-isolation.test.ts` covering legacy-mode default, `RELAY_INSTANCE_ID` flip, metadata round-trip, path-traversal rejection, separate DB paths, messages non-bleeding, lock-file collision, stale-PID reclaim, `listInstances`, `setActiveInstance` + `resolveActiveInstanceId`.
+- **E.3 — CLI + docs**. Two new subcommands: `relay list-instances` (with `--json`) and `relay use-instance <id>` (kubectl-style). `relay init` gains `--instance-id=<id>` and `--multi-instance` (auto-generates UUID) flags. CLI subcommand count 11 → 13. `docs/multi-instance.md` explains the model + when to use + backward-compat.
+- **E.4 — backward compatibility**. Operators with existing `~/.bot-relay/relay.db` see NO behavior change. Multi-instance is strictly opt-in via env or CLI flag. 8 additional tests in `tests/v2-4-0-instance-cli.test.ts` covering the CLI surface + legacy/multi coexistence.
+
+### Part F — MCP prompts + resources split
+
+Tool count stays 30 — neither prompts nor resources add tools.
+
+- **F.1 — `src/mcp-prompts.ts`**. Three shipped prompts: `recover-lost-token`, `invite-worker`, `rotate-compromised-agent`. Each is a `McpPromptDefinition` with `name`, `description`, `arguments[]`, and a `render(args)` function that returns the user-role message text. Parameter substitution validated at call time (missing required arg throws a clear error).
+- **F.2 — `src/mcp-resources.ts`**. Three shipped resources: `relay://current-state` (agents + active tasks + pending counts + schema_version), `relay://recent-activity` (last 50 audit entries with `params_json` stripped), `relay://agent-graph` (nodes + message-edges + task-edges for visualization).
+- **F.3 — capabilities**. `createServer` advertises `prompts: {}` + `resources: {}` alongside `tools: {}` in the initial capabilities exchange. Request handlers registered for `prompts/list`, `prompts/get`, `resources/list`, `resources/read`.
+- 11 tests in `tests/v2-4-0-mcp-prompts-resources.test.ts` covering prompt enumeration, parameter substitution, missing/unknown-prompt errors, all-prompts-render smoke, resource enumeration, current-state/agent-graph content shapes, unknown-URI errors, server capability declaration. `docs/mcp-prompts.md` operator guide.
+
+### Tests
+
+- `tests/v2-4-0-traffic-replay.test.ts` (D) — 8 cases.
+- `tests/v2-4-0-per-instance-isolation.test.ts` (E core) — 12 cases.
+- `tests/v2-4-0-instance-cli.test.ts` (E CLI) — 8 cases.
+- `tests/v2-4-0-mcp-prompts-resources.test.ts` (F) — 11 cases.
+
+**Total: 1087 tests pass** (1048 v2.3.0 baseline + 39 new v2.4.0).
+
+### Release hygiene
+
+- `package.json` 2.3.0 → 2.4.0.
+- `src/protocol.ts` 2.3.0 → 2.4.0.
+- New files: `src/transport/traffic-recorder.ts`, `scripts/replay-relay-traffic.ts`, `src/instance.ts`, `src/cli/list-instances.ts`, `src/cli/use-instance.ts`, `src/mcp-prompts.ts`, `src/mcp-resources.ts`, 3 docs, 4 test files.
+- `devlog/071-v2.4.0-consolidated-bundle.md` — assumptions-first.
+
+### Hall of Fame
+
+- **Maxime** — the "keep victra-build moving the moment v2.3.0 ships" directive, plus the standing "stack as much as possible in one go" pattern. v2.4.0 dispatch fired within minutes of the v2.3.0 ship ceremony completing.
+- **Codex** — federation design memo (2026-04-19) that locked `instance_id` (not $USER) as the per-instance isolation unit + the MCP tools/resources/prompts split recommendation.
+- **The v2.3.0 Part A infrastructure** — property tests + consistency probe — made the A.3 traffic-replay harness possible without re-deriving ground-truth invariants. Traffic replay now stands alongside them as permanent bug-finding infra.
+
 ## v2.3.0 — 2026-04-22 — systemic bug-finding + profiles + Phase 4s ambient wake
 
 ### ⚠ Codex pre-ship audit patches (applied 2026-04-23)
