@@ -223,14 +223,35 @@ export function resolveInstanceDbPath(): string {
 }
 
 /**
+ * v2.4.0 Codex HIGH #2 patch — resolve the effective config path for
+ * the active instance. Mirrors `resolveInstanceDbPath` exactly so DB
+ * + config always live together (no split-brain where DB nests but
+ * config stays flat). `RELAY_CONFIG_PATH` wins if set.
+ */
+export function resolveInstanceConfigPath(): string {
+  if (process.env.RELAY_CONFIG_PATH) return process.env.RELAY_CONFIG_PATH;
+  const id = resolveActiveInstanceId();
+  if (!id) return path.join(botRelayRoot(), "config.json");
+  const dir = instanceDir(id);
+  if (!dir) return path.join(botRelayRoot(), "config.json");
+  return path.join(dir, "config.json");
+}
+
+/**
  * Acquire the per-instance lock. Writes a PID file at
  * `<instance_dir>/instance.pid`. Returns a handle with a `release()`
  * callable; fail-closed when another daemon holds the lock for the
  * same instance_id.
  *
- * Lock semantics: if the PID file exists + the listed PID is alive
- * (via `kill -0`), acquire fails. Stale PID files (process dead)
- * are reclaimed.
+ * v2.4.0 Codex HIGH #1 patch — atomic create-or-fail. The prior
+ * check-then-write pattern (existsSync → readFileSync → kill(0) →
+ * writeFileSync) had a race where two daemons spawning at the same
+ * time both saw "no lock file" and both wrote. Switched to
+ * `openSync(..., 'wx')` which fails with EEXIST at the syscall level
+ * if the file already exists. On EEXIST we then inspect the existing
+ * holder: live PID → refuse; stale PID → `unlinkSync + retry`
+ * (bounded by a single retry to avoid infinite loops under pathological
+ * concurrency). Cross-platform — `'wx'` works on every Node platform.
  */
 export function acquireInstanceLock(
   instanceId: string,
@@ -239,35 +260,78 @@ export function acquireInstanceLock(
   if (!dir) throw new Error("acquireInstanceLock requires non-null instance_id");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const pidFile = path.join(dir, "instance.pid");
-  if (fs.existsSync(pidFile)) {
+  const myPid = String(process.pid);
+
+  // One-shot atomic create. On EEXIST we inspect + possibly reclaim
+  // + retry ONCE. Second failure → the other holder is authoritative.
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
     try {
-      const raw = fs.readFileSync(pidFile, "utf-8").trim();
-      const pid = parseInt(raw, 10);
+      const fd = fs.openSync(pidFile, "wx", 0o600);
+      try {
+        fs.writeSync(fd, myPid);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      // Success — we're the exclusive holder.
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw err; // some other filesystem error — surface it
+      }
+      if (attempts > 1) {
+        // We already reclaimed once and another caller sniped us.
+        // Fail-closed; they can rerun.
+        throw new Error(
+          `instance "${instanceId}" is already running (racing for the lock).`,
+        );
+      }
+      // Inspect existing holder.
+      let pid = -1;
+      try {
+        const raw = fs.readFileSync(pidFile, "utf-8").trim();
+        pid = parseInt(raw, 10);
+      } catch {
+        // Read failed — treat as reclaimable.
+      }
       if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) {
-        // Check if the process is alive.
         try {
           process.kill(pid, 0);
+          // Alive → refuse.
           throw new Error(
             `instance "${instanceId}" is already running (PID ${pid}). ` +
             `Stop that daemon first, or use a distinct --instance-id.`,
           );
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-            // Stale PID file — reclaim.
+        } catch (probeErr) {
+          if ((probeErr as NodeJS.ErrnoException).code === "ESRCH") {
+            // Dead — reclaim.
             log.warn(
               `[instance] reclaiming stale PID file for ${instanceId} (PID ${pid} dead)`,
             );
-          } else {
-            throw err;
+          } else if ((probeErr as Error).message?.includes("is already running")) {
+            throw probeErr;
+          }
+          // Other kill() error paths (EPERM etc.) — treat conservatively
+          // as "cannot prove dead" and refuse.
+          else if ((probeErr as NodeJS.ErrnoException).code === "EPERM") {
+            throw new Error(
+              `instance "${instanceId}" appears to be running as another user (PID ${pid}). ` +
+              `Cannot signal; refusing to reclaim.`,
+            );
           }
         }
       }
-    } catch (err) {
-      if ((err as Error).message?.includes("is already running")) throw err;
-      // Parse error or other read failure → treat as reclaimable.
+      // Reclaim: unlink + loop once. If the unlink races with a
+      // concurrent sniper our next `wx` will hit EEXIST and exit via
+      // the attempts>1 branch.
+      try {
+        fs.unlinkSync(pidFile);
+      } catch { /* best-effort */ }
     }
   }
-  fs.writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
+
   const release = () => {
     try {
       const raw = fs.readFileSync(pidFile, "utf-8").trim();
