@@ -47,6 +47,26 @@ export interface InstanceMetadata {
   label: string | null;
 }
 
+/**
+ * v2.4.0 Codex R3 MED — POSIX-safe shell single-quote escape for
+ * printed-remediation strings. The lock function embeds the pidfile
+ * path into an operator-facing `rm …` command in its error text.
+ * Under `RELAY_HOME=/tmp/bad"$(touch OOPS)"`, a naive `rm "${pidFile}"`
+ * would let a shell expand the command substitution if the operator
+ * copy-pasted it. Escape strategy:
+ *   - Wrap the value in single quotes.
+ *   - Inside: replace every `'` with `'\''` (close quote, escaped
+ *     literal quote, reopen quote). This is the canonical POSIX-safe
+ *     approach and handles $(), backticks, $VAR, newlines, spaces.
+ *
+ * Exported for tests that pin this behavior (H1.3 hostile-path
+ * regression). Keep in sync with any future error-message
+ * remediation helpers.
+ */
+export function shellSingleQuoteEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function botRelayRoot(): string {
   // RELAY_HOME env var is a test-friendly override that lets a suite
   // point the whole per-instance namespace at a tmp dir without
@@ -320,14 +340,15 @@ export function acquireInstanceLock(
       );
     }
     if (holderAlive === false) {
+      const rmCmd = `rm -- ${shellSingleQuoteEscape(pidFile)}`;
       log.warn(
         `[instance] stale pidfile detected for ${instanceId} (${holderDesc} not running). ` +
         `Auto-reclaim is DISABLED in v2.4.0 (security hardening). ` +
-        `Run: rm "${pidFile}" after confirming no daemon is alive, then retry.`,
+        `Run: ${rmCmd} after confirming no daemon is alive, then retry.`,
       );
       throw new Error(
         `instance "${instanceId}" has a stale pidfile (${holderDesc}, not alive). ` +
-        `Run \`rm "${pidFile}"\` after confirming no daemon is alive, then retry. ` +
+        `Run \`${rmCmd}\` after confirming no daemon is alive, then retry. ` +
         `Auto-reclaim was removed in v2.4.0 because the unlink step had a TOCTOU ` +
         `race under concurrent acquisition (see docs/multi-instance.md).`,
       );
