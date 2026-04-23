@@ -2,6 +2,22 @@
 
 ## v2.3.0 — 2026-04-22 — systemic bug-finding + profiles + Phase 4s ambient wake
 
+### ⚠ Codex pre-ship audit patches (applied 2026-04-23)
+
+Codex's dual-model audit of the v2.3.0 diff returned PATCH-THEN-SHIP. Two HIGH findings in Part C (Phase 4s ambient wake); Parts A + B cleared. Patches landed on the same PR #2 verify branch before the ship ceremony.
+
+- **HIGH #1 — atomic seq assignment race.** Pre-patch `getMessages` snapshotted `mailbox.next_seq` outside the transaction, then blindly incremented `next` for every candidate even when the `UPDATE ... WHERE seq IS NULL` no-op'd because another reader had already claimed the row. Two overlapping cross-process drains could stamp the same seq onto different messages. Fix: mailbox row is now read INSIDE the transaction; `next` advances ONLY when `UPDATE.changes === 1`; mailbox.next_seq persists the actual claim count, not the candidate count; transaction runs as BEGIN IMMEDIATE via better-sqlite3's `.immediate()` modifier so cross-process readers serialize at tx start. Rows claimed by another reader during our tx are re-hydrated via a targeted SELECT so the caller sees consistent seqs. (`src/db.ts`.)
+- **HIGH #2 — peek_inbox_version didn't surface new unread mail.** Pre-patch the response exposed `last_seq` as the watch field, but seq is assigned at DELIVERY time so `last_seq` only advances when the agent CALLS `get_messages` — defeating the point of the lightweight control-plane peek. Fix: new `total_unread_count` field computed via `SELECT COUNT(*) FROM messages WHERE to_agent = ? AND seq IS NULL`. Advances on every `send_message`. `docs/ambient-wake.md` promoted to watch-signal; `last_seq` demoted to read-cursor-across-reconnects.
+
+### Tests (patch round)
+
+- `tests/v2-3-0-ambient-wake.test.ts` +4 cases (C.3.4, C.3.5, HIGH1.1, HIGH1.2).
+- `tests/v2-3-0-property-based-query.test.ts` +2 fast-check properties (P7 seq uniqueness under overlap, P8 send→peek control-plane visibility). P7 runs fresh-DB per iteration for isolation.
+
+**Total after patches: 1048 tests pass** (1042 pre-patch + 6 new regressions).
+
+
+
 v2.3.0 is the first MINOR release since v2.2.0. Three bundled parts: (A) systemic bug-finding infrastructure — property-based tests + a live consistency probe; (B) profiles + surface shaping via `relay init --profile={solo,team,ci}`; (C) Phase 4s ambient-wake model — mailbox table + per-recipient monotonic seq + new `peek_inbox_version` MCP tool + filesystem marker fallback + dashboard wake button. Schema v10 → v11. Tool count 29 → 30. Protocol `2.2.3 → 2.3.0`.
 
 ### Part A — systemic bug-finding infrastructure

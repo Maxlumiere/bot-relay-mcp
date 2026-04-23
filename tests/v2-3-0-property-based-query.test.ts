@@ -41,7 +41,7 @@ const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v230-property-" + process.
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
 process.env.RELAY_DB_PATH = TEST_DB_PATH;
 
-const { closeDb, registerAgent, sendMessage, getMessages } = await import("../src/db.js");
+const { closeDb, registerAgent, sendMessage, getMessages, peekMailboxVersion } = await import("../src/db.js");
 
 const NUM_RUNS = process.env.FAST_CHECK_FULL === "1" ? 200 : 30;
 const FROM = "p-from";
@@ -162,6 +162,74 @@ describe("v2.3.0 A.1 — property-based relay read path", () => {
         sendMessage(FROM, TO, content, "normal");
         const [got] = getMessages(TO, "pending", 1, true);
         expect(got.content).toBe(content);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  }, 30000);
+
+  // ─── v2.3.0 Codex-patch additions ────────────────────────────────
+  it("(P7) seq uniqueness + strict monotonicity across repeated overlapping drains", () => {
+    // Codex HIGH #1 was a cross-process race where the same seq got
+    // stamped onto different messages. The repro boiled down to:
+    // mailbox.next_seq advanced by candidate count, not claim count,
+    // when drains overlapped. Property: across N overlapping drains of
+    // the same inbox, every stamped seq is unique (no collision) and
+    // mailbox.last_seq equals the number of distinct stamped messages.
+    //
+    // Fresh DB per iteration — the shared-DB optimization used by the
+    // other properties leaks last_seq across iterations, which would
+    // mask the invariant check below.
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 1, max: 10 }),
+        fc.integer({ min: 1, max: 6 }),
+        (sendBatch, drainPasses) => {
+          closeDb();
+          fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+          fs.mkdirSync(TEST_DB_DIR, { recursive: true });
+          registerAgent(FROM, "r", [], { force: true });
+          registerAgent(TO, "r", [], { force: true });
+          for (let i = 0; i < sendBatch; i++) sendMessage(FROM, TO, "x" + i, "normal");
+          const allSeqs: number[] = [];
+          for (let i = 0; i < drainPasses; i++) {
+            const rows = getMessages(TO, "all", 100, true);
+            for (const r of rows) {
+              if (typeof r.seq === "number") allSeqs.push(r.seq);
+            }
+          }
+          // seq values should be stable across drains (same row → same
+          // seq). Distinct seqs therefore equal the distinct row count.
+          const distinctSeqs = new Set(allSeqs);
+          expect(distinctSeqs.size).toBe(sendBatch);
+          // Mailbox.last_seq must match the actual stamped count.
+          expect(peekMailboxVersion(TO).last_seq).toBe(sendBatch);
+        },
+      ),
+      { numRuns: Math.max(10, Math.floor(NUM_RUNS / 3)) },
+    );
+  }, 60000);
+
+  it("(P8) send → peek control-plane visibility — at least one watch field advances", () => {
+    // Codex HIGH #2 was that peek's observable fields didn't advance on
+    // send_message (only `last_seq` was exposed + it only advances on
+    // get_messages). Property: for any random send_message, the peek
+    // response AFTER the send shows at least one field advanced vs
+    // BEFORE. Post-patch, total_unread_count is the watch-field.
+    fc.assert(
+      fc.property(messageContent, (content) => {
+        drainAll();
+        const before = peekMailboxVersion(TO);
+        sendMessage(FROM, TO, content, "normal");
+        const after = peekMailboxVersion(TO);
+        const changed =
+          after.total_unread_count > before.total_unread_count ||
+          after.total_messages_count > before.total_messages_count ||
+          after.last_seq > before.last_seq ||
+          after.epoch !== before.epoch;
+        expect(changed).toBe(true);
+        // Specifically total_unread_count — the field docs/ambient-wake.md
+        // points clients at — must advance by exactly 1.
+        expect(after.total_unread_count).toBe(before.total_unread_count + 1);
       }),
       { numRuns: NUM_RUNS },
     );

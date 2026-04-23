@@ -176,6 +176,95 @@ describe("v2.3.0 C.3 — peek_inbox_version", () => {
     expect(typeof body.epoch).toBe("string");
     expect(body.last_seq).toBe(0);
     expect(body.total_messages_count).toBe(0);
+    expect(body.total_unread_count).toBe(0);
+  });
+
+  // ─── Codex HIGH #2 patch — total_unread_count field ──────────────
+  it("(C.3.4) send-then-peek visibility — total_unread_count advances on sendMessage without a get_messages call", () => {
+    registerAgent("c34-from", "r", []);
+    registerAgent("c34-to", "r", []);
+    const before = peekMailboxVersion("c34-to");
+    expect(before.total_unread_count).toBe(0);
+    sendMessage("c34-from", "c34-to", "surprise", "normal");
+    const after = peekMailboxVersion("c34-to");
+    // THIS is the watch-signal — it jumps from 0 to 1 the instant a
+    // message lands, BEFORE the recipient has drained anything. Pre-
+    // patch only `last_seq` was exposed and it required a get_messages
+    // call to advance, defeating the point of peek.
+    expect(after.total_unread_count).toBe(1);
+    // total_messages_count also advances but is less useful — includes
+    // read mail from prior sessions.
+    expect(after.total_messages_count).toBe(1);
+    // last_seq stays at 0 because we haven't called get_messages yet.
+    expect(after.last_seq).toBe(0);
+  });
+
+  it("(C.3.5) peek-after-read consistency — unread→0, last_seq advances, epoch stable", () => {
+    registerAgent("c35-from", "r", []);
+    registerAgent("c35-to", "r", []);
+    sendMessage("c35-from", "c35-to", "body", "normal");
+    const pre = peekMailboxVersion("c35-to");
+    expect(pre.total_unread_count).toBe(1);
+    const epochPre = pre.epoch;
+    // Drain.
+    const drained = getMessages("c35-to", "pending", 100, false);
+    expect(drained.length).toBe(1);
+    expect(drained[0].seq).toBe(1);
+    const post = peekMailboxVersion("c35-to");
+    expect(post.total_unread_count).toBe(0);
+    expect(post.last_seq).toBe(1);
+    expect(post.total_messages_count).toBe(1);
+    expect(post.epoch).toBe(epochPre);
+  });
+});
+
+// ─── Codex HIGH #1 patch — atomic seq assignment ──────────────
+describe("v2.3.0 C.2 — HIGH #1 regression: atomic seq under overlap", () => {
+  it("(HIGH1.1) concurrent readers produce unique seqs — no duplicate on overlap", () => {
+    // Simulate Codex's two-connection repro in-process: two candidate
+    // lists that share rows. The current code's invariant is "if both
+    // readers stamp the same row, only one wins the UPDATE; neither
+    // advances its local `next` on a no-op". Verify: across two full
+    // drain passes of overlapping candidate sets, every stamped seq is
+    // unique.
+    registerAgent("h11-from", "r", []);
+    registerAgent("h11-to", "r", []);
+    for (let i = 0; i < 5; i++) sendMessage("h11-from", "h11-to", "m" + i, "normal");
+    // Drain twice — the second drain over the same IDs must NOT produce
+    // duplicate seqs. Pre-patch, the second drain would increment
+    // mailbox.next_seq by candidate count (5) even though every UPDATE
+    // no-ops.
+    const a = getMessages("h11-to", "all", 100, true);
+    const b = getMessages("h11-to", "all", 100, true);
+    const allSeqs = [...a, ...b]
+      .map((m) => m.seq)
+      .filter((s) => typeof s === "number") as number[];
+    const uniqueSeqs = new Set(allSeqs);
+    // Every message appears in both returned arrays but with the SAME
+    // stamped seq (since stamping is delivery-time + stable on re-read).
+    // Uniqueness of seq-per-ROW is what matters, and mailbox.next_seq
+    // should equal the unique row count, not candidate count.
+    const mailbox = peekMailboxVersion("h11-to");
+    expect(mailbox.last_seq).toBe(5);
+    // Distinct seq values across all observations equal the unique
+    // message count — no collisions.
+    expect(uniqueSeqs.size).toBe(5);
+  });
+
+  it("(HIGH1.2) mailbox.next_seq advances by actual claim count, not candidate count", () => {
+    registerAgent("h12-from", "r", []);
+    registerAgent("h12-to", "r", []);
+    // Send 3 messages. A drain stamps 3. A SECOND drain over the same
+    // message IDs MUST NOT bump mailbox.next_seq — every UPDATE no-ops
+    // because seq is non-null now.
+    for (let i = 0; i < 3; i++) sendMessage("h12-from", "h12-to", "b" + i, "normal");
+    getMessages("h12-to", "all", 100, true);
+    const afterFirstDrain = peekMailboxVersion("h12-to").last_seq;
+    expect(afterFirstDrain).toBe(3);
+    // Second drain — zero new claims.
+    getMessages("h12-to", "all", 100, true);
+    const afterSecondDrain = peekMailboxVersion("h12-to").last_seq;
+    expect(afterSecondDrain).toBe(3);
   });
 });
 

@@ -40,11 +40,22 @@ Clients maintain a local cursor:
 
 On every wake check:
 
-1. Call `peek_inbox_version({agent_name})` → `{mailbox_id, epoch, last_seq, total_messages_count}`.
+1. Call `peek_inbox_version({agent_name})` → `{mailbox_id, epoch, last_seq, total_messages_count, total_unread_count}`.
 2. Compare `epoch` to cached epoch.
-   - **Same epoch + `last_seq > cached_last_seen`** → there's new mail. Drain via `get_messages(peek=true)`.
    - **Different epoch** → DB was backed-up or restored. Reset `cached_last_seen` to 0 and drain from scratch. Update cached epoch.
-3. If nothing changed, stay idle.
+   - **Same epoch + `total_unread_count > 0`** → there's new mail addressed to this agent that hasn't been observed yet. Drain via `get_messages(peek=true)` (or `peek=false` to consume).
+   - **Same epoch + `total_unread_count === 0`** → no new mail since this agent's last drain. Stay idle.
+3. `last_seq` is secondary: use it to detect "how far have I already read" across reconnects. It only advances when the agent CALLS `get_messages` (seqs are assigned at delivery time, not at send time), so polling `last_seq` alone will never see fresh mail until you drain — that's why `total_unread_count` is the watch-signal.
+
+**Field semantics cheat sheet:**
+
+| Field | Advances on | Use for |
+| --- | --- | --- |
+| `total_unread_count` | **every `send_message`** addressed to the agent | **wake signal — watch this** |
+| `last_seq` | every `get_messages` call by the agent's session | read cursor across reconnects |
+| `total_messages_count` | every `send_message` (messages table row count) | ops telemetry (optional) |
+| `epoch` | explicit `rotateMailboxEpoch` (backup/restore) | invalidation sentinel |
+| `mailbox_id` | never (stable across sessions) | cursor durability target |
 
 ## Epoch semantics
 
@@ -73,8 +84,9 @@ Disabled by default. Cross-platform — `fs.watch` works on macOS/Linux/Windows.
   "success": true,
   "mailbox_id": "<UUID>",
   "epoch": "<UUID>",
-  "last_seq": 42,
-  "total_messages_count": 137
+  "last_seq": 42,              // read-cursor progress (advances on get_messages)
+  "total_messages_count": 137, // total rows addressed to this agent
+  "total_unread_count": 3      // rows still seq=NULL — WATCH THIS for new mail
 }
 ```
 
@@ -112,7 +124,7 @@ done
 
 ### Python / custom daemon
 
-Use `peek_inbox_version` on a 30-second interval. When the epoch changes, reset local cursor. When `last_seq > cursor`, call `get_messages` to drain.
+Use `peek_inbox_version` on a 30-second interval. When the epoch changes, reset local cursor. When `total_unread_count > 0`, call `get_messages` to drain. `last_seq` updates AFTER your drain — use it to verify "my session picked up every new mail up to seq N" across reconnects.
 
 ## Backward compatibility
 
