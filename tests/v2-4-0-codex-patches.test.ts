@@ -34,6 +34,7 @@ const {
   acquireInstanceLock,
   instanceDir,
   resolveInstanceConfigPath,
+  shellSingleQuoteEscape,
 } = await import("../src/instance.js");
 const { loadConfig } = await import("../src/config.js");
 const { getPrompt } = await import("../src/mcp-prompts.js");
@@ -121,6 +122,96 @@ describe("v2.4.0 Codex HIGH #1 — atomic lock-file", () => {
     // Non-numeric content — holder unparseable.
     fs.writeFileSync(path.join(dir, "instance.pid"), "not-a-pid");
     expect(() => acquireInstanceLock(id)).toThrow(/cannot be determined|stale pidfile/);
+  });
+
+  it("(H1.3 R3) hostile pidfile path — printed rm command is POSIX-shell-safe", () => {
+    // Codex R3 MED: RELAY_HOME=/tmp/bad"$(touch OOPS)" or paths with
+    // $(), backticks, $VAR, single quotes would let a copy-pasted
+    // `rm` command run embedded commands. R3 fix: wrap in single
+    // quotes + escape interior single quotes as '\''. Verify that
+    // feeding the rendered command to `sh -c` ONLY removes the
+    // hostile-named pidfile + does NOT execute embedded commands.
+    const { spawnSync } = require("child_process") as typeof import("child_process");
+    const hostileRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bot-relay-v240-hostile-"));
+    // The hostile RELAY_HOME must itself live under /var/folders or
+    // similar approved root. Give it a base name littered with shell
+    // metacharacters. Use the real sentinel paths the RELAY_HOME-
+    // parent dir so we can assert "no sentinel file appeared".
+    const hostileRelayHome = path.join(
+      hostileRoot,
+      `weird-$(touch SHOULD_NOT_RUN)-\`touch ALSO_NOT\`-with-'-quote-$USER`,
+    );
+    fs.mkdirSync(hostileRelayHome, { recursive: true });
+    const oopsSentinel = path.join(hostileRoot, "SHOULD_NOT_RUN");
+    const alsoSentinel = path.join(hostileRoot, "ALSO_NOT");
+    expect(fs.existsSync(oopsSentinel)).toBe(false);
+    expect(fs.existsSync(alsoSentinel)).toBe(false);
+    const orig = process.env.RELAY_HOME;
+    process.env.RELAY_HOME = hostileRelayHome;
+    let errMsg = "";
+    let pidfilePath = "";
+    try {
+      const id = "hostile-case";
+      createInstance(id, "2.4.0");
+      const dir = instanceDir(id)!;
+      pidfilePath = path.join(dir, "instance.pid");
+      fs.writeFileSync(pidfilePath, "999999");
+      try {
+        acquireInstanceLock(id);
+        throw new Error("expected acquireInstanceLock to throw on stale pidfile");
+      } catch (err) {
+        errMsg = (err as Error).message;
+      }
+    } finally {
+      if (orig === undefined) delete process.env.RELAY_HOME;
+      else process.env.RELAY_HOME = orig;
+    }
+    // The error embeds the POSIX-escaped `rm -- '<escaped>'` command.
+    // Compute the expected escape ourselves; assert the message
+    // contains it verbatim; then feed it through sh via spawnSync's
+    // argv to avoid intermediate shell-quoting surprises at the JS
+    // layer.
+    const expectedRm = `rm -- ${shellSingleQuoteEscape(pidfilePath)}`;
+    expect(errMsg).toContain(expectedRm);
+    // Run the escaped command through /bin/sh. spawnSync argv form:
+    // args = ['-c', <full command>] — the shell parses the command
+    // exactly as an operator would after copy-pasting from the error.
+    const result = spawnSync("/bin/sh", ["-c", expectedRm], { stdio: "pipe" });
+    expect(result.status).toBe(0);
+    // Sentinel files MUST NOT exist — the escape neutralized $() +
+    // backtick + $VAR expansion.
+    expect(fs.existsSync(oopsSentinel)).toBe(false);
+    expect(fs.existsSync(alsoSentinel)).toBe(false);
+    // Legit operation happened — the pidfile is gone.
+    expect(fs.existsSync(pidfilePath)).toBe(false);
+    // Cleanup.
+    fs.rmSync(hostileRoot, { recursive: true, force: true });
+  });
+
+  it("(H1.3b R3) shellSingleQuoteEscape helper: POSIX-safe across nasty inputs", () => {
+    // Canonical POSIX idiom: value wrapped in single quotes; interior
+    // single quotes become '\''. Property: sh parses the escaped form
+    // as a literal string equal to the original. Use spawnSync argv
+    // form to avoid the outer JS-level shell expanding things we
+    // intended to pass through.
+    const { spawnSync } = require("child_process") as typeof import("child_process");
+    const cases = [
+      "plain",
+      "with space",
+      "with 'quote'",
+      "$(touch X)",
+      "`backtick`",
+      "$HOME",
+      "mixed $(x) 'y' `z`",
+      "",
+    ];
+    for (const original of cases) {
+      const escaped = shellSingleQuoteEscape(original);
+      const cmd = `printf %s ${escaped}`;
+      const r = spawnSync("/bin/sh", ["-c", cmd], { stdio: "pipe" });
+      expect(r.status).toBe(0);
+      expect(r.stdout.toString("utf-8")).toBe(original);
+    }
   });
 
   it("(H1.2e R2) TOCTOU scenario defused — concurrent stale-observers cannot both win", () => {
