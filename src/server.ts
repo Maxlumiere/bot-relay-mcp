@@ -403,7 +403,7 @@ export function createServer(): Server {
       {
         name: "peek_inbox_version",
         description:
-          "v2.3.0 Phase 4s: cheap non-mutating observation of an agent's mailbox. Returns {mailbox_id, epoch, last_seq, total_messages_count}. Use to detect 'anything new arrived' without consuming messages — pair with get_messages(peek=true) to drain only when peek shows an advanced seq. Epoch rotates on backup/restore; a client whose cached epoch no longer matches MUST reset its local last_seen_seq to 0 and re-drain from scratch.",
+          "v2.3.0 Phase 4s: cheap non-mutating observation of an agent's mailbox. Returns {mailbox_id, epoch, last_seq, total_messages_count, total_unread_count}. WATCH total_unread_count for new-mail detection — it advances on every send_message. last_seq tracks read-cursor progress (only advances when the recipient calls get_messages). Epoch rotates on backup/restore; a client whose cached epoch no longer matches MUST reset its local last_seen_seq to 0 and re-drain from scratch.",
         inputSchema: zodToJsonSchema(PeekInboxVersionSchema),
       },
     ];

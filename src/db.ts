@@ -2432,17 +2432,27 @@ export function peekMailboxVersion(agentName: string): {
   epoch: string;
   last_seq: number;
   total_messages_count: number;
+  total_unread_count: number;
 } {
   const db = getDb();
   const m = getOrCreateMailbox(agentName);
   const count = (db
     .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ?")
     .get(agentName) as { c: number }).c;
+  // v2.3.0 Codex HIGH #2 patch — total_unread_count is the field clients
+  // watch for new-mail detection. `last_seq` only advances when the
+  // recipient CALLS get_messages (seq assignment is delivery-time), so
+  // it's stale for pre-first-observation new mail. `seq IS NULL` is the
+  // authoritative "not-yet-observed" signal + bumps on every sendMessage.
+  const unread = (db
+    .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND seq IS NULL")
+    .get(agentName) as { c: number }).c;
   return {
     mailbox_id: m.mailbox_id,
     epoch: m.epoch,
     last_seq: m.next_seq,
     total_messages_count: count,
+    total_unread_count: unread,
   };
 }
 
@@ -2537,38 +2547,78 @@ export function getMessages(
   // here too — the point is "seq reflects the order the recipient saw
   // them", which is stable regardless of how they filter later.
   //
-  // Wrapped in a single transaction so the increment + assignment can't
-  // interleave with a concurrent getMessages call on the same agent
-  // (two concurrent reads would otherwise both bump next_seq by N and
-  // produce duplicate seq assignments). better-sqlite3 transactions are
-  // synchronous — this is safe under WAL.
+  // v2.3.0 Codex HIGH #1 patch — atomic seq assignment:
+  //   1. BEGIN IMMEDIATE (via better-sqlite3's .immediate() modifier)
+  //      serializes cross-process concurrent readers at the SQLite file
+  //      lock — no two processes can both think next_seq=N and stamp
+  //      different rows with the same N.
+  //   2. Mailbox.next_seq is READ INSIDE the tx so every tx sees the
+  //      latest committed counter, not a pre-tx snapshot.
+  //   3. `next` advances ONLY on successful UPDATE (r.changes === 1).
+  //      Rows already stamped by a concurrent reader no-op here and we
+  //      skip — their seq stays the one the other reader assigned.
+  //   4. Mailbox.next_seq persists the actual claim count, not the
+  //      candidate count.
+  // Together these guarantee per-recipient seq uniqueness + strict
+  // monotonicity under cross-process concurrent reads.
   const unseqIds = rows.filter((r) => r.seq == null).map((r) => r.id);
   if (unseqIds.length > 0) {
-    const mailbox = getOrCreateMailbox(agentName);
+    // Ensure the mailbox row exists. INSERT OR IGNORE is idempotent +
+    // safe outside the immediate tx — concurrent callers converge on
+    // the same row id via the UNIQUE INDEX on agent_name.
+    getOrCreateMailbox(agentName);
+    const claimedByMe: Map<string, { seq: number; epoch: string }> = new Map();
     const assignTx = db.transaction(() => {
+      const mailbox = db
+        .prepare("SELECT mailbox_id, epoch, next_seq FROM mailbox WHERE agent_name = ?")
+        .get(agentName) as { mailbox_id: string; epoch: string; next_seq: number } | undefined;
+      if (!mailbox) return;
       let next = mailbox.next_seq;
       const upd = db.prepare(
         "UPDATE messages SET seq = ?, epoch = ? WHERE id = ? AND seq IS NULL",
       );
       for (const id of unseqIds) {
-        next += 1;
-        upd.run(next, mailbox.epoch, id);
+        const candidateSeq = next + 1;
+        const r = upd.run(candidateSeq, mailbox.epoch, id);
+        if (r.changes === 1) {
+          next = candidateSeq;
+          claimedByMe.set(id, { seq: candidateSeq, epoch: mailbox.epoch });
+        }
+        // r.changes === 0 → another concurrent reader already stamped
+        // this row. Skip without advancing next — that row's seq is
+        // authoritative (the other reader's assigned value).
       }
-      db.prepare("UPDATE mailbox SET next_seq = ? WHERE mailbox_id = ?").run(
-        next,
-        mailbox.mailbox_id,
-      );
+      if (next !== mailbox.next_seq) {
+        db.prepare("UPDATE mailbox SET next_seq = ? WHERE mailbox_id = ?").run(
+          next,
+          mailbox.mailbox_id,
+        );
+      }
     });
-    assignTx();
-    // Re-hydrate the row objects with the freshly-assigned seq/epoch so
-    // the caller sees them. Cheap targeted SELECT — we know the IDs.
-    const refresh = db.prepare(
-      `SELECT id, seq, epoch FROM messages WHERE id IN (${unseqIds.map(() => "?").join(",")})`,
-    );
-    const fresh = refresh.all(...unseqIds) as { id: string; seq: number; epoch: string }[];
-    const byId = new Map(fresh.map((r) => [r.id, r]));
+    // Use BEGIN IMMEDIATE via better-sqlite3's .immediate() modifier so
+    // cross-process concurrent readers serialize at tx START, not at
+    // the first write. Fall back to the default mode on drivers that
+    // don't expose .immediate() (the wasm driver is single-connection
+    // so cross-process races don't apply).
+    const immediateCaller = (assignTx as unknown as { immediate?: () => void }).immediate;
+    if (typeof immediateCaller === "function") {
+      (assignTx as unknown as { immediate: () => void }).immediate();
+    } else {
+      assignTx();
+    }
+    // Hydrate the rows we claimed with the freshly-assigned seq/epoch.
+    // For rows another reader claimed, fetch their committed values via
+    // a targeted SELECT so the caller still sees consistent seqs.
+    const unclaimedByMe = unseqIds.filter((id) => !claimedByMe.has(id));
+    if (unclaimedByMe.length > 0) {
+      const refresh = db.prepare(
+        `SELECT id, seq, epoch FROM messages WHERE id IN (${unclaimedByMe.map(() => "?").join(",")})`,
+      );
+      const fresh = refresh.all(...unclaimedByMe) as { id: string; seq: number; epoch: string }[];
+      for (const r of fresh) claimedByMe.set(r.id, { seq: r.seq, epoch: r.epoch });
+    }
     for (const r of rows) {
-      const hit = byId.get(r.id);
+      const hit = claimedByMe.get(r.id);
       if (hit) {
         r.seq = hit.seq;
         r.epoch = hit.epoch;
