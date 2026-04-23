@@ -72,15 +72,73 @@ describe("v2.4.0 Codex HIGH #1 — atomic lock-file", () => {
     expect(fs.readFileSync(first.pidFile, "utf-8").trim()).toBe(String(process.ppid));
   });
 
-  it("(H1.2) stale PID reclaim still works through the new atomic path", () => {
+  it("(H1.2 R2) stale PID file is REFUSED (auto-reclaim removed — Codex re-audit HIGH)", () => {
+    // Codex re-audit (2026-04-23) reproduced a TOCTOU race in the R1
+    // stale-reclaim path: process A pauses before unlink, process B
+    // reclaims + writes its live PID, process A resumes + unlinks B's
+    // LIVE file. Both believe they hold the lock. Auto-reclaim
+    // removed; operator manually cleans up. See docs/multi-instance.md.
     const id = generateInstanceId();
     createInstance(id, "2.4.0");
     const dir = instanceDir(id)!;
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "instance.pid"), "999999"); // dead
+    const pidFile = path.join(dir, "instance.pid");
+    fs.writeFileSync(pidFile, "999999"); // dead
+    expect(() => acquireInstanceLock(id)).toThrow(/stale pidfile/);
+    // File is unchanged (no unlink happened).
+    expect(fs.readFileSync(pidFile, "utf-8").trim()).toBe("999999");
+  });
+
+  it("(H1.2b R2) after manual cleanup of a stale pidfile, acquisition succeeds", () => {
+    const id = generateInstanceId();
+    createInstance(id, "2.4.0");
+    const dir = instanceDir(id)!;
+    fs.mkdirSync(dir, { recursive: true });
+    const pidFile = path.join(dir, "instance.pid");
+    fs.writeFileSync(pidFile, "999999");
+    // Manual cleanup — the operator-facing remediation.
+    fs.unlinkSync(pidFile);
     const lock = acquireInstanceLock(id);
-    expect(fs.readFileSync(lock.pidFile, "utf-8").trim()).toBe(String(process.pid));
+    expect(fs.readFileSync(pidFile, "utf-8").trim()).toBe(String(process.pid));
     lock.release();
+  });
+
+  it("(H1.2c R2) live holder refused with clear 'already running' error", () => {
+    const id = generateInstanceId();
+    createInstance(id, "2.4.0");
+    const dir = instanceDir(id)!;
+    fs.mkdirSync(dir, { recursive: true });
+    // process.ppid is definitively alive.
+    fs.writeFileSync(path.join(dir, "instance.pid"), String(process.ppid));
+    expect(() => acquireInstanceLock(id)).toThrow(/already running/);
+  });
+
+  it("(H1.2d R2) unreadable/malformed pidfile → unknown liveness → fail-closed", () => {
+    const id = generateInstanceId();
+    createInstance(id, "2.4.0");
+    const dir = instanceDir(id)!;
+    fs.mkdirSync(dir, { recursive: true });
+    // Non-numeric content — holder unparseable.
+    fs.writeFileSync(path.join(dir, "instance.pid"), "not-a-pid");
+    expect(() => acquireInstanceLock(id)).toThrow(/cannot be determined|stale pidfile/);
+  });
+
+  it("(H1.2e R2) TOCTOU scenario defused — concurrent stale-observers cannot both win", () => {
+    // Simulates Codex's exact repro schedule in-process. Two callers
+    // see the same stale pidfile; under the R1 auto-reclaim path both
+    // would eventually return ok:true with different PIDs. Under R2
+    // both must REFUSE. The operator cleans up + retries serially.
+    const id = generateInstanceId();
+    createInstance(id, "2.4.0");
+    const dir = instanceDir(id)!;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "instance.pid"), "999999");
+    // Caller A: refuses.
+    expect(() => acquireInstanceLock(id)).toThrow(/stale pidfile/);
+    // Caller B (same stale state): also refuses. Crucial — the file
+    // is still the stale PID, not a reclaimed one.
+    expect(() => acquireInstanceLock(id)).toThrow(/stale pidfile/);
+    expect(fs.readFileSync(path.join(dir, "instance.pid"), "utf-8").trim()).toBe("999999");
   });
 
   it("(H1.3) after release, a fresh acquire succeeds", () => {

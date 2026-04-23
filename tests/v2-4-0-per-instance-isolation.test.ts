@@ -176,14 +176,22 @@ describe("v2.4.0 E.2 — two-instance coexistence", () => {
     expect(() => acquireInstanceLock(id)).toThrow(/already running/);
   });
 
-  it("(E.2.4) acquireInstanceLock reclaims a stale PID file (dead PID)", () => {
+  it("(E.2.4) acquireInstanceLock fails-closed on stale PID file (Codex R2 hardening)", () => {
+    // v2.4.0 Codex re-audit removed the auto-reclaim path because it
+    // had a TOCTOU race: process A pauses before unlink, process B
+    // reclaims + writes its live PID, process A resumes + unlinks B's
+    // LIVE file. Both end up believing they hold the lock. The R2 fix
+    // is to refuse EVERY EEXIST, regardless of liveness, and point
+    // the operator at manual cleanup.
     const id = generateInstanceId();
     createInstance(id, "2.4.0");
     const dir = instanceDir(id)!;
     const pidFile = path.join(dir, "instance.pid");
     fs.mkdirSync(dir, { recursive: true });
-    // PID that's almost certainly dead — pick a large unused one.
-    fs.writeFileSync(pidFile, "999999");
+    fs.writeFileSync(pidFile, "999999"); // stale (dead)
+    expect(() => acquireInstanceLock(id)).toThrow(/stale pidfile.*rm/);
+    // Manual cleanup → next acquisition succeeds.
+    fs.unlinkSync(pidFile);
     const lock = acquireInstanceLock(id);
     expect(fs.readFileSync(pidFile, "utf-8").trim()).toBe(String(process.pid));
     lock.release();

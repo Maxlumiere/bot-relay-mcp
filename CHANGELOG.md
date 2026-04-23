@@ -18,6 +18,37 @@ Codex returned PATCH-THEN-SHIP with 2 HIGH + 1 MED, all on Part E + Part F. Part
 
 Codex finding on generic `http_secrets_previous` redaction — acknowledged as NOT a new v2.4 surface (pre-existing recorder allowlist gap). Folded into v2.5 hygiene queue, not blocking this ship.
 
+### ⚠ Codex re-audit patch round R2 (2026-04-23, SECURITY hardening)
+
+The R1 atomic-lock fix closed the original "both daemons write" race but introduced a NEW TOCTOU in the stale-PID reclaim path. Codex reproduced it against the built `dist/instance.js`:
+
+1. Initial `instance.pid` contains PID 999999 (stale).
+2. Process A: `wx` fails `EEXIST` → reads PID → probes `ESRCH` (dead) → **pauses** just before `unlinkSync`.
+3. Process B: same path → unlinks → `wx` wins → writes its live PID.
+4. Process A resumes → unlinks B's LIVE pidfile → `wx` wins → writes its own PID.
+5. Both A and B believe they hold the lock.
+
+The auto-reclaim path cannot be made safe without an atomic "test-and-replace specific content" primitive, which POSIX `fs` doesn't provide.
+
+**Fix R2 — fail-closed on every EEXIST**, regardless of PID liveness. `acquireInstanceLock` in `src/instance.ts` no longer unlinks anything. On `EEXIST`:
+
+- Live holder → refuse with `"already running (PID ...)"`.
+- Dead holder → refuse with a verbatim `rm <path>` command for the operator to run after confirming no daemon is alive.
+- Cross-user EPERM or unreadable file → refuse as unknown-liveness.
+
+Auto-reclaim is deferred to **v2.5+** with a proper atomic primitive (fcntl lock on the open fd, or a directory-based lock) + a regression that mirrors the exact Codex schedule.
+
+`docs/multi-instance.md` gained a "Why auto-reclaim was removed" section with the full race description + manual-cleanup workflow.
+
+### R2 regression tests
+
+- `tests/v2-4-0-codex-patches.test.ts` expanded to 16 cases (from 12). New: H1.2b manual-cleanup round-trip, H1.2c live-holder clear error, H1.2d unreadable-pidfile fail-closed, H1.2e TOCTOU scenario (two observers of the same stale pidfile BOTH refuse — neither silently reclaims).
+- `tests/v2-4-0-per-instance-isolation.test.ts` E.2.4 flipped from "reclaims stale" to "fails-closed on stale + manual cleanup succeeds."
+
+**Total after R2: 1103 tests pass** (1099 post-R1 + 4 new R2 regressions).
+
+**Not addressed (deferred):** auto-reclaim itself. v2.5+ with proper primitive + Codex-schedule regression.
+
 
 
 Three bundled parts per the v2.4.0 consolidated brief, dispatched the moment v2.3.0 shipped:
