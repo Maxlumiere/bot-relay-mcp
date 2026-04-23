@@ -20,6 +20,10 @@
  *     [--apply]               + tasks are preserved (see purge-history).
  *   relay open [--url U]      Open the dashboard in the default browser
  *                             (v2.2.2; auto-detects host+port from config).
+ *   relay list-instances      List all per-instance bot-relay setups
+ *                             (v2.4.0). --json for machine-readable output.
+ *   relay use-instance ID     Switch the active instance (kubectl-style)
+ *                             (v2.4.0). Writes ~/.bot-relay/active-instance.
  *   relay re-encrypt          Rotate at-rest encryption keys across all encrypted
  *                             columns (v2.1 Phase 4b.3). See docs/key-rotation.md.
  *   relay pair HUB_URL        Register with a remote bot-relay-mcp hub + emit an
@@ -42,6 +46,8 @@ const SUBCOMMANDS = {
   "purge-history": "../dist/cli/purge-history.js",
   "purge-agents": "../dist/cli/purge-agents.js",
   open: "../dist/cli/open.js",
+  "list-instances": "../dist/cli/list-instances.js",
+  "use-instance": "../dist/cli/use-instance.js",
   "re-encrypt": "../dist/cli/re-encrypt.js",
   pair: "../dist/cli/pair.js",
 };
@@ -61,6 +67,8 @@ function printHelp() {
       "  purge-history NAME  Delete every message + task where the agent is sender or recipient.\n" +
       "  purge-agents     Prune agent rows with last_seen > N days (dry-run; --apply commits).\n" +
       "  open [--url U]   Open the dashboard in the default browser.\n" +
+      "  list-instances   List all per-instance bot-relay setups (v2.4.0).\n" +
+      "  use-instance ID  Switch the active instance (v2.4.0, kubectl-style).\n" +
       "  re-encrypt       Rotate at-rest encryption keys across all encrypted columns.\n" +
       "  pair HUB_URL     Register with a remote hub + emit MCP client config.\n" +
       "  help             Show this message.\n\n" +

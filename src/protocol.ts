@@ -58,4 +58,4 @@
  * This file is intentionally the sole authoritative source — the drift-grep
  * in scripts/pre-publish-check.sh allowlists it alongside src/version.ts.
  */
-export const PROTOCOL_VERSION: string = "2.3.0";
+export const PROTOCOL_VERSION: string = "2.4.0";
