@@ -30,6 +30,7 @@ import {
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { touchMarker } from "./filesystem-marker.js";
+import { resolveInstanceDbPath } from "./instance.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".bot-relay");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "relay.db");
@@ -51,7 +52,17 @@ function isPathUnderApprovedRoot(resolved: string): boolean {
 }
 
 export function getDbPath(): string {
-  const raw = process.env.RELAY_DB_PATH || DEFAULT_DB_PATH;
+  // v2.4.0 Part E — per-instance isolation. RELAY_DB_PATH still wins
+  // (explicit operator override); otherwise fall back to the per-
+  // instance path if multi-instance mode is active, then the legacy
+  // flat layout. Single-instance operators with existing setups see
+  // identical behavior to v2.3.x.
+  let raw: string;
+  if (process.env.RELAY_DB_PATH) {
+    raw = process.env.RELAY_DB_PATH;
+  } else {
+    raw = resolveInstanceDbPath();
+  }
   const resolved = path.resolve(raw);
   if (!isPathUnderApprovedRoot(resolved)) {
     throw new Error(
