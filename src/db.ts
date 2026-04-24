@@ -2334,6 +2334,59 @@ export function getAgents(role?: string): AgentWithStatus[] {
   return rows.map(toAgentWithStatus);
 }
 
+/**
+ * v2.4.1 — per-agent inbox rollup for the dashboard.
+ *
+ * Single GROUP BY over agents LEFT JOIN messages so every registered agent
+ * appears in the result, including those with zero mail (pending_count=0,
+ * unread_count=0, last_message_at=null). Used by snapshotApi to decorate
+ * agents[] without a second round-trip per row.
+ *
+ * Semantics:
+ *   - pending_count — messages still in status='pending' (not yet drained
+ *     by a get_messages call that flipped them to 'read').
+ *   - unread_count  — messages whose seq is still NULL. Mirrors the
+ *     peek_inbox_version v2.3 signal: seq is assigned the moment a
+ *     recipient observes the message, so seq IS NULL is the authoritative
+ *     "never-observed" count regardless of later status transitions.
+ *   - last_message_at — ISO of MAX(created_at) across any status; NULL
+ *     when the agent has no inbox history.
+ */
+export function getInboxSummary(): Array<{
+  agent_name: string;
+  pending_count: number;
+  unread_count: number;
+  last_message_at: string | null;
+}> {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      // LEFT JOIN surfaces agents with zero mail. Guard every CASE on
+      // m.id IS NOT NULL so no-match rows (where every m.* is NULL) are
+      // NOT miscounted as unread — SQL NULL IS NULL evaluates true, which
+      // would inflate unread_count by 1 per mail-less agent.
+      `SELECT a.name AS agent_name,
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.seq IS NULL        THEN 1 ELSE 0 END), 0) AS unread_count,
+              MAX(m.created_at) AS last_message_at
+         FROM agents a
+         LEFT JOIN messages m ON m.to_agent = a.name
+        GROUP BY a.name`,
+    )
+    .all() as Array<{
+      agent_name: string;
+      pending_count: number;
+      unread_count: number;
+      last_message_at: string | null;
+    }>;
+  return rows.map((r) => ({
+    agent_name: r.agent_name,
+    pending_count: Number(r.pending_count) || 0,
+    unread_count: Number(r.unread_count) || 0,
+    last_message_at: r.last_message_at ?? null,
+  }));
+}
+
 // --- Message operations ---
 
 export function sendMessage(
