@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 import type { Request, Response } from "express";
-import { getAgents, listWebhooks, getDb, getDashboardPrefs } from "./db.js";
+import { getAgents, listWebhooks, getDb, getDashboardPrefs, getInboxSummary } from "./db.js";
 import { getKeyringInfo, decryptContent } from "./encryption.js";
 import type { MessageRecord, TaskRecord } from "./types.js";
 import { DASHBOARD_BASE_STYLES, DASHBOARD_THEMES } from "./dashboard-styles.js";
@@ -106,7 +106,20 @@ export function keyringApi(_req: Request, res: Response): void {
 export function snapshotApi(_req: Request, res: Response): void {
   try {
     const db = getDb();
-    const agents = getAgents();
+    const agentsBase = getAgents();
+    // v2.4.1 — per-agent inbox rollup. Additive fields only; the rest of
+    // AgentWithStatus is untouched so existing consumers keep working.
+    const inboxRows = getInboxSummary();
+    const inboxByName = new Map(inboxRows.map((r) => [r.agent_name, r]));
+    const agents = agentsBase.map((a) => {
+      const ix = inboxByName.get(a.name);
+      return {
+        ...a,
+        pending_count: ix ? ix.pending_count : 0,
+        unread_count: ix ? ix.unread_count : 0,
+        last_message_at: ix ? ix.last_message_at : null,
+      };
+    });
     const webhooks = listWebhooks().map((w) => ({
       id: w.id,
       url: w.url,
@@ -264,6 +277,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
         <option value="role">role</option>
         <option value="last-seen">last seen</option>
         <option value="name">name</option>
+        <option value="inbox">inbox</option>
       </select>
     </label>
     <label title="Per-human operator identity for audit-log attribution. Stored in the relay_operator_identity cookie (SameSite=Lax, 90-day). Beats RELAY_DASHBOARD_OPERATOR env.">
@@ -465,6 +479,18 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
         // Most recently active first.
         return new Date(b.last_seen).getTime() - new Date(a.last_seen).getTime();
       }
+      // v2.4.1 — inbox backlog first. Highest pending_count wins so mail-
+      // piling-up agents bubble to the top of the grid. Ties fall through
+      // to unread_count, then to name for stable ordering.
+      if (sort === 'inbox') {
+        const pa = a.pending_count | 0;
+        const pb = b.pending_count | 0;
+        if (pa !== pb) return pb - pa;
+        const ua = a.unread_count | 0;
+        const ub = b.unread_count | 0;
+        if (ua !== ub) return ub - ua;
+        return String(a.name).localeCompare(String(b.name));
+      }
       // default: status
       const sa = STATUS_ORDER[a.agent_status] != null ? STATUS_ORDER[a.agent_status] : 99;
       const sb = STATUS_ORDER[b.agent_status] != null ? STATUS_ORDER[b.agent_status] : 99;
@@ -520,10 +546,23 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
         ? ' style="grid-column:span ' + col + ';grid-row:span ' + row + '"'
         : '';
       const resized = (col > 1 || row > 1) ? ' data-resized="1"' : '';
+      // v2.4.1 — inbox badge. pending_count > 0 surfaces a yellow pill;
+      // 0 with historical mail shows a gray "0" so operators can still
+      // spot agents that used to receive but no longer do. Hover tooltip
+      // carries last_message_at as a relative time for context.
+      const pending = a.pending_count | 0;
+      const unread = a.unread_count | 0;
+      const lastAt = a.last_message_at || null;
+      const inboxTip = lastAt
+        ? 'Inbox: ' + pending + ' pending, ' + unread + ' unread · last message ' + fmtTime(lastAt)
+        : 'Inbox: no messages yet';
+      const inboxCls = pending > 0 ? 'inbox-badge inbox-badge-warn' : 'inbox-badge inbox-badge-zero';
+      const inboxLabel = pending > 0 ? pending + ' pending' : '0';
       return '<div class="agent-card' + isFocused + '" role="button" tabindex="0" data-agent="' + esc(a.name) + '"' + style + resized + '>' +
         '<button class="card-reset" type="button" aria-label="Reset card size" data-action="reset-size" data-agent-name="' + esc(a.name) + '" title="Reset size">×</button>' +
         '<div class="name">' + esc(a.name) + '</div>' +
         '<div class="role">' + esc(a.role) + '</div>' +
+        '<div class="inbox" title="' + esc(inboxTip) + '"><span class="' + inboxCls + '" data-pending="' + pending + '" data-unread="' + unread + '">' + esc(inboxLabel) + '</span></div>' +
         '<div class="state"><span class="badge badge-' + esc(s) + '">' + esc(s) + '</span></div>' +
         '<div class="seen">last seen ' + fmtTime(a.last_seen) + '</div>' +
         '<span class="card-resize" data-action="resize-handle" data-agent-name="' + esc(a.name) + '" title="Drag to resize (snaps to grid)">↘</span>' +

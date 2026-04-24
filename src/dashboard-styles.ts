@@ -87,6 +87,14 @@ export const DASHBOARD_BASE_STYLES = `
   .agent-card .role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
   .agent-card .state { margin-top: 8px; font-size: 12px; }
   .agent-card .seen { color: var(--muted); font-size: 11px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .agent-card .inbox { margin-top: 6px; font-size: 11px; }
+  .inbox-badge {
+    display: inline-flex; align-items: center;
+    font-size: 11px; padding: 2px 6px; border-radius: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .inbox-badge-warn { background: rgba(251,191,36,0.22); color: var(--stale); font-weight: 600; }
+  .inbox-badge-zero { background: rgba(107,114,128,0.12); color: var(--muted); }
   .agent-card { position: relative; }
   .agent-card .card-resize {
     position: absolute; right: 2px; bottom: 2px;
