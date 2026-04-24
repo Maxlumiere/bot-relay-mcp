@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.4.2 — 2026-04-24 — stdio TTY guard refinement (closes v2.2.1 oversight)
+
+Fixes a plug-and-play regression introduced in v2.2.1: the stdio TTY guard (`src/index.ts`) exited immediately when stdin was not a TTY, which is the default configuration for every legitimate MCP client (Claude Code, Cursor, Cline, …). Every new MCP spawn after v2.2.1 silently failed until the operator added `RELAY_SKIP_TTY_CHECK=1` to their `~/.claude.json` `mcpServers.bot-relay.env` block. The regression was masked for six releases by the long-running pre-v2.2.1 daemon, which kept serving existing operators without re-spawning.
+
+### Fixed
+
+- **`src/index.ts` TTY guard** — replaced the immediate-exit branch with a 1500ms grace window. If any bytes arrive on stdin during the window, treat as a legitimate MCP client (MCP clients send their `initialize` frame within the first few hundred ms), cancel the guard, `unshift()` the received chunk so the MCP transport downstream reads the frame unchanged, and proceed. If the timer expires with zero bytes, exit with the existing code 3 + helpful message (background-daemon-attempt detection preserved). Added `RELAY_TTY_GRACE_MS` as an override so tests can drive the grace tight without changing production behavior.
+- **`~/.claude.json` workaround is now redundant.** Operators can remove `"RELAY_SKIP_TTY_CHECK": "1"` from their `mcpServers.bot-relay.env` block after upgrading. Leaving it in place also works — the env var stays as an explicit bypass for test harnesses whose first write comes after the grace window.
+
+### Added
+
+- **`docs/deployment.md`** — first version of the deployment doc the guard error message has been pointing to since v2.2.1. Covers transport selection, HTTP-daemon launch pattern, and the TTY-guard heuristic + overrides.
+
+### Tests
+
+- `tests/v2-4-2-tty-guard.test.ts` +5 cases spawning `dist/index.js` with varying stdin configurations: background daemon (stdin=/dev/null, exits code 3 within grace), MCP-style launch (pipe + `initialize` frame within grace, proceeds), `RELAY_SKIP_TTY_CHECK=1` bypass, pipe-but-no-writes (exits code 3), non-stdio transport (guard never fires).
+
+**Total after v2.4.2: 1124 tests pass** (1119 pre-v2.4.2 + 5 new).
+
+### Cross-platform parity
+
+Pure Node `process.stdin` + timers — no platform-specific syscalls. Tests use `spawn` with `/dev/null` stdin on darwin + linux; Windows CI relies on the heuristic being platform-agnostic (`stdin.isTTY` + `stdin.on('data', …)` are portable surface).
+
 ## v2.4.1 — 2026-04-24 — dashboard inbox visibility
 
 Operator-facing friction → product feature. Pre-v2.4.1 Maxime had to drop to `sqlite3 ~/.bot-relay/relay.db` to answer "which agent has mail piling up?" — the dashboard showed the 20 most-recent messages flat but no per-agent rollup. v2.4.1 closes that gap.

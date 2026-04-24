@@ -79,34 +79,81 @@ async function main(): Promise<void> {
     throw err;
   }
 
-  // v2.2.1 B3: stdio transport requires a live TTY. Running `node
-  // dist/index.js` in a non-interactive shell (Claude Code bash sandbox,
-  // systemd service with no pty, background tab) defaults to stdio and
-  // exits the moment stdin closes — silent daemon death. Loud refusal
-  // beats magical auto-upgrade: operators running the binary as a daemon
-  // MUST pick http explicitly, otherwise we tell them why + exit.
+  // v2.2.1 B3 (refined in v2.4.2): stdio transport with non-TTY stdin is
+  // usually a daemon-launch mistake — `node dist/index.js` from a systemd
+  // service or background tab defaults to stdio and exits the moment stdin
+  // closes. Loud refusal beats silent daemon death.
   //
-  // Guard ordering: after config resolution (so env + CLI + file have all
-  // had a chance to set transport) and BEFORE initializeDb/port-bind (no
-  // side effects on the exit path). `RELAY_SKIP_TTY_CHECK=1` is the escape
-  // hatch for tests that legitimately want stdio piped from a harness.
+  // v2.4.2 refinement — the v2.2.1 guard over-fired on legitimate MCP
+  // clients (Claude Code, Cursor, Cline, …) which ALWAYS pipe stdin as
+  // part of the JSON-RPC protocol. Every post-v2.2.1 MCP spawn silently
+  // failed until the operator set RELAY_SKIP_TTY_CHECK=1 — a plug-and-play
+  // regression. New heuristic: if stdio + non-TTY, wait up to 1500ms for
+  // any bytes to arrive on stdin. MCP clients send their `initialize`
+  // frame within the first hundred ms, so they proceed. Background daemon
+  // attempts have no writer, so they hit the timeout + get the helpful
+  // error. The received chunk is unshifted back so the MCP transport
+  // downstream reads it unchanged.
+  //
+  // Guard ordering: after config resolution (env + CLI + file have all
+  // had a chance to set transport) and BEFORE initializeDb / port-bind
+  // (no side effects on the exit path). `RELAY_SKIP_TTY_CHECK=1` stays
+  // as the explicit bypass for test harnesses whose first write comes
+  // after the 1500ms window.
   if (
     config.transport === "stdio" &&
     !process.stdin.isTTY &&
     process.env.RELAY_SKIP_TTY_CHECK !== "1"
   ) {
-    process.stderr.write(
-      "Transport is stdio but stdin is not a TTY. The stdio transport will " +
-        "exit the moment stdin closes — that's almost certainly not what you " +
-        "want for a daemon.\n\n" +
-        "Fix one of:\n" +
-        "  (a) set RELAY_TRANSPORT=http (+ RELAY_HTTP_PORT=3777 for the usual port), or\n" +
-        "  (b) run `node dist/index.js --transport=http --port=3777` directly, or\n" +
-        "  (c) run interactively (attach a real TTY — e.g. a terminal, not a Claude Code bash block).\n\n" +
-        "See docs/deployment.md. Override this check with RELAY_SKIP_TTY_CHECK=1 " +
-        "if you're piping the session deliberately from a test harness.\n"
-    );
-    process.exit(3);
+    const TTY_GUARD_ERROR =
+      "Transport is stdio but stdin is not a TTY, and no MCP client sent a " +
+      "frame within 1500ms. The stdio transport will exit the moment stdin " +
+      "closes — that's almost certainly not what you want for a daemon.\n\n" +
+      "Fix one of:\n" +
+      "  (a) set RELAY_TRANSPORT=http (+ RELAY_HTTP_PORT=3777 for the usual port), or\n" +
+      "  (b) run `node dist/index.js --transport=http --port=3777` directly, or\n" +
+      "  (c) run interactively (attach a real TTY — e.g. a terminal, not a Claude Code bash block).\n\n" +
+      "See docs/deployment.md. Override this check with RELAY_SKIP_TTY_CHECK=1 " +
+      "if you're piping the session deliberately from a test harness that " +
+      "writes its first frame later than 1500ms.\n";
+    // Read the configured grace in ms so tests can drive it tight.
+    const graceMs = Number(process.env.RELAY_TTY_GRACE_MS) > 0
+      ? Number(process.env.RELAY_TTY_GRACE_MS)
+      : 1500;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        process.stdin.removeListener("data", onData);
+        process.stdin.removeListener("end", onEnd);
+        process.stderr.write(TTY_GUARD_ERROR);
+        process.exit(3);
+      }, graceMs);
+      const onData = (chunk: Buffer) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        process.stdin.removeListener("data", onData);
+        process.stdin.removeListener("end", onEnd);
+        // Hand the bytes back to the stream so the MCP transport reads
+        // the frame in full. stdin was put into flowing mode by our
+        // listener; pause + unshift restores the pre-guard state.
+        process.stdin.pause();
+        process.stdin.unshift(chunk);
+        resolve();
+      };
+      const onEnd = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        process.stdin.removeListener("data", onData);
+        process.stderr.write(TTY_GUARD_ERROR);
+        process.exit(3);
+      };
+      process.stdin.on("data", onData);
+      process.stdin.once("end", onEnd);
+    });
   }
 
   // Pre-initialize the DB so schema + purge run up front.
