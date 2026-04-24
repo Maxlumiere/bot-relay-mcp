@@ -7,6 +7,10 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import {
@@ -106,6 +110,9 @@ import { handleSetStatus, handleHealthCheck } from "./tools/status.js";
 import { handleGetStandup } from "./tools/standup.js";
 import { handleSetDashboardTheme } from "./tools/dashboard.js";
 import { handlePeekInboxVersion } from "./tools/peek-inbox-version.js";
+import { recordCall } from "./transport/traffic-recorder.js";
+import { listPrompts, getPrompt } from "./mcp-prompts.js";
+import { listResources, readResource } from "./mcp-resources.js";
 import { VERSION } from "./version.js";
 
 /**
@@ -221,6 +228,13 @@ export function createServer(): Server {
     {
       capabilities: {
         tools: {},
+        // v2.4.0 Part F — MCP prompts + resources split. Separate from
+        // tools: prompts are pre-baked instruction templates the client
+        // surfaces in a prompts menu; resources are pre-defined data
+        // endpoints clients can fetch. Neither increments the tool
+        // count (stays 30).
+        prompts: {},
+        resources: {},
       },
     }
   );
@@ -230,6 +244,35 @@ export function createServer(): Server {
     const all = ALL_TOOLS_DEFINITION;
     return {
       tools: all.filter((t) => isToolVisible(t.name, bundles, hidden)),
+    };
+  });
+
+  // v2.4.0 Part F.1 — MCP prompts. Pre-baked instruction templates
+  // the client surfaces in a prompts menu. See src/mcp-prompts.ts.
+  server.setRequestHandler(ListPromptsRequestSchema, async () => {
+    return { prompts: listPrompts() };
+  });
+  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    return getPrompt(name, args as Record<string, string> | undefined);
+  });
+
+  // v2.4.0 Part F.2 — MCP resources. Read-only JSON data endpoints
+  // the client can fetch via resources/read. See src/mcp-resources.ts.
+  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    return { resources: listResources() };
+  });
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const { uri } = request.params;
+    const content = readResource(uri);
+    return {
+      contents: [
+        {
+          uri: content.uri,
+          mimeType: content.mimeType,
+          text: content.text,
+        },
+      ],
     };
   });
 
@@ -961,6 +1004,20 @@ export function createServer(): Server {
       const result = await dispatch(name, args);
       const isError = (result as any).isError === true;
       logAudit(verifiedAgent, name, summary, !isError, null, ctx.transport, { ...baseStructured, result: isError ? "error" : "success" });
+      // v2.4.0 Part D.1 — traffic capture. Off by default; enabled by
+      // RELAY_RECORD_TRAFFIC=<path>. Never throws; swallow failures so
+      // capture can't break a tool call.
+      try {
+        recordCall({
+          tool: name,
+          args,
+          response: result,
+          transport: ctx.transport,
+          source_ip: ctx.sourceIp ?? null,
+        });
+      } catch {
+        /* already swallowed inside recordCall; belt-and-suspenders */
+      }
       return result;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

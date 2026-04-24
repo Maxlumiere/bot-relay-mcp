@@ -7,6 +7,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { validateKeyringStrict } from "./encryption.js";
+import { resolveInstanceConfigPath } from "./instance.js";
 
 export interface RelayConfig {
   transport: "stdio" | "http" | "both";
@@ -69,7 +70,17 @@ export const DEFAULT_CONFIG: RelayConfig = {
 };
 
 function getConfigPath(): string {
-  return process.env.RELAY_CONFIG_PATH || path.join(os.homedir(), ".bot-relay", "config.json");
+  // v2.4.0 Codex HIGH #2 patch — split-brain config in multi-instance
+  // mode. Pre-patch: RELAY_DB_PATH resolved per-instance but config
+  // stayed flat, so active instance 'work' with per-instance
+  // http_port=2222 still used the flat config's http_port=1111.
+  // Fix: consult resolveInstanceConfigPath() (mirrors the DB path
+  // resolution) before falling back to the flat layout.
+  //   RELAY_CONFIG_PATH      → always wins (explicit operator override)
+  //   instance_id active     → ~/.bot-relay/instances/<id>/config.json
+  //   otherwise              → legacy ~/.bot-relay/config.json
+  if (process.env.RELAY_CONFIG_PATH) return process.env.RELAY_CONFIG_PATH;
+  return resolveInstanceConfigPath();
 }
 
 export class InvalidConfigError extends Error {

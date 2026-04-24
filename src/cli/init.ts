@@ -22,8 +22,13 @@ import os from "os";
 import crypto from "crypto";
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
+import { createInstance, generateInstanceId } from "../instance.js";
 
 function defaultBotRelayDir(): string {
+  // v2.4.0 Part E — honor RELAY_HOME override (test harnesses + ops
+  // sandboxes). When set, it's the bot-relay root directly; in
+  // production operators leave it unset and get ~/.bot-relay/.
+  if (process.env.RELAY_HOME) return process.env.RELAY_HOME;
   return path.join(os.homedir(), ".bot-relay");
 }
 
@@ -54,6 +59,16 @@ interface ParsedArgs {
   transport?: string;
   secret?: string;
   profile?: Profile;
+  /**
+   * v2.4.0 Part E.3 — multi-instance opt-in. When set, init writes to
+   * `~/.bot-relay/instances/<id>/config.json` + creates the per-instance
+   * directory. Auto-generate a UUID when absent (only in multi-instance
+   * mode; single-instance mode stays the default).
+   */
+  instanceId?: string;
+  /** Ask init to create a per-instance setup even if no --instance-id
+   *  was passed (auto-generates a UUID). */
+  multiInstance?: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -81,6 +96,17 @@ function parseArgs(argv: string[]): ParsedArgs {
         throw new Error("invalid --profile");
       }
       out.profile = v as Profile;
+    } else if (a === "--instance-id") {
+      const v = argv[++i];
+      if (!v) {
+        process.stderr.write("--instance-id requires a value\n");
+        throw new Error("missing --instance-id value");
+      }
+      out.instanceId = v;
+    } else if (a.startsWith("--instance-id=")) {
+      out.instanceId = a.slice("--instance-id=".length);
+    } else if (a === "--multi-instance") {
+      out.multiInstance = true;
     } else {
       process.stderr.write(`Unknown argument: ${a}\n`);
       throw new Error("unknown arg");
@@ -165,12 +191,33 @@ export async function run(argv: string[]): Promise<number> {
         "  --secret STRING    HTTP secret (random 32-byte base64 if omitted).\n" +
         "  --profile X        solo (default) | team | ci. Shapes tool visibility,\n" +
         "                     feature bundles, logging level, and abandon threshold.\n" +
-        "                     See docs/profiles.md.\n"
+        "                     See docs/profiles.md.\n" +
+        "  --instance-id ID   v2.4.0: create a per-instance setup at\n" +
+        "                     ~/.bot-relay/instances/<id>/ instead of the flat\n" +
+        "                     layout. Implies multi-instance mode. See\n" +
+        "                     docs/multi-instance.md.\n" +
+        "  --multi-instance   v2.4.0: opt into multi-instance mode without naming\n" +
+        "                     the id — auto-generates a UUID.\n"
     );
     return 0;
   }
 
-  const configPath = defaultConfigPath();
+  // v2.4.0 Part E.3 — resolve the active instance_id up-front so the
+  // config path resolves into the per-instance subdir when multi-
+  // instance mode is chosen. Single-instance legacy mode (no flag)
+  // keeps ~/.bot-relay/config.json unchanged.
+  let effectiveInstanceId: string | null = null;
+  if (args.instanceId) {
+    effectiveInstanceId = args.instanceId;
+  } else if (args.multiInstance) {
+    effectiveInstanceId = generateInstanceId();
+  }
+  let configPath = defaultConfigPath();
+  let perInstanceDir: string | null = null;
+  if (effectiveInstanceId) {
+    perInstanceDir = path.join(defaultBotRelayDir(), "instances", effectiveInstanceId);
+    configPath = path.join(perInstanceDir, "config.json");
+  }
   if (fs.existsSync(configPath) && !args.force) {
     process.stderr.write(
       `relay init: ${configPath} already exists. Re-run with --force to overwrite, or edit the file directly.\n`
@@ -212,6 +259,15 @@ export async function run(argv: string[]): Promise<number> {
 
   // Set up directory + write config.json.
   ensureSecureDir(defaultBotRelayDir(), 0o700);
+  // v2.4.0 Part E.3 — when an instance_id was passed (or auto-generated
+  // via --multi-instance), create the per-instance subdir + metadata
+  // BEFORE the config write. createInstance is idempotent; safe across
+  // --force re-runs.
+  if (effectiveInstanceId && perInstanceDir) {
+    ensureSecureDir(path.join(defaultBotRelayDir(), "instances"), 0o700);
+    ensureSecureDir(perInstanceDir, 0o700);
+    createInstance(effectiveInstanceId, "relay-init");
+  }
   const cfg = {
     transport,
     http_port: port,
@@ -231,12 +287,24 @@ export async function run(argv: string[]): Promise<number> {
     logging_level: profileDefaults.logging_level,
     agent_abandon_days: profileDefaults.agent_abandon_days,
     dashboard_enabled: profileDefaults.dashboard_enabled,
+    // v2.4.0 Part E: record the instance_id in the config so auditors
+    // can tell which instance a given config file belongs to. null in
+    // single-instance legacy mode.
+    instance_id: effectiveInstanceId ?? null,
   };
   fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2));
   ensureSecureFile(configPath, 0o600);
 
   process.stdout.write(`\n✓ Wrote ${configPath} (mode 0600)\n`);
-  process.stdout.write(`✓ Generated HTTP secret (32 bytes, base64url)\n\n`);
+  process.stdout.write(`✓ Generated HTTP secret (32 bytes, base64url)\n`);
+  if (effectiveInstanceId) {
+    process.stdout.write(
+      `✓ Per-instance setup: ${effectiveInstanceId}\n` +
+      `  Run this instance with RELAY_INSTANCE_ID=${effectiveInstanceId} or\n` +
+      `  \`relay use-instance ${effectiveInstanceId}\` to make it active.\n`
+    );
+  }
+  process.stdout.write(`\n`);
 
   // MCP server entry hint.
   const installRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
