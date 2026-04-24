@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.4.1 — 2026-04-24 — dashboard inbox visibility
+
+Operator-facing friction → product feature. Pre-v2.4.1 Maxime had to drop to `sqlite3 ~/.bot-relay/relay.db` to answer "which agent has mail piling up?" — the dashboard showed the 20 most-recent messages flat but no per-agent rollup. v2.4.1 closes that gap.
+
+### Added
+
+- **`getInboxSummary()` in `src/db.ts`.** Single GROUP BY query across `agents LEFT JOIN messages` returning `{ agent_name, pending_count, unread_count, last_message_at }` for every registered agent — including agents with zero mail (LEFT JOIN + `m.id IS NOT NULL` guards inside the CASE expressions so no-match rows don't inflate counts). Semantics: `pending_count` = `status='pending'` (un-drained), `unread_count` = `seq IS NULL` (never observed — mirrors v2.3 `peek_inbox_version`), `last_message_at` = `MAX(created_at)` across any status.
+- **Snapshot endpoint enrichment in `src/dashboard.ts`.** `snapshotApi` now merges `getInboxSummary()` onto each `agents[]` row as additive fields (`pending_count`, `unread_count`, `last_message_at`). Existing `AgentWithStatus` shape is untouched — the dashboard's AI consumers see a strict superset.
+- **Dashboard HTML rendering.** New inbox-badge element on every agent card (yellow pill for `pending_count > 0`, gray for 0) with a hover `title` tooltip carrying `"Inbox: N pending, M unread · last message <relative>"`. New "inbox" option in the sort dropdown sorts agents descending by `pending_count` so backlog bubbles to the top of the grid; tie-breaks on `unread_count`, then name.
+
+### Tests
+
+- `tests/v2-4-1-inbox-visibility.test.ts` +7 cases: empty relay / zero-mail agents still appear (LEFT JOIN) / pending + unread piling up / drain flips `pending_count` to 0 but `last_message_at` survives / snapshot enrichment per agent / snapshot shape stable (existing fields untouched) / HTML contains inbox-badge markup + new sort option.
+
+**Total after v2.4.1: 1119 tests pass** (1112 pre-v2.4.1 + 7 new).
+
+### Cross-platform parity
+
+Pure SQL + TypeScript + HTML. No filesystem, no syscalls beyond existing patterns. Wasm SQLite driver (`RELAY_SQLITE_DRIVER=wasm`) covered via the shared `CompatDatabase` interface — the new query uses only `prepare` + `all`, both supported.
+
+### Out of scope (deferred to v2.5)
+
+Per-agent inbox drilldown page, filtering by sender/priority/age, real-time push (snapshot is poll-only — fine for this scope), mobile-responsive table.
+
 ## v2.4.0 — 2026-04-23 — traffic replay + per-instance isolation + MCP prompts/resources split
 
 ### ⚠ Codex pre-ship audit patches (applied 2026-04-23)
