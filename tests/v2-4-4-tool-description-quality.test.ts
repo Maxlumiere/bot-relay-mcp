@@ -175,38 +175,82 @@ describe("v2.4.4 — tool description quality", () => {
     }
   });
 
-  it("(Q7) description hashes are tracked — surfaces accidental drift in PR review", () => {
-    // Snapshot of the SHA-256 of every description, sorted by tool name.
-    // Updating this snapshot is intentional, not automatic — the diff in
-    // the PR forces a review pause when descriptions change. If you
-    // intentionally rewrote a description, regenerate and commit the
-    // updated snapshot in the same PR.
-    const hashes: Record<string, string> = {};
+  it("(Q7) description hashes match the pinned snapshot — fails on any drift", () => {
+    // v2.4.4 R1 (Codex 2026-04-27): the v2.4.4 R0 Q7 only checked hash
+    // shape + tool-name set, so changing every description still passed.
+    // Now pinned to the SHA-256 of every description AT THE TIME OF
+    // COMMIT. Future PRs that touch any description will fail Q7 with a
+    // clear "old vs new hash" diff and a one-line update path. This
+    // forces a review pause for every description edit — exactly the
+    // class of drift that introduced the v2.4.4 R0 Returns-shape bugs.
+    //
+    // To update intentionally:
+    //   1. Make the description edit.
+    //   2. Run `npm run build` so dist/index.js carries the new text.
+    //   3. Run this test; copy the actual hash from the failure message
+    //      into the EXPECTED_HASHES map below.
+    //   4. Commit the description edit + the hash bump in the same PR.
+    const EXPECTED_HASHES: Record<string, string> = {
+      broadcast: "0745f040a35264b317b13c72a24f2cc57f12d741c67b100f978b377806fc49e0",
+      create_channel: "fe2f8015af0266fb60327c65619542a0be390fbde2f283bb19b7073fc7caef90",
+      delete_webhook: "1077b27565205f2d900437db5afafc37889d7424b45dad55f8999e56c50436d7",
+      discover_agents: "1cc22950fa7478fee94c7549a0b8c46d76c59165b0f128aa07b0461b4c8d18a4",
+      expand_capabilities: "f68e3c05bc1779d8bef11669895c21e14a2f1844c3e01ae1f57e39f48ebb8d09",
+      get_channel_messages: "06592f4a9f58da0d111640ff64829ae49f3e388c00c9ffa9c9c7230b81f1c522",
+      get_messages: "6ab5356c79e6f3c28574ee39b98ada3fc94225ebf76c82d91c528f123d750960",
+      get_messages_summary: "fc5408be92b67606153c829f0dac464afeb3c465f75dd4abb3d36a9e8884d2bf",
+      get_standup: "50fc69fcf51b6d21632b5e9be632f570c7cee8b1cbc18999a82d0a34dc2b1519",
+      get_task: "de353b956b82f757829007fd6b9d7b7c7b89500dbf6b60681cf7080b574fce9b",
+      get_tasks: "1e1416a86554d1e17346d3cc661453a4536768dfad4ef492ce60beb9aa597e7e",
+      health_check: "9558d9d8d499dfaedeb980a25bc02d4c969353a919a5080fafdcee232704f465",
+      join_channel: "46b2b3247d5a1115e1f72635bdfae99b63e88b344bbf3482fce93410321de45f",
+      leave_channel: "654ef16a3e05b55712b155643cc92b8536b9795fa68037f203f1fb5cb7b3f9d0",
+      list_webhooks: "8c0a676339308cdf9591e789636ec49ab681eed8ff662815c2bf2a9de5f87449",
+      peek_inbox_version: "5d76f1442911e752555ed122a5ccd2254c4a47df1ddcd83307dcddcf906752a1",
+      post_task: "76309d5c555329f7df772e65230ec243c544b82a0c519f1b5cdb0351edd69e24",
+      post_task_auto: "f227175138d36cc2117dc77bbadafc2d151a33d0533996a2beb572192091a535",
+      post_to_channel: "593b795f55ccd34c8d3cc668f91bc64c6a4be27f79827b09b3895ccea37e59b2",
+      register_agent: "43f3d8cb5b37ffcf8f089e23727ee2110cc792938699f04ea6cc0623e74b7128",
+      register_webhook: "d4d28a549bb28509141d7a0373fb153c1e380438c0e14579cd4b2a5eac10b009",
+      revoke_token: "6d73ab6b1d8e238b10f3a006fb44f597b099de1f344ce9f03a964f21670a018f",
+      rotate_token: "d3a9ed36a83157f59c01335df8b25978b5af23666c1b61d8ed5ad897680bfc25",
+      rotate_token_admin: "c49dd62b8cab404d4df138ade5916a08a1527796b6126fd52dec7555499aa171",
+      send_message: "b29d2537a0e3226b08965410b461e1fe7011f0eaecd7762f71cc6fb1beaa3849",
+      set_dashboard_theme: "bc6b17d24b74b289c25f6f327046298d25c035f28a3830449848283631034ed8",
+      set_status: "62feb957849a1b52dfa7d1b4f6619c49554e59161b8bddbc3db1d1221e73d4d1",
+      spawn_agent: "aad0d0af18a29bcd8f39fc2a19e6b198604d23dac377c0c53cf2b00a3cb0e7de",
+      unregister_agent: "dcd94807ba629527459cb0df2b5d73427d0b09bea7f756a47700e000685736ee",
+      update_task: "05aacb80e85bf615a033a7611bb58d673dbb7bd86e5e33f846243f323cd02931",
+    };
+
+    const actualHashes: Record<string, string> = {};
     for (const tool of [...tools].sort((a, b) => a.name.localeCompare(b.name))) {
-      hashes[tool.name] = createHash("sha256")
+      actualHashes[tool.name] = createHash("sha256")
         .update(tool.description ?? "")
         .digest("hex");
     }
-    // The actual snapshot lives in the count + presence of every name —
-    // we don't pin specific hash values (would force a snapshot bump
-    // every commit). Instead we assert: every tool name has a stable
-    // 64-char hex hash, and the set of names matches the locked surface.
-    expect(Object.keys(hashes).length).toBe(30);
-    for (const [name, h] of Object.entries(hashes)) {
-      expect(h, `hash for ${name}`).toMatch(/^[0-9a-f]{64}$/);
+
+    // Lock the tool surface (catches add/remove/rename).
+    expect(Object.keys(actualHashes).sort()).toEqual(
+      Object.keys(EXPECTED_HASHES).sort(),
+    );
+
+    // Lock every description's content (catches drift).
+    const drifted: string[] = [];
+    for (const [name, expected] of Object.entries(EXPECTED_HASHES)) {
+      const actual = actualHashes[name];
+      if (actual !== expected) {
+        drifted.push(`  ${name}: expected ${expected}, got ${actual}`);
+      }
     }
-    // Lock the tool surface — if a tool gets added/removed/renamed,
-    // this assertion catches it for explicit review.
-    const expected = [
-      "broadcast", "create_channel", "delete_webhook", "discover_agents",
-      "expand_capabilities", "get_channel_messages", "get_messages",
-      "get_messages_summary", "get_standup", "get_task", "get_tasks",
-      "health_check", "join_channel", "leave_channel", "list_webhooks",
-      "peek_inbox_version", "post_task", "post_task_auto", "post_to_channel",
-      "register_agent", "register_webhook", "revoke_token", "rotate_token",
-      "rotate_token_admin", "send_message", "set_dashboard_theme",
-      "set_status", "spawn_agent", "unregister_agent", "update_task",
-    ];
-    expect(Object.keys(hashes).sort()).toEqual(expected);
+    if (drifted.length > 0) {
+      throw new Error(
+        `${drifted.length} tool description(s) drifted from the pinned snapshot:\n` +
+          drifted.join("\n") +
+          `\n\nIf this drift is intentional, copy the new hash(es) from above into ` +
+          `EXPECTED_HASHES in tests/v2-4-4-tool-description-quality.test.ts and ` +
+          `commit alongside the description edit.`,
+      );
+    }
   });
 });
