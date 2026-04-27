@@ -4,6 +4,7 @@
 // See LICENSE for full terms.
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Readable, Writable } from "node:stream";
 import { createServer } from "../server.js";
 import { markAgentOffline, closeAgentSession, getAgentSessionId, logAudit } from "../db.js";
 import { log } from "../logger.js";
@@ -171,9 +172,21 @@ function captureSessionId(): void {
   }
 }
 
-export async function startStdioServer(): Promise<void> {
+/**
+ * v2.4.2 R1: optional `stdin` lets the TTY guard hand a PassThrough proxy
+ * (already piped from process.stdin) to the SDK transport so the first
+ * frame survives the guard's first-byte detection. When the guard is not
+ * engaged (TTY attached, or RELAY_SKIP_TTY_CHECK=1), callers pass nothing
+ * and the SDK defaults to process.stdin / process.stdout — unchanged.
+ */
+export async function startStdioServer(
+  stdin?: Readable,
+  stdout?: Writable,
+): Promise<void> {
   const server = createServer();
-  const transport = new StdioServerTransport();
+  const transport = stdin
+    ? new StdioServerTransport(stdin, stdout ?? process.stdout)
+    : new StdioServerTransport();
   captureSessionId();
   installAutoUnregister();
   await server.connect(transport);

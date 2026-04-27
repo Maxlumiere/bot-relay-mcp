@@ -28,6 +28,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, "..");
@@ -100,52 +102,60 @@ describe("v2.4.2 — TTY guard", () => {
 
     expect(result.code).toBe(3);
     expect(result.stderr).toMatch(/Transport is stdio but stdin is not a TTY/);
-    expect(result.stderr).toMatch(/no MCP client sent a frame within 1500ms/);
+    // v2.4.2 R1 LOW: the grace value in the error is interpolated from
+    // RELAY_TTY_GRACE_MS, not hardcoded. Assert the test's configured 300
+    // surfaces in the message so the LOW fix doesn't regress.
+    expect(result.stderr).toMatch(/no MCP client sent a frame within 300ms/);
     // Grace is 300ms; leave headroom for node startup + exit flush.
     expect(elapsed).toBeLessThan(5000);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }, 10_000);
 
-  it("(T2) MCP-style launch (piped stdin + initialize frame within grace) proceeds past the guard", async () => {
+  it("(T2) MCP-style launch — real SDK client connects + lists tools (THE contract, not a proxy)", async () => {
+    // Codex repro for v2.4.2 R0 proved that the previous pause+unshift
+    // approach left the first frame stranded in process.stdin while the
+    // SDK's StdioServerTransport was attached to a different reader path
+    // — Client.connect() timed out at 4s. R1 hands a PassThrough proxy to
+    // startStdioServer so the buffered first chunk reaches the SDK
+    // transport intact. This test is the contract: a real
+    // @modelcontextprotocol/sdk Client must complete connect() + list
+    // tools through the spawned binary with the guard ENGAGED. Anything
+    // less is testing a proxy, not the path operators actually use.
     const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
-    const child = spawn(process.execPath, [ENTRY], {
-      stdio: ["pipe", "pipe", "pipe"],
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [ENTRY],
       env: {
         ...process.env,
         RELAY_DB_PATH: path.join(tmpDir, "relay.db"),
         RELAY_TRANSPORT: "stdio",
-        RELAY_TTY_GRACE_MS: "800",
+        // Default grace; the SDK sends its initialize frame far inside
+        // the window. Don't override — closer to the operator path.
         RELAY_SKIP_TTY_CHECK: "",
       },
-    }) as ChildProcessWithoutNullStreams;
-
-    // Send a valid MCP initialize frame shortly after spawn — well within
-    // the 800ms grace. Any bytes cancel the guard; MCP protocol parsing
-    // happens downstream in the SDK's stdio transport layer.
-    setTimeout(() => {
-      const frame = JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-03-26",
-          capabilities: {},
-          clientInfo: { name: "tty-guard-test", version: "0.0.0" },
-        },
-      });
-      child.stdin.write(frame + "\n");
-    }, 100);
-
-    // Success signal: the server writes stdio startup lines to stderr
-    // (logger). "stdio" appears in the config-initialized message.
-    const sawStartup = await waitForStartupSignal(child, /stdio|Initializ/i, 3000);
-    expect(sawStartup).toBe(true);
-    // Process is still alive (didn't exit via the guard path).
-    expect(child.exitCode).toBeNull();
-    child.kill("SIGTERM");
-    await waitForExit(child);
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }, 10_000);
+    });
+    const client = new Client(
+      { name: "v2-4-2-tty-guard-test", version: "0.0.0" },
+      { capabilities: {} },
+    );
+    try {
+      await Promise.race([
+        client.connect(transport),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Client.connect timed out (5s)")), 5000),
+        ),
+      ]);
+      const tools = await client.listTools();
+      // Tool count is set by createServer(); we only assert "non-empty +
+      // realistic" here so the test doesn't drift every time a tool is
+      // added / removed. The contract is "client can list tools at all".
+      expect(Array.isArray(tools.tools)).toBe(true);
+      expect(tools.tools.length).toBeGreaterThanOrEqual(25);
+    } finally {
+      try { await client.close(); } catch { /* swallow */ }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("(T3) RELAY_SKIP_TTY_CHECK=1 bypasses the guard even with /dev/null stdin", async () => {
     const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
