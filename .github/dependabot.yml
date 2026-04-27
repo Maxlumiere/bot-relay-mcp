@@ -1,0 +1,48 @@
+# bot-relay-mcp — Dependabot configuration.
+#
+# v2.4.3 R1 MED (Codex 2026-04-27): the v2.4.3 R0 CHANGELOG cited
+# Dependabot as the redundant defense-in-depth that makes the audit-step
+# soft-fail on registry flakes safe. Codex verified the claim was false —
+# `gh api repos/Maxlumiere/bot-relay-mcp/vulnerability-alerts -i` returned
+# 404 / "Vulnerability alerts are disabled." This file (plus enabling
+# vulnerability alerts on the repo) makes the claim verifiable.
+#
+# Rationale for the schedule + open-PR limits:
+#   - Weekly is fine for a small library — no production fleet, no
+#     emergency rollback path that requires same-day patching.
+#   - npm bumps are gated by the existing `npm audit (high+)` step,
+#     so a Dependabot PR with a HIGH advisory will surface in CI; one
+#     without will surface in the PR description for routine review.
+#   - github-actions ecosystem covers our CI workflows (actions/checkout,
+#     actions/setup-node) — same staleness risk as production deps.
+#   - open-pull-requests-limit: 5 keeps the queue manageable while
+#     still surfacing every meaningful upgrade. Bumping it past 5 has
+#     historically meant Dependabot PRs pile up unread; 5 is the
+#     "look at it on Monday" threshold.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - npm
+    commit-message:
+      prefix: deps
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope

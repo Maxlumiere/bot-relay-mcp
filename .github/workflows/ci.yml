@@ -36,13 +36,20 @@ jobs:
       - name: Run test suite
         run: npx vitest run
 
-      - name: npm audit (high+)
+      - name: npm audit (high+) — via resilience wrapper
         # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
         # after GHSA-w5hq-g745-h8pq (uuid <14 buffer bounds, v3/v5/v6+buf).
         # We use v4() no-args only — not vulnerable. uuid@14 drops Node 18
-        # support; engines field still commits to >=18. Kept in sync with
-        # scripts/pre-publish-check.sh's --audit-level=high.
-        run: npm audit --audit-level=high
+        # support; engines field still commits to >=18.
+        #
+        # v2.4.3 R1 HIGH 1 (Codex 2026-04-27): all `npm audit` invocations
+        # (CI + pre-publish gate alike) MUST go through scripts/audit-with-
+        # retry.sh. Calling raw `npm audit` here was the original v2.4.0
+        # CI-red-on-flake bug Codex caught — fixed in pre-publish but the
+        # CI step itself stayed raw, leaving the public main badge exposed
+        # to the same registry endpoint flakes the wrapper exists to absorb.
+        # Guarded by tests/v2-4-3-ci-audit-bypass-guard.test.ts.
+        run: bash scripts/audit-with-retry.sh high
 
   smoke:
     name: 25-tool smoke (Node 22)

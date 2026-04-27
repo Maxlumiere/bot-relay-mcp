@@ -46,12 +46,28 @@ run_audit_once() {
   fi
 }
 
-# A failure mode is "transient" if stderr surfaces any of the registry-side
-# error markers we know about. Keep this list tight: false positives let
-# real vulns hide; false negatives just mean an extra retry.
+# A failure mode is "transient" if stderr surfaces a known registry-side
+# error marker. v2.4.3 R1 HIGH 2 (Codex 2026-04-27): narrowed from the
+# blanket "HTTP 4[0-9][0-9]" match — that was classifying 401/403/404
+# (auth/permission/config issues, deterministic) as transient and soft-
+# failing through them. Now only the specific retry-worthy codes apply:
+#
+#   - 5xx — server errors (npm registry side)
+#   - 408 — Request Timeout (client-perceived timeout)
+#   - 429 — Too Many Requests (rate-limit; retry with backoff is correct)
+#   - ENETWORK / EAI_AGAIN / ECONNRESET / ECONNREFUSED / ETIMEDOUT /
+#     ENOTFOUND — transport-level failures
+#   - "endpoint is being retired" — explicit npm sunset signal (the
+#     v2.4.0 main repro)
+#   - "fetch failed" / "socket hang up" — node-fetch transport messages
+#
+# Anything else (including 401 / 403 / 404 / 410 / generic "Bad Request"
+# without the sunset signal) → NOT transient → caller exits 1 so the
+# operator sees the deterministic problem instead of a soft-fail. False
+# positives let real vulns hide; false negatives just mean an extra retry.
 is_transient() {
   local err="$1"
-  echo "$err" | grep -qiE 'EAI_AGAIN|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ENETWORK|ECONNRESET|HTTP 5[0-9][0-9]|HTTP 4[0-9][0-9]|Bad Request|endpoint is being retired|registry returned|fetch failed|socket hang up'
+  echo "$err" | grep -qiE 'EAI_AGAIN|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ENETWORK|ECONNRESET|HTTP 5[0-9][0-9]|HTTP 408|HTTP 429|endpoint is being retired|fetch failed|socket hang up'
 }
 
 # A "real high+ finding" is metadata.vulnerabilities.{high,critical} > 0 in
