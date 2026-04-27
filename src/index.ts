@@ -12,6 +12,7 @@ import { log } from "./logger.js";
 import { parseCliFlags, applyCliToEnv, usage } from "./cli.js";
 import { VERSION } from "./version.js";
 import type { Server as HttpServer } from "http";
+import { PassThrough } from "node:stream";
 
 const MIN_NODE_MAJOR = 18;
 
@@ -79,34 +80,98 @@ async function main(): Promise<void> {
     throw err;
   }
 
-  // v2.2.1 B3: stdio transport requires a live TTY. Running `node
-  // dist/index.js` in a non-interactive shell (Claude Code bash sandbox,
-  // systemd service with no pty, background tab) defaults to stdio and
-  // exits the moment stdin closes — silent daemon death. Loud refusal
-  // beats magical auto-upgrade: operators running the binary as a daemon
-  // MUST pick http explicitly, otherwise we tell them why + exit.
+  // v2.2.1 B3 (refined in v2.4.2): stdio transport with non-TTY stdin is
+  // usually a daemon-launch mistake — `node dist/index.js` from a systemd
+  // service or background tab defaults to stdio and exits the moment stdin
+  // closes. Loud refusal beats silent daemon death.
   //
-  // Guard ordering: after config resolution (so env + CLI + file have all
-  // had a chance to set transport) and BEFORE initializeDb/port-bind (no
-  // side effects on the exit path). `RELAY_SKIP_TTY_CHECK=1` is the escape
-  // hatch for tests that legitimately want stdio piped from a harness.
+  // v2.4.2 refinement — the v2.2.1 guard over-fired on legitimate MCP
+  // clients (Claude Code, Cursor, Cline, …) which ALWAYS pipe stdin as
+  // part of the JSON-RPC protocol. Every post-v2.2.1 MCP spawn silently
+  // failed until the operator set RELAY_SKIP_TTY_CHECK=1 — a plug-and-play
+  // regression. New heuristic: if stdio + non-TTY, wait up to graceMs ms
+  // for any bytes on stdin. MCP clients send `initialize` within the
+  // first hundred ms, so they proceed. Background daemon attempts have
+  // no writer, so they hit the timeout + get the helpful error.
+  //
+  // v2.4.2 R1 (Codex HIGH fix): the previous shape used
+  //   process.stdin.on('data', …) + pause() + unshift(chunk)
+  // to "give the bytes back" to the SDK. Codex repro proved this drops
+  // the first frame — Client.connect against the built binary timed out
+  // at 4s while the same client with RELAY_SKIP_TTY_CHECK=1 listed 30
+  // tools cleanly. Switched to a PassThrough proxy: process.stdin is
+  // piped into the proxy, the guard watches the proxy's 'readable' event
+  // (non-consuming), and the proxy is handed to startStdioServer →
+  // StdioServerTransport(stdin, stdout) so the SDK reads from the same
+  // proxy that already buffered the first chunk.
+  //
+  // Guard ordering: after config resolution (env + CLI + file have all
+  // had a chance to set transport) and BEFORE initializeDb / port-bind
+  // (no side effects on the exit path). `RELAY_SKIP_TTY_CHECK=1` stays
+  // as the explicit bypass for test harnesses whose first write comes
+  // after the grace window.
+  let stdinForMcp: import("node:stream").Readable | undefined;
   if (
     config.transport === "stdio" &&
     !process.stdin.isTTY &&
     process.env.RELAY_SKIP_TTY_CHECK !== "1"
   ) {
-    process.stderr.write(
-      "Transport is stdio but stdin is not a TTY. The stdio transport will " +
-        "exit the moment stdin closes — that's almost certainly not what you " +
-        "want for a daemon.\n\n" +
-        "Fix one of:\n" +
-        "  (a) set RELAY_TRANSPORT=http (+ RELAY_HTTP_PORT=3777 for the usual port), or\n" +
-        "  (b) run `node dist/index.js --transport=http --port=3777` directly, or\n" +
-        "  (c) run interactively (attach a real TTY — e.g. a terminal, not a Claude Code bash block).\n\n" +
-        "See docs/deployment.md. Override this check with RELAY_SKIP_TTY_CHECK=1 " +
-        "if you're piping the session deliberately from a test harness.\n"
-    );
-    process.exit(3);
+    // Read the configured grace in ms so tests can drive it tight.
+    const graceMs = Number(process.env.RELAY_TTY_GRACE_MS) > 0
+      ? Number(process.env.RELAY_TTY_GRACE_MS)
+      : 1500;
+    const TTY_GUARD_ERROR =
+      `Transport is stdio but stdin is not a TTY, and no MCP client sent a ` +
+      `frame within ${graceMs}ms. The stdio transport will exit the moment stdin ` +
+      `closes — that's almost certainly not what you want for a daemon.\n\n` +
+      `Fix one of:\n` +
+      `  (a) set RELAY_TRANSPORT=http (+ RELAY_HTTP_PORT=3777 for the usual port), or\n` +
+      `  (b) run \`node dist/index.js --transport=http --port=3777\` directly, or\n` +
+      `  (c) run interactively (attach a real TTY — e.g. a terminal, not a Claude Code bash block).\n\n` +
+      `See docs/deployment.md. Override this check with RELAY_SKIP_TTY_CHECK=1 ` +
+      `if you're piping the session deliberately from a test harness that ` +
+      `writes its first frame later than ${graceMs}ms.\n`;
+    // PassThrough proxy: process.stdin is piped through; the SDK transport
+    // will consume from this same stream so the buffered first chunk is
+    // delivered intact. 'readable' (not 'data') is non-consuming, so the
+    // chunk stays in the proxy's internal buffer for the SDK to read.
+    const stdinProxy = new PassThrough();
+    process.stdin.pipe(stdinProxy);
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const cleanup = () => {
+        stdinProxy.removeListener("readable", onReadable);
+        stdinProxy.removeListener("end", onEnd);
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        process.stderr.write(TTY_GUARD_ERROR);
+        process.exit(3);
+      }, graceMs);
+      const onReadable = () => {
+        if (settled) return;
+        // Bytes are sitting in the proxy's internal buffer. Don't read()
+        // them — let the SDK's 'data' listener drain them when it attaches.
+        if (stdinProxy.readableLength <= 0) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        resolve();
+      };
+      const onEnd = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        process.stderr.write(TTY_GUARD_ERROR);
+        process.exit(3);
+      };
+      stdinProxy.on("readable", onReadable);
+      stdinProxy.once("end", onEnd);
+    });
+    stdinForMcp = stdinProxy;
   }
 
   // Pre-initialize the DB so schema + purge run up front.
@@ -120,7 +185,7 @@ async function main(): Promise<void> {
   }
 
   if (config.transport === "stdio" || config.transport === "both") {
-    await startStdioServer();
+    await startStdioServer(stdinForMcp);
   }
 
   if (config.transport === "http" && !httpServer) {
