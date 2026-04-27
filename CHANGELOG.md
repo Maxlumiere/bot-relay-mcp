@@ -6,22 +6,37 @@ The CI green badge on main has to track code health, not npm registry weather. P
 
 ### Added
 
-- **`scripts/audit-with-retry.sh`** — resilient wrapper around `npm audit --json --audit-level=$LEVEL` (modern bulk-advisory endpoint on npm 10+). Classifies outcomes into three buckets: clean (exit 0), real high+ vuln finding (exit 1, no retry), or transient registry-side error (HTTP 4xx/5xx, ENETWORK, EAI_AGAIN, etc.). Transient errors retry up to 3 times with 5/15/30s backoff; if all 3 attempts hit transient errors, the wrapper soft-fails to exit 0 with a loud WARN. Real high+ findings still exit 1 immediately. Unknown / malformed responses with no transient marker also exit 1 (don't silently skip a new failure mode). Test-injection seam (`RELAY_TEST_AUDIT_CMD`) lets tests mock the registry without touching the network.
+- **`scripts/audit-with-retry.sh`** — resilient wrapper around `npm audit --json --audit-level=$LEVEL` (modern bulk-advisory endpoint on npm 10+). Classifies outcomes into three buckets: clean (exit 0), real high+ vuln finding (exit 1, no retry), or transient registry-side error. Transient errors retry up to 3 times with 5/15/30s backoff; if all 3 attempts hit transient errors, the wrapper soft-fails to exit 0 with a loud WARN. Real high+ findings still exit 1 immediately. Unknown / malformed responses with no transient marker also exit 1 (don't silently skip a new failure mode). Test-injection seam (`RELAY_TEST_AUDIT_CMD`) lets tests mock the registry without touching the network.
 - **`scripts/pre-publish-check.sh`** — `npm audit (high+)` step now invokes the wrapper instead of calling `npm audit` directly. Behavior on a clean registry is unchanged (still gates on real high+ vulns).
+- **`.github/workflows/ci.yml`** *(R1)* — same rewire applied to the CI workflow. R0 only patched the pre-publish gate; the CI step itself stayed raw, so the public main badge was still exposed to the same registry endpoint flakes the wrapper exists to absorb. Both invocations now go through the wrapper.
+- **`.github/dependabot.yml`** *(R1)* — Dependabot configuration covering both the `npm` and `github-actions` ecosystems on a weekly Monday schedule. Repo-side `vulnerability-alerts` and `automated-security-fixes` settings flipped on at the same time so Dependabot's defense-in-depth claim in this CHANGELOG is verifiable (`gh api repos/<owner>/<repo>/vulnerability-alerts` returns 204; `automated-security-fixes` returns `{"enabled":true,"paused":false}`).
+
+### Transient classifier (narrowed in R1)
+
+Codex caught that R0's classifier blanket-matched HTTP 4xx, which soft-failed through 401 / 403 / 404 — those are deterministic auth/permission/config problems, not registry flakes. The R1 classifier is narrow:
+
+- 5xx — server errors → transient
+- 408 Request Timeout → transient
+- 429 Too Many Requests → transient (backoff is the correct response)
+- `ENETWORK` / `EAI_AGAIN` / `ECONNRESET` / `ECONNREFUSED` / `ETIMEDOUT` / `ENOTFOUND` → transient transport
+- `endpoint is being retired` (the explicit npm sunset signal — the v2.4.0 main repro) → transient
+- `fetch failed` / `socket hang up` (node-fetch transport messages) → transient
+- 4xx other than 408/429 (incl. 401, 403, 404, 410) → **not** transient → exit 1
 
 ### Why soft-fail is safe
 
-`npm audit` is one input among many for security gating. Dependabot is enabled on the repo (independent network path; no shared failure mode with the audit endpoint), and the wrapper exits 1 the moment a real high+ vuln finding parses out of the JSON metadata. The soft-fail only triggers when **three consecutive attempts** all hit registry-side transport errors (not vuln findings) — at that point the registry itself is unreachable, blocking the CI badge would still not surface a new advisory, and we'd rather see the warning in CI logs than a red badge on a public repo with passing tests.
+`npm audit` is one input among many for security gating. **Dependabot is enabled on the repo** (verified via the GitHub API after R1 — see `.github/dependabot.yml` plus the repo-side `vulnerability-alerts` + `automated-security-fixes` toggles), giving an independent network path with no shared failure mode with the audit endpoint. The wrapper exits 1 the moment a real high+ vuln finding parses out of the JSON metadata. The soft-fail only triggers when **three consecutive attempts** all hit narrowly-classified transient transport errors — at that point the registry itself is unreachable, blocking the CI badge would still not surface a new advisory, and we'd rather see the warning in CI logs than a red badge on a public repo with passing tests.
 
 ### Tests
 
-- `tests/v2-4-3-pre-publish-audit-resilience.test.ts` +6 cases mocking `npm audit` via the test-injection seam: clean first try (exit 0), real high+ finding (exit 1, no retry), the exact 400/"endpoint is being retired" repro from the v2.4.0 main red CI (3 retries → soft-fail to 0), 503 with backoff (3 retries → soft-fail to 0), malformed JSON with no transient marker (exit 1), transient-then-clean (1 retry → success at attempt 2, no soft-fail).
+- `tests/v2-4-3-pre-publish-audit-resilience.test.ts` — 11 cases (R0: 6, R1: +5) mocking `npm audit` via the test-injection seam. R0 cases: clean first try (exit 0), real high+ finding (exit 1, no retry), the exact 400/"endpoint is being retired" repro from the v2.4.0 main red CI (3 retries → soft-fail to 0), 503 with backoff (3 retries → soft-fail to 0), malformed JSON with no transient marker (exit 1), transient-then-clean (1 retry → success at attempt 2, no soft-fail). R1 cases: 401 Unauthorized → exit 1 immediately, 403 Forbidden → exit 1 immediately, 404 on the audit endpoint → exit 1 immediately, 408 Request Timeout 3x → soft-fail, 429 Too Many Requests 3x → soft-fail.
+- `tests/v2-4-3-ci-audit-bypass-guard.test.ts` *(R1)* — sweeps `.github/workflows/*.yml` for raw `npm audit` invocations outside the wrapper. Same drift-grep shape as the pre-publish gate's existing guards. Catches the exact regression Codex flagged: the wrapper exists but the CI step bypasses it.
 
-**Total after v2.4.3: 1130 tests pass** (1124 pre-v2.4.3 + 6 new).
+**Total after v2.4.3 R1: 1137 tests pass** (1124 pre-v2.4.3 + 6 R0 + 5 R1 audit cases + 2 R1 bypass-guard cases).
 
 ### Cross-platform parity
 
-Pure bash + `npm` + `python3` (Python is preinstalled on every CI runner the repo targets — Ubuntu macOS Windows all have it). The audit step runs on Ubuntu CI runners only; nothing platform-specific in the wrapper itself.
+Pure bash + `npm` + `python3` (Python is preinstalled on every CI runner the repo targets). The audit step runs on Ubuntu CI runners only; nothing platform-specific in the wrapper itself.
 
 ## v2.4.2 — 2026-04-24 — stdio TTY guard refinement (closes v2.2.1 oversight)
 

@@ -106,6 +106,55 @@ describe("v2.4.3 — npm audit resilience wrapper", () => {
     expect(r.stderr).not.toMatch(/soft-failing/);
   });
 
+  // v2.4.3 R1 HIGH 2 regression cases (Codex 2026-04-27). The R0
+  // classifier blanket-matched HTTP 4xx, soft-failing through 401/403/404
+  // (deterministic auth/config issues, NOT transient). Now narrowed to
+  // 5xx + 408 + 429 + named transport errors + the explicit sunset signal.
+
+  it("(A7) HTTP 401 Unauthorized → exit 1 immediately, no retry, no soft-fail", () => {
+    // Auth misconfiguration is deterministic. Retrying just hides it.
+    const mock = `echo '{}'; echo "npm error 401 Unauthorized - GET https://registry.npmjs.org/-/npm/v1/security/advisories/bulk" >&2; exit 1`;
+    const r = runWrapper({ RELAY_TEST_AUDIT_CMD: mock });
+    expect(r.status).toBe(1);
+    expect(r.stderr).not.toMatch(/retrying/);
+    expect(r.stderr).not.toMatch(/soft-failing/);
+    expect(r.stderr).toMatch(/unknown failure mode/);
+  });
+
+  it("(A8) HTTP 403 Forbidden → exit 1 immediately, no retry, no soft-fail", () => {
+    const mock = `echo '{}'; echo "npm error 403 Forbidden - GET https://registry.npmjs.org/-/npm/v1/security/advisories/bulk" >&2; exit 1`;
+    const r = runWrapper({ RELAY_TEST_AUDIT_CMD: mock });
+    expect(r.status).toBe(1);
+    expect(r.stderr).not.toMatch(/retrying/);
+    expect(r.stderr).not.toMatch(/soft-failing/);
+  });
+
+  it("(A9) HTTP 408 Request Timeout 3x → retries with backoff → soft-fail to exit 0", () => {
+    const mock = `echo '{}'; echo "npm error HTTP 408 Request Timeout" >&2; exit 1`;
+    const r = runWrapper({ RELAY_TEST_AUDIT_CMD: mock });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/transient registry errors 3x in a row/);
+    expect(r.stderr).toMatch(/HTTP 408/);
+  });
+
+  it("(A10) HTTP 429 Too Many Requests 3x → retries with backoff → soft-fail to exit 0", () => {
+    const mock = `echo '{}'; echo "npm error HTTP 429 Too Many Requests" >&2; exit 1`;
+    const r = runWrapper({ RELAY_TEST_AUDIT_CMD: mock });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/transient registry errors 3x in a row/);
+    expect(r.stderr).toMatch(/HTTP 429/);
+  });
+
+  it("(A11) HTTP 404 on the audit endpoint → exit 1 immediately, no soft-fail", () => {
+    // 404 means the endpoint URL changed — that's a structural problem
+    // worth surfacing, not a transient flake to paper over.
+    const mock = `echo '{}'; echo "npm error 404 Not Found - GET https://registry.npmjs.org/-/npm/v1/security/advisories/bulk" >&2; exit 1`;
+    const r = runWrapper({ RELAY_TEST_AUDIT_CMD: mock });
+    expect(r.status).toBe(1);
+    expect(r.stderr).not.toMatch(/retrying/);
+    expect(r.stderr).not.toMatch(/soft-failing/);
+  });
+
   it("(A6) transient on attempt 1 then clean → exit 0 without soft-fail", () => {
     // Retry budget should fund recovery, not just paper over real failures.
     // First attempt hits a transient error; second attempt succeeds; the
