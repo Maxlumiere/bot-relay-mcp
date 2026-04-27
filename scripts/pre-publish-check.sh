@@ -62,7 +62,15 @@ step "vitest run" npx vitest run || exit 1
 # will still be addressed; bumping to `high` lets us keep Node 18 support
 # without shipping false-positive audit failures. Revisit when (a) uuid
 # backports to v13 in a Node-18-compatible way OR (b) we drop Node 18.
-step "npm audit (high+)" npm audit --audit-level=high || exit 1
+#
+# v2.4.3 (2026-04-27): direct `npm audit` call replaced with
+# `scripts/audit-with-retry.sh`. The legacy `/audits/quick` endpoint went
+# 400 Bad Request on the v2.4.0 main merge — code was fine, the public
+# CI badge swung red over an npm registry flake. The wrapper retries
+# transient registry errors with backoff and soft-fails on three-in-a-row
+# transient classifications (Dependabot remains the defense-in-depth for
+# real advisories). Real high+ vuln findings still exit 1 immediately.
+step "npm audit (high+)" bash "$PROJECT_ROOT/scripts/audit-with-retry.sh" high || exit 1
 
 # --- 4. Production build ---
 step "npm run build" npm run build || exit 1
