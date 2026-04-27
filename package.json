@@ -1,6 +1,6 @@
 {
   "name": "bot-relay-mcp",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "description": "MCP server for AI coding agent terminal-to-terminal communication. Local-first, SQLite-backed, webhook-integrated.",
   "type": "module",
   "main": "dist/index.js",
