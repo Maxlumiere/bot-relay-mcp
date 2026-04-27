@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.4.3 — 2026-04-27 — pre-publish `npm audit` resilience
+
+The CI green badge on main has to track code health, not npm registry weather. Pre-v2.4.3 it tracked both — when the v2.4.0 main merge ran post-tests, the legacy `/-/npm/v1/security/audits/quick` endpoint returned 400 ("This endpoint is being retired. Use the bulk advisory endpoint instead.") and the public CI badge swung red even though all 1099 tests passed. Same commit's branch CI was green a few minutes earlier — pure registry-side flake. Maxime's standing directive: "this is public not internal — i cannot have that every time we push."
+
+### Added
+
+- **`scripts/audit-with-retry.sh`** — resilient wrapper around `npm audit --json --audit-level=$LEVEL` (modern bulk-advisory endpoint on npm 10+). Classifies outcomes into three buckets: clean (exit 0), real high+ vuln finding (exit 1, no retry), or transient registry-side error (HTTP 4xx/5xx, ENETWORK, EAI_AGAIN, etc.). Transient errors retry up to 3 times with 5/15/30s backoff; if all 3 attempts hit transient errors, the wrapper soft-fails to exit 0 with a loud WARN. Real high+ findings still exit 1 immediately. Unknown / malformed responses with no transient marker also exit 1 (don't silently skip a new failure mode). Test-injection seam (`RELAY_TEST_AUDIT_CMD`) lets tests mock the registry without touching the network.
+- **`scripts/pre-publish-check.sh`** — `npm audit (high+)` step now invokes the wrapper instead of calling `npm audit` directly. Behavior on a clean registry is unchanged (still gates on real high+ vulns).
+
+### Why soft-fail is safe
+
+`npm audit` is one input among many for security gating. Dependabot is enabled on the repo (independent network path; no shared failure mode with the audit endpoint), and the wrapper exits 1 the moment a real high+ vuln finding parses out of the JSON metadata. The soft-fail only triggers when **three consecutive attempts** all hit registry-side transport errors (not vuln findings) — at that point the registry itself is unreachable, blocking the CI badge would still not surface a new advisory, and we'd rather see the warning in CI logs than a red badge on a public repo with passing tests.
+
+### Tests
+
+- `tests/v2-4-3-pre-publish-audit-resilience.test.ts` +6 cases mocking `npm audit` via the test-injection seam: clean first try (exit 0), real high+ finding (exit 1, no retry), the exact 400/"endpoint is being retired" repro from the v2.4.0 main red CI (3 retries → soft-fail to 0), 503 with backoff (3 retries → soft-fail to 0), malformed JSON with no transient marker (exit 1), transient-then-clean (1 retry → success at attempt 2, no soft-fail).
+
+**Total after v2.4.3: 1130 tests pass** (1124 pre-v2.4.3 + 6 new).
+
+### Cross-platform parity
+
+Pure bash + `npm` + `python3` (Python is preinstalled on every CI runner the repo targets — Ubuntu macOS Windows all have it). The audit step runs on Ubuntu CI runners only; nothing platform-specific in the wrapper itself.
+
 ## v2.4.2 — 2026-04-24 — stdio TTY guard refinement (closes v2.2.1 oversight)
 
 Fixes a plug-and-play regression introduced in v2.2.1: the stdio TTY guard (`src/index.ts`) exited immediately when stdin was not a TTY, which is the default configuration for every legitimate MCP client (Claude Code, Cursor, Cline, …). Every new MCP spawn after v2.2.1 silently failed until the operator added `RELAY_SKIP_TTY_CHECK=1` to their `~/.claude.json` `mcpServers.bot-relay.env` block. The regression was masked for six releases by the long-running pre-v2.2.1 daemon, which kept serving existing operators without re-spawning.
