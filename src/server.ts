@@ -279,174 +279,317 @@ export function createServer(): Server {
   // v2.3.0 Part B.2 — frozen tool definition list. Pulled out of the
   // setRequestHandler closure so isToolVisible can filter it; same data
   // shape as before, no runtime semantic change.
+  // v2.4.4 — Glama A-tier description push.
+  //
+  // Each tool below uses the same structured shape:
+  //   Purpose. When to use vs alternatives. Behavior + auth + side effects.
+  //   Returns shape. Errors (error_code → cause).
+  // Markdown-style line breaks (\n\n) are preserved by the MCP SDK and
+  // render in clients that surface tool descriptions to humans (Glama,
+  // mcp-inspector). Length is uniform across the 30 tools so the Glama
+  // TDQS MIN-weighted (40%) score isn't dragged by a one-liner.
   const ALL_TOOLS_DEFINITION = [
       {
         name: "register_agent",
         description:
-          "Register this terminal as a named agent. Call this first to announce your identity, role, and capabilities to other agents. Uses upsert — safe to call multiple times.",
+          "Register this terminal as a named agent so other agents can address it.\n\n" +
+          "When to use: call this first thing in any session that needs to send/receive messages, post tasks, or join channels. Idempotent upsert, safe to call again on reconnect. The SessionStart hook (`hooks/check-relay.sh`) typically calls it for you.\n\n" +
+          "Behavior: creates or updates the agent row keyed by `name`. First registration mints a fresh agent_token (returned ONCE, store it in `RELAY_AGENT_TOKEN`). Re-registering preserves the existing token unless `recovery_token` is presented (v2.1 Phase 4b.1 v2 recovery flow). Capabilities are immutable on re-register (v1.7.1), use `expand_capabilities` for additive changes.\n\n" +
+          "Returns: `{ agent: { name, role, capabilities, status, has_token, agent_status, ... }, plaintext_token: string | null, auto_assigned: QueuedAssignment[] }`.\n\n" +
+          "Errors: `AUTH_FAILED` (recovery_pending row presented without recovery_token), `RECOVERY_REQUIRED` (token rejected, present recovery_token), `INVALID_INPUT` (name/role/capabilities malformed), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(RegisterAgentSchema),
       },
       {
         name: "discover_agents",
         description:
-          "List all registered agents with their current status (online/stale/offline). Optionally filter by role.",
+          "List every registered agent with computed presence + operator-controlled status.\n\n" +
+          "When to use: pick a routing target by role (e.g., 'any builder'), confirm an expected agent is online before sending it work, or surface the agent fleet to a dashboard. For periodic team rollups use `get_standup` instead, it bundles agents + recent activity in one call.\n\n" +
+          "Behavior: pure read; never mutates `last_seen` (v1.3 presence-integrity fix). Optionally filters by `role`. The returned `status` (online | stale | offline) is computed from `last_seen` deltas; the returned `agent_status` (idle | working | blocked | waiting_user | stale | offline | abandoned | closed) is operator-controlled via `set_status`. Token hashes are stripped, `has_token: boolean` only.\n\n" +
+          "Returns: `{ agents: AgentWithStatus[] }` ordered by `last_seen DESC`.\n\n" +
+          "Errors: `RATE_LIMITED`. (No auth required, this surface is intentionally observable for orchestration.)",
         inputSchema: zodToJsonSchema(DiscoverAgentsSchema),
       },
       {
         name: "unregister_agent",
         description:
-          "Remove an agent from the relay. Use when a terminal is closing to let the relay reflect true presence. Idempotent — returns removed:false if the agent was not registered.",
+          "Remove an agent row so the relay reflects true presence after a clean shutdown.\n\n" +
+          "When to use: terminal exit, role rotation, or one half of the recovery flow when reusing a name after `revoke_token` set the row to `revoked`. For graceful working-state announcements without removing the row, use `set_status` with `offline` instead.\n\n" +
+          "Behavior: deletes the agent row + all messages and tasks the agent was the from/to of (cascade). Idempotent, unregistering a name that does not exist returns `removed:false` instead of an error. Auth: requires the agent's own token, OR for admin removals an authenticated agent with `manage_others` capability.\n\n" +
+          "Returns: `{ removed: boolean }`.\n\n" +
+          "Errors: `AUTH_FAILED` (token missing or wrong owner), `INVALID_INPUT`.",
         inputSchema: zodToJsonSchema(UnregisterAgentSchema),
       },
       {
         name: "spawn_agent",
         description:
-          "Spawn a new Claude Code terminal pre-configured as a relay agent. Opens a new iTerm2/Terminal.app window with RELAY_AGENT_NAME/ROLE/CAPABILITIES set. The SessionStart hook auto-registers the agent on startup. Optionally queue an initial_message that the new agent sees on arrival. v2.1.4: optional brief_file_path threads a durable task-brief file path into the KICKSTART prompt so respawned agents read canonical scope from disk (not inbox messages that can read as injection). macOS only.",
+          "Open a new Claude Code terminal pre-configured as a relay agent (macOS only).\n\n" +
+          "When to use: orchestrators delegating work to a fresh sub-agent. The new terminal arrives in a known role + capability set with `RELAY_AGENT_NAME`/`ROLE`/`CAPABILITIES` already in env, and the SessionStart hook auto-registers it before the LLM's first turn. Linux/Windows drivers exist for headless smoke tests but do not open a UI window.\n\n" +
+          "Behavior: pre-registers the new agent server-side (so its token is minted before the child process starts and reaches it via env), opens an iTerm2 or Terminal.app window via AppleScript, and runs the configured shell command in that window. Optional `initial_message` is queued in the new agent's mailbox and surfaces on its first `get_messages`. `brief_file_path` (v2.1.4) threads a durable on-disk task brief into the KICKSTART prompt, preferred over `initial_message` for non-trivial scopes because file-on-disk does not read as prompt-injection the way an inbox message can.\n\n" +
+          "Returns: `{ agent_name, agent_token, terminal_title_ref?, ... }`.\n\n" +
+          "Errors: `SPAWN_NOT_SUPPORTED` (non-macOS host without an explicit driver), `AUTH_FAILED`, `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(SpawnAgentSchema),
       },
       {
         name: "send_message",
         description:
-          "Send a text message to a specific agent. The message is stored and the recipient will see it when they call get_messages.",
+          "Send a text message addressed to a single agent.\n\n" +
+          "When to use: 1:1 communication, dispatching work, relaying a status update, asking a peer a question. Prefer `broadcast` for fan-out to many agents, `post_to_channel` for topical group coordination, and `post_task` (or `post_task_auto`) when the recipient should track state-machine progress (accept/complete/reject) rather than a free-text message.\n\n" +
+          "Behavior: stores the message with `status='pending'` and notifies any matching webhook subscribers (`message.sent` event). The recipient sees it on its next `get_messages` call (which auto-marks read unless `peek=true`). Content is encrypted at rest if `RELAY_ENCRYPTION_KEY` is set. Caps at `RELAY_MAX_PAYLOAD_BYTES` (default 64 KB). Auth: sender must present a valid token whose row matches `from`.\n\n" +
+          "Returns: `{ message_id, status: 'pending', created_at }`.\n\n" +
+          "Errors: `AUTH_FAILED` (token missing/mismatched), `PAYLOAD_TOO_LARGE`, `UNKNOWN_RECIPIENT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(SendMessageSchema),
       },
       {
         name: "get_messages",
         description:
-          "Check your mailbox for messages. Returns messages addressed to you, newest first. Pending messages are automatically marked as read. v2.1.6: optional `since` trims stale backlog (default '24h'; pass 'all' or null for the pre-v2.1.6 unlimited behavior). v2.2.1: when status='pending' AND count=0 AND since<24h, response includes a `hint` field nudging toward since='all' — the `since` filter trims both pending AND read mail, so a narrow window can hide older pending work. v2.2.2: optional `peek` (default false) skips the mark-as-read side effect so repeated status='pending' polls by the same session return the same rows — use for orchestrator inbox surveys that must not consume mail.",
+          "Drain or peek your own mailbox.\n\n" +
+          "When to use: each turn that should observe new mail; orchestrators that batch-poll many agents may prefer `get_messages_summary` (cheaper preview) or `peek_inbox_version` (counts only). For surveys that must NOT consume mail, set `peek=true`.\n\n" +
+          "Behavior: returns messages addressed to you, ordered by priority then `created_at` newest-first. By default `status='pending'` returns un-read messages and atomically marks them read for THIS session (sessions are per-`session_id`; a fresh terminal re-sees previously-read messages, v2.0 final fix). Optional `since` (`'1h' | '24h' | '7d' | ISO | 'all'`) trims old mail (v2.1.6 default `'24h'`). When `status='pending'` returns 0 with `since<24h`, the response includes a `hint` field nudging toward `since='all'`. `peek=true` (v2.2.2) suppresses the read-side-effect entirely.\n\n" +
+          "Returns: `{ messages: MessageRecord[], hint?: string }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `INVALID_INPUT` (bad `since` format), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetMessagesSchema),
       },
       {
         name: "get_messages_summary",
         description:
-          "v2.1.6: lightweight inbox preview. Same filter surface as get_messages (status + since) but returns only message headers + a 100-char content_preview. Does NOT mark messages read — pure observation. Use to scan an inbox cheaply then expand chosen IDs via get_messages.",
+          "Cheap, non-mutating mailbox preview (v2.1.6).\n\n" +
+          "When to use: orchestrators scanning many inboxes per cycle, dashboards rendering a per-agent backlog count, or any flow where you want to see what is there without consuming it. After picking interesting IDs, expand them with `get_messages` (which CAN mutate) or read them by ID.\n\n" +
+          "Behavior: same `status` + `since` filter surface as `get_messages`. Returns headers + a 100-char `content_preview` (decrypted on the fly when `RELAY_ENCRYPTION_KEY` is set). Never marks messages read. Auth: agent token (own mailbox only).\n\n" +
+          "Returns: `{ messages: { id, from_agent, to_agent, priority, status, created_at, content_preview }[] }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetMessagesSummarySchema),
       },
       {
         name: "broadcast",
         description:
-          "Send a message to all registered agents (or all agents with a specific role). Excludes the sender.",
+          "Fan out a single message to every registered agent (or every agent of a given role).\n\n" +
+          "When to use: announcements, fleet-wide pings, role-targeted prompts ('all builders, refresh your dependencies'). For 1:1 use `send_message`. For topical group coordination prefer `post_to_channel`, channels persist membership and avoid spamming agents who have explicitly opted out by leaving.\n\n" +
+          "Behavior: stores one row per recipient with `status='pending'`; the sender is excluded from the recipient set. Fires one `message.broadcast` webhook event for the whole batch (delivery_id + idempotency_key in the envelope). Optional `role` narrows the recipient set. Same payload size cap as `send_message` (`RELAY_MAX_PAYLOAD_BYTES`).\n\n" +
+          "Returns: `{ delivered_count: number, recipients: string[] }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `PAYLOAD_TOO_LARGE`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(BroadcastSchema),
       },
       {
         name: "post_task",
         description:
-          "Assign a task to another agent. Creates a task with status 'posted'. The assigned agent can accept, complete, or reject it.",
+          "Assign a tracked task to a specific agent.\n\n" +
+          "When to use: work that should move through accept then complete/reject and report a result, with a single named owner. Prefer `post_task_auto` when you do not care which capable agent picks it up. Prefer `send_message` for free-text comms that do not need a state machine.\n\n" +
+          "Behavior: creates a row with `status='posted'` and notifies `task.posted` webhook subscribers. The assignee accepts/completes/rejects via `update_task`; the assigner can `cancel` via the same call. Tasks have a heartbeat lease, if the assignee does not `update_task action='heartbeat'` within `RELAY_TASK_LEASE_SECONDS`, the health monitor surfaces the task as stuck. Auth: requester token; `to` must be a registered agent.\n\n" +
+          "Returns: `{ task_id, status: 'posted', created_at }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `UNKNOWN_RECIPIENT`, `PAYLOAD_TOO_LARGE`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(PostTaskSchema),
       },
       {
         name: "post_task_auto",
         description:
-          "Auto-route a task to the least-loaded agent whose capabilities match ALL `required_capabilities`. Tie-break: freshest last_seen. If no agent matches, the task is queued and auto-assigned when a capable agent registers. v2.0.",
+          "Auto-route a task to the least-loaded capable agent (v2.0).\n\n" +
+          "When to use: when you know the required capabilities but do not want to hard-code a specific assignee, load balances across the fleet. Prefer `post_task` when the assignee is intentional. Prefer `broadcast` for non-tracked notifications.\n\n" +
+          "Behavior: picks the agent with the smallest accepted-task backlog whose capability set is a superset of `required_capabilities`. Tie-break: freshest `last_seen`. If no live agent qualifies, the task enters `status='queued'` and is auto-assigned the first time a capable agent calls `register_agent` (the assignment is included in that response's `auto_assigned`). By default the sender is excluded from routing, set `allow_self_assign=true` to opt in (v2.1).\n\n" +
+          "Returns: `{ task_id, status: 'posted' | 'queued', assigned_to: string | null, created_at }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `PAYLOAD_TOO_LARGE`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(PostTaskAutoSchema),
       },
       {
         name: "update_task",
         description:
-          "Update a task's status. Actions: accept/complete/reject (assignee), cancel (requester), heartbeat (assignee, renews task lease). Heartbeat does not change status; it refreshes lease_renewed_at so the health monitor does not requeue the task.",
+          "Drive a task through its state machine, or extend its lease.\n\n" +
+          "When to use: assignees acknowledge work (`accept`), report outcome (`complete` / `reject`), or keep the lease alive on long-running tasks (`heartbeat`). Requesters cancel work they no longer need (`cancel`). Read-only progress checks belong in `get_task` / `get_tasks`.\n\n" +
+          "Behavior: enforces role-by-action, accept/complete/reject/heartbeat are assignee-only; cancel is requester-only. Heartbeat refreshes `lease_renewed_at` without changing status, so the health monitor does not requeue a long task. `result` is required on complete/reject and surfaces in `get_task`. Fires `task.accepted` / `task.completed` / `task.rejected` webhooks. Auth: agent token (matching the action's required role).\n\n" +
+          "Returns: `{ task_id, status, updated_at, result?: string }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `INVALID_STATE` (action not allowed in current status), `NOT_FOUND` (unknown task_id), `PAYLOAD_TOO_LARGE`.",
         inputSchema: zodToJsonSchema(UpdateTaskSchema),
       },
       {
         name: "get_tasks",
         description:
-          "Query your task queue. Use role 'assigned' to see tasks given to you, or 'posted' to see tasks you created. Filter by status.",
+          "Query the tasks you are involved with.\n\n" +
+          "When to use: assignees triaging their queue (`role='assigned'`), requesters checking on dispatched work (`role='posted'`). For a single task by id use `get_task`. For team-wide rollup use `get_standup`.\n\n" +
+          "Behavior: pure read. Filters by `role` + `status`; default `status='all'`. Ordered by priority then `created_at` newest-first. Auth: agent token (only your own tasks are visible).\n\n" +
+          "Returns: `{ tasks: TaskRecord[] }` (each row carries id, status, priority, title, description, result, requester, assignee, created_at, updated_at, lease_renewed_at).\n\n" +
+          "Errors: `AUTH_FAILED`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetTasksSchema),
       },
       {
         name: "get_task",
         description:
-          "Get a single task by ID. Returns full task details including status, result, and timestamps.",
+          "Look up a single task by id.\n\n" +
+          "When to use: any flow that needs the canonical state of one specific task, e.g., the assignee just heartbeat'd and wants to confirm the row, or the requester is checking on a known task_id from an earlier `post_task` response. For browsing many tasks use `get_tasks`.\n\n" +
+          "Behavior: pure read. Returns the full task record including encrypted-at-rest description + result fields decrypted on the fly. Auth: agent token whose row is either the requester or assignee on this task, the relay refuses to leak third-party tasks.\n\n" +
+          "Returns: `{ task: TaskRecord }`.\n\n" +
+          "Errors: `AUTH_FAILED` (not your task), `NOT_FOUND`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetTaskSchema),
       },
       {
         name: "register_webhook",
         description:
-          "Register a webhook to receive HTTP POST notifications for relay events (message.sent, task.posted, etc., or '*' for all). Optional agent filter and HMAC secret.",
+          "Subscribe an HTTP endpoint to relay events.\n\n" +
+          "When to use: reactive integrations, Slack notifier, audit pipeline, dashboard refresher. For polling-style observation prefer `get_standup` or `peek_inbox_version`. For local UIs the bundled `/dashboard` already consumes the live event stream.\n\n" +
+          "Behavior: stores the subscription + optional HMAC `secret` (encrypted at rest with the same keyring the message body uses, v2.1 Phase 4p). Each delivery POSTs the event JSON with `X-Relay-Delivery-ID` + `X-Relay-Idempotency-Key` headers and an `X-Relay-Signature` HMAC-SHA256 if a secret was registered. Outbound URLs are SSRF-validated against the cloud-metadata + private-IP blocklist (v1.10). Events: `message.sent` | `message.broadcast` | `task.posted` | `task.accepted` | `task.completed` | `task.rejected` | `channel.message_posted` | `agent.unregistered` | `agent.spawned` | `'*'`. Optional `agent_filter` narrows by sender/recipient.\n\n" +
+          "Returns: `{ webhook_id, url, event, has_secret: boolean }`.\n\n" +
+          "Errors: `AUTH_FAILED` (caller needs `webhooks` capability), `URL_BLOCKED` (SSRF target), `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(RegisterWebhookSchema),
       },
       {
         name: "list_webhooks",
-        description: "List all registered webhook subscriptions.",
+        description:
+          "List every webhook subscription registered on the relay.\n\n" +
+          "When to use: sanity-checking integrations ('is the Slack notifier still wired up?'), pre-cleanup audits, or building an admin UI. To narrow by event you currently filter client-side from this list.\n\n" +
+          "Behavior: pure read. The raw HMAC `secret` is NEVER returned, each row exposes `has_secret: boolean` only. Auth: any registered agent (subscriptions are observable so admins can audit them, but secrets stay write-only).\n\n" +
+          "Returns: `{ webhooks: { id, url, event, agent_filter, has_secret, created_at }[] }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(ListWebhooksSchema),
       },
       {
         name: "delete_webhook",
-        description: "Delete a webhook subscription by ID.",
+        description:
+          "Tear down a webhook subscription by id.\n\n" +
+          "When to use: cleanup when an integration is being retired, when the receiver URL is dead and you do not want delivery-log noise, or when rotating a webhook secret (delete + register fresh).\n\n" +
+          "Behavior: removes the subscription row and any pending entries in `webhook_delivery_log`. Idempotent, deleting a non-existent id returns `deleted:false` instead of an error. Auth: the registrant's token, OR an authenticated agent with `webhooks` capability for cross-owner cleanup.\n\n" +
+          "Returns: `{ deleted: boolean, webhook_id }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `INVALID_INPUT`.",
         inputSchema: zodToJsonSchema(DeleteWebhookSchema),
       },
       // v2.0 — Channel tools
       {
         name: "create_channel",
-        description: "Create a named channel for multi-agent coordination. Requires 'channels' capability.",
+        description:
+          "Create a named channel for many-to-many topical coordination.\n\n" +
+          "When to use: ongoing conversations that more than two agents care about and that should persist beyond the lifetime of any one agent (e.g., `#deploys`, `#triage`). For 1:1 use `send_message`. For one-shot fleet-wide announcements use `broadcast`.\n\n" +
+          "Behavior: creates the channel row and adds the creator as a member. Channels are flat (no hierarchy) and globally addressable by name. Auth: caller must hold the `channels` capability.\n\n" +
+          "Returns: `{ channel_id, channel_name, created_by, created_at }`.\n\n" +
+          "Errors: `AUTH_FAILED` (missing `channels` capability), `CHANNEL_EXISTS` (name collision), `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(CreateChannelSchema),
       },
       {
         name: "join_channel",
-        description: "Join an existing channel. Any authenticated agent can join any channel.",
+        description:
+          "Subscribe to a channel so you receive its messages from your join time forward.\n\n" +
+          "When to use: any agent that wants to follow a channel's traffic, joining is open to any authenticated caller (no invite gate; channels are intentionally low-friction). Pair with `post_to_channel` for posting and `get_channel_messages` for reading.\n\n" +
+          "Behavior: inserts the membership row with `joined_at = now`. `get_channel_messages` and the `channel.message_posted` webhook event scope to messages with `created_at >= joined_at` for this member, so historical traffic is NOT replayed (a deliberate design choice, channels are streams, not archives). Idempotent: rejoining is a no-op. Auth: any agent token.\n\n" +
+          "Returns: `{ joined: boolean, channel_id, joined_at }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `NOT_FOUND` (unknown channel_name), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(JoinChannelSchema),
       },
       {
         name: "leave_channel",
-        description: "Leave a channel you are a member of.",
+        description:
+          "Cancel your membership so you stop receiving a channel's messages.\n\n" +
+          "When to use: channel is no longer relevant to your role, or you are shutting down and want to be a clean citizen (the dashboard surfaces ghost members otherwise). Idempotent, calling it on a channel you never joined is fine.\n\n" +
+          "Behavior: removes the membership row. Past messages stay in the channel (other members still see them); your `joined_at` cursor is forgotten so a future `join_channel` starts a fresh observation window. Auth: agent token (you can only leave on your own behalf).\n\n" +
+          "Returns: `{ left: boolean, channel_id }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `NOT_FOUND`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(LeaveChannelSchema),
       },
       {
         name: "post_to_channel",
-        description: "Post a message to a channel. Requires membership and 'channels' capability.",
+        description:
+          "Send a message into a channel you have joined.\n\n" +
+          "When to use: ongoing topical coordination among multiple agents ('deploy started', 'triage thread for incident-12'). For 1:1 use `send_message`; for fleet-wide one-shots use `broadcast`. The audience is exactly the current channel membership at post time.\n\n" +
+          "Behavior: stores a `channel_messages` row, fires the `channel.message_posted` webhook event, and surfaces in every member's `get_channel_messages` whose `joined_at <= post.created_at`. Same `RELAY_MAX_PAYLOAD_BYTES` cap as direct messages. Encrypted at rest when keyring is configured. Auth: caller must be a current member AND hold the `channels` capability.\n\n" +
+          "Returns: `{ message_id, channel_id, created_at }`.\n\n" +
+          "Errors: `AUTH_FAILED` (not a member, or missing `channels` cap), `PAYLOAD_TOO_LARGE`, `NOT_FOUND`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(PostToChannelSchema),
       },
       {
         name: "get_channel_messages",
-        description: "Read messages from a channel you are a member of. Returns messages since your join time, newest first, in priority order.",
+        description:
+          "Read the messages you are entitled to see in a channel.\n\n" +
+          "When to use: any flow that observes channel traffic, dashboard refresh, post-incident review thread, role onboarding ('catch up on `#deploys`'). For 1:1 mailbox use `get_messages`; for whole-fleet activity use `get_standup`.\n\n" +
+          "Behavior: scoped to messages with `created_at >= your join_time`. Ordered by priority then `created_at` newest-first. Pure read, channel posts have no per-recipient read state, so this call is fully idempotent. Auth: caller must be a current member.\n\n" +
+          "Returns: `{ messages: ChannelMessage[] }` (id, channel_id, from_agent, content, priority, created_at).\n\n" +
+          "Errors: `AUTH_FAILED` (not a member), `NOT_FOUND`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetChannelMessagesSchema),
       },
       // v2.0 final — status + health
       {
         name: "set_status",
-        description: "Set your operational status: online (default), busy (exempts you from health-monitor task reassignment), away (same treatment as busy), or offline (graceful shutdown). Distinct from presence (last_seen) — this is your declared working state.",
+        description:
+          "Declare your operational state independently of presence.\n\n" +
+          "When to use: tell the relay what kind of work you are in, so the health monitor and orchestrators can route or skip accordingly. Distinct from `last_seen`-derived presence (online/stale/offline), that one is computed; this one is your declared intent. For one-call team rollup use `get_standup`.\n\n" +
+          "Behavior: updates the agent row's `agent_status` (idle | working | blocked | waiting_user | offline). v2.1.3 (I6) widened the enum from the original online/busy/away/offline. `busy` and `away` map to `working` for backward compatibility. The health monitor exempts `working`/`blocked`/`waiting_user` rows from automatic task reassignment. Auth: own agent token only.\n\n" +
+          "Returns: `{ agent_name, agent_status, updated_at }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(SetStatusSchema),
       },
       {
         name: "health_check",
-        description: "Report relay health: status, version, uptime, and live counts (agents, pending messages, active/queued tasks, channels). Works on both stdio and HTTP transports. No capability required.",
+        description:
+          "Report relay process health + live counts.\n\n" +
+          "When to use: liveness probes (`/health` HTTP endpoint mirrors this surface), version-pinning checks during upgrades, dashboard footers. Cheaper than `get_standup` for binary up/down questions.\n\n" +
+          "Behavior: pure read. Counts agents by presence, pending messages, active and queued tasks, channels, and webhook subscriptions. Reports `version` (from `package.json` via the v2.1 Phase 4a single source of truth) + `protocol_version` (the client-compat surface, distinct from package version). Works on stdio AND HTTP transports. No capability required, intentionally observable.\n\n" +
+          "Returns: `{ status: 'ok', version, protocol_version, transport, uptime_seconds, agents: {...counts}, messages: {...counts}, tasks: {...counts}, channels, webhooks }`.\n\n" +
+          "Errors: none expected (`status='ok'` is the only success shape).",
         inputSchema: zodToJsonSchema(HealthCheckSchema),
       },
       {
         name: "rotate_token",
-        description: "v2.1: rotate your own agent_token. Prove identity with the current token; get a fresh one back. Managed agents (registered with managed:true) enter a grace window during which both the old and new token auth; a priority=high push-message is sent to the agent with the new token. Unmanaged agents (default) get restart_required:true in the response — the old token is invalid immediately.",
+        description:
+          "Self-rotate your own agent_token (v2.1).\n\n" +
+          "When to use: scheduled rotation, suspected token leak, or any time you want a fresh secret without losing identity. For admin-driven rotation of someone else's token use `rotate_token_admin`. To wipe the token entirely use `revoke_token`.\n\n" +
+          "Behavior: requires the current valid token. For Managed agents (registered with `managed:true`) the relay enters a grace window during which BOTH old and new tokens authenticate, and a `priority='high'` push-message carries the new token to the agent so it can self-update. For unmanaged agents (default, Claude Code terminals), the response carries `restart_required:true` and the old token is invalid immediately.\n\n" +
+          "Returns: `{ new_token, restart_required: boolean, grace_until?: ISO, push_sent?: boolean }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `RECOVERY_REQUIRED` (row in `recovery_pending`), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(RotateTokenSchema),
       },
       {
         name: "rotate_token_admin",
-        description: "v2.1 Phase 4b.2: admin-initiated rotation of ANOTHER agent's token. Requires 'rotate_others' capability on the rotator. Managed targets enter a grace window + receive the new token via push-message; unmanaged targets return the new token to the rotator for out-of-band delivery + restart_required:true.",
+        description:
+          "Admin-initiated rotation of another agent's token (v2.1 Phase 4b.2).\n\n" +
+          "When to use: operator-driven incident response, scheduled rotation across the fleet, or onboarding a Managed agent into a new key generation. Requires `rotate_others` capability on the rotator. For self-service use `rotate_token`. For revocation without re-issuance use `revoke_token`.\n\n" +
+          "Behavior: same Managed-vs-unmanaged split as `rotate_token`. Managed targets get the new token via push-message + a grace window. Unmanaged targets return the new token in the rotator's response (the rotator delivers it out-of-band) and the response carries `restart_required:true`. The audit log records BOTH the rotator and the target so attribution survives.\n\n" +
+          "Returns: `{ target_agent_name, new_token?, push_sent: boolean, restart_required: boolean, grace_until?: ISO }`.\n\n" +
+          "Errors: `AUTH_FAILED` (rotator not authenticated, or missing `rotate_others`), `NOT_FOUND` (unknown target), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(RotateTokenAdminSchema),
       },
       {
         name: "revoke_token",
-        description: "v2.1 Phase 4b.1 v2: revoke another agent's token (admin capability required). Transitions the target row to auth_state='recovery_pending' (if issue_recovery=true, returns a one-time recovery_token the operator hands off out-of-band; re-register via register_agent with recovery_token transitions back to active) or 'revoked' (terminal — only unregister_agent + register_agent can reuse the name). The original token_hash is preserved for forensic correlation; the state gate — not the hash — enforces rejection.",
+        description:
+          "Invalidate another agent's token (v2.1 Phase 4b.1 v2).\n\n" +
+          "When to use: confirmed compromise, lost device, or graceful retirement of an agent name. For routine key-hygiene rotation prefer `rotate_token` / `rotate_token_admin` (those keep identity). For removing the agent entirely use `unregister_agent`.\n\n" +
+          "Behavior: transitions the target row to `auth_state='recovery_pending'` (when `issue_recovery=true`, also returns a one-time `recovery_token` the operator hands off out-of-band; the agent re-registers via `register_agent` with that token to mint a fresh agent_token) or `auth_state='revoked'` (terminal, only `unregister_agent` + `register_agent` can reuse the name). Original `token_hash` is preserved for forensic correlation; the state column, not the hash, enforces rejection. Requires `revoke_others` capability.\n\n" +
+          "Returns: `{ target_agent_name, new_state: 'recovery_pending' | 'revoked', recovery_token?: string }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `NOT_FOUND`, `INVALID_STATE` (already revoked), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(RevokeTokenSchema),
       },
       // v2.1.4 — observation + lifecycle
       {
         name: "get_standup",
-        description: "v2.1.4 (I12): one-shot team-status synthesis for orchestrators. Pure read-only. Given a window (`since: '15m' | '1h' | '3h' | '1d' | ISO`), returns active_agents + message_activity + task_state + rule-based observation bullets — all computed server-side so the caller burns near-zero tokens. No LLM on the relay side; observations are hand-rolled heuristics. Use instead of polling discover_agents + get_messages + get_tasks and synthesizing in-LLM.",
+        description:
+          "One-shot team-status synthesis for orchestrators (v2.1.4).\n\n" +
+          "When to use: every observation cycle that would otherwise call `discover_agents` + `get_messages` + `get_tasks` and synthesize in-LLM. The relay does the rollup server-side so the caller burns near-zero tokens. For specific drill-downs after the rollup, fall through to the underlying tools.\n\n" +
+          "Behavior: pure read. Given a window (`since: '15m' | '1h' | '3h' | '1d' | ISO`), returns active_agents (filtered to non-offline by default, set `include_offline=true` to include them), message_activity counts, task_state breakdown, and rule-based observation bullets ('agent X has been blocked >30min', etc.). Observations are hand-rolled heuristics, NO LLM on the relay side. Optional `agents` / `roles` arrays narrow the snapshot. Auth: any agent token.\n\n" +
+          "Returns: `{ window, active_agents: Agent[], message_activity: {...}, task_state: {...}, observations: string[] }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `INVALID_INPUT` (bad `since`), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetStandupSchema),
       },
       {
         name: "expand_capabilities",
-        description: "v2.1.4 (I11): self-managed ADDITIVE capability expansion. Closes the v1.7.1 immutability gap for agents that hook-registered with a narrow cap set and later need more. Caller presents their token; request MUST be a superset of current caps (reductions rejected with REDUCTION_NOT_ALLOWED — those still need unregister + re-register). Requesting already-held caps with no new additions rejects with NO_OP_EXPANSION.",
+        description:
+          "Self-managed additive capability expansion (v2.1.4).\n\n" +
+          "When to use: an agent registered (often via the SessionStart hook) with a narrow capability set and now needs more, e.g., a builder later picks up a `webhooks` integration. Reductions are NOT supported (`unregister_agent` + fresh `register_agent` for those). For privileged cross-agent edits, no equivalent admin tool exists by design, capability changes are caller-attested.\n\n" +
+          "Behavior: caller presents their token; the requested set MUST be a SUPERSET of current caps (additive only, closes the v1.7.1 immutability gap without re-opening the capability-escalation CVE). Reductions reject with `REDUCTION_NOT_ALLOWED`. Requesting only already-held caps rejects with `NO_OP_EXPANSION`. The expansion is recorded in the audit log with the verified caller name.\n\n" +
+          "Returns: `{ agent_name, capabilities: string[], added: string[] }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `REDUCTION_NOT_ALLOWED`, `NO_OP_EXPANSION`, `INVALID_INPUT`.",
         inputSchema: zodToJsonSchema(ExpandCapabilitiesSchema),
       },
       {
         name: "set_dashboard_theme",
         description:
-          "v2.2.1: set the server-side default dashboard theme. Modes: 'catppuccin' (default Mocha palette) | 'dark' (tool-neutral) | 'light' (tool-neutral) | 'custom' (requires custom_json with all 13 CSS tokens). Newly-connecting dashboard clients read this on first visit only — each client's localStorage preference beats the server default locally (path-1 client-only design). No WebSocket push; already-connected dashboards surface the change on full reload.",
+          "Set the server-side default dashboard theme (v2.2.1).\n\n" +
+          "When to use: org-level theme defaults ('every new operator should land on dark'), or programmatically applying a brand palette via `mode='custom'`. Each individual operator's `localStorage` preference still beats this default for repeat visits, this only affects first-visit theming for newly-connecting clients.\n\n" +
+          "Behavior: stores the chosen theme + optional `custom_json` in `dashboard_prefs`. Modes: `'catppuccin'` (default Mocha palette), `'dark'` (tool-neutral), `'light'` (tool-neutral), `'custom'` (requires `custom_json` with all 13 CSS color tokens). No WebSocket push, already-open dashboards adopt on full reload. Auth: dashboard-secret-equivalent capability (treated as an admin operation).\n\n" +
+          "Returns: `{ theme, custom_json: object | null, updated_at }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `INVALID_INPUT` (custom mode missing required tokens), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(SetDashboardThemeSchema),
       },
       {
         name: "peek_inbox_version",
         description:
-          "v2.3.0 Phase 4s: cheap non-mutating observation of an agent's mailbox. Returns {mailbox_id, epoch, last_seq, total_messages_count, total_unread_count}. WATCH total_unread_count for new-mail detection — it advances on every send_message. last_seq tracks read-cursor progress (only advances when the recipient calls get_messages). Epoch rotates on backup/restore; a client whose cached epoch no longer matches MUST reset its local last_seen_seq to 0 and re-drain from scratch.",
+          "Cheap non-mutating mailbox version probe (v2.3.0 Phase 4s, ambient wake support).\n\n" +
+          "When to use: low-rate polling that wants to know 'do I have new mail?' without paying a `get_messages` round-trip, clients diff `total_unread_count` against their cached value and only call `get_messages` on a change. Pair with the optional filesystem-marker wake (when `RELAY_FILESYSTEM_MARKERS=1`) for low-latency idle wake. For full mailbox content use `get_messages` (mutating) or `get_messages_summary` (preview).\n\n" +
+          "Behavior: pure read. Returns `{ mailbox_id, epoch, last_seq, total_messages_count, total_unread_count }`. WATCH `total_unread_count` for new-mail detection, it advances on every `send_message`/`broadcast` to this agent. `last_seq` only advances when the recipient calls `get_messages` (read-cursor). `epoch` rotates on backup/restore, a client whose cached epoch no longer matches MUST reset its local `last_seen_seq` to 0 and re-drain. Auth: any agent token.\n\n" +
+          "Returns: `{ mailbox_id, epoch, last_seq, total_messages_count, total_unread_count }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `NOT_FOUND` (unknown agent_name), `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(PeekInboxVersionSchema),
       },
     ];
