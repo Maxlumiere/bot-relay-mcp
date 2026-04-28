@@ -77,7 +77,7 @@ export const RegisterAgentSchema = z.object({
    * Undocumented on the public tool description — it's an escape hatch,
    * not a feature.
    */
-  force: z.boolean().default(false).optional(),
+  force: z.boolean().default(false).optional().describe("Escape hatch — bypass the duplicate-name active-session collision check. Default false rejects re-registration on an actively-held name with NAME_COLLISION_ACTIVE so concurrent terminals don't race the get_messages mailbox-drain. Set true only when the prior session is unreachable (crashed terminal, stale-but-not-yet-aged-out session) and you cannot wait for the staleness window or run `relay recover`."),
 });
 
 export const DiscoverAgentsSchema = z.object({
@@ -315,7 +315,8 @@ export const GetStandupSchema = z.object({
       roles: z.array(z.string().min(1)).optional().describe("Restrict to these roles."),
       include_offline: z.boolean().default(false).describe("Include agents with agent_status='offline' in active_agents."),
     })
-    .optional(),
+    .optional()
+    .describe("Optional narrowing filter for the standup snapshot. Combine `agents` (restrict to names) and `roles` (restrict to roles); both filters AND together. `include_offline` flips the default that drops offline agents from active_agents."),
   agent_token: AgentTokenField,
 });
 

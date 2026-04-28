@@ -1,5 +1,42 @@
 # Changelog
 
+## v2.4.4 — 2026-04-27 — tool description quality (Glama A-tier push)
+
+Pure docs release. Zero behavior change. Every one of the 30 MCP tool descriptions audited and rewritten against Glama's Tool Definition Quality Score (TDQS) criteria so the public score is gated by the surface, not by three thin one-liners. Glama scores TDQS as 60% mean + 40% MIN, so a single 30-character `delete_webhook: "Delete a webhook subscription by ID."` was actively dragging the score; that's the exact pattern this release closes.
+
+### Rewrote
+
+All 30 tool descriptions in `src/server.ts` now follow the same structured shape, ~600–1500 chars each:
+
+- **Purpose** — single-sentence what.
+- **When to use** — disambiguation against the related tools (`send_message` vs `broadcast` vs `post_to_channel`, `post_task` vs `post_task_auto`, `get_messages` vs `get_messages_summary` vs `peek_inbox_version`, etc.).
+- **Behavior** — side effects, state machine, auth requirements, version notes.
+- **Returns** — the success-shape object literal so callers don't have to read `src/types.ts` to know what comes back.
+- **Errors** — the specific `error_code` strings the dispatcher emits, each with its trigger condition.
+
+Tools that needed the most lift: `delete_webhook`, `list_webhooks`, `leave_channel` (one-liners pre-v2.4.4), plus `send_message`, `broadcast`, `create_channel`, `join_channel`, `post_to_channel`, `post_task`, `get_tasks`, `get_task`, `register_agent`, `discover_agents`. Tools already in good shape (`rotate_token`, `get_standup`, `peek_inbox_version`, `expand_capabilities`) got a format-consistency pass so the whole surface reads uniformly.
+
+### Filled parameter-description gaps
+
+Two parameter schemas in `src/types.ts` lacked `.describe()` calls — caught by the new quality-gate test:
+
+- `register_agent.force` — escape hatch for re-registering an actively-held name. Description now documents the duplicate-name collision check it bypasses + when it's safe to use.
+- `get_standup.filter` — narrowing object on the standup snapshot. Description covers the AND-shape across `agents`/`roles` and the `include_offline` flip.
+
+### Tests
+
+- `tests/v2-4-4-tool-description-quality.test.ts` — 7 quality-gate cases that hit `tools/list` against a freshly-spawned `dist/index.js` (the same surface a Glama scanner sees) and assert: every description ≥300 chars (Q1), mentions "When to use" (Q2), mentions Returns or Errors (Q3), mentions Behavior (Q4), tool name follows `verb_noun` convention (Q5), every input parameter has a description (Q6), and the locked tool surface is exactly 30 named tools with stable description hashes (Q7) so future PRs that touch any description surface the diff in review.
+
+**Total after v2.4.4: 1137 tests pass** (1130 pre-v2.4.4 + 7 new).
+
+### Out of scope (deliberately)
+
+No new tools (Glama Completeness anti-pattern: adding tools just to score). No behavior changes. No schema changes. No tool reorganization. The `protocol_version` stays at `2.4.0` because the MCP tool surface contract (names, parameters, return types) is byte-identical — only descriptions changed.
+
+### Cross-platform parity
+
+Pure string edits in TypeScript source. No runtime behavior, no syscalls, no platform branches.
+
 ## v2.4.3 — 2026-04-27 — pre-publish `npm audit` resilience
 
 The CI green badge on main has to track code health, not npm registry weather. Pre-v2.4.3 it tracked both — when the v2.4.0 main merge ran post-tests, the legacy `/-/npm/v1/security/audits/quick` endpoint returned 400 ("This endpoint is being retired. Use the bulk advisory endpoint instead.") and the public CI badge swung red even though all 1099 tests passed. Same commit's branch CI was green a few minutes earlier — pure registry-side flake. Maxime's standing directive: "this is public not internal — i cannot have that every time we push."
