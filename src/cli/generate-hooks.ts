@@ -72,6 +72,25 @@ export async function run(argv: string[]): Promise<number> {
     );
     return 0;
   }
+  // v2.4.5 R1 MED 5 — Windows parity disclaimer. The three .sh hooks are
+  // bash-only (POSIX readlink, sqlite3 CLI, python3 for JSON shaping).
+  // Operators on win32 either run inside WSL (where the bash path Just
+  // Works) or skip the hooks entirely and rely on the HTTP transport for
+  // mailbox visibility. PowerShell mirrors are deferred to a future
+  // release; the current shape would triplicate ~300 lines of bash logic
+  // for a population we have no signal of yet.
+  if (process.platform === "win32") {
+    process.stderr.write(
+      "[generate-hooks] WARNING: Claude Code hooks ship as bash scripts (.sh).\n" +
+      "  Native Windows is NOT supported in v2.4.5. Choose one:\n" +
+      "    (a) Run Claude Code inside WSL — the .sh hooks work unchanged there.\n" +
+      "    (b) Skip hook installation. Mail visibility still works via the HTTP\n" +
+      "        transport (relay daemon on :3777 + RELAY_AGENT_TOKEN); you lose\n" +
+      "        the SessionStart auto-register + the PostToolUse / Stop near-\n" +
+      "        real-time mailbox notify, but everything else is identical.\n" +
+      "  See docs/multi-instance.md §'Windows hook story' for the full rationale.\n",
+    );
+  }
   const payload = hooksConfig();
   if (full) {
     process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
