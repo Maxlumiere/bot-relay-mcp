@@ -36,9 +36,22 @@ The bash helper uses `readlink` (POSIX, available on macOS + Linux) for the syml
 
 **Total after v2.4.5: 1144 tests pass** (1137 from v2.4.4 + 7 new).
 
+### R1 patch round (dual-5.5 audit, 2026-04-28)
+
+Both 5.5 auditor instances ran independent passes on the R0 branch. Each found different problems — useful confirmation that even same-model auditors diverge by sampling. Consolidated R1 patches:
+
+- **HIGH 1 — `hooks/stop-check.sh` had the same legacy hardcode.** R0 only patched `check-relay.sh` + `post-tool-use-check.sh`; the Stop hook's sqlite-fallback path kept reading `~/.bot-relay/relay.db`. Since `src/cli/generate-hooks.ts` installs Stop by default, every Claude Code session with hooks would have hit the same bug v2.4.5 was supposed to fix. Stop hook now carries the byte-identical `resolve_relay_db_path()` helper.
+- **MED 2 — bash mirror now honors `RELAY_HOME` + raises on malformed instance_id.** TS's `botRelayRoot()` reads `RELAY_HOME` (test seam) before falling back to `$HOME/.bot-relay` (`src/instance.ts:70`); R0 hooks hardcoded `$HOME/.bot-relay`. TS's `instanceDir()` throws on `instance_id` failing the `[A-Za-z0-9._-]+` allowlist; R0 hooks silently fell back to legacy. Both gaps closed: `${RELAY_HOME:-$HOME/.bot-relay}` for the root, and stderr error + `return 1` on a malformed id.
+- **MED 3 — Q6 / Q7 are now real-subprocess contract tests.** R0 Q6 unit-asserted `resolveInstanceDbPath()` directly with a "doctor surrogate" comment; R1 spawns the real `node bin/relay doctor` subprocess and asserts the per-instance path appears in its rendered output (and the legacy path doesn't). R0 Q7 used `closeDb() + initializeDb()` in the same process to simulate "two processes"; R1 now spawns a separate `node` child that reads the DB written by the parent — actual cross-process parity.
+- **MED 4 — Q1–Q5 parameterized over all three hooks.** R0 only extracted the resolver from `check-relay.sh`. The HIGH 1 Stop bug literally existed because the test never invoked the resolver from `stop-check.sh`. R1 loops the test cases over `[check-relay.sh, post-tool-use-check.sh, stop-check.sh]`, plus a new Q-identity case asserts the three function bodies are byte-identical via SHA-256 — drift is now physically impossible.
+- **MED 5 — Windows hook story documented + warned.** The three `.sh` hooks are bash-only (POSIX `readlink`, `sqlite3`, `python3`). v2.4.5 ships an explicit non-support note: Windows operators run inside WSL (recommended) or skip hook install + use the HTTP transport. `relay generate-hooks` emits a stderr WARNING on `process.platform === 'win32'`. PowerShell mirrors deferred until inbound demand surfaces — `docs/multi-instance.md §'Windows hook story'` carries the rationale.
+
+**Total after R1: 1158 tests pass** (1137 from v2.4.4 + 21 new — the R0 cut had 7; R1 grew to 21 because Q1–Q5 fan out across 3 hooks plus Q-identity, Q5b RELAY_HOME, real-subprocess Q6, real-subprocess Q7).
+
 ### Hall of Fame
 
 - **Codex 5.5** — diagnosed the split-brain via direct DB inspection during her first session. Sharp catch.
+- **Codex 5.5 (×2 in R1)** — both auditor instances independently caught different gaps; the dual-audit pattern works. HIGH 1 (Stop hook) would have shipped uncaught from a single-auditor pass.
 - **Maxime** — pushed back ("if it's not user friendly then it's a bug we need to fix") that elevated this from a one-off workaround to a proper architectural fix.
 
 ## v2.4.4 — 2026-04-27 — tool description quality (Glama A-tier push)

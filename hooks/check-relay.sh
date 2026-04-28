@@ -45,39 +45,68 @@ AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
 # registrations). Empty → register_agent omits the field and the agent's
 # focus button stays disabled in the UI per the graceful-degrade contract.
 RELAY_TERMINAL_TITLE_VALUE="${RELAY_TERMINAL_TITLE:-}"
-# v2.4.5: bash mirror of src/instance.ts:resolveInstanceDbPath(). Pre-v2.4.5
-# this hook hardcoded the legacy ~/.bot-relay/relay.db, so an operator running
-# in per-instance mode (HTTP daemon serving instance X) saw silent split-brain:
-# the TS MCP server resolved instance X correctly via getDbPath(), but this
-# hook's mail/task delivery read from the legacy DB. Codex 5.5 bit on this
-# during the v2.4.4 R2 audit cycle. Resolution priority must match the TS
-# helper exactly: RELAY_DB_PATH > RELAY_INSTANCE_ID > active-instance link/file
-# > legacy. Single-instance operators with no symlink + no env get the legacy
-# path automatically (backward compat).
+# v2.4.5 R1 — bash mirror of src/instance.ts:resolveInstanceDbPath. Closes the
+# split-brain that bit Codex 5.5 during v2.4.4 R2 (HTTP daemon resolved per-
+# instance correctly; this hook hardcoded legacy and silently read the wrong
+# DB).
+#
+# This function is BYTE-IDENTICAL across hooks/check-relay.sh,
+# hooks/post-tool-use-check.sh, and hooks/stop-check.sh. The
+# tests/v2-4-5-stdio-per-instance-db.test.ts identity test fails on any
+# divergence — change one, change all three.
+#
+# Mirrors TS semantics:
+#   - botRelayRoot(): RELAY_HOME wins (test seam), else $HOME/.bot-relay
+#                     (src/instance.ts:70).
+#   - resolveActiveInstanceId(): RELAY_INSTANCE_ID > active-instance
+#                                link/file (src/instance.ts:118).
+#   - instanceDir(): malformed instance_id rejects with [A-Za-z0-9._-]+
+#                    allowlist (src/instance.ts:149) — bash mirror emits
+#                    stderr + returns 1 instead of throwing.
+#
+# Output: resolved DB path on stdout. On malformed instance_id, stderr
+# error + return 1 (caller decides how to degrade — silent fallback is
+# the wrong call, an attacker-controlled active-instance file would
+# otherwise mask the operator's actual setup).
 resolve_relay_db_path() {
   if [ -n "${RELAY_DB_PATH:-}" ]; then
     echo "$RELAY_DB_PATH"
-    return
+    return 0
   fi
+  local root="${RELAY_HOME:-$HOME/.bot-relay}"
   local id=""
   if [ -n "${RELAY_INSTANCE_ID:-}" ]; then
     id="$RELAY_INSTANCE_ID"
-  elif [ -L "$HOME/.bot-relay/active-instance" ]; then
-    # readlink on macOS/Linux returns the target; basename strips any path
-    # prefix so a target stored as a bare instance_id still resolves.
-    id=$(basename "$(readlink "$HOME/.bot-relay/active-instance")")
-  elif [ -f "$HOME/.bot-relay/active-instance" ]; then
-    # File-fallback for platforms where symlink creation is restricted (the
-    # TS setActiveInstance helper writes a regular file in that case).
-    id=$(head -n 1 "$HOME/.bot-relay/active-instance" | tr -d '[:space:]')
+  elif [ -L "$root/active-instance" ]; then
+    # readlink target may be a bare instance_id or an absolute/relative
+    # path; basename normalizes both shapes (mirrors path.basename in
+    # src/instance.ts:135).
+    id=$(basename "$(readlink "$root/active-instance")")
+  elif [ -f "$root/active-instance" ]; then
+    # File-fallback for platforms where symlink creation is restricted
+    # (Windows non-admin); src/instance.ts:setActiveInstance writes a
+    # regular file in that case.
+    id=$(head -n 1 "$root/active-instance" | tr -d '[:space:]')
   fi
-  if [ -n "$id" ] && echo "$id" | grep -qE '^[A-Za-z0-9._-]+$'; then
-    echo "$HOME/.bot-relay/instances/$id/relay.db"
-  else
-    echo "$HOME/.bot-relay/relay.db"
+  if [ -n "$id" ]; then
+    if ! echo "$id" | grep -qE '^[A-Za-z0-9._-]+$'; then
+      echo "[bot-relay hook] invalid instance_id \"$id\" — must match [A-Za-z0-9._-]+ (mirrors src/instance.ts:instanceDir)" >&2
+      return 1
+    fi
+    echo "$root/instances/$id/relay.db"
+    return 0
   fi
+  echo "$root/relay.db"
+  return 0
 }
-DB_PATH=$(resolve_relay_db_path)
+DB_PATH=$(resolve_relay_db_path) || {
+  # Malformed active-instance content — refuse to fall back silently. A
+  # broken setup should be loud, not hidden under legacy. The hook's
+  # other side effects (HTTP register/health, mail delivery) are gated
+  # behind DB_PATH being readable below; null DB_PATH falls cleanly to
+  # the existing "no DB → exit 0" path.
+  DB_PATH=""
+}
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 

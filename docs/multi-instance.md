@@ -162,6 +162,19 @@ Sites updated:
 
 The TS source (`src/db.ts:getDbPath`) was already correct in v2.4.0; v2.4.5 closes the bash-side gap.
 
+### Windows hook story
+
+The three Claude Code hook scripts (`hooks/check-relay.sh`, `hooks/post-tool-use-check.sh`, `hooks/stop-check.sh`) are bash-only by design — they shell out to `readlink`, `sqlite3`, and `python3` for JSON shaping. Native Windows (no WSL, no MSYS2) is **not** a supported hook environment in v2.4.5.
+
+Operators on Windows have two paths:
+
+1. **Run Claude Code inside WSL.** The `.sh` hooks work unchanged because WSL gives them a real bash. This is the recommended path — every hook feature works the same as on macOS / Linux, including the v2.4.5 per-instance resolver.
+2. **Skip hook installation entirely.** All TS surfaces (HTTP daemon, stdio MCP server, `relay` CLI subcommands) run natively on Windows via Node. You lose the SessionStart auto-register + the PostToolUse/Stop near-real-time mailbox notify, but mail visibility still works via the HTTP transport (`relay daemon` on `:3777` + `RELAY_AGENT_TOKEN`) and the agent can call `get_messages` directly when it wants to drain its inbox.
+
+`relay generate-hooks` emits a stderr WARNING when invoked on `process.platform === 'win32'` so an operator who tries the hook install workflow sees the supported-platform note immediately rather than getting confused when the `.sh` files don't run.
+
+PowerShell mirrors of the three hook scripts are a candidate for a future release. The blocker is signal — we have no inbound demand for native-Windows hooks yet, and triplicating ~300 lines of bash into PowerShell ahead of demand would be premature.
+
 ## Migration paths
 
 **Stay on legacy** (most operators): do nothing. `relay init` without `--instance-id` / `--multi-instance` keeps writing to `~/.bot-relay/` flat.
