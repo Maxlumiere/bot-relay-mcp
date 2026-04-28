@@ -424,8 +424,8 @@ export function createServer(): Server {
         description:
           "Subscribe an HTTP endpoint to relay events.\n\n" +
           "When to use: reactive integrations, Slack notifier, audit pipeline, dashboard refresher. For polling-style observation prefer `get_standup` or `peek_inbox_version`. For local UIs the bundled `/dashboard` already consumes the live event stream.\n\n" +
-          "Behavior: stores the subscription + optional HMAC `secret` (encrypted at rest with the same keyring the message body uses, v2.1 Phase 4p). Each delivery POSTs the event JSON with `X-Relay-Delivery-ID` + `X-Relay-Idempotency-Key` headers and an `X-Relay-Signature` HMAC-SHA256 if a secret was registered. Outbound URLs are SSRF-validated against the cloud-metadata + private-IP blocklist (v1.10). Events: `message.sent` | `message.broadcast` | `task.posted` | `task.accepted` | `task.completed` | `task.rejected` | `channel.message_posted` | `agent.unregistered` | `agent.spawned` | `'*'`. Optional `agent_filter` narrows by sender/recipient.\n\n" +
-          "Returns: `{ success: true, webhook_id, url, event, agent_filter, has_secret: boolean }`.\n\n" +
+          "Behavior: stores the subscription + optional HMAC `secret` (encrypted at rest with the same keyring the message body uses, v2.1 Phase 4p). Each delivery POSTs the event JSON with `X-Relay-Delivery-ID` + `X-Relay-Idempotency-Key` headers and an `X-Relay-Signature` HMAC-SHA256 if a secret was registered. Outbound URLs are SSRF-validated against the cloud-metadata + private-IP blocklist (v1.10). Events: `message.sent` | `message.broadcast` | `task.posted` | `task.accepted` | `task.completed` | `task.rejected` | `channel.message_posted` | `agent.unregistered` | `agent.spawned` | `'*'`. Optional `filter` (agent name) narrows by sender/recipient.\n\n" +
+          "Returns: `{ success: true, webhook_id, url, event, filter, has_secret: boolean, resolved_ips: string[], note }`.\n\n" +
           "Errors: `AUTH_FAILED` (caller needs `webhooks` capability), `URL_BLOCKED` (SSRF target), `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(RegisterWebhookSchema),
       },
