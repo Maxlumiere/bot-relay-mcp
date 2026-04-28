@@ -280,6 +280,74 @@ ci_green_gate() {
 }
 step "GitHub CI green-gate" ci_green_gate || exit 1
 
+# --- 6c. Split-brain DB warn (v2.4.5) ---
+# Detects the local-environment failure mode that bit Codex 5.5 during the
+# v2.4.4 R2 audit cycle: an active per-instance setup PLUS a populated legacy
+# DB usually means a stale npx-cached bot-relay-mcp (or a pre-v2.4.0 hook)
+# is writing to ~/.bot-relay/relay.db while the live daemon serves a per-
+# instance DB. Both DBs end up with agents that don't see each other.
+#
+# Pure WARN — never blocks publish. The fix is operator-side (kill the stale
+# process / clear the npx cache / unset RELAY_DB_PATH); CI cannot do it.
+# Skips silently when sqlite3 is absent or when no per-instance setup exists.
+split_brain_warn() {
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "  SKIP  sqlite3 not installed — cannot probe DBs"
+    return 0
+  fi
+  local home_dir="${HOME:-}"
+  if [ -z "$home_dir" ]; then
+    echo "  SKIP  \$HOME unset — cannot locate ~/.bot-relay/"
+    return 0
+  fi
+  local legacy_db="$home_dir/.bot-relay/relay.db"
+  local active_link="$home_dir/.bot-relay/active-instance"
+  # `-e` follows symlinks; the active-instance link target is a bare
+  # instance_id (not a path), so `-e` returns false even when the link
+  # exists. Check `-L` (link itself) OR `-f` (regular-file fallback used
+  # on platforms where symlink creation is restricted).
+  if [ ! -L "$active_link" ] && [ ! -f "$active_link" ]; then
+    echo "  No active-instance configured — single-instance setup, no split-brain risk"
+    return 0
+  fi
+  local instance_id=""
+  if [ -L "$active_link" ]; then
+    instance_id=$(basename "$(readlink "$active_link")")
+  elif [ -f "$active_link" ]; then
+    instance_id=$(head -n 1 "$active_link" | tr -d '[:space:]')
+  fi
+  if [ -z "$instance_id" ]; then
+    echo "  Could not resolve active instance from $active_link — skipping"
+    return 0
+  fi
+  local instance_db="$home_dir/.bot-relay/instances/$instance_id/relay.db"
+  if [ ! -f "$instance_db" ]; then
+    echo "  Active instance ($instance_id) DB not yet created — skipping"
+    return 0
+  fi
+  if [ ! -f "$legacy_db" ]; then
+    echo "  Per-instance setup detected (instance=$instance_id), no legacy DB — clean state"
+    return 0
+  fi
+  local legacy_count instance_count
+  legacy_count=$(sqlite3 "$legacy_db" "SELECT COUNT(*) FROM agents" 2>/dev/null || echo "?")
+  instance_count=$(sqlite3 "$instance_db" "SELECT COUNT(*) FROM agents" 2>/dev/null || echo "?")
+  if [ "$legacy_count" = "?" ] || [ "$instance_count" = "?" ]; then
+    echo "  Could not query agent counts — skipping (DB may be locked)"
+    return 0
+  fi
+  if [ "$legacy_count" -gt 0 ]; then
+    echo "  WARN  split-brain detected: legacy DB has $legacy_count agent(s), per-instance ($instance_id) has $instance_count agent(s)."
+    echo "        A pre-v2.4.5 hook OR a stale npx-cached bot-relay-mcp is likely writing to legacy."
+    echo "        Investigate: ls ~/.npm/_npx/*/node_modules/bot-relay-mcp/package.json (look for old versions)."
+    echo "        Cleanup: 'sqlite3 $legacy_db \"DELETE FROM agents\"' after confirming nothing live needs them."
+  else
+    echo "  Per-instance setup ($instance_id, $instance_count agents); legacy DB present but empty — no split-brain"
+  fi
+  return 0  # always success; this is a WARN not a gate
+}
+step "split-brain DB warn (v2.4.5)" split_brain_warn || exit 1
+
 # --- 7. (--full only) load / chaos / cross-version — Phase 5b ---
 # These run a subset of tests/*.test.ts files that are NOT included in the
 # default vitest run (they spawn subprocesses, produce load, or take 30-60s).

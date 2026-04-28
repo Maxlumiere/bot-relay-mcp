@@ -35,7 +35,32 @@ AGENT_NAME="${RELAY_AGENT_NAME:-}"
 AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
-DB_PATH="${RELAY_DB_PATH:-$HOME/.bot-relay/relay.db}"
+# v2.4.5: bash mirror of src/instance.ts:resolveInstanceDbPath(). Pre-v2.4.5
+# this hook hardcoded the legacy ~/.bot-relay/relay.db, which silently broke
+# the sqlite-fallback path under per-instance setups (HTTP path always works
+# because the daemon resolves correctly). Same resolution priority as the
+# TS helper and check-relay.sh: RELAY_DB_PATH > RELAY_INSTANCE_ID >
+# active-instance link/file > legacy fallback.
+resolve_relay_db_path() {
+  if [ -n "${RELAY_DB_PATH:-}" ]; then
+    echo "$RELAY_DB_PATH"
+    return
+  fi
+  local id=""
+  if [ -n "${RELAY_INSTANCE_ID:-}" ]; then
+    id="$RELAY_INSTANCE_ID"
+  elif [ -L "$HOME/.bot-relay/active-instance" ]; then
+    id=$(basename "$(readlink "$HOME/.bot-relay/active-instance")")
+  elif [ -f "$HOME/.bot-relay/active-instance" ]; then
+    id=$(head -n 1 "$HOME/.bot-relay/active-instance" | tr -d '[:space:]')
+  fi
+  if [ -n "$id" ] && echo "$id" | grep -qE '^[A-Za-z0-9._-]+$'; then
+    echo "$HOME/.bot-relay/instances/$id/relay.db"
+  else
+    echo "$HOME/.bot-relay/relay.db"
+  fi
+}
+DB_PATH=$(resolve_relay_db_path)
 MAX_MESSAGES="${RELAY_HOOK_MAX_MESSAGES:-20}"
 
 # --- Guard: no agent name means nothing to do ---

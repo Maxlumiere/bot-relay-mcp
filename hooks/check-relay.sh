@@ -10,7 +10,9 @@
 #   RELAY_AGENT_NAME         — agent name (default: "default")
 #   RELAY_AGENT_ROLE         — agent role (default: "user")
 #   RELAY_AGENT_CAPABILITIES — comma-separated (default: empty)
-#   RELAY_DB_PATH            — DB path (default: $HOME/.bot-relay/relay.db)
+#   RELAY_DB_PATH            — DB path (default: per-instance resolution, see below)
+#   RELAY_INSTANCE_ID        — (v2.4.5) explicit per-instance override; mirrors
+#                              src/instance.ts:resolveInstanceDbPath().
 #   RELAY_AGENT_TOKEN        — (v1.7+) token for authenticated tool calls
 #   RELAY_RECOVERY_TOKEN     — (v2.1 Phase 4b.1 v2) admin-issued one-time
 #                              recovery secret. If the daemon reports the
@@ -43,7 +45,39 @@ AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
 # registrations). Empty → register_agent omits the field and the agent's
 # focus button stays disabled in the UI per the graceful-degrade contract.
 RELAY_TERMINAL_TITLE_VALUE="${RELAY_TERMINAL_TITLE:-}"
-DB_PATH="${RELAY_DB_PATH:-$HOME/.bot-relay/relay.db}"
+# v2.4.5: bash mirror of src/instance.ts:resolveInstanceDbPath(). Pre-v2.4.5
+# this hook hardcoded the legacy ~/.bot-relay/relay.db, so an operator running
+# in per-instance mode (HTTP daemon serving instance X) saw silent split-brain:
+# the TS MCP server resolved instance X correctly via getDbPath(), but this
+# hook's mail/task delivery read from the legacy DB. Codex 5.5 bit on this
+# during the v2.4.4 R2 audit cycle. Resolution priority must match the TS
+# helper exactly: RELAY_DB_PATH > RELAY_INSTANCE_ID > active-instance link/file
+# > legacy. Single-instance operators with no symlink + no env get the legacy
+# path automatically (backward compat).
+resolve_relay_db_path() {
+  if [ -n "${RELAY_DB_PATH:-}" ]; then
+    echo "$RELAY_DB_PATH"
+    return
+  fi
+  local id=""
+  if [ -n "${RELAY_INSTANCE_ID:-}" ]; then
+    id="$RELAY_INSTANCE_ID"
+  elif [ -L "$HOME/.bot-relay/active-instance" ]; then
+    # readlink on macOS/Linux returns the target; basename strips any path
+    # prefix so a target stored as a bare instance_id still resolves.
+    id=$(basename "$(readlink "$HOME/.bot-relay/active-instance")")
+  elif [ -f "$HOME/.bot-relay/active-instance" ]; then
+    # File-fallback for platforms where symlink creation is restricted (the
+    # TS setActiveInstance helper writes a regular file in that case).
+    id=$(head -n 1 "$HOME/.bot-relay/active-instance" | tr -d '[:space:]')
+  fi
+  if [ -n "$id" ] && echo "$id" | grep -qE '^[A-Za-z0-9._-]+$'; then
+    echo "$HOME/.bot-relay/instances/$id/relay.db"
+  else
+    echo "$HOME/.bot-relay/relay.db"
+  fi
+}
+DB_PATH=$(resolve_relay_db_path)
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 

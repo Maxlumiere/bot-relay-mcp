@@ -109,7 +109,7 @@ describe("v2.2.0 Phase 6 — dashboard end-to-end smoke (--full)", () => {
     expect(health.status).toBe(200);
     const healthJson = JSON.parse(health.body);
     expect(healthJson.status).toBe("ok");
-    expect(healthJson.version).toBe("2.4.4");
+    expect(healthJson.version).toBe("2.4.5");
     expect(healthJson.protocol_version).toBe("2.4.0");
 
     // 2. Dashboard HTML.

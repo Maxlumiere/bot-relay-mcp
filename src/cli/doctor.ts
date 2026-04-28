@@ -12,6 +12,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { resolveInstanceDbPath, resolveInstanceConfigPath } from "../instance.js";
 
 type Status = "PASS" | "WARN" | "FAIL";
 interface CheckResult {
@@ -20,12 +21,17 @@ interface CheckResult {
   detail: string;
 }
 
+// v2.4.5: route through the canonical per-instance resolvers so `relay doctor`
+// describes the SAME paths the running daemon + stdio server actually use.
+// Pre-v2.4.5 this hardcoded the legacy ~/.bot-relay/relay.db, which on a
+// per-instance setup printed correct PASS/WARN against the wrong file —
+// hiding the very split-brain doctor exists to surface.
 function getDbPath(): string {
-  return process.env.RELAY_DB_PATH || path.join(os.homedir(), ".bot-relay", "relay.db");
+  return resolveInstanceDbPath();
 }
 
 function getConfigPath(): string {
-  return process.env.RELAY_CONFIG_PATH || path.join(os.homedir(), ".bot-relay", "config.json");
+  return resolveInstanceConfigPath();
 }
 
 async function checkConfig(): Promise<CheckResult> {

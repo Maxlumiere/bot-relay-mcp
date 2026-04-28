@@ -1,5 +1,46 @@
 # Changelog
 
+## v2.4.5 — 2026-04-28 — stdio/hook split-brain DB hotfix
+
+Hotfix for a multi-agent coordination bug Codex 5.5 caught during the v2.4.4 R2 audit. v2.4.0 shipped per-instance local isolation; the HTTP daemon's startup path correctly routed through `resolveInstanceDbPath()`, but several auxiliary entry points kept hardcoding `~/.bot-relay/relay.db`. An operator running with an active per-instance setup ended up with silent split-brain: the daemon wrote per-instance, the SessionStart hook read legacy, and an agent registered through one path was invisible from the other. The symptom that exposed it: Codex 5.5 couldn't authenticate via MCP because her hook was delivering from legacy while her agent row lived per-instance.
+
+### Fixed
+
+- **`hooks/check-relay.sh`** — SessionStart hook's `DB_PATH` resolution now mirrors `src/instance.ts:resolveInstanceDbPath()` exactly. New bash helper `resolve_relay_db_path()` checks `RELAY_DB_PATH` → `RELAY_INSTANCE_ID` → `~/.bot-relay/active-instance` (symlink AND regular-file forms) → legacy fallback. Path-traversal defended via the same `[A-Za-z0-9._-]+` allowlist `instance.ts:instanceDir()` enforces.
+- **`hooks/post-tool-use-check.sh`** — same fix to the PostToolUse mailbox-check fallback path. The HTTP path was already correct (the daemon resolves per-instance); only the sqlite-direct fallback was hitting legacy.
+- **`src/cli/doctor.ts`** — `getDbPath()` and `getConfigPath()` helpers were hardcoding `os.homedir() + '.bot-relay/relay.db'` (and `config.json`). Now route through `resolveInstanceDbPath()` / `resolveInstanceConfigPath()`. Pre-v2.4.5 `relay doctor` printed PASS against the wrong file, hiding the very split-brain it exists to surface.
+
+### Added
+
+- **`scripts/pre-publish-check.sh`** — non-blocking WARN step that compares agent counts between the legacy DB and the active per-instance DB. Fires when both have agents (the fingerprint of a stale npx-cached bot-relay-mcp under `~/.npm/_npx/<hash>/node_modules/bot-relay-mcp/` writing to legacy in parallel with a current daemon serving per-instance — exactly the deployment state we found on the maintainer's machine while diagnosing this bug). Pure WARN: never blocks publish, since the fix is operator-side (kill the stale process, clear the npx cache, unset stray `RELAY_DB_PATH`).
+- **`tests/v2-4-5-stdio-per-instance-db.test.ts`** — 7 cases pinning the contract:
+  - Q1: bash hook resolver falls back to legacy when no env + no symlink.
+  - Q2: bash hook resolver follows the active-instance symlink target.
+  - Q3: bash hook resolver honours `RELAY_INSTANCE_ID` env.
+  - Q4: bash hook resolver gives `RELAY_DB_PATH` highest priority.
+  - Q5: bash hook resolver rejects malformed active-instance content (path-traversal defense-in-depth).
+  - Q6: TS-side `resolveInstanceDbPath()` returns the per-instance path under multi-instance mode (doctor surrogate — doctor calls this exact function).
+  - Q7: two TS DB handles under the same `RELAY_INSTANCE_ID` see the same rows (parity surrogate proving the resolver IS the single resolution gate).
+
+The hook tests extract `resolve_relay_db_path()` from `check-relay.sh` via regex + invoke it under a controlled `$HOME`, so the contract test runs the actual bash code shipped to operators rather than a duplicate.
+
+### Out of scope (deliberately deferred)
+
+- Default-transport flip from stdio → HTTP. Bigger UX change, not a hotfix.
+- Migration command to copy legacy data into a per-instance DB. Operators who want the migration can `relay backup` → `relay init --instance-id=<x>` → `relay restore` today; a one-shot `relay migrate-legacy-to-instance` is a v2.7+ candidate.
+- TS-side `src/db.ts:getDbPath()` already routed through `resolveInstanceDbPath` in v2.4.0; v2.4.5 confirmed it via Q7 but did not need to touch it.
+
+### Cross-platform parity
+
+The bash helper uses `readlink` (POSIX, available on macOS + Linux) for the symlink branch and `head -n 1 / tr -d` for the regular-file branch. Windows operators run the TS surface (which already uses `fs.readlink` + `path.basename` — see `src/instance.ts:resolveActiveInstanceId()`); the bash hooks are macOS/Linux-only by design.
+
+**Total after v2.4.5: 1144 tests pass** (1137 from v2.4.4 + 7 new).
+
+### Hall of Fame
+
+- **Codex 5.5** — diagnosed the split-brain via direct DB inspection during her first session. Sharp catch.
+- **Maxime** — pushed back ("if it's not user friendly then it's a bug we need to fix") that elevated this from a one-off workaround to a proper architectural fix.
+
 ## v2.4.4 — 2026-04-27 — tool description quality (Glama A-tier push)
 
 Pure docs release. Zero behavior change. Every one of the 30 MCP tool descriptions audited and rewritten against Glama's Tool Definition Quality Score (TDQS) criteria so the public score is gated by the surface, not by three thin one-liners. Glama scores TDQS as 60% mean + 40% MIN, so a single 30-character `delete_webhook: "Delete a webhook subscription by ID."` was actively dragging the score; that's the exact pattern this release closes.
