@@ -144,7 +144,7 @@ A message sent to `alice` on instance `work` does NOT appear on instance `person
 
 ## v2.4.5 — every transport + hook resolves the same DB
 
-v2.4.0 shipped per-instance isolation, but only the HTTP daemon's startup path went through `resolveInstanceDbPath()`. The bash hooks (`hooks/check-relay.sh`, `hooks/post-tool-use-check.sh`) and the `relay doctor` CLI hardcoded `~/.bot-relay/relay.db`. Result: an operator with an active per-instance setup got silent split-brain — the daemon wrote to the per-instance DB while the SessionStart hook delivered mail from legacy. Codex 5.5 caught this during the v2.4.4 R2 audit (her stdio session couldn't authenticate because her hook was reading legacy while her agent row lived per-instance).
+v2.4.0 shipped per-instance isolation, but only the HTTP daemon's startup path went through `resolveInstanceDbPath()`. The bash hooks (`hooks/check-relay.sh`, `hooks/post-tool-use-check.sh`, `hooks/stop-check.sh`) and the `relay doctor` CLI hardcoded `~/.bot-relay/relay.db`. Result: an operator with an active per-instance setup got silent split-brain — the daemon wrote to the per-instance DB while the SessionStart hook delivered mail from legacy. Codex 5.5 caught this during the v2.4.4 R2 audit (her stdio session couldn't authenticate because her hook was reading legacy while her agent row lived per-instance).
 
 v2.4.5 routes every DB-opening site through the same resolver. Priority for all of them:
 
@@ -158,6 +158,7 @@ Sites updated:
 - `src/cli/doctor.ts` — `relay doctor` now reports the same DB the daemon serves.
 - `hooks/check-relay.sh` — SessionStart hook reads the same DB.
 - `hooks/post-tool-use-check.sh` — PostToolUse mailbox check sqlite-fallback reads the same DB.
+- `hooks/stop-check.sh` — Stop hook (turn-end mailbox check) sqlite-fallback reads the same DB. Caught in R1 by dual-5.5 audit; R0 only patched the other two hooks.
 - `scripts/pre-publish-check.sh` — added a non-blocking WARN that fires when both legacy and active-per-instance DBs have agents (the symptom of a stale npx-cached bot-relay-mcp under `~/.npm/_npx/` writing to legacy in parallel with a current daemon serving per-instance).
 
 The TS source (`src/db.ts:getDbPath`) was already correct in v2.4.0; v2.4.5 closes the bash-side gap.
