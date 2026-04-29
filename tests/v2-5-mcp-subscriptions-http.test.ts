@@ -297,33 +297,54 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
   }, 15_000);
 
   it("(Q-HTTP-3) DELETE /mcp closes the session — subsequent traffic on the id 404s", async () => {
-    const transport = new StreamableHTTPClientTransport(new URL("/mcp", daemon.baseUrl));
-    const client = new Client(
-      { name: "v2.5-http-cleanup", version: "0.0.0" },
-      { capabilities: {} },
-    );
-    await client.connect(transport);
-    const sessionId = transport.sessionId;
+    // Establish a session via raw fetch (not the SDK Client) so we don't
+    // hold an open SSE GET on the keep-alive pool while issuing DELETE.
+    // Node 18's undici aggressively reuses connections; the SDK's
+    // long-lived GET stream and a follow-up DELETE on the same baseUrl
+    // can race and surface as "other side closed" before our DELETE
+    // hits the wire (CI repro on the v2.5.0 R1 first push, headSha
+    // 93025a6 → run 25114600420). Going pure HTTP for this case keeps
+    // the contract assertion (DELETE → 204 → subsequent traffic 404s)
+    // independent of the SDK's connection management. Q-HTTP-1 already
+    // proves the SDK path receives frames end-to-end.
+    const initResp = await fetch(`${daemon.baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "v2.5-http-cleanup", version: "0.0.0" },
+        },
+      }),
+    });
+    expect(initResp.ok).toBe(true);
+    const sessionId = initResp.headers.get("mcp-session-id");
     expect(typeof sessionId).toBe("string");
     expect((sessionId ?? "").length).toBeGreaterThan(0);
+    // Drain the response body so the connection can be reused / freed.
+    await initResp.text();
 
-    // Server-side DELETE — canonical client-initiated session tear-down per
-    // MCP spec. The next request with the same sessionId must 404.
+    // Canonical client-initiated session tear-down per MCP spec.
     const del = await fetch(`${daemon.baseUrl}/mcp`, {
       method: "DELETE",
       headers: { "mcp-session-id": sessionId! },
     });
     expect(del.status).toBe(204);
 
+    // Subsequent traffic on the same id must 404 — proves the session
+    // was actually removed from the daemon's session map (not just
+    // closed on the client side).
     const followup = await fetch(`${daemon.baseUrl}/mcp`, {
       method: "GET",
       headers: { "mcp-session-id": sessionId! },
     });
     expect(followup.status).toBe(404);
-
-    // Cleanup the dead client gracefully so the test-runner doesn't hang
-    // on its lingering background reconnect attempts.
-    await client.close().catch(() => {});
-    await transport.close().catch(() => {});
   }, 15_000);
 });
