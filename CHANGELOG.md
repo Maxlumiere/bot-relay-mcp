@@ -1,5 +1,49 @@
 # Changelog
 
+## v2.5.0 — 2026-04-29 — Tether Phase 1 (MCP resource subscriptions + VSCode extension)
+
+Introduces **Tether** — the operator-awareness layer for bot-relay-mcp. Free, bundled. The strict architectural line between FREE Tether Local (this repo) and FUTURE Tether Cloud / Pro (paid, separate repo) is documented in `docs/tether-roadmap.md` — features that need a server, third-party API, or cross-machine sync do NOT belong here.
+
+Phase 1 ships three pieces:
+
+### Part S — MCP resource subscriptions
+
+The `relay://inbox/<agent_name>` resource is now subscribable per the MCP spec. Any MCP-aware client (Claude Code CLI, VSCode panel, Cursor, Cline, etc.) subscribes via `subscribe` and receives `notifications/resources/updated` pushes when the agent's inbox mutates.
+
+- **`src/mcp-resources.ts`** — extended with dynamic per-agent `relay://inbox/<name>` descriptors (one entry in `listResources()` per currently-registered agent), and a `buildInboxSnapshot(agentName)` helper that surfaces `pending_count`, `total_count`, `last_message_at`, `last_message_from`, `last_message_priority`, and a 200-char `last_message_preview` with a `last_message_truncated` flag.
+- **`src/mcp-subscriptions.ts`** *(new)* — central per-Server-instance subscription registry. `subscribe(uri, server)` adds, `unsubscribe(uri, server)` removes, `unsubscribeAllForServer(server)` cleans up on transport close, and an internal listener on the inbox event bus fans out `server.sendResourceUpdated({uri})` to every subscribed Server.
+- **`src/inbox-events.ts`** *(new)* — module-singleton EventEmitter so DB write paths and the subscription registry share a stream without circular imports. Three event reasons: `message_received`, `broadcast_received`, `message_read`.
+- **`src/db.ts`** — `sendMessage` (both system + normal branches), `broadcastMessage` (per-recipient fan-out), and `getMessages` (drain pending → read) now emit inbox events via `emitInboxChanged`. Emission lives AFTER the SQL commit so a subscriber's re-fetch sees fresh state.
+- **`src/server.ts`** — `resources: { subscribe: true }` capability declared; `SubscribeRequestSchema` + `UnsubscribeRequestSchema` handlers wired; `server.onclose` patched to drop subscriptions on transport tear-down.
+
+### Part E — VSCode extension v0.1
+
+`extensions/vscode/` ships the first IDE consumer of the new subscription primitive. Activation is `onStartupFinished`. Status bar shows `Tether: <pending_count> | last <relative time>` with severity coloring (gray ≤0, yellow 1-3, red 4+); click opens a read-only webview with the last message preview; optional `autoInjectInbox` writes `inbox\n` to the integrated terminal whose name matches the agent's name. Settings live under `bot-relay.tether.*` with VSCode setting > env var > default precedence. Marketplace publish steps documented in `extensions/vscode/PUBLISH.md` for Maxime to run when ready.
+
+### Part D — documentation
+
+- **`docs/tether-roadmap.md`** *(new)* — canonical free-vs-paid architectural line. Phase 2 features explicitly named out-of-scope-of-this-repo.
+- **`extensions/vscode/README.md`** *(new)* — install + config + troubleshooting for the extension.
+- **`extensions/vscode/PUBLISH.md`** *(new)* — vsce publish checklist + manual smoke verification before publish.
+- **`README.md`** — new "Tether (v2.5)" section pointing at the bundled extension + the roadmap doc.
+
+### Tests
+
+- **`tests/v2-5-mcp-subscriptions.test.ts`** *(new)* — 8 cases via real `Client` ↔ real `Server` over the SDK's `InMemoryTransport`. Per `feedback_test_asserts_contract_not_proxy.md`: every assertion answers "if the contract drifted, would this fail?" with yes. Covers single-subscriber receive, unsubscribe stops, multi-subscriber fan-out, cross-agent isolation (subscriber for X must NOT see events for Y), `readResource` snapshot shape, drain-fires-message_read, server-close cleanup, and broadcast fan-out per recipient.
+- **`tests/v2-5-tether-format.test.ts`** *(new)* — 6 unit cases for the VSCode extension's pure-function format helpers (status-bar text, severity buckets, relative-time formatter, toast text). Full UX integration (booting a real VSCode instance via `vscode-test`) is heavyweight + CI-only — surfaced as the manual-checklist in `extensions/vscode/PUBLISH.md` instead.
+
+### Protocol
+
+`protocol_version` stays at `2.4.0` — adding subscription support is additive (the resources capability flag flips from `{}` to `{ subscribe: true }`), the existing tools/prompts/resources surface is byte-identical for non-subscribing clients.
+
+**Total after v2.5.0: 1180 tests pass** (1166 from v2.4.5 + 14 new across Parts S + E).
+
+### Hall of Fame
+
+- **Maxime** — original directive 2026-04-24 to bundle for velocity then split free/paid cleanly. The strict-line architecture is his call.
+- **The MCP resource subscription primitive** — shipped as a deferred capability in v2.4.0; finally getting used end-to-end in v2.5.0.
+- **The TTY guard regression in v2.2.1** — the empirical evidence that operator-side notification was a real product gap, not a hypothetical one. That's what made Tether load-bearing instead of nice-to-have.
+
 ## v2.4.5 — 2026-04-28 — stdio/hook split-brain DB hotfix
 
 Hotfix for a multi-agent coordination bug Codex 5.5 caught during the v2.4.4 R2 audit. v2.4.0 shipped per-instance local isolation; the HTTP daemon's startup path correctly routed through `resolveInstanceDbPath()`, but several auxiliary entry points kept hardcoding `~/.bot-relay/relay.db`. An operator running with an active per-instance setup ended up with silent split-brain: the daemon wrote per-instance, the SessionStart hook read legacy, and an agent registered through one path was invisible from the other. The symptom that exposed it: Codex 5.5 couldn't authenticate via MCP because her hook was delivering from legacy while her agent row lived per-instance.

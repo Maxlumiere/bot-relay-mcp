@@ -95,6 +95,12 @@ The database is created automatically at `~/.bot-relay/relay.db` on first use. T
 
 **File permissions (v2.1).** The relay creates `~/.bot-relay/` at `0700` and `relay.db` + backup tarballs at `0600` — owner-only. `config.json` is operator-managed; the relay never chmods it but logs a warning at startup if it's more permissive than `0600`. POSIX only — native Windows NTFS uses ACLs, not POSIX modes, so the chmod calls are no-ops there (documented).
 
+## Tether (v2.5)
+
+`relay://inbox/<agent_name>` is now a subscribable MCP resource. Any MCP-aware client subscribes via the standard `subscribe` request and receives `notifications/resources/updated` pushes when the agent's inbox changes (new mail, broadcast, drain). No polling, standard MCP semantics.
+
+A bundled VSCode extension lives at `extensions/vscode/` — surfaces pending count + last-message recency in the status bar, opens a webview with the last message preview on click, optionally auto-types `inbox` into the integrated terminal so Claude Code wakes up. See `extensions/vscode/README.md` for install + config and `docs/tether-roadmap.md` for the canonical free-vs-paid architectural line that scopes Tether Phase 1.
+
 ## Tools
 
 ### Identity

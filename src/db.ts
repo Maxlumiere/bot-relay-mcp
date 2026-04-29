@@ -31,6 +31,7 @@ import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { touchMarker } from "./filesystem-marker.js";
 import { resolveInstanceDbPath } from "./instance.js";
+import { emitInboxChanged } from "./inbox-events.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".bot-relay");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "relay.db");
@@ -2422,6 +2423,10 @@ export function sendMessage(
     db.prepare(
       "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
     ).run(id, from, to, encContent, priority, timestamp);
+    // v2.5.0 Tether Phase 1 — Part S — fan out an inbox-changed event so
+    // MCP subscribers on relay://inbox/<to> get a notifications/resources/
+    // updated push without polling.
+    emitInboxChanged({ agent_name: to, reason: "message_received" });
     return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
   }
 
@@ -2451,6 +2456,12 @@ export function sendMessage(
   } catch {
     /* marker is best-effort */
   }
+
+  // v2.5.0 Tether Phase 1 — Part S — MCP subscription fan-out for
+  // relay://inbox/<to>. Emit AFTER the SQL commit + marker touch so
+  // a subscriber that immediately re-fetches the resource sees the
+  // freshly-inserted row.
+  emitInboxChanged({ agent_name: to, reason: "message_received" });
 
   return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
 }
@@ -2596,12 +2607,21 @@ export function getMessages(
   // one session surveys its own inbox without consuming it. Default
   // stays `peek=false` so consume-once semantics are preserved for
   // single-shot workers (v2.0 final #6).
+  let drainedRows = 0;
   if (!peek && rows.length > 0 && currentSession && status !== "read") {
     const ids = rows.map((r) => r.id);
     const placeholders = ids.map(() => "?").join(",");
-    db.prepare(
+    const r = db.prepare(
       `UPDATE messages SET status = 'read', read_by_session = ? WHERE id IN (${placeholders})`
     ).run(currentSession, ...ids);
+    drainedRows = r.changes;
+  }
+  // v2.5.0 Tether Phase 1 — Part S — fire the inbox-changed event when
+  // pending → read, so subscribers see the unread count drop in real time.
+  // Skipped on peek (no mutation) and skipped when zero rows transitioned
+  // (e.g. status='all' / 'read' filters never mark anything new).
+  if (drainedRows > 0) {
+    emitInboxChanged({ agent_name: agentName, reason: "message_read" });
   }
 
   // v2.3.0 Part C.2 — delivery-time seq assignment. Per Codex Q9 lock:
@@ -2858,6 +2878,14 @@ export function broadcastMessage(
   });
 
   tx();
+
+  // v2.5.0 Tether Phase 1 — Part S — fan out one inbox-changed event per
+  // recipient so MCP subscribers on each individual relay://inbox/<x> URI
+  // get woken. Emitted AFTER the tx commits so a re-fetch of the resource
+  // sees the newly-inserted rows.
+  for (const recipient of sentTo) {
+    emitInboxChanged({ agent_name: recipient, reason: "broadcast_received" });
+  }
 
   return { sent_to: sentTo, message_ids: messageIds };
 }
