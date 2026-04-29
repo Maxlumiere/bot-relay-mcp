@@ -30,34 +30,21 @@ import {
   statusBarSeverity,
   type InboxSnapshot,
 } from "./format.js";
+import { resolveTetherConfig, type TetherConfig } from "./config.js";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
 const STATUS_COMMAND = "botRelayTether.openInbox";
 
-interface TetherConfig {
-  endpoint: string;
-  agentName: string;
-  agentToken: string;
-  autoInjectInbox: boolean;
-  notificationLevel: "event" | "summary" | "none";
-}
-
 function readConfig(): TetherConfig {
+  // R1 #3: route through the pure resolveTetherConfig() so the precedence
+  // rule (VSCode setting > env > default) is verifiable in unit tests
+  // without booting VSCode. Pre-R1 the inline `?:` chain bound after `||`,
+  // ignoring the VSCode-configured endpoint when env was set.
   const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
-  // VSCode setting > env > default. Empty string from getConfiguration
-  // is "user didn't override," so fall through to env.
-  const endpoint = (cfg.get<string>("endpoint") || "").trim() ||
-    process.env.RELAY_HTTP_HOST
-      ? `http://${process.env.RELAY_HTTP_HOST}:${process.env.RELAY_HTTP_PORT ?? "3777"}`
-      : "http://127.0.0.1:3777";
-  const agentName = (cfg.get<string>("agentName") || "").trim() ||
-    (process.env.RELAY_AGENT_NAME ?? "");
-  const agentToken = (cfg.get<string>("agentToken") || "").trim() ||
-    (process.env.RELAY_AGENT_TOKEN ?? "");
-  const autoInjectInbox = cfg.get<boolean>("autoInjectInbox") ?? false;
-  const notificationLevel =
-    (cfg.get<"event" | "summary" | "none">("notificationLevel") ?? "event");
-  return { endpoint, agentName, agentToken, autoInjectInbox, notificationLevel };
+  return resolveTetherConfig(
+    (key) => cfg.get(key),
+    process.env as Record<string, string | undefined>,
+  );
 }
 
 /**
@@ -85,9 +72,12 @@ function buildInboxUri(agentName: string): string {
 async function refreshSnapshot(client: Client, agentName: string): Promise<InboxSnapshot | null> {
   try {
     const result = await client.readResource({ uri: buildInboxUri(agentName) });
-    const text = result.contents[0]?.text;
-    if (typeof text !== "string") return null;
-    return JSON.parse(text) as InboxSnapshot;
+    // R1 #2: result.contents[0] is { uri, mimeType, ... } & ({ text } | { blob }).
+    // The naive `?.text` access fails strict-mode compilation (TS2339) because
+    // the union doesn't guarantee `text` exists. Type-guard via `'text' in`.
+    const first = result.contents[0];
+    if (!first || !("text" in first) || typeof first.text !== "string") return null;
+    return JSON.parse(first.text) as InboxSnapshot;
   } catch (err) {
     log(`refreshSnapshot failed: ${err instanceof Error ? err.message : String(err)}`);
     return null;

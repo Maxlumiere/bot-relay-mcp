@@ -26,6 +26,7 @@ import {
   statusBarSeverity,
   type InboxSnapshot,
 } from "../extensions/vscode/src/format.js";
+import { resolveTetherConfig } from "../extensions/vscode/src/config.js";
 
 const NOW = Date.UTC(2026, 3, 29, 12, 0, 0); // 2026-04-29T12:00:00Z (deterministic)
 
@@ -80,5 +81,95 @@ describe("v2.5.0 Tether — VSCode extension format helpers", () => {
     expect(
       formatToast(snapshot({ agent_name: "victra-build", last_message_from: null })),
     ).toBe("Tether: New message from system in victra-build inbox");
+  });
+});
+
+/**
+ * R1 #3 — endpoint precedence regression. Pre-R1 the inline `?:` ternary
+ * bound after `||`, so VSCode-configured endpoints were silently ignored
+ * when env vars were set. The 8-combo matrix below pins the canonical
+ * rule (VSCode setting > env > default) for endpoint, agentName, and
+ * agentToken so a future inline-rewrite can't reintroduce the bug.
+ */
+function makeGetter(
+  overrides: Record<string, string | boolean | undefined>,
+): (key: string) => string | boolean | undefined {
+  return (key) => overrides[key];
+}
+
+describe("v2.5.0 R1 — Tether config precedence (VSCode > env > default)", () => {
+  it("endpoint: VSCode setting wins over env + default", () => {
+    const c = resolveTetherConfig(
+      makeGetter({ endpoint: "http://10.0.0.1:9999" }),
+      { RELAY_HTTP_HOST: "10.0.0.2", RELAY_HTTP_PORT: "9000" },
+    );
+    expect(c.endpoint).toBe("http://10.0.0.1:9999");
+  });
+
+  it("endpoint: env composes when VSCode setting is empty/whitespace", () => {
+    const c = resolveTetherConfig(
+      makeGetter({ endpoint: "  " }),
+      { RELAY_HTTP_HOST: "10.0.0.2", RELAY_HTTP_PORT: "9000" },
+    );
+    expect(c.endpoint).toBe("http://10.0.0.2:9000");
+  });
+
+  it("endpoint: env with only RELAY_HTTP_HOST defaults port to 3777", () => {
+    const c = resolveTetherConfig(makeGetter({}), { RELAY_HTTP_HOST: "10.0.0.2" });
+    expect(c.endpoint).toBe("http://10.0.0.2:3777");
+  });
+
+  it("endpoint: env with only RELAY_HTTP_PORT (no host) falls through to default", () => {
+    // R0 bug: produced "http://undefined:9000" because env partial was
+    // treated as "use env." The R1 rule: env composition requires HOST;
+    // partial env falls through.
+    const c = resolveTetherConfig(makeGetter({}), { RELAY_HTTP_PORT: "9000" });
+    expect(c.endpoint).toBe("http://127.0.0.1:3777");
+    expect(c.endpoint).not.toContain("undefined");
+  });
+
+  it("endpoint: bare default with no VSCode + no env", () => {
+    const c = resolveTetherConfig(makeGetter({}), {});
+    expect(c.endpoint).toBe("http://127.0.0.1:3777");
+  });
+
+  it("agentName: VSCode setting wins over env", () => {
+    const c = resolveTetherConfig(
+      makeGetter({ agentName: "from-cfg" }),
+      { RELAY_AGENT_NAME: "from-env" },
+    );
+    expect(c.agentName).toBe("from-cfg");
+  });
+
+  it("agentName: env wins when VSCode setting empty", () => {
+    const c = resolveTetherConfig(
+      makeGetter({ agentName: "" }),
+      { RELAY_AGENT_NAME: "from-env" },
+    );
+    expect(c.agentName).toBe("from-env");
+  });
+
+  it("agentName: empty default when neither VSCode nor env set", () => {
+    const c = resolveTetherConfig(makeGetter({}), {});
+    expect(c.agentName).toBe("");
+  });
+
+  it("agentToken: VSCode > env > '' (same precedence shape as agentName)", () => {
+    expect(
+      resolveTetherConfig(
+        makeGetter({ agentToken: "tok-cfg" }),
+        { RELAY_AGENT_TOKEN: "tok-env" },
+      ).agentToken,
+    ).toBe("tok-cfg");
+    expect(
+      resolveTetherConfig(makeGetter({}), { RELAY_AGENT_TOKEN: "tok-env" }).agentToken,
+    ).toBe("tok-env");
+    expect(resolveTetherConfig(makeGetter({}), {}).agentToken).toBe("");
+  });
+
+  it("autoInjectInbox + notificationLevel default sensibly when unset", () => {
+    const c = resolveTetherConfig(makeGetter({}), {});
+    expect(c.autoInjectInbox).toBe(false);
+    expect(c.notificationLevel).toBe("event");
   });
 });

@@ -283,6 +283,41 @@ describe("v2.5.0 Tether Phase 1 — Part S — MCP resource subscriptions", () =
     expect(_subscriberCountForTests(uri)).toBe(0);
   });
 
+  it("(Q9) inbox preview is decrypted when RELAY_ENCRYPTION_KEY is active (R1 #4 regression)", async () => {
+    // R0 buildInboxSnapshot skipped the decryptContent helper and surfaced
+    // the raw `enc1:<ciphertext>` column. With encryption disabled the
+    // preview happened to look right; with encryption enabled the operator
+    // saw garbled "enc1:..." in the VSCode webview + every MCP subscriber.
+    // This test pins the decrypt-on-read contract for the inbox snapshot.
+    const crypto = await import("node:crypto");
+    const TEST_KEY = crypto.randomBytes(32).toString("base64");
+    const prior = process.env.RELAY_ENCRYPTION_KEY;
+    process.env.RELAY_ENCRYPTION_KEY = TEST_KEY;
+    try {
+      const { _resetKeyringCacheForTests } = await import("../src/encryption.js");
+      _resetKeyringCacheForTests();
+
+      const { client, serverHandle } = await makePair();
+      try {
+        const plaintextBody = "secret-plaintext-marker-" + crypto.randomUUID();
+        sendMessage("alice", "bob", plaintextBody, "high");
+
+        const result = await client.readResource({ uri: inboxUriFor("bob") });
+        const text = result.contents[0].text as string;
+        const snapshot = JSON.parse(text);
+        expect(snapshot.last_message_preview).toBe(plaintextBody);
+        expect(snapshot.last_message_preview).not.toContain("enc1:");
+      } finally {
+        await serverHandle.close();
+      }
+    } finally {
+      if (prior === undefined) delete process.env.RELAY_ENCRYPTION_KEY;
+      else process.env.RELAY_ENCRYPTION_KEY = prior;
+      const { _resetKeyringCacheForTests } = await import("../src/encryption.js");
+      _resetKeyringCacheForTests();
+    }
+  });
+
   it("(Q8) broadcast fans out one notification per recipient subscriber", async () => {
     const a = await makePair();
     const b = await makePair();

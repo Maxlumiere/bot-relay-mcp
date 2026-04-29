@@ -26,6 +26,7 @@
  *   inbox write (send_message / broadcast / get_messages drain).
  */
 import { getDb, getAgents } from "./db.js";
+import { decryptContent } from "./encryption.js";
 import { agentNameFromInboxUri, inboxUriFor } from "./mcp-subscriptions.js";
 
 export interface McpResourceDescriptor {
@@ -193,7 +194,16 @@ function buildInboxSnapshot(agentName: string): {
       last_message_truncated: false,
     };
   }
-  const truncated = last.content.length > INBOX_PREVIEW_MAX;
+  // R1 #4 — decrypt-on-read contract. v1.7 messages are stored as
+  // `enc1:<ciphertext>` when RELAY_ENCRYPTION_KEY is set; the standard read
+  // paths (getMessages line 2714, getMessagesSummary line 2772, getTask line
+  // 2320) all run content through decryptContent. R0 buildInboxSnapshot
+  // skipped the helper and surfaced the raw column — when encryption was
+  // active, MCP subscribers + the VSCode webview saw `enc1:...` ciphertext
+  // in last_message_preview. Safe-no-op for plaintext rows by decryptContent
+  // contract (returns null on non-enc1 input → fallback to original).
+  const plaintext = decryptContent(last.content) ?? last.content;
+  const truncated = plaintext.length > INBOX_PREVIEW_MAX;
   return {
     agent_name: agentName,
     agent_known: known,
@@ -202,7 +212,7 @@ function buildInboxSnapshot(agentName: string): {
     last_message_at: last.created_at,
     last_message_from: last.from_agent,
     last_message_priority: last.priority,
-    last_message_preview: truncated ? last.content.slice(0, INBOX_PREVIEW_MAX) : last.content,
+    last_message_preview: truncated ? plaintext.slice(0, INBOX_PREVIEW_MAX) : plaintext,
     last_message_truncated: truncated,
   };
 }

@@ -38,10 +38,54 @@ The `relay://inbox/<agent_name>` resource is now subscribable per the MCP spec. 
 
 **Total after v2.5.0: 1180 tests pass** (1166 from v2.4.5 + 14 new across Parts S + E).
 
+### R1 patch round (codex-5-5 audit, 2026-04-29)
+
+R0 verdict: REJECT. Codex 5.5 caught a foundation-level gap and 3 mechanical bugs. R0's tests asserted the in-process subscription pipeline (InMemoryTransport) but the SHIPPED path is HTTP, and the HTTP daemon was strictly stateless — every GET /mcp returned 405. The VSCode extension's `StreamableHTTPClientTransport` requires a stateful SSE GET to receive `notifications/resources/updated` frames; the whole Tether UX was structurally broken in the actual deployment. Per `feedback_test_path_must_match_shipped_path.md`, an InMemoryTransport test is a proxy, not a contract.
+
+Maxime's call: **Option A** — make the HTTP daemon support stateful sessions alongside the existing stateless POST. Aligns with v2.3 federation direction (which needs stateful anyway), works for every HTTP MCP client (Cursor, Cline, future tooling), additive (existing stateless POST clients unchanged).
+
+#### Architectural fix — stateful HTTP MCP sessions
+
+- **`src/transport/http.ts`** — added a per-port session map keyed by SDK-generated UUID. POST `/mcp` now branches on three signals:
+  - Request carries `mcp-session-id` header → route to existing session's transport. 404 if session unknown.
+  - Body has `method:'initialize'` AND `Accept: text/event-stream` → mint new stateful session via `sessionIdGenerator: () => randomUUID()`. The transport assigns the id, we register the entry in the map AFTER `handleRequest` returns, response carries the id back per spec.
+  - Otherwise → original stateless one-shot transport (current smoke + curl behaviour preserved verbatim).
+
+  GET `/mcp` now opens the SSE stream against an existing session. Missing `mcp-session-id` → 400; unknown session → 404. DELETE `/mcp` is the canonical client-initiated session close — `transport.close()` triggers our `onclose` hook which removes the entry from the map and drops every subscription that session held via `unsubscribeAllForServer(server)` from the v2.5.0 R0 plumbing.
+
+  Memory bound: `RELAY_HTTP_MAX_SESSIONS` (default 64) caps the map size; new sessions over the cap return 503. `RELAY_HTTP_SESSION_IDLE_SECONDS` (default 300) defines how long a session can sit idle before the 60-second reaper sweeps it. The reaper interval is `unref`'d so it never blocks process shutdown.
+
+- **`tests/http.test.ts`** — pre-R1 pinned the "GET /mcp = 405" contract. Updated to the new contract: GET without `mcp-session-id` → 400; GET with unknown session → 404. Old assertion would have been a false-positive on the new transport.
+
+- **`tests/v2-5-mcp-subscriptions-http.test.ts`** *(new)* — REAL-HTTP integration test. Per R1's MED 3, the load-bearing subscription test must exercise the SHIPPED path:
+  - Spawns the actual `dist/index.js` daemon as a subprocess (no in-process Server reuse).
+  - Connects via the SDK's `StreamableHTTPClientTransport` (the same transport the VSCode extension uses).
+  - Subscribes to `relay://inbox/<X>`, triggers a real `send_message` via the stateless POST (different transport — proves the cross-session bus actually fans out), asserts a real `notifications/resources/updated` frame arrives.
+  - Q-HTTP-1: subscribe → real frame end-to-end. Q-HTTP-2: cross-session isolation — subscriber for X is NOT woken by message to Y. Q-HTTP-3: DELETE `/mcp` closes the session and subsequent traffic on the id 404s.
+
+#### Mechanical fixes
+
+- **R1 #2 — extension compile failure**. `extensions/vscode/src/extension.ts:88` accessed `result.contents[0]?.text`, which fails strict-mode (TS2339) because the SDK's contents array union is `{text} | {blob}`. Fix: `if (!first || !("text" in first) || typeof first.text !== "string") return null;` type-guard. R0 didn't catch this because the pre-push gate didn't compile the extension subdir; that gap is closed in R1 (see "Pre-push gate" below).
+- **R1 #3 — endpoint precedence bug**. The R0 inline `(cfg.get(...) || "").trim() || env.X ? <env-string> : <fallback>` parsed as `((cfg||"") || env) ? <env-string> : <fallback>` because `?:` binds after `||`. Result: VSCode-configured endpoint was silently ignored when env was set; partial env (RELAY_HTTP_PORT without HOST) produced `http://undefined:3777`. Extracted to `extensions/vscode/src/config.ts:resolveTetherConfig()` — a pure function unit-tested via a 10-case matrix in `tests/v2-5-tether-format.test.ts` covering VSCode setting > env > default precedence for endpoint, agentName, and agentToken.
+- **R1 #4 — inbox preview bypassed decrypt-on-read**. R0's `buildInboxSnapshot()` SELECTed `messages.content` directly and surfaced the raw column. With `RELAY_ENCRYPTION_KEY` active, MCP subscribers + the VSCode webview saw `enc1:<ciphertext>` instead of plaintext. Fix: route through `decryptContent()` (the same helper `getMessages` line 2714 + `getMessagesSummary` line 2772 use). Q9 in `tests/v2-5-mcp-subscriptions.test.ts` pins the contract — encryption-active case asserts plaintext preview + `not.toContain("enc1:")`.
+
+#### Pre-push gate update
+
+- **`scripts/pre-publish-check.sh`** — added "extension TS compile (extensions/vscode)" step. Runs `npx tsc -p . --noEmit` in the subdir; one-time `npm install` if `node_modules/` absent. Catches TS2339-class breakage that escaped R0's gate. The order is `tsc → vitest → npm audit → build → extension-compile → drift/sanctioned-helper guards → 25-tool smoke → CI green-gate → split-brain warn` — fail-fast on the cheap checks first.
+
+**Total after R1: 1187 tests pass** across 103 files (1172 from R0 + 10 endpoint-precedence + 1 encryption decrypt + 3 real-HTTP integration + 1 http.test.ts net delta — the existing 405 case was rewritten to assert 400 + a new 404-on-unknown-session case was added; old assertion would have been a false-positive on the new transport).
+
+#### Discipline notes
+
+- **Citation discipline** — re-read `src/transport/http.ts:1225-1267` verbatim before designing the dual-path router; verified SDK `StreamableHTTPServerTransport` semantics from `node_modules/@modelcontextprotocol/sdk/dist/cjs/server/streamableHttp.d.ts:30-52` (stateful vs stateless mode rules) rather than spec memory.
+- **Test path matches shipped path** — `tests/v2-5-mcp-subscriptions-http.test.ts` IS the R1 contract test. The R0 InMemoryTransport file stays as a fast unit-level check; the HTTP integration test is now the load-bearing one.
+- **STOP-AND-SURFACE on architectural forks** — surfaced the Option A/B/C choice with explicit recommendation + reasoning before coding. Maxime picked A. R0 violated this once (got lucky on subscription state — MCP spec mandated per-session); R1 didn't repeat the violation.
+
 ### Hall of Fame
 
-- **Maxime** — original directive 2026-04-24 to bundle for velocity then split free/paid cleanly. The strict-line architecture is his call.
-- **The MCP resource subscription primitive** — shipped as a deferred capability in v2.4.0; finally getting used end-to-end in v2.5.0.
+- **Maxime** — original directive 2026-04-24 to bundle for velocity then split free/paid cleanly. The strict-line architecture is his call. Plus the R1 Option A call: "yeah of course, option a." Read the trade-offs and went straight for the foundation-aligned choice.
+- **Codex 5.5** — diagnosed the v2.5 R0 HTTP push gap from line numbers in `src/transport/http.ts` rather than running the test suite. The InMemoryTransport-vs-shipped-path failure mode is exactly the test discipline `feedback_test_path_must_match_shipped_path.md` exists to surface; codex caught it on the first pass.
+- **The MCP resource subscription primitive** — shipped as a deferred capability in v2.4.0; finally getting used end-to-end in v2.5.0 R1.
 - **The TTY guard regression in v2.2.1** — the empirical evidence that operator-side notification was a real product gap, not a hypothetical one. That's what made Tether load-bearing instead of nice-to-have.
 
 ## v2.4.5 — 2026-04-28 — stdio/hook split-brain DB hotfix

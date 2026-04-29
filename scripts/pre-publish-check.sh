@@ -75,6 +75,37 @@ step "npm audit (high+)" bash "$PROJECT_ROOT/scripts/audit-with-retry.sh" high |
 # --- 4. Production build ---
 step "npm run build" npm run build || exit 1
 
+# --- 4b. v2.5.0 R1 — VSCode extension compile guard ---
+# Codex 5.5 R1 audit caught that R0's pre-push gate didn't cover the
+# extensions/vscode/ subdirectory: the extension had a TS2339 (TypeScript
+# strict-mode violation on a union access) that would fail at vsce package
+# time. The pre-push gate didn't catch it because vitest's transform is
+# permissive + tsc --noEmit only sees src/. Add an explicit compile step
+# for the extension subdir so future R0s catch this class of breakage.
+#
+# `npm install` is gated on the lockfile being absent — once the operator
+# has installed once, repeated runs are no-ops. The first install is
+# slowest but the lockfile sticks around in the working tree.
+extension_compile() {
+  local ext_dir="$PROJECT_ROOT/extensions/vscode"
+  if [ ! -d "$ext_dir" ]; then
+    echo "  SKIP  extensions/vscode not present"
+    return 0
+  fi
+  if [ ! -f "$ext_dir/package.json" ]; then
+    echo "  SKIP  extensions/vscode/package.json missing"
+    return 0
+  fi
+  ( cd "$ext_dir" && \
+    if [ ! -d node_modules ]; then
+      echo "  Installing extensions/vscode dependencies (one-time)..."
+      npm install --no-audit --no-fund --silent || return 1
+    fi
+    npx tsc -p . --noEmit
+  )
+}
+step "extension TS compile (extensions/vscode)" extension_compile || exit 1
+
 # --- 5. Drift guard ---
 # Any string literal matching /["']\d+\.\d+\.\d+["']/ inside src/ that is NOT
 # in one of the two authoritative version files (src/version.ts for package
