@@ -125,9 +125,23 @@ describe("HTTP transport", () => {
     expect(discoverData.agents.some((a: any) => a.name === "http-agent")).toBe(true);
   });
 
-  it("GET /mcp returns 405", async () => {
+  it("GET /mcp without mcp-session-id returns 400 (v2.5.0 R1 stateful path requires session)", async () => {
+    // Pre-v2.5 the daemon was stateless and 405'd every GET. v2.5.0 R1
+    // (Option A) added stateful SSE GET, which per MCP spec requires
+    // every non-initialize request to carry mcp-session-id; missing
+    // header → 400. The original 405 contract is replaced by 400 +
+    // "Initialize via POST first" guidance.
     const res = await fetch(`${baseUrl}/mcp`);
-    expect(res.status).toBe(405);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toMatch(/mcp-session-id/);
+  });
+
+  it("GET /mcp with unknown mcp-session-id returns 404", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      headers: { "mcp-session-id": "00000000-0000-0000-0000-000000000000" },
+    });
+    expect(res.status).toBe(404);
   });
 
   it("GET / serves the dashboard HTML", async () => {
