@@ -11,6 +11,8 @@ import {
   GetPromptRequestSchema,
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import {
@@ -113,6 +115,11 @@ import { handlePeekInboxVersion } from "./tools/peek-inbox-version.js";
 import { recordCall } from "./transport/traffic-recorder.js";
 import { listPrompts, getPrompt } from "./mcp-prompts.js";
 import { listResources, readResource } from "./mcp-resources.js";
+import {
+  subscribe as subscribeResource,
+  unsubscribe as unsubscribeResource,
+  unsubscribeAllForServer,
+} from "./mcp-subscriptions.js";
 import { VERSION } from "./version.js";
 
 /**
@@ -234,10 +241,33 @@ export function createServer(): Server {
         // endpoints clients can fetch. Neither increments the tool
         // count (stays 30).
         prompts: {},
-        resources: {},
+        // v2.5.0 Tether Phase 1 — Part S — declare subscribable resources.
+        // The `subscribe: true` flag lights up subscribe/unsubscribe in the
+        // MCP server's advertised capabilities so spec-compliant clients
+        // know they can request notifications/resources/updated streams.
+        resources: { subscribe: true },
       },
     }
   );
+
+  // v2.5.0 Tether Phase 1 — Part S — best-effort subscription cleanup on
+  // transport disconnect. The SDK's Server class doesn't have a public
+  // onclose hook on the constructor, so we patch the instance-level
+  // onclose property — the SDK calls our handler on transport close
+  // before clearing internal state. unsubscribeAllForServer is idempotent
+  // so a double-call (operator-driven close + transport-driven close) is
+  // safe.
+  const priorOnClose = server.onclose;
+  server.onclose = () => {
+    try {
+      unsubscribeAllForServer(server);
+    } catch (err) {
+      log.warn(
+        `[server] unsubscribeAllForServer threw on close: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (typeof priorOnClose === "function") priorOnClose();
+  };
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const { bundles, hidden } = resolveSurfaceShape();
@@ -274,6 +304,22 @@ export function createServer(): Server {
         },
       ],
     };
+  });
+
+  // v2.5.0 Tether Phase 1 — Part S — MCP resource subscription handlers.
+  // Per spec, subscribe binds the calling session to receive
+  // notifications/resources/updated for the given URI; unsubscribe drops
+  // the binding. Server-instance is the unit of subscription because the
+  // SDK scopes sendResourceUpdated to the transport bound to the Server.
+  server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+    const { uri } = request.params;
+    subscribeResource(uri, server);
+    return {};
+  });
+  server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+    const { uri } = request.params;
+    unsubscribeResource(uri, server);
+    return {};
   });
 
   // v2.3.0 Part B.2 — frozen tool definition list. Pulled out of the

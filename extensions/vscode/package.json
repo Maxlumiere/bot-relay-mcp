@@ -1,0 +1,80 @@
+{
+  "name": "bot-relay-tether",
+  "displayName": "Tether for bot-relay-mcp",
+  "description": "Local IDE awareness for bot-relay-mcp: subscribes to your agent's inbox over MCP, surfaces pending mail in the status bar, and (optionally) auto-types `inbox` into the integrated terminal so Claude Code wakes up when something arrives.",
+  "version": "0.1.0",
+  "publisher": "lumiere-ventures",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Maxlumiere/bot-relay-mcp.git",
+    "directory": "extensions/vscode"
+  },
+  "homepage": "https://github.com/Maxlumiere/bot-relay-mcp/tree/main/extensions/vscode#readme",
+  "license": "MIT",
+  "keywords": ["mcp", "claude-code", "agent", "tether", "bot-relay"],
+  "contributes": {
+    "configuration": {
+      "type": "object",
+      "title": "Tether for bot-relay-mcp",
+      "properties": {
+        "bot-relay.tether.endpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:3777",
+          "description": "HTTP endpoint of the local bot-relay daemon. Tether subscribes to this server's MCP transport for inbox events."
+        },
+        "bot-relay.tether.agentName": {
+          "type": "string",
+          "default": "",
+          "description": "Agent name to subscribe to. Empty falls back to the RELAY_AGENT_NAME env var; with neither set the extension stays idle."
+        },
+        "bot-relay.tether.agentToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional agent token for authenticated relays. Empty falls back to RELAY_AGENT_TOKEN env."
+        },
+        "bot-relay.tether.autoInjectInbox": {
+          "type": "boolean",
+          "default": false,
+          "description": "On every notification, write the literal string 'inbox\\n' into the matching integrated terminal. Useful when the agent terminal is the same name as the inbox; off by default to avoid surprising ambient typing."
+        },
+        "bot-relay.tether.notificationLevel": {
+          "type": "string",
+          "enum": ["event", "summary", "none"],
+          "default": "event",
+          "description": "event = toast on every inbox change. summary = collapsed digest every 5 min. none = silent (status bar only)."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "botRelayTether.openInbox",
+        "title": "Tether: Open Inbox Panel"
+      },
+      {
+        "command": "botRelayTether.reconnect",
+        "title": "Tether: Reconnect to Relay"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test:unit": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.0"
+  }
+}

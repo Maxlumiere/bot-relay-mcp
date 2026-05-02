@@ -2,6 +2,10 @@
 node_modules/
 dist/
 
+# v2.5.0 Tether — VSCode extension build artifacts (subdir tsc emits to out/)
+extensions/vscode/out/
+extensions/vscode/*.vsix
+
 # Local DB + data files
 *.db
 *.db-wal

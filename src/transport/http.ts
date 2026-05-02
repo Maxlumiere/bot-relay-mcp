@@ -1222,7 +1222,148 @@ export function startHttpServer(port: number, host: string): Server {
     }
   });
 
-  // Stateless MCP endpoint — new transport + server per request
+  // v2.5.0 R1 — Option A: stateful HTTP session map. Session-bound transport
+  // pairs (one Server + one Transport per session) live until either the
+  // client closes or the idle reaper sweeps them. Backward-compat path:
+  // requests without `mcp-session-id` AND not an `initialize` body fall to
+  // the original stateless one-shot logic — preserves smoke/curl callers
+  // that POST `tools/call` directly without managing a session.
+  //
+  // The stateful path activates when:
+  //   (a) request carries `mcp-session-id` header — route to that session;
+  //   (b) POST body has `method: 'initialize'` AND `Accept: text/event-stream`
+  //       — mint a new session, return its id in response headers;
+  //   (c) GET /mcp opens an SSE stream against an existing session.
+  interface HttpSession {
+    server: ReturnType<typeof createServer>;
+    transport: StreamableHTTPServerTransport;
+    createdAt: number;
+    lastSeen: number;
+    sourceIp: string | null;
+  }
+  const sessions = new Map<string, HttpSession>();
+  const HTTP_MAX_SESSIONS = Math.max(
+    1,
+    parseInt(process.env.RELAY_HTTP_MAX_SESSIONS ?? "64", 10) || 64,
+  );
+  const HTTP_SESSION_IDLE_SECONDS = Math.max(
+    30,
+    parseInt(process.env.RELAY_HTTP_SESSION_IDLE_SECONDS ?? "300", 10) || 300,
+  );
+
+  function reapIdleSessions(): void {
+    const cutoff = Date.now() - HTTP_SESSION_IDLE_SECONDS * 1000;
+    for (const [id, sess] of sessions) {
+      if (sess.lastSeen < cutoff) {
+        log.debug(`[http] reaping idle MCP session ${id} (idle ${(Date.now() - sess.lastSeen) / 1000}s)`);
+        sess.transport.close().catch(() => {});
+        // onclose hook below removes from map.
+      }
+    }
+  }
+  // 60s timer is fine even with 30s timeouts — idle reaps are best-effort,
+  // a session 1.5x its timeout window stays a few seconds longer at worst.
+  // Unref so the timer never blocks process shutdown.
+  const reaper = setInterval(reapIdleSessions, 60_000);
+  if (typeof reaper.unref === "function") reaper.unref();
+
+  function isInitializeBody(body: unknown): boolean {
+    return (
+      typeof body === "object" &&
+      body !== null &&
+      (body as { method?: unknown }).method === "initialize"
+    );
+  }
+
+  function wantsStream(req: Request): boolean {
+    const accept = (req.headers.accept ?? "") as string;
+    return accept.includes("text/event-stream");
+  }
+
+  /** Stateless one-shot path — pre-v2.5 behaviour, preserved verbatim. */
+  async function handleStatelessOneShot(req: Request, res: Response): Promise<void> {
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+    res.on("close", () => {
+      transport.close().catch(() => {});
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  }
+
+  /**
+   * Stateful path — initialize-with-stream from a fresh client. The
+   * SDK's transport assigns the session id from sessionIdGenerator at
+   * handleRequest time; we read it back via `transport.sessionId` AFTER
+   * the call returns and register the entry in the map. Concurrent
+   * sessionId conflicts are impossible because the generator is uuidv4.
+   */
+  async function handleStatefulInit(req: Request, res: Response, sourceIp: string | null): Promise<void> {
+    if (sessions.size >= HTTP_MAX_SESSIONS) {
+      log.warn(`[http] refusing new MCP session — cap (${HTTP_MAX_SESSIONS}) reached`);
+      res.status(503).json({
+        jsonrpc: "2.0",
+        id: (req.body as { id?: unknown } | undefined)?.id ?? null,
+        error: {
+          code: -32000,
+          message: `MCP session cap reached (${HTTP_MAX_SESSIONS}). Wait for idle sessions to drain or raise RELAY_HTTP_MAX_SESSIONS.`,
+        },
+      });
+      return;
+    }
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+    });
+    transport.onclose = () => {
+      const id = transport.sessionId;
+      if (id) sessions.delete(id);
+      // server.close() drops every subscription this session held via
+      // the unsubscribeAllForServer hook wired in createServer().
+      server.close().catch(() => {});
+    };
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+    const newId = transport.sessionId;
+    if (newId) {
+      sessions.set(newId, {
+        server,
+        transport,
+        createdAt: Date.now(),
+        lastSeen: Date.now(),
+        sourceIp,
+      });
+      log.debug(`[http] new MCP session ${newId} (active=${sessions.size})`);
+    } else {
+      // The SDK didn't assign a session — close + drop. Shouldn't happen
+      // when sessionIdGenerator is set, but defensive cleanup keeps us
+      // from leaking the server/transport pair.
+      transport.close().catch(() => {});
+    }
+  }
+
+  /** Route a request that carries mcp-session-id to its session transport. */
+  async function handleSessionRequest(
+    req: Request,
+    res: Response,
+    sessionId: string,
+    expectsBody: boolean,
+  ): Promise<void> {
+    const session = sessions.get(sessionId);
+    if (!session) {
+      res.status(404).json({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32001, message: `MCP session "${sessionId}" not found.` },
+      });
+      return;
+    }
+    session.lastSeen = Date.now();
+    await session.transport.handleRequest(req, res, expectsBody ? req.body : undefined);
+  }
+
   app.post("/mcp", async (req: Request, res: Response) => {
     const sourceIp = extractSourceIp(req, config.trusted_proxies);
     const authenticated = !!config.http_secret; // authMiddleware already enforced if set
@@ -1231,26 +1372,20 @@ export function startHttpServer(port: number, host: string): Server {
       { sourceIp, authenticated, transport: "http", headerAgentToken },
       async () => {
         try {
-          const server = createServer();
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: undefined, // stateless
-          });
-
-          res.on("close", () => {
-            transport.close().catch(() => {});
-          });
-
-          await server.connect(transport);
-          await transport.handleRequest(req, res, req.body);
+          const headerSession = req.headers["mcp-session-id"];
+          if (typeof headerSession === "string" && headerSession.length > 0) {
+            return await handleSessionRequest(req, res, headerSession, true);
+          }
+          if (isInitializeBody(req.body) && wantsStream(req)) {
+            return await handleStatefulInit(req, res, sourceIp);
+          }
+          return await handleStatelessOneShot(req, res);
         } catch (err) {
-          log.error("[http] Error handling MCP request:", err);
+          log.error("[http] Error handling MCP POST:", err);
           if (!res.headersSent) {
             res.status(500).json({
               jsonrpc: "2.0",
-              error: {
-                code: -32603,
-                message: "Internal server error",
-              },
+              error: { code: -32603, message: "Internal server error" },
               id: null,
             });
           }
@@ -1259,11 +1394,59 @@ export function startHttpServer(port: number, host: string): Server {
     );
   });
 
-  // GET /mcp is not supported in stateless mode (no SSE stream)
-  app.get("/mcp", (_req: Request, res: Response) => {
-    res.status(405).json({
-      error: "Method not allowed. Stateless mode does not support server-initiated streams.",
-    });
+  // v2.5.0 R1 — stateful GET /mcp opens an SSE stream against an existing
+  // session. Pre-v2.5 this 405'd because the daemon was strictly stateless.
+  // Per MCP spec, every request that's not an initialize must carry the
+  // `mcp-session-id` header; missing header → 400.
+  app.get("/mcp", async (req: Request, res: Response) => {
+    const sourceIp = extractSourceIp(req, config.trusted_proxies);
+    const authenticated = !!config.http_secret;
+    const headerAgentToken = (req.headers["x-agent-token"] as string | undefined) || undefined;
+    await requestContext.run(
+      { sourceIp, authenticated, transport: "http", headerAgentToken },
+      async () => {
+        try {
+          const headerSession = req.headers["mcp-session-id"];
+          if (typeof headerSession !== "string" || headerSession.length === 0) {
+            res.status(400).json({
+              error: "GET /mcp requires the mcp-session-id header. Initialize via POST first.",
+            });
+            return;
+          }
+          // GET has no body — handleRequest receives undefined.
+          await handleSessionRequest(req, res, headerSession, false);
+        } catch (err) {
+          log.error("[http] Error handling MCP GET (SSE):", err);
+          if (!res.headersSent) {
+            res.status(500).json({ error: "Internal server error" });
+          }
+        }
+      }
+    );
+  });
+
+  // v2.5.0 R1 — stateful DELETE /mcp closes a session explicitly. Per spec,
+  // this is the canonical client-initiated tear-down. The transport's
+  // onclose hook handles map cleanup + subscription drop.
+  app.delete("/mcp", async (req: Request, res: Response) => {
+    const headerSession = req.headers["mcp-session-id"];
+    if (typeof headerSession !== "string" || headerSession.length === 0) {
+      res.status(400).json({
+        error: "DELETE /mcp requires the mcp-session-id header.",
+      });
+      return;
+    }
+    const session = sessions.get(headerSession);
+    if (!session) {
+      res.status(404).end();
+      return;
+    }
+    try {
+      await session.transport.close();
+    } catch (err) {
+      log.warn(`[http] DELETE /mcp transport.close threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    res.status(204).end();
   });
 
   const server = app.listen(port, host, () => {
