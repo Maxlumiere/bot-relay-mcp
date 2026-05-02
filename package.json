@@ -51,7 +51,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "~1.29.0",
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^11.9.1",
+    "better-sqlite3": "^12.9.0",
     "express": "^5.2.1",
     "uuid": "^11.1.0",
     "ws": "^8.20.0",
