@@ -414,11 +414,11 @@ describe("v2.1.6 — kickstart prompt nudge", () => {
       initial_message: null,
     } as any;
 
-    const linuxCmd = linuxDriver.buildCommand(input, ctx, undefined, briefPath);
+    const linuxCmd = linuxDriver.buildCommand(input, ctx, briefPath);
     const linuxJoined = [linuxCmd.exec, ...linuxCmd.args].join(" ");
     expect(linuxJoined).toMatch(nudgeRegex);
 
-    const winCmd = windowsDriver.buildCommand(input, ctx, undefined, briefPath);
+    const winCmd = windowsDriver.buildCommand(input, ctx, briefPath);
     const winJoined = [winCmd.exec, ...winCmd.args].join(" ");
     expect(winJoined).toMatch(nudgeRegex);
   });

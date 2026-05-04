@@ -99,6 +99,80 @@ resolve_relay_db_path() {
   echo "$root/relay.db"
   return 0
 }
+
+# v2.6.1 — bash mirror of src/token-store.ts:resolveAgentVaultDir +
+# FileTokenStore.{pathFor,read,write}. BYTE-IDENTICAL across
+# hooks/check-relay.sh, hooks/post-tool-use-check.sh, hooks/stop-check.sh.
+# Token shape regex matches src/token-store.ts:62 + spawn-agent.sh's
+# legacy isValidTokenShape allowlist.
+#
+# Identity vault layout:
+#   <instanceDir>/agents/<name>.token   — chmod 0o600, parent dir 0o700
+#   ~/.bot-relay/agents/<name>.token    — single-instance legacy fallback
+#
+# Returns:
+#   resolve_relay_token_path <name>     — echo absolute path, return 0
+#                                         (or stderr+1 on bad name).
+#   read_relay_token_from_vault <name>  — echo token on stdout, return 0
+#                                         on success; return 1 on miss /
+#                                         malformed / unreadable.
+#   write_relay_token_to_vault <name> <token>
+#                                       — atomic tmp+rename, chmod 0600.
+resolve_relay_token_path() {
+  local name="$1"
+  if ! echo "$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+    echo "[bot-relay hook] invalid agent name \"$name\" for vault path (mirrors AGENT_NAME_RE in src/token-store.ts)" >&2
+    return 1
+  fi
+  local db_path
+  db_path=$(resolve_relay_db_path) || return 1
+  echo "$(dirname "$db_path")/agents/${name}.token"
+  return 0
+}
+read_relay_token_from_vault() {
+  local name="$1"
+  local token_path
+  token_path=$(resolve_relay_token_path "$name") || return 1
+  if [ ! -f "$token_path" ]; then
+    return 1
+  fi
+  local token
+  token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$token" ]; then
+    return 1
+  fi
+  if ! echo "$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
+    return 1
+  fi
+  echo "$token"
+  return 0
+}
+write_relay_token_to_vault() {
+  local name="$1"
+  local token="$2"
+  if ! echo "$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
+    echo "[bot-relay hook] refusing to write malformed token to vault for \"$name\"" >&2
+    return 1
+  fi
+  local token_path
+  token_path=$(resolve_relay_token_path "$name") || return 1
+  local dir
+  dir=$(dirname "$token_path")
+  mkdir -p "$dir" 2>/dev/null || true
+  chmod 0700 "$dir" 2>/dev/null || true   # POSIX; no-op on Windows
+  # Atomic write: tmp file in same dir, chmod, rename.
+  local tmp="${token_path}.tmp.$$"
+  {
+    umask 0177  # restrict file to 0600 even before chmod
+    printf '%s\n' "$token" > "$tmp"
+  } || return 1
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$token_path" || {
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  }
+  return 0
+}
 DB_PATH=$(resolve_relay_db_path) || {
   # Malformed active-instance content — refuse to fall back silently. A
   # broken setup should be loud, not hidden under legacy. The hook's
@@ -119,6 +193,16 @@ fi
 
 if ! echo "$AGENT_NAME" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$'; then
   exit 0
+fi
+
+# v2.6.1 — vault hydration. If the env-supplied RELAY_AGENT_TOKEN is empty
+# but a valid token sits in the vault for this agent, use it for HTTP-path
+# authentication. Sqlite-direct fallback path below does not need a token.
+if [ -z "$AGENT_TOKEN" ]; then
+  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
+    AGENT_TOKEN="$VAULT_TOKEN"
+    export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
+  fi
 fi
 
 if ! echo "$HTTP_HOST" | grep -Eq '^[A-Za-z0-9_.:-]{1,253}$'; then

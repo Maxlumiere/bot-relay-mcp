@@ -99,6 +99,80 @@ resolve_relay_db_path() {
   echo "$root/relay.db"
   return 0
 }
+
+# v2.6.1 — bash mirror of src/token-store.ts:resolveAgentVaultDir +
+# FileTokenStore.{pathFor,read,write}. BYTE-IDENTICAL across
+# hooks/check-relay.sh, hooks/post-tool-use-check.sh, hooks/stop-check.sh.
+# Token shape regex matches src/token-store.ts:62 + spawn-agent.sh's
+# legacy isValidTokenShape allowlist.
+#
+# Identity vault layout:
+#   <instanceDir>/agents/<name>.token   — chmod 0o600, parent dir 0o700
+#   ~/.bot-relay/agents/<name>.token    — single-instance legacy fallback
+#
+# Returns:
+#   resolve_relay_token_path <name>     — echo absolute path, return 0
+#                                         (or stderr+1 on bad name).
+#   read_relay_token_from_vault <name>  — echo token on stdout, return 0
+#                                         on success; return 1 on miss /
+#                                         malformed / unreadable.
+#   write_relay_token_to_vault <name> <token>
+#                                       — atomic tmp+rename, chmod 0600.
+resolve_relay_token_path() {
+  local name="$1"
+  if ! echo "$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+    echo "[bot-relay hook] invalid agent name \"$name\" for vault path (mirrors AGENT_NAME_RE in src/token-store.ts)" >&2
+    return 1
+  fi
+  local db_path
+  db_path=$(resolve_relay_db_path) || return 1
+  echo "$(dirname "$db_path")/agents/${name}.token"
+  return 0
+}
+read_relay_token_from_vault() {
+  local name="$1"
+  local token_path
+  token_path=$(resolve_relay_token_path "$name") || return 1
+  if [ ! -f "$token_path" ]; then
+    return 1
+  fi
+  local token
+  token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$token" ]; then
+    return 1
+  fi
+  if ! echo "$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
+    return 1
+  fi
+  echo "$token"
+  return 0
+}
+write_relay_token_to_vault() {
+  local name="$1"
+  local token="$2"
+  if ! echo "$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
+    echo "[bot-relay hook] refusing to write malformed token to vault for \"$name\"" >&2
+    return 1
+  fi
+  local token_path
+  token_path=$(resolve_relay_token_path "$name") || return 1
+  local dir
+  dir=$(dirname "$token_path")
+  mkdir -p "$dir" 2>/dev/null || true
+  chmod 0700 "$dir" 2>/dev/null || true   # POSIX; no-op on Windows
+  # Atomic write: tmp file in same dir, chmod, rename.
+  local tmp="${token_path}.tmp.$$"
+  {
+    umask 0177  # restrict file to 0600 even before chmod
+    printf '%s\n' "$token" > "$tmp"
+  } || return 1
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$token_path" || {
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  }
+  return 0
+}
 DB_PATH=$(resolve_relay_db_path) || {
   # Malformed active-instance content — refuse to fall back silently. A
   # broken setup should be loud, not hidden under legacy. The hook's
@@ -109,6 +183,18 @@ DB_PATH=$(resolve_relay_db_path) || {
 }
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
+
+# v2.6.1 — vault-first bootstrap. If RELAY_AGENT_TOKEN is unset in env BUT a
+# vault file exists for this agent name, hydrate the env from disk before any
+# auth-sensitive call below. Closes the spawn-without-pre-mint failure mode
+# (3-min broken state hit 2026-05-04 with gaming-build) and makes restart-of-
+# closed-terminal lossless: identity persists even when the operator did not
+# bake RELAY_AGENT_TOKEN into a shell rc file.
+if [ -z "${RELAY_AGENT_TOKEN:-}" ]; then
+  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
+    export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
+  fi
+fi
 
 # --- Input validation (security hardening) ---
 
@@ -198,11 +284,21 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
     if echo "$RECOVERY_BODY" | grep -q '"recovery_completed":true'; then
       NEW_TOKEN=$(echo "$RECOVERY_BODY" | grep -oE '"agent_token":"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)".*/\1/')
       RECOVERY_COMPLETED=1
-      echo "[relay] Recovery completed for \"$AGENT_NAME\". A fresh agent_token was minted." >&2
-      echo "[relay] The relay cannot mutate your shell env; do this manually before next tool call:" >&2
-      echo "[relay]   unset RELAY_RECOVERY_TOKEN" >&2
-      echo "[relay]   export RELAY_AGENT_TOKEN=${NEW_TOKEN}" >&2
-      echo "[relay] Persist the new token in your shell rc file if this terminal will survive restarts." >&2
+      # v2.6.1 — persist to vault + export inline. Operators no longer need
+      # to manually paste the new token into their shell config; the next
+      # spawn picks it up via FileTokenStore.read.
+      if [ -n "$NEW_TOKEN" ]; then
+        if write_relay_token_to_vault "$AGENT_NAME" "$NEW_TOKEN"; then
+          export RELAY_AGENT_TOKEN="$NEW_TOKEN"
+          echo "[relay] Recovery completed for \"$AGENT_NAME\". Fresh agent_token written to vault and exported." >&2
+          echo "[relay]   You may unset RELAY_RECOVERY_TOKEN now; the new token is persisted at:" >&2
+          if VPATH=$(resolve_relay_token_path "$AGENT_NAME"); then echo "[relay]     $VPATH" >&2; fi
+        else
+          echo "[relay] Recovery completed for \"$AGENT_NAME\" but vault write failed. Set manually:" >&2
+          echo "[relay]   unset RELAY_RECOVERY_TOKEN" >&2
+          echo "[relay]   export RELAY_AGENT_TOKEN=${NEW_TOKEN}" >&2
+        fi
+      fi
     else
       echo "[relay] Recovery attempt failed for \"$AGENT_NAME\". Response: $(echo "$RECOVERY_BODY" | head -c 200)" >&2
       exit 1
@@ -284,6 +380,25 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}}}}" \
     2>&1)
+  # v2.6.1 — capture fresh agent_token from the response body and persist
+  # to the vault. register_agent only returns `agent_token` on first-mint
+  # paths (legacy_bootstrap → active or fresh INSERT); subsequent re-
+  # registers preserve the existing hash and omit the field. So the
+  # presence of `"agent_token":"..."` here means "the daemon just minted a
+  # fresh credential for us, capture it." Closes the v2.1 Phase 4j latent
+  # bug where this token was discarded, leaving the agent registered but
+  # unable to authenticate.
+  REG_TOKEN=$(echo "$REG_BODY" | grep -oE '"agent_token":"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)".*/\1/')
+  if [ -n "$REG_TOKEN" ]; then
+    if write_relay_token_to_vault "$AGENT_NAME" "$REG_TOKEN"; then
+      export RELAY_AGENT_TOKEN="$REG_TOKEN"
+      if [ -n "${RELAY_HOOK_DEBUG:-}" ]; then
+        echo "[bot-relay hook debug] persisted fresh agent_token to vault for \"$AGENT_NAME\"" >&2
+      fi
+    else
+      echo "[relay] Bootstrap failed for $AGENT_NAME — register_agent succeeded but vault write failed. Run \`relay recover $AGENT_NAME\` and re-spawn." >&2
+    fi
+  fi
   # If $RELAY_HOOK_DEBUG is set, print the full response for troubleshooting.
   # Otherwise swallow silently — non-200 means the server refused (stale
   # token, revoked state, etc.), which is fine: the earlier health_check

@@ -49,6 +49,36 @@ One new gate step (R1 add): **npm pack contents check** — `scripts/pre-publish
 - Bulk operations (`relay rotate-all-tokens`, `relay list-stale-tokens`, `relay agents --filter ...`) — queued as v2.7.
 - Cross-machine identity, namespace prefixing, hardware-backed token storage, GUI mint flow — Tether Cloud / Pro territory per `project_tether_product_strategy.md`.
 
+### v2.6.1 stack — spawn-flow self-bootstrap (TokenStore + FileTokenStore)
+
+Closes the latent v2.1 Phase 4j bug exposed 2026-05-04 when a child terminal spawned via `bin/spawn-agent.sh` without a pre-minted token: the SessionStart hook called `register_agent` over HTTP, the relay correctly minted a fresh `agent_token` and returned it in the response body, **and the script discarded the response** — 3-min spawn-to-broken-state. Latent since v2.1 Phase 4j; hidden until now because every prior spawn used the 5th-arg-token plumbing in `spawn-agent.sh`. Fix is a single elegant primitive — a per-instance file vault — that solves both first-spawn bootstrap AND respawn persistence with zero operator mediation, working across macOS / Linux / Windows from day one. Built on the canonical credential-helper pattern (Docker / Git / gh / AWS / kubectl all use this shape), with a pluggable `TokenStore` interface so v2.9+ can plug in OS-specific helpers (Keychain / Credential Manager / libsecret / 1Password / Vault) without breaking changes.
+
+- **`src/token-store.ts`** *(new)* — `TokenStore` interface + `FileTokenStore` impl. Per-instance scoped path at `<instanceDir>/agents/<name>.token`; chmod 0o600 file, 0o700 parent; atomic write via tmp-file + rename so concurrent spawns of the same name converge cleanly; token shape validated on read against `/^[A-Za-z0-9_=.-]{8,128}$/` (mirrors the spawn-agent.sh allowlist + the bash hook helpers).
+- **`hooks/check-relay.sh`** — vault-first bootstrap. If `RELAY_AGENT_TOKEN` is unset in env but a vault file exists, hydrate. On register_agent over HTTP, parse `agent_token` from the response body and persist to vault + export. Recovery flow also writes the new token to vault + exports inline (operator no longer needs manual paste).
+- **`hooks/post-tool-use-check.sh` + `hooks/stop-check.sh`** — byte-identical mirrors of the new `resolve_relay_token_path` / `read_relay_token_from_vault` / `write_relay_token_to_vault` helpers + same vault-hydration block as check-relay.sh. The three hooks read from one vault.
+- **`bin/spawn-agent.sh`** — 5th-arg-token slot dropped. `BRIEF_PATH` moved from positional 6 to positional 5. `RELAY_AGENT_TOKEN` no longer exported into the child shell via the AppleScript embedding; the hook hydrates from disk instead.
+- **`src/spawn/dispatcher.ts` + `src/spawn/types.ts` + `src/spawn/drivers/*.ts`** — `token` parameter removed from `buildCommand` / `buildSpawnCommand` / `spawnAgent` (or kept as a `_legacyTokenSlot` placeholder for positional API stability with existing tests). macOS no longer pushes the token as arg 5; Linux/Windows no longer set `RELAY_AGENT_TOKEN` in `buildChildEnv`. The child env actively drops any inherited `RELAY_AGENT_TOKEN` from the parent's `RELAY_*` glob — child agent identity is exclusively vault-resolved.
+- **`src/tools/spawn.ts`** — `handleSpawnAgent` keeps parent-side `registerAgent` (race-safe + name-collision UX), captures `plaintext_token`, **writes to the vault before driver dispatch** (instead of passing through the env channel). Driver failure rolls back BOTH the agent row AND the vault entry so a future spawn can succeed cleanly.
+- **`src/cli/recover.ts`** — recovery now also scrubs the vault entry. After `relay recover <name>`, the next `register_agent` writes a fresh vault file via the SessionStart hook; no manual operator step.
+- **`scripts/migrate-existing-tokens-to-vault.sh`** *(new)* — one-shot migration for operators who had `RELAY_AGENT_TOKEN` baked into `~/.zshrc` / `~/.bashrc` / `~/.envrc`. Reads env, writes vault, prints "you can unset the env var now."
+- **`docs/agents/local-identity.md`** *(new)* — full lifecycle doc: vault model, bootstrap → persistence → recovery, cross-platform story, pluggable credential-helper interface, operator hygiene, audit trail.
+- **`SECURITY.md`** — new "Local agent token storage (v2.6.1)" subsection in the threat-model section. Same threat-model bar as `~/.aws/credentials` / `~/.ssh/id_rsa` / `~/.config/gh/hosts.yml`.
+
+#### Tests — `tests/v2-6-1-token-store.test.ts` *(new)*
+
+- Unit: `FileTokenStore` read / write / delete on a tmp dir; round-trip preserves token; missing file returns null; malformed content (whitespace, length out of bounds, disallowed chars) rejected on read.
+- POSIX perms: file 0o600, parent dir 0o700 after write (assertion skipped on Windows).
+- Atomic write: concurrent writes never produce a half-file readable by `read()`.
+- Integration: `handleSpawnAgent` writes the vault before driver dispatch; `RELAY_SPAWN_DRY_RUN=1` captures the constructed command and the vault file is verified on disk; rollback on driver failure scrubs both the agent row AND the vault file.
+- Recovery: `relay recover` deletes the vault entry alongside the agent row.
+
+`tests/v2-1-spawn-token-passthrough.test.ts` rewritten as legacy-rejection: assertions flipped to verify the env-var passthrough path is gone — `cmd.env.RELAY_AGENT_TOKEN` is now `undefined` for every driver, the macOS arg vector no longer carries the token, and `handleSpawnAgent` writes the vault file before dispatch.
+
+#### Cross-platform parity (per `feedback_cross_platform_parity.md`)
+
+- macOS / Linux: POSIX file (chmod 0o600), parent dir 0o700. Verified by tests.
+- Windows: NTFS file at `%USERPROFILE%\.bot-relay\instances\<id>\agents\<name>.token`. The `chmod` calls are best-effort no-ops; the parent dir under `%USERPROFILE%` already inherits a user-restricted ACL from the Windows profile defaults. Same threat model as `~/.aws/credentials` on POSIX. Documented in `SECURITY.md` + `docs/agents/local-identity.md`. v2.9+ Windows Credential Manager helper (pluggable via `TokenStore`) will move beyond profile-dir defaults.
+
 ## v2.5.0 — 2026-04-29 — Tether Phase 1 (MCP resource subscriptions + VSCode extension)
 
 Introduces **Tether** — the operator-awareness layer for bot-relay-mcp. Free, bundled. The strict architectural line between FREE Tether Local (this repo) and FUTURE Tether Cloud / Pro (paid, separate repo) is documented in `docs/tether-roadmap.md` — features that need a server, third-party API, or cross-machine sync do NOT belong here.

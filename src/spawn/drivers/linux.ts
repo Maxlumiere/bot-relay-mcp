@@ -119,7 +119,6 @@ export const linuxDriver: SpawnDriver = {
   buildCommand(
     input: SpawnAgentInput,
     ctx: DriverContext,
-    token?: string,
     briefFilePath?: string
   ): SpawnCommand {
     // v2.1.5 (I10 cross-platform completion): when briefFilePath is provided,
@@ -138,11 +137,10 @@ export const linuxDriver: SpawnDriver = {
     const cwd = normalizeCwd(input.cwd || process.env.HOME || "/", "linux");
     const kickstart = buildKickstart(briefFilePath, process.env);
     const launch = buildLaunchCommand(cwd, kickstart);
-    // v2.1 Phase 4j: token flows into the child via process env — Linux
-    // terminals (gnome-terminal, konsole, xterm, tmux) spawn bash as a child
-    // process whose inherited env comes straight from child_process.spawn's
-    // env field, so adding RELAY_AGENT_TOKEN here reaches the target claude.
-    const env = buildChildEnv(input.name, input.role, input.capabilities, "linux", process.env, token);
+    // v2.6.1: token no longer flows via env. The hook resolves identity from
+    // the per-instance file vault written by handleSpawnAgent before driver
+    // dispatch. Closes the spawn-without-pre-mint failure mode.
+    const env = buildChildEnv(input.name, input.role, input.capabilities, "linux", process.env);
 
     let exec: string;
     let args: string[];

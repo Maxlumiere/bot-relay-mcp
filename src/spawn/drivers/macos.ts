@@ -15,7 +15,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import type { SpawnAgentInput } from "../../types.js";
 import type { SpawnCommand, SpawnDriver, DriverContext } from "../types.js";
-import { buildChildEnv, normalizeCwd, isValidTokenShape } from "../validation.js";
+import { buildChildEnv, normalizeCwd } from "../validation.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,27 +36,22 @@ export const macosDriver: SpawnDriver = {
   buildCommand(
     input: SpawnAgentInput,
     _ctx: DriverContext,
-    token?: string,
     briefFilePath?: string
   ): SpawnCommand {
     const capsStr = input.capabilities.join(",");
     const cwd = normalizeCwd(input.cwd || process.env.HOME || "/", "darwin");
-    // v2.1 Phase 4j: only pass the token through the CLI-arg channel when its
-    // shape is valid. The shell script re-validates, but dropping bad tokens
-    // here keeps the argv clean + the script's CLI signature stable.
-    //
-    // v2.1.4 (I10): brief_file_path is arg 6. If present, we must also push
-    // arg 5 (token) even when invalid-shape — use empty string as placeholder
-    // so positional ordering stays stable in bin/spawn-agent.sh.
+    // v2.6.1: token CLI arg removed. Identity now flows through the file
+    // vault at <instanceDir>/agents/<name>.token (written by handleSpawnAgent
+    // before driver dispatch); the SessionStart hook reads it on first turn.
+    // bin/spawn-agent.sh dropped its 5th-arg-token slot in v2.6.1; brief
+    // moved from arg 6 to arg 5.
     const args = [input.name, input.role, capsStr, cwd];
-    const hasValidToken = isValidTokenShape(token);
     const hasBrief = typeof briefFilePath === "string" && briefFilePath.length > 0;
-    if (hasValidToken || hasBrief) args.push(hasValidToken ? (token as string) : "");
     if (hasBrief) args.push(briefFilePath as string);
     return {
       exec: SPAWN_SCRIPT,
       args,
-      env: buildChildEnv(input.name, input.role, input.capabilities, "darwin", process.env, token),
+      env: buildChildEnv(input.name, input.role, input.capabilities, "darwin", process.env),
       detached: true,
       platform: "darwin",
       driverName: "macos",

@@ -163,6 +163,23 @@ Out-of-band token handoff is the human authorization moment. Recovery tokens cur
 
 ---
 
+## Local agent token storage (v2.6.1)
+
+The SessionStart hook persists each agent's plaintext token to `<instanceDir>/agents/<name>.token` (chmod 0o600 on POSIX, parent dir 0o700) so spawned terminals can re-authenticate across restarts without re-running `register_agent`. Full lifecycle in [`docs/agents/local-identity.md`](./docs/agents/local-identity.md).
+
+**Threat model — same bar as other local credential vaults.**
+
+- Local-machine only. Plaintext at rest in `~/.bot-relay/`. Same threat surface as `~/.aws/credentials`, `~/.ssh/id_rsa`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`. A same-user process compromise can read the relay DB directly anyway — token files do not open new attack surface.
+- POSIX (macOS, Linux): `chmod 0o600` on file, `0o700` on parent dir, enforced by `FileTokenStore.write` (TS) and the byte-identical bash mirror in the SessionStart hook. Enforced at write time on every rotate.
+- Windows: NTFS profile-dir defaults inherit a user-restricted ACL from `%USERPROFILE%`. The TS `chmod` calls become best-effort no-ops; we do not currently shell out to `icacls` to verify. v2.9+ Windows Credential Manager helper (pluggable via the `TokenStore` interface) will move beyond profile-dir defaults.
+- Backup tools (Time Machine, Dropbox, iCloud Drive, Backblaze, etc.) may capture vault contents. Operators wanting stronger guarantees should exclude `~/.bot-relay/` from cloud-synced backup destinations OR wait for a v2.9+ credential-helper plug-in (Keychain / Credential Manager / 1Password) which encrypts at rest.
+- Federation tokens (v2.3+ when shipped) use a different mechanism. Local file vault is local-machine only.
+- Vault writes themselves are not separately audited; the DB-side `audit_log` already captures every credential issuance via `register_agent` / `rotate_token` / `revoke_token` / `agent.token_minted` / `recovery.cli`. The vault is the persistence side effect of an already-audited issuance.
+
+Migration of pre-v2.6.1 env-baked tokens: [`scripts/migrate-existing-tokens-to-vault.sh`](./scripts/migrate-existing-tokens-to-vault.sh) — one-shot writes the env-resolved token into the vault.
+
+---
+
 ## DNS-rebinding defense (Phase 4e + v2.1.7)
 
 Webhook targets are re-validated at fire time: `validateWebhookUrl` re-resolves the hostname and re-runs the SSRF check against every resolved IP. If a previously-safe hostname now resolves to a private IP or a cloud-metadata address, the webhook is terminally refused (no retry — feeding an attacker controlling DNS wastes bandwidth). v2.1.7 replaces IPv6 string-prefix checks with real CIDR matching (see Item 5 in v2.1.7 review above); pre-v2.1.7 clients that relied on the `fe80:` string-prefix should re-audit their webhook targets for any link-local IPv6 they depended on seeing blocked.

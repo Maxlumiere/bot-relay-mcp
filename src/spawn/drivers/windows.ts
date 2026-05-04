@@ -101,7 +101,6 @@ export const windowsDriver: SpawnDriver = {
   buildCommand(
     input: SpawnAgentInput,
     ctx: DriverContext,
-    token?: string,
     briefFilePath?: string
   ): SpawnCommand {
     // v2.1.5 (I10 cross-platform completion): when briefFilePath is provided,
@@ -116,10 +115,12 @@ export const windowsDriver: SpawnDriver = {
     }
 
     const cwd = normalizeCwd(input.cwd || process.env.USERPROFILE || "C:\\", "win32");
-    // v2.1 Phase 4j: token propagates via process env — wt.exe/powershell.exe/
-    // cmd.exe spawn as direct children of child_process.spawn and inherit
-    // the env field verbatim, including RELAY_AGENT_TOKEN when set.
-    const env = buildChildEnv(input.name, input.role, input.capabilities, "win32", process.env, token);
+    // v2.6.1: token no longer flows via env. The hook resolves identity from
+    // the per-instance file vault written by handleSpawnAgent before driver
+    // dispatch. The vault file at <instanceDir>/agents/<name>.token is
+    // owner-readable only via NTFS profile-dir defaults under %USERPROFILE%
+    // (documented in SECURITY.md + docs/agents/local-identity.md).
+    const env = buildChildEnv(input.name, input.role, input.capabilities, "win32", process.env);
     const kickstart = buildKickstart(briefFilePath, process.env);
 
     let exec: string;

@@ -9,23 +9,32 @@ import { log } from "../logger.js";
 import type { SpawnAgentInput } from "../types.js";
 import { spawnAgent } from "../spawn/dispatcher.js";
 import { validateBriefPath } from "../spawn/validation.js";
+import { defaultTokenStore } from "../token-store.js";
 import { ERROR_CODES } from "../error-codes.js";
 
 /**
- * v2.1 Phase 4j: pre-register the child agent PARENT-SIDE and thread the
- * plaintext token through the spawn dispatcher so the spawned terminal lands
- * with RELAY_AGENT_TOKEN already exported in its shell. Removes the operator-
+ * v2.1 Phase 4j: pre-register the child agent PARENT-SIDE and persist the
+ * plaintext token via the FileTokenStore vault so the spawned terminal's
+ * SessionStart hook can resolve identity from disk. Removes the operator-
  * paste step that violated `feedback_spawn_must_carry_token`.
  *
- * Rollback: if the platform driver fails to launch, unregister the agent row
- * so we don't leak a registered-but-not-running phantom.
+ * v2.6.1: token no longer flows through the env-var spawn-arg channel — it
+ * flows through the per-instance file vault at `<instanceDir>/agents/<name>
+ * .token`. The hook reads the vault first; on miss it falls back to
+ * `register_agent` + capture + write. Eliminates the "spawn-agent.sh
+ * directly without pre-mint" failure mode (3-min broken state) hit
+ * 2026-05-04 with gaming-build.
+ *
+ * Rollback: if the platform driver fails to launch, unregister the agent
+ * row AND delete the vault entry so we don't leak a registered-but-not-
+ * running phantom or a stale vault file blocking the next spawn.
  *
  * Name-collision: refuses cleanly if an agent with the requested name already
  * exists. Re-spawning on top would either silently rotate caps or force a
  * legacy-migration path we don't want to conflate with new-agent creation —
  * operator must unregister the existing one first.
  */
-export function handleSpawnAgent(input: SpawnAgentInput) {
+export async function handleSpawnAgent(input: SpawnAgentInput) {
   // v2.1.4 (I10): validate brief_file_path BEFORE any side effect. Zod has
   // already done the regex/char check; this adds the filesystem-side
   // invariants (exists, readable, size cap) that can't live in the schema.
@@ -121,13 +130,57 @@ export function handleSpawnAgent(input: SpawnAgentInput) {
     }
   }
 
+  // v2.6.1: persist the plaintext token to the per-instance file vault so
+  // the spawned terminal's SessionStart hook resolves identity from disk
+  // without an env-var passthrough. Vault writes are atomic (tmp + rename)
+  // so concurrent spawns never observe a half-written file. If the write
+  // fails, treat it as a spawn failure and roll back — silently dropping
+  // the token would leave the row registered without a way for the child
+  // to authenticate.
+  if (plaintextToken) {
+    try {
+      await defaultTokenStore().write(input.name, plaintextToken);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      try {
+        if (registeredSessionId) {
+          unregisterAgent(input.name, registeredSessionId);
+        } else {
+          unregisterAgent(input.name);
+        }
+      } catch (rollbackErr) {
+        log.warn(`[spawn] rollback after vault-write failure for "${input.name}":`, rollbackErr);
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error: `Token vault write failed for spawn_agent: ${msg}`,
+                error_code: ERROR_CODES.INTERNAL,
+                rolled_back: true,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
   // v1.9: dispatch to the platform-appropriate driver. macOS still shells
   // out to bin/spawn-agent.sh (preserving v1.6.x hardening). Linux and
-  // Windows use native TS drivers. v2.1 Phase 4j: token flows through.
-  // v2.1.4 (I10): validatedBriefPath also flows through (macOS only today).
+  // Windows use native TS drivers.
+  // v2.6.1: the token no longer flows through the dispatcher — it lives in
+  // the vault file. Drivers take undefined for the legacy `token` slot.
+  // v2.1.4 (I10): validatedBriefPath flows through (macOS only today).
   const result = spawnAgent(
     input,
-    plaintextToken ?? undefined,
+    undefined,
     undefined,
     process.platform,
     validatedBriefPath
@@ -135,6 +188,8 @@ export function handleSpawnAgent(input: SpawnAgentInput) {
 
   if (!result.ok) {
     // v2.1 Phase 4j (3/3): rollback the pre-register — don't leak phantoms.
+    // v2.6.1: ALSO scrub the vault entry so a future spawn can succeed
+    // cleanly without operator intervention.
     try {
       if (registeredSessionId) {
         unregisterAgent(input.name, registeredSessionId);
@@ -145,6 +200,11 @@ export function handleSpawnAgent(input: SpawnAgentInput) {
       // If rollback itself fails, log but still surface the original spawn
       // error to the caller — they need to know about the root cause.
       log.warn(`[spawn] rollback unregister failed for "${input.name}":`, rollbackErr);
+    }
+    try {
+      await defaultTokenStore().delete(input.name);
+    } catch (vaultErr) {
+      log.warn(`[spawn] rollback vault delete failed for "${input.name}":`, vaultErr);
     }
     return {
       content: [
@@ -192,7 +252,7 @@ export function handleSpawnAgent(input: SpawnAgentInput) {
             driver: result.driverName,
             agent_token: plaintextToken,
             auth_note: plaintextToken
-              ? "Parent-issued agent_token has been exported into the spawned child's RELAY_AGENT_TOKEN env. The spawned agent is authenticated from its first tool call. Shown once; the server stores only a bcrypt hash."
+              ? "Parent-issued agent_token has been written to the per-instance file vault (v2.6.1). The spawned terminal's SessionStart hook resolves identity from disk on first turn — no operator paste required. Shown once; the server stores only a bcrypt hash."
               : null,
             note: `Spawning agent "${input.name}" (role: ${input.role}) via ${result.driverName} on ${result.platform}. Pre-registered parent-side with token passthrough.`,
             has_initial_message: !!input.initial_message,
