@@ -1,5 +1,51 @@
 # Changelog
 
+## v2.6.0 — Unreleased — `relay mint-token` CLI + external-CLI setup docs
+
+Adds an operator-side credential issuance path for external CLI agents whose safety monitors block the `register_agent` → use-returned-token sequence in a single response (Codex 5.5 was the canonical case as of 2026-04-27; per `memory/feedback_codex_5_5_safety_blocks_register.md`). Pure-additive — zero behavior change for existing users; existing `register_agent` flow is unchanged.
+
+### `relay mint-token <name>`
+
+New CLI subcommand. Mints an agent token directly via filesystem access to the per-instance DB and prints the plaintext token ONCE to stdout. The operator exports it as `RELAY_AGENT_TOKEN` and launches the external CLI; the agent then authenticates on its first MCP call without ever invoking `register_agent` itself.
+
+```bash
+relay mint-token codex-5-5 --role builder --capabilities build,test,audit
+relay mint-token codex-5-5 --force                      # rotate token, caps + role preserved
+relay mint-token NAME --json                            # structured output for scripts
+relay mint-token NAME --description "human-readable"    # discoverable in dashboard
+```
+
+- **`src/cli/mint-token.ts`** *(new)* — argv parsing, daemon-running stderr advisory, audit-log entry on every invocation (success or refused), human-readable + `--json` output formats. Mirrors `src/cli/recover.ts`'s shape end-to-end.
+- **`src/db.ts`** — new sanctioned mutation helper `mintAgentToken(name, role, capabilities, opts)`. INSERT path mirrors `registerAgent`'s 13-column shape exactly so a minted-but-never-registered row is auth-layer-indistinguishable from a registered row. UPDATE path (under `--force`) rotates token only: caps and role preserved, `session_id` cleared, `agent_status='offline'`, auth-side fields (`previous_token_hash`, `rotation_grace_expires_at`, `recovery_token_hash`, `revoked_at`) zeroed.
+- **`src/auth.ts`** — `BCRYPT_ROUNDS` is now exported (still `10`) so the regression test can pin the cost factor without duplicating the constant.
+- **`bin/relay`** — `mint-token` wired into `SUBCOMMANDS` and `printHelp`. CLI count: 13 → 14.
+- **`docs/agents/external-cli-setup.md`** *(new)* — full setup walkthrough: how the env-token pattern works, worked examples for Codex 5.5 + Cursor (best-effort), token storage best practices (`direnv`, macOS keychain, rotation hygiene), audit-trail shape, cross-platform notes.
+- **`README.md`** — new "External-CLI Token Mint (v2.6)" section after Lost-Token Recovery, cross-linking to `docs/agents/external-cli-setup.md`.
+
+### Tests — `tests/v2-6-mint-token.test.ts` *(new)*
+
+Spawns `node bin/relay mint-token …` against a throwaway DB and asserts on:
+
+1. mint on new agent → row created, token-hash valid, plaintext token printed once.
+2. mint on existing agent without `--force` → exit 2, clear stderr error pointing at `--force`, original token still authenticates.
+3. mint on existing agent with `--force` → token rotates, old token no longer authenticates, new token does, caps and role preserved.
+4. token shape is 43-char base64url (matches the existing `generateToken` convention).
+5. bcrypt hash carries cost factor 10 (parses `$2a$10$…` prefix; pinned via the exported `BCRYPT_ROUNDS`).
+6. `--json` flag emits parseable JSON with `success`, `token`, `name`, `agent_id`, `created`, `force`, `env_block` fields.
+7. `audit_log` entry written on every mint (`tool='agent.token_minted'`), including the refused path.
+8. Daemon-running advisory printed to stderr when port 3777 has a listener (skipped to non-default port in CI to avoid heuristics colliding with a real local daemon).
+9. Caps locked at mint — `--force` rotation ignores `--capabilities` flag and preserves stored caps.
+10. `--db-path` pointing at a non-existent directory → exit 2 with clean error.
+
+### Pre-publish gate
+
+No new gate steps. The mint-token mutation routes through the sanctioned helper `mintAgentToken` in `src/db.ts`, so the existing sanctioned-helper guard passes unchanged. CLI smoke (`scripts/smoke-25-tools.sh`) is unchanged in scope (mint-token tested via dedicated integration test, not the smoke harness).
+
+### Out of scope (deferred)
+
+- Bulk operations (`relay rotate-all-tokens`, `relay list-stale-tokens`, `relay agents --filter ...`) — queued as v2.7.
+- Cross-machine identity, namespace prefixing, hardware-backed token storage, GUI mint flow — Tether Cloud / Pro territory per `project_tether_product_strategy.md`.
+
 ## v2.5.0 — 2026-04-29 — Tether Phase 1 (MCP resource subscriptions + VSCode extension)
 
 Introduces **Tether** — the operator-awareness layer for bot-relay-mcp. Free, bundled. The strict architectural line between FREE Tether Local (this repo) and FUTURE Tether Cloud / Pro (paid, separate repo) is documented in `docs/tether-roadmap.md` — features that need a server, third-party API, or cross-machine sync do NOT belong here.
