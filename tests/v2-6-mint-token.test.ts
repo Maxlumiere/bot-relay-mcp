@@ -12,6 +12,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
+import net from "net";
 import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
@@ -277,5 +278,66 @@ describe("v2.6 — relay mint-token CLI", () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/missing <name>/);
     expect(r.stdout).toMatch(/Usage: relay mint-token/);
+  });
+
+  // v2.6 R1 — codex audit P2 #2 regression. The daemon-running advisory
+  // must reach stderr regardless of --json; the prior `!args.json` exclusion
+  // suppressed it for scripted callers, defeating the brief Item 3.7 safety
+  // signal. Both subtests bind a real TCP listener on the configured probe
+  // port so the CLI's daemonListening() returns true, then assert the
+  // verbatim stderr phrase.
+
+  function bindListener(port: number): Promise<{ close: () => Promise<void> }> {
+    return new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.once("error", reject);
+      srv.listen(port, "127.0.0.1", () => {
+        resolve({
+          close: () =>
+            new Promise<void>((res) => {
+              srv.close(() => res());
+            }),
+        });
+      });
+    });
+  }
+
+  it("(12) --json still prints the daemon-running advisory to stderr", async () => {
+    // Bind a free port so the test is hermetic vs. any real daemon on :3777.
+    const port = 54897;
+    const listener = await bindListener(port);
+    try {
+      const r = runMint(["json-warn-check", "--role", "agent", "--json"], {
+        RELAY_HTTP_PORT: String(port),
+      });
+      expect(r.status).toBe(0);
+      // stdout MUST still parse as a single JSON line — no warn pollution.
+      const trimmed = r.stdout.trim();
+      const parsed = JSON.parse(trimmed);
+      expect(parsed.success).toBe(true);
+      expect(parsed.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      // stderr MUST carry the verbatim phrase from src/cli/mint-token.ts.
+      expect(r.stderr).toContain("Daemon currently running on 127.0.0.1:54897");
+      expect(r.stderr).toContain("Token mint applied to live DB.");
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("(13) human-readable mode also emits the daemon-running advisory to stderr", async () => {
+    const port = 54896;
+    const listener = await bindListener(port);
+    try {
+      const r = runMint(["human-warn-check", "--role", "agent"], {
+        RELAY_HTTP_PORT: String(port),
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/Minted token for new agent/);
+      expect(r.stderr).toContain("Daemon currently running on 127.0.0.1:54896");
+      expect(r.stderr).toContain("agent process");
+      expect(r.stderr).toContain("must be restarted with the new RELAY_AGENT_TOKEN");
+    } finally {
+      await listener.close();
+    }
   });
 });

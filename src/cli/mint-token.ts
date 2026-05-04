@@ -213,7 +213,11 @@ export async function run(argv: string[]): Promise<number> {
   const host = process.env.RELAY_HTTP_HOST || "127.0.0.1";
   const port = parseInt(process.env.RELAY_HTTP_PORT || "3777", 10);
   const daemonUp = await daemonListening(host, port);
-  if (daemonUp && !args.json) {
+  // v2.6 R1 (codex audit P2 #2): always emit the advisory to stderr when the
+  // daemon is up, including under --json. Stderr is structurally separate from
+  // stdout JSON, so they don't conflict; the advisory is brief Item 3.7's
+  // load-bearing safety signal and must surface for scripted callers too.
+  if (daemonUp) {
     process.stderr.write(
       `\n⚠ Daemon currently running on ${host}:${port}. Token mint applied to live DB.\n` +
         "  The new token is effective immediately for new MCP calls.\n" +

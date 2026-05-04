@@ -311,6 +311,48 @@ ci_green_gate() {
 }
 step "GitHub CI green-gate" ci_green_gate || exit 1
 
+# --- 6d. npm pack contents check (v2.6.0) ------------------------------------
+# v2.6 R1 codex audit P2 #1: src/cli/mint-token.ts cross-links to
+# docs/agents/external-cli-setup.md from its CLI output, and README.md does
+# the same. If `package.json.files` doesn't include the docs path, the npm
+# tarball won't carry the doc and the cross-link 404s for the user.
+#
+# Gate: every cross-linked-from-CLI doc must appear in `npm pack --dry-run`
+# output. Currently the only such file is docs/agents/external-cli-setup.md;
+# the list grows as future CLI subcommands gain docs.
+npm_pack_contents() {
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "  SKIP  npm not on PATH"
+    return 0
+  fi
+  local required=(
+    "docs/agents/external-cli-setup.md"
+  )
+  local pack_out
+  pack_out=$(cd "$PROJECT_ROOT" && npm pack --dry-run --json 2>/dev/null) || {
+    echo "  SKIP  npm pack --dry-run --json failed (network or registry)"
+    return 0
+  }
+  local missing=()
+  local f
+  for f in "${required[@]}"; do
+    # The JSON output is one large blob; grep for the path. Avoid jq dep.
+    if ! printf '%s' "$pack_out" | grep -q "\"$f\""; then
+      missing+=("$f")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "Required tarball files missing from npm pack output:" >&2
+    for f in "${missing[@]}"; do echo "  - $f" >&2; done
+    echo "" >&2
+    echo "Fix: add the path (or its parent dir) to the \"files\" array in package.json." >&2
+    return 1
+  fi
+  echo "  npm pack carries ${#required[@]} required cross-linked doc(s)"
+  return 0
+}
+step "npm pack contents (v2.6.0 — cross-linked docs included)" npm_pack_contents || exit 1
+
 # --- 6c. Split-brain DB warn (v2.4.5) ---
 # Detects the local-environment failure mode that bit Codex 5.5 during the
 # v2.4.4 R2 audit cycle: an active per-instance setup PLUS a populated legacy

@@ -33,13 +33,16 @@ Spawns `node bin/relay mint-token …` against a throwaway DB and asserts on:
 5. bcrypt hash carries cost factor 10 (parses `$2a$10$…` prefix; pinned via the exported `BCRYPT_ROUNDS`).
 6. `--json` flag emits parseable JSON with `success`, `token`, `name`, `agent_id`, `created`, `force`, `env_block` fields.
 7. `audit_log` entry written on every mint (`tool='agent.token_minted'`), including the refused path.
-8. Daemon-running advisory printed to stderr when port 3777 has a listener (skipped to non-default port in CI to avoid heuristics colliding with a real local daemon).
-9. Caps locked at mint — `--force` rotation ignores `--capabilities` flag and preserves stored caps.
-10. `--db-path` pointing at a non-existent directory → exit 2 with clean error.
+8. `audit_log` entry written on the REFUSED path (existing-without-`--force`) too.
+9. `--db-path` pointing at a non-existent directory → exit 2 with clean error.
+10. `--help` prints usage, leaves DB alone.
+11. Missing `<name>` argument → exit 1 with usage.
+12. **(R1 regression)** `--json` still emits the daemon-running advisory to stderr — listener-backed test binds a real TCP listener and asserts both `stdout` parses as JSON and `stderr` contains the verbatim phrase `Daemon currently running on 127.0.0.1:<port>`. Closes codex-5-5 R1 P2 #2 (the prior `!args.json` exclusion suppressed the brief Item 3.7 safety signal for scripted callers).
+13. **(R1 regression)** Human-readable mode also emits the advisory to stderr when a listener is bound. Pinned exact phrases verified against `src/cli/mint-token.ts:217-222`.
 
 ### Pre-publish gate
 
-No new gate steps. The mint-token mutation routes through the sanctioned helper `mintAgentToken` in `src/db.ts`, so the existing sanctioned-helper guard passes unchanged. CLI smoke (`scripts/smoke-25-tools.sh`) is unchanged in scope (mint-token tested via dedicated integration test, not the smoke harness).
+One new gate step (R1 add): **npm pack contents check** — `scripts/pre-publish-check.sh` now greps `npm pack --dry-run --json` output for every doc cross-linked from the CLI runtime (currently `docs/agents/external-cli-setup.md`) and fails if any are absent. Closes codex-5-5 R1 P2 #1: pre-R1, the `package.json.files` array omitted `docs/`, so the tarball lacked the doc despite `src/cli/mint-token.ts:317` and `README.md:654` both linking to it. The mint-token mutation itself routes through the sanctioned helper `mintAgentToken` in `src/db.ts`, so the existing sanctioned-helper guard passes unchanged. CLI smoke (`scripts/smoke-25-tools.sh`) is unchanged in scope (mint-token tested via dedicated integration test, not the smoke harness).
 
 ### Out of scope (deferred)
 

@@ -13,6 +13,7 @@
     "bin",
     "hooks",
     "roles",
+    "docs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
