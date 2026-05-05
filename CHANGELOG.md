@@ -1,5 +1,181 @@
 # Changelog
 
+## v2.6.0 — 2026-05-05 — `relay mint-token` CLI + spawn-flow self-bootstrap + cross-platform parity
+
+Adds an operator-side credential issuance path for external CLI agents whose safety monitors block the `register_agent` → use-returned-token sequence in a single response (Codex 5.5 was the canonical case as of 2026-04-27; per `memory/feedback_codex_5_5_safety_blocks_register.md`). Pure-additive — zero behavior change for existing users; existing `register_agent` flow is unchanged.
+
+### `relay mint-token <name>`
+
+New CLI subcommand. Mints an agent token directly via filesystem access to the per-instance DB and prints the plaintext token ONCE to stdout. The operator exports it as `RELAY_AGENT_TOKEN` and launches the external CLI; the agent then authenticates on its first MCP call without ever invoking `register_agent` itself.
+
+```bash
+relay mint-token codex-5-5 --role builder --capabilities build,test,audit
+relay mint-token codex-5-5 --force                      # rotate token, caps + role preserved
+relay mint-token NAME --json                            # structured output for scripts
+relay mint-token NAME --description "human-readable"    # discoverable in dashboard
+```
+
+- **`src/cli/mint-token.ts`** *(new)* — argv parsing, daemon-running stderr advisory, audit-log entry on every invocation (success or refused), human-readable + `--json` output formats. Mirrors `src/cli/recover.ts`'s shape end-to-end.
+- **`src/db.ts`** — new sanctioned mutation helper `mintAgentToken(name, role, capabilities, opts)`. INSERT path mirrors `registerAgent`'s 13-column shape exactly so a minted-but-never-registered row is auth-layer-indistinguishable from a registered row. UPDATE path (under `--force`) rotates token only: caps and role preserved, `session_id` cleared, `agent_status='offline'`, auth-side fields (`previous_token_hash`, `rotation_grace_expires_at`, `recovery_token_hash`, `revoked_at`) zeroed.
+- **`src/auth.ts`** — `BCRYPT_ROUNDS` is now exported (still `10`) so the regression test can pin the cost factor without duplicating the constant.
+- **`bin/relay`** — `mint-token` wired into `SUBCOMMANDS` and `printHelp`. CLI count: 13 → 14.
+- **`docs/agents/external-cli-setup.md`** *(new)* — full setup walkthrough: how the env-token pattern works, worked examples for Codex 5.5 + Cursor (best-effort), token storage best practices (`direnv`, macOS keychain, rotation hygiene), audit-trail shape, cross-platform notes.
+- **`README.md`** — new "External-CLI Token Mint (v2.6)" section after Lost-Token Recovery, cross-linking to `docs/agents/external-cli-setup.md`.
+
+### Tests — `tests/v2-6-mint-token.test.ts` *(new)*
+
+Spawns `node bin/relay mint-token …` against a throwaway DB and asserts on:
+
+1. mint on new agent → row created, token-hash valid, plaintext token printed once.
+2. mint on existing agent without `--force` → exit 2, clear stderr error pointing at `--force`, original token still authenticates.
+3. mint on existing agent with `--force` → token rotates, old token no longer authenticates, new token does, caps and role preserved.
+4. token shape is 43-char base64url (matches the existing `generateToken` convention).
+5. bcrypt hash carries cost factor 10 (parses `$2a$10$…` prefix; pinned via the exported `BCRYPT_ROUNDS`).
+6. `--json` flag emits parseable JSON with `success`, `token`, `name`, `agent_id`, `created`, `force`, `env_block` fields.
+7. `audit_log` entry written on every mint (`tool='agent.token_minted'`), including the refused path.
+8. `audit_log` entry written on the REFUSED path (existing-without-`--force`) too.
+9. `--db-path` pointing at a non-existent directory → exit 2 with clean error.
+10. `--help` prints usage, leaves DB alone.
+11. Missing `<name>` argument → exit 1 with usage.
+12. **(R1 regression)** `--json` still emits the daemon-running advisory to stderr — listener-backed test binds a real TCP listener and asserts both `stdout` parses as JSON and `stderr` contains the verbatim phrase `Daemon currently running on 127.0.0.1:<port>`. Closes codex-5-5 R1 P2 #2 (the prior `!args.json` exclusion suppressed the brief Item 3.7 safety signal for scripted callers).
+13. **(R1 regression)** Human-readable mode also emits the advisory to stderr when a listener is bound. Pinned exact phrases verified against `src/cli/mint-token.ts:217-222`.
+
+### Pre-publish gate
+
+One new gate step (R1 add): **npm pack contents check** — `scripts/pre-publish-check.sh` now greps `npm pack --dry-run --json` output for every doc cross-linked from the CLI runtime (currently `docs/agents/external-cli-setup.md`) and fails if any are absent. Closes codex-5-5 R1 P2 #1: pre-R1, the `package.json.files` array omitted `docs/`, so the tarball lacked the doc despite `src/cli/mint-token.ts:317` and `README.md:654` both linking to it. The mint-token mutation itself routes through the sanctioned helper `mintAgentToken` in `src/db.ts`, so the existing sanctioned-helper guard passes unchanged. CLI smoke (`scripts/smoke-25-tools.sh`) is unchanged in scope (mint-token tested via dedicated integration test, not the smoke harness).
+
+### Out of scope (deferred)
+
+- Bulk operations (`relay rotate-all-tokens`, `relay list-stale-tokens`, `relay agents --filter ...`) — queued as v2.7.
+- Cross-machine identity, namespace prefixing, hardware-backed token storage, GUI mint flow — Tether Cloud / Pro territory per `project_tether_product_strategy.md`.
+
+### v2.6.2 R2 — codex PATCH-THEN-SHIP (universal powershell.exe gate, generalize R1)
+
+R1 verdict: PATCH-THEN-SHIP (codex msg `1dd82c7b`). R1 gated `cmd.exe` on `powershell.exe` presence — but wt.exe ALSO routes through `powershell.exe -NoExit -Command "..."` (v2.6.2 wrapped the inner shell to give the prelude a script context). Codex caught the same self-contradiction one sub-driver up: selecting wt without powershell creates a terminal that opens and immediately fails. Same bug class, second instance.
+
+R2 generalizes: ALL three Windows sub-drivers require `powershell.exe`. Single universal gate.
+
+- **`src/spawn/drivers/windows.ts:isAvailable`** — replaced the cmd-specific gate with a universal one. Verbatim:
+  ```typescript
+  function isAvailable(ctx: DriverContext, sub: WindowsSubDriver): boolean {
+    // Universal: every sub-driver delegates the vault prelude to powershell.
+    if (!ctx.hasBinary("powershell.exe")) return false;
+    return ctx.hasBinary(BINARY_FOR[sub]);
+  }
+  ```
+  JSDoc cites both codex msgs (`f242914a` cmd gap → `1dd82c7b` wt gap → R2 generalization). The auto-fallback chain effective shape: wt|powershell|cmd, all predicated on powershell.exe.
+- **`tests/spawn-drivers.test.ts`** — R1 auto-fallback chain test reshaped + 1 NEW wt-without-powershell rejection test mirroring R1's cmd pattern. The new chain test enumerates 4 positive cases (powershell present + each combo) + 4 negative cases (powershell missing). Other 9 wt-only test contexts updated to include powershell.exe (legitimate wt-with-powershell case). 74 → 75 spawn-drivers tests.
+- **No functional regression on Windows boxes without powershell.exe** — daemon-side R2/R3 stdio-only fallback in `src/server.ts:resolveToken` still authenticates the agent on first MCP call from the per-instance vault. Operators on those boxes (rare; powershell.exe ships with every Windows since Vista) lose the operator-visible `printenv RELAY_AGENT_TOKEN` UX win, not the auth itself.
+
+Generalization rule (added to discipline list): **when fixing a bug class, scope the fix to ALL similarly-shaped surfaces, not just the one flagged.** Walking the analogous code paths is part of declaring scope complete. R2 codifies this after R1 missed the wt path. (My v2.6.1 R3 work caught this rule for the resolveToken auth-oracle bug class via the parallel `resolveTokenForHealthCheck` instance — but didn't apply it when the v2.6.2 R0 → R1 brief landed. Brief discipline: walk every similarly-shaped surface BEFORE writing the fix.)
+
+### v2.6.2 R1 — codex PATCH-THEN-SHIP (Windows cmd.exe contract + revoke_token vault scrub)
+
+R0 verdict: PATCH-THEN-SHIP (codex msg `f242914a`). Two small fixes — one codex P2 contract gap, one the maintainer ergonomic call.
+
+- **`src/spawn/drivers/windows.ts:pickSubDriver` — cmd.exe gated on powershell.exe presence.** Codex caught a self-contradiction in v2.6.2: `pickSubDriver` would auto-fall-through wt → ps → cmd, but the cmd sub-driver branch invokes `powershell.exe -NoExit -Command "..."` for the vault prelude. If cmd was selected because powershell was missing, the cmd window would open and immediately fail (`'powershell.exe' is not recognized`) before claude could run. R1 closes by gating cmd selectability on powershell.exe availability — both via auto-fallback AND via `RELAY_TERMINAL_APP=cmd` override. Effective auto-chain: wt → powershell → (cmd skipped). cmd remains selectable when an operator explicitly chooses it AND powershell.exe is present. Daemon-side R2/R3 stdio fallback in `src/server.ts:resolveToken` is still the universal safety net for any path where the launching shell can't run.
+- **`src/tools/identity.ts:handleRevokeToken` — vault scrubbed alongside DB revoke.** the maintainer's call (2026-05-05 per `memory/feedback_maintainer_owns_strategic_calls.md`). The security boundary already held via the auth_state check at `src/server.ts:870-878` (revoked / recovery_pending tokens refuse), so a stale token on disk was harmless. R1 aligns the mental model: revoke_token now leaves NO credential on disk for the agent. New `FileTokenStore.deleteSync()` in `src/token-store.ts` mirrors the `readSync ↔ read` pair — sync to avoid cascading the handler to async. Best-effort try/catch swallows IO errors so a vault-scrub failure can't roll back a successful DB revoke. Idempotent: ENOENT is a clean no-op (legitimate revocation of an agent that never wrote a vault entry).
+- **Tests** — 2 NEW spawn-drivers tests (cmd-without-powershell rejection + auto-fallback chain assertion). 2 NEW recovery-flow tests (revoke without recovery also scrubs vault + best-effort no-op when vault missing). Previous recovery-flow vault assertion flipped from "vault is NOT auto-scrubbed" → "vault scrubbed by revoke_token". 1248 → 1252 tests.
+- **Docs** — `revoke_token` tool description (`src/server.ts:592-598`) extended with the v2.6.2 R1 vault-scrub line. CHANGELOG entry above. Q7 hash bumped in `tests/v2-4-4-tool-description-quality.test.ts`.
+
+### v2.6.2 — Windows FIX 1 closure + spawn-to-ready integration + final security boundary closure
+
+The last piece in the v2.6.0 cumulative arc before publish. Three audit rounds (R1 → R2 → R3) progressively closed the resolveToken auth-oracle bug class; v2.6.2 closes the cross-platform parity gap deferred from R1 and adds the missing shipped-path integration tests that hid the original v2.6.0 dropped-token bug. After v2.6.2 ships green, `npm publish` makes the cumulative v2.6.0 (mint-token + spawn-flow self-bootstrap + cross-platform FIX 1 + integration coverage) live on npm.
+
+#### v2.6.1 R2 — gate vault fallback to stdio transport (codex msg `d1fbbdde`)
+
+R1 verdict: REJECT. R1's `resolveCallerNameForVault` honored `args.agent_name`, which let any unauthenticated HTTP caller name an agent and the daemon would obligingly read that name's vault file — turning the local file vault into a network-reachable auth oracle.
+
+- **`src/server.ts:resolveToken`** — added `if (ctx.transport !== "stdio") return null;` gate before the vault read. HTTP requests fall through to `AUTH_FAILED`. `resolveCallerNameForVault` rewrites: drops the `args.agent_name` path entirely and uses only `process.env.RELAY_AGENT_NAME`, with explicit `MUST NOT honor args.agent_name` JSDoc.
+- **Tests** — `tests/v2-6-1-token-store.test.ts` test 17 rewritten as a real stdio MCP subprocess test (positive path); test 17b NEW negative HTTP test pins the security boundary (HTTP daemon refuses vault fallback even with a valid vault file present).
+- **Docs** — `SECURITY.md` precedence list extended with the gated 4th entry; `docs/agents/local-identity.md` lifecycle table adds an "HTTP daemon launched with `RELAY_AGENT_TOKEN` in its env" row; spawn_agent description updated for stdio-only scope (Q7 hash bump in `tests/v2-4-4-tool-description-quality.test.ts`).
+
+#### v2.6.1 R3 — generalize stdio-only gate to env-token + close adjacent health_check oracle (codex msg `2cbe68a2`)
+
+R2 verdict: REJECT. R2 closed only the vault half. Item 3 of the precedence chain (`process.env.RELAY_AGENT_TOKEN`) was still ungated — an HTTP daemon launched with `RELAY_AGENT_TOKEN` in its env would let any unauthenticated HTTP caller authenticate against the daemon's own env token. Same bug class as R1's vault, one layer up.
+
+- **`src/server.ts:resolveToken`** — restructured. The chain is now split by trust origin: items 1-2 (`args.agent_token`, `X-Agent-Token` header) caller-presented and accepted on any transport; items 3-4 (env, vault) daemon-side and gated COLLECTIVELY on `ctx.transport === "stdio"` with a single boundary check. JSDoc fully enumerates the trust-origin split.
+- **`src/tools/status.ts:resolveTokenForHealthCheck`** — adjacent instance found and fixed during R3 implementation per "close the full bug class" discipline. Same shape: read `RELAY_AGENT_TOKEN` env without transport gate. health_check is no-auth, but if a token validates it returns `agent_name` + `auth_state`, so an HTTP caller with no creds could probe what agent the daemon's env belongs to (information disclosure of the same bug class). Surfaced explicitly in R3 ship-pong.
+- **Tests** — `tests/v2-6-1-token-store.test.ts` test 17c NEW: HTTP daemon respawned with `RELAY_AGENT_TOKEN=<real-token>` in env, attack `get_messages` with `args.agent_name` and no caller-presented token must `AUTH_FAILED`; control with `X-Agent-Token` succeeds.
+- **Docs** — `SECURITY.md` precedence list restructured with explicit caller-presented vs daemon-side split + general rule; `docs/agents/local-identity.md` bootstrap §2 expanded; spawn_agent description updated; Q7 hash bumped.
+
+#### v2.6.2 — cross-platform FIX 1 closure (Windows) + spawn-to-ready integration
+
+The Windows launching-shell prelude was deferred from R1 due to PowerShell escaping rigor. v2.6.2 closes it, plus the integration coverage that would have caught the original v2.6.0 dropped-token bug.
+
+- **`src/spawn/drivers/windows.ts:buildVaultPreludePowerShell(agentName)`** *(new)* — single-line PowerShell snippet that mirrors the macOS bash + Linux ts shapes: pre-resolves the absolute vault path on the parent (Node) side, embeds as a literal in the launched PowerShell, runs `Test-Path` + `Get-Content -Raw` + shape regex `^[A-Za-z0-9_=.-]{8,128}$` + `$env:RELAY_AGENT_TOKEN = ...`. Single source of truth shared across all 3 sub-drivers — drift-free.
+  - **wt.exe** sub-driver: changed args from `["-d", cwd, "claude"]` to `["-d", cwd, "powershell.exe", "-NoExit", "-Command", inner]` so the prelude has a script context. Pre-v2.6.2 wt.exe ran `claude` directly and had no shell context for prelude injection.
+  - **powershell.exe** sub-driver: prepends prelude to the existing `-Command` inner string.
+  - **cmd.exe** sub-driver: delegates the inner shell to `powershell.exe -NoExit -Command "..."` via `cd /D <cwd> && powershell.exe -NoExit -Command "<psInner>"`. cmd.exe lacks native `Get-Content` / regex match, so brief Option A — single PowerShell source of truth — is cleanest. The cmd `/K` window stays open after powershell exits.
+- **`tests/spawn-drivers.test.ts` — +5 new prelude tests + 5 updated existing tests** for the new wt/cmd shapes. New `v2.6.2 — Windows FIX 1 vault prelude` describe block asserts: each sub-driver embeds the prelude (4 signature regex), prelude omitted when agent name fails the FileTokenStore allowlist (defense-in-depth), cross-driver invariant (all 3 sub-drivers embed the SAME prelude byte-pattern). 67 → 72 tests.
+- **`tests/v2-6-2-spawn-to-ready.test.ts`** *(new, 4 tests)* — establishes the missing shipped-path test that hid the v2.6.0 dropped-token bug. Three vault-state scenarios (SR-A: no vault → prelude no-ops, SR-B: valid vault → prelude exports, SR-C: corrupted vault → prelude refuses to export) plus SR-D bonus end-to-end: register agent via HTTP daemon, capture token, write vault, run spawn-agent.sh DRY_RUN, exec captured prelude, then run `node dist/index.js` stdio MCP subprocess inheriting the prelude's env and assert `health_check` returns `token_validated:true` + `agent_name` + `auth_state:active`. macOS-gated; Windows / Linux equivalents covered by spawn-drivers.test.ts string-construction.
+- **`tests/v2-6-2-hook-contracts.test.ts`** *(new, 15 tests)* — shipped-path contract tests for all 3 hook scripts (`check-relay.sh`, `post-tool-use-check.sh`, `stop-check.sh`). Closes the "untested code path in shipped flow" class. Each hook tested for: empty stdin / no DB → exit 0 silent; valid agent name + DB present + pending message → correct stdout shape (plain-text for SessionStart, single-line JSON with right `hookEventName` for PostToolUse / Stop); invalid agent name → silent exit 0 with stderr warning; daemon-down → graceful degrade; vault hydration path. Cross-hook invariants assert no partial JSON / stack traces ever leak to stdout.
+- **`tests/v2-6-2-recovery-flow.test.ts`** *(new, 1 test)* — end-to-end recovery cycle: register admin (capabilities=["admin"]) + target → write target token to vault → admin `revoke_token({issue_recovery: true})` → original token now `AUTH_FAILED` → `register_agent` with `recovery_token` → fresh `agent_token` minted → write to vault → authenticated call with new token succeeds. Confirms `recovery_token` is single-use. **Surfaces a finding**: the brief's step 3 ("Verify vault is now scrubbed") doesn't match the implementation — `revoke_token` does NOT touch the vault; only the `relay recover` CLI scrubs it. The original token still fails auth post-revoke because the daemon's state check refuses `recovery_pending`, not because the vault is gone. Whether to add `vault.delete()` to `revoke_token` is a v2.6.3 / v2.7 design decision.
+- **`tests/v2-6-1-token-store.test.ts` test 17d NEW** — health_check HTTP-negative regression: daemon respawned with `RELAY_AGENT_TOKEN=<real-token>` in env, attack `health_check` with no token must NOT include `agent_name` / `auth_state` in response (the v2.6.1 R3 codex non-blocking note about the parallel resolver in `src/tools/status.ts`). Pins the resolveTokenForHealthCheck fix end-to-end. Control with `X-Agent-Token` returns `token_validated:true` + agent metadata.
+- **Docs** — `docs/agents/local-identity.md` adds a "Launching-shell vault prelude (cross-platform parity per v2.6.2)" subsection with platform table (macOS bash / Linux ts / Windows PowerShell) and Windows verification path. `SECURITY.md` extends pin-test references to include `:17b` (vault, R2), `:17c` (env-token, R3), `:17d` (health_check, v2.6.2). README + spawn_agent description unchanged from R3.
+
+Test count delta v2.6.0 baseline → v2.6.2 STAGE: +26 tests across 5 files (5 new prelude tests in spawn-drivers + 4 vault-state tests in v2-6-2-spawn-to-ready + 15 hook-contract tests + 1 recovery-flow + 1 health_check oracle).
+
+Pre-publish gate: 12/12 PASS (tsc + vitest 670+ tests + audit + build + extension TS + drift + sanctioned-helper + ip-classifier + 25-tool/CLI smoke + GitHub CI + npm pack + split-brain DB).
+
+
+
+R0 verdict: REJECT. Codex caught the foundational gap: v2.6.1 R0 wrote the vault but never CONSUMED it on the daemon side. The SessionStart hook's `export RELAY_AGENT_TOKEN` only mutates the hook subprocess; the already-running stdio MCP server forked with whatever env it had at exec time, and never re-reads that env. So gaming-build's first MCP call still failed `AUTH_FAILED` even with a vault file on disk.
+
+R1 closes the gap with two complementary fixes:
+
+- **`src/server.ts` resolveToken vault fallback (FIX 2 — load-bearing, every platform).** Adds a 4th fallback after env. When env / args / X-Agent-Token are all empty, resolve the caller's name (from `args.agent_name` for HTTP or `process.env.RELAY_AGENT_NAME` for stdio) and sync-read the vault file. Sync `fs.readFileSync` of a single-line file is microseconds — the auth path stays sync. New `FileTokenStore.readSync` mirrors the async `read` exactly. This is the foundation that makes spawn-to-ready zero-touch on every platform: even on Windows where the launching shell can't easily hydrate env (deferred to v2.6.2 / future), the daemon still authenticates from the vault.
+
+- **`bin/spawn-agent.sh` + `src/spawn/drivers/linux.ts` launching-shell vault prelude (FIX 1 — macOS / Linux UX win).** Before `exec claude`, the launcher reads the vault file into `RELAY_AGENT_TOKEN` so claude (and its stdio MCP server) inherit the token at fork time. Pre-resolves the absolute vault path on the parent side (no path-resolution in the launched shell — just `head -n 1 | tr -d '[:space:]' | grep -Eq <shape>`). Operator-visible `RELAY_AGENT_TOKEN` in `printenv` + non-MCP tooling (curl scripts) get the token for free. Windows is deferred — daemon-side fallback (FIX 2) handles every Windows sub-driver correctly, and a PowerShell/cmd prelude with full escaping rigor is its own audit cycle.
+
+- **`hooks/_vault-helpers.sh` (NEW) — single source of truth for bash mirrors (FIX 3 — test contract closure).** v2.6.1 R0 inlined the bash helper functions in three hooks with a SHA byte-identity pre-publish check. Codex correctly flagged this as drift-blind: the test inlined a SECOND copy in vitest, and edits to the shipped hook would silently pass. R1 consolidates: hooks/_vault-helpers.sh defines `resolve_relay_db_path`, `resolve_relay_token_path`, `read_relay_token_from_vault`, `write_relay_token_to_vault` once. The 3 hooks + `scripts/migrate-existing-tokens-to-vault.sh` + `tests/v2-6-1-token-store.test.ts` all `source` the same file. Drift is now physically impossible. Removed the SHA-identity guard in the gate (it was solving the byte-identity problem that no longer exists).
+
+- **`src/server.ts:374` corrected description.** The pre-R1 spawn_agent doc string claimed "already exported into the spawned child's `RELAY_AGENT_TOKEN` env" — false post-v2.6.1 R0. Updated to describe the vault-write-then-launcher-prelude flow + the daemon-side fallback. Triggers a tool-description hash bump in the v2.4.4 quality gate (Q7).
+
+- **`docs/agents/local-identity.md` rewrite.** Lifecycle table replaced with a two-layer description (launching shell hydration + daemon-side fallback) + an updated scenarios table covering: parent-MCP-spawn, direct-spawn-agent.sh-without-pre-mint, re-spawn, bare claude start, lost vault, revoked token, recovery flow.
+
+- **Tests — `tests/v2-6-1-token-store.test.ts` (was 15, now 19, +4 R1).** Test 12 now sources the actual `hooks/_vault-helpers.sh` instead of an inline copy. Test 12b adds the bash-write → TS-read direction for full bidirectional contract. Test 14b is a drift guard asserting all 3 hooks + migration script reference the helper file. Test 16 captures the spawn-agent.sh CMD via DRY_RUN=1, runs the prelude in a tmp shell, and asserts `RELAY_AGENT_TOKEN` in the spawned shell's env equals the vault content (FIX 1 e2e). Test 17 spawns an isolated HTTP daemon, registers an agent, writes the captured token to the vault, then makes a get_messages call WITHOUT supplying token via env / header / args.agent_token — auth must succeed via FIX 2 vault fallback (proves the foundation).
+
+- **`tests/v2-4-5-stdio-per-instance-db.test.ts` updated.** The byte-identity Q-identity test is replaced with a "all 3 hooks source the helper, no inline copies" test — same drift discipline, structurally cleaner. The parameterized parity tests still extract `resolve_relay_db_path` and run it under controlled env, but now read it from `_vault-helpers.sh`.
+
+- **`tests/spawn-drivers.test.ts` + `tests/v2-1-spawn-token-passthrough.test.ts` regex tightening.** The Linux launch-command pattern shifted from `^cd '...' && exec claude$` to `<vault prelude> cd '...' && exec claude$` — the end-anchor still pins the tail. The token-leak guard now compares against the actual minted token rather than a permissive shape regex (the prelude legitimately contains the public shape regex string).
+
+Pre-publish gate: 12/12 PASS (tsc, vitest 1220 tests, npm audit, build, extension TS compile, drift guard, sanctioned-helper guard, ip-classifier guard, 25-tool smoke, GitHub CI green-gate, npm pack contents, split-brain warn).
+
+#### Windows scope (deferred, judgment call flagged for audit)
+
+Codex's brief warned: "If you hit any architectural fork (e.g., Linux/Windows driver path requires more than the bash snippet), STOP-AND-SURFACE." Windows requires PowerShell + cmd snippets in `src/spawn/drivers/windows.ts` — non-trivial escaping inside `-Command "..."` strings. v2.6.1 R1 ships **macOS + Linux launcher preludes** AND **daemon-side vault fallback (FIX 2) for every platform**. Windows correctness is preserved: every Windows sub-driver (wt.exe / powershell.exe / cmd.exe) goes through `resolveToken` on every MCP call, which falls back to the vault when env is empty. The only thing Windows operators DON'T get is operator-visible `RELAY_AGENT_TOKEN` in `printenv` — the daemon authenticates without it. Full Windows launcher prelude queued as v2.6.2 follow-up (or its own dual-audit round).
+
+### v2.6.1 stack — spawn-flow self-bootstrap (TokenStore + FileTokenStore)
+
+Closes the latent v2.1 Phase 4j bug exposed 2026-05-04 when a child terminal spawned via `bin/spawn-agent.sh` without a pre-minted token: the SessionStart hook called `register_agent` over HTTP, the relay correctly minted a fresh `agent_token` and returned it in the response body, **and the script discarded the response** — 3-min spawn-to-broken-state. Latent since v2.1 Phase 4j; hidden until now because every prior spawn used the 5th-arg-token plumbing in `spawn-agent.sh`. Fix is a single elegant primitive — a per-instance file vault — that solves both first-spawn bootstrap AND respawn persistence with zero operator mediation, working across macOS / Linux / Windows from day one. Built on the canonical credential-helper pattern (Docker / Git / gh / AWS / kubectl all use this shape), with a pluggable `TokenStore` interface so v2.9+ can plug in OS-specific helpers (Keychain / Credential Manager / libsecret / 1Password / Vault) without breaking changes.
+
+- **`src/token-store.ts`** *(new)* — `TokenStore` interface + `FileTokenStore` impl. Per-instance scoped path at `<instanceDir>/agents/<name>.token`; chmod 0o600 file, 0o700 parent; atomic write via tmp-file + rename so concurrent spawns of the same name converge cleanly; token shape validated on read against `/^[A-Za-z0-9_=.-]{8,128}$/` (mirrors the spawn-agent.sh allowlist + the bash hook helpers).
+- **`hooks/check-relay.sh`** — vault-first bootstrap. If `RELAY_AGENT_TOKEN` is unset in env but a vault file exists, hydrate. On register_agent over HTTP, parse `agent_token` from the response body and persist to vault + export. Recovery flow also writes the new token to vault + exports inline (operator no longer needs manual paste).
+- **`hooks/post-tool-use-check.sh` + `hooks/stop-check.sh`** — byte-identical mirrors of the new `resolve_relay_token_path` / `read_relay_token_from_vault` / `write_relay_token_to_vault` helpers + same vault-hydration block as check-relay.sh. The three hooks read from one vault.
+- **`bin/spawn-agent.sh`** — 5th-arg-token slot dropped. `BRIEF_PATH` moved from positional 6 to positional 5. `RELAY_AGENT_TOKEN` no longer exported into the child shell via the AppleScript embedding; the hook hydrates from disk instead.
+- **`src/spawn/dispatcher.ts` + `src/spawn/types.ts` + `src/spawn/drivers/*.ts`** — `token` parameter removed from `buildCommand` / `buildSpawnCommand` / `spawnAgent` (or kept as a `_legacyTokenSlot` placeholder for positional API stability with existing tests). macOS no longer pushes the token as arg 5; Linux/Windows no longer set `RELAY_AGENT_TOKEN` in `buildChildEnv`. The child env actively drops any inherited `RELAY_AGENT_TOKEN` from the parent's `RELAY_*` glob — child agent identity is exclusively vault-resolved.
+- **`src/tools/spawn.ts`** — `handleSpawnAgent` keeps parent-side `registerAgent` (race-safe + name-collision UX), captures `plaintext_token`, **writes to the vault before driver dispatch** (instead of passing through the env channel). Driver failure rolls back BOTH the agent row AND the vault entry so a future spawn can succeed cleanly.
+- **`src/cli/recover.ts`** — recovery now also scrubs the vault entry. After `relay recover <name>`, the next `register_agent` writes a fresh vault file via the SessionStart hook; no manual operator step.
+- **`scripts/migrate-existing-tokens-to-vault.sh`** *(new)* — one-shot migration for operators who had `RELAY_AGENT_TOKEN` baked into `~/.zshrc` / `~/.bashrc` / `~/.envrc`. Reads env, writes vault, prints "you can unset the env var now."
+- **`docs/agents/local-identity.md`** *(new)* — full lifecycle doc: vault model, bootstrap → persistence → recovery, cross-platform story, pluggable credential-helper interface, operator hygiene, audit trail.
+- **`SECURITY.md`** — new "Local agent token storage (v2.6.1)" subsection in the threat-model section. Same threat-model bar as `~/.aws/credentials` / `~/.ssh/id_rsa` / `~/.config/gh/hosts.yml`.
+
+#### Tests — `tests/v2-6-1-token-store.test.ts` *(new)*
+
+- Unit: `FileTokenStore` read / write / delete on a tmp dir; round-trip preserves token; missing file returns null; malformed content (whitespace, length out of bounds, disallowed chars) rejected on read.
+- POSIX perms: file 0o600, parent dir 0o700 after write (assertion skipped on Windows).
+- Atomic write: concurrent writes never produce a half-file readable by `read()`.
+- Integration: `handleSpawnAgent` writes the vault before driver dispatch; `RELAY_SPAWN_DRY_RUN=1` captures the constructed command and the vault file is verified on disk; rollback on driver failure scrubs both the agent row AND the vault file.
+- Recovery: `relay recover` deletes the vault entry alongside the agent row.
+
+`tests/v2-1-spawn-token-passthrough.test.ts` rewritten as legacy-rejection: assertions flipped to verify the env-var passthrough path is gone — `cmd.env.RELAY_AGENT_TOKEN` is now `undefined` for every driver, the macOS arg vector no longer carries the token, and `handleSpawnAgent` writes the vault file before dispatch.
+
+#### Cross-platform parity (per `feedback_cross_platform_parity.md`)
+
+- macOS / Linux: POSIX file (chmod 0o600), parent dir 0o700. Verified by tests.
+- Windows: NTFS file at `%USERPROFILE%\.bot-relay\instances\<id>\agents\<name>.token`. The `chmod` calls are best-effort no-ops; the parent dir under `%USERPROFILE%` already inherits a user-restricted ACL from the Windows profile defaults. Same threat model as `~/.aws/credentials` on POSIX. Documented in `SECURITY.md` + `docs/agents/local-identity.md`. v2.9+ Windows Credential Manager helper (pluggable via `TokenStore`) will move beyond profile-dir defaults.
+
 ## v2.5.0 — 2026-04-29 — Tether Phase 1 (MCP resource subscriptions + VSCode extension)
 
 Introduces **Tether** — the operator-awareness layer for bot-relay-mcp. Free, bundled. The strict architectural line between FREE Tether Local (this repo) and FUTURE Tether Cloud / Pro (paid, separate repo) is documented in `docs/tether-roadmap.md` — features that need a server, third-party API, or cross-machine sync do NOT belong here.

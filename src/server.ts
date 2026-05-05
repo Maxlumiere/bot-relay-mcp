@@ -57,6 +57,7 @@ import {
   handleExpandCapabilities,
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
+import { defaultTokenStore } from "./token-store.js";
 import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents } from "./db.js";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
@@ -371,7 +372,7 @@ export function createServer(): Server {
           "Open a new Claude Code terminal pre-configured as a relay agent (macOS only).\n\n" +
           "When to use: orchestrators delegating work to a fresh sub-agent. The new terminal arrives in a known role + capability set with `RELAY_AGENT_NAME`/`ROLE`/`CAPABILITIES` already in env, and the SessionStart hook auto-registers it before the LLM's first turn. Linux/Windows drivers exist for headless smoke tests but do not open a UI window.\n\n" +
           "Behavior: pre-registers the new agent server-side (so its token is minted before the child process starts and reaches it via env), opens an iTerm2 or Terminal.app window via AppleScript, and runs the configured shell command in that window. Optional `initial_message` is queued in the new agent's mailbox and surfaces on its first `get_messages`. `brief_file_path` (v2.1.4) threads a durable on-disk task brief into the KICKSTART prompt, preferred over `initial_message` for non-trivial scopes because file-on-disk does not read as prompt-injection the way an inbox message can.\n\n" +
-          "Returns: `{ success: true, name, role, capabilities, platform, driver, agent_token, auth_note, has_initial_message, brief_file_path, note }`. `agent_token` is shown ONCE — already exported into the spawned child's `RELAY_AGENT_TOKEN` env so the child authenticates from its first tool call.\n\n" +
+          "Returns: `{ success: true, name, role, capabilities, platform, driver, agent_token, auth_note, has_initial_message, brief_file_path, note }`. `agent_token` is shown ONCE — already written to the per-instance file vault at `<instanceDir>/agents/<name>.token` (v2.6.1). The spawned terminal's launcher reads the vault before exec'ing claude (macOS / Linux), and the stdio MCP server transport's `resolveToken` falls back to `RELAY_AGENT_TOKEN` env or the per-instance vault when `RELAY_AGENT_NAME` is set, so the child authenticates from its first tool call regardless of platform. HTTP clients must always present an explicit token via `args.agent_token` or `X-Agent-Token` header — the daemon's own env (`RELAY_AGENT_TOKEN`, `RELAY_AGENT_NAME`) and the per-instance vault are stdio-only credentials and are never used to authenticate HTTP callers (R3 transport gate).\n\n" +
           "Errors: `SPAWN_NOT_SUPPORTED` (non-macOS host without an explicit driver), `AUTH_FAILED`, `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(SpawnAgentSchema),
       },
@@ -592,7 +593,7 @@ export function createServer(): Server {
         description:
           "Invalidate another agent's token (v2.1 Phase 4b.1 v2).\n\n" +
           "When to use: confirmed compromise, lost device, or graceful retirement of an agent name. For routine key-hygiene rotation prefer `rotate_token` / `rotate_token_admin` (those keep identity). For removing the agent entirely use `unregister_agent`.\n\n" +
-          "Behavior: transitions the target row to `auth_state='recovery_pending'` (when `issue_recovery=true`, also returns a one-time `recovery_token` the operator hands off out-of-band; the agent re-registers via `register_agent` with that token to mint a fresh agent_token) or `auth_state='revoked'` (terminal, only `unregister_agent` + `register_agent` can reuse the name). Original `token_hash` is preserved for forensic correlation; the state column, not the hash, enforces rejection. Requires `revoke_others` capability.\n\n" +
+          "Behavior: transitions the target row to `auth_state='recovery_pending'` (when `issue_recovery=true`, also returns a one-time `recovery_token` the operator hands off out-of-band; the agent re-registers via `register_agent` with that token to mint a fresh agent_token) or `auth_state='revoked'` (terminal, only `unregister_agent` + `register_agent` can reuse the name). Original `token_hash` is preserved for forensic correlation; the state column, not the hash, enforces rejection. v2.6.2 R1: the per-instance vault file at `<instanceDir>/agents/<name>.token` is also scrubbed on every successful revoke (best-effort, ENOENT-safe) — the security boundary already held via the state check, but the scrub aligns the mental model so revoke_token leaves no credential on disk. Requires `revoke_others` capability.\n\n" +
           "Returns: `{ success: true, revoked: target_agent_name, revoked_by, revoked_at: ISO, changed: boolean, auth_state_before, auth_state_after, note }`. When `issue_recovery=true` and the call actually changed state, also includes `recovery_token` (shown ONCE), `recovery_note`, and `recovery_reissued: boolean`. `changed=false` is an idempotent no-op (target was already revoked).\n\n" +
           "Errors: `AUTH_FAILED` (caller missing `revoke_others`), `NOT_FOUND`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(RevokeTokenSchema),
@@ -787,19 +788,93 @@ export function createServer(): Server {
   }
 
   /**
-   * Resolve the raw token a caller presented, in order of precedence:
-   *   1. args.agent_token (explicit tool input — MCP stdio + HTTP both work)
-   *   2. HTTP X-Agent-Token header (captured in request context)
-   *   3. RELAY_AGENT_TOKEN env var (for stdio flows)
+   * Resolve the raw token a caller presented, in precedence order. The chain
+   * is split into two halves by trust origin (v2.6.1 R3):
+   *
+   * **Caller-presented (safe on any transport):**
+   *   1. `args.agent_token` — explicit tool input. The caller chose to
+   *      authenticate this call with this token; works on stdio + HTTP.
+   *   2. `X-Agent-Token` HTTP header — caller-presented per request,
+   *      captured by the HTTP transport into the request context.
+   *
+   * **Daemon-side (STDIO TRANSPORT ONLY):**
+   *   3. `process.env.RELAY_AGENT_TOKEN` — daemon's own env var. On stdio
+   *      this IS the agent's identity (single agent per process,
+   *      RELAY_AGENT_NAME set at fork). On HTTP it's the daemon's env, so
+   *      letting an HTTP caller authenticate against it without presenting
+   *      the token themselves is an auth oracle — the daemon would
+   *      effectively donate its env credential to anyone who can POST.
+   *   4. Per-instance vault file at `<instanceDir>/agents/<RELAY_AGENT_NAME>.token`.
+   *      Same trust origin as item 3: it's the local filesystem of the
+   *      daemon process. Same gate.
+   *
+   * Both items 3 and 4 are gated on `ctx.transport === "stdio"`. HTTP
+   * requests skip the daemon-side half entirely and fall through to
+   * `AUTH_FAILED`. Codex caught the env-var oracle on R2 audit (msg
+   * 2cbe68a2, 2026-05-05) after R2 closed only the vault half (msg
+   * d1fbbdde) — R3 generalizes the rule so the full bug class is closed
+   * in one place. The daemon-side credential rule: anything the daemon
+   * process has access to without the caller presenting it is daemon-side,
+   * and daemon-side credentials must NEVER authenticate HTTP callers.
+   *
+   * Stdio rationale: the process identity IS the agent. The stdio MCP
+   * server is forked by `bin/spawn-agent.sh` (or the operator's shell rc)
+   * with RELAY_AGENT_NAME + RELAY_AGENT_TOKEN already in env, and it
+   * accepts JSON-RPC over stdin/stdout from a single client (the parent
+   * `claude` process) — there's no impersonation surface.
    */
   function resolveToken(args: any): string | null {
+    // Item 1 — args.agent_token (caller-presented per call).
     if (args && typeof args === "object" && typeof args.agent_token === "string" && args.agent_token.length > 0) {
       return args.agent_token;
     }
     const ctx = currentContext();
+    // Item 2 — X-Agent-Token header (caller-presented per request).
     if (ctx.headerAgentToken) return ctx.headerAgentToken;
+    // v2.6.1 R3 security boundary: items 3 and 4 are daemon-side
+    // credentials (the daemon's own env + the daemon's filesystem).
+    // STDIO ONLY. HTTP requests must always present a token via item 1
+    // or item 2 — the daemon never donates its own credentials to
+    // network callers. Codex msg 2cbe68a2 (env-token oracle) + d1fbbdde
+    // (vault oracle) both closed by this single transport gate.
+    if (ctx.transport !== "stdio") return null;
+    // Item 3 — daemon's RELAY_AGENT_TOKEN env (stdio: agent's own identity).
     const envTok = process.env.RELAY_AGENT_TOKEN;
     if (envTok && envTok.length > 0) return envTok;
+    // Item 4 — per-instance file vault (stdio: same trust as the env).
+    const vaultName = resolveCallerNameForVault();
+    if (vaultName) {
+      try {
+        const vaultTok = defaultTokenStore().readSync(vaultName);
+        if (vaultTok) return vaultTok;
+      } catch {
+        /* malformed agent name or IO error — fall through to null */
+      }
+    }
+    return null;
+  }
+
+  /**
+   * v2.6.1 R2 — resolve the caller name used to look up the vault file.
+   *
+   * **STDIO ONLY.** `resolveToken` gates this on `ctx.transport === "stdio"`,
+   * so this function is unreachable from an HTTP request. The R1
+   * implementation honored `args.agent_name` here, which created an HTTP
+   * auth-oracle (codex REJECT verdict, msg d1fbbdde): an unauthenticated
+   * HTTP caller could name any agent in `args.agent_name` and the daemon
+   * would read that name's vault file for them. Closed by the transport
+   * gate in `resolveToken` AND by dropping the args path here.
+   *
+   * **THIS FUNCTION MUST NOT HONOR `args.agent_name`.** Stdio servers run
+   * single-agent-per-process; the agent identity is set at fork via
+   * `RELAY_AGENT_NAME` by the spawn launcher. Honoring args.agent_name
+   * would still be wrong on stdio — a caller specifying a name other
+   * than its own env name should not silently authenticate as the
+   * arg-supplied identity.
+   */
+  function resolveCallerNameForVault(): string | null {
+    const envName = process.env.RELAY_AGENT_NAME;
+    if (envName && envName.length > 0) return envName;
     return null;
   }
 

@@ -50,20 +50,21 @@ export interface SpawnDriver {
    * Construct the command that launches Claude Code with the agent env set.
    * Pure — no side effects. Input is already zod-validated at the MCP boundary.
    *
-   * v2.1 Phase 4j: optional `token` is the parent-issued RELAY_AGENT_TOKEN for
-   * the new agent. Drivers thread it into buildChildEnv; macOS additionally
-   * embeds it as a CLI arg so the shell wrapper can export it into the
-   * osascript-spawned window (which does not inherit child_process.spawn env).
+   * v2.6.1: the `token` parameter from v2.1 Phase 4j has been removed. The
+   * spawned terminal's SessionStart hook now resolves identity from the
+   * per-instance file vault at `<instanceDir>/agents/<name>.token` instead of
+   * an env-var passed through the spawn driver. Closes the
+   * spawn-without-pre-mint failure mode hit 2026-05-04 with gaming-build.
    *
    * v2.1.4 (I10): optional `briefFilePath` is the absolute path to a durable
-   * task brief the spawned agent should read FIRST. macOS passes it as arg 6
-   * to bin/spawn-agent.sh; Linux/Windows drivers ignore (no KICKSTART wired
-   * on those platforms — documented limitation).
+   * task brief the spawned agent should read FIRST. macOS passes it as arg 5
+   * to bin/spawn-agent.sh (was arg 6 pre-v2.6.1 when token took arg 5).
+   * Linux/Windows drivers ignore (no KICKSTART wired on those platforms —
+   * documented limitation).
    */
   buildCommand(
     input: SpawnAgentInput,
     ctx: DriverContext,
-    token?: string,
     briefFilePath?: string
   ): SpawnCommand;
 }

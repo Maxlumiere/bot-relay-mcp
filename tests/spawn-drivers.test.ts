@@ -114,12 +114,20 @@ describe("linux driver — fallback chain", () => {
 // --- Windows driver ---
 
 describe("windows driver — fallback chain", () => {
-  it("picks wt.exe when on PATH", () => {
+  it("picks wt.exe when on PATH (v2.6.2: wraps inner shell in powershell.exe -Command for vault prelude)", () => {
     const ctx = makeCtx(["wt.exe", "powershell.exe", "cmd.exe"]);
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\Projects\\mine" }), ctx);
     expect(cmd.exec).toBe("wt.exe");
-    // wt -d <cwd> claude
-    expect(cmd.args).toEqual(["-d", "C:\\Projects\\mine", "claude"]);
+    // v2.6.2 — wt.exe -d <cwd> powershell.exe -NoExit -Command "<inner>"
+    // (was ["-d", cwd, "claude"] in v2.6.1 and earlier).
+    expect(cmd.args[0]).toBe("-d");
+    expect(cmd.args[1]).toBe("C:\\Projects\\mine");
+    expect(cmd.args[2]).toBe("powershell.exe");
+    expect(cmd.args[3]).toBe("-NoExit");
+    expect(cmd.args[4]).toBe("-Command");
+    // The PowerShell inner script must Set-Location + invoke claude
+    expect(cmd.args[5]).toContain("Set-Location -LiteralPath 'C:\\Projects\\mine'");
+    expect(cmd.args[5]).toContain("claude");
     expect(cmd.driverName).toBe("wt");
     expect(cmd.platform).toBe("win32");
   });
@@ -135,15 +143,71 @@ describe("windows driver — fallback chain", () => {
     expect(cmd.driverName).toBe("powershell");
   });
 
-  it("falls back to cmd.exe when neither wt nor powershell available", () => {
-    const ctx = makeCtx(["cmd.exe"]);
+  it("(v2.6.2 R1) cmd.exe is selectable only when powershell.exe is ALSO present (since cmd delegates inner shell to powershell)", () => {
+    // Operator-chosen cmd path: RELAY_TERMINAL_APP=cmd, both binaries present.
+    const ctx = makeCtx(["cmd.exe", "powershell.exe"], "cmd");
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx);
     expect(cmd.exec).toBe("cmd.exe");
     expect(cmd.args[0]).toBe("/K");
     expect(cmd.args[1]).toContain("cd /D");
     expect(cmd.args[1]).toContain("C:\\work");
+    // v2.6.2 — cmd /K shells out to powershell.exe so the vault prelude can
+    // run before claude (cmd.exe doesn't have native Get-Content / regex).
+    expect(cmd.args[1]).toContain("powershell.exe -NoExit -Command");
     expect(cmd.args[1]).toContain("claude");
     expect(cmd.driverName).toBe("cmd");
+  });
+
+  it("(v2.6.2 R1) cmd.exe is NOT selectable when powershell.exe is missing — pickSubDriver returns null instead of self-contradictory cmd", () => {
+    // Pre-R1 self-contradiction: cmd auto-fallback chosen because powershell
+    // missing, but cmd's inner shell tries to `powershell.exe -NoExit ...` —
+    // would open and fail. Codex P2 catch (msg f242914a). R1 closes by
+    // gating cmd selection on powershell.exe availability.
+    const cmdOnly = makeCtx(["cmd.exe"]); // powershell.exe missing
+    expect(windowsDriver.canHandle(cmdOnly)).toBe(false);
+    expect(() => windowsDriver.buildCommand(baseInput(), cmdOnly)).toThrow(/no terminal|wt\.exe|powershell/i);
+    // Even with explicit RELAY_TERMINAL_APP=cmd, missing powershell.exe
+    // means cmd falls through (no other binary present → null → throw).
+    const cmdOnlyOverride = makeCtx(["cmd.exe"], "cmd");
+    expect(windowsDriver.canHandle(cmdOnlyOverride)).toBe(false);
+  });
+
+  it("(v2.6.2 R2) wt.exe is NOT selectable when powershell.exe is missing — universal powershell dependency gate", () => {
+    // R1 gated only cmd on powershell. Codex caught (msg 1dd82c7b) that wt
+    // ALSO routes through powershell.exe (v2.6.2 wraps the inner shell in
+    // `powershell.exe -NoExit -Command "..."`), so wt has the same gap.
+    // R2 generalizes: ALL sub-drivers require powershell.exe.
+    const wtOnly = makeCtx(["wt.exe"]); // powershell.exe missing
+    expect(windowsDriver.canHandle(wtOnly)).toBe(false);
+    expect(() => windowsDriver.buildCommand(baseInput(), wtOnly)).toThrow(/no terminal|wt\.exe|powershell/i);
+    // Even with explicit RELAY_TERMINAL_APP=wt, missing powershell.exe means
+    // wt falls through.
+    const wtOnlyOverride = makeCtx(["wt.exe"], "wt");
+    expect(windowsDriver.canHandle(wtOnlyOverride)).toBe(false);
+  });
+
+  it("(v2.6.2 R2) auto-fallback chain — universal powershell.exe dependency", () => {
+    // POSITIVE cases: powershell.exe present.
+    expect(windowsDriver.canHandle(makeCtx(["wt.exe", "powershell.exe"]))).toBe(true);
+    expect(windowsDriver.canHandle(makeCtx(["powershell.exe"]))).toBe(true);
+    expect(windowsDriver.canHandle(makeCtx(["powershell.exe", "cmd.exe"]))).toBe(true);
+    expect(windowsDriver.canHandle(makeCtx(["wt.exe", "powershell.exe", "cmd.exe"]))).toBe(true);
+
+    // NEGATIVE cases: powershell.exe missing — no sub-driver selectable.
+    expect(windowsDriver.canHandle(makeCtx([]))).toBe(false);
+    expect(windowsDriver.canHandle(makeCtx(["wt.exe"]))).toBe(false);
+    expect(windowsDriver.canHandle(makeCtx(["cmd.exe"]))).toBe(false);
+    // R1 self-contradiction case: pre-R2 this returned `wt` (selecting a
+    // sub-driver that can't run because its inner powershell shell would
+    // immediately fail). R2 returns false — clean error path; daemon-side
+    // R2/R3 stdio fallback authenticates first MCP call regardless.
+    expect(windowsDriver.canHandle(makeCtx(["wt.exe", "cmd.exe"]))).toBe(false);
+
+    // Selection priority when powershell.exe is present + multiple sub-drivers.
+    const psAndCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe", "cmd.exe"]));
+    expect(psAndCmd.driverName).toBe("powershell");
+    const allThree = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "powershell.exe", "cmd.exe"]));
+    expect(allThree.driverName).toBe("wt");
   });
 
   it("throws a clear error when no Windows terminal is available", () => {
@@ -153,10 +217,116 @@ describe("windows driver — fallback chain", () => {
   });
 
   it("normalizes forward-slash CWD to backslashes on Windows", () => {
-    const ctx = makeCtx(["wt.exe"]);
+    const ctx = makeCtx(["wt.exe", "powershell.exe"]);
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:/work/project" }), ctx);
-    // The cwd passed into the wt.exe -d arg should be backslash-normalized
+    // The cwd passed into the wt.exe -d arg should be backslash-normalized.
+    // v2.6.2: also appears inside the powershell -Command Set-Location.
     expect(cmd.args).toContain("C:\\work\\project");
+  });
+});
+
+// --- v2.6.2 — Windows FIX 1 PowerShell vault prelude ---
+//
+// The launching shell on Windows hydrates RELAY_AGENT_TOKEN from the per-
+// instance vault before `claude` runs (parity with macOS + Linux). The
+// snippet is single-line PowerShell, shared across all 3 sub-drivers
+// (wt.exe wraps via powershell, powershell.exe prepends inline, cmd.exe
+// delegates to powershell). Daemon-side R2/R3 stdio-only fallback in
+// src/server.ts:resolveToken is the universal safety net.
+describe("v2.6.2 — Windows FIX 1 vault prelude (cross-platform parity)", () => {
+  // The signature snippet fragments the prelude must contain. Drift in
+  // ANY of these breaks the contract (matches the bash mirror at
+  // bin/spawn-agent.sh:230 + Linux buildVaultPrelude shape).
+  const PRELUDE_SIGNATURES = [
+    /\$env:RELAY_AGENT_TOKEN/,                      // PowerShell env var
+    /Test-Path -LiteralPath \$__bvp/,               // safe vault-exists check
+    /Get-Content -LiteralPath \$__bvp -Raw/,        // single-line read
+    /\^\[A-Za-z0-9_=\.-\]\{8,128\}\$/,              // shape regex (matches src/token-store.ts:67)
+  ];
+
+  it("wt.exe sub-driver embeds the vault prelude inside the powershell -Command inner", () => {
+    const ctx = makeCtx(["wt.exe", "powershell.exe"]);
+    const cmd = windowsDriver.buildCommand(baseInput({ name: "victra-build", cwd: "C:\\work" }), ctx);
+    const inner = cmd.args[5]; // index 5 is the powershell -Command argument
+    expect(inner).toBeDefined();
+    for (const sig of PRELUDE_SIGNATURES) {
+      expect(inner).toMatch(sig);
+    }
+    // Vault path must reference the agent name we passed.
+    expect(inner).toContain("victra-build.token");
+    // Prelude must run BEFORE Set-Location/claude, not after.
+    expect(inner!.indexOf("$env:RELAY_AGENT_TOKEN")).toBeLessThan(inner!.indexOf("Set-Location"));
+  });
+
+  it("powershell.exe sub-driver embeds the vault prelude before Set-Location", () => {
+    const ctx = makeCtx(["powershell.exe"]);
+    const cmd = windowsDriver.buildCommand(baseInput({ name: "victra-build", cwd: "C:\\work" }), ctx);
+    const inner = cmd.args[2];
+    expect(inner).toBeDefined();
+    for (const sig of PRELUDE_SIGNATURES) {
+      expect(inner).toMatch(sig);
+    }
+    expect(inner).toContain("victra-build.token");
+    expect(inner!.indexOf("$env:RELAY_AGENT_TOKEN")).toBeLessThan(inner!.indexOf("Set-Location"));
+  });
+
+  it("cmd.exe sub-driver delegates to powershell.exe with the vault prelude embedded", () => {
+    // v2.6.2 R1: cmd requires powershell.exe (delegates inner shell). Use
+    // RELAY_TERMINAL_APP=cmd to force the cmd path when both are available.
+    const ctx = makeCtx(["cmd.exe", "powershell.exe"], "cmd");
+    const cmd = windowsDriver.buildCommand(baseInput({ name: "victra-build", cwd: "C:\\work" }), ctx);
+    const compound = cmd.args[1];
+    expect(compound).toBeDefined();
+    expect(compound).toContain("powershell.exe -NoExit -Command");
+    for (const sig of PRELUDE_SIGNATURES) {
+      expect(compound).toMatch(sig);
+    }
+    expect(compound).toContain("victra-build.token");
+  });
+
+  it("prelude is omitted when the agent name fails the FileTokenStore allowlist (defense-in-depth no-op)", () => {
+    // Build a hostile name that bypasses zod (we pass it directly to
+    // buildCommand, simulating a future schema relaxation). The prelude
+    // helper validates against the same allowlist the vault uses; on
+    // failure it returns "" and the driver omits the prelude entirely.
+    // Daemon-side resolveToken stdio-only fallback covers identity from
+    // env if needed.
+    const hostile = { name: "has space", role: "r", capabilities: [], cwd: "C:\\work" } as any;
+    const ctx = makeCtx(["powershell.exe"]);
+    const cmd = windowsDriver.buildCommand(hostile, ctx);
+    const inner = cmd.args[2];
+    expect(inner).toBeDefined();
+    // None of the prelude signatures should appear when the name is invalid.
+    expect(inner).not.toMatch(/\$env:RELAY_AGENT_TOKEN/);
+    expect(inner).not.toMatch(/Test-Path -LiteralPath/);
+    // The Set-Location + claude form is still present (driver still works,
+    // just without the launching-shell prelude — daemon FIX 2/R2/R3 covers).
+    expect(inner).toMatch(/^Set-Location -LiteralPath '.*'; claude$/);
+  });
+
+  it("cross-driver invariant: all 3 Windows sub-drivers embed the SAME prelude shape", () => {
+    // Single source of truth — drift between sub-drivers re-creates the
+    // v2.4.5 R2 split-brain class of bug at the spawn layer. This test
+    // asserts the prelude byte-pattern is identical across wt / ps / cmd.
+    const wt = windowsDriver.buildCommand(baseInput({ name: "shared", cwd: "C:\\x" }), makeCtx(["wt.exe", "powershell.exe"]));
+    const ps = windowsDriver.buildCommand(baseInput({ name: "shared", cwd: "C:\\x" }), makeCtx(["powershell.exe"]));
+    // v2.6.2 R1: cmd requires powershell — use override to force cmd path.
+    const cmd = windowsDriver.buildCommand(baseInput({ name: "shared", cwd: "C:\\x" }), makeCtx(["cmd.exe", "powershell.exe"], "cmd"));
+    // Extract the prelude prefix from each (everything before "Set-Location").
+    const extractPrelude = (s: string): string => {
+      const idx = s.indexOf("Set-Location");
+      return idx > 0 ? s.slice(0, idx).trim() : "";
+    };
+    const wtPrelude = extractPrelude(wt.args[5]);
+    const psPrelude = extractPrelude(ps.args[2]);
+    const cmdPrelude = extractPrelude(cmd.args[1]);
+    expect(wtPrelude).toBe(psPrelude);
+    // cmd.exe wraps the powershell inner string in `cd /D "..." && powershell.exe -NoExit -Command "<psInner>"`,
+    // so its raw prelude prefix carries the cmd outer fragment. Strip up to
+    // the first `if (` (start of the PowerShell prelude) before comparing.
+    const cmdPsStart = cmdPrelude.indexOf("if ([string]::IsNullOrEmpty");
+    expect(cmdPsStart).toBeGreaterThanOrEqual(0);
+    expect(cmdPrelude.slice(cmdPsStart)).toBe(psPrelude);
   });
 });
 
@@ -212,7 +382,7 @@ describe("resolveTerminalOverride — platform-aware allowlist gating", () => {
 // --- Env var propagation ---
 
 describe("buildChildEnv — principle of least authority", () => {
-  it("propagates RELAY_* prefix vars from parent env", () => {
+  it("propagates RELAY_* prefix vars from parent env, but NOT RELAY_AGENT_TOKEN (v2.6.1)", () => {
     const parentEnv = {
       PATH: "/usr/bin",
       HOME: "/home/me",
@@ -223,7 +393,10 @@ describe("buildChildEnv — principle of least authority", () => {
       GITHUB_TOKEN: "should-not-propagate",
     };
     const env = buildChildEnv("me", "r", ["c"], "linux", parentEnv);
-    expect(env.RELAY_AGENT_TOKEN).toBe("tok-123");
+    // v2.6.1: child identity comes from the per-instance file vault, NOT
+    // from an inherited env var. The RELAY_* glob would otherwise leak the
+    // parent's RELAY_AGENT_TOKEN into the child shell — explicitly stripped.
+    expect(env.RELAY_AGENT_TOKEN).toBeUndefined();
     expect(env.RELAY_HTTP_HOST).toBe("127.0.0.1");
     expect(env.RELAY_HTTP_PORT).toBe("3777");
     // Principle of least authority — NOT passed through
@@ -408,7 +581,7 @@ describe("adversarial payloads — Linux driver parity (v1.9.1 Blocker 1)", () =
       // emulator's binary. No shell interpolation of the agent identity.
       expect(cmd.args).toContain("-lc");
       const lcIdx = cmd.args.indexOf("-lc");
-      expect(cmd.args[lcIdx + 1]).toMatch(/^cd '.*' && exec claude$/);
+      expect(cmd.args[lcIdx + 1]).toMatch(/cd '.*' && exec claude$/);
     }
   });
 });
@@ -418,24 +591,33 @@ describe("adversarial payloads — Windows driver parity (v1.9.1 Blocker 1)", ()
   // boundary is already covered by the Linux block above. Windows-specific
   // assertions focus on cmd.exe / powershell / wt argv-separation.
 
-  it("(argv-separation) wt.exe receives cwd as its own argv element, not concatenated", () => {
-    const ctx = makeCtx(["wt.exe"]);
+  it("(argv-separation) wt.exe receives cwd as its own argv element, not concatenated (v2.6.2 inner = powershell)", () => {
+    const ctx = makeCtx(["wt.exe", "powershell.exe"]);
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx);
-    // Expect: ["-d", "C:\\work", "claude"] — cwd as a discrete argv element
-    expect(cmd.args).toEqual(["-d", "C:\\work", "claude"]);
-    // cwd must be its own argv element (index 1), NOT merged with the flag
+    // v2.6.2: ["-d", "C:\\work", "powershell.exe", "-NoExit", "-Command", inner]
+    // (was ["-d", cwd, "claude"] in v2.6.1 and earlier — narrowed to wrap an
+    // inner powershell shell so the vault prelude can run before claude).
+    expect(cmd.args[0]).toBe("-d");
     expect(cmd.args[1]).toBe("C:\\work");
+    expect(cmd.args[2]).toBe("powershell.exe");
+    // cwd must be its own argv element (index 1), NOT merged with the flag
     expect(cmd.args.some((a) => a.includes("-d C:\\work"))).toBe(false);
   });
 
-  it("(argv-separation) cmd.exe receives the whole compound command as one argv, no shell-meta leakage", () => {
-    const ctx = makeCtx(["cmd.exe"]);
+  it("(argv-separation) cmd.exe receives the whole compound command as one argv, no shell-meta leakage (v2.6.2 inner = powershell)", () => {
+    // v2.6.2 R1: cmd requires powershell — use override to force cmd path.
+    const ctx = makeCtx(["cmd.exe", "powershell.exe"], "cmd");
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx);
-    // /K is its own argv, the compound "cd /D ... && claude" is another single argv
+    // /K is its own argv, the compound "cd /D ... && powershell.exe -NoExit -Command ..." is another single argv
     expect(cmd.args[0]).toBe("/K");
     expect(cmd.args.length).toBe(2);
-    // The compound string should be exactly the expected form
-    expect(cmd.args[1]).toBe('cd /D "C:\\work" && claude');
+    // v2.6.2: cmd /K delegates the inner shell to powershell.exe so the
+    // vault prelude can run before claude (cmd.exe lacks Get-Content / regex).
+    expect(cmd.args[1].startsWith('cd /D "C:\\work" && powershell.exe -NoExit -Command "')).toBe(true);
+    expect(cmd.args[1].endsWith('"')).toBe(true);
+    // No raw shell metacharacters leaked into argv beyond the intended
+    // `&&` chain inside the quoted compound.
+    expect(cmd.args[1]).toContain("claude");
   });
 
   it("(defense-in-depth) PowerShell driver doubles single quotes inside cwd even if zod relaxes (v1.9.1)", () => {
@@ -450,8 +632,11 @@ describe("adversarial payloads — Windows driver parity (v1.9.1 Blocker 1)", ()
     // And the raw hostile payload must NOT appear as-is (i.e., no
     // successful quote-break into whoami)
     expect(cmd.args[2]).not.toContain(`C:\\a'; whoami; '`);
-    // Command starts with Set-Location -LiteralPath ' (single quote begins literal)
-    expect(cmd.args[2]).toMatch(/^Set-Location -LiteralPath '.*'; claude$/);
+    // v2.6.2: prelude (when agent name is valid) is prepended before
+    // Set-Location, so the start anchor moved. The Set-Location + claude
+    // tail must still be the closing form, untouched by the cwd's hostile
+    // payload attempt.
+    expect(cmd.args[2]).toMatch(/Set-Location -LiteralPath '.*'; claude$/);
   });
 
   it("(zod parity) Windows driver is gated by the same allowlist — hostile name rejected", () => {
@@ -482,7 +667,7 @@ describe("adversarial payloads — Windows driver parity (v1.9.1 Blocker 1)", ()
   });
 
   it("(normalize) forward-slash cwd → backslash, even with mixed separators", () => {
-    const ctx = makeCtx(["wt.exe"]);
+    const ctx = makeCtx(["wt.exe", "powershell.exe"]);
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:/a\\b/c" }), ctx);
     expect(cmd.args).toContain("C:\\a\\b\\c");
   });
@@ -553,7 +738,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
 
     it("brief_file_path → kickstart sentence appears in bash -lc launch arg", () => {
       const ctx = makeCtx(["gnome-terminal"]);
-      const cmd = linuxDriver.buildCommand(baseInput(), ctx, undefined, briefPath);
+      const cmd = linuxDriver.buildCommand(baseInput(), ctx, briefPath);
       const launch = cmd.args[cmd.args.length - 1];
       expect(launch).toContain("exec claude '");
       expect(launch).toContain(BRIEF_POINTER_PHRASE);
@@ -564,7 +749,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
     it("brief_file_path appears across all sub-drivers (gnome-terminal, konsole, xterm, tmux)", () => {
       for (const sub of ["gnome-terminal", "konsole", "xterm", "tmux"]) {
         const ctx = makeCtx([sub]);
-        const cmd = linuxDriver.buildCommand(baseInput(), ctx, undefined, briefPath);
+        const cmd = linuxDriver.buildCommand(baseInput(), ctx, briefPath);
         // For gnome-terminal/konsole/xterm, launch is the LAST arg (after -lc).
         // For tmux, the launch is wrapped inside a bash -lc string in args[4].
         const wholeCmd = cmd.args.join(" ");
@@ -576,9 +761,9 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
     it("brief_file_path + RELAY_SPAWN_NO_KICKSTART=1 → no kickstart appended (operator opt-out wins)", () => {
       process.env.RELAY_SPAWN_NO_KICKSTART = "1";
       const ctx = makeCtx(["gnome-terminal"]);
-      const cmd = linuxDriver.buildCommand(baseInput(), ctx, undefined, briefPath);
+      const cmd = linuxDriver.buildCommand(baseInput(), ctx, briefPath);
       const launch = cmd.args[cmd.args.length - 1];
-      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).toMatch(/cd '.*' && exec claude$/);
       expect(launch).not.toContain(BRIEF_POINTER_PHRASE);
       expect(launch).not.toContain(briefPath);
     });
@@ -586,7 +771,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
     it("brief_file_path + RELAY_SPAWN_KICKSTART=custom → custom verbatim, brief-pointer NOT appended", () => {
       process.env.RELAY_SPAWN_KICKSTART = "do the custom thing";
       const ctx = makeCtx(["gnome-terminal"]);
-      const cmd = linuxDriver.buildCommand(baseInput(), ctx, undefined, briefPath);
+      const cmd = linuxDriver.buildCommand(baseInput(), ctx, briefPath);
       const launch = cmd.args[cmd.args.length - 1];
       expect(launch).toContain("exec claude 'do the custom thing'");
       expect(launch).not.toContain(BRIEF_POINTER_PHRASE);
@@ -597,7 +782,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
       const ctx = makeCtx(["gnome-terminal"]);
       const cmd = linuxDriver.buildCommand(baseInput(), ctx);
       const launch = cmd.args[cmd.args.length - 1];
-      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).toMatch(/cd '.*' && exec claude$/);
       expect(launch).not.toContain(BRIEF_POINTER_PHRASE);
     });
 
@@ -609,7 +794,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
       const ctx = makeCtx(["gnome-terminal"]);
       const cmd = linuxDriver.buildCommand(baseInput(), ctx);
       const launch = cmd.args[cmd.args.length - 1];
-      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).toMatch(/cd '.*' && exec claude$/);
       expect(launch).not.toContain("ignored without brief");
     });
   });
@@ -619,78 +804,104 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
   describe("windows", () => {
     const briefPath = "/tmp/relay-brief-test.md";
 
-    it("(wt) brief_file_path → kickstart appended as positional arg after `claude`", () => {
-      const ctx = makeCtx(["wt.exe"]);
-      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
-      // wt -d <cwd> claude <kickstart>
+    it("(wt) brief_file_path → kickstart embedded as PS single-quoted arg inside the powershell -Command (v2.6.2)", () => {
+      const ctx = makeCtx(["wt.exe", "powershell.exe"]);
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, briefPath);
+      // v2.6.2: ["-d", cwd, "powershell.exe", "-NoExit", "-Command", inner]
+      // where inner contains `claude '<kickstart>'`. Pre-v2.6.2 the kickstart
+      // was a discrete argv element after the bare "claude" command.
       expect(cmd.args[0]).toBe("-d");
-      expect(cmd.args[2]).toBe("claude");
-      expect(cmd.args[3]).toContain(BRIEF_POINTER_PHRASE);
-      expect(cmd.args[3]).toContain(briefPath);
+      expect(cmd.args[2]).toBe("powershell.exe");
+      expect(cmd.args[5]).toContain("claude '");
+      expect(cmd.args[5]).toContain(BRIEF_POINTER_PHRASE);
+      expect(cmd.args[5]).toContain(briefPath);
     });
 
     it("(powershell) brief_file_path → kickstart embedded as PS single-quoted arg in -Command", () => {
       const ctx = makeCtx(["powershell.exe"]);
-      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, briefPath);
       const inner = cmd.args[2];
+      // v2.6.2: prelude (when agent name is valid) prepends the form, so
+      // anchor on the Set-Location/claude tail rather than start of string.
       expect(inner).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude '.+'/);
       expect(inner).toContain(BRIEF_POINTER_PHRASE);
       expect(inner).toContain(briefPath);
     });
 
-    it("(cmd) brief_file_path → kickstart embedded as doublequoted arg in /K cmdline", () => {
-      const ctx = makeCtx(["cmd.exe"]);
-      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
+    it("(cmd) brief_file_path → kickstart embedded as PS single-quoted arg inside the powershell -Command (v2.6.2)", () => {
+      // v2.6.2 R1: cmd requires powershell — use override to force cmd path.
+      const ctx = makeCtx(["cmd.exe", "powershell.exe"], "cmd");
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, briefPath);
+      // v2.6.2: cmd /K delegates the inner shell to powershell.exe, so the
+      // kickstart is PS single-quoted inside that delegation, not cmd
+      // doublequoted at the cmd layer.
       expect(cmd.args[0]).toBe("/K");
-      expect(cmd.args[1]).toContain('cd /D "C:\\work" && claude "');
+      expect(cmd.args[1]).toContain('cd /D "C:\\work" && powershell.exe -NoExit -Command "');
+      expect(cmd.args[1]).toContain("claude '");
       expect(cmd.args[1]).toContain(BRIEF_POINTER_PHRASE);
       expect(cmd.args[1]).toContain(briefPath);
     });
 
-    it("brief_file_path + RELAY_SPAWN_NO_KICKSTART=1 → no kickstart on any sub-driver", () => {
+    it("brief_file_path + RELAY_SPAWN_NO_KICKSTART=1 → no kickstart on any sub-driver (v2.6.2 inner shapes)", () => {
       process.env.RELAY_SPAWN_NO_KICKSTART = "1";
-      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]), undefined, briefPath);
-      expect(wtCmd.args).toEqual(["-d", "C:\\work", "claude"]);
-      const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]), undefined, briefPath);
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "powershell.exe"]), briefPath);
+      // v2.6.2 wt: ["-d", cwd, "powershell.exe", "-NoExit", "-Command", inner].
+      expect(wtCmd.args.slice(0, 5)).toEqual(["-d", "C:\\work", "powershell.exe", "-NoExit", "-Command"]);
+      expect(wtCmd.args[5]).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude$/);
+      expect(wtCmd.args[5]).not.toContain(BRIEF_POINTER_PHRASE);
+      const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]), briefPath);
       expect(psCmd.args[2]).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude$/);
       expect(psCmd.args[2]).not.toContain(BRIEF_POINTER_PHRASE);
-      const cmdCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["cmd.exe"]), undefined, briefPath);
-      expect(cmdCmd.args[1]).toBe('cd /D "C:\\work" && claude');
+      // v2.6.2 R1: cmd requires powershell — use override to force cmd path.
+      const cmdCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["cmd.exe", "powershell.exe"], "cmd"), briefPath);
+      // v2.6.2 cmd: cd /D "..." && powershell.exe -NoExit -Command "...; claude"
+      expect(cmdCmd.args[1]).toContain('cd /D "C:\\work" && powershell.exe -NoExit -Command "');
+      expect(cmdCmd.args[1]).toMatch(/claude"$/);
+      expect(cmdCmd.args[1]).not.toContain(BRIEF_POINTER_PHRASE);
     });
 
-    it("brief_file_path + RELAY_SPAWN_KICKSTART=custom → custom verbatim, brief-pointer NOT appended", () => {
+    it("brief_file_path + RELAY_SPAWN_KICKSTART=custom → custom verbatim, brief-pointer NOT appended (v2.6.2)", () => {
       process.env.RELAY_SPAWN_KICKSTART = "custom-windows-prompt";
-      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]), undefined, briefPath);
-      expect(wtCmd.args[3]).toBe("custom-windows-prompt");
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "powershell.exe"]), briefPath);
+      expect(wtCmd.args[5]).toContain("claude 'custom-windows-prompt'");
       expect(wtCmd.args.join(" ")).not.toContain(BRIEF_POINTER_PHRASE);
-      const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]), undefined, briefPath);
+      const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]), briefPath);
       expect(psCmd.args[2]).toContain("claude 'custom-windows-prompt'");
       expect(psCmd.args[2]).not.toContain(BRIEF_POINTER_PHRASE);
     });
 
-    it("NO brief_file_path → behavior unchanged across all sub-drivers", () => {
-      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]));
-      expect(wtCmd.args).toEqual(["-d", "C:\\work", "claude"]);
+    it("NO brief_file_path → behavior unchanged across all sub-drivers (v2.6.2 shapes)", () => {
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "powershell.exe"]));
+      expect(wtCmd.args.slice(0, 5)).toEqual(["-d", "C:\\work", "powershell.exe", "-NoExit", "-Command"]);
+      expect(wtCmd.args[5]).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude$/);
       const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]));
       expect(psCmd.args[2]).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude$/);
-      const cmdCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["cmd.exe"]));
-      expect(cmdCmd.args[1]).toBe('cd /D "C:\\work" && claude');
+      // v2.6.2 R1: cmd requires powershell — use override to force cmd path.
+      const cmdCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["cmd.exe", "powershell.exe"], "cmd"));
+      expect(cmdCmd.args[1]).toContain('cd /D "C:\\work" && powershell.exe -NoExit -Command "');
+      expect(cmdCmd.args[1]).toMatch(/claude"$/);
     });
 
     it("(defense-in-depth) PS kickstart with embedded single quote is doubled (`'` → `''`)", () => {
       process.env.RELAY_SPAWN_KICKSTART = "it's a test";
       const ctx = makeCtx(["powershell.exe"]);
-      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, briefPath);
       // PS-doubling: it''s
       expect(cmd.args[2]).toContain("'it''s a test'");
     });
 
-    it("(defense-in-depth) cmd kickstart with embedded `\"` is doubled and `%` is doubled", () => {
+    it("(defense-in-depth) cmd kickstart with embedded `\"` is doubled and `%` is doubled (v2.6.2: applied at cmd layer wrapping the powershell delegation)", () => {
       process.env.RELAY_SPAWN_KICKSTART = 'say "hi" 100%';
-      const ctx = makeCtx(["cmd.exe"]);
-      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, undefined, briefPath);
-      // " → "" and % → %%
-      expect(cmd.args[1]).toContain('claude "say ""hi"" 100%%"');
+      // v2.6.2 R1: cmd requires powershell — use override to force cmd path.
+      const ctx = makeCtx(["cmd.exe", "powershell.exe"], "cmd");
+      const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, briefPath);
+      // v2.6.2 cmd: kickstart is PS single-quoted inside the inner ps script,
+      // and the WHOLE inner ps script is wrapped in cmd `"..."` with " doubled
+      // and % doubled. The kickstart's `"` and `%` survive PS quoting (PS
+      // single-quotes only escape `'`) and reach the cmd layer, where they
+      // get doubled. So the final form is `claude 'say ""hi"" 100%%'` inside
+      // the cmd outer `"..."`.
+      expect(cmd.args[1]).toContain(`claude 'say ""hi"" 100%%'`);
     });
   });
 });

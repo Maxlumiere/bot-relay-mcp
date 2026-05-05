@@ -618,6 +618,41 @@ Messages and tasks addressed to the agent are **preserved** — only the `agents
 
 Trust model: filesystem access to `~/.bot-relay/relay.db` IS the authority (same boundary the daemon relies on). Not an MCP tool — the caller by definition cannot authenticate. The CLI emits an `audit_log` entry with `tool='recovery.cli'` + the operator's OS username for incident traceability.
 
+## External-CLI Token Mint (v2.6)
+
+Some LLM CLI clients (Codex 5.5 was the canonical case) have safety monitors that pattern-match `register_agent` followed immediately by `use returned token` as a credential handoff and cancel the second tool call. The result: the agent row exists on the relay, but the agent process never captured its token, and every subsequent re-register attempt fails with `NAME_COLLISION_ACTIVE` because the orphan session is still considered live.
+
+`relay mint-token` solves this by minting the token outside the agent's process. The operator hands the plaintext token to the agent's environment via `RELAY_AGENT_TOKEN`, and the agent authenticates on its first MCP call without ever invoking `register_agent`:
+
+```bash
+relay mint-token codex-5-5 --role builder --capabilities build,test,audit
+```
+
+Output (token shown ONCE):
+
+```
+✓ Minted token for new agent "codex-5-5"
+
+Token (shown ONCE — store it now):
+
+  <43-char-base64url-token>
+
+Set in your CLI's environment before launching:
+
+  export RELAY_AGENT_NAME=codex-5-5
+  export RELAY_AGENT_TOKEN=<43-char-base64url-token>
+```
+
+Other forms:
+
+```bash
+relay mint-token NAME --json                          # structured output for scripts
+relay mint-token EXISTING --force                     # rotate token; caps + role preserved
+relay mint-token NAME --description "human-readable"  # discoverable in dashboard
+```
+
+Caps are locked at first mint per the `feedback_relay_caps_immutable.md` discipline; `--force` rotates the token but preserves both caps and role. The CLI emits a daemon-running advisory to stderr and writes an `audit_log` entry (`tool='agent.token_minted'`) with the operator's OS username, the `--force` flag state, and whether the row was created or rotated. Full setup walkthrough including platform-specific token-storage best practices: [`docs/agents/external-cli-setup.md`](./docs/agents/external-cli-setup.md).
+
 ## Cross-Platform Spawn (v1.9)
 
 `spawn_agent` opens a new Claude Code terminal on macOS, Linux, and Windows via a driver abstraction:

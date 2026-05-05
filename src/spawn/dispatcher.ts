@@ -86,17 +86,20 @@ export interface SpawnDispatchResult {
  * Build-only path — used by tests to assert on the command object without
  * actually spawning. Throws if no driver can handle the current platform.
  *
- * v2.1 Phase 4j: optional `token` is the parent-issued RELAY_AGENT_TOKEN
- * threaded to the driver. Ignored if undefined; drivers set RELAY_AGENT_TOKEN
- * in the child env only when a valid-shape token is present.
+ * v2.6.1: the `token` parameter from v2.1 Phase 4j has been removed. The
+ * spawned terminal's SessionStart hook now resolves identity from the
+ * per-instance file vault. Callers that previously passed undefined should
+ * drop the slot; the legacy 2nd-positional `token` slot is gone (was a
+ * silent-no-op for callers that always passed undefined post-v2.6.1).
  */
 export function buildSpawnCommand(
   input: SpawnAgentInput,
-  token?: string,
+  _legacyTokenSlot?: undefined,
   ctx?: DriverContext,
   platformTag: SupportedPlatform | NodeJS.Platform = process.platform,
   briefFilePath?: string
 ): SpawnCommand {
+  void _legacyTokenSlot; // kept positional so existing callers/tests still type-check
   const platform = platformTag as SupportedPlatform;
   const effectiveCtx = ctx ?? defaultDriverContext(platform);
   const driver = DRIVERS[platform];
@@ -110,27 +113,29 @@ export function buildSpawnCommand(
     // so the caller sees the exact "no emulator found" / "binary missing" text.
     // canHandle returning false + buildCommand throwing is intentional — the
     // driver knows its fallback chain best.
-    return driver.buildCommand(input, effectiveCtx, token, briefFilePath);
+    return driver.buildCommand(input, effectiveCtx, briefFilePath);
   }
-  return driver.buildCommand(input, effectiveCtx, token, briefFilePath);
+  return driver.buildCommand(input, effectiveCtx, briefFilePath);
 }
 
 /**
  * Full spawn path: build the command, honor RELAY_SPAWN_DRY_RUN, else
  * child_process.spawn(detached, stdio ignored, unref).
  *
- * v2.1 Phase 4j: optional `token` threaded to buildSpawnCommand.
+ * v2.6.1: the `token` parameter is now a legacy positional placeholder
+ * (`undefined`-only). Identity flows through the file vault, not env.
  */
 export function spawnAgent(
   input: SpawnAgentInput,
-  token?: string,
+  _legacyTokenSlot?: undefined,
   ctx?: DriverContext,
   platformTag: SupportedPlatform | NodeJS.Platform = process.platform,
   briefFilePath?: string
 ): SpawnDispatchResult {
+  void _legacyTokenSlot;
   let cmd: SpawnCommand;
   try {
-    cmd = buildSpawnCommand(input, token, ctx, platformTag, briefFilePath);
+    cmd = buildSpawnCommand(input, undefined, ctx, platformTag, briefFilePath);
   } catch (err) {
     return {
       ok: false,
