@@ -54,6 +54,18 @@ bot-relay-mcp ships every feature at macOS / Linux / Windows parity from first r
 
 Test coverage: `tests/v2-6-1-token-store.test.ts` runs the FileTokenStore TS implementation against a tmp directory and asserts on file permissions (POSIX-only assertion). Windows ACL is a documented assumption — bot-relay-mcp does not currently shell out to `icacls` to verify.
 
+### Launching-shell vault prelude (cross-platform parity per v2.6.2)
+
+The launching shell (the parent process that starts `claude`) hydrates `RELAY_AGENT_TOKEN` from the vault BEFORE `exec claude` so the spawned terminal's stdio MCP server inherits the token at fork. This is the operator-visible UX win — `printenv RELAY_AGENT_TOKEN` shows the token, non-MCP tooling (curl scripts, `relay` CLI) picks it up automatically. The daemon-side stdio R2/R3 fallback (`src/server.ts:resolveToken`) is the universal safety net for any path where the prelude can't run (broken hook, missing helper).
+
+| Platform | Implementation | Shipped since |
+|---|---|---|
+| **macOS** | `bin/spawn-agent.sh` embeds a single-line bash snippet (`if [ -z "${RELAY_AGENT_TOKEN:-}" ] && [ -f '<vault>' ]; then T=$(head -n 1 ...) ...`) before `exec claude`. Vault path is pre-resolved on the parent side via the shared `hooks/_vault-helpers.sh` helper. | v2.6.1 R1 |
+| **Linux** | `src/spawn/drivers/linux.ts:buildVaultPrelude(agentName)` emits the same shape as macOS. Same path-resolution helper (`resolveInstanceDbPath`). All 4 sub-drivers (gnome-terminal / konsole / xterm / tmux) embed the prelude inside the `bash -lc '<cmd>'` wrapper. | v2.6.1 R1 |
+| **Windows** | `src/spawn/drivers/windows.ts:buildVaultPreludePowerShell(agentName)` emits a single-line PowerShell snippet (`if ([string]::IsNullOrEmpty($env:RELAY_AGENT_TOKEN)) { $__bvp = '<vault>'; if (Test-Path -LiteralPath $__bvp) { try { $__bvt = (Get-Content -LiteralPath $__bvp -Raw -ErrorAction Stop).Trim(); if ($__bvt -match '^[A-Za-z0-9_=.-]{8,128}$') { $env:RELAY_AGENT_TOKEN = $__bvt } } catch {} } }`). Shared across all 3 Windows sub-drivers: wt.exe wraps inner shell in `powershell.exe -NoExit -Command "..."`, powershell.exe prepends the prelude inline, cmd.exe delegates the inner shell to `powershell.exe -NoExit -Command "..."` (single source of truth, no cmd-native re-implementation). | v2.6.2 |
+
+Windows verification path: command-construction tests run on any platform (`tests/spawn-drivers.test.ts:windows driver — fallback chain` + `v2.6.2 — Windows FIX 1 vault prelude`). Live PowerShell execution coverage requires a Windows CI runner — not yet wired (manual smoke per the v2.6.2 release runbook). Daemon-side R2/R3 stdio-only fallback (`src/server.ts:resolveToken`) is the universal safety net that closes the auth path for every Windows sub-driver regardless of prelude execution.
+
 ## Pluggable credential helpers (forward-looking)
 
 The `TokenStore` interface in `src/token-store.ts` is the same shape used by `docker credential-helpers`, `git credential helper`, `gh auth`, `aws configure`, and `kubectl config`. v2.6.1 ships only the `FileTokenStore` default impl. Future helpers plug in without breaking changes:
