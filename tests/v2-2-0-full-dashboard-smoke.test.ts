@@ -29,10 +29,18 @@ import path from "path";
 import os from "os";
 import http from "http";
 import { WebSocket } from "ws";
+import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v220-full-smoke-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
+
+// v2.6.0 publish-prep: read version from package.json so the health-check
+// assertion below tracks future bumps automatically. Mirrors the strategy
+// in src/version.ts (single source of truth).
+const __testFile = fileURLToPath(import.meta.url);
+const __pkgJson = path.resolve(path.dirname(__testFile), "..", "package.json");
+const EXPECTED_VERSION: string = JSON.parse(fs.readFileSync(__pkgJson, "utf-8")).version;
 process.env.RELAY_DB_PATH = TEST_DB_PATH;
 delete process.env.RELAY_AGENT_TOKEN;
 delete process.env.RELAY_AGENT_NAME;
@@ -109,7 +117,11 @@ describe("v2.2.0 Phase 6 — dashboard end-to-end smoke (--full)", () => {
     expect(health.status).toBe(200);
     const healthJson = JSON.parse(health.body);
     expect(healthJson.status).toBe("ok");
-    expect(healthJson.version).toBe("2.5.0");
+    // v2.6.0 publish-prep: read the version from package.json so this test
+    // tracks any future bump automatically. The drift-grep guard scans
+    // `src/` only — hardcoded version literals in `tests/` slip through and
+    // create false-positive --full gate failures during publish-prep.
+    expect(healthJson.version).toBe(EXPECTED_VERSION);
     expect(healthJson.protocol_version).toBe("2.4.0");
 
     // 2. Dashboard HTML.
