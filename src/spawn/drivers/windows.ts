@@ -138,28 +138,41 @@ function buildVaultPreludePowerShell(agentName: string): string {
 }
 
 /**
- * v2.6.2 R1 (codex P2 fix) — cmd.exe sub-driver requires powershell.exe to
- * also be on PATH because the cmd branch delegates the inner shell to
- * `powershell.exe -NoExit -Command "..."` for the vault prelude (cmd.exe
- * lacks native Get-Content / regex match — Brief Option A, single PS source
- * of truth). Pre-R1 `pickSubDriver` would auto-fall-through wt → ps → cmd,
- * but if cmd was selected because powershell was missing, the cmd window
- * would open and immediately fail (`'powershell.exe' is not recognized`)
- * before claude could run. Codex caught the self-contradiction.
+ * v2.6.2 R2 (codex msg `1dd82c7b`) — UNIVERSAL powershell.exe dependency.
+ * All three Windows sub-drivers route through `powershell.exe -NoExit
+ * -Command "..."` for the vault prelude (Brief Option A from v2.6.2 —
+ * PowerShell as the single source of truth across wt.exe / powershell.exe /
+ * cmd.exe). Therefore EVERY sub-driver requires powershell.exe to be on
+ * PATH; without it, the spawned terminal opens and immediately fails before
+ * claude can run.
  *
- * Post-R1 contract: cmd is only selectable when powershell.exe is ALSO
- * available. The auto-fallback chain effectively becomes wt → powershell →
- * (no Windows FIX 1 — daemon-side R2/R3 stdio fallback in
- * `src/server.ts:resolveToken` covers identity universally on every Windows
- * sub-driver regardless). Operators who explicitly choose cmd via
- * `RELAY_TERMINAL_APP=cmd` still get the cmd window, but only when
- * powershell.exe is present (otherwise pickSubDriver falls through and
- * canHandle returns false → driver throws a clear error).
+ * History of this gate (the bug class kept resurfacing one sub-driver at
+ * a time until R2 generalized):
+ *   - v2.6.2 R1 (codex msg `f242914a`) gated cmd.exe on powershell.exe
+ *     — but only cmd. wt.exe still routed through powershell unguarded.
+ *   - v2.6.2 R2 (codex msg `1dd82c7b`) generalizes the rule to ALL
+ *     sub-drivers. The brief explicitly carries the rule per
+ *     `memory/feedback_token_discipline.md`: when fixing a bug class,
+ *     scope the fix to ALL similarly-shaped surfaces, not just the one
+ *     flagged. Walking the analogous code paths is part of declaring
+ *     scope complete.
+ *
+ * The auto-fallback chain effectively becomes wt|powershell|cmd, all
+ * predicated on powershell.exe being available. With no powershell.exe at
+ * all, `canHandle` returns false and the driver throws a clear error.
+ *
+ * Daemon-side safety net unchanged: R2/R3 stdio-only fallback in
+ * `src/server.ts:resolveToken` still authenticates the agent on first MCP
+ * call from the per-instance vault — no functional regression on Windows
+ * boxes without powershell.exe (rare in practice; powershell.exe ships
+ * with every Windows since Vista). Operators on those boxes simply lose
+ * the operator-visible `printenv RELAY_AGENT_TOKEN` UX win, not the auth
+ * itself.
  */
 function isAvailable(ctx: DriverContext, sub: WindowsSubDriver): boolean {
-  if (!ctx.hasBinary(BINARY_FOR[sub])) return false;
-  if (sub === "cmd" && !ctx.hasBinary("powershell.exe")) return false;
-  return true;
+  // Universal: every sub-driver delegates the vault prelude to powershell.
+  if (!ctx.hasBinary("powershell.exe")) return false;
+  return ctx.hasBinary(BINARY_FOR[sub]);
 }
 
 function pickSubDriver(ctx: DriverContext): WindowsSubDriver | null {

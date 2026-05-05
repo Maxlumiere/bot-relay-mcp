@@ -172,20 +172,40 @@ describe("windows driver — fallback chain", () => {
     expect(windowsDriver.canHandle(cmdOnlyOverride)).toBe(false);
   });
 
-  it("(v2.6.2 R1) auto-fallback chain wt → powershell → (skip cmd) when cmd alone is left without powershell", () => {
-    // cmd-only (no powershell) → no driver selectable → canHandle false.
-    // wt-only → wt selected. powershell-only → powershell selected.
-    // wt + cmd (no powershell) → wt selected (cmd skipped per R1 gate).
-    expect(windowsDriver.canHandle(makeCtx(["wt.exe"]))).toBe(true);
+  it("(v2.6.2 R2) wt.exe is NOT selectable when powershell.exe is missing — universal powershell dependency gate", () => {
+    // R1 gated only cmd on powershell. Codex caught (msg 1dd82c7b) that wt
+    // ALSO routes through powershell.exe (v2.6.2 wraps the inner shell in
+    // `powershell.exe -NoExit -Command "..."`), so wt has the same gap.
+    // R2 generalizes: ALL sub-drivers require powershell.exe.
+    const wtOnly = makeCtx(["wt.exe"]); // powershell.exe missing
+    expect(windowsDriver.canHandle(wtOnly)).toBe(false);
+    expect(() => windowsDriver.buildCommand(baseInput(), wtOnly)).toThrow(/no terminal|wt\.exe|powershell/i);
+    // Even with explicit RELAY_TERMINAL_APP=wt, missing powershell.exe means
+    // wt falls through.
+    const wtOnlyOverride = makeCtx(["wt.exe"], "wt");
+    expect(windowsDriver.canHandle(wtOnlyOverride)).toBe(false);
+  });
+
+  it("(v2.6.2 R2) auto-fallback chain — universal powershell.exe dependency", () => {
+    // POSITIVE cases: powershell.exe present.
+    expect(windowsDriver.canHandle(makeCtx(["wt.exe", "powershell.exe"]))).toBe(true);
     expect(windowsDriver.canHandle(makeCtx(["powershell.exe"]))).toBe(true);
+    expect(windowsDriver.canHandle(makeCtx(["powershell.exe", "cmd.exe"]))).toBe(true);
+    expect(windowsDriver.canHandle(makeCtx(["wt.exe", "powershell.exe", "cmd.exe"]))).toBe(true);
+
+    // NEGATIVE cases: powershell.exe missing — no sub-driver selectable.
+    expect(windowsDriver.canHandle(makeCtx([]))).toBe(false);
+    expect(windowsDriver.canHandle(makeCtx(["wt.exe"]))).toBe(false);
     expect(windowsDriver.canHandle(makeCtx(["cmd.exe"]))).toBe(false);
-    // With wt + cmd (no powershell), wt is picked (cmd skipped per R1 gate).
-    const wtAndCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "cmd.exe"]));
-    expect(wtAndCmd.driverName).toBe("wt");
-    // With powershell + cmd (no wt), powershell is picked.
+    // R1 self-contradiction case: pre-R2 this returned `wt` (selecting a
+    // sub-driver that can't run because its inner powershell shell would
+    // immediately fail). R2 returns false — clean error path; daemon-side
+    // R2/R3 stdio fallback authenticates first MCP call regardless.
+    expect(windowsDriver.canHandle(makeCtx(["wt.exe", "cmd.exe"]))).toBe(false);
+
+    // Selection priority when powershell.exe is present + multiple sub-drivers.
     const psAndCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe", "cmd.exe"]));
     expect(psAndCmd.driverName).toBe("powershell");
-    // All three present → wt wins (head of fallback list).
     const allThree = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "powershell.exe", "cmd.exe"]));
     expect(allThree.driverName).toBe("wt");
   });
@@ -197,7 +217,7 @@ describe("windows driver — fallback chain", () => {
   });
 
   it("normalizes forward-slash CWD to backslashes on Windows", () => {
-    const ctx = makeCtx(["wt.exe"]);
+    const ctx = makeCtx(["wt.exe", "powershell.exe"]);
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:/work/project" }), ctx);
     // The cwd passed into the wt.exe -d arg should be backslash-normalized.
     // v2.6.2: also appears inside the powershell -Command Set-Location.
@@ -225,7 +245,7 @@ describe("v2.6.2 — Windows FIX 1 vault prelude (cross-platform parity)", () =>
   ];
 
   it("wt.exe sub-driver embeds the vault prelude inside the powershell -Command inner", () => {
-    const ctx = makeCtx(["wt.exe"]);
+    const ctx = makeCtx(["wt.exe", "powershell.exe"]);
     const cmd = windowsDriver.buildCommand(baseInput({ name: "victra-build", cwd: "C:\\work" }), ctx);
     const inner = cmd.args[5]; // index 5 is the powershell -Command argument
     expect(inner).toBeDefined();
@@ -288,7 +308,7 @@ describe("v2.6.2 — Windows FIX 1 vault prelude (cross-platform parity)", () =>
     // Single source of truth — drift between sub-drivers re-creates the
     // v2.4.5 R2 split-brain class of bug at the spawn layer. This test
     // asserts the prelude byte-pattern is identical across wt / ps / cmd.
-    const wt = windowsDriver.buildCommand(baseInput({ name: "shared", cwd: "C:\\x" }), makeCtx(["wt.exe"]));
+    const wt = windowsDriver.buildCommand(baseInput({ name: "shared", cwd: "C:\\x" }), makeCtx(["wt.exe", "powershell.exe"]));
     const ps = windowsDriver.buildCommand(baseInput({ name: "shared", cwd: "C:\\x" }), makeCtx(["powershell.exe"]));
     // v2.6.2 R1: cmd requires powershell — use override to force cmd path.
     const cmd = windowsDriver.buildCommand(baseInput({ name: "shared", cwd: "C:\\x" }), makeCtx(["cmd.exe", "powershell.exe"], "cmd"));
@@ -572,7 +592,7 @@ describe("adversarial payloads — Windows driver parity (v1.9.1 Blocker 1)", ()
   // assertions focus on cmd.exe / powershell / wt argv-separation.
 
   it("(argv-separation) wt.exe receives cwd as its own argv element, not concatenated (v2.6.2 inner = powershell)", () => {
-    const ctx = makeCtx(["wt.exe"]);
+    const ctx = makeCtx(["wt.exe", "powershell.exe"]);
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx);
     // v2.6.2: ["-d", "C:\\work", "powershell.exe", "-NoExit", "-Command", inner]
     // (was ["-d", cwd, "claude"] in v2.6.1 and earlier — narrowed to wrap an
@@ -647,7 +667,7 @@ describe("adversarial payloads — Windows driver parity (v1.9.1 Blocker 1)", ()
   });
 
   it("(normalize) forward-slash cwd → backslash, even with mixed separators", () => {
-    const ctx = makeCtx(["wt.exe"]);
+    const ctx = makeCtx(["wt.exe", "powershell.exe"]);
     const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:/a\\b/c" }), ctx);
     expect(cmd.args).toContain("C:\\a\\b\\c");
   });
@@ -785,7 +805,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
     const briefPath = "/tmp/relay-brief-test.md";
 
     it("(wt) brief_file_path → kickstart embedded as PS single-quoted arg inside the powershell -Command (v2.6.2)", () => {
-      const ctx = makeCtx(["wt.exe"]);
+      const ctx = makeCtx(["wt.exe", "powershell.exe"]);
       const cmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), ctx, briefPath);
       // v2.6.2: ["-d", cwd, "powershell.exe", "-NoExit", "-Command", inner]
       // where inner contains `claude '<kickstart>'`. Pre-v2.6.2 the kickstart
@@ -824,7 +844,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
 
     it("brief_file_path + RELAY_SPAWN_NO_KICKSTART=1 → no kickstart on any sub-driver (v2.6.2 inner shapes)", () => {
       process.env.RELAY_SPAWN_NO_KICKSTART = "1";
-      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]), briefPath);
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "powershell.exe"]), briefPath);
       // v2.6.2 wt: ["-d", cwd, "powershell.exe", "-NoExit", "-Command", inner].
       expect(wtCmd.args.slice(0, 5)).toEqual(["-d", "C:\\work", "powershell.exe", "-NoExit", "-Command"]);
       expect(wtCmd.args[5]).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude$/);
@@ -842,7 +862,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
 
     it("brief_file_path + RELAY_SPAWN_KICKSTART=custom → custom verbatim, brief-pointer NOT appended (v2.6.2)", () => {
       process.env.RELAY_SPAWN_KICKSTART = "custom-windows-prompt";
-      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]), briefPath);
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "powershell.exe"]), briefPath);
       expect(wtCmd.args[5]).toContain("claude 'custom-windows-prompt'");
       expect(wtCmd.args.join(" ")).not.toContain(BRIEF_POINTER_PHRASE);
       const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]), briefPath);
@@ -851,7 +871,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
     });
 
     it("NO brief_file_path → behavior unchanged across all sub-drivers (v2.6.2 shapes)", () => {
-      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe"]));
+      const wtCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["wt.exe", "powershell.exe"]));
       expect(wtCmd.args.slice(0, 5)).toEqual(["-d", "C:\\work", "powershell.exe", "-NoExit", "-Command"]);
       expect(wtCmd.args[5]).toMatch(/Set-Location -LiteralPath 'C:\\work'; claude$/);
       const psCmd = windowsDriver.buildCommand(baseInput({ cwd: "C:\\work" }), makeCtx(["powershell.exe"]));

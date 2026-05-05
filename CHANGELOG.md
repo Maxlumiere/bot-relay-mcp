@@ -49,6 +49,26 @@ One new gate step (R1 add): **npm pack contents check** — `scripts/pre-publish
 - Bulk operations (`relay rotate-all-tokens`, `relay list-stale-tokens`, `relay agents --filter ...`) — queued as v2.7.
 - Cross-machine identity, namespace prefixing, hardware-backed token storage, GUI mint flow — Tether Cloud / Pro territory per `project_tether_product_strategy.md`.
 
+### v2.6.2 R2 — codex PATCH-THEN-SHIP (universal powershell.exe gate, generalize R1)
+
+R1 verdict: PATCH-THEN-SHIP (codex msg `1dd82c7b`). R1 gated `cmd.exe` on `powershell.exe` presence — but wt.exe ALSO routes through `powershell.exe -NoExit -Command "..."` (v2.6.2 wrapped the inner shell to give the prelude a script context). Codex caught the same self-contradiction one sub-driver up: selecting wt without powershell creates a terminal that opens and immediately fails. Same bug class, second instance.
+
+R2 generalizes: ALL three Windows sub-drivers require `powershell.exe`. Single universal gate.
+
+- **`src/spawn/drivers/windows.ts:isAvailable`** — replaced the cmd-specific gate with a universal one. Verbatim:
+  ```typescript
+  function isAvailable(ctx: DriverContext, sub: WindowsSubDriver): boolean {
+    // Universal: every sub-driver delegates the vault prelude to powershell.
+    if (!ctx.hasBinary("powershell.exe")) return false;
+    return ctx.hasBinary(BINARY_FOR[sub]);
+  }
+  ```
+  JSDoc cites both codex msgs (`f242914a` cmd gap → `1dd82c7b` wt gap → R2 generalization). The auto-fallback chain effective shape: wt|powershell|cmd, all predicated on powershell.exe.
+- **`tests/spawn-drivers.test.ts`** — R1 auto-fallback chain test reshaped + 1 NEW wt-without-powershell rejection test mirroring R1's cmd pattern. The new chain test enumerates 4 positive cases (powershell present + each combo) + 4 negative cases (powershell missing). Other 9 wt-only test contexts updated to include powershell.exe (legitimate wt-with-powershell case). 74 → 75 spawn-drivers tests.
+- **No functional regression on Windows boxes without powershell.exe** — daemon-side R2/R3 stdio-only fallback in `src/server.ts:resolveToken` still authenticates the agent on first MCP call from the per-instance vault. Operators on those boxes (rare; powershell.exe ships with every Windows since Vista) lose the operator-visible `printenv RELAY_AGENT_TOKEN` UX win, not the auth itself.
+
+Generalization rule (added to discipline list): **when fixing a bug class, scope the fix to ALL similarly-shaped surfaces, not just the one flagged.** Walking the analogous code paths is part of declaring scope complete. R2 codifies this after R1 missed the wt path. (My v2.6.1 R3 work caught this rule for the resolveToken auth-oracle bug class via the parallel `resolveTokenForHealthCheck` instance — but didn't apply it when the v2.6.2 R0 → R1 brief landed. Brief discipline: walk every similarly-shaped surface BEFORE writing the fix.)
+
 ### v2.6.2 R1 — codex PATCH-THEN-SHIP (Windows cmd.exe contract + revoke_token vault scrub)
 
 R0 verdict: PATCH-THEN-SHIP (codex msg `f242914a`). Two small fixes — one codex P2 contract gap, one Maxime ergonomic call.
