@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.6.0 — Unreleased — `relay mint-token` CLI + external-CLI setup docs
+## v2.6.0 — 2026-05-05 — `relay mint-token` CLI + spawn-flow self-bootstrap + cross-platform parity
 
 Adds an operator-side credential issuance path for external CLI agents whose safety monitors block the `register_agent` → use-returned-token sequence in a single response (Codex 5.5 was the canonical case as of 2026-04-27; per `memory/feedback_codex_5_5_safety_blocks_register.md`). Pure-additive — zero behavior change for existing users; existing `register_agent` flow is unchanged.
 
