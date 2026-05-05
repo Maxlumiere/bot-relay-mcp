@@ -86,11 +86,12 @@ It is NOT designed to be safe against:
 
 Every agent registered via `register_agent` receives a 32-byte base64url token shown ONCE in the response. The relay stores only a bcrypt hash (`agents.token_hash`) — the plaintext is discarded after the response is written.
 
-Subsequent tool calls must present the token via one of three channels (in precedence order):
+Subsequent tool calls must present the token via one of four channels (in precedence order):
 
 1. `agent_token` argument in the tool input.
 2. `X-Agent-Token` HTTP header.
 3. `RELAY_AGENT_TOKEN` environment variable (stdio flow).
+4. **(stdio transport only)** per-instance file vault at `<instanceDir>/agents/<RELAY_AGENT_NAME>.token`, read via `defaultTokenStore().readSync()` (v2.6.1 R2). Gated on `currentContext().transport === "stdio"` and on `process.env.RELAY_AGENT_NAME` being set; `args.agent_name` is **not** honored for vault lookup. HTTP clients never read the vault — see `docs/agents/local-identity.md` for the threat model. R1 honored args.agent_name here and was rejected on review (auth-oracle risk over the network); R2 closed the gap.
 
 A capability list is set at first registration and is **immutable** (v1.7.1 rule). Changing capabilities requires `unregister_agent` + fresh `register_agent`.
 

@@ -213,19 +213,40 @@ write_relay_token_to_vault '${name}' '${token}'
     expect(r.stderr).toMatch(/invalid agent name/);
   });
 
-  it("(14b) all 3 hooks + migration script source the same helper file", () => {
+  it("(14b) all 3 hooks + migration script source the same helper file AND do not redefine its functions", () => {
     // Drift guard: every hook script + migration script must `source` the
     // helper. Inline copies would silently drift and recreate the v2.4.5
     // R2 split-brain class of bug.
+    //
+    // v2.6.1 R2 strengthening (codex P2): the previous test only asserted
+    // that consumers REFERENCE _vault-helpers.sh. A consumer could source
+    // the helper AND ALSO define its own copy of `read_relay_token_from_vault`
+    // (or any of the four helpers) inline, and the test would still pass —
+    // recreating the split-brain risk one inline override at a time. The
+    // body search below rejects any consumer-side function definition for
+    // the four helper functions; only `hooks/_vault-helpers.sh` may define
+    // them.
     const consumers = [
       "hooks/check-relay.sh",
       "hooks/post-tool-use-check.sh",
       "hooks/stop-check.sh",
       "scripts/migrate-existing-tokens-to-vault.sh",
     ];
+    const FORBIDDEN_DEFS = [
+      /^resolve_relay_db_path\s*\(\s*\)/m,
+      /^resolve_relay_token_path\s*\(\s*\)/m,
+      /^read_relay_token_from_vault\s*\(\s*\)/m,
+      /^write_relay_token_to_vault\s*\(\s*\)/m,
+    ];
     for (const c of consumers) {
       const body = fs.readFileSync(path.join(REPO_ROOT, c), "utf-8");
       expect(body).toMatch(/_vault-helpers\.sh/);
+      for (const re of FORBIDDEN_DEFS) {
+        expect(
+          body,
+          `${c} re-defines a vault helper function inline — must source hooks/_vault-helpers.sh and NOT shadow it. Pattern matched: ${re}`,
+        ).not.toMatch(re);
+      }
     }
     // And the helper itself must define every function the consumers expect.
     const helper = fs.readFileSync(HELPER, "utf-8");
@@ -332,18 +353,217 @@ describe("v2.6.1 R1 — FIX 1 launching-shell vault prelude (macOS spawn-agent.s
   );
 });
 
-// --- FIX 2 daemon-side: resolveToken falls back to vault when env is empty ---
-describe("v2.6.1 R1 — FIX 2 daemon resolveToken vault fallback", () => {
-  it("(17) HTTP daemon authenticates a get_messages call with no env / no header / no args.agent_token, using vault read", async () => {
-    // Spawn an isolated HTTP daemon with its own DB + RELAY_HOME. Then
-    // register an agent (which mints a token), write that token to the
-    // vault file at the expected path, and make a follow-up get_messages
-    // call WITHOUT providing the token through any of the three explicit
-    // channels (args.agent_token / X-Agent-Token / RELAY_AGENT_TOKEN env).
-    // resolveToken's vault fallback (FIX 2) must look up the agent name
-    // from args.agent_name + read the vault file + match.
-    const PORT = 39411;
-    const ROOT = path.join(os.tmpdir(), "v2-6-1-fix2-" + process.pid);
+// --- FIX 2 v2 daemon-side: vault fallback is STDIO-ONLY, never HTTP ---
+//
+// v2.6.1 R2 background: codex caught (msg d1fbbdde, 2026-05-05) that the R1
+// implementation let HTTP callers reach the vault by passing args.agent_name
+// — turning the local file vault into a network-reachable auth oracle. R2
+// gates the fallback on `currentContext().transport === "stdio"` and drops
+// the args.agent_name path entirely. These two tests pin both halves of the
+// security boundary: stdio path WORKS (positive), HTTP path REFUSES (negative).
+describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)", () => {
+  it("(17) stdio MCP server authenticates from vault when env/args/header all empty (RELAY_AGENT_NAME set at fork)", async () => {
+    // Strategy: spawn an HTTP daemon transiently to register the agent + capture
+    // a real token (mints `agents.token_hash`), kill it, write the token to the
+    // vault file, then spawn a real stdio MCP subprocess pointed at the SAME DB
+    // with RELAY_AGENT_NAME set + RELAY_AGENT_TOKEN explicitly empty. Drive the
+    // subprocess via stdin/stdout JSON-RPC (newline-delimited, per MCP spec).
+    // resolveToken's stdio-gated vault fallback must consult the file and auth
+    // the get_messages call from the disk token alone.
+    const PORT = 39413;
+    const ROOT = path.join(os.tmpdir(), "v2-6-1-r2-test17-" + process.pid);
+    if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
+    fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+    const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
+    expect(fs.existsSync(DIST_INDEX)).toBe(true);
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { spawn } = require("child_process") as typeof import("child_process");
+
+    // Phase 1 — HTTP daemon: register the agent, capture its real token.
+    const httpChild = spawn("node", [DIST_INDEX], {
+      env: {
+        ...process.env,
+        RELAY_TRANSPORT: "http",
+        RELAY_HTTP_PORT: String(PORT),
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HOME: ROOT,
+        RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+        RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
+        RELAY_AGENT_TOKEN: "",
+        RELAY_AGENT_NAME: "",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let TOKEN: string;
+    try {
+      const start = Date.now();
+      while (Date.now() - start < 5000) {
+        try {
+          const r = await fetch(`http://127.0.0.1:${PORT}/health`);
+          if (r.ok) break;
+        } catch {
+          /* not up yet */
+        }
+        await new Promise((res) => setTimeout(res, 100));
+      }
+      const regBody = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "register_agent",
+          arguments: { name: "stdio-vault-agent", role: "tester", capabilities: [] },
+        },
+      };
+      const resp = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify(regBody),
+      });
+      const text = await resp.text();
+      const dataLine = text.split("\n").map((l) => l.trim()).find((l) => l.startsWith("data:"));
+      const payload = dataLine ? dataLine.slice(5).trim() : text.trim();
+      const rpc = JSON.parse(payload);
+      const inner = JSON.parse(rpc.result.content[0].text);
+      expect(inner.success).toBe(true);
+      TOKEN = inner.agent_token;
+      expect(TOKEN).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
+    } finally {
+      httpChild.kill("SIGTERM");
+      await new Promise((res) => setTimeout(res, 200));
+      try { httpChild.kill("SIGKILL"); } catch { /* already dead */ }
+    }
+
+    // Brief settle so the HTTP daemon fully releases the DB before the stdio
+    // child opens it. better-sqlite3 in WAL mode releases on process exit.
+    await new Promise((res) => setTimeout(res, 200));
+
+    // Phase 2 — write the vault file the stdio resolveToken will consult.
+    const VAULT_FILE = path.join(ROOT, "agents", "stdio-vault-agent.token");
+    fs.mkdirSync(path.dirname(VAULT_FILE), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(VAULT_FILE, TOKEN + "\n", { mode: 0o600 });
+
+    // Phase 3 — stdio MCP subprocess. Same DB. RELAY_AGENT_NAME set;
+    // RELAY_AGENT_TOKEN is explicitly empty so the env precedence step
+    // returns null and the vault fallback runs.
+    const stdioChild = spawn("node", [DIST_INDEX], {
+      env: {
+        ...process.env,
+        RELAY_TRANSPORT: "stdio",
+        RELAY_HOME: ROOT,
+        RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+        RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
+        RELAY_AGENT_NAME: "stdio-vault-agent",
+        RELAY_AGENT_TOKEN: "",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    try {
+      // Buffer stdout, parse newline-delimited JSON-RPC messages.
+      let outBuf = "";
+      const responses: any[] = [];
+      stdioChild.stdout!.on("data", (chunk: Buffer) => {
+        outBuf += chunk.toString("utf-8");
+        let idx;
+        while ((idx = outBuf.indexOf("\n")) !== -1) {
+          const line = outBuf.slice(0, idx).trim();
+          outBuf = outBuf.slice(idx + 1);
+          if (line) {
+            try {
+              responses.push(JSON.parse(line));
+            } catch {
+              /* not JSON-RPC, ignore */
+            }
+          }
+        }
+      });
+
+      async function awaitId(id: number, timeoutMs: number): Promise<any> {
+        const t0 = Date.now();
+        while (Date.now() - t0 < timeoutMs) {
+          const r = responses.find((x) => x.id === id);
+          if (r) return r;
+          await new Promise((res) => setTimeout(res, 50));
+        }
+        throw new Error(
+          `timeout waiting for JSON-RPC id ${id}; responses so far: ${JSON.stringify(responses)}`
+        );
+      }
+
+      // MCP handshake: initialize → notifications/initialized → tools/call.
+      stdioChild.stdin!.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "v2-6-1-r2-test", version: "0" },
+          },
+        }) + "\n"
+      );
+      await awaitId(1, 5000);
+
+      stdioChild.stdin!.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "notifications/initialized",
+          params: {},
+        }) + "\n"
+      );
+
+      // The actual auth probe: get_messages with NO agent_token in args,
+      // NO X-Agent-Token (stdio has no headers), NO RELAY_AGENT_TOKEN env.
+      // resolveToken must fall through stdio gate → readSync vault → match.
+      stdioChild.stdin!.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "get_messages",
+            arguments: { agent_name: "stdio-vault-agent", status: "pending", limit: 5 },
+          },
+        }) + "\n"
+      );
+
+      const callResp = await awaitId(2, 5000);
+      expect(callResp.result).toBeDefined();
+      const inner = JSON.parse(callResp.result.content[0].text);
+      // Auth succeeded → structured response with messages array.
+      expect(Array.isArray(inner.messages)).toBe(true);
+      expect(inner.count).toBe(0);
+      // Belt-and-suspenders: confirm no auth_error envelope leaked through.
+      expect(inner.auth_error).toBeUndefined();
+    } finally {
+      stdioChild.kill("SIGTERM");
+      await new Promise((res) => setTimeout(res, 200));
+      try { stdioChild.kill("SIGKILL"); } catch { /* already dead */ }
+      fs.rmSync(ROOT, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("(17b) HTTP daemon REFUSES vault fallback even with a valid vault file present (R2 security boundary)", async () => {
+    // The R1 implementation honored args.agent_name in resolveCallerNameForVault
+    // and let an HTTP caller bypass auth by naming any registered agent. Codex
+    // flagged this as an auth oracle (msg d1fbbdde). R2 gates resolveToken on
+    // ctx.transport === "stdio" AND drops the args.agent_name path entirely.
+    //
+    // This test pins the negative case end-to-end: write a valid vault file
+    // for a real agent, then POST get_messages over HTTP with args.agent_name
+    // set + NO TOKEN through any channel. R2 must respond AUTH_FAILED (the
+    // vault is never consulted on the HTTP path). A control call with the
+    // real X-Agent-Token confirms the daemon is healthy and the refusal is
+    // due to the transport gate, not an unrelated bug.
+    const PORT = 39414;
+    const ROOT = path.join(os.tmpdir(), "v2-6-1-r2-test17b-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
     const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
@@ -360,15 +580,12 @@ describe("v2.6.1 R1 — FIX 2 daemon resolveToken vault fallback", () => {
         RELAY_HOME: ROOT,
         RELAY_DB_PATH: path.join(ROOT, "relay.db"),
         RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
-        // Ensure no operator token leaks into the daemon's env — the
-        // whole point is to verify resolveToken falls back to the vault.
         RELAY_AGENT_TOKEN: "",
         RELAY_AGENT_NAME: "",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
     try {
-      // Wait for /health.
       const start = Date.now();
       while (Date.now() - start < 5000) {
         try {
@@ -380,12 +597,12 @@ describe("v2.6.1 R1 — FIX 2 daemon resolveToken vault fallback", () => {
         await new Promise((res) => setTimeout(res, 100));
       }
 
-      async function rpc(args: any, token?: string): Promise<any> {
-        const headers: Record<string, string> = {
+      async function rpc(args: any, headers: Record<string, string> = {}): Promise<any> {
+        const allHeaders: Record<string, string> = {
           "Content-Type": "application/json",
           Accept: "application/json, text/event-stream",
+          ...headers,
         };
-        if (token) headers["X-Agent-Token"] = token;
         const body = {
           jsonrpc: "2.0",
           id: Math.floor(Math.random() * 1e9),
@@ -394,65 +611,57 @@ describe("v2.6.1 R1 — FIX 2 daemon resolveToken vault fallback", () => {
         };
         const resp = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
           method: "POST",
-          headers,
+          headers: allHeaders,
           body: JSON.stringify(body),
         });
         const text = await resp.text();
-        // Parse SSE-framed body or plain JSON.
-        const dataLine = text
-          .split("\n")
-          .map((l) => l.trim())
-          .find((l) => l.startsWith("data:"));
+        const dataLine = text.split("\n").map((l) => l.trim()).find((l) => l.startsWith("data:"));
         const payload = dataLine ? dataLine.slice(5).trim() : text.trim();
         const rpcResp = JSON.parse(payload);
         const inner = rpcResp.result?.content?.[0]?.text;
         return inner ? JSON.parse(inner) : rpcResp;
       }
 
-      // Register an agent — captures a fresh token.
+      // Register the target — populates `agents` row with a real token_hash.
       const reg = await rpc({
         name: "register_agent",
-        arguments: {
-          name: "fix2-agent",
-          role: "tester",
-          capabilities: [],
-        },
+        arguments: { name: "vault-agent", role: "tester", capabilities: [] },
       });
       expect(reg.success).toBe(true);
-      const TOKEN = reg.agent_token;
-      expect(TOKEN).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
+      const REAL_TOKEN = reg.agent_token;
+      expect(REAL_TOKEN).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
 
-      // Write the token to the vault path the daemon will resolve.
-      // Single-instance mode: <ROOT>/agents/<name>.token.
-      const VAULT_FILE = path.join(ROOT, "agents", "fix2-agent.token");
+      // Write the vault file with the REAL token. If R2 didn't gate, this
+      // file would be readable by any HTTP caller naming "vault-agent".
+      const VAULT_FILE = path.join(ROOT, "agents", "vault-agent.token");
       fs.mkdirSync(path.dirname(VAULT_FILE), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(VAULT_FILE, TOKEN + "\n", { mode: 0o600 });
+      fs.writeFileSync(VAULT_FILE, REAL_TOKEN + "\n", { mode: 0o600 });
 
-      // Make get_messages WITHOUT explicit token. Only agent_name in args
-      // — the daemon's resolveToken must fall through to the vault.
-      const got = await rpc({
+      // ATTACK: HTTP caller passes args.agent_name with no token / header / env.
+      // Must AUTH_FAILED — vault is stdio-only; transport gate short-circuits.
+      const attack = await rpc({
         name: "get_messages",
-        arguments: {
-          agent_name: "fix2-agent",
-          status: "pending",
-          limit: 5,
-          // explicitly no agent_token field
-        },
+        arguments: { agent_name: "vault-agent", status: "pending", limit: 5 },
       });
-      // Auth succeeded if we got a structured response with messages
-      // array (count: 0 is fine — agent is fresh). Auth failure would
-      // return an error envelope with auth_error: true.
-      expect(got).toBeDefined();
-      expect(Array.isArray(got.messages)).toBe(true);
-      expect(got.count).toBe(0);
+      expect(attack.auth_error).toBe(true);
+      expect(attack.error_code).toBe("AUTH_FAILED");
+      expect(attack.success).toBe(false);
+
+      // CONTROL: same call with the real X-Agent-Token succeeds — confirms the
+      // refusal above is due to the R2 transport gate, not an unrelated bug.
+      const ok = await rpc(
+        {
+          name: "get_messages",
+          arguments: { agent_name: "vault-agent", status: "pending", limit: 5 },
+        },
+        { "X-Agent-Token": REAL_TOKEN }
+      );
+      expect(Array.isArray(ok.messages)).toBe(true);
+      expect(ok.auth_error).toBeUndefined();
     } finally {
       child.kill("SIGTERM");
       await new Promise((res) => setTimeout(res, 200));
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* already dead */
-      }
+      try { child.kill("SIGKILL"); } catch { /* already dead */ }
       fs.rmSync(ROOT, { recursive: true, force: true });
     }
   }, 15_000);

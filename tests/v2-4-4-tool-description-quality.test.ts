@@ -218,7 +218,7 @@ describe("v2.4.4 — tool description quality", () => {
       send_message: "b29d2537a0e3226b08965410b461e1fe7011f0eaecd7762f71cc6fb1beaa3849",
       set_dashboard_theme: "bc6b17d24b74b289c25f6f327046298d25c035f28a3830449848283631034ed8",
       set_status: "62feb957849a1b52dfa7d1b4f6619c49554e59161b8bddbc3db1d1221e73d4d1",
-      spawn_agent: "3bc513fabbf2fb4f0298ffa60eee7e122dd4b78c238dee03d74d9bad25a5a001",
+      spawn_agent: "836def680d08f815df0b513f36f77471d3dc3dcdd8a40a15481448c64ca935a2",
       unregister_agent: "dcd94807ba629527459cb0df2b5d73427d0b09bea7f756a47700e000685736ee",
       update_task: "05aacb80e85bf615a033a7611bb58d673dbb7bd86e5e33f846243f323cd02931",
     };
