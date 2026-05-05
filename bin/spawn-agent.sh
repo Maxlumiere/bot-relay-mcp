@@ -45,19 +45,21 @@ NAME="${1:-}"
 ROLE="${2:-}"
 CAPS="${3:-}"
 CWD="${4:-$HOME}"
-# v2.1 Phase 4j: optional parent-issued agent token. When present, the script
-# exports it into the child terminal's shell so the spawned agent starts
-# authenticated — no operator paste required. Shape-validated below.
-TOKEN="${5:-}"
 # v2.1.4 (I10): optional absolute path to a durable task-brief file. When
 # present, the default KICKSTART prompt appends a sentence pointing the
 # spawned agent at this file as the canonical source for its task scope.
 # Ignored when RELAY_SPAWN_KICKSTART is overridden or RELAY_SPAWN_NO_KICKSTART=1
 # (operator's explicit intent wins). Validated below.
-BRIEF_PATH="${6:-}"
+# v2.6.1: BRIEF_PATH moved from positional 6 to positional 5. The pre-v2.6.1
+# 5th positional (TOKEN) was removed when the env-var token-passthrough
+# contract was deprecated in favor of the per-instance file vault. The
+# spawned terminal's SessionStart hook now resolves identity from the
+# vault at <instanceDir>/agents/<name>.token (written by handleSpawnAgent
+# pre-spawn or by the hook itself on first-spawn miss).
+BRIEF_PATH="${5:-}"
 
 if [ -z "$NAME" ] || [ -z "$ROLE" ]; then
-  echo "Usage: $0 <name> <role> [capabilities] [cwd] [token] [brief_file_path]" >&2
+  echo "Usage: $0 <name> <role> [capabilities] [cwd] [brief_file_path]" >&2
   exit 1
 fi
 
@@ -92,18 +94,10 @@ validate_token "$ROLE" "role" '^[A-Za-z0-9_.-]+$' 64
 if [ -n "$CAPS" ]; then
   validate_token "$CAPS" "capabilities" '^[A-Za-z0-9_.,-]+$' 256
 fi
-# v2.1 Phase 4j: token shape allowlist mirrors hooks/post-tool-use-check.sh +
-# src/spawn/validation.ts isValidTokenShape. Same pattern in three places is
-# deliberate defense-in-depth — any one of them could drift, but an invalid
-# token reaching the exported CMD would embed in an AppleScript string and
-# could smuggle characters past applescript_escape on future refactors.
-if [ -n "$TOKEN" ]; then
-  validate_token "$TOKEN" "token" '^[A-Za-z0-9_=.-]+$' 128
-  if [ "${#TOKEN}" -lt 8 ]; then
-    echo "[spawn-agent] token is too short (min 8 chars)" >&2
-    exit 2
-  fi
-fi
+# v2.6.1: TOKEN positional argument removed. Identity now flows via the
+# per-instance file vault. The hook (hooks/check-relay.sh) writes the vault
+# file on first registration and reads it on subsequent spawns; spawn-agent.sh
+# no longer touches credentials.
 
 # v2.1.4 (I10): brief_file_path validation. Allowlist mirrors CWD (absolute
 # POSIX path, no metachars, no control chars). File must exist + be readable
@@ -210,11 +204,31 @@ CMD="export RELAY_AGENT_NAME=$Q_NAME; export RELAY_AGENT_ROLE=$Q_ROLE; export RE
 # title_ref to find + raise this window. Defaults to $DISPLAY_NAME (same
 # string claude --name uses for the tab title) so the DB value matches the
 # live window title without extra operator config.
-# v2.1 Phase 4j: when a token is provided, export it into the child's shell
-# so the spawned agent is authenticated from its first tool call.
-if [ -n "$TOKEN" ]; then
-  Q_TOKEN=$(printf '%q' "$TOKEN")
-  CMD="$CMD export RELAY_AGENT_TOKEN=$Q_TOKEN;"
+#
+# v2.6.1 R1 — vault hydration in the LAUNCHING SHELL, before `claude` is
+# exec'd. Codex's R1 catch: the SessionStart hook's `export RELAY_AGENT_TOKEN`
+# only mutates the hook subprocess; already-running claude (and its stdio
+# MCP server forked from this shell) cannot inherit env post-fork. So the
+# token must be set in *this* shell so claude inherits it on fork.
+#
+# Pre-resolve the vault path on the parent side via the shared bash helper
+# (single source of truth with hooks/_vault-helpers.sh). Embed a literal
+# absolute path into CMD — no path-resolution logic in the CMD string —
+# then use `cat | tr | grep` to read + shape-validate at runtime.
+SPAWN_HELPERS_DIR="$(cd "$(dirname "$0")/../hooks" && pwd 2>/dev/null)"
+if [ -n "$SPAWN_HELPERS_DIR" ] && [ -f "$SPAWN_HELPERS_DIR/_vault-helpers.sh" ]; then
+  # shellcheck source=../hooks/_vault-helpers.sh
+  . "$SPAWN_HELPERS_DIR/_vault-helpers.sh"
+  if VAULT_PATH=$(resolve_relay_token_path "$NAME" 2>/dev/null); then
+    Q_VAULT=$(printf '%q' "$VAULT_PATH")
+    # The child shell evaluates this snippet:
+    #   if RELAY_AGENT_TOKEN is empty AND vault file exists,
+    #   read first line, strip whitespace, shape-validate, export.
+    # `\$T`, `\${RELAY_AGENT_TOKEN:-}`, and `\$` inside the regex are
+    # deferred to runtime in the child shell (escaped from THIS shell's
+    # double-quoted string assembly).
+    CMD="$CMD if [ -z \"\${RELAY_AGENT_TOKEN:-}\" ] && [ -f $Q_VAULT ]; then T=\$(head -n 1 $Q_VAULT 2>/dev/null | tr -d '[:space:]'); if printf '%s' \"\$T\" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}\$'; then export RELAY_AGENT_TOKEN=\"\$T\"; fi; fi;"
+  fi
 fi
 # v2.1.2 fix (2026-04-20): append a kickstart prompt so the spawned agent
 # auto-generates instead of idling at the `>` prompt. Claude Code treats the

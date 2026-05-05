@@ -22,6 +22,7 @@
  * the Linux driver — command-line construction is done in JS array form,
  * so there is no shell interpolation of the agent identity.
  */
+import path from "path";
 import type { SpawnAgentInput } from "../../types.js";
 import type { SpawnCommand, SpawnDriver, DriverContext } from "../types.js";
 import {
@@ -31,6 +32,7 @@ import {
   tmuxSessionSuffix,
 } from "../validation.js";
 import { log } from "../../logger.js";
+import { resolveInstanceDbPath } from "../../instance.js";
 
 const LINUX_SUB_DRIVERS = ["gnome-terminal", "konsole", "xterm", "tmux"] as const;
 type LinuxSubDriver = (typeof LINUX_SUB_DRIVERS)[number];
@@ -99,13 +101,50 @@ function buildKickstart(
  * v2.1.5: optional kickstart prompt is appended as a single-quoted positional
  * arg to `claude`, matching the bash script's `claude ... $Q_KICKSTART` form.
  */
-function buildLaunchCommand(cwd: string, kickstart: string | null): string {
+function buildLaunchCommand(cwd: string, kickstart: string | null, agentName?: string): string {
   const safeCwd = escapeSingleQuotesPosix(cwd);
-  if (!kickstart) {
-    return `cd '${safeCwd}' && exec claude`;
+  // v2.6.1 R1 — vault prelude: read RELAY_AGENT_TOKEN from the per-instance
+  // file vault into the LAUNCHING shell's env BEFORE `exec claude`. Codex
+  // R1 catch: stdio MCP server forks with whatever env this shell has at
+  // exec time, so the token must be set here, not later. Prelude is a
+  // best-effort no-op when the agent name doesn't validate or the vault
+  // file doesn't exist — the daemon's resolveToken vault fallback (FIX 2)
+  // handles every failure mode. Agent name pre-validated upstream by Zod.
+  const prelude = agentName ? buildVaultPrelude(agentName) : "";
+  const tail = kickstart
+    ? `cd '${safeCwd}' && exec claude '${escapeSingleQuotesPosix(kickstart)}'`
+    : `cd '${safeCwd}' && exec claude`;
+  return prelude ? `${prelude} ${tail}` : tail;
+}
+
+/**
+ * v2.6.1 R1 — produce a single-line bash snippet that hydrates
+ * `RELAY_AGENT_TOKEN` from the per-instance file vault when the env-supplied
+ * value is empty. Pre-resolves the absolute vault path on the parent side
+ * (no path-resolution logic in the launched shell — just a literal cat).
+ *
+ * Snippet (pseudo, before single-quote escaping):
+ *   if [ -z "${RELAY_AGENT_TOKEN:-}" ] && [ -f '<vault-path>' ]; then
+ *     T=$(head -n 1 '<vault-path>' 2>/dev/null | tr -d '[:space:]');
+ *     if printf '%s' "$T" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}$'; then
+ *       export RELAY_AGENT_TOKEN="$T";
+ *     fi
+ *   fi;
+ *
+ * Vault path resolution: dirname(resolveInstanceDbPath()) + agents/<name>.token.
+ * Mirrors src/token-store.ts:resolveAgentVaultDir + FileTokenStore.pathFor.
+ */
+function buildVaultPrelude(agentName: string): string {
+  // Validate against the same allowlist FileTokenStore.pathFor uses.
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(agentName)) return "";
+  let vaultPath: string;
+  try {
+    vaultPath = path.join(path.dirname(resolveInstanceDbPath()), "agents", `${agentName}.token`);
+  } catch {
+    return "";
   }
-  const safeKickstart = escapeSingleQuotesPosix(kickstart);
-  return `cd '${safeCwd}' && exec claude '${safeKickstart}'`;
+  const safeVault = escapeSingleQuotesPosix(vaultPath);
+  return `if [ -z "\${RELAY_AGENT_TOKEN:-}" ] && [ -f '${safeVault}' ]; then T=$(head -n 1 '${safeVault}' 2>/dev/null | tr -d '[:space:]'); if printf '%s' "$T" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}$'; then export RELAY_AGENT_TOKEN="$T"; fi; fi;`;
 }
 
 export const linuxDriver: SpawnDriver = {
@@ -119,7 +158,6 @@ export const linuxDriver: SpawnDriver = {
   buildCommand(
     input: SpawnAgentInput,
     ctx: DriverContext,
-    token?: string,
     briefFilePath?: string
   ): SpawnCommand {
     // v2.1.5 (I10 cross-platform completion): when briefFilePath is provided,
@@ -137,12 +175,11 @@ export const linuxDriver: SpawnDriver = {
 
     const cwd = normalizeCwd(input.cwd || process.env.HOME || "/", "linux");
     const kickstart = buildKickstart(briefFilePath, process.env);
-    const launch = buildLaunchCommand(cwd, kickstart);
-    // v2.1 Phase 4j: token flows into the child via process env — Linux
-    // terminals (gnome-terminal, konsole, xterm, tmux) spawn bash as a child
-    // process whose inherited env comes straight from child_process.spawn's
-    // env field, so adding RELAY_AGENT_TOKEN here reaches the target claude.
-    const env = buildChildEnv(input.name, input.role, input.capabilities, "linux", process.env, token);
+    const launch = buildLaunchCommand(cwd, kickstart, input.name);
+    // v2.6.1: token no longer flows via env. The hook resolves identity from
+    // the per-instance file vault written by handleSpawnAgent before driver
+    // dispatch. Closes the spawn-without-pre-mint failure mode.
+    const env = buildChildEnv(input.name, input.role, input.capabilities, "linux", process.env);
 
     let exec: string;
     let args: string[];

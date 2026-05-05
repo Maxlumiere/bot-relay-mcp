@@ -45,60 +45,14 @@ AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
 # registrations). Empty → register_agent omits the field and the agent's
 # focus button stays disabled in the UI per the graceful-degrade contract.
 RELAY_TERMINAL_TITLE_VALUE="${RELAY_TERMINAL_TITLE:-}"
-# v2.4.5 R1 — bash mirror of src/instance.ts:resolveInstanceDbPath. Closes the
-# split-brain that bit Codex 5.5 during v2.4.4 R2 (HTTP daemon resolved per-
-# instance correctly; this hook hardcoded legacy and silently read the wrong
-# DB).
-#
-# This function is BYTE-IDENTICAL across hooks/check-relay.sh,
-# hooks/post-tool-use-check.sh, and hooks/stop-check.sh. The
-# tests/v2-4-5-stdio-per-instance-db.test.ts identity test fails on any
-# divergence — change one, change all three.
-#
-# Mirrors TS semantics:
-#   - botRelayRoot(): RELAY_HOME wins (test seam), else $HOME/.bot-relay
-#                     (src/instance.ts:70).
-#   - resolveActiveInstanceId(): RELAY_INSTANCE_ID > active-instance
-#                                link/file (src/instance.ts:118).
-#   - instanceDir(): malformed instance_id rejects with [A-Za-z0-9._-]+
-#                    allowlist (src/instance.ts:149) — bash mirror emits
-#                    stderr + returns 1 instead of throwing.
-#
-# Output: resolved DB path on stdout. On malformed instance_id, stderr
-# error + return 1 (caller decides how to degrade — silent fallback is
-# the wrong call, an attacker-controlled active-instance file would
-# otherwise mask the operator's actual setup).
-resolve_relay_db_path() {
-  if [ -n "${RELAY_DB_PATH:-}" ]; then
-    echo "$RELAY_DB_PATH"
-    return 0
-  fi
-  local root="${RELAY_HOME:-$HOME/.bot-relay}"
-  local id=""
-  if [ -n "${RELAY_INSTANCE_ID:-}" ]; then
-    id="$RELAY_INSTANCE_ID"
-  elif [ -L "$root/active-instance" ]; then
-    # readlink target may be a bare instance_id or an absolute/relative
-    # path; basename normalizes both shapes (mirrors path.basename in
-    # src/instance.ts:135).
-    id=$(basename "$(readlink "$root/active-instance")")
-  elif [ -f "$root/active-instance" ]; then
-    # File-fallback for platforms where symlink creation is restricted
-    # (Windows non-admin); src/instance.ts:setActiveInstance writes a
-    # regular file in that case.
-    id=$(head -n 1 "$root/active-instance" | tr -d '[:space:]')
-  fi
-  if [ -n "$id" ]; then
-    if ! echo "$id" | grep -qE '^[A-Za-z0-9._-]+$'; then
-      echo "[bot-relay hook] invalid instance_id \"$id\" — must match [A-Za-z0-9._-]+ (mirrors src/instance.ts:instanceDir)" >&2
-      return 1
-    fi
-    echo "$root/instances/$id/relay.db"
-    return 0
-  fi
-  echo "$root/relay.db"
-  return 0
-}
+# v2.6.1 — vault helpers + DB-path resolution sourced from a single file.
+# Mirrors src/instance.ts:resolveInstanceDbPath + src/token-store.ts:
+# resolveAgentVaultDir + FileTokenStore.{pathFor,read,write}. Drift surfaces
+# directly as a test failure in tests/v2-6-1-token-store.test.ts (which
+# sources this same file) — no inline-copy hide-out.
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./_vault-helpers.sh
+. "$HOOKS_DIR/_vault-helpers.sh"
 DB_PATH=$(resolve_relay_db_path) || {
   # Malformed active-instance content — refuse to fall back silently. A
   # broken setup should be loud, not hidden under legacy. The hook's
@@ -109,6 +63,18 @@ DB_PATH=$(resolve_relay_db_path) || {
 }
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
+
+# v2.6.1 — vault-first bootstrap. If RELAY_AGENT_TOKEN is unset in env BUT a
+# vault file exists for this agent name, hydrate the env from disk before any
+# auth-sensitive call below. Closes the spawn-without-pre-mint failure mode
+# (3-min broken state hit 2026-05-04 with gaming-build) and makes restart-of-
+# closed-terminal lossless: identity persists even when the operator did not
+# bake RELAY_AGENT_TOKEN into a shell rc file.
+if [ -z "${RELAY_AGENT_TOKEN:-}" ]; then
+  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
+    export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
+  fi
+fi
 
 # --- Input validation (security hardening) ---
 
@@ -198,11 +164,21 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
     if echo "$RECOVERY_BODY" | grep -q '"recovery_completed":true'; then
       NEW_TOKEN=$(echo "$RECOVERY_BODY" | grep -oE '"agent_token":"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)".*/\1/')
       RECOVERY_COMPLETED=1
-      echo "[relay] Recovery completed for \"$AGENT_NAME\". A fresh agent_token was minted." >&2
-      echo "[relay] The relay cannot mutate your shell env; do this manually before next tool call:" >&2
-      echo "[relay]   unset RELAY_RECOVERY_TOKEN" >&2
-      echo "[relay]   export RELAY_AGENT_TOKEN=${NEW_TOKEN}" >&2
-      echo "[relay] Persist the new token in your shell rc file if this terminal will survive restarts." >&2
+      # v2.6.1 — persist to vault + export inline. Operators no longer need
+      # to manually paste the new token into their shell config; the next
+      # spawn picks it up via FileTokenStore.read.
+      if [ -n "$NEW_TOKEN" ]; then
+        if write_relay_token_to_vault "$AGENT_NAME" "$NEW_TOKEN"; then
+          export RELAY_AGENT_TOKEN="$NEW_TOKEN"
+          echo "[relay] Recovery completed for \"$AGENT_NAME\". Fresh agent_token written to vault and exported." >&2
+          echo "[relay]   You may unset RELAY_RECOVERY_TOKEN now; the new token is persisted at:" >&2
+          if VPATH=$(resolve_relay_token_path "$AGENT_NAME"); then echo "[relay]     $VPATH" >&2; fi
+        else
+          echo "[relay] Recovery completed for \"$AGENT_NAME\" but vault write failed. Set manually:" >&2
+          echo "[relay]   unset RELAY_RECOVERY_TOKEN" >&2
+          echo "[relay]   export RELAY_AGENT_TOKEN=${NEW_TOKEN}" >&2
+        fi
+      fi
     else
       echo "[relay] Recovery attempt failed for \"$AGENT_NAME\". Response: $(echo "$RECOVERY_BODY" | head -c 200)" >&2
       exit 1
@@ -284,6 +260,25 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}}}}" \
     2>&1)
+  # v2.6.1 — capture fresh agent_token from the response body and persist
+  # to the vault. register_agent only returns `agent_token` on first-mint
+  # paths (legacy_bootstrap → active or fresh INSERT); subsequent re-
+  # registers preserve the existing hash and omit the field. So the
+  # presence of `"agent_token":"..."` here means "the daemon just minted a
+  # fresh credential for us, capture it." Closes the v2.1 Phase 4j latent
+  # bug where this token was discarded, leaving the agent registered but
+  # unable to authenticate.
+  REG_TOKEN=$(echo "$REG_BODY" | grep -oE '"agent_token":"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)".*/\1/')
+  if [ -n "$REG_TOKEN" ]; then
+    if write_relay_token_to_vault "$AGENT_NAME" "$REG_TOKEN"; then
+      export RELAY_AGENT_TOKEN="$REG_TOKEN"
+      if [ -n "${RELAY_HOOK_DEBUG:-}" ]; then
+        echo "[bot-relay hook debug] persisted fresh agent_token to vault for \"$AGENT_NAME\"" >&2
+      fi
+    else
+      echo "[relay] Bootstrap failed for $AGENT_NAME — register_agent succeeded but vault write failed. Run \`relay recover $AGENT_NAME\` and re-spawn." >&2
+    fi
+  fi
   # If $RELAY_HOOK_DEBUG is set, print the full response for troubleshooting.
   # Otherwise swallow silently — non-200 means the server refused (stale
   # token, revoked state, etc.), which is fine: the earlier health_check

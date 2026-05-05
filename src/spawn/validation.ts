@@ -225,7 +225,6 @@ export function buildChildEnv(
   capabilities: string[],
   platform: SupportedPlatform,
   parentEnv: NodeJS.ProcessEnv = process.env,
-  token?: string | null,
   /**
    * v2.2.0: window title the child terminal should advertise to the relay on
    * register. Defaults to the agent name when omitted. Flows through the
@@ -268,16 +267,14 @@ export function buildChildEnv(
       ? terminalTitle
       : name;
 
-  // v2.1 Phase 4j: explicit child token override. The parent pre-registered
-  // the child and captured the plaintext token once — propagate it so the
-  // child's first call hits the authenticated path without operator paste.
-  // Drop silently on shape failure (defense-in-depth; an invalid token is
-  // strictly worse than no token because the hook fallback would still issue
-  // its own via legacy-migration, but a malformed string here would leak
-  // through to the child's shell).
-  if (isValidTokenShape(token)) {
-    out.RELAY_AGENT_TOKEN = token;
-  }
+  // v2.6.1: RELAY_AGENT_TOKEN is no longer propagated via env. The spawned
+  // terminal's SessionStart hook resolves identity from the per-instance
+  // file vault at <instanceDir>/agents/<name>.token. Closes the
+  // spawn-without-pre-mint failure mode hit 2026-05-04.
+  // RELAY_AGENT_TOKEN inherited from parentEnv (via the RELAY_* glob above)
+  // is filtered out here so the child does not accidentally inherit the
+  // parent's token.
+  delete out.RELAY_AGENT_TOKEN;
 
   return out;
 }

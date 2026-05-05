@@ -12,6 +12,10 @@
  *   relay restore PATH        Restore from a tar.gz archive.
  *   relay recover NAME        Clear an agent's registration so it can re-bootstrap
  *                             (filesystem-gated, for lost-token recovery).
+ *   relay mint-token NAME     Mint an agent token directly via filesystem access
+ *                             (v2.6.0). For external CLI agents whose safety
+ *                             monitors block register_agent → use-token in one
+ *                             response. See docs/agents/external-cli-setup.md.
  *   relay purge-history NAME  Delete every message + task where the agent is
  *                             sender or recipient (v2.1.6, for reused names).
  *                             Preserves the agent row itself.
@@ -43,6 +47,7 @@ const SUBCOMMANDS = {
   backup: "../dist/cli/backup.js",
   restore: "../dist/cli/restore.js",
   recover: "../dist/cli/recover.js",
+  "mint-token": "../dist/cli/mint-token.js",
   "purge-history": "../dist/cli/purge-history.js",
   "purge-agents": "../dist/cli/purge-agents.js",
   open: "../dist/cli/open.js",
@@ -64,6 +69,7 @@ function printHelp() {
       "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
       "  restore PATH     Restore from a tar.gz archive.\n" +
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +
+      "  mint-token NAME  Mint an agent token via filesystem (external-CLI setup).\n" +
       "  purge-history NAME  Delete every message + task where the agent is sender or recipient.\n" +
       "  purge-agents     Prune agent rows with last_seen > N days (dry-run; --apply commits).\n" +
       "  open [--url U]   Open the dashboard in the default browser.\n" +

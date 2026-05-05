@@ -292,6 +292,22 @@ export async function run(argv: string[]): Promise<number> {
     });
     tx();
 
+    // v2.6.1 — scrub the file-vault entry too. If recover ran while a stale
+    // <instanceDir>/agents/<name>.token sat on disk, the next spawn would
+    // hydrate from the dead file and fail auth on first call. Delete is
+    // best-effort + idempotent: missing file is a clean return.
+    try {
+      const { defaultTokenStore } = await import("../token-store.js");
+      await defaultTokenStore().delete(row.name);
+    } catch (vaultErr) {
+      process.stderr.write(
+        `relay recover: warning — vault delete failed for "${row.name}": ${
+          vaultErr instanceof Error ? vaultErr.message : String(vaultErr)
+        }\n` +
+          `(non-fatal; the next register_agent will overwrite the stale file via the SessionStart hook).\n`
+      );
+    }
+
     process.stdout.write(
       `\nRecovery complete for "${row.name}". To re-register:\n\n` +
         "  1. In the agent's Claude Code terminal (or MCP client), call:\n" +

@@ -19,7 +19,10 @@
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 
-const BCRYPT_ROUNDS = 10;
+// v2.6.0: exported so the CLI mint-token regression test can pin the cost
+// factor without duplicating the constant. Any future bump (e.g. 10 → 12)
+// then has a single source of truth.
+export const BCRYPT_ROUNDS = 10;
 const TOKEN_BYTE_LEN = 32;
 
 /** Generate a cryptographically random agent token (base64url). */

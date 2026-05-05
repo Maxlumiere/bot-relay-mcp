@@ -37,15 +37,20 @@ import { createHash } from "node:crypto";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, "..");
 
-// All three bash hooks ship the same resolve_relay_db_path() function.
-// The identity test pins them byte-identical so a future PR can't fix
-// one and forget the other two.
+// v2.6.1 R1: the three bash hooks SOURCE a single shared helper file at
+// hooks/_vault-helpers.sh. Pre-v2.6.1 R1 each hook carried an inline copy
+// of resolve_relay_db_path() and a byte-identity test pinned them in sync;
+// the inline copies are gone. The single source of truth is
+// hooks/_vault-helpers.sh — the runHookResolver helper now extracts from
+// that file, and the parity tests run the SAME function from the SAME
+// source against each hook's invocation point.
 const HOOK_PATHS = [
   path.join(PROJECT_ROOT, "hooks", "check-relay.sh"),
   path.join(PROJECT_ROOT, "hooks", "post-tool-use-check.sh"),
   path.join(PROJECT_ROOT, "hooks", "stop-check.sh"),
 ];
 const HOOK_LABELS = ["check-relay", "post-tool-use-check", "stop-check"] as const;
+const VAULT_HELPERS_PATH = path.join(PROJECT_ROOT, "hooks", "_vault-helpers.sh");
 
 // Pin RELAY_HOME at module load (instance.ts reads it lazily, but FILE_HOME
 // is a single fixed root for the whole file — per-test we override below).
@@ -62,10 +67,16 @@ const {
 } = await import("../src/instance.js");
 const dbMod = await import("../src/db.js");
 
-function extractResolver(hookPath: string): string {
-  const src = fs.readFileSync(hookPath, "utf8");
+// v2.6.1 R1: extract from the shared helper file, not the hook itself.
+// The hook merely sources hooks/_vault-helpers.sh; the function body lives
+// once in that file. Drift between TS instance.ts and the bash mirror still
+// surfaces as a behavior failure in the parameterized parity tests below.
+function extractResolver(_hookPath?: string): string {
+  const src = fs.readFileSync(VAULT_HELPERS_PATH, "utf8");
   const m = src.match(/^resolve_relay_db_path\(\)\s*\{[\s\S]*?\n\}/m);
-  if (!m) throw new Error(`could not extract resolve_relay_db_path() from ${hookPath}`);
+  if (!m) {
+    throw new Error(`could not extract resolve_relay_db_path() from ${VAULT_HELPERS_PATH}`);
+  }
   return m[0];
 }
 
@@ -106,12 +117,28 @@ function freshHome(subdir = ".bot-relay"): { HOME: string; root: string } {
 }
 
 describe("v2.4.5 — bash hook resolvers mirror src/instance.ts (parameterized over all 3 hooks)", () => {
-  it("(Q-identity) resolve_relay_db_path() is byte-identical across all three hooks", () => {
-    // Drift is the failure mode that produced HIGH 1: R0 fixed two hooks
-    // and missed Stop. Lock the function bodies together so the next PR
-    // physically cannot fix one without the others.
-    const hashes = HOOK_PATHS.map((p) => createHash("sha256").update(extractResolver(p)).digest("hex"));
-    expect(new Set(hashes).size).toBe(1);
+  it("(Q-identity) all three hooks SOURCE the shared helper — no inline copies", () => {
+    // v2.6.1 R1: replaced the byte-identical inline-copy test. Drift was
+    // the failure mode that produced HIGH 1 (R0 fixed two hooks, missed
+    // Stop). v2.6.1 R1 consolidated to a single sourced file at
+    // hooks/_vault-helpers.sh — drift is now physically impossible because
+    // there is exactly one function body for the daemon and all three
+    // hooks to share. Test the discipline that holds the consolidation:
+    // every hook must `source _vault-helpers.sh`, and the helper must
+    // define resolve_relay_db_path.
+    const helperSrc = fs.readFileSync(VAULT_HELPERS_PATH, "utf8");
+    expect(helperSrc).toMatch(/^resolve_relay_db_path\(\)/m);
+    for (const hookPath of HOOK_PATHS) {
+      const hookSrc = fs.readFileSync(hookPath, "utf8");
+      expect(hookSrc).toContain("_vault-helpers.sh");
+      // No hook should still carry an inline copy of the function — drift
+      // canary (would re-introduce the v2.4.5 R2 inline-copy split-brain).
+      expect(hookSrc).not.toMatch(/^resolve_relay_db_path\(\)/m);
+    }
+    // Sanity: extractResolver still returns a single canonical body.
+    const fromHelper = createHash("sha256").update(extractResolver()).digest("hex");
+    expect(typeof fromHelper).toBe("string");
+    expect(fromHelper.length).toBe(64);
   });
 
   for (let i = 0; i < HOOK_PATHS.length; i++) {
