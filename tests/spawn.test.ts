@@ -52,9 +52,9 @@ afterEach(() => cleanup());
 // and the dispatcher returns success=false before the mocked spawn fires.
 // Skip on non-darwin to keep this file as the macOS-integration checkpoint.
 describe.skipIf(os.platform() !== "darwin")("spawn_agent tool", () => {
-  it("returns success and calls the spawn script", () => {
+  it("returns success and calls the spawn script", async () => {
     const result = parseResult(
-      handleSpawnAgent({
+      await handleSpawnAgent({
         name: "new-worker",
         role: "builder",
         capabilities: ["build", "test"],
@@ -67,8 +67,8 @@ describe.skipIf(os.platform() !== "darwin")("spawn_agent tool", () => {
     expect(cp.spawn).toHaveBeenCalledOnce();
   });
 
-  it("passes name, role, caps, cwd to the spawn script", () => {
-    handleSpawnAgent({
+  it("passes name, role, caps, cwd to the spawn script", async () => {
+    await handleSpawnAgent({
       name: "agent-x",
       role: "reviewer",
       capabilities: ["review", "security"],
@@ -80,17 +80,16 @@ describe.skipIf(os.platform() !== "darwin")("spawn_agent tool", () => {
     const args = call[1];
 
     expect(scriptPath).toMatch(/bin\/spawn-agent\.sh$/);
-    // v2.1 Phase 4j: first four args are name/role/caps/cwd; a 5th arg is the
-    // parent-issued token. Token presence + shape asserted separately.
-    expect(args.slice(0, 4)).toEqual(["agent-x", "reviewer", "review,security", "/tmp/project"]);
-    expect(args.length).toBe(5);
-    expect(args[4]).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
+    // v2.6.1: token CLI arg removed. Only name/role/caps/cwd remain (+ brief
+    // when supplied). The parent-issued token now flows through the per-
+    // instance file vault, not the spawn dispatcher.
+    expect(args).toEqual(["agent-x", "reviewer", "review,security", "/tmp/project"]);
   });
 
-  it("queues an initial message when provided", () => {
+  it("queues an initial message when provided", async () => {
     // v2.1 Phase 4j: handleSpawnAgent now pre-registers the agent itself. A
     // prior registerAgent in the test would trigger the name_collision guard.
-    handleSpawnAgent({
+    await handleSpawnAgent({
       name: "new-worker",
       role: "builder",
       capabilities: [],
@@ -103,8 +102,8 @@ describe.skipIf(os.platform() !== "darwin")("spawn_agent tool", () => {
     expect(msgs[0].content).toContain("Welcome!");
   });
 
-  it("does not queue a message when initial_message is omitted", () => {
-    handleSpawnAgent({
+  it("does not queue a message when initial_message is omitted", async () => {
+    await handleSpawnAgent({
       name: "new-worker",
       role: "builder",
       capabilities: [],
@@ -114,8 +113,8 @@ describe.skipIf(os.platform() !== "darwin")("spawn_agent tool", () => {
     expect(msgs.length).toBe(0);
   });
 
-  it("uses HOME as default cwd when not provided", () => {
-    handleSpawnAgent({
+  it("uses HOME as default cwd when not provided", async () => {
+    await handleSpawnAgent({
       name: "homeboy",
       role: "builder",
       capabilities: [],

@@ -341,8 +341,8 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
   it.skipIf(process.platform !== "darwin")("default spawn with valid brief path embeds the pointer sentence in KICKSTART", async () => {
     const brief = writeBrief("ok", "# Task brief\n\nDo the thing.");
     try {
-      // Token is empty (arg 5) — brief_file_path is arg 6.
-      const r = await runSpawn(["builder-1", "builder", "", "/tmp", "", brief]);
+      // v2.6.1: brief_file_path is arg 5 (was arg 6 pre-v2.6.1 when token was arg 5).
+      const r = await runSpawn(["builder-1", "builder", "", "/tmp", brief]);
       expect(r.code).toBe(0);
       // The default KICKSTART is still present
       expect(r.stdout).toContain("mcp__bot-relay__get_messages");
@@ -360,7 +360,7 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
 
   it("non-existent brief path rejects with exit 2", async () => {
     const ghost = `/tmp/relay-brief-ghost-${process.pid}-does-not-exist.md`;
-    const r = await runSpawn(["builder-1", "builder", "", "/tmp", "", ghost]);
+    const r = await runSpawn(["builder-1", "builder", "", "/tmp", ghost]);
     expect(r.code).toBe(2);
     expect(r.stderr).toContain("does not exist");
   });
@@ -371,7 +371,6 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
       "builder",
       "",
       "/tmp",
-      "",
       "/tmp/$(whoami).md",
     ]);
     expect(r.code).toBe(2);
@@ -385,7 +384,6 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
       "builder",
       "",
       "/tmp",
-      "",
       "./brief.md",
     ]);
     expect(r.code).toBe(2);
@@ -395,7 +393,7 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
   it("oversized brief (>10KB) rejects with exit 2", async () => {
     const big = writeBrief("big", "x".repeat(10241));
     try {
-      const r = await runSpawn(["builder-1", "builder", "", "/tmp", "", big]);
+      const r = await runSpawn(["builder-1", "builder", "", "/tmp", big]);
       expect(r.code).toBe(2);
       expect(r.stderr).toContain("10240 bytes");
     } finally {
@@ -407,7 +405,7 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
     const brief = writeBrief("nokickstart", "# brief");
     try {
       const r = await runSpawnWithEnv(
-        ["builder-1", "builder", "", "/tmp", "", brief],
+        ["builder-1", "builder", "", "/tmp", brief],
         { RELAY_SPAWN_NO_KICKSTART: "1" }
       );
       expect(r.code).toBe(0);
@@ -422,7 +420,7 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
     const brief = writeBrief("override", "# brief");
     try {
       const r = await runSpawnWithEnv(
-        ["builder-1", "builder", "", "/tmp", "", brief],
+        ["builder-1", "builder", "", "/tmp", brief],
         { RELAY_SPAWN_KICKSTART: "customPromptFromOperator" }
       );
       expect(r.code).toBe(0);

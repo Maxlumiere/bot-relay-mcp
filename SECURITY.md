@@ -86,11 +86,19 @@ It is NOT designed to be safe against:
 
 Every agent registered via `register_agent` receives a 32-byte base64url token shown ONCE in the response. The relay stores only a bcrypt hash (`agents.token_hash`) — the plaintext is discarded after the response is written.
 
-Subsequent tool calls must present the token via one of three channels (in precedence order):
+Subsequent tool calls must present the token via one of four channels (in precedence order). The chain is split by trust origin (v2.6.1 R3):
+
+**Caller-presented (accepted on any transport):**
 
 1. `agent_token` argument in the tool input.
 2. `X-Agent-Token` HTTP header.
-3. `RELAY_AGENT_TOKEN` environment variable (stdio flow).
+
+**Daemon-side (STDIO TRANSPORT ONLY — gated on `currentContext().transport === "stdio"`):**
+
+3. `RELAY_AGENT_TOKEN` environment variable. The daemon's own env. On stdio this IS the agent's identity (single agent per process, RELAY_AGENT_NAME set at fork). On HTTP it's the daemon's env, so HTTP requests bypass it entirely — letting an HTTP caller authenticate against it without presenting the token themselves would turn the daemon into an auth oracle (codex msg 2cbe68a2, 2026-05-05).
+4. Per-instance file vault at `<instanceDir>/agents/<RELAY_AGENT_NAME>.token`, read via `defaultTokenStore().readSync()` (v2.6.1 R2). Same trust origin as item 3: the daemon's local filesystem. Gated on the same transport check; `args.agent_name` is **not** honored for vault lookup (codex msg d1fbbdde).
+
+The general rule (v2.6.1 R3): **anything the daemon process has access to without the caller presenting it is a daemon-side credential, and daemon-side credentials must NEVER authenticate HTTP callers.** HTTP clients must always present a token via item 1 or item 2; otherwise the resolver returns null and the request fails `AUTH_FAILED`. This includes a daemon launched in HTTP mode with `RELAY_AGENT_TOKEN` baked into its env — that env is for stdio mode only and is ignored on HTTP requests. Pinned by `tests/v2-6-1-token-store.test.ts:17b` (vault, R2), `:17c` (env-token, R3), and `:17d` (health_check info-disclosure oracle, v2.6.2 — closes the same bug class on the parallel resolver in `src/tools/status.ts:resolveTokenForHealthCheck`).
 
 A capability list is set at first registration and is **immutable** (v1.7.1 rule). Changing capabilities requires `unregister_agent` + fresh `register_agent`.
 
@@ -160,6 +168,23 @@ Two paths for a locked-out agent:
 **`revoke_token(issue_recovery=true)` + register_agent(recovery_token=...)`** (admin-initiated) — admin revokes the target with a one-time bcrypt-hashed recovery_token returned on the revoke response. Target's operator re-registers with that token; state flips from `recovery_pending` to `active`. Recovery_token_hash cleared on first successful use.
 
 Out-of-band token handoff is the human authorization moment. Recovery tokens currently have no TTL (deferred to v2.1.1 if demand surfaces).
+
+---
+
+## Local agent token storage (v2.6.1)
+
+The SessionStart hook persists each agent's plaintext token to `<instanceDir>/agents/<name>.token` (chmod 0o600 on POSIX, parent dir 0o700) so spawned terminals can re-authenticate across restarts without re-running `register_agent`. Full lifecycle in [`docs/agents/local-identity.md`](./docs/agents/local-identity.md).
+
+**Threat model — same bar as other local credential vaults.**
+
+- Local-machine only. Plaintext at rest in `~/.bot-relay/`. Same threat surface as `~/.aws/credentials`, `~/.ssh/id_rsa`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`. A same-user process compromise can read the relay DB directly anyway — token files do not open new attack surface.
+- POSIX (macOS, Linux): `chmod 0o600` on file, `0o700` on parent dir, enforced by `FileTokenStore.write` (TS) and the byte-identical bash mirror in the SessionStart hook. Enforced at write time on every rotate.
+- Windows: NTFS profile-dir defaults inherit a user-restricted ACL from `%USERPROFILE%`. The TS `chmod` calls become best-effort no-ops; we do not currently shell out to `icacls` to verify. v2.9+ Windows Credential Manager helper (pluggable via the `TokenStore` interface) will move beyond profile-dir defaults.
+- Backup tools (Time Machine, Dropbox, iCloud Drive, Backblaze, etc.) may capture vault contents. Operators wanting stronger guarantees should exclude `~/.bot-relay/` from cloud-synced backup destinations OR wait for a v2.9+ credential-helper plug-in (Keychain / Credential Manager / 1Password) which encrypts at rest.
+- Federation tokens (v2.3+ when shipped) use a different mechanism. Local file vault is local-machine only.
+- Vault writes themselves are not separately audited; the DB-side `audit_log` already captures every credential issuance via `register_agent` / `rotate_token` / `revoke_token` / `agent.token_minted` / `recovery.cli`. The vault is the persistence side effect of an already-audited issuance.
+
+Migration of pre-v2.6.1 env-baked tokens: [`scripts/migrate-existing-tokens-to-vault.sh`](./scripts/migrate-existing-tokens-to-vault.sh) — one-shot writes the env-resolved token into the vault.
 
 ---
 

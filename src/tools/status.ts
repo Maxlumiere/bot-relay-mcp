@@ -92,21 +92,36 @@ export function handleSetStatus(input: SetStatusInput) {
 /**
  * v2.1 Phase 4b.1 v2: token-aware extension for the SessionStart hook.
  * health_check remains a no-auth endpoint — it does NOT require a token.
- * But IF a token is presented (via args.agent_token, X-Agent-Token header,
- * or RELAY_AGENT_TOKEN env), we validate it and surface auth_error in the
- * response so the hook can detect stale/revoked tokens on terminal start.
- * Resolution mirrors the dispatcher's resolveCallerByToken + state check.
+ * But IF a token is presented, we validate it and surface auth_error +
+ * agent_name + auth_state in the response so the hook can detect
+ * stale/revoked tokens on terminal start.
+ *
+ * v2.6.1 R3: precedence chain mirrors `resolveToken` in `src/server.ts`.
+ * Items 1-2 (args, header) are caller-presented and accepted on any
+ * transport; item 3 (RELAY_AGENT_TOKEN env) is the daemon's own env and
+ * is gated on `ctx.transport === "stdio"`. Without this gate an HTTP
+ * caller could omit all credentials and the daemon would validate its
+ * own env token, returning `agent_name` + `auth_state` for whichever
+ * agent owns that env token — same auth-oracle / info-disclosure bug
+ * class as resolveToken pre-R3 (codex msg 2cbe68a2). Stdio is safe
+ * because the process identity IS the agent.
  */
 function resolveTokenForHealthCheck(input: HealthCheckInput): string | null {
+  // Item 1 — args.agent_token (caller-presented per call).
   if (typeof input?.agent_token === "string" && input.agent_token.length > 0) {
     return input.agent_token;
   }
+  let ctxTransport: "stdio" | "http" = "stdio";
   try {
     const ctx = currentContext();
+    // Item 2 — X-Agent-Token header (caller-presented per request).
     if (ctx.headerAgentToken) return ctx.headerAgentToken;
+    ctxTransport = ctx.transport;
   } catch {
-    /* outside request context (stdio) — fall through */
+    /* outside request context — defaults to stdio, which is safe */
   }
+  // Item 3 — RELAY_AGENT_TOKEN env (daemon-side, STDIO-ONLY per R3).
+  if (ctxTransport !== "stdio") return null;
   const envTok = process.env.RELAY_AGENT_TOKEN;
   if (envTok && envTok.length > 0) return envTok;
   return null;
