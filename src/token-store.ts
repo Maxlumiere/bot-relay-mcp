@@ -204,6 +204,24 @@ export class FileTokenStore implements TokenStore {
       throw err;
     }
   }
+
+  /**
+   * v2.6.2 R1 — sync delete variant for synchronous handler call sites
+   * (`src/tools/identity.ts:handleRevokeToken`). Mirrors the readSync ↔ read
+   * pair. Same idempotent ENOENT-swallow semantics. Using sync here avoids
+   * cascading the revoke_token handler to async (which would propagate
+   * through the dispatcher and into every test that exercises revoke). Sync
+   * unlink of a single file is microseconds — no perf concern.
+   */
+  deleteSync(agentName: string): void {
+    try {
+      fs.unlinkSync(this.pathFor(agentName));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return;
+      throw err;
+    }
+  }
 }
 
 /** Module-level singleton for callers that don't need to inject. */

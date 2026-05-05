@@ -21,6 +21,7 @@ import { fireWebhooks } from "../webhooks.js";
 import { log } from "../logger.js";
 import { currentContext } from "../request-context.js";
 import { updateCapturedSessionId } from "../transport/stdio.js";
+import { defaultTokenStore } from "../token-store.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { ERROR_CODES } from "../error-codes.js";
 import type {
@@ -733,6 +734,29 @@ export function handleRevokeToken(input: RevokeTokenInput) {
       log.info(
         `[auth] Recovery token issued for "${input.target_agent_name}". ` +
         `Shown ONCE in the response — hand it to the operator out-of-band.`
+      );
+    }
+    // v2.6.2 R1 — scrub the per-instance vault file alongside the DB-side
+    // revoke. The security boundary already held via the auth_state check
+    // (resolveCallerByToken at src/server.ts:870-878 refuses any state
+    // other than 'active' or 'rotation_grace'), so a stale token in the
+    // vault was harmless. But ergonomically the mental model is cleaner
+    // when revoke_token leaves NO credential on disk for that agent —
+    // mirrors the recovery-CLI scrub at src/cli/recover.ts:300-301.
+    // Maxime's call (2026-05-05) per memory/feedback_maxime_owns_strategic_calls.md.
+    //
+    // Best-effort: try/catch swallows IO errors. The revoke succeeded at
+    // the DB layer; failing here would be a worse experience than
+    // leaving a harmless stale file. Idempotent: ENOENT is a clean return
+    // inside FileTokenStore.delete (src/token-store.ts:198-206).
+    try {
+      // Sync to avoid cascading the handler to async (would propagate
+      // through the dispatcher + every revoke test). Single-file unlink is
+      // microseconds. ENOENT is swallowed inside deleteSync.
+      defaultTokenStore().deleteSync(input.target_agent_name);
+    } catch (err) {
+      log.warn(
+        `[auth] revoke_token: vault scrub for "${input.target_agent_name}" failed (DB-side revoke still applied): ${(err as Error).message}`
       );
     }
   }

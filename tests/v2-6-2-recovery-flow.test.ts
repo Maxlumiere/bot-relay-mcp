@@ -183,16 +183,15 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
       expect(stale.auth_error).toBe(true);
       expect(stale.error_code).toBe("AUTH_FAILED");
 
-      // NOTE — vault scrub: the brief's step 3 says "verify vault is now
-      // scrubbed (recovery flow deletes the file per v2.6.1 R0 builder
-      // choice)." In the current implementation, only `relay recover <name>`
-      // (CLI, src/cli/recover.ts:300-301) deletes the vault — `revoke_token`
-      // does NOT touch it. The vault still holds the ORIGINAL_TOKEN here;
-      // a subsequent call using that token still fails auth (step 6) because
-      // the daemon's state check refuses recovery_pending, not because the
-      // vault file is gone. Whether to add vault.delete() to revoke_token
-      // is a v2.6.3 / v2.7 design decision (surfaced in v2.6.2 ship-pong).
-      expect(fs.existsSync(VAULT_FILE)).toBe(true); // vault is NOT auto-scrubbed
+      // v2.6.2 R1 — revoke_token now scrubs the vault (Maxime's call,
+      // 2026-05-05, per memory/feedback_maxime_owns_strategic_calls.md).
+      // The security boundary already held via the auth_state check at
+      // src/server.ts:870-878 — a stale token in the vault was harmless.
+      // R1 aligns the mental model so revoke_token leaves NO credential on
+      // disk for the agent. Mirrors the recovery-CLI scrub at
+      // src/cli/recover.ts:300-301. Implemented via deleteSync in
+      // src/tools/identity.ts:handleRevokeToken (after the DB-side revoke).
+      expect(fs.existsSync(VAULT_FILE)).toBe(false); // vault scrubbed by revoke_token (v2.6.2 R1)
 
       // Step 7 — re-register with the recovery_token. Captures the fresh
       // agent_token. State transitions back to 'active'.
@@ -265,4 +264,171 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
       fs.rmSync(ROOT, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it("v2.6.2 R1 — revoke_token WITHOUT recovery (terminal revocation) also scrubs vault", async () => {
+    // Per Maxime's call (2026-05-05), v2.6.2 R1 added a vault scrub to
+    // revoke_token regardless of issue_recovery. The legitimate revocation
+    // path (terminal revoke, agent should re-bootstrap from scratch) leaves
+    // no credential on disk. This complements the recovery-flow test above
+    // (which exercises issue_recovery=true) — both branches must scrub.
+    const PORT = 39421;
+    const ROOT = path.join(os.tmpdir(), "v2-6-2-r1-revoke-scrub-" + process.pid);
+    if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
+    fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+    const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
+    expect(fs.existsSync(DIST_INDEX)).toBe(true);
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { spawn } = require("child_process") as typeof import("child_process");
+
+    const child = spawn("node", [DIST_INDEX], {
+      env: {
+        ...process.env,
+        RELAY_TRANSPORT: "http",
+        RELAY_HTTP_PORT: String(PORT),
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HOME: ROOT,
+        RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+        RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
+        RELAY_AGENT_TOKEN: "",
+        RELAY_AGENT_NAME: "",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    try {
+      await waitForHealth(PORT, 5000);
+
+      // Register admin + target.
+      const adminReg = await rpc({
+        port: PORT,
+        args: { name: "register_agent", arguments: { name: "admin-rev2", role: "admin", capabilities: ["admin"] } },
+      });
+      expect(adminReg.success).toBe(true);
+      const ADMIN_TOKEN = adminReg.agent_token;
+
+      const targetReg = await rpc({
+        port: PORT,
+        args: { name: "register_agent", arguments: { name: "terminal-revoke-target", role: "tester", capabilities: [] } },
+      });
+      expect(targetReg.success).toBe(true);
+      const ORIGINAL_TOKEN = targetReg.agent_token;
+
+      // Write the original token to vault.
+      const VAULT_FILE = path.join(ROOT, "agents", "terminal-revoke-target.token");
+      fs.mkdirSync(path.dirname(VAULT_FILE), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(VAULT_FILE, ORIGINAL_TOKEN + "\n", { mode: 0o600 });
+      expect(fs.existsSync(VAULT_FILE)).toBe(true);
+
+      // Terminal revocation: issue_recovery=false. State goes to 'revoked'
+      // (terminal), not 'recovery_pending'. No recovery_token issued.
+      const revoked = await rpc({
+        port: PORT,
+        args: {
+          name: "revoke_token",
+          arguments: {
+            target_agent_name: "terminal-revoke-target",
+            revoker_name: "admin-rev2",
+            issue_recovery: false,
+          },
+        },
+        headers: { "X-Agent-Token": ADMIN_TOKEN },
+      });
+      expect(revoked.success).toBe(true);
+      expect(revoked.changed).toBe(true);
+      expect(revoked.auth_state_after).toBe("revoked");
+      expect(revoked.recovery_token).toBeUndefined();
+
+      // R1 contract: vault scrubbed even on terminal-revoke (no recovery).
+      expect(fs.existsSync(VAULT_FILE)).toBe(false);
+
+      // Original token now fails (state=revoked).
+      const stale = await rpc({
+        port: PORT,
+        args: {
+          name: "get_messages",
+          arguments: { agent_name: "terminal-revoke-target", status: "pending", limit: 5 },
+        },
+        headers: { "X-Agent-Token": ORIGINAL_TOKEN },
+      });
+      expect(stale.auth_error).toBe(true);
+      expect(stale.error_code).toBe("AUTH_FAILED");
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((res) => setTimeout(res, 200));
+      try { child.kill("SIGKILL"); } catch { /* */ }
+      fs.rmSync(ROOT, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("v2.6.2 R1 — revoke_token vault scrub is best-effort (missing vault is a no-op, not a failure)", async () => {
+    // Idempotency: revoke_token must not fail when there's no vault file
+    // to scrub (e.g. agent registered manually without a vault entry, or
+    // the vault was already deleted out-of-band by the operator). The
+    // delete is wrapped in try/catch in src/tools/identity.ts, and the
+    // underlying FileTokenStore.deleteSync swallows ENOENT.
+    const PORT = 39422;
+    const ROOT = path.join(os.tmpdir(), "v2-6-2-r1-revoke-noop-" + process.pid);
+    if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
+    fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+    const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { spawn } = require("child_process") as typeof import("child_process");
+
+    const child = spawn("node", [DIST_INDEX], {
+      env: {
+        ...process.env,
+        RELAY_TRANSPORT: "http",
+        RELAY_HTTP_PORT: String(PORT),
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HOME: ROOT,
+        RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+        RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
+        RELAY_AGENT_TOKEN: "",
+        RELAY_AGENT_NAME: "",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    try {
+      await waitForHealth(PORT, 5000);
+      const adminReg = await rpc({
+        port: PORT,
+        args: { name: "register_agent", arguments: { name: "admin-rev3", role: "admin", capabilities: ["admin"] } },
+      });
+      const ADMIN_TOKEN = adminReg.agent_token;
+      const targetReg = await rpc({
+        port: PORT,
+        args: { name: "register_agent", arguments: { name: "no-vault-target", role: "tester", capabilities: [] } },
+      });
+      expect(targetReg.success).toBe(true);
+      // Intentionally do NOT write a vault file.
+      const VAULT_FILE = path.join(ROOT, "agents", "no-vault-target.token");
+      expect(fs.existsSync(VAULT_FILE)).toBe(false);
+
+      // Revoke with no vault present — must succeed cleanly.
+      const revoked = await rpc({
+        port: PORT,
+        args: {
+          name: "revoke_token",
+          arguments: {
+            target_agent_name: "no-vault-target",
+            revoker_name: "admin-rev3",
+            issue_recovery: true,
+          },
+        },
+        headers: { "X-Agent-Token": ADMIN_TOKEN },
+      });
+      expect(revoked.success).toBe(true);
+      expect(revoked.changed).toBe(true);
+      // Vault still doesn't exist — no half-creation.
+      expect(fs.existsSync(VAULT_FILE)).toBe(false);
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((res) => setTimeout(res, 200));
+      try { child.kill("SIGKILL"); } catch { /* */ }
+      fs.rmSync(ROOT, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

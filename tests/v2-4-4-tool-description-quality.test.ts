@@ -212,7 +212,7 @@ describe("v2.4.4 — tool description quality", () => {
       post_to_channel: "593b795f55ccd34c8d3cc668f91bc64c6a4be27f79827b09b3895ccea37e59b2",
       register_agent: "43f3d8cb5b37ffcf8f089e23727ee2110cc792938699f04ea6cc0623e74b7128",
       register_webhook: "7a1fd9852ec77d5ee5e23e081a5f1d82ab8d1fa0591d84893b1e1a55253ec006",
-      revoke_token: "6d73ab6b1d8e238b10f3a006fb44f597b099de1f344ce9f03a964f21670a018f",
+      revoke_token: "dbe9e38b84537ca2a4857e7b450f2cfa750698053713180047975cb152ef7884",
       rotate_token: "d3a9ed36a83157f59c01335df8b25978b5af23666c1b61d8ed5ad897680bfc25",
       rotate_token_admin: "c49dd62b8cab404d4df138ade5916a08a1527796b6126fd52dec7555499aa171",
       send_message: "b29d2537a0e3226b08965410b461e1fe7011f0eaecd7762f71cc6fb1beaa3849",

@@ -137,13 +137,38 @@ function buildVaultPreludePowerShell(agentName: string): string {
   );
 }
 
+/**
+ * v2.6.2 R1 (codex P2 fix) — cmd.exe sub-driver requires powershell.exe to
+ * also be on PATH because the cmd branch delegates the inner shell to
+ * `powershell.exe -NoExit -Command "..."` for the vault prelude (cmd.exe
+ * lacks native Get-Content / regex match — Brief Option A, single PS source
+ * of truth). Pre-R1 `pickSubDriver` would auto-fall-through wt → ps → cmd,
+ * but if cmd was selected because powershell was missing, the cmd window
+ * would open and immediately fail (`'powershell.exe' is not recognized`)
+ * before claude could run. Codex caught the self-contradiction.
+ *
+ * Post-R1 contract: cmd is only selectable when powershell.exe is ALSO
+ * available. The auto-fallback chain effectively becomes wt → powershell →
+ * (no Windows FIX 1 — daemon-side R2/R3 stdio fallback in
+ * `src/server.ts:resolveToken` covers identity universally on every Windows
+ * sub-driver regardless). Operators who explicitly choose cmd via
+ * `RELAY_TERMINAL_APP=cmd` still get the cmd window, but only when
+ * powershell.exe is present (otherwise pickSubDriver falls through and
+ * canHandle returns false → driver throws a clear error).
+ */
+function isAvailable(ctx: DriverContext, sub: WindowsSubDriver): boolean {
+  if (!ctx.hasBinary(BINARY_FOR[sub])) return false;
+  if (sub === "cmd" && !ctx.hasBinary("powershell.exe")) return false;
+  return true;
+}
+
 function pickSubDriver(ctx: DriverContext): WindowsSubDriver | null {
   if (ctx.terminalOverride && (WINDOWS_SUB_DRIVERS as readonly string[]).includes(ctx.terminalOverride)) {
     const sub = ctx.terminalOverride as WindowsSubDriver;
-    if (ctx.hasBinary(BINARY_FOR[sub])) return sub;
+    if (isAvailable(ctx, sub)) return sub;
   }
   for (const sub of WINDOWS_SUB_DRIVERS) {
-    if (ctx.hasBinary(BINARY_FOR[sub])) return sub;
+    if (isAvailable(ctx, sub)) return sub;
   }
   return null;
 }
