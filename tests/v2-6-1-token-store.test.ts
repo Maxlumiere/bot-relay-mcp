@@ -139,57 +139,55 @@ describe("v2.6.1 — FileTokenStore unit", () => {
 
 // --- Bash hook mirror discipline ---
 //
-// The bash helper `read_relay_token_from_vault` in hooks/check-relay.sh +
-// post-tool-use-check.sh + stop-check.sh must round-trip with TS writes.
-// Discrepancy here = identity drift between the daemon and the hooks.
-describe("v2.6.1 — bash hook mirror round-trip", () => {
-  function bashRead(name: string): { code: number; stdout: string; stderr: string } {
-    // Source the hook script (no `set -e` issues — bash defines functions
-    // without executing the rest because we set RELAY_AGENT_NAME='' which
-    // makes the early guard exit 0 BEFORE any state-mutating block).
+// v2.6.1 R1: tests source the SHIPPED hooks/_vault-helpers.sh — same file the
+// 3 hooks + the migration script source. Drift between bash and TS surfaces
+// directly as a real test failure (no inline-copy hide-out, per
+// memory/feedback_test_path_must_match_shipped_path.md). Codex R0 caught the
+// inline-copy weakness; this file closes the contract.
+describe("v2.6.1 — bash hook mirror round-trip (sources shipped helper)", () => {
+  const HELPER = path.join(REPO_ROOT, "hooks", "_vault-helpers.sh");
+
+  function bashRead(name: string): { status: number; stdout: string; stderr: string } {
+    // Source the SHIPPED helper file. RELAY_HOME points at TEST_ROOT so the
+    // resolved vault dir is TEST_ROOT/agents — same layout the TS
+    // FileTokenStore writes to.
     const script = `
 set -u
 RELAY_HOME='${TEST_ROOT}'
 unset RELAY_DB_PATH RELAY_INSTANCE_ID
-# Define functions inline (mirrors hooks/check-relay.sh — keep in sync).
-resolve_relay_db_path() {
-  if [ -n "\${RELAY_DB_PATH:-}" ]; then echo "\$RELAY_DB_PATH"; return 0; fi
-  local root="\${RELAY_HOME:-\$HOME/.bot-relay}"
-  echo "\$root/relay.db"
-  return 0
-}
-resolve_relay_token_path() {
-  local name="\$1"
-  if ! echo "\$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
-    echo "[bot-relay hook] invalid agent name \\"\$name\\"" >&2
-    return 1
-  fi
-  local db_path
-  db_path=\$(resolve_relay_db_path) || return 1
-  echo "\$(dirname "\$db_path")/agents/\${name}.token"
-  return 0
-}
-read_relay_token_from_vault() {
-  local name="\$1"
-  local token_path
-  token_path=\$(resolve_relay_token_path "\$name") || return 1
-  if [ ! -f "\$token_path" ]; then return 1; fi
-  local token
-  token=\$(head -n 1 "\$token_path" 2>/dev/null | tr -d '[:space:]')
-  if [ -z "\$token" ]; then return 1; fi
-  if ! echo "\$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then return 1; fi
-  echo "\$token"
-  return 0
-}
-read_relay_token_from_vault "${name}"
+. '${HELPER}'
+read_relay_token_from_vault '${name}'
 `;
-    return spawnSync("bash", ["-c", script], { encoding: "utf-8", timeout: 5000 }) as any;
+    const r = spawnSync("bash", ["-c", script], { encoding: "utf-8", timeout: 5000 });
+    return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
   }
 
-  it("(12) bash mirror reads what TS FileTokenStore wrote — identity preserved", async () => {
-    // Use the SAME path resolution — TS writes to RELAY_HOME/agents/<name>.token
-    // when RELAY_HOME points at TEST_ROOT (single-instance mode falls back to
-    // <root>/relay.db whose parent is <root>; vault dir = <root>/agents).
+  function bashWriteThenReadViaTs(name: string, token: string): {
+    bashStatus: number;
+    bashStderr: string;
+    tsRead: string | null;
+  } {
+    // Inverse direction: bash WRITES the vault, then TS FileTokenStore reads
+    // back. Closes the dispatch contract — drift in EITHER direction surfaces.
+    const script = `
+set -u
+RELAY_HOME='${TEST_ROOT}'
+unset RELAY_DB_PATH RELAY_INSTANCE_ID
+. '${HELPER}'
+write_relay_token_to_vault '${name}' '${token}'
+`;
+    const r = spawnSync("bash", ["-c", script], { encoding: "utf-8", timeout: 5000 });
+    // Read with a NEW FileTokenStore instance pointed at the same vault dir.
+    const tsStoreLocal = new FileTokenStoreCls({ vaultDir: path.join(TEST_ROOT, "agents") });
+    // Sync read for parity with the daemon's resolveToken path.
+    return {
+      bashStatus: r.status ?? -1,
+      bashStderr: r.stderr ?? "",
+      tsRead: tsStoreLocal.readSync(name),
+    };
+  }
+
+  it("(12) shipped helper reads what TS FileTokenStore wrote (TS-write → bash-read)", async () => {
     const tsStore = new FileTokenStoreCls({ vaultDir: path.join(TEST_ROOT, "agents") });
     await tsStore.write("victra", ANY_TOKEN);
     const r = bashRead("victra");
@@ -197,17 +195,267 @@ read_relay_token_from_vault "${name}"
     expect(r.stdout.trim()).toBe(ANY_TOKEN);
   });
 
-  it("(13) bash mirror returns non-zero exit on missing file (clean cache miss)", async () => {
+  it("(12b) shipped helper write is read by TS (bash-write → TS-read) — bidirectional contract", () => {
+    const r = bashWriteThenReadViaTs("inverse", ANY_TOKEN);
+    expect(r.bashStatus).toBe(0);
+    expect(r.tsRead).toBe(ANY_TOKEN);
+  });
+
+  it("(13) shipped helper returns non-zero exit on missing file (clean cache miss)", () => {
     const r = bashRead("never-written");
     expect(r.status).not.toBe(0);
     expect(r.stdout.trim()).toBe("");
   });
 
-  it("(14) bash mirror rejects an invalid agent name without touching disk", async () => {
+  it("(14) shipped helper rejects an invalid agent name without touching disk", () => {
     const r = bashRead("bad name");
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/invalid agent name/);
   });
+
+  it("(14b) all 3 hooks + migration script source the same helper file", () => {
+    // Drift guard: every hook script + migration script must `source` the
+    // helper. Inline copies would silently drift and recreate the v2.4.5
+    // R2 split-brain class of bug.
+    const consumers = [
+      "hooks/check-relay.sh",
+      "hooks/post-tool-use-check.sh",
+      "hooks/stop-check.sh",
+      "scripts/migrate-existing-tokens-to-vault.sh",
+    ];
+    for (const c of consumers) {
+      const body = fs.readFileSync(path.join(REPO_ROOT, c), "utf-8");
+      expect(body).toMatch(/_vault-helpers\.sh/);
+    }
+    // And the helper itself must define every function the consumers expect.
+    const helper = fs.readFileSync(HELPER, "utf-8");
+    expect(helper).toMatch(/^resolve_relay_db_path\(\)/m);
+    expect(helper).toMatch(/^resolve_relay_token_path\(\)/m);
+    expect(helper).toMatch(/^read_relay_token_from_vault\(\)/m);
+    expect(helper).toMatch(/^write_relay_token_to_vault\(\)/m);
+  });
+});
+
+// --- FIX 1 macOS prelude: launching shell hydrates RELAY_AGENT_TOKEN from vault ---
+describe("v2.6.1 R1 — FIX 1 launching-shell vault prelude (macOS spawn-agent.sh)", () => {
+  it.skipIf(process.platform !== "darwin")(
+    "(16) spawn-agent.sh CMD includes a vault-read prelude AND running it sets RELAY_AGENT_TOKEN to the vault content",
+    async () => {
+      // Pre-write the vault file the prelude will read.
+      const SPAWN_TEST_ROOT = path.join(os.tmpdir(), "v2-6-1-prelude-" + process.pid);
+      if (fs.existsSync(SPAWN_TEST_ROOT)) fs.rmSync(SPAWN_TEST_ROOT, { recursive: true, force: true });
+      fs.mkdirSync(SPAWN_TEST_ROOT, { recursive: true, mode: 0o700 });
+      const VAULT_DIR = path.join(SPAWN_TEST_ROOT, "agents");
+      fs.mkdirSync(VAULT_DIR, { recursive: true, mode: 0o700 });
+      const VAULT_FILE = path.join(VAULT_DIR, "prelude-agent.token");
+      const KNOWN_TOKEN = "Prelude_Token-FromVaultFile.123_abc";
+      fs.writeFileSync(VAULT_FILE, KNOWN_TOKEN + "\n", { mode: 0o600 });
+
+      // Run spawn-agent.sh in DRY_RUN mode to capture the assembled CMD
+      // string. The prelude must use this exact vault path.
+      const SPAWN_SCRIPT = path.join(REPO_ROOT, "bin", "spawn-agent.sh");
+      const dry = spawnSync(
+        SPAWN_SCRIPT,
+        // cwd must be "/tmp" specifically (not os.tmpdir(), which on macOS
+        // resolves to /private/var/folders — outside spawn-agent.sh's
+        // approved-roots case statement).
+        ["prelude-agent", "builder", "", "/tmp"],
+        {
+          encoding: "utf-8",
+          timeout: 5000,
+          env: {
+            // Pass through HOME + PATH (spawn-agent.sh runs `set -u` and
+            // touches $HOME during cwd resolution at line ~185 + line ~190).
+            HOME: process.env.HOME || os.tmpdir(),
+            PATH: process.env.PATH || "/usr/bin:/bin",
+            RELAY_HOME: SPAWN_TEST_ROOT,
+            RELAY_SPAWN_DRY_RUN: "1",
+            // Avoid colliding with the operator's real instance.
+            RELAY_INSTANCE_ID: "",
+            RELAY_DB_PATH: "",
+          },
+        }
+      );
+      if (dry.status !== 0) {
+        // surface the failure reason (stderr) so the test message is useful
+        // when debugging cross-platform regressions.
+        throw new Error(
+          `spawn-agent.sh exited ${dry.status}\nstderr: ${dry.stderr}\nstdout: ${dry.stdout}`
+        );
+      }
+      const cmdLine = (dry.stdout || "")
+        .split("\n")
+        .find((l) => l.startsWith("CMD="));
+      expect(cmdLine).toBeDefined();
+      const cmd = cmdLine!.replace(/^CMD=/, "");
+      // The prelude must reference the resolved vault path AND include
+      // `export RELAY_AGENT_TOKEN`. Both verbatim per spawn-agent.sh.
+      expect(cmd).toContain(VAULT_FILE);
+      expect(cmd).toMatch(/export RELAY_AGENT_TOKEN/);
+      expect(cmd).toMatch(/grep -Eq '\^\[A-Za-z0-9_=\.-\]\{8,128\}\$'/);
+
+      // Now invoke the prelude in a tmp shell, replacing the `claude ...`
+      // call with a printenv. Strip everything from `cd ` onwards (the
+      // launch tail) and append our probe.
+      const cdIdx = cmd.indexOf("cd ");
+      expect(cdIdx).toBeGreaterThan(0);
+      const preludeOnly = cmd.slice(0, cdIdx).trim();
+      // `printenv RELAY_AGENT_TOKEN` exits non-zero when the var is unset.
+      // Mask with `|| true` so the negative case (vault missing) doesn't
+      // confuse the test assertion — we check stdout content for both
+      // positive (token from vault) and negative (empty) cases.
+      const probe = `${preludeOnly} printenv RELAY_AGENT_TOKEN || true`;
+      const r = spawnSync("bash", ["-lc", probe], {
+        encoding: "utf-8",
+        timeout: 5000,
+        env: {
+          PATH: process.env.PATH || "/usr/bin:/bin",
+          // Crucially: NO RELAY_AGENT_TOKEN in env. The prelude must
+          // populate it from the vault file alone.
+        },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe(KNOWN_TOKEN);
+
+      // Negative case: deleting the vault file makes the prelude a no-op.
+      fs.unlinkSync(VAULT_FILE);
+      const r2 = spawnSync("bash", ["-lc", probe], {
+        encoding: "utf-8",
+        timeout: 5000,
+        env: { PATH: process.env.PATH || "/usr/bin:/bin" },
+      });
+      expect(r2.status).toBe(0);
+      expect(r2.stdout.trim()).toBe(""); // env stays empty when vault is missing
+
+      fs.rmSync(SPAWN_TEST_ROOT, { recursive: true, force: true });
+    }
+  );
+});
+
+// --- FIX 2 daemon-side: resolveToken falls back to vault when env is empty ---
+describe("v2.6.1 R1 — FIX 2 daemon resolveToken vault fallback", () => {
+  it("(17) HTTP daemon authenticates a get_messages call with no env / no header / no args.agent_token, using vault read", async () => {
+    // Spawn an isolated HTTP daemon with its own DB + RELAY_HOME. Then
+    // register an agent (which mints a token), write that token to the
+    // vault file at the expected path, and make a follow-up get_messages
+    // call WITHOUT providing the token through any of the three explicit
+    // channels (args.agent_token / X-Agent-Token / RELAY_AGENT_TOKEN env).
+    // resolveToken's vault fallback (FIX 2) must look up the agent name
+    // from args.agent_name + read the vault file + match.
+    const PORT = 39411;
+    const ROOT = path.join(os.tmpdir(), "v2-6-1-fix2-" + process.pid);
+    if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
+    fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+    const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
+    expect(fs.existsSync(DIST_INDEX)).toBe(true);
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { spawn } = require("child_process") as typeof import("child_process");
+    const child = spawn("node", [DIST_INDEX], {
+      env: {
+        ...process.env,
+        RELAY_TRANSPORT: "http",
+        RELAY_HTTP_PORT: String(PORT),
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HOME: ROOT,
+        RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+        RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
+        // Ensure no operator token leaks into the daemon's env — the
+        // whole point is to verify resolveToken falls back to the vault.
+        RELAY_AGENT_TOKEN: "",
+        RELAY_AGENT_NAME: "",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    try {
+      // Wait for /health.
+      const start = Date.now();
+      while (Date.now() - start < 5000) {
+        try {
+          const r = await fetch(`http://127.0.0.1:${PORT}/health`);
+          if (r.ok) break;
+        } catch {
+          /* not up yet */
+        }
+        await new Promise((res) => setTimeout(res, 100));
+      }
+
+      async function rpc(args: any, token?: string): Promise<any> {
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        };
+        if (token) headers["X-Agent-Token"] = token;
+        const body = {
+          jsonrpc: "2.0",
+          id: Math.floor(Math.random() * 1e9),
+          method: "tools/call",
+          params: { name: args.name, arguments: args.arguments },
+        };
+        const resp = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+        const text = await resp.text();
+        // Parse SSE-framed body or plain JSON.
+        const dataLine = text
+          .split("\n")
+          .map((l) => l.trim())
+          .find((l) => l.startsWith("data:"));
+        const payload = dataLine ? dataLine.slice(5).trim() : text.trim();
+        const rpcResp = JSON.parse(payload);
+        const inner = rpcResp.result?.content?.[0]?.text;
+        return inner ? JSON.parse(inner) : rpcResp;
+      }
+
+      // Register an agent — captures a fresh token.
+      const reg = await rpc({
+        name: "register_agent",
+        arguments: {
+          name: "fix2-agent",
+          role: "tester",
+          capabilities: [],
+        },
+      });
+      expect(reg.success).toBe(true);
+      const TOKEN = reg.agent_token;
+      expect(TOKEN).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
+
+      // Write the token to the vault path the daemon will resolve.
+      // Single-instance mode: <ROOT>/agents/<name>.token.
+      const VAULT_FILE = path.join(ROOT, "agents", "fix2-agent.token");
+      fs.mkdirSync(path.dirname(VAULT_FILE), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(VAULT_FILE, TOKEN + "\n", { mode: 0o600 });
+
+      // Make get_messages WITHOUT explicit token. Only agent_name in args
+      // — the daemon's resolveToken must fall through to the vault.
+      const got = await rpc({
+        name: "get_messages",
+        arguments: {
+          agent_name: "fix2-agent",
+          status: "pending",
+          limit: 5,
+          // explicitly no agent_token field
+        },
+      });
+      // Auth succeeded if we got a structured response with messages
+      // array (count: 0 is fine — agent is fresh). Auth failure would
+      // return an error envelope with auth_error: true.
+      expect(got).toBeDefined();
+      expect(Array.isArray(got.messages)).toBe(true);
+      expect(got.count).toBe(0);
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((res) => setTimeout(res, 200));
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already dead */
+      }
+      fs.rmSync(ROOT, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 // --- handleSpawnAgent integration: vault is written before driver dispatch ---

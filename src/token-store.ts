@@ -129,6 +129,31 @@ export class FileTokenStore implements TokenStore {
   }
 
   /**
+   * v2.6.1 R1 — sync read variant for the daemon hot path
+   * (`src/server.ts:resolveToken`). Codex caught that v2.6.1 R0 wrote to the
+   * vault but never CONSUMED it on the daemon side: stdio MCP servers fork
+   * with whatever env they inherit, and the SessionStart hook's `export
+   * RELAY_AGENT_TOKEN` only mutates the hook subprocess. The daemon must
+   * fall through to a vault read when the env-supplied token is empty.
+   *
+   * Sync to avoid cascading every auth-gated tool to async — vault read is
+   * a single-line file (microseconds). Same shape semantics as `read`:
+   * never throws on miss/malformed/IO error; always returns null in those
+   * cases so the caller falls cleanly through to "no token".
+   */
+  readSync(agentName: string): string | null {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.pathFor(agentName), "utf-8");
+    } catch {
+      return null;
+    }
+    const trimmed = raw.trim();
+    if (!TOKEN_SHAPE_RE.test(trimmed)) return null;
+    return trimmed;
+  }
+
+  /**
    * Atomic write: tmp file + rename. The rename step is atomic on POSIX
    * filesystems and on NTFS for same-volume operations (always true here —
    * tmp is a sibling of the target). Concurrent spawns of the same agent

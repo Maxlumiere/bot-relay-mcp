@@ -132,8 +132,9 @@ describe("v2.6.1 — spawn-flow self-bootstrap (regression for v2.1 Phase 4j pas
     expect(cmd.env.RELAY_AGENT_TOKEN).toBeUndefined();
   });
 
-  it("(3b) Linux argv has no token interpolated and env carries no RELAY_AGENT_TOKEN", () => {
-    registerAgent("lin-child", "r", []);
+  it("(3b) Linux argv has no actual token interpolated and env carries no RELAY_AGENT_TOKEN", () => {
+    const reg = registerAgent("lin-child", "r", []);
+    const actualToken = reg.plaintext_token;
 
     const cmd = buildSpawnCommand(
       { name: "lin-child", role: "r", capabilities: [], cwd: "/tmp" } as any,
@@ -141,10 +142,14 @@ describe("v2.6.1 — spawn-flow self-bootstrap (regression for v2.1 Phase 4j pas
       { hasBinary: (n) => n === "xterm", terminalOverride: null },
       "linux"
     );
-    // No token leaks into argv (would expose via `ps` listings on multi-user
-    // hosts — historic concern preserved in the regression).
-    const TOKEN_LIKE = /[A-Za-z0-9_=.-]{20,}/;
-    expect(cmd.args.every((a) => !TOKEN_LIKE.test(a) || a.length < 20)).toBe(true);
+    // The minted plaintext token MUST NOT appear in argv (would expose via
+    // `ps` listings on multi-user hosts — historic concern preserved in the
+    // regression). v2.6.1 R1: the launch command DOES contain a vault-read
+    // prelude that references a vault path + the token-shape regex; those
+    // are public-shape strings, not the actual minted secret. Assert
+    // specifically that the secret value isn't present.
+    expect(actualToken).toBeTruthy();
+    expect(cmd.args.some((a) => a.includes(actualToken!))).toBe(false);
     expect(cmd.env.RELAY_AGENT_TOKEN).toBeUndefined();
   });
 

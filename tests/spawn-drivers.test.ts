@@ -411,7 +411,7 @@ describe("adversarial payloads — Linux driver parity (v1.9.1 Blocker 1)", () =
       // emulator's binary. No shell interpolation of the agent identity.
       expect(cmd.args).toContain("-lc");
       const lcIdx = cmd.args.indexOf("-lc");
-      expect(cmd.args[lcIdx + 1]).toMatch(/^cd '.*' && exec claude$/);
+      expect(cmd.args[lcIdx + 1]).toMatch(/cd '.*' && exec claude$/);
     }
   });
 });
@@ -581,7 +581,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
       const ctx = makeCtx(["gnome-terminal"]);
       const cmd = linuxDriver.buildCommand(baseInput(), ctx, briefPath);
       const launch = cmd.args[cmd.args.length - 1];
-      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).toMatch(/cd '.*' && exec claude$/);
       expect(launch).not.toContain(BRIEF_POINTER_PHRASE);
       expect(launch).not.toContain(briefPath);
     });
@@ -600,7 +600,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
       const ctx = makeCtx(["gnome-terminal"]);
       const cmd = linuxDriver.buildCommand(baseInput(), ctx);
       const launch = cmd.args[cmd.args.length - 1];
-      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).toMatch(/cd '.*' && exec claude$/);
       expect(launch).not.toContain(BRIEF_POINTER_PHRASE);
     });
 
@@ -612,7 +612,7 @@ describe("v2.1.5 brief_file_path KICKSTART wiring (I10 cross-platform completion
       const ctx = makeCtx(["gnome-terminal"]);
       const cmd = linuxDriver.buildCommand(baseInput(), ctx);
       const launch = cmd.args[cmd.args.length - 1];
-      expect(launch).toMatch(/^cd '.*' && exec claude$/);
+      expect(launch).toMatch(/cd '.*' && exec claude$/);
       expect(launch).not.toContain("ignored without brief");
     });
   });

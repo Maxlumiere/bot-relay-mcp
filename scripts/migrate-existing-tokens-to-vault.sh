@@ -41,58 +41,20 @@ if ! echo "$TOKEN" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
   exit 2
 fi
 
-# Mirror the daemon's path resolution. Single source of truth lives in
-# src/instance.ts:resolveInstanceDbPath; this is the same bash mirror used
-# by hooks/check-relay.sh (kept byte-identical via discipline).
-resolve_relay_db_path() {
-  if [ -n "${RELAY_DB_PATH:-}" ]; then
-    echo "$RELAY_DB_PATH"
-    return 0
-  fi
-  local root="${RELAY_HOME:-$HOME/.bot-relay}"
-  local id=""
-  if [ -n "${RELAY_INSTANCE_ID:-}" ]; then
-    id="$RELAY_INSTANCE_ID"
-  elif [ -L "$root/active-instance" ]; then
-    id=$(basename "$(readlink "$root/active-instance")")
-  elif [ -f "$root/active-instance" ]; then
-    id=$(head -n 1 "$root/active-instance" | tr -d '[:space:]')
-  fi
-  if [ -n "$id" ]; then
-    if ! echo "$id" | grep -qE '^[A-Za-z0-9._-]+$'; then
-      echo "[migrate] invalid instance_id \"$id\"" >&2
-      return 1
-    fi
-    echo "$root/instances/$id/relay.db"
-    return 0
-  fi
-  echo "$root/relay.db"
-  return 0
-}
+# Source the shared bash helpers — single source of truth shared with the
+# 3 hooks under hooks/. Prevents drift between this migration script and
+# the runtime path resolution + vault write semantics.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../hooks/_vault-helpers.sh
+. "$REPO_ROOT/hooks/_vault-helpers.sh"
 
-DB_PATH=$(resolve_relay_db_path) || exit 2
-VAULT_DIR="$(dirname "$DB_PATH")/agents"
-VAULT_FILE="$VAULT_DIR/${NAME}.token"
-
-mkdir -p "$VAULT_DIR" 2>/dev/null || true
-chmod 0700 "$VAULT_DIR" 2>/dev/null || true   # POSIX; no-op on Windows
-
-# Atomic write via tmp + rename — same shape as the hook helpers.
-TMP="${VAULT_FILE}.tmp.$$"
-{
-  umask 0177
-  printf '%s\n' "$TOKEN" > "$TMP"
-} || {
-  echo "[migrate] failed to write tmp file at $TMP" >&2
+if ! write_relay_token_to_vault "$NAME" "$TOKEN"; then
+  echo "[migrate] vault write failed for \"$NAME\"" >&2
   exit 2
-}
-chmod 0600 "$TMP" 2>/dev/null || true
-mv -f "$TMP" "$VAULT_FILE" || {
-  rm -f "$TMP" 2>/dev/null
-  echo "[migrate] failed to move tmp file into place at $VAULT_FILE" >&2
-  exit 2
-}
+fi
 
+VAULT_FILE=$(resolve_relay_token_path "$NAME") || VAULT_FILE="(unresolved)"
 echo "[migrate] Migration complete." >&2
 echo "[migrate] Token for \"$NAME\" written to: $VAULT_FILE" >&2
 echo "[migrate] You can unset RELAY_AGENT_TOKEN in your shell config now;" >&2

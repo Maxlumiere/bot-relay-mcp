@@ -35,134 +35,14 @@ AGENT_NAME="${RELAY_AGENT_NAME:-}"
 AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
-# v2.4.5 R1 — bash mirror of src/instance.ts:resolveInstanceDbPath. Closes the
-# split-brain that bit Codex 5.5 during v2.4.4 R2 (HTTP daemon resolved per-
-# instance correctly; this hook hardcoded legacy and silently read the wrong
-# DB).
-#
-# This function is BYTE-IDENTICAL across hooks/check-relay.sh,
-# hooks/post-tool-use-check.sh, and hooks/stop-check.sh. The
-# tests/v2-4-5-stdio-per-instance-db.test.ts identity test fails on any
-# divergence — change one, change all three.
-#
-# Mirrors TS semantics:
-#   - botRelayRoot(): RELAY_HOME wins (test seam), else $HOME/.bot-relay
-#                     (src/instance.ts:70).
-#   - resolveActiveInstanceId(): RELAY_INSTANCE_ID > active-instance
-#                                link/file (src/instance.ts:118).
-#   - instanceDir(): malformed instance_id rejects with [A-Za-z0-9._-]+
-#                    allowlist (src/instance.ts:149) — bash mirror emits
-#                    stderr + returns 1 instead of throwing.
-#
-# Output: resolved DB path on stdout. On malformed instance_id, stderr
-# error + return 1 (caller decides how to degrade — silent fallback is
-# the wrong call, an attacker-controlled active-instance file would
-# otherwise mask the operator's actual setup).
-resolve_relay_db_path() {
-  if [ -n "${RELAY_DB_PATH:-}" ]; then
-    echo "$RELAY_DB_PATH"
-    return 0
-  fi
-  local root="${RELAY_HOME:-$HOME/.bot-relay}"
-  local id=""
-  if [ -n "${RELAY_INSTANCE_ID:-}" ]; then
-    id="$RELAY_INSTANCE_ID"
-  elif [ -L "$root/active-instance" ]; then
-    # readlink target may be a bare instance_id or an absolute/relative
-    # path; basename normalizes both shapes (mirrors path.basename in
-    # src/instance.ts:135).
-    id=$(basename "$(readlink "$root/active-instance")")
-  elif [ -f "$root/active-instance" ]; then
-    # File-fallback for platforms where symlink creation is restricted
-    # (Windows non-admin); src/instance.ts:setActiveInstance writes a
-    # regular file in that case.
-    id=$(head -n 1 "$root/active-instance" | tr -d '[:space:]')
-  fi
-  if [ -n "$id" ]; then
-    if ! echo "$id" | grep -qE '^[A-Za-z0-9._-]+$'; then
-      echo "[bot-relay hook] invalid instance_id \"$id\" — must match [A-Za-z0-9._-]+ (mirrors src/instance.ts:instanceDir)" >&2
-      return 1
-    fi
-    echo "$root/instances/$id/relay.db"
-    return 0
-  fi
-  echo "$root/relay.db"
-  return 0
-}
-
-# v2.6.1 — bash mirror of src/token-store.ts:resolveAgentVaultDir +
-# FileTokenStore.{pathFor,read,write}. BYTE-IDENTICAL across
-# hooks/check-relay.sh, hooks/post-tool-use-check.sh, hooks/stop-check.sh.
-# Token shape regex matches src/token-store.ts:62 + spawn-agent.sh's
-# legacy isValidTokenShape allowlist.
-#
-# Identity vault layout:
-#   <instanceDir>/agents/<name>.token   — chmod 0o600, parent dir 0o700
-#   ~/.bot-relay/agents/<name>.token    — single-instance legacy fallback
-#
-# Returns:
-#   resolve_relay_token_path <name>     — echo absolute path, return 0
-#                                         (or stderr+1 on bad name).
-#   read_relay_token_from_vault <name>  — echo token on stdout, return 0
-#                                         on success; return 1 on miss /
-#                                         malformed / unreadable.
-#   write_relay_token_to_vault <name> <token>
-#                                       — atomic tmp+rename, chmod 0600.
-resolve_relay_token_path() {
-  local name="$1"
-  if ! echo "$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
-    echo "[bot-relay hook] invalid agent name \"$name\" for vault path (mirrors AGENT_NAME_RE in src/token-store.ts)" >&2
-    return 1
-  fi
-  local db_path
-  db_path=$(resolve_relay_db_path) || return 1
-  echo "$(dirname "$db_path")/agents/${name}.token"
-  return 0
-}
-read_relay_token_from_vault() {
-  local name="$1"
-  local token_path
-  token_path=$(resolve_relay_token_path "$name") || return 1
-  if [ ! -f "$token_path" ]; then
-    return 1
-  fi
-  local token
-  token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
-  if [ -z "$token" ]; then
-    return 1
-  fi
-  if ! echo "$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
-    return 1
-  fi
-  echo "$token"
-  return 0
-}
-write_relay_token_to_vault() {
-  local name="$1"
-  local token="$2"
-  if ! echo "$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
-    echo "[bot-relay hook] refusing to write malformed token to vault for \"$name\"" >&2
-    return 1
-  fi
-  local token_path
-  token_path=$(resolve_relay_token_path "$name") || return 1
-  local dir
-  dir=$(dirname "$token_path")
-  mkdir -p "$dir" 2>/dev/null || true
-  chmod 0700 "$dir" 2>/dev/null || true   # POSIX; no-op on Windows
-  # Atomic write: tmp file in same dir, chmod, rename.
-  local tmp="${token_path}.tmp.$$"
-  {
-    umask 0177  # restrict file to 0600 even before chmod
-    printf '%s\n' "$token" > "$tmp"
-  } || return 1
-  chmod 0600 "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$token_path" || {
-    rm -f "$tmp" 2>/dev/null
-    return 1
-  }
-  return 0
-}
+# v2.6.1 — vault helpers + DB-path resolution sourced from a single file.
+# Mirrors src/instance.ts:resolveInstanceDbPath + src/token-store.ts:
+# resolveAgentVaultDir + FileTokenStore.{pathFor,read,write}. Drift surfaces
+# directly as a test failure in tests/v2-6-1-token-store.test.ts (which
+# sources this same file) — no inline-copy hide-out.
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./_vault-helpers.sh
+. "$HOOKS_DIR/_vault-helpers.sh"
 DB_PATH=$(resolve_relay_db_path) || {
   # Malformed active-instance content — refuse to fall back silently. A
   # broken setup should be loud, not hidden under legacy. The hook's

@@ -204,9 +204,32 @@ CMD="export RELAY_AGENT_NAME=$Q_NAME; export RELAY_AGENT_ROLE=$Q_ROLE; export RE
 # title_ref to find + raise this window. Defaults to $DISPLAY_NAME (same
 # string claude --name uses for the tab title) so the DB value matches the
 # live window title without extra operator config.
-# v2.6.1: RELAY_AGENT_TOKEN export removed. Identity flows via the per-
-# instance file vault at <instanceDir>/agents/<name>.token; the hook
-# resolves it on first turn without an env-var passthrough.
+#
+# v2.6.1 R1 — vault hydration in the LAUNCHING SHELL, before `claude` is
+# exec'd. Codex's R1 catch: the SessionStart hook's `export RELAY_AGENT_TOKEN`
+# only mutates the hook subprocess; already-running claude (and its stdio
+# MCP server forked from this shell) cannot inherit env post-fork. So the
+# token must be set in *this* shell so claude inherits it on fork.
+#
+# Pre-resolve the vault path on the parent side via the shared bash helper
+# (single source of truth with hooks/_vault-helpers.sh). Embed a literal
+# absolute path into CMD — no path-resolution logic in the CMD string —
+# then use `cat | tr | grep` to read + shape-validate at runtime.
+SPAWN_HELPERS_DIR="$(cd "$(dirname "$0")/../hooks" && pwd 2>/dev/null)"
+if [ -n "$SPAWN_HELPERS_DIR" ] && [ -f "$SPAWN_HELPERS_DIR/_vault-helpers.sh" ]; then
+  # shellcheck source=../hooks/_vault-helpers.sh
+  . "$SPAWN_HELPERS_DIR/_vault-helpers.sh"
+  if VAULT_PATH=$(resolve_relay_token_path "$NAME" 2>/dev/null); then
+    Q_VAULT=$(printf '%q' "$VAULT_PATH")
+    # The child shell evaluates this snippet:
+    #   if RELAY_AGENT_TOKEN is empty AND vault file exists,
+    #   read first line, strip whitespace, shape-validate, export.
+    # `\$T`, `\${RELAY_AGENT_TOKEN:-}`, and `\$` inside the regex are
+    # deferred to runtime in the child shell (escaped from THIS shell's
+    # double-quoted string assembly).
+    CMD="$CMD if [ -z \"\${RELAY_AGENT_TOKEN:-}\" ] && [ -f $Q_VAULT ]; then T=\$(head -n 1 $Q_VAULT 2>/dev/null | tr -d '[:space:]'); if printf '%s' \"\$T\" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}\$'; then export RELAY_AGENT_TOKEN=\"\$T\"; fi; fi;"
+  fi
+fi
 # v2.1.2 fix (2026-04-20): append a kickstart prompt so the spawned agent
 # auto-generates instead of idling at the `>` prompt. Claude Code treats the
 # bare `prompt` positional as a pre-submitted user message in interactive

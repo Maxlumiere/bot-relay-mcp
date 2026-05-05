@@ -57,6 +57,7 @@ import {
   handleExpandCapabilities,
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
+import { defaultTokenStore } from "./token-store.js";
 import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents } from "./db.js";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
@@ -371,7 +372,7 @@ export function createServer(): Server {
           "Open a new Claude Code terminal pre-configured as a relay agent (macOS only).\n\n" +
           "When to use: orchestrators delegating work to a fresh sub-agent. The new terminal arrives in a known role + capability set with `RELAY_AGENT_NAME`/`ROLE`/`CAPABILITIES` already in env, and the SessionStart hook auto-registers it before the LLM's first turn. Linux/Windows drivers exist for headless smoke tests but do not open a UI window.\n\n" +
           "Behavior: pre-registers the new agent server-side (so its token is minted before the child process starts and reaches it via env), opens an iTerm2 or Terminal.app window via AppleScript, and runs the configured shell command in that window. Optional `initial_message` is queued in the new agent's mailbox and surfaces on its first `get_messages`. `brief_file_path` (v2.1.4) threads a durable on-disk task brief into the KICKSTART prompt, preferred over `initial_message` for non-trivial scopes because file-on-disk does not read as prompt-injection the way an inbox message can.\n\n" +
-          "Returns: `{ success: true, name, role, capabilities, platform, driver, agent_token, auth_note, has_initial_message, brief_file_path, note }`. `agent_token` is shown ONCE — already exported into the spawned child's `RELAY_AGENT_TOKEN` env so the child authenticates from its first tool call.\n\n" +
+          "Returns: `{ success: true, name, role, capabilities, platform, driver, agent_token, auth_note, has_initial_message, brief_file_path, note }`. `agent_token` is shown ONCE — already written to the per-instance file vault at `<instanceDir>/agents/<name>.token` (v2.6.1). The spawned terminal's launcher reads the vault before exec'ing claude (macOS / Linux), and the daemon's `resolveToken` falls back to the vault on every auth call as a defense-in-depth, so the child authenticates from its first tool call regardless of platform.\n\n" +
           "Errors: `SPAWN_NOT_SUPPORTED` (non-macOS host without an explicit driver), `AUTH_FAILED`, `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(SpawnAgentSchema),
       },
@@ -791,6 +792,13 @@ export function createServer(): Server {
    *   1. args.agent_token (explicit tool input — MCP stdio + HTTP both work)
    *   2. HTTP X-Agent-Token header (captured in request context)
    *   3. RELAY_AGENT_TOKEN env var (for stdio flows)
+   *   4. v2.6.1 R1 — per-instance file vault. The stdio MCP server's env
+   *      is set at fork time and cannot be mutated by the SessionStart
+   *      hook's `export` (which only affects the hook subprocess). Without
+   *      this fallback, a fresh-spawned terminal whose hook DID write the
+   *      vault still fails its first MCP call because the daemon never
+   *      consults disk. Sync read; microseconds. Closes the gaming-build
+   *      regression caught 2026-05-04 + the v2.6.1 R0 audit gap.
    */
   function resolveToken(args: any): string | null {
     if (args && typeof args === "object" && typeof args.agent_token === "string" && args.agent_token.length > 0) {
@@ -800,6 +808,46 @@ export function createServer(): Server {
     if (ctx.headerAgentToken) return ctx.headerAgentToken;
     const envTok = process.env.RELAY_AGENT_TOKEN;
     if (envTok && envTok.length > 0) return envTok;
+    const vaultName = resolveCallerNameForVault(args);
+    if (vaultName) {
+      try {
+        const vaultTok = defaultTokenStore().readSync(vaultName);
+        if (vaultTok) return vaultTok;
+      } catch {
+        /* malformed agent name or IO error — fall through to null */
+      }
+    }
+    return null;
+  }
+
+  /**
+   * v2.6.1 R1 — resolve the caller name used to look up the vault file.
+   *
+   * - **HTTP transport (multi-agent-per-process):** the caller may be any
+   *   of N agents sharing the same daemon. Only fall back to the vault
+   *   when `args.agent_name` is explicitly present (most write-side tools
+   *   carry it; read-side discover_agents / health_check don't, and
+   *   shouldn't auto-resolve to a single agent's vault). Header-injected
+   *   names are explicitly NOT honored — header-only inputs go through
+   *   `headerAgentToken` above; vault lookup requires the caller has
+   *   self-identified in the tool args.
+   *
+   * - **stdio transport (single-agent-per-process):** the agent is
+   *   identified at process fork via `RELAY_AGENT_NAME` (set by the
+   *   spawn-agent.sh CMD prefix or by the operator's shell rc). Single
+   *   identity per process, no ambiguity.
+   */
+  function resolveCallerNameForVault(args: any): string | null {
+    if (
+      args &&
+      typeof args === "object" &&
+      typeof args.agent_name === "string" &&
+      args.agent_name.length > 0
+    ) {
+      return args.agent_name;
+    }
+    const envName = process.env.RELAY_AGENT_NAME;
+    if (envName && envName.length > 0) return envName;
     return null;
   }
 

@@ -19,17 +19,26 @@ If you want the short version: **the relay now writes `<instanceDir>/agents/<nam
 
 - File: chmod 0o600. Contents: a single line — the plaintext bcrypt-input token. The relay stores only a bcrypt hash in the `agents.token_hash` column; the plaintext lives only in the vault file (and briefly in env when the hook hydrates it).
 - Parent directory: chmod 0o700. Inherits the same per-instance scope as the relay DB so no split-brain: when the daemon serves a per-instance DB, the vault sits next to it.
-- Path resolution mirrors `src/instance.ts:resolveInstanceDbPath()` — a byte-identical bash function lives in `hooks/check-relay.sh`, `hooks/post-tool-use-check.sh`, `hooks/stop-check.sh`, and `scripts/migrate-existing-tokens-to-vault.sh`. Drift would surface as a regression in `tests/v2-6-1-token-store.test.ts`.
+- Path resolution mirrors `src/instance.ts:resolveInstanceDbPath()`. v2.6.1 R1 consolidated the bash mirrors into a single sourced file at `hooks/_vault-helpers.sh` — `hooks/check-relay.sh`, `hooks/post-tool-use-check.sh`, `hooks/stop-check.sh`, and `scripts/migrate-existing-tokens-to-vault.sh` all `source` it. The same file is sourced by `tests/v2-6-1-token-store.test.ts`, so drift between bash and TS surfaces as a real test failure rather than an inline-copy hide-out.
 
 ## Bootstrap → persistence → recovery
 
+The vault is consumed at TWO independent layers — each platform-correct on its own, together making spawn-to-ready zero-touch:
+
+1. **Launching shell hydration (macOS / Linux as of v2.6.1).** When `bin/spawn-agent.sh` (macOS) or the Linux terminal driver assembles the inner-shell command, it embeds a single-line bash snippet that reads the vault file into `RELAY_AGENT_TOKEN` BEFORE `exec claude`. Because env propagates parent → child at fork, the spawned `claude` (and its stdio MCP server) inherits the token from the moment it starts. The vault path is pre-resolved to an absolute literal on the parent side; the snippet only needs `head -n 1`, `tr`, and `grep -E` at runtime.
+2. **Daemon-side fallback (every platform, every code path).** `src/server.ts:resolveToken` falls through to a sync vault read when env / args / header all return empty. This is the load-bearing platform-independent path: if the launching shell never hydrated env (Windows wt/powershell/cmd in v2.6.1, OR a bare manual `claude` start with neither env nor a hook), the very first MCP call still authenticates because the daemon consults the same vault file the hook wrote. Sync reads of a single-line file are microseconds.
+
+Together the two layers cover every operational scenario:
+
 | Scenario | What happens |
 |---|---|
-| **First spawn** of `gaming-build` | SessionStart hook reads vault → miss → calls `register_agent` over HTTP → relay mints fresh token + returns in response → hook captures with `grep -oE '"agent_token":"[^"]*"'` → writes vault (atomic tmp+rename, chmod 0600) → exports `RELAY_AGENT_TOKEN`. First MCP call authenticates. |
-| **Re-spawn** of `gaming-build` | Hook reads vault → hit → exports. **No re-register.** Same identity, same mailbox, same session. |
-| **Lost / corrupted vault file** | Hook reads vault → miss / shape-validation rejects malformed content → calls `register_agent` → daemon refuses with `NAME_COLLISION_ACTIVE` (the row exists from the first registration). Hook stderr-prints "Bootstrap failed for `<name>` — run `relay recover <name>` and re-spawn." Existing recovery flow handles it. |
-| **Token revoked elsewhere** | Hook reads stale vault file, exports → first MCP call fails `AUTH_FAILED`. The health_check pre-probe in `hooks/check-relay.sh` surfaces actionable stderr; operator runs `relay recover <name>` (which deletes the vault file) and re-spawns. |
-| **Recovery flow** | `relay recover <name>` deletes the row + scrubs the vault file. The next register_agent (whether triggered by SessionStart or a manual MCP call) writes a fresh vault entry. Operators no longer need to manually `export RELAY_AGENT_TOKEN=...` after recovery. |
+| **First spawn via `spawn_agent` MCP tool** | `handleSpawnAgent` registers the new agent server-side, captures the plaintext token, writes the vault file (atomic tmp+rename, chmod 0o600), then dispatches the driver. The launcher's prelude (macOS / Linux) reads the vault into `RELAY_AGENT_TOKEN` before `exec claude`. First MCP call authenticates against the env-supplied token. |
+| **First spawn via direct `bin/spawn-agent.sh` invocation (no pre-mint)** | Vault is empty pre-spawn. Launcher prelude reads → miss → `claude` starts with empty `RELAY_AGENT_TOKEN`. SessionStart hook fires inside the new claude, calls `register_agent` over HTTP, captures the response token, writes the vault. The already-running stdio MCP server's env is unchanged BUT its `resolveToken` falls through to the daemon-side vault read on every call → first MCP call authenticates. (This is the gaming-build regression closed in v2.6.1 R1.) |
+| **Re-spawn of an existing agent (terminal closed + reopened)** | Vault has the token. Launcher prelude (macOS / Linux) reads → hit → exports. No re-registration. Same identity, same mailbox. On Windows the daemon-side fallback authenticates the same way. |
+| **Bare `claude` start with no spawn-agent.sh / hook** | No env, no launcher prelude. First MCP call → `resolveToken` sees env empty → falls through to vault → reads → authenticates. (Pure FIX 2 path; works on every platform.) |
+| **Lost / corrupted vault file** | Daemon-side fallback returns null on shape-validation reject; first MCP call fails `AUTH_FAILED`; hook (if running) detects via `health_check` pre-probe and surfaces actionable stderr pointing at `relay recover <name>`. |
+| **Token revoked elsewhere** | Vault holds the stale token; `resolveToken` returns it; daemon's bcrypt check fails → `AUTH_FAILED`. Operator runs `relay recover <name>` (which deletes the vault file). Next `register_agent` produces a fresh vault entry. |
+| **Recovery flow** | `relay recover <name>` deletes the row + scrubs the vault file. The next `register_agent` (via SessionStart hook or manual MCP) writes a fresh vault entry. Operators no longer need to manually `export RELAY_AGENT_TOKEN=...`. |
 
 ## Cross-platform story
 
