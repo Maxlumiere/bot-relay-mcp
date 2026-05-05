@@ -665,6 +665,165 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
       fs.rmSync(ROOT, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("(17c) HTTP daemon REFUSES env-token fallback — auth cannot bypass via daemon's own RELAY_AGENT_TOKEN env (R3 security boundary)", async () => {
+    // Codex caught (msg 2cbe68a2, 2026-05-05) on R2 audit that R2 closed only
+    // the vault half of the auth-oracle bug class. Item 3 of the precedence
+    // chain (process.env.RELAY_AGENT_TOKEN) was still ungated: an HTTP daemon
+    // launched with RELAY_AGENT_TOKEN in its env (a totally normal operator
+    // pattern when the operator runs a stdio + HTTP combo) would let any
+    // unauthenticated HTTP caller authenticate against the daemon's own env
+    // token. R3 generalizes the rule: items 3 and 4 (daemon-side credentials)
+    // are both gated on ctx.transport === "stdio". This test pins the
+    // env-token half of the boundary; test 17b pins the vault half.
+    const PORT = 39415;
+    const ROOT = path.join(os.tmpdir(), "v2-6-1-r3-test17c-" + process.pid);
+    if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
+    fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+    const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
+    expect(fs.existsSync(DIST_INDEX)).toBe(true);
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { spawn } = require("child_process") as typeof import("child_process");
+
+    async function rpc(
+      port: number,
+      args: any,
+      headers: Record<string, string> = {},
+    ): Promise<any> {
+      const allHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        ...headers,
+      };
+      const body = {
+        jsonrpc: "2.0",
+        id: Math.floor(Math.random() * 1e9),
+        method: "tools/call",
+        params: { name: args.name, arguments: args.arguments },
+      };
+      const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: allHeaders,
+        body: JSON.stringify(body),
+      });
+      const text = await resp.text();
+      const dataLine = text.split("\n").map((l) => l.trim()).find((l) => l.startsWith("data:"));
+      const payload = dataLine ? dataLine.slice(5).trim() : text.trim();
+      const rpcResp = JSON.parse(payload);
+      const inner = rpcResp.result?.content?.[0]?.text;
+      return inner ? JSON.parse(inner) : rpcResp;
+    }
+
+    async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        try {
+          const r = await fetch(`http://127.0.0.1:${port}/health`);
+          if (r.ok) return;
+        } catch {
+          /* not up yet */
+        }
+        await new Promise((res) => setTimeout(res, 100));
+      }
+      throw new Error(`HTTP daemon at :${port} did not become healthy within ${timeoutMs}ms`);
+    }
+
+    // Phase A — clean HTTP daemon (no env-token), register agent, capture
+    // its real token, kill the daemon. The DB at ROOT/relay.db now carries
+    // the agents row + token_hash for env-oracle-agent.
+    let REAL_TOKEN: string;
+    {
+      const child = spawn("node", [DIST_INDEX], {
+        env: {
+          ...process.env,
+          RELAY_TRANSPORT: "http",
+          RELAY_HTTP_PORT: String(PORT),
+          RELAY_HTTP_HOST: "127.0.0.1",
+          RELAY_HOME: ROOT,
+          RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+          RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
+          RELAY_AGENT_TOKEN: "",
+          RELAY_AGENT_NAME: "",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      try {
+        await waitForHealth(PORT, 5000);
+        const reg = await rpc(PORT, {
+          name: "register_agent",
+          arguments: { name: "env-oracle-agent", role: "tester", capabilities: [] },
+        });
+        expect(reg.success).toBe(true);
+        REAL_TOKEN = reg.agent_token;
+        expect(REAL_TOKEN).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
+      } finally {
+        child.kill("SIGTERM");
+        await new Promise((res) => setTimeout(res, 200));
+        try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      }
+    }
+
+    // Brief settle so the DB lock from phase A fully releases before phase B
+    // opens the same DB.
+    await new Promise((res) => setTimeout(res, 200));
+
+    // Phase B — re-spawn the SAME daemon (same DB) WITH the real token
+    // baked into RELAY_AGENT_TOKEN env. If R3 didn't gate, an HTTP caller
+    // with no creds could authenticate against this env token by naming
+    // env-oracle-agent in args.agent_name.
+    const child = spawn("node", [DIST_INDEX], {
+      env: {
+        ...process.env,
+        RELAY_TRANSPORT: "http",
+        RELAY_HTTP_PORT: String(PORT),
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HOME: ROOT,
+        RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+        RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
+        // The bug under test: this env exists, R2 would have honored it on
+        // every HTTP call. R3 must refuse.
+        RELAY_AGENT_TOKEN: REAL_TOKEN,
+        RELAY_AGENT_NAME: "env-oracle-agent",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    try {
+      await waitForHealth(PORT, 5000);
+
+      // ATTACK: HTTP get_messages with args.agent_name set + NO token through
+      // any caller-presented channel (no agent_token arg, no X-Agent-Token
+      // header). R3 must refuse: env-token is daemon-side and stdio-only.
+      const attack = await rpc(PORT, {
+        name: "get_messages",
+        arguments: { agent_name: "env-oracle-agent", status: "pending", limit: 5 },
+      });
+      expect(attack.auth_error).toBe(true);
+      expect(attack.error_code).toBe("AUTH_FAILED");
+      expect(attack.success).toBe(false);
+
+      // CONTROL: same call with the real X-Agent-Token succeeds — confirms
+      // the refusal is the R3 gate, not an unrelated bug. The control proves
+      // the daemon is healthy AND that the env token is the right one for
+      // this agent (so the gate, not a token mismatch, is what blocks the
+      // attack call).
+      const ok = await rpc(
+        PORT,
+        {
+          name: "get_messages",
+          arguments: { agent_name: "env-oracle-agent", status: "pending", limit: 5 },
+        },
+        { "X-Agent-Token": REAL_TOKEN },
+      );
+      expect(Array.isArray(ok.messages)).toBe(true);
+      expect(ok.auth_error).toBeUndefined();
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((res) => setTimeout(res, 200));
+      try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      fs.rmSync(ROOT, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 // --- handleSpawnAgent integration: vault is written before driver dispatch ---

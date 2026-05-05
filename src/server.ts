@@ -372,7 +372,7 @@ export function createServer(): Server {
           "Open a new Claude Code terminal pre-configured as a relay agent (macOS only).\n\n" +
           "When to use: orchestrators delegating work to a fresh sub-agent. The new terminal arrives in a known role + capability set with `RELAY_AGENT_NAME`/`ROLE`/`CAPABILITIES` already in env, and the SessionStart hook auto-registers it before the LLM's first turn. Linux/Windows drivers exist for headless smoke tests but do not open a UI window.\n\n" +
           "Behavior: pre-registers the new agent server-side (so its token is minted before the child process starts and reaches it via env), opens an iTerm2 or Terminal.app window via AppleScript, and runs the configured shell command in that window. Optional `initial_message` is queued in the new agent's mailbox and surfaces on its first `get_messages`. `brief_file_path` (v2.1.4) threads a durable on-disk task brief into the KICKSTART prompt, preferred over `initial_message` for non-trivial scopes because file-on-disk does not read as prompt-injection the way an inbox message can.\n\n" +
-          "Returns: `{ success: true, name, role, capabilities, platform, driver, agent_token, auth_note, has_initial_message, brief_file_path, note }`. `agent_token` is shown ONCE — already written to the per-instance file vault at `<instanceDir>/agents/<name>.token` (v2.6.1). The spawned terminal's launcher reads the vault before exec'ing claude (macOS / Linux), and the stdio MCP server transport's `resolveToken` falls back to the per-instance vault when `RELAY_AGENT_NAME` env is set, so the child authenticates from its first tool call regardless of platform. HTTP clients must always present an explicit token (args.agent_token, X-Agent-Token, or RELAY_AGENT_TOKEN) — the vault is stdio-only and never network-reachable.\n\n" +
+          "Returns: `{ success: true, name, role, capabilities, platform, driver, agent_token, auth_note, has_initial_message, brief_file_path, note }`. `agent_token` is shown ONCE — already written to the per-instance file vault at `<instanceDir>/agents/<name>.token` (v2.6.1). The spawned terminal's launcher reads the vault before exec'ing claude (macOS / Linux), and the stdio MCP server transport's `resolveToken` falls back to `RELAY_AGENT_TOKEN` env or the per-instance vault when `RELAY_AGENT_NAME` is set, so the child authenticates from its first tool call regardless of platform. HTTP clients must always present an explicit token via `args.agent_token` or `X-Agent-Token` header — the daemon's own env (`RELAY_AGENT_TOKEN`, `RELAY_AGENT_NAME`) and the per-instance vault are stdio-only credentials and are never used to authenticate HTTP callers (R3 transport gate).\n\n" +
           "Errors: `SPAWN_NOT_SUPPORTED` (non-macOS host without an explicit driver), `AUTH_FAILED`, `INVALID_INPUT`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(SpawnAgentSchema),
       },
@@ -788,37 +788,60 @@ export function createServer(): Server {
   }
 
   /**
-   * Resolve the raw token a caller presented, in order of precedence:
-   *   1. args.agent_token (explicit tool input — MCP stdio + HTTP both work)
-   *   2. HTTP X-Agent-Token header (captured in request context)
-   *   3. RELAY_AGENT_TOKEN env var (for stdio flows)
-   *   4. v2.6.1 R2 — per-instance file vault, **STDIO TRANSPORT ONLY**.
-   *      The stdio MCP server's env is set at fork time and cannot be
-   *      mutated by the SessionStart hook's `export` (which only affects
-   *      the hook subprocess), so a fresh-spawned terminal whose hook
-   *      DID write the vault still fails its first MCP call without this
-   *      fallback. The fallback is gated on `ctx.transport === "stdio"`
-   *      because the stdio process identity IS the agent (single agent
-   *      per process, RELAY_AGENT_NAME set at fork). HTTP cannot use the
-   *      vault: the R1 implementation honored `args.agent_name` here,
-   *      which let any unauthenticated HTTP caller name an agent and the
-   *      daemon would obligingly read that agent's vault file —
-   *      effectively turning the local file vault into a network-reachable
-   *      auth oracle. Codex caught this on the R1 audit (msg d1fbbdde,
-   *      2026-05-05). Sync read; microseconds.
+   * Resolve the raw token a caller presented, in precedence order. The chain
+   * is split into two halves by trust origin (v2.6.1 R3):
+   *
+   * **Caller-presented (safe on any transport):**
+   *   1. `args.agent_token` — explicit tool input. The caller chose to
+   *      authenticate this call with this token; works on stdio + HTTP.
+   *   2. `X-Agent-Token` HTTP header — caller-presented per request,
+   *      captured by the HTTP transport into the request context.
+   *
+   * **Daemon-side (STDIO TRANSPORT ONLY):**
+   *   3. `process.env.RELAY_AGENT_TOKEN` — daemon's own env var. On stdio
+   *      this IS the agent's identity (single agent per process,
+   *      RELAY_AGENT_NAME set at fork). On HTTP it's the daemon's env, so
+   *      letting an HTTP caller authenticate against it without presenting
+   *      the token themselves is an auth oracle — the daemon would
+   *      effectively donate its env credential to anyone who can POST.
+   *   4. Per-instance vault file at `<instanceDir>/agents/<RELAY_AGENT_NAME>.token`.
+   *      Same trust origin as item 3: it's the local filesystem of the
+   *      daemon process. Same gate.
+   *
+   * Both items 3 and 4 are gated on `ctx.transport === "stdio"`. HTTP
+   * requests skip the daemon-side half entirely and fall through to
+   * `AUTH_FAILED`. Codex caught the env-var oracle on R2 audit (msg
+   * 2cbe68a2, 2026-05-05) after R2 closed only the vault half (msg
+   * d1fbbdde) — R3 generalizes the rule so the full bug class is closed
+   * in one place. The daemon-side credential rule: anything the daemon
+   * process has access to without the caller presenting it is daemon-side,
+   * and daemon-side credentials must NEVER authenticate HTTP callers.
+   *
+   * Stdio rationale: the process identity IS the agent. The stdio MCP
+   * server is forked by `bin/spawn-agent.sh` (or the operator's shell rc)
+   * with RELAY_AGENT_NAME + RELAY_AGENT_TOKEN already in env, and it
+   * accepts JSON-RPC over stdin/stdout from a single client (the parent
+   * `claude` process) — there's no impersonation surface.
    */
   function resolveToken(args: any): string | null {
+    // Item 1 — args.agent_token (caller-presented per call).
     if (args && typeof args === "object" && typeof args.agent_token === "string" && args.agent_token.length > 0) {
       return args.agent_token;
     }
     const ctx = currentContext();
+    // Item 2 — X-Agent-Token header (caller-presented per request).
     if (ctx.headerAgentToken) return ctx.headerAgentToken;
+    // v2.6.1 R3 security boundary: items 3 and 4 are daemon-side
+    // credentials (the daemon's own env + the daemon's filesystem).
+    // STDIO ONLY. HTTP requests must always present a token via item 1
+    // or item 2 — the daemon never donates its own credentials to
+    // network callers. Codex msg 2cbe68a2 (env-token oracle) + d1fbbdde
+    // (vault oracle) both closed by this single transport gate.
+    if (ctx.transport !== "stdio") return null;
+    // Item 3 — daemon's RELAY_AGENT_TOKEN env (stdio: agent's own identity).
     const envTok = process.env.RELAY_AGENT_TOKEN;
     if (envTok && envTok.length > 0) return envTok;
-    // v2.6.1 R2 security boundary: vault fallback is stdio-only. HTTP
-    // requests fall through to AUTH_FAILED so the local file vault is
-    // never network-reachable as an auth oracle.
-    if (ctx.transport !== "stdio") return null;
+    // Item 4 — per-instance file vault (stdio: same trust as the env).
     const vaultName = resolveCallerNameForVault();
     if (vaultName) {
       try {

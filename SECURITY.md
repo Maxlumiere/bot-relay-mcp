@@ -86,12 +86,19 @@ It is NOT designed to be safe against:
 
 Every agent registered via `register_agent` receives a 32-byte base64url token shown ONCE in the response. The relay stores only a bcrypt hash (`agents.token_hash`) — the plaintext is discarded after the response is written.
 
-Subsequent tool calls must present the token via one of four channels (in precedence order):
+Subsequent tool calls must present the token via one of four channels (in precedence order). The chain is split by trust origin (v2.6.1 R3):
+
+**Caller-presented (accepted on any transport):**
 
 1. `agent_token` argument in the tool input.
 2. `X-Agent-Token` HTTP header.
-3. `RELAY_AGENT_TOKEN` environment variable (stdio flow).
-4. **(stdio transport only)** per-instance file vault at `<instanceDir>/agents/<RELAY_AGENT_NAME>.token`, read via `defaultTokenStore().readSync()` (v2.6.1 R2). Gated on `currentContext().transport === "stdio"` and on `process.env.RELAY_AGENT_NAME` being set; `args.agent_name` is **not** honored for vault lookup. HTTP clients never read the vault — see `docs/agents/local-identity.md` for the threat model. R1 honored args.agent_name here and was rejected on review (auth-oracle risk over the network); R2 closed the gap.
+
+**Daemon-side (STDIO TRANSPORT ONLY — gated on `currentContext().transport === "stdio"`):**
+
+3. `RELAY_AGENT_TOKEN` environment variable. The daemon's own env. On stdio this IS the agent's identity (single agent per process, RELAY_AGENT_NAME set at fork). On HTTP it's the daemon's env, so HTTP requests bypass it entirely — letting an HTTP caller authenticate against it without presenting the token themselves would turn the daemon into an auth oracle (codex msg 2cbe68a2, 2026-05-05).
+4. Per-instance file vault at `<instanceDir>/agents/<RELAY_AGENT_NAME>.token`, read via `defaultTokenStore().readSync()` (v2.6.1 R2). Same trust origin as item 3: the daemon's local filesystem. Gated on the same transport check; `args.agent_name` is **not** honored for vault lookup (codex msg d1fbbdde).
+
+The general rule (v2.6.1 R3): **anything the daemon process has access to without the caller presenting it is a daemon-side credential, and daemon-side credentials must NEVER authenticate HTTP callers.** HTTP clients must always present a token via item 1 or item 2; otherwise the resolver returns null and the request fails `AUTH_FAILED`. This includes a daemon launched in HTTP mode with `RELAY_AGENT_TOKEN` baked into its env — that env is for stdio mode only and is ignored on HTTP requests. Pinned by `tests/v2-6-1-token-store.test.ts:17b` (vault) + `:17c` (env-token).
 
 A capability list is set at first registration and is **immutable** (v1.7.1 rule). Changing capabilities requires `unregister_agent` + fresh `register_agent`.
 
