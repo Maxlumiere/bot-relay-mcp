@@ -7,6 +7,10 @@
 #   3. npm audit --audit-level=moderate
 #   4. npm run build
 #   5. Drift guard: no hardcoded version literals in src/ outside src/version.ts
+#   5a. Tests-side drift guard (v2.6.3): no hardcoded literal of the CURRENT
+#       package.json version in tests/ — catches assertions like
+#       `expect(...).toBe("X.Y.Z")` that go stale on bump and slipped past
+#       the src/-only check until v2.6.0 publish-prep --full gate caught one
 #   6. End-to-end 25-tool smoke + CLI subcommand smoke against an isolated relay
 #
 # Wired via package.json "prepublishOnly" so `npm publish` will refuse to ship
@@ -106,7 +110,7 @@ extension_compile() {
 }
 step "extension TS compile (extensions/vscode)" extension_compile || exit 1
 
-# --- 5. Drift guard ---
+# --- 5. Drift guard (src/) ---
 # Any string literal matching /["']\d+\.\d+\.\d+["']/ inside src/ that is NOT
 # in one of the two authoritative version files (src/version.ts for package
 # VERSION, src/protocol.ts for PROTOCOL_VERSION) fails the gate. Grep for
@@ -130,6 +134,71 @@ drift_guard() {
   return 0
 }
 step "drift guard (no hardcoded versions)" drift_guard || exit 1
+
+# --- 5a. Tests-side drift guard (v2.6.3) ---
+#
+# Catches the v2.6.0 publish-prep regression class: a test asserting against
+# the CURRENT package.json version with a hardcoded literal
+# (e.g. `expect(...version).toBe("2.5.0")`) gets stale the moment the
+# package version is bumped, but slips past the src/-only drift guard above.
+# The first time this fires is during the post-bump --full gate run — too
+# late to be caught early in iteration.
+#
+# Strategy: read the CURRENT package.json version, grep tests/ for that
+# exact literal as a quoted string. Hits indicate a test pinning to the
+# current version that should instead read package.json dynamically (mirror
+# of the v2.2.0 dashboard smoke fix:
+#   const __pkgJson = path.resolve(...) + "/package.json";
+#   const EXPECTED_VERSION = JSON.parse(fs.readFileSync(__pkgJson, "utf-8")).version;
+# ).
+#
+# Selectivity: ONLY the current version literal triggers — older-version
+# literals (e.g. "2.3.0" in traffic-replay fixtures, "2.4.0" in protocol
+# assertions or instance-metadata test data) are intentional and not flagged.
+# This keeps the guard targeted at the exact bug class without forcing
+# allowlist comments across ~50 legitimate fixture lines.
+#
+# Per-line allowlist: any line ending in `// ALLOWLIST:` (or `# ALLOWLIST:`)
+# is exempt — for the rare case where a test legitimately needs to assert
+# against the current version literal (e.g. testing a migration whose
+# expected output is "current version was X"). Use sparingly with a
+# justification in the ALLOWLIST: comment.
+tests_drift_guard() {
+  local current_version
+  current_version=$(node -e "console.log(require('$PROJECT_ROOT/package.json').version)") || {
+    echo "Failed to read package.json version" >&2
+    return 1
+  }
+  if [ -z "$current_version" ]; then
+    echo "package.json version is empty — refusing to scan" >&2
+    return 1
+  fi
+  # Escape dots for grep -E.
+  local escaped="${current_version//./\\.}"
+  local hits
+  hits=$(grep -rnE "[\"']${escaped}[\"']" "$PROJECT_ROOT/tests" \
+    | grep -vE 'ALLOWLIST:' \
+    | grep -vE ':\s*(//|\*)' \
+    || true)
+  if [ -n "$hits" ]; then
+    echo "Hardcoded current-version literal \"$current_version\" detected in tests/:" >&2
+    echo "$hits" >&2
+    echo "" >&2
+    echo "Fix: read the version from package.json at test load time (mirror src/version.ts):" >&2
+    echo "  import fs from \"fs\";" >&2
+    echo "  import path from \"path\";" >&2
+    echo "  import { fileURLToPath } from \"url\";" >&2
+    echo "  const __pkg = path.resolve(path.dirname(fileURLToPath(import.meta.url)), \"..\", \"package.json\");" >&2
+    echo "  const EXPECTED_VERSION = JSON.parse(fs.readFileSync(__pkg, \"utf-8\")).version;" >&2
+    echo "" >&2
+    echo "Or, for a legitimate one-off (e.g. testing a migration that pins to the current release)," >&2
+    echo "append \`// ALLOWLIST: <reason>\` to the offending line." >&2
+    return 1
+  fi
+  echo "No tests/ drift — no hardcoded \"$current_version\" literals (current package version)"
+  return 0
+}
+step "tests/ drift guard (no current-version literals)" tests_drift_guard || exit 1
 
 # --- 5b. Sanctioned-helper guard (v2.1 Phase 7q) -----------------------------
 # Reject raw `UPDATE agents` / `DELETE FROM agents` / `UPDATE agent_capabilities`

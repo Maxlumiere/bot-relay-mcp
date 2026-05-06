@@ -1,5 +1,45 @@
 # Changelog
 
+## v2.6.1 — 2026-05-06 — drift-grep guard extension to scan tests/
+
+> Internal brief was tracked as "v2.6.3" in dispatch sequence; npm semver patch on v2.6.0 publishes as v2.6.1. Brief naming is a tracking convention, not a semver promise.
+
+Small follow-up to the v2.6.0 publish-prep regression caught at the bumped state. `tests/v2-2-0-full-dashboard-smoke.test.ts:112` had a hardcoded `"2.5.0"` literal that slipped past the existing `src/`-only drift-grep guard. The `--full` gate caught it during publish-prep, but only at the bumped state — too late to be caught early in iteration. v2.6.3 adds a guard step so the regression is caught immediately on any future bump.
+
+### Scope
+
+- **`scripts/pre-publish-check.sh`** — new step `tests_drift_guard()` that reads the CURRENT package.json version and greps `tests/` for that exact literal as a quoted string. Fails the gate if any hits remain after excluding lines marked `// ALLOWLIST:` and comment-only lines (`//` / `*` prefix). Strategy is selective: only the CURRENT version triggers, not arbitrary X.Y.Z patterns. This keeps legitimate older-version fixtures (e.g. `"2.3.0"` in traffic-replay tests, `"2.4.0"` in protocol assertions / instance-metadata test data) un-flagged without forcing ALLOWLIST comments across ~50 lines.
+- **Per-line allowlist** — any line ending in `// ALLOWLIST: <reason>` (or `# ALLOWLIST: <reason>`) is exempt. For the rare case where a test legitimately needs to assert against the current version literal (e.g. testing a migration whose expected output is "current version was X"). Use sparingly with a justification.
+- **Error message** points the operator at the `package.json`-read pattern (mirror of `src/version.ts`):
+  ```typescript
+  const __pkg = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+  const EXPECTED_VERSION = JSON.parse(fs.readFileSync(__pkg, "utf-8")).version;
+  ```
+- **`tests/v2-6-3-drift-guard-tests-scan.test.ts`** *(new, 5 tests)* — regression coverage that exercises the actual gate function via bash + awk extraction (test path matches shipped path; not a TS reimplementation). Cases: D1 baseline at HEAD → exit 0; D2 planted current-version literal → exit 1 + file:line + remediation; D3 ALLOWLIST-marked literal → exit 0; D4 older-version literal (selective scan) → exit 0; D5 literal in `//` / `*` comment → exit 0. Plant fixtures use `.fixture.ts` extension (not `.test.ts`) so vitest does not auto-load them; `try/finally` cleanup so a crashed test never leaks a fixture file.
+- **`scripts/pre-publish-check.sh` header comment** updated to document the new step (5a in the gate-step list).
+
+### Walked analogous surfaces
+
+Per `memory/feedback_walk_analogous_surfaces.md`: checked whether other directories also need scanning. Findings:
+
+- **`hooks/`, `scripts/`, `bin/`** — at HEAD, zero current-version literals (`grep -rnE "[\"']2\.6\.0[\"']" hooks/ scripts/ bin/` returns nothing). These directories are bash; the v2.6.0 bump-test bug was specifically a TS test asserting `expect(...).toBe("X.Y.Z")` against a fresh server's reported version. The bash hooks read versions only via the daemon's HTTP `/health` endpoint or via the `relay` CLI, not via hardcoded literals. No regression found, no scan added.
+- **`docs/`** — markdown documentation legitimately mentions versions in changelogs, migration notes, and version-specific instructions. Scanning would produce mostly-false-positives. Not added.
+- **`extensions/vscode/`** — has its own `package.json` and version. Out of scope for v2.6.3; treat as a separate package if it ever needs the same guard.
+
+The new `tests_drift_guard` is targeted; expansion to other dirs is deferred until a real bug surfaces there.
+
+### Verification (3 cases)
+
+- Case 1 (HEAD, no planted): gate green, step output `No tests/ drift — no hardcoded "2.6.0" literals (current package version)`.
+- Case 2 (planted hostile literal): gate exits 1, stderr cites `tests/_planted_drift_test.test.ts:7:const HOSTILE_CURRENT_VERSION_LITERAL = "2.6.0";` plus the remediation block.
+- Case 3 (planted removed): gate green again, identical to Case 1.
+
+All three cases pinned in the regression test file (D1/D2/D3 plus D4/D5 selective-scan + comment-exclusion edge cases).
+
+### Pre-publish gate
+
+12-step gate at HEAD (with new step): all PASS. Test count: 1253 → 1258 (+5 from new regression test).
+
 ## v2.6.0 — 2026-05-05 — `relay mint-token` CLI + spawn-flow self-bootstrap + cross-platform parity
 
 Adds an operator-side credential issuance path for external CLI agents whose safety monitors block the `register_agent` → use-returned-token sequence in a single response (Codex 5.5 was the canonical case as of 2026-04-27; per `memory/feedback_codex_5_5_safety_blocks_register.md`). Pure-additive — zero behavior change for existing users; existing `register_agent` flow is unchanged.
