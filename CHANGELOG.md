@@ -1,6 +1,8 @@
 # Changelog
 
-## v2.6.3 — Unreleased — drift-grep guard extension to scan tests/
+## v2.6.1 — 2026-05-06 — drift-grep guard extension to scan tests/
+
+> Internal brief was tracked as "v2.6.3" in dispatch sequence; npm semver patch on v2.6.0 publishes as v2.6.1. Brief naming is a tracking convention, not a semver promise.
 
 Small follow-up to the v2.6.0 publish-prep regression caught at the bumped state. `tests/v2-2-0-full-dashboard-smoke.test.ts:112` had a hardcoded `"2.5.0"` literal that slipped past the existing `src/`-only drift-grep guard. The `--full` gate caught it during publish-prep, but only at the bumped state — too late to be caught early in iteration. v2.6.3 adds a guard step so the regression is caught immediately on any future bump.
 
