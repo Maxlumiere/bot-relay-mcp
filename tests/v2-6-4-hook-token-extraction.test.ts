@@ -366,30 +366,78 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
   // bytes from the shipped hooks/check-relay.sh and pipes synthetic SSE
   // fixtures through them via bash. No regex re-implementation in TS — a
   // drift between this test and the shipped hook surfaces as a real failure.
-  it("(T4) tightened {8,128} regex rejects below-min tokens, accepts valid 43-char tokens (codex residual #1)", () => {
-    // Read the shipped hook + extract the grep + sed regex bytes from the
-    // L292 REG_TOKEN line. Regex captures everything between the outer
-    // single quotes — no need to handle nested escapes because the bash
-    // pattern uses single-quoted strings (no shell escapes inside).
+  it("(T4) tightened {8,128} regex rejects below-min tokens, accepts valid 43-char tokens — pinned at EVERY agent_token extraction site (codex residual #1 + R2 walk-analogous)", () => {
+    // R2 fix (codex msg 8ccd2702): pre-R2 this test pinned only the L292
+    // REG_TOKEN line; the L174 NEW_TOKEN line could silently drift back
+    // to `[A-Za-z0-9_=.-]+` and T4 would still pass. R2 generalizes the
+    // drift guard + boundary cases to scan ALL `grep -oE.*agent_token`
+    // lines in the shipped hook (currently L174 + L292; auto-catches any
+    // future N+1 site without test updates). Same scope-too-narrow
+    // pattern as v2.6.2 R1 → R2 (cmd.exe → wt.exe powershell gate) and
+    // v2.6.4 R0 → R1 (the auth_error/auth_state/recovery_completed
+    // analogous patterns) — applied here to the test layer too.
+    //
+    // Test path matches shipped path: regex bytes come from hooks/check-relay.sh
+    // directly (read at test load + extracted via JS regex match), not a TS
+    // re-implementation. Drift between this test and the shipped hook
+    // surfaces as a real failure pointing at the offending file:line.
     const hookSrc = fs.readFileSync(HOOK, "utf-8");
-    const regTokenLine = hookSrc.split("\n").find((l) => /REG_TOKEN=.*grep -oE/.test(l));
-    expect(regTokenLine, "REG_TOKEN line not found in hooks/check-relay.sh").toBeDefined();
-    const grepMatch = regTokenLine!.match(/grep -oE '([^']+)'/);
-    const sedMatch = regTokenLine!.match(/sed -E '([^']+)'/);
-    expect(grepMatch, "grep -oE pattern not found in REG_TOKEN line").toBeTruthy();
-    expect(sedMatch, "sed -E pattern not found in REG_TOKEN line").toBeTruthy();
-    const grepPat = grepMatch![1];
-    const sedPat = sedMatch![1];
-    // The tightened patterns MUST contain `{8,128}`. Drift guard against
-    // a future revert that loosens this back to `+`.
-    expect(grepPat).toContain("{8,128}");
-    expect(sedPat).toContain("{8,128}");
 
-    // Helper: run the extracted pipeline against a synthetic input.
-    function runExtraction(sseBody: string): string {
-      // Use single-quoted bash arguments via env-var passthrough so we don't
-      // have to shell-escape the regex bytes. INPUT, GREP_PAT, SED_PAT are
-      // exported into the subshell; the pipeline mirrors check-relay.sh:292.
+    // Scan ALL agent_token extraction lines. Currently L174 (NEW_TOKEN
+    // recovery flow) + L292 (REG_TOKEN register flow); future N+1 sites
+    // get covered automatically.
+    const lines = hookSrc.split("\n");
+    interface ExtractionSite {
+      lineNum: number;        // 1-indexed
+      lineText: string;
+      grepPat: string;
+      sedPat: string;
+    }
+    const sites: ExtractionSite[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!/grep -oE.*agent_token/.test(line)) continue;
+      const grepMatch = line.match(/grep -oE '([^']+)'/);
+      const sedMatch = line.match(/sed -E '([^']+)'/);
+      // Both grep + sed must be on the same line per the shipped one-line
+      // pipeline form `grep -oE '...' | head -1 | sed -E '...'`. If the
+      // shipped hook ever switches to multi-line (highly unlikely), this
+      // assertion surfaces it loudly.
+      expect(grepMatch, `hooks/check-relay.sh:${i + 1} agent_token line missing grep -oE pattern`).toBeTruthy();
+      expect(sedMatch, `hooks/check-relay.sh:${i + 1} agent_token line missing sed -E pattern (expected one-line pipeline)`).toBeTruthy();
+      sites.push({
+        lineNum: i + 1,
+        lineText: line.trim(),
+        grepPat: grepMatch![1],
+        sedPat: sedMatch![1],
+      });
+    }
+
+    // Sanity: at least the 2 known sites (L174 + L292). If a future
+    // refactor consolidates both into one helper function, this drops to
+    // 1 — that's a good outcome and the `>= 1` floor would still catch
+    // the contract drift.
+    expect(sites.length, "expected at least 2 agent_token extraction sites (L174 + L292) — refactor consolidation? scope shrink?").toBeGreaterThanOrEqual(2);
+
+    // Drift guard — every extraction site MUST enforce {8,128} length
+    // bounds in BOTH the grep -oE pattern AND the sed -E substitution.
+    // Per-site failure message points at the exact offending file:line.
+    for (const site of sites) {
+      expect(
+        site.grepPat,
+        `hooks/check-relay.sh:${site.lineNum} grep -oE pattern must enforce {8,128} length bounds (matches src/token-store.ts:67 TOKEN_SHAPE_RE). Line: ${site.lineText}`,
+      ).toContain("{8,128}");
+      expect(
+        site.sedPat,
+        `hooks/check-relay.sh:${site.lineNum} sed -E pattern must enforce {8,128} length bounds. Line: ${site.lineText}`,
+      ).toContain("{8,128}");
+    }
+
+    // Helper: run an extraction pipeline against a synthetic input. The
+    // grep + sed bytes come from the EXTRACTED ExtractionSite — not a TS
+    // copy — so a regression in either L174 or L292 fails the matching
+    // boundary cases below.
+    function runExtraction(site: ExtractionSite, sseBody: string): string {
       const r = spawnSync(
         "bash",
         [
@@ -402,48 +450,42 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
           env: {
             PATH: process.env.PATH || "/usr/bin:/bin",
             INPUT: sseBody,
-            GREP_PAT: grepPat,
-            SED_PAT: sedPat,
+            GREP_PAT: site.grepPat,
+            SED_PAT: site.sedPat,
           },
         },
       );
       return (r.stdout ?? "").trim();
     }
 
-    // Synthesize an SSE-wrapped MCP response with a 3-char malformed
-    // agent_token. Mirrors the actual byte sequence the daemon emits
-    // (verified against live :3777 in v2.6.4 R0). The escape sequence
-    // `\\\"agent_token\\\": \\\"abc\\\"` in the JS string literal is the
-    // bytes `\"agent_token\": \"abc\"` (backslash + quote pairs) on the
-    // wire — exactly what the bash regex matches against.
-    const malformedSse =
-      `event: message\n` +
-      `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"abc\\"}"}]},"jsonrpc":"2.0","id":1}`;
-    const malformedExtracted = runExtraction(malformedSse);
-    expect(malformedExtracted, `tightened regex must reject below-min token; got '${malformedExtracted}'`).toBe("");
+    // Synthetic SSE-wrapped MCP response with a token of the given value.
+    // The escape sequence `\\\"agent_token\\\": \\\"<token>\\\"` in the
+    // JS string literal is the bytes `\"agent_token\": \"<token>\"`
+    // (backslash + quote pairs) on the wire — exactly what the bash
+    // regex matches against (verified against live :3777 in v2.6.4 R0).
+    function makeSse(token: string): string {
+      return (
+        `event: message\n` +
+        `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"${token}\\"}"}]},"jsonrpc":"2.0","id":1}`
+      );
+    }
 
-    // Positive control: same response shape with a valid 43-char token
-    // (matches the actual base64url shape `register_agent` mints).
-    const validToken = "kZIqxolWc9rYZaCURCcWxNnNnbBFqK7-UFAirnDJ5Jc";
+    // Boundary cases run against EVERY extraction site. Same 4 cases per
+    // site (originally pinned at L292 only in R1; R2 walks the analogous
+    // surface to L174 too).
+    const validToken = "kZIqxolWc9rYZaCURCcWxNnNnbBFqK7-UFAirnDJ5Jc"; // 43-char base64url
     expect(validToken).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
-    const validSse =
-      `event: message\n` +
-      `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"${validToken}\\"}"}]},"jsonrpc":"2.0","id":1}`;
-    const validExtracted = runExtraction(validSse);
-    expect(validExtracted).toBe(validToken);
 
-    // Edge case: 7-char token (one below minimum) — must reject.
-    const sevenChar = "abc1234"; // 7 chars
-    const sevenSse =
-      `event: message\n` +
-      `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"${sevenChar}\\"}"}]},"jsonrpc":"2.0","id":1}`;
-    expect(runExtraction(sevenSse)).toBe("");
-
-    // Edge case: 8-char token (at minimum) — must accept.
-    const eightChar = "abc12345"; // 8 chars
-    const eightSse =
-      `event: message\n` +
-      `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"${eightChar}\\"}"}]},"jsonrpc":"2.0","id":1}`;
-    expect(runExtraction(eightSse)).toBe(eightChar);
+    for (const site of sites) {
+      const ctx = `hooks/check-relay.sh:${site.lineNum}`;
+      // 3-char (well below minimum) — original brief case, must reject.
+      expect(runExtraction(site, makeSse("abc")), `${ctx}: 3-char token must be rejected`).toBe("");
+      // 7-char (one below minimum, boundary-1) — must reject.
+      expect(runExtraction(site, makeSse("abc1234")), `${ctx}: 7-char token (boundary-1) must be rejected`).toBe("");
+      // 8-char (at minimum, boundary) — must accept.
+      expect(runExtraction(site, makeSse("abc12345")), `${ctx}: 8-char token (boundary) must be accepted`).toBe("abc12345");
+      // Valid 43-char base64url shape (positive control, real token shape).
+      expect(runExtraction(site, makeSse(validToken)), `${ctx}: valid 43-char token must be accepted`).toBe(validToken);
+    }
   });
 });
