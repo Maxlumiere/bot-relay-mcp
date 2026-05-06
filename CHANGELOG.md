@@ -57,9 +57,17 @@ Test path matches shipped path: invokes the actual `hooks/check-relay.sh` as a s
 - **(T2)** re-spawn — hook with valid env-token + agent already in DB → `SKIP_REGISTER` branch, vault content unchanged.
 - **(T3)** recovery flow — admin revokes target with `issue_recovery=true` → operator sets `RELAY_RECOVERY_TOKEN` + invokes hook → hook detects `auth_error` (line 134) + reads `auth_state=recovery_pending` (line 137) → recovery branch fires, parses `recovery_completed:true` (line 164), extracts `NEW_TOKEN` (line 165), writes fresh vault. Exercises ALL 5 patched patterns end-to-end.
 
+### v2.6.4 R1 — codex residual: tightened agent_token extraction regex to `{8,128}` length bounds
+
+R0 codex SHIP verdict (msg `dcc06405`) flagged that the extraction patterns at L174 + L292 used `[A-Za-z0-9_=.-]+` (any length) while `write_relay_token_to_vault` validates the same charset with `{8,128}` length bounds (mirrors `src/token-store.ts:67` `TOKEN_SHAPE_RE`). Contract inconsistency — extraction would match a malformed short token, then vault-write would reject it. R1 aligns the extraction regex to the same length bounds so the hook refuses what vault-write would refuse, before the round-trip.
+
+- `hooks/check-relay.sh:174` (recovery) and `:292` (register) — `+` → `{8,128}` in BOTH the `grep -oE` pattern AND the `sed -E` substitution. Lines 140 (`auth_error`), 143 (`auth_state`), 173 (`recovery_completed`) are NOT agent_token extractions and stay as-is.
+- `tests/v2-6-4-hook-token-extraction.test.ts` — new **(T4)** test exercises the actual shipped regex bytes by reading `hooks/check-relay.sh` at test load, extracting the L292 grep + sed via JS regex, then piping synthetic SSE fixtures through `bash` with those exact bytes. No regex re-implementation in TS — drift between this test and the shipped hook surfaces as a real failure. Cases: drift guard (assert pattern contains `{8,128}`), 3-char token rejected, 7-char rejected, 8-char accepted (boundary), valid 43-char accepted.
+- Port-flake hardening (codex residual #2) — queued separately for v2.6.5; out of v2.6.4 R1 scope.
+
 ### Pre-publish gate
 
-13/13 PASS. Test count: 1258 → 1261 (+3 from new regression test).
+R0: 13/13 PASS. Test count: 1258 → 1261 (+3 from initial regression suite). R1: 13/13 PASS. Test count: 1261 → 1262 (+1 from T4 contract pin).
 
 ## v2.6.1 — 2026-05-06 — drift-grep guard extension to scan tests/
 

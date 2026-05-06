@@ -353,4 +353,97 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
       fs.rmSync(ROOT, { recursive: true, force: true });
     }
   }, 20_000);
+
+  // v2.6.4 R1 — codex residual note: extraction regex was `[A-Za-z0-9_=.-]+`
+  // (any length), while write_relay_token_to_vault validates the same charset
+  // with `{8,128}` length bounds (mirrors src/token-store.ts:67 TOKEN_SHAPE_RE).
+  // The contract was inconsistent — extraction would match a malformed short
+  // token, then vault-write would reject it. Aligning the extraction regex
+  // to the same length bounds removes the inconsistency at the extraction
+  // layer (refuse what vault-write would refuse, before the round-trip).
+  //
+  // Test path matches shipped path: extracts the actual grep + sed regex
+  // bytes from the shipped hooks/check-relay.sh and pipes synthetic SSE
+  // fixtures through them via bash. No regex re-implementation in TS — a
+  // drift between this test and the shipped hook surfaces as a real failure.
+  it("(T4) tightened {8,128} regex rejects below-min tokens, accepts valid 43-char tokens (codex residual #1)", () => {
+    // Read the shipped hook + extract the grep + sed regex bytes from the
+    // L292 REG_TOKEN line. Regex captures everything between the outer
+    // single quotes — no need to handle nested escapes because the bash
+    // pattern uses single-quoted strings (no shell escapes inside).
+    const hookSrc = fs.readFileSync(HOOK, "utf-8");
+    const regTokenLine = hookSrc.split("\n").find((l) => /REG_TOKEN=.*grep -oE/.test(l));
+    expect(regTokenLine, "REG_TOKEN line not found in hooks/check-relay.sh").toBeDefined();
+    const grepMatch = regTokenLine!.match(/grep -oE '([^']+)'/);
+    const sedMatch = regTokenLine!.match(/sed -E '([^']+)'/);
+    expect(grepMatch, "grep -oE pattern not found in REG_TOKEN line").toBeTruthy();
+    expect(sedMatch, "sed -E pattern not found in REG_TOKEN line").toBeTruthy();
+    const grepPat = grepMatch![1];
+    const sedPat = sedMatch![1];
+    // The tightened patterns MUST contain `{8,128}`. Drift guard against
+    // a future revert that loosens this back to `+`.
+    expect(grepPat).toContain("{8,128}");
+    expect(sedPat).toContain("{8,128}");
+
+    // Helper: run the extracted pipeline against a synthetic input.
+    function runExtraction(sseBody: string): string {
+      // Use single-quoted bash arguments via env-var passthrough so we don't
+      // have to shell-escape the regex bytes. INPUT, GREP_PAT, SED_PAT are
+      // exported into the subshell; the pipeline mirrors check-relay.sh:292.
+      const r = spawnSync(
+        "bash",
+        [
+          "-c",
+          'echo "$INPUT" | grep -oE "$GREP_PAT" | head -1 | sed -E "$SED_PAT"',
+        ],
+        {
+          encoding: "utf-8",
+          timeout: 5000,
+          env: {
+            PATH: process.env.PATH || "/usr/bin:/bin",
+            INPUT: sseBody,
+            GREP_PAT: grepPat,
+            SED_PAT: sedPat,
+          },
+        },
+      );
+      return (r.stdout ?? "").trim();
+    }
+
+    // Synthesize an SSE-wrapped MCP response with a 3-char malformed
+    // agent_token. Mirrors the actual byte sequence the daemon emits
+    // (verified against live :3777 in v2.6.4 R0). The escape sequence
+    // `\\\"agent_token\\\": \\\"abc\\\"` in the JS string literal is the
+    // bytes `\"agent_token\": \"abc\"` (backslash + quote pairs) on the
+    // wire — exactly what the bash regex matches against.
+    const malformedSse =
+      `event: message\n` +
+      `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"abc\\"}"}]},"jsonrpc":"2.0","id":1}`;
+    const malformedExtracted = runExtraction(malformedSse);
+    expect(malformedExtracted, `tightened regex must reject below-min token; got '${malformedExtracted}'`).toBe("");
+
+    // Positive control: same response shape with a valid 43-char token
+    // (matches the actual base64url shape `register_agent` mints).
+    const validToken = "kZIqxolWc9rYZaCURCcWxNnNnbBFqK7-UFAirnDJ5Jc";
+    expect(validToken).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
+    const validSse =
+      `event: message\n` +
+      `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"${validToken}\\"}"}]},"jsonrpc":"2.0","id":1}`;
+    const validExtracted = runExtraction(validSse);
+    expect(validExtracted).toBe(validToken);
+
+    // Edge case: 7-char token (one below minimum) — must reject.
+    const sevenChar = "abc1234"; // 7 chars
+    const sevenSse =
+      `event: message\n` +
+      `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"${sevenChar}\\"}"}]},"jsonrpc":"2.0","id":1}`;
+    expect(runExtraction(sevenSse)).toBe("");
+
+    // Edge case: 8-char token (at minimum) — must accept.
+    const eightChar = "abc12345"; // 8 chars
+    const eightSse =
+      `event: message\n` +
+      `data: {"result":{"content":[{"type":"text","text":"{\\"agent_token\\": \\"${eightChar}\\"}"}]},"jsonrpc":"2.0","id":1}`;
+    expect(runExtraction(eightSse)).toBe(eightChar);
+  });
 });

@@ -171,7 +171,7 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
     # JSON is stringified with `\"key\": value` shape; the unescaped pattern
     # never matched, so this entire branch was silently dead pre-v2.6.4.
     if echo "$RECOVERY_BODY" | grep -qE '\\"recovery_completed\\":[[:space:]]*true'; then
-      NEW_TOKEN=$(echo "$RECOVERY_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]+\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]+)\\"$/\1/')
+      NEW_TOKEN=$(echo "$RECOVERY_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
       RECOVERY_COMPLETED=1
       # v2.6.1 — persist to vault + export inline. Operators no longer need
       # to manually paste the new token into their shell config; the next
@@ -289,7 +289,7 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   # tightening from `[^\"]*` to the allowlist also defends against any
   # future change in escaping that would otherwise pass-through corrupt
   # bytes.
-  REG_TOKEN=$(echo "$REG_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]+\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]+)\\"$/\1/')
+  REG_TOKEN=$(echo "$REG_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
   if [ -n "$REG_TOKEN" ]; then
     if write_relay_token_to_vault "$AGENT_NAME" "$REG_TOKEN"; then
       export RELAY_AGENT_TOKEN="$REG_TOKEN"
