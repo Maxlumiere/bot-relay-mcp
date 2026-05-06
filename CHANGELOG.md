@@ -1,5 +1,66 @@
 # Changelog
 
+## v2.6.2 — Unreleased — check-relay.sh agent_token capture regex fix (SSE-escape) + recovery-flow parsing
+
+> Internal brief was tracked as "v2.6.4" in dispatch sequence; npm semver patch on v2.6.1 publishes as v2.6.2. Brief naming is a tracking convention, not a semver promise.
+
+Closes the bug news-intel-build hit on 2026-05-06: first spawn against a v2.6.1-LIVE daemon registered correctly in DB but the per-instance vault file was never written. The cumulative v2.6.1 R1-R3 arc was supposed to close this exact failure mode, yet here it was on the first post-publish spawn.
+
+### Root cause
+
+The daemon serves MCP-over-HTTP responses in SSE-wrapped + JSON-stringified format. Concrete shape (verified via curl against the live `:3777` daemon):
+
+```
+event: message
+data: {"result":{"content":[{"type":"text","text":"{
+  \"status\": \"ok\",
+  \"version\": \"2.6.1\",
+  \"agent_token\": \"<token>\",
+  ...
+}"}]},"jsonrpc":"2.0","id":1}
+```
+
+Three things matter:
+1. Outer envelope is SSE (`event: message\ndata: {...}`), not plain JSON. Server requires `Accept: application/json, text/event-stream` (forcing application/json only returns 406).
+2. The `"text"` field's content is a JSON-stringified inner object — quotes are escaped as `\"`.
+3. Inner JSON is pretty-printed: `\"agent_token\":` is followed by a SPACE then `\"<value>\"`.
+
+Five `grep` patterns in `hooks/check-relay.sh` expected the un-escaped, un-spaced shape (`"agent_token":"..."`) and silently never matched against the actual bytes. The bug was strictly bigger than the originally-flagged two sites:
+
+| line | pattern | failure mode pre-fix |
+|---|---|---|
+| 134 | `"auth_error":true` | health_check error detection silently never fires — operator never sees stale-token recovery prompts |
+| 137 | `"auth_state":"<state>"` | auth_state extraction returns empty — recovery flow never enters the `recovery_pending` branch even when admin issued a recovery token |
+| 164 | `"recovery_completed":true` | recovery branch never extracts the new token from response |
+| 165 | `"agent_token":"<token>"` (recovery) | recovery never persisted to vault |
+| 271 | `"agent_token":"<token>"` (register) | first-spawn never persisted to vault — the news-intel-build symptom |
+
+All five were in the SAME file with the SAME shape gap; the brief named the latter two but the **walk-analogous-surfaces** discipline (per `memory/feedback_walk_analogous_surfaces.md`) surfaced the other three pre-fix. Without addressing all five, the recovery flow would have remained dead even after the originally-flagged sites were patched.
+
+### Fix
+
+`hooks/check-relay.sh` — all 5 patterns updated to match the actual SSE-escaped + space-after-colon shape. Token-shape charset narrowed from `[^"]*` to `[A-Za-z0-9_=.-]+` (mirrors `src/token-store.ts:67` `TOKEN_SHAPE_RE`) for defense-in-depth — tightening also defends against any future change in escaping that would otherwise pass-through corrupt bytes.
+
+Verified against the live `:3777` daemon: pre-fix patterns match 0 times, post-fix patterns match 1 time (the actual bytes). Walked analogous surfaces in `scripts/migrate-existing-tokens-to-vault.sh`, `bin/spawn-agent.sh`, `src/cli/recover.ts`, `hooks/post-tool-use-check.sh`, `hooks/stop-check.sh` — none of them parse `agent_token` from MCP HTTP responses; only `check-relay.sh` does.
+
+### Why v2.6.2 SR-D didn't catch this
+
+`tests/v2-6-2-spawn-to-ready.test.ts` test SR-D claimed end-to-end coverage of "spawn → vault written → first MCP call authenticates" — but it parsed `register_agent`'s response with TS `JSON.parse()` (native; handles SSE+escape correctly) and wrote the vault from TS test code, bypassing the bash hook's grep/sed extraction entirely. Test path did NOT match shipped path (per `memory/feedback_test_path_must_match_shipped_path.md`). SR-D is kept as-is for its different coverage value (the prelude → stdio MCP env-inheritance path); v2.6.4's new test file replaces SR-D as the regression guard for the bash hook's response parsing.
+
+SR-D's docstring updated to call out the divergence + point at the v2.6.4 test as the actual coverage.
+
+### Tests — `tests/v2-6-4-hook-token-extraction.test.ts` *(new, 3 tests)*
+
+Test path matches shipped path: invokes the actual `hooks/check-relay.sh` as a subprocess against a real `node dist/index.js` HTTP daemon. Vault is written by the hook (NOT by test code), so a regression in any of the 5 patterns surfaces immediately.
+
+- **(T1)** first-spawn — hook calls `register_agent` via HTTP, parses SSE-wrapped response with the new pattern, writes vault. Pre-fix this would have failed at the vault-exists assertion (the news-intel-build symptom).
+- **(T2)** re-spawn — hook with valid env-token + agent already in DB → `SKIP_REGISTER` branch, vault content unchanged.
+- **(T3)** recovery flow — admin revokes target with `issue_recovery=true` → operator sets `RELAY_RECOVERY_TOKEN` + invokes hook → hook detects `auth_error` (line 134) + reads `auth_state=recovery_pending` (line 137) → recovery branch fires, parses `recovery_completed:true` (line 164), extracts `NEW_TOKEN` (line 165), writes fresh vault. Exercises ALL 5 patched patterns end-to-end.
+
+### Pre-publish gate
+
+13/13 PASS. Test count: 1258 → 1261 (+3 from new regression test).
+
 ## v2.6.1 — 2026-05-06 — drift-grep guard extension to scan tests/
 
 > Internal brief was tracked as "v2.6.3" in dispatch sequence; npm semver patch on v2.6.0 publishes as v2.6.1. Brief naming is a tracking convention, not a semver promise.
