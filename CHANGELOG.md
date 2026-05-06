@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.6.2 — Unreleased — check-relay.sh agent_token capture regex fix (SSE-escape) + recovery-flow parsing
+## v2.6.2 — 2026-05-06 — check-relay.sh agent_token capture regex fix (SSE-escape) + recovery-flow parsing
 
 > Internal brief was tracked as "v2.6.4" in dispatch sequence; npm semver patch on v2.6.1 publishes as v2.6.2. Brief naming is a tracking convention, not a semver promise.
 
