@@ -129,12 +129,18 @@ if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
     -H "X-Agent-Token: ${RELAY_AGENT_TOKEN}" \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}' 2>/dev/null)
   if [ -n "$HEALTH_BODY" ]; then
-    # Grep out auth_error + auth_state from the embedded JSON text. Tolerates
-    # SSE framing ("event: message\ndata: {...}") via whole-body search.
-    if echo "$HEALTH_BODY" | grep -q '"auth_error":true'; then
+    # v2.6.4 — daemon's SSE-wrapped MCP response stringifies the inner JSON
+    # via JSON.stringify with pretty-printing. The bytes the grep sees are
+    # `\"key\": value` (escaped quote + space after colon), NOT the
+    # unescaped `"key":value` form pre-v2.6.4 patterns expected. Match the
+    # actual byte sequence: backslash + quote + key + backslash + quote +
+    # colon + optional whitespace + value. SSE framing (`event: message\n
+    # data: {...}`) is on a single physical line of stdout so a whole-body
+    # grep still works.
+    if echo "$HEALTH_BODY" | grep -qE '\\"auth_error\\":[[:space:]]*true'; then
       AUTH_ERROR=1
     fi
-    AUTH_STATE=$(echo "$HEALTH_BODY" | grep -oE '"auth_state":"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)".*/\1/')
+    AUTH_STATE=$(echo "$HEALTH_BODY" | grep -oE '\\"auth_state\\":[[:space:]]*\\"[A-Za-z_]+\\"' | head -1 | sed -E 's/.*\\"([A-Za-z_]+)\\"$/\1/')
   fi
 fi
 
@@ -161,8 +167,11 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
       -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" 2>/dev/null)
-    if echo "$RECOVERY_BODY" | grep -q '"recovery_completed":true'; then
-      NEW_TOKEN=$(echo "$RECOVERY_BODY" | grep -oE '"agent_token":"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)".*/\1/')
+    # v2.6.4 — same SSE-escape fix as the health_check parsing above. Inner
+    # JSON is stringified with `\"key\": value` shape; the unescaped pattern
+    # never matched, so this entire branch was silently dead pre-v2.6.4.
+    if echo "$RECOVERY_BODY" | grep -qE '\\"recovery_completed\\":[[:space:]]*true'; then
+      NEW_TOKEN=$(echo "$RECOVERY_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
       RECOVERY_COMPLETED=1
       # v2.6.1 — persist to vault + export inline. Operators no longer need
       # to manually paste the new token into their shell config; the next
@@ -264,11 +273,23 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   # to the vault. register_agent only returns `agent_token` on first-mint
   # paths (legacy_bootstrap → active or fresh INSERT); subsequent re-
   # registers preserve the existing hash and omit the field. So the
-  # presence of `"agent_token":"..."` here means "the daemon just minted a
-  # fresh credential for us, capture it." Closes the v2.1 Phase 4j latent
-  # bug where this token was discarded, leaving the agent registered but
-  # unable to authenticate.
-  REG_TOKEN=$(echo "$REG_BODY" | grep -oE '"agent_token":"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)".*/\1/')
+  # presence of `\"agent_token\": \"...\"` (SSE-escaped + spaced) here
+  # means "the daemon just minted a fresh credential for us, capture it."
+  # Closes the v2.1 Phase 4j latent bug where this token was discarded,
+  # leaving the agent registered but unable to authenticate.
+  #
+  # v2.6.4 — match the actual SSE-wrapped + JSON-stringified shape the
+  # daemon emits (verified via curl against the live :3777 endpoint —
+  # `\"agent_token\": \"<token>\"` with a backslash before each quote
+  # and a space after the colon). The pre-v2.6.4 pattern
+  # `'"agent_token":"[^"]*"'` never matched the actual bytes, so the
+  # vault was never written on first-spawn — the bug news-intel-build hit
+  # 2026-05-06 despite the v2.6.1 R3 cumulative arc. Token-shape charset
+  # `[A-Za-z0-9_=.-]+` mirrors src/token-store.ts:67 TOKEN_SHAPE_RE so
+  # tightening from `[^\"]*` to the allowlist also defends against any
+  # future change in escaping that would otherwise pass-through corrupt
+  # bytes.
+  REG_TOKEN=$(echo "$REG_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
   if [ -n "$REG_TOKEN" ]; then
     if write_relay_token_to_vault "$AGENT_NAME" "$REG_TOKEN"; then
       export RELAY_AGENT_TOKEN="$REG_TOKEN"

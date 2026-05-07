@@ -219,6 +219,21 @@ describe("v2.6.2 — spawn-to-ready integration (vault state matrix)", () => {
   // FIRST MCP call from a stdio subprocess pointed at the same daemon DB
   // authenticates from that env alone. Closes the v2.6.0 dropped-token
   // failure mode at the wire surface.
+  //
+  // v2.6.4 NOTE — SR-D was always going to pass even when the bash hook
+  // was broken. The test parses the register_agent response with TS
+  // `JSON.parse()` (native, handles SSE+escape correctly) and writes the
+  // vault from TS code at line ~299. It does NOT exercise the bash hook's
+  // grep/sed extraction pipeline, so the news-intel-build SSE-escape bug
+  // (caught 2026-05-06, fixed in v2.6.4) slipped past this test even
+  // though SR-D claimed end-to-end coverage. Per
+  // memory/feedback_test_path_must_match_shipped_path.md, the actual
+  // regression coverage for the bash hook's response parsing now lives in
+  // tests/v2-6-4-hook-token-extraction.test.ts (T1/T2/T3 — invokes the
+  // real hooks/check-relay.sh against a real HTTP daemon and asserts the
+  // vault is written by the hook, not by test code). SR-D is kept as-is
+  // for its DIFFERENT coverage value: it pins the prelude → stdio MCP
+  // env-inheritance path, which the v2.6.4 test does not.
   it.skipIf(process.platform !== "darwin")(
     "(SR-D) bonus: env hydrated by prelude → stdio MCP subprocess authenticates first call",
     async () => {
