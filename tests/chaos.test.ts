@@ -25,6 +25,7 @@ import path from "path";
 import os from "os";
 import { spawn, type ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
+import { getFreePort } from "./_helpers/port.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,8 +39,12 @@ let daemon: ChildProcess | null = null;
 let port = 0;
 
 async function startDaemon(extraEnv: Record<string, string> = {}): Promise<void> {
-  // Pick a free-ish random port to avoid cross-test collisions.
-  port = 40000 + Math.floor(Math.random() * 10000);
+  // v2.6.3: pre-allocate via getFreePort (kernel-assigned 127.0.0.1 port,
+  // released microseconds before daemon binds). Replaces pre-v2.6.3
+  // `40000 + Math.random()*10000` random-in-range pattern which had a
+  // small but real collision risk against stale processes from interrupted
+  // gate iterations.
+  port = await getFreePort();
   daemon = spawn(
     "node",
     [RELAY_BIN],

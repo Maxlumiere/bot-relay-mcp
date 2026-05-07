@@ -1,5 +1,49 @@
 # Changelog
 
+## v2.6.3 — Unreleased — port-flake hardening (dynamic-port allocation) + dependabot vuln patches
+
+Two hardening items closed in one patch — known port-collision flake class across integration tests, plus 5 medium-severity dependabot alerts on `package-lock.json` (all auto-patched cleanly via `npm audit fix` — no breaking changes).
+
+> Naming convention switch (per dispatch): brief number now matches npm publish version directly. v2.6.3 here = npm v2.6.3, no internal-vs-published divergence going forward.
+
+### Port-flake hardening
+
+Pre-v2.6.3 several integration tests hardcoded specific ports in the 39413-39988 range to spawn isolated `node dist/index.js` HTTP daemons. When a prior gate iteration crashed mid-run and left a stale process holding the port, the next run failed with port-already-in-use. Caught manually via `lsof -i :<port>` during v2.6.0 publish-prep, then called out by codex on v2.6.4 R0/R2 audits as a known-flake class. Plus two tests using `40000 + Math.floor(Math.random() * N)` which is non-deterministic but still has a small collision probability against the same stale-process pattern.
+
+- **`tests/_helpers/port.ts`** *(new)* — `getFreePort()` async helper. Binds a throwaway `net.createServer()` to port 0 (kernel-assigned), reads the bound port from `server.address()`, closes the server, returns the port for the caller to use. Race window between close + caller-bind is microseconds; standard Node port-claim idiom (used by `get-port` npm + most Node test rigs). No new npm dependency added — Node `net` is stdlib.
+- **6 test files converted** to use `getFreePort()` in place of hardcoded literals:
+  - `tests/v2-6-1-token-store.test.ts` — 4 sites (39413, 39414, 39415, 39416)
+  - `tests/v2-6-2-recovery-flow.test.ts` — 3 sites (39420, 39421, 39422)
+  - `tests/v2-6-2-spawn-to-ready.test.ts` — 1 site (39430)
+  - `tests/v2-6-4-hook-token-extraction.test.ts` — 3 sites (39450, 39451, 39452)
+  - `tests/chaos.test.ts` — 1 site (was `40000 + Math.random()*10000`)
+  - `tests/v2-4-2-tty-guard.test.ts` — 1 site (was `40000 + Math.random()*20000`)
+- **Verification** — each affected test file run individually post-conversion; all pass.
+
+#### Walked analogous surfaces — out of scope this round
+
+- `tests/v2-1-cli-tooling.test.ts:34` (`RELAY_HTTP_PORT: "39988"`) — uses synchronous `spawnSync` inside `runRelay()` with the env baked at file scope. Conversion would require restructuring (`runRelay` → async, or per-test `beforeEach` allocation) and the CLI tests don't actually bind the daemon for most subcommands — the port is only consequential for `relay test` / `relay doctor` paths. Not on the known-flaky list. Documented as a v2.6.4+ residual; can revisit if it ever flakes.
+
+### Dependabot vuln patches
+
+`gh api .../dependabot/alerts` enumerated 5 open medium-severity alerts (brief said 3 — actual is 5). All cleanly resolvable via `npm audit fix` (semver-compatible patch upgrades; no `package.json` change, only `package-lock.json`).
+
+| # | package | from → to | scope | advisory |
+|---|---|---|---|---|
+| 7 | hono | 4.12.14 → 4.12.18 | runtime (transitive) | bodyLimit() bypass for chunked requests |
+| 6 | hono | 4.12.14 → 4.12.18 | runtime (transitive) | hono/jsx unvalidated tag names → HTML injection |
+| 5 | ip-address | 10.1.0 → 10.2.0 | runtime (transitive via express-rate-limit) | XSS in Address6 HTML-emitting methods |
+| 4 | uuid | 11.1.0 → 11.1.1 | runtime | missing buffer bounds check in v3/v5/v6 with `buf` |
+| 2 | postcss | 8.5.9 → 8.5.14 | development | XSS via unescaped `</style>` in Stringify |
+
+Pre-fix: 5 moderate, 0 high. Post-fix: 0 vulnerabilities. `npm audit` (high+ threshold) gate-step continues to pass; this patch lowers the residual surface to zero.
+
+Express-rate-limit also bumped (8.3.2 → 8.5.1) as a side-effect of the ip-address upgrade — within its declared semver range, no API change.
+
+### Pre-publish gate
+
+13/13 PASS. Test count unchanged (port hardening is an existing-test refactor, no new tests).
+
 ## v2.6.2 — 2026-05-06 — check-relay.sh agent_token capture regex fix (SSE-escape) + recovery-flow parsing
 
 > Internal brief was tracked as "v2.6.4" in dispatch sequence; npm semver patch on v2.6.1 publishes as v2.6.2. Brief naming is a tracking convention, not a semver promise.

@@ -24,6 +24,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { getFreePort } from "./_helpers/port.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -370,7 +371,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
     // subprocess via stdin/stdout JSON-RPC (newline-delimited, per MCP spec).
     // resolveToken's stdio-gated vault fallback must consult the file and auth
     // the get_messages call from the disk token alone.
-    const PORT = 39413;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-1-r2-test17-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
@@ -562,7 +563,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
     // vault is never consulted on the HTTP path). A control call with the
     // real X-Agent-Token confirms the daemon is healthy and the refusal is
     // due to the transport gate, not an unrelated bug.
-    const PORT = 39414;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-1-r2-test17b-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
@@ -680,7 +681,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
     // auth_state of whoever owns that env token. Even though no
     // authenticated action runs, the caller learns "this daemon belongs to
     // <agent>" — same bug class as the resolveToken vault/env oracles.
-    const PORT = 39416;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-2-test17d-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
@@ -834,7 +835,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
     // token. R3 generalizes the rule: items 3 and 4 (daemon-side credentials)
     // are both gated on ctx.transport === "stdio". This test pins the
     // env-token half of the boundary; test 17b pins the vault half.
-    const PORT = 39415;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-1-r3-test17c-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
