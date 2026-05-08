@@ -31,6 +31,7 @@ import {
   type InboxSnapshot,
 } from "./format.js";
 import { resolveTetherConfig, type TetherConfig } from "./config.js";
+import { wireTransportDiagnostics } from "./transport-diagnostics.js";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
 const STATUS_COMMAND = "botRelayTether.openInbox";
@@ -63,6 +64,36 @@ let mcpTransport: StreamableHTTPClientTransport | undefined;
 let lastSnapshot: InboxSnapshot | undefined;
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
+
+/**
+ * v0.1.1 — sticky error state for the active connection. Flipped by
+ * `setErrorState` (called from the transport-diagnostics helper's
+ * `setError` sink) when the SSE GET stream fails or the transport
+ * raises any error during the connect/subscribe window. Once true,
+ * `applySnapshot` + the "connected + subscribed" log line + the
+ * status-bar success-text mutation MUST NOT run — otherwise a late
+ * async failure would silently mask itself under the success path. The
+ * lock is reset at the start of each `connect()` call (a fresh attempt
+ * starts clean) and on `botRelayTether.reconnect`. Pre-v0.1.1 there was
+ * no lock; this is the load-bearing piece that makes Phase 1
+ * instrumentation observable instead of getting overwritten.
+ */
+let connectionErrorState = false;
+function isInErrorState(): boolean {
+  return connectionErrorState;
+}
+function resetErrorState(): void {
+  connectionErrorState = false;
+}
+function setErrorState(msg: string): void {
+  connectionErrorState = true;
+  log(msg);
+  if (statusBarItem) {
+    statusBarItem.text = "Tether: error — see Output channel";
+    statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
+    statusBarItem.show();
+  }
+}
 
 function log(line: string): void {
   if (!outputChannel) return;
@@ -157,6 +188,10 @@ async function connect(config: TetherConfig): Promise<void> {
     return;
   }
   await disconnect();
+  // v0.1.1 — fresh connect attempt resets the error-state lock. Any
+  // previously-flipped error from a prior session is cleared so a manual
+  // reconnect (or a config-change-driven reconnect) can recover.
+  resetErrorState();
 
   log(`connecting to ${config.endpoint}/mcp as agent="${config.agentName}"`);
   const url = new URL("/mcp", config.endpoint);
@@ -168,6 +203,19 @@ async function connect(config: TetherConfig): Promise<void> {
     requestInit.headers = { "X-Agent-Token": config.agentToken };
   }
   const transport = new StreamableHTTPClientTransport(url, { requestInit });
+
+  // v0.1.1 — wire transport diagnostics BEFORE client.connect(). The SDK
+  // (Protocol._connect at node_modules/@modelcontextprotocol/sdk/dist/esm/shared/protocol.js:220-228)
+  // PRESERVES preexisting transport.onerror/onclose and WRAPS them on
+  // connect. Wiring AFTER connect would replace the SDK's protocol-level
+  // wrapper and break protocol-level error propagation. The order is
+  // load-bearing — the drift guard at tests/v2-6-tether-transport-diagnostics.test.ts
+  // pins this contract.
+  wireTransportDiagnostics(transport, {
+    log,
+    setError: setErrorState,
+  });
+
   const client = new Client(
     { name: "bot-relay-tether-vscode", version: getExtensionVersion() },
     { capabilities: {} },
@@ -178,6 +226,7 @@ async function connect(config: TetherConfig): Promise<void> {
     log(`event: ${notification.params.uri}`);
     const fresh = await refreshSnapshot(client, config.agentName);
     if (!fresh) return;
+    if (isInErrorState()) return; // state-lock — don't paint snapshot over an error UI
     applySnapshot(fresh);
     showToast(fresh, config.notificationLevel);
     if (config.autoInjectInbox) injectInboxKeystroke(config.agentName);
@@ -190,8 +239,15 @@ async function connect(config: TetherConfig): Promise<void> {
   // Subscribe + prime the status bar with an initial fetch.
   await client.subscribeResource({ uri: buildInboxUri(config.agentName) });
   const initial = await refreshSnapshot(client, config.agentName);
-  if (initial) applySnapshot(initial);
-  log("connected + subscribed");
+  // v0.1.1 — state-lock guard: an async transport error (SSE GET stream
+  // open failure, header-mismatch close, etc.) may have fired between
+  // the start of connect() and here. If it did, setErrorState already
+  // flipped the status bar to "Tether: error". Don't overwrite it with
+  // an apparent-success snapshot or "connected + subscribed" log.
+  if (initial && !isInErrorState()) applySnapshot(initial);
+  if (!isInErrorState()) {
+    log("connected + subscribed");
+  }
 }
 
 async function disconnect(): Promise<void> {

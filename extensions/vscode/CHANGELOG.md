@@ -4,6 +4,28 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.1.1] — 2026-05-08 — Pre-publish hotfix: transport diagnostics (instrumentation only)
+
+v0.1.0 visual marketplace smoke caught a silent-failure window: the extension reported `connected + subscribed` in its output channel but no inbox notifications were ever observed on send. Root cause: `extension.ts` did not wire `transport.onerror`, and the SDK's `_startOrAuthSse()` path that opens the long-lived SSE GET stream (the channel notifications travel down to idle subscribers) silently swallows errors when `onerror` is unset (`@modelcontextprotocol/sdk` `dist/esm/client/streamableHttp.js:374-376` — `.catch(err => this.onerror?.(err))` is a no-op when `onerror` is undefined).
+
+This release wires diagnostics so the next failure surfaces. It does NOT yet fix whatever actually breaks the SSE GET stream inside VS Code's Electron-based fetch runtime — that's the v0.1.2+ structural fix once we see what error the diagnostics reveal.
+
+### Added
+
+- **Transport diagnostics**. `transport.onerror` now flips the connection into a sticky error state (status bar reads `Tether: error — see Output channel` with the standard error background color), and `transport.onclose` logs to the output channel for visibility into session teardown. Wired BEFORE `client.connect()` so the SDK's protocol-level wrapper (`Protocol._connect` at `protocol.js:220-228`) preserves and chains our handler instead of replacing it. Order pinned by drift guard `tests/v2-6-tether-transport-diagnostics.test.ts`.
+- **Sticky error-state lock**. Once a transport error fires, the `connected + subscribed` log line + status-bar success-text + initial-snapshot paint are all suppressed until the next explicit reconnect (config change OR `Tether: Reconnect to Relay` command). Prevents async failures from being silently overwritten by the success path. Verified by the helper's unit tests in `extensions/vscode/src/transport-diagnostics.test.ts`.
+- **Helper extracted to `transport-diagnostics.ts`**. VSCode-free, unit-testable. Mirrors the `Transport` interface as a structural subset so the test rig doesn't need the full SDK.
+
+### Fixed
+
+- Nothing yet — this release surfaces the bug in operator-visible UI but does not resolve the underlying SSE GET stream failure inside VS Code's runtime. Operators who see `Tether: error` after upgrading should report the error message from the output channel; the v0.1.2 release will use that signal to land the actual fix.
+
+### References
+
+- Root-cause investigation: bot-relay relay msg `18362476` (2026-05-08).
+- Audit verifying daemon-side broadcast contract is intact: msg `4eb34932` (2026-05-08).
+- Daemon repros (Node SDK + live `:3777`) confirming notifications/resources/updated frames flow correctly to Node-based subscribers — proves the bug is VS Code runtime-specific, not a daemon issue.
+
 ## [0.1.0] — 2026-05-07
 
 Initial public release. Ships with bot-relay-mcp v2.5.0+.
