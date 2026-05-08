@@ -30,6 +30,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { getFreePort } from "./_helpers/port.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, "..");
@@ -215,9 +216,12 @@ describe("v2.4.2 — TTY guard", () => {
         ...process.env,
         RELAY_DB_PATH: path.join(tmpDir, "relay.db"),
         RELAY_TRANSPORT: "http",
-        // Random port in the 40000-60000 band avoids collisions with the
-        // live :3777 daemon + other tests binding 0. Config rejects port 0.
-        RELAY_HTTP_PORT: String(40000 + Math.floor(Math.random() * 20000)),
+        // v2.6.3: pre-allocated free port via getFreePort (kernel-assigned
+        // 127.0.0.1 port, released microseconds before daemon binds).
+        // Replaces pre-v2.6.3 random-in-range pattern; config still rejects
+        // RELAY_HTTP_PORT=0, but pre-allocation passes a specific port
+        // number so config validation accepts it.
+        RELAY_HTTP_PORT: String(await getFreePort()),
         RELAY_SKIP_TTY_CHECK: "",
         RELAY_TTY_GRACE_MS: "300",
       },
