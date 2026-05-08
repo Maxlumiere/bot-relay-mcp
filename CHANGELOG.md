@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.6.3 — Unreleased — port-flake hardening (dynamic-port allocation) + dependabot vuln patches
+## v2.6.3 — 2026-05-08 — port-flake hardening (dynamic-port allocation) + dependabot vuln patches
 
 Two hardening items closed in one patch — known port-collision flake class across integration tests, plus 5 medium-severity dependabot alerts on `package-lock.json` (all auto-patched cleanly via `npm audit fix` — no breaking changes).
 
