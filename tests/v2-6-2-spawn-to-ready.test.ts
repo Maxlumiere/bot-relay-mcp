@@ -33,6 +33,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { getFreePort } from "./_helpers/port.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -240,7 +241,7 @@ describe("v2.6.2 — spawn-to-ready integration (vault state matrix)", () => {
       const ROOT = path.join(os.tmpdir(), "v2-6-2-sr-D-" + process.pid);
       if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
       fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
-      const PORT = 39430;
+      const PORT = await getFreePort();
       expect(fs.existsSync(DIST_INDEX)).toBe(true);
 
       // eslint-disable-next-line @typescript-eslint/no-var-requires

@@ -34,6 +34,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { getFreePort } from "./_helpers/port.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -59,7 +60,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
   it("(T1) first spawn: hook calls register_agent via HTTP, captures agent_token from SSE-wrapped response, writes vault", async () => {
     // Pin the EXACT bug class news-intel-build hit. Pre-v2.6.4 this would
     // fail because the bash grep pattern expected unescaped JSON.
-    const PORT = 39450;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-4-hook-extract-T1-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
@@ -137,7 +138,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
     // regex. When agent already exists in DB AND env token is valid, the
     // hook does not touch the daemon's register_agent. Vault is preserved
     // (in this test, vault was written by phase 0 below).
-    const PORT = 39451;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-4-hook-extract-T2-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
@@ -230,7 +231,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
     // bug — it never matched, so the recovery branch was silently dead
     // even when the operator set RELAY_RECOVERY_TOKEN. This test pins
     // the FULL recovery cycle through the bash hook.
-    const PORT = 39452;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-4-hook-extract-T3-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
