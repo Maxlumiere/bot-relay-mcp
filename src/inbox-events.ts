@@ -26,6 +26,7 @@
  *     throttled rate without changing producers.
  */
 import { EventEmitter } from "node:events";
+import { log } from "./logger.js";
 
 const bus = new EventEmitter();
 // Default of 10 trips on the hot path (HTTP daemon + dashboard ws + several
@@ -44,6 +45,12 @@ export interface InboxChangedEvent {
 }
 
 export function emitInboxChanged(event: InboxChangedEvent): void {
+  // v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace. Surfaces
+  // every inbox event the daemon emits so Maxime's Tether smoke can
+  // correlate "send_message landed in DB" → "emit fired" → "broadcaster
+  // reached" → "sendResourceUpdated accepted" → (extension reception is
+  // proven separately by the extension's own diagnostics from v0.1.1).
+  log.info(`[broadcast-trace] event emit agent=${event.agent_name} reason=${event.reason}`);
   bus.emit("inbox.changed", event);
 }
 

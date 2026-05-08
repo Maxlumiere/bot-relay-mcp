@@ -66,6 +66,26 @@ export function agentNameFromInboxUri(uri: string): string | null {
 const subscriptionsByUri = new Map<string, Set<Server>>();
 let inboxBusUnbinder: (() => void) | null = null;
 
+// v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace instrumentation.
+// Goal: surface where the subscribe→emit→fan-out→sendResourceUpdated chain
+// breaks during the Tether VS Code smoke (msg dispatch in 0506ac7's ship-pong
+// surfaced that Phase 1 client-side onerror/onclose never fire — failure is
+// below the SDK message-handling layer). Each Server gets a monotonic debug
+// tag (S1, S2, …) so daemon stderr can correlate subscribe + per-iteration
+// fan-out lines. Tag survives via WeakMap so we don't keep dead Servers
+// alive. Remove (or downgrade to debug-level) after the structural fix lands.
+let serverDebugCounter = 0;
+const serverDebugTags = new WeakMap<Server, string>();
+function tagFor(server: Server): string {
+  let tag = serverDebugTags.get(server);
+  if (!tag) {
+    serverDebugCounter += 1;
+    tag = `S${serverDebugCounter}`;
+    serverDebugTags.set(server, tag);
+  }
+  return tag;
+}
+
 /**
  * Register an inbox-bus listener once, lazily, the first time anything
  * subscribes. Doing it lazily keeps test fixtures clean — tests that never
@@ -76,20 +96,38 @@ function ensureBusListener(): void {
   inboxBusUnbinder = onInboxChanged((event: InboxChangedEvent) => {
     const uri = inboxUriFor(event.agent_name);
     const subs = subscriptionsByUri.get(uri);
+    // [broadcast-trace] entry: which URI fanned out + total registered URIs
+    // + subscribers for THIS URI. Pre-instrumentation, an inbox event with
+    // no subscribers was a silent return.
+    log.info(
+      `[broadcast-trace] fanout enter agent=${event.agent_name} reason=${event.reason} uri=${uri} ` +
+      `total_uris=${subscriptionsByUri.size} subs_for_uri=${subs?.size ?? 0}`,
+    );
     if (!subs || subs.size === 0) return;
     for (const server of subs) {
+      const tag = tagFor(server);
+      // [broadcast-trace] per-subscriber: about to call sendResourceUpdated
+      log.info(`[broadcast-trace] notifying server=${tag} uri=${uri}`);
       // Each Server.sendResourceUpdated() returns a Promise; we don't
       // await — fan-out is best-effort, and one slow client must not
       // block the writer that fired the event. Errors here usually mean
       // the transport closed between subscribe + emit; log + drop the
       // dead subscriber to avoid further noise.
-      server.sendResourceUpdated({ uri }).catch((err: unknown) => {
-        log.warn(
-          `[mcp-subscriptions] sendResourceUpdated(${uri}) failed; dropping dead subscriber: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        subs.delete(server);
-        if (subs.size === 0) subscriptionsByUri.delete(uri);
-      });
+      server.sendResourceUpdated({ uri })
+        .then(() => {
+          // [broadcast-trace] per-subscriber: the SDK accepted the call
+          // (does NOT prove the client received it — only that the
+          // server-side push didn't throw). Pre-instrumentation success was
+          // silent.
+          log.info(`[broadcast-trace] notify accepted server=${tag} uri=${uri}`);
+        })
+        .catch((err: unknown) => {
+          log.warn(
+            `[mcp-subscriptions] sendResourceUpdated(${uri}) failed; dropping dead subscriber=${tag}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          subs.delete(server);
+          if (subs.size === 0) subscriptionsByUri.delete(uri);
+        });
     }
   });
 }
@@ -102,6 +140,10 @@ export function subscribe(uri: string, server: Server): void {
     subscriptionsByUri.set(uri, set);
   }
   set.add(server);
+  // [broadcast-trace] subscribe arrived
+  log.info(
+    `[broadcast-trace] subscribe added server=${tagFor(server)} uri=${uri} subs_for_uri=${set.size} total_uris=${subscriptionsByUri.size}`,
+  );
 }
 
 export function unsubscribe(uri: string, server: Server): void {

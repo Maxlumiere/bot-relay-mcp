@@ -1407,6 +1407,17 @@ export function startHttpServer(port: number, host: string): Server {
       async () => {
         try {
           const headerSession = req.headers["mcp-session-id"];
+          // v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace.
+          // Log every GET /mcp arrival so the Tether smoke can prove the
+          // SDK's StreamableHTTPClientTransport actually opens its long-
+          // lived SSE GET stream against the daemon (suspected to be the
+          // Electron-fetch-vs-Node-fetch differential per ship-pong msg
+          // 18362476). Source IP + session id surface enough to match
+          // against extension session.
+          log.info(
+            `[broadcast-trace] GET /mcp (SSE stream open attempt) ` +
+            `source=${sourceIp ?? "?"} session_id=${typeof headerSession === "string" && headerSession.length > 0 ? headerSession : "<missing>"}`
+          );
           if (typeof headerSession !== "string" || headerSession.length === 0) {
             res.status(400).json({
               error: "GET /mcp requires the mcp-session-id header. Initialize via POST first.",
