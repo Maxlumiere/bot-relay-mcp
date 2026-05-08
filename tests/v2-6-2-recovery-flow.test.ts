@@ -21,6 +21,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
+import { getFreePort } from "./_helpers/port.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -73,7 +74,7 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
 
 describe("v2.6.2 — recovery flow integration (register → revoke → recover → re-auth)", () => {
   it("full recovery cycle works end-to-end against a real HTTP daemon", async () => {
-    const PORT = 39420;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-2-recovery-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
@@ -271,7 +272,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
     // path (terminal revoke, agent should re-bootstrap from scratch) leaves
     // no credential on disk. This complements the recovery-flow test above
     // (which exercises issue_recovery=true) — both branches must scrub.
-    const PORT = 39421;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-2-r1-revoke-scrub-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
@@ -367,7 +368,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
     // the vault was already deleted out-of-band by the operator). The
     // delete is wrapped in try/catch in src/tools/identity.ts, and the
     // underlying FileTokenStore.deleteSync swallows ENOENT.
-    const PORT = 39422;
+    const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-2-r1-revoke-noop-" + process.pid);
     if (fs.existsSync(ROOT)) fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
