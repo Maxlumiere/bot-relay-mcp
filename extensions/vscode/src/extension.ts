@@ -34,6 +34,11 @@ import { resolveTetherConfig, type TetherConfig } from "./config.js";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
 const STATUS_COMMAND = "botRelayTether.openInbox";
+const EXTENSION_ID = "lumiere-ventures.bot-relay-tether";
+
+function getExtensionVersion(): string {
+  return vscode.extensions.getExtension(EXTENSION_ID)?.packageJSON.version ?? "0.0.0-unknown";
+}
 
 function readConfig(): TetherConfig {
   // R1 #3: route through the pure resolveTetherConfig() so the precedence
@@ -164,7 +169,7 @@ async function connect(config: TetherConfig): Promise<void> {
   }
   const transport = new StreamableHTTPClientTransport(url, { requestInit });
   const client = new Client(
-    { name: "bot-relay-tether-vscode", version: "0.1.0" },
+    { name: "bot-relay-tether-vscode", version: getExtensionVersion() },
     { capabilities: {} },
   );
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async (notification) => {
