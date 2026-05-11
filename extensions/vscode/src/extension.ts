@@ -89,7 +89,13 @@ function setErrorState(msg: string): void {
   connectionErrorState = true;
   log(msg);
   if (statusBarItem) {
-    statusBarItem.text = "Tether: error — see Output channel";
+    // v0.1.2 Tether Phase 4 — error text now points at the Reconnect
+    // command (registered as `botRelayTether.reconnect`, surfaced in
+    // the command palette as "Tether: Reconnect to Relay") so manual
+    // recovery is discoverable when the SDK's auto-reconnect retries
+    // exhaust. Per Codex SCOPE-TIGHTEN: "operator-facing text/status
+    // to make manual reconnect discoverable when retries exhaust."
+    statusBarItem.text = 'Tether: error — run "Tether: Reconnect to Relay"';
     statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
     statusBarItem.show();
   }
@@ -202,7 +208,30 @@ async function connect(config: TetherConfig): Promise<void> {
   if (config.agentToken) {
     requestInit.headers = { "X-Agent-Token": config.agentToken };
   }
-  const transport = new StreamableHTTPClientTransport(url, { requestInit });
+  // v0.1.2 Tether Phase 4 — raise the SDK's hardcoded
+  // `maxRetries: 2` default (see
+  // `node_modules/@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js:10`
+  // — DEFAULT_STREAMABLE_HTTP_RECONNECTION_OPTIONS). 2 retries is too
+  // aggressive for a long-running editor extension: a transient TCP
+  // hiccup or daemon restart can exhaust the budget in <2 s, after
+  // which the extension wedges until manual reconnect.
+  //
+  // With maxRetries: 20 + exponential backoff (1 s × 1.5^attempt,
+  // capped at 30 s), accumulated wait before giving up is roughly
+  // 6.75 min — long enough to ride out a daemon restart but bounded
+  // so a wedged daemon doesn't loop silently forever. When the
+  // budget IS exhausted, the error path now points at the
+  // `Tether: Reconnect to Relay` command via setErrorState() so
+  // manual recovery is discoverable.
+  const transport = new StreamableHTTPClientTransport(url, {
+    requestInit,
+    reconnectionOptions: {
+      initialReconnectionDelay: 1000,
+      maxReconnectionDelay: 30_000,
+      reconnectionDelayGrowFactor: 1.5,
+      maxRetries: 20,
+    },
+  });
 
   // v0.1.1 — wire transport diagnostics BEFORE client.connect(). The SDK
   // (Protocol._connect at node_modules/@modelcontextprotocol/sdk/dist/esm/shared/protocol.js:220-228)
