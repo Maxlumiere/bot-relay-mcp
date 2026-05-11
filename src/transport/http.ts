@@ -37,6 +37,26 @@ import { PROTOCOL_VERSION } from "../protocol.js";
 import type { Server } from "http";
 
 /**
+ * v2.7 Tether Phase 4 — pure reaper predicate. Module-scope export so
+ * tests/v2-7-tether-reaper-skip.test.ts can exercise the decision
+ * logic without spinning a real HTTP daemon. Structural type lets the
+ * test pass plain objects.
+ *
+ * Contract:
+ *   - openGetStreams > 0 → NEVER reap (active SSE subscriber).
+ *   - openGetStreams === 0 AND lastSeen < now - idleMs → REAP.
+ *   - openGetStreams === 0 AND lastSeen >= now - idleMs → NO-OP.
+ */
+export function shouldReapSession(
+  session: { lastSeen: number; openGetStreams: number },
+  now: number,
+  idleMs: number,
+): boolean {
+  if (session.openGetStreams > 0) return false;
+  return session.lastSeen < now - idleMs;
+}
+
+/**
  * Extract the rate-limit source IP for an incoming request.
  *
  * DEFAULT (no trusted proxies configured): always use the direct socket peer
@@ -1240,31 +1260,59 @@ export function startHttpServer(port: number, host: string): Server {
     createdAt: number;
     lastSeen: number;
     sourceIp: string | null;
+    /**
+     * v2.7 Tether Phase 4 — count of GET /mcp SSE streams currently open
+     * against this session. Per Codex SCOPE-TIGHTEN: a count (not boolean)
+     * survives reconnect-races where the client opens a new stream
+     * fractionally before the old one closes — a boolean could be flipped
+     * back to false by the older stream's `res.close` handler while a
+     * newer stream is already live, leaving the reaper to cull a session
+     * with an active subscriber. Increment in the GET handler before
+     * handleRequest; decrement once on `res.close` with a Math.max(0, n-1)
+     * floor so duplicate close/finish/error events can't underflow.
+     *
+     * Reaper invariant: a session with `openGetStreams > 0` is NEVER
+     * reaped regardless of lastSeen age. lastSeen continues to drive
+     * culling for sessions whose client has gone away entirely (no GET
+     * stream, no recent POST).
+     */
+    openGetStreams: number;
   }
   const sessions = new Map<string, HttpSession>();
   const HTTP_MAX_SESSIONS = Math.max(
     1,
     parseInt(process.env.RELAY_HTTP_MAX_SESSIONS ?? "64", 10) || 64,
   );
-  const HTTP_SESSION_IDLE_SECONDS = Math.max(
-    30,
-    parseInt(process.env.RELAY_HTTP_SESSION_IDLE_SECONDS ?? "300", 10) || 300,
+  // v2.7 Tether Phase 4 — test seams. Production keeps the existing
+  // 30s floor + 300s default; the floor only relaxes when an explicit
+  // test override flag is set so production can't accidentally configure
+  // a 2s reaper that culls real sessions.
+  const reaperTestMode =
+    process.env.RELAY_HTTP_REAPER_TEST_MODE === "1" ||
+    process.env.NODE_ENV === "test";
+  const HTTP_SESSION_IDLE_SECONDS = reaperTestMode
+    ? Math.max(1, parseInt(process.env.RELAY_HTTP_SESSION_IDLE_SECONDS ?? "300", 10) || 300)
+    : Math.max(30, parseInt(process.env.RELAY_HTTP_SESSION_IDLE_SECONDS ?? "300", 10) || 300);
+  const HTTP_REAPER_INTERVAL_MS = Math.max(
+    100,
+    parseInt(process.env.RELAY_HTTP_REAPER_INTERVAL_MS ?? "60000", 10) || 60000,
   );
 
   function reapIdleSessions(): void {
-    const cutoff = Date.now() - HTTP_SESSION_IDLE_SECONDS * 1000;
+    const idleMs = HTTP_SESSION_IDLE_SECONDS * 1000;
+    const now = Date.now();
     for (const [id, sess] of sessions) {
-      if (sess.lastSeen < cutoff) {
-        log.debug(`[http] reaping idle MCP session ${id} (idle ${(Date.now() - sess.lastSeen) / 1000}s)`);
+      if (shouldReapSession(sess, now, idleMs)) {
+        log.debug(`[http] reaping idle MCP session ${id} (idle ${(now - sess.lastSeen) / 1000}s, openGetStreams=${sess.openGetStreams})`);
         sess.transport.close().catch(() => {});
         // onclose hook below removes from map.
       }
     }
   }
-  // 60s timer is fine even with 30s timeouts — idle reaps are best-effort,
-  // a session 1.5x its timeout window stays a few seconds longer at worst.
+  // Reaper interval defaults to 60s in production; the env seam lets the
+  // integration test crank it to 1000ms for a fast deterministic check.
   // Unref so the timer never blocks process shutdown.
-  const reaper = setInterval(reapIdleSessions, 60_000);
+  const reaper = setInterval(reapIdleSessions, HTTP_REAPER_INTERVAL_MS);
   if (typeof reaper.unref === "function") reaper.unref();
 
   function isInitializeBody(body: unknown): boolean {
@@ -1334,6 +1382,7 @@ export function startHttpServer(port: number, host: string): Server {
         createdAt: Date.now(),
         lastSeen: Date.now(),
         sourceIp,
+        openGetStreams: 0,
       });
       log.debug(`[http] new MCP session ${newId} (active=${sessions.size})`);
     } else {
@@ -1423,6 +1472,27 @@ export function startHttpServer(port: number, host: string): Server {
               error: "GET /mcp requires the mcp-session-id header. Initialize via POST first.",
             });
             return;
+          }
+          // v2.7 Tether Phase 4 — track open GET streams per session so the
+          // reaper at L1305-1311 skips sessions with at least one live
+          // subscriber. Bump BEFORE handleRequest because handleRequest
+          // returns when the response closes (long-running). Decrement once
+          // on `close` — `close` fires for normal end, client disconnect,
+          // AND error termination, so attaching to a single event is
+          // sufficient. The Math.max(0, n-1) floor guards against any
+          // duplicate emission from future Node versions.
+          const trackedSession = sessions.get(headerSession);
+          let alreadyDecremented = false;
+          const decrementOnce = () => {
+            if (alreadyDecremented) return;
+            alreadyDecremented = true;
+            if (trackedSession) {
+              trackedSession.openGetStreams = Math.max(0, trackedSession.openGetStreams - 1);
+            }
+          };
+          if (trackedSession) {
+            trackedSession.openGetStreams += 1;
+            res.once("close", decrementOnce);
           }
           // GET has no body — handleRequest receives undefined.
           await handleSessionRequest(req, res, headerSession, false);
