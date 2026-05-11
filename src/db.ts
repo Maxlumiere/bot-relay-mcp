@@ -214,6 +214,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_8(_db);
   migrateSchemaToV2_9(_db);
   migrateSchemaToV2_10(_db);
+  finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 }
 
@@ -247,6 +248,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_8(_db);
   migrateSchemaToV2_9(_db);
   migrateSchemaToV2_10(_db);
+  finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 
   return _db;
@@ -484,36 +486,97 @@ export function getSchemaVersion(): number {
 }
 
 /**
- * Hook point for future schema migrations. Currently a stub: CURRENT_SCHEMA_VERSION
- * is 1 and there are no registered migrations. A future bump to v2 must:
- *   1. Add a case here that applies the migration SQL.
- *   2. UPDATE schema_info SET version = 2, last_migrated_at = NOW WHERE id = 1.
- *   3. Bump CURRENT_SCHEMA_VERSION to 2.
- * Throws for unregistered pairs so callers see a clear actionable error
- * rather than silent no-op.
+ * v2.7 Tether Phase 3 R1 — advance the recorded schema_info.version to
+ * `target` if it is currently behind. Idempotent + safe to call multiple
+ * times. Returns the prior version if a bump occurred, or null if no
+ * advance was needed.
+ *
+ * Why this exists: initSchema uses `INSERT OR IGNORE` to populate the
+ * single schema_info row. On a FRESH DB the inserted row carries
+ * CURRENT_SCHEMA_VERSION, which is correct. But on an EXISTING DB that
+ * was initialized under a prior code version, the row already has an
+ * older version and the IGNORE clause leaves it untouched — so every
+ * subsequent migrateSchemaToV2_X function runs (idempotently, via
+ * CREATE TABLE IF NOT EXISTS + ALTER ... ADD COLUMN-with-existence-
+ * guard), structurally bringing the DB up to current shape, but the
+ * recorded `schema_info.version` field stays at the old number forever.
+ *
+ * Codex caught this in Phase 3 R1 audit on a live v11 DB whose
+ * inbox_events table existed (v12 content) but whose version row still
+ * said 11. The bug was latent in every prior bump (v10→v11, v9→v10, …)
+ * but only surfaced now because `relay doctor` started comparing the
+ * stored version against CURRENT_SCHEMA_VERSION verbatim.
+ *
+ * Walk-analogous: every prior migration had this same bug. The fix
+ * here is structural — one helper, called from both init chains AND
+ * each applyMigration case, so the pattern is correct for v12→v13,
+ * v13→v14, and all future bumps without needing per-case code.
+ */
+function advanceSchemaVersionIfBehind(db: CompatDatabase, target: number): number | null {
+  const row = db
+    .prepare("SELECT version FROM schema_info WHERE id = 1")
+    .get() as { version: number } | undefined;
+  if (!row) return null;
+  if (row.version >= target) return null;
+  const prior = row.version;
+  db.prepare("UPDATE schema_info SET version = ?, last_migrated_at = ? WHERE id = 1")
+    .run(target, now());
+  log.info(
+    `[schema] advanced schema_info.version ${prior} → ${target} (post-migration sync; ` +
+    `idempotent additive migrations had already brought DB structure to v${target})`
+  );
+  return prior;
+}
+
+/**
+ * Hook point for backup/restore's schema-version dispatcher. Each
+ * registered (from, to) pair acknowledges a known migration AND syncs
+ * schema_info.version to `to` so the recorded version doesn't drift
+ * behind the actual DB shape after a restore round-trip. Throws for
+ * unregistered pairs so callers see a clear actionable error rather
+ * than a silent no-op.
+ *
+ * Init-time mutations are applied via the migrateSchemaToV2_X
+ * functions, which run unconditionally at startup. applyMigration is
+ * NOT on the init path; it is invoked by src/backup.ts during restore.
+ * The same advance helper runs at the end of the init chain
+ * ({@link finalizeSchemaVersion}) so neither path leaves
+ * schema_info.version stale.
  */
 export function applyMigration(from: number, to: number): void {
-  // v2.1 Phase 4b.1 v2 + Phase 4p: schema_version migrations 1→2 and 2→3
-  // are applied via migrateSchemaToV2_1 / migrateSchemaToV2_2 which run
-  // unconditionally at init under the same idempotent-guard pattern as
-  // migrateSchemaToV1_7 / migrateSchemaToV2_0. The mutation already
-  // happened at init; this hook is a no-op semantic acknowledgement so
-  // backup/restore's version-bump dispatcher doesn't throw.
-  if (from === 1 && to === 2) return;
-  if (from === 2 && to === 3) return;
-  if (from === 3 && to === 4) return;
-  if (from === 4 && to === 5) return;
-  if (from === 5 && to === 6) return;
-  if (from === 6 && to === 7) return;
-  if (from === 7 && to === 8) return;
-  if (from === 8 && to === 9) return;
-  if (from === 9 && to === 10) return;
-  if (from === 10 && to === 11) return;
-  if (from === 11 && to === 12) return;
+  // v2.1 Phase 4b.1 v2 + Phase 4p + … Phase 7q + v2.7 Tether Phase 3:
+  // schema_version migrations 1→2 through 11→12 are applied via the
+  // migrateSchemaToV1_7 / migrateSchemaToV2_X functions which run
+  // unconditionally at init under additive-idempotent guards. The
+  // mutation already happened at init; this hook ALSO syncs the
+  // stored version field via advanceSchemaVersionIfBehind so a
+  // backup→restore round-trip cannot leave a structurally-current
+  // DB with a stale recorded version (Codex R1 finding).
+  const registeredPairs: Array<[number, number]> = [
+    [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],
+    [7, 8], [8, 9], [9, 10], [10, 11], [11, 12],
+  ];
+  for (const [f, t] of registeredPairs) {
+    if (from === f && to === t) {
+      advanceSchemaVersionIfBehind(getDb(), to);
+      return;
+    }
+  }
   throw new Error(
     `no migration registered for schema_version ${from}→${to}. ` +
     `Register a handler in src/db.ts applyMigration and update CURRENT_SCHEMA_VERSION.`
   );
+}
+
+/**
+ * Init-chain finalizer — runs at the END of both initializeDb and getDb
+ * chains, after every migrateSchemaToV2_X has executed. Sole job:
+ * advance schema_info.version to CURRENT_SCHEMA_VERSION if it is
+ * currently behind. See {@link advanceSchemaVersionIfBehind} for the
+ * full rationale.
+ */
+function finalizeSchemaVersion(db: CompatDatabase): void {
+  advanceSchemaVersionIfBehind(db, CURRENT_SCHEMA_VERSION);
 }
 
 /**
