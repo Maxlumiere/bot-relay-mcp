@@ -146,7 +146,7 @@ describe("v2.6.x / Tether v0.1.1 Phase 2 — broadcast-trace instrumentation val
         /\[broadcast-trace\] resources\/subscribe RPC arrived uri=relay:\/\/inbox\/trace-target/,
         /\[broadcast-trace\] subscribe added server=S\d+ uri=relay:\/\/inbox\/trace-target/,
         /\[broadcast-trace\] event emit agent=trace-target reason=message_received/,
-        /\[broadcast-trace\] fanout enter agent=trace-target reason=message_received uri=relay:\/\/inbox\/trace-target/,
+        /\[broadcast-trace\] fanout enter source=(bus|tail) agent=trace-target reason=message_received uri=relay:\/\/inbox\/trace-target/,
         /\[broadcast-trace\] notifying server=S\d+ uri=relay:\/\/inbox\/trace-target/,
         /\[broadcast-trace\] notify accepted server=S\d+ uri=relay:\/\/inbox\/trace-target/,
       ];
