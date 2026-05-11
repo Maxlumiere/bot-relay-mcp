@@ -92,12 +92,15 @@ afterEach(() => {
   delete process.env.RELAY_FILESYSTEM_MARKERS;
 });
 
-describe("v2.3.0 C.1 — schema v11 migration", () => {
-  it("(C.1.1) schema version is 11 after init + expected columns present", () => {
+describe("v2.3.0 C.1 — schema migration", () => {
+  it("(C.1.1) schema version is current after init + expected columns present", () => {
     registerAgent("c1-a", "r", []);
     const ver = (getDb().prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number }).version;
-    expect(ver).toBe(11);
-    expect(CURRENT_SCHEMA_VERSION).toBe(11);
+    // v2.7 Tether Phase 3a bumped from 11 → 12 to register the inbox_events table.
+    // This assertion floats with CURRENT_SCHEMA_VERSION; the Phase 4s columns
+    // below are the load-bearing v11 invariants this test cares about.
+    expect(ver).toBe(CURRENT_SCHEMA_VERSION);
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(11);
     const messageCols = (getDb().prepare("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name);
     expect(messageCols).toContain("seq");
     expect(messageCols).toContain("epoch");

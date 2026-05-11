@@ -42,6 +42,18 @@ export interface InboxChangedEvent {
    * Tether VSCode extension to choose toast wording.
    */
   reason: "message_received" | "message_read" | "broadcast_received";
+  /**
+   * v2.7 / Tether Phase 3 — durable outbox row id (autoincrement primary
+   * key on `inbox_events`). The producer-side write path INSERTs the
+   * outbox row + reads `lastInsertRowid` + threads it here so subscribers
+   * can dedup. Without this, the in-process bus (this same-process
+   * fast path) and the cross-process outbox tail (the polling loop
+   * inside the HTTP daemon at src/outbox-tail.ts) would both fire
+   * `sendResourceUpdated` for the same event when sender and subscriber
+   * happen to be in the same process. mcp-subscriptions tracks the
+   * highest id it has broadcast per URI and skips duplicates.
+   */
+  id: number;
 }
 
 export function emitInboxChanged(event: InboxChangedEvent): void {
