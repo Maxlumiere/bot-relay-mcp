@@ -37,6 +37,79 @@ import { PROTOCOL_VERSION } from "../protocol.js";
 import type { Server } from "http";
 
 /**
+ * v2.7 Tether Phase 5 — SSE keepalive helper.
+ *
+ * Phase 4a fixed the server-side cull (session reaper closing while a
+ * GET stream was open). Maxime's post-Phase-4 smoke revealed a SECOND
+ * disconnect class at ~2.5 min — daemon log showed nothing (no reap,
+ * no close, no error), but the extension's client-side fetch reported
+ * `SSE stream disconnected: TypeError: terminated`. Root cause: VS
+ * Code's Electron-based fetch implementation has its own idle-stream
+ * timeout on `response.body` reads, separate from Node's / undici's
+ * timeouts. When no bytes flow for ~2.5 min, Electron declares the
+ * stream dead.
+ *
+ * Fix: emit a periodic SSE comment frame (":keepalive\n\n") from the
+ * daemon side. Per SSE spec, lines beginning with `:` are comments
+ * that clients MUST ignore — so the keepalive is invisible to the
+ * MCP message stream but visible to the fetch runtime as recent byte
+ * activity. Default interval 20 s gives ~3-4× margin against the
+ * typical 60-90 s intermediary idle threshold.
+ *
+ * Module-scope export so tests/v2-7-tether-sse-keepalive.test.ts can
+ * exercise the timer logic with a fake response object.
+ *
+ * Contract:
+ *   - intervalMs &lt;= 0 → no timer, returns a no-op cleanup. Lets
+ *     `RELAY_SSE_KEEPALIVE_MS=0` disable keepalive entirely.
+ *   - intervalMs &gt; 0 → setInterval that writes `:keepalive\n\n`
+ *     while !res.writableEnded. Returns a cleanup function the
+ *     caller can invoke directly; ALSO wires `res.once("close", ...)`
+ *     so the timer is guaranteed to clear even if the caller forgets.
+ *   - Cleanup is idempotent — invoking twice is a no-op the second
+ *     time, so caller-explicit cleanup + the res-close handler are
+ *     safe to both fire.
+ */
+type WritableLike = {
+  write: (chunk: string) => boolean | unknown;
+  once: (event: "close", listener: () => void) => unknown;
+  readonly writableEnded?: boolean;
+};
+
+export function setupSseKeepalive(
+  res: WritableLike,
+  intervalMs: number,
+): () => void {
+  if (intervalMs <= 0) return () => { /* no-op */ };
+  let cleared = false;
+  const timer = setInterval(() => {
+    if (cleared) return;
+    if (res.writableEnded) {
+      cleanup();
+      return;
+    }
+    try {
+      res.write(": keepalive\n\n");
+    } catch {
+      // Stream torn down between the writableEnded check and the
+      // write call — safe to ignore + cancel the timer.
+      cleanup();
+    }
+  }, intervalMs);
+  // Don't hold the event loop alive solely for keepalive ticks.
+  if (typeof (timer as { unref?: () => void }).unref === "function") {
+    (timer as { unref: () => void }).unref();
+  }
+  const cleanup = () => {
+    if (cleared) return;
+    cleared = true;
+    clearInterval(timer);
+  };
+  res.once("close", cleanup);
+  return cleanup;
+}
+
+/**
  * v2.7 Tether Phase 4 — pure reaper predicate. Module-scope export so
  * tests/v2-7-tether-reaper-skip.test.ts can exercise the decision
  * logic without spinning a real HTTP daemon. Structural type lets the
@@ -1297,6 +1370,18 @@ export function startHttpServer(port: number, host: string): Server {
     100,
     parseInt(process.env.RELAY_HTTP_REAPER_INTERVAL_MS ?? "60000", 10) || 60000,
   );
+  // v2.7 Tether Phase 5 — SSE keepalive interval. 20 s default gives
+  // ~3-4× margin against typical 60-90 s intermediary idle thresholds
+  // AND ~7× margin against Electron-fetch's observed ~2.5 min cull.
+  // Set to 0 to disable (useful in tests that explicitly want quiet
+  // streams). NaN / negative → falls back to default.
+  const HTTP_SSE_KEEPALIVE_MS = (() => {
+    const raw = process.env.RELAY_SSE_KEEPALIVE_MS;
+    if (raw === undefined || raw === "") return 20_000;
+    const n = parseInt(raw, 10);
+    if (!Number.isFinite(n) || n < 0) return 20_000;
+    return n;
+  })();
 
   function reapIdleSessions(): void {
     const idleMs = HTTP_SESSION_IDLE_SECONDS * 1000;
@@ -1494,6 +1579,18 @@ export function startHttpServer(port: number, host: string): Server {
             trackedSession.openGetStreams += 1;
             res.once("close", decrementOnce);
           }
+          // v2.7 Tether Phase 5 — SSE keepalive comment frames. The fix
+          // for Electron-based clients (VS Code Tether extension) whose
+          // fetch implementation declares idle response.body streams
+          // dead after ~2.5 min. Periodic ": keepalive\n\n" writes show
+          // the runtime that bytes are still flowing. See the helper at
+          // module scope for the contract + the standard-SSE-comment
+          // rationale. Wired BEFORE handleRequest so the timer is set
+          // up while res is alive. cleanup is wired both via the
+          // helper's internal res.once("close", ...) and via the
+          // openGetStreams decrement's close handler, but the helper's
+          // cleared flag makes both safe.
+          setupSseKeepalive(res, HTTP_SSE_KEEPALIVE_MS);
           // GET has no body — handleRequest receives undefined.
           await handleSessionRequest(req, res, headerSession, false);
         } catch (err) {
