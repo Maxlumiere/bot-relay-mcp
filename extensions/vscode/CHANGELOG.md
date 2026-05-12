@@ -4,6 +4,25 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.1.2] — 2026-05-12 — Reconnect resilience + discoverable manual reconnect
+
+End-to-end smoke against a real Electron-based VS Code session validated the v0.1.1 diagnostics together with the daemon-side Phase 3/4/5 fixes (cross-process outbox, reaper-skip-while-SSE-open, SSE keepalive). v0.1.2 ships two extension-side changes that pair with the daemon's `bot-relay-mcp` v2.6.3 release:
+
+### Added
+
+- **Configurable SDK reconnection options.** The transport constructor now passes `reconnectionOptions: { initialReconnectionDelay: 1000, maxReconnectionDelay: 30000, reconnectionDelayGrowFactor: 1.5, maxRetries: 20 }` to `StreamableHTTPClientTransport`. The SDK default is `maxRetries: 2`, which exhausts in under 2 seconds on any transient network blip — far too aggressive for a long-running editor extension. With `maxRetries: 20` and exponential backoff (1 s × 1.5^attempt, capped at 30 s), the SDK rides out daemon restarts and brief network hiccups for roughly 6 minutes 45 seconds of accumulated wait before surfacing failure.
+- **Discoverable manual reconnect on retry exhaustion.** When the SDK's retry budget is exhausted, the status bar now reads `Tether: error — run "Tether: Reconnect to Relay"` (was a generic `Tether: error — see Output channel` message in v0.1.1). The palette command `Tether: Reconnect to Relay` was already available since v0.1.0; this surfaces it where operators look when something goes wrong.
+
+### Compatibility
+
+- Requires `bot-relay-mcp` daemon v2.6.3 or later. The daemon-side SSE keepalive frames (released as part of the same v2.7-track work) are what prevent Electron's `fetch` from declaring the response stream idle and aborting it after ~2.5 minutes. v0.1.2 will run against older daemons but will silently degrade to the same Electron-idle disconnect class v0.1.0 exhibited.
+
+### References
+
+- Phase 4b commit `270acad` in the upstream bot-relay-mcp tree: source-level reconnectionOptions + status-bar text change. Drift guard at `tests/v2-7-tether-reconnection-options.test.ts` pins the contract against both `src/` and the compiled `out/extension.js` that ships in the VSIX.
+- Phase 5 commit `6ec32d6` in the upstream bot-relay-mcp tree: daemon-side SSE keepalive comment frames (the load-bearing fix for Electron-fetch idle timeouts).
+- Smoke validation: end-to-end Electron-based VS Code test at 2026-05-12, all signals (status-bar count update, toast, `event:` log line, daemon broadcast-trace) fired cleanly.
+
 ## [0.1.1] — 2026-05-08 — Pre-publish hotfix: transport diagnostics (instrumentation only)
 
 v0.1.0 visual marketplace smoke caught a silent-failure window: the extension reported `connected + subscribed` in its output channel but no inbox notifications were ever observed on send. Root cause: `extension.ts` did not wire `transport.onerror`, and the SDK's `_startOrAuthSse()` path that opens the long-lived SSE GET stream (the channel notifications travel down to idle subscribers) silently swallows errors when `onerror` is unset (`@modelcontextprotocol/sdk` `dist/esm/client/streamableHttp.js:374-376` — `.catch(err => this.onerror?.(err))` is a no-op when `onerror` is undefined).
