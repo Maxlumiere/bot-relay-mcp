@@ -962,7 +962,14 @@ export function startHttpServer(port: number, host: string): Server {
           req,
           "send_message",
           parsed.data.from,
-          `from=${parsed.data.from} to=${parsed.data.to}`,
+          // v2.7.1 R1 [P2 FIX] — match missing-token branch by
+          // surfacing `from_authenticated=false` in params_summary too.
+          // Pre-R1 only params_json (structured) carried the marker on
+          // this branch; the human-readable summary string omitted it,
+          // making `rg -n "from_authenticated"` on audit_log surface
+          // less complete than the missing-token branch. Codex R1
+          // audit caught the dual-channel inconsistency.
+          `from=${parsed.data.from} to=${parsed.data.to} from_authenticated=false`,
           false,
           "from_agent_token verification failed",
           { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED" }

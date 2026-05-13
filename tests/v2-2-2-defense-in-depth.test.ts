@@ -77,14 +77,17 @@ function postJson(
   });
 }
 
-function latestSendAudit(): { success: number; params_summary: string; error: string | null } | undefined {
+function latestSendAudit(): { success: number; params_summary: string; params_json: string | null; error: string | null } | undefined {
+  // v2.7.1 R1 — include params_json so dual-channel assertions in
+  // A1.3 can verify the structured payload carries the same marker
+  // the summary string does.
   return getDb()
     .prepare(
-      "SELECT success, params_summary, error FROM audit_log " +
+      "SELECT success, params_summary, params_json, error FROM audit_log " +
       "WHERE tool = 'send_message' AND source = 'dashboard' " +
       "ORDER BY id DESC LIMIT 1"
     )
-    .get() as { success: number; params_summary: string; error: string | null } | undefined;
+    .get() as { success: number; params_summary: string; params_json: string | null; error: string | null } | undefined;
 }
 
 beforeEach(async () => { await bootServer(); });
@@ -153,7 +156,7 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
     expect(row!.params_summary).toMatch(/from_authenticated=false/);
   });
 
-  it("(A1.3) present-and-invalid token → 403 AUTH_FAILED + audit success=0", async () => {
+  it("(A1.3) present-and-invalid token → 403 AUTH_FAILED + audit success=0 + dual-channel from_authenticated=false marker", async () => {
     registerAgent("a3-from", "r", []);
     registerAgent("a3-to", "r", []);
     const res = await postJson("/api/send-message", {
@@ -169,5 +172,22 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
     expect(row).toBeDefined();
     expect(row!.success).toBe(0);
     expect(row!.error).toMatch(/from_agent_token verification failed/i);
+    // v2.7.1 R1 [P2 FIX] — both the human-readable summary AND the
+    // structured params_json MUST carry `from_authenticated=false`
+    // / `"from_authenticated": false`. Pre-R1 the summary was
+    // missing the marker on this branch (only the missing-token
+    // branch surfaced it). A unit test that only inspected
+    // params_summary OR params_json would slip past the
+    // dual-channel inconsistency the audit caught.
+    expect(
+      row!.params_summary,
+      "wrong-token audit row's params_summary must include `from_authenticated=false` (matches missing-token branch shape).",
+    ).toMatch(/from_authenticated=false/);
+    expect(row!.params_json, "params_json must be present on dashboard audit rows").toBeTruthy();
+    const parsed = JSON.parse(row!.params_json as string) as { from_authenticated?: boolean };
+    expect(
+      parsed.from_authenticated,
+      "wrong-token audit row's params_json must carry `from_authenticated: false`.",
+    ).toBe(false);
   });
 });
