@@ -195,8 +195,12 @@ export function subscribe(uri: string, server: Server): void {
     subscriptionsByUri.set(uri, set);
   }
   set.add(server);
-  // [broadcast-trace] subscribe arrived
-  log.info(
+  // v2.7.1 — downgraded to debug per review-Victra synthesis F5 +
+  // codex PR #31 audit pt 4: only `fanout enter` stays at info as the
+  // load-bearing per-event observability line. `subscribe added`
+  // fires once per subscriber lifetime; surface under
+  // RELAY_LOG_LEVEL=debug when chasing a specific session.
+  log.debug(
     `[broadcast-trace] subscribe added server=${tagFor(server)} uri=${uri} subs_for_uri=${set.size} total_uris=${subscriptionsByUri.size}`,
   );
 }

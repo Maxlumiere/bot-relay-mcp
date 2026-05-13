@@ -38,6 +38,56 @@ function minLevel(): number {
   return LEVEL_ORDER.info;
 }
 
+/**
+ * v2.7.1 [CRITICAL FIX] — secret redaction.
+ *
+ * Defense-in-depth on top of stripping tokens at every known call site.
+ * Even after audit-walking the codebase, the next contributor adding a
+ * `log.debug(\`token=${tok}\`)` line will re-introduce the data-leak
+ * class. This function scrubs every log line before it hits stderr.
+ *
+ * Patterns intentionally match the common shapes operators are likely
+ * to interpolate into a log message:
+ *   - `RELAY_AGENT_TOKEN=<value>` — env-form (the exact shape Hermes
+ *     surfaced in src/tools/identity.ts:150-153 pre-fix).
+ *   - `Authorization: Bearer <value>` and `Authorization: <value>` —
+ *     HTTP request/response headers.
+ *   - `X-Agent-Token: <value>` — relay's per-agent header.
+ *   - JSON-ish `"token": "<value>"` (any of: token, agent_token,
+ *     recovery_token, secret, http_secret, webhook_secret,
+ *     password) — surfaces config dumps, error contexts, etc.
+ *
+ * Replacement is `***` (the value only; the key + framing stay so the
+ * log line remains diagnostic).
+ *
+ * Origin: review-Victra synthesis msg `2b903f9b` / Hermes deep-review.
+ */
+export function redactSecrets(line: string): string {
+  if (!line || typeof line !== "string") return line;
+  return (
+    line
+      // RELAY_AGENT_TOKEN=<value> (env-form; matches trailing
+      // whitespace, comma, or end-of-string).
+      .replace(/(RELAY_AGENT_TOKEN=)([^\s,"')]+)/g, "$1***")
+      // Authorization: Bearer <value>
+      .replace(/(Authorization:\s*Bearer\s+)([^\s,"')]+)/gi, "$1***")
+      // Authorization: <other-scheme-value> when no specific scheme matched.
+      // Negative lookahead skips `Bearer`/`Basic`/`Digest` so the more
+      // specific Bearer pattern (which ran first and already replaced the
+      // value with `***`) doesn't get re-matched here — that would
+      // re-capture the surviving scheme word as the value.
+      .replace(/(Authorization:\s+)(?!Bearer\b|Basic\b|Digest\b)([^\s,"')]+)/gi, "$1***")
+      // X-Agent-Token: <value>
+      .replace(/(X-Agent-Token:\s*)([^\s,"')]+)/gi, "$1***")
+      // JSON-ish "<key>": "<value>" for common secret-bearing keys.
+      // Catches both single + double quotes; non-greedy value match.
+      .replace(
+        /("(?:token|agent_token|recovery_token|secret|http_secret|webhook_secret|password)"\s*:\s*)"([^"]+)"/gi,
+        '$1"***"',
+      )
+  );
+}
+
 function write(level: LogLevel, args: unknown[]): void {
   if (LEVEL_ORDER[level] < minLevel()) return;
   const parts = args.map((a) => {
@@ -45,7 +95,8 @@ function write(level: LogLevel, args: unknown[]): void {
     if (typeof a === "object") return JSON.stringify(a);
     return String(a);
   });
-  process.stderr.write(`${ts()} ${PREFIX} [${level}] ${parts.join(" ")}\n`);
+  const raw = `${ts()} ${PREFIX} [${level}] ${parts.join(" ")}\n`;
+  process.stderr.write(redactSecrets(raw));
 }
 
 export const log = {
