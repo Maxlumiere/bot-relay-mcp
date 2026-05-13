@@ -2838,7 +2838,8 @@ export function getMessages(
   agentName: string,
   status: string,
   limit: number,
-  peek = false
+  peek = false,
+  sinceIso: string | null = null,
 ): MessageRecord[] {
   const db = getDb();
   // No touchAgent here — observation is not liveness (v1.3 presence fix)
@@ -2851,28 +2852,48 @@ export function getMessages(
   let rows: MessageRecord[];
 
   const priorityOrder = `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
+  // v2.7.0 Hermes-flagged P1 fix — `since` filter MUST run in SQL BEFORE
+  // the mark-as-read mutation below, otherwise messages older than the
+  // bound get marked read silently and never resurface to this session.
+  // Pre-v2.7.0 the filter ran in JS (src/tools/messaging.ts filterBySince,
+  // since removed) AFTER getMessages had already mutated read_by_session —
+  // silent data loss. Mirror getMessagesSummary's pattern at
+  // src/db.ts:3037: same `AND created_at >= ?` clause stitched into each
+  // branch.
+  const sinceClause = sinceIso ? "AND created_at >= ?" : "";
 
   if (status === "all") {
+    const params: unknown[] = [agentName];
+    if (sinceIso) params.push(sinceIso);
+    params.push(limit);
     rows = db.prepare(
-      `SELECT * FROM messages WHERE to_agent = ? ${priorityOrder}`
-    ).all(agentName, limit) as MessageRecord[];
+      `SELECT * FROM messages WHERE to_agent = ? ${sinceClause} ${priorityOrder}`
+    ).all(...params) as MessageRecord[];
   } else if (status === "read") {
     // "read" = this session has already observed these messages.
+    const params: unknown[] = [agentName, currentSession ?? ""];
+    if (sinceIso) params.push(sinceIso);
+    params.push(limit);
     rows = db.prepare(
       `SELECT * FROM messages WHERE to_agent = ?
          AND read_by_session IS NOT NULL
          AND read_by_session = ?
+         ${sinceClause}
          ${priorityOrder}`
-    ).all(agentName, currentSession ?? "", limit) as MessageRecord[];
+    ).all(...params) as MessageRecord[];
   } else {
     // "pending" = never read, OR read by a different session. This is the
     // core of the fix: a fresh terminal session (new session_id) sees
     // previously-read messages again, so handovers do not drop mail.
+    const params: unknown[] = [agentName, currentSession ?? ""];
+    if (sinceIso) params.push(sinceIso);
+    params.push(limit);
     rows = db.prepare(
       `SELECT * FROM messages WHERE to_agent = ?
          AND (read_by_session IS NULL OR read_by_session != ?)
+         ${sinceClause}
          ${priorityOrder}`
-    ).all(agentName, currentSession ?? "", limit) as MessageRecord[];
+    ).all(...params) as MessageRecord[];
   }
 
   // Mark messages as read by THIS session. The old binary `status` column
