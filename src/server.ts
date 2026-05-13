@@ -314,11 +314,17 @@ export function createServer(): Server {
   // SDK scopes sendResourceUpdated to the transport bound to the Server.
   server.setRequestHandler(SubscribeRequestSchema, async (request) => {
     const { uri } = request.params;
+    // v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace.
+    // Surface every resources/subscribe RPC arrival on the daemon side
+    // so the Tether smoke can prove the call actually reaches the
+    // handler (not just succeeds at the SDK level on the client).
+    log.info(`[broadcast-trace] resources/subscribe RPC arrived uri=${uri}`);
     subscribeResource(uri, server);
     return {};
   });
   server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
     const { uri } = request.params;
+    log.info(`[broadcast-trace] resources/unsubscribe RPC arrived uri=${uri}`);
     unsubscribeResource(uri, server);
     return {};
   });
