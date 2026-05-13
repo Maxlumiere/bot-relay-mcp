@@ -1,5 +1,33 @@
 # Changelog
 
+## v2.7.1 — 2026-05-13 — SECURITY HOTFIX
+
+Two CRITICAL findings + one HIGH + three LOW/MED that surfaced in the review-Victra deep-review synthesis (msg `2b903f9b`, synthesizing codex + Hermes deep-repo audits) AFTER codex's PR #31 audit had SHIPped v2.7.0 cleanly. The PR #31 audit was scoped to the four release commits; these findings live in PRE-EXISTING code that would have shipped via `npm publish` if the publish step had run before the deep-review landed.
+
+Maxime locked "fix all in one bundled dispatch" on 2026-05-13. PR opened against `main` post-v2.7.0-merge; no v2.7.0 tag was created and no npm publish ran, so v2.7.1 is the first public npm artifact in the v2.7 series.
+
+### Security
+
+- **[CRITICAL] `expand_capabilities` now requires `admin` capability** (`a92d22a`). Pre-fix the dispatcher's `TOOL_CAPABILITY` map at `src/auth.ts` omitted `expand_capabilities` entirely. Unmapped tools fall through to "no capability required", so any authenticated agent — even one with the default `{user}` cap set — could call `expand_capabilities` on themselves to add `admin`, `manage_others`, `rotate_others`, then `revoke_token` or `rotate_token_admin` any peer. ~3 calls to compromise a relay. Origin: review-Victra synthesis / Hermes deep-review.
+
+- **[CRITICAL] Plaintext agent tokens no longer logged to stderr on `register_agent`** (`1a56beb`). Pre-fix `src/tools/identity.ts:150-153` interpolated the freshly-minted token at info level on every registration; every stderr-capturing surface (terminal scrollback, CI logs, journald, Docker logs, log aggregators, SaaS observability) ended up with the token in cleartext. The "shown ONCE in the API response" model was broken from day one. Fix has two layers: (a) strip the token from the log line entirely (agent name + "(shown once in the tool response; not logged)" hint preserve the operational signal); (b) `redactSecrets` defense-in-depth scrubber in `src/logger.ts` applied to every log line at every level, matching `RELAY_AGENT_TOKEN=<value>`, `Authorization: Bearer <value>`, `Authorization: <other-scheme>`, `X-Agent-Token: <value>` (case-insensitive), and JSON-ish `"<key>": "<value>"` for token / agent_token / recovery_token / secret / http_secret / webhook_secret / password keys. Origin: Hermes deep-review.
+
+- **[HIGH] Dashboard `send_message` now requires `from_agent_token` for any `from` field that names a registered agent** (`aa75924`). Pre-fix `src/transport/http.ts` treated `from_agent_token` as optional defense-in-depth (Option (a) audit-only). Whoever held the dashboard's HTTP secret OR an authenticated session cookie could POST send_message with `from=victra` and impersonate any registered agent across the relay's full message + task surface. Maxime locked Option A: make from_agent_token REQUIRED when from-agent has a stored token_hash. Missing → 403 AUTH_FAILED; mismatch → 403 AUTH_FAILED; correct → success. System-message senders (e.g., `dashboard-system`) need their own row + token; no "no token = system" fallback. Origin: codex deep-review.
+
+### Fixes
+
+- **[MED] Walked all handlers that do "fetch → JS-filter → mutate"; confirmed v2.7.0's `get_messages` fix was complete.** No code change in v2.7.1 — the walk confirmed no other sites match the silent-data-loss class. Sibling read paths (`getMessagesSummary`, `peekMailboxVersion`, `getMessagesInWindow`, `getTasksInWindow`) all push `since` into SQL OR are pure reads with no mutation. One adjacent fidelity gap noted for v2.8: `src/tools/standup.ts:159` fetches the audit log with a hard LIMIT 500 then filters in JS by `created_at >= sinceIso` — pure read, no data loss, but the window may be incomplete on high-traffic relays. Deferred. Origin: codex deep-review.
+
+### Operational
+
+- **[LOW] Remaining `[broadcast-trace]` info-level lines downgraded to debug** (`962aff7`). v2.7.0 cleaned up the per-event lines; v2.7.1 downgrades `subscribe added` (once-per-subscriber-lifetime) and `GET /mcp (SSE stream open attempt)` (once-per-session). Only `fanout enter` stays at info per codex PR #31 audit pt 4 — it's the load-bearing per-event observability summary. Operators chasing live correlation can set `RELAY_LOG_LEVEL=debug`.
+
+- **[LOW] `SECURITY.md` + `architecture.md` now included in npm tarball** (this commit). Pre-fix `package.json` `files` array omitted both, so `npm install bot-relay-mcp` didn't ship the security disclosure or architecture-overview docs.
+
+### Cross-references
+
+PR opened against post-v2.7.0-merge `main` (HEAD: `afcf6ef`). Branch: `hotfix/v2.7.1-security`. Tether VSCode extension v0.1.3 (HIGH F10: SecretStorage migration) ships as a separate hotfix branch; the marketplace re-publish does NOT block this npm release.
+
 ## v2.7.0 — 2026-05-13 — Tether-ready cross-process inbox notifications + Hermes-flagged P1 correctness fix
 
 The v2.7.0 release closes the cross-process notification gap between stdio MCP terminals and the HTTP daemon that ships with `bot-relay-mcp`, lands a Hermes-flagged P1 correctness bug in `get_messages`, and pairs with the [Tether VSCode extension v0.1.2](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) on the marketplace.

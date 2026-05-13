@@ -1,6 +1,6 @@
 {
   "name": "bot-relay-mcp",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "MCP server for AI coding agent terminal-to-terminal communication. Local-first, SQLite-backed, webhook-integrated.",
   "type": "module",
   "main": "dist/index.js",
@@ -16,7 +16,9 @@
     "docs",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "SECURITY.md",
+    "architecture.md"
   ],
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
