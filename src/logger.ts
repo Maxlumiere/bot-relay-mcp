@@ -69,14 +69,27 @@ export function redactSecrets(line: string): string {
       // RELAY_AGENT_TOKEN=<value> (env-form; matches trailing
       // whitespace, comma, or end-of-string).
       .replace(/(RELAY_AGENT_TOKEN=)([^\s,"')]+)/g, "$1***")
-      // Authorization: Bearer <value>
-      .replace(/(Authorization:\s*Bearer\s+)([^\s,"')]+)/gi, "$1***")
-      // Authorization: <other-scheme-value> when no specific scheme matched.
-      // Negative lookahead skips `Bearer`/`Basic`/`Digest` so the more
-      // specific Bearer pattern (which ran first and already replaced the
-      // value with `***`) doesn't get re-matched here — that would
-      // re-capture the surviving scheme word as the value.
-      .replace(/(Authorization:\s+)(?!Bearer\b|Basic\b|Digest\b)([^\s,"')]+)/gi, "$1***")
+      // Authorization: <scheme> <credential> — single regex covers EVERY
+      // scheme. Pre-v2.7.1-R1 this was two regexes: one specifically for
+      // Bearer + a generic one with a Bearer/Basic/Digest negative
+      // lookahead. Codex R1 audit caught two failure modes in the prior
+      // shape:
+      //   - `Authorization: Basic dXNlcjpwYXNz` survived UNREDACTED
+      //     (the negative lookahead excluded Basic to avoid double-
+      //     capture against the Bearer pattern; net effect: Basic
+      //     credentials shipped to stderr).
+      //   - `Authorization: Token abc123` got partially redacted to
+      //     `Authorization: *** abc123` — the regex captured the SCHEME
+      //     word (Token / ApiKey / Digest-without-quote / etc.) as the
+      //     credential and missed the actual token bytes.
+      //
+      // Capture shape: $1 = "Authorization: " framing, $2 = optional
+      // "scheme " (Bearer/Basic/Token/ApiKey/any \w+), $3 = credential.
+      // Replacement preserves $1 + $2 (scheme name) and replaces $3
+      // with `***`. When the input is scheme-less (`Authorization:
+      // <cred>`), $2 is empty and replacement becomes
+      // `Authorization: ***`.
+      .replace(/(Authorization:\s+)(\w+\s+)?([^\s,"')]+)/gi, "$1$2***")
       // X-Agent-Token: <value>
       .replace(/(X-Agent-Token:\s*)([^\s,"')]+)/gi, "$1***")
       // JSON-ish "<key>": "<value>" for common secret-bearing keys.

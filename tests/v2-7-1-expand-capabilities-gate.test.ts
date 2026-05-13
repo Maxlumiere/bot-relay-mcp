@@ -137,24 +137,127 @@ describe("v2.7.1 [CRITICAL] — expand_capabilities cap gate", () => {
   });
 });
 
-describe("v2.7.1 [WALK-ANALOGOUS] — TOOL_CAPABILITY coverage of mutating identity/auth tools", () => {
-  // Spec-pinning test: list of every src/server.ts tool that MUTATES auth
-  // or identity state. Each is either gated in TOOL_CAPABILITY or has a
-  // documented reason for being open (self-mutation only, etc.). New
-  // mutating tools added in future releases MUST be reviewed against
-  // this list — codex's discipline note on "verify don't assume".
+describe("v2.7.1 R1 [CONTRACT] — TOOL_CAPABILITY map agrees with tool-description admin marker", () => {
+  // v2.7.1 R0 had a hand-maintained fixed-list spec-pin that read:
+  //   const mustBeGated = ["revoke_token", "rotate_token_admin",
+  //                        "expand_capabilities", "spawn_agent"];
+  // Codex R1 audit caught the gap: set_dashboard_theme documents
+  // itself at src/server.ts:633 as "Auth: dashboard-secret-equivalent
+  // capability (treated as an admin operation)" but the fixed list
+  // didn't include it. The audit's exact note: "Your walk-analogous
+  // fixed list would NOT have failed if another admin tool stayed
+  // unmapped. set_dashboard_theme is that current counterexample."
   //
-  // This test is a structural pin, not a behavioral test — it imports
-  // TOOL_CAPABILITY and asserts the security-relevant keys are present.
-  it("every identified privilege-mutation tool is gated in TOOL_CAPABILITY", async () => {
+  // R1 replaces the fixed list with a CONTRACT pin: scan every tool
+  // description in src/server.ts for admin-equivalent phrasing AND
+  // assert the matching TOOL_CAPABILITY entry exists with cap='admin'.
+  // The contract is "documentation and TOOL_CAPABILITY MUST agree" —
+  // drift detection is the goal, not a hand-curated list.
+  //
+  // Markers scanned:
+  //   - "treated as an admin operation" (set_dashboard_theme's literal phrase)
+  //   - "dashboard-secret-equivalent" (alternate phrasing)
+  //   - "Requires `admin` capability" (explicit cite)
+  // Future tools landing with any of these markers automatically join
+  // the contract; future audits flagging additional markers can
+  // extend the regex below.
+  it("every tool whose description declares admin-equivalent semantics is gated cap='admin' in TOOL_CAPABILITY", async () => {
+    const fs = await import("fs");
+    const path = await import("path");
+    const { fileURLToPath } = await import("url");
     const { TOOL_CAPABILITY } = await import("../src/auth.js");
-    // Tools that mutate cross-agent auth/identity state and MUST be gated.
-    const mustBeGated = ["revoke_token", "rotate_token_admin", "expand_capabilities", "spawn_agent"];
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const serverTs = path.resolve(here, "..", "src", "server.ts");
+    const body = fs.readFileSync(serverTs, "utf-8");
+
+    // Split into tool entries by the `name: "<tool>"` marker. Each
+    // entry runs from one name: to the next (or to the array's
+    // closing bracket).
+    const toolRegex = /\bname:\s*"([a-z_][a-z0-9_]*)"/g;
+    const toolStarts: Array<{ name: string; start: number }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = toolRegex.exec(body)) !== null) {
+      toolStarts.push({ name: m[1], start: m.index });
+    }
+
+    const adminMarkerRegex = /(treated as an admin operation|dashboard-secret-equivalent|Requires `admin` capability)/i;
+    const violations: string[] = [];
+    for (let i = 0; i < toolStarts.length; i++) {
+      const entry = toolStarts[i];
+      const end = i + 1 < toolStarts.length ? toolStarts[i + 1].start : body.length;
+      const chunk = body.slice(entry.start, end);
+      if (!adminMarkerRegex.test(chunk)) continue;
+      // Skip the top-level server name; only tool entries inside the
+      // tools array carry capability semantics.
+      if (entry.name === "bot-relay") continue;
+      // Skip the `unregister_agent` entry — its docstring mentions
+      // "admin removals" with the `manage_others` cap as a HANDLER-
+      // side branch (self-removal is unauthenticated). The contract
+      // here is for tools whose admin-marker maps to a dispatcher-
+      // level TOOL_CAPABILITY gate.
+      if (entry.name === "unregister_agent") continue;
+
+      const actual = TOOL_CAPABILITY[entry.name];
+      if (actual !== "admin") {
+        violations.push(
+          `tool "${entry.name}" docs declare admin semantics but TOOL_CAPABILITY[${entry.name}] === ${JSON.stringify(actual)} (expected "admin")`,
+        );
+      }
+    }
+
+    expect(
+      violations.length,
+      `${violations.length} tool(s) drift between description and TOOL_CAPABILITY:\n  ${violations.join("\n  ")}`,
+    ).toBe(0);
+  });
+
+  // Hand-curated must-be-gated list, kept as defense-in-depth against
+  // a tool that lacks the description marker but still mutates
+  // cross-agent auth/identity state. v2.7.1 R0 shipped this list
+  // as the spec-pin; R1 retains it as a secondary check (the contract
+  // test above is the primary).
+  it("every identified privilege-mutation tool is gated in TOOL_CAPABILITY (defense-in-depth list)", async () => {
+    const { TOOL_CAPABILITY } = await import("../src/auth.js");
+    const mustBeGated = [
+      "revoke_token",
+      "rotate_token_admin",
+      "expand_capabilities",
+      "spawn_agent",
+      "set_dashboard_theme", // R1: added after codex audit caught the gap
+    ];
     for (const tool of mustBeGated) {
       expect(
         TOOL_CAPABILITY[tool],
         `${tool} is missing from TOOL_CAPABILITY in src/auth.ts — any auth'd agent can call it without a capability check.`,
       ).toBeDefined();
     }
+  });
+});
+
+describe("v2.7.1 R1 [P2] — set_dashboard_theme cap gate (runtime behavior)", () => {
+  // The fix for codex R1 P2 ALSO needs runtime regression tests
+  // mirroring the expand_capabilities cap-gate shape: a default-cap
+  // caller is REJECTED with CAP_DENIED; an admin-cap caller succeeds.
+  // Without these, the contract test above pins the static map but
+  // a future refactor of the dispatcher's TOOL_CAPABILITY consumer
+  // could break the runtime gate without failing.
+  it("agent with default `[]` caps calling set_dashboard_theme is REJECTED with CAP_DENIED", async () => {
+    const tok = await register("dash-default-cap", []);
+    const r = await rpc("set_dashboard_theme", {
+      mode: "dark",
+      agent_token: tok,
+    });
+    expect(r.success).toBe(false);
+    expect(r.error_code).toBe(ERROR_CODES.CAP_DENIED);
+  });
+
+  it("agent with `admin` cap CAN call set_dashboard_theme (positive control)", async () => {
+    const tok = await register("dash-admin", ["admin"]);
+    const r = await rpc("set_dashboard_theme", {
+      mode: "light",
+      agent_token: tok,
+    });
+    expect(r.success).toBe(true);
+    expect(r.theme).toBe("light");
   });
 });
