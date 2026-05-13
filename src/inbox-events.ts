@@ -57,12 +57,13 @@ export interface InboxChangedEvent {
 }
 
 export function emitInboxChanged(event: InboxChangedEvent): void {
-  // v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace. Surfaces
-  // every inbox event the daemon emits so Maxime's Tether smoke can
-  // correlate "send_message landed in DB" → "emit fired" → "broadcaster
-  // reached" → "sendResourceUpdated accepted" → (extension reception is
-  // proven separately by the extension's own diagnostics from v0.1.1).
-  log.info(`[broadcast-trace] event emit agent=${event.agent_name} reason=${event.reason}`);
+  // v2.7.0 — debug-level broadcast-trace. Fires on every send/read/
+  // broadcast event; useful to correlate same-process bus emission with
+  // mcp-subscriptions fanout under RELAY_LOG_LEVEL=debug. Downgraded
+  // from info in v2.7.0 (was Phase 2 temporary instrumentation). The
+  // load-bearing per-emit observability line is `fanout enter` in
+  // src/mcp-subscriptions.ts which stays at info.
+  log.debug(`[broadcast-trace] event emit agent=${event.agent_name} reason=${event.reason}`);
   bus.emit("inbox.changed", event);
 }
 
