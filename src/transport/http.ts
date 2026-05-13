@@ -907,12 +907,26 @@ export function startHttpServer(port: number, host: string): Server {
       });
       return;
     }
-    // v2.2.2 A1 — Option (b) defense-in-depth. If the caller supplied a
-    // from_agent_token (body field or X-From-Agent-Token header), verify
-    // it against the from-agent's stored token_hash. Match → audit
-    // records `from_authenticated: true`. Mismatch → 403 + audit entry.
-    // Absent → audit records `from_authenticated: false` (Option (a)
-    // audit-only model, unchanged from v2.2.1).
+    // v2.7.1 [HIGH FIX] — dashboard send_message impersonation gate.
+    //
+    // Pre-v2.7.1 the v2.2.2 A1 path treated from_agent_token as OPTIONAL
+    // (defense-in-depth only): if the caller didn't supply one, the send
+    // succeeded with `from_authenticated: false` in the audit log. Anyone
+    // who held the dashboard's HTTP secret could POST send_message with
+    // `from=victra` and impersonate any registered agent across the
+    // relay's entire message + task surface.
+    //
+    // Maxime locked Option A on 2026-05-13 (review-Victra synthesis msg
+    // `2b903f9b` / codex deep-review): make from_agent_token REQUIRED
+    // when `from` names a registered agent. The dashboard secret +
+    // CSRF + origin checks still cover access to this endpoint; the
+    // from-token gate stops impersonation if those upstream checks ever
+    // leak (stolen cookie, malicious browser extension, etc.).
+    //
+    // System-message escape hatch: a reserved sender name like
+    // `dashboard-system` must have its own row + token in the DB. No
+    // "no token = system" fallback — that would re-open the same hole
+    // under a different name. (Brief §F4 point 3.)
     const headerFromToken = req.headers["x-from-agent-token"];
     const fromAgentToken: string | null =
       (typeof parsed.data.from_agent_token === "string" && parsed.data.from_agent_token.length > 0
@@ -921,21 +935,24 @@ export function startHttpServer(port: number, host: string): Server {
           ? headerFromToken
           : null);
     let fromAuthenticated = false;
-    if (fromAgentToken) {
-      const fromRow = getAgentAuthData(parsed.data.from);
-      if (!fromRow || !fromRow.token_hash) {
+    const fromRow = getAgentAuthData(parsed.data.from);
+    if (fromRow && fromRow.token_hash) {
+      // The from-agent is registered AND has a token_hash → caller MUST
+      // present a matching from_agent_token. Missing → reject. Mismatch
+      // → reject.
+      if (!fromAgentToken) {
         logDashboardAudit(
           req,
           "send_message",
           parsed.data.from,
           `from=${parsed.data.from} to=${parsed.data.to}`,
           false,
-          "from_agent_token present but from-agent has no token_hash",
+          "from_agent_token missing — dashboard send_message requires the from-agent's token when from names a registered agent (v2.7.1 impersonation gate)",
           { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED" }
         );
         res.status(403).json({
           success: false,
-          error: `Agent "${parsed.data.from}" has no token hash (legacy or unregistered). Cannot verify from_agent_token.`,
+          error: `Dashboard send_message requires from_agent_token when "from" names a registered agent. Pass it as the from_agent_token body field or the X-From-Agent-Token header.`,
           error_code: "AUTH_FAILED",
         });
         return;
@@ -958,6 +975,27 @@ export function startHttpServer(port: number, host: string): Server {
         return;
       }
       fromAuthenticated = true;
+    } else if (fromAgentToken) {
+      // No registered row OR row has no token_hash, but caller supplied
+      // a token anyway. Pre-v2.7.1 this returned 403 with a confusing
+      // "legacy or unregistered" message; preserve that behavior for
+      // backward-compat — the unauthenticated path will hit
+      // SenderNotRegisteredError downstream which is the real signal.
+      logDashboardAudit(
+        req,
+        "send_message",
+        parsed.data.from,
+        `from=${parsed.data.from} to=${parsed.data.to}`,
+        false,
+        "from_agent_token present but from-agent has no token_hash",
+        { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED" }
+      );
+      res.status(403).json({
+        success: false,
+        error: `Agent "${parsed.data.from}" has no token hash (legacy or unregistered). Cannot verify from_agent_token.`,
+        error_code: "AUTH_FAILED",
+      });
+      return;
     }
     try {
       const msg = sendMessage(parsed.data.from, parsed.data.to, parsed.data.content, parsed.data.priority);
@@ -1541,14 +1579,13 @@ export function startHttpServer(port: number, host: string): Server {
       async () => {
         try {
           const headerSession = req.headers["mcp-session-id"];
-          // v2.7.0 — once-per-session SSE-stream-open info line. Kept at
-          // info because it fires only when a client opens an MCP SSE
-          // GET stream (rare event); useful for operators verifying
-          // that an IDE extension actually opened its long-lived
-          // notification channel rather than just POSTing one-shot
-          // requests. Source IP + session id surface enough to match
-          // against extension session.
-          log.info(
+          // v2.7.1 — downgraded to debug per review-Victra synthesis F5
+          // + codex PR #31 audit pt 4: only `fanout enter` stays at info.
+          // SSE-stream-open is once-per-session but most operators
+          // don't need the per-session trace; surface under
+          // RELAY_LOG_LEVEL=debug when verifying an extension's
+          // long-lived notification channel.
+          log.debug(
             `[broadcast-trace] GET /mcp (SSE stream open attempt) ` +
             `source=${sourceIp ?? "?"} session_id=${typeof headerSession === "string" && headerSession.length > 0 ? headerSession : "<missing>"}`
           );
