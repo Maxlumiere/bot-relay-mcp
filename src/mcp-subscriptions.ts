@@ -136,7 +136,9 @@ export function broadcastInboxChange(
     // path: bus fires first (same-process), then tail catches up; or
     // tail fires first (cross-process), then bus fires in the daemon for
     // a subscriber that happened to also be local. Either way: drop.
-    log.info(
+    // v2.7.0 — debug-level (fires on every duplicate; only useful when
+    // chasing a specific dedup edge case under RELAY_LOG_LEVEL=debug).
+    log.debug(
       `[broadcast-trace] dedup-skip source=${source} agent=${agentName} reason=${reason} ` +
       `event_id=${eventId} last_broadcast_id=${last} uri=${uri}`,
     );
@@ -144,6 +146,11 @@ export function broadcastInboxChange(
   }
   lastBroadcastIdByUri.set(uri, eventId);
 
+  // [broadcast-trace] fanout enter — KEPT at info as the load-bearing
+  // production observability line for per-event broadcast. Surfaces the
+  // (agent, reason, uri, sub count) summary on every fanout — useful
+  // for operators verifying their subscriber is receiving notifications
+  // without needing debug-level logs.
   const subs = subscriptionsByUri.get(uri);
   log.info(
     `[broadcast-trace] fanout enter source=${source} agent=${agentName} reason=${reason} uri=${uri} ` +
@@ -152,10 +159,11 @@ export function broadcastInboxChange(
   if (!subs || subs.size === 0) return;
   for (const server of subs) {
     const tag = tagFor(server);
-    log.info(`[broadcast-trace] notifying server=${tag} uri=${uri}`);
+    // v2.7.0 — debug-level per-subscriber trace.
+    log.debug(`[broadcast-trace] notifying server=${tag} uri=${uri}`);
     server.sendResourceUpdated({ uri })
       .then(() => {
-        log.info(`[broadcast-trace] notify accepted server=${tag} uri=${uri}`);
+        log.debug(`[broadcast-trace] notify accepted server=${tag} uri=${uri}`);
       })
       .catch((err: unknown) => {
         log.warn(

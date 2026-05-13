@@ -78,6 +78,12 @@ describe("v2.6.x / Tether v0.1.1 Phase 2 — broadcast-trace instrumentation val
         RELAY_CONFIG_PATH: path.join(ROOT, "config.json"),
         RELAY_AGENT_TOKEN: "",
         RELAY_AGENT_NAME: "",
+        // v2.7.0 — the per-event trace lines (resources/subscribe RPC
+        // arrival, event emit, notifying, notify accepted) were
+        // downgraded from info to debug as part of the Phase 2 trace
+        // cleanup. This test still asserts the full chain order, so
+        // bump the log level to surface them.
+        RELAY_LOG_LEVEL: "debug",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
