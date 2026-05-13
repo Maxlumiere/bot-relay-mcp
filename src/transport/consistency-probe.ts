@@ -70,6 +70,14 @@ export function sampleGetMessagesConsistency(args: {
   limit: number;
   peek: boolean;
   mcpResult: MessageRecord[];
+  /**
+   * v2.7.0: the same `since` bound the MCP path applied. Pre-v2.7.0 the
+   * filter ran in JS after the SQL fetch, so the probe's SUPERSET
+   * query naturally matched. The Hermes-flagged P1 fix moved the
+   * filter into SQL; the probe must mirror it or every since-narrower-
+   * than-all call emits false-positive "divergence" warnings.
+   */
+  sinceIso: string | null;
 }): void {
   if (!isEnabled()) return;
   callCounter += 1;
@@ -84,14 +92,22 @@ export function sampleGetMessagesConsistency(args: {
     // filter can legitimately hide rows read by THIS session, but it
     // should NOT hide rows that no session has read. If SQL sees any
     // such rows that MCP dropped, that's a v2.2.1-style divergence.
+    //
+    // The `since` clause MIRRORS the MCP path's filter so the probe
+    // doesn't flag rows the caller legitimately asked to exclude.
+    const sinceClause = args.sinceIso ? "AND created_at >= ?" : "";
+    const params: unknown[] = [args.agentName];
+    if (args.sinceIso) params.push(args.sinceIso);
+    params.push(Math.max(args.limit, 100));
     const sqlRows = db
       .prepare(
         "SELECT id FROM messages " +
           "WHERE to_agent = ? " +
           "  AND (read_by_session IS NULL OR status = 'pending') " +
+          "  " + sinceClause + " " +
           "LIMIT ?",
       )
-      .all(args.agentName, Math.max(args.limit, 100)) as { id: string }[];
+      .all(...params) as { id: string }[];
     const mcpIds = new Set(args.mcpResult.map((m) => m.id));
     const missingFromMcp = sqlRows.map((r) => r.id).filter((id) => !mcpIds.has(id));
     if (missingFromMcp.length > 0) {

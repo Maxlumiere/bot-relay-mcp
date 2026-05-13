@@ -117,6 +117,11 @@ async function startDaemon(label: string, pollMs = 50): Promise<DaemonHandle> {
       RELAY_AGENT_NAME: "",
       // Fast poll for test speed; production default is 100ms.
       RELAY_OUTBOX_POLL_MS: String(pollMs),
+      // v2.7.0 — the per-event dedup-skip + notify trace lines were
+      // downgraded to debug as part of Phase 2 log cleanup. The "mixed
+      // traffic" assertion below asserts dedup-skip appeared in stderr,
+      // so surface debug-level lines for this test.
+      RELAY_LOG_LEVEL: "debug",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

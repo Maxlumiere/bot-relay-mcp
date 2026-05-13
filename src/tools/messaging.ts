@@ -119,23 +119,15 @@ function resolveSinceBound(
   return new Date(ms).toISOString();
 }
 
-function filterBySince<T extends { created_at: string }>(
-  rows: T[],
-  sinceIso: string | null
-): T[] {
-  if (!sinceIso) return rows;
-  return rows.filter((r) => r.created_at >= sinceIso);
-}
-
 export function handleGetMessages(input: GetMessagesInput) {
   runHealthMonitor("get_messages");
-  // v2.1.6: since filter is applied AFTER the DB fetch (which mirrors the
-  // pre-v2.1.6 session-read mutation + priority ordering). We over-fetch
-  // intentionally — the `limit` is the display cap for the caller; the time
-  // filter is a secondary narrowing applied in memory. For 24h default on a
-  // healthy relay this is effectively no-op; for reused-name replay scenarios
-  // it trims the returned set + hides noise without affecting the underlying
-  // read-by-session state the DB layer already maintains.
+  // v2.7.0 Hermes P1 fix: `sinceIso` is now passed into the SQL layer and
+  // applied as `AND created_at >= ?` BEFORE the mark-as-read mutation in
+  // src/db.ts getMessages. Pre-v2.7.0 the filter ran here in JS AFTER
+  // getMessages had already marked rows as read for this session — a
+  // message older than the bound got consumed silently and never
+  // resurfaced. See docs/v2.7.0-get-messages-filter-after-mark.md for
+  // the full investigation + regression test.
   let sinceIso: string | null;
   try {
     sinceIso = resolveSinceBound(input.since, input.agent_name);
@@ -155,8 +147,8 @@ export function handleGetMessages(input: GetMessagesInput) {
       isError: true,
     };
   }
-  const raw = getMessages(input.agent_name, input.status, input.limit, input.peek ?? false);
-  const messages = filterBySince(raw, sinceIso);
+  const raw = getMessages(input.agent_name, input.status, input.limit, input.peek ?? false, sinceIso);
+  const messages = raw;
   // v2.3.0 Part A.2 — live consistency probe. Off by default; when
   // enabled via RELAY_CONSISTENCY_PROBE=1, samples every Nth call and
   // logs a stderr warning if a raw SQL superset query sees pending
@@ -169,6 +161,7 @@ export function handleGetMessages(input: GetMessagesInput) {
       limit: input.limit,
       peek: input.peek ?? false,
       mcpResult: raw,
+      sinceIso,
     });
   } catch {
     /* probe guarantees no-throw but defensive */

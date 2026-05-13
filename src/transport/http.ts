@@ -1541,12 +1541,12 @@ export function startHttpServer(port: number, host: string): Server {
       async () => {
         try {
           const headerSession = req.headers["mcp-session-id"];
-          // v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace.
-          // Log every GET /mcp arrival so the Tether smoke can prove the
-          // SDK's StreamableHTTPClientTransport actually opens its long-
-          // lived SSE GET stream against the daemon (suspected to be the
-          // Electron-fetch-vs-Node-fetch differential per ship-pong msg
-          // 18362476). Source IP + session id surface enough to match
+          // v2.7.0 — once-per-session SSE-stream-open info line. Kept at
+          // info because it fires only when a client opens an MCP SSE
+          // GET stream (rare event); useful for operators verifying
+          // that an IDE extension actually opened its long-lived
+          // notification channel rather than just POSTing one-shot
+          // requests. Source IP + session id surface enough to match
           // against extension session.
           log.info(
             `[broadcast-trace] GET /mcp (SSE stream open attempt) ` +

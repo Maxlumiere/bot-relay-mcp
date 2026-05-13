@@ -3,9 +3,9 @@
 [![CI](https://github.com/Maxlumiere/bot-relay-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Maxlumiere/bot-relay-mcp/actions/workflows/ci.yml)
 [![Tether on VSCode Marketplace](https://img.shields.io/visual-studio-marketplace/v/lumiere-ventures.bot-relay-tether?label=Tether%20on%20VSCode%20Marketplace&color=007ACC)](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether)
 
-A local-first message relay for AI coding agents. Two interfaces, one shared SQLite database, zero infrastructure.
+A local-first coordination bus for AI coding agents. Durable inboxes, task queues, and wakeups for Claude Code, Cursor, Cline, Codex-style CLIs, scripts, and webhooks. Two interfaces, one shared SQLite database, zero infrastructure.
 
-**v2.1 — architecturally complete.** 25 tools. Everything v2.0 delivered (smart routing, task leases, session-aware reads, lazy health monitor, busy/DND status, webhook retries, channels) + the v2.1 sweep: explicit auth_state machine with revoke/recovery flow, managed-agent rotation grace, keyring-based encryption with online rotation, unified `relay` CLI with `recover` + `re-encrypt` + `doctor` + `init` + `test` + `generate-hooks` + `backup` + `restore`. 14 of 14 Codex architectural findings closed. See [CHANGELOG](./CHANGELOG.md) for the full arc.
+**v2.7 — Tether-ready.** 30 MCP tools. Cross-process inbox notifications via a durable outbox + SSE keepalive (any agent's inbox change wakes IDE subscribers across stdio + HTTP processes). Pairs with the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) for live in-editor status. See [CHANGELOG](./CHANGELOG.md) for the v2.7 phase-by-phase arc and the prior v2.1 architectural sweep (explicit `auth_state` machine, managed-agent rotation grace, keyring-based encryption, unified `relay` CLI).
 
 ## What is this?
 
@@ -96,11 +96,19 @@ The database is created automatically at `~/.bot-relay/relay.db` on first use. T
 
 **File permissions (v2.1).** The relay creates `~/.bot-relay/` at `0700` and `relay.db` + backup tarballs at `0600` — owner-only. `config.json` is operator-managed; the relay never chmods it but logs a warning at startup if it's more permissive than `0600`. POSIX only — native Windows NTFS uses ACLs, not POSIX modes, so the chmod calls are no-ops there (documented).
 
-## Tether (v2.5)
+## Tether (v2.5 + v2.7 cross-process delivery)
 
-`relay://inbox/<agent_name>` is now a subscribable MCP resource. Any MCP-aware client subscribes via the standard `subscribe` request and receives `notifications/resources/updated` pushes when the agent's inbox changes (new mail, broadcast, drain). No polling, standard MCP semantics.
+`relay://inbox/<agent_name>` is a subscribable MCP resource. Any MCP-aware client subscribes via the standard `subscribe` request and receives `notifications/resources/updated` pushes when the agent's inbox changes (new mail, broadcast, drain). No polling, standard MCP semantics.
 
-A bundled VSCode extension lives at `extensions/vscode/` — surfaces pending count + last-message recency in the status bar, opens a webview with the last message preview on click, optionally auto-types `inbox` into the integrated terminal so Claude Code wakes up. See `extensions/vscode/README.md` for install + config and `docs/tether-roadmap.md` for the canonical free-vs-paid architectural line that scopes Tether Phase 1.
+**v2.7 added cross-process delivery.** A message sent from a stdio MCP terminal (one OS process) now wakes IDE subscribers connected to the HTTP daemon (a different OS process) via a durable `inbox_events` outbox table polled by the daemon. v2.5 only delivered events same-process — v2.7 is the load-bearing release for any Tether-style IDE integration.
+
+The bundled VSCode extension ships on the marketplace:
+
+```bash
+code --install-extension lumiere-ventures.bot-relay-tether
+```
+
+Or browse [marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether). Source for the extension lives at `extensions/vscode/` in this repo for users who want to build from source. The extension surfaces pending count + last-message recency in the status bar, opens a webview with the last message preview on click, and optionally auto-types `inbox` into the integrated terminal so Claude Code wakes up. See `extensions/vscode/README.md` for install + config and `docs/tether-roadmap.md` for the free-vs-paid scope line.
 
 ## Tools
 
@@ -679,7 +687,7 @@ Full install requirements per platform + manual smoke-test checklists + troubles
 
 ## Layer 2: Managed Agents (v1.10)
 
-Agents that are NOT Claude Code terminals — Python daemons, Node workers, Hermes/Ollama integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 25 MCP tools (v2.1), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
+Agents that are NOT Claude Code terminals — Python daemons, Node workers, Hermes/Ollama integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 30 MCP tools (v2.7), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
 
 Full integration guide with mental model, auth flow, lifecycle, error patterns, and security notes: [`docs/managed-agent-integration.md`](./docs/managed-agent-integration.md).
 
@@ -719,7 +727,8 @@ Both drivers read the same `relay.db` file format. Full details, performance not
 - **v1.10**: Layer 2 Managed Agents — reference Python + Node workers
 - **v1.11**: SQLite WASM driver (`sql.js` opt-in) — zero native compilation on Windows/Alpine/Docker/CI
 - **v2.0**: Plug-and-play — channels, smart routing (`post_task_auto`), task leases + heartbeat, lazy health monitor, session-aware reads, busy/DND, `health_check`, webhook retry with CAS, payload size limits, config validation, auto-unregister, dead-agent purge, debug mode. 22 tools.
-- **v2.1 (current)**: Architectural completion — explicit `auth_state` machine, managed-agent rotation grace, versioned ciphertext + keyring with online rotation (`relay re-encrypt`), lost-token recovery CLI (`relay recover`), admin-initiated cross-agent rotation (`rotate_token_admin`), structured error_code catalog, protocol_version surface, Phase 4p webhook-secret encryption, Phase 4b.1 v2 revoke/recovery redesign. 25 tools. 14 of 14 Codex architectural findings closed.
+- **v2.1**: Architectural completion — explicit `auth_state` machine, managed-agent rotation grace, versioned ciphertext + keyring with online rotation (`relay re-encrypt`), lost-token recovery CLI (`relay recover`), admin-initiated cross-agent rotation (`rotate_token_admin`), structured error_code catalog, protocol_version surface, Phase 4p webhook-secret encryption, Phase 4b.1 v2 revoke/recovery redesign. 25 tools. 14 of 14 Codex architectural findings closed.
+- **v2.7 (current)**: Tether-ready cross-process inbox notifications. Durable `inbox_events` outbox table (schema v11→v12, idempotent migration); HTTP daemon polls + dispatches to `relay://inbox/<agent>` subscribers regardless of which OS process wrote the message. Reaper now skips sessions with active SSE GET streams (`openGetStreams` count). Daemon emits `:keepalive\n\n` SSE comment frames every `RELAY_SSE_KEEPALIVE_MS` (default 20s) so Electron-based clients (VS Code Tether extension) don't idle-disconnect at ~2.5min. Hermes-flagged `get_messages` filter-after-mark P1 fix — `since` filter now applies in SQL BEFORE the read-mark mutation. 30 tools. Pairs with Tether VSCode extension v0.1.2+ on the marketplace.
 - **v2.2**: Polish — batch operations, fan-out/fan-in, scheduled messages, metrics endpoint, message ACK, private channels, token scoping, idle-terminal wake.
 - **v2.5**: Federation — cross-machine peering, E2E encryption.
 
