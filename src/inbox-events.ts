@@ -26,6 +26,7 @@
  *     throttled rate without changing producers.
  */
 import { EventEmitter } from "node:events";
+import { log } from "./logger.js";
 
 const bus = new EventEmitter();
 // Default of 10 trips on the hot path (HTTP daemon + dashboard ws + several
@@ -41,9 +42,27 @@ export interface InboxChangedEvent {
    * Tether VSCode extension to choose toast wording.
    */
   reason: "message_received" | "message_read" | "broadcast_received";
+  /**
+   * v2.7 / Tether Phase 3 — durable outbox row id (autoincrement primary
+   * key on `inbox_events`). The producer-side write path INSERTs the
+   * outbox row + reads `lastInsertRowid` + threads it here so subscribers
+   * can dedup. Without this, the in-process bus (this same-process
+   * fast path) and the cross-process outbox tail (the polling loop
+   * inside the HTTP daemon at src/outbox-tail.ts) would both fire
+   * `sendResourceUpdated` for the same event when sender and subscriber
+   * happen to be in the same process. mcp-subscriptions tracks the
+   * highest id it has broadcast per URI and skips duplicates.
+   */
+  id: number;
 }
 
 export function emitInboxChanged(event: InboxChangedEvent): void {
+  // v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace. Surfaces
+  // every inbox event the daemon emits so Maxime's Tether smoke can
+  // correlate "send_message landed in DB" → "emit fired" → "broadcaster
+  // reached" → "sendResourceUpdated accepted" → (extension reception is
+  // proven separately by the extension's own diagnostics from v0.1.1).
+  log.info(`[broadcast-trace] event emit agent=${event.agent_name} reason=${event.reason}`);
   bus.emit("inbox.changed", event);
 }
 

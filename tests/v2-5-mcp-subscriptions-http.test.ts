@@ -240,6 +240,12 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
 
   it("(Q-HTTP-1) subscribe → real notifications/resources/updated frame arrives end-to-end on HTTP SSE", async () => {
     const transport = new StreamableHTTPClientTransport(new URL("/mcp", daemon.baseUrl));
+    // v2.6.x / Tether v0.1.1 fold-in: capture transport-level errors so a
+    // future SSE-GET-stream regression surfaces here instead of silently
+    // failing the assertion downstream. Mirrors the production fix in
+    // extensions/vscode/src/extension.ts. Per codex audit msg 4eb34932.
+    const transportErrors: Error[] = [];
+    transport.onerror = (err) => transportErrors.push(err);
     const client = new Client(
       { name: "v2.5-http-test", version: "0.0.0" },
       { capabilities: {} },
@@ -269,6 +275,12 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
 
   it("(Q-HTTP-2) cross-session isolation: subscriber for X is NOT woken by message to Y", async () => {
     const transport = new StreamableHTTPClientTransport(new URL("/mcp", daemon.baseUrl));
+    // v2.6.x / Tether v0.1.1 fold-in: capture transport-level errors so a
+    // future SSE-GET-stream regression surfaces here instead of silently
+    // failing the assertion downstream. Mirrors the production fix in
+    // extensions/vscode/src/extension.ts. Per codex audit msg 4eb34932.
+    const transportErrors: Error[] = [];
+    transport.onerror = (err) => transportErrors.push(err);
     const client = new Client(
       { name: "v2.5-http-iso", version: "0.0.0" },
       { capabilities: {} },
@@ -330,6 +342,12 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
     // The SDK manages its own connection pool + abort sequencing,
     // which Q-HTTP-1 already proved works on Node 18.
     const transport = new StreamableHTTPClientTransport(new URL("/mcp", daemon.baseUrl));
+    // v2.6.x / Tether v0.1.1 fold-in: capture transport-level errors so a
+    // future SSE-GET-stream regression surfaces here instead of silently
+    // failing the assertion downstream. Mirrors the production fix in
+    // extensions/vscode/src/extension.ts. Per codex audit msg 4eb34932.
+    const transportErrors: Error[] = [];
+    transport.onerror = (err) => transportErrors.push(err);
     const client = new Client(
       { name: "v2.5-http-cleanup", version: "0.0.0" },
       { capabilities: {} },

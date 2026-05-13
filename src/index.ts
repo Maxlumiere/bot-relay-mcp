@@ -8,6 +8,7 @@ import { loadConfig, validateConfigAndEnv, InvalidConfigError, readConfigFileKey
 import { startStdioServer } from "./transport/stdio.js";
 import { startHttpServer } from "./transport/http.js";
 import { closeDb, initializeDb } from "./db.js";
+import { startOutboxTail, stopOutboxTail } from "./outbox-tail.js";
 import { log } from "./logger.js";
 import { parseCliFlags, applyCliToEnv, usage } from "./cli.js";
 import { VERSION } from "./version.js";
@@ -182,6 +183,13 @@ async function main(): Promise<void> {
 
   if (config.transport === "http" || config.transport === "both") {
     httpServer = startHttpServer(config.http_port, config.http_host);
+    // v2.7 / Tether Phase 3b — cross-process notification tail. Only the
+    // HTTP daemon needs it: stdio sessions have direct access to the
+    // in-process bus, and there is no supported topology where one stdio
+    // process subscribes to another stdio process's inbox. Starting the
+    // tail here (after startHttpServer) ensures the daemon is reachable
+    // by the time we begin pushing notifications.
+    startOutboxTail();
   }
 
   if (config.transport === "stdio" || config.transport === "both") {
@@ -193,6 +201,7 @@ async function main(): Promise<void> {
   }
 
   const shutdown = () => {
+    stopOutboxTail();
     if (httpServer) {
       httpServer.close();
     }

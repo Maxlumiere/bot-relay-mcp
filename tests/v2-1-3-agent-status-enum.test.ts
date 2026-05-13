@@ -50,11 +50,11 @@ afterEach(() => {
 // ============================================================================
 
 describe("v2.1.3 I6 — schema v2_5 migration + defaults", () => {
-  it("schema version is 11 post-migration (v2.3.0 added Phase 4s mailbox seq + epoch)", () => {
-    registerAgent("sv-11", "r", []);
-    expect(CURRENT_SCHEMA_VERSION).toBe(11);
+  it("schema version is current post-migration (v2.7 Tether Phase 3a bumped to 12 — inbox_events outbox table)", () => {
+    registerAgent("sv-current", "r", []);
+    expect(CURRENT_SCHEMA_VERSION).toBe(12);
     const row = getDb().prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number };
-    expect(row.version).toBe(11);
+    expect(row.version).toBe(12);
   });
 
   it("new registrations default agent_status='idle' (was 'online')", () => {

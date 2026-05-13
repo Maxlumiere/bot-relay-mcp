@@ -33,6 +33,21 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      # v2.7 Tether Phase 6 hotfix — drift-out guards
+      # (tests/v2-6-tether-transport-diagnostics.test.ts +
+      # tests/v2-7-tether-reconnection-options.test.ts) assert against the
+      # compiled VSIX-shipped artifact at extensions/vscode/out/extension.js.
+      # The local pre-publish gate (scripts/pre-publish-check.sh) compiles the
+      # extension as part of its "extension TS compile" step, but CI's `test`
+      # job runs `npx vitest run` directly — without this, those guards fail
+      # on every CI run with "missing extensions/vscode/out/extension.js".
+      # Position is load-bearing: BEFORE `Run test suite`, AFTER root install.
+      - name: Compile VSCode extension (drift-out tests need out/extension.js)
+        run: |
+          cd extensions/vscode
+          npm install
+          npm run compile
+
       - name: Run test suite
         run: npx vitest run
 

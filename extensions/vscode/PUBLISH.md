@@ -11,7 +11,7 @@ This is a manual checklist for Maxime to run when ready to publish the extension
 
 ## Per-release checklist
 
-1. Bump `extensions/vscode/package.json` version (semver). Tether v0.1.0 ships with bot-relay-mcp v2.5.0.
+1. Bump `extensions/vscode/package.json` version (semver). Tether is compatible with any bot-relay-mcp v2.5.0+ daemon.
 2. Update `extensions/vscode/CHANGELOG.md` with the v0.1 entry (create the file if it doesn't exist; marketplace surfaces it on the extension page).
 3. `cd extensions/vscode && npm install && npm run compile`.
 4. Smoke-test in the Extension Development Host (F5 from VSCode).
