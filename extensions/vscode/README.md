@@ -2,7 +2,22 @@
 
 A VSCode extension that subscribes to a bot-relay-mcp agent's inbox over MCP and surfaces pending mail in the status bar (and optionally as toasts). Local-only, no telemetry, no cloud.
 
-## Install (dev / pre-marketplace)
+## Requirements
+
+- A running [bot-relay-mcp](https://github.com/Maxlumiere/bot-relay-mcp) daemon at `http://127.0.0.1:3777` (or whatever you set as `bot-relay.tether.endpoint`). Install via `npm install -g bot-relay-mcp` and start with `relay doctor` for guided setup, or follow the [bot-relay-mcp install guide](https://github.com/Maxlumiere/bot-relay-mcp#integration).
+- **Best experience requires bot-relay-mcp v2.7.0+** for the daemon-side SSE keepalive that prevents Electron-fetch idle disconnects (~2.5min). v0.1.2 will run against older daemons but will silently degrade to repeated reconnect cycles.
+
+## Install
+
+In VSCode: open the Extensions panel (Cmd+Shift+X / Ctrl+Shift+X) → search "Tether for bot-relay-mcp" → Install.
+
+Or via CLI:
+
+```sh
+code --install-extension lumiere-ventures.bot-relay-tether
+```
+
+## Build from source (contributors)
 
 ```sh
 cd extensions/vscode
@@ -11,7 +26,7 @@ npm run compile
 # In VSCode: F5 to launch the Extension Development Host with this extension loaded.
 ```
 
-Marketplace install steps land here once published — see `PUBLISH.md` for the publish workflow.
+See `PUBLISH.md` for the marketplace publish workflow.
 
 ## Configuration
 
