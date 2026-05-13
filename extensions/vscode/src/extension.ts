@@ -30,27 +30,161 @@ import {
   statusBarSeverity,
   type InboxSnapshot,
 } from "./format.js";
-import { resolveTetherConfig, type TetherConfig } from "./config.js";
+import { resolveTetherConfig, decideMigrationAction, type TetherConfig } from "./config.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
 const STATUS_COMMAND = "botRelayTether.openInbox";
+const SET_TOKEN_COMMAND = "botRelayTether.setToken";
 const EXTENSION_ID = "lumiere-ventures.bot-relay-tether";
+
+/**
+ * v0.1.3 — SecretStorage key for the agent token. Stable, namespaced
+ * under `botRelay.` so future Tether settings don't collide. NEVER
+ * read agentToken from `workspace.getConfiguration` directly — go
+ * through `readConfig(context)` below which threads the SecretStorage
+ * value in as highest-priority per config.ts:resolveAgentToken.
+ */
+const SECRET_KEY_AGENT_TOKEN = "botRelay.agentToken";
+
+/**
+ * v0.1.3 — globalState key tracking whether we've shown the post-
+ * migration "we moved your token to SecretStorage; recommend rotating"
+ * notification. Stored in non-secret globalState because it's a UI
+ * one-shot flag, not a credential.
+ */
+const MIGRATION_NOTICE_SHOWN_KEY = "botRelayTether.migrationNoticeShown";
 
 function getExtensionVersion(): string {
   return vscode.extensions.getExtension(EXTENSION_ID)?.packageJSON.version ?? "0.0.0-unknown";
 }
 
-function readConfig(): TetherConfig {
-  // R1 #3: route through the pure resolveTetherConfig() so the precedence
-  // rule (VSCode setting > env > default) is verifiable in unit tests
-  // without booting VSCode. Pre-R1 the inline `?:` chain bound after `||`,
-  // ignoring the VSCode-configured endpoint when env was set.
+async function readConfig(context: vscode.ExtensionContext): Promise<TetherConfig> {
+  // v0.1.3 — token now resolves SecretStorage > env > legacy config.
+  // SecretStorage is the only persistence layer the operator should
+  // see in v0.1.3+; legacy `bot-relay.tether.agentToken` setting is
+  // removed from the contributes schema in package.json. The legacy
+  // fallback in resolveTetherConfig stays for the migration window
+  // (some operators upgrading from v0.1.2 still have a value in
+  // settings.json until migrateAgentTokenToSecretStorage runs).
+  //
+  // R1 #3 from v0.1.1 stays: route through the pure resolveTetherConfig()
+  // so the precedence rule is verifiable in unit tests without booting
+  // VSCode. The new SecretStorage source is passed as a 3rd arg.
   const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
+  let secretToken: string | undefined;
+  try {
+    secretToken = await context.secrets.get(SECRET_KEY_AGENT_TOKEN);
+  } catch (err) {
+    // VSCode SecretStorage is backed by OS keychain on macOS / Credential
+    // Vault on Windows / libsecret on Linux. The Linux case can fail in
+    // headless / minimal containers without libsecret. Fall back to
+    // env/legacy-config in that case so the extension stays functional
+    // for the operator who hasn't installed libsecret.
+    log(`SecretStorage unavailable, falling back to env/legacy-config for token: ${err instanceof Error ? err.message : String(err)}`);
+    secretToken = undefined;
+  }
   return resolveTetherConfig(
     (key) => cfg.get(key),
     process.env as Record<string, string | undefined>,
+    secretToken,
   );
+}
+
+/**
+ * v0.1.3 [HIGH F10] — one-shot migration from plaintext
+ * `settings.json` to encrypted SecretStorage.
+ *
+ * Hermes deep-review flagged that v0.1.2 stored the agent token via
+ * `workspace.getConfiguration("bot-relay.tether").get("agentToken")`,
+ * which writes to plaintext `settings.json`. Anyone with read access
+ * to a backup / settings-sync / accidental screenshot recovered the
+ * token. v0.1.3 switches to `context.secrets` (VSCode SecretStorage —
+ * OS keychain on macOS, Credential Vault on Windows, libsecret on
+ * Linux).
+ *
+ * Migration semantics:
+ *   - First-launch path: copy legacy plaintext value into
+ *     SecretStorage, then `cfg.update(..., undefined, ...)` to remove
+ *     the legacy field from `settings.json` entirely (BOTH Global +
+ *     Workspace targets, to handle the "user set it per-workspace"
+ *     case). Show a one-shot warning recommending token rotation
+ *     since the value may have been captured in backups.
+ *   - Idempotency: subsequent activations see SecretStorage populated
+ *     and short-circuit. The migration-notice flag in globalState
+ *     ensures the rotation prompt fires exactly once per install.
+ *   - Failure safety: every SecretStorage / config-update /
+ *     show-message call is try/catch'd. Activation must NOT throw
+ *     because of a Linux-without-libsecret host.
+ *
+ * Cross-platform parity: SecretStorage API is identical across
+ * macOS / Windows / Linux at the VSCode surface; the backend differs
+ * but the JS contract doesn't. No platform-specific code path.
+ *
+ * Decision logic is extracted as `decideMigrationAction` in config.ts
+ * for unit-test access. This function wires the actual VSCode side
+ * effects against that decision.
+ */
+async function migrateAgentTokenToSecretStorage(
+  context: vscode.ExtensionContext,
+): Promise<{ migrated: boolean; reason: "noop-has-secret" | "noop-no-legacy" | "migrated" | "error" }> {
+  try {
+    const existing = await context.secrets.get(SECRET_KEY_AGENT_TOKEN);
+    const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
+    const legacy = cfg.get("agentToken") as string | undefined;
+    const decision = decideMigrationAction(!!(existing && existing.length > 0), legacy);
+    if (decision.action === "noop") {
+      return {
+        migrated: false,
+        reason: existing && existing.length > 0 ? "noop-has-secret" : "noop-no-legacy",
+      };
+    }
+    const token = decision.tokenToStore!;
+    await context.secrets.store(SECRET_KEY_AGENT_TOKEN, token);
+    // Remove from BOTH Global + Workspace targets — the operator might
+    // have set it at either scope. Failures are non-fatal (the leak is
+    // partially closed even if one target's update throws on a
+    // permission boundary; SecretStorage still wins precedence-wise).
+    try {
+      await cfg.update("agentToken", undefined, vscode.ConfigurationTarget.Global);
+    } catch (err) {
+      log(`migration: cfg.update(Global) failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      await cfg.update("agentToken", undefined, vscode.ConfigurationTarget.Workspace);
+    } catch (err) {
+      log(`migration: cfg.update(Workspace) failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const alreadyShown = context.globalState.get<boolean>(MIGRATION_NOTICE_SHOWN_KEY) === true;
+    if (!alreadyShown) {
+      // Fire-and-forget; the notification flow shouldn't block
+      // activation. Mark the flag immediately so a fast re-activation
+      // doesn't double-fire.
+      void vscode.window
+        .showWarningMessage(
+          "Tether: Your bot-relay agent token has been migrated from settings.json to VSCode SecretStorage and removed from your settings. Recommend rotating the token via `relay rotate-token` since the previous plaintext value may have been captured in backups or settings sync.",
+          "Reconnect with new token",
+          "View rotation docs",
+          "Dismiss",
+        )
+        .then((choice) => {
+          if (choice === "Reconnect with new token") {
+            void vscode.commands.executeCommand("botRelayTether.reconnect");
+          } else if (choice === "View rotation docs") {
+            void vscode.env.openExternal(
+              vscode.Uri.parse("https://github.com/Maxlumiere/bot-relay-mcp/blob/main/docs/token-lifecycle.md"),
+            );
+          }
+        });
+      await context.globalState.update(MIGRATION_NOTICE_SHOWN_KEY, true);
+    }
+    log("v0.1.3 SecretStorage migration: agent token moved from settings.json → SecretStorage, legacy field cleared.");
+    return { migrated: true, reason: "migrated" };
+  } catch (err) {
+    log(`SecretStorage migration error (continuing without migration): ${err instanceof Error ? err.message : String(err)}`);
+    return { migrated: false, reason: "error" };
+  }
 }
 
 /**
@@ -339,21 +473,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       panel.webview.html = buildWebviewHtml(lastSnapshot);
     }),
     vscode.commands.registerCommand("botRelayTether.reconnect", async () => {
-      await connect(readConfig());
+      await connect(await readConfig(context));
+    }),
+    // v0.1.3 [HIGH F10] — palette command to set / clear the agent
+    // token via SecretStorage. `password: true` masks the input;
+    // `ignoreFocusOut: true` keeps the box open while the operator
+    // pastes (some terminals lose focus mid-paste). Empty input clears
+    // the stored secret.
+    vscode.commands.registerCommand(SET_TOKEN_COMMAND, async () => {
+      const input = await vscode.window.showInputBox({
+        title: "Tether: Set Agent Token",
+        prompt:
+          "Paste your bot-relay agent token. Stored in VSCode SecretStorage (OS keychain) — never written to settings.json. Submit empty to clear.",
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (input === undefined) return; // user dismissed
+      const trimmed = input.trim();
+      try {
+        if (trimmed.length === 0) {
+          await context.secrets.delete(SECRET_KEY_AGENT_TOKEN);
+          void vscode.window.showInformationMessage("Tether: Agent token cleared from SecretStorage.");
+        } else {
+          await context.secrets.store(SECRET_KEY_AGENT_TOKEN, trimmed);
+          void vscode.window.showInformationMessage("Tether: Agent token stored in SecretStorage.");
+        }
+        await connect(await readConfig(context));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(`SET_TOKEN failed: ${msg}`);
+        void vscode.window.showErrorMessage(`Tether: failed to update agent token — ${msg}`);
+      }
     }),
   );
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async (event) => {
       if (event.affectsConfiguration("bot-relay.tether")) {
-        const fresh = readConfig();
+        const fresh = await readConfig(context);
         ensureSummaryTimer(fresh.notificationLevel);
         await connect(fresh);
       }
     }),
   );
 
-  const initial = readConfig();
+  // v0.1.3 [HIGH F10] — one-shot SecretStorage migration runs BEFORE
+  // the first readConfig so a freshly-migrated token surfaces on the
+  // initial connect attempt without an extra reload.
+  await migrateAgentTokenToSecretStorage(context);
+
+  const initial = await readConfig(context);
   ensureSummaryTimer(initial.notificationLevel);
   await connect(initial);
 }

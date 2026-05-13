@@ -154,16 +154,40 @@ describe("v2.5.0 R1 — Tether config precedence (VSCode > env > default)", () =
     expect(c.agentName).toBe("");
   });
 
-  it("agentToken: VSCode > env > '' (same precedence shape as agentName)", () => {
+  it("(v0.1.3 contract change) agentToken: SecretStorage > env > legacy-config > ''", () => {
+    // v0.1.3 [HIGH F10] — Hermes deep-review demoted the plaintext
+    // `bot-relay.tether.agentToken` setting from "primary source" to
+    // "migration-window fallback only". Pre-v0.1.3 the precedence was
+    // VSCode-config > env > "" (same shape as agentName). Post-v0.1.3
+    // the precedence is SecretStorage > env > legacy-config, where
+    // legacy-config is the same VSCode setting but treated as the
+    // lowest tier so an operator who set RELAY_AGENT_TOKEN in their
+    // shell isn't surprised by a stale settings.json value silently
+    // winning. The auto-migration in extension.ts activate() empties
+    // the legacy field on first launch, closing the window.
+    //
+    // 3rd arg `fromSecret` defaults to undefined for backward-compat
+    // with callers that don't read SecretStorage. The new tests
+    // covering the fromSecret arg live in
+    // extensions/vscode/src/v0-1-3-secret-storage.test.ts.
+
+    // Env beats legacy-config (was: legacy-config beats env pre-v0.1.3).
     expect(
       resolveTetherConfig(
         makeGetter({ agentToken: "tok-cfg" }),
         { RELAY_AGENT_TOKEN: "tok-env" },
       ).agentToken,
-    ).toBe("tok-cfg");
+    ).toBe("tok-env");
+    // Env-only still wins when legacy-config absent.
     expect(
       resolveTetherConfig(makeGetter({}), { RELAY_AGENT_TOKEN: "tok-env" }).agentToken,
     ).toBe("tok-env");
+    // Legacy-config still surfaces when env absent (migration-window
+    // fallback so v0.1.2 → v0.1.3 upgraders aren't dropped).
+    expect(
+      resolveTetherConfig(makeGetter({ agentToken: "tok-cfg-only" }), {}).agentToken,
+    ).toBe("tok-cfg-only");
+    // All-empty stays empty.
     expect(resolveTetherConfig(makeGetter({}), {}).agentToken).toBe("");
   });
 
