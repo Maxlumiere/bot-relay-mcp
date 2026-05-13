@@ -4,6 +4,31 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.1.3] — 2026-05-13 — SECURITY: token storage migration to VSCode SecretStorage
+
+### Security
+
+- **[HIGH] Agent token now stored in VSCode SecretStorage** (OS keychain on macOS, Credential Vault on Windows, libsecret on Linux) instead of plaintext `settings.json`. The previous `bot-relay.tether.agentToken` configuration field exposed the credential to settings sync, dotfile backups, accidental screenshots, and shoulder-glance. (Origin: Hermes external review via review-Victra deep-review synthesis msg `2b903f9b`.)
+
+### Added
+
+- **First-launch migration.** On activation, if an existing plaintext `bot-relay.tether.agentToken` value is present in `settings.json` AND no SecretStorage value exists, the extension copies the value into SecretStorage, removes the field from `settings.json` (both Global + Workspace targets), and shows a one-shot warning notification recommending you rotate the token via `relay rotate-token` since the previous plaintext value may have been captured in backups. The notification offers "Reconnect with new token", "View rotation docs", and "Dismiss" actions; the flag persists in globalState so the recommendation fires exactly once per install.
+- **`Tether: Set Agent Token (SecretStorage)` palette command.** New command (`botRelayTether.setToken`) prompts via a password-masked input box and stores the value via `context.secrets.store`. Submit empty input to clear the stored secret. After write, the extension reconnects automatically with the new value.
+
+### Removed
+
+- **`bot-relay.tether.agentToken` from the contributes.configuration schema.** Operators upgrading from v0.1.2 see the migration banner once; the setting no longer appears in the VSCode settings UI. Use the palette command above for ongoing changes.
+
+### Compatibility
+
+- Token-resolution precedence is now **SecretStorage > `RELAY_AGENT_TOKEN` env var > legacy settings.json** (the third tier is read only during the migration window and removed once the migration step runs). v0.1.3 against `bot-relay-mcp` v2.7.1 daemon is the recommended pairing; older daemons still authenticate the same way (the daemon never saw `settings.json`).
+- VSCode SecretStorage API is identical across macOS / Windows / Linux at the JS surface; no platform-specific code path. Linux hosts without libsecret will see the extension fall back to `RELAY_AGENT_TOKEN` env / legacy config gracefully (a warning is logged to the Tether output channel).
+
+### References
+
+- v2.7.1 hotfix brief F10 + Maxime's lock 2026-05-13.
+- Cross-platform parity verified per `feedback_cross_platform_parity.md`.
+
 ## [0.1.2] — 2026-05-12 — Reconnect resilience + discoverable manual reconnect
 
 End-to-end smoke against a real Electron-based VS Code session validated the v0.1.1 diagnostics together with the daemon-side Phase 3/4/5 fixes (cross-process outbox, reaper-skip-while-SSE-open, SSE keepalive). v0.1.2 ships two extension-side changes that pair with the daemon's `bot-relay-mcp` v2.6.3 release:
