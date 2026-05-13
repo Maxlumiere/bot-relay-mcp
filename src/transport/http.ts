@@ -945,7 +945,7 @@ export function startHttpServer(port: number, host: string): Server {
           req,
           "send_message",
           parsed.data.from,
-          `from=${parsed.data.from} to=${parsed.data.to}`,
+          `from=${parsed.data.from} to=${parsed.data.to} from_authenticated=false`,
           false,
           "from_agent_token missing — dashboard send_message requires the from-agent's token when from names a registered agent (v2.7.1 impersonation gate)",
           { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED" }

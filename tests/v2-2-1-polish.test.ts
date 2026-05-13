@@ -180,13 +180,20 @@ describe("v2.2.1 P1 — dashboard themes + set_dashboard_theme tool", () => {
 // ============================================================================
 
 describe("v2.2.1 P2 — /api/send-message", () => {
-  it("(P2.S1) happy path: registered sender + recipient → 200 + message stored", async () => {
-    registerAgent("p2-from", "r", []);
+  it("(P2.S1) happy path: registered sender + recipient + from_agent_token → 200 + message stored", async () => {
+    // v2.7.1 [HIGH F4] — dashboard send_message now requires
+    // from_agent_token when from-agent has a stored token_hash.
+    // db.registerAgent mints a token by default, so the test must
+    // pass it through (matches the new contract; pre-v2.7.1 this
+    // succeeded without a token via the audit-only fallback that
+    // is now the impersonation primitive Maxime asked us to close).
+    const { plaintext_token } = registerAgent("p2-from", "r", []);
     registerAgent("p2-to", "r", []);
     const r = await postJson("/api/send-message", {
       from: "p2-from",
       to: "p2-to",
       content: "from the dashboard",
+      from_agent_token: plaintext_token,
     });
     expect(r.status).toBe(200);
     expect(r.json.success).toBe(true);
