@@ -1,5 +1,113 @@
 # Changelog
 
+## v2.7.0 — 2026-05-13 — Tether-ready cross-process inbox notifications + Hermes-flagged P1 correctness fix
+
+The v2.7.0 release closes the cross-process notification gap between stdio MCP terminals and the HTTP daemon that ships with `bot-relay-mcp`, lands a Hermes-flagged P1 correctness bug in `get_messages`, and pairs with the [Tether VSCode extension v0.1.2](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) on the marketplace.
+
+The Tether v0.1.2 marketplace listing assumes the daemon has Phase 5 keepalive — anyone running `npm install bot-relay-mcp@latest` pre-v2.7.0 would silently degrade to ~2.5min Electron-fetch idle disconnects. v2.7.0 closes that gap end-to-end.
+
+### Phase 3 — durable outbox + cross-process notification delivery
+
+Pre-v2.7.0 the inbox-changed event bus (`src/inbox-events.ts`) was a module-local Node `EventEmitter`. A message sent from a stdio MCP terminal (one OS process) emitted ONLY inside that stdio process and never woke a subscriber connected to the separate HTTP daemon. Live Tether smokes proved the gap — `[broadcast-trace] event emit` never fired in the daemon log when stdio writers committed.
+
+Fix is the durable-outbox pattern:
+- **New table `inbox_events`** (schema v11 → v12, idempotent migration). `CREATE TABLE inbox_events (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_name TEXT NOT NULL, reason TEXT CHECK (...) NOT NULL, created_at TEXT NOT NULL, source_pid INTEGER)` with two indexes on `id` and `(agent_name, id)`. Per-row retention drops outbox rows older than `RELAY_OUTBOX_RETENTION_DAYS` (default 7d).
+- **Producer wiring** at all 4 mark-as-read / send-message / broadcast sites in `src/db.ts` (`sendMessage` system + normal paths, `getMessages` drain, `broadcastMessage`). Each producer INSERTs an outbox row inside the same SQLite transaction as the underlying write and threads `lastInsertRowid` into `emitInboxChanged` so subscribers can dedup by event id.
+- **Cross-process tail** at `src/outbox-tail.ts` — runs ONLY in the HTTP daemon. Polls `inbox_events` for rows past an in-memory cursor (`MAX(id)` at startup, no replay of historical rows) and dispatches each to the existing `mcp-subscriptions` broadcaster. `PRAGMA data_version` cheap-skip means quiet periods cost one uint64 read per tick. Batched at 500 rows with `setImmediate` re-tick on backlog. Configurable via `RELAY_OUTBOX_POLL_MS` (default 100ms; 0 disables).
+- **Broadcaster refactor** at `src/mcp-subscriptions.ts` — extracted `broadcastInboxChange(agentName, reason, eventId, source)` as the single fan-out path called by BOTH the in-process bus AND the cross-process tail. `lastBroadcastIdByUri` Map dedups by event id so when sender + subscriber share a process the subscriber receives exactly one notification (bus fires first; tail catches up and is deduped).
+
+Schema migration is the structural fix to a latent bug across every prior bump: `initSchema`'s `INSERT OR IGNORE` on the single `schema_info` row was a no-op for existing DBs, and the subsequent `UPDATE` only refreshed `last_migrated_at` — never the `version` field. `advanceSchemaVersionIfBehind` helper at `src/db.ts` now runs at the end of both init chains AND from each `applyMigration` case, so the recorded version stays in sync with the actual DB shape.
+
+Cite: commits `dacc121` (Phase 3a schema + producer), `a093ee9` (Phase 3b tail + broadcaster), `0b0387c` (Phase 3d cross-process tests), `818823f` (Phase 3 R1 schema_info version advancement, P1 from codex audit).
+
+### Phase 4a — reaper skips sessions with active SSE GET stream
+
+The HTTP daemon's session reaper (`src/transport/http.ts`) closes sessions whose `lastSeen` is older than `RELAY_HTTP_SESSION_IDLE_SECONDS` (default 300s). Pre-v2.7.0, `lastSeen` was bumped only in `handleSessionRequest` — which fires ONCE per long-lived SSE GET stream open. After 5min of MCP idle (subscriber listening, no POSTs), the reaper culled the session and the SSE stream dropped.
+
+Fix: each `HttpSession` now carries an `openGetStreams: number` counter. The GET handler increments before `handleRequest` and a single `res.once("close", ...)` listener decrements with a `Math.max(0, n-1)` floor that survives reconnect-races where a newer GET stream is live before the older one closes. Reaper skips any session with `openGetStreams > 0` regardless of `lastSeen` age.
+
+`shouldReapSession(session, now, idleMs)` pure predicate exported from `src/transport/http.ts` for unit tests. New env seams `RELAY_HTTP_REAPER_INTERVAL_MS` (default 60_000) and `RELAY_HTTP_REAPER_TEST_MODE=1` (or `NODE_ENV=test`) relax the 30s floor on `RELAY_HTTP_SESSION_IDLE_SECONDS` for fast integration tests; production keeps the 30s floor.
+
+Cite: commit `f957c29`.
+
+### Phase 5 — SSE keepalive comment frames (fixes Electron-fetch idle timeouts)
+
+After Phase 4a fixed the server-side cull, post-Phase-4 Tether smoke revealed a SECOND disconnect class at ~2.5min where the daemon log went silent (no reap, no close, no error) but the extension reported `SSE stream disconnected: TypeError: terminated`. Root cause: VS Code's Electron-based `fetch` implementation has its own idle-stream timeout on `response.body` reads, separate from Node's and undici's.
+
+Fix: daemon-side periodic `:keepalive\n\n` SSE comment frame writes. Per the SSE spec, lines beginning with `:` are comments that clients MUST ignore — invisible to the MCP message stream but visible to the fetch runtime as recent byte activity. Default interval 20s gives ~3-4× margin against typical 60-90s intermediary idle thresholds AND ~7× margin against Electron's observed ~2.5min cull. Configurable via `RELAY_SSE_KEEPALIVE_MS` (default 20_000; 0 disables).
+
+`setupSseKeepalive(res, intervalMs)` exported from `src/transport/http.ts` as a pure helper with idempotent cleanup, self-cancelling on `writableEnded` / write-throws / `res.close`. Wired into the GET `/mcp` handler immediately after the Phase 4a `openGetStreams` increment.
+
+Cite: commit `6ec32d6`.
+
+### Hermes-flagged P1 — `get_messages` filter-after-mark silent data loss
+
+Hermes's external review (paste 2026-05-11) surfaced a correctness bug not caught across 4+ audit cycles: `src/tools/messaging.ts` ran `filterBySince(rows, sinceIso)` in JS at line 159 AFTER `src/db.ts` `getMessages` had already SELECTed pending rows + UPDATEed their `read_by_session` field in the same SQL call. Net effect: a message older than the caller's `since` bound was consumed (marked-read for this session) even though the caller never saw it in the response. The message never resurfaced in subsequent `status='pending'` calls from the same session because `read_by_session != null` excluded it.
+
+Fix:
+- `getMessages(agentName, status, limit, peek, sinceIso)` — new 5th parameter. SQL SELECT now stitches `AND created_at >= ?` BEFORE the mark-as-read transaction. Only rows that survive the filter get marked read.
+- `handleGetMessages` (`src/tools/messaging.ts`) — passes `sinceIso` into the DB call; obsolete `filterBySince` removed entirely.
+- `sampleGetMessagesConsistency` (`src/transport/consistency-probe.ts`) — takes `sinceIso` so its SUPERSET SQL query mirrors the same bound (else every since-narrower-than-all call emits false-positive divergence warnings post-fix).
+
+Regression test at `tests/v2-7-0-get-messages-filter-after-mark.test.ts` (3 cases): the exact scenario Hermes described, idempotency within the same window, and the `peek=true` no-mutation control. Pre-fix code fails the first assertion ("old message is missing after a since='15m' call"); post-fix all 3 pass. Full investigation + walk-analogous results at `docs/v2.7.0-get-messages-filter-after-mark.md`.
+
+Walk-analogous (verified by reading source): `getMessagesSummary` already applies `since` as SQL filter and is pure-read, no mutation — unaffected. `peekMailboxVersion` returns aggregate counts, no since filter, no mutation — unaffected. The bug was specific to `getMessages` + `filterBySince`.
+
+### Phase 2 broadcast-trace log cleanup
+
+Phase 2 of the cross-process investigation added six `[broadcast-trace]` log lines at info level for live correlation during the Tether smoke. v2.7.0 downgrades the per-event lines to debug (visible under `RELAY_LOG_LEVEL=debug`) while keeping the per-session and per-fanout summary lines at info for production observability.
+
+Downgraded (debug):
+- `src/inbox-events.ts` event emit (fires per send/read/broadcast)
+- `src/mcp-subscriptions.ts` `dedup-skip` (per duplicate observed)
+- `src/mcp-subscriptions.ts` `notifying` + `notify accepted` (per subscriber per fanout)
+- `src/server.ts` `resources/subscribe`/`unsubscribe RPC arrived`
+
+Kept at info:
+- `src/mcp-subscriptions.ts` `fanout enter` (semantic "broadcast happening" — once per emit with full context)
+- `src/mcp-subscriptions.ts` `subscribe added` (once per subscribe — semantic "subscriber registered")
+- `src/transport/http.ts` `GET /mcp (SSE stream open attempt)` (once per SSE session — verifies long-lived stream actually opened)
+
+`tests/v2-6-tether-broadcast-trace.test.ts` updated to set `RELAY_LOG_LEVEL=debug` so it still asserts the full chain.
+
+### Tool count drift fix (Hermes-flagged)
+
+README + adjacent docs claimed 25 tools. Actual count is **30 MCP tools** (verified via `grep -c "name:" src/server.ts`). Drift accumulated across v2.2 (`get_messages_summary`, `expand_capabilities`, `get_standup`), v2.2.1 (`set_dashboard_theme`), v2.3.0 (`peek_inbox_version`) — none of these landings updated the quoted count. Updated:
+- Root `README.md` v2.1 status block → v2.7 status + "30 MCP tools"
+- Root `README.md` Layer 2 Managed Agents tool count
+- Root `README.md` Tether section now leads with marketplace install
+- Roadmap entry for v2.7 added
+
+Long-term Hermes recommendation (out of v2.7.0 scope): tool registry should be the single source of truth that generates docs/MCP-defs/auth-bundle-maps/smoke-test-expectations. Deferred to a v2.8 hygiene round.
+
+### Extension Tether v0.1.2 (shipped to marketplace separately, paired with this release)
+
+The marketplace listing assumes daemon v2.7.0+:
+- Constructor passes `reconnectionOptions: { maxRetries: 20, ... }` to `StreamableHTTPClientTransport` (SDK default is 2 retries — too aggressive for a long-running editor extension).
+- Retry-budget-exhausted status bar text now reads `Tether: error — run "Tether: Reconnect to Relay"` so the existing `botRelayTether.reconnect` palette command is discoverable.
+- Drift guard `tests/v2-7-tether-reconnection-options.test.ts` pins the contract against both `src/` and the compiled `out/extension.js` that ships in the VSIX.
+
+Cite: commits `270acad` (Phase 4b extension wiring), `8b6f984` (VSIX bump + CHANGELOG).
+
+### fast-uri vulnerability patched
+
+GHSA-q3j6-qgpj-74h6 (path traversal) + GHSA-v39h-62p7-jpjc (host confusion) — both high-severity. Patched via `npm audit fix` (semver-compatible transitive bump: fast-uri 3.1.0 → 3.1.2). Lockfile-only change.
+
+### CI hygiene during the release arc
+
+Three small CI hotfixes landed in PR #29 to unblock auto-merge:
+- `9843d69` — `.github/workflows/ci.yml` compiles `extensions/vscode` before vitest (drift-out tests need `out/extension.js`).
+- `5772f66` — fast-uri vuln patched directly into the branch instead of routing through dependabot PR #30 (same fix, faster to merge).
+- `992769c` — `scripts/pre-publish-check.sh` now compiles AND emits the extension via `npm run compile` BEFORE the main vitest step (was running `tsc -p . --noEmit` AFTER vitest — never produced `out/`).
+
+### Schema migration safety
+
+Schema v11 → v12 migration is additive (CREATE TABLE IF NOT EXISTS + new indexes) and idempotent. Existing v11 DBs are upgraded in place by the next daemon start. The Phase 3 R1 `advanceSchemaVersionIfBehind` helper retroactively fixes a latent bug across every prior bump — DBs that were structurally upgraded under any prior `migrateSchemaToV2_X` but whose recorded `schema_info.version` stayed at the old number will sync to current on next start (logged as `[schema] advanced schema_info.version N → M`).
+
+### Cross-references
+
+PR #29 squash commit: `05e2b40`.
+
 ## v2.6.3 — 2026-05-08 — port-flake hardening (dynamic-port allocation) + dependabot vuln patches
 
 Two hardening items closed in one patch — known port-collision flake class across integration tests, plus 5 medium-severity dependabot alerts on `package-lock.json` (all auto-patched cleanly via `npm audit fix` — no breaking changes).
