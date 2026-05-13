@@ -8,7 +8,12 @@
  *
  * Three regression cases:
  *   A1.1  present-and-valid token → 200 + audit `from_authenticated: true`
- *   A1.2  absent (v2.2.1 default) → 200 + audit `from_authenticated: false`
+ *   A1.2  absent token → 403 AUTH_FAILED (v2.7.1 [HIGH F4] CHANGED FROM
+ *         the v2.2.2 audit-only default of "200 + from_authenticated=false".
+ *         That default was the impersonation primitive Hermes / codex
+ *         deep-review flagged: dashboard-secret holders could send
+ *         `from=anyone` without a token. v2.7.1 makes from_agent_token
+ *         REQUIRED when from-agent has a stored token_hash.)
  *   A1.3  present-and-invalid     → 403 AUTH_FAILED + audit success=0
  *
  * Also covers the `X-From-Agent-Token` header as an alternate carrier, so
@@ -123,7 +128,16 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
     expect(row!.params_summary).toMatch(/from_authenticated=true/);
   });
 
-  it("(A1.2) absent token → 200 + audit records from_authenticated=false (v2.2.1 default)", async () => {
+  it("(A1.2) absent token → 403 AUTH_FAILED (v2.7.1 [HIGH F4] impersonation gate; was 200 audit-only pre-fix)", async () => {
+    // v2.2.2 documented this case as "200 success + audit records
+    // from_authenticated=false (defense-in-depth audit-only)". That
+    // was the impersonation primitive: any dashboard-secret holder
+    // could POST send_message with `from=victim` and no token.
+    //
+    // v2.7.1 [HIGH F4] (the maintainer's Option A, locked 2026-05-13)
+    // makes from_agent_token REQUIRED when from-agent has a
+    // stored token_hash. db.registerAgent below mints a token by
+    // default, so a2-from has a token_hash and the gate fires.
     registerAgent("a2-from", "r", []);
     registerAgent("a2-to", "r", []);
     const res = await postJson("/api/send-message", {
@@ -131,10 +145,11 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
       to: "a2-to",
       content: "no token supplied",
     });
-    expect(res.status).toBe(200);
-    expect(res.json?.success).toBe(true);
+    expect(res.status).toBe(403);
+    expect(res.json?.success).toBe(false);
+    expect(res.json?.error_code).toBe("AUTH_FAILED");
     const row = latestSendAudit();
-    expect(row!.success).toBe(1);
+    expect(row!.success).toBe(0);
     expect(row!.params_summary).toMatch(/from_authenticated=false/);
   });
 

@@ -116,6 +116,17 @@ export const TOOL_CAPABILITY: Record<string, string> = {
   // enter rotation_grace + receive a push-message; unmanaged agents return
   // the new token to the rotator for out-of-band delivery.
   rotate_token_admin: "rotate_others",
+  // v2.7.1 [CRITICAL FIX] — review-Victra synthesis msg `2b903f9b` /
+  // Hermes deep-review surfaced that pre-v2.7.1 this map omitted
+  // expand_capabilities entirely. The dispatcher at src/server.ts:1034
+  // falls back to "no capability required" for unmapped tools, so any
+  // authenticated agent — even one with the default `{user}` cap set —
+  // could call expand_capabilities on themselves to add `admin`,
+  // `manage_others`, `rotate_others`, then in ~3 calls revoke any peer
+  // via revoke_token or rotate_token_admin. Gate on `admin` to match
+  // the existing revoke_token surface — the two tools form the
+  // privilege-escalation pair.
+  expand_capabilities: "admin",
 };
 
 /** Tools that do NOT require any authentication (bootstrap + always-allowed-readonly). */

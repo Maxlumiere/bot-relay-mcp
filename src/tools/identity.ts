@@ -146,11 +146,23 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     );
   }
 
-  // Surface the one-time token to stderr so the operator can capture it from
-  // their terminal session. The raw token is also in the tool response body,
-  // but the stderr line is a belt-and-suspenders backup for the hook flow.
+  // v2.7.1 [CRITICAL FIX] — the pre-v2.7.1 stderr line interpolated the
+  // freshly-minted token in cleartext at info level. Every stderr-capturing
+  // surface (terminal scrollback, CI logs, journald, Docker logs, log
+  // aggregators, SaaS observability) ended up with the token in plaintext,
+  // breaking the "shown ONCE in the API response" model from day one.
+  //
+  // The new line names the agent (still useful operationally for the
+  // "I registered, did the daemon see me?" check) but emits NO token
+  // material — not even a fingerprint or prefix, both of which narrow
+  // the search space for an attacker who recovered the log. The token
+  // remains in the tool's JSON response body, which is the only delivery
+  // surface the caller must capture. Operators wiring the "hook flow"
+  // backup should read RELAY_AGENT_TOKEN from the response shape, not
+  // from stderr scraping. (Origin: Hermes deep-review surfaced via
+  // review-Victra synthesis msg `2b903f9b`.)
   if (plaintext_token) {
-    log.info(`[auth] New agent_token issued for "${agent.name}". Save it: RELAY_AGENT_TOKEN=${plaintext_token} (shown ONCE).`);
+    log.info(`[auth] New agent_token issued for "${agent.name}" (shown once in the tool response; not logged).`);
   }
 
   // v2.1 Phase 4f.1: when a stdio process registers itself mid-lifetime, the
