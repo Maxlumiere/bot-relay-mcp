@@ -205,6 +205,37 @@ describe("v2.7.1 — logger redactSecrets utility", () => {
     expect(r).not.toContain("eyJhbGciOiJI");
   });
 
+  // v2.7.1 R1 — codex audit caught the pre-R1 regex leaving Basic
+  // unchanged AND clobbering the scheme word for non-Bearer schemes
+  // (`Token abc123` → `*** abc123`). Per
+  // feedback_test_asserts_contract_not_proxy.md, each case below
+  // asserts the EXACT output string, not just "doesn't contain
+  // <credential>" — the proxy check passed pre-R1 even though the
+  // actual contract was broken.
+  it("(R1) redacts Authorization: Basic <credential> — full base64 redacted, Basic preserved", async () => {
+    const { redactSecrets } = await import("../src/logger.js");
+    const r = redactSecrets("Authorization: Basic dXNlcjpwYXNz");
+    expect(r).toBe("Authorization: Basic ***");
+  });
+
+  it("(R1) redacts Authorization: Token <credential> — non-IANA scheme; scheme word preserved", async () => {
+    const { redactSecrets } = await import("../src/logger.js");
+    const r = redactSecrets("Authorization: Token abc123");
+    expect(r).toBe("Authorization: Token ***");
+  });
+
+  it("(R1) redacts Authorization: ApiKey <credential> — vendor scheme; scheme word preserved", async () => {
+    const { redactSecrets } = await import("../src/logger.js");
+    const r = redactSecrets("Authorization: ApiKey abc123");
+    expect(r).toBe("Authorization: ApiKey ***");
+  });
+
+  it("(R1) redacts scheme-less Authorization: <credential> — no scheme group present", async () => {
+    const { redactSecrets } = await import("../src/logger.js");
+    const r = redactSecrets("Authorization: abc123");
+    expect(r).toBe("Authorization: ***");
+  });
+
   it("redacts X-Agent-Token: headers (case-insensitive)", async () => {
     const { redactSecrets } = await import("../src/logger.js");
     const r1 = redactSecrets("with X-Agent-Token: tok_abc123 success");

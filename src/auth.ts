@@ -127,6 +127,16 @@ export const TOOL_CAPABILITY: Record<string, string> = {
   // the existing revoke_token surface — the two tools form the
   // privilege-escalation pair.
   expand_capabilities: "admin",
+  // v2.7.1 R1 [P2 FIX] — codex audit caught that set_dashboard_theme
+  // documents itself as "Auth: dashboard-secret-equivalent capability
+  // (treated as an admin operation)" at src/server.ts:633 but was NOT
+  // in TOOL_CAPABILITY. The fixed-list spec-pin in v2.7.1 R0's
+  // tests/v2-7-1-expand-capabilities-gate.test.ts missed this current
+  // counterexample (the maintainer's words: "your walk-analogous fixed list
+  // would NOT have failed if another admin tool stayed unmapped").
+  // R1 adds the cap entry AND replaces the spec-pin with a contract
+  // test that scans tool descriptions for admin-equivalent phrasing.
+  set_dashboard_theme: "admin",
 };
 
 /** Tools that do NOT require any authentication (bootstrap + always-allowed-readonly). */
