@@ -143,7 +143,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(9, 10)).not.toThrow();
     // v2.3.0 registered 10→11 (migrateSchemaToV2_9: Phase 4s mailbox+cursor+seq+epoch).
     expect(() => applyMigration(10, 11)).not.toThrow();
-    expect(() => applyMigration(11, 12)).toThrow(/no migration registered|11→12/);
+    // v2.7 / Tether Phase 3a registered 11→12 (migrateSchemaToV2_10: inbox_events outbox table).
+    expect(() => applyMigration(11, 12)).not.toThrow();
+    expect(() => applyMigration(12, 13)).toThrow(/no migration registered|12→13/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

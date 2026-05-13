@@ -1,0 +1,54 @@
+# bot-relay-mcp Tether VSCode extension — packaging exclusions.
+#
+# v2.6.3 publish-prep: trims the v0.1.0 VSIX from 4.38 MB / 3500 files
+# down to a marketplace-respectful size. Without this file vsce ships
+# every byte under the extension dir including dev-only dot-dirs inside
+# node_modules (.github FUNDING.yml, test/, source maps, declaration
+# files we don't need at runtime, the internal PUBLISH.md doc, etc).
+#
+# Keep this minimal: we are NOT bundling with esbuild for v0.1.0 (that's
+# a v0.2.0 candidate). We DO ship runtime node_modules.
+
+# Internal docs (developer-facing only — not for marketplace)
+PUBLISH.md
+marketplace-prep-results.md
+
+# Build inputs / dev configs (we only ship out/*.js — TS source is in the repo, not the VSIX)
+src/**
+tsconfig.json
+.gitignore
+
+# Source maps + declaration files inside node_modules (~50% of the bytes;
+# runtime doesn't need them, only dev tooling does)
+**/*.map
+node_modules/**/*.d.ts
+node_modules/**/*.d.ts.map
+
+# Test fixtures + spec files inside node_modules (we don't run tests at runtime)
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/__tests__/**
+node_modules/**/*.test.js
+node_modules/**/*.spec.js
+
+# GitHub repo metadata + funding files inside node_modules — not user-facing
+node_modules/**/.github/**
+node_modules/**/.gitignore
+node_modules/**/.npmignore
+node_modules/**/.eslintrc*
+node_modules/**/.prettierrc*
+
+# Internal CHANGELOGs of node_modules (we have our own CHANGELOG.md at the root)
+node_modules/**/CHANGELOG.md
+node_modules/**/CHANGELOG
+
+# Don't ship the package output itself if a prior `vsce package` left one behind
+*.vsix
+
+# Editor + OS junk
+.vscode/**
+.DS_Store
+**/.DS_Store
+
+# Vitest config (test-only, not runtime)
+vitest.config.*

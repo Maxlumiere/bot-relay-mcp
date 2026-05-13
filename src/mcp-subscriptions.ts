@@ -67,6 +67,107 @@ const subscriptionsByUri = new Map<string, Set<Server>>();
 let inboxBusUnbinder: (() => void) | null = null;
 
 /**
+ * v2.7 / Tether Phase 3b — per-URI highest event id that has already been
+ * broadcast to subscribers. The in-process bus and the cross-process outbox
+ * tail both route through {@link broadcastInboxChange}; an event whose id is
+ * &le; the recorded high-water mark is dropped. This prevents double-
+ * notification when sender and subscriber share a process (bus fires first,
+ * then the tail catches up and would otherwise re-broadcast the same row).
+ *
+ * Why event id and not timestamp:
+ *   - `inbox_events.id` is a monotonic SQLite AUTOINCREMENT PK, unique
+ *     per DB. Timestamps tie on fast batched writes.
+ *   - The tail SELECTs ORDER BY id, so its delivery order is also stable
+ *     by id, which makes the &le; comparison correct under all interleavings.
+ *
+ * Memory growth is bounded by the number of distinct subscribed URIs, which
+ * is bounded by the number of registered agents. Entries are dropped when
+ * the last subscriber leaves the URI ({@link unsubscribe} +
+ * {@link unsubscribeAllForServer}).
+ */
+const lastBroadcastIdByUri = new Map<string, number>();
+
+// v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace instrumentation.
+// Goal: surface where the subscribe→emit→fan-out→sendResourceUpdated chain
+// breaks during the Tether VS Code smoke (msg dispatch in 0506ac7's ship-pong
+// surfaced that Phase 1 client-side onerror/onclose never fire — failure is
+// below the SDK message-handling layer). Each Server gets a monotonic debug
+// tag (S1, S2, …) so daemon stderr can correlate subscribe + per-iteration
+// fan-out lines. Tag survives via WeakMap so we don't keep dead Servers
+// alive. Remove (or downgrade to debug-level) after the structural fix lands.
+let serverDebugCounter = 0;
+const serverDebugTags = new WeakMap<Server, string>();
+function tagFor(server: Server): string {
+  let tag = serverDebugTags.get(server);
+  if (!tag) {
+    serverDebugCounter += 1;
+    tag = `S${serverDebugCounter}`;
+    serverDebugTags.set(server, tag);
+  }
+  return tag;
+}
+
+/**
+ * v2.7 / Tether Phase 3b — single fan-out path used by BOTH the in-process
+ * bus listener (same-process sender + subscriber) and the cross-process
+ * outbox tail (the polling loop in src/outbox-tail.ts that drains
+ * inbox_events rows produced by stdio writers in a different process).
+ *
+ * Dedup contract: callers MUST pass `eventId` = the row id from
+ * `inbox_events` that produced this change. An event whose id is &le;
+ * the per-URI high-water mark is dropped silently. This guarantees that
+ * if both the bus and the tail observe the same row (which is the
+ * expected case when sender + subscriber share a process), the subscriber
+ * receives exactly one `sendResourceUpdated`.
+ *
+ * Exported so `outbox-tail.ts` can call it directly; tests can call it
+ * too if they want to bypass the bus + DB layer.
+ */
+export function broadcastInboxChange(
+  agentName: string,
+  reason: InboxChangedEvent["reason"],
+  eventId: number,
+  source: "bus" | "tail",
+): void {
+  const uri = inboxUriFor(agentName);
+  const last = lastBroadcastIdByUri.get(uri) ?? 0;
+  if (eventId <= last) {
+    // [broadcast-trace] dedup — second observer of the same row. Common
+    // path: bus fires first (same-process), then tail catches up; or
+    // tail fires first (cross-process), then bus fires in the daemon for
+    // a subscriber that happened to also be local. Either way: drop.
+    log.info(
+      `[broadcast-trace] dedup-skip source=${source} agent=${agentName} reason=${reason} ` +
+      `event_id=${eventId} last_broadcast_id=${last} uri=${uri}`,
+    );
+    return;
+  }
+  lastBroadcastIdByUri.set(uri, eventId);
+
+  const subs = subscriptionsByUri.get(uri);
+  log.info(
+    `[broadcast-trace] fanout enter source=${source} agent=${agentName} reason=${reason} uri=${uri} ` +
+    `event_id=${eventId} total_uris=${subscriptionsByUri.size} subs_for_uri=${subs?.size ?? 0}`,
+  );
+  if (!subs || subs.size === 0) return;
+  for (const server of subs) {
+    const tag = tagFor(server);
+    log.info(`[broadcast-trace] notifying server=${tag} uri=${uri}`);
+    server.sendResourceUpdated({ uri })
+      .then(() => {
+        log.info(`[broadcast-trace] notify accepted server=${tag} uri=${uri}`);
+      })
+      .catch((err: unknown) => {
+        log.warn(
+          `[mcp-subscriptions] sendResourceUpdated(${uri}) failed; dropping dead subscriber=${tag}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        subs.delete(server);
+        if (subs.size === 0) subscriptionsByUri.delete(uri);
+      });
+  }
+}
+
+/**
  * Register an inbox-bus listener once, lazily, the first time anything
  * subscribes. Doing it lazily keeps test fixtures clean — tests that never
  * touch subscriptions don't need to tear down a global handler.
@@ -74,23 +175,7 @@ let inboxBusUnbinder: (() => void) | null = null;
 function ensureBusListener(): void {
   if (inboxBusUnbinder) return;
   inboxBusUnbinder = onInboxChanged((event: InboxChangedEvent) => {
-    const uri = inboxUriFor(event.agent_name);
-    const subs = subscriptionsByUri.get(uri);
-    if (!subs || subs.size === 0) return;
-    for (const server of subs) {
-      // Each Server.sendResourceUpdated() returns a Promise; we don't
-      // await — fan-out is best-effort, and one slow client must not
-      // block the writer that fired the event. Errors here usually mean
-      // the transport closed between subscribe + emit; log + drop the
-      // dead subscriber to avoid further noise.
-      server.sendResourceUpdated({ uri }).catch((err: unknown) => {
-        log.warn(
-          `[mcp-subscriptions] sendResourceUpdated(${uri}) failed; dropping dead subscriber: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        subs.delete(server);
-        if (subs.size === 0) subscriptionsByUri.delete(uri);
-      });
-    }
+    broadcastInboxChange(event.agent_name, event.reason, event.id, "bus");
   });
 }
 
@@ -102,6 +187,10 @@ export function subscribe(uri: string, server: Server): void {
     subscriptionsByUri.set(uri, set);
   }
   set.add(server);
+  // [broadcast-trace] subscribe arrived
+  log.info(
+    `[broadcast-trace] subscribe added server=${tagFor(server)} uri=${uri} subs_for_uri=${set.size} total_uris=${subscriptionsByUri.size}`,
+  );
 }
 
 export function unsubscribe(uri: string, server: Server): void {
@@ -131,6 +220,7 @@ export function _subscriberCountForTests(uri: string): number {
 /** Test-only: drop every subscription + unbind the bus listener. */
 export function _resetSubscriptionsForTests(): void {
   subscriptionsByUri.clear();
+  lastBroadcastIdByUri.clear();
   if (inboxBusUnbinder) {
     inboxBusUnbinder();
     inboxBusUnbinder = null;

@@ -52,6 +52,43 @@ step() {
 # --- 1. TypeScript ---
 step "tsc --noEmit" npx tsc --noEmit || exit 1
 
+# --- 1b. v2.7 Tether Phase 6 CI hotfix #3 — VSCode extension compile (emit).
+# Two drift-out guards (tests/v2-6-tether-transport-diagnostics.test.ts +
+# tests/v2-7-tether-reconnection-options.test.ts) read
+# extensions/vscode/out/extension.js to assert the compiled artifact
+# preserves the source-level wiring contracts (transport.onerror BEFORE
+# client.connect; reconnectionOptions with maxRetries >= 10). vitest
+# below would fail those guards if out/ doesn't exist when it runs.
+#
+# Pre-fix history: an earlier "extension TS compile" step at section 4b
+# called `tsc -p . --noEmit` — it type-checked, but never emitted, so
+# vitest above never saw a fresh out/. CI's smoke job hit this gap on PR
+# #29 (run 25775805022). Local pre-publish gates only avoided it because
+# the operator had a stale out/ from a prior `npm run compile`.
+#
+# This step runs BEFORE vitest and uses `npm run compile` which emits
+# to out/. The section 4b step retains the strict --noEmit type check as
+# a separate guard that catches type errors even when out/ is stale.
+extension_compile_emit() {
+  local ext_dir="$PROJECT_ROOT/extensions/vscode"
+  if [ ! -d "$ext_dir" ]; then
+    echo "  SKIP  extensions/vscode not present"
+    return 0
+  fi
+  if [ ! -f "$ext_dir/package.json" ]; then
+    echo "  SKIP  extensions/vscode/package.json missing"
+    return 0
+  fi
+  ( cd "$ext_dir" && \
+    if [ ! -d node_modules ]; then
+      echo "  Installing extensions/vscode dependencies (one-time)..."
+      npm install --no-audit --no-fund --silent || return 1
+    fi
+    npm run compile
+  )
+}
+step "extension TS compile + emit (extensions/vscode → out/)" extension_compile_emit || exit 1
+
 # --- 2. Unit/integration tests ---
 step "vitest run" npx vitest run || exit 1
 

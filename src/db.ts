@@ -213,6 +213,8 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_7(_db);
   migrateSchemaToV2_8(_db);
   migrateSchemaToV2_9(_db);
+  migrateSchemaToV2_10(_db);
+  finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 }
 
@@ -245,6 +247,8 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_7(_db);
   migrateSchemaToV2_8(_db);
   migrateSchemaToV2_9(_db);
+  migrateSchemaToV2_10(_db);
+  finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 
   return _db;
@@ -464,7 +468,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -482,35 +486,97 @@ export function getSchemaVersion(): number {
 }
 
 /**
- * Hook point for future schema migrations. Currently a stub: CURRENT_SCHEMA_VERSION
- * is 1 and there are no registered migrations. A future bump to v2 must:
- *   1. Add a case here that applies the migration SQL.
- *   2. UPDATE schema_info SET version = 2, last_migrated_at = NOW WHERE id = 1.
- *   3. Bump CURRENT_SCHEMA_VERSION to 2.
- * Throws for unregistered pairs so callers see a clear actionable error
- * rather than silent no-op.
+ * v2.7 Tether Phase 3 R1 — advance the recorded schema_info.version to
+ * `target` if it is currently behind. Idempotent + safe to call multiple
+ * times. Returns the prior version if a bump occurred, or null if no
+ * advance was needed.
+ *
+ * Why this exists: initSchema uses `INSERT OR IGNORE` to populate the
+ * single schema_info row. On a FRESH DB the inserted row carries
+ * CURRENT_SCHEMA_VERSION, which is correct. But on an EXISTING DB that
+ * was initialized under a prior code version, the row already has an
+ * older version and the IGNORE clause leaves it untouched — so every
+ * subsequent migrateSchemaToV2_X function runs (idempotently, via
+ * CREATE TABLE IF NOT EXISTS + ALTER ... ADD COLUMN-with-existence-
+ * guard), structurally bringing the DB up to current shape, but the
+ * recorded `schema_info.version` field stays at the old number forever.
+ *
+ * Codex caught this in Phase 3 R1 audit on a live v11 DB whose
+ * inbox_events table existed (v12 content) but whose version row still
+ * said 11. The bug was latent in every prior bump (v10→v11, v9→v10, …)
+ * but only surfaced now because `relay doctor` started comparing the
+ * stored version against CURRENT_SCHEMA_VERSION verbatim.
+ *
+ * Walk-analogous: every prior migration had this same bug. The fix
+ * here is structural — one helper, called from both init chains AND
+ * each applyMigration case, so the pattern is correct for v12→v13,
+ * v13→v14, and all future bumps without needing per-case code.
+ */
+function advanceSchemaVersionIfBehind(db: CompatDatabase, target: number): number | null {
+  const row = db
+    .prepare("SELECT version FROM schema_info WHERE id = 1")
+    .get() as { version: number } | undefined;
+  if (!row) return null;
+  if (row.version >= target) return null;
+  const prior = row.version;
+  db.prepare("UPDATE schema_info SET version = ?, last_migrated_at = ? WHERE id = 1")
+    .run(target, now());
+  log.info(
+    `[schema] advanced schema_info.version ${prior} → ${target} (post-migration sync; ` +
+    `idempotent additive migrations had already brought DB structure to v${target})`
+  );
+  return prior;
+}
+
+/**
+ * Hook point for backup/restore's schema-version dispatcher. Each
+ * registered (from, to) pair acknowledges a known migration AND syncs
+ * schema_info.version to `to` so the recorded version doesn't drift
+ * behind the actual DB shape after a restore round-trip. Throws for
+ * unregistered pairs so callers see a clear actionable error rather
+ * than a silent no-op.
+ *
+ * Init-time mutations are applied via the migrateSchemaToV2_X
+ * functions, which run unconditionally at startup. applyMigration is
+ * NOT on the init path; it is invoked by src/backup.ts during restore.
+ * The same advance helper runs at the end of the init chain
+ * ({@link finalizeSchemaVersion}) so neither path leaves
+ * schema_info.version stale.
  */
 export function applyMigration(from: number, to: number): void {
-  // v2.1 Phase 4b.1 v2 + Phase 4p: schema_version migrations 1→2 and 2→3
-  // are applied via migrateSchemaToV2_1 / migrateSchemaToV2_2 which run
-  // unconditionally at init under the same idempotent-guard pattern as
-  // migrateSchemaToV1_7 / migrateSchemaToV2_0. The mutation already
-  // happened at init; this hook is a no-op semantic acknowledgement so
-  // backup/restore's version-bump dispatcher doesn't throw.
-  if (from === 1 && to === 2) return;
-  if (from === 2 && to === 3) return;
-  if (from === 3 && to === 4) return;
-  if (from === 4 && to === 5) return;
-  if (from === 5 && to === 6) return;
-  if (from === 6 && to === 7) return;
-  if (from === 7 && to === 8) return;
-  if (from === 8 && to === 9) return;
-  if (from === 9 && to === 10) return;
-  if (from === 10 && to === 11) return;
+  // v2.1 Phase 4b.1 v2 + Phase 4p + … Phase 7q + v2.7 Tether Phase 3:
+  // schema_version migrations 1→2 through 11→12 are applied via the
+  // migrateSchemaToV1_7 / migrateSchemaToV2_X functions which run
+  // unconditionally at init under additive-idempotent guards. The
+  // mutation already happened at init; this hook ALSO syncs the
+  // stored version field via advanceSchemaVersionIfBehind so a
+  // backup→restore round-trip cannot leave a structurally-current
+  // DB with a stale recorded version (Codex R1 finding).
+  const registeredPairs: Array<[number, number]> = [
+    [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],
+    [7, 8], [8, 9], [9, 10], [10, 11], [11, 12],
+  ];
+  for (const [f, t] of registeredPairs) {
+    if (from === f && to === t) {
+      advanceSchemaVersionIfBehind(getDb(), to);
+      return;
+    }
+  }
   throw new Error(
     `no migration registered for schema_version ${from}→${to}. ` +
     `Register a handler in src/db.ts applyMigration and update CURRENT_SCHEMA_VERSION.`
   );
+}
+
+/**
+ * Init-chain finalizer — runs at the END of both initializeDb and getDb
+ * chains, after every migrateSchemaToV2_X has executed. Sole job:
+ * advance schema_info.version to CURRENT_SCHEMA_VERSION if it is
+ * currently behind. See {@link advanceSchemaVersionIfBehind} for the
+ * full rationale.
+ */
+function finalizeSchemaVersion(db: CompatDatabase): void {
+  advanceSchemaVersionIfBehind(db, CURRENT_SCHEMA_VERSION);
 }
 
 /**
@@ -1128,6 +1194,62 @@ export function setDashboardPrefs(
   return { theme, custom_json, updated_at: nowIso };
 }
 
+/**
+ * v2.7 / Tether Phase 3 — durable outbox table for cross-process inbox
+ * notifications.
+ *
+ * THE PROBLEM: pre-Phase-3 the daemon's MCP subscription fan-out used an
+ * in-process EventEmitter (`src/inbox-events.ts:bus`). When a stdio MCP
+ * server (different process) wrote a message to the SAME shared
+ * `~/.bot-relay/instances/<uuid>/relay.db`, the HTTP daemon's process
+ * never observed the in-memory event — its bus is module-local. Result:
+ * the Tether VS Code smoke saw extension `connected + subscribed` but
+ * never received `notifications/resources/updated` for messages
+ * originating in other processes (the common operator shape).
+ *
+ * THE FIX: every emitInboxChanged producer now ALSO INSERTs a row into
+ * `inbox_events`. The HTTP daemon polls this table on a 100ms (default)
+ * cadence; new rows trigger `sendResourceUpdated` to subscribers in the
+ * daemon's local mcp-subscriptions registry. The in-process bus stays
+ * for the same-process fast path (Q-HTTP-1 + every existing subscription
+ * test keeps passing without modification); the daemon's broadcaster
+ * dedups by event id so same-process traffic isn't double-fired.
+ *
+ * Schema notes:
+ *   - `id` is autoincrement primary key — monotonic across all writers
+ *     because SQLite serializes writes at the file lock. The poller's
+ *     cursor is just `MAX(id) seen`. New rows have id > cursor by
+ *     construction.
+ *   - `reason` CHECK matches the InboxChangedEvent enum at
+ *     `src/inbox-events.ts`. Stay in sync — drift here means the daemon
+ *     rejects valid events at INSERT time, surfacing as a write failure
+ *     in the producer.
+ *   - `source_pid` is a debugging aid — lets `[broadcast-trace]` log
+ *     lines correlate which process wrote which event when multiple
+ *     stdio servers are active alongside the HTTP daemon.
+ *   - Indexes: `idx_inbox_events_id_after` for the poller's tail
+ *     (`id > ? ORDER BY id`); `idx_inbox_events_agent_id` for any future
+ *     query that wants per-agent history.
+ *
+ * Migration is additive; existing databases get the table on next init.
+ * No data backfill needed — pre-existing messages don't trigger a
+ * synthetic event (they're already in subscribers' inboxes; the outbox
+ * is for FUTURE writes only).
+ */
+function migrateSchemaToV2_10(db: CompatDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS inbox_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_name TEXT NOT NULL,
+      reason TEXT NOT NULL CHECK (reason IN ('message_received', 'message_read', 'broadcast_received')),
+      created_at TEXT NOT NULL,
+      source_pid INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbox_events_id_after ON inbox_events(id);
+    CREATE INDEX IF NOT EXISTS idx_inbox_events_agent_id ON inbox_events(agent_name, id);
+  `);
+}
+
 function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -1135,6 +1257,19 @@ function purgeOldRecords(db: CompatDatabase): void {
   db.prepare("DELETE FROM messages WHERE created_at < ?").run(sevenDaysAgo);
   db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'rejected', 'cancelled') AND updated_at < ?").run(thirtyDaysAgo);
   db.prepare("DELETE FROM webhook_delivery_log WHERE attempted_at < ?").run(sevenDaysAgo);
+  // v2.7 / Tether Phase 3 — outbox cleanup. Match the messages purge
+  // window by default (7 days). Configurable via RELAY_OUTBOX_RETENTION_DAYS
+  // for operators who want a longer audit trail; set to 0 to disable.
+  const outboxRetentionDays = (() => {
+    const raw = process.env.RELAY_OUTBOX_RETENTION_DAYS;
+    if (raw === undefined || raw === "") return 7;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 7;
+  })();
+  if (outboxRetentionDays > 0) {
+    const outboxCutoff = new Date(Date.now() - outboxRetentionDays * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare("DELETE FROM inbox_events WHERE created_at < ?").run(outboxCutoff);
+  }
   // v2.1 Phase 4c.2: audit log retention is now env-driven (default 90 days,
   // configurable via RELAY_AUDIT_LOG_RETENTION_DAYS, 0 = disabled).
   purgeOldAuditLog(getAuditLogRetentionDays());
@@ -2537,13 +2672,28 @@ export function sendMessage(
     const id = uuidv4();
     const timestamp = now();
     const encContent = encryptContent(content);
-    db.prepare(
-      "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
-    ).run(id, from, to, encContent, priority, timestamp);
+    // v2.7 / Tether Phase 3 — atomic message + outbox event in one tx so
+    // the cross-process tail (src/outbox-tail.ts in the HTTP daemon) sees
+    // a row iff the message commits, and never sees a row whose message
+    // was rolled back. Outbox rowid is read after run() and threaded into
+    // the in-process bus emit so same-process subscribers can dedup
+    // against the daemon-side tail dispatch.
+    let outboxId = 0;
+    const tx = db.transaction(() => {
+      db.prepare(
+        "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
+      ).run(id, from, to, encContent, priority, timestamp);
+      const r = db.prepare(
+        "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
+      ).run(to, "message_received", timestamp, process.pid);
+      outboxId = Number(r.lastInsertRowid);
+    });
+    tx();
     // v2.5.0 Tether Phase 1 — Part S — fan out an inbox-changed event so
     // MCP subscribers on relay://inbox/<to> get a notifications/resources/
-    // updated push without polling.
-    emitInboxChanged({ agent_name: to, reason: "message_received" });
+    // updated push without polling. (Same-process fast path; cross-process
+    // path is the outbox tail in the HTTP daemon.)
+    emitInboxChanged({ agent_name: to, reason: "message_received", id: outboxId });
     return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
   }
 
@@ -2560,9 +2710,19 @@ export function sendMessage(
   const timestamp = now();
   const encContent = encryptContent(content); // v1.7: encrypt at rest if RELAY_ENCRYPTION_KEY set
 
-  db.prepare(
-    "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
-  ).run(id, from, to, encContent, priority, timestamp);
+  // v2.7 / Tether Phase 3 — atomic message + outbox event. See system
+  // sender path above for rationale.
+  let outboxId = 0;
+  const tx = db.transaction(() => {
+    db.prepare(
+      "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
+    ).run(id, from, to, encContent, priority, timestamp);
+    const r = db.prepare(
+      "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
+    ).run(to, "message_received", timestamp, process.pid);
+    outboxId = Number(r.lastInsertRowid);
+  });
+  tx();
 
   // v2.3.0 Part C.4 — touch the filesystem marker for the recipient so
   // ambient-wake clients watching the marker path get a low-latency
@@ -2578,7 +2738,7 @@ export function sendMessage(
   // relay://inbox/<to>. Emit AFTER the SQL commit + marker touch so
   // a subscriber that immediately re-fetches the resource sees the
   // freshly-inserted row.
-  emitInboxChanged({ agent_name: to, reason: "message_received" });
+  emitInboxChanged({ agent_name: to, reason: "message_received", id: outboxId });
 
   return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
 }
@@ -2725,20 +2885,35 @@ export function getMessages(
   // stays `peek=false` so consume-once semantics are preserved for
   // single-shot workers (v2.0 final #6).
   let drainedRows = 0;
+  let outboxId = 0;
   if (!peek && rows.length > 0 && currentSession && status !== "read") {
     const ids = rows.map((r) => r.id);
     const placeholders = ids.map(() => "?").join(",");
-    const r = db.prepare(
-      `UPDATE messages SET status = 'read', read_by_session = ? WHERE id IN (${placeholders})`
-    ).run(currentSession, ...ids);
-    drainedRows = r.changes;
+    // v2.7 / Tether Phase 3a — drain UPDATE + outbox INSERT in one tx so
+    // the cross-process tail in the HTTP daemon (src/outbox-tail.ts) sees
+    // exactly one row per actual pending→read transition. lastInsertRowid
+    // is threaded into emitInboxChanged for in-process dedup against the
+    // tail (mcp-subscriptions tracks highest broadcast id per URI).
+    const tx = db.transaction(() => {
+      const r = db.prepare(
+        `UPDATE messages SET status = 'read', read_by_session = ? WHERE id IN (${placeholders})`
+      ).run(currentSession, ...ids);
+      drainedRows = r.changes;
+      if (drainedRows > 0) {
+        const ins = db.prepare(
+          "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
+        ).run(agentName, "message_read", now(), process.pid);
+        outboxId = Number(ins.lastInsertRowid);
+      }
+    });
+    tx();
   }
   // v2.5.0 Tether Phase 1 — Part S — fire the inbox-changed event when
   // pending → read, so subscribers see the unread count drop in real time.
   // Skipped on peek (no mutation) and skipped when zero rows transitioned
   // (e.g. status='all' / 'read' filters never mark anything new).
   if (drainedRows > 0) {
-    emitInboxChanged({ agent_name: agentName, reason: "message_read" });
+    emitInboxChanged({ agent_name: agentName, reason: "message_read", id: outboxId });
   }
 
   // v2.3.0 Part C.2 — delivery-time seq assignment. Per Codex Q9 lock:
@@ -2981,6 +3156,15 @@ export function broadcastMessage(
   const insert = db.prepare(
     "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, 'normal', 'pending', ?)"
   );
+  // v2.7 / Tether Phase 3a — per-recipient outbox row so the cross-process
+  // tail in the HTTP daemon wakes every subscriber on each individual
+  // relay://inbox/<x> URI. INSERTs live inside the same tx as the message
+  // INSERTs so a partial-failure abort leaves NO orphaned outbox rows
+  // (and inversely no committed messages without their outbox notifications).
+  const outboxInsert = db.prepare(
+    "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
+  );
+  const outboxIds: number[] = [];
 
   // v1.7: encrypt once, reuse for all recipients (each gets their own row but
   // the IV is regenerated per encryptContent call so... actually re-encrypt
@@ -2989,6 +3173,8 @@ export function broadcastMessage(
     for (const agent of recipients) {
       const id = uuidv4();
       insert.run(id, from, agent.name, encryptContent(content), timestamp);
+      const r = outboxInsert.run(agent.name, "broadcast_received", timestamp, process.pid);
+      outboxIds.push(Number(r.lastInsertRowid));
       sentTo.push(agent.name);
       messageIds.push(id);
     }
@@ -2999,9 +3185,15 @@ export function broadcastMessage(
   // v2.5.0 Tether Phase 1 — Part S — fan out one inbox-changed event per
   // recipient so MCP subscribers on each individual relay://inbox/<x> URI
   // get woken. Emitted AFTER the tx commits so a re-fetch of the resource
-  // sees the newly-inserted rows.
-  for (const recipient of sentTo) {
-    emitInboxChanged({ agent_name: recipient, reason: "broadcast_received" });
+  // sees the newly-inserted rows. v2.7 Tether Phase 3a threads each
+  // recipient's outbox row id so the in-process bus and the cross-process
+  // tail can dedup in mcp-subscriptions.
+  for (let i = 0; i < sentTo.length; i++) {
+    emitInboxChanged({
+      agent_name: sentTo[i],
+      reason: "broadcast_received",
+      id: outboxIds[i],
+    });
   }
 
   return { sent_to: sentTo, message_ids: messageIds };

@@ -1,6 +1,7 @@
 # bot-relay-mcp
 
 [![CI](https://github.com/Maxlumiere/bot-relay-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Maxlumiere/bot-relay-mcp/actions/workflows/ci.yml)
+[![Tether on VSCode Marketplace](https://img.shields.io/visual-studio-marketplace/v/lumiere-ventures.bot-relay-tether?label=Tether%20on%20VSCode%20Marketplace&color=007ACC)](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether)
 
 A local-first message relay for AI coding agents. Two interfaces, one shared SQLite database, zero infrastructure.
 
