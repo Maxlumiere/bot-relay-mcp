@@ -133,7 +133,7 @@ async function surfaceSecretStorageUnavailableNotice(
     if (context.globalState.get<boolean>(SECRET_STORAGE_UNAVAILABLE_NOTICE_KEY) === true) return;
     void vscode.window
       .showWarningMessage(
-        "Tether: VSCode SecretStorage is unreachable on this host. Tether will use the RELAY_AGENT_TOKEN environment variable only — the legacy plaintext settings.json fallback has been disabled in v0.1.3 R1 (security fix). On Linux this typically means libsecret/gnome-keyring isn't installed; install it and reload VSCode to enable token persistence.",
+        "Tether: VSCode SecretStorage is unreachable on this host. Tether will use the RELAY_AGENT_TOKEN environment variable only — the legacy plaintext settings.json fallback has been disabled in v0.1.3 R1 (security fix). On Linux this typically means libsecret/gnome-keyring isn't installed; install it and reload VSCode to enable token persistence, then set your token via the \"Tether: Set Agent Token (SecretStorage)\" palette command.",
         "View install docs",
         "Dismiss",
       )

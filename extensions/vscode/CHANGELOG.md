@@ -22,7 +22,7 @@ The marketplace surfaces this file directly on the extension's listing page, so 
 ### Compatibility
 
 - Token-resolution precedence is now **SecretStorage > `RELAY_AGENT_TOKEN` env var > legacy settings.json** (the third tier is read only during the migration window and removed once the migration step runs). v0.1.3 against `bot-relay-mcp` v2.7.1 daemon is the recommended pairing; older daemons still authenticate the same way (the daemon never saw `settings.json`).
-- VSCode SecretStorage API is identical across macOS / Windows / Linux at the JS surface; no platform-specific code path. Linux hosts without libsecret will see the extension fall back to `RELAY_AGENT_TOKEN` env / legacy config gracefully (a warning is logged to the Tether output channel).
+- VSCode SecretStorage API is identical across macOS / Windows / Linux at the JS surface; no platform-specific code path. Linux/headless hosts without libsecret fall back to `RELAY_AGENT_TOKEN` env ONLY; the legacy `settings.json` fallback is intentionally disabled when SecretStorage is unreachable (R1 security contract — see the Hardening section below). Install libsecret/gnome-keyring and reload VSCode to enable SecretStorage persistence, or set `RELAY_AGENT_TOKEN` env, or use the `Tether: Set Agent Token (SecretStorage)` palette command once SecretStorage is reachable.
 
 ### Hardening (R1, codex audit follow-up)
 
