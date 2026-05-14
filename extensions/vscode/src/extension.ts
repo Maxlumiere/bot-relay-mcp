@@ -73,22 +73,83 @@ async function readConfig(context: vscode.ExtensionContext): Promise<TetherConfi
   // VSCode. The new SecretStorage source is passed as a 3rd arg.
   const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
   let secretToken: string | undefined;
+  // v0.1.3 R1 [P2 codex audit fix] — track whether SecretStorage was
+  // actually reachable. Pre-R1 a failure here set secretToken=undefined
+  // and let resolveAgentToken fall through to legacy plaintext config,
+  // re-promoting the exact leak v0.1.3 was meant to close. R1 splits
+  // the two cases: secret-undefined-but-backend-available (fine to
+  // fall through during the migration window) vs backend-unreachable
+  // (refuse to read legacy plaintext; degrade to env-only).
+  let secretsAvailable = true;
   try {
     secretToken = await context.secrets.get(SECRET_KEY_AGENT_TOKEN);
   } catch (err) {
-    // VSCode SecretStorage is backed by OS keychain on macOS / Credential
-    // Vault on Windows / libsecret on Linux. The Linux case can fail in
-    // headless / minimal containers without libsecret. Fall back to
-    // env/legacy-config in that case so the extension stays functional
-    // for the operator who hasn't installed libsecret.
-    log(`SecretStorage unavailable, falling back to env/legacy-config for token: ${err instanceof Error ? err.message : String(err)}`);
+    // VSCode SecretStorage is backed by OS keychain on macOS /
+    // Credential Vault on Windows / libsecret on Linux. The Linux case
+    // can fail in headless / minimal containers without libsecret.
+    // Pre-R1 we fell back to legacy config; R1 explicitly refuses
+    // because that re-opens the plaintext leak. Operator falls back
+    // to RELAY_AGENT_TOKEN env (or sets up libsecret + uses the
+    // `Tether: Set Agent Token (SecretStorage)` palette command).
+    log(
+      `SecretStorage unavailable, refusing to read legacy plaintext token (codex P2 audit fix). ` +
+      `Falling back to RELAY_AGENT_TOKEN env only. Set token via the "Tether: Set Agent Token (SecretStorage)" ` +
+      `palette command once SecretStorage is reachable. Underlying error: ${err instanceof Error ? err.message : String(err)}`,
+    );
     secretToken = undefined;
+    secretsAvailable = false;
+    // Optional one-shot UI banner so the operator sees the degraded
+    // mode rather than just a silent log line. Mark via globalState
+    // so it fires once per install per the codex's "preferably visible
+    // warning/error" recommendation. Fire-and-forget; the banner
+    // shouldn't block readConfig from returning.
+    void surfaceSecretStorageUnavailableNotice(context);
   }
   return resolveTetherConfig(
     (key) => cfg.get(key),
     process.env as Record<string, string | undefined>,
     secretToken,
+    secretsAvailable,
   );
+}
+
+/**
+ * v0.1.3 R1 — one-shot warning banner when SecretStorage backend is
+ * unreachable. Surfaces the degraded mode to the operator (per codex
+ * audit's "preferably visible warning/error") so they don't silently
+ * lose Tether functionality on Linux-without-libsecret. Action button
+ * routes to the bot-relay docs.
+ *
+ * Tracked via globalState so the banner fires exactly once per install
+ * — the alternative (fire on every readConfig call) would be
+ * obnoxious during a long-running session.
+ */
+const SECRET_STORAGE_UNAVAILABLE_NOTICE_KEY = "botRelayTether.secretStorageUnavailableNoticeShown";
+
+async function surfaceSecretStorageUnavailableNotice(
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  try {
+    if (context.globalState.get<boolean>(SECRET_STORAGE_UNAVAILABLE_NOTICE_KEY) === true) return;
+    void vscode.window
+      .showWarningMessage(
+        "Tether: VSCode SecretStorage is unreachable on this host. Tether will use the RELAY_AGENT_TOKEN environment variable only — the legacy plaintext settings.json fallback has been disabled in v0.1.3 R1 (security fix). On Linux this typically means libsecret/gnome-keyring isn't installed; install it and reload VSCode to enable token persistence.",
+        "View install docs",
+        "Dismiss",
+      )
+      .then((choice) => {
+        if (choice === "View install docs") {
+          void vscode.env.openExternal(
+            vscode.Uri.parse("https://github.com/Maxlumiere/bot-relay-mcp/blob/main/docs/token-lifecycle.md"),
+          );
+        }
+      });
+    await context.globalState.update(SECRET_STORAGE_UNAVAILABLE_NOTICE_KEY, true);
+  } catch (err) {
+    // Notification path itself may fail in some headless test hosts.
+    // Swallow — the log line above is the source of truth.
+    log(`SecretStorage-unavailable notice failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /**

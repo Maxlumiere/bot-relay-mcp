@@ -24,10 +24,20 @@ The marketplace surfaces this file directly on the extension's listing page, so 
 - Token-resolution precedence is now **SecretStorage > `RELAY_AGENT_TOKEN` env var > legacy settings.json** (the third tier is read only during the migration window and removed once the migration step runs). v0.1.3 against `bot-relay-mcp` v2.7.1 daemon is the recommended pairing; older daemons still authenticate the same way (the daemon never saw `settings.json`).
 - VSCode SecretStorage API is identical across macOS / Windows / Linux at the JS surface; no platform-specific code path. Linux hosts without libsecret will see the extension fall back to `RELAY_AGENT_TOKEN` env / legacy config gracefully (a warning is logged to the Tether output channel).
 
+### Hardening (R1, codex audit follow-up)
+
+Codex audit on the initial v0.1.3 PR caught a P2 finding: when the SecretStorage backend is UNREACHABLE (Linux without libsecret, or transient failure), the pre-R1 code path fell through to the legacy plaintext `settings.json` value — silently re-promoting the exact leak v0.1.3 was built to close. v0.1.3 R1 splits the two empty-secret cases:
+
+- **SecretStorage reachable + secret value empty** (operator hasn't set one yet): legacy plaintext fallback IS consulted, preserving the upgrade-from-v0.1.2 migration window.
+- **SecretStorage UNREACHABLE** (backend error): legacy plaintext fallback is SKIPPED. Token resolves env-only (`RELAY_AGENT_TOKEN`); if env is also empty, the extension goes idle until the operator either installs the OS keychain backend (libsecret on Linux) and reloads VSCode, OR uses the new `Tether: Set Agent Token (SecretStorage)` palette command, OR sets `RELAY_AGENT_TOKEN` in their environment.
+
+A one-shot warning notification surfaces the degraded mode visibly to the operator (per codex's "preferably visible warning/error" recommendation) so the failure isn't silent in the Tether output channel only. The notification fires once per install (tracked in globalState) and offers a "View install docs" action button.
+
 ### References
 
 - v2.7.1 hotfix brief F10 + Maxime's lock 2026-05-13.
 - Cross-platform parity verified per `feedback_cross_platform_parity.md`.
+- R1 audit finding from codex-5-5 msg `561cf7c9`; R1 dispatch from victra msg `c6f9ee92`.
 
 ## [0.1.2] — 2026-05-12 — Reconnect resilience + discoverable manual reconnect
 
