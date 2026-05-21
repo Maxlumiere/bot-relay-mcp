@@ -219,6 +219,17 @@ SPAWN_HELPERS_DIR="$(cd "$(dirname "$0")/../hooks" && pwd 2>/dev/null)"
 if [ -n "$SPAWN_HELPERS_DIR" ] && [ -f "$SPAWN_HELPERS_DIR/_vault-helpers.sh" ]; then
   # shellcheck source=../hooks/_vault-helpers.sh
   . "$SPAWN_HELPERS_DIR/_vault-helpers.sh"
+  # v2.7.2 — drop a spawn manifest beside the token vault so the SessionStart
+  # hook can recover identity if the typed-env transport drops RELAY_AGENT_NAME
+  # between this script and the hook. Defense-in-depth only; the primary
+  # mechanism is still the `export RELAY_AGENT_NAME=…` typed via osascript.
+  # Best-effort: a manifest write failure is NOT a spawn failure — log to
+  # stderr (which the dispatcher captures) and continue. See
+  # audit-findings/v2.7.2-spawn-agent-name-brief.md for the failure-mode
+  # reframe and the fresh-manifest read path in hooks/check-relay.sh.
+  if ! write_relay_spawn_manifest "$NAME" "$ROLE" 2>/dev/null; then
+    echo "[spawn-agent] WARNING: failed to write spawn manifest for \"$NAME\" — continuing (typed-env transport remains primary)" >&2
+  fi
   if VAULT_PATH=$(resolve_relay_token_path "$NAME" 2>/dev/null); then
     Q_VAULT=$(printf '%q' "$VAULT_PATH")
     # The child shell evaluates this snippet:
