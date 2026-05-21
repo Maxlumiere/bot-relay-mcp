@@ -295,6 +295,39 @@ describe("v2.7.2 — hook fallback integration (check-relay.sh)", () => {
     expect(r.stderr).not.toMatch(/recovered identity from spawn manifest/);
   });
 
+  it("(H6) emits LOUD stderr warning when ambiguity blocks recovery — closes codex R0 P2 (msg 8244095e)", () => {
+    // Two fresh manifests → find_fresh returns non-zero → the else-branch
+    // must call count_fresh_* and warn loudly. The warning text is part of
+    // the SHIPPED contract (CHANGELOG promises loud-on-ambiguity); an
+    // operator grepping production logs for "ambiguous spawn manifest"
+    // must surface this event. If the warning text drifts, this test must
+    // fail — that's the instrumentation handle the R1 patch adds.
+    bashRun(helperScript(`write_relay_spawn_manifest 'agent-alpha' 'builder'`));
+    bashRun(helperScript(`write_relay_spawn_manifest 'agent-beta' 'researcher'`));
+    const r = runHook();
+    expect(r.stderr).toMatch(/ambiguous spawn manifest/);
+    expect(r.stderr).toMatch(/falling back to default/);
+    expect(r.stderr).toMatch(/2 fresh manifests/);
+    // And critically — NO false recovery breadcrumb.
+    expect(r.stderr).not.toMatch(/recovered identity from spawn manifest/);
+    // Both manifests must remain on disk — the hook does NOT delete on
+    // ambiguity (no successful recovery → no consumption).
+    const a = path.join(agentsDir(), "agent-alpha.spawn-manifest");
+    const b = path.join(agentsDir(), "agent-beta.spawn-manifest");
+    expect(fs.existsSync(a)).toBe(true);
+    expect(fs.existsSync(b)).toBe(true);
+  });
+
+  it("(H7) NO warning when zero fresh manifests exist (normal manual terminal stays quiet)", () => {
+    // Manual `claude` open with no recent spawn — agents/ dir may not even
+    // exist. Hook must stay quiet: no recovery breadcrumb, no ambiguity
+    // warning. (Codex R1 scope: "Avoid noise for normal no-manifest /
+    // manual default terminals.")
+    const r = runHook();
+    expect(r.stderr).not.toMatch(/recovered identity from spawn manifest/);
+    expect(r.stderr).not.toMatch(/ambiguous spawn manifest/);
+  });
+
   it("(H5) opt-out via RELAY_DISABLE_MANIFEST_FALLBACK skips the recovery path", () => {
     bashRun(helperScript(`write_relay_spawn_manifest 'would-recover' 'builder'`));
     const r = runHook({ RELAY_DISABLE_MANIFEST_FALLBACK: "1" });
@@ -307,11 +340,12 @@ describe("v2.7.2 — hook fallback integration (check-relay.sh)", () => {
 // --- Drift guard: shipped helper must define all four v2.7.2 manifest fns,
 //                 and no consumer may shadow them inline.
 describe("v2.7.2 — manifest helper drift guard", () => {
-  it("(DG1) hooks/_vault-helpers.sh defines all four manifest helpers", () => {
+  it("(DG1) hooks/_vault-helpers.sh defines all five manifest helpers", () => {
     const body = fs.readFileSync(HELPER, "utf-8");
     expect(body).toMatch(/^resolve_relay_spawn_manifest_path\(\)/m);
     expect(body).toMatch(/^write_relay_spawn_manifest\(\)/m);
     expect(body).toMatch(/^find_fresh_relay_spawn_manifest\(\)/m);
+    expect(body).toMatch(/^count_fresh_relay_spawn_manifests\(\)/m);
     expect(body).toMatch(/^delete_relay_spawn_manifest\(\)/m);
   });
 
@@ -327,6 +361,7 @@ describe("v2.7.2 — manifest helper drift guard", () => {
       /^resolve_relay_spawn_manifest_path\s*\(\s*\)/m,
       /^write_relay_spawn_manifest\s*\(\s*\)/m,
       /^find_fresh_relay_spawn_manifest\s*\(\s*\)/m,
+      /^count_fresh_relay_spawn_manifests\s*\(\s*\)/m,
       /^delete_relay_spawn_manifest\s*\(\s*\)/m,
     ];
     for (const c of consumers) {

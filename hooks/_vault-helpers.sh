@@ -245,6 +245,53 @@ find_fresh_relay_spawn_manifest() {
   return 0
 }
 
+# count_fresh_relay_spawn_manifests [max_age_seconds] — echo the count of
+# *.spawn-manifest files in the per-instance agents/ dir whose mtime is
+# within max_age_seconds (default 60) on stdout. Always exits 0; on missing
+# dir / no candidates echoes "0".
+#
+# v2.7.2 R1 — exposed as a sibling to find_fresh_relay_spawn_manifest so
+# the hook can distinguish:
+#   - 0 fresh manifests → silent (normal manual terminal, no spawn in
+#     flight)
+#   - 1 fresh manifest  → silent recovery (handled by find_fresh_*)
+#   - >1 fresh manifest → LOUD stderr warning, fall through to "default"
+# The shipped comments + CHANGELOG entry already promised loud-on-
+# ambiguity behavior; codex-5-5 R0 audit (msg 8244095e) caught that the
+# warning was missing. This helper is the instrumentation handle.
+#
+# Uses the same stat-second precision as find_fresh_relay_spawn_manifest
+# so the count and the find agree on which files are "fresh".
+count_fresh_relay_spawn_manifests() {
+  local max_age_seconds="${1:-60}"
+  local db_path
+  db_path=$(resolve_relay_db_path) || { echo 0; return 0; }
+  local agents_dir
+  agents_dir="$(dirname "$db_path")/agents"
+  if [ ! -d "$agents_dir" ]; then
+    echo 0
+    return 0
+  fi
+  local now
+  now=$(date +%s)
+  local count=0
+  local f mtime age
+  for f in "$agents_dir"/*.spawn-manifest; do
+    [ -f "$f" ] || continue
+    if mtime=$(stat -f %m "$f" 2>/dev/null) && [ -n "$mtime" ]; then :
+    elif mtime=$(stat -c %Y "$f" 2>/dev/null) && [ -n "$mtime" ]; then :
+    else
+      continue
+    fi
+    age=$((now - mtime))
+    if [ "$age" -ge 0 ] && [ "$age" -le "$max_age_seconds" ]; then
+      count=$((count + 1))
+    fi
+  done
+  echo "$count"
+  return 0
+}
+
 # delete_relay_spawn_manifest <name> — best-effort removal. Returns 0
 # whether or not the file existed. Used by the hook after successful
 # identity recovery so a stale manifest can't be re-used by a later

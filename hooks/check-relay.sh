@@ -85,6 +85,17 @@ if [ -z "${RELAY_DISABLE_MANIFEST_FALLBACK:-}" ] && { [ "$AGENT_NAME" = "default
       # freshness window still bounds the damage.
       delete_relay_spawn_manifest "$AGENT_NAME" >/dev/null 2>&1 || true
     fi
+  else
+    # v2.7.2 R1 — ambiguity-loud branch. find_fresh returned non-zero, so
+    # we got 0, >1, or a malformed/mismatched manifest. Only the >1 case
+    # gets a loud warning — 0 (no manifest) is the normal manual-terminal
+    # path and would be log noise. The count helper here MUST use the same
+    # 60s window the find call above used, otherwise the two can disagree
+    # on a file modified at exactly the boundary.
+    FRESH_MANIFEST_COUNT=$(count_fresh_relay_spawn_manifests 60 2>/dev/null || echo 0)
+    if [ "${FRESH_MANIFEST_COUNT:-0}" -gt 1 ]; then
+      echo "[bot-relay hook] WARNING: ambiguous spawn manifest — found $FRESH_MANIFEST_COUNT fresh manifests in the per-instance agents/ directory, not guessing identity, falling back to default. This usually means two spawn_agent calls landed within 60s. Either set RELAY_AGENT_NAME explicitly for this terminal, or wait ~60s for the older manifest(s) to age out and re-open the terminal." >&2
+    fi
   fi
 fi
 DB_PATH=$(resolve_relay_db_path) || {
