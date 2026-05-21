@@ -98,6 +98,212 @@ read_relay_token_from_vault() {
   return 0
 }
 
+# v2.7.2 — spawn-manifest helpers. The manifest is a defense-in-depth marker
+# the spawn pipeline drops next to the per-instance vault so the SessionStart
+# hook can recover identity if the typed-env transport (osascript write text
+# → child shell → claude → hook subprocess) drops RELAY_AGENT_NAME between
+# the parent script and the hook. See audit-findings/v2.7.2-spawn-agent-name-
+# brief.md for the failure-mode reframe (hook silently defaults to "default"
+# on unset env, mail dead-letters under the wrong agent).
+#
+# Format: key=value lines, ASCII only, terminated with \n. Atomic tmp+rename.
+# Owner-only readable (0600) since the role + spawn_pid leak metadata about
+# the operator's terminal layout.
+
+# resolve_relay_spawn_manifest_path <name> — echo absolute manifest file
+# path on stdout. Mirrors resolve_relay_token_path with .spawn-manifest
+# suffix instead of .token. Returns 0 on success; bad name → stderr +
+# return 1.
+resolve_relay_spawn_manifest_path() {
+  local name="$1"
+  if ! echo "$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+    echo "[bot-relay hook] invalid agent name \"$name\" for manifest path" >&2
+    return 1
+  fi
+  local db_path
+  db_path=$(resolve_relay_db_path) || return 1
+  echo "$(dirname "$db_path")/agents/${name}.spawn-manifest"
+  return 0
+}
+
+# write_relay_spawn_manifest <name> <role> — atomic key=value write at the
+# resolved manifest path. Returns 0 on success; bad input / IO failure →
+# stderr + return 1. Manifest carries name + role + spawn_pid + ISO8601
+# timestamp. The role allowlist matches validate_token in bin/spawn-agent.sh
+# so a manifest can never be persisted with metadata that the hook would
+# later refuse to use.
+write_relay_spawn_manifest() {
+  local name="$1"
+  local role="$2"
+  if ! echo "$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+    echo "[bot-relay hook] refusing to write manifest with malformed name \"$name\"" >&2
+    return 1
+  fi
+  if ! echo "$role" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+    echo "[bot-relay hook] refusing to write manifest with malformed role \"$role\"" >&2
+    return 1
+  fi
+  local manifest_path
+  manifest_path=$(resolve_relay_spawn_manifest_path "$name") || return 1
+  local dir
+  dir=$(dirname "$manifest_path")
+  mkdir -p "$dir" 2>/dev/null || true
+  chmod 0700 "$dir" 2>/dev/null || true
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local tmp="${manifest_path}.tmp.$$"
+  {
+    umask 0177
+    printf 'name=%s\nrole=%s\nspawn_pid=%s\nspawned_at=%s\n' \
+      "$name" "$role" "$$" "$now" > "$tmp"
+  } || return 1
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$manifest_path" || {
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  }
+  return 0
+}
+
+# find_fresh_relay_spawn_manifest [max_age_seconds] — scan the per-instance
+# agents/ dir for *.spawn-manifest files modified within max_age_seconds
+# (default 60). Returns 0 + echoes a single line `name=<n>;role=<r>` ONLY
+# when exactly one fresh manifest exists. Returns 1 (no output) when:
+#   - dir doesn't exist
+#   - no fresh manifests
+#   - MORE than one fresh manifest (ambiguous — caller must NOT guess)
+#   - manifest file content malformed (defense against partial writes)
+# The ambiguity-rejection branch is load-bearing: two concurrent spawns
+# within the freshness window would otherwise let the hook pick the wrong
+# identity. Better to fall through to "default" + loud warning.
+#
+# mtime granularity is real seconds (not rounded to minutes — `find -mmin`
+# was tried and rejected, it can't distinguish 30s from 90s when the
+# window is 60s). Uses stat(1) with cross-platform fallback: `-f %m` on
+# macOS/BSD, `-c %Y` on GNU/Linux. If neither flag works (exotic stat),
+# the manifest is skipped — safer to fall through than to mis-recover.
+find_fresh_relay_spawn_manifest() {
+  local max_age_seconds="${1:-60}"
+  local db_path
+  db_path=$(resolve_relay_db_path) || return 1
+  local agents_dir
+  agents_dir="$(dirname "$db_path")/agents"
+  if [ ! -d "$agents_dir" ]; then
+    return 1
+  fi
+  local now
+  now=$(date +%s)
+  local candidates=""
+  local f mtime age
+  # `nullglob` is bash-specific and not portable — guard the glob with a
+  # check that the candidate is a regular file so the literal glob pattern
+  # falls through cleanly when no matches exist.
+  for f in "$agents_dir"/*.spawn-manifest; do
+    [ -f "$f" ] || continue
+    if mtime=$(stat -f %m "$f" 2>/dev/null) && [ -n "$mtime" ]; then :
+    elif mtime=$(stat -c %Y "$f" 2>/dev/null) && [ -n "$mtime" ]; then :
+    else
+      continue
+    fi
+    age=$((now - mtime))
+    if [ "$age" -ge 0 ] && [ "$age" -le "$max_age_seconds" ]; then
+      candidates="$candidates$f
+"
+    fi
+  done
+  # Trim trailing newline; bail on empty.
+  candidates=$(printf '%s' "$candidates" | sed '/^$/d')
+  if [ -z "$candidates" ]; then
+    return 1
+  fi
+  local count
+  count=$(printf '%s\n' "$candidates" | grep -c .)
+  if [ "$count" -ne 1 ]; then
+    return 1
+  fi
+  # Validate filename + read+parse content
+  local fname mname mrole
+  fname=$(basename "$candidates" .spawn-manifest)
+  if ! echo "$fname" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+    return 1
+  fi
+  mname=$(grep -E '^name=' "$candidates" | head -n 1 | sed -E 's/^name=//')
+  mrole=$(grep -E '^role=' "$candidates" | head -n 1 | sed -E 's/^role=//')
+  # Filename + content name must agree — defends against a manifest file
+  # that was renamed under us, and against partial writes that left the
+  # name= line missing.
+  if [ "$mname" != "$fname" ]; then
+    return 1
+  fi
+  if ! echo "$mname" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+    return 1
+  fi
+  if ! echo "$mrole" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+    return 1
+  fi
+  printf 'name=%s;role=%s\n' "$mname" "$mrole"
+  return 0
+}
+
+# count_fresh_relay_spawn_manifests [max_age_seconds] — echo the count of
+# *.spawn-manifest files in the per-instance agents/ dir whose mtime is
+# within max_age_seconds (default 60) on stdout. Always exits 0; on missing
+# dir / no candidates echoes "0".
+#
+# v2.7.2 R1 — exposed as a sibling to find_fresh_relay_spawn_manifest so
+# the hook can distinguish:
+#   - 0 fresh manifests → silent (normal manual terminal, no spawn in
+#     flight)
+#   - 1 fresh manifest  → silent recovery (handled by find_fresh_*)
+#   - >1 fresh manifest → LOUD stderr warning, fall through to "default"
+# The shipped comments + CHANGELOG entry already promised loud-on-
+# ambiguity behavior; codex-5-5 R0 audit (msg 8244095e) caught that the
+# warning was missing. This helper is the instrumentation handle.
+#
+# Uses the same stat-second precision as find_fresh_relay_spawn_manifest
+# so the count and the find agree on which files are "fresh".
+count_fresh_relay_spawn_manifests() {
+  local max_age_seconds="${1:-60}"
+  local db_path
+  db_path=$(resolve_relay_db_path) || { echo 0; return 0; }
+  local agents_dir
+  agents_dir="$(dirname "$db_path")/agents"
+  if [ ! -d "$agents_dir" ]; then
+    echo 0
+    return 0
+  fi
+  local now
+  now=$(date +%s)
+  local count=0
+  local f mtime age
+  for f in "$agents_dir"/*.spawn-manifest; do
+    [ -f "$f" ] || continue
+    if mtime=$(stat -f %m "$f" 2>/dev/null) && [ -n "$mtime" ]; then :
+    elif mtime=$(stat -c %Y "$f" 2>/dev/null) && [ -n "$mtime" ]; then :
+    else
+      continue
+    fi
+    age=$((now - mtime))
+    if [ "$age" -ge 0 ] && [ "$age" -le "$max_age_seconds" ]; then
+      count=$((count + 1))
+    fi
+  done
+  echo "$count"
+  return 0
+}
+
+# delete_relay_spawn_manifest <name> — best-effort removal. Returns 0
+# whether or not the file existed. Used by the hook after successful
+# identity recovery so a stale manifest can't be re-used by a later
+# unintended terminal.
+delete_relay_spawn_manifest() {
+  local name="$1"
+  local manifest_path
+  manifest_path=$(resolve_relay_spawn_manifest_path "$name") || return 0
+  rm -f "$manifest_path" 2>/dev/null || true
+  return 0
+}
+
 # write_relay_token_to_vault <name> <token> — atomic tmp+rename, chmod
 # 0o600. Returns 0 on success; on bad shape / IO failure, stderr + return 1.
 write_relay_token_to_vault() {
