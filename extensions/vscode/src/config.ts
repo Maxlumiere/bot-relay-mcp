@@ -71,9 +71,103 @@ function resolveEndpoint(
   return DEFAULT_ENDPOINT;
 }
 
+/**
+ * v0.1.3 — agent_token now resolves from VSCode SecretStorage as the
+ * highest-priority source. The legacy `bot-relay.tether.agentToken`
+ * setting in `settings.json` is removed from the contributes schema in
+ * v0.1.3 (Hermes deep-review flagged plaintext storage; migration is
+ * auto-run in `extension.ts:activate` on first launch).
+ *
+ * Precedence: SecretStorage > env (RELAY_AGENT_TOKEN) > legacy config.
+ *
+ * v0.1.3 R1 [P2 codex audit fix] — `secretsAvailable` parameter
+ * distinguishes two empty-secret scenarios:
+ *   - `secretsAvailable = true` AND secret empty: SecretStorage is
+ *     reachable, the value just isn't set. Migration window legacy
+ *     fallback is OK (the operator opted into v0.1.2 plaintext at
+ *     install time and we're servicing them while they upgrade).
+ *   - `secretsAvailable = false`: SecretStorage backend is
+ *     UNREACHABLE (Linux without libsecret, or a transient failure).
+ *     We DO NOT consult the legacy plaintext config in this case —
+ *     doing so re-promotes the exact leak surface v0.1.3 was built
+ *     to close. Operator falls back to env-only; if env is also
+ *     empty, returns "" and the extension goes idle until the
+ *     operator fixes their SecretStorage backend or sets
+ *     RELAY_AGENT_TOKEN env.
+ *
+ * Codex P2 finding (msg 561cf7c9): "If SecretStorage access fails,
+ * do not read/use legacy `cfg(\"agentToken\")`; allow env-only
+ * (`RELAY_AGENT_TOKEN`) with a log and preferably visible
+ * warning/error. Keep the normal migration-window legacy fallback
+ * only when SecretStorage access succeeds and there is no
+ * secret/env."
+ *
+ * Exported (was module-private pre-R1) so the regression test calls
+ * the actual shipped helper rather than re-implementing the
+ * precedence rule, per `feedback_test_path_must_match_shipped_path`.
+ */
+export function resolveAgentToken(
+  fromSecret: string | undefined,
+  fromEnv: string | undefined,
+  fromLegacyConfig: string | undefined,
+  secretsAvailable: boolean,
+): string {
+  const s = (fromSecret ?? "").trim();
+  if (s.length > 0) return s;
+  const e = (fromEnv ?? "").trim();
+  if (e.length > 0) return e;
+  // v0.1.3 R1 — refuse to read legacy plaintext when SecretStorage
+  // backend is unreachable. The whole point of v0.1.3 is that
+  // settings.json is no longer trusted for tokens; falling through
+  // here on Linux-without-libsecret would re-open the leak.
+  if (!secretsAvailable) return "";
+  const c = (fromLegacyConfig ?? "").trim();
+  if (c.length > 0) return c;
+  return "";
+}
+
+/**
+ * v0.1.3 — pure decision helper for the SecretStorage migration.
+ * Extracted so the unit tests can exercise the branch matrix without
+ * mocking the full VSCode SecretStorage/Configuration surface. The
+ * extension.ts side effects (context.secrets.store, cfg.update,
+ * showWarningMessage) are wired against whatever this returns.
+ *
+ *  - hasSecret = true → noop (already migrated OR set via "Set Token").
+ *  - hasSecret = false + legacy config empty → noop (nothing to migrate).
+ *  - hasSecret = false + legacy config has value → migrate it.
+ */
+export function decideMigrationAction(
+  hasSecret: boolean,
+  legacyConfigValue: string | undefined,
+): { action: "noop" | "migrate"; tokenToStore: string | null } {
+  if (hasSecret) return { action: "noop", tokenToStore: null };
+  const trimmed = (legacyConfigValue ?? "").trim();
+  if (trimmed.length === 0) return { action: "noop", tokenToStore: null };
+  return { action: "migrate", tokenToStore: trimmed };
+}
+
 export function resolveTetherConfig(
   cfg: ConfigGetter,
   env: EnvRecord,
+  /**
+   * v0.1.3 — value from `context.secrets.get("botRelay.agentToken")`.
+   * Highest-priority source for the agent token. Optional so unit
+   * tests can omit it (legacy precedence test surface stays clean).
+   */
+  fromSecret?: string,
+  /**
+   * v0.1.3 R1 — when false, SecretStorage backend was UNREACHABLE
+   * (Linux-without-libsecret, or transient failure). The legacy
+   * plaintext fallback is SKIPPED in this case so the migration
+   * actually closes the leak instead of silently re-promoting it.
+   *
+   * Default `true` preserves backward-compat for callers that don't
+   * explicitly thread availability — an undefined-secret with
+   * `secretsAvailable: true` means "the operator hasn't set one yet,
+   * fine to use legacy during migration window."
+   */
+  secretsAvailable: boolean = true,
 ): TetherConfig {
   const endpoint = resolveEndpoint(cfg("endpoint") as string | undefined, env);
   const agentName = resolveString(
@@ -81,10 +175,11 @@ export function resolveTetherConfig(
     env.RELAY_AGENT_NAME,
     "",
   );
-  const agentToken = resolveString(
-    cfg("agentToken") as string | undefined,
+  const agentToken = resolveAgentToken(
+    fromSecret,
     env.RELAY_AGENT_TOKEN,
-    "",
+    cfg("agentToken") as string | undefined,
+    secretsAvailable,
   );
   const autoInjectInbox = (cfg("autoInjectInbox") as boolean | undefined) ?? false;
   const notificationLevel =
