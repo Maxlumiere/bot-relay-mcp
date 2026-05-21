@@ -1,5 +1,43 @@
 # Changelog
 
+## v2.7.2 — 2026-05-21 — spawn_agent identity-recovery defense-in-depth
+
+Closes the silent "default" failure mode when `mcp__bot-relay__spawn_agent` produces a child terminal whose SessionStart hook never sees `RELAY_AGENT_NAME`. Origin: victra-hermes bug report msg `149f124f` (2026-05-13), brief at `audit-findings/v2.7.2-spawn-agent-name-brief.md`.
+
+### Reframe of the failure mode
+
+The original bug report quoted the hook as printing `$RELAY_AGENT_NAME is empty — this terminal isn't registered as a named agent.` — **that string does not exist anywhere in the codebase**. `grep -rn` returns zero matches in `src/`, `hooks/`, `bin/`, and `tests/`. The user-visible symptom (identity unresolved, queued kickstart never surfaces) is real; the failure mode is silent, not loud:
+
+- `hooks/check-relay.sh:40` — `AGENT_NAME="${RELAY_AGENT_NAME:-default}"` falls back to the literal string `default` with no warning when the env var is unset or empty.
+- The hook then registers an agent named `default` over HTTP (`hooks/check-relay.sh:259-271`).
+- Mail queued for the *intended* name (e.g. `victra-memory-build`) dead-letters — the SELECT at `hooks/check-relay.sh:315-321` only matches `to_agent = 'default'` once that's the registered name.
+- From the operator's perspective the terminal "looks unregistered"; from the hook's perspective everything succeeded at exit 0.
+
+The script-side CMD is structurally correct (`bin/spawn-agent.sh:201` exports come first, before the conditional vault hydration and before `claude`). A new contract test (`tests/spawn-integration.test.ts` — v2.7.2 block) executes the dry-run CMD in a clean subshell with a `claude` stub and confirms `RELAY_AGENT_NAME` reaches both the immediate claude env AND a subprocess forked by claude. The test passes on this commit — the propagation contract holds end-to-end inside the script's scope. The remaining attack surface is between `osascript … write text` and the live `claude` binary's hook-subprocess env policy, which is opaque from outside.
+
+### Defense-in-depth fix — spawn-manifest fallback
+
+Rather than guessing which downstream layer drops the env var, this release converts the silent-default-fallback into a recoverable + loud-failing one:
+
+- **`bin/spawn-agent.sh:218-232`** — after sourcing `_vault-helpers.sh`, the script drops a `<instanceDir>/agents/<name>.spawn-manifest` file beside the per-instance token vault. Manifest format is key=value (`name`, `role`, `spawn_pid`, `spawned_at` ISO8601 UTC). Write is atomic (tmp+rename), chmod 0600, owner-only readable. Write failure is non-fatal — typed-env transport remains primary and a warning lands on stderr.
+- **`hooks/check-relay.sh:42-50` + `:60-85`** — when env-derived `AGENT_NAME` is unset OR equals literal `default`, the hook scans the per-instance `agents/` dir for *.spawn-manifest files modified within 60s. If **exactly one** fresh manifest exists and its filename matches its `name=` content, the hook recovers identity from it, emits a stderr breadcrumb, and deletes the manifest so it can't be re-used by a later unrelated terminal. Multiple-candidate ambiguity → fall through to `default` (loud warning beats wrong identity). Opt-out: `RELAY_DISABLE_MANIFEST_FALLBACK=1`.
+- **`hooks/_vault-helpers.sh:104-256`** — four new helpers (`resolve_relay_spawn_manifest_path`, `write_relay_spawn_manifest`, `find_fresh_relay_spawn_manifest`, `delete_relay_spawn_manifest`). Single source of truth, sourced by both the hook and the launcher script. The freshness check uses `stat -f %m` / `stat -c %Y` (macOS + Linux) for real-second granularity — an earlier `find -mmin -N` impl was rejected during test development because `-mmin` can only express integer minutes and silently let 30s-old manifests through a 10s window.
+
+### Caveat carried into this ship
+
+This is a defense-in-depth ship, not a root-cause kill. If the actual failure is in `claude`'s hook-subprocess env policy (e.g. claude strips `RELAY_*` before forking the hook), the manifest fallback recovers identity AND emits a stderr breadcrumb that surfaces the underlying issue. Operators who observe the recovery breadcrumb in production should report it — it's an instrumentation handle on the opaque layer.
+
+### Tests
+
+- New file `tests/v2-7-2-spawn-manifest.test.ts` — 22 tests covering manifest write atomicity, chmod, malformed-input rejection, find-fresh ambiguity handling, mtime windowing (including the sub-minute precision the `-mmin` impl couldn't deliver), delete idempotence, hook integration (5 cases including opt-out + explicit-name-wins), and drift guard for both shipped-helper definition and consumer-side shadow-redefinition.
+- New `tests/spawn-integration.test.ts` block — 4 contract tests asserting `RELAY_AGENT_NAME` reaches both `claude` env AND its subprocess env, for plain/hyphenated/dotted name shapes (`worker1`, `victra-memory-build`, `pod.alpha`).
+
+Pre-publish gate adds 26 tests on top of v2.7.1's count. Existing 75 spawn-driver tests + 41 spawn-integration tests + 15 hook-contract tests pass unchanged — no regression in the adjacent surface.
+
+### Cross-references
+
+PR opened against post-v2.7.1-merge `main` (HEAD: `d516cfd`). Branch: `hotfix/v2.7.2-spawn-name-propagation`. Filed-and-dispatched single-issue brief at `audit-findings/v2.7.2-spawn-agent-name-brief.md` (Findings section updated 2026-05-21 with the reframe + file:line citations before the patch). Tether VSCode extension v0.1.3 (`d516cfd`) and v2.7.1 R1 (`189a170`) both shipped first per brief gating.
+
 ## v2.7.1 — 2026-05-13 — SECURITY HOTFIX
 
 Two CRITICAL findings + one HIGH + three LOW/MED that surfaced in the review-Victra deep-review synthesis (msg `2b903f9b`, synthesizing codex + Hermes deep-repo audits) AFTER codex's PR #31 audit had SHIPped v2.7.0 cleanly. The PR #31 audit was scoped to the four release commits; these findings live in PRE-EXISTING code that would have shipped via `npm publish` if the publish step had run before the deep-review landed.

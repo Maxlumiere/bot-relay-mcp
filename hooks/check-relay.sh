@@ -40,6 +40,16 @@ fi
 AGENT_NAME="${RELAY_AGENT_NAME:-default}"
 AGENT_ROLE="${RELAY_AGENT_ROLE:-user}"
 AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
+# v2.7.2 — manifest-fallback for the silent "default" failure mode. When the
+# typed-env transport (osascript write text → child shell → claude → hook
+# subprocess) drops RELAY_AGENT_NAME between the spawn and us, the bash :-
+# default above silently picks "default" and the hook re-registers under the
+# wrong name (mail dead-letters). Defense-in-depth: if name is unset OR
+# literal "default", scan the per-instance agents/ dir for a single fresh
+# (<60s) spawn manifest and recover identity from it. Loud warning on
+# ambiguity or stale state; silent recovery when unambiguous.
+# Helpers are sourced below at HOOKS_DIR/_vault-helpers.sh; we defer the
+# recovery check until after sourcing so the function definitions exist.
 # v2.2.0: window title for the dashboard click-to-focus driver. Defaults to
 # the agent name when the spawn chain didn't set it (e.g. manual terminal
 # registrations). Empty → register_agent omits the field and the agent's
@@ -53,6 +63,41 @@ RELAY_TERMINAL_TITLE_VALUE="${RELAY_TERMINAL_TITLE:-}"
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_vault-helpers.sh
 . "$HOOKS_DIR/_vault-helpers.sh"
+# v2.7.2 — manifest-fallback (see comment above the AGENT_NAME default). Only
+# kicks in when env-derived name is empty or literal "default" — operators who
+# explicitly want the "default" agent (rare, but legitimate) can opt out by
+# setting RELAY_DISABLE_MANIFEST_FALLBACK=1.
+if [ -z "${RELAY_DISABLE_MANIFEST_FALLBACK:-}" ] && { [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; }; then
+  if MANIFEST_KV=$(find_fresh_relay_spawn_manifest 60 2>/dev/null); then
+    # KV shape is exactly `name=<n>;role=<r>` (find_fresh validates both).
+    M_NAME=$(printf '%s' "$MANIFEST_KV" | sed -E 's/^name=([^;]+);role=.*$/\1/')
+    M_ROLE=$(printf '%s' "$MANIFEST_KV" | sed -E 's/^name=[^;]+;role=(.*)$/\1/')
+    if [ -n "$M_NAME" ] && [ -n "$M_ROLE" ]; then
+      AGENT_NAME="$M_NAME"
+      # Only override role if the env-derived value was the bash default
+      # ("user"); a caller that explicitly set RELAY_AGENT_ROLE keeps it.
+      if [ "$AGENT_ROLE" = "user" ]; then
+        AGENT_ROLE="$M_ROLE"
+      fi
+      echo "[bot-relay hook] recovered identity from spawn manifest: name=$AGENT_NAME role=$AGENT_ROLE (RELAY_AGENT_NAME was unset/default — defense-in-depth recovery; the typed-env transport from bin/spawn-agent.sh likely dropped this between spawn and hook)" >&2
+      # Best-effort cleanup so the manifest can't be re-used by a later
+      # unrelated terminal. If delete fails (e.g. permissions), the 60s
+      # freshness window still bounds the damage.
+      delete_relay_spawn_manifest "$AGENT_NAME" >/dev/null 2>&1 || true
+    fi
+  else
+    # v2.7.2 R1 — ambiguity-loud branch. find_fresh returned non-zero, so
+    # we got 0, >1, or a malformed/mismatched manifest. Only the >1 case
+    # gets a loud warning — 0 (no manifest) is the normal manual-terminal
+    # path and would be log noise. The count helper here MUST use the same
+    # 60s window the find call above used, otherwise the two can disagree
+    # on a file modified at exactly the boundary.
+    FRESH_MANIFEST_COUNT=$(count_fresh_relay_spawn_manifests 60 2>/dev/null || echo 0)
+    if [ "${FRESH_MANIFEST_COUNT:-0}" -gt 1 ]; then
+      echo "[bot-relay hook] WARNING: ambiguous spawn manifest — found $FRESH_MANIFEST_COUNT fresh manifests in the per-instance agents/ directory, not guessing identity, falling back to default. This usually means two spawn_agent calls landed within 60s. Either set RELAY_AGENT_NAME explicitly for this terminal, or wait ~60s for the older manifest(s) to age out and re-open the terminal." >&2
+    fi
+  fi
+fi
 DB_PATH=$(resolve_relay_db_path) || {
   # Malformed active-instance content — refuse to fall back silently. A
   # broken setup should be loud, not hidden under legacy. The hook's
