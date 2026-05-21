@@ -6,6 +6,7 @@
 import { describe, it, expect } from "vitest";
 import cp from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -430,5 +431,147 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
     } finally {
       try { fs.unlinkSync(brief); } catch {}
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v2.7.2 — RELAY_AGENT_NAME propagation contract test
+// ---------------------------------------------------------------------------
+//
+// The bug behind v2.7.2: a spawn via mcp__bot-relay__spawn_agent produces a
+// child terminal where the SessionStart hook reports identity unresolved.
+// The brief at audit-findings/v2.7.2-spawn-agent-name-brief.md hypothesizes
+// five candidate causes; this test pins the *script-side* contract end-to-
+// end so any future drift inside bin/spawn-agent.sh that breaks the export-
+// before-claude ordering, the printf %q escaping, or the inline AS_CMD
+// structure fails LOUDLY here, not silently in a 20-minute live spawn.
+//
+// What this DOES test:
+//   - bin/spawn-agent.sh's dry-run CMD, when executed in a clean subshell,
+//     puts RELAY_AGENT_NAME=<expected> into the env that `claude` would
+//     inherit AND into any subprocess `claude` forks.
+//   - Plain, hyphenated, and dotted names all survive printf %q round-trip.
+//
+// What this does NOT test:
+//   - Whether the real `claude` binary preserves RELAY_* in hook subprocess
+//     env. That layer is opaque from outside and is the suspected root
+//     cause; the v2.7.2 defense-in-depth manifest fallback in
+//     hooks/check-relay.sh is what closes it.
+//   - iTerm2 `write text` truncation. That's a transport-layer concern
+//     between osascript and the child shell that no unit test can hit.
+describe("spawn-agent.sh — v2.7.2 RELAY_AGENT_NAME propagation contract", () => {
+  // Execute the CMD produced by RELAY_SPAWN_DRY_RUN=1 in a clean subshell,
+  // substituting `claude` with a stub that dumps env to a file AND forks a
+  // subprocess whose env is also dumped. Returns the captured envs.
+  async function runCmdWithClaudeStub(args: string[]): Promise<{
+    parentEnv: string;
+    childEnv: string;
+    cmdExitCode: number | null;
+    cmdStderr: string;
+  }> {
+    const dry = await runSpawn(args);
+    expect(dry.code, `dry-run failed for args ${JSON.stringify(args)}: ${dry.stderr}`).toBe(0);
+
+    // Extract the CMD line (single line of bash separated by ; tokens).
+    const cmdMatch = dry.stdout.match(/^CMD=(.*)$/m);
+    expect(cmdMatch, `CMD= line missing from dry-run stdout`).not.toBeNull();
+    const cmd = cmdMatch![1];
+
+    // Build a temp stub directory containing a `claude` script that:
+    //   1. dumps its own env to parent-env.txt
+    //   2. forks `bash -c 'env > child-env.txt'` to mirror the case where
+    //      claude invokes hooks/check-relay.sh as a subprocess.
+    // Then prepend the stub dir to PATH so the CMD's `claude` invocation
+    // resolves to the stub, not the real claude binary.
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), `relay-v272-stub-${process.pid}-`));
+    try {
+      const parentEnvFile = path.join(stubDir, "parent-env.txt");
+      const childEnvFile = path.join(stubDir, "child-env.txt");
+      const claudeStub = path.join(stubDir, "claude");
+      const stubScript =
+        `#!/bin/bash\n` +
+        `env > "${parentEnvFile}"\n` +
+        `bash -c 'env > "${childEnvFile}"'\n` +
+        `exit 0\n`;
+      fs.writeFileSync(claudeStub, stubScript, { mode: 0o755 });
+
+      // Execute the CMD in a minimal env. We deliberately do NOT inherit
+      // RELAY_AGENT_* from the test process so a stale env can't contaminate
+      // the assertion.
+      const minimalEnv: NodeJS.ProcessEnv = {
+        PATH: `${stubDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+        HOME: process.env.HOME ?? "/tmp",
+        // No RELAY_AGENT_NAME, no RELAY_AGENT_TOKEN — must be set by CMD.
+      };
+
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const proc = cp.spawn("bash", ["-c", cmd], { env: minimalEnv });
+        let stderr = "";
+        proc.stderr.on("data", (d) => (stderr += d.toString()));
+        proc.on("exit", (code) => resolve({ code, stderr }));
+      });
+
+      const parentEnv = fs.existsSync(parentEnvFile)
+        ? fs.readFileSync(parentEnvFile, "utf8")
+        : "";
+      const childEnv = fs.existsSync(childEnvFile)
+        ? fs.readFileSync(childEnvFile, "utf8")
+        : "";
+
+      return {
+        parentEnv,
+        childEnv,
+        cmdExitCode: result.code,
+        cmdStderr: result.stderr,
+      };
+    } finally {
+      try { fs.rmSync(stubDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  // Asserting on the env's literal line `RELAY_AGENT_NAME=<expected>` is the
+  // contract: every reader of the env, including any hook subprocess, sees
+  // exactly the requested name. This is NOT a proxy assertion against the
+  // CMD string — the CMD-string assertions exist elsewhere in this file. By
+  // executing CMD in a real shell and reading the resulting env, we exercise
+  // the same code path the iTerm2 child shell would. The only delta between
+  // this test and the live spawn is the osascript `write text` transport,
+  // which is outside the script's contract.
+  it.each([
+    ["plain", "worker1"],
+    ["hyphenated", "victra-memory-build"],
+    ["dotted", "pod.alpha"],
+  ])("[contract] %s name '%s' reaches both claude env AND its subprocess env", async (_label, name) => {
+    const { parentEnv, childEnv, cmdExitCode, cmdStderr } = await runCmdWithClaudeStub([
+      name,
+      "builder",
+      "build,test",
+      "/tmp",
+    ]);
+
+    expect(cmdExitCode, `cmd exit non-zero. stderr: ${cmdStderr}`).toBe(0);
+    expect(parentEnv, `parent-env capture empty — claude stub did not run`).not.toBe("");
+    expect(childEnv, `child-env capture empty — claude stub did not fork subprocess`).not.toBe("");
+
+    // Exact toBe-equivalent line match — RELAY_AGENT_NAME must equal the
+    // requested name verbatim, no surrounding quoting artifacts, no shell
+    // substitution residue.
+    const parentLine = parentEnv.split("\n").find((l) => l.startsWith("RELAY_AGENT_NAME="));
+    const childLine = childEnv.split("\n").find((l) => l.startsWith("RELAY_AGENT_NAME="));
+    expect(parentLine, `RELAY_AGENT_NAME not in parent env for ${name}`).toBe(`RELAY_AGENT_NAME=${name}`);
+    expect(childLine, `RELAY_AGENT_NAME not in subprocess env for ${name}`).toBe(`RELAY_AGENT_NAME=${name}`);
+  });
+
+  it("[contract] RELAY_AGENT_ROLE + RELAY_AGENT_CAPABILITIES also propagate", async () => {
+    const { parentEnv } = await runCmdWithClaudeStub([
+      "worker1",
+      "researcher",
+      "search,summarize",
+      "/tmp",
+    ]);
+    const roleLine = parentEnv.split("\n").find((l) => l.startsWith("RELAY_AGENT_ROLE="));
+    const capsLine = parentEnv.split("\n").find((l) => l.startsWith("RELAY_AGENT_CAPABILITIES="));
+    expect(roleLine).toBe("RELAY_AGENT_ROLE=researcher");
+    expect(capsLine).toBe("RELAY_AGENT_CAPABILITIES=search,summarize");
   });
 });
