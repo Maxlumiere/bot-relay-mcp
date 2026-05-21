@@ -4,6 +4,63 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.1.4] — 2026-05-21 — Bundling cleanup: VSIX from 2.84 MB / 2004 files → 348 KB / 8 files
+
+A mechanical packaging cleanup. No behavior changes — same SecretStorage migration, same R1 hardening, same R2 doc fixes as v0.1.3. The only thing that changed is how the extension ships.
+
+### Changed
+
+- **VSIX is now bundled with esbuild.** Before: every byte of `node_modules` (1994 files) traveled to the marketplace alongside the extension. After: `@modelcontextprotocol/sdk` and its full transitive tree are inlined into a single `out/extension.js` and `node_modules/**` is excluded from the package. Downloads + installs are faster on every fresh VSCode profile.
+- **`.vscodeignore` rewritten.** Pre-v0.1.4 it selectively excluded chunks of `node_modules` (maps, test fixtures, `.github` metadata, etc). Post-bundle the whole tree is excluded wholesale.
+- **`vscode:prepublish` runs `tsc --noEmit` (typecheck) + `node esbuild.config.mjs` (bundle).** Previous: `tsc -p .` (which emitted `out/*.js` files that no longer ship). Typecheck is still required — esbuild does not type-check by design.
+
+### Size
+
+| | files | size |
+|---|---|---|
+| v0.1.3 | 2,004 | 2.84 MB |
+| v0.1.4 | 8 | 348 KB |
+
+87.8 % byte reduction, 99.6 % file-count reduction. Well under the brief's 800 KB / 50 files ceiling.
+
+### Architectural choices
+
+The brief left three calls to victra-build (Q1-Q3):
+
+1. **Source maps shipped (Q1: YES).** `out/extension.js.map` ships alongside `out/extension.js`. Adds ~1 MB to the VSIX but resolves stack traces back to original `src/*.ts` for any contributor or operator who attaches a debugger. Tether is small enough that debug-friendliness > marginal-size cost.
+2. **Bundle minified (Q2: YES).** esbuild's minifier is cheap (no Terser/CommonJS-shim overhead) and source maps survive intact. `keepNames: true` preserves function names for stack traces even under minification.
+3. **Target Node 20 (Q3).** VSCode 1.85+ runs Electron with Node 20+; targeting older Node would bloat the output with unneeded transpilation. `format: cjs` because VSCode loads `main` via `require()`.
+
+### Tests
+
+- **+7 bundle-correctness assertions** (`src/v0-1-4-bundle.test.ts`):
+  - Bundle exists at `out/extension.js` with non-trivial size.
+  - Bundle size < 800 KB regression ceiling.
+  - Source map shipped alongside.
+  - Runtime externals are exactly `{vscode}` ∪ `node:*` built-ins — verified via esbuild metafile (machine-readable ground truth, not text-grep which would false-positive on ajv's string-literal `require("...")` standalone-code metadata).
+  - MCP SDK appears as bundled inputs in the metafile.
+  - All four `src/*.ts` modules included in the bundle.
+  - Bundle loads via `require()` with a mocked `vscode` and exports `activate` + `deactivate` as functions — the actual contract the VSCode extension host enforces.
+- **+10 VSIX-contents drift guard assertions** (`src/v0-1-4-vsix-contents.test.ts`):
+  - vsce's `ls` output exact-matches the v0.1.4 expected file set.
+  - `node_modules/**` NOT present, `src/**` NOT present, build configs NOT present, prior `*.vsix` NOT present, dev-only docs NOT present.
+  - Required marketplace files present: `package.json`, `README.md`, `LICENSE`, `CHANGELOG.md`, `out/extension.js`, `out/extension.js.map`.
+  - File count ≤ 10 (caps future bloat).
+
+All 25 pre-existing extension tests pass unchanged — they exercise the SAME source that the bundle inlines (`src/format.ts`, `src/transport-diagnostics.ts`, `src/config.ts`), so test relevance is preserved without a separate bundle-import path.
+
+### Compatibility
+
+- No runtime API surface change. v0.1.4 against any bot-relay-mcp daemon ≥ v2.6.x works identically to v0.1.3.
+- VSCode minimum stays at 1.85 (Node 20 baseline already required by v0.1.3 — no regression).
+- Source maps in the VSIX are a marketplace convention; no operator action required.
+
+### References
+
+- Brief: `Victra/briefs/2026-05-21-tether-v0.1.4-bundling-brief.md`.
+- Dispatched from victra on v2.7.2 ship (msg `775be1b8`, 2026-05-21).
+- Auditor: codex-5-5.
+
 ## [0.1.3] — 2026-05-13 — SECURITY: token storage migration to VSCode SecretStorage
 
 ### Security

@@ -1,0 +1,144 @@
+// bot-relay-mcp — Tether for VSCode
+// Copyright (c) 2026 Lumiere Ventures
+// SPDX-License-Identifier: MIT
+
+/**
+ * v0.1.4 — VSIX-contents drift guard.
+ *
+ * Closes the regression class where a future .vscodeignore drift (or a
+ * dropped exclusion) silently re-ships node_modules/** or src/** into
+ * the marketplace VSIX, undoing the v0.1.4 size reduction.
+ *
+ * Asserts:
+ *   - vsce's file list matches the v0.1.4 contract (exact set of files)
+ *   - node_modules/** NOT present (esbuild inlined it)
+ *   - src/** NOT present (TS source lives in the repo, not the VSIX)
+ *   - LICENSE + README + CHANGELOG present (marketplace requires them)
+ *   - out/extension.js + out/extension.js.map present (the bundle + map)
+ *   - extension.meta.json NOT present (test-only, excluded from VSIX)
+ *
+ * Per `feedback_test_path_must_match_shipped_path.md`: this test runs
+ * the real `vsce` against the real package directory. Mocking the
+ * file list would defeat the drift-guard purpose.
+ */
+import { describe, it, expect } from "vitest";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const EXT_ROOT = path.resolve(__dirname, "..");
+const VSCE_BIN = path.join(EXT_ROOT, "node_modules", ".bin", "vsce");
+
+interface VsceLsResult {
+  files: string[];
+  raw: string;
+}
+
+function runVsceLs(): VsceLsResult {
+  const r = spawnSync(VSCE_BIN, ["ls"], {
+    cwd: EXT_ROOT,
+    encoding: "utf-8",
+    timeout: 30_000,
+  });
+  if (r.status !== 0) {
+    throw new Error(`vsce ls failed (exit ${r.status}): ${r.stderr}`);
+  }
+  return {
+    files: r.stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean),
+    raw: r.stdout,
+  };
+}
+
+describe("v0.1.4 — VSIX contents drift guard", () => {
+  it("(V1) vsce ls completes and reports a non-empty file list", () => {
+    const { files } = runVsceLs();
+    expect(files.length).toBeGreaterThan(0);
+    expect(files.length).toBeLessThan(50); // cap at 50 — anything more means node_modules leaked back in
+  });
+
+  it("(V2) bundle + source map are in the VSIX", () => {
+    const { files } = runVsceLs();
+    expect(files).toContain("out/extension.js");
+    expect(files).toContain("out/extension.js.map");
+  });
+
+  it("(V3) marketplace required files are in the VSIX", () => {
+    const { files } = runVsceLs();
+    // vsce maps repo CHANGELOG.md → changelog.md inside the archive,
+    // README.md → readme.md, LICENSE → LICENSE.txt. The `ls` output
+    // uses the SOURCE paths (CHANGELOG.md etc), which is what we
+    // care about for the contract. The marketplace-side renames are
+    // vsce's responsibility.
+    expect(files).toContain("package.json");
+    expect(files).toContain("README.md");
+    expect(files).toContain("LICENSE");
+    expect(files).toContain("CHANGELOG.md");
+  });
+
+  it("(V4) node_modules NOT in the VSIX (esbuild inlined the runtime deps)", () => {
+    const { files } = runVsceLs();
+    const leaked = files.filter((f) => f.startsWith("node_modules/"));
+    expect(
+      leaked,
+      `node_modules leaked into VSIX: ${JSON.stringify(leaked.slice(0, 10))}${leaked.length > 10 ? `… (+${leaked.length - 10} more)` : ""}`,
+    ).toEqual([]);
+  });
+
+  it("(V5) src/** NOT in the VSIX (source lives in the repo, not the package)", () => {
+    const { files } = runVsceLs();
+    const leaked = files.filter((f) => f.startsWith("src/"));
+    expect(leaked, `src/ leaked into VSIX: ${JSON.stringify(leaked)}`).toEqual([]);
+  });
+
+  it("(V6) build-config files NOT in the VSIX", () => {
+    const { files } = runVsceLs();
+    const forbidden = [
+      "tsconfig.json",
+      "esbuild.config.mjs",
+      "vitest.config.ts",
+      "vitest.config.js",
+      "package-lock.json",
+    ];
+    for (const f of forbidden) {
+      expect(files, `${f} must not ship in the VSIX`).not.toContain(f);
+    }
+  });
+
+  it("(V7) extension.meta.json NOT in the VSIX (test-only artifact)", () => {
+    const { files } = runVsceLs();
+    expect(files, "out/extension.meta.json is test-only — must not ship").not.toContain(
+      "out/extension.meta.json",
+    );
+  });
+
+  it("(V8) internal dev docs NOT in the VSIX", () => {
+    const { files } = runVsceLs();
+    expect(files).not.toContain("PUBLISH.md");
+    expect(files).not.toContain("marketplace-prep-results.md");
+  });
+
+  it("(V9) prior VSIX artifacts NOT bundled into a new VSIX", () => {
+    const { files } = runVsceLs();
+    const leaked = files.filter((f) => f.endsWith(".vsix"));
+    expect(leaked, `prior VSIX leaked into new VSIX: ${JSON.stringify(leaked)}`).toEqual([]);
+  });
+
+  it("(V10) total file count is at most a small number — under 10 for v0.1.4", () => {
+    const { files } = runVsceLs();
+    // v0.1.4 ships exactly: package.json, README.md, LICENSE, CHANGELOG.md,
+    // out/extension.js, out/extension.js.map. That's 6 source-side files
+    // (vsce adds [Content_Types].xml + extension.vsixmanifest at the
+    // archive level). The ls output covers only the source-side files.
+    // Asserting ≤10 leaves headroom for one or two future additions
+    // (e.g. an icon) without becoming a noisy gate.
+    expect(
+      files.length,
+      `unexpected file count in VSIX: ${files.length}. Files: ${JSON.stringify(files)}`,
+    ).toBeLessThanOrEqual(10);
+  });
+});

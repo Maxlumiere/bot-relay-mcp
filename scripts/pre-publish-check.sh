@@ -52,24 +52,28 @@ step() {
 # --- 1. TypeScript ---
 step "tsc --noEmit" npx tsc --noEmit || exit 1
 
-# --- 1b. v2.7 Tether Phase 6 CI hotfix #3 — VSCode extension compile (emit).
+# --- 1b. v0.1.4 — VSCode extension bundle (esbuild).
 # Two drift-out guards (tests/v2-6-tether-transport-diagnostics.test.ts +
 # tests/v2-7-tether-reconnection-options.test.ts) read
-# extensions/vscode/out/extension.js to assert the compiled artifact
-# preserves the source-level wiring contracts (transport.onerror BEFORE
-# client.connect; reconnectionOptions with maxRetries >= 10). vitest
-# below would fail those guards if out/ doesn't exist when it runs.
+# extensions/vscode/out/extension.js to assert the SHIPPED artifact
+# preserves source-level wiring contracts (transport.onerror BEFORE
+# client.connect; reconnectionOptions with maxRetries >= 10; SecretStorage
+# wiring; legacy agentToken absent). vitest below would fail those
+# guards if out/ doesn't exist when it runs.
 #
-# Pre-fix history: an earlier "extension TS compile" step at section 4b
-# called `tsc -p . --noEmit` — it type-checked, but never emitted, so
-# vitest above never saw a fresh out/. CI's smoke job hit this gap on PR
-# #29 (run 25775805022). Local pre-publish gates only avoided it because
-# the operator had a stale out/ from a prior `npm run compile`.
-#
-# This step runs BEFORE vitest and uses `npm run compile` which emits
-# to out/. The section 4b step retains the strict --noEmit type check as
-# a separate guard that catches type errors even when out/ is stale.
-extension_compile_emit() {
+# History:
+# - Pre-v0.1.4: this step ran `npm run compile` (tsc emit) because tsc
+#   output WAS what shipped in the VSIX. CI's smoke job hit a gap on PR
+#   #29 (run 25775805022) when a `tsc -p . --noEmit` typecheck step
+#   never emitted, leaving the drift-out tests reading a stale out/.
+# - v0.1.4 (this commit): the SHIPPED artifact is now an esbuild bundle.
+#   This step runs `npm run bundle` (esbuild → out/extension.js) so the
+#   drift-out tests read the actual artifact the marketplace gets. The
+#   drift-out tests themselves were converted to byte-offset ordering on
+#   identifiers preserved by `keepNames: true` so they survive
+#   minification. The section 4b step retains the strict tsc --noEmit
+#   typecheck as a separate guard.
+extension_bundle() {
   local ext_dir="$PROJECT_ROOT/extensions/vscode"
   if [ ! -d "$ext_dir" ]; then
     echo "  SKIP  extensions/vscode not present"
@@ -84,10 +88,10 @@ extension_compile_emit() {
       echo "  Installing extensions/vscode dependencies (one-time)..."
       npm install --no-audit --no-fund --silent || return 1
     fi
-    npm run compile
+    npm run bundle
   )
 }
-step "extension TS compile + emit (extensions/vscode → out/)" extension_compile_emit || exit 1
+step "extension bundle (extensions/vscode → out/extension.js via esbuild)" extension_bundle || exit 1
 
 # --- 2. Unit/integration tests ---
 step "vitest run" npx vitest run || exit 1
@@ -146,6 +150,31 @@ extension_compile() {
   )
 }
 step "extension TS compile (extensions/vscode)" extension_compile || exit 1
+
+# --- 4c. v0.1.4 — extension-local vitest (bundle + VSIX-contents drift guards).
+# Runs `cd extensions/vscode && npm run test:unit` AFTER the bundle is
+# emitted (step 1b) so the v0.1.4 bundle-correctness tests
+# (src/v0-1-4-bundle.test.ts) read the actual bundle on disk, and the
+# VSIX-contents tests (src/v0-1-4-vsix-contents.test.ts) shell out to
+# the locally-installed vsce to introspect what would ship.
+#
+# This step is additive: the root vitest above already runs root-level
+# tests/*.test.ts. The extension-local config (vitest.config.ts in the
+# extension dir) intentionally scopes to src/*.test.ts so root vitest
+# doesn't double-run them.
+extension_test_unit() {
+  local ext_dir="$PROJECT_ROOT/extensions/vscode"
+  if [ ! -d "$ext_dir" ]; then
+    echo "  SKIP  extensions/vscode not present"
+    return 0
+  fi
+  if [ ! -f "$ext_dir/package.json" ]; then
+    echo "  SKIP  extensions/vscode/package.json missing"
+    return 0
+  fi
+  ( cd "$ext_dir" && npm run test:unit )
+}
+step "extension vitest run (extensions/vscode — bundle + VSIX drift guards)" extension_test_unit || exit 1
 
 # --- 5. Drift guard (src/) ---
 # Any string literal matching /["']\d+\.\d+\.\d+["']/ inside src/ that is NOT

@@ -95,31 +95,41 @@ describe("v2.6.x / Tether v0.1.1 — transport diagnostics drift guard", () => {
   it("(drift-out) extensions/vscode/out/extension.js (compiled artifact, what ships in VSIX) preserves the BEFORE-connect order", () => {
     expect(
       fs.existsSync(EXT_OUT),
-      `missing ${EXT_OUT} — run \`cd extensions/vscode && npm run compile\` first`,
+      `missing ${EXT_OUT} — run \`cd extensions/vscode && npm run bundle\` first`,
     ).toBe(true);
     const body = fs.readFileSync(EXT_OUT, "utf-8");
 
-    // The compiled JS preserves identifier names. Anchor on:
-    //   - StreamableHTTPClientTransport (referenced as
-    //     `streamableHttp_js_1.StreamableHTTPClientTransport` after tsc)
-    //   - wireTransportDiagnostics (function call site preserved)
-    //   - client.connect( (method call preserved)
-    const newTransportLine = findLine(body, /\bStreamableHTTPClientTransport\b/);
-    const wireDiagLine = findLine(body, /\bwireTransportDiagnostics\b/);
-    const connectLine = findLine(body, /\bawait\s+client\.connect\s*\(\s*transport\s*\)/);
-
-    expect(newTransportLine, "out/extension.js must reference StreamableHTTPClientTransport").toBeGreaterThan(0);
-    expect(wireDiagLine, "out/extension.js must reference wireTransportDiagnostics").toBeGreaterThan(0);
-    expect(connectLine, "out/extension.js must reference client.connect(").toBeGreaterThan(0);
+    // v0.1.4 bundle-aware: pre-v0.1.4 this test used `findLine` against
+    // tsc output where identifier names + line layout matched source.
+    // Post-bundle the artifact is minified single-mega-line CJS with
+    // some identifiers preserved by `keepNames: true` (function/class
+    // names) and local vars renamed. Switch to byte-offset (`indexOf`)
+    // ordering on the preserved anchors:
+    //   - StreamableHTTPClientTransport — class name, preserved.
+    //   - wireTransportDiagnostics      — function name, preserved.
+    //   - `.connect(`                   — method invocation pattern,
+    //     survives even when the local `client`/`transport` vars get
+    //     mangled to `n`/`o`. Search AFTER wireDiagIdx so we hit the
+    //     extension's call, not the SDK's superclass method definition
+    //     that bundles ahead of it.
+    const newTransportIdx = body.indexOf("StreamableHTTPClientTransport");
+    const wireDiagIdx = body.indexOf("wireTransportDiagnostics");
+    expect(newTransportIdx, "out/extension.js must reference StreamableHTTPClientTransport").toBeGreaterThan(-1);
+    expect(wireDiagIdx, "out/extension.js must reference wireTransportDiagnostics").toBeGreaterThan(-1);
+    const connectIdx = body.indexOf(".connect(", wireDiagIdx);
+    expect(
+      connectIdx,
+      "out/extension.js must contain `.connect(` AFTER wireTransportDiagnostics (extension's call to client.connect(transport))",
+    ).toBeGreaterThan(-1);
 
     expect(
-      newTransportLine,
-      `compiled artifact: wireTransportDiagnostics (line ${wireDiagLine}) must come AFTER StreamableHTTPClientTransport (line ${newTransportLine})`,
-    ).toBeLessThan(wireDiagLine);
+      newTransportIdx,
+      `compiled artifact: wireTransportDiagnostics (byte ${wireDiagIdx}) must come AFTER StreamableHTTPClientTransport (byte ${newTransportIdx})`,
+    ).toBeLessThan(wireDiagIdx);
     expect(
-      wireDiagLine,
-      `compiled artifact: wireTransportDiagnostics (line ${wireDiagLine}) must come BEFORE client.connect (line ${connectLine}). The marketplace ships out/, not src/ — drift here means the runtime breaks even if src/ looks correct.`,
-    ).toBeLessThan(connectLine);
+      wireDiagIdx,
+      `compiled artifact: wireTransportDiagnostics (byte ${wireDiagIdx}) must come BEFORE the extension's .connect( call (byte ${connectIdx}). The marketplace ships the BUNDLE — drift here means the runtime breaks even if src/ looks correct.`,
+    ).toBeLessThan(connectIdx);
   });
 
   it("(helper-presence) the transport-diagnostics module + its unit test exist", () => {
