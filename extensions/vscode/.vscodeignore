@@ -1,46 +1,55 @@
 # bot-relay-mcp Tether VSCode extension — packaging exclusions.
 #
-# v2.6.3 publish-prep: trims the v0.1.0 VSIX from 4.38 MB / 3500 files
-# down to a marketplace-respectful size. Without this file vsce ships
-# every byte under the extension dir including dev-only dot-dirs inside
-# node_modules (.github FUNDING.yml, test/, source maps, declaration
-# files we don't need at runtime, the internal PUBLISH.md doc, etc).
+# v0.1.4 esbuild bundling: pre-bundle this file excluded node_modules/**
+# selectively (maps, test fixtures, .github metadata, etc). Now that
+# esbuild rolls @modelcontextprotocol/sdk into out/extension.js, we can
+# exclude node_modules/** wholesale.
 #
-# Keep this minimal: we are NOT bundling with esbuild for v0.1.0 (that's
-# a v0.2.0 candidate). We DO ship runtime node_modules.
+# What ships in the VSIX:
+#   - out/extension.js                  (bundled CJS, ~MCP SDK inlined)
+#   - out/extension.js.map              (source map for debugging — Q1: YES)
+#   - package.json                      (extension manifest)
+#   - LICENSE, README.md, CHANGELOG.md  (Marketplace surface)
+#
+# What does NOT ship:
+#   - node_modules/**                   (bundled away)
+#   - src/**                            (bundled away; source lives in repo)
+#   - any test files                    (.test.ts at any path)
+#   - bundler/typecheck configs         (esbuild.config.mjs, tsconfig.json)
+#   - prior VSIX artifacts              (*.vsix)
+#   - dev-internal docs                 (PUBLISH.md, marketplace-prep-results.md)
+#   - editor/OS junk                    (.vscode/, .DS_Store, etc)
+#
+# NOTE: we deliberately do NOT add a blanket `**/*.map` exclusion. That
+# was correct pre-bundling (when node_modules shipped) because every
+# transitive dep's .map files were ~50% of VSIX bytes. With node_modules
+# excluded wholesale, the only .map left is our intentional
+# out/extension.js.map — which we WANT for debug-friendliness.
+
+# Source + build inputs
+src/**
+tsconfig.json
+esbuild.config.mjs
+.gitignore
+
+# Bundled-away — no runtime need
+node_modules/**
+
+# esbuild metafile — test-only ground truth, never read by the runtime
+# extension. Keeps ~155 KB out of the VSIX without losing the bundle
+# correctness drift guard (the metafile is read from disk in
+# src/v0-1-4-bundle.test.ts, which runs from out/ inside the source
+# repo, not from the VSIX).
+out/extension.meta.json
+
+# Tests + test config (vitest)
+**/*.test.ts
+**/*.test.js
+vitest.config.*
 
 # Internal docs (developer-facing only — not for marketplace)
 PUBLISH.md
 marketplace-prep-results.md
-
-# Build inputs / dev configs (we only ship out/*.js — TS source is in the repo, not the VSIX)
-src/**
-tsconfig.json
-.gitignore
-
-# Source maps + declaration files inside node_modules (~50% of the bytes;
-# runtime doesn't need them, only dev tooling does)
-**/*.map
-node_modules/**/*.d.ts
-node_modules/**/*.d.ts.map
-
-# Test fixtures + spec files inside node_modules (we don't run tests at runtime)
-node_modules/**/test/**
-node_modules/**/tests/**
-node_modules/**/__tests__/**
-node_modules/**/*.test.js
-node_modules/**/*.spec.js
-
-# GitHub repo metadata + funding files inside node_modules — not user-facing
-node_modules/**/.github/**
-node_modules/**/.gitignore
-node_modules/**/.npmignore
-node_modules/**/.eslintrc*
-node_modules/**/.prettierrc*
-
-# Internal CHANGELOGs of node_modules (we have our own CHANGELOG.md at the root)
-node_modules/**/CHANGELOG.md
-node_modules/**/CHANGELOG
 
 # Don't ship the package output itself if a prior `vsce package` left one behind
 *.vsix
@@ -50,5 +59,5 @@ node_modules/**/CHANGELOG
 .DS_Store
 **/.DS_Store
 
-# Vitest config (test-only, not runtime)
-vitest.config.*
+# Package-lock — npm install side info, not extension runtime
+package-lock.json
