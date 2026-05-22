@@ -605,4 +605,195 @@ describe("v0.1.4 — bundle correctness", () => {
       }
     }
   });
+
+  // ---- v0.2.0 R1 — closes codex audit P2 (msg 2e206b58) ----
+  //
+  // The brief + v0.2.0 CHANGELOG promise `Tether: Set Agent Token
+  // (SecretStorage)` supports per-agent tokens for the executor
+  // flow. R0 only wrote the singleton SECRET_KEY_AGENT_TOKEN
+  // ("botRelay.agentToken"), which the executor's
+  // resolveAgentSecretKey path (config.ts) does not consume — so
+  // operator-set tokens disappeared into a non-consumer key.
+  //
+  // B10a + B10b exercise the SHIPPED bundle's setToken command
+  // through Module._load with a structured vscode mock + a tracked
+  // secrets.store call log. Per
+  // `feedback_test_asserts_contract_not_proxy.md`: the assertion is
+  // EXACT key + EXACT value, not "contains" or substring.
+
+  function makeSetTokenMock(inputBoxAnswers: string[]): {
+    vscodeMock: unknown;
+    mockContext: unknown;
+    secretsStoreCalls: { key: string; value: string }[];
+    secretsDeleteCalls: { key: string }[];
+    registeredCommands: Record<string, (...args: unknown[]) => unknown>;
+    infoMessages: string[];
+  } {
+    const secretsStoreCalls: { key: string; value: string }[] = [];
+    const secretsDeleteCalls: { key: string }[] = [];
+    const registeredCommands: Record<string, (...args: unknown[]) => unknown> = {};
+    const infoMessages: string[] = [];
+    let inputIdx = 0;
+    const vscodeMock = {
+      StatusBarAlignment: { Left: 1, Right: 2 },
+      ViewColumn: { Beside: -2, Active: -1, One: 1 },
+      window: {
+        createOutputChannel: () => ({
+          appendLine: () => {},
+          append: () => {},
+          show: () => {},
+          hide: () => {},
+          dispose: () => {},
+          replace: () => {},
+          clear: () => {},
+        }),
+        createStatusBarItem: () => ({
+          text: "",
+          show: () => {},
+          hide: () => {},
+          dispose: () => {},
+        }),
+        showInformationMessage: (msg: string) => {
+          infoMessages.push(msg);
+          return Promise.resolve(undefined);
+        },
+        showWarningMessage: () => Promise.resolve(undefined),
+        showErrorMessage: () => Promise.resolve(undefined),
+        showInputBox: (_opts?: unknown) => {
+          const v = inputBoxAnswers[inputIdx++];
+          return Promise.resolve(v);
+        },
+        createTerminal: () => ({
+          show: () => {},
+          sendText: () => {},
+          dispose: () => {},
+          exitStatus: undefined,
+        }),
+        onDidCloseTerminal: () => ({ dispose: () => {} }),
+        terminals: [],
+        activeTerminal: undefined,
+        createWebviewPanel: () => ({
+          webview: { html: "" },
+          dispose: () => {},
+          reveal: () => {},
+          onDidDispose: () => ({ dispose: () => {} }),
+        }),
+      },
+      commands: {
+        registerCommand: (name: string, fn: (...args: unknown[]) => unknown) => {
+          registeredCommands[name] = fn;
+          return { dispose: () => {} };
+        },
+      },
+      workspace: {
+        getConfiguration: () => ({
+          get: () => undefined,
+          update: () => Promise.resolve(),
+          has: () => false,
+          inspect: () => undefined,
+        }),
+        onDidChangeConfiguration: () => ({ dispose: () => {} }),
+      },
+      Uri: { parse: (s: string) => ({ toString: () => s }) },
+      env: { uriScheme: "vscode" },
+      version: "1.85.0",
+    };
+    const mockContext = {
+      subscriptions: [] as unknown[],
+      secrets: {
+        get: () => Promise.resolve(undefined),
+        store: (key: string, value: string) => {
+          secretsStoreCalls.push({ key, value });
+          return Promise.resolve();
+        },
+        delete: (key: string) => {
+          secretsDeleteCalls.push({ key });
+          return Promise.resolve();
+        },
+        onDidChange: () => ({ dispose: () => {} }),
+      },
+      globalState: {
+        get: () => undefined,
+        update: () => Promise.resolve(),
+        keys: () => [],
+        setKeysForSync: () => {},
+      },
+      workspaceState: {
+        get: () => undefined,
+        update: () => Promise.resolve(),
+        keys: () => [],
+      },
+      extensionPath: path.resolve(__dirname, ".."),
+      extensionUri: { toString: () => "file://test" },
+      environmentVariableCollection: {},
+      storageUri: undefined,
+      globalStorageUri: { toString: () => "file://test-global" },
+      logUri: { toString: () => "file://test-log" },
+      asAbsolutePath: (p: string) => p,
+      extensionMode: 1,
+    };
+    return {
+      vscodeMock,
+      mockContext,
+      secretsStoreCalls,
+      secretsDeleteCalls,
+      registeredCommands,
+      infoMessages,
+    };
+  }
+
+  it("(B10a) bundled botRelayTether.setToken with NAMED agent writes per-agent key", async () => {
+    // inputBox answers (in order): name="victra-build", token="tok-abc-123"
+    const { vscodeMock, mockContext, secretsStoreCalls, registeredCommands, infoMessages } =
+      makeSetTokenMock(["victra-build", "tok-abc-123"]);
+    const savedRelayAgentName = process.env.RELAY_AGENT_NAME;
+    delete process.env.RELAY_AGENT_NAME;
+    const { loaded, restore } = await loadBundleWithMockedVscode(vscodeMock);
+    try {
+      const activate = loaded.activate as (ctx: unknown) => Promise<void>;
+      await activate(mockContext);
+      const setTokenHandler = registeredCommands["botRelayTether.setToken"];
+      expect(typeof setTokenHandler, "setToken command not registered").toBe("function");
+      await setTokenHandler!();
+      expect(
+        secretsStoreCalls,
+        "setToken with named agent must write per-agent key",
+      ).toEqual([
+        { key: "botRelayTether.token.victra-build", value: "tok-abc-123" },
+      ]);
+      // Toast confirms WHICH path ran — operator-visible.
+      expect(infoMessages.some((m) => /agent "victra-build"/.test(m))).toBe(true);
+    } finally {
+      restore();
+      if (savedRelayAgentName !== undefined) {
+        process.env.RELAY_AGENT_NAME = savedRelayAgentName;
+      }
+    }
+  });
+
+  it("(B10b) bundled botRelayTether.setToken with EMPTY agent name writes legacy singleton", async () => {
+    // inputBox answers (in order): name="" (empty → singleton path), token="leg-singleton-token"
+    const { vscodeMock, mockContext, secretsStoreCalls, registeredCommands, infoMessages } =
+      makeSetTokenMock(["", "leg-singleton-token"]);
+    const savedRelayAgentName = process.env.RELAY_AGENT_NAME;
+    delete process.env.RELAY_AGENT_NAME;
+    const { loaded, restore } = await loadBundleWithMockedVscode(vscodeMock);
+    try {
+      const activate = loaded.activate as (ctx: unknown) => Promise<void>;
+      await activate(mockContext);
+      const setTokenHandler = registeredCommands["botRelayTether.setToken"];
+      await setTokenHandler!();
+      // Singleton key is SECRET_KEY_AGENT_TOKEN = "botRelay.agentToken"
+      // (v0.1.x observer backward-compat constant at extension.ts:69).
+      expect(secretsStoreCalls).toEqual([
+        { key: "botRelay.agentToken", value: "leg-singleton-token" },
+      ]);
+      expect(infoMessages.some((m) => /observer-mode singleton/.test(m))).toBe(true);
+    } finally {
+      restore();
+      if (savedRelayAgentName !== undefined) {
+        process.env.RELAY_AGENT_NAME = savedRelayAgentName;
+      }
+    }
+  });
 });

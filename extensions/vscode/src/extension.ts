@@ -874,29 +874,85 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // `ignoreFocusOut: true` keeps the box open while the operator
     // pastes (some terminals lose focus mid-paste). Empty input clears
     // the stored secret.
+    // v0.2.0 R1 (codex audit msg 2e206b58, P2) — the brief at
+    // audit-findings/v0.2-tether-executor-scope-brief.md:93 and the
+    // v0.2.0 CHANGELOG entry both promise this command supports
+    // per-agent tokens for the executor flow. R0 still wrote only
+    // the singleton SECRET_KEY_AGENT_TOKEN, which the executor path
+    // (resolveAgentSecretKey at config.ts:160) does not consume.
+    //
+    // R1 contract:
+    //   - Prompt for an OPTIONAL agent name first.
+    //   - Non-empty name (must match AGENT_NAME_RE) → write/clear at
+    //     resolveAgentSecretKey(name) — the per-agent executor key.
+    //   - Empty name → write/clear at SECRET_KEY_AGENT_TOKEN
+    //     (singleton; preserved for v0.1.x observer backward compat).
+    //   - Toast text confirms WHICH path ran so the operator can
+    //     verify their fresh token is wired to the right consumer.
     vscode.commands.registerCommand(SET_TOKEN_COMMAND, async () => {
-      const input = await vscode.window.showInputBox({
-        title: "Tether: Set Agent Token",
+      const agentName = await vscode.window.showInputBox({
+        title: "Tether: Set Agent Token — agent name (optional)",
+        prompt:
+          "Agent name to scope the token to. Leave EMPTY to set the legacy v0.1.x observer-mode singleton token. For the executor (Tether: Spawn Agent), enter the agent name (e.g. victra-build).",
+        ignoreFocusOut: true,
+        validateInput: (v) => {
+          const t = v.trim();
+          if (t.length === 0) return null; // empty → singleton path
+          if (!AGENT_NAME_RE.test(t)) return "allowed: A-Z a-z 0-9 _ . - (1-64 chars), or leave empty";
+          return null;
+        },
+      });
+      if (agentName === undefined) return; // operator cancelled
+      const namedAgent = agentName.trim();
+      const tokenInput = await vscode.window.showInputBox({
+        title: namedAgent.length > 0
+          ? `Tether: Set Agent Token — token for "${namedAgent}"`
+          : "Tether: Set Agent Token — observer-mode singleton",
         prompt:
           "Paste your bot-relay agent token. Stored in VSCode SecretStorage (OS keychain) — never written to settings.json. Submit empty to clear.",
         password: true,
         ignoreFocusOut: true,
       });
-      if (input === undefined) return; // user dismissed
-      const trimmed = input.trim();
+      if (tokenInput === undefined) return; // operator cancelled
+      const trimmed = tokenInput.trim();
+      // Resolve the target key BEFORE any side effect so a malformed
+      // name name surfaces a clean error (resolveAgentSecretKey
+      // throws on validation failure even though validateInput
+      // above should have caught it — defense-in-depth).
+      let storageKey: string;
+      let scopeLabel: string;
+      if (namedAgent.length > 0) {
+        try {
+          storageKey = resolveAgentSecretKey(namedAgent);
+          scopeLabel = `agent "${namedAgent}"`;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          void vscode.window.showErrorMessage(`Tether: ${msg}`);
+          return;
+        }
+      } else {
+        storageKey = SECRET_KEY_AGENT_TOKEN;
+        scopeLabel = "observer-mode singleton (v0.1.x backward compat)";
+      }
       try {
         if (trimmed.length === 0) {
-          await context.secrets.delete(SECRET_KEY_AGENT_TOKEN);
-          void vscode.window.showInformationMessage("Tether: Agent token cleared from SecretStorage.");
+          await context.secrets.delete(storageKey);
+          void vscode.window.showInformationMessage(
+            `Tether: Token cleared for ${scopeLabel}.`,
+          );
         } else {
-          await context.secrets.store(SECRET_KEY_AGENT_TOKEN, trimmed);
-          void vscode.window.showInformationMessage("Tether: Agent token stored in SecretStorage.");
+          await context.secrets.store(storageKey, trimmed);
+          void vscode.window.showInformationMessage(
+            `Tether: Token stored for ${scopeLabel}.`,
+          );
         }
         await connect(await readConfig(context));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        log(`SET_TOKEN failed: ${msg}`);
-        void vscode.window.showErrorMessage(`Tether: failed to update agent token — ${msg}`);
+        log(`SET_TOKEN failed (scope=${scopeLabel}): ${msg}`);
+        void vscode.window.showErrorMessage(
+          `Tether: failed to update token for ${scopeLabel} — ${msg}`,
+        );
       }
     }),
   );

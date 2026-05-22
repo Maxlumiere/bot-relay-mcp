@@ -24,6 +24,13 @@ Per the v0.2 brief and `memory/feedback_relay_caps_immutable.md`: declare *every
 
 Each agent gets its own SecretStorage entry at `botRelayTether.token.<agentName>`. Legacy v0.1.3 singleton (`botRelay.agentToken`) stays read-only for backward compatibility — set fresh tokens via `Tether: Set Agent Token (SecretStorage)` or the in-line prompt during `Tether: Spawn Agent`.
 
+`Tether: Set Agent Token (SecretStorage)` (extended in v0.2.0 R1, closing codex audit P2 on PR #38) prompts for an agent name first:
+
+- Non-empty name (must match `[A-Za-z0-9_.-]{1,64}`) → stores/clears at `botRelayTether.token.<name>` (the per-agent executor key — same key the spawn flow + `resolvePerAgentToken` consumes).
+- Empty name → stores/clears at the legacy `botRelay.agentToken` singleton (v0.1.x observer-mode backward compat).
+
+The post-store toast text confirms which path ran (`Token stored for agent "<name>"` vs `Token stored for observer-mode singleton (v0.1.x backward compat)`) so the operator can verify their fresh token reached the right consumer.
+
 Token-resolution precedence (per agent):
 1. Per-agent SecretStorage value (`botRelayTether.token.<name>`)
 2. Per-agent env var (`RELAY_AGENT_TOKEN_<NAME_UPPER>`, with hyphens + dots normalized to underscores)
