@@ -138,11 +138,15 @@ describe("v0.1.4 — bundle correctness", () => {
     const srcInputs = Object.keys(meta.inputs).filter((p) =>
       p.startsWith("src/") && p.endsWith(".ts") && !p.endsWith(".test.ts"),
     );
-    // src/extension.ts entrypoint + config + format + transport-diagnostics
+    // v0.2 additions: agent-manager.ts + restart-policy.ts joined the
+    // bundle when AgentManager wired into extension.ts. v0.1.4 baseline
+    // (extension + config + format + transport-diagnostics) preserved.
     expect(srcInputs.sort()).toEqual([
+      "src/agent-manager.ts",
       "src/config.ts",
       "src/extension.ts",
       "src/format.ts",
+      "src/restart-policy.ts",
       "src/transport-diagnostics.ts",
     ]);
   });
@@ -293,6 +297,20 @@ describe("v0.1.4 — bundle correctness", () => {
         showWarningMessage: () => Promise.resolve(undefined),
         showErrorMessage: () => Promise.resolve(undefined),
         showInputBox: () => Promise.resolve(undefined),
+        // v0.2 — AgentManager wiring needs terminal API surface even
+        // on the idle path (the manager is constructed at activate
+        // time and registers an onDidCloseTerminal listener).
+        createTerminal: (_opts: unknown) => ({
+          show: () => {},
+          sendText: () => {},
+          dispose: () => {},
+          exitStatus: undefined,
+        }),
+        onDidCloseTerminal: (_cb: (...args: unknown[]) => unknown) => ({
+          dispose: () => {},
+        }),
+        terminals: [],
+        activeTerminal: undefined,
         createWebviewPanel: () => ({
           webview: { html: "" },
           dispose: () => {},
@@ -414,6 +432,172 @@ describe("v0.1.4 — bundle correctness", () => {
       expect(registeredCommands).toContain("botRelayTether.openInbox");
       expect(registeredCommands).toContain("botRelayTether.reconnect");
       expect(registeredCommands).toContain("botRelayTether.setToken");
+      // v0.2 — three new executor commands must also be registered
+      // by activate(). Drift here means a future refactor accidentally
+      // unbound an executor command from the manifest.
+      expect(registeredCommands).toContain("botRelayTether.spawnAgent");
+      expect(registeredCommands).toContain("botRelayTether.killAgent");
+      expect(registeredCommands).toContain("botRelayTether.restartAgent");
+    } finally {
+      restore();
+      if (savedRelayAgentName !== undefined) {
+        process.env.RELAY_AGENT_NAME = savedRelayAgentName;
+      }
+    }
+  });
+
+  // (B9) — v0.2 end-to-end spawn flow through the SHIPPED bundle.
+  // Exercises: activate → bundled Tether: Spawn Agent command →
+  // vscode.window.createTerminal called with the right name + env.
+  // Asserts the env contract end-to-end (RELAY_AGENT_NAME / ROLE /
+  // CAPABILITIES propagation) on the actual bundle, not just on the
+  // unit-test surface in agent-manager.test.ts.
+  it("(B9) bundled Tether: Spawn Agent command creates a terminal with the correct env", async () => {
+    interface CreatedTerminal {
+      options: { name: string; env?: Record<string, string>; cwd?: string };
+      shown: number;
+      sentText: { text: string; addNewLine?: boolean }[];
+    }
+    const terminals: CreatedTerminal[] = [];
+    const registeredCommands: Record<string, (...args: unknown[]) => unknown> = {};
+    const inputs: string[] = [];
+
+    // Queue of values to return from showInputBox in order:
+    // 1) agent name, 2) role, 3) caps, 4) token (empty → no token storage).
+    const inputBoxAnswers = ["b9-agent-1", "builder", "build,test,deploy", ""];
+    let inputBoxIdx = 0;
+
+    const vscodeMock = {
+      StatusBarAlignment: { Left: 1, Right: 2 },
+      ViewColumn: { Beside: -2, Active: -1, One: 1 },
+      window: {
+        createOutputChannel: (_name: string) => ({
+          name: _name,
+          appendLine: () => {},
+          append: () => {},
+          show: () => {},
+          hide: () => {},
+          dispose: () => {},
+          replace: () => {},
+          clear: () => {},
+        }),
+        createStatusBarItem: () => ({
+          text: "",
+          show: () => {},
+          hide: () => {},
+          dispose: () => {},
+        }),
+        showInformationMessage: () => Promise.resolve(undefined),
+        showWarningMessage: () => Promise.resolve(undefined),
+        showErrorMessage: () => Promise.resolve(undefined),
+        showInputBox: (_opts?: unknown) => {
+          const val = inputBoxAnswers[inputBoxIdx++];
+          inputs.push(val ?? "<undefined>");
+          return Promise.resolve(val);
+        },
+        createTerminal: (opts: { name: string; env?: Record<string, string>; cwd?: string }) => {
+          const t: CreatedTerminal = { options: opts, shown: 0, sentText: [] };
+          terminals.push(t);
+          return {
+            show: () => { t.shown += 1; },
+            sendText: (text: string, addNewLine?: boolean) => {
+              t.sentText.push({ text, addNewLine });
+            },
+            dispose: () => {},
+            exitStatus: undefined,
+          };
+        },
+        onDidCloseTerminal: () => ({ dispose: () => {} }),
+        terminals: [],
+        activeTerminal: undefined,
+        createWebviewPanel: () => ({
+          webview: { html: "" },
+          dispose: () => {},
+          reveal: () => {},
+          onDidDispose: () => ({ dispose: () => {} }),
+        }),
+      },
+      commands: {
+        registerCommand: (name: string, fn: (...args: unknown[]) => unknown) => {
+          registeredCommands[name] = fn;
+          return { dispose: () => {} };
+        },
+      },
+      workspace: {
+        getConfiguration: () => ({
+          get: () => undefined,
+          update: () => Promise.resolve(),
+          has: () => false,
+          inspect: () => undefined,
+        }),
+        onDidChangeConfiguration: () => ({ dispose: () => {} }),
+      },
+      Uri: { parse: (s: string) => ({ toString: () => s }) },
+      env: { uriScheme: "vscode" },
+      version: "1.85.0",
+    };
+
+    const mockContext = {
+      subscriptions: [] as unknown[],
+      secrets: {
+        get: () => Promise.resolve(undefined),
+        store: () => Promise.resolve(),
+        delete: () => Promise.resolve(),
+        onDidChange: () => ({ dispose: () => {} }),
+      },
+      globalState: {
+        get: () => undefined,
+        update: () => Promise.resolve(),
+        keys: () => [],
+        setKeysForSync: () => {},
+      },
+      workspaceState: {
+        get: () => undefined,
+        update: () => Promise.resolve(),
+        keys: () => [],
+      },
+      extensionPath: path.resolve(__dirname, ".."),
+      extensionUri: { toString: () => "file://test" },
+      environmentVariableCollection: {},
+      storageUri: undefined,
+      globalStorageUri: { toString: () => "file://test-global" },
+      logUri: { toString: () => "file://test-log" },
+      asAbsolutePath: (p: string) => p,
+      extensionMode: 1,
+    };
+
+    const savedRelayAgentName = process.env.RELAY_AGENT_NAME;
+    delete process.env.RELAY_AGENT_NAME;
+    const { loaded, restore } = await loadBundleWithMockedVscode(vscodeMock);
+    try {
+      const activate = loaded.activate as (ctx: unknown) => Promise<void>;
+      await activate(mockContext);
+
+      // The spawn command must be in the registry.
+      const spawnHandler = registeredCommands["botRelayTether.spawnAgent"];
+      expect(typeof spawnHandler, "spawnAgent command not registered").toBe("function");
+
+      // Fire it; the mocked showInputBox returns our queue, the
+      // spawn flow validates + calls createTerminal.
+      await spawnHandler!();
+
+      expect(
+        terminals.length,
+        "createTerminal must be called exactly once during spawn",
+      ).toBe(1);
+      const created = terminals[0]!;
+      expect(created.options.name).toBe("Tether: b9-agent-1");
+      // CONTRACT ASSERTION (per
+      // `feedback_test_asserts_contract_not_proxy.md`): the env that
+      // VSCode actually passed to the spawned shell. Drift here would
+      // re-open the "agent boots without RELAY_AGENT_NAME" failure
+      // mode v2.7.2 closed for spawn-agent.sh.
+      expect(created.options.env?.RELAY_AGENT_NAME).toBe("b9-agent-1");
+      expect(created.options.env?.RELAY_AGENT_ROLE).toBe("builder");
+      expect(created.options.env?.RELAY_AGENT_CAPABILITIES).toBe("build,test,deploy");
+      // Bundled prompt typed into the terminal — claude is the default.
+      expect(created.sentText).toEqual([{ text: "claude", addNewLine: true }]);
+      expect(created.shown).toBeGreaterThanOrEqual(1);
     } finally {
       restore();
       if (savedRelayAgentName !== undefined) {

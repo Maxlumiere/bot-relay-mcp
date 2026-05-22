@@ -28,14 +28,35 @@ import {
   formatStatusBar,
   formatToast,
   statusBarSeverity,
+  formatExecutorStatusBar,
   type InboxSnapshot,
 } from "./format.js";
-import { resolveTetherConfig, decideMigrationAction, type TetherConfig } from "./config.js";
+import {
+  resolveTetherConfig,
+  decideMigrationAction,
+  resolveAgentSecretKey,
+  resolvePerAgentToken,
+  AGENT_NAME_RE,
+  type TetherConfig,
+} from "./config.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
+import {
+  AgentManager,
+  realScheduler,
+  type AgentSnapshot,
+  type AgentSpec,
+  type ManagedTerminal,
+  type ManagedTerminalOptions,
+  type TerminalApi,
+} from "./agent-manager.js";
+import { RestartPolicy } from "./restart-policy.js";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
 const STATUS_COMMAND = "botRelayTether.openInbox";
 const SET_TOKEN_COMMAND = "botRelayTether.setToken";
+const SPAWN_AGENT_COMMAND = "botRelayTether.spawnAgent";
+const KILL_AGENT_COMMAND = "botRelayTether.killAgent";
+const RESTART_AGENT_COMMAND = "botRelayTether.restartAgent";
 const EXTENSION_ID = "lumiere-ventures.bot-relay-tether";
 
 /**
@@ -261,6 +282,16 @@ let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
 
 /**
+ * v0.2 — single-agent executor. Null when no agent has been spawned
+ * via `Tether: Spawn Agent` yet; the extension is in observer-only
+ * mode (v0.1.3 behavior) and the status bar follows the inbox
+ * snapshot. Once spawned, the status bar switches to executor mode
+ * (`Tether: <name> | N pending | <status>`).
+ */
+let agentManager: AgentManager | undefined;
+let lastAgentSnapshot: AgentSnapshot | undefined;
+
+/**
  * v0.1.1 — sticky error state for the active connection. Flipped by
  * `setErrorState` (called from the transport-diagnostics helper's
  * `setError` sink) when the SSE GET stream fails or the transport
@@ -324,6 +355,15 @@ async function refreshSnapshot(client: Client, agentName: string): Promise<Inbox
 function applySnapshot(snapshot: InboxSnapshot): void {
   lastSnapshot = snapshot;
   if (!statusBarItem) return;
+  // v0.2 — executor-mode status bar wins when an agent is actively
+  // managed by AgentManager. The brief defines the operator-facing
+  // text precisely as `Tether: <name> | <pending> pending | <status>`,
+  // so we route through formatExecutorStatusBar and ignore the
+  // inbox-only formatter.
+  if (lastAgentSnapshot?.spec) {
+    renderExecutorStatusBar();
+    return;
+  }
   statusBarItem.text = formatStatusBar(snapshot);
   const sev = statusBarSeverity(snapshot);
   statusBarItem.backgroundColor =
@@ -332,6 +372,49 @@ function applySnapshot(snapshot: InboxSnapshot): void {
       : sev === "warn"
         ? new vscode.ThemeColor("statusBarItem.warningBackground")
         : undefined;
+  statusBarItem.show();
+}
+
+/**
+ * v0.2 — render the executor-mode status bar. Called from both the
+ * AgentManager onDidChange listener AND from applySnapshot when an
+ * agent is managed so the pending count stays in sync with whichever
+ * source ticks first.
+ *
+ * Pending count is taken from the inbox snapshot ONLY when the
+ * snapshot is for the managed agent. A snapshot for a different
+ * agent (e.g. a stale v0.1.3-mode snapshot from before
+ * Spawn Agent was run) doesn't get rolled into the executor display.
+ */
+function renderExecutorStatusBar(): void {
+  if (!statusBarItem) return;
+  const spec = lastAgentSnapshot?.spec;
+  if (!spec) return;
+  const pending =
+    lastSnapshot && lastSnapshot.agent_name === spec.name
+      ? lastSnapshot.pending_count
+      : 0;
+  statusBarItem.text = formatExecutorStatusBar({
+    agentName: spec.name,
+    pendingCount: pending,
+    status: lastAgentSnapshot!.status,
+  });
+  // Theme color follows the lifecycle status: error → red,
+  // restarting/crashed → yellow, connecting/connected → no override.
+  if (lastAgentSnapshot!.status === "error") {
+    statusBarItem.backgroundColor = new vscode.ThemeColor(
+      "statusBarItem.errorBackground",
+    );
+  } else if (
+    lastAgentSnapshot!.status === "restarting" ||
+    lastAgentSnapshot!.status === "crashed"
+  ) {
+    statusBarItem.backgroundColor = new vscode.ThemeColor(
+      "statusBarItem.warningBackground",
+    );
+  } else {
+    statusBarItem.backgroundColor = undefined;
+  }
   statusBarItem.show();
 }
 
@@ -513,6 +596,185 @@ ${last}
 </body></html>`;
 }
 
+/**
+ * v0.2 — adapter from vscode.window's terminal API to the
+ * AgentManager's `TerminalApi` interface. AgentManager keeps the
+ * vscode import out of its own module so it can be unit-tested
+ * without monkey-patching node's loader.
+ */
+function buildTerminalApi(): TerminalApi {
+  const adapt = (t: vscode.Terminal): ManagedTerminal => ({
+    show: (preserveFocus?: boolean) => t.show(preserveFocus),
+    sendText: (text: string, addNewLine?: boolean) => t.sendText(text, addNewLine),
+    dispose: () => t.dispose(),
+    get exitStatus(): { code: number | undefined } | undefined {
+      return t.exitStatus ? { code: t.exitStatus.code } : undefined;
+    },
+  });
+  // Map vscode.Terminal → ManagedTerminal lazily. We can't just stash
+  // ManagedTerminal in createTerminal because vscode's
+  // `onDidCloseTerminal` hands back a vscode.Terminal, not our
+  // adapted view. So we maintain a small WeakMap to recover the
+  // adapter for the same underlying Terminal.
+  const adapters = new WeakMap<vscode.Terminal, ManagedTerminal>();
+  function ensureAdapter(t: vscode.Terminal): ManagedTerminal {
+    let a = adapters.get(t);
+    if (!a) {
+      a = adapt(t);
+      adapters.set(t, a);
+    }
+    return a;
+  }
+  return {
+    createTerminal(opts: ManagedTerminalOptions): ManagedTerminal {
+      const t = vscode.window.createTerminal({
+        name: opts.name,
+        env: opts.env,
+        cwd: opts.cwd,
+        shellPath: opts.shellPath,
+        shellArgs: opts.shellArgs,
+        hideFromUser: opts.hideFromUser,
+      });
+      const adapter = adapt(t);
+      adapters.set(t, adapter);
+      return adapter;
+    },
+    onDidCloseTerminal(cb) {
+      const sub = vscode.window.onDidCloseTerminal((t) => cb(ensureAdapter(t)));
+      return { dispose: () => sub.dispose() };
+    },
+    showInformationMessage(msg: string) {
+      return vscode.window.showInformationMessage(msg);
+    },
+    showWarningMessage(msg: string) {
+      return vscode.window.showWarningMessage(msg);
+    },
+    showErrorMessage(msg: string) {
+      return vscode.window.showErrorMessage(msg);
+    },
+  };
+}
+
+/**
+ * v0.2 — guided prompt flow for Tether: Spawn Agent. Returns a fully
+ * validated `AgentSpec` plus the resolved token, or null when the
+ * operator cancels.
+ */
+async function promptForAgentSpec(
+  context: vscode.ExtensionContext,
+): Promise<{ spec: AgentSpec; tokenWasStored: boolean } | null> {
+  const name = await vscode.window.showInputBox({
+    title: "Tether: Spawn Agent — agent name",
+    prompt:
+      "Name the agent (used for RELAY_AGENT_NAME). Must match [A-Za-z0-9_.-]{1,64}.",
+    validateInput: (v) => {
+      const t = v.trim();
+      if (t.length === 0) return "name required";
+      if (!AGENT_NAME_RE.test(t)) return "allowed: A-Z a-z 0-9 _ . - (1-64 chars)";
+      return null;
+    },
+    ignoreFocusOut: true,
+  });
+  if (!name) return null;
+  const role = await vscode.window.showInputBox({
+    title: "Tether: Spawn Agent — role",
+    prompt: "Role (e.g. builder, researcher, reviewer).",
+    value: "builder",
+    validateInput: (v) => {
+      const t = v.trim();
+      if (t.length === 0) return "role required";
+      if (!AGENT_NAME_RE.test(t)) return "allowed: A-Z a-z 0-9 _ . - (1-64 chars)";
+      return null;
+    },
+    ignoreFocusOut: true,
+  });
+  if (!role) return null;
+  const capsStr = await vscode.window.showInputBox({
+    title: "Tether: Spawn Agent — capabilities",
+    prompt:
+      "Comma-separated capabilities (caps are LOCKED at first register — declare every cap the agent might ever need).",
+    value: "build,test",
+    validateInput: (v) => {
+      const tokens = v
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      if (tokens.length === 0) return "at least one capability required";
+      for (const t of tokens) {
+        if (!AGENT_NAME_RE.test(t)) return `invalid capability "${t}"`;
+      }
+      return null;
+    },
+    ignoreFocusOut: true,
+  });
+  if (capsStr === undefined) return null;
+  const capabilities = capsStr
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  // Token — read per-agent SecretStorage first; if empty, prompt.
+  // Operator can submit empty input to spawn token-less (SessionStart
+  // hook will mint one via register_agent + vault). Operator can also
+  // paste a fresh token to overwrite the stored value.
+  let token: string | undefined;
+  let tokenWasStored = false;
+  let secretsReachable = true;
+  try {
+    token = await context.secrets.get(resolveAgentSecretKey(name.trim()));
+  } catch (err) {
+    log(
+      `SecretStorage unreachable while reading per-agent token for "${name}": ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    secretsReachable = false;
+  }
+  if (!token || token.length === 0) {
+    const env = process.env as Record<string, string | undefined>;
+    const fallback = resolvePerAgentToken(name.trim(), undefined, env, undefined, secretsReachable);
+    if (fallback.length > 0) {
+      token = fallback;
+    } else {
+      const input = await vscode.window.showInputBox({
+        title: `Tether: Spawn Agent — token for "${name.trim()}"`,
+        prompt:
+          "Paste agent token (stored in SecretStorage). Leave empty to let the relay mint one via SessionStart hook.",
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (input === undefined) return null; // operator cancelled
+      const trimmed = input.trim();
+      if (trimmed.length > 0) {
+        if (secretsReachable) {
+          try {
+            await context.secrets.store(resolveAgentSecretKey(name.trim()), trimmed);
+            tokenWasStored = true;
+          } catch (err) {
+            log(
+              `SecretStorage store failed for "${name}": ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+            // Fall through with token in memory only.
+          }
+        }
+        token = trimmed;
+      }
+    }
+  }
+
+  return {
+    spec: {
+      name: name.trim(),
+      role: role.trim(),
+      capabilities,
+      token: token && token.length > 0 ? token : undefined,
+    },
+    tokenWasStored,
+  };
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   outputChannel = vscode.window.createOutputChannel(CHANNEL_NAME);
   context.subscriptions.push(outputChannel);
@@ -522,6 +784,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBarItem.text = "Tether: starting...";
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
+
+  // v0.2 — AgentManager. Constructed at activation so the
+  // onDidChange listener wires up before any Spawn Agent command
+  // could fire. inheritedEnv passes through the entire process
+  // env so the spawned terminal has PATH, HOME, etc. — the relay's
+  // SessionStart hook + claude CLI both need that surface intact.
+  agentManager = new AgentManager({
+    terminalApi: buildTerminalApi(),
+    restartPolicy: new RestartPolicy(),
+    scheduler: realScheduler(),
+    inheritedEnv: process.env as Record<string, string | undefined>,
+  });
+  context.subscriptions.push({ dispose: () => agentManager?.dispose() });
+  context.subscriptions.push(
+    agentManager.onDidChange((snap) => {
+      lastAgentSnapshot = snap;
+      if (snap.spec) {
+        renderExecutorStatusBar();
+      } else if (lastSnapshot) {
+        // Agent killed → fall back to inbox-only status bar if a
+        // snapshot is available.
+        applySnapshot(lastSnapshot);
+      }
+    }),
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand(STATUS_COMMAND, () => {
@@ -535,6 +822,52 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("botRelayTether.reconnect", async () => {
       await connect(await readConfig(context));
+    }),
+    // v0.2 — single-agent executor commands.
+    vscode.commands.registerCommand(SPAWN_AGENT_COMMAND, async () => {
+      if (!agentManager) return;
+      const existing = agentManager.snapshot();
+      if (existing.spec && existing.status !== "idle" && existing.status !== "error") {
+        const choice = await vscode.window.showWarningMessage(
+          `Tether: an agent named "${existing.spec.name}" is already running (${existing.status}). Spawn a different one (kill the current first)?`,
+          "Kill current + spawn new",
+          "Cancel",
+        );
+        if (choice !== "Kill current + spawn new") return;
+        agentManager.kill();
+      }
+      const result = await promptForAgentSpec(context);
+      if (!result) return;
+      try {
+        agentManager.spawn(result.spec);
+        void vscode.window.showInformationMessage(
+          `Tether: spawned "${result.spec.name}" (role: ${result.spec.role})${
+            result.tokenWasStored ? " — token stored in SecretStorage" : ""
+          }.`,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(`spawn failed: ${msg}`);
+        void vscode.window.showErrorMessage(`Tether: spawn failed — ${msg}`);
+      }
+    }),
+    vscode.commands.registerCommand(KILL_AGENT_COMMAND, () => {
+      if (!agentManager) return;
+      const snap = agentManager.snapshot();
+      if (!snap.spec || snap.status === "idle") {
+        void vscode.window.showInformationMessage(
+          "Tether: no agent to kill.",
+        );
+        return;
+      }
+      agentManager.kill();
+      void vscode.window.showInformationMessage(
+        `Tether: killed "${snap.spec.name}".`,
+      );
+    }),
+    vscode.commands.registerCommand(RESTART_AGENT_COMMAND, () => {
+      if (!agentManager) return;
+      agentManager.restart();
     }),
     // v0.1.3 [HIGH F10] — palette command to set / clear the agent
     // token via SecretStorage. `password: true` masks the input;
