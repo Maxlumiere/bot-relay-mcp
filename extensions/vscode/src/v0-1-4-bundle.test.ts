@@ -147,27 +147,21 @@ describe("v0.1.4 — bundle correctness", () => {
     ]);
   });
 
-  it("(B7) bundle is CJS and exports activate/deactivate when loaded via require()", async () => {
-    const body = fs.readFileSync(BUNDLE, "utf-8");
-    // CJS bundles start with "use strict". Top-level ESM `export` would
-    // surface here as a bundle-config error.
-    expect(body.startsWith('"use strict"')).toBe(true);
-
-    // CONTRACT ASSERTION: the VSCode extension host calls
-    // require("<main>") and expects an object with activate +
-    // deactivate functions. We exercise exactly that load shape by
-    // intercepting Module._resolveFilename + Module._load for "vscode"
-    // and then require()-ing the bundle from disk. Text-grep would be
-    // a proxy (minified output may use Object.defineProperty +
-    // name-keep wrappers that don't emit literal `exports.activate`).
-    //
-    // Why require() instead of vm.runInContext: the MCP SDK pulls in
-    // pkce-challenge which has `import("node:crypto")` for the
-    // Node-vs-browser switch. vm.runInContext with dynamic imports
-    // requires --experimental-vm-modules + a callback flag we can't
-    // count on across Node versions. require() handles dynamic
-    // imports natively because the loaded module's import() is just
-    // Node's own.
+  // Shared helper for B7 + B8: monkey-patches Module._load to mock
+  // `vscode`, busts the require cache for the bundle, returns the
+  // loaded module's exports + a restore() callback the caller MUST
+  // invoke in a finally block.
+  //
+  // Why require() instead of vm.runInContext: the MCP SDK pulls in
+  // pkce-challenge which has `import("node:crypto")` for the Node-vs-
+  // browser switch. vm.runInContext with dynamic imports requires
+  // --experimental-vm-modules + a callback flag we can't count on
+  // across Node versions. require() handles dynamic imports natively
+  // because the loaded module's import() is just Node's own.
+  async function loadBundleWithMockedVscode(vscodeMock: unknown): Promise<{
+    loaded: Record<string, unknown>;
+    restore: () => void;
+  }> {
     const { createRequire } = await import("node:module");
     const Module = (await import("node:module")).default as {
       _resolveFilename: (req: string, parent: unknown) => string;
@@ -175,46 +169,256 @@ describe("v0.1.4 — bundle correctness", () => {
     };
     const origResolve = Module._resolveFilename;
     const origLoad = Module._load;
-    // Minimal vscode mock — activate is not invoked by this test, so
-    // the mock just needs to satisfy any top-level `vscode.X` lookups
-    // that occur during module-eval (there are none in the current
-    // bundle, but a Proxy makes that future-proof).
+    Module._resolveFilename = function patchedResolve(
+      request: string,
+      parent: unknown,
+    ): string {
+      if (request === "vscode") return "vscode";
+      return origResolve.call(this, request, parent);
+    };
+    Module._load = function patchedLoad(
+      request: string,
+      parent: unknown,
+      isMain: boolean,
+    ): unknown {
+      if (request === "vscode") return vscodeMock;
+      return origLoad.call(this, request, parent, isMain);
+    };
+    const reqLocal = createRequire(__filename);
+    const resolved = reqLocal.resolve(BUNDLE);
+    // Bust the require cache so re-runs (watch mode) re-evaluate.
+    delete (reqLocal as unknown as { cache: Record<string, unknown> }).cache?.[resolved];
+    const loaded = reqLocal(BUNDLE) as Record<string, unknown>;
+    return {
+      loaded,
+      restore: () => {
+        Module._resolveFilename = origResolve;
+        Module._load = origLoad;
+      },
+    };
+  }
+
+  it("(B7) bundle is CJS and exports activate/deactivate when loaded via require()", async () => {
+    const body = fs.readFileSync(BUNDLE, "utf-8");
+    // CJS bundles start with "use strict". Top-level ESM `export` would
+    // surface here as a bundle-config error.
+    expect(body.startsWith('"use strict"')).toBe(true);
+
+    // Minimal vscode mock — B7 does not invoke activate, so a Proxy
+    // satisfies any top-level `vscode.X` lookups that occur during
+    // module-eval (there are none in the current bundle, but the
+    // Proxy is future-proof).
     const vscodeMock: unknown = new Proxy(
       {},
       {
-        get: (_t, _k) =>
+        get: () =>
           new Proxy(() => undefined, {
             get: () => undefined,
           }),
       },
     );
+    const { loaded, restore } = await loadBundleWithMockedVscode(vscodeMock);
     try {
-      Module._resolveFilename = function patchedResolve(
-        request: string,
-        parent: unknown,
-      ): string {
-        if (request === "vscode") return "vscode";
-        return origResolve.call(this, request, parent);
-      };
-      Module._load = function patchedLoad(
-        request: string,
-        parent: unknown,
-        isMain: boolean,
-      ): unknown {
-        if (request === "vscode") return vscodeMock;
-        return origLoad.call(this, request, parent, isMain);
-      };
-      // Bust the require cache for the bundle so this test is
-      // re-runnable in watch mode.
-      const reqLocal = createRequire(__filename);
-      const resolved = reqLocal.resolve(BUNDLE);
-      delete (reqLocal as unknown as { cache: Record<string, unknown> }).cache?.[resolved];
-      const loaded = reqLocal(BUNDLE) as { activate?: unknown; deactivate?: unknown };
       expect(typeof loaded.activate, "bundle does not export activate()").toBe("function");
       expect(typeof loaded.deactivate, "bundle does not export deactivate()").toBe("function");
     } finally {
-      Module._resolveFilename = origResolve;
-      Module._load = origLoad;
+      restore();
+    }
+  });
+
+  // (B8) — codex-5-5 R0 P2 finding closure. B7 proves require/export
+  // shape but never CALLS activate, so a bundle that exports an
+  // activate function which throws immediately on call would still
+  // pass B7. B8 actually invokes `await loaded.activate(mockContext)`
+  // with a no-agent config so the activation reaches the idle path
+  // without dialing :3777. Asserts:
+  //   - activate completes without throwing
+  //   - statusBarItem.text mutates to "Tether: idle" (the verified
+  //     observable that connect() took the early-return idle branch
+  //     at src/extension.ts:381-390)
+  //   - mockContext.subscriptions has entries registered (outputChannel,
+  //     statusBarItem, command registrations, config-change listener)
+  // Per codex's preference: automated idle-activation call instead of
+  // "rename B7 honestly + manual smoke" (manual VSCode smoke is
+  // DEFERRED-USER already).
+  it("(B8) bundled activate() reaches the idle path without throwing when no agentName is configured", async () => {
+    // Structured vscode mock — needs to satisfy real activate() shape:
+    //   - window.createOutputChannel returning { appendLine, dispose, ... }
+    //   - window.createStatusBarItem returning a mutable item with
+    //     text/command/backgroundColor/show/hide/dispose
+    //   - commands.registerCommand returning a disposable
+    //   - workspace.onDidChangeConfiguration returning a disposable
+    //   - workspace.getConfiguration("bot-relay.tether").get(key) →
+    //     undefined for everything (so config.agentName resolves "")
+    //   - window.show{Information,Warning,Error}Message → no-op
+    interface MockStatusBarItem {
+      text: string;
+      command?: string;
+      backgroundColor?: unknown;
+      show: () => void;
+      hide: () => void;
+      dispose: () => void;
+    }
+    const statusBars: MockStatusBarItem[] = [];
+    const outputLines: string[] = [];
+    const registeredCommands: string[] = [];
+
+    const vscodeMock = {
+      StatusBarAlignment: { Left: 1, Right: 2 },
+      ViewColumn: { Beside: -2, Active: -1, One: 1 },
+      window: {
+        createOutputChannel: (_name: string) => ({
+          name: _name,
+          appendLine: (s: string) => {
+            outputLines.push(s);
+          },
+          append: (_s: string) => {},
+          show: () => {},
+          hide: () => {},
+          dispose: () => {},
+          replace: () => {},
+          clear: () => {},
+        }),
+        createStatusBarItem: (_align: number, _prio: number) => {
+          const item: MockStatusBarItem = {
+            text: "",
+            show: () => {},
+            hide: () => {},
+            dispose: () => {},
+          };
+          statusBars.push(item);
+          return item;
+        },
+        showInformationMessage: () => Promise.resolve(undefined),
+        showWarningMessage: () => Promise.resolve(undefined),
+        showErrorMessage: () => Promise.resolve(undefined),
+        showInputBox: () => Promise.resolve(undefined),
+        createWebviewPanel: () => ({
+          webview: { html: "" },
+          dispose: () => {},
+          reveal: () => {},
+          onDidDispose: () => ({ dispose: () => {} }),
+        }),
+      },
+      commands: {
+        registerCommand: (name: string, _fn: (...args: unknown[]) => unknown) => {
+          registeredCommands.push(name);
+          return { dispose: () => {} };
+        },
+      },
+      workspace: {
+        getConfiguration: (_section?: string) => ({
+          // Returns undefined for every key — `resolveTetherConfig`
+          // then sees no agentName, no endpoint override, etc., and
+          // `connect()` falls through to the idle early-return.
+          get: (_key: string) => undefined,
+          // Used by the SecretStorage migration when removing the
+          // legacy plaintext field. No legacy here → never invoked
+          // along the happy path, but stubbed for safety.
+          update: () => Promise.resolve(),
+          has: (_key: string) => false,
+          inspect: () => undefined,
+        }),
+        onDidChangeConfiguration: (_fn: (...args: unknown[]) => unknown) => ({
+          dispose: () => {},
+        }),
+      },
+      Uri: { parse: (s: string) => ({ toString: () => s }) },
+      env: { uriScheme: "vscode" },
+      version: "1.85.0",
+    };
+
+    // Minimal ExtensionContext. The activation path touches:
+    //   - subscriptions (push for each disposable)
+    //   - secrets.get/store/delete (token resolution + migration)
+    //   - globalState.get/update (one-shot migration flag + secret-
+    //     storage-unavailable banner flag)
+    // Empty values for everything → activate stays on the idle path.
+    const subscriptions: unknown[] = [];
+    const secretsStore: Record<string, string> = {};
+    const globalStateStore: Record<string, unknown> = {};
+    const mockContext = {
+      subscriptions,
+      secrets: {
+        get: (key: string) => Promise.resolve(secretsStore[key]),
+        store: (key: string, value: string) => {
+          secretsStore[key] = value;
+          return Promise.resolve();
+        },
+        delete: (key: string) => {
+          delete secretsStore[key];
+          return Promise.resolve();
+        },
+        onDidChange: () => ({ dispose: () => {} }),
+      },
+      globalState: {
+        get: <T>(key: string, def?: T): T | undefined =>
+          (globalStateStore[key] as T) ?? def,
+        update: (key: string, value: unknown) => {
+          globalStateStore[key] = value;
+          return Promise.resolve();
+        },
+        keys: () => Object.keys(globalStateStore),
+        setKeysForSync: () => {},
+      },
+      workspaceState: {
+        get: () => undefined,
+        update: () => Promise.resolve(),
+        keys: () => [],
+      },
+      extensionPath: path.resolve(__dirname, ".."),
+      extensionUri: { toString: () => "file://test" },
+      environmentVariableCollection: {},
+      storageUri: undefined,
+      globalStorageUri: { toString: () => "file://test-global" },
+      logUri: { toString: () => "file://test-log" },
+      asAbsolutePath: (p: string) => p,
+      extensionMode: 1,
+    };
+
+    // Ensure no RELAY_AGENT_NAME env leakage from the test runner can
+    // accidentally push activate() off the idle path.
+    const savedRelayAgentName = process.env.RELAY_AGENT_NAME;
+    delete process.env.RELAY_AGENT_NAME;
+
+    const { loaded, restore } = await loadBundleWithMockedVscode(vscodeMock);
+    try {
+      const activate = loaded.activate as (ctx: unknown) => Promise<void>;
+      // Resolution moment: actually call the bundled activate().
+      await activate(mockContext);
+
+      // (B8 invariant 1) — activation completed without throwing.
+      // Implicit: if `await activate(...)` rejected we'd never reach
+      // here. Vitest surfaces the rejection as a failed assertion.
+
+      // (B8 invariant 2) — exactly one status bar item created and
+      // its final text is "Tether: idle" (the verified-observable that
+      // connect() took the no-agent early-return branch at
+      // src/extension.ts:381-390).
+      expect(statusBars.length, "exactly one status bar item must be created").toBe(1);
+      expect(statusBars[0]!.text, "status bar must read 'Tether: idle' after no-agent activation").toBe(
+        "Tether: idle",
+      );
+
+      // (B8 invariant 3) — disposables registered (output channel,
+      // status bar, palette commands, config-change listener). Exact
+      // count is brittle to future activation additions; assert "many"
+      // instead of "exactly N".
+      expect(
+        subscriptions.length,
+        "activation must push disposables onto context.subscriptions",
+      ).toBeGreaterThanOrEqual(3);
+
+      // (B8 invariant 4) — the three v0.1.3 palette commands are
+      // registered: open inbox, reconnect, set token.
+      expect(registeredCommands).toContain("botRelayTether.openInbox");
+      expect(registeredCommands).toContain("botRelayTether.reconnect");
+      expect(registeredCommands).toContain("botRelayTether.setToken");
+    } finally {
+      restore();
+      if (savedRelayAgentName !== undefined) {
+        process.env.RELAY_AGENT_NAME = savedRelayAgentName;
+      }
     }
   });
 });
