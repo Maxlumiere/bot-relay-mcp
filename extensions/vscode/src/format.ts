@@ -65,3 +65,70 @@ export function formatToast(snapshot: InboxSnapshot): string {
   const sender = snapshot.last_message_from ?? "system";
   return `Tether: New message from ${sender} in ${snapshot.agent_name} inbox`;
 }
+
+/**
+ * v0.2 — executor-mode status bar. When Tether is managing an agent
+ * process (Spawn Agent has fired), the status bar shows the managed
+ * agent's name + lifecycle status alongside the pending-mail count.
+ *
+ * Format (locked in v0.2 brief):
+ *   `Tether: <agentName> | <pendingCount> pending | <status>`
+ * where status ∈ {connecting, connected, disconnected, error, restarting}
+ *
+ * Maps the AgentManager's internal status to the brief's terminology:
+ *   idle       → disconnected
+ *   spawning   → connecting
+ *   connected  → connected
+ *   crashed    → restarting   (a crashed status only exists for the
+ *                              single tick between close + schedule;
+ *                              callers should see "restarting" by the
+ *                              time the status bar redraws)
+ *   restarting → restarting
+ *   error      → error
+ *
+ * The mapping is deliberate: the brief's vocabulary is operator-
+ * facing; AgentManager's internal vocabulary distinguishes pre-spawn
+ * idle from disconnected-after-kill, which the status bar doesn't
+ * care about.
+ */
+export type ExecutorStatus =
+  | "connecting"
+  | "connected"
+  | "disconnected"
+  | "restarting"
+  | "error";
+
+export type AgentLifecycleStatus =
+  | "idle"
+  | "spawning"
+  | "connected"
+  | "crashed"
+  | "restarting"
+  | "error";
+
+export function mapExecutorStatus(s: AgentLifecycleStatus): ExecutorStatus {
+  switch (s) {
+    case "idle":
+      return "disconnected";
+    case "spawning":
+      return "connecting";
+    case "connected":
+      return "connected";
+    case "crashed":
+      return "restarting";
+    case "restarting":
+      return "restarting";
+    case "error":
+      return "error";
+  }
+}
+
+export function formatExecutorStatusBar(args: {
+  agentName: string;
+  pendingCount: number;
+  status: AgentLifecycleStatus;
+}): string {
+  const { agentName, pendingCount } = args;
+  const status = mapExecutorStatus(args.status);
+  return `Tether: ${agentName} | ${pendingCount} pending | ${status}`;
+}

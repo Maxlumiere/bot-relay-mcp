@@ -4,6 +4,67 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.2.0] — 2026-05-22 — Single-agent executor: spawn, kill, restart from the palette
+
+Tether becomes an executor: it can now manage a single agent process inside VSCode. v0.1.x was observer-only; v0.2 promotes it to actively spawn, kill, restart, and auto-recover a `claude` (or `codex`) terminal so you can travel without manually babysitting builder terminals.
+
+### Added
+
+- **`Tether: Spawn Agent`** (palette). Prompts for agent name, role, and capabilities; opens a VSCode integrated terminal with `RELAY_AGENT_NAME` / `RELAY_AGENT_ROLE` / `RELAY_AGENT_CAPABILITIES` exported in its env; types `claude` to boot. The terminal's SessionStart hook handles registration + per-instance token-vault hydration end-to-end — zero new relay-side daemon API.
+- **`Tether: Kill Agent`** (palette). Disposes the managed terminal cleanly. Cancels any pending auto-restart timer so nothing zombie-respawns.
+- **`Tether: Restart Agent`** (palette). Kill + respawn with the previously-recorded spec. Resets the backoff curve so a fresh manual restart starts at 1s delay again.
+- **Auto-restart on crash.** When the managed terminal closes without `Tether: Kill Agent` being invoked, the manager treats it as a crash and respawns automatically. Backoff: 1s → 2s → 4s → 8s → 16s, hard-capped at 30s. Hard cap: 5 restarts per agent per rolling hour. After the cap → loud error toast (`agent crash-looping, manual intervention needed`) and the status bar flips to error state.
+- **Executor-mode status bar.** When an agent is managed, the bar reads `Tether: <agentName> | <pendingCount> pending | <status>` where status ∈ `{connecting, connected, disconnected, restarting, error}`. Pending count comes from the inbox snapshot when the snapshot's agent matches the managed agent; otherwise 0. The v0.1.3 observer-mode status bar (`Tether: <count> | last Xm ago`) still renders when no agent is being managed.
+
+### Caps are immutable at first register
+
+Per the v0.2 brief and `memory/feedback_relay_caps_immutable.md`: declare *every* capability the agent might ever need at first spawn. Widening caps later requires `unregister_agent` first (operator-driven; Tether refuses to silently rotate caps under the hood). The spawn prompt explicitly calls this out.
+
+### Per-agent SecretStorage
+
+Each agent gets its own SecretStorage entry at `botRelayTether.token.<agentName>`. Legacy v0.1.3 singleton (`botRelay.agentToken`) stays read-only for backward compatibility — set fresh tokens via `Tether: Set Agent Token (SecretStorage)` or the in-line prompt during `Tether: Spawn Agent`.
+
+`Tether: Set Agent Token (SecretStorage)` (extended in v0.2.0 R1, closing codex audit P2 on PR #38) prompts for an agent name first:
+
+- Non-empty name (must match `[A-Za-z0-9_.-]{1,64}`) → stores/clears at `botRelayTether.token.<name>` (the per-agent executor key — same key the spawn flow + `resolvePerAgentToken` consumes).
+- Empty name → stores/clears at the legacy `botRelay.agentToken` singleton (v0.1.x observer-mode backward compat).
+
+The post-store toast text confirms which path ran (`Token stored for agent "<name>"` vs `Token stored for observer-mode singleton (v0.1.x backward compat)`) so the operator can verify their fresh token reached the right consumer.
+
+Token-resolution precedence (per agent):
+1. Per-agent SecretStorage value (`botRelayTether.token.<name>`)
+2. Per-agent env var (`RELAY_AGENT_TOKEN_<NAME_UPPER>`, with hyphens + dots normalized to underscores)
+3. Singleton env var (`RELAY_AGENT_TOKEN`) — v0.1.3 backward compat
+4. Legacy `settings.json` — ONLY when SecretStorage is reachable (R1 contract from v0.1.3 preserved verbatim)
+
+If SecretStorage is unreachable (Linux without libsecret, transient backend failure), the extension falls back to env-only — the v0.1.3 R1 hardening that refused to re-promote the legacy plaintext leak still applies, per-agent.
+
+### Architecture choices (locked in `audit-findings/v0.2-tether-executor-scope-brief.md`)
+
+- VSCode Terminal API hosts the agent process. No node-pty. Operator can drop into the terminal to debug live.
+- Single-agent only in v0.2. Multi-subscription (parallel management of N agents) deferred to v0.3 per the foundation-first sequencing — ship the executor model first, then layer multi-agent state-machine complexity once the executor is proven.
+
+### Tests
+
+`+59` new extension-local assertions on top of v0.1.4's 44:
+- `src/restart-policy.test.ts` (R1-R16, 16 tests) — backoff curve 1s→2s→4s→8s→16s clamped at 30s, custom configurations, 5/hr rolling-window cap with crash-aging semantics, success-resets-curve-not-history, construction guards.
+- `src/agent-manager.test.ts` (A1-A22, 22 tests) — pure helpers (env build, shell-command allowlist), spawn/kill/restart lifecycle, crash detection + auto-restart with backoff timing via manual scheduler, 6th-crash give-up + error toast, operator-restart resets state, kill-during-pending-restart cancels timer.
+- `src/v0-2-per-agent-config.test.ts` (C1-C16, 16 tests) — per-agent SecretStorage key derivation, env-var name normalization, four-level token precedence + v0.1.3 R1 SecretStorage-unreachable contract.
+- `src/v0-2-status-bar.test.ts` (S1-S5, 5 tests) — exact string match on executor status bar across all five statuses + AgentLifecycleStatus → ExecutorStatus mapping.
+- `src/v0-1-4-bundle.test.ts` (B6 updated, B9 added) — bundle inputs include the new modules; bundled `Tether: Spawn Agent` command creates a terminal with the contract env vars.
+
+### Compatibility
+
+- Marketplace minimum stays at VSCode 1.85 (Node 20 baseline, no change from v0.1.4).
+- Observer-mode (v0.1.3 + v0.1.4 behavior) is preserved for users who don't use the new spawn commands — the extension activates, connects to the inbox, and shows the v0.1.x status bar until you fire `Tether: Spawn Agent`.
+- Per-agent SecretStorage keys are additive. Existing v0.1.3 / v0.1.4 installs continue using `botRelay.agentToken` until the operator spawns a new agent via the palette.
+
+### References
+
+- Brief: `audit-findings/v0.2-tether-executor-scope-brief.md` (committed build plan, dispatched 2026-05-22).
+- Auditor: codex-5-5.
+- Pre-requisites (both shipped): `bot-relay-mcp@2.7.2` (spawn_agent identity recovery), Tether `v0.1.4` (bundling cleanup).
+
 ## [0.1.4] — 2026-05-21 — Bundling cleanup: VSIX from 2.84 MB / 2004 files → 348 KB / 8 files
 
 A mechanical packaging cleanup. No behavior changes — same SecretStorage migration, same R1 hardening, same R2 doc fixes as v0.1.3. The only thing that changed is how the extension ships.

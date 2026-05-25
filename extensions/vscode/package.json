@@ -2,7 +2,7 @@
   "name": "bot-relay-tether",
   "displayName": "Tether for bot-relay-mcp",
   "description": "Local IDE awareness for bot-relay-mcp: subscribes to your agent's inbox over MCP, surfaces pending mail in the status bar, and (optionally) auto-types `inbox` into the integrated terminal so Claude Code wakes up when something arrives.",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "publisher": "lumiere-ventures",
   "engines": {
     "vscode": "^1.85.0"
@@ -72,6 +72,18 @@
       {
         "command": "botRelayTether.setToken",
         "title": "Tether: Set Agent Token (SecretStorage)"
+      },
+      {
+        "command": "botRelayTether.spawnAgent",
+        "title": "Tether: Spawn Agent"
+      },
+      {
+        "command": "botRelayTether.killAgent",
+        "title": "Tether: Kill Agent"
+      },
+      {
+        "command": "botRelayTether.restartAgent",
+        "title": "Tether: Restart Agent"
       }
     ]
   },

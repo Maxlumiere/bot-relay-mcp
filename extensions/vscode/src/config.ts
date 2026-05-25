@@ -147,6 +147,99 @@ export function decideMigrationAction(
   return { action: "migrate", tokenToStore: trimmed };
 }
 
+/**
+ * v0.2 — per-agent SecretStorage key for the executor pattern.
+ * Mirrors `feedback_relay_caps_immutable.md` discipline by keying
+ * tokens by agent name so spawn/kill/restart cycles don't collide.
+ *
+ * Shape: `botRelayTether.token.<name>` where `<name>` matches the
+ * relay's agent-name allowlist (`^[A-Za-z0-9_.-]{1,64}$`, mirrored
+ * from `hooks/_vault-helpers.sh` + `src/token-store.ts`).
+ *
+ * Pre-v0.2 the extension used a singleton key (`botRelay.agentToken`
+ * — see `SECRET_KEY_AGENT_TOKEN` in extension.ts). The singleton
+ * stays for backward compat with v0.1.3 installs: the v0.2
+ * extension migrates the singleton to the per-agent key when the
+ * operator runs `Tether: Spawn Agent` for the first time on the
+ * configured `bot-relay.tether.agentName`.
+ *
+ * Throws on malformed names so the caller can surface a clean
+ * error to the operator instead of writing a token to a key that
+ * the SessionStart hook would refuse to read.
+ */
+export const AGENT_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+export const PER_AGENT_SECRET_KEY_PREFIX = "botRelayTether.token.";
+
+export function resolveAgentSecretKey(agentName: string): string {
+  if (!AGENT_NAME_RE.test(agentName)) {
+    throw new Error(
+      `invalid agent name "${agentName}" for SecretStorage key — must match ${AGENT_NAME_RE.source}`,
+    );
+  }
+  return `${PER_AGENT_SECRET_KEY_PREFIX}${agentName}`;
+}
+
+/**
+ * v0.2 — per-agent env-var name for the env fallback when
+ * SecretStorage is unreachable.
+ *
+ * `victra-build` → `RELAY_AGENT_TOKEN_VICTRA_BUILD`
+ * `pod.alpha`    → `RELAY_AGENT_TOKEN_POD_ALPHA`
+ * `agent1`       → `RELAY_AGENT_TOKEN_AGENT1`
+ *
+ * Hyphens + dots in agent names sanitize to underscores because
+ * POSIX env var names allow `[A-Za-z_][A-Za-z0-9_]*` only.
+ *
+ * This is ADDITIVE to the legacy `RELAY_AGENT_TOKEN` env var (the
+ * singleton). When a per-agent var is set, it wins; otherwise the
+ * singleton stays the fallback so v0.1.3 single-agent setups
+ * continue working without operator intervention.
+ */
+export function resolveAgentTokenEnvVar(agentName: string): string {
+  if (!AGENT_NAME_RE.test(agentName)) {
+    throw new Error(
+      `invalid agent name "${agentName}" for env-var name — must match ${AGENT_NAME_RE.source}`,
+    );
+  }
+  return `RELAY_AGENT_TOKEN_${agentName.replace(/[-.]/g, "_").toUpperCase()}`;
+}
+
+/**
+ * v0.2 — per-agent token resolution layered on the v0.1.3 R1
+ * precedence + SecretStorage-unavailable contract.
+ *
+ * Precedence:
+ *   1. fromSecret (per-agent SecretStorage value)
+ *   2. per-agent env var (RELAY_AGENT_TOKEN_<NAME>)
+ *   3. legacy singleton env var (RELAY_AGENT_TOKEN) — backward
+ *      compat with v0.1.3 single-agent setups
+ *   4. fromLegacyConfig (settings.json) — ONLY when
+ *      secretsAvailable === true (R1 contract preserved)
+ *
+ * Returns "" when nothing resolves. The caller (typically the
+ * AgentManager) decides whether to spawn idle, prompt for token,
+ * or refuse.
+ */
+export function resolvePerAgentToken(
+  agentName: string,
+  fromSecret: string | undefined,
+  env: EnvRecord,
+  fromLegacyConfig: string | undefined,
+  secretsAvailable: boolean,
+): string {
+  const s = (fromSecret ?? "").trim();
+  if (s.length > 0) return s;
+  const perAgentEnvName = resolveAgentTokenEnvVar(agentName);
+  const perAgentEnv = (env[perAgentEnvName] ?? "").trim();
+  if (perAgentEnv.length > 0) return perAgentEnv;
+  const legacyEnv = (env.RELAY_AGENT_TOKEN ?? "").trim();
+  if (legacyEnv.length > 0) return legacyEnv;
+  if (!secretsAvailable) return "";
+  const c = (fromLegacyConfig ?? "").trim();
+  if (c.length > 0) return c;
+  return "";
+}
+
 export function resolveTetherConfig(
   cfg: ConfigGetter,
   env: EnvRecord,
