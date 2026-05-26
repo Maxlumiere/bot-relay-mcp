@@ -8,6 +8,7 @@ import type { Readable, Writable } from "node:stream";
 import { createServer } from "../server.js";
 import { markAgentOffline, closeAgentSession, getAgentSessionId, logAudit } from "../db.js";
 import { log } from "../logger.js";
+import { broadcastDashboardEvent } from "./websocket.js";
 
 /**
  * v2.0 final (#1) + v2.0.1 (Codex HIGH 1) + v2.0.2: auto-offline on terminal
@@ -100,10 +101,20 @@ export function performAutoUnregister(
     // markAgentOffline so dashboards can distinguish "operator killed
     // the terminal" from "network dropped / sleep / transient". Fall
     // back to markAgentOffline only on helper-level failure.
+    //
+    // v2.8 — pass the signal kind through so closeAgentSession can stamp
+    // the new signal_received_at + signal_kind columns. The v2.8 state
+    // machine (src/agent-state-machine.ts) reads these to render the
+    // `closed` state with operator-visible signal source (SIGHUP =
+    // tab-close, SIGINT = ctrl-C, SIGTERM = OS shutdown).
+    const signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null =
+      signal === "SIGHUP" || signal === "SIGINT" || signal === "SIGTERM"
+        ? signal
+        : null;
     let transition: "closed" | "offline" = "closed";
     let changed = false;
     try {
-      ({ changed } = closeAgentSession(name, capturedSid));
+      ({ changed } = closeAgentSession(name, capturedSid, signalKind));
     } catch (closeErr) {
       log.warn(`[stdio] closeAgentSession failed for "${name}" — falling back to offline:`, closeErr);
       transition = "offline";
@@ -111,6 +122,24 @@ export function performAutoUnregister(
     }
     if (changed) {
       log.info(`[stdio] marked agent "${name}" ${transition} (session=${capturedSid}) on ${signal}`);
+      // v2.8 wire-emit-sites — signal-triggered close was previously
+      // only visible via the decay broadcaster's next tick (up to 30s
+      // latency). Fire an immediate agent.state_changed event so the
+      // dashboard sees the close instantly, carrying the signal kind in
+      // the metadata-only `kind` field. The decay broadcaster will
+      // dedup on the next tick (lastBroadcastedState already routes
+      // through `agent.status_changed`; this emit is the lower-level
+      // immediate signal, distinct from the periodic state derivation).
+      try {
+        broadcastDashboardEvent({
+          event: "agent.state_changed",
+          entity_id: name,
+          ts: new Date().toISOString(),
+          kind: signal, // 'SIGHUP' | 'SIGINT' | 'SIGTERM'
+        });
+      } catch {
+        // broadcast is already best-effort inside the helper; double-catch here.
+      }
       // v2.1.3: close the forensic gap. SIGINT-triggered state changes
       // now write an audit_log entry even though this path bypasses the
       // MCP dispatcher. Source='stdio' distinguishes from dispatcher calls.
@@ -140,17 +169,33 @@ export function performAutoUnregister(
 
 function installAutoUnregister(): void {
   let fired = false;
+  // v2.8 — SIGHUP added per audit-findings/v2.8-dashboard-state-machine-brief.md.
+  // iTerm2 / Terminal.app tab-close + ssh-disconnect both deliver SIGHUP;
+  // pre-v2.8 the relay would never mark the agent closed in that path
+  // and the dashboard saw a perpetually-alive ghost. SIGINT (Ctrl-C)
+  // and SIGTERM (graceful shutdown) preserved verbatim.
+  //
+  // Exit-code semantics:
+  //   SIGINT  → 130 (POSIX convention)
+  //   SIGTERM → 143 (POSIX convention)
+  //   SIGHUP  → 129 (POSIX convention — 128 + signal number 1)
+  const exitCodeFor = (signal: NodeJS.Signals): number => {
+    if (signal === "SIGINT") return 130;
+    if (signal === "SIGHUP") return 129;
+    return 143; // SIGTERM + catch-all
+  };
   const handler = (signal: NodeJS.Signals) => {
     if (fired) {
-      process.exit(signal === "SIGINT" ? 130 : 143);
+      process.exit(exitCodeFor(signal));
       return;
     }
     fired = true;
     performAutoUnregister(process.env.RELAY_AGENT_NAME, capturedSessionId, signal);
-    process.exit(signal === "SIGINT" ? 130 : 143);
+    process.exit(exitCodeFor(signal));
   };
   process.on("SIGINT", handler);
   process.on("SIGTERM", handler);
+  process.on("SIGHUP", handler);
 }
 
 /**

@@ -70,7 +70,16 @@ export interface DashboardEvent {
     | "message.sent"
     | "task.transitioned"
     | "channel.posted"
-    | "dashboard.theme_changed";
+    | "dashboard.theme_changed"
+    // v2.8 dashboard-state-machine — fires when the decay broadcaster
+    // observes a transition in `deriveDashboardState` (active → waiting →
+    // stale → closed etc) AND on explicit signal/unregister/activity
+    // events from the wire-emit-sites audit. `entity_id = <agent_name>`;
+    // `kind` carries the NEW state tag ("active" / "pending" / "waiting"
+    // / "stale" / "closed") so clients that want to render WITHOUT a
+    // refetch can read it directly. Still metadata-only per the v2.2.0
+    // H4 audit — no from/to/payload fields embedded in the broadcast.
+    | "agent.status_changed";
   /** Primary entity id used for the rate-limit coalesce key. */
   entity_id: string;
   /** ISO timestamp of the event — always stamped server-side so clients can order. */

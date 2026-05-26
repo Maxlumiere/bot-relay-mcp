@@ -145,7 +145,10 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(10, 11)).not.toThrow();
     // v2.7 / Tether Phase 3a registered 11→12 (migrateSchemaToV2_10: inbox_events outbox table).
     expect(() => applyMigration(11, 12)).not.toThrow();
-    expect(() => applyMigration(12, 13)).toThrow(/no migration registered|12→13/);
+    // v2.8 dashboard-state-machine registered 12→13 (migrateSchemaToV2_11:
+    // signal_received_at + signal_kind + last_dispatched_at columns on agents).
+    expect(() => applyMigration(12, 13)).not.toThrow();
+    expect(() => applyMigration(13, 14)).toThrow(/no migration registered|13→14/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

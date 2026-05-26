@@ -214,6 +214,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_8(_db);
   migrateSchemaToV2_9(_db);
   migrateSchemaToV2_10(_db);
+  migrateSchemaToV2_11(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 }
@@ -248,6 +249,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_8(_db);
   migrateSchemaToV2_9(_db);
   migrateSchemaToV2_10(_db);
+  migrateSchemaToV2_11(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 
@@ -468,7 +470,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -554,7 +556,7 @@ export function applyMigration(from: number, to: number): void {
   // DB with a stale recorded version (Codex R1 finding).
   const registeredPairs: Array<[number, number]> = [
     [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],
-    [7, 8], [8, 9], [9, 10], [10, 11], [11, 12],
+    [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1250,6 +1252,51 @@ function migrateSchemaToV2_10(db: CompatDatabase): void {
   `);
 }
 
+/**
+ * v2.8 dashboard-state-machine — agent state machine signal/dispatch columns
+ * (schema v12 → v13, committed in audit-findings/v2.8-dashboard-state-machine-brief.md).
+ *
+ * Three new NULL-default columns on `agents` to support the 5-state
+ * `deriveDashboardState` derivation:
+ *
+ *   - `signal_received_at INTEGER NULL` — epoch ms when the agent's stdio
+ *     process caught SIGHUP / SIGINT / SIGTERM. NULL until a signal fires.
+ *     Populated by `installAutoUnregister` at src/transport/stdio.ts so the
+ *     `closed` state can be derived without a wall-clock heuristic on
+ *     last_seen.
+ *   - `signal_kind TEXT NULL` — one of 'SIGHUP' / 'SIGINT' / 'SIGTERM' for
+ *     dashboard visibility into which path closed the terminal. iTerm2
+ *     tab-close sends SIGHUP; ctrl-C sends SIGINT; OS shutdown sends
+ *     SIGTERM. Operator-meaningful distinction surfaced in v2.9 UI.
+ *   - `last_dispatched_at INTEGER NULL` — epoch ms of the most recent
+ *     dispatch-relevant event (high-priority message received, task
+ *     posted to this agent). Powers the `stale` derivation by answering
+ *     "was this agent given something to do recently?" — agents that
+ *     went quiet without recent dispatch are `waiting`, not `stale`.
+ *
+ * All three columns are NULL on existing rows; their absence cleanly
+ * routes through the v2.7 fallback path in `deriveDashboardState`
+ * (no signal → no `closed` derivation; no dispatch → no `stale`
+ * promotion).
+ *
+ * Additive + idempotent — runs on every init, but ALTER TABLE ADD COLUMN
+ * is guarded by PRAGMA table_info inspection so re-runs are no-ops.
+ */
+function migrateSchemaToV2_11(db: CompatDatabase): void {
+  const agentCols = db
+    .prepare("PRAGMA table_info(agents)")
+    .all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "signal_received_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN signal_received_at INTEGER");
+  }
+  if (!agentCols.some((c) => c.name === "signal_kind")) {
+    db.exec("ALTER TABLE agents ADD COLUMN signal_kind TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "last_dispatched_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN last_dispatched_at INTEGER");
+  }
+}
+
 function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -1689,13 +1736,37 @@ export function markAgentOffline(
  */
 export function closeAgentSession(
   name: string,
-  expectedSessionId: string
+  expectedSessionId: string,
+  /**
+   * v2.8 — optional signal kind that triggered this close. Mirrors
+   * into the new `signal_received_at` + `signal_kind` columns the
+   * v2.8 state machine reads. Stays NULL for non-signal close paths
+   * (e.g. explicit unregister via MCP tool), which keeps the legacy
+   * `agent_status='closed'` semantics intact while the v2.8
+   * `deriveDashboardState` derivation routes through
+   * `signalReceivedAt` for signal-triggered closes specifically.
+   */
+  signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null = null,
 ): { changed: boolean } {
   const db = getDb();
+  // Conditional UPDATE so non-signal callers preserve the legacy
+  // behavior: signal_received_at + signal_kind stay NULL unless this
+  // call carries one. Two SQL forms are cheaper to maintain than a
+  // dynamic builder + safer than a single COALESCE form that could
+  // smuggle a NULL through and clear an already-set signal stamp.
+  if (signalKind === null) {
+    const r = db.prepare(
+      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL " +
+      "WHERE name = ? AND session_id = ?"
+    ).run(name, expectedSessionId);
+    return { changed: r.changes === 1 };
+  }
+  const nowMs = Date.now();
   const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL " +
+    "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
+    "signal_received_at = ?, signal_kind = ? " +
     "WHERE name = ? AND session_id = ?"
-  ).run(name, expectedSessionId);
+  ).run(nowMs, signalKind, name, expectedSessionId);
   return { changed: r.changes === 1 };
 }
 
