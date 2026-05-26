@@ -2472,6 +2472,144 @@ export function getAgentAuthData(name: string): AgentRecord | null {
  * operator actions and still wipe by name. The auto-unregister SIGINT handler
  * passes its captured session_id.
  */
+/**
+ * v2.8 dashboard-state-machine — roles that count as "dispatch-relevant"
+ * recipients for the `last_dispatched_at` stamp.
+ *
+ * Brief at `audit-findings/v2.8-dashboard-state-machine-brief.md:43`:
+ *   "set by send_message when message has priority='high' OR recipient
+ *    is a builder role"
+ *
+ * The set is intentionally tight: roles that represent agents whose
+ * "I was given work" signal is operationally meaningful for the
+ * dashboard's `stale` derivation (i.e. they're expected to be doing
+ * work in response to messages/tasks, not just observing).
+ *
+ * If you need to extend the set, update CHANGELOG.md to document the
+ * new role + the rationale before merging. The state machine reads
+ * `last_dispatched_at` to discriminate `stale` (was working, went
+ * quiet, recently dispatched) from `waiting` (just idle), so adding
+ * roles widens the `stale` surface.
+ */
+export const DISPATCH_RELEVANT_ROLES: ReadonlySet<string> = new Set([
+  "builder",
+  "auditor",
+  "researcher",
+  "reviewer",
+  "recon",
+]);
+
+/**
+ * v2.8 dashboard-state-machine — stamp `agents.last_dispatched_at` on the
+ * recipient row when the dispatch event qualifies. Called from
+ * `sendMessage`, `postTask`, `postTaskAuto` after the message/task
+ * commit so the row only gets stamped when the dispatch actually
+ * landed.
+ *
+ * Stamping rule (mirrors brief at `:43`):
+ *   - priority === 'high' (or 'critical')  → STAMP
+ *   - recipient role in DISPATCH_RELEVANT_ROLES → STAMP
+ *   - otherwise → NO-OP
+ *
+ * Best-effort: if the recipient row doesn't exist (rare race after
+ * unregister) or the role lookup throws, the stamp is silently
+ * skipped. The dispatch itself already committed; missing the
+ * dashboard breadcrumb is non-fatal to the messaging contract.
+ */
+export function markRecipientDispatched(
+  recipientName: string,
+  priority: string | null,
+): void {
+  if (!recipientName || recipientName === "system") return;
+  const db = getDb();
+  try {
+    const row = db
+      .prepare("SELECT role FROM agents WHERE name = ?")
+      .get(recipientName) as { role: string } | undefined;
+    if (!row) return;
+    const p = (priority ?? "").toLowerCase();
+    const highPriority = p === "high" || p === "critical";
+    const dispatchRole = DISPATCH_RELEVANT_ROLES.has(row.role);
+    if (!highPriority && !dispatchRole) return;
+    db.prepare("UPDATE agents SET last_dispatched_at = ? WHERE name = ?").run(
+      Date.now(),
+      recipientName,
+    );
+  } catch {
+    // best-effort — never break the dispatch commit path
+  }
+}
+
+/**
+ * v2.8 dashboard-state-machine — bulk-fetch the registered agents in
+ * the shape the decay broadcaster's `BroadcasterAgentSnapshot[]` needs.
+ *
+ * Pre-filters pending message counts by `created_at < now - pendingWindowMs`
+ * per the brief's contract — only messages older than the pending window
+ * count toward the `pending` derivation (fresh mail isn't "pending,
+ * operator should look"; it's "active, agent is processing").
+ *
+ * `agent_state_machine.ts:207-212` explicitly says callers must do
+ * this pre-filter BEFORE passing `pendingCount` to `deriveDashboardState`.
+ *
+ * Single SQL round-trip: agents JOIN messages (filtered by age). For
+ * typical N < 20 registered agents this is fast.
+ */
+export function getDashboardAgentSnapshots(
+  pendingWindowMs: number,
+  nowMs: number = Date.now(),
+): Array<{
+  name: string;
+  inputs: {
+    lastSeen: string | null;
+    signalReceivedAt: number | null;
+    signalKind: string | null;
+    unregisteredAt: number | null;
+    pendingCount: number;
+    lastDispatchedAt: number | null;
+  };
+}> {
+  const db = getDb();
+  const cutoffIso = new Date(nowMs - pendingWindowMs).toISOString();
+  const rows = db
+    .prepare(
+      `SELECT
+         a.name,
+         a.last_seen,
+         a.signal_received_at,
+         a.signal_kind,
+         a.last_dispatched_at,
+         (SELECT COUNT(*) FROM messages m
+           WHERE m.to_agent = a.name
+             AND m.status = 'pending'
+             AND m.created_at < ?) AS pending_count_old
+       FROM agents a`,
+    )
+    .all(cutoffIso) as Array<{
+    name: string;
+    last_seen: string | null;
+    signal_received_at: number | null;
+    signal_kind: string | null;
+    last_dispatched_at: number | null;
+    pending_count_old: number | bigint;
+  }>;
+  return rows.map((r) => ({
+    name: r.name,
+    inputs: {
+      lastSeen: r.last_seen,
+      signalReceivedAt: r.signal_received_at,
+      signalKind: r.signal_kind,
+      // Production rows that completed unregister have been DELETEd
+      // from the agents table (src/db.ts:2475-2492), so observed rows
+      // never carry an `unregisteredAt`. The state machine field stays
+      // useful for test fixtures.
+      unregisteredAt: null,
+      pendingCount: Number(r.pending_count_old),
+      lastDispatchedAt: r.last_dispatched_at,
+    },
+  }));
+}
+
 export function unregisterAgent(name: string, expectedSessionId?: string): boolean {
   const db = getDb();
   let result: { changes: number };
@@ -2765,6 +2903,11 @@ export function sendMessage(
     // updated push without polling. (Same-process fast path; cross-process
     // path is the outbox tail in the HTTP daemon.)
     emitInboxChanged({ agent_name: to, reason: "message_received", id: outboxId });
+    // v2.8 — stamp recipient's last_dispatched_at when the dispatch is
+    // priority='high'/'critical' OR recipient role is in
+    // DISPATCH_RELEVANT_ROLES. Best-effort: never throws into the
+    // sendMessage path. See markRecipientDispatched for the rule.
+    markRecipientDispatched(to, priority);
     return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
   }
 
@@ -2810,6 +2953,12 @@ export function sendMessage(
   // a subscriber that immediately re-fetches the resource sees the
   // freshly-inserted row.
   emitInboxChanged({ agent_name: to, reason: "message_received", id: outboxId });
+
+  // v2.8 — stamp recipient's last_dispatched_at when qualified. See
+  // the system-sender branch above for the rule. Mirrored both sides
+  // so a `system → builder` priority='high' DM stamps correctly
+  // alongside a `user-to-user` send.
+  markRecipientDispatched(to, priority);
 
   return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
 }
@@ -3311,6 +3460,12 @@ export function postTask(
     "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?)"
   ).run(id, from, to, title, encDescription, priority, timestamp, timestamp);
 
+  // v2.8 — a task post IS a dispatch event per CHANGELOG.md:31 ("was
+  // given work to do recently"). Stamp the recipient's
+  // last_dispatched_at on the same rules as sendMessage (priority +
+  // role allowlist). Best-effort.
+  markRecipientDispatched(to, priority);
+
   return {
     id,
     from_agent: from,
@@ -3662,6 +3817,10 @@ export function postTaskAuto(
     db.prepare(
       "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?, ?)"
     ).run(id, from, pick.name, title, encDescription, priority, timestamp, timestamp, capsJson);
+
+    // v2.8 — task auto-routing IS a dispatch event. Stamp the routed
+    // recipient's last_dispatched_at on the same rules as sendMessage.
+    markRecipientDispatched(pick.name, priority);
 
     return {
       task: {
