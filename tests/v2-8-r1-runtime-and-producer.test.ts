@@ -71,6 +71,40 @@ async function bootServer(extraEnv: Record<string, string | undefined> = {}): Pr
   port = typeof addr === "object" && addr ? addr.port : 0;
 }
 
+/**
+ * v2.8 R2 — awaitable HTTP server shutdown.
+ *
+ * `startHttpServer` registers `server.once("close", () => broadcaster.stop())`
+ * (src/transport/http.ts:1727) so the decay broadcaster's setInterval is
+ * cleared via the ASYNC `close` callback chain. Tests that call
+ * `server.close()` synchronously and immediately move on race against
+ * that callback — the old broadcaster can still tick once or twice
+ * against the freshly-recreated DB / reset WS state, breaking RT3's
+ * "RELAY_DECAY_TICK_DISABLED=1 → zero events" assertion on Node 18.
+ *
+ * This helper resolves only after `server.close(cb)` has fully drained,
+ * which guarantees the registered close listener (and therefore
+ * broadcaster.stop()) has fired. Already-closed / never-listening
+ * servers resolve immediately so the helper is safe to call
+ * unconditionally.
+ *
+ * Origin: codex-5-5 R1 audit msg 7110aefc — real Node 18 CI failure
+ * on run 26467555182 attributed to this exact lifecycle race.
+ */
+async function awaitServerClose(s: HttpServer | undefined): Promise<void> {
+  if (!s) return;
+  if (!s.listening) return;
+  await new Promise<void>((resolve) => {
+    s.close(() => {
+      // Ignore the error arg — "already closed" / in-flight requests
+      // are acceptable; the contract we need is "close callback fired"
+      // which is equivalent to "server.once('close', ...) listeners
+      // have flushed".
+      resolve();
+    });
+  });
+}
+
 async function connectWs(): Promise<{
   ws: WebSocket;
   nextMessage: (timeoutMs?: number) => Promise<string>;
@@ -125,13 +159,14 @@ beforeEach(async () => {
   await bootServer();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // ORDER MATTERS (codex R1 P1, msg 7110aefc): await the HTTP server's
+  // async close FIRST so the broadcaster.stop() registered on
+  // server.once("close") has flushed BEFORE we tear down the DB / WS
+  // state. Otherwise a still-running tick can broadcast through the
+  // reset WS state and into a freshly-recreated DB.
+  await awaitServerClose(server);
   _resetDashboardWsForTests();
-  try {
-    if (server) server.close();
-  } catch {
-    /* ignore */
-  }
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
 });
@@ -232,7 +267,15 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
 
   it("(RT3) RELAY_DECAY_TICK_DISABLED=1 disables the broadcaster — NO time-only emits", async () => {
     // Restart the server with the broadcaster opt-out flag set.
-    server.close();
+    // R2 (codex msg 7110aefc): the prior synchronous `server.close()`
+    // raced against the broadcaster.stop() registered on server.once
+    // ("close"). On Node 18 the still-running tick from the OLD
+    // (enabled) broadcaster fired ONE more agent.status_changed event
+    // against the WS state of the new (disabled) server, breaking
+    // the zero-events assertion. Awaiting close lets the
+    // server.once("close") callback chain fully flush before we boot
+    // the disabled server.
+    await awaitServerClose(server);
     await bootServer({ RELAY_DECAY_TICK_DISABLED: "1" });
     await rpc("register_agent", {
       name: "rt-disabled",
