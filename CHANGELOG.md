@@ -38,7 +38,7 @@ The v2.8 dashboard-daemon-precursor arc was mid-flight on `hotfix/v2.8-dashboard
 
 No tests added or modified. Full v2.7.2 test suite passes verbatim under the new vitest:
 - Root vitest (sequential `--pool=forks --no-file-parallelism`): **1353 / 125 files PASS** under vitest@4.1.8 on Node v24.13.0 locally.
-- Pre-publish `--full` gate: 19/19 PASS (same shape as v2.7.2).
+- Pre-publish `--full` gate: **18/19 PASS**. The single expected FAIL is the GitHub CI green-gate, which inspects `main`'s CI status — `main` is red from the exact advisories this PR closes (chicken-and-egg). Resolves automatically on merge. The actionable per-`feedback_pre_push_discipline.md` check is BRANCH CI at HEAD, which is CI run 26805501670: Node 20 + Node 22 + 25-tool smoke ALL PASS.
 
 ### DEFERRED-LOCAL
 
