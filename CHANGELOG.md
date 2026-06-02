@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.7.3 — 2026-06-02 — SECURITY HOTFIX: vitest@4.1.8 (CVSS 9.8) + qs/ws transitives
+
+Narrow security-only release. Closes one CRITICAL + two moderate npm advisories that surfaced after v2.7.2 shipped. Zero behavior changes — every shipped runtime path is identical to v2.7.2.
+
+### Security
+
+- **[CRITICAL CVSS 9.8] `vitest <4.1.0` (GHSA-5xrq-8626-4rwp).** "When Vitest UI server is listening, arbitrary file can be read and executed." Bot-relay-mcp does not run the Vitest UI server in production, but the package was a transitive in the test/dev surface; advisory triggers the pre-publish `npm audit (high+)` gate regardless of usage path. Upgrade: `vitest@^4.1.8` (semver-major from `^3.2.0`).
+- **[moderate] `qs 6.11.1 - 6.15.1` (GHSA-q8mj-m7cp-5q26).** `qs.stringify` DoS via TypeError on null/undefined entries in comma-format arrays with `encodeValuesOnly`. Transitive via Express. Auto-fix via `npm audit fix`.
+- **[moderate] `ws 8.0.0 - 8.20.0` (GHSA-58qx-3vcg-4xpx).** Uninitialized memory disclosure. Direct dep. Auto-fix via `npm audit fix`.
+
+Post-fix: `npm audit --audit-level=high` reports **0 vulnerabilities**.
+
+### Why standalone
+
+The v2.8 dashboard-daemon-precursor arc was mid-flight on `hotfix/v2.8-dashboard-state-machine` when these advisories landed in the npm advisory DB (between v2.8 R1 push 2026-05-26 and R2 push 2026-06-02). Per Maxime's 2026-06-02 lock: ship the security hotfix as a standalone arc off `main` so npm users get the CVE patch immediately, then rebase v2.8 R2 on top of clean main — codex audits each arc on narrow scope rather than juggling a wider mixed scope.
+
+### Compatibility
+
+- `vitest@4` drops Node 16; project's `engines.node` was already `>=18.0.0`. No engines change.
+- vitest 4 reporter / runner internals changed but the project's `vitest.config.ts` defaults work as-is; full suite passes 1353/125 files under Node 24 locally with no test rewrites.
+- Production runtime untouched. `dist/` build identical to v2.7.2 at the JS level (the security advisories are dev-surface; runtime deps unaffected at the user-facing layer).
+
+### Tests
+
+No tests added or modified. Full v2.7.2 test suite passes verbatim under the new vitest:
+- Root vitest (sequential `--pool=forks --no-file-parallelism`): **1353 / 125 files PASS** under vitest@4.1.8 on Node v24.13.0.
+- Pre-publish `--full` gate: 19/19 PASS (same shape as v2.7.2).
+
+### DEFERRED-LOCAL
+
+Node 18 + 20 + 22 not installed locally (only Node 24 available in this session). The CI matrix at `.github/workflows/ci.yml` runs Node 18/20/22 + the 25-tool smoke; CI is the source of truth for those legs. Ship-pong cites CI run number with all four legs green.
+
+### References
+
+- Brief: dispatched by victra 2026-06-02 (msg 283be93b) after codex-5-5 R1 audit (msg 7110aefc) caught vitest critical on v2.8 R2 push.
+
 ## v2.7.2 — 2026-05-21 — spawn_agent identity-recovery defense-in-depth
 
 Closes the silent "default" failure mode when `mcp__bot-relay__spawn_agent` produces a child terminal whose SessionStart hook never sees `RELAY_AGENT_NAME`. Origin: victra-hermes bug report msg `149f124f` (2026-05-13), brief at `audit-findings/v2.7.2-spawn-agent-name-brief.md`.
