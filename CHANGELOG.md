@@ -1,5 +1,57 @@
 # Changelog
 
+## v2.7.4 — 2026-06-03 — spawn-agent.sh kickstart apostrophe-quoting fix (HIGH)
+
+Closes Bug 1 from `audit-findings/v2.7.3-spawn-agent-kickstart-quoting-bug-brief.md` (reported 2026-05-21 by Maxime + Victra during v2.7.2 dispatch attempts). Spawn-flow hardening; no schema, no API, no runtime behavior changes. Bug 2 (length truncation) from the same brief is NOT in scope — that's a separate arc requiring token pre-mint + message ordering work.
+
+### The bug
+
+`bin/spawn-agent.sh` wrapped the kickstart prompt via `printf '%q'`, which emits values in `$'...'` ANSI-C-quoted form. Inside `$'...'`, a literal apostrophe terminates the string — any `RELAY_SPAWN_KICKSTART` value (or the default kickstart) containing a `'` produced an unbalanced quoting that wedged the spawned subshell at `quote>` continuation forever.
+
+The default kickstart contained three offending substrings (`status='all'`, `since='session_start'`, `since='1h'`), so first-attempt spawns wedged. Operator workaround until this lands: always pass an apostrophe-free `RELAY_SPAWN_KICKSTART="..."` override.
+
+### Fix — Option C from brief (defense in depth)
+
+**(A) Sanitize the default kickstart** (`bin/spawn-agent.sh:289`).
+
+`status='all'` → `status=all`, `since='session_start'` → `since=session_start`, `since='1h'` → `since=1h`. MCP tool calls accept unquoted enum values in prompt text; the LLM interprets the call the same way. Safety net so even if the helper below is reverted in the future, the default never wedges.
+
+**(B) Replace `printf '%q'` with `shell_escape_double` for the kickstart** (`bin/spawn-agent.sh:194-218, 313`).
+
+New helper `shell_escape_double` (paired with the existing `applescript_escape`) emits values in plain double-quoted shell context `"..."` with backslash escapes for `\`, `$`, `"`, and backtick. Apostrophes are literal inside `"..."`, so kickstarts with arbitrary apostrophe content no longer wedge.
+
+Scope is intentionally narrow: only `Q_KICKSTART` switches off `printf '%q'`. The other `Q_*` variables (`NAME`, `ROLE`, `CAPS`, `CWD`, `PERM`, `EFFORT`, `DISPLAY`) stay on `printf '%q'` — they're tight-allowlisted (no apostrophes possible) and the bug only manifests for the free-form kickstart.
+
+### Tests
+
+Five new K-tests in `tests/spawn-integration.test.ts`:
+
+- **(K1)** default kickstart contains no apostrophes — safety net for Option A.
+- **(K2)** default-kickstart CMD parses cleanly under `bash -n` (would have failed pre-fix).
+- **(K3)** `RELAY_SPAWN_KICKSTART` with apostrophes parses cleanly (root-cause fix for Option B).
+- **(K4)** `RELAY_SPAWN_KICKSTART` with every shell-special char (`'`, `"`, `\`, `$`, backtick) parses cleanly.
+- **(K5)** round-trip: execute the assembled CMD with a `claude` stub, verify the kickstart literal content (including apostrophes) reaches the final argv intact.
+
+One existing test (`spawn-agent.sh — v2.1.4 brief_file_path (I10) → default spawn with valid brief path embeds the pointer sentence in KICKSTART`) updated to match the new escape form — the brief-pointer backticks now appear as `\\\`<path>\\\`` in the dry-run CMD (the helper escapes backticks to prevent command substitution inside `"..."`); when bash actually parses CMD the escapes collapse so claude still sees `` `<brief>` ``.
+
+### Compatibility
+
+- No schema migration. No DB changes. No API changes. No env var changes.
+- `bin/spawn-agent.sh` operators on Node 20+ have no action required — `RELAY_SPAWN_KICKSTART` override values that used to wedge now work without modification, and overrides that didn't contain apostrophes continue to work verbatim.
+- Memory rules `feedback_spawn_kickstart_no_apostrophes.md` and `feedback_spawn_needs_kickstart.md` can be updated post-merge — the apostrophe restriction no longer applies.
+
+### Out of scope (explicitly NOT in v2.7.4)
+
+- Bug 2 from the brief (length truncation past ~1000-1024 chars via AppleScript `do script` buffer limit) — separate arc; requires `--initial-message` flag + token pre-mint + message ordering guarantees.
+- Other `Q_*` variables continuing to use `printf '%q'` — they're tight-allowlisted and don't trigger the bug.
+- Linux/Windows spawn drivers — they use a different code path (`src/spawn/drivers/{linux,windows}.ts`); Bug 1 was specific to the macOS bash-script path.
+
+### References
+
+- Brief: `audit-findings/v2.7.3-spawn-agent-kickstart-quoting-bug-brief.md` (note: filename predates the v2.7.3 CVE hotfix that took the v2.7.3 slot; this fix lands as v2.7.4)
+- Bug discovery: 2026-05-21 by Maxime + Victra during v2.7.2 dispatch attempts
+- Sibling memory rules to retire post-merge: `feedback_spawn_kickstart_no_apostrophes.md`
+
 ## v2.7.3 — 2026-06-02 — SECURITY HOTFIX: vitest@4.1.8 (CVSS 9.8) + qs/ws transitives + Node 18 drop
 
 Narrow security-only release. Closes one CRITICAL + two moderate npm advisories that surfaced after v2.7.2 shipped. Drops Node 18 support (14 months past EOL) because vitest@4 — the only version with the CVE fix — requires Node 20+.
