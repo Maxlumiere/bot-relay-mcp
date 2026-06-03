@@ -1,5 +1,54 @@
 # Changelog
 
+## v2.7.3 — 2026-06-02 — SECURITY HOTFIX: vitest@4.1.8 (CVSS 9.8) + qs/ws transitives + Node 18 drop
+
+Narrow security-only release. Closes one CRITICAL + two moderate npm advisories that surfaced after v2.7.2 shipped. Drops Node 18 support (14 months past EOL) because vitest@4 — the only version with the CVE fix — requires Node 20+.
+
+### ⚠️ BREAKING: minimum Node version is now Node 20
+
+`engines.node` bumped from `">=18.0.0"` to `">=20.0.0"`. CI matrix bumped from `['18', '20', '22']` to `['20', '22']`.
+
+Reasoning:
+
+- Node 18 went **EOL on 2025-04-30** — 14 months past end-of-life as of this release. Active + Maintenance LTS coverage is over.
+- vitest@4 (the only version that fixes the CRITICAL CVSS 9.8 advisory below) imports `node:util.styleText`, which only exists on Node 20.12+. There is no vitest@3.x patched release; the upstream fix is semver-major.
+- Anyone still on Node 18 is running an unpatched runtime regardless; v2.7.2 (also affected by the CVE) remains available on npm for legacy consumers who can't upgrade. They are in the same security position as if v2.7.3 didn't exist for them.
+
+Operators on Node 20+ have no action required beyond `npm install`.
+
+### Security
+
+- **[CRITICAL CVSS 9.8] `vitest <4.1.0` (GHSA-5xrq-8626-4rwp).** "When Vitest UI server is listening, arbitrary file can be read and executed." Bot-relay-mcp does not run the Vitest UI server in production, but the package was a transitive in the test/dev surface; advisory triggers the pre-publish `npm audit (high+)` gate regardless of usage path. Upgrade: `vitest@^4.1.8` (semver-major from `^3.2.0`).
+- **[moderate] `qs 6.11.1 - 6.15.1` (GHSA-q8mj-m7cp-5q26).** `qs.stringify` DoS via TypeError on null/undefined entries in comma-format arrays with `encodeValuesOnly`. Transitive via Express. Auto-fix via `npm audit fix`.
+- **[moderate] `ws 8.0.0 - 8.20.0` (GHSA-58qx-3vcg-4xpx).** Uninitialized memory disclosure. Direct dep. Auto-fix via `npm audit fix`.
+
+Post-fix: `npm audit --audit-level=high` reports **0 vulnerabilities**.
+
+### Why standalone
+
+The v2.8 dashboard-daemon-precursor arc was mid-flight on `hotfix/v2.8-dashboard-state-machine` when these advisories landed in the npm advisory DB (between v2.8 R1 push 2026-05-26 and R2 push 2026-06-02). Per Maxime's 2026-06-02 lock: ship the security hotfix as a standalone arc off `main` so npm users get the CVE patch immediately, then rebase v2.8 R2 on top of clean main — codex audits each arc on narrow scope rather than juggling a wider mixed scope.
+
+### Compatibility
+
+- **Breaking:** Node 18 no longer supported. See the BREAKING section above.
+- vitest 4 reporter / runner internals changed but the project's `vitest.config.ts` defaults work as-is; full suite passes under Node 20+ with no test rewrites.
+- Production runtime untouched. `dist/` build is byte-identical to v2.7.2 at the JS level (the security advisories are dev-surface; runtime deps unaffected at the user-facing layer).
+
+### Tests
+
+No tests added or modified. Full v2.7.2 test suite passes verbatim under the new vitest:
+- Root vitest (sequential `--pool=forks --no-file-parallelism`): **1353 / 125 files PASS** under vitest@4.1.8 on Node v24.13.0 locally.
+- Pre-publish `--full` gate: **18/19 PASS**. The single expected FAIL is the GitHub CI green-gate, which inspects `main`'s CI status — `main` is red from the exact advisories this PR closes (chicken-and-egg). Resolves automatically on merge. The actionable per-`feedback_pre_push_discipline.md` check is BRANCH CI at HEAD, which is CI run 26805501670: Node 20 + Node 22 + 25-tool smoke ALL PASS.
+
+### DEFERRED-LOCAL
+
+Only Node 24 available locally; Node 20 + 22 verified via the GitHub Actions CI matrix at `.github/workflows/ci.yml`. Ship-pong cites the CI run number with Node 20 + 22 + 25-tool smoke all green.
+
+### References
+
+- Brief: dispatched by victra 2026-06-02 (msg 283be93b) after codex-5-5 R1 audit (msg 7110aefc) caught vitest critical on v2.8 R2 push.
+- Option A (drop Node 18) locked by Maxime 2026-06-02 (msg 431b91fc) after scope-expansion ask msg `f701ef85`.
+
 ## v2.7.2 — 2026-05-21 — spawn_agent identity-recovery defense-in-depth
 
 Closes the silent "default" failure mode when `mcp__bot-relay__spawn_agent` produces a child terminal whose SessionStart hook never sees `RELAY_AGENT_NAME`. Origin: victra-hermes bug report msg `149f124f` (2026-05-13), brief at `audit-findings/v2.7.2-spawn-agent-name-brief.md`.

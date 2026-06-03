@@ -13,7 +13,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['18', '20', '22']
+        # v2.7.3: Node 18 dropped — vitest@4 requires Node 20+
+        # (uses node:util.styleText, added in Node 20.12). Node 18 went
+        # EOL April 30, 2025; users on Node 18 stay pinned to v2.7.2.
+        node: ['20', '22']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,8 +57,8 @@ jobs:
       - name: npm audit (high+) — via resilience wrapper
         # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
         # after GHSA-w5hq-g745-h8pq (uuid <14 buffer bounds, v3/v5/v6+buf).
-        # We use v4() no-args only — not vulnerable. uuid@14 drops Node 18
-        # support; engines field still commits to >=18.
+        # We use v4() no-args only — not vulnerable. v2.7.3 dropped Node 18
+        # so uuid@14 + vitest@4 can both upgrade cleanly.
         #
         # v2.4.3 R1 HIGH 1 (Codex 2026-04-27): all `npm audit` invocations
         # (CI + pre-publish gate alike) MUST go through scripts/audit-with-
