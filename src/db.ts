@@ -3889,6 +3889,12 @@ export function tryAssignQueuedTasksTo(
 
     const result = casUpdate.run(agentName, now(), row.id);
     if (result.changes === 1) {
+      // v2.8 R3 — deferred queued-task pickup IS a dispatch event,
+      // same contract as the immediate postTaskAuto route at :3823.
+      // Without this, agents.last_dispatched_at stays NULL for
+      // queued-then-picked-up tasks and the state machine derives
+      // them as `waiting` instead of `stale` after the quiet window.
+      markRecipientDispatched(agentName, row.priority);
       assigned.push({
         task_id: row.id,
         from_agent: row.from_agent,

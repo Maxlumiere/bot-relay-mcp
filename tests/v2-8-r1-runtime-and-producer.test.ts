@@ -454,4 +454,84 @@ describe("v2.8 R1 — last_dispatched_at producer writes", () => {
       ).not.toBeNull();
     }
   });
+
+  it("(PRD7) deferred queued-task pickup on register_agent stamps recipient last_dispatched_at", async () => {
+    // v2.8 R3 — codex-5-5 R2 audit (msg fdfa9ef4 / 423300c6) caught
+    // that `tryAssignQueuedTasksTo` only CAS-updated tasks; it never
+    // called `markRecipientDispatched`. The IMMEDIATE postTaskAuto
+    // route at src/db.ts:3823 was already stamped; the DEFERRED
+    // queued-then-picked-up route at :3888-3899 was not. Result:
+    // a builder registers, gets queued work auto-assigned, goes
+    // quiet past staleWindowMs, and was derived as `waiting`
+    // instead of `stale` because last_dispatched_at stayed NULL.
+    //
+    // This regression pins the contract: queued auto-assignment IS
+    // a dispatch event, must stamp last_dispatched_at, same as the
+    // immediate route.
+
+    const posterTok = await registerWithRole("prd7-poster", "user");
+
+    // Post a post_task_auto requiring caps no currently-registered
+    // agent has. With NO eligible candidate, the task lands in
+    // `queued` status with `to_agent = null`.
+    const beforeMs = Date.now();
+    const post = await rpc(
+      "post_task_auto",
+      {
+        from: "prd7-poster",
+        title: "queued work",
+        description: "no candidate yet",
+        required_capabilities: ["prd7-rare-cap"],
+        priority: "normal",
+      },
+      posterTok,
+    );
+    expect(post.ok, JSON.stringify(post.json)).toBe(true);
+    const taskId = (post.json as { task_id?: string }).task_id;
+    expect(taskId, "post_task_auto must return task_id").toBeTruthy();
+
+    // Verify the task is queued (no eligible agent at post time).
+    const queuedRow = getDb()
+      .prepare("SELECT status, to_agent FROM tasks WHERE id = ?")
+      .get(taskId!) as { status: string; to_agent: string | null } | undefined;
+    expect(queuedRow?.status, `task status before pickup: ${JSON.stringify(queuedRow)}`).toBe("queued");
+    expect(queuedRow?.to_agent).toBeNull();
+
+    // Now register a builder whose capabilities match the queued
+    // task. `register_agent` routes through tryAssignQueuedTasksTo
+    // (src/db.ts:2176) and returns auto_assigned_tasks for the
+    // picked-up task.
+    const reg = await rpc("register_agent", {
+      name: "prd7-late-builder",
+      role: "builder",
+      capabilities: ["prd7-rare-cap", "tasks"],
+    });
+    expect(reg.ok, JSON.stringify(reg.json)).toBe(true);
+
+    const autoAssigned = (reg.json as {
+      auto_assigned_tasks?: Array<{ task_id: string; title: string; priority: string }>;
+    }).auto_assigned_tasks;
+    expect(
+      autoAssigned,
+      "register_agent response must include auto_assigned_tasks for deferred queued pickup",
+    ).toBeDefined();
+    expect(autoAssigned!.some((t) => t.task_id === taskId)).toBe(true);
+
+    // Verify the task moved to `posted` + to_agent = new builder.
+    const postedRow = getDb()
+      .prepare("SELECT status, to_agent FROM tasks WHERE id = ?")
+      .get(taskId!) as { status: string; to_agent: string | null } | undefined;
+    expect(postedRow?.status).toBe("posted");
+    expect(postedRow?.to_agent).toBe("prd7-late-builder");
+
+    // THE contract pin codex flagged as missing: the recipient's
+    // last_dispatched_at must be non-NULL and within the test window.
+    const stamped = readLastDispatched("prd7-late-builder");
+    expect(
+      stamped,
+      "deferred queued-task pickup must stamp recipient's last_dispatched_at (v2.8 R3 contract)",
+    ).not.toBeNull();
+    expect(stamped!).toBeGreaterThanOrEqual(beforeMs);
+    expect(stamped!).toBeLessThanOrEqual(Date.now() + 1000);
+  });
 });
