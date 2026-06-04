@@ -347,12 +347,15 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
       expect(r.code).toBe(0);
       // The default KICKSTART is still present
       expect(r.stdout).toContain("mcp__bot-relay__get_messages");
-      // The brief-pointer sentence is appended. The KICKSTART is wrapped by
-      // printf %q as a bash $'...' ANSI-C quoted string (because it contains
-      // apostrophes), so the literal phrase appears verbatim inside that
-      // wrapper — no backslash escapes for spaces.
+      // v2.7.4 — the kickstart is now wrapped by shell_escape_double
+      // ("..." quoted form) instead of printf '%q' ($'...' form). The
+      // bash-script-internal backticks around the brief path stay literal
+      // in the KICKSTART variable but get backslash-escaped by the helper
+      // (backticks inside "..." would otherwise trigger command substitution).
+      // When bash actually parses CMD, the backslash-backtick collapses
+      // back to a literal backtick, so claude still sees `<brief>`.
       expect(r.stdout).toContain("Your full brief lives at");
-      expect(r.stdout).toContain(`\`${brief}\``);
+      expect(r.stdout).toContain(`\\\`${brief}\\\``);
       expect(r.stdout).toContain("canonical source");
     } finally {
       try { fs.unlinkSync(brief); } catch {}
@@ -573,5 +576,140 @@ describe("spawn-agent.sh — v2.7.2 RELAY_AGENT_NAME propagation contract", () =
     const capsLine = parentEnv.split("\n").find((l) => l.startsWith("RELAY_AGENT_CAPABILITIES="));
     expect(roleLine).toBe("RELAY_AGENT_ROLE=researcher");
     expect(capsLine).toBe("RELAY_AGENT_CAPABILITIES=search,summarize");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v2.7.4 — kickstart apostrophe-quoting fix (Bug 1 from
+// audit-findings/v2.7.3-spawn-agent-kickstart-quoting-bug-brief.md).
+//
+// Pre-fix, the script wrapped KICKSTART via `printf '%q'` which emits
+// values in `$'...'` ANSI-C-quoted form. Inside `$'...'`, a literal `'`
+// terminates the string — any kickstart containing an apostrophe wedged
+// the spawned subshell at `quote>` continuation, forever.
+//
+// Fix (Option C from brief — defense in depth):
+//   (A) sanitize the DEFAULT kickstart so it has zero apostrophes
+//       (status=all instead of status='all', etc.)
+//   (B) replace `printf '%q'` with `shell_escape_double` for the
+//       kickstart specifically, which emits `"..."`-quoted output where
+//       `'` is just a literal.
+// ---------------------------------------------------------------------------
+describe("spawn-agent.sh — v2.7.4 kickstart apostrophe-quoting fix", () => {
+  /** Extract the CMD line from dry-run stdout. */
+  function extractCmd(stdout: string): string {
+    const line = stdout.split("\n").find((l) => l.startsWith("CMD="));
+    if (!line) throw new Error(`no CMD= line in dry-run stdout:\n${stdout}`);
+    return line.replace(/^CMD=/, "");
+  }
+
+  it("(K1) default kickstart contains NO apostrophes — Bug 1 safety net", async () => {
+    // Option A: the default prompt must never contain a literal `'` so
+    // that even if a future maintainer reverts the helper (Option B),
+    // the default at least stays parseable.
+    const r = await runSpawn(["builder-1", "builder", "build", "/tmp"]);
+    expect(r.code).toBe(0);
+    const cmd = extractCmd(r.stdout);
+    // The brief specifically called out three offending substrings; the
+    // sanitized form replaces the quoted enum values with unquoted ones.
+    expect(cmd).toContain("status=all");
+    expect(cmd).toContain("since=session_start");
+    expect(cmd).toContain("since=1h");
+    expect(cmd).not.toContain("status='all'");
+    expect(cmd).not.toContain("since='session_start'");
+    expect(cmd).not.toContain("since='1h'");
+  });
+
+  it("(K2) default-kickstart CMD parses cleanly under `bash -n` — no quote> wedge", async () => {
+    // The regression that actually mattered: pre-fix, the assembled CMD
+    // wedged any subshell that tried to parse it because of unbalanced
+    // $'...' quoting. `bash -n` (syntax-check, no execute) returns
+    // non-zero on unbalanced quotes. Post-fix, it must succeed.
+    const r = await runSpawn(["builder-1", "builder", "build", "/tmp"]);
+    expect(r.code).toBe(0);
+    const cmd = extractCmd(r.stdout);
+    const parse = cp.spawnSync("bash", ["-n"], { input: cmd, encoding: "utf8" });
+    expect(parse.status, `bash -n stderr: ${parse.stderr}`).toBe(0);
+  });
+
+  it("(K3) RELAY_SPAWN_KICKSTART with apostrophes parses cleanly — root-cause fix", async () => {
+    // The original bug repro: an apostrophe-laden kickstart used to
+    // produce a CMD with unbalanced $'...' quoting that wedged at
+    // quote>. With shell_escape_double, apostrophes are literal inside
+    // "..." and the CMD parses without issue.
+    const r = await runSpawnWithEnv(["builder-1", "builder", "build", "/tmp"], {
+      RELAY_SPAWN_KICKSTART:
+        "poll inbox with status='all' since='session_start' limit='20'",
+    });
+    expect(r.code).toBe(0);
+    const cmd = extractCmd(r.stdout);
+    // The full kickstart content must reach claude — verify the literal
+    // substrings (including the apostrophes) survive the quoting.
+    expect(cmd).toContain("status='all'");
+    expect(cmd).toContain("since='session_start'");
+    const parse = cp.spawnSync("bash", ["-n"], { input: cmd, encoding: "utf8" });
+    expect(parse.status, `bash -n stderr: ${parse.stderr}`).toBe(0);
+  });
+
+  it("(K4) RELAY_SPAWN_KICKSTART containing every shell-special char parses cleanly", async () => {
+    // The defense the helper was designed for: `, $, ", \, and ` all
+    // need escaping inside "...". Apostrophes don't, but they're the
+    // ones that hit the original bug. Pre-fix output for this input
+    // would have wedged on multiple counts.
+    const messy = `payload with ' and " and \\ and $ and \`backtick\` and 'multiple' 'quotes'`;
+    const r = await runSpawnWithEnv(["builder-1", "builder", "build", "/tmp"], {
+      RELAY_SPAWN_KICKSTART: messy,
+    });
+    expect(r.code).toBe(0);
+    const cmd = extractCmd(r.stdout);
+    // Verify the shell parses the assembled CMD without any quoting
+    // errors. We deliberately don't assert "the literal string equals
+    // X" — that requires modeling the helper's escape table here, which
+    // is brittle. The contract that matters is "bash -n is happy".
+    const parse = cp.spawnSync("bash", ["-n"], { input: cmd, encoding: "utf8" });
+    expect(parse.status, `bash -n stderr: ${parse.stderr}`).toBe(0);
+  });
+
+  it("(K5) RELAY_SPAWN_KICKSTART round-trip: literal content reaches claude", async () => {
+    // End-to-end check that the shell-level escaping is undone when
+    // bash parses the CMD. We execute the assembled command in a
+    // controlled subshell (with claude stubbed) and capture what
+    // argument actually reaches the program. The kickstart content
+    // (literal apostrophes and all) must arrive intact.
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "k5-"));
+    try {
+      const stubDir = path.join(tmpRoot, "stub");
+      fs.mkdirSync(stubDir);
+      const stubPath = path.join(stubDir, "claude");
+      const argDumpPath = path.join(tmpRoot, "args.txt");
+      fs.writeFileSync(
+        stubPath,
+        "#!/bin/bash\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > " +
+          JSON.stringify(argDumpPath) +
+          "\nexit 0\n",
+        { mode: 0o755 },
+      );
+      const kickstart =
+        "round-trip with apostrophe: status='all', since='1h'. Done.";
+      const dry = await runSpawnWithEnv(
+        ["k5-agent", "builder", "build", "/tmp"],
+        { RELAY_SPAWN_KICKSTART: kickstart },
+      );
+      expect(dry.code).toBe(0);
+      const cmd = extractCmd(dry.stdout);
+      // Run the assembled CMD in a controlled subshell with the stub on PATH.
+      const run = cp.spawnSync("bash", ["-c", cmd], {
+        env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+        encoding: "utf8",
+      });
+      expect(run.status, `subshell stderr: ${run.stderr}`).toBe(0);
+      const args = fs.readFileSync(argDumpPath, "utf8");
+      // The kickstart is passed as ONE argument to claude. The last
+      // dumped arg must equal the original kickstart string verbatim.
+      const lastArg = args.split("\n").filter(Boolean).pop();
+      expect(lastArg).toBe(kickstart);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
