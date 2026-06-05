@@ -94,7 +94,36 @@ extension_bundle() {
 step "extension bundle (extensions/vscode → out/extension.js via esbuild)" extension_bundle || exit 1
 
 # --- 2. Unit/integration tests ---
-step "vitest run" npx vitest run || exit 1
+# v2.8 — fast-feedback smoke for the dashboard state machine + SIGHUP +
+# decay broadcaster + wire-emit sites. Runs the v2-8 test files
+# specifically BEFORE the full vitest sweep so a regression in this
+# release's surface surfaces in ~10s, not at the tail of a 90s --full
+# run. The full vitest below still runs these tests (the v2-8 files are
+# in the standard tests/ glob), so this is additive, not duplicative.
+extension_state_machine_smoke() {
+  if [ ! -d "$PROJECT_ROOT/tests" ]; then
+    echo "  SKIP  tests/ directory missing"
+    return 0
+  fi
+  if ! ls "$PROJECT_ROOT/tests"/v2-8-*.test.ts >/dev/null 2>&1; then
+    echo "  SKIP  no v2-8 test files present"
+    return 0
+  fi
+  npx vitest run tests/v2-8-agent-state-machine.test.ts tests/v2-8-sighup-handler.test.ts tests/v2-8-decay-broadcaster.test.ts tests/v2-8-wire-emit-sites.test.ts
+}
+step "v2.8 state-machine fast smoke (tests/v2-8-*.test.ts)" extension_state_machine_smoke || exit 1
+
+# v2.8 — Sequential file execution (`--pool=forks --no-file-parallelism`)
+# stabilizes the full root vitest run. The default parallel pool hits
+# pre-existing flakiness around dashboard WebSocket attach + broadcast
+# rate-limit cache when files run concurrently (the WS state is module-
+# level + the rate-limit cache keys collide across parallel tests
+# registering agents under the same name). Sequential adds ~3 minutes
+# to the gate but the prior parallel mode produced ~20 false-failure
+# noise per run. Single-file parallelism via `vitest run <file>` still
+# uses pool parallelism within a file (which is safe — per-test isolate
+# is at function level).
+step "vitest run" npx vitest run --pool=forks --no-file-parallelism || exit 1
 
 # --- 3. npm audit (fail on high+) ---
 # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high after

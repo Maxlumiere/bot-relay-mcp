@@ -1,5 +1,117 @@
 # Changelog
 
+## v2.8.0 — 2026-05-26 — Dashboard daemon precursor: 5-state state machine + SIGHUP + decay broadcaster + wire-emit sites
+
+Closes the dashboard ambiguity the maintainer called out in the 2026-05-21 dashboard recon: an iTerm2 tab-close looked identical to "alive but slow" looked identical to "waiting normally" looked identical to "stale and needs attention". v2.8 fixes the DAEMON side end-to-end; v2.9 (separate arc) will wire the new state model into the actual dashboard UI rendering.
+
+Brief: `audit-findings/v2.8-dashboard-state-machine-brief.md` — all architectural calls locked from the maintainer's 2026-05-25 lock session.
+
+### Consolidated state machine — 5 operator-meaningful states
+
+New module `src/agent-state-machine.ts` exposes `deriveDashboardState(inputs, now, thresholds)` returning one of `'active' | 'pending' | 'waiting' | 'stale' | 'closed'`. Pure function — no I/O, no side effects. Precedence top-wins: `closed > stale > pending > active > waiting`.
+
+| State | Derivation rule |
+|---|---|
+| `closed` | `signal_received_at != null` OR `unregistered_at != null` OR `last_seen` older than `RELAY_SESSION_TIMEOUT_SEC` (default 30 min) |
+| `stale` | was-active inside `RELAY_STATE_WAS_ACTIVE_WINDOW_SEC` (1 hr) AND quiet for `RELAY_STATE_STALE_WINDOW_SEC` (5 min) AND (pendingCount > 0 OR `RELAY_STATE_RECENT_DISPATCH_SEC` window has lastDispatched event) |
+| `pending` | `pendingCount > 0` (caller pre-filters by `RELAY_STATE_PENDING_WINDOW_SEC`, 60s) |
+| `active` | `last_seen` within `RELAY_STATE_ACTIVE_WINDOW_SEC` (30s) |
+| `waiting` | default catch-all |
+
+All six thresholds env-tunable via the listed vars. `resolveThresholdsFromEnv()` falls back to defaults on any invalid value (non-numeric, negative, NaN).
+
+The legacy `deriveAgentStatus` in `src/db.ts:131-159` stays untouched — it returns the pre-v2.8 8-state union (`agent_status`) which existing consumers still read. v2.9 will migrate the dashboard UI; v2.8 only emits the new state on the WebSocket wire and stamps the new DB columns.
+
+### Schema migration — three new NULL-default columns (v12 → v13)
+
+`migrateSchemaToV2_11` (idempotent additive) adds:
+
+- `agents.signal_received_at INTEGER NULL` — epoch ms stamped by `closeAgentSession` when SIGHUP / SIGINT / SIGTERM fires.
+- `agents.signal_kind TEXT NULL` — `'SIGHUP' | 'SIGINT' | 'SIGTERM'`. Operator visibility into which path closed the terminal (iTerm2 tab-close vs ctrl-C vs OS shutdown).
+- `agents.last_dispatched_at INTEGER NULL` — epoch ms of the most recent dispatch-relevant event. Powers the `stale` derivation by distinguishing "was given work to do recently" from "just idle".
+
+All three columns are NULL on existing rows; their absence routes cleanly through the v2.7 fallback paths in `deriveDashboardState` and existing consumers. Schema version 12 → 13. Migration registered in `applyMigration` at both [12, 13] pair AND finalize chain.
+
+### SIGHUP wired alongside existing SIGINT/SIGTERM
+
+`installAutoUnregister` at `src/transport/stdio.ts:151-181` now listens for SIGHUP in addition to SIGINT and SIGTERM. iTerm2 / Terminal.app tab-close and ssh-disconnect both deliver SIGHUP — pre-v2.8 the relay would never mark the agent closed in those paths and the dashboard saw a perpetually-alive ghost. Exit-code semantics preserved per POSIX: SIGINT→130, SIGTERM→143, SIGHUP→129.
+
+`closeAgentSession` at `src/db.ts:1740-1779` extended to accept an optional `signalKind` parameter; when set, it ALSO stamps the new `signal_received_at` + `signal_kind` columns. Non-signal close paths (explicit unregister, dispatcher-driven) preserve their pre-v2.8 column-set (NULL signal columns).
+
+Real-process integration test at `tests/v2-8-sighup-handler.test.ts` — spawns the built `dist/index.js`, sends `process.kill(pid, 'SIGHUP')`, verifies the row's `signal_kind = 'SIGHUP'` + `signal_received_at` populated + exit code 129. Same coverage for SIGINT (regression) + SIGTERM (regression). Per `feedback_test_path_must_match_shipped_path.md`: real OS signal, no mocks.
+
+### Decay-tick broadcaster
+
+New module `src/dashboard-state-broadcaster.ts` with class `DashboardStateBroadcaster`. Runs in the HTTP daemon process only; stdio agents skip it.
+
+- `setInterval` at `RELAY_DECAY_TICK_MS` (default 30000ms).
+- Per tick: for each registered agent compute `deriveDashboardState`, compare to `lastBroadcastedState[name]` (in-memory Map dedup), fire `broadcastDashboardEvent({ event: 'agent.status_changed', entity_id: name, kind: newState })` ONLY on transitions.
+- Steady-state: no events. Wire stays quiet while nothing is changing.
+- Lifecycle: `start()` and `stop()` are idempotent. The class accepts `scheduler` + `now` + `getAgents` + `broadcast` for DI so unit tests use fake clocks/timers without `vi.useFakeTimers()` global pollution.
+- Opt-out via `RELAY_DECAY_TICK_DISABLED=1` (test rigs, smoke).
+
+Token cost: zero. Pure Node setInterval + in-process Map + WS push. No LLM involvement anywhere.
+
+### Wire-emit sites
+
+`broadcastDashboardEvent` calls added at two previously-missing mutation sites so the dashboard sees activity instantly instead of waiting up to a 30s decay tick:
+
+- `src/tools/identity.ts:188-204` — `register_agent` now fires `agent.state_changed` with `kind = 'registered'` (first-mint) or `'reregistered'` (re-register against existing row). Metadata-only per the v2.2.0 H4 audit — no token, no caps payload.
+- `src/transport/stdio.ts:118-130` — `performAutoUnregister` (signal handler) fires `agent.state_changed` with `kind = <signal name>` immediately after `closeAgentSession` succeeds. Pre-v2.8 the close was only visible via the decay broadcaster's next tick (up to 30s latency); now the dashboard sees it instantly.
+
+Existing emit sites (send_message, post_task, update_task, set_status, unregister_agent) ALREADY routed through `fireWebhooks → emitDashboardBroadcast` at `src/webhooks.ts:110-145`, no changes needed there.
+
+`DashboardEvent` union at `src/transport/websocket.ts:66-86` extended with `'agent.status_changed'` for the decay broadcaster's transitions. The pre-v2.8 events (`agent.state_changed`, `message.sent`, `task.transitioned`, `channel.posted`, `dashboard.theme_changed`) all preserved verbatim.
+
+### Tests
+
+`tests/v2-8-agent-state-machine.test.ts` — 32 tests (M1-M32). Every state, every transition, every boundary. Custom-threshold injection. Env-var resolution with fallback on invalid values. Per `feedback_test_asserts_contract_not_proxy.md`: exact `toBe('closed')` style assertions, not proxy checks.
+
+`tests/v2-8-sighup-handler.test.ts` — 3 tests (SH1-SH3). Real OS signals (SIGHUP / SIGINT / SIGTERM) against a forked dist/index.js. Verifies DB columns populated correctly + exit codes match POSIX convention. Skipped on win32.
+
+`tests/v2-8-decay-broadcaster.test.ts` — 19 tests (D1-D19). Mock-clock + ManualScheduler + FakeBroadcastSink. Dedup correctness (no event when state unchanged). All five transitions reachable. Lifecycle (start/stop idempotency). Env resolution.
+
+`tests/v2-8-wire-emit-sites.test.ts` — 6 tests (WE1-WE6). Real HTTP transport + WebSocket round-trip. Asserts each mutation site fires the expected broadcast event with expected `kind` tag.
+
+Brief projected ~40-50 new tests. Honest count: 60. Each test pins a distinct contract — no padding.
+
+### Pre-publish gate
+
+New step `extension_state_machine_smoke` runs the v2-8 test files specifically as a fast feedback loop before the full root vitest. Pre-publish `--full` gate count goes from 18/18 to 19/19.
+
+### Environment variables added
+
+| Var | Default | Affects |
+|---|---|---|
+| `RELAY_STATE_ACTIVE_WINDOW_SEC` | 30 | `deriveDashboardState` active window |
+| `RELAY_STATE_PENDING_WINDOW_SEC` | 60 | pending-message age filter (caller-side) |
+| `RELAY_STATE_STALE_WINDOW_SEC` | 300 | stale promotion quiet threshold |
+| `RELAY_STATE_WAS_ACTIVE_WINDOW_SEC` | 3600 | stale "was active in last hour" guard |
+| `RELAY_SESSION_TIMEOUT_SEC` | 1800 | closed-via-session-timeout cutoff |
+| `RELAY_STATE_RECENT_DISPATCH_SEC` | 600 | stale "recently dispatched" alternative trigger |
+| `RELAY_DECAY_TICK_MS` | 30000 | decay broadcaster interval |
+| `RELAY_DECAY_TICK_DISABLED` | unset | set to "1" to disable decay broadcaster (test rigs) |
+
+### Compatibility
+
+- Schema migration v12 → v13 is additive (ALTER TABLE ADD COLUMN). No DROP, no rename, no breaking change. Rollback to v2.7.x leaves the three columns as unused NULL fields.
+- `closeAgentSession` parameter list extended with optional `signalKind = null`. Existing callers without the parameter preserve the pre-v2.8 column-set (signal columns stay NULL).
+- `DashboardEvent` union additive. Existing dashboard clients that switch on the pre-v2.8 event names ignore the new `agent.status_changed` events without error.
+- v2.9 dashboard UI work depends on this release shipping first — it consumes the new WS events + new DB columns.
+
+### Out of scope (explicitly NOT in v2.8)
+
+- Dashboard UI rendering changes — v2.9 arc. Theme system stays untouched per the maintainer 2026-05-25.
+- Multi-machine federation visibility — v3 federation arc.
+- Heartbeat protocol changes — current keepalive model adequate.
+- Per-agent state notifications via webhook — Phase 4 territory if anyone asks.
+- Operator alerts (toast, sound, email) — v2.10+ if operator pull surfaces this.
+
+### References
+
+- Brief: `audit-findings/v2.8-dashboard-state-machine-brief.md`
+- Auditor: codex-5-5
+
 ## v2.7.4 — 2026-06-03 — spawn-agent.sh kickstart apostrophe-quoting fix (HIGH)
 
 Closes Bug 1 from `audit-findings/v2.7.3-spawn-agent-kickstart-quoting-bug-brief.md` (reported 2026-05-21 by the maintainer + Victra during v2.7.2 dispatch attempts). Spawn-flow hardening; no schema, no API, no runtime behavior changes. Bug 2 (length truncation) from the same brief is NOT in scope — that's a separate arc requiring token pre-mint + message ordering work.

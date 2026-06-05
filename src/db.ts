@@ -214,6 +214,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_8(_db);
   migrateSchemaToV2_9(_db);
   migrateSchemaToV2_10(_db);
+  migrateSchemaToV2_11(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 }
@@ -248,6 +249,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_8(_db);
   migrateSchemaToV2_9(_db);
   migrateSchemaToV2_10(_db);
+  migrateSchemaToV2_11(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 
@@ -468,7 +470,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -554,7 +556,7 @@ export function applyMigration(from: number, to: number): void {
   // DB with a stale recorded version (Codex R1 finding).
   const registeredPairs: Array<[number, number]> = [
     [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],
-    [7, 8], [8, 9], [9, 10], [10, 11], [11, 12],
+    [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1250,6 +1252,51 @@ function migrateSchemaToV2_10(db: CompatDatabase): void {
   `);
 }
 
+/**
+ * v2.8 dashboard-state-machine — agent state machine signal/dispatch columns
+ * (schema v12 → v13, committed in audit-findings/v2.8-dashboard-state-machine-brief.md).
+ *
+ * Three new NULL-default columns on `agents` to support the 5-state
+ * `deriveDashboardState` derivation:
+ *
+ *   - `signal_received_at INTEGER NULL` — epoch ms when the agent's stdio
+ *     process caught SIGHUP / SIGINT / SIGTERM. NULL until a signal fires.
+ *     Populated by `installAutoUnregister` at src/transport/stdio.ts so the
+ *     `closed` state can be derived without a wall-clock heuristic on
+ *     last_seen.
+ *   - `signal_kind TEXT NULL` — one of 'SIGHUP' / 'SIGINT' / 'SIGTERM' for
+ *     dashboard visibility into which path closed the terminal. iTerm2
+ *     tab-close sends SIGHUP; ctrl-C sends SIGINT; OS shutdown sends
+ *     SIGTERM. Operator-meaningful distinction surfaced in v2.9 UI.
+ *   - `last_dispatched_at INTEGER NULL` — epoch ms of the most recent
+ *     dispatch-relevant event (high-priority message received, task
+ *     posted to this agent). Powers the `stale` derivation by answering
+ *     "was this agent given something to do recently?" — agents that
+ *     went quiet without recent dispatch are `waiting`, not `stale`.
+ *
+ * All three columns are NULL on existing rows; their absence cleanly
+ * routes through the v2.7 fallback path in `deriveDashboardState`
+ * (no signal → no `closed` derivation; no dispatch → no `stale`
+ * promotion).
+ *
+ * Additive + idempotent — runs on every init, but ALTER TABLE ADD COLUMN
+ * is guarded by PRAGMA table_info inspection so re-runs are no-ops.
+ */
+function migrateSchemaToV2_11(db: CompatDatabase): void {
+  const agentCols = db
+    .prepare("PRAGMA table_info(agents)")
+    .all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "signal_received_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN signal_received_at INTEGER");
+  }
+  if (!agentCols.some((c) => c.name === "signal_kind")) {
+    db.exec("ALTER TABLE agents ADD COLUMN signal_kind TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "last_dispatched_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN last_dispatched_at INTEGER");
+  }
+}
+
 function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -1689,13 +1736,37 @@ export function markAgentOffline(
  */
 export function closeAgentSession(
   name: string,
-  expectedSessionId: string
+  expectedSessionId: string,
+  /**
+   * v2.8 — optional signal kind that triggered this close. Mirrors
+   * into the new `signal_received_at` + `signal_kind` columns the
+   * v2.8 state machine reads. Stays NULL for non-signal close paths
+   * (e.g. explicit unregister via MCP tool), which keeps the legacy
+   * `agent_status='closed'` semantics intact while the v2.8
+   * `deriveDashboardState` derivation routes through
+   * `signalReceivedAt` for signal-triggered closes specifically.
+   */
+  signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null = null,
 ): { changed: boolean } {
   const db = getDb();
+  // Conditional UPDATE so non-signal callers preserve the legacy
+  // behavior: signal_received_at + signal_kind stay NULL unless this
+  // call carries one. Two SQL forms are cheaper to maintain than a
+  // dynamic builder + safer than a single COALESCE form that could
+  // smuggle a NULL through and clear an already-set signal stamp.
+  if (signalKind === null) {
+    const r = db.prepare(
+      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL " +
+      "WHERE name = ? AND session_id = ?"
+    ).run(name, expectedSessionId);
+    return { changed: r.changes === 1 };
+  }
+  const nowMs = Date.now();
   const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL " +
+    "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
+    "signal_received_at = ?, signal_kind = ? " +
     "WHERE name = ? AND session_id = ?"
-  ).run(name, expectedSessionId);
+  ).run(nowMs, signalKind, name, expectedSessionId);
   return { changed: r.changes === 1 };
 }
 
@@ -2401,6 +2472,144 @@ export function getAgentAuthData(name: string): AgentRecord | null {
  * operator actions and still wipe by name. The auto-unregister SIGINT handler
  * passes its captured session_id.
  */
+/**
+ * v2.8 dashboard-state-machine — roles that count as "dispatch-relevant"
+ * recipients for the `last_dispatched_at` stamp.
+ *
+ * Brief at `audit-findings/v2.8-dashboard-state-machine-brief.md:43`:
+ *   "set by send_message when message has priority='high' OR recipient
+ *    is a builder role"
+ *
+ * The set is intentionally tight: roles that represent agents whose
+ * "I was given work" signal is operationally meaningful for the
+ * dashboard's `stale` derivation (i.e. they're expected to be doing
+ * work in response to messages/tasks, not just observing).
+ *
+ * If you need to extend the set, update CHANGELOG.md to document the
+ * new role + the rationale before merging. The state machine reads
+ * `last_dispatched_at` to discriminate `stale` (was working, went
+ * quiet, recently dispatched) from `waiting` (just idle), so adding
+ * roles widens the `stale` surface.
+ */
+export const DISPATCH_RELEVANT_ROLES: ReadonlySet<string> = new Set([
+  "builder",
+  "auditor",
+  "researcher",
+  "reviewer",
+  "recon",
+]);
+
+/**
+ * v2.8 dashboard-state-machine — stamp `agents.last_dispatched_at` on the
+ * recipient row when the dispatch event qualifies. Called from
+ * `sendMessage`, `postTask`, `postTaskAuto` after the message/task
+ * commit so the row only gets stamped when the dispatch actually
+ * landed.
+ *
+ * Stamping rule (mirrors brief at `:43`):
+ *   - priority === 'high' (or 'critical')  → STAMP
+ *   - recipient role in DISPATCH_RELEVANT_ROLES → STAMP
+ *   - otherwise → NO-OP
+ *
+ * Best-effort: if the recipient row doesn't exist (rare race after
+ * unregister) or the role lookup throws, the stamp is silently
+ * skipped. The dispatch itself already committed; missing the
+ * dashboard breadcrumb is non-fatal to the messaging contract.
+ */
+export function markRecipientDispatched(
+  recipientName: string,
+  priority: string | null,
+): void {
+  if (!recipientName || recipientName === "system") return;
+  const db = getDb();
+  try {
+    const row = db
+      .prepare("SELECT role FROM agents WHERE name = ?")
+      .get(recipientName) as { role: string } | undefined;
+    if (!row) return;
+    const p = (priority ?? "").toLowerCase();
+    const highPriority = p === "high" || p === "critical";
+    const dispatchRole = DISPATCH_RELEVANT_ROLES.has(row.role);
+    if (!highPriority && !dispatchRole) return;
+    db.prepare("UPDATE agents SET last_dispatched_at = ? WHERE name = ?").run(
+      Date.now(),
+      recipientName,
+    );
+  } catch {
+    // best-effort — never break the dispatch commit path
+  }
+}
+
+/**
+ * v2.8 dashboard-state-machine — bulk-fetch the registered agents in
+ * the shape the decay broadcaster's `BroadcasterAgentSnapshot[]` needs.
+ *
+ * Pre-filters pending message counts by `created_at < now - pendingWindowMs`
+ * per the brief's contract — only messages older than the pending window
+ * count toward the `pending` derivation (fresh mail isn't "pending,
+ * operator should look"; it's "active, agent is processing").
+ *
+ * `agent_state_machine.ts:207-212` explicitly says callers must do
+ * this pre-filter BEFORE passing `pendingCount` to `deriveDashboardState`.
+ *
+ * Single SQL round-trip: agents JOIN messages (filtered by age). For
+ * typical N < 20 registered agents this is fast.
+ */
+export function getDashboardAgentSnapshots(
+  pendingWindowMs: number,
+  nowMs: number = Date.now(),
+): Array<{
+  name: string;
+  inputs: {
+    lastSeen: string | null;
+    signalReceivedAt: number | null;
+    signalKind: string | null;
+    unregisteredAt: number | null;
+    pendingCount: number;
+    lastDispatchedAt: number | null;
+  };
+}> {
+  const db = getDb();
+  const cutoffIso = new Date(nowMs - pendingWindowMs).toISOString();
+  const rows = db
+    .prepare(
+      `SELECT
+         a.name,
+         a.last_seen,
+         a.signal_received_at,
+         a.signal_kind,
+         a.last_dispatched_at,
+         (SELECT COUNT(*) FROM messages m
+           WHERE m.to_agent = a.name
+             AND m.status = 'pending'
+             AND m.created_at < ?) AS pending_count_old
+       FROM agents a`,
+    )
+    .all(cutoffIso) as Array<{
+    name: string;
+    last_seen: string | null;
+    signal_received_at: number | null;
+    signal_kind: string | null;
+    last_dispatched_at: number | null;
+    pending_count_old: number | bigint;
+  }>;
+  return rows.map((r) => ({
+    name: r.name,
+    inputs: {
+      lastSeen: r.last_seen,
+      signalReceivedAt: r.signal_received_at,
+      signalKind: r.signal_kind,
+      // Production rows that completed unregister have been DELETEd
+      // from the agents table (src/db.ts:2475-2492), so observed rows
+      // never carry an `unregisteredAt`. The state machine field stays
+      // useful for test fixtures.
+      unregisteredAt: null,
+      pendingCount: Number(r.pending_count_old),
+      lastDispatchedAt: r.last_dispatched_at,
+    },
+  }));
+}
+
 export function unregisterAgent(name: string, expectedSessionId?: string): boolean {
   const db = getDb();
   let result: { changes: number };
@@ -2694,6 +2903,11 @@ export function sendMessage(
     // updated push without polling. (Same-process fast path; cross-process
     // path is the outbox tail in the HTTP daemon.)
     emitInboxChanged({ agent_name: to, reason: "message_received", id: outboxId });
+    // v2.8 — stamp recipient's last_dispatched_at when the dispatch is
+    // priority='high'/'critical' OR recipient role is in
+    // DISPATCH_RELEVANT_ROLES. Best-effort: never throws into the
+    // sendMessage path. See markRecipientDispatched for the rule.
+    markRecipientDispatched(to, priority);
     return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
   }
 
@@ -2739,6 +2953,12 @@ export function sendMessage(
   // a subscriber that immediately re-fetches the resource sees the
   // freshly-inserted row.
   emitInboxChanged({ agent_name: to, reason: "message_received", id: outboxId });
+
+  // v2.8 — stamp recipient's last_dispatched_at when qualified. See
+  // the system-sender branch above for the rule. Mirrored both sides
+  // so a `system → builder` priority='high' DM stamps correctly
+  // alongside a `user-to-user` send.
+  markRecipientDispatched(to, priority);
 
   return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
 }
@@ -3240,6 +3460,12 @@ export function postTask(
     "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?)"
   ).run(id, from, to, title, encDescription, priority, timestamp, timestamp);
 
+  // v2.8 — a task post IS a dispatch event per CHANGELOG.md:31 ("was
+  // given work to do recently"). Stamp the recipient's
+  // last_dispatched_at on the same rules as sendMessage (priority +
+  // role allowlist). Best-effort.
+  markRecipientDispatched(to, priority);
+
   return {
     id,
     from_agent: from,
@@ -3592,6 +3818,10 @@ export function postTaskAuto(
       "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?, ?)"
     ).run(id, from, pick.name, title, encDescription, priority, timestamp, timestamp, capsJson);
 
+    // v2.8 — task auto-routing IS a dispatch event. Stamp the routed
+    // recipient's last_dispatched_at on the same rules as sendMessage.
+    markRecipientDispatched(pick.name, priority);
+
     return {
       task: {
         id, from_agent: from, to_agent: pick.name, title, description, priority,
@@ -3659,6 +3889,12 @@ export function tryAssignQueuedTasksTo(
 
     const result = casUpdate.run(agentName, now(), row.id);
     if (result.changes === 1) {
+      // v2.8 R3 — deferred queued-task pickup IS a dispatch event,
+      // same contract as the immediate postTaskAuto route at :3823.
+      // Without this, agents.last_dispatched_at stays NULL for
+      // queued-then-picked-up tasks and the state machine derives
+      // them as `waiting` instead of `stale` after the quiet window.
+      markRecipientDispatched(agentName, row.priority);
       assigned.push({
         task_id: row.id,
         from_agent: row.from_agent,
