@@ -18,6 +18,7 @@ import {
   NameCollisionActiveError,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
+import { broadcastDashboardEvent } from "../transport/websocket.js";
 import { log } from "../logger.js";
 import { currentContext } from "../request-context.js";
 import { updateCapturedSessionId } from "../transport/stdio.js";
@@ -182,6 +183,24 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   } catch {
     // Never block register on a re-capture failure — SIGTERM will fall back to
     // the null-guard path, which is safe.
+  }
+
+  // v2.8 wire-emit-sites — register_agent didn't broadcast pre-v2.8, so
+  // a fresh registration left the dashboard in the dark until the decay
+  // broadcaster's next tick (up to 30s). Fire an immediate
+  // agent.state_changed event with kind=registered (first-mint) or
+  // kind=reregistered (re-register against an existing row) so the
+  // dashboard reacts in real-time. Metadata-only per the v2.2.0 H4
+  // contract — no token, no caps payload.
+  try {
+    broadcastDashboardEvent({
+      event: "agent.state_changed",
+      entity_id: agent.name,
+      ts: new Date().toISOString(),
+      kind: plaintext_token ? "registered" : "reregistered",
+    });
+  } catch {
+    /* swallow — broadcast is already best-effort inside the helper */
   }
 
   // v2.0 beta.1 (Codex HIGH 4): auto_assigned is produced inside registerAgent

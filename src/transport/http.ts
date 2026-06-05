@@ -18,11 +18,17 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots } from "../db.js";
 import { verifyToken } from "../auth.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "./websocket.js";
 import { attachDashboardWs } from "./websocket.js";
+import {
+  DashboardStateBroadcaster,
+  resolveTickIntervalMs,
+  isDisabledByEnv,
+} from "../dashboard-state-broadcaster.js";
+import { resolveThresholdsFromEnv } from "../agent-state-machine.js";
 import {
   checkHostHeader,
   checkOrigin,
@@ -1691,6 +1697,37 @@ export function startHttpServer(port: number, host: string): Server {
   // http.Server. Hijacks only /dashboard/ws upgrades; every other upgrade
   // path is left untouched. Auth is checked inside attachDashboardWs.
   attachDashboardWs(server);
+
+  // v2.8 dashboard-state-machine — start the decay broadcaster on the
+  // HTTP daemon process. The class itself was added in src/dashboard-
+  // state-broadcaster.ts (v2.8 R0) but never wired to production
+  // (codex R0 P1 finding). R1 closes that gap.
+  //
+  // Lifecycle: broadcaster runs while the HTTP server is alive; the
+  // `close` event listener tears it down so a graceful shutdown leaves
+  // no leaked interval handle. Opt-out via `RELAY_DECAY_TICK_DISABLED=1`
+  // for test rigs that drive ticks manually (the v2-8-decay-broadcaster.
+  // test.ts unit suite uses this).
+  //
+  // Snapshot provider: `getDashboardAgentSnapshots` in db.ts does a
+  // single SELECT joining agents + pending-message counts pre-filtered
+  // by `pendingWindowMs` per the brief's contract — only mail older
+  // than the pending window counts toward the `pending` derivation.
+  // Fresh mail is "active, agent is processing"; old mail is "pending,
+  // operator should look."
+  if (!isDisabledByEnv()) {
+    const thresholds = resolveThresholdsFromEnv();
+    const broadcaster = new DashboardStateBroadcaster({
+      getAgents: () => getDashboardAgentSnapshots(thresholds.pendingWindowMs),
+      broadcast: broadcastDashboardEvent,
+      tickIntervalMs: resolveTickIntervalMs(),
+      thresholds,
+    });
+    broadcaster.start();
+    server.once("close", () => {
+      broadcaster.stop();
+    });
+  }
 
   return server;
 }
