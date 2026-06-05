@@ -205,6 +205,68 @@ extension_test_unit() {
 }
 step "extension vitest run (extensions/vscode — bundle + VSIX drift guards)" extension_test_unit || exit 1
 
+# --- 4d. Lockfile version-sync guard (v2.8.0 R1) ----------------------------
+#
+# Catches the v2.8.0 R0 drift class: package.json says version X.Y.Z but
+# package-lock.json's root entries (.version and .packages[""].version)
+# say something else. `npm ci` does NOT validate this drift — it only
+# verifies the dependency tree resolves. The published tarball carries
+# package.json's version (the version npm registers), while the lockfile
+# inside the tarball still advertises the prior version. Consumer-visible
+# inconsistency in their node_modules tree.
+#
+# Origin: v2.8.0 R0 commit ad9ac9fd shipped with package.json=2.8.0 +
+# package-lock.json root=2.7.4. The rebase that produced it resolved a
+# lockfile conflict via `--ours` (keeping main's 2.7.4 lockfile), then
+# the operator regenerated the lockfile in the working tree but never
+# amended the regen back into the rebase commit. CI passed (`npm ci`
+# doesn't check this), and the pre-publish gate passed because it ran
+# against the working-tree lockfile (which had been regenerated to
+# 2.8.0) — never against the committed lockfile. Caught only at the
+# post-merge pre-tag verification; v2.8.0 R1 fast-follow added this
+# guard the same round.
+#
+# Same shape as the engines.node mismatch codex caught on v2.7.3 R0
+# (msg bd771cb3 — codex compared package.json.engines vs
+# package-lock.json.packages[""].engines and found a 2-line drift).
+# Generalized here to the version fields, which are the more
+# consequential pair (npm publishes the package.json version regardless
+# of lockfile contents).
+lockfile_version_sync_guard() {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "jq not found — cannot validate lockfile version sync" >&2
+    return 1
+  fi
+  local pkg_version
+  local lock_root_version
+  local lock_pkg_version
+  pkg_version=$(jq -r '.version' "$PROJECT_ROOT/package.json") || {
+    echo "Failed to read package.json version" >&2
+    return 1
+  }
+  lock_root_version=$(jq -r '.version' "$PROJECT_ROOT/package-lock.json") || {
+    echo "Failed to read package-lock.json root .version" >&2
+    return 1
+  }
+  lock_pkg_version=$(jq -r '.packages[""].version' "$PROJECT_ROOT/package-lock.json") || {
+    echo "Failed to read package-lock.json .packages[\"\"].version" >&2
+    return 1
+  }
+  if [ "$pkg_version" != "$lock_root_version" ] || [ "$pkg_version" != "$lock_pkg_version" ]; then
+    echo "package.json <-> package-lock.json version drift:" >&2
+    echo "  package.json .version:               $pkg_version" >&2
+    echo "  package-lock.json .version:          $lock_root_version" >&2
+    echo "  package-lock.json .packages[\"\"]:     $lock_pkg_version" >&2
+    echo "" >&2
+    echo "Fix: rm -rf node_modules package-lock.json && npm install" >&2
+    echo "Then \`git add package-lock.json\` + commit (or \`git commit --amend\` if mid-rebase)." >&2
+    return 1
+  fi
+  echo "Lockfile version synced — package.json=$pkg_version matches both lockfile root + packages[\"\"]"
+  return 0
+}
+step "lockfile version sync (package.json↔package-lock.json)" lockfile_version_sync_guard || exit 1
+
 # --- 5. Drift guard (src/) ---
 # Any string literal matching /["']\d+\.\d+\.\d+["']/ inside src/ that is NOT
 # in one of the two authoritative version files (src/version.ts for package
