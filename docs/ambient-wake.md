@@ -47,7 +47,7 @@ On every wake check:
    - **Different epoch** → DB was backed-up or restored. Reset `cached_last_seen` to 0 and drain from scratch. Update cached epoch.
    - **Same epoch + `total_unread_count > 0`** → there's new mail addressed to this agent that hasn't been observed yet. Drain via `get_messages(peek=true)` (or `peek=false` to consume).
    - **Same epoch + `total_unread_count === 0`** → no new mail since this agent's last drain. Stay idle.
-3. `last_seq` is secondary: use it to detect "how far have I already read" across reconnects. It only advances when the agent CALLS `get_messages` (seqs are assigned at delivery time, not at send time), so polling `last_seq` alone will never see fresh mail until you drain — that's why `total_unread_count` is the watch-signal.
+3. `last_seq` is secondary: use it to detect "how far have I already read" across reconnects. It only advances when the agent CALLS `get_messages` — `seq` itself is assigned on FIRST OBSERVATION (the recipient's drain path at `src/db.ts:3181-3199` runs `UPDATE messages SET seq = ... WHERE seq IS NULL` inside `get_messages`, NOT on send and NOT on delivery). Polling `last_seq` alone will never see fresh mail until you drain — that's why `total_unread_count` is the watch-signal.
 
 **Field semantics cheat sheet:**
 
@@ -134,7 +134,7 @@ Use `peek_inbox_version` on a 30-second interval. When the epoch changes, reset 
 
 Pre-v2.3.0 clients that never call `peek_inbox_version` see identical behavior — `get_messages` still works exactly the same way (including the v2.2.2 `peek` parameter). The new seq/epoch columns are transparently populated on first read.
 
-Pre-v2.3.0 messages (those written before the v11 migration) get `seq=NULL + epoch=NULL` at rest. The first time their recipient reads them, they're assigned a seq + epoch by the v2.3.0 delivery-time-assignment code path.
+Pre-v2.3.0 messages (those written before the v11 migration) get `seq=NULL + epoch=NULL` at rest. The first time their recipient reads them via `get_messages`, they're assigned a seq + epoch by the v2.3.0 first-observation assignment code path (`src/db.ts:3181-3199`).
 
 ---
 
