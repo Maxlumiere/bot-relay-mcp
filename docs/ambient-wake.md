@@ -1,6 +1,8 @@
 # Ambient wake (Phase 4s)
 
-v2.3.0 adds Phase 4s: a universal idle-wake pattern that works with any MCP-speaking client, not just Claude Code. Every message/task delivered to an agent advances a per-recipient monotonic `seq`. Clients poll `peek_inbox_version` cheaply to detect "anything new", then drain via `get_messages` only when the seq has advanced.
+v2.3.0 adds Phase 4s: a universal idle-wake pattern that works with any MCP-speaking client, not just Claude Code. When the daemon delivers a message to an agent, the row is written with `seq=NULL` — i.e., as an *unread* row tied to that recipient's mailbox (see `src/db.ts:3014-3021`). Clients poll `peek_inbox_version` cheaply to read the count of unread rows, then drain via `get_messages` only when that count says there is new mail.
+
+> **Wake signal = `total_unread_count`, NOT `last_seq`.** This is the v2.3.0 Codex HIGH #2 contract locked at `src/db.ts:3014-3021`: `seq` is assigned at FIRST OBSERVATION (when the recipient calls `get_messages`), not at send time. So `last_seq` doesn't advance on delivery — it advances when the recipient drains. The authoritative "new mail since I last drained" signal is the count of `seq IS NULL` rows, surfaced as `total_unread_count` (`src/server.ts:641-644` + `src/db.ts:3019-3021`). Any client design that watches `last_seq` for new-mail detection will miss every pre-first-observation arrival.
 
 ## Why it matters
 
@@ -11,8 +13,8 @@ Pre-v2.3.0, clients had no cheap way to detect "is there new mail". Options were
 
 Neither scales. Ambient-wake splits the control plane from the data plane:
 
-- **Control plane** (`peek_inbox_version`): returns a tiny integer + UUID epoch + count. Cheap; safe to poll on any tool-use hook.
-- **Data plane** (`get_messages`): only called when peek says the seq has advanced.
+- **Control plane** (`peek_inbox_version`): returns a tiny JSON envelope — mailbox UUID + epoch UUID + the three counters (`last_seq`, `total_messages_count`, `total_unread_count`). Cheap; safe to poll on any tool-use hook.
+- **Data plane** (`get_messages`): only called when peek says drain is needed — i.e., `total_unread_count > 0` OR `epoch` differs from the client's cached epoch (the epoch-mismatch branch is the backup/restore-invalidation path).
 
 ## Mailbox model (Codex Q9 locked design, 2026-04-19)
 

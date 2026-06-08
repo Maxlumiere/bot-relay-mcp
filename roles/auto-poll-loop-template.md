@@ -24,11 +24,13 @@ Replace `<MY_AGENT_NAME>` with the agent's actual name (matches what `register_a
 
 `ScheduleWakeup` clamps to `[60, 3600]`. Pick based on operator phase:
 
-| Cadence | When to use | Idle cost (est., per-hr) |
+| Cadence | When to use | Idle cost (per-hr) |
 |---|---|---|
-| `60` | Hot iteration, real-time chain | ~40-60k tokens/hr (cache warm) |
+| `60` | Hot iteration, real-time chain | ~60-90k tokens/hr (cache warm) |
 | `270` | Default — active work day | ~13-20k tokens/hr (cache warm) |
 | `1800` | Idle / overnight / background | ~2-3k tokens/hr (1 cache miss per tick) |
+
+Numbers above are from a real `peek_inbox_version` call against the live daemon (`docs/ambient-wake.md` § "Measured token costs" is authoritative — check there if the table here drifts). 60s row updated to match the measured doc per codex audit `d5f45679-A`.
 
 **Don't pick 300s.** The 5-minute Anthropic prompt-cache TTL boundary is the worst-of-both: you pay the cache miss without amortizing it. Either stay under 270s (warm cache) or jump to 1200s+. See the ScheduleWakeup tool description for full guidance.
 
