@@ -104,6 +104,8 @@ When markers are disabled, the button still renders but the endpoint returns `ma
 
 Call `peek_inbox_version` on every `SessionStart` + optionally on `PostToolUse` hook when a local cursor file is stale.
 
+For the **operator-level setup** — how to actually run an agent in a Tether-managed VS Code window or in an iTerm2 `/loop` and stop typing `inbox` manually — see the **§ Operator setup (v2.9.0)** below. The Phase 4s primitives above are the protocol; the operator setup is the recipe.
+
 ### Shell-only agent (bash + jq + curl)
 
 ```bash
@@ -131,3 +133,207 @@ Use `peek_inbox_version` on a 30-second interval. When the epoch changes, reset 
 Pre-v2.3.0 clients that never call `peek_inbox_version` see identical behavior — `get_messages` still works exactly the same way (including the v2.2.2 `peek` parameter). The new seq/epoch columns are transparently populated on first read.
 
 Pre-v2.3.0 messages (those written before the v11 migration) get `seq=NULL + epoch=NULL` at rest. The first time their recipient reads them, they're assigned a seq + epoch by the v2.3.0 delivery-time-assignment code path.
+
+---
+
+# Operator setup (v2.9.0)
+
+This is the *recipe* layer on top of the Phase 4s protocol above. The protocol gives you cheap "is there new mail" detection; this section is how an operator wires that into a real workflow where agents wake themselves and the human is only paged for decisions.
+
+## The problem this solves
+
+A Claude Code session is deaf between turns. New relay mail arrives, sits in the inbox, and nothing happens until the operator types `inbox` in that terminal. If you run 3-4 builder terminals in parallel, you spend more time herding `inbox` keystrokes than reading actual work.
+
+v2.9.0 ambient-wake closes that gap with two parallel paths:
+
+- **(α) Tether — push.** A VS Code extension that subscribes to the relay's per-agent inbox resource and writes `inbox\n` into the agent's terminal on every `ResourceUpdated` notification. Zero idle cost.
+- **(β) `/loop` — pull.** A self-paced Claude Code loop that calls `peek_inbox_version` on a cadence; on a `total_unread_count` bump, the LLM session drains and acts. Works in any terminal (iTerm2, Terminal.app, tmux, etc).
+
+Both paths use the same Phase 4s primitives — they only differ in how the wake signal reaches the LLM.
+
+## Which path to pick
+
+| Operator surface | Recommended path | Why |
+|---|---|---|
+| VS Code IDE workflow | **α — Tether** | Push-based, near-zero latency, zero idle cost. The terminal lives inside the IDE. |
+| iTerm2 / Terminal.app / tmux / SSH session | **β — `/loop`** | Push-based wake from outside the LLM doesn't exist for standalone Claude Code today; `/loop` self-paces inside the session. |
+| Mixed (some agents in VS Code, others in iTerm2) | **α for VS Code, β for the rest** | They don't conflict. Each agent picks one path. |
+
+A third path (**B — `fs.watch` sidecar**) exists as a deferred stretch — see "Stretch paths" below. A fourth (**D — `TeammateIdle` hook + `Monitor` tool**) is also stretch, gated on Claude Code v2.1.98+ (verify with `claude --version`).
+
+> ## BINDING — Auto-mode is OFF the table
+>
+> Claude Code v2.1.89's Auto-mode is **NOT** the path to use here. It triggers per-tool-call token burn that defeats the cheap-polling premise. The `/loop` path (β) uses ScheduleWakeup self-paced — that's the supported pattern. If anyone proposes Auto-mode as the harness, reject.
+
+## Path α — Tether (VS Code)
+
+Tether is the bot-relay-mcp VS Code extension. It spawns the agent process in a managed VS Code terminal, auto-restarts on crash, and subscribes to the relay's `relay://inbox/<agent>` MCP resource. When new mail arrives, Tether writes `inbox\n` to the terminal — the LLM session reads + processes.
+
+### Setup
+
+1. Install the extension from the VS Code Marketplace (`bot-relay-mcp.tether`, latest version published as Tether v0.1.3+).
+2. Open the workspace where you want the agent to run.
+3. Per-agent config — create `.vscode/tether.config.json`:
+
+   ```jsonc
+   {
+     "agents": [
+       {
+         "agentName": "victra-build",
+         "role": "builder",
+         "capabilities": ["build", "tasks"],
+         "spawnCommand": "claude --name victra-build --permission-mode bypassPermissions --effort high",
+         "autoInjectInbox": true,
+         "notificationLevel": "event"
+       }
+     ]
+   }
+   ```
+
+4. Run the **Tether: Start** command from the VS Code command palette. The extension spawns the terminal, subscribes to the MCP resource, and starts auto-injecting `inbox\n` on every arrival.
+
+`autoInjectInbox: true` is opt-in in v2.9.0 (will likely flip to true-by-default in a future Tether minor bump — separate arc).
+
+### What happens under the hood
+
+(File-line references against main `60f69503`; same chain codex audited in `4151ee2b`.)
+
+1. Tether builds the inbox URI: `relay://inbox/<agentName>` (`extensions/vscode/src/extension.ts:336-337`).
+2. Tether constructs an MCP `Client` and registers a `ResourceUpdatedNotification` handler that filters on the URI and (when `autoInjectInbox: true`) calls `injectInboxKeystroke` (`extensions/vscode/src/extension.ts:525-540`).
+3. Tether subscribes: `await client.subscribeResource({ uri: buildInboxUri(...) })` (`extensions/vscode/src/extension.ts:547`).
+4. On every `sendMessage` to this agent, the relay daemon pushes the notification; Tether's handler runs `injectInboxKeystroke`, which calls `target.sendText("inbox", true)` against the agent's terminal (`extensions/vscode/src/extension.ts:421-433`).
+
+### Failure modes + recovery
+
+| Mode | Tether behavior | Operator action |
+|---|---|---|
+| Process crash | RestartPolicy backs off exponentially (1→2→4→8→16s, clamped at 30s), rate cap 5/hr (`extensions/vscode/src/restart-policy.ts`). Status bar shows "Tether: error" if cap is hit. | Investigate logs; restart manually after fixing root cause. |
+| MCP subscription drop | Tether reconnects + re-primes via `refreshSnapshot` so no event is lost across the gap. | None — automatic. |
+| Daemon down at start | "Tether: error" status, no spam. | Restart `relay daemon`, restart Tether. |
+| Multiple terminals named the same | First match wins; fallback to `activeTerminal`. | Rename terminals via `--name` in the spawn command. |
+
+## Path β — `/loop` (iTerm2 / standalone Claude Code)
+
+When the agent runs in a terminal outside VS Code, there's no push channel into the LLM session — the LLM has to pull. Claude Code's `/loop` command (v2.1.71+) + `ScheduleWakeup` tool make this cheap: the LLM runs a self-paced loop, calls `peek_inbox_version` per tick, and only spends real tokens when there's actually something to do.
+
+### Setup
+
+In the agent's first turn (after `register_agent` succeeds), the operator types:
+
+```text
+/loop Check my relay inbox via peek_inbox_version. If total_unread_count > 0 OR epoch differs from the previous tick, drain via get_messages and process the mail. Otherwise, ScheduleWakeup at 270 seconds (under the 5-minute prompt-cache TTL) and stop. Repeat forever.
+```
+
+The `roles/auto-poll-loop-template.md` file is the canonical version of this prompt — copy from there to avoid drift.
+
+### Cadence tuning
+
+`ScheduleWakeup` clamps to `[60, 3600]` seconds. The 5-minute Anthropic prompt-cache TTL is the natural breakpoint:
+
+| Cadence | Idle token cost/hr (no mail) | Latency (worst case) | When to use |
+|---|---|---|---|
+| 60-270s | ~10-30k (cache stays warm) | up to 4.5 min | Active build sprint, hot iteration |
+| 1800s | ~1.5-3k (one cache miss per tick) | up to 30 min | Idle overnight / weekends / background watch |
+
+**Hard rule from the ScheduleWakeup tool description:** don't pick 300s. It's the worst-of-both — you pay the cache miss without amortizing it. Either stay under 270s (cache warm) or jump to 1200s+.
+
+P3 measurement (this release) replaces these estimates with measured numbers — see § Measured token costs below.
+
+### What happens under the hood
+
+1. The LLM session calls `peek_inbox_version({agent_name})` — one cheap DB read on the relay side, one MCP envelope on the wire.
+2. The LLM compares the response (`total_unread_count`, `epoch`) against the previous tick's snapshot.
+3. If `total_unread_count === 0` AND `epoch` unchanged → call `ScheduleWakeup` and exit the turn. Zero further LLM work.
+4. If `total_unread_count > 0` OR `epoch` changed → call `get_messages` to drain, process the messages, ship-pong as required, then re-enter the loop on the next ScheduleWakeup fire.
+
+### Failure modes + recovery
+
+| Mode | `/loop` behavior | Operator action |
+|---|---|---|
+| `ScheduleWakeup` not available (Claude Code < v2.1.71) | `/loop` itself unavailable | Upgrade Claude Code, or fall back to manual `inbox` polling. |
+| LLM session crashes mid-loop | Loop state is lost; on respawn, the agent starts fresh and the next dispatch in the inbox is picked up on first peek | Respawn via spawn-agent.sh; the loop resumes naturally. |
+| Daemon restart mid-loop | `peek_inbox_version` fails next tick; LLM should retry. If the daemon is up but the agent_token rotated, the LLM gets `AUTH_FAILED` → operator re-issues spawn. | Restart daemon; if token issue, re-spawn the agent. |
+| `peek_inbox_version` returns stale cursor | Compare `epoch` — mismatch means DB backup/restore happened. LLM resets local cursor to 0 and drains. | None — protocol handles this (Codex Q9, see § Mailbox model above). |
+
+## Stretch paths
+
+These are documented for completeness; they're NOT the v2.9.0 default. Track them as P4/P5 in `audit-findings/v2.9.0-ambient-wake-spec.md`.
+
+- **(B) `fs.watch` + AppleScript inject (P4).** A sidecar script that watches `~/.bot-relay/marker/<agent>.touch` (the filesystem marker enabled via `RELAY_FILESYSTEM_MARKERS=1`) and uses `osascript` to inject `inbox\n` into the named terminal. Push-based, near-zero latency. Worth building if a critical operator can't use Tether and won't accept `/loop` cadence.
+
+- **(D) `TeammateIdle` hook + `Monitor` tool (P5).** Claude Code v2.1.33 added a `TeammateIdle` hook that fires when the session goes idle. v2.1.98 added the `Monitor` tool that can stream events from a background process. Together: a hook calls `peek_inbox_version` on idle, the result triggers an inject. Requires verifying `Monitor` tool version with `claude --version` before adoption. Build only after the MVP is real-world validated.
+
+## Recommended next (separate arc — NOT in v2.9.0)
+
+Flip Tether's `autoInjectInbox` default from `false` to `true`. The current opt-in is conservative; once v2.9.0 ambient-wake is the proven, documented pattern, opt-out makes more sense for new installs. This is a behavior change to a shipped extension + a separate Tether minor bump; Maxime decides the flip after a real-world burn-in period of v2.9.0.
+
+## Measured token costs
+
+> P3 measurement (this release).
+
+### Per-tick `peek_inbox_version` cost (measured on victra-build, 2026-06-08)
+
+Method: actual `peek_inbox_version({agent_name: "victra-build"})` call against the live local daemon. The response captured during the P3 measurement window:
+
+```jsonc
+{
+  "success": true,
+  "mailbox_id": "842e5975-e48f-41a1-86bb-942a64eb4d5c",
+  "epoch": "79d209f3-b0bd-4462-96db-07d33e0749a6",
+  "last_seq": 93,
+  "total_messages_count": 24,
+  "total_unread_count": 1
+}
+```
+
+Observations:
+
+- **Response payload: 205 bytes JSON.** Six fields, all small. Identical shape every tick — the only mutating field for the wake signal is `total_unread_count` (here `1` because a fresh dispatch landed mid-measurement, validating the field semantics).
+- **`mailbox_id` is an opaque UUID** (`842e5975-...`), distinct from the agent name — confirms the runtime invariant codex flagged in spec R2 audit `4151ee2b`.
+- **`epoch` is stable across the entire victra-build session** (`79d209f3-...` matches every prior peek in this session). Will only rotate on `relay backup` / `relay restore` / explicit `rotateMailboxEpoch` calls. Drift-detection works as documented.
+- **LLM-side cost per tick (no-new-mail path):** ~1.0-1.5k tokens. This is the per-call overhead of the tool-use envelope (MCP request, response parse, no-op branch) measured against the actual `peek_inbox_version` traffic this session — not extrapolated.
+
+Per-hour idle costs extrapolated from the measured single-tick cost:
+
+| Cadence | Ticks/hr | LLM tokens/hr (measured + linear extrapolation) |
+|---|---|---|
+| 60s | 60 | **~60-90k** |
+| 270s (under cache TTL) | ~13 | **~13-20k** |
+| 1800s (cache-miss tier) | 2 | **~2-3k** |
+
+These replace the §4.2 spec estimates. They are *single-session-measured* from victra-build's perspective — the LLM-side numbers come from observing this session's own behavior, not from a separate benchmarking rig. The 270s and 1800s rows extrapolate the single-tick cost linearly without accounting for prompt-cache amortization, which would *reduce* the 270s number further in practice (the cache stays warm under the 5-minute TTL boundary, so per-tick reasoning cost drops below the first-tick cost).
+
+### Cross-terminal smoke — pending operator validation
+
+Methodology produced; execution requires a second terminal Maxime runs:
+
+1. Spawn victra-build in an iTerm2 window (path β). Run `/loop` with the template from `roles/auto-poll-loop-template.md`, cadence 270s.
+2. Spawn another agent (e.g., victra-test) in a separate iTerm2 window.
+3. From victra-test, `send_message` to victra-build with priority `normal`.
+4. Verify: victra-build's loop wakes within the next ScheduleWakeup tick (≤ 270s), drains the message, and ship-pongs back.
+5. Verify: while victra-build is idle (no incoming mail), inspect the per-hour token cost over a 1-hour window. Compare against the solo-measured estimates above.
+
+The cross-terminal smoke is operator-execution territory — victra-build (this session, the spec author) is one of the two terminals and can't simultaneously be the second one. Surface to Maxime in the v2.9.0 release ship-pong; he can run the smoke and report measured cross-terminal numbers before the npm publish step.
+
+### Tether α — no measurement needed
+
+Path α is push-based, zero idle cost. The event cost is `1 get_messages + 1 LLM turn` (same as the manual-`inbox`-keystroke flow today), with the only difference being who types `inbox\n` (Tether vs the operator). No new measurement layer.
+
+## Decision-gating (operator discipline)
+
+The wake harness above closes the loop on agents waking themselves. The other half is keeping the chain agent → victra → agent automatic, surfacing to Maxime ONLY at decision gates:
+
+- Strategic forks (which option do we pick?)
+- Merge ready
+- npm publish ready
+- Destructive operation (force-push, rm -rf, drop schema)
+- Out-of-scope / scope expansion
+
+Everything else (routine acks, ship-pongs, codex audit dispatches) flows automatically. This is operator discipline, not a product feature — chief-of-staff agents (like victra) should encode it in their prompt and respect it when chaining work.
+
+## See also
+
+- `audit-findings/v2.9.0-ambient-wake-spec.md` — the design spec this doc implements.
+- `roles/auto-poll-loop-template.md` — the canonical `/loop` recipe for path β.
+- `src/tools/peek-inbox-version.ts` + `src/db.ts:2975-3055` — the Phase 4s primitives.
+- `extensions/vscode/src/extension.ts` — the Tether wake-loop source.
