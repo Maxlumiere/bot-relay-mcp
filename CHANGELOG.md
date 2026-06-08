@@ -2,7 +2,7 @@
 
 ## v2.9.0 — 2026-06-08 — Ambient-wake operator guide + auto-poll-loop template
 
-Added: ambient-wake operator guide + auto-poll-loop template.
+Added: ambient-wake operator guide + auto-poll-loop template + corrected stale source comments about seq-assignment timing (comment-only, no behavior change).
 
 v2.9.0 is a docs-and-template release that turns the v2.3.0 Phase 4s ambient-wake protocol into a usable operator pattern. The relay-side primitives (`peek_inbox_version`, mailbox/epoch, filesystem marker, `/api/wake-agent`, MCP resource subscription) shipped in v2.3.0 + were verified by codex in the v2.9.0 spec audit (`audit-findings/v2.9.0-ambient-wake-spec.md`). v2.9.0 documents how operators wire those primitives into a real workflow so builders wake themselves on relay mail and surface only decisions to the human.
 
