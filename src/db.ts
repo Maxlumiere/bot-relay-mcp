@@ -943,9 +943,9 @@ function migrateSchemaToV2_3(db: CompatDatabase): void {
  *
  *   1. `mailbox` table — keyed by mailbox_id (== agent_name in v2.1.0),
  *      carries an epoch (UUID, rotates on backup/restore in v2.2) + a
- *      monotonic next_seq counter. Phase 4s in v2.2 will assign seq at
- *      delivery time and surface it via `peek_inbox_version`. Table is
- *      empty in v2.1.0.
+ *      monotonic next_seq counter. Phase 4s in v2.2 will assign seq
+ *      on FIRST OBSERVATION (recipient's get_messages drain) and
+ *      surface it via `peek_inbox_version`. Table is empty in v2.1.0.
  *
  *   2. `agent_cursor` table — composite-keyed on (mailbox_id, epoch),
  *      records the last_seen_seq per consumer cursor. Empty in v2.1.0.
@@ -1106,12 +1106,15 @@ function migrateSchemaToV2_8(db: CompatDatabase): void {
  *   - updated_at TEXT — ISO timestamp.
  *
  * Additions to `messages`:
- *   - seq INTEGER — assigned at DELIVERY time via the atomic increment
- *     of mailbox.next_seq. NULL for messages that haven't been observed
- *     by their recipient yet.
- *   - epoch TEXT — snapshotted from mailbox.epoch at delivery time.
- *     Lets a recipient detect a backup/restore by comparing its cached
- *     cursor epoch vs the messages it just received.
+ *   - seq INTEGER — assigned on FIRST OBSERVATION (the recipient's
+ *     get_messages drain path at :3181-3199 runs UPDATE messages SET
+ *     seq = ... WHERE seq IS NULL via an atomic increment of
+ *     mailbox.next_seq). NULL for messages that haven't been observed
+ *     by their recipient yet. NOT assigned on send and NOT on delivery.
+ *   - epoch TEXT — snapshotted from mailbox.epoch on first observation
+ *     (same code path). Lets a recipient detect a backup/restore by
+ *     comparing its cached cursor epoch vs the messages it just
+ *     received.
  *
  * Epoch is TEXT (UUID) per the locked Codex Q9 design (memory/
  * project_phase_4s_ambient_wake.md line 47). Epoch rotates on `relay
@@ -1120,7 +1123,8 @@ function migrateSchemaToV2_8(db: CompatDatabase): void {
  *
  * Additive + idempotent. Existing pre-v2.3.0 messages stay seq=NULL +
  * epoch=NULL — they get assigned the first time their recipient reads
- * them via the v2.3.0 getMessages delivery-time assignment path.
+ * them via the v2.3.0 getMessages first-observation assignment path
+ * (see :3181-3199).
  */
 function migrateSchemaToV2_9(db: CompatDatabase): void {
   // mailbox — add agent_name + created_at columns if missing.
@@ -1148,8 +1152,9 @@ function migrateSchemaToV2_9(db: CompatDatabase): void {
     db.exec("ALTER TABLE agent_cursor ADD COLUMN updated_at TEXT");
   }
 
-  // messages — add seq + epoch columns. Populated at delivery time by
-  // getMessages; a NULL seq means "not yet observed by recipient".
+  // messages — add seq + epoch columns. Populated on first observation
+  // by getMessages (the drain path at :3181-3199 — NOT at send, NOT at
+  // delivery); a NULL seq means "not yet observed by recipient".
   const messageCols = db
     .prepare("PRAGMA table_info(messages)")
     .all() as Array<{ name: string }>;
@@ -3013,9 +3018,11 @@ export function peekMailboxVersion(agentName: string): {
     .get(agentName) as { c: number }).c;
   // v2.3.0 Codex HIGH #2 patch — total_unread_count is the field clients
   // watch for new-mail detection. `last_seq` only advances when the
-  // recipient CALLS get_messages (seq assignment is delivery-time), so
-  // it's stale for pre-first-observation new mail. `seq IS NULL` is the
-  // authoritative "not-yet-observed" signal + bumps on every sendMessage.
+  // recipient CALLS get_messages (seq is assigned on first observation
+  // inside the get_messages drain path at :3181-3199 — NOT on send,
+  // NOT on delivery), so last_seq is stale for pre-first-observation
+  // new mail. `seq IS NULL` is the authoritative "not-yet-observed"
+  // signal + bumps on every sendMessage.
   const unread = (db
     .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND seq IS NULL")
     .get(agentName) as { c: number }).c;
@@ -3157,11 +3164,12 @@ export function getMessages(
     emitInboxChanged({ agent_name: agentName, reason: "message_read", id: outboxId });
   }
 
-  // v2.3.0 Part C.2 — delivery-time seq assignment. Per Codex Q9 lock:
+  // v2.3.0 Part C.2 — first-observation seq assignment. Per Codex Q9 lock:
   // mailbox seq is assigned when the RECIPIENT first observes a message,
-  // not when it was created. Over-fetched rows (e.g. status='read' or
-  // since filters that haven't been applied yet) get their seq stamped
-  // here too — the point is "seq reflects the order the recipient saw
+  // not when it was created (and not at delivery — observation is the
+  // event). Over-fetched rows (e.g. status='read' or since filters that
+  // haven't been applied yet) get their seq stamped here too — the
+  // point is "seq reflects the order the recipient saw
   // them", which is stable regardless of how they filter later.
   //
   // v2.3.0 Codex HIGH #1 patch — atomic seq assignment:

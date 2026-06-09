@@ -722,8 +722,11 @@ export interface MessageRecord {
    */
   seq?: number | null;
   /**
-   * v2.3.0 Part C — mailbox epoch snapshotted at delivery time. Lets
-   * the recipient detect a backup/restore vs. a genuine new message.
+   * v2.3.0 Part C — mailbox epoch snapshotted on first observation
+   * (same code path as `seq` above — src/db.ts:3181-3199, inside the
+   * recipient's get_messages drain). NOT at send and NOT at delivery.
+   * Lets the recipient detect a backup/restore vs. a genuine new
+   * message.
    */
   epoch?: string | null;
 }
