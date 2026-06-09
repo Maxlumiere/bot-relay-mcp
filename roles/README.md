@@ -31,6 +31,7 @@ alias ai-reviewer='RELAY_AGENT_NAME=reviewer-1 RELAY_AGENT_ROLE=reviewer RELAY_A
 - **worker-loop.md** — semi-autonomous worker that keeps polling the relay for tasks
 - **reviewer.md** — skeptical reviewer, finds issues
 - **researcher.md** — investigates questions, returns structured findings
+- **auto-poll-loop-template.md** — `/loop` recipe (v2.9.0 ambient-wake path β) for any agent running outside VS Code that wants to wake itself on relay mail instead of being manually `inbox`-prompted
 
 ## Add your own
 

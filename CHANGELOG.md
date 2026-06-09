@@ -1,5 +1,51 @@
 # Changelog
 
+## v2.9.0 — 2026-06-08 — Ambient-wake operator guide + auto-poll-loop template
+
+Added: ambient-wake operator guide + auto-poll-loop template + corrected stale source comments about seq-assignment timing (comment-only, no behavior change).
+
+v2.9.0 is a docs-and-template release that turns the v2.3.0 Phase 4s ambient-wake protocol into a usable operator pattern. The relay-side primitives (`peek_inbox_version`, mailbox/epoch, filesystem marker, `/api/wake-agent`, MCP resource subscription) shipped in v2.3.0 + were verified by codex in the v2.9.0 spec audit (`audit-findings/v2.9.0-ambient-wake-spec.md`). v2.9.0 documents how operators wire those primitives into a real workflow so builders wake themselves on relay mail and surface only decisions to the human.
+
+### What's in scope
+
+- **`docs/ambient-wake.md`** — appended a v2.9.0 "Operator setup" section covering the two MVP paths:
+  - **(α) Tether** for VS Code (already-shipped extension's MCP-resource subscription + `autoInjectInbox` keystroke injection — zero idle cost, push-based).
+  - **(β) `/loop`** for iTerm2 / Terminal.app / tmux / SSH (Claude Code v2.1.71+ `/loop` + `ScheduleWakeup` self-paced peek polling — cheap when idle, scales by cadence choice).
+  - Decision-gating discipline (what surfaces to the human operator vs flows agent→agent automatically).
+  - Stretch paths (B `fs.watch` sidecar; D `TeammateIdle` hook + `Monitor` tool — gated on Claude Code v2.1.98+).
+  - Measured per-tick `peek_inbox_version` cost from a real call against the live daemon (replaces the spec's estimates).
+- **`roles/auto-poll-loop-template.md`** — canonical `/loop` recipe for path β. Drop-in for builders who want self-pacing without operator nudges. Includes cadence tuning table, drift detection (epoch handling), failure modes, and a copy-paste quick-start.
+- **`roles/README.md`** — references the new template alongside the existing role templates.
+
+### Binding constraint preserved
+
+Claude Code v2.1.89's **Auto-mode is OFF the table.** It triggers per-tool-call token burn that defeats the cheap-polling premise. Path (β) uses `ScheduleWakeup` self-paced, NOT Auto-mode. Any future revision suggesting Auto-mode as the harness should be rejected at audit. Recorded in `docs/ambient-wake.md` + the role template.
+
+### Out of scope (explicitly NOT in v2.9.0)
+
+- No daemon/src changes. Pre-publish gate stays 20/20 — the v2.8.0 R1 lockfile-version-sync guard self-applies to this docs release.
+- No tests/ changes. The existing v2.3.0 contract test at `tests/v2-3-0-ambient-wake.test.ts` continues to cover C.1-C.6.
+- Tether `autoInjectInbox` default flip stays opt-in for v2.9.0; recommended as a separate Tether arc after real-world burn-in (see `docs/ambient-wake.md` § "Recommended next").
+- Stretch paths P4 (`fs.watch` sidecar) + P5 (TeammateIdle hook) NOT in this release. P5 is gated on a `claude --version` check anyway.
+- The cross-terminal smoke (two-terminal end-to-end wake verification) is methodology + operator-execution territory — documented in `docs/ambient-wake.md` § "Cross-terminal smoke — pending operator validation"; the operator runs it post-publish before declaring the arc complete.
+
+### Compatibility
+
+- Backwards-compatible. Existing operators on Tether keep working unchanged (Tether's `autoInjectInbox` still defaults to false; opt-in to flip per agent).
+- Existing role templates (`builder.md`, `worker-loop.md`, etc.) unaffected; the new template composes with them (e.g., a worker-loop agent can run the auto-poll harness alongside its task-pull loop).
+- v2.3.0 `peek_inbox_version` contract unchanged. The wake signal is still `total_unread_count` (not `last_seq`) — Codex HIGH #2 patch at `src/db.ts:3014-3021` remains authoritative.
+
+### Pre-publish gate
+
+20/20 PASS — same shape as v2.8.0 R1. The lockfile-version-sync guard (step #9, added in v2.8.0 R1) passes cleanly because the lockfile was regenerated post-version-bump per the documented rebase discipline.
+
+### References
+
+- Spec: `audit-findings/v2.9.0-ambient-wake-spec.md` (513 lines, codex SHIP after R2 patch round — `ef8fc44e`).
+- Primitives doc: `docs/ambient-wake.md` (existing v2.3.0 protocol doc; v2.9.0 appends operator setup).
+- Role template: `roles/auto-poll-loop-template.md`.
+- Origin: north-star direction from the maintainer 2026-06-05 ("builders run in background/IDE with automatic polling so HE is no longer the blocker").
+
 ## v2.8.0 — 2026-05-26 — Dashboard daemon precursor: 5-state state machine + SIGHUP + decay broadcaster + wire-emit sites
 
 Closes the dashboard ambiguity the maintainer called out in the 2026-05-21 dashboard recon: an iTerm2 tab-close looked identical to "alive but slow" looked identical to "waiting normally" looked identical to "stale and needs attention". v2.8 fixes the DAEMON side end-to-end; v2.9 (separate arc) will wire the new state model into the actual dashboard UI rendering.
