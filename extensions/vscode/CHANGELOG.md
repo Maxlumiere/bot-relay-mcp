@@ -4,6 +4,22 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.2.1] — 2026-06-11 — Auto-reconnect: Tether survives daemon restarts hands-off
+
+Tether now reconnects on its own after the bot-relay daemon restarts — no more "Tether: error — run Reconnect" wedge. This matters because the daemon is now a background service that auto-restarts on crash or reboot, so restarts are routine; Tether has to ride through them without you noticing.
+
+### Fixed
+
+- **No auto-reconnect after a daemon restart (P1).** Previously, when the daemon restarted, Tether's saved session became invalid; the MCP SDK kept retrying that dead session, exhausted its retry budget, and gave up permanently — the status bar stuck at `Tether: error — run "Tether: Reconnect to Relay"` until you ran a manual Reconnect. Now, on a recoverable transport error (a dead/unknown session, the SDK's retry give-up, an SSE disconnect, or a refused connection to a down daemon), Tether performs a **fresh connect** (a brand-new session) and **re-arms indefinitely** with capped exponential backoff (1s → 2s → … → 30s) until the daemon comes back. The status bar shows `Tether: reconnecting… (attempt N)` while it recovers, then returns to normal. A bad/expired token is the one case that still asks for a manual Reconnect (retrying it would loop pointlessly).
+
+### Changed
+
+- The SDK's same-session retry budget is reduced (20 → 3): same-session retries only help a brief blip where the session still exists, and are futile after a restart. Recovery from restarts is now owned by the new reconnect supervisor, which kicks in on the first error — before the SDK gives up — so there's no gap.
+
+### Internal
+
+- New `reconnect-supervisor.ts` (VSCode-free, fully unit-tested): error classification + single-flight + indefinite capped backoff, delegating the backoff curve to the existing `RestartPolicy` (extended with a `neverGiveUp` mode for this path; the 5-restarts/hour cap stays only on the child-process crash-loop path). Manual Reconnect and extension deactivate cleanly cancel any pending auto-reconnect.
+
 ## [0.2.0] — 2026-05-22 — Single-agent executor: spawn, kill, restart from the palette
 
 Tether becomes an executor: it can now manage a single agent process inside VSCode. v0.1.x was observer-only; v0.2 promotes it to actively spawn, kill, restart, and auto-recover a `claude` (or `codex`) terminal so you can travel without manually babysitting builder terminals.
