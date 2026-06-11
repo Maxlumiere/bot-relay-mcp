@@ -1,5 +1,69 @@
 # Changelog
 
+## v2.9.1 — 2026-06-10 — HOTFIX: autowake recursion (Tether 0.2.0 + HTTP daemon crash)
+
+Fixes the deployment-blocking RangeError that surfaced when Tether 0.2.0 connected to the v2.9.0 HTTP daemon. The bug class is the same shape as v2.5-R1 (InMemoryTransport-style tests passing while real HTTP transport breaks); my v2.9.0 autowake test was real but exercised the wrong close path, so the recursion went undetected through v2.5–v2.9.0 and only triggered on the maintainer's live VS Code + Tether deployment.
+
+### The bug
+
+`src/transport/http.ts:1504-1510` (pre-v2.9.1) set the stateful-init transport's onclose handler to:
+
+```ts
+transport.onclose = () => {
+  const id = transport.sessionId;
+  if (id) sessions.delete(id);
+  server.close().catch(() => {});   // <— recursion
+};
+```
+
+`Server.close()` inherits from `Protocol.close` at `node_modules/@modelcontextprotocol/sdk/dist/esm/shared/protocol.js:500-502`:
+
+```js
+async close() {
+  await this._transport?.close();
+}
+```
+
+So calling `server.close()` from inside `transport.onclose` re-enters `transport.close()` → fires `this.onclose?.()` → handler runs again → `server.close()` again → infinite recursion → `RangeError: Maximum call stack size exceeded` surfacing at `node_modules/@modelcontextprotocol/sdk/dist/esm/server/webStandardStreamableHttp.js:639` (the closing brace of `async close()`; V8 reports async rejection at the declaration end).
+
+The recursion fires from two real-deployment paths that the v2.5-v2.9.0 test suite never exercised:
+- **Session reaper** at `src/transport/http.ts:1443` — `sess.transport.close()` on idle sessions (60s default interval, 5min idle timeout).
+- **DELETE /mcp endpoint** at `src/transport/http.ts:1691` — `await session.transport.close()` when an MCP client (Tether 0.2.0) sends a session-termination request.
+
+Tether's `maxRetries: 20` reconnection (`extensions/vscode/src/extension.ts:506-511`) amplifies — each crash → another connect → another crash. the maintainer saw ~530 RangeError lines in the live repro.
+
+### The fix
+
+Remove the `server.close()` call from `transport.onclose`. Keep the `sessions.delete(id)` so the daemon's sessions Map doesn't grow unbounded. Subscription cleanup is preserved: the v2.5.0 Tether Phase 1 Part S hook at `src/server.ts:262-272` already patches `server.onclose` to run `unsubscribeAllForServer(server)`, and the SDK fires `server.onclose` from the transport-close path WITHOUT going through `Protocol.close()`. So unsubscribe still happens; we just stop the recursive `server.close()` self-call.
+
+One-line code change at `src/transport/http.ts:1504-1527` (replacing the recursive call with a multi-line comment explaining why). Zero behavior change for any non-crashing path.
+
+### Regression test
+
+`tests/v2-9-1-autowake-server-close-recursion.test.ts` exercises the exact path: spawn daemon, connect via `StreamableHTTPClientTransport` with Tether's `reconnectionOptions`, register + subscribe, then `DELETE /mcp` to trigger server-side `transport.close()`. Asserts daemon stderr contains zero `RangeError` / `Maximum call stack` / `unhandledRejection` lines, and `/health` still responds.
+
+Empirically verified during this release: without the fix, the test fails with the same `RangeError: Maximum call stack size exceeded` the maintainer saw. With the fix, it passes. The test catches the bug class on every future PR.
+
+### Also tracked in this release
+
+- `tests/v2-9-0-autowake-headless-push-smoke.test.ts` — the v2.9.0 autowake push-delivery test was untracked in git (codex caught this in msg `2895e08d`). Committed to main alongside the v2.9.1 fix so it runs in CI from now on.
+
+### Out of scope
+
+- The Tether extension itself — no changes. The Tether-side reconnectionOptions + autoInjectInbox behavior already shipped on the marketplace and is unchanged.
+- Other transport-close call sites (session reaper, DELETE /mcp, stateless one-shot) — none of these had buggy handlers; the bug was specifically the stateful-init handler calling `server.close()`. All other call sites already correctly let the SDK + the Part S hook handle subscription cleanup.
+- v2.9.0 docs — `docs/ambient-wake.md` + `roles/auto-poll-loop-template.md` stay unchanged. The operator-facing contract is the same; v2.9.1 only fixes the underlying recursion that prevented path α (Tether) from actually working end-to-end.
+
+### Pre-publish gate
+
+Expected 20/20 PASS — fix is a one-line removal + comment, lockfile regenerated, no other changes.
+
+### References
+
+- Spec: `audit-findings/v2.9.0-ambient-wake-spec.md` (still authoritative for the operator pattern; v2.9.1 is the implementation fix that makes path α actually deliver).
+- Origin: the maintainer's live VS Code + Tether 0.2.0 repro 2026-06-10 (relay msg `add0b18c` from victra).
+- Root-cause confirmation: empirical via the regression test in this release.
+
 ## v2.9.0 — 2026-06-08 — Ambient-wake operator guide + auto-poll-loop template
 
 Added: ambient-wake operator guide + auto-poll-loop template + corrected stale source comments about seq-assignment timing (comment-only, no behavior change).

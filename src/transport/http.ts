@@ -1504,9 +1504,27 @@ export function startHttpServer(port: number, host: string): Server {
     transport.onclose = () => {
       const id = transport.sessionId;
       if (id) sessions.delete(id);
-      // server.close() drops every subscription this session held via
-      // the unsubscribeAllForServer hook wired in createServer().
-      server.close().catch(() => {});
+      // v2.9.1 — do NOT call server.close() here. server.close() inherits
+      // from Protocol.close (node_modules/@modelcontextprotocol/sdk/dist/
+      // esm/shared/protocol.js:500-502) which does
+      // `await this._transport?.close()` — that re-enters THIS onclose
+      // handler, creating infinite recursion that surfaces as
+      // `RangeError: Maximum call stack size exceeded` originating in
+      // webStandardStreamableHttp.js close() (line ~639 in @1.29.0).
+      //
+      // The recursion was latent throughout v2.5+: the InMemory-style
+      // test rigs + the client.close() teardown path never enter this
+      // chain. Tether 0.2.0 + the SDK SSE GET subscription path DO enter
+      // it (caught 2026-06-10 via the maintainer's live VS Code repro; root-cause
+      // confirmed against protocol.js:500-502 + the daemon's own
+      // onclose body).
+      //
+      // Subscription cleanup is still covered: the v2.5.0 Tether Phase 1
+      // Part S hook at src/server.ts:262-272 patches `server.onclose` to
+      // run `unsubscribeAllForServer(server)`, and the SDK fires
+      // server.onclose from the transport-close path WITHOUT going through
+      // Protocol.close(). So unsubscribe happens regardless; we only need
+      // to drop the session from the daemon's sessions Map here.
     };
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
