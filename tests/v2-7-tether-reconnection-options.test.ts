@@ -118,6 +118,33 @@ describe("v2.7 Tether Phase 4 — reconnectionOptions drift guard", () => {
     ).toMatch(/reconnecting/i);
   });
 
+  it("(handoff) the transport-error sink ROUTES to reconnectSupervisor.handleError — not the v0.2.0 setErrorState dead-end", () => {
+    // R3 (codex assert-the-contract catch): supervisor CONSTRUCTION alone is
+    // not the load-bearing invariant — the wireTransportDiagnostics `setError`
+    // sink must HAND transport errors to `reconnectSupervisor.handleError(...)`.
+    // If that sink reverts to `setErrorState` (the v0.2.0 RC-2 dead-end) while
+    // the constructor stays intact, auto-reconnect never fires and the
+    // extension wedges after a daemon restart — yet the (drift-src) construction
+    // check would still pass. This ties the `setError:` key to the handoff so a
+    // sink-only revert is caught. NEGATIVE-CONTROL: reverting the sink to
+    // `setError: setErrorState` (constructor intact) makes THIS assertion fail
+    // (verified 2026-06-12: guard goes red on codex's exact mutation, green when
+    // restored; out/extension.js sha256 restored to the T-ACC'd VSIX build).
+    const src = fs.readFileSync(EXT_SRC, "utf-8");
+    expect(
+      src,
+      "the wireTransportDiagnostics `setError` sink must route to reconnectSupervisor.handleError(...) — reverting it to setErrorState reintroduces the RC-2 permanent-wedge (no auto-reconnect on daemon restart).",
+    ).toMatch(/setError\s*:[\s\S]{0,240}reconnectSupervisor\.handleError\s*\(/);
+
+    // Shipped-artifact marker: the supervisor handoff code path survives into
+    // out/ (the marketplace runs out/, not src/).
+    const out = fs.readFileSync(EXT_OUT, "utf-8");
+    expect(
+      out,
+      "compiled out/extension.js must contain the `.handleError(` handoff — the marketplace runs out/, not src/.",
+    ).toMatch(/\.handleError\s*\(/);
+  });
+
   it("(error-text) setErrorState references the manual Reconnect command (operator discoverability on the unrecoverable path)", () => {
     const body = fs.readFileSync(EXT_SRC, "utf-8");
     // For the UNRECOVERABLE path (e.g. a bad/expired token, which the
