@@ -225,3 +225,30 @@ describe("RestartPolicy — introspection", () => {
     expect(policy.getConsecutiveAttempts()).toBe(3);
   });
 });
+
+describe("RestartPolicy — neverGiveUp (v0.2.1 reconnect path)", () => {
+  it("(R17) never returns give_up regardless of crash count within the window", () => {
+    const p = new RestartPolicy({ neverGiveUp: true, now: clock.now });
+    // Default cap is 5/hr; fire 20 crashes inside the window — all must restart.
+    for (let i = 0; i < 20; i += 1) {
+      const d = p.recordCrash();
+      expect(d.kind, `crash ${i + 1} must restart, never give_up`).toBe("restart");
+    }
+  });
+
+  it("(R18) the backoff curve still applies + clamps at 30s under neverGiveUp", () => {
+    const p = new RestartPolicy({ neverGiveUp: true, now: clock.now });
+    const want = [1000, 2000, 4000, 8000, 16000, 30000, 30000];
+    for (let i = 0; i < want.length; i += 1) {
+      const d = p.recordCrash();
+      if (d.kind !== "restart") throw new Error("expected restart");
+      expect(d.delayMs, `attempt ${i + 1} delay`).toBe(want[i]);
+    }
+  });
+
+  it("(R19) CONTRAST — the default (capped) policy still gives up at the 6th crash", () => {
+    const p = new RestartPolicy({ now: clock.now }); // neverGiveUp defaults to false
+    for (let i = 0; i < 5; i += 1) expect(p.recordCrash().kind).toBe("restart");
+    expect(p.recordCrash().kind).toBe("give_up");
+  });
+});

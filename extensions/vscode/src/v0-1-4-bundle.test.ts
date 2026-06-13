@@ -139,13 +139,16 @@ describe("v0.1.4 — bundle correctness", () => {
       p.startsWith("src/") && p.endsWith(".ts") && !p.endsWith(".test.ts"),
     );
     // v0.2 additions: agent-manager.ts + restart-policy.ts joined the
-    // bundle when AgentManager wired into extension.ts. v0.1.4 baseline
-    // (extension + config + format + transport-diagnostics) preserved.
+    // bundle when AgentManager wired into extension.ts. v0.2.1 added
+    // reconnect-supervisor.ts (wired into connect()/activate for P1
+    // auto-reconnect). v0.1.4 baseline (extension + config + format +
+    // transport-diagnostics) preserved.
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/config.ts",
       "src/extension.ts",
       "src/format.ts",
+      "src/reconnect-supervisor.ts",
       "src/restart-policy.ts",
       "src/transport-diagnostics.ts",
     ]);

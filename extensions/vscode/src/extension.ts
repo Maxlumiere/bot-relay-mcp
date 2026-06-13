@@ -50,6 +50,7 @@ import {
   type TerminalApi,
 } from "./agent-manager.js";
 import { RestartPolicy } from "./restart-policy.js";
+import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
 const STATUS_COMMAND = "botRelayTether.openInbox";
@@ -305,6 +306,14 @@ let lastAgentSnapshot: AgentSnapshot | undefined;
  * instrumentation observable instead of getting overwritten.
  */
 let connectionErrorState = false;
+/**
+ * v0.2.1 P1 — auto-reconnect supervisor. Created in activate(); drives a
+ * fresh connect() (new session id) on a recoverable transport error with
+ * indefinite capped backoff, so a daemon restart no longer wedges Tether at
+ * "Tether: error — run Reconnect". Null only before activation / in the
+ * unit-test import path.
+ */
+let reconnectSupervisor: ReconnectSupervisor | undefined;
 function isInErrorState(): boolean {
   return connectionErrorState;
 }
@@ -323,6 +332,24 @@ function setErrorState(msg: string): void {
     // to make manual reconnect discoverable when retries exhaust."
     statusBarItem.text = 'Tether: error — run "Tether: Reconnect to Relay"';
     statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
+    statusBarItem.show();
+  }
+}
+
+/**
+ * v0.2.1 P1 — paint the "auto-reconnect in progress" state. Unlike
+ * setErrorState's red manual-Reconnect dead-end, this is an amber
+ * "reconnecting…" because recovery is automatic (the supervisor will retry
+ * with backoff). It flips the same connectionErrorState lock so a late
+ * success-paint from the dying connection can't overwrite it — connect()
+ * resets the lock at the top of the next attempt (resetErrorState).
+ */
+function setReconnectingState(attempt: number, delayMs: number): void {
+  connectionErrorState = true;
+  log(`reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${attempt})`);
+  if (statusBarItem) {
+    statusBarItem.text = `Tether: reconnecting… (attempt ${attempt})`;
+    statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
     statusBarItem.show();
   }
 }
@@ -486,28 +513,25 @@ async function connect(config: TetherConfig): Promise<void> {
   if (config.agentToken) {
     requestInit.headers = { "X-Agent-Token": config.agentToken };
   }
-  // v0.1.2 Tether Phase 4 — raise the SDK's hardcoded
-  // `maxRetries: 2` default (see
-  // `node_modules/@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js:10`
-  // — DEFAULT_STREAMABLE_HTTP_RECONNECTION_OPTIONS). 2 retries is too
-  // aggressive for a long-running editor extension: a transient TCP
-  // hiccup or daemon restart can exhaust the budget in <2 s, after
-  // which the extension wedges until manual reconnect.
-  //
-  // With maxRetries: 20 + exponential backoff (1 s × 1.5^attempt,
-  // capped at 30 s), accumulated wait before giving up is roughly
-  // 6.75 min — long enough to ride out a daemon restart but bounded
-  // so a wedged daemon doesn't loop silently forever. When the
-  // budget IS exhausted, the error path now points at the
-  // `Tether: Reconnect to Relay` command via setErrorState() so
-  // manual recovery is discoverable.
+  // v0.2.1 P1 — the SDK's same-session SSE retries (default `maxRetries: 2`,
+  // see streamableHttp.js:10 DEFAULT_STREAMABLE_HTTP_RECONNECTION_OPTIONS)
+  // re-open the GET on the SAME mcp-session-id. That is only useful for a
+  // genuinely transient blip where the session still exists server-side; it
+  // is FUTILE after a daemon restart (the session id is gone → 404 every
+  // attempt). Recovery from a restart is now owned by ReconnectSupervisor,
+  // which performs a FRESH initialize (new session id) on the first
+  // recoverable error and re-arms indefinitely. So we keep the SDK budget
+  // small (3) — just enough to absorb a true transient — rather than the old
+  // 20 that burned ~6.75 min of dead retries against a dead session. The
+  // supervisor's classifier fires on the first 404, at/before the SDK
+  // give-up, so there is no recovery gap (O-1).
   const transport = new StreamableHTTPClientTransport(url, {
     requestInit,
     reconnectionOptions: {
       initialReconnectionDelay: 1000,
       maxReconnectionDelay: 30_000,
       reconnectionDelayGrowFactor: 1.5,
-      maxRetries: 20,
+      maxRetries: 3,
     },
   });
 
@@ -520,7 +544,18 @@ async function connect(config: TetherConfig): Promise<void> {
   // pins this contract.
   wireTransportDiagnostics(transport, {
     log,
-    setError: setErrorState,
+    // v0.2.1 P1 — route transport errors through the reconnect supervisor.
+    // Recoverable (dead session / daemon down) → auto-reconnect with
+    // indefinite backoff (closes RC-2). Unrecoverable (bad token) → the
+    // v0.1.x manual-Reconnect dead-end. Falls back to setErrorState if the
+    // supervisor isn't wired yet (shouldn't happen post-activate).
+    setError: (msg: string) => {
+      if (reconnectSupervisor) {
+        reconnectSupervisor.handleError(msg);
+      } else {
+        setErrorState(msg);
+      }
+    },
   });
 
   const client = new Client(
@@ -821,7 +856,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       panel.webview.html = buildWebviewHtml(lastSnapshot);
     }),
     vscode.commands.registerCommand("botRelayTether.reconnect", async () => {
+      // v0.2.1 P1 — cancel any pending auto-reconnect + reset the backoff
+      // curve: the operator is forcing a fresh attempt right now.
+      reconnectSupervisor?.notifyManualReconnect();
       await connect(await readConfig(context));
+      reconnectSupervisor?.notifyExternalConnect(!isInErrorState());
     }),
     // v0.2 — single-agent executor commands.
     vscode.commands.registerCommand(SPAWN_AGENT_COMMAND, async () => {
@@ -972,9 +1011,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // initial connect attempt without an extra reload.
   await migrateAgentTokenToSecretStorage(context);
 
+  // v0.2.1 P1 — wire the auto-reconnect supervisor BEFORE the first connect
+  // so a startup-while-daemon-down also self-heals. Backoff is delegated to
+  // RestartPolicy in neverGiveUp mode (O-2): a down/restarting daemon is
+  // retried indefinitely; the 5/hr cap stays only on the child-process
+  // crash-loop path (AgentManager above). Production timer = setTimeout.
+  reconnectSupervisor = new ReconnectSupervisor({
+    policy: new RestartPolicy({ neverGiveUp: true }),
+    connect: async () => {
+      await connect(await readConfig(context));
+      return !isInErrorState();
+    },
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+    log,
+    onReconnecting: (attempt, delayMs) => setReconnectingState(attempt, delayMs),
+    onReconnected: () => {
+      // connect() already painted the healthy snapshot; re-apply the latest
+      // snapshot defensively so the amber "reconnecting…" text can't linger.
+      if (lastSnapshot) applySnapshot(lastSnapshot);
+    },
+    onUnrecoverable: (msg) => setErrorState(msg),
+  });
+  context.subscriptions.push({ dispose: () => reconnectSupervisor?.dispose() });
+
   const initial = await readConfig(context);
   ensureSummaryTimer(initial.notificationLevel);
-  await connect(initial);
+  // Wrap the initial connect: a startup-time daemon-down must hand off to the
+  // supervisor (indefinite backoff) rather than reject activation.
+  try {
+    await connect(initial);
+    reconnectSupervisor.notifyExternalConnect(!isInErrorState());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`initial connect failed: ${msg} — handing to reconnect supervisor`);
+    reconnectSupervisor.handleError(msg);
+  }
 }
 
 export async function deactivate(): Promise<void> {
@@ -982,5 +1054,10 @@ export async function deactivate(): Promise<void> {
     clearInterval(summaryTimer);
     summaryTimer = undefined;
   }
+  // v0.2.1 P1 — tear down the supervisor first so a scheduled auto-reconnect
+  // can't fire a fresh connect() during/after teardown (no reconnect storm,
+  // no leaked timer).
+  reconnectSupervisor?.dispose();
+  reconnectSupervisor = undefined;
   await disconnect();
 }
