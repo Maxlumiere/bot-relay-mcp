@@ -72,6 +72,16 @@ export interface RestartPolicyOptions {
    * real wall-clock time.
    */
   now?: () => number;
+  /**
+   * v0.2.1 — when true, `recordCrash()` NEVER returns `give_up`: the
+   * backoff curve still applies (1s→2s→…→cap) but the rolling-hour rate
+   * cap is disabled, so the caller retries indefinitely. Used by the
+   * Tether reconnect supervisor — a daemon that is down/restarting must
+   * be retried forever until it returns. Leave false (default) for the
+   * child-process crash-loop case (AgentManager), where the 5/hr cap is
+   * a fork-bomb guard. Default: false.
+   */
+  neverGiveUp?: boolean;
 }
 
 interface CrashRecord {
@@ -86,6 +96,7 @@ export class RestartPolicy {
   private readonly backoffFactor: number;
   private readonly maxDelayMs: number;
   private readonly now: () => number;
+  private readonly neverGiveUp: boolean;
   /**
    * Crash history. Newest at the tail. Trimmed to entries within
    * `windowMs` on every read so memory stays bounded by the window
@@ -108,6 +119,7 @@ export class RestartPolicy {
     this.backoffFactor = opts.backoffFactor ?? 2;
     this.maxDelayMs = opts.maxDelayMs ?? 30_000;
     this.now = opts.now ?? (() => Date.now());
+    this.neverGiveUp = opts.neverGiveUp ?? false;
     if (this.maxRestartsPerWindow < 1) {
       throw new Error(
         `RestartPolicy.maxRestartsPerWindow must be >= 1, got ${this.maxRestartsPerWindow}`,
@@ -150,7 +162,10 @@ export class RestartPolicy {
     const t = this.now();
     this.trim(t);
     this.crashes.push({ at: t });
-    if (this.crashes.length > this.maxRestartsPerWindow) {
+    // v0.2.1 — neverGiveUp disables the rolling-hour rate cap entirely so
+    // the caller can retry indefinitely (Tether reconnect to a restarting
+    // daemon). The backoff curve below still applies.
+    if (!this.neverGiveUp && this.crashes.length > this.maxRestartsPerWindow) {
       return {
         kind: "give_up",
         reason: `agent exceeded ${this.maxRestartsPerWindow} restarts in the last ${Math.round(this.windowMs / 60_000)} minute(s)`,
