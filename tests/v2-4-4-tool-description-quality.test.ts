@@ -94,7 +94,7 @@ describe("v2.4.4 — tool description quality", () => {
   const tools = listTools();
 
   it("(Q1) every tool has a description with sufficient length", () => {
-    expect(tools.length).toBe(30);
+    expect(tools.length).toBe(31);
     const offenders = tools
       .filter((t) => !t.description || t.description.length < MIN_DESCRIPTION_CHARS)
       .map((t) => `${t.name}: ${t.description?.length ?? 0} chars`);
@@ -209,6 +209,7 @@ describe("v2.4.4 — tool description quality", () => {
       peek_inbox_version: "5d76f1442911e752555ed122a5ccd2254c4a47df1ddcd83307dcddcf906752a1",
       post_task: "76309d5c555329f7df772e65230ec243c544b82a0c519f1b5cdb0351edd69e24",
       post_task_auto: "f227175138d36cc2117dc77bbadafc2d151a33d0533996a2beb572192091a535",
+      post_to_capability: "b7a90f9fcf1957218bed13da1744bf8ab0d609892cf0df7e581410a254cde5c0",
       post_to_channel: "593b795f55ccd34c8d3cc668f91bc64c6a4be27f79827b09b3895ccea37e59b2",
       register_agent: "43f3d8cb5b37ffcf8f089e23727ee2110cc792938699f04ea6cc0623e74b7128",
       register_webhook: "7a1fd9852ec77d5ee5e23e081a5f1d82ab8d1fa0591d84893b1e1a55253ec006",

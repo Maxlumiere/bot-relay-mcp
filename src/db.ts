@@ -215,6 +215,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_9(_db);
   migrateSchemaToV2_10(_db);
   migrateSchemaToV2_11(_db);
+  migrateSchemaToV2_12(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 }
@@ -250,6 +251,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_9(_db);
   migrateSchemaToV2_10(_db);
   migrateSchemaToV2_11(_db);
+  migrateSchemaToV2_12(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 
@@ -470,7 +472,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 13;
+export const CURRENT_SCHEMA_VERSION = 14;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -557,6 +559,7 @@ export function applyMigration(from: number, to: number): void {
   const registeredPairs: Array<[number, number]> = [
     [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],
     [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13],
+    [13, 14],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1299,6 +1302,29 @@ function migrateSchemaToV2_11(db: CompatDatabase): void {
   }
   if (!agentCols.some((c) => c.name === "last_dispatched_at")) {
     db.exec("ALTER TABLE agents ADD COLUMN last_dispatched_at INTEGER");
+  }
+}
+
+/**
+ * v2.10 — capability-routed messaging (FYI/coordination lane). schema v13 → v14.
+ *
+ * One additive, NULL-default column on `messages`:
+ *   - `routed_capability TEXT NULL` — NULL on every point-to-point
+ *     send_message / broadcast row (the action lane). Set to the single
+ *     capability tag when a row was fanned out via post_to_capability
+ *     (the FYI lane). Makes the action-vs-FYI line machine-enforceable +
+ *     lets get_messages(lane=...) drain the two lanes separately, so an
+ *     action-required ship-pong is never lost in FYI noise.
+ *
+ * Additive + idempotent — guarded by PRAGMA table_info so re-runs no-op.
+ * NULL on every existing row = zero data migration.
+ */
+function migrateSchemaToV2_12(db: CompatDatabase): void {
+  const msgCols = db
+    .prepare("PRAGMA table_info(messages)")
+    .all() as Array<{ name: string }>;
+  if (!msgCols.some((c) => c.name === "routed_capability")) {
+    db.exec("ALTER TABLE messages ADD COLUMN routed_capability TEXT");
   }
 }
 
@@ -3067,6 +3093,7 @@ export function getMessages(
   limit: number,
   peek = false,
   sinceIso: string | null = null,
+  lane: "all" | "direct" | "capability" = "all",
 ): MessageRecord[] {
   const db = getDb();
   // No touchAgent here — observation is not liveness (v1.3 presence fix)
@@ -3088,13 +3115,23 @@ export function getMessages(
   // src/db.ts:3037: same `AND created_at >= ?` clause stitched into each
   // branch.
   const sinceClause = sinceIso ? "AND created_at >= ?" : "";
+  // v2.10 — lane filter. Fixed clauses (no param binding, no injection
+  // surface) so an orchestrator can drain the action lane (direct,
+  // routed_capability IS NULL) separately from the FYI lane (capability,
+  // routed_capability IS NOT NULL). Default 'all' preserves prior behavior.
+  const laneClause =
+    lane === "direct"
+      ? "AND routed_capability IS NULL"
+      : lane === "capability"
+        ? "AND routed_capability IS NOT NULL"
+        : "";
 
   if (status === "all") {
     const params: unknown[] = [agentName];
     if (sinceIso) params.push(sinceIso);
     params.push(limit);
     rows = db.prepare(
-      `SELECT * FROM messages WHERE to_agent = ? ${sinceClause} ${priorityOrder}`
+      `SELECT * FROM messages WHERE to_agent = ? ${sinceClause} ${laneClause} ${priorityOrder}`
     ).all(...params) as MessageRecord[];
   } else if (status === "read") {
     // "read" = this session has already observed these messages.
@@ -3106,6 +3143,7 @@ export function getMessages(
          AND read_by_session IS NOT NULL
          AND read_by_session = ?
          ${sinceClause}
+         ${laneClause}
          ${priorityOrder}`
     ).all(...params) as MessageRecord[];
   } else {
@@ -3119,6 +3157,7 @@ export function getMessages(
       `SELECT * FROM messages WHERE to_agent = ?
          AND (read_by_session IS NULL OR read_by_session != ?)
          ${sinceClause}
+         ${laneClause}
          ${priorityOrder}`
     ).all(...params) as MessageRecord[];
   }
@@ -3446,6 +3485,105 @@ export function broadcastMessage(
   }
 
   return { sent_to: sentTo, message_ids: messageIds };
+}
+
+/**
+ * v2.10 — capability-routed messaging. Find every registered agent whose
+ * declared capability set includes `capability` (exact-string match against
+ * the agent_capabilities index — same matching contract as post_task_auto).
+ * Optionally excludes the sender. Returns owner agent names (possibly empty).
+ *
+ * The FYI/coordination-lane analogue of post_task_auto's candidate lookup,
+ * with two deliberate differences: (1) it matches a SINGLE capability tag
+ * (membership), not an ALL-OF set; (2) it returns ALL owners for fan-out, not
+ * the single least-loaded pick — an FYI should reach every persona that owns
+ * the domain, not just one.
+ */
+export function findCapabilityOwners(
+  capability: string,
+  excludeSender: string | null = null,
+): string[] {
+  const db = getDb();
+  const rows = excludeSender
+    ? db
+        .prepare(
+          "SELECT agent_name FROM agent_capabilities WHERE capability = ? AND agent_name != ? ORDER BY agent_name",
+        )
+        .all(capability, excludeSender)
+    : db
+        .prepare(
+          "SELECT agent_name FROM agent_capabilities WHERE capability = ? ORDER BY agent_name",
+        )
+        .all(capability);
+  return (rows as Array<{ agent_name: string }>).map((r) => r.agent_name);
+}
+
+/**
+ * v2.10 — capability-routed messaging fan-out (principle #1: capability
+ * routing over named routing). Routes one FYI/coordination message to the
+ * CURRENT owner(s) of `capability` by inserting one `messages` row per owner,
+ * stamped with `routed_capability` so the recipient + dashboards distinguish
+ * the FYI lane from point-to-point ship-pongs (the action lane). Recipients
+ * drain via the normal get_messages path — no new read surface.
+ *
+ * No-owner case (victra ruling #2): if nobody currently owns the capability,
+ * insert NOTHING and return routed_to:[] — FYI is fire-and-forget to current
+ * owners, NOT queued-until-owner (that would be task semantics).
+ *
+ * Mirrors broadcastMessage's per-recipient transaction + outbox-event +
+ * inbox-changed fan-out so MCP subscribers + the cross-process tail wake.
+ */
+export function postToCapability(
+  from: string,
+  capability: string,
+  content: string,
+  priority: string,
+  excludeSelf = true,
+): { routed_to: string[]; message_ids: string[] } {
+  const db = getDb();
+  touchAgent(from);
+
+  const owners = findCapabilityOwners(capability, excludeSelf ? from : null);
+
+  const routedTo: string[] = [];
+  const messageIds: string[] = [];
+  if (owners.length === 0) {
+    // No current owner — fire-and-forget means nothing is stored. The caller
+    // sees routed_to:[] and decides what to do.
+    return { routed_to: routedTo, message_ids: messageIds };
+  }
+
+  const timestamp = now();
+  const insert = db.prepare(
+    "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at, routed_capability) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+  );
+  const outboxInsert = db.prepare(
+    "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)",
+  );
+  const outboxIds: number[] = [];
+
+  const tx = db.transaction(() => {
+    for (const owner of owners) {
+      const id = uuidv4();
+      // Re-encrypt per row so each row gets its own IV (mirrors broadcast).
+      insert.run(id, from, owner, encryptContent(content), priority, timestamp, capability);
+      const r = outboxInsert.run(owner, "message_received", timestamp, process.pid);
+      outboxIds.push(Number(r.lastInsertRowid));
+      routedTo.push(owner);
+      messageIds.push(id);
+    }
+  });
+  tx();
+
+  for (let i = 0; i < routedTo.length; i++) {
+    emitInboxChanged({
+      agent_name: routedTo[i],
+      reason: "message_received",
+      id: outboxIds[i],
+    });
+  }
+
+  return { routed_to: routedTo, message_ids: messageIds };
 }
 
 // --- Task operations ---
