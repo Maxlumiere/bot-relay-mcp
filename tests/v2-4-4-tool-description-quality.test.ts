@@ -94,7 +94,7 @@ describe("v2.4.4 — tool description quality", () => {
   const tools = listTools();
 
   it("(Q1) every tool has a description with sufficient length", () => {
-    expect(tools.length).toBe(31);
+    expect(tools.length).toBe(33);
     const offenders = tools
       .filter((t) => !t.description || t.description.length < MIN_DESCRIPTION_CHARS)
       .map((t) => `${t.name}: ${t.description?.length ?? 0} chars`);
@@ -212,6 +212,7 @@ describe("v2.4.4 — tool description quality", () => {
       post_to_capability: "b7a90f9fcf1957218bed13da1744bf8ab0d609892cf0df7e581410a254cde5c0",
       post_to_channel: "593b795f55ccd34c8d3cc668f91bc64c6a4be27f79827b09b3895ccea37e59b2",
       register_agent: "43f3d8cb5b37ffcf8f089e23727ee2110cc792938699f04ea6cc0623e74b7128",
+      register_task_schema: "60f9f8fda5aca33c58e6ed9bc2936620c69d3e15b65999ffd8869e89e1305d0b",
       register_webhook: "7a1fd9852ec77d5ee5e23e081a5f1d82ab8d1fa0591d84893b1e1a55253ec006",
       revoke_token: "dbe9e38b84537ca2a4857e7b450f2cfa750698053713180047975cb152ef7884",
       rotate_token: "d3a9ed36a83157f59c01335df8b25978b5af23666c1b61d8ed5ad897680bfc25",
@@ -220,6 +221,7 @@ describe("v2.4.4 — tool description quality", () => {
       set_dashboard_theme: "bc6b17d24b74b289c25f6f327046298d25c035f28a3830449848283631034ed8",
       set_status: "62feb957849a1b52dfa7d1b4f6619c49554e59161b8bddbc3db1d1221e73d4d1",
       spawn_agent: "d95b055dd708080cf5f4468fb26c9fe28257e947c85d34427991f247fe84a68a",
+      task_schema_get: "4ec18861f288b8e7122e43834d86715da037eecd623bd98eec4ce368460b699f",
       unregister_agent: "dcd94807ba629527459cb0df2b5d73427d0b09bea7f756a47700e000685736ee",
       update_task: "05aacb80e85bf615a033a7611bb58d673dbb7bd86e5e33f846243f323cd02931",
     };

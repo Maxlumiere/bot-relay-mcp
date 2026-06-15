@@ -96,6 +96,11 @@ export interface RotationGraceInputs {
 /** Capability requirements per tool. Missing = always allowed. */
 export const TOOL_CAPABILITY: Record<string, string> = {
   spawn_agent: "spawn",
+  // v2.10 — a registered task schema is COMPILED by ajv, so registration is
+  // restricted to agents holding the dedicated `manage_schemas` capability
+  // (least-privilege; Q9). Built-in seed schemas bypass the tool (direct DB at
+  // init). task_schema_get is an open read (TOOLS_NO_AUTH).
+  register_task_schema: "manage_schemas",
   post_task: "tasks",
   post_task_auto: "tasks",
   update_task: "tasks",
@@ -146,6 +151,8 @@ export const TOOLS_NO_AUTH: ReadonlySet<string> = new Set([
   // operators can probe from scripts without wiring a token. Returns only
   // aggregate counts — no per-agent content.
   "health_check",
+  // v2.10: task_schema_get is a pure read of a public structural contract.
+  "task_schema_get",
 ]);
 
 /**

@@ -83,9 +83,9 @@ describe("HTTP transport", () => {
     expect(body.transport).toBe("http");
   });
 
-  it("tools/list returns all 31 tools (30 from v2.3.0 + post_to_capability [v2.10])", async () => {
+  it("tools/list returns all 33 tools (31 + register_task_schema + task_schema_get [v2.10 schema-gating])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(31);
+    expect(result.result.tools.length).toBe(33);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
     expect(names).toContain("unregister_agent");
