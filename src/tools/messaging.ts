@@ -8,6 +8,7 @@ import {
   getMessages,
   getMessagesSummary,
   broadcastMessage,
+  postToCapability,
   runHealthMonitorTick,
   SenderNotRegisteredError,
   getAgentSessionStart,
@@ -21,6 +22,7 @@ import type {
   GetMessagesInput,
   GetMessagesSummaryInput,
   BroadcastInput,
+  PostToCapabilityInput,
 } from "../types.js";
 
 /** v2.0 beta: lazy health piggyback on get_messages. See tools/tasks.ts for rationale. */
@@ -147,7 +149,7 @@ export function handleGetMessages(input: GetMessagesInput) {
       isError: true,
     };
   }
-  const raw = getMessages(input.agent_name, input.status, input.limit, input.peek ?? false, sinceIso);
+  const raw = getMessages(input.agent_name, input.status, input.limit, input.peek ?? false, sinceIso, input.lane);
   const messages = raw;
   // v2.3.0 Part A.2 — live consistency probe. Off by default; when
   // enabled via RELAY_CONSISTENCY_PROBE=1, samples every Nth call and
@@ -155,14 +157,19 @@ export function handleGetMessages(input: GetMessagesInput) {
   // messages that the MCP path dropped (v2.2.1-style bug class).
   // Never throws, never blocks — pure observation.
   try {
-    sampleGetMessagesConsistency({
-      agentName: input.agent_name,
-      status: input.status,
-      limit: input.limit,
-      peek: input.peek ?? false,
-      mcpResult: raw,
-      sinceIso,
-    });
+    // v2.10 — the probe compares against a raw superset query that is NOT
+    // lane-aware, so only sample when lane='all' (default). A lane filter is
+    // an intentional subset, not a consistency bug.
+    if ((input.lane ?? "all") === "all") {
+      sampleGetMessagesConsistency({
+        agentName: input.agent_name,
+        status: input.status,
+        limit: input.limit,
+        peek: input.peek ?? false,
+        mcpResult: raw,
+        sinceIso,
+      });
+    }
   } catch {
     /* probe guarantees no-throw but defensive */
   }
@@ -306,4 +313,72 @@ export function handleBroadcast(input: BroadcastInput) {
       },
     ],
   };
+}
+
+/**
+ * v2.10 — capability-routed messaging (principle #1). Fans an FYI/coordination
+ * message out to the CURRENT owner(s) of a capability. FYI/coordination lane
+ * ONLY — action-required completions stay point-to-point ship-pongs via
+ * send_message. Fires ONE `message.capability_routed` webhook for the whole
+ * fan-out (not per-recipient) carrying the capability + recipients, so
+ * integrations (Tether) can render the FYI lane distinctly.
+ */
+export function handlePostToCapability(input: PostToCapabilityInput) {
+  try {
+    const result = postToCapability(
+      input.from,
+      input.capability,
+      input.content,
+      input.priority,
+      input.exclude_self ?? true,
+    );
+    fireWebhooks("message.capability_routed", input.from, input.capability, {
+      capability: input.capability,
+      routed_to: result.routed_to,
+      message_count: result.message_ids.length,
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              capability: input.capability,
+              routed_to: result.routed_to,
+              message_ids: result.message_ids,
+              count: result.routed_to.length,
+              note:
+                result.routed_to.length === 0
+                  ? `No registered owner for capability "${input.capability}" — nothing routed (FYI is fire-and-forget to current owners).`
+                  : `Capability-routed to ${result.routed_to.length} owner(s) of "${input.capability}".`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (err: any) {
+    if (err instanceof SenderNotRegisteredError) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error: err.message,
+                error_code: ERROR_CODES.SENDER_NOT_REGISTERED,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    throw err;
+  }
 }

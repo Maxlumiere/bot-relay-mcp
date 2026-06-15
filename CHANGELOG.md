@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.10.0 (pending — co-releases with schema-gated task completion) — Coordination + safety
+
+### Added — capability-routed messaging (`post_to_capability`)
+
+New MCP tool **`post_to_capability`** (tool #31): a sender tags an FYI/coordination message by a single domain/capability and the relay fans it out to the CURRENT owner(s) of that capability via the normal inbox — no manual channel join, no named recipient. Use case: an ad-hoc agent tags a finding by domain → the owning persona (e.g. concierge for "relationships") picks it up automatically on its next `get_messages`. This is the build vehicle for principle #1 (capability routing over named routing) of the AI-native relay directive.
+
+- **Routing** reuses the proven `agent_capabilities` index + exact-string match (same contract as `post_task_auto`), but fans out to ALL current owners (an FYI should reach every persona that owns the domain, not just the least-loaded one) and delivers into the existing `messages` inbox — recipients drain via the normal `get_messages`, so there is **zero new read path** (Tether and the SessionStart hook work unchanged).
+- **Action-vs-FYI line stays intact (machine-enforceable).** Action-required completions remain point-to-point ship-pongs (`send_message`); capability-routed topics are the FYI/coordination lane only. A new nullable `messages.routed_capability` column + a `get_messages` `lane` filter (`all` | `direct` | `capability`) keep the two lanes distinguishable, so an action item is never lost in FYI noise.
+- **No current owner** → `routed_to: []` and nothing is stored (fire-and-forget to current owners; NOT queued-until-owner, which is task semantics).
+- New webhook event **`message.capability_routed`** (fired once per fan-out, carrying the capability + recipients).
+- Schema migrates **v13 → v14** — one additive `NULL`-default column; zero data migration.
+
 ## v2.9.1 — 2026-06-10 — HOTFIX: autowake recursion (Tether 0.2.0 + HTTP daemon crash)
 
 Fixes the deployment-blocking RangeError that surfaced when Tether 0.2.0 connected to the v2.9.0 HTTP daemon. The bug class is the same shape as v2.5-R1 (InMemoryTransport-style tests passing while real HTTP transport breaks); my v2.9.0 autowake test was real but exercised the wrong close path, so the recursion went undetected through v2.5–v2.9.0 and only triggered on Maxime's live VS Code + Tether deployment.
