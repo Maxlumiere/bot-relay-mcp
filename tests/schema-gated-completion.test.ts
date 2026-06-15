@@ -10,10 +10,19 @@
 // negative control: a non-conforming result is REJECTED and the task never
 // falsely completes.
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+
+// v2.10 (codex R1 P2) — mock fireWebhooks so the negative control can assert
+// the NO-`task.completed`-webhook invariant directly (test-asserts-contract,
+// not a proxy). All importers (incl. tools/tasks.ts) get the mocked binding.
+vi.mock("../src/webhooks.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/webhooks.js")>();
+  return { ...actual, fireWebhooks: vi.fn() };
+});
+import { fireWebhooks } from "../src/webhooks.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-schemagate-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -218,5 +227,20 @@ describe("v2.10 — handlers (register_task_schema / task_schema_get / update_ta
     expect(out.success).toBe(false);
     expect(out.error_code).toBe("RESULT_SCHEMA_VIOLATION");
     expect(getTask(id)?.status).toBe("accepted");
+  });
+
+  it("★ fires NO task.completed webhook on a rejected gated completion — positive control confirms it fires on success", () => {
+    process.env.RELAY_SCHEMA_GATING = "enforce";
+    (fireWebhooks as any).mockClear();
+    const id = gatedAcceptedTask();
+    // Rejected gated completion → handler returns isError BEFORE firing any webhook.
+    const out = parse(handleUpdateTask({ task_id: id, agent_name: "worker", action: "complete", result: "{}" } as any));
+    expect(out.success).toBe(false);
+    expect((fireWebhooks as any).mock.calls.some((c: unknown[]) => c[0] === "task.completed")).toBe(false);
+    // Positive control: a CONFORMING completion DOES fire task.completed — proves
+    // the spy is wired, so the negative assertion above is load-bearing.
+    (fireWebhooks as any).mockClear();
+    handleUpdateTask({ task_id: id, agent_name: "worker", action: "complete", result: CONFORMING } as any);
+    expect((fireWebhooks as any).mock.calls.some((c: unknown[]) => c[0] === "task.completed")).toBe(true);
   });
 });
