@@ -61,6 +61,10 @@ export interface WebhookPayload {
   auto_assigned_from_queue?: boolean;
   cancelled_by?: string;
   triggered_by?: string;
+  // v2.10 — capability-routed messaging (message.capability_routed event).
+  capability?: string;
+  routed_to?: string[];
+  message_count?: number;
 }
 
 function hmac(payload: string, secret: string): string {
