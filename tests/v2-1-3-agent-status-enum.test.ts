@@ -50,11 +50,11 @@ afterEach(() => {
 // ============================================================================
 
 describe("v2.1.3 I6 — schema v2_5 migration + defaults", () => {
-  it("schema version is current post-migration (v2.8 dashboard-state-machine bumped to 13 — signal_received_at + signal_kind + last_dispatched_at columns on agents)", () => {
+  it("schema version is current post-migration (v2.10 capability-routed messaging bumped to 14 — messages.routed_capability column; v2.8 added signal columns at 13)", () => {
     registerAgent("sv-current", "r", []);
-    expect(CURRENT_SCHEMA_VERSION).toBe(13);
+    expect(CURRENT_SCHEMA_VERSION).toBe(14);
     const row = getDb().prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number };
-    expect(row.version).toBe(13);
+    expect(row.version).toBe(14);
   });
 
   it("new registrations default agent_status='idle' (was 'online')", () => {

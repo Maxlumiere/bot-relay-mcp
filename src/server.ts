@@ -24,6 +24,7 @@ import {
   GetMessagesSchema,
   GetMessagesSummarySchema,
   BroadcastSchema,
+  PostToCapabilitySchema,
   PostTaskSchema,
   PostTaskAutoSchema,
   UpdateTaskSchema,
@@ -65,7 +66,7 @@ import { currentContext, requestContext } from "./request-context.js";
 import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
 import { ZodError } from "zod";
 import { authenticateAgent, verifyToken, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive } from "./auth.js";
-import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleBroadcast } from "./tools/messaging.js";
+import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleBroadcast, handlePostToCapability } from "./tools/messaging.js";
 import { handlePostTask, handlePostTaskAuto, handleUpdateTask, handleGetTasks, handleGetTask } from "./tools/tasks.js";
 import { handleRegisterWebhook, handleListWebhooks, handleDeleteWebhook } from "./tools/webhooks.js";
 import { processDueWebhookRetries } from "./webhooks.js";
@@ -155,6 +156,8 @@ export const TOOL_BUNDLES: Record<string, string> = {
   get_messages: "core",
   get_messages_summary: "core",
   broadcast: "core",
+  // v2.10 — capability-routed messaging (FYI/coordination lane). Core primitive.
+  post_to_capability: "core",
   post_task: "core",
   post_task_auto: "core",
   update_task: "core",
@@ -421,6 +424,16 @@ export function createServer(): Server {
           "Returns: `{ success: true, sent_to: string[], message_ids: string[], count, note }`. `count=0` with a note string when no other agents matched the filter (still success, not error).\n\n" +
           "Errors: `AUTH_FAILED`, `PAYLOAD_TOO_LARGE`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(BroadcastSchema),
+      },
+      {
+        name: "post_to_capability",
+        description:
+          "Route an FYI/coordination message to the current owner(s) of a capability (v2.10 — capability routing, principle #1).\n\n" +
+          "When to use: surface a finding, status, or cross-cutting update to whoever owns a domain WITHOUT knowing their name — e.g. an ad-hoc agent tags a 'relationships' finding and the concierge persona that owns that capability picks it up on its next get_messages. FYI/COORDINATION LANE ONLY: action-required completions (a STAGED build needing an audit, a SHIP that triggers a merge) MUST stay point-to-point ship-pongs via send_message — that point-to-point reliability is what triggers the orchestrator's next action. A capability-routed message never triggers an action.\n\n" +
+          "Behavior: exact-string matches `capability` against every registered agent's declared capabilities (same lookup as post_task_auto), then fans the message out — one `messages` row per owner, stamped with `routed_capability` so recipients + dashboards distinguish the FYI lane from point-to-point mail. Recipients drain via the normal get_messages (use lane='capability' to read only the FYI lane, lane='direct' for only point-to-point). The sender is excluded by default (`exclude_self`). No current owner → `routed_to:[]` and nothing stored (fire-and-forget to current owners, NOT queued-until-owner). Fires one `message.capability_routed` webhook for the batch. Content encrypted at rest if `RELAY_ENCRYPTION_KEY` is set; same payload cap as `send_message`.\n\n" +
+          "Returns: `{ success: true, capability, routed_to: string[], message_ids: string[], count, note }`. `routed_to` is empty (with an explanatory note) when no agent currently owns the capability.\n\n" +
+          "Errors: `AUTH_FAILED`, `SENDER_NOT_REGISTERED`, `PAYLOAD_TOO_LARGE`, `RATE_LIMITED`, `VALIDATION`.",
+        inputSchema: zodToJsonSchema(PostToCapabilitySchema),
       },
       {
         name: "post_task",
@@ -735,6 +748,8 @@ export function createServer(): Server {
         return handleGetMessagesSummary(GetMessagesSummarySchema.parse(args));
       case "broadcast":
         return handleBroadcast(BroadcastSchema.parse(args));
+      case "post_to_capability":
+        return handlePostToCapability(PostToCapabilitySchema.parse(args));
       case "post_task":
         return handlePostTask(PostTaskSchema.parse(args));
       case "post_task_auto":

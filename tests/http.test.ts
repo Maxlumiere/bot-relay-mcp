@@ -83,9 +83,9 @@ describe("HTTP transport", () => {
     expect(body.transport).toBe("http");
   });
 
-  it("tools/list returns all 30 tools (29 from v2.2.1 + peek_inbox_version [v2.3.0])", async () => {
+  it("tools/list returns all 31 tools (30 from v2.3.0 + post_to_capability [v2.10])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(30);
+    expect(result.result.tools.length).toBe(31);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
     expect(names).toContain("unregister_agent");

@@ -192,6 +192,20 @@ export const GetMessagesSchema = z.object({
   peek: z.boolean().optional().default(false).describe(
     "When true, skip the mark-as-read side effect so repeated status='pending' polls return the same messages. Default false (consume-once)."
   ),
+  /**
+   * v2.10 — capability-routed messaging lane filter. 'all' (default, back-
+   * compat) returns every message; 'direct' returns only point-to-point
+   * messages (routed_capability IS NULL — the action lane); 'capability'
+   * returns only capability-routed FYI messages (routed_capability IS NOT
+   * NULL). Lets an orchestrator drain the action lane separately from the
+   * FYI lane so an action-required ship-pong is never lost in FYI noise.
+   */
+  lane: z
+    .enum(["all", "direct", "capability"])
+    .default("all")
+    .describe(
+      "Filter by message lane: 'all' (default), 'direct' (point-to-point only), or 'capability' (capability-routed FYI only)."
+    ),
   agent_token: AgentTokenField,
 });
 
@@ -216,6 +230,32 @@ export const BroadcastSchema = z.object({
   role: z.string().optional().describe("Only send to agents with this role"),
   agent_token: AgentTokenField,
 });
+
+/**
+ * v2.10 — capability-routed messaging (principle #1: capability routing over
+ * named routing). The sender tags an FYI/coordination message by a single
+ * domain/capability; the relay fans it out to the CURRENT owner(s) of that
+ * capability (exact-string match against the agent_capabilities index — same
+ * matching contract as post_task_auto). FYI/coordination lane ONLY — action-
+ * required completions stay point-to-point ship-pongs via send_message.
+ */
+export const PostToCapabilitySchema = z.object({
+  from: z.string().min(1).describe("Sender agent name"),
+  capability: z
+    .string()
+    .min(1)
+    .max(128)
+    .describe("The single domain/capability tag to route on (exact-match against registered agent capabilities)"),
+  content: payloadField("content").describe("FYI/coordination content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES)"),
+  priority: z.enum(["normal", "high"]).default("normal").describe("Message priority"),
+  exclude_self: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe("When true (default), the sender is excluded from recipients even if it owns the capability."),
+  agent_token: AgentTokenField,
+});
+export type PostToCapabilityInput = z.infer<typeof PostToCapabilitySchema>;
 
 export const PostTaskSchema = z.object({
   from: z.string().min(1).describe("Requester agent name"),
@@ -443,6 +483,7 @@ export const GetChannelMessagesSchema = z.object({
 export const WebhookEventEnum = z.enum([
   "message.sent",
   "message.broadcast",
+  "message.capability_routed",
   "task.posted",
   "task.accepted",
   "task.completed",
@@ -729,6 +770,15 @@ export interface MessageRecord {
    * message.
    */
   epoch?: string | null;
+  /**
+   * v2.10 — capability-routed messaging (FYI/coordination lane). NULL for
+   * every point-to-point send_message / broadcast row (the action lane).
+   * Non-NULL = this row was fanned out to the owner(s) of this capability
+   * via post_to_capability. Makes the action-vs-FYI line machine-
+   * distinguishable so an FYI is never mistaken for an action-required
+   * ship-pong.
+   */
+  routed_capability?: string | null;
 }
 
 export interface TaskRecord {

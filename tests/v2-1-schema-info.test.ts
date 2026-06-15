@@ -148,7 +148,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     // v2.8 dashboard-state-machine registered 12→13 (migrateSchemaToV2_11:
     // signal_received_at + signal_kind + last_dispatched_at columns on agents).
     expect(() => applyMigration(12, 13)).not.toThrow();
-    expect(() => applyMigration(13, 14)).toThrow(/no migration registered|13→14/);
+    // v2.10 capability-routed messaging registered 13→14 (migrateSchemaToV2_12: messages.routed_capability column).
+    expect(() => applyMigration(13, 14)).not.toThrow();
+    expect(() => applyMigration(14, 15)).toThrow(/no migration registered|14→15/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {
