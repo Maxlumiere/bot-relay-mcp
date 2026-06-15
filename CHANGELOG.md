@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.10.0 (pending — co-releases with schema-gated task completion) — Coordination + safety
+## v2.10.0 — 2026-06-15 — Coordination + safety
 
 ### Added — capability-routed messaging (`post_to_capability`)
 
