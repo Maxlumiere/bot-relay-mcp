@@ -32,6 +32,7 @@ import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { touchMarker } from "./filesystem-marker.js";
 import { resolveInstanceDbPath } from "./instance.js";
 import { emitInboxChanged } from "./inbox-events.js";
+import { validateSchemaDocument, validateResult, type SchemaCheck } from "./task-schema-validator.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".bot-relay");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "relay.db");
@@ -216,6 +217,8 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_10(_db);
   migrateSchemaToV2_11(_db);
   migrateSchemaToV2_12(_db);
+  migrateSchemaToV2_13(_db);
+  seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 }
@@ -252,6 +255,8 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_10(_db);
   migrateSchemaToV2_11(_db);
   migrateSchemaToV2_12(_db);
+  migrateSchemaToV2_13(_db);
+  seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
 
@@ -472,7 +477,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 15;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -560,6 +565,7 @@ export function applyMigration(from: number, to: number): void {
     [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],
     [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13],
     [13, 14],
+    [14, 15],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1325,6 +1331,39 @@ function migrateSchemaToV2_12(db: CompatDatabase): void {
     .all() as Array<{ name: string }>;
   if (!msgCols.some((c) => c.name === "routed_capability")) {
     db.exec("ALTER TABLE messages ADD COLUMN routed_capability TEXT");
+  }
+}
+
+/**
+ * v2.10 — schema-gated task completion (safety). schema v14 → v15.
+ *
+ * Additive, idempotent:
+ *   - new `task_schemas` table: reusable, immutable JSON Schema documents
+ *     (id = name-as-version, e.g. "ship_pong_v1"). A registered schema is
+ *     compiled by ajv, so registration is authz-restricted at the tool layer
+ *     and the document is meta-validated BEFORE compile (see
+ *     src/task-schema-validator.ts).
+ *   - new nullable `tasks.schema_id` column: NULL = un-gated (completes
+ *     exactly as today — the opt-in / backward-compat flag). Non-NULL gates
+ *     the accepted→completed transition on the stored schema.
+ *
+ * PRAGMA-guarded ALTER so re-runs no-op; NULL on every existing task row =
+ * zero data migration.
+ */
+function migrateSchemaToV2_13(db: CompatDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS task_schemas (
+      id          TEXT PRIMARY KEY,
+      json_schema TEXT NOT NULL,
+      created_by  TEXT NOT NULL,
+      created_at  TEXT NOT NULL
+    );
+  `);
+  const taskCols = db
+    .prepare("PRAGMA table_info(tasks)")
+    .all() as Array<{ name: string }>;
+  if (!taskCols.some((c) => c.name === "schema_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN schema_id TEXT");
   }
 }
 
@@ -3586,6 +3625,167 @@ export function postToCapability(
   return { routed_to: routedTo, message_ids: messageIds };
 }
 
+// --- v2.10 Task schema operations (schema-gated completion) ---
+
+export type SchemaGatingMode = "enforce" | "warn" | "off";
+
+/**
+ * Read the global schema-gating kill-switch. Default 'warn' (shadow): validate
+ * + log violations but ALLOW completion, so a brand-new gate can't wrongly
+ * reject legit completions during rollout. 'enforce' rejects; 'off' skips.
+ * An invalid value falls back to the safe 'warn'.
+ */
+export function getSchemaGatingMode(): SchemaGatingMode {
+  const raw = (process.env.RELAY_SCHEMA_GATING ?? "warn").toLowerCase();
+  return raw === "enforce" || raw === "warn" || raw === "off" ? raw : "warn";
+}
+
+export interface TaskSchemaRecord {
+  id: string;
+  json_schema: string;
+  /** Parsed JSON Schema document. */
+  schemaDoc: Record<string, unknown>;
+  created_by: string;
+  created_at: string;
+}
+
+/** Thrown when a candidate schema document fails meta-validation at register. */
+export class SchemaDocumentInvalidError extends Error {
+  errors: string[];
+  constructor(errors: string[]) {
+    super(`Invalid JSON Schema document: ${errors.join("; ")}`);
+    this.name = "SchemaDocumentInvalidError";
+    this.errors = errors;
+  }
+}
+
+/** Thrown when registering an id that already exists (schemas are immutable). */
+export class SchemaAlreadyExistsError extends Error {
+  constructor(id: string) {
+    super(`Task schema "${id}" already exists — schemas are immutable; register a new version id.`);
+    this.name = "SchemaAlreadyExistsError";
+  }
+}
+
+/** Thrown when a schema-gated task is completed with a non-conforming result. */
+export class ResultSchemaViolationError extends Error {
+  schemaId: string;
+  errors: string[];
+  constructor(schemaId: string, errors: string[]) {
+    super(`Task result does not conform to schema "${schemaId}": ${errors.join("; ")}`);
+    this.name = "ResultSchemaViolationError";
+    this.schemaId = schemaId;
+    this.errors = errors;
+  }
+}
+
+/**
+ * v2.10 — built-in task schemas, auto-registered on init (INSERT OR IGNORE so
+ * operator-registered overrides are never clobbered and re-runs no-op). Field
+ * sets are grounded in the team's actual ship-pong / audit-verdict / merge
+ * shapes; `required` carries the PROOF fields an agent cannot fake-complete
+ * without. additionalProperties:true keeps them forward-compatible.
+ */
+const BUILTIN_TASK_SCHEMAS: Record<string, Record<string, unknown>> = {
+  ship_pong_v1: {
+    type: "object",
+    properties: {
+      ci_status: { type: "string", enum: ["green"] },
+      tests_passed: { type: "integer", minimum: 0 },
+      summary: { type: "string", minLength: 1 },
+      pr_number: { type: "integer" },
+      head_sha: { type: "string", minLength: 7 },
+    },
+    required: ["ci_status", "tests_passed", "summary"],
+    additionalProperties: true,
+  },
+  audit_verdict_v1: {
+    type: "object",
+    properties: {
+      verdict: { type: "string", enum: ["SHIP", "PATCH_THEN_SHIP", "BLOCK"] },
+      summary: { type: "string", minLength: 1 },
+      findings: { type: "array" },
+    },
+    required: ["verdict", "summary"],
+    additionalProperties: true,
+  },
+  merge_ready_v1: {
+    type: "object",
+    properties: {
+      ci_green: { type: "boolean" },
+      audit_ship: { type: "boolean" },
+      head_sha: { type: "string", minLength: 7 },
+      summary: { type: "string", minLength: 1 },
+    },
+    required: ["ci_green", "audit_ship", "head_sha"],
+    additionalProperties: true,
+  },
+};
+
+/** Auto-register the built-in schemas. Idempotent; never clobbers overrides. */
+export function seedBuiltinTaskSchemas(db: CompatDatabase): void {
+  const ts = now();
+  const ins = db.prepare(
+    "INSERT OR IGNORE INTO task_schemas (id, json_schema, created_by, created_at) VALUES (?, ?, 'system', ?)",
+  );
+  for (const [id, doc] of Object.entries(BUILTIN_TASK_SCHEMAS)) {
+    ins.run(id, JSON.stringify(doc), ts);
+  }
+}
+
+/**
+ * Register a reusable, IMMUTABLE task schema. The document is meta-validated
+ * (validateSchemaDocument) BEFORE it is ever compiled by ajv — ajv code-gens
+ * from the schema, so an unvetted document is an attack surface. Re-registering
+ * an existing id is refused (immutability) — bump the version id instead.
+ */
+export function registerTaskSchema(id: string, schemaDoc: unknown, createdBy: string): TaskSchemaRecord {
+  const check = validateSchemaDocument(schemaDoc);
+  if (!check.valid) throw new SchemaDocumentInvalidError(check.errors);
+  const db = getDb();
+  if (db.prepare("SELECT id FROM task_schemas WHERE id = ?").get(id)) {
+    throw new SchemaAlreadyExistsError(id);
+  }
+  const json = JSON.stringify(schemaDoc);
+  const ts = now();
+  db.prepare("INSERT INTO task_schemas (id, json_schema, created_by, created_at) VALUES (?, ?, ?, ?)").run(
+    id, json, createdBy, ts,
+  );
+  return { id, json_schema: json, schemaDoc: schemaDoc as Record<string, unknown>, created_by: createdBy, created_at: ts };
+}
+
+/** Fetch a registered task schema by id (parsed doc included), or null. */
+export function getTaskSchema(id: string): TaskSchemaRecord | null {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT id, json_schema, created_by, created_at FROM task_schemas WHERE id = ?")
+    .get(id) as { id: string; json_schema: string; created_by: string; created_at: string } | undefined;
+  if (!row) return null;
+  let doc: Record<string, unknown>;
+  try { doc = JSON.parse(row.json_schema); } catch { doc = {}; }
+  return { ...row, schemaDoc: doc };
+}
+
+/**
+ * Validate a task `result` against the task's registered schema. A gated result
+ * MUST be a non-empty string that parses as JSON and conforms; a missing schema
+ * row fails CLOSED (invalid).
+ */
+export function checkResultAgainstTaskSchema(schemaId: string, result: string | undefined): SchemaCheck {
+  const row = getTaskSchema(schemaId);
+  if (!row) return { valid: false, errors: [`schema "${schemaId}" not found`] };
+  if (result == null || result === "") {
+    return { valid: false, errors: ["result is required and must be a JSON object conforming to the schema"] };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result);
+  } catch {
+    return { valid: false, errors: ["result is not valid JSON (a schema-gated task requires a JSON result)"] };
+  }
+  return validateResult(schemaId, row.schemaDoc, parsed);
+}
+
 // --- Task operations ---
 
 export function postTask(
@@ -3593,18 +3793,25 @@ export function postTask(
   to: string,
   title: string,
   description: string,
-  priority: string
+  priority: string,
+  schemaId?: string
 ): TaskRecord {
   const db = getDb();
   touchAgent(from);
+
+  // v2.10 — a requester may gate this task's completion on a registered schema.
+  // The id must reference an existing task_schema (fail-closed if unknown).
+  if (schemaId != null && !getTaskSchema(schemaId)) {
+    throw new Error(`Unknown task schema "${schemaId}" — register it first via register_task_schema.`);
+  }
 
   const id = uuidv4();
   const timestamp = now();
   const encDescription = encryptContent(description); // v1.7: encrypt at rest
 
   db.prepare(
-    "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?)"
-  ).run(id, from, to, title, encDescription, priority, timestamp, timestamp);
+    "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, schema_id) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?, ?)"
+  ).run(id, from, to, title, encDescription, priority, timestamp, timestamp, schemaId ?? null);
 
   // v2.8 — a task post IS a dispatch event per CHANGELOG.md:31 ("was
   // given work to do recently"). Stamp the recipient's
@@ -3623,6 +3830,7 @@ export function postTask(
     result: null,
     created_at: timestamp,
     updated_at: timestamp,
+    schema_id: schemaId ?? null,
   };
 }
 
@@ -3786,6 +3994,28 @@ export function updateTask(
     throw new Error(
       `Cannot ${action} a task with status "${task.status}". Allowed from: ${allowedFromStatuses.join(", ")}`
     );
+  }
+
+  // v2.10 — schema-gated completion. A task with a non-NULL schema_id must
+  // produce a result that parses as JSON and conforms to the registered schema
+  // BEFORE the accepted→completed CAS UPDATE. Applies only to `complete`;
+  // un-gated tasks (schema_id NULL) and all other actions are untouched.
+  // RELAY_SCHEMA_GATING: enforce (reject) | warn (log + allow, default) | off.
+  if (action === "complete" && task.schema_id) {
+    const mode = getSchemaGatingMode();
+    if (mode !== "off") {
+      const check = checkResultAgainstTaskSchema(task.schema_id, result);
+      if (!check.valid) {
+        if (mode === "enforce") {
+          throw new ResultSchemaViolationError(task.schema_id, check.errors);
+        }
+        log.warn(
+          `[schema-gate] WARN task ${taskId}: result does not conform to schema ` +
+          `"${task.schema_id}" (${check.errors.join("; ")}) — allowed because ` +
+          `RELAY_SCHEMA_GATING=warn; set =enforce to block.`,
+        );
+      }
+    }
   }
 
   const timestamp = now();
