@@ -28,6 +28,8 @@ import {
   PostTaskSchema,
   PostTaskAutoSchema,
   UpdateTaskSchema,
+  RegisterTaskSchemaSchema,
+  TaskSchemaGetSchema,
   GetTasksSchema,
   GetTaskSchema,
   RegisterWebhookSchema,
@@ -67,7 +69,7 @@ import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
 import { ZodError } from "zod";
 import { authenticateAgent, verifyToken, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive } from "./auth.js";
 import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleBroadcast, handlePostToCapability } from "./tools/messaging.js";
-import { handlePostTask, handlePostTaskAuto, handleUpdateTask, handleGetTasks, handleGetTask } from "./tools/tasks.js";
+import { handlePostTask, handlePostTaskAuto, handleUpdateTask, handleGetTasks, handleGetTask, handleRegisterTaskSchema, handleTaskSchemaGet } from "./tools/tasks.js";
 import { handleRegisterWebhook, handleListWebhooks, handleDeleteWebhook } from "./tools/webhooks.js";
 import { processDueWebhookRetries } from "./webhooks.js";
 import { sweepExpiredRotationGrace } from "./db.js";
@@ -186,6 +188,10 @@ export const TOOL_BUNDLES: Record<string, string> = {
   get_standup: "managed-agents",
   // v2.3.0 Part C.3 — ambient-wake peek tool, a core mailbox primitive.
   peek_inbox_version: "core",
+  // v2.10 — schema-gated task completion. register is admin-bundled + cap-gated
+  // (manage_schemas); the schema read is a core primitive.
+  register_task_schema: "admin",
+  task_schema_get: "core",
   // federation — reserved (empty)
 };
 
@@ -486,6 +492,26 @@ export function createServer(): Server {
         inputSchema: zodToJsonSchema(GetTaskSchema),
       },
       {
+        name: "register_task_schema",
+        description:
+          "Register a reusable, immutable JSON Schema that gates task completion (v2.10 — safety).\n\n" +
+          "When to use: define the PROOF shape a completing agent must satisfy — e.g. a ship-pong requiring `{ci_status:'green', tests_passed, summary}`. A requester attaches the schema id to a task via `post_task`'s `schema_id`; the assignee's `update_task(action='complete', result=...)` is then validated against it. Built-ins `ship_pong_v1` / `audit_verdict_v1` / `merge_ready_v1` are auto-registered on init.\n\n" +
+          "Behavior: the document is meta-validated + hardened (no `$ref`/`$dynamicRef`/`$recursiveRef`/`$data`) BEFORE ajv compiles it (a registered schema is compiled, so it is an attack surface). Schemas are IMMUTABLE — re-registering an id is refused; bump the version id. Auth: requires the `manage_schemas` capability.\n\n" +
+          "Returns: `{ success: true, id, created_by, created_at, note }`.\n\n" +
+          "Errors: `SCHEMA_MISMATCH` (invalid/forbidden schema document), `ALREADY_EXISTS` (id already registered), `CAP_DENIED`, `AUTH_FAILED`, `VALIDATION`.",
+        inputSchema: zodToJsonSchema(RegisterTaskSchemaSchema),
+      },
+      {
+        name: "task_schema_get",
+        description:
+          "Fetch a registered task schema by id (v2.10).\n\n" +
+          "When to use: an assignee about to complete a schema-gated task reads the required shape first, so its `result` conforms and the completion is accepted. Pure read; no auth required.\n\n" +
+          "Behavior: returns the stored JSON Schema document verbatim (the parsed object).\n\n" +
+          "Returns: `{ success: true, id, json_schema, created_by, created_at }`.\n\n" +
+          "Errors: `NOT_FOUND` (no such schema id).",
+        inputSchema: zodToJsonSchema(TaskSchemaGetSchema),
+      },
+      {
         name: "register_webhook",
         description:
           "Subscribe an HTTP endpoint to relay events.\n\n" +
@@ -760,6 +786,10 @@ export function createServer(): Server {
         return handleGetTasks(GetTasksSchema.parse(args));
       case "get_task":
         return handleGetTask(GetTaskSchema.parse(args));
+      case "register_task_schema":
+        return handleRegisterTaskSchema(RegisterTaskSchemaSchema.parse(args));
+      case "task_schema_get":
+        return handleTaskSchemaGet(TaskSchemaGetSchema.parse(args));
       case "register_webhook":
         return handleRegisterWebhook(RegisterWebhookSchema.parse(args));
       case "list_webhooks":

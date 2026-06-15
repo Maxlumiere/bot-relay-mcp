@@ -12,6 +12,17 @@ New MCP tool **`post_to_capability`** (tool #31): a sender tags an FYI/coordinat
 - New webhook event **`message.capability_routed`** (fired once per fan-out, carrying the capability + recipients).
 - Schema migrates **v13 → v14** — one additive `NULL`-default column; zero data migration.
 
+### Added — schema-gated task completion (`register_task_schema` / `task_schema_get`)
+
+Server-enforced JSON Schema validation of a task's completion result, gating the `accepted → completed` transition. Kills the root cause of the 2026-06-09 false-completion incidents — an agent marking a task complete with NO proof — at the protocol layer, for **any** agent (not just Claude hooks).
+
+- A requester attaches a schema to a task via `post_task`'s new optional `schema_id`. On `update_task(action='complete', result=…)` the relay parses `result` as JSON and validates it against the registered schema **before** the CAS UPDATE. Non-conforming → **rejected** (`RESULT_SCHEMA_VIOLATION`), the task stays `accepted`, no `task.completed` webhook. **Opt-in + backward-compatible:** a NULL `schema_id` completes exactly as today.
+- **Validator hardening (ajv):** strict mode; **no remote `$ref` / no `$data`** (no fetch/SSRF surface); the schema document is meta-validated + ref-scanned **before** ajv compiles it (a registered schema is code-generated from, so it is an attack surface); compiled validators are cached per id.
+- **Rollout-safe:** `RELAY_SCHEMA_GATING = warn (default — shadow: log + allow) | enforce | off`. Ships in **warn** so a brand-new gate can't wrongly reject legit completions; flip to `enforce` after the dual-audit window.
+- New tools **`register_task_schema`** (immutable; authz-restricted to the `manage_schemas` capability — a registered schema is compiled) + **`task_schema_get`** (open read). Built-in schemas `ship_pong_v1` / `audit_verdict_v1` / `merge_ready_v1` auto-registered on init.
+- Schema migrates **v14 → v15** — new `task_schemas` table + additive nullable `tasks.schema_id`; zero data migration.
+- Follow-up (deferred to keep v1 focused): `post_task_auto` `schema_id` threading (v1 gates via `post_task`).
+
 ## v2.9.1 — 2026-06-10 — HOTFIX: autowake recursion (Tether 0.2.0 + HTTP daemon crash)
 
 Fixes the deployment-blocking RangeError that surfaced when Tether 0.2.0 connected to the v2.9.0 HTTP daemon. The bug class is the same shape as v2.5-R1 (InMemoryTransport-style tests passing while real HTTP transport breaks); my v2.9.0 autowake test was real but exercised the wrong close path, so the recursion went undetected through v2.5–v2.9.0 and only triggered on Maxime's live VS Code + Tether deployment.

@@ -150,7 +150,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(12, 13)).not.toThrow();
     // v2.10 capability-routed messaging registered 13→14 (migrateSchemaToV2_12: messages.routed_capability column).
     expect(() => applyMigration(13, 14)).not.toThrow();
-    expect(() => applyMigration(14, 15)).toThrow(/no migration registered|14→15/);
+    // v2.10 schema-gated task completion registered 14→15 (migrateSchemaToV2_13: task_schemas table + tasks.schema_id).
+    expect(() => applyMigration(14, 15)).not.toThrow();
+    expect(() => applyMigration(15, 16)).toThrow(/no migration registered|15→16/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

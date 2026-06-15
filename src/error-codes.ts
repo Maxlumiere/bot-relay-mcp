@@ -84,6 +84,8 @@ export const ERROR_CODES = {
   // Schema / version --------------------------------------------------------
   /** v2.1 Phase 4c.3 — import schema_version mismatches relay. */
   SCHEMA_MISMATCH: "SCHEMA_MISMATCH",
+  /** v2.10 — a schema-gated task's completion result did not conform to the task's registered JSON Schema (RELAY_SCHEMA_GATING=enforce). */
+  RESULT_SCHEMA_VIOLATION: "RESULT_SCHEMA_VIOLATION",
 
   // Daemon state ------------------------------------------------------------
   /** v2.1 Phase 2c — restore refused while relay daemon appears to be running. */

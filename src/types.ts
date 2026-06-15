@@ -263,8 +263,42 @@ export const PostTaskSchema = z.object({
   title: z.string().min(1).max(256).describe("Short task title"),
   description: payloadField("description").describe("Full task description (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES)"),
   priority: z.enum(["low", "normal", "high", "critical"]).default("normal").describe("Task priority"),
+  schema_id: z
+    .string()
+    .min(1)
+    .max(128)
+    .optional()
+    .describe("v2.10: id of a registered task_schema that the assignee's completion result must conform to (schema-gated completion). Omit for an un-gated task."),
   agent_token: AgentTokenField,
 });
+
+/**
+ * v2.10 — register a reusable, immutable JSON Schema used to gate task
+ * completion. The document is meta-validated + hardened (no $ref/$data) BEFORE
+ * ajv compiles it. Registration is authz-restricted (a registered schema is
+ * compiled). Re-registering an existing id is refused (immutability).
+ */
+export const RegisterTaskSchemaSchema = z.object({
+  name: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[a-zA-Z0-9_.-]+$/, "name must contain only letters, digits, '_', '.', '-'")
+    .describe("Schema id, name-as-version (e.g. 'ship_pong_v1'). Immutable once registered."),
+  json_schema: z
+    .record(z.unknown())
+    .describe("The JSON Schema document (object). Meta-validated + hardened before compile; $ref/$dynamicRef/$recursiveRef/$data are rejected."),
+  agent_name: z.string().min(1).describe("Registering agent name"),
+  agent_token: AgentTokenField,
+});
+export type RegisterTaskSchemaInput = z.infer<typeof RegisterTaskSchemaSchema>;
+
+/** v2.10 — fetch a registered task schema so an assignee can see the required shape before completing. */
+export const TaskSchemaGetSchema = z.object({
+  name: z.string().min(1).max(128).describe("Schema id to fetch"),
+  agent_token: AgentTokenField,
+});
+export type TaskSchemaGetInput = z.infer<typeof TaskSchemaGetSchema>;
 
 /**
  * v2.1.3 (I6) — agent_status enum widened from (online | busy | away | offline)
@@ -797,6 +831,8 @@ export interface TaskRecord {
   lease_renewed_at?: string | null;
   /** v2.0 beta: JSON-array string of capabilities required for auto-routing. Null for tasks posted via legacy post_task. */
   required_capabilities?: string | null;
+  /** v2.10: id of the registered task_schema gating this task's completion. Null = un-gated (completes exactly as today). */
+  schema_id?: string | null;
 }
 
 export interface WebhookRecord {

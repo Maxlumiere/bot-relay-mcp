@@ -3,9 +3,22 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { postTask, updateTask, getTasks, getTask, postTaskAuto, runHealthMonitorTick, ConcurrentUpdateError } from "../db.js";
+import {
+  postTask,
+  updateTask,
+  getTasks,
+  getTask,
+  postTaskAuto,
+  runHealthMonitorTick,
+  ConcurrentUpdateError,
+  registerTaskSchema,
+  getTaskSchema,
+  ResultSchemaViolationError,
+  SchemaDocumentInvalidError,
+  SchemaAlreadyExistsError,
+} from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
-import type { PostTaskInput, PostTaskAutoInput, UpdateTaskInput, GetTasksInput, GetTaskInput, WebhookEvent } from "../types.js";
+import type { PostTaskInput, PostTaskAutoInput, UpdateTaskInput, GetTasksInput, GetTaskInput, WebhookEvent, RegisterTaskSchemaInput, TaskSchemaGetInput } from "../types.js";
 import { currentContext } from "../request-context.js";
 import { ERROR_CODES, type ErrorCode } from "../error-codes.js";
 
@@ -16,8 +29,13 @@ import { ERROR_CODES, type ErrorCode } from "../error-codes.js";
  */
 function classifyTaskError(err: unknown): ErrorCode {
   if (err instanceof ConcurrentUpdateError) return ERROR_CODES.CONCURRENT_UPDATE;
+  // v2.10 — schema-gated completion error classes.
+  if (err instanceof ResultSchemaViolationError) return ERROR_CODES.RESULT_SCHEMA_VIOLATION;
+  if (err instanceof SchemaDocumentInvalidError) return ERROR_CODES.SCHEMA_MISMATCH;
+  if (err instanceof SchemaAlreadyExistsError) return ERROR_CODES.ALREADY_EXISTS;
   if (err instanceof Error) {
     const m = err.message;
+    if (/unknown task schema/i.test(m)) return ERROR_CODES.NOT_FOUND;
     if (/not found/i.test(m)) return ERROR_CODES.NOT_FOUND;
     // "Cannot <action> a task with status ..." — state-transition violation.
     // Also: "Internal: no status mapping" / "unhandled action" (defensive
@@ -50,7 +68,7 @@ function runHealthMonitor(triggeredBy: string): void {
 }
 
 export function handlePostTask(input: PostTaskInput) {
-  const task = postTask(input.from, input.to, input.title, input.description, input.priority);
+  const task = postTask(input.from, input.to, input.title, input.description, input.priority, input.schema_id);
   fireWebhooks("task.posted", input.from, input.to, {
     task_id: task.id,
     task: {
@@ -75,6 +93,85 @@ export function handlePostTask(input: PostTaskInput) {
             priority: task.priority,
             status: task.status,
             note: `Task "${task.title}" posted for "${task.to_agent}"`,
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+/**
+ * v2.10 — register a reusable, immutable task-completion schema. Authz is
+ * enforced at the dispatcher (TOOL_CAPABILITY: manage_schemas); the document is
+ * meta-validated + hardened BEFORE ajv compiles it (db.registerTaskSchema →
+ * task-schema-validator).
+ */
+export function handleRegisterTaskSchema(input: RegisterTaskSchemaInput) {
+  try {
+    const rec = registerTaskSchema(input.name, input.json_schema, input.agent_name);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              id: rec.id,
+              created_by: rec.created_by,
+              created_at: rec.created_at,
+              note: `Task schema "${rec.id}" registered (immutable — bump the version id for changes).`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ success: false, error: message, error_code: classifyTaskError(err) }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+/** v2.10 — fetch a registered task schema so an assignee can see the required shape before completing. Pure read. */
+export function handleTaskSchemaGet(input: TaskSchemaGetInput) {
+  const rec = getTaskSchema(input.name);
+  if (!rec) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            { success: false, error: `Task schema "${input.name}" not found`, error_code: ERROR_CODES.NOT_FOUND },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            id: rec.id,
+            json_schema: rec.schemaDoc,
+            created_by: rec.created_by,
+            created_at: rec.created_at,
           },
           null,
           2
