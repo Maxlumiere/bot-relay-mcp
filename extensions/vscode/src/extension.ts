@@ -51,6 +51,7 @@ import {
 } from "./agent-manager.js";
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
+import { resolveWakeTarget } from "./terminal-targeting.js";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
 const STATUS_COMMAND = "botRelayTether.openInbox";
@@ -446,18 +447,38 @@ function renderExecutorStatusBar(): void {
 }
 
 function injectInboxKeystroke(agentName: string): void {
-  // Find a terminal whose name matches the agent name (Claude Code +
-  // bin/spawn-agent.sh both set the title via `--name`). If none match,
-  // fall back to the active terminal so the operator sees something
-  // happen rather than nothing.
-  const match = vscode.window.terminals.find((t) => t.name === agentName);
-  const target = match ?? vscode.window.activeTerminal;
-  if (!target) {
-    log(`auto-inject skipped: no terminal named "${agentName}" and no active terminal`);
-    return;
+  // v0.2.2 P3 — deterministic terminal-targeting (the v0.3 multi-agent prereq).
+  // Wake ONLY the terminal that belongs to `agentName` — its bare name (the
+  // `vscode-victra-build` relaunch alias names its terminal `victra-build`) or
+  // the `Tether: <name>` spawn convention. Pre-v0.2.2 fell back to the focused
+  // terminal on a miss, which woke the WRONG agent (Half-B mis-injection). On
+  // 0-match OR >1-match we do NOT inject (a wrong wake corrupts multi-agent
+  // coordination; the mail is still in the inbox) — we surface a status-bar hint.
+  const decision = resolveWakeTarget(agentName, vscode.window.terminals);
+  switch (decision.kind) {
+    case "inject":
+      decision.terminal.sendText("inbox", true);
+      log(`auto-inject: wrote "inbox\\n" to terminal "${decision.terminal.name}"`);
+      return;
+    case "no-match":
+      log(`auto-inject skipped: no terminal owns agent "${agentName}" (looked for "${agentName}" or "Tether: ${agentName}")`);
+      hintNoWake(`${agentName} has mail — no matching terminal to wake`);
+      return;
+    case "ambiguous":
+      log(`auto-inject skipped: ${decision.matches.length} terminals match agent "${agentName}" — ambiguous, not waking a guess`);
+      hintNoWake(`${agentName} has mail — multiple matching terminals, not waking a guess`);
+      return;
   }
-  target.sendText("inbox", true);
-  log(`auto-inject: wrote "inbox\\n" to terminal "${target.name}"`);
+}
+
+/**
+ * v0.2.2 P3 — transient status-bar nudge when an inbox wake could not be
+ * delivered deterministically (0 or >1 matching terminals). Uses
+ * `setStatusBarMessage` (auto-clears) so it never clobbers the persistent
+ * Tether status-bar item (normal / reconnecting / error states).
+ */
+function hintNoWake(message: string): void {
+  vscode.window.setStatusBarMessage(`$(mail) Tether: ${message}`, 8000);
 }
 
 function showToast(snapshot: InboxSnapshot, level: TetherConfig["notificationLevel"]): void {

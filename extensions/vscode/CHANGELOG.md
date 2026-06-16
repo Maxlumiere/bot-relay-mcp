@@ -4,6 +4,22 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.2.2] — 2026-06-16 — Deterministic wake: the right agent's terminal, every time
+
+When mail arrives, Tether's auto-`inbox` keystroke now wakes the terminal that belongs to **that** agent — never whichever terminal you happen to have focused. This is the foundation for running several agents (victra-build, codex, …) each in its own VS Code terminal.
+
+### Fixed
+
+- **Auto-inject could wake the wrong terminal (P3).** Previously, when no terminal's name exactly equalled the agent name, the `inbox` keystroke fell back to the **focused** terminal — so a message for one agent could nudge whichever terminal you were looking at (it once typed `inbox` into a terminal titled "✳ Restart …"). Now Tether targets the agent's terminal deterministically — by its bare name (e.g. the `vscode-victra-build` relaunch alias names its terminal `victra-build`) or the `Tether: <name>` spawn convention — and **never** falls back to the focused terminal. If **no** terminal matches, or **more than one** does, Tether does not guess: it shows a brief status-bar hint (`<agent> has mail …`) and leaves the mail for you to drain. A missed wake is recoverable; a wrong wake is not.
+
+### Internal
+
+- New `terminal-targeting.ts` (VSCode-free, unit-tested): the pure wake-matcher + the single-sourced `Tether: <name>` naming convention (shared by the spawner and the matcher so they cannot drift). Multi-agent terminal identity via a registration handshake — and its reserved-name protection — is the v0.3 follow-up.
+
+### Coming next
+
+- This is a focused, standalone release of the terminal-targeting fix (P3) — the prerequisite for v0.3 multi-agent. Two further robustness items are deferred to **v0.2.3**: live re-subscribe when you change the configured agent without a window reload (P2), and an SSE keepalive/heartbeat so the long-lived inbox subscription doesn't silently drop on the Electron host (P4).
+
 ## [0.2.1] — 2026-06-11 — Auto-reconnect: Tether survives daemon restarts hands-off
 
 Tether now reconnects on its own after the bot-relay daemon restarts — no more "Tether: error — run Reconnect" wedge. This matters because the daemon is now a background service that auto-restarts on crash or reboot, so restarts are routine; Tether has to ride through them without you noticing.
