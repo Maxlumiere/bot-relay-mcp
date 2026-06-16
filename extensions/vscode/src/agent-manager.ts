@@ -25,6 +25,7 @@
  */
 
 import { RestartPolicy, type RestartDecision } from "./restart-policy.js";
+import { tetherTerminalName } from "./terminal-targeting.js";
 
 /** Subset of vscode.TerminalOptions the AgentManager needs. */
 export interface ManagedTerminalOptions {
@@ -288,7 +289,9 @@ export class AgentManager {
     this.errorReason = null;
     this.setStatus("spawning");
     const terminal = this.terminalApi.createTerminal({
-      name: `Tether: ${spec.name}`,
+      // v0.2.2 P3 — single-source the spawn-name convention so it can never
+      // drift from what resolveWakeTarget() looks for.
+      name: tetherTerminalName(spec.name),
       env,
       cwd: spec.cwd,
     });
