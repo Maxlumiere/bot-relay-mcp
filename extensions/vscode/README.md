@@ -49,7 +49,8 @@ VSCode setting > env var > default.
 3. Status bar (left) shows: `Tether: <pending_count> | last <relative time>`. Color: gray for 0 pending, yellow 1-3, red 4+.
 4. On every `notifications/resources/updated` event for that URI, re-fetches the resource snapshot and (per `notificationLevel`) emits a toast.
 5. Click the status bar → opens a read-only webview with the last message preview + a link to the full dashboard at `http://127.0.0.1:3777`.
-6. If `autoInjectInbox=true`, also writes `inbox\n` to the integrated terminal whose name matches `agentName` (or the active terminal if no match).
+6. If `autoInjectInbox=true`, types `inbox\n` into the terminal that **owns** `agentName` — one named `agentName` or `Tether: <agentName>`. It targets that terminal deterministically and never falls back to whichever terminal is focused (v0.2.2); on 0 or >1 matches it shows a status-bar hint instead of guessing. It also fires one **catch-up** wake when mail is already waiting at (re)subscribe, without double-waking on reconnect (v0.2.3).
+7. `Tether: Switch Agent` (Command Palette) re-points Tether at another agent's inbox live, with no reload. It writes `agentName` at **workspace or global scope** (whichever already holds the value); a per-folder (multi-root) override is out of scope by design — Tether shows a hint to change it manually rather than silently failing to switch.
 
 ## What it doesn't do
 
