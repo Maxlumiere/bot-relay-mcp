@@ -4,6 +4,23 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.2.3] — 2026-06-17 — Reliable wake: catch up on mail that's already waiting, switch agents live
+
+Two fixes to make the auto-`inbox` wake reliable in day-to-day multi-agent use: Tether now wakes your terminal for mail that was **already sitting in the inbox** when it (re)connects — not just mail that arrives afterward — and you can point Tether at a different agent's inbox from the Command Palette without a window reload.
+
+### Added
+
+- **`Tether: Switch Agent` command.** Pick another agent's inbox from a Quick Pick (populated live from the relay's `discover_agents`, with a free-text fallback) and Tether re-subscribes immediately — no `Developer: Reload Window`. Combined with the catch-up wake below, switching to an agent that already has mail wakes its terminal right away.
+
+### Fixed
+
+- **Mail already waiting at connect didn't wake the terminal (catch-up wake).** The auto-`inbox` keystroke only fired for messages that arrived **after** Tether subscribed. So on a fresh start, after a daemon restart, or after switching agents, any mail already in the inbox was shown in the status bar but never woke the terminal — you had to type `inbox` yourself. Tether now fires one wake on (re)subscribe when the inbox already holds pending mail. A shared high-water mark (the newest-message timestamp, in memory) guarantees it **never double-wakes**: a reconnect with no new mail does nothing, while a window reload deliberately re-wakes still-pending mail.
+- **The "no matching terminal" hint is now actionable** — it tells you to rename a terminal to the agent's name so the wake can land (an interim nudge until automatic terminal discovery arrives).
+
+### Internal
+
+- New `catch-up-wake.ts` (pure, unit-tested) — the wake decision shared by the catch-up and live paths, so neither double-wakes the other. New `tests/helpers/relay-http-harness.ts` + a real-HTTP-daemon integration test assert the no-double-wake invariant end-to-end against the shipped transport. Gated on `autoInjectInbox` only (independent of the notification level). The next robustness item — an SSE keepalive watchdog for silent Electron drops — follows in v0.2.4; automatic terminal↔agent binding by process id lands in v0.3.
+
 ## [0.2.2] — 2026-06-16 — Deterministic wake: the right agent's terminal, every time
 
 When mail arrives, Tether's auto-`inbox` keystroke now wakes the terminal that belongs to **that** agent — never whichever terminal you happen to have focused. This is the foundation for running several agents (victra-build, codex, …) each in its own VS Code terminal.

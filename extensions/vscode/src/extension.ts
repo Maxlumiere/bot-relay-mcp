@@ -40,6 +40,8 @@ import {
   type TetherConfig,
 } from "./config.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
+import { decideWake } from "./catch-up-wake.js";
+import { parseAgentNames } from "./switch-agent.js";
 import {
   AgentManager,
   realScheduler,
@@ -59,6 +61,7 @@ const SET_TOKEN_COMMAND = "botRelayTether.setToken";
 const SPAWN_AGENT_COMMAND = "botRelayTether.spawnAgent";
 const KILL_AGENT_COMMAND = "botRelayTether.killAgent";
 const RESTART_AGENT_COMMAND = "botRelayTether.restartAgent";
+const SWITCH_AGENT_COMMAND = "botRelayTether.switchAgent";
 const EXTENSION_ID = "lumiere-ventures.bot-relay-tether";
 
 /**
@@ -280,6 +283,11 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 let mcpClient: Client | undefined;
 let mcpTransport: StreamableHTTPClientTransport | undefined;
 let lastSnapshot: InboxSnapshot | undefined;
+// v0.2.3 (A) — catch-up-wake high-water mark: the newest-message timestamp we
+// last fired an inbox wake for. MODULE memory only (resets on reload, by
+// design — a reload re-wakes still-pending mail). Shared by the catch-up path
+// and the live notification path so neither double-wakes the other.
+let lastWokenMessageAt: string | null = null;
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
 
@@ -462,7 +470,10 @@ function injectInboxKeystroke(agentName: string): void {
       return;
     case "no-match":
       log(`auto-inject skipped: no terminal owns agent "${agentName}" (looked for "${agentName}" or "Tether: ${agentName}")`);
-      hintNoWake(`${agentName} has mail — no matching terminal to wake`);
+      // v0.2.3 (C2) — make the no-match hint actionable: tell the operator how
+      // to fix it (rename a terminal to the agent name) until the v0.3 PID
+      // handshake binds terminals automatically.
+      hintNoWake(`${agentName} has mail — no terminal named "${agentName}"; rename a terminal to wake it`);
       return;
     case "ambiguous":
       log(`auto-inject skipped: ${decision.matches.length} terminals match agent "${agentName}" — ambiguous, not waking a guess`);
@@ -479,6 +490,23 @@ function injectInboxKeystroke(agentName: string): void {
  */
 function hintNoWake(message: string): void {
   vscode.window.setStatusBarMessage(`$(mail) Tether: ${message}`, 8000);
+}
+
+/**
+ * v0.2.3 (A) — fire at most one inbox wake for a snapshot, sharing a module-
+ * level high-water mark between the catch-up path (connect → initial snapshot)
+ * and the live path (ResourceUpdated → refreshed snapshot). The shared mark is
+ * what guarantees no double-wake: a daemon-restart reconnect whose newest
+ * message we've already woken for does nothing. The mark lives only in module
+ * memory, so a window reload re-wakes still-pending mail (A1, intended).
+ */
+function wakeForSnapshot(snapshot: InboxSnapshot, config: TetherConfig): void {
+  const decision = decideWake(snapshot, {
+    autoInjectInbox: config.autoInjectInbox,
+    lastWokenAt: lastWokenMessageAt,
+  });
+  lastWokenMessageAt = decision.newMark;
+  if (decision.shouldWake) injectInboxKeystroke(config.agentName);
 }
 
 function showToast(snapshot: InboxSnapshot, level: TetherConfig["notificationLevel"]): void {
@@ -592,7 +620,7 @@ async function connect(config: TetherConfig): Promise<void> {
     if (isInErrorState()) return; // state-lock — don't paint snapshot over an error UI
     applySnapshot(fresh);
     showToast(fresh, config.notificationLevel);
-    if (config.autoInjectInbox) injectInboxKeystroke(config.agentName);
+    wakeForSnapshot(fresh, config);
   });
 
   await client.connect(transport);
@@ -608,6 +636,11 @@ async function connect(config: TetherConfig): Promise<void> {
   // flipped the status bar to "Tether: error". Don't overwrite it with
   // an apparent-success snapshot or "connected + subscribed" log.
   if (initial && !isInErrorState()) applySnapshot(initial);
+  // v0.2.3 (A) — catch-up wake: live notifications only cover mail that arrives
+  // AFTER subscribe, so if the inbox already holds pending mail at (re)subscribe
+  // fire one wake now. Shares the high-water mark with the live path, so a
+  // daemon-restart reconnect with no new mail does NOT re-wake.
+  if (initial && !isInErrorState()) wakeForSnapshot(initial, config);
   if (!isInErrorState()) {
     log("connected + subscribed");
   }
@@ -630,6 +663,70 @@ async function disconnect(): Promise<void> {
   }
   mcpClient = undefined;
   mcpTransport = undefined;
+}
+
+/** Pull the first text payload out of an MCP tools/call result, or null. */
+function extractToolText(res: unknown): string | null {
+  const content = (res as { content?: unknown }).content;
+  if (!Array.isArray(content)) return null;
+  const first = content[0];
+  if (
+    first &&
+    typeof first === "object" &&
+    "text" in first &&
+    typeof (first as { text: unknown }).text === "string"
+  ) {
+    return (first as { text: string }).text;
+  }
+  return null;
+}
+
+/**
+ * v0.2.3 (B) — Switch Agent: offer the live `discover_agents` roster as a
+ * QuickPick (the multi-agent inbox-picker), always with a free-text fallback,
+ * and write the choice to `bot-relay.tether.agentName`. The existing
+ * onDidChangeConfiguration → connect(fresh) path re-subscribes live (no
+ * reload — already wired in v0.2.1/v0.2.2), and the v0.2.3 catch-up wake then
+ * delivers any mail already waiting for the newly-selected agent.
+ */
+async function runSwitchAgent(context: vscode.ExtensionContext): Promise<void> {
+  const current = (await readConfig(context)).agentName;
+  let names: string[] = [];
+  if (mcpClient) {
+    try {
+      const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
+      const text = extractToolText(res);
+      if (text) names = parseAgentNames(JSON.parse(text), current);
+    } catch (err) {
+      log(`switchAgent: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const picked = await pickAgentName(names, current);
+  if (!picked || picked === current) return;
+  await vscode.workspace
+    .getConfiguration("bot-relay.tether")
+    .update("agentName", picked, vscode.ConfigurationTarget.Global);
+  void vscode.window.showInformationMessage(`Tether: switched to agent "${picked}".`);
+}
+
+/** QuickPick over discovered agents (+ a free-text entry); falls back to a
+ *  plain input box when discover_agents yielded nothing. */
+async function pickAgentName(names: string[], current: string): Promise<string | undefined> {
+  const ENTER = "$(edit) Enter a name…";
+  if (names.length > 0) {
+    const items: vscode.QuickPickItem[] = names.map((n) => ({ label: n }));
+    items.push({ label: ENTER });
+    const sel = await vscode.window.showQuickPick(items, {
+      placeHolder: "Switch Tether to which agent's inbox?",
+    });
+    if (!sel) return undefined;
+    if (sel.label !== ENTER) return sel.label;
+  }
+  return vscode.window.showInputBox({
+    prompt: "Agent name to subscribe to",
+    value: current,
+    validateInput: (v) => (v.trim().length === 0 ? "Agent name cannot be empty" : undefined),
+  });
 }
 
 function buildWebviewHtml(snapshot: InboxSnapshot | undefined): string {
@@ -882,6 +979,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       reconnectSupervisor?.notifyManualReconnect();
       await connect(await readConfig(context));
       reconnectSupervisor?.notifyExternalConnect(!isInErrorState());
+    }),
+    // v0.2.3 (B) — Switch Agent: re-subscribe Tether to another agent's inbox
+    // live (no reload). Pairs with the catch-up wake so switching to an agent
+    // with pending mail wakes its terminal immediately.
+    vscode.commands.registerCommand(SWITCH_AGENT_COMMAND, async () => {
+      await runSwitchAgent(context);
     }),
     // v0.2 — single-agent executor commands.
     vscode.commands.registerCommand(SPAWN_AGENT_COMMAND, async () => {

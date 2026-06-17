@@ -142,15 +142,20 @@ describe("v0.1.4 — bundle correctness", () => {
     // bundle when AgentManager wired into extension.ts. v0.2.1 added
     // reconnect-supervisor.ts (wired into connect()/activate for P1
     // auto-reconnect). v0.2.2 added terminal-targeting.ts (deterministic
-    // inbox-wake matcher, imported by extension.ts + agent-manager.ts). v0.1.4
-    // baseline (extension + config + format + transport-diagnostics) preserved.
+    // inbox-wake matcher, imported by extension.ts + agent-manager.ts). v0.2.3
+    // added catch-up-wake.ts (shared catch-up/live wake decision) +
+    // switch-agent.ts (discover_agents → Switch-Agent QuickPick parse), both
+    // imported by extension.ts. v0.1.4 baseline (extension + config + format +
+    // transport-diagnostics) preserved.
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
+      "src/catch-up-wake.ts",
       "src/config.ts",
       "src/extension.ts",
       "src/format.ts",
       "src/reconnect-supervisor.ts",
       "src/restart-policy.ts",
+      "src/switch-agent.ts",
       "src/terminal-targeting.ts",
       "src/transport-diagnostics.ts",
     ]);
@@ -443,6 +448,8 @@ describe("v0.1.4 — bundle correctness", () => {
       expect(registeredCommands).toContain("botRelayTether.spawnAgent");
       expect(registeredCommands).toContain("botRelayTether.killAgent");
       expect(registeredCommands).toContain("botRelayTether.restartAgent");
+      // v0.2.3 — Switch Agent command must be registered by activate().
+      expect(registeredCommands).toContain("botRelayTether.switchAgent");
     } finally {
       restore();
       if (savedRelayAgentName !== undefined) {
