@@ -40,7 +40,7 @@ import {
 } from "./config.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
 import { WakeGate, subscribeInbox } from "./inbox-subscription.js";
-import { parseAgentNames, effectiveScope } from "./switch-agent.js";
+import { parseAgentNames, applyAgentSwitch } from "./switch-agent.js";
 import {
   AgentManager,
   realScheduler,
@@ -677,30 +677,32 @@ async function runSwitchAgent(context: vscode.ExtensionContext): Promise<void> {
   }
   const picked = await pickAgentName(names, current);
   if (!picked || picked === current) return;
-  // v0.2.3 R1 (codex) — write to the scope that's actually EFFECTIVE. Writing
-  // only to Global is silently shadowed by a Workspace/Folder override, which
-  // would leave the live re-subscribe on the OLD agent while we claimed success.
-  // Then read the effective value back and only toast success if it actually
-  // moved — an honest switch.
-  const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
-  const scope = effectiveScope(cfg.inspect("agentName"));
-  const target =
-    scope === "workspaceFolder"
-      ? vscode.ConfigurationTarget.WorkspaceFolder
-      : scope === "workspace"
-        ? vscode.ConfigurationTarget.Workspace
-        : vscode.ConfigurationTarget.Global;
-  await cfg.update("agentName", picked, target);
-  const effective = vscode.workspace
-    .getConfiguration("bot-relay.tether")
-    .get<string>("agentName");
-  if (effective === picked) {
-    void vscode.window.showInformationMessage(`Tether: switched to agent "${picked}".`);
-  } else {
-    void vscode.window.showWarningMessage(
-      `Tether: could not switch to "${picked}" — effective agentName is "${effective ?? ""}" (a higher-precedence setting is overriding it).`,
-    );
-  }
+  // v0.2.3 R2 (codex) — Switch Agent is a workspace/global concept (not
+  // per-folder). applyAgentSwitch writes at the effective WORKSPACE/GLOBAL
+  // scope, reads the effective value back, and only claims success if it
+  // actually moved; a folder-level override is surfaced honestly rather than
+  // silently shadowed. The flow lives in switch-agent.ts so it's unit-tested
+  // for real (not just the scope decision).
+  await applyAgentSwitch(picked, {
+    inspect: () =>
+      vscode.workspace.getConfiguration("bot-relay.tether").inspect<string>("agentName"),
+    update: (target, value) =>
+      Promise.resolve(
+        vscode.workspace
+          .getConfiguration("bot-relay.tether")
+          .update(
+            "agentName",
+            value,
+            target === "workspace"
+              ? vscode.ConfigurationTarget.Workspace
+              : vscode.ConfigurationTarget.Global,
+          ),
+      ),
+    readEffective: () =>
+      vscode.workspace.getConfiguration("bot-relay.tether").get<string>("agentName"),
+    info: (message) => void vscode.window.showInformationMessage(message),
+    warn: (message) => void vscode.window.showWarningMessage(message),
+  });
 }
 
 /** QuickPick over discovered agents (+ a free-text entry); falls back to a

@@ -35,19 +35,71 @@ export function parseAgentNames(raw: unknown, exclude?: string): string[] {
   return exclude ? deduped.filter((n) => n !== exclude) : deduped;
 }
 
-/** The VS Code configuration scope an effective setting value currently lives
- *  at. v0.2.3 R1 (codex): Switch Agent must write `agentName` to the scope
- *  that's actually effective — a Workspace (or WorkspaceFolder) override
- *  silently shadows a Global write, leaving the live re-subscribe on the OLD
- *  agent while the toast claims success. Given
- *  `vscode.WorkspaceConfiguration.inspect(key)`'s result, return the narrowest
- *  scope that already holds a value (so writing there changes the effective
- *  value); default to Global when nothing is set yet. Pure for unit testing. */
-export type ConfigScope = "workspaceFolder" | "workspace" | "global";
-export function effectiveScope(
-  inspected: { workspaceFolderValue?: unknown; workspaceValue?: unknown } | undefined,
-): ConfigScope {
-  if (inspected?.workspaceFolderValue !== undefined) return "workspaceFolder";
-  if (inspected?.workspaceValue !== undefined) return "workspace";
-  return "global";
+// v0.2.3 R2 (codex) — Switch Agent operates at GLOBAL + WORKSPACE scope only.
+// "Which inbox this editor watches" is not a per-file/per-folder concept, and
+// an unscoped `getConfiguration("bot-relay.tether")` cannot safely do a
+// resource-scoped WorkspaceFolder update/readback anyway (it throws — see
+// @types/vscode WorkspaceConfiguration.update). A folder-level override is
+// therefore NOT something Switch Agent writes; it must be surfaced honestly,
+// never silently shadowed behind a success toast.
+
+export interface InspectedSetting {
+  workspaceFolderValue?: unknown;
+  workspaceValue?: unknown;
+}
+
+export type SwitchScopeDecision =
+  | { kind: "write"; target: "workspace" | "global" }
+  | { kind: "folder-override" };
+
+/** Decide where (or whether) Switch Agent may write, given inspect()'s result.
+ *  A folder-level override short-circuits to an honest warning; otherwise write
+ *  to Workspace when a workspace value already exists, else Global. Pure. */
+export function decideSwitchScope(inspected: InspectedSetting | undefined): SwitchScopeDecision {
+  if (inspected?.workspaceFolderValue !== undefined) return { kind: "folder-override" };
+  if (inspected?.workspaceValue !== undefined) return { kind: "write", target: "workspace" };
+  return { kind: "write", target: "global" };
+}
+
+/** VSCode-free port over the bits of WorkspaceConfiguration + UI that
+ *  applyAgentSwitch touches — so the obtain→write→readback→toast flow is
+ *  unit-testable for real (not just decideSwitchScope's logic). */
+export interface AgentSwitchPort {
+  inspect: () => InspectedSetting | undefined;
+  update: (target: "workspace" | "global", value: string) => Promise<void>;
+  /** The EFFECTIVE agentName after the write (highest-precedence wins). */
+  readEffective: () => string | undefined;
+  info: (message: string) => void;
+  warn: (message: string) => void;
+}
+
+export type AgentSwitchOutcome = "switched" | "folder-override" | "shadowed";
+
+/**
+ * Perform the agent switch honestly: pick the writable scope, write there, read
+ * the EFFECTIVE value back, and only claim success if it actually moved to
+ * `picked`. A folder-level override is surfaced as a warning (we don't write a
+ * folder scope from an unscoped config). Returns the outcome for tests.
+ */
+export async function applyAgentSwitch(
+  picked: string,
+  port: AgentSwitchPort,
+): Promise<AgentSwitchOutcome> {
+  const decision = decideSwitchScope(port.inspect());
+  if (decision.kind === "folder-override") {
+    port.warn(
+      `Tether: a folder-level "agentName" override is set; Switch Agent operates at workspace/global scope. Clear the folder override (or change it manually) to switch to "${picked}".`,
+    );
+    return "folder-override";
+  }
+  await port.update(decision.target, picked);
+  const effective = port.readEffective();
+  if (effective === picked) {
+    port.info(`Tether: switched to agent "${picked}".`);
+    return "switched";
+  }
+  port.warn(
+    `Tether: could not switch to "${picked}" — effective agentName is "${effective ?? ""}" (a higher-precedence setting is overriding it).`,
+  );
+  return "shadowed";
 }

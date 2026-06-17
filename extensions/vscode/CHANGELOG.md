@@ -10,7 +10,7 @@ Two fixes to make the auto-`inbox` wake reliable in day-to-day multi-agent use: 
 
 ### Added
 
-- **`Tether: Switch Agent` command.** Pick another agent's inbox from a Quick Pick (populated live from the relay's `discover_agents`, with a free-text fallback) and Tether re-subscribes immediately — no `Developer: Reload Window`. Combined with the catch-up wake below, switching to an agent that already has mail wakes its terminal right away.
+- **`Tether: Switch Agent` command.** Pick another agent's inbox from a Quick Pick (populated live from the relay's `discover_agents`, with a free-text fallback) and Tether re-subscribes immediately — no `Developer: Reload Window`. Combined with the catch-up wake below, switching to an agent that already has mail wakes its terminal right away. Switch Agent sets `agentName` at **workspace or global scope** (whichever already holds the value); a per-folder (multi-root) override is out of scope by design — Tether surfaces a hint to change it manually rather than silently failing to switch.
 
 ### Fixed
 
