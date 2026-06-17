@@ -122,6 +122,12 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
       // keep the escape-hatch path quiet. `force` never reaches the DB
       // beyond this.
       force: input.force === true,
+      // Tether v0.3 PID-handshake. Governance: writing these under a name
+      // requires that name's token — the dispatcher (server.ts, authenticateAgent
+      // on the active branch) rejects an unauthenticated re-register BEFORE this
+      // handler runs, so the PID write inherits the existing name-auth.
+      host_shell_pids: input.host_shell_pids,
+      host_id: input.host_id,
     }
   );
 
