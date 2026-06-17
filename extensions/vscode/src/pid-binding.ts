@@ -32,13 +32,30 @@ export interface PidNamedTerminal extends NamedTerminal {
 }
 
 /**
+ * Is `pid` a host-scoped member of the agent's chain? True only when: the agent
+ * registered a non-empty PID chain; BOTH host ids are known AND equal (an equal
+ * PID on a different host must NOT match — the federation-safety boundary); and
+ * the pid is in the chain. The single-pid primitive shared by the full matcher
+ * and the cache fast-path re-validation.
+ */
+export function isHostScopedMember(
+  binding: AgentPidBinding,
+  localHostId: string | null,
+  pid: number | undefined,
+): boolean {
+  if (pid === undefined) return false;
+  if (!binding.hostShellPids || binding.hostShellPids.length === 0) return false;
+  if (!binding.hostId || !localHostId || binding.hostId !== localHostId) return false;
+  return binding.hostShellPids.includes(pid);
+}
+
+/**
  * Try to bind by PID, host-scoped. Returns a decision only when the PID layer is
  * authoritative; returns null to mean "PID layer abstains — fall back to name".
  *
- * Abstains (null) when: no PID chain registered; OR host-scoping can't be
- * guaranteed (either host_id missing, or they differ — a different host's equal
- * PID must NOT match); OR no live terminal's processId is in the chain.
- * Exactly-one match → inject. >1 → ambiguous (never guess).
+ * Abstains (null) when no live terminal's processId is a host-scoped member of
+ * the chain (covers: no chain registered, host_id missing/mismatched, or no
+ * matching live terminal). Exactly-one match → inject. >1 → ambiguous.
  */
 function tryPidMatch<T extends PidNamedTerminal>(
   agentName: string,
@@ -46,16 +63,33 @@ function tryPidMatch<T extends PidNamedTerminal>(
   localHostId: string | null,
   terminals: readonly T[],
 ): WakeDecision<T> | null {
-  const pids = binding.hostShellPids;
-  if (!pids || pids.length === 0) return null;
-  // Host-scoping is a correctness boundary: only intersect PIDs when BOTH host
-  // ids are known AND equal. Equal PIDs on different hosts never false-match.
-  if (!binding.hostId || !localHostId || binding.hostId !== localHostId) return null;
-  const want = new Set(pids);
-  const matches = terminals.filter((t) => t.processId !== undefined && want.has(t.processId));
+  const matches = terminals.filter((t) => isHostScopedMember(binding, localHostId, t.processId));
   if (matches.length === 1) return { kind: "inject", terminal: matches[0] };
-  if (matches.length === 0) return null; // no live terminal → let name matching try
+  if (matches.length === 0) return null; // abstain → let name matching try
   return { kind: "ambiguous", agentName, matches };
+}
+
+/**
+ * Pure parse of a `discover_agents` result into the inbox-owner agent's binding.
+ * Tolerant of shape drift / junk (→ null fields, never throws). Returns null
+ * when the agent isn't in the roster.
+ */
+export function parseAgentBinding(discoverResult: unknown, agentName: string): AgentPidBinding | null {
+  const agents =
+    discoverResult && typeof discoverResult === "object"
+      ? (discoverResult as { agents?: unknown }).agents
+      : undefined;
+  if (!Array.isArray(agents)) return null;
+  const row = agents.find(
+    (a) => a && typeof a === "object" && (a as { name?: unknown }).name === agentName,
+  ) as { host_shell_pids?: unknown; host_id?: unknown } | undefined;
+  if (!row) return null;
+  const pids =
+    Array.isArray(row.host_shell_pids) && row.host_shell_pids.every((n) => typeof n === "number")
+      ? (row.host_shell_pids as number[])
+      : null;
+  const hostId = typeof row.host_id === "string" ? row.host_id : null;
+  return { hostShellPids: pids, hostId };
 }
 
 /**

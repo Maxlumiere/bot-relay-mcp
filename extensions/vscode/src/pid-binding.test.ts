@@ -7,7 +7,12 @@
 // DIFFERENT host must never match (federation safety).
 
 import { describe, it, expect } from "vitest";
-import { resolveWakeTargetByPid, type PidNamedTerminal } from "./pid-binding.js";
+import {
+  resolveWakeTargetByPid,
+  isHostScopedMember,
+  parseAgentBinding,
+  type PidNamedTerminal,
+} from "./pid-binding.js";
 
 const t = (name: string, processId: number | undefined): PidNamedTerminal => ({ name, processId });
 
@@ -82,5 +87,52 @@ describe("resolveWakeTargetByPid — name fallback (pre-handshake compatibility)
       [t("zsh", 55479)],
     );
     expect(d.kind).toBe("no-match"); // no PID binding, no name match
+  });
+});
+
+describe("isHostScopedMember — single-pid primitive (cache fast-path re-validation)", () => {
+  it("true when pid ∈ chain AND host ids match", () => {
+    expect(isHostScopedMember(BINDING, "HOST-A", 55479)).toBe(true);
+  });
+  it("false on host mismatch (different-host equal PID)", () => {
+    expect(isHostScopedMember({ hostShellPids: [55479], hostId: "HOST-B" }, "HOST-A", 55479)).toBe(false);
+  });
+  it("false when local host id is unknown", () => {
+    expect(isHostScopedMember(BINDING, null, 55479)).toBe(false);
+  });
+  it("false for an undefined pid, an unbound pid, or an empty/absent chain", () => {
+    expect(isHostScopedMember(BINDING, "HOST-A", undefined)).toBe(false);
+    expect(isHostScopedMember(BINDING, "HOST-A", 99999)).toBe(false);
+    expect(isHostScopedMember({ hostShellPids: [], hostId: "HOST-A" }, "HOST-A", 1)).toBe(false);
+    expect(isHostScopedMember({ hostShellPids: null, hostId: "HOST-A" }, "HOST-A", 1)).toBe(false);
+  });
+});
+
+describe("parseAgentBinding — discover_agents → AgentPidBinding", () => {
+  const roster = {
+    agents: [
+      { name: "victra-build", host_shell_pids: [55566, 55479], host_id: "HOST-A" },
+      { name: "codex", host_shell_pids: null, host_id: null },
+    ],
+  };
+  it("extracts the named agent's chain + host_id", () => {
+    expect(parseAgentBinding(roster, "victra-build")).toEqual({
+      hostShellPids: [55566, 55479],
+      hostId: "HOST-A",
+    });
+  });
+  it("returns null fields for an agent that reported none", () => {
+    expect(parseAgentBinding(roster, "codex")).toEqual({ hostShellPids: null, hostId: null });
+  });
+  it("returns null when the agent is not in the roster", () => {
+    expect(parseAgentBinding(roster, "ghost")).toBeNull();
+  });
+  it("tolerates junk shapes (→ null fields / null), never throws", () => {
+    expect(parseAgentBinding({ agents: [{ name: "x", host_shell_pids: "nope", host_id: 5 }] }, "x")).toEqual({
+      hostShellPids: null,
+      hostId: null,
+    });
+    expect(parseAgentBinding({ nope: true }, "x")).toBeNull();
+    expect(parseAgentBinding(null, "x")).toBeNull();
   });
 });

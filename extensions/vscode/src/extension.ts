@@ -52,7 +52,14 @@ import {
 } from "./agent-manager.js";
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
-import { resolveWakeTarget } from "./terminal-targeting.js";
+import {
+  resolveWakeTargetByPid,
+  parseAgentBinding,
+  isHostScopedMember,
+  type AgentPidBinding,
+} from "./pid-binding.js";
+import { machineGuid, type HostPlatform } from "./host-identity.js";
+import { execFileSync } from "node:child_process";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
 const STATUS_COMMAND = "botRelayTether.openInbox";
@@ -286,6 +293,16 @@ let lastSnapshot: InboxSnapshot | undefined;
 // reconnects (catch-up + live share it); re-created on reload so still-pending
 // mail re-wakes (A1). Created at activate, used by connect()'s subscribeInbox.
 let wakeGate: WakeGate | undefined;
+// v0.3.0 PID-handshake state. localHostId = this instance's machine GUID (the
+// host-scoping anchor, computed once at activate; must match the agent-side
+// hook's host_id). boundTerminals caches the resolved agent→terminal binding so
+// we don't re-await every Terminal.processId per wake (invalidated on close).
+// agentBindingCache caches the discover_agents binding briefly so rapid wakes
+// don't re-hit the relay.
+let localHostId: string | null = null;
+const boundTerminals = new Map<string, vscode.Terminal>();
+const agentBindingCache = new Map<string, { binding: AgentPidBinding; at: number }>();
+const PID_BINDING_TTL_MS = 15_000;
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
 
@@ -452,31 +469,78 @@ function renderExecutorStatusBar(): void {
   statusBarItem.show();
 }
 
-function injectInboxKeystroke(agentName: string): void {
-  // v0.2.2 P3 — deterministic terminal-targeting (the v0.3 multi-agent prereq).
-  // Wake ONLY the terminal that belongs to `agentName` — its bare name (the
-  // `vscode-victra-build` relaunch alias names its terminal `victra-build`) or
-  // the `Tether: <name>` spawn convention. Pre-v0.2.2 fell back to the focused
-  // terminal on a miss, which woke the WRONG agent (Half-B mis-injection). On
-  // 0-match OR >1-match we do NOT inject (a wrong wake corrupts multi-agent
-  // coordination; the mail is still in the inbox) — we surface a status-bar hint.
-  const decision = resolveWakeTarget(agentName, vscode.window.terminals);
-  switch (decision.kind) {
-    case "inject":
-      decision.terminal.sendText("inbox", true);
-      log(`auto-inject: wrote "inbox\\n" to terminal "${decision.terminal.name}"`);
-      return;
-    case "no-match":
-      log(`auto-inject skipped: no terminal owns agent "${agentName}" (looked for "${agentName}" or "Tether: ${agentName}")`);
-      // v0.2.3 (C2) — make the no-match hint actionable: tell the operator how
-      // to fix it (rename a terminal to the agent name) until the v0.3 PID
-      // handshake binds terminals automatically.
-      hintNoWake(`${agentName} has mail — no terminal named "${agentName}"; rename a terminal to wake it`);
-      return;
-    case "ambiguous":
-      log(`auto-inject skipped: ${decision.matches.length} terminals match agent "${agentName}" — ambiguous, not waking a guess`);
-      hintNoWake(`${agentName} has mail — multiple matching terminals, not waking a guess`);
-      return;
+function toHostPlatform(p: NodeJS.Platform): HostPlatform | null {
+  return p === "darwin" || p === "linux" || p === "win32" ? p : null;
+}
+
+/** Fetch the inbox-owner agent's PID binding via discover_agents, cached for
+ *  PID_BINDING_TTL_MS so rapid wakes don't re-hit the relay. Unavailable → empty
+ *  binding (the matcher then falls back to the name matcher). */
+async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
+  const cached = agentBindingCache.get(agentName);
+  if (cached && Date.now() - cached.at < PID_BINDING_TTL_MS) return cached.binding;
+  let binding: AgentPidBinding = { hostShellPids: null, hostId: null };
+  if (mcpClient) {
+    try {
+      const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
+      const text = extractToolText(res);
+      if (text) binding = parseAgentBinding(JSON.parse(text), agentName) ?? binding;
+    } catch (err) {
+      log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  agentBindingCache.set(agentName, { binding, at: Date.now() });
+  return binding;
+}
+
+/**
+ * v0.3.0 PID-handshake — wake the terminal bound to `agentName`. PID-PRIMARY:
+ * the terminal whose processId is a host-scoped member of the agent's registered
+ * ancestry chain (machine-GUID-scoped, so an equal PID on another host can't
+ * false-match), else the v0.2.2 NAME matcher (bare name / `Tether: <name>`), else
+ * 0/>1 → no-inject + status-bar hint (never guess). A bound terminal is cached
+ * (invalidated on close) so we don't re-await every Terminal.processId per wake;
+ * the fast path re-validates the cached terminal still owns a chain PID (covers
+ * agent re-register / a moved terminal). Async ordering: every processId await
+ * resolves BEFORE the wake decision.
+ */
+async function injectInboxKeystroke(agentName: string): Promise<void> {
+  try {
+    const binding = await getAgentBinding(agentName);
+    // Fast path: a previously-bound terminal still open + still a host-scoped
+    // member of the (possibly refreshed) chain — one await, not N.
+    const cached = boundTerminals.get(agentName);
+    if (cached && vscode.window.terminals.includes(cached)) {
+      if (isHostScopedMember(binding, localHostId, await cached.processId)) {
+        cached.sendText("inbox", true);
+        return;
+      }
+      boundTerminals.delete(agentName); // stale (re-register / moved) → re-resolve
+    }
+    // Full resolve: await every terminal's processId once, THEN decide.
+    const wrappers = await Promise.all(
+      vscode.window.terminals.map(async (vt) => ({ vt, name: vt.name, processId: await vt.processId })),
+    );
+    const decision = resolveWakeTargetByPid(agentName, binding, localHostId, wrappers);
+    switch (decision.kind) {
+      case "inject":
+        decision.terminal.vt.sendText("inbox", true);
+        boundTerminals.set(agentName, decision.terminal.vt);
+        log(
+          `auto-inject: wrote "inbox\\n" to terminal "${decision.terminal.name}" (pid=${decision.terminal.processId ?? "?"})`,
+        );
+        return;
+      case "no-match":
+        log(`auto-inject skipped: no terminal bound to agent "${agentName}" (by PID or name)`);
+        hintNoWake(`${agentName} has mail — no bound terminal; run it as "${agentName}" or where Tether can read its PID`);
+        return;
+      case "ambiguous":
+        log(`auto-inject skipped: ${decision.matches.length} terminals match agent "${agentName}" — ambiguous, not waking a guess`);
+        hintNoWake(`${agentName} has mail — multiple matching terminals, not waking a guess`);
+        return;
+    }
+  } catch (err) {
+    log(`auto-inject failed for "${agentName}": ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -1136,10 +1200,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // RestartPolicy in neverGiveUp mode (O-2): a down/restarting daemon is
   // retried indefinitely; the 5/hr cap stays only on the child-process
   // crash-loop path (AgentManager above). Production timer = setTimeout.
-  // v0.2.3 — create the wake gate before the first connect(); it persists
-  // across reconnects so the catch-up + live paths share ONE no-double-wake
-  // high-water mark.
-  wakeGate = new WakeGate((name) => injectInboxKeystroke(name));
+  // v0.3.0 PID-handshake — compute THIS instance's machine GUID once (the
+  // host-scoping anchor; must match the agent-side hook's host_id), and
+  // invalidate the bound-terminal cache when a terminal closes.
+  const hostPlatform = toHostPlatform(process.platform);
+  localHostId = hostPlatform
+    ? machineGuid(hostPlatform, (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", timeout: 2000 }))
+    : null;
+  log(`pid-handshake: local host_id = ${localHostId ?? "(unavailable)"}`);
+  context.subscriptions.push(
+    vscode.window.onDidCloseTerminal((closed) => {
+      for (const [name, term] of boundTerminals) {
+        if (term === closed) boundTerminals.delete(name);
+      }
+    }),
+  );
+  // v0.2.3 — create the wake gate before the first connect(); it persists across
+  // reconnects so the catch-up + live paths share ONE no-double-wake mark.
+  // v0.3.0: the wake is now async (PID resolution) — fire-and-forget; the gate
+  // has already advanced its mark synchronously, so there's no double-wake window.
+  wakeGate = new WakeGate((name) => {
+    void injectInboxKeystroke(name);
+  });
   reconnectSupervisor = new ReconnectSupervisor({
     policy: new RestartPolicy({ neverGiveUp: true }),
     connect: async () => {

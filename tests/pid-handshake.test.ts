@@ -28,6 +28,7 @@ import {
   tearDownDaemon,
   type DaemonHandle,
 } from "./helpers/relay-http-harness.js";
+import { resolveWakeTargetByPid, parseAgentBinding } from "../extensions/vscode/src/pid-binding.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-pid-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -188,5 +189,82 @@ describe("PID-handshake — governance (dispatcher name-auth, real daemon)", () 
     expect(victim).toBeTruthy();
     expect(victim?.host_shell_pids).toBeNull();
     expect(victim?.host_id).toBeNull();
+  }, 20_000);
+});
+
+// --- End-to-end round-trip: register pids+guid → discover → parse → match ---
+
+describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", () => {
+  let daemon: DaemonHandle;
+  beforeEach(async () => {
+    daemon = await spawnDaemon();
+  }, 20_000);
+  afterEach(async () => {
+    if (daemon) await tearDownDaemon(daemon);
+  });
+
+  it("a registered chain+host_id round-trips through discover_agents and binds the matching PID — same host only", async () => {
+    // The agent registers its ancestry chain + machine GUID on first register.
+    const reg = await callToolViaHttp(daemon.baseUrl, "register_agent", {
+      name: "pid-agent",
+      role: "builder",
+      capabilities: [],
+      host_shell_pids: [55566, 55479, 55465],
+      host_id: "HOST-X",
+    });
+    expect(reg.ok).toBe(true);
+    const token = (JSON.parse(reg.resultText ?? "{}") as { agent_token?: string }).agent_token;
+
+    // Tether reads it back via discover_agents + parses the binding.
+    const disc = await callToolViaHttp(daemon.baseUrl, "discover_agents", {}, token);
+    expect(disc.ok).toBe(true);
+    const binding = parseAgentBinding(JSON.parse(disc.resultText ?? "{}"), "pid-agent");
+    expect(binding).toEqual({ hostShellPids: [55566, 55479, 55465], hostId: "HOST-X" });
+
+    // Same-host: a terminal whose processId is the controlling shell (55479) —
+    // even named "zsh" — binds by PID.
+    const terms = [
+      { name: "zsh", processId: 55479 },
+      { name: "codex", processId: 12345 },
+    ];
+    const sameHost = resolveWakeTargetByPid("pid-agent", binding!, "HOST-X", terms);
+    expect(sameHost.kind).toBe("inject");
+    if (sameHost.kind === "inject") expect(sameHost.terminal.name).toBe("zsh");
+
+    // Different host (equal PID present): host-scoping rejects → no PID match,
+    // and "zsh" doesn't name-match → no-match. The federation-safety invariant.
+    const otherHost = resolveWakeTargetByPid("pid-agent", binding!, "HOST-OTHER", terms);
+    expect(otherHost.kind).toBe("no-match");
+  }, 20_000);
+
+  it("re-register OVERWRITES the chain end-to-end (discover reflects the new chain)", async () => {
+    const reg = await callToolViaHttp(daemon.baseUrl, "register_agent", {
+      name: "pid-agent2",
+      role: "builder",
+      capabilities: [],
+      host_shell_pids: [111, 222],
+      host_id: "HOST-X",
+    });
+    const token = (JSON.parse(reg.resultText ?? "{}") as { agent_token?: string }).agent_token;
+    // Re-register (with the owner's token) reporting a fresh chain. force=true
+    // bypasses the active-session collision guard (the name was just claimed +
+    // still has a live session — this is the same owner re-reporting, not a
+    // concurrent-terminal race).
+    await callToolViaHttp(
+      daemon.baseUrl,
+      "register_agent",
+      {
+        name: "pid-agent2",
+        role: "builder",
+        capabilities: [],
+        host_shell_pids: [333],
+        host_id: "HOST-X",
+        force: true,
+      },
+      token,
+    );
+    const disc = await callToolViaHttp(daemon.baseUrl, "discover_agents", {}, token);
+    const binding = parseAgentBinding(JSON.parse(disc.resultText ?? "{}"), "pid-agent2");
+    expect(binding?.hostShellPids).toEqual([333]); // overwritten, not [111,222,333]
   }, 20_000);
 });
