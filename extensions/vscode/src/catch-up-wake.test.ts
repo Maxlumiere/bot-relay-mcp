@@ -56,6 +56,21 @@ describe("decideWake — catch-up / live shared watermark", () => {
     expect(d.newMark).toBe(T1);
   });
 
+  it("same-millisecond tie FAILS SAFE — a new message colliding with the mark's timestamp does NOT re-wake", () => {
+    // decideWake only sees last_message_at (the snapshot carries no per-message
+    // id), so a genuinely-new message whose created_at collides with the mark is
+    // indistinguishable from the one we already woke for. The `===` comparison
+    // therefore treats it as already-woken → NO re-wake. This is the intended
+    // fail-safe direction (victra edge / codex): a missed wake is recoverable;
+    // a double-wake corrupts coordination. Never wake on a tie.
+    const d = decideWake(
+      { pending_count: 4, last_message_at: T1 },
+      { autoInjectInbox: true, lastWokenAt: T1 },
+    );
+    expect(d.shouldWake).toBe(false);
+    expect(d.newMark).toBe(T1);
+  });
+
   it("WAKES again only when genuinely newer mail arrives (T2 > mark T1)", () => {
     const d = decideWake(
       { pending_count: 3, last_message_at: T2 },
