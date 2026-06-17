@@ -6,22 +6,19 @@
 /**
  * Tether v0.2.3 (A) — catch-up wake, real-HTTP-daemon integration.
  *
- * The unit test (extensions/vscode/src/catch-up-wake.test.ts) pins the
- * decideWake() decision in isolation. This test proves the SAME contract
- * end-to-end against the SHIPPED HTTP daemon (v2.5 R0 lesson — exercise the
- * real transport, not InMemory): it spawns the built dist/index.js, drives
- * real register_agent / send_message over the stateless POST path, reads the
- * real `relay://inbox/<agent>` snapshot via the MCP StreamableHTTP client (the
- * exact payload the extension's refreshSnapshot() consumes), and feeds those
- * real snapshots through the production decideWake().
+ * R1 (codex): the R0 version read snapshots and called decideWake DIRECTLY, so
+ * it would not have failed if the production subscribe→notify→wake wiring
+ * drifted (the v2.5 R0 test-path-must-match-shipped-path trap). This version
+ * drives the SHIPPED seam — `subscribeInbox` + `WakeGate` from
+ * extensions/vscode/src/inbox-subscription.ts, the exact code connect() runs —
+ * against the real built dist/index.js daemon over the real MCP StreamableHTTP
+ * transport. Only the terminal keystroke (WakeGate's onWake) is spied; a
+ * regression in the handler, the subscribe, or the catch-up fails these tests.
  *
- * The load-bearing assertion (Risk-A): a re-read with no new mail does NOT
- * wake again — the high-water mark prevents a double-wake on every reconnect.
- *
- * This is also the shared-harness anchor: v0.2.4 (keepalive) and v0.3
- * (PID-handshake) reuse tests/helpers/relay-http-harness.ts.
+ * Shared harness anchor: v0.2.4 (keepalive) + v0.3 (PID handshake) reuse
+ * tests/helpers/relay-http-harness.ts.
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import {
   spawnDaemon,
   tearDownDaemon,
@@ -30,102 +27,138 @@ import {
   connectMcpClient,
   readInboxSnapshot,
   type DaemonHandle,
-  type McpClientHandle,
 } from "./helpers/relay-http-harness.js";
-import { decideWake } from "../extensions/vscode/src/catch-up-wake.js";
+import { WakeGate, subscribeInbox } from "../extensions/vscode/src/inbox-subscription.js";
 
-const RCPT = "rw-recipient";
 const SENDER = "rw-sender";
+const buildInboxUri = (agent: string) => `relay://inbox/${encodeURIComponent(agent)}`;
 
-describe("Tether v0.2.3 — catch-up wake over the real HTTP daemon", () => {
+// Side-effect deps the wake path doesn't assert here (status bar / toast / error
+// state / log) — no-ops so the test isolates the wake.
+const sinkDeps = {
+  applySnapshot: () => {},
+  showToast: () => {},
+  isInErrorState: () => false,
+  log: () => {},
+};
+
+describe("Tether v0.2.3 R1 — subscribe→notify→wake through the production seam", () => {
   let daemon: DaemonHandle;
-  let mcp: McpClientHandle;
   let senderToken: string;
 
   beforeAll(async () => {
     daemon = await spawnDaemon();
     senderToken = (await registerAgentViaHttp(daemon.baseUrl, SENDER)).agentToken;
-    await registerAgentViaHttp(daemon.baseUrl, RCPT);
-    mcp = await connectMcpClient(daemon.baseUrl, "reliable-wake-test");
   }, 20_000);
 
   afterAll(async () => {
-    if (mcp) await mcp.close();
     if (daemon) await tearDownDaemon(daemon);
   });
 
-  /** Poll the inbox snapshot until `predicate` holds (or time out). */
-  async function readUntil(
-    predicate: (s: Awaited<ReturnType<typeof readInboxSnapshot>>) => boolean,
-    timeoutMs = 4000,
-  ): Promise<Awaited<ReturnType<typeof readInboxSnapshot>>> {
+  async function waitForCalls(spy: ReturnType<typeof vi.fn>, n: number, timeoutMs = 5000): Promise<number> {
     const deadline = Date.now() + timeoutMs;
-    let last = await readInboxSnapshot(mcp.client, RCPT);
-    while (!predicate(last) && Date.now() < deadline) {
+    while (spy.mock.calls.length < n && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 25));
-      last = await readInboxSnapshot(mcp.client, RCPT);
     }
-    return last;
+    return spy.mock.calls.length;
   }
 
-  it("drives catch-up wake → no-double-wake → re-wake on new mail, end-to-end", async () => {
-    // Simulate the extension's module-memory high-water mark across a sequence
-    // of real snapshots.
-    let mark: string | null = null;
+  it("catch-up wake fires once for mail already waiting, then the LIVE path wakes on a new message", async () => {
+    const RCPT = "rw-a";
+    await registerAgentViaHttp(daemon.baseUrl, RCPT);
+    // Mail waiting BEFORE subscribe — only the catch-up path can deliver it.
+    await sendMessageViaHttp(daemon.baseUrl, SENDER, senderToken, RCPT, "waiting-before-subscribe");
 
-    // (1) Empty inbox at subscribe → nothing pending → no wake.
-    const empty = await readInboxSnapshot(mcp.client, RCPT);
-    expect(empty.pending_count).toBe(0);
-    {
-      const d = decideWake(empty, { autoInjectInbox: true, lastWokenAt: mark });
-      expect(d.shouldWake).toBe(false);
-      mark = d.newMark;
+    const onWake = vi.fn();
+    const gate = new WakeGate(onWake);
+    const mcp = await connectMcpClient(daemon.baseUrl, "rw-a");
+    try {
+      await subscribeInbox({
+        client: mcp.client,
+        agentName: RCPT,
+        autoInjectInbox: true,
+        buildInboxUri,
+        readSnapshot: readInboxSnapshot,
+        wakeGate: gate,
+        ...sinkDeps,
+      });
+      // Catch-up wake fired THROUGH the production seam.
+      expect(onWake).toHaveBeenCalledTimes(1);
+      expect(onWake).toHaveBeenLastCalledWith(RCPT);
+
+      // LIVE: a new message → real ResourceUpdated notification → the production
+      // handler runs → wake. Proves the :handler wiring, not just decideWake.
+      await sendMessageViaHttp(daemon.baseUrl, SENDER, senderToken, RCPT, "live-after-subscribe");
+      expect(await waitForCalls(onWake, 2)).toBe(2);
+    } finally {
+      await mcp.close();
     }
-    expect(mark).toBe(null);
+  }, 25_000);
 
-    // (2) A message is already waiting at (re)subscribe → catch-up fires ONCE.
-    await sendMessageViaHttp(daemon.baseUrl, SENDER, senderToken, RCPT, "first-while-away");
-    const afterFirst = await readUntil((s) => s.pending_count >= 1);
-    expect(afterFirst.pending_count).toBe(1);
-    expect(afterFirst.last_message_at).not.toBe(null);
-    const T1 = afterFirst.last_message_at;
-    {
-      const d = decideWake(afterFirst, { autoInjectInbox: true, lastWokenAt: mark });
-      expect(d.shouldWake).toBe(true);
-      expect(d.newMark).toBe(T1);
-      mark = d.newMark;
+  it("★ NO double-wake: a reconnect (re-subscribe, same WakeGate) with no new mail does NOT re-fire", async () => {
+    const RCPT = "rw-b";
+    await registerAgentViaHttp(daemon.baseUrl, RCPT);
+    await sendMessageViaHttp(daemon.baseUrl, SENDER, senderToken, RCPT, "pending-for-b");
+
+    const onWake = vi.fn();
+    // ONE gate across both connects — mirrors the activate-time singleton that
+    // persists across reconnects (the no-double-wake guarantee).
+    const gate = new WakeGate(onWake);
+
+    const mcp1 = await connectMcpClient(daemon.baseUrl, "rw-b-1");
+    await subscribeInbox({
+      client: mcp1.client,
+      agentName: RCPT,
+      autoInjectInbox: true,
+      buildInboxUri,
+      readSnapshot: readInboxSnapshot,
+      wakeGate: gate,
+      ...sinkDeps,
+    });
+    expect(onWake).toHaveBeenCalledTimes(1); // catch-up
+    await mcp1.close();
+
+    // Reconnect: fresh client + SAME gate, no new mail since the last wake.
+    const mcp2 = await connectMcpClient(daemon.baseUrl, "rw-b-2");
+    try {
+      await subscribeInbox({
+        client: mcp2.client,
+        agentName: RCPT,
+        autoInjectInbox: true,
+        buildInboxUri,
+        readSnapshot: readInboxSnapshot,
+        wakeGate: gate,
+        ...sinkDeps,
+      });
+      await new Promise((r) => setTimeout(r, 300)); // settle window for any stray frame
+      expect(onWake).toHaveBeenCalledTimes(1); // STILL once — no double-wake
+    } finally {
+      await mcp2.close();
     }
+  }, 25_000);
 
-    // (3) ★ NO DOUBLE-WAKE: a reconnect re-reads the SAME snapshot (no new
-    //     mail) → the high-water mark suppresses the wake.
-    const reReadSame = await readInboxSnapshot(mcp.client, RCPT);
-    expect(reReadSame.last_message_at).toBe(T1);
-    {
-      const d = decideWake(reReadSame, { autoInjectInbox: true, lastWokenAt: mark });
-      expect(d.shouldWake).toBe(false);
-      expect(d.newMark).toBe(T1);
-      mark = d.newMark;
+  it("autoInjectInbox=false never wakes, even with real pending mail", async () => {
+    const RCPT = "rw-c";
+    await registerAgentViaHttp(daemon.baseUrl, RCPT);
+    await sendMessageViaHttp(daemon.baseUrl, SENDER, senderToken, RCPT, "pending-for-c");
+
+    const onWake = vi.fn();
+    const gate = new WakeGate(onWake);
+    const mcp = await connectMcpClient(daemon.baseUrl, "rw-c");
+    try {
+      await subscribeInbox({
+        client: mcp.client,
+        agentName: RCPT,
+        autoInjectInbox: false,
+        buildInboxUri,
+        readSnapshot: readInboxSnapshot,
+        wakeGate: gate,
+        ...sinkDeps,
+      });
+      await new Promise((r) => setTimeout(r, 250));
+      expect(onWake).not.toHaveBeenCalled();
+    } finally {
+      await mcp.close();
     }
-
-    // (4) Genuinely new mail arrives → wakes again, advancing the mark.
-    await sendMessageViaHttp(daemon.baseUrl, SENDER, senderToken, RCPT, "second-new");
-    const afterSecond = await readUntil((s) => s.last_message_at !== T1);
-    expect(afterSecond.pending_count).toBe(2);
-    const T2 = afterSecond.last_message_at;
-    expect(T2).not.toBe(T1);
-    {
-      const d = decideWake(afterSecond, { autoInjectInbox: true, lastWokenAt: mark });
-      expect(d.shouldWake).toBe(true);
-      expect(d.newMark).toBe(T2);
-      mark = d.newMark;
-    }
-  }, 20_000);
-
-  it("never wakes when autoInjectInbox is off, even with real pending mail", async () => {
-    // The recipient already has pending mail from the prior test.
-    const snap = await readInboxSnapshot(mcp.client, RCPT);
-    expect(snap.pending_count).toBeGreaterThan(0);
-    const d = decideWake(snap, { autoInjectInbox: false, lastWokenAt: null });
-    expect(d.shouldWake).toBe(false);
-  }, 20_000);
+  }, 25_000);
 });

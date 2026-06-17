@@ -153,6 +153,7 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/config.ts",
       "src/extension.ts",
       "src/format.ts",
+      "src/inbox-subscription.ts",
       "src/reconnect-supervisor.ts",
       "src/restart-policy.ts",
       "src/switch-agent.ts",

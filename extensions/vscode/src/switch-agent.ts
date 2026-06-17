@@ -34,3 +34,20 @@ export function parseAgentNames(raw: unknown, exclude?: string): string[] {
   const deduped = Array.from(new Set(names));
   return exclude ? deduped.filter((n) => n !== exclude) : deduped;
 }
+
+/** The VS Code configuration scope an effective setting value currently lives
+ *  at. v0.2.3 R1 (codex): Switch Agent must write `agentName` to the scope
+ *  that's actually effective — a Workspace (or WorkspaceFolder) override
+ *  silently shadows a Global write, leaving the live re-subscribe on the OLD
+ *  agent while the toast claims success. Given
+ *  `vscode.WorkspaceConfiguration.inspect(key)`'s result, return the narrowest
+ *  scope that already holds a value (so writing there changes the effective
+ *  value); default to Global when nothing is set yet. Pure for unit testing. */
+export type ConfigScope = "workspaceFolder" | "workspace" | "global";
+export function effectiveScope(
+  inspected: { workspaceFolderValue?: unknown; workspaceValue?: unknown } | undefined,
+): ConfigScope {
+  if (inspected?.workspaceFolderValue !== undefined) return "workspaceFolder";
+  if (inspected?.workspaceValue !== undefined) return "workspace";
+  return "global";
+}

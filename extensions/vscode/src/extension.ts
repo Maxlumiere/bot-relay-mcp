@@ -23,7 +23,6 @@
 import * as vscode from "vscode";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   formatStatusBar,
   formatToast,
@@ -40,8 +39,8 @@ import {
   type TetherConfig,
 } from "./config.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
-import { decideWake } from "./catch-up-wake.js";
-import { parseAgentNames } from "./switch-agent.js";
+import { WakeGate, subscribeInbox } from "./inbox-subscription.js";
+import { parseAgentNames, effectiveScope } from "./switch-agent.js";
 import {
   AgentManager,
   realScheduler,
@@ -283,11 +282,10 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 let mcpClient: Client | undefined;
 let mcpTransport: StreamableHTTPClientTransport | undefined;
 let lastSnapshot: InboxSnapshot | undefined;
-// v0.2.3 (A) — catch-up-wake high-water mark: the newest-message timestamp we
-// last fired an inbox wake for. MODULE memory only (resets on reload, by
-// design — a reload re-wakes still-pending mail). Shared by the catch-up path
-// and the live notification path so neither double-wakes the other.
-let lastWokenMessageAt: string | null = null;
+// v0.2.3 — the inbox-wake gate. Owns the no-double-wake high-water mark across
+// reconnects (catch-up + live share it); re-created on reload so still-pending
+// mail re-wakes (A1). Created at activate, used by connect()'s subscribeInbox.
+let wakeGate: WakeGate | undefined;
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
 
@@ -492,23 +490,6 @@ function hintNoWake(message: string): void {
   vscode.window.setStatusBarMessage(`$(mail) Tether: ${message}`, 8000);
 }
 
-/**
- * v0.2.3 (A) — fire at most one inbox wake for a snapshot, sharing a module-
- * level high-water mark between the catch-up path (connect → initial snapshot)
- * and the live path (ResourceUpdated → refreshed snapshot). The shared mark is
- * what guarantees no double-wake: a daemon-restart reconnect whose newest
- * message we've already woken for does nothing. The mark lives only in module
- * memory, so a window reload re-wakes still-pending mail (A1, intended).
- */
-function wakeForSnapshot(snapshot: InboxSnapshot, config: TetherConfig): void {
-  const decision = decideWake(snapshot, {
-    autoInjectInbox: config.autoInjectInbox,
-    lastWokenAt: lastWokenMessageAt,
-  });
-  lastWokenMessageAt = decision.newMark;
-  if (decision.shouldWake) injectInboxKeystroke(config.agentName);
-}
-
 function showToast(snapshot: InboxSnapshot, level: TetherConfig["notificationLevel"]): void {
   if (level === "none") return;
   if (level === "event") {
@@ -611,36 +592,29 @@ async function connect(config: TetherConfig): Promise<void> {
     { name: "bot-relay-tether-vscode", version: getExtensionVersion() },
     { capabilities: {} },
   );
-  client.setNotificationHandler(ResourceUpdatedNotificationSchema, async (notification) => {
-    const wantUri = buildInboxUri(config.agentName);
-    if (notification.params.uri !== wantUri) return;
-    log(`event: ${notification.params.uri}`);
-    const fresh = await refreshSnapshot(client, config.agentName);
-    if (!fresh) return;
-    if (isInErrorState()) return; // state-lock — don't paint snapshot over an error UI
-    applySnapshot(fresh);
-    showToast(fresh, config.notificationLevel);
-    wakeForSnapshot(fresh, config);
-  });
-
   await client.connect(transport);
   mcpClient = client;
   mcpTransport = transport;
 
-  // Subscribe + prime the status bar with an initial fetch.
-  await client.subscribeResource({ uri: buildInboxUri(config.agentName) });
-  const initial = await refreshSnapshot(client, config.agentName);
-  // v0.1.1 — state-lock guard: an async transport error (SSE GET stream
-  // open failure, header-mismatch close, etc.) may have fired between
-  // the start of connect() and here. If it did, setErrorState already
-  // flipped the status bar to "Tether: error". Don't overwrite it with
-  // an apparent-success snapshot or "connected + subscribed" log.
-  if (initial && !isInErrorState()) applySnapshot(initial);
-  // v0.2.3 (A) — catch-up wake: live notifications only cover mail that arrives
-  // AFTER subscribe, so if the inbox already holds pending mail at (re)subscribe
-  // fire one wake now. Shares the high-water mark with the live path, so a
-  // daemon-restart reconnect with no new mail does NOT re-wake.
-  if (initial && !isInErrorState()) wakeForSnapshot(initial, config);
+  // v0.2.3 R1 — wire the notification handler + subscribe + catch-up through the
+  // shared, VSCode-free subscribeInbox seam so the integration test exercises
+  // the REAL subscribe→notify→wake path, not just decideWake in isolation
+  // (codex test-path-must-match-shipped-path). The state-lock guard (don't paint
+  // a success snapshot / wake over an error UI) lives inside subscribeInbox. The
+  // persistent WakeGate owns the no-double-wake high-water mark across
+  // reconnects; a window reload re-creates it, re-waking pending mail (A1).
+  await subscribeInbox({
+    client,
+    agentName: config.agentName,
+    autoInjectInbox: config.autoInjectInbox,
+    buildInboxUri,
+    readSnapshot: refreshSnapshot,
+    applySnapshot,
+    showToast: (snapshot) => showToast(snapshot, config.notificationLevel),
+    isInErrorState,
+    wakeGate: wakeGate!,
+    log,
+  });
   if (!isInErrorState()) {
     log("connected + subscribed");
   }
@@ -703,10 +677,30 @@ async function runSwitchAgent(context: vscode.ExtensionContext): Promise<void> {
   }
   const picked = await pickAgentName(names, current);
   if (!picked || picked === current) return;
-  await vscode.workspace
+  // v0.2.3 R1 (codex) — write to the scope that's actually EFFECTIVE. Writing
+  // only to Global is silently shadowed by a Workspace/Folder override, which
+  // would leave the live re-subscribe on the OLD agent while we claimed success.
+  // Then read the effective value back and only toast success if it actually
+  // moved — an honest switch.
+  const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
+  const scope = effectiveScope(cfg.inspect("agentName"));
+  const target =
+    scope === "workspaceFolder"
+      ? vscode.ConfigurationTarget.WorkspaceFolder
+      : scope === "workspace"
+        ? vscode.ConfigurationTarget.Workspace
+        : vscode.ConfigurationTarget.Global;
+  await cfg.update("agentName", picked, target);
+  const effective = vscode.workspace
     .getConfiguration("bot-relay.tether")
-    .update("agentName", picked, vscode.ConfigurationTarget.Global);
-  void vscode.window.showInformationMessage(`Tether: switched to agent "${picked}".`);
+    .get<string>("agentName");
+  if (effective === picked) {
+    void vscode.window.showInformationMessage(`Tether: switched to agent "${picked}".`);
+  } else {
+    void vscode.window.showWarningMessage(
+      `Tether: could not switch to "${picked}" — effective agentName is "${effective ?? ""}" (a higher-precedence setting is overriding it).`,
+    );
+  }
 }
 
 /** QuickPick over discovered agents (+ a free-text entry); falls back to a
@@ -1140,6 +1134,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // RestartPolicy in neverGiveUp mode (O-2): a down/restarting daemon is
   // retried indefinitely; the 5/hr cap stays only on the child-process
   // crash-loop path (AgentManager above). Production timer = setTimeout.
+  // v0.2.3 — create the wake gate before the first connect(); it persists
+  // across reconnects so the catch-up + live paths share ONE no-double-wake
+  // high-water mark.
+  wakeGate = new WakeGate((name) => injectInboxKeystroke(name));
   reconnectSupervisor = new ReconnectSupervisor({
     policy: new RestartPolicy({ neverGiveUp: true }),
     connect: async () => {
@@ -1183,5 +1181,6 @@ export async function deactivate(): Promise<void> {
   // no leaked timer).
   reconnectSupervisor?.dispose();
   reconnectSupervisor = undefined;
+  wakeGate = undefined;
   await disconnect();
 }
