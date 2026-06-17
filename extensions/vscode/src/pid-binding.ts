@@ -108,3 +108,67 @@ export function resolveWakeTargetByPid<T extends PidNamedTerminal>(
     resolveWakeTarget(agentName, terminals)
   );
 }
+
+/**
+ * Live-wake orchestration (VSCode-free; the extension supplies the impure deps).
+ *
+ * v0.3.0 R1 (codex P1): the binding MUST be fresh per wake — a stale cached
+ * binding wakes the wrong terminal after a same-name re-register. So
+ * `fetchBinding` is called every wake (the extension's getAgentBinding hits
+ * discover_agents fresh, no TTL). The bound-terminal cache is the only cache,
+ * and it's self-invalidating: the fast path re-validates the cached terminal's
+ * processId against the FRESH binding via isHostScopedMember — if the agent
+ * re-registered/moved, the stale terminal fails that check and we re-resolve.
+ */
+export interface WakeDeps<T> {
+  /** ALWAYS-fresh agent binding (discover_agents per wake; never a stale cache). */
+  fetchBinding(agentName: string): Promise<AgentPidBinding>;
+  localHostId: string | null;
+  openTerminals(): readonly T[];
+  nameOf(t: T): string;
+  processIdOf(t: T): Promise<number | undefined>;
+  cacheGet(agentName: string): T | undefined;
+  cacheSet(agentName: string, t: T): void;
+  cacheClear(agentName: string): void;
+  wake(t: T): void;
+  hint(message: string): void;
+  log(line: string): void;
+}
+
+export async function resolveAndWake<T>(agentName: string, deps: WakeDeps<T>): Promise<void> {
+  const binding = await deps.fetchBinding(agentName); // FRESH — no stale-cache window
+  const open = deps.openTerminals();
+  // Fast path: a previously-bound terminal still open AND still a host-scoped
+  // member of the FRESH chain → wake it without re-awaiting every processId.
+  const cached = deps.cacheGet(agentName);
+  if (cached && open.includes(cached)) {
+    if (isHostScopedMember(binding, deps.localHostId, await deps.processIdOf(cached))) {
+      deps.wake(cached);
+      return;
+    }
+    deps.cacheClear(agentName); // stale (re-register / moved) → re-resolve
+  }
+  // Full resolve: await each open terminal's processId once, THEN decide.
+  const wrappers = await Promise.all(
+    open.map(async (t) => ({ t, name: deps.nameOf(t), processId: await deps.processIdOf(t) })),
+  );
+  const decision = resolveWakeTargetByPid(agentName, binding, deps.localHostId, wrappers);
+  switch (decision.kind) {
+    case "inject":
+      deps.wake(decision.terminal.t);
+      deps.cacheSet(agentName, decision.terminal.t);
+      deps.log(
+        `auto-inject: wrote "inbox\\n" to terminal "${decision.terminal.name}" (pid=${decision.terminal.processId ?? "?"})`,
+      );
+      return;
+    case "no-match":
+      deps.cacheClear(agentName);
+      deps.log(`auto-inject skipped: no terminal bound to agent "${agentName}" (by PID or name)`);
+      deps.hint(`${agentName} has mail — no bound terminal; run it as "${agentName}" or where Tether can read its PID`);
+      return;
+    case "ambiguous":
+      deps.log(`auto-inject skipped: ${decision.matches.length} terminals match agent "${agentName}" — ambiguous, not waking a guess`);
+      deps.hint(`${agentName} has mail — multiple matching terminals, not waking a guess`);
+      return;
+  }
+}

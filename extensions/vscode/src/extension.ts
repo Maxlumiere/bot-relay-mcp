@@ -52,12 +52,7 @@ import {
 } from "./agent-manager.js";
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
-import {
-  resolveWakeTargetByPid,
-  parseAgentBinding,
-  isHostScopedMember,
-  type AgentPidBinding,
-} from "./pid-binding.js";
+import { resolveAndWake, parseAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
 import { execFileSync } from "node:child_process";
 
@@ -296,13 +291,13 @@ let wakeGate: WakeGate | undefined;
 // v0.3.0 PID-handshake state. localHostId = this instance's machine GUID (the
 // host-scoping anchor, computed once at activate; must match the agent-side
 // hook's host_id). boundTerminals caches the resolved agent→terminal binding so
-// we don't re-await every Terminal.processId per wake (invalidated on close).
-// agentBindingCache caches the discover_agents binding briefly so rapid wakes
-// don't re-hit the relay.
+// we don't re-await every Terminal.processId per wake — invalidated on terminal
+// close AND self-invalidating: each wake re-validates the cached terminal
+// against a FRESH binding. v0.3.0 R1 (codex P1): the discover_agents binding is
+// NOT cached — a stale binding would wake the wrong terminal after a same-name
+// re-register.
 let localHostId: string | null = null;
 const boundTerminals = new Map<string, vscode.Terminal>();
-const agentBindingCache = new Map<string, { binding: AgentPidBinding; at: number }>();
-const PID_BINDING_TTL_MS = 15_000;
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
 
@@ -473,72 +468,49 @@ function toHostPlatform(p: NodeJS.Platform): HostPlatform | null {
   return p === "darwin" || p === "linux" || p === "win32" ? p : null;
 }
 
-/** Fetch the inbox-owner agent's PID binding via discover_agents, cached for
- *  PID_BINDING_TTL_MS so rapid wakes don't re-hit the relay. Unavailable → empty
- *  binding (the matcher then falls back to the name matcher). */
+/** Fetch the inbox-owner agent's PID binding via discover_agents — ALWAYS fresh.
+ *  v0.3.0 R1 (codex P1): caching this would wake the wrong terminal after a
+ *  same-name re-register, so there is no TTL cache. Unavailable → empty binding
+ *  (the matcher then falls back to the name matcher). */
 async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
-  const cached = agentBindingCache.get(agentName);
-  if (cached && Date.now() - cached.at < PID_BINDING_TTL_MS) return cached.binding;
-  let binding: AgentPidBinding = { hostShellPids: null, hostId: null };
-  if (mcpClient) {
-    try {
-      const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
-      const text = extractToolText(res);
-      if (text) binding = parseAgentBinding(JSON.parse(text), agentName) ?? binding;
-    } catch (err) {
-      log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
-    }
+  const empty: AgentPidBinding = { hostShellPids: null, hostId: null };
+  if (!mcpClient) return empty;
+  try {
+    const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
+    const text = extractToolText(res);
+    return text ? (parseAgentBinding(JSON.parse(text), agentName) ?? empty) : empty;
+  } catch (err) {
+    log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
+    return empty;
   }
-  agentBindingCache.set(agentName, { binding, at: Date.now() });
-  return binding;
 }
 
 /**
- * v0.3.0 PID-handshake — wake the terminal bound to `agentName`. PID-PRIMARY:
- * the terminal whose processId is a host-scoped member of the agent's registered
- * ancestry chain (machine-GUID-scoped, so an equal PID on another host can't
- * false-match), else the v0.2.2 NAME matcher (bare name / `Tether: <name>`), else
- * 0/>1 → no-inject + status-bar hint (never guess). A bound terminal is cached
- * (invalidated on close) so we don't re-await every Terminal.processId per wake;
- * the fast path re-validates the cached terminal still owns a chain PID (covers
- * agent re-register / a moved terminal). Async ordering: every processId await
- * resolves BEFORE the wake decision.
+ * v0.3.0 PID-handshake — wake the terminal bound to `agentName`. Thin adapter
+ * over the VSCode-free resolveAndWake (PID-primary, host-scoped; name fallback;
+ * 0/>1 → hint). resolveAndWake fetches the binding FRESH each wake (no stale
+ * cache → no wrong-terminal-after-re-register, codex R1) and re-validates any
+ * cached terminal against it. Async; fire-and-forget from WakeGate.
  */
 async function injectInboxKeystroke(agentName: string): Promise<void> {
   try {
-    const binding = await getAgentBinding(agentName);
-    // Fast path: a previously-bound terminal still open + still a host-scoped
-    // member of the (possibly refreshed) chain — one await, not N.
-    const cached = boundTerminals.get(agentName);
-    if (cached && vscode.window.terminals.includes(cached)) {
-      if (isHostScopedMember(binding, localHostId, await cached.processId)) {
-        cached.sendText("inbox", true);
-        return;
-      }
-      boundTerminals.delete(agentName); // stale (re-register / moved) → re-resolve
-    }
-    // Full resolve: await every terminal's processId once, THEN decide.
-    const wrappers = await Promise.all(
-      vscode.window.terminals.map(async (vt) => ({ vt, name: vt.name, processId: await vt.processId })),
-    );
-    const decision = resolveWakeTargetByPid(agentName, binding, localHostId, wrappers);
-    switch (decision.kind) {
-      case "inject":
-        decision.terminal.vt.sendText("inbox", true);
-        boundTerminals.set(agentName, decision.terminal.vt);
-        log(
-          `auto-inject: wrote "inbox\\n" to terminal "${decision.terminal.name}" (pid=${decision.terminal.processId ?? "?"})`,
-        );
-        return;
-      case "no-match":
-        log(`auto-inject skipped: no terminal bound to agent "${agentName}" (by PID or name)`);
-        hintNoWake(`${agentName} has mail — no bound terminal; run it as "${agentName}" or where Tether can read its PID`);
-        return;
-      case "ambiguous":
-        log(`auto-inject skipped: ${decision.matches.length} terminals match agent "${agentName}" — ambiguous, not waking a guess`);
-        hintNoWake(`${agentName} has mail — multiple matching terminals, not waking a guess`);
-        return;
-    }
+    await resolveAndWake<vscode.Terminal>(agentName, {
+      fetchBinding: getAgentBinding,
+      localHostId,
+      openTerminals: () => vscode.window.terminals,
+      nameOf: (t) => t.name,
+      processIdOf: (t) => Promise.resolve(t.processId),
+      cacheGet: (name) => boundTerminals.get(name),
+      cacheSet: (name, t) => {
+        boundTerminals.set(name, t);
+      },
+      cacheClear: (name) => {
+        boundTerminals.delete(name);
+      },
+      wake: (t) => t.sendText("inbox", true),
+      hint: hintNoWake,
+      log,
+    });
   } catch (err) {
     log(`auto-inject failed for "${agentName}": ${err instanceof Error ? err.message : String(err)}`);
   }

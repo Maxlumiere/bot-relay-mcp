@@ -11,7 +11,9 @@ import {
   resolveWakeTargetByPid,
   isHostScopedMember,
   parseAgentBinding,
+  resolveAndWake,
   type PidNamedTerminal,
+  type AgentPidBinding,
 } from "./pid-binding.js";
 
 const t = (name: string, processId: number | undefined): PidNamedTerminal => ({ name, processId });
@@ -134,5 +136,126 @@ describe("parseAgentBinding — discover_agents → AgentPidBinding", () => {
     });
     expect(parseAgentBinding({ nope: true }, "x")).toBeNull();
     expect(parseAgentBinding(null, "x")).toBeNull();
+  });
+});
+
+// --- resolveAndWake: the live-wake orchestration (codex R1 contract) ---
+
+type FT = { name: string; pid: number | undefined };
+const AGENT = "agent";
+
+function harness(opts: {
+  binding: AgentPidBinding;
+  localHostId: string | null;
+  open: FT[];
+  cached?: FT;
+}) {
+  const woken: FT[] = [];
+  const hints: string[] = [];
+  const cache = new Map<string, FT>();
+  if (opts.cached) cache.set(AGENT, opts.cached);
+  let fetchCount = 0;
+  const deps = {
+    fetchBinding: async (): Promise<AgentPidBinding> => {
+      fetchCount += 1;
+      return opts.binding;
+    },
+    localHostId: opts.localHostId,
+    openTerminals: (): readonly FT[] => opts.open,
+    nameOf: (t: FT) => t.name,
+    processIdOf: async (t: FT) => t.pid,
+    cacheGet: (n: string) => cache.get(n),
+    cacheSet: (n: string, t: FT) => {
+      cache.set(n, t);
+    },
+    cacheClear: (n: string) => {
+      cache.delete(n);
+    },
+    wake: (t: FT) => {
+      woken.push(t);
+    },
+    hint: (m: string) => {
+      hints.push(m);
+    },
+    log: () => {},
+  };
+  return { deps, woken, hints, cache, fetchCount: () => fetchCount };
+}
+
+describe("resolveAndWake — fresh binding, self-invalidating bound cache (R1)", () => {
+  it("★ STALE-CACHE REGRESSION: after a same-name re-register, does NOT wake the old cached terminal — picks the new one", async () => {
+    // Agent was bound to terminal pid 111; it re-registered with chain [222]
+    // (same host). The FRESH binding is [222]; both terminals are still open.
+    const oldTerm: FT = { name: "old", pid: 111 };
+    const newTerm: FT = { name: "zsh", pid: 222 };
+    const h = harness({
+      binding: { hostShellPids: [222], hostId: "HOST-A" },
+      localHostId: "HOST-A",
+      open: [oldTerm, newTerm],
+      cached: oldTerm, // the stale binding from before the re-register
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([newTerm]); // NOT the stale oldTerm(111)
+    expect(h.cache.get(AGENT)).toBe(newTerm); // cache re-pointed
+  });
+
+  it("after re-register, if the new terminal isn't open, does NOT wake the stale one (no-match)", async () => {
+    const oldTerm: FT = { name: "old", pid: 111 };
+    const h = harness({
+      binding: { hostShellPids: [222], hostId: "HOST-A" },
+      localHostId: "HOST-A",
+      open: [oldTerm], // only the stale terminal is open; 222 is gone
+      cached: oldTerm,
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([]); // never wakes the stale terminal
+    expect(h.cache.has(AGENT)).toBe(false); // cleared
+    expect(h.hints).toHaveLength(1);
+  });
+
+  it("fast path: an unchanged binding + still-bound terminal wakes it directly", async () => {
+    const term: FT = { name: "zsh", pid: 111 };
+    const h = harness({
+      binding: { hostShellPids: [111], hostId: "HOST-A" },
+      localHostId: "HOST-A",
+      open: [term, { name: "other", pid: 999 }],
+      cached: term,
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([term]);
+  });
+
+  it("fetches the binding FRESH on EVERY wake (no stale-cache window)", async () => {
+    const term: FT = { name: "zsh", pid: 111 };
+    const h = harness({
+      binding: { hostShellPids: [111], hostId: "HOST-A" },
+      localHostId: "HOST-A",
+      open: [term],
+    });
+    await resolveAndWake(AGENT, h.deps);
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.fetchCount()).toBe(2);
+  });
+
+  it("no binding → name fallback wakes the agent-named terminal", async () => {
+    const named: FT = { name: AGENT, pid: 777 };
+    const h = harness({
+      binding: { hostShellPids: null, hostId: null },
+      localHostId: "HOST-A",
+      open: [{ name: "zsh", pid: 111 }, named],
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([named]);
+  });
+
+  it(">1 host-scoped matches → ambiguous: nothing woken, a hint shown", async () => {
+    const h = harness({
+      binding: { hostShellPids: [111, 222], hostId: "HOST-A" },
+      localHostId: "HOST-A",
+      open: [{ name: "a", pid: 111 }, { name: "b", pid: 222 }],
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([]);
+    expect(h.hints).toHaveLength(1);
   });
 });
