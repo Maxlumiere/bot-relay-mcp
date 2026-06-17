@@ -286,6 +286,60 @@ SQL
   fi
 fi
 
+# --- Tether v0.3 PID-handshake helpers ---
+#
+# Compute the agent's machine GUID + process-ancestry PID chain so Tether can
+# bind THIS terminal to THIS agent by process id (no manual naming). Both MUST
+# match the extension's TypeScript readers (extensions/vscode/src/host-identity.ts)
+# byte-for-byte — same OS source, same extraction — or the two host_ids won't
+# agree and host-scoped matching silently fails. POSIX is the real path
+# (the maintainer's Mac); the Windows (git-bash) branches mirror the documented
+# wmic/reg shapes but are not runtime-tested (no Windows host). Any failure →
+# empty output → the field is omitted from the register call (graceful: Tether
+# falls back to name matching).
+relay_machine_guid() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+        | sed -nE 's/.*"IOPlatformUUID" = "([^"]+)".*/\1/p' | head -1 ;;
+    Linux)
+      head -1 /etc/machine-id 2>/dev/null | tr -d '[:space:]' ;;
+    MINGW*|MSYS*|CYGWIN*)
+      reg query 'HKLM\SOFTWARE\Microsoft\Cryptography' //v MachineGuid 2>/dev/null \
+        | sed -nE 's/.*MachineGuid[[:space:]]+REG_SZ[[:space:]]+([^[:space:]]+).*/\1/p' | head -1 ;;
+  esac
+}
+
+# Walk parent PIDs from this hook shell ($$) up toward init, emitting a JSON
+# array "[pid1,pid2,...]". The hook is a descendant of the agent (claude),
+# which is a descendant of the controlling shell (= VS Code Terminal.processId),
+# so that shell PID is always in the chain regardless of launch path. Bounded +
+# stops at init.
+relay_pid_chain() {
+  local pid=$$ chain="" depth=0 ppid wtable
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      wtable=$(wmic process get ProcessId,ParentProcessId /format:csv 2>/dev/null)
+      [ -z "$wtable" ] && { printf '[]'; return; }
+      while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+        chain="${chain:+$chain,}$pid"
+        ppid=$(printf '%s\n' "$wtable" | awk -F, -v p="$pid" 'NR>1 && $3+0==p {gsub(/[^0-9]/,"",$2); print $2; exit}')
+        case "$ppid" in ''|*[!0-9]*) break ;; esac
+        [ "$ppid" -le 1 ] && break
+        pid="$ppid"; depth=$((depth+1))
+      done ;;
+    *)
+      while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+        chain="${chain:+$chain,}$pid"
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        case "$ppid" in ''|*[!0-9]*) break ;; esac
+        [ "$ppid" -le 1 ] && break
+        pid="$ppid"; depth=$((depth+1))
+      done ;;
+  esac
+  printf '[%s]' "$chain"
+}
+
 # --- Register via HTTP register_agent (Phase 7p HIGH #3) ---
 #
 # Prior to Phase 7p this block did a raw sqlite3 UPSERT. That created
@@ -309,10 +363,15 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   if [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
     REG_HEADERS+=(-H "X-Agent-Token: ${RELAY_AGENT_TOKEN}")
   fi
+  # Tether v0.3 PID-handshake: best-effort PID chain + machine GUID. Empty/[] →
+  # the field is omitted (graceful — registration never fails over the handshake).
+  RELAY_HOST_PID_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
+  [ "$RELAY_HOST_PID_CHAIN" = "[]" ] && RELAY_HOST_PID_CHAIN=""
+  RELAY_HOST_GUID=$(relay_machine_guid 2>/dev/null || printf '')
   REG_BODY=$(curl -s -m 4 -w "\nHTTP_STATUS:%{http_code}\n" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}}}}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}}}}" \
     2>&1)
   # v2.6.1 — capture fresh agent_token from the response body and persist
   # to the vault. register_agent only returns `agent_token` on first-mint

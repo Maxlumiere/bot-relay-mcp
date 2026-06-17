@@ -63,6 +63,21 @@ export const RegisterAgentSchema = z.object({
   capabilities: z.array(z.string()).describe("List of capabilities"),
   description: z.string().max(512).optional().describe("v2.0: optional human-readable description (max 512 chars). Shown in discover_agents + dashboard. Mutable on re-register — if omitted, previous value preserved."),
   terminal_title_ref: TerminalTitleRefField,
+  host_shell_pids: z
+    .array(z.number().int().nonnegative())
+    .max(64)
+    .optional()
+    .describe(
+      "Tether v0.3 PID-handshake (schema v16): the agent's process-ancestry PID chain (own PID → … → init/launchd). Tether reads vscode.Terminal.processId for each terminal and intersects with this chain (host-scoped by host_id) to bind a terminal to this agent — no manual naming. Mutable on re-register: OVERWRITES the stored chain (replaces, not appends). Writing it under an existing name requires that name's token (same auth as any re-register)."
+    ),
+  host_id: z
+    .string()
+    .min(1)
+    .max(128)
+    .optional()
+    .describe(
+      "Tether v0.3 PID-handshake (schema v16): stable OS machine GUID (macOS IOPlatformUUID / Linux /etc/machine-id / Windows MachineGuid). Host-scopes the PID match so equal PIDs on different hosts never false-match (federation-safe). Immutable after first registration (same rule as `managed`)."
+    ),
   agent_token: AgentTokenField,
   recovery_token: z.string().min(1).optional().describe("v2.1 Phase 4b.1 v2: required when re-registering an agent whose auth_state is 'recovery_pending'. Obtained from the revoker's revoke_token response (shown ONCE) and handed off to the operator out-of-band."),
   managed: z.boolean().default(false).describe("v2.1 Phase 4b.2: true = agent is a Managed Agent wrapper that can parse push-token messages + self-update its local config on rotation. false (default) = Claude Code terminal or equivalent (restart-required on rotation). Immutable after first registration — change requires unregister + fresh register."),
@@ -755,9 +770,13 @@ export interface AgentRecord {
   session_started_at?: string | null;
   /** v2.2.0: window title the agent's terminal was spawned with. Used by the dashboard's click-to-focus driver. NULL on rows spawned before v2.2.0 or rows that did not thread the value through the register call. */
   terminal_title_ref?: string | null;
+  /** Tether v0.3 PID-handshake (schema v16): JSON-stringified number[] — the agent's process-ancestry PID chain. NULL on rows registered before v16 / agents that don't report it. Mutable on re-register (overwrites). */
+  host_shell_pids?: string | null;
+  /** Tether v0.3 PID-handshake (schema v16): stable OS machine GUID, host-scopes the PID match. NULL on legacy rows. Immutable after first registration. */
+  host_id?: string | null;
 }
 
-export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "token_hash" | "session_id" | "agent_status" | "description"> {
+export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "token_hash" | "session_id" | "agent_status" | "description" | "host_shell_pids" | "host_id"> {
   capabilities: string[];
   /** v1.3 presence: computed from last_seen. Distinct from agent_status. */
   status: "online" | "stale" | "offline";
@@ -778,6 +797,10 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
   session_id: string | null;
   /** v2.2.0: window title the agent's terminal was spawned with (NULL if legacy). */
   terminal_title_ref: string | null;
+  /** Tether v0.3 PID-handshake: the agent's process-ancestry PID chain, PARSED to number[] (NULL if not reported). Tether intersects this with terminal.processId — host-scoped by host_id — to bind a terminal to this agent. */
+  host_shell_pids: number[] | null;
+  /** Tether v0.3 PID-handshake: stable OS machine GUID that host-scopes the PID match (NULL if not reported). */
+  host_id: string | null;
 }
 
 export interface MessageRecord {

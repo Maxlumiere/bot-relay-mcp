@@ -4,6 +4,18 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.3.0] — 2026-06-17 — Zero-config wake: Tether finds your agent's terminal by process id
+
+Tether now binds a terminal to an agent by **process identity** — no terminal naming, no rename, no convention to remember. Start your agent however you like (a shell alias, a plain `claude --name …`, anything); when mail arrives, Tether wakes the terminal that's actually running that agent. This is the foundation for running several agents, each in its own terminal, with nothing to configure.
+
+### Changed
+
+- **Auto-`inbox` wake is now PID-primary.** An agent reports its process-ancestry chain + a stable machine id when it registers; Tether reads each terminal's process id and wakes the one whose process is in that chain. The v0.2.2 name match (`<agent>` / `Tether: <agent>`) remains as a fallback for agents that haven't reported a chain yet, and the 0/>1 safety (no wake + a status-bar hint, never a guess) is unchanged. Net effect: the common case — an alias-launched agent in a terminal named `zsh` — now wakes correctly with **zero configuration**.
+
+### Internal
+
+- Matching is **host-scoped**: an equal process id on a *different* machine never false-matches (the machine id — macOS `IOPlatformUUID` / Linux `/etc/machine-id` / Windows `MachineGuid` — is computed identically by the agent and the extension). Resolved bindings are cached and invalidated on terminal close, so wakes don't re-scan every terminal. The matcher core (`pid-binding.ts`) and the host-identity parsers (`host-identity.ts`) are pure + unit-tested across all three platforms (Windows parsers are verified against documented command output; not runtime-tested on a real Windows host). Requires a relay that surfaces the handshake fields (`register_agent` schema v16). Two-mode Tether + the iTerm2→VS Code "promote to builder" handoff build on this primitive in a later v0.3.x.
+
 ## [0.2.3] — 2026-06-17 — Reliable wake: catch up on mail that's already waiting, switch agents live
 
 Two fixes to make the auto-`inbox` wake reliable in day-to-day multi-agent use: Tether now wakes your terminal for mail that was **already sitting in the inbox** when it (re)connects — not just mail that arrives afterward — and you can point Tether at a different agent's inbox from the Command Palette without a window reload.

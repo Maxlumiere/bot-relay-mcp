@@ -160,6 +160,21 @@ function deriveAgentStatus(
   return "idle";
 }
 
+/** Parse the stored host_shell_pids JSON column → number[] | null. Tolerates
+ *  null + malformed JSON (both → null) so one bad row can't crash discover_agents. */
+function parseHostShellPids(raw: string | null | undefined): number[] | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.every((n) => typeof n === "number")) {
+      return parsed as number[];
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
   return {
     id: row.id,
@@ -174,6 +189,10 @@ function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
     description: row.description ?? null,
     session_id: row.session_id ?? null,
     terminal_title_ref: row.terminal_title_ref ?? null,
+    // Tether v0.3 PID-handshake: parse the stored JSON chain → number[] (null +
+    // malformed both surface as null, never throw).
+    host_shell_pids: parseHostShellPids(row.host_shell_pids),
+    host_id: row.host_id ?? null,
   };
 }
 
@@ -218,6 +237,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_11(_db);
   migrateSchemaToV2_12(_db);
   migrateSchemaToV2_13(_db);
+  migrateSchemaToV2_14(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -256,6 +276,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_11(_db);
   migrateSchemaToV2_12(_db);
   migrateSchemaToV2_13(_db);
+  migrateSchemaToV2_14(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -477,7 +498,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 15;
+export const CURRENT_SCHEMA_VERSION = 16;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -566,6 +587,7 @@ export function applyMigration(from: number, to: number): void {
     [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13],
     [13, 14],
     [14, 15],
+    [15, 16],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1367,6 +1389,35 @@ function migrateSchemaToV2_13(db: CompatDatabase): void {
   }
 }
 
+/**
+ * Tether v0.3 PID-handshake — schema v15 → v16.
+ *
+ * Two new nullable TEXT columns on `agents`:
+ *   - `host_shell_pids` — JSON-stringified number[] (the agent's process-
+ *     ancestry PID chain). Mutable on re-register (OVERWRITES, never appends).
+ *     NULL on legacy rows / agents that don't report it. Parsed to number[] at
+ *     read time by toAgentWithStatus.
+ *   - `host_id` — stable OS machine GUID (macOS IOPlatformUUID / Linux
+ *     /etc/machine-id / Windows MachineGuid). Host-scopes the PID match so
+ *     equal PIDs on different hosts can't false-match (federation-safe).
+ *     Immutable after first registration (same rule as `managed`). NULL on
+ *     legacy rows.
+ *
+ * Additive + idempotent — PRAGMA-guarded so re-runs no-op; NULL on every
+ * existing row = zero data migration.
+ */
+function migrateSchemaToV2_14(db: CompatDatabase): void {
+  const agentCols = db
+    .prepare("PRAGMA table_info(agents)")
+    .all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "host_shell_pids")) {
+    db.exec("ALTER TABLE agents ADD COLUMN host_shell_pids TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "host_id")) {
+    db.exec("ALTER TABLE agents ADD COLUMN host_id TEXT");
+  }
+}
+
 function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -2074,6 +2125,10 @@ export function registerAgent(
      * legacy_bootstrap branches).
      */
     expectedRecoveryHash?: string | null;
+    /** Tether v0.3 PID-handshake: agent process-ancestry PID chain. On re-register, OVERWRITES the stored chain when provided; preserved when omitted. */
+    host_shell_pids?: number[];
+    /** Tether v0.3 PID-handshake: stable OS machine GUID. Captured on FIRST registration only — immutable thereafter (re-register never changes it). */
+    host_id?: string;
   } = {}
 ): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[] } {
   const db = getDb();
@@ -2171,14 +2226,22 @@ export function registerAgent(
       options.terminal_title_ref !== undefined
         ? options.terminal_title_ref
         : existing.terminal_title_ref ?? null;
+    // Tether v0.3 PID-handshake (H3): re-register OVERWRITES host_shell_pids
+    // when the caller re-reports it; preserves the stored chain when omitted (a
+    // re-register that doesn't re-report PIDs must not wipe the binding). host_id
+    // is IMMUTABLE — never in this UPDATE's SET clause.
+    const newHostShellPids =
+      options.host_shell_pids !== undefined
+        ? JSON.stringify(options.host_shell_pids)
+        : existing.host_shell_pids ?? null;
     const r = db.prepare(
       "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
-      "terminal_title_ref = ?, " +
+      "terminal_title_ref = ?, host_shell_pids = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ? " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
       role, timestamp, newHash, session_id, timestamp, newDescription,
-      newTitleRef,
+      newTitleRef, newHostShellPids,
       newAuthState, newRecoveryHash, newRevokedAt,
       name, existingState, existing.token_hash, casRecoveryHash
     );
@@ -2196,6 +2259,7 @@ export function registerAgent(
       session_id,
       description: newDescription,
       terminal_title_ref: newTitleRef,
+      host_shell_pids: newHostShellPids,
       auth_state: newAuthState,
       recovery_token_hash: newRecoveryHash,
       revoked_at: newRevokedAt,
@@ -2210,12 +2274,18 @@ export function registerAgent(
     // thereafter (same rule as capabilities per v1.7.1). Default 0.
     const managed = options.managed ? 1 : 0;
     const titleRef = options.terminal_title_ref ?? null;
+    // Tether v0.3 PID-handshake: capture the PID chain (JSON) + machine GUID on
+    // first registration. host_id is set here ONLY — immutable thereafter.
+    const hostShellPidsJson =
+      options.host_shell_pids !== undefined ? JSON.stringify(options.host_shell_pids) : null;
+    const hostId = options.host_id ?? null;
     db.prepare(
       // v2.1.3 (I6): default agent_status is now 'idle' (was 'online').
       // v2.1.6: session_started_at = timestamp for first-register anchor.
       // v2.2.0: terminal_title_ref captured on first register (may be null).
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed, terminal_title_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description, managed, titleRef);
+      // schema v16: host_shell_pids (JSON) + host_id captured on first register.
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId);
 
     // v2.0: populate normalized agent_capabilities table.
     const insertCap = db.prepare("INSERT OR IGNORE INTO agent_capabilities (agent_name, capability) VALUES (?, ?)");
