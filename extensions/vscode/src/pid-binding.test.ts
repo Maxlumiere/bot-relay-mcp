@@ -11,6 +11,7 @@ import {
   resolveWakeTargetByPid,
   isHostScopedMember,
   parseAgentBinding,
+  resolveAgentBinding,
   resolveAndWake,
   type PidNamedTerminal,
   type AgentPidBinding,
@@ -326,5 +327,68 @@ describe("parseAgentBinding tolerates the /api/snapshot shape (token-free fallba
       hostShellPids: [63025, 63006, 62903],
       hostId: "HOST-A",
     });
+  });
+});
+
+// --- v0.3.2 the discover → /api/snapshot fallback SEAM (codex re-audit). The
+// static parse above isn't enough: assert the WIRING — discover fails (token-free
+// Tether → AUTH_FAILED) → snapshot populates the binding → that binding drives a
+// real wake to the EXACT owner. Must FAIL if the snapshot fallback is removed.
+describe("resolveAgentBinding — discover → /api/snapshot fallback SEAM (v0.3.2)", () => {
+  // The live /api/snapshot payload shape: roster + extra per-agent/global fields.
+  const SNAPSHOT = {
+    agents: [
+      {
+        name: "tacc",
+        role: "user",
+        status: "online",
+        pending_count: 1,
+        host_shell_pids: [63025, 63006, 62903],
+        host_id: "HOST-A",
+      },
+    ],
+    messages: [],
+    active_tasks: [],
+  };
+  const OWNER: FT = { name: "zsh", pid: 62903 }; // shell ∈ chain; name never matches "tacc"
+
+  it("★ FULL SEAM: token-free/FAILED discover → snapshot populates binding → EXACT owner wakes", async () => {
+    const binding = await resolveAgentBinding("tacc", {
+      // discover_agents returns AUTH_FAILED (no `agents` array) — the token-free
+      // Tether case — so resolution MUST fall through to the snapshot.
+      discover: async () => ({ success: false, error_code: "AUTH_FAILED" }),
+      snapshot: async () => SNAPSHOT,
+    });
+    // (a) the seam produced the binding from the snapshot …
+    expect(binding).toEqual({ hostShellPids: [63025, 63006, 62903], hostId: "HOST-A" });
+    // (b) … and that binding drives a real wake to the EXACT owner terminal.
+    const h = harness({ binding, localHostId: "HOST-A", open: [OWNER, { name: "codex", pid: 40000 }] });
+    await resolveAndWake(AGENT, h.deps);
+    // Delete the snapshot fallback → empty binding → name miss → woken=[] → this FAILS.
+    expect(h.woken).toEqual([OWNER]);
+  });
+
+  it("discover succeeds → binding from the roster; the snapshot is NOT consulted", async () => {
+    let snapshotCalls = 0;
+    const binding = await resolveAgentBinding("tacc", {
+      discover: async () => SNAPSHOT, // roster shape parses for discover too
+      snapshot: async () => {
+        snapshotCalls += 1;
+        return null;
+      },
+    });
+    expect(binding.hostShellPids).toEqual([63025, 63006, 62903]);
+    expect(snapshotCalls).toBe(0); // primary path settled it — no wasted fetch
+  });
+
+  it("non-200 snapshot (fetcher → null) → empty binding → name fallback, no crash, no wrong-wake", async () => {
+    const binding = await resolveAgentBinding("tacc", {
+      discover: async () => null, // discover unavailable / failed
+      snapshot: async () => null, // /api/snapshot non-200 → fetcher returns null
+    });
+    expect(binding).toEqual({ hostShellPids: null, hostId: null });
+    const h = harness({ binding, localHostId: "HOST-A", open: [OWNER] });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([]); // no PID binding + name "zsh" ≠ agent → no wake (not a wrong wake)
   });
 });

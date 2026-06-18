@@ -52,7 +52,7 @@ import {
 } from "./agent-manager.js";
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
-import { resolveAndWake, parseAgentBinding, type AgentPidBinding } from "./pid-binding.js";
+import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
 import { execFileSync } from "node:child_process";
 
@@ -472,51 +472,41 @@ function toHostPlatform(p: NodeJS.Platform): HostPlatform | null {
   return p === "darwin" || p === "linux" || p === "win32" ? p : null;
 }
 
-/** Fetch the inbox-owner agent's PID binding via discover_agents — ALWAYS fresh.
- *  v0.3.0 R1 (codex P1): caching this would wake the wrong terminal after a
- *  same-name re-register, so there is no TTL cache. Unavailable → empty binding
- *  (the matcher then falls back to the name matcher). */
+/** Fetch the inbox-owner agent's PID binding — ALWAYS fresh (no TTL cache;
+ *  v0.3.0 R1: a cached binding would wake the wrong terminal after a same-name
+ *  re-register). Thin adapter: injects the real discover_agents (MCP) + the
+ *  auth-free /api/snapshot fetcher into the VSCode-free `resolveAgentBinding`
+ *  seam (pid-binding.ts). Tether connects token-free and the relay token-gates
+ *  discover_agents, so the snapshot fallback is what populates the binding — the
+ *  v0.3.0 T-ACC fix. Each fetcher returns parsed JSON or null; a failure degrades
+ *  cleanly to the empty binding (→ name matcher), never a throw or wrong wake. */
 async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
-  const empty: AgentPidBinding = { hostShellPids: null, hostId: null };
-  // Primary: discover_agents over the live MCP client. Returns a binding only
-  // when the agent is in the roster (parseAgentBinding → null on AUTH_FAILED /
-  // not-found / junk).
-  if (mcpClient) {
-    try {
-      const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
-      const text = extractToolText(res);
-      const parsed = text ? parseAgentBinding(JSON.parse(text), agentName) : null;
-      if (parsed) return parsed;
-    } catch (err) {
-      log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-  // Fallback: the auth-free GET /api/snapshot. v0.3.1 — discover_agents is
-  // token-gated on the relay (it doubles as the token-validity probe), but
-  // Tether connects TOKEN-FREE, so that read returns AUTH_FAILED → no binding →
-  // the PID wake can't fire (the real v0.3.0 T-ACC failure). /api/snapshot is the
-  // anonymous dashboard read and already serves the same host_shell_pids/host_id
-  // (it's behind http_secret on remote binds, open on a loopback daemon — same
-  // trust boundary as the MCP surface). parseAgentBinding tolerates its
-  // `{agents:[…]}` shape identically.
-  const fromSnapshot = await fetchBindingFromSnapshot(agentName);
-  return fromSnapshot ?? empty;
-}
-
-/** GET /api/snapshot and parse the agent's PID binding from it. Returns null when
- *  the endpoint is unknown, unreachable, non-200, or the agent isn't listed.
- *  Never throws (a binding-fetch failure must degrade to the name matcher, not
- *  break the wake). */
-async function fetchBindingFromSnapshot(agentName: string): Promise<AgentPidBinding | null> {
-  if (!relayEndpoint) return null;
-  try {
-    const res = await fetch(new URL("/api/snapshot", relayEndpoint), { method: "GET" });
-    if (!res.ok) return null;
-    return parseAgentBinding(await res.json(), agentName);
-  } catch (err) {
-    log(`pid-binding: /api/snapshot fallback failed — ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
+  return resolveAgentBinding(agentName, {
+    discover: async () => {
+      if (!mcpClient) return null;
+      try {
+        const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
+        const text = extractToolText(res);
+        return text ? JSON.parse(text) : null;
+      } catch (err) {
+        log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+    },
+    snapshot: async () => {
+      // The auth-free dashboard read; serves the same host_shell_pids/host_id
+      // (behind http_secret on remote binds, open on a loopback daemon — the
+      // same trust boundary as the MCP surface).
+      if (!relayEndpoint) return null;
+      try {
+        const res = await fetch(new URL("/api/snapshot", relayEndpoint), { method: "GET" });
+        return res.ok ? await res.json() : null;
+      } catch (err) {
+        log(`pid-binding: /api/snapshot fallback failed — ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+    },
+  });
 }
 
 /**
