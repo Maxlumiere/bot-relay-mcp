@@ -17,7 +17,6 @@ import {
   type WakeDecision,
   type NamedTerminal,
 } from "./terminal-targeting.js";
-import { walkAncestry, walkDescendants } from "./host-identity.js";
 
 export interface AgentPidBinding {
   /** The agent's registered process-ancestry PID chain (null/empty = not reported). */
@@ -51,48 +50,6 @@ export function isHostScopedMember(
 }
 
 /**
- * v0.3.1 — host-scoped membership that tolerates the off-by-one between the PID
- * the hook recorded and the PID VS Code surfaces as `Terminal.processId`.
- *
- * THE v0.3.0 T-ACC FAILURE: the hook records the agent's full process-ancestry
- * CHAIN (own PID → … → controlling shell → ptyHost → Code). `Terminal.processId`
- * is *a* node on that same root-to-leaf spine — but WHICH node VS Code reports can
- * differ by a hop (login-vs-interactive shell, a shell-integration wrapper, or
- * Claude Code's own pty/daemon interposition). On Maxime's host the shell pid
- * 62903 WAS in the chain, yet the single `.includes(processId)` matched 0
- * terminals — because the pid VS Code actually exposed wasn't the literal chain
- * member. The chain was recorded for exactly this reason: match if `pid` itself
- * OR any ANCESTOR or any DESCENDANT of it is in the chain.
- *
- * Host-scoping is UNCHANGED — an equal PID on a different host must still never
- * match (the federation-safety boundary). When `table` is null/empty this degrades
- * to the exact `isHostScopedMember` check, so it can never be a false negative
- * relative to v0.3.0.
- */
-export function isHostScopedTreeMember(
-  binding: AgentPidBinding,
-  localHostId: string | null,
-  pid: number | undefined,
-  table: ReadonlyMap<number, number> | null,
-): boolean {
-  // Exact, host-scoped — the v0.3.0 contract (and the cache fast-path primitive).
-  if (isHostScopedMember(binding, localHostId, pid)) return true;
-  // Tree widening only when we have a pid, a snapshot, and the same host-scoping
-  // guarantees the exact check enforces (re-asserted so the tree path can never
-  // bypass the federation boundary).
-  if (pid === undefined || !table || table.size === 0) return false;
-  if (!binding.hostShellPids || binding.hostShellPids.length === 0) return false;
-  if (!binding.hostId || !localHostId || binding.hostId !== localHostId) return false;
-  const chain = new Set(binding.hostShellPids);
-  // Ancestors of pid (walkAncestry[0] is pid itself, which already failed the
-  // exact check above — the useful members are its ancestors) …
-  for (const a of walkAncestry(pid, table)) if (chain.has(a)) return true;
-  // … and descendants of pid (the agent process typically lives BELOW the shell).
-  for (const d of walkDescendants(pid, table)) if (chain.has(d)) return true;
-  return false;
-}
-
-/**
  * Try to bind by PID, host-scoped. Returns a decision only when the PID layer is
  * authoritative; returns null to mean "PID layer abstains — fall back to name".
  *
@@ -105,11 +62,8 @@ function tryPidMatch<T extends PidNamedTerminal>(
   binding: AgentPidBinding,
   localHostId: string | null,
   terminals: readonly T[],
-  table: ReadonlyMap<number, number> | null,
 ): WakeDecision<T> | null {
-  const matches = terminals.filter((t) =>
-    isHostScopedTreeMember(binding, localHostId, t.processId, table),
-  );
+  const matches = terminals.filter((t) => isHostScopedMember(binding, localHostId, t.processId));
   if (matches.length === 1) return { kind: "inject", terminal: matches[0] };
   if (matches.length === 0) return null; // abstain → let name matching try
   return { kind: "ambiguous", agentName, matches };
@@ -148,10 +102,9 @@ export function resolveWakeTargetByPid<T extends PidNamedTerminal>(
   binding: AgentPidBinding,
   localHostId: string | null,
   terminals: readonly T[],
-  table: ReadonlyMap<number, number> | null = null,
 ): WakeDecision<T> {
   return (
-    tryPidMatch(agentName, binding, localHostId, terminals, table) ??
+    tryPidMatch(agentName, binding, localHostId, terminals) ??
     resolveWakeTarget(agentName, terminals)
   );
 }
@@ -174,11 +127,6 @@ export interface WakeDeps<T> {
   openTerminals(): readonly T[];
   nameOf(t: T): string;
   processIdOf(t: T): Promise<number | undefined>;
-  /** v0.3.1 — OS pid→ppid snapshot for tree-intersection matching. Called at
-   *  most once per wake, and only when an exact PID match has already failed
-   *  (so the common case pays no `ps`). Empty map = unavailable → the matcher
-   *  degrades to the exact v0.3.0 check. */
-  processTable(): ReadonlyMap<number, number>;
   cacheGet(agentName: string): T | undefined;
   cacheSet(agentName: string, t: T): void;
   cacheClear(agentName: string): void;
@@ -190,83 +138,39 @@ export interface WakeDeps<T> {
 export async function resolveAndWake<T>(agentName: string, deps: WakeDeps<T>): Promise<void> {
   const binding = await deps.fetchBinding(agentName); // FRESH — no stale-cache window
   const open = deps.openTerminals();
-
-  // Could a process-tree widening even help here? Only when a non-empty chain is
-  // registered on THIS host. Gates the one `ps` snapshot so name-only / no-binding
-  // wakes pay nothing, and re-asserts the host-scoping boundary up front.
-  const hostScopable =
-    !!binding.hostShellPids &&
-    binding.hostShellPids.length > 0 &&
-    !!binding.hostId &&
-    !!deps.localHostId &&
-    binding.hostId === deps.localHostId;
-
-  // Fast path: a previously-bound terminal still open AND still a member of the
-  // FRESH chain → wake without re-awaiting every processId. Exact check first
-  // (sync, no `ps`); widen to the tree only if exact fails AND it could match.
+  // Fast path: a previously-bound terminal still open AND still a host-scoped
+  // member of the FRESH chain → wake it without re-awaiting every processId.
   const cached = deps.cacheGet(agentName);
   if (cached && open.includes(cached)) {
-    const cachedPid = await deps.processIdOf(cached);
-    if (
-      isHostScopedMember(binding, deps.localHostId, cachedPid) ||
-      (hostScopable && isHostScopedTreeMember(binding, deps.localHostId, cachedPid, deps.processTable()))
-    ) {
+    if (isHostScopedMember(binding, deps.localHostId, await deps.processIdOf(cached))) {
       deps.wake(cached);
       return;
     }
     deps.cacheClear(agentName); // stale (re-register / moved) → re-resolve
   }
-
   // Full resolve: await each open terminal's processId once, THEN decide.
   const wrappers = await Promise.all(
     open.map(async (t) => ({ t, name: deps.nameOf(t), processId: await deps.processIdOf(t) })),
   );
-
-  // v0.3.1 instrumentation — ONE diagnostic line per wake. This is the
-  // observability the v0.3.0 T-ACC lacked: the binding the ext actually resolved
-  // (post-fetch + post-parse) plus every terminal's resolved processId. A bind
-  // miss is now debuggable straight from the Output channel — no special build.
+  // v0.3.1 instrumentation — ONE diagnostic line per wake: the binding the
+  // extension actually resolved (post-fetch + post-parse) plus every terminal's
+  // resolved processId. This is the observability the v0.3.0 T-ACC lacked — it
+  // is exactly what surfaced the real bug (binding arriving EMPTY because the
+  // token-free discover_agents read was AUTH_FAILED). A bind miss is now
+  // debuggable straight from the Output channel, no special build.
   deps.log(
     `pid-binding: resolve agent="${agentName}" localHostId=${deps.localHostId ?? "∅"} ` +
       `binding.hostId=${binding.hostId ?? "∅"} ` +
       `binding.hostShellPids=${binding.hostShellPids ? `[${binding.hostShellPids.join(",")}]` : "∅"} ` +
       `terminals=${JSON.stringify(wrappers.map((w) => ({ name: w.name, pid: w.processId ?? null })))}`,
   );
-
-  // PID-primary with exact > tree > name precedence. Exact PID pass is sync; only
-  // if it abstains (and a widening could help) do we pay for one process-table
-  // snapshot and retry the tree-intersection matcher. Name matcher is the last
-  // resort (pre-handshake compatibility), exactly as in v0.3.0.
-  let matchVia: "pid-exact" | "pid-tree" | "name" = "pid-exact";
-  let decision: WakeDecision<(typeof wrappers)[number]> | null = tryPidMatch(
-    agentName,
-    binding,
-    deps.localHostId,
-    wrappers,
-    null,
-  );
-  if (!decision && hostScopable) {
-    const table = deps.processTable();
-    if (table.size > 0) {
-      const treeMatch = tryPidMatch(agentName, binding, deps.localHostId, wrappers, table);
-      if (treeMatch) {
-        decision = treeMatch;
-        matchVia = "pid-tree";
-      }
-    }
-  }
-  if (!decision) {
-    decision = resolveWakeTarget(agentName, wrappers);
-    matchVia = "name";
-  }
-
+  const decision = resolveWakeTargetByPid(agentName, binding, deps.localHostId, wrappers);
   switch (decision.kind) {
     case "inject":
       deps.wake(decision.terminal.t);
       deps.cacheSet(agentName, decision.terminal.t);
       deps.log(
-        `auto-inject: wrote "inbox\\n" to terminal "${decision.terminal.name}" ` +
-          `(pid=${decision.terminal.processId ?? "?"}, match=${matchVia})`,
+        `auto-inject: wrote "inbox\\n" to terminal "${decision.terminal.name}" (pid=${decision.terminal.processId ?? "?"})`,
       );
       return;
     case "no-match":

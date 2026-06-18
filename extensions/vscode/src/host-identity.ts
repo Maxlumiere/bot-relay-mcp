@@ -72,7 +72,7 @@ export function parseWindowsProcessTable(stdout: string): Map<number, number> {
  *  parent. */
 export function walkAncestry(
   startPid: number,
-  table: ReadonlyMap<number, number>,
+  table: Map<number, number>,
   maxDepth = 64,
 ): number[] {
   const chain: number[] = [];
@@ -90,42 +90,6 @@ export function walkAncestry(
     pid = ppid;
   }
   return chain;
-}
-
-/** Walk DESCENDANTS of `startPid` (its children, recursively) using a pid → ppid
- *  table. Returns the descendant pids (NOT including `startPid`), breadth-first.
- *  Bounded by `maxNodes` and cycle-safe (a seen-set guards a malformed table).
- *
- *  v0.3.1 (PID-tree bind): the agent process (claude) lives BELOW the controlling
- *  shell that VS Code surfaces as `Terminal.processId`, so when the recorded chain
- *  member is a descendant of the terminal's pid (rather than the pid itself), this
- *  is the walk that re-connects them. Pairs with `walkAncestry` for the other
- *  direction. */
-export function walkDescendants(
-  startPid: number,
-  table: ReadonlyMap<number, number>,
-  maxNodes = 4096,
-): number[] {
-  // Invert the pid → ppid table into ppid → children once.
-  const children = new Map<number, number[]>();
-  for (const [pid, ppid] of table) {
-    const bucket = children.get(ppid);
-    if (bucket) bucket.push(pid);
-    else children.set(ppid, [pid]);
-  }
-  const out: number[] = [];
-  const seen = new Set<number>([startPid]);
-  const queue: number[] = [startPid];
-  while (queue.length > 0 && out.length < maxNodes) {
-    const cur = queue.shift() as number;
-    for (const child of children.get(cur) ?? []) {
-      if (seen.has(child)) continue;
-      seen.add(child);
-      out.push(child);
-      queue.push(child);
-    }
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,23 +160,5 @@ export function ancestryChain(
     return walkAncestry(startPid, table);
   } catch {
     return [];
-  }
-}
-
-/** Snapshot the full OS process table (pid → ppid) for `platform`, or an empty
- *  map when unavailable. v0.3.1 PID-tree bind: Tether takes ONE snapshot per wake
- *  (only when an exact PID match fails) and walks it both ways to connect a
- *  terminal's `processId` to the agent's recorded chain. Same command + parser as
- *  `ancestryChain`, exposed so the matcher can intersect arbitrary tree relations,
- *  not just one start pid's ancestry. Never throws (→ empty map). */
-export function processTable(platform: HostPlatform, run: CommandRunner): Map<number, number> {
-  try {
-    return platform === "win32"
-      ? parseWindowsProcessTable(
-          run("wmic", ["process", "get", "ProcessId,ParentProcessId", "/format:csv"]),
-        )
-      : parsePosixProcessTable(run("ps", ["-e", "-o", "pid=,ppid="]));
-  } catch {
-    return new Map();
   }
 }

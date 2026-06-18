@@ -14,7 +14,6 @@ import {
   parsePosixProcessTable,
   parseWindowsProcessTable,
   walkAncestry,
-  walkDescendants,
   parseDarwinMachineGuid,
   parseLinuxMachineId,
   parseWindowsMachineGuid,
@@ -160,48 +159,5 @@ describe("resolvers compose command + parser per platform", () => {
         throw new Error("ps unavailable");
       }),
     ).toEqual([]);
-  });
-});
-
-describe("walkDescendants — children-of subtree (v0.3.1 PID-tree bind)", () => {
-  // Maxime's real tree: Code(55447) → ptyHost(55465) → zsh(62903) → claude(63006)
-  //   → hook(63025); plus a shell-integration wrapper 70001 that is ALSO a child
-  // of the shell 62903 (a sibling subtree of claude).
-  const table = new Map<number, number>([
-    [55465, 55447],
-    [62903, 55465],
-    [63006, 62903],
-    [63025, 63006],
-    [70001, 62903],
-    [55447, 1],
-  ]);
-
-  it("returns every descendant of a node, breadth-first, excluding the node itself", () => {
-    expect(new Set(walkDescendants(55465, table))).toEqual(new Set([62903, 63006, 63025, 70001]));
-    expect(walkDescendants(55465, table)).not.toContain(55465);
-  });
-
-  it("a leaf has no descendants", () => {
-    expect(walkDescendants(63025, table)).toEqual([]);
-  });
-
-  it("the controlling shell sees both the agent subtree AND the wrapper sibling", () => {
-    expect(new Set(walkDescendants(62903, table))).toEqual(new Set([63006, 63025, 70001]));
-  });
-
-  it("is cycle-safe against a malformed (looping) table", () => {
-    const bad = new Map<number, number>([
-      [10, 20],
-      [20, 10],
-    ]);
-    // Should terminate; 10's only 'child' via the inverted map is 20, and 20's is
-    // 10 which is the start (seen) → stops.
-    expect(walkDescendants(10, bad)).toEqual([20]);
-  });
-
-  it("bounded by maxNodes", () => {
-    const big = new Map<number, number>();
-    for (let i = 2; i <= 500; i++) big.set(i, i - 1); // a 1→2→…→500 chain
-    expect(walkDescendants(1, big, 10)).toHaveLength(10);
   });
 });

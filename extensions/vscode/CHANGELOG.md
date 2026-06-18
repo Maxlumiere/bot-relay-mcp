@@ -4,17 +4,18 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
-## [0.3.1] — 2026-06-18 — Zero-config wake, fixed: match the whole process tree, not one PID
+## [0.3.2] — 2026-06-18 — Zero-config wake, fixed: read the agent's PID binding without a token
 
-The zero-config wake from 0.3.0 didn't fire on a real machine: Tether saw the mail and knew the agent's process chain, but matched **0 terminals** and never typed `inbox`. 0.3.1 fixes the matcher and adds the diagnostics that make a miss visible.
+The zero-config wake from 0.3.0 didn't fire on a real machine: Tether saw the mail and knew which agent, but matched **0 terminals** and never typed `inbox`. The cause turned out not to be the matcher at all — Tether couldn't read the agent's process binding in the first place.
 
 ### Fixed
 
-- **Auto-`inbox` wake now matches the terminal's whole process tree against the agent's chain.** 0.3.0 compared VS Code's `Terminal.processId` to the recorded chain with a single membership test. But the PID VS Code reports for a terminal can sit one hop off the exact value the agent recorded — a login-vs-interactive shell, a shell-integration wrapper, or Claude Code's own pty/daemon — so the controlling shell could be *in* the chain yet the wake still found nothing. Tether now binds a terminal when its `processId`, **or any ancestor or descendant of it**, is in the agent's chain. The exact match still wins first (no extra work in the common case), the host-scoping boundary is unchanged (an equal PID on a different machine never matches), and the name match remains the final fallback.
+- **PID auto-bind never fired because the binding came back empty.** To wake the right terminal, Tether reads the agent's process chain from the relay. It did that via `discover_agents`, which the relay requires a token for — but Tether connects **token-free** (there's no token to configure, by design), so the read failed and the binding was empty: no process ids to match, no wake. Tether now falls back to the relay's **auth-free `/api/snapshot`** (the same endpoint the dashboard uses, which already carries the data) whenever the token-gated read returns nothing. The wake now fires with zero configuration, exactly as intended.
+- **Removed the experimental process-tree match.** A 0.3.1 internal build tried to also match a terminal whose process id was an *ancestor* of the agent's chain. Because the chain includes process ids **shared by every terminal in the window** (the editor and its terminal host), that could match — and wake — the *wrong* agent's terminal. It's removed: matching is back to the agent's own process ids (exact), which is what actually fires once the binding is read correctly. The wake decision stays host-scoped (an equal process id on a different machine never matches) with the terminal-name match as the final fallback.
 
 ### Added
 
-- **A diagnostic line on every wake** in the *Tether for bot-relay-mcp* Output channel: the agent binding Tether actually resolved (`host_shell_pids` + `host_id`) and each open terminal's resolved `processId`, plus whether the match was by `pid-exact`, `pid-tree`, or `name`. If a wake ever doesn't land, this line shows exactly why — no special build required.
+- **A diagnostic line on every wake** in the *Tether for bot-relay-mcp* Output channel: the agent binding Tether resolved (`host_shell_pids` + `host_id`) and each open terminal's resolved process id. If a wake ever doesn't land, this line shows why — it's what surfaced this very bug.
 
 ## [0.3.0] — 2026-06-17 — Zero-config wake: Tether finds your agent's terminal by process id
 

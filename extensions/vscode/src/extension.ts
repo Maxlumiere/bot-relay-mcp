@@ -53,7 +53,7 @@ import {
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { resolveAndWake, parseAgentBinding, type AgentPidBinding } from "./pid-binding.js";
-import { machineGuid, processTable, type HostPlatform } from "./host-identity.js";
+import { machineGuid, type HostPlatform } from "./host-identity.js";
 import { execFileSync } from "node:child_process";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
@@ -297,9 +297,10 @@ let wakeGate: WakeGate | undefined;
 // NOT cached — a stale binding would wake the wrong terminal after a same-name
 // re-register.
 let localHostId: string | null = null;
-// v0.3.1 — this instance's platform, captured at activate so injectInboxKeystroke
-// can snapshot the OS process table (host-identity.processTable) for tree-bind.
-let localHostPlatform: HostPlatform | null = null;
+// v0.3.1 — the relay HTTP base URL (config.endpoint), captured at connect so the
+// PID-binding fetch can fall back to the auth-free GET /api/snapshot when the
+// token-gated discover_agents read returns no binding (Tether connects token-free).
+let relayEndpoint: string | null = null;
 const boundTerminals = new Map<string, vscode.Terminal>();
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
@@ -477,14 +478,44 @@ function toHostPlatform(p: NodeJS.Platform): HostPlatform | null {
  *  (the matcher then falls back to the name matcher). */
 async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
   const empty: AgentPidBinding = { hostShellPids: null, hostId: null };
-  if (!mcpClient) return empty;
+  // Primary: discover_agents over the live MCP client. Returns a binding only
+  // when the agent is in the roster (parseAgentBinding → null on AUTH_FAILED /
+  // not-found / junk).
+  if (mcpClient) {
+    try {
+      const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
+      const text = extractToolText(res);
+      const parsed = text ? parseAgentBinding(JSON.parse(text), agentName) : null;
+      if (parsed) return parsed;
+    } catch (err) {
+      log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  // Fallback: the auth-free GET /api/snapshot. v0.3.1 — discover_agents is
+  // token-gated on the relay (it doubles as the token-validity probe), but
+  // Tether connects TOKEN-FREE, so that read returns AUTH_FAILED → no binding →
+  // the PID wake can't fire (the real v0.3.0 T-ACC failure). /api/snapshot is the
+  // anonymous dashboard read and already serves the same host_shell_pids/host_id
+  // (it's behind http_secret on remote binds, open on a loopback daemon — same
+  // trust boundary as the MCP surface). parseAgentBinding tolerates its
+  // `{agents:[…]}` shape identically.
+  const fromSnapshot = await fetchBindingFromSnapshot(agentName);
+  return fromSnapshot ?? empty;
+}
+
+/** GET /api/snapshot and parse the agent's PID binding from it. Returns null when
+ *  the endpoint is unknown, unreachable, non-200, or the agent isn't listed.
+ *  Never throws (a binding-fetch failure must degrade to the name matcher, not
+ *  break the wake). */
+async function fetchBindingFromSnapshot(agentName: string): Promise<AgentPidBinding | null> {
+  if (!relayEndpoint) return null;
   try {
-    const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
-    const text = extractToolText(res);
-    return text ? (parseAgentBinding(JSON.parse(text), agentName) ?? empty) : empty;
+    const res = await fetch(new URL("/api/snapshot", relayEndpoint), { method: "GET" });
+    if (!res.ok) return null;
+    return parseAgentBinding(await res.json(), agentName);
   } catch (err) {
-    log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
-    return empty;
+    log(`pid-binding: /api/snapshot fallback failed — ${err instanceof Error ? err.message : String(err)}`);
+    return null;
   }
 }
 
@@ -503,15 +534,6 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
       openTerminals: () => vscode.window.terminals,
       nameOf: (t) => t.name,
       processIdOf: (t) => Promise.resolve(t.processId),
-      // v0.3.1 — one OS process-table snapshot per wake, only when an exact PID
-      // match has failed (resolveAndWake gates the call). Same sync runner as the
-      // machineGuid read above. Unsupported platform → empty map → exact-only.
-      processTable: () =>
-        localHostPlatform
-          ? processTable(localHostPlatform, (cmd, args) =>
-              execFileSync(cmd, args, { encoding: "utf8", timeout: 2000 }),
-            )
-          : new Map(),
       cacheGet: (name) => boundTerminals.get(name),
       cacheSet: (name, t) => {
         boundTerminals.set(name, t);
@@ -583,6 +605,7 @@ async function connect(config: TetherConfig): Promise<void> {
   resetErrorState();
 
   log(`connecting to ${config.endpoint}/mcp as agent="${config.agentName}"`);
+  relayEndpoint = config.endpoint; // for the /api/snapshot PID-binding fallback
   const url = new URL("/mcp", config.endpoint);
   // The SDK's StreamableHTTPClientTransport accepts request init for
   // header injection; the relay's HTTP transport reads X-Agent-Token
@@ -1188,7 +1211,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // host-scoping anchor; must match the agent-side hook's host_id), and
   // invalidate the bound-terminal cache when a terminal closes.
   const hostPlatform = toHostPlatform(process.platform);
-  localHostPlatform = hostPlatform;
   localHostId = hostPlatform
     ? machineGuid(hostPlatform, (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", timeout: 2000 }))
     : null;
