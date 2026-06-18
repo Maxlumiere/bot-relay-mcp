@@ -53,7 +53,7 @@ import {
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { resolveAndWake, parseAgentBinding, type AgentPidBinding } from "./pid-binding.js";
-import { machineGuid, type HostPlatform } from "./host-identity.js";
+import { machineGuid, processTable, type HostPlatform } from "./host-identity.js";
 import { execFileSync } from "node:child_process";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
@@ -297,6 +297,9 @@ let wakeGate: WakeGate | undefined;
 // NOT cached — a stale binding would wake the wrong terminal after a same-name
 // re-register.
 let localHostId: string | null = null;
+// v0.3.1 — this instance's platform, captured at activate so injectInboxKeystroke
+// can snapshot the OS process table (host-identity.processTable) for tree-bind.
+let localHostPlatform: HostPlatform | null = null;
 const boundTerminals = new Map<string, vscode.Terminal>();
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
@@ -500,6 +503,15 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
       openTerminals: () => vscode.window.terminals,
       nameOf: (t) => t.name,
       processIdOf: (t) => Promise.resolve(t.processId),
+      // v0.3.1 — one OS process-table snapshot per wake, only when an exact PID
+      // match has failed (resolveAndWake gates the call). Same sync runner as the
+      // machineGuid read above. Unsupported platform → empty map → exact-only.
+      processTable: () =>
+        localHostPlatform
+          ? processTable(localHostPlatform, (cmd, args) =>
+              execFileSync(cmd, args, { encoding: "utf8", timeout: 2000 }),
+            )
+          : new Map(),
       cacheGet: (name) => boundTerminals.get(name),
       cacheSet: (name, t) => {
         boundTerminals.set(name, t);
@@ -1176,6 +1188,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // host-scoping anchor; must match the agent-side hook's host_id), and
   // invalidate the bound-terminal cache when a terminal closes.
   const hostPlatform = toHostPlatform(process.platform);
+  localHostPlatform = hostPlatform;
   localHostId = hostPlatform
     ? machineGuid(hostPlatform, (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", timeout: 2000 }))
     : null;

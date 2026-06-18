@@ -10,6 +10,7 @@ import { describe, it, expect } from "vitest";
 import {
   resolveWakeTargetByPid,
   isHostScopedMember,
+  isHostScopedTreeMember,
   parseAgentBinding,
   resolveAndWake,
   type PidNamedTerminal,
@@ -149,6 +150,8 @@ function harness(opts: {
   localHostId: string | null;
   open: FT[];
   cached?: FT;
+  /** v0.3.1 — OS pid→ppid snapshot the tree-intersection matcher walks. */
+  table?: Map<number, number>;
 }) {
   const woken: FT[] = [];
   const hints: string[] = [];
@@ -164,6 +167,7 @@ function harness(opts: {
     openTerminals: (): readonly FT[] => opts.open,
     nameOf: (t: FT) => t.name,
     processIdOf: async (t: FT) => t.pid,
+    processTable: (): ReadonlyMap<number, number> => opts.table ?? new Map<number, number>(),
     cacheGet: (n: string) => cache.get(n),
     cacheSet: (n: string, t: FT) => {
       cache.set(n, t);
@@ -253,6 +257,108 @@ describe("resolveAndWake — fresh binding, self-invalidating bound cache (R1)",
       binding: { hostShellPids: [111, 222], hostId: "HOST-A" },
       localHostId: "HOST-A",
       open: [{ name: "a", pid: 111 }, { name: "b", pid: 222 }],
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([]);
+    expect(h.hints).toHaveLength(1);
+  });
+});
+
+// --- v0.3.1 PID-TREE bind: the live contract the v0.3.0 green-but-broken proxy
+// missed. The hook records the agent's ANCESTRY CHAIN; `Terminal.processId` is a
+// node on the same process-tree spine but can be off by a hop. Match on the tree,
+// not a single .includes(). These model Maxime's real host (T-ACC FAIL 2026-06-18):
+//   Code(55447) → ptyHost(55465) → zsh(62903) → claude(63006) → hook(63025)
+// host_shell_pids = [63025,63006,62903,55465,55447].
+
+const CHAIN = [63025, 63006, 62903, 55465, 55447];
+const HOST_BINDING: AgentPidBinding = { hostShellPids: CHAIN, hostId: "HOST-A" };
+// Real pid→ppid spine for that tree, plus a shell-integration wrapper 70001 that
+// VS Code can surface as Terminal.processId — a CHILD of the recorded shell 62903
+// that is itself NOT in the chain (the off-by-one that broke v0.3.0).
+const HOST_TABLE = new Map<number, number>([
+  [63025, 63006],
+  [63006, 62903],
+  [62903, 55465],
+  [55465, 55447],
+  [55447, 1],
+  [70001, 62903], // wrapper below the shell, NOT a chain member
+]);
+
+describe("isHostScopedTreeMember — tree-tolerant, host-scoped (v0.3.1)", () => {
+  it("exact chain member still matches (v0.3.0 contract preserved), table or not", () => {
+    expect(isHostScopedTreeMember(HOST_BINDING, "HOST-A", 62903, null)).toBe(true);
+    expect(isHostScopedTreeMember(HOST_BINDING, "HOST-A", 62903, HOST_TABLE)).toBe(true);
+  });
+  it("★ pid NOT in the chain but an ANCESTOR is → matches (the v0.3.0 T-ACC miss)", () => {
+    // 70001 ∉ chain; its parent 62903 ∈ chain → tree match.
+    expect(isHostScopedTreeMember(HOST_BINDING, "HOST-A", 70001, null)).toBe(false); // no table → exact-only
+    expect(isHostScopedTreeMember(HOST_BINDING, "HOST-A", 70001, HOST_TABLE)).toBe(true);
+  });
+  it("pid NOT in the chain but a DESCENDANT is → matches", () => {
+    // VS Code surfaces 60000 (a parent of Code 55447, not a chain member); a chain
+    // member (55447) is its descendant.
+    const table = new Map(HOST_TABLE);
+    table.set(55447, 60000); // Code's parent is now 60000
+    expect(isHostScopedTreeMember(HOST_BINDING, "HOST-A", 60000, table)).toBe(true);
+  });
+  it("host-scoping STILL holds through the tree path: tree-related pid on a DIFFERENT host does NOT match", () => {
+    expect(isHostScopedTreeMember({ hostShellPids: CHAIN, hostId: "HOST-B" }, "HOST-A", 70001, HOST_TABLE)).toBe(false);
+    expect(isHostScopedTreeMember(HOST_BINDING, null, 70001, HOST_TABLE)).toBe(false);
+  });
+  it("a wholly-unrelated pid (no tree connection) does not match", () => {
+    expect(isHostScopedTreeMember(HOST_BINDING, "HOST-A", 99999, HOST_TABLE)).toBe(false);
+  });
+});
+
+describe("resolveAndWake — PID-tree bind (live contract, v0.3.1)", () => {
+  it("★ binds the agent terminal when Terminal.processId is a CHILD of the recorded shell (62903), named 'zsh', no rename", async () => {
+    // The exact v0.3.0 failure: terminal exposes 70001 (∉ chain), but it's a child
+    // of 62903 (∈ chain). v0.3.0 matched 0; v0.3.1 binds via the tree.
+    const zsh: FT = { name: "zsh", pid: 70001 };
+    const h = harness({
+      binding: HOST_BINDING,
+      localHostId: "HOST-A",
+      open: [zsh, { name: "codex", pid: 40000 }],
+      table: HOST_TABLE,
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([zsh]);
+    expect(h.cache.get(AGENT)).toBe(zsh);
+  });
+
+  it("exact PID match still binds WITHOUT consulting the process table (no regression, no ps)", async () => {
+    let tableCalls = 0;
+    const zsh: FT = { name: "zsh", pid: 62903 };
+    const h = harness({ binding: HOST_BINDING, localHostId: "HOST-A", open: [zsh] });
+    h.deps.processTable = () => {
+      tableCalls += 1;
+      return HOST_TABLE;
+    };
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([zsh]);
+    expect(tableCalls).toBe(0); // exact pass settled it; the ps snapshot was never taken
+  });
+
+  it("PID-tree match takes precedence over a name match (PID-primary, even when widened)", async () => {
+    const zsh: FT = { name: "zsh", pid: 70001 }; // tree-matches the chain
+    const named: FT = { name: AGENT, pid: 88888 }; // name-matches but unrelated PID
+    const h = harness({
+      binding: HOST_BINDING,
+      localHostId: "HOST-A",
+      open: [named, zsh],
+      table: HOST_TABLE,
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([zsh]); // PID (via tree) wins, not the name
+  });
+
+  it("host mismatch: a tree-related terminal on a DIFFERENT host is never woken (federation safety)", async () => {
+    const h = harness({
+      binding: { hostShellPids: CHAIN, hostId: "HOST-B" },
+      localHostId: "HOST-A",
+      open: [{ name: "zsh", pid: 70001 }],
+      table: HOST_TABLE,
     });
     await resolveAndWake(AGENT, h.deps);
     expect(h.woken).toEqual([]);

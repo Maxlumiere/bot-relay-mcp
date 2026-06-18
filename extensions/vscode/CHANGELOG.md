@@ -4,6 +4,18 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.3.1] — 2026-06-18 — Zero-config wake, fixed: match the whole process tree, not one PID
+
+The zero-config wake from 0.3.0 didn't fire on a real machine: Tether saw the mail and knew the agent's process chain, but matched **0 terminals** and never typed `inbox`. 0.3.1 fixes the matcher and adds the diagnostics that make a miss visible.
+
+### Fixed
+
+- **Auto-`inbox` wake now matches the terminal's whole process tree against the agent's chain.** 0.3.0 compared VS Code's `Terminal.processId` to the recorded chain with a single membership test. But the PID VS Code reports for a terminal can sit one hop off the exact value the agent recorded — a login-vs-interactive shell, a shell-integration wrapper, or Claude Code's own pty/daemon — so the controlling shell could be *in* the chain yet the wake still found nothing. Tether now binds a terminal when its `processId`, **or any ancestor or descendant of it**, is in the agent's chain. The exact match still wins first (no extra work in the common case), the host-scoping boundary is unchanged (an equal PID on a different machine never matches), and the name match remains the final fallback.
+
+### Added
+
+- **A diagnostic line on every wake** in the *Tether for bot-relay-mcp* Output channel: the agent binding Tether actually resolved (`host_shell_pids` + `host_id`) and each open terminal's resolved `processId`, plus whether the match was by `pid-exact`, `pid-tree`, or `name`. If a wake ever doesn't land, this line shows exactly why — no special build required.
+
 ## [0.3.0] — 2026-06-17 — Zero-config wake: Tether finds your agent's terminal by process id
 
 Tether now binds a terminal to an agent by **process identity** — no terminal naming, no rename, no convention to remember. Start your agent however you like (a shell alias, a plain `claude --name …`, anything); when mail arrives, Tether wakes the terminal that's actually running that agent. This is the foundation for running several agents, each in its own terminal, with nothing to configure.
