@@ -21,6 +21,8 @@ Completes the Tether v0.3 PID-handshake so it works for **existing** persona-bui
 
 `tests/pid-handshake.test.ts`: the "host_id is IMMUTABLE" contract is replaced by "host_id refreshes when re-reported, preserves when omitted"; new coverage for populating an initially-empty `host_id` (the `victra-build` case), `session_id` rotation on re-register, and an end-to-end **authenticated** re-register refreshing both `host_shell_pids` and `host_id` via the owner's token. The wrong-token-rejected governance test is retained unchanged.
 
+`tests/v2-11-0-hook-liveness-register.test.ts` (NEW): load-bearing coverage of the **shipped `check-relay.sh`** liveness gate — invokes the real hook as a subprocess against a real HTTP daemon and asserts register-was/wasn't-called via deterministic signals (session_id rotation + host_shell_pids overwrite, plus a host_id refresh assertion where a machine GUID is derivable). L1 (fresh+live → skip), L2 (stale → re-register), L3 (offline/`session_id` NULL → re-register, the victra-build case). Verified load-bearing by negative control: reverting `SKIP_REGISTER` to its old unconditional-skip form fails L2 + L3.
+
 ## v2.10.0 — 2026-06-15 — Coordination + safety
 
 ### Added — capability-routed messaging (`post_to_capability`)
