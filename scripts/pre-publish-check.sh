@@ -509,7 +509,11 @@ ci_green_gate() {
     return 0
   fi
   local ci_status
-  ci_status=$(gh run list --commit "$head_sha" --limit 1 --json conclusion,status \
+  # Scope to the CI workflow (.github/workflows/ci.yml) only. Without --workflow,
+  # `gh run list --limit 1` returns the MOST-RECENT run for the commit, which is
+  # the unrelated "Dependabot Updates" workflow (always latest, and red) — a false
+  # block that recurs on every publish. We gate on CI's conclusion, not Dependabot's.
+  ci_status=$(gh run list --commit "$head_sha" --workflow ci.yml --limit 1 --json conclusion,status \
     --jq 'if length == 0 then "no-run" else .[0].conclusion // .[0].status // "unknown" end' 2>/dev/null || echo "unknown")
   case "$ci_status" in
     success)
