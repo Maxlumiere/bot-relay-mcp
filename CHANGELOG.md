@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.11.0 — 2026-06-19 — Tether PID-handshake: refresh on relaunch (GAP 1)
+
+Completes the Tether v0.3 PID-handshake so it works for **existing** persona-builders, not just freshly-named agents. v0.3.2 made a token-free agent fetch its binding and autowake — but only an agent whose row was *inserted* with a live PID chain. A long-lived persona (a pre-existing row, e.g. `victra-build`) re-launched with an **empty `host_shell_pids`/`host_id`**, so Tether had nothing to bind to → no autowake. This release closes that gap end-to-end.
+
+### Fixed — `host_id` now refreshes on an authenticated re-register
+
+`register_agent` previously treated `host_id` (the OS machine GUID) as **immutable** (INSERT-only), so a row created without a handshake could never have its `host_id` populated on relaunch. It is now **session-refreshable** with the same semantics as `host_shell_pids`: provided → overwrite, omitted → preserve. (`host_shell_pids`, `session_id`, and `terminal_title_ref` already refreshed on re-register since v0.3.0.)
+
+- **Security unchanged + still load-bearing.** The re-register path is gated by `enforceAuth`: an `active` row can only be re-registered by the **token-holder**. A wrong/missing-token re-register of an existing name is rejected and writes neither PIDs nor `host_id` (regression-tested). A `host_id` refresh is therefore always the *owner* declaring its current machine — never a cross-agent overwrite.
+- **No schema change** — `host_id` column already existed (schema stays **v16**); `protocol_version` stays `2.4.0`.
+
+### Fixed — SessionStart hook re-registers on relaunch (not just first launch)
+
+`hooks/check-relay.sh` previously skipped `register_agent` entirely whenever a token was present **and** the agent row already existed (the Phase 4j spawn-handoff optimization). For a relaunched persona-builder that meant its live PID chain was **never re-sent**, so the handshake fields stayed stale/empty. The skip is now **liveness-scoped**: it fires only when the existing row holds a **fresh, live session** (true spawn handoff / concurrent-terminal guard). When the row is **offline or stale** (a genuine relaunch), the hook re-registers, refreshing `host_shell_pids` + `host_id` and repopulating `session_id`. (This also repopulates an empty `session_id` that could glitch inbox reads.)
+
+- **Known follow-up:** a *spawned* agent still doesn't capture PIDs on its first launch (the parent pre-registers a live row without the child's PIDs, and the child hook then sees a live session → skips). Tracked as a candidate GAP 2; not required for "an existing builder wakes."
+
+### Tests
+
+`tests/pid-handshake.test.ts`: the "host_id is IMMUTABLE" contract is replaced by "host_id refreshes when re-reported, preserves when omitted"; new coverage for populating an initially-empty `host_id` (the `victra-build` case), `session_id` rotation on re-register, and an end-to-end **authenticated** re-register refreshing both `host_shell_pids` and `host_id` via the owner's token. The wrong-token-rejected governance test is retained unchanged.
+
+`tests/v2-11-0-hook-liveness-register.test.ts` (NEW): load-bearing coverage of the **shipped `check-relay.sh`** liveness gate — invokes the real hook as a subprocess against a real HTTP daemon and asserts register-was/wasn't-called via deterministic signals (session_id rotation + host_shell_pids overwrite, plus a host_id refresh assertion where a machine GUID is derivable). L1 (fresh+live → skip), L2 (stale → re-register), L3 (offline/`session_id` NULL → re-register, the victra-build case). Verified load-bearing by negative control: reverting `SKIP_REGISTER` to its old unconditional-skip form fails L2 + L3.
+
 ## v2.10.0 — 2026-06-15 — Coordination + safety
 
 ### Added — capability-routed messaging (`post_to_capability`)

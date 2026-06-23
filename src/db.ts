@@ -2127,7 +2127,7 @@ export function registerAgent(
     expectedRecoveryHash?: string | null;
     /** Tether v0.3 PID-handshake: agent process-ancestry PID chain. On re-register, OVERWRITES the stored chain when provided; preserved when omitted. */
     host_shell_pids?: number[];
-    /** Tether v0.3 PID-handshake: stable OS machine GUID. Captured on FIRST registration only — immutable thereafter (re-register never changes it). */
+    /** Tether v0.3 PID-handshake: OS machine GUID. v2.11.0 GAP 1: session-refreshable on an authenticated re-register (provided→overwrite, omitted→preserve), mirroring host_shell_pids. Captured on first registration; the token-holder may refresh it on relaunch (e.g. to populate an empty host_id or after a machine move). */
     host_id?: string;
   } = {}
 ): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[] } {
@@ -2228,20 +2228,31 @@ export function registerAgent(
         : existing.terminal_title_ref ?? null;
     // Tether v0.3 PID-handshake (H3): re-register OVERWRITES host_shell_pids
     // when the caller re-reports it; preserves the stored chain when omitted (a
-    // re-register that doesn't re-report PIDs must not wipe the binding). host_id
-    // is IMMUTABLE — never in this UPDATE's SET clause.
+    // re-register that doesn't re-report PIDs must not wipe the binding).
+    // v2.11.0 GAP 1: host_id is now session-refreshable too (was immutable).
+    // Same provided→overwrite / omitted→preserve semantics. The re-register
+    // path is auth-gated by enforceAuth (server.ts) — an active row can only
+    // be re-registered by the token-holder — so a host_id refresh is the
+    // OWNER declaring its current machine GUID, never a cross-agent overwrite.
+    // This closes the empty-host_id case (long-lived persona rows created
+    // before the handshake, or via the SKIP_REGISTER-then-relaunch path) where
+    // an immutable host_id could never be populated on relaunch.
     const newHostShellPids =
       options.host_shell_pids !== undefined
         ? JSON.stringify(options.host_shell_pids)
         : existing.host_shell_pids ?? null;
+    const newHostId =
+      options.host_id !== undefined
+        ? options.host_id
+        : existing.host_id ?? null;
     const r = db.prepare(
       "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
-      "terminal_title_ref = ?, host_shell_pids = ?, " +
+      "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ? " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
       role, timestamp, newHash, session_id, timestamp, newDescription,
-      newTitleRef, newHostShellPids,
+      newTitleRef, newHostShellPids, newHostId,
       newAuthState, newRecoveryHash, newRevokedAt,
       name, existingState, existing.token_hash, casRecoveryHash
     );
@@ -2260,6 +2271,7 @@ export function registerAgent(
       description: newDescription,
       terminal_title_ref: newTitleRef,
       host_shell_pids: newHostShellPids,
+      host_id: newHostId,
       auth_state: newAuthState,
       recovery_token_hash: newRecoveryHash,
       revoked_at: newRevokedAt,
@@ -2275,7 +2287,9 @@ export function registerAgent(
     const managed = options.managed ? 1 : 0;
     const titleRef = options.terminal_title_ref ?? null;
     // Tether v0.3 PID-handshake: capture the PID chain (JSON) + machine GUID on
-    // first registration. host_id is set here ONLY — immutable thereafter.
+    // first registration. v2.11.0 GAP 1: host_id is also refreshable on a later
+    // authenticated re-register (see the UPDATE branch above) — no longer
+    // insert-only.
     const hostShellPidsJson =
       options.host_shell_pids !== undefined ? JSON.stringify(options.host_shell_pids) : null;
     const hostId = options.host_id ?? null;

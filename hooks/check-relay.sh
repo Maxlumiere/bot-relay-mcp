@@ -270,18 +270,41 @@ UUID=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "hook-$$-$(date 
 # is set in env AND an agent row already exists. Skip the register call — running it
 # would overwrite role/capabilities from this env, which may differ from what
 # the parent registered. Mail/task delivery below still proceeds normally.
+# v2.11.0 GAP 1: the skip is now LIVENESS-scoped (see the SKIP_REGISTER block
+# below) — it fires only for a fresh+live row (true spawn handoff), not for a
+# relaunch of an offline/stale row, so the Tether PID-handshake can refresh.
 # v2.1 Phase 4b.1 v2: also skip if we just completed a recovery above — the
 # register_agent over HTTP already wrote the row.
 SKIP_REGISTER=0
 if [ "$RECOVERY_COMPLETED" -eq 1 ]; then
   SKIP_REGISTER=1
 elif [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
-  EXISTS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+  # v2.11.0 GAP 1: only skip the re-register when the existing row is FRESH +
+  # LIVE — i.e. a session was claimed within the last 120s. That is the
+  # spawn-handoff / concurrent-terminal case Phase 4j was protecting (don't let
+  # this hook clobber a row the parent JUST pre-registered, and don't race a
+  # second concurrent terminal of the same name).
+  #
+  # When the row's session is OFFLINE (session_id NULL/empty) or STALE
+  # (last_seen > 120s), this is a genuine RELAUNCH: fall through and call
+  # register_agent so the Tether PID-handshake fields (host_shell_pids,
+  # host_id) refresh to THIS terminal's live process chain and session_id is
+  # repopulated. Without this, a long-lived persona-builder relaunch never
+  # re-sends its PID chain → Tether can't bind it → no autowake (the exact
+  # bug victra-build hit: pre-existing row + token → permanent skip → empty
+  # host_shell_pids). The re-register is auth-gated server-side (enforceAuth
+  # requires the row's own token) + collision-guarded (handler rejects a row
+  # that is genuinely live), so falling through is safe.
+  LIVENESS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
-SELECT 1 FROM agents WHERE name = :name LIMIT 1;
+SELECT CASE
+  WHEN session_id IS NOT NULL AND session_id != ''
+       AND (julianday('now') - julianday(last_seen)) * 86400 < 120
+  THEN 'LIVE' ELSE 'STALE' END
+FROM agents WHERE name = :name LIMIT 1;
 SQL
 )
-  if [ -n "$EXISTS" ]; then
+  if [ "$LIVENESS" = "LIVE" ]; then
     SKIP_REGISTER=1
   fi
 fi
