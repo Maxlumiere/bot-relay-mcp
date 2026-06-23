@@ -52,7 +52,7 @@ import {
 } from "./agent-manager.js";
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
-import { resolveAndWake, parseAgentBinding, type AgentPidBinding } from "./pid-binding.js";
+import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
 import { execFileSync } from "node:child_process";
 
@@ -297,6 +297,10 @@ let wakeGate: WakeGate | undefined;
 // NOT cached — a stale binding would wake the wrong terminal after a same-name
 // re-register.
 let localHostId: string | null = null;
+// v0.3.1 — the relay HTTP base URL (config.endpoint), captured at connect so the
+// PID-binding fetch can fall back to the auth-free GET /api/snapshot when the
+// token-gated discover_agents read returns no binding (Tether connects token-free).
+let relayEndpoint: string | null = null;
 const boundTerminals = new Map<string, vscode.Terminal>();
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
@@ -468,21 +472,41 @@ function toHostPlatform(p: NodeJS.Platform): HostPlatform | null {
   return p === "darwin" || p === "linux" || p === "win32" ? p : null;
 }
 
-/** Fetch the inbox-owner agent's PID binding via discover_agents — ALWAYS fresh.
- *  v0.3.0 R1 (codex P1): caching this would wake the wrong terminal after a
- *  same-name re-register, so there is no TTL cache. Unavailable → empty binding
- *  (the matcher then falls back to the name matcher). */
+/** Fetch the inbox-owner agent's PID binding — ALWAYS fresh (no TTL cache;
+ *  v0.3.0 R1: a cached binding would wake the wrong terminal after a same-name
+ *  re-register). Thin adapter: injects the real discover_agents (MCP) + the
+ *  auth-free /api/snapshot fetcher into the VSCode-free `resolveAgentBinding`
+ *  seam (pid-binding.ts). Tether connects token-free and the relay token-gates
+ *  discover_agents, so the snapshot fallback is what populates the binding — the
+ *  v0.3.0 T-ACC fix. Each fetcher returns parsed JSON or null; a failure degrades
+ *  cleanly to the empty binding (→ name matcher), never a throw or wrong wake. */
 async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
-  const empty: AgentPidBinding = { hostShellPids: null, hostId: null };
-  if (!mcpClient) return empty;
-  try {
-    const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
-    const text = extractToolText(res);
-    return text ? (parseAgentBinding(JSON.parse(text), agentName) ?? empty) : empty;
-  } catch (err) {
-    log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
-    return empty;
-  }
+  return resolveAgentBinding(agentName, {
+    discover: async () => {
+      if (!mcpClient) return null;
+      try {
+        const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
+        const text = extractToolText(res);
+        return text ? JSON.parse(text) : null;
+      } catch (err) {
+        log(`pid-binding: discover_agents failed — ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+    },
+    snapshot: async () => {
+      // The auth-free dashboard read; serves the same host_shell_pids/host_id
+      // (behind http_secret on remote binds, open on a loopback daemon — the
+      // same trust boundary as the MCP surface).
+      if (!relayEndpoint) return null;
+      try {
+        const res = await fetch(new URL("/api/snapshot", relayEndpoint), { method: "GET" });
+        return res.ok ? await res.json() : null;
+      } catch (err) {
+        log(`pid-binding: /api/snapshot fallback failed — ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+    },
+  });
 }
 
 /**
@@ -571,6 +595,7 @@ async function connect(config: TetherConfig): Promise<void> {
   resetErrorState();
 
   log(`connecting to ${config.endpoint}/mcp as agent="${config.agentName}"`);
+  relayEndpoint = config.endpoint; // for the /api/snapshot PID-binding fallback
   const url = new URL("/mcp", config.endpoint);
   // The SDK's StreamableHTTPClientTransport accepts request init for
   // header injection; the relay's HTTP transport reads X-Agent-Token
