@@ -9,7 +9,9 @@
  * DB-layer invariants (in-process):
  *   - additive round-trip: register host_shell_pids + host_id → discover surfaces them parsed
  *   - H3: re-register OVERWRITES host_shell_pids when re-reported; PRESERVES when omitted
- *   - host_id is IMMUTABLE after first registration
+ *   - v2.11.0 GAP 1: host_id REFRESHES on re-register when re-reported; PRESERVES when
+ *     omitted (was immutable pre-2.11.0) — and an initially-empty host_id can populate
+ *   - re-register rotates session_id (session-aware reads)
  *   - legacy rows (no handshake) surface null for both
  *   - malformed stored JSON surfaces as null (never throws — discover can't crash)
  *   - schema is at v16 with both columns present
@@ -91,11 +93,38 @@ describe("PID-handshake — DB layer (schema v16)", () => {
     expect(findAgent("a")?.host_shell_pids).toEqual([100, 200]);
   });
 
-  it("host_id is IMMUTABLE after first registration", () => {
+  it("v2.11.0 GAP 1: host_id REFRESHES when re-reported, PRESERVES when omitted", () => {
     registerAgent("a", "builder", [], { host_shell_pids: [1], host_id: "GUID-A" });
-    registerAgent("a", "builder", [], { host_shell_pids: [2], host_id: "GUID-B-attempt" });
-    expect(findAgent("a")?.host_id).toBe("GUID-A"); // unchanged
-    expect(findAgent("a")?.host_shell_pids).toEqual([2]); // pids still mutable
+    // Re-report a new host_id → overwrites (the owner declaring its current machine).
+    registerAgent("a", "builder", [], { host_shell_pids: [2], host_id: "GUID-B" });
+    expect(findAgent("a")?.host_id).toBe("GUID-B"); // refreshed, NOT pinned to GUID-A
+    expect(findAgent("a")?.host_shell_pids).toEqual([2]);
+    // Re-register WITHOUT host_id → preserves the stored value (don't wipe the binding).
+    registerAgent("a", "builder", [], { host_shell_pids: [3] });
+    expect(findAgent("a")?.host_id).toBe("GUID-B"); // preserved
+    expect(findAgent("a")?.host_shell_pids).toEqual([3]);
+  });
+
+  it("v2.11.0 GAP 1: re-register populates an initially-empty host_id (the victra-build case)", () => {
+    // Long-lived persona row first created WITHOUT a handshake → host_id null.
+    registerAgent("persona", "builder", []);
+    expect(findAgent("persona")?.host_id).toBeNull();
+    expect(findAgent("persona")?.host_shell_pids).toBeNull();
+    // A later relaunch reports the live chain + GUID → both populate. Pre-2.11.0
+    // host_id was immutable, so an empty host_id could NEVER be filled in.
+    registerAgent("persona", "builder", [], { host_shell_pids: [9, 8, 7], host_id: "GUID-NEW" });
+    expect(findAgent("persona")?.host_id).toBe("GUID-NEW");
+    expect(findAgent("persona")?.host_shell_pids).toEqual([9, 8, 7]);
+  });
+
+  it("re-register ROTATES session_id (session-aware reads see a fresh session)", () => {
+    registerAgent("s", "builder", [], { host_shell_pids: [1], host_id: "GUID-A" });
+    const first = findAgent("s")?.session_id;
+    expect(first).toBeTruthy();
+    registerAgent("s", "builder", [], { host_shell_pids: [2], host_id: "GUID-A" });
+    const second = findAgent("s")?.session_id;
+    expect(second).toBeTruthy();
+    expect(second).not.toBe(first); // rotated on re-register
   });
 
   it("malformed stored host_shell_pids JSON surfaces as null (parse never throws)", () => {
@@ -266,5 +295,41 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
     const disc = await callToolViaHttp(daemon.baseUrl, "discover_agents", {}, token);
     const binding = parseAgentBinding(JSON.parse(disc.resultText ?? "{}"), "pid-agent2");
     expect(binding?.hostShellPids).toEqual([333]); // overwritten, not [111,222,333]
+  }, 20_000);
+
+  it("v2.11.0 GAP 1: an AUTHENTICATED re-register refreshes host_id + host_shell_pids end-to-end", async () => {
+    // First register with an empty handshake (the long-lived persona shape:
+    // row exists, host_id null) and mint the owner's token.
+    const reg = await callToolViaHttp(daemon.baseUrl, "register_agent", {
+      name: "pid-agent3",
+      role: "builder",
+      capabilities: [],
+    });
+    expect(reg.ok).toBe(true);
+    const token = (JSON.parse(reg.resultText ?? "{}") as { agent_token?: string }).agent_token;
+    expect(token).toBeTruthy();
+
+    // The owner relaunches and re-reports a fresh chain + a NEW host_id. force=true
+    // bypasses the just-claimed active-session collision guard (same owner, not a
+    // concurrent terminal). Pre-2.11.0 host_id was immutable — this would have
+    // left host_id null forever.
+    const refresh = await callToolViaHttp(
+      daemon.baseUrl,
+      "register_agent",
+      {
+        name: "pid-agent3",
+        role: "builder",
+        capabilities: [],
+        host_shell_pids: [4242, 4200],
+        host_id: "HOST-REFRESHED",
+        force: true,
+      },
+      token,
+    );
+    expect(refresh.ok).toBe(true);
+
+    const disc = await callToolViaHttp(daemon.baseUrl, "discover_agents", {}, token);
+    const binding = parseAgentBinding(JSON.parse(disc.resultText ?? "{}"), "pid-agent3");
+    expect(binding).toEqual({ hostShellPids: [4242, 4200], hostId: "HOST-REFRESHED" });
   }, 20_000);
 });
