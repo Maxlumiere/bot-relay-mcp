@@ -93,6 +93,44 @@ export function parseAgentBinding(discoverResult: unknown, agentName: string): A
 }
 
 /**
+ * v0.3.2 — resolve an agent's PID binding with the discover → snapshot SEAM.
+ *
+ * PRIMARY: discover_agents over the MCP client. FALLBACK: the auth-free
+ * GET /api/snapshot. Tether connects TOKEN-FREE and the relay token-gates
+ * discover_agents (it doubles as a token-validity probe), so for Tether the
+ * primary read returns no binding (AUTH_FAILED → no `agents` array → null) and
+ * the snapshot — which serves the same host_shell_pids/host_id — populates it.
+ * That empty-binding-on-token-free-discover was the real v0.3.0 T-ACC failure.
+ *
+ * VSCode-free + injectable so the SEAM (not just the parse) is unit-tested; the
+ * extension supplies the impure fetchers. Each fetcher returns parsed JSON or
+ * null (unavailable / failed / non-200); parseAgentBinding tolerates either
+ * source's `{agents:[…]}` shape and junk, so a fetch failure degrades cleanly to
+ * the empty binding (→ the name matcher downstream), never a throw or wrong wake.
+ */
+export interface BindingFetchDeps {
+  /** discover_agents result as parsed JSON, or null when unavailable/failed. */
+  discover(): Promise<unknown | null>;
+  /** GET /api/snapshot result as parsed JSON, or null when unreachable/non-200. */
+  snapshot(): Promise<unknown | null>;
+}
+
+export async function resolveAgentBinding(
+  agentName: string,
+  deps: BindingFetchDeps,
+): Promise<AgentPidBinding> {
+  const empty: AgentPidBinding = { hostShellPids: null, hostId: null };
+  const discovered = await deps.discover();
+  const fromDiscover = discovered ? parseAgentBinding(discovered, agentName) : null;
+  if (fromDiscover) return fromDiscover; // agent listed via the live MCP roster
+  // discover_agents unavailable / AUTH_FAILED (token-free Tether) / agent not
+  // listed → fall back to the auth-free snapshot (the load-bearing v0.3.2 seam).
+  const snap = await deps.snapshot();
+  const fromSnapshot = snap ? parseAgentBinding(snap, agentName) : null;
+  return fromSnapshot ?? empty;
+}
+
+/**
  * Resolve the wake target: PID-primary (host-scoped) then the v0.2.2 name
  * matcher. The name fallback keeps every pre-handshake case working (agents that
  * haven't reported PIDs, or before discover_agents has the binding).
@@ -151,6 +189,18 @@ export async function resolveAndWake<T>(agentName: string, deps: WakeDeps<T>): P
   // Full resolve: await each open terminal's processId once, THEN decide.
   const wrappers = await Promise.all(
     open.map(async (t) => ({ t, name: deps.nameOf(t), processId: await deps.processIdOf(t) })),
+  );
+  // v0.3.1 instrumentation — ONE diagnostic line per wake: the binding the
+  // extension actually resolved (post-fetch + post-parse) plus every terminal's
+  // resolved processId. This is the observability the v0.3.0 T-ACC lacked — it
+  // is exactly what surfaced the real bug (binding arriving EMPTY because the
+  // token-free discover_agents read was AUTH_FAILED). A bind miss is now
+  // debuggable straight from the Output channel, no special build.
+  deps.log(
+    `pid-binding: resolve agent="${agentName}" localHostId=${deps.localHostId ?? "∅"} ` +
+      `binding.hostId=${binding.hostId ?? "∅"} ` +
+      `binding.hostShellPids=${binding.hostShellPids ? `[${binding.hostShellPids.join(",")}]` : "∅"} ` +
+      `terminals=${JSON.stringify(wrappers.map((w) => ({ name: w.name, pid: w.processId ?? null })))}`,
   );
   const decision = resolveWakeTargetByPid(agentName, binding, deps.localHostId, wrappers);
   switch (decision.kind) {

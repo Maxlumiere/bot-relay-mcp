@@ -4,6 +4,19 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.3.2] — 2026-06-18 — Zero-config wake, fixed: read the agent's PID binding without a token
+
+The zero-config wake from 0.3.0 didn't fire on a real machine: Tether saw the mail and knew which agent, but matched **0 terminals** and never typed `inbox`. The cause turned out not to be the matcher at all — Tether couldn't read the agent's process binding in the first place.
+
+### Fixed
+
+- **PID auto-bind never fired because the binding came back empty.** To wake the right terminal, Tether reads the agent's process chain from the relay. It did that via `discover_agents`, which the relay requires a token for — but Tether connects **token-free** (there's no token to configure, by design), so the read failed and the binding was empty: no process ids to match, no wake. Tether now falls back to the relay's **auth-free `/api/snapshot`** (the same endpoint the dashboard uses, which already carries the data) whenever the token-gated read returns nothing. The wake now fires with zero configuration, exactly as intended.
+- **Removed the experimental process-tree match.** A 0.3.1 internal build tried to also match a terminal whose process id was an *ancestor* of the agent's chain. Because the chain includes process ids **shared by every terminal in the window** (the editor and its terminal host), that could match — and wake — the *wrong* agent's terminal. It's removed: matching is back to the agent's own process ids (exact), which is what actually fires once the binding is read correctly. The wake decision stays host-scoped (an equal process id on a different machine never matches) with the terminal-name match as the final fallback.
+
+### Added
+
+- **A diagnostic line on every wake** in the *Tether for bot-relay-mcp* Output channel: the agent binding Tether resolved (`host_shell_pids` + `host_id`) and each open terminal's resolved process id. If a wake ever doesn't land, this line shows why — it's what surfaced this very bug.
+
 ## [0.3.0] — 2026-06-17 — Zero-config wake: Tether finds your agent's terminal by process id
 
 Tether now binds a terminal to an agent by **process identity** — no terminal naming, no rename, no convention to remember. Start your agent however you like (a shell alias, a plain `claude --name …`, anything); when mail arrives, Tether wakes the terminal that's actually running that agent. This is the foundation for running several agents, each in its own terminal, with nothing to configure.

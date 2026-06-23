@@ -11,6 +11,7 @@ import {
   resolveWakeTargetByPid,
   isHostScopedMember,
   parseAgentBinding,
+  resolveAgentBinding,
   resolveAndWake,
   type PidNamedTerminal,
   type AgentPidBinding,
@@ -257,5 +258,137 @@ describe("resolveAndWake — fresh binding, self-invalidating bound cache (R1)",
     await resolveAndWake(AGENT, h.deps);
     expect(h.woken).toEqual([]);
     expect(h.hints).toHaveLength(1);
+  });
+});
+
+// --- v0.3.1 regressions. Matching is EXACT-pid only (the experimental
+// ancestor/descendant tree-match was removed): the agent's chain includes the
+// SHARED IDE ancestors every terminal in the window has (the editor + its
+// terminal host), so a tree-walk would cross-wake a sibling terminal. Exact
+// matching never touches those shared nodes. Models the maintainer's real host:
+//   Code(55447) → ptyHost(55465) → zsh(62903) → claude(63006) → hook(63025)
+const HOST_CHAIN: AgentPidBinding = { hostShellPids: [63025, 63006, 62903, 55465, 55447], hostId: "HOST-A" };
+
+describe("no cross-wake on shared IDE ancestors (exact-pid match)", () => {
+  it("★ a SIBLING terminal (own shell ∉ chain, shares only ptyHost/Code) is NOT matched", () => {
+    // own's shell 62903 ∈ chain; sibling's shell 80000 ∉ chain — it only shares
+    // the high IDE ancestors 55465/55447, which exact matching never inspects.
+    const own = t("zsh", 62903);
+    const sibling = t("zsh", 80000);
+    const d = resolveWakeTargetByPid("tacc", HOST_CHAIN, "HOST-A", [own, sibling]);
+    expect(d.kind).toBe("inject");
+    if (d.kind === "inject") expect(d.terminal).toBe(own);
+  });
+
+  it("★ two sibling terminals + no owner → no PID match, no false ambiguity", () => {
+    // Neither 80000 nor 90000 is in the chain (they only share IDE ancestors).
+    // Exact matching selects nothing → name fallback → no-match (NOT ambiguous).
+    const d = resolveWakeTargetByPid("tacc", HOST_CHAIN, "HOST-A", [t("zsh", 80000), t("zsh", 90000)]);
+    expect(d.kind).toBe("no-match");
+  });
+
+  it("★ cached sibling (pid ∉ fresh chain) is NOT woken — re-resolves to the exact owner", async () => {
+    const sibling: FT = { name: "zsh", pid: 80000 }; // shares IDE ancestors only
+    const own: FT = { name: "zsh", pid: 62903 }; // ∈ chain
+    const h = harness({
+      binding: HOST_CHAIN,
+      localHostId: "HOST-A",
+      open: [sibling, own],
+      cached: sibling, // a stale/wrong cache pointing at the sibling
+    });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([own]); // cache re-validation fails for the sibling → exact owner wins
+    expect(h.cache.get(AGENT)).toBe(own);
+  });
+});
+
+describe("parseAgentBinding tolerates the /api/snapshot shape (token-free fallback)", () => {
+  it("reads host_shell_pids/host_id from a snapshot payload (extra per-agent fields ignored)", () => {
+    // GET /api/snapshot returns the same {agents:[…]} roster with extra fields
+    // (pending_count, status, …). parseAgentBinding must read the binding
+    // identically so the auth-free fallback populates it when token-gated
+    // discover_agents returns nothing.
+    const snapshot = {
+      agents: [
+        {
+          name: "tacc",
+          role: "user",
+          status: "online",
+          pending_count: 2,
+          unread_count: 1,
+          host_shell_pids: [63025, 63006, 62903],
+          host_id: "HOST-A",
+        },
+      ],
+      messages: [],
+      active_tasks: [],
+    };
+    expect(parseAgentBinding(snapshot, "tacc")).toEqual({
+      hostShellPids: [63025, 63006, 62903],
+      hostId: "HOST-A",
+    });
+  });
+});
+
+// --- v0.3.2 the discover → /api/snapshot fallback SEAM (codex re-audit). The
+// static parse above isn't enough: assert the WIRING — discover fails (token-free
+// Tether → AUTH_FAILED) → snapshot populates the binding → that binding drives a
+// real wake to the EXACT owner. Must FAIL if the snapshot fallback is removed.
+describe("resolveAgentBinding — discover → /api/snapshot fallback SEAM (v0.3.2)", () => {
+  // The live /api/snapshot payload shape: roster + extra per-agent/global fields.
+  const SNAPSHOT = {
+    agents: [
+      {
+        name: "tacc",
+        role: "user",
+        status: "online",
+        pending_count: 1,
+        host_shell_pids: [63025, 63006, 62903],
+        host_id: "HOST-A",
+      },
+    ],
+    messages: [],
+    active_tasks: [],
+  };
+  const OWNER: FT = { name: "zsh", pid: 62903 }; // shell ∈ chain; name never matches "tacc"
+
+  it("★ FULL SEAM: token-free/FAILED discover → snapshot populates binding → EXACT owner wakes", async () => {
+    const binding = await resolveAgentBinding("tacc", {
+      // discover_agents returns AUTH_FAILED (no `agents` array) — the token-free
+      // Tether case — so resolution MUST fall through to the snapshot.
+      discover: async () => ({ success: false, error_code: "AUTH_FAILED" }),
+      snapshot: async () => SNAPSHOT,
+    });
+    // (a) the seam produced the binding from the snapshot …
+    expect(binding).toEqual({ hostShellPids: [63025, 63006, 62903], hostId: "HOST-A" });
+    // (b) … and that binding drives a real wake to the EXACT owner terminal.
+    const h = harness({ binding, localHostId: "HOST-A", open: [OWNER, { name: "codex", pid: 40000 }] });
+    await resolveAndWake(AGENT, h.deps);
+    // Delete the snapshot fallback → empty binding → name miss → woken=[] → this FAILS.
+    expect(h.woken).toEqual([OWNER]);
+  });
+
+  it("discover succeeds → binding from the roster; the snapshot is NOT consulted", async () => {
+    let snapshotCalls = 0;
+    const binding = await resolveAgentBinding("tacc", {
+      discover: async () => SNAPSHOT, // roster shape parses for discover too
+      snapshot: async () => {
+        snapshotCalls += 1;
+        return null;
+      },
+    });
+    expect(binding.hostShellPids).toEqual([63025, 63006, 62903]);
+    expect(snapshotCalls).toBe(0); // primary path settled it — no wasted fetch
+  });
+
+  it("non-200 snapshot (fetcher → null) → empty binding → name fallback, no crash, no wrong-wake", async () => {
+    const binding = await resolveAgentBinding("tacc", {
+      discover: async () => null, // discover unavailable / failed
+      snapshot: async () => null, // /api/snapshot non-200 → fetcher returns null
+    });
+    expect(binding).toEqual({ hostShellPids: null, hostId: null });
+    const h = harness({ binding, localHostId: "HOST-A", open: [OWNER] });
+    await resolveAndWake(AGENT, h.deps);
+    expect(h.woken).toEqual([]); // no PID binding + name "zsh" ≠ agent → no wake (not a wrong wake)
   });
 });
