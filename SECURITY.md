@@ -1,7 +1,7 @@
 # Security Policy
 
 **Project:** bot-relay-mcp
-**Last updated:** 2026-04-21 (v2.1.7)
+**Last updated:** 2026-06-23 (covers through v2.11.0)
 
 ---
 
@@ -77,7 +77,7 @@ bot-relay-mcp assumes **a single trust boundary**: the operator who owns the mac
 It is NOT designed to be safe against:
 
 - Host-level compromise (any actor with root on the machine can read the keyring, the DB, and the process memory).
-- Multi-tenant relays — a single daemon serves one operator's agents. Federation (v2.5) will introduce a different trust model.
+- Multi-tenant relays — a single daemon serves one operator's agents. Federation (v2.3) will introduce a different trust model.
 - Cross-machine agent relays — the current HTTP mode is loopback-first. Exposing the relay on the public internet is possible but requires the operator to set `RELAY_HTTP_SECRET` + `RELAY_DASHBOARD_SECRET` + `RELAY_TRUSTED_PROXIES` correctly.
 
 ---
@@ -235,7 +235,7 @@ Trust-model consequences you must accept before deploying a centralized hub:
 
 - **Host-level compromise.** An actor with root on the machine can read the keyring file, the DB, the process memory (plaintext tokens during verify), and `/tmp` spawn scripts. Move to a different trust boundary (different host, container, KMS) if this matters to you.
 - **Pre-v1.7 agents migrating without operator action.** Phase 2b auto-migrates on plain `register_agent` — if the operator never calls register, legacy rows stay at `legacy_bootstrap` indefinitely. Set `RELAY_ALLOW_LEGACY=1` if you need dispatch-time grace; disable once migration finishes.
-- **Multi-tenancy.** A single relay serves one operator's agents. Concurrent operators sharing the same DB will see each other's traffic, register conflicting agent names, and audit each other. Federation is v2.5's concern.
+- **Multi-tenancy.** A single relay serves one operator's agents. Concurrent operators sharing the same DB will see each other's traffic, register conflicting agent names, and audit each other. Federation is v2.3's concern.
 - **Side-channel timing attacks.** bcrypt-verify uses a constant-time comparison (`bcrypt.compareSync`) internally, but other code paths (e.g. audit log lookups by agent_name) may be timing-observable. Not in scope for v2.1.
 - **Covert channels through messages.** Messages are stored in plaintext by default. Encryption at rest protects the DB file, not in-transit traffic between two browser tabs sharing the same relay.
 
