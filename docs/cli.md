@@ -131,4 +131,3 @@ Prints the subcommand list. `relay <sub> --help` prints per-subcommand help.
 - `src/cli/*` — per-subcommand implementations
 - `bin/relay` — unified entry point (dispatcher)
 - `tests/v2-1-cli-tooling.test.ts` — 12 integration tests
-- `devlog/046-v2.1-unified-cli.md` — design decisions

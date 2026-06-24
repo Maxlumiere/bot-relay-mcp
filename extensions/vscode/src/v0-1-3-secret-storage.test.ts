@@ -6,8 +6,8 @@
  * v0.1.3 [HIGH F10] unit tests — SecretStorage migration decision logic
  * + new agent-token precedence in resolveTetherConfig.
  *
- * Hermes deep-review (synthesized in review-Victra msg `2b903f9b`)
- * flagged v0.1.2 stored the agent token in plaintext `settings.json`
+ * An external security review flagged that v0.1.2 stored the agent token in
+ * plaintext `settings.json`
  * via `workspace.getConfiguration("bot-relay.tether").get("agentToken")`.
  * v0.1.3 switches to VSCode SecretStorage (OS keychain on macOS,
  * Credential Vault on Windows, libsecret on Linux) and auto-migrates
@@ -127,7 +127,7 @@ describe("v0.1.3 — resolveTetherConfig agentToken precedence (SecretStorage > 
 // --- v0.1.3 R1: SecretStorage failure path MUST NOT re-promote legacy plaintext ---
 
 /**
- * Codex audit (msg 561cf7c9) caught that pre-R1 the SecretStorage
+ * A Codex audit caught that pre-R1 the SecretStorage
  * failure path in extension.ts:readConfig set `secretToken = undefined`
  * and let resolveAgentToken fall through to legacy plaintext config.
  * On Linux-without-libsecret that re-opens the exact leak v0.1.3 was
@@ -138,10 +138,10 @@ describe("v0.1.3 — resolveTetherConfig agentToken precedence (SecretStorage > 
  * `resolveTetherConfig`). When `secretsAvailable === false`, the
  * legacy plaintext fallback is SKIPPED — env-only or empty.
  *
- * Per `feedback_test_path_must_match_shipped_path.md`, these tests
+ * Test path matches the shipped path: these tests
  * import the EXPORTED `resolveAgentToken` (newly exported in R1)
- * rather than re-implementing the precedence logic. Per
- * `feedback_test_asserts_contract_not_proxy.md`, every assertion
+ * rather than re-implementing the precedence logic. Tests assert the
+ * exact contract, not a proxy: every assertion
  * uses exact-string `toBe`, not `.not.toContain`.
  */
 describe("v0.1.3 R1 [P2 codex] — resolveAgentToken refuses legacy plaintext when SecretStorage unreachable", () => {

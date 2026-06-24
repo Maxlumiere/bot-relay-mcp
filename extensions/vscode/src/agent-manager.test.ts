@@ -6,8 +6,8 @@
  * v0.2 — AgentManager unit tests.
  *
  * Uses a fake TerminalApi + manual Scheduler (no real timers) so
- * tests are deterministic and don't sleep. Per
- * `feedback_test_asserts_contract_not_proxy.md`: assertions pin
+ * tests are deterministic and don't sleep. Tests assert the
+ * exact contract, not a proxy: assertions pin
  * exact env values, exact terminal options, exact UI message text.
  */
 import { describe, it, expect, beforeEach } from "vitest";
@@ -134,7 +134,7 @@ class ManualScheduler implements Scheduler {
 }
 
 const SPEC = {
-  name: "victra-build",
+  name: "build-agent",
   role: "builder",
   capabilities: ["build", "test", "deploy"],
 };
@@ -150,7 +150,7 @@ class FakeClock {
 describe("AgentManager — pure helpers", () => {
   it("(A1) buildSpawnEnv populates RELAY_AGENT_NAME/ROLE/CAPABILITIES (joined with comma)", () => {
     const env = buildSpawnEnv(SPEC, { PATH: "/usr/bin", FOO: "bar" });
-    expect(env.RELAY_AGENT_NAME).toBe("victra-build");
+    expect(env.RELAY_AGENT_NAME).toBe("build-agent");
     expect(env.RELAY_AGENT_ROLE).toBe("builder");
     expect(env.RELAY_AGENT_CAPABILITIES).toBe("build,test,deploy");
     // Inherited env preserved.
@@ -181,9 +181,11 @@ describe("AgentManager — pure helpers", () => {
     expect(buildShellCommand(SPEC)).toBe("claude");
   });
 
-  it("(A6) buildShellCommand honors known alternates (codex / codex-5-5)", () => {
+  it("(A6) buildShellCommand honors a known alternate binary in the allowlist", () => {
+    // Contract: any allowlisted non-default binary is passed through verbatim.
+    // `codex` is the allowlisted alternate; the binary mechanism — not any
+    // specific instance name — is what's under test.
     expect(buildShellCommand({ ...SPEC, agentBinary: "codex" })).toBe("codex");
-    expect(buildShellCommand({ ...SPEC, agentBinary: "codex-5-5" })).toBe("codex-5-5");
   });
 
   it("(A7) buildShellCommand rejects out-of-allowlist binaries", () => {
@@ -221,8 +223,8 @@ describe("AgentManager — spawn / kill / restart lifecycle", () => {
     mgr.spawn(SPEC);
     expect(api.terminals).toHaveLength(1);
     const t = api.terminals[0]!;
-    expect(t.options.name).toBe("Tether: victra-build");
-    expect(t.options.env.RELAY_AGENT_NAME).toBe("victra-build");
+    expect(t.options.name).toBe("Tether: build-agent");
+    expect(t.options.env.RELAY_AGENT_NAME).toBe("build-agent");
     expect(t.options.env.RELAY_AGENT_ROLE).toBe("builder");
     expect(t.options.env.RELAY_AGENT_CAPABILITIES).toBe("build,test,deploy");
     expect(t.sendTextCalls).toEqual([{ text: "claude", addNewLine: true }]);
@@ -240,7 +242,7 @@ describe("AgentManager — spawn / kill / restart lifecycle", () => {
     mgr.spawn(SPEC);
     mgr.spawn({ ...SPEC, name: "different-name" });
     expect(api.terminals).toHaveLength(1);
-    expect(api.terminals[0]!.options.env.RELAY_AGENT_NAME).toBe("victra-build");
+    expect(api.terminals[0]!.options.env.RELAY_AGENT_NAME).toBe("build-agent");
   });
 
   it("(A11) kill() disposes the terminal and transitions to idle", () => {
@@ -263,7 +265,7 @@ describe("AgentManager — spawn / kill / restart lifecycle", () => {
     mgr.spawn(SPEC);
     mgr.restart();
     expect(api.terminals).toHaveLength(2);
-    expect(api.terminals[1]!.options.env.RELAY_AGENT_NAME).toBe("victra-build");
+    expect(api.terminals[1]!.options.env.RELAY_AGENT_NAME).toBe("build-agent");
     expect(api.terminals[0]!.disposed).toBe(true);
   });
 
@@ -306,7 +308,7 @@ describe("AgentManager — crash detection + auto-restart", () => {
     // Fire the restart timer; new terminal materializes.
     scheduler.flushNext();
     expect(api.terminals).toHaveLength(2);
-    expect(api.terminals[1]!.options.env.RELAY_AGENT_NAME).toBe("victra-build");
+    expect(api.terminals[1]!.options.env.RELAY_AGENT_NAME).toBe("build-agent");
   });
 
   it("(A16) backoff curve advances on consecutive crashes (1s → 2s → 4s)", () => {

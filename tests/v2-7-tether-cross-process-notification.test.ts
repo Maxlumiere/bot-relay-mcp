@@ -40,7 +40,7 @@
  * Test path matches shipped path: real `node dist/index.js` subprocess
  * for the daemon, real `StreamableHTTPClientTransport`, real
  * `better-sqlite3` direct writes from the child to mimic a stdio
- * process. Per memory/feedback_test_path_must_match_shipped_path.md.
+ * process — the test exercises the real shipped path.
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";

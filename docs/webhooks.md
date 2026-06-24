@@ -98,4 +98,3 @@ The relay re-resolves your webhook hostname on every fire (initial + retry) and 
 - `src/webhooks.ts` — fire path, DNS re-check, delivery_id generation
 - `src/url-safety.ts` — the SSRF / DNS-rebinding validator
 - `tests/v2-1-webhook-hardening.test.ts` — 10 integration tests
-- `devlog/040-v2.1-webhook-hardening.md` — design decisions

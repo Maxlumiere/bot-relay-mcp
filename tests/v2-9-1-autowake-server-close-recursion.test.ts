@@ -7,7 +7,7 @@
  * v2.9.1 — autowake server-side transport.close() recursion regression
  * guard.
  *
- * Origin: Maxime's live VS Code repro (2026-06-10) — Tether 0.2.0
+ * Origin: a live VS Code repro (2026-06-10) — Tether 0.2.0
  * connecting to a v2.9.0 HTTP daemon on 127.0.0.1:3777 crashed the
  * daemon with `RangeError: Maximum call stack size exceeded` repeating
  * ~530 times in unhandled-promise-rejection logs at the SDK's
@@ -49,7 +49,7 @@
  * RangeError / "Maximum call stack" / unhandled-rejection lines in
  * daemon stderr. If anyone re-introduces `server.close()` from
  * `transport.onclose` (or any other recursive close path), this test
- * fails loudly with the exact stack trace Maxime saw.
+ * fails loudly with the exact stack trace from the repro.
  */
 
 import { describe, it, expect } from "vitest";
@@ -121,7 +121,7 @@ describe("v2.9.1 — autowake server-side transport.close() recursion regression
       // reconnectionOptions, same URL, same auth-token header injection
       // pattern. The point isn't to test Tether code; it's to exercise
       // the SAME server-side connect/subscribe/close lifecycle that
-      // crashed the daemon in Maxime's 2026-06-10 live repro.
+      // crashed the daemon in the 2026-06-10 live repro.
       const transport = new StreamableHTTPClientTransport(
         new URL(`http://127.0.0.1:${PORT}/mcp`),
         {
@@ -194,7 +194,7 @@ describe("v2.9.1 — autowake server-side transport.close() recursion regression
 
       // The critical assertions — all about daemon stderr cleanliness.
       // If the recursion fires, stderr fills with hundreds of
-      // RangeError stack traces (Maxime saw ~530 lines).
+      // RangeError stack traces (~530 lines in the repro).
       expect(
         stderrBuf,
         `daemon stderr contains RangeError (server-side transport.close recursion regressed). ` +

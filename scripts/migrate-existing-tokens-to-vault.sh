@@ -9,7 +9,7 @@
 # can remove the env line from their shell config.
 #
 # Usage:
-#   RELAY_AGENT_NAME=victra RELAY_AGENT_TOKEN=<token> ./scripts/migrate-existing-tokens-to-vault.sh
+#   RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=<token> ./scripts/migrate-existing-tokens-to-vault.sh
 #   (or run from a shell where both env vars are already set)
 #
 # Cross-platform: pure bash + standard POSIX utilities. Runs unmodified on
@@ -25,7 +25,7 @@ TOKEN="${RELAY_AGENT_TOKEN:-}"
 if [ -z "$NAME" ] || [ -z "$TOKEN" ]; then
   echo "[migrate] RELAY_AGENT_NAME and RELAY_AGENT_TOKEN must both be set in env." >&2
   echo "[migrate] Example:" >&2
-  echo "[migrate]   RELAY_AGENT_NAME=victra RELAY_AGENT_TOKEN=... $0" >&2
+  echo "[migrate]   RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=... $0" >&2
   exit 1
 fi
 

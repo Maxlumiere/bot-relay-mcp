@@ -181,10 +181,10 @@ Tether is the bot-relay-mcp VS Code extension. It spawns the agent process in a 
    {
      "agents": [
        {
-         "agentName": "victra-build",
+         "agentName": "builder",
          "role": "builder",
          "capabilities": ["build", "tasks"],
-         "spawnCommand": "claude --name victra-build --permission-mode bypassPermissions --effort high",
+         "spawnCommand": "claude --name builder --permission-mode bypassPermissions --effort high",
          "autoInjectInbox": true,
          "notificationLevel": "event"
        }
@@ -246,7 +246,7 @@ P3 measurement (this release) replaces these estimates with measured numbers —
 1. The LLM session calls `peek_inbox_version({agent_name})` — one cheap DB read on the relay side, one MCP envelope on the wire.
 2. The LLM compares the response (`total_unread_count`, `epoch`) against the previous tick's snapshot.
 3. If `total_unread_count === 0` AND `epoch` unchanged → call `ScheduleWakeup` and exit the turn. Zero further LLM work.
-4. If `total_unread_count > 0` OR `epoch` changed → call `get_messages` to drain, process the messages, ship-pong as required, then re-enter the loop on the next ScheduleWakeup fire.
+4. If `total_unread_count > 0` OR `epoch` changed → call `get_messages` to drain, process the messages, report completion as required, then re-enter the loop on the next ScheduleWakeup fire.
 
 ### Failure modes + recovery
 
@@ -259,7 +259,7 @@ P3 measurement (this release) replaces these estimates with measured numbers —
 
 ## Stretch paths
 
-These are documented for completeness; they're NOT the v2.9.0 default. Track them as P4/P5 in `audit-findings/v2.9.0-ambient-wake-spec.md`.
+These are documented for completeness; they're NOT the v2.9.0 default. They are tracked as P4/P5 stretch items in the ambient-wake design.
 
 - **(B) `fs.watch` + AppleScript inject (P4).** A sidecar script that watches `~/.bot-relay/marker/<agent>.touch` (the filesystem marker enabled via `RELAY_FILESYSTEM_MARKERS=1`) and uses `osascript` to inject `inbox\n` into the named terminal. Push-based, near-zero latency. Worth building if a critical operator can't use Tether and won't accept `/loop` cadence.
 
@@ -267,15 +267,15 @@ These are documented for completeness; they're NOT the v2.9.0 default. Track the
 
 ## Recommended next (separate arc — NOT in v2.9.0)
 
-Flip Tether's `autoInjectInbox` default from `false` to `true`. The current opt-in is conservative; once v2.9.0 ambient-wake is the proven, documented pattern, opt-out makes more sense for new installs. This is a behavior change to a shipped extension + a separate Tether minor bump; Maxime decides the flip after a real-world burn-in period of v2.9.0.
+Flip Tether's `autoInjectInbox` default from `false` to `true`. The current opt-in is conservative; once v2.9.0 ambient-wake is the proven, documented pattern, opt-out makes more sense for new installs. This is a behavior change to a shipped extension + a separate Tether minor bump; the maintainer decides the flip after a real-world burn-in period of v2.9.0.
 
 ## Measured token costs
 
 > P3 measurement (this release).
 
-### Per-tick `peek_inbox_version` cost (measured on victra-build, 2026-06-08)
+### Per-tick `peek_inbox_version` cost (measured on builder, 2026-06-08)
 
-Method: actual `peek_inbox_version({agent_name: "victra-build"})` call against the live local daemon. The response captured during the P3 measurement window:
+Method: actual `peek_inbox_version({agent_name: "builder"})` call against the live local daemon. The response captured during the P3 measurement window:
 
 ```jsonc
 {
@@ -292,7 +292,7 @@ Observations:
 
 - **Response payload: 205 bytes JSON.** Six fields, all small. Identical shape every tick — the only mutating field for the wake signal is `total_unread_count` (here `1` because a fresh dispatch landed mid-measurement, validating the field semantics).
 - **`mailbox_id` is an opaque UUID** (`842e5975-...`), distinct from the agent name — confirms the runtime invariant codex flagged in spec R2 audit `4151ee2b`.
-- **`epoch` is stable across the entire victra-build session** (`79d209f3-...` matches every prior peek in this session). Will only rotate on `relay backup` / `relay restore` / explicit `rotateMailboxEpoch` calls. Drift-detection works as documented.
+- **`epoch` is stable across the entire builder session** (`79d209f3-...` matches every prior peek in this session). Will only rotate on `relay backup` / `relay restore` / explicit `rotateMailboxEpoch` calls. Drift-detection works as documented.
 - **LLM-side cost per tick (no-new-mail path):** ~1.0-1.5k tokens. This is the per-call overhead of the tool-use envelope (MCP request, response parse, no-op branch) measured against the actual `peek_inbox_version` traffic this session — not extrapolated.
 
 Per-hour idle costs extrapolated from the measured single-tick cost:
@@ -303,19 +303,19 @@ Per-hour idle costs extrapolated from the measured single-tick cost:
 | 270s (under cache TTL) | ~13 | **~13-20k** |
 | 1800s (cache-miss tier) | 2 | **~2-3k** |
 
-These replace the §4.2 spec estimates. They are *single-session-measured* from victra-build's perspective — the LLM-side numbers come from observing this session's own behavior, not from a separate benchmarking rig. The 270s and 1800s rows extrapolate the single-tick cost linearly without accounting for prompt-cache amortization, which would *reduce* the 270s number further in practice (the cache stays warm under the 5-minute TTL boundary, so per-tick reasoning cost drops below the first-tick cost).
+These replace the §4.2 spec estimates. They are *single-session-measured* from builder's perspective — the LLM-side numbers come from observing this session's own behavior, not from a separate benchmarking rig. The 270s and 1800s rows extrapolate the single-tick cost linearly without accounting for prompt-cache amortization, which would *reduce* the 270s number further in practice (the cache stays warm under the 5-minute TTL boundary, so per-tick reasoning cost drops below the first-tick cost).
 
 ### Cross-terminal smoke — pending operator validation
 
-Methodology produced; execution requires a second terminal Maxime runs:
+Methodology produced; execution requires a second terminal the operator runs:
 
-1. Spawn victra-build in an iTerm2 window (path β). Run `/loop` with the template from `roles/auto-poll-loop-template.md`, cadence 270s.
-2. Spawn another agent (e.g., victra-test) in a separate iTerm2 window.
-3. From victra-test, `send_message` to victra-build with priority `normal`.
-4. Verify: victra-build's loop wakes within the next ScheduleWakeup tick (≤ 270s), drains the message, and ship-pongs back.
-5. Verify: while victra-build is idle (no incoming mail), inspect the per-hour token cost over a 1-hour window. Compare against the solo-measured estimates above.
+1. Spawn the builder agent in an iTerm2 window (path β). Run `/loop` with the template from `roles/auto-poll-loop-template.md`, cadence 270s.
+2. Spawn another agent (e.g., a test agent) in a separate iTerm2 window.
+3. From the test agent, `send_message` to the builder with priority `normal`.
+4. Verify: the builder's loop wakes within the next ScheduleWakeup tick (≤ 270s), drains the message, and reports back.
+5. Verify: while the builder is idle (no incoming mail), inspect the per-hour token cost over a 1-hour window. Compare against the solo-measured estimates above.
 
-The cross-terminal smoke is operator-execution territory — victra-build (this session, the spec author) is one of the two terminals and can't simultaneously be the second one. Surface to Maxime in the v2.9.0 release ship-pong; he can run the smoke and report measured cross-terminal numbers before the npm publish step.
+The cross-terminal smoke is operator-execution territory — the spec-authoring session is one of the two terminals and can't simultaneously be the second one. Surface it in the v2.9.0 release notes; the operator can run the smoke and report measured cross-terminal numbers before the npm publish step.
 
 ### Tether α — no measurement needed
 
@@ -323,7 +323,7 @@ Path α is push-based, zero idle cost. The event cost is `1 get_messages + 1 LLM
 
 ## Decision-gating (operator discipline)
 
-The wake harness above closes the loop on agents waking themselves. The other half is keeping the chain agent → victra → agent automatic, surfacing to Maxime ONLY at decision gates:
+The wake harness above closes the loop on agents waking themselves. The other half is keeping the chain agent → orchestrator → agent automatic, surfacing to the operator ONLY at decision gates:
 
 - Strategic forks (which option do we pick?)
 - Merge ready
@@ -331,11 +331,10 @@ The wake harness above closes the loop on agents waking themselves. The other ha
 - Destructive operation (force-push, rm -rf, drop schema)
 - Out-of-scope / scope expansion
 
-Everything else (routine acks, ship-pongs, codex audit dispatches) flows automatically. This is operator discipline, not a product feature — chief-of-staff agents (like victra) should encode it in their prompt and respect it when chaining work.
+Everything else (routine acks, completion reports, audit dispatches) flows automatically. This is operator discipline, not a product feature — orchestrator agents should encode it in their prompt and respect it when chaining work.
 
 ## See also
 
-- `audit-findings/v2.9.0-ambient-wake-spec.md` — the design spec this doc implements.
 - `roles/auto-poll-loop-template.md` — the canonical `/loop` recipe for path β.
 - `src/tools/peek-inbox-version.ts` + `src/db.ts:2975-3055` — the Phase 4s primitives.
 - `extensions/vscode/src/extension.ts` — the Tether wake-loop source.

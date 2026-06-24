@@ -2,7 +2,7 @@
 
 ## v2.11.0 — 2026-06-19 — Tether PID-handshake: refresh on relaunch (GAP 1)
 
-Completes the Tether v0.3 PID-handshake so it works for **existing** persona-builders, not just freshly-named agents. v0.3.2 made a token-free agent fetch its binding and autowake — but only an agent whose row was *inserted* with a live PID chain. A long-lived persona (a pre-existing row, e.g. `victra-build`) re-launched with an **empty `host_shell_pids`/`host_id`**, so Tether had nothing to bind to → no autowake. This release closes that gap end-to-end.
+Completes the Tether v0.3 PID-handshake so it works for **existing** persona-builders, not just freshly-named agents. v0.3.2 made a token-free agent fetch its binding and autowake — but only an agent whose row was *inserted* with a live PID chain. A long-lived persona (a pre-existing row, e.g. `build-agent`) re-launched with an **empty `host_shell_pids`/`host_id`**, so Tether had nothing to bind to → no autowake. This release closes that gap end-to-end.
 
 ### Fixed — `host_id` now refreshes on an authenticated re-register
 
@@ -19,18 +19,18 @@ Completes the Tether v0.3 PID-handshake so it works for **existing** persona-bui
 
 ### Tests
 
-`tests/pid-handshake.test.ts`: the "host_id is IMMUTABLE" contract is replaced by "host_id refreshes when re-reported, preserves when omitted"; new coverage for populating an initially-empty `host_id` (the `victra-build` case), `session_id` rotation on re-register, and an end-to-end **authenticated** re-register refreshing both `host_shell_pids` and `host_id` via the owner's token. The wrong-token-rejected governance test is retained unchanged.
+`tests/pid-handshake.test.ts`: the "host_id is IMMUTABLE" contract is replaced by "host_id refreshes when re-reported, preserves when omitted"; new coverage for populating an initially-empty `host_id` (the `build-agent` case), `session_id` rotation on re-register, and an end-to-end **authenticated** re-register refreshing both `host_shell_pids` and `host_id` via the owner's token. The wrong-token-rejected governance test is retained unchanged.
 
-`tests/v2-11-0-hook-liveness-register.test.ts` (NEW): load-bearing coverage of the **shipped `check-relay.sh`** liveness gate — invokes the real hook as a subprocess against a real HTTP daemon and asserts register-was/wasn't-called via deterministic signals (session_id rotation + host_shell_pids overwrite, plus a host_id refresh assertion where a machine GUID is derivable). L1 (fresh+live → skip), L2 (stale → re-register), L3 (offline/`session_id` NULL → re-register, the victra-build case). Verified load-bearing by negative control: reverting `SKIP_REGISTER` to its old unconditional-skip form fails L2 + L3.
+`tests/v2-11-0-hook-liveness-register.test.ts` (NEW): load-bearing coverage of the **shipped `check-relay.sh`** liveness gate — invokes the real hook as a subprocess against a real HTTP daemon and asserts register-was/wasn't-called via deterministic signals (session_id rotation + host_shell_pids overwrite, plus a host_id refresh assertion where a machine GUID is derivable). L1 (fresh+live → skip), L2 (stale → re-register), L3 (offline/`session_id` NULL → re-register, the build-agent case). Verified load-bearing by negative control: reverting `SKIP_REGISTER` to its old unconditional-skip form fails L2 + L3.
 
 ## v2.10.0 — 2026-06-15 — Coordination + safety
 
 ### Added — capability-routed messaging (`post_to_capability`)
 
-New MCP tool **`post_to_capability`** (tool #31): a sender tags an FYI/coordination message by a single domain/capability and the relay fans it out to the CURRENT owner(s) of that capability via the normal inbox — no manual channel join, no named recipient. Use case: an ad-hoc agent tags a finding by domain → the owning persona (e.g. concierge for "relationships") picks it up automatically on its next `get_messages`. This is the build vehicle for principle #1 (capability routing over named routing) of the AI-native relay directive.
+New MCP tool **`post_to_capability`** (tool #31): a sender tags an FYI/coordination message by a single domain/capability and the relay fans it out to the CURRENT owner(s) of that capability via the normal inbox — no manual channel join, no named recipient. Use case: an ad-hoc agent tags a finding by domain → the owning agent (e.g. an agent that owns the "support" capability) picks it up automatically on its next `get_messages`. This is the build vehicle for principle #1 (capability routing over named routing) of the AI-native relay directive.
 
 - **Routing** reuses the proven `agent_capabilities` index + exact-string match (same contract as `post_task_auto`), but fans out to ALL current owners (an FYI should reach every persona that owns the domain, not just the least-loaded one) and delivers into the existing `messages` inbox — recipients drain via the normal `get_messages`, so there is **zero new read path** (Tether and the SessionStart hook work unchanged).
-- **Action-vs-FYI line stays intact (machine-enforceable).** Action-required completions remain point-to-point ship-pongs (`send_message`); capability-routed topics are the FYI/coordination lane only. A new nullable `messages.routed_capability` column + a `get_messages` `lane` filter (`all` | `direct` | `capability`) keep the two lanes distinguishable, so an action item is never lost in FYI noise.
+- **Action-vs-FYI line stays intact (machine-enforceable).** Action-required completions remain point-to-point completion reports (`send_message`); capability-routed topics are the FYI/coordination lane only. A new nullable `messages.routed_capability` column + a `get_messages` `lane` filter (`all` | `direct` | `capability`) keep the two lanes distinguishable, so an action item is never lost in FYI noise.
 - **No current owner** → `routed_to: []` and nothing is stored (fire-and-forget to current owners; NOT queued-until-owner, which is task semantics).
 - New webhook event **`message.capability_routed`** (fired once per fan-out, carrying the capability + recipients).
 - Schema migrates **v13 → v14** — one additive `NULL`-default column; zero data migration.
@@ -48,7 +48,7 @@ Server-enforced JSON Schema validation of a task's completion result, gating the
 
 ## v2.9.1 — 2026-06-10 — HOTFIX: autowake recursion (Tether 0.2.0 + HTTP daemon crash)
 
-Fixes the deployment-blocking RangeError that surfaced when Tether 0.2.0 connected to the v2.9.0 HTTP daemon. The bug class is the same shape as v2.5-R1 (InMemoryTransport-style tests passing while real HTTP transport breaks); my v2.9.0 autowake test was real but exercised the wrong close path, so the recursion went undetected through v2.5–v2.9.0 and only triggered on Maxime's live VS Code + Tether deployment.
+Fixes the deployment-blocking RangeError that surfaced when Tether 0.2.0 connected to the v2.9.0 HTTP daemon. The bug class is the same shape as v2.5-R1 (InMemoryTransport-style tests passing while real HTTP transport breaks); the v2.9.0 autowake test was real but exercised the wrong close path, so the recursion went undetected through v2.5–v2.9.0 and only triggered on a live VS Code + Tether deployment.
 
 ### The bug
 
@@ -76,7 +76,7 @@ The recursion fires from two real-deployment paths that the v2.5-v2.9.0 test sui
 - **Session reaper** at `src/transport/http.ts:1443` — `sess.transport.close()` on idle sessions (60s default interval, 5min idle timeout).
 - **DELETE /mcp endpoint** at `src/transport/http.ts:1691` — `await session.transport.close()` when an MCP client (Tether 0.2.0) sends a session-termination request.
 
-Tether's `maxRetries: 20` reconnection (`extensions/vscode/src/extension.ts:506-511`) amplifies — each crash → another connect → another crash. Maxime saw ~530 RangeError lines in the live repro.
+Tether's `maxRetries: 20` reconnection (`extensions/vscode/src/extension.ts:506-511`) amplifies — each crash → another connect → another crash. The live repro produced ~530 RangeError lines.
 
 ### The fix
 
@@ -88,11 +88,11 @@ One-line code change at `src/transport/http.ts:1504-1527` (replacing the recursi
 
 `tests/v2-9-1-autowake-server-close-recursion.test.ts` exercises the exact path: spawn daemon, connect via `StreamableHTTPClientTransport` with Tether's `reconnectionOptions`, register + subscribe, then `DELETE /mcp` to trigger server-side `transport.close()`. Asserts daemon stderr contains zero `RangeError` / `Maximum call stack` / `unhandledRejection` lines, and `/health` still responds.
 
-Empirically verified during this release: without the fix, the test fails with the same `RangeError: Maximum call stack size exceeded` Maxime saw. With the fix, it passes. The test catches the bug class on every future PR.
+Empirically verified during this release: without the fix, the test fails with the same `RangeError: Maximum call stack size exceeded` from the repro. With the fix, it passes. The test catches the bug class on every future PR.
 
 ### Also tracked in this release
 
-- `tests/v2-9-0-autowake-headless-push-smoke.test.ts` — the v2.9.0 autowake push-delivery test was untracked in git (codex caught this in msg `2895e08d`). Committed to main alongside the v2.9.1 fix so it runs in CI from now on.
+- `tests/v2-9-0-autowake-headless-push-smoke.test.ts` — the v2.9.0 autowake push-delivery test was untracked in git (a Codex audit caught this). Committed to main alongside the v2.9.1 fix so it runs in CI from now on.
 
 ### Out of scope
 
@@ -106,15 +106,15 @@ Expected 20/20 PASS — fix is a one-line removal + comment, lockfile regenerate
 
 ### References
 
-- Spec: `audit-findings/v2.9.0-ambient-wake-spec.md` (still authoritative for the operator pattern; v2.9.1 is the implementation fix that makes path α actually deliver).
-- Origin: Maxime's live VS Code + Tether 0.2.0 repro 2026-06-10 (relay msg `add0b18c` from victra).
+- Spec: the ambient-wake design spec (still authoritative for the operator pattern; v2.9.1 is the implementation fix that makes path α actually deliver).
+- Origin: a live VS Code + Tether 0.2.0 repro 2026-06-10.
 - Root-cause confirmation: empirical via the regression test in this release.
 
 ## v2.9.0 — 2026-06-08 — Ambient-wake operator guide + auto-poll-loop template
 
 Added: ambient-wake operator guide + auto-poll-loop template + corrected stale source comments about seq-assignment timing (comment-only, no behavior change).
 
-v2.9.0 is a docs-and-template release that turns the v2.3.0 Phase 4s ambient-wake protocol into a usable operator pattern. The relay-side primitives (`peek_inbox_version`, mailbox/epoch, filesystem marker, `/api/wake-agent`, MCP resource subscription) shipped in v2.3.0 + were verified by codex in the v2.9.0 spec audit (`audit-findings/v2.9.0-ambient-wake-spec.md`). v2.9.0 documents how operators wire those primitives into a real workflow so builders wake themselves on relay mail and surface only decisions to the human.
+v2.9.0 is a docs-and-template release that turns the v2.3.0 Phase 4s ambient-wake protocol into a usable operator pattern. The relay-side primitives (`peek_inbox_version`, mailbox/epoch, filesystem marker, `/api/wake-agent`, MCP resource subscription) shipped in v2.3.0 + were verified by a Codex audit of the v2.9.0 spec. v2.9.0 documents how operators wire those primitives into a real workflow so builders wake themselves on relay mail and surface only decisions to the human.
 
 ### What's in scope
 
@@ -151,16 +151,16 @@ Claude Code v2.1.89's **Auto-mode is OFF the table.** It triggers per-tool-call 
 
 ### References
 
-- Spec: `audit-findings/v2.9.0-ambient-wake-spec.md` (513 lines, codex SHIP after R2 patch round — `ef8fc44e`).
+- Spec: an ambient-wake design spec.
 - Primitives doc: `docs/ambient-wake.md` (existing v2.3.0 protocol doc; v2.9.0 appends operator setup).
 - Role template: `roles/auto-poll-loop-template.md`.
-- Origin: north-star direction from Maxime 2026-06-05 ("builders run in background/IDE with automatic polling so HE is no longer the blocker").
+- Origin: ambient-wake workflow requirement (builders run in the background; the operator isn't the blocker).
 
 ## v2.8.0 — 2026-05-26 — Dashboard daemon precursor: 5-state state machine + SIGHUP + decay broadcaster + wire-emit sites
 
-Closes the dashboard ambiguity Maxime called out in the 2026-05-21 dashboard recon: an iTerm2 tab-close looked identical to "alive but slow" looked identical to "waiting normally" looked identical to "stale and needs attention". v2.8 fixes the DAEMON side end-to-end; v2.9 (separate arc) will wire the new state model into the actual dashboard UI rendering.
+Closes the dashboard ambiguity called out in the 2026-05-21 dashboard recon: an iTerm2 tab-close looked identical to "alive but slow" looked identical to "waiting normally" looked identical to "stale and needs attention". v2.8 fixes the DAEMON side end-to-end; v2.9 (separate arc) will wire the new state model into the actual dashboard UI rendering.
 
-Brief: `audit-findings/v2.8-dashboard-state-machine-brief.md` — all architectural calls locked from Maxime's 2026-05-25 lock session.
+All architectural calls locked during the 2026-05-25 v2.8 dashboard state-machine design review.
 
 ### Consolidated state machine — 5 operator-meaningful states
 
@@ -194,7 +194,7 @@ All three columns are NULL on existing rows; their absence routes cleanly throug
 
 `closeAgentSession` at `src/db.ts:1740-1779` extended to accept an optional `signalKind` parameter; when set, it ALSO stamps the new `signal_received_at` + `signal_kind` columns. Non-signal close paths (explicit unregister, dispatcher-driven) preserve their pre-v2.8 column-set (NULL signal columns).
 
-Real-process integration test at `tests/v2-8-sighup-handler.test.ts` — spawns the built `dist/index.js`, sends `process.kill(pid, 'SIGHUP')`, verifies the row's `signal_kind = 'SIGHUP'` + `signal_received_at` populated + exit code 129. Same coverage for SIGINT (regression) + SIGTERM (regression). Per `feedback_test_path_must_match_shipped_path.md`: real OS signal, no mocks.
+Real-process integration test at `tests/v2-8-sighup-handler.test.ts` — spawns the built `dist/index.js`, sends `process.kill(pid, 'SIGHUP')`, verifies the row's `signal_kind = 'SIGHUP'` + `signal_received_at` populated + exit code 129. Same coverage for SIGINT (regression) + SIGTERM (regression). Test path matches the shipped path: real OS signal, no mocks.
 
 ### Decay-tick broadcaster
 
@@ -221,7 +221,7 @@ Existing emit sites (send_message, post_task, update_task, set_status, unregiste
 
 ### Tests
 
-`tests/v2-8-agent-state-machine.test.ts` — 32 tests (M1-M32). Every state, every transition, every boundary. Custom-threshold injection. Env-var resolution with fallback on invalid values. Per `feedback_test_asserts_contract_not_proxy.md`: exact `toBe('closed')` style assertions, not proxy checks.
+`tests/v2-8-agent-state-machine.test.ts` — 32 tests (M1-M32). Every state, every transition, every boundary. Custom-threshold injection. Env-var resolution with fallback on invalid values. Tests assert the exact contract, not a proxy: exact `toBe('closed')` style assertions, not proxy checks.
 
 `tests/v2-8-sighup-handler.test.ts` — 3 tests (SH1-SH3). Real OS signals (SIGHUP / SIGINT / SIGTERM) against a forked dist/index.js. Verifies DB columns populated correctly + exit codes match POSIX convention. Skipped on win32.
 
@@ -257,7 +257,7 @@ New step `extension_state_machine_smoke` runs the v2-8 test files specifically a
 
 ### Out of scope (explicitly NOT in v2.8)
 
-- Dashboard UI rendering changes — v2.9 arc. Theme system stays untouched per Maxime 2026-05-25.
+- Dashboard UI rendering changes — v2.9 arc. Theme system stays untouched (locked 2026-05-25).
 - Multi-machine federation visibility — v3 federation arc.
 - Heartbeat protocol changes — current keepalive model adequate.
 - Per-agent state notifications via webhook — Phase 4 territory if anyone asks.
@@ -265,12 +265,12 @@ New step `extension_state_machine_smoke` runs the v2-8 test files specifically a
 
 ### References
 
-- Brief: `audit-findings/v2.8-dashboard-state-machine-brief.md`
-- Auditor: codex-5-5
+- Locked during the v2.8 dashboard state-machine design review.
+- Auditor: external Codex audit
 
 ## v2.7.4 — 2026-06-03 — spawn-agent.sh kickstart apostrophe-quoting fix (HIGH)
 
-Closes Bug 1 from `audit-findings/v2.7.3-spawn-agent-kickstart-quoting-bug-brief.md` (reported 2026-05-21 by Maxime + Victra during v2.7.2 dispatch attempts). Spawn-flow hardening; no schema, no API, no runtime behavior changes. Bug 2 (length truncation) from the same brief is NOT in scope — that's a separate arc requiring token pre-mint + message ordering work.
+Closes a spawn-agent kickstart-quoting bug. Spawn-flow hardening; no schema, no API, no runtime behavior changes. Bug 2 (length truncation) is NOT in scope — that's a separate arc requiring token pre-mint + message ordering work.
 
 ### The bug
 
@@ -278,7 +278,7 @@ Closes Bug 1 from `audit-findings/v2.7.3-spawn-agent-kickstart-quoting-bug-brief
 
 The default kickstart contained three offending substrings (`status='all'`, `since='session_start'`, `since='1h'`), so first-attempt spawns wedged. Operator workaround until this lands: always pass an apostrophe-free `RELAY_SPAWN_KICKSTART="..."` override.
 
-### Fix — Option C from brief (defense in depth)
+### Fix — Option C (defense in depth)
 
 **(A) Sanitize the default kickstart** (`bin/spawn-agent.sh:289`).
 
@@ -306,19 +306,18 @@ One existing test (`spawn-agent.sh — v2.1.4 brief_file_path (I10) → default 
 
 - No schema migration. No DB changes. No API changes. No env var changes.
 - `bin/spawn-agent.sh` operators on Node 20+ have no action required — `RELAY_SPAWN_KICKSTART` override values that used to wedge now work without modification, and overrides that didn't contain apostrophes continue to work verbatim.
-- Memory rules `feedback_spawn_kickstart_no_apostrophes.md` and `feedback_spawn_needs_kickstart.md` can be updated post-merge — the apostrophe restriction no longer applies.
+- The apostrophe restriction no longer applies.
 
 ### Out of scope (explicitly NOT in v2.7.4)
 
-- Bug 2 from the brief (length truncation past ~1000-1024 chars via AppleScript `do script` buffer limit) — separate arc; requires `--initial-message` flag + token pre-mint + message ordering guarantees.
+- Bug 2 (length truncation past ~1000-1024 chars via AppleScript `do script` buffer limit) — separate arc; requires `--initial-message` flag + token pre-mint + message ordering guarantees.
 - Other `Q_*` variables continuing to use `printf '%q'` — they're tight-allowlisted and don't trigger the bug.
 - Linux/Windows spawn drivers — they use a different code path (`src/spawn/drivers/{linux,windows}.ts`); Bug 1 was specific to the macOS bash-script path.
 
 ### References
 
-- Brief: `audit-findings/v2.7.3-spawn-agent-kickstart-quoting-bug-brief.md` (note: filename predates the v2.7.3 CVE hotfix that took the v2.7.3 slot; this fix lands as v2.7.4)
-- Bug discovery: 2026-05-21 by Maxime + Victra during v2.7.2 dispatch attempts
-- Sibling memory rules to retire post-merge: `feedback_spawn_kickstart_no_apostrophes.md`
+- Note: the prior working label predated the v2.7.3 CVE hotfix that took the v2.7.3 slot; this fix lands as v2.7.4.
+- Bug discovery: 2026-05-21 during v2.7.2 dispatch attempts
 
 ## v2.7.3 — 2026-06-02 — SECURITY HOTFIX: vitest@4.1.8 (CVSS 9.8) + qs/ws transitives + Node 18 drop
 
@@ -346,7 +345,7 @@ Post-fix: `npm audit --audit-level=high` reports **0 vulnerabilities**.
 
 ### Why standalone
 
-The v2.8 dashboard-daemon-precursor arc was mid-flight on `hotfix/v2.8-dashboard-state-machine` when these advisories landed in the npm advisory DB (between v2.8 R1 push 2026-05-26 and R2 push 2026-06-02). Per Maxime's 2026-06-02 lock: ship the security hotfix as a standalone arc off `main` so npm users get the CVE patch immediately, then rebase v2.8 R2 on top of clean main — codex audits each arc on narrow scope rather than juggling a wider mixed scope.
+The v2.8 dashboard-daemon-precursor arc was mid-flight on `hotfix/v2.8-dashboard-state-machine` when these advisories landed in the npm advisory DB (between v2.8 R1 push 2026-05-26 and R2 push 2026-06-02). Per the 2026-06-02 lock: ship the security hotfix as a standalone arc off `main` so npm users get the CVE patch immediately, then rebase v2.8 R2 on top of clean main — Codex audits each arc on narrow scope rather than juggling a wider mixed scope.
 
 ### Compatibility
 
@@ -358,20 +357,20 @@ The v2.8 dashboard-daemon-precursor arc was mid-flight on `hotfix/v2.8-dashboard
 
 No tests added or modified. Full v2.7.2 test suite passes verbatim under the new vitest:
 - Root vitest (sequential `--pool=forks --no-file-parallelism`): **1353 / 125 files PASS** under vitest@4.1.8 on Node v24.13.0 locally.
-- Pre-publish `--full` gate: **18/19 PASS**. The single expected FAIL is the GitHub CI green-gate, which inspects `main`'s CI status — `main` is red from the exact advisories this PR closes (chicken-and-egg). Resolves automatically on merge. The actionable per-`feedback_pre_push_discipline.md` check is BRANCH CI at HEAD, which is CI run 26805501670: Node 20 + Node 22 + 25-tool smoke ALL PASS.
+- Pre-publish `--full` gate: **18/19 PASS**. The single expected FAIL is the GitHub CI green-gate, which inspects `main`'s CI status — `main` is red from the exact advisories this PR closes (chicken-and-egg). Resolves automatically on merge. The actionable pre-push check is BRANCH CI at HEAD, which is CI run 26805501670: Node 20 + Node 22 + 25-tool smoke ALL PASS.
 
 ### DEFERRED-LOCAL
 
-Only Node 24 available locally; Node 20 + 22 verified via the GitHub Actions CI matrix at `.github/workflows/ci.yml`. Ship-pong cites the CI run number with Node 20 + 22 + 25-tool smoke all green.
+Only Node 24 available locally; Node 20 + 22 verified via the GitHub Actions CI matrix at `.github/workflows/ci.yml`. The completion report cites the CI run number with Node 20 + 22 + 25-tool smoke all green.
 
 ### References
 
-- Brief: dispatched by victra 2026-06-02 (msg 283be93b) after codex-5-5 R1 audit (msg 7110aefc) caught vitest critical on v2.8 R2 push.
-- Option A (drop Node 18) locked by Maxime 2026-06-02 (msg 431b91fc) after scope-expansion ask msg `f701ef85`.
+- Dispatched 2026-06-02 after a Codex R1 audit caught a vitest critical on the v2.8 R2 push.
+- Option A (drop Node 18) locked 2026-06-02 after a scope-expansion request.
 
 ## v2.7.2 — 2026-05-21 — spawn_agent identity-recovery defense-in-depth
 
-Closes the silent "default" failure mode when `mcp__bot-relay__spawn_agent` produces a child terminal whose SessionStart hook never sees `RELAY_AGENT_NAME`. Origin: victra-hermes bug report msg `149f124f` (2026-05-13), brief at `audit-findings/v2.7.2-spawn-agent-name-brief.md`.
+Closes the silent "default" failure mode when `mcp__bot-relay__spawn_agent` produces a child terminal whose SessionStart hook never sees `RELAY_AGENT_NAME`. Origin: a bug report (2026-05-13).
 
 ### Reframe of the failure mode
 
@@ -379,7 +378,7 @@ The original bug report quoted the hook as printing `$RELAY_AGENT_NAME is empty 
 
 - `hooks/check-relay.sh:40` — `AGENT_NAME="${RELAY_AGENT_NAME:-default}"` falls back to the literal string `default` with no warning when the env var is unset or empty.
 - The hook then registers an agent named `default` over HTTP (`hooks/check-relay.sh:259-271`).
-- Mail queued for the *intended* name (e.g. `victra-memory-build`) dead-letters — the SELECT at `hooks/check-relay.sh:315-321` only matches `to_agent = 'default'` once that's the registered name.
+- Mail queued for the *intended* name (e.g. `build-agent`) dead-letters — the SELECT at `hooks/check-relay.sh:315-321` only matches `to_agent = 'default'` once that's the registered name.
 - From the operator's perspective the terminal "looks unregistered"; from the hook's perspective everything succeeded at exit 0.
 
 The script-side CMD is structurally correct (`bin/spawn-agent.sh:201` exports come first, before the conditional vault hydration and before `claude`). A new contract test (`tests/spawn-integration.test.ts` — v2.7.2 block) executes the dry-run CMD in a clean subshell with a `claude` stub and confirms `RELAY_AGENT_NAME` reaches both the immediate claude env AND a subprocess forked by claude. The test passes on this commit — the propagation contract holds end-to-end inside the script's scope. The remaining attack surface is between `osascript … write text` and the live `claude` binary's hook-subprocess env policy, which is opaque from outside.
@@ -399,31 +398,31 @@ This is a defense-in-depth ship, not a root-cause kill. If the actual failure is
 ### Tests
 
 - New file `tests/v2-7-2-spawn-manifest.test.ts` — 22 tests covering manifest write atomicity, chmod, malformed-input rejection, find-fresh ambiguity handling, mtime windowing (including the sub-minute precision the `-mmin` impl couldn't deliver), delete idempotence, hook integration (5 cases including opt-out + explicit-name-wins), and drift guard for both shipped-helper definition and consumer-side shadow-redefinition.
-- New `tests/spawn-integration.test.ts` block — 4 contract tests asserting `RELAY_AGENT_NAME` reaches both `claude` env AND its subprocess env, for plain/hyphenated/dotted name shapes (`worker1`, `victra-memory-build`, `pod.alpha`).
+- New `tests/spawn-integration.test.ts` block — 4 contract tests asserting `RELAY_AGENT_NAME` reaches both `claude` env AND its subprocess env, for plain/hyphenated/dotted name shapes (`worker1`, `build-agent`, `pod.alpha`).
 
 Pre-publish gate adds 26 tests on top of v2.7.1's count. Existing 75 spawn-driver tests + 41 spawn-integration tests + 15 hook-contract tests pass unchanged — no regression in the adjacent surface.
 
 ### Cross-references
 
-PR opened against post-v2.7.1-merge `main` (HEAD: `d516cfd`). Branch: `hotfix/v2.7.2-spawn-name-propagation`. Filed-and-dispatched single-issue brief at `audit-findings/v2.7.2-spawn-agent-name-brief.md` (Findings section updated 2026-05-21 with the reframe + file:line citations before the patch). Tether VSCode extension v0.1.3 (`d516cfd`) and v2.7.1 R1 (`189a170`) both shipped first per brief gating.
+PR opened against post-v2.7.1-merge `main` (HEAD: `d516cfd`). Branch: `hotfix/v2.7.2-spawn-name-propagation`. Tether VSCode extension v0.1.3 (`d516cfd`) and v2.7.1 R1 (`189a170`) both shipped first.
 
 ## v2.7.1 — 2026-05-13 — SECURITY HOTFIX
 
-Two CRITICAL findings + one HIGH + three LOW/MED that surfaced in the review-Victra deep-review synthesis (msg `2b903f9b`, synthesizing codex + Hermes deep-repo audits) AFTER codex's PR #31 audit had SHIPped v2.7.0 cleanly. The PR #31 audit was scoped to the four release commits; these findings live in PRE-EXISTING code that would have shipped via `npm publish` if the publish step had run before the deep-review landed.
+Two CRITICAL findings + one HIGH + three LOW/MED that surfaced in a security review AFTER the PR #31 Codex audit had SHIPped v2.7.0 cleanly. The PR #31 audit was scoped to the four release commits; these findings live in PRE-EXISTING code that would have shipped via `npm publish` if the publish step had run before the security review landed.
 
-Maxime locked "fix all in one bundled dispatch" on 2026-05-13. PR opened against `main` post-v2.7.0-merge; no v2.7.0 tag was created and no npm publish ran, so v2.7.1 is the first public npm artifact in the v2.7 series.
+All fixes ship in one PR. PR opened against `main` post-v2.7.0-merge; no v2.7.0 tag was created and no npm publish ran, so v2.7.1 is the first public npm artifact in the v2.7 series.
 
 ### Security
 
-- **[CRITICAL] `expand_capabilities` now requires `admin` capability** (`a92d22a`). Pre-fix the dispatcher's `TOOL_CAPABILITY` map at `src/auth.ts` omitted `expand_capabilities` entirely. Unmapped tools fall through to "no capability required", so any authenticated agent — even one with the default `{user}` cap set — could call `expand_capabilities` on themselves to add `admin`, `manage_others`, `rotate_others`, then `revoke_token` or `rotate_token_admin` any peer. ~3 calls to compromise a relay. Origin: review-Victra synthesis / Hermes deep-review.
+- **[CRITICAL] `expand_capabilities` now requires `admin` capability** (`a92d22a`). Pre-fix the dispatcher's `TOOL_CAPABILITY` map at `src/auth.ts` omitted `expand_capabilities` entirely. Unmapped tools fall through to "no capability required", so any authenticated agent — even one with the default `{user}` cap set — could call `expand_capabilities` on themselves to add `admin`, `manage_others`, `rotate_others`, then `revoke_token` or `rotate_token_admin` any peer. ~3 calls to compromise a relay. Origin: a security review.
 
-- **[CRITICAL] Plaintext agent tokens no longer logged to stderr on `register_agent`** (`1a56beb`). Pre-fix `src/tools/identity.ts:150-153` interpolated the freshly-minted token at info level on every registration; every stderr-capturing surface (terminal scrollback, CI logs, journald, Docker logs, log aggregators, SaaS observability) ended up with the token in cleartext. The "shown ONCE in the API response" model was broken from day one. Fix has two layers: (a) strip the token from the log line entirely (agent name + "(shown once in the tool response; not logged)" hint preserve the operational signal); (b) `redactSecrets` defense-in-depth scrubber in `src/logger.ts` applied to every log line at every level, matching `RELAY_AGENT_TOKEN=<value>`, `Authorization: Bearer <value>`, `Authorization: <other-scheme>`, `X-Agent-Token: <value>` (case-insensitive), and JSON-ish `"<key>": "<value>"` for token / agent_token / recovery_token / secret / http_secret / webhook_secret / password keys. Origin: Hermes deep-review.
+- **[CRITICAL] Plaintext agent tokens no longer logged to stderr on `register_agent`** (`1a56beb`). Pre-fix `src/tools/identity.ts:150-153` interpolated the freshly-minted token at info level on every registration; every stderr-capturing surface (terminal scrollback, CI logs, journald, Docker logs, log aggregators, SaaS observability) ended up with the token in cleartext. The "shown ONCE in the API response" model was broken from day one. Fix has two layers: (a) strip the token from the log line entirely (agent name + "(shown once in the tool response; not logged)" hint preserve the operational signal); (b) `redactSecrets` defense-in-depth scrubber in `src/logger.ts` applied to every log line at every level, matching `RELAY_AGENT_TOKEN=<value>`, `Authorization: Bearer <value>`, `Authorization: <other-scheme>`, `X-Agent-Token: <value>` (case-insensitive), and JSON-ish `"<key>": "<value>"` for token / agent_token / recovery_token / secret / http_secret / webhook_secret / password keys. Origin: an external security review.
 
-- **[HIGH] Dashboard `send_message` now requires `from_agent_token` for any `from` field that names a registered agent** (`aa75924`). Pre-fix `src/transport/http.ts` treated `from_agent_token` as optional defense-in-depth (Option (a) audit-only). Whoever held the dashboard's HTTP secret OR an authenticated session cookie could POST send_message with `from=victra` and impersonate any registered agent across the relay's full message + task surface. Maxime locked Option A: make from_agent_token REQUIRED when from-agent has a stored token_hash. Missing → 403 AUTH_FAILED; mismatch → 403 AUTH_FAILED; correct → success. System-message senders (e.g., `dashboard-system`) need their own row + token; no "no token = system" fallback. Origin: codex deep-review.
+- **[HIGH] Dashboard `send_message` now requires `from_agent_token` for any `from` field that names a registered agent** (`aa75924`). Pre-fix `src/transport/http.ts` treated `from_agent_token` as optional defense-in-depth (Option (a) audit-only). Whoever held the dashboard's HTTP secret OR an authenticated session cookie could POST send_message with `from=<victim>` and impersonate any registered agent across the relay's full message + task surface. Option A was locked: make from_agent_token REQUIRED when from-agent has a stored token_hash. Missing → 403 AUTH_FAILED; mismatch → 403 AUTH_FAILED; correct → success. System-message senders (e.g., `dashboard-system`) need their own row + token; no "no token = system" fallback. Origin: an external security review.
 
 ### Fixes
 
-- **[MED] Walked all handlers that do "fetch → JS-filter → mutate"; confirmed v2.7.0's `get_messages` fix was complete.** No code change in v2.7.1 — the walk confirmed no other sites match the silent-data-loss class. Sibling read paths (`getMessagesSummary`, `peekMailboxVersion`, `getMessagesInWindow`, `getTasksInWindow`) all push `since` into SQL OR are pure reads with no mutation. One adjacent fidelity gap noted for v2.8: `src/tools/standup.ts:159` fetches the audit log with a hard LIMIT 500 then filters in JS by `created_at >= sinceIso` — pure read, no data loss, but the window may be incomplete on high-traffic relays. Deferred. Origin: codex deep-review.
+- **[MED] Walked all handlers that do "fetch → JS-filter → mutate"; confirmed v2.7.0's `get_messages` fix was complete.** No code change in v2.7.1 — the walk confirmed no other sites match the silent-data-loss class. Sibling read paths (`getMessagesSummary`, `peekMailboxVersion`, `getMessagesInWindow`, `getTasksInWindow`) all push `since` into SQL OR are pure reads with no mutation. One adjacent fidelity gap noted for v2.8: `src/tools/standup.ts:159` fetches the audit log with a hard LIMIT 500 then filters in JS by `created_at >= sinceIso` — pure read, no data loss, but the window may be incomplete on high-traffic relays. Deferred. Origin: codex security review.
 
 ### Operational
 
@@ -435,9 +434,9 @@ Maxime locked "fix all in one bundled dispatch" on 2026-05-13. PR opened against
 
 PR opened against post-v2.7.0-merge `main` (HEAD: `afcf6ef`). Branch: `hotfix/v2.7.1-security`. Tether VSCode extension v0.1.3 (HIGH F10: SecretStorage migration) ships as a separate hotfix branch; the marketplace re-publish does NOT block this npm release.
 
-## v2.7.0 — 2026-05-13 — Tether-ready cross-process inbox notifications + Hermes-flagged P1 correctness fix
+## v2.7.0 — 2026-05-13 — Tether-ready cross-process inbox notifications + externally-flagged P1 correctness fix
 
-The v2.7.0 release closes the cross-process notification gap between stdio MCP terminals and the HTTP daemon that ships with `bot-relay-mcp`, lands a Hermes-flagged P1 correctness bug in `get_messages`, and pairs with the [Tether VSCode extension v0.1.2](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) on the marketplace.
+The v2.7.0 release closes the cross-process notification gap between stdio MCP terminals and the HTTP daemon that ships with `bot-relay-mcp`, lands an externally-flagged P1 correctness bug in `get_messages`, and pairs with the [Tether VSCode extension v0.1.2](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) on the marketplace.
 
 The Tether v0.1.2 marketplace listing assumes the daemon has Phase 5 keepalive — anyone running `npm install bot-relay-mcp@latest` pre-v2.7.0 would silently degrade to ~2.5min Electron-fetch idle disconnects. v2.7.0 closes that gap end-to-end.
 
@@ -475,16 +474,16 @@ Fix: daemon-side periodic `:keepalive\n\n` SSE comment frame writes. Per the SSE
 
 Cite: commit `6ec32d6`.
 
-### Hermes-flagged P1 — `get_messages` filter-after-mark silent data loss
+### Externally-flagged P1 — `get_messages` filter-after-mark silent data loss
 
-Hermes's external review (paste 2026-05-11) surfaced a correctness bug not caught across 4+ audit cycles: `src/tools/messaging.ts` ran `filterBySince(rows, sinceIso)` in JS at line 159 AFTER `src/db.ts` `getMessages` had already SELECTed pending rows + UPDATEed their `read_by_session` field in the same SQL call. Net effect: a message older than the caller's `since` bound was consumed (marked-read for this session) even though the caller never saw it in the response. The message never resurfaced in subsequent `status='pending'` calls from the same session because `read_by_session != null` excluded it.
+An external review (2026-05-11) surfaced a correctness bug not caught across 4+ audit cycles: `src/tools/messaging.ts` ran `filterBySince(rows, sinceIso)` in JS at line 159 AFTER `src/db.ts` `getMessages` had already SELECTed pending rows + UPDATEed their `read_by_session` field in the same SQL call. Net effect: a message older than the caller's `since` bound was consumed (marked-read for this session) even though the caller never saw it in the response. The message never resurfaced in subsequent `status='pending'` calls from the same session because `read_by_session != null` excluded it.
 
 Fix:
 - `getMessages(agentName, status, limit, peek, sinceIso)` — new 5th parameter. SQL SELECT now stitches `AND created_at >= ?` BEFORE the mark-as-read transaction. Only rows that survive the filter get marked read.
 - `handleGetMessages` (`src/tools/messaging.ts`) — passes `sinceIso` into the DB call; obsolete `filterBySince` removed entirely.
 - `sampleGetMessagesConsistency` (`src/transport/consistency-probe.ts`) — takes `sinceIso` so its SUPERSET SQL query mirrors the same bound (else every since-narrower-than-all call emits false-positive divergence warnings post-fix).
 
-Regression test at `tests/v2-7-0-get-messages-filter-after-mark.test.ts` (3 cases): the exact scenario Hermes described, idempotency within the same window, and the `peek=true` no-mutation control. Pre-fix code fails the first assertion ("old message is missing after a since='15m' call"); post-fix all 3 pass. Full investigation + walk-analogous results at `docs/v2.7.0-get-messages-filter-after-mark.md`.
+Regression test at `tests/v2-7-0-get-messages-filter-after-mark.test.ts` (3 cases): the exact scenario the external review described, idempotency within the same window, and the `peek=true` no-mutation control. Pre-fix code fails the first assertion ("old message is missing after a since='15m' call"); post-fix all 3 pass. Full investigation + walk-analogous results at `docs/v2.7.0-get-messages-filter-after-mark.md`.
 
 Walk-analogous (verified by reading source): `getMessagesSummary` already applies `since` as SQL filter and is pure-read, no mutation — unaffected. `peekMailboxVersion` returns aggregate counts, no since filter, no mutation — unaffected. The bug was specific to `getMessages` + `filterBySince`.
 
@@ -505,7 +504,7 @@ Kept at info:
 
 `tests/v2-6-tether-broadcast-trace.test.ts` updated to set `RELAY_LOG_LEVEL=debug` so it still asserts the full chain.
 
-### Tool count drift fix (Hermes-flagged)
+### Tool count drift fix (externally-flagged)
 
 README + adjacent docs claimed 25 tools. Actual count is **30 MCP tools** (verified via `grep -c "name:" src/server.ts`). Drift accumulated across v2.2 (`get_messages_summary`, `expand_capabilities`, `get_standup`), v2.2.1 (`set_dashboard_theme`), v2.3.0 (`peek_inbox_version`) — none of these landings updated the quoted count. Updated:
 - Root `README.md` v2.1 status block → v2.7 status + "30 MCP tools"
@@ -513,7 +512,7 @@ README + adjacent docs claimed 25 tools. Actual count is **30 MCP tools** (verif
 - Root `README.md` Tether section now leads with marketplace install
 - Roadmap entry for v2.7 added
 
-Long-term Hermes recommendation (out of v2.7.0 scope): tool registry should be the single source of truth that generates docs/MCP-defs/auth-bundle-maps/smoke-test-expectations. Deferred to a v2.8 hygiene round.
+Long-term external-review recommendation (out of v2.7.0 scope): tool registry should be the single source of truth that generates docs/MCP-defs/auth-bundle-maps/smoke-test-expectations. Deferred to a v2.8 hygiene round.
 
 ### Extension Tether v0.1.2 (shipped to marketplace separately, paired with this release)
 
@@ -547,7 +546,7 @@ PR #29 squash commit: `05e2b40`.
 
 Two hardening items closed in one patch — known port-collision flake class across integration tests, plus 5 medium-severity dependabot alerts on `package-lock.json` (all auto-patched cleanly via `npm audit fix` — no breaking changes).
 
-> Naming convention switch (per dispatch): brief number now matches npm publish version directly. v2.6.3 here = npm v2.6.3, no internal-vs-published divergence going forward.
+> Naming convention switch: the version label now matches the npm publish version directly. v2.6.3 here = npm v2.6.3, the version label matches the published version going forward.
 
 ### Port-flake hardening
 
@@ -569,7 +568,7 @@ Pre-v2.6.3 several integration tests hardcoded specific ports in the 39413-39988
 
 ### Dependabot vuln patches
 
-`gh api .../dependabot/alerts` enumerated 5 open medium-severity alerts (brief said 3 — actual is 5). All cleanly resolvable via `npm audit fix` (semver-compatible patch upgrades; no `package.json` change, only `package-lock.json`).
+`gh api .../dependabot/alerts` enumerated 5 open medium-severity alerts (initial estimate was 3 — actual is 5). All cleanly resolvable via `npm audit fix` (semver-compatible patch upgrades; no `package.json` change, only `package-lock.json`).
 
 | # | package | from → to | scope | advisory |
 |---|---|---|---|---|
@@ -589,9 +588,9 @@ Express-rate-limit also bumped (8.3.2 → 8.5.1) as a side-effect of the ip-addr
 
 ## v2.6.2 — 2026-05-06 — check-relay.sh agent_token capture regex fix (SSE-escape) + recovery-flow parsing
 
-> Internal brief was tracked as "v2.6.4" in dispatch sequence; npm semver patch on v2.6.1 publishes as v2.6.2. Brief naming is a tracking convention, not a semver promise.
+> An earlier working label was "v2.6.4"; this publishes as v2.6.2 (npm semver patch on v2.6.1). The label is a tracking convention, not a semver promise.
 
-Closes the bug news-intel-build hit on 2026-05-06: first spawn against a v2.6.1-LIVE daemon registered correctly in DB but the per-instance vault file was never written. The cumulative v2.6.1 R1-R3 arc was supposed to close this exact failure mode, yet here it was on the first post-publish spawn.
+Closes a first-spawn bug a builder agent hit on 2026-05-06: first spawn against a v2.6.1-LIVE daemon registered correctly in DB but the per-instance vault file was never written. The cumulative v2.6.1 R1-R3 arc was supposed to close this exact failure mode, yet here it was on the first post-publish spawn.
 
 ### Root cause
 
@@ -620,9 +619,9 @@ Five `grep` patterns in `hooks/check-relay.sh` expected the un-escaped, un-space
 | 137 | `"auth_state":"<state>"` | auth_state extraction returns empty — recovery flow never enters the `recovery_pending` branch even when admin issued a recovery token |
 | 164 | `"recovery_completed":true` | recovery branch never extracts the new token from response |
 | 165 | `"agent_token":"<token>"` (recovery) | recovery never persisted to vault |
-| 271 | `"agent_token":"<token>"` (register) | first-spawn never persisted to vault — the news-intel-build symptom |
+| 271 | `"agent_token":"<token>"` (register) | first-spawn never persisted to vault — the first-spawn symptom |
 
-All five were in the SAME file with the SAME shape gap; the brief named the latter two but the **walk-analogous-surfaces** discipline (per `memory/feedback_walk_analogous_surfaces.md`) surfaced the other three pre-fix. Without addressing all five, the recovery flow would have remained dead even after the originally-flagged sites were patched.
+All five were in the SAME file with the SAME shape gap; the original report named the latter two but the **walk-analogous-surfaces** discipline surfaced the other three pre-fix. Without addressing all five, the recovery flow would have remained dead even after the originally-flagged sites were patched.
 
 ### Fix
 
@@ -632,7 +631,7 @@ Verified against the live `:3777` daemon: pre-fix patterns match 0 times, post-f
 
 ### Why v2.6.2 SR-D didn't catch this
 
-`tests/v2-6-2-spawn-to-ready.test.ts` test SR-D claimed end-to-end coverage of "spawn → vault written → first MCP call authenticates" — but it parsed `register_agent`'s response with TS `JSON.parse()` (native; handles SSE+escape correctly) and wrote the vault from TS test code, bypassing the bash hook's grep/sed extraction entirely. Test path did NOT match shipped path (per `memory/feedback_test_path_must_match_shipped_path.md`). SR-D is kept as-is for its different coverage value (the prelude → stdio MCP env-inheritance path); v2.6.4's new test file replaces SR-D as the regression guard for the bash hook's response parsing.
+`tests/v2-6-2-spawn-to-ready.test.ts` test SR-D claimed end-to-end coverage of "spawn → vault written → first MCP call authenticates" — but it parsed `register_agent`'s response with TS `JSON.parse()` (native; handles SSE+escape correctly) and wrote the vault from TS test code, bypassing the bash hook's grep/sed extraction entirely. Test path did NOT match shipped path. SR-D is kept as-is for its different coverage value (the prelude → stdio MCP env-inheritance path); v2.6.4's new test file replaces SR-D as the regression guard for the bash hook's response parsing.
 
 SR-D's docstring updated to call out the divergence + point at the v2.6.4 test as the actual coverage.
 
@@ -640,13 +639,13 @@ SR-D's docstring updated to call out the divergence + point at the v2.6.4 test a
 
 Test path matches shipped path: invokes the actual `hooks/check-relay.sh` as a subprocess against a real `node dist/index.js` HTTP daemon. Vault is written by the hook (NOT by test code), so a regression in any of the 5 patterns surfaces immediately.
 
-- **(T1)** first-spawn — hook calls `register_agent` via HTTP, parses SSE-wrapped response with the new pattern, writes vault. Pre-fix this would have failed at the vault-exists assertion (the news-intel-build symptom).
+- **(T1)** first-spawn — hook calls `register_agent` via HTTP, parses SSE-wrapped response with the new pattern, writes vault. Pre-fix this would have failed at the vault-exists assertion (the first-spawn symptom).
 - **(T2)** re-spawn — hook with valid env-token + agent already in DB → `SKIP_REGISTER` branch, vault content unchanged.
 - **(T3)** recovery flow — admin revokes target with `issue_recovery=true` → operator sets `RELAY_RECOVERY_TOKEN` + invokes hook → hook detects `auth_error` (line 134) + reads `auth_state=recovery_pending` (line 137) → recovery branch fires, parses `recovery_completed:true` (line 164), extracts `NEW_TOKEN` (line 165), writes fresh vault. Exercises ALL 5 patched patterns end-to-end.
 
 ### v2.6.4 R1 — codex residual: tightened agent_token extraction regex to `{8,128}` length bounds
 
-R0 codex SHIP verdict (msg `dcc06405`) flagged that the extraction patterns at L174 + L292 used `[A-Za-z0-9_=.-]+` (any length) while `write_relay_token_to_vault` validates the same charset with `{8,128}` length bounds (mirrors `src/token-store.ts:67` `TOKEN_SHAPE_RE`). Contract inconsistency — extraction would match a malformed short token, then vault-write would reject it. R1 aligns the extraction regex to the same length bounds so the hook refuses what vault-write would refuse, before the round-trip.
+The R0 Codex SHIP verdict flagged that the extraction patterns at L174 + L292 used `[A-Za-z0-9_=.-]+` (any length) while `write_relay_token_to_vault` validates the same charset with `{8,128}` length bounds (mirrors `src/token-store.ts:67` `TOKEN_SHAPE_RE`). Contract inconsistency — extraction would match a malformed short token, then vault-write would reject it. R1 aligns the extraction regex to the same length bounds so the hook refuses what vault-write would refuse, before the round-trip.
 
 - `hooks/check-relay.sh:174` (recovery) and `:292` (register) — `+` → `{8,128}` in BOTH the `grep -oE` pattern AND the `sed -E` substitution. Lines 140 (`auth_error`), 143 (`auth_state`), 173 (`recovery_completed`) are NOT agent_token extractions and stay as-is.
 - `tests/v2-6-4-hook-token-extraction.test.ts` — new **(T4)** test exercises the actual shipped regex bytes by reading `hooks/check-relay.sh` at test load, extracting the L292 grep + sed via JS regex, then piping synthetic SSE fixtures through `bash` with those exact bytes. No regex re-implementation in TS — drift between this test and the shipped hook surfaces as a real failure. Cases: drift guard (assert pattern contains `{8,128}`), 3-char token rejected, 7-char rejected, 8-char accepted (boundary), valid 43-char accepted.
@@ -658,7 +657,7 @@ R0: 13/13 PASS. Test count: 1258 → 1261 (+3 from initial regression suite). R1
 
 ## v2.6.1 — 2026-05-06 — drift-grep guard extension to scan tests/
 
-> Internal brief was tracked as "v2.6.3" in dispatch sequence; npm semver patch on v2.6.0 publishes as v2.6.1. Brief naming is a tracking convention, not a semver promise.
+> An earlier working label was "v2.6.3"; this publishes as v2.6.1 (npm semver patch on v2.6.0). The label is a tracking convention, not a semver promise.
 
 Small follow-up to the v2.6.0 publish-prep regression caught at the bumped state. `tests/v2-2-0-full-dashboard-smoke.test.ts:112` had a hardcoded `"2.5.0"` literal that slipped past the existing `src/`-only drift-grep guard. The `--full` gate caught it during publish-prep, but only at the bumped state — too late to be caught early in iteration. v2.6.3 adds a guard step so the regression is caught immediately on any future bump.
 
@@ -676,7 +675,7 @@ Small follow-up to the v2.6.0 publish-prep regression caught at the bumped state
 
 ### Walked analogous surfaces
 
-Per `memory/feedback_walk_analogous_surfaces.md`: checked whether other directories also need scanning. Findings:
+Per the walk-analogous-surfaces discipline: checked whether other directories also need scanning. Findings:
 
 - **`hooks/`, `scripts/`, `bin/`** — at HEAD, zero current-version literals (`grep -rnE "[\"']2\.6\.0[\"']" hooks/ scripts/ bin/` returns nothing). These directories are bash; the v2.6.0 bump-test bug was specifically a TS test asserting `expect(...).toBe("X.Y.Z")` against a fresh server's reported version. The bash hooks read versions only via the daemon's HTTP `/health` endpoint or via the `relay` CLI, not via hardcoded literals. No regression found, no scan added.
 - **`docs/`** — markdown documentation legitimately mentions versions in changelogs, migration notes, and version-specific instructions. Scanning would produce mostly-false-positives. Not added.
@@ -698,15 +697,15 @@ All three cases pinned in the regression test file (D1/D2/D3 plus D4/D5 selectiv
 
 ## v2.6.0 — 2026-05-05 — `relay mint-token` CLI + spawn-flow self-bootstrap + cross-platform parity
 
-Adds an operator-side credential issuance path for external CLI agents whose safety monitors block the `register_agent` → use-returned-token sequence in a single response (Codex 5.5 was the canonical case as of 2026-04-27; per `memory/feedback_codex_5_5_safety_blocks_register.md`). Pure-additive — zero behavior change for existing users; existing `register_agent` flow is unchanged.
+Adds an operator-side credential issuance path for external CLI agents whose safety monitors block the `register_agent` → use-returned-token sequence in a single response (Codex was the canonical case as of 2026-04-27). Pure-additive — zero behavior change for existing users; existing `register_agent` flow is unchanged.
 
 ### `relay mint-token <name>`
 
 New CLI subcommand. Mints an agent token directly via filesystem access to the per-instance DB and prints the plaintext token ONCE to stdout. The operator exports it as `RELAY_AGENT_TOKEN` and launches the external CLI; the agent then authenticates on its first MCP call without ever invoking `register_agent` itself.
 
 ```bash
-relay mint-token codex-5-5 --role builder --capabilities build,test,audit
-relay mint-token codex-5-5 --force                      # rotate token, caps + role preserved
+relay mint-token codex --role builder --capabilities build,test,audit
+relay mint-token codex --force                      # rotate token, caps + role preserved
 relay mint-token NAME --json                            # structured output for scripts
 relay mint-token NAME --description "human-readable"    # discoverable in dashboard
 ```
@@ -715,7 +714,7 @@ relay mint-token NAME --description "human-readable"    # discoverable in dashbo
 - **`src/db.ts`** — new sanctioned mutation helper `mintAgentToken(name, role, capabilities, opts)`. INSERT path mirrors `registerAgent`'s 13-column shape exactly so a minted-but-never-registered row is auth-layer-indistinguishable from a registered row. UPDATE path (under `--force`) rotates token only: caps and role preserved, `session_id` cleared, `agent_status='offline'`, auth-side fields (`previous_token_hash`, `rotation_grace_expires_at`, `recovery_token_hash`, `revoked_at`) zeroed.
 - **`src/auth.ts`** — `BCRYPT_ROUNDS` is now exported (still `10`) so the regression test can pin the cost factor without duplicating the constant.
 - **`bin/relay`** — `mint-token` wired into `SUBCOMMANDS` and `printHelp`. CLI count: 13 → 14.
-- **`docs/agents/external-cli-setup.md`** *(new)* — full setup walkthrough: how the env-token pattern works, worked examples for Codex 5.5 + Cursor (best-effort), token storage best practices (`direnv`, macOS keychain, rotation hygiene), audit-trail shape, cross-platform notes.
+- **`docs/agents/external-cli-setup.md`** *(new)* — full setup walkthrough: how the env-token pattern works, worked examples for Codex + Cursor (best-effort), token storage best practices (`direnv`, macOS keychain, rotation hygiene), audit-trail shape, cross-platform notes.
 - **`README.md`** — new "External-CLI Token Mint (v2.6)" section after Lost-Token Recovery, cross-linking to `docs/agents/external-cli-setup.md`.
 
 ### Tests — `tests/v2-6-mint-token.test.ts` *(new)*
@@ -733,21 +732,21 @@ Spawns `node bin/relay mint-token …` against a throwaway DB and asserts on:
 9. `--db-path` pointing at a non-existent directory → exit 2 with clean error.
 10. `--help` prints usage, leaves DB alone.
 11. Missing `<name>` argument → exit 1 with usage.
-12. **(R1 regression)** `--json` still emits the daemon-running advisory to stderr — listener-backed test binds a real TCP listener and asserts both `stdout` parses as JSON and `stderr` contains the verbatim phrase `Daemon currently running on 127.0.0.1:<port>`. Closes codex-5-5 R1 P2 #2 (the prior `!args.json` exclusion suppressed the brief Item 3.7 safety signal for scripted callers).
+12. **(R1 regression)** `--json` still emits the daemon-running advisory to stderr — listener-backed test binds a real TCP listener and asserts both `stdout` parses as JSON and `stderr` contains the verbatim phrase `Daemon currently running on 127.0.0.1:<port>`. Closes the Codex R1 audit finding (P2 #2) (the prior `!args.json` exclusion suppressed the Item 3.7 safety signal for scripted callers).
 13. **(R1 regression)** Human-readable mode also emits the advisory to stderr when a listener is bound. Pinned exact phrases verified against `src/cli/mint-token.ts:217-222`.
 
 ### Pre-publish gate
 
-One new gate step (R1 add): **npm pack contents check** — `scripts/pre-publish-check.sh` now greps `npm pack --dry-run --json` output for every doc cross-linked from the CLI runtime (currently `docs/agents/external-cli-setup.md`) and fails if any are absent. Closes codex-5-5 R1 P2 #1: pre-R1, the `package.json.files` array omitted `docs/`, so the tarball lacked the doc despite `src/cli/mint-token.ts:317` and `README.md:654` both linking to it. The mint-token mutation itself routes through the sanctioned helper `mintAgentToken` in `src/db.ts`, so the existing sanctioned-helper guard passes unchanged. CLI smoke (`scripts/smoke-25-tools.sh`) is unchanged in scope (mint-token tested via dedicated integration test, not the smoke harness).
+One new gate step (R1 add): **npm pack contents check** — `scripts/pre-publish-check.sh` now greps `npm pack --dry-run --json` output for every doc cross-linked from the CLI runtime (currently `docs/agents/external-cli-setup.md`) and fails if any are absent. Closes the Codex R1 audit finding (P2 #1): pre-R1, the `package.json.files` array omitted `docs/`, so the tarball lacked the doc despite `src/cli/mint-token.ts:317` and `README.md:654` both linking to it. The mint-token mutation itself routes through the sanctioned helper `mintAgentToken` in `src/db.ts`, so the existing sanctioned-helper guard passes unchanged. CLI smoke (`scripts/smoke-25-tools.sh`) is unchanged in scope (mint-token tested via dedicated integration test, not the smoke harness).
 
 ### Out of scope (deferred)
 
 - Bulk operations (`relay rotate-all-tokens`, `relay list-stale-tokens`, `relay agents --filter ...`) — queued as v2.7.
-- Cross-machine identity, namespace prefixing, hardware-backed token storage, GUI mint flow — Tether Cloud / Pro territory per `project_tether_product_strategy.md`.
+- Cross-machine identity, namespace prefixing, hardware-backed token storage, GUI mint flow — Tether Cloud / Pro territory.
 
 ### v2.6.2 R2 — codex PATCH-THEN-SHIP (universal powershell.exe gate, generalize R1)
 
-R1 verdict: PATCH-THEN-SHIP (codex msg `1dd82c7b`). R1 gated `cmd.exe` on `powershell.exe` presence — but wt.exe ALSO routes through `powershell.exe -NoExit -Command "..."` (v2.6.2 wrapped the inner shell to give the prelude a script context). Codex caught the same self-contradiction one sub-driver up: selecting wt without powershell creates a terminal that opens and immediately fails. Same bug class, second instance.
+R1 verdict: PATCH-THEN-SHIP (Codex audit). R1 gated `cmd.exe` on `powershell.exe` presence — but wt.exe ALSO routes through `powershell.exe -NoExit -Command "..."` (v2.6.2 wrapped the inner shell to give the prelude a script context). Codex caught the same self-contradiction one sub-driver up: selecting wt without powershell creates a terminal that opens and immediately fails. Same bug class, second instance.
 
 R2 generalizes: ALL three Windows sub-drivers require `powershell.exe`. Single universal gate.
 
@@ -759,18 +758,18 @@ R2 generalizes: ALL three Windows sub-drivers require `powershell.exe`. Single u
     return ctx.hasBinary(BINARY_FOR[sub]);
   }
   ```
-  JSDoc cites both codex msgs (`f242914a` cmd gap → `1dd82c7b` wt gap → R2 generalization). The auto-fallback chain effective shape: wt|powershell|cmd, all predicated on powershell.exe.
+  JSDoc cites both Codex findings (cmd gap → wt gap → R2 generalization). The auto-fallback chain effective shape: wt|powershell|cmd, all predicated on powershell.exe.
 - **`tests/spawn-drivers.test.ts`** — R1 auto-fallback chain test reshaped + 1 NEW wt-without-powershell rejection test mirroring R1's cmd pattern. The new chain test enumerates 4 positive cases (powershell present + each combo) + 4 negative cases (powershell missing). Other 9 wt-only test contexts updated to include powershell.exe (legitimate wt-with-powershell case). 74 → 75 spawn-drivers tests.
 - **No functional regression on Windows boxes without powershell.exe** — daemon-side R2/R3 stdio-only fallback in `src/server.ts:resolveToken` still authenticates the agent on first MCP call from the per-instance vault. Operators on those boxes (rare; powershell.exe ships with every Windows since Vista) lose the operator-visible `printenv RELAY_AGENT_TOKEN` UX win, not the auth itself.
 
-Generalization rule (added to discipline list): **when fixing a bug class, scope the fix to ALL similarly-shaped surfaces, not just the one flagged.** Walking the analogous code paths is part of declaring scope complete. R2 codifies this after R1 missed the wt path. (My v2.6.1 R3 work caught this rule for the resolveToken auth-oracle bug class via the parallel `resolveTokenForHealthCheck` instance — but didn't apply it when the v2.6.2 R0 → R1 brief landed. Brief discipline: walk every similarly-shaped surface BEFORE writing the fix.)
+Generalization rule (added to discipline list): **when fixing a bug class, scope the fix to ALL similarly-shaped surfaces, not just the one flagged.** Walking the analogous code paths is part of declaring scope complete. R2 codifies this after R1 missed the wt path. (My v2.6.1 R3 work caught this rule for the resolveToken auth-oracle bug class via the parallel `resolveTokenForHealthCheck` instance — but didn't apply it when the v2.6.2 R0 → R1 change landed. Discipline: walk every similarly-shaped surface before writing the fix.)
 
 ### v2.6.2 R1 — codex PATCH-THEN-SHIP (Windows cmd.exe contract + revoke_token vault scrub)
 
-R0 verdict: PATCH-THEN-SHIP (codex msg `f242914a`). Two small fixes — one codex P2 contract gap, one Maxime ergonomic call.
+R0 verdict: PATCH-THEN-SHIP (Codex audit). Two small fixes — one Codex P2 contract gap, one ergonomic call.
 
 - **`src/spawn/drivers/windows.ts:pickSubDriver` — cmd.exe gated on powershell.exe presence.** Codex caught a self-contradiction in v2.6.2: `pickSubDriver` would auto-fall-through wt → ps → cmd, but the cmd sub-driver branch invokes `powershell.exe -NoExit -Command "..."` for the vault prelude. If cmd was selected because powershell was missing, the cmd window would open and immediately fail (`'powershell.exe' is not recognized`) before claude could run. R1 closes by gating cmd selectability on powershell.exe availability — both via auto-fallback AND via `RELAY_TERMINAL_APP=cmd` override. Effective auto-chain: wt → powershell → (cmd skipped). cmd remains selectable when an operator explicitly chooses it AND powershell.exe is present. Daemon-side R2/R3 stdio fallback in `src/server.ts:resolveToken` is still the universal safety net for any path where the launching shell can't run.
-- **`src/tools/identity.ts:handleRevokeToken` — vault scrubbed alongside DB revoke.** Maxime's call (2026-05-05 per `memory/feedback_maxime_owns_strategic_calls.md`). The security boundary already held via the auth_state check at `src/server.ts:870-878` (revoked / recovery_pending tokens refuse), so a stale token on disk was harmless. R1 aligns the mental model: revoke_token now leaves NO credential on disk for the agent. New `FileTokenStore.deleteSync()` in `src/token-store.ts` mirrors the `readSync ↔ read` pair — sync to avoid cascading the handler to async. Best-effort try/catch swallows IO errors so a vault-scrub failure can't roll back a successful DB revoke. Idempotent: ENOENT is a clean no-op (legitimate revocation of an agent that never wrote a vault entry).
+- **`src/tools/identity.ts:handleRevokeToken` — vault scrubbed alongside DB revoke.** Design decision locked 2026-05-05. The security boundary already held via the auth_state check at `src/server.ts:870-878` (revoked / recovery_pending tokens refuse), so a stale token on disk was harmless. R1 aligns the mental model: revoke_token now leaves NO credential on disk for the agent. New `FileTokenStore.deleteSync()` in `src/token-store.ts` mirrors the `readSync ↔ read` pair — sync to avoid cascading the handler to async. Best-effort try/catch swallows IO errors so a vault-scrub failure can't roll back a successful DB revoke. Idempotent: ENOENT is a clean no-op (legitimate revocation of an agent that never wrote a vault entry).
 - **Tests** — 2 NEW spawn-drivers tests (cmd-without-powershell rejection + auto-fallback chain assertion). 2 NEW recovery-flow tests (revoke without recovery also scrubs vault + best-effort no-op when vault missing). Previous recovery-flow vault assertion flipped from "vault is NOT auto-scrubbed" → "vault scrubbed by revoke_token". 1248 → 1252 tests.
 - **Docs** — `revoke_token` tool description (`src/server.ts:592-598`) extended with the v2.6.2 R1 vault-scrub line. CHANGELOG entry above. Q7 hash bumped in `tests/v2-4-4-tool-description-quality.test.ts`.
 
@@ -778,7 +777,7 @@ R0 verdict: PATCH-THEN-SHIP (codex msg `f242914a`). Two small fixes — one code
 
 The last piece in the v2.6.0 cumulative arc before publish. Three audit rounds (R1 → R2 → R3) progressively closed the resolveToken auth-oracle bug class; v2.6.2 closes the cross-platform parity gap deferred from R1 and adds the missing shipped-path integration tests that hid the original v2.6.0 dropped-token bug. After v2.6.2 ships green, `npm publish` makes the cumulative v2.6.0 (mint-token + spawn-flow self-bootstrap + cross-platform FIX 1 + integration coverage) live on npm.
 
-#### v2.6.1 R2 — gate vault fallback to stdio transport (codex msg `d1fbbdde`)
+#### v2.6.1 R2 — gate vault fallback to stdio transport (Codex audit)
 
 R1 verdict: REJECT. R1's `resolveCallerNameForVault` honored `args.agent_name`, which let any unauthenticated HTTP caller name an agent and the daemon would obligingly read that name's vault file — turning the local file vault into a network-reachable auth oracle.
 
@@ -786,12 +785,12 @@ R1 verdict: REJECT. R1's `resolveCallerNameForVault` honored `args.agent_name`, 
 - **Tests** — `tests/v2-6-1-token-store.test.ts` test 17 rewritten as a real stdio MCP subprocess test (positive path); test 17b NEW negative HTTP test pins the security boundary (HTTP daemon refuses vault fallback even with a valid vault file present).
 - **Docs** — `SECURITY.md` precedence list extended with the gated 4th entry; `docs/agents/local-identity.md` lifecycle table adds an "HTTP daemon launched with `RELAY_AGENT_TOKEN` in its env" row; spawn_agent description updated for stdio-only scope (Q7 hash bump in `tests/v2-4-4-tool-description-quality.test.ts`).
 
-#### v2.6.1 R3 — generalize stdio-only gate to env-token + close adjacent health_check oracle (codex msg `2cbe68a2`)
+#### v2.6.1 R3 — generalize stdio-only gate to env-token + close adjacent health_check oracle (Codex audit)
 
 R2 verdict: REJECT. R2 closed only the vault half. Item 3 of the precedence chain (`process.env.RELAY_AGENT_TOKEN`) was still ungated — an HTTP daemon launched with `RELAY_AGENT_TOKEN` in its env would let any unauthenticated HTTP caller authenticate against the daemon's own env token. Same bug class as R1's vault, one layer up.
 
 - **`src/server.ts:resolveToken`** — restructured. The chain is now split by trust origin: items 1-2 (`args.agent_token`, `X-Agent-Token` header) caller-presented and accepted on any transport; items 3-4 (env, vault) daemon-side and gated COLLECTIVELY on `ctx.transport === "stdio"` with a single boundary check. JSDoc fully enumerates the trust-origin split.
-- **`src/tools/status.ts:resolveTokenForHealthCheck`** — adjacent instance found and fixed during R3 implementation per "close the full bug class" discipline. Same shape: read `RELAY_AGENT_TOKEN` env without transport gate. health_check is no-auth, but if a token validates it returns `agent_name` + `auth_state`, so an HTTP caller with no creds could probe what agent the daemon's env belongs to (information disclosure of the same bug class). Surfaced explicitly in R3 ship-pong.
+- **`src/tools/status.ts:resolveTokenForHealthCheck`** — adjacent instance found and fixed during R3 implementation per "close the full bug class" discipline. Same shape: read `RELAY_AGENT_TOKEN` env without transport gate. health_check is no-auth, but if a token validates it returns `agent_name` + `auth_state`, so an HTTP caller with no creds could probe what agent the daemon's env belongs to (information disclosure of the same bug class). Surfaced explicitly in the R3 completion report.
 - **Tests** — `tests/v2-6-1-token-store.test.ts` test 17c NEW: HTTP daemon respawned with `RELAY_AGENT_TOKEN=<real-token>` in env, attack `get_messages` with `args.agent_name` and no caller-presented token must `AUTH_FAILED`; control with `X-Agent-Token` succeeds.
 - **Docs** — `SECURITY.md` precedence list restructured with explicit caller-presented vs daemon-side split + general rule; `docs/agents/local-identity.md` bootstrap §2 expanded; spawn_agent description updated; Q7 hash bumped.
 
@@ -802,11 +801,11 @@ The Windows launching-shell prelude was deferred from R1 due to PowerShell escap
 - **`src/spawn/drivers/windows.ts:buildVaultPreludePowerShell(agentName)`** *(new)* — single-line PowerShell snippet that mirrors the macOS bash + Linux ts shapes: pre-resolves the absolute vault path on the parent (Node) side, embeds as a literal in the launched PowerShell, runs `Test-Path` + `Get-Content -Raw` + shape regex `^[A-Za-z0-9_=.-]{8,128}$` + `$env:RELAY_AGENT_TOKEN = ...`. Single source of truth shared across all 3 sub-drivers — drift-free.
   - **wt.exe** sub-driver: changed args from `["-d", cwd, "claude"]` to `["-d", cwd, "powershell.exe", "-NoExit", "-Command", inner]` so the prelude has a script context. Pre-v2.6.2 wt.exe ran `claude` directly and had no shell context for prelude injection.
   - **powershell.exe** sub-driver: prepends prelude to the existing `-Command` inner string.
-  - **cmd.exe** sub-driver: delegates the inner shell to `powershell.exe -NoExit -Command "..."` via `cd /D <cwd> && powershell.exe -NoExit -Command "<psInner>"`. cmd.exe lacks native `Get-Content` / regex match, so brief Option A — single PowerShell source of truth — is cleanest. The cmd `/K` window stays open after powershell exits.
+  - **cmd.exe** sub-driver: delegates the inner shell to `powershell.exe -NoExit -Command "..."` via `cd /D <cwd> && powershell.exe -NoExit -Command "<psInner>"`. cmd.exe lacks native `Get-Content` / regex match, so Option A — single PowerShell source of truth — is cleanest. The cmd `/K` window stays open after powershell exits.
 - **`tests/spawn-drivers.test.ts` — +5 new prelude tests + 5 updated existing tests** for the new wt/cmd shapes. New `v2.6.2 — Windows FIX 1 vault prelude` describe block asserts: each sub-driver embeds the prelude (4 signature regex), prelude omitted when agent name fails the FileTokenStore allowlist (defense-in-depth), cross-driver invariant (all 3 sub-drivers embed the SAME prelude byte-pattern). 67 → 72 tests.
 - **`tests/v2-6-2-spawn-to-ready.test.ts`** *(new, 4 tests)* — establishes the missing shipped-path test that hid the v2.6.0 dropped-token bug. Three vault-state scenarios (SR-A: no vault → prelude no-ops, SR-B: valid vault → prelude exports, SR-C: corrupted vault → prelude refuses to export) plus SR-D bonus end-to-end: register agent via HTTP daemon, capture token, write vault, run spawn-agent.sh DRY_RUN, exec captured prelude, then run `node dist/index.js` stdio MCP subprocess inheriting the prelude's env and assert `health_check` returns `token_validated:true` + `agent_name` + `auth_state:active`. macOS-gated; Windows / Linux equivalents covered by spawn-drivers.test.ts string-construction.
 - **`tests/v2-6-2-hook-contracts.test.ts`** *(new, 15 tests)* — shipped-path contract tests for all 3 hook scripts (`check-relay.sh`, `post-tool-use-check.sh`, `stop-check.sh`). Closes the "untested code path in shipped flow" class. Each hook tested for: empty stdin / no DB → exit 0 silent; valid agent name + DB present + pending message → correct stdout shape (plain-text for SessionStart, single-line JSON with right `hookEventName` for PostToolUse / Stop); invalid agent name → silent exit 0 with stderr warning; daemon-down → graceful degrade; vault hydration path. Cross-hook invariants assert no partial JSON / stack traces ever leak to stdout.
-- **`tests/v2-6-2-recovery-flow.test.ts`** *(new, 1 test)* — end-to-end recovery cycle: register admin (capabilities=["admin"]) + target → write target token to vault → admin `revoke_token({issue_recovery: true})` → original token now `AUTH_FAILED` → `register_agent` with `recovery_token` → fresh `agent_token` minted → write to vault → authenticated call with new token succeeds. Confirms `recovery_token` is single-use. **Surfaces a finding**: the brief's step 3 ("Verify vault is now scrubbed") doesn't match the implementation — `revoke_token` does NOT touch the vault; only the `relay recover` CLI scrubs it. The original token still fails auth post-revoke because the daemon's state check refuses `recovery_pending`, not because the vault is gone. Whether to add `vault.delete()` to `revoke_token` is a v2.6.3 / v2.7 design decision.
+- **`tests/v2-6-2-recovery-flow.test.ts`** *(new, 1 test)* — end-to-end recovery cycle: register admin (capabilities=["admin"]) + target → write target token to vault → admin `revoke_token({issue_recovery: true})` → original token now `AUTH_FAILED` → `register_agent` with `recovery_token` → fresh `agent_token` minted → write to vault → authenticated call with new token succeeds. Confirms `recovery_token` is single-use. **Surfaces a finding**: the spec's step 3 ("Verify vault is now scrubbed") doesn't match the implementation — `revoke_token` does NOT touch the vault; only the `relay recover` CLI scrubs it. The original token still fails auth post-revoke because the daemon's state check refuses `recovery_pending`, not because the vault is gone. Whether to add `vault.delete()` to `revoke_token` is a v2.6.3 / v2.7 design decision.
 - **`tests/v2-6-1-token-store.test.ts` test 17d NEW** — health_check HTTP-negative regression: daemon respawned with `RELAY_AGENT_TOKEN=<real-token>` in env, attack `health_check` with no token must NOT include `agent_name` / `auth_state` in response (the v2.6.1 R3 codex non-blocking note about the parallel resolver in `src/tools/status.ts`). Pins the resolveTokenForHealthCheck fix end-to-end. Control with `X-Agent-Token` returns `token_validated:true` + agent metadata.
 - **Docs** — `docs/agents/local-identity.md` adds a "Launching-shell vault prelude (cross-platform parity per v2.6.2)" subsection with platform table (macOS bash / Linux ts / Windows PowerShell) and Windows verification path. `SECURITY.md` extends pin-test references to include `:17b` (vault, R2), `:17c` (env-token, R3), `:17d` (health_check, v2.6.2). README + spawn_agent description unchanged from R3.
 
@@ -816,7 +815,7 @@ Pre-publish gate: 12/12 PASS (tsc + vitest 670+ tests + audit + build + extensio
 
 
 
-R0 verdict: REJECT. Codex caught the foundational gap: v2.6.1 R0 wrote the vault but never CONSUMED it on the daemon side. The SessionStart hook's `export RELAY_AGENT_TOKEN` only mutates the hook subprocess; the already-running stdio MCP server forked with whatever env it had at exec time, and never re-reads that env. So gaming-build's first MCP call still failed `AUTH_FAILED` even with a vault file on disk.
+R0 verdict: REJECT. Codex caught the foundational gap: v2.6.1 R0 wrote the vault but never CONSUMED it on the daemon side. The SessionStart hook's `export RELAY_AGENT_TOKEN` only mutates the hook subprocess; the already-running stdio MCP server forked with whatever env it had at exec time, and never re-reads that env. So a builder agent's first MCP call still failed `AUTH_FAILED` even with a vault file on disk.
 
 R1 closes the gap with two complementary fixes:
 
@@ -840,7 +839,7 @@ Pre-publish gate: 12/12 PASS (tsc, vitest 1220 tests, npm audit, build, extensio
 
 #### Windows scope (deferred, judgment call flagged for audit)
 
-Codex's brief warned: "If you hit any architectural fork (e.g., Linux/Windows driver path requires more than the bash snippet), STOP-AND-SURFACE." Windows requires PowerShell + cmd snippets in `src/spawn/drivers/windows.ts` — non-trivial escaping inside `-Command "..."` strings. v2.6.1 R1 ships **macOS + Linux launcher preludes** AND **daemon-side vault fallback (FIX 2) for every platform**. Windows correctness is preserved: every Windows sub-driver (wt.exe / powershell.exe / cmd.exe) goes through `resolveToken` on every MCP call, which falls back to the vault when env is empty. The only thing Windows operators DON'T get is operator-visible `RELAY_AGENT_TOKEN` in `printenv` — the daemon authenticates without it. Full Windows launcher prelude queued as v2.6.2 follow-up (or its own dual-audit round).
+Codex warned: "If you hit any architectural fork (e.g., Linux/Windows driver path requires more than the bash snippet), STOP-AND-SURFACE." Windows requires PowerShell + cmd snippets in `src/spawn/drivers/windows.ts` — non-trivial escaping inside `-Command "..."` strings. v2.6.1 R1 ships **macOS + Linux launcher preludes** AND **daemon-side vault fallback (FIX 2) for every platform**. Windows correctness is preserved: every Windows sub-driver (wt.exe / powershell.exe / cmd.exe) goes through `resolveToken` on every MCP call, which falls back to the vault when env is empty. The only thing Windows operators DON'T get is operator-visible `RELAY_AGENT_TOKEN` in `printenv` — the daemon authenticates without it. Full Windows launcher prelude queued as v2.6.2 follow-up (or its own dual-audit round).
 
 ### v2.6.1 stack — spawn-flow self-bootstrap (TokenStore + FileTokenStore)
 
@@ -867,7 +866,7 @@ Closes the latent v2.1 Phase 4j bug exposed 2026-05-04 when a child terminal spa
 
 `tests/v2-1-spawn-token-passthrough.test.ts` rewritten as legacy-rejection: assertions flipped to verify the env-var passthrough path is gone — `cmd.env.RELAY_AGENT_TOKEN` is now `undefined` for every driver, the macOS arg vector no longer carries the token, and `handleSpawnAgent` writes the vault file before dispatch.
 
-#### Cross-platform parity (per `feedback_cross_platform_parity.md`)
+#### Cross-platform parity
 
 - macOS / Linux: POSIX file (chmod 0o600), parent dir 0o700. Verified by tests.
 - Windows: NTFS file at `%USERPROFILE%\.bot-relay\instances\<id>\agents\<name>.token`. The `chmod` calls are best-effort no-ops; the parent dir under `%USERPROFILE%` already inherits a user-restricted ACL from the Windows profile defaults. Same threat model as `~/.aws/credentials` on POSIX. Documented in `SECURITY.md` + `docs/agents/local-identity.md`. v2.9+ Windows Credential Manager helper (pluggable via `TokenStore`) will move beyond profile-dir defaults.
@@ -890,19 +889,19 @@ The `relay://inbox/<agent_name>` resource is now subscribable per the MCP spec. 
 
 ### Part E — VSCode extension v0.1
 
-`extensions/vscode/` ships the first IDE consumer of the new subscription primitive. Activation is `onStartupFinished`. Status bar shows `Tether: <pending_count> | last <relative time>` with severity coloring (gray ≤0, yellow 1-3, red 4+); click opens a read-only webview with the last message preview; optional `autoInjectInbox` writes `inbox\n` to the integrated terminal whose name matches the agent's name. Settings live under `bot-relay.tether.*` with VSCode setting > env var > default precedence. Marketplace publish steps documented in `extensions/vscode/PUBLISH.md` for Maxime to run when ready.
+`extensions/vscode/` ships the first IDE consumer of the new subscription primitive. Activation is `onStartupFinished`. Status bar shows `Tether: <pending_count> | last <relative time>` with severity coloring (gray ≤0, yellow 1-3, red 4+); click opens a read-only webview with the last message preview; optional `autoInjectInbox` writes `inbox\n` to the integrated terminal whose name matches the agent's name. Settings live under `bot-relay.tether.*` with VSCode setting > env var > default precedence. Marketplace publish steps are documented for the maintainer to run when ready.
 
 ### Part D — documentation
 
 - **`docs/tether-roadmap.md`** *(new)* — canonical free-vs-paid architectural line. Phase 2 features explicitly named out-of-scope-of-this-repo.
 - **`extensions/vscode/README.md`** *(new)* — install + config + troubleshooting for the extension.
-- **`extensions/vscode/PUBLISH.md`** *(new)* — vsce publish checklist + manual smoke verification before publish.
+- vsce publish checklist + manual smoke verification before publish (developer-facing, not shipped).
 - **`README.md`** — new "Tether (v2.5)" section pointing at the bundled extension + the roadmap doc.
 
 ### Tests
 
-- **`tests/v2-5-mcp-subscriptions.test.ts`** *(new)* — 8 cases via real `Client` ↔ real `Server` over the SDK's `InMemoryTransport`. Per `feedback_test_asserts_contract_not_proxy.md`: every assertion answers "if the contract drifted, would this fail?" with yes. Covers single-subscriber receive, unsubscribe stops, multi-subscriber fan-out, cross-agent isolation (subscriber for X must NOT see events for Y), `readResource` snapshot shape, drain-fires-message_read, server-close cleanup, and broadcast fan-out per recipient.
-- **`tests/v2-5-tether-format.test.ts`** *(new)* — 6 unit cases for the VSCode extension's pure-function format helpers (status-bar text, severity buckets, relative-time formatter, toast text). Full UX integration (booting a real VSCode instance via `vscode-test`) is heavyweight + CI-only — surfaced as the manual-checklist in `extensions/vscode/PUBLISH.md` instead.
+- **`tests/v2-5-mcp-subscriptions.test.ts`** *(new)* — 8 cases via real `Client` ↔ real `Server` over the SDK's `InMemoryTransport`. Every assertion answers "if the contract drifted, would this fail?" with yes. Covers single-subscriber receive, unsubscribe stops, multi-subscriber fan-out, cross-agent isolation (subscriber for X must NOT see events for Y), `readResource` snapshot shape, drain-fires-message_read, server-close cleanup, and broadcast fan-out per recipient.
+- **`tests/v2-5-tether-format.test.ts`** *(new)* — 6 unit cases for the VSCode extension's pure-function format helpers (status-bar text, severity buckets, relative-time formatter, toast text). Full UX integration (booting a real VSCode instance via `vscode-test`) is heavyweight + CI-only — surfaced as a manual checklist instead.
 
 ### Protocol
 
@@ -910,11 +909,11 @@ The `relay://inbox/<agent_name>` resource is now subscribable per the MCP spec. 
 
 **Total after v2.5.0: 1180 tests pass** (1166 from v2.4.5 + 14 new across Parts S + E).
 
-### R1 patch round (codex-5-5 audit, 2026-04-29)
+### R1 patch round (Codex audit, 2026-04-29)
 
-R0 verdict: REJECT. Codex 5.5 caught a foundation-level gap and 3 mechanical bugs. R0's tests asserted the in-process subscription pipeline (InMemoryTransport) but the SHIPPED path is HTTP, and the HTTP daemon was strictly stateless — every GET /mcp returned 405. The VSCode extension's `StreamableHTTPClientTransport` requires a stateful SSE GET to receive `notifications/resources/updated` frames; the whole Tether UX was structurally broken in the actual deployment. Per `feedback_test_path_must_match_shipped_path.md`, an InMemoryTransport test is a proxy, not a contract.
+R0 verdict: REJECT. Codex caught a foundation-level gap and 3 mechanical bugs. R0's tests asserted the in-process subscription pipeline (InMemoryTransport) but the SHIPPED path is HTTP, and the HTTP daemon was strictly stateless — every GET /mcp returned 405. The VSCode extension's `StreamableHTTPClientTransport` requires a stateful SSE GET to receive `notifications/resources/updated` frames; the whole Tether UX was structurally broken in the actual deployment. The test path must match the shipped path — an InMemoryTransport test is a proxy, not a contract.
 
-Maxime's call: **Option A** — make the HTTP daemon support stateful sessions alongside the existing stateless POST. Aligns with v2.3 federation direction (which needs stateful anyway), works for every HTTP MCP client (Cursor, Cline, future tooling), additive (existing stateless POST clients unchanged).
+Decision: **Option A** — make the HTTP daemon support stateful sessions alongside the existing stateless POST. Aligns with v2.3 federation direction (which needs stateful anyway), works for every HTTP MCP client (Cursor, Cline, future tooling), additive (existing stateless POST clients unchanged).
 
 #### Architectural fix — stateful HTTP MCP sessions
 
@@ -951,18 +950,18 @@ Maxime's call: **Option A** — make the HTTP daemon support stateful sessions a
 
 - **Citation discipline** — re-read `src/transport/http.ts:1225-1267` verbatim before designing the dual-path router; verified SDK `StreamableHTTPServerTransport` semantics from `node_modules/@modelcontextprotocol/sdk/dist/cjs/server/streamableHttp.d.ts:30-52` (stateful vs stateless mode rules) rather than spec memory.
 - **Test path matches shipped path** — `tests/v2-5-mcp-subscriptions-http.test.ts` IS the R1 contract test. The R0 InMemoryTransport file stays as a fast unit-level check; the HTTP integration test is now the load-bearing one.
-- **STOP-AND-SURFACE on architectural forks** — surfaced the Option A/B/C choice with explicit recommendation + reasoning before coding. Maxime picked A. R0 violated this once (got lucky on subscription state — MCP spec mandated per-session); R1 didn't repeat the violation.
+- **STOP-AND-SURFACE on architectural forks** — surfaced the Option A/B/C choice with explicit recommendation + reasoning before coding. Option A was picked. R0 violated this once (got lucky on subscription state — MCP spec mandated per-session); R1 didn't repeat the violation.
 
 ### Hall of Fame
 
-- **Maxime** — original directive 2026-04-24 to bundle for velocity then split free/paid cleanly. The strict-line architecture is his call. Plus the R1 Option A call: "yeah of course, option a." Read the trade-offs and went straight for the foundation-aligned choice.
-- **Codex 5.5** — diagnosed the v2.5 R0 HTTP push gap from line numbers in `src/transport/http.ts` rather than running the test suite. The InMemoryTransport-vs-shipped-path failure mode is exactly the test discipline `feedback_test_path_must_match_shipped_path.md` exists to surface; codex caught it on the first pass.
+- **Design rationale** — bundle for velocity, then split free/paid cleanly (the R1 Option A call). The strict free/paid line is a deliberate architecture choice.
+- **Codex** — diagnosed the v2.5 R0 HTTP push gap from line numbers in `src/transport/http.ts` rather than running the test suite. The InMemoryTransport-vs-shipped-path failure mode is exactly the test-path-must-match-shipped-path discipline; Codex caught it on the first pass.
 - **The MCP resource subscription primitive** — shipped as a deferred capability in v2.4.0; finally getting used end-to-end in v2.5.0 R1.
 - **The TTY guard regression in v2.2.1** — the empirical evidence that operator-side notification was a real product gap, not a hypothetical one. That's what made Tether load-bearing instead of nice-to-have.
 
 ## v2.4.5 — 2026-04-28 — stdio/hook split-brain DB hotfix
 
-Hotfix for a multi-agent coordination bug Codex 5.5 caught during the v2.4.4 R2 audit. v2.4.0 shipped per-instance local isolation; the HTTP daemon's startup path correctly routed through `resolveInstanceDbPath()`, but several auxiliary entry points kept hardcoding `~/.bot-relay/relay.db`. An operator running with an active per-instance setup ended up with silent split-brain: the daemon wrote per-instance, the SessionStart hook read legacy, and an agent registered through one path was invisible from the other. The symptom that exposed it: Codex 5.5 couldn't authenticate via MCP because her hook was delivering from legacy while her agent row lived per-instance.
+Hotfix for a multi-agent coordination bug Codex caught during the v2.4.4 R2 audit. v2.4.0 shipped per-instance local isolation; the HTTP daemon's startup path correctly routed through `resolveInstanceDbPath()`, but several auxiliary entry points kept hardcoding `~/.bot-relay/relay.db`. An operator running with an active per-instance setup ended up with silent split-brain: the daemon wrote per-instance, the SessionStart hook read legacy, and an agent registered through one path was invisible from the other. The symptom that exposed it: Codex couldn't authenticate via MCP because its hook was delivering from legacy while its agent row lived per-instance.
 
 ### Fixed
 
@@ -1010,9 +1009,9 @@ Both 5.5 auditor instances ran independent passes on the R0 branch. Each found d
 
 ### Hall of Fame
 
-- **Codex 5.5** — diagnosed the split-brain via direct DB inspection during her first session. Sharp catch.
-- **Codex 5.5 (×2 in R1)** — both auditor instances independently caught different gaps; the dual-audit pattern works. HIGH 1 (Stop hook) would have shipped uncaught from a single-auditor pass.
-- **Maxime** — pushed back ("if it's not user friendly then it's a bug we need to fix") that elevated this from a one-off workaround to a proper architectural fix.
+- **Codex** — diagnosed the split-brain via direct DB inspection during its first session. Sharp catch.
+- **Codex (×2 in R1)** — both auditor instances independently caught different gaps; the dual-audit pattern works. HIGH 1 (Stop hook) would have shipped uncaught from a single-auditor pass.
+- **Maintainer feedback** — pushed back that a non-user-friendly path is a bug to fix, which elevated this from a one-off workaround to a proper architectural fix.
 
 ## v2.4.4 — 2026-04-27 — tool description quality (Glama A-tier push)
 
@@ -1053,7 +1052,7 @@ Pure string edits in TypeScript source. No runtime behavior, no syscalls, no pla
 
 ## v2.4.3 — 2026-04-27 — pre-publish `npm audit` resilience
 
-The CI green badge on main has to track code health, not npm registry weather. Pre-v2.4.3 it tracked both — when the v2.4.0 main merge ran post-tests, the legacy `/-/npm/v1/security/audits/quick` endpoint returned 400 ("This endpoint is being retired. Use the bulk advisory endpoint instead.") and the public CI badge swung red even though all 1099 tests passed. Same commit's branch CI was green a few minutes earlier — pure registry-side flake. Maxime's standing directive: "this is public not internal — i cannot have that every time we push."
+The CI green badge on main has to track code health, not npm registry weather. Pre-v2.4.3 it tracked both — when the v2.4.0 main merge ran post-tests, the legacy `/-/npm/v1/security/audits/quick` endpoint returned 400 ("This endpoint is being retired. Use the bulk advisory endpoint instead.") and the public CI badge swung red even though all 1099 tests passed. Same commit's branch CI was green a few minutes earlier — pure registry-side flake. Goal: registry-side availability must not turn the public CI badge red on every push.
 
 ### Added
 
@@ -1114,7 +1113,7 @@ Pure Node `process.stdin` + timers — no platform-specific syscalls. Tests use 
 
 ## v2.4.1 — 2026-04-24 — dashboard inbox visibility
 
-Operator-facing friction → product feature. Pre-v2.4.1 Maxime had to drop to `sqlite3 ~/.bot-relay/relay.db` to answer "which agent has mail piling up?" — the dashboard showed the 20 most-recent messages flat but no per-agent rollup. v2.4.1 closes that gap.
+Operator-facing friction → product feature. Pre-v2.4.1 an operator had to drop to `sqlite3 ~/.bot-relay/relay.db` to answer "which agent has mail piling up?" — the dashboard showed the 20 most-recent messages flat but no per-agent rollup. v2.4.1 closes that gap.
 
 ### Added
 
@@ -1140,7 +1139,7 @@ Per-agent inbox drilldown page, filtering by sender/priority/age, real-time push
 
 ### ⚠ Codex pre-ship audit patches (applied 2026-04-23)
 
-Codex returned PATCH-THEN-SHIP with 2 HIGH + 1 MED, all on Part E + Part F. Parts D (traffic replay) cleared. Patches landed on the same PR #3 verify branch before the ship ceremony.
+Codex returned PATCH-THEN-SHIP with 2 HIGH + 1 MED, all on Part E + Part F. Parts D (traffic replay) cleared. Patches landed on the same PR #3 verify branch before release.
 
 - **HIGH #1 — atomic lock-file in `src/instance.ts`.** `acquireInstanceLock` used check-then-write (`existsSync` → `readFileSync` → `kill(0)` → `writeFileSync`). Two concurrent daemon starts both passed the checks + both wrote the PID file; Codex reproduced this with two processes against the built `dist/instance.js`. Fix: switched to `openSync(pidFile, 'wx', 0o600)` — atomic exclusive-create at the syscall level. On `EEXIST` the lock inspects the existing PID + liveness for a clearer error message, but **NEVER auto-reclaims** — the re-audit (R2 below) demonstrated that any unlink-then-retry path has a TOCTOU race under concurrent acquisition. Live holder → refuse with `"already running (PID N)"`; dead / cross-user / unreadable → refuse with a verbatim POSIX-safe `rm -- '<escaped>'` remediation command for the operator to run after manual verification. See R2 + R3 below for the full final shape. Cross-platform — `'wx'` works on every Node platform.
 - **HIGH #2 — per-instance config path in `src/config.ts`.** `loadConfig()` was still reading `~/.bot-relay/config.json` in multi-instance mode while `RELAY_DB_PATH` had already been routed through `resolveInstanceDbPath()` → split-brain where an operator's DB moved to the per-instance subdir but config stayed flat. Codex repro: active instance `work` with per-instance `http_port=2222` still used `http_port=1111` from the flat file. Fix: new `resolveInstanceConfigPath()` in `src/instance.ts` that mirrors the DB-path resolution exactly; `getConfigPath()` now consults it before falling back to the flat layout. `RELAY_CONFIG_PATH` still wins as an explicit override. Regression test asserts active-instance config isolation end-to-end.
@@ -1196,10 +1195,10 @@ R2 HIGH cleared (both the fail-closed refusal and the EPERM cross-user path veri
 
 
 
-Three bundled parts per the v2.4.0 consolidated brief, dispatched the moment v2.3.0 shipped:
+Three bundled parts in the v2.4.0 release, shipped the moment v2.3.0 shipped:
 
-- **Part D** — A.3 traffic-replay harness (deferred from v2.3.0 at the brief's explicit escape-hatch).
-- **Part E** — per-instance local isolation (per `memory/project_federation_design.md` v2.2 roadmap, re-slotted to v2.4 since v2.3 took profiles + ambient-wake bandwidth).
+- **Part D** — A.3 traffic-replay harness (deferred from v2.3.0 at the explicit escape-hatch).
+- **Part E** — per-instance local isolation (per the federation design roadmap, re-slotted to v2.4 since v2.3 took profiles + ambient-wake bandwidth).
 - **Part F** — MCP prompts + resources split (the federation memo's "tools/resources/prompts split more aggressively" recommendation).
 
 Schema unchanged (v11 stays). Tool count unchanged (30 stays — prompts + resources are separate MCP capabilities, not tools). CLI subcommands 11 → 13 (`relay list-instances` + `relay use-instance`). Protocol `2.3.0 → 2.4.0`.
@@ -1242,11 +1241,10 @@ Tool count stays 30 — neither prompts nor resources add tools.
 - `package.json` 2.3.0 → 2.4.0.
 - `src/protocol.ts` 2.3.0 → 2.4.0.
 - New files: `src/transport/traffic-recorder.ts`, `scripts/replay-relay-traffic.ts`, `src/instance.ts`, `src/cli/list-instances.ts`, `src/cli/use-instance.ts`, `src/mcp-prompts.ts`, `src/mcp-resources.ts`, 3 docs, 4 test files.
-- `devlog/071-v2.4.0-consolidated-bundle.md` — assumptions-first.
 
 ### Hall of Fame
 
-- **Maxime** — the "keep victra-build moving the moment v2.3.0 ships" directive, plus the standing "stack as much as possible in one go" pattern. v2.4.0 dispatch fired within minutes of the v2.3.0 ship ceremony completing.
+- **Release cadence** — v2.4.0 bundled related work and shipped shortly after v2.3.0.
 - **Codex** — federation design memo (2026-04-19) that locked `instance_id` (not $USER) as the per-instance isolation unit + the MCP tools/resources/prompts split recommendation.
 - **The v2.3.0 Part A infrastructure** — property tests + consistency probe — made the A.3 traffic-replay harness possible without re-deriving ground-truth invariants. Traffic replay now stands alongside them as permanent bug-finding infra.
 
@@ -1254,7 +1252,7 @@ Tool count stays 30 — neither prompts nor resources add tools.
 
 ### ⚠ Codex pre-ship audit patches (applied 2026-04-23)
 
-Codex's dual-model audit of the v2.3.0 diff returned PATCH-THEN-SHIP. Two HIGH findings in Part C (Phase 4s ambient wake); Parts A + B cleared. Patches landed on the same PR #2 verify branch before the ship ceremony.
+Codex's dual-model audit of the v2.3.0 diff returned PATCH-THEN-SHIP. Two HIGH findings in Part C (Phase 4s ambient wake); Parts A + B cleared. Patches landed on the same PR #2 verify branch before release.
 
 - **HIGH #1 — atomic seq assignment race.** Pre-patch `getMessages` snapshotted `mailbox.next_seq` outside the transaction, then blindly incremented `next` for every candidate even when the `UPDATE ... WHERE seq IS NULL` no-op'd because another reader had already claimed the row. Two overlapping cross-process drains could stamp the same seq onto different messages. Fix: mailbox row is now read INSIDE the transaction; `next` advances ONLY when `UPDATE.changes === 1`; mailbox.next_seq persists the actual claim count, not the candidate count; transaction runs as BEGIN IMMEDIATE via better-sqlite3's `.immediate()` modifier so cross-process readers serialize at tx start. Rows claimed by another reader during our tx are re-hydrated via a targeted SELECT so the caller sees consistent seqs. (`src/db.ts`.)
 - **HIGH #2 — peek_inbox_version didn't surface new unread mail.** Pre-patch the response exposed `last_seq` as the watch field, but seq is assigned at DELIVERY time so `last_seq` only advances when the agent CALLS `get_messages` — defeating the point of the lightweight control-plane peek. Fix: new `total_unread_count` field computed via `SELECT COUNT(*) FROM messages WHERE to_agent = ? AND seq IS NULL`. Advances on every `send_message`. `docs/ambient-wake.md` promoted to watch-signal; `last_seq` demoted to read-cursor-across-reconnects.
@@ -1274,7 +1272,7 @@ v2.3.0 is the first MINOR release since v2.2.0. Three bundled parts: (A) systemi
 
 - **A.1 — property-based tests** (`tests/v2-3-0-property-based-query.test.ts`). 6 `fast-check` properties assert invariants that must hold regardless of input shape: (P1) send-then-peek returns exactly once, (P2) peek is non-mutating across repeated calls, (P3) consume-once drains, (P4) status-partition sums correctly, (P5) limit respected, (P6) round-trip content identity. Default gate runs 30 iterations per property (~180 scenarios); `FAST_CHECK_FULL=1` bumps to 200 (~1200) for the `--full` gate. New devDependency: `fast-check`.
 - **A.2 — live consistency probe** (`src/transport/consistency-probe.ts`). Sampling observer that runs inside the daemon when `RELAY_CONSISTENCY_PROBE=1`. Every Nth `get_messages` call (configurable via `RELAY_CONSISTENCY_PROBE_RATE`, default 100), a parallel raw-SQL SUPERSET query runs against `messages.to_agent`; if SQL sees pending rows the MCP path dropped, a structured warning lands on stderr with the missing IDs. Off by default. Never throws, never blocks, pure observation. Designed to catch the v2.2.1 drops-pending class of bug automatically in any environment the probe is on. 4 regression tests.
-- **A.3 — traffic-replay harness** — **deferred to v2.3.1** per the brief's explicit escape hatch. A.1 + A.2 deliver the bulk of the bug-finding value; the replay harness adds marginal coverage for the token cost of more test surface. Revisit when we have a reproducible bug that A.1 + A.2 can't surface deterministically.
+- **A.3 — traffic-replay harness** — **deferred to v2.3.1** per the explicit escape hatch. A.1 + A.2 deliver the bulk of the bug-finding value; the replay harness adds marginal coverage for the token cost of more test surface. Revisit when we have a reproducible bug that A.1 + A.2 can't surface deterministically.
 
 ### Part B — profiles + surface shaping
 
@@ -1319,11 +1317,10 @@ Test-fixture bumps for version/tool-count drift:
 - `package.json` 2.2.3 → 2.3.0.
 - `src/protocol.ts` 2.2.3 → 2.3.0.
 - New files: `src/cli/init.ts` profile section, `src/transport/consistency-probe.ts`, `src/tools/peek-inbox-version.ts`, `src/filesystem-marker.ts`, `docs/profiles.md`, `docs/ambient-wake.md`.
-- `devlog/070-v2.3.0-consolidated-bundle.md` — assumptions-first.
 
 ### Hall of Fame
 
-- **Maxime** — the "find bugs at scale without slowing speed" directive after the v2.2.1 get_messages-drops-pending incident that drove Part A. Also "stack as much as possible in one go" — that's what Part A + B + C together deliver.
+- **Rationale** — Part A was driven by the v2.2.1 get_messages-drops-pending incident (find bugs at scale without slowing delivery); Parts A + B + C bundle the related work.
 - **Codex (2026-04-19 Prompt B + Q9 reviews)** — the mailbox/seq-at-delivery-time/epoch-as-UUID design locked in Phase 4s. Also the event-sourcing-not-CRDT architectural correction that shapes v3+.
 - **The 2026-04-22 four-release sprint** (v2.2.0 → v2.2.1 → v2.2.2 → v2.2.3, all in one day) — every bug that surfaced became a seed for Part A's permanent prevention infrastructure.
 
@@ -1365,16 +1362,15 @@ This closes the "local gate green, CI red" loophole that let v2.2.1 + v2.2.2 shi
 - `package.json` 2.2.2 → 2.2.3.
 - `src/protocol.ts` 2.2.2 → 2.2.3.
 - `tests/v2-2-0-full-dashboard-smoke.test.ts` — version pins bumped to 2.2.3.
-- `devlog/069-v2.2.3-node-18-hotfix.md` — assumptions-first.
 
 ### Hall of Fame
 
-- **Maxime (public-facing CI failure, 2026-04-22):** caught the red badge + correctly escalated.
-- **Main-victra (root-cause diagnosis):** socket-level vs JS-level timer distinction + Node 18 EINPROGRESS behavior + prescribed fix + CI green-gate design.
+- **Maintainer (public-facing CI failure, 2026-04-22):** caught the red badge + correctly escalated.
+- **Root-cause diagnosis:** socket-level vs JS-level timer distinction + Node 18 EINPROGRESS behavior + prescribed fix + CI green-gate design.
 
 ## v2.2.2 — 2026-04-22 — defense-in-depth + dashboard UX polish + CLI ergonomics + 3 bundled bugs
 
-v2.2.2 bundles 11 items across four buckets: two server-side defense-in-depth touches (A1/A2), five dashboard UX polish items (B1-B5), one CLI ergonomics addition (C1), and three bundled bugs surfaced during the ship cycle itself (BUG1/BUG2/BUG3). One release, one Codex audit, one ship ceremony. Protocol bumps `2.2.1 → 2.2.2` (MINOR — additive endpoints + `get_messages.peek` parameter + agent_status enum widening with `abandoned` and `closed`). No breaking changes.
+v2.2.2 bundles 11 items across four buckets: two server-side defense-in-depth touches (A1/A2), five dashboard UX polish items (B1-B5), one CLI ergonomics addition (C1), and three bundled bugs surfaced during release validation (BUG1/BUG2/BUG3). One release, one Codex audit. Protocol bumps `2.2.1 → 2.2.2` (MINOR — additive endpoints + `get_messages.peek` parameter + agent_status enum widening with `abandoned` and `closed`). No breaking changes.
 
 ### Part A — server-side defense-in-depth
 
@@ -1393,7 +1389,7 @@ v2.2.2 bundles 11 items across four buckets: two server-side defense-in-depth to
 
 - **C1 — `relay open [--url <u>]`.** Opens the dashboard URL in the default browser. Auto-detects host + port from config (`$RELAY_HTTP_HOST`, `$RELAY_HTTP_PORT`, or `~/.bot-relay/config.json`). Platform routing: `darwin` → `open`, `win32` → `cmd.exe /c start "" <url>`, `linux` → `$BROWSER` when set else `xdg-open`. Daemon-down is a warning (prints actionable hint), not a hard failure — the browser still opens.
 
-### Part D — bundled bugs (discovered during the v2.2.2 ship cycle)
+### Part D — bundled bugs (discovered during v2.2.2 release validation)
 
 - **BUG1 — `get_messages` read-mark race on repeated pending polls.** Pre-v2.2.2 `getMessages(agent, 'pending', ...)` SELECTed pending messages + immediately UPDATEd them to `read_by_session = currentSession`. A second pending poll from the same session excluded those rows because they now matched their own session id — orchestrators that surveyed their own inbox on a polling interval lost visibility of real pending mail the moment they looked at it once. Fix: new optional `peek: boolean` field on `GetMessagesSchema` (default false). Threaded into `getMessages(agentName, status, limit, peek)`: when true, the mark-as-read UPDATE is skipped. Default behavior unchanged — single-shot workers still consume-once. Tool description expanded to document the orchestrator-polling use case.
 - **BUG2 — intentional-terminal-close `closed` agent_status.** Pre-v2.2.2 SIGINT/SIGTERM from a stdio terminal set `agent_status='offline'`, indistinguishable from a network drop. v2.2.2 adds a new enum value `closed` (relay-computed, not user-settable via `set_status`) with a sanctioned helper `closeAgentSession(name, expectedSessionId)` mirroring `markAgentOffline` but writing `'closed'`. `performAutoUnregister` prefers the new helper + falls back to `markAgentOffline` on helper-level failure; audit entry tool name is `stdio.auto_close` (vs `stdio.auto_offline`). Auto-promotes to `abandoned` via the existing `RELAY_AGENT_ABANDON_DAYS` chain. Dashboard adds `closed` to the status filter dropdown + a `.badge-closed` style (muted with line-through).
@@ -1424,23 +1420,22 @@ Test-fixture adjustments (v2.2.2 BUG2 semantic change — SIGINT path now `close
 
 - `package.json` 2.2.1 → 2.2.2.
 - `src/protocol.ts` 2.2.1 → 2.2.2.
-- `devlog/068-v2.2.2-consolidated-bundle.md` — assumptions-first.
 
 ### Hall of Fame
 
-- **Operator (Maxime, 2026-04-22):** surfaced the abandoned-agents UX pain after v2.2.1 ship filled the dashboard with retired spawns (B3), and requested the per-human identity cookie so the shared-daemon audit log could tell humans apart (A2).
+- **Operator (2026-04-22):** surfaced the abandoned-agents UX pain after v2.2.1 ship filled the dashboard with retired spawns (B3), and requested the per-human identity cookie so the shared-daemon audit log could tell humans apart (A2).
 - **Codex pre-ship audit (v2.2.1):** flagged the dashboard-secret-impersonation risk as a defense-in-depth gap → A1.
 
 ## v2.2.1 — 2026-04-21 — consolidated bug-sweep + dashboard polish
 
-v2.2.1 bundles 6 bug fixes (caught during v2.2.0 ship + operator use) with 5 dashboard polish items queued from the v2.2 locked spec. One release, one Codex audit, one ship ceremony. Protocol bumps `2.2.0 → 2.2.1` (MINOR — additive `set_dashboard_theme` tool + new `/api/send-message`/`/api/kill-agent`/`/api/set-status` endpoints + optional `force` field on `register_agent` + optional `hint` field on `get_messages`). No breaking changes. Schema migrates `v9 → v10`.
+v2.2.1 bundles 6 bug fixes (caught during v2.2.0 release + operator use) with 5 dashboard polish items queued from the v2.2 spec. One release, one Codex audit. Protocol bumps `2.2.0 → 2.2.1` (MINOR — additive `set_dashboard_theme` tool + new `/api/send-message`/`/api/kill-agent`/`/api/set-status` endpoints + optional `force` field on `register_agent` + optional `hint` field on `get_messages`). No breaking changes. Schema migrates `v9 → v10`.
 
 ### Part A — bug sweep
 
 - **B1 — CLI parser (Option A).** `node dist/index.js --transport=http --port=3777` no longer silently ignores the flags. New `src/cli.ts` with a tight allowlist (`--transport`, `--port`, `--host`, `--config`, `--help`, `--version`). Precedence: CLI > env > config file > default. Unknown flags fast-fail with `exit(2) + clear message`. Startup source-log emits one line showing which layer won for each knob.
 - **B2 — duplicate-name register race.** Two Claude Code terminals running under the same `RELAY_AGENT_NAME` + shared token previously silently rotated `session_id` and one terminal's mailbox reads silently dropped mail. `register_agent` now hard-rejects with `NAME_COLLISION_ACTIVE` when the existing row's `session_id` is set, `agent_status` is active, and `last_seen` is within 120s. Escape hatch: `force: true` on the register call. Exempt: `recovery_pending` + `legacy_bootstrap` auth states (admin-approved flows). Tests that legitimately exercise re-register flows now pass `force: true` to reach the re-register branch.
 - **B3 — daemon non-TTY fallback.** `node dist/index.js` in a non-TTY context (Claude Code bash sandbox, systemd service with no pty) now `exit(3)` with an actionable message pointing at `RELAY_TRANSPORT=http`. Was previously a silent exit-on-stdin-close. Escape hatch: `RELAY_SKIP_TTY_CHECK=1` for test harnesses piping MCP deliberately.
-- **B4 — `get_messages` since UX hint.** `status='pending' + count=0 + since < 24h` now surfaces a `hint` field: `"Narrow since window may hide older pending messages. Try since='24h' or since='all'..."`. Caught during v2.2.0 ship-ceremony debug when a 25-min-old pending message was hidden by `since='15m'` and triggered a false ghost-session diagnosis.
+- **B4 — `get_messages` since UX hint.** `status='pending' + count=0 + since < 24h` now surfaces a `hint` field: `"Narrow since window may hide older pending messages. Try since='24h' or since='all'..."`. Caught during v2.2.0 release-validation debugging when a 25-min-old pending message was hidden by `since='15m'` and triggered a false ghost-session diagnosis.
 - **B5 — multi-IP DNS round-robin.** `deliverPinnedPost` now accepts `pinnedIps: string[]` and tries each IP in order on connect-refused / timeout / ECONNRESET (max 3 attempts). Load-balanced webhook targets regain the failover-across-replicas semantic that native `fetch()`'s internal round-robin used to provide. Non-retryable errors (TLS, server 5xx) don't loop — they return immediately.
 - **B6 — Stop hook payload docs.** New `docs/hook-payload-format.md` consolidates Claude Code 2.1.x hook payload shapes (SessionStart / Stop / PostToolUse / PreToolUse / UserPromptSubmit) with minimal reader templates in Node + bash. Cross-linked from `docs/hooks.md`. Captured during Phase F build when the Stop-hook stdin-JSON format wasn't obvious from existing SessionStart patterns.
 
@@ -1470,7 +1465,7 @@ Single-row (CHECK id=1), seeded with `{theme:'catppuccin', custom_json:null}` on
 
 ### ⚠ Security patches from Codex pre-ship audit
 
-Codex's dual-model audit of the v2.2.1 diff returned PATCH-THEN-SHIP. Patches landed inline (not deferred) before the ship ceremony:
+Codex's dual-model audit of the v2.2.1 diff returned PATCH-THEN-SHIP. Patches landed inline (not deferred) before release:
 
 - **M1 (MEDIUM) — inline `/api/*` endpoints bypassed audit/attribution.** `/api/send-message`, `/api/kill-agent`, `/api/set-status` previously went directly to the DB functions, skipping the MCP dispatcher's `logAudit` + verified-caller attribution. A dashboard-secret holder could spoof a `send_message` as any registered `from` agent with no relay record pointing at the operator. Fix: new `logDashboardAudit()` helper in `src/transport/http.ts` wraps every call path with `source='dashboard'` + `via_dashboard: true` + `operator_identity` (sourced from `RELAY_DASHBOARD_OPERATOR` env var, fallback `"dashboard-user"`). Audit entries now record BOTH the operator AND the on-behalf-of agent for forensic replay. Failure paths (validation rejects, SENDER_NOT_REGISTERED, internal errors) also audit with `success=0` + error string.
 - **L1 (LOW) — `/api/set-status` missing WS broadcast.** MCP `set_status` fan-outs to connected dashboards via `broadcastDashboardEvent`; the HTTP endpoint skipped that step, leaving connected UIs up to 10s stale until the safety-net `/api/snapshot` poll. Fix: added the same `agent.state_changed` broadcast to the HTTP path.
@@ -1498,12 +1493,11 @@ Pre-patch retryable set: ECONNREFUSED + ETIMEDOUT + EHOSTUNREACH + ENETUNREACH +
 
 - `package.json` 2.2.0 → 2.2.1.
 - `src/protocol.ts` 2.2.0 → 2.2.1.
-- `devlog/067-v2.2.1-consolidated-bug-sweep-and-polish.md` — assumptions-first.
 
 ### Hall of Fame
 
-- **Operator surfacing (Maxime, 2026-04-21 evening):** CLI-args-silently-ignored (B1), `since` filter hiding pending (B4), daemon non-TTY silent exit (B3) — all caught during v2.2.0 ship ceremony.
-- **Codex (v2.2.0 audit):** duplicate-name race pattern context via `memory/feedback_scoped_victra_names.md` (B2), multi-IP round-robin note (B5).
+- **Operator surfacing (2026-04-21 evening):** CLI-args-silently-ignored (B1), `since` filter hiding pending (B4), daemon non-TTY silent exit (B3) — all caught during v2.2.0 release validation.
+- **Codex (v2.2.0 audit):** duplicate-name race pattern context via the scoped-agent-names guidance (B2), multi-IP round-robin note (B5).
 - **Phase F discovery (2026-04-21):** Claude Code 2.1.x Stop-hook stdin JSON payload format (B6).
 
 ## v2.2.0 — 2026-04-21 — core dashboard observability (+ bundled webhook TOCTOU fix + IP-classifier consolidation)
@@ -1528,7 +1522,7 @@ Narrow scope of the expansion:
 
 v2.2.0 introduces three platform-specific click-to-focus drivers. Validation coverage at ship time is **not symmetric across platforms**:
 
-- **macOS** — end-to-end validated. Full unit + integration test coverage (~90 tests across the v2.2.0 phase suites + 9 Codex-patch regressions). iTerm2 raise verified manually at ship ceremony.
+- **macOS** — end-to-end validated. Full unit + integration test coverage (~90 tests across the v2.2.0 phase suites + 9 Codex-patch regressions). iTerm2 raise verified manually during release validation.
 - **Linux** — code paths covered by command-construction tests (mocked spawn for `wmctrl -a`). **Not E2E-verified on a real Linux box at ship.** Architecture mirrors macOS; behavioral-divergence risk judged low. `wmctrl` is detected at startup; the focus endpoint graceful-degrades (409 with install hint) when absent.
 - **Windows** — code paths covered by command-construction tests (mocked spawn for PowerShell `WScript.Shell.AppActivate`). **Not E2E-verified on a real Windows box at ship.** Same low-risk assessment. Native to Windows; no extra install required.
 
@@ -1593,7 +1587,6 @@ If you operate on Linux or Windows and observe a focus-driver issue, please open
 - `--full` dashboard smoke (`tests/v2-2-0-full-dashboard-smoke.test.ts`): one server, every surface in one flow — health, /dashboard HTML, /api/snapshot with preview fields, /api/focus-terminal 404 + 409 paths, WS hello, TOCTOU-pinned delivery round-trip.
 - `package.json` 2.1.7 → 2.2.0.
 - `src/protocol.ts` 2.1.3 → 2.2.0 (MINOR additive).
-- `devlog/066-v2.2.0-dashboard-and-bundled-fixes.md` — assumptions-first.
 
 ### ⚠ Security patches from Codex pre-ship audit (applied before release)
 
@@ -1612,7 +1605,7 @@ Re-audit verdict: SHIP. Execution evidence: `tests/v2-2-0-codex-patches.test.ts`
 v2.2.0 ships two Codex v2.1.7 audit findings alongside the dashboard core:
 
 - **Codex** — v2.2 spec split (core vs polish), IP-classifier consolidation, TOCTOU Undici recommendation (implemented via stdlib `http`/`https` pinning — same effect, no new dep).
-- **Steph** — underlying class of TOCTOU vulnerability flagged in the v2.1.7 review that this release closes.
+- **External security review** — underlying class of TOCTOU vulnerability flagged in the v2.1.7 review that this release closes.
 
 ### Tests
 
@@ -1624,9 +1617,9 @@ v2.2.0 ships two Codex v2.1.7 audit findings alongside the dashboard core:
 
 Themes (catppuccin / dark / light), custom-paste theme JSON + `set_dashboard_theme` MCP tool, inline send-message form, inline kill-agent + `/api/kill-agent`, inline set-status dropdown + `/api/set-status`. These require more design iteration than the core observability layer; shipping the operator-facing foundation first lets the polish pass be informed by real usage.
 
-## v2.1.7 — 2026-04-21 — security hardening (external review: Steph + Codex)
+## v2.1.7 — 2026-04-21 — security hardening (external review + Codex audit)
 
-Focused security patch from external review. Steph (Maxime's wife's primary AI) surfaced four findings during a LAN-deployment review; Codex's follow-up dual-model audit added five more. v2.1.7 ships fixes for the HIGH and MEDIUM items; one MEDIUM (webhook DNS fast-flip TOCTOU) is deferred to v2.1.8, and two LOW items are documented in SECURITY.md. No tool surface change — protocol unchanged at `2.1.3`.
+Focused security patch from external review. An external security review surfaced four findings during a LAN-deployment review; Codex's follow-up dual-model audit added five more. v2.1.7 ships fixes for the HIGH and MEDIUM items; one MEDIUM (webhook DNS fast-flip TOCTOU) is deferred to v2.1.8, and two LOW items are documented in SECURITY.md. No tool surface change — protocol unchanged at `2.1.3`.
 
 ### HIGH — IPv6 prefix bypass → real CIDR matching (Codex)
 
@@ -1636,11 +1629,11 @@ Pre-v2.1.7 `src/url-safety.ts` classified link-local via `startsWith('fe80:')`, 
 
 `authMiddleware` ran before `dashboardAuthCheck` and enforced `RELAY_HTTP_SECRET` unconditionally, so operators who set `RELAY_DASHBOARD_SECRET` alone (expecting dashboard-only-secret isolation) silently got rejected with 401. The enumerated dashboard routes (`/`, `/dashboard`, `/api/snapshot`, `/api/keyring`) now bypass `authMiddleware`, letting `dashboardAuthCheck` apply its own secret independently. `/mcp` is explicitly NOT in the bypass list — its HTTP-secret gate stays intact.
 
-### HIGH — `/mcp` Host-header check (Steph)
+### HIGH — `/mcp` Host-header check
 
 `dashboardHostCheck` was wired per-route on dashboard paths only, leaving `/mcp` accepting any Host header. Renamed `dashboardHostCheck` → `httpHostCheck` and applied it globally via `app.use(...)` before `authMiddleware`, so DNS-rebinding attempts get a 421 Misdirected Request regardless of HTTP-secret state (and 421 is distinct from 401/403 so browsers/curl don't retry auth handshakes). New canonical env var `RELAY_HTTP_ALLOWED_HOSTS`; legacy `RELAY_DASHBOARD_HOSTS` preserved as a backward-compat alias. Operators can now also supply hostname-only entries (previously required exact `host:port`) — cleaner UX for random-port bind scenarios. `/health` remains exempt.
 
-### MEDIUM — SameSite cookie + CSRF double-submit infra (Steph)
+### MEDIUM — SameSite cookie + CSRF double-submit infra
 
 `dashboardAuthCheck` now (re-)issues two cookies on every successful auth:
 
@@ -1649,7 +1642,7 @@ Pre-v2.1.7 `src/url-safety.ts` classified link-local via `startsWith('fe80:')`, 
 
 New middleware `csrfCheck` enforces the double-submit pattern on unsafe methods (POST/PUT/DELETE/PATCH) against `/api/*`: cookie + header must be present AND match under constant-time compare. v2.1.7 ships with no state-changing `/api/*` endpoints — the middleware is infrastructure so v2.2's dashboard endpoints inherit CSRF coverage safe-by-construction. Token derivation: `HMAC-SHA256(dashboard_secret, per-process-random-salt)` — stateless, daemon-restart rotates.
 
-### MEDIUM — Per-IP HTTP rate + concurrent cap (Steph)
+### MEDIUM — Per-IP HTTP rate + concurrent cap
 
 Pre-v2.1.7 rate limits bucketed by `agent_name` on the tool-call path; an anonymous flood exhausted Express middleware + JSON-parse CPU before auth fired. New pre-auth middleware `rateLimitCheck`:
 
@@ -1661,7 +1654,7 @@ Pre-v2.1.7 rate limits bucketed by `agent_name` on the tool-call path; an anonym
 
 ### LOW — Documentation items
 
-- **Audit preview retention (Steph):** `audit_log.params_summary` retains 40-char plaintext previews for the audit retention window. Documented in SECURITY.md § "Known residual behavior" with operator-side sanitization guidance; server-side regex scrubbing tracked as v2.1.8 candidate.
+- **Audit preview retention:** `audit_log.params_summary` retains 40-char plaintext previews for the audit retention window. Documented in SECURITY.md § "Known residual behavior" with operator-side sanitization guidance; server-side regex scrubbing tracked as v2.1.8 candidate.
 - **Keyring reload semantics (Codex):** `RELAY_ENCRYPTION_KEYRING_PATH` contents are cached at first read; updating the file without restarting the daemon does not reload. Documented in SECURITY.md; `RELAY_ENCRYPTION_KEYRING_WATCH=1` reload flag tracked for v2.2.
 
 ### DEFERRED to v2.1.8 — webhook DNS fast-flip TOCTOU (Codex)
@@ -1676,7 +1669,7 @@ Codex noted URL-safety CIDR logic and HTTP-transport XFF classification are adja
 
 External reviewers credited in SECURITY.md:
 
-- **Steph** — LAN-deployment security review (original four findings).
+- **External security review** — LAN-deployment security review (original four findings).
 - **Codex** — dual-model audit (five additional findings including the concrete IPv6 SSRF).
 
 ### Tests
@@ -1689,7 +1682,6 @@ External reviewers credited in SECURITY.md:
 
 - `package.json` 2.1.6 → 2.1.7.
 - `src/protocol.ts` stays at `2.1.3` (no tool surface change; all items are HTTP-layer hardening + DB-layer helper updates).
-- `devlog/065-v2.1.7-security-patch.md` — assumptions-first per Karpathy rule.
 - `SECURITY.md` v2.1.7 section + Hall of Fame + known residuals.
 - Pre-publish `--full`: PASS 10/10.
 
@@ -1732,7 +1724,7 @@ Runs on macOS + Linux + Windows (pure Node CLI).
 
 The default KICKSTART embedded in spawned terminals picks up one extra sentence (macOS bash script + Linux/Windows TS drivers all at parity):
 
-> If you see more than 5 inbox messages on first pull, you may be a reused agent name inheriting prior-session backlog — filter aggressively, focus on the most recent messages addressed to you by main-victra or other active orchestrators, and consider calling get_messages with `since='session_start'` or `since='1h'` to narrow the window.
+> If you see more than 5 inbox messages on first pull, you may be a reused agent name inheriting prior-session backlog — filter aggressively, focus on the most recent messages addressed to you by your orchestrator or other active orchestrators, and consider calling get_messages with `since='session_start'` or `since='1h'` to narrow the window.
 
 `RELAY_SPAWN_KICKSTART` full-override is still honored verbatim; `RELAY_SPAWN_NO_KICKSTART=1` still suppresses entirely.
 
@@ -1755,8 +1747,7 @@ Additive + idempotent. No data backfill.
 
 - `package.json` 2.1.5 → 2.1.6.
 - `src/protocol.ts` 2.1.2 → 2.1.3.
-- `devlog/064-v2.1.6-inbox-hygiene.md` — assumptions-first per Karpathy rule.
-- Canonical spec: `audit-findings/v2.1.6-inbox-hygiene-spec.md`.
+- Canonical spec: an inbox-hygiene design spec.
 
 ## v2.1.5 — 2026-04-21 — `brief_file_path` cross-platform completion
 
@@ -1789,7 +1780,6 @@ Linux and Windows drivers do NOT emit a default kickstart in the absence of `bri
 
 - `package.json` 2.1.4 → 2.1.5.
 - `src/protocol.ts` stays at 2.1.2 (no surface change — same tool count, same args).
-- `devlog/063-v2.1.5-brief-file-path-cross-platform.md` — assumptions-first per Karpathy rule.
 
 ## v2.1.4 — 2026-04-20 (late evening) — durable briefs, server-side standup, self-managed cap expansion
 
@@ -1822,7 +1812,7 @@ Pure read path: no mutations, no side effects. Messages are NOT marked-as-read (
 
 ### I11 — `expand_capabilities` tool
 
-v1.7.1 locked capabilities as immutable on re-register to close the cap-escalation CVE. The side effect: an agent hook-registered with a narrow cap set (e.g. without `spawn`) had no way to widen without full unregister + re-register, losing its token. Main-Victra hit this on her own row. v2.1.4 adds `expand_capabilities(agent_name, new_capabilities)` — self-managed, additive-only.
+v1.7.1 locked capabilities as immutable on re-register to close the cap-escalation CVE. The side effect: an agent hook-registered with a narrow cap set (e.g. without `spawn`) had no way to widen without full unregister + re-register, losing its token. An orchestrator agent hit this on its own row. v2.1.4 adds `expand_capabilities(agent_name, new_capabilities)` — self-managed, additive-only.
 
 Rules (hard-enforced at the db layer):
 
@@ -1848,13 +1838,12 @@ New sanctioned helper: `expandAgentCapabilities(name, newCapabilities)` — join
 
 - `package.json` 2.1.3 → 2.1.4.
 - `src/protocol.ts` 2.1.1 → 2.1.2 (MINOR additive).
-- `devlog/062-v2.1.4-brief-standup-capexpand.md` — full assumptions-first per Karpathy rule.
 - `scripts/pre-publish-check.sh` drift-grep error message includes `expandAgentCapabilities` in the sanctioned-helper catalog.
 - `scripts/smoke-25-tools.sh` is NOT updated to cover the 2 new tools in v2.1.4 — they have dedicated vitest coverage, and smoke-script expansion is tracked for a future pass alongside v2.2 profile work.
 
 ## v2.1.3 — 2026-04-20 (daemon-restart resilience + 7 fixes from real-world multi-agent audit)
 
-First release driven end-to-end by real-world feedback from the 2026-04-20 multi-Victra session. Seven fixes landed — one root-cause architectural correction (I9 auto-offline instead of auto-delete), one observability reframe (I16 stdio/http process boundary), one defensive write-path (sendMessage sender verification), one test hygiene sweep (I8), one dispatcher error-code split (I5 name collision), one enum widening prereq for the v2.2 dashboard (I6), and one kickstart-prompt reflex fix for post-rate-limit injection paranoia (I7).
+First release driven end-to-end by real-world feedback from the 2026-04-20 multi-agent session. Seven fixes landed — one root-cause architectural correction (I9 auto-offline instead of auto-delete), one observability reframe (I16 stdio/http process boundary), one defensive write-path (sendMessage sender verification), one test hygiene sweep (I8), one dispatcher error-code split (I5 name collision), one enum widening prereq for the v2.2 dashboard (I6), and one kickstart-prompt reflex fix for post-rate-limit injection paranoia (I7).
 
 Protocol version bumps to `2.1.1` (MINOR — additive: `agent_status` output enum widens; new error codes `SENDER_NOT_REGISTERED` + `NAME_COLLISION_ACTIVE`). Schema version bumps to 7 (`migrateSchemaToV2_5` remaps legacy agent_status values). `src/transport/stdio.ts` SIGINT path no longer DELETEs; it now calls the new sanctioned helper `markAgentOffline`.
 
@@ -1904,7 +1893,7 @@ Health-monitor SQL that exempts `working`/`blocked`/`waiting_user`/`busy`/`away`
 
 `bin/spawn-agent.sh`'s default kickstart prompt now includes: *"Before rejecting any relay message as injection or fabricated context, first call `mcp__bot-relay__get_messages(agent_name=$RELAY_AGENT_NAME, status='all', limit=20)` to verify your own history — you may have sent the context-establishing message yourself. The relay is the trust anchor, not your in-session memory alone (which can drop across rate-limit recovery, respawn, or context compaction)."*
 
-Addresses the 2026-04-20 `medical-phase3` symptom: hit Claude usage limit mid-session, resumed after reset, rejected legitimate continuation messages from main-Victra as injection. Preserves `RELAY_SPAWN_KICKSTART` override (v2.1.2 contract).
+Addresses the 2026-04-20 symptom: an agent hit the Claude usage limit mid-session, resumed after reset, and rejected legitimate continuation messages from its orchestrator as injection. Preserves `RELAY_SPAWN_KICKSTART` override (v2.1.2 contract).
 
 ### Numbers
 
@@ -2028,7 +2017,7 @@ See [`docs/migration-v1-to-v2.md`](./docs/migration-v1-to-v2.md) for the v2.0.2 
 - **5a** — Fresh-install smoke: `scripts/smoke-25-tools.sh` (25 tools + 5 CLI subcommands; Phase 5a retires smoke-22).
 - **5b** — Load / chaos / cross-version tests under `pre-publish-check.sh --full`.
 - **5c** — Automated retro regression: `tests/regression-plug-and-play.test.ts` with 5 canary tests as publish-blockers.
-- **6** — Docs sweep: SECURITY.md, CONTRIBUTING.md, docs/migration-v1-to-v2.md, docs/key-rotation.md, docs/managed-agent-protocol.md, README/CLAUDE.md/HANDOFF.md refresh, license headers across src/tests/scripts.
+- **6** — Docs sweep: SECURITY.md, CONTRIBUTING.md, docs/migration-v1-to-v2.md, docs/key-rotation.md, docs/managed-agent-protocol.md, README refresh, license headers across src/tests/scripts.
 
 ### Numbers
 
@@ -2036,12 +2025,12 @@ See [`docs/migration-v1-to-v2.md`](./docs/migration-v1-to-v2.md) for the v2.0.2 
 - **CLI subcommands:** 0 → 8 (unified `relay` CLI ships at Phase 4h, extends to 8 with `recover` + `re-encrypt`).
 - **Tests:** 383 → 654 default + 16 opt-in = 670 (+287).
 - **Schema:** 1 → 5 (one version bump per architectural milestone).
-- **Env vars added:** 11 across the phase arc (see HANDOFF.md for the full list).
+- **Env vars added:** 11 across the phase arc (11 new env vars).
 - **Breaking MCP changes:** 0 — every additive; revoke-flow change is behavior, not shape.
 
 ### Discipline principle established
 
-"READ paths stay pure." Precedent across 4b.1 v2 (authenticateAgent), 4b.2 (rotation_grace cleanup in piggyback tick, not authenticateAgent), 4b.3 (decryptContent pure; lazy re-encrypt reserved signal only). Recorded in `devlog/052 §Architectural note` for future phase inheritance.
+"READ paths stay pure." Precedent across 4b.1 v2 (authenticateAgent), 4b.2 (rotation_grace cleanup in piggyback tick, not authenticateAgent), 4b.3 (decryptContent pure; lazy re-encrypt reserved signal only).
 
 ### What's NOT in v2.1.0
 
@@ -2126,7 +2115,7 @@ v2.0.1 is the npm-publish candidate — gated on dual-model re-audit. If GREEN, 
 
 ## v2.0.0 — 2026-04-17 (Plug-and-play release)
 
-**This is the flagship v2 release.** Everything works out of the box. Install, register, use — nothing else to configure, no conventions to remember. The guiding principle, from Maxime: if a user needs to remember a convention to avoid failure, that is a relay bug.
+**This is the flagship v2 release.** Everything works out of the box. Install, register, use — nothing else to configure, no conventions to remember. The guiding principle: if a user needs to remember a convention to avoid failure, that is a relay bug.
 
 v2.0.0 bundles the v2.0.0-alpha (data structures), v2.0.0-beta (smart routing), v2.0.0-beta.1 (Codex audit fixes), and v2.0.0 final scope into one shipping version. This is also the npm-publish candidate, gated on a final dual-model audit.
 
@@ -2219,7 +2208,7 @@ Full backlog at `plug-and-play-retro.md`. Highlights deliberately left for later
 
 ## v2.0.0-beta.1 — 2026-04-17 (Codex audit fixes — rolled into v2.0.0)
 
-Main Victra ran a Codex audit on beta. Four HIGH + two MEDIUM + one LOW findings — all valid. Beta.1 closes every HIGH before v2.0.0 final work starts (foundation-before-features).
+A Codex audit ran on beta. Four HIGH + two MEDIUM + one LOW findings — all valid. Beta.1 closes every HIGH before v2.0.0 final work starts (foundation-before-features).
 
 ### HIGH fixes
 
@@ -2249,7 +2238,7 @@ Main Victra ran a Codex audit on beta. Four HIGH + two MEDIUM + one LOW findings
 
 ## v2.0.0-beta — 2026-04-17 (Smart routing + lease heartbeat + lazy health monitor — rolled into v2.0.0)
 
-Second v2.0 sub-release. Working tree only — not published, not version-bumped in package.json yet. Checkpointing to main Victra before the final v2.0.0 sub-release (file transfer conventions + webhook retry with CAS).
+Second v2.0 sub-release. Working tree only — not published, not version-bumped in package.json yet. Checkpointing before the final v2.0.0 sub-release (file transfer conventions + webhook retry with CAS).
 
 ### What ships
 
@@ -2358,7 +2347,7 @@ Second v2.0 sub-release. Working tree only — not published, not version-bumped
 
 ## v1.10.0 — 2026-04-17 (Layer 2: Managed Agent integration — docs + reference workers)
 
-Layer 2 of the four-layer delivery architecture. Non-Claude-Code agents (Python daemons, Node workers, Hermes/Ollama integrations, custom scripts) can now integrate with the relay using a comprehensive guide and two runnable reference implementations.
+Layer 2 of the four-layer delivery architecture. Non-Claude-Code agents (Python daemons, Node workers, Ollama/vLLM integrations, custom scripts) can now integrate with the relay using a comprehensive guide and two runnable reference implementations.
 
 ### What ships
 
@@ -2381,9 +2370,9 @@ Layer 2 of the four-layer delivery architecture. Non-Claude-Code agents (Python 
 
 - **CLAUDE.md** — `examples/` directory added to file map, status line updated.
 
-### Fold-in from re-review 10
+### Fold-in from review 10
 
-- **tmux birthday-paradox math precision fix** — `docs/cross-platform-spawn.md` now says "50% at 362, 1% at 36, 0.1% at 11" instead of the directionally-correct-but-imprecise "~256." Per main Victra's re-review 10 note.
+- **tmux birthday-paradox math precision fix** — `docs/cross-platform-spawn.md` now says "50% at 362, 1% at 36, 0.1% at 11" instead of the directionally-correct-but-imprecise "~256." Per a review note.
 
 ### Numbers
 
@@ -2402,7 +2391,7 @@ Layer 2 of the four-layer delivery architecture. Non-Claude-Code agents (Python 
 
 ## v1.9.1 — 2026-04-16 (Cross-platform spawn hardening)
 
-Closes three blockers + four fold-ins surfaced by main Victra's re-review 9 of v1.9.0. Verdict for v1.9.0 was "foundation solid" with real seams to close — exactly what the v1.9 post-build section predicted. Foundation-before-features: ships before v1.10.
+Closes three blockers + four fold-ins surfaced by a review of v1.9.0. Verdict for v1.9.0 was "foundation solid" with real seams to close — exactly what the v1.9 post-build section predicted. Foundation-before-features: ships before v1.10.
 
 ### Blockers closed
 
@@ -2416,7 +2405,7 @@ Closes three blockers + four fold-ins surfaced by main Victra's re-review 9 of v
 
 **4. Cross-platform cwd rejection.** `normalizeCwd` in `src/spawn/validation.ts` now throws when passed a cwd that is nonsensical for the target platform: drive-letter paths (`C:\`, `D:/`) on POSIX, non-absolute paths on Windows. Three new fold-in tests assert these.
 
-**5. Honest-caveats section updated.** This entry explicitly lists the tmux collision closure. The `expected re-review findings` paragraph in `devlog/018` has been trued up by `devlog/019`'s post-build section.
+**5. Honest-caveats section updated.** This entry explicitly lists the tmux collision closure. The earlier expected-review-findings note has since been trued up by the post-build section.
 
 **6. Platform-aware `RELAY_TERMINAL_APP` override.** `resolveTerminalOverride` now takes the current platform as its second argument. Cross-platform names (e.g., `gnome-terminal` on macOS) are treated as invalid and fall through to auto-detect with a platform-specific stderr warning listing the valid choices. Previously: silently accepted then ignored by the macOS driver. Now: rejected consistently.
 
@@ -2518,22 +2507,22 @@ Allowlist-gated string that forces a specific sub-driver: `iterm2`, `terminal`, 
 
 **Docs-only. No code change.**
 
-v1.8.0 shipped the `PostToolUse` hook correctly, but the install docs did not teach readers that paths containing spaces must be single-quoted inside the JSON string of `.claude/settings.json`. Claude Code passes the `command` field to `/bin/sh`, which splits on whitespace — installations at paths like `/Users/name/Documents/Ai stuff/bot-relay-mcp/...` silently fail with `/bin/sh: ... is a directory` and no surfaced diagnostic.
+v1.8.0 shipped the `PostToolUse` hook correctly, but the install docs did not teach readers that paths containing spaces must be single-quoted inside the JSON string of `.claude/settings.json`. Claude Code passes the `command` field to `/bin/sh`, which splits on whitespace — installations at paths like `/path/to/My Projects/bot-relay-mcp/...` silently fail with `/bin/sh: ... is a directory` and no surfaced diagnostic.
 
 ### What ships
 
 - README "Near-Real-Time Mail Delivery" — important callout immediately after the copy-paste JSON block, with a concrete real-world quoted-path example alongside the generic `/path/to/...` template.
 - `docs/post-tool-use-hook.md` — fuller callout in the install section explaining the shell-quoting mechanics (outer JSON double-quotes, inner shell single-quotes), plus a diagnostic command (`sh -c "$COMMAND"`). Troubleshooting section gains a named entry: **"Hook silently fails on paths with spaces"** — so readers with a broken install can grep for the symptom and land on the fix.
-- Version bump to 1.8.1 across `package.json`, `src/server.ts`, `src/transport/http.ts`, CLAUDE.md, HANDOFF.md.
+- Version bump to 1.8.1 across `package.json`, `src/server.ts`, `src/transport/http.ts`.
 
 ### Why this earns a patch release, not a fold-in to v1.9
 
-Maxime's rule: v1.8 (the PostToolUse hook foundation) must be solid before v1.9 (cross-platform spawn) starts. A silent-failure install path on any machine whose workspace lives at a space-containing path is a broken first-run experience. Fixing it in a clean patch release preserves the foundation-before-features invariant and the project's clean-patch-release discipline.
+Project rule: v1.8 (the PostToolUse hook foundation) must be solid before v1.9 (cross-platform spawn) starts. A silent-failure install path on any machine whose workspace lives at a space-containing path is a broken first-run experience. Fixing it in a clean patch release preserves the foundation-before-features invariant and the project's clean-patch-release discipline.
 
 ### What was deliberately NOT done
 
 - No code changes. The hook script is correct as shipped.
-- No test churn. 238 tests pass unchanged; docs are not under test. (The optional embedded-JSON-parse test from Victra's brief did not apply — no embedded example exists in source.)
+- No test churn. 238 tests pass unchanged; docs are not under test. (The optional embedded-JSON-parse test from the review did not apply — no embedded example exists in source.)
 - No SessionStart-hook `docs/hooks.md` parallel patch. Out of scope for this patch — if the same guidance belongs there too, it queues as a separate doc ticket.
 
 ## v1.8.0 — 2026-04-15 (Layer 1 PostToolUse hook — near-real-time mail delivery)
@@ -2590,12 +2579,12 @@ Closes the human-bridged latency between agents. A new `PostToolUse` hook checks
 
 ## v1.7.1 — 2026-04-15 (Auth hardening — security advisory)
 
-**Two blockers from main Victra's v1.7 re-review.** Both are real vulnerabilities in the v1.7 auth layer. No internet-facing deployments exist and nothing has been published to npm, so no external clients are at risk — but the fixes ship before v1.8 per the foundation-before-features rule.
+**Two blockers from a v1.7 review.** Both are real vulnerabilities in the v1.7 auth layer. No internet-facing deployments exist and nothing has been published to npm, so no external clients are at risk — but the fixes ship before v1.8 per the foundation-before-features rule.
 
 ### Security advisory — CVE-equivalent issues in v1.7.0
 
 **CVE-equivalent 1 — Capability escalation via unauthenticated re-register (CRITICAL)**
-- In v1.7.0, `register_agent` was in `TOOLS_NO_AUTH` for bootstrap. Re-registration on an EXISTING agent name hit the same no-auth path and silently updated `capabilities`. An unauthenticated attacker could call `register_agent("victra", "r", ["spawn", "tasks", "webhooks", "broadcast"])` and grant themselves (or any agent they have a token for) every capability — nullifying the entire v1.7 capability-scoping feature.
+- In v1.7.0, `register_agent` was in `TOOLS_NO_AUTH` for bootstrap. Re-registration on an EXISTING agent name hit the same no-auth path and silently updated `capabilities`. An unauthenticated attacker could call `register_agent("target-agent", "r", ["spawn", "tasks", "webhooks", "broadcast"])` and grant themselves (or any agent they have a token for) every capability — nullifying the entire v1.7 capability-scoping feature.
 - **Fix:** dispatcher now bifurcates `register_agent`:
   - New registration (name does not exist in DB) → no auth required (bootstrap path preserved).
   - Re-registration (name exists, token_hash present) → auth required; the presented token must match that agent's stored hash.
@@ -2606,7 +2595,7 @@ Closes the human-bridged latency between agents. A new `PostToolUse` hook checks
 **CVE-equivalent 2 — Timing-unsafe HTTP secret comparison (HIGH)**
 - `src/transport/http.ts` used `presented === config.http_secret` and `findIndex((s) => s === presented)` — both are byte-by-byte short-circuiting JavaScript string equality. A remote caller could measure response timing to recover the shared secret one character at a time.
 - **Fix:** both checks now go through a `timingSafeStringEq` helper that length-checks first (short-circuit on length mismatch; length is operational metadata not a secret) then calls `crypto.timingSafeEqual` on `Buffer.from(s, "utf8")`. Content comparison is now constant-time. Length-mismatched callers get a clean 401 instead of a 500 (timingSafeEqual would otherwise throw).
-- A side-channel still exists on WHICH previous secret matched during rotation (loop short-circuits on first match). Documented in `devlog/015` — judged acceptable since previous secrets are already lower-trust, and will be revisited in a future patch if Victra rules otherwise.
+- A side-channel still exists on WHICH previous secret matched during rotation (loop short-circuits on first match). Judged acceptable since previous secrets are already lower-trust, and will be revisited in a future patch if review rules otherwise.
 
 ### Fold-ins from the docs audit
 
@@ -2621,11 +2610,11 @@ Closes the human-bridged latency between agents. A new `PostToolUse` hook checks
 ### What was deliberately NOT done (Karpathy rule 2 — surgical scope)
 
 - **No TOOLS_NO_AUTH membership change.** `register_agent` stays in the set for bootstrap; the re-register gate sits BEFORE the set check.
-- **No new `description` agent field.** Victra's spec mentioned "role and description" — there is no `description` column today; adding one would be scope creep. Only `role` is updatable on re-register.
+- **No new `description` agent field.** The spec mentioned "role and description" — there is no `description` column today; adding one would be scope creep. Only `role` is updatable on re-register.
 - **No bcrypt-path rework.** `bcrypt.compareSync` is already constant-time by design; only the HTTP shared-secret path was timing-leaky.
 - **No constant-time scan across all previous secrets.** Short-circuit on first match retained; documented as an acceptable trade-off in the devlog.
 - **No encryption / CORS / audit-log changes.** Out of scope.
-- **No npm publish, no v1.8 work.** Waiting on Victra's v1.7.1 re-review green-light.
+- **No npm publish, no v1.8 work.** Waiting on the v1.7.1 review green-light.
 
 ### Upgrade notes
 
@@ -2637,7 +2626,7 @@ Closes the human-bridged latency between agents. A new `PostToolUse` hook checks
 
 Per-agent auth, capability scoping, secret rotation, encryption at rest, structured audit log, CORS. Foundation shipped cleanly from v1.3 → v1.6.4. Now building the secure multi-agent + external integration layer on top of it.
 
-Plus 2 gate items rolled in from v1.6.4 re-review:
+Plus 2 gate items rolled in from v1.6.4 review:
 - **G1:** CLAUDE.md status line bumped to v1.7.0 / 218 tests / 14 tools.
 - **G2:** `ipInCidr` whitespace asymmetry — now trims both IP and CIDR inputs symmetrically.
 
@@ -2671,7 +2660,7 @@ Plus 2 gate items rolled in from v1.6.4 re-review:
 - Storage format: `enc1:<base64-iv>:<base64-ciphertext-plus-tag>`. Per-row IV (12 bytes).
 - Legacy plaintext rows (predating the key, or rows written while the key was unset) remain readable — decrypt is a safe no-op for non-`enc1:` rows.
 - Wrong key → GCM auth tag mismatch → decrypt throws clearly.
-- Key rotation DEFERRED to v1.7.1 per original brief. Single active key in v1.7.
+- Key rotation DEFERRED to v1.7.1 per the original plan. Single active key in v1.7.
 
 ### Fix 5 — Structured JSON audit log format
 - New column `audit_log.params_json` (added additively; old `params_summary` column preserved for back-compat readers).
@@ -2713,7 +2702,7 @@ Plus 2 gate items rolled in from v1.6.4 re-review:
 - Webhook User-Agent: bot-relay-mcp/1.7.0
 
 ### What was DELIBERATELY not done
-- Encryption key rotation (deferred to v1.7.1 per original brief).
+- Encryption key rotation (deferred to v1.7.1 per the original plan).
 - Token revocation list (for now, revocation = unregister the agent).
 - Capability mutation after registration (by design — unregister + re-register).
 - OAuth/JWT/SSO — shared-secret + per-agent tokens are sufficient for this threat model.
@@ -2721,7 +2710,7 @@ Plus 2 gate items rolled in from v1.6.4 re-review:
 
 ## v1.6.4 — 2026-04-14 (IPv6 form coverage + test hygiene — 5 surgical sharpening items)
 
-Main Victra's v1.6.3 re-review verdict was GREEN on all functional claims, with 5 sharpening items for v1.6.4. All shipped.
+The v1.6.3 review verdict was GREEN on all functional claims, with 5 sharpening items for v1.6.4. All shipped.
 
 ### Fix 1 — Fully-expanded IPv4-mapped IPv6 detection
 - Previously `ipv4FromMappedIPv6()` only recognized compressed forms (`::ffff:0102:0304`, `::ffff:1.2.3.4`). Fully-expanded `0:0:0:0:0:ffff:0102:0304` returned null, which would silently fail trust checks if an operator wrote a fully-expanded address in `trusted_proxies` config.
@@ -2781,7 +2770,7 @@ Main Victra's v1.6.3 re-review verdict was GREEN on all functional claims, with 
 
 ## v1.6.3 — 2026-04-14 (IPv4-mapped IPv6 + deeper attack coverage + doc drift fixes)
 
-Main Victra's v1.6.2 re-review found 10/13 items FULL, 2/13 PARTIAL, 1/13 DRIFT. v1.6.3 closes all three.
+The v1.6.2 review found 10/13 items FULL, 2/13 PARTIAL, 1/13 DRIFT. v1.6.3 closes all three.
 
 ### Fix 1 — IPv4-mapped IPv6 normalization in CIDR matcher (RFC 7239 §7.4)
 - Previously `::ffff:1.2.3.4` compared against `1.2.3.0/24` returned false (cross-family mismatch). Operators writing IPv4 CIDRs would fail to match dual-stack clients arriving in the mapped form.
@@ -2828,7 +2817,7 @@ Main Victra's v1.6.2 re-review found 10/13 items FULL, 2/13 PARTIAL, 1/13 DRIFT.
 
 ## v1.6.2 — 2026-04-14 (Defense-in-depth + trusted-proxy config)
 
-Main Victra re-reviewed v1.6.1 and found 2 items were PARTIAL. v1.6.2 addresses both fully, with real integration tests replacing mocked ones.
+A review of v1.6.1 found 2 items were PARTIAL. v1.6.2 addresses both fully, with real integration tests replacing mocked ones.
 
 ### Fix 1 — Spawn shell injection: defense-in-depth
 - **TS-layer validation in `src/types.ts` SpawnAgentSchema.** Zod schema now enforces explicit regex patterns matching the bash layer: name/role `[A-Za-z0-9_.-]+`, each capability item `[A-Za-z0-9_.-]+`, cwd absolute path with `/A-Za-z0-9_./-]` allowlist plus a negative-check `.refine` that rejects any shell metacharacter or control character even if the base pattern somehow let it through. This catches attacks at the MCP boundary before the shell ever runs.
@@ -2857,7 +2846,7 @@ Main Victra re-reviewed v1.6.1 and found 2 items were PARTIAL. v1.6.2 addresses 
 - Webhook User-Agent: bot-relay-mcp/1.6.2
 
 ### Backward compatibility
-- `trusted_proxies` defaults to `[]`. Behavior for existing deployments WITHOUT config is unchanged at the behavioral level: we never honored XFF from them meaningfully before (we did in v1.6.1, which is what Victra flagged as a leak). For anyone relying on XFF for rate limiting, they now need to explicitly configure `trusted_proxies`.
+- `trusted_proxies` defaults to `[]`. Behavior for existing deployments WITHOUT config is unchanged at the behavioral level: we never honored XFF from them meaningfully before (we did in v1.6.1, which a review flagged as a leak). For anyone relying on XFF for rate limiting, they now need to explicitly configure `trusted_proxies`.
 - All 104 v1.6.1 tests pass without modification.
 - All tool signatures unchanged.
 
@@ -2867,9 +2856,9 @@ Main Victra re-reviewed v1.6.1 and found 2 items were PARTIAL. v1.6.2 addresses 
 - `tests/spawn-integration.test.ts` — 17 real-shell integration tests
 - `tests/trusted-proxy.test.ts` — 2 HTTP-level XFF tests
 
-## v1.6.1 — 2026-04-14 (Main Victra's review fixes — 3 blockers + 5 fix-this-session items)
+## v1.6.1 — 2026-04-14 (review fixes — 3 blockers + 5 fix-this-session items)
 
-Main Victra reviewed v1.6 and held npm publish on three blockers + five fix-this-session items. All eight landed.
+A review of v1.6 held npm publish on three blockers + five fix-this-session items. All eight landed.
 
 ### Blockers resolved
 - **`bin/spawn-agent.sh` shell injection (CRITICAL).** Previously interpolated `$NAME`/`$ROLE`/`$CAPS`/`$CWD` directly into shell + osascript. Rewrote with: input validation regexes (name/role `[A-Za-z0-9_.-]`, caps `[A-Za-z0-9_.,-]`, cwd must be absolute path with no shell metacharacters), `printf %q` quoting for shell interpolation, and an `applescript_escape` helper that handles `\` and `"` for the AppleScript heredoc. 6 injection payloads verified blocked in smoke test.

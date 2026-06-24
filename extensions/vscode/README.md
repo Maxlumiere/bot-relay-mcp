@@ -26,7 +26,7 @@ npm run compile
 # In VSCode: F5 to launch the Extension Development Host with this extension loaded.
 ```
 
-See `PUBLISH.md` for the marketplace publish workflow.
+See the project's release notes for the marketplace publish workflow.
 
 ## Configuration
 

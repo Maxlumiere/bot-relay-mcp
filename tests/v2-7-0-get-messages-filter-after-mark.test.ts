@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 /**
- * v2.7.0 Hermes-flagged P1 regression — `since` filter must apply BEFORE
+ * v2.7.0 external-review-flagged P1 regression — `since` filter must apply BEFORE
  * the mark-as-read mutation.
  *
  * Bug class (pre-fix):
@@ -89,7 +89,7 @@ function parseHandlerResult(result: ReturnType<typeof handleGetMessages>): {
   return JSON.parse(result.content[0].text);
 }
 
-describe("v2.7.0 Hermes P1 — get_messages since filter applies BEFORE mark-as-read", () => {
+describe("v2.7.0 externally-flagged P1 — get_messages since filter applies BEFORE mark-as-read", () => {
   it("message older than `since` bound is NOT consumed/marked-read by a since-narrow call", () => {
     registerAgent("recipient", "tester", []);
     registerAgent("sender", "tester", []);

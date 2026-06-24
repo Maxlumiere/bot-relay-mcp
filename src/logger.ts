@@ -48,8 +48,8 @@ function minLevel(): number {
  *
  * Patterns intentionally match the common shapes operators are likely
  * to interpolate into a log message:
- *   - `RELAY_AGENT_TOKEN=<value>` — env-form (the exact shape Hermes
- *     surfaced in src/tools/identity.ts:150-153 pre-fix).
+ *   - `RELAY_AGENT_TOKEN=<value>` — env-form (the exact shape an external
+ *     review surfaced in src/tools/identity.ts:150-153 pre-fix).
  *   - `Authorization: Bearer <value>` and `Authorization: <value>` —
  *     HTTP request/response headers.
  *   - `X-Agent-Token: <value>` — relay's per-agent header.
@@ -60,7 +60,7 @@ function minLevel(): number {
  * Replacement is `***` (the value only; the key + framing stay so the
  * log line remains diagnostic).
  *
- * Origin: review-Victra synthesis msg `2b903f9b` / Hermes deep-review.
+ * Origin: an external security review.
  */
 export function redactSecrets(line: string): string {
   if (!line || typeof line !== "string") return line;

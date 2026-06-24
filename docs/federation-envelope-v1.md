@@ -119,7 +119,7 @@ The hub treats the envelope as opaque payload + metadata. It:
 ## 7. What v1 intentionally does NOT cover
 
 - **Envelope-level rotation.** If an edge's ed25519 key is compromised, v1 requires whole-edge rekey (new identity). A rotation grace (dual-key accept window) is a v3 item.
-- **Causal ordering guarantees.** `causal_refs` is a hint; receivers MAY process out-of-order. CRDT-style guarantees are explicitly deferred (CRDT-rejected per `memory/project_federation_design.md`).
+- **Causal ordering guarantees.** `causal_refs` is a hint; receivers MAY process out-of-order. CRDT-style guarantees are explicitly deferred (CRDT was rejected during federation design).
 - **Edge identity spec.** The string form of `origin_edge` / `target_edge` is defined in v2.3 federation kickoff. For v1, treat as opaque strings.
 - **Per-event-type schemas beyond §3.** Future event types extend §3 without bumping `protocol_version`. A breaking change to an EXISTING type's body shape DOES bump the version.
 - **Multiple signatures.** Exactly one `signature`, from `origin_edge`. Multi-sig envelopes (hub + origin double-attest) are a v3 item.

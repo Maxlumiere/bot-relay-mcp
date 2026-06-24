@@ -119,4 +119,3 @@ Archives are written with mode `0600` (owner-only) on POSIX filesystems, matchin
 - [`src/backup.ts`](../src/backup.ts) — implementation.
 - [`bin/relay`](../bin/relay) — unified CLI entry point. `relay backup` and `relay restore` are the Phase 4h-absorbed subcommands of the former standalone `bin/relay-backup` / `bin/relay-restore` (same flags, same exit-code contract).
 - [`tests/backup.test.ts`](../tests/backup.test.ts) + [`tests/backup-wasm.test.ts`](../tests/backup-wasm.test.ts) — 9 integration tests across native + wasm drivers.
-- [`devlog/031-v2.1-backup-restore.md`](../devlog/031-v2.1-backup-restore.md) — design decisions and assumptions.

@@ -5,9 +5,9 @@
 
 ---
 
-## v2.1.7 external review (external reviewer credit — Steph + Codex)
+## v2.1.7 external review (external reviewer + Codex)
 
-On 2026-04-21, an external security review by Steph (Maxime's wife's primary AI) surfaced four hardening gaps; Codex's follow-up audit added five more. v2.1.7 ships fixes for the HIGH and MEDIUM items inline; the two LOW items are documented in this file; the one MEDIUM (webhook TOCTOU on DNS fast-flip) is deferred to v2.1.8 per the scope envelope. Changes:
+On 2026-04-21, an external security review surfaced four hardening gaps; Codex's follow-up audit added five more. v2.1.7 ships fixes for the HIGH and MEDIUM items inline; the two LOW items are documented in this file; the one MEDIUM (webhook TOCTOU on DNS fast-flip) is deferred to v2.1.8 per the scope envelope. Changes:
 
 - **HIGH — IPv6 prefix bypass in `src/url-safety.ts`.** Pre-v2.1.7 code used `startsWith('fe80:')` for link-local classification, missing the remaining 6 prefixes in `fe80::/10` (fe90::, fea0::, etc.). Codex demonstrated a monkey-patched `dns.lookup` returning `fe90::1` passed validation and let a webhook fire against a link-local address. Replaced every prefix check with real IPv6 CIDR matching via `src/cidr.ts`. Now blocks: `::1/128`, `::/128`, `fe80::/10`, `fc00::/7`, `ff00::/8`, `::ffff:0:0/96`, `64:ff9b::/96`, `2001::/23`.
 - **HIGH — Dashboard secret layering.** `authMiddleware` (RELAY_HTTP_SECRET) ran ahead of `dashboardAuthCheck` and blocked requests lacking the HTTP secret before the dashboard-specific auth ever ran. Operators expecting dashboard-only-secret isolation silently got stronger auth than intended. Fixed: authMiddleware now skips the four enumerated dashboard routes (`/`, `/dashboard`, `/api/snapshot`, `/api/keyring`) so `dashboardAuthCheck` can enforce `RELAY_DASHBOARD_SECRET` independently.
@@ -22,7 +22,7 @@ On 2026-04-21, an external security review by Steph (Maxime's wife's primary AI)
 
 v2.1.7 hardening landed thanks to:
 
-- **Steph** — external review that flagged the original four items (/mcp Host-check, SameSite+CSRF, per-IP rate limits, audit preview retention doc).
+- **External security review** — flagged the original four items (/mcp Host-check, SameSite+CSRF, per-IP rate limits, audit preview retention doc).
 - **Codex** (dual-model audit) — five additional findings including the concrete IPv6 prefix-bypass SSRF.
 
 Reporters who prefer attribution here can request entries as part of the disclosure flow.
@@ -95,8 +95,8 @@ Subsequent tool calls must present the token via one of four channels (in preced
 
 **Daemon-side (STDIO TRANSPORT ONLY — gated on `currentContext().transport === "stdio"`):**
 
-3. `RELAY_AGENT_TOKEN` environment variable. The daemon's own env. On stdio this IS the agent's identity (single agent per process, RELAY_AGENT_NAME set at fork). On HTTP it's the daemon's env, so HTTP requests bypass it entirely — letting an HTTP caller authenticate against it without presenting the token themselves would turn the daemon into an auth oracle (codex msg 2cbe68a2, 2026-05-05).
-4. Per-instance file vault at `<instanceDir>/agents/<RELAY_AGENT_NAME>.token`, read via `defaultTokenStore().readSync()` (v2.6.1 R2). Same trust origin as item 3: the daemon's local filesystem. Gated on the same transport check; `args.agent_name` is **not** honored for vault lookup (codex msg d1fbbdde).
+3. `RELAY_AGENT_TOKEN` environment variable. The daemon's own env. On stdio this IS the agent's identity (single agent per process, RELAY_AGENT_NAME set at fork). On HTTP it's the daemon's env, so HTTP requests bypass it entirely — letting an HTTP caller authenticate against it without presenting the token themselves would turn the daemon into an auth oracle (Codex audit, 2026-05-05).
+4. Per-instance file vault at `<instanceDir>/agents/<RELAY_AGENT_NAME>.token`, read via `defaultTokenStore().readSync()` (v2.6.1 R2). Same trust origin as item 3: the daemon's local filesystem. Gated on the same transport check; `args.agent_name` is **not** honored for vault lookup (Codex audit).
 
 The general rule (v2.6.1 R3): **anything the daemon process has access to without the caller presenting it is a daemon-side credential, and daemon-side credentials must NEVER authenticate HTTP callers.** HTTP clients must always present a token via item 1 or item 2; otherwise the resolver returns null and the request fails `AUTH_FAILED`. This includes a daemon launched in HTTP mode with `RELAY_AGENT_TOKEN` baked into its env — that env is for stdio mode only and is ignored on HTTP requests. Pinned by `tests/v2-6-1-token-store.test.ts:17b` (vault, R2), `:17c` (env-token, R3), and `:17d` (health_check info-disclosure oracle, v2.6.2 — closes the same bug class on the parallel resolver in `src/tools/status.ts:resolveTokenForHealthCheck`).
 
@@ -243,7 +243,7 @@ Trust-model consequences you must accept before deploying a centralized hub:
 
 ## Disclosure
 
-Report vulnerabilities by email to **maxime@lumiereventures.co** or via the project's GitHub Security tab (if published). Please:
+Report vulnerabilities by email to **contact@lumiereventures.co** or via the project's GitHub Security tab (if published). Please:
 
 1. Include a clear reproduction (commands, env vars, expected vs observed).
 2. Specify the affected version (the running daemon's `/health` reports it).

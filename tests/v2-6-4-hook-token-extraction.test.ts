@@ -7,7 +7,7 @@
  * v2.6.4 — regression coverage for the check-relay.sh agent_token capture
  * regex bug.
  *
- * THE BUG (caught 2026-05-06 on news-intel-build's first spawn against a
+ * THE BUG (caught 2026-05-06 on a builder agent's first spawn against a
  * v2.6.0-LIVE daemon): the daemon serves MCP-over-HTTP responses in
  * SSE-wrapped + JSON-stringified format. Inner JSON has escaped quotes
  * (`\"`) and pretty-print spaces after colons (`\": `). Pre-v2.6.4
@@ -26,7 +26,7 @@
  *
  * Test path matches shipped path: real `hooks/check-relay.sh` invocation,
  * real `node dist/index.js` HTTP daemon, real curl-style fetch from
- * inside the bash hook. Per memory/feedback_test_path_must_match_shipped_path.md.
+ * inside the bash hook — the test exercises the real shipped path.
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";
@@ -58,7 +58,7 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
 
 describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE response)", () => {
   it("(T1) first spawn: hook calls register_agent via HTTP, captures agent_token from SSE-wrapped response, writes vault", async () => {
-    // Pin the EXACT bug class news-intel-build hit. Pre-v2.6.4 this would
+    // Pin the EXACT bug class the first-spawn hit. Pre-v2.6.4 this would
     // fail because the bash grep pattern expected unescaped JSON.
     const PORT = await getFreePort();
     const ROOT = path.join(os.tmpdir(), "v2-6-4-hook-extract-T1-" + process.pid);
@@ -368,7 +368,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
   // fixtures through them via bash. No regex re-implementation in TS — a
   // drift between this test and the shipped hook surfaces as a real failure.
   it("(T4) tightened {8,128} regex rejects below-min tokens, accepts valid 43-char tokens — pinned at EVERY agent_token extraction site (codex residual #1 + R2 walk-analogous)", () => {
-    // R2 fix (codex msg 8ccd2702): pre-R2 this test pinned only the L292
+    // R2 fix (Codex audit): pre-R2 this test pinned only the L292
     // REG_TOKEN line; the L174 NEW_TOKEN line could silently drift back
     // to `[A-Za-z0-9_=.-]+` and T4 would still pass. R2 generalizes the
     // drift guard + boundary cases to scan ALL `grep -oE.*agent_token`

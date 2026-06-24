@@ -6,7 +6,7 @@
 /**
  * v2.1 Phase 4p — webhook secret encryption at rest (Codex R1 HIGH #2).
  *
- * Spec: audit-findings/phase-4p-webhook-secrets-encryption-spec.md
+ * Spec: the phase-4p webhook-secrets-encryption design.
  *
  * Coverage (6 tests):
  *  1. encrypted-at-rest — raw SELECT on secret column returns ciphertext

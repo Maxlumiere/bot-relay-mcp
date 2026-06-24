@@ -14,12 +14,12 @@
  * within its handler so the dashboard doesn't wait up to a tick for
  * activity events.
  *
- * Per `feedback_test_path_must_match_shipped_path.md`: tests boot the
+ * Test path matches the shipped path: tests boot the
  * REAL HTTP transport + WebSocket layer + DB. No mocks on the
  * broadcast path — the assertion observes the actual JSON the
  * dashboard would see.
  *
- * Per `feedback_test_asserts_contract_not_proxy.md`: assertions pin
+ * Tests assert the exact contract, not a proxy: assertions pin
  * exact event names, exact entity_id values, exact kind tags.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -308,7 +308,7 @@ describe("v2.8 — wire-emit-sites — post_task", () => {
   it("(WE6) post_task fires task.transitioned broadcast", async () => {
     // The dispatcher requires the caller to hold the `tasks` capability
     // to invoke post_task (CAP_DENIED otherwise — caps are locked at
-    // first register per `feedback_relay_caps_immutable.md`). Both
+    // first register; caps are immutable after first registration). Both
     // poster and taskee must include `tasks` in their initial caps.
     const reg = await rpc("register_agent", {
       name: "wire-poster",

@@ -183,7 +183,7 @@ async function surfaceSecretStorageUnavailableNotice(
  * v0.1.3 [HIGH F10] — one-shot migration from plaintext
  * `settings.json` to encrypted SecretStorage.
  *
- * Hermes deep-review flagged that v0.1.2 stored the agent token via
+ * An external security review flagged that v0.1.2 stored the agent token via
  * `workspace.getConfiguration("bot-relay.tether").get("agentToken")`,
  * which writes to plaintext `settings.json`. Anyone with read access
  * to a backup / settings-sync / accidental screenshot recovered the
@@ -1094,8 +1094,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // `ignoreFocusOut: true` keeps the box open while the operator
     // pastes (some terminals lose focus mid-paste). Empty input clears
     // the stored secret.
-    // v0.2.0 R1 (codex audit msg 2e206b58, P2) — the brief at
-    // audit-findings/v0.2-tether-executor-scope-brief.md:93 and the
+    // v0.2.0 R1 (Codex audit, P2) — the v0.2 executor-scope brief and the
     // v0.2.0 CHANGELOG entry both promise this command supports
     // per-agent tokens for the executor flow. R0 still wrote only
     // the singleton SECRET_KEY_AGENT_TOKEN, which the executor path
@@ -1113,7 +1112,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const agentName = await vscode.window.showInputBox({
         title: "Tether: Set Agent Token — agent name (optional)",
         prompt:
-          "Agent name to scope the token to. Leave EMPTY to set the legacy v0.1.x observer-mode singleton token. For the executor (Tether: Spawn Agent), enter the agent name (e.g. victra-build).",
+          "Agent name to scope the token to. Leave EMPTY to set the legacy v0.1.x observer-mode singleton token. For the executor (Tether: Spawn Agent), enter the agent name (e.g. my-agent).",
         ignoreFocusOut: true,
         validateInput: (v) => {
           const t = v.trim();

@@ -4,7 +4,7 @@ This doc is for integrators building a **Managed Agent** — an agent that is NO
 
 - A Python script polling the relay for work, running jobs, reporting status.
 - A headless background worker on a Linux VM subscribing to `task.posted` webhooks.
-- A Hermes / Ollama / vLLM server participating in multi-agent workflows.
+- An Ollama / vLLM / llama.cpp server participating in multi-agent workflows.
 - A custom Node service bridging the relay to Slack / email / Discord.
 - (future) An Anthropic Managed Agent subscribed to the relay.
 

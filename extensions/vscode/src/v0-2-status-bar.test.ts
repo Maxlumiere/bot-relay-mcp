@@ -4,7 +4,7 @@
 
 /**
  * v0.2 — formatExecutorStatusBar contract tests.
- * Per `feedback_test_asserts_contract_not_proxy.md`: exact string
+ * Tests assert the exact contract, not a proxy: exact string
  * matches on the user-visible status bar text. Drift surfaces here.
  */
 import { describe, it, expect } from "vitest";
@@ -16,21 +16,21 @@ import {
 
 describe("v0.2 — formatExecutorStatusBar", () => {
   const baseArgs = {
-    agentName: "victra-build",
+    agentName: "build-agent",
     pendingCount: 0,
     status: "connected" as AgentLifecycleStatus,
   };
 
   it("(S1) connected + 0 pending — exact format", () => {
     expect(formatExecutorStatusBar(baseArgs)).toBe(
-      "Tether: victra-build | 0 pending | connected",
+      "Tether: build-agent | 0 pending | connected",
     );
   });
 
   it("(S2) pendingCount is interpolated verbatim", () => {
     expect(
       formatExecutorStatusBar({ ...baseArgs, pendingCount: 7 }),
-    ).toBe("Tether: victra-build | 7 pending | connected");
+    ).toBe("Tether: build-agent | 7 pending | connected");
   });
 
   it("(S3) all five executor statuses render", () => {
@@ -45,18 +45,18 @@ describe("v0.2 — formatExecutorStatusBar", () => {
     for (const c of cases) {
       expect(
         formatExecutorStatusBar({ ...baseArgs, status: c.lifecycle }),
-      ).toBe(`Tether: victra-build | 0 pending | ${c.status}`);
+      ).toBe(`Tether: build-agent | 0 pending | ${c.status}`);
     }
   });
 
   it("(S4) different agent names route through unchanged", () => {
     expect(
       formatExecutorStatusBar({
-        agentName: "codex-5-5",
+        agentName: "codex",
         pendingCount: 3,
         status: "connected",
       }),
-    ).toBe("Tether: codex-5-5 | 3 pending | connected");
+    ).toBe("Tether: codex | 3 pending | connected");
   });
 
   it("(S5) mapExecutorStatus mapping is exhaustive over the lifecycle enum", () => {

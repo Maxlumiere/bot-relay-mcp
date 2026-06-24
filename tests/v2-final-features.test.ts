@@ -50,34 +50,34 @@ afterEach(cleanup);
 
 describe("v2.0 final #6 — session-aware read receipts", () => {
   it("new terminal session sees previously-read messages again (handover fix)", () => {
-    // Victra sends audit to victra-build — session 1 reads it.
-    registerAgent("victra", "cos", []);
-    registerAgent("victra-build", "builder", ["build"]);
-    sendMessage("victra", "victra-build", "CRITICAL: 4 Codex HIGHs", "high");
+    // The orchestrator sends an audit to build-agent — session 1 reads it.
+    registerAgent("orchestrator", "cos", []);
+    registerAgent("build-agent", "builder", ["build"]);
+    sendMessage("orchestrator", "build-agent", "CRITICAL: 4 Codex HIGHs", "high");
 
     // Session 1 reads, message gets marked read_by_session = session-1.
-    const s1Messages = getMessages("victra-build", "pending", 20);
+    const s1Messages = getMessages("build-agent", "pending", 20);
     expect(s1Messages.length).toBe(1);
     expect(s1Messages[0].content).toBe("CRITICAL: 4 Codex HIGHs");
 
     // Same session re-reads pending → empty. Good.
-    const s1Again = getMessages("victra-build", "pending", 20);
+    const s1Again = getMessages("build-agent", "pending", 20);
     expect(s1Again.length).toBe(0);
 
     // New terminal opens — re-registers → session rotates.
-    const reReg = registerAgent("victra-build", "builder", ["build"]);
+    const reReg = registerAgent("build-agent", "builder", ["build"]);
     const session2 = reReg.agent.session_id;
     expect(session2).toBeTruthy();
 
     // Session 2 pending inbox includes the previously-read message.
-    const s2Messages = getMessages("victra-build", "pending", 20);
+    const s2Messages = getMessages("build-agent", "pending", 20);
     expect(s2Messages.length).toBe(1);
     expect(s2Messages[0].content).toBe("CRITICAL: 4 Codex HIGHs");
 
     // Now session 2 has marked it read. A third session would see it again.
-    const reReg3 = registerAgent("victra-build", "builder", ["build"]);
+    const reReg3 = registerAgent("build-agent", "builder", ["build"]);
     expect(reReg3.agent.session_id).not.toBe(session2);
-    const s3Messages = getMessages("victra-build", "pending", 20);
+    const s3Messages = getMessages("build-agent", "pending", 20);
     expect(s3Messages.length).toBe(1);
   });
 

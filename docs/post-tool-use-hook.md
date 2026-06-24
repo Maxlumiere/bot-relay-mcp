@@ -42,12 +42,12 @@ Replace `/path/to/` with the actual path to your bot-relay-mcp installation. `ma
 
 ### ❗ Paths containing spaces — single-quote inside the JSON string
 
-Claude Code invokes the `command` string via the shell. The shell splits on whitespace, so a path like `/Users/name/Documents/Ai stuff/bot-relay-mcp/hooks/post-tool-use-check.sh` gets interpreted as `/Users/name/Documents/Ai` + the arguments `stuff/bot-relay-mcp/hooks/post-tool-use-check.sh`. The first piece is a directory, not an executable, so the shell errors out with `/bin/sh: ... is a directory` — and because the hook's stderr is not surfaced to the user by default, the hook **silently fails**.
+Claude Code invokes the `command` string via the shell. The shell splits on whitespace, so a path like `/path/to/My Projects/bot-relay-mcp/hooks/post-tool-use-check.sh` gets interpreted as `/path/to/My` + the arguments `Projects/bot-relay-mcp/hooks/post-tool-use-check.sh`. The first piece is a directory, not an executable, so the shell errors out with `/bin/sh: ... is a directory` — and because the hook's stderr is not surfaced to the user by default, the hook **silently fails**.
 
 **Fix:** wrap the path in single quotes inside the JSON string:
 
 ```json
-"command": "'/Users/maxime/Documents/Ai stuff/Claude AI/bot-relay-mcp/hooks/post-tool-use-check.sh'"
+"command": "'/path/to/My Projects/bot-relay-mcp/hooks/post-tool-use-check.sh'"
 ```
 
 The outer double-quotes are JSON syntax. The inner single-quotes survive into the shell invocation and preserve the whole path as one argument. Paths without spaces do not need this, but the single-quote-always pattern is harmless and is the safer default.
@@ -70,7 +70,7 @@ The hook reads these:
 Typical setup via shell alias (the SessionStart hook already uses this pattern):
 
 ```bash
-alias ai-victra='RELAY_AGENT_NAME=victra RELAY_AGENT_TOKEN=<your-token> claude'
+alias ai-agent='RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=<your-token> claude'
 ```
 
 ## What the hook does
@@ -80,8 +80,8 @@ alias ai-victra='RELAY_AGENT_NAME=victra RELAY_AGENT_TOKEN=<your-token> claude'
 3. Otherwise falls back to sqlite direct on `RELAY_DB_PATH`. Reads pending rows, formats them, then marks those specific message IDs `read` in a follow-up statement.
 4. Emits a single-line Claude Code hook JSON (`{"continue": true, "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}`) to stdout. The content looks like:
    ```
-   [RELAY] New mail for victra-build (2 messages):
-     [high] from victra at 2026-04-15T07:43:23Z:
+   [RELAY] New mail for builder (2 messages):
+     [high] from planner at 2026-04-15T07:43:23Z:
        please review the v1.8 plan
      [normal] from ops at 2026-04-15T07:44:01Z:
        deploy green
@@ -102,7 +102,7 @@ The hook self-imposes a ~2 second budget (1s health probe + 2s `get_messages` ca
 
 ## Troubleshooting
 
-**Hook silently fails on paths with spaces.** This is the most common install bug. Claude Code passes the `command` string to `/bin/sh`, which splits on whitespace. A path like `/Users/name/Ai stuff/bot-relay-mcp/...` gets split at the space and the shell errors with `is a directory` — which you never see because hook stderr is not surfaced by default. **Fix:** single-quote the path inside the JSON string — see "Paths containing spaces" above. Verify with `sh -c "$COMMAND"` where `$COMMAND` is the exact string from your settings.json.
+**Hook silently fails on paths with spaces.** This is the most common install bug. Claude Code passes the `command` string to `/bin/sh`, which splits on whitespace. A path like `/path/to/My Projects/bot-relay-mcp/...` gets split at the space and the shell errors with `is a directory` — which you never see because hook stderr is not surfaced by default. **Fix:** single-quote the path inside the JSON string — see "Paths containing spaces" above. Verify with `sh -c "$COMMAND"` where `$COMMAND` is the exact string from your settings.json.
 
 **Hook fires but messages never appear.** Check that:
 - `RELAY_AGENT_NAME` matches the name the SessionStart hook registered under.

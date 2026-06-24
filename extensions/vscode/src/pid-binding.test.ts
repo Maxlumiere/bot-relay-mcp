@@ -19,13 +19,13 @@ import {
 
 const t = (name: string, processId: number | undefined): PidNamedTerminal => ({ name, processId });
 
-// Agent victra-build's registered ancestry chain + host.
+// Agent build-agent's registered ancestry chain + host.
 const BINDING = { hostShellPids: [55566, 55479, 55465], hostId: "HOST-A" };
 
 describe("resolveWakeTargetByPid — PID-primary, host-scoped", () => {
   it("★ binds the alias-launch terminal by PID even though it's named 'zsh' (NOT the agent name)", () => {
     const zsh = t("zsh", 55479); // controlling shell PID is in the chain
-    const d = resolveWakeTargetByPid("victra-build", BINDING, "HOST-A", [zsh, t("codex", 12345)]);
+    const d = resolveWakeTargetByPid("build-agent", BINDING, "HOST-A", [zsh, t("codex", 12345)]);
     expect(d.kind).toBe("inject");
     if (d.kind === "inject") expect(d.terminal).toBe(zsh);
   });
@@ -34,7 +34,7 @@ describe("resolveWakeTargetByPid — PID-primary, host-scoped", () => {
     // Same PID 55479, but the agent registered host_id HOST-B while this instance
     // is HOST-A → PID layer abstains; the terminal "zsh" doesn't name-match either.
     const d = resolveWakeTargetByPid(
-      "victra-build",
+      "build-agent",
       { hostShellPids: [55479], hostId: "HOST-B" },
       "HOST-A",
       [t("zsh", 55479)],
@@ -43,12 +43,12 @@ describe("resolveWakeTargetByPid — PID-primary, host-scoped", () => {
   });
 
   it("abstains (→ name fallback) when this instance's host_id is unknown", () => {
-    const d = resolveWakeTargetByPid("victra-build", BINDING, null, [t("zsh", 55479)]);
+    const d = resolveWakeTargetByPid("build-agent", BINDING, null, [t("zsh", 55479)]);
     expect(d.kind).toBe("no-match"); // can't host-scope → no PID match → name doesn't match
   });
 
   it(">1 terminals match the chain → ambiguous, never guess", () => {
-    const d = resolveWakeTargetByPid("victra-build", BINDING, "HOST-A", [
+    const d = resolveWakeTargetByPid("build-agent", BINDING, "HOST-A", [
       t("a", 55479),
       t("b", 55465),
     ]);
@@ -58,8 +58,8 @@ describe("resolveWakeTargetByPid — PID-primary, host-scoped", () => {
 
   it("0 PID matches (terminal closed) → falls back to the name matcher", () => {
     // No terminal carries a chain PID, but one is named for the agent → name wins.
-    const named = t("victra-build", 999);
-    const d = resolveWakeTargetByPid("victra-build", BINDING, "HOST-A", [t("zsh", 111), named]);
+    const named = t("build-agent", 999);
+    const d = resolveWakeTargetByPid("build-agent", BINDING, "HOST-A", [t("zsh", 111), named]);
     expect(d.kind).toBe("inject");
     if (d.kind === "inject") expect(d.terminal).toBe(named);
   });
@@ -69,22 +69,22 @@ describe("resolveWakeTargetByPid — name fallback (pre-handshake compatibility)
   const NO_BINDING = { hostShellPids: null, hostId: null };
 
   it("no registered PID chain → pure v0.2.2 name matcher (bare name)", () => {
-    const term = t("victra-build", 777);
-    const d = resolveWakeTargetByPid("victra-build", NO_BINDING, "HOST-A", [term, t("codex", 888)]);
+    const term = t("build-agent", 777);
+    const d = resolveWakeTargetByPid("build-agent", NO_BINDING, "HOST-A", [term, t("codex", 888)]);
     expect(d.kind).toBe("inject");
     if (d.kind === "inject") expect(d.terminal).toBe(term);
   });
 
   it("no registered PID chain + `Tether: <name>` convention still matches", () => {
-    const term = t("Tether: victra-build", 777);
-    const d = resolveWakeTargetByPid("victra-build", NO_BINDING, "HOST-A", [term]);
+    const term = t("Tether: build-agent", 777);
+    const d = resolveWakeTargetByPid("build-agent", NO_BINDING, "HOST-A", [term]);
     expect(d.kind).toBe("inject");
     if (d.kind === "inject") expect(d.terminal).toBe(term);
   });
 
   it("empty PID chain ([]) is treated as no binding → name fallback", () => {
     const d = resolveWakeTargetByPid(
-      "victra-build",
+      "build-agent",
       { hostShellPids: [], hostId: "HOST-A" },
       "HOST-A",
       [t("zsh", 55479)],
@@ -114,12 +114,12 @@ describe("isHostScopedMember — single-pid primitive (cache fast-path re-valida
 describe("parseAgentBinding — discover_agents → AgentPidBinding", () => {
   const roster = {
     agents: [
-      { name: "victra-build", host_shell_pids: [55566, 55479], host_id: "HOST-A" },
+      { name: "build-agent", host_shell_pids: [55566, 55479], host_id: "HOST-A" },
       { name: "codex", host_shell_pids: null, host_id: null },
     ],
   };
   it("extracts the named agent's chain + host_id", () => {
-    expect(parseAgentBinding(roster, "victra-build")).toEqual({
+    expect(parseAgentBinding(roster, "build-agent")).toEqual({
       hostShellPids: [55566, 55479],
       hostId: "HOST-A",
     });
@@ -265,7 +265,7 @@ describe("resolveAndWake — fresh binding, self-invalidating bound cache (R1)",
 // ancestor/descendant tree-match was removed): the agent's chain includes the
 // SHARED IDE ancestors every terminal in the window has (the editor + its
 // terminal host), so a tree-walk would cross-wake a sibling terminal. Exact
-// matching never touches those shared nodes. Models Maxime's real host:
+// matching never touches those shared nodes. Models a real host:
 //   Code(55447) → ptyHost(55465) → zsh(62903) → claude(63006) → hook(63025)
 const HOST_CHAIN: AgentPidBinding = { hostShellPids: [63025, 63006, 62903, 55465, 55447], hostId: "HOST-A" };
 

@@ -169,7 +169,7 @@ export function performAutoUnregister(
 
 function installAutoUnregister(): void {
   let fired = false;
-  // v2.8 — SIGHUP added per audit-findings/v2.8-dashboard-state-machine-brief.md.
+  // v2.8 — SIGHUP added per the v2.8 dashboard state-machine design.
   // iTerm2 / Terminal.app tab-close + ssh-disconnect both deliver SIGHUP;
   // pre-v2.8 the relay would never mark the agent closed in that path
   // and the dashboard saw a perpetually-alive ghost. SIGINT (Ctrl-C)

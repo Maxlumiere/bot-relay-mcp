@@ -103,7 +103,7 @@ export function handleSetStatus(input: SetStatusInput) {
  * caller could omit all credentials and the daemon would validate its
  * own env token, returning `agent_name` + `auth_state` for whichever
  * agent owns that env token — same auth-oracle / info-disclosure bug
- * class as resolveToken pre-R3 (codex msg 2cbe68a2). Stdio is safe
+ * class as resolveToken pre-R3 (Codex audit). Stdio is safe
  * because the process identity IS the agent.
  */
 function resolveTokenForHealthCheck(input: HealthCheckInput): string | null {

@@ -23,7 +23,7 @@ import { ERROR_CODES } from "../error-codes.js";
  * .token`. The hook reads the vault first; on miss it falls back to
  * `register_agent` + capture + write. Eliminates the "spawn-agent.sh
  * directly without pre-mint" failure mode (3-min broken state) hit
- * 2026-05-04 with gaming-build.
+ * 2026-05-04 during a builder spawn.
  *
  * Rollback: if the platform driver fails to launch, unregister the agent
  * row AND delete the vault entry so we don't leak a registered-but-not-

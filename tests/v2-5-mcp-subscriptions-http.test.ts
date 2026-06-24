@@ -7,7 +7,7 @@
  * v2.5.0 R1 — Real-HTTP MCP subscription contract test.
  *
  * The R0 InMemoryTransport test (tests/v2-5-mcp-subscriptions.test.ts)
- * proved the in-process subscription pipeline works. Codex 5.5 R1 audit
+ * proved the in-process subscription pipeline works. Codex R1 audit
  * caught that this is NOT the path the operator hits — the VSCode
  * extension subscribes over StreamableHTTPClientTransport, which requires
  * the daemon to expose a stateful GET /mcp SSE endpoint. Pre-v2.5 R0,
@@ -243,7 +243,7 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
     // v2.6.x / Tether v0.1.1 fold-in: capture transport-level errors so a
     // future SSE-GET-stream regression surfaces here instead of silently
     // failing the assertion downstream. Mirrors the production fix in
-    // extensions/vscode/src/extension.ts. Per codex audit msg 4eb34932.
+    // extensions/vscode/src/extension.ts. Per a Codex audit.
     const transportErrors: Error[] = [];
     transport.onerror = (err) => transportErrors.push(err);
     const client = new Client(
@@ -278,7 +278,7 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
     // v2.6.x / Tether v0.1.1 fold-in: capture transport-level errors so a
     // future SSE-GET-stream regression surfaces here instead of silently
     // failing the assertion downstream. Mirrors the production fix in
-    // extensions/vscode/src/extension.ts. Per codex audit msg 4eb34932.
+    // extensions/vscode/src/extension.ts. Per a Codex audit.
     const transportErrors: Error[] = [];
     transport.onerror = (err) => transportErrors.push(err);
     const client = new Client(
@@ -327,7 +327,7 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
   // DELETE" — is verified on Node 20/22 here; on Node 18 it's covered
   // indirectly by Q-HTTP-1 + Q-HTTP-2 (sessions get torn down via
   // transport.onclose when the SDK Client closes after each test). This
-  // is honest deferral per memory/feedback_honest_count_over_target.md:
+  // is honest deferral (we report an accurate count rather than padding):
   // we say what's tested where rather than green-washing a flaky case.
   const NODE_MAJOR = parseInt(process.versions.node.split(".")[0], 10);
   const skipOnNode18 = NODE_MAJOR <= 18 ? it.skip : it;
@@ -345,7 +345,7 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
     // v2.6.x / Tether v0.1.1 fold-in: capture transport-level errors so a
     // future SSE-GET-stream regression surfaces here instead of silently
     // failing the assertion downstream. Mirrors the production fix in
-    // extensions/vscode/src/extension.ts. Per codex audit msg 4eb34932.
+    // extensions/vscode/src/extension.ts. Per a Codex audit.
     const transportErrors: Error[] = [];
     transport.onerror = (err) => transportErrors.push(err);
     const client = new Client(

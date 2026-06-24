@@ -8,7 +8,7 @@
  *
  * Lives in its own module (no vscode deps) so the timing + cap logic
  * is testable with a fake clock — see src/restart-policy.test.ts.
- * Per `feedback_test_path_must_match_shipped_path.md`: the shipped
+ * Test path matches the shipped path: the shipped
  * AgentManager (src/agent-manager.ts) consumes the *same* class the
  * tests exercise.
  *

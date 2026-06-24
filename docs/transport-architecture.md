@@ -77,6 +77,5 @@ These two paths remain intact. They are explicit operator actions with delete se
 ## Related docs
 
 - `README.md` — Quick Start.
-- `HANDOFF.md` — operational cheat sheet.
 - `docs/multi-machine-deployment.md` — centralized HTTP daemon deployment (Phase 7r).
 - `architecture.md` — full architecture spec.

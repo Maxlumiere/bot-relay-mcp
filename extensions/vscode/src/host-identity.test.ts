@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // v0.3.0 PID-handshake — host-identity parser contract (all 3 platforms, H4).
-// Real T-ACC runs on POSIX (Maxime's Mac); Windows parsers are unit-verified
+// Real T-ACC runs on POSIX (macOS); Windows parsers are unit-verified
 // against documented `wmic` / `reg query` output shapes here — we have no
 // Windows host, so this is the honest Windows coverage (parser-verified, not
 // runtime-tested). The alias-launch ancestry tree is the load-bearing case:
@@ -22,7 +22,7 @@ import {
   type CommandRunner,
 } from "./host-identity.js";
 
-// The exact tree probed live on Maxime's Electron host (the v0.3 spike):
+// The exact tree probed live on an Electron host (the v0.3 spike):
 //   claude 55566 → zsh 55479 (controlling shell) → Code Helper 55465 → Code 55447 → launchd 1
 const ALIAS_PS = `
   55566  55479

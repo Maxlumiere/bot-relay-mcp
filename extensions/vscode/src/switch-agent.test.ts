@@ -15,13 +15,13 @@ import {
 
 describe("parseAgentNames — discover_agents → QuickPick candidates", () => {
   it("extracts names from the { agents: [...] } shape", () => {
-    const raw = { agents: [{ name: "victra-build" }, { name: "codex" }] };
-    expect(parseAgentNames(raw)).toEqual(["victra-build", "codex"]);
+    const raw = { agents: [{ name: "build-agent" }, { name: "codex" }] };
+    expect(parseAgentNames(raw)).toEqual(["build-agent", "codex"]);
   });
 
   it("extracts names from a bare array shape", () => {
-    const raw = [{ name: "victra-build" }, { name: "codex" }];
-    expect(parseAgentNames(raw)).toEqual(["victra-build", "codex"]);
+    const raw = [{ name: "build-agent" }, { name: "codex" }];
+    expect(parseAgentNames(raw)).toEqual(["build-agent", "codex"]);
   });
 
   it("accepts an array of plain strings", () => {
@@ -29,8 +29,8 @@ describe("parseAgentNames — discover_agents → QuickPick candidates", () => {
   });
 
   it("excludes the currently-subscribed agent", () => {
-    const raw = { agents: [{ name: "victra-build" }, { name: "codex" }] };
-    expect(parseAgentNames(raw, "victra-build")).toEqual(["codex"]);
+    const raw = { agents: [{ name: "build-agent" }, { name: "codex" }] };
+    expect(parseAgentNames(raw, "build-agent")).toEqual(["codex"]);
   });
 
   it("de-duplicates repeated names", () => {
@@ -57,14 +57,14 @@ describe("decideSwitchScope — global/workspace only (R2)", () => {
   });
 
   it("workspace when a workspace override exists (a Global write wouldn't take effect)", () => {
-    expect(decideSwitchScope({ workspaceValue: "victra-build" })).toEqual({
+    expect(decideSwitchScope({ workspaceValue: "build-agent" })).toEqual({
       kind: "write",
       target: "workspace",
     });
   });
 
   it("folder-override (no write) when a folder-level value is set — even alongside a workspace value", () => {
-    expect(decideSwitchScope({ workspaceFolderValue: "codex", workspaceValue: "victra-build" })).toEqual({
+    expect(decideSwitchScope({ workspaceFolderValue: "codex", workspaceValue: "build-agent" })).toEqual({
       kind: "folder-override",
     });
   });

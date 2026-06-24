@@ -7,8 +7,8 @@
  * v2.8 — deriveDashboardState unit tests.
  *
  * Pure derivation, fake clock + explicit thresholds. No DB boot, no
- * timers, no env munging. Per
- * `feedback_test_asserts_contract_not_proxy.md`: every test pins the
+ * timers, no env munging. Tests assert the exact contract, not a
+ * proxy: every test pins the
  * exact returned state (`toBe('closed')` etc.) and exercises a
  * specific transition / boundary / precedence rule.
  */

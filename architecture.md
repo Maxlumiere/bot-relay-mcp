@@ -1,11 +1,11 @@
 # bot-relay-mcp — Architecture Spec
 
-> See `CLAUDE.md` for quick overview, status, and build plan.
+> See `README.md` for quick overview, status, and build plan.
 
 ## System Architecture
 
 ```
-Terminal A (Victra)          Terminal B (Ops)          Terminal C (Builder)
+Terminal A (Orchestrator)    Terminal B (Ops)          Terminal C (Builder)
     |                            |                         |
     v                            v                         v
 MCP Server (stdio)          MCP Server (stdio)        MCP Server (stdio)
@@ -27,7 +27,7 @@ SQLite handles concurrent access through its built-in locking. WAL mode is enabl
 **`register_agent`** — Register the calling terminal as a named agent.
 - Input: `name` (string), `role` (string), `capabilities` (string[])
 - Behavior: Upserts by name. Sets `last_seen` to now. Returns agent record.
-- A name like "victra" or "ops" — human-readable, not UUIDs.
+- A name like "orchestrator" or "ops" — human-readable, not UUIDs.
 
 **`discover_agents`** — List all registered agents.
 - Input: `role` (optional string filter)
@@ -126,13 +126,13 @@ Every Claude Code terminal that opens will spawn its own server process. They al
 
 ## Example Workflow: Task Delegation
 
-Victra (orchestrator) needs Ops to run a server health check.
+An orchestrator agent needs an ops agent to run a server health check.
 
 ```
-1. Victra calls register_agent("victra", "orchestrator", ["planning", "delegation"])
-2. Victra calls discover_agents() — sees Ops is registered
-3. Victra calls post_task(from: "victra", to: "ops", title: "Health check",
-     description: "Run n8n health check and report status", priority: "high")
+1. Orchestrator calls register_agent("orchestrator", "orchestrator", ["planning", "delegation"])
+2. Orchestrator calls discover_agents() — sees Ops is registered
+3. Orchestrator calls post_task(from: "orchestrator", to: "ops", title: "Health check",
+     description: "Run a health check and report status", priority: "high")
    → Returns task_id: "abc-123"
 
 4. Ops calls get_messages("ops") — no direct messages, but...
@@ -145,10 +145,10 @@ Victra (orchestrator) needs Ops to run a server health check.
 7. Ops runs the health check...
 
 8. Ops calls update_task("abc-123", "ops", "complete",
-     result: "n8n healthy, 2.13.3, uptime 14 days, no errors")
+     result: "service healthy, uptime 14 days, no errors")
    → Task status: completed
 
-9. Victra calls discover_agents() or checks task status
+9. Orchestrator calls discover_agents() or checks task status
    → Sees task "abc-123" is completed with result
 ```
 

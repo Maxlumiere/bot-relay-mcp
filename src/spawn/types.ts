@@ -54,7 +54,7 @@ export interface SpawnDriver {
    * spawned terminal's SessionStart hook now resolves identity from the
    * per-instance file vault at `<instanceDir>/agents/<name>.token` instead of
    * an env-var passed through the spawn driver. Closes the
-   * spawn-without-pre-mint failure mode hit 2026-05-04 with gaming-build.
+   * spawn-without-pre-mint failure mode hit 2026-05-04 during a builder spawn.
    *
    * v2.1.4 (I10): optional `briefFilePath` is the absolute path to a durable
    * task brief the spawned agent should read FIRST. macOS passes it as arg 5

@@ -184,8 +184,8 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
       expect(stale.auth_error).toBe(true);
       expect(stale.error_code).toBe("AUTH_FAILED");
 
-      // v2.6.2 R1 — revoke_token now scrubs the vault (Maxime's call,
-      // 2026-05-05, per memory/feedback_maxime_owns_strategic_calls.md).
+      // v2.6.2 R1 — revoke_token now scrubs the vault (design decision
+      // locked 2026-05-05).
       // The security boundary already held via the auth_state check at
       // src/server.ts:870-878 — a stale token in the vault was harmless.
       // R1 aligns the mental model so revoke_token leaves NO credential on
@@ -267,7 +267,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
   }, 20_000);
 
   it("v2.6.2 R1 — revoke_token WITHOUT recovery (terminal revocation) also scrubs vault", async () => {
-    // Per Maxime's call (2026-05-05), v2.6.2 R1 added a vault scrub to
+    // Per a design decision locked 2026-05-05, v2.6.2 R1 added a vault scrub to
     // revoke_token regardless of issue_recovery. The legitimate revocation
     // path (terminal revoke, agent should re-bootstrap from scratch) leaves
     // no credential on disk. This complements the recovery-flow test above

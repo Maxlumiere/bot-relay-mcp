@@ -32,11 +32,11 @@ npm run dev
 
 ## Karpathy discipline
 
-Every change, no matter the size, follows these rules. Violating any = re-review failure.
+Every change, no matter the size, follows these rules. Violating any = review failure.
 
 ### 1. State assumptions BEFORE code
 
-Each new phase / meaningful change writes a devlog entry under `devlog/NNN-vX.Y.Z-title.md`. The entry has:
+Each new phase / meaningful change records its assumptions before the code is written:
 
 - **Context.** Why this work exists, what's broken.
 - **Verified before code.** Concrete facts about the existing surface the change depends on. Greps, reads, precedent.
@@ -44,7 +44,7 @@ Each new phase / meaningful change writes a devlog entry under `devlog/NNN-vX.Y.
 - **Planned implementation.** Ordered steps.
 - **Non-goals.** Explicit deferrals — what this change does NOT do.
 
-Assumptions-first is load-bearing. If you discover mid-build that an assumption was wrong, update the devlog and surface the delta in the ship-pong.
+Assumptions-first is load-bearing. If you discover mid-build that an assumption was wrong, update the record and surface the delta in the PR description.
 
 ### 2. Surgical scope only
 
@@ -54,20 +54,20 @@ Ship exactly what the spec calls for. No "while I'm here" refactors. No speculat
 
 No happy-path mocks for security features. If you added a defense, write a test that tries to defeat it. Semantic assertions only — `post_task_auto` self-assign bug sat in the smoke for months because the old assertion was `"assigned → <anyone>"` instead of `"routed → <not-sender>"`.
 
-### 4. Devlog is honest
+### 4. Changelog is honest
 
-Fill in the **post-build** section before ship-pong:
+Fill in the **post-build** notes before opening the PR:
 - **What shipped** — concrete file list + behavior notes.
 - **Validation** — gate output + test count.
 - **Surprises / notes** — what you didn't expect. Callouts for any deviation from the assumptions section.
 - **Numbers** — test count delta, file count delta, LOC delta.
 - **What's next.**
 
-No "TBD" — if you can't fill it, ship-pong is premature.
+No "TBD" — if you can't fill it, the change isn't ready to ship.
 
 ### 5. Foundation before features
 
-Never start v(N+1) while v(N) has PARTIAL or DRIFT items from review. Ship patches first, re-review, THEN move on.
+Never start v(N+1) while v(N) has PARTIAL or DRIFT items from review. Ship patches first, review again, THEN move on.
 
 ### 6. READ paths stay pure
 
@@ -96,14 +96,13 @@ Adds three more steps: load-smoke, chaos, cross-version. Wall clock ~90s total; 
 
 ---
 
-## Devlog numbering
+## Changelog entries
 
-Sequential zero-padded: `devlog/001-first-test.md` through `devlog/055-v2.1-load-chaos-crossversion.md` as of v2.1.0.
+Keep a clear changelog entry per change.
 
-- One devlog per "phase" (self-contained unit of work).
-- Title: `NNN-vX.Y.Z-topic.md` (e.g. `046-v2.1-unified-cli.md`).
-- Never renumber; append-only history.
-- Strategic / architectural documents live in `audit-findings/` (Victra + Codex brief material).
+- One entry per "phase" (self-contained unit of work).
+- Append-only history; never rewrite shipped entries.
+- Strategic / architectural documents live in design-notes (material for review).
 
 ---
 
@@ -111,26 +110,26 @@ Sequential zero-padded: `devlog/001-first-test.md` through `devlog/055-v2.1-load
 
 The project uses a dual-model audit pattern for every major release:
 
-1. **Claude side** — the builder self-reviews against the spec + runs the gate.
-2. **Codex side (GPT)** — asynchronous review. Specs + findings shipped in `audit-findings/` get pasted into Codex for independent critique.
+1. **First pass** — the author self-reviews against the spec + runs the gate.
+2. **Independent pass** — an asynchronous review by a second model (e.g. Codex). Specs + findings are handed to the independent reviewer for critique.
 
 Findings are tracked:
 
-- **HIGH** — blocks ship. Must be patched + re-reviewed.
+- **HIGH** — blocks ship. Must be patched + reviewed again.
 - **MEDIUM** — ship-patch OR deferred with explicit note.
 - **LOW** — can batch into a later MEDIUM+LOW phase (see Phase 4q for the pattern).
 
-GREEN verdicts between Victra + the builder travel via the MCP relay itself (`send_message` with `priority: "high"`). Keep the message body grep-able — titles like `PHASE 4X AUDIT GREEN` so later searches across `audit_log.params_summary` find them.
+Review verdicts are tracked in the PR / devlog so the audit trail stays grep-able — use consistent titles like `PHASE 4X AUDIT GREEN` so later searches find them.
 
 ---
 
 ## Pull request flow
 
 1. Branch off `main` (or dev branch if the project has one).
-2. Write the devlog assumption-first.
+2. Record the assumptions first.
 3. Ship the code + tests. Update docs in the same PR if surface changes.
 4. Run `scripts/pre-publish-check.sh` locally.
-5. PR description: link the devlog; enumerate the closed findings / retro items.
+5. PR description: enumerate the closed findings / retro items.
 6. For schema changes: include the migration function + CURRENT_SCHEMA_VERSION bump + `applyMigration(N-1, N)` registration. ONE migration per PR — never bundle multiple schema bumps in a single commit.
 
 ---
@@ -140,8 +139,8 @@ GREEN verdicts between Victra + the builder travel via the MCP relay itself (`se
 - **`src/`** — TypeScript source. Layered: `db.ts` + `auth.ts` + `encryption.ts` are the core; `tools/*` wrap MCP handlers; `cli/*` wrap the `relay` subcommands; `transport/*` is protocol adapters.
 - **`tests/`** — vitest suites. One file per surface OR per phase for cross-cutting work.
 - **`docs/`** — operator-facing manuals (key-rotation, backup-restore, hooks, migration-v1-to-v2, managed-agent-protocol).
-- **`devlog/`** — chronological build history. Source of truth for "why did we make this choice."
-- **`audit-findings/`** — strategic / architectural drafts. Specs the builder receives, Codex briefs Victra assembles.
+- **`CHANGELOG.md`** — chronological build history. Source of truth for "why did we make this choice."
+- **design notes** — strategic / architectural drafts. Specs the author receives + material assembled for the independent review pass.
 - **`scripts/`** — gate + smoke scripts.
 - **`hooks/`** — Claude Code hook scripts (SessionStart, PostToolUse, Stop).
 - **`bin/`** — executable entries (`bot-relay-mcp`, `relay`, `spawn-agent.sh`).
@@ -150,4 +149,4 @@ GREEN verdicts between Victra + the builder travel via the MCP relay itself (`se
 
 ## Questions
 
-Open an issue on the project's GitHub, or email maxime@lumiereventures.co.
+Open an issue on the project's GitHub, or email contact@lumiereventures.co.

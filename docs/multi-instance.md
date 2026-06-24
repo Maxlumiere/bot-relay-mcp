@@ -144,7 +144,7 @@ A message sent to `alice` on instance `work` does NOT appear on instance `person
 
 ## v2.4.5 — every transport + hook resolves the same DB
 
-v2.4.0 shipped per-instance isolation, but only the HTTP daemon's startup path went through `resolveInstanceDbPath()`. The bash hooks (`hooks/check-relay.sh`, `hooks/post-tool-use-check.sh`, `hooks/stop-check.sh`) and the `relay doctor` CLI hardcoded `~/.bot-relay/relay.db`. Result: an operator with an active per-instance setup got silent split-brain — the daemon wrote to the per-instance DB while the SessionStart hook delivered mail from legacy. Codex 5.5 caught this during the v2.4.4 R2 audit (her stdio session couldn't authenticate because her hook was reading legacy while her agent row lived per-instance).
+v2.4.0 shipped per-instance isolation, but only the HTTP daemon's startup path went through `resolveInstanceDbPath()`. The bash hooks (`hooks/check-relay.sh`, `hooks/post-tool-use-check.sh`, `hooks/stop-check.sh`) and the `relay doctor` CLI hardcoded `~/.bot-relay/relay.db`. Result: an operator with an active per-instance setup got silent split-brain — the daemon wrote to the per-instance DB while the SessionStart hook delivered mail from legacy. Codex caught this during the v2.4.4 R2 audit (its stdio session couldn't authenticate because its hook was reading legacy while its agent row lived per-instance).
 
 v2.4.5 routes every DB-opening site through the same resolver. Priority for all of them:
 

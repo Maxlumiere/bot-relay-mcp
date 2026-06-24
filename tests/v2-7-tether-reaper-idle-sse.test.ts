@@ -10,9 +10,8 @@
  * Background: pre-Phase-4, an MCP HTTP client that subscribes via
  * `relay://inbox/<agent>` and then sits idle (no follow-up POSTs)
  * would be culled by the daemon's session reaper after the idle
- * threshold elapsed — observed externally as Maxime's smoke
- * disconnecting ~5 min after connect (cited in dispatch
- * msg `a1e9505d`). The Phase 4 fix tracks `openGetStreams` per
+ * threshold elapsed — observed externally as a smoke test
+ * disconnecting ~5 min after connect. The Phase 4 fix tracks `openGetStreams` per
  * session and skips reaping while a GET is live.
  *
  * Strategy: spawn a real `node dist/index.js` daemon with the

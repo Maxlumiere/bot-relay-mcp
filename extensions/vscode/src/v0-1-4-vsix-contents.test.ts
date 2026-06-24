@@ -17,7 +17,7 @@
  *   - out/extension.js + out/extension.js.map present (the bundle + map)
  *   - extension.meta.json NOT present (test-only, excluded from VSIX)
  *
- * Per `feedback_test_path_must_match_shipped_path.md`: this test runs
+ * Test path matches the shipped path: this test runs
  * the real `vsce` against the real package directory. Mocking the
  * file list would defeat the drift-guard purpose.
  */
@@ -118,10 +118,13 @@ describe("v0.1.4 — VSIX contents drift guard", () => {
     );
   });
 
-  it("(V8) internal dev docs NOT in the VSIX", () => {
+  it("(V8) only marketplace-surface markdown ships in the VSIX", () => {
     const { files } = runVsceLs();
-    expect(files).not.toContain("PUBLISH.md");
-    expect(files).not.toContain("marketplace-prep-results.md");
+    // The only top-level markdown the marketplace needs is README + CHANGELOG.
+    // Any other *.md (developer-facing docs, notes, etc.) must stay out.
+    const allowedMd = new Set(["README.md", "CHANGELOG.md"]);
+    const strayMd = files.filter((f) => f.endsWith(".md") && !allowedMd.has(f));
+    expect(strayMd, `stray markdown leaked into VSIX: ${JSON.stringify(strayMd)}`).toEqual([]);
   });
 
   it("(V9) prior VSIX artifacts NOT bundled into a new VSIX", () => {
@@ -144,7 +147,7 @@ describe("v0.1.4 — VSIX contents drift guard", () => {
     ).toBeLessThanOrEqual(10);
   });
 
-  // (V11) — codex-5-5 R0 P2 finding closure. V1-V10 cap file COUNT
+  // (V11) — Codex R0 P2 finding closure. V1-V10 cap file COUNT
   // (≤10) and the bundle-correctness B2 caps `out/extension.js` BYTES
   // (≤800 KB). Neither asserted PACKAGED VSIX BYTES end-to-end. A
   // future regression (source-map growth, an icon, a doc, a transitive

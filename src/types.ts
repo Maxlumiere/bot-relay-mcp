@@ -202,7 +202,7 @@ export const GetMessagesSchema = z.object({
    * peek OR another session marks them read. Default false preserves
    * v2.0 consume-once semantics for single-shot workers. Intended for
    * orchestrators that survey their own inbox on a polling interval
-   * without consuming it (Victra's get_messages pattern).
+   * without consuming it (the orchestrator get_messages pattern).
    */
   peek: z.boolean().optional().default(false).describe(
     "When true, skip the mark-as-read side effect so repeated status='pending' polls return the same messages. Default false (consume-once)."
@@ -213,7 +213,7 @@ export const GetMessagesSchema = z.object({
    * messages (routed_capability IS NULL — the action lane); 'capability'
    * returns only capability-routed FYI messages (routed_capability IS NOT
    * NULL). Lets an orchestrator drain the action lane separately from the
-   * FYI lane so an action-required ship-pong is never lost in FYI noise.
+   * FYI lane so an action-required completion report is never lost in FYI noise.
    */
   lane: z
     .enum(["all", "direct", "capability"])
@@ -252,7 +252,7 @@ export const BroadcastSchema = z.object({
  * domain/capability; the relay fans it out to the CURRENT owner(s) of that
  * capability (exact-string match against the agent_capabilities index — same
  * matching contract as post_task_auto). FYI/coordination lane ONLY — action-
- * required completions stay point-to-point ship-pongs via send_message.
+ * required completions stay point-to-point completion reports via send_message.
  */
 export const PostToCapabilitySchema = z.object({
   from: z.string().min(1).describe("Sender agent name"),
@@ -833,7 +833,7 @@ export interface MessageRecord {
    * Non-NULL = this row was fanned out to the owner(s) of this capability
    * via post_to_capability. Makes the action-vs-FYI line machine-
    * distinguishable so an FYI is never mistaken for an action-required
-   * ship-pong.
+   * completion report.
    */
   routed_capability?: string | null;
 }

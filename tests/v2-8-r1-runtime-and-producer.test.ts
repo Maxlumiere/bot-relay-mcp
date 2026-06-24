@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 /**
- * v2.8 R1 — closes codex-5-5 P1 (broadcaster never wired to HTTP
+ * v2.8 R1 — closes Codex P1 (broadcaster never wired to HTTP
  * daemon) + P2 (`last_dispatched_at` is schema-only, no producer
  * writes).
  *
@@ -22,8 +22,8 @@
  *        per the role-allowlist + priority rules in
  *        `markRecipientDispatched` (src/db.ts).
  *
- * Both groups exercise the SHIPPED runtime path per
- * `feedback_test_path_must_match_shipped_path.md`. No fixture
+ * Both groups exercise the SHIPPED runtime path (test path matches
+ * the shipped path). No fixture
  * shortcuts.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -88,8 +88,8 @@ async function bootServer(extraEnv: Record<string, string | undefined> = {}): Pr
  * servers resolve immediately so the helper is safe to call
  * unconditionally.
  *
- * Origin: codex-5-5 R1 audit msg 7110aefc — real Node 18 CI failure
- * on run 26467555182 attributed to this exact lifecycle race.
+ * Origin: a Codex R1 audit — real Node 18 CI failure
+ * attributed to this exact lifecycle race.
  */
 async function awaitServerClose(s: HttpServer | undefined): Promise<void> {
   if (!s) return;
@@ -160,7 +160,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  // ORDER MATTERS (codex R1 P1, msg 7110aefc): await the HTTP server's
+  // ORDER MATTERS (Codex R1 P1): await the HTTP server's
   // async close FIRST so the broadcaster.stop() registered on
   // server.once("close") has flushed BEFORE we tear down the DB / WS
   // state. Otherwise a still-running tick can broadcast through the
@@ -267,7 +267,7 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
 
   it("(RT3) RELAY_DECAY_TICK_DISABLED=1 disables the broadcaster — NO time-only emits", async () => {
     // Restart the server with the broadcaster opt-out flag set.
-    // R2 (codex msg 7110aefc): the prior synchronous `server.close()`
+    // R2 (Codex audit): the prior synchronous `server.close()`
     // raced against the broadcaster.stop() registered on server.once
     // ("close"). On Node 18 the still-running tick from the OLD
     // (enabled) broadcaster fired ONE more agent.status_changed event
@@ -456,7 +456,7 @@ describe("v2.8 R1 — last_dispatched_at producer writes", () => {
   });
 
   it("(PRD7) deferred queued-task pickup on register_agent stamps recipient last_dispatched_at", async () => {
-    // v2.8 R3 — codex-5-5 R2 audit (msg fdfa9ef4 / 423300c6) caught
+    // v2.8 R3 — a Codex R2 audit caught
     // that `tryAssignQueuedTasksTo` only CAS-updated tasks; it never
     // called `markRecipientDispatched`. The IMMEDIATE postTaskAuto
     // route at src/db.ts:3823 was already stamped; the DEFERRED

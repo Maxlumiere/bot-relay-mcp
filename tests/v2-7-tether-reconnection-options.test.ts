@@ -76,7 +76,7 @@ describe("v2.7 Tether Phase 4 — reconnectionOptions drift guard", () => {
     // Unchanged contract: an explicit reconnectionOptions block with a
     // maxRetries field. A bare `new StreamableHTTPClientTransport(url,
     // { requestInit })` would silently fall back to the SDK default of
-    // maxRetries: 2 — the exact regression that wedged Maxime's Phase 3
+    // maxRetries: 2 — the exact regression that wedged the Phase 3
     // smoke. (The VALUE is now intentionally small — see module docstring
     // — so we only assert presence, not a floor.)
     expect(

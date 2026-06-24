@@ -55,4 +55,3 @@ The dashboard is never allowed to leak:
 
 - `tests/v2-1-dashboard-hardening.test.ts` — 8 tests covering the gate matrix.
 - `src/transport/http.ts` — `dashboardHostCheck` + `dashboardAuthCheck`.
-- `docs/../devlog/039-v2.1-dashboard-hardening.md` — decisions + assumptions.

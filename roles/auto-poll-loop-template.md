@@ -54,7 +54,7 @@ In practice for a `/loop` agent: when you detect an epoch change, treat it as a 
 | `agent_token` rotated mid-loop | `peek_inbox_version` returns `AUTH_FAILED`. | Re-run `register_agent` or re-spawn via spawn-agent.sh. |
 | LLM session crash | The /loop state is lost. On respawn (new Claude Code session), the SessionStart hook re-runs `register_agent` and re-delivers any pending mail. Restart the loop with this template. | Just re-paste the /loop prompt after respawn. |
 | Mail arrives between ticks | Wake latency is at most one cadence interval. Drain happens on the next tick. | Tune cadence down if latency matters. |
-| Inbox has 100+ unread messages | `get_messages` returns a large payload; the LLM turn may burn 5-20k tokens just to read. | Process in batches; ship-pong fast acks to clear pressure. |
+| Inbox has 100+ unread messages | `get_messages` returns a large payload; the LLM turn may burn 5-20k tokens just to read. | Process in batches; send fast acks to clear pressure. |
 
 ## Integration with the broader ambient-wake spec
 
@@ -65,12 +65,12 @@ See `docs/ambient-wake.md` for:
 - Decision-gating discipline (what surfaces to the human operator)
 - Stretch paths (B fs.watch sidecar; D TeammateIdle hook + Monitor)
 
-See `audit-findings/v2.9.0-ambient-wake-spec.md` for the design spec this template implements.
+See `docs/ambient-wake.md` for the design this template implements.
 
 ## Quick start (copy-paste)
 
 ```text
-/loop Call peek_inbox_version({agent_name: "victra-build"}) once. If total_unread_count > 0 OR epoch differs from the previous tick: call get_messages and process. Otherwise do nothing. Then ScheduleWakeup at 270 seconds, reason "ambient-wake idle tick". End turn.
+/loop Call peek_inbox_version({agent_name: "your-agent"}) once. If total_unread_count > 0 OR epoch differs from the previous tick: call get_messages and process. Otherwise do nothing. Then ScheduleWakeup at 270 seconds, reason "ambient-wake idle tick". End turn.
 ```
 
-Replace `victra-build` with your agent name and adjust the cadence (60/270/1800) to your phase.
+Replace `your-agent` with your agent name and adjust the cadence (60/270/1800) to your phase.

@@ -30,7 +30,7 @@ Three pieces, all in this repo, all free:
 
 1. **MCP resource subscriptions** — `relay://inbox/<agent_name>` is now a subscribable resource. Any MCP-aware client (Claude Code CLI, VSCode panel, Cursor, Cline, etc.) can subscribe and receive `notifications/resources/updated` pushes when the agent's inbox mutates. See `src/mcp-resources.ts` + `src/mcp-subscriptions.ts`.
 2. **VSCode extension v0.1** at `extensions/vscode/` — subscribes to the inbox resource for the agent associated with the workspace, surfaces a status-bar item ("Tether: N pending | last X ago"), opens a click-to-show webview with the last message preview, optionally auto-types `inbox` into the integrated terminal on every event.
-3. **Documentation** — this file, README pointer, CHANGELOG entry, and `extensions/vscode/PUBLISH.md` for the marketplace publish steps Maxime runs when ready.
+3. **Documentation** — this file, README pointer, and CHANGELOG entry, with the marketplace publish steps documented for the maintainer to run when ready.
 
 ## Phase 2 — future scope (NOT in this repo)
 
@@ -47,11 +47,11 @@ Documented here so the architectural line stays clear. Phase 2 work happens in a
 - Replay / time-travel debugging UI
 - Agent-graph visualization with live message flow
 
-The Phase 2 brief gets written **only after** Phase 1 ships and validates that operators actually use it. Validation signal Maxime named at dispatch time: he uses Tether himself for at least 2 weeks of dispatch arcs without falling back to typing `inbox` by hand.
+The Phase 2 brief gets written **only after** Phase 1 ships and validates that operators actually use it. Validation signal: operators use Tether for at least 2 weeks of dispatch arcs without falling back to typing `inbox` by hand.
 
 ## Pricing (TBD)
 
-Strategic decision deferred to Maxime — pricing model, free-tier limits, paid-tier features mix. This file gets updated when that lands; until then, this section is intentionally a placeholder so the read order is "free / paid line first, pricing later."
+Strategic decision deferred — pricing model, free-tier limits, paid-tier features mix. This file gets updated when that lands; until then, this section is intentionally a placeholder so the read order is "free / paid line first, pricing later."
 
 ## Why this design
 

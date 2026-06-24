@@ -6,13 +6,13 @@
  * v0.2 — AgentManager: spawn + observe + auto-restart a single
  * agent process inside a VSCode integrated terminal.
  *
- * Architecture (locked in audit-findings/v0.2-tether-executor-scope-brief.md):
+ * Architecture (locked during the v0.2 Tether executor design review):
  *   - VSCode Terminal API hosts the agent process. No node-pty.
  *   - claude CLI runs inside the terminal. SessionStart hook does
  *     register_agent + token-vault hydration end-to-end (zero new
  *     daemon-side API needed).
- *   - Caps locked at first spawn per
- *     `memory/feedback_relay_caps_immutable.md`. Kill+respawn with
+ *   - Caps locked at first spawn (relay caps are immutable after first
+ *     register). Kill+respawn with
  *     widened caps requires `unregister_agent` first (out of
  *     AgentManager's scope; surfaced to the operator).
  *   - Auto-restart on non-zero exit using RestartPolicy (5/hr cap,
@@ -74,8 +74,8 @@ export interface AgentSpec {
   /** Agent role — passed via RELAY_AGENT_ROLE. */
   role: string;
   /**
-   * Agent capabilities. Locked at first register per
-   * `feedback_relay_caps_immutable.md` — declare ALL caps the
+   * Agent capabilities. Locked at first register (caps are
+   * immutable after first registration) — declare ALL caps the
    * agent might ever need here at first spawn.
    */
   capabilities: string[];
@@ -89,8 +89,8 @@ export interface AgentSpec {
   token?: string;
   /**
    * Optional override of the binary to run inside the terminal.
-   * Defaults to `claude`. Useful for `codex` / `codex-5-5` /
-   * future agent CLIs. Validated against a strict allowlist
+   * Defaults to `claude`. Useful for `codex` / future
+   * agent CLIs. Validated against a strict allowlist
    * inside `buildShellCommand` so a malicious workspace setting
    * can't shell-out via this knob.
    */
@@ -125,7 +125,7 @@ export interface AgentSnapshot {
 export type AgentChangeListener = (snapshot: AgentSnapshot) => void;
 
 const AGENT_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
-const AGENT_BINARY_ALLOWLIST = ["claude", "codex", "codex-5-5"] as const;
+const AGENT_BINARY_ALLOWLIST = ["claude", "codex"] as const;
 
 /**
  * `setTimeout` factory used for restart delays. Injected so tests

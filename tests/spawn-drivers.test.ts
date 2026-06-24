@@ -161,7 +161,7 @@ describe("windows driver — fallback chain", () => {
   it("(v2.6.2 R1) cmd.exe is NOT selectable when powershell.exe is missing — pickSubDriver returns null instead of self-contradictory cmd", () => {
     // Pre-R1 self-contradiction: cmd auto-fallback chosen because powershell
     // missing, but cmd's inner shell tries to `powershell.exe -NoExit ...` —
-    // would open and fail. Codex P2 catch (msg f242914a). R1 closes by
+    // would open and fail. Codex P2 catch. R1 closes by
     // gating cmd selection on powershell.exe availability.
     const cmdOnly = makeCtx(["cmd.exe"]); // powershell.exe missing
     expect(windowsDriver.canHandle(cmdOnly)).toBe(false);
@@ -173,7 +173,7 @@ describe("windows driver — fallback chain", () => {
   });
 
   it("(v2.6.2 R2) wt.exe is NOT selectable when powershell.exe is missing — universal powershell dependency gate", () => {
-    // R1 gated only cmd on powershell. Codex caught (msg 1dd82c7b) that wt
+    // R1 gated only cmd on powershell. A Codex audit caught that wt
     // ALSO routes through powershell.exe (v2.6.2 wraps the inner shell in
     // `powershell.exe -NoExit -Command "..."`), so wt has the same gap.
     // R2 generalizes: ALL sub-drivers require powershell.exe.
@@ -246,27 +246,27 @@ describe("v2.6.2 — Windows FIX 1 vault prelude (cross-platform parity)", () =>
 
   it("wt.exe sub-driver embeds the vault prelude inside the powershell -Command inner", () => {
     const ctx = makeCtx(["wt.exe", "powershell.exe"]);
-    const cmd = windowsDriver.buildCommand(baseInput({ name: "victra-build", cwd: "C:\\work" }), ctx);
+    const cmd = windowsDriver.buildCommand(baseInput({ name: "build-agent", cwd: "C:\\work" }), ctx);
     const inner = cmd.args[5]; // index 5 is the powershell -Command argument
     expect(inner).toBeDefined();
     for (const sig of PRELUDE_SIGNATURES) {
       expect(inner).toMatch(sig);
     }
     // Vault path must reference the agent name we passed.
-    expect(inner).toContain("victra-build.token");
+    expect(inner).toContain("build-agent.token");
     // Prelude must run BEFORE Set-Location/claude, not after.
     expect(inner!.indexOf("$env:RELAY_AGENT_TOKEN")).toBeLessThan(inner!.indexOf("Set-Location"));
   });
 
   it("powershell.exe sub-driver embeds the vault prelude before Set-Location", () => {
     const ctx = makeCtx(["powershell.exe"]);
-    const cmd = windowsDriver.buildCommand(baseInput({ name: "victra-build", cwd: "C:\\work" }), ctx);
+    const cmd = windowsDriver.buildCommand(baseInput({ name: "build-agent", cwd: "C:\\work" }), ctx);
     const inner = cmd.args[2];
     expect(inner).toBeDefined();
     for (const sig of PRELUDE_SIGNATURES) {
       expect(inner).toMatch(sig);
     }
-    expect(inner).toContain("victra-build.token");
+    expect(inner).toContain("build-agent.token");
     expect(inner!.indexOf("$env:RELAY_AGENT_TOKEN")).toBeLessThan(inner!.indexOf("Set-Location"));
   });
 
@@ -274,14 +274,14 @@ describe("v2.6.2 — Windows FIX 1 vault prelude (cross-platform parity)", () =>
     // v2.6.2 R1: cmd requires powershell.exe (delegates inner shell). Use
     // RELAY_TERMINAL_APP=cmd to force the cmd path when both are available.
     const ctx = makeCtx(["cmd.exe", "powershell.exe"], "cmd");
-    const cmd = windowsDriver.buildCommand(baseInput({ name: "victra-build", cwd: "C:\\work" }), ctx);
+    const cmd = windowsDriver.buildCommand(baseInput({ name: "build-agent", cwd: "C:\\work" }), ctx);
     const compound = cmd.args[1];
     expect(compound).toBeDefined();
     expect(compound).toContain("powershell.exe -NoExit -Command");
     for (const sig of PRELUDE_SIGNATURES) {
       expect(compound).toMatch(sig);
     }
-    expect(compound).toContain("victra-build.token");
+    expect(compound).toContain("build-agent.token");
   });
 
   it("prelude is omitted when the agent name fails the FileTokenStore allowlist (defense-in-depth no-op)", () => {
@@ -437,7 +437,7 @@ describe("buildChildEnv — principle of least authority", () => {
 describe("normalizeCwd — platform-aware separator handling", () => {
   it("leaves POSIX paths untouched", () => {
     expect(normalizeCwd("/tmp/project", "linux")).toBe("/tmp/project");
-    expect(normalizeCwd("/Users/me/work", "darwin")).toBe("/Users/me/work");
+    expect(normalizeCwd("/path/to/work", "darwin")).toBe("/path/to/work");
   });
 
   it("converts forward slashes to backslashes on Windows", () => {

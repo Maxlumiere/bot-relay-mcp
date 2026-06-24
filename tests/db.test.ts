@@ -58,8 +58,8 @@ afterEach(() => {
 
 describe("registerAgent", () => {
   it("creates a new agent", () => {
-    const { agent, plaintext_token } = registerAgent("victra", "chief-of-staff", ["triage", "orchestration"]);
-    expect(agent.name).toBe("victra");
+    const { agent, plaintext_token } = registerAgent("orchestrator", "chief-of-staff", ["triage", "orchestration"]);
+    expect(agent.name).toBe("orchestrator");
     expect(agent.role).toBe("chief-of-staff");
     expect(agent.capabilities).toEqual(["triage", "orchestration"]);
     expect(agent.status).toBe("online");

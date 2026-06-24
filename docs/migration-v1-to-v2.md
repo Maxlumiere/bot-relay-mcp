@@ -232,4 +232,3 @@ A v2.1.0 DB CANNOT be downgraded to v2.0.2 in place — the schema additions don
 - `SECURITY.md` — threat model + defenses.
 - `docs/key-rotation.md` — keyring rotation runbook.
 - `docs/backup-restore.md` — backup/restore operator guide.
-- `devlog/` — chronological build history.

@@ -14,9 +14,9 @@
  * `send_message` with any `from` field and impersonate any registered
  * agent across the relay's full message + task surface.
  *
- * Maxime locked Option A on 2026-05-13 (review-Victra synthesis msg
- * `2b903f9b` / codex deep-review): make `from_agent_token` REQUIRED
- * when `from` names a registered agent. The dashboard secret + CSRF +
+ * Option A was locked on 2026-05-13 (security review synthesis): make
+ * `from_agent_token` REQUIRED when `from` names a registered agent.
+ * The dashboard secret + CSRF +
  * origin checks still cover access to the endpoint; the from-token
  * gate stops impersonation if those upstream checks ever leak
  * (stolen cookie, malicious browser extension, etc.).

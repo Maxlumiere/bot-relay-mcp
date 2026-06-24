@@ -6,12 +6,11 @@
 /**
  * v2.6.0 — `relay mint-token <name>` subcommand.
  *
- * Operator-side credential issuance for external CLI agents (Codex 5.5,
+ * Operator-side credential issuance for external CLI agents (Codex,
  * Cursor, future LLM clients) whose safety monitors block the
  * register_agent → use-token sequence inside a single response.
  *
- * Per `memory/feedback_codex_5_5_safety_blocks_register.md`: minting a
- * token outside the agent's process and exporting it as
+ * Minting a token outside the agent's process and exporting it as
  * `RELAY_AGENT_TOKEN` lets the agent authenticate on its first MCP call
  * without ever invoking register_agent itself, sidestepping the safety
  * pattern-match.
@@ -102,7 +101,7 @@ function printUsage(): void {
       "                          [--description <text>] [--force] [--json]\n" +
       "                          [--db-path <path>]\n\n" +
       "Mint an agent token directly via filesystem access. Use this when an\n" +
-      "external CLI client (e.g. Codex 5.5, Cursor) cannot run register_agent\n" +
+      "external CLI client (e.g. Codex, Cursor) cannot run register_agent\n" +
       "in its own session because its safety monitor blocks the\n" +
       "register-then-use sequence as a credential handoff. The minted token\n" +
       "is exported into the agent's environment BEFORE the CLI launches; the\n" +

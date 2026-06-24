@@ -21,7 +21,7 @@ Expected stderr output:
 [managed-node] Starting managed agent (host=127.0.0.1:3777, role=worker)
 [managed-node] Registered. Save this token:
   export RELAY_AGENT_TOKEN=<token>
-[managed-node] Peers: victra, ops, managed-node
+[managed-node] Peers: planner, ops, managed-node
 [managed-node] Entering poll loop (interval=5s). Ctrl-C to quit.
 ```
 

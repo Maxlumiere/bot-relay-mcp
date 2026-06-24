@@ -210,7 +210,7 @@ describe("§5.2 read-any / write-current", () => {
   });
 
   it("(R.7) key_id=\"1\" edge case — disambiguates cleanly from enc1: legacy prefix", async () => {
-    // Per Victra's audit note: key_id containing digits must parse correctly.
+    // Per an audit note: key_id containing digits must parse correctly.
     process.env.RELAY_ENCRYPTION_KEYRING = JSON.stringify({ current: "1", keys: { "1": K_ONE } });
     await resetEncModule();
     const { encryptContent, decryptContent } = await import("../src/encryption.js");

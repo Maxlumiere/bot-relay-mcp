@@ -75,7 +75,7 @@ function resolveEndpoint(
  * v0.1.3 — agent_token now resolves from VSCode SecretStorage as the
  * highest-priority source. The legacy `bot-relay.tether.agentToken`
  * setting in `settings.json` is removed from the contributes schema in
- * v0.1.3 (Hermes deep-review flagged plaintext storage; migration is
+ * v0.1.3 (an external security review flagged plaintext storage; migration is
  * auto-run in `extension.ts:activate` on first launch).
  *
  * Precedence: SecretStorage > env (RELAY_AGENT_TOKEN) > legacy config.
@@ -95,7 +95,7 @@ function resolveEndpoint(
  *     operator fixes their SecretStorage backend or sets
  *     RELAY_AGENT_TOKEN env.
  *
- * Codex P2 finding (msg 561cf7c9): "If SecretStorage access fails,
+ * Codex P2 finding: "If SecretStorage access fails,
  * do not read/use legacy `cfg(\"agentToken\")`; allow env-only
  * (`RELAY_AGENT_TOKEN`) with a log and preferably visible
  * warning/error. Keep the normal migration-window legacy fallback
@@ -149,7 +149,7 @@ export function decideMigrationAction(
 
 /**
  * v0.2 — per-agent SecretStorage key for the executor pattern.
- * Mirrors `feedback_relay_caps_immutable.md` discipline by keying
+ * Mirrors the immutable-caps discipline by keying
  * tokens by agent name so spawn/kill/restart cycles don't collide.
  *
  * Shape: `botRelayTether.token.<name>` where `<name>` matches the
@@ -183,7 +183,7 @@ export function resolveAgentSecretKey(agentName: string): string {
  * v0.2 — per-agent env-var name for the env fallback when
  * SecretStorage is unreachable.
  *
- * `victra-build` → `RELAY_AGENT_TOKEN_VICTRA_BUILD`
+ * `my-agent`     → `RELAY_AGENT_TOKEN_MY_AGENT`
  * `pod.alpha`    → `RELAY_AGENT_TOKEN_POD_ALPHA`
  * `agent1`       → `RELAY_AGENT_TOKEN_AGENT1`
  *

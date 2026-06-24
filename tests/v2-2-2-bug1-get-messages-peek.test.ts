@@ -9,7 +9,7 @@
  * Pre-v2.2.2 `getMessages(agentName, 'pending', …)` marked every
  * returned row as read-by-the-current-session after the SELECT,
  * consuming them on the first poll. Orchestrators that survey their
- * own inbox repeatedly (Victra's polling pattern) lost visibility of
+ * own inbox repeatedly (an orchestrator's polling pattern) lost visibility of
  * real pending mail the moment they looked at it once.
  *
  * With `peek=true`, the mark-as-read side effect is skipped. Two

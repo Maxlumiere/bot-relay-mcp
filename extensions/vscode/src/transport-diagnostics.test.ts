@@ -98,7 +98,7 @@ describe("transport-diagnostics — wireTransportDiagnostics", () => {
   });
 
   it("state-lock — once setError fires, subsequent success-flips are NO-OPs", () => {
-    // This pins the property the brief named: "once flipped to error,
+    // This pins the state-lock contract: "once flipped to error,
     // success log/state can't unflip without an explicit reconnect."
     // The lock lives in the caller's sinks (state flag + guard inside
     // setSuccessIfNotError). The helper does not itself enforce — but

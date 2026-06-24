@@ -12,8 +12,8 @@
  * even when no mutation fires, transitions like `active → waiting →
  * stale → closed` need to surface on the dashboard wire.
  *
- * Architectural calls locked in
- * `audit-findings/v2.8-dashboard-state-machine-brief.md`:
+ * Architectural calls locked during the v2.8 dashboard state-machine
+ * design review:
  *   - HTTP daemon process only (stdio skips it).
  *   - `setInterval` at `RELAY_DECAY_TICK_MS` (default 30s).
  *   - O(N) per tick where N = registered agents; tiny.

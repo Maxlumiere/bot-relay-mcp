@@ -12,7 +12,7 @@
  * directly via `bin/spawn-agent.sh` (no parent-side register step) — the
  * SessionStart hook called register_agent over HTTP, the relay returned a
  * fresh token, the script discarded the response. 3-min spawn-to-broken-state
- * caught 2026-05-04 with gaming-build.
+ * caught 2026-05-04 during a builder spawn.
  *
  * v2.6.1 closes the gap with a per-instance file vault. handleSpawnAgent now
  * writes the plaintext token to `<instanceDir>/agents/<name>.token` BEFORE

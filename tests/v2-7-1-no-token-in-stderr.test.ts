@@ -14,8 +14,7 @@
  * observability) ended up with the token in cleartext at info level.
  * The "shown ONCE in the API response" model was broken from day one.
  *
- * Origin: review-Victra deep-review synthesis msg `2b903f9b`
- * (synthesizes codex + Hermes deep-repo audits).
+ * Origin: a security review.
  *
  * Fix landed in v2.7.1: identity.ts log line no longer interpolates
  * the token; the redaction utility in src/logger.ts:redactSecrets
@@ -23,8 +22,8 @@
  * token+secret+password keys defense-in-depth.
  *
  * Test strategy: spawn a real `node dist/index.js` HTTP daemon
- * subprocess (matches shipped path per
- * feedback_walk_analogous_verify_dont_assume.md — InMemoryTransport
+ * subprocess (matches the shipped path; verify by reading source,
+ * don't assume — InMemoryTransport
  * would miss any pre-write path that goes through the actual logger).
  * Capture stderr while running register_agent + send_message + the
  * redaction-utility direct test. Assert no token bytes appear in the
@@ -207,8 +206,8 @@ describe("v2.7.1 — logger redactSecrets utility", () => {
 
   // v2.7.1 R1 — codex audit caught the pre-R1 regex leaving Basic
   // unchanged AND clobbering the scheme word for non-Bearer schemes
-  // (`Token abc123` → `*** abc123`). Per
-  // feedback_test_asserts_contract_not_proxy.md, each case below
+  // (`Token abc123` → `*** abc123`). Tests assert the exact
+  // contract, not a proxy: each case below
   // asserts the EXACT output string, not just "doesn't contain
   // <credential>" — the proxy check passed pre-R1 even though the
   // actual contract was broken.

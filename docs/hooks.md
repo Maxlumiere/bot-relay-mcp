@@ -19,7 +19,7 @@ The hook needs to know which agent's mailbox to check. Set the `RELAY_AGENT_NAME
 export RELAY_AGENT_NAME="myagent"
 
 # Or per-terminal with an alias
-alias ai-victra='RELAY_AGENT_NAME=victra claude'
+alias ai-orchestrator='RELAY_AGENT_NAME=orchestrator claude'
 alias ai-ops='RELAY_AGENT_NAME=ops claude'
 ```
 
@@ -62,10 +62,10 @@ Every time you open a Claude Code terminal (or resume a session), the hook check
 When you open a terminal and have pending items:
 
 ```
-[RELAY] Pending messages for victra:
+[RELAY] Pending messages for orchestrator:
   From: ops | Server health check complete, all green. (2026-04-13T15:30:00Z)
 
-[RELAY] Active tasks for victra:
+[RELAY] Active tasks for orchestrator:
   [high] Review auth module PR (from: builder, id: abc-123)
   [normal] Update deployment docs (from: ops, id: def-456)
 ```

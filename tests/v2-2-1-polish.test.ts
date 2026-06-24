@@ -186,7 +186,7 @@ describe("v2.2.1 P2 — /api/send-message", () => {
     // db.registerAgent mints a token by default, so the test must
     // pass it through (matches the new contract; pre-v2.7.1 this
     // succeeded without a token via the audit-only fallback that
-    // is now the impersonation primitive Maxime asked us to close).
+    // is now the impersonation primitive that was closed).
     const { plaintext_token } = registerAgent("p2-from", "r", []);
     registerAgent("p2-to", "r", []);
     const r = await postJson("/api/send-message", {

@@ -10,8 +10,7 @@
  * an MCP HTTP client via SSE within a real two-connection scenario,
  * AND a measurement of mail→push latency.
  *
- * Specifically answers victra's verification gate (msg `87f78922` →
- * `f8ee43b1`): "does server-initiated push reach an HTTP client in
+ * Specifically answers a verification gate: "does server-initiated push reach an HTTP client in
  * deployment, the exact thing that was 100% broken pre-v2.5-R1
  * despite passing InMemoryTransport tests?" — with the added
  * constraint that the SEND path goes through `send_message` via a

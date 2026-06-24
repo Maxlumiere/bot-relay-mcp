@@ -14,9 +14,9 @@
  * silent-failure window meant the SSE GET stream could fail to open inside
  * VS Code's Electron-based fetch runtime and leave the extension in a
  * "connected + subscribed" state that never receives notifications. The
- * v0.1.0 marketplace smoke caught this; ship-pong msg `18362476` traced
- * the root cause; codex audit msg `4eb34932` confirmed the daemon-side
- * broadcast contract is intact and the fix lives extension-side.
+ * v0.1.0 marketplace smoke caught this; root-cause investigation traced
+ * it, and an audit confirmed the daemon-side broadcast contract is intact
+ * and the fix lives extension-side.
  *
  * CRITICAL ORDERING — `wireTransportDiagnostics` MUST be called BEFORE
  * `await client.connect(transport)`. The SDK's `Protocol._connect`

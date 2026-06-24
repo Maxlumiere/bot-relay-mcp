@@ -5,8 +5,8 @@
 # and scripts/migrate-existing-tokens-to-vault.sh. Tested directly via
 # `bash -c "source <this-file>; ..."` in tests/v2-6-1-token-store.test.ts
 # so any drift between this file and the TS implementation surfaces as a
-# real test failure (not a silent inline-copy hide-out, per
-# memory/feedback_test_path_must_match_shipped_path.md).
+# real test failure (not a silent inline-copy hide-out — the test path
+# must match the shipped path).
 #
 # Mirrors:
 #   - src/instance.ts:resolveInstanceDbPath          → resolve_relay_db_path
@@ -102,9 +102,9 @@ read_relay_token_from_vault() {
 # the spawn pipeline drops next to the per-instance vault so the SessionStart
 # hook can recover identity if the typed-env transport (osascript write text
 # → child shell → claude → hook subprocess) drops RELAY_AGENT_NAME between
-# the parent script and the hook. See audit-findings/v2.7.2-spawn-agent-name-
-# brief.md for the failure-mode reframe (hook silently defaults to "default"
-# on unset env, mail dead-letters under the wrong agent).
+# the parent script and the hook. The failure mode it guards against: the
+# hook silently defaults to "default" on unset env, so mail dead-letters
+# under the wrong agent.
 #
 # Format: key=value lines, ASCII only, terminated with \n. Atomic tmp+rename.
 # Owner-only readable (0600) since the role + spawn_pid leak metadata about
@@ -257,7 +257,7 @@ find_fresh_relay_spawn_manifest() {
 #   - 1 fresh manifest  → silent recovery (handled by find_fresh_*)
 #   - >1 fresh manifest → LOUD stderr warning, fall through to "default"
 # The shipped comments + CHANGELOG entry already promised loud-on-
-# ambiguity behavior; codex-5-5 R0 audit (msg 8244095e) caught that the
+# ambiguity behavior; a Codex R0 audit caught that the
 # warning was missing. This helper is the instrumentation handle.
 #
 # Uses the same stat-second precision as find_fresh_relay_spawn_manifest

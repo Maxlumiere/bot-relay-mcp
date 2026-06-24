@@ -58,7 +58,7 @@ describe("v2.0.2 — SIGINT auto-offline honours capturedSessionId contract", ()
     expect(sessionB).not.toBe(sessionA);
 
     // SIGINT fires on the old process with capturedSid=null. Must NOT touch the
-    // row — this is the exact failure mode victra's audit flagged.
+    // row — this is the exact failure mode an audit flagged.
     performAutoUnregister("handoff-target", null, "SIGINT");
 
     const live = getAgents().find((a) => a.name === "handoff-target");

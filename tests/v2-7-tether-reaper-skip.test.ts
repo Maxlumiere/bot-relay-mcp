@@ -11,9 +11,8 @@
  * (src/transport/http.ts:1363). Subsequent server-side pushes don't
  * touch lastSeen. After RELAY_HTTP_SESSION_IDLE_SECONDS (default 300s),
  * the reaper would close the transport and drop the active subscriber
- * — observed externally as Maxime's "SSE stream disconnected" after
- * ~5 min of idle in the Phase 4 smoke (cited in dispatch
- * msg `a1e9505d`).
+ * — observed externally as an "SSE stream disconnected" after
+ * ~5 min of idle in the Phase 4 smoke.
  *
  * The fix is structural: every session tracks `openGetStreams` (a
  * COUNT, not a boolean — codex SCOPE-TIGHTEN's specific note: a count

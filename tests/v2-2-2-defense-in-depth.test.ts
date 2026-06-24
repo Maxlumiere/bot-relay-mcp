@@ -10,8 +10,8 @@
  *   A1.1  present-and-valid token → 200 + audit `from_authenticated: true`
  *   A1.2  absent token → 403 AUTH_FAILED (v2.7.1 [HIGH F4] CHANGED FROM
  *         the v2.2.2 audit-only default of "200 + from_authenticated=false".
- *         That default was the impersonation primitive Hermes / codex
- *         deep-review flagged: dashboard-secret holders could send
+ *         That default was the impersonation primitive an external
+ *         security review flagged: dashboard-secret holders could send
  *         `from=anyone` without a token. v2.7.1 makes from_agent_token
  *         REQUIRED when from-agent has a stored token_hash.)
  *   A1.3  present-and-invalid     → 403 AUTH_FAILED + audit success=0
@@ -137,7 +137,7 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
     // was the impersonation primitive: any dashboard-secret holder
     // could POST send_message with `from=victim` and no token.
     //
-    // v2.7.1 [HIGH F4] (Maxime's Option A, locked 2026-05-13)
+    // v2.7.1 [HIGH F4] (Option A, locked 2026-05-13)
     // makes from_agent_token REQUIRED when from-agent has a
     // stored token_hash. db.registerAgent below mints a token by
     // default, so a2-from has a token_hash and the gate fires.
