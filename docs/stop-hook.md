@@ -43,12 +43,12 @@ Replace `/path/to/` with the actual path to your bot-relay-mcp installation. `ti
 
 ### ❗ Paths containing spaces — single-quote inside the JSON string
 
-Claude Code invokes the `command` string via the shell. The shell splits on whitespace, so a path like `/Users/name/workspace/bot-relay-mcp/hooks/stop-check.sh` gets interpreted as `/Users/name/Documents/Ai` + the arguments `stuff/bot-relay-mcp/hooks/stop-check.sh`. The first piece is a directory, not an executable, so the shell errors with `/bin/sh: ... is a directory` — and because the hook's stderr is not surfaced to the user by default, the hook **silently fails**.
+Claude Code invokes the `command` string via the shell. The shell splits on whitespace, so a path like `/path/to/My Projects/bot-relay-mcp/hooks/stop-check.sh` gets interpreted as `/path/to/My` + the arguments `Projects/bot-relay-mcp/hooks/stop-check.sh`. The first piece is a directory, not an executable, so the shell errors with `/bin/sh: ... is a directory` — and because the hook's stderr is not surfaced to the user by default, the hook **silently fails**.
 
 **Fix:** wrap the path in single quotes inside the JSON string:
 
 ```json
-"command": "'/Users/user/workspace/Claude AI/bot-relay-mcp/hooks/stop-check.sh'"
+"command": "'/path/to/My Projects/bot-relay-mcp/hooks/stop-check.sh'"
 ```
 
 The outer double-quotes are JSON syntax. The inner single-quotes survive into the shell invocation and preserve the whole path as one argument. Paths without spaces do not need this, but the single-quote-always pattern is harmless and is the safer default.
@@ -69,7 +69,7 @@ The hook reads the same env vars as `PostToolUse`:
 Typical setup via shell alias (matches the `SessionStart` + `PostToolUse` pattern):
 
 ```bash
-alias ai-victra='RELAY_AGENT_NAME=victra RELAY_AGENT_TOKEN=<your-token> claude'
+alias ai-agent='RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=<your-token> claude'
 ```
 
 ## What the hook does
@@ -79,8 +79,8 @@ alias ai-victra='RELAY_AGENT_NAME=victra RELAY_AGENT_TOKEN=<your-token> claude'
 3. Otherwise falls back to sqlite direct on `RELAY_DB_PATH`. Reads pending rows, formats them, then marks those specific message IDs `read` in a follow-up statement.
 4. Emits a single-line Claude Code hook JSON (`{"continue": true, "hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": "..."}}`) to stdout. The content looks like:
    ```
-   [RELAY] New mail for victra-build (2 messages):
-     [high] from victra at 2026-04-17T20:15:00Z:
+   [RELAY] New mail for builder (2 messages):
+     [high] from planner at 2026-04-17T20:15:00Z:
        re-audit ready
      [normal] from ops at 2026-04-17T20:16:30Z:
        smoke green

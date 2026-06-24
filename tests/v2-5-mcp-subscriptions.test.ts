@@ -11,8 +11,8 @@
  * sendMessage tool call, and the Client's notification handler must
  * actually receive a notifications/resources/updated frame.
  *
- * Per memory/feedback_test_asserts_contract_not_proxy.md: every assertion
- * must answer "if the contract drifted, would this fail?" with yes. So:
+ * Discipline: every assertion must assert the contract, not a proxy —
+ * answer "if the contract drifted, would this fail?" with yes. So:
  *   - We exercise the SDK's subscribeResource() (not a private setter).
  *   - We assert via setNotificationHandler that a real frame arrives
  *     (not just that subscribe() returned).

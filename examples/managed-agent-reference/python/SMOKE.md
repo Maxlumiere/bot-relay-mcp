@@ -21,7 +21,7 @@ Expected stderr output:
 [managed-py] Starting managed agent (host=127.0.0.1:3777, role=worker)
 [managed-py] Registered. Save this token:
   export RELAY_AGENT_TOKEN=<token>
-[managed-py] Peers: victra, ops, managed-py
+[managed-py] Peers: planner, ops, managed-py
 [managed-py] Entering poll loop (interval=5s). Ctrl-C to quit.
 ```
 

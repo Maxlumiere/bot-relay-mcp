@@ -10,7 +10,7 @@
  * delay against the contract in the v0.2 brief (backoff
  * 1s→2s→4s→8s→16s capped at 30s, 5/hr hard cap).
  *
- * Per `feedback_test_asserts_contract_not_proxy.md`: assertions
+ * Tests assert the exact contract, not a proxy: assertions
  * pin exact delayMs values (not "≤30s") and exact decision kinds
  * — drift in the curve or the cap surfaces here loud.
  */

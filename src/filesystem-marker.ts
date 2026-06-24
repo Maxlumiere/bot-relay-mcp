@@ -13,8 +13,7 @@
  *
  * HINT ONLY. The marker is non-authoritative — a missed event is safe
  * because SQLite holds the ground truth. The Phase 4s locked design
- * (memory/project_phase_4s_ambient_wake.md) treats the marker as a
- * wake signal, not a message queue.
+ * treats the marker as a wake signal, not a message queue.
  *
  * Cross-platform — macOS / Linux / Windows all support mtime updates
  * + fs.watch on the marker path. NFS / SMB / cloud-sync folders are

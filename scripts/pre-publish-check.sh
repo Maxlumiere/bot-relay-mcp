@@ -150,7 +150,7 @@ step "npm audit (high+)" bash "$PROJECT_ROOT/scripts/audit-with-retry.sh" high |
 step "npm run build" npm run build || exit 1
 
 # --- 4b. v2.5.0 R1 — VSCode extension compile guard ---
-# Codex 5.5 R1 audit caught that R0's pre-push gate didn't cover the
+# Codex R1 audit caught that R0's pre-push gate didn't cover the
 # extensions/vscode/ subdirectory: the extension had a TS2339 (TypeScript
 # strict-mode violation on a union access) that would fail at vsce package
 # time. The pre-push gate didn't catch it because vitest's transform is
@@ -226,8 +226,8 @@ step "extension vitest run (extensions/vscode — bundle + VSIX drift guards)" e
 # post-merge pre-tag verification; v2.8.0 R1 fast-follow added this
 # guard the same round.
 #
-# Same shape as the engines.node mismatch codex caught on v2.7.3 R0
-# (msg bd771cb3 — codex compared package.json.engines vs
+# Same shape as the engines.node mismatch a Codex audit caught on v2.7.3 R0
+# (it compared package.json.engines vs
 # package-lock.json.packages[""].engines and found a 2-line drift).
 # Generalized here to the version fields, which are the more
 # consequential pair (npm publishes the package.json version regardless
@@ -470,7 +470,7 @@ smoke_25_isolated() {
   # v2.1 Phase 5a: smoke-22 superseded by smoke-25 (adds rotate_token_admin +
   # managed rotation + recovery flow + CLI subcommands). Export the isolated
   # DB + config paths so the CLI subcommands in smoke-25 (doctor, backup,
-  # recover, re-encrypt) operate on the throwaway state, not the maintainer's live DB.
+  # recover, re-encrypt) operate on the throwaway state, not a live DB.
   if [ "$rc" -eq 0 ]; then
     if ! RELAY_DB_PATH="$tmp_dir/relay.db" \
          RELAY_CONFIG_PATH="$tmp_dir/config.json" \
@@ -584,7 +584,7 @@ npm_pack_contents() {
 step "npm pack contents (v2.6.0 — cross-linked docs included)" npm_pack_contents || exit 1
 
 # --- 6c. Split-brain DB warn (v2.4.5) ---
-# Detects the local-environment failure mode that bit Codex 5.5 during the
+# Detects the local-environment failure mode that bit Codex during the
 # v2.4.4 R2 audit cycle: an active per-instance setup PLUS a populated legacy
 # DB usually means a stale npx-cached bot-relay-mcp (or a pre-v2.4.0 hook)
 # is writing to ~/.bot-relay/relay.db while the live daemon serves a per-

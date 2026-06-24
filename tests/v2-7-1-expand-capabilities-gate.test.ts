@@ -16,9 +16,8 @@
  * `rotate_token_admin` on any peer. ~3 calls to fully compromise a
  * relay.
  *
- * Origin: review-Victra deep-review synthesis msg `2b903f9b`
- * (synthesizes codex + Hermes deep-repo audits), the maintainer locked
- * "fix all in one bundled dispatch" 2026-05-13.
+ * Origin: a security review synthesis (multiple deep-repo audits);
+ * "fix all in one bundled dispatch" was locked 2026-05-13.
  *
  * This test exercises the dispatcher path via HTTP RPC (same pattern
  * as tests/v2-1-error-codes.test.ts) — calling handleExpandCapabilities
@@ -94,7 +93,7 @@ describe("v2.7.1 [CRITICAL] — expand_capabilities cap gate", () => {
     expect(r.error_code).toBe(ERROR_CODES.CAP_DENIED);
   });
 
-  it("agent with default `[]` caps cannot escalate by chaining (the exploit path Hermes flagged)", async () => {
+  it("agent with default `[]` caps cannot escalate by chaining (the exploit path the external review flagged)", async () => {
     const attackerTok = await register("attacker", []);
     await register("victim", []);
     // Step 1: try to add admin → BLOCKED

@@ -19,8 +19,8 @@ import {
 
 describe("v0.2 — resolveAgentSecretKey", () => {
   it("(C1) builds the key from the agent name", () => {
-    expect(resolveAgentSecretKey("victra-build")).toBe(
-      `${PER_AGENT_SECRET_KEY_PREFIX}victra-build`,
+    expect(resolveAgentSecretKey("build-agent")).toBe(
+      `${PER_AGENT_SECRET_KEY_PREFIX}build-agent`,
     );
   });
 
@@ -49,7 +49,7 @@ describe("v0.2 — resolveAgentSecretKey", () => {
 
 describe("v0.2 — resolveAgentTokenEnvVar", () => {
   it("(C6) converts hyphens + dots to underscores and uppercases", () => {
-    expect(resolveAgentTokenEnvVar("victra-build")).toBe("RELAY_AGENT_TOKEN_VICTRA_BUILD");
+    expect(resolveAgentTokenEnvVar("build-agent")).toBe("RELAY_AGENT_TOKEN_BUILD_AGENT");
     expect(resolveAgentTokenEnvVar("pod.alpha")).toBe("RELAY_AGENT_TOKEN_POD_ALPHA");
     expect(resolveAgentTokenEnvVar("foo_bar")).toBe("RELAY_AGENT_TOKEN_FOO_BAR");
     expect(resolveAgentTokenEnvVar("a.b-c_d")).toBe("RELAY_AGENT_TOKEN_A_B_C_D");
@@ -66,8 +66,8 @@ describe("v0.2 — resolveAgentTokenEnvVar", () => {
 });
 
 describe("v0.2 — resolvePerAgentToken precedence", () => {
-  const NAME = "victra-build";
-  const PER_AGENT_ENV = "RELAY_AGENT_TOKEN_VICTRA_BUILD";
+  const NAME = "build-agent";
+  const PER_AGENT_ENV = "RELAY_AGENT_TOKEN_BUILD_AGENT";
 
   it("(C9) returns the per-agent SecretStorage value first when set", () => {
     const t = resolvePerAgentToken(

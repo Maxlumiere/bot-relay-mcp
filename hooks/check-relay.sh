@@ -22,7 +22,7 @@
 #   RELAY_HTTP_PORT          — daemon port (default: 3777)
 #
 # Example alias:
-#   alias ai='RELAY_AGENT_NAME=victra RELAY_AGENT_ROLE=chief-of-staff claude'
+#   alias ai='RELAY_AGENT_NAME=orchestrator RELAY_AGENT_ROLE=chief-of-staff claude'
 #
 # Security notes (v1.6):
 # - All env-var inputs are validated against an allowlist regex BEFORE use.
@@ -112,7 +112,7 @@ HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 # v2.6.1 — vault-first bootstrap. If RELAY_AGENT_TOKEN is unset in env BUT a
 # vault file exists for this agent name, hydrate the env from disk before any
 # auth-sensitive call below. Closes the spawn-without-pre-mint failure mode
-# (3-min broken state hit 2026-05-04 with gaming-build) and makes restart-of-
+# (3-min broken state hit 2026-05-04 during a builder spawn) and makes restart-of-
 # closed-terminal lossless: identity persists even when the operator did not
 # bake RELAY_AGENT_TOKEN into a shell rc file.
 if [ -z "${RELAY_AGENT_TOKEN:-}" ]; then
@@ -291,7 +291,7 @@ elif [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
   # host_id) refresh to THIS terminal's live process chain and session_id is
   # repopulated. Without this, a long-lived persona-builder relaunch never
   # re-sends its PID chain → Tether can't bind it → no autowake (the exact
-  # bug victra-build hit: pre-existing row + token → permanent skip → empty
+  # bug a long-lived builder hit: pre-existing row + token → permanent skip → empty
   # host_shell_pids). The re-register is auth-gated server-side (enforceAuth
   # requires the row's own token) + collision-guarded (handler rejects a row
   # that is genuinely live), so falling through is safe.
@@ -316,7 +316,7 @@ fi
 # match the extension's TypeScript readers (extensions/vscode/src/host-identity.ts)
 # byte-for-byte — same OS source, same extraction — or the two host_ids won't
 # agree and host-scoped matching silently fails. POSIX is the real path
-# (the maintainer's Mac); the Windows (git-bash) branches mirror the documented
+# (macOS / Linux); the Windows (git-bash) branches mirror the documented
 # wmic/reg shapes but are not runtime-tested (no Windows host). Any failure →
 # empty output → the field is omitted from the register call (graceful: Tether
 # falls back to name matching).
@@ -410,7 +410,7 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   # `\"agent_token\": \"<token>\"` with a backslash before each quote
   # and a space after the colon). The pre-v2.6.4 pattern
   # `'"agent_token":"[^"]*"'` never matched the actual bytes, so the
-  # vault was never written on first-spawn — the bug news-intel-build hit
+  # vault was never written on first-spawn — the first-spawn bug hit
   # 2026-05-06 despite the v2.6.1 R3 cumulative arc. Token-shape charset
   # `[A-Za-z0-9_=.-]+` mirrors src/token-store.ts:67 TOKEN_SHAPE_RE so
   # tightening from `[^\"]*` to the allowlist also defends against any

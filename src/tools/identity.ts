@@ -57,7 +57,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   //   (a) wait for the row to go stale (5min at last_seen),
   //   (b) run `relay recover <name>` to force-release, or
   //   (c) pass `force: true` to register_agent (undocumented escape hatch).
-  // See memory/feedback_scoped_victra_names.md for the bug's history.
+  // Scoped, unique agent names avoid the shared-inbox drain race this guards against.
   //
   // Exemptions:
   //   - auth_state recovery_pending: admin-approved re-take-over via
@@ -166,8 +166,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   // remains in the tool's JSON response body, which is the only delivery
   // surface the caller must capture. Operators wiring the "hook flow"
   // backup should read RELAY_AGENT_TOKEN from the response shape, not
-  // from stderr scraping. (Origin: Hermes deep-review surfaced via
-  // review-Victra synthesis msg `2b903f9b`.)
+  // from stderr scraping. (Origin: an external security review.)
   if (plaintext_token) {
     log.info(`[auth] New agent_token issued for "${agent.name}" (shown once in the tool response; not logged).`);
   }
@@ -780,7 +779,7 @@ export function handleRevokeToken(input: RevokeTokenInput) {
     // vault was harmless. But ergonomically the mental model is cleaner
     // when revoke_token leaves NO credential on disk for that agent —
     // mirrors the recovery-CLI scrub at src/cli/recover.ts:300-301.
-    // the maintainer's call (2026-05-05) per memory/feedback_maintainer_owns_strategic_calls.md.
+    // Design decision locked 2026-05-05.
     //
     // Best-effort: try/catch swallows IO errors. The revoke succeeded at
     // the DB layer; failing here would be a worse experience than

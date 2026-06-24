@@ -13,9 +13,9 @@
  * plaintext `settings.json`. Every backup, settings sync, accidental
  * screenshot, and shoulder-glance leaked the token.
  *
- * Origin: Hermes deep-review surfaced via review-Victra synthesis
- * msg `2b903f9b`. v2.7.1 brief F10 locked the maintainer's Option (full
- * SecretStorage migration with one-shot rotation notice).
+ * Origin: an external security review.
+ * v2.7.1 locked the chosen option (full SecretStorage migration with a
+ * one-shot rotation notice).
  *
  * COVERAGE:
  *   - drift-pkg: extensions/vscode/package.json's
@@ -65,7 +65,7 @@ describe("v0.1.3 [HIGH F10] — Tether SecretStorage migration drift guards", ()
     const props = pkg.contributes?.configuration?.properties ?? {};
     expect(
       "bot-relay.tether.agentToken" in props,
-      "extensions/vscode/package.json must NOT contain `bot-relay.tether.agentToken` in contributes.configuration.properties — Hermes flagged this as plaintext storage. Use VSCode SecretStorage via the `botRelayTether.setToken` palette command instead.",
+      "extensions/vscode/package.json must NOT contain `bot-relay.tether.agentToken` in contributes.configuration.properties — an external review flagged this as plaintext storage. Use VSCode SecretStorage via the `botRelayTether.setToken` palette command instead.",
     ).toBe(false);
   });
 
@@ -93,7 +93,7 @@ describe("v0.1.3 [HIGH F10] — Tether SecretStorage migration drift guards", ()
       "extensions/vscode/src/extension.ts must call `context.secrets.store(...)` — without it the migration + Set Token command can't persist the secret.",
     ).toMatch(/context\.secrets\.store\s*\(/);
     // The migration function must be invoked from activate() — not
-    // gated behind a manual command. Hermes's contract is "first-launch
+    // gated behind a manual command. The review's contract is "first-launch
     // migration runs automatically."
     expect(
       body,

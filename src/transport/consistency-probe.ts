@@ -73,7 +73,7 @@ export function sampleGetMessagesConsistency(args: {
   /**
    * v2.7.0: the same `since` bound the MCP path applied. Pre-v2.7.0 the
    * filter ran in JS after the SQL fetch, so the probe's SUPERSET
-   * query naturally matched. The Hermes-flagged P1 fix moved the
+   * query naturally matched. The external-review-flagged P1 fix moved the
    * filter into SQL; the probe must mirror it or every since-narrower-
    * than-all call emits false-positive "divergence" warnings.
    */

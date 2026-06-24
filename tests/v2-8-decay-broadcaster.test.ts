@@ -6,11 +6,11 @@
 /**
  * v2.8 — DashboardStateBroadcaster unit tests.
  *
- * Mock clock + manual scheduler + FakeBroadcastSink. Per
- * `feedback_test_asserts_contract_not_proxy.md`: assertions pin exact
+ * Mock clock + manual scheduler + FakeBroadcastSink. Tests assert
+ * the exact contract, not a proxy: assertions pin exact
  * broadcast events fired, exact dedup behavior, exact lifecycle state.
  *
- * Per `feedback_test_path_must_match_shipped_path.md`: tests exercise
+ * Test path matches the shipped path: tests exercise
  * the actual exported class. No reimplementation of dedup logic in
  * test space.
  */
@@ -158,12 +158,12 @@ describe("v2.8 — DashboardStateBroadcaster — tick + dedup", () => {
 
   it("(D6) entity_id equals agent name (rate-limit coalesce key)", () => {
     agents = [
-      { name: "victra-build", inputs: baseInputs() },
+      { name: "build-agent", inputs: baseInputs() },
       { name: "pod.alpha", inputs: baseInputs({ pendingCount: 1 }) },
     ];
     broadcaster.tick();
     const names = broadcasts.map((b) => b.entity_id).sort();
-    expect(names).toEqual(["pod.alpha", "victra-build"]);
+    expect(names).toEqual(["build-agent", "pod.alpha"]);
   });
 
   it("(D7) event field is always 'agent.status_changed' (stable wire format)", () => {

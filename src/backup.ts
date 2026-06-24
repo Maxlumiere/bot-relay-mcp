@@ -13,7 +13,7 @@
  *     replacement of the current DB. Refuses schema mismatches and running
  *     daemon unless force=true.
  *
- * Design notes (see devlog/031):
+ * Design notes:
  *   - VACUUM INTO is the single snapshot mechanism for both native and wasm
  *     drivers — it's plain SQL and runs identically through CompatDatabase.
  *   - Schema version is a hardcoded constant here; Phase 4c will retrofit it

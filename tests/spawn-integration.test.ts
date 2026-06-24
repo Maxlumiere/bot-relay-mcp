@@ -443,8 +443,8 @@ describe("spawn-agent.sh — v2.1.4 brief_file_path (I10)", () => {
 //
 // The bug behind v2.7.2: a spawn via mcp__bot-relay__spawn_agent produces a
 // child terminal where the SessionStart hook reports identity unresolved.
-// The brief at audit-findings/v2.7.2-spawn-agent-name-brief.md hypothesizes
-// five candidate causes; this test pins the *script-side* contract end-to-
+// The investigation hypothesized five candidate causes; this
+// test pins the *script-side* contract end-to-
 // end so any future drift inside bin/spawn-agent.sh that breaks the export-
 // before-claude ordering, the printf %q escaping, or the inline AS_CMD
 // structure fails LOUDLY here, not silently in a 20-minute live spawn.
@@ -542,7 +542,7 @@ describe("spawn-agent.sh — v2.7.2 RELAY_AGENT_NAME propagation contract", () =
   // which is outside the script's contract.
   it.each([
     ["plain", "worker1"],
-    ["hyphenated", "victra-memory-build"],
+    ["hyphenated", "mem-build-agent"],
     ["dotted", "pod.alpha"],
   ])("[contract] %s name '%s' reaches both claude env AND its subprocess env", async (_label, name) => {
     const { parentEnv, childEnv, cmdExitCode, cmdStderr } = await runCmdWithClaudeStub([
@@ -580,8 +580,8 @@ describe("spawn-agent.sh — v2.7.2 RELAY_AGENT_NAME propagation contract", () =
 });
 
 // ---------------------------------------------------------------------------
-// v2.7.4 — kickstart apostrophe-quoting fix (Bug 1 from
-// audit-findings/v2.7.3-spawn-agent-kickstart-quoting-bug-brief.md).
+// v2.7.4 — kickstart apostrophe-quoting fix (Bug 1: spawn-agent
+// kickstart-quoting).
 //
 // Pre-fix, the script wrapped KICKSTART via `printf '%q'` which emits
 // values in `$'...'` ANSI-C-quoted form. Inside `$'...'`, a literal `'`

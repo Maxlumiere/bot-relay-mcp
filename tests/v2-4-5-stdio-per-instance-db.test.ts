@@ -7,7 +7,7 @@
  * v2.4.5 — stdio + every hook + every CLI read the same per-instance DB the
  * HTTP daemon writes to.
  *
- * Closes the split-brain bug Codex 5.5 caught during the v2.4.4 R2 audit:
+ * Closes the split-brain bug Codex caught during the v2.4.4 R2 audit:
  * agent registered via HTTP daemon (per-instance DB), but the operator's
  * stdio session's mailbox check ran a bash hook that hardcoded the legacy
  * ~/.bot-relay/relay.db. Two state stores, agents/messages don't cross,

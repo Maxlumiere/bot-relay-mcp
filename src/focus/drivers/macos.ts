@@ -11,8 +11,8 @@
  * as `{raised: false, reason: "..."}`.
  *
  * Fallback to Terminal.app is deferred — the v2.1.x spawn chain preferred
- * iTerm2 and the maintainer's machine runs iTerm2 as the primary. Terminal.app
- * focus is a v2.2.x candidate if demand surfaces.
+ * iTerm2 as the primary terminal. Terminal.app focus is a v2.2.x candidate
+ * if demand surfaces.
  */
 import type { FocusCommand, FocusDriver, FocusDriverContext } from "../types.js";
 import { escapeAppleScript } from "../validation.js";

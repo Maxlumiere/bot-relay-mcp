@@ -11,7 +11,7 @@ The zero-config wake from 0.3.0 didn't fire on a real machine: Tether saw the ma
 ### Fixed
 
 - **PID auto-bind never fired because the binding came back empty.** To wake the right terminal, Tether reads the agent's process chain from the relay. It did that via `discover_agents`, which the relay requires a token for — but Tether connects **token-free** (there's no token to configure, by design), so the read failed and the binding was empty: no process ids to match, no wake. Tether now falls back to the relay's **auth-free `/api/snapshot`** (the same endpoint the dashboard uses, which already carries the data) whenever the token-gated read returns nothing. The wake now fires with zero configuration, exactly as intended.
-- **Removed the experimental process-tree match.** A 0.3.1 internal build tried to also match a terminal whose process id was an *ancestor* of the agent's chain. Because the chain includes process ids **shared by every terminal in the window** (the editor and its terminal host), that could match — and wake — the *wrong* agent's terminal. It's removed: matching is back to the agent's own process ids (exact), which is what actually fires once the binding is read correctly. The wake decision stays host-scoped (an equal process id on a different machine never matches) with the terminal-name match as the final fallback.
+- **Removed the experimental process-tree match.** A 0.3.1 build tried to also match a terminal whose process id was an *ancestor* of the agent's chain. Because the chain includes process ids **shared by every terminal in the window** (the editor and its terminal host), that could match — and wake — the *wrong* agent's terminal. It's removed: matching is back to the agent's own process ids (exact), which is what actually fires once the binding is read correctly. The wake decision stays host-scoped (an equal process id on a different machine never matches) with the terminal-name match as the final fallback.
 
 ### Added
 
@@ -25,7 +25,7 @@ Tether now binds a terminal to an agent by **process identity** — no terminal 
 
 - **Auto-`inbox` wake is now PID-primary.** An agent reports its process-ancestry chain + a stable machine id when it registers; Tether reads each terminal's process id and wakes the one whose process is in that chain. The v0.2.2 name match (`<agent>` / `Tether: <agent>`) remains as a fallback for agents that haven't reported a chain yet, and the 0/>1 safety (no wake + a status-bar hint, never a guess) is unchanged. Net effect: the common case — an alias-launched agent in a terminal named `zsh` — now wakes correctly with **zero configuration**.
 
-### Internal
+### Implementation Notes
 
 - Matching is **host-scoped**: an equal process id on a *different* machine never false-matches (the machine id — macOS `IOPlatformUUID` / Linux `/etc/machine-id` / Windows `MachineGuid` — is computed identically by the agent and the extension). Resolved bindings are cached and invalidated on terminal close, so wakes don't re-scan every terminal. The matcher core (`pid-binding.ts`) and the host-identity parsers (`host-identity.ts`) are pure + unit-tested across all three platforms (Windows parsers are verified against documented command output; not runtime-tested on a real Windows host). Requires a relay that surfaces the handshake fields (`register_agent` schema v16). Two-mode Tether + the iTerm2→VS Code "promote to builder" handoff build on this primitive in a later v0.3.x.
 
@@ -42,19 +42,19 @@ Two fixes to make the auto-`inbox` wake reliable in day-to-day multi-agent use: 
 - **Mail already waiting at connect didn't wake the terminal (catch-up wake).** The auto-`inbox` keystroke only fired for messages that arrived **after** Tether subscribed. So on a fresh start, after a daemon restart, or after switching agents, any mail already in the inbox was shown in the status bar but never woke the terminal — you had to type `inbox` yourself. Tether now fires one wake on (re)subscribe when the inbox already holds pending mail. A shared high-water mark (the newest-message timestamp, in memory) guarantees it **never double-wakes**: a reconnect with no new mail does nothing, while a window reload deliberately re-wakes still-pending mail.
 - **The "no matching terminal" hint is now actionable** — it tells you to rename a terminal to the agent's name so the wake can land (an interim nudge until automatic terminal discovery arrives).
 
-### Internal
+### Implementation Notes
 
 - New `catch-up-wake.ts` (pure, unit-tested) — the wake decision shared by the catch-up and live paths, so neither double-wakes the other. New `tests/helpers/relay-http-harness.ts` + a real-HTTP-daemon integration test assert the no-double-wake invariant end-to-end against the shipped transport. Gated on `autoInjectInbox` only (independent of the notification level). The next robustness item — an SSE keepalive watchdog for silent Electron drops — follows in v0.2.4; automatic terminal↔agent binding by process id lands in v0.3.
 
 ## [0.2.2] — 2026-06-16 — Deterministic wake: the right agent's terminal, every time
 
-When mail arrives, Tether's auto-`inbox` keystroke now wakes the terminal that belongs to **that** agent — never whichever terminal you happen to have focused. This is the foundation for running several agents (victra-build, codex, …) each in its own VS Code terminal.
+When mail arrives, Tether's auto-`inbox` keystroke now wakes the terminal that belongs to **that** agent — never whichever terminal you happen to have focused. This is the foundation for running several agents (e.g. a build agent and a review agent), each in its own VS Code terminal.
 
 ### Fixed
 
-- **Auto-inject could wake the wrong terminal (P3).** Previously, when no terminal's name exactly equalled the agent name, the `inbox` keystroke fell back to the **focused** terminal — so a message for one agent could nudge whichever terminal you were looking at (it once typed `inbox` into a terminal titled "✳ Restart …"). Now Tether targets the agent's terminal deterministically — by its bare name (e.g. the `vscode-victra-build` relaunch alias names its terminal `victra-build`) or the `Tether: <name>` spawn convention — and **never** falls back to the focused terminal. If **no** terminal matches, or **more than one** does, Tether does not guess: it shows a brief status-bar hint (`<agent> has mail …`) and leaves the mail for you to drain. A missed wake is recoverable; a wrong wake is not.
+- **Auto-inject could wake the wrong terminal (P3).** Previously, when no terminal's name exactly equalled the agent name, the `inbox` keystroke fell back to the **focused** terminal — so a message for one agent could nudge whichever terminal you were looking at (it once typed `inbox` into a terminal titled "✳ Restart …"). Now Tether targets the agent's terminal deterministically — by its bare name (e.g. the `vscode-<agent>` relaunch alias names its terminal `<agent>`, such as `my-agent`) or the `Tether: <name>` spawn convention — and **never** falls back to the focused terminal. If **no** terminal matches, or **more than one** does, Tether does not guess: it shows a brief status-bar hint (`<agent> has mail …`) and leaves the mail for you to drain. A missed wake is recoverable; a wrong wake is not.
 
-### Internal
+### Implementation Notes
 
 - New `terminal-targeting.ts` (VSCode-free, unit-tested): the pure wake-matcher + the single-sourced `Tether: <name>` naming convention (shared by the spawner and the matcher so they cannot drift). Multi-agent terminal identity via a registration handshake — and its reserved-name protection — is the v0.3 follow-up.
 
@@ -74,7 +74,7 @@ Tether now reconnects on its own after the bot-relay daemon restarts — no more
 
 - The SDK's same-session retry budget is reduced (20 → 3): same-session retries only help a brief blip where the session still exists, and are futile after a restart. Recovery from restarts is now owned by the new reconnect supervisor, which kicks in on the first error — before the SDK gives up — so there's no gap.
 
-### Internal
+### Implementation Notes
 
 - New `reconnect-supervisor.ts` (VSCode-free, fully unit-tested): error classification + single-flight + indefinite capped backoff, delegating the backoff curve to the existing `RestartPolicy` (extended with a `neverGiveUp` mode for this path; the 5-restarts/hour cap stays only on the child-process crash-loop path). Manual Reconnect and extension deactivate cleanly cancel any pending auto-reconnect.
 
@@ -92,7 +92,7 @@ Tether becomes an executor: it can now manage a single agent process inside VSCo
 
 ### Caps are immutable at first register
 
-Per the v0.2 brief and `memory/feedback_relay_caps_immutable.md`: declare *every* capability the agent might ever need at first spawn. Widening caps later requires `unregister_agent` first (operator-driven; Tether refuses to silently rotate caps under the hood). The spawn prompt explicitly calls this out.
+Per the v0.2 design (relay caps are immutable after first register): declare *every* capability the agent might ever need at first spawn. Widening caps later requires `unregister_agent` first (operator-driven; Tether refuses to silently rotate caps under the hood). The spawn prompt explicitly calls this out.
 
 ### Per-agent SecretStorage
 
@@ -113,7 +113,7 @@ Token-resolution precedence (per agent):
 
 If SecretStorage is unreachable (Linux without libsecret, transient backend failure), the extension falls back to env-only — the v0.1.3 R1 hardening that refused to re-promote the legacy plaintext leak still applies, per-agent.
 
-### Architecture choices (locked in `audit-findings/v0.2-tether-executor-scope-brief.md`)
+### Architecture choices (locked during the v0.2 design review)
 
 - VSCode Terminal API hosts the agent process. No node-pty. Operator can drop into the terminal to debug live.
 - Single-agent only in v0.2. Multi-subscription (parallel management of N agents) deferred to v0.3 per the foundation-first sequencing — ship the executor model first, then layer multi-agent state-machine complexity once the executor is proven.
@@ -135,8 +135,8 @@ If SecretStorage is unreachable (Linux without libsecret, transient backend fail
 
 ### References
 
-- Brief: `audit-findings/v0.2-tether-executor-scope-brief.md` (committed build plan, dispatched 2026-05-22).
-- Auditor: codex-5-5.
+- Released 2026-05-22.
+- Auditor: an external dual-model audit.
 - Pre-requisites (both shipped): `bot-relay-mcp@2.7.2` (spawn_agent identity recovery), Tether `v0.1.4` (bundling cleanup).
 
 ## [0.1.4] — 2026-05-21 — Bundling cleanup: VSIX from 2.84 MB / 2004 files → 348 KB / 8 files
@@ -160,7 +160,7 @@ A mechanical packaging cleanup. No behavior changes — same SecretStorage migra
 
 ### Architectural choices
 
-The brief left three calls to victra-build (Q1-Q3):
+A design review left three open questions (Q1-Q3):
 
 1. **Source maps shipped (Q1: YES).** `out/extension.js.map` ships alongside `out/extension.js`. Adds ~1 MB to the VSIX but resolves stack traces back to original `src/*.ts` for any contributor or operator who attaches a debugger. Tether is small enough that debug-friendliness > marginal-size cost.
 2. **Bundle minified (Q2: YES).** esbuild's minifier is cheap (no Terser/CommonJS-shim overhead) and source maps survive intact. `keepNames: true` preserves function names for stack traces even under minification.
@@ -192,15 +192,15 @@ All 25 pre-existing extension tests pass unchanged — they exercise the SAME so
 
 ### References
 
-- Brief: `Victra/briefs/2026-05-21-tether-v0.1.4-bundling-brief.md`.
-- Dispatched from victra on v2.7.2 ship (msg `775be1b8`, 2026-05-21).
-- Auditor: codex-5-5.
+- Build plan dated 2026-05-21.
+- Shipped alongside v2.7.2 (2026-05-21).
+- Auditor: an external dual-model audit.
 
 ## [0.1.3] — 2026-05-13 — SECURITY: token storage migration to VSCode SecretStorage
 
 ### Security
 
-- **[HIGH] Agent token now stored in VSCode SecretStorage** (OS keychain on macOS, Credential Vault on Windows, libsecret on Linux) instead of plaintext `settings.json`. The previous `bot-relay.tether.agentToken` configuration field exposed the credential to settings sync, dotfile backups, accidental screenshots, and shoulder-glance. (Origin: Hermes external review via review-Victra deep-review synthesis msg `2b903f9b`.)
+- **[HIGH] Agent token now stored in VSCode SecretStorage** (OS keychain on macOS, Credential Vault on Windows, libsecret on Linux) instead of plaintext `settings.json`. The previous `bot-relay.tether.agentToken` configuration field exposed the credential to settings sync, dotfile backups, accidental screenshots, and shoulder-glance. (Origin: an external security review.)
 
 ### Added
 
@@ -227,9 +227,9 @@ A one-shot warning notification surfaces the degraded mode visibly to the operat
 
 ### References
 
-- v2.7.1 hotfix brief F10 + the maintainer's lock 2026-05-13.
-- Cross-platform parity verified per `feedback_cross_platform_parity.md`.
-- R1 audit finding from codex-5-5 msg `561cf7c9`; R1 dispatch from victra msg `c6f9ee92`.
+- v2.7.1 hotfix; locked 2026-05-13.
+- Cross-platform parity verified (macOS / Windows / Linux).
+- R1 audit finding from an external dual-model audit.
 
 ## [0.1.2] — 2026-05-12 — Reconnect resilience + discoverable manual reconnect
 
@@ -268,8 +268,8 @@ This release wires diagnostics so the next failure surfaces. It does NOT yet fix
 
 ### References
 
-- Root-cause investigation: bot-relay relay msg `18362476` (2026-05-08).
-- Audit verifying daemon-side broadcast contract is intact: msg `4eb34932` (2026-05-08).
+- Root-cause investigation completed 2026-05-08.
+- Audit verifying the daemon-side broadcast contract is intact (2026-05-08).
 - Daemon repros (Node SDK + live `:3777`) confirming notifications/resources/updated frames flow correctly to Node-based subscribers — proves the bug is VS Code runtime-specific, not a daemon issue.
 
 ## [0.1.0] — 2026-05-07

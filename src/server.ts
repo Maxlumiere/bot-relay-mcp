@@ -135,7 +135,7 @@ import { VERSION } from "./version.js";
  * rejected at call time with TOOL_NOT_AVAILABLE + a hint pointing at
  * the profile that would expose them.
  *
- * Bundle list (authoritative; mirrors memory/project_federation_design.md):
+ * Bundle list (authoritative; mirrors the federation design notes):
  *   core           — identity + messaging + tasks + status + health + peek
  *   webhooks       — webhook registration/list/delete
  *   channels       — channel primitives
@@ -435,7 +435,7 @@ export function createServer(): Server {
         name: "post_to_capability",
         description:
           "Route an FYI/coordination message to the current owner(s) of a capability (v2.10 — capability routing, principle #1).\n\n" +
-          "When to use: surface a finding, status, or cross-cutting update to whoever owns a domain WITHOUT knowing their name — e.g. an ad-hoc agent tags a 'relationships' finding and the concierge persona that owns that capability picks it up on its next get_messages. FYI/COORDINATION LANE ONLY: action-required completions (a STAGED build needing an audit, a SHIP that triggers a merge) MUST stay point-to-point ship-pongs via send_message — that point-to-point reliability is what triggers the orchestrator's next action. A capability-routed message never triggers an action.\n\n" +
+          "When to use: surface a finding, status, or cross-cutting update to whoever owns a domain WITHOUT knowing their name — e.g. an ad-hoc agent tags a 'relationships' finding and the agent that owns that capability picks it up on its next get_messages. FYI/COORDINATION LANE ONLY: action-required completions (a STAGED build needing an audit, a SHIP that triggers a merge) MUST stay point-to-point completion reports via send_message — that point-to-point reliability is what triggers the orchestrator's next action. A capability-routed message never triggers an action.\n\n" +
           "Behavior: exact-string matches `capability` against every registered agent's declared capabilities (same lookup as post_task_auto), then fans the message out — one `messages` row per owner, stamped with `routed_capability` so recipients + dashboards distinguish the FYI lane from point-to-point mail. Recipients drain via the normal get_messages (use lane='capability' to read only the FYI lane, lane='direct' for only point-to-point). The sender is excluded by default (`exclude_self`). No current owner → `routed_to:[]` and nothing stored (fire-and-forget to current owners, NOT queued-until-owner). Fires one `message.capability_routed` webhook for the batch. Content encrypted at rest if `RELAY_ENCRYPTION_KEY` is set; same payload cap as `send_message`.\n\n" +
           "Returns: `{ success: true, capability, routed_to: string[], message_ids: string[], count, note }`. `routed_to` is empty (with an explanatory note) when no agent currently owns the capability.\n\n" +
           "Errors: `AUTH_FAILED`, `SENDER_NOT_REGISTERED`, `PAYLOAD_TOO_LARGE`, `RATE_LIMITED`, `VALIDATION`.",
@@ -495,7 +495,7 @@ export function createServer(): Server {
         name: "register_task_schema",
         description:
           "Register a reusable, immutable JSON Schema that gates task completion (v2.10 — safety).\n\n" +
-          "When to use: define the PROOF shape a completing agent must satisfy — e.g. a ship-pong requiring `{ci_status:'green', tests_passed, summary}`. A requester attaches the schema id to a task via `post_task`'s `schema_id`; the assignee's `update_task(action='complete', result=...)` is then validated against it. Built-ins `ship_pong_v1` / `audit_verdict_v1` / `merge_ready_v1` are auto-registered on init.\n\n" +
+          "When to use: define the PROOF shape a completing agent must satisfy — e.g. a completion report requiring `{ci_status:'green', tests_passed, summary}`. A requester attaches the schema id to a task via `post_task`'s `schema_id`; the assignee's `update_task(action='complete', result=...)` is then validated against it. Built-ins `ship_pong_v1` / `audit_verdict_v1` / `merge_ready_v1` are auto-registered on init.\n\n" +
           "Behavior: the document is meta-validated + hardened (no `$ref`/`$dynamicRef`/`$recursiveRef`/`$data`) BEFORE ajv compiles it (a registered schema is compiled, so it is an attack surface). Schemas are IMMUTABLE — re-registering an id is refused; bump the version id. Auth: requires the `manage_schemas` capability.\n\n" +
           "Returns: `{ success: true, id, created_by, created_at, note }`.\n\n" +
           "Errors: `SCHEMA_MISMATCH` (invalid/forbidden schema document), `ALREADY_EXISTS` (id already registered), `CAP_DENIED`, `AUTH_FAILED`, `VALIDATION`.",
@@ -886,8 +886,8 @@ export function createServer(): Server {
     // credentials (the daemon's own env + the daemon's filesystem).
     // STDIO ONLY. HTTP requests must always present a token via item 1
     // or item 2 — the daemon never donates its own credentials to
-    // network callers. Codex msg 2cbe68a2 (env-token oracle) + d1fbbdde
-    // (vault oracle) both closed by this single transport gate.
+    // network callers. The env-token oracle + vault oracle are both
+    // closed by this single transport gate (Codex audit).
     if (ctx.transport !== "stdio") return null;
     // Item 3 — daemon's RELAY_AGENT_TOKEN env (stdio: agent's own identity).
     const envTok = process.env.RELAY_AGENT_TOKEN;
@@ -911,7 +911,7 @@ export function createServer(): Server {
    * **STDIO ONLY.** `resolveToken` gates this on `ctx.transport === "stdio"`,
    * so this function is unreachable from an HTTP request. The R1
    * implementation honored `args.agent_name` here, which created an HTTP
-   * auth-oracle (codex REJECT verdict, msg d1fbbdde): an unauthenticated
+   * auth-oracle (Codex REJECT verdict): an unauthenticated
    * HTTP caller could name any agent in `args.agent_name` and the daemon
    * would read that name's vault file for them. Closed by the transport
    * gate in `resolveToken` AND by dropping the args path here.

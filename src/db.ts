@@ -1147,8 +1147,7 @@ function migrateSchemaToV2_8(db: CompatDatabase): void {
  *     comparing its cached cursor epoch vs the messages it just
  *     received.
  *
- * Epoch is TEXT (UUID) per the locked Codex Q9 design (memory/
- * project_phase_4s_ambient_wake.md line 47). Epoch rotates on `relay
+ * Epoch is TEXT (UUID) per the locked ambient-wake design. Epoch rotates on `relay
  * backup` + `relay restore` so restored DBs don't silently over-filter
  * cursors that were recorded against the pre-backup seq space.
  *
@@ -1290,7 +1289,7 @@ function migrateSchemaToV2_10(db: CompatDatabase): void {
 
 /**
  * v2.8 dashboard-state-machine — agent state machine signal/dispatch columns
- * (schema v12 → v13, committed in audit-findings/v2.8-dashboard-state-machine-brief.md).
+ * (schema v12 → v13, locked during the v2.8 dashboard state-machine design review).
  *
  * Three new NULL-default columns on `agents` to support the 5-state
  * `deriveDashboardState` derivation:
@@ -1342,7 +1341,7 @@ function migrateSchemaToV2_11(db: CompatDatabase): void {
  *     capability tag when a row was fanned out via post_to_capability
  *     (the FYI lane). Makes the action-vs-FYI line machine-enforceable +
  *     lets get_messages(lane=...) drain the two lanes separately, so an
- *     action-required ship-pong is never lost in FYI noise.
+ *     action-required completion report is never lost in FYI noise.
  *
  * Additive + idempotent — guarded by PRAGMA table_info so re-runs no-op.
  * NULL on every existing row = zero data migration.
@@ -1971,7 +1970,7 @@ export function expandAgentCapabilities(
  *     defaults). agent_status='idle' (matches registerAgent first-mint).
  *
  *   - Force rotate (existing row + options.force=true): rotate token only.
- *     Caps are PRESERVED per `feedback_relay_caps_immutable.md`; role is
+ *     Caps are PRESERVED (caps are immutable after first registration); role is
  *     also preserved so a force-rotate cannot quietly relabel an agent.
  *     session_id is CLEARED and agent_status set to 'offline' so the next
  *     time the agent process authenticates, the dashboard accurately
@@ -1992,8 +1991,7 @@ export function expandAgentCapabilities(
  * row at the auth layer. The agent process can then authenticate via
  * RELAY_AGENT_TOKEN env without ever calling register_agent — which is
  * the whole point: it sidesteps the LLM-client safety monitors that
- * pattern-match register-then-use sequences as credential handoff
- * (per `feedback_codex_5_5_safety_blocks_register.md`).
+ * pattern-match register-then-use sequences as credential handoff.
  */
 export function mintAgentToken(
   name: string,
@@ -2136,8 +2134,8 @@ export function registerAgent(
   const capsJson = JSON.stringify(capabilities);
   // v2.0 final (#6): rotate session_id on EVERY register_agent call. A new
   // terminal = a new session = previously-read messages reappear. This is
-  // the fix for the bug Victra hit when the prior session's terminal had
-  // already marked her Codex audit message as read.
+  // the fix for the bug where a prior session's terminal had already
+  // marked an audit message as read.
   const session_id = uuidv4();
 
   const existing = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord | undefined;
@@ -2630,7 +2628,7 @@ export function getAgentAuthData(name: string): AgentRecord | null {
  * v2.8 dashboard-state-machine — roles that count as "dispatch-relevant"
  * recipients for the `last_dispatched_at` stamp.
  *
- * Brief at `audit-findings/v2.8-dashboard-state-machine-brief.md:43`:
+ * Per the v2.8 dashboard state-machine design:
  *   "set by send_message when message has priority='high' OR recipient
  *    is a builder role"
  *
@@ -3229,7 +3227,7 @@ export function getMessages(
   let rows: MessageRecord[];
 
   const priorityOrder = `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
-  // v2.7.0 Hermes-flagged P1 fix — `since` filter MUST run in SQL BEFORE
+  // v2.7.0 external-review-flagged P1 fix — `since` filter MUST run in SQL BEFORE
   // the mark-as-read mutation below, otherwise messages older than the
   // bound get marked read silently and never resurface to this session.
   // Pre-v2.7.0 the filter ran in JS (src/tools/messaging.ts filterBySince,
@@ -3646,10 +3644,10 @@ export function findCapabilityOwners(
  * routing over named routing). Routes one FYI/coordination message to the
  * CURRENT owner(s) of `capability` by inserting one `messages` row per owner,
  * stamped with `routed_capability` so the recipient + dashboards distinguish
- * the FYI lane from point-to-point ship-pongs (the action lane). Recipients
+ * the FYI lane from point-to-point completion reports (the action lane). Recipients
  * drain via the normal get_messages path — no new read surface.
  *
- * No-owner case (victra ruling #2): if nobody currently owns the capability,
+ * No-owner case (design ruling #2): if nobody currently owns the capability,
  * insert NOTHING and return routed_to:[] — FYI is fire-and-forget to current
  * owners, NOT queued-until-owner (that would be task semantics).
  *
@@ -3766,7 +3764,7 @@ export class ResultSchemaViolationError extends Error {
 /**
  * v2.10 — built-in task schemas, auto-registered on init (INSERT OR IGNORE so
  * operator-registered overrides are never clobbered and re-runs no-op). Field
- * sets are grounded in the team's actual ship-pong / audit-verdict / merge
+ * sets are grounded in the team's actual completion-report / audit-verdict / merge
  * shapes; `required` carries the PROOF fields an agent cannot fake-complete
  * without. additionalProperties:true keeps them forward-compatible.
  */
@@ -4003,8 +4001,8 @@ export class SenderNotRegisteredError extends Error {
  * different online session. Pre-v2.2.1 this was a silent warn + session_id
  * rotation — whichever terminal polled `get_messages` first drained the
  * mailbox; the other got zero and no error. Caught in the wild
- * 2026-04-21 during the v2.2.0 ship ceremony (see
- * `memory/feedback_scoped_victra_names.md`).
+ * 2026-04-21 during v2.2.0 validation (scoped agent names
+ * prevent duplicate-name shared-inbox drain races).
  *
  * The class is kept in db.ts for shared visibility + type-safe catch
  * blocks, but is thrown ONLY from the handler. Direct db.registerAgent

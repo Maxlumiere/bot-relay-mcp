@@ -17,7 +17,6 @@
 #   - any test files                    (.test.ts at any path)
 #   - bundler/typecheck configs         (esbuild.config.mjs, tsconfig.json)
 #   - prior VSIX artifacts              (*.vsix)
-#   - dev-internal docs                 (PUBLISH.md, marketplace-prep-results.md)
 #   - editor/OS junk                    (.vscode/, .DS_Store, etc)
 #
 # NOTE: we deliberately do NOT add a blanket `**/*.map` exclusion. That
@@ -46,10 +45,6 @@ out/extension.meta.json
 **/*.test.ts
 **/*.test.js
 vitest.config.*
-
-# Internal docs (developer-facing only — not for marketplace)
-PUBLISH.md
-marketplace-prep-results.md
 
 # Don't ship the package output itself if a prior `vsce package` left one behind
 *.vsix

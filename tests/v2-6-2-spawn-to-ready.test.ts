@@ -225,10 +225,10 @@ describe("v2.6.2 — spawn-to-ready integration (vault state matrix)", () => {
   // was broken. The test parses the register_agent response with TS
   // `JSON.parse()` (native, handles SSE+escape correctly) and writes the
   // vault from TS code at line ~299. It does NOT exercise the bash hook's
-  // grep/sed extraction pipeline, so the news-intel-build SSE-escape bug
+  // grep/sed extraction pipeline, so the SSE-escape bug
   // (caught 2026-05-06, fixed in v2.6.4) slipped past this test even
-  // though SR-D claimed end-to-end coverage. Per
-  // memory/feedback_test_path_must_match_shipped_path.md, the actual
+  // though SR-D claimed end-to-end coverage. Because the test path must
+  // match the shipped path, the actual
   // regression coverage for the bash hook's response parsing now lives in
   // tests/v2-6-4-hook-token-extraction.test.ts (T1/T2/T3 — invokes the
   // real hooks/check-relay.sh against a real HTTP daemon and asserts the

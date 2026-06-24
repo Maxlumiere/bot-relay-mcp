@@ -150,8 +150,8 @@ describe("v2.7 Tether Phase 5 — drift guard (RELAY_SSE_KEEPALIVE_MS env consum
   it("src/transport/http.ts reads RELAY_SSE_KEEPALIVE_MS and calls setupSseKeepalive", async () => {
     // Static guard: a future refactor that drops the env-read or the
     // wiring site would silently regress to "no keepalive" — same
-    // observable symptom the maintainer hit pre-Phase-5. Codex's Phase 4
-    // SCOPE-TIGHTEN explicitly called out this drift class.
+    // observable symptom hit pre-Phase-5. An audit explicitly called
+    // out this drift class.
     const fs = await import("fs");
     const path = await import("path");
     const { fileURLToPath } = await import("url");

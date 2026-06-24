@@ -14,7 +14,7 @@
  * read_relay_token_from_vault, write_relay_token_to_vault) round-trip
  * with TS FileTokenStore writes — byte-identical mirror discipline.
  *
- * Test path matches shipped path per `feedback_test_path_must_match_shipped_path.md`:
+ * Test path matches the shipped path:
  * the bash mirror is exercised by sourcing the actual hook script and
  * invoking the real shell function, not a TS reimplementation.
  */
@@ -55,8 +55,8 @@ const ANY_TOKEN = "Xy0z_Test_Token-WithAllowedChars.123=ab";
 
 describe("v2.6.1 — FileTokenStore unit", () => {
   it("(1) write + read round-trip preserves the token", async () => {
-    await store.write("victra", ANY_TOKEN);
-    const back = await store.read("victra");
+    await store.write("orchestrator", ANY_TOKEN);
+    const back = await store.read("orchestrator");
     expect(back).toBe(ANY_TOKEN);
   });
 
@@ -142,8 +142,8 @@ describe("v2.6.1 — FileTokenStore unit", () => {
 //
 // v2.6.1 R1: tests source the SHIPPED hooks/_vault-helpers.sh — same file the
 // 3 hooks + the migration script source. Drift between bash and TS surfaces
-// directly as a real test failure (no inline-copy hide-out, per
-// memory/feedback_test_path_must_match_shipped_path.md). Codex R0 caught the
+// directly as a real test failure (no inline-copy hide-out — the test
+// exercises the real shipped path). Codex R0 caught the
 // inline-copy weakness; this file closes the contract.
 describe("v2.6.1 — bash hook mirror round-trip (sources shipped helper)", () => {
   const HELPER = path.join(REPO_ROOT, "hooks", "_vault-helpers.sh");
@@ -190,8 +190,8 @@ write_relay_token_to_vault '${name}' '${token}'
 
   it("(12) shipped helper reads what TS FileTokenStore wrote (TS-write → bash-read)", async () => {
     const tsStore = new FileTokenStoreCls({ vaultDir: path.join(TEST_ROOT, "agents") });
-    await tsStore.write("victra", ANY_TOKEN);
-    const r = bashRead("victra");
+    await tsStore.write("orchestrator", ANY_TOKEN);
+    const r = bashRead("orchestrator");
     expect(r.status).toBe(0);
     expect(r.stdout.trim()).toBe(ANY_TOKEN);
   });
@@ -356,7 +356,7 @@ describe("v2.6.1 R1 — FIX 1 launching-shell vault prelude (macOS spawn-agent.s
 
 // --- FIX 2 v2 daemon-side: vault fallback is STDIO-ONLY, never HTTP ---
 //
-// v2.6.1 R2 background: codex caught (msg d1fbbdde, 2026-05-05) that the R1
+// v2.6.1 R2 background: a Codex audit (2026-05-05) caught that the R1
 // implementation let HTTP callers reach the vault by passing args.agent_name
 // — turning the local file vault into a network-reachable auth oracle. R2
 // gates the fallback on `currentContext().transport === "stdio"` and drops
@@ -554,7 +554,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
   it("(17b) HTTP daemon REFUSES vault fallback even with a valid vault file present (R2 security boundary)", async () => {
     // The R1 implementation honored args.agent_name in resolveCallerNameForVault
     // and let an HTTP caller bypass auth by naming any registered agent. Codex
-    // flagged this as an auth oracle (msg d1fbbdde). R2 gates resolveToken on
+    // flagged this as an auth oracle. R2 gates resolveToken on
     // ctx.transport === "stdio" AND drops the args.agent_name path entirely.
     //
     // This test pins the negative case end-to-end: write a valid vault file
@@ -826,7 +826,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
   }, 20_000);
 
   it("(17c) HTTP daemon REFUSES env-token fallback — auth cannot bypass via daemon's own RELAY_AGENT_TOKEN env (R3 security boundary)", async () => {
-    // Codex caught (msg 2cbe68a2, 2026-05-05) on R2 audit that R2 closed only
+    // A Codex audit (2026-05-05) caught on R2 that R2 closed only
     // the vault half of the auth-oracle bug class. Item 3 of the precedence
     // chain (process.env.RELAY_AGENT_TOKEN) was still ungated: an HTTP daemon
     // launched with RELAY_AGENT_TOKEN in its env (a totally normal operator

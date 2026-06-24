@@ -37,7 +37,7 @@
  * Vault) without breaking changes. Same shape as `docker credential-helpers`,
  * `git credential helper`, `gh auth`, `aws configure`, `kubectl config`.
  *
- * Cross-platform parity from day one (per `feedback_cross_platform_parity.md`):
+ * Cross-platform parity from day one:
  *   - macOS / Linux: POSIX perms (0o600 file, 0o700 parent).
  *   - Windows: NTFS profile-dir defaults inherit user-restricted ACL from
  *     `%USERPROFILE%`. We do not (and cannot, without `icacls` shell-out)

@@ -39,10 +39,10 @@ afterEach(() => cleanup());
 
 describe("audit log", () => {
   it("records a successful tool call", () => {
-    logAudit("victra", "send_message", '{"to":"ops"}', true, null);
+    logAudit("orchestrator", "send_message", '{"to":"ops"}', true, null);
     const log = getAuditLog();
     expect(log.length).toBe(1);
-    expect(log[0].agent_name).toBe("victra");
+    expect(log[0].agent_name).toBe("orchestrator");
     expect(log[0].tool).toBe("send_message");
     expect(log[0].success).toBe(1);
     expect(log[0].error).toBeNull();

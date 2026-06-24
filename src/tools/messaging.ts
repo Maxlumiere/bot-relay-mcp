@@ -123,7 +123,7 @@ function resolveSinceBound(
 
 export function handleGetMessages(input: GetMessagesInput) {
   runHealthMonitor("get_messages");
-  // v2.7.0 Hermes P1 fix: `sinceIso` is now passed into the SQL layer and
+  // v2.7.0 external-review P1 fix: `sinceIso` is now passed into the SQL layer and
   // applied as `AND created_at >= ?` BEFORE the mark-as-read mutation in
   // src/db.ts getMessages. Pre-v2.7.0 the filter ran here in JS AFTER
   // getMessages had already marked rows as read for this session — a
@@ -318,7 +318,7 @@ export function handleBroadcast(input: BroadcastInput) {
 /**
  * v2.10 — capability-routed messaging (principle #1). Fans an FYI/coordination
  * message out to the CURRENT owner(s) of a capability. FYI/coordination lane
- * ONLY — action-required completions stay point-to-point ship-pongs via
+ * ONLY — action-required completions stay point-to-point completion reports via
  * send_message. Fires ONE `message.capability_routed` webhook for the whole
  * fan-out (not per-recipient) carrying the capability + recipients, so
  * integrations (Tether) can render the FYI lane distinctly.

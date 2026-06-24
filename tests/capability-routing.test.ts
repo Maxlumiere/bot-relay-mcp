@@ -7,7 +7,7 @@
 // named routing). A sender tags an FYI by a single domain/capability and the
 // relay fans it out to the CURRENT owner(s) of that capability via the normal
 // messages inbox. FYI/coordination lane ONLY — the action lane (point-to-point
-// ship-pongs) stays send_message and is kept machine-distinguishable via the
+// completion reports) stays send_message and is kept machine-distinguishable via the
 // routed_capability column + the get_messages lane filter.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -79,9 +79,9 @@ describe("v2.10 — migration: messages.routed_capability column", () => {
 
 describe("v2.10 — findCapabilityOwners", () => {
   it("returns every agent whose capability set includes the tag (exact match)", () => {
-    registerAgent("concierge", "concierge", ["relationships", "calendar"]);
+    registerAgent("agent-a", "agent-a", ["relationships", "calendar"]);
     registerAgent("builder", "builder", ["build"]);
-    expect(findCapabilityOwners("relationships")).toEqual(["concierge"]);
+    expect(findCapabilityOwners("relationships")).toEqual(["agent-a"]);
     expect(findCapabilityOwners("build")).toEqual(["builder"]);
   });
 
@@ -92,7 +92,7 @@ describe("v2.10 — findCapabilityOwners", () => {
   });
 
   it("does NOT fuzzy/substring match — exact string only", () => {
-    registerAgent("concierge", "concierge", ["relationships"]);
+    registerAgent("agent-a", "agent-a", ["relationships"]);
     expect(findCapabilityOwners("relationship")).toEqual([]); // singular ≠ plural
     expect(findCapabilityOwners("relation")).toEqual([]);
   });
@@ -111,49 +111,49 @@ describe("v2.10 — findCapabilityOwners", () => {
 
 describe("v2.10 — postToCapability fan-out", () => {
   it("routes to the single owner of a capability", () => {
-    registerAgent("concierge", "concierge", ["relationships"]);
-    registerAgent("scout", "worker", ["scan"]);
-    const res = postToCapability("scout", "relationships", "found a lead", "normal");
-    expect(res.routed_to).toEqual(["concierge"]);
+    registerAgent("agent-a", "agent-a", ["relationships"]);
+    registerAgent("agent-b", "worker", ["scan"]);
+    const res = postToCapability("agent-b", "relationships", "found a lead", "normal");
+    expect(res.routed_to).toEqual(["agent-a"]);
     expect(res.message_ids).toHaveLength(1);
 
     // The owning persona picks it up on a normal get_messages drain, with
     // the capability provenance attached.
-    const inbox = getMessages("concierge", "all", 50, true, null, "all");
+    const inbox = getMessages("agent-a", "all", 50, true, null, "all");
     expect(inbox).toHaveLength(1);
     expect(inbox[0].content).toBe("found a lead");
     expect(inbox[0].routed_capability).toBe("relationships");
-    expect(inbox[0].from_agent).toBe("scout");
+    expect(inbox[0].from_agent).toBe("agent-b");
   });
 
   it("fans out one row per owner to ALL current owners", () => {
     registerAgent("b1", "builder", ["build"]);
     registerAgent("b2", "builder", ["build"]);
-    registerAgent("scout", "worker", ["scan"]);
-    const res = postToCapability("scout", "build", "ci is red", "high");
+    registerAgent("agent-b", "worker", ["scan"]);
+    const res = postToCapability("agent-b", "build", "ci is red", "high");
     expect(res.routed_to.sort()).toEqual(["b1", "b2"]);
     expect(res.message_ids).toHaveLength(2);
     expect(rawMessageCount()).toBe(2);
   });
 
   it("excludes the sender by default (exclude_self=true)", () => {
-    registerAgent("concierge", "concierge", ["relationships"]);
-    // concierge tags its own domain — should not ping itself.
-    const res = postToCapability("concierge", "relationships", "self note", "normal", true);
+    registerAgent("agent-a", "agent-a", ["relationships"]);
+    // agent-a tags its own domain — should not ping itself.
+    const res = postToCapability("agent-a", "relationships", "self note", "normal", true);
     expect(res.routed_to).toEqual([]);
     expect(rawMessageCount()).toBe(0);
   });
 
   it("includes the sender when exclude_self=false", () => {
-    registerAgent("concierge", "concierge", ["relationships"]);
-    const res = postToCapability("concierge", "relationships", "self note", "normal", false);
-    expect(res.routed_to).toEqual(["concierge"]);
+    registerAgent("agent-a", "agent-a", ["relationships"]);
+    const res = postToCapability("agent-a", "relationships", "self note", "normal", false);
+    expect(res.routed_to).toEqual(["agent-a"]);
     expect(res.message_ids).toHaveLength(1);
   });
 
   it("NO-OWNER CASE (ruling #2): returns routed_to:[] and stores NOTHING (fire-and-forget, not queued)", () => {
-    registerAgent("scout", "worker", ["scan"]);
-    const res = postToCapability("scout", "astrology", "nobody owns this", "normal");
+    registerAgent("agent-b", "worker", ["scan"]);
+    const res = postToCapability("agent-b", "astrology", "nobody owns this", "normal");
     expect(res.routed_to).toEqual([]);
     expect(res.message_ids).toEqual([]);
     // Critical: no row was inserted (NOT queued-until-owner — that's task semantics).
@@ -163,23 +163,23 @@ describe("v2.10 — postToCapability fan-out", () => {
 
 describe("v2.10 — hard line: action vs FYI is machine-distinguishable (get_messages lane filter)", () => {
   it("lane='direct' returns only point-to-point; lane='capability' returns only FYI; lane='all' returns both", () => {
-    registerAgent("concierge", "concierge", ["relationships"]);
-    registerAgent("scout", "worker", ["scan"]);
+    registerAgent("agent-a", "agent-a", ["relationships"]);
+    registerAgent("agent-b", "worker", ["scan"]);
 
-    // One action-lane ship-pong (point-to-point) ...
-    sendMessage("scout", "concierge", "ACTION: review my PR", "high");
+    // One action-lane completion report (point-to-point) ...
+    sendMessage("agent-b", "agent-a", "ACTION: review my PR", "high");
     // ... and one FYI-lane capability-routed message to the same inbox.
-    postToCapability("scout", "relationships", "FYI: cross-cutting intel", "normal");
+    postToCapability("agent-b", "relationships", "FYI: cross-cutting intel", "normal");
 
-    const all = getMessages("concierge", "all", 50, true, null, "all");
+    const all = getMessages("agent-a", "all", 50, true, null, "all");
     expect(all).toHaveLength(2);
 
-    const direct = getMessages("concierge", "all", 50, true, null, "direct");
+    const direct = getMessages("agent-a", "all", 50, true, null, "direct");
     expect(direct).toHaveLength(1);
     expect(direct[0].routed_capability).toBeNull();
     expect(direct[0].content).toBe("ACTION: review my PR");
 
-    const fyi = getMessages("concierge", "all", 50, true, null, "capability");
+    const fyi = getMessages("agent-a", "all", 50, true, null, "capability");
     expect(fyi).toHaveLength(1);
     expect(fyi[0].routed_capability).toBe("relationships");
     expect(fyi[0].content).toBe("FYI: cross-cutting intel");
@@ -192,11 +192,11 @@ describe("v2.10 — handlePostToCapability (tool handler)", () => {
   }
 
   it("returns success with routed_to + count + note when an owner exists", () => {
-    registerAgent("concierge", "concierge", ["relationships"]);
-    registerAgent("scout", "worker", ["scan"]);
+    registerAgent("agent-a", "agent-a", ["relationships"]);
+    registerAgent("agent-b", "worker", ["scan"]);
     const out = parse(
       handlePostToCapability({
-        from: "scout",
+        from: "agent-b",
         capability: "relationships",
         content: "found a lead",
         priority: "normal",
@@ -205,16 +205,16 @@ describe("v2.10 — handlePostToCapability (tool handler)", () => {
     );
     expect(out.success).toBe(true);
     expect(out.capability).toBe("relationships");
-    expect(out.routed_to).toEqual(["concierge"]);
+    expect(out.routed_to).toEqual(["agent-a"]);
     expect(out.count).toBe(1);
     expect(out.message_ids).toHaveLength(1);
   });
 
   it("returns routed_to:[] with an explanatory note when no owner exists", () => {
-    registerAgent("scout", "worker", ["scan"]);
+    registerAgent("agent-b", "worker", ["scan"]);
     const out = parse(
       handlePostToCapability({
-        from: "scout",
+        from: "agent-b",
         capability: "astrology",
         content: "nobody owns this",
         priority: "normal",

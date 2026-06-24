@@ -23,7 +23,7 @@
  * If SKIP_REGISTER reverts to "skip whenever the row exists", the stale +
  * offline cases below MUST fail (no rotation, seed PIDs preserved).
  *
- * Test path matches shipped path (memory/feedback_test_path_must_match_shipped_path):
+ * Test path matches shipped path (so the test exercises the real seam):
  * the seam under test is the bash hook itself, not a TS/SQL surrogate.
  */
 import { describe, it, expect } from "vitest";
@@ -238,13 +238,13 @@ describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shippe
     }
   }, 25_000);
 
-  it("(L3) offline row (session_id NULL) → hook RE-REGISTERS: session_id repopulates, host_shell_pids + host_id refresh (the victra-build case)", async () => {
+  it("(L3) offline row (session_id NULL) → hook RE-REGISTERS: session_id repopulates, host_shell_pids + host_id refresh (the build-agent case)", async () => {
     const h = await startHarness("offline");
     try {
       const name = "offline-builder";
       const token = await registerAndGetToken(h.port, name);
       // Offline: prior terminal marked the row offline (session_id NULL). This
-      // is exactly victra-build's observed state — empty session_id + empty PIDs.
+      // is exactly the build-agent's observed state — empty session_id + empty PIDs.
       seedRow(h.dbPath, name, { sessionId: null, lastSeenIso: new Date().toISOString() });
       expect(sql(h.dbPath, `SELECT IFNULL(session_id,'') FROM agents WHERE name='${name}';`)).toBe("");
 

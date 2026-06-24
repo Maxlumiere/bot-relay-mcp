@@ -107,11 +107,11 @@ describe("v2.4.1 — getInboxSummary()", () => {
   });
 
   it("(I2) agents with zero mail still appear in the result (LEFT JOIN)", () => {
-    registerAgent("victra", "orchestrator", []);
-    registerAgent("outreach-tech", "builder", []);
+    registerAgent("orchestrator", "orchestrator", []);
+    registerAgent("worker", "builder", []);
     const rows = getInboxSummary();
     const names = rows.map((r) => r.agent_name).sort();
-    expect(names).toEqual(["outreach-tech", "victra"]);
+    expect(names).toEqual(["orchestrator", "worker"]);
     for (const r of rows) {
       expect(r.pending_count).toBe(0);
       expect(r.unread_count).toBe(0);
@@ -120,13 +120,13 @@ describe("v2.4.1 — getInboxSummary()", () => {
   });
 
   it("(I3) pending_count + unread_count reflect mail piling up", () => {
-    registerAgent("victra", "orchestrator", []);
+    registerAgent("orchestrator", "orchestrator", []);
     registerAgent("sender", "r", []);
-    sendMessage("sender", "victra", "m1", "normal");
-    sendMessage("sender", "victra", "m2", "high");
-    sendMessage("sender", "victra", "m3", "normal");
+    sendMessage("sender", "orchestrator", "m1", "normal");
+    sendMessage("sender", "orchestrator", "m2", "high");
+    sendMessage("sender", "orchestrator", "m3", "normal");
     const rows = getInboxSummary();
-    const v = rows.find((r) => r.agent_name === "victra")!;
+    const v = rows.find((r) => r.agent_name === "orchestrator")!;
     expect(v.pending_count).toBe(3);
     expect(v.unread_count).toBe(3);
     expect(v.last_message_at).not.toBeNull();
@@ -137,13 +137,13 @@ describe("v2.4.1 — getInboxSummary()", () => {
   });
 
   it("(I4) drain flips pending_count to 0 but last_message_at survives history", () => {
-    registerAgent("victra", "orchestrator", []);
+    registerAgent("orchestrator", "orchestrator", []);
     registerAgent("sender", "r", []);
-    sendMessage("sender", "victra", "m1", "normal");
-    sendMessage("sender", "victra", "m2", "normal");
-    getMessages("victra", "pending", 100);
+    sendMessage("sender", "orchestrator", "m1", "normal");
+    sendMessage("sender", "orchestrator", "m2", "normal");
+    getMessages("orchestrator", "pending", 100);
     const rows = getInboxSummary();
-    const v = rows.find((r) => r.agent_name === "victra")!;
+    const v = rows.find((r) => r.agent_name === "orchestrator")!;
     expect(v.pending_count).toBe(0);
     expect(v.unread_count).toBe(0);
     expect(v.last_message_at).not.toBeNull();
@@ -152,12 +152,12 @@ describe("v2.4.1 — getInboxSummary()", () => {
 
 describe("v2.4.1 — /api/snapshot enrichment", () => {
   it("(S1) each agent row carries pending_count / unread_count / last_message_at", async () => {
-    registerAgent("victra", "orchestrator", []);
+    registerAgent("orchestrator", "orchestrator", []);
     registerAgent("sender", "r", []);
-    sendMessage("sender", "victra", "ping", "high");
+    sendMessage("sender", "orchestrator", "ping", "high");
     const r = await getJson("/api/snapshot");
     expect(r.status).toBe(200);
-    const v = r.json.agents.find((a: any) => a.name === "victra");
+    const v = r.json.agents.find((a: any) => a.name === "orchestrator");
     expect(v).toBeTruthy();
     expect(v.pending_count).toBe(1);
     expect(v.unread_count).toBe(1);
@@ -169,11 +169,11 @@ describe("v2.4.1 — /api/snapshot enrichment", () => {
   });
 
   it("(S2) snapshot shape stable: existing agent fields survive enrichment", async () => {
-    registerAgent("victra", "orchestrator", ["triage"]);
+    registerAgent("orchestrator", "orchestrator", ["triage"]);
     const r = await getJson("/api/snapshot");
     expect(r.status).toBe(200);
-    const v = r.json.agents.find((a: any) => a.name === "victra");
-    expect(v.name).toBe("victra");
+    const v = r.json.agents.find((a: any) => a.name === "orchestrator");
+    expect(v.name).toBe("orchestrator");
     expect(v.role).toBe("orchestrator");
     expect(v.capabilities).toEqual(["triage"]);
     expect(v.agent_status).toBeDefined();

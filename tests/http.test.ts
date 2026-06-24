@@ -15,7 +15,7 @@ process.env.RELAY_DB_PATH = TEST_DB_PATH;
 // v1.7: legacy grace for tests predating the token flow
 process.env.RELAY_ALLOW_LEGACY = "1";
 // v2.1.3 I8: scrub parent-shell RELAY_AGENT_* env vars. Otherwise the
-// spawn-agent.sh parent exports RELAY_AGENT_TOKEN for victra-build (or
+// spawn-agent.sh parent exports RELAY_AGENT_TOKEN for the agent (or
 // whatever agent is running the test) and the server's token resolver
 // picks it up when test calls omit agent_token. That token won't exist
 // in this fresh isolated DB → auth rejection → tests get garbage envelopes.

@@ -105,7 +105,7 @@ describe("PID-handshake — DB layer (schema v16)", () => {
     expect(findAgent("a")?.host_shell_pids).toEqual([3]);
   });
 
-  it("v2.11.0 GAP 1: re-register populates an initially-empty host_id (the victra-build case)", () => {
+  it("v2.11.0 GAP 1: re-register populates an initially-empty host_id (the build-agent case)", () => {
     // Long-lived persona row first created WITHOUT a handshake → host_id null.
     registerAgent("persona", "builder", []);
     expect(findAgent("persona")?.host_id).toBeNull();

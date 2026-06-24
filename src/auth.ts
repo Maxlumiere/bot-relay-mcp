@@ -121,8 +121,8 @@ export const TOOL_CAPABILITY: Record<string, string> = {
   // enter rotation_grace + receive a push-message; unmanaged agents return
   // the new token to the rotator for out-of-band delivery.
   rotate_token_admin: "rotate_others",
-  // v2.7.1 [CRITICAL FIX] — review-Victra synthesis msg `2b903f9b` /
-  // Hermes deep-review surfaced that pre-v2.7.1 this map omitted
+  // v2.7.1 [CRITICAL FIX] — an external security review surfaced that
+  // pre-v2.7.1 this map omitted
   // expand_capabilities entirely. The dispatcher at src/server.ts:1034
   // falls back to "no capability required" for unmapped tools, so any
   // authenticated agent — even one with the default `{user}` cap set —
@@ -137,8 +137,8 @@ export const TOOL_CAPABILITY: Record<string, string> = {
   // (treated as an admin operation)" at src/server.ts:633 but was NOT
   // in TOOL_CAPABILITY. The fixed-list spec-pin in v2.7.1 R0's
   // tests/v2-7-1-expand-capabilities-gate.test.ts missed this current
-  // counterexample (the maintainer's words: "your walk-analogous fixed list
-  // would NOT have failed if another admin tool stayed unmapped").
+  // counterexample (a fixed list would NOT have failed if another admin
+  // tool stayed unmapped).
   // R1 adds the cap entry AND replaces the spec-pin with a contract
   // test that scans tool descriptions for admin-equivalent phrasing.
   set_dashboard_theme: "admin",

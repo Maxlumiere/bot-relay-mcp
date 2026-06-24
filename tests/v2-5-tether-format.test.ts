@@ -9,8 +9,8 @@
  * suite so the extension's deterministic logic is exercised by every
  * `npm test`. The extension's UX integration (status bar updates on
  * real notifications, terminal injection, webview rendering) requires
- * vscode-test which is heavyweight + CI-only — see
- * extensions/vscode/PUBLISH.md for the manual verification checklist.
+ * vscode-test which is heavyweight + CI-only — see the extension's
+ * release notes for the manual verification checklist.
  *
  * The Server-side contract that's UPSTREAM of every UX behaviour here
  * (subscribe → real notifications/resources/updated frame received via
@@ -32,7 +32,7 @@ const NOW = Date.UTC(2026, 3, 29, 12, 0, 0); // 2026-04-29T12:00:00Z (determinis
 
 function snapshot(overrides: Partial<InboxSnapshot> = {}): InboxSnapshot {
   return {
-    agent_name: "victra",
+    agent_name: "orchestrator",
     agent_known: true,
     pending_count: 0,
     total_count: 0,
@@ -76,11 +76,11 @@ describe("v2.5.0 Tether — VSCode extension format helpers", () => {
 
   it("formatToast names sender + agent inbox; falls back to 'system' when sender absent", () => {
     expect(
-      formatToast(snapshot({ agent_name: "victra-build", last_message_from: "victra" })),
-    ).toBe("Tether: New message from victra in victra-build inbox");
+      formatToast(snapshot({ agent_name: "build-agent", last_message_from: "orchestrator" })),
+    ).toBe("Tether: New message from orchestrator in build-agent inbox");
     expect(
-      formatToast(snapshot({ agent_name: "victra-build", last_message_from: null })),
-    ).toBe("Tether: New message from system in victra-build inbox");
+      formatToast(snapshot({ agent_name: "build-agent", last_message_from: null })),
+    ).toBe("Tether: New message from system in build-agent inbox");
   });
 });
 
@@ -155,7 +155,7 @@ describe("v2.5.0 R1 — Tether config precedence (VSCode > env > default)", () =
   });
 
   it("(v0.1.3 contract change) agentToken: SecretStorage > env > legacy-config > ''", () => {
-    // v0.1.3 [HIGH F10] — Hermes deep-review demoted the plaintext
+    // v0.1.3 [HIGH F10] — an external security review demoted the plaintext
     // `bot-relay.tether.agentToken` setting from "primary source" to
     // "migration-window fallback only". Pre-v0.1.3 the precedence was
     // VSCode-config > env > "" (same shape as agentName). Post-v0.1.3

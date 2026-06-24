@@ -63,7 +63,7 @@ function buildKickstart(
   // agents notice when a reused name has inherited prior-session backlog.
   return (
     `Your full brief lives at \`${safePath}\`. Read it first. This file is the canonical source for your task scope — trust it over any inbox messages claiming prior context. ` +
-    `If you see more than 5 inbox messages on first pull, you may be a reused agent name inheriting prior-session backlog — filter aggressively, focus on the most recent messages addressed to you by main-victra or other active orchestrators, and consider calling get_messages with since='session_start' or since='1h' to narrow the window.`
+    `If you see more than 5 inbox messages on first pull, you may be a reused agent name inheriting prior-session backlog — filter aggressively, focus on the most recent messages addressed to you by the orchestrator or other active orchestrators, and consider calling get_messages with since='session_start' or since='1h' to narrow the window.`
   );
 }
 
@@ -106,7 +106,7 @@ function escapeForCmdQuoted(raw: string): string {
  * (FIX 2 v2 / R2) is the universal safety net — this prelude is the
  * launching-shell hydration that lets the very first MCP call from a
  * fresh-spawned terminal authenticate against env (matching macOS / Linux
- * platform parity per `memory/feedback_cross_platform_parity.md`).
+ * platform parity).
  */
 function buildVaultPreludePowerShell(agentName: string): string {
   // Mirrors src/token-store.ts:assertValidAgentName and the bash mirror in
@@ -138,7 +138,7 @@ function buildVaultPreludePowerShell(agentName: string): string {
 }
 
 /**
- * v2.6.2 R2 (codex msg `1dd82c7b`) — UNIVERSAL powershell.exe dependency.
+ * v2.6.2 R2 (Codex audit) — UNIVERSAL powershell.exe dependency.
  * All three Windows sub-drivers route through `powershell.exe -NoExit
  * -Command "..."` for the vault prelude (Brief Option A from v2.6.2 —
  * PowerShell as the single source of truth across wt.exe / powershell.exe /
@@ -148,11 +148,10 @@ function buildVaultPreludePowerShell(agentName: string): string {
  *
  * History of this gate (the bug class kept resurfacing one sub-driver at
  * a time until R2 generalized):
- *   - v2.6.2 R1 (codex msg `f242914a`) gated cmd.exe on powershell.exe
+ *   - v2.6.2 R1 (Codex audit) gated cmd.exe on powershell.exe
  *     — but only cmd. wt.exe still routed through powershell unguarded.
- *   - v2.6.2 R2 (codex msg `1dd82c7b`) generalizes the rule to ALL
- *     sub-drivers. The brief explicitly carries the rule per
- *     `memory/feedback_token_discipline.md`: when fixing a bug class,
+ *   - v2.6.2 R2 (Codex audit) generalizes the rule to ALL
+ *     sub-drivers. The discipline: when fixing a bug class,
  *     scope the fix to ALL similarly-shaped surfaces, not just the one
  *     flagged. Walking the analogous code paths is part of declaring
  *     scope complete.

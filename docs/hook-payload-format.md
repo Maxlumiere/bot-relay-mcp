@@ -40,9 +40,9 @@ with external services, context injection, stale-state audits.
 
 ```json
 {
-  "session_id": "REDACTED-SESSION-ID",
-  "transcript_path": "/Users/user/.claude/projects/-Users-maintainer-workspace-Claude-AI/REDACTED-SESSION-ID.jsonl",
-  "cwd": "/Users/user/workspace/Claude AI",
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/<project>/<session-id>.jsonl",
+  "cwd": "/path/to/workspace",
   "hook_event_name": "SessionStart"
 }
 ```
@@ -63,9 +63,9 @@ cleanup, final audit.
 
 ```json
 {
-  "session_id": "REDACTED-SESSION-ID",
-  "transcript_path": "/Users/user/.claude/projects/-Users-maintainer-workspace-Claude-AI/REDACTED-SESSION-ID.jsonl",
-  "cwd": "/Users/user/workspace/Claude AI",
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/<project>/<session-id>.jsonl",
+  "cwd": "/path/to/workspace",
   "hook_event_name": "Stop",
   "stop_hook_active": false
 }
@@ -78,13 +78,12 @@ scripts only care about the `false` case.
 
 **Stdout convention:** the Stop hook's stdout is discarded by Claude Code
 (session is already ending). Writes go to disk directly or to stderr for
-operator logs. The `Victra/bin/extract-session.mjs` reference pattern
-appends extraction candidates to `Victra/extractions/inbox.md` and logs a
-one-liner to stderr.
+operator logs. A typical session-extraction pattern appends extraction
+candidates to a file on disk and logs a one-liner to stderr.
 
-**Reference implementation:** `Victra/bin/extract-session.mjs --stdin-hook`
-(in the Victra workspace). Reads `transcript_path` from stdin JSON, streams
-the JSONL, writes markdown output.
+**Reference implementation:** a `--stdin-hook` extractor script reads
+`transcript_path` from stdin JSON, streams the JSONL, and writes markdown
+output.
 
 ## PostToolUse
 
@@ -93,9 +92,9 @@ trails, side-effect triggers.
 
 ```json
 {
-  "session_id": "REDACTED-SESSION-ID",
-  "transcript_path": "/Users/user/.claude/projects/-Users-maintainer-workspace-Claude-AI/REDACTED-SESSION-ID.jsonl",
-  "cwd": "/Users/user/workspace/Claude AI",
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/<project>/<session-id>.jsonl",
+  "cwd": "/path/to/workspace",
   "hook_event_name": "PostToolUse",
   "tool_name": "Bash",
   "tool_input": { "command": "ls -la" },
@@ -122,7 +121,7 @@ stdout JSON), dangerous-op gates.
 
 ```json
 {
-  "session_id": "REDACTED-SESSION-ID",
+  "session_id": "<session-id>",
   "transcript_path": "...",
   "cwd": "...",
   "hook_event_name": "PreToolUse",
@@ -144,7 +143,7 @@ for: prompt rewriting, policy checks.
 
 ```json
 {
-  "session_id": "REDACTED-SESSION-ID",
+  "session_id": "<session-id>",
   "transcript_path": "...",
   "cwd": "...",
   "hook_event_name": "UserPromptSubmit",
@@ -216,6 +215,6 @@ The `hooks/check-relay.sh` reference pattern in this repo used env vars +
 direct sqlite3 access because the SessionStart hook's env-bootstrapping
 predates the stdin-JSON contract. New scripts SHOULD read stdin JSON
 instead — it's the canonical format and carries fields the env vars don't
-(like `transcript_path` on Stop). Surfaced during the Phase F Layer 1
-build (2026-04-21) when `Victra/bin/extract-session.mjs` couldn't use env
-vars to find the transcript on the Stop event.
+(like `transcript_path` on Stop). Surfaced during a 2026-04-21 build when a
+session-extraction script couldn't use env vars to find the transcript on
+the Stop event.

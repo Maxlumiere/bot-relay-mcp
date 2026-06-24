@@ -11,11 +11,11 @@
  * node_modules in the VSIX).
  *
  * Discipline:
- *   - `feedback_test_path_must_match_shipped_path.md`: assertions are
+ *   - Test path matches the shipped path: assertions are
  *     against out/extension.js + out/extension.meta.json — the actual
  *     artifacts that go into the VSIX. Tests run after `npm run bundle`,
  *     not against source.
- *   - `feedback_test_asserts_contract_not_proxy.md`: the contract is
+ *   - Tests assert the exact contract, not a proxy: the contract is
  *     "the bundle has no un-bundled runtime require beyond a safe
  *     allowlist". We parse the metafile esbuild emits (machine-readable
  *     ground truth for esbuild's bundling decisions) rather than
@@ -243,7 +243,7 @@ describe("v0.1.4 — bundle correctness", () => {
     }
   });
 
-  // (B8) — codex-5-5 R0 P2 finding closure. B7 proves require/export
+  // (B8) — Codex R0 P2 finding closure. B7 proves require/export
   // shape but never CALLS activate, so a bundle that exports an
   // activate function which throws immediately on call would still
   // pass B7. B8 actually invokes `await loaded.activate(mockContext)`
@@ -602,8 +602,8 @@ describe("v0.1.4 — bundle correctness", () => {
       ).toBe(1);
       const created = terminals[0]!;
       expect(created.options.name).toBe("Tether: b9-agent-1");
-      // CONTRACT ASSERTION (per
-      // `feedback_test_asserts_contract_not_proxy.md`): the env that
+      // CONTRACT ASSERTION (tests assert the exact contract, not a
+      // proxy): the env that
       // VSCode actually passed to the spawned shell. Drift here would
       // re-open the "agent boots without RELAY_AGENT_NAME" failure
       // mode v2.7.2 closed for spawn-agent.sh.
@@ -621,7 +621,7 @@ describe("v0.1.4 — bundle correctness", () => {
     }
   });
 
-  // ---- v0.2.0 R1 — closes codex audit P2 (msg 2e206b58) ----
+  // ---- v0.2.0 R1 — closes Codex audit P2 ----
   //
   // The brief + v0.2.0 CHANGELOG promise `Tether: Set Agent Token
   // (SecretStorage)` supports per-agent tokens for the executor
@@ -632,8 +632,8 @@ describe("v0.1.4 — bundle correctness", () => {
   //
   // B10a + B10b exercise the SHIPPED bundle's setToken command
   // through Module._load with a structured vscode mock + a tracked
-  // secrets.store call log. Per
-  // `feedback_test_asserts_contract_not_proxy.md`: the assertion is
+  // secrets.store call log. Tests assert the exact contract, not a
+  // proxy: the assertion is
   // EXACT key + EXACT value, not "contains" or substring.
 
   function makeSetTokenMock(inputBoxAnswers: string[]): {
@@ -758,9 +758,9 @@ describe("v0.1.4 — bundle correctness", () => {
   }
 
   it("(B10a) bundled botRelayTether.setToken with NAMED agent writes per-agent key", async () => {
-    // inputBox answers (in order): name="victra-build", token="tok-abc-123"
+    // inputBox answers (in order): name="build-agent", token="tok-abc-123"
     const { vscodeMock, mockContext, secretsStoreCalls, registeredCommands, infoMessages } =
-      makeSetTokenMock(["victra-build", "tok-abc-123"]);
+      makeSetTokenMock(["build-agent", "tok-abc-123"]);
     const savedRelayAgentName = process.env.RELAY_AGENT_NAME;
     delete process.env.RELAY_AGENT_NAME;
     const { loaded, restore } = await loadBundleWithMockedVscode(vscodeMock);
@@ -774,10 +774,10 @@ describe("v0.1.4 — bundle correctness", () => {
         secretsStoreCalls,
         "setToken with named agent must write per-agent key",
       ).toEqual([
-        { key: "botRelayTether.token.victra-build", value: "tok-abc-123" },
+        { key: "botRelayTether.token.build-agent", value: "tok-abc-123" },
       ]);
       // Toast confirms WHICH path ran — operator-visible.
-      expect(infoMessages.some((m) => /agent "victra-build"/.test(m))).toBe(true);
+      expect(infoMessages.some((m) => /agent "build-agent"/.test(m))).toBe(true);
     } finally {
       restore();
       if (savedRelayAgentName !== undefined) {

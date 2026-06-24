@@ -5,7 +5,7 @@
 //
 // v2.10 — schema-gated task completion (safety). Hardened JSON Schema
 // validation for task-completion gating. Per the v2.10 design rulings
-// (victra Q1 + codex audit gate), ajv is used because a battle-tested
+// (design review + Codex audit gate), ajv is used because a battle-tested
 // standard validator is SAFER than a hand-rolled subset (a bug in our own
 // validator = the gate fails OPEN), and real JSON Schema is portable.
 //

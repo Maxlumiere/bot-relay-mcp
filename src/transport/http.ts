@@ -46,7 +46,7 @@ import type { Server } from "http";
  * v2.7 Tether Phase 5 — SSE keepalive helper.
  *
  * Phase 4a fixed the server-side cull (session reaper closing while a
- * GET stream was open). the maintainer's post-Phase-4 smoke revealed a SECOND
+ * GET stream was open). Post-Phase-4 smoke testing revealed a SECOND
  * disconnect class at ~2.5 min — daemon log showed nothing (no reap,
  * no close, no error), but the extension's client-side fetch reported
  * `SSE stream disconnected: TypeError: terminated`. Root cause: VS
@@ -168,7 +168,7 @@ function timingSafeStringEq(a: string, b: string): boolean {
 }
 
 /**
- * v2.1.7 Item 2 (external reviewer): CSRF token derivation.
+ * v2.1.7 Item 2: CSRF token derivation.
  *
  * Stateless double-submit: token is an HMAC-SHA256 of the authenticated
  * dashboard secret under a per-process random salt. Properties that matter:
@@ -372,7 +372,7 @@ export function startHttpServer(port: number, host: string): Server {
   // 64KB) on message/task content. 1MB here guards against pathological
   // JSON wrappers while still comfortably accommodating bundled tool calls.
 
-  // v2.1.7 Item 3 (external reviewer): per-IP rate + concurrent-request cap at the
+  // v2.1.7 Item 3: per-IP rate + concurrent-request cap at the
   // transport layer. Existing per-tool-call rate limits (src/server.ts) bucket
   // by agent_name; a noisy anonymous source can still exhaust express
   // middleware + JSON-parse CPU before auth fires. This middleware sits
@@ -499,7 +499,7 @@ export function startHttpServer(port: number, host: string): Server {
     next();
   };
 
-  // v2.1 Phase 4d (B) — DNS-rebinding defense, widened in v2.1.7 (external reviewer): Host
+  // v2.1 Phase 4d (B) — DNS-rebinding defense, widened in v2.1.7: Host
   // header must match an allowlist on EVERY HTTP route, not just the dashboard
   // surface. Pre-v2.1.7 this gate only fired on /, /dashboard, /api/snapshot,
   // /api/keyring — leaving /mcp open to browser-side DNS-rebinding attacks
@@ -595,7 +595,7 @@ export function startHttpServer(port: number, host: string): Server {
       });
       return;
     }
-    // v2.1.7 Item 2 (external reviewer): on successful auth, (re-)issue BOTH cookies with
+    // v2.1.7 Item 2: on successful auth, (re-)issue BOTH cookies with
     // hardened attributes:
     //   - relay_dashboard_auth: HttpOnly + SameSite=Strict + Path=/
     //     (+ Secure only when RELAY_TLS_ENABLED=1 so local http-only dev
@@ -632,7 +632,7 @@ export function startHttpServer(port: number, host: string): Server {
     next();
   };
 
-  // v2.1.7 Item 2 (external reviewer) — CSRF double-submit check. Applies to unsafe
+  // v2.1.7 Item 2 — CSRF double-submit check. Applies to unsafe
   // methods (POST/PUT/DELETE/PATCH) on /api/* paths. Pre-v2.2 there are no
   // such endpoints; the middleware ships as infrastructure so every new
   // state-changing dashboard endpoint shipped in v2.2 is safe-by-construction.
@@ -919,11 +919,10 @@ export function startHttpServer(port: number, host: string): Server {
     // (defense-in-depth only): if the caller didn't supply one, the send
     // succeeded with `from_authenticated: false` in the audit log. Anyone
     // who held the dashboard's HTTP secret could POST send_message with
-    // `from=victra` and impersonate any registered agent across the
+    // an arbitrary `from` and impersonate any registered agent across the
     // relay's entire message + task surface.
     //
-    // the maintainer locked Option A on 2026-05-13 (review-Victra synthesis msg
-    // `2b903f9b` / codex deep-review): make from_agent_token REQUIRED
+    // Option A: make from_agent_token REQUIRED
     // when `from` names a registered agent. The dashboard secret +
     // CSRF + origin checks still cover access to this endpoint; the
     // from-token gate stops impersonation if those upstream checks ever
@@ -1515,7 +1514,7 @@ export function startHttpServer(port: number, host: string): Server {
       // The recursion was latent throughout v2.5+: the InMemory-style
       // test rigs + the client.close() teardown path never enter this
       // chain. Tether 0.2.0 + the SDK SSE GET subscription path DO enter
-      // it (caught 2026-06-10 via the maintainer's live VS Code repro; root-cause
+      // it (caught 2026-06-10 via a live VS Code repro; root-cause
       // confirmed against protocol.js:500-502 + the daemon's own
       // onclose body).
       //
@@ -1610,8 +1609,8 @@ export function startHttpServer(port: number, host: string): Server {
       async () => {
         try {
           const headerSession = req.headers["mcp-session-id"];
-          // v2.7.1 — downgraded to debug per review-Victra synthesis F5
-          // + codex PR #31 audit pt 4: only `fanout enter` stays at info.
+          // v2.7.1 — downgraded to debug per an audit finding: only
+          // `fanout enter` stays at info.
           // SSE-stream-open is once-per-session but most operators
           // don't need the per-session trace; surface under
           // RELAY_LOG_LEVEL=debug when verifying an extension's

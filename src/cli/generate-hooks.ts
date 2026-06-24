@@ -8,7 +8,7 @@
  *
  * Emits a ~/.claude/settings.json fragment (default) OR full file (--full)
  * containing the three hook entries with correctly-quoted absolute paths for
- * this install. Paths containing spaces are single-quoted per HANDOFF.md
+ * this install. Paths containing spaces are single-quoted per the
  * edge-case discipline.
  */
 import path from "path";

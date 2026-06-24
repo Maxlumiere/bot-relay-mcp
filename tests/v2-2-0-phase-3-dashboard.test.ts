@@ -21,8 +21,8 @@
  *   - Recent-messages list uses <button> rows with aria-expanded (keyboard
  *     navigable ARIA-compliant accordion).
  *
- * Manual verification outstanding (per spec § Success criteria, demo-able
- * at ship ceremony): live WebSocket push visible on browser, cards-per-row
+ * Manual verification outstanding (per spec § Success criteria, manual
+ * release-validation criteria): live WebSocket push visible on browser, cards-per-row
  * toggle updates grid, click-to-focus raises iTerm2 on macOS.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";

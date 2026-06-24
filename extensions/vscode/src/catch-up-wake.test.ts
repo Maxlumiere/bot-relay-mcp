@@ -61,7 +61,7 @@ describe("decideWake — catch-up / live shared watermark", () => {
     // id), so a genuinely-new message whose created_at collides with the mark is
     // indistinguishable from the one we already woke for. The `===` comparison
     // therefore treats it as already-woken → NO re-wake. This is the intended
-    // fail-safe direction (victra edge / codex): a missed wake is recoverable;
+    // fail-safe direction: a missed wake is recoverable;
     // a double-wake corrupts coordination. Never wake on a tie.
     const d = decideWake(
       { pending_count: 4, last_message_at: T1 },

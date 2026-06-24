@@ -89,7 +89,7 @@ const lastBroadcastIdByUri = new Map<string, number>();
 
 // v2.6.x / Tether v0.1.1 Phase 2 — TEMPORARY broadcast-trace instrumentation.
 // Goal: surface where the subscribe→emit→fan-out→sendResourceUpdated chain
-// breaks during the Tether VS Code smoke (msg dispatch in 0506ac7's ship-pong
+// breaks during the Tether VS Code smoke (a completion report during dispatch
 // surfaced that Phase 1 client-side onerror/onclose never fire — failure is
 // below the SDK message-handling layer). Each Server gets a monotonic debug
 // tag (S1, S2, …) so daemon stderr can correlate subscribe + per-iteration
@@ -195,8 +195,8 @@ export function subscribe(uri: string, server: Server): void {
     subscriptionsByUri.set(uri, set);
   }
   set.add(server);
-  // v2.7.1 — downgraded to debug per review-Victra synthesis F5 +
-  // codex PR #31 audit pt 4: only `fanout enter` stays at info as the
+  // v2.7.1 — downgraded to debug per an audit finding: only `fanout
+  // enter` stays at info as the
   // load-bearing per-event observability line. `subscribe added`
   // fires once per subscriber lifetime; surface under
   // RELAY_LOG_LEVEL=debug when chasing a specific session.

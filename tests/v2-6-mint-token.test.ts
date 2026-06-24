@@ -82,9 +82,9 @@ const TOKEN_REGEX = /[A-Za-z0-9_-]{43}/;
 
 describe("v2.6 — relay mint-token CLI", () => {
   it("(1) first mint creates row, prints token, hashes correctly", async () => {
-    const r = runMint(["codex-5-5", "--role", "builder", "--capabilities", "build,test,audit"]);
+    const r = runMint(["codex", "--role", "builder", "--capabilities", "build,test,audit"]);
     expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/Minted token for new agent "codex-5-5"/);
+    expect(r.stdout).toMatch(/Minted token for new agent "codex"/);
     expect(r.stdout).toMatch(/Token \(shown ONCE/);
     const tokenMatch = r.stdout.match(TOKEN_REGEX);
     expect(tokenMatch).not.toBeNull();
@@ -93,7 +93,7 @@ describe("v2.6 — relay mint-token CLI", () => {
     const { initializeDb, getDb, getAgentAuthData } = await import("../src/db.js");
     await initializeDb();
     const db = getDb();
-    const row = db.prepare("SELECT * FROM agents WHERE name = ?").get("codex-5-5") as any;
+    const row = db.prepare("SELECT * FROM agents WHERE name = ?").get("codex") as any;
     expect(row).toBeDefined();
     expect(row.role).toBe("builder");
     expect(row.token_hash).toBeTruthy();
@@ -101,7 +101,7 @@ describe("v2.6 — relay mint-token CLI", () => {
     expect(JSON.parse(row.capabilities)).toEqual(["build", "test", "audit"]);
 
     // Token authenticates against stored hash.
-    const auth = getAgentAuthData("codex-5-5");
+    const auth = getAgentAuthData("codex");
     expect(auth).toBeDefined();
     const { verifyToken } = await import("../src/auth.js");
     expect(verifyToken(plaintext, auth!.token_hash!)).toBe(true);

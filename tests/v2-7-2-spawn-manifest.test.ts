@@ -16,8 +16,8 @@
  * drift between this test file's expectations and what bash actually
  * does at runtime surfaces here, not in a live spawn.
  *
- * Per `feedback_test_path_must_match_shipped_path.md`: no TS re-impl.
- * Per `feedback_test_asserts_contract_not_proxy.md`: assertions are on
+ * Test path matches the shipped path: no TS re-impl.
+ * Tests assert the exact contract, not a proxy: assertions are on
  * the observed effect (fallback name appears in hook output) not on a
  * proxy of the effect.
  */
@@ -91,13 +91,13 @@ function agentsDir(): string {
 describe("v2.7.2 — write_relay_spawn_manifest", () => {
   it("(M1) writes name + role + spawn_pid + ISO timestamp to the resolved path", () => {
     const r = bashRun(
-      helperScript(`write_relay_spawn_manifest 'victra-memory-build' 'builder'`),
+      helperScript(`write_relay_spawn_manifest 'mem-build-agent' 'builder'`),
     );
     expect(r.status, `stderr: ${r.stderr}`).toBe(0);
-    const p = path.join(agentsDir(), "victra-memory-build.spawn-manifest");
+    const p = path.join(agentsDir(), "mem-build-agent.spawn-manifest");
     expect(fs.existsSync(p)).toBe(true);
     const body = fs.readFileSync(p, "utf-8");
-    expect(body).toMatch(/^name=victra-memory-build$/m);
+    expect(body).toMatch(/^name=mem-build-agent$/m);
     expect(body).toMatch(/^role=builder$/m);
     expect(body).toMatch(/^spawn_pid=\d+$/m);
     expect(body).toMatch(/^spawned_at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/m);
@@ -144,10 +144,10 @@ describe("v2.7.2 — write_relay_spawn_manifest", () => {
 
 describe("v2.7.2 — find_fresh_relay_spawn_manifest", () => {
   it("(F1) returns name+role on exactly one fresh manifest", () => {
-    bashRun(helperScript(`write_relay_spawn_manifest 'victra-memory-build' 'builder'`));
+    bashRun(helperScript(`write_relay_spawn_manifest 'mem-build-agent' 'builder'`));
     const r = bashRun(helperScript(`find_fresh_relay_spawn_manifest 60`));
     expect(r.status, `stderr: ${r.stderr}`).toBe(0);
-    expect(r.stdout.trim()).toBe("name=victra-memory-build;role=builder");
+    expect(r.stdout.trim()).toBe("name=mem-build-agent;role=builder");
   });
 
   it("(F2) returns non-zero when no manifest exists", () => {
@@ -261,11 +261,11 @@ describe("v2.7.2 — hook fallback integration (check-relay.sh)", () => {
   }
 
   it("(H1) recovers identity from a single fresh manifest and emits a stderr breadcrumb", () => {
-    bashRun(helperScript(`write_relay_spawn_manifest 'victra-memory-build' 'builder'`));
+    bashRun(helperScript(`write_relay_spawn_manifest 'mem-build-agent' 'builder'`));
     const r = runHook();
     // The breadcrumb must mention the recovered name + role.
     expect(r.stderr).toMatch(/recovered identity from spawn manifest/);
-    expect(r.stderr).toMatch(/name=victra-memory-build/);
+    expect(r.stderr).toMatch(/name=mem-build-agent/);
     expect(r.stderr).toMatch(/role=builder/);
   });
 
@@ -295,7 +295,7 @@ describe("v2.7.2 — hook fallback integration (check-relay.sh)", () => {
     expect(r.stderr).not.toMatch(/recovered identity from spawn manifest/);
   });
 
-  it("(H6) emits LOUD stderr warning when ambiguity blocks recovery — closes codex R0 P2 (msg 8244095e)", () => {
+  it("(H6) emits LOUD stderr warning when ambiguity blocks recovery — closes Codex R0 P2", () => {
     // Two fresh manifests → find_fresh returns non-zero → the else-branch
     // must call count_fresh_* and warn loudly. The warning text is part of
     // the SHIPPED contract (CHANGELOG promises loud-on-ambiguity); an

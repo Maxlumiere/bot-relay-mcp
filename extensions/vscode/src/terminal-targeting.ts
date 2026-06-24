@@ -9,7 +9,7 @@
 // `vscode.window.activeTerminal`; because Tether names spawned terminals
 // `Tether: <name>` the exact match never hit, so every wake landed on the
 // focused terminal (the 2026-06-11 Half-B cross-agent mis-injection). For
-// multi-agent (victra-build + codex + … each in its own terminal) a wrong wake
+// multi-agent setups (several agents, each in its own terminal) a wrong wake
 // nudges the WRONG agent and corrupts coordination.
 //
 // This module is the pure, VSCode-free decision core (unit-tested in isolation):
@@ -37,11 +37,11 @@ export function tetherTerminalName(agentName: string): string {
 
 /**
  * Decide which terminal to wake for `agentName`. A terminal owns the agent
- * when its name is EITHER the bare agent name (operator-opened — e.g. the
- * `vscode-victra-build` relaunch alias names its terminal `victra-build`) OR
+ * when its name is EITHER the bare agent name (operator-opened — e.g. a
+ * `vscode-<agent>` relaunch alias names its terminal `<agent>`) OR
  * the Tether spawn convention `Tether: <name>`.
  *
- * Rulings (v0.2.2, victra-locked):
+ * Rulings (v0.2.2, locked):
  *  - exactly 1 match → inject.
  *  - 0 matches      → no-inject (caller surfaces a status-bar hint; the mail is
  *                     still in the inbox to drain — a missed wake is recoverable).

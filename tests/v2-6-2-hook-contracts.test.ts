@@ -158,7 +158,7 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     // No DB created; hook should exit 0 silently.
     const r = runHook({
       hook: HOOK_CHECK_RELAY,
-      agentName: "victra-build",
+      agentName: "build-agent",
       home: root,
       // Use a path that doesn't exist so the "no DB" branch fires cleanly.
       dbPath: path.join(root, "missing.db"),
@@ -173,17 +173,17 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
   it("(C2) DB present + matching agent + pending message → stdout includes [RELAY] Pending messages line", () => {
     const { root, dbPath } = freshTestRoot();
     initMinimalDb(dbPath);
-    insertAgent(dbPath, "victra-build");
-    insertMessage(dbPath, "victra", "victra-build", "Hello from C2 test");
+    insertAgent(dbPath, "build-agent");
+    insertMessage(dbPath, "orchestrator", "build-agent", "Hello from C2 test");
     const r = runHook({
       hook: HOOK_CHECK_RELAY,
-      agentName: "victra-build",
+      agentName: "build-agent",
       home: root,
       dbPath,
       httpPort: 1, // skip HTTP path
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain("[RELAY] Pending messages for victra-build");
+    expect(r.stdout).toContain("[RELAY] Pending messages for build-agent");
     expect(r.stdout).toContain("Hello from C2 test");
   });
 
@@ -236,7 +236,7 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     const outsideDb = path.join(root, "..", "..", "etc", "fake.db");
     const r = runHook({
       hook: HOOK_CHECK_RELAY,
-      agentName: "victra-build",
+      agentName: "build-agent",
       home: "/nonexistent-home",
       dbPath: outsideDb,
       httpPort: 1,
@@ -277,7 +277,7 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
     const { root, dbPath } = freshTestRoot();
     initMinimalDb(dbPath);
     insertAgent(dbPath, "post-test-agent");
-    insertMessage(dbPath, "victra", "post-test-agent", "Hello from P3");
+    insertMessage(dbPath, "orchestrator", "post-test-agent", "Hello from P3");
     const r = runHook({
       hook: HOOK_POST_TOOL,
       agentName: "post-test-agent",
@@ -303,7 +303,7 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
     const { root } = freshTestRoot();
     const r = runHook({
       hook: HOOK_POST_TOOL,
-      agentName: "victra-build",
+      agentName: "build-agent",
       agentToken: "Some_Valid_Token-AAAAAAA",
       home: root,
       dbPath: path.join(root, "missing.db"),
@@ -316,10 +316,10 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
   it("(P5) malformed RELAY_AGENT_TOKEN (contains space) → token discarded, no auth header sent, exit 0", () => {
     const { root, dbPath } = freshTestRoot();
     initMinimalDb(dbPath);
-    insertAgent(dbPath, "victra-build");
+    insertAgent(dbPath, "build-agent");
     const r = runHook({
       hook: HOOK_POST_TOOL,
-      agentName: "victra-build",
+      agentName: "build-agent",
       agentToken: "has space inside", // fails shape regex
       home: root,
       dbPath,
@@ -352,7 +352,7 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
     const { root, dbPath } = freshTestRoot();
     initMinimalDb(dbPath);
     insertAgent(dbPath, "stop-test-agent");
-    insertMessage(dbPath, "victra", "stop-test-agent", "Hello from S2");
+    insertMessage(dbPath, "orchestrator", "stop-test-agent", "Hello from S2");
     const r = runHook({
       hook: HOOK_STOP,
       agentName: "stop-test-agent",
@@ -374,7 +374,7 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
     const { root } = freshTestRoot();
     const r = runHook({
       hook: HOOK_STOP,
-      agentName: "victra-build",
+      agentName: "build-agent",
       agentToken: "Some_Valid_Token-AAAAAAA",
       home: root,
       dbPath: path.join(root, "missing.db"),

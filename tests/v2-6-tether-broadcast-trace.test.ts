@@ -26,7 +26,7 @@
  *
  * Test path matches shipped path: real `node dist/index.js` subprocess,
  * real `StreamableHTTPClientTransport` (the SDK Tether uses), real
- * stderr capture. Per memory/feedback_test_path_must_match_shipped_path.md.
+ * stderr capture — the test exercises the real shipped path.
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";

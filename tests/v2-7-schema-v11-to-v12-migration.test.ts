@@ -6,7 +6,7 @@
 /**
  * v2.7 Tether Phase 3 R1 — seeded-version migration regression.
  *
- * Codex caught a P1 in the Phase 3 R0 ship-pong: on a live DB whose
+ * A Codex audit caught a P1 in the Phase 3 R0 release: on a live DB whose
  * recorded `schema_info.version` was 11, Phase 3's
  * `migrateSchemaToV2_10` created the `inbox_events` table (v12 content)
  * but the version field stayed at 11 forever — because

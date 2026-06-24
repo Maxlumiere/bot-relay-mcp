@@ -63,12 +63,12 @@ describe("v2.2.0 Phase 1 — schema + register_agent surface", () => {
   });
 
   it("(1b) registerAgent stores terminal_title_ref on first insert", () => {
-    const r = registerAgent("fresh", "builder", ["tasks"], { terminal_title_ref: "victra-build" });
-    expect(r.agent.terminal_title_ref).toBe("victra-build");
+    const r = registerAgent("fresh", "builder", ["tasks"], { terminal_title_ref: "build-agent" });
+    expect(r.agent.terminal_title_ref).toBe("build-agent");
     const row = getDb()
       .prepare("SELECT terminal_title_ref FROM agents WHERE name = ?")
       .get("fresh") as { terminal_title_ref: string };
-    expect(row.terminal_title_ref).toBe("victra-build");
+    expect(row.terminal_title_ref).toBe("build-agent");
   });
 
   it("(1c) registerAgent UPDATE path replaces terminal_title_ref when provided", () => {
@@ -101,7 +101,7 @@ describe("v2.2.0 Phase 1 — schema + register_agent surface", () => {
       name: "x",
       role: "r",
       capabilities: [],
-      terminal_title_ref: "victra build-1",
+      terminal_title_ref: "agent build-1",
     });
     expect(ok.success).toBe(true);
     const bad = RegisterAgentSchema.safeParse({
@@ -122,10 +122,10 @@ describe("v2.2.0 Phase 1 — focus drivers (command construction)", () => {
   const ctxWithBins = { platform: "darwin" as const, hasBinary: () => true };
 
   it("(2a) macOS driver: osascript invocation with escaped title", () => {
-    const cmd = macosDriver.buildCommand("victra-build", { ...ctxWithBins, platform: "darwin" });
+    const cmd = macosDriver.buildCommand("build-agent", { ...ctxWithBins, platform: "darwin" });
     expect(cmd.exec).toBe("osascript");
     expect(cmd.args[0]).toBe("-e");
-    expect(cmd.args[1]).toContain(`name of s is "victra-build"`);
+    expect(cmd.args[1]).toContain(`name of s is "build-agent"`);
     expect(cmd.args[1]).toContain("tell application \"iTerm2\"");
   });
 
@@ -136,9 +136,9 @@ describe("v2.2.0 Phase 1 — focus drivers (command construction)", () => {
   });
 
   it("(2c) Linux driver: wmctrl -a TITLE with title as discrete argv", () => {
-    const cmd = linuxDriver.buildCommand("victra build", { ...ctxWithBins, platform: "linux" });
+    const cmd = linuxDriver.buildCommand("agent build", { ...ctxWithBins, platform: "linux" });
     expect(cmd.exec).toBe("wmctrl");
-    expect(cmd.args).toEqual(["-a", "victra build"]);
+    expect(cmd.args).toEqual(["-a", "agent build"]);
   });
 
   it("(2d) Linux driver: canHandle false when wmctrl missing → dispatcher graceful degrades", () => {

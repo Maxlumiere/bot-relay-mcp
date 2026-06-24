@@ -97,4 +97,3 @@ ORDER BY created_at DESC LIMIT 20;
 - `src/db.ts` — `rotateAgentToken` (CAS) / `revokeAgentToken`
 - `tests/v2-1-token-rotate-revoke.test.ts` — 8 integration tests
 - `docs/error-codes.md` — stable error-code catalog
-- `devlog/045-v2.1-token-rotate-revoke.md` — design decisions

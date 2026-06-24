@@ -6,7 +6,7 @@
 /**
  * v2.8 — SIGHUP handler integration test.
  *
- * Per `memory/feedback_test_path_must_match_shipped_path.md`: this MUST
+ * The test path must match the shipped path: this MUST
  * exercise the actual `installAutoUnregister` chain in the shipped
  * `dist/index.js` via a real OS signal. A mocked signal handler would
  * pass even if the SIGHUP listener was never registered.

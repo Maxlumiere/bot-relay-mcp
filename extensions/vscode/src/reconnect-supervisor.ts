@@ -5,8 +5,7 @@
 /**
  * v0.2.1 P1 — auto-reconnect supervisor.
  *
- * Fixes the "permanent wedge after daemon restart" defect (spec:
- * audit-findings/v0.2.1-tether-p1-autoreconnect-spec.md). Two root causes
+ * Fixes the "permanent wedge after daemon restart" defect. Two root causes
  * compounded:
  *   RC-1 — the MCP SDK's StreamableHTTPClientTransport reconnects the SSE
  *          GET on the SAME mcp-session-id captured at initialize. After a

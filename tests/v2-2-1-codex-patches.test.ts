@@ -110,7 +110,7 @@ describe("Codex M1 — /api/send-message + /api/kill-agent + /api/set-status aud
   });
 
   it("(M1.2) RELAY_DASHBOARD_OPERATOR env sets the operator_identity marker", async () => {
-    process.env.RELAY_DASHBOARD_OPERATOR = "maintainer";
+    process.env.RELAY_DASHBOARD_OPERATOR = "operator-1";
     await bootServer(); // pick up the env
     registerAgent("mx-from", "r", []);
     registerAgent("mx-to", "r", []);
@@ -123,7 +123,7 @@ describe("Codex M1 — /api/send-message + /api/kill-agent + /api/set-status aud
       .prepare("SELECT params_summary FROM audit_log WHERE tool = 'send_message' AND source = 'dashboard'")
       .get() as { params_summary: string } | undefined;
     expect(row).toBeDefined();
-    expect(row!.params_summary).toMatch(/operator=maintainer/);
+    expect(row!.params_summary).toMatch(/operator=operator-1/);
   });
 
   it("(M1.3) /api/kill-agent audit records target + removed flag", async () => {

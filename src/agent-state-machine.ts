@@ -10,8 +10,8 @@
  * effects, no DB writes.
  *
  * Lives in its own module so unit tests exercise the EXACT function the
- * decay broadcaster + dashboard derivation call at runtime (per
- * `memory/feedback_test_path_must_match_shipped_path.md`). The legacy
+ * decay broadcaster + dashboard derivation call at runtime (so the
+ * test path always matches the shipped path). The legacy
  * `deriveAgentStatus` in `src/db.ts` stays untouched — it returns the
  * pre-v2.8 8-state union (`agent_status`) which existing dashboard
  * rendering still consumes. v2.9 will migrate the dashboard UI to use
@@ -19,9 +19,8 @@
  * the decay broadcaster) and stamps the new DB columns; no existing
  * consumer changes shape.
  *
- * Architectural calls locked in
- * `audit-findings/v2.8-dashboard-state-machine-brief.md` (Decisions
- * table). State count = 5 (the maintainer 2026-05-25). Precedence top wins:
+ * Architectural calls locked during a v2.8 design review. State count = 5
+ * (locked 2026-05-25). Precedence top wins:
  * `closed > stale > pending > active > waiting`.
  */
 

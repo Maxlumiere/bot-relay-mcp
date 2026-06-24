@@ -557,10 +557,10 @@ Install per-project (NOT global), in `<project>/.claude/settings.json`:
 }
 ```
 
-> **Important — if your path contains spaces, single-quote it inside the JSON string.** Claude Code passes the `command` to the shell, which splits on whitespace. Without the single quotes the hook silently fails with errors like `/bin/sh: ... is a directory`. Example for a real installation at `/Users/user/workspace/Claude AI/bot-relay-mcp/`:
+> **Important — if your path contains spaces, single-quote it inside the JSON string.** Claude Code passes the `command` to the shell, which splits on whitespace. Without the single quotes the hook silently fails with errors like `/bin/sh: ... is a directory`. Example for an installation at `/path/to/My Projects/bot-relay-mcp/`:
 >
 > ```json
-> "command": "'/Users/user/workspace/Claude AI/bot-relay-mcp/hooks/post-tool-use-check.sh'"
+> "command": "'/path/to/My Projects/bot-relay-mcp/hooks/post-tool-use-check.sh'"
 > ```
 >
 > The outer double-quotes are JSON; the inner single-quotes are shell. Paths with no spaces do not need this treatment.
@@ -629,18 +629,18 @@ Trust model: filesystem access to `~/.bot-relay/relay.db` IS the authority (same
 
 ## External-CLI Token Mint (v2.6)
 
-Some LLM CLI clients (Codex 5.5 was the canonical case) have safety monitors that pattern-match `register_agent` followed immediately by `use returned token` as a credential handoff and cancel the second tool call. The result: the agent row exists on the relay, but the agent process never captured its token, and every subsequent re-register attempt fails with `NAME_COLLISION_ACTIVE` because the orphan session is still considered live.
+Some LLM CLI clients (Codex was the canonical case) have safety monitors that pattern-match `register_agent` followed immediately by `use returned token` as a credential handoff and cancel the second tool call. The result: the agent row exists on the relay, but the agent process never captured its token, and every subsequent re-register attempt fails with `NAME_COLLISION_ACTIVE` because the orphan session is still considered live.
 
 `relay mint-token` solves this by minting the token outside the agent's process. The operator hands the plaintext token to the agent's environment via `RELAY_AGENT_TOKEN`, and the agent authenticates on its first MCP call without ever invoking `register_agent`:
 
 ```bash
-relay mint-token codex-5-5 --role builder --capabilities build,test,audit
+relay mint-token codex --role builder --capabilities build,test,audit
 ```
 
 Output (token shown ONCE):
 
 ```
-✓ Minted token for new agent "codex-5-5"
+✓ Minted token for new agent "codex"
 
 Token (shown ONCE — store it now):
 
@@ -648,7 +648,7 @@ Token (shown ONCE — store it now):
 
 Set in your CLI's environment before launching:
 
-  export RELAY_AGENT_NAME=codex-5-5
+  export RELAY_AGENT_NAME=codex
   export RELAY_AGENT_TOKEN=<43-char-base64url-token>
 ```
 
@@ -660,7 +660,7 @@ relay mint-token EXISTING --force                     # rotate token; caps + rol
 relay mint-token NAME --description "human-readable"  # discoverable in dashboard
 ```
 
-Caps are locked at first mint per the `feedback_relay_caps_immutable.md` discipline; `--force` rotates the token but preserves both caps and role. The CLI emits a daemon-running advisory to stderr and writes an `audit_log` entry (`tool='agent.token_minted'`) with the operator's OS username, the `--force` flag state, and whether the row was created or rotated. Full setup walkthrough including platform-specific token-storage best practices: [`docs/agents/external-cli-setup.md`](./docs/agents/external-cli-setup.md).
+Caps are locked at first mint (caps are immutable after first registration); `--force` rotates the token but preserves both caps and role. The CLI emits a daemon-running advisory to stderr and writes an `audit_log` entry (`tool='agent.token_minted'`) with the operator's OS username, the `--force` flag state, and whether the row was created or rotated. Full setup walkthrough including platform-specific token-storage best practices: [`docs/agents/external-cli-setup.md`](./docs/agents/external-cli-setup.md).
 
 ## Cross-Platform Spawn (v1.9)
 
@@ -687,7 +687,7 @@ Full install requirements per platform + manual smoke-test checklists + troubles
 
 ## Layer 2: Managed Agents (v1.10)
 
-Agents that are NOT Claude Code terminals — Python daemons, Node workers, Hermes/Ollama integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 30 MCP tools (v2.7), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
+Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 30 MCP tools (v2.7), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
 
 Full integration guide with mental model, auth flow, lifecycle, error patterns, and security notes: [`docs/managed-agent-integration.md`](./docs/managed-agent-integration.md).
 
@@ -728,7 +728,7 @@ Both drivers read the same `relay.db` file format. Full details, performance not
 - **v1.11**: SQLite WASM driver (`sql.js` opt-in) — zero native compilation on Windows/Alpine/Docker/CI
 - **v2.0**: Plug-and-play — channels, smart routing (`post_task_auto`), task leases + heartbeat, lazy health monitor, session-aware reads, busy/DND, `health_check`, webhook retry with CAS, payload size limits, config validation, auto-unregister, dead-agent purge, debug mode. 22 tools.
 - **v2.1**: Architectural completion — explicit `auth_state` machine, managed-agent rotation grace, versioned ciphertext + keyring with online rotation (`relay re-encrypt`), lost-token recovery CLI (`relay recover`), admin-initiated cross-agent rotation (`rotate_token_admin`), structured error_code catalog, protocol_version surface, Phase 4p webhook-secret encryption, Phase 4b.1 v2 revoke/recovery redesign. 25 tools. 14 of 14 Codex architectural findings closed.
-- **v2.7 (current)**: Tether-ready cross-process inbox notifications. Durable `inbox_events` outbox table (schema v11→v12, idempotent migration); HTTP daemon polls + dispatches to `relay://inbox/<agent>` subscribers regardless of which OS process wrote the message. Reaper now skips sessions with active SSE GET streams (`openGetStreams` count). Daemon emits `:keepalive\n\n` SSE comment frames every `RELAY_SSE_KEEPALIVE_MS` (default 20s) so Electron-based clients (VS Code Tether extension) don't idle-disconnect at ~2.5min. Hermes-flagged `get_messages` filter-after-mark P1 fix — `since` filter now applies in SQL BEFORE the read-mark mutation. 30 tools. Pairs with Tether VSCode extension v0.1.2+ on the marketplace.
+- **v2.7 (current)**: Tether-ready cross-process inbox notifications. Durable `inbox_events` outbox table (schema v11→v12, idempotent migration); HTTP daemon polls + dispatches to `relay://inbox/<agent>` subscribers regardless of which OS process wrote the message. Reaper now skips sessions with active SSE GET streams (`openGetStreams` count). Daemon emits `:keepalive\n\n` SSE comment frames every `RELAY_SSE_KEEPALIVE_MS` (default 20s) so Electron-based clients (VS Code Tether extension) don't idle-disconnect at ~2.5min. External-review-flagged `get_messages` filter-after-mark P1 fix — `since` filter now applies in SQL BEFORE the read-mark mutation. 30 tools. Pairs with Tether VSCode extension v0.1.2+ on the marketplace.
 - **v2.2**: Polish — batch operations, fan-out/fan-in, scheduled messages, metrics endpoint, message ACK, private channels, token scoping, idle-terminal wake.
 - **v2.5**: Federation — cross-machine peering, E2E encryption.
 

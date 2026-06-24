@@ -6,7 +6,7 @@
 /**
  * v2.1.7 security-patch tests.
  *
- * External review findings (external reviewer) + Codex dual-model audit follow-up.
+ * External review findings + Codex dual-model audit follow-up.
  *
  * Coverage:
  *   - Item 5 (HIGH) IPv6 CIDR — url-safety.ts no longer bypassable via fe90::

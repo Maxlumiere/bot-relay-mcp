@@ -79,7 +79,7 @@ describe("v2.1 Phase 4q MED #5 — atomic backup swap", () => {
     try {
       const { importRelayState } = await import("../src/backup.js?swap1=1");
       // force:true bypasses the live-daemon probe — this test harness
-      // runs alongside the maintainer's dev daemon on :3777 which is expected.
+      // runs alongside a local dev daemon on :3777 which is expected.
       await importRelayState(archive, { force: true });
     } finally {
       clearInterval(interval);

@@ -16,7 +16,7 @@ For the HTTP daemon:
 RELAY_TRANSPORT=http RELAY_HTTP_PORT=3777 node dist/index.js
 ```
 
-See the live daemon pattern in `HANDOFF.md` and the `relay doctor --remote` runbook in `docs/multi-machine-deployment.md`.
+See the `relay doctor --remote` runbook in `docs/multi-machine-deployment.md`.
 
 ## stdio TTY guard
 

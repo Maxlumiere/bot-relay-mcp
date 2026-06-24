@@ -10,7 +10,7 @@
  * Exposed via MCP `prompts/list` + `prompts/get`. NOT new tools —
  * the tool count stays 30.
  *
- * Per `memory/project_federation_design.md` v2.2 roadmap:
+ * Per the v2.2 roadmap:
  * "convert routine operator flows (recover lost token, invite worker,
  *  rotate compromised agent) into executable MCP prompts so advanced
  *  tools stop being first-class on the surface."
