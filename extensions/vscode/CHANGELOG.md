@@ -4,6 +4,10 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.3.3] — 2026-06-25 — Republish from cleaned sources
+
+No functional change. Republished from cleaned sources (genericized examples, removed non-public references). No new features or behavior changes — same wake behavior as 0.3.2.
+
 ## [0.3.2] — 2026-06-18 — Zero-config wake, fixed: read the agent's PID binding without a token
 
 The zero-config wake from 0.3.0 didn't fire on a real machine: Tether saw the mail and knew which agent, but matched **0 terminals** and never typed `inbox`. The cause turned out not to be the matcher at all — Tether couldn't read the agent's process binding in the first place.
