@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.11.1 — 2026-06-25 — Republish from cleaned sources
+
+No functional or API change. Genericized examples and removed non-public references from docs, changelog, code comments, and tests; `dist` rebuilt from the cleaned sources. Protocol unchanged.
+
 ## v2.11.0 — 2026-06-19 — Tether PID-handshake: refresh on relaunch (GAP 1)
 
 Completes the Tether v0.3 PID-handshake so it works for **existing** persona-builders, not just freshly-named agents. v0.3.2 made a token-free agent fetch its binding and autowake — but only an agent whose row was *inserted* with a live PID chain. A long-lived persona (a pre-existing row, e.g. `build-agent`) re-launched with an **empty `host_shell_pids`/`host_id`**, so Tether had nothing to bind to → no autowake. This release closes that gap end-to-end.
