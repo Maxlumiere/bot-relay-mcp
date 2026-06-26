@@ -106,15 +106,15 @@ describe("PID-handshake — DB layer (schema v16)", () => {
   });
 
   it("v2.11.0 GAP 1: re-register populates an initially-empty host_id (the build-agent case)", () => {
-    // Long-lived persona row first created WITHOUT a handshake → host_id null.
-    registerAgent("persona", "builder", []);
-    expect(findAgent("persona")?.host_id).toBeNull();
-    expect(findAgent("persona")?.host_shell_pids).toBeNull();
+    // Long-lived agent row first created WITHOUT a handshake → host_id null.
+    registerAgent("agent", "builder", []);
+    expect(findAgent("agent")?.host_id).toBeNull();
+    expect(findAgent("agent")?.host_shell_pids).toBeNull();
     // A later relaunch reports the live chain + GUID → both populate. Pre-2.11.0
     // host_id was immutable, so an empty host_id could NEVER be filled in.
-    registerAgent("persona", "builder", [], { host_shell_pids: [9, 8, 7], host_id: "GUID-NEW" });
-    expect(findAgent("persona")?.host_id).toBe("GUID-NEW");
-    expect(findAgent("persona")?.host_shell_pids).toEqual([9, 8, 7]);
+    registerAgent("agent", "builder", [], { host_shell_pids: [9, 8, 7], host_id: "GUID-NEW" });
+    expect(findAgent("agent")?.host_id).toBe("GUID-NEW");
+    expect(findAgent("agent")?.host_shell_pids).toEqual([9, 8, 7]);
   });
 
   it("re-register ROTATES session_id (session-aware reads see a fresh session)", () => {
@@ -298,7 +298,7 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
   }, 20_000);
 
   it("v2.11.0 GAP 1: an AUTHENTICATED re-register refreshes host_id + host_shell_pids end-to-end", async () => {
-    // First register with an empty handshake (the long-lived persona shape:
+    // First register with an empty handshake (the long-lived agent shape:
     // row exists, host_id null) and mint the owner's token.
     const reg = await callToolViaHttp(daemon.baseUrl, "register_agent", {
       name: "pid-agent3",

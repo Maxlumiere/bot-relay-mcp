@@ -318,7 +318,7 @@ export function encryptContent(plaintext: string): string {
 /**
  * Decrypt an at-rest string. Handles v2 versioned (enc:key_id:...),
  * legacy v1 (enc1:...), and plaintext pass-through uniformly. READ paths
- * stay pure — no side effects, no writes. See devlog 052 "READ paths stay
+ * stay pure — no side effects, no writes. See the READ-paths-stay-pure design note "READ paths stay
  * pure" discipline note.
  */
 export function decryptContent(stored: string | null): string | null {

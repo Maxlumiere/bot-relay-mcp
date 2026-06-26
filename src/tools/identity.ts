@@ -779,7 +779,7 @@ export function handleRevokeToken(input: RevokeTokenInput) {
     // vault was harmless. But ergonomically the mental model is cleaner
     // when revoke_token leaves NO credential on disk for that agent —
     // mirrors the recovery-CLI scrub at src/cli/recover.ts:300-301.
-    // Design decision locked 2026-05-05.
+    // Design decision recorded 2026-05-05.
     //
     // Best-effort: try/catch swallows IO errors. The revoke succeeded at
     // the DB layer; failing here would be a worse experience than
