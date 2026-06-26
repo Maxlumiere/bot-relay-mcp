@@ -100,7 +100,7 @@ describe("LLM adapters", () => {
 
   it("codex: wakeText is injected verbatim (the templated INSTRUCTION)", async () => {
     const { ctx, ops } = fakeCtx();
-    const instruction = 'Relay mail arrived — call get_messages(agent_name="codex-5-5", status="pending"), act, then continue.';
+    const instruction = 'Relay mail arrived — call get_messages(agent_name="codex-agent", status="pending"), act, then continue.';
     await makeCodexAdapter({ wakeText: instruction, submitDelayMs: 0 }).wake(ctx);
     expect(ops[0]).toBe(`sendText:${JSON.stringify(instruction)}:false`);
   });
