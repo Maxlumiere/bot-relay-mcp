@@ -17,7 +17,7 @@
  * relay.
  *
  * Origin: a security review synthesis (multiple deep-repo audits);
- * "fix all in one bundled dispatch" was locked 2026-05-13.
+ * "fix all in one bundled dispatch" was selected 2026-05-13.
  *
  * This test exercises the dispatcher path via HTTP RPC (same pattern
  * as tests/v2-1-error-codes.test.ts) — calling handleExpandCapabilities

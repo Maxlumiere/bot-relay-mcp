@@ -267,7 +267,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
   }, 20_000);
 
   it("v2.6.2 R1 — revoke_token WITHOUT recovery (terminal revocation) also scrubs vault", async () => {
-    // Per a design decision locked 2026-05-05, v2.6.2 R1 added a vault scrub to
+    // Per a design decision recorded 2026-05-05, v2.6.2 R1 added a vault scrub to
     // revoke_token regardless of issue_recovery. The legitimate revocation
     // path (terminal revoke, agent should re-bootstrap from scratch) leaves
     // no credential on disk. This complements the recovery-flow test above

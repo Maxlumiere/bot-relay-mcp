@@ -117,7 +117,7 @@ describe("v2.10 — postToCapability fan-out", () => {
     expect(res.routed_to).toEqual(["agent-a"]);
     expect(res.message_ids).toHaveLength(1);
 
-    // The owning persona picks it up on a normal get_messages drain, with
+    // The owning agent picks it up on a normal get_messages drain, with
     // the capability provenance attached.
     const inbox = getMessages("agent-a", "all", 50, true, null, "all");
     expect(inbox).toHaveLength(1);
