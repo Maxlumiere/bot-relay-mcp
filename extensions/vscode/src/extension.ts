@@ -54,6 +54,7 @@ import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
+import { adapterFor, type LlmAdapter } from "./llm-adapter.js";
 import { execFileSync } from "node:child_process";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
@@ -516,7 +517,21 @@ async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
  * cache → no wrong-terminal-after-re-register, codex R1) and re-validates any
  * cached terminal against it. Async; fire-and-forget from WakeGate.
  */
+/**
+ * Pick the per-LLM wake adapter from config (`bot-relay.tether.agentLlm`,
+ * default "claude"). The adapter owns the wake word + the inject/submit quirks
+ * for that CLI agent; the terminal matcher above is LLM-agnostic. Read fresh per
+ * wake so a config change takes effect without a reload.
+ */
+function resolveWakeAdapter(): LlmAdapter {
+  const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
+  const llm = cfg.get<string>("agentLlm") ?? "claude";
+  const codexSubmitKey: "\r" | "\n" = cfg.get<string>("codexEnterKey") === "lf" ? "\n" : "\r";
+  return adapterFor(llm, { codexSubmitKey });
+}
+
 async function injectInboxKeystroke(agentName: string): Promise<void> {
+  const adapter = resolveWakeAdapter();
   try {
     await resolveAndWake<vscode.Terminal>(agentName, {
       fetchBinding: getAgentBinding,
@@ -531,7 +546,10 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
       cacheClear: (name) => {
         boundTerminals.delete(name);
       },
-      wake: (t) => t.sendText("inbox", true),
+      // Per-LLM injection: Claude submits an appended newline; Codex needs the
+      // word then a SEPARATE Enter (see llm-adapter.ts).
+      wake: (t) => adapter.wake(t),
+      wakeWord: adapter.wakeWord,
       hint: hintNoWake,
       log,
     });

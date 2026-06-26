@@ -46,7 +46,7 @@
         "bot-relay.tether.autoInjectInbox": {
           "type": "boolean",
           "default": false,
-          "description": "On every notification, write the literal string 'inbox\\n' into the matching integrated terminal. Useful when the agent terminal is the same name as the inbox; off by default to avoid surprising ambient typing."
+          "description": "On every notification, inject the wake word for the configured agentLlm (Claude: 'inbox'; Codex: 'ping-off') into the matching integrated terminal so the agent drains its inbox. Off by default to avoid surprising ambient typing."
         },
         "bot-relay.tether.notificationLevel": {
           "type": "string",
@@ -57,6 +57,24 @@
           ],
           "default": "event",
           "description": "event = toast on every inbox change. summary = collapsed digest every 5 min. none = silent (status bar only)."
+        },
+        "bot-relay.tether.agentLlm": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "default": "claude",
+          "description": "Which CLI agent runs in the bound terminal. Selects how Tether injects the wake word: claude = 'inbox' submitted with an appended newline; codex = 'ping-off' typed then submitted with a separate Enter (Codex's TUI swallows a newline embedded in the same paste block)."
+        },
+        "bot-relay.tether.codexEnterKey": {
+          "type": "string",
+          "enum": [
+            "cr",
+            "lf"
+          ],
+          "default": "cr",
+          "description": "Codex only: the separate submit keystroke sent after the wake word. cr = carriage return (matches a real Enter); lf = line feed fallback. Only used when agentLlm = codex."
         }
       }
     },
