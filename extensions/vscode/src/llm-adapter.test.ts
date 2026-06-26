@@ -14,6 +14,7 @@ import {
   codexAdapter,
   makeCodexAdapter,
   adapterFor,
+  DEFAULT_CODEX_WAKE_TEXT,
   type WakeContext,
   type WakeTerminal,
 } from "./llm-adapter.js";
@@ -52,10 +53,11 @@ describe("LLM adapters", () => {
     await codexAdapter.wake(ctx);
     expect(codexAdapter.id).toBe("codex");
     expect(codexAdapter.wakeWord).toBe("ping-off");
-    // Exact ordered contract: type word with addNewLine=false, wait 150ms for
-    // the paste block to close, THEN send the CR as its own write.
+    // Exact ordered contract: type the INSTRUCTION (default wake text) with
+    // addNewLine=false, wait 150ms for the paste block to close, THEN send the
+    // CR as its own write.
     expect(ops).toEqual([
-      `sendText:"ping-off":false`,
+      `sendText:${JSON.stringify(DEFAULT_CODEX_WAKE_TEXT)}:false`,
       `delay:150`,
       `sendText:"\\r":false`,
     ]);
@@ -64,7 +66,7 @@ describe("LLM adapters", () => {
   it("codex: the submit is a DISTINCT event AFTER the delay (not embedded)", async () => {
     const { ctx, ops } = fakeCtx();
     await codexAdapter.wake(ctx);
-    expect(ops[0]).toBe(`sendText:"ping-off":false`); // word, never with a newline
+    expect(ops[0]).toBe(`sendText:${JSON.stringify(DEFAULT_CODEX_WAKE_TEXT)}:false`); // instruction, never with a newline
     expect(ops[1].startsWith("delay:")).toBe(true); // delay BEFORE submit
     expect(ops[2]).toBe(`sendText:"\\r":false`); // submit is its own write
     expect(ops).toHaveLength(3);
@@ -72,7 +74,7 @@ describe("LLM adapters", () => {
 
   it("codex sendSequence method: focus-then-sequence submit after the delay", async () => {
     const { ctx, ops } = fakeCtx();
-    await makeCodexAdapter({ submitMethod: "sendSequence" }).wake(ctx);
+    await makeCodexAdapter({ submitMethod: "sendSequence", wakeText: "ping-off" }).wake(ctx);
     expect(ops).toEqual([
       `sendText:"ping-off":false`,
       `delay:150`,
@@ -82,7 +84,7 @@ describe("LLM adapters", () => {
 
   it("codex: LF submit key + custom delay are honored", async () => {
     const { ctx, ops } = fakeCtx();
-    await makeCodexAdapter({ submitKey: "\n", submitDelayMs: 200 }).wake(ctx);
+    await makeCodexAdapter({ submitKey: "\n", submitDelayMs: 200, wakeText: "ping-off" }).wake(ctx);
     expect(ops).toEqual([
       `sendText:"ping-off":false`,
       `delay:200`,
@@ -92,13 +94,22 @@ describe("LLM adapters", () => {
 
   it("codex: submitDelayMs=0 skips the delay", async () => {
     const { ctx, ops } = fakeCtx();
-    await makeCodexAdapter({ submitDelayMs: 0 }).wake(ctx);
+    await makeCodexAdapter({ submitDelayMs: 0, wakeText: "ping-off" }).wake(ctx);
     expect(ops).toEqual([`sendText:"ping-off":false`, `sendText:"\\r":false`]);
+  });
+
+  it("codex: wakeText is injected verbatim (the templated INSTRUCTION)", async () => {
+    const { ctx, ops } = fakeCtx();
+    const instruction = 'Relay mail arrived — call get_messages(agent_name="codex-5-5", status="pending"), act, then continue.';
+    await makeCodexAdapter({ wakeText: instruction, submitDelayMs: 0 }).wake(ctx);
+    expect(ops[0]).toBe(`sendText:${JSON.stringify(instruction)}:false`);
   });
 
   it("adapterFor: codex id → codex adapter with options threaded", async () => {
     const { ctx, ops } = fakeCtx();
-    const a = adapterFor("codex", { codex: { submitMethod: "sendSequence", submitKey: "\n" } });
+    const a = adapterFor("codex", {
+      codex: { submitMethod: "sendSequence", submitKey: "\n", wakeText: "ping-off" },
+    });
     expect(a.id).toBe("codex");
     await a.wake(ctx);
     expect(ops).toEqual([`sendText:"ping-off":false`, `delay:150`, `seq:"\\n"`]);

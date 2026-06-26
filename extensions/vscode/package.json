@@ -89,6 +89,11 @@
           ],
           "default": "sendText",
           "description": "Codex only: how the submit keystroke is delivered. sendText = write it to the bound terminal directly (default). sendSequence = focus the terminal then send a raw key sequence to it — try this if a delayed sendText still won't submit."
+        },
+        "bot-relay.tether.codexWakePrompt": {
+          "type": "string",
+          "default": "Relay mail arrived — call get_messages(agent_name=\"{agent}\", status=\"pending\"), act on every message, then continue.",
+          "description": "Codex only: the instruction injected into the Codex terminal on wake. Codex has no 'inbox' convention, so a bare token just makes it reply — it must be told to drain the relay. '{agent}' is replaced with the agent name."
         }
       }
     },

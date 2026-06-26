@@ -523,14 +523,20 @@ async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
  * for that CLI agent; the terminal matcher above is LLM-agnostic. Read fresh per
  * wake so a config change takes effect without a reload.
  */
-function resolveWakeAdapter(): LlmAdapter {
+function resolveWakeAdapter(agentName: string): LlmAdapter {
   const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
   const llm = cfg.get<string>("agentLlm") ?? "claude";
   const submitKey: "\r" | "\n" = cfg.get<string>("codexEnterKey") === "lf" ? "\n" : "\r";
   const submitDelayMs = cfg.get<number>("codexSubmitDelayMs") ?? 150;
   const submitMethod: SubmitMethod =
     cfg.get<string>("codexSubmitMethod") === "sendSequence" ? "sendSequence" : "sendText";
-  return adapterFor(llm, { codex: { submitKey, submitDelayMs, submitMethod } });
+  // Codex has no `inbox` convention — inject an explicit instruction, with the
+  // agent name templated into the configured prompt so it drains the right inbox.
+  const promptTemplate =
+    cfg.get<string>("codexWakePrompt") ??
+    'Relay mail arrived — call get_messages(agent_name="{agent}", status="pending"), act on every message, then continue.';
+  const wakeText = promptTemplate.replace(/\{agent\}/g, agentName);
+  return adapterFor(llm, { codex: { wakeText, submitKey, submitDelayMs, submitMethod } });
 }
 
 /**
@@ -552,7 +558,7 @@ function buildWakeContext(t: vscode.Terminal): WakeContext {
 }
 
 async function injectInboxKeystroke(agentName: string): Promise<void> {
-  const adapter = resolveWakeAdapter();
+  const adapter = resolveWakeAdapter(agentName);
   try {
     await resolveAndWake<vscode.Terminal>(agentName, {
       fetchBinding: getAgentBinding,

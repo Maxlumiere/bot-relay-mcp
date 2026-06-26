@@ -64,7 +64,18 @@ export const claudeAdapter: LlmAdapter = {
   },
 };
 
+/** Default Codex wake INSTRUCTION. Codex has no `inbox`-style convention, so a
+ *  bare wake token just makes it reply ("pong") rather than drain its inbox — it
+ *  must be told what to do. The extension templates the agent name into the
+ *  configured prompt; this generic fallback is used when none is supplied. */
+export const DEFAULT_CODEX_WAKE_TEXT =
+  'Relay mail arrived — call get_messages(status="pending"), act on every message, then continue.';
+
 export interface CodexAdapterOptions {
+  /** The full text injected into the Codex terminal — an INSTRUCTION, not a bare
+   *  token. The extension templates the agent name in; defaults to
+   *  DEFAULT_CODEX_WAKE_TEXT. */
+  wakeText?: string;
   /** Separate submit key (default CR). */
   submitKey?: SubmitKey;
   /** Delay between typing the word and sending the submit key, so the paste
@@ -91,15 +102,17 @@ export interface CodexAdapterOptions {
  *     active terminal — for TUIs that ignore a sendText'd CR.
  */
 export function makeCodexAdapter(opts?: CodexAdapterOptions): LlmAdapter {
+  const wakeText = opts?.wakeText ?? DEFAULT_CODEX_WAKE_TEXT;
   const submitKey: SubmitKey = opts?.submitKey ?? "\r";
   const submitDelayMs = opts?.submitDelayMs ?? 150;
   const submitMethod: SubmitMethod = opts?.submitMethod ?? "sendText";
   return {
     id: "codex",
+    // Short label for logs/UX; the injected text is the full `wakeText` instruction.
     wakeWord: "ping-off",
     wake: async (ctx) => {
-      // 1) type the word, no auto-newline (avoid the embedded-CR swallow)
-      ctx.terminal.sendText("ping-off", false);
+      // 1) type the INSTRUCTION, no auto-newline (avoid the embedded-CR swallow)
+      ctx.terminal.sendText(wakeText, false);
       // 2) let the paste block close before submitting
       if (submitDelayMs > 0) await ctx.delay(submitDelayMs);
       // 3) submit as a SEPARATE event
