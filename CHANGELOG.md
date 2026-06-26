@@ -6,7 +6,7 @@ No functional or API change. Genericized examples and removed non-public referen
 
 ## v2.11.0 — 2026-06-19 — Tether PID-handshake: refresh on relaunch (GAP 1)
 
-Completes the Tether v0.3 PID-handshake so it works for **existing** persona-builders, not just freshly-named agents. v0.3.2 made a token-free agent fetch its binding and autowake — but only an agent whose row was *inserted* with a live PID chain. A long-lived persona (a pre-existing row, e.g. `build-agent`) re-launched with an **empty `host_shell_pids`/`host_id`**, so Tether had nothing to bind to → no autowake. This release closes that gap end-to-end.
+Completes the Tether v0.3 PID-handshake so it works for **existing** agents, not just freshly-named agents. v0.3.2 made a token-free agent fetch its binding and autowake — but only an agent whose row was *inserted* with a live PID chain. A long-lived agent (a pre-existing row, e.g. `build-agent`) re-launched with an **empty `host_shell_pids`/`host_id`**, so Tether had nothing to bind to → no autowake. This release closes that gap end-to-end.
 
 ### Fixed — `host_id` now refreshes on an authenticated re-register
 
@@ -17,7 +17,7 @@ Completes the Tether v0.3 PID-handshake so it works for **existing** persona-bui
 
 ### Fixed — SessionStart hook re-registers on relaunch (not just first launch)
 
-`hooks/check-relay.sh` previously skipped `register_agent` entirely whenever a token was present **and** the agent row already existed (the Phase 4j spawn-handoff optimization). For a relaunched persona-builder that meant its live PID chain was **never re-sent**, so the handshake fields stayed stale/empty. The skip is now **liveness-scoped**: it fires only when the existing row holds a **fresh, live session** (true spawn handoff / concurrent-terminal guard). When the row is **offline or stale** (a genuine relaunch), the hook re-registers, refreshing `host_shell_pids` + `host_id` and repopulating `session_id`. (This also repopulates an empty `session_id` that could glitch inbox reads.)
+`hooks/check-relay.sh` previously skipped `register_agent` entirely whenever a token was present **and** the agent row already existed (the Phase 4j spawn-handoff optimization). For a relaunched agent that meant its live PID chain was **never re-sent**, so the handshake fields stayed stale/empty. The skip is now **liveness-scoped**: it fires only when the existing row holds a **fresh, live session** (true spawn handoff / concurrent-terminal guard). When the row is **offline or stale** (a genuine relaunch), the hook re-registers, refreshing `host_shell_pids` + `host_id` and repopulating `session_id`. (This also repopulates an empty `session_id` that could glitch inbox reads.)
 
 - **Known follow-up:** a *spawned* agent still doesn't capture PIDs on its first launch (the parent pre-registers a live row without the child's PIDs, and the child hook then sees a live session → skips). Tracked as a candidate GAP 2; not required for "an existing builder wakes."
 
@@ -31,9 +31,9 @@ Completes the Tether v0.3 PID-handshake so it works for **existing** persona-bui
 
 ### Added — capability-routed messaging (`post_to_capability`)
 
-New MCP tool **`post_to_capability`** (tool #31): a sender tags an FYI/coordination message by a single domain/capability and the relay fans it out to the CURRENT owner(s) of that capability via the normal inbox — no manual channel join, no named recipient. Use case: an ad-hoc agent tags a finding by domain → the owning agent (e.g. an agent that owns the "support" capability) picks it up automatically on its next `get_messages`. This is the build vehicle for principle #1 (capability routing over named routing) of the AI-native relay directive.
+New MCP tool **`post_to_capability`** (tool #31): a sender tags an FYI/coordination message by a single domain/capability and the relay fans it out to the CURRENT owner(s) of that capability via the normal inbox — no manual channel join, no named recipient. Use case: an ad-hoc agent tags a finding by domain → the owning agent (e.g. an agent that owns the "support" capability) picks it up automatically on its next `get_messages`. This implements principle #1 — capability routing over named recipients.
 
-- **Routing** reuses the proven `agent_capabilities` index + exact-string match (same contract as `post_task_auto`), but fans out to ALL current owners (an FYI should reach every persona that owns the domain, not just the least-loaded one) and delivers into the existing `messages` inbox — recipients drain via the normal `get_messages`, so there is **zero new read path** (Tether and the SessionStart hook work unchanged).
+- **Routing** reuses the proven `agent_capabilities` index + exact-string match (same contract as `post_task_auto`), but fans out to ALL current owners (an FYI should reach every agent that owns the domain, not just the least-loaded one) and delivers into the existing `messages` inbox — recipients drain via the normal `get_messages`, so there is **zero new read path** (Tether and the SessionStart hook work unchanged).
 - **Action-vs-FYI line stays intact (machine-enforceable).** Action-required completions remain point-to-point completion reports (`send_message`); capability-routed topics are the FYI/coordination lane only. A new nullable `messages.routed_capability` column + a `get_messages` `lane` filter (`all` | `direct` | `capability`) keep the two lanes distinguishable, so an action item is never lost in FYI noise.
 - **No current owner** → `routed_to: []` and nothing is stored (fire-and-forget to current owners; NOT queued-until-owner, which is task semantics).
 - New webhook event **`message.capability_routed`** (fired once per fan-out, carrying the capability + recipients).
@@ -158,7 +158,7 @@ Claude Code v2.1.89's **Auto-mode is OFF the table.** It triggers per-tool-call 
 - Spec: an ambient-wake design spec.
 - Primitives doc: `docs/ambient-wake.md` (existing v2.3.0 protocol doc; v2.9.0 appends operator setup).
 - Role template: `roles/auto-poll-loop-template.md`.
-- Origin: ambient-wake workflow requirement (builders run in the background; the operator isn't the blocker).
+- Origin: ambient-wake workflow requirement (agents run in the background and surface decisions only when needed).
 
 ## v2.8.0 — 2026-05-26 — Dashboard daemon precursor: 5-state state machine + SIGHUP + decay broadcaster + wire-emit sites
 
@@ -412,7 +412,7 @@ PR opened against post-v2.7.1-merge `main` (HEAD: `d516cfd`). Branch: `hotfix/v2
 
 ## v2.7.1 — 2026-05-13 — SECURITY HOTFIX
 
-Two CRITICAL findings + one HIGH + three LOW/MED that surfaced in a security review AFTER the PR #31 Codex audit had SHIPped v2.7.0 cleanly. The PR #31 audit was scoped to the four release commits; these findings live in PRE-EXISTING code that would have shipped via `npm publish` if the publish step had run before the security review landed.
+Two CRITICAL findings + one HIGH + three LOW/MED that surfaced in a security review AFTER the PR #31 Codex audit had shipped v2.7.0 cleanly. The PR #31 audit was scoped to the four release commits; these findings live in PRE-EXISTING code that would have shipped via `npm publish` if the publish step had run before the security review landed.
 
 All fixes ship in one PR. PR opened against `main` post-v2.7.0-merge; no v2.7.0 tag was created and no npm publish ran, so v2.7.1 is the first public npm artifact in the v2.7 series.
 
@@ -422,7 +422,7 @@ All fixes ship in one PR. PR opened against `main` post-v2.7.0-merge; no v2.7.0 
 
 - **[CRITICAL] Plaintext agent tokens no longer logged to stderr on `register_agent`** (`1a56beb`). Pre-fix `src/tools/identity.ts:150-153` interpolated the freshly-minted token at info level on every registration; every stderr-capturing surface (terminal scrollback, CI logs, journald, Docker logs, log aggregators, SaaS observability) ended up with the token in cleartext. The "shown ONCE in the API response" model was broken from day one. Fix has two layers: (a) strip the token from the log line entirely (agent name + "(shown once in the tool response; not logged)" hint preserve the operational signal); (b) `redactSecrets` defense-in-depth scrubber in `src/logger.ts` applied to every log line at every level, matching `RELAY_AGENT_TOKEN=<value>`, `Authorization: Bearer <value>`, `Authorization: <other-scheme>`, `X-Agent-Token: <value>` (case-insensitive), and JSON-ish `"<key>": "<value>"` for token / agent_token / recovery_token / secret / http_secret / webhook_secret / password keys. Origin: an external security review.
 
-- **[HIGH] Dashboard `send_message` now requires `from_agent_token` for any `from` field that names a registered agent** (`aa75924`). Pre-fix `src/transport/http.ts` treated `from_agent_token` as optional defense-in-depth (Option (a) audit-only). Whoever held the dashboard's HTTP secret OR an authenticated session cookie could POST send_message with `from=<victim>` and impersonate any registered agent across the relay's full message + task surface. Option A was locked: make from_agent_token REQUIRED when from-agent has a stored token_hash. Missing → 403 AUTH_FAILED; mismatch → 403 AUTH_FAILED; correct → success. System-message senders (e.g., `dashboard-system`) need their own row + token; no "no token = system" fallback. Origin: an external security review.
+- **[HIGH] Dashboard `send_message` now requires `from_agent_token` for any `from` field that names a registered agent** (`aa75924`). Pre-fix `src/transport/http.ts` treated `from_agent_token` as optional defense-in-depth (Option (a) audit-only). Whoever held the dashboard's HTTP secret OR an authenticated session cookie could POST send_message with `from=<victim>` and impersonate any registered agent across the relay's full message + task surface. Option A was selected: make from_agent_token REQUIRED when from-agent has a stored token_hash. Missing → 403 AUTH_FAILED; mismatch → 403 AUTH_FAILED; correct → success. System-message senders (e.g., `dashboard-system`) need their own row + token; no "no token = system" fallback. Origin: an external security review.
 
 ### Fixes
 
@@ -2616,7 +2616,7 @@ Closes the human-bridged latency between agents. A new `PostToolUse` hook checks
 - **No TOOLS_NO_AUTH membership change.** `register_agent` stays in the set for bootstrap; the re-register gate sits BEFORE the set check.
 - **No new `description` agent field.** The spec mentioned "role and description" — there is no `description` column today; adding one would be scope creep. Only `role` is updatable on re-register.
 - **No bcrypt-path rework.** `bcrypt.compareSync` is already constant-time by design; only the HTTP shared-secret path was timing-leaky.
-- **No constant-time scan across all previous secrets.** Short-circuit on first match retained; documented as an acceptable trade-off in the devlog.
+- **No constant-time scan across all previous secrets.** Short-circuit on first match retained; documented as an acceptable trade-off.
 - **No encryption / CORS / audit-log changes.** Out of scope.
 - **No npm publish, no v1.8 work.** Waiting on the v1.7.1 review green-light.
 

@@ -754,7 +754,7 @@ describe("Backward compatibility", () => {
  *   retro #19 — hook truncation self-check: bash-script-level guard in
  *               hooks/check-relay.sh; no way to assert without spawning
  *               a subprocess with an artificially-truncated $0 — deferred
- *               to manual review per v2.0 final devlog.
+ *               to manual review per the v2.0 final review.
  *   retro #20 — health_check tool: exercised throughout this file
  *               implicitly (used as a probe in canary 4 et al).
  *   retro #34 — RELAY_LOG_LEVEL=debug: log-level verification would
