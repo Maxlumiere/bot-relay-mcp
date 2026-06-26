@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: MIT
 //
 // LLM adapter contract tests. The load-bearing one is the Codex wake SEQUENCE:
-// the word must be injected WITHOUT a trailing newline, then the submit key sent
-// as a SEPARATE write — the empirically-proven fix for Codex's TUI swallowing a
-// newline embedded in the same paste block (2026-06-26). Asserting the exact
-// sendText call sequence pins that contract, not a proxy.
+// type the word WITHOUT a trailing newline, WAIT for the paste block to close,
+// then submit with a SEPARATE event. Codex's TUI swallows both an embedded
+// newline AND a submit key sent before the paste settles (confirmed live
+// 2026-06-26). Asserting the exact ordered op log pins that contract, not a
+// proxy.
 
 import { describe, it, expect } from "vitest";
 import {
@@ -13,69 +14,94 @@ import {
   codexAdapter,
   makeCodexAdapter,
   adapterFor,
+  type WakeContext,
   type WakeTerminal,
 } from "./llm-adapter.js";
 
-/** Records every sendText call so the wake sequence can be asserted exactly. */
-function fakeTerminal(): WakeTerminal & { calls: { text: string; addNewLine?: boolean }[] } {
-  const calls: { text: string; addNewLine?: boolean }[] = [];
-  return {
-    calls,
-    sendText(text: string, addNewLine?: boolean) {
-      calls.push({ text, addNewLine });
+/** Records an ordered log of every side effect so the wake sequence (incl. the
+ *  delay BETWEEN word and submit) can be asserted exactly. */
+function fakeCtx(): { ctx: WakeContext; ops: string[] } {
+  const ops: string[] = [];
+  const terminal: WakeTerminal = {
+    sendText: (text, addNewLine) => ops.push(`sendText:${JSON.stringify(text)}:${addNewLine}`),
+    show: (preserveFocus) => ops.push(`show:${preserveFocus}`),
+  };
+  const ctx: WakeContext = {
+    terminal,
+    delay: async (ms) => {
+      ops.push(`delay:${ms}`);
+    },
+    sendSequenceToTerminal: async (text) => {
+      ops.push(`seq:${JSON.stringify(text)}`);
     },
   };
+  return { ctx, ops };
 }
 
 describe("LLM adapters", () => {
-  it("claude: single sendText(word, true) types AND submits", () => {
-    const t = fakeTerminal();
-    claudeAdapter.wake(t);
+  it("claude: single sendText(word, true) types AND submits", async () => {
+    const { ctx, ops } = fakeCtx();
+    await claudeAdapter.wake(ctx);
     expect(claudeAdapter.id).toBe("claude");
     expect(claudeAdapter.wakeWord).toBe("inbox");
-    // One call, word with appended newline (Claude's TUI submits it).
-    expect(t.calls).toEqual([{ text: "inbox", addNewLine: true }]);
+    expect(ops).toEqual([`sendText:"inbox":true`]);
   });
 
-  it("codex: inject word (NO newline) THEN a SEPARATE Enter — the submit fix", () => {
-    const t = fakeTerminal();
-    codexAdapter.wake(t);
+  it("codex default: word (no newline) → delay → SEPARATE sendText(CR)", async () => {
+    const { ctx, ops } = fakeCtx();
+    await codexAdapter.wake(ctx);
     expect(codexAdapter.id).toBe("codex");
     expect(codexAdapter.wakeWord).toBe("ping-off");
-    // Exactly two writes: the word with addNewLine=false (so no embedded CR is
-    // swallowed), then "\r" as its own write (the decoupled Enter).
-    expect(t.calls).toEqual([
-      { text: "ping-off", addNewLine: false },
-      { text: "\r", addNewLine: false },
+    // Exact ordered contract: type word with addNewLine=false, wait 150ms for
+    // the paste block to close, THEN send the CR as its own write.
+    expect(ops).toEqual([
+      `sendText:"ping-off":false`,
+      `delay:150`,
+      `sendText:"\\r":false`,
     ]);
   });
 
-  it("codex: never appends a newline to the word (the swallow bug)", () => {
-    const t = fakeTerminal();
-    codexAdapter.wake(t);
-    const wordCall = t.calls[0];
-    expect(wordCall.text).toBe("ping-off");
-    expect(wordCall.addNewLine).toBe(false);
-    // The submit is a distinct second call, not folded into the word call.
-    expect(t.calls.length).toBe(2);
-    expect(t.calls[1].text).not.toContain("ping-off");
+  it("codex: the submit is a DISTINCT event AFTER the delay (not embedded)", async () => {
+    const { ctx, ops } = fakeCtx();
+    await codexAdapter.wake(ctx);
+    expect(ops[0]).toBe(`sendText:"ping-off":false`); // word, never with a newline
+    expect(ops[1].startsWith("delay:")).toBe(true); // delay BEFORE submit
+    expect(ops[2]).toBe(`sendText:"\\r":false`); // submit is its own write
+    expect(ops).toHaveLength(3);
   });
 
-  it("codex: LF fallback submit key", () => {
-    const t = fakeTerminal();
-    makeCodexAdapter("\n").wake(t);
-    expect(t.calls).toEqual([
-      { text: "ping-off", addNewLine: false },
-      { text: "\n", addNewLine: false },
+  it("codex sendSequence method: focus-then-sequence submit after the delay", async () => {
+    const { ctx, ops } = fakeCtx();
+    await makeCodexAdapter({ submitMethod: "sendSequence" }).wake(ctx);
+    expect(ops).toEqual([
+      `sendText:"ping-off":false`,
+      `delay:150`,
+      `seq:"\\r"`,
     ]);
   });
 
-  it("adapterFor: codex id → codex adapter, with submit-key override", () => {
-    const t = fakeTerminal();
-    const a = adapterFor("codex", { codexSubmitKey: "\n" });
+  it("codex: LF submit key + custom delay are honored", async () => {
+    const { ctx, ops } = fakeCtx();
+    await makeCodexAdapter({ submitKey: "\n", submitDelayMs: 200 }).wake(ctx);
+    expect(ops).toEqual([
+      `sendText:"ping-off":false`,
+      `delay:200`,
+      `sendText:"\\n":false`,
+    ]);
+  });
+
+  it("codex: submitDelayMs=0 skips the delay", async () => {
+    const { ctx, ops } = fakeCtx();
+    await makeCodexAdapter({ submitDelayMs: 0 }).wake(ctx);
+    expect(ops).toEqual([`sendText:"ping-off":false`, `sendText:"\\r":false`]);
+  });
+
+  it("adapterFor: codex id → codex adapter with options threaded", async () => {
+    const { ctx, ops } = fakeCtx();
+    const a = adapterFor("codex", { codex: { submitMethod: "sendSequence", submitKey: "\n" } });
     expect(a.id).toBe("codex");
-    a.wake(t);
-    expect(t.calls[1]).toEqual({ text: "\n", addNewLine: false });
+    await a.wake(ctx);
+    expect(ops).toEqual([`sendText:"ping-off":false`, `delay:150`, `seq:"\\n"`]);
   });
 
   it("adapterFor: claude id and unknown/undefined ids → claude adapter (safe default)", () => {

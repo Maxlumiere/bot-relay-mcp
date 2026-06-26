@@ -54,7 +54,7 @@ import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
-import { adapterFor, type LlmAdapter } from "./llm-adapter.js";
+import { adapterFor, type LlmAdapter, type WakeContext, type SubmitMethod } from "./llm-adapter.js";
 import { execFileSync } from "node:child_process";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
@@ -526,8 +526,29 @@ async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
 function resolveWakeAdapter(): LlmAdapter {
   const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
   const llm = cfg.get<string>("agentLlm") ?? "claude";
-  const codexSubmitKey: "\r" | "\n" = cfg.get<string>("codexEnterKey") === "lf" ? "\n" : "\r";
-  return adapterFor(llm, { codexSubmitKey });
+  const submitKey: "\r" | "\n" = cfg.get<string>("codexEnterKey") === "lf" ? "\n" : "\r";
+  const submitDelayMs = cfg.get<number>("codexSubmitDelayMs") ?? 150;
+  const submitMethod: SubmitMethod =
+    cfg.get<string>("codexSubmitMethod") === "sendSequence" ? "sendSequence" : "sendText";
+  return adapterFor(llm, { codex: { submitKey, submitDelayMs, submitMethod } });
+}
+
+/**
+ * Build the side-effecting WakeContext for a bound terminal: the per-terminal
+ * sendText/show, a real timer delay, and a focus-then-sendSequence path. VSCode's
+ * sendSequence command only targets the ACTIVE terminal, so we `show()` first to
+ * make the bound terminal active. The submit-key timing quirk itself lives in the
+ * Codex adapter; this only supplies the effects.
+ */
+function buildWakeContext(t: vscode.Terminal): WakeContext {
+  return {
+    terminal: t,
+    delay: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    sendSequenceToTerminal: async (text: string) => {
+      t.show(false);
+      await vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text });
+    },
+  };
 }
 
 async function injectInboxKeystroke(agentName: string): Promise<void> {
@@ -546,9 +567,12 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
       cacheClear: (name) => {
         boundTerminals.delete(name);
       },
-      // Per-LLM injection: Claude submits an appended newline; Codex needs the
-      // word then a SEPARATE Enter (see llm-adapter.ts).
-      wake: (t) => adapter.wake(t),
+      // Per-LLM injection: Claude submits an appended newline; Codex types the
+      // word then submits with a SEPARATE, delayed Enter (see llm-adapter.ts).
+      // resolveAndWake's wake is sync/void — fire-and-forget the async adapter.
+      wake: (t) => {
+        void adapter.wake(buildWakeContext(t));
+      },
       wakeWord: adapter.wakeWord,
       hint: hintNoWake,
       log,

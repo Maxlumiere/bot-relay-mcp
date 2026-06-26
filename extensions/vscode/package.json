@@ -75,6 +75,20 @@
           ],
           "default": "cr",
           "description": "Codex only: the separate submit keystroke sent after the wake word. cr = carriage return (matches a real Enter); lf = line feed fallback. Only used when agentLlm = codex."
+        },
+        "bot-relay.tether.codexSubmitDelayMs": {
+          "type": "number",
+          "default": 150,
+          "description": "Codex only: milliseconds to wait between typing the wake word and sending the submit keystroke, so the paste block closes first (a key sent too early is absorbed). Raise if the wake word stays typed-but-unsent; 0 disables the delay."
+        },
+        "bot-relay.tether.codexSubmitMethod": {
+          "type": "string",
+          "enum": [
+            "sendText",
+            "sendSequence"
+          ],
+          "default": "sendText",
+          "description": "Codex only: how the submit keystroke is delivered. sendText = write it to the bound terminal directly (default). sendSequence = focus the terminal then send a raw key sequence to it — try this if a delayed sendText still won't submit."
         }
       }
     },
