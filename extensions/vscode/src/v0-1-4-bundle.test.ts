@@ -146,7 +146,8 @@ describe("v0.1.4 — bundle correctness", () => {
     // added catch-up-wake.ts (shared catch-up/live wake decision) +
     // switch-agent.ts (discover_agents → Switch-Agent QuickPick parse), both
     // imported by extension.ts. v0.1.4 baseline (extension + config + format +
-    // transport-diagnostics) preserved.
+    // transport-diagnostics) preserved. v0.3.x added llm-adapter.ts (per-LLM
+    // wake adapters, imported by extension.ts).
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/catch-up-wake.ts",
@@ -155,6 +156,7 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/format.ts",
       "src/host-identity.ts",
       "src/inbox-subscription.ts",
+      "src/llm-adapter.ts",
       "src/pid-binding.ts",
       "src/reconnect-supervisor.ts",
       "src/restart-policy.ts",

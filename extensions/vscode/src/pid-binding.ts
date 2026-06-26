@@ -169,6 +169,9 @@ export interface WakeDeps<T> {
   cacheSet(agentName: string, t: T): void;
   cacheClear(agentName: string): void;
   wake(t: T): void;
+  /** Wake word, for the diagnostic log only (default "inbox"). The actual
+   *  injection (incl. submit quirks) lives entirely in `wake`. */
+  wakeWord?: string;
   hint(message: string): void;
   log(line: string): void;
 }
@@ -208,7 +211,7 @@ export async function resolveAndWake<T>(agentName: string, deps: WakeDeps<T>): P
       deps.wake(decision.terminal.t);
       deps.cacheSet(agentName, decision.terminal.t);
       deps.log(
-        `auto-inject: wrote "inbox\\n" to terminal "${decision.terminal.name}" (pid=${decision.terminal.processId ?? "?"})`,
+        `auto-inject: woke terminal "${decision.terminal.name}" with wake word "${deps.wakeWord ?? "inbox"}" (pid=${decision.terminal.processId ?? "?"})`,
       );
       return;
     case "no-match":

@@ -46,7 +46,7 @@
         "bot-relay.tether.autoInjectInbox": {
           "type": "boolean",
           "default": false,
-          "description": "On every notification, write the literal string 'inbox\\n' into the matching integrated terminal. Useful when the agent terminal is the same name as the inbox; off by default to avoid surprising ambient typing."
+          "description": "On every notification, inject the wake word for the configured agentLlm (Claude: 'inbox'; Codex: 'ping-off') into the matching integrated terminal so the agent drains its inbox. Off by default to avoid surprising ambient typing."
         },
         "bot-relay.tether.notificationLevel": {
           "type": "string",
@@ -57,6 +57,69 @@
           ],
           "default": "event",
           "description": "event = toast on every inbox change. summary = collapsed digest every 5 min. none = silent (status bar only)."
+        },
+        "bot-relay.tether.agentLlm": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "default": "claude",
+          "description": "Which CLI agent runs in the bound terminal. Selects how Tether injects the wake word: claude = 'inbox' submitted with an appended newline; codex = 'ping-off' typed then submitted with a separate Enter (Codex's TUI swallows a newline embedded in the same paste block)."
+        },
+        "bot-relay.tether.codexEnterKey": {
+          "type": "string",
+          "enum": [
+            "cr",
+            "lf"
+          ],
+          "default": "cr",
+          "description": "Codex only: the separate submit keystroke sent after the wake word. cr = carriage return (matches a real Enter); lf = line feed fallback. Only used when agentLlm = codex."
+        },
+        "bot-relay.tether.codexSubmitDelayMs": {
+          "type": "number",
+          "default": 150,
+          "description": "Codex only: milliseconds to wait between typing the wake word and sending the submit keystroke, so the paste block closes first (a key sent too early is absorbed). Raise if the wake word stays typed-but-unsent; 0 disables the delay."
+        },
+        "bot-relay.tether.codexSubmitMethod": {
+          "type": "string",
+          "enum": [
+            "sendText",
+            "sendSequence"
+          ],
+          "default": "sendSequence",
+          "description": "Codex only: how the submit keystroke is delivered. sendSequence (default) = focus the terminal then send a standalone key sequence to it — the programmatic twin of a real keyboard Enter, the most reliable way to make Codex auto-submit (note: it focuses the Codex terminal on wake). sendText = write the key to the bound terminal directly, no focus-steal, but a sendText'd CR can be absorbed by Codex's TUI."
+        },
+        "bot-relay.tether.codexWakePrompt": {
+          "type": "string",
+          "default": "Relay mail arrived — call get_messages(agent_name=\"{agent}\", status=\"pending\"), act on every message, then continue.",
+          "description": "Codex only: the instruction injected into the Codex terminal on wake. Codex has no 'inbox' convention, so a bare token just makes it reply — it must be told to drain the relay. '{agent}' is replaced with the agent name."
+        },
+        "bot-relay.tether.agents": {
+          "type": "array",
+          "default": [],
+          "description": "Watch MULTIPLE agents at once (no switching). Each entry binds one agent name to its LLM so Tether wakes each agent's terminal with the right adapter. The legacy single 'agentName' is still watched (as the primary / status-bar agent) and is merged in. Example: [{ \"name\": \"build-agent\", \"llm\": \"claude\" }, { \"name\": \"codex-agent\", \"llm\": \"codex\" }].",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Agent name (matches the agent's RELAY_AGENT_NAME)."
+              },
+              "llm": {
+                "type": "string",
+                "enum": [
+                  "claude",
+                  "codex"
+                ],
+                "default": "claude",
+                "description": "Which CLI agent runs in this agent's terminal."
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
         }
       }
     },
