@@ -39,7 +39,7 @@ import {
   type TetherConfig,
 } from "./config.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
-import { WakeGate, subscribeInbox } from "./inbox-subscription.js";
+import { WakeGate, subscribeInboxes } from "./inbox-subscription.js";
 import { parseAgentNames, applyAgentSwitch } from "./switch-agent.js";
 import {
   AgentManager,
@@ -285,10 +285,21 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 let mcpClient: Client | undefined;
 let mcpTransport: StreamableHTTPClientTransport | undefined;
 let lastSnapshot: InboxSnapshot | undefined;
-// v0.2.3 — the inbox-wake gate. Owns the no-double-wake high-water mark across
-// reconnects (catch-up + live share it); re-created on reload so still-pending
-// mail re-wakes (A1). Created at activate, used by connect()'s subscribeInbox.
-let wakeGate: WakeGate | undefined;
+// Per-agent inbox-wake gates. Each agent owns its no-double-wake high-water mark
+// across reconnects (catch-up + live share it). The map persists across
+// reconnects (cleared only on deactivate) so the mark survives; a window reload
+// re-creates the extension → fresh map → still-pending mail re-wakes (A1).
+const wakeGates = new Map<string, WakeGate>();
+function getWakeGate(agentName: string): WakeGate {
+  let g = wakeGates.get(agentName);
+  if (!g) {
+    g = new WakeGate((name) => {
+      void injectInboxKeystroke(name);
+    });
+    wakeGates.set(agentName, g);
+  }
+  return g;
+}
 // v0.3.0 PID-handshake state. localHostId = this instance's machine GUID (the
 // host-scoping anchor, computed once at activate; must match the agent-side
 // hook's host_id). boundTerminals caches the resolved agent→terminal binding so
@@ -525,11 +536,21 @@ async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
  */
 function resolveWakeAdapter(agentName: string): LlmAdapter {
   const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
-  const llm = cfg.get<string>("agentLlm") ?? "claude";
+  // Per-agent llm: prefer this agent's entry in agents[], else the global
+  // agentLlm (legacy single-agent config).
+  let llm = cfg.get<string>("agentLlm") ?? "claude";
+  const agentsCfg = cfg.get<Array<{ name?: unknown; llm?: unknown }>>("agents");
+  if (Array.isArray(agentsCfg)) {
+    const entry = agentsCfg.find((a) => a && typeof a.name === "string" && a.name === agentName);
+    if (entry) llm = entry.llm === "codex" ? "codex" : "claude";
+  }
   const submitKey: "\r" | "\n" = cfg.get<string>("codexEnterKey") === "lf" ? "\n" : "\r";
   const submitDelayMs = cfg.get<number>("codexSubmitDelayMs") ?? 150;
+  // Default to sendSequence: focusing the terminal + a standalone CR is the
+  // programmatic twin of a real keyboard Enter — the only thing proven to make
+  // Codex submit (a sendText'd CR can be absorbed). sendText stays selectable.
   const submitMethod: SubmitMethod =
-    cfg.get<string>("codexSubmitMethod") === "sendSequence" ? "sendSequence" : "sendText";
+    cfg.get<string>("codexSubmitMethod") === "sendText" ? "sendText" : "sendSequence";
   // Codex has no `inbox` convention — inject an explicit instruction, with the
   // agent name templated into the configured prompt so it drains the right inbox.
   const promptTemplate =
@@ -537,6 +558,30 @@ function resolveWakeAdapter(agentName: string): LlmAdapter {
     'Relay mail arrived — call get_messages(agent_name="{agent}", status="pending"), act on every message, then continue.';
   const wakeText = promptTemplate.replace(/\{agent\}/g, agentName);
   return adapterFor(llm, { codex: { wakeText, submitKey, submitDelayMs, submitMethod } });
+}
+
+/** Resolve the agents Tether watches: the legacy single `agentName` (primary —
+ *  the connection identity + status-bar agent) plus any entries in
+ *  `bot-relay.tether.agents`. Deduped; primary first. */
+function resolveAgentList(config: TetherConfig): Array<{ name: string; llm: string }> {
+  const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
+  const out: Array<{ name: string; llm: string }> = [];
+  const seen = new Set<string>();
+  const globalLlm = cfg.get<string>("agentLlm") === "codex" ? "codex" : "claude";
+  if (config.agentName && AGENT_NAME_RE.test(config.agentName)) {
+    out.push({ name: config.agentName, llm: globalLlm });
+    seen.add(config.agentName);
+  }
+  const raw = cfg.get<Array<{ name?: unknown; llm?: unknown }>>("agents");
+  if (Array.isArray(raw)) {
+    for (const a of raw) {
+      const name = a && typeof a.name === "string" ? a.name : "";
+      if (!name || !AGENT_NAME_RE.test(name) || seen.has(name)) continue;
+      out.push({ name, llm: a.llm === "codex" ? "codex" : "claude" });
+      seen.add(name);
+    }
+  }
+  return out;
 }
 
 /**
@@ -627,8 +672,9 @@ function ensureSummaryTimer(level: TetherConfig["notificationLevel"]): void {
 }
 
 async function connect(config: TetherConfig): Promise<void> {
-  if (!config.agentName) {
-    log("idle: no agentName configured (set bot-relay.tether.agentName or RELAY_AGENT_NAME)");
+  const agentList = resolveAgentList(config);
+  if (agentList.length === 0) {
+    log("idle: no agents configured (set bot-relay.tether.agentName / RELAY_AGENT_NAME, or bot-relay.tether.agents)");
     if (statusBarItem) {
       statusBarItem.text = "Tether: idle";
       statusBarItem.backgroundColor = undefined;
@@ -642,7 +688,7 @@ async function connect(config: TetherConfig): Promise<void> {
   // reconnect (or a config-change-driven reconnect) can recover.
   resetErrorState();
 
-  log(`connecting to ${config.endpoint}/mcp as agent="${config.agentName}"`);
+  log(`connecting to ${config.endpoint}/mcp; watching ${agentList.length} agent(s): ${agentList.map((a) => `${a.name}(${a.llm})`).join(", ")}`);
   relayEndpoint = config.endpoint; // for the /api/snapshot PID-binding fallback
   const url = new URL("/mcp", config.endpoint);
   // The SDK's StreamableHTTPClientTransport accepts request init for
@@ -705,23 +751,27 @@ async function connect(config: TetherConfig): Promise<void> {
   mcpClient = client;
   mcpTransport = transport;
 
-  // v0.2.3 R1 — wire the notification handler + subscribe + catch-up through the
-  // shared, VSCode-free subscribeInbox seam so the integration test exercises
-  // the REAL subscribe→notify→wake path, not just decideWake in isolation
-  // (codex test-path-must-match-shipped-path). The state-lock guard (don't paint
-  // a success snapshot / wake over an error UI) lives inside subscribeInbox. The
-  // persistent WakeGate owns the no-double-wake high-water mark across
-  // reconnects; a window reload re-creates it, re-waking pending mail (A1).
-  await subscribeInbox({
+  // Wire ONE notification handler + subscribe + catch-up through the shared,
+  // VSCode-free subscribeInboxes seam (the integration test exercises the REAL
+  // subscribe→notify→wake path via the single-agent subscribeInbox shim, not just
+  // decideWake in isolation — test-path-must-match-shipped-path). The state-lock
+  // guard (don't paint a success snapshot / wake over an error UI) lives inside
+  // it. Each watched agent has its OWN persistent WakeGate (per-agent no-double-
+  // wake mark across reconnects); a window reload re-creates them, re-waking
+  // pending mail (A1).
+  await subscribeInboxes({
     client,
-    agentName: config.agentName,
-    autoInjectInbox: config.autoInjectInbox,
+    agents: agentList.map((a, i) => ({
+      agentName: a.name,
+      autoInjectInbox: config.autoInjectInbox,
+      wakeGate: getWakeGate(a.name),
+      primary: i === 0,
+    })),
     buildInboxUri,
     readSnapshot: refreshSnapshot,
     applySnapshot,
     showToast: (snapshot) => showToast(snapshot, config.notificationLevel),
     isInErrorState,
-    wakeGate: wakeGate!,
     log,
   });
   if (!isInErrorState()) {
@@ -1259,13 +1309,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
   );
-  // v0.2.3 — create the wake gate before the first connect(); it persists across
-  // reconnects so the catch-up + live paths share ONE no-double-wake mark.
-  // v0.3.0: the wake is now async (PID resolution) — fire-and-forget; the gate
-  // has already advanced its mark synchronously, so there's no double-wake window.
-  wakeGate = new WakeGate((name) => {
-    void injectInboxKeystroke(name);
-  });
+  // Per-agent wake gates are created lazily in connect() via getWakeGate (one
+  // per watched agent), persisting across reconnects so each agent's
+  // no-double-wake mark survives. v0.3.0: the wake is async (PID resolution) —
+  // fire-and-forget; the gate advances its mark synchronously, so there's no
+  // double-wake window.
   reconnectSupervisor = new ReconnectSupervisor({
     policy: new RestartPolicy({ neverGiveUp: true }),
     connect: async () => {
@@ -1309,6 +1357,6 @@ export async function deactivate(): Promise<void> {
   // no leaked timer).
   reconnectSupervisor?.dispose();
   reconnectSupervisor = undefined;
-  wakeGate = undefined;
+  wakeGates.clear();
   await disconnect();
 }

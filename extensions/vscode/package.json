@@ -87,13 +87,39 @@
             "sendText",
             "sendSequence"
           ],
-          "default": "sendText",
-          "description": "Codex only: how the submit keystroke is delivered. sendText = write it to the bound terminal directly (default). sendSequence = focus the terminal then send a raw key sequence to it — try this if a delayed sendText still won't submit."
+          "default": "sendSequence",
+          "description": "Codex only: how the submit keystroke is delivered. sendSequence (default) = focus the terminal then send a standalone key sequence to it — the programmatic twin of a real keyboard Enter, the most reliable way to make Codex auto-submit (note: it focuses the Codex terminal on wake). sendText = write the key to the bound terminal directly, no focus-steal, but a sendText'd CR can be absorbed by Codex's TUI."
         },
         "bot-relay.tether.codexWakePrompt": {
           "type": "string",
           "default": "Relay mail arrived — call get_messages(agent_name=\"{agent}\", status=\"pending\"), act on every message, then continue.",
           "description": "Codex only: the instruction injected into the Codex terminal on wake. Codex has no 'inbox' convention, so a bare token just makes it reply — it must be told to drain the relay. '{agent}' is replaced with the agent name."
+        },
+        "bot-relay.tether.agents": {
+          "type": "array",
+          "default": [],
+          "description": "Watch MULTIPLE agents at once (no switching). Each entry binds one agent name to its LLM so Tether wakes each agent's terminal with the right adapter. The legacy single 'agentName' is still watched (as the primary / status-bar agent) and is merged in. Example: [{ \"name\": \"build-agent\", \"llm\": \"claude\" }, { \"name\": \"codex-agent\", \"llm\": \"codex\" }].",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Agent name (matches the agent's RELAY_AGENT_NAME)."
+              },
+              "llm": {
+                "type": "string",
+                "enum": [
+                  "claude",
+                  "codex"
+                ],
+                "default": "claude",
+                "description": "Which CLI agent runs in this agent's terminal."
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
         }
       }
     },

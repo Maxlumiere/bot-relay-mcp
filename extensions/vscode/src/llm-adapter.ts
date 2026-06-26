@@ -81,7 +81,9 @@ export interface CodexAdapterOptions {
   /** Delay between typing the word and sending the submit key, so the paste
    *  block closes first (default 150ms). */
   submitDelayMs?: number;
-  /** How to deliver the submit key (default "sendText"). */
+  /** How to deliver the submit key (default "sendSequence" — focus + a standalone
+   *  CR, the programmatic twin of a real keyboard Enter, which is the only thing
+   *  proven to make Codex submit). */
   submitMethod?: SubmitMethod;
 }
 
@@ -105,7 +107,7 @@ export function makeCodexAdapter(opts?: CodexAdapterOptions): LlmAdapter {
   const wakeText = opts?.wakeText ?? DEFAULT_CODEX_WAKE_TEXT;
   const submitKey: SubmitKey = opts?.submitKey ?? "\r";
   const submitDelayMs = opts?.submitDelayMs ?? 150;
-  const submitMethod: SubmitMethod = opts?.submitMethod ?? "sendText";
+  const submitMethod: SubmitMethod = opts?.submitMethod ?? "sendSequence";
   return {
     id: "codex",
     // Short label for logs/UX; the injected text is the full `wakeText` instruction.
@@ -125,7 +127,7 @@ export function makeCodexAdapter(opts?: CodexAdapterOptions): LlmAdapter {
   };
 }
 
-/** Default Codex adapter (CR, 150ms, sendText). */
+/** Default Codex adapter (CR, 150ms, sendSequence). */
 export const codexAdapter: LlmAdapter = makeCodexAdapter();
 
 /**

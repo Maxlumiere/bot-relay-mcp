@@ -53,13 +53,13 @@ describe("LLM adapters", () => {
     await codexAdapter.wake(ctx);
     expect(codexAdapter.id).toBe("codex");
     expect(codexAdapter.wakeWord).toBe("ping-off");
-    // Exact ordered contract: type the INSTRUCTION (default wake text) with
-    // addNewLine=false, wait 150ms for the paste block to close, THEN send the
-    // CR as its own write.
+    // Exact ordered contract (DEFAULT = sendSequence): type the INSTRUCTION with
+    // addNewLine=false, wait 150ms for the paste block to close, THEN submit via
+    // a focused standalone CR (sendSequence) — the twin of a real keyboard Enter.
     expect(ops).toEqual([
       `sendText:${JSON.stringify(DEFAULT_CODEX_WAKE_TEXT)}:false`,
       `delay:150`,
-      `sendText:"\\r":false`,
+      `seq:"\\r"`,
     ]);
   });
 
@@ -68,7 +68,7 @@ describe("LLM adapters", () => {
     await codexAdapter.wake(ctx);
     expect(ops[0]).toBe(`sendText:${JSON.stringify(DEFAULT_CODEX_WAKE_TEXT)}:false`); // instruction, never with a newline
     expect(ops[1].startsWith("delay:")).toBe(true); // delay BEFORE submit
-    expect(ops[2]).toBe(`sendText:"\\r":false`); // submit is its own write
+    expect(ops[2]).toBe(`seq:"\\r"`); // submit is its own (focused) event
     expect(ops).toHaveLength(3);
   });
 
@@ -84,7 +84,7 @@ describe("LLM adapters", () => {
 
   it("codex: LF submit key + custom delay are honored", async () => {
     const { ctx, ops } = fakeCtx();
-    await makeCodexAdapter({ submitKey: "\n", submitDelayMs: 200, wakeText: "ping-off" }).wake(ctx);
+    await makeCodexAdapter({ submitKey: "\n", submitDelayMs: 200, wakeText: "ping-off", submitMethod: "sendText" }).wake(ctx);
     expect(ops).toEqual([
       `sendText:"ping-off":false`,
       `delay:200`,
@@ -94,7 +94,7 @@ describe("LLM adapters", () => {
 
   it("codex: submitDelayMs=0 skips the delay", async () => {
     const { ctx, ops } = fakeCtx();
-    await makeCodexAdapter({ submitDelayMs: 0, wakeText: "ping-off" }).wake(ctx);
+    await makeCodexAdapter({ submitDelayMs: 0, wakeText: "ping-off", submitMethod: "sendText" }).wake(ctx);
     expect(ops).toEqual([`sendText:"ping-off":false`, `sendText:"\\r":false`]);
   });
 
