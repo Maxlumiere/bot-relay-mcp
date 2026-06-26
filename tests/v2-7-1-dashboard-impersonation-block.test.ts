@@ -14,7 +14,7 @@
  * `send_message` with any `from` field and impersonate any registered
  * agent across the relay's full message + task surface.
  *
- * Option A was locked on 2026-05-13 (security review synthesis): make
+ * Option A was selected on 2026-05-13 (security review synthesis): make
  * `from_agent_token` REQUIRED when `from` names a registered agent.
  * The dashboard secret + CSRF +
  * origin checks still cover access to the endpoint; the from-token

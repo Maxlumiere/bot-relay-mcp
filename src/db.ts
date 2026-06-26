@@ -2232,7 +2232,7 @@ export function registerAgent(
     // path is auth-gated by enforceAuth (server.ts) — an active row can only
     // be re-registered by the token-holder — so a host_id refresh is the
     // OWNER declaring its current machine GUID, never a cross-agent overwrite.
-    // This closes the empty-host_id case (long-lived persona rows created
+    // This closes the empty-host_id case (long-lived agent rows created
     // before the handshake, or via the SKIP_REGISTER-then-relaunch path) where
     // an immutable host_id could never be populated on relaunch.
     const newHostShellPids =
@@ -3617,7 +3617,7 @@ export function broadcastMessage(
  * The FYI/coordination-lane analogue of post_task_auto's candidate lookup,
  * with two deliberate differences: (1) it matches a SINGLE capability tag
  * (membership), not an ALL-OF set; (2) it returns ALL owners for fan-out, not
- * the single least-loaded pick — an FYI should reach every persona that owns
+ * the single least-loaded pick — an FYI should reach every agent that owns
  * the domain, not just one.
  */
 export function findCapabilityOwners(

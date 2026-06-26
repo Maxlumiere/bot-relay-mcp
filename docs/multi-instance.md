@@ -8,7 +8,7 @@ Per the federation design memo (Codex 2026-04-19), isolation is per-**instance**
 
 ## When to use
 
-- You want to run separate relays for separate projects/personas on one machine without state bleeding between them.
+- You want to run separate relays for separate projects/agents on one machine without state bleeding between them.
 - You're running CI runners on the same machine as a dev relay and want hard isolation.
 - You're testing bot-relay itself (property tests, replay harness) and want a disposable instance alongside your main setup.
 
