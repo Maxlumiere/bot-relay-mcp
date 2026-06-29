@@ -7,6 +7,7 @@ import {
   sendMessage,
   getMessages,
   getMessagesSummary,
+  resolveMessages,
   broadcastMessage,
   postToCapability,
   runHealthMonitorTick,
@@ -21,6 +22,7 @@ import type {
   SendMessageInput,
   GetMessagesInput,
   GetMessagesSummaryInput,
+  ResolveMessagesInput,
   BroadcastInput,
   PostToCapabilityInput,
 } from "../types.js";
@@ -149,7 +151,17 @@ export function handleGetMessages(input: GetMessagesInput) {
       isError: true,
     };
   }
-  const raw = getMessages(input.agent_name, input.status, input.limit, input.peek ?? false, sinceIso, input.lane);
+  const raw = getMessages(
+    input.agent_name,
+    input.status,
+    input.limit,
+    input.peek ?? false,
+    sinceIso,
+    input.lane,
+    // v2.12.0 — resolve-on-ack. getMessages itself gates the resolve to
+    // status='pending' + non-peek; passing the flag through is sufficient.
+    input.ack ?? false,
+  );
   const messages = raw;
   // v2.3.0 Part A.2 — live consistency probe. Off by default; when
   // enabled via RELAY_CONSISTENCY_PROBE=1, samples every Nth call and
@@ -198,6 +210,11 @@ export function handleGetMessages(input: GetMessagesInput) {
     }
   }
 
+  // v2.12.0 — surface an `acked` confirmation ONLY when ack actually took
+  // effect (true + the drain path). Omitted otherwise so an ack=false call is
+  // byte-identical to pre-v2.12.0 output (back-compat contract).
+  const ackEffective = (input.ack ?? false) === true && input.status === "pending";
+
   return {
     content: [
       {
@@ -211,6 +228,41 @@ export function handleGetMessages(input: GetMessagesInput) {
             since: input.since ?? null,
             since_bound: sinceIso,
             ...(hint ? { hint } : {}),
+            ...(ackEffective ? { acked: true, resolved_count: messages.length } : {}),
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+/**
+ * v2.12.0 — pending-vs-history. Explicitly resolve (ack) specific messages so
+ * they leave the cross-session pending queue. Recipient-scoped at two layers:
+ * the dispatcher binds the caller's token to `agent_name` (so a foreign token
+ * can't even call this for another agent), and resolveMessages additionally
+ * scopes its UPDATE by `to_agent = agent_name`. Idempotent: re-resolving or
+ * passing unknown/foreign ids is a no-op (reported via the counts).
+ */
+export function handleResolveMessages(input: ResolveMessagesInput) {
+  const result = resolveMessages(input.agent_name, input.message_ids);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            agent: input.agent_name,
+            resolved_ids: result.resolved_ids,
+            resolved_count: result.resolved_count,
+            requested_count: result.requested_count,
+            note:
+              result.resolved_count === 0
+                ? "No messages resolved (already resolved, unknown ids, or not addressed to you)."
+                : `Resolved ${result.resolved_count} message(s); they will not re-surface as pending.`,
           },
           null,
           2

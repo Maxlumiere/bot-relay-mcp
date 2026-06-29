@@ -238,6 +238,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_12(_db);
   migrateSchemaToV2_13(_db);
   migrateSchemaToV2_14(_db);
+  migrateSchemaToV2_15(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -277,6 +278,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_12(_db);
   migrateSchemaToV2_13(_db);
   migrateSchemaToV2_14(_db);
+  migrateSchemaToV2_15(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -498,7 +500,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 16;
+export const CURRENT_SCHEMA_VERSION = 17;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -588,6 +590,7 @@ export function applyMigration(from: number, to: number): void {
     [13, 14],
     [14, 15],
     [15, 16],
+    [16, 17],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1414,6 +1417,36 @@ function migrateSchemaToV2_14(db: CompatDatabase): void {
   }
   if (!agentCols.some((c) => c.name === "host_id")) {
     db.exec("ALTER TABLE agents ADD COLUMN host_id TEXT");
+  }
+}
+
+/**
+ * v2.12.0 — pending-vs-history. schema v16 → v17.
+ *
+ * One additive, NULL-default column on `messages`:
+ *   - `resolved_at TEXT NULL` — ISO timestamp set when the recipient
+ *     permanently RESOLVES (acks) a message; NULL = unresolved. This is a
+ *     SESSION-INDEPENDENT plane, orthogonal to the existing session-scoped
+ *     read plane (`status` / `read_by_session`): "read" is a per-session
+ *     observation, "resolved" is a permanent "handled, archive it."
+ *
+ * Why: the pending read model is session-scoped on purpose (a fresh
+ * terminal re-sees previously-read mail so handovers never drop unfinished
+ * work — v2.0 final #6). The side effect is that ALREADY-HANDLED mail also
+ * re-floods every new session. The `pending` filter gains `AND resolved_at
+ * IS NULL`, so resolved items leave the action queue permanently while
+ * unfinished work still re-surfaces across sessions.
+ *
+ * Additive + idempotent — PRAGMA-guarded so re-runs no-op. NULL on every
+ * existing row = zero data migration; every currently-pending row stays
+ * pending until an agent opts into resolving (ack / resolve_messages).
+ */
+function migrateSchemaToV2_15(db: CompatDatabase): void {
+  const msgCols = db
+    .prepare("PRAGMA table_info(messages)")
+    .all() as Array<{ name: string }>;
+  if (!msgCols.some((c) => c.name === "resolved_at")) {
+    db.exec("ALTER TABLE messages ADD COLUMN resolved_at TEXT");
   }
 }
 
@@ -3215,6 +3248,13 @@ export function getMessages(
   peek = false,
   sinceIso: string | null = null,
   lane: "all" | "direct" | "capability" = "all",
+  // v2.12.0 — pending-vs-history. When true, also permanently RESOLVE the
+  // returned messages (set resolved_at) in the SAME transaction as the
+  // read-mark, so the next poll — even from a fresh session — never re-floods
+  // with already-handled mail. Default false ⇒ byte-identical to prior
+  // behavior. Ignored on peek (observation only) and on read/all/history/
+  // resolved reads (those never mark, so they never resolve).
+  ack = false,
 ): MessageRecord[] {
   const db = getDb();
   // No touchAgent here — observation is not liveness (v1.3 presence fix)
@@ -3247,12 +3287,27 @@ export function getMessages(
         ? "AND routed_capability IS NOT NULL"
         : "";
 
-  if (status === "all") {
+  if (status === "all" || status === "history") {
+    // "all" / "history" (alias) = the full durable record, incl. resolved
+    // mail. The on-demand HISTORY plane for cross-session handover pulls.
     const params: unknown[] = [agentName];
     if (sinceIso) params.push(sinceIso);
     params.push(limit);
     rows = db.prepare(
       `SELECT * FROM messages WHERE to_agent = ? ${sinceClause} ${laneClause} ${priorityOrder}`
+    ).all(...params) as MessageRecord[];
+  } else if (status === "resolved") {
+    // v2.12.0 — only messages the recipient has permanently resolved
+    // (acked). "show me what I've already handled." Session-independent.
+    const params: unknown[] = [agentName];
+    if (sinceIso) params.push(sinceIso);
+    params.push(limit);
+    rows = db.prepare(
+      `SELECT * FROM messages WHERE to_agent = ?
+         AND resolved_at IS NOT NULL
+         ${sinceClause}
+         ${laneClause}
+         ${priorityOrder}`
     ).all(...params) as MessageRecord[];
   } else if (status === "read") {
     // "read" = this session has already observed these messages.
@@ -3268,15 +3323,20 @@ export function getMessages(
          ${priorityOrder}`
     ).all(...params) as MessageRecord[];
   } else {
-    // "pending" = never read, OR read by a different session. This is the
-    // core of the fix: a fresh terminal session (new session_id) sees
-    // previously-read messages again, so handovers do not drop mail.
+    // "pending" = (never read, OR read by a different session) AND not yet
+    // resolved. The session-scoped clause re-surfaces a prior session's
+    // UNFINISHED work to a fresh terminal (handovers don't drop mail, v2.0
+    // final #6); the v2.12.0 `resolved_at IS NULL` clause keeps ALREADY-
+    // HANDLED mail out of the action queue permanently, killing the
+    // cross-session re-flood for resolved items without touching the
+    // session-scoped read semantics.
     const params: unknown[] = [agentName, currentSession ?? ""];
     if (sinceIso) params.push(sinceIso);
     params.push(limit);
     rows = db.prepare(
       `SELECT * FROM messages WHERE to_agent = ?
          AND (read_by_session IS NULL OR read_by_session != ?)
+         AND resolved_at IS NULL
          ${sinceClause}
          ${laneClause}
          ${priorityOrder}`
@@ -3297,16 +3357,37 @@ export function getMessages(
   if (!peek && rows.length > 0 && currentSession && status !== "read") {
     const ids = rows.map((r) => r.id);
     const placeholders = ids.map(() => "?").join(",");
+    // v2.12.0 — resolve-on-ack. Only the PENDING drain path resolves: it is
+    // the "drain my queue, I've handled all of these" call. Browsing history
+    // (status all/history/resolved) must NOT resolve even with ack=true — a
+    // caller paging the full record shouldn't accidentally empty its action
+    // queue. lane is orthogonal (pending + lane='capability' + ack still
+    // resolves the FYI rows it drained).
+    const doResolve = ack && status === "pending";
+    const resolvedAt = now();
     // v2.7 / Tether Phase 3a — drain UPDATE + outbox INSERT in one tx so
     // the cross-process tail in the HTTP daemon (src/outbox-tail.ts) sees
     // exactly one row per actual pending→read transition. lastInsertRowid
     // is threaded into emitInboxChanged for in-process dedup against the
     // tail (mcp-subscriptions tracks highest broadcast id per URI).
+    //
+    // v2.12.0 — when ack, the session-independent resolve UPDATE rides the
+    // SAME tx as the per-session read-mark so they commit atomically (the
+    // returned set is resolved iff it is marked read — never half). The
+    // `resolved_at IS NULL` guard makes it idempotent under concurrent
+    // racing drains; the tx is promoted to BEGIN IMMEDIATE below so two
+    // ack drains serialize at tx start (same pattern as the seq tx) and
+    // neither double-counts nor drops.
     const tx = db.transaction(() => {
       const r = db.prepare(
         `UPDATE messages SET status = 'read', read_by_session = ? WHERE id IN (${placeholders})`
       ).run(currentSession, ...ids);
       drainedRows = r.changes;
+      if (doResolve) {
+        db.prepare(
+          `UPDATE messages SET resolved_at = ? WHERE id IN (${placeholders}) AND resolved_at IS NULL`
+        ).run(resolvedAt, ...ids);
+      }
       if (drainedRows > 0) {
         const ins = db.prepare(
           "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
@@ -3314,7 +3395,16 @@ export function getMessages(
         outboxId = Number(ins.lastInsertRowid);
       }
     });
-    tx();
+    // BEGIN IMMEDIATE via better-sqlite3's .immediate() modifier so
+    // cross-process concurrent drains serialize at tx START. Fall back to
+    // the default mode on drivers that don't expose it (the wasm driver is
+    // single-connection so cross-process races don't apply).
+    const immediateCaller = (tx as unknown as { immediate?: () => void }).immediate;
+    if (typeof immediateCaller === "function") {
+      (tx as unknown as { immediate: () => void }).immediate();
+    } else {
+      tx();
+    }
   }
   // v2.5.0 Tether Phase 1 — Part S — fire the inbox-changed event when
   // pending → read, so subscribers see the unread count drop in real time.
@@ -3416,6 +3506,65 @@ export function getMessages(
 }
 
 /**
+ * v2.12.0 — pending-vs-history. Permanently RESOLVE (ack) the named messages
+ * for `agentName`, so they leave the cross-session pending queue for good.
+ * Backs the `resolve_messages` tool and the partial-handling path ("I handled
+ * these, not those") that `get_messages(ack=true)` (resolve-the-whole-drain)
+ * does not cover.
+ *
+ * Recipient-scoped: only rows WHERE `to_agent = agentName` are touched, so a
+ * caller can never resolve another agent's mail even if it passes foreign ids
+ * (defense-in-depth — the dispatcher already binds the caller's token to
+ * `agent_name`). Idempotent: the `resolved_at IS NULL` guard means re-resolving
+ * an already-resolved id is a no-op, and unknown / non-owned ids are silently
+ * skipped (reported via the count). Resolving does NOT mark a message read —
+ * read is a separate per-session plane.
+ *
+ * Returns `{ resolved_ids, resolved_count, requested_count }` so the caller can
+ * see exactly which of the requested ids it actually owned + flipped.
+ */
+export function resolveMessages(
+  agentName: string,
+  messageIds: string[],
+): { resolved_ids: string[]; resolved_count: number; requested_count: number } {
+  const db = getDb();
+  const requested = Array.from(new Set(messageIds));
+  if (requested.length === 0) {
+    return { resolved_ids: [], resolved_count: 0, requested_count: 0 };
+  }
+  const placeholders = requested.map(() => "?").join(",");
+  const resolvedAt = now();
+  // Single immediate tx: SELECT the owned-and-unresolved ids, then flip them.
+  // The SELECT is scoped by to_agent so the returned id list reflects only
+  // what THIS recipient actually resolved (not foreign/unknown ids).
+  let resolvedIds: string[] = [];
+  const tx = db.transaction(() => {
+    const owned = db
+      .prepare(
+        `SELECT id FROM messages WHERE id IN (${placeholders}) AND to_agent = ? AND resolved_at IS NULL`,
+      )
+      .all(...requested, agentName) as { id: string }[];
+    resolvedIds = owned.map((r) => r.id);
+    if (resolvedIds.length > 0) {
+      db.prepare(
+        `UPDATE messages SET resolved_at = ? WHERE id IN (${placeholders}) AND to_agent = ? AND resolved_at IS NULL`,
+      ).run(resolvedAt, ...requested, agentName);
+    }
+  });
+  const immediateCaller = (tx as unknown as { immediate?: () => void }).immediate;
+  if (typeof immediateCaller === "function") {
+    (tx as unknown as { immediate: () => void }).immediate();
+  } else {
+    tx();
+  }
+  return {
+    resolved_ids: resolvedIds,
+    resolved_count: resolvedIds.length,
+    requested_count: requested.length,
+  };
+}
+
+/**
  * v2.1.6 — inbox-summary helper. Mirrors the priority + status ordering of
  * getMessages but:
  *   1. does NOT mutate read_by_session (pure observation),
@@ -3447,8 +3596,16 @@ export function getMessagesSummary(
   const params: unknown[] = [agentName];
 
   let sql: string;
-  if (status === "all") {
+  if (status === "all" || status === "history") {
+    // "all" / "history" (alias) — full durable record incl. resolved mail.
     sql = `SELECT * FROM messages WHERE to_agent = ? ${sinceClause} ${priorityOrder}`;
+    if (sinceIso) params.push(sinceIso);
+  } else if (status === "resolved") {
+    // v2.12.0 — only permanently-resolved (acked) mail.
+    sql = `SELECT * FROM messages WHERE to_agent = ?
+       AND resolved_at IS NOT NULL
+       ${sinceClause}
+       ${priorityOrder}`;
     if (sinceIso) params.push(sinceIso);
   } else if (status === "read") {
     sql = `SELECT * FROM messages WHERE to_agent = ?
@@ -3459,9 +3616,13 @@ export function getMessagesSummary(
     params.push(currentSession ?? "");
     if (sinceIso) params.push(sinceIso);
   } else {
-    // "pending" — never read OR read by a different session
+    // "pending" — (never read OR read by a different session) AND not yet
+    // resolved. v2.12.0: the `resolved_at IS NULL` clause mirrors getMessages
+    // so the cheap preview and the mutating drain agree on the pending set
+    // (an already-resolved item never shows as pending in either path).
     sql = `SELECT * FROM messages WHERE to_agent = ?
        AND (read_by_session IS NULL OR read_by_session != ?)
+       AND resolved_at IS NULL
        ${sinceClause}
        ${priorityOrder}`;
     params.push(currentSession ?? "");

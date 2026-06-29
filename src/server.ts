@@ -23,6 +23,7 @@ import {
   SendMessageSchema,
   GetMessagesSchema,
   GetMessagesSummarySchema,
+  ResolveMessagesSchema,
   BroadcastSchema,
   PostToCapabilitySchema,
   PostTaskSchema,
@@ -68,7 +69,7 @@ import { currentContext, requestContext } from "./request-context.js";
 import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
 import { ZodError } from "zod";
 import { authenticateAgent, verifyToken, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive } from "./auth.js";
-import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleBroadcast, handlePostToCapability } from "./tools/messaging.js";
+import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleResolveMessages, handleBroadcast, handlePostToCapability } from "./tools/messaging.js";
 import { handlePostTask, handlePostTaskAuto, handleUpdateTask, handleGetTasks, handleGetTask, handleRegisterTaskSchema, handleTaskSchemaGet } from "./tools/tasks.js";
 import { handleRegisterWebhook, handleListWebhooks, handleDeleteWebhook } from "./tools/webhooks.js";
 import { processDueWebhookRetries } from "./webhooks.js";
@@ -157,6 +158,9 @@ export const TOOL_BUNDLES: Record<string, string> = {
   send_message: "core",
   get_messages: "core",
   get_messages_summary: "core",
+  // v2.12.0 — pending-vs-history. Own-mailbox primitive (no extra capability;
+  // recipient-scoped by token→agent_name binding, like get_messages).
+  resolve_messages: "core",
   broadcast: "core",
   // v2.10 — capability-routed messaging (FYI/coordination lane). Core primitive.
   post_to_capability: "core",
@@ -420,6 +424,16 @@ export function createServer(): Server {
           "Returns: `{ summaries: { id, from_agent, priority, status, created_at, content_preview, content_truncated }[], count, agent, filter, since, since_bound }`. `content_truncated=true` when the original content exceeded the 100-char preview cap.\n\n" +
           "Errors: `AUTH_FAILED`, `VALIDATION`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetMessagesSummarySchema),
+      },
+      {
+        name: "resolve_messages",
+        description:
+          "Permanently resolve (ack) specific messages so they leave your pending queue for good (v2.12.0).\n\n" +
+          "When to use: PARTIAL handling — you've actioned some of your mail but not all (\"I did these, not those\"). For the common \"I've handled everything I just drained\" path, prefer `get_messages(status='pending', ack=true)` which drains AND resolves in one call. Resolving is the durable, session-INDEPENDENT counterpart to reading: `read` is a per-session observation (a fresh terminal re-sees prior-session-read mail so handovers don't drop unfinished work); `resolved` is a permanent \"handled, archive it\" that the `pending` filter honors, so an already-handled message never re-floods a new session.\n\n" +
+          "Behavior: sets `resolved_at=now()` for the given ids WHERE `to_agent` is you AND not already resolved, in one transaction. Does NOT mark messages read (orthogonal plane) and does NOT delete them — they remain in `status='all'`/`'history'`/`'resolved'`. Idempotent: re-resolving, unknown ids, or ids addressed to another agent are silently skipped (reflected in the returned counts). Recipient-scoped: you can only resolve your OWN mail (the dispatcher binds your token to `agent_name`; the DB also filters by `to_agent`).\n\n" +
+          "Returns: `{ success: true, agent, resolved_ids: string[], resolved_count, requested_count, note }`. `resolved_count` < `requested_count` when some ids were already resolved, unknown, or not yours.\n\n" +
+          "Errors: `AUTH_FAILED` (token missing/mismatched), `VALIDATION` (empty/oversized id list), `RATE_LIMITED`.",
+        inputSchema: zodToJsonSchema(ResolveMessagesSchema),
       },
       {
         name: "broadcast",
@@ -772,6 +786,8 @@ export function createServer(): Server {
         return handleGetMessages(GetMessagesSchema.parse(args));
       case "get_messages_summary":
         return handleGetMessagesSummary(GetMessagesSummarySchema.parse(args));
+      case "resolve_messages":
+        return handleResolveMessages(ResolveMessagesSchema.parse(args));
       case "broadcast":
         return handleBroadcast(BroadcastSchema.parse(args));
       case "post_to_capability":

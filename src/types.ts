@@ -192,9 +192,27 @@ export type PeekInboxVersionInput = z.infer<typeof PeekInboxVersionSchema>;
 
 export const GetMessagesSchema = z.object({
   agent_name: z.string().min(1).describe("Your agent name"),
-  status: z.enum(["pending", "read", "all"]).default("pending").describe("Filter by status"),
+  status: z
+    .enum(["pending", "read", "all", "history", "resolved"])
+    .default("pending")
+    .describe(
+      "Filter by status. 'pending' (default) = unresolved + not-read-by-this-session (the action queue). 'read' = read by this session. 'all'/'history' = the full durable record incl. resolved. 'resolved' = only messages you've acked (v2.12.0)."
+    ),
   limit: z.number().int().min(1).max(100).default(20).describe("Max messages to return"),
   since: GetMessagesSinceField,
+  /**
+   * v2.12.0 — pending-vs-history. When true, permanently RESOLVE (ack) the
+   * returned messages in the SAME transaction as the per-session read-mark,
+   * so the next poll — even from a fresh terminal session — never re-floods
+   * with already-handled mail. Only takes effect on status='pending' (the
+   * drain path); browsing history never resolves. Default false ⇒ byte-
+   * identical to pre-v2.12.0 behavior (the session-scoped handover re-surface
+   * is preserved for UNfinished work). Use `resolve_messages` for partial
+   * handling ("I did these, not those").
+   */
+  ack: z.boolean().optional().default(false).describe(
+    "v2.12.0: when true, permanently resolve the returned messages (atomic with the read-mark) so a fresh session won't re-surface them. Only applies to status='pending'. Default false = unchanged behavior."
+  ),
   /**
    * v2.2.2 BUG1 — when true, do NOT mark returned messages as read-by-
    * this-session. Repeated calls with `status='pending'` continue to
@@ -233,9 +251,32 @@ export const GetMessagesSchema = z.object({
  */
 export const GetMessagesSummarySchema = z.object({
   agent_name: z.string().min(1).describe("Your agent name"),
-  status: z.enum(["pending", "read", "all"]).default("pending").describe("Filter by status"),
+  status: z
+    .enum(["pending", "read", "all", "history", "resolved"])
+    .default("pending")
+    .describe(
+      "Filter by status (same surface as get_messages). 'pending' excludes resolved mail (v2.12.0) so the preview agrees with the mutating drain."
+    ),
   limit: z.number().int().min(1).max(100).default(20).describe("Max message summaries to return"),
   since: GetMessagesSinceField,
+  agent_token: AgentTokenField,
+});
+
+/**
+ * v2.12.0 — pending-vs-history. Explicitly RESOLVE (ack) specific messages so
+ * they leave the cross-session pending queue permanently. Recipient-scoped:
+ * the dispatcher binds the caller's token to `agent_name`, and the DB layer
+ * additionally scopes the UPDATE by `to_agent = agent_name`, so an agent can
+ * only resolve its OWN mail. Use this for partial handling; use
+ * get_messages(ack=true) to resolve a whole drain in one call.
+ */
+export const ResolveMessagesSchema = z.object({
+  agent_name: z.string().min(1).describe("Your agent name (the recipient; only your own mail can be resolved)"),
+  message_ids: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(100)
+    .describe("The message ids to permanently resolve (ack). Only ids addressed to you are affected; unknown/foreign ids are silently skipped."),
   agent_token: AgentTokenField,
 });
 
@@ -698,6 +739,7 @@ export type SpawnAgentInput = z.infer<typeof SpawnAgentSchema>;
 export type SendMessageInput = z.infer<typeof SendMessageSchema>;
 export type GetMessagesInput = z.infer<typeof GetMessagesSchema>;
 export type GetMessagesSummaryInput = z.infer<typeof GetMessagesSummarySchema>;
+export type ResolveMessagesInput = z.infer<typeof ResolveMessagesSchema>;
 export type BroadcastInput = z.infer<typeof BroadcastSchema>;
 export type PostTaskInput = z.infer<typeof PostTaskSchema>;
 export type PostTaskAutoInput = z.infer<typeof PostTaskAutoSchema>;
@@ -836,6 +878,15 @@ export interface MessageRecord {
    * completion report.
    */
   routed_capability?: string | null;
+  /**
+   * v2.12.0 — pending-vs-history. ISO timestamp set when the recipient
+   * permanently RESOLVED (acked) this message; NULL = unresolved. Session-
+   * INDEPENDENT, orthogonal to `read_by_session`: read is a per-session
+   * observation, resolved is a permanent "handled, archive it." The
+   * `pending` filter excludes resolved rows so already-handled mail never
+   * re-floods a fresh session.
+   */
+  resolved_at?: string | null;
 }
 
 export interface TaskRecord {

@@ -52,14 +52,14 @@ function findAgent(name: string) {
   return getAgents().find((a) => a.name === name);
 }
 
-describe("PID-handshake — DB layer (schema v16)", () => {
+describe("PID-handshake — DB layer (schema v17)", () => {
   beforeEach(cleanup);
   afterEach(cleanup);
 
-  it("schema is at version 16 with host_shell_pids + host_id columns", () => {
+  it("schema is at version 17 with host_shell_pids + host_id columns", () => {
     registerAgent("seed", "role", []); // triggers init
-    expect(CURRENT_SCHEMA_VERSION).toBe(16);
-    expect(getSchemaVersion()).toBe(16);
+    expect(CURRENT_SCHEMA_VERSION).toBe(17);
+    expect(getSchemaVersion()).toBe(17);
     const cols = (getDb().prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).map(
       (c) => c.name,
     );

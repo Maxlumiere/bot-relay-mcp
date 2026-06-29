@@ -83,9 +83,9 @@ describe("HTTP transport", () => {
     expect(body.transport).toBe("http");
   });
 
-  it("tools/list returns all 33 tools (31 + register_task_schema + task_schema_get [v2.10 schema-gating])", async () => {
+  it("tools/list returns all 34 tools (33 + resolve_messages [v2.12.0 pending-vs-history])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(33);
+    expect(result.result.tools.length).toBe(34);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
     expect(names).toContain("unregister_agent");
@@ -105,6 +105,8 @@ describe("HTTP transport", () => {
     expect(names).toContain("set_dashboard_theme");
     // v2.3.0 additions (Phase 4s ambient wake)
     expect(names).toContain("peek_inbox_version");
+    // v2.12.0 additions (pending-vs-history)
+    expect(names).toContain("resolve_messages");
   });
 
   it("registers and discovers an agent via HTTP", async () => {
