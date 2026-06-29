@@ -125,6 +125,30 @@ function resolveSinceBound(
 
 export function handleGetMessages(input: GetMessagesInput) {
   runHealthMonitor("get_messages");
+  // v2.12.0 (validation hardening) — ack + peek are mutually exclusive. peek
+  // suppresses the read/resolve mutation entirely, so an `ack=true, peek=true`
+  // call resolves NOTHING; returning `acked:true` would be a false receipt.
+  // Reject loudly rather than silently no-op the ack.
+  if ((input.ack ?? false) && (input.peek ?? false)) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              error:
+                "ack and peek are mutually exclusive: peek suppresses the mutation, so nothing can be resolved. Use ack=true without peek to drain+resolve, or peek=true alone to observe.",
+              error_code: ERROR_CODES.VALIDATION,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
   // v2.7.0 external-review P1 fix: `sinceIso` is now passed into the SQL layer and
   // applied as `AND created_at >= ?` BEFORE the mark-as-read mutation in
   // src/db.ts getMessages. Pre-v2.7.0 the filter ran here in JS AFTER

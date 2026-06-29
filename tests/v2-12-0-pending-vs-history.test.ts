@@ -33,9 +33,12 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import cp from "child_process";
+import { fileURLToPath, pathToFileURL } from "url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v2120-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
 process.env.RELAY_DB_PATH = TEST_DB_PATH;
@@ -48,7 +51,7 @@ delete process.env.RELAY_AGENT_CAPABILITIES;
 delete process.env.RELAY_ALLOW_LEGACY;
 process.env.RELAY_HTTP_PORT = "54996";
 
-const { handleSendMessage, handleGetMessages, handleResolveMessages } =
+const { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleResolveMessages } =
   await import("../src/tools/messaging.js");
 const {
   closeDb,
@@ -268,6 +271,93 @@ describe("v2.12.0 — (5) authz: B's token cannot resolve A's mail", () => {
       await server.close();
     }
   });
+
+  // The exact bypass an external audit reproduced: a STRAY `from` on an
+  // agent_name-keyed tool. Pre-fix, agentFromArgs read `from` first for every
+  // tool, so a valid bob token + from:bob authenticated as bob while the
+  // handler acted on agent_name:alice. Now `from` is unknown to these tools'
+  // schemas, so it cannot identify the caller → the bob/alice mismatch is
+  // rejected.
+  it("resolve_messages: a stray `from` cannot bypass the agent_name binding", async () => {
+    registerAgent("alice", "r", []);
+    const bob = registerAgent("bob", "r", []);
+    const [aliceMsg] = seed("alice", "alice", 1);
+
+    const { client, server } = await connectClient();
+    try {
+      const res: any = await client.callTool({
+        name: "resolve_messages",
+        arguments: {
+          from: "bob", // ← the exploit: extra field, valid bob token below
+          agent_name: "alice",
+          message_ids: [aliceMsg],
+          agent_token: bob.plaintext_token,
+        },
+      });
+      expect(res.isError).toBe(true);
+      const body = JSON.parse(res.content[0].text);
+      expect(body.error_code).toBe("AUTH_FAILED");
+      // alice's mail untouched.
+      expect(getMessages("alice", "resolved", 20).length).toBe(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("get_messages: a stray `from` cannot read/consume another agent's mailbox", async () => {
+    registerAgent("alice", "r", []);
+    const bob = registerAgent("bob", "r", []);
+    const [aliceMsg] = seed("bob", "alice", 1);
+
+    const { client, server } = await connectClient();
+    try {
+      const res: any = await client.callTool({
+        name: "get_messages",
+        arguments: {
+          from: "bob",
+          agent_name: "alice",
+          status: "pending",
+          limit: 20,
+          agent_token: bob.plaintext_token,
+        },
+      });
+      expect(res.isError).toBe(true);
+      const body = JSON.parse(res.content[0].text);
+      expect(body.error_code).toBe("AUTH_FAILED");
+      // The rejected call must NOT have marked alice's message read.
+      const row = getDb()
+        .prepare("SELECT read_by_session FROM messages WHERE id = ?")
+        .get(aliceMsg) as { read_by_session: string | null };
+      expect(row.read_by_session).toBeNull();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("get_messages_summary: a stray `from` cannot preview another agent's mailbox", async () => {
+    registerAgent("alice", "r", []);
+    const bob = registerAgent("bob", "r", []);
+    seed("bob", "alice", 1);
+
+    const { client, server } = await connectClient();
+    try {
+      const res: any = await client.callTool({
+        name: "get_messages_summary",
+        arguments: {
+          from: "bob",
+          agent_name: "alice",
+          status: "pending",
+          limit: 20,
+          agent_token: bob.plaintext_token,
+        },
+      });
+      expect(res.isError).toBe(true);
+      const body = JSON.parse(res.content[0].text);
+      expect(body.error_code).toBe("AUTH_FAILED");
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 // --- 6. Back-compat: ack=false is byte-identical + preserves handover ---
@@ -295,6 +385,29 @@ describe("v2.12.0 — (6) back-compat when ack=false", () => {
     registerAgent("alice", "r", []); // S2
     const s2 = parse(handleGetMessages({ agent_name: "alice", status: "pending", limit: 20 } as any));
     expect(s2.count).toBe(1); // unfinished work re-surfaces across sessions
+  });
+});
+
+// --- 6b. ack + peek are mutually exclusive (validation hardening) ---
+
+describe("v2.12.0 — (6b) ack + peek rejected (no false ack receipt)", () => {
+  it("ack=true + peek=true is a VALIDATION error and resolves nothing", () => {
+    registerAgent("sender", "r", []);
+    registerAgent("alice", "r", []);
+    const [id] = seed("sender", "alice", 1);
+
+    const res = handleGetMessages({ agent_name: "alice", status: "pending", limit: 20, ack: true, peek: true } as any);
+    expect((res as any).isError).toBe(true);
+    const body = parse(res);
+    expect(body.success).toBe(false);
+    expect(body.error_code).toBe("VALIDATION");
+
+    // Nothing was resolved or read — the call was rejected before any mutation.
+    const row = getDb()
+      .prepare("SELECT read_by_session, resolved_at FROM messages WHERE id = ?")
+      .get(id) as { read_by_session: string | null; resolved_at: string | null };
+    expect(row.read_by_session).toBeNull();
+    expect(row.resolved_at).toBeNull();
   });
 });
 
@@ -334,4 +447,70 @@ describe("v2.12.0 — (7) idempotent resolution (no double-count, no drop)", () 
 
     expect(getMessages("alice", "resolved", 20).filter((m) => m.id === id).length).toBe(1);
   });
+
+  // A REAL OS-level race (not a sequential simulation): two child processes
+  // resolve the SAME id set against the shared DB file at the same time. The
+  // BEGIN IMMEDIATE tx + `resolved_at IS NULL` guard must make each id resolve
+  // EXACTLY once — so the children's resolved_counts sum to N (no double-count)
+  // and every message ends resolved (no drop), regardless of interleaving.
+  it("two OS processes ack-resolving the same set — each id resolved exactly once", async () => {
+    const N = 40;
+    getDb();
+    registerAgent("sender", "r", []);
+    registerAgent("raceagent", "r", []);
+    const ids = seed("sender", "raceagent", N);
+    closeDb(); // release the parent connection so the children open cleanly
+
+    // ESM child written to a .mjs file. It calls the async initializeDb()
+    // first (the ESM-safe driver loader the daemon uses) so the synchronous
+    // getDb() returns the cached connection rather than its lazy
+    // createRequire path, which is not loadable in a standalone ESM child.
+    // Then it resolves the id set against the shared DB and prints the count
+    // (logger writes to stderr, so stdout is clean JSON).
+    const dbUrl = pathToFileURL(path.join(REPO_ROOT, "dist/db.js")).href;
+    const childPath = path.join(TEST_DB_DIR, "race-child.mjs");
+    fs.writeFileSync(
+      childPath,
+      `import { initializeDb, resolveMessages } from ${JSON.stringify(dbUrl)};\n` +
+        `await initializeDb();\n` +
+        `const ids = JSON.parse(process.env.RACE_IDS);\n` +
+        `const r = resolveMessages("raceagent", ids);\n` +
+        `process.stdout.write(JSON.stringify({ resolved_count: r.resolved_count }));\n`,
+    );
+    function spawnResolver() {
+      return new Promise<{ resolved_count: number; stderr: string; code: number | null }>((resolve, reject) => {
+        const child = cp.spawn(process.execPath, [childPath], {
+          env: { ...process.env, RELAY_DB_PATH: TEST_DB_PATH, RACE_IDS: JSON.stringify(ids) },
+        });
+        let stdout = "", stderr = "";
+        child.stdout.on("data", (d) => (stdout += d.toString()));
+        child.stderr.on("data", (d) => (stderr += d.toString()));
+        child.on("error", reject);
+        child.on("exit", (code) => {
+          let parsed = { resolved_count: -1 };
+          try { parsed = JSON.parse(stdout); } catch { /* leave -1 */ }
+          resolve({ resolved_count: parsed.resolved_count, stderr, code });
+        });
+      });
+    }
+
+    // Launch both concurrently for genuine contention.
+    const [a, b] = await Promise.all([spawnResolver(), spawnResolver()]);
+    expect(a.code, `child A failed: ${a.stderr}`).toBe(0);
+    expect(b.code, `child B failed: ${b.stderr}`).toBe(0);
+
+    // No double-count: the two processes resolved disjoint subsets summing to N.
+    expect(a.resolved_count + b.resolved_count).toBe(N);
+
+    // No drop: every message ended resolved, exactly once.
+    const verify = getDb();
+    const resolved = (verify
+      .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = 'raceagent' AND resolved_at IS NOT NULL")
+      .get() as { c: number }).c;
+    const unresolved = (verify
+      .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = 'raceagent' AND resolved_at IS NULL")
+      .get() as { c: number }).c;
+    expect(resolved).toBe(N);
+    expect(unresolved).toBe(0);
+  }, 30000);
 });

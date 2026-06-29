@@ -240,6 +240,65 @@ export function resolveSurfaceShape(): { bundles: string[]; hidden: string[] } {
   };
 }
 
+/**
+ * v2.12.0 (authz hardening) — map each tool to its input schema so the
+ * caller-identity extractor can gate candidate caller fields by SCHEMA
+ * membership. Pre-fix, agentFromArgs read `args.from` (then `agent_name`) from
+ * the RAW args for EVERY tool, so an attacker could tack a valid-token `from`
+ * onto a `get_messages`/`resolve_messages` call (whose schema has no `from`)
+ * and authenticate as themselves while the handler acted on `agent_name` —
+ * reading/resolving another agent's mailbox. Gating by the tool's own schema
+ * means a field the schema doesn't declare can never identify the caller.
+ */
+const TOOL_SCHEMAS: Record<string, unknown> = {
+  register_agent: RegisterAgentSchema,
+  discover_agents: DiscoverAgentsSchema,
+  unregister_agent: UnregisterAgentSchema,
+  spawn_agent: SpawnAgentSchema,
+  send_message: SendMessageSchema,
+  get_messages: GetMessagesSchema,
+  get_messages_summary: GetMessagesSummarySchema,
+  resolve_messages: ResolveMessagesSchema,
+  broadcast: BroadcastSchema,
+  post_to_capability: PostToCapabilitySchema,
+  post_task: PostTaskSchema,
+  post_task_auto: PostTaskAutoSchema,
+  update_task: UpdateTaskSchema,
+  get_tasks: GetTasksSchema,
+  get_task: GetTaskSchema,
+  register_task_schema: RegisterTaskSchemaSchema,
+  task_schema_get: TaskSchemaGetSchema,
+  register_webhook: RegisterWebhookSchema,
+  delete_webhook: DeleteWebhookSchema,
+  create_channel: CreateChannelSchema,
+  join_channel: JoinChannelSchema,
+  leave_channel: LeaveChannelSchema,
+  post_to_channel: PostToChannelSchema,
+  get_channel_messages: GetChannelMessagesSchema,
+  set_status: SetStatusSchema,
+  health_check: HealthCheckSchema,
+  rotate_token: RotateTokenSchema,
+  rotate_token_admin: RotateTokenAdminSchema,
+  revoke_token: RevokeTokenSchema,
+  get_standup: GetStandupSchema,
+  expand_capabilities: ExpandCapabilitiesSchema,
+  set_dashboard_theme: SetDashboardThemeSchema,
+  peek_inbox_version: PeekInboxVersionSchema,
+  // list_webhooks intentionally omitted — it takes no args (no caller field).
+};
+
+/**
+ * Return the set of top-level field names a tool's Zod schema declares.
+ * Unwraps ZodEffects (`.refine`/`.transform` wrap the object) to reach `.shape`.
+ * Empty set ⇒ no schema / no fields ⇒ no field may identify the caller.
+ */
+function schemaCallerKeys(schema: unknown): Set<string> {
+  let s: any = schema;
+  while (s && !s.shape && s._def?.schema) s = s._def.schema;
+  const shape = s?.shape;
+  return new Set(shape ? Object.keys(shape) : []);
+}
+
 export function createServer(): Server {
   const server = new Server(
     {
@@ -743,31 +802,38 @@ export function createServer(): Server {
 
   /**
    * Resolve the caller's agent name from tool args, tool-aware.
+   *
+   * v2.12.0 (authz hardening): a candidate caller field is honored ONLY
+   * if the tool's OWN schema declares it. Pre-fix this read `from`/`agent_name`
+   * from the raw args for every tool, so `resolve_messages`/`get_messages`/
+   * `get_messages_summary` (whose schema has no `from`) could be called with a
+   * stray `{from: attacker}` to authenticate as the attacker while the handler
+   * acted on `agent_name` — i.e. read or resolve another agent's mailbox. By
+   * gating on the schema, a `from` tacked onto an agent_name-keyed tool is
+   * unknown to that tool and never participates in auth.
+   *
    * `name` is only a caller-identity for unregister_agent (self-delete) and
    * register_agent (bootstrap). For spawn_agent, `name` is the CHILD agent
-   * being spawned — the caller must be identified by the token instead.
+   * being spawned — the caller is identified by the token instead.
    */
   function agentFromArgs(toolName: string, args: any): string | null {
     if (!args || typeof args !== "object") return null;
-    if (typeof args.from === "string") return args.from;
-    if (typeof args.agent_name === "string") return args.agent_name;
-    if (typeof args.creator === "string") return args.creator;
-    // v2.1 Phase 4b.1 v2 (HIGH A fix): revoke_token's caller is revoker_name,
-    // not target_agent_name. The dispatcher needs this to capability-check the
-    // REVOKER, not the victim row being rewritten.
-    if (toolName === "revoke_token" && typeof args.revoker_name === "string") {
-      return args.revoker_name;
-    }
-    // v2.1 Phase 4b.2: same pattern for admin-initiated rotation. Caller is
-    // `rotator_name`, not target_agent_name; dispatcher cap-checks `rotate_others`
-    // on the rotator before the handler runs.
-    if (toolName === "rotate_token_admin" && typeof args.rotator_name === "string") {
-      return args.rotator_name;
-    }
-    if ((toolName === "unregister_agent" || toolName === "register_agent") && typeof args.name === "string") {
-      return args.name;
-    }
-    return null;
+    const keys = schemaCallerKeys(TOOL_SCHEMAS[toolName]);
+    // A field identifies the caller only if the tool's schema declares it.
+    const fromSchema = (f: string): string | null =>
+      keys.has(f) && typeof args[f] === "string" ? args[f] : null;
+
+    // Tool-specific caller fields: for these the CALLER is named by a field
+    // distinct from the TARGET agent the handler rewrites, so they take
+    // precedence over the generic chain below.
+    // v2.1 Phase 4b.1 v2: revoke_token's caller is revoker_name, not the victim.
+    if (toolName === "revoke_token") return fromSchema("revoker_name");
+    // v2.1 Phase 4b.2: admin-initiated rotation — caller is rotator_name.
+    if (toolName === "rotate_token_admin") return fromSchema("rotator_name");
+    if (toolName === "unregister_agent" || toolName === "register_agent") return fromSchema("name");
+
+    // Generic caller fields, each gated by the tool's own schema.
+    return fromSchema("from") ?? fromSchema("agent_name") ?? fromSchema("creator");
   }
 
   async function dispatch(name: string, args: any): Promise<any> {
