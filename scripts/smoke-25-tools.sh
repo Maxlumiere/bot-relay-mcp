@@ -256,6 +256,23 @@ else
   record fail get_messages "content not found in inbox: $RES"
 fi
 
+# 7b. resolve_messages (v2.12.0 pending-vs-history) — resolve the message we
+#     just drained, then assert it appears in status="resolved" (the session-
+#     independent history plane) and resolved_count is EXACTLY 1.
+ENV=$(mcp_call resolve_messages "$(jq -nc --arg b "$B_NAME" --arg id "$MID" '{agent_name:$b, message_ids:[$id]}')" "$B_TOKEN")
+RES=$(extract_result "$ENV")
+if is_ok_envelope "$ENV" && printf '%s' "$RES" | jq -e --arg id "$MID" '.success == true and .resolved_count == 1 and (.resolved_ids | index($id) != null)' >/dev/null; then
+  ENV2=$(mcp_call get_messages "$(jq -nc --arg b "$B_NAME" '{agent_name:$b, status:"resolved", limit:10}')" "$B_TOKEN")
+  RES2=$(extract_result "$ENV2")
+  if printf '%s' "$RES2" | jq -e --arg id "$MID" '.messages // [] | map(.id) | index($id) != null' >/dev/null; then
+    record pass resolve_messages "resolved id=${MID:0:8}… + present in status=resolved"
+  else
+    record fail resolve_messages "resolved but absent from status=resolved: $RES2"
+  fi
+else
+  record fail resolve_messages "resolve_count!=1 or id missing: $RES"
+fi
+
 # 8. broadcast — assert success + delivered_count > 0.
 ENV=$(mcp_call broadcast "$(jq -nc --arg a "$A_NAME" '{from:$a, content:"smoke broadcast"}')" "$A_TOKEN")
 RES=$(extract_result "$ENV")

@@ -154,7 +154,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(14, 15)).not.toThrow();
     // Tether v0.3 PID-handshake registered 15→16 (migrateSchemaToV2_14: agents.host_shell_pids + host_id columns).
     expect(() => applyMigration(15, 16)).not.toThrow();
-    expect(() => applyMigration(16, 17)).toThrow(/no migration registered|16→17/);
+    // v2.12.0 pending-vs-history registered 16→17 (migrateSchemaToV2_15: messages.resolved_at column).
+    expect(() => applyMigration(16, 17)).not.toThrow();
+    expect(() => applyMigration(17, 18)).toThrow(/no migration registered|17→18/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

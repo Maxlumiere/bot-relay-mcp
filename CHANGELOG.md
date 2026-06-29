@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.12.0 — 2026-06-29 — Pending vs. history (a permanent "resolved" plane)
+
+A fresh agent session calling `get_messages(status="pending")` could re-surface messages it had already handled in a **prior** session, as if newly actionable. This is a direct consequence of the intentional **session-scoped** read model (a new terminal re-sees previously-read mail so a handover never drops *unfinished* work, v2.0 final #6): a new `session_id` makes every prior-session-read message look pending again — correct for unfinished work, wrong for already-handled items.
+
+This release adds a session-**independent** "resolved" plane on top of the existing session-scoped read plane. "Resolved" ≠ "read": read is a per-session observation; resolved is a permanent "handled, archive it." The change is purely **additive** — zero behavior change until an agent opts into resolving.
+
+### Added — `resolve_messages` (tool #34) + `ack` on `get_messages`
+
+- New tool **`resolve_messages(agent_name, message_ids[])`** permanently resolves specific messages (partial handling — "I did these, not those"). Recipient-scoped: the dispatcher binds the caller's token to `agent_name`, and the DB layer additionally scopes the `UPDATE` by `to_agent`, so an agent can only resolve its **own** mail. Idempotent — re-resolving, unknown ids, or ids addressed to another agent are no-ops (reflected in the returned counts). Own-mailbox primitive; no extra capability required.
+- **`get_messages` gains `ack` (default `false`).** `get_messages(status="pending", ack=true)` drains **and** resolves the returned set in the **same transaction** as the per-session read-mark, so the next poll — even from a fresh session — won't re-flood. Only the pending drain path resolves; browsing history never does. The drain transaction is promoted to `BEGIN IMMEDIATE` so concurrent acking drains serialize and neither double-counts nor drops.
+
+### Changed — the `pending` filter honors resolution
+
+- `status="pending"` now also requires `resolved_at IS NULL`. This single clause keeps already-handled mail out of the cross-session action queue **permanently**, while genuinely unfinished work still re-surfaces across sessions (handover safety preserved). The same clause is mirrored in `get_messages_summary` so the cheap preview agrees with the mutating drain.
+- New `status` values: **`history`** (alias of `all` — the full durable record) and **`resolved`** (only acked mail). `read`, `all`, `lane`, `since`, and sequence assignment are unchanged.
+
+### Schema
+
+- Migrates **v16 → v17** — one additive `NULL`-default column `messages.resolved_at`. Existing rows stay `NULL` (unresolved) → every currently-pending message stays pending; zero data migration. No backfill: the live re-flood self-heals once agents adopt `ack=true`, and stale mail ages out via the existing 7-day purge.
+
+### Tests
+
+`tests/v2-12-0-pending-vs-history.test.ts` (NEW) — 7 contract groups: the cross-session re-flood regression (ack-drain in S1 ⇒ S2 pending empty; **without** ack S2 still re-sees them, proving the fix is the resolve and not a change to read semantics); resolved-absent-from-pending / present-in-history; `ack` resolves exactly the returned set (read-mark + resolve move together); `resolve_messages` id + recipient scoping; **adversarial authz** (one agent's token cannot resolve another's mail — verified through the real dispatcher); back-compat byte-identical response when `ack=false`; and idempotent, no-double-count resolution. Tool count moves 33 → 34.
+
 ## v2.11.1 — 2026-06-25 — Republish from cleaned sources
 
 No functional or API change. Genericized examples and removed non-public references from docs, changelog, code comments, and tests; `dist` rebuilt from the cleaned sources. Protocol unchanged.
