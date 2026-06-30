@@ -5,7 +5,7 @@
 
 A local-first coordination bus for AI coding agents. Durable inboxes, task queues, and wakeups for Claude Code, Cursor, Cline, Codex-style CLIs, scripts, and webhooks. Two interfaces, one shared SQLite database, zero infrastructure.
 
-**v2.7 — Tether-ready.** 30 MCP tools. Cross-process inbox notifications via a durable outbox + SSE keepalive (any agent's inbox change wakes IDE subscribers across stdio + HTTP processes). Pairs with the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) for live in-editor status. See [CHANGELOG](./CHANGELOG.md) for the v2.7 phase-by-phase arc and the prior v2.1 architectural sweep (explicit `auth_state` machine, managed-agent rotation grace, keyring-based encryption, unified `relay` CLI).
+**v2.12.** 34 MCP tools. The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the phase-by-phase arc, including the v2.1 architectural sweep (auth-state machine, keyring encryption, unified `relay` CLI), the v2.7 cross-process delivery layer, and the v2.12 pending-vs-history resolved plane.
 
 ## What is this?
 
@@ -687,7 +687,7 @@ Full install requirements per platform + manual smoke-test checklists + troubles
 
 ## Layer 2: Managed Agents (v1.10)
 
-Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 30 MCP tools (v2.7), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
+Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 34 MCP tools (v2.12), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
 
 Full integration guide with mental model, auth flow, lifecycle, error patterns, and security notes: [`docs/managed-agent-integration.md`](./docs/managed-agent-integration.md).
 
@@ -728,9 +728,9 @@ Both drivers read the same `relay.db` file format. Full details, performance not
 - **v1.11**: SQLite WASM driver (`sql.js` opt-in) — zero native compilation on Windows/Alpine/Docker/CI
 - **v2.0**: Plug-and-play — channels, smart routing (`post_task_auto`), task leases + heartbeat, lazy health monitor, session-aware reads, busy/DND, `health_check`, webhook retry with CAS, payload size limits, config validation, auto-unregister, dead-agent purge, debug mode. 22 tools.
 - **v2.1**: Architectural completion — explicit `auth_state` machine, managed-agent rotation grace, versioned ciphertext + keyring with online rotation (`relay re-encrypt`), lost-token recovery CLI (`relay recover`), admin-initiated cross-agent rotation (`rotate_token_admin`), structured error_code catalog, protocol_version surface, Phase 4p webhook-secret encryption, Phase 4b.1 v2 revoke/recovery redesign. 25 tools. 14 of 14 Codex architectural findings closed.
-- **v2.7 (current)**: Tether-ready cross-process inbox notifications. Durable `inbox_events` outbox table (schema v11→v12, idempotent migration); HTTP daemon polls + dispatches to `relay://inbox/<agent>` subscribers regardless of which OS process wrote the message. Reaper now skips sessions with active SSE GET streams (`openGetStreams` count). Daemon emits `:keepalive\n\n` SSE comment frames every `RELAY_SSE_KEEPALIVE_MS` (default 20s) so Electron-based clients (VS Code Tether extension) don't idle-disconnect at ~2.5min. External-review-flagged `get_messages` filter-after-mark P1 fix — `since` filter now applies in SQL BEFORE the read-mark mutation. 30 tools. Pairs with Tether VSCode extension v0.1.2+ on the marketplace.
-- **v2.2**: Polish — batch operations, fan-out/fan-in, scheduled messages, metrics endpoint, message ACK, private channels, token scoping, idle-terminal wake.
-- **v2.5**: Federation — cross-machine peering, E2E encryption.
+- **v2.7**: Tether-ready cross-process inbox notifications. Durable `inbox_events` outbox table (schema v11→v12, idempotent migration); HTTP daemon polls + dispatches to `relay://inbox/<agent>` subscribers regardless of which OS process wrote the message. Reaper now skips sessions with active SSE GET streams (`openGetStreams` count). Daemon emits `:keepalive\n\n` SSE comment frames every `RELAY_SSE_KEEPALIVE_MS` (default 20s) so Electron-based clients (VS Code Tether extension) don't idle-disconnect at ~2.5min. External-review-flagged `get_messages` filter-after-mark P1 fix — `since` filter now applies in SQL BEFORE the read-mark mutation. 30 tools. Pairs with Tether VSCode extension v0.1.2+ on the marketplace.
+- **v2.12 (current)**: Hands-free, LLM-agnostic autowake. The multi-agent Tether watch-all wakes Claude and Codex agents on relay mail and auto-submits, no manual polling (dogfood-proven: the relay now coordinates its own development). Plus the pending-vs-history resolved plane (`resolve_messages` + an `ack` flag, so handled mail stops re-flooding fresh sessions; tool #34) and a central schema-scoped auth fix closing a stray-field impersonation hole. 34 tools.
+- **Beyond**: cross-machine federation (hub/edge) so multiple self-hosted relays mesh without a shared namespace, plus an App Server push path for low-latency remote wake.
 
 ## Dashboard
 
