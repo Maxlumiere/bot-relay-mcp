@@ -70,6 +70,16 @@ export interface AgentStateInputs {
    * (was actively working, went quiet) from `waiting` (just idle).
    */
   lastDispatchedAt: number | null;
+  /**
+   * v2.13.0 — ISO timestamp of the most recent POSITIVE liveness confirmation
+   * (same-host PID probe / heartbeat), or `null`. When fresh (within
+   * `aliveWindowMs`) it proves the terminal is OPEN even while idle, so it
+   * suppresses the `last_seen`-age session-timeout `closed` promotion — an
+   * alive-and-idle agent derives `waiting`, not `closed`. A genuine
+   * current-session teardown (`signalReceivedAt`/`unregisteredAt`) still wins,
+   * and cannot coincide: a real SIGINT kills the shell PIDs the probe reads.
+   */
+  lastAlive: string | null;
 }
 
 /**
@@ -90,6 +100,9 @@ export interface AgentStateThresholds {
   sessionTimeoutMs: number;
   /** Recent dispatch window — counts toward "stale" when present. Default 10 min. */
   recentDispatchWindowMs: number;
+  /** v2.13.0 — positive-liveness freshness window. A `lastAlive` within this
+   *  suppresses the session-timeout `closed`. Default 2 min. */
+  aliveWindowMs: number;
 }
 
 export const DEFAULT_THRESHOLDS: AgentStateThresholds = {
@@ -99,6 +112,7 @@ export const DEFAULT_THRESHOLDS: AgentStateThresholds = {
   wasActiveWindowMs: 60 * 60 * 1000,
   sessionTimeoutMs: 30 * 60 * 1000,
   recentDispatchWindowMs: 10 * 60 * 1000,
+  aliveWindowMs: 2 * 60 * 1000,
 };
 
 /**
@@ -132,6 +146,7 @@ export function resolveThresholdsFromEnv(
     wasActiveWindowMs: sec(env.RELAY_STATE_WAS_ACTIVE_WINDOW_SEC, DEFAULT_THRESHOLDS.wasActiveWindowMs),
     sessionTimeoutMs: sec(env.RELAY_SESSION_TIMEOUT_SEC, DEFAULT_THRESHOLDS.sessionTimeoutMs),
     recentDispatchWindowMs: sec(env.RELAY_STATE_RECENT_DISPATCH_SEC, DEFAULT_THRESHOLDS.recentDispatchWindowMs),
+    aliveWindowMs: sec(env.RELAY_AGENT_ALIVE_WINDOW_SEC, DEFAULT_THRESHOLDS.aliveWindowMs),
   };
 }
 
@@ -173,18 +188,27 @@ export function deriveDashboardState(
     unregisteredAt,
     pendingCount,
     lastDispatchedAt,
+    lastAlive,
   } = inputs;
 
   const lastSeenMs = parseIsoOrNull(lastSeen);
+  const lastAliveMs = parseIsoOrNull(lastAlive);
+  // v2.13.0 — a fresh positive-liveness confirmation means the terminal is
+  // open right now. It does NOT override an intentional teardown signal
+  // (those win below), but it DOES suppress the last_seen-age session-timeout
+  // `closed` so an alive-and-idle agent reads `waiting`/`active`, not `closed`.
+  const aliveFresh =
+    lastAliveMs !== null && now - lastAliveMs >= 0 && now - lastAliveMs < thresholds.aliveWindowMs;
 
-  // 1. closed — top precedence.
+  // 1. closed — top precedence (intentional teardown wins over liveness).
   if (signalReceivedAt !== null && Number.isFinite(signalReceivedAt) && signalReceivedAt > 0) {
     return "closed";
   }
   if (unregisteredAt !== null && Number.isFinite(unregisteredAt) && unregisteredAt > 0) {
     return "closed";
   }
-  if (lastSeenMs !== null && now - lastSeenMs >= thresholds.sessionTimeoutMs) {
+  // Session-timeout closed — gated by positive liveness (the gate-5 fix).
+  if (!aliveFresh && lastSeenMs !== null && now - lastSeenMs >= thresholds.sessionTimeoutMs) {
     return "closed";
   }
 

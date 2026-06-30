@@ -187,7 +187,15 @@ RES=$(extract_result "$ENV")
 if is_ok_envelope "$ENV" && printf '%s' "$RES" | jq -e --arg a "$A_NAME" --arg b "$B_NAME" --arg m "$MGR_NAME" \
     '(.agents // []) | map(.name) | (index($a) != null) and (index($b) != null) and (index($m) != null)' >/dev/null; then
   COUNT=$(printf '%s' "$RES" | jq '.agents | length')
-  record pass discover_agents "$COUNT agents visible, all smoke agents present"
+  # v2.13.0 — assert the positive-liveness surface is present + well-typed on
+  # every agent row (alive is a boolean, last_alive is string|null). Smoke
+  # agents register over MCP without host_shell_pids, so alive is expected
+  # false here; the contract checked is that the FIELDS exist + are typed.
+  if printf '%s' "$RES" | jq -e '(.agents // []) | all((.alive|type)=="boolean" and ((.last_alive==null) or ((.last_alive|type)=="string")))' >/dev/null; then
+    record pass discover_agents "$COUNT agents visible, all smoke agents present + liveness fields well-typed"
+  else
+    record fail discover_agents "liveness surface (alive/last_alive) missing or mistyped: $RES"
+  fi
 else
   record fail discover_agents "expected smokes missing: $RES"
 fi

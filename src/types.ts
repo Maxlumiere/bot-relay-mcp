@@ -816,6 +816,8 @@ export interface AgentRecord {
   host_shell_pids?: string | null;
   /** Tether v0.3 PID-handshake (schema v16): stable OS machine GUID, host-scopes the PID match. NULL on legacy rows. Immutable after first registration. */
   host_id?: string | null;
+  /** v2.13.0 (schema v18): ISO timestamp of the most recent POSITIVE liveness confirmation (same-host PID probe / future heartbeat). NULL = no liveness signal → age-based derivation. Distinct from last_seen (activity). */
+  last_alive?: string | null;
 }
 
 export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "token_hash" | "session_id" | "agent_status" | "description" | "host_shell_pids" | "host_id"> {
@@ -843,6 +845,20 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
   host_shell_pids: number[] | null;
   /** Tether v0.3 PID-handshake: stable OS machine GUID that host-scopes the PID match (NULL if not reported). */
   host_id: string | null;
+  /**
+   * v2.13.0 — presence liveness. ISO timestamp of the most
+   * recent positive liveness confirmation (a same-host PID probe found a live
+   * shell in host_shell_pids). NULL = no signal. Distinct from last_seen
+   * (activity): last_alive proves the terminal is OPEN even while idle.
+   */
+  last_alive: string | null;
+  /**
+   * v2.13.0 — the trustworthy "awake right now?" answer. True when last_alive
+   * is fresh (within RELAY_AGENT_ALIVE_WINDOW_SEC). Lets an orchestrator
+   * distinguish alive-and-idle from offline/closed without re-deriving from
+   * timestamps.
+   */
+  alive: boolean;
 }
 
 export interface MessageRecord {

@@ -1,5 +1,33 @@
 # Changelog
 
+## v2.13.0 — 2026-06-30 — Presence liveness (alive-and-idle vs. closed)
+
+The relay couldn't reliably tell an **alive-but-idle** agent from a **closed** one. `last_seen` only advances on activity (observation isn't liveness, v1.3), so an agent sitting open and waiting aged out to `stale → offline → closed`/`abandoned` — and orchestrators misread live idle agents as dead. This adds a **positive** liveness signal so "is this agent awake and waiting?" has a trustworthy answer.
+
+### Added — same-host PID-liveness probe + `last_alive`
+
+- New additive column **`agents.last_alive`** (ISO timestamp), distinct from `last_seen` (activity) and `last_dispatched_at`. It records the most recent **positive** liveness confirmation.
+- On a presence read (`discover_agents`, `get_standup`, `health_check`), the relay lazily probes the agent's recorded `host_shell_pids` chain with a `process.kill(pid, 0)` signal-0 check **(same-host only)**. If any shell PID is alive, the terminal is open — even while idle — and `last_alive` is stamped. The probe is host-scoped by the OS machine GUID (`host_id`): a PID is only probed when the agent shares the relay's host, so a PID can never false-match an unrelated process on another machine. `EPERM` (cross-user) counts as alive; `ESRCH` as dead. The probe is gated by a short cache so rapid successive reads don't re-probe.
+- New module computing this host's machine GUID with the exact OS source the SessionStart hook + extension use (macOS `IOPlatformUUID` / Linux `/etc/machine-id` / Windows `MachineGuid`), so host comparison is byte-identical.
+
+### Changed — both presence derivations honor liveness
+
+- `deriveAgentStatus` (the `discover_agents`/`health_check` surface) and `deriveDashboardState` (the dashboard) now take the liveness signal: a **fresh** `last_alive` overrides the age-based `offline`/`abandoned` promotions and a **stale stored `closed`** from a prior session, so an alive-and-idle agent reads `idle`/`waiting` instead of `closed`. A genuine current-session teardown (SIGINT/SIGTERM/explicit unregister) still wins — and can't conflict, since a real teardown kills the shell PIDs the probe reads.
+- New query surface: `discover_agents` + `get_standup` agents carry **`last_alive`** (ISO) and **`alive`** (boolean — the trustworthy "awake right now?"); `health_check` adds **`agent_count_alive`**.
+- Freshness window tunable via `RELAY_AGENT_ALIVE_WINDOW_SEC` (default 120s).
+
+### Schema
+
+- Migrates **v17 → v18** — one additive `NULL`-default column `agents.last_alive`. Zero data migration: with no liveness signal an agent derives exactly as before (pure age-based), so behavior is byte-identical until a probe populates it.
+
+### Notes
+
+- This ships the relay-side foundation. A Tether-extension liveness **heartbeat** (cross-host + relaunch-gap coverage, with its own auth model) is a planned follow-on; the relay-side PID probe covers same-host fleets today.
+
+### Tests
+
+`tests/v2-13-0-presence-liveness.test.ts` (NEW) + `tests/liveness`-style coverage: the headline regression (idle agent with a live same-host PID reads `alive`/`idle`, not `closed`/`offline`, even with a stale stored `closed`); dead-PID → no liveness → age-based `closed`; cross-host fallback (a locally-live PID under a different `host_id` is **not** probed — no false-alive); `process.kill` errno handling (success/`EPERM` alive, `ESRCH` dead); back-compat (no signal → byte-identical age-based derivation); `deriveDashboardState` honoring/ignoring `last_alive`; and the machine-GUID parsers.
+
 ## v2.12.0 — 2026-06-29 — Pending vs. history (a permanent "resolved" plane)
 
 A fresh agent session calling `get_messages(status="pending")` could re-surface messages it had already handled in a **prior** session, as if newly actionable. This is a direct consequence of the intentional **session-scoped** read model (a new terminal re-sees previously-read mail so a handover never drops *unfinished* work, v2.0 final #6): a new `session_id` makes every prior-session-read message look pending again — correct for unfinished work, wrong for already-handled items.
