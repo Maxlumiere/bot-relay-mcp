@@ -7,7 +7,7 @@
  * v2.14.0 — reserved-name / impersonation protection (Part 1, the security
  * fast-track of the transient-identity governance).
  *
- * Background: gate 6 (v2.12.0 schemaCallerKeys) already made `from`/actor
+ * Background: v2.12.0 (schemaCallerKeys) already made `from`/actor
  * fields authenticate against the caller's token, so impersonating a
  * token-bearing agent via send_message is already blocked. This gate closes
  * the REGISTER side + three narrow holes:
@@ -48,7 +48,7 @@ const {
   getAgents,
 } = await import("../src/db.js");
 const { createServer } = await import("../src/server.js");
-const { isReservedName, getReservedNames, RELAY_SENTINEL_NAMES } = await import("../src/reserved-names.js");
+const { isReservedName, getReservedNames, canonicalAgentName, RELAY_SENTINEL_NAMES } = await import("../src/reserved-names.js");
 
 function cleanup() {
   closeDb();
@@ -85,6 +85,27 @@ describe("v2.14.0 — reserved-name set", () => {
     expect(set.has("alpha")).toBe(true);
     expect(set.has("beta")).toBe(true); // trimmed + lowercased
     expect(set.has("")).toBe(false);
+  });
+});
+
+// --- normalization: the canonical identity folds whitespace + unicode ---
+
+describe("v2.14.0 — canonical identity (anti-confusable)", () => {
+  it("canonicalAgentName folds trim + case + NFC", () => {
+    expect(canonicalAgentName("system ")).toBe("system");
+    expect(canonicalAgentName(" System\t")).toBe("system");
+    // NFD (e + combining acute) and NFC (é) fold to the same canonical form.
+    expect(canonicalAgentName("café")).toBe(canonicalAgentName("café"));
+  });
+  it("isReservedName matches whitespace variants of a reserved name", () => {
+    expect(isReservedName("system ")).toBe(true); // the reproduced bypass
+    expect(isReservedName(" system")).toBe(true);
+    expect(isReservedName("\tSYSTEM\n")).toBe(true);
+    expect(isReservedName("test-persona ")).toBe(true);
+  });
+  it("isReservedName matches NFD vs NFC of a reserved name (injected env)", () => {
+    const env = { RELAY_RESERVED_NAMES: "café" }; // NFC in the config
+    expect(isReservedName("café", env)).toBe(true); // NFD candidate → matches
   });
 });
 
@@ -127,6 +148,35 @@ describe("v2.14.0 — (A/C) reserved names can't be self-registered", () => {
       await server.close();
     }
   });
+
+  // The reproduced normalization-bypass class: every visual variant of a
+  // reserved name (whitespace padding, embedded tab, all-whitespace, unicode
+  // confusable) must be rejected before it can register + mint a token. Caught
+  // either by the canonical reserved-check (AUTH_FAILED) or the ASCII schema
+  // pattern at the door (VALIDATION) — assert rejection + that NO row landed.
+  const BYPASS_NAMES = [
+    "system ", // trailing space (the exact reproduced exploit)
+    " system", // leading space
+    "\tsystem", // embedded tab
+    "SYSTEM", // case (already covered, pinned here)
+    "   ", // all-whitespace
+    "test-persona ", // env-reserved + trailing space
+    "ѕystem", // Cyrillic 'ѕ' confusable of 'system'
+  ];
+  it.each(BYPASS_NAMES)("rejects normalization-bypass register name %j (no row, no token)", async (name) => {
+    const { client, server } = await connectClient();
+    try {
+      const res: any = await client.callTool({ name: "register_agent", arguments: { name, role: "x", capabilities: [] } });
+      expect(res.isError).toBe(true);
+      const b = body(res);
+      expect(b.success).not.toBe(true);
+      expect(b.agent_token === undefined || b.agent_token === null).toBe(true); // no usable credential issued
+      // And nothing was persisted under the bypass name.
+      expect(getAgents().some((a) => a.name === name)).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 // --- Provisioning path: relay mint-token provisions a reserved name ---
@@ -158,7 +208,7 @@ describe("v2.14.0 — operator provisioning (relay mint-token)", () => {
   });
 });
 
-// --- send-from impersonation (pin gate-6 + reserved) ---
+// --- send-from impersonation (pin v2.12.0 + reserved) ---
 
 describe("v2.14.0 — send-from requires the actor's token", () => {
   it("(pin) sending as an active agent WITHOUT its token is rejected", async () => {

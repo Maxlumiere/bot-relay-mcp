@@ -36,33 +36,52 @@
  */
 export const RELAY_SENTINEL_NAMES: readonly string[] = ["system"];
 
-/** Parse the operator's RELAY_RESERVED_NAMES env (comma-separated) → lowercased names. */
+/**
+ * v2.14.0 — the ONE canonical identity form, applied to BOTH the reserved-set
+ * entries AND every candidate name before comparison. Without a shared
+ * canonicalizer a visual variant of a reserved name (trailing/leading/embedded
+ * whitespace, NFD vs NFC unicode) could slip past the guard and register as a
+ * look-alike of a sentinel/persona (a security review reproduced exactly this
+ * with a trailing space). NFC folds unicode equivalents; trim removes whitespace
+ * padding; lowercase folds case. The schema's ASCII pattern is the primary
+ * door; this is defense in depth so the reserved comparison is robust even if
+ * a non-ASCII name reached it via another path.
+ */
+export function canonicalAgentName(name: string): string {
+  return name.normalize("NFC").trim().toLowerCase();
+}
+
+/** Parse the operator's RELAY_RESERVED_NAMES env (comma-separated) → canonical names. */
 function envReservedNames(env: Record<string, string | undefined> = process.env): string[] {
   const raw = env.RELAY_RESERVED_NAMES;
   if (!raw) return [];
   return raw
     .split(",")
-    .map((s) => s.trim().toLowerCase())
+    .map((s) => canonicalAgentName(s))
     .filter((s) => s.length > 0);
 }
 
 /**
- * The full reserved-name set (lowercased): hardcoded relay sentinels ∪ the
+ * The full reserved-name set (canonical form): hardcoded relay sentinels ∪ the
  * operator's RELAY_RESERVED_NAMES. Computed per call so an env change (or a
  * test override) takes effect without a restart — the set is tiny.
  */
 export function getReservedNames(env: Record<string, string | undefined> = process.env): Set<string> {
   const set = new Set<string>();
-  for (const n of RELAY_SENTINEL_NAMES) set.add(n.toLowerCase());
+  for (const n of RELAY_SENTINEL_NAMES) set.add(canonicalAgentName(n));
   for (const n of envReservedNames(env)) set.add(n);
   return set;
 }
 
-/** Is `name` reserved (case-insensitive)? Empty/null → false. */
+/**
+ * Is `name` reserved? Compared in canonical form (NFC + trim + lowercase) on
+ * BOTH sides, so any visual variant of a reserved name resolves to it and is
+ * rejected. Empty/null → false.
+ */
 export function isReservedName(
   name: string | null | undefined,
   env: Record<string, string | undefined> = process.env,
 ): boolean {
   if (!name) return false;
-  return getReservedNames(env).has(name.toLowerCase());
+  return getReservedNames(env).has(canonicalAgentName(name));
 }

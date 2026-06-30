@@ -57,8 +57,21 @@ const TerminalTitleRefField = z
       "Mutable on re-register (updates to reflect the current session's title)."
   );
 
+// v2.14.0 — conservative ASCII agent-name policy, identical to the one
+// spawn_agent (SPAWN_IDENT_PATTERN) and token-store already enforce. Rejecting
+// whitespace + non-ASCII at the door is a security control, not cosmetics: it
+// blocks reserved-name confusables/whitespace variants (e.g. "system ",
+// "\tsystem", a Cyrillic look-alike) from ever registering, so they can't
+// bypass the reserved-name guard. Every real agent name is already ASCII.
+export const AGENT_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
+
 export const RegisterAgentSchema = z.object({
-  name: z.string().min(1).max(64).describe("Human-readable agent name"),
+  name: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(AGENT_NAME_PATTERN, "name must match [A-Za-z0-9_.-] (1-64 chars; no spaces, no unicode — blocks reserved-name confusables)")
+    .describe("Human-readable agent name — [A-Za-z0-9_.-]{1,64} (ASCII only)"),
   role: z.string().min(1).max(64).describe("Agent role (e.g. orchestrator, builder, ops)"),
   capabilities: z.array(z.string()).describe("List of capabilities"),
   description: z.string().max(512).optional().describe("v2.0: optional human-readable description (max 512 chars). Shown in discover_agents + dashboard. Mutable on re-register — if omitted, previous value preserved."),
