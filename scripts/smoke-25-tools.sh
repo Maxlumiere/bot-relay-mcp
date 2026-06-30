@@ -181,6 +181,18 @@ ADMIN_TOKEN=$(extract_result "$ENV" | jq -r '.agent_token // empty')
 ENV=$(mcp_call register_agent "$(jq -nc --arg n "$VICTIM_NAME" '{name:$n, role:"smoke", capabilities:["broadcast"]}')")
 _=$(extract_result "$ENV" | jq -r '.agent_token // empty')
 
+# 1b. reserved-name protection (v2.14.0) — bootstrap-claiming the 'system'
+#     sentinel must be REJECTED (it can only be operator-provisioned). Assert
+#     the call errored / auth-failed and no token was issued.
+ENV=$(mcp_call register_agent "$(jq -nc '{name:"system", role:"smoke", capabilities:[]}')")
+RES=$(extract_result "$ENV")
+RESERVED_TOKEN=$(printf '%s' "$RES" | jq -r '.agent_token // empty')
+if [ -z "$RESERVED_TOKEN" ] && printf '%s' "$RES" | jq -e '.success != true and (.auth_error == true or (.error // "" | test("reserved";"i")))' >/dev/null; then
+  record pass register_agent[reserved] "bootstrap-claim of reserved 'system' rejected"
+else
+  record fail register_agent[reserved] "reserved 'system' was NOT rejected: $RES"
+fi
+
 # 2. discover_agents — assert smoke-a + smoke-b + managed are all visible.
 ENV=$(mcp_call discover_agents "{}" "$A_TOKEN")
 RES=$(extract_result "$ENV")

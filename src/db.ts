@@ -8,6 +8,7 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import { getOwnHostId, isAgentProcessAlive } from "./liveness.js";
+import { isReservedName } from "./reserved-names.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -1570,7 +1571,7 @@ function migrateSchemaToV2_16(db: CompatDatabase): void {
   }
 }
 
-function purgeOldRecords(db: CompatDatabase): void {
+export function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
@@ -1601,6 +1602,11 @@ function purgeOldRecords(db: CompatDatabase): void {
     "SELECT name FROM agents WHERE last_seen < ?"
   ).all(thirtyDaysAgo) as Array<{ name: string }>;
   for (const a of staleAgents) {
+    // v2.14.0 — reserved names are NEVER auto-purged. Their row + token_hash IS
+    // their impersonation protection (re-register / send-from requires the
+    // token); purging would delete the row and reopen the bootstrap-claim
+    // window on the freed name. Operators prune reserved rows explicitly.
+    if (isReservedName(a.name)) continue;
     // v2.1 Phase 7q: sanctioned teardown helper.
     teardownAgent(a.name, "stale_purge");
   }

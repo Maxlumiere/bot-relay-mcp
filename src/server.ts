@@ -69,6 +69,7 @@ import { currentContext, requestContext } from "./request-context.js";
 import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
 import { ZodError } from "zod";
 import { authenticateAgent, verifyToken, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive } from "./auth.js";
+import { isReservedName } from "./reserved-names.js";
 import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleResolveMessages, handleBroadcast, handlePostToCapability } from "./tools/messaging.js";
 import { handlePostTask, handlePostTaskAuto, handleUpdateTask, handleGetTasks, handleGetTask, handleRegisterTaskSchema, handleTaskSchemaGet } from "./tools/tasks.js";
 import { handleRegisterWebhook, handleListWebhooks, handleDeleteWebhook } from "./tools/webhooks.js";
@@ -1084,7 +1085,22 @@ export function createServer(): Server {
       const claimedName = typeof args?.name === "string" ? args.name : null;
       if (!claimedName) return null; // let zod produce the validation error
       const existing = getAgentAuthData(claimedName);
-      if (!existing) return null; // first registration — bootstrap path
+      if (!existing) {
+        // v2.14.0 — reserved-name protection. A reserved persona/sentinel name
+        // cannot be CLAIMED via the auth-free bootstrap path (that's how a
+        // transient could grab a persona's identity + mint its token). It must
+        // be provisioned by an operator first (filesystem-authorized), after
+        // which the normal token requirement on re-register protects it.
+        if (isReservedName(claimedName)) {
+          return authError(
+            `"${claimedName}" is a reserved name and cannot be self-registered. ` +
+            `An operator must provision it first via 'relay mint-token ${claimedName}', ` +
+            `then register with the minted token (set RELAY_AGENT_TOKEN).`,
+            ERROR_CODES.AUTH_FAILED
+          );
+        }
+        return null; // first registration — bootstrap path
+      }
       const state = (existing.auth_state ?? "active") as
         | "active"
         | "legacy_bootstrap"
@@ -1182,6 +1198,21 @@ export function createServer(): Server {
         rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
       });
       if (!result.ok) return authError(result.reason!);
+      // v2.14.0 — impersonation tighten: an explicit caller field (from/
+      // agent_name/creator) is an ACTOR claim. The legacy-grace path
+      // authenticates a token-less legacy_bootstrap row WITHOUT proving
+      // identity, so under RELAY_ALLOW_LEGACY a caller could stamp
+      // from=<legacy persona> and speak as it. Grace is for the no-actor
+      // bootstrap path only — it must NOT authenticate an actor identity.
+      // The legacy agent must mint a token (re-register) before using
+      // actor-stamping tools.
+      if (result.legacy) {
+        return authError(
+          `Agent "${explicitCaller}" has no token (legacy pre-v1.7 row). Legacy grace cannot authenticate an actor identity — ` +
+          `register a token (re-register, or 'relay mint-token ${explicitCaller}') before using actor-stamping tools.`,
+          ERROR_CODES.AUTH_FAILED
+        );
+      }
       callerName = explicitCaller;
       callerCaps = JSON.parse(auth.capabilities) as string[];
     } else {

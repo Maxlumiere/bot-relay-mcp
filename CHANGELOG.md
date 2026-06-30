@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.14.0 — 2026-06-30 — Reserved-name / impersonation protection
+
+The local daemon is intentionally auth-free for zero-config onboarding. An agent that already holds a token is protected from impersonation by the token↔identity binding (v2.12.0: a `from`/actor field authenticates only against the caller's own token — so you cannot `send_message(from=someone-else)` without their token). The remaining hole was the **register side**: `register_agent`'s auth-free bootstrap path let any caller **claim** a persona/sentinel name that had no live row and mint its token — becoming that identity. This closes it.
+
+### Added — reserved names
+
+- A **reserved-name set** that cannot be self-registered via the bootstrap path. It is the relay's own sentinels (hardcoded: `system`, the sender sentinel `send_message` uses for relay-authored messages) **plus** an operator-configured list via the **`RELAY_RESERVED_NAMES`** env var (comma-separated). Matching is case-insensitive. Private persona names live only in the operator's env — never in the codebase.
+- `register_agent` now **rejects** a bootstrap (no existing row) attempt to claim a reserved name, with a clear error pointing at the provisioning path. A reserved name must be **provisioned by an operator** first via `relay mint-token <name>` (filesystem-authorized, bypasses the dispatcher); after that, the normal token requirement on re-register / send-`from` protects it.
+- Reserved names are **exempt from the 30-day dead-agent purge** — their row + token hash is their protection, so they never age out and reopen the claim window.
+
+### Changed — legacy grace can't authenticate an actor
+
+- Under `RELAY_ALLOW_LEGACY=1`, the legacy-bootstrap path authenticates a token-less pre-v1.7 row without proving identity. It is now **rejected on actor-stamping tools** (`send_message`, `broadcast`, `post_*`, etc.) — grace remains only for the no-actor bootstrap path, so a legacy `from` can never impersonate. A legacy agent mints a token (re-register / `relay mint-token`) before using actor tools.
+
+### Notes
+
+- This is **Part 1** (the security fast-track) of the transient-identity governance. The transient onboarding model (auto-named `tmp-*` agents that may send *to* a persona but never *as* one) and the `rename`/`promote` tool are the queued relay feature — a documented follow-on, not in this release.
+- No schema change; no new MCP tool.
+
+### Tests
+
+`tests/v2-14-0-reserved-name-protection.test.ts` (NEW): reserved-set resolution (hardcoded `system` + env, case-insensitive); bootstrap-registering `system` or an env-reserved name → rejected (and no row recorded) while an ordinary name still self-registers; the operator provisioning path (`mint-token` → the persona acts with its token); send-`from` requires the actor's token (pinning the v2.12.0 protection + the provisioned-persona case); the legacy-grace actor rejection; and the purge exemption (a stale reserved name survives, a stale ordinary agent is purged).
+
 ## v2.13.0 — 2026-06-30 — Presence liveness (alive-and-idle vs. closed)
 
 The relay couldn't reliably tell an **alive-but-idle** agent from a **closed** one. `last_seen` only advances on activity (observation isn't liveness, v1.3), so an agent sitting open and waiting aged out to `stale → offline → closed`/`abandoned` — and orchestrators misread live idle agents as dead. This adds a **positive** liveness signal so "is this agent awake and waiting?" has a trustworthy answer.
