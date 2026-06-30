@@ -52,6 +52,7 @@ const {
   setAgentStatus,
   closeAgentSession,
   getAgentSessionId,
+  deriveAgentStatus,
   _resetLivenessProbeCacheForTests,
   _getLivenessProbeCountForTests,
 } = await import("../src/db.js");
@@ -268,6 +269,77 @@ describe("v2.13.0 — (5c) agent matcher extensibility", () => {
     expect(resolveAgentPattern({ RELAY_AGENT_PROCESS_PATTERN: "(" }).source).toBe(
       DEFAULT_AGENT_PATTERN.source,
     );
+  });
+});
+
+// --- 5d. Resume: a re-registered agent comes back available ---
+
+describe("v2.13.0 — (5d) re-register resets terminal states (resume)", () => {
+  it("an OFFLINE agent that re-registers resumes as idle (the resume-stuck-offline fix)", () => {
+    const { agent } = registerAgent("resumer", "researcher", [], { host_id: OWN_HOST });
+    setAgentStatus("resumer", "offline"); // went offline
+    expect(findAgent("resumer").agent_status).toBe("offline");
+
+    registerAgent("resumer", "researcher", []); // relaunch / re-register with token
+    expect(findAgent("resumer").agent_status).toBe("idle"); // resumed, not stuck offline
+  });
+
+  it("a CLOSED/abandoned/stale agent likewise resumes idle on re-register", () => {
+    for (const terminal of ["closed", "abandoned", "stale"]) {
+      registerAgent("res2", "r", [], { host_id: OWN_HOST });
+      getDb().prepare("UPDATE agents SET agent_status = ? WHERE name = ?").run(terminal, "res2");
+      registerAgent("res2", "r", []);
+      expect(findAgent("res2").agent_status, `terminal=${terminal}`).toBe("idle");
+      closeDb();
+      _resetOwnHostIdForTests(OWN_HOST);
+    }
+  });
+
+  it("an ACTIVE declared state (working) is PRESERVED across re-register", () => {
+    registerAgent("worker", "builder", [], { host_id: OWN_HOST });
+    setAgentStatus("worker", "working");
+    registerAgent("worker", "builder", []); // re-register
+    expect(findAgent("worker").agent_status).toBe("working"); // current intent preserved
+  });
+});
+
+// --- 5e. CANONICAL PRECEDENCE TABLE (single source of truth) ---
+
+describe("v2.13.0 — (5e) deriveAgentStatus canonical precedence table", () => {
+  const ABANDON_MIN = 7 * 24 * 60; // default RELAY_AGENT_ABANDON_DAYS=7
+  const iso = (minAgo: number) => new Date(Date.now() - minAgo * 60_000).toISOString();
+  const FRESH = () => iso(0.001); // ~now → within the 120s alive window
+  // [stored, ageMinutes, aliveFresh] -> expected agent_status
+  const CELLS: Array<[string, number, boolean, string]> = [
+    // No liveness — pure age + stored chain (pre-v2.13 behavior).
+    ["idle", 0, false, "idle"],
+    ["idle", 10, false, "stale"],
+    ["idle", 45, false, "offline"],
+    ["idle", ABANDON_MIN + 1, false, "abandoned"],
+    ["working", 0, false, "working"],
+    ["working", 45, false, "offline"],
+    ["stale", 10, false, "stale"],
+    ["stale", 45, false, "offline"],
+    ["closed", 0, false, "closed"],
+    ["closed", 45, false, "closed"],
+    ["closed", ABANDON_MIN + 1, false, "abandoned"],
+    ["abandoned", 0, false, "abandoned"],
+    // Liveness overrides AGE-derived states + stale 'closed'.
+    ["idle", 45, true, "idle"],
+    ["idle", ABANDON_MIN + 1, true, "idle"],
+    ["working", 45, true, "working"],
+    ["closed", 45, true, "idle"],
+    ["abandoned", 45, true, "idle"],
+    ["stale", 45, true, "idle"],
+    // Explicit current-session 'offline' DECLARATION — liveness never overrides.
+    ["offline", 0, false, "offline"],
+    ["offline", 45, false, "offline"],
+    ["offline", 45, true, "offline"],
+    ["offline", ABANDON_MIN + 1, true, "abandoned"], // old declaration → dashboard hygiene
+  ];
+  it.each(CELLS)("stored=%s age=%dmin aliveFresh=%s → %s", (stored, ageMin, aliveFresh, expected) => {
+    const got = deriveAgentStatus(stored, iso(ageMin), aliveFresh ? FRESH() : null);
+    expect(got).toBe(expected);
   });
 });
 

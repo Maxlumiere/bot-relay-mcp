@@ -148,13 +148,58 @@ function normalizeStoredAgentStatus(raw: string | null | undefined): string {
 }
 
 /**
- * v2.1.3 (I6) — derive the observed agent_status from the stored declared
- * state + last_seen age. Active declared states (idle/working/blocked/
- * waiting_user) get overridden to 'stale' after 5 min and 'offline' after
- * 30 min of silence. Declared 'offline' is always offline. 'stale' (rare —
- * only via direct DB write) upgrades to 'offline' at the 30-min threshold.
+ * v2.13.0 — TERMINAL lifecycle states. An agent in one of these "was gone"
+ * states is NOT available. They are the states a re-registration RESETS
+ * (re-register = a fresh session = the agent is back), and the states the
+ * `alive` boolean treats as not-awake.
  */
-function deriveAgentStatus(
+const TERMINAL_AGENT_STATES = new Set(["offline", "closed", "abandoned", "stale"]);
+/** Active declared states — the agent is present + available. */
+const ACTIVE_AGENT_STATES = new Set(["idle", "working", "blocked", "waiting_user"]);
+
+/**
+ * v2.13.0 — the stored agent_status a successful EXISTING-ROW re-registration
+ * should carry forward. A re-register starts a fresh session, so a TERMINAL
+ * state (offline/closed/abandoned/stale) from a prior session is reset to
+ * 'idle' — the agent is back and available (fixes the resume-stuck-offline
+ * bug, incl. the next valid registration after a force token rotation). Active
+ * declared states (idle/working/blocked/waiting_user) reflect current intent
+ * and are PRESERVED across the rotation (the agent re-declares via set_status
+ * if its mode changed). This is the single discriminator that lets
+ * deriveAgentStatus treat a stored 'offline' as an unambiguous CURRENT-session
+ * declaration.
+ */
+function statusAfterReregister(storedRaw: string | null | undefined): string {
+  const s = normalizeStoredAgentStatus(storedRaw);
+  if (ACTIVE_AGENT_STATES.has(s)) return s;
+  return "idle"; // terminal states + anything unknown → fresh idle
+}
+
+/**
+ * Derive the observed agent_status. CANONICAL PRECEDENCE (single source of
+ * truth; the table-driven test in tests/v2-13-0-presence-liveness.test.ts
+ * exercises every cell). Inputs: the STORED declared state (which a re-register
+ * has already normalized — `statusAfterReregister` resets a prior-session
+ * terminal state to idle, so a stored 'offline'/'closed' here means a
+ * CURRENT-session declaration, never carried-over staleness), the last_seen
+ * age, and the positive-liveness signal (`lastAlive`).
+ *
+ * Precedence, top wins:
+ *   1. stored 'offline' (current-session declaration: set_status / force-rotation)
+ *      → 'offline'  [→ 'abandoned' only past the abandon window, dashboard hygiene].
+ *      Liveness does NOT override an explicit "unavailable" — a live process
+ *      doesn't un-declare intent.
+ *   2. fresh liveness (process confirmed alive now) → the declared ACTIVE state
+ *      (idle default). Overrides age-derived stale/offline/abandoned AND a
+ *      current-session 'closed' that somehow still has a live anchor.
+ *   3. no liveness → the v2.1.3 age + stored-terminal chain (unchanged):
+ *      abandoned > stored 'abandoned' > stored 'closed' > age-offline >
+ *      stored 'stale' > age-stale > active.
+ *
+ * With no `lastAlive` (NULL), rules 1+3 are exactly the pre-v2.13 behavior —
+ * byte-identical for every agent without a liveness signal.
+ */
+export function deriveAgentStatus(
   storedRaw: string | null | undefined,
   lastSeen: string,
   lastAlive: string | null | undefined = null,
@@ -162,55 +207,26 @@ function deriveAgentStatus(
   const stored = normalizeStoredAgentStatus(storedRaw);
   const minutes = (Date.now() - new Date(lastSeen).getTime()) / 60_000;
   const abandonMinutes = getAgentAbandonMinutes();
+  const aliveFresh = isAliveFresh(lastAlive);
 
-  // v2.13.0 — positive liveness wins over AGE. A fresh `last_alive` means the
-  // agent's own process is confirmed alive RIGHT NOW (same-host probe), so it's
-  // open even though `last_seen` is stale from idle-waiting. It overrides the
-  // age-based offline/abandoned promotions AND a stale stored 'closed' left by
-  // a PRIOR session (a real close clears the anchor, so a fresh `last_alive`
-  // with stored 'closed' means the agent re-launched and is alive). It surfaces
-  // the declared active state (idle default).
-  //
-  // EXCEPTION — an explicit stored 'offline' is a DECLARATION, not an aged-into
-  // state: set_status('offline') / force-rotation / SIGINT-offline deliberately
-  // say "unavailable." Liveness does NOT override that — a live process doesn't
-  // un-declare intent. Stored 'offline' falls through to the chain below
-  // (→ 'offline', or 'abandoned' past the abandon window), exactly as pre-v2.13.
-  if (isAliveFresh(lastAlive) && stored !== "offline") {
-    if (
-      stored === "working" ||
-      stored === "blocked" ||
-      stored === "waiting_user" ||
-      stored === "idle"
-    ) {
-      return stored;
-    }
-    return "idle";
+  // 1. Explicit current-session 'offline' DECLARATION — wins over liveness.
+  if (stored === "offline") {
+    return minutes >= abandonMinutes ? "abandoned" : "offline";
   }
 
-  // v2.2.2 B3: abandoned-state promotion. Offline / closed for
-  // >=7-days (default) agents surface as "abandoned" so dashboards
-  // can hide them by default.
+  // 2. Positive liveness — the agent's process is confirmed up.
+  if (aliveFresh) {
+    return ACTIVE_AGENT_STATES.has(stored) ? (stored as AgentWithStatus["agent_status"]) : "idle";
+  }
+
+  // 3. No liveness → age + stored-terminal chain (v2.1.3 behavior, unchanged).
   if (minutes >= abandonMinutes) return "abandoned";
   if (stored === "abandoned") return "abandoned";
-  // v2.2.2 BUG2: stored 'closed' state (set by SIGINT handler) wins
-  // over age-based promotions below the abandoned threshold.
   if (stored === "closed") return "closed";
-  if (stored === "offline") return "offline";
   if (minutes >= AGENT_STATUS_OFFLINE_MINUTES) return "offline";
   if (stored === "stale") return minutes >= AGENT_STATUS_OFFLINE_MINUTES ? "offline" : "stale";
   if (minutes >= AGENT_STATUS_STALE_MINUTES) return "stale";
-
-  // Active declared state. Validate against the known set; fall back to
-  // 'idle' for unrecognized legacy or drift values.
-  if (
-    stored === "idle" ||
-    stored === "working" ||
-    stored === "blocked" ||
-    stored === "waiting_user"
-  ) {
-    return stored;
-  }
+  if (ACTIVE_AGENT_STATES.has(stored)) return stored as AgentWithStatus["agent_status"];
   return "idle";
 }
 
@@ -248,12 +264,7 @@ function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
     // offline (or is closed/abandoned) reads alive=false even if its process
     // happens to still be up, keeping `alive` consistent with `agent_status`.
     last_alive: row.last_alive ?? null,
-    alive:
-      isAliveFresh(row.last_alive) &&
-      (derivedAgentStatus === "idle" ||
-        derivedAgentStatus === "working" ||
-        derivedAgentStatus === "blocked" ||
-        derivedAgentStatus === "waiting_user"),
+    alive: isAliveFresh(row.last_alive) && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
     description: row.description ?? null,
     session_id: row.session_id ?? null,
     terminal_title_ref: row.terminal_title_ref ?? null,
@@ -2426,14 +2437,19 @@ export function registerAgent(
       options.host_id !== undefined
         ? options.host_id
         : existing.host_id ?? null;
+    // v2.13.0 — a fresh session resets a TERMINAL lifecycle state (offline/
+    // closed/abandoned/stale) to idle so a genuinely RESUMED agent (relaunch,
+    // or the next valid registration after a force token rotation) comes back
+    // available instead of staying stuck offline. Active states are preserved.
+    const newAgentStatus = statusAfterReregister(existing.agent_status);
     const r = db.prepare(
       "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
-      "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, " +
+      "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, agent_status = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ? " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
       role, timestamp, newHash, session_id, timestamp, newDescription,
-      newTitleRef, newHostShellPids, newHostId,
+      newTitleRef, newHostShellPids, newHostId, newAgentStatus,
       newAuthState, newRecoveryHash, newRevokedAt,
       name, existingState, existing.token_hash, casRecoveryHash
     );
@@ -2453,6 +2469,7 @@ export function registerAgent(
       terminal_title_ref: newTitleRef,
       host_shell_pids: newHostShellPids,
       host_id: newHostId,
+      agent_status: newAgentStatus,
       auth_state: newAuthState,
       recovery_token_hash: newRecoveryHash,
       revoked_at: newRevokedAt,
