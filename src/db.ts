@@ -163,14 +163,20 @@ function deriveAgentStatus(
   const minutes = (Date.now() - new Date(lastSeen).getTime()) / 60_000;
   const abandonMinutes = getAgentAbandonMinutes();
 
-  // v2.13.0 — positive liveness wins over age. A fresh `last_alive` means a
-  // process in the agent's shell chain is confirmed alive RIGHT NOW (same-host
-  // PID probe), so the terminal is open even though `last_seen` is stale from
-  // idle-waiting. Override the age-based offline/abandoned promotions AND a
-  // stale stored 'closed' left by a PRIOR session, and surface the declared
-  // active state (idle default). A genuine current-session teardown clears the
-  // shell PIDs, so `last_alive` cannot be fresh in that case — no conflict.
-  if (isAliveFresh(lastAlive)) {
+  // v2.13.0 — positive liveness wins over AGE. A fresh `last_alive` means the
+  // agent's own process is confirmed alive RIGHT NOW (same-host probe), so it's
+  // open even though `last_seen` is stale from idle-waiting. It overrides the
+  // age-based offline/abandoned promotions AND a stale stored 'closed' left by
+  // a PRIOR session (a real close clears the anchor, so a fresh `last_alive`
+  // with stored 'closed' means the agent re-launched and is alive). It surfaces
+  // the declared active state (idle default).
+  //
+  // EXCEPTION — an explicit stored 'offline' is a DECLARATION, not an aged-into
+  // state: set_status('offline') / force-rotation / SIGINT-offline deliberately
+  // say "unavailable." Liveness does NOT override that — a live process doesn't
+  // un-declare intent. Stored 'offline' falls through to the chain below
+  // (→ 'offline', or 'abandoned' past the abandon window), exactly as pre-v2.13.
+  if (isAliveFresh(lastAlive) && stored !== "offline") {
     if (
       stored === "working" ||
       stored === "blocked" ||
@@ -224,6 +230,7 @@ function parseHostShellPids(raw: string | null | undefined): number[] | null {
 }
 
 function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
+  const derivedAgentStatus = deriveAgentStatus(row.agent_status, row.last_seen, row.last_alive);
   return {
     id: row.id,
     name: row.name,
@@ -233,12 +240,20 @@ function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
     created_at: row.created_at,
     status: computeStatus(row.last_seen),
     has_token: !!row.token_hash,
-    agent_status: deriveAgentStatus(row.agent_status, row.last_seen, row.last_alive),
+    agent_status: derivedAgentStatus,
     // v2.13.0 — positive-liveness surface. `last_alive` is the ISO timestamp
-    // of the most recent confirmation; `alive` is the trustworthy "awake right
-    // now?" answer orchestrators read (fresh same-host PID probe / heartbeat).
+    // of the most recent confirmation; `alive` is the trustworthy "awake +
+    // available right now?" answer. It requires a fresh confirmation AND that
+    // the surfaced status is an active state — so an agent that DECLARED itself
+    // offline (or is closed/abandoned) reads alive=false even if its process
+    // happens to still be up, keeping `alive` consistent with `agent_status`.
     last_alive: row.last_alive ?? null,
-    alive: isAliveFresh(row.last_alive),
+    alive:
+      isAliveFresh(row.last_alive) &&
+      (derivedAgentStatus === "idle" ||
+        derivedAgentStatus === "working" ||
+        derivedAgentStatus === "blocked" ||
+        derivedAgentStatus === "waiting_user"),
     description: row.description ?? null,
     session_id: row.session_id ?? null,
     terminal_title_ref: row.terminal_title_ref ?? null,

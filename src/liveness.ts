@@ -29,10 +29,16 @@
  *      SessionStart hook and the Tether extension use, so values compare
  *      byte-for-byte.
  *
- * Universal / agnostic: the ancestry walk runs in the stdio MCP server startup,
- * which every stdio agent (claude, codex, any MCP client) spawns — so it covers
- * Codex and anything else, not just Claude. Pure parse functions are separated
- * from the impure command runner so extraction is unit-testable.
+ * Universal capture POINT, accurate identification: the ancestry walk runs in
+ * the stdio MCP server startup, which EVERY stdio agent spawns as a child — so
+ * the capture mechanism is agent-agnostic. The agent CLI is then IDENTIFIED by
+ * an argv match covering claude + codex out of the box, EXTENSIBLE via
+ * RELAY_AGENT_PROCESS_PATTERN for other CLIs. An agent whose argv doesn't match
+ * (and isn't configured) simply gets no positive liveness signal → it falls
+ * back to age-based presence (safe, byte-identical to pre-v2.13). Managed/script
+ * agents bypass identification entirely by self-reporting their PID on register.
+ * Pure parse functions are separated from the impure command runner so
+ * extraction is unit-testable.
  */
 import { execFileSync } from "node:child_process";
 import { log } from "./logger.js";
@@ -154,14 +160,37 @@ export interface AgentProcess {
 }
 
 /**
- * Agent-binary matcher. The agent CLI's argv contains its name (claude/codex).
- * Deliberately argv-based (not comm) because the CLIs commonly run under a
- * generic runtime (`node …/claude`, `node …/codex`). Case-insensitive,
- * word-ish boundary so "claude"/"codex" anywhere in argv matches but a random
- * substring (e.g. a path component) is unlikely to collide. The relay's own
- * process (argv contains the relay entrypoint) is excluded by the caller.
+ * Default agent-binary matcher. The agent CLI's argv contains its name
+ * (claude/codex). Deliberately argv-based (not comm) because the CLIs commonly
+ * run under a generic runtime (`node …/claude`, `node …/codex`). Case-
+ * insensitive, word-ish boundary so the name anywhere in argv matches but a
+ * random substring (e.g. a path component) is unlikely to collide. The relay's
+ * own process (argv contains the relay entrypoint) is excluded by the caller.
+ *
+ * Scope is honest: this covers claude + codex out of the box. It is NOT
+ * "any MCP client" — an unrecognized agent CLI falls back to age-based presence
+ * (safe). Operators running other CLIs extend coverage via the
+ * RELAY_AGENT_PROCESS_PATTERN env var (an alternation merged in below).
  */
 export const DEFAULT_AGENT_PATTERN = /(^|[^a-z0-9])(claude|codex)([^a-z0-9]|$)/i;
+
+/**
+ * Resolve the agent-binary matcher, broadened by RELAY_AGENT_PROCESS_PATTERN
+ * when set (a regex source string, e.g. "aider|goose|my-agent-cli"). Invalid
+ * regexes are ignored (→ default only) so a bad env var can never crash the
+ * startup walk. The custom alternation is OR'd with the claude/codex default.
+ */
+export function resolveAgentPattern(
+  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+): RegExp {
+  const extra = env.RELAY_AGENT_PROCESS_PATTERN?.trim();
+  if (!extra) return DEFAULT_AGENT_PATTERN;
+  try {
+    return new RegExp(`(^|[^a-z0-9])(claude|codex|${extra})([^a-z0-9]|$)`, "i");
+  } catch {
+    return DEFAULT_AGENT_PATTERN;
+  }
+}
 
 /**
  * Parse `ps -axo pid=,ppid=,lstart=,command=` output into a pid→entry map.
@@ -223,7 +252,7 @@ export function findAgentProcess(
 export function detectAgentProcess(
   selfPid: number = process.pid,
   run: CommandRunner = defaultRunner,
-  agentPattern: RegExp = DEFAULT_AGENT_PATTERN,
+  agentPattern: RegExp = resolveAgentPattern(),
 ): AgentProcess | null {
   try {
     return findAgentProcess(selfPid, buildProcessTable(run), agentPattern);
@@ -242,10 +271,17 @@ export function processStartedAt(pid: number, run: CommandRunner = defaultRunner
 /**
  * Is the recorded agent process still the SAME live process? Alive iff the PID
  * is live AND (when both start-times are readable) they match — a reused PID
- * (new process, different start-time) reads dead. If the current start-time
- * can't be read, fall back to PID-liveness alone (conservative on the
- * don't-falsely-close-a-live-agent side; the reuse window is small and the
- * heartbeat follow-on closes it).
+ * (new process, different start-time) reads dead.
+ *
+ * EXPLICIT TRADEOFF (intentional): if the current start-time can't be read
+ * (`ps` restricted/failed, or no token was recorded), we fall back to
+ * PID-liveness ALONE. This deliberately errs toward NOT falsely closing a live
+ * agent at the cost of a weaker reuse guard. The exposure is narrow: a reused
+ * PID only false-reads-alive when (a) the original agent's row wasn't cleared
+ * on close — close clears the anchor (HIGH #1) — AND (b) the OS recycled that
+ * exact PID within the ~120s alive window AND (c) ps can't read the new
+ * process's start-time. We accept this for the relay-side foundation; the
+ * cross-host heartbeat follow-on removes the PID dependency entirely.
  */
 export function isAgentProcessAlive(
   pid: number,

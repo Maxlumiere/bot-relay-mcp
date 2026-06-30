@@ -49,6 +49,7 @@ const {
   getAgents,
   getHealthSnapshot,
   setAgentLivenessAnchor,
+  setAgentStatus,
   closeAgentSession,
   getAgentSessionId,
   _resetLivenessProbeCacheForTests,
@@ -61,6 +62,7 @@ const {
   parseProcessTable,
   findAgentProcess,
   detectAgentProcess,
+  resolveAgentPattern,
   DEFAULT_AGENT_PATTERN,
   parseDarwinMachineGuid,
   parseLinuxMachineId,
@@ -218,6 +220,54 @@ describe("v2.13.0 — (5) universality: a non-Claude agent reads alive-when-idle
   it("findAgentProcess returns null when no agent ancestor exists (→ age-based fallback)", () => {
     const ps = `  200  90 x x x x x node /path/to/bot-relay/dist/index.js\n   90   1 x x x x x -zsh\n`;
     expect(findAgentProcess(200, parseProcessTable(ps))).toBeNull();
+  });
+});
+
+// --- 5b. Explicit offline declaration is NOT overridden by liveness ---
+
+describe("v2.13.0 — (5b) explicit set_status('offline') wins over liveness", () => {
+  it("a live same-host agent that DECLARED offline reads offline + alive=false", () => {
+    registerAgent("declared", "builder", [], { host_id: OWN_HOST });
+    setAgentLivenessAnchor("declared", LIVE_PID, null); // process is genuinely up
+    setAgentStatus("declared", "offline"); // operator/agent declares unavailable
+
+    const a = findAgent("declared"); // the getAgents probe WILL find the live pid
+    expect(a.agent_status).toBe("offline"); // declaration wins over fresh liveness
+    expect(a.alive).toBe(false); // alive stays consistent with the surfaced status
+  });
+
+  it("any path that stores 'offline' (e.g. force token rotation) is respected over a live anchor", () => {
+    // Path-independent: the fix lives in the derivation, so any writer that
+    // stores agent_status='offline' (set_status, force-rotation) is honored.
+    registerAgent("rotated", "builder", [], { host_id: OWN_HOST });
+    setAgentLivenessAnchor("rotated", LIVE_PID, null);
+    getDb().prepare("UPDATE agents SET agent_status = 'offline' WHERE name = ?").run("rotated");
+    expect(findAgent("rotated").agent_status).toBe("offline");
+  });
+
+  it("aged-into-offline (stored 'idle', stale last_seen) IS still overridden by liveness", () => {
+    // Contrast: an agent that DIDN'T declare offline but merely went quiet must
+    // still read alive when its process is up — the whole point of the fix.
+    registerAgent("quiet", "builder", [], { host_id: OWN_HOST });
+    setAgentLivenessAnchor("quiet", LIVE_PID, null);
+    ageOut("quiet", "idle"); // stored idle, 1h silent → would derive offline by age
+    expect(findAgent("quiet").agent_status).toBe("idle"); // liveness overrides age
+  });
+});
+
+// --- 5c. Matcher is extensible (RELAY_AGENT_PROCESS_PATTERN) ---
+
+describe("v2.13.0 — (5c) agent matcher extensibility", () => {
+  it("default matches claude/codex only; env broadens it; invalid regex → default", () => {
+    expect(resolveAgentPattern({}).source).toBe(DEFAULT_AGENT_PATTERN.source);
+    const broadened = resolveAgentPattern({ RELAY_AGENT_PROCESS_PATTERN: "aider|my-cli" });
+    expect(broadened.test("python -m aider")).toBe(true);
+    expect(broadened.test("/opt/my-cli run")).toBe(true);
+    expect(broadened.test("node /usr/local/bin/claude")).toBe(true); // default still in
+    // A malformed pattern is ignored (never crashes the startup walk).
+    expect(resolveAgentPattern({ RELAY_AGENT_PROCESS_PATTERN: "(" }).source).toBe(
+      DEFAULT_AGENT_PATTERN.source,
+    );
   });
 });
 
