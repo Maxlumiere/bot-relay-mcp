@@ -7,7 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
 import os from "os";
-import { getOwnHostId, isAnyPidAlive } from "./liveness.js";
+import { getOwnHostId, isAgentProcessAlive } from "./liveness.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -1509,14 +1509,21 @@ function migrateSchemaToV2_15(db: CompatDatabase): void {
 /**
  * v2.13.0 — presence liveness. schema v17 → v18.
  *
- * One additive, NULL-default column on `agents`:
+ * Three additive, NULL-default columns on `agents`:
  *   - `last_alive TEXT NULL` — ISO timestamp of the most recent POSITIVE
- *     liveness confirmation (a same-host PID probe found a live shell in the
- *     agent's `host_shell_pids` chain; future: a Tether heartbeat). Distinct
- *     from `last_seen` (activity) and `last_dispatched_at`. A fresh
- *     `last_alive` proves the terminal is open even while idle, so the
- *     presence derivations stop misreading an alive-and-idle agent as
- *     offline/closed.
+ *     liveness confirmation (a same-host probe found the agent's own process
+ *     alive; future: a Tether heartbeat). Distinct from `last_seen` (activity)
+ *     and `last_dispatched_at`. A fresh `last_alive` proves the agent is open
+ *     even while idle, so the presence derivations stop misreading an
+ *     alive-and-idle agent as offline/closed.
+ *   - `agent_pid INTEGER NULL` — the agent's OWN process id (the claude/codex
+ *     CLI), identified by the stdio server's ancestry walk (or self-reported
+ *     by managed/script agents on register). This is the process we probe —
+ *     NOT the host_shell_pids ancestry chain, whose shell/terminal ancestors
+ *     outlive the agent. Dies exactly when the agent exits/crashes.
+ *   - `agent_pid_start TEXT NULL` — the agent process's start-time token, a
+ *     PID-reuse guard: a recycled PID (new process, different start-time)
+ *     reads dead.
  *
  * Additive + idempotent — PRAGMA-guarded so re-runs no-op. NULL on every
  * existing row = zero data migration; with no liveness signal the agent
@@ -1528,6 +1535,12 @@ function migrateSchemaToV2_16(db: CompatDatabase): void {
     .all() as Array<{ name: string }>;
   if (!agentCols.some((c) => c.name === "last_alive")) {
     db.exec("ALTER TABLE agents ADD COLUMN last_alive TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "agent_pid")) {
+    db.exec("ALTER TABLE agents ADD COLUMN agent_pid INTEGER");
+  }
+  if (!agentCols.some((c) => c.name === "agent_pid_start")) {
+    db.exec("ALTER TABLE agents ADD COLUMN agent_pid_start TEXT");
   }
 }
 
@@ -1910,6 +1923,33 @@ export function updateAgentMetadata(
 }
 
 /**
+ * v2.13.0 — record the agent's OWN process as its liveness anchor. Called by
+ * the stdio MCP server at startup (it walks its ancestry to find the agent
+ * CLI) and by register_agent self-report (managed/script agents). Sets
+ * agent_pid + agent_pid_start, and fills host_id with the relay's own machine
+ * GUID iff currently NULL (so the same-host probe can match; never overwrites
+ * a host_id the handshake already set). Clears any stale negative-probe verdict
+ * so a freshly-relaunched agent isn't briefly dead-cached. No-op (false) if the
+ * row doesn't exist yet. Sanctioned single-site agents mutation (lives in db.ts).
+ */
+export function setAgentLivenessAnchor(
+  name: string,
+  pid: number,
+  startedAt: string | null,
+): boolean {
+  if (!name || !Number.isInteger(pid) || pid <= 0) return false;
+  const db = getDb();
+  const ownHost = getOwnHostId();
+  const r = db
+    .prepare(
+      "UPDATE agents SET agent_pid = ?, agent_pid_start = ?, host_id = COALESCE(host_id, ?) WHERE name = ?",
+    )
+    .run(pid, startedAt, ownHost, name);
+  if (r.changes > 0) _negativeProbeCache.delete(name);
+  return r.changes > 0;
+}
+
+/**
  * v2.1.3 — sanctioned offline transition for a stdio terminal that is
  * exiting (SIGINT / SIGTERM).
  *
@@ -1948,9 +1988,13 @@ export function markAgentOffline(
 ): { changed: boolean } {
   const db = getDb();
   const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'offline', busy_expires_at = NULL " +
+    // v2.13.0 — clear the liveness anchor in the SAME CAS so a same-host probe
+    // can't restamp last_alive and mask this offline transition.
+    "UPDATE agents SET session_id = NULL, agent_status = 'offline', busy_expires_at = NULL, " +
+    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(name, expectedSessionId);
+  if (r.changes === 1) _negativeProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -1991,19 +2035,26 @@ export function closeAgentSession(
   // call carries one. Two SQL forms are cheaper to maintain than a
   // dynamic builder + safer than a single COALESCE form that could
   // smuggle a NULL through and clear an already-set signal stamp.
+  // v2.13.0 — clear the liveness anchor (last_alive + agent_pid + start) in the
+  // SAME CAS as the close so a same-host probe can't restamp last_alive and
+  // mask the close. Applies to both SQL forms.
   if (signalKind === null) {
     const r = db.prepare(
-      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL " +
+      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
+      "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
       "WHERE name = ? AND session_id = ?"
     ).run(name, expectedSessionId);
+    if (r.changes === 1) _negativeProbeCache.delete(name);
     return { changed: r.changes === 1 };
   }
   const nowMs = Date.now();
   const r = db.prepare(
     "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
-    "signal_received_at = ?, signal_kind = ? " +
+    "signal_received_at = ?, signal_kind = ?, " +
+    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(nowMs, signalKind, name, expectedSessionId);
+  if (r.changes === 1) _negativeProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2850,7 +2901,8 @@ export function getDashboardAgentSnapshots(
          a.signal_kind,
          a.last_dispatched_at,
          a.host_id,
-         a.host_shell_pids,
+         a.agent_pid,
+         a.agent_pid_start,
          a.last_alive,
          (SELECT COUNT(*) FROM messages m
            WHERE m.to_agent = a.name
@@ -2865,7 +2917,8 @@ export function getDashboardAgentSnapshots(
     signal_kind: string | null;
     last_dispatched_at: number | null;
     host_id: string | null;
-    host_shell_pids: string | null;
+    agent_pid: number | null;
+    agent_pid_start: string | null;
     last_alive: string | null;
     pending_count_old: number | bigint;
   }>;
@@ -3073,22 +3126,51 @@ export function getTasksInWindow(sinceIso: string, limit: number = 1000): TaskRe
 }
 
 /**
+ * v2.13.0 — negative-probe cache. A dead agent has no fresh `last_alive` to
+ * cache against, so without this every presence read would re-probe it (an
+ * extra `ps`/kill per dead same-host row, every getAgents/health/standup).
+ * Keyed by agent name → the wall-clock ms of the last dead verdict; within the
+ * cache window we skip the re-probe. In-memory (process-local): a stale entry
+ * at worst delays a fresh alive verdict by the cache window, never a wrong one.
+ */
+const _negativeProbeCache = new Map<string, number>();
+
+/** Test-only: count of ACTUAL liveness probes (cache-miss isAgentProcessAlive
+ *  calls), so tests can assert the positive/negative caches suppress re-probes. */
+let _livenessProbeCount = 0;
+
+/** Test-only: clear the negative-probe cache + reset the probe counter. */
+export function _resetLivenessProbeCacheForTests(): void {
+  _negativeProbeCache.clear();
+  _livenessProbeCount = 0;
+}
+
+/** Test-only: read the probe counter. */
+export function _getLivenessProbeCountForTests(): number {
+  return _livenessProbeCount;
+}
+
+/**
  * v2.13.0 — lazy presence-liveness refresh. For each row that is (a) on THIS
- * host (host_id matches the relay's own GUID), (b) has a recorded shell-PID
- * chain, and (c) whose `last_alive` is stale beyond the probe cache, probe the
- * PID chain; on a live hit, stamp `last_alive = now()` (mutating `row` in place
- * so the immediate map() sees it, and persisting via the sanctioned metadata
- * writer). Cross-host agents, agents with no PIDs, and recently-confirmed
- * agents are skipped — they fall back to the unchanged age-based derivation.
+ * host (host_id matches the relay's own GUID) and (b) has a recorded
+ * `agent_pid` (the agent's OWN process — claude/codex — NOT the host_shell_pids
+ * ancestry chain, whose shell/terminal ancestors outlive the agent), probe
+ * that process. On a live hit, stamp `last_alive = now()` (mutating `row` in
+ * place so the immediate map() sees it + persisting via the sanctioned writer).
  *
- * Cheap: process.kill(pid,0) is a microsecond syscall, gated by host match +
- * the cache window, so a steady-state read does near-zero probes.
+ * Skipped (→ unchanged age-based derivation): cross-host agents, agents with no
+ * recorded agent_pid, agents whose `last_alive` is fresh within the cache
+ * window (positive cache), and agents recently confirmed dead (negative cache).
+ *
+ * Cheap: gated by host match + both caches, a steady-state read does near-zero
+ * probes.
  */
 function refreshLivenessForRows(
   rows: Array<{
     name: string;
     host_id?: string | null;
-    host_shell_pids?: string | null;
+    agent_pid?: number | null;
+    agent_pid_start?: string | null;
     last_alive?: string | null;
   }>,
 ): void {
@@ -3098,18 +3180,26 @@ function refreshLivenessForRows(
   const ts = new Date(nowMs).toISOString();
   for (const row of rows) {
     if (!row.host_id || row.host_id !== ownHost) continue; // cross-host
-    // Within the probe-cache window a fresh confirmation is trusted as-is.
+    if (typeof row.agent_pid !== "number" || row.agent_pid <= 0) continue; // no anchor
+    // Positive cache — a recent live confirmation is trusted as-is.
     if (row.last_alive) {
       const age = nowMs - Date.parse(row.last_alive);
       if (Number.isFinite(age) && age >= 0 && age < LIVENESS_PROBE_CACHE_MS) continue;
     }
-    const pids = parseHostShellPids(row.host_shell_pids);
-    if (!pids || pids.length === 0) continue;
-    if (isAnyPidAlive(pids)) {
+    // Negative cache — recently-confirmed-dead rows aren't re-probed in-window.
+    const deadAt = _negativeProbeCache.get(row.name);
+    if (deadAt !== undefined && nowMs - deadAt < LIVENESS_PROBE_CACHE_MS) continue;
+
+    _livenessProbeCount++;
+    if (isAgentProcessAlive(row.agent_pid, row.agent_pid_start ?? null)) {
       row.last_alive = ts; // in-place so the subsequent map() reflects it
+      _negativeProbeCache.delete(row.name);
       updateAgentMetadata(row.name, { last_alive: ts });
+    } else {
+      // Dead → record the verdict so we don't re-probe every read; leave
+      // last_alive untouched so the age-based derivation applies.
+      _negativeProbeCache.set(row.name, nowMs);
     }
-    // Dead PIDs → leave last_alive untouched; the age-based derivation applies.
   }
 }
 

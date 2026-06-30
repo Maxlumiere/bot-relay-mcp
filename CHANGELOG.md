@@ -4,29 +4,31 @@
 
 The relay couldn't reliably tell an **alive-but-idle** agent from a **closed** one. `last_seen` only advances on activity (observation isn't liveness, v1.3), so an agent sitting open and waiting aged out to `stale → offline → closed`/`abandoned` — and orchestrators misread live idle agents as dead. This adds a **positive** liveness signal so "is this agent awake and waiting?" has a trustworthy answer.
 
-### Added — same-host PID-liveness probe + `last_alive`
+### Added — same-host agent-process liveness probe + `last_alive`
 
-- New additive column **`agents.last_alive`** (ISO timestamp), distinct from `last_seen` (activity) and `last_dispatched_at`. It records the most recent **positive** liveness confirmation.
-- On a presence read (`discover_agents`, `get_standup`, `health_check`), the relay lazily probes the agent's recorded `host_shell_pids` chain with a `process.kill(pid, 0)` signal-0 check **(same-host only)**. If any shell PID is alive, the terminal is open — even while idle — and `last_alive` is stamped. The probe is host-scoped by the OS machine GUID (`host_id`): a PID is only probed when the agent shares the relay's host, so a PID can never false-match an unrelated process on another machine. `EPERM` (cross-user) counts as alive; `ESRCH` as dead. The probe is gated by a short cache so rapid successive reads don't re-probe.
+- New additive columns **`agents.last_alive`** (ISO timestamp of the most recent positive liveness confirmation; distinct from `last_seen` activity), **`agents.agent_pid`** (the agent's OWN process id), and **`agents.agent_pid_start`** (a start-time token guarding PID reuse).
+- On a presence read (`discover_agents`, `get_standup`, `health_check`), the relay lazily probes **the agent's own process** with a `process.kill(pid, 0)` signal-0 check **(same-host only)**. If that process is alive, the agent is open — even while idle — and `last_alive` is stamped. Crucially this probes the **agent process**, not the `host_shell_pids` ancestry chain: the chain's shell/terminal ancestors outlive the agent, so probing them would keep a dead agent "alive" while its terminal stays open. `host_shell_pids` is left untouched for its terminal-binding purpose.
+- The probe is host-scoped by the OS machine GUID (`host_id`) — a PID is only probed when the agent shares the relay's host, so it can never false-match an unrelated process elsewhere. `EPERM` (cross-user) counts as alive; `ESRCH` as dead. A recycled PID (different `agent_pid_start`) reads dead. Two caches (positive `last_alive` + an in-memory negative cache) suppress re-probing on rapid successive reads.
+- **Capturing `agent_pid` is universal/agnostic**, not Claude-specific: the relay's **stdio MCP server** — which every stdio agent (claude, codex, any MCP client) spawns as a child — walks its own ancestry once at startup (a single `ps`, zero-token, no loop) to identify the agent CLI and records it. Managed/script agents self-report `agent_pid` via `register_agent`. Anything that can't report it falls back to age-based presence.
 - New module computing this host's machine GUID with the exact OS source the SessionStart hook + extension use (macOS `IOPlatformUUID` / Linux `/etc/machine-id` / Windows `MachineGuid`), so host comparison is byte-identical.
 
 ### Changed — both presence derivations honor liveness
 
-- `deriveAgentStatus` (the `discover_agents`/`health_check` surface) and `deriveDashboardState` (the dashboard) now take the liveness signal: a **fresh** `last_alive` overrides the age-based `offline`/`abandoned` promotions and a **stale stored `closed`** from a prior session, so an alive-and-idle agent reads `idle`/`waiting` instead of `closed`. A genuine current-session teardown (SIGINT/SIGTERM/explicit unregister) still wins — and can't conflict, since a real teardown kills the shell PIDs the probe reads.
+- `deriveAgentStatus` (the `discover_agents`/`health_check` surface) and `deriveDashboardState` (the dashboard) now take the liveness signal: a **fresh** `last_alive` overrides the age-based `offline`/`abandoned` promotions and a **stale stored `closed`** from a prior session, so an alive-and-idle agent reads `idle`/`waiting` instead of `closed`. A genuine current-session teardown wins: `closeAgentSession`/`markAgentOffline` clear `last_alive` + `agent_pid` in the same atomic update, so the probe has nothing to restamp and the close is never masked.
 - New query surface: `discover_agents` + `get_standup` agents carry **`last_alive`** (ISO) and **`alive`** (boolean — the trustworthy "awake right now?"); `health_check` adds **`agent_count_alive`**.
 - Freshness window tunable via `RELAY_AGENT_ALIVE_WINDOW_SEC` (default 120s).
 
 ### Schema
 
-- Migrates **v17 → v18** — one additive `NULL`-default column `agents.last_alive`. Zero data migration: with no liveness signal an agent derives exactly as before (pure age-based), so behavior is byte-identical until a probe populates it.
+- Migrates **v17 → v18** — three additive `NULL`-default columns (`last_alive`, `agent_pid`, `agent_pid_start`). Zero data migration: with no liveness signal an agent derives exactly as before (pure age-based), so behavior is byte-identical until a probe populates it.
 
 ### Notes
 
-- This ships the relay-side foundation. A Tether-extension liveness **heartbeat** (cross-host + relaunch-gap coverage, with its own auth model) is a planned follow-on; the relay-side PID probe covers same-host fleets today.
+- This ships the relay-side foundation. A Tether-extension liveness **heartbeat** (cross-host + crash-without-clean-exit coverage, with its own auth model) is a planned follow-on; the relay-side probe covers same-host fleets today.
 
 ### Tests
 
-`tests/v2-13-0-presence-liveness.test.ts` (NEW) + `tests/liveness`-style coverage: the headline regression (idle agent with a live same-host PID reads `alive`/`idle`, not `closed`/`offline`, even with a stale stored `closed`); dead-PID → no liveness → age-based `closed`; cross-host fallback (a locally-live PID under a different `host_id` is **not** probed — no false-alive); `process.kill` errno handling (success/`EPERM` alive, `ESRCH` dead); back-compat (no signal → byte-identical age-based derivation); `deriveDashboardState` honoring/ignoring `last_alive`; and the machine-GUID parsers.
+`tests/v2-13-0-presence-liveness.test.ts` (NEW): the headline regression (idle agent with a live process reads `alive`/`idle`, not `closed`/`offline`, even with a stale stored `closed`); a current-session close clears the anchor so liveness can't mask it; we probe `agent_pid` not the chain (a dead agent with a live shell ancestor reads dead); the negative cache (dead rows aren't re-probed in-window); **the agnostic proof** — a non-Claude (codex) agent reads alive-when-idle, and the ancestry walk identifies codex as readily as claude; the PID-reuse start-time guard; cross-host fallback; back-compat (no signal → byte-identical age-based); `process.kill` errno handling; and the machine-GUID parsers.
 
 ## v2.12.0 — 2026-06-29 — Pending vs. history (a permanent "resolved" plane)
 

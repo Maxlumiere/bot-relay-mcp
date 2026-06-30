@@ -15,13 +15,14 @@ import {
   logAudit,
   ConcurrentUpdateError,
   expandAgentCapabilities,
+  setAgentLivenessAnchor,
   NameCollisionActiveError,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
 import { log } from "../logger.js";
 import { currentContext } from "../request-context.js";
-import { updateCapturedSessionId } from "../transport/stdio.js";
+import { updateCapturedSessionId, stampDetectedAgentLiveness } from "../transport/stdio.js";
 import { defaultTokenStore } from "../token-store.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { ERROR_CODES } from "../error-codes.js";
@@ -184,10 +185,24 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     const ownName = process.env.RELAY_AGENT_NAME;
     if (ctx.transport === "stdio" && ownName && ownName === agent.name) {
       updateCapturedSessionId(agent.session_id ?? null);
+      // v2.13.0 — re-stamp the presence-liveness anchor (the agent's own
+      // process, detected at stdio startup) now that the row definitely
+      // exists. Covers MCP-first / re-register orderings.
+      stampDetectedAgentLiveness(agent.name);
     }
   } catch {
     // Never block register on a re-capture failure — SIGTERM will fall back to
     // the null-guard path, which is safe.
+  }
+  // v2.13.0 — managed/script agents (no relay-side stdio server to auto-detect
+  // their process) self-report their own PID. Best-effort; host-scoped + cleared
+  // on close like any anchor.
+  if (typeof input.agent_pid === "number") {
+    try {
+      setAgentLivenessAnchor(agent.name, input.agent_pid, input.agent_pid_start ?? null);
+    } catch {
+      /* liveness is best-effort — never block register */
+    }
   }
 
   // v2.8 wire-emit-sites — register_agent didn't broadcast pre-v2.8, so

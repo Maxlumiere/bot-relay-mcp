@@ -79,6 +79,22 @@ export const RegisterAgentSchema = z.object({
       "Tether v0.3 PID-handshake (schema v16): stable OS machine GUID (macOS IOPlatformUUID / Linux /etc/machine-id / Windows MachineGuid). Host-scopes the PID match so equal PIDs on different hosts never false-match (federation-safe). Immutable after first registration (same rule as `managed`)."
     ),
   agent_token: AgentTokenField,
+  agent_pid: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "v2.13.0 presence liveness: the agent's OWN process id (this CLI/wrapper's PID). Lets the relay confirm the agent is alive-and-idle via a same-host probe instead of misreading idle silence as closed. Self-reported by managed/script agents; stdio MCP agents have it captured automatically by the relay stdio server. Host-scoped by host_id; cleared on close. Omit if unknown → age-based presence (unchanged).",
+    ),
+  agent_pid_start: z
+    .string()
+    .min(1)
+    .max(128)
+    .optional()
+    .describe(
+      "v2.13.0 presence liveness: an opaque start-time token for agent_pid (e.g. the process start clock time) used as a PID-reuse guard — a recycled PID with a different start-time reads dead. Optional; omit if unavailable.",
+    ),
   recovery_token: z.string().min(1).optional().describe("v2.1 Phase 4b.1 v2: required when re-registering an agent whose auth_state is 'recovery_pending'. Obtained from the revoker's revoke_token response (shown ONCE) and handed off to the operator out-of-band."),
   managed: z.boolean().default(false).describe("v2.1 Phase 4b.2: true = agent is a Managed Agent wrapper that can parse push-token messages + self-update its local config on rotation. false (default) = Claude Code terminal or equivalent (restart-required on rotation). Immutable after first registration — change requires unregister + fresh register."),
   /**
@@ -818,6 +834,10 @@ export interface AgentRecord {
   host_id?: string | null;
   /** v2.13.0 (schema v18): ISO timestamp of the most recent POSITIVE liveness confirmation (same-host PID probe / future heartbeat). NULL = no liveness signal → age-based derivation. Distinct from last_seen (activity). */
   last_alive?: string | null;
+  /** v2.13.0 (schema v18): the agent's OWN process id (claude/codex CLI), identified by the stdio server's ancestry walk or self-reported on register. The process the same-host liveness probe checks — NOT the host_shell_pids chain. NULL = no anchor → age-based. */
+  agent_pid?: number | null;
+  /** v2.13.0 (schema v18): start-time token of `agent_pid` (PID-reuse guard). A recycled PID with a different start-time reads dead. */
+  agent_pid_start?: string | null;
 }
 
 export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "token_hash" | "session_id" | "agent_status" | "description" | "host_shell_pids" | "host_id"> {

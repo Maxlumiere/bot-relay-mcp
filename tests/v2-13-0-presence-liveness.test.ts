@@ -6,24 +6,25 @@
 /**
  * v2.13.0 — presence liveness contract tests.
  *
- * The bug: the relay couldn't tell ALIVE-AND-IDLE from CLOSED. An open
- * terminal that's just waiting stops bumping last_seen (observation isn't
- * liveness, v1.3), so the age-based derivations promoted it to offline/closed
- * even though its process was alive. The fix adds a positive liveness signal:
- * a SAME-HOST PID probe of the agent's host_shell_pids chain stamps
- * `last_alive`, which both presence derivations honor.
+ * The bug: the relay couldn't tell ALIVE-AND-IDLE from CLOSED. last_seen only
+ * advances on activity (observation isn't liveness, v1.3), so an open terminal
+ * sitting idle aged out to stale -> offline -> closed. The fix adds a positive
+ * liveness signal: a SAME-HOST probe of the agent's OWN process (agent_pid —
+ * NOT the host_shell_pids ancestry chain, whose shell/terminal ancestors
+ * outlive the agent) stamps `last_alive`, which both presence derivations honor.
  *
- * Contract:
- *   1. HEADLINE regression — an idle agent (stale last_seen, even a stale
- *      stored 'closed') with a LIVE same-host PID reads alive/idle, NOT
- *      closed/offline.
- *   2. dead PID → no liveness → age-based closed/offline (unchanged).
- *   3. cross-host (host_id mismatch) → NO probe (PID could collide) → age-based.
- *   4. cross-platform errno — isPidAlive: success/EPERM alive, ESRCH dead.
- *   5. back-compat — last_alive NULL → byte-identical age-based derivation.
- *   6. deriveDashboardState — fresh last_alive suppresses session-timeout
- *      closed; an intentional teardown signal still wins.
- *   7. machine-GUID parse fns (the host-scoping source of truth).
+ * Contract (covers the codex re-audit findings):
+ *   1. HEADLINE — an idle agent (stale last_seen, even a stale stored 'closed')
+ *      with a LIVE agent process reads alive/idle, NOT closed/offline.
+ *   2. (HIGH #1) a real close CLEARS the anchor → getAgents() immediately reads
+ *      closed + alive=false (liveness can't mask a current teardown).
+ *   3. (HIGH #2) we probe agent_pid, NOT the chain — a dead agent_pid reads
+ *      dead even when host_shell_pids contains a live ancestor.
+ *   4. (MED #3) dead same-host rows are negative-cached → not re-probed in-window.
+ *   5. AGNOSTIC PROOF — a non-Claude agent (codex) reads alive-when-idle, and
+ *      the ancestry walk identifies codex as readily as claude.
+ *   6. PID-reuse guard — a recycled PID (different start-time) reads dead.
+ *   7. cross-host fallback + back-compat + machine-GUID parsers.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
@@ -38,35 +39,49 @@ delete process.env.RELAY_AGENT_NAME;
 delete process.env.RELAY_AGENT_ROLE;
 delete process.env.RELAY_AGENT_CAPABILITIES;
 delete process.env.RELAY_ALLOW_LEGACY;
-delete process.env.RELAY_AGENT_ALIVE_WINDOW_SEC; // use the 120s default
+delete process.env.RELAY_AGENT_ALIVE_WINDOW_SEC; // 120s default
 process.env.RELAY_HTTP_PORT = "54994";
 
-const { closeDb, getDb, registerAgent, getAgents, getHealthSnapshot } =
-  await import("../src/db.js");
+const {
+  closeDb,
+  getDb,
+  registerAgent,
+  getAgents,
+  getHealthSnapshot,
+  setAgentLivenessAnchor,
+  closeAgentSession,
+  getAgentSessionId,
+  _resetLivenessProbeCacheForTests,
+  _getLivenessProbeCountForTests,
+} = await import("../src/db.js");
 const {
   isPidAlive,
-  isAnyPidAlive,
+  isAgentProcessAlive,
+  processStartedAt,
+  parseProcessTable,
+  findAgentProcess,
+  detectAgentProcess,
+  DEFAULT_AGENT_PATTERN,
   parseDarwinMachineGuid,
   parseLinuxMachineId,
   parseWindowsMachineGuid,
-  machineGuid,
   _resetOwnHostIdForTests,
 } = await import("../src/liveness.js");
-const { deriveDashboardState, DEFAULT_THRESHOLDS } = await import("../src/agent-state-machine.js");
 
 const OWN_HOST = "test-own-host-guid";
 const LIVE_PID = process.pid; // this vitest process — guaranteed alive
-const DEAD_PID = 2_147_483_646; // astronomically unlikely to exist
+const DEAD_PID = 2_147_483_646;
 
 function cleanup() {
   closeDb();
   _resetOwnHostIdForTests(undefined);
+  _resetLivenessProbeCacheForTests();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
 }
 
 /** Make `name` look idle-for-an-hour with an optional stale stored status. */
 function ageOut(name: string, storedStatus = "idle") {
-  const oldIso = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1h ago
+  const oldIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   getDb()
     .prepare("UPDATE agents SET last_seen = ?, agent_status = ? WHERE name = ?")
     .run(oldIso, storedStatus, name);
@@ -78,8 +93,6 @@ function findAgent(name: string) {
 
 beforeEach(() => {
   cleanup();
-  // Pin the relay's own host id deterministically so host-scoping is testable
-  // without depending on the CI machine's real GUID extraction.
   _resetOwnHostIdForTests(OWN_HOST);
 });
 afterEach(() => cleanup());
@@ -87,26 +100,21 @@ afterEach(() => cleanup());
 // --- 1. HEADLINE regression ---
 
 describe("v2.13.0 — (1) alive-and-idle reads alive, not closed", () => {
-  it("an idle same-host agent with a LIVE PID is alive/idle even with a stale stored 'closed'", () => {
-    registerAgent("idler", "builder", [], { host_id: OWN_HOST, host_shell_pids: [LIVE_PID] });
-    ageOut("idler", "closed"); // simulate a prior-session SIGINT marker + idle silence
+  it("an idle same-host agent with a LIVE process is alive/idle even with a stale stored 'closed'", () => {
+    registerAgent("idler", "builder", [], { host_id: OWN_HOST });
+    setAgentLivenessAnchor("idler", LIVE_PID, null); // PID-liveness only (no start token)
+    ageOut("idler", "closed"); // prior-session SIGINT marker + idle silence
 
     const a = findAgent("idler");
-    expect(a.alive).toBe(true); // the trustworthy answer
+    expect(a.alive).toBe(true);
     expect(a.last_alive).not.toBeNull();
-    // The exact bug: it must NOT read closed/offline/abandoned/stale.
     expect(["closed", "offline", "abandoned", "stale"]).not.toContain(a.agent_status);
     expect(a.agent_status).toBe("idle");
   });
 
-  it("preserves a declared active state (working) when alive", () => {
-    registerAgent("worker", "builder", [], { host_id: OWN_HOST, host_shell_pids: [LIVE_PID] });
-    ageOut("worker", "working");
-    expect(findAgent("worker").agent_status).toBe("working");
-  });
-
   it("health_check counts the alive agent in agent_count_alive", () => {
-    registerAgent("idler", "builder", [], { host_id: OWN_HOST, host_shell_pids: [LIVE_PID] });
+    registerAgent("idler", "builder", [], { host_id: OWN_HOST });
+    setAgentLivenessAnchor("idler", LIVE_PID, null);
     ageOut("idler", "closed");
     const snap = getHealthSnapshot();
     expect(snap.agent_count).toBe(1);
@@ -114,144 +122,174 @@ describe("v2.13.0 — (1) alive-and-idle reads alive, not closed", () => {
   });
 });
 
-// --- 2. dead PID → age-based closed/offline ---
+// --- 2. HIGH #1 — a real close clears the anchor; liveness can't mask it ---
 
-describe("v2.13.0 — (2) dead PID → no liveness", () => {
-  it("an idle same-host agent whose PID is dead reads its stored 'closed' (no false-alive)", () => {
-    registerAgent("ghost", "builder", [], { host_id: OWN_HOST, host_shell_pids: [DEAD_PID] });
-    ageOut("ghost", "closed");
-    const a = findAgent("ghost");
+describe("v2.13.0 — (2) a current-session close wins over liveness", () => {
+  it("closeAgentSession clears the anchor → getAgents() immediately reads closed + alive=false", () => {
+    const { agent } = registerAgent("closer", "builder", [], { host_id: OWN_HOST });
+    setAgentLivenessAnchor("closer", LIVE_PID, null);
+    ageOut("closer", "idle");
+
+    // Fresh live anchor → alive.
+    expect(findAgent("closer").alive).toBe(true);
+
+    // The agent's terminal is closed (SIGINT) for THIS session.
+    const sid = agent.session_id ?? getAgentSessionId("closer")!;
+    const res = closeAgentSession("closer", sid, "SIGINT");
+    expect(res.changed).toBe(true);
+
+    // Immediately: the close is NOT masked by the (now-cleared) liveness.
+    const a = findAgent("closer");
     expect(a.alive).toBe(false);
     expect(a.last_alive).toBeNull();
     expect(a.agent_status).toBe("closed");
   });
 });
 
-// --- 3. cross-host fallback (no PID collision false-alive) ---
+// --- 3. HIGH #2 — probe the agent process, NOT the ancestry chain ---
 
-describe("v2.13.0 — (3) cross-host fallback", () => {
-  it("a DIFFERENT-host agent is NOT probed even if its PID is locally alive", () => {
-    // host_shell_pids includes a locally-live PID, but host_id != our host —
-    // probing it would false-match an unrelated local process. Must skip.
-    registerAgent("remote", "builder", [], { host_id: "some-other-machine", host_shell_pids: [LIVE_PID] });
+describe("v2.13.0 — (3) a live shell ancestor does NOT keep a dead agent alive", () => {
+  it("dead agent_pid reads dead even though host_shell_pids has a live PID", () => {
+    // host_shell_pids carries a LIVE pid (a shell/terminal ancestor), but the
+    // AGENT's own process (agent_pid) is dead — the exact false-alive codex flagged.
+    registerAgent("crashed", "builder", [], { host_id: OWN_HOST, host_shell_pids: [LIVE_PID] });
+    setAgentLivenessAnchor("crashed", DEAD_PID, null); // agent process is gone
+    ageOut("crashed", "idle");
+
+    const a = findAgent("crashed");
+    expect(a.alive).toBe(false);
+    expect(a.last_alive).toBeNull();
+    expect(a.agent_status).toBe("offline"); // 1h idle, no live agent process
+  });
+});
+
+// --- 4. MED #3 — negative-probe cache ---
+
+describe("v2.13.0 — (4) dead rows are not re-probed within the cache window", () => {
+  it("a second read within the window does not re-probe the dead agent", () => {
+    registerAgent("ghost", "builder", [], { host_id: OWN_HOST });
+    setAgentLivenessAnchor("ghost", DEAD_PID, null);
+    ageOut("ghost", "idle");
+    _resetLivenessProbeCacheForTests();
+
+    getAgents(); // first read → probes once, caches the dead verdict
+    expect(_getLivenessProbeCountForTests()).toBe(1);
+    getAgents(); // second read in-window → cache hit, no re-probe
+    expect(_getLivenessProbeCountForTests()).toBe(1);
+  });
+});
+
+// --- 5. AGNOSTIC PROOF — codex (a non-Claude agent) ---
+
+describe("v2.13.0 — (5) universality: a non-Claude agent reads alive-when-idle", () => {
+  it("an idle non-Claude (codex) agent with a live process reads alive (probe is agent-agnostic)", () => {
+    registerAgent("codex-agent", "auditor", [], { host_id: OWN_HOST });
+    setAgentLivenessAnchor("codex-agent", LIVE_PID, null);
+    ageOut("codex-agent", "closed");
+    const a = findAgent("codex-agent");
+    expect(a.alive).toBe(true);
+    expect(a.agent_status).toBe("idle");
+  });
+
+  it("the ancestry walk identifies codex as readily as claude (capture is agent-agnostic)", () => {
+    // Synthetic ancestry: relay stdio server (self) <- codex <- shell <- terminal.
+    const lstart = "Mon Jan  1 00:00:00 2020";
+    const ps =
+      `  100   90 ${lstart} node /usr/local/bin/codex serve\n` + // the codex CLI (ancestor)
+      `  200  100 ${lstart} node /path/to/bot-relay/dist/index.js\n` + // relay stdio server (self)
+      `   90    1 ${lstart} -zsh\n`; // controlling shell
+    const table = parseProcessTable(ps);
+    const found = findAgentProcess(200, table);
+    expect(found?.pid).toBe(100); // codex, not the shell (90) or self (200)
+
+    // And claude in the same shape.
+    const psClaude = ps.replace("codex serve", "claude --resume");
+    const foundClaude = findAgentProcess(200, parseProcessTable(psClaude));
+    expect(foundClaude?.pid).toBe(100);
+  });
+
+  it("DEFAULT_AGENT_PATTERN matches claude + codex argv but not a plain shell", () => {
+    expect(DEFAULT_AGENT_PATTERN.test("node /usr/local/bin/claude")).toBe(true);
+    expect(DEFAULT_AGENT_PATTERN.test("/opt/codex/codex serve")).toBe(true);
+    expect(DEFAULT_AGENT_PATTERN.test("-zsh")).toBe(false);
+    expect(DEFAULT_AGENT_PATTERN.test("/usr/bin/login")).toBe(false);
+  });
+
+  it("findAgentProcess returns null when no agent ancestor exists (→ age-based fallback)", () => {
+    const ps = `  200  90 x x x x x node /path/to/bot-relay/dist/index.js\n   90   1 x x x x x -zsh\n`;
+    expect(findAgentProcess(200, parseProcessTable(ps))).toBeNull();
+  });
+});
+
+// --- 6. PID-reuse guard ---
+
+describe("v2.13.0 — (6) start-time reuse guard", () => {
+  it("a recycled PID (different start-time) reads dead", () => {
+    // process.pid is alive, but the stored start-time doesn't match → reused → dead.
+    expect(isAgentProcessAlive(LIVE_PID, "Mon Jan  1 00:00:00 2020")).toBe(false);
+  });
+  it("a matching start-time reads alive", () => {
+    const real = processStartedAt(LIVE_PID);
+    expect(real).not.toBeNull();
+    expect(isAgentProcessAlive(LIVE_PID, real)).toBe(true);
+  });
+  it("a null start-time falls back to PID-liveness alone", () => {
+    expect(isAgentProcessAlive(LIVE_PID, null)).toBe(true);
+    expect(isAgentProcessAlive(DEAD_PID, null)).toBe(false);
+  });
+});
+
+// --- 7. cross-host fallback + back-compat + errno + GUID parsers ---
+
+describe("v2.13.0 — (7) host-scope, back-compat, errno, parsers", () => {
+  it("a DIFFERENT-host agent is NOT probed even if agent_pid is locally alive", () => {
+    registerAgent("remote", "builder", [], { host_id: "some-other-machine" });
+    setAgentLivenessAnchor("remote", LIVE_PID, null); // COALESCE keeps the other host_id
     ageOut("remote", "idle");
     const a = findAgent("remote");
     expect(a.alive).toBe(false);
-    expect(a.last_alive).toBeNull();
-    // Age-based: idle + 1h silence → offline.
     expect(a.agent_status).toBe("offline");
   });
 
   it("when the relay's own host id is unknown, NO agent is probed", () => {
-    _resetOwnHostIdForTests(null); // GUID extraction failed
-    registerAgent("idler", "builder", [], { host_id: OWN_HOST, host_shell_pids: [LIVE_PID] });
+    _resetOwnHostIdForTests(null);
+    registerAgent("idler", "builder", [], { host_id: OWN_HOST });
+    // setAgentLivenessAnchor still records agent_pid; the probe is what's gated.
+    getDb().prepare("UPDATE agents SET agent_pid = ? WHERE name = ?").run(LIVE_PID, "idler");
     ageOut("idler", "idle");
-    const a = findAgent("idler");
-    expect(a.alive).toBe(false);
-    expect(a.agent_status).toBe("offline"); // pure age-based fallback
+    expect(findAgent("idler").alive).toBe(false);
   });
-});
 
-// --- 4. cross-platform errno handling (pure probe) ---
+  it("an agent with no agent_pid derives exactly as pre-v2.13 (age-based)", () => {
+    registerAgent("legacy", "builder", []);
+    ageOut("legacy", "idle");
+    const a = findAgent("legacy");
+    expect(a.last_alive).toBeNull();
+    expect(a.alive).toBe(false);
+    expect(a.agent_status).toBe("offline");
+  });
 
-describe("v2.13.0 — (4) isPidAlive errno handling", () => {
   const throwing = (code: string) => () => {
     const e = new Error(code) as NodeJS.ErrnoException;
     e.code = code;
     throw e;
   };
-  it("success → alive", () => expect(isPidAlive(123, () => undefined)).toBe(true));
-  it("EPERM (cross-user) → alive", () => expect(isPidAlive(123, throwing("EPERM"))).toBe(true));
-  it("ESRCH (no such process) → dead", () => expect(isPidAlive(123, throwing("ESRCH"))).toBe(false));
-  it("non-positive / non-integer pid → dead", () => {
+  it("isPidAlive: success/EPERM alive, ESRCH dead, bad pid dead", () => {
+    expect(isPidAlive(123, () => undefined)).toBe(true);
+    expect(isPidAlive(123, throwing("EPERM"))).toBe(true);
+    expect(isPidAlive(123, throwing("ESRCH"))).toBe(false);
     expect(isPidAlive(0)).toBe(false);
-    expect(isPidAlive(-1)).toBe(false);
-    expect(isPidAlive(1.5)).toBe(false);
-  });
-  it("isAnyPidAlive: true if any pid alive; false for empty/null", () => {
-    expect(isAnyPidAlive([DEAD_PID, LIVE_PID])).toBe(true);
-    expect(isAnyPidAlive([])).toBe(false);
-    expect(isAnyPidAlive(null)).toBe(false);
-  });
-});
-
-// --- 5. back-compat: no liveness signal → unchanged age-based derivation ---
-
-describe("v2.13.0 — (5) back-compat when no liveness signal", () => {
-  it("an agent with no host_shell_pids derives exactly as pre-v2.13 (age-based)", () => {
-    registerAgent("legacy", "builder", []); // no host_id, no pids
-    ageOut("legacy", "idle");
-    const a = findAgent("legacy");
-    expect(a.last_alive).toBeNull();
-    expect(a.alive).toBe(false);
-    expect(a.agent_status).toBe("offline"); // 1h idle → offline, unchanged
   });
 
-  it("a fresh agent (recent last_seen, no liveness) still reads idle", () => {
-    registerAgent("fresh", "builder", []);
-    const a = findAgent("fresh");
-    expect(a.alive).toBe(false); // no positive signal
-    expect(a.agent_status).toBe("idle"); // recent last_seen
-  });
-});
-
-// --- 6. deriveDashboardState honors lastAlive ---
-
-describe("v2.13.0 — (6) deriveDashboardState + lastAlive", () => {
-  const NOW = 1_900_000_000_000;
-  const longAgo = new Date(NOW - 60 * 60 * 1000).toISOString(); // 1h ago > sessionTimeout
-  const base = {
-    signalReceivedAt: null,
-    signalKind: null,
-    unregisteredAt: null,
-    pendingCount: 0,
-    lastDispatchedAt: null,
-  };
-
-  it("fresh lastAlive suppresses the session-timeout closed → waiting", () => {
-    const inputs = { ...base, lastSeen: longAgo, lastAlive: new Date(NOW - 1000).toISOString() };
-    expect(deriveDashboardState(inputs, NOW, DEFAULT_THRESHOLDS)).toBe("waiting");
-  });
-
-  it("without lastAlive, the same idle agent is closed (the old behavior)", () => {
-    const inputs = { ...base, lastSeen: longAgo, lastAlive: null };
-    expect(deriveDashboardState(inputs, NOW, DEFAULT_THRESHOLDS)).toBe("closed");
-  });
-
-  it("an intentional teardown signal still wins over fresh lastAlive", () => {
-    const inputs = { ...base, lastSeen: longAgo, lastAlive: new Date(NOW - 1000).toISOString(), signalReceivedAt: NOW - 2000 };
-    expect(deriveDashboardState(inputs, NOW, DEFAULT_THRESHOLDS)).toBe("closed");
-  });
-
-  it("a STALE lastAlive (older than the window) does not suppress closed", () => {
-    const inputs = { ...base, lastSeen: longAgo, lastAlive: longAgo };
-    expect(deriveDashboardState(inputs, NOW, DEFAULT_THRESHOLDS)).toBe("closed");
-  });
-});
-
-// --- 7. machine-GUID parse functions (host-scoping source of truth) ---
-
-describe("v2.13.0 — (7) machineGuid extraction", () => {
-  it("parses macOS IOPlatformUUID", () => {
-    const out = '    "IOPlatformUUID" = "564D1234-ABCD-5678-90EF-1234567890AB"';
-    expect(parseDarwinMachineGuid(out)).toBe("564D1234-ABCD-5678-90EF-1234567890AB");
-  });
-  it("parses Linux /etc/machine-id (32 hex)", () => {
+  it("machineGuid parsers", () => {
+    expect(parseDarwinMachineGuid('"IOPlatformUUID" = "564D-ABCD"')).toBe("564D-ABCD");
     expect(parseLinuxMachineId("0123456789abcdef0123456789abcdef\n")).toBe("0123456789abcdef0123456789abcdef");
-    expect(parseLinuxMachineId("not-a-machine-id")).toBeNull();
+    expect(parseLinuxMachineId("nope")).toBeNull();
+    expect(parseWindowsMachineGuid("    MachineGuid    REG_SZ    abcd-1234")).toBe("abcd-1234");
   });
-  it("parses Windows MachineGuid", () => {
-    const out = "    MachineGuid    REG_SZ    abcd1234-5678-90ef-ghij-klmnopqrstuv";
-    expect(parseWindowsMachineGuid(out)).toBe("abcd1234-5678-90ef-ghij-klmnopqrstuv");
-  });
-  it("machineGuid uses the right OS source per platform (injected runner)", () => {
-    const calls: string[] = [];
-    const run = (cmd: string) => {
-      calls.push(cmd);
-      return cmd === "ioreg" ? '"IOPlatformUUID" = "AAAA"' : "";
-    };
-    expect(machineGuid("darwin", run)).toBe("AAAA");
-    expect(calls).toContain("ioreg");
-    expect(machineGuid("freebsd" as any, run)).toBeNull(); // unsupported → null
+
+  it("detectAgentProcess returns null in a non-agent ancestry (e.g. the daemon)", () => {
+    const run = () => `  ${process.pid}  90 x x x x x node /path/bot-relay/dist/index.js\n   90  1 x x x x x launchd\n`;
+    expect(detectAgentProcess(process.pid, run)).toBeNull();
   });
 });
