@@ -6,7 +6,8 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Readable, Writable } from "node:stream";
 import { createServer } from "../server.js";
-import { markAgentOffline, closeAgentSession, getAgentSessionId, logAudit } from "../db.js";
+import { markAgentOffline, closeAgentSession, getAgentSessionId, logAudit, setAgentLivenessAnchor } from "../db.js";
+import { detectAgentProcess, type AgentProcess } from "../liveness.js";
 import { log } from "../logger.js";
 import { broadcastDashboardEvent } from "./websocket.js";
 
@@ -72,6 +73,41 @@ export function updateCapturedSessionId(sid: string | null): void {
 /** Exposed for tests — read-only accessor on the module-local state. */
 export function getCapturedSessionId(): string | null {
   return capturedSessionId;
+}
+
+/**
+ * v2.13.0 — the agent's OWN process (the claude/codex CLI that spawned this
+ * relay stdio server), identified once at startup by an ancestry walk. This is
+ * the universal/agnostic capture point: every stdio agent spawns the relay
+ * stdio server, so its ancestry contains the agent regardless of which CLI it
+ * is. Probing THIS pid (not the host_shell_pids chain) means a
+ * dead agent reads dead even while its terminal stays open. Null when no agent
+ * ancestor matched (or in HTTP-daemon mode, whose ancestry is launchd) → the
+ * agent simply gets no positive liveness signal (age-based fallback).
+ */
+let detectedAgentProcess: AgentProcess | null = null;
+
+/**
+ * Stamp the detected agent process onto `name`'s row as its liveness anchor.
+ * No-op unless this is a stdio process whose RELAY_AGENT_NAME matches `name`
+ * AND an agent ancestor was detected. Called at startup (covers hook-first
+ * registration) and on register (covers MCP-first / re-register) — mirroring
+ * the capturedSessionId dual-capture so it's robust to ordering.
+ */
+export function stampDetectedAgentLiveness(name: string | undefined): void {
+  try {
+    const ownName = process.env.RELAY_AGENT_NAME;
+    if (!name || !ownName || ownName !== name) return;
+    if (!detectedAgentProcess) return;
+    setAgentLivenessAnchor(name, detectedAgentProcess.pid, detectedAgentProcess.startedAt);
+  } catch {
+    // Liveness is best-effort — never block startup/register on a stamp miss.
+  }
+}
+
+/** Test-only: override the detected agent process. */
+export function _setDetectedAgentProcessForTests(p: AgentProcess | null): void {
+  detectedAgentProcess = p;
 }
 
 /**
@@ -233,6 +269,15 @@ export async function startStdioServer(
     ? new StdioServerTransport(stdin, stdout ?? process.stdout)
     : new StdioServerTransport();
   captureSessionId();
+  // v2.13.0 — identify the agent's own process once (zero-token: a single `ps`
+  // at startup, no loop) and stamp it as the liveness anchor if our row already
+  // exists (hook-first registration). The on-register re-stamp in
+  // src/tools/identity.ts covers the MCP-first / re-register orderings.
+  const name = process.env.RELAY_AGENT_NAME;
+  if (name && name !== "default") {
+    detectedAgentProcess = detectAgentProcess();
+    stampDetectedAgentLiveness(name);
+  }
   installAutoUnregister();
   await server.connect(transport);
 }

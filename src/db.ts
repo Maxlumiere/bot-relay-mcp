@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import { getOwnHostId, isAgentProcessAlive } from "./liveness.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -94,6 +95,33 @@ function computeStatus(lastSeen: string): "online" | "stale" | "offline" {
  */
 const AGENT_STATUS_STALE_MINUTES = 5;
 const AGENT_STATUS_OFFLINE_MINUTES = 30;
+
+/**
+ * v2.13.0 — presence liveness. A `last_alive` confirmation counts as "the
+ * terminal is open right now" only while it is fresh; past this window it is
+ * treated as no signal (the agent falls back to age-based derivation). Default
+ * 120s (≈ a probe-on-read cadence with headroom); tunable via
+ * RELAY_AGENT_ALIVE_WINDOW_SEC. The probe cache window suppresses re-probing
+ * the same agent on rapid successive reads — within it, a fresh `last_alive`
+ * is trusted without re-running process.kill.
+ */
+function getAliveWindowMs(): number {
+  const raw = process.env.RELAY_AGENT_ALIVE_WINDOW_SEC;
+  const n = raw ? parseInt(raw, 10) : 120;
+  const sec = Number.isFinite(n) && n > 0 ? n : 120;
+  return sec * 1000;
+}
+const LIVENESS_PROBE_CACHE_MS = 5_000;
+
+/** True when `lastAlive` is a recent positive liveness confirmation. NULL /
+ *  unparseable / future-dated-beyond-window / older than the window → false. */
+function isAliveFresh(lastAlive: string | null | undefined, nowMs: number = Date.now()): boolean {
+  if (!lastAlive) return false;
+  const t = Date.parse(lastAlive);
+  if (!Number.isFinite(t)) return false;
+  const age = nowMs - t;
+  return age >= 0 && age < getAliveWindowMs();
+}
 /**
  * v2.2.2 B3 — abandoned threshold. Agents that have been offline (no
  * re-register, no set_status refresh) for longer than this get
@@ -120,43 +148,85 @@ function normalizeStoredAgentStatus(raw: string | null | undefined): string {
 }
 
 /**
- * v2.1.3 (I6) — derive the observed agent_status from the stored declared
- * state + last_seen age. Active declared states (idle/working/blocked/
- * waiting_user) get overridden to 'stale' after 5 min and 'offline' after
- * 30 min of silence. Declared 'offline' is always offline. 'stale' (rare —
- * only via direct DB write) upgrades to 'offline' at the 30-min threshold.
+ * v2.13.0 — TERMINAL lifecycle states. An agent in one of these "was gone"
+ * states is NOT available. They are the states a re-registration RESETS
+ * (re-register = a fresh session = the agent is back), and the states the
+ * `alive` boolean treats as not-awake.
  */
-function deriveAgentStatus(
+const TERMINAL_AGENT_STATES = new Set(["offline", "closed", "abandoned", "stale"]);
+/** Active declared states — the agent is present + available. */
+const ACTIVE_AGENT_STATES = new Set(["idle", "working", "blocked", "waiting_user"]);
+
+/**
+ * v2.13.0 — the stored agent_status a successful EXISTING-ROW re-registration
+ * should carry forward. A re-register starts a fresh session, so a TERMINAL
+ * state (offline/closed/abandoned/stale) from a prior session is reset to
+ * 'idle' — the agent is back and available (fixes the resume-stuck-offline
+ * bug, incl. the next valid registration after a force token rotation). Active
+ * declared states (idle/working/blocked/waiting_user) reflect current intent
+ * and are PRESERVED across the rotation (the agent re-declares via set_status
+ * if its mode changed). This is the single discriminator that lets
+ * deriveAgentStatus treat a stored 'offline' as an unambiguous CURRENT-session
+ * declaration.
+ */
+function statusAfterReregister(storedRaw: string | null | undefined): string {
+  const s = normalizeStoredAgentStatus(storedRaw);
+  if (ACTIVE_AGENT_STATES.has(s)) return s;
+  return "idle"; // terminal states + anything unknown → fresh idle
+}
+
+/**
+ * Derive the observed agent_status. CANONICAL PRECEDENCE (single source of
+ * truth; the table-driven test in tests/v2-13-0-presence-liveness.test.ts
+ * exercises every cell). Inputs: the STORED declared state (which a re-register
+ * has already normalized — `statusAfterReregister` resets a prior-session
+ * terminal state to idle, so a stored 'offline'/'closed' here means a
+ * CURRENT-session declaration, never carried-over staleness), the last_seen
+ * age, and the positive-liveness signal (`lastAlive`).
+ *
+ * Precedence, top wins:
+ *   1. stored 'offline' (current-session declaration: set_status / force-rotation)
+ *      → 'offline'  [→ 'abandoned' only past the abandon window, dashboard hygiene].
+ *      Liveness does NOT override an explicit "unavailable" — a live process
+ *      doesn't un-declare intent.
+ *   2. fresh liveness (process confirmed alive now) → the declared ACTIVE state
+ *      (idle default). Overrides age-derived stale/offline/abandoned AND a
+ *      current-session 'closed' that somehow still has a live anchor.
+ *   3. no liveness → the v2.1.3 age + stored-terminal chain (unchanged):
+ *      abandoned > stored 'abandoned' > stored 'closed' > age-offline >
+ *      stored 'stale' > age-stale > active.
+ *
+ * With no `lastAlive` (NULL), rules 1+3 are exactly the pre-v2.13 behavior —
+ * byte-identical for every agent without a liveness signal.
+ */
+export function deriveAgentStatus(
   storedRaw: string | null | undefined,
-  lastSeen: string
+  lastSeen: string,
+  lastAlive: string | null | undefined = null,
 ): AgentWithStatus["agent_status"] {
   const stored = normalizeStoredAgentStatus(storedRaw);
   const minutes = (Date.now() - new Date(lastSeen).getTime()) / 60_000;
   const abandonMinutes = getAgentAbandonMinutes();
+  const aliveFresh = isAliveFresh(lastAlive);
 
-  // v2.2.2 B3: abandoned-state promotion. Offline / closed for
-  // >=7-days (default) agents surface as "abandoned" so dashboards
-  // can hide them by default.
+  // 1. Explicit current-session 'offline' DECLARATION — wins over liveness.
+  if (stored === "offline") {
+    return minutes >= abandonMinutes ? "abandoned" : "offline";
+  }
+
+  // 2. Positive liveness — the agent's process is confirmed up.
+  if (aliveFresh) {
+    return ACTIVE_AGENT_STATES.has(stored) ? (stored as AgentWithStatus["agent_status"]) : "idle";
+  }
+
+  // 3. No liveness → age + stored-terminal chain (v2.1.3 behavior, unchanged).
   if (minutes >= abandonMinutes) return "abandoned";
   if (stored === "abandoned") return "abandoned";
-  // v2.2.2 BUG2: stored 'closed' state (set by SIGINT handler) wins
-  // over age-based promotions below the abandoned threshold.
   if (stored === "closed") return "closed";
-  if (stored === "offline") return "offline";
   if (minutes >= AGENT_STATUS_OFFLINE_MINUTES) return "offline";
   if (stored === "stale") return minutes >= AGENT_STATUS_OFFLINE_MINUTES ? "offline" : "stale";
   if (minutes >= AGENT_STATUS_STALE_MINUTES) return "stale";
-
-  // Active declared state. Validate against the known set; fall back to
-  // 'idle' for unrecognized legacy or drift values.
-  if (
-    stored === "idle" ||
-    stored === "working" ||
-    stored === "blocked" ||
-    stored === "waiting_user"
-  ) {
-    return stored;
-  }
+  if (ACTIVE_AGENT_STATES.has(stored)) return stored as AgentWithStatus["agent_status"];
   return "idle";
 }
 
@@ -176,6 +246,7 @@ function parseHostShellPids(raw: string | null | undefined): number[] | null {
 }
 
 function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
+  const derivedAgentStatus = deriveAgentStatus(row.agent_status, row.last_seen, row.last_alive);
   return {
     id: row.id,
     name: row.name,
@@ -185,7 +256,15 @@ function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
     created_at: row.created_at,
     status: computeStatus(row.last_seen),
     has_token: !!row.token_hash,
-    agent_status: deriveAgentStatus(row.agent_status, row.last_seen),
+    agent_status: derivedAgentStatus,
+    // v2.13.0 — positive-liveness surface. `last_alive` is the ISO timestamp
+    // of the most recent confirmation; `alive` is the trustworthy "awake +
+    // available right now?" answer. It requires a fresh confirmation AND that
+    // the surfaced status is an active state — so an agent that DECLARED itself
+    // offline (or is closed/abandoned) reads alive=false even if its process
+    // happens to still be up, keeping `alive` consistent with `agent_status`.
+    last_alive: row.last_alive ?? null,
+    alive: isAliveFresh(row.last_alive) && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
     description: row.description ?? null,
     session_id: row.session_id ?? null,
     terminal_title_ref: row.terminal_title_ref ?? null,
@@ -239,6 +318,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_13(_db);
   migrateSchemaToV2_14(_db);
   migrateSchemaToV2_15(_db);
+  migrateSchemaToV2_16(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -279,6 +359,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_13(_db);
   migrateSchemaToV2_14(_db);
   migrateSchemaToV2_15(_db);
+  migrateSchemaToV2_16(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -500,7 +581,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 17;
+export const CURRENT_SCHEMA_VERSION = 18;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -591,6 +672,7 @@ export function applyMigration(from: number, to: number): void {
     [14, 15],
     [15, 16],
     [16, 17],
+    [17, 18],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1450,6 +1532,44 @@ function migrateSchemaToV2_15(db: CompatDatabase): void {
   }
 }
 
+/**
+ * v2.13.0 — presence liveness. schema v17 → v18.
+ *
+ * Three additive, NULL-default columns on `agents`:
+ *   - `last_alive TEXT NULL` — ISO timestamp of the most recent POSITIVE
+ *     liveness confirmation (a same-host probe found the agent's own process
+ *     alive; future: a Tether heartbeat). Distinct from `last_seen` (activity)
+ *     and `last_dispatched_at`. A fresh `last_alive` proves the agent is open
+ *     even while idle, so the presence derivations stop misreading an
+ *     alive-and-idle agent as offline/closed.
+ *   - `agent_pid INTEGER NULL` — the agent's OWN process id (the claude/codex
+ *     CLI), identified by the stdio server's ancestry walk (or self-reported
+ *     by managed/script agents on register). This is the process we probe —
+ *     NOT the host_shell_pids ancestry chain, whose shell/terminal ancestors
+ *     outlive the agent. Dies exactly when the agent exits/crashes.
+ *   - `agent_pid_start TEXT NULL` — the agent process's start-time token, a
+ *     PID-reuse guard: a recycled PID (new process, different start-time)
+ *     reads dead.
+ *
+ * Additive + idempotent — PRAGMA-guarded so re-runs no-op. NULL on every
+ * existing row = zero data migration; with no liveness signal the agent
+ * derives exactly as today (pure age-based) until a probe populates it.
+ */
+function migrateSchemaToV2_16(db: CompatDatabase): void {
+  const agentCols = db
+    .prepare("PRAGMA table_info(agents)")
+    .all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "last_alive")) {
+    db.exec("ALTER TABLE agents ADD COLUMN last_alive TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "agent_pid")) {
+    db.exec("ALTER TABLE agents ADD COLUMN agent_pid INTEGER");
+  }
+  if (!agentCols.some((c) => c.name === "agent_pid_start")) {
+    db.exec("ALTER TABLE agents ADD COLUMN agent_pid_start TEXT");
+  }
+}
+
 function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -1807,6 +1927,9 @@ export function updateAgentMetadata(
     last_seen?: string;
     agent_status?: string;
     busy_expires_at?: string | null;
+    // v2.13.0 — positive-liveness timestamp (same-host PID probe / heartbeat).
+    // Non-auth-state field, same single-site writer as the rest.
+    last_alive?: string;
   }
 ): boolean {
   const db = getDb();
@@ -1822,6 +1945,33 @@ export function updateAgentMetadata(
   const r = db.prepare(
     `UPDATE agents SET ${setCols.join(", ")} WHERE name = ?`
   ).run(...vals, name);
+  return r.changes > 0;
+}
+
+/**
+ * v2.13.0 — record the agent's OWN process as its liveness anchor. Called by
+ * the stdio MCP server at startup (it walks its ancestry to find the agent
+ * CLI) and by register_agent self-report (managed/script agents). Sets
+ * agent_pid + agent_pid_start, and fills host_id with the relay's own machine
+ * GUID iff currently NULL (so the same-host probe can match; never overwrites
+ * a host_id the handshake already set). Clears any stale negative-probe verdict
+ * so a freshly-relaunched agent isn't briefly dead-cached. No-op (false) if the
+ * row doesn't exist yet. Sanctioned single-site agents mutation (lives in db.ts).
+ */
+export function setAgentLivenessAnchor(
+  name: string,
+  pid: number,
+  startedAt: string | null,
+): boolean {
+  if (!name || !Number.isInteger(pid) || pid <= 0) return false;
+  const db = getDb();
+  const ownHost = getOwnHostId();
+  const r = db
+    .prepare(
+      "UPDATE agents SET agent_pid = ?, agent_pid_start = ?, host_id = COALESCE(host_id, ?) WHERE name = ?",
+    )
+    .run(pid, startedAt, ownHost, name);
+  if (r.changes > 0) _negativeProbeCache.delete(name);
   return r.changes > 0;
 }
 
@@ -1864,9 +2014,13 @@ export function markAgentOffline(
 ): { changed: boolean } {
   const db = getDb();
   const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'offline', busy_expires_at = NULL " +
+    // v2.13.0 — clear the liveness anchor in the SAME CAS so a same-host probe
+    // can't restamp last_alive and mask this offline transition.
+    "UPDATE agents SET session_id = NULL, agent_status = 'offline', busy_expires_at = NULL, " +
+    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(name, expectedSessionId);
+  if (r.changes === 1) _negativeProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -1907,19 +2061,26 @@ export function closeAgentSession(
   // call carries one. Two SQL forms are cheaper to maintain than a
   // dynamic builder + safer than a single COALESCE form that could
   // smuggle a NULL through and clear an already-set signal stamp.
+  // v2.13.0 — clear the liveness anchor (last_alive + agent_pid + start) in the
+  // SAME CAS as the close so a same-host probe can't restamp last_alive and
+  // mask the close. Applies to both SQL forms.
   if (signalKind === null) {
     const r = db.prepare(
-      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL " +
+      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
+      "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
       "WHERE name = ? AND session_id = ?"
     ).run(name, expectedSessionId);
+    if (r.changes === 1) _negativeProbeCache.delete(name);
     return { changed: r.changes === 1 };
   }
   const nowMs = Date.now();
   const r = db.prepare(
     "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
-    "signal_received_at = ?, signal_kind = ? " +
+    "signal_received_at = ?, signal_kind = ?, " +
+    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(nowMs, signalKind, name, expectedSessionId);
+  if (r.changes === 1) _negativeProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2276,14 +2437,19 @@ export function registerAgent(
       options.host_id !== undefined
         ? options.host_id
         : existing.host_id ?? null;
+    // v2.13.0 — a fresh session resets a TERMINAL lifecycle state (offline/
+    // closed/abandoned/stale) to idle so a genuinely RESUMED agent (relaunch,
+    // or the next valid registration after a force token rotation) comes back
+    // available instead of staying stuck offline. Active states are preserved.
+    const newAgentStatus = statusAfterReregister(existing.agent_status);
     const r = db.prepare(
       "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
-      "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, " +
+      "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, agent_status = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ? " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
       role, timestamp, newHash, session_id, timestamp, newDescription,
-      newTitleRef, newHostShellPids, newHostId,
+      newTitleRef, newHostShellPids, newHostId, newAgentStatus,
       newAuthState, newRecoveryHash, newRevokedAt,
       name, existingState, existing.token_hash, casRecoveryHash
     );
@@ -2303,6 +2469,7 @@ export function registerAgent(
       terminal_title_ref: newTitleRef,
       host_shell_pids: newHostShellPids,
       host_id: newHostId,
+      agent_status: newAgentStatus,
       auth_state: newAuthState,
       recovery_token_hash: newRecoveryHash,
       revoked_at: newRevokedAt,
@@ -2752,6 +2919,7 @@ export function getDashboardAgentSnapshots(
     unregisteredAt: number | null;
     pendingCount: number;
     lastDispatchedAt: number | null;
+    lastAlive: string | null;
   };
 }> {
   const db = getDb();
@@ -2764,6 +2932,10 @@ export function getDashboardAgentSnapshots(
          a.signal_received_at,
          a.signal_kind,
          a.last_dispatched_at,
+         a.host_id,
+         a.agent_pid,
+         a.agent_pid_start,
+         a.last_alive,
          (SELECT COUNT(*) FROM messages m
            WHERE m.to_agent = a.name
              AND m.status = 'pending'
@@ -2776,8 +2948,16 @@ export function getDashboardAgentSnapshots(
     signal_received_at: number | null;
     signal_kind: string | null;
     last_dispatched_at: number | null;
+    host_id: string | null;
+    agent_pid: number | null;
+    agent_pid_start: string | null;
+    last_alive: string | null;
     pending_count_old: number | bigint;
   }>;
+  // v2.13.0 — refresh positive liveness so the dashboard reflects alive-and-
+  // idle agents too (mutates row.last_alive in place). Same host-scoped,
+  // cache-gated probe getAgents() uses.
+  refreshLivenessForRows(rows);
   return rows.map((r) => ({
     name: r.name,
     inputs: {
@@ -2791,6 +2971,7 @@ export function getDashboardAgentSnapshots(
       unregisteredAt: null,
       pendingCount: Number(r.pending_count_old),
       lastDispatchedAt: r.last_dispatched_at,
+      lastAlive: r.last_alive,
     },
   }));
 }
@@ -2887,6 +3068,10 @@ export function setAgentStatus(name: string, status: SetStatusValue): boolean {
 export interface HealthSnapshot {
   status: "ok";
   agent_count: number;
+  /** v2.13.0 — agents confirmed alive RIGHT NOW (fresh same-host PID probe /
+   *  heartbeat). The trustworthy "how many are actually awake?" count, vs the
+   *  raw agent_count which includes idle/closed/abandoned rows. */
+  agent_count_alive: number;
   message_count_pending: number;
   task_count_active: number;
   task_count_queued: number;
@@ -2910,9 +3095,13 @@ export function getHealthSnapshot(): HealthSnapshot {
     "SELECT COUNT(*) AS c FROM tasks WHERE status = 'queued'"
   ).get() as { c: number }).c;
   const channelCount = (db.prepare("SELECT COUNT(*) AS c FROM channels").get() as { c: number }).c;
+  // v2.13.0 — alive count routes through getAgents() so it reflects the same
+  // positive-liveness probe discover_agents uses (not a stale age-based guess).
+  const agentCountAlive = getAgents().filter((a) => a.alive).length;
   return {
     status: "ok",
     agent_count: agentCount,
+    agent_count_alive: agentCountAlive,
     message_count_pending: messageCountPending,
     task_count_active: taskCountActive,
     task_count_queued: taskCountQueued,
@@ -2968,6 +3157,84 @@ export function getTasksInWindow(sinceIso: string, limit: number = 1000): TaskRe
   }));
 }
 
+/**
+ * v2.13.0 — negative-probe cache. A dead agent has no fresh `last_alive` to
+ * cache against, so without this every presence read would re-probe it (an
+ * extra `ps`/kill per dead same-host row, every getAgents/health/standup).
+ * Keyed by agent name → the wall-clock ms of the last dead verdict; within the
+ * cache window we skip the re-probe. In-memory (process-local): a stale entry
+ * at worst delays a fresh alive verdict by the cache window, never a wrong one.
+ */
+const _negativeProbeCache = new Map<string, number>();
+
+/** Test-only: count of ACTUAL liveness probes (cache-miss isAgentProcessAlive
+ *  calls), so tests can assert the positive/negative caches suppress re-probes. */
+let _livenessProbeCount = 0;
+
+/** Test-only: clear the negative-probe cache + reset the probe counter. */
+export function _resetLivenessProbeCacheForTests(): void {
+  _negativeProbeCache.clear();
+  _livenessProbeCount = 0;
+}
+
+/** Test-only: read the probe counter. */
+export function _getLivenessProbeCountForTests(): number {
+  return _livenessProbeCount;
+}
+
+/**
+ * v2.13.0 — lazy presence-liveness refresh. For each row that is (a) on THIS
+ * host (host_id matches the relay's own GUID) and (b) has a recorded
+ * `agent_pid` (the agent's OWN process — claude/codex — NOT the host_shell_pids
+ * ancestry chain, whose shell/terminal ancestors outlive the agent), probe
+ * that process. On a live hit, stamp `last_alive = now()` (mutating `row` in
+ * place so the immediate map() sees it + persisting via the sanctioned writer).
+ *
+ * Skipped (→ unchanged age-based derivation): cross-host agents, agents with no
+ * recorded agent_pid, agents whose `last_alive` is fresh within the cache
+ * window (positive cache), and agents recently confirmed dead (negative cache).
+ *
+ * Cheap: gated by host match + both caches, a steady-state read does near-zero
+ * probes.
+ */
+function refreshLivenessForRows(
+  rows: Array<{
+    name: string;
+    host_id?: string | null;
+    agent_pid?: number | null;
+    agent_pid_start?: string | null;
+    last_alive?: string | null;
+  }>,
+): void {
+  const ownHost = getOwnHostId();
+  if (!ownHost) return; // can't host-scope → never probe (cross-host fallback)
+  const nowMs = Date.now();
+  const ts = new Date(nowMs).toISOString();
+  for (const row of rows) {
+    if (!row.host_id || row.host_id !== ownHost) continue; // cross-host
+    if (typeof row.agent_pid !== "number" || row.agent_pid <= 0) continue; // no anchor
+    // Positive cache — a recent live confirmation is trusted as-is.
+    if (row.last_alive) {
+      const age = nowMs - Date.parse(row.last_alive);
+      if (Number.isFinite(age) && age >= 0 && age < LIVENESS_PROBE_CACHE_MS) continue;
+    }
+    // Negative cache — recently-confirmed-dead rows aren't re-probed in-window.
+    const deadAt = _negativeProbeCache.get(row.name);
+    if (deadAt !== undefined && nowMs - deadAt < LIVENESS_PROBE_CACHE_MS) continue;
+
+    _livenessProbeCount++;
+    if (isAgentProcessAlive(row.agent_pid, row.agent_pid_start ?? null)) {
+      row.last_alive = ts; // in-place so the subsequent map() reflects it
+      _negativeProbeCache.delete(row.name);
+      updateAgentMetadata(row.name, { last_alive: ts });
+    } else {
+      // Dead → record the verdict so we don't re-probe every read; leave
+      // last_alive untouched so the age-based derivation applies.
+      _negativeProbeCache.set(row.name, nowMs);
+    }
+  }
+}
+
 export function getAgents(role?: string): AgentWithStatus[] {
   const db = getDb();
   let rows: AgentRecord[];
@@ -2978,6 +3245,9 @@ export function getAgents(role?: string): AgentWithStatus[] {
     rows = db.prepare("SELECT * FROM agents ORDER BY last_seen DESC").all() as AgentRecord[];
   }
 
+  // v2.13.0 — refresh positive liveness before deriving status so an alive-
+  // and-idle agent reads alive, not offline/closed.
+  refreshLivenessForRows(rows);
   return rows.map(toAgentWithStatus);
 }
 

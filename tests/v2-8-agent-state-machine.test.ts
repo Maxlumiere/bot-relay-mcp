@@ -355,7 +355,7 @@ describe("v2.8 — resolveThresholdsFromEnv", () => {
     expect(t.staleWindowMs).toBe(DEFAULT_THRESHOLDS.staleWindowMs);
   });
 
-  it("(M31) honors all six env vars together", () => {
+  it("(M31) honors all seven env vars together", () => {
     const t = resolveThresholdsFromEnv({
       RELAY_STATE_ACTIVE_WINDOW_SEC: "10",
       RELAY_STATE_PENDING_WINDOW_SEC: "20",
@@ -363,6 +363,7 @@ describe("v2.8 — resolveThresholdsFromEnv", () => {
       RELAY_STATE_WAS_ACTIVE_WINDOW_SEC: "40",
       RELAY_SESSION_TIMEOUT_SEC: "50",
       RELAY_STATE_RECENT_DISPATCH_SEC: "60",
+      RELAY_AGENT_ALIVE_WINDOW_SEC: "70", // v2.13.0 — positive-liveness window
     });
     expect(t).toEqual({
       activeWindowMs: 10_000,
@@ -371,6 +372,7 @@ describe("v2.8 — resolveThresholdsFromEnv", () => {
       wasActiveWindowMs: 40_000,
       sessionTimeoutMs: 50_000,
       recentDispatchWindowMs: 60_000,
+      aliveWindowMs: 70_000,
     });
   });
 

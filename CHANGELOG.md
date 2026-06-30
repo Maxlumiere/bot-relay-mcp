@@ -1,5 +1,37 @@
 # Changelog
 
+## v2.13.0 — 2026-06-30 — Presence liveness (alive-and-idle vs. closed)
+
+The relay couldn't reliably tell an **alive-but-idle** agent from a **closed** one. `last_seen` only advances on activity (observation isn't liveness, v1.3), so an agent sitting open and waiting aged out to `stale → offline → closed`/`abandoned` — and orchestrators misread live idle agents as dead. This adds a **positive** liveness signal so "is this agent awake and waiting?" has a trustworthy answer.
+
+### Added — same-host agent-process liveness probe + `last_alive`
+
+- New additive columns **`agents.last_alive`** (ISO timestamp of the most recent positive liveness confirmation; distinct from `last_seen` activity), **`agents.agent_pid`** (the agent's OWN process id), and **`agents.agent_pid_start`** (a start-time token guarding PID reuse).
+- On a presence read (`discover_agents`, `get_standup`, `health_check`), the relay lazily probes **the agent's own process** with a `process.kill(pid, 0)` signal-0 check **(same-host only)**. If that process is alive, the agent is open — even while idle — and `last_alive` is stamped. Crucially this probes the **agent process**, not the `host_shell_pids` ancestry chain: the chain's shell/terminal ancestors outlive the agent, so probing them would keep a dead agent "alive" while its terminal stays open. `host_shell_pids` is left untouched for its terminal-binding purpose.
+- The probe is host-scoped by the OS machine GUID (`host_id`) — a PID is only probed when the agent shares the relay's host, so it can never false-match an unrelated process elsewhere. `EPERM` (cross-user) counts as alive; `ESRCH` as dead. A recycled PID (different `agent_pid_start`) reads dead. Two caches (positive `last_alive` + an in-memory negative cache) suppress re-probing on rapid successive reads.
+- **The capture point is universal**, not Claude-specific: the relay's **stdio MCP server** — which every stdio agent spawns as a child — walks its own ancestry once at startup (a single `ps`, zero-token, no loop) to identify the agent CLI. Identification matches **claude + codex** out of the box and is **extensible via `RELAY_AGENT_PROCESS_PATTERN`** for other CLIs; an unrecognized binary falls back to age-based presence (safe). Managed/script agents self-report `agent_pid` via `register_agent`.
+- New module computing this host's machine GUID with the exact OS source the SessionStart hook + extension use (macOS `IOPlatformUUID` / Linux `/etc/machine-id` / Windows `MachineGuid`), so host comparison is byte-identical.
+
+### Changed — both presence derivations honor liveness
+
+- `deriveAgentStatus` (the `discover_agents`/`health_check` surface) and `deriveDashboardState` (the dashboard) now take the liveness signal: a **fresh** `last_alive` overrides the age-based `offline`/`abandoned` promotions and a **stale stored `closed`** from a prior session, so an alive-and-idle agent reads `idle`/`waiting` instead of `closed`. A genuine current-session teardown wins: `closeAgentSession`/`markAgentOffline` clear `last_alive` + `agent_pid` in the same atomic update, so the probe has nothing to restamp and the close is never masked.
+- Presence derivation follows a **canonical precedence table** (single source of truth, exercised cell-by-cell in tests): (1) an explicit current-session `offline` declaration (`set_status('offline')`, force token rotation) wins over liveness — a deliberate "unavailable" isn't un-declared by a live process; (2) a fresh liveness signal surfaces the active state, overriding age-derived `stale`/`offline`/`abandoned` and a stale prior-session `closed`; (3) with no liveness, the unchanged age + stored-terminal chain. The `alive` boolean requires a fresh confirmation **and** an active surfaced status, so it stays consistent with `agent_status`.
+- **Resume is clean:** an existing-row re-registration resets a TERMINAL lifecycle state (`offline`/`closed`/`abandoned`/`stale`) to `idle` — a relaunched agent (or the next valid registration after a force token rotation) comes back **available**, not stuck offline. Active declared states (`working`/`blocked`/`waiting_user`) are preserved across the session rotation as current intent. This reset is what lets a stored `offline` be read unambiguously as a current-session declaration.
+- New query surface: `discover_agents` + `get_standup` agents carry **`last_alive`** (ISO) and **`alive`** (boolean — the trustworthy "awake right now?"); `health_check` adds **`agent_count_alive`**.
+- Freshness window tunable via `RELAY_AGENT_ALIVE_WINDOW_SEC` (default 120s).
+
+### Schema
+
+- Migrates **v17 → v18** — three additive `NULL`-default columns (`last_alive`, `agent_pid`, `agent_pid_start`). Zero data migration: with no liveness signal an agent derives exactly as before (pure age-based), so behavior is byte-identical until a probe populates it.
+
+### Notes
+
+- This ships the relay-side foundation. A Tether-extension liveness **heartbeat** (cross-host + crash-without-clean-exit coverage, with its own auth model) is a planned follow-on; the relay-side probe covers same-host fleets today.
+
+### Tests
+
+`tests/v2-13-0-presence-liveness.test.ts` (NEW): the headline regression (idle agent with a live process reads `alive`/`idle`, not `closed`/`offline`, even with a stale stored `closed`); a current-session close clears the anchor so liveness can't mask it; we probe `agent_pid` not the chain (a dead agent with a live shell ancestor reads dead); the negative cache (dead rows aren't re-probed in-window); **the agnostic proof** — a non-Claude (codex) agent reads alive-when-idle, and the ancestry walk identifies codex as readily as claude; the PID-reuse start-time guard; cross-host fallback; back-compat (no signal → byte-identical age-based); `process.kill` errno handling; and the machine-GUID parsers.
+
 ## v2.12.0 — 2026-06-29 — Pending vs. history (a permanent "resolved" plane)
 
 A fresh agent session calling `get_messages(status="pending")` could re-surface messages it had already handled in a **prior** session, as if newly actionable. This is a direct consequence of the intentional **session-scoped** read model (a new terminal re-sees previously-read mail so a handover never drops *unfinished* work, v2.0 final #6): a new `session_id` makes every prior-session-read message look pending again — correct for unfinished work, wrong for already-handled items.
