@@ -26,7 +26,7 @@ vi.mock("child_process", () => ({
 }));
 
 const { handleSpawnAgent } = await import("../src/tools/spawn.js");
-const { getMessages, registerAgent, closeDb } = await import("../src/db.js");
+const { getMessages, registerAgent, getAgents, closeDb } = await import("../src/db.js");
 const cp = await import("child_process");
 
 function parseResult(result: { content: { text: string }[] }) {
@@ -100,6 +100,28 @@ describe.skipIf(os.platform() !== "darwin")("spawn_agent tool", () => {
     expect(msgs.length).toBe(1);
     expect(msgs[0].from_agent).toBe("system");
     expect(msgs[0].content).toContain("Welcome!");
+  });
+
+  it("(v2.14.1) pre-registers the child OFFLINE so its first hook run captures PIDs without a name-collision", async () => {
+    await handleSpawnAgent({
+      name: "spawned-child",
+      role: "builder",
+      capabilities: [],
+      initial_message: "hello child",
+    });
+
+    // The parent-side pre-register RESERVES name+token but leaves the row
+    // OFFLINE (session cleared) — so the child's SessionStart hook re-register
+    // is not blocked by the name-collision guard and can fill its PIDs.
+    const row = getAgents().find((a) => a.name === "spawned-child");
+    expect(row).toBeTruthy();
+    expect(row!.session_id).toBeNull();
+    expect(row!.agent_status).toBe("offline");
+
+    // Mail queued to the offline pre-registered row STILL delivers to the child.
+    const msgs = getMessages("spawned-child", "pending", 10);
+    expect(msgs.length).toBe(1);
+    expect(msgs[0].content).toBe("hello child");
   });
 
   it("does not queue a message when initial_message is omitted", async () => {

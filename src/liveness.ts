@@ -68,7 +68,19 @@ export type CommandRunner = (cmd: string, args: string[]) => string;
 
 const defaultRunner: CommandRunner = (cmd, args) => {
   try {
-    return execFileSync(cmd, args, { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+    // v2.14.1 — force LC_ALL=C so `ps -o lstart=` yields a DETERMINISTIC,
+    // locale-independent start-time. The agent_pid_start token is written by
+    // the SessionStart hook (user shell) and re-read here at probe time under
+    // launchd; without a pinned locale the two could format the same start
+    // time differently → a live agent's token wouldn't match → it would read
+    // DEAD. The other commands here (ioreg/cat/reg) are locale-insensitive, so
+    // pinning C is safe for all.
+    return execFileSync(cmd, args, {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, LC_ALL: "C" },
+    });
   } catch {
     return "";
   }

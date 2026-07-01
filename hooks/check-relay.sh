@@ -295,11 +295,20 @@ elif [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
   # host_shell_pids). The re-register is auth-gated server-side (enforceAuth
   # requires the row's own token) + collision-guarded (handler rejects a row
   # that is genuinely live), so falling through is safe.
+  #
+  # v2.14.1 — a row is only treated as LIVE (skip) when it ALSO already carries
+  # host_shell_pids. A freshly pre-registered/spawned child (or any row that
+  # never captured its PID handshake) has EMPTY host_shell_pids → treated as
+  # STALE → we fall through and register, so the child's FIRST hook run captures
+  # host_shell_pids + host_id + agent_pid. Paired with the spawn-side offline
+  # pre-register (src/tools/spawn.ts), which keeps that register from tripping
+  # the collision guard. Populated-live rows still skip as before.
   LIVENESS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT CASE
   WHEN session_id IS NOT NULL AND session_id != ''
        AND (julianday('now') - julianday(last_seen)) * 86400 < 120
+       AND host_shell_pids IS NOT NULL AND host_shell_pids != ''
   THEN 'LIVE' ELSE 'STALE' END
 FROM agents WHERE name = :name LIMIT 1;
 SQL
@@ -363,6 +372,56 @@ relay_pid_chain() {
   printf '[%s]' "$chain"
 }
 
+# v2.14.1 — find the AGENT's OWN process PID (the claude/codex CLI) in this
+# hook's ancestry, for presence liveness. Unlike relay_pid_chain (a chain
+# incl. shell/terminal ancestors that OUTLIVE the agent — only good for Tether
+# terminal binding), this returns the single process that dies exactly when the
+# agent exits, so the relay can probe it.
+#
+# Matches on the executable's COMM (basename, NO path) — critical, because the
+# relay repo can live under a directory named "Claude" (e.g. ".../Claude AI/
+# bot-relay-mcp"), so an argv/path match would false-hit ANY process launched
+# from there (including this very hook). comm has no path, so only the actual
+# executable matters. Node/bun/deno-hosted agent CLIs report comm=node/bun/deno;
+# in THIS hook's ancestry the only such runtime IS the agent (the relay stdio
+# server is a sibling, not an ancestor, and is excluded by its argv anyway).
+# Starts from the hook's PARENT — the hook's own process is never the agent.
+# Extensible via RELAY_AGENT_PROCESS_PATTERN. Empty → agent_pid omitted → the
+# relay falls back to age-based presence (graceful). POSIX only (Windows omit).
+relay_agent_pid() {
+  local pid ppid comm args depth=0 pat
+  pat='claude|codex|node|bun|deno'
+  [ -n "${RELAY_AGENT_PROCESS_PATTERN:-}" ] && pat="${pat}|${RELAY_AGENT_PROCESS_PATTERN}"
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) return ;;
+  esac
+  pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
+  while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm="${comm##*/}"
+    if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
+      # The relay's own stdio server also reports comm=node — exclude it by its
+      # entrypoint so we never bind the presence anchor to the relay itself.
+      args=$(ps -o args= -p "$pid" 2>/dev/null)
+      case "$args" in *dist/index.js*) ;; *) printf '%s' "$pid"; return ;; esac
+    fi
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$ppid" in ''|*[!0-9]*) break ;; esac
+    [ "$ppid" -le 1 ] && break
+    pid="$ppid"; depth=$((depth+1))
+  done
+}
+
+# v2.14.1 — start-time token for a PID (the relay's PID-reuse guard). LC_ALL=C so
+# the format is DETERMINISTIC and byte-identical to what the daemon's probe
+# reads (src/liveness.ts also pins LC_ALL=C) — otherwise a locale difference
+# between this user shell and the launchd daemon would make a live agent read
+# dead. Trimmed of surrounding whitespace. Empty on any failure.
+relay_pid_start() {
+  local pid="$1"
+  [ -n "$pid" ] || return
+  LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
 # --- Register via HTTP register_agent (Phase 7p HIGH #3) ---
 #
 # Prior to Phase 7p this block did a raw sqlite3 UPSERT. That created
@@ -391,10 +450,16 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   RELAY_HOST_PID_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
   [ "$RELAY_HOST_PID_CHAIN" = "[]" ] && RELAY_HOST_PID_CHAIN=""
   RELAY_HOST_GUID=$(relay_machine_guid 2>/dev/null || printf '')
+  # v2.14.1 — the agent's OWN process (presence). Best-effort: empty →
+  # field omitted → age-based fallback (like host_shell_pids). agent_pid_start
+  # is only sent when agent_pid resolved.
+  RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
+  RELAY_AGENT_PID_START=""
+  [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
   REG_BODY=$(curl -s -m 4 -w "\nHTTP_STATUS:%{http_code}\n" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}}}}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
     2>&1)
   # v2.6.1 — capture fresh agent_token from the response body and persist
   # to the vault. register_agent only returns `agent_token` on first-mint
