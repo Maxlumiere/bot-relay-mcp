@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { sendMessage, getAgentAuthData, registerAgent, unregisterAgent } from "../db.js";
+import { sendMessage, getAgentAuthData, registerAgent, unregisterAgent, markAgentOffline } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { log } from "../logger.js";
 import type { SpawnAgentInput } from "../types.js";
@@ -234,6 +234,23 @@ export async function handleSpawnAgent(input: SpawnAgentInput) {
       ],
       isError: true,
     };
+  }
+
+  // v2.14.1 — NOW that the driver launched successfully, clear the just-minted
+  // session so the pre-registered row is OFFLINE/reserved. Done AFTER the driver
+  // (not before) so the driver-failure + vault-failure rollbacks above can still
+  // find the live session for their session-scoped unregister. The child process
+  // doesn't exist yet — the parent is not its live session. Offline means the
+  // child's own SessionStart hook re-registers freely (the name-collision guard
+  // only fires on an actively-held row), capturing its live PID handshake
+  // (host_shell_pids + agent_pid); the presence derivation resets offline→idle so it comes up
+  // idle+alive. The token stays valid and mail still delivers to an offline row.
+  if (registeredSessionId) {
+    try {
+      markAgentOffline(input.name, registeredSessionId);
+    } catch (err) {
+      log.warn("[spawn] Failed to mark the pre-registered row offline (child may hit a name-collision on its first register):", err);
+    }
   }
 
   fireWebhooks("agent.spawned", "system", input.name, {});

@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.14.1 — 2026-07-01 — Every agent captures its liveness anchor on launch
+
+v2.13.0's presence probe was **live but inert** in production: `agent_pid` (the process the probe checks) was only populated by the stdio MCP server's ancestry walk, but live agents register via the SessionStart hook over HTTP — which sent `host_shell_pids` but **not** `agent_pid` — and the HTTP daemon can't self-detect (its own ancestry is launchd). So `agent_pid` stayed NULL and presence fell back to the age-based chain. This makes the probe real for every agent.
+
+### Fixed — the SessionStart hooks now capture `agent_pid`
+
+- Both hooks (`check-relay.sh` for Claude, `codex/codex-session-start.sh` for Codex) now compute the agent's own process id + start-time and send them in `register_agent` (which already persists them). So every hook-registered agent — summoned, spawned, or relaunched — captures its liveness anchor on first launch, HTTP or stdio, zero-token.
+- The agent process is identified by its **`comm` (executable basename), not its argv/path** — critical, because the relay can live under a directory named `Claude` (e.g. `.../Claude AI/bot-relay-mcp`), so an argv/path match would false-hit any process launched from there (including the hook itself). Node/bun/deno-hosted CLIs are matched via the runtime `comm`; the relay's own node is excluded by its entrypoint. Extensible via `RELAY_AGENT_PROCESS_PATTERN`. Unidentified → omitted → age-based fallback (graceful).
+- `start-time` is read with `LC_ALL=C` in **both** the hook and the relay's probe (`src/liveness.ts`), so the captured token matches the daemon's probe-time read byte-for-byte across the user-shell/launchd locale boundary (a drift would false-read a live agent dead).
+- The **stdio-server matcher (`src/liveness.ts`) is brought to the same identity discipline**: `findAgentProcess` now matches process **identity** — the executable basename (via `comm`, else argv[0]), or for a runtime-hosted CLI the hosted script's basename — never the raw `ps command=` string. The old full-command regex would stamp any non-agent ancestor whose *path* merely contained `claude`/`codex` (e.g. a wrapper under `.../Claude AI/...`) as the agent, reading a dead agent alive while that ancestor lived. `DEFAULT_AGENT_PATTERN` / `RELAY_AGENT_PROCESS_PATTERN` are now exact-basename matchers, and the self-exclude is narrowed to the entrypoint only (an agent launched from a `bot-relay` checkout is no longer wrongly excluded).
+
+### Fixed — spawned agents capture their PIDs
+
+- `spawn_agent` pre-registered the child parent-side as a live row, so the child's own SessionStart hook re-register would trip the name-collision guard (`NAME_COLLISION_ACTIVE`) — the child could never fill its `host_shell_pids`/`agent_pid`. The parent now marks the pre-registered row **offline** (after the driver launches, so failure rollbacks still work), so the child re-registers freely, the presence derivation resets `offline → idle`, and it captures its PIDs. The token stays valid and mail still delivers to the offline row.
+- `check-relay.sh`'s `SKIP_REGISTER` liveness gate now treats a row as skippable only when it is live **and already carries `host_shell_pids`** — a freshly-provisioned/spawned row with empty PIDs re-registers on its first hook run to fill them.
+
+### Tests
+
+`tests/v2-14-1-spawned-agent-pid.test.ts` (NEW) runs the shipped hook against a real daemon: an offline (spawn-preregister-state) row → the hook registers and fills `agent_pid` + `host_shell_pids` (a live ancestor process); a populated-live row → the hook skips; and the hook-captured start-time equals the relay's probe (`LC_ALL=C` parity). `tests/spawn.test.ts` pins the offline pre-register (session cleared, mail still delivered), and the driver-failure rollback tests confirm the offline transition doesn't break the session-scoped rollback. No schema change; no new tool.
+
 ## v2.14.0 — 2026-06-30 — Reserved-name / impersonation protection
 
 The local daemon is intentionally auth-free for zero-config onboarding. An agent that already holds a token is protected from impersonation by the token↔identity binding (v2.12.0: a `from`/actor field authenticates only against the caller's own token — so you cannot `send_message(from=someone-else)` without their token). The remaining hole was the **register side**: `register_agent`'s auth-free bootstrap path let any caller **claim** a persona/sentinel name that had no live row and mint its token — becoming that identity. This closes it.

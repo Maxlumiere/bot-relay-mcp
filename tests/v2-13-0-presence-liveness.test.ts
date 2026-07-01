@@ -64,6 +64,7 @@ const {
   findAgentProcess,
   detectAgentProcess,
   resolveAgentPattern,
+  processIdentityIsAgent,
   DEFAULT_AGENT_PATTERN,
   parseDarwinMachineGuid,
   parseLinuxMachineId,
@@ -211,11 +212,43 @@ describe("v2.13.0 — (5) universality: a non-Claude agent reads alive-when-idle
     expect(foundClaude?.pid).toBe(100);
   });
 
-  it("DEFAULT_AGENT_PATTERN matches claude + codex argv but not a plain shell", () => {
-    expect(DEFAULT_AGENT_PATTERN.test("node /usr/local/bin/claude")).toBe(true);
-    expect(DEFAULT_AGENT_PATTERN.test("/opt/codex/codex serve")).toBe(true);
-    expect(DEFAULT_AGENT_PATTERN.test("-zsh")).toBe(false);
-    expect(DEFAULT_AGENT_PATTERN.test("/usr/bin/login")).toBe(false);
+  it("matches the agent by IDENTITY (exe/script basename), NOT a full-command substring", () => {
+    // Real positives — executable basename or runtime-hosted script basename.
+    expect(processIdentityIsAgent("node /usr/local/bin/claude", "node")).toBe(true);
+    expect(processIdentityIsAgent("node /usr/local/bin/codex serve", "node")).toBe(true);
+    expect(processIdentityIsAgent("node /usr/local/bin/claude --resume", "node")).toBe(true);
+    expect(processIdentityIsAgent("/opt/codex/codex serve", "codex")).toBe(true);
+    expect(processIdentityIsAgent("claude --resume", "claude")).toBe(true);
+    expect(processIdentityIsAgent("codex serve", "codex")).toBe(true);
+    // comm may be unset (hand-built tables) → argv[0] basename fallback.
+    expect(processIdentityIsAgent("/opt/codex/codex serve", undefined)).toBe(true);
+
+    // The reported HIGH — a NON-agent process whose PATH merely contains
+    // "claude"/"codex" (a directory) must NOT match. These are codex's exact
+    // reproduction cases; the old full-command regex false-matched all three.
+    expect(processIdentityIsAgent("node /home/dev/Claude AI/not-agent-wrapper.js", "node")).toBe(false);
+    expect(processIdentityIsAgent("node /tmp/codex-notes/not-agent.js", "node")).toBe(false);
+    expect(processIdentityIsAgent("node /home/x/notes.js claude-notes.md", "node")).toBe(false);
+    expect(processIdentityIsAgent("cat /Users/x/Claude AI/readme.md", "cat")).toBe(false);
+
+    // Plain shells / logins never match.
+    expect(processIdentityIsAgent("-zsh", "zsh")).toBe(false);
+    expect(processIdentityIsAgent("/usr/bin/login", "login")).toBe(false);
+    expect(DEFAULT_AGENT_PATTERN.test("claude")).toBe(true); // the matcher is exact-basename
+    expect(DEFAULT_AGENT_PATTERN.test("claude-notes.md")).toBe(false);
+  });
+
+  it("findAgentProcess does NOT bind to a non-agent wrapper under a 'Claude' path (the HIGH, end to end)", () => {
+    // Ancestry: relay self (200) <- a non-agent node wrapper (100) whose script
+    // lives under '/Users/.../Claude AI/' <- shell (90). The wrapper must be
+    // rejected → null → age-based fallback, NOT stamped as the agent.
+    const lstart = "Mon Jan  1 00:00:00 2020";
+    const table = parseProcessTable(
+      `  100   90 ${lstart} node /home/dev/Claude AI/not-agent-wrapper.js\n` +
+      `  200  100 ${lstart} node /path/to/bot-relay/dist/index.js\n` +
+      `   90    1 ${lstart} -zsh\n`,
+    );
+    expect(findAgentProcess(200, table)).toBeNull();
   });
 
   it("findAgentProcess returns null when no agent ancestor exists (→ age-based fallback)", () => {
@@ -259,12 +292,16 @@ describe("v2.13.0 — (5b) explicit set_status('offline') wins over liveness", (
 // --- 5c. Matcher is extensible (RELAY_AGENT_PROCESS_PATTERN) ---
 
 describe("v2.13.0 — (5c) agent matcher extensibility", () => {
-  it("default matches claude/codex only; env broadens it; invalid regex → default", () => {
+  it("default matches claude/codex only; env broadens it (by basename); invalid regex → default", () => {
     expect(resolveAgentPattern({}).source).toBe(DEFAULT_AGENT_PATTERN.source);
     const broadened = resolveAgentPattern({ RELAY_AGENT_PROCESS_PATTERN: "aider|my-cli" });
-    expect(broadened.test("python -m aider")).toBe(true);
-    expect(broadened.test("/opt/my-cli run")).toBe(true);
-    expect(broadened.test("node /usr/local/bin/claude")).toBe(true); // default still in
+    // The matcher is applied to a BASENAME (exe or hosted script), so it tests
+    // against identity tokens, not full commands.
+    expect(processIdentityIsAgent("python -m aider", "python", broadened)).toBe(true);
+    expect(processIdentityIsAgent("/opt/my-cli run", "my-cli", broadened)).toBe(true);
+    expect(processIdentityIsAgent("node /usr/local/bin/claude", "node", broadened)).toBe(true); // default still in
+    // Still anchored — a broadened alternation can't match a mid-path segment.
+    expect(processIdentityIsAgent("node /Users/x/my-cli-notes/thing.js", "node", broadened)).toBe(false);
     // A malformed pattern is ignored (never crashes the startup walk).
     expect(resolveAgentPattern({ RELAY_AGENT_PROCESS_PATTERN: "(" }).source).toBe(
       DEFAULT_AGENT_PATTERN.source,
