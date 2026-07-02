@@ -4,6 +4,12 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.4.0] — 2026-07-02 — LLM-agnostic multi-agent wake
+
+- **LLM-agnostic wake.** Tether now wakes any supported LLM agent, not just Claude, via per-LLM adapters. Claude: inject `inbox`. Codex: inject a `get_messages` drain instruction, then auto-submit with a bracketed-paste-safe standalone Enter.
+- **Multi-agent watch-all.** One Tether watches multiple agents at once (`bot-relay.tether.agents: [{ name, llm }]`), waking each through its own adapter. No more one-agent-at-a-time switching.
+- Zero idle cost preserved: the extension watches the relay; the agent stays asleep until real mail arrives.
+
 ## [0.3.3] — 2026-06-25 — Republish from cleaned sources
 
 No functional change. Republished from cleaned sources (genericized examples, removed non-public references). No new features or behavior changes — same wake behavior as 0.3.2.
