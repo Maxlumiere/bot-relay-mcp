@@ -68,7 +68,19 @@ export type CommandRunner = (cmd: string, args: string[]) => string;
 
 const defaultRunner: CommandRunner = (cmd, args) => {
   try {
-    return execFileSync(cmd, args, { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+    // v2.14.1 — force LC_ALL=C so `ps -o lstart=` yields a DETERMINISTIC,
+    // locale-independent start-time. The agent_pid_start token is written by
+    // the SessionStart hook (user shell) and re-read here at probe time under
+    // launchd; without a pinned locale the two could format the same start
+    // time differently → a live agent's token wouldn't match → it would read
+    // DEAD. The other commands here (ioreg/cat/reg) are locale-insensitive, so
+    // pinning C is safe for all.
+    return execFileSync(cmd, args, {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, LC_ALL: "C" },
+    });
   } catch {
     return "";
   }
@@ -150,8 +162,15 @@ export interface ProcEntry {
   ppid: number;
   /** The process's start time, as an opaque stable token (PID-reuse guard). */
   startedAt: string;
-  /** The command line (argv) — used to match the agent binary. */
+  /** The full command line (argv0 + args) — used for the runtime-script check + self-exclude. */
   command: string;
+  /**
+   * The executable's `comm` (basename source), captured separately because on
+   * macOS it can itself contain spaces (full exec path) and so can't share a
+   * line with the greedy `command` field. Optional: hand-built test tables and
+   * the parse-from-`command` path leave it unset → we fall back to argv[0].
+   */
+  comm?: string;
 }
 
 export interface AgentProcess {
@@ -160,25 +179,30 @@ export interface AgentProcess {
 }
 
 /**
- * Default agent-binary matcher. The agent CLI's argv contains its name
- * (claude/codex). Deliberately argv-based (not comm) because the CLIs commonly
- * run under a generic runtime (`node …/claude`, `node …/codex`). Case-
- * insensitive, word-ish boundary so the name anywhere in argv matches but a
- * random substring (e.g. a path component) is unlikely to collide. The relay's
- * own process (argv contains the relay entrypoint) is excluded by the caller.
+ * Default agent matcher — an EXACT-basename test, NOT a full-command-line regex.
+ * The matcher is applied to a process's IDENTITY (the executable basename, or —
+ * for a runtime-hosted CLI like `node …/claude` — the script basename), never
+ * the raw `ps command=` string. This is load-bearing: a substring/argv match
+ * against the full command false-hits any process whose PATH contains "claude"
+ * or "codex" (e.g. a checkout under `…/Claude AI/…`), stamping a non-agent
+ * ancestor as the agent — so presence would read a dead agent alive while that
+ * ancestor lives. See processIdentityIsAgent for how identity is derived.
  *
- * Scope is honest: this covers claude + codex out of the box. It is NOT
- * "any MCP client" — an unrecognized agent CLI falls back to age-based presence
- * (safe). Operators running other CLIs extend coverage via the
- * RELAY_AGENT_PROCESS_PATTERN env var (an alternation merged in below).
+ * Scope is honest: covers claude + codex out of the box. An unrecognized CLI
+ * falls back to age-based presence (safe). Operators extend coverage via
+ * RELAY_AGENT_PROCESS_PATTERN (an alternation of BASENAMES, e.g. "aider|goose").
  */
-export const DEFAULT_AGENT_PATTERN = /(^|[^a-z0-9])(claude|codex)([^a-z0-9]|$)/i;
+export const DEFAULT_AGENT_PATTERN = /^(claude|codex)$/i;
+
+/** Runtimes that host an agent CLI as a script — for these, the SCRIPT basename is the identity. */
+const RUNTIME_BASENAMES = /^(node|nodejs|bun|deno|python|python[23](\.\d+)?|ruby)$/i;
 
 /**
- * Resolve the agent-binary matcher, broadened by RELAY_AGENT_PROCESS_PATTERN
- * when set (a regex source string, e.g. "aider|goose|my-agent-cli"). Invalid
- * regexes are ignored (→ default only) so a bad env var can never crash the
- * startup walk. The custom alternation is OR'd with the claude/codex default.
+ * Resolve the agent matcher, broadened by RELAY_AGENT_PROCESS_PATTERN when set
+ * (an alternation of executable/script BASENAMES, e.g. "aider|goose|my-cli").
+ * Anchored to a whole basename (^…$) so it can never match a mid-path segment.
+ * Invalid regexes are ignored (→ default only) so a bad env var can't crash the
+ * startup walk.
  */
 export function resolveAgentPattern(
   env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
@@ -186,10 +210,84 @@ export function resolveAgentPattern(
   const extra = env.RELAY_AGENT_PROCESS_PATTERN?.trim();
   if (!extra) return DEFAULT_AGENT_PATTERN;
   try {
-    return new RegExp(`(^|[^a-z0-9])(claude|codex|${extra})([^a-z0-9]|$)`, "i");
+    return new RegExp(`^(claude|codex|${extra})$`, "i");
   } catch {
     return DEFAULT_AGENT_PATTERN;
   }
+}
+
+/** basename of a path, tolerant of both POSIX and Windows separators + trailing slashes. */
+function pathBasename(p: string): string {
+  const cleaned = p.replace(/[/\\]+$/, "");
+  const idx = Math.max(cleaned.lastIndexOf("/"), cleaned.lastIndexOf("\\"));
+  return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
+}
+
+/** Script file extensions that mark a runtime's argv[1] as a COMPLETE script token. */
+const SCRIPT_EXT = /\.(js|cjs|mjs|ts|cts|mts|tsx|jsx|py|rb|sh|bash|pl|php|lua)$/i;
+
+/**
+ * For a runtime-hosted CLI (`node …/claude`), extract the SCRIPT basename — the
+ * identity — from argv[1]. This is a SECURITY ANCHOR: a process wrongly judged
+ * to be the agent reads a dead agent alive, which is strictly worse than
+ * missing a live one (a miss just falls back to age-based presence). So the
+ * rule is CONSERVATIVE — only ARGV[1] can ever be the script, never a later
+ * token, because a later token is an ARGUMENT (path-valued or not) and
+ * arguments must never control identity:
+ *
+ *   1. argv[1] carries a known script extension → it is the complete script;
+ *      use its basename verbatim and IGNORE all following tokens (they are args).
+ *      `node /tmp/runner.js /tmp/codex` → "runner.js" (NOT "codex").
+ *   2. argv[1] has no extension AND the next positional token is path-like
+ *      (has a separator) → argv[1] is likely a FRAGMENT of a space-containing
+ *      path, so the true script is AMBIGUOUS → decline (null → age-based).
+ *      `node /x/Claude AI/not-agent.js` → null (NOT "Claude").
+ *   3. argv[1] has no extension and no path-like positional follower → it is an
+ *      unambiguous bare script; use its basename.
+ *      `node /usr/local/bin/claude` → "claude"; `node /a/b/codex serve` → "codex".
+ *
+ * Options (leading `-…`) are skipped/ignored; they never make argv[1] ambiguous.
+ */
+function scriptBasenameForRuntime(command: string): string | null {
+  const parts = command.trim().split(/\s+/);
+  let i = 1;
+  while (i < parts.length && parts[i].startsWith("-")) i++; // skip runtime flags
+  if (i >= parts.length) return null; // runtime with no script
+  const first = parts[i];
+  // (1) complete script token → its basename; args after it are irrelevant.
+  if (SCRIPT_EXT.test(first)) return pathBasename(first);
+  // (2) ambiguous: a path-like POSITIONAL arg follows a no-extension argv[1] —
+  // could be a spaced-path fragment or a path-valued arg. Either way, decline.
+  for (let j = i + 1; j < parts.length; j++) {
+    if (parts[j].startsWith("-")) break; // an option ends the ambiguity window
+    if (parts[j].includes("/") || parts[j].includes("\\")) return null;
+    break; // a bare non-path token (subcommand like "serve") → argv[1] is complete
+  }
+  // (3) unambiguous bare script token.
+  return pathBasename(first);
+}
+
+/**
+ * True iff a process is an agent CLI, judged by IDENTITY (basenames) not the
+ * full command string. Order: (1) executable basename — `comm` when available,
+ * else argv[0] — matched exactly; (2) if the executable is a known runtime, the
+ * hosted SCRIPT basename matched exactly. Never regex-tests the raw command, so
+ * a "claude"/"codex" substring in a directory path cannot false-match. Exported
+ * for the adversarial regression tests.
+ */
+export function processIdentityIsAgent(
+  command: string,
+  comm: string | undefined,
+  agentBasename: RegExp = DEFAULT_AGENT_PATTERN,
+): boolean {
+  const argv0 = command.trim().split(/\s+/)[0] ?? "";
+  const execBase = pathBasename(comm && comm.trim() ? comm.trim() : argv0);
+  if (agentBasename.test(execBase)) return true;
+  if (RUNTIME_BASENAMES.test(execBase)) {
+    const script = scriptBasenameForRuntime(command);
+    if (script && agentBasename.test(script)) return true;
+  }
+  return false;
 }
 
 /**
@@ -214,7 +312,18 @@ export function parseProcessTable(psStdout: string): Map<number, ProcEntry> {
 function buildProcessTable(run: CommandRunner): Map<number, ProcEntry> {
   // POSIX only here (macOS/Linux). Windows capture is a documented follow-on
   // (the daemon there falls back to age-based, same as cross-host).
-  return parseProcessTable(run("ps", ["-axo", "pid=,ppid=,lstart=,command="]));
+  const table = parseProcessTable(run("ps", ["-axo", "pid=,ppid=,lstart=,command="]));
+  // Second pass: capture `comm` (the executable basename source) in its OWN ps
+  // call — comm can contain spaces on macOS (full exec path), so it can't share
+  // a line with the greedy `command` field. `pid=,comm=` puts comm last, so
+  // "pid rest-is-comm" parses unambiguously even when comm has spaces.
+  for (const line of run("ps", ["-axo", "pid=,comm="]).split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const entry = table.get(Number(m[1]));
+    if (entry) entry.comm = m[2].trim();
+  }
+  return table;
 }
 
 /**
@@ -228,14 +337,20 @@ export function findAgentProcess(
   selfPid: number,
   table: Map<number, ProcEntry>,
   agentPattern: RegExp = DEFAULT_AGENT_PATTERN,
-  selfExcludePattern = /dist[/\\]index\.js|bot-relay/i,
+  // The relay's own stdio server is excluded by its ENTRYPOINT (dist/index.js),
+  // NOT the repo path — agents legitimately launch from a checkout whose path
+  // contains "bot-relay" (the old `|bot-relay` alternative over-excluded them).
+  selfExcludePattern = /dist[/\\]index\.js/i,
 ): AgentProcess | null {
   let cur = table.get(selfPid);
   let depth = 0;
   while (cur && cur.ppid > 1 && depth < 64) {
     const parent = table.get(cur.ppid);
     if (!parent) break;
-    if (agentPattern.test(parent.command) && !selfExcludePattern.test(parent.command)) {
+    if (
+      !selfExcludePattern.test(parent.command) &&
+      processIdentityIsAgent(parent.command, parent.comm, agentPattern)
+    ) {
       return { pid: parent.pid, startedAt: parent.startedAt };
     }
     cur = parent;
