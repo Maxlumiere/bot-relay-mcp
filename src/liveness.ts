@@ -223,29 +223,48 @@ function pathBasename(p: string): string {
   return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
 }
 
+/** Script file extensions that mark a runtime's argv[1] as a COMPLETE script token. */
+const SCRIPT_EXT = /\.(js|cjs|mjs|ts|cts|mts|tsx|jsx|py|rb|sh|bash|pl|php|lua)$/i;
+
 /**
- * For a runtime-hosted CLI (`node …/claude`), extract the SCRIPT basename.
- * The script is argv[1], but a path containing spaces (`…/Claude AI/cli.js`)
- * is split across whitespace tokens by `ps`. We reassemble it: skip leading
- * runtime options, take the first script token, then keep appending following
- * tokens that are a path CONTINUATION (contain a separator) — a spaced
- * directory segment does; a bare subcommand ("serve") or flag ("--resume")
- * does not. This keeps `node /a/b/codex serve` → "codex" while
- * `node "/x/Claude AI/not-agent.js"` → "not-agent.js" (NOT "Claude").
+ * For a runtime-hosted CLI (`node …/claude`), extract the SCRIPT basename — the
+ * identity — from argv[1]. This is a SECURITY ANCHOR: a process wrongly judged
+ * to be the agent reads a dead agent alive, which is strictly worse than
+ * missing a live one (a miss just falls back to age-based presence). So the
+ * rule is CONSERVATIVE — only ARGV[1] can ever be the script, never a later
+ * token, because a later token is an ARGUMENT (path-valued or not) and
+ * arguments must never control identity:
+ *
+ *   1. argv[1] carries a known script extension → it is the complete script;
+ *      use its basename verbatim and IGNORE all following tokens (they are args).
+ *      `node /tmp/runner.js /tmp/codex` → "runner.js" (NOT "codex").
+ *   2. argv[1] has no extension AND the next positional token is path-like
+ *      (has a separator) → argv[1] is likely a FRAGMENT of a space-containing
+ *      path, so the true script is AMBIGUOUS → decline (null → age-based).
+ *      `node /x/Claude AI/not-agent.js` → null (NOT "Claude").
+ *   3. argv[1] has no extension and no path-like positional follower → it is an
+ *      unambiguous bare script; use its basename.
+ *      `node /usr/local/bin/claude` → "claude"; `node /a/b/codex serve` → "codex".
+ *
+ * Options (leading `-…`) are skipped/ignored; they never make argv[1] ambiguous.
  */
 function scriptBasenameForRuntime(command: string): string | null {
   const parts = command.trim().split(/\s+/);
   let i = 1;
   while (i < parts.length && parts[i].startsWith("-")) i++; // skip runtime flags
-  if (i >= parts.length) return null;
-  const script = [parts[i]];
+  if (i >= parts.length) return null; // runtime with no script
+  const first = parts[i];
+  // (1) complete script token → its basename; args after it are irrelevant.
+  if (SCRIPT_EXT.test(first)) return pathBasename(first);
+  // (2) ambiguous: a path-like POSITIONAL arg follows a no-extension argv[1] —
+  // could be a spaced-path fragment or a path-valued arg. Either way, decline.
   for (let j = i + 1; j < parts.length; j++) {
-    const t = parts[j];
-    if (t.startsWith("-")) break;
-    if (t.includes("/") || t.includes("\\")) { script.push(t); continue; }
-    break;
+    if (parts[j].startsWith("-")) break; // an option ends the ambiguity window
+    if (parts[j].includes("/") || parts[j].includes("\\")) return null;
+    break; // a bare non-path token (subcommand like "serve") → argv[1] is complete
   }
-  return pathBasename(script.join(" "));
+  // (3) unambiguous bare script token.
+  return pathBasename(first);
 }
 
 /**

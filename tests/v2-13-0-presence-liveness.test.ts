@@ -229,7 +229,18 @@ describe("v2.13.0 — (5) universality: a non-Claude agent reads alive-when-idle
     expect(processIdentityIsAgent("node /home/dev/Claude AI/not-agent-wrapper.js", "node")).toBe(false);
     expect(processIdentityIsAgent("node /tmp/codex-notes/not-agent.js", "node")).toBe(false);
     expect(processIdentityIsAgent("node /home/x/notes.js claude-notes.md", "node")).toBe(false);
-    expect(processIdentityIsAgent("cat /Users/x/Claude AI/readme.md", "cat")).toBe(false);
+    expect(processIdentityIsAgent("cat /home/x/Claude AI/readme.md", "cat")).toBe(false);
+
+    // 2nd audit HIGH: a path-VALUED ARGUMENT after the real script must never
+    // control identity — only argv[1] can be the script. (Reproduction cases.)
+    expect(processIdentityIsAgent("node /tmp/runner.js /tmp/codex", "node")).toBe(false);
+    expect(processIdentityIsAgent("node /tmp/runner.js /tmp/claude", "node")).toBe(false);
+    expect(processIdentityIsAgent("python /tmp/runner.py /tmp/codex", "python")).toBe(false);
+    // A no-extension script with a path-like positional arg is AMBIGUOUS →
+    // decline (safety over a false-alive), even though the arg basename is "codex".
+    expect(processIdentityIsAgent("node /opt/tool /var/codex", "node")).toBe(false);
+    // Options after a bare script are fine — they don't make it ambiguous.
+    expect(processIdentityIsAgent("node /usr/local/bin/codex --flag /some/path", "node")).toBe(true);
 
     // Plain shells / logins never match.
     expect(processIdentityIsAgent("-zsh", "zsh")).toBe(false);
