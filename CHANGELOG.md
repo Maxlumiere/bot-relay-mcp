@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.15.0 — 2026-07-06 — Presence you can trust: the `unknown` state
+
+The relay could mislabel a live-but-quiet agent as `closed`/`offline` and callers would relaunch it (rotating its token). Root cause: `deriveAgentStatus` guessed death from `last_seen` age whenever it had no liveness data, and "no data" was indistinguishable from "confirmed dead". This rebuild makes the misread impossible: **staleness alone can never produce a terminal state again.**
+
+### The model
+
+- **Three-way liveness verdict** (`alive` | `dead` | `unknown`), computed by a live same-host process probe: `unknown` = no probe-able anchor (`agent_pid` absent or cross-host) or; `dead` = a POSITIVE dead signal (`agent_pid` present + process confirmed gone / PID reused); `alive` = process confirmed up.
+- **`deriveAgentStatus` is now age-free** — a pure function of `(stored_status, verdict)`. Precedence: an explicit `offline` declaration wins (R1); a live process is authoritative even with days-stale `last_seen` — the rate-limited-but-alive case (R2); a dead probe → `closed` (R3); a clean-SIGINT-close declaration → `closed` (R4); otherwise **`unknown`** (R5). Age is not an input.
+- **New `unknown` agent_status + `liveness` field.** `agent_status` gains `unknown`; a new `liveness: alive|dead|unknown` is the **field of record** for any dead-vs-unknown decision (close/relaunch/purge). The back-compat `alive` boolean stays, but `alive===false` means "not confirmed alive", NOT "dead" — a drift-guard test fails if any in-repo runtime path reads the lossy `.alive` bool to drive a terminal decision. The dashboard state machine + HTML, `get_standup`, and `health_check` (new `agent_count_unknown`) all surface `unknown` distinctly from `closed`.
+
+### report_liveness (new tool) + self-heal
+
+- **`report_liveness`** (tool #35) — a narrow, metadata-only presence self-report that restamps ONLY the liveness anchor (`agent_pid` + start-time, and fills `host_id` when NULL) via the sanctioned `setAgentLivenessAnchor`. It does NOT rotate `session_id`, bump `last_seen`, or touch the read cursor — so an old/existing session that predates the anchor mechanism becomes probe-able WITHOUT a re-register (which would re-surface already-read mail).
+- **PostToolUse self-heal.** The PostToolUse hook computes the agent's PID + start-time and calls `report_liveness` when the stored anchor doesn't match the current process (PID changed, or a readable start-time differs/fills) — gated on a real mismatch so it's a one-shot with zero steady-state churn, and it never downgrades a present start to null when the current one is transiently unreadable. `relay_agent_pid`/`relay_pid_start` moved to `_vault-helpers.sh`, shared by all three hooks.
+
+### Reads are pure
+
+- The positive liveness cache moved from the `last_alive` DB column to in-memory (mirroring the negative cache), so `getAgents`/`health_check`/`get_standup` compute the verdict from a live probe + in-memory TTL caches and write **nothing** to the DB on read. `deriveAgentStatus`'s narrow-dead rule matches `isAgentProcessAlive`: kill-ESRCH or start-time mismatch → dead; kill-ok + start-time missing/unreadable → alive (never dead).
+
+### Tests
+
+`tests/v2-15-0-presence-unknown.test.ts` (NEW): the six named regression cells end-to-end (rate-limited→idle, pre-anchor-live→unknown, crash→closed, clean-close→closed, declared-offline→offline, start-missing→alive), the `report_liveness` self-heal invariants (session/last_seen/message-plane untouched, stale-start restamp flips dead→alive, host_id COALESCE no-churn), read-path purity (rows byte-identical after repeated reads), `agent_count_unknown`, and the `.alive`-drift guard. The full `deriveAgentStatus` stored×verdict matrix is pinned in `tests/v2-13-0-presence-liveness.test.ts`. No schema change (derivation-only; `agent_pid` already existed).
+
 ## v2.14.1 — 2026-07-01 — Every agent captures its liveness anchor on launch
 
 v2.13.0's presence probe was **live but inert** in production: `agent_pid` (the process the probe checks) was only populated by the stdio MCP server's ancestry walk, but live agents register via the SessionStart hook over HTTP — which sent `host_shell_pids` but **not** `agent_pid` — and the HTTP daemon can't self-detect (its own ancestry is launchd). So `agent_pid` stayed NULL and presence fell back to the age-based chain. This makes the probe real for every agent.

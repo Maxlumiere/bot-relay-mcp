@@ -78,28 +78,31 @@ afterEach(() => {
   delete process.env.RELAY_AGENT_ABANDON_DAYS;
 });
 
-describe("v2.2.2 B3.a — abandoned agent_status", () => {
-  it("(B3.1) agent with last_seen > 7 days surfaces as agent_status='abandoned'", () => {
+describe("v2.15.0 B3.a — old rows read 'unknown', NOT an age-derived abandoned/offline", () => {
+  // v2.15.0 removed age from deriveAgentStatus: staleness never produces a
+  // terminal state. An agent with no liveness anchor reads 'unknown' regardless
+  // of how old last_seen is. 'abandoned' stays in the enum + the purge-agents
+  // CLI still keys on last_seen (B3.4-B3.6), but is never DERIVED.
+  it("(B3.1) an agent with no anchor + last_seen > 7 days reads 'unknown', not abandoned", () => {
     registerAgent("abandon-me", "r", []);
     ageAgent("abandon-me", 8);
     const found = getAgents().find((a) => a.name === "abandon-me");
     expect(found).toBeDefined();
-    expect(found!.agent_status).toBe("abandoned");
+    expect(found!.agent_status).toBe("unknown");
+    expect(found!.liveness).toBe("unknown");
   });
 
-  it("(B3.2) RELAY_AGENT_ABANDON_DAYS override respected", () => {
+  it("(B3.2) RELAY_AGENT_ABANDON_DAYS no longer affects the derived status (age isn't an input)", () => {
     process.env.RELAY_AGENT_ABANDON_DAYS = "2";
     registerAgent("quick-abandon", "r", []);
     ageAgent("quick-abandon", 3);
-    const found = getAgents().find((a) => a.name === "quick-abandon");
-    expect(found!.agent_status).toBe("abandoned");
+    expect(getAgents().find((a) => a.name === "quick-abandon")!.agent_status).toBe("unknown");
   });
 
-  it("(B3.2b) last_seen under threshold → offline, not abandoned", () => {
+  it("(B3.2b) a moderately-old agent with no anchor also reads 'unknown', never a stale-age offline", () => {
     registerAgent("still-alive", "r", []);
     ageAgent("still-alive", 3); // < 7 days
-    const found = getAgents().find((a) => a.name === "still-alive");
-    expect(found!.agent_status).toBe("offline");
+    expect(getAgents().find((a) => a.name === "still-alive")!.agent_status).toBe("unknown");
   });
 });
 

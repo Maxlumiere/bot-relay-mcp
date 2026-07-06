@@ -83,9 +83,9 @@ describe("HTTP transport", () => {
     expect(body.transport).toBe("http");
   });
 
-  it("tools/list returns all 34 tools (33 + resolve_messages [v2.12.0 pending-vs-history])", async () => {
+  it("tools/list returns all 35 tools (34 + report_liveness [v2.15.0 presence self-heal])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(34);
+    expect(result.result.tools.length).toBe(35);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
     expect(names).toContain("unregister_agent");

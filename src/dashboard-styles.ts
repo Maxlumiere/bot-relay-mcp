@@ -140,6 +140,9 @@ export const DASHBOARD_BASE_STYLES = `
   .badge-offline { background: rgba(107,114,128,0.15); color: var(--offline); }
   .badge-closed { background: rgba(107,114,128,0.12); color: var(--offline); text-decoration: line-through; }
   .badge-abandoned { background: rgba(107,114,128,0.1); color: var(--muted); font-style: italic; }
+  /* v2.15.0 — 'unknown' (no liveness data): a distinct dashed amber, NOT the
+     grey/strikethrough of closed/offline, so "we don't know" never reads "dead". */
+  .badge-unknown { background: rgba(251,191,36,0.10); color: var(--stale); border: 1px dashed var(--stale); }
   .msg-list { list-style: none; padding: 0; margin: 0; }
   .msg-row {
     display: block;

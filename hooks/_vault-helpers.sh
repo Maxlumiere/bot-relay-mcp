@@ -332,3 +332,50 @@ write_relay_token_to_vault() {
   }
   return 0
 }
+
+# --- v2.15.0: agent-process identity helpers (shared by check-relay.sh,
+# codex/codex-session-start.sh, and post-tool-use-check.sh) ---------------
+
+# Find the AGENT's OWN process PID (the claude/codex CLI) in this hook's
+# ancestry, for presence liveness. Unlike relay_pid_chain (shell/terminal
+# ancestors that OUTLIVE the agent — only good for Tether binding), this
+# returns the process that dies exactly when the agent exits, so the relay can
+# probe it. Matches on the executable's COMM (basename, NO path) — critical
+# because the repo can live under a "Claude"-named dir, so an argv/path match
+# would false-hit any process launched from there (incl. the hook itself).
+# Node/bun/deno-hosted CLIs report comm=node/bun/deno; in this ancestry the
+# only such runtime IS the agent (the relay's own node is excluded by its
+# dist/index.js entrypoint). Starts from the hook's PARENT (the hook is never
+# the agent). Extensible via RELAY_AGENT_PROCESS_PATTERN. Empty → agent_pid
+# omitted → age-based fallback (graceful). POSIX only (Windows omit).
+relay_agent_pid() {
+  local pid ppid comm args depth=0 pat
+  pat='claude|codex|node|bun|deno'
+  [ -n "${RELAY_AGENT_PROCESS_PATTERN:-}" ] && pat="${pat}|${RELAY_AGENT_PROCESS_PATTERN}"
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) return ;;
+  esac
+  pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
+  while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm="${comm##*/}"
+    if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
+      args=$(ps -o args= -p "$pid" 2>/dev/null)
+      case "$args" in *dist/index.js*) ;; *) printf '%s' "$pid"; return ;; esac
+    fi
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$ppid" in ''|*[!0-9]*) break ;; esac
+    [ "$ppid" -le 1 ] && break
+    pid="$ppid"; depth=$((depth+1))
+  done
+}
+
+# Start-time token for a PID (the relay's PID-reuse guard). LC_ALL=C so the
+# format is DETERMINISTIC + byte-identical to the daemon's probe (src/liveness.ts
+# also pins LC_ALL=C) — a locale difference between this user shell and the
+# launchd daemon would otherwise make a live agent read dead. Trimmed. Empty on
+# any failure.
+relay_pid_start() {
+  local pid="$1"
+  [ -n "$pid" ] || return
+  LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}

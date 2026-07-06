@@ -134,10 +134,14 @@ describe("handleGetStandup — busy state", () => {
   });
 
   it("fires blocked-agent observation when agent_status='blocked'", async () => {
-    registerAgent("alice", "orchestrator", []);
-    // Declared blocked, fresh last_seen → hybrid status surfaces 'blocked'.
-    const { setAgentStatus } = await import("../src/db.js");
+    const { setAgentStatus, setAgentLivenessAnchor } = await import("../src/db.js");
+    const { _resetOwnHostIdForTests } = await import("../src/liveness.js");
+    _resetOwnHostIdForTests("standup-own-host");
+    registerAgent("alice", "orchestrator", [], { host_id: "standup-own-host" });
+    // v2.15.0: 'blocked' is a declared active state — it only surfaces when the
+    // process is confirmed alive (a live anchor); without one the agent reads 'unknown'.
     setAgentStatus("alice", "blocked");
+    setAgentLivenessAnchor("alice", process.pid, null);
     const r = handleGetStandup({ since: "1h" });
     const body = parseResult(r);
     const joined = body.observations.join(" ");

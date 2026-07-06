@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData } from "../db.js";
-import type { SetStatusInput, HealthCheckInput } from "../types.js";
+import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData, setAgentLivenessAnchor } from "../db.js";
+import type { SetStatusInput, HealthCheckInput, ReportLivenessInput } from "../types.js";
 import { VERSION } from "../version.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { ERROR_CODES } from "../error-codes.js";
@@ -32,6 +32,54 @@ const LEGACY_SET_STATUS_MAP: Record<string, "idle" | "working" | "blocked" | "wa
 };
 
 const EXEMPT_FROM_REASSIGN = new Set(["working", "blocked", "waiting_user"]);
+
+/**
+ * v2.15.0 — report_liveness: narrow, metadata-only presence self-report.
+ * Restamps ONLY the agent's liveness anchor (agent_pid + start-time, + fills
+ * host_id when NULL) via setAgentLivenessAnchor — NO session_id rotation, NO
+ * last_seen bump, NO read-cursor touch — so an old/existing session can become
+ * probe-able without a re-register that would re-surface session-scoped mail.
+ * Auth: own agent token only (agent_name is the caller field).
+ */
+export function handleReportLiveness(input: ReportLivenessInput) {
+  const updated = setAgentLivenessAnchor(
+    input.agent_name,
+    input.agent_pid,
+    input.agent_pid_start ?? null,
+  );
+  if (!updated) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            { success: false, error: `Agent "${input.agent_name}" is not registered.`, error_code: ERROR_CODES.NOT_FOUND },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            agent_name: input.agent_name,
+            agent_pid: input.agent_pid,
+            note: "Liveness anchor restamped (metadata-only: agent_pid + start-time; no session rotation).",
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
 
 export function handleSetStatus(input: SetStatusInput) {
   // Normalize legacy → new. Zod has already restricted to the known set.

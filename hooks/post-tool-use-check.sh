@@ -297,7 +297,71 @@ SQL
   return 0
 }
 
-# --- Main: try HTTP, fall back to sqlite ---
+# --- v2.15.0: presence self-heal (narrow, metadata-only) ---
+#
+# Restamp our liveness anchor (agent_pid + start-time) via the narrow
+# report_liveness tool IF the stored anchor doesn't match our CURRENT process —
+# so an old/existing session that registered before the anchor mechanism
+# becomes probe-able WITHOUT a re-register (register_agent rotates session_id +
+# can re-surface already-read mail; report_liveness touches only agent_pid +
+# start). Gated on a real mismatch → zero churn in steady state. Best-effort +
+# silent: any failure is a no-op that never affects the hook contract or the
+# mail delivery below. relay_agent_pid/relay_pid_start come from _vault-helpers.sh.
+liveness_self_heal() {
+  [ -z "$AGENT_TOKEN" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  command -v relay_agent_pid >/dev/null 2>&1 || return 0
+  local cur_pid cur_start stored_pid stored_start
+  cur_pid=$(relay_agent_pid 2>/dev/null || printf '')
+  [ -z "$cur_pid" ] && return 0
+  cur_start=$(relay_pid_start "$cur_pid" 2>/dev/null || printf '')
+  # Read the stored anchor. Requires the sqlite fast-path; if unavailable we
+  # can't compute the gate → skip (SessionStart still carries the anchor).
+  { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; } || return 0
+  stored_pid=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+SELECT IFNULL(agent_pid,'') FROM agents WHERE name = :name LIMIT 1;
+SQL
+)
+  stored_start=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+SELECT IFNULL(agent_pid_start,'') FROM agents WHERE name = :name LIMIT 1;
+SQL
+)
+  # Gate: restamp on a real mismatch — pid changed, OR we have a READABLE
+  # current start that differs from / fills the stored one. Do NOT downgrade a
+  # present stored start to empty when the current start is transiently
+  # unreadable (stays alive-by-PID; next run corrects it). Steady state = no-op.
+  local need=0
+  if [ "$stored_pid" != "$cur_pid" ]; then
+    need=1
+  elif [ -n "$cur_start" ] && [ "$stored_start" != "$cur_start" ]; then
+    need=1
+  fi
+  [ "$need" -eq 0 ] && return 0
+  # Only over a reachable daemon (tight budget).
+  curl -fsS --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1 || return 0
+  local payload
+  payload=$(AN="$AGENT_NAME" AT="$AGENT_TOKEN" PID="$cur_pid" ST="$cur_start" python3 -c '
+import json, os
+args = {"agent_name": os.environ["AN"], "agent_pid": int(os.environ["PID"]), "agent_token": os.environ["AT"]}
+st = os.environ.get("ST", "")
+if st:
+    args["agent_pid_start"] = st
+print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"report_liveness","arguments":args}}))
+' 2>/dev/null) || return 0
+  curl -fsS --max-time 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "X-Agent-Token: $AGENT_TOKEN" \
+    --data "$payload" >/dev/null 2>&1 || return 0
+  return 0
+}
+
+# --- Main: self-heal presence (best-effort), then try HTTP, fall back to sqlite ---
+
+liveness_self_heal
 
 BODY=$(http_try)
 RC=$?

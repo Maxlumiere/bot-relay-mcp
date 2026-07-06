@@ -42,6 +42,7 @@ import {
   PostToChannelSchema,
   GetChannelMessagesSchema,
   SetStatusSchema,
+  ReportLivenessSchema,
   HealthCheckSchema,
   RotateTokenSchema,
   RotateTokenAdminSchema,
@@ -114,7 +115,7 @@ import {
   handleGetChannelMessages,
   handleListChannels,
 } from "./tools/channels.js";
-import { handleSetStatus, handleHealthCheck } from "./tools/status.js";
+import { handleSetStatus, handleHealthCheck, handleReportLiveness } from "./tools/status.js";
 import { handleGetStandup } from "./tools/standup.js";
 import { handleSetDashboardTheme } from "./tools/dashboard.js";
 import { handlePeekInboxVersion } from "./tools/peek-inbox-version.js";
@@ -171,6 +172,7 @@ export const TOOL_BUNDLES: Record<string, string> = {
   get_tasks: "core",
   get_task: "core",
   set_status: "core",
+  report_liveness: "core",
   health_check: "core",
   // webhooks
   register_webhook: "webhooks",
@@ -277,6 +279,7 @@ const TOOL_SCHEMAS: Record<string, unknown> = {
   post_to_channel: PostToChannelSchema,
   get_channel_messages: GetChannelMessagesSchema,
   set_status: SetStatusSchema,
+  report_liveness: ReportLivenessSchema,
   health_check: HealthCheckSchema,
   rotate_token: RotateTokenSchema,
   rotate_token_admin: RotateTokenAdminSchema,
@@ -678,6 +681,16 @@ export function createServer(): Server {
         inputSchema: zodToJsonSchema(SetStatusSchema),
       },
       {
+        name: "report_liveness",
+        description:
+          "Restamp your own liveness anchor (agent_pid + process start-time) — a narrow, metadata-only presence self-report.\n\n" +
+          "When to use: your hooks call this automatically (SessionStart + PostToolUse) so the relay can positively probe whether your process is alive. An old/existing session that registered before the anchor mechanism becomes probe-able without a full re-register — critical because `register_agent` rotates your session_id and can re-surface already-read mail, whereas this touches ONLY agent_pid + start-time (+ fills host_id when unset). You rarely call it by hand.\n\n" +
+          "Behavior: updates agent_pid + agent_pid_start (and host_id if NULL) for your row. Does NOT rotate session_id, bump last_seen, or touch your read cursor. Idempotent — restamping the same values is a no-op. Auth: own agent token only.\n\n" +
+          "Returns: `{ success: true, agent_name, agent_pid, note }`.\n\n" +
+          "Errors: `NOT_FOUND` (unknown agent_name), `AUTH_FAILED`, `INVALID_INPUT`, `RATE_LIMITED`.",
+        inputSchema: zodToJsonSchema(ReportLivenessSchema),
+      },
+      {
         name: "health_check",
         description:
           "Report relay process health + live counts.\n\n" +
@@ -892,6 +905,8 @@ export function createServer(): Server {
         return handleGetChannelMessages(GetChannelMessagesSchema.parse(args));
       case "set_status":
         return handleSetStatus(SetStatusSchema.parse(args));
+      case "report_liveness":
+        return handleReportLiveness(ReportLivenessSchema.parse(args));
       case "health_check":
         return handleHealthCheck(HealthCheckSchema.parse(args));
       case "rotate_token":
