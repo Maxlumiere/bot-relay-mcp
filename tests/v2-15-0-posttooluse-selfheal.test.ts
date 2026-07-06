@@ -120,6 +120,48 @@ describe("v2.15.0 — PostToolUse self-heal gates on the FULL (agent_pid, agent_
     }
   }, 30_000);
 
+  it("the self-heal restamp touches NO message/read plane — already-read stays read, pending stays pending, no reflood", async () => {
+    const h = await startHarness();
+    try {
+      const name = "mailheal";
+      const token = await registerAndToken(h.port, name);
+
+      // Establish the anchor + capture the live session so we can seed a message
+      // that is already-read FOR THAT SESSION.
+      runPostToolUse(h, name, token);
+      const sid = sql(h.dbPath, `SELECT session_id FROM agents WHERE name='${name}';`);
+      expect(sid.length).toBeGreaterThan(0);
+
+      // Seed the message/read plane: one already-READ (for this session) + one
+      // still-PENDING. Deliver the pending one via a FIRST hook run so the
+      // mailbox is settled; from here on the mail-delivery path is a no-op and
+      // only the self-heal can move anything.
+      sql(h.dbPath, `INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at, read_by_session) VALUES ('m-read', 'system', '${name}', 'already read', 'normal', 'read', datetime('now'), '${sid}');`);
+      sql(h.dbPath, `INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES ('m-pend', 'system', '${name}', 'still pending', 'normal', 'pending', datetime('now'));`);
+      runPostToolUse(h, name, token); // delivers 'm-pend' (normal delivery, not the self-heal)
+
+      // Now snapshot the WHOLE message/read plane + session, corrupt ONLY the
+      // start-time to force a self-heal, and run again. The self-heal fires but
+      // must leave every message row + read cursor + session_id byte-identical.
+      const msgsBefore = sql(h.dbPath, `SELECT id||'|'||status||'|'||IFNULL(read_by_session,'') FROM messages WHERE to_agent='${name}' ORDER BY id;`);
+      const sidBefore = sql(h.dbPath, `SELECT session_id FROM agents WHERE name='${name}';`);
+      sql(h.dbPath, `UPDATE agents SET agent_pid_start='${STALE_START}' WHERE name='${name}';`);
+
+      const r = runPostToolUse(h, name, token);
+      expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
+
+      const startAfter = sql(h.dbPath, `SELECT IFNULL(agent_pid_start,'') FROM agents WHERE name='${name}';`);
+      const msgsAfter = sql(h.dbPath, `SELECT id||'|'||status||'|'||IFNULL(read_by_session,'') FROM messages WHERE to_agent='${name}' ORDER BY id;`);
+      const sidAfter = sql(h.dbPath, `SELECT session_id FROM agents WHERE name='${name}';`);
+
+      expect(startAfter).not.toBe(STALE_START); // the self-heal DID fire
+      expect(sidAfter).toBe(sidBefore); // session_id unchanged → read cursor intact
+      expect(msgsAfter).toBe(msgsBefore); // message/read plane byte-identical → NO reflood
+    } finally {
+      stopHarness(h);
+    }
+  }, 30_000);
+
   it("steady state (anchor already correct) → the hook does NOT churn the row", async () => {
     const h = await startHarness();
     try {
