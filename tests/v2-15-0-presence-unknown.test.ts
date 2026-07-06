@@ -251,27 +251,86 @@ describe("v2.15.0 — drift guard: liveness is the field of record", () => {
     return out;
   }
 
-  it("no RUNTIME file (src/extension/hooks/bin/scripts) reads a `.alive` property to drive a decision", () => {
+  // Detect a READ of the lossy `alive` boolean off an object, in every form a
+  // consumer could use to (mis)drive a close/relaunch/purge decision:
+  //   dot / optional-chain : agent.alive, agent?.alive
+  //   bracket              : agent['alive'], agent["alive"]
+  //   destructuring        : const { alive } = agent; const { alive: up } = a
+  // NOT matched (legitimate): the surface WRITE (`alive: <expr>` object literal),
+  // the type declaration (`alive: boolean`), the string value `"alive"`, and the
+  // probe FUNCTION names (isPidAlive / isAgentProcessAlive) — none is a `.alive`
+  // property read. This is the CONTRACT (feedback_test_asserts_contract_not_proxy):
+  // dead-vs-unknown decisions must key on `liveness`, never on `alive`.
+  function readsAliveProp(line: string): boolean {
+    if (/(?:\?\.|\.)\s*alive\b/.test(line)) return true; // .alive / ?.alive
+    if (/\[\s*["']alive["']\s*\]/.test(line)) return true; // ['alive'] / ["alive"]
+    if (/\{[^{}]*\balive\b[^{}]*\}\s*=(?!=)/.test(line)) return true; // destructure { alive } =
+    return false;
+  }
+
+  it("(negative control) the detector CATCHES every read form + IGNORES legitimate writes/uses", () => {
+    // If any of these regress to false, the guard below is toothless.
+    for (const bad of [
+      "if (!agent.alive) relaunch();",
+      "if (agent?.alive === false) closeAgentSession();",
+      "const dead = row['alive'] === false;",
+      'const closed = row["alive"] === false;',
+      "const { alive } = agent; if (!alive) purgeOldRecords();",
+      "const { alive: isUp } = a; if (!isUp) markAgentOffline();",
+    ]) {
+      expect(readsAliveProp(bad), `should CATCH: ${bad}`).toBe(true);
+    }
+    for (const ok of [
+      'return { alive: verdict === "alive", liveness: verdict };', // surface WRITE
+      "  alive: boolean;", // type declaration
+      "const up = isPidAlive(pid);", // probe fn name, not a property
+      "if (holderAlive === false) {}", // unrelated variable
+      'liveness: "alive"', // string value
+      "agent_count_alive: agentsSnapshot.filter((a) => a.liveness === 'alive').length,", // keys on liveness
+    ]) {
+      expect(readsAliveProp(ok), `should IGNORE: ${ok}`).toBe(false);
+    }
+  });
+
+  it("no RUNTIME JS/TS file (src + extension) reads `.alive` to drive a decision", () => {
+    // The lossy `.alive` BOOL only exists on the JS/TS AgentWithStatus surface,
+    // so a decision-read of it can only occur in .ts/.js. The bash hooks/scripts
+    // are also scanned (below) but decide off the `agent_status` SQL column —
+    // which is itself now verdict-derived + includes `unknown` — never a JS
+    // `.alive` property; their only `.alive` is a jq surface TYPE assertion.
     const files = [
       ...walk(path.join(ROOT, "src")),
       ...walk(path.join(ROOT, "extensions", "vscode", "src")),
-      ...walk(path.join(ROOT, "hooks")),
       ...walk(path.join(ROOT, "bin")),
-      ...walk(path.join(ROOT, "scripts")),
-    ];
-    // A `.alive` PROPERTY read on an object (agent.alive / a.alive / row.alive)
-    // is the lossy bool that conflates dead + unknown — consumers must use
-    // `.liveness` instead. The presence-probe helpers (isPidAlive /
-    // isAgentProcessAlive) are function names, not property reads, so they don't match.
+    ].filter((f) => /\.(ts|js|mjs)$/.test(f));
     const offending: string[] = [];
     for (const f of files) {
-      const txt = fs.readFileSync(f, "utf8");
-      txt.split("\n").forEach((line, i) => {
-        if (/[A-Za-z_$][\w$]*\.alive\b/.test(line)) {
+      fs.readFileSync(f, "utf8").split("\n").forEach((line, i) => {
+        if (readsAliveProp(line)) offending.push(`${path.relative(ROOT, f)}:${i + 1}: ${line.trim()}`);
+      });
+    }
+    expect(offending, `Use \`.liveness\` (alive|dead|unknown) for dead-vs-unknown decisions, not the lossy \`.alive\` bool:\n${offending.join("\n")}`).toEqual([]);
+  });
+
+  it("bash hooks/scripts decide agent lifecycle off the (verdict-derived) agent_status column, not a raw liveness bool", () => {
+    // A bash close/relaunch/offline decision must read `agent_status` (which now
+    // carries 'unknown' + is age-free) — NOT re-derive death from last_seen age
+    // or a bespoke alive flag. This catches a regression that hard-codes an
+    // age/alive death heuristic in a hook instead of trusting agent_status.
+    const shFiles = [...walk(path.join(ROOT, "hooks")), ...walk(path.join(ROOT, "scripts"))]
+      .filter((f) => f.endsWith(".sh"));
+    const offending: string[] = [];
+    for (const f of shFiles) {
+      fs.readFileSync(f, "utf8").split("\n").forEach((line, i) => {
+        // A bash comparison of agent_status to a TERMINAL literal is a decision;
+        // it's allowed ONLY against 'unknown'-aware reads. Flag any hook that
+        // compares to 'closed'/'offline'/'abandoned' derived from last_seen math.
+        if (/agent_status\s*(=|==|!=)\s*['"]?(closed|offline|abandoned)['"]?/.test(line) &&
+            /julianday|last_seen|86400/.test(line)) {
           offending.push(`${path.relative(ROOT, f)}:${i + 1}: ${line.trim()}`);
         }
       });
     }
-    expect(offending, `Use \`.liveness\` (alive|dead|unknown) for dead-vs-unknown decisions, not the lossy \`.alive\` bool:\n${offending.join("\n")}`).toEqual([]);
+    expect(offending, `bash lifecycle decisions must trust the verdict-derived agent_status, not re-derive death from last_seen age:\n${offending.join("\n")}`).toEqual([]);
   });
 });
