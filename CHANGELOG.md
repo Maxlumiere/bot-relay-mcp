@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.15.1 — 2026-07-06 — Clear stale stored terminal states
+
+v2.15.0 honors a stored `offline`/`closed` as a declaration (rules R1/R4), which is correct going forward — but agents carrying a *leftover* terminal state from before the presence fix (the stdio signal handlers, force-rotation, and the spawn offline-pre-register all STORE `offline`/`closed`, sometimes on a transient signal the agent survived) read that stale value instead of their live state, and an `offline`-polluted live agent never self-corrects. This is a one-time cleanup so the live verdict governs again.
+
+### The migration
+
+A **version-guarded (18→19), data-only, run-exactly-once, idempotent** migration (`migrateSchemaToV2_19`) clears the stale terminal states:
+
+```
+UPDATE agents SET agent_status = 'idle'
+WHERE agent_status IN ('closed','abandoned','stale')
+   OR (agent_status = 'offline' AND session_id IS NULL);
+```
+
+**Narrowed contract (deliberate + documented).** `set_status` can only produce `offline` (its enum excludes `closed`/`abandoned`/`stale`), so those three are *always* cleared. For `offline`: a **session-present** row is a genuine `set_status` declaration and is **preserved** (R1 keeps honoring it); a **session-NULL** `offline` has ambiguous provenance — it could be signal/rotation pollution *or* a genuine-but-sessionless `set_status`, so it is **intentionally cleared to `idle`** and the live presence verdict governs (dead→closed, alive→idle, no-anchor→unknown). This can never produce a false-alive (`idle` only ever comes from a real positive probe, never from clearing the column); any genuine offline intent is trivially re-assertable via `set_status`; and because the migration runs exactly once (guarded on the stored `schema_version < 19`), all future operator/dashboard offline-sets — on any row, sessionless or not — persist normally. It is **not** a read-path mutation (init/deploy path only).
+
+### Tests
+
+`tests/v2-15-1-stale-status-cleanup.test.ts` — the five contract regressions: (a) a session-present `set_status('offline')` is preserved; (b) a session-NULL `offline` (signal-derived *or* genuine-but-sessionless) is intentionally wiped → verdict-governed, asserted as designed; (c) `closed`/`abandoned`/`stale` are always cleared; (d) runs exactly once — a post-migration sessionless `offline` persists (not re-wiped) — and is idempotent; (e) no false-alive — a signal-marked row reads its real probe (dead→closed, alive→idle). Schema version 18→19; no new column, no new tool.
+
 ## v2.15.0 — 2026-07-06 — Presence you can trust: the `unknown` state
 
 The relay could mislabel a live-but-quiet agent as `closed`/`offline` and callers would relaunch it (rotating its token). Root cause: `deriveAgentStatus` guessed death from `last_seen` age whenever it had no liveness data, and "no data" was indistinguishable from "confirmed dead". This rebuild makes the misread impossible: **staleness alone can never produce a terminal state again.**

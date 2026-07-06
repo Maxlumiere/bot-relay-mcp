@@ -273,6 +273,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_14(_db);
   migrateSchemaToV2_15(_db);
   migrateSchemaToV2_16(_db);
+  migrateSchemaToV2_19(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -314,6 +315,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_14(_db);
   migrateSchemaToV2_15(_db);
   migrateSchemaToV2_16(_db);
+  migrateSchemaToV2_19(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -535,7 +537,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 18;
+export const CURRENT_SCHEMA_VERSION = 19;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -627,6 +629,7 @@ export function applyMigration(from: number, to: number): void {
     [15, 16],
     [16, 17],
     [17, 18],
+    [18, 19],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1522,6 +1525,45 @@ function migrateSchemaToV2_16(db: CompatDatabase): void {
   if (!agentCols.some((c) => c.name === "agent_pid_start")) {
     db.exec("ALTER TABLE agents ADD COLUMN agent_pid_start TEXT");
   }
+}
+
+/**
+ * v2.15.1 — one-time cleanup of STALE stored terminal agent_status values.
+ *
+ * Pre-v2.15.0, the stdio signal handlers (closeAgentSession → 'closed',
+ * markAgentOffline → 'offline'), force-rotation, and the spawn offline-pre-
+ * register STORE a terminal state on the row — sometimes on a TRANSIENT signal
+ * the agent survives. v2.15.0 honors a stored 'offline'/'closed' as a
+ * DECLARATION (R1/R4), so a live agent carrying a leftover 'offline' reads
+ * offline forever (never self-corrects). This clears the stale ones so the live
+ * presence VERDICT governs again.
+ *
+ * NARROWED CONTRACT (deliberate + documented): set_status can ONLY produce
+ * 'offline' (its enum excludes closed/abandoned/stale), so those three are
+ * ALWAYS cleared. For 'offline': a session-PRESENT row is a genuine set_status
+ * declaration and is PRESERVED (R1 keeps honoring it); a session-NULL 'offline'
+ * has AMBIGUOUS provenance (signal/rotation pollution OR a genuine-but-
+ * sessionless set_status) so it is INTENTIONALLY cleared to 'idle' and the live
+ * verdict governs (dead→closed, alive→idle, no-anchor→unknown). This can never
+ * false-alive ('idle' only ever comes from a real positive probe, never from
+ * clearing the column); any genuine offline intent is re-assertable via
+ * set_status; and because this runs EXACTLY ONCE (guarded on the stored
+ * schema_version < 19), all future operator/dashboard offline-sets — on any
+ * row, sessionless or not — persist normally.
+ *
+ * DATA-only + version-guarded ⇒ runs once; a fresh or already-migrated DB is a
+ * no-op. NOT a read-path mutation — this is the init/deploy path only.
+ */
+function migrateSchemaToV2_19(db: CompatDatabase): void {
+  const row = db
+    .prepare("SELECT version FROM schema_info WHERE id = 1")
+    .get() as { version?: number } | undefined;
+  if ((row?.version ?? 0) >= 19) return; // already applied — never re-wipe a legitimately-set row
+  db.prepare(
+    "UPDATE agents SET agent_status = 'idle' " +
+      "WHERE agent_status IN ('closed', 'abandoned', 'stale') " +
+      "OR (agent_status = 'offline' AND session_id IS NULL)",
+  ).run();
 }
 
 export function purgeOldRecords(db: CompatDatabase): void {

@@ -158,7 +158,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(16, 17)).not.toThrow();
     // v2.13.0 presence liveness registered 17→18 (migrateSchemaToV2_16: agents.last_alive column).
     expect(() => applyMigration(17, 18)).not.toThrow();
-    expect(() => applyMigration(18, 19)).toThrow(/no migration registered|18→19/);
+    // v2.15.1 stale-status cleanup registered 18→19 (migrateSchemaToV2_19: one-time terminal-state wipe).
+    expect(() => applyMigration(18, 19)).not.toThrow();
+    expect(() => applyMigration(19, 20)).toThrow(/no migration registered|19→20/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {
