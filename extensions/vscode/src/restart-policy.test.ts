@@ -252,3 +252,81 @@ describe("RestartPolicy — neverGiveUp (v0.2.1 reconnect path)", () => {
     expect(p.recordCrash().kind).toBe("give_up");
   });
 });
+
+describe("RestartPolicy — equalJitter (v0.4.1 reconnect fleet decorrelation)", () => {
+  it("(R20) DEFAULT OFF — deterministic curve unchanged AND random() is never consulted", () => {
+    // Inject a random that throws: if the default path touched it, this fails.
+    const p = new RestartPolicy({
+      now: clock.now,
+      neverGiveUp: true,
+      random: () => {
+        throw new Error("random() must not be called when equalJitter is off");
+      },
+    });
+    const want = [1000, 2000, 4000, 8000, 16000, 30000];
+    for (let i = 0; i < want.length; i += 1) {
+      const d = p.recordCrash();
+      if (d.kind !== "restart") throw new Error("expected restart");
+      expect(d.delayMs, `attempt ${i + 1} deterministic delay`).toBe(want[i]);
+    }
+  });
+
+  it("(R21) equal-jitter maps random 0 / 0.5 / →1 to D/2, 3D/4, →D (per attempt's clamped D)", () => {
+    // random=0 → D*(0.5+0)     = D/2 (the floor)
+    let r = 0;
+    const p0 = new RestartPolicy({ now: clock.now, neverGiveUp: true, equalJitter: true, random: () => r });
+    const base = [1000, 2000, 4000, 8000, 16000, 30000]; // the clamped curve
+    for (let i = 0; i < base.length; i += 1) {
+      const d = p0.recordCrash();
+      if (d.kind !== "restart") throw new Error("expected restart");
+      expect(d.delayMs, `attempt ${i + 1} at random=0`).toBe(base[i]! * 0.5);
+    }
+    // random=0.5 → D*0.75
+    r = 0.5;
+    const p1 = new RestartPolicy({ now: clock.now, neverGiveUp: true, equalJitter: true, random: () => r });
+    for (let i = 0; i < base.length; i += 1) {
+      const d = p1.recordCrash();
+      if (d.kind !== "restart") throw new Error("expected restart");
+      expect(d.delayMs, `attempt ${i + 1} at random=0.5`).toBe(base[i]! * 0.75);
+    }
+    // random→1 (0.999…) → →D (never exceeds it, since jitter applies AFTER the clamp)
+    r = 0.999999;
+    const p2 = new RestartPolicy({ now: clock.now, neverGiveUp: true, equalJitter: true, random: () => r });
+    for (let i = 0; i < base.length; i += 1) {
+      const d = p2.recordCrash();
+      if (d.kind !== "restart") throw new Error("expected restart");
+      expect(d.delayMs, `attempt ${i + 1} at random→1 is < D`).toBeLessThan(base[i]!);
+      expect(d.delayMs).toBeGreaterThan(base[i]! * 0.9);
+    }
+  });
+
+  it("(R22) jittered delay ALWAYS lands in [D/2, D] and never exceeds maxDelayMs (cap respected)", () => {
+    const randoms = [0, 0.13, 0.37, 0.5, 0.71, 0.93, 0.999];
+    let idx = 0;
+    const p = new RestartPolicy({
+      now: clock.now,
+      neverGiveUp: true,
+      equalJitter: true,
+      maxDelayMs: 30_000,
+      random: () => randoms[idx++ % randoms.length]!,
+    });
+    const base = [1000, 2000, 4000, 8000, 16000, 30000, 30000];
+    for (let i = 0; i < base.length; i += 1) {
+      const d = p.recordCrash();
+      if (d.kind !== "restart") throw new Error("expected restart");
+      expect(d.delayMs, `attempt ${i + 1} >= D/2`).toBeGreaterThanOrEqual(base[i]! * 0.5);
+      expect(d.delayMs, `attempt ${i + 1} <= D (and thus <= cap)`).toBeLessThanOrEqual(base[i]!);
+      expect(d.delayMs, `attempt ${i + 1} <= maxDelayMs`).toBeLessThanOrEqual(30_000);
+    }
+  });
+
+  it("(R23) jitter does NOT alter decision kind or the attempt counter (only the delay)", () => {
+    const p = new RestartPolicy({ now: clock.now, neverGiveUp: true, equalJitter: true, random: () => 0.42 });
+    for (let i = 1; i <= 4; i += 1) {
+      const d = p.recordCrash();
+      expect(d.kind).toBe("restart");
+      if (d.kind !== "restart") return;
+      expect(d.attempt, `attempt counter unaffected by jitter`).toBe(i);
+    }
+  });
+});

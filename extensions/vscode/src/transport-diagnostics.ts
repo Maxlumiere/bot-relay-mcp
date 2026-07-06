@@ -67,6 +67,18 @@ export interface DiagnosticsSinks {
    * background color, etc.) and arm the "isInErrorState" check below.
    */
   setError: (msg: string) => void;
+  /**
+   * v0.4.1 — the transport CLOSED. Fired AFTER the diagnostic log line, on
+   * every `transport.onclose`. Optional: pre-v0.4.1 callers relied on close
+   * being log-only. The v0.4.1 caller (extension.ts) routes an *unexpected*
+   * close (not an operator/teardown-initiated one) into the reconnect
+   * supervisor — this is the fix for the "clean daemon restart ends the SSE
+   * as a quiet EOF (onclose), never an onerror, so the supervisor never fires
+   * and Tether wedges until a manual Reconnect" defect. The intentional-vs-
+   * unexpected discrimination is the CALLER's responsibility (this helper is
+   * dumb wiring); see the ConnectionLifecycle guard in extension.ts.
+   */
+  onClose?: () => void;
 }
 
 /**
@@ -88,9 +100,12 @@ export function wireTransportDiagnostics(
   transport.onclose = () => {
     // Closures are not always errors (operator-initiated disconnect, normal
     // session teardown on extension reload, etc.) so this only logs — does
-    // NOT flip to error state. The caller may downgrade to error if the
-    // close arrives at a time it shouldn't (e.g. mid-subscribe), via
-    // setError on its own logic.
+    // NOT itself flip to error state. v0.4.1: it ALSO notifies the optional
+    // `onClose` sink so the caller can decide whether this close is
+    // unexpected (→ route to the reconnect supervisor) or intentional
+    // (→ ignore). The log fires first so the diagnostic record is present
+    // regardless of what the caller does with the notification.
     sinks.log("transport closed");
+    sinks.onClose?.();
   };
 }

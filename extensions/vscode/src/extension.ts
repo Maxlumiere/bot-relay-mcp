@@ -52,6 +52,7 @@ import {
 } from "./agent-manager.js";
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
+import { ConnectionLifecycle } from "./connection-lifecycle.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
 import { adapterFor, type LlmAdapter, type WakeContext, type SubmitMethod } from "./llm-adapter.js";
@@ -316,6 +317,31 @@ let relayEndpoint: string | null = null;
 const boundTerminals = new Map<string, vscode.Terminal>();
 let summaryTimer: ReturnType<typeof setInterval> | undefined;
 let summaryDirty = false;
+
+/**
+ * v0.4.1 — connection lifecycle guard. Owns the intentional-disconnect flag +
+ * transport-identity so an UNEXPECTED transport close (a clean daemon restart
+ * ending the SSE as a quiet EOF) routes into the reconnect supervisor, while
+ * an operator/teardown close is swallowed. Its `establish()` binds the new
+ * transport BEFORE connect so a mid-connect close is honored (the mid-connect race).
+ * Persists across reconnects; `reset()` on deactivate.
+ */
+const connectionLifecycle = new ConnectionLifecycle<StreamableHTTPClientTransport>();
+
+/**
+ * v0.4.1 — reachability health-poll (belt-and-suspenders for a SILENTLY
+ * swallowed SSE death — no onerror AND no onclose, the Electron-fetch failure
+ * class transport-diagnostics.ts was born to fight). A plain HTTP GET of the
+ * daemon's /health while connected; N consecutive failures hand off to the
+ * reconnect supervisor. ZERO idle-token cost — a raw HTTP GET, not an MCP tool
+ * call, no relay writes, no agent token spend. Paused while a reconnect owns
+ * recovery (error/reconnecting state) and cleared on dispose.
+ */
+const HEALTH_POLL_INTERVAL_MS = 15_000;
+const HEALTH_POLL_TIMEOUT_MS = 5_000;
+const HEALTH_POLL_FAIL_THRESHOLD = 2; // N consecutive fails → reconnect
+let healthPollTimer: ReturnType<typeof setInterval> | undefined;
+let healthPollFailures = 0;
 
 /**
  * v0.2 — single-agent executor. Null when no agent has been spawned
@@ -675,6 +701,7 @@ async function connect(config: TetherConfig): Promise<void> {
   const agentList = resolveAgentList(config);
   if (agentList.length === 0) {
     log("idle: no agents configured (set bot-relay.tether.agentName / RELAY_AGENT_NAME, or bot-relay.tether.agents)");
+    stopHealthPoll(); // nothing to watch — don't poll
     if (statusBarItem) {
       statusBarItem.text = "Tether: idle";
       statusBarItem.backgroundColor = undefined;
@@ -682,6 +709,13 @@ async function connect(config: TetherConfig): Promise<void> {
     }
     return;
   }
+  // v0.4.1 — a fresh connect intentionally tears down the OLD transport. Raise
+  // the intentional-disconnect window (so the old transport's onclose is
+  // swallowed, not treated as a drop) and stop the health-poll before the
+  // teardown. establish() below resets the flag before wiring/connecting the
+  // NEW transport, so a genuine close on the new transport IS honored.
+  connectionLifecycle.beginIntentionalDisconnect();
+  stopHealthPoll();
   await disconnect();
   // v0.1.1 — fresh connect attempt resets the error-state lock. Any
   // previously-flipped error from a prior session is cleared so a manual
@@ -710,44 +744,76 @@ async function connect(config: TetherConfig): Promise<void> {
   // 20 that burned ~6.75 min of dead retries against a dead session. The
   // supervisor's classifier fires on the first 404, at/before the SDK
   // give-up, so there is no recovery gap (O-1).
-  const transport = new StreamableHTTPClientTransport(url, {
-    requestInit,
-    reconnectionOptions: {
-      initialReconnectionDelay: 1000,
-      maxReconnectionDelay: 30_000,
-      reconnectionDelayGrowFactor: 1.5,
-      maxRetries: 3,
-    },
-  });
-
-  // v0.1.1 — wire transport diagnostics BEFORE client.connect(). The SDK
-  // (Protocol._connect at node_modules/@modelcontextprotocol/sdk/dist/esm/shared/protocol.js:220-228)
-  // PRESERVES preexisting transport.onerror/onclose and WRAPS them on
-  // connect. Wiring AFTER connect would replace the SDK's protocol-level
-  // wrapper and break protocol-level error propagation. The order is
-  // load-bearing — the drift guard at tests/v2-6-tether-transport-diagnostics.test.ts
-  // pins this contract.
-  wireTransportDiagnostics(transport, {
-    log,
-    // v0.2.1 P1 — route transport errors through the reconnect supervisor.
-    // Recoverable (dead session / daemon down) → auto-reconnect with
-    // indefinite backoff (closes RC-2). Unrecoverable (bad token) → the
-    // v0.1.x manual-Reconnect dead-end. Falls back to setErrorState if the
-    // supervisor isn't wired yet (shouldn't happen post-activate).
-    setError: (msg: string) => {
-      if (reconnectSupervisor) {
-        reconnectSupervisor.handleError(msg);
-      } else {
-        setErrorState(msg);
-      }
-    },
-  });
-
   const client = new Client(
     { name: "bot-relay-tether-vscode", version: getExtensionVersion() },
     { capabilities: {} },
   );
-  await client.connect(transport);
+
+  // v0.4.1 — establish the transport through the ConnectionLifecycle seam. It
+  // binds the new transport as guard-accepted BEFORE connect (closing the
+  // mid-connect race: a close during client.connect() is honored, not dropped)
+  // and resets the intentional-disconnect flag before wiring/connecting, so a
+  // genuine close on the NEW transport routes to the supervisor.
+  const transport = await connectionLifecycle.establish({
+    build: () =>
+      new StreamableHTTPClientTransport(url, {
+        requestInit,
+        // v0.2.1 P1 — the SDK's same-session SSE retries (default `maxRetries: 2`,
+        // see streamableHttp.js:10 DEFAULT_STREAMABLE_HTTP_RECONNECTION_OPTIONS)
+        // re-open the GET on the SAME mcp-session-id. That is only useful for a
+        // genuinely transient blip where the session still exists server-side; it
+        // is FUTILE after a daemon restart (the session id is gone → 404 every
+        // attempt). Recovery from a restart is owned by ReconnectSupervisor,
+        // which performs a FRESH initialize (new session id) on the first
+        // recoverable error/close and re-arms indefinitely. So we keep the SDK
+        // budget small (3) — just enough to absorb a true transient.
+        reconnectionOptions: {
+          initialReconnectionDelay: 1000,
+          maxReconnectionDelay: 30_000,
+          reconnectionDelayGrowFactor: 1.5,
+          maxRetries: 3,
+        },
+      }),
+    // v0.1.1 — wire transport diagnostics BEFORE client.connect(). The SDK
+    // (Protocol._connect at node_modules/@modelcontextprotocol/sdk/dist/esm/shared/protocol.js:220-228)
+    // PRESERVES preexisting transport.onerror/onclose and WRAPS them on
+    // connect. Wiring AFTER connect would replace the SDK's protocol-level
+    // wrapper and break protocol-level error propagation. The order is
+    // load-bearing — the drift guard at tests/v2-6-tether-transport-diagnostics.test.ts
+    // pins this contract. establish() calls this before its connect().
+    wire: (t) =>
+      wireTransportDiagnostics(t, {
+        log,
+        // v0.2.1 P1 — route transport ERRORS through the reconnect supervisor.
+        // Recoverable (dead session / daemon down) → auto-reconnect with
+        // indefinite backoff (closes RC-2). Unrecoverable (bad token) → the
+        // v0.1.x manual-Reconnect dead-end. Falls back to setErrorState if the
+        // supervisor isn't wired yet (shouldn't happen post-activate).
+        setError: (msg: string) => {
+          if (reconnectSupervisor) {
+            reconnectSupervisor.handleError(msg);
+          } else {
+            setErrorState(msg);
+          }
+        },
+        // v0.4.1 — route an UNEXPECTED transport CLOSE through the supervisor
+        // too. A clean daemon restart (launchctl kickstart) often ends the SSE
+        // as a quiet EOF (onclose), never an onerror; pre-v0.4.1 that wedged
+        // Tether until a manual Reconnect. The guard swallows operator/teardown
+        // closes and stale/superseded closes; only a real drop of the live (or
+        // mid-establish) transport reaches here.
+        onClose: () => {
+          if (!connectionLifecycle.shouldReconnectOnClose(t)) return;
+          log("transport closed unexpectedly — routing to reconnect supervisor");
+          if (reconnectSupervisor) {
+            reconnectSupervisor.handleError("transport closed");
+          } else {
+            setErrorState("transport closed");
+          }
+        },
+      }),
+    connect: (t) => client.connect(t),
+  });
   mcpClient = client;
   mcpTransport = transport;
 
@@ -776,6 +842,77 @@ async function connect(config: TetherConfig): Promise<void> {
   });
   if (!isInErrorState()) {
     log("connected + subscribed");
+    // v0.4.1 — arm the reachability health-poll now that we're live. Resets
+    // its failure counter each fresh connect; auto-resumes after a reconnect
+    // (a successful reconnect re-runs connect() → here).
+    startHealthPoll();
+  }
+}
+
+/**
+ * v0.4.1 — start (or restart) the reachability health-poll. Idempotent: clears
+ * any prior timer + zeroes the failure counter first. No-op without a known
+ * relay endpoint.
+ */
+function startHealthPoll(): void {
+  stopHealthPoll();
+  if (!relayEndpoint) return;
+  healthPollTimer = setInterval(() => {
+    void pollHealthOnce();
+  }, HEALTH_POLL_INTERVAL_MS);
+}
+
+/** v0.4.1 — stop the health-poll + reset its failure counter (no leaked timer). */
+function stopHealthPoll(): void {
+  if (healthPollTimer) {
+    clearInterval(healthPollTimer);
+    healthPollTimer = undefined;
+  }
+  healthPollFailures = 0;
+}
+
+/**
+ * v0.4.1 — one health-poll tick. Plain HTTP GET of the daemon's /health
+ * (reachability only; the current /health has no numeric uptime — the uptime-
+ * decrease reboot detector is deferred to a follow-on once the daemon adds a
+ * monotonic uptime_seconds to HTTP /health). N consecutive failures hand off
+ * to the reconnect supervisor. Skipped while a reconnect already owns recovery
+ * (error/reconnecting state) so it never double-drives with onerror/onclose.
+ * Zero idle-token cost: a raw HTTP GET, not an MCP tool call.
+ */
+async function pollHealthOnce(): Promise<void> {
+  if (isInErrorState()) return; // a reconnect owns recovery; don't double-drive
+  const base = relayEndpoint;
+  if (!base) return;
+  let ok = false;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HEALTH_POLL_TIMEOUT_MS);
+    try {
+      const res = await fetch(new URL("/health", base), { signal: controller.signal });
+      ok = res.ok;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    ok = false; // network error / abort (timeout) / DNS — daemon unreachable
+  }
+  if (isInErrorState()) return; // re-check after the await: supervisor may have taken over
+  if (ok) {
+    healthPollFailures = 0;
+    return;
+  }
+  healthPollFailures += 1;
+  log(`health-poll: /health unreachable (${healthPollFailures}/${HEALTH_POLL_FAIL_THRESHOLD})`);
+  if (healthPollFailures >= HEALTH_POLL_FAIL_THRESHOLD) {
+    // Hand off to the supervisor and stop polling — it owns retries now, and a
+    // successful reconnect re-arms the poll via connect().
+    stopHealthPoll();
+    if (reconnectSupervisor) {
+      reconnectSupervisor.handleError("health-poll: daemon unreachable");
+    } else {
+      setErrorState("health-poll: daemon unreachable");
+    }
   }
 }
 
@@ -1315,7 +1452,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // fire-and-forget; the gate advances its mark synchronously, so there's no
   // double-wake window.
   reconnectSupervisor = new ReconnectSupervisor({
-    policy: new RestartPolicy({ neverGiveUp: true }),
+    // v0.4.1 — equalJitter decorrelates a fleet of Tether windows / watched
+    // agents so they don't retry a just-restarted daemon in lockstep. Enabled
+    // ONLY here (the reconnect path); the child-process crash-loop policy in
+    // AgentManager keeps its deterministic curve.
+    policy: new RestartPolicy({ neverGiveUp: true, equalJitter: true }),
     connect: async () => {
       await connect(await readConfig(context));
       return !isInErrorState();
@@ -1358,5 +1499,10 @@ export async function deactivate(): Promise<void> {
   reconnectSupervisor?.dispose();
   reconnectSupervisor = undefined;
   wakeGates.clear();
+  // v0.4.1 — stop the health-poll (no leaked timer) and reset the connection
+  // lifecycle so the imminent transport close is swallowed (flag raised, both
+  // transports forgotten) rather than treated as a drop.
+  stopHealthPoll();
+  connectionLifecycle.reset();
   await disconnect();
 }

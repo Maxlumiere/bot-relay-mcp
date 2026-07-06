@@ -82,6 +82,26 @@ export interface RestartPolicyOptions {
    * a fork-bomb guard. Default: false.
    */
   neverGiveUp?: boolean;
+  /**
+   * v0.4.1 — "equal jitter" on the backoff delay: when true, the computed
+   * (clamped) delay D is randomized to `D * (0.5 + random()*0.5)`, i.e. a
+   * uniform pick in [D/2, D]. This decorrelates a fleet of reconnecters
+   * (multiple Tether windows / watched agents) so they don't all retry a
+   * just-restarted daemon in lockstep (thundering herd). Keeps a floor of
+   * D/2 so a jittered retry never collapses toward ~0ms.
+   *
+   * DEFAULT OFF — the child-process crash-loop path (AgentManager) and its
+   * exact-timing tests ("1s → 2s → 4s") depend on the deterministic curve,
+   * so jitter is opt-in and enabled ONLY on the Tether reconnect supervisor's
+   * policy. Default: false.
+   */
+  equalJitter?: boolean;
+  /**
+   * v0.4.1 — randomness source for `equalJitter`, injected so unit tests can
+   * pin the jittered delay deterministically (and so the default deterministic
+   * path never calls it). Returns a value in [0, 1). Default: Math.random.
+   */
+  random?: () => number;
 }
 
 interface CrashRecord {
@@ -97,6 +117,8 @@ export class RestartPolicy {
   private readonly maxDelayMs: number;
   private readonly now: () => number;
   private readonly neverGiveUp: boolean;
+  private readonly equalJitter: boolean;
+  private readonly random: () => number;
   /**
    * Crash history. Newest at the tail. Trimmed to entries within
    * `windowMs` on every read so memory stays bounded by the window
@@ -120,6 +142,8 @@ export class RestartPolicy {
     this.maxDelayMs = opts.maxDelayMs ?? 30_000;
     this.now = opts.now ?? (() => Date.now());
     this.neverGiveUp = opts.neverGiveUp ?? false;
+    this.equalJitter = opts.equalJitter ?? false;
+    this.random = opts.random ?? Math.random;
     if (this.maxRestartsPerWindow < 1) {
       throw new Error(
         `RestartPolicy.maxRestartsPerWindow must be >= 1, got ${this.maxRestartsPerWindow}`,
@@ -208,11 +232,19 @@ export class RestartPolicy {
    * attempt=1 → initialDelayMs (default 1000)
    * attempt=2 → initialDelayMs * backoffFactor
    * attempt=N → initialDelayMs * backoffFactor^(N-1), clamped to maxDelayMs
+   *
+   * v0.4.1 — when `equalJitter` is on, the clamped delay D is randomized to
+   * a uniform pick in [D/2, D] (`D * (0.5 + random()*0.5)`) so concurrent
+   * reconnecters don't retry in lockstep. Applied AFTER the clamp, so the
+   * jittered value never exceeds maxDelayMs. Off by default → deterministic
+   * curve unchanged (AgentManager exact-timing tests preserved).
    */
   private delayForAttempt(attempt: number): number {
     if (attempt < 1) return 0;
     const raw = this.initialDelayMs * Math.pow(this.backoffFactor, attempt - 1);
-    return Math.min(raw, this.maxDelayMs);
+    const clamped = Math.min(raw, this.maxDelayMs);
+    if (!this.equalJitter) return clamped;
+    return clamped * (0.5 + this.random() * 0.5);
   }
 
   /** Drop crash entries older than the rolling window. */
