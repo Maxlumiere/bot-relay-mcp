@@ -372,55 +372,9 @@ relay_pid_chain() {
   printf '[%s]' "$chain"
 }
 
-# v2.14.1 — find the AGENT's OWN process PID (the claude/codex CLI) in this
-# hook's ancestry, for presence liveness. Unlike relay_pid_chain (a chain
-# incl. shell/terminal ancestors that OUTLIVE the agent — only good for Tether
-# terminal binding), this returns the single process that dies exactly when the
-# agent exits, so the relay can probe it.
-#
-# Matches on the executable's COMM (basename, NO path) — critical, because the
-# relay repo can live under a directory named "Claude" (e.g. ".../Claude AI/
-# bot-relay-mcp"), so an argv/path match would false-hit ANY process launched
-# from there (including this very hook). comm has no path, so only the actual
-# executable matters. Node/bun/deno-hosted agent CLIs report comm=node/bun/deno;
-# in THIS hook's ancestry the only such runtime IS the agent (the relay stdio
-# server is a sibling, not an ancestor, and is excluded by its argv anyway).
-# Starts from the hook's PARENT — the hook's own process is never the agent.
-# Extensible via RELAY_AGENT_PROCESS_PATTERN. Empty → agent_pid omitted → the
-# relay falls back to age-based presence (graceful). POSIX only (Windows omit).
-relay_agent_pid() {
-  local pid ppid comm args depth=0 pat
-  pat='claude|codex|node|bun|deno'
-  [ -n "${RELAY_AGENT_PROCESS_PATTERN:-}" ] && pat="${pat}|${RELAY_AGENT_PROCESS_PATTERN}"
-  case "$(uname -s 2>/dev/null)" in
-    MINGW*|MSYS*|CYGWIN*) return ;;
-  esac
-  pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
-  while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm="${comm##*/}"
-    if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
-      # The relay's own stdio server also reports comm=node — exclude it by its
-      # entrypoint so we never bind the presence anchor to the relay itself.
-      args=$(ps -o args= -p "$pid" 2>/dev/null)
-      case "$args" in *dist/index.js*) ;; *) printf '%s' "$pid"; return ;; esac
-    fi
-    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    case "$ppid" in ''|*[!0-9]*) break ;; esac
-    [ "$ppid" -le 1 ] && break
-    pid="$ppid"; depth=$((depth+1))
-  done
-}
-
-# v2.14.1 — start-time token for a PID (the relay's PID-reuse guard). LC_ALL=C so
-# the format is DETERMINISTIC and byte-identical to what the daemon's probe
-# reads (src/liveness.ts also pins LC_ALL=C) — otherwise a locale difference
-# between this user shell and the launchd daemon would make a live agent read
-# dead. Trimmed of surrounding whitespace. Empty on any failure.
-relay_pid_start() {
-  local pid="$1"
-  [ -n "$pid" ] || return
-  LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
-}
+# v2.15.0 — relay_agent_pid + relay_pid_start moved to _vault-helpers.sh (sourced
+# above) so check-relay.sh, the Codex hook, and post-tool-use-check.sh share one
+# copy. No inline definition here.
 
 # --- Register via HTTP register_agent (Phase 7p HIGH #3) ---
 #

@@ -419,6 +419,13 @@ export const AgentStatusEnum = z.enum([
   // show retired-by-intent sessions differently. Auto-promotes to
   // `abandoned` via the existing RELAY_AGENT_ABANDON_DAYS chain.
   "closed",
+  // v2.15.0 — relay-computed "no liveness data" state. An agent whose
+  // agent_pid is absent (never captured) or cross-host has NO probe-able
+  // liveness signal, so we surface `unknown` rather than GUESS death from a
+  // stale last_seen. Distinct from `closed`/`offline` so a reader (human or
+  // agent) can never treat "no data" as "dead". Staleness never produces it —
+  // it's the honest absence-of-signal state.
+  "unknown",
 ]);
 
 /** v2.1.3 — union accepted by set_status: new values + legacy aliases. */
@@ -446,6 +453,23 @@ export const SetStatusSchema = z.object({
   ),
   agent_token: AgentTokenField,
 });
+
+/**
+ * v2.15.0 — report_liveness: a NARROW, metadata-only presence self-report. The
+ * agent (via its SessionStart / PostToolUse hook) restamps its OWN liveness
+ * anchor (agent_pid + start-time) so an existing/old-registration session that
+ * predates the anchor capture becomes probe-able WITHOUT a full re-register
+ * (register_agent rotates session_id + can re-surface session-scoped reads —
+ * this must not). Wraps ONLY setAgentLivenessAnchor (pid + start + fill-host-
+ * if-null), touching neither session_id, last_seen, nor the read cursor.
+ */
+export const ReportLivenessSchema = z.object({
+  agent_name: z.string().min(1).describe("Your agent name (must match your token)"),
+  agent_pid: z.number().int().positive().describe("The agent CLI's own OS process id (from the hook's ancestry walk)"),
+  agent_pid_start: z.string().max(128).nullable().optional().describe("The process start-time token (LC_ALL=C `ps -o lstart=`), or null if unreadable — PID-liveness only in that case"),
+  agent_token: AgentTokenField,
+});
+export type ReportLivenessInput = z.infer<typeof ReportLivenessSchema>;
 
 export const HealthCheckSchema = z.object({
   agent_token: AgentTokenField,
@@ -867,7 +891,7 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
    * (idle/working/blocked/waiting_user) with 'stale' at 5 min + 'offline' at
    * 30 min of last_seen silence.
    */
-  agent_status: "idle" | "working" | "blocked" | "waiting_user" | "stale" | "offline" | "abandoned" | "closed";
+  agent_status: "idle" | "working" | "blocked" | "waiting_user" | "stale" | "offline" | "abandoned" | "closed" | "unknown";
   /** v2.0 final: optional description. */
   description: string | null;
   /** v2.0 final: current session_id (UUID, rotates on re-register). */
@@ -879,17 +903,25 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
   /** Tether v0.3 PID-handshake: stable OS machine GUID that host-scopes the PID match (NULL if not reported). */
   host_id: string | null;
   /**
-   * v2.13.0 — presence liveness. ISO timestamp of the most
-   * recent positive liveness confirmation (a same-host PID probe found a live
-   * shell in host_shell_pids). NULL = no signal. Distinct from last_seen
-   * (activity): last_alive proves the terminal is OPEN even while idle.
+   * v2.15.0 — presence liveness, the FIELD OF RECORD. `alive` = the process is
+   * confirmed up (same-host agent_pid probe). `dead` = a POSITIVE dead signal
+   * (agent_pid present, process confirmed gone / PID reused). `unknown` = no
+   * probe-able anchor (agent_pid absent) or cross-host — the honest "we don't
+   * know", NEVER death. Any dead-vs-unknown decision (close/relaunch/purge/
+   * rotate) MUST key on this field, never on `alive`/`status`.
+   */
+  liveness: "alive" | "dead" | "unknown";
+  /**
+   * v2.15.0 — informational ISO timestamp of the most recent positive liveness
+   * confirmation (computed in-memory; null when the current verdict isn't a
+   * fresh alive). Distinct from last_seen (activity).
    */
   last_alive: string | null;
   /**
-   * v2.13.0 — the trustworthy "awake right now?" answer. True when last_alive
-   * is fresh (within RELAY_AGENT_ALIVE_WINDOW_SEC). Lets an orchestrator
-   * distinguish alive-and-idle from offline/closed without re-deriving from
-   * timestamps.
+   * v2.13.0 — lossy back-compat convenience bool: "awake + available right now?"
+   * = liveness==='alive' AND an active agent_status (so a declared-offline live
+   * process reads false). `alive===false` means "not confirmed alive", NOT
+   * "dead" — use `liveness` to distinguish dead from unknown.
    */
   alive: boolean;
 }

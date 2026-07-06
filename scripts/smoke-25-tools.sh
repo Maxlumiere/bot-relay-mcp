@@ -199,14 +199,16 @@ RES=$(extract_result "$ENV")
 if is_ok_envelope "$ENV" && printf '%s' "$RES" | jq -e --arg a "$A_NAME" --arg b "$B_NAME" --arg m "$MGR_NAME" \
     '(.agents // []) | map(.name) | (index($a) != null) and (index($b) != null) and (index($m) != null)' >/dev/null; then
   COUNT=$(printf '%s' "$RES" | jq '.agents | length')
-  # v2.13.0 — assert the positive-liveness surface is present + well-typed on
-  # every agent row (alive is a boolean, last_alive is string|null). Smoke
-  # agents register over MCP without host_shell_pids, so alive is expected
-  # false here; the contract checked is that the FIELDS exist + are typed.
-  if printf '%s' "$RES" | jq -e '(.agents // []) | all((.alive|type)=="boolean" and ((.last_alive==null) or ((.last_alive|type)=="string")))' >/dev/null; then
-    record pass discover_agents "$COUNT agents visible, all smoke agents present + liveness fields well-typed"
+  # v2.13.0/v2.15.0 — assert the presence surface is present + well-typed on
+  # every agent row: `alive` boolean, `last_alive` string|null, and the v2.15.0
+  # field-of-record `liveness` ∈ {alive,dead,unknown}. Smoke agents register
+  # over MCP without an agent_pid, so `liveness` is expected 'unknown' here (no
+  # probe-able anchor) — NEVER 'dead'; the contract is that the fields exist +
+  # are typed + unknown is surfaced distinctly from dead.
+  if printf '%s' "$RES" | jq -e '(.agents // []) | all((.alive|type)=="boolean" and ((.last_alive==null) or ((.last_alive|type)=="string")) and (.liveness|IN("alive","dead","unknown")))' >/dev/null; then
+    record pass discover_agents "$COUNT agents visible, all smoke agents present + presence fields (alive/liveness/last_alive) well-typed"
   else
-    record fail discover_agents "liveness surface (alive/last_alive) missing or mistyped: $RES"
+    record fail discover_agents "presence surface (alive/liveness/last_alive) missing or mistyped: $RES"
   fi
 else
   record fail discover_agents "expected smokes missing: $RES"

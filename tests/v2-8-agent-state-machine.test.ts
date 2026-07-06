@@ -35,6 +35,7 @@ function base(overrides: Partial<AgentStateInputs> = {}): AgentStateInputs {
     unregisteredAt: null,
     pendingCount: 0,
     lastDispatchedAt: null,
+    liveness: "unknown", // v2.15.0: default = no probe-able anchor
     ...overrides,
   };
 }
@@ -52,13 +53,28 @@ describe("v2.8 — deriveDashboardState — closed precedence", () => {
     ).toBe("closed");
   });
 
-  it("(M3) last_seen older than session timeout returns closed", () => {
+  it("(M3) v2.15.0: last_seen older than session timeout with NO liveness → 'unknown' (age never = closed)", () => {
     expect(
       deriveDashboardState(
         base({ lastSeen: iso(-DEFAULT_THRESHOLDS.sessionTimeoutMs - 1) }),
         NOW_MS,
       ),
+    ).toBe("unknown");
+  });
+
+  it("(M3b) a POSITIVE dead probe → closed regardless of last_seen age", () => {
+    expect(
+      deriveDashboardState(base({ liveness: "dead" }), NOW_MS),
     ).toBe("closed");
+  });
+
+  it("(M3c) a live probe suppresses the age rule → an old-but-alive agent reads 'waiting', not closed", () => {
+    expect(
+      deriveDashboardState(
+        base({ liveness: "alive", lastSeen: iso(-DEFAULT_THRESHOLDS.sessionTimeoutMs - 1) }),
+        NOW_MS,
+      ),
+    ).toBe("waiting");
   });
 
   it("(M4) closed wins over stale — agent with pending work + signal still reads closed", () => {
@@ -281,14 +297,15 @@ describe("v2.8 — deriveDashboardState — threshold injection", () => {
         tight,
       ),
     ).toBe("waiting");
-    // 11s ago — past session timeout.
+    // 11s ago — past the (tight) session timeout, no liveness data → 'unknown'
+    // (v2.15.0: age past the timeout no longer declares 'closed').
     expect(
       deriveDashboardState(
         base({ lastSeen: iso(-11_000) }),
         NOW_MS,
         tight,
       ),
-    ).toBe("closed");
+    ).toBe("unknown");
   });
 
   it("(M27) all five states reachable from a single thresholds set", () => {

@@ -255,6 +255,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
         <option value="offline">offline</option>
         <option value="closed">closed</option>
         <option value="abandoned">abandoned</option>
+        <option value="unknown">unknown</option>
       </select>
     </label>
     <label>
@@ -457,7 +458,9 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
   // terminal rows. Keeps the grid visually stable as agents transition.
   const STATUS_ORDER = {
     working: 0, blocked: 1, waiting_user: 2, idle: 3,
-    stale: 4, offline: 5, closed: 6, abandoned: 7,
+    // v2.15.0: 'unknown' (no liveness data) sorts between the observation and
+    // terminal groups — it's NOT a dead state, so it must read distinctly.
+    stale: 4, unknown: 5, offline: 6, closed: 7, abandoned: 8,
   };
   function applyFilters(agents) {
     const filtered = agents.filter((a) => {

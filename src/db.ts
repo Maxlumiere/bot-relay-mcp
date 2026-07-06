@@ -89,53 +89,12 @@ function computeStatus(lastSeen: string): "online" | "stale" | "offline" {
   return "offline";
 }
 
-/**
- * v2.1.3 (I6) — agent_status auto-transition thresholds. Kept in sync with
- * docs/agent-status-lifecycle.md. Relay overrides a stored active-state
- * (idle/working/blocked/waiting_user) based on last_seen age.
- */
-const AGENT_STATUS_STALE_MINUTES = 5;
-const AGENT_STATUS_OFFLINE_MINUTES = 30;
-
-/**
- * v2.13.0 — presence liveness. A `last_alive` confirmation counts as "the
- * terminal is open right now" only while it is fresh; past this window it is
- * treated as no signal (the agent falls back to age-based derivation). Default
- * 120s (≈ a probe-on-read cadence with headroom); tunable via
- * RELAY_AGENT_ALIVE_WINDOW_SEC. The probe cache window suppresses re-probing
- * the same agent on rapid successive reads — within it, a fresh `last_alive`
- * is trusted without re-running process.kill.
- */
-function getAliveWindowMs(): number {
-  const raw = process.env.RELAY_AGENT_ALIVE_WINDOW_SEC;
-  const n = raw ? parseInt(raw, 10) : 120;
-  const sec = Number.isFinite(n) && n > 0 ? n : 120;
-  return sec * 1000;
-}
+// v2.15.0 — the old age-based liveness helpers (AGENT_STATUS_STALE/OFFLINE_MINUTES,
+// getAliveWindowMs, isAliveFresh, getAgentAbandonMinutes) were REMOVED: the
+// presence verdict is now a live in-memory probe (computeLivenessVerdict), and
+// deriveAgentStatus no longer uses last_seen age at all. The v1.3 `status`
+// field (online/stale/offline) keeps its own thresholds in computeStatus.
 const LIVENESS_PROBE_CACHE_MS = 5_000;
-
-/** True when `lastAlive` is a recent positive liveness confirmation. NULL /
- *  unparseable / future-dated-beyond-window / older than the window → false. */
-function isAliveFresh(lastAlive: string | null | undefined, nowMs: number = Date.now()): boolean {
-  if (!lastAlive) return false;
-  const t = Date.parse(lastAlive);
-  if (!Number.isFinite(t)) return false;
-  const age = nowMs - t;
-  return age >= 0 && age < getAliveWindowMs();
-}
-/**
- * v2.2.2 B3 — abandoned threshold. Agents that have been offline (no
- * re-register, no set_status refresh) for longer than this get
- * surfaced as `agent_status: "abandoned"` in snapshots. The raw DB
- * row is left alone — operators prune via `relay purge-agents`.
- * Overridable via RELAY_AGENT_ABANDON_DAYS (integer days).
- */
-function getAgentAbandonMinutes(): number {
-  const raw = process.env.RELAY_AGENT_ABANDON_DAYS;
-  const n = raw ? parseInt(raw, 10) : 7;
-  const days = Number.isFinite(n) && n > 0 ? n : 7;
-  return days * 24 * 60;
-}
 
 const LEGACY_STATUS_MAP: Record<string, string> = {
   online: "idle",
@@ -179,56 +138,44 @@ function statusAfterReregister(storedRaw: string | null | undefined): string {
 /**
  * Derive the observed agent_status. CANONICAL PRECEDENCE (single source of
  * truth; the table-driven test in tests/v2-13-0-presence-liveness.test.ts
- * exercises every cell). Inputs: the STORED declared state (which a re-register
- * has already normalized — `statusAfterReregister` resets a prior-session
- * terminal state to idle, so a stored 'offline'/'closed' here means a
- * CURRENT-session declaration, never carried-over staleness), the last_seen
- * age, and the positive-liveness signal (`lastAlive`).
+ * exercises every stored × verdict cell).
+ *
+ * v2.15.0 — AGE IS GONE from the derivation. Staleness alone can NEVER produce
+ * a terminal state (closed/offline/abandoned) again — only a DECLARATION or a
+ * POSITIVE dead probe can. Inputs are just the STORED declared state (a
+ * re-register has already normalized it via `statusAfterReregister`, so a
+ * stored 'offline'/'closed' here is a CURRENT-session declaration, not
+ * carried-over staleness) and the three-way liveness `verdict`.
  *
  * Precedence, top wins:
- *   1. stored 'offline' (current-session declaration: set_status / force-rotation)
- *      → 'offline'  [→ 'abandoned' only past the abandon window, dashboard hygiene].
- *      Liveness does NOT override an explicit "unavailable" — a live process
- *      doesn't un-declare intent.
- *   2. fresh liveness (process confirmed alive now) → the declared ACTIVE state
- *      (idle default). Overrides age-derived stale/offline/abandoned AND a
- *      current-session 'closed' that somehow still has a live anchor.
- *   3. no liveness → the v2.1.3 age + stored-terminal chain (unchanged):
- *      abandoned > stored 'abandoned' > stored 'closed' > age-offline >
- *      stored 'stale' > age-stale > active.
+ *   R1. stored 'offline' (declaration: set_status / force-rotation) → offline.
+ *       A declared-unavailable agent stays offline even with a live process —
+ *       a live PID doesn't un-declare intent. (Not 'closed' → never falsely closed.)
+ *   R2. verdict 'alive' (process confirmed up) → the declared ACTIVE state
+ *       (idle default). AUTHORITATIVE regardless of how stale last_seen is —
+ *       this is the rate-limited-but-alive case. Never 'closed'.
+ *   R3. verdict 'dead' (agent_pid present + process confirmed gone) → closed.
+ *       The ONLY probe-derived death (a crash).
+ *   R4. verdict 'unknown' + stored 'closed' (a clean SIGINT close DECLARES
+ *       closed and clears agent_pid) → closed. A declaration, not a guess.
+ *   R5. verdict 'unknown', no declaration → 'unknown'. No liveness data +
+ *       no death declaration ⇒ we DON'T KNOW; never guess dead.
  *
- * With no `lastAlive` (NULL), rules 1+3 are exactly the pre-v2.13 behavior —
- * byte-identical for every agent without a liveness signal.
+ * 'abandoned' + 'stale' remain in the enum for back-compat but are NEVER
+ * derived here; the 30-day last_seen purge handles retired-row cleanup.
  */
 export function deriveAgentStatus(
   storedRaw: string | null | undefined,
-  lastSeen: string,
-  lastAlive: string | null | undefined = null,
+  verdict: LivenessVerdict,
 ): AgentWithStatus["agent_status"] {
   const stored = normalizeStoredAgentStatus(storedRaw);
-  const minutes = (Date.now() - new Date(lastSeen).getTime()) / 60_000;
-  const abandonMinutes = getAgentAbandonMinutes();
-  const aliveFresh = isAliveFresh(lastAlive);
-
-  // 1. Explicit current-session 'offline' DECLARATION — wins over liveness.
-  if (stored === "offline") {
-    return minutes >= abandonMinutes ? "abandoned" : "offline";
+  if (stored === "offline") return "offline"; // R1
+  if (verdict === "alive") {
+    return ACTIVE_AGENT_STATES.has(stored) ? (stored as AgentWithStatus["agent_status"]) : "idle"; // R2
   }
-
-  // 2. Positive liveness — the agent's process is confirmed up.
-  if (aliveFresh) {
-    return ACTIVE_AGENT_STATES.has(stored) ? (stored as AgentWithStatus["agent_status"]) : "idle";
-  }
-
-  // 3. No liveness → age + stored-terminal chain (v2.1.3 behavior, unchanged).
-  if (minutes >= abandonMinutes) return "abandoned";
-  if (stored === "abandoned") return "abandoned";
-  if (stored === "closed") return "closed";
-  if (minutes >= AGENT_STATUS_OFFLINE_MINUTES) return "offline";
-  if (stored === "stale") return minutes >= AGENT_STATUS_OFFLINE_MINUTES ? "offline" : "stale";
-  if (minutes >= AGENT_STATUS_STALE_MINUTES) return "stale";
-  if (ACTIVE_AGENT_STATES.has(stored)) return stored as AgentWithStatus["agent_status"];
-  return "idle";
+  if (verdict === "dead") return "closed"; // R3
+  if (stored === "closed") return "closed"; // R4 (verdict === 'unknown')
+  return "unknown"; // R5 (verdict === 'unknown', no declaration)
 }
 
 /** Parse the stored host_shell_pids JSON column → number[] | null. Tolerates
@@ -246,8 +193,11 @@ function parseHostShellPids(raw: string | null | undefined): number[] | null {
   }
 }
 
-function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
-  const derivedAgentStatus = deriveAgentStatus(row.agent_status, row.last_seen, row.last_alive);
+function toAgentWithStatus(
+  row: AgentRecord,
+  verdict: LivenessVerdict = computeLivenessVerdict(row),
+): AgentWithStatus {
+  const derivedAgentStatus = deriveAgentStatus(row.agent_status, verdict);
   return {
     id: row.id,
     name: row.name,
@@ -258,14 +208,17 @@ function toAgentWithStatus(row: AgentRecord): AgentWithStatus {
     status: computeStatus(row.last_seen),
     has_token: !!row.token_hash,
     agent_status: derivedAgentStatus,
-    // v2.13.0 — positive-liveness surface. `last_alive` is the ISO timestamp
-    // of the most recent confirmation; `alive` is the trustworthy "awake +
-    // available right now?" answer. It requires a fresh confirmation AND that
-    // the surfaced status is an active state — so an agent that DECLARED itself
-    // offline (or is closed/abandoned) reads alive=false even if its process
-    // happens to still be up, keeping `alive` consistent with `agent_status`.
-    last_alive: row.last_alive ?? null,
-    alive: isAliveFresh(row.last_alive) && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
+    // v2.15.0 — presence surface. `liveness` (alive|dead|unknown) is the FIELD
+    // OF RECORD for "is the process there?" — the ONLY safe signal for a
+    // dead-vs-unknown decision (close/relaunch/purge). `alive` is a lossy
+    // back-compat bool ("awake + available right now?" = confirmed-alive AND in
+    // an active state, so a declared-offline live process reads alive=false);
+    // `alive===false` means "not confirmed alive", NEVER "dead" — readers MUST
+    // use `liveness` to tell dead from unknown. `last_alive` is informational
+    // (last positive confirmation), computed in-memory, null when not fresh-alive.
+    liveness: verdict,
+    last_alive: positiveConfirmationISO(row.name),
+    alive: verdict === "alive" && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
     description: row.description ?? null,
     session_id: row.session_id ?? null,
     terminal_title_ref: row.terminal_title_ref ?? null,
@@ -1977,7 +1930,7 @@ export function setAgentLivenessAnchor(
       "UPDATE agents SET agent_pid = ?, agent_pid_start = ?, host_id = COALESCE(host_id, ?) WHERE name = ?",
     )
     .run(pid, startedAt, ownHost, name);
-  if (r.changes > 0) _negativeProbeCache.delete(name);
+  if (r.changes > 0) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
   return r.changes > 0;
 }
 
@@ -2026,7 +1979,7 @@ export function markAgentOffline(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(name, expectedSessionId);
-  if (r.changes === 1) _negativeProbeCache.delete(name);
+  if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
   return { changed: r.changes === 1 };
 }
 
@@ -2076,7 +2029,7 @@ export function closeAgentSession(
       "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
       "WHERE name = ? AND session_id = ?"
     ).run(name, expectedSessionId);
-    if (r.changes === 1) _negativeProbeCache.delete(name);
+    if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
     return { changed: r.changes === 1 };
   }
   const nowMs = Date.now();
@@ -2086,7 +2039,7 @@ export function closeAgentSession(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(nowMs, signalKind, name, expectedSessionId);
-  if (r.changes === 1) _negativeProbeCache.delete(name);
+  if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
   return { changed: r.changes === 1 };
 }
 
@@ -2925,7 +2878,7 @@ export function getDashboardAgentSnapshots(
     unregisteredAt: number | null;
     pendingCount: number;
     lastDispatchedAt: number | null;
-    lastAlive: string | null;
+    liveness: LivenessVerdict;
   };
 }> {
   const db = getDb();
@@ -2960,10 +2913,9 @@ export function getDashboardAgentSnapshots(
     last_alive: string | null;
     pending_count_old: number | bigint;
   }>;
-  // v2.13.0 — refresh positive liveness so the dashboard reflects alive-and-
-  // idle agents too (mutates row.last_alive in place). Same host-scoped,
-  // cache-gated probe getAgents() uses.
-  refreshLivenessForRows(rows);
+  // v2.15.0 — compute the liveness verdict PURELY (in-memory probe + caches,
+  // zero DB writes) and feed it to the dashboard state machine, same as
+  // getAgents(). No read-path mutation.
   return rows.map((r) => ({
     name: r.name,
     inputs: {
@@ -2977,7 +2929,7 @@ export function getDashboardAgentSnapshots(
       unregisteredAt: null,
       pendingCount: Number(r.pending_count_old),
       lastDispatchedAt: r.last_dispatched_at,
-      lastAlive: r.last_alive,
+      liveness: computeLivenessVerdict(r),
     },
   }));
 }
@@ -3078,6 +3030,10 @@ export interface HealthSnapshot {
    *  heartbeat). The trustworthy "how many are actually awake?" count, vs the
    *  raw agent_count which includes idle/closed/abandoned rows. */
   agent_count_alive: number;
+  /** v2.15.0 — agents with NO liveness data (agent_pid absent / cross-host):
+   *  liveness==='unknown'. Surfaced DISTINCTLY from any dead/closed count so a
+   *  reader never treats "we don't know" as "gone". */
+  agent_count_unknown: number;
   message_count_pending: number;
   task_count_active: number;
   task_count_queued: number;
@@ -3101,13 +3057,16 @@ export function getHealthSnapshot(): HealthSnapshot {
     "SELECT COUNT(*) AS c FROM tasks WHERE status = 'queued'"
   ).get() as { c: number }).c;
   const channelCount = (db.prepare("SELECT COUNT(*) AS c FROM channels").get() as { c: number }).c;
-  // v2.13.0 — alive count routes through getAgents() so it reflects the same
-  // positive-liveness probe discover_agents uses (not a stale age-based guess).
-  const agentCountAlive = getAgents().filter((a) => a.alive).length;
+  // v2.15.0 — alive + unknown counts route through getAgents() so they reflect
+  // the same pure liveness verdict discover_agents uses (not an age-based guess).
+  const agentsSnapshot = getAgents();
+  const agentCountAlive = agentsSnapshot.filter((a) => a.liveness === "alive").length;
+  const agentCountUnknown = agentsSnapshot.filter((a) => a.liveness === "unknown").length;
   return {
     status: "ok",
     agent_count: agentCount,
     agent_count_alive: agentCountAlive,
+    agent_count_unknown: agentCountUnknown,
     message_count_pending: messageCountPending,
     task_count_active: taskCountActive,
     task_count_queued: taskCountQueued,
@@ -3173,13 +3132,23 @@ export function getTasksInWindow(sinceIso: string, limit: number = 1000): TaskRe
  */
 const _negativeProbeCache = new Map<string, number>();
 
+/**
+ * v2.15.0 — POSITIVE probe cache, now IN-MEMORY (was the `last_alive` DB column).
+ * Keyed by agent name → wall-clock ms of the last ALIVE confirmation. Moving it
+ * off the DB is what makes the read path PURE: getAgents/health/standup compute
+ * the liveness verdict from a live probe + these two in-memory caches and write
+ * NOTHING to the DB (see feedback project_read_paths_stay_pure).
+ */
+const _positiveProbeCache = new Map<string, number>();
+
 /** Test-only: count of ACTUAL liveness probes (cache-miss isAgentProcessAlive
  *  calls), so tests can assert the positive/negative caches suppress re-probes. */
 let _livenessProbeCount = 0;
 
-/** Test-only: clear the negative-probe cache + reset the probe counter. */
+/** Test-only: clear both probe caches + reset the probe counter. */
 export function _resetLivenessProbeCacheForTests(): void {
   _negativeProbeCache.clear();
+  _positiveProbeCache.clear();
   _livenessProbeCount = 0;
 }
 
@@ -3188,57 +3157,53 @@ export function _getLivenessProbeCountForTests(): number {
   return _livenessProbeCount;
 }
 
-/**
- * v2.13.0 — lazy presence-liveness refresh. For each row that is (a) on THIS
- * host (host_id matches the relay's own GUID) and (b) has a recorded
- * `agent_pid` (the agent's OWN process — claude/codex — NOT the host_shell_pids
- * ancestry chain, whose shell/terminal ancestors outlive the agent), probe
- * that process. On a live hit, stamp `last_alive = now()` (mutating `row` in
- * place so the immediate map() sees it + persisting via the sanctioned writer).
- *
- * Skipped (→ unchanged age-based derivation): cross-host agents, agents with no
- * recorded agent_pid, agents whose `last_alive` is fresh within the cache
- * window (positive cache), and agents recently confirmed dead (negative cache).
- *
- * Cheap: gated by host match + both caches, a steady-state read does near-zero
- * probes.
- */
-function refreshLivenessForRows(
-  rows: Array<{
-    name: string;
-    host_id?: string | null;
-    agent_pid?: number | null;
-    agent_pid_start?: string | null;
-    last_alive?: string | null;
-  }>,
-): void {
-  const ownHost = getOwnHostId();
-  if (!ownHost) return; // can't host-scope → never probe (cross-host fallback)
-  const nowMs = Date.now();
-  const ts = new Date(nowMs).toISOString();
-  for (const row of rows) {
-    if (!row.host_id || row.host_id !== ownHost) continue; // cross-host
-    if (typeof row.agent_pid !== "number" || row.agent_pid <= 0) continue; // no anchor
-    // Positive cache — a recent live confirmation is trusted as-is.
-    if (row.last_alive) {
-      const age = nowMs - Date.parse(row.last_alive);
-      if (Number.isFinite(age) && age >= 0 && age < LIVENESS_PROBE_CACHE_MS) continue;
-    }
-    // Negative cache — recently-confirmed-dead rows aren't re-probed in-window.
-    const deadAt = _negativeProbeCache.get(row.name);
-    if (deadAt !== undefined && nowMs - deadAt < LIVENESS_PROBE_CACHE_MS) continue;
+/** v2.15.0 — the three-way presence verdict. `unknown` = no positive AND no
+ *  negative signal (agent_pid absent, or cross-host so we can't probe) — it is
+ *  the honest "we don't know", NEVER treated as death. */
+export type LivenessVerdict = "alive" | "dead" | "unknown";
 
-    _livenessProbeCount++;
-    if (isAgentProcessAlive(row.agent_pid, row.agent_pid_start ?? null)) {
-      row.last_alive = ts; // in-place so the subsequent map() reflects it
-      _negativeProbeCache.delete(row.name);
-      updateAgentMetadata(row.name, { last_alive: ts });
-    } else {
-      // Dead → record the verdict so we don't re-probe every read; leave
-      // last_alive untouched so the age-based derivation applies.
-      _negativeProbeCache.set(row.name, nowMs);
-    }
+/**
+ * v2.15.0 — compute a row's liveness verdict PURELY (in-memory only; ZERO DB
+ * writes) so it can run on every read path. Absence of a probe-able anchor
+ * (no agent_pid) or a cross-host row → `unknown`, never `dead`. Only a positive
+ * dead signal — agent_pid present, same host, and the process confirmed gone
+ * (kill ESRCH) or its start-time mismatched (PID reuse) — yields `dead`.
+ * `isAgentProcessAlive` already encodes the narrow-dead rule (kill ok +
+ * start-time missing/unreadable ⇒ alive, not dead). Positive + negative caches
+ * (both in-memory) suppress re-probes within LIVENESS_PROBE_CACHE_MS.
+ */
+export function computeLivenessVerdict(row: {
+  name: string;
+  host_id?: string | null;
+  agent_pid?: number | null;
+  agent_pid_start?: string | null;
+}): LivenessVerdict {
+  if (typeof row.agent_pid !== "number" || row.agent_pid <= 0) return "unknown"; // no anchor
+  const ownHost = getOwnHostId();
+  if (!ownHost || !row.host_id || row.host_id !== ownHost) return "unknown"; // cross-host / can't host-scope
+  const nowMs = Date.now();
+  const aliveAt = _positiveProbeCache.get(row.name);
+  if (aliveAt !== undefined && nowMs - aliveAt < LIVENESS_PROBE_CACHE_MS) return "alive";
+  const deadAt = _negativeProbeCache.get(row.name);
+  if (deadAt !== undefined && nowMs - deadAt < LIVENESS_PROBE_CACHE_MS) return "dead";
+  _livenessProbeCount++;
+  if (isAgentProcessAlive(row.agent_pid, row.agent_pid_start ?? null)) {
+    _positiveProbeCache.set(row.name, nowMs);
+    _negativeProbeCache.delete(row.name);
+    return "alive";
   }
+  _negativeProbeCache.set(row.name, nowMs);
+  _positiveProbeCache.delete(row.name);
+  return "dead";
+}
+
+/** The ISO timestamp of the last positive confirmation for `name`, for the
+ *  informational `last_alive` surface. In-memory (no DB read); null when the
+ *  current verdict isn't a fresh alive. */
+function positiveConfirmationISO(name: string): string | null {
+  const at = _positiveProbeCache.get(name);
+  if (at === undefined || Date.now() - at >= LIVENESS_PROBE_CACHE_MS) return null;
+  return new Date(at).toISOString();
 }
 
 export function getAgents(role?: string): AgentWithStatus[] {
@@ -3251,10 +3216,9 @@ export function getAgents(role?: string): AgentWithStatus[] {
     rows = db.prepare("SELECT * FROM agents ORDER BY last_seen DESC").all() as AgentRecord[];
   }
 
-  // v2.13.0 — refresh positive liveness before deriving status so an alive-
-  // and-idle agent reads alive, not offline/closed.
-  refreshLivenessForRows(rows);
-  return rows.map(toAgentWithStatus);
+  // v2.15.0 — compute the liveness verdict PURELY (in-memory probe + caches,
+  // zero DB writes) and derive status from it. No read-path mutation.
+  return rows.map((row) => toAgentWithStatus(row, computeLivenessVerdict(row)));
 }
 
 /**

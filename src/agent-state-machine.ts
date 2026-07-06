@@ -19,9 +19,9 @@
  * the decay broadcaster) and stamps the new DB columns; no existing
  * consumer changes shape.
  *
- * Architectural calls locked during a v2.8 design review. State count = 5
- * (locked 2026-05-25). Precedence top wins:
- * `closed > stale > pending > active > waiting`.
+ * Architectural calls locked during a v2.8 design review. State count = 6
+ * (v2.15.0 added `unknown`; original 5 locked 2026-05-25). Precedence top wins:
+ * `closed > unknown > stale > pending > active > waiting`.
  */
 
 /**
@@ -34,7 +34,13 @@ export type DashboardAgentState =
   | "pending"
   | "waiting"
   | "stale"
-  | "closed";
+  | "closed"
+  // v2.15.0 — "no liveness data" (agent_pid absent / cross-host). Shown
+  // DISTINCTLY from `closed` so the operator never reads "we don't know" as
+  // "dead". Age alone never produces `closed` anymore — only a teardown
+  // declaration or a positive dead probe does; an old row with no probe-able
+  // anchor lands here instead.
+  | "unknown";
 
 /**
  * Observable facts used to derive the state. Mirrors the agents-row
@@ -71,15 +77,15 @@ export interface AgentStateInputs {
    */
   lastDispatchedAt: number | null;
   /**
-   * v2.13.0 — ISO timestamp of the most recent POSITIVE liveness confirmation
-   * (same-host PID probe / heartbeat), or `null`. When fresh (within
-   * `aliveWindowMs`) it proves the terminal is OPEN even while idle, so it
-   * suppresses the `last_seen`-age session-timeout `closed` promotion — an
-   * alive-and-idle agent derives `waiting`, not `closed`. A genuine
-   * current-session teardown (`signalReceivedAt`/`unregisteredAt`) still wins,
-   * and cannot coincide: a real SIGINT kills the shell PIDs the probe reads.
+   * v2.15.0 — the three-way liveness verdict, pre-computed by the caller from
+   * the agent's own-process probe. `alive` = process confirmed up → suppresses
+   * the age-based `closed`/`unknown` (an alive-and-idle agent derives
+   * `waiting`, even with a stale last_seen — the rate-limit case). `dead` =
+   * positive dead probe → `closed`. `unknown` = no probe-able anchor → an old
+   * row derives `unknown`, NEVER a stale-age `closed`. A genuine teardown
+   * declaration (`signalReceivedAt`/`unregisteredAt`) still wins over all.
    */
-  lastAlive: string | null;
+  liveness: "alive" | "dead" | "unknown";
 }
 
 /**
@@ -155,10 +161,13 @@ export function resolveThresholdsFromEnv(
  *
  * Precedence (top wins) per the brief's locked rule:
  *
- *   1. `closed` — any of:
+ *   1. `closed` — a teardown DECLARATION or a POSITIVE dead probe:
  *        - `signalReceivedAt` is set (SIGHUP/SIGINT/SIGTERM fired)
  *        - `unregisteredAt` is set (explicit unregister tool call)
- *        - `lastSeen` older than `sessionTimeoutMs` (session timeout)
+ *        - `liveness === 'dead'` (agent_pid present, process confirmed gone)
+ *   1b. `unknown` — v2.15.0: `liveness !== 'alive'` (no probe-able anchor) AND
+ *        `lastSeen` older than `sessionTimeoutMs`. Replaces the old stale-age
+ *        `closed` — age alone never declares death; a live probe suppresses it.
  *   2. `stale`  — was-active inside `wasActiveWindowMs` AND quiet for
  *                 >= `staleWindowMs` AND (`pendingCount > 0` OR
  *                 `lastDispatchedAt` inside `recentDispatchWindowMs`).
@@ -188,28 +197,33 @@ export function deriveDashboardState(
     unregisteredAt,
     pendingCount,
     lastDispatchedAt,
-    lastAlive,
+    liveness,
   } = inputs;
 
   const lastSeenMs = parseIsoOrNull(lastSeen);
-  const lastAliveMs = parseIsoOrNull(lastAlive);
-  // v2.13.0 — a fresh positive-liveness confirmation means the terminal is
-  // open right now. It does NOT override an intentional teardown signal
-  // (those win below), but it DOES suppress the last_seen-age session-timeout
-  // `closed` so an alive-and-idle agent reads `waiting`/`active`, not `closed`.
-  const aliveFresh =
-    lastAliveMs !== null && now - lastAliveMs >= 0 && now - lastAliveMs < thresholds.aliveWindowMs;
 
-  // 1. closed — top precedence (intentional teardown wins over liveness).
+  // 1. closed — top precedence: an intentional teardown DECLARATION.
   if (signalReceivedAt !== null && Number.isFinite(signalReceivedAt) && signalReceivedAt > 0) {
     return "closed";
   }
   if (unregisteredAt !== null && Number.isFinite(unregisteredAt) && unregisteredAt > 0) {
     return "closed";
   }
-  // Session-timeout closed — gated by positive liveness (the gate-5 fix).
-  if (!aliveFresh && lastSeenMs !== null && now - lastSeenMs >= thresholds.sessionTimeoutMs) {
+  // 2. closed — a POSITIVE dead probe (agent_pid present, process confirmed gone).
+  if (liveness === "dead") {
     return "closed";
+  }
+  // v2.15.0 — age NEVER produces `closed` on its own. A live process is
+  // authoritative (suppresses the age rule → falls through to activity states,
+  // so a rate-limited alive-but-quiet agent reads `waiting`, not closed). With
+  // NO liveness data (`unknown`), an old-past-session-timeout row reads
+  // `unknown`, never a stale-age `closed`.
+  if (
+    liveness !== "alive" &&
+    lastSeenMs !== null &&
+    now - lastSeenMs >= thresholds.sessionTimeoutMs
+  ) {
+    return "unknown";
   }
 
   // 2. stale — was-active recently AND quiet long enough AND has work to do.

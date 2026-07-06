@@ -23,7 +23,12 @@ const {
   getDb,
   CURRENT_SCHEMA_VERSION,
   closeDb,
+  setAgentLivenessAnchor,
+  _resetLivenessProbeCacheForTests,
 } = await import("../src/db.js");
+const { _resetOwnHostIdForTests } = await import("../src/liveness.js");
+const OWN_HOST = "v213-own-host";
+const LIVE_PID = process.pid;
 const { handleSetStatus } = await import("../src/tools/status.js");
 
 function cleanup() {
@@ -141,53 +146,47 @@ describe("v2.1.3 I6 — setAgentStatus accepts new + legacy enum", () => {
 });
 
 describe("v2.1.3 I6 — discover_agents read-side auto-transition", () => {
-  it("fresh registration shows agent_status='idle'", () => {
-    registerAgent("a", "r", []);
-    const agents = getAgents();
-    const a = agents.find((x) => x.name === "a")!;
-    expect(a.agent_status).toBe("idle");
+  // v2.15.0 — agent_status is now VERDICT-driven, not age-driven. Staleness
+  // never transitions the status; only a live/dead probe or a declaration does.
+  const anchorAlive = (name: string) => setAgentLivenessAnchor(name, LIVE_PID, null);
+  const staleLastSeen = (name: string, minAgo: number) =>
+    getDb().prepare("UPDATE agents SET last_seen = ? WHERE name = ?")
+      .run(new Date(Date.now() - minAgo * 60 * 1000).toISOString(), name);
+
+  beforeEach(() => _resetOwnHostIdForTests(OWN_HOST));
+
+  it("fresh registration with NO liveness anchor reads 'unknown' (no data), not idle", () => {
+    registerAgent("a", "r", [], { host_id: OWN_HOST });
+    const a = getAgents().find((x) => x.name === "a")!;
+    expect(a.agent_status).toBe("unknown");
+    expect(a.liveness).toBe("unknown");
   });
 
-  it("stale after 5 min of last_seen silence (stored idle → output stale)", () => {
-    registerAgent("stale-target", "r", []);
-    const db = getDb();
-    const sixMinAgo = new Date(Date.now() - 6 * 60 * 1000).toISOString();
-    db.prepare("UPDATE agents SET last_seen = ? WHERE name = ?").run(sixMinAgo, "stale-target");
-    const a = getAgents().find((x) => x.name === "stale-target")!;
-    expect(a.agent_status).toBe("stale");
+  it("a live anchor makes it idle — and STALE last_seen never changes that (rate-limit case)", () => {
+    registerAgent("live", "r", [], { host_id: OWN_HOST });
+    anchorAlive("live");
+    expect(getAgents().find((x) => x.name === "live")!.agent_status).toBe("idle");
+    staleLastSeen("live", 6 * 60); // 6 hours stale — OLD code would have said offline/abandoned
+    _resetLivenessProbeCacheForTests();
+    const a = getAgents().find((x) => x.name === "live")!;
+    expect(a.agent_status).toBe("idle"); // AGE-FREE: a live PID is authoritative
+    expect(a.liveness).toBe("alive");
   });
 
-  it("offline after 30 min of last_seen silence", () => {
-    registerAgent("offline-target", "r", []);
-    const db = getDb();
-    const thirtyOneMinAgo = new Date(Date.now() - 31 * 60 * 1000).toISOString();
-    db.prepare("UPDATE agents SET last_seen = ? WHERE name = ?").run(thirtyOneMinAgo, "offline-target");
-    const a = getAgents().find((x) => x.name === "offline-target")!;
-    expect(a.agent_status).toBe("offline");
-  });
-
-  it("stored working within 5-min window stays working", () => {
-    registerAgent("working-target", "r", []);
+  it("stored working + live anchor stays working regardless of last_seen age", () => {
+    registerAgent("working-target", "r", [], { host_id: OWN_HOST });
     setAgentStatus("working-target", "working");
-    const a = getAgents().find((x) => x.name === "working-target")!;
-    expect(a.agent_status).toBe("working");
+    anchorAlive("working-target");
+    staleLastSeen("working-target", 6);
+    _resetLivenessProbeCacheForTests();
+    expect(getAgents().find((x) => x.name === "working-target")!.agent_status).toBe("working");
   });
 
-  it("stored working beyond 5 min → stale override", () => {
-    registerAgent("working-stale", "r", []);
-    setAgentStatus("working-stale", "working");
-    const db = getDb();
-    const sixMinAgo = new Date(Date.now() - 6 * 60 * 1000).toISOString();
-    db.prepare("UPDATE agents SET last_seen = ? WHERE name = ?").run(sixMinAgo, "working-stale");
-    const a = getAgents().find((x) => x.name === "working-stale")!;
-    expect(a.agent_status).toBe("stale");
-  });
-
-  it("stored offline always outputs offline regardless of last_seen recency", () => {
-    registerAgent("always-offline", "r", []);
+  it("stored offline always outputs offline regardless of last_seen recency or a live anchor", () => {
+    registerAgent("always-offline", "r", [], { host_id: OWN_HOST });
     setAgentStatus("always-offline", "offline");
-    const a = getAgents().find((x) => x.name === "always-offline")!;
-    expect(a.agent_status).toBe("offline");
+    anchorAlive("always-offline"); // even a live process doesn't un-declare offline
+    expect(getAgents().find((x) => x.name === "always-offline")!.agent_status).toBe("offline");
   });
 });
 

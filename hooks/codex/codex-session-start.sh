@@ -87,39 +87,8 @@ fi
 # daemon is unreachable we skip silently and still emit the inbox nudge — the
 # agent's own get_messages call will surface a clear auth/registration error.
 
-# v2.14.1 — the agent's OWN process PID (this codex CLI) for presence
-# liveness. Matches on COMM (executable basename, NO path) so a repo dir named
-# "Claude"/"Codex" can't false-hit; starts from the hook's PARENT (the hook is
-# never the agent); excludes the relay's own node by its entrypoint. Empty →
-# agent_pid omitted → age-based fallback. POSIX only. Mirrors check-relay.sh.
-relay_agent_pid() {
-  local pid ppid comm args depth=0 pat
-  pat='claude|codex|node|bun|deno'
-  [ -n "${RELAY_AGENT_PROCESS_PATTERN:-}" ] && pat="${pat}|${RELAY_AGENT_PROCESS_PATTERN}"
-  case "$(uname -s 2>/dev/null)" in
-    MINGW*|MSYS*|CYGWIN*) return ;;
-  esac
-  pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
-  while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm="${comm##*/}"
-    if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
-      args=$(ps -o args= -p "$pid" 2>/dev/null)
-      case "$args" in *dist/index.js*) ;; *) printf '%s' "$pid"; return ;; esac
-    fi
-    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    case "$ppid" in ''|*[!0-9]*) break ;; esac
-    [ "$ppid" -le 1 ] && break
-    pid="$ppid"; depth=$((depth+1))
-  done
-}
-
-# v2.14.1 — start-time token (PID-reuse guard). LC_ALL=C so it matches the
-# daemon's probe byte-for-byte (src/liveness.ts also pins LC_ALL=C).
-relay_pid_start() {
-  local pid="$1"
-  [ -n "$pid" ] || return
-  LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
-}
+# v2.15.0 — relay_agent_pid + relay_pid_start now live in _vault-helpers.sh
+# (sourced above), shared with check-relay.sh + post-tool-use-check.sh.
 
 build_caps_json() {
   if [ -z "$AGENT_CAPS" ]; then printf '[]'; return; fi
