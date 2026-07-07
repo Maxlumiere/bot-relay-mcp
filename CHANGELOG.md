@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.15.2 — 2026-07-07 — Signal teardown stops re-polluting terminal states
+
+v2.15.1 was a one-time cleanup of stale stored terminal states. This closes the source that *re-creates* them: the stdio signal handler. A `SIGHUP`/`SIGINT`/`SIGTERM` is delivered to the agent's **MCP-server process**, not to the agent itself (the agent — `claude`/`codex`, tracked by `agent_pid` — can survive a terminal reflow / editor reload and relaunch its MCP server). The pre-v2.15.2 handler stamped a terminal `agent_status` on that signal, which stuck on two surfaces and phantom-closed a surviving agent:
+
+- **`getAgents`** — `deriveAgentStatus` R1 makes a stored `offline` win even over a confirmed-alive probe, so a signal-stamped `offline` never self-heals.
+- **dashboard** — `deriveDashboardState` returned `closed` from the signal stamp alone, *and* the stamp was never cleared on re-register, so a fresh session with no probe-able anchor (a valid case: no agent ancestor matched / cross-host) read `closed` from the stale stamp.
+
+### The fix (liveness governs; a signal is context, not a verdict)
+
+1. **New signal-only teardown** (`endAgentSessionOnSignal`) replaces `closeAgentSession`/`markAgentOffline` on the stdio signal path. It **clears the liveness anchor** (`agent_pid`/`agent_pid_start`/`last_alive`), writes **no sticky terminal status** (`agent_status = 'idle'` — a neutral, derivable value: with the anchor cleared `deriveAgentStatus` returns `unknown`, and if the agent comes back it reads active), stamps `signal_received_at`/`signal_kind` for dashboard forensics only, and releases the session. There is **no `markAgentOffline` fallback** — on failure it logs + audits and writes no terminal status. `markAgentOffline` is untouched for spawn's deliberate offline-pre-register.
+2. **Dashboard liveness gate** — `deriveDashboardState` now suppresses the signal-derived `closed` when the liveness probe is `alive`. An explicit `unregister` (a deliberate delete) is **not** gated and still wins.
+3. **Session-scoped stamp** — `registerAgent` clears `signal_received_at`/`signal_kind` in the same UPDATE that rotates `session_id`, so a signal stamp can never outlive its session. Long-term forensics live in `audit_log` (`stdio.session_ended_on_signal`).
+
+A genuine operator `set_status('offline')` is unaffected — that declaration path (R1) still wins over a live probe.
+
+### Also
+
+- **HTTP `/health` now reports `uptime_seconds`** (monotonic, `process.uptime()`-based, not wall-clock), so a follow-on Tether can detect a silent daemon restart under a still-open connection. The detector must compare with a strict `<` (uptime is non-decreasing within one process).
+- **CI now runs the VSCode extension unit suite** (`extensions/vscode` `npm run test:unit`) in GitHub Actions — previously it ran only locally, which is how the v0.4.1 health-poll status-check gap slipped past CI.
+
 ## v2.15.1 — 2026-07-06 — Clear stale stored terminal states
 
 v2.15.0 honors a stored `offline`/`closed` as a declaration (rules R1/R4), which is correct going forward — but agents carrying a *leftover* terminal state from before the presence fix (the stdio signal handlers, force-rotation, and the spawn offline-pre-register all STORE `offline`/`closed`, sometimes on a transient signal the agent survived) read that stale value instead of their live state, and an `offline`-polluted live agent never self-corrects. This is a one-time cleanup so the live verdict governs again.

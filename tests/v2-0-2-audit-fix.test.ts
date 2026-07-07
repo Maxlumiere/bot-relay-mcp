@@ -84,13 +84,13 @@ describe("v2.0.2 — SIGINT auto-offline honours capturedSessionId contract", ()
     // v2.1.3: row is preserved (not deleted). session_id is cleared. Token
     // hash and capabilities stay intact so a new terminal with the same
     // RELAY_AGENT_TOKEN can resume via the active-state re-register path.
-    // v2.2.2 BUG2: the intentional-terminal-close transition now lands on
-    // agent_status='closed' (not 'offline') so dashboards can distinguish
-    // retired-by-intent from network-drop.
+    // v2.15.2: the signal path stores a NEUTRAL 'idle' (no sticky terminal
+    // status) + clears the anchor; liveness derivation governs presence from
+    // here (getAgents → 'unknown' with the anchor gone).
     const row = getAgentAuthData("solo-stdio");
     expect(row).toBeTruthy();
     expect(row?.session_id).toBeNull();
-    expect(row?.agent_status).toBe("closed");
+    expect(row?.agent_status).toBe("idle");
     expect(row?.token_hash).toBe(tokenHashBefore);
     expect(row?.auth_state).toBe("active");
   });

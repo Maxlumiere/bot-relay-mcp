@@ -172,14 +172,13 @@ describe("v2.1.3 I5 — NAME_COLLISION_ACTIVE on live session + wrong token", ()
     const sid = r.agent.session_id!;
     performAutoUnregister("collider-4", sid, "SIGTERM");
 
-    // Row is preserved but closed. session_id is NULL. (v2.2.2 BUG2:
-    // SIGINT transition is now 'closed' rather than 'offline' so
-    // dashboards can distinguish retired-by-intent from transient drop.
-    // Collision semantics below are unchanged — neither state is live.)
+    // Row is preserved; session_id is NULL. (v2.15.2: the signal path stores a
+    // NEUTRAL 'idle' + clears the anchor rather than a sticky 'closed'/'offline'.
+    // Collision semantics below are unchanged — the session is not live.)
     const row = getAgentAuthData("collider-4");
     expect(row).toBeTruthy();
     expect(row?.session_id).toBeNull();
-    expect(row?.agent_status).toBe("closed");
+    expect(row?.agent_status).toBe("idle");
 
     // Fresh terminal with the existing token resumes the active-state
     // re-register path — no collision (session is not live).

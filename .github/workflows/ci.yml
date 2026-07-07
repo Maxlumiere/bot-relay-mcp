@@ -51,6 +51,18 @@ jobs:
           npm install
           npm run compile
 
+      # v2.15.2 — run the VSCode extension unit suite in CI. Previously it ran
+      # ONLY locally (root `npm test` covers tests/, whose vitest config excludes
+      # extensions/vscode/src/*.test.ts), so ext-side regressions (e.g. the
+      # v0.4.1 health-poll status-check) were gated by hand. The ext deps are
+      # already installed by the compile step above. Note: the VSIX-content
+      # guards (v0-1-4-vsix-contents) shell out to `vsce package`; if they flake
+      # on CI, add a retry/timeout there rather than dropping this gate.
+      - name: Run VSCode extension unit tests
+        run: |
+          cd extensions/vscode
+          npm run test:unit
+
       - name: Run test suite
         run: npx vitest run
 

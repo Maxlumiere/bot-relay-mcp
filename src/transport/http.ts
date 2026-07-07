@@ -479,6 +479,14 @@ export function startHttpServer(port: number, host: string): Server {
       protocol_version: PROTOCOL_VERSION,
       transport: "http",
       auth_required: !!config.http_secret,
+      // v2.15.2 — MONOTONIC process uptime (process.uptime(), NOT Date.now
+      // wall-clock, which can jump on clock adjustments). A follow-on Tether
+      // health-poll uses this as a silent-death detector: a decrease across
+      // polls means the daemon restarted under a still-open connection. The
+      // detector MUST compare with a STRICT `<` (uptime went backwards), never
+      // `<=` — uptime is non-decreasing within one process, so `<=` would
+      // false-trigger on two equal readings.
+      uptime_seconds: Math.floor(process.uptime()),
     });
   });
 

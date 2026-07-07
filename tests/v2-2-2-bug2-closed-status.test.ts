@@ -92,20 +92,24 @@ describe("v2.2.2 BUG2 — closed agent_status", () => {
     expect(derived?.agent_status).toBe("closed");
   });
 
-  it("(BUG2.2) performAutoUnregister routes through closeAgentSession + writes stdio.auto_close audit", () => {
+  it("(BUG2.2) performAutoUnregister routes through endAgentSessionOnSignal (v2.15.2 — neutral 'idle', anchor cleared, stdio.session_ended_on_signal audit)", () => {
     registerAgent("sigint-target", "r", []);
     const row = getDb()
       .prepare("SELECT session_id FROM agents WHERE name = ?")
       .get("sigint-target") as { session_id: string };
     performAutoUnregister("sigint-target", row.session_id, "SIGINT");
     const after = getDb()
-      .prepare("SELECT agent_status FROM agents WHERE name = ?")
-      .get("sigint-target") as { agent_status: string };
-    expect(after.agent_status).toBe("closed");
+      .prepare("SELECT agent_status, agent_pid, signal_kind FROM agents WHERE name = ?")
+      .get("sigint-target") as { agent_status: string; agent_pid: number | null; signal_kind: string | null };
+    // v2.15.2 — no sticky terminal status: stored 'idle' (neutral), anchor
+    // cleared, signal stamped for dashboard forensics.
+    expect(after.agent_status).toBe("idle");
+    expect(after.agent_pid).toBeNull();
+    expect(after.signal_kind).toBe("SIGINT");
     const audit = getDb()
       .prepare(
         "SELECT agent_name, tool, params_summary FROM audit_log " +
-        "WHERE tool = 'stdio.auto_close' ORDER BY id DESC LIMIT 1"
+        "WHERE tool = 'stdio.session_ended_on_signal' ORDER BY id DESC LIMIT 1"
       )
       .get() as { agent_name: string; tool: string; params_summary: string } | undefined;
     expect(audit).toBeDefined();
