@@ -53,6 +53,7 @@ import {
 import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { ConnectionLifecycle } from "./connection-lifecycle.js";
+import { HealthPoll } from "./health-poll.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
 import { adapterFor, type LlmAdapter, type WakeContext, type SubmitMethod } from "./llm-adapter.js";
@@ -329,19 +330,51 @@ let summaryDirty = false;
 const connectionLifecycle = new ConnectionLifecycle<StreamableHTTPClientTransport>();
 
 /**
- * v0.4.1 — reachability health-poll (belt-and-suspenders for a SILENTLY
- * swallowed SSE death — no onerror AND no onclose, the Electron-fetch failure
- * class transport-diagnostics.ts was born to fight). A plain HTTP GET of the
- * daemon's /health while connected; N consecutive failures hand off to the
- * reconnect supervisor. ZERO idle-token cost — a raw HTTP GET, not an MCP tool
- * call, no relay writes, no agent token spend. Paused while a reconnect owns
- * recovery (error/reconnecting state) and cleared on dispose.
+ * v0.4.1 — health-poll backstop (belt-and-suspenders for a SILENTLY swallowed
+ * SSE death — no onerror AND no onclose, the Electron-fetch failure class
+ * transport-diagnostics.ts was born to fight). Probes the daemon's /health
+ * while connected; a tick is healthy ONLY when the response is 2xx AND the
+ * body reports status==="ok" (health, not mere reachability). N consecutive
+ * failures hand off to the reconnect supervisor. ZERO idle-token cost — a raw
+ * HTTP GET, not an MCP tool call, no relay writes, no agent token spend. Paused
+ * while a reconnect owns recovery (error/reconnecting state) and cleared on
+ * dispose.
+ *
+ * The status check + failure counter live in the VSCode-free HealthPoll helper
+ * (tested path == shipped path); extension.ts owns only the interval, the real
+ * fetch, and the unhealthy handoff.
  */
 const HEALTH_POLL_INTERVAL_MS = 15_000;
 const HEALTH_POLL_TIMEOUT_MS = 5_000;
 const HEALTH_POLL_FAIL_THRESHOLD = 2; // N consecutive fails → reconnect
 let healthPollTimer: ReturnType<typeof setInterval> | undefined;
-let healthPollFailures = 0;
+const healthPoll = new HealthPoll({
+  threshold: HEALTH_POLL_FAIL_THRESHOLD,
+  fetchHealth: async () => {
+    const base = relayEndpoint;
+    if (!base) throw new Error("no relay endpoint");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HEALTH_POLL_TIMEOUT_MS);
+    try {
+      const res = await fetch(new URL("/health", base), { signal: controller.signal });
+      // Read the body only on a 2xx — HealthPoll requires status==="ok", so a
+      // non-2xx (bodyText=null) is already unhealthy without spending a read.
+      return { ok: res.ok, bodyText: res.ok ? await res.text() : null };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+  onUnhealthy: () => {
+    if (isInErrorState()) return; // a reconnect already owns recovery
+    stopHealthPoll(); // the supervisor owns retries now; connect() re-arms on success
+    if (reconnectSupervisor) {
+      reconnectSupervisor.handleError("health-poll: daemon not healthy");
+    } else {
+      setErrorState("health-poll: daemon not healthy");
+    }
+  },
+  log,
+});
 
 /**
  * v0.2 — single-agent executor. Null when no agent has been spawned
@@ -850,13 +883,15 @@ async function connect(config: TetherConfig): Promise<void> {
 }
 
 /**
- * v0.4.1 — start (or restart) the reachability health-poll. Idempotent: clears
- * any prior timer + zeroes the failure counter first. No-op without a known
- * relay endpoint.
+ * v0.4.1 — start (or restart) the health-poll. Idempotent: clears any prior
+ * timer + zeroes the helper's failure counter first. No-op without a known
+ * relay endpoint. The uptime-decrease reboot detector is deferred to a
+ * follow-on once the daemon adds a monotonic uptime_seconds to HTTP /health.
  */
 function startHealthPoll(): void {
   stopHealthPoll();
   if (!relayEndpoint) return;
+  healthPoll.reset();
   healthPollTimer = setInterval(() => {
     void pollHealthOnce();
   }, HEALTH_POLL_INTERVAL_MS);
@@ -868,52 +903,19 @@ function stopHealthPoll(): void {
     clearInterval(healthPollTimer);
     healthPollTimer = undefined;
   }
-  healthPollFailures = 0;
+  healthPoll.reset();
 }
 
 /**
- * v0.4.1 — one health-poll tick. Plain HTTP GET of the daemon's /health
- * (reachability only; the current /health has no numeric uptime — the uptime-
- * decrease reboot detector is deferred to a follow-on once the daemon adds a
- * monotonic uptime_seconds to HTTP /health). N consecutive failures hand off
- * to the reconnect supervisor. Skipped while a reconnect already owns recovery
- * (error/reconnecting state) so it never double-drives with onerror/onclose.
- * Zero idle-token cost: a raw HTTP GET, not an MCP tool call.
+ * v0.4.1 — one health-poll tick. Skipped while a reconnect already owns
+ * recovery (error/reconnecting state) so it never double-drives with
+ * onerror/onclose. The probe (2xx + status==="ok"), the failure counter, the
+ * threshold, and the supervisor handoff all live in the HealthPoll helper.
  */
 async function pollHealthOnce(): Promise<void> {
   if (isInErrorState()) return; // a reconnect owns recovery; don't double-drive
-  const base = relayEndpoint;
-  if (!base) return;
-  let ok = false;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), HEALTH_POLL_TIMEOUT_MS);
-    try {
-      const res = await fetch(new URL("/health", base), { signal: controller.signal });
-      ok = res.ok;
-    } finally {
-      clearTimeout(timer);
-    }
-  } catch {
-    ok = false; // network error / abort (timeout) / DNS — daemon unreachable
-  }
-  if (isInErrorState()) return; // re-check after the await: supervisor may have taken over
-  if (ok) {
-    healthPollFailures = 0;
-    return;
-  }
-  healthPollFailures += 1;
-  log(`health-poll: /health unreachable (${healthPollFailures}/${HEALTH_POLL_FAIL_THRESHOLD})`);
-  if (healthPollFailures >= HEALTH_POLL_FAIL_THRESHOLD) {
-    // Hand off to the supervisor and stop polling — it owns retries now, and a
-    // successful reconnect re-arms the poll via connect().
-    stopHealthPoll();
-    if (reconnectSupervisor) {
-      reconnectSupervisor.handleError("health-poll: daemon unreachable");
-    } else {
-      setErrorState("health-poll: daemon unreachable");
-    }
-  }
+  if (!relayEndpoint) return;
+  await healthPoll.tick();
 }
 
 async function disconnect(): Promise<void> {
