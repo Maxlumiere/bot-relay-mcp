@@ -40,24 +40,35 @@ jobs:
       # (tests/v2-6-tether-transport-diagnostics.test.ts +
       # tests/v2-7-tether-reconnection-options.test.ts) assert against the
       # compiled VSIX-shipped artifact at extensions/vscode/out/extension.js.
-      # The local pre-publish gate (scripts/pre-publish-check.sh) compiles the
-      # extension as part of its "extension TS compile" step, but CI's `test`
-      # job runs `npx vitest run` directly — without this, those guards fail
-      # on every CI run with "missing extensions/vscode/out/extension.js".
-      # Position is load-bearing: BEFORE `Run test suite`, AFTER root install.
-      - name: Compile VSCode extension (drift-out tests need out/extension.js)
+      # The local pre-publish gate (scripts/pre-publish-check.sh) builds the
+      # extension, but CI's `test` job runs `npx vitest run` directly — without
+      # this, those guards fail with "missing extensions/vscode/out/extension.js".
+      # Position is load-bearing: BEFORE the test steps, AFTER root install.
+      #
+      # v2.15.2 — build the esbuild BUNDLE (`npm run bundle`), not the tsc
+      # per-module compile. The ext unit suite's VSIX/bundle guards
+      # (v0-1-4-vsix-contents V10 + v0-1-4-bundle) inspect the REAL shipped
+      # artifact: a single bundled out/extension.js (+ extension.meta.json).
+      # `npm run compile` (tsc) emits ~32 per-module files with no metafile, so
+      # the VSIX would package 36 files (V10 caps at 10) and the bundle test's
+      # metafile read would throw. `npm run typecheck` preserves ext type safety
+      # that the tsc emit used to provide. The drift-out root guards read this
+      # same bundled out/extension.js (their byte-offset scan handles the
+      # minified bundle).
+      - name: Build VSCode extension bundle (drift-out + ext-unit VSIX/bundle guards need the shipped out/extension.js)
         run: |
           cd extensions/vscode
           npm install
-          npm run compile
+          npm run typecheck
+          npm run bundle
 
       # v2.15.2 — run the VSCode extension unit suite in CI. Previously it ran
       # ONLY locally (root `npm test` covers tests/, whose vitest config excludes
       # extensions/vscode/src/*.test.ts), so ext-side regressions (e.g. the
-      # v0.4.1 health-poll status-check) were gated by hand. The ext deps are
-      # already installed by the compile step above. Note: the VSIX-content
-      # guards (v0-1-4-vsix-contents) shell out to `vsce package`; if they flake
-      # on CI, add a retry/timeout there rather than dropping this gate.
+      # v0.4.1 health-poll status-check) were gated by hand. The ext deps + the
+      # bundle are produced by the step above. Note: the VSIX-content guards
+      # (v0-1-4-vsix-contents) shell out to `vsce package`; if they flake on CI,
+      # add a retry/timeout there rather than dropping this gate.
       - name: Run VSCode extension unit tests
         run: |
           cd extensions/vscode
