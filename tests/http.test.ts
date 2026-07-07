@@ -83,6 +83,21 @@ describe("HTTP transport", () => {
     expect(body.transport).toBe("http");
   });
 
+  it("health check exposes a monotonic uptime_seconds (v2.15.2)", async () => {
+    // v2.15.2 — a follow-on Tether health-poll uses this as a silent-death
+    // detector (a strict decrease across polls = daemon restarted). It must be
+    // process.uptime()-based (monotonic), a non-negative integer.
+    const res = await fetch(`${baseUrl}/health`);
+    const body = await res.json();
+    expect(typeof body.uptime_seconds).toBe("number");
+    expect(Number.isInteger(body.uptime_seconds)).toBe(true);
+    expect(body.uptime_seconds).toBeGreaterThanOrEqual(0);
+    // Non-decreasing across two reads (monotonic).
+    const res2 = await fetch(`${baseUrl}/health`);
+    const body2 = await res2.json();
+    expect(body2.uptime_seconds).toBeGreaterThanOrEqual(body.uptime_seconds);
+  });
+
   it("tools/list returns all 35 tools (34 + report_liveness [v2.15.0 presence self-heal])", async () => {
     const result = await mcpCall("tools/list", {});
     expect(result.result.tools.length).toBe(35);

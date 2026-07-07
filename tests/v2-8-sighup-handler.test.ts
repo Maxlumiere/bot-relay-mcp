@@ -191,8 +191,12 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
     expect(row.signal_received_at).toBeLessThanOrEqual(Date.now() + 1000);
     expect(
       row.agent_status,
-      "agent_status must transition to 'closed' on the signal path",
-    ).toBe("closed");
+      "v2.15.2: signal stamps forensics but stores a NEUTRAL 'idle' (no sticky " +
+        "terminal status — a stored 'closed'/'offline' would phantom a " +
+        "surviving/relaunched agent). getAgents derives 'unknown' with the " +
+        "anchor cleared; the dashboard derives 'closed' from the stamp + " +
+        "non-alive liveness.",
+    ).toBe("idle");
   }, 15_000);
 
   it("(SH2) SIGINT stamps signal_kind='SIGINT' (regression — pre-v2.8 path still works)", async () => {
@@ -209,7 +213,7 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
     const row = readAgentSignalCols(NAME);
     expect(row.signal_kind).toBe("SIGINT");
     expect(row.signal_received_at).not.toBeNull();
-    expect(row.agent_status).toBe("closed");
+    expect(row.agent_status).toBe("idle"); // v2.15.2 — stored neutral, not sticky 'closed'
   }, 15_000);
 
   it("(SH3) SIGTERM stamps signal_kind='SIGTERM' (regression)", async () => {
@@ -226,6 +230,6 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
     const row = readAgentSignalCols(NAME);
     expect(row.signal_kind).toBe("SIGTERM");
     expect(row.signal_received_at).not.toBeNull();
-    expect(row.agent_status).toBe("closed");
+    expect(row.agent_status).toBe("idle"); // v2.15.2 — stored neutral, not sticky 'closed'
   }, 15_000);
 });

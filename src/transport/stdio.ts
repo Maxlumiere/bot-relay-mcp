@@ -6,7 +6,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Readable, Writable } from "node:stream";
 import { createServer } from "../server.js";
-import { markAgentOffline, closeAgentSession, getAgentSessionId, logAudit, setAgentLivenessAnchor } from "../db.js";
+import { endAgentSessionOnSignal, getAgentSessionId, logAudit, setAgentLivenessAnchor } from "../db.js";
 import { detectAgentProcess, type AgentProcess } from "../liveness.js";
 import { log } from "../logger.js";
 import { broadcastDashboardEvent } from "./websocket.js";
@@ -133,35 +133,34 @@ export function performAutoUnregister(
     return;
   }
   try {
-    // v2.2.2 BUG2: prefer closeAgentSession (agent_status='closed') over
-    // markAgentOffline so dashboards can distinguish "operator killed
-    // the terminal" from "network dropped / sleep / transient". Fall
-    // back to markAgentOffline only on helper-level failure.
+    // v2.15.2 — signal-only session teardown. A SIGHUP/SIGINT/SIGTERM to THIS
+    // MCP-server process is NOT a reliable death signal for the agent (the
+    // agent, tracked by agent_pid, can survive a terminal reflow / VS Code
+    // reload and relaunch its MCP server). So we make NO liveness claim (clear
+    // the anchor) and write NO sticky terminal status — a stored 'closed'/
+    // 'offline' would phantom a surviving/relaunched agent, and R1 makes
+    // 'offline' stick even over a live probe. We stamp signal forensics
+    // (signal_received_at/signal_kind) for the dashboard; deriveDashboardState
+    // gates that on liveness and registerAgent clears it on the next session,
+    // so the stamp is session-scoped.
     //
-    // v2.8 — pass the signal kind through so closeAgentSession can stamp
-    // the new signal_received_at + signal_kind columns. The v2.8 state
-    // machine (src/agent-state-machine.ts) reads these to render the
-    // `closed` state with operator-visible signal source (SIGHUP =
-    // tab-close, SIGINT = ctrl-C, SIGTERM = OS shutdown).
+    // v2.8 — pass the signal kind through so the forensic columns record the
+    // source (SIGHUP = tab-close, SIGINT = ctrl-C, SIGTERM = OS shutdown).
     const signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null =
       signal === "SIGHUP" || signal === "SIGINT" || signal === "SIGTERM"
         ? signal
         : null;
-    let transition: "closed" | "offline" = "closed";
-    let changed = false;
-    try {
-      ({ changed } = closeAgentSession(name, capturedSid, signalKind));
-    } catch (closeErr) {
-      log.warn(`[stdio] closeAgentSession failed for "${name}" — falling back to offline:`, closeErr);
-      transition = "offline";
-      ({ changed } = markAgentOffline(name, capturedSid));
-    }
+    // v2.15.2 — NO markAgentOffline fallback: it would reintroduce the sticky
+    // 'offline' this fix removes on the exact path being fixed. If the helper
+    // throws, the outer catch logs + audits and writes NO terminal status;
+    // liveness derivation governs the row from there.
+    const { changed } = endAgentSessionOnSignal(name, capturedSid, signalKind);
     if (changed) {
-      log.info(`[stdio] marked agent "${name}" ${transition} (session=${capturedSid}) on ${signal}`);
-      // v2.8 wire-emit-sites — signal-triggered close was previously
+      log.info(`[stdio] ended session for agent "${name}" (session=${capturedSid}) on ${signal} — liveness now governs presence`);
+      // v2.8 wire-emit-sites — signal-triggered state change was previously
       // only visible via the decay broadcaster's next tick (up to 30s
       // latency). Fire an immediate agent.state_changed event so the
-      // dashboard sees the close instantly, carrying the signal kind in
+      // dashboard sees the transition instantly, carrying the signal kind in
       // the metadata-only `kind` field. The decay broadcaster will
       // dedup on the next tick (lastBroadcastedState already routes
       // through `agent.status_changed`; this emit is the lower-level
@@ -176,30 +175,45 @@ export function performAutoUnregister(
       } catch {
         // broadcast is already best-effort inside the helper; double-catch here.
       }
-      // v2.1.3: close the forensic gap. SIGINT-triggered state changes
-      // now write an audit_log entry even though this path bypasses the
+      // v2.1.3: close the forensic gap. Signal-triggered state changes
+      // write an audit_log entry even though this path bypasses the
       // MCP dispatcher. Source='stdio' distinguishes from dispatcher calls.
       try {
         logAudit(
           name,
-          transition === "closed" ? "stdio.auto_close" : "stdio.auto_offline",
+          "stdio.session_ended_on_signal",
           `signal=${signal}`,
           true,
           null,
           "stdio",
-          { signal, captured_session_id: capturedSid, transition },
+          { signal, captured_session_id: capturedSid },
         );
       } catch (auditErr) {
         // Audit write failure MUST NOT block the exit path. Log + continue.
-        log.warn(`[stdio] auto-${transition} audit_log write failed for "${name}":`, auditErr);
+        log.warn(`[stdio] session-end audit_log write failed for "${name}":`, auditErr);
       }
     } else {
       log.debug(
-        `[stdio] auto-${transition} skipped for "${name}" — session_id mismatch (${capturedSid}) or row already ${transition}`,
+        `[stdio] session-end skipped for "${name}" — session_id mismatch (${capturedSid}) or session already ended`,
       );
     }
   } catch (err) {
-    log.warn(`[stdio] auto-offline failed for "${name}":`, err);
+    // v2.15.2 — endAgentSessionOnSignal threw. Write NO terminal status (no
+    // fallback that could re-pollute); best-effort log + audit only.
+    log.warn(`[stdio] session-end failed for "${name}" — no terminal status written:`, err);
+    try {
+      logAudit(
+        name,
+        "stdio.session_end_failed",
+        `signal=${signal}`,
+        false,
+        err instanceof Error ? err.message : String(err),
+        "stdio",
+        { signal, captured_session_id: capturedSid },
+      );
+    } catch {
+      /* audit best-effort */
+    }
   }
 }
 

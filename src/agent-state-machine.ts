@@ -82,8 +82,10 @@ export interface AgentStateInputs {
    * the age-based `closed`/`unknown` (an alive-and-idle agent derives
    * `waiting`, even with a stale last_seen — the rate-limit case). `dead` =
    * positive dead probe → `closed`. `unknown` = no probe-able anchor → an old
-   * row derives `unknown`, NEVER a stale-age `closed`. A genuine teardown
-   * declaration (`signalReceivedAt`/`unregisteredAt`) still wins over all.
+   * row derives `unknown`, NEVER a stale-age `closed`. v2.15.2: an `alive`
+   * probe SUPPRESSES the `signalReceivedAt`-derived close (the signal hits the
+   * MCP-server process, not the agent); an explicit `unregisteredAt` delete is
+   * NOT gated and still wins.
    */
   liveness: "alive" | "dead" | "unknown";
 }
@@ -162,8 +164,11 @@ export function resolveThresholdsFromEnv(
  * Precedence (top wins) per the brief's locked rule:
  *
  *   1. `closed` — a teardown DECLARATION or a POSITIVE dead probe:
- *        - `signalReceivedAt` is set (SIGHUP/SIGINT/SIGTERM fired)
- *        - `unregisteredAt` is set (explicit unregister tool call)
+ *        - `signalReceivedAt` is set (SIGHUP/SIGINT/SIGTERM fired) AND
+ *          `liveness !== 'alive'` — v2.15.2: a confirmed-alive probe suppresses
+ *          the signal-derived close (the signal hit the MCP-server process, not
+ *          the agent; the stamp is session-scoped and cleared on re-register)
+ *        - `unregisteredAt` is set (explicit unregister tool call) — NOT gated
  *        - `liveness === 'dead'` (agent_pid present, process confirmed gone)
  *   1b. `unknown` — v2.15.0: `liveness !== 'alive'` (no probe-able anchor) AND
  *        `lastSeen` older than `sessionTimeoutMs`. Replaces the old stale-age
@@ -202,8 +207,21 @@ export function deriveDashboardState(
 
   const lastSeenMs = parseIsoOrNull(lastSeen);
 
-  // 1. closed — top precedence: an intentional teardown DECLARATION.
-  if (signalReceivedAt !== null && Number.isFinite(signalReceivedAt) && signalReceivedAt > 0) {
+  // 1. closed — an intentional teardown, BUT liveness governs the signal path.
+  // v2.15.2 — a SIGHUP/SIGINT/SIGTERM hits the agent's MCP-SERVER process, not
+  // the agent itself; the agent (tracked by agent_pid) can survive/relaunch. So
+  // a confirmed-ALIVE probe SUPPRESSES the signal-derived close — a live agent
+  // with a stale signal stamp never reads 'closed'. (The stamp is also session-
+  // scoped: registerAgent clears it on the next session, so it can't outlive
+  // its session and phantom a fresh no-anchor session.) An explicit
+  // `unregisteredAt` is a deliberate operator delete — it is NOT gated and
+  // still wins (parallels the set_status('offline') R1 boundary in getAgents).
+  if (
+    signalReceivedAt !== null &&
+    Number.isFinite(signalReceivedAt) &&
+    signalReceivedAt > 0 &&
+    liveness !== "alive"
+  ) {
     return "closed";
   }
   if (unregisteredAt !== null && Number.isFinite(unregisteredAt) && unregisteredAt > 0) {

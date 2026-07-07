@@ -2086,6 +2086,60 @@ export function closeAgentSession(
 }
 
 /**
+ * v2.15.2 — signal-only session teardown for the stdio signal handler
+ * (`performAutoUnregister`). Supersedes `closeAgentSession`/`markAgentOffline`
+ * on THAT path only (spawn's offline pre-register keeps `markAgentOffline`).
+ *
+ * WHY THIS IS DIFFERENT. A SIGHUP/SIGINT/SIGTERM to THIS MCP-server process is
+ * NOT a reliable death signal for the AGENT: the agent (claude/codex, tracked
+ * by `agent_pid` via the hook's ancestry-walk) can survive a terminal
+ * reflow / VS Code reload and relaunch its MCP server. Storing a terminal
+ * `agent_status` ('closed'/'offline') on such a signal PHANTOMS a
+ * surviving/relaunched agent — and `deriveAgentStatus` R1 makes a stored
+ * 'offline' win even over a confirmed-alive probe, so it never self-heals.
+ *
+ * So this teardown makes NO liveness claim and writes NO sticky terminal
+ * status:
+ *   - CLEAR the liveness anchor (agent_pid / agent_pid_start / last_alive) —
+ *     the next register re-stamps it; until then liveness derives 'unknown'.
+ *   - agent_status = 'idle' — a non-terminal, derivable value: with the anchor
+ *     cleared, `deriveAgentStatus('idle', 'unknown')` returns 'unknown' (never
+ *     a phantom 'idle'), and if the agent comes back alive it reads active.
+ *   - STAMP signal_received_at / signal_kind for dashboard forensics ONLY.
+ *     `deriveDashboardState` now gates the signal-derived 'closed' on liveness
+ *     (a live probe suppresses it), and `registerAgent` clears these on the
+ *     next session, so the stamp is session-scoped and can't become stale
+ *     live input.
+ *   - release session_id + busy_expires_at (the session ended).
+ *
+ * Same CAS predicate as closeAgentSession (`name = ? AND session_id = ?`): a
+ * concurrent terminal that rotated session_id between our signal capture and
+ * this call wins the race (we no-op). Invalidates both probe caches on change.
+ *
+ * A genuine operator `set_status('offline')` is UNAFFECTED — that path
+ * (`setAgentStatus`) is a deliberate declaration and R1 still makes it win.
+ */
+export function endAgentSessionOnSignal(
+  name: string,
+  expectedSessionId: string,
+  signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null = null,
+): { changed: boolean } {
+  const db = getDb();
+  const nowMs = Date.now();
+  const r = db.prepare(
+    "UPDATE agents SET session_id = NULL, agent_status = 'idle', busy_expires_at = NULL, " +
+    "signal_received_at = ?, signal_kind = ?, " +
+    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
+    "WHERE name = ? AND session_id = ?"
+  ).run(nowMs, signalKind, name, expectedSessionId);
+  if (r.changes === 1) {
+    _negativeProbeCache.delete(name);
+    _positiveProbeCache.delete(name);
+  }
+  return { changed: r.changes === 1 };
+}
+
+/**
  * v2.1.4 (I11) — sanctioned additive cap expansion.
  *
  * Rules enforced here (belt + handler-layer suspenders):
@@ -2444,9 +2498,17 @@ export function registerAgent(
     // available instead of staying stuck offline. Active states are preserved.
     const newAgentStatus = statusAfterReregister(existing.agent_status);
     const r = db.prepare(
+      // v2.15.2 — CLEAR signal_received_at / signal_kind in the SAME statement
+      // that rotates session_id / session_started_at, so a signal stamp from a
+      // PRIOR session can't outlive it and drive deriveDashboardState to
+      // 'closed' for the fresh session (the no-probeable-anchor case: liveness
+      // stays 'unknown', so the dashboard's liveness gate alone would still
+      // read the stale stamp as closed). The stamp is session-scoped;
+      // long-term forensics live in audit_log (stdio.session_ended_on_signal).
       "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
       "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, agent_status = ?, " +
-      "auth_state = ?, recovery_token_hash = ?, revoked_at = ? " +
+      "auth_state = ?, recovery_token_hash = ?, revoked_at = ?, " +
+      "signal_received_at = NULL, signal_kind = NULL " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
       role, timestamp, newHash, session_id, timestamp, newDescription,
