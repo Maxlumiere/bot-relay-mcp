@@ -97,6 +97,35 @@ describe("transport-diagnostics — wireTransportDiagnostics", () => {
     expect(sinks.errors.length).toBe(0);
   });
 
+  it("v0.4.1 — onClose sink (when provided) fires on close, AFTER the diagnostic log", () => {
+    const transport = makeTransport();
+    const order: string[] = [];
+    const sinks: DiagnosticsSinks = {
+      log: (l) => order.push(`log:${l}`),
+      setError: () => order.push("setError"),
+      onClose: () => order.push("onClose"),
+    };
+    wireTransportDiagnostics(transport, sinks);
+
+    transport.onclose!();
+
+    // Log must be recorded before the onClose notification, so the diagnostic
+    // trail exists regardless of what the caller does on close.
+    expect(order).toEqual(["log:transport closed", "onClose"]);
+    // A bare close does not itself raise an error via this helper.
+    expect(order).not.toContain("setError");
+  });
+
+  it("v0.4.1 — onClose is optional: a close with no onClose sink stays log-only (back-compat)", () => {
+    const transport = makeTransport();
+    const sinks = makeCapturingSinks(); // no onClose defined
+    wireTransportDiagnostics(transport, sinks);
+
+    expect(() => transport.onclose!()).not.toThrow();
+    expect(sinks.logs.some((l) => l.includes("transport closed"))).toBe(true);
+    expect(sinks.errorState).toBe(false);
+  });
+
   it("state-lock — once setError fires, subsequent success-flips are NO-OPs", () => {
     // This pins the state-lock contract: "once flipped to error,
     // success log/state can't unflip without an explicit reconnect."

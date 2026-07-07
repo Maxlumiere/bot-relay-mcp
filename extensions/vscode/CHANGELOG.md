@@ -4,6 +4,14 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.4.1] — 2026-07-07 — Auto-reconnect on daemon restart (no manual reconnect)
+
+- **Auto-reconnect when the relay restarts.** Restarting the relay daemon (e.g. after an update) dropped Tether's connection, and Tether stayed disconnected — silently no longer waking any agent — until you ran "Tether: Reconnect to Relay" by hand. Tether now detects the drop and reconnects on its own, with capped exponential backoff, so you never have to reconnect manually after a relay update or restart.
+  - **Nothing missed during the gap.** On reconnect, Tether re-subscribes and runs its catch-up wake, so any mail that arrived while it was disconnected still wakes the agent.
+  - **Detects clean drops too.** A graceful daemon shutdown ends the connection as a quiet close (not an error); Tether now treats that as a drop and reconnects, closing the case that previously wedged it.
+  - **Reachability backstop.** A lightweight health check of the relay catches a silently-dropped connection even when no error surfaces, and triggers a reconnect. Zero idle cost is preserved — it's a plain reachability check, not agent activity.
+  - Reconnect attempts are jittered so multiple Tether windows don't retry a just-restarted relay in lockstep.
+
 ## [0.4.0] — 2026-07-02 — LLM-agnostic multi-agent wake
 
 - **LLM-agnostic wake.** Tether now wakes any supported LLM agent, not just Claude, via per-LLM adapters. Claude: inject `inbox`. Codex: inject a `get_messages` drain instruction, then auto-submit with a bracketed-paste-safe standalone Enter.

@@ -71,13 +71,23 @@ describe("v2.6.x / Tether v0.1.1 — transport diagnostics drift guard", () => {
     const body = fs.readFileSync(EXT_SRC, "utf-8");
 
     // Find the 3 anchor lines.
+    // v0.4.1 — the wiring moved into the ConnectionLifecycle.establish() deps:
+    //   build:   () => new StreamableHTTPClientTransport(...)
+    //   wire:    (t) => wireTransportDiagnostics(t, {...})
+    //   connect: (t) => client.connect(t)
+    // establish() runs `wire(t)` then `await connect(t)`, so the BEFORE-connect
+    // order is preserved at runtime; in source the `wire:` dep precedes the
+    // `connect:` dep. The `client.connect(` anchor matches the callback CALL
+    // form `client.connect(t)` — requiring a non-empty argument (`\(\s*\w`) so
+    // it anchors on the real invocation, NOT prose comments that mention
+    // "client.connect()" (empty parens).
     const newTransportLine = findLine(body, /new StreamableHTTPClientTransport\b/);
     const wireDiagLine = findLine(body, /\bwireTransportDiagnostics\s*\(/);
-    const connectLine = findLine(body, /\bawait\s+client\.connect\s*\(\s*transport\s*\)/);
+    const connectLine = findLine(body, /\bclient\.connect\s*\(\s*\w/);
 
     expect(newTransportLine, "extension.ts must instantiate StreamableHTTPClientTransport").toBeGreaterThan(0);
     expect(wireDiagLine, "extension.ts must call wireTransportDiagnostics(transport, sinks)").toBeGreaterThan(0);
-    expect(connectLine, "extension.ts must call client.connect(transport)").toBeGreaterThan(0);
+    expect(connectLine, "extension.ts must call client.connect(...)").toBeGreaterThan(0);
 
     // ORDER constraint — the regression class this guard catches: someone
     // wiring diagnostics AFTER connect, which replaces the SDK's protocol
