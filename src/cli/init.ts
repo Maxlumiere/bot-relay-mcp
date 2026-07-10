@@ -326,7 +326,14 @@ export async function run(argv: string[]): Promise<number> {
   const profileDefaults = applyProfileDefaults(profile);
   let transport = args.transport ?? profileDefaults.transport;
   let port = args.port ?? 3777;
-  let secret = args.secret ?? crypto.randomBytes(32).toString("base64url");
+  // v2.16.0 — a LOCAL (loopback) install needs NO http_secret: the daemon's
+  // assertBindSafety (src/transport/http.ts) treats a 127.0.0.1 bind as
+  // local-only-safe, and a transport secret would 401 the SessionStart hook's
+  // register — breaking the "just works" loop (per-agent tokens + gate-11
+  // from-verification still protect identity). Generate/keep one ONLY when the
+  // operator explicitly passes --secret (e.g. for a non-loopback / team bind,
+  // where assertBindSafety requires it at daemon start).
+  let secret = args.secret ?? "";
 
   if (isFreshConfig && !args.yes) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -335,7 +342,7 @@ export async function run(argv: string[]): Promise<number> {
       transport = await promptWithDefault(rl, "Transport (stdio/http/both)", transport);
       const portStr = await promptWithDefault(rl, "HTTP port", String(port));
       port = parseInt(portStr, 10) || 3777;
-      const secAns = await rl.question(`HTTP secret (ENTER = generate random 32-byte base64): `);
+      const secAns = await rl.question(`HTTP secret (ENTER = none — 127.0.0.1 is local-trusted; set one only for a non-loopback bind): `);
       if (secAns.trim()) secret = secAns.trim();
     } finally {
       rl.close();
@@ -358,7 +365,12 @@ export async function run(argv: string[]): Promise<number> {
     transport,
     http_port: port,
     http_host: "127.0.0.1",
-    http_secret: secret,
+    // v2.16.0 — OMIT http_secret for a local (loopback) install. The config
+    // validator rejects a present-but-short secret ("must be >= 32 chars"), and
+    // the daemon treats a 127.0.0.1 bind as local-safe WITHOUT one; a transport
+    // secret would 401 the SessionStart hook's register. Written only when the
+    // operator explicitly passes --secret (non-loopback / team bind).
+    ...(secret ? { http_secret: secret } : {}),
     webhook_timeout_ms: 5000,
     rate_limit_messages_per_hour: 1000,
     rate_limit_tasks_per_hour: 200,

@@ -103,27 +103,40 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
     expect(cfg.transport).toBe("stdio");
     expect(cfg.profile).toBe("solo");
     expect(cfg.http_port).toBe(3777);
-    expect(cfg.http_secret).toBeTruthy();
-    expect(cfg.http_secret.length).toBeGreaterThan(20);
+    // v2.16.0 — a local (loopback) install OMITS http_secret (the daemon treats
+    // 127.0.0.1 as local-safe; a secret would 401 the SessionStart hook). It is
+    // opt-in via --secret only.
+    expect(cfg.http_secret).toBeUndefined();
     if (process.platform !== "win32") {
       expect(fs.statSync(TEST_CONFIG_PATH).mode & 0o777).toBe(0o600);
       expect(fs.statSync(TEST_DB_DIR).mode & 0o777).toBe(0o700);
     }
   });
 
+  it("(5b) v2.16.0 — `--secret` opt-in writes an http_secret (non-loopback / team bind)", () => {
+    const SECRET = "a".repeat(40); // >= 32 chars (config validator floor)
+    expect(runRelay(["init", "--yes", "--secret", SECRET]).status).toBe(0);
+    const cfg = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8"));
+    expect(cfg.http_secret).toBe(SECRET);
+  });
+
   it("(6) v2.16.0 — `relay init` re-run is idempotent + PRESERVES the secret; `--force` resets it", () => {
-    // First init seeds the config.
-    expect(runRelay(["init", "--yes"]).status).toBe(0);
+    const SECRET = "s".repeat(40);
+    // First init seeds the config WITH an explicit secret.
+    expect(runRelay(["init", "--yes", "--secret", SECRET]).status).toBe(0);
     const originalSecret = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8")).http_secret;
-    // Second init WITHOUT --force → succeeds (reconcile, not refuse) + secret PRESERVED.
+    expect(originalSecret).toBe(SECRET);
+    // Second init WITHOUT --force and WITHOUT --secret → reconcile PRESERVES it.
     const rerun = runRelay(["init", "--yes"]);
     expect(rerun.status).toBe(0);
     const preservedSecret = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8")).http_secret;
-    expect(preservedSecret, "re-run must preserve the http_secret (token-safety-adjacent)").toBe(originalSecret);
-    // --force → resets to defaults; secret rotates.
-    const forced = runRelay(["init", "--yes", "--force"]);
+    expect(preservedSecret, "re-run must preserve the http_secret").toBe(originalSecret);
+    // --force with a new --secret → resets.
+    const NEW = "n".repeat(40);
+    const forced = runRelay(["init", "--yes", "--force", "--secret", NEW]);
     expect(forced.status).toBe(0);
     const newSecret = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8")).http_secret;
+    expect(newSecret).toBe(NEW);
     expect(newSecret).not.toBe(originalSecret);
   });
 

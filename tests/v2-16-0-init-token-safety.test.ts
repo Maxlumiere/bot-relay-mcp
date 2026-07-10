@@ -6,12 +6,12 @@
 /**
  * v2.16.0 (gate 9) — the LOAD-BEARING token-safety guarantees.
  *
- * Part A (token-blind, codex constraint 1): `relay init` must NOT mint,
+ * Part A (token-blind, gate-9 constraint 1): `relay init` must NOT mint,
  * register, rotate, recover, or write/delete a token — it must import NO
  * token/db module and reference NO token function. Proven statically on BOTH
  * the source and the compiled artifact (what actually ships).
  *
- * Part B (token-safety regression, codex constraint 2): seed an existing agent
+ * Part B (token-safety regression, gate-9 constraint 2): seed an existing agent
  * with a MATCHING vault (bcrypt(vault) == token_hash), run `relay init` twice
  * (+ a simulated bounce = the DB/vault are untouched by a restart), and assert
  * BOTH the token_hash AND the plaintext vault are byte-stable AND still

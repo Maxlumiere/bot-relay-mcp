@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.16.0 — 2026-07-10 — One-command install (`relay init`), the adoption gate
+
+Getting a working relay used to take ~6 disjoint manual steps across three files plus a hand-authored launchd plist. `relay init` is now the single idempotent macOS install path: a stranger runs one command and gets a working relay + autowake loop, and re-running is always safe.
+
+### What `relay init` now does (all reconcile-not-clobber, safe to re-run)
+
+1. **`~/.bot-relay/config.json`** — reconciles: PRESERVES an existing `http_secret`, `instance_id`, and any operator edits; adds only missing defaults. Records a `default_agent_name` (`--agent NAME`) the SessionStart hook falls back to.
+2. **`~/.claude.json`** — deep-merges the `bot-relay` stdio `mcpServers` entry (absolute path), preserving other servers.
+3. **`~/.claude/settings.json`** — deep-merges the SessionStart hook, deduped by command path, preserving unrelated hooks.
+4. **macOS launchd** — installs + bootstraps a `KeepAlive` daemon plist, but SKIPS if `:3777` is already served by any relay (collision-safe, label-agnostic — never double-loads an existing supervisor).
+
+Opt-outs: `--config-only`, `--skip-hooks`, `--skip-daemon`, `--skip-mcp`. Deep-merges are structural + atomic (tmp+rename+`.bak`); a second run is a strict no-op.
+
+### Token-safety — the load-bearing invariant
+
+`relay init` is **token-blind by construction**: it imports no token/db module and never mints, rotates, registers, recovers, or writes/deletes a token or touches the agents token-hash column / the vault. So init / deploy / bounce can never desync a live agent's credential. Agent identity is established by the already-token-safe SessionStart hook on first launch (vault-first read; register captures the minted token → writes the vault). Guarded by a source+compiled token-blind scan and a regression that seeds a matching vault, runs init twice, and asserts both the DB hash and the plaintext vault stay byte-stable + authenticating (a negative control proves the assertion catches a rotate).
+
+### Local installs are secret-free (loopback = trusted)
+
+A default local install now OMITS `http_secret`: the daemon treats a `127.0.0.1` bind as local-only-safe, and a transport secret would 401 the SessionStart hook's register (breaking the loop). Per-agent tokens + reserved-name/from-verification still protect identity. A secret is opt-in via `--secret` for a non-loopback / team bind (where the daemon requires it at start).
+
+macOS-first: Linux/Windows daemon supervision is "coming" (init prints manual guidance there, not gated). D2: the config `default_agent_name` never overrides an explicit `RELAY_AGENT_NAME` or spawn manifest.
+
 ## v2.15.2 — 2026-07-07 — Signal teardown stops re-polluting terminal states
 
 v2.15.1 was a one-time cleanup of stale stored terminal states. This closes the source that *re-creates* them: the stdio signal handler. A `SIGHUP`/`SIGINT`/`SIGTERM` is delivered to the agent's **MCP-server process**, not to the agent itself (the agent — `claude`/`codex`, tracked by `agent_pid` — can survive a terminal reflow / editor reload and relaunch its MCP server). The pre-v2.15.2 handler stamped a terminal `agent_status` on that signal, which stuck on two surfaces and phantom-closed a surviving agent:

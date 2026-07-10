@@ -10,7 +10,7 @@
  * The fallback lets `relay init --agent NAME` give a zero-shell-edit identity,
  * BUT an explicit RELAY_AGENT_NAME (and a spawn manifest) must WIN — otherwise
  * multiple terminals that each set their own name would collapse into one
- * identity (the failure codex called out). This drives the SHIPPED hook.
+ * identity (the failure gate-9 guards against). This drives the SHIPPED hook.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";

@@ -7,7 +7,7 @@
  * v2.16.0 (gate 9) — macOS launchd keep-alive supervisor for the relay HTTP
  * daemon. Generated + bootstrapped by the one-command installer (`relay init`).
  *
- * COLLISION-SAFE BY DESIGN (codex constraint). Before writing/loading a plist,
+ * COLLISION-SAFE BY DESIGN (gate-9 constraint). Before writing/loading a plist,
  * the installer probes the target port AND `launchctl list`:
  *   - If :3777 is ALREADY served by a relay (any label) → SKIP. This is the
  *     adoption path: ":3777 already serves this relay" — never double-load
@@ -36,7 +36,7 @@ export const CANONICAL_LABEL = "com.bot-relay.daemon";
 
 /** Substring that identifies ANY bot-relay LaunchAgent, regardless of the
  *  operator's chosen label prefix (e.g. a hand-authored `com.acme.bot-relay`).
- *  Label-agnostic on purpose (codex constraint 3). */
+ *  Label-agnostic on purpose (gate-9 constraint 3). */
 const RELAY_LABEL_HINT = "bot-relay";
 
 function xmlEscape(s: string): string {

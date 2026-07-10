@@ -6,7 +6,7 @@
 /**
  * v2.16.0 (gate 9) — launchd generator + collision-probe tests.
  *
- * The load-bearing case (codex constraint 3): an EXISTING relay already serving
+ * The load-bearing case (gate-9 constraint 3): an EXISTING relay already serving
  * :3777 under a NONCANONICAL label must cause the installer to SKIP — no second
  * plist write, no bootstrap. Detection is label-agnostic (port /health + any
  * "bot-relay" LaunchAgent), never same-label-only, never a hard-coded name.
@@ -71,8 +71,8 @@ describe("parseLoadedRelayLabels — label-agnostic", () => {
 
 describe("classifyHealthProbe", () => {
   it("relay = status ok + version + protocol_version; foreign = 200 non-relay; none = unreachable", () => {
-    expect(classifyHealthProbe(true, { status: "ok", version: "2.16.0", protocol_version: "2.4.0" })).toBe("relay");
-    expect(classifyHealthProbe(true, { status: "ok", version: "2.16.0" })).toBe("foreign"); // no protocol_version
+    expect(classifyHealthProbe(true, { status: "ok", version: "9.9.9", protocol_version: "2.4.0" })).toBe("relay");
+    expect(classifyHealthProbe(true, { status: "ok", version: "9.9.9" })).toBe("foreign"); // no protocol_version
     expect(classifyHealthProbe(true, { hello: "world" })).toBe("foreign");
     expect(classifyHealthProbe(false, null)).toBe("none");
   });
