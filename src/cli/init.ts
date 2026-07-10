@@ -20,8 +20,9 @@
  *      SKIPPING if :3777 is already served by any relay (collision-safe).
  *
  * TOKEN-BLIND BY CONSTRUCTION (gate-9 invariant): init NEVER mints, rotates,
- * registers, recovers, or writes/deletes a token or touches agents.token_hash /
- * the vault. It imports NO token/db module. Agent identity is established by the
+ * registers, recovers, or writes/deletes a token or touches the agents
+ * token-hash column / the vault. It imports NO token/db module. Agent identity
+ * is established by the
  * already-token-safe SessionStart hook on first launch (vault-first read;
  * register captures the minted token → writes the vault). So init/deploy/bounce
  * can never desync a live agent's credential.
