@@ -17,9 +17,13 @@ Opt-outs: `--config-only`, `--skip-hooks`, `--skip-daemon`, `--skip-mcp`. Deep-m
 
 `relay init` is **token-blind by construction**: it imports no token/db module and never mints, rotates, registers, recovers, or writes/deletes a token or touches the agents token-hash column / the vault. So init / deploy / bounce can never desync a live agent's credential. Agent identity is established by the already-token-safe SessionStart hook on first launch (vault-first read; register captures the minted token → writes the vault). Guarded by a source+compiled token-blind scan and a regression that seeds a matching vault, runs init twice, and asserts both the DB hash and the plaintext vault stay byte-stable + authenticating (a negative control proves the assertion catches a rotate).
 
-### Local installs are secret-free (loopback = trusted)
+### Local installs are secret-free — a deliberate local-trust default
 
-A default local install now OMITS `http_secret`: the daemon treats a `127.0.0.1` bind as local-only-safe, and a transport secret would 401 the SessionStart hook's register (breaking the loop). Per-agent tokens + reserved-name/from-verification still protect identity. A secret is opt-in via `--secret` for a non-loopback / team bind (where the daemon requires it at start).
+A default local install OMITS `http_secret`: the daemon treats a `127.0.0.1` bind as local-only (a transport secret would 401 the SessionStart hook's register and break the loop). **Be clear-eyed about what this means: the default trusts every process on the same machine.** With no secret, any local process can reach the loopback HTTP surface, including the dashboard operator endpoints (`/api/snapshot` read, `set-status`, `wake-agent`, `kill-agent`, `operator-identity`). Per-agent tokens + gate-11 from-verification protect only agent **identity** — you still can't send or act *as* another agent without its token — but they do **not** gate the whole surface.
+
+This is a reasonable boundary for a single-user machine: a local process already has OS-level access to the same data (PIDs via `ps`, the DB file). It is enforced conservatively — non-loopback binds are still **refused** without a secret, and the loopback-literal Host check still blocks DNS-rebind / malicious-webpage access on every route.
+
+**On a shared machine, or any non-loopback / team / remote setup, set a secret:** `relay init --secret <strong-random>` (or export `RELAY_DASHBOARD_SECRET`) to gate the surface. The daemon *requires* a secret to bind to any non-loopback host.
 
 macOS-first: Linux/Windows daemon supervision is "coming" (init prints manual guidance there, not gated). D2: the config `default_agent_name` never overrides an explicit `RELAY_AGENT_NAME` or spawn manifest.
 
