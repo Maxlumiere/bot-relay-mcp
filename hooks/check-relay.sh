@@ -109,6 +109,27 @@ DB_PATH=$(resolve_relay_db_path) || {
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 
+# v2.16.0 (gate 9) — config `default_agent_name` fallback. Fires ONLY when the
+# name is STILL unresolved after env + spawn manifest (i.e. still "default" or
+# empty) — so an explicit RELAY_AGENT_NAME and a spawn manifest both WIN (D2
+# precedence; multiple terminals that set their own name never collapse into
+# one identity). Lets `relay init --agent NAME` give a zero-shell-edit default
+# identity. config.json is co-located with the DB (dirname(DB_PATH)/config.json),
+# or RELAY_CONFIG_PATH. Parsed with a single-field sed — no jq dependency.
+if [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; then
+  CFG_PATH="${RELAY_CONFIG_PATH:-}"
+  if [ -z "$CFG_PATH" ] && [ -n "$DB_PATH" ]; then
+    CFG_PATH="$(dirname "$DB_PATH")/config.json"
+  fi
+  if [ -n "$CFG_PATH" ] && [ -r "$CFG_PATH" ]; then
+    CFG_NAME=$(sed -n 's/.*"default_agent_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CFG_PATH" | head -n1)
+    if [ -n "$CFG_NAME" ]; then
+      AGENT_NAME="$CFG_NAME"
+      echo "[bot-relay hook] using default agent name from config: $AGENT_NAME (no RELAY_AGENT_NAME / spawn manifest — set RELAY_AGENT_NAME to override)" >&2
+    fi
+  fi
+fi
+
 # v2.6.1 — vault-first bootstrap. If RELAY_AGENT_TOKEN is unset in env BUT a
 # vault file exists for this agent name, hydrate the env from disk before any
 # auth-sensitive call below. Closes the spawn-without-pre-mint failure mode
