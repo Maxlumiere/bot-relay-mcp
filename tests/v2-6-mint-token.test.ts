@@ -107,17 +107,20 @@ describe("v2.6 — relay mint-token CLI", () => {
     expect(verifyToken(plaintext, auth!.token_hash!)).toBe(true);
   });
 
-  it("(2) mint on existing agent without --force is refused", async () => {
+  it("(2) v2.16.1 — mint on existing agent without --force REUSES the authenticating vault (no rotate)", async () => {
     const r1 = runMint(["existing", "--role", "builder", "--capabilities", "build"]);
     expect(r1.status).toBe(0);
     const t1 = r1.stdout.match(TOKEN_REGEX)![0];
 
+    // Second launch (no --force): the vault written by the first mint
+    // authenticates → REUSE the same token, not a refusal, not a rotation.
     const r2 = runMint(["existing", "--role", "builder", "--capabilities", "build"]);
-    expect(r2.status).toBe(2);
-    expect(r2.stderr).toMatch(/already exists/);
-    expect(r2.stderr).toMatch(/--force/);
+    expect(r2.status).toBe(0);
+    expect(r2.stdout).toMatch(/Reusing existing token/);
+    const t2 = r2.stdout.match(TOKEN_REGEX)![0];
+    expect(t2, "reuse must return the SAME token").toBe(t1);
 
-    // Original token still authenticates — refusal did not mutate state.
+    // token_hash unchanged — the recurring churn is gone.
     const { initializeDb, getAgentAuthData } = await import("../src/db.js");
     await initializeDb();
     const auth = getAgentAuthData("existing");
@@ -209,8 +212,8 @@ describe("v2.6 — relay mint-token CLI", () => {
     expect(parsed.success).toBe(true);
     expect(parsed.name).toBe("json-check");
     expect(parsed.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(parsed.agent_id).toMatch(/[0-9a-f-]{36}/i);
     expect(parsed.created).toBe(true);
+    expect(parsed.reused).toBe(false); // v2.16.1 — fresh mint, not a reuse
     expect(parsed.force).toBe(false);
     expect(parsed.env_block).toContain("RELAY_AGENT_NAME=json-check");
     expect(parsed.env_block).toContain(`RELAY_AGENT_TOKEN=${parsed.token}`);
@@ -234,11 +237,16 @@ describe("v2.6 — relay mint-token CLI", () => {
     expect(row.params_summary).toMatch(/operator=\S+ target=audit-check created=true force=false/);
   });
 
-  it("(8) audit_log entry written on REFUSED mint (existing-without-force)", async () => {
+  it("(8) v2.16.1 — audit_log refusal on a vault MISMATCH (existing row, vault can't authenticate)", async () => {
     const r1 = runMint(["audit-refused", "--role", "agent"]);
     expect(r1.status).toBe(0);
+    // Remove the vault so the existing row can no longer authenticate → a
+    // mismatch. The CLI must REFUSE (not silently rotate) + audit it.
+    fs.rmSync(path.join(TEST_ROOT, "agents", "audit-refused.token"));
     const r2 = runMint(["audit-refused", "--role", "agent"]);
     expect(r2.status).toBe(2);
+    expect(r2.stderr).toMatch(/does not authenticate/);
+    expect(r2.stderr).toMatch(/--force|recover/);
 
     const { initializeDb, getDb } = await import("../src/db.js");
     await initializeDb();
@@ -248,11 +256,11 @@ describe("v2.6 — relay mint-token CLI", () => {
         "SELECT success, params_summary FROM audit_log WHERE tool = 'agent.token_minted' AND agent_name = ? ORDER BY created_at"
       )
       .all("audit-refused") as any[];
-    // First success then a refusal — at least one row with success=0.
     expect(rows.length).toBeGreaterThanOrEqual(2);
     const refused = rows.find((r) => r.success === 0);
     expect(refused).toBeDefined();
     expect(refused.params_summary).toMatch(/success=false/);
+    expect(refused.params_summary).toMatch(/vault_mismatch/);
   });
 
   it("(9) --db-path with non-existent parent directory: exit 2 with clean error", () => {

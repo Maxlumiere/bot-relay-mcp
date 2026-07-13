@@ -239,84 +239,91 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const { mintAgentToken, logAudit } = await import("../db.js");
+    const { logAudit } = await import("../db.js");
+    // v2.16.1 — stable mint-once-reuse: the default (non-force) path reuses an
+    // authenticating vault instead of churning the token, and BOTH paths write
+    // the vault (closing the pre-v2.16.1 "minted but never wrote the vault"
+    // strand). A row whose vault can't authenticate is a MISMATCH — never a
+    // silent rotate.
+    const { stableMintOrReuse, forceRotateAndVault } = await import("../mint-reuse.js");
+    const operator = currentOperator();
 
-    let result: { agent: { id: string; name: string }; plaintext_token: string; created: boolean };
-    try {
-      result = mintAgentToken(args.name, args.role, args.capabilities, {
-        description: args.description,
-        force: args.force,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`relay mint-token: ${msg}\n`);
-      // Audit the refusal too — security-sensitive op deserves a paper trail
-      // even when refused.
-      try {
-        const operator = currentOperator();
-        logAudit(
-          args.name,
-          "agent.token_minted",
-          `operator=${operator} target=${args.name} force=${args.force} success=false`,
-          false,
-          msg,
-          "cli",
-          {
-            operator,
-            target: args.name,
-            force: args.force,
-            success: false,
-            error: msg,
-          }
+    let token: string;
+    let created = false;
+    let reused = false;
+    if (args.force) {
+      const f = await forceRotateAndVault(args.name, args.role, args.capabilities, { description: args.description });
+      token = f.token;
+      created = f.created;
+    } else {
+      const r = await stableMintOrReuse(args.name, args.role, args.capabilities, { description: args.description });
+      if (r.status === "mismatch") {
+        // Do NOT rotate silently. Surface the state (no token logged).
+        process.stderr.write(
+          `relay mint-token: agent "${args.name}" already exists but its vault token does not authenticate ` +
+            `(missing, stale, or mismatched). NOT rotating silently — that would invalidate a possibly-live token ` +
+            `and hide a stale/compromised credential.\n` +
+            `  • To rotate deliberately (invalidates the old token): relay mint-token ${args.name} --force\n` +
+            `  • To reset the identity entirely: relay recover ${args.name}, then re-register.\n`
         );
-      } catch {
-        /* best-effort */
+        try {
+          logAudit(
+            args.name,
+            "agent.token_minted",
+            `operator=${operator} target=${args.name} force=false success=false reason=vault_mismatch`,
+            false,
+            "vault token does not authenticate against the stored hash",
+            "cli",
+            { operator, target: args.name, force: false, success: false, reason: "vault_mismatch" }
+          );
+        } catch {
+          /* best-effort */
+        }
+        return 2;
       }
-      return 2;
+      token = r.token;
+      created = r.status === "created";
+      reused = r.status === "reused";
     }
 
-    const operator = currentOperator();
     logAudit(
       args.name,
       "agent.token_minted",
       `operator=${operator} target=${args.name} ${
-        result.created ? "created=true" : "rotated=true"
+        created ? "created=true" : reused ? "reused=true" : "rotated=true"
       } force=${args.force}`,
       true,
       null,
       "cli",
-      {
-        operator,
-        target: args.name,
-        created: result.created,
-        rotated: !result.created,
-        force: args.force,
-        agent_id: result.agent.id,
-      }
+      { operator, target: args.name, created, reused, rotated: args.force && !created, force: args.force }
     );
 
     if (args.json) {
       const out = {
         success: true,
-        token: result.plaintext_token,
-        name: result.agent.name,
-        agent_id: result.agent.id,
-        created: result.created,
+        token,
+        name: args.name,
+        created,
+        reused,
         force: args.force,
-        env_block: `RELAY_AGENT_NAME=${result.agent.name}\nRELAY_AGENT_TOKEN=${result.plaintext_token}`,
+        env_block: `RELAY_AGENT_NAME=${args.name}\nRELAY_AGENT_TOKEN=${token}`,
       };
       process.stdout.write(JSON.stringify(out) + "\n");
       return 0;
     }
 
+    const verb = created
+      ? "Minted token for new agent"
+      : reused
+        ? "Reusing existing token for agent"
+        : "Rotated token for existing agent";
     process.stdout.write(
-      `\n✓ ${result.created ? "Minted token for new agent" : "Rotated token for existing agent"} ` +
-        `"${result.agent.name}"\n\n` +
+      `\n✓ ${verb} "${args.name}"\n\n` +
         "Token (shown ONCE — store it now):\n\n" +
-        `  ${result.plaintext_token}\n\n` +
+        `  ${token}\n\n` +
         "Set in your CLI's environment before launching:\n\n" +
-        `  export RELAY_AGENT_NAME=${result.agent.name}\n` +
-        `  export RELAY_AGENT_TOKEN=${result.plaintext_token}\n\n` +
+        `  export RELAY_AGENT_NAME=${args.name}\n` +
+        `  export RELAY_AGENT_TOKEN=${token}\n\n` +
         "See docs/agents/external-cli-setup.md for the full setup walkthrough\n" +
         "and token storage best practices.\n"
     );
