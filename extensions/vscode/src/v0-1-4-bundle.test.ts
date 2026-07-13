@@ -149,8 +149,9 @@ describe("v0.1.4 — bundle correctness", () => {
     // transport-diagnostics) preserved. v0.3.x added llm-adapter.ts (per-LLM
     // wake adapters, imported by extension.ts). v0.4.1 added
     // connection-lifecycle.ts (the auto-reconnect-on-close guard seam) +
-    // health-poll.ts (the reachability/health backstop), both imported by
-    // extension.ts.
+    // health-poll.ts (the reachability/health backstop). v0.5.0 added
+    // vault-path.ts (the per-instance vault-first token resolver), all
+    // imported by extension.ts.
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/catch-up-wake.ts",
@@ -168,6 +169,7 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/switch-agent.ts",
       "src/terminal-targeting.ts",
       "src/transport-diagnostics.ts",
+      "src/vault-path.ts",
     ]);
   });
 

@@ -21,6 +21,7 @@
  * full VSCode stub. All vscode imports live inside `activate`.
  */
 import * as vscode from "vscode";
+import os from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
@@ -38,6 +39,7 @@ import {
   AGENT_NAME_RE,
   type TetherConfig,
 } from "./config.js";
+import { readVaultToken } from "./vault-path.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
 import { WakeGate, subscribeInboxes } from "./inbox-subscription.js";
 import { parseAgentNames, applyAgentSwitch } from "./switch-agent.js";
@@ -140,6 +142,10 @@ async function readConfig(context: vscode.ExtensionContext): Promise<TetherConfi
     process.env as Record<string, string | undefined>,
     secretToken,
     secretsAvailable,
+    // v0.5.0 — vault-first: read the per-instance token the SessionStart hook
+    // keeps current, so a rotated token auto-syncs on the next (re)connect
+    // (readConfig runs on every connect + reconnect). Never logs the token.
+    (agentName) => readVaultToken(agentName, process.env as Record<string, string | undefined>, os.homedir(), log),
   );
 }
 
@@ -1179,7 +1185,10 @@ async function promptForAgentSpec(
   }
   if (!token || token.length === 0) {
     const env = process.env as Record<string, string | undefined>;
-    const fallback = resolvePerAgentToken(name.trim(), undefined, env, undefined, secretsReachable);
+    // v0.5.0 — vault-first here too: a spawned agent's hook-written token is
+    // read from the per-instance vault before prompting the operator.
+    const vaultTok = readVaultToken(name.trim(), env, os.homedir(), log) ?? undefined;
+    const fallback = resolvePerAgentToken(name.trim(), undefined, env, undefined, secretsReachable, vaultTok);
     if (fallback.length > 0) {
       token = fallback;
     } else {
