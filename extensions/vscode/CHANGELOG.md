@@ -4,6 +4,14 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.5.0] — 2026-07-13 — Vault-first token: no more manual "Set Agent Token"
+
+- **Tether reads the token the relay keeps current.** Previously Tether used only the token you set manually in SecretStorage, so when a relaunch rotated your agent's token, Tether kept presenting the stale copy and stopped waking the agent until you re-ran "Set Agent Token" by hand. Tether now reads the agent's token from the **per-instance vault file** the SessionStart hook keeps up to date, and re-reads it on **every (re)connect** — so a rotated token auto-syncs with zero manual steps.
+  - **Precedence:** an explicit `RELAY_AGENT_TOKEN_<NAME>` / `RELAY_AGENT_TOKEN` env var still wins (emergency/debug override), then the vault, then SecretStorage, then the legacy setting. The vault sits above the (previously stale) SecretStorage copy that caused the recurring failure.
+  - **Correct per-instance path.** The vault is resolved exactly the way the relay resolves it (honoring `RELAY_DB_PATH` / `RELAY_HOME` / `RELAY_INSTANCE_ID` and the `~/.bot-relay/active-instance` pointer), so multi-instance setups read the right token. A malformed active-instance fails closed rather than silently reading the wrong instance's token. Tokens are shape-validated and never logged.
+  - **Spawn Agent uses the current token too.** The same fix applies to "Tether: Spawn Agent": it now resolves the token with the same precedence (env, then vault, then SecretStorage) before spawning, so a newly spawned agent inherits the token the relay keeps current instead of a stale SecretStorage copy that would leave it unable to authenticate.
+  - Pairs with relay v2.16.1's stable mint-once-reuse, which stops rotating the token on every relaunch in the first place.
+
 ## [0.4.1] — 2026-07-07 — Auto-reconnect on daemon restart (no manual reconnect)
 
 - **Auto-reconnect when the relay restarts.** Restarting the relay daemon (e.g. after an update) dropped Tether's connection, and Tether stayed disconnected — silently no longer waking any agent — until you ran "Tether: Reconnect to Relay" by hand. Tether now detects the drop and reconnects on its own, with capped exponential backoff, so you never have to reconnect manually after a relay update or restart.
