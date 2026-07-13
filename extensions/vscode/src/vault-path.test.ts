@@ -1,7 +1,7 @@
 // Tether for bot-relay-mcp (VSCode)
 // SPDX-License-Identifier: MIT
 //
-// v0.5.0 — vault-path resolver tests. The load-bearing case (codex test 1):
+// v0.5.0 — vault-path resolver tests. The load-bearing case (per-instance path):
 // with an active per-instance setup, a tempting STALE token in the FLAT vault
 // must NOT be chosen — the resolver keys on the SAME rule the relay uses.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";

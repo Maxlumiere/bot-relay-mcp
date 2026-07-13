@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 /**
- * v2.16.1 — the LOAD-BEARING autowake-token regression (codex test 3).
+ * v2.16.1 — the LOAD-BEARING autowake-token regression.
  *
  * The recurring failure: a launcher rotates the agent's token on relaunch, the
  * SessionStart hook rewrites the fresh token to the vault, but Tether keeps its

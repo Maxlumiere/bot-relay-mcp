@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.16.1 — 2026-07-13 — Stable agent tokens (the relay half of the durable autowake fix)
+
+The recurring "autowake stops working after a relaunch" bug had two halves. The relay half: a launcher running `relay mint-token --force` on **every** relaunch rotated the agent's token, invalidating any holder of the old one. `relay mint-token` now defaults to **stable mint-once-reuse**:
+
+- **No agent yet** → mint a token **and write it to the vault** (closing a long-standing gap where the CLI minted a token but never wrote the vault the SessionStart hook reads).
+- **Agent exists and its vault token still authenticates** → **reuse it** — the `token_hash` is byte-stable, no rotation, no churn.
+- **Agent exists but its vault token can't authenticate** (missing / stale / mismatched) → **refuse**, with guidance (`--force` to rotate deliberately, or `relay recover`). It never silently rotates — that would invalidate a possibly-live token and mask a stale/compromised credential.
+
+`--force` still rotates on demand for the genuine "I want a new token" case (and now also writes the vault). Paired with the Tether 0.5.0 vault-first token read, this ends the manual "Set Agent Token" babysitting for good.
+
 ## v2.16.0 — 2026-07-10 — One-command install (`relay init`), the adoption gate
 
 Getting a working relay used to take ~6 disjoint manual steps across three files plus a hand-authored launchd plist. `relay init` is now the single idempotent macOS install path: a stranger runs one command and gets a working relay + autowake loop, and re-running is always safe.

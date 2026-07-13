@@ -28,8 +28,8 @@
 //
 // VSCode-free: `env` + `homeDir` are injected so the unit tests drive the REAL
 // resolver (extension.ts wires `process.env` + `os.homedir()`).
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 
 /** Mirrors src/token-store.ts TOKEN_SHAPE_RE. */
 export const TOKEN_SHAPE_RE = /^[A-Za-z0-9_=.-]{8,128}$/;
