@@ -1113,7 +1113,11 @@ function buildTerminalApi(): TerminalApi {
  * validated `AgentSpec` plus the resolved token, or null when the
  * operator cancels.
  */
-async function promptForAgentSpec(
+// Exported (was module-private pre-v0.5.0) so the #94 code-audit spawn-path
+// regression drives the SHIPPED resolution flow — the pure resolvePerAgentToken
+// test missed the bug because this function short-circuited on SecretStorage
+// before ever consulting the vault. Per feedback_test_path_must_match_shipped_path.
+export async function promptForAgentSpec(
   context: vscode.ExtensionContext,
 ): Promise<{ spec: AgentSpec; tokenWasStored: boolean } | null> {
   const name = await vscode.window.showInputBox({
@@ -1166,15 +1170,23 @@ async function promptForAgentSpec(
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
 
-  // Token — read per-agent SecretStorage first; if empty, prompt.
-  // Operator can submit empty input to spawn token-less (SessionStart
-  // hook will mint one via register_agent + vault). Operator can also
-  // paste a fresh token to overwrite the stored value.
+  // Token — resolve with the SHIPPED precedence (explicit env > vault >
+  // per-agent SecretStorage > legacy) BEFORE deciding whether to prompt.
+  // v0.5.0 #94 code-audit fix: the spawn path previously read per-agent
+  // SecretStorage FIRST and only consulted the vault when that was empty, so a
+  // STALE SecretStorage copy shadowed the hook-maintained vault — the same
+  // desync that killed autowake on the reconnect path, injected here as
+  // RELAY_AGENT_TOKEN into the spawned agent (which then bypasses SessionStart
+  // vault hydration). Both secret + vault are now read and handed to
+  // resolvePerAgentToken UNCONDITIONALLY so the vault wins over a stale secret.
+  // Operator can still submit empty input to spawn token-less (SessionStart
+  // hook mints one via register_agent + vault) or paste a fresh token.
   let token: string | undefined;
   let tokenWasStored = false;
   let secretsReachable = true;
+  let perAgentSecret: string | undefined;
   try {
-    token = await context.secrets.get(resolveAgentSecretKey(name.trim()));
+    perAgentSecret = await context.secrets.get(resolveAgentSecretKey(name.trim()));
   } catch (err) {
     log(
       `SecretStorage unreachable while reading per-agent token for "${name}": ${
@@ -1183,40 +1195,43 @@ async function promptForAgentSpec(
     );
     secretsReachable = false;
   }
-  if (!token || token.length === 0) {
-    const env = process.env as Record<string, string | undefined>;
-    // v0.5.0 — vault-first here too: a spawned agent's hook-written token is
-    // read from the per-instance vault before prompting the operator.
-    const vaultTok = readVaultToken(name.trim(), env, os.homedir(), log) ?? undefined;
-    const fallback = resolvePerAgentToken(name.trim(), undefined, env, undefined, secretsReachable, vaultTok);
-    if (fallback.length > 0) {
-      token = fallback;
-    } else {
-      const input = await vscode.window.showInputBox({
-        title: `Tether: Spawn Agent — token for "${name.trim()}"`,
-        prompt:
-          "Paste agent token (stored in SecretStorage). Leave empty to let the relay mint one via SessionStart hook.",
-        password: true,
-        ignoreFocusOut: true,
-      });
-      if (input === undefined) return null; // operator cancelled
-      const trimmed = input.trim();
-      if (trimmed.length > 0) {
-        if (secretsReachable) {
-          try {
-            await context.secrets.store(resolveAgentSecretKey(name.trim()), trimmed);
-            tokenWasStored = true;
-          } catch (err) {
-            log(
-              `SecretStorage store failed for "${name}": ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-            );
-            // Fall through with token in memory only.
-          }
+  const env = process.env as Record<string, string | undefined>;
+  const vaultTok = readVaultToken(name.trim(), env, os.homedir(), log) ?? undefined;
+  const resolved = resolvePerAgentToken(
+    name.trim(),
+    perAgentSecret,
+    env,
+    undefined,
+    secretsReachable,
+    vaultTok,
+  );
+  if (resolved.length > 0) {
+    token = resolved;
+  } else {
+    const input = await vscode.window.showInputBox({
+      title: `Tether: Spawn Agent — token for "${name.trim()}"`,
+      prompt:
+        "Paste agent token (stored in SecretStorage). Leave empty to let the relay mint one via SessionStart hook.",
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (input === undefined) return null; // operator cancelled
+    const trimmed = input.trim();
+    if (trimmed.length > 0) {
+      if (secretsReachable) {
+        try {
+          await context.secrets.store(resolveAgentSecretKey(name.trim()), trimmed);
+          tokenWasStored = true;
+        } catch (err) {
+          log(
+            `SecretStorage store failed for "${name}": ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          // Fall through with token in memory only.
         }
-        token = trimmed;
       }
+      token = trimmed;
     }
   }
 
