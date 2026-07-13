@@ -33,6 +33,10 @@ function runRelay(args: string[], extraEnv: Record<string, string | undefined> =
     RELAY_CONFIG_PATH: TEST_CONFIG_PATH,
     RELAY_HTTP_PORT: "39988",
     HOME: TEST_HOME,
+    // v2.16.0 — isolate the one-command installer: write ~/.claude* into the
+    // temp home and NEVER shell out to real launchctl from a test.
+    RELAY_CLAUDE_HOME: TEST_HOME,
+    RELAY_SKIP_DAEMON: "1",
     // Unset so doctor/init don't see pre-existing state.
     RELAY_HTTP_SECRET: undefined,
     RELAY_ALLOW_LEGACY: undefined,
@@ -99,27 +103,67 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
     expect(cfg.transport).toBe("stdio");
     expect(cfg.profile).toBe("solo");
     expect(cfg.http_port).toBe(3777);
-    expect(cfg.http_secret).toBeTruthy();
-    expect(cfg.http_secret.length).toBeGreaterThan(20);
+    // v2.16.0 — a local (loopback) install OMITS http_secret (the daemon treats
+    // 127.0.0.1 as local-safe; a secret would 401 the SessionStart hook). It is
+    // opt-in via --secret only.
+    expect(cfg.http_secret).toBeUndefined();
     if (process.platform !== "win32") {
       expect(fs.statSync(TEST_CONFIG_PATH).mode & 0o777).toBe(0o600);
       expect(fs.statSync(TEST_DB_DIR).mode & 0o777).toBe(0o700);
     }
   });
 
-  it("(6) `relay init` refuses when config exists; `--force` overwrites", () => {
-    // First init seeds the config.
-    expect(runRelay(["init", "--yes"]).status).toBe(0);
-    // Second init without --force → refuse.
-    const refused = runRelay(["init", "--yes"]);
-    expect(refused.status).not.toBe(0);
-    expect(refused.stderr).toMatch(/already exists/i);
-    // With --force → succeeds; secret rotates.
+  it("(5b) v2.16.0 — `--secret` opt-in writes an http_secret (non-loopback / team bind)", () => {
+    const SECRET = "a".repeat(40); // >= 32 chars (config validator floor)
+    expect(runRelay(["init", "--yes", "--secret", SECRET]).status).toBe(0);
+    const cfg = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8"));
+    expect(cfg.http_secret).toBe(SECRET);
+  });
+
+  it("(6) v2.16.0 — `relay init` re-run is idempotent + PRESERVES the secret; `--force` resets it", () => {
+    const SECRET = "s".repeat(40);
+    // First init seeds the config WITH an explicit secret.
+    expect(runRelay(["init", "--yes", "--secret", SECRET]).status).toBe(0);
     const originalSecret = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8")).http_secret;
-    const forced = runRelay(["init", "--yes", "--force"]);
+    expect(originalSecret).toBe(SECRET);
+    // Second init WITHOUT --force and WITHOUT --secret → reconcile PRESERVES it.
+    const rerun = runRelay(["init", "--yes"]);
+    expect(rerun.status).toBe(0);
+    const preservedSecret = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8")).http_secret;
+    expect(preservedSecret, "re-run must preserve the http_secret").toBe(originalSecret);
+    // --force with a new --secret → resets.
+    const NEW = "n".repeat(40);
+    const forced = runRelay(["init", "--yes", "--force", "--secret", NEW]);
     expect(forced.status).toBe(0);
     const newSecret = JSON.parse(fs.readFileSync(TEST_CONFIG_PATH, "utf-8")).http_secret;
+    expect(newSecret).toBe(NEW);
     expect(newSecret).not.toBe(originalSecret);
+  });
+
+  it("(6b) v2.16.0 — init deep-merges mcpServers + SessionStart hook, idempotent, preserving unrelated entries", () => {
+    // Seed unrelated user config as canaries.
+    const claudeJson = path.join(TEST_HOME, ".claude.json");
+    const settings = path.join(TEST_HOME, ".claude", "settings.json");
+    fs.writeFileSync(claudeJson, JSON.stringify({ mcpServers: { other: { type: "stdio", command: "x" } }, ui: "keep" }));
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({ hooks: { PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "/u/pre.sh" }] }] } }));
+
+    expect(runRelay(["init", "--yes"]).status).toBe(0);
+    const cj = JSON.parse(fs.readFileSync(claudeJson, "utf-8"));
+    expect(cj.mcpServers.other).toEqual({ type: "stdio", command: "x" }); // canary preserved
+    expect(cj.mcpServers["bot-relay"].command).toBe("node"); // ours added
+    expect(cj.ui).toBe("keep"); // unrelated top-level preserved
+    const st = JSON.parse(fs.readFileSync(settings, "utf-8"));
+    expect(st.hooks.PreToolUse).toBeDefined(); // canary event preserved
+    const ss = st.hooks.SessionStart;
+    expect(ss.some((g: any) => g.hooks.some((h: any) => h.command.includes("check-relay.sh")))).toBe(true);
+
+    // Second run → structurally identical (no dup, no clobber).
+    expect(runRelay(["init", "--yes"]).status).toBe(0);
+    const cj2 = JSON.parse(fs.readFileSync(claudeJson, "utf-8"));
+    const st2 = JSON.parse(fs.readFileSync(settings, "utf-8"));
+    expect(cj2).toEqual(cj); // byte-for-byte structural no-op
+    expect(st2.hooks.SessionStart.length).toBe(ss.length); // no duplicate hook
   });
 
   it("(7) `relay generate-hooks` emits a valid JSON fragment with absolute paths", () => {

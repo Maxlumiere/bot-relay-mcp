@@ -62,7 +62,21 @@ npm install
 npm run build
 ```
 
-Add to `~/.claude.json`:
+### One-command setup (`relay init`)
+
+After building, run the installer:
+
+```bash
+./bin/relay init
+```
+
+It reconciles your `~/.claude.json` (mcpServers entry), `~/.claude/settings.json` (SessionStart hook), and — on macOS — installs a keep-alive launchd daemon. It never touches your agent tokens, and re-running is always safe (idempotent). Use `--config-only` / `--skip-hooks` / `--skip-daemon` to opt out of any step.
+
+> **⚠️ Security — the default is local-trust.** A default `relay init` install has **no HTTP secret**: the relay binds to `127.0.0.1` and trusts every process on the same machine. Any local process can then reach the loopback HTTP surface — including the dashboard operator endpoints (`/api/snapshot`, `set-status`, `wake-agent`, `kill-agent`, `operator-identity`). Per-agent tokens protect *who you can act as* (you can't impersonate another agent), but they do **not** gate the whole surface. This is a reasonable boundary on a personal, single-user machine (a local process already has OS-level access to the same data), and non-loopback binds are still refused without a secret.
+>
+> **On a shared machine, or any non-loopback / team / remote setup, gate it:** run `relay init --secret <strong-random>` (or export `RELAY_DASHBOARD_SECRET`). The daemon *requires* a secret to bind to any non-loopback host.
+
+Alternatively, wire it up by hand — add to `~/.claude.json`:
 
 ```json
 {
