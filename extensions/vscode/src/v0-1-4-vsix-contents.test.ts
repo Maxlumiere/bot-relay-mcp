@@ -39,7 +39,15 @@ interface VsceLsResult {
 }
 
 function runVsceLs(): VsceLsResult {
-  const r = spawnSync(VSCE_BIN, ["ls"], {
+  // `--no-dependencies` skips vsce's `npm list --production --parseable
+  // --depth=99999` dependency scan. Under npm 11 (Node 24, the environment the
+  // relay pre-publish gate runs in) that scan EXITS 1 on a false-positive
+  // ELSPROBLEMS — the qs/form-data `overrides` mark call-bind-apply-helpers /
+  // get-intrinsic "invalid" though the installed versions satisfy their ranges
+  // (npm 20/22 in CI accept it, which is why CI stays green). The extension is
+  // esbuild-BUNDLED, so runtime deps never ship in the VSIX anyway — skipping
+  // the scan changes nothing about the packaged file list this guard asserts.
+  const r = spawnSync(VSCE_BIN, ["ls", "--no-dependencies"], {
     cwd: EXT_ROOT,
     encoding: "utf-8",
     timeout: 30_000,
@@ -170,7 +178,11 @@ describe("v0.1.4 — VSIX contents drift guard", () => {
     try {
       const r = spawnSync(
         VSCE_BIN,
-        ["package", "--skip-license", "--out", outVsix],
+        // `--no-dependencies` for the same npm-11 reason as runVsceLs: vsce
+        // package runs the same dependency scan that EXITS 1 on the
+        // false-positive ELSPROBLEMS under Node 24. The bundled VSIX contents
+        // (and therefore the byte ceiling this test measures) are unchanged.
+        ["package", "--skip-license", "--no-dependencies", "--out", outVsix],
         {
           cwd: EXT_ROOT,
           encoding: "utf-8",

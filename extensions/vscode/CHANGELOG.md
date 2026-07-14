@@ -10,7 +10,7 @@ The marketplace surfaces this file directly on the extension's listing page, so 
   - **Precedence:** an explicit `RELAY_AGENT_TOKEN_<NAME>` / `RELAY_AGENT_TOKEN` env var still wins (emergency/debug override), then the vault, then SecretStorage, then the legacy setting. The vault sits above the (previously stale) SecretStorage copy that caused the recurring failure.
   - **Correct per-instance path.** The vault is resolved exactly the way the relay resolves it (honoring `RELAY_DB_PATH` / `RELAY_HOME` / `RELAY_INSTANCE_ID` and the `~/.bot-relay/active-instance` pointer), so multi-instance setups read the right token. A malformed active-instance fails closed rather than silently reading the wrong instance's token. Tokens are shape-validated and never logged.
   - **Spawn Agent uses the current token too.** The same fix applies to "Tether: Spawn Agent": it now resolves the token with the same precedence (env, then vault, then SecretStorage) before spawning, so a newly spawned agent inherits the token the relay keeps current instead of a stale SecretStorage copy that would leave it unable to authenticate.
-  - Pairs with relay v2.16.1's stable mint-once-reuse, which stops rotating the token on every relaunch in the first place.
+  - Pairs with relay v2.16.2's stable mint-once-reuse, which stops rotating the token on every relaunch in the first place.
 
 ## [0.4.1] — 2026-07-07 — Auto-reconnect on daemon restart (no manual reconnect)
 
