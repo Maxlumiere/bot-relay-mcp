@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.16.2 — 2026-07-13 — Publish-gate fix for Node 24 / npm 11 (carries 2.16.1)
+
+A release-tooling patch: **2.16.1 never reached npm** because the pre-publish gate failed on Node 24 / npm 11, so 2.16.2 is what ships and it **carries all of 2.16.1** (stable mint-once-reuse, below) plus this fix.
+
+- **The block.** The extension's VSIX-contents drift guard (`v0-1-4-vsix-contents.test.ts`) shells out to `vsce ls` / `vsce package`, which internally run `npm list --production --parseable --depth=99999`. Under npm 11 that scan **exits 1** on a false-positive `ELSPROBLEMS` (the `qs`/`form-data` `overrides` mark `call-bind-apply-helpers` / `get-intrinsic` "invalid" though the installed versions satisfy their ranges). npm 20/22 accept it, so CI stayed green while the gate — which Maxime runs on Node 24 — went red on all 11 assertions.
+- **The fix.** Both vsce invocations now pass `--no-dependencies`, skipping the dependency scan. The extension is esbuild-bundled, so runtime deps never ship in the VSIX — the packaged file list and byte ceiling the guard asserts are unchanged; only the spurious scan is gone. Verified passing on Node 24 / npm 11.
+- **Known follow-up (flagged, not in this patch):** the *relay* pre-publish gate runs this *extension* VSIX test, so a Tether-tooling failure can block a relay npm publish. Decoupling the two gates (or making the shared gate Node-version-robust) is a tracked follow-up.
+
 ## v2.16.1 — 2026-07-13 — Stable agent tokens (the relay half of the durable autowake fix)
 
 The recurring "autowake stops working after a relaunch" bug had two halves. The relay half: a launcher running `relay mint-token --force` on **every** relaunch rotated the agent's token, invalidating any holder of the old one. `relay mint-token` now defaults to **stable mint-once-reuse**:
