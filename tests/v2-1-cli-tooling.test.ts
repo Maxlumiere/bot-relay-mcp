@@ -15,6 +15,19 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { tomlBasicString } from "../src/cli/generate-hooks.js";
+
+/** Parse TOML via python3's stdlib tomllib (CI runner = ubuntu-latest → py3.12).
+ *  Throws on invalid TOML, so the emitted config is proven parseable, not grepped. */
+function parseTomlViaPython(toml: string): { hooks?: Record<string, unknown> } & Record<string, unknown> {
+  const r = spawnSync(
+    "python3",
+    ["-c", "import tomllib,sys,json; sys.stdout.write(json.dumps(tomllib.loads(sys.stdin.read())))"],
+    { input: toml, encoding: "utf-8" },
+  );
+  if (r.status !== 0) throw new Error(`TOML did not parse (python3 tomllib): ${r.stderr}`);
+  return JSON.parse(r.stdout);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -187,33 +200,34 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
     expect(parsed.hooks.Stop).toBeDefined();
   });
 
-  it("(8b) v2.17.0 P1 — `generate-hooks --codex` emits a REGISTER-ONLY Codex config.toml (no poller)", () => {
+  it("(8b) v2.17.0 P1 — `generate-hooks --codex` PARSES as valid TOML and is REGISTER-ONLY (only SessionStart)", () => {
     const r = runRelay(["generate-hooks", "--codex"]);
     expect(r.status).toBe(0);
-    const out = r.stdout;
-    expect(out).toContain("[[hooks.SessionStart]]");
-    expect(out).toContain('matcher = "startup|resume"');
-    expect(out).toMatch(/command\s*=\s*"[^"]*hooks\/codex\/codex-session-start\.sh"/);
-    // Reconciled to the current no-poller model (codex-stop.sh was removed in
-    // v2.16.4; Codex wakes via Tether): NO Stop hook table, NO codex-stop.sh command.
-    expect(out).not.toContain("[[hooks.Stop]]");
-    expect(out).not.toMatch(/command\s*=\s*"[^"]*codex-stop/);
-    // Documents the Tether cold-start launcher as the wake path.
-    expect(out).toContain("bin/codex-relay");
-    // Absolute command path.
-    const m = out.match(/command\s*=\s*"([^"]+)"/);
-    expect(m).toBeTruthy();
-    expect(m![1]).toMatch(/^\//);
+    const toml = parseTomlViaPython(r.stdout); // throws if the emitted TOML is invalid
+    const hooks = (toml.hooks ?? {}) as Record<string, any>;
+    // Register-only: the ONLY hook table is SessionStart — no Stop, no PostToolUse.
+    expect(Object.keys(hooks).sort()).toEqual(["SessionStart"]);
+    const cmd = hooks.SessionStart[0].hooks[0].command as string;
+    expect(cmd).toMatch(/^\//); // absolute
+    expect(cmd.endsWith("hooks/codex/codex-session-start.sh")).toBe(true);
+    expect(cmd).not.toContain("codex-stop");
+    expect(hooks.SessionStart[0].matcher).toBe("startup|resume");
   });
 
-  it("(8c) v2.17.0 P1 — `generate-hooks --all` emits both the Claude JSON and Codex TOML sections", () => {
+  it("(8c) v2.17.0 P1 — `generate-hooks --all` — split both labeled payloads; Claude JSON + Codex TOML each parse; Codex register-only", () => {
     const r = runRelay(["generate-hooks", "--all"]);
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain("Claude Code — ~/.claude/settings.json");
-    expect(r.stdout).toContain("Codex CLI — ~/.codex/config.toml");
-    expect(r.stdout).toContain("PostToolUse"); // Claude section keeps all three
-    expect(r.stdout).toContain("[[hooks.SessionStart]]"); // Codex section
-    expect(r.stdout).not.toContain("[[hooks.Stop]]"); // Codex stays register-only
+    const CODEX_HDR = "# ===== Codex CLI — ~/.codex/config.toml (TOML) =====";
+    const idx = r.stdout.indexOf(CODEX_HDR);
+    expect(idx).toBeGreaterThan(0);
+    // Claude section = between its header and the Codex header → must be valid JSON.
+    const claudePart = r.stdout.slice(0, idx).replace(/^# =====[^\n]*\n/, "").trim();
+    const claude = JSON.parse(claudePart) as Record<string, unknown>;
+    expect(Object.keys(claude).sort()).toEqual(["PostToolUse", "SessionStart", "Stop"]);
+    // Codex section = after the Codex header → must be valid TOML + register-only.
+    const codexPart = r.stdout.slice(idx + CODEX_HDR.length).trim();
+    const codex = parseTomlViaPython(codexPart);
+    expect(Object.keys((codex.hooks ?? {}) as Record<string, unknown>).sort()).toEqual(["SessionStart"]);
   });
 
   it("(8d) v2.17.0 P1 — `generate-hooks --help` documents --codex/--all + the honest hook-model mapping", () => {
@@ -222,6 +236,14 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
     expect(r.stdout).toContain("--codex");
     expect(r.stdout).toContain("--all");
     expect(r.stdout).toMatch(/no Codex analog|Tether-driven|register-only/i);
+  });
+
+  it("(8e) v2.17.0 P1 — tomlBasicString escapes control chars → a path with newline/CR/tab/quote/backslash emits VALID TOML that round-trips exactly", () => {
+    const hostile = 'a\nb\tc\rd"e\\f';
+    const encoded = tomlBasicString(hostile);
+    // Feed `k = <encoded>` through a REAL TOML parser and assert the exact round-trip.
+    const parsed = parseTomlViaPython(`k = ${encoded}`);
+    expect(parsed.k).toBe(hostile);
   });
 
   it("(9) `relay backup` writes an archive + exits 0 when DB exists", () => {

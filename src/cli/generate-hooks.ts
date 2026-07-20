@@ -33,9 +33,28 @@ function quoteForHookCommand(p: string): string {
   return `'${p.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Escape a path for a TOML double-quoted basic string (backslash + quote). */
-function tomlBasicString(p: string): string {
-  return `"${p.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+/**
+ * Encode a string as a TOML double-quoted basic string. Escapes backslash,
+ * double-quote, AND all control characters (U+0000–U+001F, U+007F) per the TOML
+ * spec — a POSIX path containing a newline / CR / tab would otherwise be emitted
+ * literally and produce INVALID TOML. Named escapes for the common controls,
+ * \uXXXX for the rest. Exported for the escaping regression test.
+ */
+export function tomlBasicString(s: string): string {
+  let out = '"';
+  for (const ch of s) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (ch === "\\") out += "\\\\";
+    else if (ch === '"') out += '\\"';
+    else if (ch === "\b") out += "\\b";
+    else if (ch === "\t") out += "\\t";
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\f") out += "\\f";
+    else if (ch === "\r") out += "\\r";
+    else if (code < 0x20 || code === 0x7f) out += "\\u" + code.toString(16).padStart(4, "0").toUpperCase();
+    else out += ch;
+  }
+  return out + '"';
 }
 
 function resolveInstallDir(): string {
