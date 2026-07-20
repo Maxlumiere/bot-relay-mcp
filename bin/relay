@@ -7,7 +7,8 @@
  *                             --remote <url> probes a remote hub instead (v2.1 Phase 7r).
  *   relay init [options]      First-run setup (interactive unless --yes).
  *   relay test                Fresh-install self-check (throwaway relay).
- *   relay generate-hooks      Emit Claude Code hook JSON for settings.json.
+ *   relay generate-hooks      Emit agent hook config (Claude JSON default;
+ *                             --codex for Codex config.toml; --all for both).
  *   relay backup [--output]   Snapshot the DB + config into a tar.gz archive.
  *   relay restore PATH        Restore from a tar.gz archive.
  *   relay recover NAME        Clear an agent's registration so it can re-bootstrap
@@ -65,7 +66,7 @@ function printHelp() {
       "  doctor           Diagnostic sweep of the local install (or --remote URL).\n" +
       "  init             First-run setup (interactive; --yes for non-interactive).\n" +
       "  test             Fresh-install self-check against a throwaway relay.\n" +
-      "  generate-hooks   Emit Claude Code hook JSON to merge into settings.json.\n" +
+      "  generate-hooks   Emit agent hook config (Claude JSON default; --codex Codex TOML; --all both).\n" +
       "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
       "  restore PATH     Restore from a tar.gz archive.\n" +
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +

@@ -187,6 +187,43 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
     expect(parsed.hooks.Stop).toBeDefined();
   });
 
+  it("(8b) v2.17.0 P1 — `generate-hooks --codex` emits a REGISTER-ONLY Codex config.toml (no poller)", () => {
+    const r = runRelay(["generate-hooks", "--codex"]);
+    expect(r.status).toBe(0);
+    const out = r.stdout;
+    expect(out).toContain("[[hooks.SessionStart]]");
+    expect(out).toContain('matcher = "startup|resume"');
+    expect(out).toMatch(/command\s*=\s*"[^"]*hooks\/codex\/codex-session-start\.sh"/);
+    // Reconciled to the current no-poller model (codex-stop.sh was removed in
+    // v2.16.4; Codex wakes via Tether): NO Stop hook table, NO codex-stop.sh command.
+    expect(out).not.toContain("[[hooks.Stop]]");
+    expect(out).not.toMatch(/command\s*=\s*"[^"]*codex-stop/);
+    // Documents the Tether cold-start launcher as the wake path.
+    expect(out).toContain("bin/codex-relay");
+    // Absolute command path.
+    const m = out.match(/command\s*=\s*"([^"]+)"/);
+    expect(m).toBeTruthy();
+    expect(m![1]).toMatch(/^\//);
+  });
+
+  it("(8c) v2.17.0 P1 — `generate-hooks --all` emits both the Claude JSON and Codex TOML sections", () => {
+    const r = runRelay(["generate-hooks", "--all"]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("Claude Code — ~/.claude/settings.json");
+    expect(r.stdout).toContain("Codex CLI — ~/.codex/config.toml");
+    expect(r.stdout).toContain("PostToolUse"); // Claude section keeps all three
+    expect(r.stdout).toContain("[[hooks.SessionStart]]"); // Codex section
+    expect(r.stdout).not.toContain("[[hooks.Stop]]"); // Codex stays register-only
+  });
+
+  it("(8d) v2.17.0 P1 — `generate-hooks --help` documents --codex/--all + the honest hook-model mapping", () => {
+    const r = runRelay(["generate-hooks", "--help"]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("--codex");
+    expect(r.stdout).toContain("--all");
+    expect(r.stdout).toMatch(/no Codex analog|Tether-driven|register-only/i);
+  });
+
   it("(9) `relay backup` writes an archive + exits 0 when DB exists", () => {
     // Seed a DB via init + a test round-trip.
     runRelay(["init", "--yes"]);
