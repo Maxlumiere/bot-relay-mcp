@@ -379,3 +379,59 @@ relay_pid_start() {
   [ -n "$pid" ] || return
   LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
+
+# --- v2.16.3: Tether v0.3 PID-handshake helpers (shared — moved out of
+# check-relay.sh so the Codex SessionStart hook can report the SAME handshake
+# and Tether can PID-bind Codex terminals, not just Claude ones) --------------
+#
+# Compute the agent's machine GUID + process-ancestry PID chain so Tether can
+# bind THIS terminal to THIS agent by process id (no manual naming). Both MUST
+# match the extension's TypeScript readers (extensions/vscode/src/host-identity.ts)
+# byte-for-byte — same OS source, same extraction — or the two host_ids won't
+# agree and host-scoped matching silently fails. POSIX is the real path
+# (macOS / Linux); the Windows (git-bash) branches mirror the documented
+# wmic/reg shapes but are not runtime-tested (no Windows host). Any failure →
+# empty output → the field is omitted from the register call (graceful: Tether
+# falls back to name matching).
+relay_machine_guid() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+        | sed -nE 's/.*"IOPlatformUUID" = "([^"]+)".*/\1/p' | head -1 ;;
+    Linux)
+      head -1 /etc/machine-id 2>/dev/null | tr -d '[:space:]' ;;
+    MINGW*|MSYS*|CYGWIN*)
+      reg query 'HKLM\SOFTWARE\Microsoft\Cryptography' //v MachineGuid 2>/dev/null \
+        | sed -nE 's/.*MachineGuid[[:space:]]+REG_SZ[[:space:]]+([^[:space:]]+).*/\1/p' | head -1 ;;
+  esac
+}
+
+# Walk parent PIDs from this hook shell ($$) up toward init, emitting a JSON
+# array "[pid1,pid2,...]". The hook is a descendant of the agent (claude/codex),
+# which is a descendant of the controlling shell (= VS Code Terminal.processId),
+# so that shell PID is always in the chain regardless of launch path. Bounded +
+# stops at init.
+relay_pid_chain() {
+  local pid=$$ chain="" depth=0 ppid wtable
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      wtable=$(wmic process get ProcessId,ParentProcessId /format:csv 2>/dev/null)
+      [ -z "$wtable" ] && { printf '[]'; return; }
+      while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+        chain="${chain:+$chain,}$pid"
+        ppid=$(printf '%s\n' "$wtable" | awk -F, -v p="$pid" 'NR>1 && $3+0==p {gsub(/[^0-9]/,"",$2); print $2; exit}')
+        case "$ppid" in ''|*[!0-9]*) break ;; esac
+        [ "$ppid" -le 1 ] && break
+        pid="$ppid"; depth=$((depth+1))
+      done ;;
+    *)
+      while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+        chain="${chain:+$chain,}$pid"
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        case "$ppid" in ''|*[!0-9]*) break ;; esac
+        [ "$ppid" -le 1 ] && break
+        pid="$ppid"; depth=$((depth+1))
+      done ;;
+  esac
+  printf '[%s]' "$chain"
+}
