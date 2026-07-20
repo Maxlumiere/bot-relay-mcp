@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.16.4 — 2026-07-20 — Codex cold-start launcher (autowake at pure launch)
+
+Closes the last gap in the Codex autowake story. The P0 handshake (2.16.3) works, but Codex runs the SessionStart hook's `register_agent` at the **first turn**, not at idle launch — so a freshly-summoned Codex has no `host_shell_pids` until you take a turn, and Tether can't PID-bind it until then ("summon → nothing happens until you talk to it").
+
+- **`bin/codex-relay <agent-name>`** — a cold-start launcher that pre-registers the Tether handshake **from the shell**, before exec'ing Codex. Because it runs as a child of the launching shell, its ancestry (`relay_pid_chain`) includes the VS Code `Terminal.processId`, so `host_shell_pids` is populated at **pure launch** → Tether binds + wakes immediately, zero manual turn. Uses the SAME shared helpers as the hook (`hooks/_vault-helpers.sh`, no drift); the `SessionStart` hook still runs afterward (refreshes the chain + inbox nudge).
+- **Cause-independent:** pre-registering before Codex starts sidesteps Codex's hook-lifecycle timing entirely (whether it skips the launch register or sandbox-blocks it).
+- **Generalizes** to any summoned Codex (the agent name is the first arg). Best-effort — any failure falls back to the first-turn hook register and never blocks the launch. Brand-new agents register auth-free at first launch and the launcher vaults the minted token; existing agents re-register with `force` + the owner's token (authenticated launch-time takeover of their own name for the new terminal).
+- **Load-bearing invariant tested** (`tests/v2-16-4-codex-coldstart-launch-register.test.ts`): the registered `host_shell_pids` contains the launching process PID — the terminal Tether binds — and the launcher exec's with the per-agent `-c` identity override + forwards extra args.
+- Doc: `docs/agents/codex-autowake.md` gains a "Cold-start" section + the launcher alias.
+
 ## v2.16.3 — 2026-07-20 — Tether wakes Codex terminals (P0 LLM-agnostic parity)
 
 Restores the reported break — **"Tether stopped waking Codex."** It was a registration-contract gap, not wake logic. Tether binds a VS Code terminal to an agent by **PID**, host-scoped (`pid-binding.ts` needs the agent's `host_shell_pids` + a `host_id` matching this machine). The Claude hook (`check-relay.sh`) has always sent them; the Codex `SessionStart` hook sent **only** `agent_pid` — its comment (*"Tether is Claude/VSCode-only"*) was frozen from before Tether went LLM-agnostic (v0.4.0). So Tether abstained on Codex and fell back to fragile terminal-name matching, which broke when a workspace move / alias change renamed the terminal.
