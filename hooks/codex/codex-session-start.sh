@@ -97,10 +97,11 @@ build_caps_json() {
   if [ -z "$AGENT_CAPS" ]; then printf '[]'; return; fi
   echo "$AGENT_CAPS" | awk -F',' '{
     printf "[";
+    n = 0;
     for (i=1; i<=NF; i++) {
       gsub(/^ +| +$/, "", $i);
-      if ($i !~ /^[A-Za-z0-9_.-]+$/) next;
-      printf "%s\"%s\"", (i==1 ? "" : ","), $i;
+      if ($i !~ /^[A-Za-z0-9_.-]+$/) continue;
+      printf "%s\"%s\"", (n++ ? "," : ""), $i;
     }
     printf "]";
   }'
@@ -163,19 +164,63 @@ RELAY_AGENT_PID_START=""
 REG_HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 [ -n "${RELAY_AGENT_TOKEN:-}" ] && REG_HEADERS+=(-H "X-Agent-Token: ${RELAY_AGENT_TOKEN}")
 
-REG_BODY=$(curl -s -m 4 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
-  "${REG_HEADERS[@]}" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
-  2>/dev/null)
+# v2.16.4 cold-start handoff: if bin/codex-relay pre-registered this launch it
+# exports RELAY_LAUNCH_SESSION = the session_id it registered. SKIP our register
+# ONLY when that marker matches OUR row's CURRENT session_id — proof THIS
+# launch's launcher registered THIS agent's row. NEVER skip on DB-state alone:
+# a stale / other-terminal live session would otherwise let us stamp our pid onto
+# someone else's row (the cross-terminal corruption the collision guard exists to
+# prevent). No marker / mismatch / unreadable → register normally (fallback = the
+# pre-launcher first-turn behavior, WITH host_shell_pids). Reading OUR row's
+# session_id (filtered by AGENT_NAME) also means a marker for a DIFFERENT agent
+# can never make us skip (no cross-agent leakage).
+SKIP_REGISTER_HANDOFF=0
+if echo "${RELAY_LAUNCH_SESSION:-}" | grep -Eq '^[0-9a-fA-F-]{8,64}$'; then
+  DISCOVER_BODY=$(curl -fsS --connect-timeout 1 --max-time 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    "${REG_HEADERS[@]}" \
+    --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_agents","arguments":{}}}' 2>/dev/null) || DISCOVER_BODY=""
+  if [ -n "$DISCOVER_BODY" ] && command -v python3 >/dev/null 2>&1; then
+    CUR_SID=$(RESP="$DISCOVER_BODY" AN="$AGENT_NAME" python3 -c '
+import json, os
+raw = (os.environ.get("RESP", "") or "").strip()
+payload = None
+for line in raw.splitlines():
+    line = line.strip()
+    if line.startswith("data:"):
+        payload = line[5:].strip(); break
+if payload is None:
+    payload = raw
+try:
+    rpc = json.loads(payload)
+    inner = json.loads(rpc["result"]["content"][0]["text"])
+    for a in inner.get("agents", []):
+        if a.get("name") == os.environ["AN"]:
+            print(a.get("session_id") or "")
+            break
+except Exception:
+    pass
+' 2>/dev/null)
+    if [ -n "$CUR_SID" ] && [ "$CUR_SID" = "$RELAY_LAUNCH_SESSION" ]; then
+      SKIP_REGISTER_HANDOFF=1
+    fi
+  fi
+fi
 
-# Capture a freshly-minted token (first register only) and persist it to the
-# vault so the stdio MCP server's resolveToken can authenticate this agent's
-# later get_messages calls. SSE-wrapped + JSON-stringified shape: \"key\": value
-# (escaped quote + space after colon) — same parser as check-relay.sh.
-if [ -n "$REG_BODY" ] && command -v write_relay_token_to_vault >/dev/null 2>&1; then
-  REG_TOKEN=$(echo "$REG_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
-  if [ -n "$REG_TOKEN" ]; then
-    write_relay_token_to_vault "$AGENT_NAME" "$REG_TOKEN" >/dev/null 2>&1 || true
+if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
+  REG_BODY=$(curl -s -m 4 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    "${REG_HEADERS[@]}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
+    2>/dev/null)
+
+  # Capture a freshly-minted token (first register only) and persist it to the
+  # vault so the stdio MCP server's resolveToken can authenticate this agent's
+  # later get_messages calls. SSE-wrapped + JSON-stringified shape: \"key\": value
+  # (escaped quote + space after colon) — same parser as check-relay.sh.
+  if [ -n "$REG_BODY" ] && command -v write_relay_token_to_vault >/dev/null 2>&1; then
+    REG_TOKEN=$(echo "$REG_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
+    if [ -n "$REG_TOKEN" ]; then
+      write_relay_token_to_vault "$AGENT_NAME" "$REG_TOKEN" >/dev/null 2>&1 || true
+    fi
   fi
 fi
 

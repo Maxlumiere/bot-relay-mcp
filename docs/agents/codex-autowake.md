@@ -47,13 +47,24 @@ The **`bin/codex-relay`** launcher closes this. It pre-registers the handshake
 launching shell, its ancestry (`relay_pid_chain`) includes the VS Code
 `Terminal.processId`, so `host_shell_pids` is populated at pure launch → Tether
 binds + wakes immediately, zero manual turn. It uses the SAME shared helpers as
-the hook (no drift), and Codex's `SessionStart` hook still runs afterward
-(refreshing the chain + delivering the inbox nudge). It generalizes to **any**
-summoned Codex — the agent name is the first argument.
+the hook (no drift). It generalizes to **any** summoned Codex — the agent name is
+the first argument.
 
-The pre-register is best-effort: any failure (daemon down, no token, a genuinely
-live same-name session) falls back to the hook's first-turn register (today's
-behavior) and never blocks the launch. See the alias in §1.
+**The handoff (no double-register collision).** The launch register is *non-force*,
+so a genuinely-live same-name session correctly rejects it (duplicate-session
+protection intact). On success the launcher captures the registered `session_id`
+and exports it as `RELAY_LAUNCH_SESSION`. Codex's `SessionStart` hook then runs
+and **skips its own register only when that marker equals its row's current
+`session_id`** — proof *this* launch registered *this* row (never on DB-state
+alone, which could let a second terminal stamp onto the first's row). It still
+delivers the inbox nudge. `agent_pid` (the exact Codex process, for liveness) is
+stamped by the stdio MCP server on startup, so the launcher never sends a
+stand-in PID.
+
+The pre-register is best-effort and time-bounded (tight connect/read timeouts):
+any failure (daemon down/hung, no token, a live same-name session) falls back to
+the hook's first-turn register — with `host_shell_pids` — and never blocks or
+delays the launch. See the alias in §1.
 
 ## Prerequisites
 
