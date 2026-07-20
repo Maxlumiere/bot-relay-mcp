@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.16.3 — 2026-07-20 — Tether wakes Codex terminals (P0 LLM-agnostic parity)
+
+Restores the reported break — **"Tether stopped waking Codex."** It was a registration-contract gap, not wake logic. Tether binds a VS Code terminal to an agent by **PID**, host-scoped (`pid-binding.ts` needs the agent's `host_shell_pids` + a `host_id` matching this machine). The Claude hook (`check-relay.sh`) has always sent them; the Codex `SessionStart` hook sent **only** `agent_pid` — its comment (*"Tether is Claude/VSCode-only"*) was frozen from before Tether went LLM-agnostic (v0.4.0). So Tether abstained on Codex and fell back to fragile terminal-name matching, which broke when a workspace move / alias change renamed the terminal.
+
+- **Shared helpers.** `relay_machine_guid()` + `relay_pid_chain()` moved out of `hooks/check-relay.sh` into the shared `hooks/_vault-helpers.sh` (byte-identical behavior for Claude — no inline copy), so the Codex hook can report the **same** handshake.
+- **Codex handshake.** `hooks/codex/codex-session-start.sh` now sends `host_shell_pids` + `host_id` + `terminal_title_ref` on register — byte-parity with the Claude hook, so a Codex agent's `host_id` agrees with the extension reader (`extensions/vscode/src/host-identity.ts`). Tether can now PID-bind and wake Codex terminals **token-free** (the extension does the idle waiting, not the model).
+- **No poll loop.** This is a **register-only** `SessionStart` change. The token-burning `Stop`-hook keep-alive poller (which re-prompted the model every ~90s and blocked terminal input) stays **removed** — Tether does the waking; Codex spends tokens only when there is actually mail. The now-orphaned `hooks/codex/codex-stop.sh` script is deleted (zero references remained; git history retains it).
+- **Hardened `terminal_title_ref`.** The Codex hook validates the title against the server's `TERMINAL_TITLE_REF_PATTERN` allowlist (`[A-Za-z0-9_.- ]`) and drops it if it fails, so a hostile title (quote / backslash / newline / JSON fragment) can never malform the register payload — or be rejected server-side — and take the handshake down with it. The `SessionStart` context also no longer references a Stop-hook waker (it names Tether).
+- **Test.** `tests/v2-16-3-codex-tether-handshake.test.ts` drives the shipped Codex hook against a real daemon and asserts the register payload lands `host_shell_pids` + `host_id`, and that the Codex `host_id` is byte-identical to the Claude hook's (shared-helper, no drift).
+- **Doc.** `docs/agents/codex-autowake.md` rewritten to the Tether-wake model (no poll loop).
+- Ships as a hooks-only relay patch — no Tether VSIX republish (hooks travel with the npm package). Scope is P0 only; broader LLM-agnostic parity (spawn, hook generation, profile registry) is P1–P4 in `audit-findings/llm-agnostic-parity-scope-brief.md`.
+
 ## v2.16.2 — 2026-07-13 — Publish-gate fix for Node 24 / npm 11 (carries 2.16.1)
 
 A release-tooling patch: **2.16.1 never reached npm** because the pre-publish gate failed on Node 24 / npm 11, so 2.16.2 is what ships and it **carries all of 2.16.1** (stable mint-once-reuse, below) plus this fix.

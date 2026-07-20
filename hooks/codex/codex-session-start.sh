@@ -8,8 +8,11 @@
 # This is the Codex port of `hooks/check-relay.sh` (the Claude SessionStart
 # hook). It mirrors the same HTTP register_agent call and the same per-instance
 # token vault, so a Codex agent and a Claude agent on the same machine share one
-# relay identity model. The Tether PID-handshake fields are NOT sent (Tether is
-# Claude/VSCode-only); name-based addressing is all a Codex agent needs.
+# relay identity model. As of v2.16.3 it ALSO sends the Tether v0.3 PID-handshake
+# (host_shell_pids + host_id + terminal_title_ref), byte-parity with check-relay.sh,
+# so Tether can PID-bind a Codex terminal and wake it token-free — exactly like
+# Claude. (Tether went LLM-agnostic in v0.4.0; the old "Claude/VSCode-only" note
+# was frozen from before that and was the root cause of "Tether stopped waking Codex.")
 #
 # Codex hook contract (codex-cli):
 #   - stdin  : SessionStart payload JSON ({session_id, cwd, source, ...}). Read
@@ -107,7 +110,7 @@ build_caps_json() {
 # function so every code path (incl. "curl missing") funnels through it.
 emit_context_and_exit() {
   local ctx
-  ctx="You are bot-relay agent \"${AGENT_NAME}\" (role: ${AGENT_ROLE}) on a local relay at ${HTTP_HOST}:${HTTP_PORT}. Check your inbox now: call get_messages(agent_name=\"${AGENT_NAME}\", status=\"pending\") and act on anything you find. A Stop hook will keep waking you when new relay mail arrives."
+  ctx="You are bot-relay agent \"${AGENT_NAME}\" (role: ${AGENT_ROLE}) on a local relay at ${HTTP_HOST}:${HTTP_PORT}. Check your inbox now: call get_messages(agent_name=\"${AGENT_NAME}\", status=\"pending\") and act on anything you find. Tether wakes this terminal when new relay mail arrives — no polling, no idle turns."
   if command -v python3 >/dev/null 2>&1; then
     CTX="$ctx" AN="$AGENT_NAME" python3 -c '
 import json, os, sys
@@ -128,6 +131,30 @@ command -v curl >/dev/null 2>&1 || emit_context_and_exit
 
 CAPS_JSON=$(build_caps_json)
 
+# v2.16.3 — Tether v0.3 PID-handshake (shared helpers from _vault-helpers.sh).
+# Best-effort: empty / [] → the field is omitted (graceful — registration never
+# fails over the handshake, Tether falls back to name matching). Byte-parity with
+# check-relay.sh so a Codex agent's host_id agrees with the extension's reader.
+RELAY_HOST_PID_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
+[ "$RELAY_HOST_PID_CHAIN" = "[]" ] && RELAY_HOST_PID_CHAIN=""
+RELAY_HOST_GUID=$(relay_machine_guid 2>/dev/null || printf '')
+# terminal_title_ref: only sent when the launcher exports RELAY_TERMINAL_TITLE
+# (the name-match fallback path); omitted otherwise. HARDENED — validate against
+# the SAME allowlist the server enforces (TERMINAL_TITLE_REF_PATTERN in
+# src/types.ts: [A-Za-z0-9_.- ], max 100) and DROP the title if it doesn't match.
+# A hostile title (quote / backslash / newline / JSON fragment) would otherwise
+# either malform the register JSON or be rejected server-side, failing the WHOLE
+# register — taking host_shell_pids/host_id down with it (silent wake breakage).
+# Dropping it keeps the handshake landing. `[[ =~ ]]` matches the whole value
+# (newline-safe, unlike line-based grep); an allowlisted title has no JSON-special
+# chars, so the raw interpolation below is safe and byte-identical to
+# check-relay.sh for every well-formed title.
+RELAY_TERMINAL_TITLE_VALUE="${RELAY_TERMINAL_TITLE:-}"
+RELAY_TERMINAL_TITLE_RE='^[A-Za-z0-9_. -]{1,100}$'
+if [ -n "$RELAY_TERMINAL_TITLE_VALUE" ] && ! [[ "$RELAY_TERMINAL_TITLE_VALUE" =~ $RELAY_TERMINAL_TITLE_RE ]]; then
+  RELAY_TERMINAL_TITLE_VALUE=""
+fi
+
 # v2.14.1 — capture the agent's own process for presence (best-effort).
 RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
 RELAY_AGENT_PID_START=""
@@ -138,7 +165,7 @@ REG_HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, t
 
 REG_BODY=$(curl -s -m 4 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
   "${REG_HEADERS[@]}" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
   2>/dev/null)
 
 # Capture a freshly-minted token (first register only) and persist it to the
