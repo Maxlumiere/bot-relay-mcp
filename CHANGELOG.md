@@ -1,13 +1,20 @@
 # Changelog
 
-## v2.17.0 — 2026-07-20 — LLM-agnostic parity P1: `generate-hooks --codex` / `--all`
+## v2.17.0 — 2026-07-20 — LLM-agnostic parity (P1–P4)
 
-First phase of the LLM-agnostic parity arc (`audit-findings/llm-agnostic-parity-scope-brief.md`; P0 = the Codex Tether handshake + cold-start launcher, 2.16.3/2.16.4).
+The LLM-agnostic parity arc (`audit-findings/llm-agnostic-parity-scope-brief.md`; P0 = the Codex Tether handshake + cold-start launcher, 2.16.3/2.16.4). Bundled into one minor across the relay phases (P1, P3, P2); the Tether extension change (P4) ships separately as a Tether VSIX minor.
 
+**P1 — Codex hook generation.**
 - **`relay generate-hooks --codex`** — emits a `~/.codex/config.toml` fragment with a **register-only** SessionStart hook (points at `hooks/codex/codex-session-start.sh`). Reconciled to the current no-poller model: Codex wakes via Tether + `bin/codex-relay`, so there is **no Stop-hook poll loop** (the `codex-stop.sh` poller was removed in 2.16.4). The output documents the cold-start launcher + the MCP-server requirement inline.
 - **`--all`** emits both the Claude JSON and Codex TOML, each in its own labeled section. Default (no flag) and `--full` are unchanged — Claude Code, back-compat.
 - **Honest hook-model mapping** (no forced symmetry): Claude Code uses SessionStart + PostToolUse + Stop; Codex uses a single register-only SessionStart hook (its wake is Tether-driven, not a hook poll loop). PostToolUse/Stop have no Codex analog by design — documented in `--help`.
-- Tests: `tests/v2-1-cli-tooling.test.ts` (8b–8d) — `--codex` is valid register-only TOML with no Stop table / no `codex-stop.sh` command; `--all` emits both sections; `--help` documents the flags + mapping.
+- Parser-based tests (`tests/v2-1-cli-tooling.test.ts` 8b–8e): `--codex` and both `--all` payloads are TOML/JSON-parsed and asserted register-only; TOML basic-string escaping covers all control chars (round-trip regression).
+
+**P3 — CLI-profile registry (registry-first, ahead of P2 spawn).**
+- **`src/agent-cli-profiles.ts`** — one declarative registry (claude + codex; schema extensible = new CLI is one entry) carrying each CLI's `processPattern`, `hookInstall`, `launch` (consumed by P2 spawn) and `wake` (consumed by P4 Tether). The shared machine-GUID / `host_id` derivation is deliberately **not** per-profile (the federation-safety invariant).
+- **`relay cli-profiles [--json]`** — prints the registry (human summary or JSON for cross-boundary reads).
+- **Refactors** `generate-hooks` (output byte-identical) and `liveness.ts:DEFAULT_AGENT_PATTERN` to read the registry — every hardcoded `claude|codex` branch in those consumers is gone.
+- **Drift guards** (vitest + pre-publish): reject a hardcoded `(claude|codex)` alternation / id-equality branch in `src/` outside the registry; and a bash-mirror guard asserting the `_vault-helpers.sh` PID-finder pattern's CLI tokens track the registry (kept a mirror, not read on the per-hook hot path).
 
 ## v2.16.4 — 2026-07-20 — Codex cold-start launcher (autowake at pure launch)
 

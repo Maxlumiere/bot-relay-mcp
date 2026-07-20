@@ -426,6 +426,32 @@ ip_classifier_guard() {
 }
 step "ip-classifier guard (no duplicate CIDR logic)" ip_classifier_guard || exit 1
 
+# v2.17.0 P3 — CLI-profile drift guard (mirrors the CIDR guard). The agent-CLI
+# profile registry (src/agent-cli-profiles.ts) is the ONE place `claude`/`codex`
+# BRANCHING lives. This rejects a hardcoded `(claude|codex)` regex alternation or
+# an id-equality / switch-case comparison anywhere else in src/. It deliberately
+# does NOT flag prose, file paths (~/.claude/…), --flag strings, or registry
+# lookups by id. Escape hatch: `// CLI-PROFILE-ALLOWLIST: <reason>`.
+cli_profile_guard() {
+  local hits
+  hits=$(grep -rnE '\(claude\|codex\)|\(codex\|claude\)|(===|!==|==|!=|case)[[:space:]]*["'"'"'](claude|codex)["'"'"']' "$PROJECT_ROOT/src" \
+    --include='*.ts' \
+    | grep -v "/agent-cli-profiles\.ts:" \
+    | grep -v "// CLI-PROFILE-ALLOWLIST:" \
+    || true)
+  if [ -n "$hits" ]; then
+    echo "Hardcoded claude|codex CLI branching in src/ outside the profile registry:" >&2
+    echo "$hits" >&2
+    echo "" >&2
+    echo "Fix: read from src/agent-cli-profiles.ts (getAgentCliProfile / profileProcessPatternSource)." >&2
+    echo "If genuinely needed, append '// CLI-PROFILE-ALLOWLIST: <reason>' to the line." >&2
+    return 1
+  fi
+  echo "No hardcoded claude|codex branching outside src/agent-cli-profiles.ts — registry consolidated"
+  return 0
+}
+step "cli-profile guard (no hardcoded claude|codex branching)" cli_profile_guard || exit 1
+
 # --- 6. 25-tool + CLI smoke against an isolated relay (v2.1 Phase 5a) ---
 # Inline cleanup (no RETURN trap) — simpler + avoids set-u pitfalls around
 # deferred variable lookup in trap strings.

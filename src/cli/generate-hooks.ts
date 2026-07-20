@@ -21,6 +21,7 @@
  */
 import path from "path";
 import { fileURLToPath } from "url";
+import { getAgentCliProfile } from "../agent-cli-profiles.js";
 
 /**
  * Quote a shell command path for embedding in JSON's "command" field.
@@ -63,34 +64,27 @@ function resolveInstallDir(): string {
   return path.resolve(here, "..", "..");
 }
 
-/** Claude Code hook config (~/.claude/settings.json). */
+/** Claude Code hook config (~/.claude/settings.json), built from the registry. */
 function claudeHooksConfig(): { hooks: Record<string, unknown> } {
   const root = resolveInstallDir();
-  const sessionStart = path.join(root, "hooks", "check-relay.sh");
-  const postToolUse = path.join(root, "hooks", "post-tool-use-check.sh");
-  const stop = path.join(root, "hooks", "stop-check.sh");
-  return {
-    hooks: {
-      SessionStart: [
-        {
-          matcher: "startup|resume",
-          hooks: [{ type: "command", command: quoteForHookCommand(sessionStart), timeout: 10 }],
-        },
-      ],
-      PostToolUse: [
-        {
-          matcher: "*",
-          hooks: [{ type: "command", command: quoteForHookCommand(postToolUse), timeout: 5 }],
-        },
-      ],
-      Stop: [
-        {
-          matcher: "*",
-          hooks: [{ type: "command", command: quoteForHookCommand(stop), timeout: 5 }],
-        },
-      ],
-    },
-  };
+  const profile = getAgentCliProfile("claude");
+  if (!profile) throw new Error("agent-cli-profiles: 'claude' profile missing");
+  const hooks: Record<string, unknown> = {};
+  for (const ev of profile.hookInstall.events) {
+    hooks[ev.event] = [
+      {
+        matcher: ev.matcher,
+        hooks: [
+          {
+            type: "command",
+            command: quoteForHookCommand(path.join(root, ev.script)),
+            ...(ev.timeout !== undefined ? { timeout: ev.timeout } : {}),
+          },
+        ],
+      },
+    ];
+  }
+  return { hooks };
 }
 
 /**
@@ -102,9 +96,12 @@ function claudeHooksConfig(): { hooks: Record<string, unknown> } {
  */
 function codexConfigToml(): string {
   const root = resolveInstallDir();
-  const sessionStart = path.join(root, "hooks", "codex", "codex-session-start.sh");
+  const profile = getAgentCliProfile("codex");
+  if (!profile) throw new Error("agent-cli-profiles: 'codex' profile missing");
+  const ss = profile.hookInstall.events.find((e) => e.event === "SessionStart");
+  if (!ss) throw new Error("agent-cli-profiles: 'codex' profile has no SessionStart hook");
   const launcher = path.join(root, "bin", "codex-relay");
-  return [
+  const lines = [
     "# bot-relay-mcp — Codex CLI hook. Paste into ~/.codex/config.toml.",
     "#",
     "# Register-only SessionStart hook: it registers this Codex session + its Tether",
@@ -121,14 +118,15 @@ function codexConfigToml(): string {
     "# (the launcher's -c override handles it). See docs/agents/codex-autowake.md.",
     "",
     "[[hooks.SessionStart]]",
-    'matcher = "startup|resume"',
+    `matcher = ${tomlBasicString(ss.matcher)}`,
     "",
     "[[hooks.SessionStart.hooks]]",
     'type = "command"',
-    `command = ${tomlBasicString(sessionStart)}`,
-    'statusMessage = "Registering with bot-relay"',
-    "",
-  ].join("\n");
+    `command = ${tomlBasicString(path.join(root, ss.script))}`,
+  ];
+  if (ss.statusMessage) lines.push(`statusMessage = ${tomlBasicString(ss.statusMessage)}`);
+  lines.push("");
+  return lines.join("\n");
 }
 
 function windowsHookDisclaimer(): void {
