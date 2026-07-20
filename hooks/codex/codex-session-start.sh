@@ -110,7 +110,7 @@ build_caps_json() {
 # function so every code path (incl. "curl missing") funnels through it.
 emit_context_and_exit() {
   local ctx
-  ctx="You are bot-relay agent \"${AGENT_NAME}\" (role: ${AGENT_ROLE}) on a local relay at ${HTTP_HOST}:${HTTP_PORT}. Check your inbox now: call get_messages(agent_name=\"${AGENT_NAME}\", status=\"pending\") and act on anything you find. A Stop hook will keep waking you when new relay mail arrives."
+  ctx="You are bot-relay agent \"${AGENT_NAME}\" (role: ${AGENT_ROLE}) on a local relay at ${HTTP_HOST}:${HTTP_PORT}. Check your inbox now: call get_messages(agent_name=\"${AGENT_NAME}\", status=\"pending\") and act on anything you find. Tether wakes this terminal when new relay mail arrives — no polling, no idle turns."
   if command -v python3 >/dev/null 2>&1; then
     CTX="$ctx" AN="$AGENT_NAME" python3 -c '
 import json, os, sys
@@ -139,8 +139,21 @@ RELAY_HOST_PID_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
 [ "$RELAY_HOST_PID_CHAIN" = "[]" ] && RELAY_HOST_PID_CHAIN=""
 RELAY_HOST_GUID=$(relay_machine_guid 2>/dev/null || printf '')
 # terminal_title_ref: only sent when the launcher exports RELAY_TERMINAL_TITLE
-# (the name-match fallback path); omitted otherwise. Same source as check-relay.sh.
+# (the name-match fallback path); omitted otherwise. HARDENED — validate against
+# the SAME allowlist the server enforces (TERMINAL_TITLE_REF_PATTERN in
+# src/types.ts: [A-Za-z0-9_.- ], max 100) and DROP the title if it doesn't match.
+# A hostile title (quote / backslash / newline / JSON fragment) would otherwise
+# either malform the register JSON or be rejected server-side, failing the WHOLE
+# register — taking host_shell_pids/host_id down with it (silent wake breakage).
+# Dropping it keeps the handshake landing. `[[ =~ ]]` matches the whole value
+# (newline-safe, unlike line-based grep); an allowlisted title has no JSON-special
+# chars, so the raw interpolation below is safe and byte-identical to
+# check-relay.sh for every well-formed title.
 RELAY_TERMINAL_TITLE_VALUE="${RELAY_TERMINAL_TITLE:-}"
+RELAY_TERMINAL_TITLE_RE='^[A-Za-z0-9_. -]{1,100}$'
+if [ -n "$RELAY_TERMINAL_TITLE_VALUE" ] && ! [[ "$RELAY_TERMINAL_TITLE_VALUE" =~ $RELAY_TERMINAL_TITLE_RE ]]; then
+  RELAY_TERMINAL_TITLE_VALUE=""
+fi
 
 # v2.14.1 — capture the agent's own process for presence (best-effort).
 RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')

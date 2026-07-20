@@ -388,7 +388,12 @@ relay_pid_start() {
 # bind THIS terminal to THIS agent by process id (no manual naming). Both MUST
 # match the extension's TypeScript readers (extensions/vscode/src/host-identity.ts)
 # byte-for-byte — same OS source, same extraction — or the two host_ids won't
-# agree and host-scoped matching silently fails. POSIX is the real path
+# agree and host-scoped matching silently fails. For a well-formed OS machine id
+# (a 32-hex /etc/machine-id or a real IOPlatformUUID — the only case on a real
+# host) the bash strip-whitespace here and the TS 32-hex-first-line extraction
+# resolve the SAME value (exercised: tests/v2-16-3 C5, bash == TS on this host).
+# A malformed id could diverge, but that only degrades to a host-scope miss →
+# name-match fallback, never a wrong wake. POSIX is the real path
 # (macOS / Linux); the Windows (git-bash) branches mirror the documented
 # wmic/reg shapes but are not runtime-tested (no Windows host). Any failure →
 # empty output → the field is omitted from the register call (graceful: Tether

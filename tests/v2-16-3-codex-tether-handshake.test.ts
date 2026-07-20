@@ -30,9 +30,10 @@ import { describe, it, expect } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { spawn, spawnSync } from "child_process";
+import { spawn, spawnSync, execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { machineGuid as tsMachineGuid, type HostPlatform } from "../extensions/vscode/src/host-identity.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -208,4 +209,98 @@ describe("v2.16.3 P0 — Codex SessionStart hook sends the Tether PID-handshake"
       stopHarness(h);
     }
   }, 30_000);
+
+  it("(C3) a hostile terminal title is DROPPED (register still succeeds, handshake lands); a well-formed title round-trips exactly", async () => {
+    const h = await startHarness("title");
+    try {
+      // A title with a quote / backslash / newline / JSON fragment. Raw-interpolated
+      // it would malform the register JSON (or be rejected by the server's
+      // TERMINAL_TITLE_REF_PATTERN), failing the WHOLE register and taking the
+      // handshake down with it. The hook allowlists+drops it → register succeeds.
+      const hostile = 'ev"il\\t\n{"x":1}';
+      const rh = runHook(CODEX_HOOK, h, "codex-hostile-title", hostile);
+      expect(rh.status, `codex hook stderr: ${rh.stderr}`).toBe(0);
+      // Title dropped (stored NULL) — never the hostile bytes.
+      expect(sql(h.dbPath, `SELECT IFNULL(terminal_title_ref,'<NULL>') FROM agents WHERE name='codex-hostile-title';`)).toBe("<NULL>");
+      // The whole point: the PID handshake STILL landed despite the bad title.
+      expect(sql(h.dbPath, `SELECT IFNULL(host_shell_pids,'') FROM agents WHERE name='codex-hostile-title';`)).toMatch(/^\[\d+(,\d+)*\]$/);
+      const guid = machineGuid();
+      if (guid) {
+        expect(sql(h.dbPath, `SELECT IFNULL(host_id,'') FROM agents WHERE name='codex-hostile-title';`)).toBe(guid);
+      }
+
+      // A well-formed title (letters, digits, dot, space, dash — the server's
+      // allowlist) round-trips EXACTLY.
+      const good = "My Codex 5.5";
+      const rg = runHook(CODEX_HOOK, h, "codex-good-title", good);
+      expect(rg.status, `codex hook stderr: ${rg.stderr}`).toBe(0);
+      expect(sql(h.dbPath, `SELECT IFNULL(terminal_title_ref,'') FROM agents WHERE name='codex-good-title';`)).toBe(good);
+    } finally {
+      stopHarness(h);
+    }
+  }, 30_000);
+
+  it("(C4) register-only: the shipped Codex SessionStart path has no Stop-hook poller, and its injected context does not promise one", () => {
+    const src = fs.readFileSync(CODEX_HOOK, "utf-8");
+    // The removed 90s keep-alive poller must not be wired into the default path.
+    expect(src, "must not reference codex-stop.sh").not.toMatch(/codex-stop/);
+    expect(src, 'must not emit a Stop "decision: block" continuation').not.toMatch(/"decision"\s*:\s*"block"/);
+    expect(src, "no keep-alive poller vocabulary").not.toMatch(/keep waking|ping-off|keep-alive/i);
+
+    // Run with NO reachable daemon (bogus port) — the hook still emits its
+    // SessionStart additionalContext. It must describe the Tether wake, NOT a Stop hook.
+    const r = spawnSync("bash", [CODEX_HOOK], {
+      encoding: "utf-8",
+      timeout: 8000,
+      input: "",
+      env: {
+        HOME: os.tmpdir(),
+        PATH: process.env.PATH || "/usr/bin:/bin",
+        RELAY_AGENT_NAME: "codex-ctx-check",
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HTTP_PORT: "1", // nothing listening → register no-ops, context still emits
+      },
+    });
+    expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
+    expect(r.stdout, "injected context must not promise a Stop-hook waker").not.toMatch(/Stop hook/i);
+    expect(r.stdout, "injected context should describe the Tether wake").toMatch(/Tether/);
+  });
+
+  it("(C5) bash relay_machine_guid == TS host-identity.ts machineGuid on THIS machine (byte-parity, exercised not just claimed)", () => {
+    const plat: HostPlatform | null =
+      process.platform === "darwin"
+        ? "darwin"
+        : process.platform === "linux"
+          ? "linux"
+          : process.platform === "win32"
+            ? "win32"
+            : null;
+    if (!plat) {
+      // eslint-disable-next-line no-console
+      console.warn(`[C5] unsupported platform ${process.platform} — parity check skipped`);
+      return;
+    }
+    const runner = (cmd: string, args: string[]): string => {
+      try {
+        return execFileSync(cmd, args, { encoding: "utf-8" });
+      } catch {
+        return "";
+      }
+    };
+    const ts = tsMachineGuid(plat, runner) ?? "";
+    const helpers = path.join(REPO_ROOT, "hooks", "_vault-helpers.sh");
+    const bash = (
+      spawnSync("bash", ["-c", `. '${helpers}'; relay_machine_guid`], { encoding: "utf-8" }).stdout ?? ""
+    ).trim();
+    if (!ts && !bash) {
+      // eslint-disable-next-line no-console
+      console.warn("[C5] no derivable machine GUID on this host — parity holds trivially (both empty)");
+      return;
+    }
+    // The exact invariant behind the host_id claim: the bash hook and the TS
+    // extension reader derive the SAME GUID from the same OS source, so an agent's
+    // registered host_id matches what Tether computes for the terminal.
+    expect(bash).toBe(ts);
+    expect(bash.length).toBeGreaterThan(0);
+  });
 });
