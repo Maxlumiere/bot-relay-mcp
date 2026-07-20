@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.17.0 — 2026-07-20 — LLM-agnostic parity P1: `generate-hooks --codex` / `--all`
+
+First phase of the LLM-agnostic parity arc (`audit-findings/llm-agnostic-parity-scope-brief.md`; P0 = the Codex Tether handshake + cold-start launcher, 2.16.3/2.16.4).
+
+- **`relay generate-hooks --codex`** — emits a `~/.codex/config.toml` fragment with a **register-only** SessionStart hook (points at `hooks/codex/codex-session-start.sh`). Reconciled to the current no-poller model: Codex wakes via Tether + `bin/codex-relay`, so there is **no Stop-hook poll loop** (the `codex-stop.sh` poller was removed in 2.16.4). The output documents the cold-start launcher + the MCP-server requirement inline.
+- **`--all`** emits both the Claude JSON and Codex TOML, each in its own labeled section. Default (no flag) and `--full` are unchanged — Claude Code, back-compat.
+- **Honest hook-model mapping** (no forced symmetry): Claude Code uses SessionStart + PostToolUse + Stop; Codex uses a single register-only SessionStart hook (its wake is Tether-driven, not a hook poll loop). PostToolUse/Stop have no Codex analog by design — documented in `--help`.
+- Tests: `tests/v2-1-cli-tooling.test.ts` (8b–8d) — `--codex` is valid register-only TOML with no Stop table / no `codex-stop.sh` command; `--all` emits both sections; `--help` documents the flags + mapping.
+
 ## v2.16.4 — 2026-07-20 — Codex cold-start launcher (autowake at pure launch)
 
 Closes the last gap in the Codex autowake story. The P0 handshake (2.16.3) works, but Codex runs the SessionStart hook's `register_agent` at the **first turn**, not at idle launch — so a freshly-summoned Codex has no `host_shell_pids` until you take a turn, and Tether can't PID-bind it until then ("summon → nothing happens until you talk to it").

@@ -119,8 +119,11 @@ fallback. `RELAY_CODEX_LAUNCHER` overrides the launched binary (default
 
 ## 2. Add the register-only hook to `~/.codex/config.toml`
 
-Add **only** the `SessionStart` block (adjust the absolute path to wherever this
-repo lives). Codex also accepts a `hooks.json` file with the same shape.
+Generate this block for your install with **`relay generate-hooks --codex`** (it
+prints the fragment below with the absolute path filled in; `--all` prints both
+the Claude and Codex configs). Add **only** the `SessionStart` block (adjust the
+absolute path to wherever this repo lives). Codex also accepts a `hooks.json`
+file with the same shape.
 
 ```toml
 [[hooks.SessionStart]]
