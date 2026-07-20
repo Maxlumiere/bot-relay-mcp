@@ -61,10 +61,12 @@ delivers the inbox nudge. `agent_pid` (the exact Codex process, for liveness) is
 stamped by the stdio MCP server on startup, so the launcher never sends a
 stand-in PID.
 
-The pre-register is best-effort and time-bounded (tight connect/read timeouts):
-any failure (daemon down/hung, no token, a live same-name session) falls back to
-the hook's first-turn register — with `host_shell_pids` — and never blocks or
-delays the launch. The launcher also **unsets any inherited `RELAY_LAUNCH_SESSION`
+The pre-register is best-effort and **bounded-synchronous**: a tight health probe
+(`--connect-timeout 1 --max-time 1`) then the register (`--max-time 2`) — **~3s
+worst case** against a hung daemon — after which Codex `exec`s regardless. Any
+failure (daemon down/hung, no token, a live same-name session) falls back to the
+hook's first-turn register — with `host_shell_pids`. So the launch is never
+*blocked*, only briefly *bounded*. The launcher also **unsets any inherited `RELAY_LAUNCH_SESSION`
 at entry** and re-exports it only after its own successful register, so a stale or
 leaked marker can never cause the hook to skip against a row this launch didn't
 register.

@@ -32,6 +32,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import net from "net";
+import http from "http";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
@@ -344,6 +345,37 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(fs.readFileSync(envFile, "utf-8")).toContain("RELAY_LAUNCH_SESSION=<none>");
     } finally {
       hung.close();
+      stopHarness(h);
+    }
+  }, 25_000);
+
+  it("(T3) /health OK but /mcp register HANGS → wrapper exec's after the bounded register timeout, no marker", async () => {
+    const h = await startHarness("t3");
+    // A server that answers /health fast but never responds to the /mcp register.
+    const srv = http.createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end('{"status":"ok"}');
+        return;
+      }
+      // /mcp → hang (never respond) — exercises the register --max-time bound.
+    });
+    try {
+      const port = await getFreePort();
+      await new Promise<void>((r) => srv.listen(port, "127.0.0.1", () => r()));
+      const start = Date.now();
+      const { res, argvFile, envFile } = runLauncher(h, "codex-t3", {
+        port,
+        inheritedMarker: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      });
+      const elapsed = Date.now() - start;
+      expect(res.status, `stderr: ${res.stderr}`).toBe(0);
+      expect(fs.existsSync(argvFile), "launcher must exec even when /mcp hangs").toBe(true);
+      // health (fast) + register --max-time 2 → bounded, well under any unbounded path.
+      expect(elapsed, "register hang is bounded by --max-time 2").toBeLessThan(4000);
+      expect(fs.readFileSync(envFile, "utf-8")).toContain("RELAY_LAUNCH_SESSION=<none>");
+    } finally {
+      srv.close();
       stopHarness(h);
     }
   }, 25_000);
