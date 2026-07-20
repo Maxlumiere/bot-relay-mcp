@@ -35,6 +35,53 @@ Confirm signal — Tether Output channel shows a **non-empty** binding:
 The `∅/∅` fingerprint (empty host_id / host_shell_pids) means the handshake
 didn't land — check that the agent launched via a hook-enabled `~/.codex/config.toml`.
 
+## Cold-start: register at launch, not first turn (`bin/codex-relay`)
+
+The `SessionStart` hook registers the handshake, but Codex runs it at the **first
+turn**, not at pure idle launch — so a freshly-summoned, idle Codex has no
+`host_shell_pids` until you take a turn, and Tether can't bind it until then
+("summon → nothing happens until you talk to it").
+
+The **`bin/codex-relay`** launcher closes this. It pre-registers the handshake
+**from the shell**, before exec'ing Codex: because it runs as a child of the
+launching shell, its ancestry (`relay_pid_chain`) includes the VS Code
+`Terminal.processId`, so `host_shell_pids` is populated at pure launch → Tether
+binds + wakes immediately, zero manual turn. It uses the SAME shared helpers as
+the hook (no drift). It generalizes to **any** summoned Codex — the agent name is
+the first argument.
+
+**The handoff (no double-register collision).** The launch register is *non-force*,
+so a genuinely-live same-name session correctly rejects it (duplicate-session
+protection intact). On success the launcher captures the registered `session_id`
+and exports it as `RELAY_LAUNCH_SESSION`. Codex's `SessionStart` hook then runs
+and **skips its own register only when that marker equals its row's current
+`session_id`** — proof *this* launch registered *this* row (never on DB-state
+alone, which could let a second terminal stamp onto the first's row). It still
+delivers the inbox nudge. `agent_pid` (the exact Codex process, for liveness) is
+stamped by the stdio MCP server on startup, so the launcher never sends a
+stand-in PID.
+
+The pre-register is best-effort and **bounded-synchronous**: a tight health probe
+(`--connect-timeout 1 --max-time 1`) then the register (`--max-time 2`) — **~3s
+worst case** against a hung daemon — after which Codex `exec`s regardless. Any
+failure (daemon down/hung, no token, a live same-name session) falls back to the
+hook's first-turn register — with `host_shell_pids`. So the launch is never
+*blocked*, only briefly *bounded*. The launcher also **unsets any inherited `RELAY_LAUNCH_SESSION`
+at entry** and re-exports it only after its own successful register, so a stale or
+leaked marker can never cause the hook to skip against a row this launch didn't
+register.
+
+> **Trust boundary (local-trust).** The marker is the row's `session_id`, which
+> unauthenticated `discover_agents` exposes. A *hostile same-user process* could
+> read it and forge a skip. This is accepted under the relay's existing
+> local-trust model (loopback-only, gate-9): a same-user attacker already reads
+> the per-instance token vault (`0600`) and can fully act as any agent via
+> `get_messages`/`send_message`, so the marker grants no new capability. A
+> cryptographic launch-nonce was deliberately **not** added — it would be
+> gold-plating for a threat the local relay already trusts away, and could not
+> beat a token-holding same-user attacker anyway. The `session_id`-marker only has
+> to defend against *accidental* inheritance, which the entry-unset does.
+
 ## Prerequisites
 
 - `codex-cli` with the `SessionStart` lifecycle hook.
@@ -45,17 +92,30 @@ didn't land — check that the agent launched via a hook-enabled `~/.codex/confi
 - The bot-relay MCP server configured in Codex so the woken agent can call
   `get_messages` / `send_message` itself (see "Reading mail once woken" below).
 
-## 1. Set the agent identity
+## 1. Set the agent identity + launch through `bin/codex-relay`
 
 The hook reads the agent name/role from the environment (the payload Codex passes
-does not carry it). Launch Codex with these set, e.g. via a shell alias:
+does not carry it). Launch each Codex agent through the cold-start launcher, which
+sets identity, pre-registers the handshake at launch, and exec's Codex with the
+per-agent `-c` MCP identity override:
 
 ```bash
-alias codex-relay='RELAY_AGENT_NAME=codex RELAY_AGENT_ROLE=auditor codex'
+alias codex5.5='cd "/path/to/workspace" && \
+  RELAY_AGENT_NAME=codex-5-5 RELAY_AGENT_TOKEN=<token> RELAY_AGENT_ROLE=auditor \
+  RELAY_AGENT_CAPABILITIES=audit,review \
+  /path/to/bot-relay-mcp/bin/codex-relay codex-5-5'
 ```
 
-`RELAY_AGENT_NAME` is required; `RELAY_AGENT_ROLE` defaults to `user`. Optionally
-export `RELAY_TERMINAL_TITLE=<name>` so the name-match fallback also has a value.
+`RELAY_AGENT_NAME` (also the launcher's first argument) is required; `RELAY_AGENT_ROLE`
+defaults to `user`. `RELAY_AGENT_TOKEN` is used to re-register an existing agent
+(a brand-new agent's first launch registers auth-free and the launcher vaults the
+minted token). Optionally export `RELAY_TERMINAL_TITLE=<name>` for the name-match
+fallback. `RELAY_CODEX_LAUNCHER` overrides the launched binary (default
+`npx @openai/codex`).
+
+> If you launch Codex **without** `bin/codex-relay` (plain `codex`), autowake still
+> works — but only from the **first turn** (the SessionStart hook's register).
+> Summoning an idle Codex that wakes with zero manual turns requires the launcher.
 
 ## 2. Add the register-only hook to `~/.codex/config.toml`
 
