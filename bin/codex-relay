@@ -52,6 +52,23 @@ HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOOKS_DIR="$SCRIPT_DIR/../hooks"
 
+# Clear any INHERITED RELAY_LAUNCH_SESSION at entry (codex-5-5 PR#98 H1). A parent
+# process, a rapid relaunch, or an explicit env supply could otherwise leak a
+# stale / other-session marker straight through to the exec'd Codex. We re-export
+# it ONLY after THIS invocation's OWN successful register (bottom of file), so the
+# hook can never inherit a marker we did not just create — closing the accidental
+# inherited-marker corruption where a 2nd terminal's failed (collision) register
+# still let its hook skip against the live row.
+#
+# Threat-model note (local-trust, Option A): the marker is the row's session_id,
+# which unauthenticated discover_agents exposes. An ADVERSARIAL same-user process
+# could read + supply it directly (bypassing this wrapper) to forge a skip. That is
+# accepted under the relay's existing local-trust boundary — a same-user attacker
+# already reads the per-instance token vault (0600) and can fully act as the agent
+# via get_messages/send_message, so the marker adds no new exposure. See
+# docs/agents/codex-autowake.md.
+unset RELAY_LAUNCH_SESSION
+
 # Set by register_at_launch on success → exported to Codex as the handoff marker.
 RELAY_LAUNCH_SESSION_MARKER=""
 

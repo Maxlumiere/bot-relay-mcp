@@ -132,7 +132,7 @@ async function registerViaHttp(
 function runLauncher(
   h: Harness,
   name: string,
-  opts: { title?: string; extraArgs?: string[]; token?: string; port?: number } = {},
+  opts: { title?: string; extraArgs?: string[]; token?: string; port?: number; inheritedMarker?: string } = {},
 ): { res: ReturnType<typeof spawnSync>; argvFile: string; envFile: string } {
   const argvFile = path.join(h.root, `argv-${name}.txt`);
   const envFile = path.join(h.root, `env-${name}.txt`);
@@ -154,6 +154,9 @@ function runLauncher(
   };
   if (opts.title !== undefined) env.RELAY_TERMINAL_TITLE = opts.title;
   if (opts.token) env.RELAY_AGENT_TOKEN = opts.token;
+  // An inherited/leaked marker in the wrapper's own env — the wrapper must clear
+  // it at entry and only re-export on its OWN successful register.
+  if (opts.inheritedMarker !== undefined) env.RELAY_LAUNCH_SESSION = opts.inheritedMarker;
   const res = spawnSync("bash", [LAUNCHER, name, ...(opts.extraArgs ?? [])], {
     encoding: "utf-8",
     timeout: 15_000,
@@ -276,13 +279,41 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
     }
   }, 25_000);
 
-  it("(T1) daemon DOWN → wrapper still exec's Codex promptly, no marker exported", async () => {
+  it("(H5) inherited/supplied marker is CLEARED on a failed LIVE-collision register (no cross-terminal skip)", async () => {
+    const h = await startHarness("h5");
+    try {
+      const name = "codex-h5";
+      const { token, session_id } = await registerViaHttp(h.port, name, { host_shell_pids: [7, 8], host_id: "G" });
+      // Fresh, actively-held session → a non-force re-register collides (the real
+      // duplicate-LIVE case; NOT an aged-out stale row).
+      sql(h.dbPath, `UPDATE agents SET agent_status='idle', last_seen='${new Date().toISOString()}' WHERE name='${name}';`);
+      // A 2nd launch INHERITS the live session id as a marker + has the token; its
+      // non-force register collides. The wrapper must have UNSET the inherited marker
+      // at entry, so the exec'd Codex gets NO marker → its hook won't skip the live row.
+      const { envFile } = runLauncher(h, name, { token, inheritedMarker: session_id! });
+      expect(
+        fs.readFileSync(envFile, "utf-8"),
+        "inherited marker must be cleared when this launch's register fails",
+      ).toContain("RELAY_LAUNCH_SESSION=<none>");
+      // The live row was NOT clobbered by the (correctly-rejected) non-force register.
+      expect(sid(h, name)).toBe(session_id);
+    } finally {
+      stopHarness(h);
+    }
+  }, 25_000);
+
+  it("(T1) daemon DOWN → wrapper still exec's Codex promptly, inherited marker cleared, none exported", async () => {
     const h = await startHarness("t1");
     try {
       const deadPort = await getFreePort(); // nothing listening
       const name = "codex-t1";
       const start = Date.now();
-      const { res, argvFile, envFile } = runLauncher(h, name, { port: deadPort });
+      // Seed an inherited marker: the wrapper must clear it even when the daemon is
+      // down (register skipped early) — never leak it to Codex.
+      const { res, argvFile, envFile } = runLauncher(h, name, {
+        port: deadPort,
+        inheritedMarker: "11111111-2222-3333-4444-555555555555",
+      });
       const elapsed = Date.now() - start;
       expect(res.status, `stderr: ${res.stderr}`).toBe(0);
       expect(fs.existsSync(argvFile), "launcher must still exec when the daemon is down").toBe(true);
@@ -301,7 +332,10 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       await new Promise<void>((r) => hung.listen(hungPort, "127.0.0.1", () => r()));
       const name = "codex-t2";
       const start = Date.now();
-      const { res, argvFile, envFile } = runLauncher(h, name, { port: hungPort });
+      const { res, argvFile, envFile } = runLauncher(h, name, {
+        port: hungPort,
+        inheritedMarker: "99999999-8888-7777-6666-555555555555",
+      });
       const elapsed = Date.now() - start;
       expect(res.status, `stderr: ${res.stderr}`).toBe(0);
       expect(fs.existsSync(argvFile), "launcher must still exec against a hung daemon").toBe(true);

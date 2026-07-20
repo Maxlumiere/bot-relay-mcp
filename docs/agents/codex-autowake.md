@@ -64,7 +64,21 @@ stand-in PID.
 The pre-register is best-effort and time-bounded (tight connect/read timeouts):
 any failure (daemon down/hung, no token, a live same-name session) falls back to
 the hook's first-turn register — with `host_shell_pids` — and never blocks or
-delays the launch. See the alias in §1.
+delays the launch. The launcher also **unsets any inherited `RELAY_LAUNCH_SESSION`
+at entry** and re-exports it only after its own successful register, so a stale or
+leaked marker can never cause the hook to skip against a row this launch didn't
+register.
+
+> **Trust boundary (local-trust).** The marker is the row's `session_id`, which
+> unauthenticated `discover_agents` exposes. A *hostile same-user process* could
+> read it and forge a skip. This is accepted under the relay's existing
+> local-trust model (loopback-only, gate-9): a same-user attacker already reads
+> the per-instance token vault (`0600`) and can fully act as any agent via
+> `get_messages`/`send_message`, so the marker grants no new capability. A
+> cryptographic launch-nonce was deliberately **not** added — it would be
+> gold-plating for a threat the local relay already trusts away, and could not
+> beat a token-holding same-user attacker anyway. The `session_id`-marker only has
+> to defend against *accidental* inheritance, which the entry-unset does.
 
 ## Prerequisites
 
