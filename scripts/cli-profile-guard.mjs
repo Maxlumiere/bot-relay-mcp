@@ -25,6 +25,15 @@
  * registry lookups by id (`getAgentCliProfile("codex")`) — none of those are a
  * branch. Per the codex + victra gate: stay TARGETED, no blanket-literal guard.
  *
+ * THREAT MODEL (deliberate, Victra-ratified scope boundary): this is a dev-time
+ * hygiene guard against ACCIDENTAL drift, not a security sandbox. It resolves
+ * string + no-substitution-template literals (devs realistically write both).
+ * It does NOT constant-fold arbitrary expressions — e.g. `id === ("co"+"dex")`
+ * or `new RegExp("claude"+"|"+"codex")` are adversarial obfuscation, not
+ * accidental drift, and anyone splitting strings to evade the guard would just
+ * add the allowlist comment anyway. For any intentional exception, use
+ * `// CLI-PROFILE-ALLOWLIST: <reason>` on the offending line.
+ *
  * Escape hatch: put `// CLI-PROFILE-ALLOWLIST: <reason>` on the offending line.
  *
  * Usage:   node scripts/cli-profile-guard.mjs <dir> [<dir> ...]
@@ -44,6 +53,10 @@ const EQ_OPS = new Set([
 const EXCLUDE_BASENAME = new Set(["agent-cli-profiles.ts"]);
 const ALLOW_MARK = "CLI-PROFILE-ALLOWLIST:";
 
+// A CLI-id LITERAL operand: a string literal OR a no-substitution template
+// literal (`codex`) whose value is a CLI id. Template literals are resolved the
+// same as strings because devs realistically write them; arbitrary expressions
+// are NOT constant-folded (see the threat-model note at the top of this file).
 function isCliIdLiteral(node) {
   return (
     !!node &&
@@ -52,12 +65,16 @@ function isCliIdLiteral(node) {
   );
 }
 
-// A regex source that alternates the CLI ids mentions BOTH — this catches the
-// capturing/noncapturing/bare alternation forms and interleaved variants
-// (claude|foo|codex) without whack-a-mole over paren syntax. A single-id regex
-// (/^codex-/) is NOT a claude-vs-codex branch and stays out of scope.
-function regexMentionsBothIds(text) {
-  return text.includes("claude") && text.includes("codex");
+// A regex source ALTERNATES the CLI ids iff each id is pipe-adjacent (`id|` or
+// `|id`) — i.e. an actual alternation branch, not mere co-occurrence. This
+// flags capturing / noncapturing / bare / interleaved (claude|foo|codex) forms
+// but SPARES a sequence like /claude.*codex/ (no `|` between the ids) and a
+// single-id regex /^codex-/. Escaped pairs (incl. a literal \|) are stripped
+// first so they don't count as an alternation operator.
+function isCliRegexAlternation(source) {
+  const cleaned = source.replace(/\\./g, "");
+  const participates = (id) => cleaned.includes(id + "|") || cleaned.includes("|" + id);
+  return participates("claude") && participates("codex");
 }
 
 function scanFile(file, violations) {
@@ -86,11 +103,12 @@ function scanFile(file, violations) {
     if (ts.isCaseClause(node) && isCliIdLiteral(node.expression)) {
       report(node, "cli-id switch/case");
     }
-    // 3a. regex literal alternating the CLI ids
-    if (ts.isRegularExpressionLiteral(node) && regexMentionsBothIds(node.text)) {
+    // 3a. regex literal alternating the CLI ids (actual `|` branch, not a sequence)
+    if (ts.isRegularExpressionLiteral(node) && isCliRegexAlternation(node.text)) {
       report(node, "cli-id regex alternation");
     }
-    // 3b. new RegExp("<…claude…codex…>") — string-literal arg alternating the ids
+    // 3b. new RegExp("claude|codex") / new RegExp(`claude|codex`) — a string or
+    // no-substitution-template arg that alternates the ids
     if (
       ts.isNewExpression(node) &&
       ts.isIdentifier(node.expression) &&
@@ -101,7 +119,7 @@ function scanFile(file, violations) {
       const arg = node.arguments[0];
       if (
         (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg)) &&
-        regexMentionsBothIds(arg.text)
+        isCliRegexAlternation(arg.text)
       ) {
         report(node, "cli-id RegExp() alternation");
       }

@@ -103,15 +103,18 @@ describe("v2.17.0 P3 — agent-cli-profiles registry", () => {
     // alternation) PLUS switch/case and the RegExp() constructor.
     const DANGEROUS: Record<string, string> = {
       "eq-right.ts": 'export const f = (id: string) => id === "codex";',
-      "eq-left-reversed.ts": 'export const f = (id: string) => "codex" === id;',
+      "eq-left-reversed.ts": 'export const f = (id: string) => "codex" === id;', // codex bypass #1
+      "eq-template.ts": "export const f = (id: string) => id === `codex`;", // no-substitution template
       "neq-right.ts": 'export const f = (id: string) => id !== "claude";',
       "neq-left-reversed.ts": 'export const f = (id: string) => "claude" !== id;',
       "switch-case.ts": 'export function f(x: string){ switch(x){ case "codex": return 1; default: return 0; } }',
-      "regex-bare.ts": "export const f = (id: string) => /claude|codex/.test(id);",
-      "regex-noncapturing.ts": "export const r = /(?:claude|codex)/;",
+      "regex-bare.ts": "export const f = (id: string) => /claude|codex/.test(id);", // codex bypass #2
+      "regex-noncapturing.ts": "export const r = /(?:claude|codex)/;", // codex bypass #3
       "regex-capturing.ts": "export const r = /(claude|codex)/i;",
       "regex-reversed.ts": "export const r = /(codex|claude)/;",
+      "regex-interleaved.ts": "export const r = /claude|foo|codex/;",
       "regexp-ctor.ts": 'export const r = new RegExp("^(claude|codex)$");',
+      "regexp-ctor-template.ts": "export const r = new RegExp(`claude|codex`);", // template RegExp arg
     };
 
     // 1) All dangerous forms fire — assert each fixture basename shows up in the
@@ -143,6 +146,18 @@ describe("v2.17.0 P3 — agent-cli-profiles registry", () => {
           "// choose claude or codex from config", // prose
           'export const flags = ["--codex-mode"];', // flag token
           "export const single = /^codex-/;", // single-id regex (not a branch)
+          "export const seq = /claude.*codex/;", // codex P2 FP: a SEQUENCE, no `|` — must be spared
+        ].join("\n") + "\n",
+      );
+      // Declined-by-design boundary (Victra-ratified threat model): string
+      // CONCATENATION that statically evaluates to a CLI id / alternation is
+      // adversarial obfuscation, not accidental drift — deliberately NOT
+      // flagged. Asserting it here documents the boundary as a tested decision.
+      fs.writeFileSync(
+        path.join(cleanDir, "declined-obfuscation.ts"),
+        [
+          'export const a = (id: string) => id === ("co" + "dex");',
+          'export const r = new RegExp("claude" + "|" + "codex");',
         ].join("\n") + "\n",
       );
       fs.writeFileSync(
