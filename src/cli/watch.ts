@@ -1,0 +1,246 @@
+// bot-relay-mcp
+// Copyright (c) 2026 Lumiere Ventures
+// SPDX-License-Identifier: MIT
+// See LICENSE for full terms.
+
+/**
+ * v2.18.0 — Sentinel: `relay watch <agent>` subcommand.
+ *
+ * Surface-agnostic autowake for terminal agents NOT in VS Code/Tether (iTerm2
+ * personas, plain terminals, remote sessions). The poll/marker-based counterpart
+ * to Tether's push-based wake: it stands watch over an agent's inbox and emits a
+ * wake SIGNAL (a stdout line a harness Monitor consumes) when new mail lands.
+ *
+ * Design (spec-gated to fork A — in-process, local-trust):
+ *   - Consumes the SANCTIONED cheap primitive `peekMailboxVersion` in-process
+ *     (a single indexed COUNT query — NOT a raw sqlite scan loop). The wake
+ *     signal is `total_unread_count` rising (last_seq is unreliable before the
+ *     recipient's first observation — v2.3.0 Codex HIGH #2).
+ *   - Event-driven when `RELAY_FILESYSTEM_MARKERS=1`: waits on the delivery
+ *     marker (~/.bot-relay/marker/<agent>.touch, written by the daemon on every
+ *     delivery) via fs.watch — near-zero idle cost — with a slow fallback
+ *     re-check so a DROPPED fs.watch event is never a silent permanent miss
+ *     (the marker is a HINT, not a queue). Falls back to bounded polling when
+ *     markers are off.
+ *   - Local-trust auth (filesystem authority, like `mint-token` / `recover`):
+ *     the operator's read access to the per-instance DB IS the authority; no
+ *     token. `--remote` (token via /mcp) is a documented forward-compat flag,
+ *     NOT built here (YAGNI).
+ *
+ * INSTANCE-DB TRAP (hard requirement): the in-process read MUST resolve the
+ * ACTIVE per-instance DB (~/.bot-relay/instances/<id>/relay.db), the SAME path
+ * the daemon writes — NOT the legacy ~/.bot-relay/relay.db. Reading the wrong
+ * path watches a dead DB and never sees mail (the stdio-legacy-DB-split bug).
+ * We set RELAY_DB_PATH from resolveInstanceDbPath() exactly as the daemon does.
+ */
+import fs from "fs";
+import path from "path";
+
+interface Args {
+  agent: string | null;
+  intervalMs: number;
+  once: boolean;
+  json: boolean;
+  help: boolean;
+}
+
+function parseArgs(argv: string[]): Args {
+  const out: Args = { agent: null, intervalMs: 3000, once: false, json: false, help: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") out.help = true;
+    else if (a === "--once") out.once = true;
+    else if (a === "--json") out.json = true;
+    else if (a === "--interval") {
+      const v = argv[++i];
+      const secs = Number(v);
+      if (!v || !Number.isFinite(secs) || secs < 1) throw new Error("--interval requires seconds >= 1");
+      out.intervalMs = Math.round(secs * 1000);
+    } else if (a.startsWith("-")) {
+      throw new Error(`unknown flag: ${a}`);
+    } else if (!out.agent) {
+      out.agent = a;
+    } else {
+      throw new Error(`unexpected argument: ${a}`);
+    }
+  }
+  return out;
+}
+
+function usage(): void {
+  process.stdout.write(
+    "Usage: relay watch <agent> [--interval SECONDS] [--once] [--json]\n\n" +
+      "Sentinel — autowake for a terminal agent NOT in VS Code/Tether. Watches\n" +
+      "<agent>'s inbox and prints a wake line when new mail arrives, so a harness\n" +
+      "Monitor (or you) can nudge the agent to read it. Event-driven when\n" +
+      "RELAY_FILESYSTEM_MARKERS=1 (near-zero idle cost); bounded polling otherwise.\n\n" +
+      "  <agent>            Agent name to watch (its own inbox).\n" +
+      "  --interval SECONDS Poll cadence when markers are off (default 3; the\n" +
+      "                     marker path is event-driven regardless).\n" +
+      "  --once             Check once and exit (0). For scripts / smoke tests.\n" +
+      "  --json             Emit each wake as a JSON line (machine-consumable).\n" +
+      "  --help             Show this message.\n\n" +
+      "Auth: local-trust — reads the ACTIVE per-instance relay DB directly\n" +
+      "(operator filesystem authority, like `relay mint-token`). Runs until Ctrl-C.\n"
+  );
+}
+
+/** Emit the wake signal: a single stdout line a harness Monitor can consume. */
+function emitWake(
+  agent: string,
+  snap: { total_unread_count: number; epoch: string; last_seq: number },
+  previousUnread: number,
+  json: boolean,
+): void {
+  if (json) {
+    process.stdout.write(
+      JSON.stringify({
+        event: "wake",
+        agent,
+        total_unread_count: snap.total_unread_count,
+        previous_unread: previousUnread,
+        epoch: snap.epoch,
+        at: new Date().toISOString(),
+      }) + "\n",
+    );
+  } else {
+    process.stdout.write(
+      `[sentinel] ${agent}: ${snap.total_unread_count} unread (was ${previousUnread}) — check your inbox\n`,
+    );
+  }
+}
+
+export async function run(argv: string[]): Promise<number> {
+  let args: Args;
+  try {
+    args = parseArgs(argv);
+  } catch (err) {
+    process.stderr.write(`relay watch: ${err instanceof Error ? err.message : String(err)}\n\n`);
+    usage();
+    return 1;
+  }
+  if (args.help) {
+    usage();
+    return 0;
+  }
+  if (!args.agent) {
+    process.stderr.write("relay watch: missing <agent> (the agent whose inbox to watch)\n");
+    return 1;
+  }
+  const agent = args.agent;
+
+  // INSTANCE-DB TRAP: resolve the ACTIVE per-instance DB, exactly as the daemon
+  // does — never the legacy ~/.bot-relay/relay.db. The marker the daemon writes
+  // (~/.bot-relay/marker/<agent>.touch) and this DB then describe the same live
+  // instance.
+  try {
+    const { resolveInstanceDbPath } = await import("../instance.js");
+    if (!process.env.RELAY_DB_PATH) process.env.RELAY_DB_PATH = resolveInstanceDbPath();
+  } catch {
+    /* fall back to db.ts default resolution */
+  }
+
+  const { initializeDb, peekMailboxVersion, closeDb } = await import("../db.js");
+  await initializeDb();
+  const { markersEnabled, markerPath } = await import("../filesystem-marker.js");
+
+  let prevUnread: number | null = null;
+  let prevEpoch: string | null = null;
+
+  const check = (): void => {
+    let snap: { total_unread_count: number; epoch: string; last_seq: number };
+    try {
+      snap = peekMailboxVersion(agent);
+    } catch {
+      return; // transient read error — a later signal/tick retries (never fatal)
+    }
+    // Epoch change (DB backup/restore) → the cached baseline is incomparable;
+    // reset it so we don't miss or double-fire (v2.3.0 epoch semantics).
+    if (prevEpoch !== null && snap.epoch !== prevEpoch) prevUnread = null;
+    prevEpoch = snap.epoch;
+
+    const unread = snap.total_unread_count;
+    if (prevUnread === null) {
+      // First observation: set the baseline. If there is ALREADY pending mail
+      // (the "register → start your watch" flow), surface it once.
+      if (unread > 0) emitWake(agent, snap, 0, args.json);
+    } else if (unread > prevUnread) {
+      emitWake(agent, snap, prevUnread, args.json);
+    }
+    prevUnread = unread;
+  };
+
+  if (args.once) {
+    check();
+    try {
+      closeDb();
+    } catch {
+      /* ignore */
+    }
+    return 0;
+  }
+
+  // --- Continuous watch. Bounded, no busy-spin. Runs until SIGINT/SIGTERM. ---
+  let timer: NodeJS.Timeout | null = null;
+  let watcher: fs.FSWatcher | null = null;
+  const stop = (): void => {
+    if (timer) clearInterval(timer);
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      closeDb();
+    } catch {
+      /* ignore */
+    }
+  };
+  const onSignal = (): void => {
+    stop();
+    process.exit(0);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+
+  check(); // baseline / surface existing mail
+
+  if (markersEnabled()) {
+    // Event-driven: watch the marker's DIRECTORY (the file may not exist until
+    // the first delivery) and re-check on any touch of <agent>.touch. A slow
+    // fallback tick recovers dropped fs.watch events — the marker is a HINT, so
+    // a missed event must never be a silent permanent miss.
+    const mp = markerPath(agent);
+    if (mp) {
+      const dir = path.dirname(mp);
+      const base = path.basename(mp);
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+      } catch {
+        /* best-effort */
+      }
+      try {
+        watcher = fs.watch(dir, (_event, filename) => {
+          if (!filename || filename === base) check();
+        });
+      } catch {
+        /* fs.watch unsupported here → interval-only below still covers it */
+      }
+    }
+    const FALLBACK_MS = 30_000; // marker-miss safety net
+    timer = setInterval(check, FALLBACK_MS);
+  } else {
+    // No markers → bounded polling of the cheap primitive.
+    timer = setInterval(check, args.intervalMs);
+  }
+
+  process.stderr.write(
+    `[sentinel] watching "${agent}"${markersEnabled() ? " (event-driven; markers on)" : ` (polling every ${Math.round(args.intervalMs / 1000)}s)`} — Ctrl-C to stop.\n`,
+  );
+
+  // Hold the process open (the timer + watcher keep the event loop alive) until
+  // a signal calls process.exit. This promise never resolves by design.
+  return await new Promise<number>(() => {});
+}
