@@ -2,7 +2,7 @@
   "name": "bot-relay-tether",
   "displayName": "Tether for bot-relay-mcp",
   "description": "Local IDE awareness for bot-relay-mcp: subscribes to your agent's inbox over MCP, surfaces pending mail in the status bar, and (optionally) auto-types `inbox` into the integrated terminal so Claude Code wakes up when something arrives.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "lumiere-ventures",
   "engines": {
     "vscode": "^1.85.0"
