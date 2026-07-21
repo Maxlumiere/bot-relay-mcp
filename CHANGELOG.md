@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.17.1 — 2026-07-21 — WakeSpec reconciliation + transient-send retro quick wins
+
+Fast relay patch. Corrects the 2.17.0 interim WakeSpec placeholders to the Tether extension's **proven** wake behavior (so the data-driven Tether 0.6.0 reads real values), plus three one-line-send DX wins from the transient-send retro.
+
+- **WakeSpec reconciled** (`src/agent-cli-profiles.ts`): codex `wakeText` is now **byte-identical** to the extension's `DEFAULT_CODEX_WAKE_TEXT` (kept in sync by a drift-guard test that reads the extension source), `submitMethod: "sendSequence"` + a new **`submitDelayMs: 150`** match the tuned `codexAdapter`, and claude wakes by typing `inbox` inline (`sendText`, 0 ms). The interim-placeholder marker is **removed** — these are the real values now.
+- **`relay send <to> <content>`** — one-line send. Resolves the sender's token (`$RELAY_AGENT_TOKEN` → per-instance vault → `--mint-if-missing`) and POSTs `/api/send-message`; `--from NAME` sets the sender (default `$RELAY_AGENT_NAME`). **Never sends unauthenticated** — it sends `from_agent_token`, so the relay's impersonation gate still applies, and it refuses (exit 2) when no token can be resolved (rather than a silent unauth send).
+- **`mint-token --json`** verified to emit **only** JSON on stdout (the daemon advisory + init logs already go to stderr); locked with a regression test.
+- **`/api/send-message` accepts `message` as an alias for `content`** — one send vocabulary across the MCP `send_message` tool, the agent-team `SendMessage`, and the HTTP endpoint. Exactly one is required; sending **both with different values is rejected** (no silent precedence).
+
 ## v2.17.0 — 2026-07-20 — LLM-agnostic parity (P1–P4)
 
 The LLM-agnostic parity arc (`audit-findings/llm-agnostic-parity-scope-brief.md`; P0 = the Codex Tether handshake + cold-start launcher, 2.16.3/2.16.4). Bundled into one minor across the relay phases (P1, P3, P2); the Tether extension change (P4) ships separately as a Tether VSIX minor.
