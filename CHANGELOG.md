@@ -4,6 +4,8 @@
 
 The LLM-agnostic parity arc (`audit-findings/llm-agnostic-parity-scope-brief.md`; P0 = the Codex Tether handshake + cold-start launcher, 2.16.3/2.16.4). Bundled into one minor across the relay phases (P1, P3, P2); the Tether extension change (P4) ships separately as a Tether VSIX minor.
 
+> **Interim data note (honest scope).** The profile registry's `wake` values (`src/agent-cli-profiles.ts`) are **interim placeholders** in 2.17.0 — populated in P3 to freeze the shape. **No shipped relay code consumes them** (Tether 0.5.0 does not read the registry), so this is documented-interim data, not silent-wrong data. They are reconciled to the extension's proven wake behavior (tuned codex `wakeText` + 150 ms submit delay + correct `submitMethod`) in **2.17.1**, and the data-driven Tether **0.6.0** reads only the corrected registry.
+
 **P1 — Codex hook generation.**
 - **`relay generate-hooks --codex`** — emits a `~/.codex/config.toml` fragment with a **register-only** SessionStart hook (points at `hooks/codex/codex-session-start.sh`). Reconciled to the current no-poller model: Codex wakes via Tether + `bin/codex-relay`, so there is **no Stop-hook poll loop** (the `codex-stop.sh` poller was removed in 2.16.4). The output documents the cold-start launcher + the MCP-server requirement inline.
 - **`--all`** emits both the Claude JSON and Codex TOML, each in its own labeled section. Default (no flag) and `--full` are unchanged — Claude Code, back-compat.
