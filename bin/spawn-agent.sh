@@ -310,7 +310,60 @@ case "$EFFORT" in
 esac
 Q_EFFORT=$(printf '%q' "$EFFORT")
 
-if [ "${RELAY_SPAWN_NO_KICKSTART:-}" = "1" ]; then
+# v2.17.0 (P2 — LLM-agnostic spawn): launcher-strategy CLIs. When the TS driver
+# (resolving the profile registry) sets RELAY_SPAWN_LAUNCHER, the spawned
+# terminal runs that repo launcher instead of `claude`. The launcher (e.g.
+# bin/codex-relay) pre-registers the relay handshake (host_shell_pids) FROM THE
+# LAUNCHED SHELL, then execs the CLI — the 2.16.4 cold-start property for a
+# SPAWNED agent. Everything above (name/role/caps/cwd allowlist + control-char +
+# symlink-root defense, osascript escaping, vault hydration, manifest, terminal
+# detection) is CLI-AGNOSTIC and reused verbatim. There is deliberately NO CLI
+# literal here — the branch is on launcher-PRESENCE, so a future launcher-CLI
+# needs zero change to this script.
+#
+# Defense-in-depth on RELAY_SPAWN_LAUNCHER (the driver already resolved it from
+# the TRUSTED registry; this still validates it, mirroring the cwd hardening):
+# absolute, no control chars, no shell metacharacters, resolves to a regular
+# executable file WITHIN this script's own bin/ directory.
+if [ -n "${RELAY_SPAWN_LAUNCHER:-}" ]; then
+  LAUNCHER="$RELAY_SPAWN_LAUNCHER"
+  case "$LAUNCHER" in
+    /*) ;;
+    *) echo "[spawn-agent] RELAY_SPAWN_LAUNCHER must be an absolute path. Got: $LAUNCHER" >&2; exit 2 ;;
+  esac
+  if [ "${#LAUNCHER}" -gt 1024 ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER exceeds 1024 chars" >&2; exit 2
+  fi
+  launcher_stripped=$(printf '%s' "$LAUNCHER" | tr -d '\n\r\t\0')
+  if [ "${#launcher_stripped}" -ne "${#LAUNCHER}" ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER contains a newline, carriage return, tab, or null byte" >&2; exit 2
+  fi
+  case "$LAUNCHER" in
+    *[\`\;\$\&\|\<\>\"\'\*\?]*)
+      echo "[spawn-agent] RELAY_SPAWN_LAUNCHER contains disallowed shell metacharacters" >&2; exit 2 ;;
+  esac
+  # `|| true` keeps a failed cd (e.g. the launcher's parent dir does not exist)
+  # from tripping `set -e` mid-assignment — we want the explicit exit-2 below
+  # with a helpful message, not a bare set -e exit 1.
+  BIN_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P 2>/dev/null || true)"
+  LAUNCHER_DIR="$(cd "$(dirname "$LAUNCHER")" 2>/dev/null && pwd -P 2>/dev/null || true)"
+  if [ -z "$BIN_DIR" ] || [ -z "$LAUNCHER_DIR" ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER path could not be resolved (missing dir?): $LAUNCHER" >&2; exit 2
+  fi
+  LAUNCHER_RESOLVED="$LAUNCHER_DIR/$(basename "$LAUNCHER")"
+  case "$LAUNCHER_RESOLVED" in
+    "$BIN_DIR"/*) ;;
+    *) echo "[spawn-agent] RELAY_SPAWN_LAUNCHER '$LAUNCHER' resolves outside the repo bin/ ($BIN_DIR)" >&2; exit 2 ;;
+  esac
+  if [ ! -x "$LAUNCHER_RESOLVED" ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER is not an executable file: $LAUNCHER_RESOLVED" >&2; exit 2
+  fi
+  Q_LAUNCHER=$(printf '%q' "$LAUNCHER")
+  # The launcher self-configures identity/handshake and takes the agent name as
+  # its first arg (codex-relay <name>). No claude --permission-mode/--effort/
+  # kickstart — those are Claude-specific; the launcher CLI wakes via Tether.
+  CMD="$CMD cd $Q_CWD; $Q_LAUNCHER $Q_NAME"
+elif [ "${RELAY_SPAWN_NO_KICKSTART:-}" = "1" ]; then
   CMD="$CMD cd $Q_CWD; claude --permission-mode $Q_PERM --effort $Q_EFFORT --name $Q_DISPLAY"
 else
   # v2.7.4 — default kickstart MUST stay apostrophe-free (defense-in-depth

@@ -52,6 +52,20 @@ export interface HookInstall {
 
 /** How LLM-agnostic spawn (P2) builds the launch command. Consumed in P2. */
 export interface LaunchSpec {
+  /**
+   * How the spawn driver invokes this CLI (P2):
+   *  - "binary":   run `binary` directly with `flags` + a positional kickstart
+   *                (Claude Code — the historical spawn path, unchanged).
+   *  - "launcher": run `launcherScript` (a repo-relative POSIX launcher) that
+   *                self-configures the agent's identity + relay handshake, then
+   *                execs the CLI (Codex → bin/codex-relay: the cold-start
+   *                host_shell_pids handshake AT LAUNCH, per 2.16.4). Driven
+   *                generically by the driver — no per-CLI branch.
+   */
+  strategy: "binary" | "launcher";
+  /** For strategy "launcher": repo-relative launcher path (resolved to absolute
+   *  by the driver). null for "binary". */
+  launcherScript: string | null;
   /** How a positional startup prompt is passed, or null if the CLI takes it bare. */
   kickstartArg: string | null;
   /** Permission / effort / title flag names the spawn driver fills. */
@@ -110,6 +124,8 @@ const CLAUDE: AgentCliProfile = {
     ],
   },
   launch: {
+    strategy: "binary", // run `claude` directly (the historical spawn path).
+    launcherScript: null,
     kickstartArg: null, // Claude takes the startup prompt as a bare positional arg.
     flags: ["--permission-mode", "--effort", "--name"],
     titleFlag: "--name",
@@ -142,9 +158,14 @@ const CODEX: AgentCliProfile = {
     ],
   },
   launch: {
+    // Codex launches via bin/codex-relay — it pre-registers the Tether PID
+    // handshake (host_shell_pids) FROM THE SHELL before exec'ing codex with the
+    // `-c` MCP identity override, so a SPAWNED codex is Tether-bindable at pure
+    // launch (the 2.16.4 cold-start property). The spawn driver runs the
+    // launcher generically off `strategy`; no per-CLI branch.
+    strategy: "launcher",
+    launcherScript: "bin/codex-relay",
     kickstartArg: null,
-    // The cold-start launcher (bin/codex-relay) + the `-c` MCP identity override
-    // are the Codex launch path; P2 wires this through the spawn driver.
     flags: ["-c"],
     titleFlag: null,
   },
