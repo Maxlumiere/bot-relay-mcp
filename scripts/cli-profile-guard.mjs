@@ -36,6 +36,22 @@
  *
  * Escape hatch: put `// CLI-PROFILE-ALLOWLIST: <reason>` on the offending line.
  *
+ * ── ACCEPTANCE CRITERIA (Victra's scope decision — this guard is FROZEN) ──────
+ * This guard is COMPLETE when all three hold; it is not iterated further:
+ *   • MUST catch the COMMON accidental-drift forms: id-equality on either
+ *     operand (string OR no-substitution-template literal), switch/case on an
+ *     id, and regex alternation of the EXACT CLI-id tokens (capturing /
+ *     noncapturing / bare).
+ *   • MUST NOT false-positive on REALISTIC code: /claude.*codex/ (sequence),
+ *     /claude|codexish/ (longer alternative), ~/.claude paths,
+ *     getAgentCliProfile("codex") lookups, "Codex CLI" display strings,
+ *     /^codex-/ single-id regex, prose.
+ *   • OUT OF SCOPE, non-blocking BY DESIGN: adversarial obfuscation (constant
+ *     concatenation, dynamically-built patterns) and exotic constructions no
+ *     dev writes by accident. `// CLI-PROFILE-ALLOWLIST:` covers intentional
+ *     exceptions. An exotic-only / adversarial-only finding is a documented
+ *     note, NOT a merge blocker.
+ *
  * Usage:   node scripts/cli-profile-guard.mjs <dir> [<dir> ...]
  * Exit:    0 = clean · 1 = violations (printed to stderr) · 2 = usage/parse error
  */
@@ -65,15 +81,23 @@ function isCliIdLiteral(node) {
   );
 }
 
-// A regex source ALTERNATES the CLI ids iff each id is pipe-adjacent (`id|` or
-// `|id`) — i.e. an actual alternation branch, not mere co-occurrence. This
-// flags capturing / noncapturing / bare / interleaved (claude|foo|codex) forms
-// but SPARES a sequence like /claude.*codex/ (no `|` between the ids) and a
-// single-id regex /^codex-/. Escaped pairs (incl. a literal \|) are stripped
-// first so they don't count as an alternation operator.
+// A regex source ALTERNATES the CLI ids iff each id appears as a COMPLETE
+// alternation alternative — adjacent to an alternation pipe (`id|` or `|id`) on
+// one side AND not extended by an identifier char on the other. So it flags
+// capturing / noncapturing / bare / interleaved (claude|foo|codex) forms, but
+// SPARES a sequence /claude.*codex/ (no `|` between the ids), a single-id regex
+// /^codex-/, AND a longer alternative /claude|codexish/ (codexish ≠ the codex
+// id — the pipe touches only its prefix). CONT below = the chars that would
+// make an id a prefix/suffix of a longer literal token. Escaped pairs (incl. a
+// literal \|) are stripped first so they don't count as an alternation operator.
 function isCliRegexAlternation(source) {
   const cleaned = source.replace(/\\./g, "");
-  const participates = (id) => cleaned.includes(id + "|") || cleaned.includes("|" + id);
+  const CONT = "[A-Za-z0-9_-]";
+  const participates = (id) => {
+    const pipeBefore = new RegExp("\\|" + id + "(?!" + CONT + ")"); // …|id  (id not extended right)
+    const pipeAfter = new RegExp("(?<!" + CONT + ")" + id + "\\|"); // id|…  (id not extended left)
+    return pipeBefore.test(cleaned) || pipeAfter.test(cleaned);
+  };
   return participates("claude") && participates("codex");
 }
 

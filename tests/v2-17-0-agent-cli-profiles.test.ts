@@ -147,6 +147,10 @@ describe("v2.17.0 P3 — agent-cli-profiles registry", () => {
           'export const flags = ["--codex-mode"];', // flag token
           "export const single = /^codex-/;", // single-id regex (not a branch)
           "export const seq = /claude.*codex/;", // codex P2 FP: a SEQUENCE, no `|` — must be spared
+          "export const longalt = /claude|codexish/;", // codex FP: codexish ≠ codex id (prefix only)
+          "export const longalt2 = /claudeish|codex/;", // symmetric: claudeish ≠ claude id
+          "export const longsingle = /codexish/;", // a longer token, not the codex id
+          "export const hyphenalt = /claude|codex-cli/;", // codex-cli ≠ codex id
         ].join("\n") + "\n",
       );
       // Declined-by-design boundary (Victra-ratified threat model): string
