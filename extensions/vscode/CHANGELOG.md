@@ -4,6 +4,14 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.6.0] — 2026-07-21 — Data-driven wake: the LLM list + wake behavior track the relay registry
+
+Tether's per-LLM wake behavior is now **driven by the relay's agent-CLI profile registry** (`bot-relay-mcp@2.17.1`) instead of hand-coded per-CLI branches. Nothing changes for you day-to-day — Claude still wakes on `inbox`, Codex still gets its instruction + a separate Enter after a short paste-settle delay — but the wake **values** (the Codex wake prompt, the 150 ms submit delay, the submit method) now come from a single source shared with the relay, and adding support for a new agent CLI becomes a one-line registry entry.
+
+- **Registry-driven wake values.** The Codex wake text, submit key, submit method, and 150 ms delay now mirror the relay registry (`src/agent-cli-profiles.ts`) exactly. A drift-guard test imports the real registry and fails the build if the mirror ever diverges, so the two can't silently drift apart.
+- **Data-driven adapter selection.** `agentLlm` (`claude` | `codex`) resolves its wake adapter from the mirror with no per-CLI `if`; the `agentLlm` config enum and a CLI-parity test both track the registry ids, so a newly-supported CLI flows through automatically.
+- **No behavior change.** The exact Claude (`sendText("inbox", true)`) and Codex (type → 150 ms → separate CR) wake sequences are unchanged and still pinned by tests. Requires the relay at **2.17.1+** (the corrected registry values).
+
 ## [0.5.0] — 2026-07-13 — Vault-first token: no more manual "Set Agent Token"
 
 - **Tether reads the token the relay keeps current.** Previously Tether used only the token you set manually in SecretStorage, so when a relaunch rotated your agent's token, Tether kept presenting the stale copy and stopped waking the agent until you re-ran "Set Agent Token" by hand. Tether now reads the agent's token from the **per-instance vault file** the SessionStart hook keeps up to date, and re-reads it on **every (re)connect** — so a rotated token auto-syncs with zero manual steps.
