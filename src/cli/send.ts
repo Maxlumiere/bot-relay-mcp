@@ -116,57 +116,88 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
-  // --- Resolve the sender's token (never send unauthenticated) ---
+  // --- Resolve + LOCALLY VALIDATE the sender's token (never send a bad cred) ---
+  // Precedence: $RELAY_AGENT_TOKEN (operator-explicit — trusted as-provided,
+  // since it may target a remote hub whose agent isn't in the local DB) → the
+  // per-instance vault, which MUST authenticate against the local DB BEFORE we
+  // POST. A stale / missing / mismatched vault token for a registered agent is a
+  // LOCAL refusal (exit 2, NO POST) on EVERY path (not just --mint-if-missing) —
+  // same discipline as `relay mint-token`; a mismatched credential is never sent
+  // to the daemon and mapped to a confusing exit 1 (codex v2.17.1 fix).
   let token: string | null = null;
   const envToken = process.env.RELAY_AGENT_TOKEN;
   if (isValidTokenShape(envToken)) {
     token = envToken;
   } else {
     try {
-      const { defaultTokenStore } = await import("../token-store.js");
-      token = await defaultTokenStore().read(from);
-    } catch {
-      token = null;
-    }
-  }
-
-  if (!token) {
-    if (!args.mintIfMissing) {
-      process.stderr.write(
-        `relay send: no token for "${from}" (env RELAY_AGENT_TOKEN unset/invalid, and no vault entry).\n` +
-          "  Pass --mint-if-missing to mint one, or export RELAY_AGENT_TOKEN.\n"
-      );
-      return 2;
-    }
-    try {
       const { resolveInstanceDbPath } = await import("../instance.js");
       if (!process.env.RELAY_DB_PATH) process.env.RELAY_DB_PATH = resolveInstanceDbPath();
     } catch {
       /* fall back to db default */
     }
+    let dbOpen = false;
     try {
-      const { initializeDb, closeDb } = await import("../db.js");
+      const { initializeDb, getAgentAuthData } = await import("../db.js");
       await initializeDb();
-      try {
+      dbOpen = true;
+      const { defaultTokenStore } = await import("../token-store.js");
+      const vaultToken = await defaultTokenStore().read(from);
+      const authData = getAgentAuthData(from);
+      if (authData && authData.token_hash) {
+        // Registered agent — the vault token MUST authenticate. Even with
+        // --mint-if-missing a mismatch is NOT silently rotated (that needs
+        // `mint-token --force`); it refuses locally with NO POST.
+        const bcrypt = (await import("bcryptjs")).default;
+        if (vaultToken && bcrypt.compareSync(vaultToken, authData.token_hash)) {
+          token = vaultToken;
+        } else {
+          process.stderr.write(
+            `relay send: the vault token for "${from}" does not authenticate against the DB ` +
+              "(missing / stale / mismatched). NOT sending a mismatched credential.\n" +
+              `  • Rotate deliberately (invalidates the old token): relay mint-token ${from} --force\n` +
+              `  • Or reset the identity: relay recover ${from}\n`
+          );
+          return 2;
+        }
+      } else if (args.mintIfMissing) {
+        // Not registered locally → mint + vault a fresh identity, then send.
         const { stableMintOrReuse } = await import("../mint-reuse.js");
         const r = await stableMintOrReuse(from, "agent", []);
         if (r.status === "mismatch") {
           process.stderr.write(
-            `relay send: agent "${from}" exists but its vault token does not authenticate. ` +
-              "NOT rotating silently — use `relay mint-token " + from + " --force` to rotate deliberately.\n"
+            `relay send: agent "${from}" is in a mismatched state — use \`relay mint-token ${from} --force\`.\n`
           );
           return 2;
         }
         token = r.token;
-      } finally {
-        closeDb();
+      } else {
+        process.stderr.write(
+          `relay send: no usable token for "${from}" — not registered locally, env RELAY_AGENT_TOKEN unset/invalid, and no vault entry.\n` +
+            "  Pass --mint-if-missing to register + mint, or export RELAY_AGENT_TOKEN.\n"
+        );
+        return 2;
       }
     } catch (err) {
       process.stderr.write(
-        `relay send: could not mint a token: ${err instanceof Error ? err.message : String(err)}\n`
+        `relay send: could not resolve a token: ${err instanceof Error ? err.message : String(err)}\n`
       );
       return 2;
+    } finally {
+      if (dbOpen) {
+        try {
+          const { closeDb } = await import("../db.js");
+          closeDb();
+        } catch {
+          /* ignore */
+        }
+      }
     }
+  }
+
+  if (!token) {
+    // Defensive: every branch above set token or returned; never POST tokenless.
+    process.stderr.write(`relay send: could not resolve a sender token for "${from}".\n`);
+    return 2;
   }
 
   // --- Resolve host/port + optional dashboard secret ---

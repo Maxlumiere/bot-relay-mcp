@@ -54,22 +54,44 @@ describe("v2.17.1 — relay send (auth-respecting one-line send)", () => {
   let sendRun: (argv: string[]) => Promise<number>;
   let outSpy: ReturnType<typeof vi.spyOn>;
   let errSpy: ReturnType<typeof vi.spyOn>;
-  const savedName = process.env.RELAY_AGENT_NAME;
-  const savedToken = process.env.RELAY_AGENT_TOKEN;
+  let tmpRoot: string;
+  const saved = {
+    name: process.env.RELAY_AGENT_NAME,
+    token: process.env.RELAY_AGENT_TOKEN,
+    db: process.env.RELAY_DB_PATH,
+  };
 
   beforeEach(async () => {
     ({ run: sendRun } = await import("../src/cli/send.js"));
-    // Neutralize ambient identity so tests are deterministic + never actually send.
+    // Hermetic: a throwaway DB + co-located vault (resolveInstanceDbPath honors
+    // RELAY_DB_PATH; the vault is dirname(db)/agents). Never touches the real DB.
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "relay-send-"));
+    process.env.RELAY_DB_PATH = path.join(tmpRoot, "relay.db");
     delete process.env.RELAY_AGENT_NAME;
     delete process.env.RELAY_AGENT_TOKEN;
+    const { _resetDefaultTokenStoreForTests } = await import("../src/token-store.js");
+    _resetDefaultTokenStoreForTests();
     outSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     errSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
   });
-  afterEach(() => {
+  afterEach(async () => {
     outSpy.mockRestore();
     errSpy.mockRestore();
-    if (savedName !== undefined) process.env.RELAY_AGENT_NAME = savedName;
-    if (savedToken !== undefined) process.env.RELAY_AGENT_TOKEN = savedToken;
+    const { _resetDefaultTokenStoreForTests } = await import("../src/token-store.js");
+    _resetDefaultTokenStoreForTests();
+    for (const [k, v] of [
+      ["RELAY_AGENT_NAME", saved.name],
+      ["RELAY_AGENT_TOKEN", saved.token],
+      ["RELAY_DB_PATH", saved.db],
+    ] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   });
 
   it("--help returns 0 without sending", async () => {
@@ -88,10 +110,33 @@ describe("v2.17.1 — relay send (auth-respecting one-line send)", () => {
     expect(await sendRun(["_to", "--from", "someone"])).toBe(1);
   });
 
-  it("AUTH GATE: no resolvable token + no --mint-if-missing → exit 2 (never sends unauthenticated)", async () => {
-    // A vault-miss name with no env token: refuses BEFORE any POST.
-    const missName = `_p2_no_such_${process.pid}_${Date.now() % 100000}`;
-    expect(await sendRun(["_to", "body", "--from", missName])).toBe(2);
+  it("AUTH GATE: unregistered sender, no token, no --mint-if-missing → exit 2 (no unauth send)", async () => {
+    expect(await sendRun(["_to", "body", "--from", "nobody_here"])).toBe(2);
+  });
+
+  it("AUTH GATE (codex fix): a STALE vault token → exit 2 with NO POST fired", async () => {
+    // Register an agent (DB row + vault with a MATCHING token), then corrupt the
+    // vault with a DIFFERENT shape-valid token so it no longer authenticates.
+    const { initializeDb, closeDb } = await import("../src/db.js");
+    await initializeDb();
+    const { stableMintOrReuse } = await import("../src/mint-reuse.js");
+    await stableMintOrReuse("stale_sender", "agent", []);
+    closeDb();
+    fs.writeFileSync(
+      path.join(tmpRoot, "agents", "stale_sender.token"),
+      "Zzz9DifferentTokenWontMatch_01234567\n",
+    );
+    // fetch MUST NOT be called — the mismatch is caught locally before any POST.
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("fetch must NOT be called for a stale-vault sender"));
+    try {
+      const code = await sendRun(["_to", "body", "--from", "stale_sender"]);
+      expect(code).toBe(2);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 
