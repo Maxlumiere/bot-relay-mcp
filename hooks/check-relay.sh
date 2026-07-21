@@ -55,6 +55,18 @@ AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
 # registrations). Empty → register_agent omits the field and the agent's
 # focus button stays disabled in the UI per the graceful-degrade contract.
 RELAY_TERMINAL_TITLE_VALUE="${RELAY_TERMINAL_TITLE:-}"
+# v2.18.0 — validate the title against the SERVER's allowlist (src/types.ts:
+# [A-Za-z0-9_.- ], max 100) and DROP it if it doesn't match. The value is
+# raw-interpolated into the register_agent JSON below; a hostile title (quote /
+# backslash / newline / JSON fragment) would otherwise malform the payload or be
+# server-rejected, failing the whole register + mail delivery. Dropping it keeps
+# the handshake landing (focus button just stays disabled). `[[ =~ ]]` matches
+# the WHOLE value (newline-safe, unlike line-based grep). Byte-parity with the
+# Codex hook (codex-session-start.sh) + bin/codex-relay.
+RELAY_TERMINAL_TITLE_RE='^[A-Za-z0-9_. -]{1,100}$'
+if [ -n "$RELAY_TERMINAL_TITLE_VALUE" ] && ! [[ "$RELAY_TERMINAL_TITLE_VALUE" =~ $RELAY_TERMINAL_TITLE_RE ]]; then
+  RELAY_TERMINAL_TITLE_VALUE=""
+fi
 # v2.6.1 — vault helpers + DB-path resolution sourced from a single file.
 # Mirrors src/instance.ts:resolveInstanceDbPath + src/token-store.ts:
 # resolveAgentVaultDir + FileTokenStore.{pathFor,read,write}. Drift surfaces
@@ -221,10 +233,11 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
     if [ -n "$AGENT_CAPS" ]; then
       CAPS_JSON=$(echo "$AGENT_CAPS" | awk -F',' '{
         printf "[";
+        n = 0;
         for (i=1; i<=NF; i++) {
           gsub(/^ +| +$/, "", $i);
-          if ($i !~ /^[A-Za-z0-9_.-]+$/) next;
-          printf "%s\"%s\"", (i==1 ? "" : ","), $i;
+          if ($i !~ /^[A-Za-z0-9_.-]+$/) continue;
+          printf "%s\"%s\"", (n++ ? "," : ""), $i;
         }
         printf "]";
       }')
@@ -274,10 +287,11 @@ if [ "$RECOVERY_COMPLETED" -eq 0 ]; then
     # Each token also matches our allowlist (already validated as a whole; re-check per-token)
     CAPS_JSON=$(echo "$AGENT_CAPS" | awk -F',' '{
       printf "[";
+      n = 0;
       for (i=1; i<=NF; i++) {
         gsub(/^ +| +$/, "", $i);
-        if ($i !~ /^[A-Za-z0-9_.-]+$/) next;
-        printf "%s\"%s\"", (i==1 ? "" : ","), $i;
+        if ($i !~ /^[A-Za-z0-9_.-]+$/) continue;
+        printf "%s\"%s\"", (n++ ? "," : ""), $i;
       }
       printf "]";
     }')
