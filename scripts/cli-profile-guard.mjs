@@ -1,0 +1,165 @@
+#!/usr/bin/env node
+// bot-relay-mcp
+// Copyright (c) 2026 Lumiere Ventures
+// SPDX-License-Identifier: MIT
+// See LICENSE for full terms.
+
+/**
+ * v2.17.0 P3 — CLI-profile branching drift guard (TS-AST based).
+ *
+ * The agent-CLI profile registry (src/agent-cli-profiles.ts) is the ONE place
+ * hardcoded claude/codex DECISION LOGIC may live. This walks the AST of every
+ * other src/ *.ts file and flags the dangerous BRANCH FORMS — regardless of
+ * syntactic ordering, which a regex cannot do reliably (codex's audit found 3
+ * bypasses of the original regex; AST closes the whole class):
+ *
+ *   1. equality / inequality (=== !== == !=) with a CLI-id string literal on
+ *      EITHER operand — `id === "codex"` AND the reversed `"codex" === id`;
+ *   2. a switch `case` label that is a CLI-id string literal — `case "claude":`;
+ *   3. a regex that alternates the CLI ids — a /.../ literal OR `new RegExp("…")`
+ *      whose source mentions BOTH "claude" and "codex" (covers capturing
+ *      `(claude|codex)`, noncapturing `(?:claude|codex)`, and bare `claude|codex`).
+ *
+ * It deliberately does NOT flag prose, ~/.claude/… paths, --flags, display
+ * strings ("Codex CLI"), longer identifiers ("claude-scope-planner"), or
+ * registry lookups by id (`getAgentCliProfile("codex")`) — none of those are a
+ * branch. Per the codex + victra gate: stay TARGETED, no blanket-literal guard.
+ *
+ * Escape hatch: put `// CLI-PROFILE-ALLOWLIST: <reason>` on the offending line.
+ *
+ * Usage:   node scripts/cli-profile-guard.mjs <dir> [<dir> ...]
+ * Exit:    0 = clean · 1 = violations (printed to stderr) · 2 = usage/parse error
+ */
+import ts from "typescript";
+import fs from "fs";
+import path from "path";
+
+const CLI_IDS = new Set(["claude", "codex"]);
+const EQ_OPS = new Set([
+  ts.SyntaxKind.EqualsEqualsEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsEqualsToken,
+  ts.SyntaxKind.EqualsEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsToken,
+]);
+const EXCLUDE_BASENAME = new Set(["agent-cli-profiles.ts"]);
+const ALLOW_MARK = "CLI-PROFILE-ALLOWLIST:";
+
+function isCliIdLiteral(node) {
+  return (
+    !!node &&
+    (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+    CLI_IDS.has(node.text)
+  );
+}
+
+// A regex source that alternates the CLI ids mentions BOTH — this catches the
+// capturing/noncapturing/bare alternation forms and interleaved variants
+// (claude|foo|codex) without whack-a-mole over paren syntax. A single-id regex
+// (/^codex-/) is NOT a claude-vs-codex branch and stays out of scope.
+function regexMentionsBothIds(text) {
+  return text.includes("claude") && text.includes("codex");
+}
+
+function scanFile(file, violations) {
+  const src = fs.readFileSync(file, "utf-8");
+  const allowedLines = new Set();
+  src.split("\n").forEach((l, i) => {
+    if (l.includes(ALLOW_MARK)) allowedLines.add(i + 1);
+  });
+
+  const sf = ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+
+  const report = (node, kind) => {
+    const ln = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+    if (allowedLines.has(ln)) return;
+    violations.push({ file, line: ln, kind, snippet: node.getText(sf).replace(/\s+/g, " ").slice(0, 100) });
+  };
+
+  const visit = (node) => {
+    // 1. id-equality branch — CLI literal on EITHER operand of === !== == !=
+    if (ts.isBinaryExpression(node) && EQ_OPS.has(node.operatorToken.kind)) {
+      if (isCliIdLiteral(node.left) || isCliIdLiteral(node.right)) {
+        report(node, "cli-id equality branch");
+      }
+    }
+    // 2. switch/case on a CLI id
+    if (ts.isCaseClause(node) && isCliIdLiteral(node.expression)) {
+      report(node, "cli-id switch/case");
+    }
+    // 3a. regex literal alternating the CLI ids
+    if (ts.isRegularExpressionLiteral(node) && regexMentionsBothIds(node.text)) {
+      report(node, "cli-id regex alternation");
+    }
+    // 3b. new RegExp("<…claude…codex…>") — string-literal arg alternating the ids
+    if (
+      ts.isNewExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "RegExp" &&
+      node.arguments &&
+      node.arguments.length > 0
+    ) {
+      const arg = node.arguments[0];
+      if (
+        (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg)) &&
+        regexMentionsBothIds(arg.text)
+      ) {
+        report(node, "cli-id RegExp() alternation");
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+}
+
+function collectTsFiles(dir, out) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) collectTsFiles(p, out);
+    else if (entry.isFile() && entry.name.endsWith(".ts") && !entry.name.endsWith(".d.ts")) out.push(p);
+  }
+}
+
+function main() {
+  const roots = process.argv.slice(2);
+  if (roots.length === 0) {
+    process.stderr.write("usage: cli-profile-guard.mjs <dir> [<dir> ...]\n");
+    process.exit(2);
+  }
+  const files = [];
+  for (const r of roots) {
+    const abs = path.resolve(r);
+    if (!fs.existsSync(abs)) {
+      process.stderr.write(`cli-profile-guard: no such path: ${abs}\n`);
+      process.exit(2);
+    }
+    if (fs.statSync(abs).isDirectory()) collectTsFiles(abs, files);
+    else if (abs.endsWith(".ts")) files.push(abs);
+  }
+
+  const violations = [];
+  try {
+    for (const f of files) {
+      if (EXCLUDE_BASENAME.has(path.basename(f))) continue;
+      scanFile(f, violations);
+    }
+  } catch (err) {
+    process.stderr.write(`cli-profile-guard: parse error: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(2);
+  }
+
+  if (violations.length > 0) {
+    process.stderr.write("Hardcoded claude|codex CLI branching outside the profile registry:\n");
+    for (const v of violations) {
+      process.stderr.write(`  ${v.file}:${v.line}  [${v.kind}]  ${v.snippet}\n`);
+    }
+    process.stderr.write("\nFix: read from src/agent-cli-profiles.ts (getAgentCliProfile / profileProcessPatternSource).\n");
+    process.stderr.write(`If genuinely needed, append '// ${ALLOW_MARK} <reason>' to the offending line.\n`);
+    process.exit(1);
+  }
+  process.stdout.write(
+    "No hardcoded claude|codex branching outside src/agent-cli-profiles.ts — registry consolidated\n",
+  );
+  process.exit(0);
+}
+
+main();

@@ -14,7 +14,7 @@ The LLM-agnostic parity arc (`audit-findings/llm-agnostic-parity-scope-brief.md`
 - **`src/agent-cli-profiles.ts`** — one declarative registry (claude + codex; schema extensible = new CLI is one entry) carrying each CLI's `processPattern`, `hookInstall`, `launch` (consumed by P2 spawn) and `wake` (consumed by P4 Tether). The shared machine-GUID / `host_id` derivation is deliberately **not** per-profile (the federation-safety invariant).
 - **`relay cli-profiles [--json]`** — prints the registry (human summary or JSON for cross-boundary reads).
 - **Refactors** `generate-hooks` (output byte-identical) and `liveness.ts:DEFAULT_AGENT_PATTERN` to read the registry — every hardcoded `claude|codex` branch in those consumers is gone.
-- **Drift guards** (vitest + pre-publish): reject a hardcoded `(claude|codex)` alternation / id-equality branch in `src/` outside the registry; and a bash-mirror guard asserting the `_vault-helpers.sh` PID-finder pattern's CLI tokens track the registry (kept a mirror, not read on the per-hook hot path).
+- **Drift guards** (vitest + pre-publish share one TS-AST walk, `scripts/cli-profile-guard.mjs`): reject hardcoded claude/codex *decision logic* in `src/` outside the registry — id-equality on **either** operand, switch/case on a CLI id, or a regex alternation of the ids — with planted regressions for each dangerous form (incl. the three regex bypasses codex's audit found). A bash-mirror guard also asserts the `_vault-helpers.sh` PID-finder pattern's CLI tokens track the registry (kept a mirror, not read on the per-hook hot path).
 
 ## v2.16.4 — 2026-07-20 — Codex cold-start launcher (autowake at pure launch)
 

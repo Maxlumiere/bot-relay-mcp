@@ -11,14 +11,17 @@
  *   - it ships claude + codex only, each structurally well-formed;
  *   - launch{} / wake{} are populated + typed (Q3 — behavior is exercised in
  *     P2 / P4, but the fields get a structural assertion in P3);
- *   - a BRANCHING drift guard: no hardcoded `(claude|codex)` alternation or
- *     `=== "codex"`-style id comparison in src/ outside the registry;
+ *   - a BRANCHING drift guard (shared TS-AST walk, scripts/cli-profile-guard.mjs):
+ *     no hardcoded id-equality (either operand), switch/case on a CLI id, or
+ *     regex alternation of the ids in src/ outside the registry — plus planted
+ *     regressions for each dangerous form (incl. codex's 3 audit bypasses);
  *   - a BASH-MIRROR drift guard: the _vault-helpers.sh PID-finder pattern's CLI
  *     tokens match the registry (Q1-b — a mirror kept honest by a test, not read
  *     on the per-hook hot path).
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
@@ -80,20 +83,77 @@ describe("v2.17.0 P3 — agent-cli-profiles registry", () => {
     expect(profileProcessPatternSource()).toBe("claude|codex");
   });
 
-  it("DRIFT-GUARD (branching): no hardcoded (claude|codex) alternation or id-equality in src/ outside the registry", () => {
-    // Targets the DANGEROUS branching forms the registry replaces — a regex
-    // alternation of the CLI ids, or an id-equality / switch-case comparison.
-    // Deliberately NOT prose, file paths (~/.claude/…), --flag strings, or
-    // registry lookups by id. Escape hatch: `// CLI-PROFILE-ALLOWLIST: <reason>`.
-    const PATTERN =
-      "\\(claude\\|codex\\)|\\(codex\\|claude\\)|(===|!==|==|!=|case)[[:space:]]*[\"'](claude|codex)[\"']";
-    const r = spawnSync("grep", ["-rnE", PATTERN, path.join(REPO, "src"), "--include=*.ts"], {
-      encoding: "utf-8",
-    });
-    const hits = (r.stdout ?? "")
-      .split("\n")
-      .filter((l) => l && !l.includes("/agent-cli-profiles.ts:") && !l.includes("// CLI-PROFILE-ALLOWLIST:"));
-    expect(hits, `hardcoded CLI branching outside src/agent-cli-profiles.ts:\n${hits.join("\n")}`).toEqual([]);
+  // The branching guard is a narrow TS-AST walk (scripts/cli-profile-guard.mjs)
+  // shared VERBATIM with the pre-publish gate — one implementation, both
+  // surfaces. A regex proved too leaky (codex's audit found 3 bypasses:
+  // reversed equality, bare + noncapturing alternation), so the detector works
+  // on the AST FORM, not on syntax spelling.
+  const GUARD = path.join(REPO, "scripts", "cli-profile-guard.mjs");
+  const runGuard = (dir: string) => spawnSync("node", [GUARD, dir], { encoding: "utf-8" });
+
+  it("DRIFT-GUARD (branching): the shared AST guard reports src/ clean", () => {
+    const r = runGuard(path.join(REPO, "src"));
+    expect(r.status, `guard flagged src/:\nstdout=${r.stdout}\nstderr=${r.stderr}`).toBe(0);
+    expect(r.stdout).toContain("registry consolidated");
+  });
+
+  it("DRIFT-GUARD (branching) regression: catches every dangerous form, spares legit code, honors the allowlist", () => {
+    // Hermetic fixtures — never written into the repo tree. DANGEROUS covers
+    // codex's 3 audit bypasses (reversed equality, bare + noncapturing
+    // alternation) PLUS switch/case and the RegExp() constructor.
+    const DANGEROUS: Record<string, string> = {
+      "eq-right.ts": 'export const f = (id: string) => id === "codex";',
+      "eq-left-reversed.ts": 'export const f = (id: string) => "codex" === id;',
+      "neq-right.ts": 'export const f = (id: string) => id !== "claude";',
+      "neq-left-reversed.ts": 'export const f = (id: string) => "claude" !== id;',
+      "switch-case.ts": 'export function f(x: string){ switch(x){ case "codex": return 1; default: return 0; } }',
+      "regex-bare.ts": "export const f = (id: string) => /claude|codex/.test(id);",
+      "regex-noncapturing.ts": "export const r = /(?:claude|codex)/;",
+      "regex-capturing.ts": "export const r = /(claude|codex)/i;",
+      "regex-reversed.ts": "export const r = /(codex|claude)/;",
+      "regexp-ctor.ts": 'export const r = new RegExp("^(claude|codex)$");',
+    };
+
+    // 1) All dangerous forms fire — assert each fixture basename shows up in the
+    // violation report (proves each was individually caught, not just one).
+    const dangerDir = fs.mkdtempSync(path.join(os.tmpdir(), "cli-guard-danger-"));
+    try {
+      for (const [name, code] of Object.entries(DANGEROUS)) {
+        fs.writeFileSync(path.join(dangerDir, name), code + "\n");
+      }
+      const dr = runGuard(dangerDir);
+      expect(dr.status, "guard should reject the dangerous fixtures").toBe(1);
+      for (const name of Object.keys(DANGEROUS)) {
+        expect(dr.stderr, `guard MISSED dangerous form: ${name}`).toContain(name);
+      }
+    } finally {
+      fs.rmSync(dangerDir, { recursive: true, force: true });
+    }
+
+    // 2) Legit code is spared; 3) the allowlist marker suppresses a real hit.
+    const cleanDir = fs.mkdtempSync(path.join(os.tmpdir(), "cli-guard-clean-"));
+    try {
+      fs.writeFileSync(
+        path.join(cleanDir, "legit.ts"),
+        [
+          'export const p = getAgentCliProfile("codex");', // registry lookup by id
+          'export const p2 = "~/.claude/settings.json";', // path
+          'export const dn = "Codex CLI";', // display string (capitalized)
+          'export const lbl = "claude-scope-planner";', // longer identifier
+          "// choose claude or codex from config", // prose
+          'export const flags = ["--codex-mode"];', // flag token
+          "export const single = /^codex-/;", // single-id regex (not a branch)
+        ].join("\n") + "\n",
+      );
+      fs.writeFileSync(
+        path.join(cleanDir, "allowed.ts"),
+        'export const f = (id: string) => id === "codex"; // CLI-PROFILE-ALLOWLIST: legacy shim, P2 migrates\n',
+      );
+      const cr = runGuard(cleanDir);
+      expect(cr.status, `guard false-positive or allowlist ignored:\n${cr.stderr}`).toBe(0);
+    } finally {
+      fs.rmSync(cleanDir, { recursive: true, force: true });
+    }
   });
 
   it("DRIFT-GUARD (bash mirror): _vault-helpers.sh PID pattern's CLI tokens == the registry processPatterns", () => {

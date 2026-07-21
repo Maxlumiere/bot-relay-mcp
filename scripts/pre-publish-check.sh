@@ -426,29 +426,17 @@ ip_classifier_guard() {
 }
 step "ip-classifier guard (no duplicate CIDR logic)" ip_classifier_guard || exit 1
 
-# v2.17.0 P3 — CLI-profile drift guard (mirrors the CIDR guard). The agent-CLI
-# profile registry (src/agent-cli-profiles.ts) is the ONE place `claude`/`codex`
-# BRANCHING lives. This rejects a hardcoded `(claude|codex)` regex alternation or
-# an id-equality / switch-case comparison anywhere else in src/. It deliberately
-# does NOT flag prose, file paths (~/.claude/…), --flag strings, or registry
-# lookups by id. Escape hatch: `// CLI-PROFILE-ALLOWLIST: <reason>`.
+# v2.17.0 P3 — CLI-profile branching drift guard. The agent-CLI profile registry
+# (src/agent-cli-profiles.ts) is the ONE place hardcoded claude/codex DECISION
+# LOGIC may live. A regex proved too leaky (codex's audit found 3 bypasses:
+# reversed equality, bare + noncapturing alternations), so detection is now a
+# narrow TS-AST walk (scripts/cli-profile-guard.mjs) shared with the vitest
+# drift-guard test — one implementation, both surfaces. It flags id-equality on
+# either operand, switch/case on a CLI id, and regex alternation of the ids; it
+# spares prose, ~/.claude/… paths, --flags, display strings, and registry
+# lookups by id. Escape hatch: `// CLI-PROFILE-ALLOWLIST: <reason>` on the line.
 cli_profile_guard() {
-  local hits
-  hits=$(grep -rnE '\(claude\|codex\)|\(codex\|claude\)|(===|!==|==|!=|case)[[:space:]]*["'"'"'](claude|codex)["'"'"']' "$PROJECT_ROOT/src" \
-    --include='*.ts' \
-    | grep -v "/agent-cli-profiles\.ts:" \
-    | grep -v "// CLI-PROFILE-ALLOWLIST:" \
-    || true)
-  if [ -n "$hits" ]; then
-    echo "Hardcoded claude|codex CLI branching in src/ outside the profile registry:" >&2
-    echo "$hits" >&2
-    echo "" >&2
-    echo "Fix: read from src/agent-cli-profiles.ts (getAgentCliProfile / profileProcessPatternSource)." >&2
-    echo "If genuinely needed, append '// CLI-PROFILE-ALLOWLIST: <reason>' to the line." >&2
-    return 1
-  fi
-  echo "No hardcoded claude|codex branching outside src/agent-cli-profiles.ts — registry consolidated"
-  return 0
+  node "$PROJECT_ROOT/scripts/cli-profile-guard.mjs" "$PROJECT_ROOT/src"
 }
 step "cli-profile guard (no hardcoded claude|codex branching)" cli_profile_guard || exit 1
 
