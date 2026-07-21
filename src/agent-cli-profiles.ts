@@ -74,7 +74,18 @@ export interface LaunchSpec {
   titleFlag: string | null;
 }
 
-/** Tether adapter inputs (P4). Consumed in P4. */
+/**
+ * Tether adapter inputs (P4). Consumed in P4.
+ *
+ * ⚠️ INTERIM PLACEHOLDER VALUES (v2.17.0). The `wake` values on each profile
+ * below are approximate placeholders populated in P3 to freeze the shape. They
+ * are NOT yet the source of truth for Tether — the shipped Tether 0.5.0 does not
+ * read this registry, so NO shipped relay code consumes them in 2.17.0. In
+ * 2.17.1 they are reconciled to the extension's PROVEN wake behavior (the tuned
+ * codex wakeText + the 150ms submit delay + the correct submitMethod), and the
+ * data-driven Tether 0.6.0 then reads the corrected registry. Until then, treat
+ * these as documentation, not the live wake contract. See CHANGELOG v2.17.0.
+ */
 export interface WakeSpec {
   /** Text injected to wake the agent, or null if the CLI has no injected-prompt wake. */
   wakeText: string | null;
