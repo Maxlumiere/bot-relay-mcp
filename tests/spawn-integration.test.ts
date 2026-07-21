@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
 import cp from "child_process";
 import fs from "fs";
 import os from "os";
@@ -808,12 +808,28 @@ describe("spawn-agent.sh — v2.17.0 codex launcher path (RELAY_SPAWN_LAUNCHER)"
   // physically inside bin/ point anywhere and pass. The fix canonicalizes the
   // FINAL target; these prove the "symlink out of bin → exit 2" invariant.
   const BIN_DIR = path.dirname(CODEX_RELAY);
+  // NOTE: fs.rmSync(force) on a DANGLING symlink no-ops on macOS (it follows the
+  // link, finds nothing, skips), leaving the link behind. Always unlink links.
+  const rmLink = (p: string): void => {
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      /* ENOENT — already gone */
+    }
+  };
   const mkLink = (name: string, target: string): string => {
     const p = path.join(BIN_DIR, name);
-    fs.rmSync(p, { force: true });
+    rmLink(p);
     fs.symlinkSync(target, p);
     return p;
   };
+  // Belt-and-suspenders: sweep any `.p2-*` test artifact out of bin/ so a
+  // dangling symlink can never litter the repo, whatever a test does.
+  afterAll(() => {
+    for (const f of fs.readdirSync(BIN_DIR)) {
+      if (f.startsWith(".p2-")) rmLink(path.join(BIN_DIR, f));
+    }
+  });
 
   it("(codex audit) rejects a symlink INSIDE bin/ that points to /bin/sh (the exact reported exploit)", async () => {
     const link = mkLink(`.p2-audit-symlink-${process.pid}`, "/bin/sh");
@@ -826,7 +842,7 @@ describe("spawn-agent.sh — v2.17.0 codex launcher path (RELAY_SPAWN_LAUNCHER)"
       // And the emitted CMD must NOT reference the symlink / /bin/sh.
       expect(r.stdout).not.toContain("/bin/sh");
     } finally {
-      fs.rmSync(link, { force: true });
+      rmLink(link);
     }
   });
 
@@ -837,7 +853,7 @@ describe("spawn-agent.sh — v2.17.0 codex launcher path (RELAY_SPAWN_LAUNCHER)"
       expect(r.code, `stderr: ${r.stderr}`).toBe(REJECT_EXIT);
       expect(r.stderr).toMatch(/outside the repo bin/i);
     } finally {
-      fs.rmSync(link, { force: true });
+      rmLink(link);
     }
   });
 
@@ -850,7 +866,7 @@ describe("spawn-agent.sh — v2.17.0 codex launcher path (RELAY_SPAWN_LAUNCHER)"
       expect(r.code, `stderr: ${r.stderr}`).toBe(REJECT_EXIT);
       expect(r.stderr).toMatch(/not executable/i);
     } finally {
-      fs.rmSync(link, { force: true });
+      rmLink(link);
       fs.rmSync(plain, { force: true });
     }
   });
@@ -858,16 +874,16 @@ describe("spawn-agent.sh — v2.17.0 codex launcher path (RELAY_SPAWN_LAUNCHER)"
   it("(codex audit) rejects a symlink cycle", async () => {
     const a = path.join(BIN_DIR, `.p2-cycle-a-${process.pid}`);
     const b = path.join(BIN_DIR, `.p2-cycle-b-${process.pid}`);
-    fs.rmSync(a, { force: true });
-    fs.rmSync(b, { force: true });
+    rmLink(a);
+    rmLink(b);
     fs.symlinkSync(b, a);
     fs.symlinkSync(a, b);
     try {
       const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], { RELAY_SPAWN_LAUNCHER: a });
       expect(r.code, `stderr: ${r.stderr}`).toBe(REJECT_EXIT);
     } finally {
-      fs.rmSync(a, { force: true });
-      fs.rmSync(b, { force: true });
+      rmLink(a);
+      rmLink(b);
     }
   });
 
