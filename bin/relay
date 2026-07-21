@@ -9,6 +9,9 @@
  *   relay test                Fresh-install self-check (throwaway relay).
  *   relay generate-hooks      Emit agent hook config (Claude JSON default;
  *                             --codex for Codex config.toml; --all for both).
+ *   relay send TO CONTENT     Send a relay message in one line (v2.17.1). Resolves
+ *                             the sender's token (env → vault → --mint-if-missing)
+ *                             and POSTs /api/send-message. --from NAME sets sender.
  *   relay backup [--output]   Snapshot the DB + config into a tar.gz archive.
  *   relay restore PATH        Restore from a tar.gz archive.
  *   relay recover NAME        Clear an agent's registration so it can re-bootstrap
@@ -46,6 +49,7 @@ const SUBCOMMANDS = {
   test: "../dist/cli/test.js",
   "generate-hooks": "../dist/cli/generate-hooks.js",
   "cli-profiles": "../dist/cli/cli-profiles.js",
+  send: "../dist/cli/send.js",
   backup: "../dist/cli/backup.js",
   restore: "../dist/cli/restore.js",
   recover: "../dist/cli/recover.js",
@@ -69,6 +73,7 @@ function printHelp() {
       "  test             Fresh-install self-check against a throwaway relay.\n" +
       "  generate-hooks   Emit agent hook config (Claude JSON default; --codex Codex TOML; --all both).\n" +
       "  cli-profiles     Print the agent-CLI profile registry (--json for machine-readable).\n" +
+      "  send TO CONTENT  Send a relay message in one line (resolves the sender's token).\n" +
       "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
       "  restore PATH     Restore from a tar.gz archive.\n" +
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +

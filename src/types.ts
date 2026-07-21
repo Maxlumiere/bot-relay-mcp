@@ -692,22 +692,47 @@ export type FocusTerminalInput = z.infer<typeof FocusTerminalSchema>;
  * also have an admin-cap agent token, which defeats the "operator
  * dashboard" semantic.
  */
-export const ApiSendMessageSchema = z.object({
-  from: z.string().min(1).max(64).describe("Sender agent name (must be a registered agent)"),
-  to: z.string().min(1).max(64).describe("Recipient agent name"),
-  content: payloadField("content"),
-  priority: z.enum(["normal", "high"]).default("normal"),
-  /**
-   * v2.2.2 A1 — Option (b) defense-in-depth. Optional: when present, the
-   * server verifies against the from-agent's stored token_hash + the
-   * audit-log entry records `from_authenticated: true`. When absent, the
-   * v2.2.1 Option (a) audit-only model applies: dashboard-secret gate is
-   * the only check + `from_authenticated: false` is recorded so incident
-   * review can distinguish operator-impersonation from token-verified
-   * sends. Also acceptable via `X-From-Agent-Token` header.
-   */
-  from_agent_token: z.string().min(8).max(128).optional(),
-});
+export const ApiSendMessageSchema = z
+  .object({
+    from: z.string().min(1).max(64).describe("Sender agent name (must be a registered agent)"),
+    to: z.string().min(1).max(64).describe("Recipient agent name"),
+    // v2.17.1: the message body accepts EITHER `content` (this endpoint's
+    // historical field) OR `message` (the field the MCP `send_message` tool and
+    // the agent-team `SendMessage` both use) — one send vocabulary across all
+    // three surfaces. Exactly one must be present; supplying BOTH with DIFFERENT
+    // values is rejected (no silent precedence). The transform below normalizes
+    // to `content` so the handler is unchanged.
+    content: payloadField("content").optional(),
+    message: payloadField("message").optional().describe("Alias for `content` (parity with MCP send_message / SendMessage)"),
+    priority: z.enum(["normal", "high"]).default("normal"),
+    /**
+     * v2.2.2 A1 — Option (b) defense-in-depth. Optional: when present, the
+     * server verifies against the from-agent's stored token_hash + the
+     * audit-log entry records `from_authenticated: true`. When absent, the
+     * v2.2.1 Option (a) audit-only model applies: dashboard-secret gate is
+     * the only check + `from_authenticated: false` is recorded so incident
+     * review can distinguish operator-impersonation from token-verified
+     * sends. Also acceptable via `X-From-Agent-Token` header.
+     */
+    from_agent_token: z.string().min(8).max(128).optional(),
+  })
+  .transform((v, ctx) => {
+    const hasContent = typeof v.content === "string";
+    const hasMessage = typeof v.message === "string";
+    if (!hasContent && !hasMessage) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "either `content` or `message` is required" });
+      return z.NEVER;
+    }
+    if (hasContent && hasMessage && v.content !== v.message) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "provide only one of `content` / `message` — both were sent with different values",
+      });
+      return z.NEVER;
+    }
+    const { message: _drop, ...rest } = v;
+    return { ...rest, content: (hasContent ? v.content : v.message) as string };
+  });
 export type ApiSendMessageInput = z.infer<typeof ApiSendMessageSchema>;
 
 export const ApiKillAgentSchema = z.object({

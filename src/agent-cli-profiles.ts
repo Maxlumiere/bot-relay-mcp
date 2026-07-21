@@ -75,16 +75,13 @@ export interface LaunchSpec {
 }
 
 /**
- * Tether adapter inputs (P4). Consumed in P4.
- *
- * ⚠️ INTERIM PLACEHOLDER VALUES (v2.17.0). The `wake` values on each profile
- * below are approximate placeholders populated in P3 to freeze the shape. They
- * are NOT yet the source of truth for Tether — the shipped Tether 0.5.0 does not
- * read this registry, so NO shipped relay code consumes them in 2.17.0. In
- * 2.17.1 they are reconciled to the extension's PROVEN wake behavior (the tuned
- * codex wakeText + the 150ms submit delay + the correct submitMethod), and the
- * data-driven Tether 0.6.0 then reads the corrected registry. Until then, treat
- * these as documentation, not the live wake contract. See CHANGELOG v2.17.0.
+ * Tether adapter inputs. RECONCILED in v2.17.1 to the extension's PROVEN wake
+ * behavior (extensions/vscode/src/llm-adapter.ts): codex `wakeText` byte-matches
+ * DEFAULT_CODEX_WAKE_TEXT, the 150ms `submitDelayMs` + `sendSequence` match the
+ * tuned codexAdapter, and claude wakes by typing "inbox" (`sendText`). These are
+ * now the real values the data-driven Tether 0.6.0 reads directly — no longer
+ * placeholders. A drift-guard test (tests/v2-17-1-wakespec.test.ts) keeps the
+ * codex wakeText byte-identical to the extension constant.
  */
 export interface WakeSpec {
   /** Text injected to wake the agent, or null if the CLI has no injected-prompt wake. */
@@ -93,6 +90,12 @@ export interface WakeSpec {
   submitKey: "\r" | "\n";
   /** Terminal write method. */
   submitMethod: "sendSequence" | "sendText";
+  /**
+   * ms to wait AFTER typing wakeText BEFORE the submit key, so a TUI's paste
+   * block closes first. Codex needs 150 (its empirically-proven value); claude
+   * submits inline with the typed text, so 0.
+   */
+  submitDelayMs: number;
   /**
    * true when the CLI self-continues WITHOUT Tether (e.g. a native stop-block
    * loop). Codex is FALSE: its self-wake poller was removed in 2.16.4; it wakes
@@ -142,9 +145,13 @@ const CLAUDE: AgentCliProfile = {
     titleFlag: "--name",
   },
   wake: {
-    wakeText: null, // Claude has an `inbox` convention; Tether submits a bare newline.
+    // Claude Code: Tether types "inbox" (its inbox convention drains + acts)
+    // with an appended newline in a single sendText — no separate submit, no
+    // delay. Matches extensions/vscode claudeAdapter: sendText("inbox", true).
+    wakeText: "inbox",
     submitKey: "\r",
-    submitMethod: "sendSequence",
+    submitMethod: "sendText",
+    submitDelayMs: 0,
     nativeSelfWake: false,
   },
 };
@@ -181,10 +188,15 @@ const CODEX: AgentCliProfile = {
     titleFlag: null,
   },
   wake: {
-    // Codex has no `inbox` convention — Tether injects an explicit instruction.
-    wakeText: "Check your bot-relay inbox: call get_messages and act on anything pending.",
+    // Codex has no `inbox` convention — Tether types an explicit INSTRUCTION,
+    // waits 150ms for the paste block to close, then submits a standalone CR via
+    // sendSequence (the programmatic twin of a real Enter — the only thing proven
+    // to make Codex submit). wakeText is byte-identical to the extension's
+    // DEFAULT_CODEX_WAKE_TEXT (kept in sync by tests/v2-17-1-wakespec.test.ts).
+    wakeText: 'Relay mail arrived — call get_messages(status="pending"), act on every message, then continue.',
     submitKey: "\r",
     submitMethod: "sendSequence",
+    submitDelayMs: 150,
     nativeSelfWake: false,
   },
 };
