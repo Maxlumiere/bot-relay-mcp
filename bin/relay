@@ -45,6 +45,7 @@ const SUBCOMMANDS = {
   init: "../dist/cli/init.js",
   test: "../dist/cli/test.js",
   "generate-hooks": "../dist/cli/generate-hooks.js",
+  "cli-profiles": "../dist/cli/cli-profiles.js",
   backup: "../dist/cli/backup.js",
   restore: "../dist/cli/restore.js",
   recover: "../dist/cli/recover.js",
@@ -67,6 +68,7 @@ function printHelp() {
       "  init             First-run setup (interactive; --yes for non-interactive).\n" +
       "  test             Fresh-install self-check against a throwaway relay.\n" +
       "  generate-hooks   Emit agent hook config (Claude JSON default; --codex Codex TOML; --all both).\n" +
+      "  cli-profiles     Print the agent-CLI profile registry (--json for machine-readable).\n" +
       "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
       "  restore PATH     Restore from a tar.gz archive.\n" +
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +

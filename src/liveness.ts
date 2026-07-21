@@ -42,6 +42,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { log } from "./logger.js";
+import { profileProcessPatternSource } from "./agent-cli-profiles.js";
 
 export type HostPlatform = "darwin" | "linux" | "win32" | string;
 
@@ -192,7 +193,10 @@ export interface AgentProcess {
  * falls back to age-based presence (safe). Operators extend coverage via
  * RELAY_AGENT_PROCESS_PATTERN (an alternation of BASENAMES, e.g. "aider|goose").
  */
-export const DEFAULT_AGENT_PATTERN = /^(claude|codex)$/i;
+// Derived from the agent-cli-profile registry (src/agent-cli-profiles.ts) — the
+// single source of truth for supported CLIs. Adding a profile widens this pattern
+// automatically; no hardcoded `claude|codex` here.
+export const DEFAULT_AGENT_PATTERN = new RegExp(`^(${profileProcessPatternSource()})$`, "i");
 
 /** Runtimes that host an agent CLI as a script — for these, the SCRIPT basename is the identity. */
 const RUNTIME_BASENAMES = /^(node|nodejs|bun|deno|python|python[23](\.\d+)?|ruby)$/i;
@@ -210,7 +214,7 @@ export function resolveAgentPattern(
   const extra = env.RELAY_AGENT_PROCESS_PATTERN?.trim();
   if (!extra) return DEFAULT_AGENT_PATTERN;
   try {
-    return new RegExp(`^(claude|codex|${extra})$`, "i");
+    return new RegExp(`^(${profileProcessPatternSource()}|${extra})$`, "i");
   } catch {
     return DEFAULT_AGENT_PATTERN;
   }

@@ -333,8 +333,19 @@ The wake harness above closes the loop on agents waking themselves. The other ha
 
 Everything else (routine acks, completion reports, audit dispatches) flows automatically. This is operator discipline, not a product feature — orchestrator agents should encode it in their prompt and respect it when chaining work.
 
+## Roadmap — any-terminal opt-in polling → `relay watch` (Maxime, 2026-07-15)
+
+**Goal:** any relay-connected terminal (not just Tether/VS Code) can *turn polling on* as a supported option. Today path β is a `/loop` template you copy by hand, and bare terminals (iTerm2 personas like victra) fall back to an operator hand-arming a Monitor. Per [[feedback_relay_plug_and_play]] a convention the user must remember = a relay bug, and per [[feedback_relay_over_memory]] this mechanical step should become a shipped feature.
+
+**Step 1 — opt-in polling for any terminal (near-term, low-effort).** Ship `relay watch <agent>` as a first-class CLI subcommand: runs the cheap `peek_inbox_version` loop (NOT a raw DB poke), and on an unread-count increase emits a standard wake signal — filesystem marker (turn on `RELAY_FILESYSTEM_MARKERS`, module already coded in `src/filesystem-marker.ts`) and/or a stdout line a harness Monitor can consume. One-line launcher gives polling to any surface. Reuses the Phase 4s primitives already built; no new detection layer.
+
+**Step 2 — per-surface wake shims consume the signal.** The relay ships the detector + signal; the last hop (nudge the specific REPL to read its inbox) stays surface-specific — Tether for VS Code, a Claude Code Monitor/hook for CLI, etc. The relay can't inject into an arbitrary runtime, so "polling comes with the relay" = watcher + standard signal shipped, thin shim per harness.
+
+**Priority:** low-effort; slot to victra-build on a building day, after the Codex-autowake item. Scoped task mirrored in `tasks/open.md`.
+
 ## See also
 
 - `roles/auto-poll-loop-template.md` — the canonical `/loop` recipe for path β.
 - `src/tools/peek-inbox-version.ts` + `src/db.ts:2975-3055` — the Phase 4s primitives.
+- `src/filesystem-marker.ts` — the marker-wake module (currently gated behind `RELAY_FILESYSTEM_MARKERS`, off by default).
 - `extensions/vscode/src/extension.ts` — the Tether wake-loop source.

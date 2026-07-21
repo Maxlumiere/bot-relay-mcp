@@ -426,6 +426,20 @@ ip_classifier_guard() {
 }
 step "ip-classifier guard (no duplicate CIDR logic)" ip_classifier_guard || exit 1
 
+# v2.17.0 P3 — CLI-profile branching drift guard. The agent-CLI profile registry
+# (src/agent-cli-profiles.ts) is the ONE place hardcoded claude/codex DECISION
+# LOGIC may live. A regex proved too leaky (codex's audit found 3 bypasses:
+# reversed equality, bare + noncapturing alternations), so detection is now a
+# narrow TS-AST walk (scripts/cli-profile-guard.mjs) shared with the vitest
+# drift-guard test — one implementation, both surfaces. It flags id-equality on
+# either operand, switch/case on a CLI id, and regex alternation of the ids; it
+# spares prose, ~/.claude/… paths, --flags, display strings, and registry
+# lookups by id. Escape hatch: `// CLI-PROFILE-ALLOWLIST: <reason>` on the line.
+cli_profile_guard() {
+  node "$PROJECT_ROOT/scripts/cli-profile-guard.mjs" "$PROJECT_ROOT/src"
+}
+step "cli-profile guard (no hardcoded claude|codex branching)" cli_profile_guard || exit 1
+
 # --- 6. 25-tool + CLI smoke against an isolated relay (v2.1 Phase 5a) ---
 # Inline cleanup (no RETURN trap) — simpler + avoids set-u pitfalls around
 # deferred variable lookup in trap strings.
