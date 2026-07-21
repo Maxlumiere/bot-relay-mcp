@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
 import cp from "child_process";
 import fs from "fs";
 import os from "os";
@@ -711,5 +711,187 @@ describe("spawn-agent.sh — v2.7.4 kickstart apostrophe-quoting fix", () => {
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
+  });
+});
+
+// v2.17.0 (P2 — LLM-agnostic spawn): the codex / launcher-strategy path.
+// spawn-agent.sh runs RELAY_SPAWN_LAUNCHER (set by the TS driver from the
+// registry) instead of `claude`. ALL identity/cwd hardening is CLI-agnostic and
+// still fires; the launcher path gets its own defense-in-depth validation
+// (absolute, no metachars/control chars, resolves to an executable WITHIN the
+// repo bin/). These run the real bash with RELAY_SPAWN_DRY_RUN=1.
+describe("spawn-agent.sh — v2.17.0 codex launcher path (RELAY_SPAWN_LAUNCHER)", () => {
+  const REJECT_EXIT = 2;
+  const CODEX_RELAY = path.resolve(__dirname, "..", "bin", "codex-relay");
+
+  it("accepts the real bin/codex-relay launcher → CMD runs `codex-relay <name>`, NOT claude", async () => {
+    const r = await runSpawnWithEnv(["cx-agent", "worker", "build", "/tmp"], {
+      RELAY_SPAWN_LAUNCHER: CODEX_RELAY,
+    });
+    expect(r.code, `stderr: ${r.stderr}`).toBe(0);
+    const cmd = r.stdout.split("\n").find((l) => l.startsWith("CMD=")) ?? "";
+    expect(cmd).toContain("codex-relay");
+    expect(cmd).toContain("cx-agent");
+    // The launcher path replaces claude entirely — no claude flags leak in.
+    expect(cmd).not.toContain("claude --permission-mode");
+    // Identity exports are still present (CLI-agnostic, reused).
+    expect(cmd).toContain("RELAY_AGENT_NAME=cx-agent");
+    expect(cmd).toContain("RELAY_TERMINAL_TITLE=cx-agent");
+  });
+
+  it("still enforces name hardening on the codex path (metachars in name blocked)", async () => {
+    for (const badName of ["x;rm -rf /", "x$(id)", "x`id`", "x|y", 'x"y']) {
+      const r = await runSpawnWithEnv([badName, "worker", "", "/tmp"], {
+        RELAY_SPAWN_LAUNCHER: CODEX_RELAY,
+      });
+      expect(r.code, `name "${badName}" should be rejected. stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+      expect(r.stderr).not.toBe("");
+    }
+  });
+
+  it("still enforces cwd hardening on the codex path (metachars / traversal blocked)", async () => {
+    for (const badCwd of ["relative/path", "/tmp/$(id)", "/tmp/`id`", "/tmp/x;y"]) {
+      const r = await runSpawnWithEnv(["cx", "worker", "", badCwd], {
+        RELAY_SPAWN_LAUNCHER: CODEX_RELAY,
+      });
+      expect(r.code, `cwd "${badCwd}" should be rejected. stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+    }
+  });
+
+  it("rejects a launcher OUTSIDE the repo bin/ (path escape)", async () => {
+    for (const bad of ["/tmp/evil-launcher", "/bin/sh", "/usr/bin/env"]) {
+      const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], { RELAY_SPAWN_LAUNCHER: bad });
+      expect(r.code, `launcher "${bad}" should be rejected. stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+      expect(r.stderr).toMatch(/outside the repo bin|not an executable|absolute path/i);
+    }
+  });
+
+  it("rejects a relative launcher path", async () => {
+    const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], {
+      RELAY_SPAWN_LAUNCHER: "bin/codex-relay",
+    });
+    expect(r.code).toBe(REJECT_EXIT);
+    expect(r.stderr).toMatch(/absolute path/i);
+  });
+
+  it("rejects a launcher with shell metacharacters", async () => {
+    for (const bad of [`${CODEX_RELAY}; rm -rf /`, `${CODEX_RELAY}$(id)`, `${CODEX_RELAY}|cat`]) {
+      const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], { RELAY_SPAWN_LAUNCHER: bad });
+      expect(r.code, `launcher "${bad}" should be rejected. stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+    }
+  });
+
+  it("rejects a bin/ path traversal that escapes the repo bin/", async () => {
+    // Absolute, textually under the repo but '..'-escaping to /etc/passwd.
+    const traversal = path.join(path.dirname(CODEX_RELAY), "..", "..", "..", "..", "etc", "passwd");
+    const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], { RELAY_SPAWN_LAUNCHER: traversal });
+    expect(r.code).toBe(REJECT_EXIT);
+  });
+
+  it("rejects a non-executable file inside bin/ (must be -x)", async () => {
+    // spawn-agent.sh itself lives in bin/ but pick a plain file: create a temp
+    // non-exec file INSIDE bin/, assert rejection, clean up.
+    const binDir = path.dirname(CODEX_RELAY);
+    const plain = path.join(binDir, `.p2-nonexec-${process.pid}.tmp`);
+    fs.writeFileSync(plain, "#!/bin/sh\n", { mode: 0o644 });
+    try {
+      const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], { RELAY_SPAWN_LAUNCHER: plain });
+      expect(r.code, `stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+      expect(r.stderr).toMatch(/not executable/i);
+    } finally {
+      fs.rmSync(plain, { force: true });
+    }
+  });
+
+  // v2.17.0 codex P2 audit regression — the symlink-escape hole. Validating the
+  // launcher's PARENT dir only (then re-joining basename) let a symlink
+  // physically inside bin/ point anywhere and pass. The fix canonicalizes the
+  // FINAL target; these prove the "symlink out of bin → exit 2" invariant.
+  const BIN_DIR = path.dirname(CODEX_RELAY);
+  // NOTE: fs.rmSync(force) on a DANGLING symlink no-ops on macOS (it follows the
+  // link, finds nothing, skips), leaving the link behind. Always unlink links.
+  const rmLink = (p: string): void => {
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      /* ENOENT — already gone */
+    }
+  };
+  const mkLink = (name: string, target: string): string => {
+    const p = path.join(BIN_DIR, name);
+    rmLink(p);
+    fs.symlinkSync(target, p);
+    return p;
+  };
+  // Belt-and-suspenders: sweep any `.p2-*` test artifact out of bin/ so a
+  // dangling symlink can never litter the repo, whatever a test does.
+  afterAll(() => {
+    for (const f of fs.readdirSync(BIN_DIR)) {
+      if (f.startsWith(".p2-")) rmLink(path.join(BIN_DIR, f));
+    }
+  });
+
+  it("(codex audit) rejects a symlink INSIDE bin/ that points to /bin/sh (the exact reported exploit)", async () => {
+    const link = mkLink(`.p2-audit-symlink-${process.pid}`, "/bin/sh");
+    try {
+      const r = await runSpawnWithEnv(["audit-codex", "worker", "", "/tmp"], {
+        RELAY_SPAWN_LAUNCHER: link,
+      });
+      expect(r.code, `symlink→/bin/sh must be rejected. stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+      expect(r.stderr).toMatch(/outside the repo bin/i);
+      // And the emitted CMD must NOT reference the symlink / /bin/sh.
+      expect(r.stdout).not.toContain("/bin/sh");
+    } finally {
+      rmLink(link);
+    }
+  });
+
+  it("(codex audit) rejects a symlink inside bin/ pointing outside the repo entirely", async () => {
+    const link = mkLink(`.p2-out-symlink-${process.pid}`, "/usr/bin/env");
+    try {
+      const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], { RELAY_SPAWN_LAUNCHER: link });
+      expect(r.code, `stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+      expect(r.stderr).toMatch(/outside the repo bin/i);
+    } finally {
+      rmLink(link);
+    }
+  });
+
+  it("(codex audit) rejects a symlink inside bin/ → a NON-EXECUTABLE file inside bin/", async () => {
+    const plain = path.join(BIN_DIR, `.p2-nonexec-target-${process.pid}.tmp`);
+    fs.writeFileSync(plain, "#!/bin/sh\n", { mode: 0o644 });
+    const link = mkLink(`.p2-nonexec-link-${process.pid}`, plain);
+    try {
+      const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], { RELAY_SPAWN_LAUNCHER: link });
+      expect(r.code, `stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+      expect(r.stderr).toMatch(/not executable/i);
+    } finally {
+      rmLink(link);
+      fs.rmSync(plain, { force: true });
+    }
+  });
+
+  it("(codex audit) rejects a symlink cycle", async () => {
+    const a = path.join(BIN_DIR, `.p2-cycle-a-${process.pid}`);
+    const b = path.join(BIN_DIR, `.p2-cycle-b-${process.pid}`);
+    rmLink(a);
+    rmLink(b);
+    fs.symlinkSync(b, a);
+    fs.symlinkSync(a, b);
+    try {
+      const r = await runSpawnWithEnv(["cx", "worker", "", "/tmp"], { RELAY_SPAWN_LAUNCHER: a });
+      expect(r.code, `stderr: ${r.stderr}`).toBe(REJECT_EXIT);
+    } finally {
+      rmLink(a);
+      rmLink(b);
+    }
+  });
+
+  it("(codex audit) STILL accepts the real bin/codex-relay after the fix (invariant not over-tightened)", async () => {
+    const r = await runSpawnWithEnv(["cx-agent", "worker", "", "/tmp"], {
+      RELAY_SPAWN_LAUNCHER: CODEX_RELAY,
+    });
+    expect(r.code, `stderr: ${r.stderr}`).toBe(0);
+    expect(r.stdout).toContain("codex-relay");
   });
 });

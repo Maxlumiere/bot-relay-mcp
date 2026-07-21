@@ -4,6 +4,7 @@
 // See LICENSE for full terms.
 
 import { z } from "zod";
+import { getAgentCliProfile } from "./agent-cli-profiles.js";
 
 // --- Zod Schemas for tool inputs ---
 
@@ -179,6 +180,17 @@ export const SpawnAgentSchema = z.object({
     .refine((v) => !SPAWN_BRIEF_PATH_FORBIDDEN.test(v), "brief_file_path contains a forbidden character (shell metachar or control char)")
     .optional()
     .describe("v2.1.4 (I10): absolute path to a task-brief file the spawned agent should read FIRST. The relay validates that the file exists at spawn time, is readable, and is <=10KB. When set, the default KICKSTART prompt appends a sentence telling the agent to read this file as the canonical source for its task scope — trust-anchored fix for respawned-agent context loss (inbox messages are not durable). macOS only for v2.1.4; Linux/Windows drivers ignore (no KICKSTART on those platforms yet)."),
+  // v2.17.0 (P2 — LLM-agnostic spawn): which agent CLI to launch. A registered
+  // agent-CLI profile id (see src/agent-cli-profiles.ts / `relay cli-profiles`).
+  // Default "claude" keeps every existing spawn_agent call byte-identical. The
+  // .refine() rejects an unknown CLI at the MCP boundary; the driver resolves
+  // the launch strategy from the profile registry (no hardcoded branch).
+  cli: z.string()
+    .min(1).max(32)
+    .regex(/^[A-Za-z0-9_-]+$/, "cli must match [A-Za-z0-9_-]+ (no spaces / shell metachars)")
+    .refine((v) => getAgentCliProfile(v) !== undefined, "cli must be a known agent-CLI profile id — see `relay cli-profiles` (claude|codex)")
+    .default("claude")
+    .describe("Which agent CLI to launch for the new terminal: a registered agent-CLI profile id — 'claude' (default) or 'codex'. Codex launches via bin/codex-relay (POSIX; macOS + Linux). See `relay cli-profiles`."),
   agent_token: AgentTokenField,
 });
 

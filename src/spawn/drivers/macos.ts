@@ -16,6 +16,7 @@ import { fileURLToPath } from "url";
 import type { SpawnAgentInput } from "../../types.js";
 import type { SpawnCommand, SpawnDriver, DriverContext } from "../types.js";
 import { buildChildEnv, normalizeCwd } from "../validation.js";
+import { getAgentCliProfile } from "../../agent-cli-profiles.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -48,10 +49,30 @@ export const macosDriver: SpawnDriver = {
     const args = [input.name, input.role, capsStr, cwd];
     const hasBrief = typeof briefFilePath === "string" && briefFilePath.length > 0;
     if (hasBrief) args.push(briefFilePath as string);
+
+    const env = buildChildEnv(input.name, input.role, input.capabilities, "darwin", process.env);
+
+    // v2.17.0 (P2): resolve the launch strategy from the profile registry — no
+    // per-CLI branch. `binary` → spawn-agent.sh runs `claude` (unchanged,
+    // byte-identical). `launcher` → spawn-agent.sh runs the repo launcher
+    // (bin/codex-relay), which pre-registers the cold-start handshake then
+    // execs the CLI. The launcher path is validated inside spawn-agent.sh
+    // (absolute, within repo bin/, executable) before it is embedded.
+    const profile = getAgentCliProfile(input.cli ?? "claude");
+    if (!profile) {
+      throw new Error(
+        `spawn: unknown cli "${input.cli}" — no agent-CLI profile. See \`relay cli-profiles\`.`
+      );
+    }
+    env.RELAY_SPAWN_CLI = profile.id;
+    if (profile.launch.strategy === "launcher" && profile.launch.launcherScript) {
+      env.RELAY_SPAWN_LAUNCHER = path.join(PROJECT_ROOT, profile.launch.launcherScript);
+    }
+
     return {
       exec: SPAWN_SCRIPT,
       args,
-      env: buildChildEnv(input.name, input.role, input.capabilities, "darwin", process.env),
+      env,
       detached: true,
       platform: "darwin",
       driverName: "macos",

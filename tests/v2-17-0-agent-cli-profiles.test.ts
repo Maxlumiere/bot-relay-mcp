@@ -58,6 +58,15 @@ describe("v2.17.0 P3 — agent-cli-profiles registry", () => {
       expect(Array.isArray(p.launch.flags)).toBe(true);
       p.launch.flags.forEach((f) => expect(typeof f).toBe("string"));
       expect(p.launch.titleFlag === null || typeof p.launch.titleFlag === "string").toBe(true);
+      // P2 launch strategy: "binary" carries no launcher; "launcher" MUST name a
+      // repo-relative launcher script (consumed by the spawn drivers).
+      expect(["binary", "launcher"]).toContain(p.launch.strategy);
+      if (p.launch.strategy === "launcher") {
+        expect(typeof p.launch.launcherScript).toBe("string");
+        expect(p.launch.launcherScript).toMatch(/^bin\//);
+      } else {
+        expect(p.launch.launcherScript).toBeNull();
+      }
       expect(p.wake.wakeText === null || typeof p.wake.wakeText === "string").toBe(true);
       expect(["\r", "\n"]).toContain(p.wake.submitKey);
       expect(["sendSequence", "sendText"]).toContain(p.wake.submitMethod);

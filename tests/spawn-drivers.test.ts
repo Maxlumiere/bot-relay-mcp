@@ -572,6 +572,38 @@ describe("adversarial payloads — Linux driver parity (v1.9.1 Blocker 1)", () =
     expect(launchArg).not.toContain(`/tmp/a'; rm -rf /; echo '`);
   });
 
+  it("(defense-in-depth, P2 codex launcher) escapes single-quoted cwd AND name even if zod relaxes", () => {
+    const ctx = makeCtx(["xterm"]);
+    // Bypass zod: hostile cwd + hostile name + cli=codex. The launcher path,
+    // the cwd, and the name are ALL POSIX single-quote-escaped so none can
+    // break out of the `bash -lc` string. Same guarantee as the claude path.
+    const hostile = {
+      name: "a'; rm -rf /; echo '",
+      role: "r",
+      capabilities: [],
+      cwd: "/tmp/b'; id; echo '",
+      cli: "codex",
+    } as any;
+    const cmd = linuxDriver.buildCommand(hostile, ctx);
+    const launchArg = cmd.args[cmd.args.indexOf("-lc") + 1];
+    // Runs the codex launcher, not claude.
+    expect(launchArg).toContain("codex-relay");
+    expect(launchArg).not.toContain("exec claude");
+    // POSIX escape idiom present; neither raw break-out payload appears as-is.
+    expect(launchArg).toContain(`'\\''`);
+    expect(launchArg).not.toContain(`/tmp/b'; id; echo '`);
+    expect(launchArg).not.toContain(`a'; rm -rf /; echo '`);
+  });
+
+  it("(argv-separation, P2 codex launcher) launch is `exec '<launcher>' '<name>'`, one argv element", () => {
+    for (const subEmulator of ["gnome-terminal", "konsole", "xterm"]) {
+      const ctx = makeCtx([subEmulator]);
+      const cmd = linuxDriver.buildCommand(baseInput({ cli: "codex" }), ctx);
+      const launchArg = cmd.args[cmd.args.indexOf("-lc") + 1];
+      expect(launchArg).toMatch(/cd '.*' && exec '.*\/bin\/codex-relay' 'worker-1'$/);
+    }
+  });
+
   it("(argv-separation) every other Linux sub-driver passes launch as own argv element, never concatenated", () => {
     for (const subEmulator of ["gnome-terminal", "konsole", "xterm"]) {
       const ctx = makeCtx([subEmulator]);
