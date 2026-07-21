@@ -70,7 +70,9 @@ describe("wasm driver — agent operations", () => {
     expect(agent.name).toBe("alice");
     expect(agent.role).toBe("chief");
     expect(agent.capabilities).toEqual(["a", "b"]);
-    expect(agent.status).toBe("online");
+    // v2.18.1: verdict-derived status — a bare register has no liveness anchor
+    // (host_id/agent_pid), so it is honestly `unknown`, never age-based `online`.
+    expect(agent.status).toBe("unknown");
     expect(plaintext_token).toBeTruthy();
     expect(agent.has_token).toBe(true);
   });

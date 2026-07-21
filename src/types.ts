@@ -916,8 +916,10 @@ export interface AgentRecord {
 
 export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "token_hash" | "session_id" | "agent_status" | "description" | "host_shell_pids" | "host_id"> {
   capabilities: string[];
-  /** v1.3 presence: computed from last_seen. Distinct from agent_status. */
-  status: "online" | "stale" | "offline";
+  /** Coarse presence, derived from the liveness VERDICT (v2.18.1 — NOT from
+   *  last_seen age, which lied) — alive→online, dead→offline, unknown→unknown.
+   *  A live agent NEVER reads offline; last_seen is pure telemetry. */
+  status: "online" | "offline" | "unknown";
   /** v1.7: whether the agent has a token (false = legacy pre-v1.7 agent) */
   has_token: boolean;
   /**

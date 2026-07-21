@@ -414,3 +414,41 @@ export function isAgentProcessAlive(
   if (current === null) return true; // can't validate → trust PID-liveness
   return current === expectedStartedAt;
 }
+
+// --- v2.18.1 liveness cascade fallback (Sentinel/liveness-derivation) ---
+// The verdict used to anchor ONLY on the agent's own pid, so an agent with no
+// registered agent_pid (or a stale one) read `unknown` → surfaced as the
+// age-based "offline" lie even while its process was trivially alive. This adds
+// one ALIVE-only fallback (it can confirm alive; its absence never proves dead),
+// host-scoped by the caller (host_id must equal this relay's own GUID) and
+// cache-bounded.
+//
+// NOTE: host_shell_pids is DELIBERATELY not probed as a fallback — see the
+// verdict cascade in db.ts. The Tether ancestry chain includes the terminal/
+// shell, which OUTLIVE the agent, so "any host_shell_pid alive" would false-read
+// a crashed agent alive (the v2.13.0 §3 contract). The argv scan below finds the
+// agent's OWN process instead, without that false-alive.
+
+/**
+ * Last-resort ALIVE probe: does a live process on THIS host advertise
+ * `RELAY_AGENT_NAME="<name>"` in its argv? (The launch path that fixed Codex
+ * cold-start puts the name in the command line.) Implemented as a LITERAL
+ * both-side-anchored substring search of `ps` command lines — NOT a `pgrep -f`
+ * regex — so:
+ *   - the surrounding quotes anchor both sides: agent "foo" cannot match a live
+ *     "foobar" / "foo-x" process (the needle `RELAY_AGENT_NAME="foo"` is not a
+ *     substring of `RELAY_AGENT_NAME="foobar"`);
+ *   - a literal `includes` has ZERO regex/shell-injection surface (a name with a
+ *     `.` or other metachar can't widen the match). Names are allowlisted on
+ *     register; we re-validate here belt-and-suspenders and bail on a bad name.
+ * Matches ARGV only (ps `command=`), never the environment, so this is exactly
+ * the argv-advertised case. Cost is one `ps` — the caller gates it behind the
+ * liveness probe cache and only reaches it when the pid probes miss.
+ */
+export function agentProcessAdvertised(name: string, run: CommandRunner = defaultRunner): boolean {
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(name)) return false; // belt-and-suspenders
+  const needle = `RELAY_AGENT_NAME="${name}"`;
+  const out = run("ps", ["-axo", "command="]);
+  if (!out) return false;
+  return out.split("\n").some((line) => line.includes(needle));
+}

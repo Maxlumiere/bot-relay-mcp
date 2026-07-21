@@ -62,7 +62,12 @@ describe("registerAgent", () => {
     expect(agent.name).toBe("orchestrator");
     expect(agent.role).toBe("chief-of-staff");
     expect(agent.capabilities).toEqual(["triage", "orchestration"]);
-    expect(agent.status).toBe("online");
+    // v2.18.1: `status` is verdict-derived, not last_seen age. A bare
+    // programmatic register carries no host_id / agent_pid liveness anchor, so
+    // the verdict is honestly `unknown` (NOT the old age-based `online`, and
+    // crucially NEVER `offline`). A real hook register sets host_id + agent_pid
+    // → the verdict resolves alive → online.
+    expect(agent.status).toBe("unknown");
     expect(agent.id).toBeTruthy();
     // v1.7: first registration returns a plaintext token
     expect(plaintext_token).toBeTruthy();
