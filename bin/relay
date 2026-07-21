@@ -12,6 +12,9 @@
  *   relay send TO CONTENT     Send a relay message in one line (v2.17.1). Resolves
  *                             the sender's token (env → vault → --mint-if-missing)
  *                             and POSTs /api/send-message. --from NAME sets sender.
+ *   relay watch AGENT         Sentinel (v2.18.0): autowake for a terminal agent not
+ *                             in Tether. Prints a wake line when AGENT gets new mail
+ *                             (event-driven with RELAY_FILESYSTEM_MARKERS). --once.
  *   relay backup [--output]   Snapshot the DB + config into a tar.gz archive.
  *   relay restore PATH        Restore from a tar.gz archive.
  *   relay recover NAME        Clear an agent's registration so it can re-bootstrap
@@ -50,6 +53,7 @@ const SUBCOMMANDS = {
   "generate-hooks": "../dist/cli/generate-hooks.js",
   "cli-profiles": "../dist/cli/cli-profiles.js",
   send: "../dist/cli/send.js",
+  watch: "../dist/cli/watch.js",
   backup: "../dist/cli/backup.js",
   restore: "../dist/cli/restore.js",
   recover: "../dist/cli/recover.js",
@@ -74,6 +78,7 @@ function printHelp() {
       "  generate-hooks   Emit agent hook config (Claude JSON default; --codex Codex TOML; --all both).\n" +
       "  cli-profiles     Print the agent-CLI profile registry (--json for machine-readable).\n" +
       "  send TO CONTENT  Send a relay message in one line (resolves the sender's token).\n" +
+      "  watch AGENT      Sentinel: autowake — print a wake line when AGENT gets new mail.\n" +
       "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
       "  restore PATH     Restore from a tar.gz archive.\n" +
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +

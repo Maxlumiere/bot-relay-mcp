@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.18.0 — 2026-07-21 — Sentinel: `relay watch` — autowake for any terminal
+
+Sentinel is the relay's built-in autowake for terminal agents **not** in VS Code/Tether (iTerm2 personas, plain terminals, remote sessions) — the poll/marker-based sibling of Tether's push-based wake. It's the shipped replacement for the hand-armed inbox-watcher bash loop. Pairs with Tether: **Tether = push-wake in VS Code; Sentinel = wake anywhere.**
+
+- **`relay watch <agent> [--interval S] [--once] [--json]`** — stands watch over `<agent>`'s inbox and prints a wake line when new mail arrives, so a harness Monitor (or you) can nudge the agent to read it. It consumes the sanctioned cheap primitive `peekMailboxVersion` **in-process** (a single indexed `COUNT`, not a raw `sqlite`-every-Ns scan loop); the wake signal is `total_unread_count` **rising** (`last_seq` is unreliable before first observation — v2.3.0 Codex HIGH #2). `--once` checks + exits (scripts/smoke); `--json` emits machine-consumable wake lines.
+- **Event-driven when `RELAY_FILESYSTEM_MARKERS=1`:** waits on the daemon-written delivery marker (`~/.bot-relay/marker/<agent>.touch`) via `fs.watch` (near-zero idle cost), with a slow fallback re-check so a **dropped** fs event is never a silent permanent miss (the marker is a HINT, not a queue). Falls back to bounded polling otherwise — no busy-spin.
+- **Local-trust auth** (filesystem authority, like `mint-token`/`recover`): reads the **ACTIVE per-instance DB** directly — no token. It resolves the instance DB exactly as the daemon does (`resolveInstanceDbPath`), **never** the legacy `~/.bot-relay/relay.db` (the stdio-legacy-DB-split trap), so the marker and the count read describe the same live instance. A token-authenticated `--remote` path is documented forward-compat, not built (YAGNI).
+
 ## v2.17.1 — 2026-07-21 — WakeSpec reconciliation + transient-send retro quick wins
 
 Fast relay patch. Corrects the 2.17.0 interim WakeSpec placeholders to the Tether extension's **proven** wake behavior (so the data-driven Tether 0.6.0 reads real values), plus three one-line-send DX wins from the transient-send retro.

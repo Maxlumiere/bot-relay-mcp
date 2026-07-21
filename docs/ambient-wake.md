@@ -333,9 +333,21 @@ The wake harness above closes the loop on agents waking themselves. The other ha
 
 Everything else (routine acks, completion reports, audit dispatches) flows automatically. This is operator discipline, not a product feature — orchestrator agents should encode it in their prompt and respect it when chaining work.
 
-## Roadmap — any-terminal opt-in polling → `relay watch` (Maxime, 2026-07-15)
+## Sentinel — `relay watch` (SHIPPED v2.18.0)
 
-**Goal:** any relay-connected terminal (not just Tether/VS Code) can *turn polling on* as a supported option. Today path β is a `/loop` template you copy by hand, and bare terminals (iTerm2 personas like victra) fall back to an operator hand-arming a Monitor. Per [[feedback_relay_plug_and_play]] a convention the user must remember = a relay bug, and per [[feedback_relay_over_memory]] this mechanical step should become a shipped feature.
+**Autowake for any terminal not in Tether.** `relay watch <agent>` is the shipped replacement for hand-arming a Monitor bash loop. It watches `<agent>`'s inbox via the cheap in-process `peekMailboxVersion` primitive (the wake signal is `total_unread_count` rising), event-driven off the delivery marker when `RELAY_FILESYSTEM_MARKERS=1` (with a fallback re-check so a dropped fs event is never a permanent miss), bounded polling otherwise. On new mail it prints a wake line (`--json` for machine parse) a harness Monitor consumes. Local-trust: it reads the ACTIVE per-instance DB directly (no token) — never the legacy flat DB.
+
+**Onboarding — "register → start your watch".** When an agent registers AND expects replies back — a temporary `tmp-*` transient watching for its one reply, or a full-time persona — the standard is: register, then start Sentinel in a side process:
+
+```sh
+relay watch "$RELAY_AGENT_NAME" &      # event-driven with RELAY_FILESYSTEM_MARKERS=1
+```
+
+A harness Monitor (or the operator) consumes the wake line and nudges the REPL to drain its inbox. This is the poll/marker sibling of Tether's push-wake: **Tether = VS Code; Sentinel = anywhere.**
+
+## Roadmap — any-terminal opt-in polling → `relay watch` (Maxime, 2026-07-15) — DELIVERED
+
+**Goal (met by v2.18.0 above):** any relay-connected terminal (not just Tether/VS Code) can *turn polling on* as a supported option. Today path β is a `/loop` template you copy by hand, and bare terminals (iTerm2 personas like victra) fall back to an operator hand-arming a Monitor. Per [[feedback_relay_plug_and_play]] a convention the user must remember = a relay bug, and per [[feedback_relay_over_memory]] this mechanical step should become a shipped feature.
 
 **Step 1 — opt-in polling for any terminal (near-term, low-effort).** Ship `relay watch <agent>` as a first-class CLI subcommand: runs the cheap `peek_inbox_version` loop (NOT a raw DB poke), and on an unread-count increase emits a standard wake signal — filesystem marker (turn on `RELAY_FILESYSTEM_MARKERS`, module already coded in `src/filesystem-marker.ts`) and/or a stdout line a harness Monitor can consume. One-line launcher gives polling to any surface. Reuses the Phase 4s primitives already built; no new detection layer.
 
