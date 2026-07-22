@@ -17,8 +17,7 @@
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
-    "SECURITY.md",
-    "architecture.md"
+    "SECURITY.md"
   ],
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",

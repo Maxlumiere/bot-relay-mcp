@@ -22,6 +22,10 @@ import os from "os";
 
 const TEST_TMP = path.join(os.tmpdir(), "bot-relay-v230-profiles-" + process.pid);
 const CONFIG_PATH = path.join(TEST_TMP, "config.json");
+// `--profile=team` init reaches init.ts's macOS launchd bootstrap (real
+// `launchctl`) under `npm test`. Guard the whole file (matches v2-16-0 +
+// tests/v2-1-cli-tooling.test.ts's "tests never touch real launchctl" rule).
+process.env.RELAY_SKIP_DAEMON = "1";
 
 beforeEach(() => {
   if (fs.existsSync(TEST_TMP)) fs.rmSync(TEST_TMP, { recursive: true, force: true });

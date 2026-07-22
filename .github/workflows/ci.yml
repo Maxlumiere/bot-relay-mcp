@@ -92,6 +92,60 @@ jobs:
         # Guarded by tests/v2-4-3-ci-audit-bypass-guard.test.ts.
         run: bash scripts/audit-with-retry.sh high
 
+  # macOS launchd side-effect guard. The Ubuntu `test` job structurally CANNOT
+  # catch a test that shells to real `launchctl` — init.ts's daemon bootstrap is
+  # darwin-gated, so a `runInit` test that forgets RELAY_SKIP_DAEMON silently
+  # installs a real launchd KeepAlive service + a :3777 daemon on a contributor's
+  # Mac under `npm test` (the exact bug this job exists to prevent recurring).
+  # This runs the suite on macOS and then ASSERTS no bot-relay launchd service
+  # leaked, so a future unguarded runInit caller fails HERE instead of on a Mac.
+  test-macos:
+    name: Test (macOS — launchd side-effect guard)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Same as the Ubuntu job: the drift-out + ext-unit guards read the shipped
+      # extensions/vscode/out/extension.js, so build it before the suite runs.
+      - name: Build VSCode extension bundle
+        run: |
+          cd extensions/vscode
+          npm install
+          npm run typecheck
+          npm run bundle
+
+      - name: Assert no bot-relay launchd service pre-exists on the runner
+        run: |
+          if launchctl list 2>/dev/null | grep -q 'com.lumiereventures.bot-relay'; then
+            echo "Unexpected: a bot-relay launchd service already exists on the runner"; exit 1
+          fi
+
+      - name: Run test suite
+        run: npx vitest run
+
+      - name: Assert the suite installed NO real launchd service
+        run: |
+          if launchctl list 2>/dev/null | grep -q 'com.lumiereventures.bot-relay'; then
+            echo "FAIL: a test shelled to real launchctl and installed a bot-relay daemon service:"
+            launchctl list | grep bot-relay
+            echo "Fix: set RELAY_SKIP_DAEMON=1 in the offending runInit test (see tests/v2-4-0-instance-cli.test.ts)."
+            exit 1
+          fi
+          echo "OK: no bot-relay launchd service leaked"
+
   smoke:
     name: 25-tool smoke (Node 22)
     runs-on: ubuntu-latest
