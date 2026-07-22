@@ -291,4 +291,40 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
       }`;
     expect(findAuthGenViolations(good, "good.ts")).toEqual([]);
   });
+
+  // codex ADR-0003 forward-hardening: the two synthetic bypasses codex
+  // constructed against the declaration-only / name-pattern-exemption v1.
+  it("EVASION 1: a validity-changing mutator NAMED migrateSchemaTo* does NOT evade (explicit allowlist)", () => {
+    const evasion = `
+      export function migrateSchemaToEvil(name: string): void {
+        getDb().prepare("UPDATE agents SET token_hash = ? WHERE name = ?").run("x", name);
+      }`;
+    const v = findAuthGenViolations(evasion, "ev.ts").map((x: { name: string }) => x.name);
+    expect(v).toContain("migrateSchemaToEvil");
+    // ...while the genuinely init-only, explicitly-allowlisted migration stays exempt.
+    const allowed = `
+      function migrateSchemaToV2_1(db: any): void {
+        db.prepare("UPDATE agents SET auth_state = 'legacy_bootstrap' WHERE token_hash IS NULL").run();
+      }`;
+    expect(findAuthGenViolations(allowed, "mig.ts")).toEqual([]);
+  });
+
+  it("EVASION 2: arrow-function + function-expression + method mutators do NOT evade", () => {
+    const evasion = `
+      export const arrowRevoke = (name: string): void => {
+        getDb().prepare("UPDATE agents SET auth_state = 'revoked' WHERE name = ?").run(name);
+      };
+      const exprDelete = function (name: string) {
+        getDb().prepare("DELETE FROM agents WHERE name = ?").run(name);
+      };
+      class Store {
+        methodRotate(name: string): void {
+          getDb().prepare("UPDATE agents SET token_hash = ? WHERE name = ?").run("h", name);
+        }
+      }`;
+    const v = findAuthGenViolations(evasion, "ev2.ts").map((x: { name: string }) => x.name);
+    expect(v).toContain("arrowRevoke");
+    expect(v).toContain("exprDelete");
+    expect(v).toContain("methodRotate");
+  });
 });

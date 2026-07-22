@@ -26,12 +26,23 @@
  *   • `bumpAuthGeneration` / `applyAuthStateTransition` — the sanctioned bump
  *     primitives (the latter contains a dynamic `UPDATE agents SET` + bumps).
  *
- * SCOPE (documented boundary, like the cli-profile guard): the guard proves a
- * mutator contains a bump; it does not prove EVERY return-path bumps. That
- * finer property is covered by the behavioral invalidation tests
- * (tests/v2-20-0-auth-latency.test.ts — one case per mutation path). The guard's
- * job is to catch the OMISSION class — a new/edited mutator that ships with no
- * bump at all — which it does, adversarially proven by its negative fixture.
+ * ── FROZEN ACCEPTANCE CRITERIA (Victra ADR-0003 gate — do NOT whack-a-mole) ───
+ * This guard exists to catch ACCIDENTAL DRIFT — a new/edited mutator that ships
+ * with no bump. It is COMPLETE when all three hold; it is not iterated further:
+ *   • MUST visit the common function syntaxes a mutator is realistically
+ *     written as: function declarations, arrow functions + function expressions
+ *     assigned to a name, class methods, and object-literal function
+ *     properties. (codex proved the declaration-only v1 was evaded by an arrow.)
+ *   • MUST exempt init-only migrations via an EXPLICIT name allowlist
+ *     (INIT_ONLY_ALLOWLIST), NOT a `migrateSchemaTo*` wildcard — so a runtime
+ *     mutator cannot evade by naming itself `migrateSchemaTo…`.
+ *   • MUST NOT chase adversarial obfuscation — dynamically-named / eval'd /
+ *     reflection-dispatched / string-concatenated mutators are OUT OF SCOPE BY
+ *     DESIGN. That is a malicious-insider threat model; this guard defends
+ *     against accidental drift. It also does not prove EVERY return-path bumps
+ *     (the behavioral tests in tests/v2-20-0-auth-latency.test.ts do that,
+ *     one case per mutation path). An obfuscation-only finding is a documented
+ *     note, NOT a merge blocker.
  *
  * Exit: 0 = clean · 1 = violations (stderr) · 2 = usage/parse error
  * Usage: node scripts/auth-gen-guard.mjs <db.ts> [<file> ...]
@@ -52,12 +63,18 @@ const SENSITIVE_COLS = [
 ];
 // Functions that ARE the bump primitives — they don't need to call themselves.
 const SELF_BUMPERS = new Set(["bumpAuthGeneration", "applyAuthStateTransition"]);
-// Init-only schema migrations (the `migrateSchemaToV2_x` chain) run ONCE at
-// startup, before the daemon serves any auth request — the per-process
-// verified-token cache is empty at that point, so a one-time backfill of
-// auth_state/token columns has nothing to invalidate. Exempt by the codebase's
-// migration-naming convention.
-const INIT_ONLY_RE = /^migrateSchemaTo/;
+// EXPLICIT init-only allowlist (codex ADR-0003 forward-hardening): schema
+// migrations run ONCE during DB initialization, before the daemon serves any
+// auth request — the per-process verified-token cache is empty then, so a
+// one-time backfill of auth columns has nothing to invalidate. They ALSO
+// cannot bump: bumpAuthGeneration writes auth_meta, which an EARLY migration
+// (e.g. V2_1) predates (auth_meta is created in V2_20). This is an EXPLICIT set
+// — NOT a `migrateSchemaTo*` wildcard — so a validity-changing mutator can't
+// evade the guard merely by naming itself `migrateSchemaTo…`. A future
+// migration that rewrites a token/auth column must be added here CONSCIOUSLY
+// (and only if it is genuinely init-only). Today only V2_1 backfills auth_state
+// (on token_hash IS NULL rows, which can't have a positive cache entry).
+const INIT_ONLY_ALLOWLIST = new Set(["migrateSchemaToV2_1"]);
 const BUMP_CALL_RE = /\b(?:bumpAuthGeneration|applyAuthStateTransition)\s*\(/;
 
 /** Does this function body perform a validity-changing agents mutation? */
@@ -84,16 +101,49 @@ function hasValidityChangingMutation(bodyText) {
 export function findAuthGenViolations(source, fileName = "db.ts") {
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const violations = [];
+
+  // Analyze one NAMED function unit (declaration / arrow / function-expression /
+  // method): if its body performs a validity-changing agents mutation it MUST
+  // bump, unless it is a self-bumper or an explicit init-only migration.
+  const analyze = (name, bodyNode, nameNode) => {
+    if (!name || SELF_BUMPERS.has(name) || INIT_ONLY_ALLOWLIST.has(name)) return;
+    const bodyText = bodyNode.getText(sf);
+    if (hasValidityChangingMutation(bodyText) && !BUMP_CALL_RE.test(bodyText)) {
+      violations.push({ name, line: sf.getLineAndCharacterOfPosition(nameNode.getStart(sf)).line + 1 });
+    }
+  };
+
   const visit = (node) => {
+    // 1. function NAME(...) { ... }
     if (ts.isFunctionDeclaration(node) && node.name && node.body) {
-      const name = node.name.text;
-      if (!SELF_BUMPERS.has(name) && !INIT_ONLY_RE.test(name)) {
-        const bodyText = node.body.getText(sf);
-        if (hasValidityChangingMutation(bodyText) && !BUMP_CALL_RE.test(bodyText)) {
-          const line = sf.getLineAndCharacterOfPosition(node.name.getStart(sf)).line + 1;
-          violations.push({ name, line });
-        }
-      }
+      analyze(node.name.text, node.body, node.name);
+    }
+    // 2. const NAME = (...) => { ... }  /  const NAME = function (...) { ... }
+    //    (the arrow / function-expression evasion codex constructed)
+    else if (
+      ts.isVariableDeclaration(node) &&
+      node.name &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer)) &&
+      node.initializer.body
+    ) {
+      analyze(node.name.text, node.initializer.body, node.name);
+    }
+    // 3. class/object method NAME(...) { ... }
+    else if (ts.isMethodDeclaration(node) && node.name && ts.isIdentifier(node.name) && node.body) {
+      analyze(node.name.text, node.body, node.name);
+    }
+    // 4. { NAME: (...) => { ... } }  object-literal property holding a function
+    else if (
+      ts.isPropertyAssignment(node) &&
+      node.name &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer)) &&
+      node.initializer.body
+    ) {
+      analyze(node.name.text, node.initializer.body, node.name);
     }
     ts.forEachChild(node, visit);
   };
