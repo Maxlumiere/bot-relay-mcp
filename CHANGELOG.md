@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.20.1 — 2026-07-22 — Verified-token cache on the explicit-caller auth path
+
+ADR-0003 made the O(N) **token-only** auth scan O(1). This extends the same verified-token cache to the **explicit-caller** path (`enforceAuth` for tools that name their caller — `send_message.from`, `get_messages.agent_name`, … — the orchestration hot path), which still bcrypt-verified on every call.
+
+- **Cache short-circuit, impersonation-gated.** The explicit-caller branch now consults the same verified-token cache first; a hit skips the per-call bcrypt. A hit is honored **only when the cached verdict belongs to the claimed caller** — a valid token for agent X can **never** authenticate a claim `from: Y`, even with a warm cache (the name-match gate). A miss falls through to the unchanged `authenticateAgent` flow, so every revoked / recovery / rotation-grace / legacy-can't-actor-stamp behavior is preserved, then re-populates the cache.
+- **One cache layer, one invalidation.** Both auth paths now route through the same `verifiedTokenCacheGet` / store-or-heal helpers (a security argument, not just DRY — two paths that must invalidate identically shouldn't be maintained separately). The generation counter still gives instant revocation on both: a revoked/rotated token → generation moved → cache miss → the correct error. bcrypt remains the sole verifier.
+- **Deterministic O(1) migration.** The explicit-path miss now lazily **self-heals** the caller's lookup digest too. Since every agent makes explicit-path calls, the whole fleet's `token_lookup` populates on first send — so token-only calls also go O(1), closing the NULL-digest gap left by ADR-0003 (which only self-healed on the token-only path). Native + wasm parity. No new tools, no API change.
+
 ## v2.20.0 — 2026-07-22 — ADR-0003: O(1) token auth (indexed HMAC locator + verified-token cache)
 
 Token-only tool calls no longer scan every agent with bcrypt. Two O(N) linear bcrypt scans (`resolveCallerByToken` for the dispatcher, `checkToken` for `health_check`) are replaced by an O(1) indexed lookup plus a verified-token cache — bcrypt stays the sole verifier throughout.

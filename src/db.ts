@@ -1760,51 +1760,154 @@ function selfHealTokenLookup(
 }
 
 /**
- * ADR-0003 — O(1) token-only caller resolution. Faithful drop-in replacement
- * for the legacy O(N) bcrypt scan (server.ts resolveCallerByToken).
+ * v2.20.1 SHARED verified-token cache GET — used by BOTH auth paths so they
+ * read + invalidate IDENTICALLY (anti-divergence is the security argument, per
+ * Victra's Q2 gate). `requireName`: on the explicit-caller path, only honor a
+ * hit whose cached identity equals the CLAIMED caller — a valid token for X
+ * must NEVER authenticate a claim to be Y (the impersonation gate). `null`
+ * (token-only path) accepts any cached name. The generation + TTL are enforced
+ * inside authCacheGet.
+ */
+function verifiedTokenCacheGet(
+  digest: string,
+  gen: number,
+  now: number,
+  requireName: string | null,
+): { name: string; capabilities: string[] } | null {
+  const c = authCacheGet(digest, gen, now);
+  if (!c) return null;
+  if (requireName !== null && c.name !== requireName) return null;
+  return c;
+}
+
+/**
+ * v2.20.1 SHARED store-or-heal after a bcrypt-verified POSITIVE verdict — used
+ * by BOTH auth paths. `indexed` true (the digest is already stored — a locator
+ * hit, or the row's column already equals the digest) → cache the verdict.
+ * `indexed` false (fallback / not-yet-indexed row) → lazily self-heal the
+ * digest column (which bumps the generation) and SKIP caching this call — the
+ * next call caches under the fresh generation. Only positive active/grace
+ * verdicts ever reach here, so revoked/recovery/legacy are never cached.
+ */
+function verifiedTokenCachePut(
+  digest: string,
+  gen: number,
+  now: number,
+  indexed: boolean,
+  row: AgentRecord,
+  matchedColumn: "token_lookup" | "previous_token_lookup",
+  name: string,
+  capabilities: string[],
+  graceExpiry: number | null,
+): void {
+  if (indexed) {
+    authCacheSet(digest, { name, capabilities }, gen, authCacheExpiry(now, graceExpiry));
+  } else {
+    selfHealTokenLookup(row, matchedColumn, digest);
+  }
+}
+
+/**
+ * ADR-0003 — O(1) token-only caller resolution (server.ts resolveCallerByToken).
  *
- * Path: verified-token cache (generation + TTL checked) → shared indexed
- * locator (findAgentRowByToken) → active/grace decision → cache. On a locator
- * MISS the shared fallback still finds the row; we then lazily self-heal the
- * digest (which bumps the generation) and skip caching this call — the next
- * call's locator hit caches it under the fresh generation.
+ * Path: shared verified-token cache → shared indexed locator
+ * (findAgentRowByToken) → active/grace decision → shared store-or-heal. On a
+ * locator MISS the shared fallback still finds the row; we then lazily self-heal
+ * the digest (which bumps the generation) and skip caching this call.
  *
- * bcrypt stays the sole verifier: the digest only narrows candidates (a
- * collision is caught by the bcrypt confirm inside findAgentRowByToken), and
- * the cache only replays an already-bcrypt-verified verdict that is still
- * current (generation unchanged) and unexpired.
+ * v2.20.1: refactored onto the SAME verifiedTokenCacheGet/Put helpers the
+ * explicit-caller path uses — one cache layer, one invalidation. bcrypt stays
+ * the sole verifier (the digest only narrows candidates; the cache replays an
+ * already-verified, still-current verdict).
  */
 export function resolveAgentByToken(token: string): { name: string; capabilities: string[] } | null {
   const digest = computeTokenLookup(token);
   const gen = getAuthGeneration();
   const now = Date.now();
 
-  // 1. Cache — generation + TTL enforced inside; a stale/expired entry is evicted.
-  const cached = authCacheGet(digest, gen, now);
+  const cached = verifiedTokenCacheGet(digest, gen, now, null); // token-only: any name
   if (cached) return cached;
 
-  // 2. Shared O(1) locator (+ O(N) fallback).
   const found = findAgentRowByToken(token);
   if (!found) return null;
   const decision = decideActiveGrace(found.row, found.matched);
   if (!decision) return null; // revoked / recovery / legacy / expired-grace-previous → not a caller
 
-  if (found.fromLocator) {
-    authCacheSet(
-      digest,
-      { name: found.row.name, capabilities: decision.capabilities },
-      gen,
-      authCacheExpiry(now, decision.graceExpiry),
-    );
-  } else {
-    // Fallback → self-heal (bumps the generation), so do NOT cache this call.
-    selfHealTokenLookup(
-      found.row,
-      found.matched === "current" ? "token_lookup" : "previous_token_lookup",
-      digest,
-    );
-  }
+  verifiedTokenCachePut(
+    digest,
+    gen,
+    now,
+    found.fromLocator,
+    found.row,
+    found.matched === "current" ? "token_lookup" : "previous_token_lookup",
+    found.row.name,
+    decision.capabilities,
+    decision.graceExpiry,
+  );
   return { name: found.row.name, capabilities: decision.capabilities };
+}
+
+/**
+ * v2.20.1 — verified-token cache GET for the EXPLICIT-CALLER auth path
+ * (server.ts enforceAuth: send_message.from, get_messages.agent_name, …).
+ * Impersonation-gated: returns a cached verdict ONLY when it belongs to
+ * `claimedName`. On a hit the caller skips its per-call bcrypt; on null the
+ * caller runs the full authenticateAgent flow (preserving all
+ * revoked/recovery/grace/legacy semantics), then calls explicitCallerCachePut.
+ */
+export function explicitCallerCacheGet(
+  token: string,
+  claimedName: string,
+): { name: string; capabilities: string[] } | null {
+  const digest = computeTokenLookup(token);
+  const gen = getAuthGeneration();
+  const now = Date.now();
+  return verifiedTokenCacheGet(digest, gen, now, claimedName);
+}
+
+/**
+ * v2.20.1 — store the explicit-caller path's bcrypt-verified verdict + lazily
+ * self-heal `claimedRow`'s lookup digest (Q1: every agent makes explicit-path
+ * calls, so this deterministically migrates the whole fleet to O(1) and closes
+ * the NULL-digest observation). Call ONLY after authenticateAgent returned ok
+ * (and not legacy). For an `active` row the current token matched (no extra
+ * bcrypt); only a rotation_grace row needs a one-row re-check to tell the
+ * current token from the grace-window previous token (for the correct TTL cap).
+ */
+export function explicitCallerCachePut(
+  token: string,
+  claimedRow: AgentRecord,
+  capabilities: string[],
+): void {
+  const digest = computeTokenLookup(token);
+  const gen = getAuthGeneration();
+  const now = Date.now();
+
+  let matchedColumn: "token_lookup" | "previous_token_lookup" = "token_lookup";
+  let graceExpiry: number | null = null;
+  if ((claimedRow.auth_state ?? "active") === "rotation_grace") {
+    const m = matchTokenAgainstRows(token, [claimedRow]);
+    if (m && m.matched === "previous") {
+      matchedColumn = "previous_token_lookup";
+      const e = claimedRow.rotation_grace_expires_at
+        ? new Date(claimedRow.rotation_grace_expires_at).getTime()
+        : 0;
+      graceExpiry = e > 0 ? e : null;
+    }
+  }
+  const stored =
+    matchedColumn === "token_lookup" ? claimedRow.token_lookup : claimedRow.previous_token_lookup;
+  verifiedTokenCachePut(
+    digest,
+    gen,
+    now,
+    stored === digest, // indexed?
+    claimedRow,
+    matchedColumn,
+    claimedRow.name,
+    capabilities,
+    graceExpiry,
+  );
 }
 
 export function purgeOldRecords(db: CompatDatabase): void {
