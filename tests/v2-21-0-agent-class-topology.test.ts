@@ -59,6 +59,19 @@ describe("ADR-0002 — class round-trips + defaults + immutability", () => {
     expect(agent("rt-orch")!.class).toBe("orchestrator");
   });
 
+  it("the INITIAL register_agent response carries the declared class (codex #114 blocker)", () => {
+    // The FIRST-registration response is projected from an in-memory row (not
+    // re-read from the DB), so a dropped `class` there reads 'unclassified'
+    // even though the persisted row + next discover_agents are correct. The
+    // round-trip test above goes through getAgents() (re-read) and would NOT
+    // catch it — so assert the DIRECT return value of registerAgent().
+    const declared = registerAgent("first-auditor", "builder", [], { class: "auditor" });
+    expect(declared.agent.class).toBe("auditor");
+    // Undeclared still normalizes to unclassified in that same first response.
+    const undeclared = registerAgent("first-legacy", "worker", []);
+    expect(undeclared.agent.class).toBe(UNCLASSIFIED);
+  });
+
   it("an undeclared class reads as `unclassified` (NULL normalized)", () => {
     reg("rt-legacy", "worker");
     expect(agent("rt-legacy")!.class).toBe(UNCLASSIFIED);

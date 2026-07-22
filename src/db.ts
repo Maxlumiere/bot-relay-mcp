@@ -2974,6 +2974,12 @@ export function registerAgent(
       agent_status: "idle", // v2.1.3 (I6)
       managed,
       terminal_title_ref: titleRef,
+      // ADR-0002 (codex #114 blocker): the INSERT above persists the declared
+      // class, but this in-memory row is projected straight to the FIRST
+      // register_agent response — omitting it made toAgentWithStatus read
+      // row.class===undefined → normalizeAgentClass → 'unclassified'. Mirror the
+      // persisted value so the initial response matches the row + next read.
+      class: options.class ?? null,
     });
   }
 
