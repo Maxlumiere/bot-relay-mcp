@@ -1,9 +1,11 @@
 # Security Policy
 
 **Project:** bot-relay-mcp
-**Last updated:** 2026-04-21 (v2.1.7)
+**Last updated:** 2026-07-22 (latest release: v2.20.0)
 
 ---
+
+> **Post-v2.1.7 hardening is tracked per-release in the [CHANGELOG](./CHANGELOG.md).** Highlights since this document's v2.1.7 baseline: the **v2.20.0 `fast-uri` HIGH advisory pin** (GHSA-4c8g-83qw-93j6 + GHSA-v2hh-gcrm-f6hx, CVSS 7.5 — URI host-confusion, pinned to 3.1.4 via `overrides`); the **ADR-0003 O(1) auth path** (indexed HMAC token locator + verified-token cache — **bcrypt remains the sole verifier**, with an adversarial drift guard enforcing cache invalidation on every token mutation); and the **v2.19.0 presence-derivation** fix. The v2.1.7 external review below is retained as the baseline hardening record.
 
 ## v2.1.7 external review (external reviewer + Codex)
 

@@ -130,7 +130,7 @@ The command prints an MCP client config snippet like:
     "type": "http",
     "url": "https://relay.example.com/mcp",
     "headers": {
-      "X-Agent-Token": "NQ4fgn4mFw_Y5Ar6ERH1WL38QziChjD624STj0eU_m4",
+      "X-Agent-Token": "<your-agent-token>",
       "X-Relay-Secret": "…"
     }
   }
@@ -146,7 +146,7 @@ Paste it under `mcpServers` in your MCP client config:
 Then persist the token for hooks:
 
 ```bash
-echo 'export RELAY_AGENT_TOKEN=NQ4fgn4mFw_Y5Ar6ERH1WL38QziChjD624STj0eU_m4' >> ~/.zshrc
+echo 'export RELAY_AGENT_TOKEN=<your-agent-token>' >> ~/.zshrc
 source ~/.zshrc
 ```
 

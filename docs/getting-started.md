@@ -11,7 +11,7 @@ npm install
 npm run build
 ```
 
-(Once published to npm, this will become `npx bot-relay-mcp` — one command.)
+> **Published on npm — you can skip the clone/build above.** The one-command path is `npx -y bot-relay-mcp` wired straight into `~/.claude.json` (see the [README Quick Start](../README.md#quick-start-30-seconds)). The from-source steps here are for development or pinning a local build.
 
 ## Step 2 — Wire into Claude Code
 
