@@ -98,11 +98,12 @@ describe("HTTP transport", () => {
     expect(body2.uptime_seconds).toBeGreaterThanOrEqual(body.uptime_seconds);
   });
 
-  it("tools/list returns all 35 tools (34 + report_liveness [v2.15.0 presence self-heal])", async () => {
+  it("tools/list returns all 36 tools (35 + abandon_registration [ADR-0005])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(35);
+    expect(result.result.tools.length).toBe(36);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
+    expect(names).toContain("abandon_registration");
     expect(names).toContain("unregister_agent");
     expect(names).toContain("spawn_agent");
     expect(names).toContain("register_webhook");

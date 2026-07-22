@@ -47,7 +47,7 @@ async function rpc(tool: string, args: any, token?: string): Promise<any> {
   });
   const text = await res.text();
   const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-  return JSON.parse(JSON.parse(dataLine!.slice(5).trim()).result.content[0].text);
+  return JSON.parse(JSON.parse(dataLine ? dataLine.slice(5).trim() : text).result.content[0].text);
 }
 
 function cleanup() {

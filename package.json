@@ -1,7 +1,7 @@
 {
   "name": "bot-relay-mcp",
   "mcpName": "io.github.Maxlumiere/bot-relay-mcp",
-  "version": "2.21.0",
+  "version": "2.22.0",
   "description": "MCP server for AI coding agent terminal-to-terminal communication. Local-first, SQLite-backed, webhook-integrated.",
   "type": "module",
   "main": "dist/index.js",

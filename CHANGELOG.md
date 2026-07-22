@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.22.0 — 2026-07-22 — ADR-0005: relay DX hardening (curl/script-caller friction)
+
+Five fixes for callers driving the relay over raw HTTP (no MCP client wired in), from a real friction report. The load-bearing one is a **safe self-serve orphan cleanup**.
+
+- **Safe orphan cleanup (#4) — `abandon_registration` + auto-GC.** A caller who registered but lost the `agent_token` before ever authenticating (e.g. a truncated `curl` capture) orphaned a row it couldn't unregister (unregister needs the lost token) — and had to reach for the *destructive operator endpoint*. Now: register returns a one-time, name-scoped **`registration_recovery`** handle; `abandon_registration(name, handle)` self-cleans the orphan without a token. **Safe by construction** via the security keystone — a new `first_authed_at` marker (stamped on first successful auth) means abandon + the auto-GC can **only ever** remove a row that has NEVER authenticated, so a working agent self-excludes and can never be reached (the handle just authorizes + covers the just-registered race). A daemon **auto-GC** removes never-authed, session-less rows after ~30 min (`RELAY_ORPHAN_TTL_MINUTES`) as a deterministic backstop — retiring `/api/kill-agent` for self-cleanup. Architect-designed (ADR-0005); the keystone invariant is adversarially tested.
+- **Reliable token capture (#2).** `agent_token` is now the **first** field of the register response, so a truncated `head -c` read still captures it (it was buried 4th).
+- **Plain JSON for one-shots (#3).** A non-streaming one-shot `POST /mcp` now returns `application/json`, not an `event: message\ndata: {…}` SSE frame — curl/script callers can `JSON.parse` the body directly. The stateful/streaming (Tether SSE) path is unchanged.
+- **`send_message` accepts `message` (#5).** The MCP tool now takes `content` **or** its alias `message` (exactly one; both-with-different-values rejected), matching the REST endpoint + the agent-team `SendMessage` — one send vocabulary across every surface.
+- **HTTP one-shot recipe (#1).** New `docs/http-one-shot.md`: register → capture → send → self-clean over `curl`.
+
+Schema v22 (`first_authed_at` + `registration_recovery_hash`/`_expires_at`, additive). 36 MCP tools (adds `abandon_registration`). Native + wasm parity.
+
 ## v2.21.0 — 2026-07-22 — ADR-0002: agent class/flare topology
 
 Agents can now declare a **coordination class** — a coarse "flare" of their posture in the team — and `discover_agents` gains a **`view='topology'`** that renders the live team grouped by class. A fresh agent can also learn its peers on session start (opt-in).

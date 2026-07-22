@@ -5,7 +5,7 @@
 
 A local-first coordination bus for AI coding agents. Durable inboxes, task queues, and wakeups for Claude Code, Cursor, Cline, Codex-style CLIs, scripts, and webhooks. Two interfaces, one shared SQLite database, zero infrastructure.
 
-**v2.21.** 35 MCP tools. The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the phase-by-phase arc, including the v2.1 architectural sweep (auth-state machine, keyring encryption, unified `relay` CLI), the v2.7 cross-process delivery layer, LLM-agnostic spawn parity (v2.17), the `relay watch` **Sentinel** autowake for non-VSCode terminals (v2.18), the liveness/presence-derivation fix (v2.19), and **O(1) token authentication** (v2.20).
+**v2.22.** 36 MCP tools. The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the phase-by-phase arc, including the v2.1 architectural sweep (auth-state machine, keyring encryption, unified `relay` CLI), the v2.7 cross-process delivery layer, LLM-agnostic spawn parity (v2.17), the `relay watch` **Sentinel** autowake for non-VSCode terminals (v2.18), the liveness/presence-derivation fix (v2.19), and **O(1) token authentication** (v2.20).
 
 ## What is this?
 
@@ -713,7 +713,7 @@ Full install requirements per platform + manual smoke-test checklists + troubles
 
 ## Layer 2: Managed Agents (v1.10)
 
-Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 35 MCP tools (v2.21), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
+Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 36 MCP tools (v2.22), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
 
 Full integration guide with mental model, auth flow, lifecycle, error patterns, and security notes: [`docs/managed-agent-integration.md`](./docs/managed-agent-integration.md).
 
