@@ -103,7 +103,7 @@ Response (SSE-framed, one event):
 
 ```
 event: message
-data: {"result":{"content":[{"type":"text","text":"{\n  \"success\": true,\n  \"agent\": { ... },\n  \"agent_token\": \"jHE9unOA3QVybi_1AfQ95FdNeIDtaUANPfES2gmzLWM\",\n  ...\n}"}]},"jsonrpc":"2.0","id":1}
+data: {"result":{"content":[{"type":"text","text":"{\n  \"success\": true,\n  \"agent\": { ... },\n  \"agent_token\": \"<your-agent-token-shown-once>\",\n  ...\n}"}]},"jsonrpc":"2.0","id":1}
 ```
 
 **Save the `agent_token`.** The server stores only a bcrypt hash. The raw token is returned exactly once. If you lose it, you must `unregister_agent` and re-register to get a new one.

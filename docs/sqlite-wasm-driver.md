@@ -25,7 +25,7 @@ npm install sql.js
 RELAY_SQLITE_DRIVER=wasm RELAY_TRANSPORT=http node dist/index.js
 ```
 
-That's it. The relay initializes sql.js instead of better-sqlite3, runs the same schema migrations, serves the same 25 tools.
+That's it. The relay initializes sql.js instead of better-sqlite3, runs the same schema migrations, serves the same 35 tools.
 
 ## How to switch back
 
