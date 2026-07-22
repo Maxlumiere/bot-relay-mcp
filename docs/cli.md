@@ -74,7 +74,7 @@ $ relay test
 Result: PASS
 ```
 
-For the full 35-tool + CLI battery, use `scripts/smoke-25-tools.sh` (script name is historical — it now exercises all 35 tools; v2.1 Phase 5a, runs in the pre-publish gate).
+For the full 36-tool + CLI battery, use `scripts/smoke-25-tools.sh` (script name is historical — it now exercises all 36 tools; v2.1 Phase 5a, runs in the pre-publish gate).
 
 ## `relay generate-hooks`
 

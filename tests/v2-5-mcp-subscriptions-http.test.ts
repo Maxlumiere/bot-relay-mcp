@@ -158,15 +158,13 @@ async function registerAgentViaHttp(
   if (!resp.ok) {
     throw new Error(`register_agent HTTP ${resp.status}: ${await resp.text()}`);
   }
-  // The stateless transport returns SSE-framed JSON-RPC (event: message\ndata: {...}).
+  // ADR-0005 #3: the one-shot POST path returns plain application/json; older
+  // SSE framing (event: message\ndata: {...}) is still handled here too.
   const raw = await resp.text();
   const dataLine = raw
     .split("\n")
     .find((line) => line.startsWith("data: "));
-  if (!dataLine) {
-    throw new Error(`register_agent: no SSE data frame in response: ${raw}`);
-  }
-  const rpc = JSON.parse(dataLine.slice(6)) as {
+  const rpc = JSON.parse(dataLine ? dataLine.slice(6) : raw) as {
     result?: { content?: { text?: string }[] };
   };
   const text = rpc.result?.content?.[0]?.text;

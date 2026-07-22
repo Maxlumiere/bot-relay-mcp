@@ -94,7 +94,7 @@ describe("v2.4.4 — tool description quality", () => {
   const tools = listTools();
 
   it("(Q1) every tool has a description with sufficient length", () => {
-    expect(tools.length).toBe(35);
+    expect(tools.length).toBe(36); // 35 + abandon_registration (ADR-0005 #4)
     const offenders = tools
       .filter((t) => !t.description || t.description.length < MIN_DESCRIPTION_CHARS)
       .map((t) => `${t.name}: ${t.description?.length ?? 0} chars`);
@@ -191,6 +191,7 @@ describe("v2.4.4 — tool description quality", () => {
     //      into the EXPECTED_HASHES map below.
     //   4. Commit the description edit + the hash bump in the same PR.
     const EXPECTED_HASHES: Record<string, string> = {
+      abandon_registration: "662bb7435196f3e0fffc02505fd9bc43cba39474fdf789cffd797494b0d0fac9",
       broadcast: "0745f040a35264b317b13c72a24f2cc57f12d741c67b100f978b377806fc49e0",
       create_channel: "fe2f8015af0266fb60327c65619542a0be390fbde2f283bb19b7073fc7caef90",
       delete_webhook: "1077b27565205f2d900437db5afafc37889d7424b45dad55f8999e56c50436d7",

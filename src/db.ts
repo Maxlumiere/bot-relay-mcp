@@ -290,6 +290,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_19(_db);
   migrateSchemaToV2_20(_db);
   migrateSchemaToV2_21(_db);
+  migrateSchemaToV2_22(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -334,6 +335,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_19(_db);
   migrateSchemaToV2_20(_db);
   migrateSchemaToV2_21(_db);
+  migrateSchemaToV2_22(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -555,7 +557,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 21;
+export const CURRENT_SCHEMA_VERSION = 22;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -650,6 +652,7 @@ export function applyMigration(from: number, to: number): void {
     [18, 19],
     [19, 20],
     [20, 21],
+    [21, 22],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1641,6 +1644,34 @@ function migrateSchemaToV2_21(db: CompatDatabase): void {
 }
 
 /**
+ * ADR-0005 (v2.22.0) — safe orphan cleanup substrate. Additive + idempotent.
+ * Adds:
+ *   - `first_authed_at TEXT NULL` — set ONCE on an agent's first successful
+ *     token auth. NULL = the row has NEVER authenticated = the definition of an
+ *     orphan. This is the SECURITY KEYSTONE: abandon_registration + the orphan
+ *     GC only ever touch first_authed_at IS NULL rows, so a working agent (which
+ *     has authed ≥1x) self-excludes and can NEVER be reached.
+ *   - `registration_recovery_hash TEXT NULL` — bcrypt hash of a one-time,
+ *     name-scoped handle returned at first register, so the registrant can
+ *     abandon its OWN botched registration WITHOUT the destructive operator
+ *     endpoint. NULL after redemption / for authed rows.
+ *   - `registration_recovery_expires_at TEXT NULL` — short TTL for the handle.
+ * All NULL on existing rows = zero data migration.
+ */
+function migrateSchemaToV2_22(db: CompatDatabase): void {
+  const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "first_authed_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN first_authed_at TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "registration_recovery_hash")) {
+    db.exec("ALTER TABLE agents ADD COLUMN registration_recovery_hash TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "registration_recovery_expires_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN registration_recovery_expires_at TEXT");
+  }
+}
+
+/**
  * ADR-0003 — read the current auth generation. A single-row PK read
  * (~microseconds), cheap enough to run on every auth (the verified-token cache
  * saves the bcrypt, not this read). Returns 0 if the row is somehow absent
@@ -1824,11 +1855,115 @@ function verifiedTokenCachePut(
   capabilities: string[],
   graceExpiry: number | null,
 ): void {
+  // ADR-0005: this funnel runs ONLY on a verified-token cache MISS (a fresh
+  // bcrypt verify) — so it is exactly "the agent just proved it holds a valid
+  // token." Stamp the first-auth marker (no-op after the first, via WHERE
+  // first_authed_at IS NULL). Cache HITS return before reaching here, so the
+  // 2.20.1 hot path is untouched. This is the security keystone: any agent that
+  // has authed ≥1x has a non-NULL first_authed_at → it self-excludes from
+  // abandon_registration + the orphan GC.
+  markAgentAuthenticated(name);
   if (indexed) {
     authCacheSet(digest, { name, capabilities }, gen, authCacheExpiry(now, graceExpiry));
   } else {
     selfHealTokenLookup(row, matchedColumn, digest);
   }
+}
+
+/**
+ * ADR-0005 — stamp the SECURITY-KEYSTONE first-auth marker + retire the
+ * registration-recovery handle. Fires once (WHERE first_authed_at IS NULL); an
+ * already-authed row is a no-op. Does NOT bump the auth generation:
+ * first_authed_at is not a token-validity field (it never changes whether the
+ * token authenticates), so it's outside the auth-gen guard's scope.
+ */
+export function markAgentAuthenticated(name: string): void {
+  getDb()
+    .prepare(
+      "UPDATE agents SET first_authed_at = ?, registration_recovery_hash = NULL, registration_recovery_expires_at = NULL " +
+        "WHERE name = ? AND first_authed_at IS NULL",
+    )
+    .run(now(), name);
+}
+
+/** ADR-0005 — orphan TTL (handle expiry + GC threshold). Default 30min (> any legit register→first-auth gap). Env: RELAY_ORPHAN_TTL_MINUTES. */
+const ORPHAN_TTL_DEFAULT_MINUTES = 30;
+function orphanTtlMs(): number {
+  const raw = process.env.RELAY_ORPHAN_TTL_MINUTES;
+  const n = raw !== undefined && raw !== "" ? Number(raw) : ORPHAN_TTL_DEFAULT_MINUTES;
+  return (Number.isFinite(n) && n > 0 ? n : ORPHAN_TTL_DEFAULT_MINUTES) * 60_000;
+}
+
+/**
+ * ADR-0005 — self-serve abandon of the caller's OWN botched (orphaned)
+ * registration, WITHOUT the destructive operator endpoint. SAFE BY
+ * CONSTRUCTION via the keystone invariant: it deletes ONLY a row that has NEVER
+ * authenticated (`first_authed_at IS NULL`) — a working agent (authed ≥1x)
+ * self-excludes and can NEVER be reached, handle or not. The name-scoped,
+ * one-time, TTL'd handle is the AUTHORIZATION (proves the caller is the
+ * registrant + covers the just-registered-not-yet-authed race). The keystone is
+ * RE-ASSERTED in the DELETE WHERE so a concurrent auth between the read and the
+ * delete cannot let us remove a now-authed row (TOCTOU-safe).
+ */
+export function abandonRegistration(name: string, handle: string): { abandoned: boolean; reason?: string } {
+  const db = getDb();
+  const row = db
+    .prepare(
+      "SELECT first_authed_at, registration_recovery_hash, registration_recovery_expires_at FROM agents WHERE name = ?",
+    )
+    .get(name) as
+    | { first_authed_at: string | null; registration_recovery_hash: string | null; registration_recovery_expires_at: string | null }
+    | undefined;
+  if (!row) return { abandoned: false, reason: "no such registration" };
+  if (row.first_authed_at !== null) {
+    return { abandoned: false, reason: "agent has authenticated — not an orphan. Use unregister_agent with its token." };
+  }
+  if (!row.registration_recovery_hash) return { abandoned: false, reason: "no active registration-recovery handle for this name" };
+  if (
+    row.registration_recovery_expires_at &&
+    Date.now() >= new Date(row.registration_recovery_expires_at).getTime()
+  ) {
+    return { abandoned: false, reason: "registration-recovery handle expired (the orphan GC will clean it up)" };
+  }
+  if (!verifyToken(handle, row.registration_recovery_hash)) {
+    return { abandoned: false, reason: "invalid registration-recovery handle" };
+  }
+  // Keystone RE-ASSERTED in the WHERE — closes the TOCTOU race.
+  const r = db.prepare("DELETE FROM agents WHERE name = ? AND first_authed_at IS NULL").run(name);
+  if (r.changes > 0) {
+    db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
+    bumpAuthGeneration();
+    return { abandoned: true };
+  }
+  return { abandoned: false, reason: "agent authenticated concurrently — not abandoned" };
+}
+
+/**
+ * ADR-0005 — automatic orphan garbage collection (runs on the purge tick).
+ * Removes never-authed + session-less rows older than the TTL — the same
+ * keystone (`first_authed_at IS NULL`) so it can NEVER remove a working agent.
+ * The deterministic safety net that decouples orphan cleanup from reliable
+ * token capture (retires /api/kill-agent for self-cleanup). Returns the count.
+ */
+export function gcOrphanRegistrations(db: CompatDatabase): number {
+  const cutoff = new Date(Date.now() - orphanTtlMs()).toISOString();
+  const orphans = db
+    .prepare(
+      "SELECT name FROM agents WHERE first_authed_at IS NULL AND session_id IS NULL AND created_at < ?",
+    )
+    .all(cutoff) as Array<{ name: string }>;
+  let removed = 0;
+  for (const o of orphans) {
+    const r = db
+      .prepare("DELETE FROM agents WHERE name = ? AND first_authed_at IS NULL AND session_id IS NULL")
+      .run(o.name);
+    if (r.changes > 0) {
+      db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(o.name);
+      removed++;
+    }
+  }
+  if (removed > 0) bumpAuthGeneration();
+  return removed;
 }
 
 /**
@@ -1941,6 +2076,9 @@ export function purgeOldRecords(db: CompatDatabase): void {
   db.prepare("DELETE FROM messages WHERE created_at < ?").run(sevenDaysAgo);
   db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'rejected', 'cancelled') AND updated_at < ?").run(thirtyDaysAgo);
   db.prepare("DELETE FROM webhook_delivery_log WHERE attempted_at < ?").run(sevenDaysAgo);
+  // ADR-0005: automatic orphan GC — never-authed + session-less rows past the
+  // TTL (safe-by-keystone; can never touch a working agent).
+  gcOrphanRegistrations(db);
   // v2.7 / Tether Phase 3 — outbox cleanup. Match the messages purge
   // window by default (7 days). Configurable via RELAY_OUTBOX_RETENTION_DAYS
   // for operators who want a longer audit trail; set to 0 to disable.
@@ -2762,7 +2900,7 @@ export function registerAgent(
     /** Tether v0.3 PID-handshake: OS machine GUID. v2.11.0 GAP 1: session-refreshable on an authenticated re-register (provided→overwrite, omitted→preserve), mirroring host_shell_pids. Captured on first registration; the token-holder may refresh it on relaunch (e.g. to populate an empty host_id or after a machine move). */
     host_id?: string;
   } = {}
-): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[] } {
+): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[]; registration_recovery: string | null } {
   const db = getDb();
   const timestamp = now();
   const capsJson = JSON.stringify(capabilities);
@@ -2776,6 +2914,8 @@ export function registerAgent(
 
   let agentWithStatus: AgentWithStatus;
   let plaintext_token: string | null = null;
+  // ADR-0005: one-time registration-recovery handle — set ONLY on first register.
+  let registration_recovery: string | null = null;
 
   if (existing) {
     // v2.0.1 (Codex MEDIUM 5): warn when we're about to overwrite an ONLINE
@@ -2931,6 +3071,13 @@ export function registerAgent(
     // First registration — always generate a token.
     plaintext_token = generateToken();
     const token_hash = hashToken(plaintext_token);
+    // ADR-0005: issue a one-time, name-scoped registration-recovery HANDLE so
+    // the registrant can abandon its OWN botched registration (lost token)
+    // without the destructive operator endpoint. Stored bcrypt-hashed with a
+    // short TTL; retired on first successful auth (markAgentAuthenticated).
+    registration_recovery = generateToken();
+    const regRecoveryHash = hashToken(registration_recovery);
+    const regRecoveryExpiresAt = new Date(Date.now() + orphanTtlMs()).toISOString();
     const id = uuidv4();
     const description = options.description ?? null;
     // v2.1 Phase 4b.2: managed flag captured at first registration + immutable
@@ -2951,8 +3098,8 @@ export function registerAgent(
       // schema v16: host_shell_pids (JSON) + host_id captured on first register.
       // ADR-0002: `class` captured on FIRST register (NULL if undeclared →
       // read as 'unclassified'). A re-register never writes it (immutable).
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id, class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId, options.class ?? null);
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id, class, registration_recovery_hash, registration_recovery_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId, options.class ?? null, regRecoveryHash, regRecoveryExpiresAt);
     bumpAuthGeneration(); // ADR-0003: fresh token_hash + token_lookup written
 
     // v2.0: populate normalized agent_capabilities table.
@@ -2989,7 +3136,7 @@ export function registerAgent(
   // the returned list — circular-import-safe.
   const auto_assigned = tryAssignQueuedTasksTo(agentWithStatus.name, agentWithStatus.capabilities);
 
-  return { agent: agentWithStatus, plaintext_token, auto_assigned };
+  return { agent: agentWithStatus, plaintext_token, auto_assigned, registration_recovery };
 }
 
 /** Fetch an agent's auth record (includes token_hash) by name. */

@@ -147,6 +147,11 @@ export const TOOL_CAPABILITY: Record<string, string> = {
 /** Tools that do NOT require any authentication (bootstrap + always-allowed-readonly). */
 export const TOOLS_NO_AUTH: ReadonlySet<string> = new Set([
   "register_agent",
+  // ADR-0005: abandon_registration authenticates via the one-time
+  // registration-recovery HANDLE (the caller lost the agent_token — that's the
+  // whole point), verified inside the handler; the keystone (only-never-authed
+  // rows) makes it safe. No agent_token gate.
+  "abandon_registration",
   // v2.0 final: health_check is a monitoring/diagnostic endpoint. No auth so
   // operators can probe from scripts without wiring a token. Returns only
   // aggregate counts — no per-agent content.
