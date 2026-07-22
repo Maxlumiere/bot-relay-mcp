@@ -476,4 +476,28 @@ if [ -n "$TASKS" ]; then
   echo "[bot-relay] $AGENT_NAME has active tasks (delivered to context)." >&2
 fi
 
+# --- ADR-0002: opt-in team onboarding map (default OFF) ---
+# Enable with RELAY_ONBOARD_TOPOLOGY=1. A compact who's-who grouped by
+# coordination class, so a freshly-started agent knows its peers. Rough liveness
+# proxy (agent_status, not the full verdict) — the authoritative view is
+# `discover_agents view='topology'`. Visible classes mirror
+# TOPOLOGY_VISIBLE_CLASSES in src/agent-class.ts (SSOT); transient + unclassified
+# are excluded by omission from the IN-list.
+if [ "${RELAY_ONBOARD_TOPOLOGY:-0}" = "1" ]; then
+  TOPOLOGY=$(sqlite3 "$DB_PATH" <<'SQL' 2>/dev/null
+SELECT '  ' || class || ': ' || GROUP_CONCAT(name, ', ')
+FROM agents
+WHERE class IN ('orchestrator','builder','advisory','auditor')
+  AND agent_status NOT IN ('offline','closed','abandoned','stale')
+GROUP BY class
+ORDER BY CASE class WHEN 'orchestrator' THEN 0 WHEN 'builder' THEN 1 WHEN 'advisory' THEN 2 WHEN 'auditor' THEN 3 ELSE 4 END;
+SQL
+)
+  if [ -n "$TOPOLOGY" ]; then
+    echo "[RELAY] Team (by class):"
+    echo "$TOPOLOGY"
+    echo ""
+  fi
+fi
+
 exit 0
