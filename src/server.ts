@@ -63,7 +63,7 @@ import {
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
 import { defaultTokenStore } from "./token-store.js";
-import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken } from "./db.js";
+import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken, explicitCallerCacheGet, explicitCallerCachePut } from "./db.js";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { currentContext, requestContext } from "./request-context.js";
@@ -1170,36 +1170,56 @@ export function createServer(): Server {
       if (!auth) {
         return authError(`Agent "${explicitCaller}" is not registered. Call register_agent first.`);
       }
-      const explicitState = (auth.auth_state ?? "active") as
-        | "active"
-        | "legacy_bootstrap"
-        | "revoked"
-        | "recovery_pending"
-        | "rotation_grace";
-      // v2.1 Phase 4b.2: pass grace inputs so rotation_grace rows can
-      // verify the old token via previous_token_hash until expiry.
-      const result = authenticateAgent(explicitCaller, token, auth.token_hash, explicitState, {
-        previousTokenHash: auth.previous_token_hash ?? null,
-        rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
-      });
-      if (!result.ok) return authError(result.reason!);
-      // v2.14.0 — impersonation tighten: an explicit caller field (from/
-      // agent_name/creator) is an ACTOR claim. The legacy-grace path
-      // authenticates a token-less legacy_bootstrap row WITHOUT proving
-      // identity, so under RELAY_ALLOW_LEGACY a caller could stamp
-      // from=<legacy persona> and speak as it. Grace is for the no-actor
-      // bootstrap path only — it must NOT authenticate an actor identity.
-      // The legacy agent must mint a token (re-register) before using
-      // actor-stamping tools.
-      if (result.legacy) {
-        return authError(
-          `Agent "${explicitCaller}" has no token (legacy pre-v1.7 row). Legacy grace cannot authenticate an actor identity — ` +
-          `register a token (re-register, or 'relay mint-token ${explicitCaller}') before using actor-stamping tools.`,
-          ERROR_CODES.AUTH_FAILED
-        );
+      // v2.20.1 — verified-token cache short-circuit for the explicit-caller HOT
+      // PATH. Impersonation-gated: a hit is honored ONLY when the cached verdict
+      // belongs to `explicitCaller` (a valid token for X cannot authenticate
+      // from=Y). A hit skips the per-call bcrypt; a miss falls through to the
+      // full authenticateAgent flow below (all revoked/recovery/grace/legacy
+      // semantics preserved), which re-verifies + re-populates the cache. The
+      // generation counter (bumped on every token/auth mutation) makes a hit
+      // safe: a revoked/rotated token → generation moved → cache miss → the
+      // authenticateAgent path returns the correct error.
+      const cachedVerdict = token ? explicitCallerCacheGet(token, explicitCaller) : null;
+      if (cachedVerdict) {
+        callerName = explicitCaller;
+        callerCaps = cachedVerdict.capabilities;
+      } else {
+        const explicitState = (auth.auth_state ?? "active") as
+          | "active"
+          | "legacy_bootstrap"
+          | "revoked"
+          | "recovery_pending"
+          | "rotation_grace";
+        // v2.1 Phase 4b.2: pass grace inputs so rotation_grace rows can
+        // verify the old token via previous_token_hash until expiry.
+        const result = authenticateAgent(explicitCaller, token, auth.token_hash, explicitState, {
+          previousTokenHash: auth.previous_token_hash ?? null,
+          rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
+        });
+        if (!result.ok) return authError(result.reason!);
+        // v2.14.0 — impersonation tighten: an explicit caller field (from/
+        // agent_name/creator) is an ACTOR claim. The legacy-grace path
+        // authenticates a token-less legacy_bootstrap row WITHOUT proving
+        // identity, so under RELAY_ALLOW_LEGACY a caller could stamp
+        // from=<legacy persona> and speak as it. Grace is for the no-actor
+        // bootstrap path only — it must NOT authenticate an actor identity.
+        // The legacy agent must mint a token (re-register) before using
+        // actor-stamping tools. (Never cached — see below — so this gate is
+        // ALWAYS reached for a legacy row.)
+        if (result.legacy) {
+          return authError(
+            `Agent "${explicitCaller}" has no token (legacy pre-v1.7 row). Legacy grace cannot authenticate an actor identity — ` +
+            `register a token (re-register, or 'relay mint-token ${explicitCaller}') before using actor-stamping tools.`,
+            ERROR_CODES.AUTH_FAILED
+          );
+        }
+        callerName = explicitCaller;
+        callerCaps = JSON.parse(auth.capabilities) as string[];
+        // v2.20.1 — cache the verified verdict (+ self-heal the digest, Q1) so
+        // repeat calls skip bcrypt. Only reached on ok && !legacy, so only
+        // positive active/grace verdicts are ever cached.
+        if (token) explicitCallerCachePut(token, auth, callerCaps);
       }
-      callerName = explicitCaller;
-      callerCaps = JSON.parse(auth.capabilities) as string[];
     } else {
       // Tools without an explicit caller field — identify by token.
       if (!token) {
