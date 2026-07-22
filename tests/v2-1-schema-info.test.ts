@@ -160,7 +160,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(17, 18)).not.toThrow();
     // v2.15.1 stale-status cleanup registered 18→19 (migrateSchemaToV2_19: one-time terminal-state wipe).
     expect(() => applyMigration(18, 19)).not.toThrow();
-    expect(() => applyMigration(19, 20)).toThrow(/no migration registered|19→20/);
+    // ADR-0003 auth latency registered 19→20 (migrateSchemaToV2_20: token_lookup / previous_token_lookup columns + auth_meta counter).
+    expect(() => applyMigration(19, 20)).not.toThrow();
+    expect(() => applyMigration(20, 21)).toThrow(/no migration registered|20→21/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

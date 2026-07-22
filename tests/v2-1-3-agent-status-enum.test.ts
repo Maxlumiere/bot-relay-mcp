@@ -55,11 +55,11 @@ afterEach(() => {
 // ============================================================================
 
 describe("v2.1.3 I6 — schema v2_5 migration + defaults", () => {
-  it("schema version is current post-migration (v2.15.1 stale-status cleanup bumped to 19; v2.13.0 presence liveness 18, v2.12.0 pending-vs-history 17, Tether PID-handshake 16)", () => {
+  it("schema version is current post-migration (ADR-0003 auth latency bumped to 20; v2.15.1 stale-status cleanup 19, v2.13.0 presence liveness 18, v2.12.0 pending-vs-history 17, Tether PID-handshake 16)", () => {
     registerAgent("sv-current", "r", []);
-    expect(CURRENT_SCHEMA_VERSION).toBe(19);
+    expect(CURRENT_SCHEMA_VERSION).toBe(20);
     const row = getDb().prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number };
-    expect(row.version).toBe(19);
+    expect(row.version).toBe(20);
   });
 
   it("new registrations default agent_status='idle' (was 'online')", () => {

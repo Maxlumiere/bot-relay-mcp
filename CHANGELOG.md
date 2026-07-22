@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.20.0 — 2026-07-22 — ADR-0003: O(1) token auth (indexed HMAC locator + verified-token cache)
+
+Token-only tool calls no longer scan every agent with bcrypt. Two O(N) linear bcrypt scans (`resolveCallerByToken` for the dispatcher, `checkToken` for `health_check`) are replaced by an O(1) indexed lookup plus a verified-token cache — bcrypt stays the sole verifier throughout.
+
+- **O(1) HMAC locator (schema v20).** New `agents.token_lookup` / `previous_token_lookup` columns hold `HMAC-SHA256(lookup_key, token)` (hex), indexed by `idx_agents_token_lookup`. Auth resolves the candidate row via a single indexed SELECT, then **bcrypt confirms** — the digest only narrows candidates, never authorizes (a digest collision is rejected by the bcrypt check). The lookup key is a dedicated HKDF subkey of the encryption keyring when one is configured (key-separated from `http_secret` + the record key; rotates with the keyring), or a persisted per-instance secret (`<instance>/token-lookup.key`, 0600) in plaintext mode.
+- **Verified-token cache (`src/auth-cache.ts`).** Per-process, LRU-bounded, TTL-capped cache of positive verdicts keyed on the digest — never the plaintext token, never the bcrypt hash. A hit skips the locator + bcrypt.
+- **Invalidation via a global `auth_meta.generation` counter — the correctness mechanism.** Every mutation that can change a token's validity bumps it; a cache entry is served only when its stamped generation still matches, giving **instant revocation** regardless of TTL. The classic trap is covered: `revoke_token` keeps `token_hash` for forensics (the token still bcrypt-matches), so validity is keyed on generation, not hash presence — a revoked token is denied on its very next call. A build-time drift guard (`scripts/auth-gen-guard.mjs`, with an adversarial negative-fixture test) fails the build if any token/auth mutator omits its bump.
+- **Zero-lockout migration.** `token_lookup` can't be backfilled from a bcrypt hash, so legacy rows stay NULL and authenticate via an O(N) fallback that **lazily self-heals** the digest on first authenticated call — each agent goes O(1) thereafter. Native + wasm driver parity covered.
+- No new tools, no API changes; auth semantics (active / rotation_grace / revoked / recovery / legacy) are byte-for-byte preserved.
+
 ## v2.19.0 — 2026-07-22 — Liveness derivation: presence that stops lying
 
 Fixes the presence **lie**: a rate-limited-but-alive agent (e.g. an agent mid-audit) reported `status=offline` because presence was still derived from `last_seen` **age**, and the liveness verdict anchored **only** on a registered `agent_pid`. Consumers misread "offline" as "dead."

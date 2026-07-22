@@ -63,7 +63,7 @@ import {
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
 import { defaultTokenStore } from "./token-store.js";
-import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents } from "./db.js";
+import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken } from "./db.js";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { currentContext, requestContext } from "./request-context.js";
@@ -1030,46 +1030,16 @@ export function createServer(): Server {
   /**
    * For tools that don't have an explicit caller-name field (spawn_agent,
    * register_webhook, list_webhooks, delete_webhook, discover_agents,
-   * get_task), identify the caller by matching the presented token against
-   * all registered agents. O(N) bcrypt, fine for small deployments. Defer
-   * O(1) token-index lookup to v1.7.x if N grows.
+   * get_task), identify the caller by the presented token.
+   *
+   * ADR-0003 (v2.20.0): delegates to the O(1) resolver in db.ts — verified-
+   * token cache → indexed HMAC locator → single bcrypt confirm, with an O(N)
+   * fallback that guarantees no legacy agent is locked out. Faithful
+   * replacement for the former inline O(N) bcrypt scan: a caller is returned
+   * ONLY for an `active` row or a valid `rotation_grace` window.
    */
   function resolveCallerByToken(token: string): { name: string; capabilities: string[] } | null {
-    const agents = getAgents();
-    for (const a of agents) {
-      const auth = getAgentAuthData(a.name);
-      if (!auth) continue;
-      // v2.1 Phase 4b.1 v2: token_hash is preserved post-revoke (forensic
-      // integrity + CAS contract), so a hash-match alone is insufficient —
-      // state must be 'active' (or rotation_grace, v2.1 Phase 4b.2) for the
-      // token to authenticate.
-      const state = (auth.auth_state ?? "active") as
-        | "active"
-        | "legacy_bootstrap"
-        | "revoked"
-        | "recovery_pending"
-        | "rotation_grace";
-      if (state === "active" && auth.token_hash && verifyToken(token, auth.token_hash)) {
-        return { name: a.name, capabilities: a.capabilities };
-      }
-      // v2.1 Phase 4b.2: during rotation_grace, both the NEW token
-      // (token_hash) and the PREVIOUS token (previous_token_hash) validate
-      // the caller — until rotation_grace_expires_at. Piggyback cleanup
-      // elsewhere will auto-expire the state.
-      if (state === "rotation_grace") {
-        const expiry = auth.rotation_grace_expires_at
-          ? new Date(auth.rotation_grace_expires_at).getTime()
-          : 0;
-        const expired = expiry > 0 && Date.now() >= expiry;
-        if (auth.token_hash && verifyToken(token, auth.token_hash)) {
-          return { name: a.name, capabilities: a.capabilities };
-        }
-        if (!expired && auth.previous_token_hash && verifyToken(token, auth.previous_token_hash)) {
-          return { name: a.name, capabilities: a.capabilities };
-        }
-      }
-    }
-    return null;
+    return resolveAgentByToken(token);
   }
 
   /**

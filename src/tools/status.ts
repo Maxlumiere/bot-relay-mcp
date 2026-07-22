@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData, setAgentLivenessAnchor } from "../db.js";
+import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData, setAgentLivenessAnchor, findAgentRowByToken } from "../db.js";
 import type { SetStatusInput, HealthCheckInput, ReportLivenessInput } from "../types.js";
 import { VERSION } from "../version.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
@@ -192,42 +192,39 @@ interface TokenCheckResult {
  * auth_error, which would wrongly trigger the hook's stale-token recovery
  * path.
  *
- * Resolution: linear-scan agents to find the one whose current OR previous
- * hash matches the token (identification), then let `authenticateAgent` —
- * the canonical gate also used by the dispatcher — make the state-aware
- * yes/no call.
+ * Resolution: identify the agent whose current OR previous hash matches the
+ * token, then let `authenticateAgent` — the canonical gate also used by the
+ * dispatcher — make the state-aware yes/no call.
+ *
+ * ADR-0003 (v2.20.0): identification is now O(1) via the SHARED locator
+ * `findAgentRowByToken` (indexed HMAC digest + O(N) fallback) — the SAME
+ * primitive the dispatcher's resolveCallerByToken uses, so the two token-auth
+ * paths cannot diverge. This diagnostic path intentionally does NOT consult the
+ * verified-token cache (it always re-verifies).
  */
 function checkToken(token: string): TokenCheckResult {
-  const agents = getAgents();
-  for (const a of agents) {
-    const auth = getAgentAuthData(a.name);
-    if (!auth) continue;
-    // Identification: does the token match EITHER the current token_hash OR
-    // (for rotation_grace rows) the previous_token_hash? If not, keep looking.
-    const matchesCurrent = !!auth.token_hash && verifyToken(token, auth.token_hash);
-    const matchesPrevious =
-      !!auth.previous_token_hash && verifyToken(token, auth.previous_token_hash);
-    if (!matchesCurrent && !matchesPrevious) continue;
-
-    const state = (auth.auth_state ?? "active") as AuthStateInput;
-    const result = authenticateAgent(a.name, token, auth.token_hash ?? null, state, {
-      previousTokenHash: auth.previous_token_hash ?? null,
-      rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
-    });
-    if (result.ok) {
-      return { auth_error: false, agent_name: a.name, auth_state: state };
-    }
+  const found = findAgentRowByToken(token);
+  if (!found) {
     return {
       auth_error: true,
-      auth_error_reason: result.reason,
-      agent_name: a.name,
-      auth_state: state,
+      auth_error_reason:
+        "agent_token did not match any registered agent (stale or never issued). Ensure RELAY_AGENT_TOKEN matches the token from your most recent register_agent response.",
     };
+  }
+  const auth = found.row;
+  const state = (auth.auth_state ?? "active") as AuthStateInput;
+  const result = authenticateAgent(auth.name, token, auth.token_hash ?? null, state, {
+    previousTokenHash: auth.previous_token_hash ?? null,
+    rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
+  });
+  if (result.ok) {
+    return { auth_error: false, agent_name: auth.name, auth_state: state };
   }
   return {
     auth_error: true,
-    auth_error_reason:
-      "agent_token did not match any registered agent (stale or never issued). Ensure RELAY_AGENT_TOKEN matches the token from your most recent register_agent response.",
+    auth_error_reason: result.reason,
+    agent_name: auth.name,
+    auth_state: state,
   };
 }
 
