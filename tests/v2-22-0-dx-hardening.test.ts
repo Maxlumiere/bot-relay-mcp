@@ -172,3 +172,53 @@ describe("ADR-0005 #5 — MCP send_message accepts `content` OR `message`", () =
     expect(r.error).toMatch(/only one/i);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// victra pre-ship catch (2026-07-22): the v22 migration must BACKFILL every
+// row that predates the orphan concept, or an upgrade leaves all existing
+// agents at first_authed_at IS NULL and the orphan-GC could false-reap a
+// live-but-session-less one before it re-authenticates.
+describe("ADR-0005 — v22 migration backfills pre-existing rows (no false-reap on upgrade)", () => {
+  it("a pre-v22 row (no v22 columns) gets first_authed_at backfilled on migrate → GC-safe", () => {
+    let db = getDb(); // fresh v22
+    // Simulate a genuine PRE-v22 agent: a row created before the v22 columns
+    // existed. Register it, then drop the three v22 columns to reproduce v21
+    // shape (row keeps its created_at; loses first_authed_at + the handle cols).
+    const old = new Date(Date.now() - 3600_000).toISOString();
+    registerAgent("pre22", "worker", []);
+    db.exec("UPDATE agents SET created_at = '" + old + "' WHERE name = 'pre22'");
+    db.exec("ALTER TABLE agents DROP COLUMN first_authed_at");
+    db.exec("ALTER TABLE agents DROP COLUMN registration_recovery_hash");
+    db.exec("ALTER TABLE agents DROP COLUMN registration_recovery_expires_at");
+    // Sanity: the column is genuinely gone (v21 shape).
+    const before = (db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(before).not.toContain("first_authed_at");
+
+    // Re-open the DB → the init chain re-runs migrateSchemaToV2_22 (the real
+    // 21→22 column migration + backfill; applyMigration only syncs the version).
+    closeDb();
+    db = getDb();
+
+    // The pre-v22 row is now stamped (= its created_at) — NOT NULL.
+    const row = getAgentAuthData("pre22");
+    expect(row).not.toBeNull();
+    expect(row!.first_authed_at).not.toBeNull();
+    // And its (re-added) recovery handle is NULL — a pre-v22 row was never an orphan.
+    expect(row!.registration_recovery_hash ?? null).toBeNull();
+
+    // Keystone consequence: the GC can NEVER reap it, even session-less + old.
+    db.exec("UPDATE agents SET session_id = NULL WHERE name = 'pre22'");
+    gcOrphanRegistrations(db);
+    expect(getAgentAuthData("pre22")).not.toBeNull();
+  });
+
+  it("the backfill does NOT stamp a genuine post-v22 orphan (guarded by ADD COLUMN, runs once)", () => {
+    getDb(); // already v22 — column exists
+    registerAgent("post22-orphan", "worker", []); // fresh orphan: first_authed_at NULL
+    // Re-open (re-runs the init chain). The column already exists → the ADD
+    // COLUMN + backfill are skipped → the genuine orphan must stay NULL.
+    closeDb();
+    getDb();
+    expect(getAgentAuthData("post22-orphan")!.first_authed_at).toBeNull();
+  });
+});
