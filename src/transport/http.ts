@@ -1484,6 +1484,13 @@ export function startHttpServer(port: number, host: string): Server {
     const server = createServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
+      // v2.22.0 (#3): non-streaming one-shot POSTs return plain
+      // `application/json`, not an `event: message\ndata: {…}` SSE frame — so
+      // curl/script callers can `JSON.parse` the body directly (was the #3
+      // papercut). The stateful/streaming path (Tether SSE) is unaffected: it
+      // uses a separate transport with a session id. Architect-ratified: this
+      // moves toward the stateless-transport direction, safe either way.
+      enableJsonResponse: true,
     });
     res.on("close", () => {
       transport.close().catch(() => {});
