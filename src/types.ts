@@ -203,7 +203,15 @@ export const SpawnAgentSchema = z.object({
 export const SendMessageSchema = z.object({
   from: z.string().min(1).describe("Sender agent name"),
   to: z.string().min(1).describe("Recipient agent name"),
-  content: payloadField("content").describe("Message content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES)"),
+  // v2.22.0 (#5): the MCP tool now accepts EITHER `content` (historical) OR
+  // `message` (the field the agent-team SendMessage + the REST
+  // /api/send-message both use) — one send vocabulary across every surface.
+  // Both are optional at the schema layer; handleSendMessage requires EXACTLY
+  // one (rejecting neither, and both-with-different-values) and normalizes to
+  // content. Kept as a plain object (not a .transform) so the generated MCP
+  // tool inputSchema stays clean.
+  content: payloadField("content").optional().describe("Message content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES). Alias: `message`."),
+  message: payloadField("message").optional().describe("Alias for `content` (parity with the REST /api/send-message endpoint + the agent-team SendMessage tool)."),
   priority: z.enum(["normal", "high"]).default("normal").describe("Message priority"),
   agent_token: AgentTokenField,
 });

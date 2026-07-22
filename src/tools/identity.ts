@@ -260,15 +260,20 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
         type: "text" as const,
         text: JSON.stringify(
           {
-            success: true,
-            agent,
-            protocol_version: PROTOCOL_VERSION,
+            // v2.22.0 (#2): agent_token FIRST so curl/script callers capture it
+            // reliably (a truncated `head -c` read still gets it; `.agent_token`
+            // is the leading key) — it was previously buried 4th and a botched
+            // capture orphaned the registration. Shown ONCE; the server stores
+            // only a bcrypt hash.
             ...(plaintext_token
               ? {
                   agent_token: plaintext_token,
                   auth_note: `Save this agent_token in the RELAY_AGENT_TOKEN env var. It is shown only on this response; the server stores a bcrypt hash.`,
                 }
               : {}),
+            success: true,
+            agent,
+            protocol_version: PROTOCOL_VERSION,
             ...(capsNote ? { capabilities_note: capsNote } : {}),
             ...(auto_assigned.length > 0 ? { auto_assigned_tasks: auto_assigned.map((a) => ({ task_id: a.task_id, title: a.title, priority: a.priority })) } : {}),
             ...(recoveryCompleted ? { recovery_completed: true } : {}),
