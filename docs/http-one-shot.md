@@ -28,14 +28,14 @@ HANDLE=$(printf '%s' "$payload"  | jq -r '.registration_recovery') # for self-cl
 
 ## 2. Send a message
 
-`send_message` accepts `content` **or** its alias `message` (ADR-0005 #5). Authenticate the sender with `from_agent_token` (the impersonation gate applies — a token for X cannot send `from: Y`).
+`send_message` accepts `content` **or** its alias `message` (ADR-0005 #5). Authenticate the sender with `agent_token` (the same field every MCP tool uses; equivalently the `X-Agent-Token` header). The impersonation gate applies — a token for X cannot send `from: Y`. (Note: `from_agent_token` is a *dashboard*-only field; the MCP tool uses `agent_token`.)
 
 ```bash
 curl -s "$BASE/mcp" \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",
        \"arguments\":{\"from\":\"my-script\",\"to\":\"some-agent\",\"message\":\"hello\",
-       \"from_agent_token\":\"$TOKEN\"}}}" | jq -r '.result.content[0].text' | jq .
+       \"agent_token\":\"$TOKEN\"}}}" | jq -r '.result.content[0].text' | jq .
 ```
 
 ## 3. Clean up

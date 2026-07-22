@@ -1710,6 +1710,17 @@ function migrateSchemaToV2_23(db: CompatDatabase): void {
   const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
   if (!agentCols.some((c) => c.name === "first_authed_at")) {
     db.exec("ALTER TABLE agents ADD COLUMN first_authed_at TEXT");
+    // victra pre-ship catch (2026-07-22): BACKFILL every row that exists at
+    // v22-migration time. Such a row predates the orphan concept entirely — an
+    // orphan is defined by a v2.22 `registration_recovery` handle, which no
+    // pre-v22 registration ever minted — so none is a legitimate
+    // abandon_registration / orphan-GC target. Without this, an upgrade leaves
+    // ALL existing agents at first_authed_at IS NULL until each re-authenticates
+    // and self-stamps; a live-but-session-less one could be false-reaped by the
+    // GC inside that window (the exact failure the keystone must prevent).
+    // Stamping them non-NULL closes the window by construction. Runs ONCE — it's
+    // guarded by the ADD COLUMN, so it never re-stamps a genuine post-v22 orphan.
+    db.exec("UPDATE agents SET first_authed_at = COALESCE(created_at, datetime('now')) WHERE first_authed_at IS NULL");
   }
   if (!agentCols.some((c) => c.name === "registration_recovery_hash")) {
     db.exec("ALTER TABLE agents ADD COLUMN registration_recovery_hash TEXT");
