@@ -906,9 +906,9 @@ export interface AgentRecord {
   host_shell_pids?: string | null;
   /** Tether v0.3 PID-handshake (schema v16): stable OS machine GUID, host-scopes the PID match. NULL on legacy rows. Immutable after first registration. */
   host_id?: string | null;
-  /** v2.13.0 (schema v18): ISO timestamp of the most recent POSITIVE liveness confirmation (same-host PID probe / future heartbeat). NULL = no liveness signal → age-based derivation. Distinct from last_seen (activity). */
+  /** v2.13.0 (schema v18): ISO timestamp of the most recent POSITIVE liveness confirmation (same-host PID probe / future heartbeat). NULL = no liveness signal → verdict is unknown (age-based derivation retired in v2.19.0). Distinct from last_seen (activity). */
   last_alive?: string | null;
-  /** v2.13.0 (schema v18): the agent's OWN process id (claude/codex CLI), identified by the stdio server's ancestry walk or self-reported on register. The process the same-host liveness probe checks — NOT the host_shell_pids chain. NULL = no anchor → age-based. */
+  /** v2.13.0 (schema v18): the agent's OWN process id (claude/codex CLI), identified by the stdio server's ancestry walk or self-reported on register. The process the same-host liveness probe checks — NOT the host_shell_pids chain. NULL = no anchor → verdict unknown unless the agent advertises RELAY_AGENT_NAME in its argv (v2.19.0). */
   agent_pid?: number | null;
   /** v2.13.0 (schema v18): start-time token of `agent_pid` (PID-reuse guard). A recycled PID with a different start-time reads dead. */
   agent_pid_start?: string | null;
@@ -916,8 +916,10 @@ export interface AgentRecord {
 
 export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "token_hash" | "session_id" | "agent_status" | "description" | "host_shell_pids" | "host_id"> {
   capabilities: string[];
-  /** v1.3 presence: computed from last_seen. Distinct from agent_status. */
-  status: "online" | "stale" | "offline";
+  /** Coarse presence, derived from the liveness VERDICT (v2.19.0 — NOT from
+   *  last_seen age, which lied) — alive→online, dead→offline, unknown→unknown.
+   *  A live agent NEVER reads offline; last_seen is pure telemetry. */
+  status: "online" | "offline" | "unknown";
   /** v1.7: whether the agent has a token (false = legacy pre-v1.7 agent) */
   has_token: boolean;
   /**

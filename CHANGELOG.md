@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.19.0 — 2026-07-22 — Liveness derivation: presence that stops lying
+
+Fixes the presence **lie**: a rate-limited-but-alive agent (e.g. an agent mid-audit) reported `status=offline` because presence was still derived from `last_seen` **age**, and the liveness verdict anchored **only** on a registered `agent_pid`. Consumers misread "offline" as "dead."
+
+> **⚠ Presence-semantics contract change** (minor-version bump). `computeStatus` (the age→status mapper) is **removed**; the coarse `status` is now PID/verdict-derived. A programmatic register with **no** `host_id`/`agent_pid` anchor now reads `unknown` (was age-based `online`) — real hook/Tether registrations stamp an anchor and read `online`. The `status` enum drops `stale` (`online | offline | unknown`). External snapshot readers keying on `status` should treat `unknown` as "no liveness signal," never as offline/dead.
+
+- **Security — `fast-uri` HIGH advisory pinned out.** Pins `overrides.fast-uri = 3.1.4` to clear **GHSA-4c8g-83qw-93j6** and **GHSA-v2hh-gcrm-f6hx** (CVSS 7.5 each — URI host-confusion via failed IDN canonicalization + literal-backslash authority delimiter; both affect fast-uri `3.0.0`–`3.1.3`). It reaches us transitively via `ajv@8.20.0`, which declares `fast-uri ^3.0.1`, so `3.1.4` is in-range and non-breaking (the MCP SDK is untouched — `npm audit fix` was rejected because it force-upgrades the SDK to a breaking major). Repo-wide `npm audit (high+)` in CI now passes.
+
+- **The coarse `status` is now derived from the liveness VERDICT, not `last_seen` age.** `alive → online`, `dead → offline`, `unknown → unknown`. A live agent **never** reads `offline`; `last_seen` is pure telemetry. (The verdict-based `agent_status` already dropped age in v2.15.0; this finishes the job for the last age-based surface. The `status` enum is now `online | offline | unknown`, was `online | stale | offline`.)
+- **The liveness verdict gained an argv-scan fallback.** When an agent has no (or a stale) `agent_pid`, the verdict also confirms *alive* by finding a live process on **this host** that advertises `RELAY_AGENT_NAME="<name>"` in its argv — the agent's **own** process. Both-side anchored + a **literal** substring search (not a `pgrep -f` regex), so `foo` never matches `foobar`/`foo-x`, and a name metacharacter can't inject. Host-scoped + behind the 5 s probe cache.
+- **`host_shell_pids` is deliberately NOT probed** as a fallback: the Tether ancestry chain includes the terminal/shell, which outlive the agent — probing it would false-read a crashed-agent-in-an-open-terminal *alive* (the v2.13.0 §3 contract). The argv scan fixes the same case via the agent's own process, without that false-alive.
+- On-read (no periodic sweep). Remote/federated agents stay `unknown` (a daemon can't PID-probe another host) — a cross-host heartbeat is a parked follow-on.
+- Acceptance test reproduces the exact failing shape (agent_pid null, process alive with the name in argv) and asserts the surface shows **alive**, not offline.
+
 ## v2.18.0 — 2026-07-21 — Sentinel: `relay watch` — autowake for any terminal
 
 Sentinel is the relay's built-in autowake for terminal agents **not** in VS Code/Tether (iTerm2 personas, plain terminals, remote sessions) — the poll/marker-based sibling of Tether's push-based wake. It's the shipped replacement for the hand-armed inbox-watcher bash loop. Pairs with Tether: **Tether = push-wake in VS Code; Sentinel = wake anywhere.**

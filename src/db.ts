@@ -7,7 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
 import os from "os";
-import { getOwnHostId, isAgentProcessAlive } from "./liveness.js";
+import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised } from "./liveness.js";
 import { isReservedName } from "./reserved-names.js";
 import type {
   AgentRecord,
@@ -81,19 +81,26 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function computeStatus(lastSeen: string): "online" | "stale" | "offline" {
-  const diff = Date.now() - new Date(lastSeen).getTime();
-  const minutes = diff / 60_000;
-  if (minutes < 10) return "online";
-  if (minutes < 60) return "stale";
-  return "offline";
+// v2.19.0 — the coarse presence `status`, derived from the liveness VERDICT, NOT
+// from last_seen age. This RETIRES the age-based lie (root cause of the
+// "codex-5-5 reports offline while actively auditing" bug): staleness alone can
+// no longer render a live agent offline; the verdict maps alive→online,
+// dead→offline, unknown→unknown (a live-but-unanchored, or cross-host, agent
+// must NEVER read dead).
+// `last_seen` is now pure telemetry ("last write"), never a presence signal.
+function statusFromVerdict(verdict: LivenessVerdict): "online" | "offline" | "unknown" {
+  if (verdict === "alive") return "online";
+  if (verdict === "dead") return "offline";
+  return "unknown";
 }
 
 // v2.15.0 — the old age-based liveness helpers (AGENT_STATUS_STALE/OFFLINE_MINUTES,
 // getAliveWindowMs, isAliveFresh, getAgentAbandonMinutes) were REMOVED: the
 // presence verdict is now a live in-memory probe (computeLivenessVerdict), and
-// deriveAgentStatus no longer uses last_seen age at all. The v1.3 `status`
-// field (online/stale/offline) keeps its own thresholds in computeStatus.
+// deriveAgentStatus no longer uses last_seen age at all. v2.19.0 finished the job:
+// the coarse `status` field is now derived from the same VERDICT (statusFromVerdict),
+// NOT last_seen age — so no presence surface lies about a rate-limited-but-alive
+// agent anymore. last_seen is pure telemetry.
 const LIVENESS_PROBE_CACHE_MS = 5_000;
 
 const LEGACY_STATUS_MAP: Record<string, string> = {
@@ -205,7 +212,7 @@ function toAgentWithStatus(
     capabilities: JSON.parse(row.capabilities) as string[],
     last_seen: row.last_seen,
     created_at: row.created_at,
-    status: computeStatus(row.last_seen),
+    status: statusFromVerdict(verdict),
     has_token: !!row.token_hash,
     agent_status: derivedAgentStatus,
     // v2.15.0 — presence surface. `liveness` (alive|dead|unknown) is the FIELD
@@ -3281,24 +3288,54 @@ export function computeLivenessVerdict(row: {
   host_id?: string | null;
   agent_pid?: number | null;
   agent_pid_start?: string | null;
+  host_shell_pids?: string | null;
 }): LivenessVerdict {
-  if (typeof row.agent_pid !== "number" || row.agent_pid <= 0) return "unknown"; // no anchor
+  // Host-scope FIRST (was AFTER the agent_pid gate — the bug: a missing agent_pid
+  // short-circuited to `unknown` before we could try the other host-local
+  // signals). A daemon can only PID-probe agents on its OWN host; cross-host /
+  // no-GUID → unknown (federation boundary, parked; never guessed dead).
   const ownHost = getOwnHostId();
-  if (!ownHost || !row.host_id || row.host_id !== ownHost) return "unknown"; // cross-host / can't host-scope
+  if (!ownHost || !row.host_id || row.host_id !== ownHost) return "unknown";
+
+  const hasAnchor = typeof row.agent_pid === "number" && row.agent_pid > 0;
   const nowMs = Date.now();
+
+  // Cache. Positive = confirmed alive. Negative = "probed, NOT alive"; its
+  // verdict depends on whether an anchor existed: an anchored pid that is gone →
+  // dead (a crash); no anchor + no live signal → unknown (never guess dead).
   const aliveAt = _positiveProbeCache.get(row.name);
   if (aliveAt !== undefined && nowMs - aliveAt < LIVENESS_PROBE_CACHE_MS) return "alive";
-  const deadAt = _negativeProbeCache.get(row.name);
-  if (deadAt !== undefined && nowMs - deadAt < LIVENESS_PROBE_CACHE_MS) return "dead";
+  const notAliveAt = _negativeProbeCache.get(row.name);
+  if (notAliveAt !== undefined && nowMs - notAliveAt < LIVENESS_PROBE_CACHE_MS) {
+    return hasAnchor ? "dead" : "unknown";
+  }
+
+  // Cascade — ALIVE-only signals, strongest/cheapest first; ANY hit → alive.
+  //   1. the agent's OWN pid (start-time-matched — no PID-reuse false-alive);
+  //   2. argv scan: a live process advertising RELAY_AGENT_NAME="<name>" — this
+  //      identifies the agent's OWN process by its name marker (the codex-5-5
+  //      case: no agent_pid, but the process carries the name in argv).
+  //
+  // DELIBERATELY NOT host_shell_pids (Victra's spec step 2): the v2.13.0 contract
+  // (tests/v2-13-0-presence-liveness.test.ts §3) proves a live shell ANCESTOR must
+  // NOT keep a dead agent alive — host_shell_pids is the Tether ancestry chain
+  // (terminal → shell → agent → …) and the terminal/shell OUTLIVE the agent, so
+  // "any host_shell_pid alive" false-reads a crashed-agent-in-an-open-terminal as
+  // alive. The argv scan gets the same fix (codex-5-5) via the agent's OWN
+  // process, without that false-alive. (Flagged to Victra — deviation from spec.)
   _livenessProbeCount++;
-  if (isAgentProcessAlive(row.agent_pid, row.agent_pid_start ?? null)) {
+  const alive =
+    (hasAnchor && isAgentProcessAlive(row.agent_pid as number, row.agent_pid_start ?? null)) ||
+    agentProcessAdvertised(row.name);
+
+  if (alive) {
     _positiveProbeCache.set(row.name, nowMs);
     _negativeProbeCache.delete(row.name);
     return "alive";
   }
   _negativeProbeCache.set(row.name, nowMs);
   _positiveProbeCache.delete(row.name);
-  return "dead";
+  return hasAnchor ? "dead" : "unknown";
 }
 
 /** The ISO timestamp of the last positive confirmation for `name`, for the
