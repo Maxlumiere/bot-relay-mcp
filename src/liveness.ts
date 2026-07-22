@@ -415,7 +415,7 @@ export function isAgentProcessAlive(
   return current === expectedStartedAt;
 }
 
-// --- v2.18.1 liveness cascade fallback (Sentinel/liveness-derivation) ---
+// --- v2.19.0 liveness cascade fallback (Sentinel/liveness-derivation) ---
 // The verdict used to anchor ONLY on the agent's own pid, so an agent with no
 // registered agent_pid (or a stale one) read `unknown` → surfaced as the
 // age-based "offline" lie even while its process was trivially alive. This adds

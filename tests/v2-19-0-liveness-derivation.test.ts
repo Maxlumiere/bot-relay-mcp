@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 /**
- * v2.18.1 — liveness derivation: presence that stops lying.
+ * v2.19.0 — liveness derivation: presence that stops lying.
  *
  * Two root causes fixed:
  *   (a) the coarse `status` was derived from last_seen AGE — a live but
@@ -24,7 +24,7 @@ import path from "path";
 import { agentProcessAdvertised, _resetOwnHostIdForTests } from "../src/liveness.js";
 
 // ───────── Section A: the argv scan — prefix-substring + metachar + injection ─────────
-describe("v2.18.1 — agentProcessAdvertised (argv scan, both-side anchored, literal)", () => {
+describe("v2.19.0 — agentProcessAdvertised (argv scan, both-side anchored, literal)", () => {
   const runWith =
     (lines: string[]) =>
     (): string =>
@@ -60,7 +60,7 @@ describe("v2.18.1 — agentProcessAdvertised (argv scan, both-side anchored, lit
 });
 
 // ───────── Section B: end-to-end verdict + status (the acceptance test) ─────────
-describe("v2.18.1 — verdict cascade + status retire (acceptance)", () => {
+describe("v2.19.0 — verdict cascade + status retire (acceptance)", () => {
   const OWN = "test-host-guid-liveness";
   let tmpRoot: string;
   const savedDb = process.env.RELAY_DB_PATH;

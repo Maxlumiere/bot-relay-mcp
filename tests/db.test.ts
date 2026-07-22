@@ -62,7 +62,7 @@ describe("registerAgent", () => {
     expect(agent.name).toBe("orchestrator");
     expect(agent.role).toBe("chief-of-staff");
     expect(agent.capabilities).toEqual(["triage", "orchestration"]);
-    // v2.18.1: `status` is verdict-derived, not last_seen age. A bare
+    // v2.19.0: `status` is verdict-derived, not last_seen age. A bare
     // programmatic register carries no host_id / agent_pid liveness anchor, so
     // the verdict is honestly `unknown` (NOT the old age-based `online`, and
     // crucially NEVER `offline`). A real hook register sets host_id + agent_pid

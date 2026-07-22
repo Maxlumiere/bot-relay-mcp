@@ -81,7 +81,7 @@ function now(): string {
   return new Date().toISOString();
 }
 
-// v2.18.1 — the coarse presence `status`, derived from the liveness VERDICT, NOT
+// v2.19.0 — the coarse presence `status`, derived from the liveness VERDICT, NOT
 // from last_seen age. This RETIRES the age-based lie (root cause of the
 // "codex-5-5 reports offline while actively auditing" bug): staleness alone can
 // no longer render a live agent offline; the verdict maps alive→online,
@@ -97,7 +97,7 @@ function statusFromVerdict(verdict: LivenessVerdict): "online" | "offline" | "un
 // v2.15.0 — the old age-based liveness helpers (AGENT_STATUS_STALE/OFFLINE_MINUTES,
 // getAliveWindowMs, isAliveFresh, getAgentAbandonMinutes) were REMOVED: the
 // presence verdict is now a live in-memory probe (computeLivenessVerdict), and
-// deriveAgentStatus no longer uses last_seen age at all. v2.18.1 finished the job:
+// deriveAgentStatus no longer uses last_seen age at all. v2.19.0 finished the job:
 // the coarse `status` field is now derived from the same VERDICT (statusFromVerdict),
 // NOT last_seen age — so no presence surface lies about a rate-limited-but-alive
 // agent anymore. last_seen is pure telemetry.
