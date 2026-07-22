@@ -440,6 +440,19 @@ cli_profile_guard() {
 }
 step "cli-profile guard (no hardcoded claude|codex branching)" cli_profile_guard || exit 1
 
+# --- 5c. ADR-0003 auth-generation invalidation drift guard (v2.20.0) ----------
+# The verified-token cache (src/auth-cache.ts) is only safe if EVERY mutator
+# that changes a token's validity bumps the auth generation. A stale cache =
+# accepting a revoked token = auth bypass. This TS-AST walk asserts every
+# validity-changing `agents` mutator in src/db.ts calls bumpAuthGeneration (or
+# routes through applyAuthStateTransition). Shared with the vitest negative-
+# fixture test (tests/v2-20-0-auth-latency.test.ts) that proves the guard FAILS
+# when a bump is omitted — test the guard, not just the code (Victra Q3 gate).
+auth_gen_guard() {
+  node "$PROJECT_ROOT/scripts/auth-gen-guard.mjs" "$PROJECT_ROOT/src/db.ts"
+}
+step "auth-gen guard (every token/auth mutator invalidates the cache)" auth_gen_guard || exit 1
+
 # --- 6. 25-tool + CLI smoke against an isolated relay (v2.1 Phase 5a) ---
 # Inline cleanup (no RETURN trap) — simpler + avoids set-u pitfalls around
 # deferred variable lookup in trap strings.

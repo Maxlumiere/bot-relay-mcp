@@ -20,8 +20,10 @@ import type {
   WebhookDeliveryRecord,
 } from "./types.js";
 import { VALID_TRANSITIONS, ACTION_TO_STATUS } from "./types.js";
-import { generateToken, hashToken } from "./auth.js";
+import { generateToken, hashToken, verifyToken } from "./auth.js";
 import type { AuthStateInput } from "./auth.js";
+import { computeTokenLookup } from "./token-lookup.js";
+import { authCacheGet, authCacheSet, authCacheTtlMs } from "./auth-cache.js";
 import { encryptContent, decryptContent } from "./encryption.js";
 import {
   type CompatDatabase,
@@ -281,6 +283,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_15(_db);
   migrateSchemaToV2_16(_db);
   migrateSchemaToV2_19(_db);
+  migrateSchemaToV2_20(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -323,6 +326,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_15(_db);
   migrateSchemaToV2_16(_db);
   migrateSchemaToV2_19(_db);
+  migrateSchemaToV2_20(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -544,7 +548,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 19;
+export const CURRENT_SCHEMA_VERSION = 20;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -637,6 +641,7 @@ export function applyMigration(from: number, to: number): void {
     [16, 17],
     [17, 18],
     [18, 19],
+    [19, 20],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1573,6 +1578,235 @@ function migrateSchemaToV2_19(db: CompatDatabase): void {
   ).run();
 }
 
+/**
+ * ADR-0003 (v2.20.0) — O(1) token-auth substrate. Additive + idempotent.
+ *
+ * Adds:
+ *   - `agents.token_lookup TEXT NULL` — HMAC-SHA256 digest of the CURRENT token
+ *     (an indexed locator; NEVER an auth decision — see src/token-lookup.ts).
+ *   - `agents.previous_token_lookup TEXT NULL` — digest of the PREVIOUS token,
+ *     populated only during rotation_grace (mirrors previous_token_hash).
+ *   - `idx_agents_token_lookup` — the index that turns the O(N) bcrypt scan
+ *     into a single-row candidate lookup.
+ *   - `auth_meta` — a single-row (CHECK id=1) monotonic `generation` counter.
+ *     ANY mutation that can change a token's validity bumps it; the verified-
+ *     token cache stamps the generation at insert and treats a bumped counter
+ *     as instant invalidation (see bumpAuthGeneration / getAuthGeneration).
+ *
+ * NO BACKFILL: `token_lookup` cannot be recomputed from the stored bcrypt hash
+ * (we don't hold the raw token). Existing rows stay NULL until their token is
+ * next minted/rotated/registered; the locator's O(N) fallback + lazy self-heal
+ * (see locateAgentByToken) keep every legacy agent authenticating meanwhile,
+ * so this is a zero-lockout, zero-data migration.
+ */
+function migrateSchemaToV2_20(db: CompatDatabase): void {
+  const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "token_lookup")) {
+    db.exec("ALTER TABLE agents ADD COLUMN token_lookup TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "previous_token_lookup")) {
+    db.exec("ALTER TABLE agents ADD COLUMN previous_token_lookup TEXT");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agents_token_lookup ON agents(token_lookup)");
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS auth_meta (" +
+      "id INTEGER PRIMARY KEY CHECK (id = 1), " +
+      "generation INTEGER NOT NULL DEFAULT 0)",
+  );
+  db.prepare("INSERT OR IGNORE INTO auth_meta (id, generation) VALUES (1, 0)").run();
+}
+
+/**
+ * ADR-0003 — read the current auth generation. A single-row PK read
+ * (~microseconds), cheap enough to run on every auth (the verified-token cache
+ * saves the bcrypt, not this read). Returns 0 if the row is somehow absent
+ * (fail-safe: a 0 never matches a stamped positive gen → forces a re-verify).
+ */
+export function getAuthGeneration(): number {
+  const row = getDb().prepare("SELECT generation FROM auth_meta WHERE id = 1").get() as
+    | { generation?: number }
+    | undefined;
+  return row?.generation ?? 0;
+}
+
+/**
+ * ADR-0003 — bump the auth generation. MUST be called by every sanctioned
+ * mutator that can change a token's validity: a write to token_hash /
+ * auth_state / previous_token_hash / recovery_token_hash /
+ * rotation_grace_expires_at, or a delete of an agent row. It invalidates the
+ * ENTIRE verified-token cache logically — any entry stamped with a now-stale
+ * generation is rejected on its next hit, giving INSTANT revocation regardless
+ * of the entry's TTL. Coverage is enforced adversarially by the sanctioned-
+ * mutation drift guard (scripts/auth-gen-guard.mjs + its negative fixture).
+ */
+export function bumpAuthGeneration(): void {
+  getDb().prepare("UPDATE auth_meta SET generation = generation + 1 WHERE id = 1").run();
+}
+
+/**
+ * ADR-0003 — bcrypt-scan a set of candidate rows for the one the token belongs
+ * to, returning WHICH hash matched. Identification only — NO auth-state
+ * decision (so callers like checkToken can see a revoked row). bcrypt is the
+ * verifier; a digest collision that reaches here is rejected because the
+ * bcrypt.compareSync still fails. Order matters: token_hash before
+ * previous_token_hash (a grace window's NEW token wins).
+ */
+function matchTokenAgainstRows(
+  token: string,
+  rows: AgentRecord[],
+): { row: AgentRecord; matched: "current" | "previous" } | null {
+  for (const row of rows) {
+    if (row.token_hash && verifyToken(token, row.token_hash)) return { row, matched: "current" };
+    if (row.previous_token_hash && verifyToken(token, row.previous_token_hash)) {
+      return { row, matched: "previous" };
+    }
+  }
+  return null;
+}
+
+/**
+ * ADR-0003 — SHARED identification primitive for BOTH token-auth call sites
+ * (server.ts resolveCallerByToken via resolveAgentByToken, and status.ts
+ * checkToken). Finds the agent row a token belongs to in O(1) via the indexed
+ * HMAC digest, with an O(N) fallback that guarantees a legacy NULL-digest row
+ * (or a keyring-rotation straggler whose digest was computed under the old key)
+ * is never missed. `fromLocator` distinguishes the index hit from the fallback
+ * (drives lazy self-heal). Returns the row for ANY auth_state — the caller
+ * decides what the state means. Feeding both sites from here is what keeps the
+ * two auth paths from diverging.
+ */
+export function findAgentRowByToken(
+  token: string,
+): { row: AgentRecord; matched: "current" | "previous"; fromLocator: boolean } | null {
+  const digest = computeTokenLookup(token);
+  const db = getDb();
+  const candidates = db
+    .prepare("SELECT * FROM agents WHERE token_lookup = ? OR previous_token_lookup = ?")
+    .all(digest, digest) as AgentRecord[];
+  const hit = matchTokenAgainstRows(token, candidates);
+  if (hit) return { ...hit, fromLocator: true };
+  // Fallback: legacy NULL-digest rows / keyring-rotation stragglers.
+  const all = db.prepare("SELECT * FROM agents").all() as AgentRecord[];
+  const fb = matchTokenAgainstRows(token, all);
+  return fb ? { ...fb, fromLocator: false } : null;
+}
+
+/**
+ * ADR-0003 — apply the active/rotation_grace decision to an identified row,
+ * faithfully replicating the legacy O(N) scan's POSITIVE cases: a caller is
+ * returned ONLY for an `active` row (its current token), or a `rotation_grace`
+ * row where the current token OR the not-yet-expired previous token matched.
+ * revoked / recovery_pending / legacy_bootstrap → null. `graceExpiry` (epoch
+ * ms, or null) bounds the cache TTL for a previous-token match.
+ */
+function decideActiveGrace(
+  row: AgentRecord,
+  matched: "current" | "previous",
+): { capabilities: string[]; graceExpiry: number | null } | null {
+  const state = (row.auth_state ?? "active") as AuthStateInput;
+  if (state !== "active" && state !== "rotation_grace") return null;
+  let caps: string[];
+  try {
+    caps = JSON.parse(row.capabilities) as string[];
+  } catch {
+    caps = [];
+  }
+  if (matched === "current") {
+    // The current token authenticates in both `active` and `rotation_grace`.
+    return { capabilities: caps, graceExpiry: null };
+  }
+  // The previous token authenticates ONLY inside a non-expired grace window.
+  if (state === "rotation_grace") {
+    const expiry = row.rotation_grace_expires_at ? new Date(row.rotation_grace_expires_at).getTime() : 0;
+    const expired = expiry > 0 && Date.now() >= expiry;
+    if (!expired) return { capabilities: caps, graceExpiry: expiry > 0 ? expiry : null };
+  }
+  return null;
+}
+
+/** Absolute cache deadline: now+TTL, capped at a rotation-grace expiry when present. */
+function authCacheExpiry(now: number, graceExpiry: number | null): number {
+  const ttlDeadline = now + authCacheTtlMs();
+  return graceExpiry !== null ? Math.min(ttlDeadline, graceExpiry) : ttlDeadline;
+}
+
+/**
+ * ADR-0003 lazy self-heal — populate the matched lookup-digest column for a row
+ * the O(N) fallback matched (a legacy NULL-digest row, or a keyring-rotation
+ * straggler whose digest was computed under the old key). Bumps the auth
+ * generation (Q6 decision (a): the drift guard stays exception-free; the write
+ * does not change token validity but a bump is harmless + self-terminating).
+ * No-op when the column already holds the correct digest.
+ */
+function selfHealTokenLookup(
+  row: AgentRecord,
+  column: "token_lookup" | "previous_token_lookup",
+  digest: string,
+): void {
+  const existing = column === "token_lookup" ? row.token_lookup : row.previous_token_lookup;
+  if (existing === digest) return;
+  try {
+    if (column === "token_lookup") {
+      getDb().prepare("UPDATE agents SET token_lookup = ? WHERE name = ?").run(digest, row.name);
+    } else {
+      getDb().prepare("UPDATE agents SET previous_token_lookup = ? WHERE name = ?").run(digest, row.name);
+    }
+    bumpAuthGeneration();
+  } catch (err) {
+    log.warn(
+      `[token-lookup] self-heal failed for "${row.name}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * ADR-0003 — O(1) token-only caller resolution. Faithful drop-in replacement
+ * for the legacy O(N) bcrypt scan (server.ts resolveCallerByToken).
+ *
+ * Path: verified-token cache (generation + TTL checked) → shared indexed
+ * locator (findAgentRowByToken) → active/grace decision → cache. On a locator
+ * MISS the shared fallback still finds the row; we then lazily self-heal the
+ * digest (which bumps the generation) and skip caching this call — the next
+ * call's locator hit caches it under the fresh generation.
+ *
+ * bcrypt stays the sole verifier: the digest only narrows candidates (a
+ * collision is caught by the bcrypt confirm inside findAgentRowByToken), and
+ * the cache only replays an already-bcrypt-verified verdict that is still
+ * current (generation unchanged) and unexpired.
+ */
+export function resolveAgentByToken(token: string): { name: string; capabilities: string[] } | null {
+  const digest = computeTokenLookup(token);
+  const gen = getAuthGeneration();
+  const now = Date.now();
+
+  // 1. Cache — generation + TTL enforced inside; a stale/expired entry is evicted.
+  const cached = authCacheGet(digest, gen, now);
+  if (cached) return cached;
+
+  // 2. Shared O(1) locator (+ O(N) fallback).
+  const found = findAgentRowByToken(token);
+  if (!found) return null;
+  const decision = decideActiveGrace(found.row, found.matched);
+  if (!decision) return null; // revoked / recovery / legacy / expired-grace-previous → not a caller
+
+  if (found.fromLocator) {
+    authCacheSet(
+      digest,
+      { name: found.row.name, capabilities: decision.capabilities },
+      gen,
+      authCacheExpiry(now, decision.graceExpiry),
+    );
+  } else {
+    // Fallback → self-heal (bumps the generation), so do NOT cache this call.
+    selfHealTokenLookup(
+      found.row,
+      found.matched === "current" ? "token_lookup" : "previous_token_lookup",
+      digest,
+    );
+  }
+  return { name: found.row.name, capabilities: decision.capabilities };
+}
+
 export function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -1855,6 +2089,7 @@ export function teardownAgent(
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
   });
   tx();
+  bumpAuthGeneration(); // ADR-0003: agent row removed → any cached verdict invalid
 }
 
 /**
@@ -1886,6 +2121,12 @@ export function applyAuthStateTransition(
   updates: {
     token_hash?: string | null;
     previous_token_hash?: string | null;
+    // ADR-0003 (schema v20): callers that change token_hash / previous_token_hash
+    // MUST pass the mirroring lookup digest(s) so the O(1) locator index stays
+    // consistent (e.g. sweepExpiredRotationGrace nulls previous_token_lookup
+    // alongside previous_token_hash).
+    token_lookup?: string | null;
+    previous_token_lookup?: string | null;
     rotation_grace_expires_at?: string | null;
     recovery_token_hash?: string | null;
     revoked_at?: string | null;
@@ -1909,6 +2150,9 @@ export function applyAuthStateTransition(
   }
   const sql = `UPDATE agents SET ${setCols.join(", ")} WHERE ${whereClause}`;
   const r = db.prepare(sql).run(...setVals, ...whereVals);
+  // ADR-0003: any successful auth-state transition can change a token's
+  // validity → invalidate the verified-token cache.
+  if (r.changes === 1) bumpAuthGeneration();
   return { changed: r.changes === 1 };
 }
 
@@ -2212,6 +2456,9 @@ export function expandAgentCapabilities(
     }
   });
   tx();
+  // ADR-0003: resolveAgentByToken returns capabilities, so a cached verdict
+  // would carry stale authz — invalidate on a caps change.
+  bumpAuthGeneration();
   return { added, current: unionCaps };
 }
 
@@ -2274,9 +2521,9 @@ export function mintAgentToken(
     const capsJson = JSON.stringify(capabilities);
     const tx = db.transaction(() => {
       db.prepare(
-        "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed, terminal_title_ref) " +
-          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', 0, NULL)"
-      ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description);
+        "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', 0, NULL)"
+      ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description);
       const insertCap = db.prepare(
         "INSERT OR IGNORE INTO agent_capabilities (agent_name, capability) VALUES (?, ?)"
       );
@@ -2285,6 +2532,7 @@ export function mintAgentToken(
       }
     });
     tx();
+    bumpAuthGeneration(); // ADR-0003: new token_hash + token_lookup written
 
     const fresh = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
     return {
@@ -2308,13 +2556,13 @@ export function mintAgentToken(
     options.description !== undefined ? options.description : existing.description ?? null;
   const tx = db.transaction(() => {
     const r = db.prepare(
-      "UPDATE agents SET last_seen = ?, token_hash = ?, session_id = NULL, " +
+      "UPDATE agents SET last_seen = ?, token_hash = ?, token_lookup = ?, session_id = NULL, " +
         "agent_status = 'offline', auth_state = 'active', " +
-        "previous_token_hash = NULL, rotation_grace_expires_at = NULL, " +
+        "previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL, " +
         "recovery_token_hash = NULL, revoked_at = NULL, " +
         "description = ? " +
         "WHERE name = ?"
-    ).run(timestamp, token_hash, newDescription, name);
+    ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name);
     if (r.changes !== 1) {
       throw new Error(
         `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
@@ -2322,6 +2570,7 @@ export function mintAgentToken(
     }
   });
   tx();
+  bumpAuthGeneration(); // ADR-0003: token rotated (new token_hash/token_lookup, old invalidated)
 
   const updated = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
   return {
@@ -2512,13 +2761,17 @@ export function registerAgent(
       // stays 'unknown', so the dashboard's liveness gate alone would still
       // read the stale stamp as closed). The stamp is session-scoped;
       // long-term forensics live in audit_log (stdio.session_ended_on_signal).
-      "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
+      "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, token_lookup = ?, session_id = ?, session_started_at = ?, description = ?, " +
       "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, agent_status = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ?, " +
       "signal_received_at = NULL, signal_kind = NULL " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
-      role, timestamp, newHash, session_id, timestamp, newDescription,
+      role, timestamp, newHash,
+      // ADR-0003: rotate the lookup digest only when a NEW token was issued;
+      // an unchanged token keeps its existing digest.
+      plaintext_token !== null ? computeTokenLookup(plaintext_token) : existing.token_lookup ?? null,
+      session_id, timestamp, newDescription,
       newTitleRef, newHostShellPids, newHostId, newAgentStatus,
       newAuthState, newRecoveryHash, newRevokedAt,
       name, existingState, existing.token_hash, casRecoveryHash
@@ -2528,6 +2781,7 @@ export function registerAgent(
         `register_agent failed for "${name}": auth_state / token_hash / recovery_token_hash changed since we read it (concurrent rotate_token / revoke_token / unregister_agent / recovery reissue). Re-auth and retry.`
       );
     }
+    bumpAuthGeneration(); // ADR-0003: re-register can change token/auth_state validity
 
     agentWithStatus = toAgentWithStatus({
       ...existing,
@@ -2566,8 +2820,9 @@ export function registerAgent(
       // v2.1.6: session_started_at = timestamp for first-register anchor.
       // v2.2.0: terminal_title_ref captured on first register (may be null).
       // schema v16: host_shell_pids (JSON) + host_id captured on first register.
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId);
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId);
+    bumpAuthGeneration(); // ADR-0003: fresh token_hash + token_lookup written
 
     // v2.0: populate normalized agent_capabilities table.
     const insertCap = db.prepare("INSERT OR IGNORE INTO agent_capabilities (agent_name, capability) VALUES (?, ?)");
@@ -2661,22 +2916,29 @@ export function rotateAgentToken(
       // Hard-cut — no grace column, skip straight to active with new hash.
       const r = db
         .prepare(
-          "UPDATE agents SET token_hash = ? WHERE name = ? AND token_hash = ? AND auth_state = 'active' AND managed = 1"
+          "UPDATE agents SET token_hash = ?, token_lookup = ?, previous_token_lookup = NULL " +
+            "WHERE name = ? AND token_hash = ? AND auth_state = 'active' AND managed = 1"
         )
-        .run(newHash, name, expectedOldHash);
+        .run(newHash, computeTokenLookup(newPlaintextToken), name, expectedOldHash);
       if (r.changes !== 1) {
         throw new ConcurrentUpdateError(
           `rotate_token failed for "${name}": state or hash changed mid-flight. Re-auth and retry.`
         );
       }
+      bumpAuthGeneration(); // ADR-0003: token rotated (hard-cut)
       return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt: null };
     }
 
+    // ADR-0003: mirror previous_token_hash = token_hash with
+    // previous_token_lookup = token_lookup so the OLD token stays O(1)-findable
+    // during the grace window.
     const r = db
       .prepare(
         `UPDATE agents SET
            token_hash = ?,
+           token_lookup = ?,
            previous_token_hash = token_hash,
+           previous_token_lookup = token_lookup,
            auth_state = 'rotation_grace',
            rotation_grace_expires_at = ?
          WHERE name = ?
@@ -2684,26 +2946,29 @@ export function rotateAgentToken(
            AND token_hash = ?
            AND managed = 1`
       )
-      .run(newHash, graceExpiresAt, name, expectedOldHash);
+      .run(newHash, computeTokenLookup(newPlaintextToken), graceExpiresAt, name, expectedOldHash);
     if (r.changes !== 1) {
       throw new ConcurrentUpdateError(
         `rotate_token failed for "${name}": state or hash changed mid-flight (concurrent rotate / revoke / unregister). Re-auth and retry.`
       );
     }
+    bumpAuthGeneration(); // ADR-0003: token rotated (grace)
     return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt };
   }
 
   // Unmanaged path — straight swap, no grace, no push.
   const r = db
     .prepare(
-      "UPDATE agents SET token_hash = ? WHERE name = ? AND token_hash = ? AND auth_state = 'active' AND managed = 0"
+      "UPDATE agents SET token_hash = ?, token_lookup = ?, previous_token_lookup = NULL " +
+        "WHERE name = ? AND token_hash = ? AND auth_state = 'active' AND managed = 0"
     )
-    .run(newHash, name, expectedOldHash);
+    .run(newHash, computeTokenLookup(newPlaintextToken), name, expectedOldHash);
   if (r.changes !== 1) {
     throw new ConcurrentUpdateError(
       `rotate_token failed for "${name}": token_hash or auth_state changed since we read it (concurrent rotate_token / revoke_token / unregister_agent). Re-auth and retry.`
     );
   }
+  bumpAuthGeneration(); // ADR-0003: token rotated (unmanaged)
   return { newPlaintextToken, newHash, agentClass: "unmanaged", graceExpiresAt: null };
 }
 
@@ -2741,14 +3006,16 @@ export function rotateAgentTokenAdmin(
     if (graceSec === 0) {
       const r = db
         .prepare(
-          "UPDATE agents SET token_hash = ? WHERE name = ? AND auth_state = 'active' AND managed = 1"
+          "UPDATE agents SET token_hash = ?, token_lookup = ?, previous_token_lookup = NULL " +
+            "WHERE name = ? AND auth_state = 'active' AND managed = 1"
         )
-        .run(newHash, targetName);
+        .run(newHash, computeTokenLookup(newPlaintextToken), targetName);
       if (r.changes !== 1) {
         throw new ConcurrentUpdateError(
           `rotate_token_admin failed for "${targetName}": target state changed mid-flight.`
         );
       }
+      bumpAuthGeneration(); // ADR-0003: admin token rotated (hard-cut)
       return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt: null };
     }
 
@@ -2756,32 +3023,37 @@ export function rotateAgentTokenAdmin(
       .prepare(
         `UPDATE agents SET
            token_hash = ?,
+           token_lookup = ?,
            previous_token_hash = token_hash,
+           previous_token_lookup = token_lookup,
            auth_state = 'rotation_grace',
            rotation_grace_expires_at = ?
          WHERE name = ?
            AND auth_state = 'active'
            AND managed = 1`
       )
-      .run(newHash, graceExpiresAt, targetName);
+      .run(newHash, computeTokenLookup(newPlaintextToken), graceExpiresAt, targetName);
     if (r.changes !== 1) {
       throw new ConcurrentUpdateError(
         `rotate_token_admin failed for "${targetName}": target state changed mid-flight.`
       );
     }
+    bumpAuthGeneration(); // ADR-0003: admin token rotated (grace)
     return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt };
   }
 
   const r = db
     .prepare(
-      "UPDATE agents SET token_hash = ? WHERE name = ? AND auth_state = 'active' AND managed = 0"
+      "UPDATE agents SET token_hash = ?, token_lookup = ?, previous_token_lookup = NULL " +
+        "WHERE name = ? AND auth_state = 'active' AND managed = 0"
     )
-    .run(newHash, targetName);
+    .run(newHash, computeTokenLookup(newPlaintextToken), targetName);
   if (r.changes !== 1) {
     throw new ConcurrentUpdateError(
       `rotate_token_admin failed for "${targetName}": target state changed mid-flight.`
     );
   }
+  bumpAuthGeneration(); // ADR-0003: admin token rotated (unmanaged)
   return { newPlaintextToken, newHash, agentClass: "unmanaged", graceExpiresAt: null };
 }
 
@@ -2814,10 +3086,11 @@ export function sweepExpiredRotationGrace(): number {
       "active",
       {
         previous_token_hash: null,
+        previous_token_lookup: null, // ADR-0003: old token dies at grace expiry
         rotation_grace_expires_at: null,
       }
     );
-    if (r.changed) swept++;
+    if (r.changed) swept++; // applyAuthStateTransition bumps the auth generation on change
   }
   return swept;
 }
@@ -2866,9 +3139,14 @@ export function revokeAgentToken(
   const r = db.prepare(
     "UPDATE agents " +
     "SET auth_state = ?, revoked_at = ?, recovery_token_hash = ?, " +
-    "    previous_token_hash = NULL, rotation_grace_expires_at = NULL " +
+    "    previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL " +
     "WHERE name = ? AND auth_state IN ('active','legacy_bootstrap','recovery_pending','rotation_grace')"
   ).run(newState, revokedAt, recoveryHash, targetName);
+  // ADR-0003: revoke keeps token_hash for forensics, so the token still
+  // bcrypt-matches — only auth_state makes it invalid. The cache keys validity
+  // on generation, so we MUST bump here or a revoked token would keep passing
+  // from cache. (The revoke-trap.)
+  if (r.changes > 0) bumpAuthGeneration();
 
   return {
     revoked: r.changes > 0,
@@ -3060,6 +3338,7 @@ export function unregisterAgent(name: string, expectedSessionId?: string): boole
   // deleted anything.
   if (result.changes > 0) {
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
+    bumpAuthGeneration(); // ADR-0003: agent row removed → any cached verdict invalid
   }
   return result.changes > 0;
 }
@@ -4086,6 +4365,7 @@ export function deleteAgentIfAbandoned(name: string, cutoffIso: string): boolean
   const r = db
     .prepare("DELETE FROM agents WHERE name = ? AND last_seen < ?")
     .run(name, cutoffIso);
+  if (r.changes > 0) bumpAuthGeneration(); // ADR-0003: agent row removed
   return r.changes > 0;
 }
 

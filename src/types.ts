@@ -898,6 +898,10 @@ export interface AgentRecord {
   rotation_grace_expires_at?: string | null;
   /** v2.1 Phase 4b.2: bcrypt hash of pre-rotation token. Populated iff state=rotation_grace; allows the old token to auth alongside the new token during the grace window. */
   previous_token_hash?: string | null;
+  /** ADR-0003 (schema v20): HMAC-SHA256 lookup digest of the CURRENT token — an indexed O(1) locator, NEVER an auth decision (bcrypt on token_hash stays the verifier). NULL on legacy rows until the token is next minted/rotated or lazily self-healed on the O(N) fallback path. */
+  token_lookup?: string | null;
+  /** ADR-0003 (schema v20): lookup digest of the PREVIOUS token; populated only during rotation_grace (mirrors previous_token_hash). NULL otherwise. */
+  previous_token_lookup?: string | null;
   /** v2.1.6: ISO timestamp of the agent's current session start (last register_agent). NULL on rows registered before v2.1.6. */
   session_started_at?: string | null;
   /** v2.2.0: window title the agent's terminal was spawned with. Used by the dashboard's click-to-focus driver. NULL on rows spawned before v2.2.0 or rows that did not thread the value through the register call. */
