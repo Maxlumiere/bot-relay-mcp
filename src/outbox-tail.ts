@@ -53,6 +53,7 @@ import { getDb } from "./db.js";
 import { log } from "./logger.js";
 import { broadcastInboxChange } from "./mcp-subscriptions.js";
 import { touchMarker } from "./filesystem-marker.js";
+import { onInboxChanged } from "./inbox-events.js";
 import type { InboxChangedEvent } from "./inbox-events.js";
 
 /**
@@ -104,6 +105,9 @@ let timer: NodeJS.Timeout | null = null;
 let running = false;
 let stopping = false;
 let lastDataVersion: number | null = null;
+/** Set when THIS process commits an inbox event (which `data_version` hides). */
+let localDirty = false;
+let unsubscribeLocalWrites: (() => void) | null = null;
 
 function pollIntervalMs(): number {
   const raw = process.env.RELAY_OUTBOX_POLL_MS;
@@ -133,10 +137,23 @@ function tickOnce(): { rowsProcessed: number; hitLimit: boolean } {
   // bumps on every COMMIT to the underlying DB file, regardless of which
   // process did the writing — so a stdio writer's commit will be visible
   // here as a version bump.
+  // SAME-CONNECTION BLIND SPOT. `PRAGMA data_version` only reports commits made
+  // by OTHER connections — it is deliberately unchanged for commits on this one.
+  // That was harmless while the tail only fanned out to remote subscribers, but
+  // the tail now also OWNS marker writes, so skipping our own connection's
+  // commits would mean a message sent through the daemon itself (the `relay
+  // send` -> /api/send-message path) never woke anybody. Verified the hard way:
+  // with the skip unguarded, a daemon-path send left the recipient's marker
+  // untouched, silently breaking the one path that used to work.
+  //
+  // `localDirty` is set by the in-process bus whenever this process commits an
+  // inbox event, so a same-connection write forces the SELECT that data_version
+  // will not. Cross-process writes still ride the cheap pragma check.
   const dv = readDataVersion();
-  if (dv !== null && lastDataVersion !== null && dv === lastDataVersion) {
+  if (!localDirty && dv !== null && lastDataVersion !== null && dv === lastDataVersion) {
     return { rowsProcessed: 0, hitLimit: false };
   }
+  localDirty = false;
 
   const rows = db
     .prepare(
@@ -228,6 +245,12 @@ export function startOutboxTail(): void {
   }
   running = true;
   stopping = false;
+  // Subscribe to this process's own commits so a same-connection write is not
+  // hidden by the data_version skip (see tickOnce). Idempotent: unsubscribed in
+  // stopOutboxTail so repeated start/stop cycles never stack handlers.
+  if (!unsubscribeLocalWrites) {
+    unsubscribeLocalWrites = onInboxChanged(() => { localDirty = true; });
+  }
   try {
     const db = getDb();
     const row = db
@@ -259,6 +282,10 @@ export function stopOutboxTail(): void {
     clearTimeout(timer);
     timer = null;
   }
+  if (unsubscribeLocalWrites) {
+    unsubscribeLocalWrites();
+    unsubscribeLocalWrites = null;
+  }
 }
 
 /** Test-only: current in-memory cursor. Used by Phase 3d cross-process test. */
@@ -271,4 +298,5 @@ export function _resetOutboxTailForTests(): void {
   stopOutboxTail();
   cursorId = 0;
   lastDataVersion = null;
+  localDirty = false;
 }
