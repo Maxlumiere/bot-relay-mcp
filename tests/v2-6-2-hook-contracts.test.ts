@@ -35,6 +35,42 @@ const HOOK_CHECK_RELAY = path.join(REPO_ROOT, "hooks", "check-relay.sh");
 const HOOK_POST_TOOL = path.join(REPO_ROOT, "hooks", "post-tool-use-check.sh");
 const HOOK_STOP = path.join(REPO_ROOT, "hooks", "stop-check.sh");
 
+/**
+ * DERIVED HOOK SET — deliberately NOT a written list.
+ *
+ * The previous cross-hook block was named "all 3 hooks" and looped over three
+ * hardcoded paths. hooks/codex/codex-session-start.sh was never in it, so the
+ * mechanism built to enforce cross-hook discipline had precisely the blind spot
+ * it existed to prevent. A fifth hook would have been missed the same way.
+ *
+ * So the set is enumerated from the hooks directory. A new hook is a MEMBER BY
+ * DEFAULT and fails these contracts until it complies; opting out requires
+ * adding a name to NON_HOOK_FILES below, which is a visible, reviewable edit
+ * rather than a silent omission.
+ */
+const NON_HOOK_FILES = new Set([
+  "_vault-helpers.sh", // sourced helper library, never executed directly
+  "_verdict.sh",       // sourced verdict primitive, never executed directly
+]);
+
+function discoverHooks(): string[] {
+  const root = path.join(REPO_ROOT, "hooks");
+  const found: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!entry.name.endsWith(".sh")) continue;
+      if (NON_HOOK_FILES.has(entry.name)) continue;
+      found.push(full);
+    }
+  };
+  walk(root);
+  return found.sort();
+}
+
+const ALL_HOOKS = discoverHooks();
+
 const TEST_ROOT = path.join(os.tmpdir(), "v2-6-2-hook-contracts-" + process.pid);
 
 function freshTestRoot(): { root: string; dbPath: string; vaultDir: string } {
@@ -414,10 +450,36 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
 
 // --- Cross-hook invariants ---
 describe("v2.6.2 — cross-hook invariants", () => {
-  it("all 3 hooks NEVER emit partial JSON or stack traces to stdout (output contract discipline)", () => {
+  it("discovers every hook — the set is derived, not written down", () => {
+    // Guards the guard. The old hardcoded trio silently excluded the Codex
+    // hook; if discovery ever returns fewer hooks than exist on disk, this
+    // fails rather than quietly shrinking the coverage of everything below.
+    const names = ALL_HOOKS.map((h) => path.basename(h));
+    expect(names).toContain("check-relay.sh");
+    expect(names).toContain("codex-session-start.sh"); // the one that was missed
+    expect(names).toContain("post-tool-use-check.sh");
+    expect(names).toContain("stop-check.sh");
+    expect(ALL_HOOKS.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("EVERY hook emits EXACTLY ONE verdict — a new hook cannot quietly opt out", () => {
+    // The whole point of the inversion: absence of a verdict is failure. A hook
+    // added later is a member of ALL_HOOKS by default, so it fails here until
+    // it sources _verdict.sh. Verdict may ride stdout or stderr — hooks whose
+    // stdout is structured JSON must use stderr, so both streams are searched.
+    const { root } = freshTestRoot();
+    for (const hook of ALL_HOOKS) {
+      const r = runHook({ hook, root, agentName: "probe" });
+      const combined = `${r.stdout}\n${r.stderr}`;
+      const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+      expect(count, `hook ${path.basename(hook)} emitted ${count} verdicts (expected exactly 1)`).toBe(1);
+    }
+  });
+
+  it("EVERY discovered hook NEVER emits partial JSON or stack traces to stdout (output contract discipline)", () => {
     // Empty everything; all 3 hooks must exit 0 with empty stdout.
     const { root } = freshTestRoot();
-    for (const hook of [HOOK_CHECK_RELAY, HOOK_POST_TOOL, HOOK_STOP]) {
+    for (const hook of ALL_HOOKS) {
       const r = runHook({
         hook,
         agentName: "",
@@ -430,9 +492,9 @@ describe("v2.6.2 — cross-hook invariants", () => {
     }
   });
 
-  it("all 3 hooks reject invalid agent name silently with exit 0 (no info leak)", () => {
+  it("EVERY discovered hook rejects an invalid agent name silently with exit 0 (no info leak)", () => {
     const { root } = freshTestRoot();
-    for (const hook of [HOOK_CHECK_RELAY, HOOK_POST_TOOL, HOOK_STOP]) {
+    for (const hook of ALL_HOOKS) {
       const r = runHook({
         hook,
         agentName: "has space and weird chars",

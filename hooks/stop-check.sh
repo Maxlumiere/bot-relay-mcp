@@ -37,6 +37,18 @@
 
 # v2.0 final (#19): self-check for path truncation. Stderr warn so operators
 # see setup mistakes without breaking the hook contract (stdout stays clean).
+# VERDICT BY CONSTRUCTION — first executable code, so none of the `exit 0`
+# guards below can leave this session unaccounted for. STDERR, not stdout: this
+# hook's stdout is a hookSpecificOutput JSON object the harness PARSES, and a
+# trailing bare line would corrupt it — an alarm that corrupts the channel it
+# rides on is worse than no alarm. Shared primitive; see hooks/_verdict.sh.
+RELAY_VERDICT_STREAM=stderr
+RELAY_VERDICT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./_verdict.sh
+if [ -f "$RELAY_VERDICT_DIR/_verdict.sh" ]; then
+  . "$RELAY_VERDICT_DIR/_verdict.sh"
+fi
+
 if [[ "$0" != *"/bot-relay-mcp/hooks/"* ]]; then
   echo "[bot-relay hook WARNING] \$0 does not contain '/bot-relay-mcp/hooks/' — the install path may be truncated. Quote the command string in .claude/settings.json if the path contains spaces. \$0='$0'" >&2
 fi
@@ -311,9 +323,21 @@ SQL
 
 BODY=$(http_try)
 RC=$?
+READ_OK=0
+[ $RC -eq 0 ] && READ_OK=1
 if [ $RC -ne 0 ] || [ -z "$BODY" ]; then
   BODY=$(sqlite_try)
   # sqlite_try returning 0 with empty BODY = empty mailbox, which is fine.
+  [ $? -eq 0 ] && READ_OK=1
+fi
+
+# THE ONLY UPGRADE. Positive evidence is a mailbox read that SUCCEEDED — via
+# HTTP or via the sqlite fallback. An empty BODY alone is NOT evidence: it is
+# ambiguous between "no mail" and "could not read", and treating ambiguity as
+# health is the exact conflation this whole mechanism removes. If both paths
+# failed, CANNOT-JUDGE stands.
+if [ "$READ_OK" -eq 1 ] && command -v relay_verdict_set >/dev/null 2>&1; then
+  relay_verdict_set "HEALTHY" "mailbox read succeeded" " agent=\"${AGENT_NAME:-?}\""
 fi
 
 if [ -z "$BODY" ]; then
