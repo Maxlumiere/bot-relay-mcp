@@ -323,11 +323,21 @@ export async function run(argv: string[]): Promise<number> {
       }
       try {
         watcher = fs.watch(dir, (_event, filename) => {
-          if (!filename || filename === base) {
-            // A real marker write reached us — the event path is PROVEN live,
-            // not merely configured. This is the only positive evidence that
-            // exists for the wake path working end to end.
+          if (filename === base) {
+            // A real marker write for THIS agent reached us — the event path is
+            // PROVEN live, not merely configured. This is the only positive
+            // evidence that exists for the wake path working end to end.
             sawMarkerEvent = true;
+            check();
+          } else if (!filename) {
+            // fs.watch may fire with no filename (platform-dependent). That is
+            // an unrelated directory change, another agent's marker, or ours —
+            // we cannot tell. Checking is free and correct; claiming PROOF from
+            // it is not. Setting sawMarkerEvent here would let one anonymous
+            // event permanently suppress the degraded-path announcement below,
+            // so a dead marker path would go back to being detected silently by
+            // the 30s poll — the exact failure this evidence flag exists to
+            // make loud. Unknown stays UNPROVEN.
             check();
           }
         });
@@ -337,12 +347,21 @@ export async function run(argv: string[]): Promise<number> {
     }
     const FALLBACK_MS = 30_000; // marker-miss safety net
     timer = setInterval(() => {
+      // PER-WINDOW, NOT PER-PROCESS. `sawMarkerEvent` used to latch: one
+      // legitimate marker early in the watcher's life made it true forever, so
+      // if the marker writer later died, every subsequent message was found by
+      // this poll and the degraded branch could never fire again. "A marker
+      // worked once" is not evidence that the wake path worked for THIS
+      // message. Consume the evidence and reset, so each window is judged on
+      // its own delivery.
+      const sawMarkerThisWindow = sawMarkerEvent;
+      sawMarkerEvent = false;
       const before = prevUnread;
       check();
       // New mail that the marker watcher never told us about: the marker did
       // not fire for a message that definitely landed. Prove-by-behaviour that
       // we are degraded, then stop pretending the 30s net is a wake path.
-      if (!sawMarkerEvent && before !== null && prevUnread !== null && prevUnread > before) {
+      if (!sawMarkerThisWindow && before !== null && prevUnread !== null && prevUnread > before) {
         announceDegraded("new mail was detected by the fallback poll, not by a marker event");
         tightenToPolling();
       }
