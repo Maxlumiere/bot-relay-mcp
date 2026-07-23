@@ -133,6 +133,44 @@ describe("codex HIGH 2 — only the CANONICAL relay entry can trigger a mute cla
   });
 });
 
+describe("the detector must announce its OWN death", () => {
+  it("reports MUTE SELF-CHECK FAILED when the diagnostic itself cannot run", () => {
+    // The nastiest failure this feature can have is being disabled without
+    // anyone noticing — which already happened once (Illegal Return + the
+    // hook's own 2>/dev/null). A silence-detector that dies quietly is worse
+    // than none, because its quiet reads as "all clear".
+    //
+    // Simulate the detector failing WITHOUT editing the hook: shadow `node`
+    // with a stub that always exits non-zero.
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-fakebin-"));
+    const fakeNode = path.join(binDir, "node");
+    fs.writeFileSync(fakeNode, "#!/bin/sh\nexit 1\n");
+    fs.chmodSync(fakeNode, 0o755);
+
+    writeConfig({ mcpServers: { "bot-relay": { type: "http", url: "http://127.0.0.1:3777/mcp" } } });
+    const out = runHook({
+      RELAY_DB_PATH: instanceDb(),
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    });
+
+    try {
+      expect(out).toContain("MUTE SELF-CHECK FAILED TO RUN");
+      // It must say the state is UNKNOWN, not healthy — the whole point.
+      expect(out).toContain("UNVERIFIED");
+    } finally {
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT report a self-check failure when the detector runs normally", () => {
+    // Negative half of the pair: proves the assertion above is not simply
+    // always-on.
+    writeConfig({ mcpServers: { "bot-relay": { type: "http", url: "http://127.0.0.1:3777/mcp" } } });
+    const out = runHook({ RELAY_DB_PATH: instanceDb() });
+    expect(out).not.toContain("MUTE SELF-CHECK FAILED");
+  });
+});
+
 describe("the diagnostics must never break the hook they ride on", () => {
   const shapes: Array<[string, () => void]> = [
     ["config absent", () => { /* no file at all */ }],

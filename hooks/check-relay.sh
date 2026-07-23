@@ -237,6 +237,15 @@ fi
 # Uses node (already a hard dependency of the relay) and stays silent if the
 # config is absent or unreadable; a missing check must never break the hook.
 if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
+  # SELF-CHECK THE SELF-CHECK. This block's job is to SPEAK UP, so it must not be
+  # allowed to fail quietly. It already did once: a top-level `return` in the
+  # script below is an Illegal Return SyntaxError, `2>/dev/null` swallowed it,
+  # and the entire mute detector was silently disabled while every
+  # must-stay-silent test still passed — dead code is silent too.
+  # So stderr is captured rather than discarded, and a non-zero exit is reported
+  # as a failure OF THE DIAGNOSTIC. A silence-detector that can die silently is
+  # worse than none, because its quiet reads as "all clear".
+  RELAY_DIAG_ERR=$(mktemp -t relay-diag 2>/dev/null || echo "/tmp/relay-diag.$$")
   RELAY_MUTE_PATH=$(node -e '
     try {
       const fs = require("fs");
@@ -290,7 +299,20 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
           : (candidates.map(pathOf).filter(Boolean)[0] || "");
       process.stdout.write(broken);
     } catch (e) { /* never break the hook on a config we cannot read */ }
-  ' 2>/dev/null)
+  ' 2>"$RELAY_DIAG_ERR")
+  RELAY_DIAG_RC=$?
+  if [ "$RELAY_DIAG_RC" -ne 0 ]; then
+    # The detector itself failed to run. Say so — do NOT let this read as "no
+    # problems found". This is the exact failure that shipped once.
+    {
+      echo "[RELAY] *** MUTE SELF-CHECK FAILED TO RUN (exit $RELAY_DIAG_RC) ***"
+      echo "[RELAY] The relay-config diagnostic could not execute, so this session's"
+      echo "[RELAY] connectivity is UNVERIFIED — treat its silence as unknown, not as healthy."
+      RELAY_DIAG_MSG=$(head -c 400 "$RELAY_DIAG_ERR" 2>/dev/null | tr '\n' ' ')
+      [ -n "${RELAY_DIAG_MSG:-}" ] && echo "[RELAY]   $RELAY_DIAG_MSG"
+    } | tee /dev/stderr
+  fi
+  rm -f "$RELAY_DIAG_ERR" 2>/dev/null
   if [ -n "${RELAY_MUTE_PATH:-}" ]; then
     {
       echo "[RELAY] *** RELAY MUTE — NO RELAY TOOLS THIS SESSION ***"
