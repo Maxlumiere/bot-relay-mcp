@@ -4,30 +4,47 @@
 // See LICENSE for full terms.
 
 /**
- * ADR-0005 lifecycle refinement — THE establishment-invariant guard (codex #115).
+ * ADR-0005 lifecycle refinement — the establishment-invariant checklist (codex #115).
  *
- * The orphan-GC reaps rows where `established_at IS NULL` (never became a
- * legitimate identity) + session-less + old. `established_at` is set at N sites
- * with NO single write-chokepoint (`verifyToken` is nameless + reused for the
- * recovery secret + the registration handle; recovery is a separate,
- * credential-ISSUING path). So there is no by-construction storage-layer
- * guarantee that every establishment path stamps — THIS TEST IS THAT GUARANTEE.
- * It enumerates EVERY way a row becomes a legitimate identity and asserts each
- * sets established_at. A future 7th path that forgets it fails here, not by
- * silently reaping a live agent in production.
+ * THE MODEL (for async architect review — ADR-0005's domain): a row is ESTABLISHED
+ * the moment the system committed a USABLE CREDENTIAL to a party it LAUNCHED, or
+ * that PROVED ownership. A bare register stays PROVISIONAL until first auth — its
+ * token was returned but nobody has shown they hold it. The orphan-GC reaps
+ * `established_at IS NULL` + session-less + old, so establishment must be recorded
+ * at each such event.
  *
- * Establishment paths (identity becomes real):
- *   token auth — #1 register active-row re-register (force), #2 token-only
- *   resolver, #3 explicit-caller (send_message/get_messages), #4 health_check,
- *   #5 dashboard /api/send-message (also `relay send`); AND the credential-
- *   ISSUING path #6 recovery completion (the codex blocker that proved
- *   token-auth alone is the wrong anchor).
+ * The seven establishment paths (identity becomes real):
+ *   proved-ownership (token auth) — #1 register active-row re-register (force),
+ *   #2 token-only resolver, #3 explicit-caller (send_message/get_messages),
+ *   #4 health_check, #5 dashboard /api/send-message (also `relay send`);
+ *   credential-committed — #6 recovery completion (proved authorization via the
+ *   recovery_token), #7 spawn_agent provisioning (the system wrote the child's
+ *   token to the vault + launched the driver — a stronger commitment than a bare
+ *   register; silence is startup, not abandonment — else we reap children we
+ *   ourselves just spawned).
+ *
+ * HONEST CEILING — this guard is a MANUALLY ENUMERATED checklist, NOT
+ * by-construction: it proves every LISTED path stamps, but it does NOT
+ * auto-discover an UNLISTED path. A new establishment path is silently absent
+ * until someone adds its case here (the recovery + spawn misses are why this
+ * caveat is load-bearing). The negative control (break a stamp → the listed
+ * checks fail) proves the listed assertions work — it CANNOT prove coverage of
+ * paths nobody enumerated. `established_at` is set at N call sites with no single
+ * write-chokepoint; this checklist is call-site discipline with a check attached,
+ * strictly better than an implicit proxy but not a storage-layer guarantee.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+
+// #7 spawn: the platform driver is macOS-only on CI, so mock the dispatcher to
+// report a clean launch — the establishment stamp under test lives in spawn.ts's
+// provisioning success path (after vault-write + driver-launch), not the driver.
+vi.mock("../src/spawn/dispatcher.js", () => ({
+  spawnAgent: () => ({ ok: true, platform: "test", driverName: "mock" }),
+}));
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-2220-establish-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -38,6 +55,7 @@ delete process.env.RELAY_ORPHAN_TTL_MINUTES;
 const { startHttpServer } = await import("../src/transport/http.js");
 const { closeDb, getDb, getAgentAuthData, gcOrphanRegistrations, resolveAgentByToken } = await import("../src/db.js");
 const { hashToken } = await import("../src/auth.js");
+const { handleSpawnAgent } = await import("../src/tools/spawn.js");
 
 let server: HttpServer;
 let baseUrl: string;
@@ -133,6 +151,16 @@ describe("ADR-0005 — every identity-establishment path stamps established_at",
     expect(established("est-rec")).not.toBeNull();
     expect(firstAuthed("est-rec")).toBeNull();
   });
+
+  it("#7 spawn_agent provisioning establishes the child (delivered vault credential + launched driver)", async () => {
+    const res = await handleSpawnAgent({ name: "est-spawn", role: "worker", capabilities: [] } as any);
+    expect(JSON.parse(res.content[0].text).success).toBe(true);
+    // The child is a PROVISIONED live identity even before its first MCP call —
+    // established, NOT a bare provisional register. (Not a token auth, so
+    // first_authed_at stays NULL until the child authenticates.)
+    expect(established("est-spawn")).not.toBeNull();
+    expect(firstAuthed("est-spawn")).toBeNull();
+  });
 });
 
 describe("ADR-0005 — codex #115 recovery blocker: exact 6-step repro (must collect 0)", () => {
@@ -156,5 +184,18 @@ describe("ADR-0005 — codex #115 recovery blocker: exact 6-step repro (must col
     // 6. GC → the recovered row is a legitimate identity → NOT reaped (was: reaped)
     gcOrphanRegistrations(getDb());
     expect(getAgentAuthData("rec-repro")).not.toBeNull();
+  });
+
+  it("spawn (path #7): a slow-starting child survives the GC (was reaped: expected 0, got 1)", async () => {
+    // spawn provisions the child (register + vault-write + driver launch) then
+    // marks the pre-reg session OFFLINE → a sessionless row with a delivered,
+    // usable credential. Before the fix established_at was NULL, so a child that
+    // hadn't yet made its first MCP call (slow startup) + aged past the TTL got
+    // GC'd — deleting an agent we just spawned.
+    const res = await handleSpawnAgent({ name: "spawn-repro", role: "worker", capabilities: [] } as any);
+    expect(JSON.parse(res.content[0].text).success).toBe(true);
+    getDb().prepare("UPDATE agents SET session_id = NULL, created_at = ? WHERE name = ?").run(new Date(Date.now() - 3600_000).toISOString(), "spawn-repro");
+    gcOrphanRegistrations(getDb());
+    expect(getAgentAuthData("spawn-repro")).not.toBeNull(); // established at provisioning → survives
   });
 });

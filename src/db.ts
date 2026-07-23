@@ -1903,11 +1903,13 @@ function verifiedTokenCachePut(
  * token-validity change (outside the auth-gen guard's scope).
  *
  * The reap invariant (REAPABLE_ORPHAN_WHERE) keys on `established_at`, NOT
- * first_authed_at: recovery establishes a real identity WITHOUT a token auth, and
- * anchoring reapability to token-auth alone reintroduced deletion risk (codex #115
- * recovery blocker). HONEST CEILING: there is NO single write-chokepoint — this is
- * called at N sites — so tests/v2-22-0-establishment-invariant.test.ts is the
- * checked contract that every establishment path stamps.
+ * first_authed_at: recovery + spawn establish a real identity WITHOUT a token
+ * auth, and anchoring reapability to token-auth alone reintroduced deletion risk
+ * (codex #115 recovery + spawn blockers). HONEST CEILING: there is NO single
+ * write-chokepoint — this is called at N sites, so it is call-site discipline.
+ * tests/v2-22-0-establishment-invariant.test.ts is a MANUALLY ENUMERATED checklist
+ * that proves every LISTED path stamps; it does NOT auto-discover an unlisted
+ * path (a new establishment path is silently absent until its case is added).
  */
 export function markEstablished(name: string): void {
   getDb()
