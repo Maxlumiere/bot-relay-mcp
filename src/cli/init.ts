@@ -35,6 +35,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
+import { fileURLToPath } from "url";
 import { execFileSync } from "child_process";
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
@@ -201,10 +202,23 @@ async function promptWithDefault(rl: readline.Interface, q: string, def: string)
   return ans.trim() || def;
 }
 
+/**
+ * Module URL → repo root, via fileURLToPath. The previous form —
+ * `new URL(import.meta.url).pathname` — returns a PERCENT-ENCODED path, so an
+ * install living under a directory with a space wrote
+ * `.../Claude%20AI/.../dist/index.js` into ~/.claude.json: a path that does
+ * not exist, i.e. a config entry that silently kills every relay session
+ * spawned from it (the "%20 fossil" chased across nine days, 2026-07-23).
+ * Exported for the decoding regression in tests/user-config-write-guard.test.ts.
+ */
+export function moduleRootFromUrl(moduleUrl: string): string {
+  return path.resolve(path.dirname(fileURLToPath(moduleUrl)), "..", "..");
+}
+
 /** Resolve the install root (repo dir) + the two abs paths the operator's
  *  Claude config needs to point at. */
 function installPaths(): { root: string; distEntry: string; hookScript: string } {
-  const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
+  const root = moduleRootFromUrl(import.meta.url);
   return {
     root,
     distEntry: path.join(root, "dist", "index.js"),

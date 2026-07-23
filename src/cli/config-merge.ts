@@ -22,7 +22,95 @@
  */
 import fs from "fs";
 import path from "path";
+import os from "os";
 import crypto from "crypto";
+
+/**
+ * SHIPPING-DEFECT guard (2026-07-23): under a test harness, UNCONDITIONALLY
+ * refuse to write the real account's user-scope config files.
+ * `tests/v2-3-0-profiles.test.ts` ran the real installer without redirecting
+ * the home dir, so every `npm test` — any contributor's, any audit
+ * worktree's — silently rewrote the REAL `~/.claude.json` +
+ * `~/.claude/settings.json` to point at whichever checkout ran the suite (an
+ * unmerged /private/tmp audit build, or a percent-encoded path that doesn't
+ * exist). Same class as the launchd install Steph flagged (#116 /
+ * RELAY_SKIP_DAEMON) — that fix covered one symptom of the pattern; this
+ * covers the pattern at the only JSON-write chokepoint.
+ *
+ * The basis is the SYSTEM ACCOUNT home (os.userInfo().homedir — read from the
+ * account database, immune to a sandboxed $HOME), not os.homedir(). codex
+ * #125 audit: a first version keyed on env-var PRESENCE, on the claim that a
+ * HOME-sandboxed subprocess cannot tell the real home apart from inside —
+ * false: userInfo() can. Presence-keying was bypassable by pointing the
+ * redirect AT the real home; account-home keying refuses the real paths no
+ * matter what the environment claims, while true sandboxes (a temp HOME or a
+ * temp RELAY_CLAUDE_HOME) resolve to different paths and pass untouched.
+ * Fallback to os.homedir() only if userInfo() throws (no account entry —
+ * containers with unmapped uids), documented and strictly-less-strict there.
+ * The suite-wide tripwire (tests/global-user-config-tripwire.ts) backstops
+ * anything this can't see. THROW, not skip: a silently-skipped write would
+ * let a test certify an install that never happened.
+ */
+let accountHomeOverride: string | null = null;
+/** Test-only (pattern: db.ts _resetAuditPurgeCounterForTests): lets the guard's
+ *  own negative controls exercise the FULL chokepoint against a temp "account
+ *  home" — a broken guard then writes a temp file, never the real config. */
+export function _setAccountHomeForTests(p: string | null): void {
+  accountHomeOverride = p;
+}
+
+function accountHome(): string {
+  if (accountHomeOverride) return accountHomeOverride;
+  try {
+    const h = os.userInfo().homedir;
+    if (h) return h;
+  } catch {
+    /* unmapped uid (some containers) — fall through */
+  }
+  return os.homedir();
+}
+
+/**
+ * Canonicalize a path that may not exist yet: realpath the deepest EXISTING
+ * ancestor (following symlinks), then re-append the non-existent tail.
+ * codex #125 blocker 2: lexical path.resolve equality is symlink-bypassable —
+ * `alias -> home` makes `alias/.claude.json` land in `home/.claude.json`
+ * while resolving unequal. Canonicalizing BOTH sides closes that.
+ */
+function canonicalize(p: string): string {
+  let base = path.resolve(p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync(base);
+      return tail.length ? path.join(real, ...tail.slice().reverse()) : real;
+    } catch {
+      const parent = path.dirname(base);
+      if (parent === base) return path.resolve(p); // nothing on the path exists
+      tail.push(path.basename(base));
+      base = parent;
+    }
+  }
+}
+
+export function assertNotRealUserConfigWrite(filePath: string): void {
+  if (!process.env.VITEST && process.env.NODE_ENV !== "test") return;
+  const resolved = canonicalize(filePath);
+  const home = accountHome();
+  const guarded = [
+    path.join(home, ".claude.json"),
+    path.join(home, ".claude", "settings.json"),
+    path.join(home, ".bot-relay", "config.json"),
+  ];
+  if (guarded.some((real) => canonicalize(real) === resolved)) {
+    throw new Error(
+      `[config-guard] refusing to write the REAL user config ${resolved} from inside a test harness. ` +
+        `This is the account's actual config (os.userInfo().homedir) — no environment variable makes ` +
+        `writing it safe in a test. Sandbox user-scope writes: point RELAY_CLAUDE_HOME / RELAY_CONFIG_PATH ` +
+        `(or the subprocess HOME) at a temp dir.`,
+    );
+  }
+}
 
 /** Parse a JSON file. Returns null on missing OR malformed (never throws) so a
  *  hand-corrupted user file degrades to "treat as empty + back it up" rather
@@ -54,6 +142,7 @@ export function atomicWriteJson(
   obj: unknown,
   mode = 0o600,
 ): void {
+  assertNotRealUserConfigWrite(filePath);
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
   if (fs.existsSync(filePath)) {
