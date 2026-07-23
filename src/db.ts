@@ -3502,6 +3502,10 @@ export function getDashboardAgentSnapshots(
          (SELECT COUNT(*) FROM messages m
            WHERE m.to_agent = a.name
              AND m.status = 'pending'
+             -- status alone is NOT a proxy for unresolved: resolve_messages
+             -- stamps resolved_at and deliberately leaves status alone, so
+             -- resolved mail stayed counted here. See getInboxSummary.
+             AND m.resolved_at IS NULL
              AND m.created_at < ?) AS pending_count_old
        FROM agents a`,
     )
@@ -3929,7 +3933,7 @@ export function getInboxSummary(): Array<{
       // NOT miscounted as unread — SQL NULL IS NULL evaluates true, which
       // would inflate unread_count by 1 per mail-less agent.
       `SELECT a.name AS agent_name,
-              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.status = 'pending' AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS pending_count,
               COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.seq IS NULL        THEN 1 ELSE 0 END), 0) AS unread_count,
               MAX(m.created_at) AS last_message_at
          FROM agents a
