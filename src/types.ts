@@ -936,6 +936,7 @@ export interface AgentRecord {
   previous_token_lookup?: string | null;
   /** ADR-0005 (schema v22): ISO timestamp of the agent's FIRST successful token auth. NULL = NEVER authenticated = an orphan — the abandon_registration + orphan-GC keystone. */
   first_authed_at?: string | null;
+  established_at?: string | null;
   /** ADR-0005 (schema v22): bcrypt hash of the one-time, name-scoped registration-recovery handle (self-serve orphan cleanup). NULL after redemption / first auth. */
   registration_recovery_hash?: string | null;
   /** ADR-0005 (schema v22): TTL for the registration-recovery handle. */
