@@ -45,6 +45,22 @@
 
 set -u
 
+# VERDICT BY CONSTRUCTION — first executable code after `set -u`, so no exit
+# path below can leave this session unaccounted for. LLM-AGNOSTIC PARITY: a
+# Codex agent that comes up mute was, until now, exactly as invisible as a
+# Claude agent was before the Claude hook got this. Shipping observability that
+# only worked for one CLI would re-open the asymmetry the July autowake arc
+# closed. Shared implementation — see hooks/_verdict.sh for the rationale, the
+# two invariants, and the honest boundary.
+# STDERR, not stdout: this hook's stdout is a hookSpecificOutput JSON object
+# that Codex parses. A trailing bare verdict line would corrupt it.
+RELAY_VERDICT_STREAM=stderr
+RELAY_VERDICT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../_verdict.sh
+if [ -f "$RELAY_VERDICT_DIR/_verdict.sh" ]; then
+  . "$RELAY_VERDICT_DIR/_verdict.sh"
+fi
+
 # Drain stdin (the SessionStart payload) so the writer never blocks on a full
 # pipe. We don't need any field from it — identity is env-derived.
 cat >/dev/null 2>&1 || true
@@ -216,6 +232,12 @@ if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
   # vault so the stdio MCP server's resolveToken can authenticate this agent's
   # later get_messages calls. SSE-wrapped + JSON-stringified shape: \"key\": value
   # (escaped quote + space after colon) — same parser as check-relay.sh.
+  # The ONLY upgrade path: the relay answered our register call, which is
+  # direct evidence this session can reach it. A curl timeout, a refused
+  # connection or an empty body all leave CANNOT-JUDGE standing.
+  if [ -n "$REG_BODY" ] && command -v relay_verdict_set >/dev/null 2>&1; then
+    relay_verdict_set "HEALTHY" "registered with the relay over HTTP" " agent=\"$AGENT_NAME\""
+  fi
   if [ -n "$REG_BODY" ] && command -v write_relay_token_to_vault >/dev/null 2>&1; then
     REG_TOKEN=$(echo "$REG_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
     if [ -n "$REG_TOKEN" ]; then
