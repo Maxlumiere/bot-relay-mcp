@@ -97,11 +97,12 @@ describe("ADR-0005 #4 — orphan cleanup KEYSTONE (safe by construction)", () =>
 
   it("KEYSTONE: an AUTHENTICATED agent can NEVER be abandoned — even with a VALID handle", () => {
     const { token, handle } = reg("o-live");
-    expect(authOnce(token)).not.toBeNull(); // it authenticates → first_authed_at set
+    expect(authOnce(token)).not.toBeNull(); // token auth → first_authed_at AND established_at set
     expect(getAgentAuthData("o-live")!.first_authed_at).not.toBeNull();
+    expect(getAgentAuthData("o-live")!.established_at).not.toBeNull(); // the reap invariant
     const r = abandonRegistration("o-live", handle);
     expect(r.abandoned).toBe(false);
-    expect(r.reason).toMatch(/authenticated/i);
+    expect(r.reason).toMatch(/established|authenticated/i);
     expect(getAgentAuthData("o-live")).not.toBeNull(); // still there, untouched
   });
 
@@ -213,21 +214,26 @@ describe("ADR-0005 — v22 migration backfills pre-existing rows (no false-reap 
     registerAgent("pre22", "worker", []);
     db.exec("UPDATE agents SET created_at = '" + old + "' WHERE name = 'pre22'");
     db.exec("ALTER TABLE agents DROP COLUMN first_authed_at");
+    db.exec("ALTER TABLE agents DROP COLUMN established_at");
     db.exec("ALTER TABLE agents DROP COLUMN registration_recovery_hash");
     db.exec("ALTER TABLE agents DROP COLUMN registration_recovery_expires_at");
-    // Sanity: the column is genuinely gone (v21 shape).
+    // Sanity: the columns are genuinely gone (v21 shape).
     const before = (db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).map((c) => c.name);
     expect(before).not.toContain("first_authed_at");
+    expect(before).not.toContain("established_at");
 
     // Re-open the DB → the init chain re-runs migrateSchemaToV2_22 (the real
     // 21→22 column migration + backfill; applyMigration only syncs the version).
     closeDb();
     db = getDb();
 
-    // The pre-v22 row is now stamped (= its created_at) — NOT NULL.
+    // The pre-v22 row is now stamped (= its created_at) — NOT NULL. established_at
+    // is the REAP-relevant one (it keys REAPABLE_ORPHAN_WHERE); first_authed_at is
+    // the forensic sibling. Both are backfilled so the row is treated as established.
     const row = getAgentAuthData("pre22");
     expect(row).not.toBeNull();
     expect(row!.first_authed_at).not.toBeNull();
+    expect(row!.established_at).not.toBeNull();
     // And its (re-added) recovery handle is NULL — a pre-v22 row was never an orphan.
     expect(row!.registration_recovery_hash ?? null).toBeNull();
 

@@ -1722,6 +1722,19 @@ function migrateSchemaToV2_23(db: CompatDatabase): void {
     // guarded by the ADD COLUMN, so it never re-stamps a genuine post-v22 orphan.
     db.exec("UPDATE agents SET first_authed_at = COALESCE(created_at, datetime('now')) WHERE first_authed_at IS NULL");
   }
+  if (!agentCols.some((c) => c.name === "established_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN established_at TEXT");
+    // ADR-0005 lifecycle refinement (codex #115 recovery blocker). `established_at`
+    // is THE reap invariant: set the moment a row first becomes a legitimate
+    // IDENTITY via ANY establishment path — a successful TOKEN auth OR recovery
+    // completion (see markEstablished). It is a sibling to first_authed_at, which
+    // stays literally "first TOKEN auth" (kept for forensic value + honesty; the
+    // proxy first_authed_at IS NULL produced 3 reap blockers precisely because
+    // recovery establishes identity WITHOUT a token auth). REAPABLE_ORPHAN_WHERE
+    // keys on established_at. Same one-time backfill — every pre-v22 row predates
+    // the orphan concept, so it is established.
+    db.exec("UPDATE agents SET established_at = COALESCE(created_at, datetime('now')) WHERE established_at IS NULL");
+  }
   if (!agentCols.some((c) => c.name === "registration_recovery_hash")) {
     db.exec("ALTER TABLE agents ADD COLUMN registration_recovery_hash TEXT");
   }
@@ -1954,19 +1967,39 @@ function verifiedTokenCachePut(
 }
 
 /**
- * ADR-0005 — stamp the SECURITY-KEYSTONE first-auth marker + retire the
- * registration-recovery handle. Fires once (WHERE first_authed_at IS NULL); an
- * already-authed row is a no-op. Does NOT bump the auth generation:
- * first_authed_at is not a token-validity field (it never changes whether the
- * token authenticates), so it's outside the auth-gen guard's scope.
+ * ADR-0005 lifecycle refinement — THE reap-invariant stamp. Called the first time
+ * a row becomes a legitimate IDENTITY via ANY establishment path (a successful
+ * token auth OR recovery completion; a future SSO/pairing flow would call it too).
+ * Sets `established_at` (idempotent, WHERE established_at IS NULL) + retires the
+ * orphan handle. Does NOT bump the auth generation — establishment is not a
+ * token-validity change (outside the auth-gen guard's scope).
+ *
+ * The reap invariant (REAPABLE_ORPHAN_WHERE) keys on `established_at`, NOT
+ * first_authed_at: recovery establishes a real identity WITHOUT a token auth, and
+ * anchoring reapability to token-auth alone reintroduced deletion risk (codex #115
+ * recovery blocker). HONEST CEILING: there is NO single write-chokepoint — this is
+ * called at N sites — so tests/v2-22-0-establishment-invariant.test.ts is the
+ * checked contract that every establishment path stamps.
+ */
+export function markEstablished(name: string): void {
+  getDb()
+    .prepare(
+      "UPDATE agents SET established_at = ?, registration_recovery_hash = NULL, registration_recovery_expires_at = NULL " +
+        "WHERE name = ? AND established_at IS NULL",
+    )
+    .run(now(), name);
+}
+
+/**
+ * ADR-0005 — a successful TOKEN auth. Stamps first_authed_at (the forensic,
+ * literal "first TOKEN auth" marker; idempotent) AND establishes the identity
+ * via markEstablished (which carries the reap invariant + handle retirement).
  */
 export function markAgentAuthenticated(name: string): void {
   getDb()
-    .prepare(
-      "UPDATE agents SET first_authed_at = ?, registration_recovery_hash = NULL, registration_recovery_expires_at = NULL " +
-        "WHERE name = ? AND first_authed_at IS NULL",
-    )
+    .prepare("UPDATE agents SET first_authed_at = ? WHERE name = ? AND first_authed_at IS NULL")
     .run(now(), name);
+  markEstablished(name);
 }
 
 /** ADR-0005 — orphan TTL (handle expiry + GC threshold). Default 30min (> any legit register→first-auth gap). Env: RELAY_ORPHAN_TTL_MINUTES. */
@@ -1979,14 +2012,16 @@ function orphanTtlMs(): number {
 
 /**
  * ADR-0005 — THE reapability invariant, defined ONCE. A row is a reapable orphan
- * ONLY when it has NEVER authenticated (`first_authed_at IS NULL`) AND has no
- * live session (`session_id IS NULL`). BOTH deletion paths — the auto-GC and
- * abandon_registration — delete THROUGH `deleteReapableOrphan`, so neither can
- * silently omit a predicate: the safe-by-construction guarantee is physical, not
- * a WHERE clause each call site restates correctly from memory. (codex #115
- * blockers a+b were two independent omissions of this exact shape.)
+ * ONLY when it has NEVER become a legitimate identity (`established_at IS NULL` —
+ * no token auth AND no recovery completion) AND has no live session (`session_id
+ * IS NULL`). BOTH deletion paths — the auto-GC and abandon_registration — delete
+ * THROUGH `deleteReapableOrphan`, so neither can silently omit a predicate: the
+ * safe-by-construction guarantee is physical, not a WHERE clause each call site
+ * restates from memory. (codex #115 blockers a+b were two independent omissions
+ * of this exact shape; the recovery blocker moved the invariant from the
+ * token-auth proxy first_authed_at onto the establishment marker established_at.)
  */
-const REAPABLE_ORPHAN_WHERE = "first_authed_at IS NULL AND session_id IS NULL";
+const REAPABLE_ORPHAN_WHERE = "established_at IS NULL AND session_id IS NULL";
 
 /**
  * The ONLY sanctioned way to delete an agent row on the orphan-cleanup path.
@@ -2020,24 +2055,24 @@ export function abandonRegistration(name: string, handle: string): { abandoned: 
   const db = getDb();
   const row = db
     .prepare(
-      "SELECT first_authed_at, session_id, registration_recovery_hash, registration_recovery_expires_at FROM agents WHERE name = ?",
+      "SELECT established_at, session_id, registration_recovery_hash, registration_recovery_expires_at FROM agents WHERE name = ?",
     )
     .get(name) as
     | {
-        first_authed_at: string | null;
+        established_at: string | null;
         session_id: string | null;
         registration_recovery_hash: string | null;
         registration_recovery_expires_at: string | null;
       }
     | undefined;
   if (!row) return { abandoned: false, reason: "no such registration" };
-  // Reject a NON-ORPHAN — ever-authenticated OR live-session — BEFORE any bcrypt
-  // work. Abandon is ONLY for a never-authed, session-less registration; these
-  // two guards mirror the two halves of REAPABLE_ORPHAN_WHERE that the shared
-  // DELETE then re-asserts (codex #115 blocker b: the DELETE was missing the
-  // session_id half, so a fresh live-session row could be abandoned).
-  if (row.first_authed_at !== null) {
-    return { abandoned: false, reason: "agent has authenticated — not an orphan. Use unregister_agent with its token." };
+  // Reject a NON-ORPHAN — an ESTABLISHED identity (token auth OR recovery) OR a
+  // live session — BEFORE any bcrypt work. Abandon is ONLY for a never-established,
+  // session-less registration; these two guards mirror the two halves of
+  // REAPABLE_ORPHAN_WHERE that the shared DELETE then re-asserts (codex #115
+  // blocker b: the DELETE was missing the session_id half).
+  if (row.established_at !== null) {
+    return { abandoned: false, reason: "agent has an established identity — not an orphan. Use unregister_agent with its token." };
   }
   if (row.session_id !== null) {
     return { abandoned: false, reason: "agent has a live session — not an orphan. Use unregister_agent with its token." };
@@ -3173,6 +3208,17 @@ export function registerAgent(
       );
     }
     bumpAuthGeneration(); // ADR-0003: re-register can change token/auth_state validity
+    if (existingState === "recovery_pending") {
+      // ADR-0005 (codex #115 recovery blocker): recovery completion is an
+      // identity-ESTABLISHMENT event — the agent proved authorization via the
+      // operator's recovery_token (enforceAuth verified it; the CAS above pins
+      // it). Stamp established_at HERE, at the state transition that actually
+      // completes recovery, so the orphan-GC can never reap the recovered row
+      // once its session ends. (Recovery is NOT a token auth, so first_authed_at
+      // is intentionally left NULL until the agent authenticates with its new
+      // token — the two markers stay honest.)
+      markEstablished(name);
+    }
 
     agentWithStatus = toAgentWithStatus({
       ...existing,
