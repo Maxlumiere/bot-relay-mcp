@@ -5,7 +5,7 @@
 
 A local-first coordination bus for AI coding agents. Durable inboxes, task queues, and wakeups for Claude Code, Cursor, Cline, Codex-style CLIs, scripts, and webhooks. Two interfaces, one shared SQLite database, zero infrastructure.
 
-**v2.20.** 35 MCP tools. The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the phase-by-phase arc, including the v2.1 architectural sweep (auth-state machine, keyring encryption, unified `relay` CLI), the v2.7 cross-process delivery layer, LLM-agnostic spawn parity (v2.17), the `relay watch` **Sentinel** autowake for non-VSCode terminals (v2.18), the liveness/presence-derivation fix (v2.19), and **O(1) token authentication** (v2.20).
+**v2.21.** 35 MCP tools. The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the phase-by-phase arc, including the v2.1 architectural sweep (auth-state machine, keyring encryption, unified `relay` CLI), the v2.7 cross-process delivery layer, LLM-agnostic spawn parity (v2.17), the `relay watch` **Sentinel** autowake for non-VSCode terminals (v2.18), the liveness/presence-derivation fix (v2.19), and **O(1) token authentication** (v2.20).
 
 ## What is this?
 
@@ -713,7 +713,7 @@ Full install requirements per platform + manual smoke-test checklists + troubles
 
 ## Layer 2: Managed Agents (v1.10)
 
-Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 35 MCP tools (v2.20), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
+Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 35 MCP tools (v2.21), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
 
 Full integration guide with mental model, auth flow, lifecycle, error patterns, and security notes: [`docs/managed-agent-integration.md`](./docs/managed-agent-integration.md).
 
@@ -760,7 +760,8 @@ Both drivers read the same `relay.db` file format. Full details, performance not
 - **v2.17**: LLM-agnostic spawn parity. `spawn_agent(cli: "codex")` launches a Codex CLI (macOS/Linux), driven by a central agent-CLI profile registry with an AST drift guard; Tether wake behavior is data-driven from the same registry.
 - **v2.18**: **Sentinel** (`relay watch <agent>`) — poll/marker-based autowake for terminals *not* in VSCode/Tether (iTerm2 personas, plain terminals, remote sessions). The wake-anywhere sibling of Tether's push-wake.
 - **v2.19**: Liveness derivation — presence that stops lying. The coarse agent status is now derived from the liveness verdict (online/offline/unknown), never from `last_seen` age, so a rate-limited-but-alive agent no longer reads offline.
-- **v2.20 (current)**: **O(1) token authentication.** An indexed HMAC token locator + a verified-token cache replace the O(N) per-call bcrypt scan (bcrypt stays the sole verifier); instant revocation via a generation counter; zero-lockout migration. 35 tools.
+- **v2.20**: **O(1) token authentication.** An indexed HMAC token locator + a verified-token cache replace the O(N) per-call bcrypt scan (bcrypt stays the sole verifier); instant revocation via a generation counter; zero-lockout migration. 35 tools.
+- **v2.21 (current)**: **ADR-0002 — agent class/flare topology.** Agents declare an immutable coordination `class` at `register_agent` (`orchestrator | builder | advisory | auditor | transient`), a third axis orthogonal to `role` and `capabilities`. `discover_agents view='topology'` renders the live team grouped by class (default `view='list'` is unchanged), plus an opt-in SessionStart onboarding map (`RELAY_ONBOARD_TOPOLOGY=1`, default off) and a taxonomy drift guard in the pre-publish gate. Still 35 tools — a `view` parameter, not a new tool.
 - **Beyond**: cross-machine federation (hub/edge) so multiple self-hosted relays mesh without a shared namespace, plus an App Server push path for low-latency remote wake.
 
 ## Dashboard
