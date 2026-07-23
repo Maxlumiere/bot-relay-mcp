@@ -6,6 +6,7 @@
 import {
   registerAgent,
   getAgents,
+  buildAgentTopology,
   unregisterAgent,
   rotateAgentToken,
   rotateAgentTokenAdmin,
@@ -117,6 +118,9 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     {
       description: input.description,
       managed: input.managed,
+      // ADR-0002: self-declared coordination class (Zod-validated against
+      // AGENT_CLASSES). Immutable — the DB layer only writes it on first register.
+      class: input.class,
       terminal_title_ref: input.terminal_title_ref,
       expectedRecoveryHash,
       // v2.2.1 B2: when force=true the db-layer warn is also suppressed to
@@ -850,6 +854,15 @@ export function handleRevokeToken(input: RevokeTokenInput) {
 }
 
 export function handleDiscoverAgents(input: DiscoverAgentsInput) {
+  // ADR-0002: view='topology' → the live team grouped by coordination class
+  // (transient + unclassified + dead excluded). Default 'list' is unchanged.
+  if (input.view === "topology") {
+    return {
+      content: [
+        { type: "text" as const, text: JSON.stringify(buildAgentTopology(), null, 2) },
+      ],
+    };
+  }
   const agents = getAgents(input.role);
   return {
     content: [

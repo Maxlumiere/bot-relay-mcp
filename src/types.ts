@@ -5,6 +5,7 @@
 
 import { z } from "zod";
 import { getAgentCliProfile } from "./agent-cli-profiles.js";
+import { AgentClassEnum, type AgentClass } from "./agent-class.js";
 
 // --- Zod Schemas for tool inputs ---
 
@@ -111,6 +112,7 @@ export const RegisterAgentSchema = z.object({
     ),
   recovery_token: z.string().min(1).optional().describe("v2.1 Phase 4b.1 v2: required when re-registering an agent whose auth_state is 'recovery_pending'. Obtained from the revoker's revoke_token response (shown ONCE) and handed off to the operator out-of-band."),
   managed: z.boolean().default(false).describe("v2.1 Phase 4b.2: true = agent is a Managed Agent wrapper that can parse push-token messages + self-update its local config on rotation. false (default) = Claude Code terminal or equivalent (restart-required on rotation). Immutable after first registration — change requires unregister + fresh register."),
+  class: AgentClassEnum.optional().describe("ADR-0002 (v2.21.0): the agent's COARSE coordination posture — one of orchestrator | builder | advisory | auditor | transient (SSOT: src/agent-class.ts). Self-declared; IMMUTABLE after first registration (same rule as managed/host_id). Orthogonal to `role` (free-text label) and `capabilities` (what it does). Omit → `unclassified`; surfaced in discover_agents view='topology'."),
   /**
    * v2.2.1 B2: bypass the duplicate-name active-session collision check.
    * Default false → re-register on an actively-held name returns
@@ -127,6 +129,10 @@ export const RegisterAgentSchema = z.object({
 
 export const DiscoverAgentsSchema = z.object({
   role: z.string().optional().describe("Filter by role"),
+  view: z
+    .enum(["list", "topology"])
+    .default("list")
+    .describe("ADR-0002: 'list' (default) = flat agent list (unchanged). 'topology' = the live team grouped by coordination class (orchestrator/builder/advisory/auditor), flat within each; transient + unclassified + dead/terminal agents are excluded from the who's-who."),
   agent_token: AgentTokenField,
 });
 
@@ -894,6 +900,8 @@ export interface AgentRecord {
   recovery_token_hash?: string | null;
   /** v2.1 Phase 4b.2: true = Managed Agent wrapper (can self-update from push-token messages). Immutable after first register (same as capabilities). */
   managed?: number;
+  /** ADR-0002 (schema v21): self-declared coarse coordination posture (SSOT src/agent-class.ts). NULL on legacy rows → normalized to `unclassified` on read. Immutable after first register. */
+  class?: string | null;
   /** v2.1 Phase 4b.2: ISO timestamp of rotation grace window expiry. Populated iff state=rotation_grace. */
   rotation_grace_expires_at?: string | null;
   /** v2.1 Phase 4b.2: bcrypt hash of pre-rotation token. Populated iff state=rotation_grace; allows the old token to auth alongside the new token during the grace window. */
@@ -924,6 +932,8 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
    *  last_seen age, which lied) — alive→online, dead→offline, unknown→unknown.
    *  A live agent NEVER reads offline; last_seen is pure telemetry. */
   status: "online" | "offline" | "unknown";
+  /** ADR-0002: normalized coordination posture (NULL/unknown → "unclassified"). Surfaced through the projection so discover_agents view='topology' can group on it. */
+  class: AgentClass;
   /** v1.7: whether the agent has a token (false = legacy pre-v1.7 agent) */
   has_token: boolean;
   /**

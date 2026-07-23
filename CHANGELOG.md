@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.21.0 — 2026-07-22 — ADR-0002: agent class/flare topology
+
+Agents can now declare a **coordination class** — a coarse "flare" of their posture in the team — and `discover_agents` gains a **`view='topology'`** that renders the live team grouped by class. A fresh agent can also learn its peers on session start (opt-in).
+
+- **`class` — a self-declared, immutable coordination posture (schema v21).** One of `orchestrator | builder | advisory | auditor | transient`, declared at `register_agent` and immutable thereafter (the `managed`/`host_id` precedent). It is a THIRD axis, orthogonal to `role` (free-text label) and `capabilities` (what an agent does) — kept deliberately coarse so it never collapses into capability. Undeclared/legacy rows read as `unclassified`; `bridge` is reserved for a future federation node. Single source of truth: **`src/agent-class.ts`**.
+- **`discover_agents view='topology'`** (default `view='list'` is 100% back-compat) groups the live team by class, flat within each `{name, role, class, status}`. **Two independent exclusions:** dead/terminal agents (liveness verdict) and the `transient` + `unclassified` classes are omitted from the who's-who (with honest excluded-counts — no silent truncation). The `class` field is surfaced through the discovery projection (the gate that silently drops `managed`/`visibility`), so it actually reaches clients.
+- **Opt-in SessionStart onboarding map** (`RELAY_ONBOARD_TOPOLOGY=1`, default OFF) — a compact "team by class" roster delivered to a freshly-started agent via `check-relay.sh`. Off by default so existing installs' session output is unchanged.
+- **Taxonomy drift guard** (`scripts/agent-class-guard.mjs`, wired into the pre-publish gate) — a TS-AST walk that rejects a class-value branch (equality/switch) or a parallel class vocabulary (an array of ≥2 class ids) defined anywhere outside `src/agent-class.ts`, mirroring the cli-profile guard. It prevents a taxonomy re-fork; an adversarial negative-fixture test proves it fails on a synthetic re-fork. Native + wasm parity. No new tool (a `view` param on `discover_agents`); not security-critical.
+
 ## v2.20.1 — 2026-07-22 — Verified-token cache on the explicit-caller auth path
 
 ADR-0003 made the O(N) **token-only** auth scan O(1). This extends the same verified-token cache to the **explicit-caller** path (`enforceAuth` for tools that name their caller — `send_message.from`, `get_messages.agent_name`, … — the orchestration hot path), which still bcrypt-verified on every call.

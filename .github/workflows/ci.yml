@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+  # Run CI on EVERY pull request regardless of its BASE branch. `branches: [main]`
+  # matched ONLY PRs whose base is main, so a STACKED PR (base = another feature
+  # branch — e.g. a PR stacked on an unmerged arc) NEVER triggered CI and shipped
+  # with an EMPTY status rollup that reads as "clean/mergeable" in the UI. That is
+  # a silent hole in the pre-merge gate (an auth-adjacent PR ran zero CI). `['**']`
+  # matches any base. NOTE: for `pull_request`, GitHub uses the BASE branch's copy
+  # of this workflow, so this protects every PR whose base branch carries this file
+  # (i.e. any branch cut from main after this lands). The whole workflow — the
+  # `test` job incl. the extension `test:unit` step AND the `smoke` job — runs
+  # under this one trigger, so widening it covers the full gate, not a subset.
   pull_request:
-    branches: [main]
+    branches: ['**']
 
 jobs:
   test:
