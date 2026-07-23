@@ -162,7 +162,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(18, 19)).not.toThrow();
     // ADR-0003 auth latency registered 19→20 (migrateSchemaToV2_20: token_lookup / previous_token_lookup columns + auth_meta counter).
     expect(() => applyMigration(19, 20)).not.toThrow();
-    expect(() => applyMigration(20, 21)).toThrow(/no migration registered|20→21/);
+    // ADR-0002 agent-class registered 20→21 (migrateSchemaToV2_21: agents.class column).
+    expect(() => applyMigration(20, 21)).not.toThrow();
+    expect(() => applyMigration(21, 22)).toThrow(/no migration registered|21→22/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

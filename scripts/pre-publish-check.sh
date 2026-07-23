@@ -453,6 +453,18 @@ auth_gen_guard() {
 }
 step "auth-gen guard (every token/auth mutator invalidates the cache)" auth_gen_guard || exit 1
 
+# --- 5d. ADR-0002 agent-class taxonomy drift guard (v2.21.0) -----------------
+# src/agent-class.ts is the SSOT for the coordination-class taxonomy. This
+# TS-AST walk rejects a class-value literal branched-on (equality/switch) or a
+# parallel class vocabulary (array of >=2 class ids) defined anywhere else in
+# src/ — mirroring the cli-profile guard, preventing a taxonomy re-fork (the
+# class the orchestrator nearly shipped). Shared with the vitest negative-
+# fixture test that proves the guard FAILS on a synthetic re-fork.
+agent_class_guard() {
+  node "$PROJECT_ROOT/scripts/agent-class-guard.mjs" "$PROJECT_ROOT/src"
+}
+step "agent-class guard (no class taxonomy re-fork outside src/agent-class.ts)" agent_class_guard || exit 1
+
 # --- 6. 25-tool + CLI smoke against an isolated relay (v2.1 Phase 5a) ---
 # Inline cleanup (no RETURN trap) — simpler + avoids set-u pitfalls around
 # deferred variable lookup in trap strings.

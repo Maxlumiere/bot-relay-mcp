@@ -23,6 +23,7 @@ import { VALID_TRANSITIONS, ACTION_TO_STATUS } from "./types.js";
 import { generateToken, hashToken, verifyToken } from "./auth.js";
 import type { AuthStateInput } from "./auth.js";
 import { computeTokenLookup } from "./token-lookup.js";
+import { normalizeAgentClass, TOPOLOGY_VISIBLE_CLASSES, TOPOLOGY_HIDDEN_CLASSES, TRANSIENT } from "./agent-class.js";
 import { authCacheGet, authCacheSet, authCacheTtlMs } from "./auth-cache.js";
 import { encryptContent, decryptContent } from "./encryption.js";
 import {
@@ -235,6 +236,10 @@ function toAgentWithStatus(
     // malformed both surface as null, never throw).
     host_shell_pids: parseHostShellPids(row.host_shell_pids),
     host_id: row.host_id ?? null,
+    // ADR-0002: normalized coordination class (NULL/legacy → "unclassified").
+    // MUST be surfaced here — the projection, not SELECT *, gates what discovery
+    // (incl. view='topology') can see.
+    class: normalizeAgentClass(row.class),
   };
 }
 
@@ -284,6 +289,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_16(_db);
   migrateSchemaToV2_19(_db);
   migrateSchemaToV2_20(_db);
+  migrateSchemaToV2_21(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -327,6 +333,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_16(_db);
   migrateSchemaToV2_19(_db);
   migrateSchemaToV2_20(_db);
+  migrateSchemaToV2_21(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -548,7 +555,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 20;
+export const CURRENT_SCHEMA_VERSION = 21;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -642,6 +649,7 @@ export function applyMigration(from: number, to: number): void {
     [17, 18],
     [18, 19],
     [19, 20],
+    [20, 21],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1614,6 +1622,22 @@ function migrateSchemaToV2_20(db: CompatDatabase): void {
       "generation INTEGER NOT NULL DEFAULT 0)",
   );
   db.prepare("INSERT OR IGNORE INTO auth_meta (id, generation) VALUES (1, 0)").run();
+}
+
+/**
+ * ADR-0002 (v2.21.0) — agent coordination-class. Additive + idempotent.
+ * Adds `agents.class TEXT NULL` — the self-declared coarse coordination posture
+ * (SSOT: src/agent-class.ts). NULL on every existing row = zero data migration;
+ * a NULL/unknown value normalizes to `unclassified` on read (normalizeAgentClass),
+ * so legacy agents appear under `unclassified` and are hidden from the default
+ * topology who's-who until they re-declare a real class. `class` is a valid
+ * unquoted SQLite column name.
+ */
+function migrateSchemaToV2_21(db: CompatDatabase): void {
+  const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "class")) {
+    db.exec("ALTER TABLE agents ADD COLUMN class TEXT");
+  }
 }
 
 /**
@@ -2709,6 +2733,8 @@ export function registerAgent(
   options: {
     description?: string;
     managed?: boolean;
+    /** ADR-0002: self-declared coordination class. Set on FIRST register only; a re-register silently preserves the original (immutable, like managed/capabilities). Validated against AGENT_CLASSES at the handler (Zod). */
+    class?: string;
     /** v2.2.0: window title for the dashboard click-to-focus driver. Mutable on re-register. */
     terminal_title_ref?: string | null;
     /**
@@ -2923,8 +2949,10 @@ export function registerAgent(
       // v2.1.6: session_started_at = timestamp for first-register anchor.
       // v2.2.0: terminal_title_ref captured on first register (may be null).
       // schema v16: host_shell_pids (JSON) + host_id captured on first register.
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId);
+      // ADR-0002: `class` captured on FIRST register (NULL if undeclared →
+      // read as 'unclassified'). A re-register never writes it (immutable).
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id, class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId, options.class ?? null);
     bumpAuthGeneration(); // ADR-0003: fresh token_hash + token_lookup written
 
     // v2.0: populate normalized agent_capabilities table.
@@ -2946,6 +2974,12 @@ export function registerAgent(
       agent_status: "idle", // v2.1.3 (I6)
       managed,
       terminal_title_ref: titleRef,
+      // ADR-0002 (codex #114 blocker): the INSERT above persists the declared
+      // class, but this in-memory row is projected straight to the FIRST
+      // register_agent response — omitting it made toAgentWithStatus read
+      // row.class===undefined → normalizeAgentClass → 'unclassified'. Mirror the
+      // persisted value so the initial response matches the row + next read.
+      class: options.class ?? null,
     });
   }
 
@@ -3294,7 +3328,7 @@ export function getAgentAuthData(name: string): AgentRecord | null {
  * quiet, recently dispatched) from `waiting` (just idle), so adding
  * roles widens the `stale` surface.
  */
-export const DISPATCH_RELEVANT_ROLES: ReadonlySet<string> = new Set([
+export const DISPATCH_RELEVANT_ROLES: ReadonlySet<string> = new Set([ // AGENT-CLASS-ALLOWLIST: this is the ROLE axis (dashboard dispatch), not the class taxonomy — 'builder'/'auditor' overlap lexically only; per ADR-0002 the three axes (role/class/capability) are orthogonal and role vocabs stay as-is.
   "builder",
   "auditor",
   "researcher",
@@ -3742,6 +3776,47 @@ export function getAgents(role?: string): AgentWithStatus[] {
   // v2.15.0 — compute the liveness verdict PURELY (in-memory probe + caches,
   // zero DB writes) and derive status from it. No read-path mutation.
   return rows.map((row) => toAgentWithStatus(row, computeLivenessVerdict(row)));
+}
+
+/**
+ * ADR-0002 — the live team "who's-who" grouped by coordination class, for
+ * discover_agents view='topology'. TWO independent exclusions (per the gate):
+ *   1. dead/terminal (LIVENESS): status === 'offline' (the dead verdict) is dropped.
+ *   2. hidden CLASSES: `transient` (alive-but-ephemeral) + `unclassified` (no
+ *      declared posture) are dropped from the who's-who.
+ * Everything else is grouped FLAT within its class {name, role, class, status}.
+ * Groups are seeded in TOPOLOGY_VISIBLE_CLASSES order; excluded counts are
+ * reported (no silent truncation). Read-only.
+ */
+export function buildAgentTopology(): {
+  view: "topology";
+  topology: Record<string, Array<{ name: string; role: string; class: string; status: string }>>;
+  counts: Record<string, number>;
+  excluded: { offline: number; transient: number; unclassified: number };
+  total_shown: number;
+} {
+  const topology: Record<string, Array<{ name: string; role: string; class: string; status: string }>> = {};
+  for (const c of TOPOLOGY_VISIBLE_CLASSES) topology[c] = [];
+  const excluded = { offline: 0, transient: 0, unclassified: 0 };
+  let total_shown = 0;
+
+  for (const a of getAgents()) {
+    if (a.status === "offline") {
+      excluded.offline++; // dead/terminal — liveness exclusion
+      continue;
+    }
+    if (TOPOLOGY_HIDDEN_CLASSES.has(a.class)) {
+      if (a.class === TRANSIENT) excluded.transient++;
+      else excluded.unclassified++;
+      continue;
+    }
+    (topology[a.class] ??= []).push({ name: a.name, role: a.role, class: a.class, status: a.status });
+    total_shown++;
+  }
+
+  const counts: Record<string, number> = {};
+  for (const c of Object.keys(topology)) counts[c] = topology[c].length;
+  return { view: "topology", topology, counts, excluded, total_shown };
 }
 
 /**
