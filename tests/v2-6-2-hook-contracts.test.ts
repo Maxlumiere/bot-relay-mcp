@@ -60,8 +60,15 @@ function discoverHooks(): string[] {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) { walk(full); continue; }
-      if (!entry.name.endsWith(".sh")) continue;
       if (NON_HOOK_FILES.has(entry.name)) continue;
+      // EXECUTABLE, not ".sh". codex dropped in `hooks/audit-unseen-hook` with
+      // no suffix and the contract still passed 17/17 — a manually configured
+      // no-suffix or .bash hook is a valid entry point yet was invisible to the
+      // very test meant to catch invisible hooks. Suffix is a naming habit;
+      // the executable bit is what actually makes something a hook.
+      let executable = false;
+      try { fs.accessSync(full, fs.constants.X_OK); executable = true; } catch { /* not executable */ }
+      if (!executable && !entry.name.endsWith(".sh")) continue;
       found.push(full);
     }
   };
@@ -460,6 +467,58 @@ describe("v2.6.2 — cross-hook invariants", () => {
     expect(names).toContain("post-tool-use-check.sh");
     expect(names).toContain("stop-check.sh");
     expect(ALL_HOOKS.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("EVERY hook still emits a verdict when the SHARED HELPER IS CORRUPTED", () => {
+    // codex round 4, HIGH. A shared primitive CANNOT GUARANTEE ITS OWN LOADER:
+    // corrupting hooks/_verdict.sh made all four hooks print a source error,
+    // exit 0, and emit ZERO verdicts — the exact silence the mechanism exists
+    // to end, reintroduced at the loader boundary. Each hook now installs a
+    // minimal fallback trap BEFORE sourcing; a healthy load upgrades it.
+    const helper = path.join(REPO_ROOT, "hooks", "_verdict.sh");
+    const original = fs.readFileSync(helper, "utf8");
+    try {
+      fs.writeFileSync(helper, "this is not valid bash (((\n");
+      const { root } = freshTestRoot();
+      for (const hook of ALL_HOOKS) {
+        const r = runHook({ hook, root, agentName: "probe" });
+        const combined = `${r.stdout}\n${r.stderr}`;
+        const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+        expect(count, `${path.basename(hook)} emitted ${count} verdicts with a CORRUPT helper`).toBe(1);
+      }
+    } finally {
+      fs.writeFileSync(helper, original);
+    }
+  });
+
+  it("EVERY hook still emits a verdict when the SHARED HELPER IS ABSENT", () => {
+    // The other half: post/stop/codex guard the source with `if [ -f ]`, which
+    // silently accepts a missing helper. Absence must still produce a verdict.
+    const helper = path.join(REPO_ROOT, "hooks", "_verdict.sh");
+    const original = fs.readFileSync(helper, "utf8");
+    try {
+      fs.rmSync(helper);
+      const { root } = freshTestRoot();
+      for (const hook of ALL_HOOKS) {
+        const r = runHook({ hook, root, agentName: "probe" });
+        const combined = `${r.stdout}\n${r.stderr}`;
+        const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+        expect(count, `${path.basename(hook)} emitted ${count} verdicts with NO helper`).toBe(1);
+      }
+    } finally {
+      fs.writeFileSync(helper, original);
+    }
+  });
+
+  it("check-relay's verdict stream is NOT forgeable by inherited environment", () => {
+    // codex round 4, MED. Claude SessionStart injects STDOUT, so an inherited
+    // RELAY_VERDICT_STREAM=stderr would redirect the agent-visible verdict away
+    // from the agent. check-relay pins it explicitly before loading.
+    const { root } = freshTestRoot();
+    const hook = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+    const r = runHook({ hook, root, agentName: "probe", env: { RELAY_VERDICT_STREAM: "stderr" } });
+    expect((r.stdout.match(/VERDICT=/g) ?? []).length, "verdict was redirected off stdout").toBe(1);
+    expect((r.stderr.match(/VERDICT=/g) ?? []).length).toBe(0);
   });
 
   it("EVERY hook emits EXACTLY ONE verdict — a new hook cannot quietly opt out", () => {

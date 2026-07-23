@@ -34,6 +34,24 @@
 # Shared with every other relay hook so there is ONE implementation and no
 # inline copy can rot silently. See hooks/_verdict.sh for the full rationale,
 # the two invariants, and the honest boundary (SIGKILL / hook-never-runs).
+RELAY_VERDICT_STREAM=stdout
+# FALLBACK VERDICT — installed BEFORE the shared helper is sourced, and this
+# ordering is the whole point. A SHARED PRIMITIVE CANNOT GUARANTEE ITS OWN
+# LOADER: if _verdict.sh is missing or unparseable, sourcing it fails and every
+# verdict vanishes, which is the exact silence this mechanism exists to end
+# (codex round 4 proved it by corrupting the helper — all four hooks then
+# emitted ZERO verdicts and exited 0).
+# These definitions are deliberately self-contained. Sourcing the helper
+# REDEFINES them, so a healthy load transparently upgrades this fallback; the
+# trap resolves `relay_emit_verdict` by name at exit time.
+RELAY_VERDICT="CANNOT-JUDGE"
+RELAY_VERDICT_REASON="verdict helper did not load"
+RELAY_VERDICT_DETAIL=""
+relay_emit_verdict() {
+  _l="[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
+  if [ "${RELAY_VERDICT_STREAM:-stdout}" = "stderr" ]; then echo "$_l" >&2; else echo "$_l"; fi
+}
+trap relay_emit_verdict EXIT
 RELAY_VERDICT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_verdict.sh
 . "$RELAY_VERDICT_DIR/_verdict.sh"
