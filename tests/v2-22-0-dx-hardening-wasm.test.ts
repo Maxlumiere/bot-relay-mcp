@@ -40,6 +40,8 @@ describe("wasm driver — ADR-0005 parity", () => {
     expect(cols).toContain("registration_recovery_hash");
 
     const orphan = registerAgent("w-orphan", "worker", []);
+    // abandon targets a session-LESS orphan; a fresh register carries a live session.
+    getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = ?").run("w-orphan");
     expect(abandonRegistration("w-orphan", orphan.registration_recovery!)).toEqual({ abandoned: true });
 
     // KEYSTONE: an authenticated agent can't be abandoned even with a valid handle.

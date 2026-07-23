@@ -65,7 +65,7 @@ import {
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
 import { defaultTokenStore } from "./token-store.js";
-import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken, explicitCallerCacheGet, explicitCallerCachePut } from "./db.js";
+import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken, explicitCallerCacheGet, explicitCallerCachePut, markAgentAuthenticated } from "./db.js";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { currentContext, requestContext } from "./request-context.js";
@@ -1167,6 +1167,11 @@ export function createServer(): Server {
         }
         return authError(result.reason!);
       }
+      // ADR-0005 (codex #115 blocker a): a successful active-row re-register is a
+      // real token verification, but register_agent never routes through the
+      // dispatcher's verified-token cache-put — so this exit is where it must
+      // stamp first_authed_at, or the orphan-GC would reap a live re-authed agent.
+      if (!result.legacy) markAgentAuthenticated(claimedName);
       return null;
     }
 

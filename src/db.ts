@@ -1906,6 +1906,34 @@ function orphanTtlMs(): number {
 }
 
 /**
+ * ADR-0005 — THE reapability invariant, defined ONCE. A row is a reapable orphan
+ * ONLY when it has NEVER authenticated (`first_authed_at IS NULL`) AND has no
+ * live session (`session_id IS NULL`). BOTH deletion paths — the auto-GC and
+ * abandon_registration — delete THROUGH `deleteReapableOrphan`, so neither can
+ * silently omit a predicate: the safe-by-construction guarantee is physical, not
+ * a WHERE clause each call site restates correctly from memory. (codex #115
+ * blockers a+b were two independent omissions of this exact shape.)
+ */
+const REAPABLE_ORPHAN_WHERE = "first_authed_at IS NULL AND session_id IS NULL";
+
+/**
+ * The ONLY sanctioned way to delete an agent row on the orphan-cleanup path.
+ * Carries the canonical predicate + re-asserts it in the DELETE WHERE (TOCTOU:
+ * a row that authenticates or acquires a session between check and delete is
+ * left intact). Deleting an agent invalidates its token, so it bumps the auth
+ * generation. Returns whether a row was removed.
+ */
+function deleteReapableOrphan(db: CompatDatabase, name: string): boolean {
+  const r = db.prepare(`DELETE FROM agents WHERE name = ? AND ${REAPABLE_ORPHAN_WHERE}`).run(name);
+  if (r.changes > 0) {
+    db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
+    bumpAuthGeneration();
+    return true;
+  }
+  return false;
+}
+
+/**
  * ADR-0005 — self-serve abandon of the caller's OWN botched (orphaned)
  * registration, WITHOUT the destructive operator endpoint. SAFE BY
  * CONSTRUCTION via the keystone invariant: it deletes ONLY a row that has NEVER
@@ -1920,14 +1948,27 @@ export function abandonRegistration(name: string, handle: string): { abandoned: 
   const db = getDb();
   const row = db
     .prepare(
-      "SELECT first_authed_at, registration_recovery_hash, registration_recovery_expires_at FROM agents WHERE name = ?",
+      "SELECT first_authed_at, session_id, registration_recovery_hash, registration_recovery_expires_at FROM agents WHERE name = ?",
     )
     .get(name) as
-    | { first_authed_at: string | null; registration_recovery_hash: string | null; registration_recovery_expires_at: string | null }
+    | {
+        first_authed_at: string | null;
+        session_id: string | null;
+        registration_recovery_hash: string | null;
+        registration_recovery_expires_at: string | null;
+      }
     | undefined;
   if (!row) return { abandoned: false, reason: "no such registration" };
+  // Reject a NON-ORPHAN — ever-authenticated OR live-session — BEFORE any bcrypt
+  // work. Abandon is ONLY for a never-authed, session-less registration; these
+  // two guards mirror the two halves of REAPABLE_ORPHAN_WHERE that the shared
+  // DELETE then re-asserts (codex #115 blocker b: the DELETE was missing the
+  // session_id half, so a fresh live-session row could be abandoned).
   if (row.first_authed_at !== null) {
     return { abandoned: false, reason: "agent has authenticated — not an orphan. Use unregister_agent with its token." };
+  }
+  if (row.session_id !== null) {
+    return { abandoned: false, reason: "agent has a live session — not an orphan. Use unregister_agent with its token." };
   }
   if (!row.registration_recovery_hash) return { abandoned: false, reason: "no active registration-recovery handle for this name" };
   if (
@@ -1939,14 +1980,12 @@ export function abandonRegistration(name: string, handle: string): { abandoned: 
   if (!verifyToken(handle, row.registration_recovery_hash)) {
     return { abandoned: false, reason: "invalid registration-recovery handle" };
   }
-  // Keystone RE-ASSERTED in the WHERE — closes the TOCTOU race.
-  const r = db.prepare("DELETE FROM agents WHERE name = ? AND first_authed_at IS NULL").run(name);
-  if (r.changes > 0) {
-    db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
-    bumpAuthGeneration();
+  // Delete THROUGH the shared helper — re-asserts BOTH predicates in the WHERE,
+  // closing the TOCTOU race (a concurrent auth OR session-acquire leaves it intact).
+  if (deleteReapableOrphan(db, name)) {
     return { abandoned: true };
   }
-  return { abandoned: false, reason: "agent authenticated concurrently — not abandoned" };
+  return { abandoned: false, reason: "agent authenticated or acquired a session concurrently — not abandoned" };
 }
 
 /**
@@ -1958,22 +1997,15 @@ export function abandonRegistration(name: string, handle: string): { abandoned: 
  */
 export function gcOrphanRegistrations(db: CompatDatabase): number {
   const cutoff = new Date(Date.now() - orphanTtlMs()).toISOString();
+  // Candidate scan + per-row delete BOTH use the one canonical predicate — the
+  // GC cannot drift from abandon_registration's notion of "reapable orphan".
   const orphans = db
-    .prepare(
-      "SELECT name FROM agents WHERE first_authed_at IS NULL AND session_id IS NULL AND created_at < ?",
-    )
+    .prepare(`SELECT name FROM agents WHERE ${REAPABLE_ORPHAN_WHERE} AND created_at < ?`)
     .all(cutoff) as Array<{ name: string }>;
   let removed = 0;
   for (const o of orphans) {
-    const r = db
-      .prepare("DELETE FROM agents WHERE name = ? AND first_authed_at IS NULL AND session_id IS NULL")
-      .run(o.name);
-    if (r.changes > 0) {
-      db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(o.name);
-      removed++;
-    }
+    if (deleteReapableOrphan(db, o.name)) removed++;
   }
-  if (removed > 0) bumpAuthGeneration();
   return removed;
 }
 
