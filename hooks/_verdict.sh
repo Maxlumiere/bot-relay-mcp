@@ -28,7 +28,29 @@
 # implementation means a new hook opts in with a single `.` line, and the
 # cross-hook contract test fails if it does not.
 #
-# HONEST BOUNDARY, stated rather than papered over:
+# WHAT IS ACTUALLY GUARANTEED — narrowed after codex round 5 proved the earlier
+# wording false. The guarantee is over ACCIDENTAL failure, not over an adversary:
+#
+#   GUARANTEED: no accidental failure suppresses the verdict. Missing helper,
+#   unparseable helper, syntax error, missing interpreter, an early `exit 0`
+#   guard, `set -e`, or a catchable signal all still yield exactly one
+#   CANNOT-JUDGE. Those are the failures that actually happen, and all four
+#   audit findings lived here.
+#
+#   NOT GUARANTEED: a hostile or corrupted _verdict.sh. `source` grants the
+#   helper full authority over this shell — it can `trap - EXIT` and exit, and
+#   no fallback installed BEFORE it can survive that. codex proved it.
+#
+# SO THIS FILE IS A TRUST BOUNDARY. Treat its integrity as you would any other
+# code in hooks/: anyone who can write here already has code execution in every
+# hook. And note the asymmetry that makes further hardening pointless — the SAME
+# access that suppresses a verdict can FORGE one. Verified: a hostile helper made
+# a genuinely MUTE machine report VERDICT=HEALTHY. Forging is strictly the better
+# attack, because a suppressed verdict is at least visible as absence to a
+# consumer that expects one, whereas a forged HEALTHY is invisible. Defending
+# suppression while forging stays open would be theatre.
+#
+# OTHER LIMITS, unchanged:
 #   * SIGKILL emits nothing. Uncatchable by anything, anywhere.
 #   * A hook that NEVER RUNS cannot speak for itself. Only a party that knows a
 #     verdict was OWED can notice one missing — that is the server-side absence
