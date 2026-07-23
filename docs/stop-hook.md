@@ -16,7 +16,9 @@ Install `Stop` in **every project where you already install `PostToolUse`**. The
 | `PostToolUse` | After every tool call | Mail only (intra-turn push) |
 | `Stop` | At every turn end (even text-only) | A wake only — the agent fetches its own mail |
 
-**Cost, stated honestly:** a `decision:"block"` steals the turn boundary — the agent continues into mail processing before yielding, and anything the human types meanwhile queues behind that continuation. Two guards bound it: `stop_hook_active` in the hook payload (one wake per natural stop — if the agent could not drain its inbox in the granted continuation, it stops and the floor takes over) and a per-agent time damper (default 120s). Both guards leave the mail **pending** when they suppress: a delayed wake, never a lost one.
+**Cost, stated honestly:** a `decision:"block"` steals the turn boundary — the agent continues into mail processing before yielding, and anything the human types meanwhile queues behind that continuation. Two guards bound it: `stop_hook_active` in the hook payload (one wake per natural stop — if the agent could not drain its inbox in the granted continuation, it stops and the floor takes over) and a per-agent time damper (default 120s) that applies **only when the payload lacked a parseable `stop_hook_active`** — on a modern harness the field alone is the exact guard, and damping on top would swallow the wake for a new batch arriving after a continuation drained the old one. All guards leave the mail **pending** when they suppress: a delayed wake, never a lost one.
+
+**The floor is conditional, and that should be said plainly:** "suppressed wakes are covered by the floor" holds where PostToolUse, Tether, or Sentinel is installed. On a session with none of them, a damper-suppressed wake surfaces at the next natural stop or the next `SessionStart` — delay, not loss, but potentially long delay on an idle text-only session. Install the hooks together (as this doc recommends) and the window closes.
 
 ## Per-project install (NOT global)
 
@@ -79,10 +81,10 @@ alias ai-agent='RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=<your-token> claude'
 
 ## What the hook does
 
-1. Reads the hook payload from stdin; if `stop_hook_active` is true (this stop is already a hook-forced continuation), exits silently — one wake per natural stop.
+1. Reads the **complete** hook payload from stdin (bounded at 256KB — not first-line-only, so a pretty-printed payload cannot defeat the guard). If `stop_hook_active` is true (this stop is already a hook-forced continuation), exits silently — one wake per natural stop. A non-empty payload that does not parse as JSON also suppresses (fail-safe: we cannot rule out active, and the mail stays pending either way).
 2. Validates all env-var inputs against an allowlist (no surprises in URLs or SQL).
 3. If `RELAY_AGENT_TOKEN` is set AND the HTTP daemon responds on `/health` within 1 second, calls `get_messages` with **`peek: true`** via `/mcp` — the v2.2.2 non-mutating read. This path goes through the full auth / rate-limit / audit pipeline and marks nothing.
-4. Otherwise falls back to sqlite on `RELAY_DB_PATH`, opened **`-readonly`** with a bare `SELECT`.
+4. Otherwise falls back to sqlite on `RELAY_DB_PATH` with a bare `SELECT` that mirrors the authoritative pending query (`status='pending' AND resolved_at IS NULL`, with a filterless retry for pre-v2.12 legacy DBs). The connection is deliberately **not** opened `-readonly`: readonly open of a WAL database is sqlite-version-dependent and fails on some builds, which would silently kill the whole fallback — the read-only guarantee is structural instead (no mutating SQL exists in the file; enforced by test).
 5. If mail is pending and the damper window has elapsed, emits a single-line Claude Code hook JSON to stdout:
    ```json
    {"decision": "block", "reason": "[RELAY] 2 pending messages for builder (high priority), latest from planner. Before stopping, call get_messages(agent_name=\"builder\", status=\"pending\"), act on every message, then continue. The mail is still unread in the relay; this wake did not consume it."}

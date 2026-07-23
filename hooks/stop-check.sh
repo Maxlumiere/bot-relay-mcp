@@ -29,18 +29,27 @@
 #      `reason`: the agent is told to call get_messages itself. Content
 #      delivery rides that authenticated tool call — the one place mark-as-read
 #      has always been correct — so read continues to mean received.
-#   3. Loop guards, both of which leave the mail PENDING when they suppress
-#      (suppression can delay a wake, never lose mail — Sentinel and
-#      PostToolUse remain the floor):
-#        a. `stop_hook_active` in the hook's stdin payload: when this stop is
-#           itself the result of a Stop-hook block, never block again — one
-#           wake per natural stop. If the agent could not drain its inbox in
-#           the granted continuation (e.g. broken token), it stops and the
-#           floor takes over, loudly.
-#        b. A time damper (default 120s, RELAY_STOP_WAKE_DAMPER_SECS to tune,
-#           0 disables): at most one block per window per agent, keyed on a
-#           state-file mtime under ~/.bot-relay/hook-state/. Belt-and-braces
-#           for harness versions whose payload lacks stop_hook_active.
+#   3. Loop guards, all of which leave the mail PENDING when they suppress
+#      (suppression can delay a wake, never lose mail — PostToolUse, Tether
+#      and Sentinel remain the floor WHERE INSTALLED; on a session with none
+#      of them, a suppressed wake surfaces at the next natural stop or
+#      SessionStart, which is honest delay, not loss):
+#        a. `stop_hook_active` in the hook's stdin payload (read COMPLETELY,
+#           not first-line-only): when this stop is itself the result of a
+#           Stop-hook block, never block again — one wake per natural stop.
+#           If the agent could not drain its inbox in the granted
+#           continuation (e.g. broken token), it stops and the floor takes
+#           over, loudly.
+#        b. Fail-safe on a non-empty payload that does not parse as JSON:
+#           suppress. We cannot rule out active, and a wrong guess in the
+#           other direction is a block loop.
+#        c. A time damper (default 120s, RELAY_STOP_WAKE_DAMPER_SECS to tune,
+#           0 disables), applied ONLY when the payload lacked a parseable
+#           stop_hook_active — on a trusted payload the field alone already
+#           guarantees one wake per natural stop, and damping on top would
+#           swallow the wake for a NEW batch after a continuation drained
+#           the old one. Keyed on state-file mtime under
+#           ~/.bot-relay/hook-state/.
 #
 # COST, stated for the operator: a block steals the turn boundary — the agent
 # continues into mail processing before yielding, and anything the human types
@@ -101,27 +110,57 @@ if [[ "$0" != *"/bot-relay-mcp/hooks/"* ]]; then
 fi
 
 # --- Hook input (stdin) — the ONE-WAKE-PER-NATURAL-STOP guard -----------------
-# Claude Code writes the hook payload to stdin and closes it. `read -t 1`
-# returns instantly on a closed pipe / EOF; the timeout only guards a manual
-# TTY invocation from hanging. The payload is compact single-line JSON; if it
-# is absent or unparseable we treat stop_hook_active as false and rely on the
-# damper below — a missing guard field must degrade to bounded loudness, never
-# to data loss (nothing on this path writes).
+# Claude Code writes the hook payload to stdin and closes it. The COMPLETE
+# payload is read (bounded at 256KB), not just the first line — a pretty-printed
+# payload with `stop_hook_active` on a later line must not parse as inactive
+# (codex #124: first-line-only reading let a multi-line active:true payload
+# defeat the guard and re-block every forced continuation). The per-line 1s
+# timeout only guards a manual TTY invocation from hanging; on a closed pipe
+# every read returns instantly. Concatenating lines is JSON-safe: newlines are
+# inter-token whitespace and cannot occur inside JSON strings.
 HOOK_INPUT=""
-IFS= read -r -t 1 HOOK_INPUT 2>/dev/null || true
-if [ -n "$HOOK_INPUT" ] && command -v python3 >/dev/null 2>&1; then
-  STOP_ACTIVE=$(HI="$HOOK_INPUT" python3 -c '
+_line=""
+while IFS= read -r -t 1 _line 2>/dev/null; do
+  HOOK_INPUT="${HOOK_INPUT}${_line}"
+  [ ${#HOOK_INPUT} -ge 262144 ] && break
+done
+HOOK_INPUT="${HOOK_INPUT}${_line}"
+# Guard modes, decided by what the payload PROVES (fail-safe in every branch —
+# suppression always leaves mail PENDING for the floor; nothing here writes):
+#   active   → this stop is already our forced continuation: one wake per
+#              natural stop, never block again.
+#   invalid  → a non-empty payload we cannot parse: we cannot rule out
+#              active, so suppress rather than risk a block loop.
+#   inactive → the harness explicitly says this is a natural stop. TRUSTED:
+#              the damper below is skipped — stop_hook_active alone already
+#              guarantees one wake per natural stop, and damping on top of it
+#              would swallow the wake for a NEW batch arriving after a
+#              continuation drained the old one.
+#   absent/empty → old harness or manual run: fall through with the damper as
+#              the bounded-loudness backstop.
+GUARD_TRUSTED=0
+if [ -n "$HOOK_INPUT" ]; then
+  command -v python3 >/dev/null 2>&1 || exit 0
+  PARSE=$(HI="$HOOK_INPUT" python3 -c '
 import json, os
 try:
-    print("1" if json.loads(os.environ["HI"]).get("stop_hook_active") else "0")
+    d = json.loads(os.environ["HI"])
 except Exception:
-    print("0")
+    print("invalid")
+    raise SystemExit
+if d.get("stop_hook_active"):
+    print("active")
+elif "stop_hook_active" in d:
+    print("inactive")
+else:
+    print("absent")
 ' 2>/dev/null)
-  if [ "$STOP_ACTIVE" = "1" ]; then
-    # This stop is already the continuation we forced. Do not block again —
-    # the mail (if any remains) is still PENDING and the floor covers it.
-    exit 0
-  fi
+  case "$PARSE" in
+    active) exit 0 ;;
+    inactive) GUARD_TRUSTED=1 ;;
+    absent) GUARD_TRUSTED=0 ;;
+    *) exit 0 ;;
+  esac
 fi
 
 AGENT_NAME="${RELAY_AGENT_NAME:-}"
@@ -203,8 +242,15 @@ else
 fi
 
 # --- Peek helpers — both emit "COUNT<US>LATEST_FROM<US>TOP_PRIORITY" ----------
-# <US> = 0x1f. Neither path mutates anything: HTTP passes peek:true (the
-# v2.2.2 non-mutating read), sqlite opens the DB -readonly with a bare SELECT.
+# <US> = 0x1f. Neither path mutates message state: HTTP passes peek:true (the
+# v2.2.2 non-mutating read), sqlite runs a bare SELECT. The sqlite connection
+# is deliberately NOT opened with -readonly: readonly open of a WAL database
+# is version-dependent (it fails with SQLITE_CANTOPEN on a cleanly-closed WAL
+# DB under some sqlite3 builds because the readonly connection cannot create
+# the -shm), and the relay DB is WAL by default — so -readonly silently
+# degraded the whole fallback to no-wake on affected machines. The read-only
+# guarantee is structural instead: no mutating SQL exists in this file, and
+# tests/hooks-stop.test.ts asserts that against the source.
 
 http_peek() {
   [ -z "$AGENT_TOKEN" ] && return 1
@@ -278,8 +324,23 @@ sqlite_peek() {
   command -v sqlite3 >/dev/null 2>&1 || return 1
   command -v python3 >/dev/null 2>&1 || return 1
 
+  # `resolved_at IS NULL` mirrors the authoritative get_messages pending
+  # query: resolve_messages stamps resolved_at WITHOUT touching status, so a
+  # status-only filter would wake the agent for mail get_messages will not
+  # return — a block loop with nothing to drain (codex #124). The column
+  # exists since v2.12; on a pre-v2.12 legacy DB the query errors and we
+  # retry without the filter rather than silently losing the whole fallback.
   local rows
-  rows=$(sqlite3 -readonly -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
+  rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+.parameter set :lim $MAX_MESSAGES
+SELECT from_agent, priority
+FROM messages WHERE to_agent = :name AND status = 'pending' AND resolved_at IS NULL
+ORDER BY created_at DESC LIMIT :lim;
+SQL
+)
+  if [ $? -ne 0 ]; then
+    rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 .parameter set :lim $MAX_MESSAGES
 SELECT from_agent, priority
@@ -287,6 +348,7 @@ FROM messages WHERE to_agent = :name AND status = 'pending'
 ORDER BY created_at DESC LIMIT :lim;
 SQL
 ) || return 1
+  fi
   if [ -z "$rows" ]; then
     return 0  # empty — nothing to wake for
   fi
@@ -337,14 +399,28 @@ if [ -z "$SUMMARY" ]; then
   exit 0
 fi
 
-# Damper: at most one block per window per agent. Suppression leaves the mail
-# PENDING — a delayed wake, never a lost one. 0 disables (tests drive this).
-if [ "$DAMPER_SECS" -gt 0 ]; then
+# Damper: at most one block per window per agent — applied ONLY when the
+# payload did not carry a parseable stop_hook_active (GUARD_TRUSTED=0). On a
+# trusted payload the field alone guarantees one wake per natural stop, and
+# damping on top would swallow the wake for a NEW batch arriving after a
+# continuation drained the old one. Suppression leaves the mail PENDING — a
+# delayed wake, never a lost one. 0 disables (tests drive this).
+if [ "$GUARD_TRUSTED" -eq 0 ] && [ "$DAMPER_SECS" -gt 0 ]; then
   STATE_DIR="$HOME/.bot-relay/hook-state"
   STATE_FILE="$STATE_DIR/stop-wake-$AGENT_NAME"
   NOW=$(date +%s)
   if [ -f "$STATE_FILE" ]; then
-    LAST=$(stat -f %m "$STATE_FILE" 2>/dev/null || stat -c %Y "$STATE_FILE" 2>/dev/null || echo 0)
+    # mtime, portably. GNU stat -f is "filesystem status" — it SUCCEEDS and
+    # prints the MOUNT POINT for %m, so `stat -f || stat -c` never falls
+    # through on Linux and the arithmetic below would compare against a path
+    # (codex #124 HIGH). Accept the BSD answer only if it is numeric.
+    LAST=$(stat -f %m "$STATE_FILE" 2>/dev/null)
+    case "$LAST" in
+      ''|*[!0-9]*) LAST=$(stat -c %Y "$STATE_FILE" 2>/dev/null) ;;
+    esac
+    case "$LAST" in
+      ''|*[!0-9]*) LAST=0 ;;
+    esac
     if [ $((NOW - LAST)) -lt "$DAMPER_SECS" ]; then
       exit 0
     fi

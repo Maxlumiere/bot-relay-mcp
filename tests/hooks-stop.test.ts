@@ -255,6 +255,74 @@ describe("Stop hook — loop guards (suppression must never consume)", () => {
     expect(pendingCount("stop-recv-5")).toBe(1);
   });
 
+  it("(4b) multi-line payload with stop_hook_active on a LATER line still suppresses (damper 0)", async () => {
+    // codex #124: first-line-only stdin reading parsed a pretty-printed
+    // active:true payload as inactive — with the damper disabled that
+    // re-blocks every forced continuation. The guard must see the whole
+    // payload.
+    const senderTok = await registerWithToken("stop-sender-8", []);
+    const recvTok = await registerWithToken("stop-recv-8", []);
+    await sendMessage("stop-sender-8", "stop-recv-8", "multi-line payload", senderTok);
+
+    const r = await runHook(
+      {
+        RELAY_AGENT_NAME: "stop-recv-8",
+        RELAY_AGENT_TOKEN: recvTok,
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HTTP_PORT: String(port),
+        RELAY_DB_PATH: TEST_DB_PATH,
+      },
+      { stdinPayload: '{\n  "session_id": "s1",\n  "stop_hook_active": true\n}\n' },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+    expect(pendingCount("stop-recv-8")).toBe(1);
+  });
+
+  it("(4c) non-empty UNPARSEABLE payload → fail-safe suppress (damper 0), mail still pending", async () => {
+    const senderTok = await registerWithToken("stop-sender-9", []);
+    const recvTok = await registerWithToken("stop-recv-9", []);
+    await sendMessage("stop-sender-9", "stop-recv-9", "garbage payload", senderTok);
+
+    const r = await runHook(
+      {
+        RELAY_AGENT_NAME: "stop-recv-9",
+        RELAY_AGENT_TOKEN: recvTok,
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HTTP_PORT: String(port),
+        RELAY_DB_PATH: TEST_DB_PATH,
+      },
+      { stdinPayload: "this is not json {{{" },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+    expect(pendingCount("stop-recv-9")).toBe(1);
+  });
+
+  it("(4d) trusted payload (stop_hook_active:false) SKIPS the damper — consecutive natural stops each wake", async () => {
+    // On a trusted payload, stop_hook_active alone guarantees one wake per
+    // natural stop; damping on top would swallow the wake for a new batch
+    // arriving after a continuation drained the old one (codex #124).
+    const senderTok = await registerWithToken("stop-sender-10", []);
+    const recvTok = await registerWithToken("stop-recv-10", []);
+    await sendMessage("stop-sender-10", "stop-recv-10", "trusted mode", senderTok);
+
+    const env = {
+      RELAY_AGENT_NAME: "stop-recv-10",
+      RELAY_AGENT_TOKEN: recvTok,
+      RELAY_HTTP_HOST: "127.0.0.1",
+      RELAY_HTTP_PORT: String(port),
+      RELAY_DB_PATH: TEST_DB_PATH,
+      RELAY_STOP_WAKE_DAMPER_SECS: "3600",
+    };
+    const payload = { stdinPayload: JSON.stringify({ session_id: "s1", stop_hook_active: false }) };
+    const r1 = await runHook(env, payload);
+    expect(JSON.parse(r1.stdout).decision).toBe("block");
+    const r2 = await runHook(env, payload);
+    expect(JSON.parse(r2.stdout).decision).toBe("block");
+    expect(pendingCount("stop-recv-10")).toBe(1);
+  });
+
   it("(5) damper: second run inside the window is suppressed; mail still pending; window expiry re-arms", async () => {
     const senderTok = await registerWithToken("stop-sender-6", []);
     const recvTok = await registerWithToken("stop-recv-6", []);
@@ -282,6 +350,46 @@ describe("Stop hook — loop guards (suppression must never consume)", () => {
     const r3 = await runHook(env);
     expect(JSON.parse(r3.stdout).decision).toBe("block");
     expect(pendingCount("stop-recv-6")).toBe(1);
+  });
+
+  it("(5b) damper under GNU-coreutils stat semantics: suppression still works", async () => {
+    // codex #124 HIGH: GNU `stat -f %m` SUCCEEDS and prints the MOUNT POINT
+    // (a path), so a `stat -f || stat -c` chain never falls through on Linux
+    // and the mtime arithmetic ran against a path — the damper silently never
+    // suppressed. This control runs the hook against a stat shim that
+    // reproduces GNU behavior; the hook must reject the non-numeric answer
+    // and fall through to -c %Y.
+    const shimDir = path.join(TEST_DB_DIR, "gnu-stat-shim");
+    fs.mkdirSync(shimDir, { recursive: true });
+    const python3 = cp.execSync("command -v python3").toString().trim();
+    fs.writeFileSync(
+      path.join(shimDir, "stat"),
+      `#!/bin/bash
+# GNU-coreutils behavior simulation: -f is FILESYSTEM status; %m = mount point.
+if [ "$1" = "-f" ]; then echo "/"; exit 0; fi
+if [ "$1" = "-c" ]; then ${python3} -c 'import os,sys;print(int(os.path.getmtime(sys.argv[1])))' "$3"; exit $?; fi
+exit 1
+`,
+      { mode: 0o755 },
+    );
+    const senderTok = await registerWithToken("stop-sender-11", []);
+    const recvTok = await registerWithToken("stop-recv-11", []);
+    await sendMessage("stop-sender-11", "stop-recv-11", "gnu stat", senderTok);
+
+    const env = {
+      PATH: `${shimDir}:${process.env.PATH ?? ""}`,
+      RELAY_AGENT_NAME: "stop-recv-11",
+      RELAY_AGENT_TOKEN: recvTok,
+      RELAY_HTTP_HOST: "127.0.0.1",
+      RELAY_HTTP_PORT: String(port),
+      RELAY_DB_PATH: TEST_DB_PATH,
+      RELAY_STOP_WAKE_DAMPER_SECS: "3600",
+    };
+    const r1 = await runHook(env);
+    expect(JSON.parse(r1.stdout).decision).toBe("block");
+    const r2 = await runHook(env);
+    expect(r2.stdout).toBe("");
+    expect(pendingCount("stop-recv-11")).toBe(1);
   });
 });
 
@@ -315,6 +423,43 @@ describe("Stop hook — graceful degradation", () => {
     expect(parsed.decision).toBe("block");
     expect(parsed.reason).toContain("high priority");
     expect(pendingCount("stop-recv-3")).toBe(1);
+  });
+
+  it("(7b) resolved-but-status-pending mail does NOT wake via the sqlite fallback", async () => {
+    // resolve_messages stamps resolved_at WITHOUT touching status (known
+    // quirk). The authoritative get_messages pending query excludes resolved
+    // rows, so a status-only sqlite peek would wake the agent for mail
+    // get_messages will not return — a block with nothing to drain
+    // (codex #124). The fallback must mirror the resolved_at filter.
+    const senderTok = await registerWithToken("stop-sender-12", []);
+    const recvTok = await registerWithToken("stop-recv-12", []);
+    await sendMessage("stop-sender-12", "stop-recv-12", "will be resolved", senderTok);
+
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const Better = require("better-sqlite3");
+    const dbRo = new Better(TEST_DB_PATH, { readonly: true });
+    const msg = dbRo
+      .prepare("SELECT id FROM messages WHERE to_agent = 'stop-recv-12' AND status = 'pending'")
+      .get() as { id: string };
+    dbRo.close();
+
+    const resolveResp = await mcpCall({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: {
+        name: "resolve_messages",
+        arguments: { agent_name: "stop-recv-12", message_ids: [msg.id], agent_token: recvTok },
+      },
+    });
+    const resolved = JSON.parse(resolveResp.result.content[0].text);
+    expect(resolved.resolved_count ?? resolved.resolved ?? 1).toBeTruthy();
+
+    const r = await runHook({
+      RELAY_AGENT_NAME: "stop-recv-12",
+      // No token → sqlite fallback path, the one under test.
+      RELAY_DB_PATH: TEST_DB_PATH,
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
   });
 
   it("(8) missing RELAY_AGENT_NAME → silent exit 0, empty stdout", async () => {
@@ -374,12 +519,19 @@ describe("Stop hook — behavioral invariants", () => {
     expect(afterSelf.capabilities).toEqual(beforeSelf.capabilities);
   });
 
-  it("(11) STRUCTURAL: the script contains no UPDATE statement — the write path is gone, not disabled", () => {
+  it("(11) STRUCTURAL: the script contains no mutating SQL — the write path is gone, not disabled", () => {
+    // NOTE: the sqlite connection is deliberately NOT opened -readonly.
+    // Readonly open of a WAL database is version-dependent (SQLITE_CANTOPEN
+    // on a cleanly-closed WAL DB under some sqlite3 builds), and the relay DB
+    // is WAL by default — -readonly silently degraded the whole fallback to
+    // no-wake on affected machines. The read-only guarantee is therefore
+    // structural: no mutating SQL exists in the file at all.
     const src = fs.readFileSync(HOOK_SCRIPT, "utf8");
-    expect(src).not.toMatch(/UPDATE\s+messages/i);
-    // And the sqlite CLI is opened read-only, so even a future stray
-    // statement could not silently mutate.
-    expect(src).toContain("sqlite3 -readonly");
+    expect(src).not.toMatch(/UPDATE\s+\w+\s+SET/i);
+    expect(src).not.toMatch(/INSERT\s+INTO/i);
+    expect(src).not.toMatch(/DELETE\s+FROM/i);
+    expect(src).not.toMatch(/REPLACE\s+INTO/i);
+    expect(src).not.toMatch(/DROP\s+(TABLE|INDEX)/i);
   });
 });
 

@@ -114,7 +114,8 @@ function initMinimalDb(dbPath: string): void {
       content TEXT,
       priority TEXT DEFAULT 'normal',
       status TEXT DEFAULT 'pending',
-      created_at TEXT
+      created_at TEXT,
+      resolved_at TEXT
     );
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
@@ -418,7 +419,11 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
     expect(stripVerdict(r.stdout)).toBe("");
   });
 
-  it("(S2) valid agent name + DB present + pending message → stdout is single-line JSON with hookEventName=Stop", () => {
+  it("(S2) valid agent name + DB present + pending message → decision:'block' wake; the mail is NOT consumed", () => {
+    // v2.23 contract: the Stop hook is a READ-ONLY WAKE. It emits
+    // decision:"block" (the only Stop output that forces immediate
+    // continuation) with a compact summary, and never marks anything read —
+    // the agent fetches its own mail via get_messages.
     const { root, dbPath } = freshTestRoot();
     initMinimalDb(dbPath);
     insertAgent(dbPath, "stop-test-agent");
@@ -433,9 +438,19 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
     expect(r.status).toBe(0);
     if (r.stdout) {
       const parsed = JSON.parse(r.stdout);
-      expect(parsed.continue).toBe(true);
-      expect(parsed.hookSpecificOutput?.hookEventName).toBe("Stop");
-      expect(parsed.hookSpecificOutput?.additionalContext).toContain("Hello from S2");
+      expect(parsed.decision).toBe("block");
+      expect(parsed.reason).toContain("[RELAY]");
+      expect(parsed.reason).toContain("orchestrator");
+      // The wake carries no bodies — content rides the agent's own
+      // authenticated get_messages call.
+      expect(parsed.reason).not.toContain("Hello from S2");
+      // READ MUST MEAN RECEIVED: the hook consumed nothing.
+      const db = new Database(dbPath, { readonly: true });
+      const row = db
+        .prepare("SELECT COUNT(*) AS n FROM messages WHERE to_agent = 'stop-test-agent' AND status = 'pending'")
+        .get() as { n: number };
+      db.close();
+      expect(row.n).toBe(1);
     }
     // (else: clean degrade — same caveat as P3)
   });

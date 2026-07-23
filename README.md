@@ -618,7 +618,7 @@ The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is
 }
 ```
 
-Same single-quote-the-path-if-it-contains-spaces rule, same env vars, same HTTP/sqlite fallback (both non-mutating: `peek:true` over HTTP, `-readonly` sqlite), same silent-fail contract as `PostToolUse`. Two loop guards bound the blocking: `stop_hook_active` in the hook payload (one wake per natural stop) and a time damper (`RELAY_STOP_WAKE_DAMPER_SECS`, default 120s). Both guards leave mail pending when they suppress — a delayed wake, never a lost one. Full docs + troubleshooting in [`docs/stop-hook.md`](./docs/stop-hook.md).
+Same single-quote-the-path-if-it-contains-spaces rule, same env vars, same HTTP/sqlite fallback (both non-mutating: `peek:true` over HTTP, a bare SELECT over sqlite — no mutating SQL exists in the script), same silent-fail contract as `PostToolUse`. Two loop guards bound the blocking: `stop_hook_active` in the hook payload (one wake per natural stop) and a time damper (`RELAY_STOP_WAKE_DAMPER_SECS`, default 120s) that applies only when the payload lacks a parseable `stop_hook_active`. All guards leave mail pending when they suppress — a delayed wake, never a lost one. Full docs + troubleshooting in [`docs/stop-hook.md`](./docs/stop-hook.md).
 
 **Honest limitation:** `Stop` does NOT wake truly idle terminals. If no turn is in progress, neither hook fires. For long-idle windows, use the Layer 2 Managed Agent reference (`examples/managed-agent-reference/`).
 
