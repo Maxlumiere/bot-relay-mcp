@@ -140,8 +140,9 @@ async function rpc(
   const text = await res.text();
   const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
   let json: Record<string, unknown> | null = null;
-  if (dataLine) {
-    const inner = JSON.parse(dataLine.slice(5).trim()) as {
+  {
+    // ADR-0005 #3: one-shot POSTs now return plain JSON (no `data:` frame) — fall back to raw text.
+    const inner = JSON.parse(dataLine ? dataLine.slice(5).trim() : text) as {
       result?: { content?: Array<{ text?: string }> };
     };
     const innerText = inner.result?.content?.[0]?.text;

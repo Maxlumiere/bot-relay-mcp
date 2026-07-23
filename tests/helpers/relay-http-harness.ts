@@ -110,11 +110,14 @@ export async function tearDownDaemon(handle: DaemonHandle): Promise<void> {
   fs.rmSync(handle.tmpDir, { recursive: true, force: true });
 }
 
-/** Parse the single SSE `data:` frame the stateless POST path returns. */
+/**
+ * Parse a stateless POST /mcp response body. ADR-0005 #3 made the one-shot
+ * (non-streaming) path reply with plain `application/json`; older SSE framing
+ * (`event: message\ndata: {…}`) is still handled for stateful paths.
+ */
 function parseSseRpc(raw: string): { result?: { content?: { text?: string }[] } } {
   const dataLine = raw.split("\n").find((line) => line.startsWith("data: "));
-  if (!dataLine) throw new Error(`no SSE data frame in response: ${raw}`);
-  return JSON.parse(dataLine.slice(6));
+  return JSON.parse(dataLine ? dataLine.slice(6) : raw);
 }
 
 export async function registerAgentViaHttp(

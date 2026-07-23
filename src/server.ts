@@ -19,6 +19,7 @@ import {
   RegisterAgentSchema,
   DiscoverAgentsSchema,
   UnregisterAgentSchema,
+  AbandonRegistrationSchema,
   SpawnAgentSchema,
   SendMessageSchema,
   GetMessagesSchema,
@@ -56,6 +57,7 @@ import {
   handleRegisterAgent,
   handleDiscoverAgents,
   handleUnregisterAgent,
+  handleAbandonRegistration,
   handleRotateToken,
   handleRotateTokenAdmin,
   handleRevokeToken,
@@ -63,7 +65,7 @@ import {
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
 import { defaultTokenStore } from "./token-store.js";
-import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken, explicitCallerCacheGet, explicitCallerCachePut } from "./db.js";
+import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken, explicitCallerCacheGet, explicitCallerCachePut, markAgentAuthenticated } from "./db.js";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { currentContext, requestContext } from "./request-context.js";
@@ -156,6 +158,7 @@ export const TOOL_BUNDLES: Record<string, string> = {
   // core
   register_agent: "core",
   unregister_agent: "core",
+  abandon_registration: "core",
   discover_agents: "core",
   send_message: "core",
   get_messages: "core",
@@ -257,6 +260,7 @@ const TOOL_SCHEMAS: Record<string, unknown> = {
   register_agent: RegisterAgentSchema,
   discover_agents: DiscoverAgentsSchema,
   unregister_agent: UnregisterAgentSchema,
+  abandon_registration: AbandonRegistrationSchema,
   spawn_agent: SpawnAgentSchema,
   send_message: SendMessageSchema,
   get_messages: GetMessagesSchema,
@@ -447,6 +451,15 @@ export function createServer(): Server {
           "Returns: `{ success: true, name, removed: boolean, note }`. `removed=false` indicates the name was already absent (idempotent no-op) and is NOT an error.\n\n" +
           "Errors: `AUTH_FAILED` (token missing or wrong owner), `INVALID_INPUT`.",
         inputSchema: zodToJsonSchema(UnregisterAgentSchema),
+      },
+      {
+        name: "abandon_registration",
+        description:
+          "Self-clean YOUR OWN botched (orphaned) registration when you lost the agent_token before ever authenticating — e.g. a curl/script caller truncated the register response. Authenticated by the one-time `registration_recovery` handle returned in the register_agent response (NOT the lost token), so it needs no auth token.\n\n" +
+          "When to use: you registered but never captured/used the token, and the row is now an orphan you can't unregister (unregister needs the token you lost). NOT for a live agent that lost its token mid-session — that agent has authenticated, so this is refused; use `rotate_token` / `relay recover` instead.\n\n" +
+          "Behavior: verifies the `registration_recovery` handle (bcrypt, name-scoped, one-time, TTL-bound) and — ONLY if the target row has NEVER authenticated (the keystone) — deletes it, bumps the auth generation, and fires an `agent.unregistered` webhook. The keystone is re-asserted inside the DELETE, so it can never reach a working agent (a row that authenticates between check and delete is left intact) — the safe, self-serve alternative to the operator kill endpoint. Orphans are also auto-GC'd after ~30min (never-authed + session-less + older than the orphan TTL) as a backstop.\n\n" +
+          "Returns: `{ success, name, abandoned }`. Errors (AUTH_FAILED): agent has authenticated (not an orphan), invalid/expired handle, or no such registration.",
+        inputSchema: zodToJsonSchema(AbandonRegistrationSchema),
       },
       {
         name: "spawn_agent",
@@ -858,6 +871,8 @@ export function createServer(): Server {
         return handleDiscoverAgents(DiscoverAgentsSchema.parse(args));
       case "unregister_agent":
         return handleUnregisterAgent(UnregisterAgentSchema.parse(args));
+      case "abandon_registration":
+        return handleAbandonRegistration(AbandonRegistrationSchema.parse(args));
       case "spawn_agent":
         return handleSpawnAgent(SpawnAgentSchema.parse(args));
       case "send_message":
@@ -1152,6 +1167,11 @@ export function createServer(): Server {
         }
         return authError(result.reason!);
       }
+      // ADR-0005 (codex #115 blocker a): a successful active-row re-register is a
+      // real token verification, but register_agent never routes through the
+      // dispatcher's verified-token cache-put — so this exit is where it must
+      // stamp first_authed_at, or the orphan-GC would reap a live re-authed agent.
+      if (!result.legacy) markAgentAuthenticated(claimedName);
       return null;
     }
 

@@ -164,7 +164,11 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(19, 20)).not.toThrow();
     // ADR-0002 agent-class registered 20→21 (migrateSchemaToV2_21: agents.class column).
     expect(() => applyMigration(20, 21)).not.toThrow();
-    expect(() => applyMigration(21, 22)).toThrow(/no migration registered|21→22/);
+    // Phase A version visibility registered 21→22 (migrateSchemaToV2_22: agents.server_version + cli_profile).
+    expect(() => applyMigration(21, 22)).not.toThrow();
+    // ADR-0005 orphan-cleanup registered 22→23 (migrateSchemaToV2_23 — renumbered from v2_22 on rebase over #121).
+    expect(() => applyMigration(22, 23)).not.toThrow();
+    expect(() => applyMigration(23, 24)).toThrow(/no migration registered|23→24/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

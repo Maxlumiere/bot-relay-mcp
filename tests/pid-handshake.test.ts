@@ -56,10 +56,10 @@ describe("PID-handshake — DB layer (schema v19)", () => {
   beforeEach(cleanup);
   afterEach(cleanup);
 
-  it("schema is at version 22 with host_shell_pids + host_id columns", () => {
+  it("schema is at version 23 with host_shell_pids + host_id columns", () => {
     registerAgent("seed", "role", []); // triggers init
-    expect(CURRENT_SCHEMA_VERSION).toBe(22);
-    expect(getSchemaVersion()).toBe(22);
+    expect(CURRENT_SCHEMA_VERSION).toBe(23);
+    expect(getSchemaVersion()).toBe(23);
     const cols = (getDb().prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).map(
       (c) => c.name,
     );
@@ -166,12 +166,19 @@ async function callToolViaHttp(
     }),
   });
   const raw = await resp.text();
+  // ADR-0005 #3: one-shot POSTs return plain application/json; older SSE
+  // framing (event: message\ndata: {…}) is still handled for stateful paths.
   const dataLine = raw.split("\n").find((l) => l.startsWith("data: "));
-  if (!dataLine) return { ok: resp.ok, raw };
-  const rpc = JSON.parse(dataLine.slice(6)) as {
+  const body = dataLine ? dataLine.slice(6) : raw;
+  let rpc: {
     error?: unknown;
     result?: { isError?: boolean; content?: { text?: string }[] };
   };
+  try {
+    rpc = JSON.parse(body);
+  } catch {
+    return { ok: resp.ok, raw };
+  }
   // A tool that throws surfaces as result.isError (MCP) or a top-level error.
   const isError = !!rpc.error || rpc.result?.isError === true;
   return { ok: !isError, resultText: rpc.result?.content?.[0]?.text, raw };

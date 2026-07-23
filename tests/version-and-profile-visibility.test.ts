@@ -62,7 +62,9 @@ describe("schema v22 carries both columns", () => {
       .map((c) => c.name);
     expect(cols).toContain("server_version");
     expect(cols).toContain("cli_profile");
-    expect(CURRENT_SCHEMA_VERSION).toBe(22);
+    // v22 added these columns; ADR-0005 (#119) renumbered its own migration to
+    // v23 on rebase, so CURRENT is now past 22.
+    expect(CURRENT_SCHEMA_VERSION).toBe(23);
   });
 });
 

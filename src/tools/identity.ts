@@ -8,6 +8,7 @@ import {
   getAgents,
   buildAgentTopology,
   unregisterAgent,
+  abandonRegistration,
   rotateAgentToken,
   rotateAgentTokenAdmin,
   revokeAgentToken,
@@ -31,6 +32,7 @@ import type {
   RegisterAgentInput,
   DiscoverAgentsInput,
   UnregisterAgentInput,
+  AbandonRegistrationInput,
   RotateTokenInput,
   RotateTokenAdminInput,
   RevokeTokenInput,
@@ -111,7 +113,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   // landing between verify and UPDATE. Undefined when not a recovery flow.
   const expectedRecoveryHash = currentContext().verifiedRecoveryHash;
 
-  const { agent, plaintext_token, auto_assigned } = registerAgent(
+  const { agent, plaintext_token, auto_assigned, registration_recovery } = registerAgent(
     input.name,
     input.role,
     input.capabilities,
@@ -261,15 +263,26 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
         type: "text" as const,
         text: JSON.stringify(
           {
-            success: true,
-            agent,
-            protocol_version: PROTOCOL_VERSION,
+            // v2.22.0 (#2): agent_token FIRST so curl/script callers capture it
+            // reliably (a truncated `head -c` read still gets it; `.agent_token`
+            // is the leading key) — it was previously buried 4th and a botched
+            // capture orphaned the registration. Shown ONCE; the server stores
+            // only a bcrypt hash.
             ...(plaintext_token
               ? {
                   agent_token: plaintext_token,
                   auth_note: `Save this agent_token in the RELAY_AGENT_TOKEN env var. It is shown only on this response; the server stores a bcrypt hash.`,
                 }
               : {}),
+            // ADR-0005: one-time registration-recovery handle (first register
+            // only). If you lose agent_token before authenticating, call
+            // abandon_registration(name, recovery_handle) to self-clean the
+            // orphan — no operator endpoint needed. Short-lived; retired on
+            // first successful auth.
+            ...(registration_recovery ? { registration_recovery } : {}),
+            success: true,
+            agent,
+            protocol_version: PROTOCOL_VERSION,
             ...(capsNote ? { capabilities_note: capsNote } : {}),
             ...(auto_assigned.length > 0 ? { auto_assigned_tasks: auto_assigned.map((a) => ({ task_id: a.task_id, title: a.title, priority: a.priority })) } : {}),
             ...(recoveryCompleted ? { recovery_completed: true } : {}),
@@ -306,6 +319,38 @@ export function handleUnregisterAgent(input: UnregisterAgentInput) {
         ),
       },
     ],
+  };
+}
+
+/**
+ * ADR-0005 — abandon_registration: self-serve cleanup of the caller's OWN
+ * orphaned registration via the one-time registration-recovery handle (NOT the
+ * lost agent_token). No auth token required — the handle is the proof, and the
+ * keystone (only-never-authed rows) makes it safe by construction. See
+ * db.abandonRegistration.
+ */
+export function handleAbandonRegistration(input: AbandonRegistrationInput) {
+  const result = abandonRegistration(input.name, input.recovery_handle);
+  if (result.abandoned) {
+    fireWebhooks("agent.unregistered", input.name, input.name, {});
+    logAudit(input.name, "abandon_registration", `orphan abandoned target=${input.name}`, true, null, currentContext().transport, {
+      tool: "abandon_registration",
+    });
+  }
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          result.abandoned
+            ? { success: true, name: input.name, abandoned: true, note: `Orphaned registration "${input.name}" abandoned.` }
+            : { success: false, name: input.name, abandoned: false, error: result.reason, error_code: ERROR_CODES.AUTH_FAILED },
+          null,
+          2
+        ),
+      },
+    ],
+    ...(result.abandoned ? {} : { isError: true }),
   };
 }
 

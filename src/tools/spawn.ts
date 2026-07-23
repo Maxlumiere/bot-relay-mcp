@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { sendMessage, getAgentAuthData, registerAgent, unregisterAgent, markAgentOffline } from "../db.js";
+import { sendMessage, getAgentAuthData, registerAgent, unregisterAgent, markAgentOffline, markEstablished } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { log } from "../logger.js";
 import type { SpawnAgentInput } from "../types.js";
@@ -235,6 +235,15 @@ export async function handleSpawnAgent(input: SpawnAgentInput) {
       isError: true,
     };
   }
+
+  // ADR-0005 (codex #115 path #7): spawn provisioning IS establishment. The driver
+  // launched AND the child's usable token is committed to the vault — a delivered
+  // credential to a process we LAUNCHED, a stronger commitment than a bare
+  // register. Stamp established_at HERE (provisioning success) — crucially BEFORE
+  // the markAgentOffline below nulls the session — so the orphan-GC can never reap
+  // the child while its (slow) startup hasn't made its first MCP call yet. Silence
+  // is startup, not abandonment: else we delete children we ourselves just spawned.
+  markEstablished(input.name);
 
   // v2.14.1 — NOW that the driver launched successfully, clear the just-minted
   // session so the pre-registered row is OFFLINE/reserved. Done AFTER the driver

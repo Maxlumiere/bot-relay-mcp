@@ -18,7 +18,7 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated } from "../db.js";
 import { verifyToken } from "../auth.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "./websocket.js";
@@ -1003,6 +1003,10 @@ export function startHttpServer(port: number, host: string): Server {
         return;
       }
       fromAuthenticated = true;
+      // ADR-0005 (codex #115): a verified from_agent_token IS a successful token
+      // verification — stamp first_authed_at so this agent (incl. `relay send`
+      // callers, which POST here) can never be reaped by the orphan-GC.
+      markAgentAuthenticated(parsed.data.from);
     } else if (fromAgentToken) {
       // No registered row OR row has no token_hash, but caller supplied
       // a token anyway. Pre-v2.7.1 this returned 403 with a confusing
@@ -1484,6 +1488,13 @@ export function startHttpServer(port: number, host: string): Server {
     const server = createServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
+      // v2.22.0 (#3): non-streaming one-shot POSTs return plain
+      // `application/json`, not an `event: message\ndata: {…}` SSE frame — so
+      // curl/script callers can `JSON.parse` the body directly (was the #3
+      // papercut). The stateful/streaming path (Tether SSE) is unaffected: it
+      // uses a separate transport with a session id. Architect-ratified: this
+      // moves toward the stateless-transport direction, safe either way.
+      enableJsonResponse: true,
     });
     res.on("close", () => {
       transport.close().catch(() => {});

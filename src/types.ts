@@ -142,6 +142,21 @@ export const UnregisterAgentSchema = z.object({
   agent_token: AgentTokenField,
 });
 
+/**
+ * ADR-0005 (v2.22.0): self-serve cleanup of a BOTCHED (orphaned) registration —
+ * a row that registered but whose caller lost the agent_token before ever
+ * authenticating (e.g. a truncated curl capture). Authenticated by the
+ * one-time, name-scoped `recovery_handle` returned at register (NOT the lost
+ * agent_token), so it needs NO auth token (the handle is the proof). SAFE by
+ * the keystone: it can ONLY remove a NEVER-authenticated row, so it can never
+ * reach a working agent — that's what makes it a safe alternative to the
+ * operator kill endpoint. A live agent that lost its token uses rotate/recover.
+ */
+export const AbandonRegistrationSchema = z.object({
+  name: z.string().min(1).max(64).describe("The agent name whose orphaned registration to abandon."),
+  recovery_handle: z.string().min(1).describe("The one-time registration-recovery handle returned in the register_agent response (the `registration_recovery` field). Name-scoped + short-lived."),
+});
+
 // Defense-in-depth (v1.6.2): these patterns MUST match the validation in
 // bin/spawn-agent.sh. If you change one, change the other. The TS layer is
 // the primary defense; the shell layer is the belt-and-suspenders.
@@ -204,7 +219,15 @@ export const SpawnAgentSchema = z.object({
 export const SendMessageSchema = z.object({
   from: z.string().min(1).describe("Sender agent name"),
   to: z.string().min(1).describe("Recipient agent name"),
-  content: payloadField("content").describe("Message content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES)"),
+  // v2.22.0 (#5): the MCP tool now accepts EITHER `content` (historical) OR
+  // `message` (the field the agent-team SendMessage + the REST
+  // /api/send-message both use) — one send vocabulary across every surface.
+  // Both are optional at the schema layer; handleSendMessage requires EXACTLY
+  // one (rejecting neither, and both-with-different-values) and normalizes to
+  // content. Kept as a plain object (not a .transform) so the generated MCP
+  // tool inputSchema stays clean.
+  content: payloadField("content").optional().describe("Message content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES). Alias: `message`."),
+  message: payloadField("message").optional().describe("Alias for `content` (parity with the REST /api/send-message endpoint + the agent-team SendMessage tool)."),
   priority: z.enum(["normal", "high"]).default("normal").describe("Message priority"),
   agent_token: AgentTokenField,
 });
@@ -832,6 +855,7 @@ export type ApiDashboardThemeInput = z.infer<typeof ApiDashboardThemeSchema>;
 export type RegisterAgentInput = z.infer<typeof RegisterAgentSchema>;
 export type DiscoverAgentsInput = z.infer<typeof DiscoverAgentsSchema>;
 export type UnregisterAgentInput = z.infer<typeof UnregisterAgentSchema>;
+export type AbandonRegistrationInput = z.infer<typeof AbandonRegistrationSchema>;
 export type SpawnAgentInput = z.infer<typeof SpawnAgentSchema>;
 export type SendMessageInput = z.infer<typeof SendMessageSchema>;
 export type GetMessagesInput = z.infer<typeof GetMessagesSchema>;
@@ -915,6 +939,13 @@ export interface AgentRecord {
   token_lookup?: string | null;
   /** ADR-0003 (schema v20): lookup digest of the PREVIOUS token; populated only during rotation_grace (mirrors previous_token_hash). NULL otherwise. */
   previous_token_lookup?: string | null;
+  /** ADR-0005 (schema v22): ISO timestamp of the agent's FIRST successful token auth. NULL = NEVER authenticated = an orphan — the abandon_registration + orphan-GC keystone. */
+  first_authed_at?: string | null;
+  established_at?: string | null;
+  /** ADR-0005 (schema v22): bcrypt hash of the one-time, name-scoped registration-recovery handle (self-serve orphan cleanup). NULL after redemption / first auth. */
+  registration_recovery_hash?: string | null;
+  /** ADR-0005 (schema v22): TTL for the registration-recovery handle. */
+  registration_recovery_expires_at?: string | null;
   /** v2.1.6: ISO timestamp of the agent's current session start (last register_agent). NULL on rows registered before v2.1.6. */
   session_started_at?: string | null;
   /** v2.2.0: window title the agent's terminal was spawned with. Used by the dashboard's click-to-focus driver. NULL on rows spawned before v2.2.0 or rows that did not thread the value through the register call. */

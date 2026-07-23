@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData, setAgentLivenessAnchor, findAgentRowByToken } from "../db.js";
+import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData, setAgentLivenessAnchor, findAgentRowByToken, markAgentAuthenticated } from "../db.js";
 import type { SetStatusInput, HealthCheckInput, ReportLivenessInput } from "../types.js";
 import { VERSION } from "../version.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
@@ -218,6 +218,11 @@ function checkToken(token: string): TokenCheckResult {
     rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
   });
   if (result.ok) {
+    // ADR-0005 (codex #115): a valid-token health_check IS a successful token
+    // verification — stamp first_authed_at so an agent whose only interaction is
+    // health_check still self-excludes from the orphan-GC. This diagnostic path
+    // re-verifies and never touches the cache, so it must stamp explicitly.
+    if (!result.legacy) markAgentAuthenticated(auth.name);
     return { auth_error: false, agent_name: auth.name, auth_state: state };
   }
   return {
