@@ -120,6 +120,29 @@ export function fallbackObservedMissedDelivery(
   return before !== null && after !== null && after > before;
 }
 
+/**
+ * The fallback tick, extracted so tests exercise the REAL closure rather than
+ * a re-implementation of it. The predicate above is trivially correct; what
+ * can silently break is THIS wiring — `before` must be captured BEFORE the
+ * tick's own check(), or the comparison is post-state against itself and the
+ * degraded announcement can never fire again. That ordering lives here and
+ * only here, so the call-shape controls in
+ * tests/marker-evidence-negative-controls.test.ts drive this exact function.
+ */
+export function makeFallbackTick(deps: {
+  readPrevUnread: () => number | null;
+  check: () => void;
+  onMissedDelivery: () => void;
+}): () => void {
+  return () => {
+    const before = deps.readPrevUnread();
+    deps.check();
+    if (fallbackObservedMissedDelivery(before, deps.readPrevUnread())) {
+      deps.onMissedDelivery();
+    }
+  };
+}
+
 /** Emit the wake signal: a single stdout line a harness Monitor can consume. */
 function emitWake(
   agent: string,
@@ -369,17 +392,20 @@ export async function run(argv: string[]): Promise<number> {
       }
     }
     const FALLBACK_MS = 30_000; // marker-miss safety net
-    timer = setInterval(() => {
-      const before = prevUnread;
-      check();
-      // New mail that the marker watcher never told us about: the marker did
-      // not fire for a message that definitely landed. Prove-by-behaviour that
-      // we are degraded, then stop pretending the 30s net is a wake path.
-      if (fallbackObservedMissedDelivery(before, prevUnread)) {
-        announceDegraded("new mail was detected by the fallback poll, not by a marker event");
-        tightenToPolling();
-      }
-    }, FALLBACK_MS);
+    // New mail that the marker watcher never told us about: the marker did
+    // not fire for a message that definitely landed. Prove-by-behaviour that
+    // we are degraded, then stop pretending the 30s net is a wake path.
+    timer = setInterval(
+      makeFallbackTick({
+        readPrevUnread: () => prevUnread,
+        check,
+        onMissedDelivery: () => {
+          announceDegraded("new mail was detected by the fallback poll, not by a marker event");
+          tightenToPolling();
+        },
+      }),
+      FALLBACK_MS,
+    );
   } else {
     // No markers → bounded polling of the cheap primitive.
     timer = setInterval(check, args.intervalMs);

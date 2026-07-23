@@ -31,7 +31,7 @@
  * construction, a delivery no callback observed.
  */
 import { describe, it, expect } from "vitest";
-import { fallbackObservedMissedDelivery } from "../src/cli/watch.js";
+import { fallbackObservedMissedDelivery, makeFallbackTick } from "../src/cli/watch.js";
 
 describe("the fallback poll discovering new mail IS the degradation", () => {
   it("a rise across the fallback's own check() means the marker missed it", () => {
@@ -93,5 +93,71 @@ describe("DEFECT 3 — a good marker must not mask a later unmarked delivery", (
     ]) {
       expect(fallbackObservedMissedDelivery(before, after)).toBe(true);
     }
+  });
+});
+
+describe("CALL SHAPE — the real fallback tick, not a re-implementation of it", () => {
+  // The predicate is trivially correct; all three historical defects lived in
+  // the WIRING. These controls drive makeFallbackTick — the exact closure
+  // setInterval runs in production — so a wiring regression fails here instead
+  // of surviving behind a green predicate suite (the #123 lesson: tests that
+  // exercise the convenient shape rather than the real call shape miss the
+  // real call site's bug).
+
+  /** Codex's repro as world-state: A marked+observed, writer dies, B unmarked. */
+  function codexScenario() {
+    let unread = 1; // message A, already observed by its own marker callback
+    let prev: number | null = 1;
+    let fired = 0;
+    return {
+      deps: {
+        readPrevUnread: () => prev,
+        check: () => {
+          prev = unread; // real check(): reads the DB, advances the baseline
+        },
+        onMissedDelivery: () => {
+          fired++;
+        },
+      },
+      deliverUnmarked: () => {
+        unread += 1; // lands in the DB; no marker, so no callback observes it
+      },
+      fired: () => fired,
+    };
+  }
+
+  it("codex's repro through the REAL tick: the unmarked delivery is announced", () => {
+    const world = codexScenario();
+    const tick = makeFallbackTick(world.deps);
+    world.deliverUnmarked(); // message B, same window, no marker
+    tick();
+    expect(world.fired()).toBe(1);
+  });
+
+  it("healthy path through the REAL tick: callback observed everything → silent", () => {
+    const world = codexScenario();
+    const tick = makeFallbackTick(world.deps);
+    tick(); // nothing new since the callback's own check()
+    expect(world.fired()).toBe(0);
+  });
+
+  it("ORDER control: a tick that checks BEFORE capturing the baseline is blind forever", () => {
+    // The plausible one-line refactor mistake: swap check() ahead of the
+    // baseline capture. Built here deliberately to prove these controls can
+    // tell the difference — the swapped tick stays silent on the exact
+    // scenario the real tick announces. If someone swaps the real wiring,
+    // the first test in this block fails; this one documents the failure
+    // mode that makes that assertion load-bearing.
+    const world = codexScenario();
+    const swappedTick = (): void => {
+      world.deps.check();
+      const before = world.deps.readPrevUnread(); // too late — already advanced
+      if (fallbackObservedMissedDelivery(before, world.deps.readPrevUnread())) {
+        world.deps.onMissedDelivery();
+      }
+    };
+    world.deliverUnmarked();
+    swappedTick();
+    expect(world.fired()).toBe(0); // the defect: a missed delivery, silently absorbed
   });
 });
