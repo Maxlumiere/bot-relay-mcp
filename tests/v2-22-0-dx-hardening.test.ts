@@ -27,7 +27,7 @@ const {
   getDb,
   registerAgent,
   abandonRegistration,
-  gcOrphanRegistrations,
+  purgeOldRecords,
   resolveAgentByToken,
   getAgentAuthData,
 } = await import("../src/db.js");
@@ -149,7 +149,7 @@ describe("ADR-0005 #4 — handle can't be forged / replayed / mis-scoped", () =>
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-describe("ADR-0005 #4 — auto orphan GC (same keystone)", () => {
+describe("ADR-0005 FINAL — the purge tick reaps NO agent row (auto-GC cut by ruling)", () => {
   function makeOrphan(name: string, opts: { authed?: boolean; sessionNull?: boolean; oldCreate?: boolean }) {
     const { token } = reg(name);
     if (opts.authed) authOnce(token);
@@ -158,14 +158,17 @@ describe("ADR-0005 #4 — auto orphan GC (same keystone)", () => {
     if (opts.oldCreate) db.prepare("UPDATE agents SET created_at = ? WHERE name = ?").run(new Date(Date.now() - 60 * 60 * 1000).toISOString(), name);
   }
 
-  it("removes ONLY never-authed + session-less + old rows", () => {
-    makeOrphan("gc-orphan", { sessionNull: true, oldCreate: true }); // → removed
-    makeOrphan("gc-authed", { authed: true, sessionNull: true, oldCreate: true }); // authed → kept (keystone)
-    makeOrphan("gc-session", { sessionNull: false, oldCreate: true }); // has session → kept
-    makeOrphan("gc-recent", { sessionNull: true, oldCreate: false }); // recent → kept
-    const removed = gcOrphanRegistrations(getDb());
-    expect(removed).toBe(1);
-    expect(getAgentAuthData("gc-orphan")).toBeNull();
+  it("EVERY shape survives — including the exact never-authed + session-less + old row the GC used to reap", () => {
+    // Abandonment is undecidable from row state: this "true orphan" shape is
+    // byte-identical to a slow-spawned child or an idle recovered agent. The
+    // ruling: no irreversible action on an undecidable predicate. If someone
+    // reintroduces a reaper on the purge tick, the first assertion fails.
+    makeOrphan("gc-orphan", { sessionNull: true, oldCreate: true }); // the old reap target
+    makeOrphan("gc-authed", { authed: true, sessionNull: true, oldCreate: true });
+    makeOrphan("gc-session", { sessionNull: false, oldCreate: true });
+    makeOrphan("gc-recent", { sessionNull: true, oldCreate: false });
+    purgeOldRecords(getDb());
+    expect(getAgentAuthData("gc-orphan")).not.toBeNull();
     expect(getAgentAuthData("gc-authed")).not.toBeNull();
     expect(getAgentAuthData("gc-session")).not.toBeNull();
     expect(getAgentAuthData("gc-recent")).not.toBeNull();
@@ -237,9 +240,10 @@ describe("ADR-0005 — v22 migration backfills pre-existing rows (no false-reap 
     // And its (re-added) recovery handle is NULL — a pre-v22 row was never an orphan.
     expect(row!.registration_recovery_hash ?? null).toBeNull();
 
-    // Keystone consequence: the GC can NEVER reap it, even session-less + old.
+    // Post-ruling: nothing on the purge tick reaps ANY row, established or not —
+    // but the stamp still matters (abandon_registration must refuse this row).
     db.exec("UPDATE agents SET session_id = NULL WHERE name = 'pre22'");
-    gcOrphanRegistrations(db);
+    purgeOldRecords(db);
     expect(getAgentAuthData("pre22")).not.toBeNull();
   });
 

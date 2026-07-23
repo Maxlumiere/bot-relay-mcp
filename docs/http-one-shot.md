@@ -56,7 +56,7 @@ curl -s "$BASE/mcp" -H 'Content-Type: application/json' -H 'Accept: application/
        \"arguments\":{\"name\":\"my-script\",\"recovery_handle\":\"$HANDLE\"}}}"
 ```
 
-Lost both the token *and* the handle? Orphans (never-authed, session-less) are **auto-removed after ~30 minutes** — no action needed. (A *live* agent that lost its token is not an orphan; use `rotate_token` or `relay recover`.)
+Lost both the token *and* the handle? The row simply **persists, harmlessly** — it is session-less, never authenticated, and blocks nothing. There is deliberately **no automatic cleanup**: abandonment cannot be decided from row state (a slow-starting agent looks identical), so nothing deletes a registration without a principal asking. Reclaim the name whenever you like via a fresh `register_agent` (`force`), `unregister_agent`, or `relay recover`. (A *live* agent that lost its token is not an orphan; use `rotate_token` or `relay recover`.)
 
 ---
 

@@ -20,7 +20,7 @@ delete process.env.RELAY_AGENT_NAME;
 delete process.env.RELAY_ORPHAN_TTL_MINUTES;
 process.env.RELAY_SQLITE_DRIVER = "wasm";
 
-const { initializeDb, closeDb, getDb, registerAgent, abandonRegistration, gcOrphanRegistrations, resolveAgentByToken, getAgentAuthData } =
+const { initializeDb, closeDb, getDb, registerAgent, abandonRegistration, purgeOldRecords, resolveAgentByToken, getAgentAuthData } =
   await import("../src/db.js");
 
 function cleanup() {
@@ -51,10 +51,10 @@ describe("wasm driver — ADR-0005 parity", () => {
     expect(getAgentAuthData("w-live")).not.toBeNull();
   });
 
-  it("auto-GC removes never-authed + session-less + old rows only", () => {
+  it("no auto-GC on the wasm driver either: the old reap-target shape survives the purge tick", () => {
     registerAgent("w-gc", "worker", []);
     getDb().prepare("UPDATE agents SET session_id = NULL, created_at = ? WHERE name = ?").run(new Date(Date.now() - 3600_000).toISOString(), "w-gc");
-    expect(gcOrphanRegistrations(getDb())).toBe(1);
-    expect(getAgentAuthData("w-gc")).toBeNull();
+    purgeOldRecords(getDb());
+    expect(getAgentAuthData("w-gc")).not.toBeNull();
   });
 });

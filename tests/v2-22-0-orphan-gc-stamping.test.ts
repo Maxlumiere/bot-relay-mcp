@@ -35,7 +35,7 @@ delete process.env.RELAY_AGENT_CAPABILITIES;
 delete process.env.RELAY_ALLOW_LEGACY;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { closeDb, getDb, getAgentAuthData, gcOrphanRegistrations } = await import("../src/db.js");
+const { closeDb, getDb, getAgentAuthData, purgeOldRecords } = await import("../src/db.js");
 
 let server: HttpServer;
 let baseUrl: string;
@@ -112,24 +112,24 @@ describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller 
     expect(getAgentAuthData("gc-reader")!.first_authed_at).not.toBeNull();
   });
 
-  it("a fully-authed agent is NEVER reaped by the orphan-GC — even session-less + old", async () => {
-    // gc-orch authenticated above → first_authed_at set. Now push it into the
-    // exact shape the GC scans for (session lost + older than the TTL).
+  it("a fully-authed agent survives the purge tick — even session-less + old", async () => {
+    // gc-orch authenticated above → first_authed_at set. Push it into the
+    // shape the retired GC used to scan for (session lost + older than TTL).
     makeSessionlessAndOld("gc-orch");
-    const removed = gcOrphanRegistrations(getDb());
-    // It must survive: the keystone (first_authed_at NOT NULL) excludes it.
+    purgeOldRecords(getDb());
     expect(getAgentAuthData("gc-orch")).not.toBeNull();
-    // Sanity: the GC didn't just no-op globally — it can still reap a TRUE orphan.
-    expect(typeof removed).toBe("number");
   });
 
-  it("CONTRAST: a never-authed orphan (session-less + old) IS reaped", async () => {
+  it("ADR-0005 FINAL: a never-authed orphan (session-less + old) ALSO survives — nothing reaps without a principal asking", async () => {
+    // This test used to assert the opposite (the GC reaped this row). The
+    // ruling inverted it: this shape is byte-identical to a slow-spawned
+    // child or an idle recovered agent, so no automatic deletion may key on
+    // it. If a reaper returns to the purge tick, this fails first.
     await register("gc-true-orphan"); // registered, never authenticated
     expect(getAgentAuthData("gc-true-orphan")!.first_authed_at).toBeNull();
     makeSessionlessAndOld("gc-true-orphan");
-    const removed = gcOrphanRegistrations(getDb());
-    expect(removed).toBeGreaterThanOrEqual(1);
-    expect(getAgentAuthData("gc-true-orphan")).toBeNull();
+    purgeOldRecords(getDb());
+    expect(getAgentAuthData("gc-true-orphan")).not.toBeNull();
   });
 
   it("BLOCKER a (codex #115): a force re-register that RE-AUTHENTICATES stamps first_authed_at → GC can't reap it", async () => {
@@ -147,10 +147,11 @@ describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller 
     expect(JSON.parse(reReg.result.content[0].text).success).toBe(true);
     // The re-auth MUST have stamped first_authed_at (this is the fix).
     expect(getAgentAuthData("reauth-a")!.first_authed_at).not.toBeNull();
-    // codex's exact shape: null session + age past TTL → the agent must SURVIVE
-    // the GC (without the stamp above, this row is deleted — the negative control).
+    // codex's exact shape: null session + age past TTL. Post-ruling the purge
+    // tick reaps nothing regardless, but the stamp assertion above remains the
+    // load-bearing check — establishment must be recorded at every auth path.
     makeSessionlessAndOld("reauth-a");
-    gcOrphanRegistrations(getDb());
+    purgeOldRecords(getDb());
     expect(getAgentAuthData("reauth-a")).not.toBeNull();
   });
 

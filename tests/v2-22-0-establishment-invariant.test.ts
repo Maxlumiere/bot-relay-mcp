@@ -53,7 +53,7 @@ delete process.env.RELAY_AGENT_NAME;
 delete process.env.RELAY_ORPHAN_TTL_MINUTES;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { closeDb, getDb, getAgentAuthData, gcOrphanRegistrations, resolveAgentByToken } = await import("../src/db.js");
+const { closeDb, getDb, getAgentAuthData, purgeOldRecords, resolveAgentByToken } = await import("../src/db.js");
 const { hashToken } = await import("../src/auth.js");
 const { handleSpawnAgent } = await import("../src/tools/spawn.js");
 
@@ -181,8 +181,9 @@ describe("ADR-0005 — codex #115 recovery blocker: exact 6-step repro (must col
     expect(established("rec-repro")).not.toBeNull();
     // 5. recovered terminal ends normally → session_id NULL
     getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = ?").run("rec-repro");
-    // 6. GC → the recovered row is a legitimate identity → NOT reaped (was: reaped)
-    gcOrphanRegistrations(getDb());
+    // 6. purge tick → the recovered row is a legitimate identity → NOT reaped
+    //    (was: reaped by the retired GC; the tick now deletes no agent row at all)
+    purgeOldRecords(getDb());
     expect(getAgentAuthData("rec-repro")).not.toBeNull();
   });
 
@@ -195,7 +196,7 @@ describe("ADR-0005 — codex #115 recovery blocker: exact 6-step repro (must col
     const res = await handleSpawnAgent({ name: "spawn-repro", role: "worker", capabilities: [] } as any);
     expect(JSON.parse(res.content[0].text).success).toBe(true);
     getDb().prepare("UPDATE agents SET session_id = NULL, created_at = ? WHERE name = ?").run(new Date(Date.now() - 3600_000).toISOString(), "spawn-repro");
-    gcOrphanRegistrations(getDb());
-    expect(getAgentAuthData("spawn-repro")).not.toBeNull(); // established at provisioning → survives
+    purgeOldRecords(getDb());
+    expect(getAgentAuthData("spawn-repro")).not.toBeNull(); // established at provisioning; and the tick reaps nothing anyway
   });
 });

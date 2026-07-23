@@ -1957,7 +1957,8 @@ function verifiedTokenCachePut(
   // first_authed_at IS NULL). Cache HITS return before reaching here, so the
   // 2.20.1 hot path is untouched. This is the security keystone: any agent that
   // has authed ≥1x has a non-NULL first_authed_at → it self-excludes from
-  // abandon_registration + the orphan GC.
+  // abandon_registration (the sole orphan-deletion path; the auto-GC was cut
+  // by final ruling — see the comment above REAPABLE_ORPHAN_WHERE).
   markAgentAuthenticated(name);
   if (indexed) {
     authCacheSet(digest, { name, capabilities }, gen, authCacheExpiry(now, graceExpiry));
@@ -2016,17 +2017,25 @@ function orphanTtlMs(): number {
  * ADR-0005 — THE reapability invariant, defined ONCE. A row is a reapable orphan
  * ONLY when it has NEVER become a legitimate identity (`established_at IS NULL` —
  * no token auth AND no recovery completion) AND has no live session (`session_id
- * IS NULL`). BOTH deletion paths — the auto-GC and abandon_registration — delete
- * THROUGH `deleteReapableOrphan`, so neither can silently omit a predicate: the
- * safe-by-construction guarantee is physical, not a WHERE clause each call site
+ * IS NULL`). The sole deletion path — abandon_registration — deletes THROUGH
+ * `deleteReapableOrphan`, so it cannot silently omit a predicate: the
+ * safe-by-construction guarantee is physical, not a WHERE clause the call site
  * restates from memory. (codex #115 blockers a+b were two independent omissions
  * of this exact shape; the recovery blocker moved the invariant from the
  * token-auth proxy first_authed_at onto the establishment marker established_at.)
+ *
+ * NOTE the invariant is an AUTHORIZATION CHECK, not an abandonment detector:
+ * it can prove a row is safe to delete when a principal ASKS (never
+ * established + no session ⇒ deleting cannot break a working identity), but
+ * it cannot prove the row is abandoned — that predicate is undecidable from
+ * row state, which is why the automatic GC was cut (see the ruling below).
  */
 const REAPABLE_ORPHAN_WHERE = "established_at IS NULL AND session_id IS NULL";
 
 /**
- * The ONLY sanctioned way to delete an agent row on the orphan-cleanup path.
+ * The ONLY sanctioned way to delete an agent row on the orphan-cleanup path,
+ * and abandon_registration is its ONLY caller — an agent-row deletion always
+ * traces back to a principal proving a one-time handle and asking.
  * Carries the canonical predicate + re-asserts it in the DELETE WHERE (TOCTOU:
  * a row that authenticates or acquires a session between check and delete is
  * left intact). Deleting an agent invalidates its token, so it bumps the auth
@@ -2084,7 +2093,7 @@ export function abandonRegistration(name: string, handle: string): { abandoned: 
     row.registration_recovery_expires_at &&
     Date.now() >= new Date(row.registration_recovery_expires_at).getTime()
   ) {
-    return { abandoned: false, reason: "registration-recovery handle expired (the orphan GC will clean it up)" };
+    return { abandoned: false, reason: "registration-recovery handle expired. The row persists harmlessly; reclaim the name via register (fresh) or `relay recover`." };
   }
   if (!verifyToken(handle, row.registration_recovery_hash)) {
     return { abandoned: false, reason: "invalid registration-recovery handle" };
@@ -2097,26 +2106,20 @@ export function abandonRegistration(name: string, handle: string): { abandoned: 
   return { abandoned: false, reason: "agent authenticated or acquired a session concurrently — not abandoned" };
 }
 
-/**
- * ADR-0005 — automatic orphan garbage collection (runs on the purge tick).
- * Removes never-authed + session-less rows older than the TTL — the same
- * keystone (`first_authed_at IS NULL`) so it can NEVER remove a working agent.
- * The deterministic safety net that decouples orphan cleanup from reliable
- * token capture (retires /api/kill-agent for self-cleanup). Returns the count.
- */
-export function gcOrphanRegistrations(db: CompatDatabase): number {
-  const cutoff = new Date(Date.now() - orphanTtlMs()).toISOString();
-  // Candidate scan + per-row delete BOTH use the one canonical predicate — the
-  // GC cannot drift from abandon_registration's notion of "reapable orphan".
-  const orphans = db
-    .prepare(`SELECT name FROM agents WHERE ${REAPABLE_ORPHAN_WHERE} AND created_at < ?`)
-    .all(cutoff) as Array<{ name: string }>;
-  let removed = 0;
-  for (const o of orphans) {
-    if (deleteReapableOrphan(db, o.name)) removed++;
-  }
-  return removed;
-}
+// ADR-0005 FINAL RULING (Maxime, 2026-07-23) — there is NO automatic orphan GC,
+// and one must not be reintroduced. Abandonment is UNDECIDABLE from row state:
+// a slow-spawned child, an idle recovered agent, and a genuinely abandoned
+// registration are byte-identical in the data. Five audit rounds each found a
+// different legitimate identity being reaped (force re-registration, live-
+// session abandon, credential recovery, spawn provisioning, operator CLI token
+// rotation) — every fix was correct and the bug simply relocated, because the
+// predicate itself cannot be decided by observation. THE RULE: do not attach an
+// irreversible action to a predicate that cannot be decided by observation.
+// Un-abandoned rows persist harmlessly: they are session-less, never
+// established, and the name stays reclaimable via unregister_agent or
+// `relay recover`. The only deletion on this path is abandon_registration —
+// a principal proving a one-time handle and ASKING. Regression:
+// tests/v2-22-0-no-auto-gc.test.ts proves the GC is gone, not disabled.
 
 /**
  * ADR-0003 — O(1) token-only caller resolution (server.ts resolveCallerByToken).
@@ -2228,9 +2231,10 @@ export function purgeOldRecords(db: CompatDatabase): void {
   db.prepare("DELETE FROM messages WHERE created_at < ?").run(sevenDaysAgo);
   db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'rejected', 'cancelled') AND updated_at < ?").run(thirtyDaysAgo);
   db.prepare("DELETE FROM webhook_delivery_log WHERE attempted_at < ?").run(sevenDaysAgo);
-  // ADR-0005: automatic orphan GC — never-authed + session-less rows past the
-  // TTL (safe-by-keystone; can never touch a working agent).
-  gcOrphanRegistrations(db);
+  // ADR-0005 final ruling: NO automatic orphan GC here — deliberately. Agent
+  // rows are identities, not records with a retention window; abandonment is
+  // undecidable from row state, so nothing on this tick may delete one. See
+  // the ruling comment above abandonRegistration's invariant block.
   // v2.7 / Tether Phase 3 — outbox cleanup. Match the messages purge
   // window by default (7 days). Configurable via RELAY_OUTBOX_RETENTION_DAYS
   // for operators who want a longer audit trail; set to 0 to disable.
