@@ -26,12 +26,12 @@ When `transport=stdio`, `bot-relay-mcp` checks whether stdin is a TTY. Running `
 
 If `transport=stdio` and stdin is not a TTY, the relay waits on an **event**, not a duration:
 
-- **stdin becomes readable** → a client is there. Treat as a legitimate MCP client (Claude Code, Cursor, Cline, …), cancel the guard, unshift the bytes back so the MCP transport reads the full frame, and proceed.
+- **stdin becomes readable** → a client is there. Treat as a legitimate MCP client (Claude Code, Cursor, Cline, …), cancel the guard, and proceed.
 - **stdin reaches `end` (EOF)** → nobody is ever coming. Exit with code 3 and a helpful error message pointing to the three usual fixes (set `RELAY_TRANSPORT=http`, run with `--transport=http --port=3777`, or attach a real TTY).
 
 There is **no time limit and no window to tune.** A client that takes ten seconds to send its first frame is still a client, and the guard waits for it.
 
-The received bytes are preserved via `process.stdin.unshift(chunk)`, so the MCP SDK's stdio transport downstream reads the JSON-RPC frame unchanged.
+The received bytes are preserved via a `PassThrough` proxy: `process.stdin` is piped into the proxy, the guard watches the proxy's `readable` event without consuming anything, and the same proxy is handed to the MCP SDK's stdio transport — so the SDK reads the JSON-RPC frame unchanged from the stream that already buffered it. (An earlier shape used `process.stdin.unshift(chunk)` to "give the bytes back"; a Codex repro proved that drops the first frame, so it was retired.)
 
 ### Configuration
 
