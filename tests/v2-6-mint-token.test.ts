@@ -285,7 +285,7 @@ describe("v2.6 — relay mint-token CLI", () => {
     const r = runMint([]);
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/missing <name>/);
-    expect(r.stdout).toMatch(/Usage: relay mint-token/);
+    expect(r.stderr).toMatch(/Usage: relay mint-token/);
   });
 
   // v2.6 R1 — codex audit P2 #2 regression. The daemon-running advisory

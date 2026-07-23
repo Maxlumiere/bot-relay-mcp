@@ -82,10 +82,13 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
     }
   });
 
-  it("(2) `relay` with no args prints help + exits 0", () => {
+  it("(2) `relay` with no args prints help to STDERR + exits NON-ZERO", () => {
     const r = runRelay([]);
-    expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/Usage: relay/);
+    // CONTRACT CHANGE (deliberate): no-args is an ERROR, not a help request.
+    // Exiting 0 while writing usage to stdout let a failed $(relay ...) capture
+    // look like success AND yield a plausible value. Both halves are fixed.
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/Usage: relay/);
   });
 
   it("(3) unknown subcommand → non-zero exit + help", () => {

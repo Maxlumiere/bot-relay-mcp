@@ -67,8 +67,13 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function usage(): void {
-  process.stdout.write(
+function usage(requested = false): void {
+  // STREAM DISCIPLINE: usage is diagnostic on the ERROR path, so it goes to
+  // STDERR. On stdout it poisoned command substitutions — a failed
+  // $(relay mint-token ... --json) captured the help text and the agent
+  // launched with a garbage token that LOOKED like a value. `requested`
+  // (an explicit --help) is the one case where the text IS the data.
+  (requested ? process.stdout : process.stderr).write(
     "Usage: relay watch <agent> [--interval SECONDS] [--once] [--json]\n\n" +
       "Sentinel — autowake for a terminal agent NOT in VS Code/Tether. Watches\n" +
       "<agent>'s inbox and prints a wake line when new mail arrives, so a harness\n" +
@@ -172,7 +177,7 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   if (args.help) {
-    usage();
+    usage(true);
     return 0;
   }
   if (!args.agent) {
