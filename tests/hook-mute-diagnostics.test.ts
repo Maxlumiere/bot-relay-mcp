@@ -171,6 +171,60 @@ describe("the detector must announce its OWN death", () => {
   });
 });
 
+describe("codex round 2 — the detector must not be silently bypassable", () => {
+  it("HIGH: a deeply nested but VALID config still produces a verdict, never silence", () => {
+    // codex's repro: 12k nested wrappers around a canonical entry with a dead
+    // path. JSON.parse succeeded, the RECURSIVE walk overflowed the stack, and
+    // a broad catch turned that RangeError into a successful zero-output run —
+    // no mute warning, no self-check failure, nothing. Traversal is now
+    // iterative, so this resolves properly rather than merely failing loudly.
+    // Built as a string: generating it with a recursive encoder overflows too.
+    const N = 12000;
+    const inner = JSON.stringify({
+      mcpServers: {
+        "bot-relay": { type: "stdio", command: "node", args: ["/nonexistent/bot-relay-mcp/dist/index.js"] },
+      },
+    });
+    fs.writeFileSync(
+      path.join(home, ".claude.json"),
+      '{"x":'.repeat(N) + inner + "}".repeat(N),
+    );
+
+    const out = runHook({ RELAY_DB_PATH: instanceDb() });
+
+    // Either verdict is acceptable; SILENCE is not. That is the whole contract.
+    expect(out === "" || (!out.includes("RELAY MUTE") && !out.includes("SELF-CHECK FAILED"))).toBe(false);
+    // With an iterative walk it should find the entry and give the real answer.
+    expect(out).toContain("RELAY MUTE");
+  });
+
+  it("MED: a detector that writes stdout then FAILS must not produce a mute verdict", () => {
+    // codex's repro: a node stub that prints a plausible path and exits 23.
+    // The hook previously emitted BOTH "UNVERIFIED" and a definitive "you are
+    // mute" — the second built entirely on untrusted partial output. When the
+    // detector failed, UNVERIFIED is the only honest verdict.
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-fakebin2-"));
+    const fakeNode = path.join(binDir, "node");
+    fs.writeFileSync(fakeNode, '#!/bin/sh\nprintf "/untrusted/index.js"\nexit 23\n');
+    fs.chmodSync(fakeNode, 0o755);
+
+    writeConfig({ mcpServers: { "bot-relay": { type: "http", url: "http://127.0.0.1:3777/mcp" } } });
+    const out = runHook({
+      RELAY_DB_PATH: instanceDb(),
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    });
+
+    try {
+      expect(out).toContain("MUTE SELF-CHECK FAILED TO RUN");
+      // The contradictory second banner must be gone.
+      expect(out).not.toContain("NO RELAY TOOLS THIS SESSION");
+      expect(out).not.toContain("/untrusted/index.js");
+    } finally {
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("the diagnostics must never break the hook they ride on", () => {
   const shapes: Array<[string, () => void]> = [
     ["config absent", () => { /* no file at all */ }],

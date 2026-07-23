@@ -247,9 +247,21 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
   # worse than none, because its quiet reads as "all clear".
   RELAY_DIAG_ERR=$(mktemp -t relay-diag 2>/dev/null || echo "/tmp/relay-diag.$$")
   RELAY_MUTE_PATH=$(node -e '
+    const fs = require("fs");
+
+    // PARSE is allowed to fail quietly: a malformed or unreadable config is a
+    // legitimate "cannot judge", not a detector fault, and must not nag.
+    // TRAVERSAL is NOT — codex found that a valid but deeply nested config
+    // (12k wrappers) overflows the stack, and a broad catch turned that
+    // RangeError into a successful zero-output run: no mute warning, no
+    // self-check failure, complete silence. So the two are separated, and
+    // anything unexpected below is rethrown to become a non-zero exit.
+    let c = null;
     try {
-      const fs = require("fs");
-      const c = JSON.parse(fs.readFileSync(process.env.HOME + "/.claude.json", "utf8"));
+      c = JSON.parse(fs.readFileSync(process.env.HOME + "/.claude.json", "utf8"));
+    } catch (e) { c = null; }
+
+    if (c !== null) {
 
       // Identify the CANONICAL bot-relay entry, not anything merely relay-NAMED.
       // Matching /relay/i on the key falsely accused an unrelated stale server
@@ -264,19 +276,30 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
         return args.some(a => typeof a === "string" && /bot-relay-mcp\/dist\/index\.js$/.test(a));
       };
 
+      // ITERATIVE traversal with an explicit stack. A recursive walk overflows
+      // on a deeply nested config, and an overflow here is indistinguishable
+      // from "nothing wrong" — codex reproduced exactly that with 12k wrappers.
+      // Depth is bounded as defence-in-depth; hitting the bound is reported as
+      // a detector failure rather than silently truncating the search.
       const candidates = [];
-      const walk = (o) => {
-        if (!o || typeof o !== "object") return;
-        if (o.mcpServers) {
+      const MAX_NODES = 200000;
+      let visited = 0;
+      const stack = [c];
+      while (stack.length > 0) {
+        const o = stack.pop();
+        if (!o || typeof o !== "object") continue;
+        if (++visited > MAX_NODES) {
+          throw new Error("relay mute scan aborted: config exceeds " + MAX_NODES + " nodes");
+        }
+        if (o.mcpServers && typeof o.mcpServers === "object") {
           for (const [k, v] of Object.entries(o.mcpServers)) {
             if (isCanonical(k, v)) candidates.push(v);
           }
         }
         for (const [k, v] of Object.entries(o)) {
-          if (k !== "mcpServers" && v && typeof v === "object") walk(v);
+          if (k !== "mcpServers" && v && typeof v === "object") stack.push(v);
         }
-      };
-      walk(c);
+      }
 
       // An HTTP/SSE entry has no filesystem path to rot, so it is healthy by
       // construction here. A stdio entry is healthy iff its script exists.
@@ -298,7 +321,7 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
           ? ""
           : (candidates.map(pathOf).filter(Boolean)[0] || "");
       process.stdout.write(broken);
-    } catch (e) { /* never break the hook on a config we cannot read */ }
+    }
   ' 2>"$RELAY_DIAG_ERR")
   RELAY_DIAG_RC=$?
   if [ "$RELAY_DIAG_RC" -ne 0 ]; then
@@ -311,6 +334,12 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
       RELAY_DIAG_MSG=$(head -c 400 "$RELAY_DIAG_ERR" 2>/dev/null | tr '\n' ' ')
       [ -n "${RELAY_DIAG_MSG:-}" ] && echo "[RELAY]   $RELAY_DIAG_MSG"
     } | tee /dev/stderr
+    # DISCARD the partial stdout of a detector that failed. A process can write
+    # a plausible-looking path AND THEN die; trusting that byte stream produced
+    # two contradictory definitive banners at once — UNVERIFIED and "you are
+    # mute" — off untrusted output (codex MED). When the detector failed, the
+    # only honest verdict is UNVERIFIED, so the mute branch must not run.
+    RELAY_MUTE_PATH=""
   fi
   rm -f "$RELAY_DIAG_ERR" 2>/dev/null
   if [ -n "${RELAY_MUTE_PATH:-}" ]; then
