@@ -199,7 +199,10 @@ DB_PATH="$RESOLVED_DB_PATH"
 # Written to STDOUT deliberately: SessionStart hook stdout is injected into the
 # session as context, so the agent itself reads the warning and can refuse to
 # proceed as connected. A copy goes to stderr for the operator's terminal.
-RELAY_ROOT="${HOME}/.bot-relay"
+# RELAY_HOME mirrors botRelayRoot() in src/instance.ts — the hook and the server
+# must agree on where the namespace lives or their diagnostics will contradict
+# each other (codex HIGH: hardcoding $HOME/.bot-relay diverged from the server).
+RELAY_ROOT="${RELAY_HOME:-${HOME}/.bot-relay}"
 RELAY_LEGACY_DB="${RELAY_ROOT}/relay.db"
 RELAY_INSTANCES_DIR="${RELAY_ROOT}/instances"
 
@@ -209,7 +212,13 @@ if [ -d "$RELAY_INSTANCES_DIR" ]; then
 fi
 
 # HARM 2 — the contradiction: instances exist, yet we resolved the flat legacy DB.
-if [ "${RELAY_INSTANCE_DIR_COUNT:-0}" -gt 0 ] && [ "$DB_PATH" = "$RELAY_LEGACY_DB" ]; then
+#
+# An explicit RELAY_DB_PATH is a DELIBERATE OPERATOR CHOICE and must never be
+# reported as a fault — assertInstanceResolution() already treats it that way,
+# and the two halves contradicting each other is worse than either being wrong
+# alone. Without this guard the hook tells a legitimate legacy-DB session that
+# it has lost its mail (codex HIGH).
+if [ -z "${RELAY_DB_PATH:-}" ] && [ "${RELAY_INSTANCE_DIR_COUNT:-0}" -gt 0 ] && [ "$DB_PATH" = "$RELAY_LEGACY_DB" ]; then
   RELAY_AVAILABLE_IDS=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
   {
     echo "[RELAY] *** WRONG INSTANCE — DO NOT PROCEED AS CONNECTED ***"
@@ -232,14 +241,26 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
     try {
       const fs = require("fs");
       const c = JSON.parse(fs.readFileSync(process.env.HOME + "/.claude.json", "utf8"));
-      let bad = "";
+
+      // Identify the CANONICAL bot-relay entry, not anything merely relay-NAMED.
+      // Matching /relay/i on the key falsely accused an unrelated stale server
+      // and told the agent to stop acting connected while a perfectly good relay
+      // entry existed (codex HIGH). A false "you are mute" is worse than no
+      // check at all, because the agent obeys it.
+      // Canonical = the key `relay init` writes ("bot-relay"), or a stdio entry
+      // whose command path is unmistakably this product.
+      const isCanonical = (k, v) => {
+        if (k === "bot-relay") return true;
+        const args = (v && Array.isArray(v.args)) ? v.args : [];
+        return args.some(a => typeof a === "string" && /bot-relay-mcp\/dist\/index\.js$/.test(a));
+      };
+
+      const candidates = [];
       const walk = (o) => {
         if (!o || typeof o !== "object") return;
         if (o.mcpServers) {
           for (const [k, v] of Object.entries(o.mcpServers)) {
-            if (!/relay/i.test(k)) continue;
-            const p = v && Array.isArray(v.args) ? v.args.find(a => /index\.js$/.test(a)) : null;
-            if (p && !fs.existsSync(p)) bad = p;
+            if (isCanonical(k, v)) candidates.push(v);
           }
         }
         for (const [k, v] of Object.entries(o)) {
@@ -247,7 +268,27 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
         }
       };
       walk(c);
-      process.stdout.write(bad);
+
+      // An HTTP/SSE entry has no filesystem path to rot, so it is healthy by
+      // construction here. A stdio entry is healthy iff its script exists.
+      const pathOf = (v) => (Array.isArray(v.args) ? v.args.find(a => /index\.js$/.test(a)) : null) || null;
+      const isHealthy = (v) => {
+        if (v && (v.type === "http" || v.type === "sse" || v.url)) return true;
+        const p = pathOf(v);
+        return p ? fs.existsSync(p) : true; // no resolvable path => cannot judge => do not accuse
+      };
+
+      // Only warn when EVERY canonical entry is broken. If any one of them works,
+      // this session has relay tools and must not be told otherwise.
+      // NOTE: computed as an expression, NOT with early `return` — a top-level
+      // return is an Illegal Return SyntaxError under `node -e`, and with the
+      // stderr redirect below it fails SILENTLY, disabling this whole check.
+      // That exact mistake shipped once and is why the positive control exists.
+      const broken =
+        (candidates.length === 0 || candidates.some(isHealthy))
+          ? ""
+          : (candidates.map(pathOf).filter(Boolean)[0] || "");
+      process.stdout.write(broken);
     } catch (e) { /* never break the hook on a config we cannot read */ }
   ' 2>/dev/null)
   if [ -n "${RELAY_MUTE_PATH:-}" ]; then
