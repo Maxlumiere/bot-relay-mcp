@@ -52,7 +52,44 @@
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
 import { broadcastInboxChange } from "./mcp-subscriptions.js";
+import { touchMarker } from "./filesystem-marker.js";
 import type { InboxChangedEvent } from "./inbox-events.js";
+
+/**
+ * SENTINEL MARKER OWNERSHIP — the tail is the SOLE writer of wake markers.
+ *
+ * Previously `sendMessage` (src/db.ts) touched the marker in-process. That was
+ * wrong, and the failure was invisible: `touchMarker` gates on
+ * `RELAY_FILESYSTEM_MARKERS` read from *whichever process executes the write*.
+ * The daemon sets it; a stdio MCP server does not. Same call site, same
+ * mailbox, same instance DB — but a message sent from an MCP peer silently
+ * skipped the marker while a `relay send` through the daemon wrote it. Watchers
+ * then fell back to polling and looked merely "slow" (measured: 12ms on the
+ * event path vs a 3s poll fingerprint).
+ *
+ * A per-process env check is not a bug you fix once — it returns every time
+ * someone adds an execution context. The tail is the only component that
+ * observes every commit cross-process, so it is the only place that can
+ * honestly claim to see all mail. It also removes the `from === 'system'`
+ * blind spot BY CONSTRUCTION: that branch never called `touchMarker` at all,
+ * and now it does not need to, because it writes `inbox_events` like every
+ * other producer.
+ *
+ * CONSEQUENCE, stated rather than buried: markers are now a DAEMON-PROVIDED
+ * service. A stdio-only deployment with no daemon has no marker writer, so
+ * watchers there poll. That is correct and honest — and the end-to-end marker
+ * assertion (the companion change) makes it *visible* instead of silent, which
+ * is the property that was actually missing.
+ *
+ * Kept as a single narrow seam so relocating the owner is a move, not a
+ * rewrite, if the ADR-0005 review prefers a different one.
+ */
+function writeWakeMarker(row: OutboxRow): void {
+  // `message_read` is the agent draining its OWN mailbox — waking on it would
+  // be a self-inflicted wake. Only genuine new-mail reasons signal.
+  if (row.reason !== "message_received" && row.reason !== "broadcast_received") return;
+  touchMarker(row.agent_name);
+}
 
 interface OutboxRow {
   id: number;
@@ -115,6 +152,18 @@ function tickOnce(): { rowsProcessed: number; hitLimit: boolean } {
   }
 
   for (const row of rows) {
+    // Marker FIRST, and in its own try/catch: it is a best-effort hint, so a
+    // marker failure must never cost the row its authoritative subscriber
+    // dispatch below. `touchMarker` already swallows its own IO errors; this
+    // guard is defence-in-depth against the tail halting on an unexpected throw.
+    try {
+      writeWakeMarker(row);
+    } catch (err: unknown) {
+      log.debug(
+        `[outbox-tail] marker write threw for row id=${row.id} ` +
+        `agent=${row.agent_name}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     try {
       broadcastInboxChange(row.agent_name, row.reason, row.id, "tail");
     } catch (err: unknown) {

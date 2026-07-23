@@ -34,7 +34,6 @@ import {
 } from "./sqlite-compat.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
-import { touchMarker } from "./filesystem-marker.js";
 import { resolveInstanceDbPath } from "./instance.js";
 import { emitInboxChanged } from "./inbox-events.js";
 import { validateSchemaDocument, validateResult, type SchemaCheck } from "./task-schema-validator.js";
@@ -3961,15 +3960,14 @@ export function sendMessage(
   });
   tx();
 
-  // v2.3.0 Part C.4 — touch the filesystem marker for the recipient so
-  // ambient-wake clients watching the marker path get a low-latency
-  // wake signal. Off by default (RELAY_FILESYSTEM_MARKERS=1 to enable).
-  // Never throws — pure hint.
-  try {
-    touchMarker(to);
-  } catch {
-    /* marker is best-effort */
-  }
+  // MARKER WRITE DELIBERATELY REMOVED — see src/outbox-tail.ts writeWakeMarker().
+  // This used to call touchMarker(to) in-process. That silently produced two
+  // behaviours from one call site: `touchMarker` gates on
+  // RELAY_FILESYSTEM_MARKERS read from the EXECUTING process, which the daemon
+  // sets and a stdio MCP server does not. Identical code, identical mailbox,
+  // and only the daemon-side send ever woke the recipient. The outbox tail now
+  // owns marker writes as the single component that observes every commit
+  // cross-process. Do NOT reintroduce a marker write here.
 
   // v2.5.0 Tether Phase 1 — Part S — MCP subscription fan-out for
   // relay://inbox/<to>. Emit AFTER the SQL commit + marker touch so
