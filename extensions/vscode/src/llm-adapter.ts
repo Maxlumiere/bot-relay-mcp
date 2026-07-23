@@ -206,7 +206,13 @@ export function adapterFor(
   opts?: { codex?: CodexAdapterOptions },
 ): LlmAdapter {
   const entry = entryFor(id);
-  const values = applyOpts(entry.wake, opts?.codex);
+  // GATED ON THE RESOLVED ENTRY, NOT ON WHAT THE CALLER PASSED. resolveWakeAdapter()
+  // always builds a populated `codex` block (it cannot know the llm before calling
+  // us), so applying it unconditionally handed the CODEX instruction to every
+  // claude-configured agent — they got 'Relay mail arrived — call get_messages(
+  // agent_name="…")' instead of the bare `inbox` their profile specifies. The
+  // tuning is Codex's; a profile must never be reshaped by another profile's options.
+  const values = applyOpts(entry.wake, entry.id === "codex" ? opts?.codex : undefined);
   return {
     id: entry.id,
     wakeWord: entry.wakeWord,
