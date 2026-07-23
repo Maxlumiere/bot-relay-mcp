@@ -131,4 +131,51 @@ describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller 
     expect(removed).toBeGreaterThanOrEqual(1);
     expect(getAgentAuthData("gc-true-orphan")).toBeNull();
   });
+
+  it("BLOCKER a (codex #115): a force re-register that RE-AUTHENTICATES stamps first_authed_at → GC can't reap it", async () => {
+    // THE critical repro. The active-row re-register re-auth exit authenticated
+    // successfully but returned WITHOUT stamping (register never routes through
+    // the dispatcher's cache-put) → GC reaped a live re-authed agent (got 1).
+    const token = await register("reauth-a");
+    expect(getAgentAuthData("reauth-a")!.first_authed_at).toBeNull();
+    // FORCE re-register with the ISSUED token — codex's exact repro: a genuinely
+    // successful authenticated path (enforceAuth #1) that re-registers the row.
+    const reReg = await mcpCall("tools/call", {
+      name: "register_agent",
+      arguments: { name: "reauth-a", role: "worker", capabilities: [], agent_token: token, force: true },
+    });
+    expect(JSON.parse(reReg.result.content[0].text).success).toBe(true);
+    // The re-auth MUST have stamped first_authed_at (this is the fix).
+    expect(getAgentAuthData("reauth-a")!.first_authed_at).not.toBeNull();
+    // codex's exact shape: null session + age past TTL → the agent must SURVIVE
+    // the GC (without the stamp above, this row is deleted — the negative control).
+    makeSessionlessAndOld("reauth-a");
+    gcOrphanRegistrations(getDb());
+    expect(getAgentAuthData("reauth-a")).not.toBeNull();
+  });
+
+  it("health_check with a valid token stamps first_authed_at (inventory path #4)", async () => {
+    const token = await register("hc-agent");
+    expect(getAgentAuthData("hc-agent")!.first_authed_at).toBeNull();
+    await mcpCall("tools/call", { name: "health_check", arguments: { agent_token: token } });
+    expect(getAgentAuthData("hc-agent")!.first_authed_at).not.toBeNull();
+  });
+
+  it("dashboard /api/send-message with a verified from_agent_token stamps (inventory path #5 — the `relay send` path)", async () => {
+    // victra's live production case: an orchestrator that authenticates ONLY via
+    // `relay send` (→ /api/send-message, path #5) had first_authed_at EMPTY on the
+    // 2.20.0 daemon — so once 2.22.0 ships it would GC ITSELF the moment its
+    // session nulled. This asserts the fix: an agent whose ONLY auth is #5 ends
+    // up with a non-null first_authed_at.
+    const token = await register("dash-from");
+    await register("dash-to");
+    expect(getAgentAuthData("dash-from")!.first_authed_at).toBeNull();
+    const res = await fetch(`${baseUrl}/api/send-message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from: "dash-from", to: "dash-to", content: "hi", from_agent_token: token }),
+    });
+    expect(res.ok).toBe(true);
+    expect(getAgentAuthData("dash-from")!.first_authed_at).not.toBeNull();
+  });
 });

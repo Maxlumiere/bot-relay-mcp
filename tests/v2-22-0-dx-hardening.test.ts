@@ -43,10 +43,21 @@ beforeEach(() => {
 });
 afterEach(() => reset());
 
-/** Register + return {token, handle}. */
+/** Register + return {token, handle}. A fresh register carries a LIVE session. */
 function reg(name: string) {
   const r = registerAgent(name, "worker", []);
   return { token: r.plaintext_token!, handle: r.registration_recovery! };
+}
+/**
+ * Register a genuine session-LESS ORPHAN. abandon/GC only ever touch a
+ * session-less orphan (`session_id IS NULL`); a fresh register carries a live
+ * session, so end it — modelling a registration whose session died before it
+ * ever authenticated (the real orphan-cleanup target).
+ */
+function regOrphan(name: string) {
+  const r = reg(name);
+  getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = ?").run(name);
+  return r;
 }
 /** Drive one successful auth (goes through the cache-miss funnel → sets first_authed_at). */
 function authOnce(token: string) {
@@ -64,10 +75,24 @@ describe("ADR-0005 #4 — orphan cleanup KEYSTONE (safe by construction)", () =>
   });
 
   it("a never-authed orphan CAN be abandoned with its handle", () => {
-    const { handle } = reg("o-orphan");
+    const { handle } = regOrphan("o-orphan");
     expect(getAgentAuthData("o-orphan")).not.toBeNull();
     expect(abandonRegistration("o-orphan", handle)).toEqual({ abandoned: true });
     expect(getAgentAuthData("o-orphan")).toBeNull(); // row gone
+  });
+
+  it("BLOCKER b (codex #115): abandon REFUSES a never-authed row with a LIVE session — even with a valid handle", () => {
+    // A FRESH register carries a live session_id. The old DELETE reasserted only
+    // `first_authed_at IS NULL` and wrongly removed it (expected false, got true).
+    // Now abandon rejects it (session_id !== null) BEFORE the bcrypt handle check,
+    // and the shared deleteReapableOrphan re-asserts session_id IS NULL by construction.
+    const r = registerAgent("o-livesess", "worker", []); // NOT via reg() → keep the live session
+    const liveSession = (getDb().prepare("SELECT session_id FROM agents WHERE name = ?").get("o-livesess") as { session_id: string | null }).session_id;
+    expect(liveSession).not.toBeNull();
+    const res = abandonRegistration("o-livesess", r.registration_recovery!);
+    expect(res.abandoned).toBe(false);
+    expect(res.reason).toMatch(/live session/i);
+    expect(getAgentAuthData("o-livesess")).not.toBeNull(); // untouched
   });
 
   it("KEYSTONE: an AUTHENTICATED agent can NEVER be abandoned — even with a VALID handle", () => {
@@ -95,12 +120,12 @@ describe("ADR-0005 #4 — orphan cleanup KEYSTONE (safe by construction)", () =>
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0005 #4 — handle can't be forged / replayed / mis-scoped", () => {
   it("a wrong handle is refused (bcrypt)", () => {
-    reg("h-a");
+    regOrphan("h-a");
     expect(abandonRegistration("h-a", "not-the-real-handle").abandoned).toBe(false);
   });
 
   it("an EXPIRED handle is refused", () => {
-    const { handle } = reg("h-exp");
+    const { handle } = regOrphan("h-exp");
     getDb()
       .prepare("UPDATE agents SET registration_recovery_expires_at = ? WHERE name = ?")
       .run(new Date(Date.now() - 1000).toISOString(), "h-exp");
@@ -109,14 +134,14 @@ describe("ADR-0005 #4 — handle can't be forged / replayed / mis-scoped", () =>
   });
 
   it("agent X's handle can NOT abandon agent Y (name-scoped)", () => {
-    const x = reg("h-x");
-    reg("h-y");
+    const x = regOrphan("h-x");
+    regOrphan("h-y");
     expect(abandonRegistration("h-y", x.handle).abandoned).toBe(false); // X's handle ≠ Y's hash
     expect(getAgentAuthData("h-y")).not.toBeNull();
   });
 
   it("a replayed handle is dead after the row is gone", () => {
-    const { handle } = reg("h-replay");
+    const { handle } = regOrphan("h-replay");
     expect(abandonRegistration("h-replay", handle).abandoned).toBe(true);
     expect(abandonRegistration("h-replay", handle).abandoned).toBe(false); // no such registration
   });
