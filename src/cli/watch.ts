@@ -90,6 +90,54 @@ function usage(requested = false): void {
   );
 }
 
+/**
+ * Evidence that the MARKER wake path is live — deliberately hard to satisfy.
+ *
+ * This exists so a degraded wake path announces itself instead of quietly
+ * falling back to the 30s poll. Two ways it previously lied, both found by
+ * codex on #121, both re-creating the exact silence this file is meant to end:
+ *
+ *   1. `!filename` was accepted as proof. fs.watch may fire with no filename;
+ *      that is an unrelated directory change, or another agent's marker, or
+ *      ours — indistinguishable. One anonymous event permanently suppressed
+ *      the announcement.
+ *   2. The flag LATCHED. One legitimate marker early in the process's life
+ *      made it true forever, so if the marker writer later died, every
+ *      subsequent message was found by the poll and the degraded branch could
+ *      never fire. "A marker worked once" is not evidence that the wake path
+ *      worked for THIS message.
+ *
+ * So: proof requires a POSITIVELY IDENTIFIED filename, and it is CONSUMED —
+ * each window is judged on its own delivery. Exported for the negative
+ * controls; the guard is only worth having if it can be shown to say no.
+ */
+export interface MarkerEvidence {
+  /** Record an fs.watch event. Returns true iff it counts as proof. */
+  record(filename: string | Buffer | null | undefined, base: string): boolean;
+  /** Read AND reset. The value covers only the window since the last consume. */
+  consume(): boolean;
+}
+
+export function createMarkerEvidence(): MarkerEvidence {
+  let proven = false;
+  return {
+    record(filename, base) {
+      // Buffer/null/undefined are all UNPROVEN. Only an exact string match on
+      // this agent's own marker basename is evidence.
+      if (typeof filename === "string" && filename === base) {
+        proven = true;
+        return true;
+      }
+      return false;
+    },
+    consume() {
+      const seen = proven;
+      proven = false;
+      return seen;
+    },
+  };
+}
+
 /** Emit the wake signal: a single stdout line a harness Monitor can consume. */
 function emitWake(
   agent: string,
@@ -280,7 +328,7 @@ export async function run(argv: string[]): Promise<number> {
   //      than by the marker watcher, the marker did not fire for a message
   //      that definitely landed. That is the degraded case proving itself, and
   //      it is announced once and acted on (see tightenToPolling).
-  let sawMarkerEvent = false;
+  const markerEvidence = createMarkerEvidence();
   let degradedAnnounced = false;
 
   /** Did a real marker write reach us, or are we only being saved by the timer? */
@@ -323,23 +371,15 @@ export async function run(argv: string[]): Promise<number> {
       }
       try {
         watcher = fs.watch(dir, (_event, filename) => {
-          if (filename === base) {
-            // A real marker write for THIS agent reached us — the event path is
-            // PROVEN live, not merely configured. This is the only positive
-            // evidence that exists for the wake path working end to end.
-            sawMarkerEvent = true;
-            check();
-          } else if (!filename) {
-            // fs.watch may fire with no filename (platform-dependent). That is
-            // an unrelated directory change, another agent's marker, or ours —
-            // we cannot tell. Checking is free and correct; claiming PROOF from
-            // it is not. Setting sawMarkerEvent here would let one anonymous
-            // event permanently suppress the degraded-path announcement below,
-            // so a dead marker path would go back to being detected silently by
-            // the 30s poll — the exact failure this evidence flag exists to
-            // make loud. Unknown stays UNPROVEN.
-            check();
-          }
+          // record() returns true ONLY for a positively identified marker for
+          // THIS agent — that is the sole positive evidence the wake path works
+          // end to end. Anything else (no filename, another agent's marker) is
+          // indistinguishable from an unrelated directory change, so it stays
+          // UNPROVEN. We still check() either way: checking is free and correct,
+          // and it is claiming PROOF from an unidentified event that would let
+          // one anonymous callback suppress the degraded announcement forever.
+          markerEvidence.record(filename, base);
+          check();
         });
       } catch {
         /* fs.watch unsupported here → interval-only below still covers it */
@@ -354,8 +394,7 @@ export async function run(argv: string[]): Promise<number> {
       // worked once" is not evidence that the wake path worked for THIS
       // message. Consume the evidence and reset, so each window is judged on
       // its own delivery.
-      const sawMarkerThisWindow = sawMarkerEvent;
-      sawMarkerEvent = false;
+      const sawMarkerThisWindow = markerEvidence.consume();
       const before = prevUnread;
       check();
       // New mail that the marker watcher never told us about: the marker did
