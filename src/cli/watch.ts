@@ -91,51 +91,33 @@ function usage(requested = false): void {
 }
 
 /**
- * Evidence that the MARKER wake path is live — deliberately hard to satisfy.
+ * THE RUNTIME DEGRADATION PREDICATE.
  *
- * This exists so a degraded wake path announces itself instead of quietly
- * falling back to the 30s poll. Two ways it previously lied, both found by
- * codex on #121, both re-creating the exact silence this file is meant to end:
+ * Did the FALLBACK poll discover a delivery the marker never announced?
  *
- *   1. `!filename` was accepted as proof. fs.watch may fire with no filename;
- *      that is an unrelated directory change, or another agent's marker, or
- *      ours — indistinguishable. One anonymous event permanently suppressed
- *      the announcement.
- *   2. The flag LATCHED. One legitimate marker early in the process's life
- *      made it true forever, so if the marker writer later died, every
- *      subsequent message was found by the poll and the degraded branch could
- *      never fire. "A marker worked once" is not evidence that the wake path
- *      worked for THIS message.
+ * This deliberately consults NO marker-evidence flag, and that is the whole
+ * point. Three attempts got this wrong, each closing a route while leaving the
+ * bad state reachable:
+ *   1. `!filename` counted as proof, so one anonymous fs.watch event suppressed
+ *      the announcement forever.
+ *   2. The proof latched for the process lifetime, so a marker that worked once
+ *      masked a writer that died later.
+ *   3. Even consumed per-window, a marker for message A masked an UNMARKED
+ *      message B arriving in the same window.
  *
- * So: proof requires a POSITIVELY IDENTIFIED filename, and it is CONSUMED —
- * each window is judged on its own delivery. Exported for the negative
- * controls; the guard is only worth having if it can be shown to say no.
+ * All three are the same error: treating "a marker fired at some point" as
+ * evidence about a DIFFERENT delivery. The fix is to stop asking that question.
+ * Watcher callbacks invoke check() IMMEDIATELY, so a marked delivery has
+ * already moved prevUnread by the time this tick runs. Therefore an unread
+ * count that rises ACROSS the fallback's own check() is, by construction, a
+ * delivery no callback observed — which is exactly the degradation, per
+ * delivery, with no state to get stale.
  */
-export interface MarkerEvidence {
-  /** Record an fs.watch event. Returns true iff it counts as proof. */
-  record(filename: string | Buffer | null | undefined, base: string): boolean;
-  /** Read AND reset. The value covers only the window since the last consume. */
-  consume(): boolean;
-}
-
-export function createMarkerEvidence(): MarkerEvidence {
-  let proven = false;
-  return {
-    record(filename, base) {
-      // Buffer/null/undefined are all UNPROVEN. Only an exact string match on
-      // this agent's own marker basename is evidence.
-      if (typeof filename === "string" && filename === base) {
-        proven = true;
-        return true;
-      }
-      return false;
-    },
-    consume() {
-      const seen = proven;
-      proven = false;
-      return seen;
-    },
-  };
+export function fallbackObservedMissedDelivery(
+  before: number | null,
+  after: number | null,
+): boolean {
+  return before !== null && after !== null && after > before;
 }
 
 /** Emit the wake signal: a single stdout line a harness Monitor can consume. */
@@ -328,7 +310,6 @@ export async function run(argv: string[]): Promise<number> {
   //      than by the marker watcher, the marker did not fire for a message
   //      that definitely landed. That is the degraded case proving itself, and
   //      it is announced once and acted on (see tightenToPolling).
-  const markerEvidence = createMarkerEvidence();
   let degradedAnnounced = false;
 
   /** Did a real marker write reach us, or are we only being saved by the timer? */
@@ -378,7 +359,9 @@ export async function run(argv: string[]): Promise<number> {
           // UNPROVEN. We still check() either way: checking is free and correct,
           // and it is claiming PROOF from an unidentified event that would let
           // one anonymous callback suppress the degraded announcement forever.
-          markerEvidence.record(filename, base);
+          // No evidence is recorded. A marker callback's only job is to make
+          // the delivery observed; whether it fired is not evidence about any
+          // OTHER delivery. See fallbackObservedMissedDelivery().
           check();
         });
       } catch {
@@ -387,20 +370,12 @@ export async function run(argv: string[]): Promise<number> {
     }
     const FALLBACK_MS = 30_000; // marker-miss safety net
     timer = setInterval(() => {
-      // PER-WINDOW, NOT PER-PROCESS. `sawMarkerEvent` used to latch: one
-      // legitimate marker early in the watcher's life made it true forever, so
-      // if the marker writer later died, every subsequent message was found by
-      // this poll and the degraded branch could never fire again. "A marker
-      // worked once" is not evidence that the wake path worked for THIS
-      // message. Consume the evidence and reset, so each window is judged on
-      // its own delivery.
-      const sawMarkerThisWindow = markerEvidence.consume();
       const before = prevUnread;
       check();
       // New mail that the marker watcher never told us about: the marker did
       // not fire for a message that definitely landed. Prove-by-behaviour that
       // we are degraded, then stop pretending the 30s net is a wake path.
-      if (!sawMarkerThisWindow && before !== null && prevUnread !== null && prevUnread > before) {
+      if (fallbackObservedMissedDelivery(before, prevUnread)) {
         announceDegraded("new mail was detected by the fallback poll, not by a marker event");
         tightenToPolling();
       }
