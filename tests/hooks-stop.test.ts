@@ -144,6 +144,16 @@ function runHook(
     child.stderr.on("data", (d) => (stderr += d.toString()));
     child.on("exit", (code) => resolve({ code, stdout, stderr, durationMs: Date.now() - start }));
     child.on("error", reject);
+    // EPIPE on stdin is EXPECTED, not exceptional: the hook deliberately
+    // stops reading — the 256KB cap-break mid-payload, or `read -t 1` timing
+    // out mid-line on a loaded runner — and exits with the writer's remainder
+    // stranded in flight. Without this listener that surfaces as an UNHANDLED
+    // error and fails the whole vitest run even with every test green (the CI
+    // failure this fixed; (4f) reproduces it deterministically). Anything
+    // other than EPIPE is a real harness bug: reject.
+    child.stdin.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code !== "EPIPE") reject(err);
+    });
     // Mirror the harness: write the hook payload (if any) and CLOSE stdin.
     // An open stdin would make the hook's bounded `read -t` wait out its
     // timeout on every invocation.
@@ -323,6 +333,41 @@ describe("Stop hook — loop guards (suppression must never consume)", () => {
     expect(r.code).toBe(0);
     expect(r.stdout).toBe("");
     expect(pendingCount("stop-recv-13")).toBe(1);
+  });
+
+  it("(4f) writer outlives the reader: a multi-line 1.5MB payload cap-breaks the read loop, the hook exits with ~1.2MB stranded, and the writer's EPIPE is absorbed", async () => {
+    // The deterministic form of the race that failed CI at 300KB. There, the
+    // single-line payload merely ARRIVED slowly under load, `read -t 1` gave
+    // up mid-line, and the hook exited with the harness's write still in
+    // flight — an EPIPE nothing handled, failing the run with all 168 test
+    // files green. A single-line payload can't reproduce that reliably: one
+    // `read` drains the whole line to EOF, stranding nothing. MULTI-LINE
+    // input is read line-by-line, so the 256KB cap-break fires with the rest
+    // of the payload genuinely unread; ~1.2MB can never fit a pipe buffer, so
+    // the in-flight write completes EPIPE on every platform, every time —
+    // while this test is still on the clock. Revert runHook's stdin 'error'
+    // handler and this test fails the run the exact way CI did.
+    const senderTok = await registerWithToken("stop-sender-14", []);
+    const recvTok = await registerWithToken("stop-recv-14", []);
+    await sendMessage("stop-sender-14", "stop-recv-14", "stranded writer", senderTok);
+
+    // ~1.5MB of 1KB lines. Concatenated + truncated at the cap it is an
+    // unterminated JSON string → unparseable → (4c) fail-safe suppress.
+    const giant =
+      '{"stop_hook_active": false, "pad": "' + ("x".repeat(1023) + "\n").repeat(1500) + '"}';
+    const r = await runHook(
+      {
+        RELAY_AGENT_NAME: "stop-recv-14",
+        RELAY_AGENT_TOKEN: recvTok,
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HTTP_PORT: String(port),
+        RELAY_DB_PATH: TEST_DB_PATH,
+      },
+      { stdinPayload: giant },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe(""); // truncated payload is unparseable → fail-safe suppress
+    expect(pendingCount("stop-recv-14")).toBe(1); // and nothing was consumed
   });
 
   it("(4d) trusted payload (stop_hook_active:false) SKIPS the damper — consecutive natural stops each wake", async () => {
