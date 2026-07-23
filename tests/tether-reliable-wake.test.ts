@@ -24,6 +24,7 @@ import {
   tearDownDaemon,
   registerAgentViaHttp,
   sendMessageViaHttp,
+  drainInboxViaHttp,
   connectMcpClient,
   readInboxSnapshot,
   type DaemonHandle,
@@ -63,9 +64,9 @@ describe("Tether v0.2.3 R1 — subscribe→notify→wake through the production 
     return spy.mock.calls.length;
   }
 
-  it("catch-up wake fires once for mail already waiting, then the LIVE path wakes on a new message", async () => {
+  it("catch-up wake fires once for mail already waiting, then the LIVE path wakes on a new message AFTER a drain", async () => {
     const RCPT = "rw-a";
-    await registerAgentViaHttp(daemon.baseUrl, RCPT);
+    const { agentToken: rcptToken } = await registerAgentViaHttp(daemon.baseUrl, RCPT);
     // Mail waiting BEFORE subscribe — only the catch-up path can deliver it.
     await sendMessageViaHttp(daemon.baseUrl, SENDER, senderToken, RCPT, "waiting-before-subscribe");
 
@@ -80,11 +81,25 @@ describe("Tether v0.2.3 R1 — subscribe→notify→wake through the production 
         buildInboxUri,
         readSnapshot: readInboxSnapshot,
         wakeGate: gate,
+        // ADR-0010: the harness agent has no turn in flight — it IS idle. An
+        // idle observation is the flush evidence that re-arms the gate between
+        // the catch-up wake and the live one (drain alone no longer re-arms:
+        // pending==0 is not consumption).
+        observe: async () => ({ state: "idle" as const, busyCoveredByHook: true }),
         ...sinkDeps,
       });
       // Catch-up wake fired THROUGH the production seam.
       expect(onWake).toHaveBeenCalledTimes(1);
       expect(onWake).toHaveBeenLastCalledWith(RCPT);
+
+      // The agent consumes the wake (drains its inbox) before new mail lands.
+      await drainInboxViaHttp(daemon.baseUrl, RCPT, rcptToken);
+      // The re-arm CONTRACT the wake-gate depends on: a drain drops the
+      // RESOURCE's pending_count to 0 (strict status='pending' count). If this
+      // assertion fails, rule-1 re-arming is broken at the relay, not in the
+      // gate.
+      const postDrain = await readInboxSnapshot(mcp.client, RCPT);
+      expect(postDrain?.pending_count).toBe(0);
 
       // LIVE: a new message → real ResourceUpdated notification → the production
       // handler runs → wake. Proves the :handler wiring, not just decideWake.

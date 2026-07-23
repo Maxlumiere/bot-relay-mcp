@@ -43,6 +43,11 @@
           "default": "",
           "description": "Agent name to subscribe to. Empty falls back to the RELAY_AGENT_NAME env var; with neither set the extension stays idle."
         },
+        "bot-relay.tether.wakeOutstandingTtlMs": {
+          "type": "number",
+          "default": 10800000,
+          "description": "Backstop TTL (ms) for the one-outstanding-wake rule (ADR-0010): after Tether injects a wake, no further injection fires for the same agent until the agent is OBSERVED IDLE (the host submits queued input at the turn boundary, so idleness is flush evidence), its terminal closes, the injection fails, or this TTL elapses. Deliberately LONG (default 3h) — it must exceed a long single build turn, or the stacked-wake wall returns. The TTL only covers losses the decidable signals cannot see."
+        },
         "bot-relay.tether.autoInjectInbox": {
           "type": "boolean",
           "default": false,

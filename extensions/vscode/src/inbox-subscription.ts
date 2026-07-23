@@ -19,6 +19,16 @@
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { decideWake, type WakeInboxView } from "./catch-up-wake.js";
+import { routeWake, type ObservedAgentState } from "./wake-routing.js";
+
+/** What the router needs to observe at decision time (ADR-0010). Supplied by
+ *  the caller per consideration — the gate stays pure of VSCode + MCP. */
+export interface WakeObservation {
+  /** Liveness-derived agent state (v2.19 verdict; activity-inferred). */
+  state: ObservedAgentState;
+  /** Does this agent's CLI install a tool-result hook (busy already covered)? */
+  busyCoveredByHook: boolean;
+}
 
 /**
  * Owns the catch-up/live high-water mark (the newest-message timestamp we last
@@ -28,23 +38,100 @@ import { decideWake, type WakeInboxView } from "./catch-up-wake.js";
  * new mail). A window reload re-creates the instance → the mark resets → still-
  * pending mail re-wakes (A1, intended).
  */
+/**
+ * TTL BACKSTOP for the outstanding-wake flag — deliberately LONG (3h), and
+ * only a backstop. The primary clear signals are DECIDABLE EVENTS (idle
+ * evidence: an agent observed idle cannot still hold our injection, the host
+ * submits queued input at the turn boundary; loss evidence: the injected-into
+ * terminal closes, the injection fails, a window reload recreates the gate).
+ * NOT a drain — pending_count returning to 0 is NOT consumption (a busy
+ * agent's hook drains without touching the queued injection). Time is only
+ * for losses none of the decidable signals can observe. It must exceed a long
+ * build turn with margin: 70-minute single turns are NORMAL deep-build
+ * behavior here, and a TTL shorter than a turn re-injects repeatedly through
+ * it — recreating the exact stacked-wake wall this exists to remove.
+ */
+export const DEFAULT_WAKE_OUTSTANDING_TTL_MS = 3 * 60 * 60 * 1000;
+
 export class WakeGate {
   private lastWokenAt: string | null = null;
+  /**
+   * Rule-1 idempotency (2026-07-23, the 14-stacked-wakes fix): epoch-ms of an
+   * injection we have fired that the agent has NOT yet consumed. While set
+   * (and fresh), NO further injection fires no matter how much new mail
+   * arrives — the queued injection drains the WHOLE inbox when consumed.
+   * Consumption is observed as pending_count returning to 0, whichever path
+   * drained it (Tether's own injection or the PostToolUse hook — the gate
+   * neither knows nor needs to know which). TETHER'S JOB IS TO WAKE AN IDLE
+   * AGENT; this flag is how that rule is enforced by observable state rather
+   * than by busy-detection (which would strand mail when a turn ends without
+   * a tool call — measured and ruled out, see PR).
+   */
+  private outstandingSince: number | null = null;
 
-  constructor(private readonly onWake: (agentName: string) => void) {}
+  constructor(
+    private readonly onWake: (agentName: string) => void,
+    private readonly opts: { outstandingTtlMs?: number; now?: () => number } = {},
+  ) {}
 
   /**
-   * Consider a snapshot for one wake. Returns whether it fired (handy for
-   * tests/telemetry). Advances the mark exactly as decideWake dictates — a
-   * same-timestamp tie fails safe to NO re-wake.
+   * LOSS EVIDENCE: the terminal we injected into closed, the injection failed
+   * to land, or the binding was invalidated. A decidable event — clear the
+   * flag so the next mail event re-wakes immediately (no TTL wait).
    */
-  consider(snapshot: WakeInboxView, agentName: string, autoInjectInbox: boolean): boolean {
+  clearOutstanding(): void {
+    this.outstandingSince = null;
+  }
+
+  /**
+   * Consider a snapshot for one wake (ADR-0010 state-routed). Returns whether
+   * it fired (handy for tests/telemetry). Advances the mark exactly as
+   * decideWake dictates — a same-timestamp tie fails safe to NO re-wake.
+   *
+   * OUTSTANDING CLEARS ONLY ON: idle-evidence (below), loss evidence
+   * (clearOutstanding), or the TTL backstop. NEVER on drain — a busy agent's
+   * PostToolUse drain empties the inbox WITHOUT consuming the queued
+   * injection (injection-consumption and inbox-drain are different events;
+   * pending==0-as-consumption was the falsified first design, the one that
+   * re-created the fourteen-stack).
+   *
+   * ANTI-STRANDING CONTRACT ON THE CALLER: every suppression here is only
+   * safe because the caller re-considers on the poll tick as well as on
+   * arrival notifications — a wake suppressed while busy fires within one
+   * tick of the agent being observed idle.
+   */
+  consider(
+    snapshot: WakeInboxView,
+    agentName: string,
+    autoInjectInbox: boolean,
+    observed: WakeObservation = { state: "unknown", busyCoveredByHook: false },
+  ): boolean {
+    const now = this.opts.now ?? Date.now;
+    // IDLE-EVIDENCE: the host submits queued input at the turn boundary, so
+    // an agent observed idle cannot still hold our injection. Decidable
+    // flush evidence — re-arm.
+    if (observed.state === "idle") this.outstandingSince = null;
+    // TTL backstop for losses nothing can observe.
+    if (this.outstandingSince !== null) {
+      const ttl = this.opts.outstandingTtlMs ?? DEFAULT_WAKE_OUTSTANDING_TTL_MS;
+      if (now() - this.outstandingSince >= ttl) this.outstandingSince = null;
+    }
+    const route = routeWake({
+      pendingMail: snapshot.pending_count > 0,
+      state: observed.state,
+      busyCoveredByHook: observed.busyCoveredByHook,
+      outstanding: this.outstandingSince !== null,
+    });
+    // Suppression never advances the watermark — it means "newest message we
+    // WOKE for", and we didn't. The poll-tick re-route picks it up later.
+    if (route.action === "suppress") return false;
     const decision = decideWake(snapshot, {
       autoInjectInbox,
       lastWokenAt: this.lastWokenAt,
     });
     this.lastWokenAt = decision.newMark;
     if (decision.shouldWake) {
+      this.outstandingSince = now();
       this.onWake(agentName);
       return true;
     }
@@ -78,6 +165,10 @@ export interface SubscribeInboxesDeps<S extends WakeInboxView> {
    *  paint a success snapshot or wake over it. */
   isInErrorState: () => boolean;
   log: (line: string) => void;
+  /** ADR-0010 wake routing: observe the agent's state + hook coverage at
+   *  decision time. Optional — absent (tests, older callers) routes as
+   *  unknown/uncovered, which preserves inject-with-idempotency. */
+  observe?: (agentName: string) => Promise<WakeObservation>;
 }
 
 /**
@@ -109,7 +200,8 @@ export async function subscribeInboxes<S extends WakeInboxView>(
       applySnapshot(fresh);
       showToast(fresh);
     }
-    agent.wakeGate.consider(fresh, agent.agentName, agent.autoInjectInbox);
+    const obs = deps.observe ? await deps.observe(agent.agentName) : undefined;
+    agent.wakeGate.consider(fresh, agent.agentName, agent.autoInjectInbox, obs);
   });
 
   // Subscribe + prime each agent.
@@ -118,7 +210,8 @@ export async function subscribeInboxes<S extends WakeInboxView>(
     const initial = await readSnapshot(client, agent.agentName);
     if (initial && !isInErrorState()) {
       if (agent.primary) applySnapshot(initial);
-      agent.wakeGate.consider(initial, agent.agentName, agent.autoInjectInbox);
+      const obs = deps.observe ? await deps.observe(agent.agentName) : undefined;
+      agent.wakeGate.consider(initial, agent.agentName, agent.autoInjectInbox, obs);
     }
   }
 }
@@ -134,6 +227,7 @@ export interface SubscribeInboxDeps<S extends WakeInboxView> {
   isInErrorState: () => boolean;
   wakeGate: WakeGate;
   log: (line: string) => void;
+  observe?: (agentName: string) => Promise<WakeObservation>;
 }
 
 /**
@@ -160,5 +254,6 @@ export async function subscribeInbox<S extends WakeInboxView>(
     showToast: deps.showToast,
     isInErrorState: deps.isInErrorState,
     log: deps.log,
+    observe: deps.observe,
   });
 }

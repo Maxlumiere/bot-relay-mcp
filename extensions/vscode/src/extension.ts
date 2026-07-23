@@ -41,7 +41,7 @@ import {
 } from "./config.js";
 import { readVaultToken } from "./vault-path.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
-import { WakeGate, subscribeInboxes } from "./inbox-subscription.js";
+import { WakeGate, subscribeInboxes, type WakeObservation } from "./inbox-subscription.js";
 import { parseAgentNames, applyAgentSwitch } from "./switch-agent.js";
 import {
   AgentManager,
@@ -298,12 +298,23 @@ let lastSnapshot: InboxSnapshot | undefined;
 // reconnects (cleared only on deactivate) so the mark survives; a window reload
 // re-creates the extension → fresh map → still-pending mail re-wakes (A1).
 const wakeGates = new Map<string, WakeGate>();
+// Rule-1 idempotency (wake-stacking fix): which terminal each agent's
+// OUTSTANDING injection went into, so a terminal-close is attributable —
+// loss evidence that clears the gate immediately (decidable event; the TTL
+// only backstops losses nothing here can see).
+const outstandingWakeTerminals = new Map<string, vscode.Terminal>();
 function getWakeGate(agentName: string): WakeGate {
   let g = wakeGates.get(agentName);
   if (!g) {
-    g = new WakeGate((name) => {
-      void injectInboxKeystroke(name);
-    });
+    const ttl = vscode.workspace
+      .getConfiguration("bot-relay")
+      .get<number>("tether.wakeOutstandingTtlMs");
+    g = new WakeGate(
+      (name) => {
+        void injectInboxKeystroke(name);
+      },
+      typeof ttl === "number" && ttl > 0 ? { outstandingTtlMs: ttl } : {},
+    );
     wakeGates.set(agentName, g);
   }
   return g;
@@ -599,16 +610,57 @@ async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
  * for that CLI agent; the terminal matcher above is LLM-agnostic. Read fresh per
  * wake so a config change takes effect without a reload.
  */
-function resolveWakeAdapter(agentName: string): LlmAdapter {
+/** Per-agent llm id (agents[] entry, else the global agentLlm). Shared by the
+ *  wake adapter and ADR-0010 routing (hook coverage is per-CLI). */
+function resolveAgentLlm(agentName: string): string {
   const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
-  // Per-agent llm: prefer this agent's entry in agents[], else the global
-  // agentLlm (legacy single-agent config).
   let llm = cfg.get<string>("agentLlm") ?? "claude";
   const agentsCfg = cfg.get<Array<{ name?: unknown; llm?: unknown }>>("agents");
   if (Array.isArray(agentsCfg)) {
     const entry = agentsCfg.find((a) => a && typeof a.name === "string" && a.name === agentName);
     if (entry) llm = entry.llm === "codex" ? "codex" : "claude";
   }
+  return llm;
+}
+
+/**
+ * ADR-0010 wake routing — observe an agent's state + hook coverage at
+ * decision time. State comes from the auth-free /api/snapshot (agent_status +
+ * last_seen, same trust boundary as the wake itself): recent activity means a
+ * turn is in flight (PostToolUse bumps last_seen on every tool call), so
+ * BUSY = last_seen fresher than the activity window OR a fresh declared
+ * 'working'. IDLE = a known row without in-flight evidence. UNKNOWN = fetch
+ * failed / row missing — routed as inject-with-idempotency (suppress-on-
+ * unknown could strand mail behind a signal that never resolves; a spurious
+ * inject costs one queued line). Coverage: only the claude CLI installs the
+ * PostToolUse relay hook today — the Copilot driver work makes this
+ * registry-driven.
+ */
+const BUSY_ACTIVITY_WINDOW_MS = 120_000;
+async function observeAgentForWake(agentName: string): Promise<WakeObservation> {
+  const busyCoveredByHook = resolveAgentLlm(agentName) === "claude";
+  try {
+    if (!relayEndpoint) return { state: "unknown", busyCoveredByHook };
+    const res = await fetch(new URL("/api/snapshot", relayEndpoint), { method: "GET" });
+    if (!res.ok) return { state: "unknown", busyCoveredByHook };
+    const snap = (await res.json()) as {
+      agents?: Array<{ name?: string; agent_status?: string; last_seen?: string }>;
+    };
+    const row = snap.agents?.find((a) => a.name === agentName);
+    if (!row) return { state: "unknown", busyCoveredByHook };
+    const lastSeenAge = row.last_seen ? Date.now() - Date.parse(row.last_seen) : Number.POSITIVE_INFINITY;
+    const busy =
+      (Number.isFinite(lastSeenAge) && lastSeenAge < BUSY_ACTIVITY_WINDOW_MS) ||
+      (row.agent_status === "working" && lastSeenAge < BUSY_ACTIVITY_WINDOW_MS * 3);
+    return { state: busy ? "busy" : "idle", busyCoveredByHook };
+  } catch {
+    return { state: "unknown", busyCoveredByHook };
+  }
+}
+
+function resolveWakeAdapter(agentName: string): LlmAdapter {
+  const cfg = vscode.workspace.getConfiguration("bot-relay.tether");
+  const llm = resolveAgentLlm(agentName);
   const submitKey: "\r" | "\n" = cfg.get<string>("codexEnterKey") === "lf" ? "\n" : "\r";
   const submitDelayMs = cfg.get<number>("codexSubmitDelayMs") ?? 150;
   // Default to sendSequence: focusing the terminal + a standalone CR is the
@@ -669,6 +721,12 @@ function buildWakeContext(t: vscode.Terminal): WakeContext {
 
 async function injectInboxKeystroke(agentName: string): Promise<void> {
   const adapter = resolveWakeAdapter(agentName);
+  // Rule-1 idempotency: the WakeGate set its outstanding flag when it fired
+  // us. If the injection does NOT land (0/>1 terminals → hint, or a throw),
+  // that flag would suppress every future wake for the TTL — a delivery
+  // failure converted into muteness. So any non-landed path clears it (loss
+  // evidence, decidable now).
+  let injected = false;
   try {
     await resolveAndWake<vscode.Terminal>(agentName, {
       fetchBinding: getAgentBinding,
@@ -687,6 +745,8 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
       // word then submits with a SEPARATE, delayed Enter (see llm-adapter.ts).
       // resolveAndWake's wake is sync/void — fire-and-forget the async adapter.
       wake: (t) => {
+        injected = true;
+        outstandingWakeTerminals.set(agentName, t);
         void adapter.wake(buildWakeContext(t));
       },
       wakeWord: adapter.wakeWord,
@@ -695,6 +755,10 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
     });
   } catch (err) {
     log(`auto-inject failed for "${agentName}": ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!injected) {
+    wakeGates.get(agentName)?.clearOutstanding();
+    outstandingWakeTerminals.delete(agentName);
   }
 }
 
@@ -864,6 +928,9 @@ async function connect(config: TetherConfig): Promise<void> {
   // it. Each watched agent has its OWN persistent WakeGate (per-agent no-double-
   // wake mark across reconnects); a window reload re-creates them, re-waking
   // pending mail (A1).
+  watchedWakeAgents.clear();
+  lastWakeSnapshots.clear();
+  for (const a of agentList) watchedWakeAgents.set(a.name, { autoInjectInbox: config.autoInjectInbox });
   await subscribeInboxes({
     client,
     agents: agentList.map((a, i) => ({
@@ -873,11 +940,18 @@ async function connect(config: TetherConfig): Promise<void> {
       primary: i === 0,
     })),
     buildInboxUri,
-    readSnapshot: refreshSnapshot,
+    // Capture every snapshot for the poll-tick re-route (ADR-0010) — the tick
+    // only re-reads agents whose last known snapshot had pending mail.
+    readSnapshot: async (c, name) => {
+      const s = await refreshSnapshot(c, name);
+      if (s) lastWakeSnapshots.set(name, s);
+      return s;
+    },
     applySnapshot,
     showToast: (snapshot) => showToast(snapshot, config.notificationLevel),
     isInErrorState,
     log,
+    observe: observeAgentForWake,
   });
   if (!isInErrorState()) {
     log("connected + subscribed");
@@ -922,6 +996,33 @@ async function pollHealthOnce(): Promise<void> {
   if (isInErrorState()) return; // a reconnect owns recovery; don't double-drive
   if (!relayEndpoint) return;
   await healthPoll.tick();
+  await rerouteSuppressedWakes();
+}
+
+// ADR-0010 anti-stranding invariant: suppression decisions are re-evaluated on
+// the poll tick, not only on arrival notifications. Mail that arrived while an
+// agent was busy (its notification consumed during the turn) wakes within one
+// tick of the agent being observed idle — the suppression race CANNOT strand,
+// by construction. Re-reads a FRESH snapshot (never routes on a stale pending
+// count) and only for agents whose last known snapshot had pending mail.
+const watchedWakeAgents = new Map<string, { autoInjectInbox: boolean }>();
+const lastWakeSnapshots = new Map<string, InboxSnapshot>();
+async function rerouteSuppressedWakes(): Promise<void> {
+  if (!mcpClient) return;
+  for (const [name, sub] of watchedWakeAgents) {
+    const last = lastWakeSnapshots.get(name);
+    if (!last || last.pending_count <= 0) continue;
+    try {
+      const fresh = await refreshSnapshot(mcpClient, name);
+      if (!fresh) continue;
+      lastWakeSnapshots.set(name, fresh);
+      if (isInErrorState()) return;
+      const obs = await observeAgentForWake(name);
+      getWakeGate(name).consider(fresh, name, sub.autoInjectInbox, obs);
+    } catch {
+      /* transient — next tick retries */
+    }
+  }
 }
 
 async function disconnect(): Promise<void> {
@@ -1277,6 +1378,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Agent killed → fall back to inbox-only status bar if a
         // snapshot is available.
         applySnapshot(lastSnapshot);
+      }
+    }),
+  );
+
+  // Rule-1 idempotency, loss evidence: an outstanding injection dies with the
+  // terminal it was typed into. A closed terminal is a DECIDABLE loss event —
+  // clear that agent's gate so the next mail event re-wakes immediately
+  // (never waiting out the TTL backstop).
+  context.subscriptions.push(
+    vscode.window.onDidCloseTerminal((closed) => {
+      for (const [name, term] of outstandingWakeTerminals) {
+        if (term === closed) {
+          outstandingWakeTerminals.delete(name);
+          wakeGates.get(name)?.clearOutstanding();
+          log(`outstanding wake for "${name}" cleared — its terminal closed`);
+        }
       }
     }),
   );
