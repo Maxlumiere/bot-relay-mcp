@@ -12,6 +12,9 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
+    // 2026-07-23 worktree-clobber fix: fail any run that modifies the REAL
+    // ~/.claude.json / ~/.claude/settings.json / ~/.bot-relay/config.json.
+    globalSetup: ["./tests/global-user-config-tripwire.ts"],
     include: ["tests/**/*.test.ts"],
     exclude: [
       "node_modules/**",

@@ -31,9 +31,21 @@ beforeEach(() => {
   if (fs.existsSync(TEST_TMP)) fs.rmSync(TEST_TMP, { recursive: true, force: true });
   fs.mkdirSync(TEST_TMP, { recursive: true });
   process.env.RELAY_CONFIG_PATH = CONFIG_PATH;
+  // THE WORKTREE-CLOBBER FIX (2026-07-23). This file runs the REAL runInit,
+  // which (since v2.16.0) also writes ~/.claude.json + ~/.claude/settings.json
+  // — and this suite redirected only the relay config, so every `npm test`
+  // rewrote the REAL user config to point at whichever checkout ran it (codex
+  // audit worktrees under /private/tmp; the %20-encoded main checkout). Any
+  // contributor running our tests lost their working relay setup, silently.
+  // The sandbox below fixes THIS file; the chokepoint guard in
+  // config-merge.ts assertNotRealUserConfigWrite makes the whole class
+  // impossible to reintroduce (a test reaching a real user-config write now
+  // throws instead of certifying).
+  process.env.RELAY_CLAUDE_HOME = TEST_TMP;
 });
 afterEach(() => {
   delete process.env.RELAY_CONFIG_PATH;
+  delete process.env.RELAY_CLAUDE_HOME;
   if (fs.existsSync(TEST_TMP)) fs.rmSync(TEST_TMP, { recursive: true, force: true });
 });
 
@@ -44,6 +56,12 @@ describe("v2.3.0 B.1 — relay init --profile", () => {
   it("(B.1.1) --profile=solo writes minimal core-only config", async () => {
     const code = await runInit(["--yes", "--profile=solo"]);
     expect(code).toBe(0);
+    // The user-scope writes landed IN THE SANDBOX — proves the redirect took
+    // effect and the real-installer coverage is intact (init still exercised
+    // installMcpServer + installHook; they just wrote here, not to ~).
+    const sandboxClaude = JSON.parse(fs.readFileSync(path.join(TEST_TMP, ".claude.json"), "utf-8"));
+    expect(sandboxClaude.mcpServers["bot-relay"].args[0]).toMatch(/dist\/index\.js$/);
+    expect(fs.existsSync(path.join(TEST_TMP, ".claude", "settings.json"))).toBe(true);
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
     expect(cfg.profile).toBe("solo");
     expect(cfg.transport).toBe("stdio");

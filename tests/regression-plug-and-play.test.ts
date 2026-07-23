@@ -371,6 +371,9 @@ describe("Install surface — retro #35 / #45 / #46 / #47 / Phase 4h + Phase 4o 
       HOME: tmpHome,
       RELAY_DB_PATH: dbPath,
       RELAY_CONFIG_PATH: cfgPath,
+      // Worktree-clobber fix (2026-07-23): mark the child's user-scope writes
+      // as deliberately sandboxed (config-guard chokepoint).
+      RELAY_CLAUDE_HOME: tmpHome,
     });
     expect(r.status).toBe(0);
     expect(fs.existsSync(cfgPath)).toBe(true);

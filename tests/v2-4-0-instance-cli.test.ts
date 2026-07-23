@@ -50,6 +50,11 @@ function freshHome(): void {
   if (fs.existsSync(TEST_HOME)) fs.rmSync(TEST_HOME, { recursive: true, force: true });
   fs.mkdirSync(TEST_HOME, { recursive: true });
   process.env.RELAY_CONFIG_PATH = path.join(TEST_HOME, "config.json");
+  // Worktree-clobber fix (2026-07-23): the module-level HOME sandbox is
+  // restored by afterEach after the FIRST test, so later runInit calls saw
+  // the real home. RELAY_CLAUDE_HOME per-test keeps every user-scope write
+  // in the sandbox and satisfies the config-guard chokepoint.
+  process.env.RELAY_CLAUDE_HOME = TEST_HOME;
 }
 
 beforeEach(() => {
@@ -62,6 +67,7 @@ afterEach(() => {
   else delete process.env.HOME;
   delete process.env.RELAY_INSTANCE_ID;
   delete process.env.RELAY_DB_PATH;
+  delete process.env.RELAY_CLAUDE_HOME;
 });
 
 // Utility: capture stdout across a CLI run. The CLIs write to

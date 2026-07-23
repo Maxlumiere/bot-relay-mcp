@@ -22,7 +22,51 @@
  */
 import fs from "fs";
 import path from "path";
+import os from "os";
 import crypto from "crypto";
+
+/**
+ * SHIPPING-DEFECT guard (2026-07-23): under a test harness, REFUSE to write a
+ * home-derived user-scope config file when the matching sandbox redirect is
+ * NOT set. `tests/v2-3-0-profiles.test.ts` ran the real installer without
+ * redirecting the home dir, so every `npm test` — any contributor's, any
+ * audit worktree's — silently rewrote the REAL `~/.claude.json` +
+ * `~/.claude/settings.json` to point at whichever checkout ran the suite (an
+ * unmerged /private/tmp audit build, or a percent-encoded path that doesn't
+ * exist). Same class as the launchd install Steph flagged (#116 /
+ * RELAY_SKIP_DAEMON) — that fix covered one symptom of the pattern; this
+ * covers the pattern at the only JSON-write chokepoint.
+ *
+ * Why the guard keys on TARGET==homedir-derived AND redirect-var ABSENT: a
+ * subprocess test that sandboxes HOME itself (v2-1-cli-tooling,
+ * fresh-install-smoke, …) is indistinguishable FROM INSIDE from a real home —
+ * os.homedir() IS the sandbox there. The presence of RELAY_CLAUDE_HOME /
+ * RELAY_CONFIG_PATH is the one signal that says "this environment was
+ * sandboxed on purpose"; its ABSENCE while writing a home-derived config is
+ * exactly the forgotten-redirect defect. The suite-wide tripwire
+ * (tests/global-user-config-tripwire.ts) backstops everything this can't see.
+ * THROW, not skip: a silently-skipped write would let a test certify an
+ * install that never happened.
+ */
+export function assertNotRealUserConfigWrite(filePath: string): void {
+  if (!process.env.VITEST && process.env.NODE_ENV !== "test") return;
+  const resolved = path.resolve(filePath);
+  const home = os.homedir();
+  const guarded: Array<{ real: string; redirect: string }> = [
+    { real: path.join(home, ".claude.json"), redirect: "RELAY_CLAUDE_HOME" },
+    { real: path.join(home, ".claude", "settings.json"), redirect: "RELAY_CLAUDE_HOME" },
+    { real: path.join(home, ".bot-relay", "config.json"), redirect: "RELAY_CONFIG_PATH" },
+  ];
+  for (const { real, redirect } of guarded) {
+    if (path.resolve(real) === resolved && !process.env[redirect]) {
+      throw new Error(
+        `[config-guard] refusing to write the REAL user config ${resolved} from inside a test harness ` +
+          `(${redirect} is not set). Tests must sandbox user-scope writes: set RELAY_CLAUDE_HOME and ` +
+          `RELAY_CONFIG_PATH to a temp dir.`,
+      );
+    }
+  }
+}
 
 /** Parse a JSON file. Returns null on missing OR malformed (never throws) so a
  *  hand-corrupted user file degrades to "treat as empty + back it up" rather
@@ -54,6 +98,7 @@ export function atomicWriteJson(
   obj: unknown,
   mode = 0o600,
 ): void {
+  assertNotRealUserConfigWrite(filePath);
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
   if (fs.existsSync(filePath)) {
