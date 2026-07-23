@@ -10,6 +10,8 @@ Five fixes for callers driving the relay over raw HTTP (no MCP client wired in),
 - **`send_message` accepts `message` (#5).** The MCP tool now takes `content` **or** its alias `message` (exactly one; both-with-different-values rejected), matching the REST endpoint + the agent-team `SendMessage` — one send vocabulary across every surface.
 - **HTTP one-shot recipe (#1).** New `docs/http-one-shot.md`: register → capture → send → self-clean over `curl`.
 
+- **The v2.0 30-day dead-agent purge is also CUT (same ruling, worse instance).** `purgeOldRecords` deleted any agent row with `last_seen` older than 30 days — no principal asking, establishment not even checked, so a working token-authed agent that went idle 31 days was deleted and its name freed for anyone to claim (the v2.14.0 reserved-name exemption had already documented that freeing a name reopens the bootstrap-claim window — the rationale applied to every name, not just reserved ones). Found by codex's re-audit of the orphan-GC cut as the last remaining autonomous agent-row deletion. The purge tick now deletes messages/tasks/logs/events — records with retention windows — and **no agent row, ever**. Deliberate pruning stays available via `relay purge-agents` (dry-run by default, `--apply` + audit).
+
 Schema v22 (`first_authed_at` + `registration_recovery_hash`/`_expires_at`, additive). 36 MCP tools (adds `abandon_registration`). Native + wasm parity.
 
 ## v2.21.0 — 2026-07-22 — ADR-0002: agent class/flare topology

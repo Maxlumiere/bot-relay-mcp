@@ -56,19 +56,47 @@ afterAll(() => {
 });
 
 describe("ADR-0005 FINAL — auto orphan GC is GONE, not disabled", () => {
-  it("(G1) STRUCTURAL: gcOrphanRegistrations is no longer exported, and no purge-path code references it", () => {
+  it("(G1) STRUCTURAL: both retired reapers are gone from the source — the orphan GC and the stale purge", () => {
     expect((dbModule as Record<string, unknown>).gcOrphanRegistrations).toBeUndefined();
     const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "db.ts"), "utf8");
     expect(src).not.toContain("gcOrphanRegistrations");
+    // The 30-day dead-agent purge (codex #119 blocker: the LAST autonomous
+    // agent-row deletion, keyed on last_seen alone) — its teardown reason is
+    // gone from the union, so reintroduction fails the type-check too.
+    expect(src).not.toContain('"stale_purge"');
   });
 
-  it("(G2) BEHAVIORAL: a maximally-reapable row — never authed, session-less, ancient — survives the purge tick", () => {
+  it("(G2) BEHAVIORAL: a maximally-reapable row — never authed, session-less, ancient on BOTH time axes — survives the purge tick", () => {
+    // Both axes matter and both are aged deliberately: the retired orphan GC
+    // keyed on created_at, the retired 30-day dead-agent purge keyed on
+    // last_seen. Codex caught the first version of this test aging only
+    // created_at — it passed while the last_seen reaper was still live,
+    // because the fixture never exercised the predicate that reaper used.
+    const ancient = new Date(Date.now() - 365 * 24 * 3600_000).toISOString();
     registerAgent("ancient-orphan", "worker", []);
     getDb()
-      .prepare("UPDATE agents SET session_id = NULL, created_at = ? WHERE name = ?")
-      .run(new Date(Date.now() - 365 * 24 * 3600_000).toISOString(), "ancient-orphan");
+      .prepare("UPDATE agents SET session_id = NULL, created_at = ?, last_seen = ? WHERE name = ?")
+      .run(ancient, ancient, "ancient-orphan");
     purgeOldRecords(getDb());
     expect(getAgentAuthData("ancient-orphan")).not.toBeNull();
+  });
+
+  it("(G2b) an ESTABLISHED identity idle for a year also survives — the old dead-agent purge reaped these on last_seen alone", () => {
+    // The 30-day purge did not even check establishment: a working,
+    // token-authed agent that went idle 31 days was deleted and its name
+    // freed for anyone to claim. This is the regression that keeps THAT
+    // reaper out.
+    const reg = registerAgent("idle-established", "worker", []);
+    const { resolveAgentByToken } = dbModule as unknown as {
+      resolveAgentByToken: (t: string) => unknown;
+    };
+    resolveAgentByToken(reg.plaintext_token!); // authenticates → established
+    const ancient = new Date(Date.now() - 365 * 24 * 3600_000).toISOString();
+    getDb()
+      .prepare("UPDATE agents SET session_id = NULL, last_seen = ? WHERE name = ?")
+      .run(ancient, "idle-established");
+    purgeOldRecords(getDb());
+    expect(getAgentAuthData("idle-established")).not.toBeNull();
   });
 
   it("(G3) the surviving deletion path still requires the ASKING principal — abandon with the handle works, absence of the ask preserves the row forever", () => {

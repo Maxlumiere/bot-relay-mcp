@@ -8,7 +8,6 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised } from "./liveness.js";
-import { isReservedName } from "./reserved-names.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -2253,20 +2252,20 @@ export function purgeOldRecords(db: CompatDatabase): void {
   purgeOldAuditLog(getAuditLogRetentionDays());
   // v2.0: purge old channel messages (same 7-day window as direct messages)
   db.prepare("DELETE FROM channel_messages WHERE created_at < ?").run(sevenDaysAgo);
-  // v2.0 final (#2): purge dead agents (offline >30 days) and their
-  // normalized capability rows. Hard kill + never re-registered = dead.
-  const staleAgents = db.prepare(
-    "SELECT name FROM agents WHERE last_seen < ?"
-  ).all(thirtyDaysAgo) as Array<{ name: string }>;
-  for (const a of staleAgents) {
-    // v2.14.0 — reserved names are NEVER auto-purged. Their row + token_hash IS
-    // their impersonation protection (re-register / send-from requires the
-    // token); purging would delete the row and reopen the bootstrap-claim
-    // window on the freed name. Operators prune reserved rows explicitly.
-    if (isReservedName(a.name)) continue;
-    // v2.1 Phase 7q: sanctioned teardown helper.
-    teardownAgent(a.name, "stale_purge");
-  }
+  // ADR-0005 final ruling, applied to the LAST autonomous row deleter: the
+  // v2.0 30-day dead-agent purge (last_seen < 30d → teardownAgent) is CUT.
+  // "Idle for 30 days" is the same undecidable abandonment proxy the orphan
+  // GC guessed on — and this one deleted ESTABLISHED identities. Worse, the
+  // v2.14.0 reserved-name exemption documented the security cost precisely:
+  // purging a row frees its name and reopens the bootstrap-claim window —
+  // which was true for EVERY name, not just reserved ones. An idle-40-days
+  // agent's identity could be squatted the moment the purge freed it.
+  // Dead rows persist harmlessly (liveness derivation already renders them
+  // offline/unknown); operators prune deliberately via `relay purge-agents`
+  // (dry-run by default, --apply + audit) — a principal asking.
+  // This tick deletes MESSAGES, TASKS, LOGS, EVENTS — records with retention
+  // windows. It deletes no agent row, ever. tests/v2-22-0-no-auto-gc.test.ts
+  // holds that line for both the created_at and last_seen axes.
 }
 
 /**
@@ -2478,20 +2477,20 @@ export function checkAndRecordRateLimit(
 /**
  * v2.1 Phase 7q — sanctioned teardown of an agent row.
  *
- * Owns the DELETE paths that are NOT session_id-scoped: `relay recover`
- * (operator-initiated forensic wipe of a stuck registration) and the
- * 30-day dead-agent purge inside `purgeOldRecords`. Each runs a single
- * transaction that removes the `agents` row AND its `agent_capabilities`
- * sidecar — consistent with the existing two-DELETE idiom those sites
- * already used inline.
+ * Owns the DELETE paths that are NOT session_id-scoped. Sole remaining
+ * caller: `relay recover` (operator-initiated forensic wipe of a stuck
+ * registration). The 30-day dead-agent purge that also called this was
+ * CUT under the ADR-0005 final ruling (see purgeOldRecords) — it was the
+ * last autonomous agent-row deletion, and "idle 30 days" is an
+ * undecidable abandonment proxy. Runs a single transaction that removes
+ * the `agents` row AND its `agent_capabilities` sidecar.
  *
  * NO CAS. DELETE is idempotent by design: a missing row returns
  * changes=0, which is not an error in any caller's contract. The
  * session_id-scoped CAS DELETE is deliberately NOT folded here — that
  * path (`unregisterAgent`) protects against stale-SIGINT races which
- * teardownAgent callers by definition are not subject to (recover CLI
- * is operator-invoked; purge runs over rows that have been offline
- * >30 days, so there is no live session to race with).
+ * teardownAgent's caller by definition is not subject to (recover CLI
+ * is operator-invoked).
  *
  * `reason` is telemetry-only in v2.1.0 — future cascade side-effects
  * (e.g. audit-log entry per teardown, fire `agent.torn_down` webhook)
@@ -2500,7 +2499,7 @@ export function checkAndRecordRateLimit(
  */
 export function teardownAgent(
   name: string,
-  reason: "unregister" | "recover" | "stale_purge"
+  reason: "unregister" | "recover"
 ): void {
   const db = getDb();
   // Keep `reason` referenced so TS doesn't strip it — future cascade ops land here.
