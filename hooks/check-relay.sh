@@ -30,6 +30,50 @@
 # - DB_PATH is resolved and must live under $HOME (no /etc/passwd shenanigans).
 # - SQL is parameterised via sqlite3's `.parameter set` rather than string-interpolated.
 
+# ============================================================================
+# VERDICT BY CONSTRUCTION — must be the FIRST executable code in this file.
+#
+# WHY THIS SHAPE. Four separate audit findings all reached ONE state: "the
+# detector produced no output", which was read as healthy. An illegal `return`
+# in `node -e`; a detector that failed to execute at all; a stack overflow
+# converted into a successful zero-output run; and `command -v node` skipping
+# the whole check. Four mechanisms, one destination. Each fix closed a ROUTE and
+# left the STATE reachable, because the premise underneath was SILENCE MEANS
+# HEALTHY — which makes the detector's success and its failure the same
+# observable, and turns this into an enumeration problem that cannot converge.
+#
+# So it is inverted. This hook emits EXACTLY ONE explicit verdict on every run,
+# and the absence of a verdict is failure rather than health. Two invariants
+# make that hold without predicting failure modes:
+#
+#   1. PESSIMISTIC DEFAULT — set here, before anything else can run. It is only
+#      ever UPGRADED by positive evidence, so nothing can leave it unset and a
+#      partial run cannot forge a verdict it never earned.
+#   2. EMITTED FROM AN EXIT TRAP — so it is the LAST thing written on every exit
+#      path this shell can observe: normal return, early `exit 0` guard,
+#      uncaught error, `set -e` abort, or a catchable signal.
+#
+# A stack overflow, a missing node, a sandbox denial, a timeout and any future
+# mechanism nobody has thought of all land in the same place: no positive
+# evidence -> CANNOT-JUDGE -> announced.
+#
+# HONEST BOUNDARY, stated rather than papered over:
+#   * SIGKILL emits nothing. Uncatchable by anything, anywhere.
+#   * A hook that NEVER RUNS cannot speak for itself. That class is closed by
+#     the second channel (the server-side absence check), because only a party
+#     that knows a verdict was OWED can notice one missing.
+# ============================================================================
+RELAY_VERDICT="CANNOT-JUDGE"
+RELAY_VERDICT_REASON="hook did not reach a conclusion"
+RELAY_VERDICT_DETAIL=""
+
+relay_emit_verdict() {
+  # Single line, machine-parseable, so Tether / Sentinel / tests consume the
+  # same artifact a human reads. Deliberately NOT wrapped in any conditional.
+  echo "[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
+}
+trap relay_emit_verdict EXIT
+
 # v2.0 final (#19): self-check for path truncation. When .claude/settings.json
 # references this script with an unquoted path containing spaces, only the
 # first word reaches $0 — the script silently fails to find itself.
@@ -219,6 +263,11 @@ fi
 # alone. Without this guard the hook tells a legitimate legacy-DB session that
 # it has lost its mail (codex HIGH).
 if [ -z "${RELAY_DB_PATH:-}" ] && [ "${RELAY_INSTANCE_DIR_COUNT:-0}" -gt 0 ] && [ "$DB_PATH" = "$RELAY_LEGACY_DB" ]; then
+  # Set OUTSIDE the `{ ... } | tee` below: a pipeline runs in a SUBSHELL, so an
+  # assignment made inside it is discarded when that subshell exits.
+  RELAY_VERDICT="MUTE"
+  RELAY_VERDICT_REASON="resolved the legacy DB while instances exist — inbox will read empty"
+  RELAY_VERDICT_DETAIL=" db=\"$DB_PATH\""
   RELAY_AVAILABLE_IDS=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
   {
     echo "[RELAY] *** WRONG INSTANCE — DO NOT PROCEED AS CONNECTED ***"
@@ -260,6 +309,10 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
     try {
       c = JSON.parse(fs.readFileSync(process.env.HOME + "/.claude.json", "utf8"));
     } catch (e) { c = null; }
+
+    // Distinct sentinel: "could not read/parse" must NOT be mistaken for
+    // "parsed fine, nothing wrong". Identical observables was the whole bug.
+    if (c === null) { process.stdout.write("PARSE-FAILED"); }
 
     if (c !== null) {
 
@@ -325,6 +378,7 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
   ' 2>"$RELAY_DIAG_ERR")
   RELAY_DIAG_RC=$?
   if [ "$RELAY_DIAG_RC" -ne 0 ]; then
+    RELAY_VERDICT_REASON="mute self-check failed to run (exit $RELAY_DIAG_RC)"
     # The detector itself failed to run. Say so — do NOT let this read as "no
     # problems found". This is the exact failure that shipped once.
     {
@@ -342,7 +396,18 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
     RELAY_MUTE_PATH=""
   fi
   rm -f "$RELAY_DIAG_ERR" 2>/dev/null
-  if [ -n "${RELAY_MUTE_PATH:-}" ]; then
+  if [ "${RELAY_MUTE_PATH:-}" = "PARSE-FAILED" ]; then
+    RELAY_VERDICT_REASON="relay config could not be read or parsed"
+    RELAY_MUTE_PATH=""
+    # Blocks the HEALTHY upgrade below. "Could not parse" is CANNOT-JUDGE; the
+    # detector ran but reached no conclusion, and treating that as healthy is
+    # the exact conflation this redesign exists to remove.
+    RELAY_PARSE_FAILED=1
+  elif [ -n "${RELAY_MUTE_PATH:-}" ]; then
+    # Hoisted out of the piped brace-group below — see subshell note above.
+    RELAY_VERDICT="MUTE"
+    RELAY_VERDICT_REASON="configured relay path does not exist"
+    RELAY_VERDICT_DETAIL=" path=\"$RELAY_MUTE_PATH\""
     {
       echo "[RELAY] *** RELAY MUTE — NO RELAY TOOLS THIS SESSION ***"
       echo "[RELAY] The bot-relay MCP entry in ~/.claude.json points at a path that does not exist:"
@@ -354,6 +419,18 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
       echo "[RELAY]     node ~/bot-relay-mcp/bin/relay send <TO> \"<MSG>\" --from <YOUR_NAME>"
       echo "[RELAY] Announce this to your orchestrator immediately. Do not proceed as connected."
     } | tee /dev/stderr
+  fi
+
+  # THE ONLY UPGRADE TO HEALTHY, and it requires POSITIVE evidence on every
+  # clause: the detector actually RAN (rc==0 — an unset rc means we never got
+  # here, which is codex's node-absent case handled by construction), it found
+  # no broken canonical entry, and nothing earlier downgraded the verdict.
+  # Written as an upgrade-only step so no path can reach HEALTHY by default.
+  if [ "${RELAY_DIAG_RC:-1}" -eq 0 ] && [ -z "${RELAY_MUTE_PATH:-}" ] \
+     && [ -z "${RELAY_PARSE_FAILED:-}" ] && [ "$RELAY_VERDICT" = "CANNOT-JUDGE" ]; then
+    RELAY_VERDICT="HEALTHY"
+    RELAY_VERDICT_REASON="relay config resolves and instance is consistent"
+    RELAY_VERDICT_DETAIL=" db=\"$DB_PATH\""
   fi
 fi
 

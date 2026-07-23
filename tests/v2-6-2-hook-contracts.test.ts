@@ -122,6 +122,33 @@ interface RunOpts {
   extraEnv?: Record<string, string>;
 }
 
+/**
+ * v2.22 VERDICT INVERSION — check-relay.sh now emits exactly ONE verdict line on
+ * every run, because "silent stdout" previously meant BOTH "healthy" and
+ * "detector died", and four separate audit findings exploited that ambiguity.
+ *
+ * The original contracts here are preserved in INTENT, not in letter: stdout
+ * must still carry no partial JSON, no stack traces, and no echo of rejected
+ * input. What changed is that an empty stdout is no longer the way to express
+ * "nothing to report" — a verdict is. So we strip the single verdict line and
+ * assert the REMAINDER is empty, plus assert the verdict itself leaks nothing.
+ */
+function stripVerdict(stdout: string): string {
+  return stdout
+    .split("\n")
+    .filter((l) => !l.startsWith("[RELAY] VERDICT="))
+    .join("\n")
+    .trim();
+}
+
+/** The verdict must never echo attacker-controlled input back to the session. */
+function assertVerdictLeaksNothing(stdout: string, secrets: string[]): void {
+  const line = stdout.split("\n").find((l) => l.startsWith("[RELAY] VERDICT=")) ?? "";
+  for (const secret of secrets) {
+    if (secret) expect(line).not.toContain(secret);
+  }
+}
+
 function runHook(o: RunOpts): { status: number; stdout: string; stderr: string } {
   const env: Record<string, string> = {
     HOME: o.home,
@@ -167,7 +194,7 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
       httpPort: 1, // privileged port, ECONNREFUSED instantly
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(C2) DB present + matching agent + pending message → stdout includes [RELAY] Pending messages line", () => {
@@ -198,7 +225,7 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
     expect(r.stderr).toMatch(/RELAY_AGENT_NAME has invalid characters/);
   });
 
@@ -243,7 +270,7 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     });
     // Either status 0 with stderr warning, OR clean exit. Whatever shape,
     // stdout MUST be empty (never partial-state context).
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 });
 
@@ -258,7 +285,7 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(P2) invalid agent name → exit 0, empty stdout", () => {
@@ -270,7 +297,7 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(P3) valid agent name + DB present + pending message → stdout is single-line JSON with hookEventName=PostToolUse", () => {
@@ -310,7 +337,7 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1, // ECONNREFUSED
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(P5) malformed RELAY_AGENT_TOKEN (contains space) → token discarded, no auth header sent, exit 0", () => {
@@ -345,7 +372,7 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(S2) valid agent name + DB present + pending message → stdout is single-line JSON with hookEventName=Stop", () => {
@@ -381,7 +408,7 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 });
 
@@ -399,7 +426,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
         httpPort: 1,
       });
       expect(r.status, `hook ${path.basename(hook)} exited ${r.status} (expected 0)`).toBe(0);
-      expect(r.stdout, `hook ${path.basename(hook)} emitted unexpected stdout: ${r.stdout}`).toBe("");
+      expect(stripVerdict(r.stdout), `hook ${path.basename(hook)} emitted unexpected stdout: ${r.stdout}`).toBe("");
     }
   });
 
@@ -414,7 +441,9 @@ describe("v2.6.2 — cross-hook invariants", () => {
       });
       expect(r.status, `hook ${path.basename(hook)} exited ${r.status}`).toBe(0);
       // stderr CAN have a warning (check-relay.sh emits one); stdout MUST be empty
-      expect(r.stdout, `hook ${path.basename(hook)} stdout: ${r.stdout}`).toBe("");
+      expect(stripVerdict(r.stdout), `hook ${path.basename(hook)} stdout: ${r.stdout}`).toBe("");
+      // Intent preserved: the rejected name must not come back in the verdict.
+      assertVerdictLeaksNothing(r.stdout, ["bad name", "bad;name", "$(whoami)"]);
     }
   });
 });

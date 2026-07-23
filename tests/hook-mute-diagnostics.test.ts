@@ -225,6 +225,78 @@ describe("codex round 2 — the detector must not be silently bypassable", () =>
   });
 });
 
+describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
+  const OK = { mcpServers: { "bot-relay": { type: "http", url: "http://127.0.0.1:3777/mcp" } } };
+  const DEAD = {
+    mcpServers: {
+      "bot-relay": { type: "stdio", command: "node", args: ["/nonexistent/bot-relay-mcp/dist/index.js"] },
+    },
+  };
+
+  /** Extract the single verdict token, or null if the hook emitted none. */
+  function verdictOf(out: string): string | null {
+    const m = out.match(/VERDICT=([A-Z-]+)/);
+    return m ? m[1] : null;
+  }
+
+  function linkInstance(): void {
+    fs.symlinkSync("work", path.join(home, ".bot-relay", "active-instance"));
+  }
+
+  it("HEALTHY when the config resolves and the instance is consistent", () => {
+    linkInstance(); writeConfig(OK);
+    expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb() }))).toBe("HEALTHY");
+  });
+
+  it("MUTE when the canonical entry points at a missing path", () => {
+    linkInstance(); writeConfig(DEAD);
+    expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb() }))).toBe("MUTE");
+  });
+
+  it("MUTE when we resolved the legacy DB while instances exist", () => {
+    writeConfig(OK); // no active-instance link, no RELAY_DB_PATH
+    expect(verdictOf(runHook())).toBe("MUTE");
+  });
+
+  it("CANNOT-JUDGE when there is no config to judge", () => {
+    linkInstance();
+    expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb() }))).toBe("CANNOT-JUDGE");
+  });
+
+  it("CANNOT-JUDGE when the config cannot be parsed — NOT healthy", () => {
+    // "Could not parse" and "parsed fine, nothing wrong" previously produced
+    // identical observables (empty stdout, exit 0), so this reached HEALTHY.
+    // That conflation is the entire bug class this redesign removes.
+    linkInstance();
+    fs.writeFileSync(path.join(home, ".claude.json"), "{ not json");
+    expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb() }))).toBe("CANNOT-JUDGE");
+  });
+
+  it("CANNOT-JUDGE when the detector crashes", () => {
+    linkInstance(); writeConfig(DEAD);
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-vbin1-"));
+    fs.writeFileSync(path.join(binDir, "node"), "#!/bin/sh\nexit 1\n");
+    fs.chmodSync(path.join(binDir, "node"), 0o755);
+    try {
+      const out = runHook({ RELAY_DB_PATH: instanceDb(), PATH: `${binDir}:${process.env.PATH ?? ""}` });
+      expect(verdictOf(out)).toBe("CANNOT-JUDGE");
+    } finally { fs.rmSync(binDir, { recursive: true, force: true }); }
+  });
+
+  it("CANNOT-JUDGE when node is absent entirely (codex round 3, by construction)", () => {
+    // Previously `command -v node` skipped the whole check and emitted NOTHING.
+    // Nothing special-cases this now — it simply never earns a HEALTHY upgrade.
+    linkInstance(); writeConfig(DEAD);
+    expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb(), PATH: "/usr/bin:/bin" }))).toBe("CANNOT-JUDGE");
+  });
+
+  it("emits EXACTLY ONE verdict — never two, never zero", () => {
+    linkInstance(); writeConfig(DEAD);
+    const out = runHook({ RELAY_DB_PATH: instanceDb() });
+    expect((out.match(/VERDICT=/g) ?? []).length).toBe(1);
+  });
+});
+
 describe("the diagnostics must never break the hook they ride on", () => {
   const shapes: Array<[string, () => void]> = [
     ["config absent", () => { /* no file at all */ }],
