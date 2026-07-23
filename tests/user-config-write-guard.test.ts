@@ -30,26 +30,24 @@ import path from "path";
 import os from "os";
 
 const { moduleRootFromUrl } = await import("../src/cli/init.js");
-const { atomicWriteJson, assertNotRealUserConfigWrite } = await import("../src/cli/config-merge.js");
+const { atomicWriteJson, assertNotRealUserConfigWrite, _setAccountHomeForTests } =
+  await import("../src/cli/config-merge.js");
 
 const SANDBOX = path.join(os.tmpdir(), "bot-relay-config-guard-" + process.pid);
-const REAL_HOME = process.env.HOME;
 const SAVED = {
   claudeHome: process.env.RELAY_CLAUDE_HOME,
   configPath: process.env.RELAY_CONFIG_PATH,
 };
 
 beforeEach(() => {
-  // The guard fires only when the redirect vars are ABSENT (their absence is
-  // the forgotten-sandbox defect). Clear them so each test states its case.
   delete process.env.RELAY_CLAUDE_HOME;
   delete process.env.RELAY_CONFIG_PATH;
+  fs.mkdirSync(SANDBOX, { recursive: true });
 });
 
 afterEach(() => {
-  // Restore env even if a test threw mid-way — a leaked sandbox HOME would
-  // corrupt every later test in this worker.
-  if (REAL_HOME !== undefined) process.env.HOME = REAL_HOME;
+  // Restore state even if a test threw mid-way.
+  _setAccountHomeForTests(null);
   if (SAVED.claudeHome !== undefined) process.env.RELAY_CLAUDE_HOME = SAVED.claudeHome;
   if (SAVED.configPath !== undefined) process.env.RELAY_CONFIG_PATH = SAVED.configPath;
   if (fs.existsSync(SANDBOX)) fs.rmSync(SANDBOX, { recursive: true, force: true });
@@ -68,45 +66,47 @@ describe("%20 fossil — moduleRootFromUrl decodes the module URL", () => {
 });
 
 describe("chokepoint — test-harness writes to REAL user config are refused", () => {
-  it("(G3) assertNotRealUserConfigWrite names all three protected files", () => {
-    // Direct contract check against the true home paths. The assert function
-    // never writes, so this is safe to run against the real locations.
+  it("(G3) assertNotRealUserConfigWrite names all three ACCOUNT-home files", () => {
+    // Direct contract check against the true account paths. The assert
+    // function never writes, so this is safe to run against the real
+    // locations. userInfo().homedir, not os.homedir(): the account database
+    // answer, immune to a sandboxed $HOME.
+    const home = os.userInfo().homedir;
     for (const p of [
-      path.join(os.homedir(), ".claude.json"),
-      path.join(os.homedir(), ".claude", "settings.json"),
-      path.join(os.homedir(), ".bot-relay", "config.json"),
+      path.join(home, ".claude.json"),
+      path.join(home, ".claude", "settings.json"),
+      path.join(home, ".bot-relay", "config.json"),
     ]) {
       expect(() => assertNotRealUserConfigWrite(p), p).toThrow(/refusing to write the REAL user config/);
     }
   });
 
-  it("(G3b) a PRESENT redirect var marks the environment as deliberately sandboxed — no refusal", () => {
-    // The subprocess-test shape (v2-1-cli-tooling, fresh-install-smoke): HOME
-    // itself is a temp dir AND RELAY_CLAUDE_HOME points into it. From inside,
-    // os.homedir() IS the sandbox — the redirect var's presence is the one
-    // signal that this was done on purpose, so the guard must stand down.
-    process.env.RELAY_CLAUDE_HOME = path.join(os.homedir());
-    expect(() => assertNotRealUserConfigWrite(path.join(os.homedir(), ".claude.json"))).not.toThrow();
-    process.env.RELAY_CONFIG_PATH = path.join(os.homedir(), ".bot-relay", "config.json");
+  it("(G3b) codex #125 blocker 1: pointing the redirect AT the real home does NOT stand the guard down", () => {
+    // The first guard version keyed on redirect-var PRESENCE; codex proved
+    // RELAY_CLAUDE_HOME=<real home> bypassed it. Account-home keying refuses
+    // the real paths no matter what the environment claims.
+    process.env.RELAY_CLAUDE_HOME = os.userInfo().homedir;
+    process.env.RELAY_CONFIG_PATH = path.join(os.userInfo().homedir, ".bot-relay", "config.json");
     expect(() =>
-      assertNotRealUserConfigWrite(path.join(os.homedir(), ".bot-relay", "config.json")),
-    ).not.toThrow();
+      assertNotRealUserConfigWrite(path.join(os.userInfo().homedir, ".claude.json")),
+    ).toThrow(/config-guard/);
+    expect(() =>
+      assertNotRealUserConfigWrite(path.join(os.userInfo().homedir, ".bot-relay", "config.json")),
+    ).toThrow(/config-guard/);
   });
 
-  it("(G4) atomicWriteJson ACTUALLY refuses — proven end-to-end under a sandboxed HOME", () => {
-    // os.homedir() follows $HOME on POSIX, so pointing HOME at a sandbox makes
-    // the sandbox's .claude.json "the real file" — the full chokepoint fires
-    // without any risk to the operator's actual config.
-    fs.mkdirSync(SANDBOX, { recursive: true });
-    process.env.HOME = SANDBOX;
+  it("(G4) atomicWriteJson ACTUALLY refuses — full chokepoint, temp account home", () => {
+    // _setAccountHomeForTests points the guard's notion of "the account" at a
+    // temp dir, so a BROKEN guard writes a temp file here — never the real
+    // config (the negative-control paradox solved).
+    _setAccountHomeForTests(SANDBOX);
     const target = path.join(SANDBOX, ".claude.json");
     expect(() => atomicWriteJson(target, { clobbered: true })).toThrow(/config-guard/);
     expect(fs.existsSync(target)).toBe(false); // the write NEVER landed
   });
 
   it("(G5) settings.json + relay config.json are protected by the same chokepoint", () => {
-    fs.mkdirSync(SANDBOX, { recursive: true });
-    process.env.HOME = SANDBOX;
+    _setAccountHomeForTests(SANDBOX);
     for (const target of [
       path.join(SANDBOX, ".claude", "settings.json"),
       path.join(SANDBOX, ".bot-relay", "config.json"),
@@ -116,11 +116,26 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     }
   });
 
+  it("(G5b) codex #125 blocker 2: a SYMLINK ALIAS to the account home is refused BEFORE any write", () => {
+    // path.resolve is lexical: alias/.claude.json !== home/.claude.json even
+    // though the write lands in home. The guard canonicalizes the deepest
+    // existing ancestor on both sides, so the alias resolves to the guarded
+    // path and is refused — and nothing is written through the link.
+    const home = path.join(SANDBOX, "acct-home");
+    const alias = path.join(SANDBOX, "alias");
+    fs.mkdirSync(home, { recursive: true });
+    fs.symlinkSync(home, alias);
+    _setAccountHomeForTests(home);
+    const viaAlias = path.join(alias, ".claude.json");
+    expect(() => atomicWriteJson(viaAlias, { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.existsSync(path.join(home, ".claude.json"))).toBe(false); // nothing landed through the link
+  });
+
   it("(G6) sandboxed writes still work — the guard blocks the clobber, not the installer", () => {
-    // RELAY_CLAUDE_HOME-redirected paths differ from the real files, so the
-    // real-installer coverage in v2-3-0-profiles / v2-16-0-* keeps running.
-    fs.mkdirSync(SANDBOX, { recursive: true });
-    const target = path.join(SANDBOX, "redirected-claude.json");
+    // A temp HOME / RELAY_CLAUDE_HOME resolves to different paths than the
+    // account home, so the real-installer coverage in v2-3-0-profiles /
+    // v2-1-cli-tooling / v2-16-0-* keeps running exactly as before.
+    const target = path.join(SANDBOX, ".claude.json"); // guarded-SHAPED, but not the account home
     atomicWriteJson(target, { mcpServers: {} });
     expect(JSON.parse(fs.readFileSync(target, "utf-8"))).toEqual({ mcpServers: {} });
   });
