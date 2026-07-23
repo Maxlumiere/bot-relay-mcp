@@ -121,3 +121,52 @@ describe("LLM adapters", () => {
     expect(adapterFor(undefined).id).toBe("claude");
   });
 });
+
+/**
+ * REGRESSION — a claude agent must get the CLAUDE wake, not Codex's.
+ *
+ * The existing coverage called adapterFor("claude") with NO overrides, so it
+ * could never see this: the REAL call site (resolveWakeAdapter) always passes a
+ * populated `codex` block, because it cannot know the llm before calling. Those
+ * overrides were then applied unconditionally, so every claude-configured agent
+ * received the Codex instruction with its name templated in. Testing the
+ * convenient shape instead of the shape production uses is why it survived.
+ */
+describe("profile isolation — codex options must not reshape the claude profile", () => {
+  it("adapterFor('claude', {codex:…}) still types the bare `inbox` and submits inline", () => {
+    const adapter = adapterFor("claude", {
+      codex: {
+        wakeText: 'Relay mail arrived — call get_messages(agent_name="victra-build", …)',
+        submitKey: "\r",
+        submitDelayMs: 150,
+        submitMethod: "sendSequence",
+      },
+    });
+    const sent: Array<[string, boolean | undefined]> = [];
+    const ctx = {
+      terminal: { sendText: (t: string, nl?: boolean) => sent.push([t, nl]) },
+      sendSequenceToTerminal: async () => { throw new Error("claude must not use sendSequence"); },
+      delay: async () => { throw new Error("claude must not delay — it submits inline"); },
+    };
+    return adapter.wake(ctx as never).then(() => {
+      expect(sent).toEqual([["inbox", true]]);
+      expect(adapter.wakeWord).toBe("inbox");
+    });
+  });
+
+  it("adapterFor('codex', {codex:…}) DOES still honour its own tuning (positive control)", () => {
+    // Without this, gating could be 'fixed' by ignoring the options entirely,
+    // which would silently un-tune every Codex agent.
+    const adapter = adapterFor("codex", { codex: { wakeText: "CUSTOM-CODEX-TEXT" } });
+    const sent: string[] = [];
+    const ctx = {
+      terminal: { sendText: (t: string) => sent.push(t) },
+      sendSequenceToTerminal: async () => { sent.push("<CR-sequence>"); },
+      delay: async () => {},
+    };
+    return adapter.wake(ctx as never).then(() => {
+      expect(sent[0]).toBe("CUSTOM-CODEX-TEXT");
+      expect(sent).toContain("<CR-sequence>");
+    });
+  });
+});
