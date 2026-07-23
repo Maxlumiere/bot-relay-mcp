@@ -78,4 +78,3 @@ These two paths remain intact. They are explicit operator actions with delete se
 
 - `README.md` — Quick Start.
 - `docs/multi-machine-deployment.md` — centralized HTTP daemon deployment (Phase 7r).
-- `architecture.md` — full architecture spec.
