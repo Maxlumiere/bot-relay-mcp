@@ -595,9 +595,9 @@ The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is
 
 **Honest limitation:** idle terminals get no delivery. The hook only fires when the agent is actively running tool calls. For long-idle windows, still rely on SessionStart + human attention.
 
-## Turn-End Mail Delivery (v2.1)
+## Turn-Boundary Wake (v2.1, rewritten v2.23)
 
-`PostToolUse` only fires on turns that include at least one tool call. A text-only turn (Claude responds with no tool invocation) does not trigger it. The `Stop` hook — `hooks/stop-check.sh` — closes that gap by firing on every turn-end, whether or not the turn invoked tools. Install both together in your project's `.claude/settings.json`:
+`PostToolUse` only fires on turns that include at least one tool call. A text-only turn (Claude responds with no tool invocation) does not trigger it. The `Stop` hook — `hooks/stop-check.sh` — closes that gap by firing at every turn end, whether or not the turn invoked tools. It is a **read-only wake**: it peeks at the mailbox and, if mail is pending, emits `decision:"block"` so the agent continues immediately and fetches its own mail via `get_messages`. The hook itself never marks anything read — a wake that cannot prove delivery must not consume (`additionalContext` on Stop is queued for a next turn that may never come, so the original mark-read-and-inject shape was a silent data-loss path). Install both together in your project's `.claude/settings.json`:
 
 ```json
 {
@@ -618,7 +618,7 @@ The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is
 }
 ```
 
-Same single-quote-the-path-if-it-contains-spaces rule, same env vars, same HTTP/sqlite fallback, same silent-fail contract as `PostToolUse`. Full docs + troubleshooting in [`docs/stop-hook.md`](./docs/stop-hook.md).
+Same single-quote-the-path-if-it-contains-spaces rule, same env vars, same HTTP/sqlite fallback (both non-mutating: `peek:true` over HTTP, a bare SELECT over sqlite — no mutating SQL exists in the script), same silent-fail contract as `PostToolUse`. Two loop guards bound the blocking: `stop_hook_active` in the hook payload (one wake per natural stop) and a time damper (`RELAY_STOP_WAKE_DAMPER_SECS`, default 120s) that applies only when the payload lacks a parseable `stop_hook_active`. All guards leave mail pending when they suppress — a delayed wake, never a lost one. Full docs + troubleshooting in [`docs/stop-hook.md`](./docs/stop-hook.md).
 
 **Honest limitation:** `Stop` does NOT wake truly idle terminals. If no turn is in progress, neither hook fires. For long-idle windows, use the Layer 2 Managed Agent reference (`examples/managed-agent-reference/`).
 
