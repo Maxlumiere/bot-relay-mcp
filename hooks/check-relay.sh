@@ -182,6 +182,89 @@ if [ -z "$RESOLVED_DB_PATH" ] || { [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ 
 fi
 DB_PATH="$RESOLVED_DB_PATH"
 
+# --- SELF-DIAGNOSING MUTE DETECTION -----------------------------------------
+# Standing rule: a failure that presents as normal operation must be converted
+# into a loud one. Two harms are covered here, and the second is the dangerous
+# one because the session looks perfectly healthy while it happens.
+#
+#   HARM 1 — MUTE. The bot-relay entry in ~/.claude.json points at a path that
+#     does not exist, so the MCP server never starts and the session simply has
+#     no relay tools. Looks like "nothing to report".
+#   HARM 2 — CONNECTED BUT WRONG INSTANCE. Tools work, registration succeeds,
+#     health is green — and the process resolved the flat legacy DB while the
+#     real mailbox lives under ~/.bot-relay/instances/<id>/. The inbox is empty
+#     forever. This is silent message loss; it cost nine days before anyone saw
+#     it. Mirrors assertInstanceResolution() in src/instance.ts.
+#
+# Written to STDOUT deliberately: SessionStart hook stdout is injected into the
+# session as context, so the agent itself reads the warning and can refuse to
+# proceed as connected. A copy goes to stderr for the operator's terminal.
+RELAY_ROOT="${HOME}/.bot-relay"
+RELAY_LEGACY_DB="${RELAY_ROOT}/relay.db"
+RELAY_INSTANCES_DIR="${RELAY_ROOT}/instances"
+
+RELAY_INSTANCE_DIR_COUNT=0
+if [ -d "$RELAY_INSTANCES_DIR" ]; then
+  RELAY_INSTANCE_DIR_COUNT=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+# HARM 2 — the contradiction: instances exist, yet we resolved the flat legacy DB.
+if [ "${RELAY_INSTANCE_DIR_COUNT:-0}" -gt 0 ] && [ "$DB_PATH" = "$RELAY_LEGACY_DB" ]; then
+  RELAY_AVAILABLE_IDS=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
+  {
+    echo "[RELAY] *** WRONG INSTANCE — DO NOT PROCEED AS CONNECTED ***"
+    echo "[RELAY] Relay tools may work, but this session resolved the LEGACY database:"
+    echo "[RELAY]     using     : $DB_PATH"
+    echo "[RELAY]     instances : ${RELAY_AVAILABLE_IDS:-(unreadable)}"
+    echo "[RELAY] Your real mailbox lives under an instance directory, so your inbox will"
+    echo "[RELAY] read EMPTY no matter how much mail is sent to you. This is silent message"
+    echo "[RELAY] loss, not a quiet inbox."
+    echo "[RELAY] FIX: set RELAY_INSTANCE_ID=<id>, or run \`relay use-instance <id>\`, then RESTART."
+    echo "[RELAY] Report this to your orchestrator rather than working around it."
+  } | tee /dev/stderr
+fi
+
+# HARM 1 — the configured MCP server path does not exist => this session is mute.
+# Uses node (already a hard dependency of the relay) and stays silent if the
+# config is absent or unreadable; a missing check must never break the hook.
+if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
+  RELAY_MUTE_PATH=$(node -e '
+    try {
+      const fs = require("fs");
+      const c = JSON.parse(fs.readFileSync(process.env.HOME + "/.claude.json", "utf8"));
+      let bad = "";
+      const walk = (o) => {
+        if (!o || typeof o !== "object") return;
+        if (o.mcpServers) {
+          for (const [k, v] of Object.entries(o.mcpServers)) {
+            if (!/relay/i.test(k)) continue;
+            const p = v && Array.isArray(v.args) ? v.args.find(a => /index\.js$/.test(a)) : null;
+            if (p && !fs.existsSync(p)) bad = p;
+          }
+        }
+        for (const [k, v] of Object.entries(o)) {
+          if (k !== "mcpServers" && v && typeof v === "object") walk(v);
+        }
+      };
+      walk(c);
+      process.stdout.write(bad);
+    } catch (e) { /* never break the hook on a config we cannot read */ }
+  ' 2>/dev/null)
+  if [ -n "${RELAY_MUTE_PATH:-}" ]; then
+    {
+      echo "[RELAY] *** RELAY MUTE — NO RELAY TOOLS THIS SESSION ***"
+      echo "[RELAY] The bot-relay MCP entry in ~/.claude.json points at a path that does not exist:"
+      echo "[RELAY]     $RELAY_MUTE_PATH"
+      echo "[RELAY] The MCP server cannot start, so you have NO relay tools — you are unable to"
+      echo "[RELAY] send or receive. Silence from you will look identical to having nothing to say."
+      echo "[RELAY] FIX: re-add the server (\`claude mcp add\`) with a path that exists, then RESTART."
+      echo "[RELAY] Until then, use the CLI fallback for every message you would have relayed:"
+      echo "[RELAY]     node ~/bot-relay-mcp/bin/relay send <TO> \"<MSG>\" --from <YOUR_NAME>"
+      echo "[RELAY] Announce this to your orchestrator immediately. Do not proceed as connected."
+    } | tee /dev/stderr
+  fi
+fi
+
 # If there's no DB yet, nothing to do
 if [ ! -f "$DB_PATH" ]; then
   exit 0
