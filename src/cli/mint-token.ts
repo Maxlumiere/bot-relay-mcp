@@ -95,8 +95,13 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function printUsage(): void {
-  process.stdout.write(
+function printUsage(requested = false): void {
+  // STREAM DISCIPLINE: usage is diagnostic on the ERROR path, so it goes to
+  // STDERR. On stdout it poisoned command substitutions — a failed
+  // $(relay mint-token ... --json) captured the help text and the agent
+  // launched with a garbage token that LOOKED like a value. `requested`
+  // (an explicit --help) is the one case where the text IS the data.
+  (requested ? process.stdout : process.stderr).write(
     "Usage: relay mint-token <name> [--role <role>] [--capabilities <c1,c2,...>]\n" +
       "                          [--description <text>] [--force] [--json]\n" +
       "                          [--db-path <path>]\n\n" +
@@ -170,7 +175,7 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   if (args.help) {
-    printUsage();
+    printUsage(true);
     return 0;
   }
   if (!args.name) {

@@ -487,6 +487,14 @@ export function startHttpServer(port: number, host: string): Server {
       // `<=` — uptime is non-decreasing within one process, so `<=` would
       // false-trigger on two equal readings.
       uptime_seconds: Math.floor(process.uptime()),
+      // The daemon's outbox tail is the SOLE writer of wake markers, so this
+      // process is the only thing that can answer "will markers actually be
+      // written?". Exposed so `relay watch` can assert the wake path END TO END
+      // instead of echoing its own env — a watcher that merely reads its own
+      // RELAY_FILESYSTEM_MARKERS can print "event-driven" while nothing on the
+      // producer side ever touches the marker. Reachability alone is not proof;
+      // this field is what makes the assertion honest.
+      filesystem_markers: markersEnabled(),
     });
   });
 

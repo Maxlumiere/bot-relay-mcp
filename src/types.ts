@@ -112,6 +112,7 @@ export const RegisterAgentSchema = z.object({
     ),
   recovery_token: z.string().min(1).optional().describe("v2.1 Phase 4b.1 v2: required when re-registering an agent whose auth_state is 'recovery_pending'. Obtained from the revoker's revoke_token response (shown ONCE) and handed off to the operator out-of-band."),
   managed: z.boolean().default(false).describe("v2.1 Phase 4b.2: true = agent is a Managed Agent wrapper that can parse push-token messages + self-update its local config on rotation. false (default) = Claude Code terminal or equivalent (restart-required on rotation). Immutable after first registration — change requires unregister + fresh register."),
+  cli_profile: z.string().max(64).optional().describe("Which agent-CLI this session runs under (e.g. \"claude\", \"codex\"). Set by the SessionStart hook; VALIDATED against the agent-CLI profile registry and stored as NULL when unrecognised — never defaulted, because a wrong default would make the verdict-absence check fire on healthy agents. Enables the server to know whether this agent OWES a session-start verdict."),
   class: AgentClassEnum.optional().describe("ADR-0002 (v2.21.0): the agent's COARSE coordination posture — one of orchestrator | builder | advisory | auditor | transient (SSOT: src/agent-class.ts). Self-declared; IMMUTABLE after first registration (same rule as managed/host_id). Orthogonal to `role` (free-text label) and `capabilities` (what it does). Omit → `unclassified`; surfaced in discover_agents view='topology'."),
   /**
    * v2.2.1 B2: bypass the duplicate-name active-session collision check.
@@ -902,6 +903,10 @@ export interface AgentRecord {
   managed?: number;
   /** ADR-0002 (schema v21): self-declared coarse coordination posture (SSOT src/agent-class.ts). NULL on legacy rows → normalized to `unclassified` on read. Immutable after first register. */
   class?: string | null;
+  /** Phase A (schema v22): relay build that SERVED this row's last register. Stdio servers are spawned per session from dist and run that build for life, so a machine routinely runs several versions at once — and until this column there was no way to ask a stdio server which one it was. */
+  server_version?: string | null;
+  /** Phase A (schema v22): which agent-CLI this row registered through, validated against the profile registry. NULL = UNKNOWN and is never asked for a session-start verdict. */
+  cli_profile?: string | null;
   /** v2.1 Phase 4b.2: ISO timestamp of rotation grace window expiry. Populated iff state=rotation_grace. */
   rotation_grace_expires_at?: string | null;
   /** v2.1 Phase 4b.2: bcrypt hash of pre-rotation token. Populated iff state=rotation_grace; allows the old token to auth alongside the new token during the grace window. */

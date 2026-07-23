@@ -35,6 +35,49 @@ const HOOK_CHECK_RELAY = path.join(REPO_ROOT, "hooks", "check-relay.sh");
 const HOOK_POST_TOOL = path.join(REPO_ROOT, "hooks", "post-tool-use-check.sh");
 const HOOK_STOP = path.join(REPO_ROOT, "hooks", "stop-check.sh");
 
+/**
+ * DERIVED HOOK SET — deliberately NOT a written list.
+ *
+ * The previous cross-hook block was named "all 3 hooks" and looped over three
+ * hardcoded paths. hooks/codex/codex-session-start.sh was never in it, so the
+ * mechanism built to enforce cross-hook discipline had precisely the blind spot
+ * it existed to prevent. A fifth hook would have been missed the same way.
+ *
+ * So the set is enumerated from the hooks directory. A new hook is a MEMBER BY
+ * DEFAULT and fails these contracts until it complies; opting out requires
+ * adding a name to NON_HOOK_FILES below, which is a visible, reviewable edit
+ * rather than a silent omission.
+ */
+const NON_HOOK_FILES = new Set([
+  "_vault-helpers.sh", // sourced helper library, never executed directly
+  "_verdict.sh",       // sourced verdict primitive, never executed directly
+]);
+
+function discoverHooks(): string[] {
+  const root = path.join(REPO_ROOT, "hooks");
+  const found: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (NON_HOOK_FILES.has(entry.name)) continue;
+      // EXECUTABLE, not ".sh". codex dropped in `hooks/audit-unseen-hook` with
+      // no suffix and the contract still passed 17/17 — a manually configured
+      // no-suffix or .bash hook is a valid entry point yet was invisible to the
+      // very test meant to catch invisible hooks. Suffix is a naming habit;
+      // the executable bit is what actually makes something a hook.
+      let executable = false;
+      try { fs.accessSync(full, fs.constants.X_OK); executable = true; } catch { /* not executable */ }
+      if (!executable && !entry.name.endsWith(".sh")) continue;
+      found.push(full);
+    }
+  };
+  walk(root);
+  return found.sort();
+}
+
+const ALL_HOOKS = discoverHooks();
+
 const TEST_ROOT = path.join(os.tmpdir(), "v2-6-2-hook-contracts-" + process.pid);
 
 function freshTestRoot(): { root: string; dbPath: string; vaultDir: string } {
@@ -122,6 +165,33 @@ interface RunOpts {
   extraEnv?: Record<string, string>;
 }
 
+/**
+ * v2.22 VERDICT INVERSION — check-relay.sh now emits exactly ONE verdict line on
+ * every run, because "silent stdout" previously meant BOTH "healthy" and
+ * "detector died", and four separate audit findings exploited that ambiguity.
+ *
+ * The original contracts here are preserved in INTENT, not in letter: stdout
+ * must still carry no partial JSON, no stack traces, and no echo of rejected
+ * input. What changed is that an empty stdout is no longer the way to express
+ * "nothing to report" — a verdict is. So we strip the single verdict line and
+ * assert the REMAINDER is empty, plus assert the verdict itself leaks nothing.
+ */
+function stripVerdict(stdout: string): string {
+  return stdout
+    .split("\n")
+    .filter((l) => !l.startsWith("[RELAY] VERDICT="))
+    .join("\n")
+    .trim();
+}
+
+/** The verdict must never echo attacker-controlled input back to the session. */
+function assertVerdictLeaksNothing(stdout: string, secrets: string[]): void {
+  const line = stdout.split("\n").find((l) => l.startsWith("[RELAY] VERDICT=")) ?? "";
+  for (const secret of secrets) {
+    if (secret) expect(line).not.toContain(secret);
+  }
+}
+
 function runHook(o: RunOpts): { status: number; stdout: string; stderr: string } {
   const env: Record<string, string> = {
     HOME: o.home,
@@ -167,7 +237,7 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
       httpPort: 1, // privileged port, ECONNREFUSED instantly
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(C2) DB present + matching agent + pending message → stdout includes [RELAY] Pending messages line", () => {
@@ -198,7 +268,7 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
     expect(r.stderr).toMatch(/RELAY_AGENT_NAME has invalid characters/);
   });
 
@@ -243,7 +313,7 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     });
     // Either status 0 with stderr warning, OR clean exit. Whatever shape,
     // stdout MUST be empty (never partial-state context).
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 });
 
@@ -258,7 +328,7 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(P2) invalid agent name → exit 0, empty stdout", () => {
@@ -270,7 +340,7 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(P3) valid agent name + DB present + pending message → stdout is single-line JSON with hookEventName=PostToolUse", () => {
@@ -310,7 +380,7 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1, // ECONNREFUSED
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(P5) malformed RELAY_AGENT_TOKEN (contains space) → token discarded, no auth header sent, exit 0", () => {
@@ -345,7 +415,7 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 
   it("(S2) valid agent name + DB present + pending message → stdout is single-line JSON with hookEventName=Stop", () => {
@@ -381,16 +451,94 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
       httpPort: 1,
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toBe("");
+    expect(stripVerdict(r.stdout)).toBe("");
   });
 });
 
 // --- Cross-hook invariants ---
 describe("v2.6.2 — cross-hook invariants", () => {
-  it("all 3 hooks NEVER emit partial JSON or stack traces to stdout (output contract discipline)", () => {
+  it("discovers every hook — the set is derived, not written down", () => {
+    // Guards the guard. The old hardcoded trio silently excluded the Codex
+    // hook; if discovery ever returns fewer hooks than exist on disk, this
+    // fails rather than quietly shrinking the coverage of everything below.
+    const names = ALL_HOOKS.map((h) => path.basename(h));
+    expect(names).toContain("check-relay.sh");
+    expect(names).toContain("codex-session-start.sh"); // the one that was missed
+    expect(names).toContain("post-tool-use-check.sh");
+    expect(names).toContain("stop-check.sh");
+    expect(ALL_HOOKS.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("EVERY hook still emits a verdict when the SHARED HELPER IS CORRUPTED", () => {
+    // codex round 4, HIGH. A shared primitive CANNOT GUARANTEE ITS OWN LOADER:
+    // corrupting hooks/_verdict.sh made all four hooks print a source error,
+    // exit 0, and emit ZERO verdicts — the exact silence the mechanism exists
+    // to end, reintroduced at the loader boundary. Each hook now installs a
+    // minimal fallback trap BEFORE sourcing; a healthy load upgrades it.
+    const helper = path.join(REPO_ROOT, "hooks", "_verdict.sh");
+    const original = fs.readFileSync(helper, "utf8");
+    try {
+      fs.writeFileSync(helper, "this is not valid bash (((\n");
+      const { root } = freshTestRoot();
+      for (const hook of ALL_HOOKS) {
+        const r = runHook({ hook, root, agentName: "probe" });
+        const combined = `${r.stdout}\n${r.stderr}`;
+        const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+        expect(count, `${path.basename(hook)} emitted ${count} verdicts with a CORRUPT helper`).toBe(1);
+      }
+    } finally {
+      fs.writeFileSync(helper, original);
+    }
+  });
+
+  it("EVERY hook still emits a verdict when the SHARED HELPER IS ABSENT", () => {
+    // The other half: post/stop/codex guard the source with `if [ -f ]`, which
+    // silently accepts a missing helper. Absence must still produce a verdict.
+    const helper = path.join(REPO_ROOT, "hooks", "_verdict.sh");
+    const original = fs.readFileSync(helper, "utf8");
+    try {
+      fs.rmSync(helper);
+      const { root } = freshTestRoot();
+      for (const hook of ALL_HOOKS) {
+        const r = runHook({ hook, root, agentName: "probe" });
+        const combined = `${r.stdout}\n${r.stderr}`;
+        const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+        expect(count, `${path.basename(hook)} emitted ${count} verdicts with NO helper`).toBe(1);
+      }
+    } finally {
+      fs.writeFileSync(helper, original);
+    }
+  });
+
+  it("check-relay's verdict stream is NOT forgeable by inherited environment", () => {
+    // codex round 4, MED. Claude SessionStart injects STDOUT, so an inherited
+    // RELAY_VERDICT_STREAM=stderr would redirect the agent-visible verdict away
+    // from the agent. check-relay pins it explicitly before loading.
+    const { root } = freshTestRoot();
+    const hook = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+    const r = runHook({ hook, root, agentName: "probe", env: { RELAY_VERDICT_STREAM: "stderr" } });
+    expect((r.stdout.match(/VERDICT=/g) ?? []).length, "verdict was redirected off stdout").toBe(1);
+    expect((r.stderr.match(/VERDICT=/g) ?? []).length).toBe(0);
+  });
+
+  it("EVERY hook emits EXACTLY ONE verdict — a new hook cannot quietly opt out", () => {
+    // The whole point of the inversion: absence of a verdict is failure. A hook
+    // added later is a member of ALL_HOOKS by default, so it fails here until
+    // it sources _verdict.sh. Verdict may ride stdout or stderr — hooks whose
+    // stdout is structured JSON must use stderr, so both streams are searched.
+    const { root } = freshTestRoot();
+    for (const hook of ALL_HOOKS) {
+      const r = runHook({ hook, root, agentName: "probe" });
+      const combined = `${r.stdout}\n${r.stderr}`;
+      const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+      expect(count, `hook ${path.basename(hook)} emitted ${count} verdicts (expected exactly 1)`).toBe(1);
+    }
+  });
+
+  it("EVERY discovered hook NEVER emits partial JSON or stack traces to stdout (output contract discipline)", () => {
     // Empty everything; all 3 hooks must exit 0 with empty stdout.
     const { root } = freshTestRoot();
-    for (const hook of [HOOK_CHECK_RELAY, HOOK_POST_TOOL, HOOK_STOP]) {
+    for (const hook of ALL_HOOKS) {
       const r = runHook({
         hook,
         agentName: "",
@@ -399,13 +547,13 @@ describe("v2.6.2 — cross-hook invariants", () => {
         httpPort: 1,
       });
       expect(r.status, `hook ${path.basename(hook)} exited ${r.status} (expected 0)`).toBe(0);
-      expect(r.stdout, `hook ${path.basename(hook)} emitted unexpected stdout: ${r.stdout}`).toBe("");
+      expect(stripVerdict(r.stdout), `hook ${path.basename(hook)} emitted unexpected stdout: ${r.stdout}`).toBe("");
     }
   });
 
-  it("all 3 hooks reject invalid agent name silently with exit 0 (no info leak)", () => {
+  it("EVERY discovered hook rejects an invalid agent name silently with exit 0 (no info leak)", () => {
     const { root } = freshTestRoot();
-    for (const hook of [HOOK_CHECK_RELAY, HOOK_POST_TOOL, HOOK_STOP]) {
+    for (const hook of ALL_HOOKS) {
       const r = runHook({
         hook,
         agentName: "has space and weird chars",
@@ -414,7 +562,9 @@ describe("v2.6.2 — cross-hook invariants", () => {
       });
       expect(r.status, `hook ${path.basename(hook)} exited ${r.status}`).toBe(0);
       // stderr CAN have a warning (check-relay.sh emits one); stdout MUST be empty
-      expect(r.stdout, `hook ${path.basename(hook)} stdout: ${r.stdout}`).toBe("");
+      expect(stripVerdict(r.stdout), `hook ${path.basename(hook)} stdout: ${r.stdout}`).toBe("");
+      // Intent preserved: the rejected name must not come back in the verdict.
+      assertVerdictLeaksNothing(r.stdout, ["bad name", "bad;name", "$(whoami)"]);
     }
   });
 });

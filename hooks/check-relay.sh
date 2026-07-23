@@ -30,6 +30,32 @@
 # - DB_PATH is resolved and must live under $HOME (no /etc/passwd shenanigans).
 # - SQL is parameterised via sqlite3's `.parameter set` rather than string-interpolated.
 
+# VERDICT BY CONSTRUCTION — must be the FIRST executable code in this file.
+# Shared with every other relay hook so there is ONE implementation and no
+# inline copy can rot silently. See hooks/_verdict.sh for the full rationale,
+# the two invariants, and the honest boundary (SIGKILL / hook-never-runs).
+RELAY_VERDICT_STREAM=stdout
+# FALLBACK VERDICT — installed BEFORE the shared helper is sourced, and this
+# ordering is the whole point. A SHARED PRIMITIVE CANNOT GUARANTEE ITS OWN
+# LOADER: if _verdict.sh is missing or unparseable, sourcing it fails and every
+# verdict vanishes, which is the exact silence this mechanism exists to end
+# (codex round 4 proved it by corrupting the helper — all four hooks then
+# emitted ZERO verdicts and exited 0).
+# These definitions are deliberately self-contained. Sourcing the helper
+# REDEFINES them, so a healthy load transparently upgrades this fallback; the
+# trap resolves `relay_emit_verdict` by name at exit time.
+RELAY_VERDICT="CANNOT-JUDGE"
+RELAY_VERDICT_REASON="verdict helper did not load"
+RELAY_VERDICT_DETAIL=""
+relay_emit_verdict() {
+  _l="[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
+  if [ "${RELAY_VERDICT_STREAM:-stdout}" = "stderr" ]; then echo "$_l" >&2; else echo "$_l"; fi
+}
+trap relay_emit_verdict EXIT
+RELAY_VERDICT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./_verdict.sh
+. "$RELAY_VERDICT_DIR/_verdict.sh"
+
 # v2.0 final (#19): self-check for path truncation. When .claude/settings.json
 # references this script with an unquoted path containing spaces, only the
 # first word reaches $0 — the script silently fails to find itself.
@@ -181,6 +207,208 @@ if [ -z "$RESOLVED_DB_PATH" ] || { [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ 
   exit 0
 fi
 DB_PATH="$RESOLVED_DB_PATH"
+
+# --- SELF-DIAGNOSING MUTE DETECTION -----------------------------------------
+# Standing rule: a failure that presents as normal operation must be converted
+# into a loud one. Two harms are covered here, and the second is the dangerous
+# one because the session looks perfectly healthy while it happens.
+#
+#   HARM 1 — MUTE. The bot-relay entry in ~/.claude.json points at a path that
+#     does not exist, so the MCP server never starts and the session simply has
+#     no relay tools. Looks like "nothing to report".
+#   HARM 2 — CONNECTED BUT WRONG INSTANCE. Tools work, registration succeeds,
+#     health is green — and the process resolved the flat legacy DB while the
+#     real mailbox lives under ~/.bot-relay/instances/<id>/. The inbox is empty
+#     forever. This is silent message loss; it cost nine days before anyone saw
+#     it. Mirrors assertInstanceResolution() in src/instance.ts.
+#
+# Written to STDOUT deliberately: SessionStart hook stdout is injected into the
+# session as context, so the agent itself reads the warning and can refuse to
+# proceed as connected. A copy goes to stderr for the operator's terminal.
+# RELAY_HOME mirrors botRelayRoot() in src/instance.ts — the hook and the server
+# must agree on where the namespace lives or their diagnostics will contradict
+# each other (codex HIGH: hardcoding $HOME/.bot-relay diverged from the server).
+RELAY_ROOT="${RELAY_HOME:-${HOME}/.bot-relay}"
+RELAY_LEGACY_DB="${RELAY_ROOT}/relay.db"
+RELAY_INSTANCES_DIR="${RELAY_ROOT}/instances"
+
+RELAY_INSTANCE_DIR_COUNT=0
+if [ -d "$RELAY_INSTANCES_DIR" ]; then
+  RELAY_INSTANCE_DIR_COUNT=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+# HARM 2 — the contradiction: instances exist, yet we resolved the flat legacy DB.
+#
+# An explicit RELAY_DB_PATH is a DELIBERATE OPERATOR CHOICE and must never be
+# reported as a fault — assertInstanceResolution() already treats it that way,
+# and the two halves contradicting each other is worse than either being wrong
+# alone. Without this guard the hook tells a legitimate legacy-DB session that
+# it has lost its mail (codex HIGH).
+if [ -z "${RELAY_DB_PATH:-}" ] && [ "${RELAY_INSTANCE_DIR_COUNT:-0}" -gt 0 ] && [ "$DB_PATH" = "$RELAY_LEGACY_DB" ]; then
+  # Set OUTSIDE the `{ ... } | tee` below: a pipeline runs in a SUBSHELL, so an
+  # assignment made inside it is discarded when that subshell exits.
+  relay_verdict_set "MUTE" "resolved the legacy DB while instances exist — inbox will read empty" " db=\"$DB_PATH\""
+  RELAY_AVAILABLE_IDS=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
+  {
+    echo "[RELAY] *** WRONG INSTANCE — DO NOT PROCEED AS CONNECTED ***"
+    echo "[RELAY] Relay tools may work, but this session resolved the LEGACY database:"
+    echo "[RELAY]     using     : $DB_PATH"
+    echo "[RELAY]     instances : ${RELAY_AVAILABLE_IDS:-(unreadable)}"
+    echo "[RELAY] Your real mailbox lives under an instance directory, so your inbox will"
+    echo "[RELAY] read EMPTY no matter how much mail is sent to you. This is silent message"
+    echo "[RELAY] loss, not a quiet inbox."
+    echo "[RELAY] FIX: set RELAY_INSTANCE_ID=<id>, or run \`relay use-instance <id>\`, then RESTART."
+    echo "[RELAY] Report this to your orchestrator rather than working around it."
+  } | tee /dev/stderr
+fi
+
+# HARM 1 — the configured MCP server path does not exist => this session is mute.
+# Uses node (already a hard dependency of the relay) and stays silent if the
+# config is absent or unreadable; a missing check must never break the hook.
+if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
+  # SELF-CHECK THE SELF-CHECK. This block's job is to SPEAK UP, so it must not be
+  # allowed to fail quietly. It already did once: a top-level `return` in the
+  # script below is an Illegal Return SyntaxError, `2>/dev/null` swallowed it,
+  # and the entire mute detector was silently disabled while every
+  # must-stay-silent test still passed — dead code is silent too.
+  # So stderr is captured rather than discarded, and a non-zero exit is reported
+  # as a failure OF THE DIAGNOSTIC. A silence-detector that can die silently is
+  # worse than none, because its quiet reads as "all clear".
+  RELAY_DIAG_ERR=$(mktemp -t relay-diag 2>/dev/null || echo "/tmp/relay-diag.$$")
+  RELAY_MUTE_PATH=$(node -e '
+    const fs = require("fs");
+
+    // PARSE is allowed to fail quietly: a malformed or unreadable config is a
+    // legitimate "cannot judge", not a detector fault, and must not nag.
+    // TRAVERSAL is NOT — codex found that a valid but deeply nested config
+    // (12k wrappers) overflows the stack, and a broad catch turned that
+    // RangeError into a successful zero-output run: no mute warning, no
+    // self-check failure, complete silence. So the two are separated, and
+    // anything unexpected below is rethrown to become a non-zero exit.
+    let c = null;
+    try {
+      c = JSON.parse(fs.readFileSync(process.env.HOME + "/.claude.json", "utf8"));
+    } catch (e) { c = null; }
+
+    // Distinct sentinel: "could not read/parse" must NOT be mistaken for
+    // "parsed fine, nothing wrong". Identical observables was the whole bug.
+    if (c === null) { process.stdout.write("PARSE-FAILED"); }
+
+    if (c !== null) {
+
+      // Identify the CANONICAL bot-relay entry, not anything merely relay-NAMED.
+      // Matching /relay/i on the key falsely accused an unrelated stale server
+      // and told the agent to stop acting connected while a perfectly good relay
+      // entry existed (codex HIGH). A false "you are mute" is worse than no
+      // check at all, because the agent obeys it.
+      // Canonical = the key `relay init` writes ("bot-relay"), or a stdio entry
+      // whose command path is unmistakably this product.
+      const isCanonical = (k, v) => {
+        if (k === "bot-relay") return true;
+        const args = (v && Array.isArray(v.args)) ? v.args : [];
+        return args.some(a => typeof a === "string" && /bot-relay-mcp\/dist\/index\.js$/.test(a));
+      };
+
+      // ITERATIVE traversal with an explicit stack. A recursive walk overflows
+      // on a deeply nested config, and an overflow here is indistinguishable
+      // from "nothing wrong" — codex reproduced exactly that with 12k wrappers.
+      // Depth is bounded as defence-in-depth; hitting the bound is reported as
+      // a detector failure rather than silently truncating the search.
+      const candidates = [];
+      const MAX_NODES = 200000;
+      let visited = 0;
+      const stack = [c];
+      while (stack.length > 0) {
+        const o = stack.pop();
+        if (!o || typeof o !== "object") continue;
+        if (++visited > MAX_NODES) {
+          throw new Error("relay mute scan aborted: config exceeds " + MAX_NODES + " nodes");
+        }
+        if (o.mcpServers && typeof o.mcpServers === "object") {
+          for (const [k, v] of Object.entries(o.mcpServers)) {
+            if (isCanonical(k, v)) candidates.push(v);
+          }
+        }
+        for (const [k, v] of Object.entries(o)) {
+          if (k !== "mcpServers" && v && typeof v === "object") stack.push(v);
+        }
+      }
+
+      // An HTTP/SSE entry has no filesystem path to rot, so it is healthy by
+      // construction here. A stdio entry is healthy iff its script exists.
+      const pathOf = (v) => (Array.isArray(v.args) ? v.args.find(a => /index\.js$/.test(a)) : null) || null;
+      const isHealthy = (v) => {
+        if (v && (v.type === "http" || v.type === "sse" || v.url)) return true;
+        const p = pathOf(v);
+        return p ? fs.existsSync(p) : true; // no resolvable path => cannot judge => do not accuse
+      };
+
+      // Only warn when EVERY canonical entry is broken. If any one of them works,
+      // this session has relay tools and must not be told otherwise.
+      // NOTE: computed as an expression, NOT with early `return` — a top-level
+      // return is an Illegal Return SyntaxError under `node -e`, and with the
+      // stderr redirect below it fails SILENTLY, disabling this whole check.
+      // That exact mistake shipped once and is why the positive control exists.
+      const broken =
+        (candidates.length === 0 || candidates.some(isHealthy))
+          ? ""
+          : (candidates.map(pathOf).filter(Boolean)[0] || "");
+      process.stdout.write(broken);
+    }
+  ' 2>"$RELAY_DIAG_ERR")
+  RELAY_DIAG_RC=$?
+  if [ "$RELAY_DIAG_RC" -ne 0 ]; then
+    RELAY_VERDICT_REASON="mute self-check failed to run (exit $RELAY_DIAG_RC)"
+    # The detector itself failed to run. Say so — do NOT let this read as "no
+    # problems found". This is the exact failure that shipped once.
+    {
+      echo "[RELAY] *** MUTE SELF-CHECK FAILED TO RUN (exit $RELAY_DIAG_RC) ***"
+      echo "[RELAY] The relay-config diagnostic could not execute, so this session's"
+      echo "[RELAY] connectivity is UNVERIFIED — treat its silence as unknown, not as healthy."
+      RELAY_DIAG_MSG=$(head -c 400 "$RELAY_DIAG_ERR" 2>/dev/null | tr '\n' ' ')
+      [ -n "${RELAY_DIAG_MSG:-}" ] && echo "[RELAY]   $RELAY_DIAG_MSG"
+    } | tee /dev/stderr
+    # DISCARD the partial stdout of a detector that failed. A process can write
+    # a plausible-looking path AND THEN die; trusting that byte stream produced
+    # two contradictory definitive banners at once — UNVERIFIED and "you are
+    # mute" — off untrusted output (codex MED). When the detector failed, the
+    # only honest verdict is UNVERIFIED, so the mute branch must not run.
+    RELAY_MUTE_PATH=""
+  fi
+  rm -f "$RELAY_DIAG_ERR" 2>/dev/null
+  if [ "${RELAY_MUTE_PATH:-}" = "PARSE-FAILED" ]; then
+    RELAY_VERDICT_REASON="relay config could not be read or parsed"
+    RELAY_MUTE_PATH=""
+    # Blocks the HEALTHY upgrade below. "Could not parse" is CANNOT-JUDGE; the
+    # detector ran but reached no conclusion, and treating that as healthy is
+    # the exact conflation this redesign exists to remove.
+    RELAY_PARSE_FAILED=1
+  elif [ -n "${RELAY_MUTE_PATH:-}" ]; then
+    # Hoisted out of the piped brace-group below — see subshell note above.
+    relay_verdict_set "MUTE" "configured relay path does not exist" " path=\"$RELAY_MUTE_PATH\""
+    {
+      echo "[RELAY] *** RELAY MUTE — NO RELAY TOOLS THIS SESSION ***"
+      echo "[RELAY] The bot-relay MCP entry in ~/.claude.json points at a path that does not exist:"
+      echo "[RELAY]     $RELAY_MUTE_PATH"
+      echo "[RELAY] The MCP server cannot start, so you have NO relay tools — you are unable to"
+      echo "[RELAY] send or receive. Silence from you will look identical to having nothing to say."
+      echo "[RELAY] FIX: re-add the server (\`claude mcp add\`) with a path that exists, then RESTART."
+      echo "[RELAY] Until then, use the CLI fallback for every message you would have relayed:"
+      echo "[RELAY]     node ~/bot-relay-mcp/bin/relay send <TO> \"<MSG>\" --from <YOUR_NAME>"
+      echo "[RELAY] Announce this to your orchestrator immediately. Do not proceed as connected."
+    } | tee /dev/stderr
+  fi
+
+  # THE ONLY UPGRADE TO HEALTHY, and it requires POSITIVE evidence on every
+  # clause: the detector actually RAN (rc==0 — an unset rc means we never got
+  # here, which is codex's node-absent case handled by construction), it found
+  # no broken canonical entry, and nothing earlier downgraded the verdict.
+  # Written as an upgrade-only step so no path can reach HEALTHY by default.
+  if [ "${RELAY_DIAG_RC:-1}" -eq 0 ] && [ -z "${RELAY_MUTE_PATH:-}" ] \
+     && [ -z "${RELAY_PARSE_FAILED:-}" ] && [ "$RELAY_VERDICT" = "CANNOT-JUDGE" ]; then
+    relay_verdict_set "HEALTHY" "relay config resolves and instance is consistent" " db=\"$DB_PATH\""
+  fi
+fi
 
 # If there's no DB yet, nothing to do
 if [ ! -f "$DB_PATH" ]; then
@@ -399,7 +627,7 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   REG_BODY=$(curl -s -m 4 -w "\nHTTP_STATUS:%{http_code}\n" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
     2>&1)
   # v2.6.1 — capture fresh agent_token from the response body and persist
   # to the vault. register_agent only returns `agent_token` on first-mint

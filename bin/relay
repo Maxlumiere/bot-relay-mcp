@@ -67,8 +67,24 @@ const SUBCOMMANDS = {
   pair: "../dist/cli/pair.js",
 };
 
-function printHelp() {
-  process.stdout.write(
+// STREAM DISCIPLINE: usage is DIAGNOSTIC unless it was explicitly requested.
+//
+// This shipped writing usage to STDOUT unconditionally, so a failed command
+// substitution — RELAY_AGENT_TOKEN=$(relay mint-token NAME --json | sed ...) —
+// captured 1549 bytes of help text instead of yielding empty. The agent then
+// launched with a garbage token, every MCP call returned AUTH_FAILED, and it
+// LOOKED HEALTHY throughout. Two real broken launches came from this today.
+// A failure whose symptom is a plausible wrong value is the worst shape there
+// is, because nothing downstream can tell it from a real one.
+//
+// `requested` = the operator typed `help`/`--help`/`-h`, so the text IS the
+// requested data and belongs on stdout. Every other path is an error: usage
+// goes to STDERR so a capture yields EMPTY, which fails loudly and visibly.
+function printHelp(requested) {
+  const write = requested
+    ? (t) => process.stdout.write(t)
+    : (t) => process.stderr.write(t);
+  write(
     "bot-relay-mcp — unified CLI\n\n" +
       "Usage: relay <subcommand> [options]\n\n" +
       "Subcommands:\n" +
@@ -97,9 +113,18 @@ function printHelp() {
 
 async function main() {
   const argv = process.argv.slice(2);
-  if (argv.length === 0 || argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h") {
-    printHelp();
+  const askedForHelp =
+    argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h";
+  if (askedForHelp) {
+    printHelp(true); // requested → stdout, exit 0
     process.exit(0);
+  }
+  if (argv.length === 0) {
+    // NO ARGS IS AN ERROR, not a help request. Exiting 0 here was half the
+    // reason the poisoned-substitution failure was silent: `set -e` and `||`
+    // guards both saw success.
+    printHelp(false);
+    process.exit(2);
   }
 
   const sub = argv[0];
@@ -107,7 +132,7 @@ async function main() {
   const modulePath = SUBCOMMANDS[sub];
   if (!modulePath) {
     process.stderr.write(`relay: unknown subcommand "${sub}"\n\n`);
-    printHelp();
+    printHelp(false); // error path → stderr
     process.exit(1);
   }
 

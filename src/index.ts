@@ -8,6 +8,7 @@ import { loadConfig, validateConfigAndEnv, InvalidConfigError, readConfigFileKey
 import { startStdioServer } from "./transport/stdio.js";
 import { startHttpServer } from "./transport/http.js";
 import { closeDb, initializeDb } from "./db.js";
+import { assertInstanceResolution } from "./instance.js";
 import { startOutboxTail, stopOutboxTail } from "./outbox-tail.js";
 import { log } from "./logger.js";
 import { parseCliFlags, applyCliToEnv, usage } from "./cli.js";
@@ -192,6 +193,14 @@ async function main(): Promise<void> {
     });
     stdinForMcp = stdinProxy;
   }
+
+  // REFUSE TO RUN MUTE. Must come BEFORE initializeDb(): if instance resolution
+  // is ambiguous we would otherwise create/open the wrong DB and only then fail,
+  // leaving a stray empty legacy DB behind as a decoy. Announces the resolved
+  // instance + DB path on success so no agent is ever running on a database
+  // nobody can identify. See assertInstanceResolution() for why this keys on the
+  // multi-instance CONTRADICTION rather than on a missing RELAY_INSTANCE_ID.
+  assertInstanceResolution((msg) => log.info(msg));
 
   // Pre-initialize the DB so schema + purge run up front.
   // v1.11: async init supports both native (sync under hood) and wasm (async wasm load).

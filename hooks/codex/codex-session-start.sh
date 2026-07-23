@@ -45,6 +45,39 @@
 
 set -u
 
+# VERDICT BY CONSTRUCTION — first executable code after `set -u`, so no exit
+# path below can leave this session unaccounted for. LLM-AGNOSTIC PARITY: a
+# Codex agent that comes up mute was, until now, exactly as invisible as a
+# Claude agent was before the Claude hook got this. Shipping observability that
+# only worked for one CLI would re-open the asymmetry the July autowake arc
+# closed. Shared implementation — see hooks/_verdict.sh for the rationale, the
+# two invariants, and the honest boundary.
+# STDERR, not stdout: this hook's stdout is a hookSpecificOutput JSON object
+# that Codex parses. A trailing bare verdict line would corrupt it.
+RELAY_VERDICT_STREAM=stderr
+# FALLBACK VERDICT — installed BEFORE the shared helper is sourced, and this
+# ordering is the whole point. A SHARED PRIMITIVE CANNOT GUARANTEE ITS OWN
+# LOADER: if _verdict.sh is missing or unparseable, sourcing it fails and every
+# verdict vanishes, which is the exact silence this mechanism exists to end
+# (codex round 4 proved it by corrupting the helper — all four hooks then
+# emitted ZERO verdicts and exited 0).
+# These definitions are deliberately self-contained. Sourcing the helper
+# REDEFINES them, so a healthy load transparently upgrades this fallback; the
+# trap resolves `relay_emit_verdict` by name at exit time.
+RELAY_VERDICT="CANNOT-JUDGE"
+RELAY_VERDICT_REASON="verdict helper did not load"
+RELAY_VERDICT_DETAIL=""
+relay_emit_verdict() {
+  _l="[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
+  if [ "${RELAY_VERDICT_STREAM:-stdout}" = "stderr" ]; then echo "$_l" >&2; else echo "$_l"; fi
+}
+trap relay_emit_verdict EXIT
+RELAY_VERDICT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../_verdict.sh
+if [ -f "$RELAY_VERDICT_DIR/_verdict.sh" ]; then
+  . "$RELAY_VERDICT_DIR/_verdict.sh"
+fi
+
 # Drain stdin (the SessionStart payload) so the writer never blocks on a full
 # pipe. We don't need any field from it — identity is env-derived.
 cat >/dev/null 2>&1 || true
@@ -209,13 +242,19 @@ fi
 if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
   REG_BODY=$(curl -s -m 4 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"codex\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
     2>/dev/null)
 
   # Capture a freshly-minted token (first register only) and persist it to the
   # vault so the stdio MCP server's resolveToken can authenticate this agent's
   # later get_messages calls. SSE-wrapped + JSON-stringified shape: \"key\": value
   # (escaped quote + space after colon) — same parser as check-relay.sh.
+  # The ONLY upgrade path: the relay answered our register call, which is
+  # direct evidence this session can reach it. A curl timeout, a refused
+  # connection or an empty body all leave CANNOT-JUDGE standing.
+  if [ -n "$REG_BODY" ] && command -v relay_verdict_set >/dev/null 2>&1; then
+    relay_verdict_set "HEALTHY" "registered with the relay over HTTP" " agent=\"$AGENT_NAME\""
+  fi
   if [ -n "$REG_BODY" ] && command -v write_relay_token_to_vault >/dev/null 2>&1; then
     REG_TOKEN=$(echo "$REG_BODY" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
     if [ -n "$REG_TOKEN" ]; then

@@ -121,6 +121,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
       // ADR-0002: self-declared coordination class (Zod-validated against
       // AGENT_CLASSES). Immutable — the DB layer only writes it on first register.
       class: input.class,
+      cli_profile: input.cli_profile,
       terminal_title_ref: input.terminal_title_ref,
       expectedRecoveryHash,
       // v2.2.1 B2: when force=true the db-layer warn is also suppressed to

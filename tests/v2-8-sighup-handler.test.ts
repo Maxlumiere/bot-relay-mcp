@@ -15,9 +15,18 @@
  *  1. Fresh DB pre-populated with one agent row (name + session_id known).
  *  2. Spawn `node dist/index.js` in stdio mode pointed at the test DB
  *     with RELAY_AGENT_NAME set so `captureSessionId` finds the row.
- *  3. Wait for the child to come up + finish `installAutoUnregister`.
+ *  3. Prove readiness: send a real MCP `initialize` frame on stdin and
+ *     await the JSON-RPC response on stdout. In `startStdioServer`,
+ *     `installAutoUnregister()` runs synchronously BEFORE
+ *     `server.connect(transport)`, so a response is a happens-after
+ *     proof that the signal handlers are installed — no wall-clock
+ *     guess about startup speed.
  *  4. Send the signal under test via `child.kill(signal)`.
- *  5. Wait for the child to exit.
+ *  5. Await the child's `exit` event — with NO fallback timeout racing
+ *     it. The per-test vitest timeout is the only bound, so a genuine
+ *     hang fails loudly as a timeout instead of asserting against a
+ *     null exitCode from a process that simply hadn't exited yet
+ *     (the exact CI flake this replaced: `expected null to be 130`).
  *  6. Read the DB and assert `signal_received_at` (epoch ms) +
  *     `signal_kind` (string) are populated correctly.
  *
@@ -47,15 +56,35 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  if (daemon && daemon.exitCode === null) {
+  if (daemon && daemon.exitCode === null && daemon.signalCode === null) {
     daemon.kill("SIGKILL");
-    await new Promise<void>((r) => setTimeout(r, 100));
+    // SIGKILL cannot be caught, so `exit` always fires — await it rather
+    // than sleeping an arbitrary 100ms and hoping the reap finished.
+    await waitForExit(daemon);
   }
   daemon = null;
   if (fs.existsSync(TEST_ROOT)) {
     fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   }
 });
+
+/**
+ * Resolve with the child's termination state. Deliberately has NO
+ * fallback timeout: racing a timer against `exit` and resolving silently
+ * is what let the assertion run against a still-alive child under CI
+ * load. The vitest per-test timeout bounds a genuine hang and reports
+ * it as what it is.
+ */
+function waitForExit(
+  child: ChildProcess,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+  }
+  return new Promise((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+}
 
 /**
  * Pre-populate the test DB with one agent row. Uses the shipped
@@ -116,18 +145,78 @@ async function startDaemonWithStdioTransport(agentName: string): Promise<ChildPr
         RELAY_DB_PATH: TEST_DB_PATH,
         RELAY_CONFIG_PATH: path.join(TEST_ROOT, "config.json"),
       },
-      stdio: ["pipe", "ignore", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     },
   );
-  // Give the child ~500ms to import dist/index.js, run config, init the
-  // DB, and call captureSessionId + installAutoUnregister. We don't have
-  // a direct readiness signal (stdio transport doesn't expose one), so
-  // a small wall-clock wait is the pragmatic choice. The test is
-  // bounded above by the 5s vitest default.
-  await new Promise<void>((r) => setTimeout(r, 800));
-  if (child.exitCode !== null) {
-    throw new Error(`daemon exited before signal could be sent (code ${child.exitCode})`);
-  }
+  // Readiness is proven, not guessed: the daemon is an MCP server, so a
+  // JSON-RPC response to a real `initialize` frame is a happens-after
+  // witness for everything `startStdioServer` does before
+  // `server.connect(transport)` — including `installAutoUnregister()`.
+  // The previous shape slept a flat 800ms, which under a loaded CI
+  // runner left a window where the signal arrived before the handler
+  // was installed and the default disposition killed the child with
+  // exitCode null.
+  await new Promise<void>((resolve, reject) => {
+    let stdoutBuf = "";
+    let stderrBuf = "";
+    const onStdout = (d: Buffer) => {
+      stdoutBuf += d.toString();
+      const nl = stdoutBuf.indexOf("\n");
+      if (nl === -1) return;
+      const line = stdoutBuf.slice(0, nl);
+      try {
+        const msg = JSON.parse(line) as { id?: number };
+        if (msg.id !== 1) {
+          throw new Error(`unexpected id ${String(msg.id)}`);
+        }
+      } catch (err) {
+        cleanup();
+        reject(
+          new Error(
+            `first stdout line is not the initialize response: ${line} (${String(err)})`,
+          ),
+        );
+        return;
+      }
+      cleanup();
+      resolve();
+    };
+    const onStderr = (d: Buffer) => {
+      stderrBuf += d.toString();
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(
+        new Error(
+          `daemon exited before becoming ready (code ${String(code)}, signal ${String(signal)}): ${stderrBuf}`,
+        ),
+      );
+    };
+    const cleanup = () => {
+      child.stdout!.off("data", onStdout);
+      child.stderr!.off("data", onStderr);
+      child.off("exit", onExit);
+      // Keep both pipes draining so the child can never block on a full
+      // pipe buffer after the handshake.
+      child.stdout!.resume();
+      child.stderr!.resume();
+    };
+    child.stdout!.on("data", onStdout);
+    child.stderr!.on("data", onStderr);
+    child.on("exit", onExit);
+    child.stdin!.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "v2-8-sighup-test", version: "0.0.0" },
+        },
+      }) + "\n",
+    );
+  });
   return child;
 }
 
@@ -167,12 +256,13 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
     expect(daemon.pid).toBeTypeOf("number");
     const beforeMs = Date.now();
     daemon.kill("SIGHUP");
-    await new Promise<void>((resolve) => {
-      daemon!.once("exit", () => resolve());
-      setTimeout(() => resolve(), 3000);
-    });
+    const exit = await waitForExit(daemon);
     expect(
-      daemon.exitCode,
+      exit.signal,
+      "child died from the raw signal (default disposition) — the handler was not installed when the signal arrived",
+    ).toBeNull();
+    expect(
+      exit.code,
       "SIGHUP should exit with code 129 (128 + signal number 1)",
     ).toBe(129);
     const row = readAgentSignalCols(NAME);
@@ -205,11 +295,12 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
     await seedAgent(NAME, SID);
     daemon = await startDaemonWithStdioTransport(NAME);
     daemon.kill("SIGINT");
-    await new Promise<void>((resolve) => {
-      daemon!.once("exit", () => resolve());
-      setTimeout(() => resolve(), 3000);
-    });
-    expect(daemon.exitCode).toBe(130);
+    const exit = await waitForExit(daemon);
+    expect(
+      exit.signal,
+      "child died from the raw signal (default disposition) — the handler was not installed when the signal arrived",
+    ).toBeNull();
+    expect(exit.code).toBe(130);
     const row = readAgentSignalCols(NAME);
     expect(row.signal_kind).toBe("SIGINT");
     expect(row.signal_received_at).not.toBeNull();
@@ -222,11 +313,12 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
     await seedAgent(NAME, SID);
     daemon = await startDaemonWithStdioTransport(NAME);
     daemon.kill("SIGTERM");
-    await new Promise<void>((resolve) => {
-      daemon!.once("exit", () => resolve());
-      setTimeout(() => resolve(), 3000);
-    });
-    expect(daemon.exitCode).toBe(143);
+    const exit = await waitForExit(daemon);
+    expect(
+      exit.signal,
+      "child died from the raw signal (default disposition) — the handler was not installed when the signal arrived",
+    ).toBeNull();
+    expect(exit.code).toBe(143);
     const row = readAgentSignalCols(NAME);
     expect(row.signal_kind).toBe("SIGTERM");
     expect(row.signal_received_at).not.toBeNull();

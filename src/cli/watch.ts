@@ -67,8 +67,13 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function usage(): void {
-  process.stdout.write(
+function usage(requested = false): void {
+  // STREAM DISCIPLINE: usage is diagnostic on the ERROR path, so it goes to
+  // STDERR. On stdout it poisoned command substitutions — a failed
+  // $(relay mint-token ... --json) captured the help text and the agent
+  // launched with a garbage token that LOOKED like a value. `requested`
+  // (an explicit --help) is the one case where the text IS the data.
+  (requested ? process.stdout : process.stderr).write(
     "Usage: relay watch <agent> [--interval SECONDS] [--once] [--json]\n\n" +
       "Sentinel — autowake for a terminal agent NOT in VS Code/Tether. Watches\n" +
       "<agent>'s inbox and prints a wake line when new mail arrives, so a harness\n" +
@@ -83,6 +88,59 @@ function usage(): void {
       "Auth: local-trust — reads the ACTIVE per-instance relay DB directly\n" +
       "(operator filesystem authority, like `relay mint-token`). Runs until Ctrl-C.\n"
   );
+}
+
+/**
+ * THE RUNTIME DEGRADATION PREDICATE.
+ *
+ * Did the FALLBACK poll discover a delivery the marker never announced?
+ *
+ * This deliberately consults NO marker-evidence flag, and that is the whole
+ * point. Three attempts got this wrong, each closing a route while leaving the
+ * bad state reachable:
+ *   1. `!filename` counted as proof, so one anonymous fs.watch event suppressed
+ *      the announcement forever.
+ *   2. The proof latched for the process lifetime, so a marker that worked once
+ *      masked a writer that died later.
+ *   3. Even consumed per-window, a marker for message A masked an UNMARKED
+ *      message B arriving in the same window.
+ *
+ * All three are the same error: treating "a marker fired at some point" as
+ * evidence about a DIFFERENT delivery. The fix is to stop asking that question.
+ * Watcher callbacks invoke check() IMMEDIATELY, so a marked delivery has
+ * already moved prevUnread by the time this tick runs. Therefore an unread
+ * count that rises ACROSS the fallback's own check() is, by construction, a
+ * delivery no callback observed — which is exactly the degradation, per
+ * delivery, with no state to get stale.
+ */
+export function fallbackObservedMissedDelivery(
+  before: number | null,
+  after: number | null,
+): boolean {
+  return before !== null && after !== null && after > before;
+}
+
+/**
+ * The fallback tick, extracted so tests exercise the REAL closure rather than
+ * a re-implementation of it. The predicate above is trivially correct; what
+ * can silently break is THIS wiring — `before` must be captured BEFORE the
+ * tick's own check(), or the comparison is post-state against itself and the
+ * degraded announcement can never fire again. That ordering lives here and
+ * only here, so the call-shape controls in
+ * tests/marker-evidence-negative-controls.test.ts drive this exact function.
+ */
+export function makeFallbackTick(deps: {
+  readPrevUnread: () => number | null;
+  check: () => void;
+  onMissedDelivery: () => void;
+}): () => void {
+  return () => {
+    const before = deps.readPrevUnread();
+    deps.check();
+    if (fallbackObservedMissedDelivery(before, deps.readPrevUnread())) {
+      deps.onMissedDelivery();
+    }
+  };
 }
 
 /** Emit the wake signal: a single stdout line a harness Monitor can consume. */
@@ -110,6 +168,58 @@ function emitWake(
   }
 }
 
+/**
+ * Is there actually something that will WRITE the marker?
+ *
+ * Markers are written by the daemon's outbox tail (the single owner), so the
+ * producer side is only live when a daemon is reachable AND that daemon has
+ * markers enabled. Reachability alone is not enough — a daemon running without
+ * RELAY_FILESYSTEM_MARKERS never touches the marker, which is precisely the
+ * silent degradation this assertion exists to catch. `/health` reports
+ * `filesystem_markers` for exactly this purpose.
+ *
+ * Conservative by design: any failure (no daemon, timeout, old daemon that does
+ * not report the field) returns false, so we announce POLLING. Claiming the
+ * slower mode when unsure is safe; claiming the faster one when unsure is the
+ * bug we are fixing.
+ */
+type MarkerWriterProbe =
+  | { live: true }
+  | { live: false; reason: string };
+
+async function probeMarkerWriter(): Promise<MarkerWriterProbe> {
+  const port = process.env.RELAY_HTTP_PORT ?? "3777";
+  const host = process.env.RELAY_HTTP_HOST ?? "127.0.0.1";
+  const where = `${host}:${port}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1000);
+  try {
+    const res = await fetch(`http://${host}:${port}/health`, { signal: controller.signal });
+    if (!res.ok) {
+      return { live: false, reason: `daemon at ${where} answered /health with HTTP ${res.status}` };
+    }
+    const body = (await res.json()) as { filesystem_markers?: boolean };
+    if (body.filesystem_markers === true) return { live: true };
+    if (body.filesystem_markers === false) {
+      return {
+        live: false,
+        reason: `daemon at ${where} is running WITHOUT RELAY_FILESYSTEM_MARKERS=1, so it never writes markers`,
+      };
+    }
+    // Strict: an older daemon omits the field entirely, and "absent" must not
+    // read as "enabled". Absence of information is not information — say
+    // exactly that rather than blaming a daemon that is plainly reachable.
+    return {
+      live: false,
+      reason: `daemon at ${where} is reachable but does not report filesystem_markers (pre-2.22 build) — cannot confirm the marker path`,
+    };
+  } catch {
+    return { live: false, reason: `no relay daemon reachable at ${where}, so nothing will ever write the marker` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function run(argv: string[]): Promise<number> {
   let args: Args;
   try {
@@ -120,7 +230,7 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   if (args.help) {
-    usage();
+    usage(true);
     return 0;
   }
   if (!args.agent) {
@@ -207,6 +317,48 @@ export async function run(argv: string[]): Promise<number> {
 
   check(); // baseline / surface existing mail
 
+  // --- END-TO-END WAKE-PATH ASSERTION -----------------------------------
+  // The old startup line reported markersEnabled(), which reads THIS process's
+  // env. That attests to the wrong thing: a watcher can print "event-driven"
+  // while no producer ever touches the marker, and it will simply run slow
+  // forever. A status line that can confidently state the opposite of reality
+  // is worse than no status line, because the operator stops looking.
+  //
+  // So the mode is now asserted from BEHAVIOUR, in two places:
+  //   1. STARTUP — markers are written by the daemon's outbox tail (the single
+  //      owner). If markers are enabled but no daemon is reachable, nothing
+  //      will EVER write the marker, so event-driven is a false claim and we
+  //      say polling instead. This is checkable before any mail arrives.
+  //   2. RUNTIME — if new mail is first observed by the FALLBACK TIMER rather
+  //      than by the marker watcher, the marker did not fire for a message
+  //      that definitely landed. That is the degraded case proving itself, and
+  //      it is announced once and acted on (see tightenToPolling).
+  let degradedAnnounced = false;
+
+  /** Did a real marker write reach us, or are we only being saved by the timer? */
+  const announceDegraded = (reason: string): void => {
+    if (degradedAnnounced) return;
+    degradedAnnounced = true;
+    process.stderr.write(
+      `[sentinel] DEGRADED — wake is POLLING, not event-driven: ${reason}\n` +
+        `[sentinel]   markers are enabled in THIS process, but that only controls whether we\n` +
+        `[sentinel]   WATCH the marker — the daemon's outbox tail is what WRITES it.\n` +
+        `[sentinel]   Latency will be up to the poll interval instead of ~10ms.\n` +
+        `[sentinel]   Check: is the daemon running with RELAY_FILESYSTEM_MARKERS=1?\n`,
+    );
+  };
+
+  /**
+   * In marker mode the safety-net tick is deliberately slow (30s). If markers
+   * are in fact dead, that is SLOWER than plain polling would have been, so a
+   * degraded watcher must fall back to the real poll interval rather than sit
+   * on a 30s net it no longer has a reason to trust.
+   */
+  const tightenToPolling = (): void => {
+    if (timer) clearInterval(timer);
+    timer = setInterval(check, args.intervalMs);
+  };
+
   if (markersEnabled()) {
     // Event-driven: watch the marker's DIRECTORY (the file may not exist until
     // the first delivery) and re-check on any touch of <agent>.touch. A slow
@@ -223,21 +375,62 @@ export async function run(argv: string[]): Promise<number> {
       }
       try {
         watcher = fs.watch(dir, (_event, filename) => {
-          if (!filename || filename === base) check();
+          // record() returns true ONLY for a positively identified marker for
+          // THIS agent — that is the sole positive evidence the wake path works
+          // end to end. Anything else (no filename, another agent's marker) is
+          // indistinguishable from an unrelated directory change, so it stays
+          // UNPROVEN. We still check() either way: checking is free and correct,
+          // and it is claiming PROOF from an unidentified event that would let
+          // one anonymous callback suppress the degraded announcement forever.
+          // No evidence is recorded. A marker callback's only job is to make
+          // the delivery observed; whether it fired is not evidence about any
+          // OTHER delivery. See fallbackObservedMissedDelivery().
+          check();
         });
       } catch {
         /* fs.watch unsupported here → interval-only below still covers it */
       }
     }
     const FALLBACK_MS = 30_000; // marker-miss safety net
-    timer = setInterval(check, FALLBACK_MS);
+    // New mail that the marker watcher never told us about: the marker did
+    // not fire for a message that definitely landed. Prove-by-behaviour that
+    // we are degraded, then stop pretending the 30s net is a wake path.
+    timer = setInterval(
+      makeFallbackTick({
+        readPrevUnread: () => prevUnread,
+        check,
+        onMissedDelivery: () => {
+          announceDegraded("new mail was detected by the fallback poll, not by a marker event");
+          tightenToPolling();
+        },
+      }),
+      FALLBACK_MS,
+    );
   } else {
     // No markers → bounded polling of the cheap primitive.
     timer = setInterval(check, args.intervalMs);
   }
 
+  // STARTUP ASSERTION — markers are daemon-written, so a marker-mode watcher
+  // with no reachable daemon is claiming an event path that cannot exist.
+  // Checked before any mail arrives so the operator is not told "event-driven"
+  // and then left to discover otherwise.
+  let modeLabel: string;
+  if (!markersEnabled()) {
+    modeLabel = `polling every ${Math.round(args.intervalMs / 1000)}s`;
+  } else {
+    const probe = await probeMarkerWriter();
+    if (probe.live) {
+      modeLabel = "event-driven; marker writer confirmed live";
+    } else {
+      modeLabel = `polling every ${Math.round(args.intervalMs / 1000)}s (markers enabled but marker writer NOT confirmed)`;
+      announceDegraded(probe.reason);
+      tightenToPolling();
+    }
+  }
+
   process.stderr.write(
-    `[sentinel] watching "${agent}"${markersEnabled() ? " (event-driven; markers on)" : ` (polling every ${Math.round(args.intervalMs / 1000)}s)`} — Ctrl-C to stop.\n`,
+    `[sentinel] watching "${agent}" (${modeLabel}) — marker=${markerPath(agent) ?? "n/a"} — Ctrl-C to stop.\n`,
   );
 
   // Hold the process open (the timer + watcher keep the event loop alive) until
