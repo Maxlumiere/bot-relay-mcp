@@ -120,11 +120,23 @@ fi
 # inter-token whitespace and cannot occur inside JSON strings.
 HOOK_INPUT=""
 _line=""
+_capped=0
 while IFS= read -r -t 1 _line 2>/dev/null; do
   HOOK_INPUT="${HOOK_INPUT}${_line}"
-  [ ${#HOOK_INPUT} -ge 262144 ] && break
+  if [ ${#HOOK_INPUT} -ge 262144 ]; then
+    _capped=1
+    break
+  fi
 done
-HOOK_INPUT="${HOOK_INPUT}${_line}"
+# On EOF-exit, `read` returns non-zero with the unterminated final line still
+# in _line — append it. On cap-break it was ALREADY appended inside the loop;
+# appending again would retain up to 2x the cap for a single giant line
+# (codex #124 round 2). Then truncate, so the cap holds even for the
+# EOF-remnant case and the 256KB claim is actually true.
+if [ "$_capped" -eq 0 ]; then
+  HOOK_INPUT="${HOOK_INPUT}${_line}"
+fi
+HOOK_INPUT="${HOOK_INPUT:0:262144}"
 # Guard modes, decided by what the payload PROVES (fail-safe in every branch —
 # suppression always leaves mail PENDING for the floor; nothing here writes):
 #   active   → this stop is already our forced continuation: one wake per

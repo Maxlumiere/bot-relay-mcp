@@ -299,6 +299,32 @@ describe("Stop hook — loop guards (suppression must never consume)", () => {
     expect(pendingCount("stop-recv-9")).toBe(1);
   });
 
+  it("(4e) a giant single-line payload (300KB) fail-safes to suppress — and the cap truncation keeps it unparseable, never a wake", async () => {
+    // codex #124 round 2: the cap was enforced per-line with a double-append
+    // on the cap-break path, retaining up to 2x for one giant line. The
+    // outcome contract locked here: oversized input can never produce a
+    // block (truncated JSON parses as invalid → fail-safe suppress) and the
+    // mail stays pending.
+    const senderTok = await registerWithToken("stop-sender-13", []);
+    const recvTok = await registerWithToken("stop-recv-13", []);
+    await sendMessage("stop-sender-13", "stop-recv-13", "giant payload", senderTok);
+
+    const giant = '{"stop_hook_active": false, "padding": "' + "x".repeat(300_000) + '"}';
+    const r = await runHook(
+      {
+        RELAY_AGENT_NAME: "stop-recv-13",
+        RELAY_AGENT_TOKEN: recvTok,
+        RELAY_HTTP_HOST: "127.0.0.1",
+        RELAY_HTTP_PORT: String(port),
+        RELAY_DB_PATH: TEST_DB_PATH,
+      },
+      { stdinPayload: giant },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+    expect(pendingCount("stop-recv-13")).toBe(1);
+  });
+
   it("(4d) trusted payload (stop_hook_active:false) SKIPS the damper — consecutive natural stops each wake", async () => {
     // On a trusted payload, stop_hook_active alone guarantees one wake per
     // natural stop; damping on top would swallow the wake for a new batch
