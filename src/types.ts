@@ -902,6 +902,10 @@ export interface AgentRecord {
   managed?: number;
   /** ADR-0002 (schema v21): self-declared coarse coordination posture (SSOT src/agent-class.ts). NULL on legacy rows → normalized to `unclassified` on read. Immutable after first register. */
   class?: string | null;
+  /** Phase A (schema v22): relay build that SERVED this row's last register. Stdio servers are spawned per session from dist and run that build for life, so a machine routinely runs several versions at once — and until this column there was no way to ask a stdio server which one it was. */
+  server_version?: string | null;
+  /** Phase A (schema v22): which agent-CLI this row registered through, validated against the profile registry. NULL = UNKNOWN and is never asked for a session-start verdict. */
+  cli_profile?: string | null;
   /** v2.1 Phase 4b.2: ISO timestamp of rotation grace window expiry. Populated iff state=rotation_grace. */
   rotation_grace_expires_at?: string | null;
   /** v2.1 Phase 4b.2: bcrypt hash of pre-rotation token. Populated iff state=rotation_grace; allows the old token to auth alongside the new token during the grace window. */

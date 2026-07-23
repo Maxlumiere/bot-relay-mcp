@@ -36,6 +36,8 @@ import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { resolveInstanceDbPath } from "./instance.js";
 import { emitInboxChanged } from "./inbox-events.js";
+import { VERSION } from "./version.js";
+import { getAgentCliProfile } from "./agent-cli-profiles.js";
 import { validateSchemaDocument, validateResult, type SchemaCheck } from "./task-schema-validator.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".bot-relay");
@@ -229,6 +231,11 @@ function toAgentWithStatus(
     last_alive: positiveConfirmationISO(row.name),
     alive: verdict === "alive" && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
     description: row.description ?? null,
+    // Phase A — version + CLI visibility. `health_check` reports the version of
+    // WHICHEVER SERVER ANSWERS, so an agent on a stale build asks, is told its
+    // own stale version, and cannot tell. Per-row makes skew answerable.
+    server_version: row.server_version ?? null,
+    cli_profile: row.cli_profile ?? null,
     session_id: row.session_id ?? null,
     terminal_title_ref: row.terminal_title_ref ?? null,
     // Tether v0.3 PID-handshake: parse the stored JSON chain → number[] (null +
@@ -289,6 +296,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_19(_db);
   migrateSchemaToV2_20(_db);
   migrateSchemaToV2_21(_db);
+  migrateSchemaToV2_22(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -333,6 +341,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_19(_db);
   migrateSchemaToV2_20(_db);
   migrateSchemaToV2_21(_db);
+  migrateSchemaToV2_22(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -554,7 +563,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 21;
+export const CURRENT_SCHEMA_VERSION = 22;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -1637,6 +1646,69 @@ function migrateSchemaToV2_21(db: CompatDatabase): void {
   if (!agentCols.some((c) => c.name === "class")) {
     db.exec("ALTER TABLE agents ADD COLUMN class TEXT");
   }
+}
+
+/**
+ * VERSION VISIBILITY (Phase A) — record which relay build is serving each agent.
+ *
+ * Every stdio MCP server is spawned per client session from `dist/` at the
+ * moment that session starts, and runs that build for its whole life. Rebuilding
+ * does nothing for an already-running session. Measured on the development
+ * machine: TWELVE relay servers alive at once running SEVEN distinct versions,
+ * 2.9.1 through 2.21.0, all against ONE database.
+ *
+ * The dangerous part is that this is INVISIBLE. A stdio server has no port and
+ * no endpoint, so nobody can ask it anything — and `health_check` answers with
+ * the version of whichever server handled the call, so an agent on a stale build
+ * asks, is told its own stale version, and has no way to know. That is
+ * silence-as-failure with a confident voice.
+ *
+ * Additive, defaulting to NULL, matching every other migration here: an older
+ * server writing this row simply omits the column.
+ *
+ * NOTE FOR WHOEVER MERGES SECOND: PR #119 (held) also introduces a "v2_22"
+ * migration for `established_at`. The numbers collide by name only — both are
+ * plain ADD COLUMNs and are order-independent — but the second branch to land
+ * must renumber and bump CURRENT_SCHEMA_VERSION accordingly.
+ */
+function migrateSchemaToV2_22(db: CompatDatabase): void {
+  const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "server_version")) {
+    db.exec("ALTER TABLE agents ADD COLUMN server_version TEXT");
+  }
+  // ONE migration for one row. `cli_profile` records WHICH agent-CLI the row
+  // registered through, and it is the enabling half of the server-side
+  // verdict-absence check: only a profile that actually installs a hook can OWE
+  // a verdict, so without this the server would have to either interrogate
+  // every agent or assume a default — and a wrong default is how a guard starts
+  // crying wolf. NULL means UNKNOWN and is never asked for a verdict.
+  if (!agentCols.some((c) => c.name === "cli_profile")) {
+    db.exec("ALTER TABLE agents ADD COLUMN cli_profile TEXT");
+  }
+}
+
+/**
+ * Does this CLI profile OWE a verdict at session start?
+ *
+ * Derived from the registry rather than listed here, so the recording side and
+ * the expectation side cannot drift apart: a profile owes a verdict iff it
+ * installs a hook, because only then is there something that could have emitted
+ * one. An unknown / absent profile returns false — under-cover deliberately
+ * rather than train anyone to ignore a false alarm.
+ */
+export function profileOwesVerdict(cliProfile: string | null | undefined): boolean {
+  if (!cliProfile) return false;
+  const profile = getAgentCliProfile(cliProfile);
+  return Boolean(profile?.hookInstall);
+}
+
+/**
+ * Normalize a caller-supplied CLI profile id against the registry. Anything the
+ * registry does not know becomes NULL (= UNKNOWN), never a default.
+ */
+export function normalizeCliProfile(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  return getAgentCliProfile(raw) ? raw : null;
 }
 
 /**
@@ -2732,6 +2804,8 @@ export function registerAgent(
   options: {
     description?: string;
     managed?: boolean;
+    /** Which agent-CLI this row registered through (validated against the profile registry; unknown → NULL = UNKNOWN, never a default). Enables the server-side verdict-absence check. */
+    cli_profile?: string | null;
     /** ADR-0002: self-declared coordination class. Set on FIRST register only; a re-register silently preserves the original (immutable, like managed/capabilities). Validated against AGENT_CLASSES at the handler (Zod). */
     class?: string;
     /** v2.2.0: window title for the dashboard click-to-focus driver. Mutable on re-register. */
@@ -2892,7 +2966,8 @@ export function registerAgent(
       "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, token_lookup = ?, session_id = ?, session_started_at = ?, description = ?, " +
       "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, agent_status = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ?, " +
-      "signal_received_at = NULL, signal_kind = NULL " +
+      "signal_received_at = NULL, signal_kind = NULL, server_version = ?, " +
+      "cli_profile = COALESCE(?, cli_profile) " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
     ).run(
       role, timestamp, newHash,
@@ -2902,6 +2977,10 @@ export function registerAgent(
       session_id, timestamp, newDescription,
       newTitleRef, newHostShellPids, newHostId, newAgentStatus,
       newAuthState, newRecoveryHash, newRevokedAt,
+      VERSION,
+      // COALESCE: a re-register that does not know its profile must not ERASE a
+      // profile an earlier register established.
+      normalizeCliProfile(options.cli_profile),
       name, existingState, existing.token_hash, casRecoveryHash
     );
     if (r.changes !== 1) {
@@ -2950,8 +3029,8 @@ export function registerAgent(
       // schema v16: host_shell_pids (JSON) + host_id captured on first register.
       // ADR-0002: `class` captured on FIRST register (NULL if undeclared →
       // read as 'unclassified'). A re-register never writes it (immutable).
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id, class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId, options.class ?? null);
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id, class, server_version, cli_profile) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId, options.class ?? null, VERSION, normalizeCliProfile(options.cli_profile));
     bumpAuthGeneration(); // ADR-0003: fresh token_hash + token_lookup written
 
     // v2.0: populate normalized agent_capabilities table.
