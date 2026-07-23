@@ -34,6 +34,11 @@ process.env.HOME = TEST_HOME;
 delete process.env.RELAY_INSTANCE_ID;
 delete process.env.RELAY_DB_PATH;
 delete process.env.RELAY_HTTP_SECRET;
+// runInit with a team/http profile reaches init.ts's launchd bootstrap on
+// macOS — shelling to REAL `launchctl bootstrap`/`kickstart` under `npm test`.
+// The belt-and-suspenders guard init.ts documents keeps the suite from ever
+// touching real launchd (matches tests/v2-1-cli-tooling.test.ts + v2-16-0).
+process.env.RELAY_SKIP_DAEMON = "1";
 
 const { run: runInit } = await import("../src/cli/init.js");
 const { run: runListInstances } = await import("../src/cli/list-instances.js");
