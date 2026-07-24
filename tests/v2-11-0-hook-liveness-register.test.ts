@@ -145,19 +145,48 @@ async function registerAndGetToken(port: number, name: string): Promise<string> 
   return inner.agent_token as string;
 }
 
-/** Seed the row's session/liveness/handshake columns to a known state. */
+/**
+ * Seed the row's session/liveness/handshake columns to a known state.
+ * `pids` overrides the stored host_shell_pids (defaults to the dead SEED_PIDS
+ * sentinel); ADR-0012 tests pass a chain containing a LIVE FOREIGN pid to model a
+ * genuinely-held concurrent binding vs the dead-terminal default.
+ */
 function seedRow(
   dbPath: string,
   name: string,
-  opts: { sessionId: string | null; lastSeenIso: string },
+  opts: { sessionId: string | null; lastSeenIso: string; pids?: string },
 ): void {
   const sid = opts.sessionId === null ? "NULL" : `'${opts.sessionId}'`;
+  const pids = opts.pids ?? SEED_PIDS;
   sql(
     dbPath,
     `UPDATE agents SET session_id=${sid}, last_seen='${opts.lastSeenIso}', ` +
-      `agent_status='idle', host_shell_pids='${SEED_PIDS}', host_id='${SEED_HOSTID}' ` +
+      `agent_status='idle', host_shell_pids='${pids}', host_id='${SEED_HOSTID}' ` +
       `WHERE name='${name}';`,
   );
+}
+
+/**
+ * Spawn a real, live process that is NOT an ancestor of the shipped hook (the
+ * hook is spawned separately by runHook). Its pid stands in for a CONCURRENT
+ * terminal's live shell: seeded into host_shell_pids it must make the LIVE gate
+ * SKIP, because relay_binding_live_elsewhere finds a live pid outside this hook's
+ * own tree. Caller MUST kill it in `finally`.
+ */
+function spawnLivePid(): { pid: number; kill: () => void } {
+  const p = spawn("sleep", ["30"], { stdio: "ignore", detached: true });
+  p.unref();
+  const pid = p.pid ?? 0;
+  return {
+    pid,
+    kill: () => {
+      try {
+        if (pid > 0) process.kill(pid);
+      } catch {
+        /* already gone */
+      }
+    },
+  };
 }
 
 /** Invoke the SHIPPED hook for `name` with a valid token + daemon pointer. */
@@ -182,23 +211,33 @@ function runHook(h: Harness, name: string, token: string): ReturnType<typeof spa
 }
 
 describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shipped hook)", () => {
-  it("(L1) fresh+live row → hook SKIPS register: session_id + host_shell_pids + host_id UNCHANGED", async () => {
+  it("(L1) fresh+live row held by a LIVE concurrent terminal → hook SKIPS register: session_id + host_shell_pids + host_id UNCHANGED", async () => {
     const h = await startHarness("live");
+    const live = spawnLivePid();
     try {
       const name = "live-builder";
       const token = await registerAndGetToken(h.port, name);
-      // Live: a session claimed just now (< 120s) — the spawn-handoff /
-      // concurrent-terminal case the skip must still protect.
-      seedRow(h.dbPath, name, { sessionId: SEED_SESSION, lastSeenIso: new Date().toISOString() });
+      // ADR-0012: "live" is a REAL live foreign process (a concurrent terminal's
+      // shell) that is NOT in this hook's tree — the advisory discriminator finds
+      // it and SKIPs (doesn't even attempt a takeover). A fake/dead [999999] seed
+      // can't model this: a resummon's shared ancestors are in this hook's chain
+      // too and must NOT count as "still held".
+      const heldPids = `[${live.pid}]`;
+      seedRow(h.dbPath, name, {
+        sessionId: SEED_SESSION,
+        lastSeenIso: new Date().toISOString(),
+        pids: heldPids,
+      });
 
       const r = runHook(h, name, token);
       expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
 
       // Register was NOT called → every session-scoped field is exactly the seed.
       expect(sql(h.dbPath, `SELECT session_id FROM agents WHERE name='${name}';`)).toBe(SEED_SESSION);
-      expect(sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`)).toBe(SEED_PIDS);
+      expect(sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`)).toBe(heldPids);
       expect(sql(h.dbPath, `SELECT host_id FROM agents WHERE name='${name}';`)).toBe(SEED_HOSTID);
     } finally {
+      live.kill();
       stopHarness(h);
     }
   }, 25_000);
@@ -267,6 +306,108 @@ describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shippe
         // eslint-disable-next-line no-console
         console.warn("[L3] machine GUID unavailable on this host — host_id refresh sub-assertion skipped");
       }
+    } finally {
+      stopHarness(h);
+    }
+  }, 25_000);
+});
+
+/**
+ * ADR-0012 — host_shell_pids stale-on-restart via a SAFE force CAS takeover.
+ *
+ * A resummon's stored chain is NOT disjoint from the live chain — the persistent
+ * VS Code app ancestors appear in both — so a whole-chain intersection misses the
+ * common case. The advisory discriminator asks instead: does the stored chain
+ * have a LIVE process OUTSIDE this hook's own tree? None ⇒ relaunch ⇒ the hook
+ * reads the current session_id and re-registers with force + expected_session_id
+ * (a server CAS takeover: the row's session_id still matches → it wins, session
+ * rotates, host_shell_pids refreshes). One ⇒ a live concurrent terminal ⇒ SKIP.
+ *
+ * R1/R2/R3 assert BOTH directions AND the discriminating shared-ancestor case.
+ * (Concurrent-double-force / loser-not-mute are proven deterministically at the
+ * server level in tests/adr-0012-force-cas-takeover.test.ts.)
+ */
+describe("ADR-0012 — resummon CAS-force refreshes host_shell_pids (stale-on-restart)", () => {
+  it("(R1) live row whose stored chain is all DEAD pids → hook CAS-force RE-REGISTERS: session rotates, host_shell_pids refreshes", async () => {
+    const h = await startHarness("dead");
+    try {
+      const name = "resummon-builder";
+      const token = await registerAndGetToken(h.port, name);
+      // Looks live (session set + last_seen now) but the stored [999999] belongs
+      // to the DEAD prior terminal. Nothing is live-elsewhere → relaunch → the
+      // hook reads session_id (SEED_SESSION) and force+expected — the CAS matches
+      // → wins → session rotates + chain refreshes.
+      seedRow(h.dbPath, name, {
+        sessionId: SEED_SESSION,
+        lastSeenIso: new Date().toISOString(),
+        pids: SEED_PIDS,
+      });
+
+      const r = runHook(h, name, token);
+      expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
+
+      const newSession = sql(h.dbPath, `SELECT session_id FROM agents WHERE name='${name}';`);
+      expect(newSession, "session_id must rotate — proves the CAS force ran + won").not.toBe(SEED_SESSION);
+      expect(newSession.length).toBeGreaterThan(0);
+      const newPids = sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`);
+      expect(newPids, "the dead [999999] chain must be replaced").not.toBe(SEED_PIDS);
+      expect(newPids).toMatch(/^\[\d+(,\d+)*\]$/);
+    } finally {
+      stopHarness(h);
+    }
+  }, 25_000);
+
+  it("(R2) live row whose stored chain has a LIVE FOREIGN pid (not in this hook's tree) → hook SKIPS: the concurrent-terminal binding is preserved", async () => {
+    const h = await startHarness("concurrent");
+    const live = spawnLivePid();
+    try {
+      const name = "concurrent-builder";
+      const token = await registerAndGetToken(h.port, name);
+      const heldPids = `[${live.pid}]`;
+      seedRow(h.dbPath, name, {
+        sessionId: SEED_SESSION,
+        lastSeenIso: new Date().toISOString(),
+        pids: heldPids,
+      });
+
+      const r = runHook(h, name, token);
+      expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
+
+      // A live foreign process holds it → SKIP → session + chain preserved.
+      expect(sql(h.dbPath, `SELECT session_id FROM agents WHERE name='${name}';`)).toBe(SEED_SESSION);
+      expect(sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`)).toBe(heldPids);
+    } finally {
+      live.kill();
+      stopHarness(h);
+    }
+  }, 25_000);
+
+  it("(R3) live row, DEAD leaves + a SHARED LIVE ancestor in this hook's chain → hook CAS-force RE-REGISTERS (the real resummon case a whole-chain intersection would wrongly SKIP)", async () => {
+    const h = await startHarness("shared-ancestor");
+    try {
+      const name = "shared-ancestor-builder";
+      const token = await registerAndGetToken(h.port, name);
+      // process.pid is the parent of the spawned hook shell → in the hook's live
+      // chain (the stand-in for the persistent VS-Code-app ancestor). A whole-chain
+      // intersection is NON-EMPTY here ({process.pid}) → would SKIP → bug survives.
+      // The liveness discriminator excludes the in-my-chain ancestor and finds the
+      // leaves dead → relaunch → CAS-force re-register.
+      const deadLeavesPlusSharedLiveAncestor = `[999997,999998,${process.pid}]`;
+      seedRow(h.dbPath, name, {
+        sessionId: SEED_SESSION,
+        lastSeenIso: new Date().toISOString(),
+        pids: deadLeavesPlusSharedLiveAncestor,
+      });
+
+      const r = runHook(h, name, token);
+      expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
+
+      const newSession = sql(h.dbPath, `SELECT session_id FROM agents WHERE name='${name}';`);
+      expect(newSession, "the shared-ancestor case must NOT skip").not.toBe(SEED_SESSION);
+      expect(newSession.length).toBeGreaterThan(0);
+      const newPids = sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`);
+      expect(newPids, "the stale shared-ancestor chain must be replaced").not.toBe(deadLeavesPlusSharedLiveAncestor);
+      expect(newPids).toMatch(/^\[\d+(,\d+)*\]$/);
     } finally {
       stopHarness(h);
     }

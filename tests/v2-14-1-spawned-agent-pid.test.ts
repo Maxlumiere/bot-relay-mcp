@@ -127,21 +127,34 @@ describe("v2.14.1 — hook agent_pid capture + spawn-window", () => {
     }
   }, 25_000);
 
-  it("(B) a populated LIVE row (session + host_shell_pids) → hook SKIPS (agent_pid untouched)", async () => {
+  it("(B) a populated LIVE row held by a LIVE concurrent terminal → hook SKIPS (agent_pid untouched)", async () => {
     const h = await startHarness("live");
+    // ADR-0012: "live" must be a REAL live foreign process (a concurrent
+    // terminal's shell), not a fake [999999]. The LIVE gate now skips only when
+    // the stored chain carries a live pid OUTSIDE this hook's own tree; a dead
+    // sentinel is (correctly) treated as a stale relaunch and CAS-force taken over.
+    const live = spawn("sleep", ["30"], { stdio: "ignore", detached: true });
+    live.unref();
+    const livePid = live.pid ?? 0;
     try {
       const name = "live-builder";
       const token = await registerAndGetToken(h.port, name);
-      sql(h.dbPath, `UPDATE agents SET session_id='SEED', last_seen='${new Date().toISOString()}', agent_status='idle', host_shell_pids='[999999]', agent_pid=12345 WHERE name='${name}';`);
+      expect(livePid).toBeGreaterThan(0);
+      sql(h.dbPath, `UPDATE agents SET session_id='SEED', last_seen='${new Date().toISOString()}', agent_status='idle', host_shell_pids='[${livePid}]', agent_pid=12345 WHERE name='${name}';`);
 
       const r = runHook(h, name, token);
       expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
 
       // SKIP: nothing rotated/overwritten.
       expect(sql(h.dbPath, `SELECT session_id FROM agents WHERE name='${name}';`)).toBe("SEED");
-      expect(sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`)).toBe("[999999]");
+      expect(sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`)).toBe(`[${livePid}]`);
       expect(sql(h.dbPath, `SELECT agent_pid FROM agents WHERE name='${name}';`)).toBe("12345");
     } finally {
+      try {
+        if (livePid > 0) process.kill(livePid);
+      } catch {
+        /* already gone */
+      }
       stopHarness(h);
     }
   }, 25_000);
