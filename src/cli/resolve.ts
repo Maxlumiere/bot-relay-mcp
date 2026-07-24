@@ -231,15 +231,21 @@ export async function run(argv: string[]): Promise<number> {
     return 0;
   }
 
+  // STDOUT carries ONLY the resolved ids, so the SUCCESS/output decision is
+  // derived SOLELY from resolved_ids — NEVER from resolved_count independently.
+  // A success envelope that claims a count but carries no usable ids (or whose
+  // count disagrees with its ids) is malformed: emitting `resolved_ids.join()`
+  // would put an empty/whitespace value on stdout at exit 0 — the exact silent-
+  // empty-capture class this CLI exists to prevent (same family as #130's send.ts
+  // blocker). Fail loud instead.
   const resolvedIds: string[] = Array.isArray(envelope?.resolved_ids)
     ? (envelope!.resolved_ids as unknown[]).filter((x): x is string => typeof x === "string")
     : [];
-  const resolvedCount =
-    typeof envelope?.resolved_count === "number" ? envelope.resolved_count : resolvedIds.length;
 
-  if (resolvedCount === 0) {
-    // Nothing resolved — unknown/foreign/already-resolved ids. Loud + NON-ZERO so
-    // a `$(relay resolve …)` capture fails visibly instead of binding "" at exit 0.
+  if (resolvedIds.length === 0) {
+    // Nothing usable resolved — unknown/foreign/already-resolved ids, or a
+    // malformed success envelope. Loud + NON-ZERO so a `$(relay resolve …)`
+    // capture fails visibly instead of binding "" / "\n" at exit 0.
     process.stderr.write(
       `relay resolve: no messages resolved for "${agent}" — the ${args.messageIds.length} id(s) were ` +
         "unknown, not addressed to you, or already resolved. Nothing changed.\n"
@@ -247,9 +253,20 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
+  const claimedCount = envelope?.resolved_count;
+  if (typeof claimedCount === "number" && claimedCount !== resolvedIds.length) {
+    // Inconsistent envelope (e.g. resolved_count=1 but resolved_ids=[]): refuse
+    // to emit a partial/empty capture rather than trust a count over the ids.
+    process.stderr.write(
+      `relay resolve: daemon returned an inconsistent response (resolved_count=${claimedCount} but ` +
+        `${resolvedIds.length} usable id(s)) — refusing to emit a partial/empty capture.\n`
+    );
+    return 1;
+  }
+
   // STDOUT: ONLY the resolved ids, one per line — a clean, parseable capture.
   process.stderr.write(
-    `✓ resolved ${resolvedCount} of ${args.messageIds.length} message(s) for "${agent}"; they will not re-surface as pending.\n`
+    `✓ resolved ${resolvedIds.length} of ${args.messageIds.length} message(s) for "${agent}"; they will not re-surface as pending.\n`
   );
   process.stdout.write(resolvedIds.join("\n") + "\n");
   return 0;
