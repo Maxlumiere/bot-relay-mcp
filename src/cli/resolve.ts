@@ -233,30 +233,29 @@ export async function run(argv: string[]): Promise<number> {
 
   // STDOUT carries ONLY the resolved ids, so the SUCCESS/output decision is
   // derived SOLELY from resolved_ids — NEVER from resolved_count independently.
-  // A success envelope that claims a count but carries no usable ids (or whose
-  // count disagrees with its ids) is malformed: emitting `resolved_ids.join()`
-  // would put an empty/whitespace value on stdout at exit 0 — the exact silent-
-  // empty-capture class this CLI exists to prevent (same family as #130's send.ts
-  // blocker). Fail loud instead.
-  const resolvedIds: string[] = Array.isArray(envelope?.resolved_ids)
-    ? (envelope!.resolved_ids as unknown[]).filter((x): x is string => typeof x === "string")
-    : [];
-
-  if (resolvedIds.length === 0) {
-    // Nothing usable resolved — unknown/foreign/already-resolved ids, or a
-    // malformed success envelope. Loud + NON-ZERO so a `$(relay resolve …)`
-    // capture fails visibly instead of binding "" / "\n" at exit 0.
+  // FAIL CLOSED: a success envelope MUST carry a NON-EMPTY, ALL-STRING
+  // resolved_ids array. An empty/absent list — or one with ANY non-string element
+  // — is malformed and must NOT reach stdout. This is ENFORCED, not filtered:
+  // filtering a mixed `[123, "m-1"]` would silently accept a PARTIAL list and
+  // emit an unverifiable capture at exit 0 (the exact silent-empty/partial-capture
+  // class this CLI exists to prevent; same family as #130's send.ts blocker).
+  const rawIds: unknown = envelope?.resolved_ids;
+  if (!Array.isArray(rawIds) || rawIds.length === 0 || !rawIds.every((x) => typeof x === "string")) {
+    // Loud + NON-ZERO so a `$(relay resolve …)` capture fails visibly instead of
+    // binding "" / "\n" / a partial list at exit 0. No ✓.
     process.stderr.write(
       `relay resolve: no messages resolved for "${agent}" — the ${args.messageIds.length} id(s) were ` +
-        "unknown, not addressed to you, or already resolved. Nothing changed.\n"
+        "unknown, not addressed to you, already resolved, or the daemon returned a malformed resolved_ids " +
+        "list (empty or non-string). Nothing changed.\n"
     );
     return 1;
   }
+  const resolvedIds = rawIds as string[];
 
   const claimedCount = envelope?.resolved_count;
   if (typeof claimedCount === "number" && claimedCount !== resolvedIds.length) {
-    // Inconsistent envelope (e.g. resolved_count=1 but resolved_ids=[]): refuse
-    // to emit a partial/empty capture rather than trust a count over the ids.
+    // Inconsistent envelope (e.g. resolved_count=2 but 1 usable id): refuse to
+    // emit a partial capture rather than trust a count that disagrees with the ids.
     process.stderr.write(
       `relay resolve: daemon returned an inconsistent response (resolved_count=${claimedCount} but ` +
         `${resolvedIds.length} usable id(s)) — refusing to emit a partial/empty capture.\n`

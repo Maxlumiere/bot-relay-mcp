@@ -139,6 +139,18 @@ describe("`relay resolve` — clean ids on stdout, confirmation on stderr", () =
     expect(r.out).toBe("");
     expect(r.err).toMatch(/inconsistent/);
   });
+
+  it("(8) MIXED-type resolved_ids [123, \"m-1\"] → ENFORCED (not filtered): non-zero + empty stdout + NO ✓", async () => {
+    // codex #133 GAP 2: filtering non-strings would silently accept a PARTIAL list
+    // (filtered=["m-1"], count=1 matches) and exit 0. The locked contract is
+    // non-empty ALL-STRING — a mixed array is malformed and must fail closed.
+    const fetchImpl = (async () =>
+      mcpEnvelope({ success: true, agent: "muted", resolved_ids: [123, "m-1"], resolved_count: 1, requested_count: 2 })) as unknown as typeof fetch;
+    const r = await runResolve(["m-1", "m-2", "--agent", "muted"], fetchImpl);
+    expect(r.code).not.toBe(0);
+    expect(r.out, `stdout leaked ${JSON.stringify(r.out)}`).toBe("");
+    expect(r.err).not.toMatch(/✓/);
+  });
 });
 
 interface DaemonCtx {
@@ -233,7 +245,7 @@ describe("`relay resolve` — end-to-end against a real daemon + resolve_message
     });
   }, 25_000);
 
-  it("(E2) a FOREIGN token cannot resolve another agent's message (CLI defense-in-depth)", async () => {
+  it("(E2) a SPOOFED recipient is rejected: B's token while the CLI CLAIMS agent-a → auth error, empty stdout, A's mail survives", async () => {
     await withRealDaemon("e2", async ({ rpc, resolveInProcess }) => {
       const a = await rpc("register_agent", { name: "agent-a", role: "r", capabilities: [] });
       const b = await rpc("register_agent", { name: "agent-b", role: "r", capabilities: [] });
@@ -242,16 +254,19 @@ describe("`relay resolve` — end-to-end against a real daemon + resolve_message
       const msgIdForA = sent.message_id as string;
       expect(msgIdForA).toBeTruthy();
 
-      // B authenticates as itself and asks to resolve A's message id. The server
-      // resolves for agent_name=B; the id is not addressed to B → nothing usable
-      // resolves → the CLI fails loud (non-zero, empty stdout). No cross-resolve.
-      const r = await resolveInProcess([msgIdForA], "agent-b", b.agent_token as string);
+      // THE IMPERSONATION CASE (codex #133 GAP 1): the CLI CLAIMS agent_name=agent-a
+      // but presents B's token. The daemon binds the token to the CLAIMED row
+      // (enforceAuth / agentFromArgs exact-row) → B's token does NOT authenticate
+      // agent-a → AUTH_FAILED. The resolve is REJECTED outright — not merely
+      // recipient-skipped. (Weaker recipient-scoping is already proven by v2-12-0.)
+      const r = await resolveInProcess([msgIdForA], "agent-a", b.agent_token as string);
       expect(r.code).not.toBe(0);
-      expect(r.out).toBe("");
+      expect(r.out, `stdout leaked ${JSON.stringify(r.out)}`).toBe("");
+      expect(r.err).toMatch(/auth|token|AUTH_FAILED|does not authenticate|rejected/i);
 
-      // A's message is STILL pending — B did not touch it.
+      // A's message is STILL pending — the spoof changed nothing.
       const aPending = await rpc("get_messages", { agent_name: "agent-a", status: "pending", since: "all", peek: true }, a.agent_token);
-      expect((aPending.messages || []).some((m: { id: string }) => m.id === msgIdForA), "A's message must survive B's resolve attempt").toBe(true);
+      expect((aPending.messages || []).some((m: { id: string }) => m.id === msgIdForA), "A's message must survive the spoofed resolve").toBe(true);
     });
   }, 25_000);
 });
