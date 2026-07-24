@@ -113,12 +113,21 @@ export const TETHER_LLM: readonly TetherLlmEntry[] = [
   {
     id: "claude",
     wakeWord: "inbox",
-    style: "inline-newline",
+    // v0.7.0: WAS "inline-newline" — the appended newline never submitted.
+    // Claude Code's TUI takes a newline arriving inside the typed chunk as
+    // literal input, so `sendText("inbox", true)` filled the box and sat there
+    // until a human pressed Enter; every new message stacked another dead
+    // "inbox" (observed 14 deep, 2026-07-24). Same TUI lesson Codex taught on
+    // 2026-06-26 — type, let the paste block close, submit as a SEPARATE event.
+    // submitMethod stays "sendText" (targets the bound terminal, no focus
+    // steal); flip bot-relay.tether.claudeSubmitMethod to "sendSequence" if a
+    // sendText'd CR proves absorbed like Codex's was.
+    style: "type-then-submit",
     wake: {
       wakeText: "inbox",
       submitKey: "\r",
       submitMethod: "sendText",
-      submitDelayMs: 0,
+      submitDelayMs: 150,
       nativeSelfWake: false,
     },
   },
@@ -138,8 +147,8 @@ export const TETHER_LLM: readonly TetherLlmEntry[] = [
 
 function entryFor(id: string | undefined): TetherLlmEntry {
   const found = id ? TETHER_LLM.find((e) => e.id === id) : undefined;
-  // Unknown / undefined id → Claude (the safest default: a single newline-
-  // appended wake, no separate submit to mis-fire).
+  // Unknown / undefined id → Claude (a short wake word + separate CR into an
+  // idle prompt is the least-harmful default for an unrecognized TUI).
   return found ?? TETHER_LLM[0];
 }
 
@@ -147,17 +156,21 @@ function entryFor(id: string | undefined): TetherLlmEntry {
  *  the ordered op sequence is determined by `style`, never by the CLI id. */
 function buildWake(style: WakeStyle, v: WakeValues): (ctx: WakeContext) => Promise<void> {
   if (style === "inline-newline") {
-    // Claude Code's TUI accepts a wake word with an appended newline cleanly, so
-    // a single sendText(word, true) both types AND submits.
+    // No shipped CLI uses this style anymore. Claude did until v0.7.0, on the
+    // belief the appended newline submitted — it doesn't (the TUI treats a
+    // newline inside the typed chunk as literal input; the wake sat in the box
+    // until a human pressed Enter). Kept for a future CLI whose input is a
+    // plain line-buffered readline, where text+newline genuinely submits.
     return async (ctx) => {
       ctx.terminal.sendText(v.wakeText, true);
     };
   }
-  // "type-then-submit" (Codex): the TUI swallows a newline embedded in the same
-  // paste block AND a submit key sent before the paste settles. So: type the
-  // instruction (no newline) → WAIT for the paste block to close → submit as a
-  // SEPARATE event (a focused standalone CR via sendSequence, the twin of a real
-  // keyboard Enter, is the only thing proven to make Codex submit).
+  // "type-then-submit" (Claude + Codex): the TUI swallows a newline embedded in
+  // the same paste block AND a submit key sent before the paste settles. So:
+  // type the instruction (no newline) → WAIT for the paste block to close →
+  // submit as a SEPARATE event (per-terminal sendText CR for Claude; a focused
+  // standalone CR via sendSequence for Codex, the only thing proven to make
+  // Codex submit).
   return async (ctx) => {
     ctx.terminal.sendText(v.wakeText, false);
     if (v.submitDelayMs > 0) await ctx.delay(v.submitDelayMs);
@@ -184,6 +197,14 @@ export interface CodexAdapterOptions {
   submitMethod?: SubmitMethod;
 }
 
+/** Per-call Claude tuning (v0.7.0). Submit-mechanics only — the wake TEXT is
+ *  Claude's `inbox` convention and is deliberately not configurable, so a
+ *  misconfigured prompt can't break the drain contract. */
+export type ClaudeAdapterOptions = Pick<
+  CodexAdapterOptions,
+  "submitKey" | "submitDelayMs" | "submitMethod"
+>;
+
 function applyOpts(v: WakeValues, opts?: CodexAdapterOptions): WakeValues {
   if (!opts) return v;
   return {
@@ -198,21 +219,24 @@ function applyOpts(v: WakeValues, opts?: CodexAdapterOptions): WakeValues {
 /**
  * Resolve the adapter for a configured LLM id, data-drivenly from TETHER_LLM.
  * Unknown / undefined ids fall back to Claude (the safest default). `opts.codex`
- * threads per-call tuning onto the resolved entry's wake values (used for any
- * type-then-submit CLI, historically named for Codex).
+ * / `opts.claude` thread per-call tuning onto the resolved entry's wake values.
  */
 export function adapterFor(
   id: string | undefined,
-  opts?: { codex?: CodexAdapterOptions },
+  opts?: { codex?: CodexAdapterOptions; claude?: ClaudeAdapterOptions },
 ): LlmAdapter {
   const entry = entryFor(id);
   // GATED ON THE RESOLVED ENTRY, NOT ON WHAT THE CALLER PASSED. resolveWakeAdapter()
-  // always builds a populated `codex` block (it cannot know the llm before calling
-  // us), so applying it unconditionally handed the CODEX instruction to every
+  // always builds populated tuning blocks (it cannot know the llm before calling
+  // us), so applying them unconditionally handed the CODEX instruction to every
   // claude-configured agent — they got 'Relay mail arrived — call get_messages(
-  // agent_name="…")' instead of the bare `inbox` their profile specifies. The
-  // tuning is Codex's; a profile must never be reshaped by another profile's options.
-  const values = applyOpts(entry.wake, entry.id === "codex" ? opts?.codex : undefined);
+  // agent_name="…")' instead of the bare `inbox` their profile specifies. Each
+  // profile takes ONLY its own block; one profile must never be reshaped by
+  // another profile's options.
+  const values = applyOpts(
+    entry.wake,
+    entry.id === "codex" ? opts?.codex : entry.id === "claude" ? opts?.claude : undefined,
+  );
   return {
     id: entry.id,
     wakeWord: entry.wakeWord,

@@ -58,7 +58,13 @@ import { ConnectionLifecycle } from "./connection-lifecycle.js";
 import { HealthPoll } from "./health-poll.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
-import { adapterFor, type LlmAdapter, type WakeContext, type SubmitMethod } from "./llm-adapter.js";
+import {
+  adapterFor,
+  type LlmAdapter,
+  type WakeContext,
+  type SubmitKey,
+  type SubmitMethod,
+} from "./llm-adapter.js";
 import { execFileSync } from "node:child_process";
 
 const CHANNEL_NAME = "Tether for bot-relay-mcp";
@@ -681,7 +687,22 @@ function resolveWakeAdapter(agentName: string): LlmAdapter {
     cfg.get<string>("codexWakePrompt") ??
     'Relay mail arrived — call get_messages(agent_name="{agent}", status="pending"), act on every message, then continue.';
   const wakeText = promptTemplate.replace(/\{agent\}/g, agentName);
-  return adapterFor(llm, { codex: { wakeText, submitKey, submitDelayMs, submitMethod } });
+  // Claude (v0.7.0): type-then-submit like Codex — the old newline-appended
+  // sendText never submitted (the TUI takes an in-chunk newline as literal
+  // input). Default submit stays sendText (no focus steal); claudeSubmitMethod
+  // flips to sendSequence if a sendText'd CR proves absorbed.
+  const claudeSubmitKey: SubmitKey = cfg.get<string>("claudeEnterKey") === "lf" ? "\n" : "\r";
+  const claudeSubmitDelayMs = cfg.get<number>("claudeSubmitDelayMs") ?? 150;
+  const claudeSubmitMethod: SubmitMethod =
+    cfg.get<string>("claudeSubmitMethod") === "sendSequence" ? "sendSequence" : "sendText";
+  return adapterFor(llm, {
+    codex: { wakeText, submitKey, submitDelayMs, submitMethod },
+    claude: {
+      submitKey: claudeSubmitKey,
+      submitDelayMs: claudeSubmitDelayMs,
+      submitMethod: claudeSubmitMethod,
+    },
+  });
 }
 
 /** Resolve the agents Tether watches: the legacy single `agentName` (primary —
