@@ -440,3 +440,48 @@ relay_pid_chain() {
   esac
   printf '[%s]' "$chain"
 }
+
+# ADR-0012 — relay_binding_live_elsewhere <stored_chain_json> <my_chain_json>:
+# return 0 (true) when the STORED host_shell_pids chain still has a LIVE process
+# that is NOT part of THIS hook's own live process chain — i.e. a genuine
+# concurrent terminal is holding the binding. Return 1 (false) otherwise.
+#
+# The SessionStart ADVISORY discriminator (check-relay.sh): a row can pass the
+# coarse LIVE gate (session set + last_seen < 120s + pids present) yet be a
+# genuine RELAUNCH — after a resummon / VS Code reload the prior terminal's LEAF
+# pids (its shell + the claude/codex process) are DEAD and only the persistent VS
+# Code APP ancestors survive (Code Helper / Code). But those shared ancestors are
+# in THIS hook's chain too, so they are NOT "elsewhere". Excluding my-own-tree
+# pids and probing the REMAINDER for liveness separates:
+#   - relaunch (dead leaves + shared LIVE ancestors) → nothing is live-elsewhere
+#     → return 1 → attempt a CAS force takeover (refresh the binding).
+#   - concurrent 2nd terminal (a live foreign shell not in my tree) → alive AND
+#     not mine → return 0 → SKIP (don't even attempt a takeover).
+# A whole-chain intersection would wrongly count the shared ancestors as "still
+# live here" and skip the relaunch — the exact miss this avoids.
+#
+# ADR-0012 DEMOTES this to an ADVISORY optimization, NOT the safety authority:
+# the server CAS (expected_session_id) is what prevents a lost-update clobber, so
+# a false result here (MED PID-reuse / live-ancestor≠live-agent — tracked
+# follow-ups) degrades to a bounded self-healing wake miss, never a clobber.
+#
+# Liveness via `ps -p` (existence, ownership-independent). Parses bare integers;
+# exact-token compare so pid 12 is never treated as 123. Empty/no-integer stored
+# → return 1 (nothing to protect → attempt takeover, the safe direction).
+relay_binding_live_elsewhere() {
+  local stored mine sp x mine_hit
+  stored=$(printf '%s' "${1:-}" | tr -cs '0-9' ' ')
+  mine=$(printf '%s' "${2:-}" | tr -cs '0-9' ' ')
+  case "$stored" in *[0-9]*) ;; *) return 1 ;; esac
+  for sp in $stored; do
+    mine_hit=0
+    for x in $mine; do
+      [ "$sp" = "$x" ] && { mine_hit=1; break; }
+    done
+    [ "$mine_hit" -eq 1 ] && continue
+    if ps -p "$sp" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}

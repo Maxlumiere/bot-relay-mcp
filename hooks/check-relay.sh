@@ -539,6 +539,13 @@ UUID=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "hook-$$-$(date 
 # v2.1 Phase 4b.1 v2: also skip if we just completed a recovery above — the
 # register_agent over HTTP already wrote the row.
 SKIP_REGISTER=0
+# ADR-0012 — when the LIVE gate detects a genuine relaunch (advisory
+# discriminator: the stored binding has no live process outside this hook's
+# tree), the register carries force=true + expected_session_id=<the session_id
+# we READ> so the server performs an atomic CAS takeover (exactly one of N racing
+# relaunches wins; losers get FORCE_PRECONDITION_FAILED and surface loudly).
+RELAY_FORCE_REGISTER=0
+RELAY_EXPECTED_SESSION_ID=""
 if [ "$RECOVERY_COMPLETED" -eq 1 ]; then
   SKIP_REGISTER=1
 elif [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
@@ -577,7 +584,46 @@ FROM agents WHERE name = :name LIMIT 1;
 SQL
 )
   if [ "$LIVENESS" = "LIVE" ]; then
-    SKIP_REGISTER=1
+    # ADR-0012 (host_shell_pids stale-on-restart) — a row that passes the LIVE
+    # gate (session set + last_seen < 120s + pids present) may be a genuine
+    # RELAUNCH whose terminal changed: after a resummon / VS Code reload the
+    # stored host_shell_pids' LEAF pids (prior shell + claude) are DEAD and only
+    # the persistent VS Code APP ancestors survive — and those are in THIS hook's
+    # chain too. Skipping then strands Tether's PID-binding ("no bound terminal").
+    # ADVISORY discriminator: does the stored chain still have a LIVE process
+    # OUTSIDE this hook's own tree?
+    STORED_PIDS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+SELECT IFNULL(host_shell_pids,'') FROM agents WHERE name = :name LIMIT 1;
+SQL
+)
+    THIS_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
+    if relay_binding_live_elsewhere "$STORED_PIDS" "$THIS_CHAIN"; then
+      # A live process outside this hook's tree holds it → genuine concurrent
+      # terminal → SKIP (don't even attempt a takeover). ADVISORY only: even a
+      # false-skip degrades to a bounded self-healing wake miss, never a clobber —
+      # the server CAS below is the safety authority (ADR-0012).
+      SKIP_REGISTER=1
+    else
+      # Relaunch (prior terminal dead) → attempt a CAS TAKEOVER. Read the CURRENT
+      # session_id so the server compare-and-swaps against it: exactly one of N
+      # racing relaunches wins; losers get FORCE_PRECONDITION_FAILED and surface
+      # loudly below (never mute). The row still looks actively-held, so a plain
+      # re-register would hit the B2 collision guard — the CAS force is the
+      # sanctioned, race-safe takeover (NOT an unconditional bypass).
+      RELAY_EXPECTED_SESSION_ID=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+SELECT IFNULL(session_id,'') FROM agents WHERE name = :name LIMIT 1;
+SQL
+)
+      # LIVE implies session_id is present; only force when we actually read one
+      # (a non-empty expected is required — never emit force with an empty value).
+      if [ -n "$RELAY_EXPECTED_SESSION_ID" ]; then
+        RELAY_FORCE_REGISTER=1
+      else
+        SKIP_REGISTER=1
+      fi
+    fi
   fi
 fi
 
@@ -624,11 +670,26 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
+  # ADR-0012 — on the relaunch path, carry force=true + expected_session_id (the
+  # session_id we READ above) so the server CAS-takes-over the row atomically.
+  # expected_session_id is REQUIRED with force and is always a non-empty UUID here
+  # (the LIVE gate guarantees it), emitted as a JSON string.
+  RELAY_FORCE_FRAGMENT=""
+  if [ "${RELAY_FORCE_REGISTER:-0}" -eq 1 ] && [ -n "$RELAY_EXPECTED_SESSION_ID" ]; then
+    RELAY_FORCE_FRAGMENT=",\"force\":true,\"expected_session_id\":\"${RELAY_EXPECTED_SESSION_ID}\""
+  fi
   REG_BODY=$(curl -s -m 4 -w "\nHTTP_STATUS:%{http_code}\n" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_FORCE_FRAGMENT}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
     2>&1)
+  # ADR-0012 — if this was a force TAKEOVER and it LOST the CAS, the daemon
+  # returns FORCE_PRECONDITION_FAILED. Surface LOUDLY (never mute): another live
+  # session already holds this name (a duplicate relaunch). Do NOT retry force —
+  # the row is the winner's now, and this hook's LIVE gate will SKIP next run.
+  if [ "${RELAY_FORCE_REGISTER:-0}" -eq 1 ] && printf '%s' "$REG_BODY" | grep -q "FORCE_PRECONDITION_FAILED"; then
+    echo "[RELAY] ⚠️  \"$AGENT_NAME\": another LIVE session already holds this name — this looks like a DUPLICATE relaunch, and your registration did NOT take it over (ADR-0012 CAS lost). If you meant to run a second terminal, give it a distinct RELAY_AGENT_NAME; otherwise the other session is the live one. Not retrying force." >&2
+  fi
   # v2.6.1 — capture fresh agent_token from the response body and persist
   # to the vault. register_agent only returns `agent_token` on first-mint
   # paths (legacy_bootstrap → active or fresh INSERT); subsequent re-

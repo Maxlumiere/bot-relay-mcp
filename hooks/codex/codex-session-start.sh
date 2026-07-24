@@ -240,10 +240,59 @@ except Exception:
 fi
 
 if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
+  # ADR-0012 — Codex parity with check-relay.sh. On a genuine relaunch (no clean
+  # handoff marker) the row may be live-looking but its terminal is DEAD. Read the
+  # row's current session_id + host_shell_pids via discover_agents and, if the
+  # ADVISORY discriminator says relaunch (no live process outside our tree holds
+  # the stored chain), take over with a CAS force (expected_session_id = the
+  # session_id we read) — exactly one of N racing relaunches wins; losers get
+  # FORCE_PRECONDITION_FAILED and surface loudly (never mute). A plain non-force
+  # register would instead hit the B2 collision guard → stale binding (the P1a
+  # gap codex-5-5 flagged). Fresh/offline rows carry no chain → register normally.
+  CODEX_FORCE_FRAGMENT=""
+  if command -v python3 >/dev/null 2>&1; then
+    CODEX_DISCOVER=$(curl -fsS --connect-timeout 1 --max-time 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+      "${REG_HEADERS[@]}" \
+      --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_agents","arguments":{}}}' 2>/dev/null) || CODEX_DISCOVER=""
+    if [ -n "$CODEX_DISCOVER" ]; then
+      # Emit "session_id<TAB>[pid,pid,...]" for OUR row (empty if absent).
+      CODEX_ROW=$(RESP="$CODEX_DISCOVER" AN="$AGENT_NAME" python3 -c '
+import json, os
+raw=(os.environ.get("RESP","") or "").strip()
+payload=None
+for line in raw.splitlines():
+    line=line.strip()
+    if line.startswith("data:"):
+        payload=line[5:].strip(); break
+if payload is None: payload=raw
+try:
+    inner=json.loads(json.loads(payload)["result"]["content"][0]["text"])
+    for a in inner.get("agents",[]):
+        if a.get("name")==os.environ["AN"]:
+            sid=a.get("session_id") or ""
+            pids=a.get("host_shell_pids") or []
+            arr="["+",".join(str(int(p)) for p in pids if isinstance(p,int))+"]"
+            print(sid+"\t"+arr)
+            break
+except Exception:
+    pass
+' 2>/dev/null)
+      CODEX_SID=$(printf '%s' "$CODEX_ROW" | cut -f1)
+      CODEX_CHAIN=$(printf '%s' "$CODEX_ROW" | cut -f2)
+      if [ -n "$CODEX_SID" ] && [ -n "$CODEX_CHAIN" ] && [ "$CODEX_CHAIN" != "[]" ] \
+         && ! relay_binding_live_elsewhere "$CODEX_CHAIN" "$RELAY_HOST_PID_CHAIN"; then
+        CODEX_FORCE_FRAGMENT=",\"force\":true,\"expected_session_id\":\"${CODEX_SID}\""
+      fi
+    fi
+  fi
   REG_BODY=$(curl -s -m 4 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"codex\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"codex\"${CODEX_FORCE_FRAGMENT}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
     2>/dev/null)
+  # ADR-0012 — loud loser (never mute) when the CAS takeover is lost.
+  if [ -n "$CODEX_FORCE_FRAGMENT" ] && printf '%s' "$REG_BODY" | grep -q "FORCE_PRECONDITION_FAILED"; then
+    echo "[RELAY] ⚠️  \"$AGENT_NAME\": another LIVE session already holds this name — duplicate Codex relaunch; registration did NOT take it over (ADR-0012 CAS lost). Give this terminal a distinct RELAY_AGENT_NAME, or the other session is the live one. Not retrying force." >&2
+  fi
 
   # Capture a freshly-minted token (first register only) and persist it to the
   # vault so the stdio MCP server's resolveToken can authenticate this agent's

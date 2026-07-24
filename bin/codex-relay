@@ -136,8 +136,14 @@ register_at_launch() {
   local reg_headers=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
   [ -n "$token" ] && reg_headers+=(-H "X-Agent-Token: ${token}")
 
-  # NON-force, NO agent_pid. A live same-name session correctly rejects this
-  # (duplicate-session protection intact) → no marker → hook fallback.
+  # ADR-0012 — NON-force pre-register (a cold-start best-effort), NO agent_pid. A
+  # live same-name session correctly rejects this (B2 duplicate-session protection
+  # intact) → no marker → the SessionStart hook (codex-session-start.sh) then
+  # performs the CAS TAKEOVER (force + expected_session_id) if it's a genuine
+  # relaunch. The launcher deliberately does NOT force: on a cold start it has no
+  # session_id to compare-and-swap against, and forcing here would duplicate the
+  # hook's takeover. No unconditional bypass anywhere — the launcher defers, it
+  # never bypasses B2.
   local body reg_body
   body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${caps_json}${title_val:+,\"terminal_title_ref\":\"${title_val}\"}${chain:+,\"host_shell_pids\":${chain}}${guid:+,\"host_id\":\"${guid}\"}}}}"
   reg_body=$(curl -fsS --connect-timeout 1 --max-time 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
