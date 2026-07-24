@@ -182,4 +182,52 @@ describe("`relay send` puts a CLEAN id on stdout, the confirmation on stderr", (
       else process.env.RELAY_AGENT_TOKEN = saved;
     }
   });
+
+  it("a success response WITHOUT a message_id → NON-ZERO exit + EMPTY stdout (never a silent empty capture)", async () => {
+    // codex-5-5's #130 re-audit repro: HTTP 200 + {success:true} but NO
+    // message_id. The old default path printed the id only when present yet
+    // returned 0 unconditionally → `id=$(relay send …)` captured "" at exit 0 —
+    // the exact silent-capture failure the id-only contract exists to prevent.
+    const { run: sendRun } = await import("../src/cli/send.js");
+    const saved = process.env.RELAY_AGENT_TOKEN;
+    process.env.RELAY_AGENT_TOKEN = "AbCd1234efGH5678ijKL9012mnOP3456";
+    const out: string[] = [];
+    const err: string[] = [];
+    const outSpy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(((c: unknown) => {
+        out.push(String(c));
+        return true;
+      }) as typeof process.stdout.write);
+    const errSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(((c: unknown) => {
+        err.push(String(c));
+        return true;
+      }) as typeof process.stderr.write);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ success: true }), {
+          // success — but NO message_id in the body
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    try {
+      const code = await sendRun(["rcpt", "hello world", "--from", "sender"]);
+      // Non-zero exit so `set -e` / `||` guards and $()-capture checks fail loudly.
+      expect(code).not.toBe(0);
+      // STDOUT stays EMPTY — nothing capturable, so "" is never bound as an id.
+      expect(out.join(""), `stdout leaked ${out.join("").length} bytes`).toBe("");
+      // The operator still sees WHY, on STDERR.
+      expect(err.join("")).toMatch(/no usable message_id/);
+    } finally {
+      fetchSpy.mockRestore();
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+      if (saved === undefined) delete process.env.RELAY_AGENT_TOKEN;
+      else process.env.RELAY_AGENT_TOKEN = saved;
+    }
+  });
 });

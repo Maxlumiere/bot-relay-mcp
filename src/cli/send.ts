@@ -258,17 +258,30 @@ export async function run(argv: string[]): Promise<number> {
 
   if (args.json) {
     process.stdout.write((parsed ? JSON.stringify(parsed) : text.trim()) + "\n");
-  } else {
-    // STDOUT carries ONLY the real result — the message id — so
-    // `$(relay send TO MSG)` captures a clean, parseable value (or nothing, on a
-    // failure that already exited non-zero above). The human-friendly
-    // confirmation is DIAGNOSTIC → STDERR, where it stays visible interactively
-    // but never pollutes a capture.
-    const id = parsed?.message_id ?? null;
-    process.stderr.write(
-      `✓ sent ${args.priority} message from "${from}" to "${args.to}"${id ? ` (id ${id})` : ""}\n`
-    );
-    if (id) process.stdout.write(`${id}\n`);
+    return 0;
   }
+
+  // Default path — STDOUT carries ONLY the real result, the message id, so
+  // `$(relay send TO MSG)` captures a clean, parseable value. A success response
+  // that carries NO usable message_id must NOT print an empty stdout and still
+  // exit 0: that is a SILENT CAPTURE of the empty string — the exact failure this
+  // id-only contract exists to prevent (the caller cannot tell "" from a real id,
+  // and an id-only stdout that can be empty at exit 0 is worthless). Require a
+  // non-empty string id; otherwise diagnose to STDERR and exit non-zero so the
+  // capture fails loudly instead of silently binding "".
+  const id = typeof parsed?.message_id === "string" ? parsed.message_id.trim() : "";
+  if (!id) {
+    process.stderr.write(
+      `relay send: daemon returned success but no usable message_id — refusing to emit an empty capture. ` +
+        `Response: ${text.slice(0, 300)}\n`
+    );
+    return 1;
+  }
+  // The human-friendly confirmation is DIAGNOSTIC → STDERR (visible interactively,
+  // never pollutes a capture); the bare id is the only thing on STDOUT.
+  process.stderr.write(
+    `✓ sent ${args.priority} message from "${from}" to "${args.to}" (id ${id})\n`
+  );
+  process.stdout.write(`${id}\n`);
   return 0;
 }
