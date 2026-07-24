@@ -82,15 +82,23 @@ describe("Tether v0.2.3 R1 — subscribe→notify→wake through the production 
         readSnapshot: readInboxSnapshot,
         wakeGate: gate,
         // ADR-0010: the harness agent has no turn in flight — it IS idle. An
-        // idle observation is the flush evidence that re-arms the gate between
-        // the catch-up wake and the live one (drain alone no longer re-arms:
-        // pending==0 is not consumption).
+        // idle observation flushes a LANDED injection, re-arming the gate
+        // between the catch-up wake and the live one (drain alone no longer
+        // re-arms: pending==0 is not consumption).
         observe: async () => ({ state: "idle" as const, busyCoveredByHook: true }),
         ...sinkDeps,
       });
       // Catch-up wake fired THROUGH the production seam.
       expect(onWake).toHaveBeenCalledTimes(1);
       expect(onWake).toHaveBeenLastCalledWith(RCPT);
+      // ADR-0010 round 2 (codex #126): idle is flush evidence ONLY for a wake
+      // that actually LANDED. In production onWake starts injectInboxKeystroke,
+      // which acks landing (gate.markInjectionLanded) when adapter.wake
+      // resolves; onWake is spied here at that boundary, so ack the landing
+      // explicitly — the catch-up injection submits (a fast keystroke into an
+      // idle terminal) before the drain. Without the ack the in-flight guard
+      // correctly holds the outstanding flag and the live wake is suppressed.
+      gate.markInjectionLanded();
 
       // The agent consumes the wake (drains its inbox) before new mail lands.
       await drainInboxViaHttp(daemon.baseUrl, RCPT, rcptToken);
