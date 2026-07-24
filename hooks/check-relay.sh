@@ -539,6 +539,12 @@ UUID=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "hook-$$-$(date 
 # v2.1 Phase 4b.1 v2: also skip if we just completed a recovery above — the
 # register_agent over HTTP already wrote the row.
 SKIP_REGISTER=0
+# v2.23.0 — set to 1 by the LIVE gate below when a row that LOOKS actively-held
+# is actually a genuine relaunch (stored host_shell_pids disjoint from this
+# hook's live chain → the prior terminal is dead). The register call then carries
+# force=true so the server's B2 collision guard (NAME_COLLISION_ACTIVE) lets the
+# relaunch refresh the binding instead of rejecting it as a concurrent terminal.
+RELAY_FORCE_REGISTER=0
 if [ "$RECOVERY_COMPLETED" -eq 1 ]; then
   SKIP_REGISTER=1
 elif [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
@@ -577,7 +583,46 @@ FROM agents WHERE name = :name LIMIT 1;
 SQL
 )
   if [ "$LIVENESS" = "LIVE" ]; then
-    SKIP_REGISTER=1
+    # v2.23.0 (host_shell_pids stale-on-restart) — a row can pass the LIVE gate
+    # above (session set + last_seen < 120s + host_shell_pids present) yet be a
+    # genuine RELAUNCH whose terminal changed: after a resummon / VS Code reload
+    # the stored host_shell_pids' LEAF pids (the prior shell + claude) are DEAD
+    # and only the persistent VS Code APP ancestors survive (Code Helper / Code).
+    # Skipping re-register then strands Tether's PID-binding (it matches an open
+    # terminal's processId against host_shell_pids → no live match → "no bound
+    # terminal" → unwakeable until a full restart), while agent_pid keeps
+    # refreshing independently via report_liveness (post-tool-use-check.sh) —
+    # the exact agent_pid-fresh / host_shell_pids-stale asymmetry seen in the
+    # field. A whole-chain intersection can't tell the two apart: the shared VS
+    # Code ancestors are in BOTH the dead stored chain and this hook's live chain.
+    # The discriminator that CAN: does the stored chain still have a LIVE process
+    # OUTSIDE this hook's own tree?
+    #   live-elsewhere → a genuine concurrent terminal holds the binding → SKIP
+    #                    (protect the case the 120s window was built for).
+    #   not            → the prior terminal is dead (only shared ancestors, which
+    #                    are in MY chain, remain) → genuine relaunch → re-register
+    #                    WITH force=true (see below) so host_shell_pids refreshes
+    #                    to THIS terminal instead of stranding the binding.
+    STORED_PIDS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+SELECT IFNULL(host_shell_pids,'') FROM agents WHERE name = :name LIMIT 1;
+SQL
+)
+    THIS_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
+    if relay_binding_live_elsewhere "$STORED_PIDS" "$THIS_CHAIN"; then
+      SKIP_REGISTER=1
+    else
+      # No live process outside this hook's tree holds the binding → the prior
+      # terminal is gone → genuine relaunch. The row still LOOKS actively-held
+      # (session set + last_seen < 120s), so a plain re-register would be rejected
+      # by the server's B2 collision guard (NAME_COLLISION_ACTIVE,
+      # src/tools/identity.ts). Carry force=true — the sanctioned escape hatch for
+      # "prior session unreachable, not yet aged out" (types.ts
+      # register_agent.force) — so the binding refreshes to THIS terminal. force
+      # is scoped to the relaunch case ONLY: a live foreign terminal SKIPs above
+      # and never forces, so the concurrent-terminal protection is untouched.
+      RELAY_FORCE_REGISTER=1
+    fi
   fi
 fi
 
@@ -624,10 +669,15 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
+  # v2.23.0 — force=true ONLY on the genuine-relaunch path (the LIVE gate above
+  # saw a disjoint stored chain). Empty otherwise, so the B2 collision guard
+  # stays fully active for every non-relaunch register.
+  RELAY_FORCE_FRAGMENT=""
+  [ "${RELAY_FORCE_REGISTER:-0}" -eq 1 ] && RELAY_FORCE_FRAGMENT=',"force":true'
   REG_BODY=$(curl -s -m 4 -w "\nHTTP_STATUS:%{http_code}\n" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_FORCE_FRAGMENT}${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
     2>&1)
   # v2.6.1 — capture fresh agent_token from the response body and persist
   # to the vault. register_agent only returns `agent_token` on first-mint

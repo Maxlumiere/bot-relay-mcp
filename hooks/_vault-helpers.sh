@@ -440,3 +440,48 @@ relay_pid_chain() {
   esac
   printf '[%s]' "$chain"
 }
+
+# v2.23.0 — relay_binding_live_elsewhere <stored_chain_json> <my_chain_json>:
+# return 0 (true) when the STORED host_shell_pids chain still has a LIVE process
+# that is NOT part of THIS hook's own live process chain — i.e. a genuine
+# concurrent terminal is holding the binding. Return 1 (false) otherwise.
+#
+# This is the SessionStart LIVE-gate discriminator (check-relay.sh). A row can
+# pass the coarse LIVE gate (session set + last_seen < 120s + pids present) yet
+# be a genuine RELAUNCH: after a resummon / VS Code reload the prior terminal's
+# LEAF pids (its shell + the claude/codex process) are DEAD, and only the
+# persistent VS Code APP ancestors survive (Code Helper / Code — e.g. the
+# measured 26798 / 26779). But those shared ancestors are in THIS hook's chain
+# too, so they are NOT "elsewhere". Excluding my-own-tree pids and probing the
+# REMAINDER for liveness is the only test that separates:
+#   - relaunch (dead leaves + shared LIVE ancestors) → nothing is live-elsewhere
+#     → return 1 → re-register so host_shell_pids refreshes to THIS terminal
+#     (else Tether's PID-binding matches no open terminal → "no bound terminal"
+#     → the agent is unwakeable until a full restart). [the field bug]
+#   - concurrent 2nd terminal (a live foreign shell not in my tree) → that pid is
+#     alive AND not mine → return 0 → SKIP (don't clobber it).
+# A whole-chain intersection would wrongly count the shared ancestors as "still
+# live here" and skip the relaunch — the exact miss this replaces.
+#
+# Liveness via `ps -p` (existence, ownership-independent). Parses bare integers
+# (tolerant of "[1,2,3]", "1 2 3", junk); exact-token compare so pid 12 is never
+# treated as 123. Empty / no-integer stored → return 1 (nothing to protect →
+# re-register, the safe direction).
+relay_binding_live_elsewhere() {
+  local stored mine sp x mine_hit
+  stored=$(printf '%s' "${1:-}" | tr -cs '0-9' ' ')
+  mine=$(printf '%s' "${2:-}" | tr -cs '0-9' ' ')
+  case "$stored" in *[0-9]*) ;; *) return 1 ;; esac
+  for sp in $stored; do
+    mine_hit=0
+    for x in $mine; do
+      [ "$sp" = "$x" ] && { mine_hit=1; break; }
+    done
+    [ "$mine_hit" -eq 1 ] && continue
+    # sp is NOT in my chain — is it a live process (a foreign live terminal)?
+    if ps -p "$sp" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
