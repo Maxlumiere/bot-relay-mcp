@@ -229,8 +229,36 @@ export const SendMessageSchema = z.object({
   content: payloadField("content").optional().describe("Message content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES). Alias: `message`."),
   message: payloadField("message").optional().describe("Alias for `content` (parity with the REST /api/send-message endpoint + the agent-team SendMessage tool)."),
   priority: z.enum(["normal", "high"]).default("normal").describe("Message priority"),
+  // ADR-0011 — message disposition. 'log' (default) is FYI and NEVER goes
+  // overdue; 'ask' expects a reply/resolve (overdue past the tunable bound);
+  // 'obligation' is an action the recipient owes (overdue past `deadline`, or
+  // the bound if none). Unset ⇒ 'log', so every existing caller and the whole
+  // historical backlog stay LOG — an upgrade never manufactures overdue mail.
+  disposition: z.enum(["log", "ask", "obligation"]).default("log").describe(
+    "ADR-0011 disposition: 'log' (default, FYI, never overdue) | 'ask' (expects a reply/resolve) | 'obligation' (an action owed; pair with optional `deadline`). Overdue is report-only — query it via get_outstanding."
+  ),
+  // Free-form ISO string (created_at/deadline are TEXT here); get_outstanding
+  // parses it robustly and fail-safes to NOT-overdue on an unparseable value
+  // (err-long, per the architect). Only consulted for an 'obligation'.
+  deadline: z.string().min(1).optional().describe(
+    "ADR-0011: optional ISO8601 deadline for an 'obligation'. Overdue is reported strictly past this instant; omit to use the tunable default bound (RELAY_OVERDUE_SECONDS). Ignored for log/ask."
+  ),
   agent_token: AgentTokenField,
 });
+
+/**
+ * ADR-0011 — the SENDER's outstanding-ask recap. Pull source of truth for
+ * overdue drift: a fresh orchestrator session reconstructs what it is owed by
+ * calling this, with zero reliance on a webhook it may not have heard.
+ */
+export const GetOutstandingSchema = z.object({
+  agent_name: z.string().min(1).describe("Your agent name — the SENDER whose outstanding asks/obligations to recap"),
+  include_resolved: z.boolean().optional().default(false).describe(
+    "false (default) = only still-outstanding (unresolved) ask/obligation messages YOU sent — the recap. true = the full sender view incl. resolved rows (unread/read-unresolved/resolved)."
+  ),
+  agent_token: AgentTokenField,
+});
+export type GetOutstandingInput = z.infer<typeof GetOutstandingSchema>;
 
 /**
  * v2.1.6: optional `since` filter. Same grammar as `/standup`'s since arg —
@@ -1057,6 +1085,28 @@ export interface MessageRecord {
    * re-floods a fresh session.
    */
   resolved_at?: string | null;
+  /**
+   * ADR-0011 (v2.23.0) — message disposition: 'log' (default) | 'ask' |
+   * 'obligation'. LOG never goes overdue; only an explicit ask/obligation is
+   * ever reported outstanding/overdue. Every pre-v24 row is backfilled to 'log'
+   * by the migration DEFAULT, so an upgrade never manufactures overdue mail.
+   */
+  disposition?: string;
+  /**
+   * ADR-0011 — optional ISO deadline for an OBLIGATION. NULL for log/ask (an
+   * ask past the config bound is overdue; an obligation is overdue past its
+   * deadline, or past the config bound if it declared none).
+   */
+  deadline?: string | null;
+  /**
+   * ADR-0011 — the SENDER's sticky, AGENT-LEVEL read receipt: ISO timestamp set
+   * WRITE-ONCE the first time ANY recipient session drains the message through
+   * get_messages, and NEVER cleared (monotonic). ORTHOGONAL to `read_by_session`
+   * above (per-session, re-pends for a fresh session). NULL = not yet read via
+   * the normal MCP path — note a direct-DB/CLI read does NOT stamp it (the
+   * receipt means "read via the MCP path," not "seen by any means").
+   */
+  read_at?: string | null;
 }
 
 export interface TaskRecord {

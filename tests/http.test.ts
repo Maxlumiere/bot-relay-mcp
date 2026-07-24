@@ -100,7 +100,7 @@ describe("HTTP transport", () => {
 
   it("tools/list returns all 36 tools (35 + abandon_registration [ADR-0005])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(36);
+    expect(result.result.tools.length).toBe(37);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
     expect(names).toContain("abandon_registration");
