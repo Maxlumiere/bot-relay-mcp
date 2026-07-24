@@ -43,6 +43,7 @@ function run(args: string[]): { stdout: string; stderr: string; status: number }
  *  still leaked 690–1109 bytes of "Usage:" to stdout (2026-07-24 fix). */
 const AFFECTED = [
   "send",
+  "resolve",
   "watch",
   "list-instances",
   "use-instance",
@@ -123,6 +124,7 @@ describe("a MISSING required argument writes nothing to stdout (the leak the bad
   // stdout. `$(relay recover)` captured 690 bytes of help as if it were a value.
   const cases: Array<[string, string[]]> = [
     ["send", ["send"]], // missing <to>/<content>
+    ["resolve", ["resolve"]], // missing <message-id>
     ["recover", ["recover"]], // missing <agent-name>
     ["purge-history", ["purge-history"]], // missing <agent-name>
     ["pair", ["pair"]], // missing <hub-url>

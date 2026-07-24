@@ -53,6 +53,7 @@ const SUBCOMMANDS = {
   "generate-hooks": "../dist/cli/generate-hooks.js",
   "cli-profiles": "../dist/cli/cli-profiles.js",
   send: "../dist/cli/send.js",
+  resolve: "../dist/cli/resolve.js",
   watch: "../dist/cli/watch.js",
   backup: "../dist/cli/backup.js",
   restore: "../dist/cli/restore.js",
@@ -94,6 +95,7 @@ function printHelp(requested) {
       "  generate-hooks   Emit agent hook config (Claude JSON default; --codex Codex TOML; --all both).\n" +
       "  cli-profiles     Print the agent-CLI profile registry (--json for machine-readable).\n" +
       "  send TO CONTENT  Send a relay message in one line (resolves the sender's token).\n" +
+      "  resolve ID...    Resolve (ack) your own inbox messages — the CLI path for MCP-mute sessions.\n" +
       "  watch AGENT      Sentinel: autowake — print a wake line when AGENT gets new mail.\n" +
       "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
       "  restore PATH     Restore from a tar.gz archive.\n" +

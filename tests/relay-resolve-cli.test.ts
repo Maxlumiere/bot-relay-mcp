@@ -1,0 +1,207 @@
+// bot-relay-mcp
+// Copyright (c) 2026 Lumiere Ventures
+// SPDX-License-Identifier: MIT
+// See LICENSE for full terms.
+
+/**
+ * `relay resolve` — the CLI path for MCP-mute sessions to ack their own inbox.
+ *
+ * Contract (matches `relay send`'s stream discipline):
+ *   - STDOUT carries ONLY the resolved message ids (one per line) — a clean,
+ *     parseable capture; the ✓ confirmation goes to STDERR.
+ *   - A resolve that changed NOTHING (unknown / foreign / already-resolved ids)
+ *     exits NON-ZERO with an empty stdout, so `$(relay resolve …)` fails loudly.
+ *   - --json emits the full envelope on stdout.
+ *
+ * The in-process cases mock the daemon fetch (deterministic + assert the request
+ * targets resolve_messages). One end-to-end case drives the REAL daemon +
+ * resolve_messages so the wiring is observed, not asserted.
+ */
+import { describe, it, expect, vi } from "vitest";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import type { Server as HttpServer } from "http";
+
+const SHAPE_VALID_TOKEN = "AbCd1234efGH5678ijKL9012mnOP3456"; // matches TOKEN_SHAPE_RE → env path, no DB
+
+/** SSE-wrap a resolve_messages envelope the way the daemon's /mcp does. */
+function mcpEnvelope(inner: Record<string, unknown>): Response {
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: { content: [{ type: "text", text: JSON.stringify(inner) }] },
+  });
+  return new Response(`event: message\ndata: ${body}\n\n`, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
+describe("`relay resolve` — clean ids on stdout, confirmation on stderr", () => {
+  async function runResolve(argv: string[], fetchImpl: typeof fetch) {
+    const { run } = await import("../src/cli/resolve.js");
+    const saved = process.env.RELAY_AGENT_TOKEN;
+    process.env.RELAY_AGENT_TOKEN = SHAPE_VALID_TOKEN;
+    const out: string[] = [];
+    const err: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
+      out.push(String(c));
+      return true;
+    }) as typeof process.stdout.write);
+    const errSpy = vi.spyOn(process.stderr, "write").mockImplementation(((c: unknown) => {
+      err.push(String(c));
+      return true;
+    }) as typeof process.stderr.write);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
+    try {
+      const code = await run(argv);
+      return { code, out: out.join(""), err: err.join(""), fetchSpy };
+    } finally {
+      fetchSpy.mockRestore();
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+      if (saved === undefined) delete process.env.RELAY_AGENT_TOKEN;
+      else process.env.RELAY_AGENT_TOKEN = saved;
+    }
+  }
+
+  it("(1) success → ONLY the resolved ids on stdout; the ✓ line on stderr; targets resolve_messages", async () => {
+    let seenBody = "";
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      seenBody = String(init.body);
+      return mcpEnvelope({ success: true, agent: "muted", resolved_ids: ["m-1", "m-2"], resolved_count: 2, requested_count: 2 });
+    }) as unknown as typeof fetch;
+    const r = await runResolve(["m-1", "m-2", "--agent", "muted"], fetchImpl);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("m-1\nm-2");
+    expect(r.out).not.toMatch(/resolved|✓/); // stdout is ids only
+    expect(r.err).toMatch(/✓ resolved 2 of 2 message\(s\) for "muted"/);
+    // The CLI calls the SAME path resolve_messages uses.
+    expect(seenBody).toMatch(/"name":"resolve_messages"/);
+    expect(seenBody).toMatch(/"agent_name":"muted"/);
+    expect(seenBody).toMatch(/"message_ids":\["m-1","m-2"\]/);
+  });
+
+  it("(2) NOTHING resolved (unknown/foreign/already-resolved) → EMPTY stdout + NON-ZERO exit", async () => {
+    const fetchImpl = (async () =>
+      mcpEnvelope({ success: true, agent: "muted", resolved_ids: [], resolved_count: 0, requested_count: 1 })) as unknown as typeof fetch;
+    const r = await runResolve(["nonexistent-id", "--agent", "muted"], fetchImpl);
+    expect(r.code).not.toBe(0);
+    expect(r.out, `stdout leaked ${r.out.length} bytes`).toBe("");
+    expect(r.err).toMatch(/no messages resolved/);
+  });
+
+  it("(3) --json → the full envelope on stdout", async () => {
+    const fetchImpl = (async () =>
+      mcpEnvelope({ success: true, agent: "muted", resolved_ids: ["m-1"], resolved_count: 1, requested_count: 1 })) as unknown as typeof fetch;
+    const r = await runResolve(["m-1", "--agent", "muted", "--json"], fetchImpl);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.out).resolved_ids).toEqual(["m-1"]);
+  });
+
+  it("(4) daemon error envelope (success:false) → stderr + non-zero, empty stdout", async () => {
+    const fetchImpl = (async () =>
+      mcpEnvelope({ success: false, error: "AUTH_FAILED" })) as unknown as typeof fetch;
+    const r = await runResolve(["m-1", "--agent", "muted"], fetchImpl);
+    expect(r.code).not.toBe(0);
+    expect(r.out).toBe("");
+    expect(r.err).toMatch(/AUTH_FAILED/);
+  });
+
+  it("(5) unreachable daemon → stderr + non-zero, empty stdout", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+    const r = await runResolve(["m-1", "--agent", "muted"], fetchImpl);
+    expect(r.code).not.toBe(0);
+    expect(r.out).toBe("");
+    expect(r.err).toMatch(/could not reach the daemon/);
+  });
+});
+
+describe("`relay resolve` — end-to-end against a real daemon + resolve_messages", () => {
+  it("(E1) resolves a real message so it stops re-surfacing as pending; stdout = the id", async () => {
+    process.env.RELAY_DB_PATH = path.join(
+      os.tmpdir(),
+      `relay-resolve-e2e-${process.pid}-${Date.now()}`,
+      "relay.db",
+    );
+    const dbDir = path.dirname(process.env.RELAY_DB_PATH);
+    fs.mkdirSync(dbDir, { recursive: true });
+    const cfgPath = path.join(dbDir, "config.json");
+    delete process.env.RELAY_AGENT_TOKEN;
+    delete process.env.RELAY_HTTP_SECRET;
+
+    const { startHttpServer } = await import("../src/transport/http.js");
+    const { closeDb } = await import("../src/db.js");
+    let server: HttpServer | undefined;
+    try {
+      server = startHttpServer(0, "127.0.0.1");
+      await new Promise((r) => setTimeout(r, 80));
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      const baseUrl = `http://127.0.0.1:${port}`;
+      // resolve.ts loads config for host/port — point it at this daemon.
+      fs.writeFileSync(cfgPath, JSON.stringify({ http_host: "127.0.0.1", http_port: port }));
+
+      const rpc = async (tool: string, args: Record<string, unknown>, token?: string) => {
+        const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
+        if (token) headers["X-Agent-Token"] = token;
+        const res = await fetch(`${baseUrl}/mcp`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
+        });
+        const text = await res.text();
+        const dataLine = text.split("\n").map((l) => l.trim()).find((l) => l.startsWith("data:"));
+        return JSON.parse(JSON.parse(dataLine ? dataLine.slice(5).trim() : text).result.content[0].text);
+      };
+
+      const recip = await rpc("register_agent", { name: "muted-agent", role: "r", capabilities: [] });
+      const token = recip.agent_token as string;
+      const sender = await rpc("register_agent", { name: "sender", role: "r", capabilities: [] });
+      const sent = await rpc("send_message", { from: "sender", to: "muted-agent", content: "handle me" }, sender.agent_token);
+      const msgId = sent.message_id as string;
+      expect(msgId).toBeTruthy();
+
+      // Drive the SHIPPED resolve.run() IN-PROCESS with the REAL daemon fetch —
+      // NOT spawnSync, which would block this event loop and deadlock the
+      // in-process HTTP server. An env token keeps run() off the DB entirely, so
+      // the only side effect is the real /mcp resolve_messages call.
+      const { run } = await import("../src/cli/resolve.js");
+      const out: string[] = [];
+      const err: string[] = [];
+      const outSpy = vi.spyOn(process.stdout, "write").mockImplementation(((c: unknown) => { out.push(String(c)); return true; }) as typeof process.stdout.write);
+      const errSpy = vi.spyOn(process.stderr, "write").mockImplementation(((c: unknown) => { err.push(String(c)); return true; }) as typeof process.stderr.write);
+      const savedName = process.env.RELAY_AGENT_NAME;
+      const savedTok = process.env.RELAY_AGENT_TOKEN;
+      const savedCfg = process.env.RELAY_CONFIG_PATH;
+      process.env.RELAY_AGENT_NAME = "muted-agent";
+      process.env.RELAY_AGENT_TOKEN = token;
+      process.env.RELAY_CONFIG_PATH = cfgPath;
+      let code: number;
+      try {
+        code = await run([msgId]);
+      } finally {
+        outSpy.mockRestore();
+        errSpy.mockRestore();
+        if (savedName === undefined) delete process.env.RELAY_AGENT_NAME; else process.env.RELAY_AGENT_NAME = savedName;
+        if (savedTok === undefined) delete process.env.RELAY_AGENT_TOKEN; else process.env.RELAY_AGENT_TOKEN = savedTok;
+        if (savedCfg === undefined) delete process.env.RELAY_CONFIG_PATH; else process.env.RELAY_CONFIG_PATH = savedCfg;
+      }
+      expect(code, `stderr: ${err.join("")}`).toBe(0);
+      expect(out.join("").trim()).toBe(msgId); // clean id on stdout
+      expect(err.join("")).toMatch(/✓ resolved 1 of 1/);
+
+      // The resolved message no longer re-surfaces as pending (peek, don't drain).
+      const after = await rpc("get_messages", { agent_name: "muted-agent", status: "pending", since: "all", peek: true }, token);
+      const stillPending = (after.messages || []).some((m: { id: string }) => m.id === msgId);
+      expect(stillPending, "resolved message must not re-surface as pending").toBe(false);
+    } finally {
+      try { server?.close(); } catch { /* */ }
+      try { closeDb(); } catch { /* */ }
+      try { fs.rmSync(dbDir, { recursive: true, force: true }); } catch { /* */ }
+    }
+  }, 25_000);
+});
