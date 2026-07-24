@@ -46,6 +46,7 @@ import {
   reconcileRelayConfig,
   upsertMcpServer,
   upsertSessionStartHook,
+  assertNotRealUserConfigWrite,
 } from "./config-merge.js";
 import { installDaemon, type InstallDeps } from "./launchd.js";
 
@@ -235,16 +236,28 @@ export function installMcpServer(distEntry: string, jsonPath: string = claudeJso
   return { changed };
 }
 
+/** Hook commands are executed through a shell: a bare path containing a space
+ *  (`.../Claude AI/...` — the very layout that produced the %20 fossil)
+ *  word-splits and the hook dies at every SessionStart. Quote when needed;
+ *  normalizeHookCommand strips the quotes for identity, so dedupe/repair see
+ *  the same script either way. */
+function shellQuoteIfNeeded(p: string): string {
+  return /\s/.test(p) ? `'${p.replace(/'/g, `'\\''`)}'` : p;
+}
+
 /** v2.16.0 — deep-merge the SessionStart hook into ~/.claude/settings.json. */
-export function installHook(hookScript: string, settingsPath: string = claudeSettingsPath()): { changed: boolean } {
+export function installHook(
+  hookScript: string,
+  settingsPath: string = claudeSettingsPath(),
+): { changed: boolean; repaired: string[]; pruned: string[] } {
   const existing = readJsonSafe(settingsPath);
-  const { root, changed } = upsertSessionStartHook(existing, {
+  const { root, changed, repaired, pruned } = upsertSessionStartHook(existing, {
     matcher: "startup|resume",
-    command: hookScript,
+    command: shellQuoteIfNeeded(hookScript),
     timeout: 10,
   });
   if (changed) atomicWriteJson(settingsPath, root, 0o600);
-  return { changed };
+  return { changed, repaired, pruned };
 }
 
 /** Real launchd deps — the only place init shells out to launchctl / fetch. */
@@ -369,6 +382,11 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   // ---- 1. config.json (reconcile) ------------------------------------------
+  // Guard the DIR op too: defaultBotRelayDir() resolves via RELAY_HOME (not
+  // RELAY_CLAUDE_HOME / RELAY_CONFIG_PATH), so a test sandboxed with only
+  // those two still mkdir/chmods the REAL ~/.bot-relay here — the one init
+  // side effect the file-write chokepoint could not see (#125 residual).
+  assertNotRealUserConfigWrite(path.join(defaultBotRelayDir(), "config.json"));
   ensureSecureDir(defaultBotRelayDir(), 0o700);
   if (effectiveInstanceId && perInstanceDir) {
     ensureSecureDir(path.join(defaultBotRelayDir(), "instances"), 0o700);
@@ -433,6 +451,14 @@ export async function run(argv: string[]): Promise<number> {
     process.stdout.write(
       `✓ ~/.claude/settings.json: SessionStart hook ${r.changed ? "merged" : "already present (no change)"}\n`,
     );
+    // Loudly account for every fossil we touched — a silent prune of an entry
+    // the operator can see in their settings.json reads as data loss.
+    for (const cmd of r.repaired) {
+      process.stdout.write(`  ↻ repaired stale relay hook spelling: ${cmd}\n`);
+    }
+    for (const cmd of r.pruned) {
+      process.stdout.write(`  ✂ pruned stale relay hook entry: ${cmd}\n`);
+    }
   }
 
   // ---- 4. macOS launchd daemon (collision-safe) ----------------------------

@@ -256,11 +256,59 @@ export interface SessionStartHookSpec {
 }
 
 /**
- * Upsert a SessionStart hook, deduped by SEMANTIC identity = the command path.
- * Preserves every other hook event AND every other SessionStart matcher-group
- * (unrelated hooks the operator already has). If a SessionStart entry already
- * invokes `command`, it is a no-op (no duplicate) — even if the matcher/timeout
- * were hand-tweaked, we do NOT clobber the operator's version.
+ * Normalize a hook command string to its SEMANTIC path identity: strip one
+ * layer of surrounding shell quotes, percent-decode (the pre-#125 installer
+ * wrote URL-encoded paths — the "%20 fossil"), then canonicalize (symlink- and
+ * non-existent-tolerant). Two raw strings that normalize equal invoke the same
+ * script; an exact-string dedupe cannot see that, which is how a broken
+ * `Claude%20AI` twin survived next to its working sibling indefinitely.
+ */
+export function normalizeHookCommand(raw: string): string {
+  let s = raw.trim();
+  if (s.length >= 2 && (s[0] === "'" || s[0] === '"') && s.endsWith(s[0])) {
+    s = s.slice(1, -1);
+  }
+  if (/%[0-9A-Fa-f]{2}/.test(s)) {
+    try {
+      s = decodeURIComponent(s);
+    } catch {
+      /* not valid percent-encoding — keep as-is */
+    }
+  }
+  return canonicalize(s);
+}
+
+/**
+ * A hook entry is RELAY-OWNED iff its command resolves to our hook script by
+ * basename. Operator hooks never match; the extreme edge (an operator wrapping
+ * check-relay.sh in a custom command) is recoverable via the `.bak`
+ * atomicWriteJson leaves, and every repair/prune is reported by `relay init`.
+ */
+export function isRelayHookCommand(raw: string): boolean {
+  return path.basename(normalizeHookCommand(raw)) === "check-relay.sh";
+}
+
+export interface HookMergeResult extends MergeResult {
+  /** Raw commands rewritten to the canonical spec (quoted / %20 variants). */
+  repaired: string[];
+  /** Raw commands removed (dead paths, superseded duplicate installs). */
+  pruned: string[];
+}
+
+/**
+ * Upsert a SessionStart hook, deduped by SEMANTIC identity = the normalized
+ * command path, with fossil repair. Preserves every other hook event, every
+ * non-relay SessionStart entry, and an exact-match relay entry verbatim (a
+ * hand-tweaked matcher/timeout is the operator's, we do NOT clobber it).
+ *
+ * Relay-owned entries are a SINGLETON by design: one account, one relay, one
+ * SessionStart hook. Variant spellings of the same script (quoted twin, %20
+ * fossil) are repaired in place to `spec.command`; any further relay entry —
+ * a dead percent-encoded path, a deleted /tmp audit checkout, a superseded
+ * install location — is pruned. Before this, the dedupe was raw `===` and
+ * append-only: every checkout that ran init stacked one more entry, and a
+ * broken twin could never be recognized or removed (six entries deep on the
+ * machine that motivated this, 2026-07-24).
  *
  * Claude Code settings hook shape:
  *   { hooks: { SessionStart: [ { matcher, hooks: [ { type:"command", command, timeout } ] } ] } }
@@ -268,7 +316,7 @@ export interface SessionStartHookSpec {
 export function upsertSessionStartHook(
   root: Record<string, unknown> | null,
   spec: SessionStartHookSpec,
-): MergeResult {
+): HookMergeResult {
   const out: Record<string, unknown> = { ...(root ?? {}) };
   const hooks: Record<string, unknown> = {
     ...((out.hooks as Record<string, unknown> | undefined) ?? {}),
@@ -277,30 +325,64 @@ export function upsertSessionStartHook(
     ? [...(hooks.SessionStart as unknown[])]
     : [];
 
-  // Dedup by command path across ALL existing SessionStart groups.
-  const alreadyPresent = sessionStart.some((group) => {
-    const inner = (group as { hooks?: unknown[] })?.hooks;
-    return (
-      Array.isArray(inner) &&
-      inner.some((h) => (h as { command?: string })?.command === spec.command)
-    );
-  });
-  if (alreadyPresent) {
-    // Preserve the operator's existing entry verbatim — no clobber, no dup.
-    out.hooks = { ...hooks, SessionStart: sessionStart };
-    return { root: out, changed: false };
+  const targetNorm = normalizeHookCommand(spec.command);
+  const repaired: string[] = [];
+  const pruned: string[] = [];
+  let keptOurs = false;
+  let changed = false;
+
+  const rebuilt: unknown[] = [];
+  for (const group of sessionStart) {
+    const g = group as { matcher?: string; hooks?: unknown[] };
+    const gHooks = g?.hooks;
+    if (!Array.isArray(gHooks)) {
+      rebuilt.push(group); // malformed/foreign group — preserve verbatim
+      continue;
+    }
+    const inner: unknown[] = [];
+    let touched = false;
+    for (const h of gHooks) {
+      const cmd = (h as { command?: string })?.command;
+      if (typeof cmd !== "string" || !isRelayHookCommand(cmd)) {
+        inner.push(h); // operator's hook — never touched
+        continue;
+      }
+      if (!keptOurs && cmd === spec.command) {
+        inner.push(h); // exact — preserve verbatim, tweaks included
+        keptOurs = true;
+        continue;
+      }
+      if (!keptOurs && normalizeHookCommand(cmd) === targetNorm) {
+        inner.push({ ...(h as object), command: spec.command });
+        repaired.push(cmd);
+        keptOurs = true;
+        changed = true;
+        touched = true;
+        continue;
+      }
+      pruned.push(cmd);
+      changed = true;
+      touched = true;
+    }
+    if (inner.length === 0 && gHooks.length > 0) {
+      continue; // we emptied this group by pruning — drop it
+    }
+    rebuilt.push(touched ? { ...g, hooks: inner } : group);
   }
 
-  sessionStart.push({
-    matcher: spec.matcher,
-    hooks: [
-      {
-        type: "command",
-        command: spec.command,
-        ...(spec.timeout !== undefined ? { timeout: spec.timeout } : {}),
-      },
-    ],
-  });
-  out.hooks = { ...hooks, SessionStart: sessionStart };
-  return { root: out, changed: true };
+  if (!keptOurs) {
+    rebuilt.push({
+      matcher: spec.matcher,
+      hooks: [
+        {
+          type: "command",
+          command: spec.command,
+          ...(spec.timeout !== undefined ? { timeout: spec.timeout } : {}),
+        },
+      ],
+    });
+    changed = true;
+  }
+  out.hooks = { ...hooks, SessionStart: rebuilt };
+  return { root: out, changed, repaired, pruned };
 }

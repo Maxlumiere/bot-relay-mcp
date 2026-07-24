@@ -42,10 +42,15 @@ beforeEach(() => {
   // impossible to reintroduce (a test reaching a real user-config write now
   // throws instead of certifying).
   process.env.RELAY_CLAUDE_HOME = TEST_TMP;
+  // #125 residual: init's `ensureSecureDir(defaultBotRelayDir())` resolves via
+  // RELAY_HOME || os.homedir() — RELAY_CONFIG_PATH and RELAY_CLAUDE_HOME do
+  // not cover it, so without this the suite mkdir/chmods the REAL ~/.bot-relay.
+  process.env.RELAY_HOME = path.join(TEST_TMP, ".bot-relay");
 });
 afterEach(() => {
   delete process.env.RELAY_CONFIG_PATH;
   delete process.env.RELAY_CLAUDE_HOME;
+  delete process.env.RELAY_HOME;
   if (fs.existsSync(TEST_TMP)) fs.rmSync(TEST_TMP, { recursive: true, force: true });
 });
 
