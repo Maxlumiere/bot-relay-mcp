@@ -259,8 +259,16 @@ export async function run(argv: string[]): Promise<number> {
   if (args.json) {
     process.stdout.write((parsed ? JSON.stringify(parsed) : text.trim()) + "\n");
   } else {
-    const id = parsed?.message_id ? ` (id ${parsed.message_id})` : "";
-    process.stdout.write(`✓ sent ${args.priority} message from "${from}" to "${args.to}"${id}\n`);
+    // STDOUT carries ONLY the real result — the message id — so
+    // `$(relay send TO MSG)` captures a clean, parseable value (or nothing, on a
+    // failure that already exited non-zero above). The human-friendly
+    // confirmation is DIAGNOSTIC → STDERR, where it stays visible interactively
+    // but never pollutes a capture.
+    const id = parsed?.message_id ?? null;
+    process.stderr.write(
+      `✓ sent ${args.priority} message from "${from}" to "${args.to}"${id ? ` (id ${id})` : ""}\n`
+    );
+    if (id) process.stdout.write(`${id}\n`);
   }
   return 0;
 }
