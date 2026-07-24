@@ -297,6 +297,7 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_21(_db);
   migrateSchemaToV2_22(_db);
   migrateSchemaToV2_23(_db);
+  migrateSchemaToV2_24(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -343,6 +344,7 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_21(_db);
   migrateSchemaToV2_22(_db);
   migrateSchemaToV2_23(_db);
+  migrateSchemaToV2_24(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -564,7 +566,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 23;
+export const CURRENT_SCHEMA_VERSION = 24;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -661,6 +663,7 @@ export function applyMigration(from: number, to: number): void {
     [20, 21],
     [21, 22],
     [22, 23],
+    [23, 24],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1740,6 +1743,42 @@ function migrateSchemaToV2_23(db: CompatDatabase): void {
   if (!agentCols.some((c) => c.name === "registration_recovery_expires_at")) {
     db.exec("ALTER TABLE agents ADD COLUMN registration_recovery_expires_at TEXT");
   }
+}
+
+/**
+ * ADR-0011 (v2.23.0, schema v24) — message disposition + read-receipts (L2 of
+ * ADR-0007). Additive + idempotent. Adds to `messages`:
+ *   - `disposition TEXT NOT NULL DEFAULT 'log'` — LOG | ASK | OBLIGATION. The
+ *     NOT NULL DEFAULT is the MIGRATION-SAFETY KEYSTONE: every pre-existing row
+ *     backfills to 'log', and only LOG never goes overdue — so an upgrade can
+ *     NEVER turn the historical backlog into a wall of overdue obligations.
+ *     Only an EXPLICIT ask/obligation is ever overdue.
+ *   - `deadline TEXT NULL` — optional ISO deadline for an OBLIGATION. NULL for
+ *     log/ask (ask uses the config bound).
+ *   - `read_at TEXT NULL` — the SENDER's STICKY, AGENT-LEVEL read receipt: set
+ *     ONCE (COALESCE, write-once) the first time ANY recipient session drains
+ *     the message, and NEVER cleared — monotonic. Orthogonal to the per-session
+ *     `read_by_session` plane (which re-pends the message for a fresh session);
+ *     a message can be read_at-stamped (sender sees "read") AND pending for a
+ *     new session at once. The per-session re-pend path must never touch read_at.
+ * All existing rows: disposition='log' (backfilled by the DEFAULT), deadline &
+ * read_at NULL = zero data migration, nothing overdue, nothing pre-read.
+ */
+function migrateSchemaToV2_24(db: CompatDatabase): void {
+  const msgCols = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+  if (!msgCols.some((c) => c.name === "disposition")) {
+    // Constant DEFAULT backfills every existing row to 'log' atomically.
+    db.exec("ALTER TABLE messages ADD COLUMN disposition TEXT NOT NULL DEFAULT 'log'");
+  }
+  if (!msgCols.some((c) => c.name === "deadline")) {
+    db.exec("ALTER TABLE messages ADD COLUMN deadline TEXT");
+  }
+  if (!msgCols.some((c) => c.name === "read_at")) {
+    db.exec("ALTER TABLE messages ADD COLUMN read_at TEXT");
+  }
+  // Sender-recap query (get_outstanding) filters WHERE from_agent = ? AND
+  // disposition IN ('ask','obligation') AND resolved_at IS NULL.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_messages_from_disposition ON messages(from_agent, disposition)");
 }
 
 /**
@@ -4196,13 +4235,122 @@ export function getInboxSummary(): Array<{
   }));
 }
 
+/** Content preview cap for the get_outstanding recap (mirrors the summary cap). */
+const OUTSTANDING_PREVIEW_MAX = 100;
+
+/** ADR-0011 — one row of the sender's outstanding-ask recap. */
+export interface OutstandingMessage {
+  id: string;
+  to_agent: string;
+  disposition: string;
+  created_at: string;
+  deadline: string | null;
+  read_at: string | null;
+  resolved_at: string | null;
+  /** Sender-visible lifecycle state, derived at query time. */
+  state: "unread" | "read-unresolved" | "resolved";
+  /** REPORT-ONLY: past its bound and still unresolved. NEVER stored/mutated. */
+  overdue: boolean;
+  content_preview: string;
+  content_truncated: boolean;
+}
+
+/**
+ * ADR-0011 — the SENDER's outstanding-ask recap, and the PULL source of truth
+ * for overdue drift. Returns the ask/obligation messages the caller SENT, each
+ * with its sender-visible lifecycle state (unread / read-unresolved / resolved)
+ * and a REPORT-ONLY `overdue` flag computed AT QUERY TIME. It NEVER mutates a
+ * message — report-first, never auto-resolve/auto-delete (ADR-0005). A fresh
+ * orchestrator session reconstructs overdue state purely by calling this; the
+ * optional read/resolved webhooks are push-on-top, never the source of truth.
+ *
+ * LOG messages are excluded entirely — LOG can never be overdue, so the
+ * historical backlog can never wall this recap. `overdueBoundSeconds` (the
+ * tunable RELAY_OVERDUE_SECONDS, resolved by the caller so this stays pure +
+ * testable) applies to an ASK, and to an OBLIGATION that declared no explicit
+ * deadline; an obligation WITH a deadline is overdue strictly past that deadline.
+ * `includeResolved=false` (default) returns just the outstanding set (the recap);
+ * true returns the full C-view including resolved rows. `nowIso` is injectable
+ * for deterministic tests.
+ */
+export function getOutstanding(
+  senderName: string,
+  opts: { overdueBoundSeconds: number; includeResolved?: boolean; nowIso?: string },
+): OutstandingMessage[] {
+  const db = getDb();
+  const nowMs = Date.parse(opts.nowIso ?? now());
+  const boundMs = Math.max(0, opts.overdueBoundSeconds) * 1000;
+  const resolvedClause = opts.includeResolved ? "" : "AND resolved_at IS NULL";
+  const rows = db
+    .prepare(
+      `SELECT id, to_agent, content, disposition, created_at, deadline, read_at, resolved_at
+         FROM messages
+        WHERE from_agent = ?
+          AND disposition IN ('ask', 'obligation')
+          ${resolvedClause}
+        ORDER BY created_at ASC`,
+    )
+    .all(senderName) as Array<{
+      id: string;
+      to_agent: string;
+      content: string;
+      disposition: string;
+      created_at: string;
+      deadline: string | null;
+      read_at: string | null;
+      resolved_at: string | null;
+    }>;
+  return rows.map((r) => {
+    const state: OutstandingMessage["state"] = r.resolved_at
+      ? "resolved"
+      : r.read_at
+        ? "read-unresolved"
+        : "unread";
+    // Report-only overdue, computed here and never written back. A resolved
+    // message is never overdue. Obligation w/ explicit deadline → past it.
+    // Obligation w/o deadline, or an ask → past created_at + the config bound.
+    let overdue = false;
+    if (!r.resolved_at) {
+      if (r.disposition === "obligation" && r.deadline) {
+        const dl = Date.parse(r.deadline);
+        overdue = Number.isFinite(dl) && nowMs > dl;
+      } else {
+        const created = Date.parse(r.created_at);
+        overdue = Number.isFinite(created) && nowMs - created > boundMs;
+      }
+    }
+    const decrypted = decryptContent(r.content) ?? r.content;
+    const truncated = decrypted.length > OUTSTANDING_PREVIEW_MAX;
+    return {
+      id: r.id,
+      to_agent: r.to_agent,
+      disposition: r.disposition,
+      created_at: r.created_at,
+      deadline: r.deadline ?? null,
+      read_at: r.read_at ?? null,
+      resolved_at: r.resolved_at ?? null,
+      state,
+      overdue,
+      content_preview: truncated ? decrypted.slice(0, OUTSTANDING_PREVIEW_MAX) : decrypted,
+      content_truncated: truncated,
+    };
+  });
+}
+
 // --- Message operations ---
 
 export function sendMessage(
   from: string,
   to: string,
   content: string,
-  priority: string
+  priority: string,
+  // ADR-0011: message disposition. 'log' (default) never goes overdue; only an
+  // explicit 'ask'/'obligation' is ever reported outstanding/overdue. `deadline`
+  // is an optional ISO timestamp for an obligation (null otherwise; ask uses the
+  // config bound). Both default so every existing caller (broadcast, capability,
+  // legacy sends) stays LOG with no thread-through.
+  disposition: string = "log",
+  deadline: string | null = null
 ): MessageRecord {
   const db = getDb();
 
@@ -4237,8 +4385,8 @@ export function sendMessage(
     let outboxId = 0;
     const tx = db.transaction(() => {
       db.prepare(
-        "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
-      ).run(id, from, to, encContent, priority, timestamp);
+        "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at, disposition, deadline) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)"
+      ).run(id, from, to, encContent, priority, timestamp, disposition, deadline);
       const r = db.prepare(
         "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
       ).run(to, "message_received", timestamp, process.pid);
@@ -4255,7 +4403,7 @@ export function sendMessage(
     // DISPATCH_RELEVANT_ROLES. Best-effort: never throws into the
     // sendMessage path. See markRecipientDispatched for the rule.
     markRecipientDispatched(to, priority);
-    return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
+    return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp, disposition, deadline, read_at: null };
   }
 
   const senderExists = db
@@ -4276,8 +4424,8 @@ export function sendMessage(
   let outboxId = 0;
   const tx = db.transaction(() => {
     db.prepare(
-      "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
-    ).run(id, from, to, encContent, priority, timestamp);
+      "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at, disposition, deadline) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)"
+    ).run(id, from, to, encContent, priority, timestamp, disposition, deadline);
     const r = db.prepare(
       "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
     ).run(to, "message_received", timestamp, process.pid);
@@ -4306,7 +4454,7 @@ export function sendMessage(
   // alongside a `user-to-user` send.
   markRecipientDispatched(to, priority);
 
-  return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp };
+  return { id, from_agent: from, to_agent: to, content, priority, status: "pending", created_at: timestamp, disposition, deadline, read_at: null };
 }
 
 /**
@@ -4539,10 +4687,22 @@ export function getMessages(
     // racing drains; the tx is promoted to BEGIN IMMEDIATE below so two
     // ack drains serialize at tx start (same pattern as the seq tx) and
     // neither double-counts nor drops.
+    // ADR-0011: the SENDER's sticky read receipt. `read_at` is stamped here, on
+    // the pending→read DRAIN, via COALESCE(read_at, ?) — WRITE-ONCE/monotonic:
+    // the FIRST session to drain sets it; every later drain (any session) and
+    // every re-pend leaves it. It is AGENT-LEVEL, orthogonal to the per-session
+    // `read_by_session` above (which this same UPDATE overwrites so the message
+    // re-pends for a fresh session). HONEST BOUNDARY: read_at only stamps a read
+    // observed through THIS get_messages drain (the normal MCP path). A recipient
+    // reading its mail by any OTHER means — a direct DB/CLI read, e.g. victra-build's
+    // own MCP-muted session that drains via sqlite — does NOT stamp read_at. So the
+    // receipt means "read via the normal MCP path," NOT "seen by any means"; a
+    // sender must fall back to an explicit ack when the recipient is off that path.
+    const readStampedAt = now();
     const tx = db.transaction(() => {
       const r = db.prepare(
-        `UPDATE messages SET status = 'read', read_by_session = ? WHERE id IN (${placeholders})`
-      ).run(currentSession, ...ids);
+        `UPDATE messages SET status = 'read', read_by_session = ?, read_at = COALESCE(read_at, ?) WHERE id IN (${placeholders})`
+      ).run(currentSession, readStampedAt, ...ids);
       drainedRows = r.changes;
       if (doResolve) {
         db.prepare(

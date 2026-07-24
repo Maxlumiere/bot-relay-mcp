@@ -269,6 +269,11 @@ export function validateConfigAndEnv(config: RelayConfig): void {
     // v2.1 Phase 4c.2: audit-log retention + piggyback interval
     RELAY_AUDIT_LOG_RETENTION_DAYS: { min: 0, max: 3650 },
     RELAY_AUDIT_LOG_PURGE_INTERVAL: { min: 1, max: 1_000_000 },
+    // ADR-0011 (v2.23.0): overdue bound (seconds) for an ask / deadline-less
+    // obligation. Read at get_outstanding call time (tools/messaging.ts);
+    // validated here so a garbage value fails at startup, not on first query.
+    // Default is 24h (conservative / err-long); this only enforces the floor.
+    RELAY_OVERDUE_SECONDS: { min: 1 },
   };
   for (const [name, bounds] of Object.entries(integerEnvVars)) {
     const raw = process.env[name];

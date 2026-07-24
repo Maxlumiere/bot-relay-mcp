@@ -168,7 +168,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(21, 22)).not.toThrow();
     // ADR-0005 orphan-cleanup registered 22→23 (migrateSchemaToV2_23 — renumbered from v2_22 on rebase over #121).
     expect(() => applyMigration(22, 23)).not.toThrow();
-    expect(() => applyMigration(23, 24)).toThrow(/no migration registered|23→24/);
+    // ADR-0011 message-disposition registered 23→24 (migrateSchemaToV2_24: messages.disposition + deadline + read_at).
+    expect(() => applyMigration(23, 24)).not.toThrow();
+    expect(() => applyMigration(24, 25)).toThrow(/no migration registered|24→25/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {
