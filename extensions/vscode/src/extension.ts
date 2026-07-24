@@ -756,21 +756,32 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
         const epoch = (injectionEpoch.get(agentName) ?? 0) + 1;
         injectionEpoch.set(agentName, epoch);
         outstandingWakeTerminals.set(agentName, t);
-        // Fire-and-forget the async adapter, but OBSERVE a rejection: an
-        // unhandled reject (Claude sendText / Codex delay+sendSequence throwing)
-        // would leave the gate's outstanding flag set until the 3h TTL — a
-        // delivery failure silently converted into muteness. On failure re-arm
-        // the gate as loss evidence, but ONLY if this injection is still the
-        // current one, so an idle-flushed newer wake is not rolled back.
-        void adapter.wake(buildWakeContext(t)).catch((err) => {
-          log(
-            `auto-inject wake rejected for "${agentName}": ${err instanceof Error ? err.message : String(err)}`,
-          );
-          if (injectionEpoch.get(agentName) === epoch) {
-            outstandingWakeTerminals.delete(agentName);
-            wakeGates.get(agentName)?.clearOutstanding();
-          }
-        });
+        // adapter.wake is async (Claude sendText / Codex delayed sendSequence).
+        // ACK LANDING on resolve so an idle observation only counts as flush
+        // evidence AFTER the keystroke actually submitted — otherwise a stale
+        // idle in the in-flight window flushes the gate and a second inject
+        // re-stacks (codex #126 round 2). Re-arm as LOSS evidence on reject: an
+        // unobserved reject would leave the gate outstanding until the 3h TTL,
+        // a delivery failure silently converted into muteness. Both outcomes
+        // are epoch-guarded so a stale ack/reject can't touch a newer injection
+        // into the same terminal (terminal identity alone can't distinguish two
+        // successive injects into it).
+        void adapter.wake(buildWakeContext(t)).then(
+          () => {
+            if (injectionEpoch.get(agentName) === epoch) {
+              wakeGates.get(agentName)?.markInjectionLanded();
+            }
+          },
+          (err) => {
+            log(
+              `auto-inject wake rejected for "${agentName}": ${err instanceof Error ? err.message : String(err)}`,
+            );
+            if (injectionEpoch.get(agentName) === epoch) {
+              outstandingWakeTerminals.delete(agentName);
+              wakeGates.get(agentName)?.clearOutstanding();
+            }
+          },
+        );
       },
       wakeWord: adapter.wakeWord,
       hint: hintNoWake,

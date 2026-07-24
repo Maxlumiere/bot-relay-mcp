@@ -78,6 +78,18 @@ export class WakeGate {
    * the very next tick). null whenever nothing is outstanding.
    */
   private markBeforeOutstanding: string | null = null;
+  /**
+   * Has the currently-outstanding injection actually LANDED — adapter.wake
+   * resolved, the keystroke was typed AND submitted? onWake only SCHEDULES the
+   * async inject; binding-fetch + terminal-resolve + adapter submission all run
+   * after it returns. Until the caller acks landing (markInjectionLanded), an
+   * IDLE snapshot is NOT proof our injection submitted — it may be a stale read
+   * from the in-flight window (before our keystroke) — so idle must NOT flush a
+   * not-yet-landed wake, or a second inject fires and re-stacks (codex #126
+   * round 2: two consecutive idle snapshots produced {first:true, second:true}
+   * while wake #1 was still in flight). false whenever nothing is outstanding.
+   */
+  private outstandingLanded = false;
 
   constructor(
     private readonly onWake: (agentName: string) => void,
@@ -94,13 +106,27 @@ export class WakeGate {
   }
 
   /**
-   * FLUSH EVIDENCE: the injection LANDED — the host submitted the queued input
-   * at the turn boundary and drained it. Clear the outstanding flag; the mark
-   * STAYS advanced because we genuinely woke for that mail (no re-wake of the
-   * same message).
+   * DELIVERY ACK: the async injection this gate fired actually LANDED —
+   * adapter.wake resolved, so the keystroke was typed and submitted. Only now
+   * is an idle observation valid FLUSH evidence for it; before this, idle is a
+   * stale read from the in-flight window and must not flush the wake (codex
+   * #126 round 2). The caller MUST epoch-guard this so a stale ack from a
+   * superseded injection can't mark a newer one landed. No-op if nothing is
+   * outstanding (a lost/flushed injection already cleared the flag).
+   */
+  markInjectionLanded(): void {
+    if (this.outstandingSince !== null) this.outstandingLanded = true;
+  }
+
+  /**
+   * FLUSH EVIDENCE: a LANDED injection was consumed — the host submitted the
+   * queued input at the turn boundary and drained it. Clear the outstanding
+   * flag; the mark STAYS advanced because we genuinely woke for that mail (no
+   * re-wake of the same message).
    */
   private markLanded(): void {
     this.outstandingSince = null;
+    this.outstandingLanded = false;
     this.markBeforeOutstanding = null;
   }
 
@@ -114,6 +140,7 @@ export class WakeGate {
   private markLost(): void {
     if (this.outstandingSince !== null) this.lastWokenAt = this.markBeforeOutstanding;
     this.outstandingSince = null;
+    this.outstandingLanded = false;
     this.markBeforeOutstanding = null;
   }
 
@@ -141,10 +168,16 @@ export class WakeGate {
     observed: WakeObservation = { state: "unknown", busyCoveredByHook: false },
   ): boolean {
     const now = this.opts.now ?? Date.now;
-    // IDLE-EVIDENCE: the host submits queued input at the turn boundary, so
-    // an agent observed idle cannot still hold our injection — it LANDED and
-    // was consumed. Decidable flush evidence: clear the flag, KEEP the mark.
-    if (observed.state === "idle") this.markLanded();
+    // IDLE-EVIDENCE — but ONLY for a LANDED injection. The host submits queued
+    // input at the turn boundary, so an idle agent cannot still hold an
+    // injection that ACTUALLY SUBMITTED. An in-flight (scheduled-but-not-yet-
+    // landed) inject is different: onWake only STARTS the async injection, so
+    // an idle snapshot then is a stale read from before our keystroke, and
+    // flushing it would let a second inject fire and re-stack (codex #126
+    // round 2). Wait for the delivery ack (markInjectionLanded); a later idle
+    // flushes it. A not-yet-landed wake stays suppressed via the outstanding
+    // flag until it lands or fails.
+    if (observed.state === "idle" && this.outstandingLanded) this.markLanded();
     // TTL backstop for losses nothing can observe. An injection outstanding
     // past the TTL never resolved either way; treat it as a (very late) LOSS
     // so mail still pending re-wakes — clearing the flag alone would leave the
@@ -176,6 +209,7 @@ export class WakeGate {
     if (decision.shouldWake) {
       this.markBeforeOutstanding = markBeforeThisWake;
       this.outstandingSince = now();
+      this.outstandingLanded = false; // scheduled, not yet landed — awaits the delivery ack
       this.onWake(agentName);
       return true;
     }

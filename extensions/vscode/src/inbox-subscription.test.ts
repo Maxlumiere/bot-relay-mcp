@@ -44,16 +44,19 @@ describe("WakeGate", () => {
     expect(onWake).toHaveBeenCalledWith("x");
   });
 
-  it("wakes again for newer mail only AFTER idle-evidence flushed the previous injection", () => {
+  it("wakes again for newer mail only AFTER the injection LANDED and idle-evidence flushed it", () => {
     // Pre-ADR-0010 this test asserted a second wake while the first was still
     // unconsumed — the exact stacking defect. The contract now: an agent
     // OBSERVED IDLE cannot still hold our injection (the host submits queued
-    // input at the turn boundary), so idleness — not drain — re-arms.
+    // input at the turn boundary), so idleness re-arms — but ONLY once the
+    // injection actually LANDED (codex #126 round 2: an idle snapshot during
+    // the in-flight window is a stale read, not flush evidence).
     const onWake = vi.fn();
     const gate = new WakeGate(onWake);
     expect(gate.consider({ pending_count: 1, last_message_at: "T1" }, "x", true)).toBe(true);
     expect(gate.consider({ pending_count: 2, last_message_at: "T2" }, "x", true)).toBe(false); // outstanding
-    // Newer mail + IDLE observation → flush evidence → re-wake.
+    gate.markInjectionLanded(); // adapter.wake resolved — inject #1 actually submitted
+    // Newer mail + IDLE observation on a LANDED injection → flush → re-wake.
     expect(
       gate.consider({ pending_count: 1, last_message_at: "T3" }, "x", true, {
         state: "idle",
@@ -138,6 +141,7 @@ describe("WakeGate ADR-0010 state-routed wakes (the 14-stacked-wakes fix)", () =
     const onWake = vi.fn();
     const gate = new WakeGate(onWake);
     gate.consider(snap(1, "T1"), "x", true, idle); // wake, mark=T1
+    gate.markInjectionLanded(); // inject #1 landed
     gate.consider(snap(2, "T2"), "x", true, busyCovered); // suppressed — mark must STAY T1
     // Idle again with T2 still the newest: never woken for → must wake now.
     expect(gate.consider(snap(2, "T2"), "x", true, idle)).toBe(true);
@@ -171,18 +175,39 @@ describe("WakeGate ADR-0010 state-routed wakes (the 14-stacked-wakes fix)", () =
   });
 
   it("a LANDED wake (idle flush) does NOT roll the mark back — the same mail is not re-woken", () => {
-    // The other half of the contract: flush evidence (idle) means the injection
-    // WAS submitted, so the mark must STAY — otherwise every idle observation
-    // would re-wake already-delivered mail. Distinguishing landed from lost is
-    // the whole fix; this pins the "landed" side so a future rollback change
-    // can't over-reach into successful deliveries.
+    // The other half of the contract: flush evidence (idle on a LANDED wake)
+    // means the injection WAS submitted, so the mark must STAY — otherwise every
+    // idle observation would re-wake already-delivered mail. Distinguishing
+    // landed from lost is the whole fix; this pins the "landed" side so a future
+    // rollback change can't over-reach into successful deliveries.
     const onWake = vi.fn();
     const gate = new WakeGate(onWake);
-    expect(gate.consider(snap(1, "T1"), "a", true)).toBe(true); // wake for T1
-    // Agent observed idle → injection landed + consumed; same still-pending T1
-    // must NOT re-wake.
+    expect(gate.consider(snap(1, "T1"), "a", true)).toBe(true); // wake for T1 (in-flight)
+    gate.markInjectionLanded(); // adapter.wake resolved — submitted
+    // Agent observed idle on a LANDED injection → flushed + consumed; same
+    // still-pending T1 must NOT re-wake.
     expect(gate.consider(snap(1, "T1"), "a", true, idle)).toBe(false);
     expect(onWake).toHaveBeenCalledTimes(1);
+  });
+
+  it("a premature idle does NOT flush an IN-FLIGHT (not-yet-landed) injection — no re-stacking (codex #126 round 2)", () => {
+    // onWake only SCHEDULES the async inject (binding fetch + terminal resolve +
+    // adapter submit run after). An idle snapshot in that window is a stale read
+    // from before our keystroke — flushing it would let a second inject fire and
+    // rebuild the stack. codex's compiled probe: two consecutive idle snapshots
+    // with newer mail produced {first:true, second:true} while wake #1 was still
+    // in flight. Idle is flush evidence ONLY after the delivery ack.
+    const onWake = vi.fn();
+    const gate = new WakeGate(onWake);
+    expect(gate.consider(snap(1, "T1"), "a", true, idle)).toBe(true); // inject #1 scheduled (in-flight)
+    // #1 has NOT landed; a burst / poll re-observes idle → must NOT re-inject.
+    expect(gate.consider(snap(2, "T2"), "a", true, idle)).toBe(false);
+    expect(gate.consider(snap(3, "T3"), "a", true, idle)).toBe(false);
+    expect(onWake).toHaveBeenCalledTimes(1);
+    // Once #1 actually lands, the next idle IS valid flush evidence → re-wake.
+    gate.markInjectionLanded();
+    expect(gate.consider(snap(3, "T3"), "a", true, idle)).toBe(true);
+    expect(onWake).toHaveBeenCalledTimes(2);
   });
 
   it("TTL backstop — an outstanding older than the TTL re-wakes (unobservable loss), a fresh one suppresses", () => {
