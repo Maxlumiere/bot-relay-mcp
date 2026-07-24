@@ -108,8 +108,12 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function printUsage(): void {
-  process.stdout.write(
+function printUsage(requested = false): void {
+  // STREAM DISCIPLINE: usage is DIAGNOSTIC on the error path → STDERR, so a
+  // failed `$(relay pair …)` capture yields EMPTY (fails loud) instead of help
+  // text that reads as a value. Only an explicit --help is `requested` and
+  // belongs on stdout.
+  (requested ? process.stdout : process.stderr).write(
     "Usage: relay pair <hub-url> [--name NAME] [--role ROLE] [--capabilities CAPS]\n" +
       "                     [--output PATH] [--secret SECRET] [--yes]\n\n" +
       "Register this machine as an agent on a remote bot-relay-mcp hub and emit\n" +
@@ -174,7 +178,7 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   if (args.help) {
-    printUsage();
+    printUsage(true);
     return 0;
   }
   if (!args.hubUrl) {
