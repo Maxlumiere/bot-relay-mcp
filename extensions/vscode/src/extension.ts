@@ -303,6 +303,13 @@ const wakeGates = new Map<string, WakeGate>();
 // loss evidence that clears the gate immediately (decidable event; the TTL
 // only backstops losses nothing here can see).
 const outstandingWakeTerminals = new Map<string, vscode.Terminal>();
+// Monotonic per-agent injection id — the epoch guard for ASYNC wake outcomes.
+// adapter.wake is fire-and-forget (resolveAndWake's wake is sync/void), so a
+// rejection surfaces later; by then an idle-flush may have let a NEWER wake
+// fire into the same terminal. A late rejection must re-arm the gate ONLY if
+// ITS injection is still the current one — terminal identity can't tell two
+// successive injects into the same terminal apart; a counter can.
+const injectionEpoch = new Map<string, number>();
 function getWakeGate(agentName: string): WakeGate {
   let g = wakeGates.get(agentName);
   if (!g) {
@@ -746,8 +753,24 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
       // resolveAndWake's wake is sync/void — fire-and-forget the async adapter.
       wake: (t) => {
         injected = true;
+        const epoch = (injectionEpoch.get(agentName) ?? 0) + 1;
+        injectionEpoch.set(agentName, epoch);
         outstandingWakeTerminals.set(agentName, t);
-        void adapter.wake(buildWakeContext(t));
+        // Fire-and-forget the async adapter, but OBSERVE a rejection: an
+        // unhandled reject (Claude sendText / Codex delay+sendSequence throwing)
+        // would leave the gate's outstanding flag set until the 3h TTL — a
+        // delivery failure silently converted into muteness. On failure re-arm
+        // the gate as loss evidence, but ONLY if this injection is still the
+        // current one, so an idle-flushed newer wake is not rolled back.
+        void adapter.wake(buildWakeContext(t)).catch((err) => {
+          log(
+            `auto-inject wake rejected for "${agentName}": ${err instanceof Error ? err.message : String(err)}`,
+          );
+          if (injectionEpoch.get(agentName) === epoch) {
+            outstandingWakeTerminals.delete(agentName);
+            wakeGates.get(agentName)?.clearOutstanding();
+          }
+        });
       },
       wakeWord: adapter.wakeWord,
       hint: hintNoWake,

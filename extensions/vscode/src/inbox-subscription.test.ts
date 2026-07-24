@@ -154,6 +154,37 @@ describe("WakeGate ADR-0010 state-routed wakes (the 14-stacked-wakes fix)", () =
     expect(onWake).toHaveBeenCalledTimes(2);
   });
 
+  it("failed delivery of the SAME still-pending mail recovers on the next poll tick — not silence-until-newer-mail (codex #126)", () => {
+    // The bug: clearOutstanding cleared the flag but NOT the watermark, so on
+    // every re-route of the same still-pending T1, decideWake saw
+    // T1 === lastWokenAt and returned false — the mail stayed silent
+    // INDEFINITELY, not "one tick". codex's compiled repro: first=true, then
+    // clearOutstanding(), same still-pending T1 retry=false. Loss evidence must
+    // roll the mark back so the retry wakes.
+    const onWake = vi.fn();
+    const gate = new WakeGate(onWake);
+    expect(gate.consider(snap(1, "T1"), "a", true)).toBe(true); // wake for T1
+    gate.clearOutstanding(); // injection did NOT land (no target / adapter reject)
+    // SAME T1, still pending, next route tick → must re-wake (was false pre-fix).
+    expect(gate.consider(snap(1, "T1"), "a", true)).toBe(true);
+    expect(onWake).toHaveBeenCalledTimes(2);
+  });
+
+  it("a LANDED wake (idle flush) does NOT roll the mark back — the same mail is not re-woken", () => {
+    // The other half of the contract: flush evidence (idle) means the injection
+    // WAS submitted, so the mark must STAY — otherwise every idle observation
+    // would re-wake already-delivered mail. Distinguishing landed from lost is
+    // the whole fix; this pins the "landed" side so a future rollback change
+    // can't over-reach into successful deliveries.
+    const onWake = vi.fn();
+    const gate = new WakeGate(onWake);
+    expect(gate.consider(snap(1, "T1"), "a", true)).toBe(true); // wake for T1
+    // Agent observed idle → injection landed + consumed; same still-pending T1
+    // must NOT re-wake.
+    expect(gate.consider(snap(1, "T1"), "a", true, idle)).toBe(false);
+    expect(onWake).toHaveBeenCalledTimes(1);
+  });
+
   it("TTL backstop — an outstanding older than the TTL re-wakes (unobservable loss), a fresh one suppresses", () => {
     let nowMs = 1_000_000;
     const onWake = vi.fn();

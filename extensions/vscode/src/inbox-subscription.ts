@@ -68,6 +68,16 @@ export class WakeGate {
    * a tool call — measured and ruled out, see PR).
    */
   private outstandingSince: number | null = null;
+  /**
+   * The high-water mark AS IT STOOD before the currently-outstanding injection
+   * advanced it. Held so LOSS EVIDENCE can roll `lastWokenAt` back to it: a
+   * wake that never landed must not count as "woken for", or the SAME still-
+   * pending mail is masked (its timestamp === lastWokenAt) and stays silent
+   * until newer mail bumps the timestamp past it — the codex #126 failed-
+   * delivery-stays-silent-INDEFINITELY bug (a poll re-route must recover it on
+   * the very next tick). null whenever nothing is outstanding.
+   */
+  private markBeforeOutstanding: string | null = null;
 
   constructor(
     private readonly onWake: (agentName: string) => void,
@@ -80,7 +90,31 @@ export class WakeGate {
    * flag so the next mail event re-wakes immediately (no TTL wait).
    */
   clearOutstanding(): void {
+    this.markLost();
+  }
+
+  /**
+   * FLUSH EVIDENCE: the injection LANDED — the host submitted the queued input
+   * at the turn boundary and drained it. Clear the outstanding flag; the mark
+   * STAYS advanced because we genuinely woke for that mail (no re-wake of the
+   * same message).
+   */
+  private markLanded(): void {
     this.outstandingSince = null;
+    this.markBeforeOutstanding = null;
+  }
+
+  /**
+   * LOSS EVIDENCE: the injection did NOT land. Clear the outstanding flag AND
+   * roll `lastWokenAt` back to its pre-injection value, so the SAME still-
+   * pending mail re-wakes on the next route (no silence-until-newer-mail).
+   * Guarded on an actual outstanding injection so a stray clear cannot disturb
+   * a good mark.
+   */
+  private markLost(): void {
+    if (this.outstandingSince !== null) this.lastWokenAt = this.markBeforeOutstanding;
+    this.outstandingSince = null;
+    this.markBeforeOutstanding = null;
   }
 
   /**
@@ -108,13 +142,16 @@ export class WakeGate {
   ): boolean {
     const now = this.opts.now ?? Date.now;
     // IDLE-EVIDENCE: the host submits queued input at the turn boundary, so
-    // an agent observed idle cannot still hold our injection. Decidable
-    // flush evidence — re-arm.
-    if (observed.state === "idle") this.outstandingSince = null;
-    // TTL backstop for losses nothing can observe.
+    // an agent observed idle cannot still hold our injection — it LANDED and
+    // was consumed. Decidable flush evidence: clear the flag, KEEP the mark.
+    if (observed.state === "idle") this.markLanded();
+    // TTL backstop for losses nothing can observe. An injection outstanding
+    // past the TTL never resolved either way; treat it as a (very late) LOSS
+    // so mail still pending re-wakes — clearing the flag alone would leave the
+    // mark masking it forever.
     if (this.outstandingSince !== null) {
       const ttl = this.opts.outstandingTtlMs ?? DEFAULT_WAKE_OUTSTANDING_TTL_MS;
-      if (now() - this.outstandingSince >= ttl) this.outstandingSince = null;
+      if (now() - this.outstandingSince >= ttl) this.markLost();
     }
     const route = routeWake({
       pendingMail: snapshot.pending_count > 0,
@@ -129,8 +166,15 @@ export class WakeGate {
       autoInjectInbox,
       lastWokenAt: this.lastWokenAt,
     });
+    // Hold the mark AS IT STANDS before this injection advances it, so LOSS
+    // EVIDENCE (clearOutstanding / TTL) can roll it back — a wake that never
+    // lands must not count as "woken for" (codex #126). In every decideWake
+    // no-wake branch newMark === lastWokenAt, so this assignment is a no-op
+    // there; it only advances on an actual wake.
+    const markBeforeThisWake = this.lastWokenAt;
     this.lastWokenAt = decision.newMark;
     if (decision.shouldWake) {
+      this.markBeforeOutstanding = markBeforeThisWake;
       this.outstandingSince = now();
       this.onWake(agentName);
       return true;

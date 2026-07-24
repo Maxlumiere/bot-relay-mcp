@@ -151,7 +151,9 @@ describe("v0.1.4 — bundle correctness", () => {
     // connection-lifecycle.ts (the auto-reconnect-on-close guard seam) +
     // health-poll.ts (the reachability/health backstop). v0.5.0 added
     // vault-path.ts (the per-instance vault-first token resolver), all
-    // imported by extension.ts.
+    // imported by extension.ts. v0.5.x added wake-routing.ts (ADR-0010 pure
+    // state-routed wake decision) — imported by inbox-subscription.ts, where
+    // routeWake gates each wake, so it is a genuine bundle input.
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/catch-up-wake.ts",
@@ -170,6 +172,7 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/terminal-targeting.ts",
       "src/transport-diagnostics.ts",
       "src/vault-path.ts",
+      "src/wake-routing.ts",
     ]);
   });
 
