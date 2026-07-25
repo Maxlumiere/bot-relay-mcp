@@ -331,4 +331,19 @@ describe("installer — quote (init) + exact-match migration (no classifier)", (
     expect(relay).toHaveLength(1); // deduped to one
     expect(isRelayCheckHookCommand(relay[0].command)).toBe(true); // now precisely owned
   });
+
+  it("TRANSIENT residual (codex #139): a legacy raw $() command is REPAIRED by the next init (migrate → owned)", () => {
+    // A pre-2.23.0 install with a $()-bearing (no-whitespace) root stored the RAW
+    // path — precise-detect rejects the `$`, ambiguous needs whitespace, so it is
+    // in NEITHER bucket (uncovered). Codex asked: does the next init repair it?
+    const raw = "/x/$(id)/bot-relay-mcp/hooks/check-relay.sh";
+    expect(isRelayCheckHookCommand(raw), "starts uncovered").toBe(false);
+    const canonical = quoteForHookCommand(raw); // '/x/$(id)/…/check-relay.sh' — $() now literal
+    const existing = { hooks: { SessionStart: [{ matcher: "startup|resume", hooks: [{ type: "command", command: raw, timeout: 10 }] }] } };
+    const { root, changed } = migrateRawHookCommand(existing, raw, canonical);
+    expect(changed).toBe(true);
+    const cmd = (root.hooks as { SessionStart: { hooks: { command: string }[] }[] }).SessionStart[0].hooks[0].command;
+    expect(cmd).toBe(canonical);
+    expect(isRelayCheckHookCommand(cmd), "repaired → precisely owned + watched").toBe(true); // transient, not permanent
+  });
 });

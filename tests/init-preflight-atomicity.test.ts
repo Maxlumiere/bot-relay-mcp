@@ -4,60 +4,81 @@
 // See LICENSE for full terms.
 
 /**
- * codex #139 v6 P1 — ATOMICITY of the unquotable-root refusal.
+ * codex #139 P1 (rounds 6 & 10) — ATOMICITY of the unquotable-root refusal.
  *
  * quoteForHookCommand refuses a newline/CR-bearing install root (no safe
- * single-line shell command exists for it). The refusal POLICY is right; the old
- * MECHANISM — a throw INSIDE installHook, after config.json + ~/.claude.json were
- * already written — was a PARTIAL COMMIT: mcp pointed at the relay with no
- * registration hook, and re-running just repeated the half-install.
+ * single-line shell command exists). The refusal POLICY is right; the MECHANISM
+ * must not leave a PARTIAL COMMIT. v6 moved the refusal before the config writes
+ * but `ensureSecureDir($RELAY_HOME)` still ran first — so a refusal created
+ * $RELAY_HOME and "nothing was written" was a lie (round 10). runInit now
+ * preflights before ANY filesystem-creating action.
  *
- * `runInit` now PREFLIGHTS (validate before any write). Controls written FROM the
- * harm:
- *   HARM   — init from a newline root → refuse, exit 1, write NOTHING (neither
- *            config.json nor ~/.claude.json).
- *   INNOCENT — --config-only from the same newline root SUCCEEDS (we are not
- *            writing a hook, so an unquotable root must not block the run).
- * The `rootOverride` param is a test seam (a real module URL can never contain a
- * newline).
+ * THE CONTROL IS WRITTEN FROM THE HARM, NOT A PROXY. The v6 control asserted on
+ * config.json + ~/.claude.json SPECIFICALLY — which is exactly why it passed while
+ * a THIRD artefact ($RELAY_HOME) was created. The harm is "ANYTHING was written",
+ * so we snapshot the ENTIRE redirected tree (every path, its bytes, and its mode)
+ * before and after, and assert byte-identical. An enumerated file list can only
+ * catch artefacts you already imagined.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import crypto from "crypto";
 
 const { run: runInit } = await import("../src/cli/init.js");
 
-let dir: string;
-let claudeHome: string;
+/** The WHOLE tree under `root`: relpath → "dir:<mode>" | "file:<mode>:<sha256>". */
+function snapshotTree(root: string): Map<string, string> {
+  const m = new Map<string, string>();
+  const walk = (p: string): void => {
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(p);
+    } catch {
+      return;
+    }
+    const rel = path.relative(root, p) || ".";
+    const mode = (st.mode & 0o777).toString(8);
+    if (st.isDirectory()) {
+      m.set(rel, `dir:${mode}`);
+      for (const e of fs.readdirSync(p).sort()) walk(path.join(p, e));
+    } else if (st.isFile()) {
+      m.set(rel, `file:${mode}:${crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex")}`);
+    } else {
+      m.set(rel, `other:${mode}`);
+    }
+  };
+  walk(root);
+  return m;
+}
+
+let dir: string; // the temp ROOT; every redirected path lives UNDER it
+let relayHome: string; // does NOT exist yet — init would create it (the round-10 artefact)
+let claudeHome: string; // does NOT exist yet
 let configPath: string;
-let claudeJson: string;
 let errs: string[];
-let outs: string[];
 let errSpy: ReturnType<typeof vi.spyOn>;
 let outSpy: ReturnType<typeof vi.spyOn>;
 const saved: Record<string, string | undefined> = {};
 
 beforeEach(() => {
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), "init-preflight-"));
-  claudeHome = path.join(dir, "home");
-  fs.mkdirSync(claudeHome, { recursive: true });
-  configPath = path.join(dir, "config.json");
-  claudeJson = path.join(claudeHome, ".claude.json");
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), "init-atomicity-"));
+  relayHome = path.join(dir, "botrelay"); // NOT created — init's ensureSecureDir would create it
+  claudeHome = path.join(dir, "claude"); // NOT created
+  configPath = path.join(relayHome, "config.json");
   for (const k of ["RELAY_CONFIG_PATH", "RELAY_HOME", "RELAY_CLAUDE_HOME", "RELAY_SKIP_DAEMON", "RELAY_INSTANCE_ID"]) {
     saved[k] = process.env[k];
   }
-  process.env.RELAY_CONFIG_PATH = configPath; // config.json → sandbox
-  process.env.RELAY_HOME = dir;
-  process.env.RELAY_CLAUDE_HOME = claudeHome; // ~/.claude.json + settings.json → sandbox
+  process.env.RELAY_CONFIG_PATH = configPath;
+  process.env.RELAY_HOME = relayHome;
+  process.env.RELAY_CLAUDE_HOME = claudeHome;
   process.env.RELAY_SKIP_DAEMON = "1";
   delete process.env.RELAY_INSTANCE_ID;
   errs = [];
-  outs = [];
   errSpy = vi.spyOn(process.stderr, "write").mockImplementation((s: string | Uint8Array) => (errs.push(String(s)), true));
-  outSpy = vi.spyOn(process.stdout, "write").mockImplementation((s: string | Uint8Array) => (outs.push(String(s)), true));
+  outSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 });
-
 afterEach(() => {
   errSpy.mockRestore();
   outSpy.mockRestore();
@@ -70,36 +91,35 @@ afterEach(() => {
 
 const NEWLINE_ROOT = () => path.join(dir, "root\nwith-newline", "bot-relay-mcp");
 
-describe("codex #139 v6 P1 — init preflight atomicity (newline install root)", () => {
-  it("HARM: init from a newline root → refuses, exit 1, and writes NOTHING", async () => {
+describe("codex #139 P1 — init preflight atomicity (newline install root)", () => {
+  it("HARM: init from a newline root → refuses AND leaves the WHOLE tree byte-identical (nothing created)", async () => {
+    const before = snapshotTree(dir);
     const code = await runInit(["--yes", "--skip-daemon"], NEWLINE_ROOT());
     expect(code).toBe(1);
-    // NOT a partial commit — neither file exists:
-    expect(fs.existsSync(configPath), "config.json must NOT be written").toBe(false);
-    expect(fs.existsSync(claudeJson), "~/.claude.json must NOT be written").toBe(false);
-    // clean one-line refusal naming the cause + that nothing was written:
+    // The harm is "anything written", not "config.json written" — assert the ENTIRE
+    // tree is unchanged: no $RELAY_HOME, no instance dir, no config, no artefact.
+    expect(snapshotTree(dir)).toEqual(before);
     const msg = errs.join("");
     expect(msg).toMatch(/refusing/i);
     expect(msg).toMatch(/newline\/CR/);
     expect(msg).toMatch(/nothing was written/i);
   });
 
-  it("re-running from the newline root repeats the refusal and STILL writes nothing (no accreting half-install)", async () => {
+  it("re-running from the newline root repeats the refusal and STILL leaves the tree byte-identical", async () => {
+    const before = snapshotTree(dir);
     await runInit(["--yes", "--skip-daemon"], NEWLINE_ROOT());
     const code2 = await runInit(["--yes", "--skip-daemon"], NEWLINE_ROOT());
     expect(code2).toBe(1);
-    expect(fs.existsSync(configPath)).toBe(false);
-    expect(fs.existsSync(claudeJson)).toBe(false);
+    expect(snapshotTree(dir)).toEqual(before); // no accreting half-install across runs
   });
 
   it("INNOCENT: --config-only from the SAME newline root SUCCEEDS and writes config.json", async () => {
     const code = await runInit(["--yes", "--config-only"], NEWLINE_ROOT());
     expect(code, errs.join("")).toBe(0);
-    expect(fs.existsSync(configPath), "config.json IS written for --config-only").toBe(true);
-    expect(fs.existsSync(claudeJson), "no hook/mcp for --config-only").toBe(false);
+    expect(fs.existsSync(configPath)).toBe(true); // config IS written (no hook involved)
   });
 
-  it("INNOCENT: --skip-hooks from a newline root SUCCEEDS (mcp written, no hook, no throw)", async () => {
+  it("INNOCENT: --skip-hooks from a newline root SUCCEEDS (config written, no hook, no throw)", async () => {
     const code = await runInit(["--yes", "--skip-daemon", "--skip-hooks"], NEWLINE_ROOT());
     expect(code, errs.join("")).toBe(0);
     expect(fs.existsSync(configPath)).toBe(true);

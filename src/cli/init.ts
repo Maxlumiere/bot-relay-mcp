@@ -221,9 +221,14 @@ export function moduleRootFromUrl(moduleUrl: string): string {
 /** Resolve the install root (repo dir) + the two abs paths the operator's
  *  Claude config needs to point at. */
 function installPaths(rootOverride?: string): { root: string; distEntry: string; hookScript: string } {
-  // rootOverride is a TEST seam only (the atomicity controls need a newline-bearing
-  // install root, which the real module URL can never have). Production passes
-  // nothing → the module's own directory.
+  // rootOverride is a TEST seam for the atomicity controls. It is NOT reachable
+  // from the CLI (bin/relay calls `run(rest)` with no second argument, and nothing
+  // in argv/env/config sets it), and it structurally CANNOT bypass the preflight —
+  // it feeds the very `hookScript` value the preflight validates. (It is not
+  // justified by "a real module URL can't contain a newline": codex disproved that
+  // by running the shipped CLI from a checkout whose directory name has one. The
+  // seam exists so the control can exercise that real shape deterministically, not
+  // because the shape is impossible.) Production passes nothing → the module dir.
   const root = rootOverride ?? moduleRootFromUrl(import.meta.url);
   return {
     root,
@@ -382,6 +387,26 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     return 1;
   }
 
+  // PREFLIGHT — MUST run before ANY filesystem action (codex #139 P1 atomicity,
+  // rounds 6 & 10). Everything below touches the disk (ensureSecureDir creates
+  // $RELAY_HOME, createInstance scaffolds an instance dir, atomicWriteJson writes
+  // config/mcp/hook). If the hook command is unquotable (a newline/CR install
+  // root) we REFUSE — and a refusal that has already created $RELAY_HOME or an
+  // instance dir is a PARTIAL COMMIT that makes "nothing was written" a LIE (codex
+  // caught exactly this by diffing the whole tree, not just config.json). THE
+  // RULE: nothing that CREATES a filesystem artefact may run before this decision.
+  // installPaths is pure path math. Only gate when a hook will actually be written
+  // (--config-only / --skip-hooks never call quoteForHookCommand).
+  const { distEntry, hookScript } = installPaths(rootOverride);
+  if (!args.configOnly && !args.skipHooks && !canQuoteForHookCommand(hookScript)) {
+    process.stderr.write(
+      `relay init: refusing — the install path contains a newline/CR: ${JSON.stringify(hookScript)}. ` +
+        `No safe single-line SessionStart hook command exists for it, so nothing was written. Reinstall from a ` +
+        `path without control characters, or re-run with --config-only / --skip-hooks to install without the hook.\n`,
+    );
+    return 1;
+  }
+
   // ---- 1. config.json (reconcile) ------------------------------------------
   ensureSecureDir(defaultBotRelayDir(), 0o700);
   if (effectiveInstanceId && perInstanceDir) {
@@ -419,23 +444,6 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     : reconcileRelayConfig(existingConfig, defaults);
   // --agent explicitly sets/updates the hook's default agent name (override).
   if (args.agent) reconciled.root.default_agent_name = args.agent;
-
-  const { distEntry, hookScript } = installPaths(rootOverride);
-  // PREFLIGHT (codex #139 v6 P1 — atomicity). We are about to write config.json,
-  // then ~/.claude.json, then the SessionStart hook. If the hook command cannot be
-  // safely quoted (a newline/CR-bearing install root), quoteForHookCommand throws —
-  // and a throw AFTER the first writes is a PARTIAL COMMIT (mcp points at the relay
-  // with no registration hook, and re-running just repeats the half-install). So
-  // validate here, BEFORE any write, and only when we will actually write the hook
-  // (not --config-only, not --skip-hooks). Refuse cleanly, write NOTHING.
-  if (!args.configOnly && !args.skipHooks && !canQuoteForHookCommand(hookScript)) {
-    process.stderr.write(
-      `relay init: refusing — the install path contains a newline/CR: ${JSON.stringify(hookScript)}. ` +
-        `No safe single-line SessionStart hook command exists for it, so nothing was written. Reinstall from a ` +
-        `path without control characters, or re-run with --config-only / --skip-hooks to install without the hook.\n`,
-    );
-    return 1;
-  }
 
   atomicWriteJson(configPath, reconciled.root, 0o600);
   ensureSecureFile(configPath, 0o600);

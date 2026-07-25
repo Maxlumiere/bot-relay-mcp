@@ -35,13 +35,26 @@
  *    any write), and those are in the precise-owned region — so the biconditional
  *    above holds for anything WE write. mcpServers["bot-relay"] and the config.json
  *    content+mode are covered whole.
- *  NOT COVERED (known residuals — outside BOTH the precise-owned and the
- *    ambiguous-legacy buckets): a legacy `sh -c <script>` / interpreter-wrapped
- *    hook, a DOUBLE-quoted hook command (we never emit one; double quotes don't
- *    stop $()/backtick), and a newline/CR-bearing command. A test/agent that
- *    mutated one of those SessionStart entries would not trip. These are not shapes
- *    the relay produces; re-running `relay init` migrates a raw entry to the
- *    covered canonical. Documented as a known gap, not implied completeness.
+ *  NOT COVERED — known residuals, outside BOTH the precise-owned and the
+ *    ambiguous-legacy buckets. Two kinds, and the distinction is the honest part:
+ *    TRANSIENT (repaired by the next `relay init`):
+ *      · a LEGACY RAW UNQUOTED command with shell metacharacters and no whitespace
+ *        (`/x/$(id)/…/check-relay.sh`, `;`, backtick) — a pre-2.23.0 install could
+ *        store one, precise-detect rejects the metachar and the ambiguous bucket
+ *        needs whitespace, so it is in NEITHER. But migrateRawHookCommand exact-
+ *        matches the raw literal THIS root writes, so the next `relay init` REWRITES
+ *        it to the covered single-quoted canonical (verified: a raw `$(id)` command
+ *        migrates and becomes precisely owned). Uncovered until the next init,
+ *        which repairs it — not permanent.
+ *    PERMANENT (the relay never emits or migrates these):
+ *      · a `sh -c <script>` / interpreter-wrapped hook, or a DOUBLE-quoted command
+ *        (we never emit one; double quotes don't stop $()/backtick). A newline/CR
+ *        command can no longer be created (init refuses it, atomically).
+ *    QUIRK: a raw (unquoted) APOSTROPHE-bearing path (`/x/O'Hare/…/check-relay.sh`)
+ *    has no metachar in the reject set, so it is misclassified as bare-safe and
+ *    WATCHED — even though as shell it is a broken (unbalanced-quote) command. The
+ *    watch is harmless (deletion still trips) and the next init migrates it to the
+ *    correct single-quoted form. Stated as a known gap + quirk, not completeness.
  *
  * Fails the run if a test writes the RELAY-OWNED region of the operator's real
  * user-scope config. It is the observation-level backstop behind the two
@@ -95,13 +108,13 @@ import { isRelayCheckHookCommand } from "../src/cli/config-merge.js";
 /**
  * RESIDUALS, deliberately out of scope (codex #139 asked they be named, not left
  * silent):
- *  - FILE PERMISSIONS are not fingerprinted for ~/.claude.json /
- *    ~/.claude/settings.json. Those files are SHARED (Claude Code owns most of
- *    them); a mode-only change there is not a relay-content clobber, and folding
- *    mode into the fingerprint would re-admit exactly the ambient false-trips
- *    this rewrite removed. ~/.bot-relay/config.json is relay-owned and its
- *    CONTENT is fingerprinted whole; a permission-only change without a content
- *    change is not the write-clobber class this guard exists to catch.
+ *  - FILE PERMISSIONS: fingerprinted ONLY for ~/.bot-relay/config.json (relay-
+ *    owned + secret-bearing — a mode-only widening there exposes http_secret, so
+ *    its access mode IS in the region; regionOf folds it in, and the mode-harm
+ *    control covers it). NOT fingerprinted for the two SHARED Claude files
+ *    (~/.claude.json, ~/.claude/settings.json): Claude Code owns most of those,
+ *    a mode change there is not a relay-content clobber, and folding mode in would
+ *    re-admit the ambient false-trips this rewrite removed.
  *  - UNPARSEABLE files: handled, not ignored — a parse failure fingerprints as
  *    "UNPARSEABLE:<sha256 of raw>", so a test that corrupts a file two DIFFERENT
  *    ways trips (distinct hashes) rather than reading unchanged. A valid file
