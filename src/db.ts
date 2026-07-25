@@ -2042,6 +2042,10 @@ const REAPABLE_ORPHAN_WHERE = "established_at IS NULL AND session_id IS NULL";
  */
 function deleteReapableOrphan(db: CompatDatabase, name: string): boolean {
   const r = db.prepare(`DELETE FROM agents WHERE name = ? AND ${REAPABLE_ORPHAN_WHERE}`).run(name);
+  // v2.23.x #140 (hygiene) — an orphan-reap DELETE ends the name's liveness
+  // identity; evict both probe caches UNCONDITIONALLY (widened guard predicate).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   if (r.changes > 0) {
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
     bumpAuthGeneration();
@@ -2509,6 +2513,13 @@ export function teardownAgent(
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
   });
   tx();
+  // v2.23.x #140 (hygiene) — a teardown DELETE ends the name's liveness identity;
+  // evict both probe caches UNCONDITIONALLY (same rationale as unregisterAgent).
+  // The widened guard predicate requires it so this sibling delete path can't
+  // drift back to leaving a stale entry that suppresses an argv-scan alive signal
+  // after the name re-registers.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   bumpAuthGeneration(); // ADR-0003: agent row removed → any cached verdict invalid
 }
 
@@ -2796,41 +2807,37 @@ export function closeAgentSession(
   signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null = null,
 ): { changed: boolean } {
   const db = getDb();
-  // Conditional UPDATE so non-signal callers preserve the legacy
-  // behavior: signal_received_at + signal_kind stay NULL unless this
-  // call carries one. Two SQL forms are cheaper to maintain than a
-  // dynamic builder + safer than a single COALESCE form that could
-  // smuggle a NULL through and clear an already-set signal stamp.
+  // Conditional UPDATE so non-signal callers preserve the legacy behavior:
+  // signal_received_at + signal_kind stay NULL unless this call carries one. Two
+  // SQL forms are cheaper to maintain than a dynamic builder + safer than a
+  // single COALESCE form that could smuggle a NULL through and clear an
+  // already-set signal stamp.
   // v2.13.0 — clear the liveness anchor (last_alive + agent_pid + start) in the
-  // SAME CAS as the close so a same-host probe can't restamp last_alive and
-  // mask the close. Applies to both SQL forms.
+  // SAME CAS as the close so a same-host probe can't restamp last_alive and mask
+  // the close. Applies to both SQL forms.
+  let r: { changes: number };
   if (signalKind === null) {
-    const r = db.prepare(
+    r = db.prepare(
       "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
       "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
       "WHERE name = ? AND session_id = ?"
     ).run(name, expectedSessionId);
-    // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
-    // left _negativeProbeCache intact on r.changes===0 (a CAS loser) — where a
-    // concurrent rebind already moved the session/anchor — so a stale NEGATIVE entry
-    // labelled the now-fresh live row `dead` until the TTL. Bracing preserves the
-    // harm; unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
-    _negativeProbeCache.delete(name);
-    _positiveProbeCache.delete(name);
-    return { changed: r.changes === 1 };
+  } else {
+    const nowMs = Date.now();
+    r = db.prepare(
+      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
+      "signal_received_at = ?, signal_kind = ?, " +
+      "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
+      "WHERE name = ? AND session_id = ?"
+    ).run(nowMs, signalKind, name, expectedSessionId);
   }
-  const nowMs = Date.now();
-  const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
-    "signal_received_at = ?, signal_kind = ?, " +
-    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
-    "WHERE name = ? AND session_id = ?"
-  ).run(nowMs, signalKind, name, expectedSessionId);
-  // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
-  // left _negativeProbeCache intact on r.changes===0 (a CAS loser) — where a
-  // concurrent rebind already moved the session/anchor — so a stale NEGATIVE entry
-  // labelled the now-fresh live row `dead` until the TTL. Bracing preserves the
-  // harm; unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+  // v2.23.x #140 — SINGLE unconditional dual eviction covering BOTH SQL forms
+  // (refactored from a per-branch eviction so the probe-cache guard's "eviction
+  // is a top-level statement" rule verifies it on every path — the prior
+  // null-branch eviction was nested and structurally invisible to the guard). On
+  // a CAS loser (r.changes===0 — a concurrent rebind moved the session/anchor) a
+  // stale NEGATIVE entry must not survive to label the now-fresh live row `dead`.
+  // Bracing preserves the harm; unconditional fixes it (≤ one extra probe).
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
@@ -2883,10 +2890,16 @@ export function endAgentSessionOnSignal(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(nowMs, signalKind, name, expectedSessionId);
-  if (r.changes === 1) {
-    _negativeProbeCache.delete(name);
-    _positiveProbeCache.delete(name);
-  }
+  // v2.23.x #140 — the FIFTH site, and the one four reviewers missed because it
+  // was BRACED (looked correct). Same defect as the four unbraced ones: on a CAS
+  // loser (r.changes===0 — a concurrent rebind already moved the session/anchor)
+  // the guarded `if` left a stale NEGATIVE entry intact, so the fresh live row
+  // read `dead`, or its argv-scan alive signal was SUPPRESSED (computeLiveness-
+  // Verdict returns at the negative-cache hit before reaching the argv probe),
+  // until the ~5s TTL. UNCONDITIONAL dual eviction — a CAS loser must not retain
+  // a verdict about a binding it failed to mutate (≤ one extra probe).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -3014,6 +3027,7 @@ export function mintAgentToken(
   const plaintext_token = generateToken();
   const token_hash = hashToken(plaintext_token);
 
+  let created: boolean;
   if (!existing) {
     const id = uuidv4();
     const session_id = uuidv4();
@@ -3033,51 +3047,51 @@ export function mintAgentToken(
     });
     tx();
     bumpAuthGeneration(); // ADR-0003: new token_hash + token_lookup written
-
-    const fresh = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
-    return {
-      agent: toAgentWithStatus(fresh),
-      plaintext_token,
-      created: true,
-    };
-  }
-
-  if (!options.force) {
-    throw new Error(
-      `Agent "${name}" already exists. Pass --force to mint a new token (rotates + invalidates the existing token, clears session, sets status=offline).`
-    );
-  }
-
-  // Force-rotate: token-only. Caps + role preserved (immutability + safety).
-  // Description is preserved when not supplied; if explicitly supplied (even
-  // null) the caller is updating it. CLI doesn't expose --description on the
-  // rotate path in v2.6.0 to keep the surface tight; future-add via this hook.
-  const newDescription =
-    options.description !== undefined ? options.description : existing.description ?? null;
-  const tx = db.transaction(() => {
-    const r = db.prepare(
-      "UPDATE agents SET last_seen = ?, token_hash = ?, token_lookup = ?, session_id = NULL, " +
-        "agent_status = 'offline', auth_state = 'active', " +
-        "previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL, " +
-        "recovery_token_hash = NULL, revoked_at = NULL, " +
-        "description = ? " +
-        "WHERE name = ?"
-    ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name);
-    if (r.changes !== 1) {
+    created = true;
+  } else {
+    if (!options.force) {
       throw new Error(
-        `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
+        `Agent "${name}" already exists. Pass --force to mint a new token (rotates + invalidates the existing token, clears session, sets status=offline).`
       );
     }
-  });
-  tx();
-  bumpAuthGeneration(); // ADR-0003: token rotated (new token_hash/token_lookup, old invalidated)
+    // Force-rotate: token-only. Caps + role preserved (immutability + safety).
+    // Description is preserved when not supplied; if explicitly supplied (even
+    // null) the caller is updating it. CLI doesn't expose --description on the
+    // rotate path in v2.6.0 to keep the surface tight; future-add via this hook.
+    const newDescription =
+      options.description !== undefined ? options.description : existing.description ?? null;
+    const tx = db.transaction(() => {
+      const r = db.prepare(
+        "UPDATE agents SET last_seen = ?, token_hash = ?, token_lookup = ?, session_id = NULL, " +
+          "agent_status = 'offline', auth_state = 'active', " +
+          "previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL, " +
+          "recovery_token_hash = NULL, revoked_at = NULL, " +
+          "description = ? " +
+          "WHERE name = ?"
+      ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name);
+      if (r.changes !== 1) {
+        throw new Error(
+          `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
+        );
+      }
+    });
+    tx();
+    bumpAuthGeneration(); // ADR-0003: token rotated (new token_hash/token_lookup, old invalidated)
+    created = false;
+  }
 
-  const updated = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
-  return {
-    agent: toAgentWithStatus(updated),
-    plaintext_token,
-    created: false,
-  };
+  // v2.23.x #140 (hygiene, guard-required) — mint CREATES (first-mint INSERT) or
+  // REPLACES (force-rotate clears session_id) the name's liveness identity, so
+  // evict both probe caches UNCONDITIONALLY. The behavioural guard caught THIS
+  // writer — not one of the five teardown sites nor register/unregister — proving
+  // the exact "seventh class" the widened predicate exists to stop. (Throw paths
+  // above bypass this: a non-force collision or a changes!==1 rotate mutated
+  // nothing, so there is no fresh binding whose cache could be stale.)
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+
+  const row = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
+  return { agent: toAgentWithStatus(row), plaintext_token, created };
 }
 
 /**
@@ -3415,6 +3429,19 @@ export function registerAgent(
       class: options.class ?? null,
     });
   }
+
+  // v2.23.x #140 (hygiene, guard-required) — registration CREATES (first INSERT)
+  // or REPLACES (re-register rotates session_id) the name's liveness identity, so
+  // evict both probe caches UNCONDITIONALLY on the success path. Concrete harm
+  // prevented: a crashed terminal left a dead-anchor NEGATIVE entry; the relaunch
+  // re-registers HERE before its hook restamps the anchor — without this evict the
+  // stale negative would SUPPRESS the argv-scan alive signal (computeLiveness-
+  // Verdict returns at the negative-cache hit before the argv probe) for the ~5s
+  // TTL. setAgentLivenessAnchor also evicts when the fresh anchor lands, but that
+  // can trail the register, so close the window here too. (CAS-loser register
+  // paths throw above → no identity change → nothing stale to clear.)
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
 
   // v2.0 beta.1 (Codex HIGH 4): auto-assign queued tasks at the DB layer so
   // every caller of registerAgent (tool handler, future hooks, direct scripts)
@@ -3907,6 +3934,16 @@ export function unregisterAgent(name: string, expectedSessionId?: string): boole
   } else {
     result = db.prepare("DELETE FROM agents WHERE name = ?").run(name);
   }
+  // v2.23.x #140 (hygiene, NOT the P1) — deleting a row ENDS the name's liveness
+  // identity, so evict both probe caches UNCONDITIONALLY. This is not a false-
+  // `dead` source (a re-registered name has no anchor yet → computeLivenessVerdict
+  // returns `unknown`, never `dead`), but a stale NEGATIVE entry would SUPPRESS
+  // the argv-scan alive signal during the brief unanchored interval after a
+  // re-register (the negative-cache hit returns before the argv probe runs). The
+  // widened guard predicate — any CREATE/REPLACE/DELETE of a liveness identity
+  // evicts — makes this load-bearing so a future delete path can't reopen the gap.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   // Only clean up normalized capabilities when the agent row actually went
   // away — important for the session_id-scoped case where we might not have
   // deleted anything.
@@ -4979,6 +5016,13 @@ export function deleteAgentIfAbandoned(name: string, cutoffIso: string): boolean
   const r = db
     .prepare("DELETE FROM agents WHERE name = ? AND last_seen < ?")
     .run(name, cutoffIso);
+  // v2.23.x #140 (hygiene) — a purge DELETE ends the name's liveness identity;
+  // evict both probe caches UNCONDITIONALLY (widened guard predicate). A row this
+  // stale (last_seen past the cutoff) has no live ~5s cache entry in practice,
+  // but the guard treats every DELETE-of-identity uniformly so no purge path can
+  // drift into leaving one.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   if (r.changes > 0) bumpAuthGeneration(); // ADR-0003: agent row removed
   return r.changes > 0;
 }

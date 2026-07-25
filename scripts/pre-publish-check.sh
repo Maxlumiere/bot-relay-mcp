@@ -483,6 +483,23 @@ agent_class_guard() {
 }
 step "agent-class guard (no class taxonomy re-fork outside src/agent-class.ts)" agent_class_guard || exit 1
 
+# --- 5e. #140 probe-cache eviction drift guard (v2.23.x) ---------------------
+# The liveness probe caches (_negativeProbeCache / _positiveProbeCache in
+# src/db.ts) are only safe if EVERY writer that CREATEs / REPLACEs / DELETEs a
+# name's liveness identity evicts BOTH caches UNCONDITIONALLY — else a stale
+# entry outlives the binding it described and mislabels the next one (a live row
+# read `dead`, or an argv-scan alive signal suppressed) until the ~5s TTL. This
+# TS-AST walk asserts each identity writer evicts both caches as TOP-LEVEL
+# (= unconditional) statements — the SEMANTIC encoding of "unconditional" that
+# catches the BRACED fifth site four reviewers missed (a syntax lint / `curly`
+# rule would not, since that site was correctly braced). Shared with the vitest
+# negative-fixture test (tests/v2-23-0-probe-cache-guard.test.ts) that proves the
+# guard FAILS on a drifted writer — test the guard, not just the code.
+probe_cache_guard() {
+  node "$PROJECT_ROOT/scripts/probe-cache-guard.mjs" "$PROJECT_ROOT/src/db.ts"
+}
+step "probe-cache guard (every liveness-identity writer evicts both probe caches)" probe_cache_guard || exit 1
+
 # --- 6. 25-tool + CLI smoke against an isolated relay (v2.1 Phase 5a) ---
 # Inline cleanup (no RETURN trap) — simpler + avoids set-u pitfalls around
 # deferred variable lookup in trap strings.
