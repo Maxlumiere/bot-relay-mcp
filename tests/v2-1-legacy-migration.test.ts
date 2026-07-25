@@ -257,6 +257,7 @@ describe("v2.1 Phase 2b — legacy-row register_agent migration bypass", () => {
       capabilities: [],
       agent_token: firstToken,
       force: true,
+      expected_session_id: getAgentAuthData("legacy-d")?.session_id, // ADR-0012 CAS
     });
     expect(rightPath.success).toBe(true);
   });

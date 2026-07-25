@@ -100,6 +100,7 @@ describe("v2.1 Phase 4f.1 — capturedSessionId re-capture", () => {
         capabilities: [],
         agent_token: token,
         force: true,
+        expected_session_id: firstSid, // ADR-0012 CAS — the session we read
       } as any)
     );
     const body = parseResult(resp);

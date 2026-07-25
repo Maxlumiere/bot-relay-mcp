@@ -498,6 +498,7 @@ describe("First-run UX", () => {
       description: "test agent description for retro check",
       agent_token: tok,
       force: true,
+      expected_session_id: getAgentAuthData("desc-1")?.session_id, // ADR-0012 CAS
     });
     expect(r.success).toBe(true);
     const d = await rpc("discover_agents", {}, tok);

@@ -131,7 +131,7 @@ describe("ADR-0005 — every identity-establishment path stamps established_at",
   it("#1 force re-register (token auth) establishes AND stamps first_authed_at", async () => {
     const token = await register("est-force");
     expect(established("est-force")).toBeNull();
-    const r = await mcpCall("register_agent", { name: "est-force", role: "worker", capabilities: [], agent_token: token, force: true });
+    const r = await mcpCall("register_agent", { name: "est-force", role: "worker", capabilities: [], agent_token: token, force: true, expected_session_id: getAgentAuthData("est-force")?.session_id });
     expect(JSON.parse(r.result.content[0].text).success).toBe(true);
     expect(established("est-force")).not.toBeNull();
     expect(firstAuthed("est-force")).not.toBeNull(); // token auth → both

@@ -281,11 +281,11 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
       host_shell_pids: [111, 222],
       host_id: "HOST-X",
     });
-    const token = (JSON.parse(reg.resultText ?? "{}") as { agent_token?: string }).agent_token;
-    // Re-register (with the owner's token) reporting a fresh chain. force=true
-    // bypasses the active-session collision guard (the name was just claimed +
-    // still has a live session — this is the same owner re-reporting, not a
-    // concurrent-terminal race).
+    const regJson = JSON.parse(reg.resultText ?? "{}") as { agent_token?: string; agent?: { session_id?: string } };
+    const token = regJson.agent_token;
+    // Re-register (with the owner's token) reporting a fresh chain. ADR-0012:
+    // force is a CAS takeover — carry the session_id we just read; the name was
+    // just claimed + still has a live session, this is the same owner re-reporting.
     await callToolViaHttp(
       daemon.baseUrl,
       "register_agent",
@@ -296,6 +296,7 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
         host_shell_pids: [333],
         host_id: "HOST-X",
         force: true,
+        expected_session_id: regJson.agent?.session_id, // ADR-0012 CAS
       },
       token,
     );
@@ -313,7 +314,8 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
       capabilities: [],
     });
     expect(reg.ok).toBe(true);
-    const token = (JSON.parse(reg.resultText ?? "{}") as { agent_token?: string }).agent_token;
+    const reg3 = JSON.parse(reg.resultText ?? "{}") as { agent_token?: string; agent?: { session_id?: string } };
+    const token = reg3.agent_token;
     expect(token).toBeTruthy();
 
     // The owner relaunches and re-reports a fresh chain + a NEW host_id. force=true
@@ -330,6 +332,7 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
         host_shell_pids: [4242, 4200],
         host_id: "HOST-REFRESHED",
         force: true,
+        expected_session_id: reg3.agent?.session_id, // ADR-0012 CAS
       },
       token,
     );

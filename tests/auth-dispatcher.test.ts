@@ -32,7 +32,7 @@ delete process.env.RELAY_AGENT_CAPABILITIES;
 delete process.env.RELAY_ALLOW_LEGACY;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { closeDb } = await import("../src/db.js");
+const { closeDb, getAgentAuthData } = await import("../src/db.js");
 
 let server: HttpServer;
 let baseUrl: string;
@@ -311,6 +311,7 @@ describe("register_agent re-registration auth (v1.7.1)", () => {
         capabilities: ["spawn", "tasks"], // attempt to grant herself spawn
         agent_token: tok,
         force: true,
+        expected_session_id: getAgentAuthData("rr-caps-locked")?.session_id, // ADR-0012 CAS
       },
     });
     const body = JSON.parse(resp.result.content[0].text);
