@@ -47,6 +47,7 @@ import {
   upsertMcpServer,
   upsertSessionStartHook,
   quoteForHookCommand,
+  canQuoteForHookCommand,
   migrateRawHookCommand,
 } from "./config-merge.js";
 import { installDaemon, type InstallDeps } from "./launchd.js";
@@ -219,8 +220,11 @@ export function moduleRootFromUrl(moduleUrl: string): string {
 
 /** Resolve the install root (repo dir) + the two abs paths the operator's
  *  Claude config needs to point at. */
-function installPaths(): { root: string; distEntry: string; hookScript: string } {
-  const root = moduleRootFromUrl(import.meta.url);
+function installPaths(rootOverride?: string): { root: string; distEntry: string; hookScript: string } {
+  // rootOverride is a TEST seam only (the atomicity controls need a newline-bearing
+  // install root, which the real module URL can never have). Production passes
+  // nothing → the module's own directory.
+  const root = rootOverride ?? moduleRootFromUrl(import.meta.url);
   return {
     root,
     distEntry: path.join(root, "dist", "index.js"),
@@ -295,7 +299,7 @@ function realDaemonDeps(log: (l: string) => void): InstallDeps {
   };
 }
 
-export async function run(argv: string[]): Promise<number> {
+export async function run(argv: string[], rootOverride?: string): Promise<number> {
   let args: ParsedArgs;
   try {
     args = parseArgs(argv);
@@ -415,6 +419,24 @@ export async function run(argv: string[]): Promise<number> {
     : reconcileRelayConfig(existingConfig, defaults);
   // --agent explicitly sets/updates the hook's default agent name (override).
   if (args.agent) reconciled.root.default_agent_name = args.agent;
+
+  const { distEntry, hookScript } = installPaths(rootOverride);
+  // PREFLIGHT (codex #139 v6 P1 — atomicity). We are about to write config.json,
+  // then ~/.claude.json, then the SessionStart hook. If the hook command cannot be
+  // safely quoted (a newline/CR-bearing install root), quoteForHookCommand throws —
+  // and a throw AFTER the first writes is a PARTIAL COMMIT (mcp points at the relay
+  // with no registration hook, and re-running just repeats the half-install). So
+  // validate here, BEFORE any write, and only when we will actually write the hook
+  // (not --config-only, not --skip-hooks). Refuse cleanly, write NOTHING.
+  if (!args.configOnly && !args.skipHooks && !canQuoteForHookCommand(hookScript)) {
+    process.stderr.write(
+      `relay init: refusing — the install path contains a newline/CR: ${JSON.stringify(hookScript)}. ` +
+        `No safe single-line SessionStart hook command exists for it, so nothing was written. Reinstall from a ` +
+        `path without control characters, or re-run with --config-only / --skip-hooks to install without the hook.\n`,
+    );
+    return 1;
+  }
+
   atomicWriteJson(configPath, reconciled.root, 0o600);
   ensureSecureFile(configPath, 0o600);
   process.stdout.write(
@@ -426,8 +448,6 @@ export async function run(argv: string[]): Promise<number> {
     process.stdout.write(`\nDone (config only). Your HTTP secret is in ${configPath}.\n`);
     return 0;
   }
-
-  const { distEntry, hookScript } = installPaths();
 
   // ---- 2. ~/.claude.json — mcpServers deep-merge ---------------------------
   if (!args.skipMcp) {
@@ -451,7 +471,7 @@ export async function run(argv: string[]): Promise<number> {
   if (!args.skipDaemon && process.env.RELAY_SKIP_DAEMON !== "1") {
     const wantsHttp = transport === "http" || transport === "both";
     if (process.platform === "darwin" && wantsHttp) {
-      const { root } = installPaths();
+      const { root } = installPaths(rootOverride);
       const res = await installDaemon(
         {
           nodePath: process.execPath,

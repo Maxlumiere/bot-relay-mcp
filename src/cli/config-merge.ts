@@ -306,11 +306,25 @@ export function upsertSessionStartHook(
 }
 
 /**
- * Is `command` a hook invocation we can PRECISELY, CONSERVATIVELY identify as the
- * relay's SessionStart hook (`hooks/check-relay.sh`)? This is the DETECTION /
- * exact-match predicate. It is used where a false positive is expensive — the
- * installer's dedup and, via the tripwire, the precise-watch set. It is NOT the
- * only relay-hook predicate; see "three predicates, three certainties" below.
+ * Is `command` the relay's SessionStart hook (`hooks/check-relay.sh`)? The
+ * DETECTION / exact-match predicate — used where a false positive is expensive
+ * (the installer's dedup; the tripwire's precise-watch set). NOT the only relay-
+ * hook predicate; see "three predicates, three certainties" below.
+ *
+ * WHAT IT GUARANTEES — and what it does NOT (codex flagged three rounds of
+ * over-claim on this one function; state the limit first). It is PRECISE FOR THE
+ * FORMS WE EMIT: quoteForHookCommand only ever produces a single-quoted path, and
+ * this owns exactly those + the legacy bare no-space path, and rejects the shapes
+ * we never emit (`echo …`, unquoted `$()`/`;`, double-quoted, unquoted-whitespace).
+ * It is NOT a general "is this really a relay invocation" oracle: the single-quote
+ * branch owns ANY `'…/hooks/check-relay.sh'` BY SHAPE, so it DELIBERATELY
+ * OVER-OWNS some foreign quoted paths — e.g. `'/foreign/hooks/check-relay.sh'` and
+ * `'/bin/bash /x/hooks/check-relay.sh'` (which reads as one literal path token, not
+ * a bash call). That over-ownership is WATCH-ONLY: its worst case is a false
+ * tripwire ALARM (the accepted direction), never a destructive migration write
+ * (migration uses exact-literal match, not this). We accept it because
+ * disambiguating a single-quoted string's INTENT is undecidable and the cost is
+ * only an alarm.
  *
  * THE RULE (two forms — init now emits only the first):
  *   - SINGLE-QUOTED `'…'`: inside single quotes every byte is literal, so it is ONE
@@ -411,13 +425,23 @@ export function isRelayCheckHookCommand(command: unknown): boolean {
  * single-quoted form.
  */
 export function quoteForHookCommand(p: string): string {
-  if (/[\r\n]/.test(p)) {
+  if (!canQuoteForHookCommand(p)) {
     throw new Error(
       `[config] refusing to write a hook command for a path containing a newline/CR: ${JSON.stringify(p)} — ` +
         `no safe single-line shell command exists for it. Reinstall from a path without control characters.`,
     );
   }
   return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Would `quoteForHookCommand(p)` succeed? The PREFLIGHT predicate — a single
+ * source with quoteForHookCommand's throw condition, so init can validate BEFORE
+ * it writes anything (a refusal must not be a partial commit — codex #139 v6 P1).
+ * Only a newline/CR-bearing path is unquotable; every other byte single-quotes.
+ */
+export function canQuoteForHookCommand(p: string): boolean {
+  return !/[\r\n]/.test(p);
 }
 
 /**

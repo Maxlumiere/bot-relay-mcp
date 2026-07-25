@@ -29,6 +29,20 @@
  *    predicate would be a proxy — which is exactly how "file-bytes" once stood in
  *    for "the hook fires" and let a matcher flip through.)
  *
+ * COVERAGE BOUNDARY (codex #139 — stated plainly, not left to inference):
+ *  COVERED: every form the installer EMITS. init writes only canonical
+ *    single-quoted, non-CR/LF hook commands (it refuses an unquotable root before
+ *    any write), and those are in the precise-owned region — so the biconditional
+ *    above holds for anything WE write. mcpServers["bot-relay"] and the config.json
+ *    content+mode are covered whole.
+ *  NOT COVERED (known residuals — outside BOTH the precise-owned and the
+ *    ambiguous-legacy buckets): a legacy `sh -c <script>` / interpreter-wrapped
+ *    hook, a DOUBLE-quoted hook command (we never emit one; double quotes don't
+ *    stop $()/backtick), and a newline/CR-bearing command. A test/agent that
+ *    mutated one of those SessionStart entries would not trip. These are not shapes
+ *    the relay produces; re-running `relay init` migrates a raw entry to the
+ *    covered canonical. Documented as a known gap, not implied completeness.
+ *
  * Fails the run if a test writes the RELAY-OWNED region of the operator's real
  * user-scope config. It is the observation-level backstop behind the two
  * by-construction guards (the atomicWriteJson chokepoint and the
