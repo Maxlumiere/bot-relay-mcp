@@ -216,7 +216,11 @@ function parseHostShellPids(raw: string | null | undefined): number[] | null {
  */
 export const ROUTABLE_TERMINAL_STATUSES = ["offline", "closed", "abandoned", "stale"] as const;
 export function isAgentRoutable(row: { session_id?: string | null; agent_status?: string | null }): boolean {
-  return row.session_id != null && !(ROUTABLE_TERMINAL_STATUSES as readonly string[]).includes(row.agent_status ?? "");
+  // Case-INSENSITIVE (codex HIGH #2 P1): a persisted 'OFFLINE' must read the same
+  // terminal state the lowercase display shows — otherwise `routable` disagrees
+  // with its own `agent_status` neighbour in the same row. This is now the ONE
+  // implementation the router (postTaskAuto) and the surface both call.
+  return row.session_id != null && !(ROUTABLE_TERMINAL_STATUSES as readonly string[]).includes((row.agent_status ?? "").toLowerCase());
 }
 export type Routability = "routable" | "unroutable_alive" | "unroutable_offline";
 /**
@@ -5776,9 +5780,6 @@ export function postTaskAuto(
   const tx = db.transaction((): AutoRoutingResult => {
     const placeholders = requiredCapabilities.map(() => "?").join(",");
     const excludeSenderClause = allowSelfAssign ? "" : " AND a.name != ?";
-    // Single-source the terminal-status vocabulary with the operator surface's
-    // routable field (ADR-0015 L4). Fixed compile-time constants, no injection.
-    const terminalIn = ROUTABLE_TERMINAL_STATUSES.map((s) => `'${s}'`).join(", ");
     const bindArgs: (string | number)[] = [...requiredCapabilities];
     if (!allowSelfAssign) bindArgs.push(from);
     bindArgs.push(requiredCapabilities.length);
@@ -5789,37 +5790,37 @@ export function postTaskAuto(
     // corpse that never accepted and was never requeued: a silent black hole,
     // while the caller got routed=true.
     //
-    // PREDICATE, stated deliberately (ADR-0015 L4 — same-signal / no-fourth-
-    // notion-of-alive): routing consumes the RAW SESSION + STATUS COLUMNS
-    // (a.session_id IS NOT NULL AND a.agent_status not terminal), NOT
-    // computeLivenessVerdict. That verdict is the argv/PID *presence* probe — a
-    // DISPLAY signal that reads a still-running process with a DROPPED session
-    // as "alive"; but a task is delivered THROUGH the session, so a dropped
-    // session means "cannot receive work" no matter what the process is doing.
-    // "Can this agent act on a task right now?" is exactly "does it hold a
-    // session?", so the session column is the authorization-grade answer. This
-    // is the third of the three notions that already exist (verdict /
-    // anchor-eligibility / raw columns) — no new one is introduced. A pool with
-    // no live candidate falls through to the queued path below (routed:false),
-    // which the tool contract already promises and tryAssignQueuedTasksTo heals
-    // on the next capable registration.
+    // SINGLE PREDICATE (codex HIGH #2 P1 / ADR-0015 L4): both the router here and
+    // the operator surface (`routable`/`routability` on the agent row) call the
+    // SAME isAgentRoutable() — ONE implementation, so they cannot disagree. The
+    // SQL deliberately NO LONGER duplicates the session/status filter: a
+    // case-sensitive SQL `NOT IN` let a persisted 'OFFLINE' route while the
+    // display normalized it to 'offline' — `routable` disagreeing with its own
+    // neighbour in the same row. The registry is tens of rows, so we fetch the
+    // capability matches (with the columns isAgentRoutable needs) and filter in
+    // JS. Deliberately NOT computeLivenessVerdict — that is the argv/PID
+    // *presence* probe (a display signal that reads a dropped-session live
+    // process as "alive"); a task is delivered THROUGH the session, so
+    // session-holding is the authorization answer. No routable candidate → the
+    // queued path below (routed:false), healed by tryAssignQueuedTasksTo later.
     const candidates = db.prepare(
-      `SELECT a.name, a.last_seen,
+      `SELECT a.name, a.last_seen, a.session_id, a.agent_status,
               (SELECT COUNT(*) FROM tasks t
                  WHERE t.to_agent = a.name AND t.status IN ('posted','accepted')) AS load
          FROM agents a
          JOIN agent_capabilities ac ON ac.agent_name = a.name
         WHERE ac.capability IN (${placeholders})${excludeSenderClause}
-          AND a.session_id IS NOT NULL
-          AND a.agent_status NOT IN (${terminalIn})
         GROUP BY a.name
        HAVING COUNT(DISTINCT ac.capability) = ?
-        ORDER BY load ASC, a.last_seen DESC
-        LIMIT 10`
-    ).all(...bindArgs) as Array<{ name: string; last_seen: string; load: number }>;
+        ORDER BY load ASC, a.last_seen DESC`
+    ).all(...bindArgs) as Array<{
+      name: string; last_seen: string; session_id: string | null; agent_status: string | null; load: number;
+    }>;
+    // The ONE routability predicate — identical to the operator surface's.
+    const routableCandidates = candidates.filter((c) => isAgentRoutable(c));
 
-    if (candidates.length === 0) {
-      log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] candidates=0 → queued`);
+    if (routableCandidates.length === 0) {
+      log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] routable=0/${candidates.length} → queued`);
       db.prepare(
         "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, NULL, ?, ?, ?, 'queued', NULL, ?, ?, ?)"
       ).run(id, from, title, encDescription, priority, timestamp, timestamp, capsJson);
@@ -5835,8 +5836,8 @@ export function postTaskAuto(
       };
     }
 
-    const pick = candidates[0];
-    log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] candidates=${candidates.length} picked=${pick.name} (load=${pick.load})`);
+    const pick = routableCandidates[0];
+    log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] routable=${routableCandidates.length}/${candidates.length} picked=${pick.name} (load=${pick.load})`);
     db.prepare(
       "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?, ?)"
     ).run(id, from, pick.name, title, encDescription, priority, timestamp, timestamp, capsJson);
@@ -5853,7 +5854,7 @@ export function postTaskAuto(
       },
       routed: true,
       assigned_to: pick.name,
-      candidate_count: candidates.length,
+      candidate_count: routableCandidates.length,
     };
   });
 

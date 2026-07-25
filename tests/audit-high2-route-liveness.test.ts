@@ -173,3 +173,30 @@ describe("audit HIGH #2 — routability surface matches the routing predicate (A
     expect(surfaced.routable).toBe(false);
   });
 });
+
+describe("audit HIGH #2 P1 — casing: routable must agree with its own agent_status neighbour", () => {
+  // codex's harm: a persisted UPPERCASE 'OFFLINE' (a legacy/foreign writer) with
+  // the session still present. The old case-sensitive SQL NOT IN let it route
+  // while the display normalized it to 'offline' — routable disagreeing with its
+  // own neighbouring field. One predicate (isAgentRoutable, case-insensitive)
+  // now drives both the router and the surface. Assert the FULL operator row.
+  it("(harm) uppercase 'OFFLINE' with a session → unroutable AND displays 'offline' (no self-disagreement); router refuses", () => {
+    registerAgent("boss", "user", ["tasks"]);
+    registerAgent("legacy", "builder", ["build"]); // session present from register
+    getDb().prepare("UPDATE agents SET agent_status = 'OFFLINE' WHERE name = ?").run("legacy");
+    const r = postTaskAuto("boss", "job", "desc", ["build"], "normal");
+    expect(r.routed).toBe(false); // router (isAgentRoutable) refuses the corpse
+    const row = getAgents().find((a) => a.name === "legacy")!;
+    expect(row.routable).toBe(false); // surface (isAgentRoutable) agrees
+    expect(row.agent_status).toBe("offline"); // normalized display matches the verdict
+  });
+
+  it("(twin) canonical lowercase 'idle' with a session → routable AND routed", () => {
+    registerAgent("boss", "user", ["tasks"]);
+    registerAgent("worker", "builder", ["build"]);
+    const r = postTaskAuto("boss", "job", "desc", ["build"], "normal");
+    expect(r.routed).toBe(true);
+    expect(r.assigned_to).toBe("worker");
+    expect(getAgents().find((a) => a.name === "worker")!.routable).toBe(true);
+  });
+});
