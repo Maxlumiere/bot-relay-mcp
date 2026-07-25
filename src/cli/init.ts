@@ -285,14 +285,16 @@ export function installHook(hookScript: string, settingsPath: string = claudeSet
  * that sends headers then STALLS its body hung init forever). An abort mid-body
  * rejects res.json() → parseable:false → unreadable.
  *
- * UNVERIFIED cross-platform (codex round 4, stated honestly): the claim "Node
- * normalizes the OS connection-refused error to code 'ECONNREFUSED' (incl.
- * Windows WSAECONNREFUSED)" is from Node docs and executed in this fleet ONLY on
- * Node 24.13.0 — NOT on Node 20/22 (which CI covers) and NOT on Windows. Windows
- * is an OPEN verification gap. ACCEPTED fails-closed residuals (all → refuse,
- * the safe direction): a loopback firewall that DROPs instead of REJECTs (no
- * RST → runs to the abort deadline), EACCES, EADDRNOTAVAIL — if loopback itself
- * is broken, refusing to install is correct.
+ * CROSS-PLATFORM verification (stated precisely): the claim "Node normalizes the
+ * OS connection-refused error to code 'ECONNREFUSED' (incl. Windows
+ * WSAECONNREFUSED)" is from Node docs. These probeHealth tests EXECUTE on Linux
+ * Node 20 + 22 in CI (the matrix runs the full suite) and on Node 24.13.0 via
+ * codex; macOS is local-only (the CI macOS job is scoped to the launchd guard,
+ * not the full suite). WINDOWS IS NOT EXECUTED ANYWHERE — there is no Windows
+ * runner in .github/workflows — that is the one OPEN gap. ACCEPTED fails-closed
+ * residuals (all → refuse, the safe direction): a loopback firewall that DROPs
+ * instead of REJECTs (no RST → runs to the abort deadline), EACCES,
+ * EADDRNOTAVAIL — if loopback itself is broken, refusing to install is correct.
  */
 export async function probeHealth(port: number): Promise<HealthProbe> {
   const timeoutMs = Math.max(1, parseInt(process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS || "3000", 10));
