@@ -180,4 +180,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Run 25-tool smoke against isolated relay
+        # RELAY_SMOKE_ONLY marks this as the CI SMOKE invocation (exercise the
+        # always-on gate steps), so the publish-only gates (branch-identity,
+        # CI-green) SKIP here — CI checks out non-main PR branches and cannot
+        # assert its own in-flight run. This is a DEDICATED internal flag, not a
+        # generic CI var: `npm publish` never sets it, and the gate ignores it
+        # during an actual publish anyway (see _relay_is_ci_smoke).
         run: bash scripts/pre-publish-check.sh
+        env:
+          RELAY_SMOKE_ONLY: '1'
