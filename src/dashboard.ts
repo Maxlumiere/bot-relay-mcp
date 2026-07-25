@@ -92,6 +92,23 @@ function pickPublic(obj: Record<string, unknown>, fields: readonly string[]): Re
 }
 
 /**
+ * The HOST of a webhook URL for the unauthenticated view — never the path,
+ * query, or userinfo. A webhook URL like `https://user:pass@host/services/TOKEN`
+ * carries the credential in exactly those parts; `URL.hostname` yields ONLY the
+ * host (no userinfo, no port, no path), so a parser — never a regex that grabs
+ * "everything after :// up to /" — is the safe extractor. A malformed URL → null
+ * (never throw, never fall back to the raw string, which would leak it).
+ */
+function hostOnly(rawUrl: string | null | undefined): string | null {
+  if (!rawUrl) return null;
+  try {
+    return new URL(rawUrl).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * v2.2.0 reactive dashboard — WebSocket push + /api/snapshot refetch.
  * Vanilla JS, no build step, no dependencies. Mounted at GET / + /dashboard.
  *
@@ -100,9 +117,18 @@ function pickPublic(obj: Record<string, unknown>, fields: readonly string[]): Re
  *   - agents: `AgentWithStatus` (`toAgentWithStatus` in db.ts) strips
  *     `token_hash` and exposes `has_token: boolean`. NEVER surfaces the
  *     bcrypt hash or any raw token.
- *   - webhooks: raw `WebhookRecord.secret` is replaced with
- *     `has_secret: boolean` by the dashboard mapper below. NEVER surfaces
- *     the raw HMAC secret.
+ *   - webhooks: the HMAC `secret` IS NOT THE ONLY CREDENTIAL. A webhook `url`
+ *     for an incoming-hook service (Slack/Discord/…) IS itself a credential —
+ *     possession of the string is enough to post as the operator, so an
+ *     unauthenticated caller reading it ACQUIRES that power (ADR-0006: power
+ *     from identity, never network position; who AUTHORED the value is
+ *     irrelevant). This comment's prior version redacted only the field NAMED
+ *     `secret`, declared webhooks handled, and shipped the credential in the
+ *     adjacent `url` — field-name-as-proxy, the birthplace of this leak. By
+ *     classification: `has_secret` (bool) + `event` (WebhookEventEnum, a
+ *     declared set) are structural and exposed; the raw HMAC `secret` never is;
+ *     the `url` is reduced to its `url_host` for an unauthenticated caller (full
+ *     `url` only when authenticated); and the free-text `filter` is excluded.
  *   - messages / tasks: an AUTHENTICATED caller (verified dashboard secret) gets
  *     the full rows — raw `content` / `description` / `result` (ciphertext only
  *     IF a keyring is configured; PLAINTEXT otherwise, since at-rest encryption
@@ -198,14 +224,11 @@ export function snapshotApi(_req: Request, res: Response): void {
         ? { ...a, ...counts }
         : { ...pickPublic(a as unknown as Record<string, unknown>, AGENT_PUBLIC_FIELDS), ...counts };
     });
-    const webhooks = listWebhooks().map((w) => ({
-      id: w.id,
-      url: w.url,
-      event: w.event,
-      filter: w.filter,
-      has_secret: !!w.secret,
-      created_at: w.created_at,
-    }));
+    const webhooks = listWebhooks().map((w) =>
+      authed
+        ? { id: w.id, url: w.url, event: w.event, filter: w.filter, has_secret: !!w.secret, created_at: w.created_at }
+        : { id: w.id, url_host: hostOnly(w.url), event: w.event, has_secret: !!w.secret, created_at: w.created_at },
+    );
 
     const messages = db
       .prepare("SELECT * FROM messages ORDER BY created_at DESC LIMIT 20")
@@ -252,6 +275,13 @@ export function snapshotApi(_req: Request, res: Response): void {
       dashboardPrefs = getDashboardPrefs();
     } catch {
       dashboardPrefs = { theme: "catppuccin", custom_json: null, updated_at: null };
+    }
+    // ADR-0006: `custom_json` is an operator-authored FREE-TEXT theme blob —
+    // withhold it from an unauthenticated caller. The named `theme` is a known
+    // value and stays, so the restricted dashboard still themes. (Applying the
+    // free-text/structural rule past the agent/message/task/webhook lists.)
+    if (!authed && dashboardPrefs && typeof dashboardPrefs === "object") {
+      dashboardPrefs = { ...dashboardPrefs, custom_json: null };
     }
 
     res.json({
@@ -723,7 +753,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
       html += '<div class="row"><div class="row-head">' +
         '<span class="row-title">🪝 ' + esc(w.event) + (w.filter ? ' (filter: ' + esc(w.filter) + ')' : '') + '</span>' +
         '<span class="row-meta">' + fmtTime(w.created_at) + '</span></div>' +
-        '<div class="row-body"><code>' + esc(w.url) + '</code>' + (w.has_secret ? ' · signed' : '') + '</div></div>';
+        '<div class="row-body"><code>' + esc(w.url || w.url_host || '') + '</code>' + (w.has_secret ? ' · signed' : '') + '</div></div>';
     });
     completions.forEach((t) => {
       const preview = t.result_preview || t.description_preview || '';

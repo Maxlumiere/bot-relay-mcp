@@ -44,7 +44,7 @@ delete process.env.RELAY_HTTP_SECRET;
 delete process.env.RELAY_DASHBOARD_SECRET;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { registerAgent, sendMessage, getDb, closeDb } = await import("../src/db.js");
+const { registerAgent, sendMessage, registerWebhook, getDb, closeDb } = await import("../src/db.js");
 const { _resetDashboardWsForTests } = await import("../src/transport/websocket.js");
 
 let server: HttpServer;
@@ -172,6 +172,9 @@ describe("v2.2.0 /api/snapshot — ADR-0006 harm refused (unauthenticated loopba
     task_description: "SECRET-task-description-Td",
     task_result: "SECRET-task-result-Tr",
     task_required_capability: "SECRET-task-reqcap-Tq",
+    webhook_url_path: "SECRET-webhook-urlpath-Wu", // in the URL path → stripped to host
+    webhook_url_userinfo: "SECRET-webhook-userinfo-Wi", // in userinfo → stripped
+    webhook_filter: "SECRET-webhook-filter-Wf", // free-text filter → excluded
   };
 
   function seedAllFreeText(): void {
@@ -191,6 +194,11 @@ describe("v2.2.0 /api/snapshot — ADR-0006 harm refused (unauthenticated loopba
     );
     insTask.run("task-active", "sender", "receiver", S.task_title, S.task_description, "normal", "posted", null, ts, ts, JSON.stringify([S.task_required_capability]));
     insTask.run("task-done", "sender", "receiver", "plain title", "plain desc", "normal", "completed", S.task_result, ts, ts, null);
+    // A webhook whose secret is in the PATH (must reduce to host) and one whose
+    // secret is in the USERINFO (URL.hostname must never include it); plus a
+    // free-text filter (excluded). host `hooks.example.com` is NOT a secret.
+    registerWebhook(`https://hooks.example.com/services/${S.webhook_url_path}`, "message.sent", S.webhook_filter);
+    registerWebhook(`https://user:${S.webhook_url_userinfo}@host.example.com/hook`, "message.sent");
   }
 
   it("(HARM, no keyring) NO operator free-text field reaches an unauthenticated caller", async () => {
@@ -211,6 +219,11 @@ describe("v2.2.0 /api/snapshot — ADR-0006 harm refused (unauthenticated loopba
     expect("content" in m).toBe(false);
     expect((r.json.agents as any[]).some((a) => a.name === "sender")).toBe(true);
     expect((r.json.active_tasks as any[]).some((t) => t.id === "task-active")).toBe(true);
+    // Webhook is still listed (its HOST is safe to show), full url + filter gone.
+    const wh = (r.json.webhooks as any[]).find((w) => w.url_host === "hooks.example.com");
+    expect(wh).toBeDefined();
+    expect("url" in wh).toBe(false);
+    expect("filter" in wh).toBe(false);
   });
 
   it("(S2) process-identifying agent metadata is absent for an unauthenticated caller; presence stays", async () => {
@@ -262,16 +275,18 @@ describe("v2.2.0 /api/snapshot — ADR-0006 innocent twin (authenticated operato
     getDb().prepare("UPDATE agents SET description = ? WHERE name = ?").run("SECRET-desc-Ad", "sender");
     registerAgent("agent-with-title", "r", [], { terminal_title_ref: "my-window" });
     sendMessage("sender", "agent-with-title", "SECRET-content-Mc", "normal");
+    registerWebhook("https://hooks.example.com/services/AUTHED-webhook-path-Wp", "message.sent");
     const r = await getJsonAuthed("/api/snapshot", SECRET);
     expect(r.status).toBe(200);
     expect(r.json.authenticated).toBe(true);
     expect(r.json.content_visibility).toBe("full");
     const body = JSON.stringify(r.json);
-    // The authenticated operator DOES get the free text — proves the guard
-    // restricts by principal, not by breaking the dashboard's content.
+    // The authenticated operator DOES get the free text + full webhook url —
+    // proves the guard restricts by principal, not by breaking the dashboard.
     expect(body).toContain("SECRET-content-Mc"); // message content
     expect(body).toContain("SECRET-desc-Ad"); // agent description
     expect(body).toContain("SECRET-role-Ar"); // agent role
+    expect(body).toContain("AUTHED-webhook-path-Wp"); // full webhook url
     expect(r.json.messages[0].content_preview).toBe("SECRET-content-Mc");
     const ag = (r.json.agents as any[]).find((a) => a.name === "agent-with-title");
     expect(ag.terminal_title_ref).toBe("my-window");
