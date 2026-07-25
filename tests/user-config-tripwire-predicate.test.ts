@@ -10,14 +10,21 @@
  * churn (which rewrites ~/.claude.json on a minutes timescale) no longer trips a
  * ~7-minute suite — while a test writing OUR region still does.
  *
- * Both directions are proven, per the acceptance bar:
- *   NEGATIVE — mutate an UNRELATED part of the file → region unchanged → PASS.
- *   POSITIVE — mutate the relay region (mcpServers["bot-relay"] / our SessionStart
- *              hook) → region changes → FAIL, and for the RIGHT reason.
- * These exercise the pure extractors + the pure decision layer directly, on
- * sandboxed strings/maps — the real ~/ is never touched.
+ * ADR-0015 two-leg rule — EVERY guard is tested by BOTH:
+ *   HARM LEG — attempt the harm through the shipped predicate → assert it FAILS
+ *     (region CHANGES): relay MCP entry rewritten, our hook's command OR matcher
+ *     changed, config.json mode widened with identical bytes, a foreign command
+ *     falsely claimed as ours. Written FROM the harm, not from the implementation.
+ *   INNOCENT TWIN — the benign near-neighbour → assert it PASSES (region
+ *     unchanged): ambient Claude Code churn, a foreign SessionStart hook, key
+ *     reordering, a mode change on the SHARED Claude files.
+ * These exercise the shipped predicate (the pure extractors + regionOf + the
+ * decision layer the globalSetup calls) on sandboxed strings/files — the real ~/
+ * is never touched.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import fs from "fs";
+import os from "os";
 import path from "path";
 import {
   claudeJsonRegion,
@@ -25,6 +32,7 @@ import {
   botRelayConfigRegion,
   changedRegions,
   protectedRegions,
+  regionOf,
 } from "./global-user-config-tripwire.js";
 import { isRelayCheckHookCommand } from "../src/cli/config-merge.js";
 
@@ -114,32 +122,41 @@ describe("tripwire predicate — ~/.claude/settings.json (relay SessionStart hoo
   });
 });
 
-describe("shared ownership classifier — isRelayCheckHookCommand (precise, not substring)", () => {
-  it("ACCEPTS every shape the installer writes", () => {
-    expect(isRelayCheckHookCommand("/Users/x/bot-relay-mcp/hooks/check-relay.sh")).toBe(true); // init raw path
-    expect(isRelayCheckHookCommand("'/Users/x/bot-relay-mcp/hooks/check-relay.sh'")).toBe(true); // quoted (spaces)
-    expect(isRelayCheckHookCommand("'/Users/x/LLMs/Claude AI/bot-relay-mcp/hooks/check-relay.sh'")).toBe(true); // real space-path
-    expect(isRelayCheckHookCommand("bash /root/hooks/check-relay.sh")).toBe(true); // leading interpreter
-    expect(isRelayCheckHookCommand("/root/hooks/check-relay.sh --flag")).toBe(true); // trailing arg
+describe("shared ownership classifier — isRelayCheckHookCommand (reject cases FIRST)", () => {
+  // codex #139: a classifier without reject controls is an accept-list in a
+  // costume. The whole command must BE our hook path, not merely CONTAIN it.
+  it("REJECTS: a foreign command whose ARGUMENT is a relay-shaped path (the codex counterexample)", () => {
+    expect(isRelayCheckHookCommand("echo /foreign/hooks/check-relay.sh")).toBe(false); // <-- the v2 false-positive
+    expect(isRelayCheckHookCommand("cat '/x/hooks/check-relay.sh'")).toBe(false); // quoted arg, opening quote not at index 0
+    expect(isRelayCheckHookCommand("bash /root/hooks/check-relay.sh")).toBe(false); // interpreter prefix — not a shape we write
+    expect(isRelayCheckHookCommand("/root/hooks/check-relay.sh --flag")).toBe(false); // trailing arg
   });
 
-  it("REJECTS foreign commands that merely mention the name (the #128 false-ownership trap)", () => {
-    expect(isRelayCheckHookCommand("echo check-relay.sh")).toBe(false); // bare name, not a path tail
-    expect(isRelayCheckHookCommand("/x/not-hooks/check-relay.sh")).toBe(false); // wrong parent dir
-    expect(isRelayCheckHookCommand("/x/hooks/check-relay.sh.bak")).toBe(false); // not the exact tail
+  it("REJECTS: name-mentions that are not our hook (#128 false-ownership class)", () => {
+    expect(isRelayCheckHookCommand("echo check-relay.sh")).toBe(false); // bare name
     expect(isRelayCheckHookCommand("check-relay.sh")).toBe(false); // basename alone
+    expect(isRelayCheckHookCommand("/x/not-hooks/check-relay.sh")).toBe(false); // wrong parent dir
+    expect(isRelayCheckHookCommand("/x/hooks/check-relay.sh.bak")).toBe(false); // wrong suffix
+    expect(isRelayCheckHookCommand("/x/hooks/check-relay.sh/wrapper.sh")).toBe(false); // our name is a parent DIR
+    expect(isRelayCheckHookCommand("/x/check-relay.sh/hooks/other.sh")).toBe(false); // name in an ancestor dir
+    expect(isRelayCheckHookCommand("")).toBe(false);
     expect(isRelayCheckHookCommand(undefined)).toBe(false);
     expect(isRelayCheckHookCommand(42)).toBe(false);
   });
 
-  it("DIVERGENCE GUARD: the classifier accepts the EXACT command the installer produces", () => {
-    // Pins the classifier to what src/cli/init.ts writes (path.join(root,"hooks",
-    // "check-relay.sh")) and what generate-hooks emits (same path, single-quoted
-    // when it has spaces). If the installer's command shape ever drifts, this fails.
+  it("ACCEPTS: only the single-token path shapes the installer actually writes", () => {
+    expect(isRelayCheckHookCommand("/Users/x/bot-relay-mcp/hooks/check-relay.sh")).toBe(true); // init raw path (no space)
+    expect(isRelayCheckHookCommand("'/Users/x/bot-relay-mcp/hooks/check-relay.sh'")).toBe(true); // single-quoted
+    expect(isRelayCheckHookCommand("'/Users/x/LLMs/Claude AI/bot-relay-mcp/hooks/check-relay.sh'")).toBe(true); // quoted spaced path
+    expect(isRelayCheckHookCommand('"/Users/x/bot-relay-mcp/hooks/check-relay.sh"')).toBe(true); // double-quoted
+    expect(isRelayCheckHookCommand("/Users/x/My%20Dir/bot-relay-mcp/hooks/check-relay.sh")).toBe(true); // %20 fossil — our own broken entry
+  });
+
+  it("DIVERGENCE GUARD: accepts the EXACT command init/generate-hooks produce (fails if the shape drifts)", () => {
     const rootNoSpace = "/opt/relay/bot-relay-mcp";
     const rootSpace = "/Users/x/LLMs/Claude AI/bot-relay-mcp";
-    const initCmd = path.join(rootNoSpace, "hooks", "check-relay.sh"); // init writes the raw path
-    const genQuoted = `'${path.join(rootSpace, "hooks", "check-relay.sh")}'`; // generate-hooks quotes spaced paths
+    const initCmd = path.join(rootNoSpace, "hooks", "check-relay.sh"); // init writes the raw path (no-space install)
+    const genQuoted = `'${path.join(rootSpace, "hooks", "check-relay.sh")}'`; // generate-hooks single-quotes a spaced path
     expect(isRelayCheckHookCommand(initCmd)).toBe(true);
     expect(isRelayCheckHookCommand(genQuoted)).toBe(true);
   });
@@ -174,5 +191,52 @@ describe("tripwire predicate — decision layer + ABSENT handling", () => {
     expect(good).not.toBe(brokenA); // valid → corrupt trips
     expect(brokenA).not.toBe(brokenB); // corrupt one way → corrupt another trips
     expect(brokenA).toMatch(/^UNPARSEABLE:/);
+  });
+});
+
+// codex #139 P1 — the harm is a MODE widening that exposes http_secret with
+// byte-identical content. Exercised through the SHIPPED regionOf() on real files.
+// POSIX only (chmod semantics); Windows mode bits are not meaningful.
+describe.skipIf(process.platform === "win32")("mode leg — ~/.bot-relay/config.json (relay-owned, secret-bearing)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tripwire-mode-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const configPR = (p: string) => ({ path: p, extract: botRelayConfigRegion, label: "config", fingerprintMode: true });
+  const sharedPR = (p: string) => ({ path: p, extract: claudeJsonRegion, label: "shared" }); // fingerprintMode omitted
+
+  it("HARM: config.json chmod 0644 with BYTE-IDENTICAL content → region CHANGES (would FAIL)", () => {
+    const f = path.join(dir, "config.json");
+    fs.writeFileSync(f, '{"http_secret":"s3cr3t","http_port":3777}', { mode: 0o600 });
+    const before = regionOf(configPR(f));
+    fs.chmodSync(f, 0o644); // widen mode, do NOT touch bytes
+    const after = regionOf(configPR(f));
+    expect(before).not.toBe(after); // the P1: a content-only fingerprint would MISS this
+    expect(before).toMatch(/::mode=600$/);
+    expect(after).toMatch(/::mode=644$/);
+  });
+
+  it("INNOCENT TWIN: a mode change on a SHARED Claude file → region UNCHANGED (PASS)", () => {
+    // The distinction victra got wrong and codex corrected: mode is in scope ONLY
+    // for the relay-owned secret-bearing file, out of scope for shared/ambient ones
+    // (folding it in there would re-admit the false-trips this rewrite removed).
+    const f = path.join(dir, "claude.json");
+    fs.writeFileSync(f, JSON.stringify({ mcpServers: { "bot-relay": { command: "node" } } }), { mode: 0o600 });
+    const before = regionOf(sharedPR(f));
+    fs.chmodSync(f, 0o644);
+    const after = regionOf(sharedPR(f));
+    expect(before).toBe(after); // mode out of scope for the shared file
+  });
+
+  it("INNOCENT: config.json identical content AND identical mode → region unchanged", () => {
+    const f = path.join(dir, "config.json");
+    fs.writeFileSync(f, '{"http_secret":"s3cr3t"}', { mode: 0o600 });
+    const before = regionOf(configPR(f));
+    const after = regionOf(configPR(f)); // no mutation
+    expect(before).toBe(after);
   });
 });

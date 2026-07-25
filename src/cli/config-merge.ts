@@ -312,16 +312,23 @@ export function upsertSessionStartHook(
  * (tests/global-user-config-tripwire.ts) so its ownership notion cannot drift
  * from what the installer writes.
  *
- * PRECISE, not a substring: it requires the `/hooks/check-relay.sh` path tail at
- * a token boundary (end-of-string, whitespace, or a shell quote). So it accepts
- * every shape the installer emits — the raw path init writes
- * (`/root/hooks/check-relay.sh`), the single-quoted form quoteForHookCommand
- * emits for paths with spaces (`'/a b/hooks/check-relay.sh'`), and a leading
- * interpreter (`bash /root/hooks/check-relay.sh`) — while REJECTING a foreign
- * command that merely mentions the name (`echo check-relay.sh`) or lives under a
- * different dir (`/x/not-hooks/check-relay.sh`). That rejection is the point: a
- * loose basename/substring match is the false-ownership trap codex rejected in
- * #128 (it would let a guard disable or delete a command it does not own).
+ * PRECISE — the ENTIRE command must BE our hook path, not merely CONTAIN it.
+ * The installer writes the command as ONE token: the absolute path to the hook,
+ * optionally wrapped in a single matching layer of quotes (quoteForHookCommand
+ * single-quotes paths with spaces) — never `bash <path>`, never trailing args.
+ * So we strip one layer of surrounding quotes and require the whole remainder to
+ * END with `/hooks/check-relay.sh`. Unquoted, a whitespace char means there is an
+ * executable/argument split, which our hook never has.
+ *
+ * This is what rejects the #128 false-ownership class — codex's counterexample
+ * `echo /foreign/hooks/check-relay.sh` is UNQUOTED-with-a-space, so the leading
+ * `echo` is caught (a bare substring/tail match would have owned it, disabling or
+ * deleting a command that isn't ours). Also rejected: a wrong parent dir
+ * (`/x/not-hooks/check-relay.sh`), the bare basename, a `.bak`/dir suffix, and a
+ * quoted arg to some other command (the opening quote is not at index 0).
+ * Accepted: init's raw path, generate-hooks' single-quoted spaced path, and a
+ * `%20`-fossil path (still a single token — it is our own broken entry, and the
+ * tripwire must track changes to it).
  *
  * NOTE ON THE upsertSessionStartHook DIVERGENCE (deliberate, pinned by test):
  * upsertSessionStartHook dedups by EXACT command equality (`h.command ===
@@ -330,9 +337,21 @@ export function upsertSessionStartHook(
  * routing its dedup through this classifier would suppress that recovery. So the
  * two ask different questions on purpose; the divergence-guard test asserts this
  * classifier ACCEPTS the exact command init/generate-hooks produce, so the shared
- * shape can never drift silently.
+ * shape can never drift silently. (Latent, out of scope: init writes the raw path
+ * UNQUOTED, so an install root WITH SPACES yields an unquoted spaced command that
+ * is both a broken shell command AND indistinguishable from `echo <path>` — this
+ * classifier rejects it; the real fix is init quoting like generate-hooks.)
  */
 export function isRelayCheckHookCommand(command: unknown): boolean {
   if (typeof command !== "string") return false;
-  return /\/hooks\/check-relay\.sh(?=$|[\s"'])/.test(command);
+  let s = command.trim();
+  if (s.length >= 2) {
+    const q = s[0];
+    if ((q === "'" || q === '"') && s[s.length - 1] === q) {
+      // one matching layer of surrounding quotes → the inside is the whole path
+      return s.slice(1, -1).endsWith("/hooks/check-relay.sh");
+    }
+  }
+  if (/\s/.test(s)) return false; // unquoted whitespace → executable/arg split, not ours
+  return s.endsWith("/hooks/check-relay.sh");
 }

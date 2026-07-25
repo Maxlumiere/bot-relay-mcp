@@ -7,6 +7,28 @@
  * SUITE-WIDE USER-CONFIG TRIPWIRE (2026-07-23 worktree-clobber fix, layer 3;
  * predicate hardened 2026-07-25).
  *
+ * ═══ GUARD CONTRACT (ADR-0015 L1) ═══
+ *  HARM it prevents: a test (or an ambient process) silently writes the RELAY's
+ *    OWN user-scope config and every suite run stays green, so the clobber ships
+ *    (the 2026-07-23 class — nine days silent). Concretely: mcpServers["bot-relay"]
+ *    rewritten/removed; our check-relay.sh SessionStart hook's command OR matcher
+ *    changed (matcher:"never" DISABLES it); ~/.bot-relay/config.json content
+ *    changed, OR its mode widened to expose http_secret.
+ *  PREDICATE it enforces: after the suite, the RELAY-OWNED REGION of each
+ *    protected file is byte-identical to before — region = the bot-relay
+ *    mcpServers subtree; the SessionStart hook entries (command + group matcher)
+ *    that isRelayCheckHookCommand owns; and the whole CONTENT + ACCESS MODE of
+ *    ~/.bot-relay/config.json.
+ *  WHY the predicate implies prevention: every harm above IS a change to one of
+ *    those regions, and nothing the suite legitimately does touches them — relay
+ *    code writes user config only through the sandbox-guarded atomicWriteJson
+ *    chokepoint, and ambient Claude Code churn lives OUTSIDE these regions (other
+ *    mcpServers, other hooks, session keys, and the mode of the SHARED Claude
+ *    files, all deliberately excluded). So region-unchanged ⟺ our config was not
+ *    clobbered. (If that third sentence could not be written honestly, the
+ *    predicate would be a proxy — which is exactly how "file-bytes" once stood in
+ *    for "the hook fires" and let a matcher flip through.)
+ *
  * Fails the run if a test writes the RELAY-OWNED region of the operator's real
  * user-scope config. It is the observation-level backstop behind the two
  * by-construction guards (the atomicWriteJson chokepoint and the
@@ -139,6 +161,18 @@ interface ProtectedRegion {
   path: string;
   extract: (raw: string) => string;
   label: string;
+  /**
+   * Fold the file's access mode into the region. ONLY for ~/.bot-relay/config.json:
+   * it is relay-owned AND can hold `http_secret` (src/config.ts) — a mode-only
+   * widening (chmod 0644 with identical bytes) exposes that secret to every local
+   * user with NO content change, direct harm a content-only fingerprint waves
+   * through (codex #139 P1; the codebase already warns "mode 0644, wider than
+   * recommended 0600"). Deliberately FALSE for the two shared Claude files: those
+   * are Claude-Code-owned + ambient, a mode change there is not a relay-content
+   * clobber, and folding mode in would re-admit the false-trips this rewrite
+   * removed. relay-owned+secret-bearing vs shared+ambient — never collapse them.
+   */
+  fingerprintMode?: boolean;
 }
 
 export function protectedRegions(): ProtectedRegion[] {
@@ -146,7 +180,7 @@ export function protectedRegions(): ProtectedRegion[] {
   return [
     { path: path.join(home, ".claude.json"), extract: claudeJsonRegion, label: 'mcpServers["bot-relay"]' },
     { path: path.join(home, ".claude", "settings.json"), extract: claudeSettingsRegion, label: "relay SessionStart hook (check-relay.sh)" },
-    { path: path.join(home, ".bot-relay", "config.json"), extract: botRelayConfigRegion, label: "~/.bot-relay/config.json (whole file)" },
+    { path: path.join(home, ".bot-relay", "config.json"), extract: botRelayConfigRegion, label: "~/.bot-relay/config.json (content + mode)", fingerprintMode: true },
   ];
 }
 
@@ -158,7 +192,17 @@ export function regionOf(p: ProtectedRegion): string {
   } catch {
     return "ABSENT";
   }
-  return p.extract(raw);
+  let region = p.extract(raw);
+  if (p.fingerprintMode) {
+    let mode = "?";
+    try {
+      mode = (fs.statSync(p.path).mode & 0o777).toString(8);
+    } catch {
+      /* keep "?" — a stat failure is itself a change from a readable file */
+    }
+    region = `${region}::mode=${mode}`;
+  }
+  return region;
 }
 
 export function snapshotRegions(): Map<string, string> {

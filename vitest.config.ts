@@ -11,6 +11,13 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // Vite writes its transform cache (`.vite-temp`, deps optimizer) under cacheDir,
+  // which defaults to `node_modules/.vite`. In a read-only / symlinked dependency
+  // tree (e.g. an isolated audit checkout) that write is EPERM and vitest fails to
+  // start. Honor VITEST_CACHE_DIR so such a checkout can point the cache at a
+  // writable temp dir: `VITEST_CACHE_DIR=$(mktemp -d) npx vitest run <file>`.
+  // Unset → Vite's default, so normal runs are unchanged.
+  cacheDir: process.env.VITEST_CACHE_DIR || undefined,
   test: {
     // 2026-07-23 worktree-clobber fix: fail any run that modifies the REAL
     // ~/.claude.json / ~/.claude/settings.json / ~/.bot-relay/config.json.
