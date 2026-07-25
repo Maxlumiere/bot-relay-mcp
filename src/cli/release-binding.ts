@@ -231,7 +231,27 @@ export async function run(argv: string[]): Promise<number> {
       );
     }
 
-    releaseAgentBinding(args.name);
+    // CAS on the EXACT binding the liveness probe evaluated — "the row I am
+    // writing is the row I looked at" (codex #136 P1). A legitimate fresh rebind
+    // that landed between the probe above and this write rotates session_id +
+    // overwrites the anchor; releasing blind would clear that NEW live binding
+    // and report success, stranding a healthy terminal — the exact write-race
+    // Fork B exists to refuse. changes=0 → the binding moved → refuse, don't
+    // guess. Same shape as a FORCE_PRECONDITION_FAILED loser.
+    const released = releaseAgentBinding(args.name, {
+      session_id: row.session_id ?? null,
+      agent_pid: row.agent_pid ?? null,
+      agent_pid_start: row.agent_pid_start ?? null,
+    });
+    if (!released.changed) {
+      process.stderr.write(
+        `relay release-binding: REFUSING — the binding for "${args.name}" CHANGED since it was probed ` +
+          "(a fresh session rebound between the liveness check and the release). Re-read, NOT released — " +
+          "the current binding was NOT touched. Re-run to evaluate the new binding.\n"
+      );
+      return 3;
+    }
+
     let operator = "unknown";
     try {
       operator = os.userInfo().username || "unknown";

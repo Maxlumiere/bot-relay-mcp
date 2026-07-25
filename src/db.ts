@@ -2715,24 +2715,37 @@ export function markAgentOffline(
  * three hazards are exactly why `relay recover` (a destructive DELETE) was
  * REJECTED as the remedy; see ADR-0012 amended.
  *
- * NO CAS: the operator is releasing a binding they've been told is dead and does
- * not (and should not need to) know the current `session_id`. Idempotent. NEVER
- * forces / registers / takes over, and touches NO mailbox path.
+ * CAS ON THE OBSERVED BINDING (codex #136 P1 — the TOCTOU this arc exists to
+ * kill, at the recovery layer). The caller probed liveness on a row it READ; the
+ * release must prove "the row I am writing is the row I looked at." Without it,
+ * a legitimate fresh rebind landing between the probe and the write (a new
+ * terminal wins `register(force, expected_session_id=<observed>)` → rotates
+ * session_id + overwrites the anchor) gets its LIVE binding cleared and the
+ * command reports SUCCESS — stranding a healthy terminal unwakeable, the exact
+ * outcome the liveness gate was added to prevent. So the UPDATE is predicated on
+ * the full observed binding identity: `session_id` AND `agent_pid` AND
+ * `agent_pid_start`, all `IS`-compared (null-safe) against what the caller read.
+ * changes=0 means the binding moved under us → the caller REFUSES (re-read, not
+ * released) — the same shape as a `FORCE_PRECONDITION_FAILED` loser, deliberately.
  *
- * SAFETY BOUNDARY: this raw helper trusts its caller. The LIVENESS GATE that
- * refuses to release a LIVE binding (which would strand a healthy idle agent
- * unwakeable — the self-inflicted silent-mute this arc exists to kill) lives in
- * the `relay release-binding` CLI (src/cli/release-binding.ts), which calls this
- * ONLY after `computeLivenessVerdict` reads OBSERVED-DEAD (or an explicit
- * `--override`). Do NOT wire a new caller to this helper without that gate.
+ * SAFETY BOUNDARY: this helper enforces the write-race guard but trusts its
+ * caller for the LIVENESS decision. The gate that refuses to release a LIVE
+ * binding (which would strand a healthy idle agent unwakeable — the
+ * self-inflicted silent-mute this arc exists to kill) lives in the `relay
+ * release-binding` CLI (src/cli/release-binding.ts), which calls this ONLY after
+ * `anchorLivenessVerdict` reads OBSERVED-DEAD (or an explicit `--override`). Do
+ * NOT wire a new caller to this helper without that gate.
  */
-export function releaseAgentBinding(name: string): { changed: boolean } {
+export function releaseAgentBinding(
+  name: string,
+  expected: { session_id: string | null; agent_pid: number | null; agent_pid_start: string | null }
+): { changed: boolean } {
   const db = getDb();
   const r = db.prepare(
     "UPDATE agents SET session_id = NULL, host_shell_pids = NULL, agent_pid = NULL, " +
     "agent_pid_start = NULL, last_alive = NULL, agent_status = 'offline', busy_expires_at = NULL " +
-    "WHERE name = ?"
-  ).run(name);
+    "WHERE name = ? AND session_id IS ? AND agent_pid IS ? AND agent_pid_start IS ?"
+  ).run(name, expected.session_id, expected.agent_pid, expected.agent_pid_start);
   // Any anchor/session change invalidates BOTH cached probe verdicts → re-probe.
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);

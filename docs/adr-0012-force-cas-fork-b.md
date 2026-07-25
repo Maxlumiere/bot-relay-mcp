@@ -51,7 +51,7 @@ It **never auto-forces**. It is suppressed when the verdict is already `MUTE` (a
 
 ### 3.4 The recovery command — why `relay release-binding`, not `relay recover`
 
-The thing that is broken is the BINDING, not the IDENTITY. So the remedy clears exactly the binding and preserves the identity: `db.releaseAgentBinding` (`src/db.ts:2729`) NULLs `session_id` + `host_shell_pids` + `agent_pid`/`agent_pid_start` (+ `last_alive`, `busy_expires_at`; sets `agent_status='offline'`) and PRESERVES `token_hash`, `name`, `capabilities`, and `host_id`. A fresh SessionStart on the released row then reads STALE to the LIVE-gate and takes the register path — proven sufficient in `tests/cli-release-binding.test.ts`.
+The thing that is broken is the BINDING, not the IDENTITY. So the remedy clears exactly the binding and preserves the identity: `db.releaseAgentBinding` NULLs `session_id` + `host_shell_pids` + `agent_pid`/`agent_pid_start` (+ `last_alive`, `busy_expires_at`; sets `agent_status='offline'`) and PRESERVES `token_hash`, `name`, `capabilities`, and `host_id` — and the write is a **CAS on the observed binding** (§3.6). A fresh SessionStart on the released row then reads STALE to the LIVE-gate and takes the register path — proven sufficient in `tests/cli-release-binding.test.ts`.
 
 `relay recover <name> --yes` was rejected as the named remedy for **three reasons**, recorded here so the error message can never regress into shipping the cut behaviour back through the front door:
 
@@ -69,6 +69,18 @@ The anchor-only rule is implemented twice: `anchorLivenessVerdict` (TS) for the 
 
 **Message honesty.** `anchorLivenessVerdict` collapses "observed alive (start matched)" and "present-but-unverifiable (no/unreadable start anchor → PID reuse cannot be excluded)" into one `alive` verdict — the RULE is correct (fail toward NOT acting), but the operator MESSAGE must not assert liveness it has not observed. The refusal text branches on whether a start anchor is on record, so it never claims "observed dead" when what it has is "cannot verify." This is message-only — it adds no verdict state and so cannot drift the two probes apart.
 
+### 3.6 The recovery write is ITSELF a TOCTOU — CAS it (codex #136 P1)
+
+**The finding, and it is the most valuable thing this arc produced.** The same defect — *observe state, then act on that observation without proving the state still holds at the moment of the write* — has now appeared THREE times, one layer down each time:
+
+1. **Registration layer** — the original force-TOCTOU (a client ps-check + a non-atomic force). Fixed by the server CAS (§3.1).
+2. **Mailbox-auth layer** — codex's reframe: a CAS *loser* still drains, because mailbox auth reads `session_id` dynamically. Deferred to ADR-0013 (§2/§3.2).
+3. **Recovery-write layer** — the first cut of `release-binding` probed the anchor, decided "dead, safe to release," then wrote `UPDATE … WHERE name = ?` with **no CAS**. Between the probe and the write, a legitimate fresh rebind can land (a new terminal wins `register(force, expected_session_id=<observed>)` → rotates `session_id` + overwrites the anchor with its own live pid). The blind release then clears that NEW live binding and **reports SUCCESS** — stranding a healthy terminal unwakeable, the exact outcome the liveness gate was added to prevent. **We built a whole fork around refusing to act on assumed state, and the remedy itself acted on assumed state.** Reproduced by codex against built `dist/db.js` (old=b579…, live=dd90…, after=null).
+
+**The fix.** `releaseAgentBinding(name, expected)` is now a CONDITIONAL update predicated on the FULL binding identity the probe evaluated: `WHERE name = ? AND session_id IS ? AND agent_pid IS ? AND agent_pid_start IS ?` (`IS`, so NULLs compare null-safe). The claim it makes is "the row I am writing is the row I looked at" — and it makes it on all three fields, not `session_id` alone, because that is the strongest claim the available fields support. `changes = 0` → the binding moved under us → the CLI REFUSES loudly (nonzero exit, empty stdout, "binding changed since it was probed; re-read, NOT released"), the **same shape as a `FORCE_PRECONDITION_FAILED` loser** — deliberately, so it reads as the same thing. No retry, no re-probe loop: it is handed back to the operator. Pinned by the RACE regression in `tests/cli-release-binding.test.ts` (a fresh rebind after the probe SURVIVES the release; verified to FAIL without the CAS).
+
+**The rule for the next person touching a binding write:** never write a binding you merely observed — CAS it on what you observed, or refuse.
+
 ## 4. Explicit non-goals (shipping any = a rejected build)
 
 - **NO** session-bound mailbox auth; **NO** changes to `get_messages` / `get_messages_summary` / `resolve_messages` / recipient-mutation auth. That is **ADR-0013**.
@@ -84,7 +96,7 @@ The dead-anchor probe IS the substrate for Fork A's eligibility leg (codex TIER-
 - CAS invariant — `tests/adr-0012-force-cas-takeover.test.ts` (unchanged, cherry-picked from #132).
 - Anchor conformance — `tests/anchor-liveness-conformance.test.ts` (TS≡bash≡expected; argv-advertised divergence guard).
 - Diagnostic + **negative control** — `tests/check-relay-dead-anchor.test.ts` proves the verdict flips HEALTHY→UNWAKEABLE, and (verified by reverting the diagnostic) that WITHOUT the fix the row prints `VERDICT=HEALTHY` — the false-HEALTHY. Plus no-false-fire (live anchor stays HEALTHY) and unverifiable→`--override`.
-- Remedy — `tests/cli-release-binding.test.ts`: preserves token/name/caps/host_id; REFUSES on a live anchor and mutates nothing; refuses cross-host (unverifiable); `--override` releases with a loud note; sufficiency (post-release LIVE-gate reads STALE → SessionStart re-registers).
+- Remedy — `tests/cli-release-binding.test.ts`: preserves token/name/caps/host_id; REFUSES on a live anchor and mutates nothing; refuses cross-host (unverifiable); `--override` releases with a loud note; sufficiency (post-release LIVE-gate reads STALE → SessionStart re-registers); and the **RACE regression** (§3.6) — a fresh rebind after the probe SURVIVES the release, verified to FAIL without the CAS.
 - Full CI at HEAD (root + extensions/vscode + `npm audit`, GitHub-green at the real HEAD, `npm ci` in the pre-merge gate), then codex-5-5 dual-audit before merge. No npm-publish (Maxime's 2FA gate; version bump deferred to release).
 
 ## 7. Accepted residual

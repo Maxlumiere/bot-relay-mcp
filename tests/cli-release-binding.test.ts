@@ -149,7 +149,11 @@ describe("ADR-0012 Fork B — releaseAgentBinding (db-level, host-independent)",
     const before = getDb().prepare("SELECT * FROM agents WHERE name = ?").get("stale") as Record<string, unknown>;
     expect(before.token_hash, "seed must have a token_hash").toBeTruthy();
 
-    const res = releaseAgentBinding("stale");
+    const res = releaseAgentBinding("stale", {
+      session_id: before.session_id as string | null,
+      agent_pid: before.agent_pid as number | null,
+      agent_pid_start: before.agent_pid_start as string | null,
+    });
     expect(res.changed).toBe(true);
 
     const after = getDb().prepare("SELECT * FROM agents WHERE name = ?").get("stale") as Record<string, unknown>;
@@ -190,10 +194,39 @@ describe("ADR-0012 Fork B — releaseAgentBinding (db-level, host-independent)",
     getDb().prepare("UPDATE agents SET last_seen = ? WHERE name = ?").run(new Date().toISOString(), "stale");
     expect(liveGate(), "a freshly-bound row reads LIVE (skip)").toBe("LIVE");
 
-    releaseAgentBinding("stale");
+    releaseAgentBinding("stale", { session_id: "sess-abc", agent_pid: DEAD_PID, agent_pid_start: null });
     getDb().prepare("UPDATE agents SET last_seen = ? WHERE name = ?").run(new Date().toISOString(), "stale");
     expect(liveGate(), "after release the row reads STALE → hook falls through to register").toBe("STALE");
     closeDb();
+  });
+
+  it("RACE (codex #136 P1): a fresh rebind after the probe SURVIVES the release — CAS refuses the stale write", async () => {
+    // The state the liveness probe observes: dead anchor + session S_old.
+    await seedBinding({ pid: DEAD_PID, start: "old-start", host: "host-X" });
+    const { getDb, releaseAgentBinding } = await import("../src/db.js");
+
+    // What the CLI captured at probe time (the row it read + evaluated as dead).
+    const observed = { session_id: "sess-abc", agent_pid: DEAD_PID, agent_pid_start: "old-start" };
+
+    // Between the probe and the write, a LEGITIMATE fresh rebind lands: a new
+    // terminal wins register(force, expected=S_old) → rotates session_id and
+    // overwrites the anchor with its OWN live pid. (Simulated with a direct
+    // write; the point is the row identity changed under the CLI.)
+    getDb()
+      .prepare("UPDATE agents SET session_id = ?, agent_pid = ?, agent_pid_start = ?, host_shell_pids = ? WHERE name = ?")
+      .run("sess-NEW", LIVE_PID, "new-start", "[333,444]", "stale");
+
+    // Releasing with the STALE observed identity must CAS-fail — NOT clear the
+    // new live binding.
+    const res = releaseAgentBinding("stale", observed);
+    expect(res.changed, "stale-identity release must be refused by the CAS").toBe(false);
+
+    // The NEW live binding SURVIVES intact — the healthy terminal is not stranded.
+    const after = getDb().prepare("SELECT session_id, agent_pid, agent_pid_start, host_shell_pids FROM agents WHERE name = ?").get("stale") as Record<string, unknown>;
+    expect(after.session_id).toBe("sess-NEW");
+    expect(after.agent_pid).toBe(LIVE_PID);
+    expect(after.agent_pid_start).toBe("new-start");
+    expect(after.host_shell_pids).toBe("[333,444]");
   });
 });
 
