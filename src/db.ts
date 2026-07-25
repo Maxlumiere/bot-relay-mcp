@@ -2042,8 +2042,9 @@ const REAPABLE_ORPHAN_WHERE = "established_at IS NULL AND session_id IS NULL";
  */
 function deleteReapableOrphan(db: CompatDatabase, name: string): boolean {
   const r = db.prepare(`DELETE FROM agents WHERE name = ? AND ${REAPABLE_ORPHAN_WHERE}`).run(name);
-  // v2.23.x #140 (hygiene) — an orphan-reap DELETE ends the name's liveness
-  // identity; evict both probe caches UNCONDITIONALLY (widened guard predicate).
+  // v2.23.x #140 — an orphan-reap DELETE ends the name's liveness identity, so
+  // evict both probe caches unconditionally: a stale entry must not outlive the
+  // binding it described and mislabel a re-used name.
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
   if (r.changes > 0) {
@@ -2513,11 +2514,10 @@ export function teardownAgent(
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
   });
   tx();
-  // v2.23.x #140 (hygiene) — a teardown DELETE ends the name's liveness identity;
-  // evict both probe caches UNCONDITIONALLY (same rationale as unregisterAgent).
-  // The widened guard predicate requires it so this sibling delete path can't
-  // drift back to leaving a stale entry that suppresses an argv-scan alive signal
-  // after the name re-registers.
+  // v2.23.x #140 — a teardown DELETE ends the name's liveness identity, so evict
+  // both probe caches unconditionally (same rationale as unregisterAgent): a
+  // stale NEGATIVE entry left on this sibling delete path would suppress an
+  // argv-scan alive signal after the name re-registers.
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
   bumpAuthGeneration(); // ADR-0003: agent row removed → any cached verdict invalid
@@ -2831,13 +2831,12 @@ export function closeAgentSession(
       "WHERE name = ? AND session_id = ?"
     ).run(nowMs, signalKind, name, expectedSessionId);
   }
-  // v2.23.x #140 — SINGLE unconditional dual eviction covering BOTH SQL forms
-  // (refactored from a per-branch eviction so the probe-cache guard's "eviction
-  // is a top-level statement" rule verifies it on every path — the prior
-  // null-branch eviction was nested and structurally invisible to the guard). On
-  // a CAS loser (r.changes===0 — a concurrent rebind moved the session/anchor) a
-  // stale NEGATIVE entry must not survive to label the now-fresh live row `dead`.
-  // Bracing preserves the harm; unconditional fixes it (≤ one extra probe).
+  // v2.23.x #140 — SINGLE unconditional dual eviction covering BOTH SQL forms,
+  // hoisted to the common tail (the prior per-branch null-branch eviction was
+  // nested one level down, so it was easy to miss that it ran on only one path).
+  // On a CAS loser (r.changes===0 — a concurrent rebind moved the session/anchor)
+  // a stale NEGATIVE entry must not survive to label the now-fresh live row
+  // `dead`. Bracing preserves the harm; unconditional fixes it (≤ one extra probe).
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
@@ -3080,13 +3079,13 @@ export function mintAgentToken(
     created = false;
   }
 
-  // v2.23.x #140 (hygiene, guard-required) — mint CREATES (first-mint INSERT) or
-  // REPLACES (force-rotate clears session_id) the name's liveness identity, so
-  // evict both probe caches UNCONDITIONALLY. The behavioural guard caught THIS
-  // writer — not one of the five teardown sites nor register/unregister — proving
-  // the exact "seventh class" the widened predicate exists to stop. (Throw paths
-  // above bypass this: a non-force collision or a changes!==1 rotate mutated
-  // nothing, so there is no fresh binding whose cache could be stale.)
+  // v2.23.x #140 — mint CREATES (first-mint INSERT) or REPLACES (force-rotate
+  // clears session_id) the name's liveness identity, so evict both probe caches
+  // unconditionally. Found during #140 by sweeping for identity writers by
+  // behaviour rather than syntax — mint is neither one of the five teardown sites
+  // nor register/unregister, yet it resets the same identity the caches key on.
+  // (Throw paths above bypass this: a non-force collision or a changes!==1 rotate
+  // mutated nothing, so there is no fresh binding whose cache could be stale.)
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
 
@@ -3430,9 +3429,9 @@ export function registerAgent(
     });
   }
 
-  // v2.23.x #140 (hygiene, guard-required) — registration CREATES (first INSERT)
-  // or REPLACES (re-register rotates session_id) the name's liveness identity, so
-  // evict both probe caches UNCONDITIONALLY on the success path. Concrete harm
+  // v2.23.x #140 — registration CREATES (first INSERT) or REPLACES (re-register
+  // rotates session_id) the name's liveness identity, so evict both probe caches
+  // unconditionally on the success path. Concrete harm
   // prevented: a crashed terminal left a dead-anchor NEGATIVE entry; the relaunch
   // re-registers HERE before its hook restamps the anchor — without this evict the
   // stale negative would SUPPRESS the argv-scan alive signal (computeLiveness-
@@ -3934,14 +3933,12 @@ export function unregisterAgent(name: string, expectedSessionId?: string): boole
   } else {
     result = db.prepare("DELETE FROM agents WHERE name = ?").run(name);
   }
-  // v2.23.x #140 (hygiene, NOT the P1) — deleting a row ENDS the name's liveness
-  // identity, so evict both probe caches UNCONDITIONALLY. This is not a false-
-  // `dead` source (a re-registered name has no anchor yet → computeLivenessVerdict
-  // returns `unknown`, never `dead`), but a stale NEGATIVE entry would SUPPRESS
-  // the argv-scan alive signal during the brief unanchored interval after a
-  // re-register (the negative-cache hit returns before the argv probe runs). The
-  // widened guard predicate — any CREATE/REPLACE/DELETE of a liveness identity
-  // evicts — makes this load-bearing so a future delete path can't reopen the gap.
+  // v2.23.x #140 — deleting a row ENDS the name's liveness identity, so evict
+  // both probe caches unconditionally. This is not a false-`dead` source (a
+  // re-registered name has no anchor yet → computeLivenessVerdict returns
+  // `unknown`, never `dead`), but a stale NEGATIVE entry would SUPPRESS the
+  // argv-scan alive signal during the brief unanchored interval after a
+  // re-register (the negative-cache hit returns before the argv probe runs).
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
   // Only clean up normalized capabilities when the agent row actually went
@@ -5016,11 +5013,10 @@ export function deleteAgentIfAbandoned(name: string, cutoffIso: string): boolean
   const r = db
     .prepare("DELETE FROM agents WHERE name = ? AND last_seen < ?")
     .run(name, cutoffIso);
-  // v2.23.x #140 (hygiene) — a purge DELETE ends the name's liveness identity;
-  // evict both probe caches UNCONDITIONALLY (widened guard predicate). A row this
-  // stale (last_seen past the cutoff) has no live ~5s cache entry in practice,
-  // but the guard treats every DELETE-of-identity uniformly so no purge path can
-  // drift into leaving one.
+  // v2.23.x #140 — a purge DELETE ends the name's liveness identity; evict both
+  // probe caches unconditionally, applied uniformly to every delete-of-identity
+  // path. A row this stale (last_seen past the cutoff) has no live ~5s cache entry
+  // in practice; the eviction is harmless there and keeps the treatment uniform.
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
   if (r.changes > 0) bumpAuthGeneration(); // ADR-0003: agent row removed
