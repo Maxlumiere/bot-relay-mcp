@@ -11,12 +11,14 @@ import { DASHBOARD_BASE_STYLES, DASHBOARD_THEMES } from "./dashboard-styles.js";
 
 /**
  * v2.2.0 Phase 3: decrypt + truncate a content field for dashboard display.
- * 100-char cap matches get_messages_summary (v2.1.6). Narrow expansion of
- * the v2.1 Phase 4d encryption-policy comment: the dashboard is behind
- * dashboardAuthCheck + originCheck + httpHostCheck, so this preview is
- * only reachable by someone who could already call get_messages. Full
- * ciphertext stays untouched in the `content` / `description` / `result`
- * fields for clients that want the raw on-disk form.
+ * 100-char cap matches get_messages_summary (v2.1.6).
+ *
+ * ADR-0006 (2026-07-25): a decrypted preview is OPERATOR-POWER — it exposes
+ * one agent's plaintext mail to whoever holds it, which get_messages grants
+ * ONLY to that agent's own token. It is therefore emitted solely to an
+ * authenticated dashboard caller (see snapshotApi); a caller admitted on
+ * loopback position alone is NOT a principal and never receives it. Full
+ * ciphertext stays in the `content` / `description` / `result` fields.
  */
 const PREVIEW_CAP = 100;
 function previewField(raw: string | null | undefined): string | null {
@@ -24,6 +26,25 @@ function previewField(raw: string | null | undefined): string | null {
   const decrypted = decryptContent(raw) ?? raw;
   if (decrypted.length <= PREVIEW_CAP) return decrypted;
   return decrypted.slice(0, PREVIEW_CAP);
+}
+
+/**
+ * Per-agent fields that identify or locate an agent's PROCESS/SESSION: the
+ * session id (a mailbox-scoping handle), OS process ids, host id, and terminal
+ * title. Under ADR-0006 these are operator-power and must not reach a snapshot
+ * caller admitted on network position alone; presence/status/counts stay
+ * visible so the operational dashboard still works without a secret.
+ */
+const OPERATOR_ONLY_AGENT_FIELDS = [
+  "session_id",
+  "host_shell_pids",
+  "host_id",
+  "terminal_title_ref",
+] as const;
+function redactOperatorAgentFields<T extends object>(a: T): Partial<T> {
+  const copy: Partial<T> = { ...a };
+  for (const f of OPERATOR_ONLY_AGENT_FIELDS) delete (copy as Record<string, unknown>)[f];
+  return copy;
 }
 
 /**
@@ -40,15 +61,17 @@ function previewField(raw: string | null | undefined): string | null {
  *     the raw HMAC secret.
  *   - messages / tasks: raw `content` / `description` / `result` columns
  *     remain at-rest-encrypted ciphertext (`enc1:…` / `enc:<kid>:…`)
- *     in the response, unchanged from v2.1. v2.2.0 ADDS sibling
- *     `content_preview` / `description_preview` / `result_preview`
- *     fields — 100-char decrypted previews for the reactive dashboard.
- *     Narrow Phase 4d policy expansion: the dashboard is gated by
- *     `dashboardAuthCheck` + `originCheck` + `httpHostCheck` + CSRF on
- *     state-changing endpoints, so any caller reaching the preview could
- *     already call `get_messages` for the same decrypted content. See
- *     CHANGELOG v2.2.0 "Policy change for operators" callout for the
- *     operator-facing guidance.
+ *     in every response. The sibling `content_preview` /
+ *     `description_preview` / `result_preview` fields (100-char decrypted
+ *     previews) are OPERATOR-POWER and are emitted ONLY when the caller
+ *     authenticated with a dashboard secret (res.locals.dashboardAuthenticated).
+ *     ADR-0006 (2026-07-25) corrects the prior v2.2.0 note, which claimed any
+ *     caller reaching the preview "could already call get_messages for the
+ *     same content" — FALSE: get_messages is scoped to the caller's OWN inbox
+ *     by its own token and can never return another agent's content, whereas a
+ *     no-secret loopback caller presents no token at all. Location is not a
+ *     principal: an unauthenticated caller gets a `restricted` snapshot with
+ *     previews nulled and process metadata redacted.
  *   - webhook_delivery_log with its `error_text` is NOT returned by
  *     snapshotApi. If a future change adds it, redact internal-looking
  *     paths + IPs before surfacing.
@@ -105,6 +128,14 @@ export function keyringApi(_req: Request, res: Response): void {
  */
 export function snapshotApi(_req: Request, res: Response): void {
   try {
+    // ADR-0006 — "location is not a principal." Operator-power fields
+    // (decrypted content previews + process-identifying agent metadata) are
+    // served ONLY to a caller authenticated with a real dashboard secret.
+    // dashboardAuthCheck sets this true only on a verified secret; a caller
+    // admitted on loopback position alone leaves it false and receives a
+    // `restricted` snapshot. Agent-trust (presence/status/counts) is separate
+    // and stays visible so the operational dashboard works without a secret.
+    const authed = res.locals?.dashboardAuthenticated === true;
     const db = getDb();
     const agentsBase = getAgents();
     // v2.4.1 — per-agent inbox rollup. Additive fields only; the rest of
@@ -113,8 +144,9 @@ export function snapshotApi(_req: Request, res: Response): void {
     const inboxByName = new Map(inboxRows.map((r) => [r.agent_name, r]));
     const agents = agentsBase.map((a) => {
       const ix = inboxByName.get(a.name);
+      const view = authed ? a : redactOperatorAgentFields(a);
       return {
-        ...a,
+        ...view,
         pending_count: ix ? ix.pending_count : 0,
         unread_count: ix ? ix.unread_count : 0,
         last_message_at: ix ? ix.last_message_at : null,
@@ -144,18 +176,21 @@ export function snapshotApi(_req: Request, res: Response): void {
     // v2.2.0 Phase 3: attach 100-char decrypted previews alongside the
     // raw (encrypted) content/description/result fields. Frontend renders
     // the preview; raw stays available for clients that want it.
+    // Previews are operator-power (ADR-0006): only an authenticated caller
+    // receives decrypted plaintext; otherwise null. The raw encrypted column
+    // still ships, so the frontend can show a "authenticate to view" affordance.
     const messagesWithPreview = messages.map((m) => ({
       ...m,
-      content_preview: previewField(m.content),
+      content_preview: authed ? previewField(m.content) : null,
     }));
     const tasksWithPreview = activeTasks.map((t) => ({
       ...t,
-      description_preview: previewField(t.description),
+      description_preview: authed ? previewField(t.description) : null,
     }));
     const completionsWithPreview = recentCompletions.map((t) => ({
       ...t,
-      description_preview: previewField(t.description),
-      result_preview: previewField(t.result),
+      description_preview: authed ? previewField(t.description) : null,
+      result_preview: authed ? previewField(t.result) : null,
     }));
 
     // v2.2.1 P1: surface the server-side default theme alongside the rest
@@ -171,6 +206,10 @@ export function snapshotApi(_req: Request, res: Response): void {
 
     res.json({
       timestamp: new Date().toISOString(),
+      // ADR-0006 visibility signal — never silent: an unauthenticated caller
+      // is told the operator-power fields were withheld, not left guessing.
+      authenticated: authed,
+      content_visibility: authed ? "full" : "restricted",
       agents,
       webhooks,
       messages: messagesWithPreview,

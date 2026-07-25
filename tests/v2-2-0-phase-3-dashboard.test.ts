@@ -154,41 +154,101 @@ describe("v2.2.0 Phase 3 — dashboard HTML", () => {
   });
 });
 
-describe("v2.2.0 Phase 3 — /api/snapshot shape", () => {
-  it("(S1) includes content_preview on messages", async () => {
+// ADR-0006 (2026-07-25): "location is not a principal." Decrypted content
+// previews + process-identifying agent metadata are operator-power and must be
+// REFUSED to a caller admitted on loopback position alone. These are the
+// ADR-0015 harm-attempt legs: getJson presents NO credential (the tokenless /
+// co-resident caller) against a no-secret deployment (both secrets deleted at
+// module top). The prior S1-S3 asserted the leak was correct — the exact
+// "test derived from the implementation defends the hole" failure ADR-0015 names.
+describe("v2.2.0 /api/snapshot — ADR-0006 harm refused (unauthenticated loopback = restricted)", () => {
+  it("(S1) decrypted content_preview is WITHHELD; raw ciphertext column still ships", async () => {
     registerAgent("snap-from", "r", []);
     registerAgent("snap-to", "r", []);
     sendMessage("snap-from", "snap-to", "hello dashboard", "normal");
     const r = await getJson("/api/snapshot");
     expect(r.status).toBe(200);
-    expect(Array.isArray(r.json.messages)).toBe(true);
-    expect(r.json.messages.length).toBeGreaterThan(0);
+    expect(r.json.authenticated).toBe(false);
+    expect(r.json.content_visibility).toBe("restricted");
     const m = r.json.messages[0];
-    // raw (possibly encrypted) content still present for clients that want it
-    expect(typeof m.content).toBe("string");
-    // new decrypted preview field
-    expect(m.content_preview).toBe("hello dashboard");
+    expect(typeof m.content).toBe("string"); // raw column present (encrypted or plain)
+    expect(m.content_preview).toBeNull(); // decrypted plaintext withheld
   });
 
-  it("(S2) long content_preview truncated at 100 chars", async () => {
+  it("(S2) process-identifying agent metadata is redacted; presence stays visible", async () => {
+    registerAgent("agent-with-title", "r", [], { terminal_title_ref: "my-window" });
+    const r = await getJson("/api/snapshot");
+    expect(r.status).toBe(200);
+    const ag = (r.json.agents as any[]).find((a) => a.name === "agent-with-title");
+    expect(ag).toBeDefined(); // the agent is still listed (presence is agent-trust, not operator-power)
+    expect(ag.terminal_title_ref).toBeUndefined();
+    expect(ag.session_id).toBeUndefined();
+    expect(ag.host_shell_pids).toBeUndefined();
+    expect(ag.host_id).toBeUndefined();
+  });
+});
+
+// ADR-0015 innocent twin: an authenticated operator (dashboard secret + valid
+// Bearer) gets the full content — proving the gate refuses the harm without
+// breaking the legitimate operator path. The secret is set for THIS block only.
+describe("v2.2.0 /api/snapshot — ADR-0006 innocent twin (authenticated operator sees full content)", () => {
+  const SECRET = "test-dashboard-secret-abcdefghijklmnopqrstuv";
+  beforeEach(() => {
+    process.env.RELAY_DASHBOARD_SECRET = SECRET;
+  });
+  afterEach(() => {
+    delete process.env.RELAY_DASHBOARD_SECRET;
+  });
+
+  function getJsonAuthed(p: string, bearer: string): Promise<{ status: number; json: any }> {
+    return new Promise((resolve, reject) => {
+      http
+        .get(
+          { host: "127.0.0.1", port, path: p, headers: { Authorization: `Bearer ${bearer}` } },
+          (res) => {
+            let body = "";
+            res.setEncoding("utf8");
+            res.on("data", (c) => (body += c));
+            res.on("end", () =>
+              resolve({ status: res.statusCode ?? 0, json: body ? JSON.parse(body) : null }),
+            );
+          },
+        )
+        .on("error", reject);
+    });
+  }
+
+  it("(A1) authenticated caller receives decrypted previews + full metadata", async () => {
+    registerAgent("snap-from", "r", []);
+    registerAgent("snap-to", "r", []);
+    registerAgent("agent-with-title", "r", [], { terminal_title_ref: "my-window" });
+    sendMessage("snap-from", "snap-to", "hello dashboard", "normal");
+    const r = await getJsonAuthed("/api/snapshot", SECRET);
+    expect(r.status).toBe(200);
+    expect(r.json.authenticated).toBe(true);
+    expect(r.json.content_visibility).toBe("full");
+    expect(r.json.messages[0].content_preview).toBe("hello dashboard");
+    const ag = (r.json.agents as any[]).find((a) => a.name === "agent-with-title");
+    expect(ag.terminal_title_ref).toBe("my-window");
+  });
+
+  it("(A2) authenticated preview still truncates at 100 chars", async () => {
     registerAgent("long-from", "r", []);
     registerAgent("long-to", "r", []);
-    const big = "x".repeat(500);
-    sendMessage("long-from", "long-to", big, "normal");
-    const r = await getJson("/api/snapshot");
+    sendMessage("long-from", "long-to", "x".repeat(500), "normal");
+    const r = await getJsonAuthed("/api/snapshot", SECRET);
     const m = (r.json.messages as any[]).find(
-      (m) => m.from_agent === "long-from" && m.to_agent === "long-to"
+      (m) => m.from_agent === "long-from" && m.to_agent === "long-to",
     );
     expect(m).toBeDefined();
     expect(m.content_preview.length).toBe(100);
   });
 
-  it("(S3) active_tasks carry description_preview; agents carry terminal_title_ref (Phase 1 wire)", async () => {
-    registerAgent("task-owner", "r", []);
-    registerAgent("agent-with-title", "r", [], { terminal_title_ref: "my-window" });
-    const r = await getJson("/api/snapshot");
-    expect(r.status).toBe(200);
-    const ag = (r.json.agents as any[]).find((a) => a.name === "agent-with-title");
-    expect(ag.terminal_title_ref).toBe("my-window");
+  it("(A3) with a secret set, a WRONG bearer is refused (401) — loopback is not a bypass", async () => {
+    registerAgent("snap-from", "r", []);
+    registerAgent("snap-to", "r", []);
+    sendMessage("snap-from", "snap-to", "hello dashboard", "normal");
+    const r = await getJsonAuthed("/api/snapshot", "wrong-secret");
+    expect(r.status).toBe(401);
   });
 });

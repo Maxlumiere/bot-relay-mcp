@@ -580,7 +580,13 @@ export function startHttpServer(port: number, host: string): Server {
       // attacker-controllable; socket IP is not).
       const peerIp = (req.socket.remoteAddress || "").toLowerCase();
       const peerIsLoopback = peerIp === "127.0.0.1" || peerIp === "::1" || peerIp === "::ffff:127.0.0.1" || peerIp === "localhost";
-      if (peerIsLoopback) return next();
+      if (peerIsLoopback) {
+        // Host-trust let this peer through — it presented NO credential.
+        // Downstream handlers (snapshotApi) must treat it as unauthenticated
+        // and withhold cross-agent decrypted content / process metadata.
+        res.locals.dashboardAuthenticated = false;
+        return next();
+      }
       res.status(403).json({
         error: "Dashboard requires a secret",
         hint: "Set RELAY_DASHBOARD_SECRET=<strong-random-string> (or RELAY_HTTP_SECRET) to expose the dashboard on a non-loopback bind.",
@@ -645,6 +651,9 @@ export function startHttpServer(port: number, host: string): Server {
     } else {
       res.setHeader("Set-Cookie", [String(existing), authCookie, csrfCookie]);
     }
+    // A real dashboard secret was verified — this caller IS authenticated and
+    // may receive decrypted content / process metadata in the snapshot.
+    res.locals.dashboardAuthenticated = true;
     next();
   };
 
