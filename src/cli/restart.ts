@@ -24,15 +24,25 @@ import { VERSION } from "../version.js";
 export async function run(argv: string[]): Promise<number> {
   if (argv.includes("--help") || argv.includes("-h")) {
     process.stdout.write(
-      "Usage: relay restart\n\n" +
+      "Usage: relay restart [--dry-run]\n\n" +
         "Restart the local bot-relay launchd daemon so a newly-installed package\n" +
         "version takes effect. Operator-invoked only — `relay init` never bounces a\n" +
-        "running daemon automatically (every agent on this host depends on it).\n",
+        "running daemon automatically (every agent on this host depends on it).\n\n" +
+        "  --dry-run, -n   Report which daemon WOULD be restarted, without touching it.\n",
     );
     return 0;
   }
 
+  // --dry-run reports the decision without running any launchctl mutation — the
+  // affordance whose absence let a smoke test bounce a live daemon (2026-07-25).
+  // A mutating ops command MUST offer a way to preview against a live system.
+  const dryRun = argv.includes("--dry-run") || argv.includes("-n");
+
   if (process.platform !== "darwin") {
+    if (dryRun) {
+      process.stdout.write("[dry-run] launchd restart is macOS-only — no-op on this platform.\n");
+      return 0;
+    }
     // Stream discipline: this is an error path, so guidance goes to stderr.
     process.stderr.write(
       "relay restart: the launchd supervisor is macOS-only.\n" +
@@ -61,6 +71,15 @@ export async function run(argv: string[]): Promise<number> {
   if (!target.label) {
     process.stderr.write(`relay restart: ${target.reason}\n`);
     return 1;
+  }
+
+  if (dryRun) {
+    const boot = target.needsBootstrap ? " (would bootstrap the plist first)" : "";
+    process.stdout.write(
+      `[dry-run] would restart ${target.label}${boot} via: ` +
+        `launchctl kickstart -k gui/${uid}/${target.label}\n`,
+    );
+    return 0;
   }
 
   // If the canonical plist exists but isn't loaded yet, bootstrap before kick.
