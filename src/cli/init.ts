@@ -267,48 +267,63 @@ export function installHook(hookScript: string, settingsPath: string = claudeSet
 }
 
 /**
- * Probe :port/health, DISCRIMINATING "unreachable" (fetch rejects → the port is
- * genuinely free) from "reachable-but-unreadable" (a response came back but the
- * body is empty / non-JSON, or the status is non-2xx). The empty-200 case is
- * real: `curl -s` after a daemon bounce returns an empty body that `res.json()`
- * throws on; treating that throw as "port free" installs a competing daemon
- * (audit HIGH #3). Exported so the fail-closed behavior is tested through the
- * REAL `res.json()` adapter — the harm lives in the adapter, not a stub.
+ * Probe :port/health, DISCRIMINATING "unreachable" (fetch rejects with an
+ * unambiguous ECONNREFUSED → the port is genuinely free) from
+ * "reachable-but-unreadable" (a response came back but the body is empty /
+ * non-JSON, the status is non-2xx, a 3xx, or the body stalls). Exported so the
+ * fail-closed behavior is tested through the REAL `res.json()` adapter — the
+ * harm lives in the adapter, not a stub.
+ *
+ * FAIL CLOSED by ENUMERATING SUCCESS (audit HIGH #3): "the port is free" is a
+ * POSITIVE determination (ECONNREFUSED alone), never the default for "anything
+ * went wrong." Everything else — a 3xx (redirect:"manual", not followed to a
+ * dead target and misread as free), a reset, a timeout/abort, a DNS failure, an
+ * unknown error — is reachable:true → unreadable → refuse.
+ *
+ * The abort timer spans BOTH `fetch` AND `res.json()` in ONE try/finally (codex
+ * round-4 P1: clearing it after fetch left the body read unbounded, so a server
+ * that sends headers then STALLS its body hung init forever). An abort mid-body
+ * rejects res.json() → parseable:false → unreadable.
+ *
+ * UNVERIFIED cross-platform (codex round 4, stated honestly): the claim "Node
+ * normalizes the OS connection-refused error to code 'ECONNREFUSED' (incl.
+ * Windows WSAECONNREFUSED)" is from Node docs and executed in this fleet ONLY on
+ * Node 24.13.0 — NOT on Node 20/22 (which CI covers) and NOT on Windows. Windows
+ * is an OPEN verification gap. ACCEPTED fails-closed residuals (all → refuse,
+ * the safe direction): a loopback firewall that DROPs instead of REJECTs (no
+ * RST → runs to the abort deadline), EACCES, EADDRNOTAVAIL — if loopback itself
+ * is broken, refusing to install is correct.
  */
 export async function probeHealth(port: number): Promise<HealthProbe> {
-  // FAIL CLOSED by ENUMERATING SUCCESS (codex HIGH #3 P1): "the port is free" is
-  // a POSITIVE determination — an unambiguous local ECONNREFUSED — never the
-  // default branch for "anything went wrong." A 3xx (redirect:"manual" so we do
-  // NOT follow it to a dead target and then misread the follow-up refusal as a
-  // free port), a socket reset, a timeout/abort, a DNS failure, or any unknown
-  // error all mean "something is there / we don't know" → reachable:true →
-  // unreadable → refuse. A bounded timeout keeps a black-holed response from
-  // hanging init forever.
   const timeoutMs = Math.max(1, parseInt(process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS || "3000", 10));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal: controller.signal });
-  } catch (err) {
-    const code =
-      (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
-      (err as { code?: string } | null)?.code;
-    if (code === "ECONNREFUSED") {
-      return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
+    let res: Response;
+    try {
+      res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal: controller.signal });
+    } catch (err) {
+      const code =
+        (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
+        (err as { code?: string } | null)?.code;
+      if (code === "ECONNREFUSED") {
+        return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
+      }
+      return { reachable: true, ok: false, parseable: false, body: null }; // reset/timeout/abort/DNS/unknown → fail closed
     }
-    return { reachable: true, ok: false, parseable: false, body: null }; // reset/timeout/abort/DNS/unknown → fail closed
+    // The body read is STILL under the same timer — a server that sends headers
+    // then stalls the body aborts res.json() here instead of hanging forever.
+    let body: unknown = null;
+    let parseable = true;
+    try {
+      body = await res.json();
+    } catch {
+      parseable = false; // malformed OR aborted-mid-body → unreadable → refuse
+    }
+    return { reachable: true, ok: res.ok, parseable, body };
   } finally {
     clearTimeout(timer);
   }
-  let body: unknown = null;
-  let parseable = true;
-  try {
-    body = await res.json();
-  } catch {
-    parseable = false;
-  }
-  return { reachable: true, ok: res.ok, parseable, body };
 }
 
 /** Real launchd deps — the only place init shells out to launchctl / fetch. */

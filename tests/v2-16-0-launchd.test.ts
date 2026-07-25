@@ -364,3 +364,64 @@ describe("installDaemon fail-closed on non-refused fetch errors (real adapter)",
     expect(writes).toEqual([]);
   });
 });
+
+// ============================================================================
+// codex HIGH #3 round-4 P1 — the abort timer must span BOTH fetch AND res.json.
+// Round 3 cleared the timer after fetch, so a server that sent headers then
+// stalled its body hung init forever. Exercised through the REAL adapter.
+// ============================================================================
+describe("installDaemon fail-closed on a STALLED body (real adapter)", () => {
+  function rawServer(handler: http.RequestListener): Promise<{ port: number; close: () => Promise<void> }> {
+    const sockets = new Set<import("net").Socket>();
+    const srv = http.createServer(handler);
+    srv.on("connection", (s) => {
+      sockets.add(s);
+      s.on("close", () => sockets.delete(s));
+    });
+    return new Promise((resolve) => {
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address();
+        const port = typeof addr === "object" && addr ? addr.port : 0;
+        resolve({
+          port,
+          close: () =>
+            new Promise<void>((r) => {
+              for (const s of sockets) s.destroy();
+              srv.close(() => r());
+            }),
+        });
+      });
+    });
+  }
+
+  it("(harm) headers sent then body STALLS → bounded timeout → unreadable → REFUSE, and does NOT hang", async () => {
+    process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS = "200";
+    const s = await rawServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"status":'); // partial body, never res.end()
+    });
+    const { deps, writes, bootstraps } = makeDeps({ fetchHealth: probeHealth, launchctlList: () => "" });
+    const start = Date.now();
+    const res = await installDaemon({ ...BASE_OPTS, port: s.port }, deps, "/home/u");
+    const elapsed = Date.now() - start;
+    delete process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS;
+    await s.close();
+    expect(res.decision.action).toBe("skip-unreadable");
+    expect(res.installed).toBe(false);
+    expect(writes).toEqual([]);
+    expect(bootstraps).toEqual([]);
+    expect(elapsed).toBeLessThan(2000); // proves the timer spans the body read (would hang otherwise)
+  });
+
+  it("(twin) a COMPLETE 200 relay body reads fine → classified relay → skip (no double-load, no hang)", async () => {
+    const s = await rawServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", version: "9.9.9", protocol_version: "2.4.0" }));
+    });
+    const { deps, writes } = makeDeps({ fetchHealth: probeHealth, launchctlList: () => "" });
+    const res = await installDaemon({ ...BASE_OPTS, port: s.port }, deps, "/home/u");
+    await s.close();
+    expect(res.decision.action).toBe("skip-relay-present"); // complete body read + classified
+    expect(writes).toEqual([]);
+  });
+});
