@@ -5743,6 +5743,27 @@ export function postTaskAuto(
     const bindArgs: (string | number)[] = [...requiredCapabilities];
     if (!allowSelfAssign) bindArgs.push(from);
     bindArgs.push(requiredCapabilities.length);
+    // v2.24 (audit HIGH #2) — ROUTE ONLY TO A LIVE AGENT. Previously the
+    // candidate set was capability-only, so a registered-but-closed agent (its
+    // terminal gone, session dropped) stayed a candidate and — with load 0 —
+    // sorted AHEAD of live busy agents, so post_task_auto handed work to a
+    // corpse that never accepted and was never requeued: a silent black hole,
+    // while the caller got routed=true.
+    //
+    // PREDICATE, stated deliberately (ADR-0015 L4 — same-signal / no-fourth-
+    // notion-of-alive): routing consumes the RAW SESSION + STATUS COLUMNS
+    // (a.session_id IS NOT NULL AND a.agent_status not terminal), NOT
+    // computeLivenessVerdict. That verdict is the argv/PID *presence* probe — a
+    // DISPLAY signal that reads a still-running process with a DROPPED session
+    // as "alive"; but a task is delivered THROUGH the session, so a dropped
+    // session means "cannot receive work" no matter what the process is doing.
+    // "Can this agent act on a task right now?" is exactly "does it hold a
+    // session?", so the session column is the authorization-grade answer. This
+    // is the third of the three notions that already exist (verdict /
+    // anchor-eligibility / raw columns) — no new one is introduced. A pool with
+    // no live candidate falls through to the queued path below (routed:false),
+    // which the tool contract already promises and tryAssignQueuedTasksTo heals
+    // on the next capable registration.
     const candidates = db.prepare(
       `SELECT a.name, a.last_seen,
               (SELECT COUNT(*) FROM tasks t
@@ -5750,6 +5771,8 @@ export function postTaskAuto(
          FROM agents a
          JOIN agent_capabilities ac ON ac.agent_name = a.name
         WHERE ac.capability IN (${placeholders})${excludeSenderClause}
+          AND a.session_id IS NOT NULL
+          AND a.agent_status NOT IN ('offline','closed','abandoned','stale')
         GROUP BY a.name
        HAVING COUNT(DISTINCT ac.capability) = ?
         ORDER BY load ASC, a.last_seen DESC
@@ -5876,6 +5899,12 @@ export interface HealthReassignment {
   triggered_by: string;
   from_agent: string;
   required_capabilities: string[] | null;
+  /** Why the task was requeued — 'lease-expired' (an accepted task whose
+   *  assignee stopped renewing its lease) or 'assignee-gone-before-accept' (a
+   *  task routed to an agent whose session dropped before it accepted — audit
+   *  HIGH #2). Lets callers/webhooks distinguish a normal lease timeout from a
+   *  route to a vanished agent. */
+  reason: "lease-expired" | "assignee-gone-before-accept";
 }
 
 /**
@@ -5906,6 +5935,75 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
   //   (c) assignee is NOT in busy/away with an unexpired TTL
   // busy_expires_at < now → shield has lapsed, agent is no longer protected.
   const nowIsoForStatus = now();
+  const scanLimit = Math.max(1, Math.min(500, parseInt(process.env.RELAY_HEALTH_SCAN_LIMIT || "50", 10)));
+  const requeued: HealthReassignment[] = [];
+
+  // ===== POSTED-BUT-NEVER-ACCEPTED ORPHANS (audit HIGH #2) — always runs =====
+  // postTaskAuto now routes only to a live-session agent, but an agent can drop
+  // its session in the window between 'posted' and 'accepted' (a VS Code reload,
+  // a crash). Such a task is status='posted' with lease_renewed_at NULL, so the
+  // accepted-lease scan below never matches it and it dead-ends forever.
+  // Requeue it to the pool — LOUDLY: routing to an agent that then vanished is
+  // an anomaly the operator must SEE, not a silent redirect (the black hole in
+  // a new guise). Same session predicate as the postTaskAuto candidate filter:
+  // assignee unregistered OR holding no session. A short grace lets a
+  // just-posted task be accepted / a brief reconnect recover before we step in.
+  const postedGraceSec = Math.max(1, parseInt(process.env.RELAY_POSTED_ORPHAN_GRACE_SECONDS || "120", 10));
+  const postedThreshold = new Date(Date.now() - postedGraceSec * 1000).toISOString();
+  const postedOrphans = db.prepare(
+    `SELECT t.id, t.to_agent, t.from_agent, t.required_capabilities
+       FROM tasks t
+      WHERE t.status = 'posted'
+        AND t.lease_renewed_at IS NULL
+        AND t.to_agent IS NOT NULL
+        AND t.updated_at < ?
+        AND (
+          t.to_agent NOT IN (SELECT name FROM agents)
+          OR t.to_agent IN (SELECT name FROM agents WHERE session_id IS NULL)
+        )
+      ORDER BY t.updated_at ASC
+      LIMIT ?`,
+  ).all(postedThreshold, scanLimit) as Array<{
+    id: string; to_agent: string; from_agent: string; required_capabilities: string | null;
+  }>;
+  if (postedOrphans.length > 0) {
+    // CAS re-checks status='posted' + lease NULL + assignee-still-gone, so an
+    // agent that accepted or reconnected between SELECT and UPDATE keeps its task.
+    const casRequeuePosted = db.prepare(
+      `UPDATE tasks SET to_agent = NULL, status = 'queued', updated_at = ?
+        WHERE id = ?
+          AND status = 'posted'
+          AND lease_renewed_at IS NULL
+          AND to_agent = ?
+          AND (
+            to_agent NOT IN (SELECT name FROM agents)
+            OR to_agent IN (SELECT name FROM agents WHERE session_id IS NULL)
+          )`,
+    );
+    for (const row of postedOrphans) {
+      const result = casRequeuePosted.run(now(), row.id, row.to_agent);
+      if (result.changes === 1) {
+        log.warn(
+          `[health] task ${row.id} was routed to "${row.to_agent}" which is gone (no live session) and never accepted it — requeued to the pool (triggered_by=${triggeredBy})`,
+        );
+        let reqCaps: string[] | null = null;
+        if (row.required_capabilities) {
+          try { reqCaps = JSON.parse(row.required_capabilities) as string[]; } catch { reqCaps = null; }
+        }
+        requeued.push({
+          task_id: row.id,
+          previous_agent: row.to_agent,
+          triggered_by: triggeredBy,
+          from_agent: row.from_agent,
+          required_capabilities: reqCaps,
+          reason: "assignee-gone-before-accept",
+        });
+      }
+      // changes===0 → agent accepted or reconnected between SELECT and UPDATE; correct to skip.
+    }
+  }
+
+  // ===== ACCEPTED-LEASE-EXPIRED scan (existing v2.0 / #26 path) =====
   const staleCount = db.prepare(
     `SELECT COUNT(*) AS c
        FROM tasks t
@@ -5930,9 +6028,8 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
           )
         )`
   ).get(threshold, threshold, nowIsoForStatus) as { c: number };
-  if (staleCount.c === 0) return [];
+  if (staleCount.c === 0) return requeued;
 
-  const scanLimit = parseInt(process.env.RELAY_HEALTH_SCAN_LIMIT || "50", 10);
   const stale = db.prepare(
     `SELECT t.id, t.to_agent, t.from_agent, t.lease_renewed_at, t.required_capabilities
        FROM tasks t
@@ -5958,11 +6055,10 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
         )
       ORDER BY t.lease_renewed_at ASC
       LIMIT ?`
-  ).all(threshold, threshold, nowIsoForStatus, Math.max(1, Math.min(500, scanLimit))) as Array<{
+  ).all(threshold, threshold, nowIsoForStatus, scanLimit) as Array<{
     id: string; to_agent: string; from_agent: string; lease_renewed_at: string; required_capabilities: string | null;
   }>;
 
-  const requeued: HealthReassignment[] = [];
   // CAS ensures we only requeue the exact row we inspected. Re-check agent
   // liveness AND agent_status/TTL inside the CAS as belt-and-suspenders — a
   // concurrent touchAgent can bump last_seen between SELECT and UPDATE, and
@@ -6008,6 +6104,7 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
         triggered_by: triggeredBy,
         from_agent: row.from_agent,
         required_capabilities: reqCaps,
+        reason: "lease-expired",
       });
     }
     // changes===0 means the assignee heartbeated between our SELECT and UPDATE — no requeue, correct outcome.
