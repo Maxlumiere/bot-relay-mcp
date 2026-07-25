@@ -49,6 +49,24 @@ step() {
   fi
 }
 
+# Is this the CI SMOKE invocation (running the whole gate to exercise the
+# always-on steps), as opposed to an actual publish? The publish-only gates
+# (branch-identity, CI-green) are meaningless in CI — it checks out non-main PR
+# branches and cannot assert its own in-flight run is green — so they SKIP here.
+#
+# The signal is the DEDICATED, INTERNAL RELAY_SMOKE_ONLY=1 that ci.yml sets on the
+# smoke step — NOT a generic CI env var. `GITHUB_ACTIONS` was the first cut and it
+# is a SILENT BYPASS (codex #138 P1): `npm publish` inherits it in any CI-ish
+# shell, and anyone can `GITHUB_ACTIONS=true npm publish` locally to skip both
+# gates with no audit trail. A generic CI marker is not authorization for a manual
+# publish. Belt-and-suspenders: NEVER treat it as smoke during a real publish
+# (npm sets npm_lifecycle_event=prepublishOnly), so `RELAY_SMOKE_ONLY=1 npm
+# publish` cannot bypass either. The ONLY sanctioned off-main *publish* path is the
+# explicit RELAY_PUBLISH_ALLOW_NONMAIN=1, which prints both SHAs.
+_relay_is_ci_smoke() {
+  [ "${RELAY_SMOKE_ONLY:-}" = "1" ] && [ "${npm_lifecycle_event:-}" != "prepublishOnly" ]
+}
+
 # --- 1. TypeScript ---
 step "tsc --noEmit" npx tsc --noEmit || exit 1
 
@@ -547,15 +565,14 @@ step "25-tool + CLI smoke (isolated relay)" smoke_25_isolated || exit 1
 # deliberate, never the default, and it PRINTS exactly what it is overriding so an
 # off-main publish can never be silent.
 branch_identity_gate() {
-  # PUBLISH-ONLY. This gate also runs inside CI's 25-tool smoke (which invokes the
-  # whole script), and CI checks out PR branches that are DELIBERATELY not main —
-  # so enforcing here would red every non-main PR. This repo never publishes from
-  # CI (npm publish is manual + local + 2FA), so in a GitHub Actions runner the
-  # check is not applicable: SKIP loudly. It still ENFORCES everywhere a real
-  # publish or local pre-publish dry-run happens (GITHUB_ACTIONS unset). This
-  # mirrors ci_green_gate below, which is likewise tolerant in CI by design.
-  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-    echo "  SKIP  branch-identity is a publish-only check; not applicable in CI (branch is intentionally not main, no publish happens here)."
+  # PUBLISH-ONLY. The 25-tool smoke runs the whole script on non-main PR branches;
+  # enforcing there would red every PR. Skip ONLY for the CI smoke, keyed on the
+  # dedicated RELAY_SMOKE_ONLY (see _relay_is_ci_smoke) — never on a generic CI var
+  # a publish would inherit. It ENFORCES for every actual publish + local
+  # pre-publish dry-run. A non-main *publish* still has exactly one sanctioned
+  # skip: the explicit RELAY_PUBLISH_ALLOW_NONMAIN=1 below, which prints both SHAs.
+  if _relay_is_ci_smoke; then
+    echo "  SKIP  branch-identity is a publish-only check; RELAY_SMOKE_ONLY set (CI smoke, not a publish)."
     return 0
   fi
   if ! command -v git >/dev/null 2>&1; then
@@ -637,12 +654,13 @@ ci_green_gate() {
       # line of work exists to end). A commit with no CI run has not been proven
       # green on the matrix — refuse rather than "proceed at own risk". Push the
       # commit and let CI run, or fix why the run is missing.
-      # EXCEPT in CI itself: the smoke job runs this gate while its own ci.yml run
-      # is in flight, and if gh can't resolve that run it reads "no-run" — which
-      # here is a query artifact, not an unverified publish. Keep it a WARN in CI
-      # (publish-only FAIL applies to a real local publish, GITHUB_ACTIONS unset).
-      if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-        echo "  WARN  no ci.yml run resolved for $head_sha in CI — tolerated (this run is in flight; publish-only gate)."
+      # EXCEPT for the CI smoke itself: it runs this gate while its own ci.yml run
+      # is in flight, and if gh can't resolve that run it reads "no-run" — a query
+      # artifact, not an unverified publish. Tolerated only under the dedicated
+      # RELAY_SMOKE_ONLY (see _relay_is_ci_smoke) — never a generic CI var, and
+      # never during an actual publish. The FAIL applies to a real local publish.
+      if _relay_is_ci_smoke; then
+        echo "  WARN  no ci.yml run resolved for $head_sha during the CI smoke (RELAY_SMOKE_ONLY) — tolerated; this run is in flight."
         return 0
       fi
       echo "  FAIL  GitHub has NO ci.yml run for $head_sha — refusing to publish unverified."

@@ -57,14 +57,23 @@ function runGateFn(
 ): { code: number; out: string } {
   const harness =
     `PROJECT_ROOT="${REPO_ROOT}"\n` +
+    // the gate fns call the shared _relay_is_ci_smoke helper — load it too.
+    `eval "$(awk '/^_relay_is_ci_smoke\\(\\) \\{/,/^\\}/' "${GATE}")"\n` +
     `eval "$(awk '/^${fnName}\\(\\) \\{/,/^\\}/' "${GATE}")"\n` +
     `${fnName}\n`;
   const r = spawnSync("bash", ["-c", harness], {
     encoding: "utf8",
-    // GITHUB_ACTIONS/CI cleared by default so the ENFORCEMENT branches are
-    // deterministic even when this test itself runs in CI (the gate skips under
-    // GitHub Actions by design); a scenario opts INTO CI by passing them in `env`.
-    env: { PATH: `${binDir}:${process.env.PATH}`, GITHUB_ACTIONS: "", CI: "", ...env },
+    // The skip signals are cleared by default so the ENFORCEMENT branches are
+    // deterministic even when this test itself runs in CI (which sets GITHUB_ACTIONS
+    // + RELAY_SMOKE_ONLY). A scenario opts into a context by passing them in `env`.
+    env: {
+      PATH: `${binDir}:${process.env.PATH}`,
+      GITHUB_ACTIONS: "",
+      CI: "",
+      RELAY_SMOKE_ONLY: "",
+      npm_lifecycle_event: "",
+      ...env,
+    },
   });
   return { code: r.status ?? -1, out: (r.stdout ?? "") + (r.stderr ?? "") };
 }
@@ -119,18 +128,42 @@ describe("v2.23.0 pre-publish — branch-identity gate", () => {
     expect(r.out).toMatch(/NOT verified-equal to origin\/main/);
   });
 
-  it("CI-SKIP: under GITHUB_ACTIONS a non-main branch is SKIPPED, not failed (publish-only; CI runs on PR branches)", () => {
-    // This is the regression for the CI break: the 25-tool smoke runs the whole
-    // gate on a PR branch (HEAD != origin/main); enforcing there red-lined every
-    // non-main PR. In CI it must SKIP.
+  it("CI-SMOKE SKIP: RELAY_SMOKE_ONLY (not a publish) on a non-main branch → SKIP, not fail", () => {
+    // The 25-tool smoke runs the whole gate on a PR branch (HEAD != origin/main);
+    // enforcing there red-lined every non-main PR. The dedicated smoke flag skips.
     const r = runGateFn("branch_identity_gate", {
       MOCK_HEAD: SHA_A,
-      MOCK_ORIGIN: SHA_B, // mismatch — but CI skips before comparing
-      GITHUB_ACTIONS: "true",
+      MOCK_ORIGIN: SHA_B, // mismatch — the smoke skips before comparing
+      RELAY_SMOKE_ONLY: "1",
     });
     expect(r.code, r.out).toBe(0);
     expect(r.out).toMatch(/SKIP/);
-    expect(r.out).toMatch(/publish-only/i);
+    expect(r.out).toMatch(/RELAY_SMOKE_ONLY/);
+  });
+
+  it("SPOOF REJECTED (codex #138 P1): GITHUB_ACTIONS=true alone does NOT skip — a non-main publish FAILS", () => {
+    // A generic CI marker is not authorization for a manual publish. The old cut
+    // skipped on GITHUB_ACTIONS; this proves that hole is closed.
+    const r = runGateFn("branch_identity_gate", {
+      MOCK_HEAD: SHA_A,
+      MOCK_ORIGIN: SHA_B,
+      GITHUB_ACTIONS: "true", // spoof — must be ignored
+    });
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/HEAD is NOT origin\/main/);
+  });
+
+  it("SPOOF REJECTED: RELAY_SMOKE_ONLY=1 during an ACTUAL publish (prepublishOnly) does NOT bypass → FAILS", () => {
+    // Belt-and-suspenders: the smoke flag is never honored inside npm publish, so
+    // `RELAY_SMOKE_ONLY=1 npm publish` from a non-main checkout is still rejected.
+    const r = runGateFn("branch_identity_gate", {
+      MOCK_HEAD: SHA_A,
+      MOCK_ORIGIN: SHA_B,
+      RELAY_SMOKE_ONLY: "1",
+      npm_lifecycle_event: "prepublishOnly",
+    });
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/HEAD is NOT origin\/main/);
   });
 });
 
@@ -155,11 +188,17 @@ describe("v2.23.0 pre-publish — CI green-gate: no-run promoted WARN→FAIL", (
     expect(r.out).toMatch(/still running/);
   });
 
-  it("CI-tolerant: no-run under GITHUB_ACTIONS stays WARN (exit 0) — the FAIL is publish-only", () => {
-    // In CI the gate runs while its own ci.yml run is in flight; a gh no-run
-    // reading there is a query artifact, not an unverified publish.
-    const r = runGateFn("ci_green_gate", { MOCK_HEAD: SHA, MOCK_CI: "no-run", GITHUB_ACTIONS: "true" });
+  it("CI-SMOKE tolerant: no-run under RELAY_SMOKE_ONLY stays WARN (exit 0) — the FAIL is publish-only", () => {
+    // The smoke runs while its own ci.yml run is in flight; a gh no-run there is a
+    // query artifact, not an unverified publish. Only the dedicated smoke flag.
+    const r = runGateFn("ci_green_gate", { MOCK_HEAD: SHA, MOCK_CI: "no-run", RELAY_SMOKE_ONLY: "1" });
     expect(r.code, r.out).toBe(0);
     expect(r.out).toMatch(/tolerated/);
+  });
+
+  it("SPOOF REJECTED: no-run under GITHUB_ACTIONS alone still FAILS (generic CI var grants nothing)", () => {
+    const r = runGateFn("ci_green_gate", { MOCK_HEAD: SHA, MOCK_CI: "no-run", GITHUB_ACTIONS: "true" });
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/NO ci\.yml run/);
   });
 });
