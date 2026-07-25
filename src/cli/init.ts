@@ -276,11 +276,30 @@ export function installHook(hookScript: string, settingsPath: string = claudeSet
  * REAL `res.json()` adapter — the harm lives in the adapter, not a stub.
  */
 export async function probeHealth(port: number): Promise<HealthProbe> {
+  // FAIL CLOSED by ENUMERATING SUCCESS (codex HIGH #3 P1): "the port is free" is
+  // a POSITIVE determination — an unambiguous local ECONNREFUSED — never the
+  // default branch for "anything went wrong." A 3xx (redirect:"manual" so we do
+  // NOT follow it to a dead target and then misread the follow-up refusal as a
+  // free port), a socket reset, a timeout/abort, a DNS failure, or any unknown
+  // error all mean "something is there / we don't know" → reachable:true →
+  // unreadable → refuse. A bounded timeout keeps a black-holed response from
+  // hanging init forever.
+  const timeoutMs = Math.max(1, parseInt(process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS || "3000", 10));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${port}/health`);
-  } catch {
-    return { reachable: false, ok: false, parseable: false, body: null };
+    res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal: controller.signal });
+  } catch (err) {
+    const code =
+      (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
+      (err as { code?: string } | null)?.code;
+    if (code === "ECONNREFUSED") {
+      return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
+    }
+    return { reachable: true, ok: false, parseable: false, body: null }; // reset/timeout/abort/DNS/unknown → fail closed
+  } finally {
+    clearTimeout(timer);
   }
   let body: unknown = null;
   let parseable = true;

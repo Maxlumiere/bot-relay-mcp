@@ -307,3 +307,60 @@ describe("chooseRestartTarget — pick or refuse (audit HIGH #3)", () => {
     expect(t.reason).toContain("relay init");
   });
 });
+
+// ============================================================================
+// codex HIGH #3 P1 — a fail-open caused by an over-broad catch is repaired by
+// enumerating the SUCCESS condition: ONLY an unambiguous ECONNREFUSED means the
+// port is free. A non-followed 3xx, a socket reset, and a timeout must all be
+// unreadable → REFUSE, exercised through the REAL probeHealth adapter.
+// ============================================================================
+describe("installDaemon fail-closed on non-refused fetch errors (real adapter)", () => {
+  function rawServer(handler: http.RequestListener): Promise<{ port: number; close: () => Promise<void> }> {
+    return new Promise((resolve) => {
+      const srv = http.createServer(handler);
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address();
+        const port = typeof addr === "object" && addr ? addr.port : 0;
+        resolve({ port, close: () => new Promise<void>((r) => srv.close(() => r())) });
+      });
+    });
+  }
+
+  it("(harm) a 3xx redirect (to a dead target) is NOT followed → unreadable → REFUSE", async () => {
+    const s = await rawServer((_req, res) => {
+      res.writeHead(302, { Location: "http://127.0.0.1:1/health" });
+      res.end();
+    });
+    const { deps, writes, bootstraps } = makeDeps({ fetchHealth: probeHealth, launchctlList: () => "" });
+    const res = await installDaemon({ ...BASE_OPTS, port: s.port }, deps, "/home/u");
+    await s.close();
+    expect(res.decision.action).toBe("skip-unreadable");
+    expect(res.installed).toBe(false);
+    expect(writes).toEqual([]);
+    expect(bootstraps).toEqual([]);
+  });
+
+  it("(harm) a socket reset after accept → unreadable → REFUSE (not classified as free)", async () => {
+    const s = await rawServer((req) => {
+      req.socket.destroy();
+    });
+    const { deps, writes } = makeDeps({ fetchHealth: probeHealth, launchctlList: () => "" });
+    const res = await installDaemon({ ...BASE_OPTS, port: s.port }, deps, "/home/u");
+    await s.close();
+    expect(res.decision.action).toBe("skip-unreadable");
+    expect(writes).toEqual([]);
+  });
+
+  it("(harm) a black-holed (never-responding) server → bounded timeout → unreadable → REFUSE (no hang)", async () => {
+    process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS = "200";
+    const s = await rawServer(() => {
+      /* never respond */
+    });
+    const { deps, writes } = makeDeps({ fetchHealth: probeHealth, launchctlList: () => "" });
+    const res = await installDaemon({ ...BASE_OPTS, port: s.port }, deps, "/home/u");
+    delete process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS;
+    await s.close();
+    expect(res.decision.action).toBe("skip-unreadable");
+    expect(writes).toEqual([]);
+  });
+});
