@@ -61,7 +61,10 @@ function runGateFn(
     `${fnName}\n`;
   const r = spawnSync("bash", ["-c", harness], {
     encoding: "utf8",
-    env: { PATH: `${binDir}:${process.env.PATH}`, ...env },
+    // GITHUB_ACTIONS/CI cleared by default so the ENFORCEMENT branches are
+    // deterministic even when this test itself runs in CI (the gate skips under
+    // GitHub Actions by design); a scenario opts INTO CI by passing them in `env`.
+    env: { PATH: `${binDir}:${process.env.PATH}`, GITHUB_ACTIONS: "", CI: "", ...env },
   });
   return { code: r.status ?? -1, out: (r.stdout ?? "") + (r.stderr ?? "") };
 }
@@ -115,6 +118,20 @@ describe("v2.23.0 pre-publish — branch-identity gate", () => {
     expect(r.out).toContain(SHA_B); // origin/main printed
     expect(r.out).toMatch(/NOT verified-equal to origin\/main/);
   });
+
+  it("CI-SKIP: under GITHUB_ACTIONS a non-main branch is SKIPPED, not failed (publish-only; CI runs on PR branches)", () => {
+    // This is the regression for the CI break: the 25-tool smoke runs the whole
+    // gate on a PR branch (HEAD != origin/main); enforcing there red-lined every
+    // non-main PR. In CI it must SKIP.
+    const r = runGateFn("branch_identity_gate", {
+      MOCK_HEAD: SHA_A,
+      MOCK_ORIGIN: SHA_B, // mismatch — but CI skips before comparing
+      GITHUB_ACTIONS: "true",
+    });
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toMatch(/SKIP/);
+    expect(r.out).toMatch(/publish-only/i);
+  });
 });
 
 describe("v2.23.0 pre-publish — CI green-gate: no-run promoted WARN→FAIL", () => {
@@ -136,5 +153,13 @@ describe("v2.23.0 pre-publish — CI green-gate: no-run promoted WARN→FAIL", (
     const r = runGateFn("ci_green_gate", { MOCK_HEAD: SHA, MOCK_CI: "in_progress" });
     expect(r.code, r.out).toBe(0);
     expect(r.out).toMatch(/still running/);
+  });
+
+  it("CI-tolerant: no-run under GITHUB_ACTIONS stays WARN (exit 0) — the FAIL is publish-only", () => {
+    // In CI the gate runs while its own ci.yml run is in flight; a gh no-run
+    // reading there is a query artifact, not an unverified publish.
+    const r = runGateFn("ci_green_gate", { MOCK_HEAD: SHA, MOCK_CI: "no-run", GITHUB_ACTIONS: "true" });
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toMatch(/tolerated/);
   });
 });

@@ -547,6 +547,17 @@ step "25-tool + CLI smoke (isolated relay)" smoke_25_isolated || exit 1
 # deliberate, never the default, and it PRINTS exactly what it is overriding so an
 # off-main publish can never be silent.
 branch_identity_gate() {
+  # PUBLISH-ONLY. This gate also runs inside CI's 25-tool smoke (which invokes the
+  # whole script), and CI checks out PR branches that are DELIBERATELY not main —
+  # so enforcing here would red every non-main PR. This repo never publishes from
+  # CI (npm publish is manual + local + 2FA), so in a GitHub Actions runner the
+  # check is not applicable: SKIP loudly. It still ENFORCES everywhere a real
+  # publish or local pre-publish dry-run happens (GITHUB_ACTIONS unset). This
+  # mirrors ci_green_gate below, which is likewise tolerant in CI by design.
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    echo "  SKIP  branch-identity is a publish-only check; not applicable in CI (branch is intentionally not main, no publish happens here)."
+    return 0
+  fi
   if ! command -v git >/dev/null 2>&1; then
     echo "  FAIL  git not available — cannot verify HEAD == origin/main."
     return 1
@@ -626,6 +637,14 @@ ci_green_gate() {
       # line of work exists to end). A commit with no CI run has not been proven
       # green on the matrix — refuse rather than "proceed at own risk". Push the
       # commit and let CI run, or fix why the run is missing.
+      # EXCEPT in CI itself: the smoke job runs this gate while its own ci.yml run
+      # is in flight, and if gh can't resolve that run it reads "no-run" — which
+      # here is a query artifact, not an unverified publish. Keep it a WARN in CI
+      # (publish-only FAIL applies to a real local publish, GITHUB_ACTIONS unset).
+      if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        echo "  WARN  no ci.yml run resolved for $head_sha in CI — tolerated (this run is in flight; publish-only gate)."
+        return 0
+      fi
       echo "  FAIL  GitHub has NO ci.yml run for $head_sha — refusing to publish unverified."
       echo "        Push HEAD and wait for CI, or investigate the missing run."
       return 1
