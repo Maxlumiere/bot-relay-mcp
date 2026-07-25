@@ -154,36 +154,63 @@ describe("v2.2.0 Phase 3 — dashboard HTML", () => {
   });
 });
 
-// ADR-0006 (2026-07-25): "location is not a principal." The HARM is
-// "a secret string reached an unauthenticated caller" — so these assert the
-// secret is ABSENT FROM THE ENTIRE RESPONSE BODY (field-agnostic), not that one
-// derived field is null. That is what catches the raw `content` column (which
-// is PLAINTEXT with no keyring — encryption is opt-in) and any field added
-// later. The prior version asserted `content_preview===null` while the row
-// spread still shipped the plaintext `content` — a proxy that defended the hole
-// (codex flipped it to `content===SECRET` and it passed). getJson presents NO
-// credential against a no-secret deployment (both secrets deleted at module top).
+// ADR-0006 (2026-07-25): "location is not a principal." The HARM is "an
+// operator-authored FREE-TEXT value reached an unauthenticated caller" — the
+// text itself, whatever field carries it. Each free-text field gets a DISTINCT
+// secret so a failure NAMES which one leaked. No keyring (the default) → every
+// value is plaintext at rest. Prior versions each asserted one field / a proxy
+// and each missed a different free-text field (content → description → title).
+// This asserts the CLASS: no free-text value appears anywhere in the body.
 describe("v2.2.0 /api/snapshot — ADR-0006 harm refused (unauthenticated loopback)", () => {
-  const SECRET = "TOPSECRET-cross-agent-plaintext-Zx9";
+  const S = {
+    agent_role: "SECRET-agent-role-Ar",
+    agent_capability: "SECRET-agent-capability-Ac",
+    agent_description: "SECRET-agent-description-Ad",
+    message_content: "SECRET-message-content-Mc",
+    message_routed_capability: "SECRET-message-routedcap-Mr",
+    task_title: "SECRET-task-title-Tt",
+    task_description: "SECRET-task-description-Td",
+    task_result: "SECRET-task-result-Tr",
+    task_required_capability: "SECRET-task-reqcap-Tq",
+  };
 
-  it("(S1, NO KEYRING = the default) the message secret is ABSENT from the whole snapshot body", async () => {
-    delete process.env.RELAY_ENCRYPTION_KEY; // pass-through → content stored as plaintext
-    registerAgent("snap-from", "r", []);
-    registerAgent("snap-to", "r", []);
-    sendMessage("snap-from", "snap-to", SECRET, "normal");
+  function seedAllFreeText(): void {
+    delete process.env.RELAY_ENCRYPTION_KEY; // pass-through → plaintext at rest
+    registerAgent("sender", S.agent_role, [S.agent_capability]);
+    registerAgent("receiver", "worker", []);
+    getDb().prepare("UPDATE agents SET description = ? WHERE name = ?").run(S.agent_description, "sender");
+    sendMessage("sender", "receiver", S.message_content, "normal");
+    const ts = new Date().toISOString();
+    getDb()
+      .prepare(
+        "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at, routed_capability) VALUES (?,?,?,?,?,?,?,?)",
+      )
+      .run("msg-cap", "sender", "receiver", "plain body", "normal", "pending", ts, S.message_routed_capability);
+    const insTask = getDb().prepare(
+      "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    );
+    insTask.run("task-active", "sender", "receiver", S.task_title, S.task_description, "normal", "posted", null, ts, ts, JSON.stringify([S.task_required_capability]));
+    insTask.run("task-done", "sender", "receiver", "plain title", "plain desc", "normal", "completed", S.task_result, ts, ts, null);
+  }
+
+  it("(HARM, no keyring) NO operator free-text field reaches an unauthenticated caller", async () => {
+    seedAllFreeText();
     const r = await getJson("/api/snapshot");
     expect(r.status).toBe(200);
     expect(r.json.authenticated).toBe(false);
     expect(r.json.content_visibility).toBe("restricted");
-    expect(JSON.stringify(r.json)).not.toContain(SECRET); // the harm, field-agnostic
-    // Non-vacuity: the message IS still listed with its flow metadata (so the
-    // secret is absent because CONTENT was stripped, not because the array is
-    // empty). It just carries no content/content_preview of any kind.
-    const m = (r.json.messages as any[]).find((x) => x.from_agent === "snap-from");
+    const body = JSON.stringify(r.json);
+    for (const [field, secret] of Object.entries(S)) {
+      expect(body, `${field} leaked to an unauthenticated caller`).not.toContain(secret);
+    }
+    // Non-vacuity: the entities ARE still listed (flow metadata present), so the
+    // secrets are absent because free text was stripped, not because the arrays
+    // are empty. No content/preview key survives at all.
+    const m = (r.json.messages as any[]).find((x) => x.from_agent === "sender" && x.to_agent === "receiver");
     expect(m).toBeDefined();
-    expect(m.to_agent).toBe("snap-to");
     expect("content" in m).toBe(false);
-    expect("content_preview" in m).toBe(false);
+    expect((r.json.agents as any[]).some((a) => a.name === "sender")).toBe(true);
+    expect((r.json.active_tasks as any[]).some((t) => t.id === "task-active")).toBe(true);
   });
 
   it("(S2) process-identifying agent metadata is absent for an unauthenticated caller; presence stays", async () => {
@@ -196,19 +223,6 @@ describe("v2.2.0 /api/snapshot — ADR-0006 harm refused (unauthenticated loopba
     expect(ag.host_shell_pids).toBeUndefined();
     expect(ag.host_id).toBeUndefined();
     expect(JSON.stringify(r.json)).not.toContain("my-window"); // field-agnostic backstop
-  });
-
-  it("(S3) task description + result never reach an unauthenticated caller (active AND completed)", async () => {
-    delete process.env.RELAY_ENCRYPTION_KEY;
-    const ts = new Date().toISOString();
-    const ins = getDb().prepare(
-      "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-    );
-    ins.run("task-active-1", "boss", "worker", "job A", "SECRET-DESC-active-Q7", "normal", "posted", null, ts, ts, null);
-    ins.run("task-done-1", "boss", "worker", "job B", "plain desc", "normal", "completed", "SECRET-RESULT-done-K3", ts, ts, null);
-    const body = JSON.stringify((await getJson("/api/snapshot")).json);
-    expect(body).not.toContain("SECRET-DESC-active-Q7"); // active task description
-    expect(body).not.toContain("SECRET-RESULT-done-K3"); // completed task result
   });
 });
 
@@ -242,18 +256,23 @@ describe("v2.2.0 /api/snapshot — ADR-0006 innocent twin (authenticated operato
     });
   }
 
-  it("(A1) an authenticated caller receives the FULL content + metadata (guard doesn't break the dashboard)", async () => {
-    const CONTENT = "authed-operator-sees-this-fully";
-    registerAgent("snap-from", "r", []);
-    registerAgent("snap-to", "r", []);
+  it("(A1) an authenticated caller receives the free-text fields + full metadata (guard doesn't break the dashboard)", async () => {
+    delete process.env.RELAY_ENCRYPTION_KEY;
+    registerAgent("sender", "SECRET-role-Ar", ["SECRET-cap-Ac"]);
+    getDb().prepare("UPDATE agents SET description = ? WHERE name = ?").run("SECRET-desc-Ad", "sender");
     registerAgent("agent-with-title", "r", [], { terminal_title_ref: "my-window" });
-    sendMessage("snap-from", "snap-to", CONTENT, "normal");
+    sendMessage("sender", "agent-with-title", "SECRET-content-Mc", "normal");
     const r = await getJsonAuthed("/api/snapshot", SECRET);
     expect(r.status).toBe(200);
     expect(r.json.authenticated).toBe(true);
     expect(r.json.content_visibility).toBe("full");
-    expect(r.json.messages[0].content_preview).toBe(CONTENT);
-    expect(JSON.stringify(r.json)).toContain(CONTENT); // full content DOES reach the authenticated operator
+    const body = JSON.stringify(r.json);
+    // The authenticated operator DOES get the free text — proves the guard
+    // restricts by principal, not by breaking the dashboard's content.
+    expect(body).toContain("SECRET-content-Mc"); // message content
+    expect(body).toContain("SECRET-desc-Ad"); // agent description
+    expect(body).toContain("SECRET-role-Ar"); // agent role
+    expect(r.json.messages[0].content_preview).toBe("SECRET-content-Mc");
     const ag = (r.json.agents as any[]).find((a) => a.name === "agent-with-title");
     expect(ag.terminal_title_ref).toBe("my-window");
   });

@@ -30,33 +30,59 @@ function previewField(raw: string | null | undefined): string | null {
 }
 
 /**
- * ADR-0006 (2026-07-25) — the UNauthenticated snapshot is built from an
- * explicit ALLOWLIST of safe fields, NOT by redacting known-sensitive ones.
+ * ADR-0006 (2026-07-25) — the UNauthenticated snapshot is built from an explicit
+ * ALLOWLIST of fields classified SAFE, not by redacting known-bad ones.
  *
- * The denylist this replaces was worse than the leak it tried to fix: it nulled
- * the DERIVED `content_preview` but the row spread still shipped the raw
- * `content` column, which is PLAINTEXT when no keyring is configured (at-rest
- * encryption is OPT-IN — the default, and the common single-operator machine).
- * A denylist also fails silently the day a new column is added. Naming the safe
- * fields makes every unlisted field — including any added tomorrow, and every
- * content column whether encrypted or plaintext — absent BY CONSTRUCTION.
+ * THE CLASSIFICATION RULE — apply to EVERY field before adding it here: is the
+ * value OPERATOR-AUTHORED FREE TEXT, or STRUCTURAL (drawn from a fixed
+ * vocabulary the system controls)? Free text can carry an arbitrary secret
+ * regardless of the field's NAME, so it is content and must NOT appear here. A
+ * denylist missed this twice: first the raw `content` column (plaintext without
+ * a keyring), then the free-text `description` / `title` fields that are content
+ * despite innocuous names. Structural values — enums, timestamps, uuids,
+ * booleans, system-computed presence, registry-validated ids — cannot carry a
+ * secret.
  *
- * Safe = identity / presence / flow metadata the operational dashboard needs.
- * Deliberately EXCLUDED: message/task CONTENT (content/description/result) and
- * process/session locators (session_id/host_shell_pids/host_id/terminal_title_ref).
+ * DELIBERATE, DOCUMENTED exposures (constrained, but required for the dashboard
+ * to function at all): the agent-name addressing keys `name` / `from_agent` /
+ * `to_agent`. They are regex-constrained to AGENT_NAME_PATTERN ([A-Za-z0-9_.-],
+ * no spaces, no prose) and ARE the public addressing layer — you cannot display
+ * or address an agent without its name.
+ *
+ * Verified FREE TEXT and therefore EXCLUDED (src/types.ts): agent `role`
+ * (string≤64, no pattern), `capabilities` (array of free strings), `description`
+ * (string≤512); task `title` (string≤256), `required_capabilities` (array of
+ * free strings); message `routed_capability` (a free capability token).
+ * `server_version` is excluded as ambiguous-provenance — not worth the risk for
+ * an operational view. CONTENT columns (content/description/result) and process
+ * locators (session_id, host_shell_pids, host_id, terminal_title_ref) are
+ * excluded as before.
+ *
+ * If a future field is free text AND genuinely required unauthenticated, add it
+ * here WITH a one-line justification. An honest documented exposure is fine; an
+ * unexamined one is the class we keep removing.
  */
 const AGENT_PUBLIC_FIELDS = [
-  "name", "role", "capabilities", "description", "status", "agent_status",
-  "liveness", "alive", "last_alive", "last_seen", "created_at", "has_token",
-  "class", "cli_profile", "server_version",
+  "name", // addressing key — deliberate documented exposure (regex-constrained id)
+  "status", "agent_status", // structural: derived-status enums
+  "liveness", "alive", "last_alive", // structural: system-computed presence
+  "last_seen", "created_at", // structural: timestamps
+  "has_token", // structural: boolean
+  "class", // structural: fixed 5-value enum
+  "cli_profile", // structural: validated against the CLI registry (or null)
 ] as const;
 const MESSAGE_PUBLIC_FIELDS = [
-  "id", "from_agent", "to_agent", "priority", "status", "created_at",
-  "routed_capability", "disposition", "deadline", "read_at", "resolved_at", "seq",
+  "id", // structural: uuid
+  "from_agent", "to_agent", // addressing keys — deliberate documented exposure
+  "priority", "status", "disposition", // structural: enums
+  "created_at", "deadline", "read_at", "resolved_at", // structural: timestamps
+  "seq", // structural: integer
 ] as const;
 const TASK_PUBLIC_FIELDS = [
-  "id", "from_agent", "to_agent", "title", "priority", "status",
-  "created_at", "updated_at", "lease_renewed_at", "required_capabilities",
+  "id", // structural: uuid
+  "from_agent", "to_agent", // addressing keys — deliberate documented exposure
+  "priority", "status", // structural: enums
+  "created_at", "updated_at", "lease_renewed_at", // structural: timestamps
 ] as const;
 /** Build an object from ONLY the named fields that are present on the source. */
 function pickPublic(obj: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
