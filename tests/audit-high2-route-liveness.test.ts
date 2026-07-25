@@ -26,9 +26,17 @@ delete process.env.RELAY_AGENT_NAME;
 delete process.env.RELAY_AGENT_ROLE;
 delete process.env.RELAY_AGENT_CAPABILITIES;
 
-const { registerAgent, postTaskAuto, runHealthMonitorTick, getTask, getDb, closeDb } = await import(
-  "../src/db.js"
-);
+const {
+  registerAgent,
+  postTaskAuto,
+  runHealthMonitorTick,
+  getTask,
+  getAgents,
+  isAgentRoutable,
+  agentRoutability,
+  getDb,
+  closeDb,
+} = await import("../src/db.js");
 
 /** Simulate a closed terminal: the session lifecycle nulls session_id and sets
  *  a terminal status on every close/offline/signal path. */
@@ -127,5 +135,41 @@ describe("audit HIGH #2 — health monitor requeues posted-but-never-accepted or
     const requeued = runHealthMonitorTick("test-tick");
     expect(requeued.find((x) => x.task_id === r.task.id)).toBeUndefined();
     expect(getTask(r.task.id)!.status).toBe("posted");
+  });
+});
+
+describe("audit HIGH #2 — routability surface matches the routing predicate (ADR-0015 L4)", () => {
+  // codex's harm: a LIVE process whose session dropped while agent_status stayed
+  // 'idle' (the endAgentSessionOnSignal shape). The presence verdict says alive;
+  // routing refuses. The operator surface must say so as ONE loud named state.
+  it("(harm) live process + dropped session → routability 'unroutable_alive', routable=false", () => {
+    const row = { session_id: null, agent_status: "idle" };
+    expect(isAgentRoutable(row)).toBe(false);
+    expect(agentRoutability(row, "alive")).toBe("unroutable_alive"); // the loud diagnostic
+  });
+
+  it("(twin) a live session → routable, routability 'routable' regardless of the presence verdict", () => {
+    const row = { session_id: "sess-1", agent_status: "idle" };
+    expect(isAgentRoutable(row)).toBe(true);
+    expect(agentRoutability(row, "alive")).toBe("routable");
+    expect(agentRoutability(row, "unknown")).toBe("routable");
+  });
+
+  it("a terminal status is unroutable even WITH a session; a dead+sessionless agent is unroutable_offline", () => {
+    expect(isAgentRoutable({ session_id: "s", agent_status: "closed" })).toBe(false);
+    expect(agentRoutability({ session_id: null, agent_status: "closed" }, "dead")).toBe("unroutable_offline");
+    expect(agentRoutability({ session_id: null, agent_status: "idle" }, "unknown")).toBe("unroutable_offline");
+  });
+
+  it("(L4) the operator surface (getAgents().routable) MATCHES the router's refusal for the same agent", () => {
+    registerAgent("worker", "builder", ["build"]);
+    getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = ?").run("worker"); // session dropped, status stays idle
+    registerAgent("boss", "user", ["tasks"]);
+    // enforcement: the router refuses to route to it
+    const r = postTaskAuto("boss", "job", "desc", ["build"], "normal");
+    expect(r.routed).toBe(false);
+    // operator surface: the SAME agent reads routable=false — not merely "alive"
+    const surfaced = getAgents().find((a) => a.name === "worker")!;
+    expect(surfaced.routable).toBe(false);
   });
 });

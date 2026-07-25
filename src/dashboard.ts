@@ -66,6 +66,7 @@ const AGENT_PUBLIC_FIELDS = [
   "name", // addressing key — deliberate documented exposure (regex-constrained id)
   "status", "agent_status", // structural: derived-status enums
   "liveness", "alive", "last_alive", // structural: system-computed presence
+  "routable", "routability", // structural: routing-actionability (audit HIGH #2)
   "last_seen", "created_at", // structural: timestamps
   "has_token", // structural: boolean
   "class", // structural: fixed 5-value enum
@@ -680,12 +681,19 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
         : 'Inbox: no messages yet';
       const inboxCls = pending > 0 ? 'inbox-badge inbox-badge-warn' : 'inbox-badge inbox-badge-zero';
       const inboxLabel = pending > 0 ? pending + ' pending' : '0';
+      // audit HIGH #2 — LOUD, distinct, named state. unroutable_alive = a live
+      // process the router will silently never give work; surface it as its own
+      // badge so an operator sees it at a glance, not by diffing two fields.
+      const routWarn = a.routability === 'unroutable_alive'
+        ? '<div class="state"><span class="badge" style="background:#c0392b;color:#fff" title="Live process but NO session — the router will never give this agent work until it re-registers.">⚠ unroutable</span></div>'
+        : '';
       return '<div class="agent-card' + isFocused + '" role="button" tabindex="0" data-agent="' + esc(a.name) + '"' + style + resized + '>' +
         '<button class="card-reset" type="button" aria-label="Reset card size" data-action="reset-size" data-agent-name="' + esc(a.name) + '" title="Reset size">×</button>' +
         '<div class="name">' + esc(a.name) + '</div>' +
-        '<div class="role">' + esc(a.role) + '</div>' +
+        '<div class="role">' + esc(a.role || '') + '</div>' +
         '<div class="inbox" title="' + esc(inboxTip) + '"><span class="' + inboxCls + '" data-pending="' + pending + '" data-unread="' + unread + '">' + esc(inboxLabel) + '</span></div>' +
         '<div class="state"><span class="badge badge-' + esc(s) + '">' + esc(s) + '</span></div>' +
+        routWarn +
         '<div class="seen">last seen ' + fmtTime(a.last_seen) + '</div>' +
         '<span class="card-resize" data-action="resize-handle" data-agent-name="' + esc(a.name) + '" title="Drag to resize (snaps to grid)">↘</span>' +
       '</div>';

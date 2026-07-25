@@ -1021,6 +1021,15 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
    * "dead" — use `liveness` to distinguish dead from unknown.
    */
   alive: boolean;
+  /**
+   * audit HIGH #2 — session-actionability, the SAME predicate `post_task_auto`
+   * enforces (a live session + non-terminal status), surfaced so the operator
+   * reads what the router uses (ADR-0015 L4). `routable` is the boolean;
+   * `routability` is the one named state — `unroutable_alive` is the loud
+   * diagnostic: a live process the router will silently never give work.
+   */
+  routable: boolean;
+  routability: "routable" | "unroutable_alive" | "unroutable_offline";
 }
 
 export interface MessageRecord {

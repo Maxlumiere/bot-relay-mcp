@@ -203,6 +203,36 @@ function parseHostShellPids(raw: string | null | undefined): number[] | null {
   }
 }
 
+/**
+ * THE ROUTING PREDICATE — single source (audit HIGH #2, ADR-0015 L4). An agent
+ * can RECEIVE a task iff it holds a live session AND is not in a terminal status.
+ * postTaskAuto's SQL candidate query (ENFORCEMENT) and the `routable` /
+ * `routability` fields on the agent surface (what the OPERATOR reads) both
+ * derive from this, so the operator can never read a different predicate than
+ * the router enforces. This is DELIBERATELY not `computeLivenessVerdict`: that
+ * asks "is the process alive?", a strictly different question — a live process
+ * whose session dropped is alive-but-unroutable, and conflating the two is what
+ * this split fixes.
+ */
+export const ROUTABLE_TERMINAL_STATUSES = ["offline", "closed", "abandoned", "stale"] as const;
+export function isAgentRoutable(row: { session_id?: string | null; agent_status?: string | null }): boolean {
+  return row.session_id != null && !(ROUTABLE_TERMINAL_STATUSES as readonly string[]).includes(row.agent_status ?? "");
+}
+export type Routability = "routable" | "unroutable_alive" | "unroutable_offline";
+/**
+ * Classify an agent's routability as ONE named state (not two fields to diff).
+ * `unroutable_alive` is the loud diagnostic: the process is alive yet holds no
+ * routable session, so the router will SILENTLY never give it work — the
+ * canonical failure shape wearing a healthy badge (audit HIGH #2).
+ */
+export function agentRoutability(
+  row: { session_id?: string | null; agent_status?: string | null },
+  verdict: LivenessVerdict,
+): Routability {
+  if (isAgentRoutable(row)) return "routable";
+  return verdict === "alive" ? "unroutable_alive" : "unroutable_offline";
+}
+
 function toAgentWithStatus(
   row: AgentRecord,
   verdict: LivenessVerdict = computeLivenessVerdict(row),
@@ -229,6 +259,12 @@ function toAgentWithStatus(
     liveness: verdict,
     last_alive: positiveConfirmationISO(row.name),
     alive: verdict === "alive" && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
+    // audit HIGH #2 — session-actionability, the SAME predicate postTaskAuto
+    // enforces (isAgentRoutable), surfaced so the operator reads what the router
+    // uses (ADR-0015 L4). `routability` is the loud named state; the alarming
+    // one, `unroutable_alive`, is a live process the router will silently starve.
+    routable: isAgentRoutable(row),
+    routability: agentRoutability(row, verdict),
     description: row.description ?? null,
     // Phase A — version + CLI visibility. `health_check` reports the version of
     // WHICHEVER SERVER ANSWERS, so an agent on a stale build asks, is told its
@@ -5740,6 +5776,9 @@ export function postTaskAuto(
   const tx = db.transaction((): AutoRoutingResult => {
     const placeholders = requiredCapabilities.map(() => "?").join(",");
     const excludeSenderClause = allowSelfAssign ? "" : " AND a.name != ?";
+    // Single-source the terminal-status vocabulary with the operator surface's
+    // routable field (ADR-0015 L4). Fixed compile-time constants, no injection.
+    const terminalIn = ROUTABLE_TERMINAL_STATUSES.map((s) => `'${s}'`).join(", ");
     const bindArgs: (string | number)[] = [...requiredCapabilities];
     if (!allowSelfAssign) bindArgs.push(from);
     bindArgs.push(requiredCapabilities.length);
@@ -5772,7 +5811,7 @@ export function postTaskAuto(
          JOIN agent_capabilities ac ON ac.agent_name = a.name
         WHERE ac.capability IN (${placeholders})${excludeSenderClause}
           AND a.session_id IS NOT NULL
-          AND a.agent_status NOT IN ('offline','closed','abandoned','stale')
+          AND a.agent_status NOT IN (${terminalIn})
         GROUP BY a.name
        HAVING COUNT(DISTINCT ac.capability) = ?
         ORDER BY load ASC, a.last_seen DESC
