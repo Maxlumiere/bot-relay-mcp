@@ -312,17 +312,28 @@ export function upsertSessionStartHook(
  * installer's dedup and, via the tripwire, the precise-watch set. It is NOT the
  * only relay-hook predicate; see "three predicates, three certainties" below.
  *
- * THE RULE. Strip one matching layer of surrounding quotes, then own iff:
- *   - starts with "/"                        — an absolute path (not `echo <x>` /
- *                                              `cat <x>` / a relative call, which
- *                                              start with a command WORD);
- *   - ends with "/hooks/check-relay.sh"      — exact tail (no args/suffix/parent);
- *   - no shell metacharacter (|;&$<>`,CR,LF)  — those mean a command LINE, not a path;
- *   - it was QUOTED, or has NO whitespace.
+ * THE RULE (two forms — init now emits only the first):
+ *   - SINGLE-QUOTED `'…'`: inside single quotes every byte is literal, so it is ONE
+ *     token — own by SHAPE, no metachar check: inner starts "/" and ends
+ *     "/hooks/check-relay.sh". This is quoteForHookCommand's canonical output, incl.
+ *     roots with `$`, `'`, backticks, `;` (all literal + safe inside `'…'`).
+ *   - OTHERWISE (unquoted / double-quoted): must be a BARE SAFE absolute path —
+ *     starts "/", ends the tail, NO shell metachar (|;&$<>`"CR LF), NO whitespace.
  * REJECTED: `echo /foreign/…`, `/bin/bash /foreign/…`, `/bin/bash foreign/…`,
- * wrong parent, .bak/dir suffix, bare basename, quoted-arg-to-another-command.
- * ACCEPTED: init's raw NO-SPACE path, generate-hooks' QUOTED (spaced or not) path,
- * a `%20`-fossil path.
+ * wrong parent, .bak/dir suffix, bare basename, an UNQUOTED `$()`/`;` path
+ * (metachar), a DOUBLE-quoted command (we never emit one — double quotes don't
+ * stop expansion), an unquoted SPACED path (undecidable — see below). ACCEPTED:
+ * init's single-quoted canonical (any root), a legacy raw NO-SPACE path, a
+ * `%20`-fossil path.
+ *
+ * L4 AT THE HELPER LEVEL (ADR-0015 — codex #139 v4). quoteForHookCommand began as
+ * a DISPLAY helper (quote only on whitespace). It was moved onto the install path,
+ * where its output is EXECUTED as shell — a no-whitespace `$()`/apostrophe root
+ * shipped RAW = command injection. A signal is authorization-grade only if its
+ * CONTRACT says so; a quoting fn is security-grade only if its contract says it
+ * handles shell metacharacters. Re-derive the contract when you move a helper onto
+ * a new consequence — do not assume the name still fits. Fixed by ALWAYS
+ * single-quoting; the classifier's single-quote branch reflects that canonical.
  *
  * WHY UNQUOTED-WITH-WHITESPACE IS NOT OWNED — the load-bearing decision.
  * `/a b/c` is EITHER the single path "/a b/c" OR the two tokens "/a" and "b/c",
@@ -352,43 +363,60 @@ export function upsertSessionStartHook(
  */
 export function isRelayCheckHookCommand(command: unknown): boolean {
   if (typeof command !== "string") return false;
-  let s = command.trim();
-  let quoted = false;
-  if (s.length >= 2) {
-    const q = s[0];
-    if ((q === "'" || q === '"') && s[s.length - 1] === q) {
-      s = s.slice(1, -1);
-      quoted = true;
-    }
+  const s = command.trim();
+  // init's canonical form is SINGLE-quoted (quoteForHookCommand). Inside `'…'`
+  // every byte is LITERAL, so the command is ONE token and the inner is a bare
+  // path — own it by SHAPE, with NO metacharacter check: a `$`/`;`/backtick inside
+  // single quotes is literal and safe, and IS exactly what we now emit for a root
+  // that contains one (e.g. `/tmp/O'Hare/…`, `/x/$(id)/…`). We own the canonical
+  // string; the region watches it verbatim.
+  if (s.length >= 2 && s[0] === "'" && s[s.length - 1] === "'") {
+    const inner = s.slice(1, -1);
+    return inner.startsWith("/") && inner.endsWith("/hooks/check-relay.sh");
   }
-  if (!s.startsWith("/")) return false; // must be an absolute path, not `echo <x>` / a relative call
-  if (!s.endsWith("/hooks/check-relay.sh")) return false; // exact tail — no args/suffix/wrong-parent
-  if (/[|;&$<>`\r\n]/.test(s)) return false; // shell metachar → a command LINE, not a path
-  // UNQUOTED whitespace is genuinely shell-ambiguous: `/a b/c` is either the path
-  // "/a b/c" OR the two tokens "/a" and "b/c", and no syntactic rule can tell a
-  // real spaced install root from `/bin/bash foreign/…/check-relay.sh` (interpreter
-  // + relative script). We refuse to OWN it — owning it would let a heuristic
-  // authorize the destructive migration path (#128). A QUOTED path may contain
-  // spaces (the quotes disambiguate) and IS owned. The tripwire separately WATCHES
-  // the unquoted-whitespace relay-tail-ish shape under a loud AMBIGUOUS-LEGACY
-  // marker (watch-only, false-positive = false alarm, never a destructive write) so
-  // its deletion still trips — see tests/global-user-config-tripwire.ts.
-  if (!quoted && /\s/.test(s)) return false;
+  // Otherwise it must be a BARE, unquoted, SAFE absolute path — the legacy
+  // no-space raw form. A shell metacharacter means a command LINE, not a path;
+  // unquoted whitespace is UNDECIDABLE (`/a b/c` is one path or two tokens; a
+  // spaced install root is indistinguishable from `/bin/bash foreign/…`) → not
+  // owned (the tripwire WATCHES that shape separately, watch-only). `"` is in the
+  // metachar set deliberately: we NEVER emit a double-quoted command (double
+  // quotes do NOT stop `$()`/backtick expansion), so a double-quoted string is not
+  // our canonical and is conservatively not owned.
+  if (!s.startsWith("/")) return false; // not `echo <x>` / a relative call
+  if (!s.endsWith("/hooks/check-relay.sh")) return false; // exact tail
+  if (/[|;&$<>`"\r\n]/.test(s)) return false;
+  if (/\s/.test(s)) return false;
   return true;
 }
 
 /**
- * Quote a hook-command PATH for embedding in a JSON "command" field so Claude Code
- * runs it as ONE token. Paths without whitespace pass through unchanged; paths
- * WITH whitespace are single-quoted (double-quote is the JSON delimiter; a single
- * quote survives to the shell) with any embedded single-quote escaped. THE one
- * shared impl — both `relay init` (installHook) and `relay generate-hooks` call
- * it, so a spaced install root produces an UNAMBIGUOUS, quoted, precisely-ownable
- * command (see isRelayCheckHookCommand's undecidability note). Moved here from
- * generate-hooks.ts as the single source (2.23.0 / codex #139).
+ * Quote a hook-command PATH for embedding in a JSON "command" field. Claude Code
+ * runs that string AS SHELL, and `relay init` writes it to the user's real
+ * settings.json — so this is a SECURITY writer, not a display helper.
+ *
+ * ALWAYS SINGLE-QUOTE (codex #139 v4 P1). An earlier "quote only if it has
+ * whitespace" was fit for emitting display text; on the shell-executed install
+ * path it was a command-injection surface — a NO-whitespace root like
+ * `/tmp/O'Hare/…` (unbalanced quote → broken hook) or `/x/$(id)/…` (bash runs
+ * `id`) shipped RAW. Single-quoting is uniform and TOTAL: inside `'…'` every byte
+ * is literal — `$ ` backtick `; & | > < * ? "` `\` space, apostrophes — nothing
+ * expands. The only escape needed is the embedded single-quote, closed-reopened
+ * as `'\''` (POSIX). No metacharacter blacklist — a blacklist is the wrong shape
+ * for a quoting function; unconditional quoting is the defensible one.
+ *
+ * REFUSES a newline/CR-bearing path: no safe SINGLE-LINE shell command exists for
+ * it (and both watch predicates reject control chars, so it would be unwatchable).
+ * The one shared impl — `relay init` (installHook) and `relay generate-hooks` both
+ * call it — so every emitted hook command is the canonical, precisely-ownable
+ * single-quoted form.
  */
 export function quoteForHookCommand(p: string): string {
-  if (!/\s/.test(p)) return p;
+  if (/[\r\n]/.test(p)) {
+    throw new Error(
+      `[config] refusing to write a hook command for a path containing a newline/CR: ${JSON.stringify(p)} — ` +
+        `no safe single-line shell command exists for it. Reinstall from a path without control characters.`,
+    );
+  }
   return `'${p.replace(/'/g, `'\\''`)}'`;
 }
 

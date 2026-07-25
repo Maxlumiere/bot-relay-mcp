@@ -27,6 +27,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { spawnSync } from "child_process";
 import {
   claudeJsonRegion,
   botRelayConfigRegion,
@@ -86,17 +87,22 @@ describe("DETECTION predicate — isRelayCheckHookCommand (precise; reject cases
     expect(isRelayCheckHookCommand("/x/not-hooks/check-relay.sh")).toBe(false); // wrong parent dir
     expect(isRelayCheckHookCommand("/x/hooks/check-relay.sh.bak")).toBe(false); // wrong suffix
     expect(isRelayCheckHookCommand("/x/hooks/check-relay.sh/wrapper.sh")).toBe(false); // our name is a DIR
-    expect(isRelayCheckHookCommand("/x/hooks/check-relay.sh; rm -rf /")).toBe(false); // shell metachar
+    expect(isRelayCheckHookCommand("/x/hooks/check-relay.sh; rm -rf /")).toBe(false); // UNQUOTED metachar
+    expect(isRelayCheckHookCommand("/x/$(id)/hooks/check-relay.sh")).toBe(false); // UNQUOTED `$()` — command line
+    expect(isRelayCheckHookCommand(`"/Users/x/bot-relay-mcp/hooks/check-relay.sh"`)).toBe(false); // DOUBLE-quoted — we never emit it
     expect(isRelayCheckHookCommand("")).toBe(false);
     expect(isRelayCheckHookCommand(undefined)).toBe(false);
     expect(isRelayCheckHookCommand(42)).toBe(false);
   });
 
-  it("ACCEPTS: the unambiguous shapes only — unquoted NO-SPACE, or QUOTED (spaced or not)", () => {
-    expect(isRelayCheckHookCommand("/Users/x/bot-relay-mcp/hooks/check-relay.sh")).toBe(true); // init raw, no space
-    expect(isRelayCheckHookCommand(QUOTED_SPACED)).toBe(true); // quoted spaced → quotes disambiguate
-    expect(isRelayCheckHookCommand(`"/Users/x/bot-relay-mcp/hooks/check-relay.sh"`)).toBe(true); // double-quoted
+  it("ACCEPTS: the single-quoted canonical (any root) + a legacy bare no-space path", () => {
+    expect(isRelayCheckHookCommand("/Users/x/bot-relay-mcp/hooks/check-relay.sh")).toBe(true); // legacy raw, no space
+    expect(isRelayCheckHookCommand(QUOTED_SPACED)).toBe(true); // single-quoted spaced
     expect(isRelayCheckHookCommand("/Users/x/My%20Dir/bot-relay-mcp/hooks/check-relay.sh")).toBe(true); // %20, no literal space
+    // The single-quote branch owns the canonical for shell-hazardous roots too —
+    // inside '…' they are literal (see the injection HARM suite):
+    expect(isRelayCheckHookCommand(quoteForHookCommand("/tmp/O'Hare/bot-relay-mcp/hooks/check-relay.sh"))).toBe(true);
+    expect(isRelayCheckHookCommand(quoteForHookCommand("/x/$(id)/bot-relay-mcp/hooks/check-relay.sh"))).toBe(true);
   });
 
   it("DIVERGENCE GUARD: accepts EXACTLY what installHook now writes (quoteForHookCommand of the path)", () => {
@@ -243,10 +249,53 @@ describe("decision layer + ABSENT + UNPARSEABLE", () => {
   });
 });
 
+describe("SECURITY — quoteForHookCommand is a shell writer (codex #139 v4 P1: command injection)", () => {
+  // HARM written FROM the harm: a no-whitespace shell-hazardous install root. The
+  // emitted command MUST be (a) valid shell — no broken quote (the O'Hare break) —
+  // and (c) precisely OWNED so the tripwire watches it. Roots from codex's list.
+  const HAZARD_ROOTS = [
+    "/tmp/O'Hare/bot-relay-mcp/hooks/check-relay.sh", // apostrophe — /Users/o'brien is an ordinary name
+    "/x/$(id)/bot-relay-mcp/hooks/check-relay.sh", // command substitution
+    "/x/`id`/bot-relay-mcp/hooks/check-relay.sh", // backtick substitution
+    "/x/a;rm -rf ~/bot-relay-mcp/hooks/check-relay.sh", // command separator
+    '/x/a"b/bot-relay-mcp/hooks/check-relay.sh', // embedded double quote
+    "/x/a\\b/bot-relay-mcp/hooks/check-relay.sh", // embedded backslash
+  ];
+
+  for (const root of HAZARD_ROOTS) {
+    it(`shell-safe + owned: ${JSON.stringify(root)}`, () => {
+      const cmd = quoteForHookCommand(root);
+      expect(spawnSync("bash", ["-n", "-c", cmd], { encoding: "utf8" }).status, cmd).toBe(0); // (a) valid syntax
+      expect(isRelayCheckHookCommand(cmd)).toBe(true); // (c) owned → watched
+    });
+  }
+
+  it("(b) NO INJECTION: a $()/backtick root does not EXECUTE — proven by a side-effect sentinel", () => {
+    // The root string itself contains the marker text, so grepping output is
+    // unsound (the not-found error echoes the literal path). Instead: the injected
+    // command, IF it runs, creates a sentinel FILE. Single-quoting → literal → no file.
+    for (const mkRoot of [
+      (s: string) => `/x/$(touch ${s})/bot-relay-mcp/hooks/check-relay.sh`,
+      (s: string) => "/x/`touch " + s + "`/bot-relay-mcp/hooks/check-relay.sh",
+    ]) {
+      const sentinel = path.join(dir, `inj-${Math.random().toString(36).slice(2)}`);
+      const cmd = quoteForHookCommand(mkRoot(sentinel));
+      spawnSync("bash", ["-c", cmd], { encoding: "utf8" }); // tries to run the (nonexistent) path
+      expect(fs.existsSync(sentinel), `injection executed for ${cmd}`).toBe(false);
+    }
+  });
+
+  it("REFUSES a newline/CR-bearing root rather than emit a broken command", () => {
+    expect(() => quoteForHookCommand("/x/a\nb/bot-relay-mcp/hooks/check-relay.sh")).toThrow(/newline\/CR/);
+    expect(() => quoteForHookCommand("/x/a\rb/bot-relay-mcp/hooks/check-relay.sh")).toThrow(/newline\/CR/);
+  });
+});
+
 describe("installer — quote (init) + exact-match migration (no classifier)", () => {
-  it("quoteForHookCommand: spaced path → single-quoted; no-space → unchanged", () => {
-    expect(quoteForHookCommand("/opt/x/hooks/check-relay.sh")).toBe("/opt/x/hooks/check-relay.sh");
+  it("quoteForHookCommand: ALWAYS single-quotes (a display-only 'quote on whitespace' was the injection surface)", () => {
+    expect(quoteForHookCommand("/opt/x/hooks/check-relay.sh")).toBe("'/opt/x/hooks/check-relay.sh'"); // quoted even with no space
     expect(quoteForHookCommand(RAW_SPACED)).toBe(QUOTED_SPACED);
+    expect(quoteForHookCommand("/tmp/O'Hare/x/hooks/check-relay.sh")).toBe("'/tmp/O'\\''Hare/x/hooks/check-relay.sh'");
   });
 
   it("migrateRawHookCommand: rewrites EXACTLY the raw literal → canonical; leaves other shapes alone", () => {
@@ -266,7 +315,7 @@ describe("installer — quote (init) + exact-match migration (no classifier)", (
     expect(ss[1].hooks[0].command).toBe("/someone/else.sh"); // untouched
   });
 
-  it("migrateRawHookCommand: NO-OP when raw == canonical (no-space install)", () => {
+  it("migrateRawHookCommand: NO-OP when no matching raw literal is present", () => {
     const noSpace = "/opt/x/hooks/check-relay.sh";
     const { changed } = migrateRawHookCommand({ hooks: { SessionStart: [] } }, noSpace, quoteForHookCommand(noSpace));
     expect(changed).toBe(false);
