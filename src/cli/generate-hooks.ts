@@ -22,17 +22,9 @@
 import path from "path";
 import { fileURLToPath } from "url";
 import { getAgentCliProfile } from "../agent-cli-profiles.js";
-
-/**
- * Quote a shell command path for embedding in JSON's "command" field.
- * Paths without spaces pass through unchanged. Paths with spaces get
- * single-quoted inside the JSON string value — double-quote is the JSON
- * delimiter; single-quote survives to the shell that Claude Code spawns.
- */
-function quoteForHookCommand(p: string): string {
-  if (!/\s/.test(p)) return p;
-  return `'${p.replace(/'/g, `'\\''`)}'`;
-}
+// quoteForHookCommand moved to config-merge.ts as the single shared impl so init
+// and generate-hooks quote identically (codex #139).
+import { quoteForHookCommand } from "./config-merge.js";
 
 /**
  * Encode a string as a TOML double-quoted basic string. Escapes backslash,

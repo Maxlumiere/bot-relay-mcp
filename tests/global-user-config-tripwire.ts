@@ -121,14 +121,39 @@ export function claudeJsonRegion(raw: string): string {
 }
 
 /**
- * ~/.claude/settings.json relay region = the SessionStart hook entries whose
- * command invokes OUR hook (isRelayCheckHookCommand), each paired with its
- * enclosing group's `matcher`, order-independent. The matcher is INCLUDED because
- * it is load-bearing: flipping `matcher:"startup|resume"` → `"never"` DISABLES the
- * relay hook without touching the hook object — destructive config damage that a
- * hook-object-only region would wave through (codex #139 P1). Ignores every other
- * hook event and every non-relay SessionStart entry — those are the operator's /
- * other agents', and their churn must not trip us.
+ * WATCH-only predicate (tripwire-local, NOT exported as ownership). The
+ * AMBIGUOUS-LEGACY bucket: a command that MIGHT be our raw spaced install hook but
+ * is genuinely undecidable — unquoted, absolute, ends with our tail, contains
+ * whitespace. The DETECTION predicate (isRelayCheckHookCommand) refuses to OWN
+ * these (owning would let a heuristic authorize the destructive migration — the
+ * #128 defect), so a hook-object-only region would miss deleting a raw spaced
+ * hook (codex #139 v3 P1). The tripwire WATCHES them anyway: a false positive here
+ * is a false ALARM, never a destructive write, so a BROADER predicate is
+ * acceptable — ADR-0015, the required certainty scales with the consequence.
+ */
+function isAmbiguousLegacyRelayCommand(command: unknown): boolean {
+  if (typeof command !== "string") return false;
+  const s = command.trim();
+  if (s.startsWith("'") || s.startsWith('"')) return false; // quoted → the precise predicate handles it
+  if (!s.startsWith("/")) return false; // `echo <x>` / a relative call start with a command WORD
+  if (!s.endsWith("/hooks/check-relay.sh")) return false;
+  if (/[|;&$<>`\r\n]/.test(s)) return false; // a shell metachar means a command LINE, not even an ambiguous path
+  return /\s/.test(s); // the ambiguous bit: UNQUOTED whitespace
+}
+
+/**
+ * ~/.claude/settings.json relay region = OWNED SessionStart hooks (precise,
+ * isRelayCheckHookCommand) each paired with its group `matcher` (a matcher flip
+ * "startup|resume"→"never" DISABLES the hook — load-bearing, codex #139 P1);
+ * PLUS, under a loud marker, any AMBIGUOUS-LEGACY hooks (undecidable raw-spaced
+ * shapes) so deleting a real raw spaced hook still trips. Ignores every other hook
+ * event and every non-relay SessionStart entry — their churn must not trip us.
+ *
+ * The marker text is itself a CLAIM (ADR-0015: L1 applies to the message, not just
+ * the predicate). It states only what is KNOWN — that this MAY be ours and cannot
+ * be determined — never that it IS ours; the watch predicate also matches genuine
+ * foreign commands, and a guard that overstates what it knows fails in the
+ * reader's head instead of the code.
  */
 export function claudeSettingsRegion(raw: string): string {
   let c: { hooks?: { SessionStart?: unknown[] } };
@@ -139,17 +164,26 @@ export function claudeSettingsRegion(raw: string): string {
   }
   const groups = Array.isArray(c?.hooks?.SessionStart) ? (c.hooks!.SessionStart as unknown[]) : [];
   const owned: string[] = [];
+  const ambiguous: string[] = [];
   for (const g of groups) {
     const matcher = (g as { matcher?: unknown })?.matcher ?? null;
     const inner = (g as { hooks?: unknown[] })?.hooks;
     if (!Array.isArray(inner)) continue;
     for (const h of inner) {
-      if (isRelayCheckHookCommand((h as { command?: unknown })?.command)) {
-        owned.push(stableStringify({ matcher, hook: h })); // matcher carried with the hook
-      }
+      const cmd = (h as { command?: unknown })?.command;
+      if (isRelayCheckHookCommand(cmd)) owned.push(stableStringify({ matcher, hook: h }));
+      else if (isAmbiguousLegacyRelayCommand(cmd)) ambiguous.push(stableStringify({ matcher, hook: h }));
     }
   }
-  return "[" + owned.sort().join(",") + "]"; // sorted → array reorder doesn't trip
+  const region = "[" + owned.sort().join(",") + "]"; // sorted → array reorder doesn't trip
+  if (ambiguous.length === 0) return region; // common case: no marker, no noise
+  return (
+    region +
+    "::AMBIGUOUS-LEGACY-HOOK(unquoted path ending /hooks/check-relay.sh — MAY be a relay hook from a" +
+    " spaced install root; undecidable without quoting; run `relay init` to migrate, or ignore if not ours):[" +
+    ambiguous.sort().join(",") +
+    "]"
+  );
 }
 
 /** ~/.bot-relay/config.json is relay-owned in full → the whole file is the region. */
@@ -157,7 +191,7 @@ export function botRelayConfigRegion(raw: string): string {
   return raw;
 }
 
-interface ProtectedRegion {
+export interface ProtectedRegion {
   path: string;
   extract: (raw: string) => string;
   label: string;

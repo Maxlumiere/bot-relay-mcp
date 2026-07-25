@@ -306,52 +306,130 @@ export function upsertSessionStartHook(
 }
 
 /**
- * Is `command` an invocation of the relay's SessionStart hook
- * (`hooks/check-relay.sh`)? The single, PRECISE source of truth for "this
- * SessionStart hook is ours", shared by the suite user-config tripwire
- * (tests/global-user-config-tripwire.ts) so its ownership notion cannot drift
- * from what the installer writes.
+ * Is `command` a hook invocation we can PRECISELY, CONSERVATIVELY identify as the
+ * relay's SessionStart hook (`hooks/check-relay.sh`)? This is the DETECTION /
+ * exact-match predicate. It is used where a false positive is expensive — the
+ * installer's dedup and, via the tripwire, the precise-watch set. It is NOT the
+ * only relay-hook predicate; see "three predicates, three certainties" below.
  *
- * PRECISE — the ENTIRE command must BE our hook path, not merely CONTAIN it.
- * The installer writes the command as ONE token: the absolute path to the hook,
- * optionally wrapped in a single matching layer of quotes (quoteForHookCommand
- * single-quotes paths with spaces) — never `bash <path>`, never trailing args.
- * So we strip one layer of surrounding quotes and require the whole remainder to
- * END with `/hooks/check-relay.sh`. Unquoted, a whitespace char means there is an
- * executable/argument split, which our hook never has.
+ * THE RULE. Strip one matching layer of surrounding quotes, then own iff:
+ *   - starts with "/"                        — an absolute path (not `echo <x>` /
+ *                                              `cat <x>` / a relative call, which
+ *                                              start with a command WORD);
+ *   - ends with "/hooks/check-relay.sh"      — exact tail (no args/suffix/parent);
+ *   - no shell metacharacter (|;&$<>`,CR,LF)  — those mean a command LINE, not a path;
+ *   - it was QUOTED, or has NO whitespace.
+ * REJECTED: `echo /foreign/…`, `/bin/bash /foreign/…`, `/bin/bash foreign/…`,
+ * wrong parent, .bak/dir suffix, bare basename, quoted-arg-to-another-command.
+ * ACCEPTED: init's raw NO-SPACE path, generate-hooks' QUOTED (spaced or not) path,
+ * a `%20`-fossil path.
  *
- * This is what rejects the #128 false-ownership class — codex's counterexample
- * `echo /foreign/hooks/check-relay.sh` is UNQUOTED-with-a-space, so the leading
- * `echo` is caught (a bare substring/tail match would have owned it, disabling or
- * deleting a command that isn't ours). Also rejected: a wrong parent dir
- * (`/x/not-hooks/check-relay.sh`), the bare basename, a `.bak`/dir suffix, and a
- * quoted arg to some other command (the opening quote is not at index 0).
- * Accepted: init's raw path, generate-hooks' single-quoted spaced path, and a
- * `%20`-fossil path (still a single token — it is our own broken entry, and the
- * tripwire must track changes to it).
+ * WHY UNQUOTED-WITH-WHITESPACE IS NOT OWNED — the load-bearing decision.
+ * `/a b/c` is EITHER the single path "/a b/c" OR the two tokens "/a" and "b/c",
+ * and nothing in the string settles it without quoting or the filesystem. So a
+ * real spaced install root (`/Users/x/Claude AI/…/check-relay.sh`) is
+ * SYNTACTICALLY INDISTINGUISHABLE from an interpreter + relative script
+ * (`/bin/bash foreign/…/check-relay.sh`). That is not a parser gap; it is a
+ * property of the input. Standing rule: NO IRREVERSIBLE ACTION ON AN UNDECIDABLE
+ * PREDICATE — quarantine it or make a caller assert it. So we DON'T own it here;
+ * the operator makes it decidable by running `relay init`, which quotes it.
  *
- * NOTE ON THE upsertSessionStartHook DIVERGENCE (deliberate, pinned by test):
- * upsertSessionStartHook dedups by EXACT command equality (`h.command ===
- * spec.command`) because it must preserve the operator's exact entry and must
- * still ADD the correct hook when a stale one (e.g. a %20-fossil path) exists —
- * routing its dedup through this classifier would suppress that recovery. So the
- * two ask different questions on purpose; the divergence-guard test asserts this
- * classifier ACCEPTS the exact command init/generate-hooks produce, so the shared
- * shape can never drift silently. (Latent, out of scope: init writes the raw path
- * UNQUOTED, so an install root WITH SPACES yields an unquoted spaced command that
- * is both a broken shell command AND indistinguishable from `echo <path>` — this
- * classifier rejects it; the real fix is init quoting like generate-hooks.)
+ * THREE PREDICATES, THREE CERTAINTIES (ADR-0015, generalizes L2/L3 — the level of
+ * certainty required scales with the CONSEQUENCE of a false positive):
+ *   - DETECTION / exact-match (this fn) → drives dedup + precise watch → must be
+ *     PRECISE, uniformly conservative on the undecidable class.
+ *   - WATCH (tripwire ambiguous-legacy marker) → drives only an ALARM → may be
+ *     BROADER; its worst case is a false alarm, so it may cover the undecidable
+ *     class — but its message must NOT overstate ownership (see the tripwire).
+ *   - MIGRATION (installHook) → drives a DESTRUCTIVE write → uses NO predicate at
+ *     all: EXACT LITERAL match against the string THIS install root would have
+ *     written. A heuristic authorizing a destructive write is the #128 defect.
+ *
+ * NOTE — installHook's migration does NOT call this predicate; it exact-matches
+ * the literal string this root would have written. Detect and migrate ask
+ * different questions with different failure costs; they are deliberately not one
+ * shared predicate (the earlier "L4 single source" framing was withdrawn).
  */
 export function isRelayCheckHookCommand(command: unknown): boolean {
   if (typeof command !== "string") return false;
   let s = command.trim();
+  let quoted = false;
   if (s.length >= 2) {
     const q = s[0];
     if ((q === "'" || q === '"') && s[s.length - 1] === q) {
-      // one matching layer of surrounding quotes → the inside is the whole path
-      return s.slice(1, -1).endsWith("/hooks/check-relay.sh");
+      s = s.slice(1, -1);
+      quoted = true;
     }
   }
-  if (/\s/.test(s)) return false; // unquoted whitespace → executable/arg split, not ours
-  return s.endsWith("/hooks/check-relay.sh");
+  if (!s.startsWith("/")) return false; // must be an absolute path, not `echo <x>` / a relative call
+  if (!s.endsWith("/hooks/check-relay.sh")) return false; // exact tail — no args/suffix/wrong-parent
+  if (/[|;&$<>`\r\n]/.test(s)) return false; // shell metachar → a command LINE, not a path
+  // UNQUOTED whitespace is genuinely shell-ambiguous: `/a b/c` is either the path
+  // "/a b/c" OR the two tokens "/a" and "b/c", and no syntactic rule can tell a
+  // real spaced install root from `/bin/bash foreign/…/check-relay.sh` (interpreter
+  // + relative script). We refuse to OWN it — owning it would let a heuristic
+  // authorize the destructive migration path (#128). A QUOTED path may contain
+  // spaces (the quotes disambiguate) and IS owned. The tripwire separately WATCHES
+  // the unquoted-whitespace relay-tail-ish shape under a loud AMBIGUOUS-LEGACY
+  // marker (watch-only, false-positive = false alarm, never a destructive write) so
+  // its deletion still trips — see tests/global-user-config-tripwire.ts.
+  if (!quoted && /\s/.test(s)) return false;
+  return true;
+}
+
+/**
+ * Quote a hook-command PATH for embedding in a JSON "command" field so Claude Code
+ * runs it as ONE token. Paths without whitespace pass through unchanged; paths
+ * WITH whitespace are single-quoted (double-quote is the JSON delimiter; a single
+ * quote survives to the shell) with any embedded single-quote escaped. THE one
+ * shared impl — both `relay init` (installHook) and `relay generate-hooks` call
+ * it, so a spaced install root produces an UNAMBIGUOUS, quoted, precisely-ownable
+ * command (see isRelayCheckHookCommand's undecidability note). Moved here from
+ * generate-hooks.ts as the single source (2.23.0 / codex #139).
+ */
+export function quoteForHookCommand(p: string): string {
+  if (!/\s/.test(p)) return p;
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * DETERMINISTIC migration of a SessionStart hook command — EXACT LITERAL match,
+ * NO classifier, NO resemblance. If any SessionStart hook's command is EXACTLY
+ * `rawCommand` (the unquoted string a prior `installHook` wrote for THIS install
+ * root) and `rawCommand !== canonicalCommand` (i.e. the root has spaces and the
+ * raw form needs quoting), rewrite exactly that string to `canonicalCommand`.
+ *
+ * WHY EXACT-MATCH AND NOT isRelayCheckHookCommand: this drives a DESTRUCTIVE write
+ * (it replaces an entry). A heuristic authorizing a destructive write is the #128
+ * defect — a fuzzy predicate is fuzzy at the edges and the edges are where an
+ * operator's own config lives. The installer KNOWS the exact string it would have
+ * written, so it needs no predicate. Any shape it does not recognize byte-for-byte
+ * (a different root, a `%20` path from elsewhere) is LEFT ALONE — the tripwire
+ * surfaces those loudly; migrating them would be guessing.
+ */
+export function migrateRawHookCommand(
+  root: Record<string, unknown> | null,
+  rawCommand: string,
+  canonicalCommand: string,
+): MergeResult {
+  const out: Record<string, unknown> = { ...(root ?? {}) };
+  if (rawCommand === canonicalCommand) return { root: out, changed: false }; // no-op (no-space install)
+  const hooks: Record<string, unknown> = { ...((out.hooks as Record<string, unknown> | undefined) ?? {}) };
+  if (!Array.isArray(hooks.SessionStart)) return { root: out, changed: false };
+  let changed = false;
+  const sessionStart = (hooks.SessionStart as unknown[]).map((group) => {
+    const inner = (group as { hooks?: unknown[] })?.hooks;
+    if (!Array.isArray(inner)) return group;
+    const newInner = inner.map((h) => {
+      if ((h as { command?: unknown })?.command === rawCommand) {
+        changed = true;
+        return { ...(h as Record<string, unknown>), command: canonicalCommand };
+      }
+      return h;
+    });
+    return { ...(group as Record<string, unknown>), hooks: newInner };
+  });
+  if (!changed) return { root: out, changed: false };
+  out.hooks = { ...hooks, SessionStart: sessionStart };
+  return { root: out, changed: true };
 }

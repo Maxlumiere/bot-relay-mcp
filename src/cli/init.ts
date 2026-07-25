@@ -46,6 +46,8 @@ import {
   reconcileRelayConfig,
   upsertMcpServer,
   upsertSessionStartHook,
+  quoteForHookCommand,
+  migrateRawHookCommand,
 } from "./config-merge.js";
 import { installDaemon, type InstallDeps } from "./launchd.js";
 
@@ -235,16 +237,24 @@ export function installMcpServer(distEntry: string, jsonPath: string = claudeJso
   return { changed };
 }
 
-/** v2.16.0 — deep-merge the SessionStart hook into ~/.claude/settings.json. */
+/** v2.16.0 — deep-merge the SessionStart hook into ~/.claude/settings.json.
+ * v2.23.0 (codex #139): QUOTE the command (quoteForHookCommand) so a spaced
+ * install root yields an unambiguous, precisely-ownable hook — and MIGRATE a
+ * prior RAW (unquoted) literal of this exact root to the quoted form, so the
+ * ambiguous shape drains out of the installed base instead of being carried
+ * forever. Migration is exact-literal, never a classifier (see config-merge). */
 export function installHook(hookScript: string, settingsPath: string = claudeSettingsPath()): { changed: boolean } {
   const existing = readJsonSafe(settingsPath);
-  const { root, changed } = upsertSessionStartHook(existing, {
+  const canonical = quoteForHookCommand(hookScript);
+  const migrated = migrateRawHookCommand(existing, hookScript, canonical);
+  const { root, changed } = upsertSessionStartHook(migrated.root, {
     matcher: "startup|resume",
-    command: hookScript,
+    command: canonical,
     timeout: 10,
   });
-  if (changed) atomicWriteJson(settingsPath, root, 0o600);
-  return { changed };
+  const anyChange = migrated.changed || changed;
+  if (anyChange) atomicWriteJson(settingsPath, root, 0o600);
+  return { changed: anyChange };
 }
 
 /** Real launchd deps — the only place init shells out to launchctl / fetch. */
