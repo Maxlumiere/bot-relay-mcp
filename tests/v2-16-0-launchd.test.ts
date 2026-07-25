@@ -19,6 +19,7 @@ import {
   parseLoadedRelayLabels,
   classifyHealthProbe,
   decideDaemonAction,
+  chooseRestartTarget,
   installDaemon,
   type InstallDeps,
 } from "../src/cli/launchd.js";
@@ -156,5 +157,82 @@ describe("installDaemon — MANDATORY collision: existing relay under a noncanon
     const res = await installDaemon(BASE_OPTS, deps, "/home/u");
     expect(res.installed).toBe(true); // unreachable → install
     expect(writes.length).toBe(1);
+  });
+});
+
+// ============================================================================
+// Audit HIGH #3 — a stale daemon must be surfaced LOUDLY, never auto-restarted.
+// ADR-0015 harm + twin on the two pure decisions.
+// ============================================================================
+describe("decideDaemonAction — version drift (audit HIGH #3)", () => {
+  it("(harm) a relay on the port running an OLDER version → versionDrift + restart remedy, still skip", () => {
+    const d = decideDaemonAction({
+      healthClass: "relay",
+      loadedRelayLabels: [CANONICAL_LABEL],
+      port: 3777,
+      installedVersion: "9.9.9",
+      runningVersion: "9.9.8",
+    });
+    expect(d.action).toBe("skip-relay-present"); // never auto-restarts
+    expect(d.versionDrift).toEqual({ running: "9.9.8", installed: "9.9.9" });
+    expect(d.reason).toContain("relay restart");
+    expect(d.reason).toContain("NOT taken effect");
+  });
+
+  it("(twin) matching versions → no drift, benign reason", () => {
+    const d = decideDaemonAction({
+      healthClass: "relay",
+      loadedRelayLabels: [],
+      port: 3777,
+      installedVersion: "9.9.9",
+      runningVersion: "9.9.9",
+    });
+    expect(d.versionDrift).toBeUndefined();
+    expect(d.reason).toContain("leaving the existing supervisor in place");
+  });
+
+  it("(twin) unknown running version (no /health version field) → no drift claimed", () => {
+    const d = decideDaemonAction({
+      healthClass: "relay",
+      loadedRelayLabels: [],
+      port: 3777,
+      installedVersion: "9.9.9",
+      runningVersion: null,
+    });
+    expect(d.versionDrift).toBeUndefined();
+  });
+});
+
+describe("chooseRestartTarget — pick or refuse (audit HIGH #3)", () => {
+  it("canonical label loaded → restart it, no bootstrap", () => {
+    const t = chooseRestartTarget({ loadedRelayLabels: [CANONICAL_LABEL], canonicalPlistExists: true });
+    expect(t.label).toBe(CANONICAL_LABEL);
+    expect(t.needsBootstrap).toBe(false);
+  });
+
+  it("canonical plist on disk but not loaded → target it, needs bootstrap", () => {
+    const t = chooseRestartTarget({ loadedRelayLabels: [], canonicalPlistExists: true });
+    expect(t.label).toBe(CANONICAL_LABEL);
+    expect(t.needsBootstrap).toBe(true);
+  });
+
+  it("a sole hand-authored relay label → restart that one", () => {
+    const t = chooseRestartTarget({ loadedRelayLabels: ["com.acme.bot-relay"], canonicalPlistExists: false });
+    expect(t.label).toBe("com.acme.bot-relay");
+  });
+
+  it("(harm) multiple relay labels, none canonical → REFUSE to guess", () => {
+    const t = chooseRestartTarget({
+      loadedRelayLabels: ["com.a.bot-relay", "com.b.bot-relay"],
+      canonicalPlistExists: false,
+    });
+    expect(t.label).toBeNull();
+    expect(t.reason).toContain("multiple");
+  });
+
+  it("(harm) nothing loaded, no plist → REFUSE with an init hint", () => {
+    const t = chooseRestartTarget({ loadedRelayLabels: [], canonicalPlistExists: false });
+    expect(t.label).toBeNull();
+    expect(t.reason).toContain("relay init");
   });
 });

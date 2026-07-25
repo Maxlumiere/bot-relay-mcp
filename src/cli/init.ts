@@ -491,11 +491,27 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
         },
         realDaemonDeps((l) => process.stdout.write(`  ${l}\n`)),
       );
-      process.stdout.write(
-        res.installed
-          ? `✓ launchd daemon installed + started (KeepAlive) on :${port}\n`
-          : `• launchd daemon: ${res.decision.reason}\n`,
-      );
+      if (res.decision.versionDrift) {
+        // LOUD (audit HIGH #3): the running daemon is STALE. Never auto-restart
+        // (it would cut every agent on this host mid-session — ADR-0005); tell
+        // the operator exactly what to run. This replaces the prior
+        // "leaving the existing supervisor in place" line that reassured
+        // falsely after an upgrade that had not taken effect.
+        const d = res.decision.versionDrift;
+        process.stdout.write(
+          `\n⚠️  DAEMON VERSION DRIFT — the running daemon is STALE.\n` +
+            `     running:   ${d.running}\n` +
+            `     installed: ${d.installed}\n` +
+            `   The upgrade will NOT take effect until the daemon is restarted.\n` +
+            `   Run:  relay restart\n\n`,
+        );
+      } else {
+        process.stdout.write(
+          res.installed
+            ? `✓ launchd daemon installed + started (KeepAlive) on :${port}\n`
+            : `• launchd daemon: ${res.decision.reason}\n`,
+        );
+      }
     } else if (process.platform !== "darwin") {
       process.stdout.write(
         `• daemon: launchd supervision is macOS-only for now (Linux/Windows coming). ` +

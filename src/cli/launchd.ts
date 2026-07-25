@@ -29,6 +29,7 @@
  */
 import path from "path";
 import os from "os";
+import { VERSION } from "../version.js";
 
 /** Public-clean canonical LaunchAgent label. Deliberately generic — NEVER a
  *  private/persona name (a stranger's machine gets this). */
@@ -137,26 +138,45 @@ export interface DaemonDecision {
   reason: string;
   /** Loaded relay labels observed (for operator visibility). */
   existingLabels: string[];
+  /** Set when a relay daemon IS on the port but reports a DIFFERENT version
+   *  than the installed package — an upgrade that has NOT taken effect. The
+   *  action stays skip (we NEVER auto-bounce a daemon the whole fleet depends
+   *  on — ADR-0005: report drift loudly, let a human run `relay restart`), but
+   *  this signals the caller to warn LOUDLY instead of reassuring. */
+  versionDrift?: { running: string; installed: string };
 }
 
 /**
  * Pure collision decision. install ONLY when the port is free AND no bot-relay
  * LaunchAgent is already loaded. Every other case SKIPS (never double-loads).
+ *
+ * When a relay IS on the port, compare its reported version to the installed
+ * package: a mismatch means `npm update` landed new code but the OLD daemon is
+ * still serving it (launchd KeepAlive has no WatchPaths, so it never restarts
+ * on a dist change). We surface that as `versionDrift` so the installer stops
+ * printing "leaving the existing supervisor in place" as if all were well.
  */
 export function decideDaemonAction(input: {
   healthClass: HealthClass;
   loadedRelayLabels: string[];
   port: number;
+  installedVersion?: string;
+  runningVersion?: string | null;
 }): DaemonDecision {
-  const { healthClass, loadedRelayLabels, port } = input;
+  const { healthClass, loadedRelayLabels, port, installedVersion, runningVersion } = input;
   if (healthClass === "relay") {
+    const labels = loadedRelayLabels.length ? ` (LaunchAgent: ${loadedRelayLabels.join(", ")})` : "";
+    const drift =
+      installedVersion && runningVersion && runningVersion !== installedVersion
+        ? { running: runningVersion, installed: installedVersion }
+        : undefined;
     return {
       action: "skip-relay-present",
-      reason:
-        `:${port} is already served by a bot-relay daemon` +
-        (loadedRelayLabels.length ? ` (LaunchAgent: ${loadedRelayLabels.join(", ")})` : "") +
-        ` — leaving the existing supervisor in place (no double-load).`,
+      reason: drift
+        ? `:${port} is served by a bot-relay daemon running ${drift.running}${labels}, but the installed package is ${drift.installed} — the upgrade has NOT taken effect. The running daemon keeps serving ${drift.running} until it is restarted. Run \`relay restart\` to load ${drift.installed}. (Not auto-restarting: every agent on this host depends on this daemon.)`
+        : `:${port} is already served by a bot-relay daemon${labels} — leaving the existing supervisor in place (no double-load).`,
       existingLabels: loadedRelayLabels,
+      versionDrift: drift,
     };
   }
   if (healthClass === "foreign") {
@@ -176,6 +196,55 @@ export function decideDaemonAction(input: {
     };
   }
   return { action: "install", reason: "no relay on the port and no bot-relay LaunchAgent loaded — installing the canonical daemon.", existingLabels: [] };
+}
+
+export interface RestartTarget {
+  /** The launchd label to kickstart, or null when there's nothing safe to restart. */
+  label: string | null;
+  /** True when the canonical plist exists but the label isn't loaded yet — the
+   *  caller must `bootstrap` it before `kickstart`. */
+  needsBootstrap: boolean;
+  /** Operator-facing explanation on the null / ambiguous paths (empty on success). */
+  reason: string;
+}
+
+/**
+ * Pure selection of which daemon `relay restart` should bounce, from the loaded
+ * relay labels + whether the canonical plist exists on disk. Prefers the
+ * canonical label; falls back to a SOLE hand-authored relay label; REFUSES to
+ * guess among several (never restart an arbitrary one). Kept pure so the harm
+ * cases (nothing to restart / ambiguous) are tested without launchctl.
+ */
+export function chooseRestartTarget(input: {
+  loadedRelayLabels: string[];
+  canonicalPlistExists: boolean;
+}): RestartTarget {
+  const { loadedRelayLabels, canonicalPlistExists } = input;
+  if (loadedRelayLabels.includes(CANONICAL_LABEL)) {
+    return { label: CANONICAL_LABEL, needsBootstrap: false, reason: "" };
+  }
+  if (canonicalPlistExists) {
+    return { label: CANONICAL_LABEL, needsBootstrap: true, reason: "" };
+  }
+  if (loadedRelayLabels.length === 1) {
+    return { label: loadedRelayLabels[0], needsBootstrap: false, reason: "" };
+  }
+  if (loadedRelayLabels.length > 1) {
+    return {
+      label: null,
+      needsBootstrap: false,
+      reason:
+        `multiple bot-relay LaunchAgents are loaded (${loadedRelayLabels.join(", ")}) and none is the ` +
+        `canonical ${CANONICAL_LABEL} — bounce the intended one by hand: launchctl kickstart -k gui/<uid>/<label>`,
+    };
+  }
+  return {
+    label: null,
+    needsBootstrap: false,
+    reason:
+      `no bot-relay launchd daemon found (canonical plist missing and nothing relay-shaped loaded) — ` +
+      `run \`relay init\` to install it first`,
+  };
 }
 
 export interface InstallDeps {
@@ -208,14 +277,23 @@ export async function installDaemon(
   label: string = CANONICAL_LABEL,
 ): Promise<InstallResult> {
   let healthClass: HealthClass = "none";
+  let runningVersion: string | null = null;
   try {
     const { ok, body } = await deps.fetchHealth(opts.port);
     healthClass = classifyHealthProbe(ok, body);
+    const b = body as { version?: unknown } | null;
+    runningVersion = b && typeof b.version === "string" ? b.version : null;
   } catch {
     healthClass = "none";
   }
   const loadedRelayLabels = parseLoadedRelayLabels(deps.launchctlList());
-  const decision = decideDaemonAction({ healthClass, loadedRelayLabels, port: opts.port });
+  const decision = decideDaemonAction({
+    healthClass,
+    loadedRelayLabels,
+    port: opts.port,
+    installedVersion: VERSION,
+    runningVersion,
+  });
 
   if (decision.action !== "install") {
     deps.log(`daemon: ${decision.reason}`);
