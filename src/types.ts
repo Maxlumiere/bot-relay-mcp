@@ -115,17 +115,25 @@ export const RegisterAgentSchema = z.object({
   cli_profile: z.string().max(64).optional().describe("Which agent-CLI this session runs under (e.g. \"claude\", \"codex\"). Set by the SessionStart hook; VALIDATED against the agent-CLI profile registry and stored as NULL when unrecognised — never defaulted, because a wrong default would make the verdict-absence check fire on healthy agents. Enables the server to know whether this agent OWES a session-start verdict."),
   class: AgentClassEnum.optional().describe("ADR-0002 (v2.21.0): the agent's COARSE coordination posture — one of orchestrator | builder | advisory | auditor | transient (SSOT: src/agent-class.ts). Self-declared; IMMUTABLE after first registration (same rule as managed/host_id). Orthogonal to `role` (free-text label) and `capabilities` (what it does). Omit → `unclassified`; surfaced in discover_agents view='topology'."),
   /**
-   * v2.2.1 B2: bypass the duplicate-name active-session collision check.
-   * Default false → re-register on an actively-held name returns
-   * NAME_COLLISION_ACTIVE (forces operators to scope names distinctly, which
-   * kills the get_messages mailbox-drain race when two terminals share a
-   * RELAY_AGENT_NAME + token). Operators who genuinely need to force a
-   * takeover (e.g. previous session crashed + they can't wait for
-   * staleness or run `relay recover`) can pass force=true explicitly.
-   * Undocumented on the public tool description — it's an escape hatch,
-   * not a feature.
+   * v2.2.1 B2 → ADR-0012: request a CAS TAKEOVER of the name (NOT an
+   * unconditional bypass). Default false → re-register on an actively-held name
+   * returns NAME_COLLISION_ACTIVE. force=true is a CONDITIONAL takeover that
+   * MUST carry `expected_session_id` (see below): the server performs an atomic
+   * compare-and-swap on the row's session_id, so exactly one of two racing
+   * relaunches wins and the loser is rejected — there is NO lost-update path.
+   * Bare force=true (without expected_session_id) is rejected as malformed.
    */
-  force: z.boolean().default(false).optional().describe("Escape hatch — bypass the duplicate-name active-session collision check. Default false rejects re-registration on an actively-held name with NAME_COLLISION_ACTIVE so concurrent terminals don't race the get_messages mailbox-drain. Set true only when the prior session is unreachable (crashed terminal, stale-but-not-yet-aged-out session) and you cannot wait for the staleness window or run `relay recover`."),
+  force: z.boolean().default(false).optional().describe("ADR-0012: request a CAS TAKEOVER of an actively-held name (NOT an unconditional bypass). MUST be accompanied by expected_session_id (the session_id you READ from the row; null = expect an offline row). The takeover is an atomic compare-and-swap on that session_id — exactly one of two racing relaunches wins; the loser gets FORCE_PRECONDITION_FAILED and re-reads (never retry-force). Default false rejects re-registration on an actively-held name with NAME_COLLISION_ACTIVE. Set true only when the prior session is unreachable (crashed/relaunched terminal); a live concurrent terminal still wins the CAS and you correctly lose."),
+  /**
+   * ADR-0012: CAS precondition for a force takeover. REQUIRED when force=true;
+   * `null` is a valid EXPLICIT value meaning "I expect an offline row"
+   * (CAS matches `session_id IS NULL`). Absent + force=true → malformed reject.
+   */
+  expected_session_id: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("ADR-0012 CAS precondition for a force takeover. REQUIRED whenever force=true: the session_id the caller READ from the row it intends to take over (pass null to mean \"I expect an OFFLINE row\" → CAS matches session_id IS NULL). The re-register lands ONLY if the row's session_id still equals this value, so exactly one of two racing relaunches wins; the loser is rejected with FORCE_PRECONDITION_FAILED and MUST re-read (never retry-force, never come up mute). force=true WITHOUT this field is rejected as malformed — there is NO unconditional-force bypass, which would reopen the lost-update TOCTOU ADR-0012 eliminates."),
 });
 
 export const DiscoverAgentsSchema = z.object({

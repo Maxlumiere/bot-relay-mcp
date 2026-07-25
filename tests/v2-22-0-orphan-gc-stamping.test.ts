@@ -142,7 +142,7 @@ describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller 
     // successful authenticated path (enforceAuth #1) that re-registers the row.
     const reReg = await mcpCall("tools/call", {
       name: "register_agent",
-      arguments: { name: "reauth-a", role: "worker", capabilities: [], agent_token: token, force: true },
+      arguments: { name: "reauth-a", role: "worker", capabilities: [], agent_token: token, force: true, expected_session_id: getAgentAuthData("reauth-a")?.session_id },
     });
     expect(JSON.parse(reReg.result.content[0].text).success).toBe(true);
     // The re-auth MUST have stamped first_authed_at (this is the fix).

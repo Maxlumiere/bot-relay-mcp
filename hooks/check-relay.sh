@@ -578,6 +578,86 @@ SQL
 )
   if [ "$LIVENESS" = "LIVE" ]; then
     SKIP_REGISTER=1
+
+    # --- Fork B (ADR-0012 amended): DEAD-ANCHOR DIAGNOSTIC ------------------
+    # The 120s LIVE gate SKIPS re-register — correct for a true spawn handoff /
+    # concurrent terminal. But on a FAST (<120s) resummon of a NEW terminal
+    # whose PRIOR terminal died, the row still carries the dead prior session's
+    # session_id + host_shell_pids + agent_pid, so it reads LIVE and we skip →
+    # this terminal stays bound to a DEAD chain → no wake reaches it and Tether
+    # cannot bind a terminal to it → UNWAKEABLE. And the config-level HEALTHY
+    # verdict above LIES about it — the exact silence-as-health bug this arc
+    # exists to kill.
+    #
+    # Fork B does NOT auto-refresh the binding (safe automatic takeover needs
+    # session-bound mailbox auth too = ADR-0013, NOT this build). Instead: probe
+    # the STORED anchor (anchor-only, same-host — relay_anchor_liveness, the bash
+    # twin of TS anchorLivenessVerdict, pinned by the conformance test) and:
+    #   dead        → KILL the false-HEALTHY, name the exact non-destructive
+    #                 remedy (`relay release-binding`, which PROCEEDS on a dead
+    #                 anchor — diagnostic and remedy agree by construction).
+    #   unverifiable→ can't assert HEALTHY, but can't assert dead either: emit
+    #                 TAKEOVER_LIVENESS_UNVERIFIABLE and point at the --override
+    #                 remedy (release-binding REFUSES here without it, so naming
+    #                 the bare command would deadlock — name --override instead).
+    #   alive       → genuinely-live 2nd terminal / same agent → skip is correct,
+    #                 leave the verdict untouched. This is the no-false-fire crux.
+    # NEVER auto-forces. Suppressed when already MUTE (a bigger, more-actionable
+    # problem dominates the verdict line).
+    if [ "$RELAY_VERDICT" != "MUTE" ]; then
+      RELAY_OWN_GUID=$(relay_machine_guid 2>/dev/null || printf '')
+      RELAY_ANCHOR_ROW=$(sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+SELECT COALESCE(agent_pid,''), COALESCE(agent_pid_start,''), COALESCE(host_id,'')
+FROM agents WHERE name = :name LIMIT 1;
+SQL
+)
+      RELAY_A_PID="${RELAY_ANCHOR_ROW%%|*}"
+      RELAY_A_REST="${RELAY_ANCHOR_ROW#*|}"
+      RELAY_A_START="${RELAY_A_REST%%|*}"
+      RELAY_A_HOST="${RELAY_A_REST##*|}"
+      RELAY_ANCHOR_VERDICT=$(relay_anchor_liveness "$RELAY_A_PID" "$RELAY_A_START" "$RELAY_A_HOST" "$RELAY_OWN_GUID")
+
+      # The exact remedy command, path-quoted (the repo path can contain spaces).
+      RELAY_BIN_ABS="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+      if [ -f "$RELAY_BIN_ABS" ]; then
+        RELAY_RELEASE_CMD="node \"$RELAY_BIN_ABS\" release-binding $AGENT_NAME"
+      else
+        RELAY_RELEASE_CMD="relay release-binding $AGENT_NAME"
+      fi
+
+      case "$RELAY_ANCHOR_VERDICT" in
+        dead)
+          {
+            echo "[RELAY] ============== UNWAKEABLE: STALE BINDING =============="
+            echo "[RELAY] \"$AGENT_NAME\" reads live (session claimed <120s ago) but its recorded"
+            echo "[RELAY] agent process (pid $RELAY_A_PID) is DEAD on this host. This terminal is"
+            echo "[RELAY] bound to a dead session chain: NO wake will reach you and Tether cannot"
+            echo "[RELAY] bind a terminal to it. The relay LOOKS healthy and is NOT."
+            echo "[RELAY] FIX (non-destructive — preserves your token, name, capabilities):"
+            echo "[RELAY]     $RELAY_RELEASE_CMD"
+            echo "[RELAY] Then relaunch this agent; its next SessionStart re-binds cleanly."
+          } | tee /dev/stderr
+          relay_verdict_set "UNWAKEABLE" "stale binding: session reads live but agent_pid $RELAY_A_PID is dead on this host" " agent=\"$AGENT_NAME\" remedy=\"release-binding\""
+          ;;
+        unverifiable)
+          {
+            echo "[RELAY] ============ LIVENESS UNVERIFIABLE (live-skip) ============"
+            echo "[RELAY] \"$AGENT_NAME\" reads live but its binding anchor cannot be verified on"
+            echo "[RELAY] this host (no probe-able agent_pid, or a cross-host row). You may be fine,"
+            echo "[RELAY] OR an unwakeable resummon — this hook cannot tell them apart, so it will"
+            echo "[RELAY] NOT guess and will NOT take over."
+            echo "[RELAY] If you are NOT receiving wakes AND have confirmed the prior process is gone:"
+            echo "[RELAY]     $RELAY_RELEASE_CMD --override"
+          } | tee /dev/stderr
+          relay_verdict_set "TAKEOVER_LIVENESS_UNVERIFIABLE" "live-reading binding for \"$AGENT_NAME\" has no verifiable same-host anchor" " agent=\"$AGENT_NAME\""
+          ;;
+        alive)
+          : # genuinely live — skip is correct; leave the verdict as-is
+          ;;
+      esac
+    fi
+    # --- end dead-anchor diagnostic ----------------------------------------
   fi
 fi
 

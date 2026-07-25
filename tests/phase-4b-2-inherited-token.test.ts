@@ -277,7 +277,7 @@ describe("§4.2 unmanaged agent flow", () => {
     // exercises managed-immutability semantic, independent of collision.
     const r = await rpc(
       "register_agent",
-      { name: "u-5", role: "r", capabilities: [], managed: true, force: true },
+      { name: "u-5", role: "r", capabilities: [], managed: true, force: true, expected_session_id: getAgentAuthData("u-5")?.session_id },
       tok
     );
     expect(r.success).toBe(true);
@@ -460,7 +460,7 @@ describe("§4.4 race + edge matrix", () => {
     // v2.2.1 B2: force=true to bypass active-name collision gate.
     const r = await rpc(
       "register_agent",
-      { name: "r-5", role: "r", capabilities: [], managed: false, force: true },
+      { name: "r-5", role: "r", capabilities: [], managed: false, force: true, expected_session_id: getAgentAuthData("r-5")?.session_id },
       tok
     );
     expect(r.success).toBe(true);

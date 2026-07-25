@@ -132,22 +132,32 @@ describe("v2.1.3 I5 — NAME_COLLISION_ACTIVE on live session + wrong token", ()
     expect(body2.existing_session_id).toBe(body1.agent.session_id);
   });
 
-  it("(b2) same-owner re-register WITH force=true → succeeds + rotates session_id (v2.2.1 B2 escape hatch)", async () => {
+  it("(b2) same-owner re-register WITH force=true + expected_session_id → CAS takeover succeeds + rotates session_id (ADR-0012)", async () => {
     const first = await mcpCall("tools/call", {
       name: "register_agent",
       arguments: { name: "collider-2b", role: "r", capabilities: [] },
     });
     const body1 = parseEnvelope(first);
     const token = body1.agent_token;
+    const sid = body1.agent.session_id;
 
+    // ADR-0012: force is now a CAS takeover — it must carry the session_id the
+    // caller READ (here the live sid). It matches → the takeover wins.
     const reRegister = await mcpCall("tools/call", {
       name: "register_agent",
-      arguments: { name: "collider-2b", role: "r", capabilities: [], agent_token: token, force: true },
+      arguments: {
+        name: "collider-2b",
+        role: "r",
+        capabilities: [],
+        agent_token: token,
+        force: true,
+        expected_session_id: sid,
+      },
     });
     const body2 = parseEnvelope(reRegister);
     expect(body2.success).toBe(true);
     expect(body2.agent.name).toBe("collider-2b");
-    expect(body2.agent.session_id).not.toBe(body1.agent.session_id);
+    expect(body2.agent.session_id).not.toBe(sid);
   });
 
   it("(c) after relay recover, fresh register on the freed name → succeeds", async () => {

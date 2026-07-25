@@ -2697,6 +2697,49 @@ export function markAgentOffline(
 }
 
 /**
+ * ADR-0012 (Fork B) — non-destructive BINDING RELEASE.
+ *
+ * The dead-anchor diagnostic (hooks/check-relay.sh) detects a STALE BINDING — a
+ * fast resummon left a dead terminal's `host_shell_pids` + a dead `agent_pid`
+ * anchor, so Tether can't wake the agent ("no bound terminal") — and REFUSES to
+ * auto-recover (Fork B ships no automatic takeover). It names THIS as the exact
+ * operator remedy.
+ *
+ * Clears EXACTLY the binding — `session_id` + the Tether terminal chain
+ * (`host_shell_pids`) + the same-host liveness anchor (`agent_pid` /
+ * `agent_pid_start` / `last_alive`) — and PRESERVES the IDENTITY: `token_hash`,
+ * `auth_state`, `name`, `capabilities`, `host_id`, `description`, `last_seen`. So
+ * the next SessionStart takes the register path (`session_id IS NULL` → the 120s
+ * LIVE-gate reads STALE) and re-binds with a fresh chain — WITHOUT freeing the
+ * name, invalidating the token, or resetting the immutable capabilities. Those
+ * three hazards are exactly why `relay recover` (a destructive DELETE) was
+ * REJECTED as the remedy; see ADR-0012 amended.
+ *
+ * NO CAS: the operator is releasing a binding they've been told is dead and does
+ * not (and should not need to) know the current `session_id`. Idempotent. NEVER
+ * forces / registers / takes over, and touches NO mailbox path.
+ *
+ * SAFETY BOUNDARY: this raw helper trusts its caller. The LIVENESS GATE that
+ * refuses to release a LIVE binding (which would strand a healthy idle agent
+ * unwakeable — the self-inflicted silent-mute this arc exists to kill) lives in
+ * the `relay release-binding` CLI (src/cli/release-binding.ts), which calls this
+ * ONLY after `computeLivenessVerdict` reads OBSERVED-DEAD (or an explicit
+ * `--override`). Do NOT wire a new caller to this helper without that gate.
+ */
+export function releaseAgentBinding(name: string): { changed: boolean } {
+  const db = getDb();
+  const r = db.prepare(
+    "UPDATE agents SET session_id = NULL, host_shell_pids = NULL, agent_pid = NULL, " +
+    "agent_pid_start = NULL, last_alive = NULL, agent_status = 'offline', busy_expires_at = NULL " +
+    "WHERE name = ?"
+  ).run(name);
+  // Any anchor/session change invalidates BOTH cached probe verdicts → re-probe.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+  return { changed: r.changes === 1 };
+}
+
+/**
  * v2.2.2 BUG2 — sanctioned closed-session transition for a stdio
  * terminal that is shutting down *intentionally* (SIGINT / SIGTERM).
  *
@@ -3056,6 +3099,17 @@ export function registerAgent(
     host_shell_pids?: number[];
     /** Tether v0.3 PID-handshake: OS machine GUID. v2.11.0 GAP 1: session-refreshable on an authenticated re-register (provided→overwrite, omitted→preserve), mirroring host_shell_pids. Captured on first registration; the token-holder may refresh it on relaunch (e.g. to populate an empty host_id or after a machine move). */
     host_id?: string;
+    /**
+     * ADR-0012 — CAS precondition for a force TAKEOVER. When provided (including
+     * an explicit `null` = "expect an offline row"), the re-register UPDATE gains
+     * `AND session_id IS ?`, so the write lands ONLY if the row's session_id
+     * still equals this value. changes==0 with a session mismatch → the takeover
+     * LOST the race → ForcePreconditionError (distinct from the auth-race
+     * ConcurrentUpdateError). `undefined` = no session CAS (a normal re-register).
+     * The handler (handleRegisterAgent) REQUIRES this whenever force=true — there
+     * is no unconditional-force bypass left at the MCP surface.
+     */
+    expected_session_id?: string | null;
   } = {}
 ): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[]; registration_recovery: string | null } {
   const db = getDb();
@@ -3179,7 +3233,14 @@ export function registerAgent(
     // or the next valid registration after a force token rotation) comes back
     // available instead of staying stuck offline. Active states are preserved.
     const newAgentStatus = statusAfterReregister(existing.agent_status);
-    const r = db.prepare(
+    // ADR-0012 — force TAKEOVER compare-and-swap. When the caller supplies
+    // expected_session_id (the handler REQUIRES it whenever force=true), the
+    // re-register lands ONLY if the row's session_id still equals it → exactly
+    // one of two racing relaunches wins; the loser matches 0 rows and is mapped
+    // to ForcePreconditionError (distinct from the auth-race ConcurrentUpdate).
+    // `undefined` = no session CAS (a normal, non-force re-register).
+    const applySessionCas = options.expected_session_id !== undefined;
+    const reregisterSql =
       // v2.15.2 — CLEAR signal_received_at / signal_kind in the SAME statement
       // that rotates session_id / session_started_at, so a signal stamp from a
       // PRIOR session can't outlive it and drive deriveDashboardState to
@@ -3192,8 +3253,9 @@ export function registerAgent(
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ?, " +
       "signal_received_at = NULL, signal_kind = NULL, server_version = ?, " +
       "cli_profile = COALESCE(?, cli_profile) " +
-      "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
-    ).run(
+      "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?" +
+      (applySessionCas ? " AND session_id IS ?" : "");
+    const r = db.prepare(reregisterSql).run(
       role, timestamp, newHash,
       // ADR-0003: rotate the lookup digest only when a NEW token was issued;
       // an unchanged token keeps its existing digest.
@@ -3205,9 +3267,23 @@ export function registerAgent(
       // COALESCE: a re-register that does not know its profile must not ERASE a
       // profile an earlier register established.
       normalizeCliProfile(options.cli_profile),
-      name, existingState, existing.token_hash, casRecoveryHash
+      name, existingState, existing.token_hash, casRecoveryHash,
+      ...(applySessionCas ? [options.expected_session_id ?? null] : [])
     );
     if (r.changes !== 1) {
+      if (applySessionCas) {
+        // ADR-0012 — disambiguate a LOST TAKEOVER (session_id moved off the
+        // expected value — another relaunch won, or the row went live) from a
+        // concurrent auth race. Best-effort re-read: the row may churn again,
+        // but the caller re-reads regardless; this only picks the right code.
+        const cur = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(name) as
+          | { session_id: string | null }
+          | undefined;
+        const expected = options.expected_session_id ?? null;
+        if (!cur || cur.session_id !== expected) {
+          throw new ForcePreconditionError(name, expected, cur?.session_id ?? null);
+        }
+      }
       throw new ConcurrentUpdateError(
         `register_agent failed for "${name}": auth_state / token_hash / recovery_token_hash changed since we read it (concurrent rotate_token / revoke_token / unregister_agent / recovery reissue). Re-auth and retry.`
       );
@@ -5292,6 +5368,33 @@ export class ConcurrentUpdateError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ConcurrentUpdateError";
+  }
+}
+
+/**
+ * ADR-0012 — thrown by `registerAgent` when a force TAKEOVER loses its
+ * compare-and-swap: the caller passed `expected_session_id` (the session_id it
+ * READ from the row) but the row's session_id no longer equals it — another
+ * relaunch won the takeover, or the row went live between the caller's read and
+ * this write. There is exactly ONE winner by construction; every other racer
+ * lands here. The handler maps this to FORCE_PRECONDITION_FAILED; the caller
+ * MUST re-read (its LIVE gate then skips) and surface LOUDLY — never retry-force,
+ * never come up mute (silence-as-failure). This is the concurrency guarantee
+ * that replaces the old unconditional force bypass (codex-5-5's #131 TOCTOU).
+ */
+export class ForcePreconditionError extends Error {
+  public readonly expectedSessionId: string | null;
+  public readonly actualSessionId: string | null;
+  constructor(name: string, expectedSessionId: string | null, actualSessionId: string | null) {
+    super(
+      `Force takeover of "${name}" lost the compare-and-swap: expected session_id=${expectedSessionId ?? "NULL"} ` +
+      `but the row is now session_id=${actualSessionId ?? "NULL"}. Another live session holds this name ` +
+      `(a concurrent relaunch won, or the row went live). Re-read — do NOT retry force. If this is a genuine ` +
+      `duplicate relaunch, scope the name (distinct RELAY_AGENT_NAME) rather than racing the mailbox drain.`
+    );
+    this.name = "ForcePreconditionError";
+    this.expectedSessionId = expectedSessionId;
+    this.actualSessionId = actualSessionId;
   }
 }
 
