@@ -46,6 +46,9 @@ import {
   reconcileRelayConfig,
   upsertMcpServer,
   upsertSessionStartHook,
+  quoteForHookCommand,
+  canQuoteForHookCommand,
+  migrateRawHookCommand,
 } from "./config-merge.js";
 import { installDaemon, type InstallDeps } from "./launchd.js";
 
@@ -217,8 +220,16 @@ export function moduleRootFromUrl(moduleUrl: string): string {
 
 /** Resolve the install root (repo dir) + the two abs paths the operator's
  *  Claude config needs to point at. */
-function installPaths(): { root: string; distEntry: string; hookScript: string } {
-  const root = moduleRootFromUrl(import.meta.url);
+function installPaths(rootOverride?: string): { root: string; distEntry: string; hookScript: string } {
+  // rootOverride is a TEST seam for the atomicity controls. It is NOT reachable
+  // from the CLI (bin/relay calls `run(rest)` with no second argument, and nothing
+  // in argv/env/config sets it), and it structurally CANNOT bypass the preflight —
+  // it feeds the very `hookScript` value the preflight validates. (It is not
+  // justified by "a real module URL can't contain a newline": codex disproved that
+  // by running the shipped CLI from a checkout whose directory name has one. The
+  // seam exists so the control can exercise that real shape deterministically, not
+  // because the shape is impossible.) Production passes nothing → the module dir.
+  const root = rootOverride ?? moduleRootFromUrl(import.meta.url);
   return {
     root,
     distEntry: path.join(root, "dist", "index.js"),
@@ -235,16 +246,24 @@ export function installMcpServer(distEntry: string, jsonPath: string = claudeJso
   return { changed };
 }
 
-/** v2.16.0 — deep-merge the SessionStart hook into ~/.claude/settings.json. */
+/** v2.16.0 — deep-merge the SessionStart hook into ~/.claude/settings.json.
+ * v2.23.0 (codex #139): QUOTE the command (quoteForHookCommand) so a spaced
+ * install root yields an unambiguous, precisely-ownable hook — and MIGRATE a
+ * prior RAW (unquoted) literal of this exact root to the quoted form, so the
+ * ambiguous shape drains out of the installed base instead of being carried
+ * forever. Migration is exact-literal, never a classifier (see config-merge). */
 export function installHook(hookScript: string, settingsPath: string = claudeSettingsPath()): { changed: boolean } {
   const existing = readJsonSafe(settingsPath);
-  const { root, changed } = upsertSessionStartHook(existing, {
+  const canonical = quoteForHookCommand(hookScript);
+  const migrated = migrateRawHookCommand(existing, hookScript, canonical);
+  const { root, changed } = upsertSessionStartHook(migrated.root, {
     matcher: "startup|resume",
-    command: hookScript,
+    command: canonical,
     timeout: 10,
   });
-  if (changed) atomicWriteJson(settingsPath, root, 0o600);
-  return { changed };
+  const anyChange = migrated.changed || changed;
+  if (anyChange) atomicWriteJson(settingsPath, root, 0o600);
+  return { changed: anyChange };
 }
 
 /** Real launchd deps — the only place init shells out to launchctl / fetch. */
@@ -285,7 +304,7 @@ function realDaemonDeps(log: (l: string) => void): InstallDeps {
   };
 }
 
-export async function run(argv: string[]): Promise<number> {
+export async function run(argv: string[], rootOverride?: string): Promise<number> {
   let args: ParsedArgs;
   try {
     args = parseArgs(argv);
@@ -368,6 +387,26 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // PREFLIGHT — MUST run before ANY filesystem action (codex #139 P1 atomicity,
+  // rounds 6 & 10). Everything below touches the disk (ensureSecureDir creates
+  // $RELAY_HOME, createInstance scaffolds an instance dir, atomicWriteJson writes
+  // config/mcp/hook). If the hook command is unquotable (a newline/CR install
+  // root) we REFUSE — and a refusal that has already created $RELAY_HOME or an
+  // instance dir is a PARTIAL COMMIT that makes "nothing was written" a LIE (codex
+  // caught exactly this by diffing the whole tree, not just config.json). THE
+  // RULE: nothing that CREATES a filesystem artefact may run before this decision.
+  // installPaths is pure path math. Only gate when a hook will actually be written
+  // (--config-only / --skip-hooks never call quoteForHookCommand).
+  const { distEntry, hookScript } = installPaths(rootOverride);
+  if (!args.configOnly && !args.skipHooks && !canQuoteForHookCommand(hookScript)) {
+    process.stderr.write(
+      `relay init: refusing — the install path contains a newline/CR: ${JSON.stringify(hookScript)}. ` +
+        `No safe single-line SessionStart hook command exists for it, so nothing was written. Reinstall from a ` +
+        `path without control characters, or re-run with --config-only / --skip-hooks to install without the hook.\n`,
+    );
+    return 1;
+  }
+
   // ---- 1. config.json (reconcile) ------------------------------------------
   ensureSecureDir(defaultBotRelayDir(), 0o700);
   if (effectiveInstanceId && perInstanceDir) {
@@ -405,6 +444,7 @@ export async function run(argv: string[]): Promise<number> {
     : reconcileRelayConfig(existingConfig, defaults);
   // --agent explicitly sets/updates the hook's default agent name (override).
   if (args.agent) reconciled.root.default_agent_name = args.agent;
+
   atomicWriteJson(configPath, reconciled.root, 0o600);
   ensureSecureFile(configPath, 0o600);
   process.stdout.write(
@@ -416,8 +456,6 @@ export async function run(argv: string[]): Promise<number> {
     process.stdout.write(`\nDone (config only). Your HTTP secret is in ${configPath}.\n`);
     return 0;
   }
-
-  const { distEntry, hookScript } = installPaths();
 
   // ---- 2. ~/.claude.json — mcpServers deep-merge ---------------------------
   if (!args.skipMcp) {
@@ -441,7 +479,7 @@ export async function run(argv: string[]): Promise<number> {
   if (!args.skipDaemon && process.env.RELAY_SKIP_DAEMON !== "1") {
     const wantsHttp = transport === "http" || transport === "both";
     if (process.platform === "darwin" && wantsHttp) {
-      const { root } = installPaths();
+      const { root } = installPaths(rootOverride);
       const res = await installDaemon(
         {
           nodePath: process.execPath,

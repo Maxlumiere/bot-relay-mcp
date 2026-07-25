@@ -304,3 +304,184 @@ export function upsertSessionStartHook(
   out.hooks = { ...hooks, SessionStart: sessionStart };
   return { root: out, changed: true };
 }
+
+/**
+ * Is `command` the relay's SessionStart hook (`hooks/check-relay.sh`)? The
+ * DETECTION / exact-match predicate — used where a false positive is expensive
+ * (the installer's dedup; the tripwire's precise-watch set). NOT the only relay-
+ * hook predicate; see "three predicates, three certainties" below.
+ *
+ * WHAT IT GUARANTEES — and what it does NOT (codex flagged three rounds of
+ * over-claim on this one function; state the limit first). It is PRECISE FOR THE
+ * FORMS WE EMIT: quoteForHookCommand only ever produces a single-quoted path, and
+ * this owns exactly those + the legacy bare no-space path, and rejects the shapes
+ * we never emit (`echo …`, unquoted `$()`/`;`, double-quoted, unquoted-whitespace).
+ * It is NOT a general "is this really a relay invocation" oracle: the single-quote
+ * branch owns ANY `'…/hooks/check-relay.sh'` BY SHAPE, so it DELIBERATELY
+ * OVER-OWNS some foreign quoted paths — e.g. `'/foreign/hooks/check-relay.sh'` and
+ * `'/bin/bash /x/hooks/check-relay.sh'` (which reads as one literal path token, not
+ * a bash call). That over-ownership is WATCH-ONLY: its worst case is a false
+ * tripwire ALARM (the accepted direction), never a destructive migration write
+ * (migration uses exact-literal match, not this). We accept it because
+ * disambiguating a single-quoted string's INTENT is undecidable and the cost is
+ * only an alarm.
+ *
+ * THE RULE (two forms — init now emits only the first):
+ *   - SINGLE-QUOTED `'…'`: inside single quotes every byte is literal, so it is ONE
+ *     token — own by SHAPE, no metachar check: inner starts "/" and ends
+ *     "/hooks/check-relay.sh". This is quoteForHookCommand's canonical output, incl.
+ *     roots with `$`, `'`, backticks, `;` (all literal + safe inside `'…'`).
+ *   - OTHERWISE (unquoted / double-quoted): must be a BARE SAFE absolute path —
+ *     starts "/", ends the tail, NO shell metachar (|;&$<>`"CR LF), NO whitespace.
+ * REJECTED: `echo /foreign/…`, `/bin/bash /foreign/…`, `/bin/bash foreign/…`,
+ * wrong parent, .bak/dir suffix, bare basename, an UNQUOTED `$()`/`;` path
+ * (metachar), a DOUBLE-quoted command (we never emit one — double quotes don't
+ * stop expansion), an unquoted SPACED path (undecidable — see below). ACCEPTED:
+ * init's single-quoted canonical (any root), a legacy raw NO-SPACE path, a
+ * `%20`-fossil path.
+ *
+ * L4 AT THE HELPER LEVEL (ADR-0015 — codex #139 v4). quoteForHookCommand began as
+ * a DISPLAY helper (quote only on whitespace). It was moved onto the install path,
+ * where its output is EXECUTED as shell — a no-whitespace `$()`/apostrophe root
+ * shipped RAW = command injection. A signal is authorization-grade only if its
+ * CONTRACT says so; a quoting fn is security-grade only if its contract says it
+ * handles shell metacharacters. Re-derive the contract when you move a helper onto
+ * a new consequence — do not assume the name still fits. Fixed by ALWAYS
+ * single-quoting; the classifier's single-quote branch reflects that canonical.
+ *
+ * WHY UNQUOTED-WITH-WHITESPACE IS NOT OWNED — the load-bearing decision.
+ * `/a b/c` is EITHER the single path "/a b/c" OR the two tokens "/a" and "b/c",
+ * and nothing in the string settles it without quoting or the filesystem. So a
+ * real spaced install root (`/Users/x/Claude AI/…/check-relay.sh`) is
+ * SYNTACTICALLY INDISTINGUISHABLE from an interpreter + relative script
+ * (`/bin/bash foreign/…/check-relay.sh`). That is not a parser gap; it is a
+ * property of the input. Standing rule: NO IRREVERSIBLE ACTION ON AN UNDECIDABLE
+ * PREDICATE — quarantine it or make a caller assert it. So we DON'T own it here;
+ * the operator makes it decidable by running `relay init`, which quotes it.
+ *
+ * THREE PREDICATES, THREE CERTAINTIES (ADR-0015, generalizes L2/L3 — the level of
+ * certainty required scales with the CONSEQUENCE of a false positive):
+ *   - DETECTION / exact-match (this fn) → drives dedup + precise watch → must be
+ *     PRECISE, uniformly conservative on the undecidable class.
+ *   - WATCH (tripwire ambiguous-legacy marker) → drives only an ALARM → may be
+ *     BROADER; its worst case is a false alarm, so it may cover the undecidable
+ *     class — but its message must NOT overstate ownership (see the tripwire).
+ *   - MIGRATION (installHook) → drives a DESTRUCTIVE write → uses NO predicate at
+ *     all: EXACT LITERAL match against the string THIS install root would have
+ *     written. A heuristic authorizing a destructive write is the #128 defect.
+ *
+ * NOTE — installHook's migration does NOT call this predicate; it exact-matches
+ * the literal string this root would have written. Detect and migrate ask
+ * different questions with different failure costs; they are deliberately not one
+ * shared predicate (the earlier "L4 single source" framing was withdrawn).
+ */
+export function isRelayCheckHookCommand(command: unknown): boolean {
+  if (typeof command !== "string") return false;
+  const s = command.trim();
+  // init's canonical form is SINGLE-quoted (quoteForHookCommand). Inside `'…'`
+  // every byte is LITERAL, so the command is ONE token and the inner is a bare
+  // path — own it by SHAPE, with NO metacharacter check: a `$`/`;`/backtick inside
+  // single quotes is literal and safe, and IS exactly what we now emit for a root
+  // that contains one (e.g. `/tmp/O'Hare/…`, `/x/$(id)/…`). We own the canonical
+  // string; the region watches it verbatim.
+  if (s.length >= 2 && s[0] === "'" && s[s.length - 1] === "'") {
+    const inner = s.slice(1, -1);
+    return inner.startsWith("/") && inner.endsWith("/hooks/check-relay.sh");
+  }
+  // Otherwise it must be a BARE, unquoted, SAFE absolute path — the legacy
+  // no-space raw form. A shell metacharacter means a command LINE, not a path;
+  // unquoted whitespace is UNDECIDABLE (`/a b/c` is one path or two tokens; a
+  // spaced install root is indistinguishable from `/bin/bash foreign/…`) → not
+  // owned (the tripwire WATCHES that shape separately, watch-only). `"` is in the
+  // metachar set deliberately: we NEVER emit a double-quoted command (double
+  // quotes do NOT stop `$()`/backtick expansion), so a double-quoted string is not
+  // our canonical and is conservatively not owned.
+  if (!s.startsWith("/")) return false; // not `echo <x>` / a relative call
+  if (!s.endsWith("/hooks/check-relay.sh")) return false; // exact tail
+  if (/[|;&$<>`"\r\n]/.test(s)) return false;
+  if (/\s/.test(s)) return false;
+  return true;
+}
+
+/**
+ * Quote a hook-command PATH for embedding in a JSON "command" field. Claude Code
+ * runs that string AS SHELL, and `relay init` writes it to the user's real
+ * settings.json — so this is a SECURITY writer, not a display helper.
+ *
+ * ALWAYS SINGLE-QUOTE (codex #139 v4 P1). An earlier "quote only if it has
+ * whitespace" was fit for emitting display text; on the shell-executed install
+ * path it was a command-injection surface — a NO-whitespace root like
+ * `/tmp/O'Hare/…` (unbalanced quote → broken hook) or `/x/$(id)/…` (bash runs
+ * `id`) shipped RAW. Single-quoting is uniform and TOTAL: inside `'…'` every byte
+ * is literal — `$ ` backtick `; & | > < * ? "` `\` space, apostrophes — nothing
+ * expands. The only escape needed is the embedded single-quote, closed-reopened
+ * as `'\''` (POSIX). No metacharacter blacklist — a blacklist is the wrong shape
+ * for a quoting function; unconditional quoting is the defensible one.
+ *
+ * REFUSES a newline/CR-bearing path: no safe SINGLE-LINE shell command exists for
+ * it (and both watch predicates reject control chars, so it would be unwatchable).
+ * The one shared impl — `relay init` (installHook) and `relay generate-hooks` both
+ * call it — so every emitted hook command is the canonical, precisely-ownable
+ * single-quoted form.
+ */
+export function quoteForHookCommand(p: string): string {
+  if (!canQuoteForHookCommand(p)) {
+    throw new Error(
+      `[config] refusing to write a hook command for a path containing a newline/CR: ${JSON.stringify(p)} — ` +
+        `no safe single-line shell command exists for it. Reinstall from a path without control characters.`,
+    );
+  }
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Would `quoteForHookCommand(p)` succeed? The PREFLIGHT predicate — a single
+ * source with quoteForHookCommand's throw condition, so init can validate BEFORE
+ * it writes anything (a refusal must not be a partial commit — codex #139 v6 P1).
+ * Only a newline/CR-bearing path is unquotable; every other byte single-quotes.
+ */
+export function canQuoteForHookCommand(p: string): boolean {
+  return !/[\r\n]/.test(p);
+}
+
+/**
+ * DETERMINISTIC migration of a SessionStart hook command — EXACT LITERAL match,
+ * NO classifier, NO resemblance. If any SessionStart hook's command is EXACTLY
+ * `rawCommand` (the unquoted string a prior `installHook` wrote for THIS install
+ * root) and `rawCommand !== canonicalCommand` (i.e. the root has spaces and the
+ * raw form needs quoting), rewrite exactly that string to `canonicalCommand`.
+ *
+ * WHY EXACT-MATCH AND NOT isRelayCheckHookCommand: this drives a DESTRUCTIVE write
+ * (it replaces an entry). A heuristic authorizing a destructive write is the #128
+ * defect — a fuzzy predicate is fuzzy at the edges and the edges are where an
+ * operator's own config lives. The installer KNOWS the exact string it would have
+ * written, so it needs no predicate. Any shape it does not recognize byte-for-byte
+ * (a different root, a `%20` path from elsewhere) is LEFT ALONE — the tripwire
+ * surfaces those loudly; migrating them would be guessing.
+ */
+export function migrateRawHookCommand(
+  root: Record<string, unknown> | null,
+  rawCommand: string,
+  canonicalCommand: string,
+): MergeResult {
+  const out: Record<string, unknown> = { ...(root ?? {}) };
+  if (rawCommand === canonicalCommand) return { root: out, changed: false }; // no-op (no-space install)
+  const hooks: Record<string, unknown> = { ...((out.hooks as Record<string, unknown> | undefined) ?? {}) };
+  if (!Array.isArray(hooks.SessionStart)) return { root: out, changed: false };
+  let changed = false;
+  const sessionStart = (hooks.SessionStart as unknown[]).map((group) => {
+    const inner = (group as { hooks?: unknown[] })?.hooks;
+    if (!Array.isArray(inner)) return group;
+    const newInner = inner.map((h) => {
+      if ((h as { command?: unknown })?.command === rawCommand) {
+        changed = true;
+        return { ...(h as Record<string, unknown>), command: canonicalCommand };
+      }
+      return h;
+    });
+    return { ...(group as Record<string, unknown>), hooks: newInner };
+  });
+  if (!changed) return { root: out, changed: false };
+  out.hooks = { ...hooks, SessionStart: sessionStart };
+  return { root: out, changed: true };
+}
