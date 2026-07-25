@@ -17,8 +17,9 @@ import { DASHBOARD_BASE_STYLES, DASHBOARD_THEMES } from "./dashboard-styles.js";
  * one agent's plaintext mail to whoever holds it, which get_messages grants
  * ONLY to that agent's own token. It is therefore emitted solely to an
  * authenticated dashboard caller (see snapshotApi); a caller admitted on
- * loopback position alone is NOT a principal and never receives it. Full
- * ciphertext stays in the `content` / `description` / `result` fields.
+ * loopback position alone is NOT a principal and never receives it. The raw
+ * column ships ONLY in the authenticated response (ciphertext if a keyring is
+ * set, else plaintext); the unauthenticated view omits it entirely.
  */
 const PREVIEW_CAP = 100;
 function previewField(raw: string | null | undefined): string | null {
@@ -29,22 +30,39 @@ function previewField(raw: string | null | undefined): string | null {
 }
 
 /**
- * Per-agent fields that identify or locate an agent's PROCESS/SESSION: the
- * session id (a mailbox-scoping handle), OS process ids, host id, and terminal
- * title. Under ADR-0006 these are operator-power and must not reach a snapshot
- * caller admitted on network position alone; presence/status/counts stay
- * visible so the operational dashboard still works without a secret.
+ * ADR-0006 (2026-07-25) — the UNauthenticated snapshot is built from an
+ * explicit ALLOWLIST of safe fields, NOT by redacting known-sensitive ones.
+ *
+ * The denylist this replaces was worse than the leak it tried to fix: it nulled
+ * the DERIVED `content_preview` but the row spread still shipped the raw
+ * `content` column, which is PLAINTEXT when no keyring is configured (at-rest
+ * encryption is OPT-IN — the default, and the common single-operator machine).
+ * A denylist also fails silently the day a new column is added. Naming the safe
+ * fields makes every unlisted field — including any added tomorrow, and every
+ * content column whether encrypted or plaintext — absent BY CONSTRUCTION.
+ *
+ * Safe = identity / presence / flow metadata the operational dashboard needs.
+ * Deliberately EXCLUDED: message/task CONTENT (content/description/result) and
+ * process/session locators (session_id/host_shell_pids/host_id/terminal_title_ref).
  */
-const OPERATOR_ONLY_AGENT_FIELDS = [
-  "session_id",
-  "host_shell_pids",
-  "host_id",
-  "terminal_title_ref",
+const AGENT_PUBLIC_FIELDS = [
+  "name", "role", "capabilities", "description", "status", "agent_status",
+  "liveness", "alive", "last_alive", "last_seen", "created_at", "has_token",
+  "class", "cli_profile", "server_version",
 ] as const;
-function redactOperatorAgentFields<T extends object>(a: T): Partial<T> {
-  const copy: Partial<T> = { ...a };
-  for (const f of OPERATOR_ONLY_AGENT_FIELDS) delete (copy as Record<string, unknown>)[f];
-  return copy;
+const MESSAGE_PUBLIC_FIELDS = [
+  "id", "from_agent", "to_agent", "priority", "status", "created_at",
+  "routed_capability", "disposition", "deadline", "read_at", "resolved_at", "seq",
+] as const;
+const TASK_PUBLIC_FIELDS = [
+  "id", "from_agent", "to_agent", "title", "priority", "status",
+  "created_at", "updated_at", "lease_renewed_at", "required_capabilities",
+] as const;
+/** Build an object from ONLY the named fields that are present on the source. */
+function pickPublic(obj: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const f of fields) if (f in obj) out[f] = obj[f];
+  return out;
 }
 
 /**
@@ -59,19 +77,19 @@ function redactOperatorAgentFields<T extends object>(a: T): Partial<T> {
  *   - webhooks: raw `WebhookRecord.secret` is replaced with
  *     `has_secret: boolean` by the dashboard mapper below. NEVER surfaces
  *     the raw HMAC secret.
- *   - messages / tasks: raw `content` / `description` / `result` columns
- *     remain at-rest-encrypted ciphertext (`enc1:…` / `enc:<kid>:…`)
- *     in every response. The sibling `content_preview` /
- *     `description_preview` / `result_preview` fields (100-char decrypted
- *     previews) are OPERATOR-POWER and are emitted ONLY when the caller
- *     authenticated with a dashboard secret (res.locals.dashboardAuthenticated).
- *     ADR-0006 (2026-07-25) corrects the prior v2.2.0 note, which claimed any
- *     caller reaching the preview "could already call get_messages for the
- *     same content" — FALSE: get_messages is scoped to the caller's OWN inbox
- *     by its own token and can never return another agent's content, whereas a
- *     no-secret loopback caller presents no token at all. Location is not a
- *     principal: an unauthenticated caller gets a `restricted` snapshot with
- *     previews nulled and process metadata redacted.
+ *   - messages / tasks: an AUTHENTICATED caller (verified dashboard secret) gets
+ *     the full rows — raw `content` / `description` / `result` (ciphertext only
+ *     IF a keyring is configured; PLAINTEXT otherwise, since at-rest encryption
+ *     is opt-in) plus decrypted `*_preview` fields. An UNAUTHENTICATED caller
+ *     gets an ALLOWLISTED metadata view (see `*_PUBLIC_FIELDS`) with NO content
+ *     column of any kind — shipping the raw column would leak plaintext by
+ *     default. ADR-0006 (2026-07-25) corrects the prior v2.2.0 note twice over:
+ *     it claimed any caller reaching the preview "could already call
+ *     get_messages for the same content" (FALSE — get_messages is scoped to the
+ *     caller's OWN token-bound inbox, never another agent's), AND it assumed the
+ *     raw column was safe because "encrypted" (FALSE by default). Location is
+ *     not a principal: unauthenticated → `restricted`, and `restricted` means
+ *     the content is genuinely absent from the body, not merely un-previewed.
  *   - webhook_delivery_log with its `error_text` is NOT returned by
  *     snapshotApi. If a future change adds it, redact internal-looking
  *     paths + IPs before surfacing.
@@ -144,13 +162,15 @@ export function snapshotApi(_req: Request, res: Response): void {
     const inboxByName = new Map(inboxRows.map((r) => [r.agent_name, r]));
     const agents = agentsBase.map((a) => {
       const ix = inboxByName.get(a.name);
-      const view = authed ? a : redactOperatorAgentFields(a);
-      return {
-        ...view,
+      // Counts are non-sensitive flow metadata — safe in both views.
+      const counts = {
         pending_count: ix ? ix.pending_count : 0,
         unread_count: ix ? ix.unread_count : 0,
         last_message_at: ix ? ix.last_message_at : null,
       };
+      return authed
+        ? { ...a, ...counts }
+        : { ...pickPublic(a as unknown as Record<string, unknown>, AGENT_PUBLIC_FIELDS), ...counts };
     });
     const webhooks = listWebhooks().map((w) => ({
       id: w.id,
@@ -176,22 +196,26 @@ export function snapshotApi(_req: Request, res: Response): void {
     // v2.2.0 Phase 3: attach 100-char decrypted previews alongside the
     // raw (encrypted) content/description/result fields. Frontend renders
     // the preview; raw stays available for clients that want it.
-    // Previews are operator-power (ADR-0006): only an authenticated caller
-    // receives decrypted plaintext; otherwise null. The raw encrypted column
-    // still ships, so the frontend can show a "authenticate to view" affordance.
-    const messagesWithPreview = messages.map((m) => ({
-      ...m,
-      content_preview: authed ? previewField(m.content) : null,
-    }));
-    const tasksWithPreview = activeTasks.map((t) => ({
-      ...t,
-      description_preview: authed ? previewField(t.description) : null,
-    }));
-    const completionsWithPreview = recentCompletions.map((t) => ({
-      ...t,
-      description_preview: authed ? previewField(t.description) : null,
-      result_preview: authed ? previewField(t.result) : null,
-    }));
+    // CONTENT is operator-power (ADR-0006). An authenticated caller gets the
+    // full row + decrypted previews. An UNauthenticated caller gets ONLY the
+    // allowlisted metadata — NO content/description/result column at all (they
+    // are plaintext without a keyring), so there is nothing to leak, by
+    // construction, even for a column added later.
+    const messagesWithPreview = messages.map((m) =>
+      authed
+        ? { ...m, content_preview: previewField(m.content) }
+        : pickPublic(m as unknown as Record<string, unknown>, MESSAGE_PUBLIC_FIELDS),
+    );
+    const tasksWithPreview = activeTasks.map((t) =>
+      authed
+        ? { ...t, description_preview: previewField(t.description) }
+        : pickPublic(t as unknown as Record<string, unknown>, TASK_PUBLIC_FIELDS),
+    );
+    const completionsWithPreview = recentCompletions.map((t) =>
+      authed
+        ? { ...t, description_preview: previewField(t.description), result_preview: previewField(t.result) }
+        : pickPublic(t as unknown as Record<string, unknown>, TASK_PUBLIC_FIELDS),
+    );
 
     // v2.2.1 P1: surface the server-side default theme alongside the rest
     // of the snapshot. The dashboard client reads it on first connect when

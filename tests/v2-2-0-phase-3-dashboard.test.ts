@@ -44,7 +44,7 @@ delete process.env.RELAY_HTTP_SECRET;
 delete process.env.RELAY_DASHBOARD_SECRET;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { registerAgent, sendMessage, closeDb } = await import("../src/db.js");
+const { registerAgent, sendMessage, getDb, closeDb } = await import("../src/db.js");
 const { _resetDashboardWsForTests } = await import("../src/transport/websocket.js");
 
 let server: HttpServer;
@@ -154,37 +154,61 @@ describe("v2.2.0 Phase 3 — dashboard HTML", () => {
   });
 });
 
-// ADR-0006 (2026-07-25): "location is not a principal." Decrypted content
-// previews + process-identifying agent metadata are operator-power and must be
-// REFUSED to a caller admitted on loopback position alone. These are the
-// ADR-0015 harm-attempt legs: getJson presents NO credential (the tokenless /
-// co-resident caller) against a no-secret deployment (both secrets deleted at
-// module top). The prior S1-S3 asserted the leak was correct — the exact
-// "test derived from the implementation defends the hole" failure ADR-0015 names.
-describe("v2.2.0 /api/snapshot — ADR-0006 harm refused (unauthenticated loopback = restricted)", () => {
-  it("(S1) decrypted content_preview is WITHHELD; raw ciphertext column still ships", async () => {
+// ADR-0006 (2026-07-25): "location is not a principal." The HARM is
+// "a secret string reached an unauthenticated caller" — so these assert the
+// secret is ABSENT FROM THE ENTIRE RESPONSE BODY (field-agnostic), not that one
+// derived field is null. That is what catches the raw `content` column (which
+// is PLAINTEXT with no keyring — encryption is opt-in) and any field added
+// later. The prior version asserted `content_preview===null` while the row
+// spread still shipped the plaintext `content` — a proxy that defended the hole
+// (codex flipped it to `content===SECRET` and it passed). getJson presents NO
+// credential against a no-secret deployment (both secrets deleted at module top).
+describe("v2.2.0 /api/snapshot — ADR-0006 harm refused (unauthenticated loopback)", () => {
+  const SECRET = "TOPSECRET-cross-agent-plaintext-Zx9";
+
+  it("(S1, NO KEYRING = the default) the message secret is ABSENT from the whole snapshot body", async () => {
+    delete process.env.RELAY_ENCRYPTION_KEY; // pass-through → content stored as plaintext
     registerAgent("snap-from", "r", []);
     registerAgent("snap-to", "r", []);
-    sendMessage("snap-from", "snap-to", "hello dashboard", "normal");
+    sendMessage("snap-from", "snap-to", SECRET, "normal");
     const r = await getJson("/api/snapshot");
     expect(r.status).toBe(200);
     expect(r.json.authenticated).toBe(false);
     expect(r.json.content_visibility).toBe("restricted");
-    const m = r.json.messages[0];
-    expect(typeof m.content).toBe("string"); // raw column present (encrypted or plain)
-    expect(m.content_preview).toBeNull(); // decrypted plaintext withheld
+    expect(JSON.stringify(r.json)).not.toContain(SECRET); // the harm, field-agnostic
+    // Non-vacuity: the message IS still listed with its flow metadata (so the
+    // secret is absent because CONTENT was stripped, not because the array is
+    // empty). It just carries no content/content_preview of any kind.
+    const m = (r.json.messages as any[]).find((x) => x.from_agent === "snap-from");
+    expect(m).toBeDefined();
+    expect(m.to_agent).toBe("snap-to");
+    expect("content" in m).toBe(false);
+    expect("content_preview" in m).toBe(false);
   });
 
-  it("(S2) process-identifying agent metadata is redacted; presence stays visible", async () => {
+  it("(S2) process-identifying agent metadata is absent for an unauthenticated caller; presence stays", async () => {
     registerAgent("agent-with-title", "r", [], { terminal_title_ref: "my-window" });
     const r = await getJson("/api/snapshot");
     expect(r.status).toBe(200);
     const ag = (r.json.agents as any[]).find((a) => a.name === "agent-with-title");
-    expect(ag).toBeDefined(); // the agent is still listed (presence is agent-trust, not operator-power)
-    expect(ag.terminal_title_ref).toBeUndefined();
+    expect(ag).toBeDefined(); // presence is agent-trust — the agent is still listed
     expect(ag.session_id).toBeUndefined();
     expect(ag.host_shell_pids).toBeUndefined();
     expect(ag.host_id).toBeUndefined();
+    expect(JSON.stringify(r.json)).not.toContain("my-window"); // field-agnostic backstop
+  });
+
+  it("(S3) task description + result never reach an unauthenticated caller (active AND completed)", async () => {
+    delete process.env.RELAY_ENCRYPTION_KEY;
+    const ts = new Date().toISOString();
+    const ins = getDb().prepare(
+      "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    );
+    ins.run("task-active-1", "boss", "worker", "job A", "SECRET-DESC-active-Q7", "normal", "posted", null, ts, ts, null);
+    ins.run("task-done-1", "boss", "worker", "job B", "plain desc", "normal", "completed", "SECRET-RESULT-done-K3", ts, ts, null);
+    const body = JSON.stringify((await getJson("/api/snapshot")).json);
+    expect(body).not.toContain("SECRET-DESC-active-Q7"); // active task description
+    expect(body).not.toContain("SECRET-RESULT-done-K3"); // completed task result
   });
 });
 
@@ -218,16 +242,18 @@ describe("v2.2.0 /api/snapshot — ADR-0006 innocent twin (authenticated operato
     });
   }
 
-  it("(A1) authenticated caller receives decrypted previews + full metadata", async () => {
+  it("(A1) an authenticated caller receives the FULL content + metadata (guard doesn't break the dashboard)", async () => {
+    const CONTENT = "authed-operator-sees-this-fully";
     registerAgent("snap-from", "r", []);
     registerAgent("snap-to", "r", []);
     registerAgent("agent-with-title", "r", [], { terminal_title_ref: "my-window" });
-    sendMessage("snap-from", "snap-to", "hello dashboard", "normal");
+    sendMessage("snap-from", "snap-to", CONTENT, "normal");
     const r = await getJsonAuthed("/api/snapshot", SECRET);
     expect(r.status).toBe(200);
     expect(r.json.authenticated).toBe(true);
     expect(r.json.content_visibility).toBe("full");
-    expect(r.json.messages[0].content_preview).toBe("hello dashboard");
+    expect(r.json.messages[0].content_preview).toBe(CONTENT);
+    expect(JSON.stringify(r.json)).toContain(CONTENT); // full content DOES reach the authenticated operator
     const ag = (r.json.agents as any[]).find((a) => a.name === "agent-with-title");
     expect(ag.terminal_title_ref).toBe("my-window");
   });
