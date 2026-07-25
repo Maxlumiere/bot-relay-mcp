@@ -530,6 +530,58 @@ smoke_25_isolated() {
 }
 step "25-tool + CLI smoke (isolated relay)" smoke_25_isolated || exit 1
 
+# --- 6a2. Branch-identity gate (v2.23.0) ---
+# The CI green-gate below asserts CI COLOUR — "is this commit's CI green?" — but
+# NOT BRANCH IDENTITY. A green FEATURE BRANCH therefore passes and publishes
+# silently as if it were main, shipping code no reviewer merged to every user.
+# That is the same silence-as-failure class as everything else this arc closed:
+# the gate proved the wrong thing and its success read as safety.
+#
+# So: HEAD must be EXACTLY origin/main. Deliberately exact-equality, NOT
+# `merge-base --is-ancestor` — ancestor-of would also pass an OLDER main commit,
+# letting a stale checkout re-ship superseded code under a fresh version number (a
+# silent code-downgrade). origin/main is FRESHENED from the remote first, so the
+# comparison is against the true remote tip, not a possibly-stale local ref.
+#
+# Escape hatch: RELAY_PUBLISH_ALLOW_NONMAIN=1 skips the check — but it is
+# deliberate, never the default, and it PRINTS exactly what it is overriding so an
+# off-main publish can never be silent.
+branch_identity_gate() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "  FAIL  git not available — cannot verify HEAD == origin/main."
+    return 1
+  fi
+  local head_sha origin_sha fetch_ok=1
+  head_sha=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")
+  # Freshen the remote tip (into FETCH_HEAD) so we compare against TRUE origin/main.
+  git -C "$PROJECT_ROOT" fetch --quiet origin main 2>/dev/null || fetch_ok=0
+  origin_sha=$(git -C "$PROJECT_ROOT" rev-parse FETCH_HEAD 2>/dev/null || echo "")
+
+  if [ "${RELAY_PUBLISH_ALLOW_NONMAIN:-}" = "1" ]; then
+    echo "  OVERRIDE  RELAY_PUBLISH_ALLOW_NONMAIN=1 — branch-identity check SKIPPED (deliberate)."
+    echo "            HEAD=${head_sha:-?}  origin/main=${origin_sha:-?}  (fetch_ok=$fetch_ok)"
+    echo "            You are publishing a commit NOT verified-equal to origin/main."
+    return 0
+  fi
+  if [ "$fetch_ok" -ne 1 ] || [ -z "$origin_sha" ]; then
+    echo "  FAIL  could not fetch/resolve origin/main — cannot verify HEAD is merged main."
+    echo "        Refusing to publish unverified. (RELAY_PUBLISH_ALLOW_NONMAIN=1 to override.)"
+    return 1
+  fi
+  if [ -z "$head_sha" ] || [ "$head_sha" != "$origin_sha" ]; then
+    echo "  FAIL  HEAD is NOT origin/main — refusing to publish unmerged/foreign code."
+    echo "        HEAD        = ${head_sha:-?}"
+    echo "        origin/main = $origin_sha"
+    echo "        Exact equality is required (not ancestor-of): anything else ships code no"
+    echo "        reviewer merged, or re-ships an older main as a new version."
+    echo "        (RELAY_PUBLISH_ALLOW_NONMAIN=1 to override — it prints what it overrides.)"
+    return 1
+  fi
+  echo "  HEAD == origin/main ($head_sha) — publishing verified merged main."
+  return 0
+}
+step "branch-identity gate (HEAD == origin/main, exact)" branch_identity_gate || exit 1
+
 # --- 6b. GitHub CI green-gate (v2.2.3) ---
 # Query GitHub for the CI conclusion of the current HEAD. Blocks shipping a
 # commit whose CI is known-red (the pre-v2.2.3 failure mode where local
@@ -569,8 +621,14 @@ ci_green_gate() {
       return 0
       ;;
     no-run)
-      echo "  WARN  GitHub has no run for $head_sha (not pushed?) — proceed at own risk"
-      return 0
+      # Promoted WARN→FAIL: "no CI run for this commit" is unverified, and
+      # unverified must not read as safe (the silence-as-failure class this whole
+      # line of work exists to end). A commit with no CI run has not been proven
+      # green on the matrix — refuse rather than "proceed at own risk". Push the
+      # commit and let CI run, or fix why the run is missing.
+      echo "  FAIL  GitHub has NO ci.yml run for $head_sha — refusing to publish unverified."
+      echo "        Push HEAD and wait for CI, or investigate the missing run."
+      return 1
       ;;
     *)
       echo "  WARN  GitHub CI status unknown ($ci_status) for $head_sha — proceed at own risk"
