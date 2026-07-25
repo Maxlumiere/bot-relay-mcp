@@ -2643,7 +2643,13 @@ export function setAgentLivenessAnchor(
       "UPDATE agents SET agent_pid = ?, agent_pid_start = ?, host_id = COALESCE(host_id, ?) WHERE name = ?",
     )
     .run(pid, startedAt, ownHost, name);
-  if (r.changes > 0) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
+  // left _negativeProbeCache intact on r.changes===0, where a concurrent write may
+  // already have moved the session/anchor — so a stale NEGATIVE entry labelled the
+  // now-fresh live row `dead` until the TTL. Bracing preserves the harm;
+  // unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return r.changes > 0;
 }
 
@@ -2692,7 +2698,13 @@ export function markAgentOffline(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(name, expectedSessionId);
-  if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
+  // left _negativeProbeCache intact on r.changes===0 (a CAS loser) — where a
+  // concurrent rebind already moved the session/anchor — so a stale NEGATIVE entry
+  // labelled the now-fresh live row `dead` until the TTL. Bracing preserves the
+  // harm; unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2798,7 +2810,13 @@ export function closeAgentSession(
       "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
       "WHERE name = ? AND session_id = ?"
     ).run(name, expectedSessionId);
-    if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+    // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
+    // left _negativeProbeCache intact on r.changes===0 (a CAS loser) — where a
+    // concurrent rebind already moved the session/anchor — so a stale NEGATIVE entry
+    // labelled the now-fresh live row `dead` until the TTL. Bracing preserves the
+    // harm; unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+    _negativeProbeCache.delete(name);
+    _positiveProbeCache.delete(name);
     return { changed: r.changes === 1 };
   }
   const nowMs = Date.now();
@@ -2808,7 +2826,13 @@ export function closeAgentSession(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(nowMs, signalKind, name, expectedSessionId);
-  if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
+  // left _negativeProbeCache intact on r.changes===0 (a CAS loser) — where a
+  // concurrent rebind already moved the session/anchor — so a stale NEGATIVE entry
+  // labelled the now-fresh live row `dead` until the TTL. Bracing preserves the
+  // harm; unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
