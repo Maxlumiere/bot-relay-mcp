@@ -24,10 +24,11 @@
  * rarity assumption is false in a multi-agent fleet. So we compare only the parts
  * WE own:
  *   - ~/.claude.json          → the `mcpServers["bot-relay"]` subtree.
- *   - ~/.claude/settings.json → the SessionStart hook entries whose command
- *                               invokes our hook (check-relay.sh) — the SAME
- *                               command-path identity src/cli/config-merge.ts
- *                               (upsertSessionStartHook) dedups on.
+ *   - ~/.claude/settings.json → the SessionStart hook entries our hook owns,
+ *                               classified by the SHARED, precise
+ *                               `isRelayCheckHookCommand` (src/cli/config-merge.ts)
+ *                               — NOT a local substring — each carried WITH its
+ *                               group `matcher` (a matcher flip disables the hook).
  *   - ~/.bot-relay/config.json → the whole file: it is relay-owned by definition.
  * Comparison is order-independent (canonical key sort) so a rewrite that reorders
  * keys but preserves our region does not trip; a test that changes our region
@@ -49,9 +50,30 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import crypto from "crypto";
+// SHARED, precise ownership classifier — the SAME source of truth the installer
+// uses (src/cli/config-merge.ts), so this guard's notion of "our SessionStart
+// hook" cannot drift from what init/generate-hooks write. NOT a local substring.
+import { isRelayCheckHookCommand } from "../src/cli/config-merge.js";
 
-/** The relay's SessionStart hook script — its command-path identity marker. */
-const RELAY_HOOK_MARKER = "check-relay.sh";
+/**
+ * RESIDUALS, deliberately out of scope (codex #139 asked they be named, not left
+ * silent):
+ *  - FILE PERMISSIONS are not fingerprinted for ~/.claude.json /
+ *    ~/.claude/settings.json. Those files are SHARED (Claude Code owns most of
+ *    them); a mode-only change there is not a relay-content clobber, and folding
+ *    mode into the fingerprint would re-admit exactly the ambient false-trips
+ *    this rewrite removed. ~/.bot-relay/config.json is relay-owned and its
+ *    CONTENT is fingerprinted whole; a permission-only change without a content
+ *    change is not the write-clobber class this guard exists to catch.
+ *  - UNPARSEABLE files: handled, not ignored — a parse failure fingerprints as
+ *    "UNPARSEABLE:<sha256 of raw>", so a test that corrupts a file two DIFFERENT
+ *    ways trips (distinct hashes) rather than reading unchanged. A valid file
+ *    never reaches this path, so it adds no ambient false-trips.
+ */
+function unparseable(raw: string): string {
+  return "UNPARSEABLE:" + crypto.createHash("sha256").update(raw).digest("hex");
+}
 
 /**
  * Deterministic JSON: recursively sort object keys so a semantically-equal region
@@ -72,33 +94,40 @@ export function claudeJsonRegion(raw: string): string {
     const c = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
     return stableStringify(c?.mcpServers?.["bot-relay"] ?? null);
   } catch {
-    return "UNPARSEABLE";
+    return unparseable(raw);
   }
 }
 
 /**
  * ~/.claude/settings.json relay region = the SessionStart hook entries whose
- * command invokes our hook (check-relay.sh), order-independent. Ignores every
- * other hook event and every non-relay SessionStart entry — those are the
- * operator's / other agents', and their churn must not trip us.
+ * command invokes OUR hook (isRelayCheckHookCommand), each paired with its
+ * enclosing group's `matcher`, order-independent. The matcher is INCLUDED because
+ * it is load-bearing: flipping `matcher:"startup|resume"` → `"never"` DISABLES the
+ * relay hook without touching the hook object — destructive config damage that a
+ * hook-object-only region would wave through (codex #139 P1). Ignores every other
+ * hook event and every non-relay SessionStart entry — those are the operator's /
+ * other agents', and their churn must not trip us.
  */
 export function claudeSettingsRegion(raw: string): string {
+  let c: { hooks?: { SessionStart?: unknown[] } };
   try {
-    const c = JSON.parse(raw) as { hooks?: { SessionStart?: unknown[] } };
-    const groups = Array.isArray(c?.hooks?.SessionStart) ? (c.hooks!.SessionStart as unknown[]) : [];
-    const relay: string[] = [];
-    for (const g of groups) {
-      const inner = (g as { hooks?: unknown[] })?.hooks;
-      if (!Array.isArray(inner)) continue;
-      for (const h of inner) {
-        const cmd = (h as { command?: unknown })?.command;
-        if (typeof cmd === "string" && cmd.includes(RELAY_HOOK_MARKER)) relay.push(stableStringify(h));
+    c = JSON.parse(raw);
+  } catch {
+    return unparseable(raw);
+  }
+  const groups = Array.isArray(c?.hooks?.SessionStart) ? (c.hooks!.SessionStart as unknown[]) : [];
+  const owned: string[] = [];
+  for (const g of groups) {
+    const matcher = (g as { matcher?: unknown })?.matcher ?? null;
+    const inner = (g as { hooks?: unknown[] })?.hooks;
+    if (!Array.isArray(inner)) continue;
+    for (const h of inner) {
+      if (isRelayCheckHookCommand((h as { command?: unknown })?.command)) {
+        owned.push(stableStringify({ matcher, hook: h })); // matcher carried with the hook
       }
     }
-    return "[" + relay.sort().join(",") + "]"; // sorted → array reorder doesn't trip
-  } catch {
-    return "UNPARSEABLE";
   }
+  return "[" + owned.sort().join(",") + "]"; // sorted → array reorder doesn't trip
 }
 
 /** ~/.bot-relay/config.json is relay-owned in full → the whole file is the region. */

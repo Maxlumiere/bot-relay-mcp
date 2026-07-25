@@ -304,3 +304,35 @@ export function upsertSessionStartHook(
   out.hooks = { ...hooks, SessionStart: sessionStart };
   return { root: out, changed: true };
 }
+
+/**
+ * Is `command` an invocation of the relay's SessionStart hook
+ * (`hooks/check-relay.sh`)? The single, PRECISE source of truth for "this
+ * SessionStart hook is ours", shared by the suite user-config tripwire
+ * (tests/global-user-config-tripwire.ts) so its ownership notion cannot drift
+ * from what the installer writes.
+ *
+ * PRECISE, not a substring: it requires the `/hooks/check-relay.sh` path tail at
+ * a token boundary (end-of-string, whitespace, or a shell quote). So it accepts
+ * every shape the installer emits — the raw path init writes
+ * (`/root/hooks/check-relay.sh`), the single-quoted form quoteForHookCommand
+ * emits for paths with spaces (`'/a b/hooks/check-relay.sh'`), and a leading
+ * interpreter (`bash /root/hooks/check-relay.sh`) — while REJECTING a foreign
+ * command that merely mentions the name (`echo check-relay.sh`) or lives under a
+ * different dir (`/x/not-hooks/check-relay.sh`). That rejection is the point: a
+ * loose basename/substring match is the false-ownership trap codex rejected in
+ * #128 (it would let a guard disable or delete a command it does not own).
+ *
+ * NOTE ON THE upsertSessionStartHook DIVERGENCE (deliberate, pinned by test):
+ * upsertSessionStartHook dedups by EXACT command equality (`h.command ===
+ * spec.command`) because it must preserve the operator's exact entry and must
+ * still ADD the correct hook when a stale one (e.g. a %20-fossil path) exists —
+ * routing its dedup through this classifier would suppress that recovery. So the
+ * two ask different questions on purpose; the divergence-guard test asserts this
+ * classifier ACCEPTS the exact command init/generate-hooks produce, so the shared
+ * shape can never drift silently.
+ */
+export function isRelayCheckHookCommand(command: unknown): boolean {
+  if (typeof command !== "string") return false;
+  return /\/hooks\/check-relay\.sh(?=$|[\s"'])/.test(command);
+}
