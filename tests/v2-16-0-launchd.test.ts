@@ -12,6 +12,7 @@
  * "bot-relay" LaunchAgent), never same-label-only, never a hard-coded name.
  */
 import { describe, it, expect } from "vitest";
+import http from "http";
 import {
   CANONICAL_LABEL,
   buildLaunchdPlist,
@@ -23,6 +24,7 @@ import {
   installDaemon,
   type InstallDeps,
 } from "../src/cli/launchd.js";
+import { probeHealth } from "../src/cli/init.js"; // the REAL res.json() adapter
 
 const BASE_OPTS = {
   nodePath: "/usr/local/bin/node",
@@ -71,11 +73,23 @@ describe("parseLoadedRelayLabels — label-agnostic", () => {
 });
 
 describe("classifyHealthProbe", () => {
-  it("relay = status ok + version + protocol_version; foreign = 200 non-relay; none = unreachable", () => {
-    expect(classifyHealthProbe(true, { status: "ok", version: "9.9.9", protocol_version: "2.4.0" })).toBe("relay");
-    expect(classifyHealthProbe(true, { status: "ok", version: "9.9.9" })).toBe("foreign"); // no protocol_version
-    expect(classifyHealthProbe(true, { hello: "world" })).toBe("foreign");
-    expect(classifyHealthProbe(false, null)).toBe("none");
+  const P = (o: Partial<Parameters<typeof classifyHealthProbe>[0]>) => ({
+    reachable: true,
+    ok: true,
+    parseable: true,
+    body: null as unknown,
+    ...o,
+  });
+  it("relay/foreign/none by probe shape", () => {
+    expect(classifyHealthProbe(P({ body: { status: "ok", version: "9.9.9", protocol_version: "2.4.0" } }))).toBe("relay");
+    expect(classifyHealthProbe(P({ body: { status: "ok", version: "9.9.9" } }))).toBe("foreign"); // no protocol_version
+    expect(classifyHealthProbe(P({ body: { hello: "world" } }))).toBe("foreign");
+    // fetch REJECTED → the port is genuinely free.
+    expect(classifyHealthProbe({ reachable: false, ok: false, parseable: false, body: null })).toBe("none");
+  });
+  it("FAIL-CLOSED (audit HIGH #3): reachable-but-unreadable is NOT 'none'", () => {
+    expect(classifyHealthProbe(P({ parseable: false, body: null }))).toBe("unreadable"); // empty / non-JSON body
+    expect(classifyHealthProbe(P({ ok: false, parseable: false, body: null }))).toBe("unreadable"); // non-2xx
   });
 });
 
@@ -124,7 +138,7 @@ function makeDeps(over: Partial<InstallDeps> & { fetchHealth: InstallDeps["fetch
 describe("installDaemon — MANDATORY collision: existing relay under a noncanonical label → NO second load", () => {
   it("a relay already serving :3777 (loaded as com.lumiereventures.bot-relay) → installs nothing", async () => {
     const { deps, writes, bootstraps } = makeDeps({
-      fetchHealth: async () => ({ ok: true, body: { status: "ok", version: "2.15.2", protocol_version: "2.4.0" } }),
+      fetchHealth: async () => ({ reachable: true, ok: true, parseable: true, body: { status: "ok", version: "2.15.2", protocol_version: "2.4.0" } }),
       launchctlList: () => "28824\t0\tcom.lumiereventures.bot-relay\n",
     });
     const res = await installDaemon(BASE_OPTS, deps);
@@ -137,7 +151,7 @@ describe("installDaemon — MANDATORY collision: existing relay under a noncanon
 
   it("port free + no agent loaded → writes the canonical plist + bootstraps exactly once", async () => {
     const { deps, writes, bootstraps } = makeDeps({
-      fetchHealth: async () => ({ ok: false, body: null }), // unreachable
+      fetchHealth: async () => ({ reachable: false, ok: false, parseable: false, body: null }), // port free
       launchctlList: () => "123\t0\tcom.apple.Safari\n",
     });
     const res = await installDaemon(BASE_OPTS, deps, "/home/u");
@@ -147,15 +161,72 @@ describe("installDaemon — MANDATORY collision: existing relay under a noncanon
     expect(bootstraps.length).toBe(1);
   });
 
-  it("a fetchHealth rejection is treated as 'none' (not a crash)", async () => {
-    const { deps, writes } = makeDeps({
+  it("a fetchHealth that THROWS unexpectedly fails CLOSED (unreadable), does NOT install", async () => {
+    // The real adapter (probeHealth) never throws for connection-refused — it
+    // returns reachable:false. So a THROW here is an unexpected adapter failure
+    // = unknown state = must not assume the port is free (audit HIGH #3).
+    const { deps, writes, bootstraps } = makeDeps({
       fetchHealth: async () => {
-        throw new Error("ECONNREFUSED");
+        throw new Error("unexpected adapter failure");
       },
       launchctlList: () => "",
     });
     const res = await installDaemon(BASE_OPTS, deps, "/home/u");
-    expect(res.installed).toBe(true); // unreachable → install
+    expect(res.decision.action).toBe("skip-unreadable");
+    expect(res.installed).toBe(false);
+    expect(writes).toEqual([]);
+    expect(bootstraps).toEqual([]);
+  });
+});
+
+// ============================================================================
+// Audit HIGH #3 (codex) — installDaemon must FAIL CLOSED on an unreadable probe,
+// exercised through the REAL res.json() adapter (probeHealth), because the harm
+// lives in the adapter: an empty/malformed 200 body throws and was reclassified
+// as "port free" → a competing daemon installed.
+// ============================================================================
+describe("installDaemon fail-closed on an unreadable probe (real adapter)", () => {
+  function tinyServer(status: number, body: string): Promise<{ port: number; close: () => Promise<void> }> {
+    return new Promise((resolve) => {
+      const srv = http.createServer((_req, res) => {
+        res.statusCode = status;
+        res.end(body);
+      });
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address();
+        const port = typeof addr === "object" && addr ? addr.port : 0;
+        resolve({ port, close: () => new Promise<void>((r) => srv.close(() => r())) });
+      });
+    });
+  }
+
+  it("(harm) an empty 200 body → res.json() throws → unreadable → REFUSE (no plist, no bootstrap)", async () => {
+    const s = await tinyServer(200, ""); // the `curl -s` empty-body case
+    const { deps, writes, bootstraps } = makeDeps({ fetchHealth: probeHealth, launchctlList: () => "" });
+    const res = await installDaemon({ ...BASE_OPTS, port: s.port }, deps, "/home/u");
+    await s.close();
+    expect(res.decision.action).toBe("skip-unreadable");
+    expect(res.installed).toBe(false);
+    expect(writes).toEqual([]);
+    expect(bootstraps).toEqual([]);
+  });
+
+  it("(harm) a malformed-JSON 200 → unreadable → REFUSE", async () => {
+    const s = await tinyServer(200, "{ not json");
+    const { deps, writes } = makeDeps({ fetchHealth: probeHealth, launchctlList: () => "" });
+    const res = await installDaemon({ ...BASE_OPTS, port: s.port }, deps, "/home/u");
+    await s.close();
+    expect(res.decision.action).toBe("skip-unreadable");
+    expect(writes).toEqual([]);
+  });
+
+  it("(twin) connection refused (nothing listening) → port free → INSTALLS", async () => {
+    const s = await tinyServer(200, "{}");
+    const freePort = s.port;
+    await s.close(); // now nothing listens on freePort → fetch rejects
+    const { deps, writes } = makeDeps({ fetchHealth: probeHealth, launchctlList: () => "" });
+    const res = await installDaemon({ ...BASE_OPTS, port: freePort }, deps, "/home/u");
+    expect(res.installed).toBe(true);
     expect(writes.length).toBe(1);
   });
 });

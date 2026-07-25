@@ -50,7 +50,7 @@ import {
   canQuoteForHookCommand,
   migrateRawHookCommand,
 } from "./config-merge.js";
-import { installDaemon, type InstallDeps } from "./launchd.js";
+import { installDaemon, type InstallDeps, type HealthProbe } from "./launchd.js";
 
 function defaultBotRelayDir(): string {
   // v2.4.0 Part E — honor RELAY_HOME override (test harnesses + ops sandboxes).
@@ -266,13 +266,36 @@ export function installHook(hookScript: string, settingsPath: string = claudeSet
   return { changed: anyChange };
 }
 
+/**
+ * Probe :port/health, DISCRIMINATING "unreachable" (fetch rejects → the port is
+ * genuinely free) from "reachable-but-unreadable" (a response came back but the
+ * body is empty / non-JSON, or the status is non-2xx). The empty-200 case is
+ * real: `curl -s` after a daemon bounce returns an empty body that `res.json()`
+ * throws on; treating that throw as "port free" installs a competing daemon
+ * (audit HIGH #3). Exported so the fail-closed behavior is tested through the
+ * REAL `res.json()` adapter — the harm lives in the adapter, not a stub.
+ */
+export async function probeHealth(port: number): Promise<HealthProbe> {
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${port}/health`);
+  } catch {
+    return { reachable: false, ok: false, parseable: false, body: null };
+  }
+  let body: unknown = null;
+  let parseable = true;
+  try {
+    body = await res.json();
+  } catch {
+    parseable = false;
+  }
+  return { reachable: true, ok: res.ok, parseable, body };
+}
+
 /** Real launchd deps — the only place init shells out to launchctl / fetch. */
 function realDaemonDeps(log: (l: string) => void): InstallDeps {
   return {
-    fetchHealth: async (port) => {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      return { ok: res.ok, body: res.ok ? await res.json() : null };
-    },
+    fetchHealth: probeHealth,
     launchctlList: () => {
       try {
         return execFileSync("launchctl", ["list"], { encoding: "utf-8" });
@@ -505,6 +528,11 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
             `   The upgrade will NOT take effect until the daemon is restarted.\n` +
             `   Run:  relay restart\n\n`,
         );
+      } else if (res.decision.action === "skip-unreadable") {
+        // LOUD + FAIL-CLOSED (audit HIGH #3): something answered on the port but
+        // we could not read its health — we did NOT install (a competing daemon
+        // would be worse). The operator must investigate; we never report clean.
+        process.stdout.write(`\n⚠️  DAEMON STATE UNKNOWN — refusing to change it.\n   ${res.decision.reason}\n\n`);
       } else {
         process.stdout.write(
           res.installed

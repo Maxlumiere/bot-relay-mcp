@@ -112,25 +112,54 @@ export function parseLoadedRelayLabels(launchctlListOutput: string): string[] {
   return out;
 }
 
-export type HealthClass = "relay" | "foreign" | "none";
+export type HealthClass = "relay" | "foreign" | "none" | "unreadable";
 
 /**
- * Classify a /health probe of the target port:
- *   - "relay"   — reachable AND the body is our relay's health shape
- *                 (status:"ok" + version + protocol_version).
- *   - "foreign" — reachable but NOT relay-shaped (someone else on the port).
- *   - "none"    — unreachable (probe failed / non-2xx).
+ * The outcome of probing :port/health, DISCRIMINATED so the caller can tell
+ * "nothing is on the port" apart from "something answered but we could not read
+ * it." Collapsing those (the fail-open bug) treats an unreadable daemon as a
+ * free port and installs a COMPETING one.
  */
-export function classifyHealthProbe(ok: boolean, body: unknown): HealthClass {
-  if (!ok) return "none";
-  const b = body as { status?: unknown; version?: unknown; protocol_version?: unknown } | null;
+export interface HealthProbe {
+  /** An HTTP response came back at all (fetch resolved). false = connection
+   *  refused / network error / timeout ⇒ the port is genuinely free. */
+  reachable: boolean;
+  /** The response status was 2xx. */
+  ok: boolean;
+  /** The body parsed as JSON. false = empty / non-JSON body (the `curl -s`
+   *  empty-200-after-a-bounce case that `res.json()` throws on). */
+  parseable: boolean;
+  /** The parsed JSON body (null when unreachable or unparseable). */
+  body: unknown;
+}
+
+/**
+ * Classify a /health probe:
+ *   - "none"       — UNREACHABLE (fetch rejected): the port is genuinely free.
+ *   - "relay"      — reachable, 2xx, parseable, our relay's health shape.
+ *   - "foreign"    — reachable, 2xx, parseable, but NOT relay-shaped.
+ *   - "unreadable" — reachable but the health could NOT be read (empty body,
+ *                    non-JSON, or non-2xx). Something is there we cannot
+ *                    identify → the caller must FAIL CLOSED (never install a
+ *                    competing daemon on an occupied port). An unreadable probe
+ *                    is NOT "none" — that conflation was the fail-open bug.
+ */
+export function classifyHealthProbe(probe: HealthProbe): HealthClass {
+  if (!probe.reachable) return "none";
+  if (!probe.ok || !probe.parseable) return "unreadable";
+  const b = probe.body as { status?: unknown; version?: unknown; protocol_version?: unknown } | null;
   if (b && b.status === "ok" && typeof b.version === "string" && typeof b.protocol_version === "string") {
     return "relay";
   }
   return "foreign";
 }
 
-export type DaemonAction = "install" | "skip-relay-present" | "skip-foreign-port" | "skip-agent-loaded";
+export type DaemonAction =
+  | "install"
+  | "skip-relay-present"
+  | "skip-foreign-port"
+  | "skip-agent-loaded"
+  | "skip-unreadable";
 
 export interface DaemonDecision {
   action: DaemonAction;
@@ -183,6 +212,17 @@ export function decideDaemonAction(input: {
     return {
       action: "skip-foreign-port",
       reason: `:${port} is held by a non-relay process — not installing a daemon that would fight for the port. Free the port or set a different http_port, then re-run.`,
+      existingLabels: loadedRelayLabels,
+    };
+  }
+  if (healthClass === "unreadable") {
+    // FAIL CLOSED (audit HIGH #3): a detector that cannot read its reference
+    // point must SAY SO, never report clean. Something answered on :port but we
+    // could not confirm what — installing a second daemon would be a collision,
+    // strictly worse than the silent staleness this whole path fixes.
+    return {
+      action: "skip-unreadable",
+      reason: `:${port} answered a health probe but the response was UNREADABLE (empty body, non-JSON, or non-2xx) — something is on the port and its identity/version cannot be confirmed. REFUSING to install or restart a daemon: a competing daemon on an occupied port is worse than doing nothing. Find what holds :${port} (a stale or broken relay?), stop it, then re-run.`,
       existingLabels: loadedRelayLabels,
     };
   }
@@ -248,8 +288,10 @@ export function chooseRestartTarget(input: {
 }
 
 export interface InstallDeps {
-  /** GET the health endpoint. Returns {ok, body}. Rejection → treated as none. */
-  fetchHealth: (port: number) => Promise<{ ok: boolean; body: unknown }>;
+  /** Probe the health endpoint, discriminating unreachable vs reachable-but-
+   *  unreadable (see HealthProbe). Must NOT collapse the two — that is the
+   *  fail-open bug. Should not throw; installDaemon fails closed if it does. */
+  fetchHealth: (port: number) => Promise<HealthProbe>;
   /** Run `launchctl list` and return stdout (or "" on failure). */
   launchctlList: () => string;
   /** Run `launchctl bootstrap gui/<uid> <plistPath>` (or kickstart). */
@@ -276,15 +318,18 @@ export async function installDaemon(
   home: string = os.homedir(),
   label: string = CANONICAL_LABEL,
 ): Promise<InstallResult> {
-  let healthClass: HealthClass = "none";
+  let healthClass: HealthClass = "unreadable"; // fail-closed default
   let runningVersion: string | null = null;
   try {
-    const { ok, body } = await deps.fetchHealth(opts.port);
-    healthClass = classifyHealthProbe(ok, body);
-    const b = body as { version?: unknown } | null;
+    const probe = await deps.fetchHealth(opts.port);
+    healthClass = classifyHealthProbe(probe);
+    const b = probe.parseable ? (probe.body as { version?: unknown } | null) : null;
     runningVersion = b && typeof b.version === "string" ? b.version : null;
   } catch {
-    healthClass = "none";
+    // fetchHealth discriminates internally and should not throw. If the adapter
+    // itself fails unexpectedly we do NOT know the port is free — FAIL CLOSED as
+    // unreadable, never "none" (which would install a possibly-competing daemon).
+    healthClass = "unreadable";
   }
   const loadedRelayLabels = parseLoadedRelayLabels(deps.launchctlList());
   const decision = decideDaemonAction({
