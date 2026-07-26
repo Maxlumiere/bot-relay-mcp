@@ -1,12 +1,14 @@
 // Tether for bot-relay-mcp (VSCode)
 // SPDX-License-Identifier: MIT
 //
-// LLM adapter contract tests. The load-bearing one is the Codex wake SEQUENCE:
-// type the word WITHOUT a trailing newline, WAIT for the paste block to close,
-// then submit with a SEPARATE event. Codex's TUI swallows both an embedded
-// newline AND a submit key sent before the paste settles (confirmed live
-// 2026-06-26). Asserting the exact ordered op log pins that contract, not a
-// proxy.
+// LLM adapter contract tests. The load-bearing contract is the wake SEQUENCE
+// for BOTH CLIs: type the word WITHOUT a trailing newline, WAIT for the paste
+// block to close, then submit with a SEPARATE event. Both TUIs swallow an
+// embedded newline AND a submit key sent before the paste settles — confirmed
+// live for Codex 2026-06-26, and re-learned the hard way for Claude 2026-07-24
+// (the inline-newline wake typed "inbox" that sat unsubmitted until a human
+// pressed Enter, stacking one injection per new message — 14 observed).
+// Asserting the exact ordered op log pins that contract, not a proxy.
 
 import { describe, it, expect } from "vitest";
 import {
@@ -40,12 +42,34 @@ function fakeCtx(): { ctx: WakeContext; ops: string[] } {
 }
 
 describe("LLM adapters", () => {
-  it("claude: single sendText(word, true) types AND submits", async () => {
+  it("claude: word (no newline) → delay → SEPARATE sendText(CR)", async () => {
     const { ctx, ops } = fakeCtx();
     await claudeAdapter.wake(ctx);
     expect(claudeAdapter.id).toBe("claude");
     expect(claudeAdapter.wakeWord).toBe("inbox");
-    expect(ops).toEqual([`sendText:"inbox":true`]);
+    // REGRESSION (v0.7.0): this was `sendText:"inbox":true` — one call, relying
+    // on the appended newline to submit. It never did: the TUI treats an
+    // in-chunk newline as literal input, so the wake sat in the box until a
+    // human pressed Enter (and stacked, one per new message). The submit MUST
+    // be a separate event after the paste settles.
+    expect(ops).toEqual([`sendText:"inbox":false`, `delay:150`, `sendText:"\\r":false`]);
+  });
+
+  it("claude: the submit is a DISTINCT event AFTER the delay (never embedded in the text)", async () => {
+    const { ctx, ops } = fakeCtx();
+    await claudeAdapter.wake(ctx);
+    expect(ops[0]).toBe(`sendText:"inbox":false`); // the word, never with a newline
+    expect(ops[1].startsWith("delay:")).toBe(true); // paste-settle BEFORE submit
+    expect(ops[2]).toBe(`sendText:"\\r":false`); // submit is its own event
+    expect(ops).toHaveLength(3);
+  });
+
+  it("claude: {claude:…} tuning threads submit mechanics (method/delay/key)", async () => {
+    const { ctx, ops } = fakeCtx();
+    await adapterFor("claude", {
+      claude: { submitMethod: "sendSequence", submitDelayMs: 200, submitKey: "\n" },
+    }).wake(ctx);
+    expect(ops).toEqual([`sendText:"inbox":false`, `delay:200`, `seq:"\\n"`]);
   });
 
   it("codex default: word (no newline) → delay → SEPARATE sendText(CR)", async () => {
@@ -133,25 +157,21 @@ describe("LLM adapters", () => {
  * convenient shape instead of the shape production uses is why it survived.
  */
 describe("profile isolation — codex options must not reshape the claude profile", () => {
-  it("adapterFor('claude', {codex:…}) still types the bare `inbox` and submits inline", () => {
+  it("adapterFor('claude', {codex:…}) still types the bare `inbox` with claude's own submit mechanics", async () => {
     const adapter = adapterFor("claude", {
       codex: {
         wakeText: 'Relay mail arrived — call get_messages(agent_name="victra-build", …)',
-        submitKey: "\r",
-        submitDelayMs: 150,
+        submitKey: "\n",
+        submitDelayMs: 999,
         submitMethod: "sendSequence",
       },
     });
-    const sent: Array<[string, boolean | undefined]> = [];
-    const ctx = {
-      terminal: { sendText: (t: string, nl?: boolean) => sent.push([t, nl]) },
-      sendSequenceToTerminal: async () => { throw new Error("claude must not use sendSequence"); },
-      delay: async () => { throw new Error("claude must not delay — it submits inline"); },
-    };
-    return adapter.wake(ctx as never).then(() => {
-      expect(sent).toEqual([["inbox", true]]);
-      expect(adapter.wakeWord).toBe("inbox");
-    });
+    const { ctx, ops } = fakeCtx();
+    await adapter.wake(ctx);
+    // Codex's block must not leak in: bare `inbox` (not the instruction),
+    // claude's default 150ms (not 999), sendText CR (not a focused sequence).
+    expect(ops).toEqual([`sendText:"inbox":false`, `delay:150`, `sendText:"\\r":false`]);
+    expect(adapter.wakeWord).toBe("inbox");
   });
 
   it("adapterFor('codex', {codex:…}) DOES still honour its own tuning (positive control)", () => {

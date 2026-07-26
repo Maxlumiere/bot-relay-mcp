@@ -93,7 +93,9 @@ export interface WakeSpec {
   /**
    * ms to wait AFTER typing wakeText BEFORE the submit key, so a TUI's paste
    * block closes first. Codex needs 150 (its empirically-proven value); claude
-   * submits inline with the typed text, so 0.
+   * needs the same treatment — its TUI treats a newline arriving inside the
+   * typed chunk as literal input, not a submit (the 2026-07-24 "types but
+   * never submits" wake bug), so it too gets a settle delay + separate submit.
    */
   submitDelayMs: number;
   /**
@@ -145,13 +147,17 @@ const CLAUDE: AgentCliProfile = {
     titleFlag: "--name",
   },
   wake: {
-    // Claude Code: Tether types "inbox" (its inbox convention drains + acts)
-    // with an appended newline in a single sendText — no separate submit, no
-    // delay. Matches extensions/vscode claudeAdapter: sendText("inbox", true).
+    // Claude Code: Tether types "inbox" (its inbox convention drains + acts),
+    // waits for the paste block to close, then submits a SEPARATE CR. The
+    // previous single sendText("inbox", true) relied on the appended newline
+    // submitting — it does not: the TUI takes a newline inside the typed chunk
+    // as literal input, so the wake sat unsubmitted until a human pressed
+    // Enter, and every new message stacked another dead "inbox" on top
+    // (observed 14 deep, 2026-07-24). Same lesson Codex taught on 2026-06-26.
     wakeText: "inbox",
     submitKey: "\r",
     submitMethod: "sendText",
-    submitDelayMs: 0,
+    submitDelayMs: 150,
     nativeSelfWake: false,
   },
 };
