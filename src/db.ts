@@ -203,6 +203,40 @@ function parseHostShellPids(raw: string | null | undefined): number[] | null {
   }
 }
 
+/**
+ * THE ROUTING PREDICATE — single source (audit HIGH #2, ADR-0015 L4). An agent
+ * can RECEIVE a task iff it holds a live session AND is not in a terminal status.
+ * postTaskAuto's SQL candidate query (ENFORCEMENT) and the `routable` /
+ * `routability` fields on the agent surface (what the OPERATOR reads) both
+ * derive from this, so the operator can never read a different predicate than
+ * the router enforces. This is DELIBERATELY not `computeLivenessVerdict`: that
+ * asks "is the process alive?", a strictly different question — a live process
+ * whose session dropped is alive-but-unroutable, and conflating the two is what
+ * this split fixes.
+ */
+export const ROUTABLE_TERMINAL_STATUSES = ["offline", "closed", "abandoned", "stale"] as const;
+export function isAgentRoutable(row: { session_id?: string | null; agent_status?: string | null }): boolean {
+  // Case-INSENSITIVE (codex HIGH #2 P1): a persisted 'OFFLINE' must read the same
+  // terminal state the lowercase display shows — otherwise `routable` disagrees
+  // with its own `agent_status` neighbour in the same row. This is now the ONE
+  // implementation the router (postTaskAuto) and the surface both call.
+  return row.session_id != null && !(ROUTABLE_TERMINAL_STATUSES as readonly string[]).includes((row.agent_status ?? "").toLowerCase());
+}
+export type Routability = "routable" | "unroutable_alive" | "unroutable_offline";
+/**
+ * Classify an agent's routability as ONE named state (not two fields to diff).
+ * `unroutable_alive` is the loud diagnostic: the process is alive yet holds no
+ * routable session, so the router will SILENTLY never give it work — the
+ * canonical failure shape wearing a healthy badge (audit HIGH #2).
+ */
+export function agentRoutability(
+  row: { session_id?: string | null; agent_status?: string | null },
+  verdict: LivenessVerdict,
+): Routability {
+  if (isAgentRoutable(row)) return "routable";
+  return verdict === "alive" ? "unroutable_alive" : "unroutable_offline";
+}
+
 function toAgentWithStatus(
   row: AgentRecord,
   verdict: LivenessVerdict = computeLivenessVerdict(row),
@@ -229,6 +263,12 @@ function toAgentWithStatus(
     liveness: verdict,
     last_alive: positiveConfirmationISO(row.name),
     alive: verdict === "alive" && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
+    // audit HIGH #2 — session-actionability, the SAME predicate postTaskAuto
+    // enforces (isAgentRoutable), surfaced so the operator reads what the router
+    // uses (ADR-0015 L4). `routability` is the loud named state; the alarming
+    // one, `unroutable_alive`, is a live process the router will silently starve.
+    routable: isAgentRoutable(row),
+    routability: agentRoutability(row, verdict),
     description: row.description ?? null,
     // Phase A — version + CLI visibility. `health_check` reports the version of
     // WHICHEVER SERVER ANSWERS, so an agent on a stale build asks, is told its
@@ -5743,8 +5783,28 @@ export function postTaskAuto(
     const bindArgs: (string | number)[] = [...requiredCapabilities];
     if (!allowSelfAssign) bindArgs.push(from);
     bindArgs.push(requiredCapabilities.length);
+    // v2.24 (audit HIGH #2) — ROUTE ONLY TO A LIVE AGENT. Previously the
+    // candidate set was capability-only, so a registered-but-closed agent (its
+    // terminal gone, session dropped) stayed a candidate and — with load 0 —
+    // sorted AHEAD of live busy agents, so post_task_auto handed work to a
+    // corpse that never accepted and was never requeued: a silent black hole,
+    // while the caller got routed=true.
+    //
+    // SINGLE PREDICATE (codex HIGH #2 P1 / ADR-0015 L4): both the router here and
+    // the operator surface (`routable`/`routability` on the agent row) call the
+    // SAME isAgentRoutable() — ONE implementation, so they cannot disagree. The
+    // SQL deliberately NO LONGER duplicates the session/status filter: a
+    // case-sensitive SQL `NOT IN` let a persisted 'OFFLINE' route while the
+    // display normalized it to 'offline' — `routable` disagreeing with its own
+    // neighbour in the same row. The registry is tens of rows, so we fetch the
+    // capability matches (with the columns isAgentRoutable needs) and filter in
+    // JS. Deliberately NOT computeLivenessVerdict — that is the argv/PID
+    // *presence* probe (a display signal that reads a dropped-session live
+    // process as "alive"); a task is delivered THROUGH the session, so
+    // session-holding is the authorization answer. No routable candidate → the
+    // queued path below (routed:false), healed by tryAssignQueuedTasksTo later.
     const candidates = db.prepare(
-      `SELECT a.name, a.last_seen,
+      `SELECT a.name, a.last_seen, a.session_id, a.agent_status,
               (SELECT COUNT(*) FROM tasks t
                  WHERE t.to_agent = a.name AND t.status IN ('posted','accepted')) AS load
          FROM agents a
@@ -5752,12 +5812,15 @@ export function postTaskAuto(
         WHERE ac.capability IN (${placeholders})${excludeSenderClause}
         GROUP BY a.name
        HAVING COUNT(DISTINCT ac.capability) = ?
-        ORDER BY load ASC, a.last_seen DESC
-        LIMIT 10`
-    ).all(...bindArgs) as Array<{ name: string; last_seen: string; load: number }>;
+        ORDER BY load ASC, a.last_seen DESC`
+    ).all(...bindArgs) as Array<{
+      name: string; last_seen: string; session_id: string | null; agent_status: string | null; load: number;
+    }>;
+    // The ONE routability predicate — identical to the operator surface's.
+    const routableCandidates = candidates.filter((c) => isAgentRoutable(c));
 
-    if (candidates.length === 0) {
-      log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] candidates=0 → queued`);
+    if (routableCandidates.length === 0) {
+      log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] routable=0/${candidates.length} → queued`);
       db.prepare(
         "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, NULL, ?, ?, ?, 'queued', NULL, ?, ?, ?)"
       ).run(id, from, title, encDescription, priority, timestamp, timestamp, capsJson);
@@ -5773,8 +5836,8 @@ export function postTaskAuto(
       };
     }
 
-    const pick = candidates[0];
-    log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] candidates=${candidates.length} picked=${pick.name} (load=${pick.load})`);
+    const pick = routableCandidates[0];
+    log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] routable=${routableCandidates.length}/${candidates.length} picked=${pick.name} (load=${pick.load})`);
     db.prepare(
       "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?, ?)"
     ).run(id, from, pick.name, title, encDescription, priority, timestamp, timestamp, capsJson);
@@ -5791,7 +5854,7 @@ export function postTaskAuto(
       },
       routed: true,
       assigned_to: pick.name,
-      candidate_count: candidates.length,
+      candidate_count: routableCandidates.length,
     };
   });
 
@@ -5876,6 +5939,12 @@ export interface HealthReassignment {
   triggered_by: string;
   from_agent: string;
   required_capabilities: string[] | null;
+  /** Why the task was requeued — 'lease-expired' (an accepted task whose
+   *  assignee stopped renewing its lease) or 'assignee-gone-before-accept' (a
+   *  task routed to an agent whose session dropped before it accepted — audit
+   *  HIGH #2). Lets callers/webhooks distinguish a normal lease timeout from a
+   *  route to a vanished agent. */
+  reason: "lease-expired" | "assignee-gone-before-accept";
 }
 
 /**
@@ -5906,6 +5975,75 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
   //   (c) assignee is NOT in busy/away with an unexpired TTL
   // busy_expires_at < now → shield has lapsed, agent is no longer protected.
   const nowIsoForStatus = now();
+  const scanLimit = Math.max(1, Math.min(500, parseInt(process.env.RELAY_HEALTH_SCAN_LIMIT || "50", 10)));
+  const requeued: HealthReassignment[] = [];
+
+  // ===== POSTED-BUT-NEVER-ACCEPTED ORPHANS (audit HIGH #2) — always runs =====
+  // postTaskAuto now routes only to a live-session agent, but an agent can drop
+  // its session in the window between 'posted' and 'accepted' (a VS Code reload,
+  // a crash). Such a task is status='posted' with lease_renewed_at NULL, so the
+  // accepted-lease scan below never matches it and it dead-ends forever.
+  // Requeue it to the pool — LOUDLY: routing to an agent that then vanished is
+  // an anomaly the operator must SEE, not a silent redirect (the black hole in
+  // a new guise). Same session predicate as the postTaskAuto candidate filter:
+  // assignee unregistered OR holding no session. A short grace lets a
+  // just-posted task be accepted / a brief reconnect recover before we step in.
+  const postedGraceSec = Math.max(1, parseInt(process.env.RELAY_POSTED_ORPHAN_GRACE_SECONDS || "120", 10));
+  const postedThreshold = new Date(Date.now() - postedGraceSec * 1000).toISOString();
+  const postedOrphans = db.prepare(
+    `SELECT t.id, t.to_agent, t.from_agent, t.required_capabilities
+       FROM tasks t
+      WHERE t.status = 'posted'
+        AND t.lease_renewed_at IS NULL
+        AND t.to_agent IS NOT NULL
+        AND t.updated_at < ?
+        AND (
+          t.to_agent NOT IN (SELECT name FROM agents)
+          OR t.to_agent IN (SELECT name FROM agents WHERE session_id IS NULL)
+        )
+      ORDER BY t.updated_at ASC
+      LIMIT ?`,
+  ).all(postedThreshold, scanLimit) as Array<{
+    id: string; to_agent: string; from_agent: string; required_capabilities: string | null;
+  }>;
+  if (postedOrphans.length > 0) {
+    // CAS re-checks status='posted' + lease NULL + assignee-still-gone, so an
+    // agent that accepted or reconnected between SELECT and UPDATE keeps its task.
+    const casRequeuePosted = db.prepare(
+      `UPDATE tasks SET to_agent = NULL, status = 'queued', updated_at = ?
+        WHERE id = ?
+          AND status = 'posted'
+          AND lease_renewed_at IS NULL
+          AND to_agent = ?
+          AND (
+            to_agent NOT IN (SELECT name FROM agents)
+            OR to_agent IN (SELECT name FROM agents WHERE session_id IS NULL)
+          )`,
+    );
+    for (const row of postedOrphans) {
+      const result = casRequeuePosted.run(now(), row.id, row.to_agent);
+      if (result.changes === 1) {
+        log.warn(
+          `[health] task ${row.id} was routed to "${row.to_agent}" which is gone (no live session) and never accepted it — requeued to the pool (triggered_by=${triggeredBy})`,
+        );
+        let reqCaps: string[] | null = null;
+        if (row.required_capabilities) {
+          try { reqCaps = JSON.parse(row.required_capabilities) as string[]; } catch { reqCaps = null; }
+        }
+        requeued.push({
+          task_id: row.id,
+          previous_agent: row.to_agent,
+          triggered_by: triggeredBy,
+          from_agent: row.from_agent,
+          required_capabilities: reqCaps,
+          reason: "assignee-gone-before-accept",
+        });
+      }
+      // changes===0 → agent accepted or reconnected between SELECT and UPDATE; correct to skip.
+    }
+  }
+
+  // ===== ACCEPTED-LEASE-EXPIRED scan (existing v2.0 / #26 path) =====
   const staleCount = db.prepare(
     `SELECT COUNT(*) AS c
        FROM tasks t
@@ -5930,9 +6068,8 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
           )
         )`
   ).get(threshold, threshold, nowIsoForStatus) as { c: number };
-  if (staleCount.c === 0) return [];
+  if (staleCount.c === 0) return requeued;
 
-  const scanLimit = parseInt(process.env.RELAY_HEALTH_SCAN_LIMIT || "50", 10);
   const stale = db.prepare(
     `SELECT t.id, t.to_agent, t.from_agent, t.lease_renewed_at, t.required_capabilities
        FROM tasks t
@@ -5958,11 +6095,10 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
         )
       ORDER BY t.lease_renewed_at ASC
       LIMIT ?`
-  ).all(threshold, threshold, nowIsoForStatus, Math.max(1, Math.min(500, scanLimit))) as Array<{
+  ).all(threshold, threshold, nowIsoForStatus, scanLimit) as Array<{
     id: string; to_agent: string; from_agent: string; lease_renewed_at: string; required_capabilities: string | null;
   }>;
 
-  const requeued: HealthReassignment[] = [];
   // CAS ensures we only requeue the exact row we inspected. Re-check agent
   // liveness AND agent_status/TTL inside the CAS as belt-and-suspenders — a
   // concurrent touchAgent can bump last_seen between SELECT and UPDATE, and
@@ -6008,6 +6144,7 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
         triggered_by: triggeredBy,
         from_agent: row.from_agent,
         required_capabilities: reqCaps,
+        reason: "lease-expired",
       });
     }
     // changes===0 means the assignee heartbeated between our SELECT and UPDATE — no requeue, correct outcome.

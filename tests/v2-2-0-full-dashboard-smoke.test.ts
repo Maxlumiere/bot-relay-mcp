@@ -131,15 +131,20 @@ describe("v2.2.0 Phase 6 — dashboard end-to-end smoke (--full)", () => {
     expect(dash.body).toContain('/dashboard/ws');
     expect(dash.body).toContain('/api/focus-terminal');
 
-    // 3. Snapshot with preview fields.
+    // 3. Snapshot lists agents. ADR-0006: terminal_title_ref is operator-power
+    // and redacted for this UNauthenticated (no-secret) smoke caller — the
+    // agent is still listed (presence is agent-trust), and the focus lookup in
+    // step 4 is server-side, so it does not need the client to hold the title.
     registerAgent("smoke-a", "r", []);
     registerAgent("smoke-b", "r", [], { terminal_title_ref: "smoke-window" });
     const snap = await get("/api/snapshot");
     expect(snap.status).toBe(200);
     const snapJson = JSON.parse(snap.body);
+    expect(snapJson.content_visibility).toBe("restricted");
     expect(Array.isArray(snapJson.agents)).toBe(true);
     const b = snapJson.agents.find((a: any) => a.name === "smoke-b");
-    expect(b.terminal_title_ref).toBe("smoke-window");
+    expect(b).toBeDefined();
+    expect(b.terminal_title_ref).toBeUndefined();
 
     // 4. Focus endpoint: 409 on null ref, 404 on unknown.
     const ghost = await post("/api/focus-terminal", { agent_name: "nonexistent" });

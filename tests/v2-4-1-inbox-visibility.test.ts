@@ -174,8 +174,12 @@ describe("v2.4.1 — /api/snapshot enrichment", () => {
     expect(r.status).toBe(200);
     const v = r.json.agents.find((a: any) => a.name === "orchestrator");
     expect(v.name).toBe("orchestrator");
-    expect(v.role).toBe("orchestrator");
-    expect(v.capabilities).toEqual(["triage"]);
+    // ADR-0006 (2026-07-25): role + capabilities are operator FREE TEXT and are
+    // EXCLUDED from the UNauthenticated snapshot (this test runs no-secret; see
+    // AGENT_PUBLIC_FIELDS). The structural fields + the v2.4.1 enrichment still
+    // survive — which is what "shape stable" actually needs to guard.
+    expect("role" in v).toBe(false);
+    expect("capabilities" in v).toBe(false);
     expect(v.agent_status).toBeDefined();
     expect(v.has_token).toBeDefined();
     // v2.4.1 additive fields present.

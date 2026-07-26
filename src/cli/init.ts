@@ -50,7 +50,7 @@ import {
   canQuoteForHookCommand,
   migrateRawHookCommand,
 } from "./config-merge.js";
-import { installDaemon, type InstallDeps } from "./launchd.js";
+import { installDaemon, type InstallDeps, type HealthProbe } from "./launchd.js";
 
 function defaultBotRelayDir(): string {
   // v2.4.0 Part E — honor RELAY_HOME override (test harnesses + ops sandboxes).
@@ -266,13 +266,72 @@ export function installHook(hookScript: string, settingsPath: string = claudeSet
   return { changed: anyChange };
 }
 
+/**
+ * Probe :port/health, DISCRIMINATING "unreachable" (fetch rejects with an
+ * unambiguous ECONNREFUSED → the port is genuinely free) from
+ * "reachable-but-unreadable" (a response came back but the body is empty /
+ * non-JSON, the status is non-2xx, a 3xx, or the body stalls). Exported so the
+ * fail-closed behavior is tested through the REAL `res.json()` adapter — the
+ * harm lives in the adapter, not a stub.
+ *
+ * FAIL CLOSED by ENUMERATING SUCCESS (audit HIGH #3): "the port is free" is a
+ * POSITIVE determination (ECONNREFUSED alone), never the default for "anything
+ * went wrong." Everything else — a 3xx (redirect:"manual", not followed to a
+ * dead target and misread as free), a reset, a timeout/abort, a DNS failure, an
+ * unknown error — is reachable:true → unreadable → refuse.
+ *
+ * The abort timer spans BOTH `fetch` AND `res.json()` in ONE try/finally (codex
+ * round-4 P1: clearing it after fetch left the body read unbounded, so a server
+ * that sends headers then STALLS its body hung init forever). An abort mid-body
+ * rejects res.json() → parseable:false → unreadable.
+ *
+ * CROSS-PLATFORM verification (stated precisely): the claim "Node normalizes the
+ * OS connection-refused error to code 'ECONNREFUSED' (incl. Windows
+ * WSAECONNREFUSED)" is from Node docs. These probeHealth tests EXECUTE on Linux
+ * Node 20 + 22 in CI (the matrix runs the full suite) and on Node 24.13.0 via
+ * codex; macOS is local-only (the CI macOS job is scoped to the launchd guard,
+ * not the full suite). WINDOWS IS NOT EXECUTED ANYWHERE — there is no Windows
+ * runner in .github/workflows — that is the one OPEN gap. ACCEPTED fails-closed
+ * residuals (all → refuse, the safe direction): a loopback firewall that DROPs
+ * instead of REJECTs (no RST → runs to the abort deadline), EACCES,
+ * EADDRNOTAVAIL — if loopback itself is broken, refusing to install is correct.
+ */
+export async function probeHealth(port: number): Promise<HealthProbe> {
+  const timeoutMs = Math.max(1, parseInt(process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS || "3000", 10));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    let res: Response;
+    try {
+      res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal: controller.signal });
+    } catch (err) {
+      const code =
+        (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
+        (err as { code?: string } | null)?.code;
+      if (code === "ECONNREFUSED") {
+        return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
+      }
+      return { reachable: true, ok: false, parseable: false, body: null }; // reset/timeout/abort/DNS/unknown → fail closed
+    }
+    // The body read is STILL under the same timer — a server that sends headers
+    // then stalls the body aborts res.json() here instead of hanging forever.
+    let body: unknown = null;
+    let parseable = true;
+    try {
+      body = await res.json();
+    } catch {
+      parseable = false; // malformed OR aborted-mid-body → unreadable → refuse
+    }
+    return { reachable: true, ok: res.ok, parseable, body };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Real launchd deps — the only place init shells out to launchctl / fetch. */
 function realDaemonDeps(log: (l: string) => void): InstallDeps {
   return {
-    fetchHealth: async (port) => {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      return { ok: res.ok, body: res.ok ? await res.json() : null };
-    },
+    fetchHealth: probeHealth,
     launchctlList: () => {
       try {
         return execFileSync("launchctl", ["list"], { encoding: "utf-8" });
@@ -491,11 +550,32 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
         },
         realDaemonDeps((l) => process.stdout.write(`  ${l}\n`)),
       );
-      process.stdout.write(
-        res.installed
-          ? `✓ launchd daemon installed + started (KeepAlive) on :${port}\n`
-          : `• launchd daemon: ${res.decision.reason}\n`,
-      );
+      if (res.decision.versionDrift) {
+        // LOUD (audit HIGH #3): the running daemon is STALE. Never auto-restart
+        // (it would cut every agent on this host mid-session — ADR-0005); tell
+        // the operator exactly what to run. This replaces the prior
+        // "leaving the existing supervisor in place" line that reassured
+        // falsely after an upgrade that had not taken effect.
+        const d = res.decision.versionDrift;
+        process.stdout.write(
+          `\n⚠️  DAEMON VERSION DRIFT — the running daemon is STALE.\n` +
+            `     running:   ${d.running}\n` +
+            `     installed: ${d.installed}\n` +
+            `   The upgrade will NOT take effect until the daemon is restarted.\n` +
+            `   Run:  relay restart\n\n`,
+        );
+      } else if (res.decision.action === "skip-unreadable") {
+        // LOUD + FAIL-CLOSED (audit HIGH #3): something answered on the port but
+        // we could not read its health — we did NOT install (a competing daemon
+        // would be worse). The operator must investigate; we never report clean.
+        process.stdout.write(`\n⚠️  DAEMON STATE UNKNOWN — refusing to change it.\n   ${res.decision.reason}\n\n`);
+      } else {
+        process.stdout.write(
+          res.installed
+            ? `✓ launchd daemon installed + started (KeepAlive) on :${port}\n`
+            : `• launchd daemon: ${res.decision.reason}\n`,
+        );
+      }
     } else if (process.platform !== "darwin") {
       process.stdout.write(
         `• daemon: launchd supervision is macOS-only for now (Linux/Windows coming). ` +
