@@ -23,6 +23,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v220-p1-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -46,6 +47,7 @@ const { RegisterAgentSchema, FocusTerminalSchema } = await import("../src/types.
 function cleanup() {
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+  delete process.env.RELAY_DASHBOARD_SECRET;
 }
 
 beforeEach(() => cleanup());
@@ -190,6 +192,10 @@ async function bootServer(): Promise<void> {
   if (server) {
     try { server.close(); } catch { /* ignore */ }
   }
+  // ADR-0006: /api/focus-terminal is operator-power — it requires a VERIFIED
+  // dashboard secret + CSRF. Configure one so operatorPost authenticates; the
+  // 400/404/409 handler-branch assertions below are unchanged.
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
   server = startHttpServer(0, "127.0.0.1");
@@ -233,7 +239,7 @@ function post(
 describe("v2.2.0 Phase 1 — POST /api/focus-terminal", () => {
   it("(3a) 400 on invalid body (no agent_name)", async () => {
     await bootServer();
-    const r = await post("/api/focus-terminal", {});
+    const r = await operatorPost(port, "/api/focus-terminal", {});
     expect(r.status).toBe(400);
     expect(r.body).toMatch(/invalid/i);
     server.close();
@@ -241,7 +247,7 @@ describe("v2.2.0 Phase 1 — POST /api/focus-terminal", () => {
 
   it("(3b) 404 on unknown agent", async () => {
     await bootServer();
-    const r = await post("/api/focus-terminal", { agent_name: "ghost" });
+    const r = await operatorPost(port, "/api/focus-terminal", { agent_name: "ghost" });
     expect(r.status).toBe(404);
     const data = JSON.parse(r.body);
     expect(data.raised).toBe(false);
@@ -252,7 +258,7 @@ describe("v2.2.0 Phase 1 — POST /api/focus-terminal", () => {
   it("(3c) 409 when agent has NULL terminal_title_ref (graceful degrade)", async () => {
     await bootServer();
     registerAgent("no-ref", "r", []);
-    const r = await post("/api/focus-terminal", { agent_name: "no-ref" });
+    const r = await operatorPost(port, "/api/focus-terminal", { agent_name: "no-ref" });
     expect(r.status).toBe(409);
     const data = JSON.parse(r.body);
     expect(data.raised).toBe(false);
@@ -263,7 +269,7 @@ describe("v2.2.0 Phase 1 — POST /api/focus-terminal", () => {
   it("(3d) Zod-level rejection of invalid agent_name shape returns 400", async () => {
     await bootServer();
     // agent_name max is 64 chars per Zod. 100-char string → rejection.
-    const r = await post("/api/focus-terminal", { agent_name: "x".repeat(100) });
+    const r = await operatorPost(port, "/api/focus-terminal", { agent_name: "x".repeat(100) });
     expect(r.status).toBe(400);
     server.close();
   });

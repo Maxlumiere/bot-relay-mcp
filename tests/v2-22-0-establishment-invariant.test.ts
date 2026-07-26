@@ -38,6 +38,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 // #7 spawn: the platform driver is macOS-only on CI, so mock the dispatcher to
 // report a clean launch — the establishment stamp under test lives in spawn.ts's
@@ -81,6 +82,10 @@ beforeEach(async () => {
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
+  // ADR-0006: the dashboard /api/send-message (path #5) is operator-power — it
+  // requires a VERIFIED dashboard secret + CSRF. Configure one so operatorPost
+  // authenticates. The MCP /mcp calls (no http_secret) are unaffected.
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   server = startHttpServer(0, "127.0.0.1");
   await new Promise((r) => setTimeout(r, 100));
   const addr = server.address();
@@ -90,6 +95,7 @@ afterEach(() => {
   try { server?.close(); } catch { /* ignore */ }
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+  delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
 describe("ADR-0005 — every identity-establishment path stamps established_at", () => {
@@ -119,12 +125,12 @@ describe("ADR-0005 — every identity-establishment path stamps established_at",
     const token = await register("est-dash");
     await register("est-dash-to");
     expect(established("est-dash")).toBeNull();
-    const res = await fetch(`${baseUrl}/api/send-message`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from: "est-dash", to: "est-dash-to", content: "hi", from_agent_token: token }),
-    });
-    expect(res.ok).toBe(true);
+    const res = await operatorPost(
+      Number(new URL(baseUrl).port),
+      "/api/send-message",
+      { from: "est-dash", to: "est-dash-to", content: "hi", from_agent_token: token },
+    );
+    expect(res.status).toBe(200);
     expect(established("est-dash")).not.toBeNull();
   });
 

@@ -26,6 +26,20 @@ export interface RelayConfig {
    * secret index was used so operators can see who is still on the old secret.
    */
   http_secrets_previous: string[];
+  /**
+   * ADR-0006: the DASHBOARD / OPERATOR secret. This authenticates the operator
+   * principal for the dashboard and operator-power endpoints (kill-agent,
+   * wake-agent, set-status, …). It is DELIBERATELY SEPARATE from `http_secret`
+   * (the agent *transport* credential every HTTP agent holds): agents and the
+   * operator are different principals with different lifetimes and rotation, so
+   * one secret must not authorize both. `relay init` generates one by default
+   * (secret-by-default) so operator endpoints are always satisfiable. Resolution
+   * is `RELAY_DASHBOARD_SECRET || dashboard_secret` and NOTHING ELSE — the old
+   * `http_secret` fallback was removed because it was a live privilege-
+   * escalation (an agent transport credential reaching operator power); do not
+   * re-add it as a convenience.
+   */
+  dashboard_secret: string | null;
   /** Messages per agent per hour. 0 disables the limit. */
   rate_limit_messages_per_hour: number;
   /** Tasks posted per agent per hour. 0 disables. */
@@ -57,6 +71,7 @@ export const DEFAULT_CONFIG: RelayConfig = {
   api_allowlist: [],
   http_secret: null,
   http_secrets_previous: [],
+  dashboard_secret: null,
   rate_limit_messages_per_hour: 1000,
   rate_limit_tasks_per_hour: 200,
   rate_limit_spawns_per_hour: 50,
@@ -148,6 +163,12 @@ export function loadConfig(): RelayConfig {
   const envPort = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : undefined;
   const envHost = process.env.RELAY_HTTP_HOST;
   const envSecret = process.env.RELAY_HTTP_SECRET;
+  // ADR-0006: the operator/dashboard secret. Folded into config so it is subject
+  // to the same 32-char validation as http_secret. The request-time resolver in
+  // http.ts still reads process.env.RELAY_DASHBOARD_SECRET live (so a value set
+  // after server start is honored), so this mapping is for startup validation +
+  // making config.dashboard_secret reflect the env; the two agree.
+  const envDashboardSecret = process.env.RELAY_DASHBOARD_SECRET;
   const envPrevSecrets = process.env.RELAY_HTTP_SECRET_PREVIOUS
     ? process.env.RELAY_HTTP_SECRET_PREVIOUS.split(",").map((s) => s.trim()).filter(Boolean)
     : undefined;
@@ -162,9 +183,28 @@ export function loadConfig(): RelayConfig {
     ...(envPort && !isNaN(envPort) ? { http_port: envPort } : {}),
     ...(envHost ? { http_host: envHost } : {}),
     ...(envSecret ? { http_secret: envSecret } : {}),
+    ...(envDashboardSecret ? { dashboard_secret: envDashboardSecret } : {}),
     ...(envPrevSecrets ? { http_secrets_previous: envPrevSecrets } : {}),
     ...(envProxies ? { trusted_proxies: envProxies } : {}),
   };
+}
+
+/**
+ * ADR-0006 — resolve the DASHBOARD / OPERATOR secret. The chain is
+ * `RELAY_DASHBOARD_SECRET` (env) || `dashboard_secret` (config) — and NOTHING
+ * ELSE. The former `|| http_secret` fallback was REMOVED as a privilege-
+ * ESCALATION path (authMiddleware enforces http_secret on /mcp, so every HTTP
+ * agent already holds it; falling back to it let an agent *transport* credential
+ * satisfy *operator* auth). Do not re-add it as a convenience.
+ *
+ * This is the SINGLE definition of the predicate. Every dashboard/operator auth
+ * site consumes it — the HTTP dashboardAuthCheck / csrfCheck / operatorAuthCheck
+ * AND the dashboard WebSocket gate (websocket.ts) — so the predicate cannot
+ * drift between surfaces (ADR-0015 L4). The caller supplies the config source
+ * (a captured config, or a fresh loadConfig()); the env is always read live.
+ */
+export function resolveDashboardSecret(config: RelayConfig): string | null {
+  return process.env.RELAY_DASHBOARD_SECRET || config.dashboard_secret || null;
 }
 
 /**
@@ -217,6 +257,14 @@ export function validateConfigAndEnv(config: RelayConfig): void {
   if (config.http_secret !== null && config.http_secret !== undefined) {
     if (typeof config.http_secret !== "string" || config.http_secret.length < 32) {
       errors.push(`RELAY_HTTP_SECRET must be at least 32 characters for adequate entropy (got length ${config.http_secret?.length ?? 0})`);
+    }
+  }
+
+  // Dashboard/operator secret (ADR-0006) — same 32-char entropy floor when set.
+  // Separate principal from http_secret; validated independently.
+  if (config.dashboard_secret !== null && config.dashboard_secret !== undefined) {
+    if (typeof config.dashboard_secret !== "string" || config.dashboard_secret.length < 32) {
+      errors.push(`RELAY_DASHBOARD_SECRET / dashboard_secret must be at least 32 characters for adequate entropy (got length ${config.dashboard_secret?.length ?? 0})`);
     }
   }
 
