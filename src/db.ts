@@ -20,6 +20,7 @@ import type {
 } from "./types.js";
 import { VALID_TRANSITIONS, ACTION_TO_STATUS } from "./types.js";
 import { generateToken, hashToken, verifyToken } from "./auth.js";
+import { registerIdentitySecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
 import { computeTokenLookup } from "./token-lookup.js";
 import { normalizeAgentClass, TOPOLOGY_VISIBLE_CLASSES, TOPOLOGY_HIDDEN_CLASSES, TRANSIENT } from "./agent-class.js";
@@ -3065,6 +3066,7 @@ export function mintAgentToken(
 
   const plaintext_token = generateToken();
   const token_hash = hashToken(plaintext_token);
+  registerIdentitySecret(name, plaintext_token); // PR C — redact-by-value, keyed by principal
 
   let created: boolean;
   if (!existing) {
@@ -3254,6 +3256,7 @@ export function registerAgent(
     if (existingState === "legacy_bootstrap" || existingState === "recovery_pending") {
       plaintext_token = generateToken();
       newHash = hashToken(plaintext_token);
+      registerIdentitySecret(name, plaintext_token); // PR C — redact-by-value, keyed by principal
       newAuthState = "active";
       newRecoveryHash = null;
       newRevokedAt = null;
@@ -3263,6 +3266,7 @@ export function registerAgent(
     if (existingState === "active" && !newHash) {
       plaintext_token = generateToken();
       newHash = hashToken(plaintext_token);
+      registerIdentitySecret(name, plaintext_token); // PR C — redact-by-value, keyed by principal
     }
 
     // v2.0 final (#29): description is mutable on re-register. If caller
@@ -3410,12 +3414,14 @@ export function registerAgent(
     // First registration — always generate a token.
     plaintext_token = generateToken();
     const token_hash = hashToken(plaintext_token);
+    registerIdentitySecret(name, plaintext_token); // PR C — redact-by-value, keyed by principal
     // ADR-0005: issue a one-time, name-scoped registration-recovery HANDLE so
     // the registrant can abandon its OWN botched registration (lost token)
     // without the destructive operator endpoint. Stored bcrypt-hashed with a
     // short TTL; retired on first successful auth (markAgentAuthenticated).
     registration_recovery = generateToken();
     const regRecoveryHash = hashToken(registration_recovery);
+    registerIdentitySecret(name, registration_recovery); // PR C — redact-by-value, keyed by principal
     const regRecoveryExpiresAt = new Date(Date.now() + orphanTtlMs()).toISOString();
     const id = uuidv4();
     const description = options.description ?? null;
@@ -3528,6 +3534,7 @@ export function rotateAgentToken(
   const db = getDb();
   const newPlaintextToken = generateToken();
   const newHash = hashToken(newPlaintextToken);
+  registerIdentitySecret(name, newPlaintextToken); // PR C — redact-by-value, keyed by principal
 
   // Look up the agent's `managed` flag to decide which CAS path applies.
   const row = db
@@ -3632,6 +3639,7 @@ export function rotateAgentTokenAdmin(
   const newPlaintextToken = generateToken();
   const newHash = hashToken(newPlaintextToken);
   const isManaged = row.managed === 1;
+  registerIdentitySecret(targetName, newPlaintextToken); // PR C — redact-by-value, keyed by principal
 
   if (isManaged) {
     const graceSec = options.graceSeconds !== undefined
@@ -3758,6 +3766,7 @@ export function revokeAgentToken(
   if (options.issueRecovery) {
     recoveryToken = generateToken();
     recoveryHash = hashToken(recoveryToken);
+    registerIdentitySecret(targetName, recoveryToken); // PR C — redact-by-value, keyed by principal
     newState = "recovery_pending";
   }
 
