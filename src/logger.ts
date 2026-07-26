@@ -95,7 +95,7 @@ export function redactSecrets(line: string): string {
       // JSON-ish "<key>": "<value>" for common secret-bearing keys.
       // Catches both single + double quotes; non-greedy value match.
       .replace(
-        /("(?:token|agent_token|recovery_token|secret|http_secret|webhook_secret|password)"\s*:\s*)"([^"]+)"/gi,
+        /("(?:token|agent_token|recovery_token|new_token|registration_recovery|secret|http_secret|webhook_secret|password)"\s*:\s*)"([^"]+)"/gi,
         '$1"***"',
       )
   );
