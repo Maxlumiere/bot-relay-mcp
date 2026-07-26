@@ -7,7 +7,8 @@ so every slice lands as a permanent part of one design.
 **Status (reality-check, 2026-07-26, base `936f5f3`, post-#141):** now under version control. Verified against main —
 S0's "already exists unnamed" list holds: dead-anchor Fork B (#136), register-time `server_version` recording, and
 the wake-routing module (#126) are merged. One shipped-status correction was applied: L2 (see §4) was marked
-"shipped / live since v2.22" but only its *substrate* is in main; the operator-recap query surface is in flight.
+"shipped / live since v2.22", but main carries only the *resolve/read-receipt* substrate (`resolved_at` +
+`resolve_messages`) — the `disposition` classification AND the operator-recap query surface are unmerged (PR #127).
 The cross-referenced ADRs are a mix of states: **ADR-0012** and **ADR-0015** are committed in `docs/`, **ADR-0006**
 lands with the in-flight operator-auth PR, and the remainder (0005 / 0007 / 0008 / 0009 / 0010 / 0011 / 0013) are
 forthcoming deliverables not yet in `docs/` — cited here by number as the roadmap intends, not as extant files.
@@ -62,12 +63,14 @@ Per agent, the plane holds current, observed data:
   agent in each state — never inferred from the agent's CLI identity (the Gap-4a lesson).
 - **Watchers:** a registry of who watches whom; one watcher per name, enforced.
 
-### L2 — Work disposition (substrate live; query surface in flight)
+### L2 — Work disposition (resolve substrate live; disposition + query surface in flight)
 Message disposition (log / ask / obligation), sticky agent-level read, explicit resolve, pull-queryable
-outstanding/overdue (ADR-0011). The **substrate** is live in main at schema v23 — the per-message `disposition`
-column, sticky read-receipts, and the explicit `resolve_messages` tool. The **operator-recap query surface** — the
-pull-queryable outstanding/overdue view (`get_outstanding`), which is what makes L2 answer "what is owed, by whom,
-how late" in one call — is **in flight as PR #127, not yet merged**. L2 is the substrate of the operator's recap.
+outstanding/overdue (ADR-0011). What is live in main today is the **explicit-resolve + read-receipt substrate** — the
+`resolved_at` column and the `resolve_messages` tool. The rest of ADR-0011 — the per-message `disposition` /
+`deadline` / `read_at` columns AND the operator-recap query surface (`get_outstanding`, the pull-queryable
+outstanding/overdue view that makes L2 answer "what is owed, by whom, how late" in one call) — is **in flight as PR
+#127, not yet merged** (verified against main: it carries no `disposition` column). L2's substrate is the resolve
+layer; the disposition classification and the recap surface land together with #127.
 
 ### L3 — Desired state + reconcile + report
 A declared fleet spec — which agents should exist, what coverage each should have, the minimum protocol version —
