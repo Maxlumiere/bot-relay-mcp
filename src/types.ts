@@ -4,6 +4,7 @@
 // See LICENSE for full terms.
 
 import { z } from "zod";
+import { isSafeCssColorValue } from "./css-color.js";
 import { getAgentCliProfile } from "./agent-cli-profiles.js";
 import { AgentClassEnum, type AgentClass } from "./agent-class.js";
 
@@ -803,11 +804,22 @@ export type ApiSetStatusInput = z.infer<typeof ApiSetStatusSchema>;
  * `src/dashboard-styles.ts` :root selector. A theme object MUST set every
  * token; partial themes are rejected at the Zod boundary so the dashboard
  * never ends up with a mix-of-themes visual (e.g. dark backgrounds + light
- * tag colors). Each token is a CSS color string — no format validation
- * beyond "non-empty string" because CSS accepts many forms (#hex,
- * rgb(), hsl(), color()).
+ * tag colors). Each token is a CSS color string, VALIDATED against a positive
+ * grammar (hex / numeric rgb()/rgba()/hsl()/hsla() / a closed named-color set)
+ * — see src/css-color.ts. This is the WRITE-path primary control: the stored
+ * value feeds a CSS `background:` shorthand, which accepts `url(...)`, so an
+ * unvalidated token was a CSS-beaconing / defacement vector (LOW — authed write).
+ * Refusing everything but the permitted forms means url()/var()/color()/escapes/
+ * comments are refused by default.
  */
-const THEME_TOKEN_FIELD = z.string().min(1).max(64);
+const THEME_TOKEN_FIELD = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine(isSafeCssColorValue, {
+    message:
+      "must be a CSS color: #hex, rgb()/rgba()/hsl()/hsla() with a numeric interior, or a named color — url()/var()/escapes/comments are refused",
+  });
 export const CustomThemeSchema = z.object({
   bg: THEME_TOKEN_FIELD,
   panel: THEME_TOKEN_FIELD,
