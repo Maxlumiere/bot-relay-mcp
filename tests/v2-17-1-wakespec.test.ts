@@ -43,7 +43,7 @@ describe("v2.17.1 — WakeSpec reconciled to the extension's proven behavior", (
   });
 
   it("claude wake = types 'inbox', settles, then a SEPARATE submit (sendText, 150ms)", () => {
-    // v2.22.0 wake fix: the old inline-newline wake (submitDelayMs 0) relied on
+    // Tether v0.7.0 wake fix (#129): the old inline-newline wake (submitDelayMs 0) relied on
     // the appended newline submitting — Claude Code's TUI takes an in-chunk
     // newline as literal input, so wakes sat unsubmitted until a human pressed
     // Enter and stacked one injection per new message (2026-07-24).
