@@ -695,6 +695,23 @@ export function startHttpServer(port: number, host: string): Server {
     // the two never disagree about whether a session can exist (ADR-0015 L4).
     const dashboardSecret = resolveDashboardSecret(config);
     if (!dashboardSecret) return next();
+    // ADR-0006 — CSRF defends the AMBIENT-credential path ONLY. dashboardAuthCheck
+    // resolves the credential Bearer → ?auth → cookie (http.ts ~609), each behind
+    // `if (!presented)`, so a request presenting an EXPLICIT credential (an
+    // Authorization header or an ?auth query) authenticates via THAT channel and
+    // NEVER falls through to the cookie — a wrong explicit credential 401s, it does
+    // not ride the cookie. CSRF (a double-submit defence against a browser being
+    // tricked into riding its auto-attached cookie) is therefore meaningless for
+    // such requests: an attacker cannot send a dummy header to skip this check and
+    // then ride the ambient cookie, because the dummy header 401s FIRST. Exempt
+    // them so non-browser clients (the `relay send` CLI presents Bearer) are not
+    // forced into a browser handshake they have no cookie for. Cookie-only requests
+    // (the ONLY ambient case) keep full CSRF. This MIRRORS dashboardAuthCheck's
+    // channel precedence — keep the two in sync (ADR-0015 L4).
+    const hasExplicitCredential =
+      (typeof req.headers.authorization === "string" && req.headers.authorization.length > 0) ||
+      (typeof req.query.auth === "string" && (req.query.auth as string).length > 0);
+    if (hasExplicitCredential) return next();
     const cookieHeader = req.headers.cookie;
     let cookieToken: string | null = null;
     if (typeof cookieHeader === "string") {

@@ -400,19 +400,39 @@ describe("v2.1.7 Item 2 — SameSite cookie + CSRF double-submit", () => {
     expect(csrfCookie).not.toMatch(/HttpOnly/);
   });
 
-  it("(2d) POST /api/* without CSRF cookie/header → 403 (infra active, no endpoint needed)", async () => {
+  it("(2d) CSRF is enforced for AMBIENT-cookie sessions and EXEMPT for explicit-credential (Bearer) requests (ADR-0006)", async () => {
     await bootServer({ RELAY_DASHBOARD_SECRET: "csrf-deny-test" });
-    // Attempt a state-changing request. No endpoint exists — but the CSRF
-    // middleware fires BEFORE route matching, so missing CSRF → 403 regardless
-    // of whether /api/fake has a handler.
-    const r = await rawRequest({
+    // Authenticate via GET to receive the relay_dashboard_auth cookie.
+    const auth = await rawRequest({
+      method: "GET",
+      path: "/api/snapshot",
+      extraHeaders: { Authorization: "Bearer csrf-deny-test" },
+    });
+    const cookies = ([] as string[]).concat(auth.headers["set-cookie"] ?? []);
+    const authCookie = cookies.find((c) => c.startsWith("relay_dashboard_auth="))!.split(";")[0];
+    // AMBIENT cookie session with NO CSRF header → 403. This is the path CSRF
+    // defends (a browser tricked into riding its auto-attached cookie), and the
+    // middleware fires before route matching so /api/fake need not exist.
+    const cookieOnly = await rawRequest({
+      method: "POST",
+      path: "/api/fake",
+      body: "{}",
+      extraHeaders: { Cookie: authCookie },
+    });
+    expect(cookieOnly.status).toBe(403);
+    expect(cookieOnly.body).toMatch(/CSRF/i);
+    // EXPLICIT Bearer (non-ambient) → CSRF-EXEMPT: passes the middleware to route
+    // matching → 404 for a fake endpoint, NOT 403. Safe because dashboardAuthCheck
+    // resolves Bearer before the cookie and a wrong Bearer 401s rather than riding
+    // the cookie, so an attacker cannot send a dummy header to skip CSRF and then
+    // ride the ambient cookie. CSRF is applied to what it actually defends.
+    const bearerOnly = await rawRequest({
       method: "POST",
       path: "/api/fake",
       body: "{}",
       extraHeaders: { Authorization: "Bearer csrf-deny-test" },
     });
-    expect(r.status).toBe(403);
-    expect(r.body).toMatch(/CSRF/i);
+    expect(bearerOnly.status).not.toBe(403);
   });
 
   it("(2e) POST /api/* with matching CSRF cookie + header passes through middleware (to route 404)", async () => {
