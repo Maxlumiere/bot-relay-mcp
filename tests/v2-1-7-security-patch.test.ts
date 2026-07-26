@@ -324,7 +324,13 @@ describe("v2.1.7 Item 6 — dashboard secret layers independently of HTTP secret
     expect(r.status).toBe(200);
   });
 
-  it("(6b) RELAY_HTTP_SECRET still works on /api/snapshot as fallback when dashboard secret is unset", async () => {
+  it("(6b) RELAY_HTTP_SECRET does NOT authenticate the dashboard (ADR-0006 — removed fallback)", async () => {
+    // http_secret set, NO dashboard secret. Presenting http_secret as the dashboard
+    // Bearer must NOT authenticate — the fallback was removed. Loopback /api/snapshot
+    // still 200s, but RESTRICTED (authenticated=false), and that is regardless of
+    // the Bearer, not because of it. (Pre-#142 this test's name claimed the
+    // opposite and passed only because loopback returns 200 either way — a green
+    // light wired to nothing.)
     await bootServer({ RELAY_HTTP_SECRET: "fallback-secret" });
     const r = await rawRequest({
       method: "GET",
@@ -332,6 +338,18 @@ describe("v2.1.7 Item 6 — dashboard secret layers independently of HTTP secret
       extraHeaders: { Authorization: "Bearer fallback-secret" },
     });
     expect(r.status).toBe(200);
+    const body = JSON.parse(r.body);
+    expect(body.authenticated).toBe(false); // http_secret did NOT authenticate
+    expect(body.content_visibility).toBe("restricted");
+
+    // With a REAL dashboard secret configured, the http_secret Bearer is REFUSED
+    // while the dashboard secret authenticates — proving what actually gates it.
+    await bootServer({ RELAY_HTTP_SECRET: "fallback-secret", RELAY_DASHBOARD_SECRET: "the-real-dashboard-secret-000000-ok" });
+    const wrong = await rawRequest({ method: "GET", path: "/api/snapshot", extraHeaders: { Authorization: "Bearer fallback-secret" } });
+    expect(wrong.status).toBe(401); // http_secret is not the dashboard secret
+    const right = await rawRequest({ method: "GET", path: "/api/snapshot", extraHeaders: { Authorization: "Bearer the-real-dashboard-secret-000000-ok" } });
+    expect(right.status).toBe(200);
+    expect(JSON.parse(right.body).authenticated).toBe(true);
   });
 
   it("(6c) /mcp still requires RELAY_HTTP_SECRET when set (dashboard bypass does NOT leak to /mcp)", async () => {

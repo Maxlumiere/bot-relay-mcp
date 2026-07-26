@@ -470,6 +470,12 @@ export function startHttpServer(port: number, host: string): Server {
   app.use(express.json({ limit: process.env.RELAY_HTTP_BODY_LIMIT || "1mb" }));
 
   const config = loadConfig();
+  // P2a — capture the config PATH at boot, next to the config the daemon actually
+  // loaded. The recovery hint must name THIS file, not a live getConfigPath():
+  // after a `use-instance` switch the daemon keeps enforcing the booted config
+  // while getConfigPath() re-resolves the now-active instance, so a live call would
+  // point a locked-out operator at a file the daemon is not reading.
+  const bootConfigPath = getConfigPath();
 
   // Health check (auth-free)
   app.get("/health", (_req: Request, res: Response) => {
@@ -625,7 +631,13 @@ export function startHttpServer(port: number, host: string): Server {
     if (!presented || !timingSafeStringEq(presented, dashboardSecret)) {
       res.status(401).json({
         error: "Dashboard secret required",
-        hint: "Present via `Authorization: Bearer <secret>`, `?auth=<secret>`, or cookie `relay_dashboard_auth=<secret>`.",
+        // P2b — this is the REACHABLE 401 when a secret IS configured (this branch
+        // only runs when one exists). Name WHERE it lives so an operator who missed
+        // the install-time print can recover it: there is no CLI to read the secret
+        // back, so the config file is the recovery path. Boot-captured path (P2a).
+        hint:
+          "Present via `Authorization: Bearer <secret>`, `?auth=<secret>`, or cookie `relay_dashboard_auth=<secret>`. " +
+          `The configured secret is stored under \`dashboard_secret\` in ${bootConfigPath} (printed once at \`relay init\`).`,
       });
       return;
     }
@@ -755,13 +767,12 @@ export function startHttpServer(port: number, host: string): Server {
       error: "Operator authentication required",
       hint:
         "This endpoint performs an operator action (agent control / operator config) and is authed regardless of network position (ADR-0006). " +
-        "Present the dashboard/operator secret via `Authorization: Bearer <secret>`, `?auth=<secret>`, or the `relay_dashboard_auth` cookie. " +
-        // Close the recovery loop: name WHERE an existing secret lives, not just
-        // how to present it. Without this a legit operator who missed the
-        // install-time print is fail-closed with no documented way back — there
-        // is no CLI to read the secret, so the config file IS the recovery path.
-        `An existing secret is stored under \`dashboard_secret\` in ${getConfigPath()} (printed once at \`relay init\`); ` +
-        "if none exists yet, run `relay init` to generate one, then restart the daemon to load it.",
+        // P2b — this branch is reached ONLY when NO dashboard secret is configured
+        // (a loopback caller dashboardAuthCheck let through unauthenticated), so do
+        // NOT claim an existing secret — there is none. The configured-but-not-
+        // presented case is handled by dashboardAuthCheck's 401, which names where
+        // the secret lives. Two states, two true messages.
+        "No operator/dashboard secret is configured, so operator endpoints are refused. Run `relay init` to generate a `dashboard_secret`, then restart the daemon to load it.",
     });
   };
 

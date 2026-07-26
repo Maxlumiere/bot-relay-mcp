@@ -160,10 +160,15 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
 
-  // --- Resolve host/port + optional dashboard/http secret ---
+  // --- Resolve host/port + the /mcp TRANSPORT secret ---
+  // resolve.ts POSTs to /mcp (the agent transport, authed by http_secret via
+  // authMiddleware) — NOT a dashboard/operator endpoint. So present http_secret,
+  // NOT RELAY_DASHBOARD_SECRET (the operator principal). Preferring the dashboard
+  // secret here was the mirror-image of send.ts's bug — the fifth copy of the
+  // resolver drift, mixing the principals the OPPOSITE way.
   let host = "127.0.0.1";
   let port = 3777;
-  let secret: string | null = process.env.RELAY_DASHBOARD_SECRET || process.env.RELAY_HTTP_SECRET || null;
+  let secret: string | null = process.env.RELAY_HTTP_SECRET || null;
   try {
     const { loadConfig } = await import("../config.js");
     const cfg = loadConfig();

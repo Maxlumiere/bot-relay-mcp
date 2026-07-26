@@ -109,14 +109,15 @@ describe("ADR-0006 — HARM: tokenless loopback caller is refused operator power
     expect(agentStatus("victim")).toBe(before); // refused = unchanged, not just a 401 shell
   });
 
-  it("(recovery) the 401 hint names WHERE an existing secret lives — fail-closed, not fail-closed-with-no-way-back", async () => {
+  it("(recovery, no secret) the 401 says no secret is configured + run relay init — NOT a false 'existing secret'", async () => {
+    // No secret is configured in this block → operatorAuthCheck's 401 is reached.
+    // It must NOT claim a secret exists (P2b: a signpost whose premise is false is
+    // worse than none); it must tell the operator to generate one.
     const r = await rawRequest(port, "GET", "/api/keyring", null);
     expect(r.status).toBe(401);
-    // A locked-out operator must have a documented path back: the field name +
-    // the config file it lives in. There is no CLI to read the secret, so the
-    // hint IS the recovery signpost (Victra ruling, PR B gate).
-    expect(r.json.hint).toContain("dashboard_secret");
-    expect(r.json.hint).toContain("config.json");
+    expect(r.json.hint).toMatch(/no operator.*secret is configured/i);
+    expect(r.json.hint).toContain("relay init");
+    expect(r.json.hint).not.toContain("stored under"); // no false "existing secret" claim
   });
 
   it("(side effect) an unauthenticated kill-agent does NOT remove the row", async () => {
@@ -182,6 +183,16 @@ describe("ADR-0006 — INNOCENT TWIN: an authenticated operator performs the sam
     expect(k.status).toBe(200);
     const o = await operatorGet(port, "/api/operator-identity");
     expect(o.status).toBe(200);
+  });
+
+  it("(recovery, secret configured) a no-credential request gets the REACHABLE signpost naming where the secret lives", async () => {
+    // A secret IS configured here, so dashboardAuthCheck 401s FIRST (before
+    // operatorAuthCheck ever runs) — and ITS hint is the reachable recovery path,
+    // naming the field + the config file. This is the case the signpost is FOR.
+    const r = await rawRequest(port, "GET", "/api/keyring", null);
+    expect(r.status).toBe(401);
+    expect(r.json.hint).toContain("dashboard_secret");
+    expect(r.json.hint).toContain("config.json");
   });
 
   it("a WRONG bearer is refused at the auth gate even from loopback (secret set, no bypass)", async () => {
