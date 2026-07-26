@@ -497,43 +497,30 @@ readme_masthead_version_guard() {
 }
 step "readme version guard (no **vX.Y** masthead; history '(current)' tracks package.json)" readme_masthead_version_guard || exit 1
 
-# --- 5b. Sanctioned-helper guard (v2.1 Phase 7q) -----------------------------
-# Reject raw `UPDATE agents` / `DELETE FROM agents` / `UPDATE agent_capabilities`
-# / `DELETE FROM agent_capabilities` tokens in src/*.ts OUTSIDE src/db.ts, which
-# is the single sanctioned mutation site for the agents table. A genuine
-# one-off can escape the guard with a trailing `// ALLOWLIST: <reason>`
-# comment — that's the "you must explicitly acknowledge you're mutating agents"
-# surface Codex asked for. If that comment starts appearing in a third file,
-# extract a new helper instead.
+# --- 5b. Sanctioned-mutation guard (ADR-0015 rebuild) ------------------------
+# Reject any INSERT / REPLACE / UPDATE / DELETE of the `agents` or
+# `agent_capabilities` table in a src/ TypeScript file OUTSIDE src/db.ts — the
+# single sanctioned mutation site, where the load-bearing invariants live (probe-
+# cache eviction, auth-generation bump, agent_capabilities cascade, session/anchor
+# CAS). The prior case-sensitive grep enforced a TEXT PROXY: it covered only
+# UPDATE/DELETE (never INSERT/REPLACE), and `main.agents`, table aliases, inline
+# comments, and case variants all walked straight past it. This is a TS-AST +
+# SQL-statement parser that classifies the actual statement — L1–L4 declared
+# inline in scripts/sanctioned-mutation-guard.mjs, shared with the harm /
+# innocent-twin vitest test (tests/v2-24-0-sanctioned-mutation-guard.test.ts). It
+# FAILS CLOSED on an unparseable/unreadable file (never `exit 0` on input it
+# cannot process — the audit-state-freshness.sh disease). A genuine one-off still
+# escapes with a per-line `// ALLOWLIST: <reason>` acknowledgement.
 #
-# Not checking hooks/, scripts/, tests/ — hooks are external clients that now
-# go through register_agent over HTTP (Phase 7p HIGH #3), scripts don't touch
-# this schema, tests legitimately seed raw rows.
-sanctioned_helper_guard() {
-  local hits
-  hits=$(grep -rnE "(UPDATE[[:space:]]+agents|DELETE[[:space:]]+FROM[[:space:]]+agents|UPDATE[[:space:]]+agent_capabilities|DELETE[[:space:]]+FROM[[:space:]]+agent_capabilities)" "$PROJECT_ROOT/src" \
-    --include='*.ts' \
-    | grep -v "^$PROJECT_ROOT/src/db\.ts:" \
-    | grep -v "// ALLOWLIST:" \
-    || true)
-  if [ -n "$hits" ]; then
-    echo "Raw agents/agent_capabilities mutations found outside src/db.ts:" >&2
-    echo "$hits" >&2
-    echo "" >&2
-    echo "Fix: route the mutation through one of the sanctioned helpers in src/db.ts:" >&2
-    echo "  - teardownAgent(name, reason)          — DELETE + cascade to agent_capabilities" >&2
-    echo "  - applyAuthStateTransition(name, ...)  — CAS UPDATE on auth_state + related fields" >&2
-    echo "  - updateAgentMetadata(name, fields)    — UPDATE last_seen / agent_status / busy_expires_at" >&2
-    echo "  - markAgentOffline(name, sessionId)    — CAS offline transition on stdio SIGINT/SIGTERM (v2.1.3)" >&2
-    echo "  - expandAgentCapabilities(name, caps)  — additive cap expansion (v2.1.4)" >&2
-    echo "" >&2
-    echo "If you genuinely need a one-off, append '// ALLOWLIST: <reason>' to the line." >&2
-    return 1
-  fi
-  echo "No raw agents-table mutations outside src/db.ts — invariant surface consolidated"
-  return 0
-}
-step "sanctioned-helper guard (no raw agents mutations)" sanctioned_helper_guard || exit 1
+# Scans src/ only — hooks are external clients that register over HTTP (Phase 7p
+# HIGH #3), scripts don't touch this schema, tests legitimately seed raw rows.
+#
+# WIRED DIRECT (#206 step model): invoked as `step "…" node <guard> <target>` — NOT via a
+# wrapper function — so `--list-steps` records the node-script position and
+# guard-wiring-coverage.test.ts binds this guard to its reached step. A wrapper (`step "…"
+# fn`) would record cmd=<fn>/script=<empty>, bind nothing, and redden the coverage check.
+# Column 0 + unconditional, per scripts/step-gate-guard.mjs.
+step "sanctioned-mutation guard (no raw agents/agent_capabilities writes outside src/db.ts)" node "$PROJECT_ROOT/scripts/sanctioned-mutation-guard.mjs" "$PROJECT_ROOT/src" || exit 1
 
 # --- 5c. IP-classifier consolidation guard (v2.2.0 Phase 5 / Codex Item 9) ---
 # Classification CIDR literals (like "127.0.0.0/8", "fe80::/10") belong in
