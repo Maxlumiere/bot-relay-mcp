@@ -34,7 +34,7 @@ import {
   checkOrigin,
   parseHostAllowlist,
 } from "./boundary-checks.js";
-import { loadConfig, resolveDashboardSecret } from "../config.js";
+import { loadConfig, resolveDashboardSecret, getConfigPath } from "../config.js";
 import { log } from "../logger.js";
 import { requestContext } from "../request-context.js";
 import { ipInAnyCidr } from "../cidr.js";
@@ -739,7 +739,12 @@ export function startHttpServer(port: number, host: string): Server {
       hint:
         "This endpoint performs an operator action (agent control / operator config) and is authed regardless of network position (ADR-0006). " +
         "Present the dashboard/operator secret via `Authorization: Bearer <secret>`, `?auth=<secret>`, or the `relay_dashboard_auth` cookie. " +
-        "If no secret exists yet (a legacy install), run `relay init` to generate one, then restart the daemon to load it.",
+        // Close the recovery loop: name WHERE an existing secret lives, not just
+        // how to present it. Without this a legit operator who missed the
+        // install-time print is fail-closed with no documented way back — there
+        // is no CLI to read the secret, so the config file IS the recovery path.
+        `An existing secret is stored under \`dashboard_secret\` in ${getConfigPath()} (printed once at \`relay init\`); ` +
+        "if none exists yet, run `relay init` to generate one, then restart the daemon to load it.",
     });
   };
 

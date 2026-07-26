@@ -109,6 +109,16 @@ describe("ADR-0006 — HARM: tokenless loopback caller is refused operator power
     expect(agentStatus("victim")).toBe(before); // refused = unchanged, not just a 401 shell
   });
 
+  it("(recovery) the 401 hint names WHERE an existing secret lives — fail-closed, not fail-closed-with-no-way-back", async () => {
+    const r = await rawRequest(port, "GET", "/api/keyring", null);
+    expect(r.status).toBe(401);
+    // A locked-out operator must have a documented path back: the field name +
+    // the config file it lives in. There is no CLI to read the secret, so the
+    // hint IS the recovery signpost (Victra ruling, PR B gate).
+    expect(r.json.hint).toContain("dashboard_secret");
+    expect(r.json.hint).toContain("config.json");
+  });
+
   it("(side effect) an unauthenticated kill-agent does NOT remove the row", async () => {
     registerAgent("victim", "worker", []);
     expect(agentExists("victim")).toBe(true);

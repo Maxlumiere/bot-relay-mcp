@@ -84,7 +84,7 @@ export const DEFAULT_CONFIG: RelayConfig = {
   ],
 };
 
-function getConfigPath(): string {
+export function getConfigPath(): string {
   // v2.4.0 Codex HIGH #2 patch — split-brain config in multi-instance
   // mode. Pre-patch: RELAY_DB_PATH resolved per-instance but config
   // stayed flat, so active instance 'work' with per-instance
