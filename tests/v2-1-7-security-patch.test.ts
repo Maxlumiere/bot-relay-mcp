@@ -451,6 +451,20 @@ describe("v2.1.7 Item 2 — SameSite cookie + CSRF double-submit", () => {
       extraHeaders: { Authorization: "Bearer csrf-deny-test" },
     });
     expect(bearerOnly.status).not.toBe(403);
+    // HARM (channel-mismatch regression): a NON-Bearer Authorization header
+    // (`Basic …`) is NOT an explicit auth channel — dashboardAuthCheck ignores it
+    // and falls through to the ambient cookie. So it must NOT exempt CSRF: with the
+    // cookie present and no CSRF header → still 403. (An earlier exemption keyed on
+    // "any Authorization header" and let this skip CSRF while authenticating from
+    // the cookie — the shared channel resolver closes that gap.)
+    const nonBearerPlusCookie = await rawRequest({
+      method: "POST",
+      path: "/api/fake",
+      body: "{}",
+      extraHeaders: { Authorization: "Basic Zm9vOmJhcg==", Cookie: authCookie },
+    });
+    expect(nonBearerPlusCookie.status).toBe(403);
+    expect(nonBearerPlusCookie.body).toMatch(/CSRF/i);
   });
 
   it("(2e) POST /api/* with matching CSRF cookie + header passes through middleware (to route 404)", async () => {

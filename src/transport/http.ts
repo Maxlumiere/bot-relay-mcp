@@ -360,6 +360,45 @@ export function assertBindSafety(host: string, httpSecret: string | null): void 
   );
 }
 
+/**
+ * ADR-0006 / ADR-0015 L4 — the SINGLE source of "which credential channel will
+ * this request authenticate through". `dashboardAuthCheck` consumes `.value` to
+ * verify the secret; `csrfCheck` consumes `.channel` to decide whether the
+ * request rides an AMBIENT credential (the cookie). ONE function makes the
+ * csrf-exemption ⇔ auth-channel equivalence STRUCTURAL rather than a comment kept
+ * true by hand — which it wasn't: an earlier pair of inline copies drifted (the
+ * exemption matched any `Authorization` header while the consumer accepted only
+ * `Bearer `, so `Authorization: Basic` skipped CSRF yet authenticated from the
+ * cookie). Precedence: Bearer header → ?auth query → relay_dashboard_auth cookie.
+ */
+type CredentialChannel = "bearer" | "query" | "cookie" | "none";
+function resolvePresentedCredential(req: Request): { value: string | null; channel: CredentialChannel } {
+  const headerAuth = req.headers.authorization;
+  if (typeof headerAuth === "string" && headerAuth.toLowerCase().startsWith("bearer ")) {
+    return { value: headerAuth.slice(7).trim(), channel: "bearer" };
+  }
+  const q = req.query.auth;
+  if (typeof q === "string" && q.length > 0) {
+    return { value: q, channel: "query" };
+  }
+  const cookieHeader = req.headers.cookie;
+  if (typeof cookieHeader === "string") {
+    const match = cookieHeader.match(/(?:^|;\s*)relay_dashboard_auth=([^;]+)/);
+    if (match) return { value: decodeURIComponent(match[1]), channel: "cookie" };
+  }
+  return { value: null, channel: "none" };
+}
+/**
+ * A channel is EXPLICIT (not ambient) when the client had to know the secret to
+ * set it — Bearer or ?auth. Those are never a CSRF vector: a wrong explicit
+ * credential 401s in dashboardAuthCheck rather than falling through to the
+ * cookie. Only the cookie is ambient (browser-auto-attached), which is exactly
+ * and only what CSRF defends. `none` has nothing to protect and 401s downstream.
+ */
+function isExplicitCredentialChannel(channel: CredentialChannel): boolean {
+  return channel === "bearer" || channel === "query";
+}
+
 export function startHttpServer(port: number, host: string): Server {
   // v2.1 Phase 4n: bind-safety check BEFORE any express setup so we fail
   // fast and never accidentally bind to a risky host.
@@ -611,23 +650,10 @@ export function startHttpServer(port: number, host: string): Server {
       });
       return;
     }
-    // A secret IS configured — require it.
-    const headerAuth = req.headers.authorization;
-    let presented: string | null = null;
-    if (headerAuth && headerAuth.toLowerCase().startsWith("bearer ")) {
-      presented = headerAuth.slice(7).trim();
-    }
-    if (!presented) {
-      const q = req.query.auth;
-      if (typeof q === "string" && q.length > 0) presented = q;
-    }
-    if (!presented) {
-      const cookieHeader = req.headers.cookie;
-      if (typeof cookieHeader === "string") {
-        const match = cookieHeader.match(/(?:^|;\s*)relay_dashboard_auth=([^;]+)/);
-        if (match) presented = decodeURIComponent(match[1]);
-      }
-    }
+    // A secret IS configured — require it. Resolve the presented credential via
+    // the SHARED channel resolver — the same function csrfCheck consumes, so
+    // "which channel authenticates" has ONE definition (ADR-0015 L4).
+    const { value: presented } = resolvePresentedCredential(req);
     if (!presented || !timingSafeStringEq(presented, dashboardSecret)) {
       res.status(401).json({
         error: "Dashboard secret required",
@@ -707,23 +733,18 @@ export function startHttpServer(port: number, host: string): Server {
     // the two never disagree about whether a session can exist (ADR-0015 L4).
     const dashboardSecret = resolveDashboardSecret(config);
     if (!dashboardSecret) return next();
-    // ADR-0006 — CSRF defends the AMBIENT-credential path ONLY. dashboardAuthCheck
-    // resolves the credential Bearer → ?auth → cookie (http.ts ~609), each behind
-    // `if (!presented)`, so a request presenting an EXPLICIT credential (an
-    // Authorization header or an ?auth query) authenticates via THAT channel and
-    // NEVER falls through to the cookie — a wrong explicit credential 401s, it does
-    // not ride the cookie. CSRF (a double-submit defence against a browser being
-    // tricked into riding its auto-attached cookie) is therefore meaningless for
-    // such requests: an attacker cannot send a dummy header to skip this check and
-    // then ride the ambient cookie, because the dummy header 401s FIRST. Exempt
-    // them so non-browser clients (the `relay send` CLI presents Bearer) are not
-    // forced into a browser handshake they have no cookie for. Cookie-only requests
-    // (the ONLY ambient case) keep full CSRF. This MIRRORS dashboardAuthCheck's
-    // channel precedence — keep the two in sync (ADR-0015 L4).
-    const hasExplicitCredential =
-      (typeof req.headers.authorization === "string" && req.headers.authorization.length > 0) ||
-      (typeof req.query.auth === "string" && (req.query.auth as string).length > 0);
-    if (hasExplicitCredential) return next();
+    // ADR-0006 — CSRF defends the AMBIENT-credential path ONLY (a browser tricked
+    // into riding its auto-attached cookie). Whether THIS request rides an ambient
+    // credential is answered by the SAME channel resolver dashboardAuthCheck uses
+    // to authenticate — so the exemption CANNOT drift from the auth channel
+    // (ADR-0015 L4). It used to: an earlier copy exempted any `Authorization`
+    // header while the consumer accepted only `Bearer `, so `Authorization: Basic`
+    // + cookie skipped CSRF yet authenticated from the cookie. Now both call one
+    // function: if the request authenticates through an EXPLICIT channel (Bearer /
+    // ?auth) it never rides the cookie (a wrong explicit credential 401s, no
+    // fallthrough), so CSRF is moot — exempt it (this is what lets the `relay send`
+    // CLI work without a browser handshake). Cookie / none → enforce.
+    if (isExplicitCredentialChannel(resolvePresentedCredential(req).channel)) return next();
     const cookieHeader = req.headers.cookie;
     let cookieToken: string | null = null;
     if (typeof cookieHeader === "string") {
