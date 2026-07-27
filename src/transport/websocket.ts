@@ -11,7 +11,7 @@
  * upgrade path alone.
  *
  * Auth: same semantics as dashboardAuthCheck.
- *   - `RELAY_DASHBOARD_SECRET` (or `RELAY_HTTP_SECRET` as fallback) required
+ *   - `RELAY_DASHBOARD_SECRET` (or the `dashboard_secret` config) required
  *     for remote clients.
  *   - Loopback peer (127.0.0.1 / ::1) permitted with no secret — matches the
  *     dev-friendly default on the HTTP surface.
@@ -37,7 +37,7 @@
 import { WebSocketServer, type WebSocket } from "ws";
 import { timingSafeEqual } from "crypto";
 import type { IncomingMessage, Server as HttpServer } from "http";
-import { loadConfig } from "../config.js";
+import { loadConfig, resolveDashboardSecret } from "../config.js";
 import { log } from "../logger.js";
 import {
   checkHostHeader,
@@ -148,7 +148,10 @@ function extractSecretCandidate(req: IncomingMessage): string | null {
  * Exported for testability.
  */
 export function dashboardWsAuthOk(req: IncomingMessage): { ok: boolean; reason?: string } {
-  const dashboardSecret = process.env.RELAY_DASHBOARD_SECRET || loadConfig().http_secret || null;
+  // ADR-0006: SAME resolver as the HTTP dashboard gate — `RELAY_DASHBOARD_SECRET`
+  // || `dashboard_secret`, no http_secret fallback (a removed escalation path).
+  // One predicate across the HTTP and WS surfaces (ADR-0015 L4).
+  const dashboardSecret = resolveDashboardSecret(loadConfig());
   if (!dashboardSecret) {
     // No secret configured — fall back to the loopback-only rule that
     // dashboardAuthCheck applies. Socket-level peer IP is authoritative;
@@ -157,7 +160,7 @@ export function dashboardWsAuthOk(req: IncomingMessage): { ok: boolean; reason?:
     if (LOOPBACK_PEERS.has(peer)) return { ok: true };
     return {
       ok: false,
-      reason: "dashboard requires a secret for non-loopback clients — set RELAY_DASHBOARD_SECRET or RELAY_HTTP_SECRET",
+      reason: "dashboard requires a secret for non-loopback clients — set RELAY_DASHBOARD_SECRET (or run `relay init` to generate a dashboard_secret)",
     };
   }
   const presented = extractSecretCandidate(req);
