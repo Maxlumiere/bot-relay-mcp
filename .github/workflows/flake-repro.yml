@@ -1,0 +1,140 @@
+name: flake-repro (v2-6-2-recovery-flow)
+
+# DISPOSABLE — investigation-only. Runs the flaky recovery-flow test on the
+# EXACT failing CI cell (ubuntu-latest + node20) to reproduce the ECONNRESET
+# or bound its frequency. Fires on push to this throwaway branch (workflow_dispatch
+# is declared too, but it only becomes usable once a copy of this file is on the
+# default branch — the push trigger is what actually runs it here). Delete the
+# `ci/flake-repro` branch when the investigation closes and this file is gone with it.
+#
+# Why two jobs:
+#   isolated   — the one test 50×, in isolation. Victra's exact ask: a frequency
+#                bound / direct repro for the test on its own.
+#   contended  — the FULL `npx vitest run` 10×. The real CI failure came through
+#                the full suite, where ~59 test files share the runner's CPU. If
+#                the ECONNRESET is event-loop starvation under contention, the
+#                isolated job would come back clean (a false negative). This job
+#                reintroduces the contention the real failure had.
+#
+# Neither job fails the run on a test failure — we want COUNTS, read from the log,
+# not a red/green verdict. Logs are uploaded as artifacts so a repro captures the
+# mechanism.
+
+on:
+  push:
+    branches: [ci/flake-repro]
+  workflow_dispatch:
+
+jobs:
+  isolated:
+    name: isolated — one test 50× (ubuntu-latest + node20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Repro loop — 50× isolated
+        run: |
+          set +e
+          mkdir -p /tmp/flake-logs
+          pass=0; fail=0; econnreset=0
+          for i in $(seq 1 50); do
+            npx vitest run tests/v2-6-2-recovery-flow.test.ts > "/tmp/flake-logs/isolated-run-$i.log" 2>&1
+            rc=$?
+            if [ $rc -eq 0 ]; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1))
+              echo "=========== isolated run $i FAILED (rc=$rc) ==========="
+              grep -iE 'ECONNRESET|did not become healthy|AssertionError|FAIL|failed' "/tmp/flake-logs/isolated-run-$i.log" | head -30
+              if grep -qi 'ECONNRESET' "/tmp/flake-logs/isolated-run-$i.log"; then econnreset=$((econnreset+1)); fi
+              echo "----- last 40 lines of run $i -----"
+              tail -40 "/tmp/flake-logs/isolated-run-$i.log"
+            fi
+          done
+          echo ""
+          echo "RESULT (isolated): $pass pass / $fail fail of 50 — ECONNRESET in $econnreset runs (ubuntu-latest + node20)"
+
+      - name: Upload isolated logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-logs
+          path: /tmp/flake-logs/
+          if-no-files-found: ignore
+
+  contended:
+    name: contended — full suite 10× (ubuntu-latest + node20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # The full suite includes the drift-out guards, which read the shipped
+      # extensions/vscode/out/extension.js — build it or the full run errors
+      # out before it ever reaches the recovery-flow test (mirrors ci.yml).
+      - name: Build VSCode extension bundle
+        run: |
+          cd extensions/vscode
+          npm install
+          npm run typecheck
+          npm run bundle
+
+      - name: Repro loop — 10× full suite, attribute recovery-flow failures
+        run: |
+          set +e
+          mkdir -p /tmp/flake-logs
+          recovery_fail=0; econnreset=0
+          for i in $(seq 1 10); do
+            npx vitest run > "/tmp/flake-logs/contended-run-$i.log" 2>&1
+            rc=$?
+            rec="-"; rst="-"
+            if grep -qi 'v2-6-2-recovery-flow' "/tmp/flake-logs/contended-run-$i.log" \
+               && grep -iE 'FAIL|×|failed' "/tmp/flake-logs/contended-run-$i.log" | grep -qi 'recovery'; then
+              rec="RECOVERY-FAIL"; recovery_fail=$((recovery_fail+1))
+            fi
+            if grep -qi 'ECONNRESET' "/tmp/flake-logs/contended-run-$i.log"; then
+              rst="ECONNRESET"; econnreset=$((econnreset+1))
+            fi
+            echo "full-suite run $i: suite_rc=$rc $rec $rst"
+            if [ "$rec" != "-" ] || [ "$rst" != "-" ]; then
+              echo "----- recovery/ECONNRESET context, run $i -----"
+              grep -iE -A3 -B1 'ECONNRESET|v2-6-2-recovery-flow|did not become healthy' "/tmp/flake-logs/contended-run-$i.log" | head -60
+            fi
+          done
+          echo ""
+          echo "RESULT (contended): recovery-flow failed in $recovery_fail / 10 full-suite runs — ECONNRESET seen in $econnreset runs (ubuntu-latest + node20)"
+
+      - name: Upload contended logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contended-logs
+          path: /tmp/flake-logs/
+          if-no-files-found: ignore
