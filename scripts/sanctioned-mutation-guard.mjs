@@ -5,84 +5,95 @@
 // See LICENSE for full terms.
 
 /**
- * Sanctioned-mutation guard (ADR-0015). Rebuilt from a case-sensitive grep that
- * covered almost nothing (missed INSERT/REPLACE entirely, `main.agents`, table
- * aliases, and inline comments) into a guard that enforces the HARM predicate.
+ * Sanctioned-mutation guard (ADR-0015). A grep → text-parser → statement-parser
+ * chain: the grep missed INSERT/REPLACE/aliases/case; the first parser classified
+ * only TOKEN 0, which codex broke by executing `SELECT 1; DELETE FROM agents`, a
+ * leading `;`, a WITH-CTE, and identity-destroying DDL. This version enumerates
+ * and classifies EVERY statement, covers DDL + trigger bodies, and fails closed.
  *
  * ── L1 — HARM + PREDICATE DECLARED ───────────────────────────────────────────
- * HARM: an agent's identity is CREATED, REPLACED, or DELETED outside the single
- *   sanctioned mutation site (src/db.ts). The db.ts helpers are the only place
- *   the load-bearing invariants live — probe-cache eviction, auth-generation
- *   bump, the agent_capabilities cascade, the session/anchor CAS. A raw
- *   `agents` / `agent_capabilities` write anywhere else silently bypasses ALL of
- *   them; the bug is not "a string appears", it is "the table is mutated off the
- *   sanctioned path."
- * PREDICATE: no SQL statement that mutates the `agents` or `agent_capabilities`
- *   table — INSERT (incl. INSERT OR …/UPSERT), REPLACE, UPDATE, or DELETE —
- *   appears in a src/ TypeScript file other than src/db.ts, unless the line
- *   carries an explicit `// ALLOWLIST: <reason>` acknowledgement.
- * WHY predicate ⟹ harm-prevented: agent-identity mutation is *definitionally*
- *   one of those four verbs against one of those two tables. Confining all four
- *   verbs on both tables to db.ts means every identity change goes through a
- *   helper that maintains the invariants. The predicate is the harm, not a proxy
- *   for it — it classifies the actual statement, so widening the SQL surface
- *   (aliases, case, comments, schema qualifiers, split strings) cannot slip past.
+ * HARM: an agent's identity is CREATED, REPLACED, DELETED, DROPPED, or RENAMED
+ *   outside the single sanctioned site (src/db.ts), where the load-bearing
+ *   invariants live — probe-cache eviction, auth-generation bump, the
+ *   agent_capabilities cascade, the session/anchor CAS. A raw `agents` /
+ *   `agent_capabilities` mutation anywhere else bypasses all of them.
+ * PREDICATE: in a src/ TypeScript file other than THE project's one src/db.ts, no
+ *   string literal contains SQL that, in ANY of its (possibly many, `db.exec`
+ *   accepts multiple) statements, mutates a guarded table — by INSERT
+ *   (incl. OR-clause/UPSERT) / REPLACE / UPDATE / DELETE, by `DROP TABLE` or
+ *   `ALTER TABLE` of it, or by a `CREATE TRIGGER … BEGIN <mutation> END` whose
+ *   body does — unless the line carries `// ALLOWLIST: <reason>`.
+ * WHY predicate ⟹ harm-prevented, stated HONESTLY (the prior "definitionally only
+ *   four DML verbs" claim was FALSE — codex executed DROP/ALTER/trigger, and
+ *   src/db.ts itself uses `ALTER TABLE agents`): the guard tokenizes each string
+ *   with a string/comment-aware lexer, splits it into statements, and classifies
+ *   each. It is a BEST-EFFORT SQL statement classifier over static literals — NOT
+ *   a full SQLite grammar, and NOT "the harm itself". What it does not cover is in
+ *   the OUT list below; the durable, non-re-expressible anchor is what SQLite
+ *   resolves at execution (a runtime prepare()+exec() probe), tracked separately.
  *
  * ── L2 — FRESHNESS ───────────────────────────────────────────────────────────
- * N/A by construction: this is a STATIC scan of committed source at build time,
- * not a runtime observe→decide→act. There is no TOCTOU window to CAS against —
- * the artifact it judges (the source tree) does not change between the read and
- * the verdict within a run.
+ * N/A: a STATIC scan of committed source; no observe→decide→act, no TOCTOU.
  *
- * ── L3 — BYPASS INVENTORY (every way to weaken the check, closed) ─────────────
- *   • CASE — SQLite keywords + identifiers are case-insensitive; the old grep
- *     was `-E` case-sensitive. CLOSED: verbs compared upper-cased, table names
- *     compared case-insensitively.
- *   • VERB COVERAGE — the old grep matched only UPDATE/DELETE. CLOSED: INSERT
- *     (incl. `INSERT OR REPLACE|IGNORE|ABORT|FAIL|ROLLBACK`), REPLACE (the verb
- *     form), UPDATE, DELETE all classified.
- *   • TABLE ALIAS — `UPDATE agents AS a SET …` / `UPDATE agents a SET …`. CLOSED:
- *     the parser consumes an optional `AS <alias>` / bare alias before SET.
- *   • SCHEMA-QUALIFIED — `UPDATE main.agents …`, `DELETE FROM temp.agents …`.
- *     CLOSED: `schema.table` resolves to the table component.
- *   • QUOTED IDENTIFIER — `"agents"`, `` `agents` ``, `[agents]`. CLOSED: quoted
- *     identifiers tokenize to the same bare name.
- *   • INLINE COMMENTS — a block comment or a `--` line comment sitting between
- *     the verb and the table (e.g. `UPDATE <block-comment> agents …`). CLOSED:
- *     block and line comments are stripped during tokenization (string-aware, so
- *     a `--` inside a '…' literal is preserved).
- *   • STRING-SPLIT SQL — `"UPDATE agents " + "SET …"`. CLOSED: `+`-concatenation
- *     of literals is reconstructed before classification; template quasis too.
- *   • HIDING IN A VARIABLE — the guard scans every string/template LITERAL in the
- *     file (not only `.prepare(...)` args), so `const q = "DELETE FROM agents…"`
- *     is caught even before it reaches prepare/exec. (SQL in a line or block code
- *     comment is NOT a string literal and is correctly ignored — a commented-out
- *     statement does not execute, so it is not the harm.)
- *   • AMBIENT DISABLE — none. No env var, CI flag, or network position weakens
- *     this guard; it is a static scan. The ONLY escape is the per-line
- *     `// ALLOWLIST: <reason>` — a visible, reviewable, reason-bearing
- *     acknowledgement in the diff, never ambient state.
- *   • FAIL-OPEN ON UNPARSEABLE INPUT — the `audit-state-freshness.sh` disease
- *     (exit 0 when it cannot read its own input). CLOSED: a file that fails to
- *     parse exits 2 (error), never 0; the guard refuses rather than waves through.
+ * ── L3 — BYPASS INVENTORY (each closed; codex-executed items marked ⚑) ────────
+ *   • CASE / VERB COVERAGE — case-insensitive verbs+tables; INSERT (incl.
+ *     OR-clause), REPLACE, UPDATE, DELETE all classified (the grep did only U/D).
+ *   • TABLE ALIAS — `UPDATE agents AS a` / bare alias. CLOSED.
+ *   • SCHEMA-QUALIFIED — `UPDATE main.agents …` → resolves the table component.
+ *   • QUOTED IDENTIFIER — `"agents"` / `` `agents` `` / `[agents]` → bare name.
+ *   • INLINE COMMENTS — a block/line comment between the verb and the table is
+ *     stripped during tokenization (string-aware: a `--` inside '…' is preserved).
+ *   • STRING-SPLIT / VARIABLE — `+`-concat + template quasis reconstructed; every
+ *     string literal is scanned, not only `.prepare()` args.
+ *   • ⚑ MULTI-STATEMENT — `db.exec` runs many statements; token-0 classification
+ *     hid every statement after the first. CLOSED: enumerate ALL statements by
+ *     splitting the LEXED token stream on top-level `;` (paren- and BEGIN/END-
+ *     aware; a `;` inside a string/comment is a token, never a separator — the
+ *     split is sound BECAUSE the lexer already resolved that context).
+ *   • ⚑ LEADING SEPARATOR — `; DELETE …` (empty first statement). CLOSED by the
+ *     same enumeration.
+ *   • ⚑ CTE — `WITH x AS (…) DELETE FROM agents` hides the verb behind WITH.
+ *     CLOSED: resolve the real DML verb at paren-depth 0 after the CTE list.
+ *   • ⚑ IDENTITY DDL + TRIGGERS — `DROP TABLE agents`, `ALTER TABLE agents RENAME
+ *     …`, and `CREATE TRIGGER … BEGIN DELETE FROM agents … END` were all
+ *     executed. CLOSED: DROP TABLE / ALTER TABLE classified; a trigger's BEGIN…END
+ *     body is enumerated and each body statement classified.
+ *   • ⚑ NESTED src/db.ts SELF-EXEMPTION — `endsWith("/src/db.ts")` exempted a
+ *     nested src/<sub>/src/db.ts (TypeScript compiles it), a bypass anyone could
+ *     build. CLOSED: EXACT project-root-relative match to the one src/db.ts.
+ *   • ⚑ FAIL-OPEN ON PARSE — the old code CLAIMED it exited 2 on a parse failure
+ *     but never checked `parseDiagnostics`, so malformed TS ran on an
+ *     error-recovery tree (fail-closed on READ, fail-OPEN on PARSE — the exact
+ *     audit-state-freshness.sh split). CLOSED: parseDiagnostics non-empty → exit 2.
+ *   • AMBIENT DISABLE — none; the only escape is the per-line `// ALLOWLIST:
+ *     <reason>` (visible, reviewable). Its OWNER/ticket/registry authority + an
+ *     emitted-exemption report are a tracked follow-up (allowlist governance).
  *
- *   OUT (documented, not a hidden gap): SQL assembled by runtime operations that
- *   produce no classifiable literal — `[...].join(' ')`, char-by-char building,
- *   or a fully computed identifier. That is beyond "an adversary who knows the
- *   grep" (valid-SQL evasion) and into arbitrary obfuscation; this guard defends
- *   accidental drift + the known evasion forms. A new dynamic-SQL mutator must
- *   route through db.ts or carry an ALLOWLIST.
+ *   OUT — HONEST BOUNDARIES (things not yet shown reachable, or deliberately
+ *   deferred), never captions over demonstrated harm:
+ *   • FALSE POSITIVE on PROSE (known, deferred): the guard classifies string
+ *     LITERALS, so a diagnostic constant that happens to lex as a mutation
+ *     statement (e.g. "DELETE FROM agents is forbidden; call teardownAgent") is
+ *     OVER-flagged, though SQLite rejects that text as a syntax error. Over-flag
+ *     is the SAFE direction; the principled cure is the SQL-SINK constraint (only
+ *     classify literals that reach `prepare`/`exec`/`run`), a tracked follow-up.
+ *   • RUNTIME-ASSEMBLED SQL — `[...].join(' ')`, char-building, a fully computed
+ *     identifier: no classifiable literal. Route through db.ts or ALLOWLIST.
+ *   • NOVEL GRAMMAR — a statement form the classifier does not enumerate. This is
+ *     the residual the durable RUNTIME anchor (SQLite's own parse at prepare/exec)
+ *     exists to close; the static guard is the broad net over all source
+ *     (cold paths included), the runtime probe is authoritative over executed
+ *     paths — neither alone is complete, they compose.
  *
  * ── L4 — SIGNAL CONTRACT ─────────────────────────────────────────────────────
- * One predicate, one source: the same `mutatesAgentsTable()` classifier decides
- * BOTH the violation and the message — no split-brain between what is detected
- * and what is reported. The classifier is exported and driven by the harm/
- * innocent-twin test, so the gate and the test consume the identical predicate.
+ * One predicate, one source: `mutatesAgentsTable()` decides both the violation
+ * and the message, exported + driven by the harm/innocent-twin test, so gate and
+ * test consume the identical predicate.
  *
- * TEST (green-by-construction): tests/v2-24-0-sanctioned-mutation-guard.test.ts
- * attempts the ACTUAL harm through each evasion form (assert flagged) and the
- * innocent twin — a real mutation inside db.ts, a SELECT, a different table
- * (assert NOT flagged) — and includes a case that the LEGACY grep let through.
+ * TEST: tests/v2-24-0-sanctioned-mutation-guard.test.ts attempts the ACTUAL harm
+ * through each executed bypass (assert flagged, each red against the token-0
+ * version) + innocent twins (assert NOT flagged) + the tokenizer's string/comment
+ * lexing directly (the statement split's soundness rests on it).
  *
  * Exit: 0 = clean · 1 = violations (stderr) · 2 = usage/parse error
  * Usage: node scripts/sanctioned-mutation-guard.mjs <src-dir-or-file> [...]
@@ -94,12 +105,16 @@ import { fileURLToPath } from "url";
 
 // The two tables whose mutation IS an agent-identity change.
 const GUARDED_TABLES = new Set(["agents", "agent_capabilities"]);
-// The single sanctioned mutation site — EXACTLY src/db.ts (not any */db.ts, so a
-// future src/<sub>/db.ts cannot auto-exempt itself). Normalize separators so the
-// check holds on Windows paths too; the bare "db.ts" form is the test's fixture.
-const SANCTIONED = (fileName) => {
-  const norm = fileName.replace(/\\/g, "/");
-  return norm === "db.ts" || norm === "src/db.ts" || norm.endsWith("/src/db.ts");
+// The single sanctioned mutation site — EXACTLY the project's one src/db.ts.
+// codex P1: the prior `endsWith("/src/db.ts")` let a NESTED src/<sub>/src/db.ts
+// exempt itself (TypeScript compiles nested src trees), so anyone could bypass
+// the guard by adding a file at that path. Match is now EXACT: with a srcRoot
+// (the scanned dir, passed by the CLI) the file's path RELATIVE to it must be
+// exactly "db.ts"; without one, the bare relative form must be "db.ts" /
+// "src/db.ts" (the test fixtures). No suffix match anywhere.
+const SANCTIONED = (fileName, srcRoot) => {
+  const rel = (srcRoot ? path.relative(srcRoot, fileName) : fileName).replace(/\\/g, "/");
+  return rel === "db.ts" || rel === "src/db.ts";
 };
 // Mutating verbs. REPLACE is a verb in SQLite; INSERT may carry an OR-clause.
 const OR_ACTIONS = new Set(["REPLACE", "IGNORE", "ABORT", "FAIL", "ROLLBACK"]);
@@ -159,32 +174,122 @@ function resolveTable(tk, i) {
   return { table: first, next: i + 1 };
 }
 
-/** Does this statement INSERT / REPLACE / UPDATE / DELETE a guarded table? */
+const DML_VERBS = new Set(["DELETE", "INSERT", "REPLACE", "UPDATE"]);
+
+/**
+ * Split a token stream into TOP-LEVEL statements on `;` — where "top level" is
+ * paren depth 0 AND outside a BEGIN…END / CASE…END block, so a `;` inside a
+ * trigger body (or a CASE) does not terminate the outer statement. `db.exec`
+ * accepts MANY statements in one string; each must be classified, not just the
+ * first (codex P1: token-0-only classification let `SELECT 1; DELETE FROM
+ * agents`, a leading `;`, and a CTE all hide the mutation). The `;` split is
+ * sound because the tokenizer already resolved string/comment context — a `;`
+ * inside a '…' / "…" / `…` / […] literal is part of that token, never a punct.
+ */
+function splitStatements(tk) {
+  const out = [];
+  let cur = [];
+  let depth = 0;
+  for (const t of tk) {
+    if (t.t === "punct" && t.v === "(") depth++;
+    else if (t.t === "punct" && t.v === ")") { if (depth > 0) depth--; }
+    else if (t.t === "id") {
+      const kw = t.v.toUpperCase();
+      if (kw === "BEGIN" || kw === "CASE") depth++;
+      else if (kw === "END") { if (depth > 0) depth--; }
+    }
+    if (t.t === "punct" && t.v === ";" && depth === 0) { out.push(cur); cur = []; continue; }
+    cur.push(t);
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
+/** First DML verb at paren-depth 0 from `from` — used to skip a WITH … CTE list,
+ *  whose subquery bodies live inside `AS ( … )` at depth ≥ 1. */
+function firstTopLevelDml(tk, from) {
+  let depth = 0;
+  for (let i = from; i < tk.length; i++) {
+    const t = tk[i];
+    if (t.t === "punct" && t.v === "(") depth++;
+    else if (t.t === "punct" && t.v === ")") { if (depth > 0) depth--; }
+    else if (depth === 0 && t.t === "id" && DML_VERBS.has(t.v.toUpperCase())) return i;
+  }
+  return -1;
+}
+
+/**
+ * Does ONE statement CREATE / REPLACE / DELETE / DROP / RENAME the guarded table,
+ * or install a trigger whose body mutates it? Covers, beyond DML: `DROP TABLE
+ * agents`, `ALTER TABLE agents …` (incl. RENAME), and `CREATE TRIGGER … BEGIN
+ * <mutation> END` — all EXECUTED by codex, and `src/db.ts` itself uses `ALTER
+ * TABLE agents`, so identity destruction is NOT "definitionally only DML".
+ */
+function classifyStatement(tk) {
+  let i = 0;
+  while (i < tk.length && tk[i].t === "punct") i++; // leading empties / stray `;`
+  if (i >= tk.length) return false;
+  let verb = kwAt(tk, i);
+
+  // WITH [RECURSIVE] <cte>… <verb …> — resolve to the real DML verb after the CTE.
+  if (verb === "WITH") {
+    const vi = firstTopLevelDml(tk, i + 1);
+    if (vi < 0) return false; // WITH … SELECT is a read
+    i = vi;
+    verb = kwAt(tk, i);
+  }
+
+  if (verb === "DELETE") return kwAt(tk, i + 1) === "FROM" && isGuarded(resolveTable(tk, i + 2).table);
+  if (verb === "INSERT") {
+    let j = i + 1;
+    if (kwAt(tk, j) === "OR" && OR_ACTIONS.has(kwAt(tk, j + 1))) j += 2;
+    return kwAt(tk, j) === "INTO" && isGuarded(resolveTable(tk, j + 1).table);
+  }
+  if (verb === "REPLACE") return kwAt(tk, i + 1) === "INTO" && isGuarded(resolveTable(tk, i + 2).table);
+  if (verb === "UPDATE") {
+    let j = i + 1;
+    if (kwAt(tk, j) === "OR" && OR_ACTIONS.has(kwAt(tk, j + 1))) j += 2;
+    return isGuarded(resolveTable(tk, j).table); // any UPDATE of the table
+  }
+  if (verb === "DROP") {
+    if (kwAt(tk, i + 1) !== "TABLE") return false; // DROP TRIGGER/INDEX/VIEW are not table mutations
+    let j = i + 2;
+    if (kwAt(tk, j) === "IF" && kwAt(tk, j + 1) === "EXISTS") j += 2;
+    return isGuarded(resolveTable(tk, j).table);
+  }
+  if (verb === "ALTER") {
+    return kwAt(tk, i + 1) === "TABLE" && isGuarded(resolveTable(tk, i + 2).table);
+  }
+  if (verb === "CREATE") {
+    // CREATE [TEMP|TEMPORARY] TRIGGER … BEGIN <body> END — flag if the body
+    // mutates a guarded table. (CREATE TABLE/VIEW/INDEX before any TRIGGER kw → not us.)
+    let isTrigger = false;
+    for (let k = i + 1; k < tk.length; k++) {
+      const kw = kwAt(tk, k);
+      if (kw === "TRIGGER") { isTrigger = true; break; }
+      if (kw === "TABLE" || kw === "VIEW" || kw === "INDEX" || kw === "BEGIN") break;
+    }
+    if (!isTrigger) return false;
+    const bi = tk.findIndex((t, idx) => idx > i && t.t === "id" && t.v.toUpperCase() === "BEGIN");
+    if (bi < 0) return false;
+    let depth = 0, ei = -1;
+    for (let k = bi; k < tk.length; k++) {
+      const kw = tk[k].t === "id" ? tk[k].v.toUpperCase() : null;
+      if (kw === "BEGIN" || kw === "CASE") depth++;
+      else if (kw === "END") { depth--; if (depth === 0) { ei = k; break; } }
+    }
+    const body = tk.slice(bi + 1, ei < 0 ? tk.length : ei);
+    return splitStatements(body).some(classifyStatement);
+  }
+  return false;
+}
+
+/** Does this SQL string CREATE / REPLACE / DELETE / DROP / RENAME / trigger-mutate
+ *  a guarded table in ANY of its (possibly many) statements? */
 export function mutatesAgentsTable(sql) {
   const tk = tokenizeSql(sql);
   if (tk.length === 0) return false;
-  const verb = kwAt(tk, 0);
-  if (verb === "DELETE") {
-    if (kwAt(tk, 1) !== "FROM") return false;
-    return isGuarded(resolveTable(tk, 2).table);
-  }
-  if (verb === "INSERT") {
-    let i = 1;
-    if (kwAt(tk, i) === "OR" && OR_ACTIONS.has(kwAt(tk, i + 1))) i += 2;
-    if (kwAt(tk, i) !== "INTO") return false;
-    return isGuarded(resolveTable(tk, i + 1).table);
-  }
-  if (verb === "REPLACE") {
-    if (kwAt(tk, 1) !== "INTO") return false;
-    return isGuarded(resolveTable(tk, 2).table);
-  }
-  if (verb === "UPDATE") {
-    let i = 1;
-    if (kwAt(tk, i) === "OR" && OR_ACTIONS.has(kwAt(tk, i + 1))) i += 2;
-    const { table } = resolveTable(tk, i);
-    return isGuarded(table); // any UPDATE of the table (alias/SET checked implicitly by SQLite)
-  }
-  return false;
+  return splitStatements(tk).some(classifyStatement);
 }
 
 // ── AST extraction of static SQL string expressions ──────────────────────────
@@ -223,9 +328,19 @@ const isConcatParent = (node) =>
  * (src/db.ts) is exempt. A line carrying `// ALLOWLIST: <reason>` is exempt.
  * Exported for the harm / innocent-twin test.
  */
-export function findSanctionedMutationViolations(source, fileName = "file.ts") {
-  if (SANCTIONED(fileName)) return [];
+export function findSanctionedMutationViolations(source, fileName = "file.ts", opts = {}) {
+  if (SANCTIONED(fileName, opts.srcRoot)) return [];
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  // FAIL CLOSED on a parse failure. createSourceFile does NOT throw on malformed
+  // TS — it records syntax errors in `parseDiagnostics` and returns an
+  // error-recovery tree the guard cannot trust (a mutation may or may not survive
+  // recovery, input-dependent). The guard already exits 2 when it cannot READ a
+  // file; an unreadable-vs-unparseable split (fail-closed on read, fail-OPEN on
+  // parse) is the exact audit-state-freshness.sh defect. Throw so main() maps it
+  // to exit 2. Real source that compiles under tsc has zero parseDiagnostics.
+  if (sf.parseDiagnostics && sf.parseDiagnostics.length > 0) {
+    throw new Error(`unparseable TypeScript (${sf.parseDiagnostics.length} syntax error(s)) — cannot soundly scan`);
+  }
   const lines = source.split("\n");
   const violations = [];
   const seen = new Set();
@@ -262,15 +377,17 @@ export function findSanctionedMutationViolations(source, fileName = "file.ts") {
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
-function walkTs(target, acc) {
+function walkTs(target, acc, root) {
   const st = fs.statSync(target);
   if (st.isDirectory()) {
     for (const e of fs.readdirSync(target)) {
       if (e === "node_modules" || e === "dist" || e.startsWith(".")) continue;
-      walkTs(path.join(target, e), acc);
+      walkTs(path.join(target, e), acc, root);
     }
   } else if (target.endsWith(".ts") && !target.endsWith(".d.ts")) {
-    acc.push(target);
+    // Carry the scan root so SANCTIONED can match src/db.ts by EXACT relative
+    // path (a nested src/db.ts must NOT self-exempt — codex P1).
+    acc.push({ file: target, root });
   }
   return acc;
 }
@@ -286,14 +403,15 @@ function main() {
     for (const a of args) {
       const abs = path.resolve(a);
       if (!fs.existsSync(abs)) { process.stderr.write(`sanctioned-mutation-guard: no such path: ${abs}\n`); process.exit(2); }
-      walkTs(abs, files);
+      const root = fs.statSync(abs).isDirectory() ? abs : path.dirname(abs);
+      walkTs(abs, files, root);
     }
   } catch (err) {
     process.stderr.write(`sanctioned-mutation-guard: walk error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exit(2);
   }
   const all = [];
-  for (const f of files) {
+  for (const { file: f, root } of files) {
     let src;
     try {
       src = fs.readFileSync(f, "utf-8");
@@ -304,7 +422,7 @@ function main() {
     }
     let vios;
     try {
-      vios = findSanctionedMutationViolations(src, f);
+      vios = findSanctionedMutationViolations(src, f, { srcRoot: root });
     } catch (err) {
       // FAIL CLOSED — a parse failure is an error, never a silent pass.
       process.stderr.write(`sanctioned-mutation-guard: parse error in ${f}: ${err instanceof Error ? err.message : String(err)}\n`);

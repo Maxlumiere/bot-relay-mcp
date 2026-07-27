@@ -56,7 +56,9 @@ describe("v2.24.0 — sanctioned-mutation guard (ADR-0015)", () => {
       return out;
     };
     const violations = walk(srcDir).flatMap((f) =>
-      (findSanctionedMutationViolations(fs.readFileSync(f, "utf-8"), f) as unknown[]).map((v) => ({ f, v })),
+      // Pass srcRoot the way the CLI does, so the ONE real src/db.ts is exempt by
+      // exact relative path (a nested src/db.ts would not be — codex P1 #2).
+      (findSanctionedMutationViolations(fs.readFileSync(f, "utf-8"), f, { srcRoot: srcDir }) as unknown[]).map((v) => ({ f, v })),
     );
     expect(violations).toEqual([]);
   });
@@ -168,5 +170,91 @@ describe("v2.24.0 — sanctioned-mutation guard (ADR-0015)", () => {
       expect(() => mutatesAgentsTable(junk)).not.toThrow();
       expect(mutatesAgentsTable(junk)).toBe(false);
     }
+  });
+});
+
+// A source that db.exec's `sql` — the multi-statement path (prepare() is single-
+// statement; exec() is where codex's bypasses actually executed).
+const inExec = (sql: string) => `export function raw(db: any){ db.exec(${JSON.stringify(sql)}); }`;
+const execFlagged = (sql: string) =>
+  (findSanctionedMutationViolations(inExec(sql), "src/transport/http.ts") as Array<{ line: number }>).length > 0;
+
+describe("#143 P1 hardening — codex's EXECUTED bypasses (each red against the token-0 version)", () => {
+  // ── P1: token-0-only classification → multi-statement / leading-sep / CTE ──
+  const MULTI: Array<[string, string]> = [
+    ["SELECT-then-DELETE (token 0 = SELECT)", "SELECT 1; DELETE FROM agents WHERE name='victim'"],
+    ["leading separator (token 0 empty)", "; DELETE FROM agents WHERE name='victim'"],
+    ["CTE hides the verb (token 0 = WITH)", "WITH doomed(x) AS (SELECT 1) DELETE FROM agents WHERE name='victim'"],
+    ["mutation is the SECOND statement", "INSERT INTO agents (id) VALUES (?); SELECT 2"],
+  ];
+  for (const [label, sql] of MULTI) {
+    it(`HARM flagged (db.exec): ${label}`, () => expect(execFlagged(sql), sql).toBe(true));
+  }
+
+  // ── P1 #2: identity-destroying DDL + trigger bodies (all executed) ──
+  const DDL: Array<[string, string]> = [
+    ["DROP TABLE agents", "DROP TABLE agents"],
+    ["DROP TABLE IF EXISTS agent_capabilities", "DROP TABLE IF EXISTS agent_capabilities"],
+    ["ALTER TABLE agents RENAME", "ALTER TABLE agents RENAME TO former_agents"],
+    ["ALTER schema-qualified", "ALTER TABLE main.agents ADD COLUMN x TEXT"],
+    ["CREATE TRIGGER w/ DELETE body", "CREATE TRIGGER trg AFTER INSERT ON t BEGIN DELETE FROM agents WHERE name='v'; END"],
+    ["CREATE TEMP TRIGGER w/ UPDATE body", "CREATE TEMP TRIGGER trg AFTER INSERT ON t BEGIN UPDATE agents SET x=1; END"],
+  ];
+  for (const [label, sql] of DDL) {
+    it(`HARM flagged: ${label}`, () => expect(execFlagged(sql), sql).toBe(true));
+  }
+
+  // ── P1 #2 (second P1): nested src/db.ts must NOT self-exempt ──
+  it("P1: a nested src/<sub>/src/db.ts does NOT exempt itself; only the real src/db.ts does", () => {
+    const del = inExec("DELETE FROM agents WHERE name='victim'");
+    // relative-form (no srcRoot): exact match only
+    expect((findSanctionedMutationViolations(del, "src/audit-nested/src/db.ts") as unknown[]).length, "nested self-exempt").toBeGreaterThan(0);
+    expect(findSanctionedMutationViolations(del, "src/db.ts"), "the one real db.ts stays exempt").toEqual([]);
+    expect(findSanctionedMutationViolations(del, "db.ts")).toEqual([]);
+    // srcRoot form (how the CLI calls it): relative to the scanned dir
+    expect((findSanctionedMutationViolations(del, "/p/src/audit-nested/src/db.ts", { srcRoot: "/p/src" }) as unknown[]).length).toBeGreaterThan(0);
+    expect(findSanctionedMutationViolations(del, "/p/src/db.ts", { srcRoot: "/p/src" })).toEqual([]);
+  });
+
+  // ── Fail-closed on parse failure (was fail-OPEN — audit-state-freshness split) ──
+  it("FAIL-CLOSED: malformed TypeScript makes the guard THROW (→ exit 2), never silently pass", () => {
+    const malformed = `export function broken(db {  db.exec("SELECT 1")  `; // unbalanced parens
+    expect(() => findSanctionedMutationViolations(malformed, "src/bad.ts")).toThrow(/unparseable/i);
+  });
+
+  // ── Tokenizer soundness — the statement split's whole correctness rests here ──
+  it("TOKENIZER: a `;` inside a string/quoted-identifier does NOT split a statement", () => {
+    expect(mutatesAgentsTable("SELECT '; DELETE FROM agents'"), "; inside '…' is string content").toBe(false);
+    expect(mutatesAgentsTable('SELECT "a;b" FROM x'), "; inside a quoted identifier").toBe(false);
+    // but a REAL top-level ; after a string still splits and catches the mutation
+    expect(mutatesAgentsTable("INSERT INTO t VALUES ('a;b'); DELETE FROM agents")).toBe(true);
+  });
+  it("TOKENIZER: SQLite `''` escaped quote inside a literal doesn't break classification", () => {
+    expect(mutatesAgentsTable("INSERT INTO agents (n) VALUES ('o''brien')")).toBe(true);
+    expect(mutatesAgentsTable("SELECT 'can''t; DELETE FROM agents'"), "escaped-quote-then-; still all one string").toBe(false);
+  });
+  it("TOKENIZER: an (even unterminated) comment is not a statement", () => {
+    expect(mutatesAgentsTable("/* commented out DELETE FROM agents"), "unterminated block comment").toBe(false);
+    expect(mutatesAgentsTable("SELECT 1 -- ; DELETE FROM agents"), "line comment swallows the rest").toBe(false);
+  });
+
+  // ── Innocent twins for the new coverage (assert NOT flagged) ──
+  it("INNOCENT: multi-statement reads, WITH…SELECT, and other-table DDL/triggers are not flagged", () => {
+    expect(execFlagged("SELECT 1; SELECT 2")).toBe(false);
+    expect(execFlagged("WITH x AS (SELECT 1) SELECT * FROM x")).toBe(false);
+    expect(execFlagged("DROP TABLE agents_new")).toBe(false);
+    expect(execFlagged("ALTER TABLE messages ADD COLUMN x TEXT")).toBe(false);
+    expect(execFlagged("DROP TRIGGER some_trigger")).toBe(false);
+    expect(execFlagged("CREATE TRIGGER t AFTER INSERT ON u BEGIN DELETE FROM messages; END")).toBe(false);
+  });
+
+  // ── KNOWN, DOCUMENTED over-flag (P2 / SQL-sink follow-up) — asserted so the ──
+  //    suite is honest about the boundary the header states, not silent about it.
+  it("KNOWN over-flag (deferred to the SQL-sink follow-up): a diagnostic PROSE constant IS flagged", () => {
+    const prose = `export const MSG = "DELETE FROM agents is forbidden; call teardownAgent instead";`;
+    // Over-flag is the SAFE direction; the SQL-sink constraint (only literals that
+    // reach prepare/exec/run) is the tracked cure. This test PINS the current
+    // behaviour so a future SQL-sink PR flips it deliberately, not by accident.
+    expect((findSanctionedMutationViolations(prose, "src/transport/http.ts") as unknown[]).length).toBeGreaterThan(0);
   });
 });
