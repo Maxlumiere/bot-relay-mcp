@@ -525,6 +525,31 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
 
   // v2.2.1 P1: apply the selected theme to <html> via data-theme (for
   // named themes) or inline --* custom properties (for pasted custom).
+  // Defence-in-depth (READ side). The server WRITE path (isSafeCssColorValue in
+  // src/css-color.ts, via the theme schema) is the PRIMARY control; this guard
+  // catches a value written BEFORE that validation existed, or via direct DB
+  // access, so it never reaches setProperty un-checked — a token feeds the CSS
+  // background: shorthand, which accepts url() and would beacon.
+  //
+  // DELIBERATE DIVERGENCE — do NOT unify this with the write-side validator
+  // (ADR-0015 L4: two predicates are fine when the divergence is named). They
+  // answer DIFFERENT questions. WRITE asks "is this a known-GOOD form?" -> strict,
+  // closed named-colour set. READ asks "could this stored value BEACON?" ->
+  // looser: a bare alpha word passes, because with no parens it cannot url()-
+  // beacon and an invalid CSS colour is simply ignored by the browser. The read
+  // side MUST stay this permissive so a legitimate LEGACY theme (a named/system
+  // colour stored before the write guard existed) still applies. Tightening read
+  // to the strict set breaks those; loosening write to this weakens the primary
+  // control. Keep them separate.
+  function isSafeThemeColor(v) {
+    if (typeof v !== 'string') return false;
+    var s = v.trim();
+    if (!s || s.length > 64) return false;
+    if (/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(s)) return true;
+    if (/^(?:rgb|rgba|hsl|hsla)\(\s*[0-9.,%/\s]+\)$/i.test(s)) return true;
+    if (/^[a-z]+$/i.test(s)) return true;
+    return false;
+  }
   function applyTheme(theme, customJson) {
     const root = document.documentElement;
     if (theme === 'custom' && customJson) {
@@ -535,7 +560,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
       try {
         const obj = typeof customJson === 'string' ? JSON.parse(customJson) : customJson;
         for (const t of TOKENS) {
-          if (obj && typeof obj[t] === 'string') root.style.setProperty('--' + t, obj[t]);
+          if (obj && typeof obj[t] === 'string' && isSafeThemeColor(obj[t])) root.style.setProperty('--' + t, obj[t]);
         }
       } catch (_e) { /* silently fall back to catppuccin */ }
     } else {
