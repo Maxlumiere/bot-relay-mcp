@@ -4,6 +4,15 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## [0.7.0] — 2026-07-24 — Claude wakes actually submit: no more prompts piling up waiting for a human Enter
+
+The Claude wake was typing `inbox` into the agent's terminal but **never actually submitting it**. Claude Code's input treats a newline that arrives inside the typed chunk as literal text — not as pressing Enter — so the wake sat in the box until you pressed Enter yourself, and each new message stacked another dead `inbox` on top (observed 14 deep). Codex was immune because its wake already sent a separate Enter after a short settle delay; Claude now does the same.
+
+- **Claude wake = type → settle → separate Enter.** Tether types `inbox` (no newline), waits 150 ms for the paste block to close, then sends a standalone CR to the same terminal. This is the exact sequence that fixed Codex on 2026-06-26, now applied to Claude.
+- **New tuning settings (Claude), mirroring the Codex ones:** `bot-relay.tether.claudeSubmitDelayMs` (default 150 — raise it if the wake word stays typed-but-unsent), `bot-relay.tether.claudeSubmitMethod` (`sendText` default, no focus-steal; switch to `sendSequence` if a sendText'd Enter is absorbed on your setup), and `bot-relay.tether.claudeEnterKey` (`cr`/`lf`).
+- **Registry updated in lockstep.** The relay's agent-CLI profile registry (`src/agent-cli-profiles.ts`) carries the corrected Claude wake values; the drift guard keeps extension and relay byte-identical.
+- **Honest docs on the wake ack.** The landed-gate's delivery ack means "the wake sequence was dispatched", not "the TUI submitted it" — comments now say so, and the adapter tests pin the type→settle→submit sequence itself (the old test asserted the broken single-call shape under the title "types AND submits").
+
 ## [0.6.0] — 2026-07-21 — Data-driven wake: the LLM list + wake behavior track the relay registry
 
 Tether's per-LLM wake behavior is now **driven by the relay's agent-CLI profile registry** (`bot-relay-mcp@2.17.1`) instead of hand-coded per-CLI branches. Nothing changes for you day-to-day — Claude still wakes on `inbox`, Codex still gets its instruction + a separate Enter after a short paste-settle delay — but the wake **values** (the Codex wake prompt, the 150 ms submit delay, the submit method) now come from a single source shared with the relay, and adding support for a new agent CLI becomes a one-line registry entry.
