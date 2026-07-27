@@ -38,6 +38,17 @@ This cluster is the strongest illustration the codebase has produced, because th
 
 4. **Free-text vs structural — the classification boundary was the bug.** An unauthenticated projection (the dashboard snapshot) leaked cross-agent secrets three times: first the raw `content` column (plaintext when at-rest encryption is opt-in — the default), then the free-text `description`/`title` fields hiding under innocuous names, then a webhook `url` that *is* a credential. A denylist could not close it. The durable form is an **allowlist by classification**: every field is either operator-authored **free text** (can carry a secret regardless of its name → excluded, or admitted only as a documented, constrained exposure) or **structural** (a fixed vocabulary the system controls → safe). Classify every field in the artifact, and test the harm per-field with a distinct secret so a leak names its own field.
 
+## Anti-pattern — a comment asserting an invariant is not evidence the invariant holds
+
+A recurring failure: a comment states the exact property the adjacent code violates. It is evidence someone *intended* the invariant, never that it *holds* — and it actively misleads the next reader into trusting the code without checking. Observed four times in one week:
+
+- the webhook mapper comment declaring the dashboard "never leaks secrets" beside code that shipped a webhook URL credential (PR A);
+- a `--force` alias comment claiming re-registration is rejected without the flag, beside code that accepted it;
+- `db.ts` comments asserting a guard that had already been deleted;
+- a `csrfCheck` comment reading *"This MIRRORS dashboardAuthCheck's channel precedence — keep the two in sync (ADR-0015 L4)"* directly above six lines that broke the mirror (the exemption matched any `Authorization` header; the consumer accepted only `Bearer `), so a non-Bearer header skipped CSRF while authenticating from the ambient cookie.
+
+The cure is L4's own medicine applied to the comment: if two sites must agree, do not ask a comment to keep them agreeing — extract ONE predicate both call, so agreement is structural and the comment becomes true by construction. A comment that must be manually kept true is a latent bug with a due date. When reviewing, treat an invariant-asserting comment as a **claim to verify**, never as evidence that the invariant holds.
+
 ## Consequences
 
 - New guards and projections declare L1–L4 inline and carry harm + innocent-twin tests.
