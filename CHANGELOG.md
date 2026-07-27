@@ -1,28 +1,31 @@
 # Changelog
 
-## v[VERSION — Maxime's call] — 2026-07-27 — Security hardening: operator auth, dashboard content isolation, orchestration integrity
+## v2.24.0 — 2026-07-27 — Security hardening: operator auth, dashboard content isolation, orchestration integrity
 
 <!--
-  VERSION IS UNDECIDED — leave this note until Maxime rules. Strict semver makes
-  this a MAJOR (3.0.0): #142 is a breaking change. Maintainer lean: 2.24.0 WITH
-  the loud upgrade note below, because a major-version bump signals a rewrite to
-  anyone browsing npm and this is a hardening release, not that. Maxime rules;
-  drop the number into the heading. DRAFT — not yet released.
+  VERSION: 2.24.0, locked by Maxime this session. Strict semver would make this a
+  MAJOR (3.0.0) because #142 is a breaking change, but a major bump signals a
+  rewrite to anyone browsing npm and this is a hardening release, not that — so
+  2.24.0 WITH the loud upgrade note below. DRAFT — not yet released; this PR stays
+  not-for-merge until the release is cut.
 -->
 
-Eight merges since 2.23.0. The spine is a security cluster: operator power can no
+Nine merges since 2.23.0. The spine is a security cluster: operator power can no
 longer be inferred from being on the box, the dashboard no longer hands message
 content to unauthenticated callers, and the orchestrator no longer loses work to
 a dead agent or a stale daemon.
 
 ### ⚠️ BREAKING — the operator dashboard now requires a secret (one action needed on upgrade)
 
-**Upgrade step (do this once): run `relay init`.** On an existing HTTP install,
-operator actions in the dashboard — kill/wake an agent, send a message, focus a
+**Required step — existing installs AND fresh installs: run `relay init`.**
+Operator actions in the dashboard — kill/wake an agent, send a message, focus a
 terminal, set status, change the theme, the keyring — return **401 until a
-dashboard secret exists**. `relay init` generates one (printed once, preserved on
-re-run, added to legacy installs automatically). **If your dashboard starts
-refusing actions right after upgrading, this is the reason — not a regression.**
+dashboard secret exists**, and **a fresh install ships with no secret, so it has
+no working operator actions at all until you run it.** `relay init` generates one
+(printed once, preserved on re-run, added to legacy installs automatically). This
+is a required setup step, not a footnote — without it the dashboard's operator
+controls are inert. **If your dashboard starts refusing actions right after
+upgrading, this is the reason — not a regression.**
 
 Why it changed (**#142**, ADR-0006): before this, in the default loopback
 deployment, **any local process that could reach the dashboard port could invoke
@@ -37,11 +40,13 @@ network position plus a transport secret, not from an operator identity. ADR-000
 
 > **◆ FLAGGED FOR MAXIME — a possible SECOND breaking change for this release, not yet decided.**
 > Node 20 reached **end-of-life on 2026-04-30** (Node.js release schedule) and no
-> longer receives security patches; Node 22 is supported to 2027-04-30. The
-> pending better-sqlite3 major decision (**#81**) may drop Node 20 from the
-> support matrix. If you take that, it is itself a breaking change and belongs in
-> these notes — the slot is left ready here rather than bolted on afterward. Not
-> decided.
+> longer receives security patches; Node 22 is supported to 2027-04-30. The pending
+> better-sqlite3 major (**#81**, 11.x → 13.0.1) declares `engines: node >=22` and,
+> verified in CI this session, failed **only** the Node 20 cell (Node 22 + macOS
+> passed). Taking it moves this package's own `engines` from `>=20` to `>=22` and
+> drops Node 20 from the support matrix — itself a breaking change that belongs in
+> these notes. The slot is left ready here rather than bolted on afterward. **Not
+> decided.**
 
 ### Security
 
@@ -82,35 +87,40 @@ network position plus a transport secret, not from an operator identity. ADR-000
   (the newline rode in the same chunk and did not register as Enter), so a woken
   agent sat with an unsent prompt and looked like it had ignored the wake. It now
   types, settles briefly, then sends the Enter as a separate keystroke.
+- **The server no longer closes an idle keep-alive socket first (#149).** The HTTP
+  server's keep-alive timeout sat below the idle window a pooling client may hold a
+  connection, so under load the server could close a socket the client was about to
+  reuse — surfacing as an intermittent `ECONNRESET` on the next request. The
+  timeout is raised (to 61s, with the header-read timeout above it) so the client
+  always closes first. Affects raw/proxy/non-undici HTTP clients regardless of
+  platform (LOW).
 
 ### Internal / hardening
 
-- **Publish gate hardened (#138):** the pre-publish gate refuses to publish from
-  the wrong branch and treats a **missing CI run as a failure**, not a pass.
+- **Dashboard theme values validated against a CSS-color grammar (#147):** the
+  dashboard theme endpoint now rejects theme token values that are not well-formed
+  CSS colors, closing a stored-value injection vector on an operator-settable field
+  (LOW).
+- **From-source native-build CI gate (#148):** CI now compiles `better-sqlite3`
+  from source on the matrix, closing a prebuilt-only blind spot — a dependency that
+  breaks on a from-source build (or drops a Node version) now reds CI instead of
+  passing on a cached prebuilt.
 - **Liveness probe caches evicted on every state change (#140):** the five writers
   that change an agent's session/anchor now evict the probe caches unconditionally,
   so a stale cached verdict cannot outlive the change.
-- **Test integrity (#139, #144):** the user-config tripwire now compares only
-  relay-owned config regions (a whole-file byte comparison false-tripped on
-  unrelated user edits); the backup test asserts the atomic-swap **harm** directly
-  instead of a poll-count proxy (ADR-0015).
+- **Backup test asserts the harm, not a proxy (#144):** the backup test asserts the
+  atomic-swap **harm** directly instead of a poll-count proxy (ADR-0015).
 - **Docs (#146):** ADR-0007 (control-plane target architecture) committed to
   version control.
-
-### Pending — NOT in this release (open PRs, tracking only)
-
-Subject to change; listed so nothing is lost from view:
-- **#145** — token-redaction registry (security; under codex audit). Folds into **Security** when it lands.
-- **#147** — dashboard theme CSS input validation (LOW). → Security / Fixed.
-- **#148** — from-source native-build CI gate (advisory). → Internal.
-- **#149** — server keep-alive timeout; no more premature idle keep-alive resets (LOW; green). → Fixed.
 
 ## v2.23.0 — 2026-07-25 — Config-clobber closed, orchestration-anchor safety, DX + a HIGH dependency advisory
 
 > _**Backfilled 2026-07-27.** 2.23.0 shipped without release notes; this entry was
-> reconstructed after the fact from the first-parent merge log between v2.22.0 and
-> the 2.23.0 release commit (`91a4c57`) — it is **not** contemporaneous. The PRs
-> are named per item; for the precise diff see those commits._
+> reconstructed after the fact from the first-parent commit log between v2.22.0
+> (`1f64ec8`) and the **published** 2.23.0 commit (`22c92db` — the npm `gitHead`
+> for 2.23.0, which is two commits past the `2.22.0 → 2.23.0` version bump and so
+> includes #138 and #139) — it is **not** contemporaneous. The PRs are named per
+> item; for the precise diff see those commits._
 
 The load-bearing one is a **shipping defect that anyone who ran the test suite hit.**
 
@@ -125,6 +135,10 @@ The load-bearing one is a **shipping defect that anyone who ran the test suite h
   negative control: HOME sandboxes for the three offending test environments, a
   chokepoint guard that throws on any real-user-config write under test, a
   suite-wide tripwire hashing the real config files, and the `%20` path fix.
+- **The user-config tripwire compares only relay-owned regions (#139).** A
+  follow-up to #125: that suite-wide tripwire's whole-file byte comparison
+  false-tripped on unrelated user edits to `~/.claude.json`, so it now compares only
+  the relay-owned config regions — a legitimate user edit no longer reds the suite.
 - **Security — postcss HIGH advisory patched (#134, GHSA-r28c-9q8g-f849).** A
   path-traversal advisory (CVSS 7.5) landed on `postcss <= 8.5.17`. It reaches this
   project only as a **dev-only transitive dependency** (vitest → vite → postcss;
@@ -135,6 +149,9 @@ The load-bearing one is a **shipping defect that anyone who ran the test suite h
   `force` re-anchoring uses a compare-and-swap plus a dead-anchor diagnostic
   instead of an unconditional takeover, so two agents racing for the same identity
   anchor cannot silently clobber each other.
+- **Publish gate hardened (#138).** The pre-publish gate refuses to publish from
+  the wrong branch and treats a **missing CI run as a failure**, not a pass —
+  closing a stacked-PR hole where an empty CI rollup read as clean/mergeable.
 - **`relay resolve` — a CLI ack for MCP-mute sessions (#133).** A session that
   cannot call the MCP tool (e.g. a plain terminal) can still acknowledge/resolve
   messages from the command line.
