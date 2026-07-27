@@ -1,5 +1,153 @@
 # Changelog
 
+## v[VERSION — Maxime's call] — 2026-07-27 — Security hardening: operator auth, dashboard content isolation, orchestration integrity
+
+<!--
+  VERSION IS UNDECIDED — leave this note until Maxime rules. Strict semver makes
+  this a MAJOR (3.0.0): #142 is a breaking change. Maintainer lean: 2.24.0 WITH
+  the loud upgrade note below, because a major-version bump signals a rewrite to
+  anyone browsing npm and this is a hardening release, not that. Maxime rules;
+  drop the number into the heading. DRAFT — not yet released.
+-->
+
+Eight merges since 2.23.0. The spine is a security cluster: operator power can no
+longer be inferred from being on the box, the dashboard no longer hands message
+content to unauthenticated callers, and the orchestrator no longer loses work to
+a dead agent or a stale daemon.
+
+### ⚠️ BREAKING — the operator dashboard now requires a secret (one action needed on upgrade)
+
+**Upgrade step (do this once): run `relay init`.** On an existing HTTP install,
+operator actions in the dashboard — kill/wake an agent, send a message, focus a
+terminal, set status, change the theme, the keyring — return **401 until a
+dashboard secret exists**. `relay init` generates one (printed once, preserved on
+re-run, added to legacy installs automatically). **If your dashboard starts
+refusing actions right after upgrading, this is the reason — not a regression.**
+
+Why it changed (**#142**, ADR-0006): before this, in the default loopback
+deployment, **any local process that could reach the dashboard port could invoke
+operator powers** — kill or wake agents, send messages as you, focus terminals —
+with no operator credential. Worse, the shared `http_secret` that *every* HTTP
+agent already holds was accepted as operator authorization, so a mere agent
+transport credential silently granted operator power. Power was derived from
+network position plus a transport secret, not from an operator identity. ADR-0006
+("location is not a principal") closes it: operator endpoints now require a
+**verified dashboard secret regardless of network position**, and the
+`http_secret`→operator escalation is removed at every site.
+
+> **◆ FLAGGED FOR MAXIME — a possible SECOND breaking change for this release, not yet decided.**
+> Node 20 reached **end-of-life on 2026-04-30** (Node.js release schedule) and no
+> longer receives security patches; Node 22 is supported to 2027-04-30. The
+> pending better-sqlite3 major decision (**#81**) may drop Node 20 from the
+> support matrix. If you take that, it is itself a breaking change and belongs in
+> these notes — the slot is left ready here rather than bolted on afterward. Not
+> decided.
+
+### Security
+
+- **The dashboard no longer serves message content to unauthenticated callers (#141).**
+  In the default loopback deployment, the dashboard's snapshot endpoint served
+  **decrypted previews of every agent's messages and tasks — plus each agent's
+  session and process identifiers — to anyone who could reach the port, with no
+  password.** That defeated the per-agent token isolation `get_messages` enforces,
+  and where at-rest encryption was not configured (the default) it exposed
+  plaintext. The unauthenticated snapshot is now built from an explicit
+  **allowlist** of non-sensitive identity/presence fields; message and task
+  content and process locators are **absent by construction** (a first denylist
+  attempt still shipped the raw content column and was caught and replaced).
+  Authenticated operators still get full previews.
+- **Operator power now requires operator authentication, everywhere (#142).** (See
+  the BREAKING note above.) The `http_secret`→operator-auth escalation is removed
+  at all three sites; a single resolver decides operator auth from the dashboard
+  secret and nothing else.
+- **Tasks are never handed to a dead agent (#141).** `post_task_auto` could route a
+  task to a **registered-but-closed** agent; the task then dead-ended forever
+  while the caller was told `routed=true` — **silent work loss on the core
+  orchestration path**. Routing now targets only agents with a live session, and a
+  task orphaned by an agent vanishing between post and accept is **loudly
+  requeued**, never silently redirected.
+- **A stale daemon after an upgrade is surfaced, not silently kept (#141).** After
+  `npm update`, the already-running daemon kept serving every HTTP client on the
+  **old code until reboot** (launchd does not restart on a code change), with no
+  warning — the "merged but never takes effect" trap at the daemon layer. `relay
+  init` now **loudly flags a version drift** with the exact remedy, and a new
+  operator-invoked **`relay restart`** (with `--dry-run` to preview) applies it. It
+  never auto-restarts — bouncing a shared daemon mid-session is the operator's
+  call.
+
+### Fixed
+
+- **Tether: `claude wake` now actually submits the prompt (#129, Tether v0.7.0).**
+  The VS Code wake typed the prompt into the terminal but **never submitted it**
+  (the newline rode in the same chunk and did not register as Enter), so a woken
+  agent sat with an unsent prompt and looked like it had ignored the wake. It now
+  types, settles briefly, then sends the Enter as a separate keystroke.
+
+### Internal / hardening
+
+- **Publish gate hardened (#138):** the pre-publish gate refuses to publish from
+  the wrong branch and treats a **missing CI run as a failure**, not a pass.
+- **Liveness probe caches evicted on every state change (#140):** the five writers
+  that change an agent's session/anchor now evict the probe caches unconditionally,
+  so a stale cached verdict cannot outlive the change.
+- **Test integrity (#139, #144):** the user-config tripwire now compares only
+  relay-owned config regions (a whole-file byte comparison false-tripped on
+  unrelated user edits); the backup test asserts the atomic-swap **harm** directly
+  instead of a poll-count proxy (ADR-0015).
+- **Docs (#146):** ADR-0007 (control-plane target architecture) committed to
+  version control.
+
+### Pending — NOT in this release (open PRs, tracking only)
+
+Subject to change; listed so nothing is lost from view:
+- **#145** — token-redaction registry (security; under codex audit). Folds into **Security** when it lands.
+- **#147** — dashboard theme CSS input validation (LOW). → Security / Fixed.
+- **#148** — from-source native-build CI gate (advisory). → Internal.
+- **#149** — server keep-alive timeout; no more premature idle keep-alive resets (LOW; green). → Fixed.
+
+## v2.23.0 — 2026-07-25 — Config-clobber closed, orchestration-anchor safety, DX + a HIGH dependency advisory
+
+> _**Backfilled 2026-07-27.** 2.23.0 shipped without release notes; this entry was
+> reconstructed after the fact from the first-parent merge log between v2.22.0 and
+> the 2.23.0 release commit (`91a4c57`) — it is **not** contemporaneous. The PRs
+> are named per item; for the precise diff see those commits._
+
+The load-bearing one is a **shipping defect that anyone who ran the test suite hit.**
+
+- **`npm test` no longer rewrites your real Claude config (#125).** **Anyone who
+  cloned this repo and ran `npm test` had their real `~/.claude.json` and
+  `~/.claude/settings.json` silently rewritten to point at their checkout — no
+  warning, no error.** On dev machines it quietly pointed every agent at an
+  unmerged build for nine days; run from a path containing a space it wrote a
+  percent-encoded path (`%20`) that does not exist, so it failed mutely rather than
+  loudly. **If you ran this repo's test suite before 2.23.0, check your
+  `~/.claude.json` MCP entries.** Fixed in four layers, each with a proven-failing
+  negative control: HOME sandboxes for the three offending test environments, a
+  chokepoint guard that throws on any real-user-config write under test, a
+  suite-wide tripwire hashing the real config files, and the `%20` path fix.
+- **Security — postcss HIGH advisory patched (#134, GHSA-r28c-9q8g-f849).** A
+  path-traversal advisory (CVSS 7.5) landed on `postcss <= 8.5.17`. It reaches this
+  project only as a **dev-only transitive dependency** (vitest → vite → postcss;
+  production deps are empty), so runtime exposure is nil — but it reds the `npm
+  audit --audit-level=high` gate. Patched lockfile-only (postcss 8.5.15 → 8.5.23),
+  no production or SDK change.
+- **Anchor takeover is CAS-guarded; no silent auto-takeover (#136, ADR-0012).**
+  `force` re-anchoring uses a compare-and-swap plus a dead-anchor diagnostic
+  instead of an unconditional takeover, so two agents racing for the same identity
+  anchor cannot silently clobber each other.
+- **`relay resolve` — a CLI ack for MCP-mute sessions (#133).** A session that
+  cannot call the MCP tool (e.g. a plain terminal) can still acknowledge/resolve
+  messages from the command line.
+- **`relay send` stdout hygiene (#130).** Usage/help now goes to stderr and `relay
+  send` prints a clean message id on stdout, so a script can capture the id without
+  parsing noise.
+- **Tether wakes routed by observed agent-state; wake-stacking ended (#126).** A
+  "landed" gate stops the extension from stacking repeated wakes on an agent that
+  has already been woken and is working.
+- **Stop-hook is a read-only wake (#124).** The stop-check hook never consumes mail
+  it cannot prove it delivered — a silence-as-failure guard so a wake can never
+  quietly eat a message.
+
 ## v2.22.0 — 2026-07-22 — ADR-0005: relay DX hardening (curl/script-caller friction)
 
 Five fixes for callers driving the relay over raw HTTP (no MCP client wired in), from a real friction report. The load-bearing one is a **safe self-serve orphan cleanup**.
