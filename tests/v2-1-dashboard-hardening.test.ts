@@ -154,21 +154,26 @@ describe("v2.1 Phase 4d — dashboard hardening", () => {
     expect(r.status).toBe(200);
   });
 
-  it("(6) falls back to RELAY_HTTP_SECRET when RELAY_DASHBOARD_SECRET unset", async () => {
+  it("(6) http_secret does NOT grant dashboard access (escalation removed, ADR-0006)", async () => {
+    // Pre-ADR-0006 the dashboard gate fell back to `|| config.http_secret`, so
+    // the AGENT transport secret doubled as the dashboard/operator secret. That
+    // privilege-escalation was removed: with ONLY RELAY_HTTP_SECRET set (no
+    // dashboard secret), presenting the http_secret confers no dashboard/operator
+    // power. An operator-power endpoint isolates the gate cleanly — GET
+    // /api/keyring is refused (401) whether the http_secret is presented or not,
+    // because operatorAuthCheck requires a VERIFIED dashboard secret and there is
+    // none. (Pre-fix, `Bearer http-fallback` would have authenticated.)
     server.close();
     process.env.RELAY_HTTP_SECRET = "http-fallback";
+    delete process.env.RELAY_DASHBOARD_SECRET; // only the transport secret exists
     server = startHttpServer(0, "127.0.0.1");
     await new Promise((r) => setTimeout(r, 100));
     const addr = server.address();
     port = typeof addr === "object" && addr ? addr.port : 0;
-    const ok = await getWithHeaders(`http://127.0.0.1:${port}/api/snapshot`, {
+    const r = await getWithHeaders(`http://127.0.0.1:${port}/api/keyring`, {
       Authorization: "Bearer http-fallback",
     });
-    expect(ok.status).toBe(200);
-    const bad = await getWithHeaders(`http://127.0.0.1:${port}/api/snapshot`, {
-      Authorization: "Bearer not-it",
-    });
-    expect(bad.status).toBe(401);
+    expect(r.status).toBe(401);
   });
 
   it("(7) cookie `relay_dashboard_auth=<secret>` also authorizes", async () => {

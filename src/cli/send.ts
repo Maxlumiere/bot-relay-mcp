@@ -205,19 +205,26 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
 
-  // --- Resolve host/port + optional dashboard secret ---
+  // --- Resolve host/port + the OPERATOR (dashboard) secret ---
+  // /api/send-message is an operator-authed endpoint (ADR-0006), so present the
+  // dashboard/operator secret via the SHARED resolver — NOT http_secret. This was
+  // the fourth copy of the resolution logic; wiring it in fixes two bugs at once:
+  // it stops presenting an agent transport credential (which no longer
+  // authenticates operator endpoints — the removed escalation) and it reads the
+  // stored `dashboard_secret`, which the old `http_secret`-only path never did.
   let host = "127.0.0.1";
   let port = 3777;
-  let secret: string | null = process.env.RELAY_DASHBOARD_SECRET || process.env.RELAY_HTTP_SECRET || null;
+  let secret: string | null = null;
   try {
-    const { loadConfig } = await import("../config.js");
+    const { loadConfig, resolveDashboardSecret } = await import("../config.js");
     const cfg = loadConfig();
     host = cfg.http_host || host;
     port = cfg.http_port || port;
-    if (!secret) secret = cfg.http_secret || null;
+    secret = resolveDashboardSecret(cfg);
   } catch {
     host = process.env.RELAY_HTTP_HOST || host;
     port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
+    secret = process.env.RELAY_DASHBOARD_SECRET || null;
   }
 
   const url = `http://${host}:${port}/api/send-message`;

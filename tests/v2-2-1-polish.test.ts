@@ -19,6 +19,7 @@ import os from "os";
 import http from "http";
 import type { Server as HttpServer } from "http";
 import { fileURLToPath } from "url";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -52,6 +53,11 @@ let port: number;
 
 async function bootServer(): Promise<void> {
   if (server) { try { server.close(); } catch { /* ignore */ } }
+  // ADR-0006: the P2 inline mutation endpoints are operator-power (verified
+  // dashboard secret + CSRF); the dashboard READ endpoints (/dashboard,
+  // /api/snapshot) require the same secret once one is configured. Set it and
+  // authenticate both surfaces (operatorPost for writes, Bearer for getText).
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
   server = startHttpServer(0, "127.0.0.1");
@@ -95,7 +101,7 @@ function postJson(p: string, body: Record<string, unknown>, extraHeaders: Record
 function getText(p: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     http
-      .get({ host: "127.0.0.1", port, path: p }, (res) => {
+      .get({ host: "127.0.0.1", port, path: p, headers: { Authorization: `Bearer ${OPERATOR_SECRET}` } }, (res) => {
         let b = "";
         res.setEncoding("utf8");
         res.on("data", (c) => (b += c));
@@ -112,6 +118,7 @@ afterEach(() => {
   try { if (server) server.close(); } catch { /* ignore */ }
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+  delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
 // ============================================================================
@@ -189,7 +196,7 @@ describe("v2.2.1 P2 — /api/send-message", () => {
     // is now the impersonation primitive that was closed).
     const { plaintext_token } = registerAgent("p2-from", "r", []);
     registerAgent("p2-to", "r", []);
-    const r = await postJson("/api/send-message", {
+    const r = await operatorPost(port, "/api/send-message", {
       from: "p2-from",
       to: "p2-to",
       content: "from the dashboard",
@@ -203,13 +210,13 @@ describe("v2.2.1 P2 — /api/send-message", () => {
   });
 
   it("(P2.S2) invalid body (no `to`) → 400", async () => {
-    const r = await postJson("/api/send-message", { from: "x", content: "hi" });
+    const r = await operatorPost(port, "/api/send-message", { from: "x", content: "hi" });
     expect(r.status).toBe(400);
   });
 
   it("(P2.S3) unknown sender → 400 with SENDER_NOT_REGISTERED", async () => {
     registerAgent("p2-to2", "r", []);
-    const r = await postJson("/api/send-message", {
+    const r = await operatorPost(port, "/api/send-message", {
       from: "ghost-sender",
       to: "p2-to2",
       content: "spoofed",
@@ -222,14 +229,14 @@ describe("v2.2.1 P2 — /api/send-message", () => {
 describe("v2.2.1 P2 — /api/kill-agent", () => {
   it("(P2.K1) missing X-Relay-Confirm header → 428 with confirmation-required hint", async () => {
     registerAgent("doomed", "r", []);
-    const r = await postJson("/api/kill-agent", { name: "doomed" });
+    const r = await operatorPost(port, "/api/kill-agent", { name: "doomed" });
     expect(r.status).toBe(428);
     expect(r.json.error).toMatch(/confirmation/i);
   });
 
   it("(P2.K2) with X-Relay-Confirm=yes + valid target → 200 + row removed", async () => {
     registerAgent("doomed-2", "r", []);
-    const r = await postJson("/api/kill-agent", { name: "doomed-2" }, { "X-Relay-Confirm": "yes" });
+    const r = await operatorPost(port, "/api/kill-agent", { name: "doomed-2" }, { extraHeaders: { "X-Relay-Confirm": "yes" } });
     expect(r.status).toBe(200);
     expect(r.json.success).toBe(true);
     expect(r.json.removed).toBe(true);
@@ -237,14 +244,14 @@ describe("v2.2.1 P2 — /api/kill-agent", () => {
   });
 
   it("(P2.K3) non-registered target → 200 with removed:false (idempotent)", async () => {
-    const r = await postJson("/api/kill-agent", { name: "ghost" }, { "X-Relay-Confirm": "yes" });
+    const r = await operatorPost(port, "/api/kill-agent", { name: "ghost" }, { extraHeaders: { "X-Relay-Confirm": "yes" } });
     expect(r.status).toBe(200);
     expect(r.json.success).toBe(true);
     expect(r.json.removed).toBe(false);
   });
 
   it("(P2.K4) invalid body → 400", async () => {
-    const r = await postJson("/api/kill-agent", {}, { "X-Relay-Confirm": "yes" });
+    const r = await operatorPost(port, "/api/kill-agent", {}, { extraHeaders: { "X-Relay-Confirm": "yes" } });
     expect(r.status).toBe(400);
   });
 });
@@ -252,7 +259,7 @@ describe("v2.2.1 P2 — /api/kill-agent", () => {
 describe("v2.2.1 P2 — /api/set-status", () => {
   it("(P2.ST1) happy path: registered agent + valid status → 200 + row updated", async () => {
     registerAgent("statuschanger", "r", []);
-    const r = await postJson("/api/set-status", {
+    const r = await operatorPost(port, "/api/set-status", {
       agent_name: "statuschanger",
       agent_status: "blocked",
     });
@@ -263,7 +270,7 @@ describe("v2.2.1 P2 — /api/set-status", () => {
   });
 
   it("(P2.ST2) unknown agent → 404", async () => {
-    const r = await postJson("/api/set-status", {
+    const r = await operatorPost(port, "/api/set-status", {
       agent_name: "ghost",
       agent_status: "working",
     });
@@ -272,7 +279,7 @@ describe("v2.2.1 P2 — /api/set-status", () => {
 
   it("(P2.ST3) invalid status enum → 400", async () => {
     registerAgent("statuschanger-2", "r", []);
-    const r = await postJson("/api/set-status", {
+    const r = await operatorPost(port, "/api/set-status", {
       agent_name: "statuschanger-2",
       agent_status: "DEFINITELY_NOT_A_STATUS",
     });
