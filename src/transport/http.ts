@@ -1838,6 +1838,32 @@ export function startHttpServer(port: number, host: string): Server {
     );
   });
 
+  // v2.24 keepAliveTimeout — the server must never close an idle keep-alive
+  // socket before the client does, or a client that reuses the socket in the
+  // gap gets ECONNRESET on an otherwise-healthy connection. Node's default
+  // keepAliveTimeout is 5000ms, so on a bare app.listen() the SERVER closes
+  // first: measured on a throwaway daemon the socket FINs at ~6001ms idle and
+  // a raw reuse at 6003ms fails with ECONNRESET at ~6012ms. undici (the
+  // default agent our own clients use) evicts its pooled socket at ~4s, before
+  // the server's 5s, so it never sees this — which is why the impact is LOW:
+  // the exposed population is raw HTTP clients, proxies, and libraries without
+  // that client-side eviction.
+  //
+  // Fix (server-side only): hold idle keep-alive sockets past any plausible
+  // client window so the server is never the one to close first. 61s clears
+  // the common 60s proxy/library keep-alive; headersTimeout must sit above
+  // keepAliveTimeout (Node ordering requirement) so a slow-header request
+  // stays bounded above the new keep-alive window.
+  //
+  // Deliberately NOT paired with a client-side idempotent-retry-on-ECONNRESET:
+  // once the server stops closing first there is nothing legitimate left for
+  // such a retry to catch — only a silent regression of THIS tuning, which it
+  // would quietly convert from "keep-alive tuning broke" into "occasional
+  // invisible retry." If a reset ever returns it must stay loud (ADR-0015: no
+  // mechanism that masks the failure of the guard it sits behind).
+  server.keepAliveTimeout = 61000;
+  server.headersTimeout = 65000;
+
   // v2.2.0 Phase 2: attach the dashboard WebSocket server to the running
   // http.Server. Hijacks only /dashboard/ws upgrades; every other upgrade
   // path is left untouched. Auth is checked inside attachDashboardWs.
