@@ -66,17 +66,29 @@
  *     error-recovery tree (fail-closed on READ, fail-OPEN on PARSE — the exact
  *     audit-state-freshness.sh split). CLOSED: parseDiagnostics non-empty → exit 2.
  *   • AMBIENT DISABLE — none; the only escape is the per-line `// ALLOWLIST:
- *     <reason>` (visible, reviewable). Its OWNER/ticket/registry authority + an
- *     emitted-exemption report are a tracked follow-up (allowlist governance).
+ *     <reason>` (visible, reviewable). It requires a NON-TRIVIAL reason — a bare
+ *     `// ALLOWLIST: x` no longer exempts — and EVERY use is EMITTED to stderr,
+ *     so an unjustified exemption is LOUD in CI, not "detectable only by a human
+ *     noticing the diff" (codex T5). A structured OWNER/ticket registry is a
+ *     tracked follow-up (allowlist governance).
  *
  *   OUT — HONEST BOUNDARIES (things not yet shown reachable, or deliberately
  *   deferred), never captions over demonstrated harm:
- *   • FALSE POSITIVE on PROSE (known, deferred): the guard classifies string
- *     LITERALS, so a diagnostic constant that happens to lex as a mutation
- *     statement (e.g. "DELETE FROM agents is forbidden; call teardownAgent") is
- *     OVER-flagged, though SQLite rejects that text as a syntax error. Over-flag
- *     is the SAFE direction; the principled cure is the SQL-SINK constraint (only
- *     classify literals that reach `prepare`/`exec`/`run`), a tracked follow-up.
+ *   • FALSE POSITIVE on PROSE — ACCEPTED + STATED (codex bar 4; a stated proxy is
+ *     honest, an unstated one is the defect). The guard classifies string LITERALS
+ *     by structure, so a diagnostic constant that lexes as a mutation prefix (e.g.
+ *     "DELETE FROM agents is forbidden; call teardownAgent") is OVER-flagged,
+ *     though SQLite rejects that text as a syntax error. This is DELIBERATELY not
+ *     "fixed": both cures are worse than the FP. A hand-rolled continuation grammar
+ *     UNDER-blocks silently — `IS` is itself a SQL keyword, so "…agents is
+ *     forbidden" defeats a next-token check, and "my continuation list is complete"
+ *     is a NEW proxy for "valid SQL" (a false NEGATIVE — the dangerous direction).
+ *     A `db.prepare()` validator puts a live SQL engine inside the lint script (new
+ *     audit surface in the thing that audits). ADR-0015 direction-of-failure: a
+ *     LOUD safe over-block with an escape beats a SILENT under-block. ESCAPE for a
+ *     legitimate such string: route via src/db.ts, or add a reason-bearing
+ *     `// ALLOWLIST:`. (The guard passes clean on real src today — this FP is
+ *     latent, not active.)
  *   • RUNTIME-ASSEMBLED SQL — `[...].join(' ')`, char-building, a fully computed
  *     identifier: no classifiable literal. Route through db.ts or ALLOWLIST.
  *   • NOVEL GRAMMAR — a statement form the classifier does not enumerate. This is
@@ -345,13 +357,21 @@ export function findSanctionedMutationViolations(source, fileName = "file.ts", o
   const violations = [];
   const seen = new Set();
 
-  const hasAllowlist = (node) => {
+  // A per-line `// ALLOWLIST: <reason>` exempts the line — but ONLY with a
+  // NON-TRIVIAL reason (codex T5: a bare `// ALLOWLIST: x` must not authorize).
+  // Returns the reason string when a valid exemption is present, else null.
+  const allowlistReason = (node) => {
     const start = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line;
     const end = sf.getLineAndCharacterOfPosition(node.getEnd()).line;
     for (let ln = start; ln <= end && ln < lines.length; ln++) {
-      if (/\/\/\s*ALLOWLIST:\s*\S/.test(lines[ln])) return true;
+      const m = lines[ln].match(/\/\/\s*ALLOWLIST:\s*(.+?)\s*$/);
+      if (m) {
+        const reason = m[1].trim();
+        // Non-trivial = a real justification: ≥8 chars OR two+ words. `x` fails.
+        if (reason.length >= 8 || /\S+\s+\S+/.test(reason)) return reason;
+      }
     }
-    return false;
+    return null;
   };
 
   const visit = (node) => {
@@ -362,9 +382,17 @@ export function findSanctionedMutationViolations(source, fileName = "file.ts", o
       if (sql && mutatesAgentsTable(sql)) {
         const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
         const key = `${line}:${sql.slice(0, 40)}`;
-        if (!seen.has(key) && !hasAllowlist(node)) {
+        if (!seen.has(key)) {
           seen.add(key);
-          violations.push({ line, sql: sql.replace(/\s+/g, " ").trim().slice(0, 90) });
+          const trimmed = sql.replace(/\s+/g, " ").trim().slice(0, 90);
+          const reason = allowlistReason(node);
+          if (reason !== null) {
+            // Exempted by a valid reason — RECORD it so main() emits it (codex T5),
+            // rather than a silent skip only a diff-reader would catch.
+            if (Array.isArray(opts.allowlisted)) opts.allowlisted.push({ line, sql: trimmed, reason });
+          } else {
+            violations.push({ line, sql: trimmed });
+          }
         }
       }
       return; // don't descend into an already-classified string expression
@@ -411,6 +439,7 @@ function main() {
     process.exit(2);
   }
   const all = [];
+  const allowlisted = [];
   for (const { file: f, root } of files) {
     let src;
     try {
@@ -421,14 +450,23 @@ function main() {
       process.exit(2);
     }
     let vios;
+    const fileAllow = [];
     try {
-      vios = findSanctionedMutationViolations(src, f, { srcRoot: root });
+      vios = findSanctionedMutationViolations(src, f, { srcRoot: root, allowlisted: fileAllow });
     } catch (err) {
       // FAIL CLOSED — a parse failure is an error, never a silent pass.
       process.stderr.write(`sanctioned-mutation-guard: parse error in ${f}: ${err instanceof Error ? err.message : String(err)}\n`);
       process.exit(2);
     }
     for (const v of vios) all.push({ file: f, ...v });
+    for (const a of fileAllow) allowlisted.push({ file: f, ...a });
+  }
+  // codex T5 — EMIT every allowlist exemption to stderr, so an unjustified one is
+  // LOUD in CI, never "detectable only by a human noticing the diff". These do
+  // NOT fail the gate on their own; each is printed for review.
+  if (allowlisted.length > 0) {
+    process.stderr.write(`sanctioned-mutation-guard: ${allowlisted.length} ALLOWLIST exemption(s) in effect (review each):\n`);
+    for (const a of allowlisted) process.stderr.write(`  ALLOWLIST ${a.file}:${a.line}  ${a.sql}  — reason: ${a.reason}\n`);
   }
   if (all.length > 0) {
     process.stderr.write(
