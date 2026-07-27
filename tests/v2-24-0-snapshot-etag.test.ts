@@ -45,7 +45,7 @@ delete process.env.RELAY_AGENT_ROLE;
 delete process.env.RELAY_AGENT_CAPABILITIES;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { closeDb } = await import("../src/db.js");
+const { closeDb, _setPositiveProbeForTests } = await import("../src/db.js");
 
 let server: HttpServer;
 let baseUrl: string;
@@ -116,12 +116,17 @@ describe("v2.24.0 — /api/snapshot ETag + Date caching (lumen contract)", () =>
     expect(Number.isNaN(new Date(conditional.date!).getTime())).toBe(false); // parseable HTTP-date
   });
 
-  it("HARM: stability holds WITH agents present (no hidden time-varying field in agent rows)", async () => {
+  it("HARM: stability holds with STATIC agents present (no probe activity — the churning-field case is the separate test below)", async () => {
+    // NOTE: this proves stability only for agents whose last_alive is NOT moving
+    // (they are never liveness-probed in an isolated test server, so last_alive
+    // stays null). It does NOT prove "no time-varying field" — the reopened
+    // gate showed last_alive DOES churn on a real 5s cycle; that case is covered
+    // by the "last_alive CHURNS" test below, which this one originally missed.
     await registerAgent("etag-stable-agent");
     const a = await snap();
     expect(a.status).toBe(200);
     const b = await snap();
-    expect(b.etag).toBe(a.etag); // still stable once content exists
+    expect(b.etag).toBe(a.etag); // stable once content exists AND nothing is churning
     const conditional = await snap({ "If-None-Match": a.etag! });
     expect(conditional.status).toBe(304);
   });
@@ -147,5 +152,44 @@ describe("v2.24.0 — /api/snapshot ETag + Date caching (lumen contract)", () =>
     expect(parsed.timestamp).toBeUndefined();
     expect(parsed).toHaveProperty("agents");
     expect(parsed).toHaveProperty("content_visibility");
+  });
+
+  // v2.24.0 reopened (lumen re-measure over 60s): `last_alive` is a genuine
+  // liveness observation that refreshes on a ~5s probe cycle, so it churns on its
+  // own cadence. It must be excluded from the ETag INPUT (but stay in the body).
+  // The prior "stability with agents" test passed for the WRONG reason — test
+  // agents were never liveness-probed, so last_alive never moved. These drive it.
+  it("HARM: an agent whose last_alive CHURNS between polls still yields the SAME ETag (last_alive excluded from ETag input) — and the served body genuinely differs", async () => {
+    await registerAgent("liveness-churn-agent");
+    const base = Date.now();
+    _setPositiveProbeForTests("liveness-churn-agent", base - 2000); // last_alive = 2s ago (fresh)
+    const p1 = await snap();
+    _setPositiveProbeForTests("liveness-churn-agent", base - 1000); // last_alive = 1s ago — CHANGED
+    const p2 = await snap();
+
+    // The churn is real: last_alive genuinely moved and the raw bodies differ...
+    const la = (t: string) =>
+      JSON.parse(t).agents.find((a: { name?: string }) => a.name === "liveness-churn-agent")?.last_alive;
+    expect(la(p1.bodyText)).toBeTruthy();
+    expect(la(p2.bodyText)).toBeTruthy();
+    expect(la(p2.bodyText)).not.toBe(la(p1.bodyText)); // last_alive changed
+    expect(p2.bodyText).not.toBe(p1.bodyText); // the served bodies differ
+
+    // ...yet the ETag is STABLE. This assertion is the negative control inline: if
+    // last_alive were NOT excluded from the ETag input, the ETag would be over the
+    // full (differing) body and p2.etag !== p1.etag would FAIL here.
+    expect(p2.etag).toBe(p1.etag);
+    // and a conditional GET still 304s despite last_alive having moved:
+    const c = await snap({ "If-None-Match": p1.etag! });
+    expect(c.status).toBe(304);
+  });
+
+  it("INNOCENT TWIN: a substantive change (new agent) still yields a DIFFERENT ETag even though last_alive is excluded", async () => {
+    _setPositiveProbeForTests("liveness-churn-agent", Date.now() - 500); // keep last_alive churning
+    const before = await snap();
+    await registerAgent("substantive-after-churn-agent"); // substantive change
+    const after = await snap({ "If-None-Match": before.etag! });
+    expect(after.status).toBe(200); // NOT 304 — a real change must still miss
+    expect(after.etag).not.toBe(before.etag);
   });
 });

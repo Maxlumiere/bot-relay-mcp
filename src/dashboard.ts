@@ -327,10 +327,32 @@ export function snapshotApi(req: Request, res: Response): void {
       dashboard_prefs: dashboardPrefs,
     };
     const payload = JSON.stringify(bodyObj);
-    // Strong ETag over the STABLE body — base64url of a SHA-256. Computed
-    // explicitly (not via Express's `etag` app setting) so the 304 contract is
-    // deterministic and directly testable.
-    const etag = `"${createHash("sha256").update(payload).digest("base64url")}"`;
+    // Strong ETag over a STABLE PROJECTION of the body — base64url of a SHA-256,
+    // computed explicitly (not via Express's `etag` app setting) so the 304
+    // contract is deterministic and directly testable.
+    //
+    // The ETag must cover SUBSTANTIVE state only. Per-agent `last_alive` is a
+    // genuine liveness observation on a ~5-second probe cycle
+    // (`positiveConfirmationISO`, src/db.ts — it refreshes on each positive probe
+    // and nulls out after `LIVENESS_PROBE_CACHE_MS`), so it legitimately changes
+    // ~every 5s on its own cadence. That is NOT substantive change for caching:
+    // if it fed the ETag the body would rehash every few seconds and the 304 path
+    // would stay dead (measured: with only `timestamp` excluded, 13 distinct
+    // bodies across 25 polls / 60s; excluding `last_alive` too → 1). So
+    // `last_alive` is excluded from the ETag INPUT — but it STAYS in the sent body
+    // (`payload` above), because it is real data lumen's board consumes. This is
+    // an ETag-input exclusion, NOT a field removal: do NOT "fix" it by dropping
+    // `last_alive` from the body — that would repeat the `timestamp` treatment on
+    // a field that is meant to be served.
+    const etagInput = {
+      ...bodyObj,
+      agents: bodyObj.agents.map((a) => {
+        const rest = { ...(a as Record<string, unknown>) };
+        delete rest.last_alive;
+        return rest;
+      }),
+    };
+    const etag = `"${createHash("sha256").update(JSON.stringify(etagInput)).digest("base64url")}"`;
     // Server-now in the `Date` header — present on BOTH the 200 and the 304, so
     // a cache HIT still delivers an authoritative clock (the whole point of the
     // header-not-body split). Set explicitly so a 304 is never clock-less.
