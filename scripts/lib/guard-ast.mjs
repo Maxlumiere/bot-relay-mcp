@@ -77,11 +77,27 @@
  *   • anonymous functions with no stable name (IIFEs, inline callbacks) — there
  *     is nothing to name in a violation, and a mutator you cannot name is not a
  *     maintainable finding. A must-call mutator is expected to be a named unit.
- *   • the body scan descends INTO nested functions, so a required call anywhere
- *     in the unit (including a nested closure) counts — this matches the v1
- *     text behaviour and is the over-triggering (safe) direction; per-branch /
- *     reachability placement is deliberately NOT checked here (a guard cannot;
- *     the behavioural tests assert the actual runtime property).
+ *   • bodyCallsFunction counts a call only in the unit's OWN body, NOT inside a
+ *     nested function unit (arrow / fn-expression / method / accessor /
+ *     constructor). A required call in a NEVER-INVOKED closure (`const onSuccess
+ *     = () => requiredCall()`) is that closure's, not this unit's — counting it
+ *     would UNDER-detect, the only dangerous direction (a wired-but-uncalled
+ *     handler reads as working code, worse than a TODO). So the scan stops at
+ *     function boundaries. It does NOT stop at blocks / if / try / loops /
+ *     switch — those are the SAME execution unit, so a call inside an `if` or
+ *     `try` still counts; stopping there would break every honest function that
+ *     registers conditionally (the innocent twin).
+ *   • ACCEPTED OVER-FLAG (safe, named not discovered): an immediately-invoked
+ *     function expression genuinely runs, but is skipped like any function node,
+ *     so an IIFE doing the required call reads as absent → the guard OVER-flags
+ *     → a loud false failure, fixable with an allowlist comment. Deliberately no
+ *     bespoke IIFE detection — added machinery buys rarer correctness for a new
+ *     place to be subtly wrong, and this already fails safe.
+ *   • ACCEPTED RISK, honestly labelled (NOT "over-trigger safe" — it is
+ *     under-detection we choose not to close here): REACHABILITY within a unit
+ *     is not verified. A call in `if (false)` or an unreachable branch still
+ *     counts, so the guard proves the call is PRESENT in the own-body, not that
+ *     it runs on every path. Runtime-path coverage is the behavioural tests' job.
  *
  * ── bodyCallsFunction — what resolves, and the boundary that does NOT ─────────
  * RESOLVES a CallExpression whose callee is:
@@ -183,6 +199,18 @@ function collectDirectAliases(bodyNode, names) {
  * @param {ts.SourceFile} _sf  (kept for signature symmetry / future position use)
  * @param {Set<string>} names  callee names that count as "the required/trigger call"
  */
+function isFunctionNode(n) {
+  return (
+    ts.isFunctionDeclaration(n) ||
+    ts.isFunctionExpression(n) ||
+    ts.isArrowFunction(n) ||
+    ts.isMethodDeclaration(n) ||
+    ts.isGetAccessorDeclaration(n) ||
+    ts.isSetAccessorDeclaration(n) ||
+    ts.isConstructorDeclaration(n)
+  );
+}
+
 export function bodyCallsFunction(bodyNode, _sf, names) {
   const aliases = collectDirectAliases(bodyNode, names);
   const isTarget = (n) => names.has(n) || aliases.has(n);
@@ -202,7 +230,19 @@ export function bodyCallsFunction(bodyNode, _sf, names) {
         found = true;
       }
     }
-    if (!found) ts.forEachChild(node, visit);
+    if (found) return;
+    // Descend, but NOT into a nested function unit. A call inside a nested
+    // closure belongs to THAT unit's execution, not this one's, and may never be
+    // invoked (a wired-but-uncalled `const onSuccess = () => requiredCall()`).
+    // Counting it here would UNDER-detect — the only dangerous direction. The
+    // nested unit is analysed separately by forEachFunctionUnit. (Erring the
+    // other way — a required call genuinely made inside an invoked callback, e.g.
+    // `arr.forEach(x => requiredCall(x))` — is NOT counted and OVER-flags, which
+    // is the safe direction for a must-call guard.)
+    ts.forEachChild(node, (child) => {
+      if (found || isFunctionNode(child)) return;
+      visit(child);
+    });
   };
   visit(bodyNode);
   return found;

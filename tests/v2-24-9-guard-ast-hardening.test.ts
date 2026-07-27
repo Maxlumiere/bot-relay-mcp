@@ -100,3 +100,28 @@ describe("v2.24.9 auth-gen-guard — structural bump detection closes the same e
     expect(findAuthGenViolations(`function rotate(n, h){ ${MUT} bumpAuthGeneration(); }`, "t.ts")).toEqual([]);
   });
 });
+
+describe("v2.24.9 nested-function boundary (Victra's never-invoked-callback refutation)", () => {
+  const MUT = `db.prepare("UPDATE agents SET token_hash = ? WHERE name = ?").run(h, name);`;
+  const names = (src: string) => findAuthGenViolations(src, "t.ts").map((v: { name: string }) => v.name);
+
+  it("UNDER-DETECTION CLOSED: a bump inside a NEVER-INVOKED callback is FLAGGED (v1 counted it → auth bypass on a token that never registers)", () => {
+    expect(names(`function rotate(name, h){ ${MUT} const onSuccess = () => bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("INNOCENT TWIN: a bump inside an `if` block still PASSES — same execution unit, not a function boundary", () => {
+    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} if (ok) { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
+  });
+
+  it("INNOCENT TWIN: a bump inside `try` still PASSES (breaking this would fail every honest conditional register)", () => {
+    expect(findAuthGenViolations(`function rotate(name, h){ try { ${MUT} bumpAuthGeneration(); } catch (e) {} }`, "t.ts")).toEqual([]);
+  });
+
+  it("ACCEPTED OVER-FLAG (safe, documented): an IIFE doing the bump reads as absent → FLAGGED (allowlist is the remedy; no bespoke IIFE detection by design)", () => {
+    expect(names(`function rotate(name, h){ ${MUT} (() => bumpAuthGeneration())(); }`)).toContain("rotate");
+  });
+
+  it("ACCEPTED RISK (labelled, NOT 'safe'): reachability within a unit is not checked — an if(false) bump still passes; runtime paths are the behavioural tests' job", () => {
+    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} if (false) { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
+  });
+});
