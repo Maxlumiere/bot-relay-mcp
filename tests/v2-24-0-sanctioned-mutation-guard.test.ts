@@ -248,13 +248,50 @@ describe("#143 P1 hardening — codex's EXECUTED bypasses (each red against the 
     expect(execFlagged("CREATE TRIGGER t AFTER INSERT ON u BEGIN DELETE FROM messages; END")).toBe(false);
   });
 
-  // ── KNOWN, DOCUMENTED over-flag (P2 / SQL-sink follow-up) — asserted so the ──
-  //    suite is honest about the boundary the header states, not silent about it.
-  it("KNOWN over-flag (deferred to the SQL-sink follow-up): a diagnostic PROSE constant IS flagged", () => {
+  // ── BAR 4 — the PROSE false positive, ACCEPTED + STATED (codex bar 4). Not a
+  //    "deferred" limitation — a DECIDED, documented over-block. Both "fixes" are
+  //    worse: a hand-rolled continuation grammar UNDER-blocks silently (`IS` is a
+  //    SQL keyword, so "…agents is forbidden" defeats a next-token check = a false
+  //    NEGATIVE, the dangerous direction), and a db.prepare() validator puts a live
+  //    SQL engine in the lint script. ADR-0015 direction-of-failure: a loud safe
+  //    over-block with an escape beats a silent under-block. Covered BOTH ways:
+  it("BAR4 — a benign PROSE constant that lexes as a mutation IS flagged (the ACCEPTED, documented over-block)", () => {
     const prose = `export const MSG = "DELETE FROM agents is forbidden; call teardownAgent instead";`;
-    // Over-flag is the SAFE direction; the SQL-sink constraint (only literals that
-    // reach prepare/exec/run) is the tracked cure. This test PINS the current
-    // behaviour so a future SQL-sink PR flips it deliberately, not by accident.
+    // SQLite rejects this text as a syntax error, but the guard classifies by
+    // structure. Over-flag is the SAFE direction; this pins the accepted behaviour.
     expect((findSanctionedMutationViolations(prose, "src/transport/http.ts") as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it("BAR4 ESCAPE — the same prose string with a reason-bearing `// ALLOWLIST:` PASSES", () => {
+    // The documented escape for a legitimate string that trips the FP: route via
+    // db.ts, OR acknowledge it with a real reason. This makes the accepted
+    // over-block livable rather than a wall.
+    const prose = `export const MSG = "DELETE FROM agents is forbidden; call teardownAgent instead"; // ALLOWLIST: diagnostic message, not executed SQL`;
+    expect(findSanctionedMutationViolations(prose, "src/transport/http.ts")).toEqual([]);
+  });
+
+  // ── BAR 5 — allowlist authority: a trivial reason no longer exempts, and every
+  //    exemption is emitted (kills "detectable only by a human noticing the diff").
+  it("BAR5 — a TRIVIAL allowlist reason does NOT exempt; a real one exempts AND is recorded for emission", () => {
+    // codex T5: `// ALLOWLIST: x` (a single throwaway token) must not authorize —
+    // the 1-char escape was the pre-existing weakness.
+    const trivial = `
+      export function raw(db: any, name: string) {
+        db.prepare("DELETE FROM agents WHERE name = ?").run(name); // ALLOWLIST: x
+      }`;
+    expect(
+      (findSanctionedMutationViolations(trivial, "src/cli/recover.ts") as unknown[]).length,
+      "trivial reason must NOT exempt",
+    ).toBeGreaterThan(0);
+
+    // A real reason exempts AND is COLLECTED for emission (main() prints each).
+    const real = `
+      export function raw(db: any, name: string) {
+        db.prepare("DELETE FROM agents WHERE name = ?").run(name); // ALLOWLIST: legacy teardown path, see #143
+      }`;
+    const allowlisted: Array<{ line: number; reason: string }> = [];
+    expect(findSanctionedMutationViolations(real, "src/cli/recover.ts", { allowlisted })).toEqual([]);
+    expect(allowlisted.length, "the exemption is recorded for emission").toBe(1);
+    expect(allowlisted[0].reason).toMatch(/legacy teardown/);
   });
 });
