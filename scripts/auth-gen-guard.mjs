@@ -51,6 +51,7 @@ import ts from "typescript";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { forEachFunctionUnit, bodyCallsFunction } from "./lib/guard-ast.mjs";
 
 const SENSITIVE_COLS = [
   "token_hash",
@@ -75,7 +76,12 @@ const SELF_BUMPERS = new Set(["bumpAuthGeneration", "applyAuthStateTransition"])
 // (and only if it is genuinely init-only). Today only V2_1 backfills auth_state
 // (on token_hash IS NULL rows, which can't have a positive cache entry).
 const INIT_ONLY_ALLOWLIST = new Set(["migrateSchemaToV2_1"]);
-const BUMP_CALL_RE = /\b(?:bumpAuthGeneration|applyAuthStateTransition)\s*\(/;
+// The required-bump call names — a validity mutator satisfies the invariant by
+// calling EITHER (applyAuthStateTransition bumps internally). Detected
+// STRUCTURALLY via bodyCallsFunction (a resolved CallExpression), NOT a regex
+// over body text: a `// bumpAuthGeneration()` comment or a matching string can
+// no longer satisfy it (the codex refutation of the copied regex-over-body
+// shape). SELF_BUMPERS IS exactly this set of sanctioned calls.
 
 /** Does this function body perform a validity-changing agents mutation? */
 function hasValidityChangingMutation(bodyText) {
@@ -97,57 +103,30 @@ function hasValidityChangingMutation(bodyText) {
  * Analyze source text; return an array of { name, line } for functions that
  * mutate token/auth validity but do not bump the generation. Exported so the
  * negative-fixture test can prove the guard FAILS on an omitted bump.
+ *
+ * v2.24 hardening — the required-bump check is now STRUCTURAL (bodyCallsFunction,
+ * a resolved CallExpression) via the shared scripts/lib/guard-ast.mjs, closing
+ * the comment / alias / class-field evasions codex found in the copied
+ * regex-over-body-text shape. Node coverage also widened (class fields,
+ * accessors, constructors — see forEachFunctionUnit). The SQL TRIGGER
+ * (hasValidityChangingMutation) stays a TEXT match BY DESIGN: it OVER-triggers on
+ * a comment that merely mentions the SQL, which is the SAFE direction (a false
+ * demand-to-bump, never a missed one) — see the direction-of-failure note in
+ * guard-ast.mjs. Do not "tighten" that half and call the guard fixed.
  */
 export function findAuthGenViolations(source, fileName = "db.ts") {
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const violations = [];
-
-  // Analyze one NAMED function unit (declaration / arrow / function-expression /
-  // method): if its body performs a validity-changing agents mutation it MUST
-  // bump, unless it is a self-bumper or an explicit init-only migration.
-  const analyze = (name, bodyNode, nameNode) => {
+  forEachFunctionUnit(sf, (name, bodyNode, nameNode) => {
     if (!name || SELF_BUMPERS.has(name) || INIT_ONLY_ALLOWLIST.has(name)) return;
     const bodyText = bodyNode.getText(sf);
-    if (hasValidityChangingMutation(bodyText) && !BUMP_CALL_RE.test(bodyText)) {
+    // TRIGGER: text (over-trigger-safe). REQUIRED CALL: structural (a real
+    // CallExpression to bumpAuthGeneration / applyAuthStateTransition or a direct
+    // local alias) — comments and strings are structurally incapable of it.
+    if (hasValidityChangingMutation(bodyText) && !bodyCallsFunction(bodyNode, sf, SELF_BUMPERS)) {
       violations.push({ name, line: sf.getLineAndCharacterOfPosition(nameNode.getStart(sf)).line + 1 });
     }
-  };
-
-  const visit = (node) => {
-    // 1. function NAME(...) { ... }
-    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
-      analyze(node.name.text, node.body, node.name);
-    }
-    // 2. const NAME = (...) => { ... }  /  const NAME = function (...) { ... }
-    //    (the arrow / function-expression evasion codex constructed)
-    else if (
-      ts.isVariableDeclaration(node) &&
-      node.name &&
-      ts.isIdentifier(node.name) &&
-      node.initializer &&
-      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer)) &&
-      node.initializer.body
-    ) {
-      analyze(node.name.text, node.initializer.body, node.name);
-    }
-    // 3. class/object method NAME(...) { ... }
-    else if (ts.isMethodDeclaration(node) && node.name && ts.isIdentifier(node.name) && node.body) {
-      analyze(node.name.text, node.body, node.name);
-    }
-    // 4. { NAME: (...) => { ... } }  object-literal property holding a function
-    else if (
-      ts.isPropertyAssignment(node) &&
-      node.name &&
-      ts.isIdentifier(node.name) &&
-      node.initializer &&
-      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer)) &&
-      node.initializer.body
-    ) {
-      analyze(node.name.text, node.initializer.body, node.name);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
+  });
   return violations;
 }
 
