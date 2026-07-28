@@ -6,17 +6,19 @@
   VERSION: 2.24.0, locked by Maxime this session. Strict semver would make this a
   MAJOR (3.0.0) because #142 is a breaking change, but a major bump signals a
   rewrite to anyone browsing npm and this is a hardening release, not that — so
-  2.24.0 WITH the loud upgrade note below. DRAFT — not yet released; this PR stays
-  not-for-merge until the release is cut.
+  2.24.0 WITH the loud upgrade note below. This is the RELEASE PR: content is final
+  and package.json is bumped to 2.24.0 — ready to cut once merged + published.
 -->
 
-Twelve merges since 2.23.0. The spine is a security cluster: operator power can no
+Sixteen merges since 2.23.0. The spine is a security cluster: operator power can no
 longer be inferred from being on the box, the dashboard no longer hands message
-content to unauthenticated callers, and the orchestrator no longer loses work to
-a dead agent or a stale daemon. The rest harden the tooling around the release —
-one shared structural detector for the must-call guards, a network deadline that
-covers the whole exchange, and a build-time guard against an accidental
-production-tree deploy.
+content to unauthenticated callers, the orchestrator no longer loses work to a dead
+agent or a stale daemon, and the diagnostic traffic recorder no longer captures live
+tokens. The rest harden the tooling around the release — one shared structural
+detector for the must-call guards, a network deadline that covers the whole
+exchange, a build-time guard against an accidental production-tree deploy, a
+config-path fix so `init` and the daemon agree, and cacheable snapshot output for
+the fleet board.
 
 ### ⚠️ BREAKING — the operator dashboard now requires a secret (one action needed on upgrade)
 
@@ -82,6 +84,11 @@ network position plus a transport secret, not from an operator identity. ADR-000
   operator-invoked **`relay restart`** (with `--dry-run` to preview) applies it. It
   never auto-restarts — bouncing a shared daemon mid-session is the operator's
   call.
+- **Token redaction — the traffic recorder no longer leaks secrets (#145).** The
+  diagnostic traffic recorder could write agent tokens (and other secret values)
+  verbatim into its capture. A central **redact-by-value registry** now scrubs known
+  secret values from recorded traffic, so a captured exchange cannot expose a live
+  credential.
 
 ### Fixed
 
@@ -102,6 +109,15 @@ network position plus a transport secret, not from an operator identity. ADR-000
   unbounded, so a peer that accepted the request and then stalled mid-body could
   hang the caller indefinitely. The deadline now covers the entire request→response
   exchange, so a stalled peer fails fast instead of hanging.
+- **`relay init` writes config to the daemon's RESOLVED path (#153, P1).** `init`
+  wrote `config.json` to the flat default location instead of the per-instance path
+  the running daemon actually resolves, so a configured setting could silently land
+  where the daemon never reads it. `init` now writes to the resolved path, so config
+  and daemon agree.
+- **Tether surfaces a no-delivery condition to a human, not an 8-second blip (#154,
+  Tether #3).** When a wake or message failed to deliver, Tether showed only a
+  transient ~8s status-bar note that was easy to miss; the condition is now surfaced
+  persistently, so a human actually sees that delivery did not happen.
 
 ### Internal / hardening
 
@@ -129,6 +145,11 @@ network position plus a transport secret, not from an operator identity. ADR-000
   silently overwrites the `dist` the daemon and the whole stdio fleet load — unless
   `RELAY_ALLOW_PROD_BUILD=1`. Positive-match only, so CI checkouts and throwaway
   worktrees build freely; repo/dev tooling only (excluded from the npm package).
+- **Stable snapshot body + ETag/Date caching for `/api/snapshot` (#152):** the
+  dashboard snapshot endpoint now emits a stable body with `ETag`/`Date`, so a
+  polling consumer (the lumen fleet board) can cache and conditionally re-fetch
+  (304) instead of re-pulling the full snapshot every tick. `last_alive` is excluded
+  from the ETag input so a liveness-only heartbeat does not churn the cache.
 
 ## v2.23.0 — 2026-07-25 — Config-clobber closed, orchestration-anchor safety, DX + a HIGH dependency advisory
 
