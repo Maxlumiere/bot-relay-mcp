@@ -40,7 +40,8 @@ import { withDeadline } from "../http-deadline.js";
 import { execFileSync } from "child_process";
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
-import { createInstance, generateInstanceId } from "../instance.js";
+import { createInstance, generateInstanceId, resolveActiveInstanceId } from "../instance.js";
+import { getConfigPath } from "../config.js";
 import {
   readJsonSafe,
   atomicWriteJson,
@@ -409,14 +410,35 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
   }
 
   // Resolve the active instance_id + config path.
+  //
+  // P1 (2026-07): init MUST write the config to the SAME path the daemon
+  // RESOLVES, or a secret it writes is invisible to the running daemon while init
+  // still reports success (the dashboard_secret-not-read defect on an
+  // instance-scoped install). The daemon resolves via getConfigPath() →
+  // RELAY_CONFIG_PATH, then the ~/.bot-relay/active-instance symlink, then the
+  // flat legacy path. The pre-fix code defaulted to the FLAT path unless
+  // --instance-id / --multi-instance was passed, so a plain `relay init` on a
+  // machine with an active-instance symlink wrote a config the daemon never read.
+  // One predicate for both sides (ADR-0015 L4).
   let effectiveInstanceId: string | null = null;
-  if (args.instanceId) effectiveInstanceId = args.instanceId;
-  else if (args.multiInstance) effectiveInstanceId = generateInstanceId();
-  let configPath = defaultConfigPath();
+  let configPath: string;
   let perInstanceDir: string | null = null;
-  if (effectiveInstanceId) {
+  if (args.instanceId || args.multiInstance) {
+    // Explicit: CREATE / target a specific instance. This branch scaffolds the
+    // instance dir below (createInstance) and owns its config path.
+    effectiveInstanceId = args.instanceId ?? generateInstanceId();
     perInstanceDir = path.join(defaultBotRelayDir(), "instances", effectiveInstanceId);
     configPath = path.join(perInstanceDir, "config.json");
+  } else {
+    // No explicit flag: reconcile the ACTIVE install exactly as the daemon sees
+    // it. getConfigPath() honours the active-instance symlink, so init lands in
+    // the instance dir the daemon actually reads (or the flat path when there is
+    // no active instance). effectiveInstanceId is captured for messaging + the
+    // write-target check below; perInstanceDir stays null — the instance dir
+    // already exists (getConfigPath only resolves to one that does), so we do NOT
+    // re-scaffold it.
+    configPath = getConfigPath();
+    effectiveInstanceId = resolveActiveInstanceId();
   }
 
   const existingConfig = readJsonSafe(configPath);
@@ -444,7 +466,16 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
       transport = await promptWithDefault(rl, "Transport (stdio/http/both)", transport);
       const portStr = await promptWithDefault(rl, "HTTP port", String(port));
       port = parseInt(portStr, 10) || 3777;
-      const secAns = await rl.question(`HTTP secret (ENTER = none — 127.0.0.1 is local-trusted; set one only for a non-loopback bind): `);
+      // v2.24 P1: this is the TRANSPORT secret (agent messaging). A 127.0.0.1
+      // bind is loopback-safe for TRANSPORT without one (assertBindSafety) — but
+      // ADR-0006 retired "local is trusted" for OPERATOR actions: the dashboard /
+      // operator endpoints ALWAYS require the separate dashboard_secret (generated
+      // below), loopback or not. The prompt must not imply blanket local trust.
+      const secAns = await rl.question(
+        `HTTP transport secret (ENTER = none — a loopback bind needs none for agent transport; ` +
+          `operator/dashboard auth is a SEPARATE, always-required secret set up automatically. ` +
+          `Set this only for a non-loopback / team bind): `,
+      );
       if (secAns.trim()) secret = secAns.trim();
     } finally {
       rl.close();
@@ -551,6 +582,78 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
         `   Present via \`Authorization: Bearer <secret>\`, \`?auth=<secret>\`, or the\n` +
         `   \`relay_dashboard_auth\` cookie. Override with RELAY_DASHBOARD_SECRET.\n\n`,
     );
+  }
+
+  const explicitInstance = !!(args.instanceId || args.multiInstance);
+
+  // ---- P1 env-only-instance guard: init resolved the FLAT config, but if
+  // instances/ exist with no active-instance symlink, a daemon launched with
+  // RELAY_INSTANCE_ID in its ENV is reading an instance config this shell cannot
+  // discover (getConfigPath has no env here). Rather than silently write a flat
+  // config the daemon ignores, WARN. When a symlink DOES exist, getConfigPath
+  // already resolved to the instance above — this only fires on the env-only gap.
+  if (
+    !explicitInstance &&
+    !process.env.RELAY_CONFIG_PATH &&
+    path.resolve(configPath) === path.resolve(defaultConfigPath())
+  ) {
+    let instanceDirs: string[] = [];
+    try {
+      instanceDirs = fs
+        .readdirSync(path.join(defaultBotRelayDir(), "instances"), { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+    } catch {
+      /* no instances/ dir → none */
+    }
+    if (instanceDirs.length > 0) {
+      process.stdout.write(
+        `\n⚠️  Wrote the FLAT config, but instance dir(s) exist (${instanceDirs.join(", ")}) with no ` +
+          `active-instance symlink. A daemon launched with RELAY_INSTANCE_ID set reads an instance config ` +
+          `this write will NOT reach. Run \`relay use-instance <id>\` to set the symlink, then re-run init.\n`,
+      );
+    }
+  }
+
+  // ---- P1 verify-after-write: is the config we wrote the one the daemon READS?
+  // Writing a credential and printing success WITHOUT confirming it is readable
+  // at the daemon's resolved path is the exact defect this closes (init wrote the
+  // flat path, the instance-scoped daemon read elsewhere, success printed). We
+  // verify at the FILESYSTEM — the path the daemon reads on its NEXT start — not
+  // against the running daemon, which loads config only at boot and would
+  // false-alarm on a correct write until it is restarted.
+  const daemonResolvedPath = getConfigPath();
+  const sameAsDaemon = path.resolve(daemonResolvedPath) === path.resolve(configPath);
+  if (httpEnabled) {
+    const readback = readJsonSafe(daemonResolvedPath) as Record<string, unknown> | null;
+    const secretReadable =
+      sameAsDaemon &&
+      readback !== null &&
+      typeof readback.dashboard_secret === "string" &&
+      (readback.dashboard_secret as string).length >= 32;
+    if (!secretReadable) {
+      if (!explicitInstance) {
+        // The common `relay init`: configPath IS getConfigPath() by construction,
+        // so a miss here means the write genuinely did not land — never a benign
+        // "different instance". Fail loud; do NOT let the success line stand.
+        process.stderr.write(
+          `\n✗ VERIFY FAILED: wrote ${configPath}, but the daemon's dashboard_secret is not readable at ` +
+            `its resolved path ${daemonResolvedPath}. Operator actions would 401. The write did not land as ` +
+            `expected — do NOT trust the success line above.\n`,
+        );
+        return 1;
+      }
+      // Explicit --instance-id / --multi-instance: configuring a NON-active
+      // instance is legitimate (set up now, activate later). Not fatal — but say
+      // plainly the running daemon will not read it until it is made active.
+      process.stdout.write(
+        `\n⚠️  Not the ACTIVE instance: the daemon resolves ${daemonResolvedPath}, not ${configPath}. ` +
+          `The dashboard_secret set here will NOT take effect until you run ` +
+          `\`relay use-instance ${effectiveInstanceId}\` and restart the daemon.\n`,
+      );
+    } else {
+      process.stdout.write(`✓ verified: the daemon resolves this config at ${daemonResolvedPath}\n`);
+    }
   }
 
   if (args.configOnly) {
