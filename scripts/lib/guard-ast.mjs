@@ -99,19 +99,63 @@
  *     counts, so the guard proves the call is PRESENT in the own-body, not that
  *     it runs on every path. Runtime-path coverage is the behavioural tests' job.
  *
+ * ── EVERY PASS THAT WALKS A BODY, AND ITS SCOPING RULE (keep this current) ────
+ * Two passes over one body applying two different answers to "where does this
+ * unit end" is not an edge case — it is the defect that shipped in round 1 of
+ * this fix and it is why #151 failed audit. So the rule is enumerated here, and
+ * the two passes that need the SAME rule now share ONE implementation rather
+ * than agreeing by inspection (ADR-0015 L4 — one predicate, one site):
+ *
+ *   1. forEachFunctionUnit (visit)  — scope: THE WHOLE FILE, no boundary.
+ *      Deliberately descends into nested functions: every named unit must be
+ *      found, because each is analysed on its own. Different job, different
+ *      rule, and that difference is correct.
+ *   2. forEachOwnBodyNode           — scope: ONE EXECUTION UNIT. Descends
+ *      through blocks / if / try / loops / switch; STOPS at nested function
+ *      units. This is the only "this unit's body" rule in the file.
+ *        ├─ collectUnitBindings uses it (which names are bound here)
+ *        └─ bodyCallsFunction  uses it (which calls happen here)
+ *      They cannot drift apart because there is nothing to keep in sync.
+ *
+ * If you add a third pass that reasons about a unit's body, route it through
+ * forEachOwnBodyNode or state here why it needs a different rule.
+ *
  * ── bodyCallsFunction — what resolves, and the boundary that does NOT ─────────
  * RESOLVES a CallExpression whose callee is:
- *   • a direct Identifier in the name set                 requiredCall()
- *   • a property access ending in a name in the set       x.requiredCall()
- *   • a DIRECT local alias: `const a = <name>` then a()    (codex (b))
- * DOES NOT resolve (open boundary — indirection ≈ obfuscation, outside the
- * ACCIDENTAL-DRIFT threat model this guard defends; I will not imply totality):
- *   • reassignment (`let a = other; a = requiredCall; a()`)
+ *   • a direct Identifier in the name set, NOT locally shadowed  requiredCall()
+ *   • a property access ending in a name in the set              x.requiredCall()
+ *   • a local alias bound EXACTLY ONCE in this unit by a `const` initialised to
+ *     a name in the set: `const a = requiredCall` then `a()`     (codex (b))
+ * REFUSED — these look like the required call and are NOT counted, so the guard
+ * OVER-flags (loud false failure, the safe direction):
+ *   • an alias whose name is bound more than once in the unit (a shadow — we
+ *     cannot say which binding `a()` resolves to)
+ *   • a `let`/`var` alias. `const` is not a style preference here: it makes
+ *     reassignment a COMPILE error, so `let a = requiredCall; a = other; a()`
+ *     is structurally impossible to satisfy the guard rather than being
+ *     detected after the fact. Structure over policing.
+ *   • a call to a target name that is itself locally bound — a parameter, const,
+ *     function declaration, catch variable or destructured name shadowing
+ *     `requiredCall` means the call may not be the imported one.
+ *   • an alias spelling appearing as a PROPERTY (`unrelated.finish()`). A local
+ *     binding says nothing about an object's property.
  *   • the function passed as a callback / argument and invoked elsewhere
  *   • destructured (`const { requiredCall } = mod`) or dynamically-accessed
  *     (`mod["requiredCall"]()`) references
- * Anyone splitting a reference across those forms to evade the guard is not
- * drifting by accident, and would add the allowlist comment anyway.
+ *
+ * ⚠ ROUND 1 SHIPPED A DOC NOTE THAT WAS FALSE — do not restore it. It listed
+ * reassignment under "does not resolve," implying safety. Reassignment did not
+ * fail to resolve; it resolved WRONGLY and PASSED the guard. A comment asserting
+ * an invariant the code does not hold is worse than no comment: it retires the
+ * question. If you add a boundary here, prove which direction it errs with an
+ * executed fixture, and pin it.
+ *
+ * ── PARAMETERS REQUIRE PARENT LINKS ──────────────────────────────────────────
+ * A unit's parameters are not inside its body node, so they are reached via
+ * bodyNode.parent. bodyCallsFunction THROWS if that link is missing rather than
+ * proceeding blind — without it a parameter shadowing a target name is invisible
+ * and the guard silently under-detects. Create SourceFiles with
+ * setParentNodes = true (both shipped call sites do).
  */
 import ts from "typescript";
 
@@ -169,36 +213,6 @@ export function forEachFunctionUnit(sf, cb) {
   visit(sf);
 }
 
-/** Collect DIRECT local aliases of any name in `names`: `const a = <name>`. */
-function collectDirectAliases(bodyNode, names) {
-  const aliases = new Set();
-  const walk = (node) => {
-    if (
-      ts.isVariableDeclaration(node) &&
-      node.name &&
-      ts.isIdentifier(node.name) &&
-      node.initializer &&
-      ts.isIdentifier(node.initializer) &&
-      names.has(node.initializer.text)
-    ) {
-      aliases.add(node.name.text);
-    }
-    ts.forEachChild(node, walk);
-  };
-  walk(bodyNode);
-  return aliases;
-}
-
-/**
- * Structurally decide whether `bodyNode` contains a CallExpression to any name
- * in `names` (or a direct local alias of one). Comments and string literals are
- * not CallExpression nodes and therefore cannot satisfy this. See the boundary
- * note above for the indirection cases this does not resolve.
- *
- * @param {ts.Node} bodyNode  the function body to scan
- * @param {ts.SourceFile} _sf  (kept for signature symmetry / future position use)
- * @param {Set<string>} names  callee names that count as "the required/trigger call"
- */
 function isFunctionNode(n) {
   return (
     ts.isFunctionDeclaration(n) ||
@@ -211,39 +225,145 @@ function isFunctionNode(n) {
   );
 }
 
-export function bodyCallsFunction(bodyNode, _sf, names) {
-  const aliases = collectDirectAliases(bodyNode, names);
-  const isTarget = (n) => names.has(n) || aliases.has(n);
-
-  let found = false;
-  const visit = (node) => {
-    if (found) return;
-    if (ts.isCallExpression(node)) {
-      const callee = node.expression;
-      if (ts.isIdentifier(callee) && isTarget(callee.text)) {
-        found = true;
-      } else if (
-        ts.isPropertyAccessExpression(callee) &&
-        ts.isIdentifier(callee.name) &&
-        isTarget(callee.name.text)
-      ) {
-        found = true;
-      }
-    }
-    if (found) return;
-    // Descend, but NOT into a nested function unit. A call inside a nested
-    // closure belongs to THAT unit's execution, not this one's, and may never be
-    // invoked (a wired-but-uncalled `const onSuccess = () => requiredCall()`).
-    // Counting it here would UNDER-detect — the only dangerous direction. The
-    // nested unit is analysed separately by forEachFunctionUnit. (Erring the
-    // other way — a required call genuinely made inside an invoked callback, e.g.
-    // `arr.forEach(x => requiredCall(x))` — is NOT counted and OVER-flags, which
-    // is the safe direction for a must-call guard.)
+/**
+ * THE scoping rule, in ONE place. Visits every node of `bodyNode`'s OWN
+ * execution unit: descends through blocks / if / try / loops / switch (same
+ * unit), stops at nested function units (different unit, analysed separately by
+ * forEachFunctionUnit).
+ *
+ * Every pass that reasons about "this unit's body" MUST go through this, or two
+ * passes end up applying two different answers to "where does this unit end" —
+ * which is exactly the defect that shipped in v1 of this fix (the call scan
+ * stopped at function boundaries; the alias pre-pass did not, so an alias
+ * declared in a never-invoked nested function satisfied the outer unit).
+ * Extracted rather than duplicated so the two CANNOT drift apart (ADR-0015 L4).
+ */
+function forEachOwnBodyNode(bodyNode, cb) {
+  const walk = (node) => {
+    cb(node);
     ts.forEachChild(node, (child) => {
-      if (found || isFunctionNode(child)) return;
-      visit(child);
+      if (isFunctionNode(child)) return;
+      walk(child);
     });
   };
-  visit(bodyNode);
+  walk(bodyNode);
+}
+
+/**
+ * Every name BOUND inside this unit (its own parameters + every declaration in
+ * its own body), with a count, plus which of those bindings are `const <a> =
+ * <target>` alias declarations.
+ *
+ * The count is what makes this binding-aware without a TypeChecker: a name bound
+ * exactly once, by a `const` initialised to a target, provably refers to that
+ * target at every position in the unit. Anything else — two bindings (a shadow),
+ * a `let`/`var` (reassignable), a parameter — is ambiguous, and ambiguity must
+ * resolve to NOT-a-call, which OVER-flags. That is the safe direction.
+ */
+function collectUnitBindings(bodyNode, names) {
+  const total = new Map();
+  const constToTarget = new Map();
+  const bump = (m, k) => m.set(k, (m.get(k) ?? 0) + 1);
+
+  const addName = (nameNode) => {
+    if (!nameNode) return;
+    if (ts.isIdentifier(nameNode)) {
+      bump(total, nameNode.text);
+    } else if (ts.isObjectBindingPattern(nameNode) || ts.isArrayBindingPattern(nameNode)) {
+      // `const { requiredCall } = mod` binds the name too — it must count as a
+      // binding (so it shadows), even though it is not a resolvable alias.
+      for (const el of nameNode.elements) if (ts.isBindingElement(el)) addName(el.name);
+    }
+  };
+
+  // The unit's OWN parameters. They are not inside bodyNode, so they are reached
+  // through the parent link — see the setParentNodes requirement in
+  // bodyCallsFunction. A parameter named like a target shadows the import.
+  const fnNode = bodyNode.parent;
+  if (fnNode && isFunctionNode(fnNode) && fnNode.parameters) {
+    for (const p of fnNode.parameters) addName(p.name);
+  }
+
+  forEachOwnBodyNode(bodyNode, (node) => {
+    if (ts.isVariableDeclaration(node)) {
+      addName(node.name);
+      const list = node.parent;
+      const isConst =
+        list && ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0;
+      if (
+        isConst &&
+        ts.isIdentifier(node.name) &&
+        node.initializer &&
+        ts.isIdentifier(node.initializer) &&
+        names.has(node.initializer.text)
+      ) {
+        bump(constToTarget, node.name.text);
+      }
+    } else if (ts.isFunctionDeclaration(node) && node.name) {
+      addName(node.name);
+    } else if (ts.isClassDeclaration(node) && node.name) {
+      addName(node.name);
+    } else if (ts.isCatchClause(node) && node.variableDeclaration) {
+      addName(node.variableDeclaration.name);
+    }
+  });
+
+  // An alias counts only if its name is bound EXACTLY ONCE in this unit and that
+  // one binding is the const-to-target. A second binding of the same name is a
+  // shadow, and we cannot say which one a call resolves to.
+  const aliases = new Set();
+  for (const [name, n] of constToTarget) if (n === 1 && total.get(name) === 1) aliases.add(name);
+
+  // A TARGET name that is itself bound locally (parameter, const, function decl,
+  // catch var, destructure) may resolve to the local, not the import — so a bare
+  // call to it is no longer proof. Do not count it; over-flag instead.
+  const shadowedTargets = new Set();
+  for (const name of names) if ((total.get(name) ?? 0) > 0) shadowedTargets.add(name);
+
+  return { aliases, shadowedTargets };
+}
+
+/**
+ * Structurally decide whether `bodyNode` contains a CallExpression to any name
+ * in `names` (or a direct local alias of one). Comments and string literals are
+ * not CallExpression nodes and therefore cannot satisfy this. See the boundary
+ * note above for the indirection cases this does not resolve.
+ *
+ * @param {ts.Node} bodyNode  the function body to scan
+ * @param {ts.SourceFile} _sf  (kept for signature symmetry / future position use)
+ * @param {Set<string>} names  callee names that count as "the required/trigger call"
+ */
+export function bodyCallsFunction(bodyNode, _sf, names) {
+  // Parameters are reached via bodyNode.parent, so the SourceFile MUST have been
+  // created with setParentNodes = true. Throwing is deliberate: without the
+  // parent link a parameter shadowing a target name would be invisible and the
+  // guard would silently UNDER-detect. A loud failure (the CLI catches this and
+  // exits 2) beats a guard that quietly stops guarding.
+  if (!bodyNode.parent) {
+    throw new Error(
+      "bodyCallsFunction: bodyNode has no parent — create the SourceFile with setParentNodes = true",
+    );
+  }
+  const { aliases, shadowedTargets } = collectUnitBindings(bodyNode, names);
+
+  let found = false;
+  forEachOwnBodyNode(bodyNode, (node) => {
+    if (found || !ts.isCallExpression(node)) return;
+    const callee = node.expression;
+    if (ts.isIdentifier(callee)) {
+      // A bare identifier: the real name (unless locally shadowed) or a proven
+      // single-binding const alias.
+      const n = callee.text;
+      if ((names.has(n) && !shadowedTargets.has(n)) || aliases.has(n)) found = true;
+    } else if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name)) {
+      // `x.requiredCall()`. Matched against the REAL names only — an alias is a
+      // local binding and says nothing about an object's property, so applying
+      // alias spellings here made an unrelated `unrelated.finish()` satisfy the
+      // guard. A local binding cannot shadow a property either, so
+      // shadowedTargets does not apply. Coarse (any receiver counts) and that is
+      // the OVER-flag direction, which is safe.
+      if (names.has(callee.name.text)) found = true;
+    }
+  });
   return found;
 }
