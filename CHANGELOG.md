@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.24.0 — 2026-07-27 — Security hardening: operator auth, dashboard content isolation, orchestration integrity
+## v2.24.0 — 2026-07-28 — Security hardening: operator auth, dashboard content isolation, orchestration integrity
 
 <!--
   VERSION: 2.24.0, locked by Maxime this session. Strict semver would make this a
@@ -10,10 +10,13 @@
   not-for-merge until the release is cut.
 -->
 
-Nine merges since 2.23.0. The spine is a security cluster: operator power can no
+Twelve merges since 2.23.0. The spine is a security cluster: operator power can no
 longer be inferred from being on the box, the dashboard no longer hands message
 content to unauthenticated callers, and the orchestrator no longer loses work to
-a dead agent or a stale daemon.
+a dead agent or a stale daemon. The rest harden the tooling around the release —
+one shared structural detector for the must-call guards, a network deadline that
+covers the whole exchange, and a build-time guard against an accidental
+production-tree deploy.
 
 ### ⚠️ BREAKING — the operator dashboard now requires a secret (one action needed on upgrade)
 
@@ -94,6 +97,11 @@ network position plus a transport secret, not from an operator identity. ADR-000
   timeout is raised (to 61s, with the header-read timeout above it) so the client
   always closes first. Affects raw/proxy/non-undici HTTP clients regardless of
   platform (LOW).
+- **Network calls bound the WHOLE exchange, not just the headers (#155).** The
+  request deadline capped the header-read phase but left the response body/exchange
+  unbounded, so a peer that accepted the request and then stalled mid-body could
+  hang the caller indefinitely. The deadline now covers the entire request→response
+  exchange, so a stalled peer fails fast instead of hanging.
 
 ### Internal / hardening
 
@@ -112,6 +120,15 @@ network position plus a transport secret, not from an operator identity. ADR-000
   atomic-swap **harm** directly instead of a poll-count proxy (ADR-0015).
 - **Docs (#146):** ADR-0007 (control-plane target architecture) committed to
   version control.
+- **Must-call guards share one structural detector (#151):** the guards that
+  assert a required call is present now use a single AST-based helper, closing
+  comment-, alias-, and class-field-shaped evasions a per-guard textual check
+  missed. One detector, so the guards cannot drift apart.
+- **Prebuild guard against an accidental production-tree build (#156):** an npm
+  `prebuild` hook refuses `npm run build` in the live-serving tree — where a build
+  silently overwrites the `dist` the daemon and the whole stdio fleet load — unless
+  `RELAY_ALLOW_PROD_BUILD=1`. Positive-match only, so CI checkouts and throwaway
+  worktrees build freely; repo/dev tooling only (excluded from the npm package).
 
 ## v2.23.0 — 2026-07-25 — Config-clobber closed, orchestration-anchor safety, DX + a HIGH dependency advisory
 
