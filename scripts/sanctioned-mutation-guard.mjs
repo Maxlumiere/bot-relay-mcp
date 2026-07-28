@@ -47,9 +47,16 @@
  *     OPEN. Inverted: in identifier position anything that is not a PROVABLE
  *     non-identifier (a `punct`) is resolved, so the NEXT unforeseen quote form
  *     over-flags loudly instead of silently passing.
- *   • tokenizeSql WHITESPACE + COMMENTS → stripped. SAFE: neither changes which
- *     statement a token belongs to (a line `--` or a block comment that appears
- *     inside a '…' literal is kept as string content, never stripped).
+ *   • tokenizeSql WHITESPACE → stripped, but ONLY SQLite's five ASCII whitespace
+ *     code points (isSqliteWs). The @2e69d16 P1 lived here: JS `/\s/` ALSO matches
+ *     the Unicode whitespace set (NBSP U+00A0, U+1680, U+2000…), which SQLite
+ *     treats as IDENTIFIER chars — so `/\s/` DROPPED the `<NBSP>` before isIdStart
+ *     could see it, and `DELETE FROM <NBSP>.agents` executed and walked past. `/\s/`
+ *     is JAVASCRIPT's whitespace, not SQLite's (see the CLASSIFIER CENSUS below).
+ *     Now ASCII-exact → a Unicode-space survives to isIdStart and over-flags.
+ *   • tokenizeSql COMMENTS → stripped. SAFE: does not change which statement a
+ *     token belongs to (a line `--` or a block comment that appears inside a '…'
+ *     literal is kept as string content, never stripped).
  *   • kwAt CASE → folds keywords to UPPER. SAFE + correct: SQL keywords are
  *     case-insensitive, and only UNQUOTED tokens reach kwAt.
  *   • isGuarded CASE → folds the table name to lower. OVER-detects a case-distinct
@@ -57,24 +64,71 @@
  *     case-insensitive so this matches SQLite — residual is OVER-flag (safe).
  *   • resolveTable SCHEMA → `schema.agents` → `agents`. OVER-detects (any schema's
  *     agents is still an agents mutation). Safe direction.
- *   THREE discards UNDER-flagged and all three are fixed: quote provenance in the
- *   structure passes (@509a368), the resolution allowlist (@b5aae98), and the
- *   ASCII-only identifier CHARACTER class (@e2d7607 — `α.agents` executed and
- *   walked past). Each was an ENUMERATION of an EXTERNAL grammar we do NOT control
- *   (SQLite's quote forms, then its identifier character classes) and cannot close
- *   by reading our own code — hence default-deny at BOTH levels, not lists. The
- *   quoted-identifier class proof (by the guarded-name assertion below) therefore
- *   rests on THREE premises, each stated with its direction:
+ *   FOUR discards UNDER-flagged and all four are fixed: quote provenance in the
+ *   structure passes (@509a368), the resolution allowlist (@b5aae98), the
+ *   ASCII-only identifier CHARACTER class (@e2d7607 — `α.agents` executed), and the
+ *   JS-vs-SQLite WHITESPACE class (@2e69d16 — `<NBSP>.agents` executed and walked
+ *   past because `/\s/` dropped the NBSP one classifier BEFORE the fixed isIdStart
+ *   could see it). Each was an ENUMERATION of an EXTERNAL grammar we do NOT control
+ *   and cannot close by reading our own code — hence default-deny / match-SQLite,
+ *   not lists. Direction-of-failure: under-detection is the only dangerous
+ *   direction — when in doubt, over-flag.
+ *
+ *   ── THE TERMINAL FORM — CLASSIFIER CENSUS ────────────────────────────────────
+ *   The generalisation the first three P1s were groping toward: EVERY classifier
+ *   this guard BORROWS FROM JAVASCRIPT to make a SQLite decision is an implicit
+ *   enumeration of a FOREIGN grammar. `/\s/`, `.toUpperCase()`, `.toLowerCase()`,
+ *   `[0-9]` are JavaScript's notions, not SQLite's; where they diverge AND the
+ *   divergence points the wrong way, a mutation walks past. Unlike the previous
+ *   layers this set is FINITE — the classifiers in one file are countable — so
+ *   enumerating it TERMINATES the layer-by-layer arc. Each is stated with its
+ *   direction vs SQLite (WIDER → can spuriously match → over-flag = safe; NARROWER
+ *   → can miss a real one → under-flag = the danger):
+ *   A. `/\s/` WHITESPACE (now isSqliteWs) — was WIDER (matched Unicode whitespace
+ *      SQLite treats as identifier chars) → UNDER-flag, the @2e69d16 P1. FIXED:
+ *      ASCII-exact to SQLite's five (U+0009/0A/0C/0D/20).
+ *   B. `.toUpperCase()` KEYWORD fold (kwAt, splitStatements, classifyStatement) —
+ *      WIDER than SQLite's ASCII-only keyword fold; only a NON-ASCII token can be
+ *      spuriously promoted to a keyword (SQLite rejects it as syntax) → OVER-flag.
+ *      No real ASCII keyword ever folds AWAY. Safe. (codex: no case bypass.)
+ *   C. `.toLowerCase()` TABLE-NAME fold (isGuarded) — WIDER than SQLite's ASCII-only
+ *      identifier case-insensitivity; every name SQLite treats as guarded is ASCII
+ *      and folds correctly, and a non-ASCII name folding INTO a guarded name is a
+ *      table SQLite treats as DISTINCT → OVER-flag. Safe. (codex: no case bypass.)
+ *   D. `isIdStart`/`isId` CHARACTER class — MATCHES SQLite (any code point >= 0x80
+ *      is an identifier char); the ASCII set matches. isIdStart omits `$`-as-first,
+ *      but guarded names never start with `$` (assertGuardedNamesProvable) so that
+ *      narrowing is unreachable.
+ *   E. `[0-9]` NUMERIC start (only entered when NOT isIdStart) — EXACT to SQLite's
+ *      ASCII digits; a non-ASCII "digit" (U+0660…) is >= 0x80 so isIdStart claims it
+ *      first, exactly as SQLite treats it (identifier, not number). Consistent.
+ *   F. PUNCT equality `=== "." / "(" / ")" / ";"` — EXACT ASCII; SQLite accepts only
+ *      ASCII for the schema dot, statement `;`, and parens (a fullwidth `．`/`；` is
+ *      > 0x7F → an identifier char to BOTH tokenizers). Matches.
+ *   G. COMMENT delimiters — the `--` line form (terminated at `\n` = U+000A) and the
+ *      block form opened by slash-star — EXACT ASCII, matching SQLite (which ends a
+ *      line comment at LF or EOF only).
+ *   NON-classifiers (borrow JS notions but make NO SQLite decision, so excluded):
+ *   the path `.replace(/\\/g,"/")` (filesystem); the display `.replace(/\s+/g," ")`
+ *   (cosmetic, AFTER mutatesAgentsTable already decided); the `// ALLOWLIST:` regex
+ *   `\s` (parses THIS guard's own TS-source directive — JS whitespace is correct
+ *   there); TS `node.text` (decodes escapes to the exact runtime string SQLite sees).
+ *
+ *   The quoted-identifier / character-class proof (by the guarded-name assertion
+ *   below) therefore rests on FOUR premises, each stated with its direction:
  *   (1) guarded names are bare identifiers — ENFORCED at module load
  *       (assertGuardedNamesProvable): the premise is CHECKED, not assumed;
  *   (2) the quote-form enumeration — OPEN; default-deny in idAt makes its failure a
  *       loud OVER-flag (an unforeseen quote form resolves), not a silent miss;
- *   (3) the identifier CHARACTER classes — OPEN; classification is CONSERVATIVE
- *       (any code point >= 0x80 is an identifier char, matching SQLite), so an
- *       unrecognised code point OVER-flags rather than being silently made punct.
- *   Direction-of-failure: under-detection is the only dangerous direction — when in
- *   doubt, over-flag. Each new P1 was this same lesson one layer deeper; each is
- *   closed by default-deny at that layer, not by extending a list.
+ *   (3) the identifier CHARACTER classes — CLOSED to SQLite's rule (any code point
+ *       >= 0x80 is an identifier char), so an unrecognised code point OVER-flags
+ *       rather than being silently made punct;
+ *   (4) the host-language classifier census (A–G) — FINITE and enumerated here; each
+ *       classifier either MATCHES SQLite or diverges only in the OVER-flag (safe)
+ *       direction. This is the premise that TERMINATES the arc: there is no further
+ *       layer beneath it, because the borrowed classifiers are a bounded, listed set.
+ *   Each earlier P1 was this same lesson one layer deeper; the census names the
+ *   floor — closed by matching SQLite at that layer, never by extending a list.
  *
  * ── L2 — FRESHNESS ───────────────────────────────────────────────────────────
  * N/A: a STATIC scan of committed source; no observe→decide→act, no TOCTOU.
@@ -220,6 +274,22 @@ function tokenizeSql(sql) {
   // point resolves as a POSSIBLE identifier and OVER-flags, never silently punct.
   const isIdStart = (c) => /[A-Za-z_]/.test(c) || c.charCodeAt(0) >= 128;
   const isId = (c) => /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) >= 128;
+  // SQLite whitespace (sqlite3Isspace) is EXACTLY these five ASCII code points:
+  // tab U+0009, LF U+000A, FF U+000C, CR U+000D, space U+0020 — NOT U+000B (VT),
+  // and NOTHING >= 0x80. JS `/\s/` is WIDER on BOTH counts: it also matches VT and
+  // the whole Unicode whitespace set (NBSP U+00A0, U+1680, U+2000–U+200A, U+2028,
+  // U+2029, U+202F, U+205F, U+3000, U+FEFF). SQLite treats every char > U+007F as
+  // an IDENTIFIER char, so `DELETE FROM <NBSP>.agents` is a real mutation — but
+  // `/\s/` DROPPED the NBSP before isIdStart (@2e69d16 P1). The fix to isIdStart
+  // above was correct AND unreachable for those code points: a correct predicate
+  // BEHIND a wrong one is not a correct classifier. The terminal lesson (see the
+  // CLASSIFIER CENSUS in the header): `/\s/` is JAVASCRIPT's idea of whitespace,
+  // not SQLite's — every host-language classifier is an implicit enumeration of a
+  // FOREIGN grammar. Match SQLite EXACTLY here; borrow nothing from JS. Direction:
+  // ASCII-whitespace-only is NARROWER than `/\s/`, so a Unicode-whitespace code
+  // point now survives to isIdStart and OVER-flags rather than being silently
+  // dropped — the safe direction, consistent with the rest of the lexer.
+  const isSqliteWs = (c) => c === "\t" || c === "\n" || c === "\f" || c === "\r" || c === " ";
   const readQuoted = (close) => {
     i++;
     let v = "";
@@ -235,7 +305,7 @@ function tokenizeSql(sql) {
   };
   while (i < n) {
     const c = sql[i];
-    if (/\s/.test(c)) { i++; continue; }
+    if (isSqliteWs(c)) { i++; continue; }
     // Comments — stripped like whitespace, but only OUTSIDE a string literal
     // (we are at top level here; string literals are consumed whole below).
     if (c === "/" && sql[i + 1] === "*") { i += 2; while (i < n && !(sql[i] === "*" && sql[i + 1] === "/")) i++; i += 2; continue; }

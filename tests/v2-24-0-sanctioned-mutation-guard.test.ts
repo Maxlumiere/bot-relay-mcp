@@ -404,6 +404,7 @@ describe("#143 — normalization-audit directional contracts", () => {
     ["C3 whitespace around dot", "DELETE FROM temp . agents WHERE x=1", true],
     ["C3 bracket schema", "DELETE FROM [main].agents", true],
     ["C3 UNICODE schema α.agents (premise 3 — was under-flagging)", "DELETE FROM α.agents", true],
+    ["C5 UNICODE-WHITESPACE schema <NBSP>.agents (premise 4 - was under-flagging)", "DELETE FROM \u00A0.agents", true],
     ["C3 agents.col (schema NAMED agents) NOT flagged", "DELETE FROM agents.col", false],
     ["C4 block comments between tokens", "DELETE/**/FROM/**/agents", true],
     ["C4 line comment + newline + mutation", "SELECT 1 -- c\n; DELETE FROM agents WHERE x=1", true],
@@ -481,5 +482,88 @@ describe("#143 re-audit @e2d7607 — Unicode identifiers (premise 3: character c
     }
     fs.rmSync(dir, { recursive: true, force: true });
     expect(exit, "the shipped CLI must flag the Unicode-schema mutation (exit 1)").toBe(1);
+  });
+});
+
+// codex re-audit @2e69d16 P1 — the FOURTH layer: Unicode WHITESPACE. tokenizeSql ran
+// JS `/\s/` BEFORE isIdStart, and JS treats U+00A0 NBSP (also U+1680, U+2000, U+202F)
+// as whitespace and DROPS it — but SQLite treats every code point > U+007F as an
+// IDENTIFIER char, so `DELETE FROM <NBSP>.agents` mutated the guarded table while the
+// lexer split the NBSP off as whitespace and never resolved schema.table. The premise-3
+// isIdStart fix was correct AND UNREACHABLE for those code points: a correct predicate
+// behind a wrong one is not a correct classifier. Terminal lesson (premise 4 / the
+// classifier census in the guard header): every classifier borrowed from JavaScript
+// (`/\s/`, toUpperCase, toLowerCase, [0-9]) is an implicit enumeration of a FOREIGN
+// grammar. Fix: isSqliteWs strips ONLY SQLite's five ASCII whitespace code points, so a
+// Unicode-space survives to isIdStart and over-flags instead of being silently dropped.
+describe("#143 re-audit @2e69d16 — Unicode whitespace (premise 4: classifier census)", () => {
+  // Code points JS `/\s/` matches but SQLite treats as identifier chars (schema names).
+  const WS: Array<[string, string]> = [
+    ["NBSP U+00A0", "\u00A0"],
+    ["OGHAM SPACE U+1680", "\u1680"],
+    ["EN QUAD U+2000", "\u2000"],
+    ["NARROW NBSP U+202F", "\u202F"],
+  ];
+
+  it("HARM (real SQLite + guard, FRESH db per case): each <ws>.agents DELETEs the row AND is flagged", () => {
+    for (const [name, ws] of WS) {
+      const db = new Database(":memory:"); // fresh per case — no cross-pair contamination (codex harness-hygiene)
+      db.exec(`ATTACH ':memory:' AS ${ws}`);
+      db.exec(`CREATE TABLE ${ws}.agents (id INTEGER)`);
+      db.exec(`INSERT INTO ${ws}.agents VALUES (1)`);
+      db.exec(`DELETE FROM ${ws}.agents`);
+      const remaining = (db.prepare(`SELECT count(*) c FROM ${ws}.agents`).get() as { c: number }).c;
+      db.close();
+      expect(remaining, `${name}: the <ws>.agents mutation must actually EXECUTE in SQLite`).toBe(0);
+      expect(mutatesAgentsTable(`DELETE FROM ${ws}.agents`), `${name}: and the guard must flag it`).toBe(true);
+    }
+  });
+
+  // The full verb surface, across distinct whitespace code points (NBSP, U+2000, U+202F).
+  const HARM: Array<[string, string]> = [
+    ["UPDATE <NBSP>.agents", `UPDATE \u00A0.agents SET x=1`],
+    ["INSERT INTO <NBSP>.agents", `INSERT INTO \u00A0.agents VALUES (1)`],
+    ["DROP TABLE <U+2000>.agents", `DROP TABLE \u2000.agents`],
+    ["ALTER TABLE <U+202F>.agents", `ALTER TABLE \u202F.agents RENAME TO gone`],
+    ["OGHAM-space agent_capabilities", `DELETE FROM \u1680.agent_capabilities WHERE a=1`],
+  ];
+  for (const [l, sql] of HARM) it(`HARM flagged: ${l}`, () => expect(execFlagged(sql), sql).toBe(true));
+
+  it("HARM through the SHIPPED CLI: a fixture with `DELETE FROM <NBSP>.agents` exits 1", () => {
+    const guard = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "sanctioned-mutation-guard.mjs");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-ws-"));
+    fs.mkdirSync(path.join(dir, "src"));
+    // \u00A0 is emitted as a real NBSP into the SQL string literal the fixture runs.
+    fs.writeFileSync(path.join(dir, "src", "x.ts"), `export function f(db: any){ db.exec("DELETE FROM \u00A0.agents"); }\n`);
+    let exit = 0;
+    try {
+      execFileSync("node", [guard, path.join(dir, "src")], { stdio: "pipe" });
+    } catch (e) {
+      exit = (e as { status?: number }).status ?? -1;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect(exit, "the shipped CLI must flag the NBSP-schema mutation (exit 1)").toBe(1);
+  });
+
+  it("TWIN: a Unicode-whitespace schema on a DIFFERENT table is not flagged", () => {
+    expect(execFlagged(`DELETE FROM \u00A0.messages WHERE x=1`)).toBe(false);
+    expect(mutatesAgentsTable(`DELETE FROM \u2000.messages`)).toBe(false);
+  });
+
+  it("REGRESSION: the five ASCII SQLite whitespace chars still tokenize (fix did not over-narrow)", () => {
+    // U+0009 tab, U+000A LF, U+000C FF, U+000D CR, U+0020 space between verb and table.
+    expect(mutatesAgentsTable("DELETE\tFROM\nmain.agents"), "tab/LF").toBe(true);
+    expect(mutatesAgentsTable("DELETE\fFROM\r main.agents"), "FF/CR/space").toBe(true);
+    expect(mutatesAgentsTable("DELETE FROM main.messages"), "innocent twin, ASCII ws").toBe(false);
+  });
+
+  // Premise (4) — the census's WIDER folds over-flag, never under-flag. codex cleared
+  // case-folding; these pin the DIRECTION executably so a regression goes red.
+  it("CENSUS DIRECTION: JS-wider folds (toUpperCase/toLowerCase) over-flag, never under-flag", () => {
+    // Every ASCII case-variant SQLite treats as `agents` is still caught (no under-flag)…
+    expect(mutatesAgentsTable("DELETE FROM AGENTS"), "ASCII upper agents still caught").toBe(true);
+    expect(mutatesAgentsTable("delete from Agents where x=1"), "mixed case still caught").toBe(true);
+    // …and a non-ASCII name SQLite treats as DISTINCT is not smuggled OUT as a guarded hit.
+    expect(mutatesAgentsTable("DELETE FROM agent\u0161"), "s-caron-suffixed name is a different table").toBe(false);
   });
 });
