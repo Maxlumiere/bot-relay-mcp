@@ -406,12 +406,22 @@ describe("#4a · suppression visibility", () => {
     // outstanding flag BEFORE routing, so this path yields the watermark
     // decline only — one decline per consider, never both. An earlier version
     // of this test asserted both and was simply wrong about the order.
-    const watermark = gate();
+    // The clock must cross the LANDED SETTLE window: inside it, an idle read
+    // with pending mail is treated as a delivery still in progress and the gate
+    // HOLDS (so the decline is the routing one). Past it, the wake is owed, the
+    // mark rolls back, and the next consider reaches the watermark branch.
+    let clock = 0;
+    const watermark = gate({ now: () => clock, landedSettleMs: 20_000 });
     watermark.g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false });
     watermark.g.markInjectionLanded();
-    watermark.g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false });
-    const wmLine = watermark.lines.find((l) => l.includes("declined"))!;
-    expect(wmLine).toMatch(/watermark/i);
+    clock += 30_000; // past the settle window
+    watermark.g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false }); // rolls back + re-wakes
+    watermark.g.markInjectionLanded();
+    clock += 30_000;
+    watermark.g.consider(view({ pending_count: 0 }), "a1", true, { state: "idle", busyCoveredByHook: false }); // drained
+    watermark.g.consider(view({ pending_count: 1 }), "a1", true, { state: "idle", busyCoveredByHook: false }); // same mail, already woken
+    const wmLine = watermark.lines.find((l) => /watermark/i.test(l))!;
+    expect(wmLine, "no watermark decline was produced").toBeDefined();
 
     const routing = gate();
     routing.g.consider(view(), "a2", true, { state: "unknown", busyCoveredByHook: true });
@@ -484,5 +494,99 @@ describe("#4a · suppression visibility", () => {
     g.consider(view({ pending_count: 0 }), "a1", true, { state: "idle", busyCoveredByHook: false }); // different reason
     const reasons = lines.filter((l) => l.includes("declined"));
     expect(reasons.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ═══ LINK 1 — watermark clears on consumption evidence, not on dispatch ═══
+
+describe("watermark · consumption evidence, not dispatch", () => {
+  const v = (pending: number, last: string | null) =>
+    ({ pending_count: pending, last_message_at: last }) as WakeInboxView;
+  const idleObs = { state: "idle" as const, busyCoveredByHook: false };
+
+  it("HARM: codex-lumen's exact stranding — a wake that never delivered re-wakes", () => {
+    // Live signature it reproduces: lastWokenAt === newest, pending=1, agent
+    // idle, and NO re-wake for hours until a human intervened.
+    let clock = 0;
+    const woke: string[] = [];
+    const g = new WakeGate((n) => woke.push(n), { now: () => clock, landedSettleMs: 20_000 });
+
+    expect(g.consider(v(1, "T1"), "a", true, idleObs)).toBe(true); // wake for T1
+    g.markInjectionLanded();
+    clock += 30_000;                                              // settle window passes
+    expect(g.consider(v(1, "T1"), "a", true, idleObs), "still stranded").toBe(true);
+    expect(woke).toEqual(["a", "a"]);
+  });
+
+  it("INNOCENT TWIN: a delivered wake does NOT re-wake the same mail", () => {
+    // The fourteen-stack regression. Drained inbox ⇒ genuine consumption ⇒ the
+    // mark stays advanced no matter how long we wait.
+    let clock = 0;
+    const woke: string[] = [];
+    const g = new WakeGate((n) => woke.push(n), { now: () => clock, landedSettleMs: 20_000 });
+    g.consider(v(1, "T1"), "a", true, idleObs);
+    g.markInjectionLanded();
+    clock += 30_000;
+    g.consider(v(0, "T1"), "a", true, idleObs);   // drained
+    clock += 300_000;
+    expect(g.consider(v(1, "T1"), "a", true, idleObs), "re-woke delivered mail").toBe(false);
+    expect(woke).toEqual(["a"]);
+  });
+
+  it("HARM: the SETTLE GRACE must not be skipped — an idle read may predate the agent acting", () => {
+    // Preserves the pre-existing pinned invariant ("a LANDED wake does NOT roll
+    // the mark back"), which taken literally against a pending inbox IS the
+    // stranding bug. Separating the two by time is what lets both hold.
+    let clock = 0;
+    const woke: string[] = [];
+    const g = new WakeGate((n) => woke.push(n), { now: () => clock, landedSettleMs: 20_000 });
+    g.consider(v(1, "T1"), "a", true, idleObs);
+    g.markInjectionLanded();
+    clock += 5_000; // INSIDE the window
+    expect(g.consider(v(1, "T1"), "a", true, idleObs), "rolled back too eagerly").toBe(false);
+    expect(woke).toEqual(["a"]);
+  });
+
+  it("newer mail is NOT blocked while our own delivery is unsettled", () => {
+    // The regression an earlier formulation of mine introduced: holding for the
+    // settle window also blocked genuinely new mail for up to 20s.
+    let clock = 0;
+    const woke: string[] = [];
+    const g = new WakeGate((n) => woke.push(n), { now: () => clock, landedSettleMs: 20_000 });
+    g.consider(v(1, "T1"), "a", true, idleObs);
+    g.markInjectionLanded();
+    clock += 1_000; // well inside the settle window
+    expect(g.consider(v(2, "T2"), "a", true, idleObs), "newer mail was blocked").toBe(true);
+  });
+
+  it("DIRECTION OF ERROR, declared and pinned: rollback OVER-wakes, never under-wakes", () => {
+    // Rolling back to markBeforeOutstanding re-opens everything since that
+    // mark, not only the undelivered message. Safe direction — and bounded by
+    // `outstanding`, which still permits one injection in flight at a time.
+    let clock = 0;
+    const woke: string[] = [];
+    const g = new WakeGate((n) => woke.push(n), { now: () => clock, landedSettleMs: 20_000 });
+    g.consider(v(1, "T1"), "a", true, idleObs);
+    g.markInjectionLanded();
+    clock += 30_000;
+    g.consider(v(1, "T1"), "a", true, idleObs);   // rollback + re-wake
+    // A second consider WITHOUT landing must not stack a third injection.
+    expect(g.consider(v(1, "T1"), "a", true, idleObs), "stacked while in flight").toBe(false);
+    expect(woke.length).toBe(2);
+  });
+
+  it("ORDERING: the rollback must run BEFORE markLanded destroys its inputs", () => {
+    // markLanded() nulls BOTH the rollback value (markBeforeOutstanding) and
+    // the rollback guard (outstandingSince). Land-then-reconsider leaves
+    // markLost() silently no-opping — a rollback that LOOKS like it ran. This
+    // fixture fails if the branch is ever reordered that way.
+    let clock = 0;
+    const woke: string[] = [];
+    const g = new WakeGate((n) => woke.push(n), { now: () => clock, landedSettleMs: 0 });
+    g.consider(v(1, "T1"), "a", true, idleObs);
+    g.markInjectionLanded();
+    clock += 1;
+    // If markLanded ran first, the mark would stay advanced and this is false.
+    expect(g.consider(v(1, "T1"), "a", true, idleObs), "rollback silently no-opped").toBe(true);
   });
 });

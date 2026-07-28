@@ -57,6 +57,12 @@ export const DEFAULT_WAKE_OUTSTANDING_TTL_MS = 3 * 60 * 60 * 1000;
  *  immediately; this only rate-limits the unchanged condition. */
 export const DEFAULT_DECLINE_HEARTBEAT_MS = 5 * 60 * 1000;
 
+/** How long a landed injection is given to be acted on before an idle agent
+ *  with pending mail counts as owed a fresh wake. One poll interval (15s) plus
+ *  headroom — long enough that a delivery in progress is never read as a
+ *  failure, short enough that stranding is measured in seconds. */
+export const DEFAULT_LANDED_SETTLE_MS = 20_000;
+
 export class WakeGate {
   private lastWokenAt: string | null = null;
   /**
@@ -94,6 +100,12 @@ export class WakeGate {
    * while wake #1 was still in flight). false whenever nothing is outstanding.
    */
   private outstandingLanded = false;
+  /**
+   * When the outstanding injection was acked as landed. Used for the settle
+   * grace below — an idle read taken immediately after a submit may simply
+   * predate the agent picking it up.
+   */
+  private landedAt: number | null = null;
 
   /**
    * #4a — SUPPRESSION VISIBILITY.
@@ -126,6 +138,7 @@ export class WakeGate {
       now?: () => number;
       log?: (msg: string) => void;
       declineHeartbeatMs?: number;
+      landedSettleMs?: number;
     } = {},
   ) {}
 
@@ -178,7 +191,10 @@ export class WakeGate {
    * outstanding (a lost/flushed injection already cleared the flag).
    */
   markInjectionLanded(): void {
-    if (this.outstandingSince !== null) this.outstandingLanded = true;
+    if (this.outstandingSince !== null) {
+      this.outstandingLanded = true;
+      this.landedAt = (this.opts.now ?? Date.now)();
+    }
   }
 
   /**
@@ -188,6 +204,7 @@ export class WakeGate {
    * re-wake of the same message).
    */
   private markLanded(): void {
+    this.landedAt = null;
     this.outstandingSince = null;
     this.outstandingLanded = false;
     this.markBeforeOutstanding = null;
@@ -201,6 +218,7 @@ export class WakeGate {
    * a good mark.
    */
   private markLost(): void {
+    this.landedAt = null;
     if (this.outstandingSince !== null) this.lastWokenAt = this.markBeforeOutstanding;
     this.outstandingSince = null;
     this.outstandingLanded = false;
@@ -231,6 +249,85 @@ export class WakeGate {
     observed: WakeObservation = { state: "unknown", busyCoveredByHook: false },
   ): boolean {
     const now = this.opts.now ?? Date.now;
+    // ── WATERMARK: CONSUMPTION EVIDENCE, NOT DISPATCH ────────────────────
+    //
+    // `lastWokenAt` used to advance on DISPATCH, so a wake that never achieved
+    // delivery marked its mail "woken for" and the mail was never re-offered.
+    // Live instance: codex-lumen stranded from 04:05 with pending=1 until a
+    // human cleared it by hand. A proxy ("I sent a wake") standing in for the
+    // property ("the mail was read").
+    //
+    // THE PREDICATE, stated at the strength the evidence supports: idle with
+    // mail still pending does NOT prove the injection failed — the agent may
+    // have read message A, gone idle, and message B landed a moment later. What
+    // it proves is weaker and sufficient: MAIL IS UNREAD WHILE THE AGENT IS
+    // IDLE, THEREFORE A WAKE IS OWED. The stronger sentence would be a claim
+    // ahead of its mechanism.
+    //
+    // DIRECTION OF ERROR, declared: rolling the mark back re-opens wakes for
+    // everything since `markBeforeOutstanding`, not only the undelivered
+    // message — so this OVER-WAKES rather than under-wakes. Safe direction, and
+    // bounded by `outstanding`, which still permits only one injection in
+    // flight. Pinned by test rather than asserted.
+    //
+    // THE SETTLE GRACE, and why it is not a fudge. An existing pinned test
+    // asserts that an idle observation on a LANDED wake must NOT roll the mark
+    // back — written to stop a rollback over-reaching into successful
+    // deliveries. Taken literally against a still-pending inbox, that invariant
+    // IS the stranding bug: it is codex-lumen's exact scenario. But the test is
+    // also protecting something real — an idle read taken in the instant after a
+    // submit can simply PREDATE the agent picking the wake up, and rolling back
+    // on that reads a delivery-in-progress as a failure.
+    //
+    // Both hold once the two cases are separated by TIME rather than merged:
+    // immediately-after-landing is a delivery in flight; still-pending a full
+    // settle window later is mail that is owed a wake. So the rollback waits one
+    // settle window. The pinned invariant keeps its meaning, the stranding is
+    // fixed, and no existing guard was deleted to get there.
+    //
+    // ORDERING — DECIDE, THEN CALL EXACTLY ONE. `markLanded()` nulls BOTH the
+    // rollback value (`markBeforeOutstanding`) AND the rollback guard
+    // (`outstandingSince`). Land-then-reconsider therefore leaves `markLost()`
+    // silently no-opping — a rollback that LOOKS like it ran and did nothing,
+    // which is the more dangerous of the two failures. The branch below reads
+    // its inputs before either mutator runs, and a fixture fails if it is ever
+    // reordered.
+    if (observed.state === "idle" && this.outstandingLanded) {
+      const settled =
+        this.landedAt === null ||
+        now() - this.landedAt >= (this.opts.landedSettleMs ?? DEFAULT_LANDED_SETTLE_MS);
+      // Is the newest message STILL the one we woke for? That is the whole
+      // discriminator, and it is the only one the inbox resource can support:
+      // it exposes pending_count and last_message_at (the NEWEST message) and
+      // nothing per-message. So:
+      //   newer mail exists  → last_message_at has moved past our mark; the
+      //                        watermark will wake for it on its own merits.
+      //   mark still newest  → the message we woke for is the newest AND mail
+      //                        is pending, i.e. ours was never consumed.
+      const ourMessageStillNewest =
+        snapshot.last_message_at !== null && snapshot.last_message_at === this.lastWokenAt;
+
+      if (snapshot.pending_count === 0) {
+        // Inbox drained → the mail this wake was for is genuinely consumed.
+        this.markLanded();
+      } else if (!ourMessageStillNewest) {
+        // Pending, but NEWER mail has arrived — our delivery is not implicated.
+        // Clear the anti-stacking flag and KEEP the mark; decideWake wakes for
+        // the newer message on its own timestamp. (Without this branch, newer
+        // mail was blocked for the whole settle window — a regression this
+        // formulation introduced and this branch removes.)
+        this.markLanded();
+      } else if (settled) {
+        // Our message is still the newest and still pending, a full settle
+        // window after the injection landed → a wake is owed. Roll back using
+        // the SAME machinery known loss already uses. This is codex-lumen's
+        // exact signature: lastWokenAt === newest, pending=1.
+        this.markLost();
+      }
+      // else: ours, pending, not yet settled → HOLD. The idle read may simply
+      // predate the agent acting on the wake.
+    }
+
     // IDLE-EVIDENCE — but ONLY for a LANDED injection. The host submits queued
     // input at the turn boundary, so an idle agent cannot still hold an
     // injection that ACTUALLY SUBMITTED. An in-flight (scheduled-but-not-yet-
@@ -240,7 +337,6 @@ export class WakeGate {
     // round 2). Wait for the delivery ack (markInjectionLanded); a later idle
     // flushes it. A not-yet-landed wake stays suppressed via the outstanding
     // flag until it lands or fails.
-    if (observed.state === "idle" && this.outstandingLanded) this.markLanded();
     // TTL backstop for losses nothing can observe. An injection outstanding
     // past the TTL never resolved either way; treat it as a (very late) LOSS
     // so mail still pending re-wakes — clearing the flag alone would leave the
