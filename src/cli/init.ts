@@ -36,6 +36,7 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { withDeadline } from "../http-deadline.js";
 import { execFileSync } from "child_process";
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
@@ -299,33 +300,42 @@ export function installHook(hookScript: string, settingsPath: string = claudeSet
  */
 export async function probeHealth(port: number): Promise<HealthProbe> {
   const timeoutMs = Math.max(1, parseInt(process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS || "3000", 10));
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // NOT A BUG FIX — behaviour here was already correct, and deliberately so: the
+  // timer stayed live across the body read (see the note below), which MEASURES
+  // as bounded on Node v24.13.0. This is converted to the owned-deadline helper
+  // to remove a dependency on undici honouring abort mid-body, which was not
+  // verified on Node 20 — the version `engines` allows and CI exercises.
   try {
-    let res: Response;
-    try {
-      res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal: controller.signal });
-    } catch (err) {
-      const code =
-        (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
-        (err as { code?: string } | null)?.code;
-      if (code === "ECONNREFUSED") {
-        return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
+    return await withDeadline(timeoutMs, `health probe on 127.0.0.1:${port}`, async (signal) => {
+      let res: Response;
+      try {
+        res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal });
+      } catch (err) {
+        const code =
+          (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
+          (err as { code?: string } | null)?.code;
+        if (code === "ECONNREFUSED") {
+          return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
+        }
+        return { reachable: true, ok: false, parseable: false, body: null }; // reset/timeout/abort/DNS/unknown → fail closed
       }
-      return { reachable: true, ok: false, parseable: false, body: null }; // reset/timeout/abort/DNS/unknown → fail closed
-    }
-    // The body read is STILL under the same timer — a server that sends headers
-    // then stalls the body aborts res.json() here instead of hanging forever.
-    let body: unknown = null;
-    let parseable = true;
-    try {
-      body = await res.json();
-    } catch {
-      parseable = false; // malformed OR aborted-mid-body → unreadable → refuse
-    }
-    return { reachable: true, ok: res.ok, parseable, body };
-  } finally {
-    clearTimeout(timer);
+      // The body read is inside the same deadline — a server that sends headers
+      // then stalls is refused here instead of hanging forever.
+      let body: unknown = null;
+      let parseable = true;
+      try {
+        body = await res.json();
+      } catch {
+        parseable = false; // malformed OR aborted-mid-body → unreadable → refuse
+      }
+      return { reachable: true, ok: res.ok, parseable, body };
+    });
+  } catch {
+    // Deadline elapsed. FAIL CLOSED, identical to the previous abort path: a
+    // timeout must never report the port free, because only ECONNREFUSED proves
+    // that. Returning here (rather than letting the rejection escape) preserves
+    // probeHealth's contract — it answers, it does not throw.
+    return { reachable: true, ok: false, parseable: false, body: null };
   }
 }
 
