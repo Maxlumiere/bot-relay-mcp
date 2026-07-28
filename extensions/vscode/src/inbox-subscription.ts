@@ -57,10 +57,36 @@ export const DEFAULT_WAKE_OUTSTANDING_TTL_MS = 3 * 60 * 60 * 1000;
  *  immediately; this only rate-limits the unchanged condition. */
 export const DEFAULT_DECLINE_HEARTBEAT_MS = 5 * 60 * 1000;
 
-/** How long a landed injection is given to be acted on before an idle agent
- *  with pending mail counts as owed a fresh wake. One poll interval (15s) plus
- *  headroom — long enough that a delivery in progress is never read as a
- *  failure, short enough that stranding is measured in seconds. */
+/**
+ * How long a landed injection is given to be acted on before an idle agent with
+ * pending mail counts as owed a fresh wake.
+ *
+ * ⚠️ THIS IS A TIMER STANDING IN FOR A FACT, AND THAT IS NOT A PREFERENCE.
+ * Read this before touching the number.
+ *
+ * (a) WHY IT EXISTS: the inbox resource exposes `pending_count`, `total_count`
+ *     and `last_message_at` (the NEWEST message) — and NOTHING per-message. So
+ *     Tether physically cannot ask the question it needs answered: "is the
+ *     message I woke for still unread?". The window is the best available
+ *     discriminator given that interface, not a shortcut chosen over a better
+ *     predicate.
+ *
+ * (b) THE REAL FIX, when this class next bites: add `oldest_pending_at` (or
+ *     per-message resolution state) to the inbox resource, then delete this
+ *     constant and test the fact directly. That is a relay contract change, not
+ *     a Tether change. Do NOT replace it with a cleverer heuristic here —
+ *     tuning a proxy is how the 120s liveness window became the terminal-binding
+ *     bug this same arc is fixing.
+ *
+ * (c) DIRECTION OF ERROR: an agent that picks the wake up LATE — after the
+ *     window — causes an OVER-wake, never a missed one. Bounded by
+ *     `outstanding`, which still permits one injection in flight at a time.
+ *     Shorten it and over-waking gets more likely; lengthen it and stranding
+ *     lasts longer. Both are bounded; neither is silent.
+ *
+ * 20s = one 15s poll interval plus headroom, so a delivery in progress is never
+ * read as a failure across a single tick.
+ */
 export const DEFAULT_LANDED_SETTLE_MS = 20_000;
 
 export class WakeGate {
