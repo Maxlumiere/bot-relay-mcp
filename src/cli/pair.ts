@@ -33,6 +33,7 @@
 import * as readline from "readline/promises";
 import fs from "fs";
 import path from "path";
+import { withDeadline } from "../http-deadline.js";
 
 interface Args {
   hubUrl: string | null;
@@ -149,16 +150,17 @@ function sanitizeHubUrl(raw: string): { url: URL | null; error: string | null } 
   }
 }
 
-/** 5s timeout fetch wrapper. Returns Response or throws. */
-async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 5000): Promise<Response> {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
+/**
+ * REMOVED: the old `fetchWithTimeout` cleared its timer in a `finally` that ran
+ * as soon as `fetch()` resolved — i.e. on RESPONSE HEADERS — leaving every
+ * subsequent `res.json()` / `res.text()` completely unbounded. Measured against
+ * a real stalling server: `pair.run` still pending at 7003ms against its own
+ * 5000ms promise.
+ *
+ * Callers now wrap the WHOLE exchange (connect + body) in `withDeadline`. Do not
+ * reintroduce a helper that returns a Response for the caller to drain later —
+ * that shape is the defect, and it looks correct at every call site.
+ */
 
 async function promptInteractive(msg: string, hidden = false): Promise<string> {
   void hidden; // readline/promises doesn't provide hidden input natively; keep API simple
@@ -197,15 +199,21 @@ export async function run(argv: string[]): Promise<number> {
   // --- Step 1: probe /health ---
   let healthBody: any = null;
   try {
-    const res = await fetchWithTimeout(`${hubBase}/health`);
-    if (!res.ok) {
+    // The body read is INSIDE the deadline — that is the whole fix. A hub that
+    // sends headers and stalls now fails at 5s instead of hanging forever.
+    const probe = await withDeadline(5000, "hub health probe", async (signal) => {
+      const res = await fetch(`${hubBase}/health`, { signal });
+      if (!res.ok) return { ok: false as const, status: res.status };
+      return { ok: true as const, body: await res.json().catch(() => ({})) };
+    });
+    if (!probe.ok) {
       process.stderr.write(
-        `relay pair: hub health probe returned HTTP ${res.status}. ` +
+        `relay pair: hub health probe returned HTTP ${probe.status}. ` +
           `Hub may be down or URL may be wrong.\n`
       );
       return 1;
     }
-    healthBody = await res.json().catch(() => ({}));
+    healthBody = probe.body;
   } catch (err) {
     process.stderr.write(
       `relay pair: cannot reach hub at ${hubBase}: ${err instanceof Error ? err.message : String(err)}\n`
@@ -247,11 +255,14 @@ export async function run(argv: string[]): Promise<number> {
       Accept: "application/json, text/event-stream",
     };
     if (secret) headers["X-Relay-Secret"] = secret;
-    const res = await fetchWithTimeout(
-      `${hubBase}/mcp`,
-      {
+    // `res.text()` is inside the deadline. The MCP endpoint answers with SSE
+    // frames, so this is exactly the shape most likely to deliver headers and
+    // then stall — the register step was the second unbounded body read.
+    return await withDeadline(10_000, "hub register_agent", async (signal) => {
+      const res = await fetch(`${hubBase}/mcp`, {
         method: "POST",
         headers,
+        signal,
         body: JSON.stringify({
           jsonrpc: "2.0",
           id: 1,
@@ -265,17 +276,16 @@ export async function run(argv: string[]): Promise<number> {
             },
           },
         }),
-      },
-      10_000
-    );
-    const text = await res.text();
-    // The HTTP transport emits SSE frames; pull the data line when present.
-    const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-    const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text || "{}");
-    const body = rpcResp?.result?.content?.[0]?.text
-      ? JSON.parse(rpcResp.result.content[0].text)
-      : rpcResp;
-    return { status: res.status, body };
+      });
+      const text = await res.text();
+      // The HTTP transport emits SSE frames; pull the data line when present.
+      const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
+      const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text || "{}");
+      const body = rpcResp?.result?.content?.[0]?.text
+        ? JSON.parse(rpcResp.result.content[0].text)
+        : rpcResp;
+      return { status: res.status, body };
+    });
   };
 
   // --- Step 4: register (handle 401 → prompt for secret → retry once) ---
