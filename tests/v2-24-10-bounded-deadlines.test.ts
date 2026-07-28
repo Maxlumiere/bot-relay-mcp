@@ -27,6 +27,11 @@ import { describe, it, expect } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { withDeadline, DeadlineExceededError } from "../src/http-deadline.js";
+// Use the REAL package version (never a hardcoded literal): a literal equal to the
+// current package.json version trips the pre-publish tests-drift guard the moment
+// it is released. The value here is an arbitrary mock-server field; VERSION keeps it
+// correct and drift-proof.
+import { VERSION } from "../src/version.js";
 
 /** Real server: sends full headers + one byte, then never finishes the body. */
 function stallingBodyServer(): Promise<{ url: string; port: number; close: () => void }> {
@@ -86,13 +91,13 @@ describe("v2.24.10 withDeadline — the owned deadline covers connect AND body",
   });
 
   it("TWIN: a complete body inside the bound still resolves normally", async () => {
-    const srv = await healthyServer({ version: "2.24.0" });
+    const srv = await healthyServer({ version: VERSION });
     const body = await withDeadline(3000, "probe", async (signal) => {
       const res = await fetch(`${srv.url}/health`, { signal });
       return (await res.json()) as { version: string };
     });
     srv.close();
-    expect(body.version).toBe("2.24.0");
+    expect(body.version).toBe(VERSION);
   });
 
   it("TWIN: a non-deadline error from inside propagates unchanged (not masked as a timeout)", async () => {
@@ -180,7 +185,7 @@ describe("v2.24.10 relay init probeHealth — bounded, and still FAILS CLOSED", 
   }, 15000);
 
   it("TWIN: a healthy daemon still probes as reachable + parseable", async () => {
-    const srv = await healthyServer({ status: "ok", version: "2.24.0" });
+    const srv = await healthyServer({ status: "ok", version: VERSION });
     const init = await import("../src/cli/init.js");
     const probe = await init.probeHealth(srv.port);
     srv.close();
