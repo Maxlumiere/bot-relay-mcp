@@ -295,3 +295,48 @@ describe("#143 P1 hardening — codex's EXECUTED bypasses (each red against the 
     expect(allowlisted[0].reason).toMatch(/legacy teardown/);
   });
 });
+
+// codex re-audit @509a368 P1 (all EXECUTED in real SQLite — rows died): the
+// tokenizer collapsed quoted + unquoted words into ONE `id` type, so a quoted
+// keyword hijacked the three structural passes. Fix: quoted → `qid`; keyword +
+// structure passes consume UNQUOTED `id` only; identifier resolution accepts both.
+describe("#143 re-audit — quoted-identifier provenance (codex @509a368)", () => {
+  // ── the three EXECUTED harms (each got=false / seeded row-count → 0 on the old head) ──
+  const HARM: Array<[string, string]> = [
+    ["quoted CASE defeats the `;` split", `SELECT 1 AS "CASE"; DELETE FROM agents WHERE name='victim'`],
+    ["quoted `delete` masquerades as the CTE verb", `WITH "delete"(x) AS (SELECT 1) DELETE FROM agents WHERE name='victim'`],
+    ["quoted BEGIN steals the trigger-body opener", `CREATE TRIGGER "BEGIN" AFTER INSERT ON t BEGIN DELETE FROM agents WHERE name='victim'; END`],
+  ];
+  for (const [label, sql] of HARM) it(`HARM flagged: ${label}`, () => expect(execFlagged(sql), sql).toBe(true));
+
+  // ── the three innocent twins codex ran (must still PASS) ──
+  it("TWIN: quoted CASE as a read-only alias is not a mutation", () => expect(execFlagged(`SELECT 1 AS "CASE"`)).toBe(false));
+  it("TWIN: a quoted `delete` CTE consumed by a SELECT is a read", () =>
+    expect(execFlagged(`WITH "delete"(x) AS (SELECT 1) SELECT * FROM "delete"`)).toBe(false));
+  it("TWIN: a trigger named `BEGIN` mutating a DIFFERENT table is not flagged", () =>
+    expect(execFlagged(`CREATE TRIGGER "BEGIN" AFTER INSERT ON t BEGIN DELETE FROM messages WHERE name='v'; END`)).toBe(false));
+
+  // ── BEYOND codex — shapes it did not write (the MIRROR + resolution coverage) ──
+  it("HARM flagged: a quoted `END` inside a trigger body does NOT falsely CLOSE the block early", () => {
+    // The mirror of the quoted-BEGIN harm: a quoted keyword must not close a block
+    // either. The real DELETE lives AFTER the fake `"END"`.
+    expect(execFlagged(`CREATE TRIGGER trg AFTER INSERT ON u BEGIN SELECT 1 AS "END"; DELETE FROM agents WHERE name='v'; END`)).toBe(true);
+  });
+  it("HARM flagged: a quoted GUARDED table resolves through every quote style", () => {
+    for (const sql of [`DELETE FROM "agents" WHERE x=1`, `DELETE FROM [agents]`, "DELETE FROM `agents`", `UPDATE "agents" SET x=1`, `INSERT INTO "agents" (id) VALUES (1)`]) {
+      expect(mutatesAgentsTable(sql), sql).toBe(true);
+    }
+  });
+  it("HARM flagged: quoted-keyword COLUMN names in an INSERT do not hide the guarded table", () =>
+    expect(mutatesAgentsTable(`INSERT INTO agents ("SELECT", "FROM", "WHERE") VALUES (1, 2, 3)`)).toBe(true));
+  it("HARM flagged: a quoted keyword as a false block-opener (a different keyword) still splits", () =>
+    expect(execFlagged(`SELECT 1 AS "BEGIN"; DELETE FROM agents WHERE name='v'`)).toBe(true));
+  it("HARM flagged: a quoted mixed-CASE guarded table (SQLite identifiers are case-insensitive)", () =>
+    expect(mutatesAgentsTable(`DELETE FROM "AGENTS" WHERE x=1`)).toBe(true));
+  it("TWIN: a quoted keyword used as a READ column is not a mutation", () =>
+    expect(mutatesAgentsTable(`SELECT "DELETE" FROM agents WHERE x=1`)).toBe(false));
+  it("TWIN: a quoted DIFFERENT table (incl. agents_new) is not flagged", () => {
+    expect(mutatesAgentsTable(`DELETE FROM "messages" WHERE x=1`)).toBe(false);
+    expect(mutatesAgentsTable(`DELETE FROM [agents_new]`)).toBe(false);
+  });
+});

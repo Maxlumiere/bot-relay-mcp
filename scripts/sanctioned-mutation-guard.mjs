@@ -32,6 +32,28 @@
  *   the OUT list below; the durable, non-re-expressible anchor is what SQLite
  *   resolves at execution (a runtime prepare()+exec() probe), tracked separately.
  *
+ * ── NORMALIZATION AUDIT ──────────────────────────────────────────────────────
+ *   codex re-audit lesson (@509a368): a normalizer that discards the exact
+ *   attribute the predicate depends on defects EVERY downstream pass at once —
+ *   the quoted-vs-unquoted collapse broke all THREE parser passes. So each
+ *   normalization step is stated with WHAT it discards and the DIRECTION:
+ *   • tokenizeSql QUOTE PROVENANCE → distinct `qid` vs `id`. A quoted keyword is
+ *     NEVER structural; only unquoted `id` is. Dropping this was the P1
+ *     under-detection. NOW PRESERVED (see the tokenizer + idAt notes).
+ *   • tokenizeSql WHITESPACE + COMMENTS → stripped. SAFE: neither changes which
+ *     statement a token belongs to (a line `--` or a block comment that appears
+ *     inside a '…' literal is kept as string content, never stripped).
+ *   • kwAt CASE → folds keywords to UPPER. SAFE + correct: SQL keywords are
+ *     case-insensitive, and post-fix only UNQUOTED tokens reach kwAt.
+ *   • isGuarded CASE → folds the table name to lower. OVER-detects a case-distinct
+ *     quoted table (`"AGENTS"`), but SQLite identifier comparison is itself
+ *     case-insensitive so this matches SQLite — residual is OVER-flag (safe).
+ *   • resolveTable SCHEMA → `schema.agents` → `agents`. OVER-detects (any schema's
+ *     agents is still an agents mutation). Safe direction.
+ *   Every remaining discard OVER-flags; the only one that UNDER-flagged (quote
+ *   provenance) is fixed. Direction-of-failure: under-detection is the only
+ *   dangerous direction — when a normalizer must choose, it over-flags.
+ *
  * ── L2 — FRESHNESS ───────────────────────────────────────────────────────────
  * N/A: a STATIC scan of committed source; no observe→decide→act, no TOCTOU.
  *
@@ -66,11 +88,15 @@
  *     error-recovery tree (fail-closed on READ, fail-OPEN on PARSE — the exact
  *     audit-state-freshness.sh split). CLOSED: parseDiagnostics non-empty → exit 2.
  *   • AMBIENT DISABLE — none; the only escape is the per-line `// ALLOWLIST:
- *     <reason>` (visible, reviewable). It requires a NON-TRIVIAL reason — a bare
- *     `// ALLOWLIST: x` no longer exempts — and EVERY use is EMITTED to stderr,
- *     so an unjustified exemption is LOUD in CI, not "detectable only by a human
- *     noticing the diff" (codex T5). A structured OWNER/ticket registry is a
- *     tracked follow-up (allowlist governance).
+ *     <reason>`. The reason check enforces a SHAPE ONLY — it rejects a trivially
+ *     empty / one-token reason but does NOT verify JUSTIFICATION (it accepts
+ *     `// ALLOWLIST: aaaaaaaa` and rejects `// ALLOWLIST: aa`: a spelling gate,
+ *     not a meaning gate; codex T5 correctly refuted the stronger claim).
+ *     MEANING IS HUMAN-REVIEWED ONLY — the actual authority is that EVERY
+ *     exemption is EMITTED to stderr (file:line + SQL + reason) for a reviewer to
+ *     confirm. A structured OWNER/ticket registry that mechanically justifies an
+ *     exemption is a real, SEPARATE piece of work, scoped later — NOT claimed
+ *     closed here.
  *
  *   OUT — HONEST BOUNDARIES (things not yet shown reachable, or deliberately
  *   deferred), never captions over demonstrated harm:
@@ -160,9 +186,17 @@ function tokenizeSql(sql) {
     if (c === "/" && sql[i + 1] === "*") { i += 2; while (i < n && !(sql[i] === "*" && sql[i + 1] === "/")) i++; i += 2; continue; }
     if (c === "-" && sql[i + 1] === "-") { i += 2; while (i < n && sql[i] !== "\n") i++; continue; }
     if (c === "'") { toks.push({ t: "str", v: readQuoted("'") }); continue; }
-    if (c === '"') { toks.push({ t: "id", v: readQuoted('"') }); continue; } // "identifier"
-    if (c === "`") { toks.push({ t: "id", v: readQuoted("`") }); continue; }
-    if (c === "[") { toks.push({ t: "id", v: readQuoted("]") }); continue; }
+    // QUOTED identifiers get a DISTINCT token type `qid` — NEVER `id`. codex P1
+    // (@509a368): collapsing quoted + unquoted words into one `id` type let a
+    // quoted keyword HIJACK the three structural passes — `"CASE"`/`"BEGIN"` read
+    // as block openers, `"delete"` as a CTE's real DML verb, `"BEGIN"` as a
+    // trigger-body opener — each an EXECUTED under-detection. Keyword + structure
+    // passes (kwAt / splitStatements / firstTopLevelDml / trigger discovery)
+    // consume UNQUOTED `id` only; identifier RESOLUTION (idAt) accepts both, so a
+    // quoted TABLE name like `"agents"` / `[agents]` still resolves and is caught.
+    if (c === '"') { toks.push({ t: "qid", v: readQuoted('"') }); continue; } // "identifier"
+    if (c === "`") { toks.push({ t: "qid", v: readQuoted("`") }); continue; }
+    if (c === "[") { toks.push({ t: "qid", v: readQuoted("]") }); continue; }
     if (isIdStart(c)) { let v = ""; while (i < n && isId(sql[i])) v += sql[i++]; toks.push({ t: "id", v }); continue; }
     if (/[0-9]/.test(c)) { let v = ""; while (i < n && /[0-9.]/.test(sql[i])) v += sql[i++]; toks.push({ t: "num", v }); continue; }
     toks.push({ t: "punct", v: c });
@@ -172,7 +206,10 @@ function tokenizeSql(sql) {
 }
 
 const kwAt = (tk, j) => (tk[j] && tk[j].t === "id" ? tk[j].v.toUpperCase() : null);
-const idAt = (tk, j) => (tk[j] && tk[j].t === "id" ? tk[j].v : null);
+// Identifier RESOLUTION accepts a quoted OR unquoted identifier (a table may be
+// written `agents`, `"agents"`, `[agents]`, or `` `agents` ``). Keyword/structure
+// reads use kwAt (UNQUOTED `id` only) — see the tokenizer's `qid` note above.
+const idAt = (tk, j) => (tk[j] && (tk[j].t === "id" || tk[j].t === "qid") ? tk[j].v : null);
 const isGuarded = (name) => name != null && GUARDED_TABLES.has(name.toLowerCase());
 
 /** Resolve a (possibly schema-qualified) table reference at index i.
@@ -357,9 +394,10 @@ export function findSanctionedMutationViolations(source, fileName = "file.ts", o
   const violations = [];
   const seen = new Set();
 
-  // A per-line `// ALLOWLIST: <reason>` exempts the line — but ONLY with a
-  // NON-TRIVIAL reason (codex T5: a bare `// ALLOWLIST: x` must not authorize).
-  // Returns the reason string when a valid exemption is present, else null.
+  // A per-line `// ALLOWLIST: <reason>` exempts the line. The reason check is a
+  // SHAPE gate only — it rejects a trivially empty / one-token reason but does
+  // NOT verify justification (codex T5). Meaning is HUMAN-REVIEWED via the emitted
+  // report. Returns the reason when a shape-valid exemption is present, else null.
   const allowlistReason = (node) => {
     const start = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line;
     const end = sf.getLineAndCharacterOfPosition(node.getEnd()).line;
@@ -367,7 +405,7 @@ export function findSanctionedMutationViolations(source, fileName = "file.ts", o
       const m = lines[ln].match(/\/\/\s*ALLOWLIST:\s*(.+?)\s*$/);
       if (m) {
         const reason = m[1].trim();
-        // Non-trivial = a real justification: ≥8 chars OR two+ words. `x` fails.
+        // Shape gate (NOT justification): ≥8 chars OR two+ words. `x` / `aa` fail.
         if (reason.length >= 8 || /\S+\s+\S+/.test(reason)) return reason;
       }
     }
@@ -465,7 +503,7 @@ function main() {
   // LOUD in CI, never "detectable only by a human noticing the diff". These do
   // NOT fail the gate on their own; each is printed for review.
   if (allowlisted.length > 0) {
-    process.stderr.write(`sanctioned-mutation-guard: ${allowlisted.length} ALLOWLIST exemption(s) in effect (review each):\n`);
+    process.stderr.write(`sanctioned-mutation-guard: ${allowlisted.length} ALLOWLIST exemption(s) in effect — reasons are HUMAN-REVIEWED, not machine-verified; confirm each is justified:\n`);
     for (const a of allowlisted) process.stderr.write(`  ALLOWLIST ${a.file}:${a.line}  ${a.sql}  — reason: ${a.reason}\n`);
   }
   if (all.length > 0) {
