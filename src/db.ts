@@ -4217,6 +4217,13 @@ export function _getLivenessProbeCountForTests(): number {
   return _livenessProbeCount;
 }
 
+/** Test-only: seed the in-memory positive-probe cache, so `last_alive`
+ *  (positiveConfirmationISO) can be driven to CHANGE between reads without a
+ *  live process on a real ~5s probe cycle. Mirrors the reset/count hooks. */
+export function _setPositiveProbeForTests(name: string, atMs: number): void {
+  _positiveProbeCache.set(name, atMs);
+}
+
 /** v2.15.0 — the three-way presence verdict. `unknown` = no positive AND no
  *  negative signal (agent_pid absent, or cross-host so we can't probe) — it is
  *  the honest "we don't know", NEVER treated as death. */
