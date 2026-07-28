@@ -26,15 +26,18 @@
  *
  * ── THE TERMINAL BAR (do not widen this; widening is how every round started) ─
  *
- *     ACCEPT ONLY a bare identifier call that resolves to a DIRECT TOP-LEVEL
- *     FUNCTION DECLARATION, WITH A BODY, whose name is sanctioned, IN THE FILE
- *     UNDER ANALYSIS — plus a `const` alias, declared before the call, that
- *     itself so resolves. REJECT EVERYTHING ELSE.
+ *     ACCEPT ONLY a bare identifier call that resolves to a VERIFIED TOP-LEVEL
+ *     FUNCTION DECLARATION WITH A BODY whose name is sanctioned — in the file
+ *     under analysis, OR one hop away through a direct relative NAMED import
+ *     whose imported name is sanctioned and whose target file declares it that
+ *     way — plus a `const` alias, declared before the call, that itself so
+ *     resolves. REJECT EVERYTHING ELSE.
  *
- * Rejected wholesale: every import form (named, default, namespace, equals,
- * renamed), every ambient declaration, every variable / class / enum / `using`
- * binding, every property or element receiver, every shadowed or ambiguous name,
- * and every unresolved free name.
+ * Rejected wholesale: renamed / default / namespace / `import =` bindings, bare
+ * package specifiers, unresolvable paths, re-export and barrel chains, every
+ * ambient declaration, every variable / class / enum / `using` binding, every
+ * property or element receiver, every shadowed or ambiguous name, and every
+ * unresolved free name.
  *
  * This is why it is TERMINAL rather than one more patch. Every earlier round
  * accepted a CATEGORY and then discovered which members of the category nobody
@@ -92,10 +95,34 @@
  * spelling and identity come apart hardest. The reasoning inside the frame was
  * sound; the frame was drawn too small.
  *
- * STATED BOUNDARY, not a gap to close casually: this helper handles SAME-FILE
- * primitives only. A guard whose primitive is IMPORTED cannot use it — that
- * needs canonical module/symbol identity (a TypeChecker, or an explicit trusted
- * declaration reference). Do not build toward it by widening the bar.
+ * ── ⚠ THIS BOUNDARY WAS REWRITTEN IN #145. READ WHY. ────────────────────────
+ * It previously said: *"this helper handles SAME-FILE primitives only. A guard
+ * whose primitive is IMPORTED cannot use it … Do not build toward it by widening
+ * the bar."* That sentence is SUPERSEDED, and it is replaced rather than quietly
+ * contradicted, because inheriting a stale map is how the next person gets hurt.
+ *
+ * WHAT WAS ACTUALLY WRONG WITH IT: "same file" was never the requirement. **A
+ * VERIFIED TOP-LEVEL FUNCTION DECLARATION** was. The helper simply could not see
+ * past the file boundary, and the boundary note described that limitation as if
+ * it were the rule.
+ *
+ * #145 proved it mattered: `registerPersistedSecret` and `generateToken` are
+ * IMPORTED into src/db.ts (declared in src/secret-registry.ts and src/auth.ts).
+ * Measured against the real file, the same-file-only bar recognised **0 of 5**
+ * legitimate call sites and would have failed every build.
+ *
+ * THE NEW BOUNDARY — direct relative NAMED imports, one hop, verified:
+ *   HANDLES: `import { primitive } from "./sibling.js"` where the IMPORTED name
+ *     is sanctioned AND that file declares it as a top-level function with a
+ *     body. Identity is settled by the declaration node, never by the specifier
+ *     string — the specifier is demoted to a path lookup.
+ *   REFUSES (all OVER-flag): renamed imports (`{ other as primitive }`), default,
+ *     namespace and `import =` bindings, bare package specifiers, unresolvable
+ *     paths, re-export chains and barrel files (ONE hop only — not chased),
+ *     dynamic imports.
+ * The PREDICATE is unchanged; only its REACH grew. If the real import graph ever
+ * stops being direct relative specifiers to sibling files, this is the point
+ * where a TypeChecker wins — measure it rather than assuming it stays simple.
  *
  * ── GUARD TAXONOMY (the durable map — answers "could this defect be here?") ───
  *   • must-CALL — "a function that does X must CALL Y" (auth-gen-guard,
@@ -143,6 +170,61 @@
  *     @fixture "ACCEPTED RISK ... an if(false) bump still passes"
  */
 import ts from "typescript";
+import fs from "fs";
+import path from "path";
+
+/**
+ * RESOLVE-AND-VERIFY (Victra ruling, #145) — parse cache for one-hop import
+ * resolution. Keyed by absolute path; each imported module is read and parsed at
+ * most once per process.
+ */
+const _moduleCache = new Map();
+
+/**
+ * Resolve a RELATIVE module specifier to a real source file on disk.
+ *
+ * Returns null — meaning REFUSE — for anything not a direct relative path to an
+ * existing file: bare package specifiers, unresolvable paths, and (by omission)
+ * anything needing node_modules resolution. Refusing is the OVER-flag direction.
+ * @fixture "TERMINAL BAR: a bare package import is refused"
+ */
+function resolveRelativeModule(specifier, fromFileName) {
+  if (!specifier.startsWith("./") && !specifier.startsWith("../")) return null;
+  if (!fromFileName || !path.isAbsolute(fromFileName)) return null;
+  const base = path.resolve(path.dirname(fromFileName), specifier);
+  // TS ESM writes `./x.js` for `./x.ts`. Try the TS source first, then literal.
+  const candidates = base.endsWith(".js")
+    ? [base.slice(0, -3) + ".ts", base.slice(0, -3) + ".tsx", base]
+    : [base + ".ts", base + ".tsx", base, path.join(base, "index.ts")];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
+    } catch {
+      /* unreadable → refuse */
+    }
+  }
+  return null;
+}
+
+/** Parse a resolved module once, with parents (the scope chain needs them). */
+function parseModule(absPath) {
+  const hit = _moduleCache.get(absPath);
+  if (hit !== undefined) return hit;
+  let parsed = null;
+  try {
+    parsed = ts.createSourceFile(
+      absPath,
+      fs.readFileSync(absPath, "utf-8"),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
+    );
+  } catch {
+    parsed = null; // unreadable → refuse
+  }
+  _moduleCache.set(absPath, parsed);
+  return parsed;
+}
 
 function isFunctionNode(n) {
   return (
@@ -390,6 +472,67 @@ function isPrimitiveDeclaration(decl, names) {
 }
 
 /**
+ * RESOLVE-AND-VERIFY: is this binding a NAMED IMPORT that genuinely resolves to
+ * the sanctioned primitive one file over?
+ *
+ * ── WHY THIS IS NOT A WIDENING OF THE BAR ────────────────────────────────────
+ * The tempting version accepts on "module specifier string + imported name."
+ * That makes an IDENTITY CLAIM REST ON A STRING — the same class of defect this
+ * whole arc has been deleting. This instead DEMOTES the specifier to a path
+ * lookup and settles identity by verifying the actual declaration node in the
+ * resolved file, using the IDENTICAL predicate (`isPrimitiveDeclaration`).
+ * The predicate is unchanged; only its REACH grows, by exactly one hop, with a
+ * verification at the end of it.
+ *
+ * REQUIRES ALL THREE:
+ *   1. the IMPORTED name (`propertyName ?? name`) is sanctioned — so
+ *      `import { other as registerPersistedSecret }` is REFUSED, because the
+ *      local spelling is precisely not the imported thing.
+ *      @fixture "RESOLVE-AND-VERIFY: a renamed import is refused"
+ *   2. the specifier resolves to a real source file (relative paths only)
+ *   3. in THAT file the imported name is a top-level function declaration with
+ *      a body.
+ *
+ * REFUSES, all OVER-flagging (loud false failure, never a hole): default,
+ * namespace and `import =` bindings; bare package specifiers; unresolvable
+ * paths; re-export chains and barrel files (NOT followed — one hop only);
+ * dynamic imports.
+ * @fixture "RESOLVE-AND-VERIFY: a re-export chain is refused (one hop only)"
+ */
+function importResolvesToPrimitive(decl, names, fromFileName) {
+  // ONLY a named ImportSpecifier. ImportClause (default), NamespaceImport and
+  // ImportEqualsDeclaration all fall through to refusal.
+  if (!decl || !ts.isImportSpecifier(decl)) return false;
+  const importedName = (decl.propertyName ?? decl.name)?.text;
+  if (!importedName || !names.has(importedName)) return false;
+
+  const decl_ = decl.parent?.parent?.parent; // ImportSpecifier→NamedImports→ImportClause→ImportDeclaration
+  const spec = decl_ && ts.isImportDeclaration(decl_) ? decl_.moduleSpecifier : undefined;
+  if (!spec || !ts.isStringLiteral(spec)) return false;
+
+  const abs = resolveRelativeModule(spec.text, fromFileName);
+  if (!abs) return false;
+  const mod = parseModule(abs);
+  if (!mod) return false;
+
+  // The SAME predicate, one file over. A re-export (`export { x } from "./y"`)
+  // is not a FunctionDeclaration, so a barrel refuses here rather than being
+  // chased — one hop, verified, or nothing.
+  for (const st of mod.statements) {
+    if (
+      ts.isFunctionDeclaration(st) &&
+      st.body &&
+      st.name &&
+      st.name.text === importedName &&
+      names.has(st.name.text)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * THE PREMISE this helper rests on: each sanctioned name must actually BE a
  * top-level function declaration in the file under analysis. Returns the names
  * that are NOT.
@@ -402,6 +545,43 @@ function isPrimitiveDeclaration(decl, names) {
  * so precisely. Today it is a no-op: both primitives are `export function`.
  * @fixture "PREMISE: a primitive converted to a const arrow is reported by name"
  */
+/**
+ * PREMISE for a guard whose primitives are IMPORTED (#145): does each sanctioned
+ * name RESOLVE, from this file, to a verified top-level function declaration —
+ * same-file OR one hop through a direct relative named import? Returns those
+ * that do not.
+ *
+ * Same job as findUnsatisfiedPrimitives, one environment over. Without it, a
+ * primitive that stops resolving (moved to a barrel, re-exported, renamed at the
+ * import site) makes EVERY minter read as unregistered — the guard would still
+ * fail loudly, but as an avalanche that reads like the codebase broke rather
+ * than like the guard's premise did. This says which.
+ * @fixture "PREMISE: an unresolvable primitive is reported by name"
+ */
+export function findUnresolvablePrimitives(sf, names) {
+  const missing = [];
+  for (const name of names) {
+    let ok = false;
+    for (const st of sf.statements) {
+      if (ts.isFunctionDeclaration(st) && st.body && st.name && st.name.text === name) ok = true;
+    }
+    if (!ok) {
+      // Look for a named import of it and verify one hop.
+      for (const st of sf.statements) {
+        if (!ts.isImportDeclaration(st)) continue;
+        const named = st.importClause?.namedBindings;
+        if (!named || !ts.isNamedImports(named)) continue;
+        for (const el of named.elements) {
+          if (el.name.text !== name) continue;
+          if (importResolvesToPrimitive(el, new Set([name]), sf.fileName)) ok = true;
+        }
+      }
+    }
+    if (!ok) missing.push(name);
+  }
+  return missing;
+}
+
 export function findUnsatisfiedPrimitives(sf, names) {
   const missing = [];
   for (const name of names) {
@@ -454,10 +634,12 @@ function constAliasInitializer(decl) {
  *   • a `let`/`var` alias, a destructured alias, a dynamically-accessed name.
  *
  * @param {ts.Node} bodyNode  the function body to scan
- * @param {ts.SourceFile} _sf  (kept for signature symmetry)
+ * @param {ts.SourceFile} sf   the parsed file — its `fileName` MUST be a real
+ *   absolute path for one-hop import resolution to work; when it is not, imports
+ *   simply refuse (over-flag).
  * @param {Set<string>} names  callee names that count as "the required call"
  */
-export function bodyCallsFunction(bodyNode, _sf, names) {
+export function bodyCallsFunction(bodyNode, sf, names) {
   // Resolution walks parent links. Throwing is deliberate: without them every
   // shadow is invisible and the guard would silently UNDER-detect. The CLI
   // catches this and exits non-zero.
@@ -481,6 +663,10 @@ export function bodyCallsFunction(bodyNode, _sf, names) {
     // @fixture "TERMINAL BAR: an unresolved free name is refused"
     if (decls.length !== 1) return false;
     if (isPrimitiveDeclaration(decls[0], names)) return true;
+    // One hop, verified — see importResolvesToPrimitive. `_sf.fileName` must be a
+    // real absolute path for this to resolve; when it is not (unit fixtures), it
+    // simply refuses, which is the over-flag direction.
+    if (importResolvesToPrimitive(decls[0], names, sf?.fileName)) return true;
     if (!allowAlias) return false;
     const init = constAliasInitializer(decls[0]);
     if (!init) return false;
