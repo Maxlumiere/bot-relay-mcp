@@ -51,7 +51,7 @@ import ts from "typescript";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { forEachFunctionUnit, bodyCallsFunction } from "./lib/guard-ast.mjs";
+import { forEachFunctionUnit, bodyCallsFunction, isTopLevelFunctionDeclaration } from "./lib/guard-ast.mjs";
 
 const SENSITIVE_COLS = [
   "token_hash",
@@ -118,7 +118,17 @@ export function findAuthGenViolations(source, fileName = "db.ts") {
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const violations = [];
   forEachFunctionUnit(sf, (name, bodyNode, nameNode) => {
-    if (!name || SELF_BUMPERS.has(name) || INIT_ONLY_ALLOWLIST.has(name)) return;
+    if (!name) return;
+    // ROOT G (codex, #151 round 2): this exemption used to key on the NAME
+    // alone, so ANY unit spelled `bumpAuthGeneration` — a class field, a method,
+    // an object-literal property — was exempt wholesale. A mutator could do the
+    // harmful UPDATE and skip the guard entirely just by being named after the
+    // primitive. The exemption must mean "IS the sanctioned primitive," which is
+    // the TOP-LEVEL FUNCTION DECLARATION, not anything sharing its spelling.
+    // Same disease as the callee side: identity by spelling instead of binding.
+    if ((SELF_BUMPERS.has(name) || INIT_ONLY_ALLOWLIST.has(name)) && isTopLevelFunctionDeclaration(nameNode)) {
+      return;
+    }
     const bodyText = bodyNode.getText(sf);
     // TRIGGER: text (over-trigger-safe). REQUIRED CALL: structural (a real
     // CallExpression to bumpAuthGeneration / applyAuthStateTransition or a direct
@@ -150,7 +160,12 @@ function main() {
       }
     }
   } catch (err) {
-    process.stderr.write(`auth-gen-guard: parse error: ${err instanceof Error ? err.message : String(err)}\n`);
+    // Labelled "analysis error", not "parse error": this catch covers the whole
+    // analysis, and the most likely throw is the parent-links contract
+    // violation from bodyCallsFunction — nothing to do with malformed TS. A
+    // loud failure with a misleading label still sends the next person hunting
+    // for a syntax error that does not exist.
+    process.stderr.write(`auth-gen-guard: analysis error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exit(2);
   }
   if (all.length > 0) {
@@ -158,7 +173,19 @@ function main() {
       "ADR-0003 auth-generation drift: these functions mutate token/auth validity but never bump the auth generation (a stale verified-token cache = accepting a revoked token):\n",
     );
     for (const v of all) process.stderr.write(`  ${v.file}:${v.line}  ${v.name}()\n`);
-    process.stderr.write("\nFix: call bumpAuthGeneration() after the mutation (or route through applyAuthStateTransition).\n");
+    process.stderr.write(
+      "\nFix: call bumpAuthGeneration() after the mutation (or route through applyAuthStateTransition).\n" +
+        "\nIF YOU BELIEVE YOU ALREADY BUMP: this guard only accepts a call it can prove\n" +
+        "reaches the top-level primitive — a BARE call, or a `const` alias of one. It\n" +
+        "deliberately REFUSES these, because it cannot prove which binding they reach:\n" +
+        "  • any receiver form   — db.bumpAuthGeneration(), this.bumpAuthGeneration()\n" +
+        "  • a destructured ref  — const { bumpAuthGeneration } = db;\n" +
+        "  • a property alias    — const b = db.bumpAuthGeneration;\n" +
+        "  • a let/var alias, or a name shadowed by a parameter/local/nested function\n" +
+        "Each of those is refused LOUDLY rather than passed silently: a missed bump is a\n" +
+        "stale auth cache, and this guard would rather fail your build than miss one.\n" +
+        "The remedy is the direct call: `bumpAuthGeneration();` after the mutation.\n",
+    );
     process.exit(1);
   }
   process.stdout.write("All token/auth mutators bump the auth generation — verified-token cache invalidation intact\n");

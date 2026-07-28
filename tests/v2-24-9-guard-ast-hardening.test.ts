@@ -197,8 +197,19 @@ describe("v2.24.9 #151 r2 — alias binding + scope safety (harm fixtures, all e
     expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} const bump = bumpAuthGeneration; bump(); }`, "t.ts")).toEqual([]);
   });
 
-  it("TWIN: a property access on the REAL name still counts (db.bumpAuthGeneration())", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} db.bumpAuthGeneration(); }`, "t.ts")).toEqual([]);
+  // DELIBERATELY INVERTED in #151 round 3. This used to assert that
+  // `db.bumpAuthGeneration()` is an innocent twin. It is not: the sanctioned
+  // primitives are TOP-LEVEL FUNCTIONS in this codebase — verified, both are
+  // `export function`, all 18 call sites are bare identifiers, and there are
+  // ZERO property-style calls in src/db.ts. Treating a receiver form as the
+  // sanctioned call was root E, and keeping a "closed set of receivers" would
+  // have preserved the hole while looking safe.
+  it("ROOT E: a RECEIVER form is refused — no receiver is the sanctioned primitive (db.x())", () => {
+    expect(names(`function rotate(name, h){ ${MUT} db.bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("ROOT E: an unrelated receiver spelled like the primitive is refused (metrics.x())", () => {
+    expect(names(`function rotate(name, h){ ${MUT} metrics.bumpAuthGeneration(); }`)).toContain("rotate");
   });
 
   it("TWIN: a bump inside a bare nested block still counts — a block is not a function boundary", () => {
@@ -219,6 +230,51 @@ describe("v2.24.9 #151 r2 — alias binding + scope safety (harm fixtures, all e
 
   it("STATED BOUNDARY (not closed): a destructured reference reads as absent → OVER-flags, the safe direction", () => {
     expect(names(`function rotate(name, h){ ${MUT} const { bumpAuthGeneration: b } = db; b(); }`)).toContain("rotate");
+  });
+
+  it("ROOT F1: a nested FUNCTION DECLARATION shadowing the primitive is refused", () => {
+    expect(names(`function rotate(name, h){ ${MUT} function bumpAuthGeneration(){} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("ROOT F2: an ENCLOSING-scope block shadow around the unit is refused", () => {
+    expect(names(`{ const bumpAuthGeneration = () => log("x"); function rotate(name, h){ ${MUT} bumpAuthGeneration(); } }`)).toContain("rotate");
+  });
+
+  // codex's actual F3 shape: the alias is bound exactly ONCE inside the unit (so
+  // round 2's bound-exactly-once rule accepted it) but only inside a BLOCK, while
+  // the call sits outside that block and resolves to an unrelated MODULE-level
+  // binding. This refutes the round-2 doc claim that a name bound once in a unit
+  // "provably refers to that target at every position."
+  it("ROOT F3: a block-local alias does not escape its block — the call outside resolves elsewhere", () => {
+    expect(names(`const f = () => log("outer");\nfunction rotate(name, h){ ${MUT} { const f = bumpAuthGeneration; } f(); }`)).toContain("rotate");
+  });
+
+  it("ROOT F4: a named function expression's own binding is RECURSION, not the primitive", () => {
+    expect(names(`const rotate = function bumpAuthGeneration(name, h){ ${MUT} bumpAuthGeneration(); };`)).toContain("rotate");
+  });
+
+  it("ROOT F5: a class-field method collision via this.x() is refused", () => {
+    expect(names(`class C { bumpAuthGeneration(){} rotate = (name, h) => { ${MUT} this.bumpAuthGeneration(); }; }`)).toContain("rotate");
+  });
+
+  it("ROOT G: a unit merely SPELLED like the primitive is ANALYSED, not exempt wholesale", () => {
+    expect(names(`class C { bumpAuthGeneration = (name, h) => { ${MUT} }; }`)).toContain("bumpAuthGeneration");
+  });
+
+  it("ROOT G: the same for an allowlisted migration name on a class field", () => {
+    expect(names(`class C { migrateSchemaToV2_1 = (name, h) => { ${MUT} }; }`)).toContain("migrateSchemaToV2_1");
+  });
+
+  it("TWIN (ROOT G): the REAL top-level primitive IS still exempt from bumping itself", () => {
+    expect(findAuthGenViolations(`function bumpAuthGeneration(){ ${MUT} }`, "t.ts")).toEqual([]);
+  });
+
+  it("TWIN (ROOT G): the REAL top-level allowlisted migration is still exempt", () => {
+    expect(findAuthGenViolations(`function migrateSchemaToV2_1(db){ ${MUT} }`, "t.ts")).toEqual([]);
+  });
+
+  it("TWIN: an honest const alias still resolves when USED INSIDE a block", () => {
+    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} const bump = bumpAuthGeneration; { bump(); } }`, "t.ts")).toEqual([]);
   });
 
   it("LOUD-FAILURE CONTRACT: bodyCallsFunction THROWS without parent links rather than silently under-detecting on parameters", () => {
