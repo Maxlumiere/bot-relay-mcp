@@ -7,6 +7,7 @@
 import { loadConfig, validateConfigAndEnv, InvalidConfigError, readConfigFileKeys } from "./config.js";
 import { startStdioServer } from "./transport/stdio.js";
 import { startHttpServer } from "./transport/http.js";
+import { registerConfigSecret } from "./secret-registry.js";
 import { closeDb, initializeDb } from "./db.js";
 import { assertInstanceResolution } from "./instance.js";
 import { startOutboxTail, stopOutboxTail } from "./outbox-tail.js";
@@ -57,6 +58,14 @@ async function main(): Promise<void> {
   const sources = applyCliToEnv(parsed.flags, process.env, fileKeys);
 
   const config = loadConfig();
+
+  // PR C — register the operator/transport secrets at boot ingress so redact-by-
+  // value (secret-registry) scrubs them from any log or config-dump line. This is
+  // the non-minted-secret ingress. `dashboard_secret` (ADR-0006) is read
+  // defensively so this compiles before that config field lands and registers it
+  // once present; registerSecret no-ops on null/undefined and short values.
+  registerConfigSecret(config.http_secret);
+  registerConfigSecret((config as unknown as Record<string, unknown>).dashboard_secret);
 
   // B1: emit a source-log line per resolved value so operators can see which
   // layer won for each knob. Helps diagnose "I set --port=3777 but it's

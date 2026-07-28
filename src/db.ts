@@ -20,6 +20,7 @@ import type {
 } from "./types.js";
 import { VALID_TRANSITIONS, ACTION_TO_STATUS } from "./types.js";
 import { generateToken, hashToken, verifyToken } from "./auth.js";
+import { registerPersistedSecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
 import { computeTokenLookup } from "./token-lookup.js";
 import { normalizeAgentClass, TOPOLOGY_VISIBLE_CLASSES, TOPOLOGY_HIDDEN_CLASSES, TRANSIENT } from "./agent-class.js";
@@ -3129,6 +3130,11 @@ export function mintAgentToken(
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
 
+  // PR C v2 — register the persisted token AFTER both success branches committed
+  // (the non-force collision and changes!==1 throw paths above return early), so
+  // a failed mint never plants a throwaway. See registerPersistedSecret.
+  registerPersistedSecret(name, plaintext_token);
+
   const row = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
   return { agent: toAgentWithStatus(row), plaintext_token, created };
 }
@@ -3488,6 +3494,12 @@ export function registerAgent(
   // the returned list — circular-import-safe.
   const auto_assigned = tryAssignQueuedTasksTo(agentWithStatus.name, agentWithStatus.capabilities);
 
+  // PR C v2 — register the persisted secrets AFTER the CAS/INSERT committed (the
+  // ForcePrecondition / ConcurrentUpdate throw paths above return early). Both
+  // branches converge here: re-register sets plaintext_token (null when the token
+  // was preserved → skipped), first-registration sets both token + recovery.
+  // Never before commit; a failed re-register plants no throwaway.
+  registerPersistedSecret(name, plaintext_token, registration_recovery);
   return { agent: agentWithStatus, plaintext_token, auto_assigned, registration_recovery };
 }
 
@@ -3562,6 +3574,7 @@ export function rotateAgentToken(
         );
       }
       bumpAuthGeneration(); // ADR-0003: token rotated (hard-cut)
+      registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
       return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt: null };
     }
 
@@ -3589,6 +3602,7 @@ export function rotateAgentToken(
       );
     }
     bumpAuthGeneration(); // ADR-0003: token rotated (grace)
+    registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
     return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt };
   }
 
@@ -3605,6 +3619,7 @@ export function rotateAgentToken(
     );
   }
   bumpAuthGeneration(); // ADR-0003: token rotated (unmanaged)
+  registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
   return { newPlaintextToken, newHash, agentClass: "unmanaged", graceExpiresAt: null };
 }
 
@@ -3652,6 +3667,7 @@ export function rotateAgentTokenAdmin(
         );
       }
       bumpAuthGeneration(); // ADR-0003: admin token rotated (hard-cut)
+      registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
       return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt: null };
     }
 
@@ -3675,6 +3691,7 @@ export function rotateAgentTokenAdmin(
       );
     }
     bumpAuthGeneration(); // ADR-0003: admin token rotated (grace)
+    registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
     return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt };
   }
 
@@ -3690,6 +3707,7 @@ export function rotateAgentTokenAdmin(
     );
   }
   bumpAuthGeneration(); // ADR-0003: admin token rotated (unmanaged)
+  registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
   return { newPlaintextToken, newHash, agentClass: "unmanaged", graceExpiresAt: null };
 }
 
@@ -3783,6 +3801,10 @@ export function revokeAgentToken(
   // on generation, so we MUST bump here or a revoked token would keep passing
   // from cache. (The revoke-trap.)
   if (r.changes > 0) bumpAuthGeneration();
+  // PR C v2 — register the recovery token only if it was actually PERSISTED (the
+  // CAS updated a row AND a recovery token was issued). A no-op revoke on an
+  // already-revoked row (changes===0) persisted no secret → nothing to register.
+  if (r.changes > 0 && recoveryToken) registerPersistedSecret(targetName, recoveryToken);
 
   return {
     revoked: r.changes > 0,
