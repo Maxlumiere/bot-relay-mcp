@@ -30,6 +30,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
+import { withDeadline } from "./http-deadline.js";
 import Database from "better-sqlite3";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
@@ -237,11 +238,14 @@ async function probeDaemonRunning(): Promise<boolean> {
   const port = parseInt(process.env.RELAY_HTTP_PORT || "3777", 10);
   const host = process.env.RELAY_HTTP_HOST || "127.0.0.1";
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 1000);
-    const res = await fetch(`http://${host}:${port}/health`, { signal: ctrl.signal });
-    clearTimeout(timer);
-    return res.ok;
+    // NOT A BUG FIX — this never read a body, so the cleared timer had nothing
+    // left to bound and it could not hang. Converted for one predicate, one
+    // shape: every bounded network call in the CLI now goes through the same
+    // owned deadline, so the next person copying this site copies the safe form.
+    return await withDeadline(1000, `daemon /health at ${host}:${port}`, async (signal) => {
+      const res = await fetch(`http://${host}:${port}/health`, { signal });
+      return res.ok;
+    });
   } catch {
     return false;
   }
