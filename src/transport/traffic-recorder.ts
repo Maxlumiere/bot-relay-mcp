@@ -31,7 +31,7 @@
  */
 import fs from "fs";
 import path from "path";
-import { log } from "../logger.js";
+import { log, redactSecrets } from "../logger.js";
 
 const MAX_LOG_BYTES = 1024 * 1024 * 1024; // 1 GB
 
@@ -99,6 +99,16 @@ function redact(value: unknown): unknown {
     }
     return out;
   }
+  // A bare STRING can carry a credential INSIDE it — most importantly the MCP
+  // response envelope `content[].text`, a serialized JSON blob where a minted
+  // token (agent_token / new_token / recovery_token / registration_recovery)
+  // lives as a SUBSTRING, never as an object key REDACT_KEYS could match. The
+  // field-name walk above never descends into it; that is the P1 that fsync'd
+  // minted tokens to disk cleartext when RELAY_RECORD_TRAFFIC was set. Run the
+  // logger's redactor over every string so those are scrubbed — by field-name
+  // AND by the `RELAY_AGENT_TOKEN=` / `Authorization:` anchors — before the line
+  // hits disk. (The registry pass, added next, makes this redact-by-VALUE too.)
+  if (typeof value === "string") return redactSecrets(value);
   return value;
 }
 
