@@ -25,7 +25,12 @@ import crypto from "crypto";
 export const BCRYPT_ROUNDS = 10;
 const TOKEN_BYTE_LEN = 32;
 
-/** Generate a cryptographically random agent token (base64url). */
+/**
+ * Generate a cryptographically random agent token (base64url). Pure — the
+ * redact-by-value registry is fed at the IDENTITY-association sites in db.ts
+ * (registerAgent / rotate / revoke / mintAgentToken), which key each token to its
+ * owning principal so a live token is never aged out by mint volume (secret-registry).
+ */
 export function generateToken(): string {
   return crypto.randomBytes(TOKEN_BYTE_LEN).toString("base64url");
 }
