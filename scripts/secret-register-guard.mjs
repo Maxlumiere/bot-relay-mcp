@@ -17,12 +17,32 @@
  * src/db.ts, finds every function whose body mints a token, and asserts each ALSO
  * calls registerPersistedSecret.
  *
- * "Mints a token" = the function body calls `generateToken(`. Verified at authoring
- * time: every generateToken() use in db.ts produces a PERSISTED credential (agent
- * token, rotated token, or recovery handle), so this trigger has no false
- * positives today. Over-inclusion is SAFE (it only demands a register call);
- * under-inclusion is the dangerous direction, so the trigger is deliberately
- * coarse.
+ * "Mints a token" = the unit contains a RESOLVED CALL to `generateToken` — not a
+ * body-text match. Verified at authoring time: every generateToken() use in db.ts
+ * produces a PERSISTED credential (agent token, rotated token, or recovery
+ * handle), so the trigger has no false positives today.
+ *
+ * DIRECTION, per case (the bare word "coarse" used to stand here and hid a
+ * quantifier — see the two mechanical rules in guard-ast.mjs):
+ *   • a unit that mints for a NON-persisted purpose would be flagged and told to
+ *     register → OVER-flag, loud false build failure, safe.
+ *     @fixture "TWIN: a unit that mints and registers passes"
+ *   • a mint reached by a form the resolver REFUSES reads as NO MINT → no
+ *     register is demanded → the unit passes → **UNDER-detect**. This is the
+ *     dangerous direction, and it is the price of resolving the trigger. It is
+ *     NOT hypothetical — MEASURED: `import * as auth` + `auth.generateToken()`
+ *     is a real mint that the trigger does not see, so an unregistered token
+ *     there passes. src/db.ts uses a direct named import, so this is not live
+ *     today; it is a KNOWN, PINNED boundary, not a closed one.
+ *     @fixture "STATED BOUNDARY: a namespace-import mint escapes the trigger"
+ *   • a LOCAL FAKE `generateToken` correctly does NOT trigger — it is not the
+ *     primitive, so no register is owed. That one is right, not a gap.
+ *     @fixture "TWIN: a local fake generateToken owes nothing"
+ *
+ * Leaving the trigger on TEXT would have been worse in the other direction: any
+ * comment or string mentioning generateToken would demand a register (noisy), and
+ * an aliased real mint would still be missed. Structural on both sides keeps the
+ * two halves at the same strength — the #151 two-sided-predicate lesson.
  *
  * ── BOUNDARY — what this guard enforces, and what it does NOT (state it, never
  *    imply totality; same discipline as auth-gen-guard) ──────────────────────
@@ -52,73 +72,68 @@ import ts from "typescript";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import {
+  forEachFunctionUnit,
+  bodyCallsFunction,
+  isTopLevelFunctionDeclaration,
+  findUnresolvablePrimitives,
+} from "./lib/guard-ast.mjs";
 
-const MINT_CALL_RE = /\bgenerateToken\s*\(/;
-const REGISTER_CALL_RE = /\bregisterPersistedSecret\s*\(/;
-// registerPersistedSecret is the sanctioned register primitive; it lives in
-// secret-registry.ts, not db.ts, so it never needs to register itself. Kept as an
-// EXPLICIT allowlist so a future db.ts helper that legitimately mints a token for
-// a non-persisted purpose can be added CONSCIOUSLY rather than silently evading.
+/**
+ * ── v2.24.11 REBUILD ON THE SHARED HELPER — BOTH SIDES STRUCTURAL ────────────
+ * v1 of this guard regexed the function's raw body TEXT for BOTH halves:
+ * `/\bgenerateToken\s*\(/` for the trigger and `/\bregisterPersistedSecret\s*\(/`
+ * for the required call. So a `// TODO: registerPersistedSecret(name, t)` comment
+ * satisfied it, and an aliased or shadowed name defeated it — the same seven
+ * root causes (A-G) auth-gen-guard failed audit on four times.
+ *
+ * BOTH halves now resolve a real CallExpression through scripts/lib/guard-ast.mjs.
+ * The trigger is hardened too, deliberately: **a two-sided predicate is only as
+ * strong as its weaker side** — if the trigger never fires, no register is ever
+ * demanded and the hardened required-call side never runs. That was the #151
+ * lesson and it is why this does not fix one half and stop.
+ *
+ * ENVIRONMENT — verified for THIS file, not inherited from db.ts's other guard:
+ * both primitives are IMPORTED into src/db.ts (`./auth.js`, `./secret-registry.js`)
+ * and declared as top-level `export function` in those files. The helper resolves
+ * one hop and VERIFIES the declaration node there. Measured on the real file:
+ * 5/5 legitimate units recognised on both sides, 0 missed.
+ */
+const MINT = new Set(["generateToken"]);
+const REGISTER = new Set(["registerPersistedSecret"]);
+// The register primitives themselves never need to register their own output.
+// SCOPED BY DECLARATION, NOT BY NAME (root G, codex #151): keying an exemption on
+// a NAME let any unit merely SPELLED `registerPersistedSecret` — a class field, a
+// method — skip the guard wholesale. An exemption must mean "IS the primitive."
 const EXEMPT = new Set(["registerPersistedSecret", "registerIdentitySecret"]);
-
-/** Does this function body mint a token (and therefore owe a register call)? */
-function mintsAToken(bodyText) {
-  return MINT_CALL_RE.test(bodyText);
-}
 
 /**
  * Analyze source text; return { name, line } for functions that mint a token but
  * never call registerPersistedSecret. Exported so the negative-fixture test can
  * prove the guard FAILS on an omitted register.
+ *
+ * `fileName` SHOULD be an absolute path — one-hop import resolution needs it.
+ * When it is not, imported primitives simply do not resolve and every minter
+ * reads as unregistered: loud over-flag, never a silent pass.
+ * @fixture "trigger and required call both resolve through imports"
  */
 export function findSecretRegisterViolations(source, fileName = "db.ts") {
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const violations = [];
-
-  const analyze = (name, bodyNode, nameNode) => {
-    if (!name || EXEMPT.has(name)) return;
-    const bodyText = bodyNode.getText(sf);
-    if (mintsAToken(bodyText) && !REGISTER_CALL_RE.test(bodyText)) {
-      violations.push({ name, line: sf.getLineAndCharacterOfPosition(nameNode.getStart(sf)).line + 1 });
-    }
-  };
-
-  const visit = (node) => {
-    // 1. function NAME(...) { ... }
-    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
-      analyze(node.name.text, node.body, node.name);
-    }
-    // 2. const NAME = (...) => { ... } / const NAME = function (...) { ... }
-    else if (
-      ts.isVariableDeclaration(node) &&
-      node.name &&
-      ts.isIdentifier(node.name) &&
-      node.initializer &&
-      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer)) &&
-      node.initializer.body
-    ) {
-      analyze(node.name.text, node.initializer.body, node.name);
-    }
-    // 3. class/object method NAME(...) { ... }
-    else if (ts.isMethodDeclaration(node) && node.name && ts.isIdentifier(node.name) && node.body) {
-      analyze(node.name.text, node.body, node.name);
-    }
-    // 4. { NAME: (...) => { ... } } object-literal property holding a function
-    else if (
-      ts.isPropertyAssignment(node) &&
-      node.name &&
-      ts.isIdentifier(node.name) &&
-      node.initializer &&
-      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer)) &&
-      node.initializer.body
-    ) {
-      analyze(node.name.text, node.initializer.body, node.name);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
+  forEachFunctionUnit(sf, (name, bodyNode, nameNode) => {
+    if (!name) return;
+    if (EXEMPT.has(name) && isTopLevelFunctionDeclaration(nameNode)) return;
+    // TRIGGER: does this unit actually CALL generateToken (structurally)?
+    if (!bodyCallsFunction(bodyNode, sf, MINT)) return;
+    // REQUIRED: does it actually CALL registerPersistedSecret (structurally)?
+    if (bodyCallsFunction(bodyNode, sf, REGISTER)) return;
+    violations.push({ name, line: sf.getLineAndCharacterOfPosition(nameNode.getStart(sf)).line + 1 });
+  });
   return violations;
 }
+
+/** The primitives this guard rests on, for premise enforcement. */
+export const REQUIRED_PRIMITIVES = new Set([...MINT, ...REGISTER]);
 
 function main() {
   const files = process.argv.slice(2);
@@ -135,7 +150,28 @@ function main() {
         process.exit(2);
       }
       const src = fs.readFileSync(abs, "utf-8");
-      for (const v of findSecretRegisterViolations(src, path.basename(abs))) {
+      // PREMISE ENFORCEMENT. This guard rests on both primitives RESOLVING from
+      // this file to a verified top-level function declaration — here, one hop
+      // through `./auth.js` and `./secret-registry.js`. If that stops holding
+      // (moved behind a barrel, re-exported, renamed at the import site), every
+      // minter would read as unregistered and the failure would look like the
+      // codebase broke rather than the guard's premise. Say which, and refuse.
+      const premiseSf = ts.createSourceFile(abs, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      const unresolvable = findUnresolvablePrimitives(premiseSf, REQUIRED_PRIMITIVES);
+      if (unresolvable.length > 0) {
+        process.stderr.write(
+          `secret-register-guard: PREMISE VIOLATED in ${abs}\n` +
+            `  These primitives no longer resolve to a top-level function declaration: ${unresolvable.join(", ")}\n` +
+            `  This guard resolves a call ONE hop through a direct relative named import\n` +
+            `  and verifies the declaration in the target file. Barrel/re-export chains,\n` +
+            `  renamed imports and package specifiers are deliberately NOT followed.\n` +
+            `  Fix: keep the primitive a top-level \`function\` reached by a direct\n` +
+            `  relative named import, or rework this guard (see scripts/lib/guard-ast.mjs).\n`,
+        );
+        process.exit(2);
+      }
+      // ABSOLUTE path, not basename: one-hop import resolution needs a real path.
+      for (const v of findSecretRegisterViolations(src, abs)) {
         all.push({ file: abs, ...v });
       }
     }
