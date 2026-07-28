@@ -21,8 +21,11 @@
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { execFileSync } from "node:child_process";
+import Database from "better-sqlite3";
 
 const { findSanctionedMutationViolations, mutatesAgentsTable, assertGuardedNamesProvable } = await import(
   "../scripts/sanctioned-mutation-guard.mjs"
@@ -400,6 +403,7 @@ describe("#143 — normalization-audit directional contracts", () => {
     ["C3 main.agents", "DELETE FROM main.agents", true],
     ["C3 whitespace around dot", "DELETE FROM temp . agents WHERE x=1", true],
     ["C3 bracket schema", "DELETE FROM [main].agents", true],
+    ["C3 UNICODE schema α.agents (premise 3 — was under-flagging)", "DELETE FROM α.agents", true],
     ["C3 agents.col (schema NAMED agents) NOT flagged", "DELETE FROM agents.col", false],
     ["C4 block comments between tokens", "DELETE/**/FROM/**/agents", true],
     ["C4 line comment + newline + mutation", "SELECT 1 -- c\n; DELETE FROM agents WHERE x=1", true],
@@ -428,4 +432,54 @@ describe("#143 — quoted-identifier equivalence edges", () => {
     ["real agents after a closed quoted id CAUGHT", `SELECT 1 AS "note"; DELETE FROM agents WHERE x=1`, true],
   ];
   for (const [l, sql, want] of EDGES) it(`${l}`, () => expect(mutatesAgentsTable(sql), sql).toBe(want));
+});
+
+// codex re-audit @e2d7607 P1 — SQLite accepts NON-ASCII bare identifiers, so a
+// schema-qualified `DELETE FROM α.agents` EXECUTES. The ASCII-only isIdStart
+// labelled `α` as `punct`, and default-deny's "provable non-identifier = punct"
+// then rejected it → under-flag. PREMISE (3): character classes — the enumeration
+// one layer UNDER the quote-form enumeration. Fix: any code point >= 128 is an
+// identifier char (conservative + SQLite-matching), so an unrecognised code point
+// resolves as a possible identifier and over-flags, never silently becomes punct.
+describe("#143 re-audit @e2d7607 — Unicode identifiers (premise 3: character classes)", () => {
+  it("HARM (real SQLite + guard): `DELETE FROM α.agents` deletes the row AND is flagged", () => {
+    const db = new Database(":memory:");
+    db.exec("ATTACH ':memory:' AS α");
+    db.exec("CREATE TABLE α.agents (id INTEGER)");
+    db.exec("INSERT INTO α.agents VALUES (1)");
+    db.exec("DELETE FROM α.agents");
+    const remaining = (db.prepare("SELECT count(*) c FROM α.agents").get() as { c: number }).c;
+    db.close();
+    expect(remaining, "the α.agents mutation must actually EXECUTE in SQLite").toBe(0);
+    expect(mutatesAgentsTable("DELETE FROM α.agents"), "and the guard must flag it").toBe(true);
+  });
+
+  const HARM: Array<[string, string]> = [
+    ["UPDATE α.agents", `UPDATE α.agents SET x=1`],
+    ["INSERT INTO α.agents", `INSERT INTO α.agents VALUES (1)`],
+    ["DROP TABLE α.agents", `DROP TABLE α.agents`],
+    ["ALTER TABLE α.agents", `ALTER TABLE α.agents RENAME TO gone`],
+    ["CJK schema 名.agents", `DELETE FROM 名.agents WHERE x=1`],
+  ];
+  for (const [l, sql] of HARM) it(`HARM flagged: ${l}`, () => expect(execFlagged(sql), sql).toBe(true));
+
+  it("TWIN: a Unicode-schema DIFFERENT table, and a fully-Unicode non-guarded table, are not flagged", () => {
+    expect(execFlagged(`DELETE FROM α.messages WHERE x=1`)).toBe(false);
+    expect(mutatesAgentsTable(`DELETE FROM αβγ`)).toBe(false);
+  });
+
+  it("HARM through the SHIPPED CLI: a fixture with `DELETE FROM α.agents` exits 1", () => {
+    const guard = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "sanctioned-mutation-guard.mjs");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-unicode-"));
+    fs.mkdirSync(path.join(dir, "src"));
+    fs.writeFileSync(path.join(dir, "src", "x.ts"), `export function f(db: any){ db.exec("DELETE FROM α.agents"); }\n`);
+    let exit = 0;
+    try {
+      execFileSync("node", [guard, path.join(dir, "src")], { stdio: "pipe" });
+    } catch (e) {
+      exit = (e as { status?: number }).status ?? -1;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect(exit, "the shipped CLI must flag the Unicode-schema mutation (exit 1)").toBe(1);
+  });
 });

@@ -57,17 +57,24 @@
  *     case-insensitive so this matches SQLite — residual is OVER-flag (safe).
  *   • resolveTable SCHEMA → `schema.agents` → `agents`. OVER-detects (any schema's
  *     agents is still an agents mutation). Safe direction.
- *   TWO discards UNDER-flagged and BOTH are fixed: quote provenance in the
- *   structure passes (@509a368) and the resolution allowlist (@b5aae98). The
- *   second was not a code slip but an ENUMERATION of an EXTERNAL grammar (SQLite's
- *   identifier-quoting forms) we do NOT control and cannot close by reading our own
- *   code — hence default-deny, not a list. The quoted-identifier class proof (by
- *   the guarded-name assertion below) therefore rests on TWO premises: (1) guarded
- *   names are bare identifiers — ENFORCED at module load (assertGuardedNamesProvable);
- *   and (2) the quote-form enumeration — which we KNOW is still OPEN (codex did not
- *   exhaust novel SQLite grammar), so default-deny is what makes premise (2)'s
- *   failure a loud OVER-flag rather than a silent miss. Direction-of-failure:
- *   under-detection is the only dangerous direction — when in doubt, over-flag.
+ *   THREE discards UNDER-flagged and all three are fixed: quote provenance in the
+ *   structure passes (@509a368), the resolution allowlist (@b5aae98), and the
+ *   ASCII-only identifier CHARACTER class (@e2d7607 — `α.agents` executed and
+ *   walked past). Each was an ENUMERATION of an EXTERNAL grammar we do NOT control
+ *   (SQLite's quote forms, then its identifier character classes) and cannot close
+ *   by reading our own code — hence default-deny at BOTH levels, not lists. The
+ *   quoted-identifier class proof (by the guarded-name assertion below) therefore
+ *   rests on THREE premises, each stated with its direction:
+ *   (1) guarded names are bare identifiers — ENFORCED at module load
+ *       (assertGuardedNamesProvable): the premise is CHECKED, not assumed;
+ *   (2) the quote-form enumeration — OPEN; default-deny in idAt makes its failure a
+ *       loud OVER-flag (an unforeseen quote form resolves), not a silent miss;
+ *   (3) the identifier CHARACTER classes — OPEN; classification is CONSERVATIVE
+ *       (any code point >= 0x80 is an identifier char, matching SQLite), so an
+ *       unrecognised code point OVER-flags rather than being silently made punct.
+ *   Direction-of-failure: under-detection is the only dangerous direction — when in
+ *   doubt, over-flag. Each new P1 was this same lesson one layer deeper; each is
+ *   closed by default-deny at that layer, not by extending a list.
  *
  * ── L2 — FRESHNESS ───────────────────────────────────────────────────────────
  * N/A: a STATIC scan of committed source; no observe→decide→act, no TOCTOU.
@@ -203,8 +210,16 @@ function tokenizeSql(sql) {
   const toks = [];
   const n = sql.length;
   let i = 0;
-  const isIdStart = (c) => /[A-Za-z_]/.test(c);
-  const isId = (c) => /[A-Za-z0-9_$]/.test(c);
+  // SQLite treats ANY byte >= 0x80 (any non-ASCII code point) as an identifier
+  // character — `α`, `名`, etc. are legal BARE identifiers, so `DELETE FROM
+  // α.agents` executes. codex re-audit @e2d7607: the ASCII-only isIdStart labelled
+  // `α` as `punct`, and idAt's default-deny rejects punct → under-flag. This is
+  // PREMISE (3) — character classes, the enumeration one layer UNDER the
+  // default-deny "provable non-identifier = punct" test. Conservative + matches
+  // SQLite: any code point >= 128 is an identifier char, so an unrecognised code
+  // point resolves as a POSSIBLE identifier and OVER-flags, never silently punct.
+  const isIdStart = (c) => /[A-Za-z_]/.test(c) || c.charCodeAt(0) >= 128;
+  const isId = (c) => /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) >= 128;
   const readQuoted = (close) => {
     i++;
     let v = "";
