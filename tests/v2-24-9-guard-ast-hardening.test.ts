@@ -29,8 +29,18 @@
 import { describe, it, expect } from "vitest";
 import ts from "typescript";
 
-const { forEachFunctionUnit, bodyCallsFunction } = await import("../scripts/lib/guard-ast.mjs");
+const { forEachFunctionUnit, bodyCallsFunction, findUnsatisfiedPrimitives } = await import("../scripts/lib/guard-ast.mjs");
 const { findAuthGenViolations } = await import("../scripts/auth-gen-guard.mjs");
+
+/**
+ * The sanctioned primitives, declared as the TOP-LEVEL FUNCTION DECLARATIONS the
+ * terminal bar requires. Any fixture that expects a bump to be RECOGNISED must
+ * include this: the guard resolves a call to one specific declaration node, so a
+ * free-floating `bumpAuthGeneration()` is refused by design. That refusal is
+ * itself a round-4 fix — round 3 trusted unresolved names by spelling, which is
+ * how `import x = require(...)` slipped through.
+ */
+const P = `function bumpAuthGeneration(){}\nfunction applyAuthStateTransition(){}\n`;
 
 /** Parse `src`, return the body node of the first function unit named `name`. */
 function callsIt(src: string, unitName: string, names: string[]): boolean {
@@ -45,9 +55,13 @@ function callsIt(src: string, unitName: string, names: string[]): boolean {
 
 describe("v2.24.9 shared guard-ast — structural call detection (codex's mutators)", () => {
   const REG = ["registerPersistedSecret"];
+  // The terminal bar resolves to a real top-level declaration, so fixtures that
+  // EXPECT the call to be found must declare the primitive. A free name is
+  // refused by design (round-3 leak: unresolved names were trusted by spelling).
+  const RP = `function registerPersistedSecret(n, t){}\n`;
 
   it("a real direct call is detected", () => {
-    expect(callsIt(`function mint(n){ const t = generateToken(); registerPersistedSecret(n, t); }`, "mint", REG)).toBe(true);
+    expect(callsIt(`${RP}function mint(n){ const t = generateToken(); registerPersistedSecret(n, t); }`, "mint", REG)).toBe(true);
   });
 
   it("(a) a block-comment mention is NOT a call — the killer codex found", () => {
@@ -63,11 +77,11 @@ describe("v2.24.9 shared guard-ast — structural call detection (codex's mutato
   });
 
   it("(b) a direct local alias is resolved and detected", () => {
-    expect(callsIt(`function mint(n){ const reg = registerPersistedSecret; const t = generateToken(); reg(n, t); }`, "mint", REG)).toBe(true);
+    expect(callsIt(`${RP}function mint(n){ const reg = registerPersistedSecret; const t = generateToken(); reg(n, t); }`, "mint", REG)).toBe(true);
   });
 
   it("(c) a class-field arrow is visited, and its real call detected", () => {
-    expect(callsIt(`class C { mint = (n) => { const t = generateToken(); registerPersistedSecret(n, t); }; }`, "mint", REG)).toBe(true);
+    expect(callsIt(`${RP}class C { mint = (n) => { const t = generateToken(); registerPersistedSecret(n, t); }; }`, "mint", REG)).toBe(true);
   });
 
   it("(c) a class-field arrow that only comments the call is caught as absent", () => {
@@ -93,11 +107,11 @@ describe("v2.24.9 auth-gen-guard — structural bump detection closes the same e
   });
 
   it("(b) a real bump reached through a direct alias is RECOGNIZED (no false positive)", () => {
-    expect(findAuthGenViolations(`function rotate(n, h){ const bump = bumpAuthGeneration; ${MUT} bump(); }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(n, h){ const bump = bumpAuthGeneration; ${MUT} bump(); }`, "t.ts")).toEqual([]);
   });
 
   it("INNOCENT TWIN: a normal mutator that bumps directly is clean", () => {
-    expect(findAuthGenViolations(`function rotate(n, h){ ${MUT} bumpAuthGeneration(); }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(n, h){ ${MUT} bumpAuthGeneration(); }`, "t.ts")).toEqual([]);
   });
 });
 
@@ -110,11 +124,11 @@ describe("v2.24.9 nested-function boundary (Victra's never-invoked-callback refu
   });
 
   it("INNOCENT TWIN: a bump inside an `if` block still PASSES — same execution unit, not a function boundary", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} if (ok) { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} if (ok) { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
   });
 
   it("INNOCENT TWIN: a bump inside `try` still PASSES (breaking this would fail every honest conditional register)", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ try { ${MUT} bumpAuthGeneration(); } catch (e) {} }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ try { ${MUT} bumpAuthGeneration(); } catch (e) {} }`, "t.ts")).toEqual([]);
   });
 
   it("ACCEPTED OVER-FLAG (safe, documented): an IIFE doing the bump reads as absent → FLAGGED (allowlist is the remedy; no bespoke IIFE detection by design)", () => {
@@ -122,7 +136,7 @@ describe("v2.24.9 nested-function boundary (Victra's never-invoked-callback refu
   });
 
   it("ACCEPTED RISK (labelled, NOT 'safe'): reachability within a unit is not checked — an if(false) bump still passes; runtime paths are the behavioural tests' job", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} if (false) { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} if (false) { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
   });
 });
 
@@ -194,7 +208,7 @@ describe("v2.24.9 #151 r2 — alias binding + scope safety (harm fixtures, all e
   // ── INNOCENT TWINS — each genuinely bumps; breaking any of these fails honest code ──
 
   it("TWIN: an honest single-binding const alias is still resolved", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} const bump = bumpAuthGeneration; bump(); }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} const bump = bumpAuthGeneration; bump(); }`, "t.ts")).toEqual([]);
   });
 
   // DELIBERATELY INVERTED in #151 round 3. This used to assert that
@@ -213,19 +227,19 @@ describe("v2.24.9 #151 r2 — alias binding + scope safety (harm fixtures, all e
   });
 
   it("TWIN: a bump inside a bare nested block still counts — a block is not a function boundary", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
   });
 
   it("TWIN: a bump inside a loop still counts", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} for (const x of xs) { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} for (const x of xs) { bumpAuthGeneration(); } }`, "t.ts")).toEqual([]);
   });
 
   it("TWIN: routing through applyAuthStateTransition still counts", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} applyAuthStateTransition(name, "rotated"); }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} applyAuthStateTransition(name, "rotated"); }`, "t.ts")).toEqual([]);
   });
 
   it("TWIN: an unrelated local named `finish` with no alias at all does not crash or flag a bumping unit", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} const finish = () => log("x"); finish(); bumpAuthGeneration(); }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} const finish = () => log("x"); finish(); bumpAuthGeneration(); }`, "t.ts")).toEqual([]);
   });
 
   it("STATED BOUNDARY (not closed): a destructured reference reads as absent → OVER-flags, the safe direction", () => {
@@ -274,7 +288,91 @@ describe("v2.24.9 #151 r2 — alias binding + scope safety (harm fixtures, all e
   });
 
   it("TWIN: an honest const alias still resolves when USED INSIDE a block", () => {
-    expect(findAuthGenViolations(`function rotate(name, h){ ${MUT} const bump = bumpAuthGeneration; { bump(); } }`, "t.ts")).toEqual([]);
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} const bump = bumpAuthGeneration; { bump(); } }`, "t.ts")).toEqual([]);
+  });
+
+  // ── #151 round 4: THE TERMINAL BAR ────────────────────────────────────────
+  // Accept only a resolved direct TOP-LEVEL FUNCTION DECLARATION with a body,
+  // in this file. Reject every other binding kind wholesale. Round 3 accepted a
+  // CATEGORY ("any top-level binding of the name") and lost six more ways at the
+  // module boundary; this accepts ONE declaration node, so there is nothing left
+  // to enumerate. Module-scope `P` supplies the real primitives where needed.
+
+  it("TERMINAL BAR: a direct named import of an unrelated function is refused", () => {
+    expect(names(`import { bumpAuthGeneration } from "./unrelated";\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: a DEFAULT import is refused", () => {
+    expect(names(`import bumpAuthGeneration from "./unrelated";\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: an import-equals binding is refused", () => {
+    expect(names(`import bumpAuthGeneration = require("./unrelated");\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: a NAMESPACE import is refused", () => {
+    expect(names(`import * as bumpAuthGeneration from "./unrelated";\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: an import RENAMED to the primitive's spelling is refused (local name is not identity)", () => {
+    expect(names(`import { other as bumpAuthGeneration } from "./m";\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: an ambient `declare const` is refused", () => {
+    expect(names(`declare const bumpAuthGeneration: () => void;\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: an ambient `declare function` (no body) is refused — it declares nothing and runs nothing", () => {
+    expect(names(`declare function bumpAuthGeneration(): void;\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  // MODULE scope deliberately — that is codex's actual shape. A `using` INSIDE
+  // the unit was already caught by round 3's local-binding rule, so an in-unit
+  // fixture would pass on the broken code and be false coverage of the finding.
+  it("TERMINAL BAR: a module-scope `using` binding is refused", () => {
+    expect(names(`using bumpAuthGeneration = resource;\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: a module-scope `await using` binding is refused", () => {
+    expect(names(`await using bumpAuthGeneration = asyncResource;\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: an unresolved FREE name is refused — round 3 trusted these by spelling", () => {
+    expect(names(`function rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: a top-level CLASS named like the primitive is refused", () => {
+    expect(names(`class bumpAuthGeneration {}\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: a top-level ENUM named like the primitive is refused", () => {
+    expect(names(`enum bumpAuthGeneration { X }\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("TERMINAL BAR: a top-level const arrow named like the primitive is refused", () => {
+    expect(names(`const bumpAuthGeneration = () => {};\nfunction rotate(name, h){ ${MUT} bumpAuthGeneration(); }`)).toContain("rotate");
+  });
+
+  it("SELF-FOUND fx3: an alias used BEFORE its declaration is refused (TDZ — mutation commits, then it throws)", () => {
+    expect(names(`${P}function rotate(name, h){ ${MUT} a(); const a = bumpAuthGeneration; }`)).toContain("rotate");
+  });
+
+  it("TWIN: the real top-level primitive + a bare call still passes", () => {
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} bumpAuthGeneration(); }`, "t.ts")).toEqual([]);
+  });
+
+  it("TWIN: an honest const alias of the real primitive still passes", () => {
+    expect(findAuthGenViolations(`${P}function rotate(name, h){ ${MUT} const b = bumpAuthGeneration; b(); }`, "t.ts")).toEqual([]);
+  });
+
+  it("PREMISE: findUnsatisfiedPrimitives names a primitive converted to a const arrow", () => {
+    const sf = ts.createSourceFile("t.ts", `const bumpAuthGeneration = () => {};`, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    expect(findUnsatisfiedPrimitives(sf, new Set(["bumpAuthGeneration"]))).toEqual(["bumpAuthGeneration"]);
+  });
+
+  it("PREMISE: a genuine top-level function declaration satisfies it", () => {
+    const sf = ts.createSourceFile("t.ts", `export function bumpAuthGeneration(): void {}`, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    expect(findUnsatisfiedPrimitives(sf, new Set(["bumpAuthGeneration"]))).toEqual([]);
   });
 
   it("LOUD-FAILURE CONTRACT: bodyCallsFunction THROWS without parent links rather than silently under-detecting on parameters", () => {

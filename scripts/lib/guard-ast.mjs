@@ -20,17 +20,27 @@
  *     ASSERT IS ABOUT A BINDING.
  *
  * Each round patched the spellings we thought of; each audit found the spellings
- * we did not. That does not converge, because the predicate cannot express the
- * property. So this version does not patch spellings. It shrinks the accepted
- * surface until SPELLING IS IDENTITY:
+ * we did not. Round 3 tried "accept any top-level binding of the name" and lost
+ * six more ways at the MODULE boundary — direct/default/equals imports, ambient
+ * declares, `using` bindings, and unresolved free names all counted.
  *
- *     ACCEPT ONLY a bare identifier call that LEXICALLY RESOLVES to a top-level
- *     binding of a sanctioned name — plus a `const` alias that itself so
- *     resolves. REFUSE EVERYTHING ELSE, LOUDLY.
+ * ── THE TERMINAL BAR (do not widen this; widening is how every round started) ─
  *
- * "Everything else" includes every property receiver, every shadowed name, every
- * mutable binding, every ambiguous one. Those all OVER-flag: a loud false build
- * failure, never a silent hole.
+ *     ACCEPT ONLY a bare identifier call that resolves to a DIRECT TOP-LEVEL
+ *     FUNCTION DECLARATION, WITH A BODY, whose name is sanctioned, IN THE FILE
+ *     UNDER ANALYSIS — plus a `const` alias, declared before the call, that
+ *     itself so resolves. REJECT EVERYTHING ELSE.
+ *
+ * Rejected wholesale: every import form (named, default, namespace, equals,
+ * renamed), every ambient declaration, every variable / class / enum / `using`
+ * binding, every property or element receiver, every shadowed or ambiguous name,
+ * and every unresolved free name.
+ *
+ * This is why it is TERMINAL rather than one more patch. Every earlier round
+ * accepted a CATEGORY and then discovered which members of the category nobody
+ * had thought of. This accepts ONE declaration node. There is nothing left to
+ * enumerate, because the answer to "what about form X?" is now always REJECTED.
+ * Everything rejected OVER-flags: a loud false build failure, never a hole.
  *
  * ── WHY NOT THE TYPESCRIPT CHECKER ───────────────────────────────────────────
  * Symbol resolution via ts.Program is the theoretically right answer and was
@@ -45,14 +55,47 @@
  * auth cache = accepting a revoked token). OVER-detection only produces a loud
  * false build failure.
  *
- * ⚠ EVERY DIRECTION CLAIM IN THIS FILE MUST SIT NEXT TO THE FIXTURE THAT PROVES
- * IT (@fixture tags below). This is mechanical on purpose. Twice now a comment
- * in this file asserted a direction that was FALSE — round 1 said reassignment
- * "does not resolve" when it resolved wrongly and PASSED; round 2 said "any
- * receiver counts ... that is the OVER-flag direction" when accepting more
- * receivers means the guard PASSES more, i.e. UNDER-detects. Both were written
- * while moving fast, which is exactly when a remember-to-check rule fails. A
- * direction claim with no fixture beside it is the smell.
+ * ⚠ TWO MECHANICAL RULES, because four direction claims in this file have now
+ * been wrong and none of them was carelessness — they were a sentence pattern:
+ *   1. EVERY DIRECTION CLAIM SITS NEXT TO THE FIXTURE THAT PROVES IT (@fixture
+ *      tags below). A direction claim with no fixture beside it is the smell.
+ *   2. A DIRECTION CLAIM MUST NAME **WHICH DIRECTION, FOR WHICH CASE**.
+ *      "Conservative", "safe", "coarse" are not directions — they hide a
+ *      quantifier. Every one of the four had the same shape: a property true in
+ *      ONE direction, stated as if true generally.
+ * The four, for the record: round 1 said reassignment "does not resolve" when it
+ * resolved wrongly and PASSED. Round 2 said "any receiver counts ... the
+ * OVER-flag direction" when accepting more receivers makes the guard PASS more,
+ * i.e. UNDER-detect. Round 2 said the trigger side "over-triggers on a comment,
+ * the SAFE direction" — true, and half the story, since it also under-detects
+ * when the SQL is not textually present. Round 3 documented ignoring TDZ as
+ * "conservative" — true for the shadow direction, false for the alias direction,
+ * where position-blindness errs toward ACCEPT.
+ *
+ * ── ⚠ BOTH SIDES OF THIS PREDICATE MUST BE EQUALLY STRONG ────────────────────
+ * This guard is TWO-SIDED: "does this unit mutate?" THEN "then it must bump."
+ * The must-bump side is now resolved to a single declaration node. The
+ * does-it-mutate side (hasValidityChangingMutation, in auth-gen-guard.mjs) is
+ * still a TEXT match. **A two-sided predicate is only as strong as its weaker
+ * side: if the trigger never fires, no bump is ever demanded and everything
+ * below never runs.** Hardening one side MOVES the guard's real strength to the
+ * other — it does not raise it. Known live gap: SQL hoisted into a module-level
+ * constant is not seen as a mutation (queued as its own item; measured LATENT —
+ * every `UPDATE agents SET` in today's src/db.ts sits inside a function unit).
+ *
+ * ── ⚠ WHAT DOES THIS RESOLVER TREAT AS OUTSIDE ITS WORLD? ────────────────────
+ * Standing question for the next person, because this is how round 3 failed:
+ * WHEN YOU REPLACE A PROXY WITH A RESOLVER, THE RESOLVER'S FRAME BECOMES THE NEW
+ * PROXY. Round 3 correctly replaced spelling-matching with lexical resolution,
+ * then scoped the resolver to lexical scopes INSIDE the file — and every
+ * `import { x as y }` is a re-binding, so the module boundary is exactly where
+ * spelling and identity come apart hardest. The reasoning inside the frame was
+ * sound; the frame was drawn too small.
+ *
+ * STATED BOUNDARY, not a gap to close casually: this helper handles SAME-FILE
+ * primitives only. A guard whose primitive is IMPORTED cannot use it — that
+ * needs canonical module/symbol identity (a TypeChecker, or an explicit trusted
+ * declaration reference). Do not build toward it by widening the bar.
  *
  * ── GUARD TAXONOMY (the durable map — answers "could this defect be here?") ───
  *   • must-CALL — "a function that does X must CALL Y" (auth-gen-guard,
@@ -275,7 +318,20 @@ function scopeBindings(scope) {
         if (depth === 0 || isFnScope) add(child.name.text, child);
       } else if (ts.isClassDeclaration(child) && child.name && depth === 0) {
         add(child.name.text, child);
-      } else if (ts.isImportSpecifier(child) || ts.isImportClause(child) || ts.isNamespaceImport(child)) {
+      } else if (ts.isEnumDeclaration(child) && child.name && depth === 0) {
+        add(child.name.text, child);
+      } else if (
+        ts.isImportSpecifier(child) ||
+        ts.isImportClause(child) ||
+        ts.isNamespaceImport(child) ||
+        ts.isImportEqualsDeclaration(child)
+      ) {
+        // Collected by their LOCAL name, and then rejected as a binding kind.
+        // Note the local name is deliberately NOT trusted as identity: `import
+        // { other as bumpAuthGeneration }` re-binds the spelling, which is why
+        // the module boundary is where spelling and identity come apart hardest.
+        // Under the terminal bar none of these can satisfy the guard anyway —
+        // collecting them is for a precise refusal, not for safety.
         if (child.name) add(child.name.text, child);
       }
       // Do not descend into a nested FUNCTION at all — its interior is a
@@ -290,35 +346,72 @@ function scopeBindings(scope) {
 }
 
 /**
- * Resolve `name` as seen from `fromNode`. Returns:
- *   { kind: "top" }                — resolves to a direct top-level binding, or
- *                                    is free (an import/global). Spelling IS
- *                                    identity here, and only here.
- *   { kind: "local", decls: [...] } — bound by a nearer scope; NOT the primitive
- *                                    unless it is a proven const alias.
+ * Resolve `name` as seen from `fromNode` to the declaration(s) that bind it:
+ * the binding list of the NEAREST enclosing scope that binds it, or [] if
+ * nothing in this file binds it (a free / global / unresolved name).
+ *
+ * It deliberately does NOT classify the result. Round 3 returned a KIND
+ * ("top" vs "local") and then trusted "top" — which accepted every module-scope
+ * binding by SPELLING: direct imports, default imports, import-equals, ambient
+ * declares, `using` bindings, classes, and unresolved names alike. Returning raw
+ * declarations, and making the caller demand one specific declaration NODE, is
+ * what turns this from allow-a-category into default-deny.
  */
 function resolveName(name, fromNode) {
   for (let n = fromNode; n; n = n.parent) {
     if (!isScopeNode(n)) continue;
     const decls = scopeBindings(n).get(name);
-    if (!decls) continue;
-    if (ts.isSourceFile(n)) {
-      // A binding found at SourceFile scope is only "top level" if it is a
-      // direct top-level declaration. scopeBindings hoists var/function decls
-      // out of nested blocks, so verify the declaration is not nested.
-      // @fixture "ROOT F2: a block-enclosed shadow around the unit"
-      const anyNested = decls.some((d) => {
-        for (let p = d; p; p = p.parent) {
-          if (ts.isSourceFile(p)) return false;
-          if (ts.isBlock(p) || ts.isModuleBlock(p) || ts.isCaseBlock(p)) return true;
-        }
-        return false;
-      });
-      return anyNested ? { kind: "local", decls } : { kind: "top", decls };
-    }
-    return { kind: "local", decls };
+    if (decls) return decls;
   }
-  return { kind: "top", decls: [] };
+  return [];
+}
+
+/**
+ * IS this declaration node the actual sanctioned primitive — a direct top-level
+ * function declaration WITH A BODY whose name is sanctioned?
+ *
+ * This is the terminal bar. Every other binding kind is rejected wholesale, so
+ * there is no category left to enumerate: the answer to "what about form X?" is
+ * always "rejected." `d.body` is required so an AMBIENT `declare function
+ * bumpAuthGeneration(): void` — which declares nothing and runs nothing — cannot
+ * satisfy it.
+ * @fixture "TERMINAL BAR: every non-function-declaration binding kind is refused"
+ */
+function isPrimitiveDeclaration(decl, names) {
+  return (
+    !!decl &&
+    ts.isFunctionDeclaration(decl) &&
+    !!decl.body &&
+    !!decl.name &&
+    names.has(decl.name.text) &&
+    !!decl.parent &&
+    ts.isSourceFile(decl.parent)
+  );
+}
+
+/**
+ * THE PREMISE this helper rests on: each sanctioned name must actually BE a
+ * top-level function declaration in the file under analysis. Returns the names
+ * that are NOT.
+ *
+ * Enforcing it is the difference between an argument and a complete artifact.
+ * If someone converts `export function bumpAuthGeneration()` into
+ * `const bumpAuthGeneration = () => …`, this helper stops resolving ANY call to
+ * it — the guard would still fail loudly, but as a confusing wall of violations
+ * rather than a statement of what actually changed. The caller uses this to say
+ * so precisely. Today it is a no-op: both primitives are `export function`.
+ * @fixture "PREMISE: a primitive converted to a const arrow is reported by name"
+ */
+export function findUnsatisfiedPrimitives(sf, names) {
+  const missing = [];
+  for (const name of names) {
+    let ok = false;
+    for (const st of sf.statements) {
+      if (ts.isFunctionDeclaration(st) && st.body && st.name && st.name.text === name) ok = true;
+    }
+    if (!ok) missing.push(name);
+  }
+  return missing;
 }
 
 /** Is this declaration `const <id> = <identifier>`? Returns the initializer or null. */
@@ -375,16 +468,34 @@ export function bodyCallsFunction(bodyNode, _sf, names) {
     );
   }
 
-  /** Does bare identifier `name`, used at `site`, provably reach a sanctioned name? */
+  /**
+   * Does bare identifier `name`, used at `site`, provably reach THE primitive?
+   * Default-deny: everything that is not the one accepted declaration node, or a
+   * `const` alias of it, returns false and therefore OVER-flags.
+   */
   const reaches = (name, site, allowAlias) => {
-    const r = resolveName(name, site);
-    if (r.kind === "top") return names.has(name);
+    const decls = resolveName(name, site);
+    // Unresolved / free names are REFUSED. Round 3 accepted them by spelling,
+    // which is how `import x = require(...)` slipped through: the binding was
+    // never collected, so the name looked free, so it was trusted.
+    // @fixture "TERMINAL BAR: an unresolved free name is refused"
+    if (decls.length !== 1) return false;
+    if (isPrimitiveDeclaration(decls[0], names)) return true;
     if (!allowAlias) return false;
-    // Exactly one declaration, or we cannot say which binding wins.
-    if (r.decls.length !== 1) return false;
-    const init = constAliasInitializer(r.decls[0]);
+    const init = constAliasInitializer(decls[0]);
     if (!init) return false;
-    // The alias target must itself resolve top-level, from the alias's position.
+    // The alias must be declared BEFORE the call. A `const` used above its
+    // declaration is a TDZ ReferenceError — the mutation commits and then the
+    // call throws, leaving exactly the stale cache this guard exists to prevent.
+    // The terminal bar does NOT close this one: position is orthogonal to
+    // declaration kind, so an alias-before-declaration is still a well-formed
+    // `const <a> = <primitive>`. Refusing it OVER-flags in the one odd-but-legal
+    // case (an alias declared later in an ENCLOSING scope, hoisted-and-called
+    // later at runtime), which is the safe direction.
+    // @fixture "SELF-FOUND fx3: an alias used before its declaration is refused"
+    if (decls[0].getStart() > site.getStart()) return false;
+    // The alias target must itself reach the primitive, from the alias's own
+    // position. Chained aliases (a -> b -> primitive) are refused: over-flag.
     return reaches(init.text, init, false);
   };
 

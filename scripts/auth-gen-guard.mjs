@@ -51,7 +51,12 @@ import ts from "typescript";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { forEachFunctionUnit, bodyCallsFunction, isTopLevelFunctionDeclaration } from "./lib/guard-ast.mjs";
+import {
+  forEachFunctionUnit,
+  bodyCallsFunction,
+  isTopLevelFunctionDeclaration,
+  findUnsatisfiedPrimitives,
+} from "./lib/guard-ast.mjs";
 
 const SENSITIVE_COLS = [
   "token_hash",
@@ -108,11 +113,25 @@ function hasValidityChangingMutation(bodyText) {
  * a resolved CallExpression) via the shared scripts/lib/guard-ast.mjs, closing
  * the comment / alias / class-field evasions codex found in the copied
  * regex-over-body-text shape. Node coverage also widened (class fields,
- * accessors, constructors — see forEachFunctionUnit). The SQL TRIGGER
- * (hasValidityChangingMutation) stays a TEXT match BY DESIGN: it OVER-triggers on
- * a comment that merely mentions the SQL, which is the SAFE direction (a false
- * demand-to-bump, never a missed one) — see the direction-of-failure note in
- * guard-ast.mjs. Do not "tighten" that half and call the guard fixed.
+ * accessors, constructors — see forEachFunctionUnit).
+ *
+ * ⚠ THE SQL TRIGGER (hasValidityChangingMutation) IS STILL A TEXT MATCH, AND ITS
+ * DIRECTION CUTS BOTH WAYS. The old note here said only that it "over-triggers
+ * on a comment mentioning the SQL, which is the SAFE direction." That is true
+ * and it is HALF THE STORY — a half-stated direction is a false claim wearing a
+ * technicality. Stated in full, per case:
+ *   • a comment/string that merely MENTIONS the SQL  -> OVER-triggers (safe: a
+ *     false demand to bump, never a missed one).
+ *   • SQL that is NOT textually in the body — hoisted into a module-level
+ *     constant, or built by concatenation -> UNDER-detects: no bump is ever
+ *     demanded, so the fully-hardened must-bump side never runs. Concatenation
+ *     is documented out of scope by design (below); the HOISTED CONSTANT is a
+ *     genuine gap inside the accidental-drift model and is queued as its own
+ *     item. Measured LATENT, not active: every `UPDATE agents SET` in today's
+ *     src/db.ts sits inside a function unit, and there are zero module-level
+ *     mutation constants.
+ * This is the WEAKER SIDE of a two-sided predicate — see guard-ast.mjs. Do not
+ * read the hardened call side as making the guard strong overall.
  */
 export function findAuthGenViolations(source, fileName = "db.ts") {
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -155,6 +174,35 @@ function main() {
         process.exit(2);
       }
       const src = fs.readFileSync(abs, "utf-8");
+      // PREMISE ENFORCEMENT (Victra ruling, #151 round 4). The whole helper
+      // rests on each sanctioned primitive genuinely BEING a top-level function
+      // declaration in this file — that is the only condition under which a bare
+      // call can be resolved to it. If someone converts one to
+      // `const bumpAuthGeneration = () => …`, no call resolves any more and the
+      // guard would still fail — but as an avalanche of violations that reads
+      // like the codebase broke, not like the guard's premise did. Say which it
+      // is, and refuse to run rather than guess.
+      const premiseSf = ts.createSourceFile(
+        path.basename(abs),
+        src,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TS,
+      );
+      const missing = findUnsatisfiedPrimitives(premiseSf, SELF_BUMPERS);
+      if (missing.length > 0) {
+        process.stderr.write(
+          `auth-gen-guard: PREMISE VIOLATED in ${abs}\n` +
+            `  These sanctioned primitives are not top-level function declarations here: ${missing.join(", ")}\n` +
+            `  This guard can only resolve a bare call to a primitive that is declared as a\n` +
+            `  top-level \`function\` in the file under analysis. Converting one to a const\n` +
+            `  arrow, an import, or a method silently removes the guard's ability to see ANY\n` +
+            `  call to it — so it refuses to run instead of reporting a false all-clear.\n` +
+            `  Fix: keep the primitive a top-level function declaration, or rework this guard\n` +
+            `  to resolve cross-module identity (needs a TypeChecker — see guard-ast.mjs).\n`,
+        );
+        process.exit(2);
+      }
       for (const v of findAuthGenViolations(src, path.basename(abs))) {
         all.push({ file: abs, ...v });
       }
