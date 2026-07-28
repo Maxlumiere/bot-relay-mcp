@@ -17,6 +17,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { AGENT_CLI_PROFILES } from "../../../src/agent-cli-profiles.js";
 import { TETHER_LLM, adapterFor, type WakeContext, type WakeTerminal } from "./llm-adapter.js";
+import { MACHINE_WAKE_MARKER } from "./llm-adapter.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -70,8 +71,25 @@ describe("v0.6.0 — Tether LLM mirror ↔ relay registry parity", () => {
       const { ctx, ops } = fakeCtx();
       await a.wake(ctx);
       expect(ops.length, `adapterFor("${p.id}").wake produced no ops`).toBeGreaterThan(0);
-      // Every CLI's wake types its registry wakeText first.
-      expect(ops[0]).toContain(JSON.stringify(p.wake.wakeText));
+      // Every CLI's wake types its registry wakeText FIRST, and nothing
+      // unexpected may follow it.
+      //
+      // The previous assertion was `toContain(JSON.stringify(wakeText))`, which
+      // did NOT test what its comment claimed: `toContain` checks "anywhere",
+      // not "first". So the ordering half was never enforced. What the quoting
+      // DID enforce was a terminator — the closing quote caught a mirror whose
+      // value had drifted with an unexpected suffix, and drift is the whole
+      // reason this file exists (TETHER_LLM mirrors a registry the extension
+      // cannot import).
+      //
+      // This keeps both: the typed text must START with the registry value, and
+      // the remainder must be empty or EXACTLY the known marker. A drifted
+      // mirror still fails; only our own marker is licensed.
+      const typed = JSON.parse(ops[0]!.replace(/^sendText:/, "").replace(/:(true|false)$/, "")) as string;
+      expect(typed.startsWith(p.wake.wakeText), `${p.id}: typed text does not START with its registry wakeText`).toBe(true);
+      const remainder = typed.slice(p.wake.wakeText.length);
+      expect(remainder === "" || remainder === ` ${MACHINE_WAKE_MARKER}`,
+        `${p.id}: unexpected suffix after wakeText: ${JSON.stringify(remainder)}`).toBe(true);
     }
   });
 

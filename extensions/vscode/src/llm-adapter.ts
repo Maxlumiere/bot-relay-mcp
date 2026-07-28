@@ -154,6 +154,52 @@ function entryFor(id: string | undefined): TetherLlmEntry {
 
 /** Build the wake function for a `style` + resolved wake values. Data-driven —
  *  the ordered op sequence is determined by `style`, never by the CLI id. */
+/**
+ * The marker appended to every wake THIS EXTENSION injects.
+ *
+ * WHY: the claude wake word is the literal string `inbox` — byte-identical to
+ * what the operator types to check on a terminal. No receiving agent could
+ * distinguish a machine wake from a human nudge, so none could honestly report
+ * its own wake state. That ambiguity cost three failed experiments and about an
+ * hour, and produced at least one confidently-wrong "Tether did not wake me"
+ * from an agent that Tether had woken 610ms earlier. The injector knows what
+ * the receiver cannot, so the injector says so.
+ *
+ * ⚠️ THE CLAIM IS ONE-DIRECTIONAL. DO NOT COMPLETE THE INFERENCE.
+ *
+ *     marker PRESENT ⇒ this extension injected it.     SOUND.
+ *     marker ABSENT  ⇒ a human typed it.               NOT SOUND. PROVES NOTHING.
+ *
+ * Absence is not evidence of a human, because this extension is not proven to
+ * be the only thing that can put text in a terminal. `/api/wake-agent` was
+ * traced and is a different mechanism (it touches a filesystem marker, and did
+ * not produce a terminal injection when fired), which removes that specific
+ * candidate — but it does not close the general question, and an ambient-wake
+ * client elsewhere could in principle type.
+ *
+ * Reading "no marker" as "a human did it" would replace an honest "I cannot
+ * certify causation" with a false certainty — manufacturing the exact defect
+ * class this whole arc exists to remove. Upgrading absence into a real negative
+ * requires EVERY injector to mark; that is the recorded follow-up.
+ *
+ * APPENDED AT INJECTION TIME, deliberately not edited into the registry data:
+ * `wakeText` is kept byte-identical with the relay's agent-CLI profile registry
+ * by llm-adapter-registry-parity.test.ts. Editing it there would break that
+ * mirror invariant and drag this change into `src/`.
+ *
+ * ASCII ON PURPOSE. The approved shape was `⟨tether⟩`; square brackets are used
+ * because the failure mode of an encoding a TUI mangles is a wake that does not
+ * submit — the exact 2026-07-24 defect this file already carries scars from.
+ */
+export const MACHINE_WAKE_MARKER = "[tether]";
+
+/** What is actually typed for an injected wake: the profile's registry text
+ *  plus the marker. Trailing and additive, so the leading token the agent acts
+ *  on is unchanged and the CLI still takes a normal turn. */
+export function machineWakeText(wakeText: string): string {
+  return `${wakeText} ${MACHINE_WAKE_MARKER}`;
+}
+
 function buildWake(style: WakeStyle, v: WakeValues): (ctx: WakeContext) => Promise<void> {
   if (style === "inline-newline") {
     // No shipped CLI uses this style anymore. Claude did until v0.7.0, on the
@@ -162,7 +208,7 @@ function buildWake(style: WakeStyle, v: WakeValues): (ctx: WakeContext) => Promi
     // until a human pressed Enter). Kept for a future CLI whose input is a
     // plain line-buffered readline, where text+newline genuinely submits.
     return async (ctx) => {
-      ctx.terminal.sendText(v.wakeText, true);
+      ctx.terminal.sendText(machineWakeText(v.wakeText), true);
     };
   }
   // "type-then-submit" (Claude + Codex): the TUI swallows a newline embedded in
@@ -172,7 +218,9 @@ function buildWake(style: WakeStyle, v: WakeValues): (ctx: WakeContext) => Promi
   // standalone CR via sendSequence for Codex, the only thing proven to make
   // Codex submit).
   return async (ctx) => {
-    ctx.terminal.sendText(v.wakeText, false);
+    // The marker rides the TYPED text only. The submit stays a SEPARATE event
+    // below — that separation is the 2026-07-24 fix and must never be merged.
+    ctx.terminal.sendText(machineWakeText(v.wakeText), false);
     if (v.submitDelayMs > 0) await ctx.delay(v.submitDelayMs);
     if (v.submitMethod === "sendSequence") {
       await ctx.sendSequenceToTerminal(v.submitKey);
