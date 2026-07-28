@@ -2,7 +2,7 @@
   "name": "bot-relay-tether",
   "displayName": "Tether for bot-relay-mcp",
   "description": "Local IDE awareness for bot-relay-mcp: subscribes to your agent's inbox over MCP, surfaces pending mail in the status bar, and (optionally) auto-types `inbox` into the integrated terminal so Claude Code wakes up when something arrives.",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "lumiere-ventures",
   "engines": {
     "vscode": "^1.85.0"
@@ -46,7 +46,7 @@
         "bot-relay.tether.wakeOutstandingTtlMs": {
           "type": "number",
           "default": 10800000,
-          "description": "Backstop TTL (ms) for the one-outstanding-wake rule (ADR-0010): after Tether injects a wake, no further injection fires for the same agent until the agent is OBSERVED IDLE (the host submits queued input at the turn boundary, so idleness is flush evidence), its terminal closes, the injection fails, or this TTL elapses. Deliberately LONG (default 3h) — it must exceed a long single build turn, or the stacked-wake wall returns. The TTL only covers losses the decidable signals cannot see."
+          "description": "Backstop TTL (ms) for the one-outstanding-wake rule (ADR-0010): after Tether injects a wake, no further injection fires for the same agent until the agent is OBSERVED IDLE (the host submits queued input at the turn boundary, so idleness is flush evidence), its terminal closes, the injection fails, or this TTL elapses. Deliberately LONG (default 3h) \u2014 it must exceed a long single build turn, or the stacked-wake wall returns. The TTL only covers losses the decidable signals cannot see."
         },
         "bot-relay.tether.autoInjectInbox": {
           "type": "boolean",
@@ -93,12 +93,12 @@
             "sendSequence"
           ],
           "default": "sendSequence",
-          "description": "Codex only: how the submit keystroke is delivered. sendSequence (default) = focus the terminal then send a standalone key sequence to it — the programmatic twin of a real keyboard Enter, the most reliable way to make Codex auto-submit (note: it focuses the Codex terminal on wake). sendText = write the key to the bound terminal directly, no focus-steal, but a sendText'd CR can be absorbed by Codex's TUI."
+          "description": "Codex only: how the submit keystroke is delivered. sendSequence (default) = focus the terminal then send a standalone key sequence to it \u2014 the programmatic twin of a real keyboard Enter, the most reliable way to make Codex auto-submit (note: it focuses the Codex terminal on wake). sendText = write the key to the bound terminal directly, no focus-steal, but a sendText'd CR can be absorbed by Codex's TUI."
         },
         "bot-relay.tether.codexWakePrompt": {
           "type": "string",
-          "default": "Relay mail arrived — call get_messages(agent_name=\"{agent}\", status=\"pending\"), act on every message, then continue.",
-          "description": "Codex only: the instruction injected into the Codex terminal on wake. Codex has no 'inbox' convention, so a bare token just makes it reply — it must be told to drain the relay. '{agent}' is replaced with the agent name."
+          "default": "Relay mail arrived \u2014 call get_messages(agent_name=\"{agent}\", status=\"pending\"), act on every message, then continue.",
+          "description": "Codex only: the instruction injected into the Codex terminal on wake. Codex has no 'inbox' convention, so a bare token just makes it reply \u2014 it must be told to drain the relay. '{agent}' is replaced with the agent name."
         },
         "bot-relay.tether.claudeEnterKey": {
           "type": "string",
@@ -121,7 +121,7 @@
             "sendSequence"
           ],
           "default": "sendText",
-          "description": "Claude only: how the submit keystroke is delivered. sendText (default) = write the key to the bound terminal directly, no focus-steal. sendSequence = focus the terminal then send a standalone key sequence — the programmatic twin of a real keyboard Enter; switch to this if the wake word stays typed-but-unsent with sendText."
+          "description": "Claude only: how the submit keystroke is delivered. sendText (default) = write the key to the bound terminal directly, no focus-steal. sendSequence = focus the terminal then send a standalone key sequence \u2014 the programmatic twin of a real keyboard Enter; switch to this if the wake word stays typed-but-unsent with sendText."
         },
         "bot-relay.tether.agents": {
           "type": "array",

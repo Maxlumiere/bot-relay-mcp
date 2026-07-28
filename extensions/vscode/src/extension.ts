@@ -601,13 +601,26 @@ async function getAgentBinding(agentName: string): Promise<AgentPidBinding> {
       }
     },
     snapshot: async () => {
-      // The auth-free dashboard read; serves the same host_shell_pids/host_id
-      // (behind http_secret on remote binds, open on a loopback daemon — the
-      // same trust boundary as the MCP surface).
+      // FALLBACK ONLY, and no longer auth-free.
+      //
+      // The previous comment here read "the auth-free dashboard read ... open on
+      // a loopback daemon — the same trust boundary as the MCP surface". That is
+      // FALSE since #142 made operator endpoints always-authed: this returns 401
+      // on a loopback daemon with a secret configured. It is dormant rather than
+      // broken only because the `discover` primary above succeeds — a false claim
+      // sitting next to a working path is exactly how the wake bug hid.
+      //
+      // Kept, not deleted: it is the documented degradation path for a relay
+      // with NO dashboard secret, which is still a supported posture. But a
+      // non-2xx is now reported instead of collapsing to a silent null.
       if (!relayEndpoint) return null;
       try {
         const res = await fetch(new URL("/api/snapshot", relayEndpoint), { method: "GET" });
-        return res.ok ? await res.json() : null;
+        if (!res.ok) {
+          log(`pid-binding: /api/snapshot fallback returned HTTP ${res.status} (expected when a dashboard secret is set; the MCP primary is authoritative)`);
+          return null;
+        }
+        return await res.json();
       } catch (err) {
         log(`pid-binding: /api/snapshot fallback failed — ${err instanceof Error ? err.message : String(err)}`);
         return null;
@@ -669,27 +682,50 @@ function reportObserveFailure(why: string): void {
   log(`wake observation UNAVAILABLE — ${why}; agent state reads "unknown", which disables idle-flush`);
 }
 
+/**
+ * Observe an agent's state for wake routing — over the AUTHENTICATED MCP client.
+ *
+ * WHY THIS CHANGED. This function used to call `fetch("/api/snapshot")` with no
+ * credential. That endpoint became always-authed (#142, ADR-0006), so it began
+ * returning 401 the moment a dashboard secret existed. `res.ok` was false, every
+ * agent read `state: "unknown"` forever, and `"unknown"` never satisfies the
+ * `state === "idle"` condition that is the ONLY flush for a landed injection —
+ * so the outstanding flag stuck and every subsequent wake was suppressed,
+ * silently, until a three-hour TTL. One unauthenticated read made the fleet
+ * deaf.
+ *
+ * The fix is not to give Tether the dashboard secret. It is to stop asking for
+ * operator-privileged data over an anonymous channel when an authenticated one
+ * is already open: `discover_agents` carries the agent token and is used
+ * successfully by the PID-binding path in this same file. Fewer secrets in
+ * fewer places, and the credential Tether already legitimately holds.
+ *
+ * Verified before building rather than assumed: the live log shows zero
+ * `discover_agents failed` lines and populated `binding.hostShellPids`, so this
+ * call demonstrably works in production today. (A neighbouring comment claims
+ * "Tether connects token-free and the relay token-gates discover_agents" — that
+ * is stale, predating SecretStorage token support, and the evidence contradicts
+ * it. Corrected below.)
+ */
 async function observeAgentForWake(agentName: string): Promise<WakeObservation> {
   const busyCoveredByHook = resolveAgentLlm(agentName) === "claude";
+  if (!mcpClient) {
+    reportObserveFailure("no MCP client connected");
+    return { state: "unknown", busyCoveredByHook };
+  }
   try {
-    if (!relayEndpoint) {
-      reportObserveFailure("no relay endpoint configured");
+    const res = await mcpClient.callTool({ name: "discover_agents", arguments: {} });
+    const text = extractToolText(res);
+    if (!text) {
+      reportObserveFailure("discover_agents returned no text content");
       return { state: "unknown", busyCoveredByHook };
     }
-    const res = await fetch(new URL("/api/snapshot", relayEndpoint), { method: "GET" });
-    if (!res.ok) {
-      // 401 here is the live case: /api/snapshot became always-authed and this
-      // call carries no credential. Naming the status is what turns a silent
-      // degrade into a two-minute diagnosis.
-      reportObserveFailure(`GET /api/snapshot returned HTTP ${res.status}`);
-      return { state: "unknown", busyCoveredByHook };
-    }
-    const snap = (await res.json()) as {
+    const parsed = JSON.parse(text) as {
       agents?: Array<{ name?: string; agent_status?: string; last_seen?: string }>;
     };
-    const row = snap.agents?.find((a) => a.name === agentName);
+    const row = parsed.agents?.find((a) => a.name === agentName);
     if (!row) {
-      reportObserveFailure(`agent "${agentName}" absent from the snapshot`);
+      reportObserveFailure(`agent "${agentName}" absent from discover_agents`);
       return { state: "unknown", busyCoveredByHook };
     }
     const lastSeenAge = row.last_seen ? Date.now() - Date.parse(row.last_seen) : Number.POSITIVE_INFINITY;
