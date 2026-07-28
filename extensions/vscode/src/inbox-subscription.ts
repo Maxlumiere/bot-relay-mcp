@@ -53,6 +53,10 @@ export interface WakeObservation {
  */
 export const DEFAULT_WAKE_OUTSTANDING_TTL_MS = 3 * 60 * 60 * 1000;
 
+/** How often a PERSISTENT decline repeats in the log. Changes always log
+ *  immediately; this only rate-limits the unchanged condition. */
+export const DEFAULT_DECLINE_HEARTBEAT_MS = 5 * 60 * 1000;
+
 export class WakeGate {
   private lastWokenAt: string | null = null;
   /**
@@ -91,10 +95,63 @@ export class WakeGate {
    */
   private outstandingLanded = false;
 
+  /**
+   * #4a — SUPPRESSION VISIBILITY.
+   *
+   * Every `consider()` that declines to wake used to `return false` in silence.
+   * That made the ONLY failure mode which actually strands the fleet the one
+   * mode that says nothing, while the harmless no-terminal-bound case shouts.
+   * Loud when it cannot find you, silent when it decides not to try.
+   *
+   * The cost of that silence, measured: thirty inbox events in one morning
+   * produced thirty silent declines, and the log physically could not say which
+   * of two candidate mechanisms was responsible. The diagnosis had to be done by
+   * reading source, and it still ended in "these two are indistinguishable from
+   * outside".
+   *
+   * NOISE CONTROL, because a log nobody can read is its own silence: the poll
+   * tick re-considers every watched agent every 15s, so logging every decline
+   * would emit thousands of identical lines an hour and bury the transition
+   * that matters. A line is emitted when the REASON CHANGES for an agent, and
+   * thereafter at most once per heartbeat interval — so a state change is
+   * immediate and a persistent condition stays visible without flooding.
+   */
+  private lastDeclineReason: string | null = null;
+  private lastDeclineLoggedAt = 0;
+
   constructor(
     private readonly onWake: (agentName: string) => void,
-    private readonly opts: { outstandingTtlMs?: number; now?: () => number } = {},
+    private readonly opts: {
+      outstandingTtlMs?: number;
+      now?: () => number;
+      log?: (msg: string) => void;
+      declineHeartbeatMs?: number;
+    } = {},
   ) {}
+
+  /** Report a decline, deduplicated by reason. Returns nothing; never throws. */
+  private reportDecline(agentName: string, reason: string, detail: string): void {
+    const emit = this.opts.log;
+    if (!emit) return;
+    const now = (this.opts.now ?? Date.now)();
+    const heartbeat = this.opts.declineHeartbeatMs ?? DEFAULT_DECLINE_HEARTBEAT_MS;
+    const changed = reason !== this.lastDeclineReason;
+    if (!changed && now - this.lastDeclineLoggedAt < heartbeat) return;
+    this.lastDeclineReason = reason;
+    this.lastDeclineLoggedAt = now;
+    try {
+      emit(`wake declined for "${agentName}": ${reason}${detail ? ` (${detail})` : ""}${changed ? "" : " [still]"}`);
+    } catch {
+      /* a logger must never break the wake path */
+    }
+  }
+
+  /** Clear the decline memo so the next decline logs immediately. Called when a
+   *  wake actually fires — the next decline after a delivery is news. */
+  private resetDeclineMemo(): void {
+    this.lastDeclineReason = null;
+    this.lastDeclineLoggedAt = 0;
+  }
 
   /**
    * LOSS EVIDENCE: the terminal we injected into closed, the injection failed
@@ -200,7 +257,19 @@ export class WakeGate {
     });
     // Suppression never advances the watermark — it means "newest message we
     // WOKE for", and we didn't. The poll-tick re-route picks it up later.
-    if (route.action === "suppress") return false;
+    if (route.action === "suppress") {
+      // The observation inputs are logged with the decision because the
+      // decision is UNINTERPRETABLE without them: "an injection is already
+      // outstanding" reads as benign until you can see that state is `unknown`,
+      // which is what stops the flush that would have cleared it.
+      this.reportDecline(
+        agentName,
+        route.reason,
+        `state=${observed.state} hookCovered=${observed.busyCoveredByHook} ` +
+        `outstanding=${this.outstandingSince !== null} landed=${this.outstandingLanded} pending=${snapshot.pending_count}`,
+      );
+      return false;
+    }
     const decision = decideWake(snapshot, {
       autoInjectInbox,
       lastWokenAt: this.lastWokenAt,
@@ -216,9 +285,20 @@ export class WakeGate {
       this.markBeforeOutstanding = markBeforeThisWake;
       this.outstandingSince = now();
       this.outstandingLanded = false; // scheduled, not yet landed — awaits the delivery ack
+      this.resetDeclineMemo();
       this.onWake(agentName);
       return true;
     }
+    // The SECOND silent path, and the one that made the morning's thirty
+    // events indistinguishable: routing said inject, the watermark said no.
+    // Naming which of the two declined is the whole point of #4a.
+    this.reportDecline(
+      agentName,
+      !autoInjectInbox ? "auto-inject is disabled"
+        : snapshot.last_message_at === null ? "no message timestamp to form a watermark"
+        : "already woke for this newest message (watermark)",
+      `lastWokenAt=${markBeforeThisWake ?? "none"} newest=${snapshot.last_message_at ?? "none"} pending=${snapshot.pending_count}`,
+    );
     return false;
   }
 }

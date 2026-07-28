@@ -359,3 +359,130 @@ describe("subscribeInboxes (multi-agent watch-all)", () => {
     expect(applied).toEqual([5]);
   });
 });
+
+// ═══════ #4a — every decline must say why (the instrument, not a nicety) ═══════
+
+describe("#4a · suppression visibility", () => {
+  const view = (over: Partial<WakeInboxView> = {}): WakeInboxView =>
+    ({ pending_count: 1, last_message_at: "2026-07-28T01:00:00.000Z", ...over }) as WakeInboxView;
+
+  function gate(opts: Record<string, unknown> = {}) {
+    const lines: string[] = [];
+    const woke: string[] = [];
+    const g = new WakeGate((n) => woke.push(n), { log: (m: string) => lines.push(m), ...opts });
+    return { g, lines, woke };
+  }
+
+  it("HARM: a routing suppression is no longer silent", () => {
+    // Thirty inbox events in one morning produced thirty silent declines and
+    // the log could not say which of two mechanisms was responsible.
+    const { g, lines, woke } = gate();
+    // First consider wakes and arms `outstanding`.
+    g.consider(view(), "a1", true, { state: "unknown", busyCoveredByHook: true });
+    expect(woke).toEqual(["a1"]);
+    // Second is suppressed by the outstanding flag — the live case.
+    g.consider(view({ last_message_at: "2026-07-28T02:00:00.000Z" }), "a1", true,
+      { state: "unknown", busyCoveredByHook: true });
+    expect(lines.some((l) => /wake declined for "a1".*outstanding/i.test(l))).toBe(true);
+  });
+
+  it("names the OBSERVATION INPUTS, not just the verdict", () => {
+    // "an injection is already outstanding" reads benign until you can see that
+    // state=unknown is what stops the flush that would have cleared it.
+    const { g, lines } = gate();
+    g.consider(view(), "a1", true, { state: "unknown", busyCoveredByHook: true });
+    g.consider(view({ last_message_at: "2026-07-28T02:00:00.000Z" }), "a1", true,
+      { state: "unknown", busyCoveredByHook: true });
+    const line = lines.find((l) => l.includes("declined"))!;
+    expect(line).toContain("state=unknown");
+    expect(line).toContain("outstanding=true");
+  });
+
+  it("HARM: the WATERMARK decline is distinguishable from the routing one", () => {
+    // These were the two candidates I could not tell apart from outside, and
+    // naming which fired is the whole value of #4a.
+    //
+    // Note the sequence: an idle observation on a LANDED injection flushes the
+    // outstanding flag BEFORE routing, so this path yields the watermark
+    // decline only — one decline per consider, never both. An earlier version
+    // of this test asserted both and was simply wrong about the order.
+    const watermark = gate();
+    watermark.g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false });
+    watermark.g.markInjectionLanded();
+    watermark.g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false });
+    const wmLine = watermark.lines.find((l) => l.includes("declined"))!;
+    expect(wmLine).toMatch(/watermark/i);
+
+    const routing = gate();
+    routing.g.consider(view(), "a2", true, { state: "unknown", busyCoveredByHook: true });
+    routing.g.consider(view({ last_message_at: "2026-07-28T02:00:00.000Z" }), "a2", true,
+      { state: "unknown", busyCoveredByHook: true });
+    const rtLine = routing.lines.find((l) => l.includes("declined"))!;
+    expect(rtLine).toMatch(/outstanding/i);
+
+    // The point: an operator reading the log can tell them apart.
+    expect(wmLine).not.toEqual(rtLine);
+  });
+
+  it("names auto-inject being disabled", () => {
+    const { g, lines } = gate();
+    g.consider(view(), "a1", false, { state: "idle", busyCoveredByHook: false });
+    expect(lines.some((l) => /auto-inject is disabled/.test(l))).toBe(true);
+  });
+
+  it("INNOCENT TWIN: a successful wake logs no decline", () => {
+    const { g, lines, woke } = gate();
+    g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false });
+    expect(woke).toEqual(["a1"]);
+    expect(lines.filter((l) => l.includes("declined"))).toEqual([]);
+  });
+
+  it("HARM: a persistent condition does not flood the log", () => {
+    // The poll tick re-considers every watched agent every 15s. Logging each
+    // decline would emit thousands of identical lines an hour and bury the
+    // transition that matters — a log nobody can read is its own silence.
+    let clock = 0;
+    const { g, lines } = gate({ now: () => clock, declineHeartbeatMs: 60_000 });
+    g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false }); // wakes
+    g.markInjectionLanded();
+    for (let i = 0; i < 50; i++) {
+      clock += 1_000; // 50 seconds of re-considers, same reason
+      g.consider(view({ last_message_at: "2026-07-28T03:00:00.000Z" }), "a1", true,
+        { state: "unknown", busyCoveredByHook: true });
+    }
+    const declines = lines.filter((l) => l.includes("declined"));
+    expect(declines.length, "flooded the log").toBeLessThanOrEqual(2);
+    expect(declines.length, "went silent instead").toBeGreaterThan(0);
+  });
+
+  it("a persistent condition still repeats on the heartbeat", () => {
+    // Rate-limited, never silenced: an operator arriving an hour later must
+    // still be able to see the condition without waiting for it to change.
+    let clock = 0;
+    const { g, lines } = gate({ now: () => clock, declineHeartbeatMs: 60_000 });
+    g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false });
+    g.markInjectionLanded();
+    g.consider(view({ last_message_at: "2026-07-28T03:00:00.000Z" }), "a1", true,
+      { state: "unknown", busyCoveredByHook: true });
+    const first = lines.filter((l) => l.includes("declined")).length;
+    clock += 120_000;
+    g.consider(view({ last_message_at: "2026-07-28T03:00:00.000Z" }), "a1", true,
+      { state: "unknown", busyCoveredByHook: true });
+    expect(lines.filter((l) => l.includes("declined")).length).toBeGreaterThan(first);
+    expect(lines.some((l) => l.includes("[still]"))).toBe(true);
+  });
+
+  it("a CHANGE of reason logs immediately, without waiting for the heartbeat", () => {
+    let clock = 0;
+    const { g, lines } = gate({ now: () => clock, declineHeartbeatMs: 3_600_000 });
+    g.consider(view(), "a1", true, { state: "idle", busyCoveredByHook: false });
+    g.markInjectionLanded();
+    clock += 1_000;
+    g.consider(view({ last_message_at: "2026-07-28T03:00:00.000Z" }), "a1", true,
+      { state: "unknown", busyCoveredByHook: true }); // outstanding
+    clock += 1_000;
+    g.consider(view({ pending_count: 0 }), "a1", true, { state: "idle", busyCoveredByHook: false }); // different reason
+    const reasons = lines.filter((l) => l.includes("declined"));
+    expect(reasons.length).toBeGreaterThanOrEqual(2);
+  });
+});

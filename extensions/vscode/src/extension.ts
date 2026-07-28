@@ -326,7 +326,13 @@ function getWakeGate(agentName: string): WakeGate {
       (name) => {
         void injectInboxKeystroke(name);
       },
-      typeof ttl === "number" && ttl > 0 ? { outstandingTtlMs: ttl } : {},
+      {
+        ...(typeof ttl === "number" && ttl > 0 ? { outstandingTtlMs: ttl } : {}),
+        // #4a — the gate can now say why it declined. Without this every
+        // suppression was a silent `return false`, which is how thirty inbox
+        // events in one morning produced no diagnosable trace at all.
+        log,
+      },
     );
     wakeGates.set(agentName, g);
   }
@@ -650,23 +656,49 @@ function resolveAgentLlm(agentName: string): string {
  * registry-driven.
  */
 const BUSY_ACTIVITY_WINDOW_MS = 120_000;
+/** Rate-limit for the observation-failure line — one cause, many callers. */
+let lastObserveFailureLoggedAt = 0;
+function reportObserveFailure(why: string): void {
+  const now = Date.now();
+  if (now - lastObserveFailureLoggedAt < 5 * 60 * 1000) return;
+  lastObserveFailureLoggedAt = now;
+  // This is the input that silently disables the outstanding-flush: a state
+  // that is never "idle" can never satisfy the flush condition, so one failed
+  // observation path suppresses every subsequent wake until the 3h TTL.
+  // It used to produce no output whatsoever.
+  log(`wake observation UNAVAILABLE — ${why}; agent state reads "unknown", which disables idle-flush`);
+}
+
 async function observeAgentForWake(agentName: string): Promise<WakeObservation> {
   const busyCoveredByHook = resolveAgentLlm(agentName) === "claude";
   try {
-    if (!relayEndpoint) return { state: "unknown", busyCoveredByHook };
+    if (!relayEndpoint) {
+      reportObserveFailure("no relay endpoint configured");
+      return { state: "unknown", busyCoveredByHook };
+    }
     const res = await fetch(new URL("/api/snapshot", relayEndpoint), { method: "GET" });
-    if (!res.ok) return { state: "unknown", busyCoveredByHook };
+    if (!res.ok) {
+      // 401 here is the live case: /api/snapshot became always-authed and this
+      // call carries no credential. Naming the status is what turns a silent
+      // degrade into a two-minute diagnosis.
+      reportObserveFailure(`GET /api/snapshot returned HTTP ${res.status}`);
+      return { state: "unknown", busyCoveredByHook };
+    }
     const snap = (await res.json()) as {
       agents?: Array<{ name?: string; agent_status?: string; last_seen?: string }>;
     };
     const row = snap.agents?.find((a) => a.name === agentName);
-    if (!row) return { state: "unknown", busyCoveredByHook };
+    if (!row) {
+      reportObserveFailure(`agent "${agentName}" absent from the snapshot`);
+      return { state: "unknown", busyCoveredByHook };
+    }
     const lastSeenAge = row.last_seen ? Date.now() - Date.parse(row.last_seen) : Number.POSITIVE_INFINITY;
     const busy =
       (Number.isFinite(lastSeenAge) && lastSeenAge < BUSY_ACTIVITY_WINDOW_MS) ||
       (row.agent_status === "working" && lastSeenAge < BUSY_ACTIVITY_WINDOW_MS * 3);
     return { state: busy ? "busy" : "idle", busyCoveredByHook };
-  } catch {
+  } catch (err) {
+    reportObserveFailure(err instanceof Error ? err.message : String(err));
     return { state: "unknown", busyCoveredByHook };
   }
 }
