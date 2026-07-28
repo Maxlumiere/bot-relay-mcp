@@ -38,21 +38,36 @@
  *   the quoted-vs-unquoted collapse broke all THREE parser passes. So each
  *   normalization step is stated with WHAT it discards and the DIRECTION:
  *   • tokenizeSql QUOTE PROVENANCE → distinct `qid` vs `id`. A quoted keyword is
- *     NEVER structural; only unquoted `id` is. Dropping this was the P1
- *     under-detection. NOW PRESERVED (see the tokenizer + idAt notes).
+ *     NEVER structural; only unquoted `id` is. Dropping this was the @509a368 P1
+ *     (a quoted keyword hijacked the block/CTE/trigger passes). Preserved.
+ *   • idAt IDENTIFIER RESOLUTION → DEFAULT-DENY. The @b5aae98 P1 lived here: idAt
+ *     ALLOWLISTED the quote forms we knew (id|qid), so SQLite's SINGLE-quoted
+ *     identifier (`str`, a MySQL-compat form we had not enumerated) walked past —
+ *     six EXECUTED under-detections. An allowlist of what is RECOGNISED fails
+ *     OPEN. Inverted: in identifier position anything that is not a PROVABLE
+ *     non-identifier (a `punct`) is resolved, so the NEXT unforeseen quote form
+ *     over-flags loudly instead of silently passing.
  *   • tokenizeSql WHITESPACE + COMMENTS → stripped. SAFE: neither changes which
  *     statement a token belongs to (a line `--` or a block comment that appears
  *     inside a '…' literal is kept as string content, never stripped).
  *   • kwAt CASE → folds keywords to UPPER. SAFE + correct: SQL keywords are
- *     case-insensitive, and post-fix only UNQUOTED tokens reach kwAt.
+ *     case-insensitive, and only UNQUOTED tokens reach kwAt.
  *   • isGuarded CASE → folds the table name to lower. OVER-detects a case-distinct
  *     quoted table (`"AGENTS"`), but SQLite identifier comparison is itself
  *     case-insensitive so this matches SQLite — residual is OVER-flag (safe).
  *   • resolveTable SCHEMA → `schema.agents` → `agents`. OVER-detects (any schema's
  *     agents is still an agents mutation). Safe direction.
- *   Every remaining discard OVER-flags; the only one that UNDER-flagged (quote
- *   provenance) is fixed. Direction-of-failure: under-detection is the only
- *   dangerous direction — when a normalizer must choose, it over-flags.
+ *   TWO discards UNDER-flagged and BOTH are fixed: quote provenance in the
+ *   structure passes (@509a368) and the resolution allowlist (@b5aae98). The
+ *   second was not a code slip but an ENUMERATION of an EXTERNAL grammar (SQLite's
+ *   identifier-quoting forms) we do NOT control and cannot close by reading our own
+ *   code — hence default-deny, not a list. The quoted-identifier class proof (by
+ *   the guarded-name assertion below) therefore rests on TWO premises: (1) guarded
+ *   names are bare identifiers — ENFORCED at module load (assertGuardedNamesProvable);
+ *   and (2) the quote-form enumeration — which we KNOW is still OPEN (codex did not
+ *   exhaust novel SQLite grammar), so default-deny is what makes premise (2)'s
+ *   failure a loud OVER-flag rather than a silent miss. Direction-of-failure:
+ *   under-detection is the only dangerous direction — when in doubt, over-flag.
  *
  * ── L2 — FRESHNESS ───────────────────────────────────────────────────────────
  * N/A: a STATIC scan of committed source; no observe→decide→act, no TOCTOU.
@@ -62,7 +77,10 @@
  *     OR-clause), REPLACE, UPDATE, DELETE all classified (the grep did only U/D).
  *   • TABLE ALIAS — `UPDATE agents AS a` / bare alias. CLOSED.
  *   • SCHEMA-QUALIFIED — `UPDATE main.agents …` → resolves the table component.
- *   • QUOTED IDENTIFIER — `"agents"` / `` `agents` `` / `[agents]` → bare name.
+ *   • QUOTED IDENTIFIER — `"agents"` / `` `agents` `` / `[agents]` / SINGLE-quoted
+ *     `'agents'` (SQLite's MySQL-compat form; @b5aae98 P1, missed at first) →
+ *     bare name. NOTE: identifier resolution is DEFAULT-DENY, not this list — a
+ *     fifth form resolves too; the list is illustrative, not the contract.
  *   • INLINE COMMENTS — a block/line comment between the verb and the table is
  *     stripped during tokenization (string-aware: a `--` inside '…' is preserved).
  *   • STRING-SPLIT / VARIABLE — `+`-concat + template quasis reconstructed; every
@@ -143,6 +161,28 @@ import { fileURLToPath } from "url";
 
 // The two tables whose mutation IS an agent-identity change.
 const GUARDED_TABLES = new Set(["agents", "agent_capabilities"]);
+
+// GUARD ON THE GUARD — the quoted-identifier equivalence proof in this header
+// rests on a PREMISE: every guarded name is a bare identifier that needs NO
+// quoting (so no quoting edge can PRODUCE it). True today; enforced NOWHERE — so
+// the day a guarded name with a quote / dot / semicolon / space / uppercase is
+// added, the proof silently stops holding while the header still asserts it (a
+// gate resting on a fact that does not record the dependency). Check it at module
+// load and FAIL LOUD on whoever adds such a name. Over-strict here refuses a
+// legal-but-unproven name loudly — the safe way to be wrong.
+const SAFE_GUARDED_NAME = /^[a-z_][a-z0-9_]*$/;
+export function assertGuardedNamesProvable(names) {
+  for (const n of names) {
+    if (!SAFE_GUARDED_NAME.test(n)) {
+      throw new Error(
+        `sanctioned-mutation-guard: guarded name ${JSON.stringify(n)} is not a bare identifier ` +
+          `(${SAFE_GUARDED_NAME}). The quoted-identifier equivalence proof in this file's header assumes ` +
+          `guarded names need NO quoting — this one does, so re-derive that proof before adding it.`,
+      );
+    }
+  }
+}
+assertGuardedNamesProvable(GUARDED_TABLES);
 // The single sanctioned mutation site — EXACTLY the project's one src/db.ts.
 // codex P1: the prior `endsWith("/src/db.ts")` let a NESTED src/<sub>/src/db.ts
 // exempt itself (TypeScript compiles nested src trees), so anyone could bypass
@@ -206,10 +246,20 @@ function tokenizeSql(sql) {
 }
 
 const kwAt = (tk, j) => (tk[j] && tk[j].t === "id" ? tk[j].v.toUpperCase() : null);
-// Identifier RESOLUTION accepts a quoted OR unquoted identifier (a table may be
-// written `agents`, `"agents"`, `[agents]`, or `` `agents` ``). Keyword/structure
-// reads use kwAt (UNQUOTED `id` only) — see the tokenizer's `qid` note above.
-const idAt = (tk, j) => (tk[j] && (tk[j].t === "id" || tk[j].t === "qid") ? tk[j].v : null);
+// Identifier RESOLUTION is DEFAULT-DENY (codex re-audit @b5aae98). A table
+// identifier may be unquoted (agents), double/backtick/bracket-quoted, OR — a
+// SQLite MySQL-compat MISFEATURE — a SINGLE-QUOTED token (our `str`) where the
+// grammar requires an identifier (`DELETE FROM 'agents'` deletes the rows). We do
+// NOT allowlist the quote forms we KNOW: that fails OPEN when SQLite has a form we
+// did not enumerate (it had a fourth, and six mutations walked past). Instead, in
+// IDENTIFIER POSITION any token that is not a PROVABLE non-identifier — a `punct`
+// separator/operator — is treated as a POSSIBLE identifier and resolved, so an
+// unforeseen quoting form OVER-flags loudly instead of silently under-flagging.
+// (An allowlist of what is RECOGNISED fails open; excluding what is PROVABLY
+// not-an-identifier fails closed — the same inversion the value-allowlist uses.)
+// Keyword/structure readers stay STRICT: kwAt takes UNQUOTED `id` only, so a
+// single-quoted `'DELETE'` is NEVER a verb.
+const idAt = (tk, j) => (tk[j] && tk[j].t !== "punct" ? tk[j].v : null);
 const isGuarded = (name) => name != null && GUARDED_TABLES.has(name.toLowerCase());
 
 /** Resolve a (possibly schema-qualified) table reference at index i.

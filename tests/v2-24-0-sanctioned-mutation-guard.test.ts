@@ -24,7 +24,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
-const { findSanctionedMutationViolations, mutatesAgentsTable } = await import(
+const { findSanctionedMutationViolations, mutatesAgentsTable, assertGuardedNamesProvable } = await import(
   "../scripts/sanctioned-mutation-guard.mjs"
 );
 
@@ -339,4 +339,93 @@ describe("#143 re-audit — quoted-identifier provenance (codex @509a368)", () =
     expect(mutatesAgentsTable(`DELETE FROM "messages" WHERE x=1`)).toBe(false);
     expect(mutatesAgentsTable(`DELETE FROM [agents_new]`)).toBe(false);
   });
+});
+
+// codex re-audit @b5aae98 P1 — a FOURTH SQLite identifier-quoting form: a SINGLE
+// quoted token used where the grammar wants an identifier (a MySQL-compat
+// misfeature). `'agents'` tokenizes as `str`; idAt allow-listed id|qid, so SIX
+// mutations walked past (all EXECUTED in real SQLite). FIX = DEFAULT-DENY in
+// identifier position (idAt resolves anything that is not a `punct`), so the NEXT
+// unforeseen quote form OVER-flags loudly instead of silently under-flagging.
+describe("#143 re-audit @b5aae98 — single-quote-as-identifier (default-deny in identifier position)", () => {
+  const HARM: Array<[string, string]> = [
+    ["DELETE FROM 'agents'", `DELETE FROM 'agents' WHERE name='v'`],
+    ["UPDATE 'agents' SET", `UPDATE 'agents' SET x=1 WHERE name='v'`],
+    ["INSERT INTO 'agents'", `INSERT INTO 'agents' (id) VALUES (1)`],
+    ["DROP TABLE 'agents'", `DROP TABLE 'agents'`],
+    ["ALTER TABLE 'agents' RENAME", `ALTER TABLE 'agents' RENAME TO gone`],
+    ["schema-qualified main.'agents'", `DELETE FROM main.'agents' WHERE name='v'`],
+    ["single-quoted schema 'main'.agents", `DELETE FROM 'main'.agents WHERE name='v'`],
+  ];
+  for (const [l, sql] of HARM) it(`HARM flagged: ${l}`, () => expect(execFlagged(sql), sql).toBe(true));
+  it("TWIN: a single-quoted DIFFERENT table is not flagged", () => {
+    expect(execFlagged(`DELETE FROM 'messages' WHERE x=1`)).toBe(false);
+    expect(mutatesAgentsTable(`DELETE FROM 'agents_new'`)).toBe(false);
+  });
+  it("KEYWORD readers stay STRICT — a single-quoted `'DELETE'` is NEVER a verb (default-deny is identifier POSITION only)", () => {
+    expect(mutatesAgentsTable(`'DELETE' FROM agents`)).toBe(false);
+    expect(mutatesAgentsTable(`SELECT 1 WHERE x = 'DELETE FROM agents'`)).toBe(false); // a string VALUE, not a stmt
+  });
+  it("DEFAULT-DENY: the single-quote form is caught WITHOUT teaching the guard about single-quotes as a special case", () => {
+    // The guard was not given a `'…'`-is-an-identifier rule; idAt rejects only
+    // `punct`, so `str` (and any future quote form) resolves → over-flags, never
+    // silently passes. This is the property, proven by the harms above.
+    expect(mutatesAgentsTable(`DELETE FROM 'agents'`)).toBe(true);
+  });
+});
+
+// GUARD ON THE GUARD — the quoted-identifier class proof rests on the premise that
+// guarded names are bare identifiers. Enforced at module load; asserted here so
+// the failure case is pinned without planting a bad name in the real set.
+describe("#143 — guard on the guard (the class proof's premise, enforced)", () => {
+  it("the real GUARDED set passes (bare identifiers)", () => {
+    expect(() => assertGuardedNamesProvable(["agents", "agent_capabilities"])).not.toThrow();
+  });
+  it("a guarded name that would NEED quoting fails LOUD with an actionable message", () => {
+    for (const bad of [`agent"s`, "agent.s", "agent;s", "agent s", "Agents", "1agents", "agent[s]", "agent\ns"]) {
+      expect(() => assertGuardedNamesProvable([bad]), bad).toThrow(/re-derive that proof/);
+    }
+  });
+});
+
+// DIRECTIONAL-CLAIM CONTRACTS — the normalization audit's four claims, pinned from
+// execution (test proves the instance; the header argument proves the class).
+describe("#143 — normalization-audit directional contracts", () => {
+  const OVER_OR_CORRECT: Array<[string, string, boolean]> = [
+    ["C1 lowercase", "delete from agents where x=1", true],
+    ["C1 mixed case", "DeLeTe FrOm AgEnTs", true],
+    ["C2 UPPER table", "DELETE FROM AGENTS", true],
+    ["C2 quoted mixed", `DELETE FROM "AgEnTs"`, true],
+    ["C2 agent_capabilities upper", "DELETE FROM AGENT_CAPABILITIES WHERE a=1", true],
+    ["C3 main.agents", "DELETE FROM main.agents", true],
+    ["C3 whitespace around dot", "DELETE FROM temp . agents WHERE x=1", true],
+    ["C3 bracket schema", "DELETE FROM [main].agents", true],
+    ["C3 agents.col (schema NAMED agents) NOT flagged", "DELETE FROM agents.col", false],
+    ["C4 block comments between tokens", "DELETE/**/FROM/**/agents", true],
+    ["C4 line comment + newline + mutation", "SELECT 1 -- c\n; DELETE FROM agents WHERE x=1", true],
+    ["C4 -- to EOF (mutation before)", "DELETE FROM agents WHERE x=1 -- tail no newline", true],
+    ["C4 -- to EOF hides following DELETE", "SELECT 1 -- ; DELETE FROM agents", false],
+    ["C4 all-string is not a mutation", `SELECT '-- ; DELETE FROM agents'`, false],
+    ["C4 real ; after a /* */-holding string", "INSERT INTO t VALUES ('/* */'); DELETE FROM agents", true],
+  ];
+  for (const [l, sql, want] of OVER_OR_CORRECT) it(`${l}`, () => expect(mutatesAgentsTable(sql), sql).toBe(want));
+});
+
+// QUOTED-IDENTIFIER EQUIVALENCE EDGES — the bounded equivalence with SQLite's own
+// identifier decode. Guarded names have no special chars, so no doubling/embedded
+// form can PRODUCE a guarded name; every decorated form decodes to a name-with-the
+// -extra-char in BOTH parsers → cannot under-flag by construction.
+describe("#143 — quoted-identifier equivalence edges", () => {
+  const EDGES: Array<[string, string, boolean]> = [
+    [`double-quote id "ag""ents" ≠ agents`, `DELETE FROM "ag""ents" WHERE x=1`, false],
+    ["backtick-double id ag``ents ≠ agents", "DELETE FROM `ag``ents` WHERE x=1", false],
+    [`simple quoted agents CAUGHT`, `DELETE FROM "agents"`, true],
+    ["DROP hidden inside a doubled-quote id is not a mutation", `SELECT 1 AS "a""; DROP TABLE agents; ""z"`, false],
+    ["; inside a quoted id ≠ agents", `DELETE FROM "agents;messages"`, false],
+    ["; + DELETE inside a quoted alias is not a mutation", `SELECT 1 AS "x; DELETE FROM agents"`, false],
+    ["newline inside a quoted id ≠ agents", `DELETE FROM "agents\nx"`, false],
+    ["unterminated quoted id → not a mutation, no crash", `DELETE FROM "agents; DELETE FROM agents`, false],
+    ["real agents after a closed quoted id CAUGHT", `SELECT 1 AS "note"; DELETE FROM agents WHERE x=1`, true],
+  ];
+  for (const [l, sql, want] of EDGES) it(`${l}`, () => expect(mutatesAgentsTable(sql), sql).toBe(want));
 });
