@@ -90,8 +90,14 @@ describe("prebuild-guard — shipped script end-to-end (HOME isolated)", () => {
   // the real machine's live config.
   const run = (cwd: string, env: Record<string, string> = {}) => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "guard-home-"));
+    // The publish environment sets RELAY_ALLOW_PROD_BUILD=1 so `npm publish`'s own prebuild
+    // is allowed. If we inherited it here it would leak into the spawned guard and turn the
+    // "refuse" case into "build-allowed" — a false green that hid failure-class 3. Strip it
+    // from the inherited env; a case that WANTS the opt-in passes it explicitly via `env`.
+    const spawnEnv: NodeJS.ProcessEnv = { ...process.env, HOME: home, ...env };
+    if (!("RELAY_ALLOW_PROD_BUILD" in env)) delete spawnEnv.RELAY_ALLOW_PROD_BUILD;
     try {
-      execFileSync("node", [GUARD], { cwd, env: { ...process.env, HOME: home, ...env }, stdio: "pipe" });
+      execFileSync("node", [GUARD], { cwd, env: spawnEnv, stdio: "pipe" });
       return 0;
     } catch (e) {
       return (e as { status?: number }).status ?? -1;
