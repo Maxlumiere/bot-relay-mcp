@@ -101,14 +101,59 @@ describe("HTTP auth (shared secret)", () => {
     expect(body.auth_required).toBe(true);
   });
 
-  it("rejects dashboard without auth", async () => {
-    const res = await fetch(`${baseUrl}/`);
-    expect(res.status).toBe(401);
+  // ADR-0006 — these two tests previously asserted that the dashboard `/` and
+  // `/api/snapshot` were protected in a suite that configures ONLY
+  // RELAY_HTTP_SECRET. That protection came from the removed
+  // `dashboard secret || http_secret` fallback: the agent transport secret
+  // doubled as dashboard auth. With that escalation gone, the http_secret does
+  // NOT gate the dashboard at all — a dashboard secret is the only dashboard
+  // credential. Inverted (mirrors ADR-0006 / v2.24.0): with a real dashboard
+  // secret configured, presenting the http_secret is REFUSED (401) while the
+  // dashboard secret is accepted (200). A throwaway server carries a dashboard
+  // secret distinct from this suite's http_secret without disturbing the shared
+  // `server` the other tests use.
+  it("http_secret does NOT authenticate the dashboard (escalation removed, ADR-0006)", async () => {
+    process.env.RELAY_DASHBOARD_SECRET = "dashboard-only-secret-distinct-abcd";
+    const s2 = startHttpServer(0, "127.0.0.1");
+    await new Promise((r) => setTimeout(r, 100));
+    const addr = s2.address();
+    const p2 = typeof addr === "object" && addr ? addr.port : 0;
+    try {
+      // The AGENT transport secret is NOT dashboard auth → refused.
+      const bad = await fetch(`http://127.0.0.1:${p2}/`, {
+        headers: { Authorization: "Bearer test-secret-value-12345" },
+      });
+      expect(bad.status).toBe(401);
+      // The real dashboard secret IS accepted.
+      const ok = await fetch(`http://127.0.0.1:${p2}/`, {
+        headers: { Authorization: "Bearer dashboard-only-secret-distinct-abcd" },
+      });
+      expect(ok.status).toBe(200);
+    } finally {
+      s2.close();
+      delete process.env.RELAY_DASHBOARD_SECRET;
+    }
   });
 
-  it("rejects snapshot API without auth", async () => {
-    const res = await fetch(`${baseUrl}/api/snapshot`);
-    expect(res.status).toBe(401);
+  it("http_secret does NOT authenticate the snapshot API (escalation removed, ADR-0006)", async () => {
+    process.env.RELAY_DASHBOARD_SECRET = "dashboard-only-secret-distinct-abcd";
+    const s2 = startHttpServer(0, "127.0.0.1");
+    await new Promise((r) => setTimeout(r, 100));
+    const addr = s2.address();
+    const p2 = typeof addr === "object" && addr ? addr.port : 0;
+    try {
+      const bad = await fetch(`http://127.0.0.1:${p2}/api/snapshot`, {
+        headers: { Authorization: "Bearer test-secret-value-12345" },
+      });
+      expect(bad.status).toBe(401);
+      const ok = await fetch(`http://127.0.0.1:${p2}/api/snapshot`, {
+        headers: { Authorization: "Bearer dashboard-only-secret-distinct-abcd" },
+      });
+      expect(ok.status).toBe(200);
+    } finally {
+      s2.close();
+      delete process.env.RELAY_DASHBOARD_SECRET;
+    }
   });
 });
 

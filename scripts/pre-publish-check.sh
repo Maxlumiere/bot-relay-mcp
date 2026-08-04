@@ -4,7 +4,7 @@
 # Orchestrates every check that must pass before `npm publish`:
 #   1. npx tsc --noEmit
 #   2. npx vitest run
-#   3. npm audit --audit-level=moderate
+#   3. npm audit (high+ threshold, via scripts/audit-with-retry.sh; moderate→high since v2.3.0)
 #   4. npm run build
 #   5. Drift guard: no hardcoded version literals in src/ outside src/version.ts
 #   5a. Tests-side drift guard (v2.6.3): no hardcoded literal of the CURRENT

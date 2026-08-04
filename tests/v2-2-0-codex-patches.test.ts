@@ -23,6 +23,7 @@ import os from "os";
 import http from "http";
 import { WebSocket } from "ws";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v220-codex-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -126,22 +127,24 @@ function rawRequest(opts: {
 
 describe("Codex H1 — /api/focus-terminal bypasses HTTP-secret gate", () => {
   it("(H1.1) POST /api/focus-terminal works when RELAY_HTTP_SECRET is set (via dashboardAuthCheck)", async () => {
-    await bootServer({ RELAY_HTTP_SECRET: "http-only-secret" });
+    // ADR-0006: /api/focus-terminal still bypasses the HTTP-secret gate
+    // (authMiddleware) but is now operator-power — it requires a VERIFIED
+    // dashboard secret + CSRF. Configure BOTH the http_secret (the condition
+    // under test) and a dashboard secret, then drive the shipped operator
+    // handshake. The invariant is unchanged: the request must reach
+    // dashboardAuthCheck + the dispatcher, NOT be rejected by authMiddleware.
+    await bootServer({ RELAY_HTTP_SECRET: "http-only-secret", RELAY_DASHBOARD_SECRET: OPERATOR_SECRET });
     // Register an agent with terminal_title_ref so we can test the
     // successful focus lookup branch. The driver will fail to actually
     // raise (no live iTerm2 with that title) — we just care that the
     // request was ROUTED to dashboardAuthCheck + dispatcher, not rejected
     // by authMiddleware on the HTTP-secret gate.
     registerAgent("focus-target", "r", [], { terminal_title_ref: "some-window" });
-    const r = await rawRequest({
-      method: "POST",
-      path: "/api/focus-terminal",
-      body: JSON.stringify({ agent_name: "focus-target" }),
-    });
-    // Loopback-no-dashboard-secret → dashboardAuthCheck passes;
-    // dispatcher runs; focus fails at OS level → 409 (raised=false).
-    // Pre-patch behavior was 401 from authMiddleware. We assert the
-    // response is NOT 401 — the dashboardAuthCheck + dispatcher path ran.
+    const r = await operatorPost(port, "/api/focus-terminal", { agent_name: "focus-target" });
+    // Operator-authed → dashboardAuthCheck passes; dispatcher runs; focus
+    // fails at OS level → 409 (raised=false). Pre-patch behavior was 401
+    // from authMiddleware. We assert the response is NOT 401 — the
+    // dashboardAuthCheck + dispatcher path ran.
     expect(r.status).not.toBe(401);
   });
 });

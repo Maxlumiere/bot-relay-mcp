@@ -23,6 +23,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorGet, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v222-a2-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -45,6 +46,11 @@ let port: number;
 async function bootServer(): Promise<void> {
   if (server) { try { server.close(); } catch { /* ignore */ } }
   _resetDashboardWsForTests();
+  // ADR-0006: /api/operator-identity + /api/send-message are operator-power —
+  // they require a VERIFIED dashboard secret + CSRF. Configure one so the
+  // operator handshake authenticates; the operator-identity precedence
+  // (cookie > env > default) assertions below are unchanged.
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
   server = startHttpServer(0, "127.0.0.1");
@@ -116,11 +122,12 @@ afterEach(() => {
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   delete process.env.RELAY_DASHBOARD_OPERATOR;
+  delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
 describe("v2.2.2 A2 — operator identity cookie", () => {
   it("(A2.1) POST sets cookie + following action audits operator=<cookie>", async () => {
-    const setRes = await request("POST", "/api/operator-identity", { identity: "alice" });
+    const setRes = await operatorPost(port, "/api/operator-identity", { identity: "alice" });
     expect(setRes.status).toBe(200);
     expect(setRes.json?.identity).toBe("alice");
     const cookie = extractCookie(setRes.setCookie, "relay_operator_identity");
@@ -132,11 +139,11 @@ describe("v2.2.2 A2 — operator identity cookie", () => {
     // Exercise a send-message with the cookie attached.
     registerAgent("a2-1-from", "r", []);
     registerAgent("a2-1-to", "r", []);
-    await request(
-      "POST",
+    await operatorPost(
+      port,
       "/api/send-message",
       { from: "a2-1-from", to: "a2-1-to", content: "cookie test" },
-      { Cookie: "relay_operator_identity=alice" },
+      { extraCookies: "relay_operator_identity=alice" },
     );
     const audit = latestAudit("send_message");
     expect(audit).toBeDefined();
@@ -150,11 +157,11 @@ describe("v2.2.2 A2 — operator identity cookie", () => {
     await bootServer();
     registerAgent("a2-2-from", "r", []);
     registerAgent("a2-2-to", "r", []);
-    await request(
-      "POST",
+    await operatorPost(
+      port,
       "/api/send-message",
       { from: "a2-2-from", to: "a2-2-to", content: "env vs cookie" },
-      { Cookie: "relay_operator_identity=bob" },
+      { extraCookies: "relay_operator_identity=bob" },
     );
     const audit = latestAudit("send_message");
     expect(audit!.params_summary).toMatch(/operator=bob/);
@@ -166,11 +173,10 @@ describe("v2.2.2 A2 — operator identity cookie", () => {
     await bootServer();
     registerAgent("a2-3-from", "r", []);
     registerAgent("a2-3-to", "r", []);
-    await request(
-      "POST",
+    await operatorPost(
+      port,
       "/api/send-message",
       { from: "a2-3-from", to: "a2-3-to", content: "env only" },
-      {},
     );
     const audit = latestAudit("send_message");
     expect(audit!.params_summary).toMatch(/operator=envperson/);
@@ -179,18 +185,17 @@ describe("v2.2.2 A2 — operator identity cookie", () => {
   it("(A2.4) default sentinel when no cookie + no env", async () => {
     registerAgent("a2-4-from", "r", []);
     registerAgent("a2-4-to", "r", []);
-    await request(
-      "POST",
+    await operatorPost(
+      port,
       "/api/send-message",
       { from: "a2-4-from", to: "a2-4-to", content: "default" },
-      {},
     );
     const audit = latestAudit("send_message");
     expect(audit!.params_summary).toMatch(/operator=dashboard-user/);
   });
 
   it("(A2.5) POST with empty identity clears cookie (Max-Age=0)", async () => {
-    const res = await request("POST", "/api/operator-identity", { identity: "" });
+    const res = await operatorPost(port, "/api/operator-identity", { identity: "" });
     expect(res.status).toBe(200);
     expect(res.json?.cleared).toBe(true);
     const clearLine = res.setCookie.find((c) => c.startsWith("relay_operator_identity="));
@@ -201,28 +206,27 @@ describe("v2.2.2 A2 — operator identity cookie", () => {
   it("(A2.6) GET surfaces identity + source", async () => {
     process.env.RELAY_DASHBOARD_OPERATOR = "envdefault";
     await bootServer();
-    const r1 = await request("GET", "/api/operator-identity", null, {});
+    const r1 = await operatorGet(port, "/api/operator-identity");
     expect(r1.status).toBe(200);
     expect(r1.json.identity).toBe("envdefault");
     expect(r1.json.source).toBe("env");
     expect(r1.json.env_set).toBe(true);
 
-    const r2 = await request(
-      "GET",
+    const r2 = await operatorGet(
+      port,
       "/api/operator-identity",
-      null,
-      { Cookie: "relay_operator_identity=carol" },
+      { extraHeaders: { Cookie: "relay_operator_identity=carol" } },
     );
     expect(r2.json.identity).toBe("carol");
     expect(r2.json.source).toBe("cookie");
   });
 
   it("(A2.7) invalid identity (bad chars / too long) → 400", async () => {
-    const bad1 = await request("POST", "/api/operator-identity", { identity: "nope;DROP TABLE" });
+    const bad1 = await operatorPost(port, "/api/operator-identity", { identity: "nope;DROP TABLE" });
     expect(bad1.status).toBe(400);
-    const bad2 = await request("POST", "/api/operator-identity", { identity: "x".repeat(65) });
+    const bad2 = await operatorPost(port, "/api/operator-identity", { identity: "x".repeat(65) });
     expect(bad2.status).toBe(400);
-    const good = await request("POST", "/api/operator-identity", { identity: "max.user@lumiere" });
+    const good = await operatorPost(port, "/api/operator-identity", { identity: "max.user@lumiere" });
     expect(good.status).toBe(200);
   });
 });

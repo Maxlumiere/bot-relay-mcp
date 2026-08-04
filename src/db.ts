@@ -20,6 +20,7 @@ import type {
 } from "./types.js";
 import { VALID_TRANSITIONS, ACTION_TO_STATUS } from "./types.js";
 import { generateToken, hashToken, verifyToken } from "./auth.js";
+import { registerPersistedSecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
 import { computeTokenLookup } from "./token-lookup.js";
 import { normalizeAgentClass, TOPOLOGY_VISIBLE_CLASSES, TOPOLOGY_HIDDEN_CLASSES, TRANSIENT } from "./agent-class.js";
@@ -203,6 +204,40 @@ function parseHostShellPids(raw: string | null | undefined): number[] | null {
   }
 }
 
+/**
+ * THE ROUTING PREDICATE — single source (audit HIGH #2, ADR-0015 L4). An agent
+ * can RECEIVE a task iff it holds a live session AND is not in a terminal status.
+ * postTaskAuto's SQL candidate query (ENFORCEMENT) and the `routable` /
+ * `routability` fields on the agent surface (what the OPERATOR reads) both
+ * derive from this, so the operator can never read a different predicate than
+ * the router enforces. This is DELIBERATELY not `computeLivenessVerdict`: that
+ * asks "is the process alive?", a strictly different question — a live process
+ * whose session dropped is alive-but-unroutable, and conflating the two is what
+ * this split fixes.
+ */
+export const ROUTABLE_TERMINAL_STATUSES = ["offline", "closed", "abandoned", "stale"] as const;
+export function isAgentRoutable(row: { session_id?: string | null; agent_status?: string | null }): boolean {
+  // Case-INSENSITIVE (codex HIGH #2 P1): a persisted 'OFFLINE' must read the same
+  // terminal state the lowercase display shows — otherwise `routable` disagrees
+  // with its own `agent_status` neighbour in the same row. This is now the ONE
+  // implementation the router (postTaskAuto) and the surface both call.
+  return row.session_id != null && !(ROUTABLE_TERMINAL_STATUSES as readonly string[]).includes((row.agent_status ?? "").toLowerCase());
+}
+export type Routability = "routable" | "unroutable_alive" | "unroutable_offline";
+/**
+ * Classify an agent's routability as ONE named state (not two fields to diff).
+ * `unroutable_alive` is the loud diagnostic: the process is alive yet holds no
+ * routable session, so the router will SILENTLY never give it work — the
+ * canonical failure shape wearing a healthy badge (audit HIGH #2).
+ */
+export function agentRoutability(
+  row: { session_id?: string | null; agent_status?: string | null },
+  verdict: LivenessVerdict,
+): Routability {
+  if (isAgentRoutable(row)) return "routable";
+  return verdict === "alive" ? "unroutable_alive" : "unroutable_offline";
+}
+
 function toAgentWithStatus(
   row: AgentRecord,
   verdict: LivenessVerdict = computeLivenessVerdict(row),
@@ -229,6 +264,12 @@ function toAgentWithStatus(
     liveness: verdict,
     last_alive: positiveConfirmationISO(row.name),
     alive: verdict === "alive" && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
+    // audit HIGH #2 — session-actionability, the SAME predicate postTaskAuto
+    // enforces (isAgentRoutable), surfaced so the operator reads what the router
+    // uses (ADR-0015 L4). `routability` is the loud named state; the alarming
+    // one, `unroutable_alive`, is a live process the router will silently starve.
+    routable: isAgentRoutable(row),
+    routability: agentRoutability(row, verdict),
     description: row.description ?? null,
     // Phase A — version + CLI visibility. `health_check` reports the version of
     // WHICHEVER SERVER ANSWERS, so an agent on a stale build asks, is told its
@@ -2042,6 +2083,11 @@ const REAPABLE_ORPHAN_WHERE = "established_at IS NULL AND session_id IS NULL";
  */
 function deleteReapableOrphan(db: CompatDatabase, name: string): boolean {
   const r = db.prepare(`DELETE FROM agents WHERE name = ? AND ${REAPABLE_ORPHAN_WHERE}`).run(name);
+  // v2.23.x #140 — an orphan-reap DELETE ends the name's liveness identity, so
+  // evict both probe caches unconditionally: a stale entry must not outlive the
+  // binding it described and mislabel a re-used name.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   if (r.changes > 0) {
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
     bumpAuthGeneration();
@@ -2509,6 +2555,12 @@ export function teardownAgent(
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
   });
   tx();
+  // v2.23.x #140 — a teardown DELETE ends the name's liveness identity, so evict
+  // both probe caches unconditionally (same rationale as unregisterAgent): a
+  // stale NEGATIVE entry left on this sibling delete path would suppress an
+  // argv-scan alive signal after the name re-registers.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   bumpAuthGeneration(); // ADR-0003: agent row removed → any cached verdict invalid
 }
 
@@ -2643,7 +2695,13 @@ export function setAgentLivenessAnchor(
       "UPDATE agents SET agent_pid = ?, agent_pid_start = ?, host_id = COALESCE(host_id, ?) WHERE name = ?",
     )
     .run(pid, startedAt, ownHost, name);
-  if (r.changes > 0) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
+  // left _negativeProbeCache intact on r.changes===0, where a concurrent write may
+  // already have moved the session/anchor — so a stale NEGATIVE entry labelled the
+  // now-fresh live row `dead` until the TTL. Bracing preserves the harm;
+  // unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return r.changes > 0;
 }
 
@@ -2692,7 +2750,13 @@ export function markAgentOffline(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(name, expectedSessionId);
-  if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
+  // left _negativeProbeCache intact on r.changes===0 (a CAS loser) — where a
+  // concurrent rebind already moved the session/anchor — so a stale NEGATIVE entry
+  // labelled the now-fresh live row `dead` until the TTL. Bracing preserves the
+  // harm; unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2784,31 +2848,38 @@ export function closeAgentSession(
   signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null = null,
 ): { changed: boolean } {
   const db = getDb();
-  // Conditional UPDATE so non-signal callers preserve the legacy
-  // behavior: signal_received_at + signal_kind stay NULL unless this
-  // call carries one. Two SQL forms are cheaper to maintain than a
-  // dynamic builder + safer than a single COALESCE form that could
-  // smuggle a NULL through and clear an already-set signal stamp.
+  // Conditional UPDATE so non-signal callers preserve the legacy behavior:
+  // signal_received_at + signal_kind stay NULL unless this call carries one. Two
+  // SQL forms are cheaper to maintain than a dynamic builder + safer than a
+  // single COALESCE form that could smuggle a NULL through and clear an
+  // already-set signal stamp.
   // v2.13.0 — clear the liveness anchor (last_alive + agent_pid + start) in the
-  // SAME CAS as the close so a same-host probe can't restamp last_alive and
-  // mask the close. Applies to both SQL forms.
+  // SAME CAS as the close so a same-host probe can't restamp last_alive and mask
+  // the close. Applies to both SQL forms.
+  let r: { changes: number };
   if (signalKind === null) {
-    const r = db.prepare(
+    r = db.prepare(
       "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
       "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
       "WHERE name = ? AND session_id = ?"
     ).run(name, expectedSessionId);
-    if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
-    return { changed: r.changes === 1 };
+  } else {
+    const nowMs = Date.now();
+    r = db.prepare(
+      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
+      "signal_received_at = ?, signal_kind = ?, " +
+      "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
+      "WHERE name = ? AND session_id = ?"
+    ).run(nowMs, signalKind, name, expectedSessionId);
   }
-  const nowMs = Date.now();
-  const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
-    "signal_received_at = ?, signal_kind = ?, " +
-    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
-    "WHERE name = ? AND session_id = ?"
-  ).run(nowMs, signalKind, name, expectedSessionId);
-  if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x #140 — SINGLE unconditional dual eviction covering BOTH SQL forms,
+  // hoisted to the common tail (the prior per-branch null-branch eviction was
+  // nested one level down, so it was easy to miss that it ran on only one path).
+  // On a CAS loser (r.changes===0 — a concurrent rebind moved the session/anchor)
+  // a stale NEGATIVE entry must not survive to label the now-fresh live row
+  // `dead`. Bracing preserves the harm; unconditional fixes it (≤ one extra probe).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2859,10 +2930,16 @@ export function endAgentSessionOnSignal(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(nowMs, signalKind, name, expectedSessionId);
-  if (r.changes === 1) {
-    _negativeProbeCache.delete(name);
-    _positiveProbeCache.delete(name);
-  }
+  // v2.23.x #140 — the FIFTH site, and the one four reviewers missed because it
+  // was BRACED (looked correct). Same defect as the four unbraced ones: on a CAS
+  // loser (r.changes===0 — a concurrent rebind already moved the session/anchor)
+  // the guarded `if` left a stale NEGATIVE entry intact, so the fresh live row
+  // read `dead`, or its argv-scan alive signal was SUPPRESSED (computeLiveness-
+  // Verdict returns at the negative-cache hit before reaching the argv probe),
+  // until the ~5s TTL. UNCONDITIONAL dual eviction — a CAS loser must not retain
+  // a verdict about a binding it failed to mutate (≤ one extra probe).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2990,6 +3067,7 @@ export function mintAgentToken(
   const plaintext_token = generateToken();
   const token_hash = hashToken(plaintext_token);
 
+  let created: boolean;
   if (!existing) {
     const id = uuidv4();
     const session_id = uuidv4();
@@ -3009,51 +3087,56 @@ export function mintAgentToken(
     });
     tx();
     bumpAuthGeneration(); // ADR-0003: new token_hash + token_lookup written
-
-    const fresh = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
-    return {
-      agent: toAgentWithStatus(fresh),
-      plaintext_token,
-      created: true,
-    };
-  }
-
-  if (!options.force) {
-    throw new Error(
-      `Agent "${name}" already exists. Pass --force to mint a new token (rotates + invalidates the existing token, clears session, sets status=offline).`
-    );
-  }
-
-  // Force-rotate: token-only. Caps + role preserved (immutability + safety).
-  // Description is preserved when not supplied; if explicitly supplied (even
-  // null) the caller is updating it. CLI doesn't expose --description on the
-  // rotate path in v2.6.0 to keep the surface tight; future-add via this hook.
-  const newDescription =
-    options.description !== undefined ? options.description : existing.description ?? null;
-  const tx = db.transaction(() => {
-    const r = db.prepare(
-      "UPDATE agents SET last_seen = ?, token_hash = ?, token_lookup = ?, session_id = NULL, " +
-        "agent_status = 'offline', auth_state = 'active', " +
-        "previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL, " +
-        "recovery_token_hash = NULL, revoked_at = NULL, " +
-        "description = ? " +
-        "WHERE name = ?"
-    ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name);
-    if (r.changes !== 1) {
+    created = true;
+  } else {
+    if (!options.force) {
       throw new Error(
-        `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
+        `Agent "${name}" already exists. Pass --force to mint a new token (rotates + invalidates the existing token, clears session, sets status=offline).`
       );
     }
-  });
-  tx();
-  bumpAuthGeneration(); // ADR-0003: token rotated (new token_hash/token_lookup, old invalidated)
+    // Force-rotate: token-only. Caps + role preserved (immutability + safety).
+    // Description is preserved when not supplied; if explicitly supplied (even
+    // null) the caller is updating it. CLI doesn't expose --description on the
+    // rotate path in v2.6.0 to keep the surface tight; future-add via this hook.
+    const newDescription =
+      options.description !== undefined ? options.description : existing.description ?? null;
+    const tx = db.transaction(() => {
+      const r = db.prepare(
+        "UPDATE agents SET last_seen = ?, token_hash = ?, token_lookup = ?, session_id = NULL, " +
+          "agent_status = 'offline', auth_state = 'active', " +
+          "previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL, " +
+          "recovery_token_hash = NULL, revoked_at = NULL, " +
+          "description = ? " +
+          "WHERE name = ?"
+      ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name);
+      if (r.changes !== 1) {
+        throw new Error(
+          `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
+        );
+      }
+    });
+    tx();
+    bumpAuthGeneration(); // ADR-0003: token rotated (new token_hash/token_lookup, old invalidated)
+    created = false;
+  }
 
-  const updated = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
-  return {
-    agent: toAgentWithStatus(updated),
-    plaintext_token,
-    created: false,
-  };
+  // v2.23.x #140 — mint CREATES (first-mint INSERT) or REPLACES (force-rotate
+  // clears session_id) the name's liveness identity, so evict both probe caches
+  // unconditionally. Found during #140 by sweeping for identity writers by
+  // behaviour rather than syntax — mint is neither one of the five teardown sites
+  // nor register/unregister, yet it resets the same identity the caches key on.
+  // (Throw paths above bypass this: a non-force collision or a changes!==1 rotate
+  // mutated nothing, so there is no fresh binding whose cache could be stale.)
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+
+  // PR C v2 — register the persisted token AFTER both success branches committed
+  // (the non-force collision and changes!==1 throw paths above return early), so
+  // a failed mint never plants a throwaway. See registerPersistedSecret.
+  registerPersistedSecret(name, plaintext_token);
+
+  const row = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
+  return { agent: toAgentWithStatus(row), plaintext_token, created };
 }
 
 /**
@@ -3392,12 +3475,31 @@ export function registerAgent(
     });
   }
 
+  // v2.23.x #140 — registration CREATES (first INSERT) or REPLACES (re-register
+  // rotates session_id) the name's liveness identity, so evict both probe caches
+  // unconditionally on the success path. Concrete harm
+  // prevented: a crashed terminal left a dead-anchor NEGATIVE entry; the relaunch
+  // re-registers HERE before its hook restamps the anchor — without this evict the
+  // stale negative would SUPPRESS the argv-scan alive signal (computeLiveness-
+  // Verdict returns at the negative-cache hit before the argv probe) for the ~5s
+  // TTL. setAgentLivenessAnchor also evicts when the fresh anchor lands, but that
+  // can trail the register, so close the window here too. (CAS-loser register
+  // paths throw above → no identity change → nothing stale to clear.)
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+
   // v2.0 beta.1 (Codex HIGH 4): auto-assign queued tasks at the DB layer so
   // every caller of registerAgent (tool handler, future hooks, direct scripts)
   // gets the sweep. Handler layer remains responsible for firing webhooks off
   // the returned list — circular-import-safe.
   const auto_assigned = tryAssignQueuedTasksTo(agentWithStatus.name, agentWithStatus.capabilities);
 
+  // PR C v2 — register the persisted secrets AFTER the CAS/INSERT committed (the
+  // ForcePrecondition / ConcurrentUpdate throw paths above return early). Both
+  // branches converge here: re-register sets plaintext_token (null when the token
+  // was preserved → skipped), first-registration sets both token + recovery.
+  // Never before commit; a failed re-register plants no throwaway.
+  registerPersistedSecret(name, plaintext_token, registration_recovery);
   return { agent: agentWithStatus, plaintext_token, auto_assigned, registration_recovery };
 }
 
@@ -3472,6 +3574,7 @@ export function rotateAgentToken(
         );
       }
       bumpAuthGeneration(); // ADR-0003: token rotated (hard-cut)
+      registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
       return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt: null };
     }
 
@@ -3499,6 +3602,7 @@ export function rotateAgentToken(
       );
     }
     bumpAuthGeneration(); // ADR-0003: token rotated (grace)
+    registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
     return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt };
   }
 
@@ -3515,6 +3619,7 @@ export function rotateAgentToken(
     );
   }
   bumpAuthGeneration(); // ADR-0003: token rotated (unmanaged)
+  registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
   return { newPlaintextToken, newHash, agentClass: "unmanaged", graceExpiresAt: null };
 }
 
@@ -3562,6 +3667,7 @@ export function rotateAgentTokenAdmin(
         );
       }
       bumpAuthGeneration(); // ADR-0003: admin token rotated (hard-cut)
+      registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
       return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt: null };
     }
 
@@ -3585,6 +3691,7 @@ export function rotateAgentTokenAdmin(
       );
     }
     bumpAuthGeneration(); // ADR-0003: admin token rotated (grace)
+    registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
     return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt };
   }
 
@@ -3600,6 +3707,7 @@ export function rotateAgentTokenAdmin(
     );
   }
   bumpAuthGeneration(); // ADR-0003: admin token rotated (unmanaged)
+  registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
   return { newPlaintextToken, newHash, agentClass: "unmanaged", graceExpiresAt: null };
 }
 
@@ -3693,6 +3801,10 @@ export function revokeAgentToken(
   // on generation, so we MUST bump here or a revoked token would keep passing
   // from cache. (The revoke-trap.)
   if (r.changes > 0) bumpAuthGeneration();
+  // PR C v2 — register the recovery token only if it was actually PERSISTED (the
+  // CAS updated a row AND a recovery token was issued). A no-op revoke on an
+  // already-revoked row (changes===0) persisted no secret → nothing to register.
+  if (r.changes > 0 && recoveryToken) registerPersistedSecret(targetName, recoveryToken);
 
   return {
     revoked: r.changes > 0,
@@ -3883,6 +3995,14 @@ export function unregisterAgent(name: string, expectedSessionId?: string): boole
   } else {
     result = db.prepare("DELETE FROM agents WHERE name = ?").run(name);
   }
+  // v2.23.x #140 — deleting a row ENDS the name's liveness identity, so evict
+  // both probe caches unconditionally. This is not a false-`dead` source (a
+  // re-registered name has no anchor yet → computeLivenessVerdict returns
+  // `unknown`, never `dead`), but a stale NEGATIVE entry would SUPPRESS the
+  // argv-scan alive signal during the brief unanchored interval after a
+  // re-register (the negative-cache hit returns before the argv probe runs).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   // Only clean up normalized capabilities when the agent row actually went
   // away — important for the session_id-scoped case where we might not have
   // deleted anything.
@@ -4095,6 +4215,13 @@ export function _resetLivenessProbeCacheForTests(): void {
 /** Test-only: read the probe counter. */
 export function _getLivenessProbeCountForTests(): number {
   return _livenessProbeCount;
+}
+
+/** Test-only: seed the in-memory positive-probe cache, so `last_alive`
+ *  (positiveConfirmationISO) can be driven to CHANGE between reads without a
+ *  live process on a real ~5s probe cycle. Mirrors the reset/count hooks. */
+export function _setPositiveProbeForTests(name: string, atMs: number): void {
+  _positiveProbeCache.set(name, atMs);
 }
 
 /** v2.15.0 — the three-way presence verdict. `unknown` = no positive AND no
@@ -4955,6 +5082,12 @@ export function deleteAgentIfAbandoned(name: string, cutoffIso: string): boolean
   const r = db
     .prepare("DELETE FROM agents WHERE name = ? AND last_seen < ?")
     .run(name, cutoffIso);
+  // v2.23.x #140 — a purge DELETE ends the name's liveness identity; evict both
+  // probe caches unconditionally, applied uniformly to every delete-of-identity
+  // path. A row this stale (last_seen past the cutoff) has no live ~5s cache entry
+  // in practice; the eviction is harmless there and keeps the treatment uniform.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   if (r.changes > 0) bumpAuthGeneration(); // ADR-0003: agent row removed
   return r.changes > 0;
 }
@@ -5679,8 +5812,28 @@ export function postTaskAuto(
     const bindArgs: (string | number)[] = [...requiredCapabilities];
     if (!allowSelfAssign) bindArgs.push(from);
     bindArgs.push(requiredCapabilities.length);
+    // v2.24 (audit HIGH #2) — ROUTE ONLY TO A LIVE AGENT. Previously the
+    // candidate set was capability-only, so a registered-but-closed agent (its
+    // terminal gone, session dropped) stayed a candidate and — with load 0 —
+    // sorted AHEAD of live busy agents, so post_task_auto handed work to a
+    // corpse that never accepted and was never requeued: a silent black hole,
+    // while the caller got routed=true.
+    //
+    // SINGLE PREDICATE (codex HIGH #2 P1 / ADR-0015 L4): both the router here and
+    // the operator surface (`routable`/`routability` on the agent row) call the
+    // SAME isAgentRoutable() — ONE implementation, so they cannot disagree. The
+    // SQL deliberately NO LONGER duplicates the session/status filter: a
+    // case-sensitive SQL `NOT IN` let a persisted 'OFFLINE' route while the
+    // display normalized it to 'offline' — `routable` disagreeing with its own
+    // neighbour in the same row. The registry is tens of rows, so we fetch the
+    // capability matches (with the columns isAgentRoutable needs) and filter in
+    // JS. Deliberately NOT computeLivenessVerdict — that is the argv/PID
+    // *presence* probe (a display signal that reads a dropped-session live
+    // process as "alive"); a task is delivered THROUGH the session, so
+    // session-holding is the authorization answer. No routable candidate → the
+    // queued path below (routed:false), healed by tryAssignQueuedTasksTo later.
     const candidates = db.prepare(
-      `SELECT a.name, a.last_seen,
+      `SELECT a.name, a.last_seen, a.session_id, a.agent_status,
               (SELECT COUNT(*) FROM tasks t
                  WHERE t.to_agent = a.name AND t.status IN ('posted','accepted')) AS load
          FROM agents a
@@ -5688,12 +5841,15 @@ export function postTaskAuto(
         WHERE ac.capability IN (${placeholders})${excludeSenderClause}
         GROUP BY a.name
        HAVING COUNT(DISTINCT ac.capability) = ?
-        ORDER BY load ASC, a.last_seen DESC
-        LIMIT 10`
-    ).all(...bindArgs) as Array<{ name: string; last_seen: string; load: number }>;
+        ORDER BY load ASC, a.last_seen DESC`
+    ).all(...bindArgs) as Array<{
+      name: string; last_seen: string; session_id: string | null; agent_status: string | null; load: number;
+    }>;
+    // The ONE routability predicate — identical to the operator surface's.
+    const routableCandidates = candidates.filter((c) => isAgentRoutable(c));
 
-    if (candidates.length === 0) {
-      log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] candidates=0 → queued`);
+    if (routableCandidates.length === 0) {
+      log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] routable=0/${candidates.length} → queued`);
       db.prepare(
         "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, NULL, ?, ?, ?, 'queued', NULL, ?, ?, ?)"
       ).run(id, from, title, encDescription, priority, timestamp, timestamp, capsJson);
@@ -5709,8 +5865,8 @@ export function postTaskAuto(
       };
     }
 
-    const pick = candidates[0];
-    log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] candidates=${candidates.length} picked=${pick.name} (load=${pick.load})`);
+    const pick = routableCandidates[0];
+    log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] routable=${routableCandidates.length}/${candidates.length} picked=${pick.name} (load=${pick.load})`);
     db.prepare(
       "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?, ?)"
     ).run(id, from, pick.name, title, encDescription, priority, timestamp, timestamp, capsJson);
@@ -5727,7 +5883,7 @@ export function postTaskAuto(
       },
       routed: true,
       assigned_to: pick.name,
-      candidate_count: candidates.length,
+      candidate_count: routableCandidates.length,
     };
   });
 
@@ -5812,6 +5968,12 @@ export interface HealthReassignment {
   triggered_by: string;
   from_agent: string;
   required_capabilities: string[] | null;
+  /** Why the task was requeued — 'lease-expired' (an accepted task whose
+   *  assignee stopped renewing its lease) or 'assignee-gone-before-accept' (a
+   *  task routed to an agent whose session dropped before it accepted — audit
+   *  HIGH #2). Lets callers/webhooks distinguish a normal lease timeout from a
+   *  route to a vanished agent. */
+  reason: "lease-expired" | "assignee-gone-before-accept";
 }
 
 /**
@@ -5842,6 +6004,75 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
   //   (c) assignee is NOT in busy/away with an unexpired TTL
   // busy_expires_at < now → shield has lapsed, agent is no longer protected.
   const nowIsoForStatus = now();
+  const scanLimit = Math.max(1, Math.min(500, parseInt(process.env.RELAY_HEALTH_SCAN_LIMIT || "50", 10)));
+  const requeued: HealthReassignment[] = [];
+
+  // ===== POSTED-BUT-NEVER-ACCEPTED ORPHANS (audit HIGH #2) — always runs =====
+  // postTaskAuto now routes only to a live-session agent, but an agent can drop
+  // its session in the window between 'posted' and 'accepted' (a VS Code reload,
+  // a crash). Such a task is status='posted' with lease_renewed_at NULL, so the
+  // accepted-lease scan below never matches it and it dead-ends forever.
+  // Requeue it to the pool — LOUDLY: routing to an agent that then vanished is
+  // an anomaly the operator must SEE, not a silent redirect (the black hole in
+  // a new guise). Same session predicate as the postTaskAuto candidate filter:
+  // assignee unregistered OR holding no session. A short grace lets a
+  // just-posted task be accepted / a brief reconnect recover before we step in.
+  const postedGraceSec = Math.max(1, parseInt(process.env.RELAY_POSTED_ORPHAN_GRACE_SECONDS || "120", 10));
+  const postedThreshold = new Date(Date.now() - postedGraceSec * 1000).toISOString();
+  const postedOrphans = db.prepare(
+    `SELECT t.id, t.to_agent, t.from_agent, t.required_capabilities
+       FROM tasks t
+      WHERE t.status = 'posted'
+        AND t.lease_renewed_at IS NULL
+        AND t.to_agent IS NOT NULL
+        AND t.updated_at < ?
+        AND (
+          t.to_agent NOT IN (SELECT name FROM agents)
+          OR t.to_agent IN (SELECT name FROM agents WHERE session_id IS NULL)
+        )
+      ORDER BY t.updated_at ASC
+      LIMIT ?`,
+  ).all(postedThreshold, scanLimit) as Array<{
+    id: string; to_agent: string; from_agent: string; required_capabilities: string | null;
+  }>;
+  if (postedOrphans.length > 0) {
+    // CAS re-checks status='posted' + lease NULL + assignee-still-gone, so an
+    // agent that accepted or reconnected between SELECT and UPDATE keeps its task.
+    const casRequeuePosted = db.prepare(
+      `UPDATE tasks SET to_agent = NULL, status = 'queued', updated_at = ?
+        WHERE id = ?
+          AND status = 'posted'
+          AND lease_renewed_at IS NULL
+          AND to_agent = ?
+          AND (
+            to_agent NOT IN (SELECT name FROM agents)
+            OR to_agent IN (SELECT name FROM agents WHERE session_id IS NULL)
+          )`,
+    );
+    for (const row of postedOrphans) {
+      const result = casRequeuePosted.run(now(), row.id, row.to_agent);
+      if (result.changes === 1) {
+        log.warn(
+          `[health] task ${row.id} was routed to "${row.to_agent}" which is gone (no live session) and never accepted it — requeued to the pool (triggered_by=${triggeredBy})`,
+        );
+        let reqCaps: string[] | null = null;
+        if (row.required_capabilities) {
+          try { reqCaps = JSON.parse(row.required_capabilities) as string[]; } catch { reqCaps = null; }
+        }
+        requeued.push({
+          task_id: row.id,
+          previous_agent: row.to_agent,
+          triggered_by: triggeredBy,
+          from_agent: row.from_agent,
+          required_capabilities: reqCaps,
+          reason: "assignee-gone-before-accept",
+        });
+      }
+      // changes===0 → agent accepted or reconnected between SELECT and UPDATE; correct to skip.
+    }
+  }
+
+  // ===== ACCEPTED-LEASE-EXPIRED scan (existing v2.0 / #26 path) =====
   const staleCount = db.prepare(
     `SELECT COUNT(*) AS c
        FROM tasks t
@@ -5866,9 +6097,8 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
           )
         )`
   ).get(threshold, threshold, nowIsoForStatus) as { c: number };
-  if (staleCount.c === 0) return [];
+  if (staleCount.c === 0) return requeued;
 
-  const scanLimit = parseInt(process.env.RELAY_HEALTH_SCAN_LIMIT || "50", 10);
   const stale = db.prepare(
     `SELECT t.id, t.to_agent, t.from_agent, t.lease_renewed_at, t.required_capabilities
        FROM tasks t
@@ -5894,11 +6124,10 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
         )
       ORDER BY t.lease_renewed_at ASC
       LIMIT ?`
-  ).all(threshold, threshold, nowIsoForStatus, Math.max(1, Math.min(500, scanLimit))) as Array<{
+  ).all(threshold, threshold, nowIsoForStatus, scanLimit) as Array<{
     id: string; to_agent: string; from_agent: string; lease_renewed_at: string; required_capabilities: string | null;
   }>;
 
-  const requeued: HealthReassignment[] = [];
   // CAS ensures we only requeue the exact row we inspected. Re-check agent
   // liveness AND agent_status/TTL inside the CAS as belt-and-suspenders — a
   // concurrent touchAgent can bump last_seen between SELECT and UPDATE, and
@@ -5944,6 +6173,7 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
         triggered_by: triggeredBy,
         from_agent: row.from_agent,
         required_capabilities: reqCaps,
+        reason: "lease-expired",
       });
     }
     // changes===0 means the assignee heartbeated between our SELECT and UPDATE — no requeue, correct outcome.

@@ -25,6 +25,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v222-b1-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -44,6 +45,11 @@ let port: number;
 async function bootServer(): Promise<void> {
   if (server) { try { server.close(); } catch { /* ignore */ } }
   _resetDashboardWsForTests();
+  // ADR-0006: /api/dashboard-theme is operator-power (verified dashboard secret
+  // + CSRF); the dashboard HTML + /dashboard/ws require the same secret once one
+  // is configured. Set it and authenticate all three surfaces (operatorPost for
+  // the POSTs, Bearer for getHtml, ?auth= for the WS upgrade).
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
   server = startHttpServer(0, "127.0.0.1");
@@ -73,7 +79,7 @@ function postJson(p: string, body: Record<string, unknown>): Promise<{ status: n
 function getHtml(p: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const req = http.get(
-      { host: "127.0.0.1", port, path: p },
+      { host: "127.0.0.1", port, path: p, headers: { Authorization: `Bearer ${OPERATOR_SECRET}` } },
       (res) => {
         let raw = "";
         res.setEncoding("utf8");
@@ -91,6 +97,7 @@ afterEach(() => {
   _resetDashboardWsForTests();
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+  delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
 const FULL_THEME = {
@@ -123,7 +130,7 @@ describe("v2.2.2 B1 — custom-theme dialog + /api/dashboard-theme", () => {
   });
 
   it("(B1.2) POST { mode: 'catppuccin' } persists via setDashboardPrefs", async () => {
-    const res = await postJson("/api/dashboard-theme", { mode: "catppuccin" });
+    const res = await operatorPost(port, "/api/dashboard-theme", { mode: "catppuccin" });
     expect(res.status).toBe(200);
     expect(res.json?.success).toBe(true);
     expect(res.json?.theme).toBe("catppuccin");
@@ -132,7 +139,7 @@ describe("v2.2.2 B1 — custom-theme dialog + /api/dashboard-theme", () => {
   });
 
   it("(B1.3) POST { mode: 'custom', custom_json } persists + broadcasts WS event", async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/dashboard/ws`);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/dashboard/ws?auth=${OPERATOR_SECRET}`);
     const messages: any[] = [];
     ws.on("message", (d: Buffer) => {
       try { messages.push(JSON.parse(d.toString("utf8"))); } catch { /* ignore */ }
@@ -144,7 +151,7 @@ describe("v2.2.2 B1 — custom-theme dialog + /api/dashboard-theme", () => {
     });
     // Let the eager hello frame land before we post.
     await new Promise((r) => setTimeout(r, 80));
-    const res = await postJson("/api/dashboard-theme", { mode: "custom", custom_json: FULL_THEME });
+    const res = await operatorPost(port, "/api/dashboard-theme", { mode: "custom", custom_json: FULL_THEME });
     expect(res.status).toBe(200);
     expect(res.json?.success).toBe(true);
     const persisted = getDashboardPrefs();
@@ -160,7 +167,7 @@ describe("v2.2.2 B1 — custom-theme dialog + /api/dashboard-theme", () => {
   });
 
   it("(B1.4) POST { mode: 'custom' } without custom_json → 400", async () => {
-    const res = await postJson("/api/dashboard-theme", { mode: "custom" });
+    const res = await operatorPost(port, "/api/dashboard-theme", { mode: "custom" });
     expect(res.status).toBe(400);
     expect(res.json?.success).toBe(false);
   });
@@ -168,12 +175,12 @@ describe("v2.2.2 B1 — custom-theme dialog + /api/dashboard-theme", () => {
   it("(B1.5) POST { mode: 'custom', custom_json: partial } → 400", async () => {
     const partial = { ...FULL_THEME } as Record<string, string>;
     delete partial.bg;
-    const res = await postJson("/api/dashboard-theme", { mode: "custom", custom_json: partial });
+    const res = await operatorPost(port, "/api/dashboard-theme", { mode: "custom", custom_json: partial });
     expect(res.status).toBe(400);
   });
 
   it("(B1.6) audit log records via_dashboard on successful set", async () => {
-    await postJson("/api/dashboard-theme", { mode: "dark" });
+    await operatorPost(port, "/api/dashboard-theme", { mode: "dark" });
     const row = getDb()
       .prepare(
         "SELECT success, params_summary FROM audit_log " +

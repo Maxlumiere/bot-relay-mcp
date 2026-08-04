@@ -178,7 +178,12 @@ describe("HTTP transport", () => {
     expect(data).toHaveProperty("messages");
     expect(data).toHaveProperty("active_tasks");
     expect(data).toHaveProperty("webhooks");
-    expect(data).toHaveProperty("timestamp");
+    // v2.24.0: server-now moved OUT of the body (it defeated the snapshot ETag)
+    // into the HTTP Date header; a strong ETag over the now-stable body drives
+    // If-None-Match / 304 revalidation.
+    expect(data).not.toHaveProperty("timestamp");
+    expect(res.headers.get("date")).toBeTruthy();
+    expect(res.headers.get("etag")).toBeTruthy();
     expect(Array.isArray(data.agents)).toBe(true);
   });
 });

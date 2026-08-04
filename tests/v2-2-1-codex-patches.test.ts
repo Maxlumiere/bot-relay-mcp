@@ -19,6 +19,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v221-codex-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -43,6 +44,10 @@ let port: number;
 async function bootServer(): Promise<void> {
   if (server) { try { server.close(); } catch { /* ignore */ } }
   _resetDashboardWsForTests();
+  // ADR-0006: the inline /api/* mutation endpoints are operator-power — they
+  // require a VERIFIED dashboard secret + CSRF. Configure one so operatorPost
+  // authenticates; the audit-trail assertions below are unchanged.
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
   server = startHttpServer(0, "127.0.0.1");
@@ -76,6 +81,7 @@ afterEach(() => {
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   delete process.env.RELAY_DASHBOARD_OPERATOR;
+  delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
 // ============================================================================
@@ -86,7 +92,7 @@ describe("Codex M1 — /api/send-message + /api/kill-agent + /api/set-status aud
   it("(M1.1) /api/send-message writes audit_log entry with via_dashboard: true", async () => {
     registerAgent("auditor-from", "r", []);
     registerAgent("auditor-to", "r", []);
-    await postJson("/api/send-message", {
+    await operatorPost(port, "/api/send-message", {
       from: "auditor-from",
       to: "auditor-to",
       content: "audit me",
@@ -114,7 +120,7 @@ describe("Codex M1 — /api/send-message + /api/kill-agent + /api/set-status aud
     await bootServer(); // pick up the env
     registerAgent("mx-from", "r", []);
     registerAgent("mx-to", "r", []);
-    await postJson("/api/send-message", {
+    await operatorPost(port, "/api/send-message", {
       from: "mx-from",
       to: "mx-to",
       content: "operator-tagged",
@@ -128,7 +134,7 @@ describe("Codex M1 — /api/send-message + /api/kill-agent + /api/set-status aud
 
   it("(M1.3) /api/kill-agent audit records target + removed flag", async () => {
     registerAgent("doomed-audit", "r", []);
-    await postJson("/api/kill-agent", { name: "doomed-audit" }, { "X-Relay-Confirm": "yes" });
+    await operatorPost(port, "/api/kill-agent", { name: "doomed-audit" }, { extraHeaders: { "X-Relay-Confirm": "yes" } });
     const row = getDb()
       .prepare("SELECT agent_name, params_summary, success FROM audit_log WHERE tool = 'unregister_agent' AND source = 'dashboard'")
       .get() as { agent_name: string; params_summary: string; success: number } | undefined;
@@ -140,7 +146,7 @@ describe("Codex M1 — /api/send-message + /api/kill-agent + /api/set-status aud
 
   it("(M1.4) /api/set-status audit records target + new status", async () => {
     registerAgent("statuschanger-audit", "r", []);
-    await postJson("/api/set-status", { agent_name: "statuschanger-audit", agent_status: "working" });
+    await operatorPost(port, "/api/set-status", { agent_name: "statuschanger-audit", agent_status: "working" });
     const row = getDb()
       .prepare("SELECT agent_name, params_summary, success FROM audit_log WHERE tool = 'set_status' AND source = 'dashboard'")
       .get() as { agent_name: string; params_summary: string; success: number } | undefined;
@@ -151,7 +157,7 @@ describe("Codex M1 — /api/send-message + /api/kill-agent + /api/set-status aud
   });
 
   it("(M1.5) failed send-message (unknown sender) still writes an audit entry with success=0", async () => {
-    await postJson("/api/send-message", { from: "ghost", to: "any", content: "x" });
+    await operatorPost(port, "/api/send-message", { from: "ghost", to: "any", content: "x" });
     const row = getDb()
       .prepare("SELECT success, error FROM audit_log WHERE tool = 'send_message' AND source = 'dashboard'")
       .get() as { success: number; error: string | null } | undefined;
@@ -168,7 +174,9 @@ describe("Codex M1 — /api/send-message + /api/kill-agent + /api/set-status aud
 describe("Codex L1 — /api/set-status broadcasts to dashboard WebSocket", () => {
   it("(L1.1) WS client receives agent.state_changed after /api/set-status call", async () => {
     registerAgent("ws-status", "r", []);
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/dashboard/ws`);
+    // ADR-0006: with a dashboard secret configured, the /dashboard/ws upgrade
+    // requires the secret (same resolver as the HTTP gate). Present it via ?auth=.
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/dashboard/ws?auth=${OPERATOR_SECRET}`);
     const queue: string[] = [];
     ws.on("message", (d: Buffer) => queue.push(d.toString("utf8")));
     await new Promise<void>((r, j) => {
@@ -180,7 +188,7 @@ describe("Codex L1 — /api/set-status broadcasts to dashboard WebSocket", () =>
     for (let i = 0; i < 20 && queue.length === 0; i++) await new Promise((r) => setTimeout(r, 25));
     queue.length = 0;
 
-    await postJson("/api/set-status", { agent_name: "ws-status", agent_status: "blocked" });
+    await operatorPost(port, "/api/set-status", { agent_name: "ws-status", agent_status: "blocked" });
 
     // Wait for the broadcast frame.
     for (let i = 0; i < 20 && queue.length === 0; i++) await new Promise((r) => setTimeout(r, 25));

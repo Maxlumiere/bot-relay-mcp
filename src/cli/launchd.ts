@@ -29,6 +29,7 @@
  */
 import path from "path";
 import os from "os";
+import { VERSION } from "../version.js";
 
 /** Public-clean canonical LaunchAgent label. Deliberately generic — NEVER a
  *  private/persona name (a stranger's machine gets this). */
@@ -111,25 +112,54 @@ export function parseLoadedRelayLabels(launchctlListOutput: string): string[] {
   return out;
 }
 
-export type HealthClass = "relay" | "foreign" | "none";
+export type HealthClass = "relay" | "foreign" | "none" | "unreadable";
 
 /**
- * Classify a /health probe of the target port:
- *   - "relay"   — reachable AND the body is our relay's health shape
- *                 (status:"ok" + version + protocol_version).
- *   - "foreign" — reachable but NOT relay-shaped (someone else on the port).
- *   - "none"    — unreachable (probe failed / non-2xx).
+ * The outcome of probing :port/health, DISCRIMINATED so the caller can tell
+ * "nothing is on the port" apart from "something answered but we could not read
+ * it." Collapsing those (the fail-open bug) treats an unreadable daemon as a
+ * free port and installs a COMPETING one.
  */
-export function classifyHealthProbe(ok: boolean, body: unknown): HealthClass {
-  if (!ok) return "none";
-  const b = body as { status?: unknown; version?: unknown; protocol_version?: unknown } | null;
+export interface HealthProbe {
+  /** An HTTP response came back at all (fetch resolved). false = connection
+   *  refused / network error / timeout ⇒ the port is genuinely free. */
+  reachable: boolean;
+  /** The response status was 2xx. */
+  ok: boolean;
+  /** The body parsed as JSON. false = empty / non-JSON body (the `curl -s`
+   *  empty-200-after-a-bounce case that `res.json()` throws on). */
+  parseable: boolean;
+  /** The parsed JSON body (null when unreachable or unparseable). */
+  body: unknown;
+}
+
+/**
+ * Classify a /health probe:
+ *   - "none"       — UNREACHABLE (fetch rejected): the port is genuinely free.
+ *   - "relay"      — reachable, 2xx, parseable, our relay's health shape.
+ *   - "foreign"    — reachable, 2xx, parseable, but NOT relay-shaped.
+ *   - "unreadable" — reachable but the health could NOT be read (empty body,
+ *                    non-JSON, or non-2xx). Something is there we cannot
+ *                    identify → the caller must FAIL CLOSED (never install a
+ *                    competing daemon on an occupied port). An unreadable probe
+ *                    is NOT "none" — that conflation was the fail-open bug.
+ */
+export function classifyHealthProbe(probe: HealthProbe): HealthClass {
+  if (!probe.reachable) return "none";
+  if (!probe.ok || !probe.parseable) return "unreadable";
+  const b = probe.body as { status?: unknown; version?: unknown; protocol_version?: unknown } | null;
   if (b && b.status === "ok" && typeof b.version === "string" && typeof b.protocol_version === "string") {
     return "relay";
   }
   return "foreign";
 }
 
-export type DaemonAction = "install" | "skip-relay-present" | "skip-foreign-port" | "skip-agent-loaded";
+export type DaemonAction =
+  | "install"
+  | "skip-relay-present"
+  | "skip-foreign-port"
+  | "skip-agent-loaded"
+  | "skip-unreadable";
 
 export interface DaemonDecision {
   action: DaemonAction;
@@ -137,32 +167,62 @@ export interface DaemonDecision {
   reason: string;
   /** Loaded relay labels observed (for operator visibility). */
   existingLabels: string[];
+  /** Set when a relay daemon IS on the port but reports a DIFFERENT version
+   *  than the installed package — an upgrade that has NOT taken effect. The
+   *  action stays skip (we NEVER auto-bounce a daemon the whole fleet depends
+   *  on — ADR-0005: report drift loudly, let a human run `relay restart`), but
+   *  this signals the caller to warn LOUDLY instead of reassuring. */
+  versionDrift?: { running: string; installed: string };
 }
 
 /**
  * Pure collision decision. install ONLY when the port is free AND no bot-relay
  * LaunchAgent is already loaded. Every other case SKIPS (never double-loads).
+ *
+ * When a relay IS on the port, compare its reported version to the installed
+ * package: a mismatch means `npm update` landed new code but the OLD daemon is
+ * still serving it (launchd KeepAlive has no WatchPaths, so it never restarts
+ * on a dist change). We surface that as `versionDrift` so the installer stops
+ * printing "leaving the existing supervisor in place" as if all were well.
  */
 export function decideDaemonAction(input: {
   healthClass: HealthClass;
   loadedRelayLabels: string[];
   port: number;
+  installedVersion?: string;
+  runningVersion?: string | null;
 }): DaemonDecision {
-  const { healthClass, loadedRelayLabels, port } = input;
+  const { healthClass, loadedRelayLabels, port, installedVersion, runningVersion } = input;
   if (healthClass === "relay") {
+    const labels = loadedRelayLabels.length ? ` (LaunchAgent: ${loadedRelayLabels.join(", ")})` : "";
+    const drift =
+      installedVersion && runningVersion && runningVersion !== installedVersion
+        ? { running: runningVersion, installed: installedVersion }
+        : undefined;
     return {
       action: "skip-relay-present",
-      reason:
-        `:${port} is already served by a bot-relay daemon` +
-        (loadedRelayLabels.length ? ` (LaunchAgent: ${loadedRelayLabels.join(", ")})` : "") +
-        ` — leaving the existing supervisor in place (no double-load).`,
+      reason: drift
+        ? `:${port} is served by a bot-relay daemon running ${drift.running}${labels}, but the installed package is ${drift.installed} — the upgrade has NOT taken effect. The running daemon keeps serving ${drift.running} until it is restarted. Run \`relay restart\` to load ${drift.installed}. (Not auto-restarting: every agent on this host depends on this daemon.)`
+        : `:${port} is already served by a bot-relay daemon${labels} — leaving the existing supervisor in place (no double-load).`,
       existingLabels: loadedRelayLabels,
+      versionDrift: drift,
     };
   }
   if (healthClass === "foreign") {
     return {
       action: "skip-foreign-port",
       reason: `:${port} is held by a non-relay process — not installing a daemon that would fight for the port. Free the port or set a different http_port, then re-run.`,
+      existingLabels: loadedRelayLabels,
+    };
+  }
+  if (healthClass === "unreadable") {
+    // FAIL CLOSED (audit HIGH #3): a detector that cannot read its reference
+    // point must SAY SO, never report clean. Something answered on :port but we
+    // could not confirm what — installing a second daemon would be a collision,
+    // strictly worse than the silent staleness this whole path fixes.
+    return {
+      action: "skip-unreadable",
+      reason: `:${port} answered a health probe but the response was UNREADABLE (empty body, non-JSON, or non-2xx) — something is on the port and its identity/version cannot be confirmed. REFUSING to install or restart a daemon: a competing daemon on an occupied port is worse than doing nothing. Find what holds :${port} (a stale or broken relay?), stop it, then re-run.`,
       existingLabels: loadedRelayLabels,
     };
   }
@@ -178,9 +238,60 @@ export function decideDaemonAction(input: {
   return { action: "install", reason: "no relay on the port and no bot-relay LaunchAgent loaded — installing the canonical daemon.", existingLabels: [] };
 }
 
+export interface RestartTarget {
+  /** The launchd label to kickstart, or null when there's nothing safe to restart. */
+  label: string | null;
+  /** True when the canonical plist exists but the label isn't loaded yet — the
+   *  caller must `bootstrap` it before `kickstart`. */
+  needsBootstrap: boolean;
+  /** Operator-facing explanation on the null / ambiguous paths (empty on success). */
+  reason: string;
+}
+
+/**
+ * Pure selection of which daemon `relay restart` should bounce, from the loaded
+ * relay labels + whether the canonical plist exists on disk. Prefers the
+ * canonical label; falls back to a SOLE hand-authored relay label; REFUSES to
+ * guess among several (never restart an arbitrary one). Kept pure so the harm
+ * cases (nothing to restart / ambiguous) are tested without launchctl.
+ */
+export function chooseRestartTarget(input: {
+  loadedRelayLabels: string[];
+  canonicalPlistExists: boolean;
+}): RestartTarget {
+  const { loadedRelayLabels, canonicalPlistExists } = input;
+  if (loadedRelayLabels.includes(CANONICAL_LABEL)) {
+    return { label: CANONICAL_LABEL, needsBootstrap: false, reason: "" };
+  }
+  if (canonicalPlistExists) {
+    return { label: CANONICAL_LABEL, needsBootstrap: true, reason: "" };
+  }
+  if (loadedRelayLabels.length === 1) {
+    return { label: loadedRelayLabels[0], needsBootstrap: false, reason: "" };
+  }
+  if (loadedRelayLabels.length > 1) {
+    return {
+      label: null,
+      needsBootstrap: false,
+      reason:
+        `multiple bot-relay LaunchAgents are loaded (${loadedRelayLabels.join(", ")}) and none is the ` +
+        `canonical ${CANONICAL_LABEL} — bounce the intended one by hand: launchctl kickstart -k gui/<uid>/<label>`,
+    };
+  }
+  return {
+    label: null,
+    needsBootstrap: false,
+    reason:
+      `no bot-relay launchd daemon found (canonical plist missing and nothing relay-shaped loaded) — ` +
+      `run \`relay init\` to install it first`,
+  };
+}
+
 export interface InstallDeps {
-  /** GET the health endpoint. Returns {ok, body}. Rejection → treated as none. */
-  fetchHealth: (port: number) => Promise<{ ok: boolean; body: unknown }>;
+  /** Probe the health endpoint, discriminating unreachable vs reachable-but-
+   *  unreadable (see HealthProbe). Must NOT collapse the two — that is the
+   *  fail-open bug. Should not throw; installDaemon fails closed if it does. */
+  fetchHealth: (port: number) => Promise<HealthProbe>;
   /** Run `launchctl list` and return stdout (or "" on failure). */
   launchctlList: () => string;
   /** Run `launchctl bootstrap gui/<uid> <plistPath>` (or kickstart). */
@@ -207,15 +318,27 @@ export async function installDaemon(
   home: string = os.homedir(),
   label: string = CANONICAL_LABEL,
 ): Promise<InstallResult> {
-  let healthClass: HealthClass = "none";
+  let healthClass: HealthClass = "unreadable"; // fail-closed default
+  let runningVersion: string | null = null;
   try {
-    const { ok, body } = await deps.fetchHealth(opts.port);
-    healthClass = classifyHealthProbe(ok, body);
+    const probe = await deps.fetchHealth(opts.port);
+    healthClass = classifyHealthProbe(probe);
+    const b = probe.parseable ? (probe.body as { version?: unknown } | null) : null;
+    runningVersion = b && typeof b.version === "string" ? b.version : null;
   } catch {
-    healthClass = "none";
+    // fetchHealth discriminates internally and should not throw. If the adapter
+    // itself fails unexpectedly we do NOT know the port is free — FAIL CLOSED as
+    // unreadable, never "none" (which would install a possibly-competing daemon).
+    healthClass = "unreadable";
   }
   const loadedRelayLabels = parseLoadedRelayLabels(deps.launchctlList());
-  const decision = decideDaemonAction({ healthClass, loadedRelayLabels, port: opts.port });
+  const decision = decideDaemonAction({
+    healthClass,
+    loadedRelayLabels,
+    port: opts.port,
+    installedVersion: VERSION,
+    runningVersion,
+  });
 
   if (decision.action !== "install") {
     deps.log(`daemon: ${decision.reason}`);

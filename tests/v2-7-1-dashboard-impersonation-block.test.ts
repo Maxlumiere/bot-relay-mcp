@@ -23,11 +23,14 @@
  *
  * Test path: real `node dist/index.js` HTTP daemon subprocess. Hits
  * the dashboard /api/send-message endpoint directly (no MCP wrapping).
- * The dashboard endpoint normally requires a dashboard secret +
- * CSRF token; we bypass those by NOT configuring a dashboard secret
- * (the dashboardAuthCheck middleware no-ops when no secret is set,
- * matching the local-only default). The CSRF check only applies when
- * the dashboard secret is set.
+ * ADR-0006: the dashboard endpoint is operator-power — it requires a VERIFIED
+ * dashboard secret + CSRF double-submit regardless of network position (no
+ * loopback bypass). So the daemon is spawned WITH a dashboard secret and every
+ * dashboard call drives the real operator handshake (operatorPost). The
+ * from_agent_token impersonation gate is layered UNDERNEATH operator auth: an
+ * authenticated operator with a missing/wrong from_agent_token is STILL 403
+ * AUTH_FAILED; with the correct from_agent_token it is 200. Those assertions
+ * are unchanged.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
@@ -36,6 +39,7 @@ import os from "os";
 import cp from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,6 +75,9 @@ async function startDaemon(): Promise<DaemonHandle> {
       RELAY_CONFIG_PATH: path.join(root, "config.json"),
       RELAY_AGENT_TOKEN: "",
       RELAY_AGENT_NAME: "",
+      // ADR-0006: operator-power endpoints require a verified dashboard secret.
+      // /mcp stays open (no RELAY_HTTP_SECRET) so mcpRpc register still works.
+      RELAY_DASHBOARD_SECRET: OPERATOR_SECRET,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -112,13 +119,10 @@ async function mcpRpc(port: number, tool: string, args: Record<string, unknown>)
 }
 
 async function dashSendMessage(port: number, body: Record<string, unknown>): Promise<{ status: number; json: Record<string, unknown> }> {
-  const res = await fetch(`http://127.0.0.1:${port}/api/send-message`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const json = await res.json() as Record<string, unknown>;
-  return { status: res.status, json };
+  // ADR-0006: authenticate as operator (dashboard secret + CSRF double-submit)
+  // via the shipped handshake. The impersonation gate is layered underneath.
+  const r = await operatorPost(port, "/api/send-message", body);
+  return { status: r.status, json: (r.json ?? {}) as Record<string, unknown> };
 }
 
 describe("v2.7.1 [HIGH] — dashboard send_message impersonation gate", () => {
@@ -218,20 +222,21 @@ describe("v2.7.1 [HIGH] — dashboard send_message impersonation gate", () => {
       capabilities: [],
     });
 
-    // Missing token via header → 403.
-    const noToken = await fetch(`http://127.0.0.1:${daemon!.port}/api/send-message`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from: "imp-victim-hdr", to: "imp-target-hdr", content: "hdr no token", priority: "normal" }),
-    });
+    // Missing token via header → 403 (operator-authed, but impersonation gate fires).
+    const noToken = await operatorPost(
+      daemon!.port,
+      "/api/send-message",
+      { from: "imp-victim-hdr", to: "imp-target-hdr", content: "hdr no token", priority: "normal" },
+    );
     expect(noToken.status).toBe(403);
 
     // Correct token via header → 200.
-    const ok = await fetch(`http://127.0.0.1:${daemon!.port}/api/send-message`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-From-Agent-Token": tok },
-      body: JSON.stringify({ from: "imp-victim-hdr", to: "imp-target-hdr", content: "hdr correct token", priority: "normal" }),
-    });
+    const ok = await operatorPost(
+      daemon!.port,
+      "/api/send-message",
+      { from: "imp-victim-hdr", to: "imp-target-hdr", content: "hdr correct token", priority: "normal" },
+      { extraHeaders: { "X-From-Agent-Token": tok } },
+    );
     expect(ok.status).toBe(200);
   });
 });

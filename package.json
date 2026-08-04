@@ -1,7 +1,7 @@
 {
   "name": "bot-relay-mcp",
   "mcpName": "io.github.Maxlumiere/bot-relay-mcp",
-  "version": "2.23.0",
+  "version": "2.24.0",
   "description": "MCP server for AI coding agent terminal-to-terminal communication. Local-first, SQLite-backed, webhook-integrated.",
   "type": "module",
   "main": "dist/index.js",
@@ -21,6 +21,7 @@
     "SECURITY.md"
   ],
   "scripts": {
+    "prebuild": "node scripts/prebuild-guard.mjs",
     "build": "tsc && chmod +x dist/index.js",
     "start": "node dist/index.js",
     "test": "vitest run",
@@ -76,6 +77,7 @@
   },
   "overrides": {
     "hono": "4.12.27",
-    "fast-uri": "3.1.4"
+    "fast-uri": "3.1.5",
+    "ip-address": "^10.4.0"
   }
 }

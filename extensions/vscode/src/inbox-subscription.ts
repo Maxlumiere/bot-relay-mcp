@@ -106,12 +106,18 @@ export class WakeGate {
   }
 
   /**
-   * DELIVERY ACK: the async injection this gate fired actually LANDED —
-   * adapter.wake resolved, so the keystroke was typed and submitted. Only now
-   * is an idle observation valid FLUSH evidence for it; before this, idle is a
-   * stale read from the in-flight window and must not flush the wake (codex
-   * #126 round 2). The caller MUST epoch-guard this so a stale ack from a
-   * superseded injection can't mark a newer one landed. No-op if nothing is
+   * DELIVERY ACK: the async injection this gate fired was DISPATCHED —
+   * adapter.wake resolved, meaning the wake sequence (type, settle, separate
+   * submit) was written to the terminal. NOT proof the TUI processed the
+   * submit: sendText resolving says nothing about what the agent did with the
+   * bytes (the 2026-07-24 wake bug hid here — a types-but-never-submits wake
+   * acked "landed" and read idle, so the gate flushed and every new message
+   * stacked another injection). Dispatch-ack is still the right gate input; the
+   * submit correctness itself is the adapter's contract (llm-adapter.ts). Only
+   * after this ack is an idle observation valid FLUSH evidence; before it, idle
+   * is a stale read from the in-flight window and must not flush the wake
+   * (codex #126 round 2). The caller MUST epoch-guard this so a stale ack from
+   * a superseded injection can't mark a newer one landed. No-op if nothing is
    * outstanding (a lost/flushed injection already cleared the flag).
    */
   markInjectionLanded(): void {
