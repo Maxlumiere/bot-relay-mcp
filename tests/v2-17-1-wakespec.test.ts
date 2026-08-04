@@ -42,11 +42,16 @@ describe("v2.17.1 — WakeSpec reconciled to the extension's proven behavior", (
     expect(codex.wake.nativeSelfWake).toBe(false);
   });
 
-  it("claude wake = types 'inbox' inline (sendText, no delay)", () => {
+  it("claude wake = types 'inbox', settles, then a SEPARATE submit (sendText, 150ms)", () => {
+    // Tether v0.7.0 wake fix (#129): the old inline-newline wake (submitDelayMs 0) relied on
+    // the appended newline submitting — Claude Code's TUI takes an in-chunk
+    // newline as literal input, so wakes sat unsubmitted until a human pressed
+    // Enter and stacked one injection per new message (2026-07-24).
     const claude = getAgentCliProfile("claude")!;
     expect(claude.wake.wakeText).toBe("inbox");
+    expect(claude.wake.submitKey).toBe("\r");
     expect(claude.wake.submitMethod).toBe("sendText");
-    expect(claude.wake.submitDelayMs).toBe(0);
+    expect(claude.wake.submitDelayMs).toBe(150);
     expect(claude.wake.nativeSelfWake).toBe(false);
   });
 

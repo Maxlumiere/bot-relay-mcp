@@ -179,6 +179,7 @@ describe("v2.2.1 B2 — duplicate-name register race", () => {
       capabilities: [],
       managed: false,
       force: true,
+      expected_session_id: first.agent.session_id, // ADR-0012 CAS
     } as any);
     const body = parseResult(r);
     expect(body.success).toBe(true);

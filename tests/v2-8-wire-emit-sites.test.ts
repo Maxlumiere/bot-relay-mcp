@@ -44,7 +44,7 @@ process.env.RELAY_DECAY_TICK_DISABLED = "1";
 
 const { startHttpServer } = await import("../src/transport/http.js");
 const { _resetDashboardWsForTests } = await import("../src/transport/websocket.js");
-const { closeDb } = await import("../src/db.js");
+const { closeDb, getAgentAuthData } = await import("../src/db.js");
 
 import { connectWs as baseConnectWs } from "./_helpers/ws.js";
 
@@ -203,6 +203,7 @@ describe("v2.8 — wire-emit-sites — register_agent", () => {
         role: "builder",
         capabilities: ["build"],
         force: true,
+        expected_session_id: getAgentAuthData("wire-2")?.session_id, // ADR-0012 CAS
       },
       token,
     );

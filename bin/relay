@@ -49,14 +49,17 @@
 const SUBCOMMANDS = {
   doctor: "../dist/cli/doctor.js",
   init: "../dist/cli/init.js",
+  restart: "../dist/cli/restart.js",
   test: "../dist/cli/test.js",
   "generate-hooks": "../dist/cli/generate-hooks.js",
   "cli-profiles": "../dist/cli/cli-profiles.js",
   send: "../dist/cli/send.js",
+  resolve: "../dist/cli/resolve.js",
   watch: "../dist/cli/watch.js",
   backup: "../dist/cli/backup.js",
   restore: "../dist/cli/restore.js",
   recover: "../dist/cli/recover.js",
+  "release-binding": "../dist/cli/release-binding.js",
   "mint-token": "../dist/cli/mint-token.js",
   "purge-history": "../dist/cli/purge-history.js",
   "purge-agents": "../dist/cli/purge-agents.js",
@@ -90,14 +93,17 @@ function printHelp(requested) {
       "Subcommands:\n" +
       "  doctor           Diagnostic sweep of the local install (or --remote URL).\n" +
       "  init             First-run setup (interactive; --yes for non-interactive).\n" +
+      "  restart          Restart the local launchd daemon so a new package version takes effect (macOS).\n" +
       "  test             Fresh-install self-check against a throwaway relay.\n" +
       "  generate-hooks   Emit agent hook config (Claude JSON default; --codex Codex TOML; --all both).\n" +
       "  cli-profiles     Print the agent-CLI profile registry (--json for machine-readable).\n" +
       "  send TO CONTENT  Send a relay message in one line (resolves the sender's token).\n" +
+      "  resolve ID...    Resolve (ack) your own inbox messages — the CLI path for MCP-mute sessions.\n" +
       "  watch AGENT      Sentinel: autowake — print a wake line when AGENT gets new mail.\n" +
       "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
       "  restore PATH     Restore from a tar.gz archive.\n" +
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +
+      "  release-binding NAME  Clear a STALE binding (refuses on a live anchor) so the next launch re-binds; preserves identity.\n" +
       "  mint-token NAME  Mint an agent token via filesystem (external-CLI setup).\n" +
       "  purge-history NAME  Delete every message + task where the agent is sender or recipient.\n" +
       "  purge-agents     Prune agent rows with last_seen > N days (dry-run; --apply commits).\n" +

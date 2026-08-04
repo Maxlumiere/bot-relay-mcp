@@ -415,6 +415,42 @@ export function isAgentProcessAlive(
   return current === expectedStartedAt;
 }
 
+export type AnchorVerdict = "alive" | "dead" | "unverifiable";
+
+/**
+ * ADR-0012 (Fork B) — ANCHOR-ONLY liveness verdict. The SHARED canonical rule for
+ * the dead-anchor diagnostic (hooks/check-relay.sh) AND the `relay release-binding`
+ * gate: exactly the brief's "stored agent PID/start anchor + host_id, probed
+ * same-host". The bash `relay_anchor_liveness` mirrors this 1:1 (pinned by the
+ * conformance test) so the diagnostic and the remedy can never disagree.
+ *
+ * DELIBERATELY NOT `computeLivenessVerdict`: that OR's in an argv scan
+ * (`agentProcessAdvertised`) which reads a resummon'd argv-advertised agent (e.g.
+ * a codex process whose argv carries RELAY_AGENT_NAME) "alive" DESPITE a dead
+ * anchor — masking the stale binding and deadlocking the remedy (the bash
+ * anchor-only probe would say dead, computeLivenessVerdict would say alive). That
+ * argv fallback is correct for the dashboard PRESENCE surface, wrong for a
+ * wakeability/eligibility decision. This function reuses the SAME narrow-dead
+ * primitive (`isAgentProcessAlive`) — no new rule — minus the argv fallback.
+ *
+ *   - cross-host / no own-host GUID → "unverifiable" (never guess across the
+ *     federation boundary);
+ *   - no probe-able anchor (agent_pid absent / non-positive) → "unverifiable";
+ *   - same-host + anchor → `isAgentProcessAlive` (pid gone or start-time MISMATCH
+ *     → dead; pid live + start matched/unreadable → alive).
+ */
+export function anchorLivenessVerdict(
+  row: { host_id?: string | null; agent_pid?: number | null; agent_pid_start?: string | null },
+  ownHostId: string | null = getOwnHostId(),
+  run: CommandRunner = defaultRunner,
+  kill: KillProbe = process.kill,
+): AnchorVerdict {
+  if (!ownHostId || !row.host_id || row.host_id !== ownHostId) return "unverifiable";
+  const pid = row.agent_pid;
+  if (!(typeof pid === "number" && pid > 0)) return "unverifiable";
+  return isAgentProcessAlive(pid, row.agent_pid_start ?? null, run, kill) ? "alive" : "dead";
+}
+
 // --- v2.19.0 liveness cascade fallback (Sentinel/liveness-derivation) ---
 // The verdict used to anchor ONLY on the agent's own pid, so an agent with no
 // registered agent_pid (or a stale one) read `unknown` → surfaced as the

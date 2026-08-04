@@ -281,7 +281,12 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
   });
 
   it("a mutator WITH the bump passes; a non-token UPDATE is not flagged", () => {
+    // #151 round 4: the guard now resolves a bump to a real top-level function
+    // declaration in the file under analysis, so this fixture must declare it.
+    // A free-floating name is refused by design — round 3 trusted unresolved
+    // names by spelling, which is how an unrelated import passed the guard.
     const good = `
+      export function bumpAuthGeneration(): void {}
       export function properRotate(name: string): void {
         getDb().prepare("UPDATE agents SET token_hash = ? WHERE name = ?").run("h", name);
         bumpAuthGeneration();

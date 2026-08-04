@@ -324,7 +324,13 @@ describe("v2.1.7 Item 6 — dashboard secret layers independently of HTTP secret
     expect(r.status).toBe(200);
   });
 
-  it("(6b) RELAY_HTTP_SECRET still works on /api/snapshot as fallback when dashboard secret is unset", async () => {
+  it("(6b) RELAY_HTTP_SECRET does NOT authenticate the dashboard (ADR-0006 — removed fallback)", async () => {
+    // http_secret set, NO dashboard secret. Presenting http_secret as the dashboard
+    // Bearer must NOT authenticate — the fallback was removed. Loopback /api/snapshot
+    // still 200s, but RESTRICTED (authenticated=false), and that is regardless of
+    // the Bearer, not because of it. (Pre-#142 this test's name claimed the
+    // opposite and passed only because loopback returns 200 either way — a green
+    // light wired to nothing.)
     await bootServer({ RELAY_HTTP_SECRET: "fallback-secret" });
     const r = await rawRequest({
       method: "GET",
@@ -332,6 +338,18 @@ describe("v2.1.7 Item 6 — dashboard secret layers independently of HTTP secret
       extraHeaders: { Authorization: "Bearer fallback-secret" },
     });
     expect(r.status).toBe(200);
+    const body = JSON.parse(r.body);
+    expect(body.authenticated).toBe(false); // http_secret did NOT authenticate
+    expect(body.content_visibility).toBe("restricted");
+
+    // With a REAL dashboard secret configured, the http_secret Bearer is REFUSED
+    // while the dashboard secret authenticates — proving what actually gates it.
+    await bootServer({ RELAY_HTTP_SECRET: "fallback-secret", RELAY_DASHBOARD_SECRET: "the-real-dashboard-secret-000000-ok" });
+    const wrong = await rawRequest({ method: "GET", path: "/api/snapshot", extraHeaders: { Authorization: "Bearer fallback-secret" } });
+    expect(wrong.status).toBe(401); // http_secret is not the dashboard secret
+    const right = await rawRequest({ method: "GET", path: "/api/snapshot", extraHeaders: { Authorization: "Bearer the-real-dashboard-secret-000000-ok" } });
+    expect(right.status).toBe(200);
+    expect(JSON.parse(right.body).authenticated).toBe(true);
   });
 
   it("(6c) /mcp still requires RELAY_HTTP_SECRET when set (dashboard bypass does NOT leak to /mcp)", async () => {
@@ -400,19 +418,53 @@ describe("v2.1.7 Item 2 — SameSite cookie + CSRF double-submit", () => {
     expect(csrfCookie).not.toMatch(/HttpOnly/);
   });
 
-  it("(2d) POST /api/* without CSRF cookie/header → 403 (infra active, no endpoint needed)", async () => {
+  it("(2d) CSRF is enforced for AMBIENT-cookie sessions and EXEMPT for explicit-credential (Bearer) requests (ADR-0006)", async () => {
     await bootServer({ RELAY_DASHBOARD_SECRET: "csrf-deny-test" });
-    // Attempt a state-changing request. No endpoint exists — but the CSRF
-    // middleware fires BEFORE route matching, so missing CSRF → 403 regardless
-    // of whether /api/fake has a handler.
-    const r = await rawRequest({
+    // Authenticate via GET to receive the relay_dashboard_auth cookie.
+    const auth = await rawRequest({
+      method: "GET",
+      path: "/api/snapshot",
+      extraHeaders: { Authorization: "Bearer csrf-deny-test" },
+    });
+    const cookies = ([] as string[]).concat(auth.headers["set-cookie"] ?? []);
+    const authCookie = cookies.find((c) => c.startsWith("relay_dashboard_auth="))!.split(";")[0];
+    // AMBIENT cookie session with NO CSRF header → 403. This is the path CSRF
+    // defends (a browser tricked into riding its auto-attached cookie), and the
+    // middleware fires before route matching so /api/fake need not exist.
+    const cookieOnly = await rawRequest({
+      method: "POST",
+      path: "/api/fake",
+      body: "{}",
+      extraHeaders: { Cookie: authCookie },
+    });
+    expect(cookieOnly.status).toBe(403);
+    expect(cookieOnly.body).toMatch(/CSRF/i);
+    // EXPLICIT Bearer (non-ambient) → CSRF-EXEMPT: passes the middleware to route
+    // matching → 404 for a fake endpoint, NOT 403. Safe because dashboardAuthCheck
+    // resolves Bearer before the cookie and a wrong Bearer 401s rather than riding
+    // the cookie, so an attacker cannot send a dummy header to skip CSRF and then
+    // ride the ambient cookie. CSRF is applied to what it actually defends.
+    const bearerOnly = await rawRequest({
       method: "POST",
       path: "/api/fake",
       body: "{}",
       extraHeaders: { Authorization: "Bearer csrf-deny-test" },
     });
-    expect(r.status).toBe(403);
-    expect(r.body).toMatch(/CSRF/i);
+    expect(bearerOnly.status).not.toBe(403);
+    // HARM (channel-mismatch regression): a NON-Bearer Authorization header
+    // (`Basic …`) is NOT an explicit auth channel — dashboardAuthCheck ignores it
+    // and falls through to the ambient cookie. So it must NOT exempt CSRF: with the
+    // cookie present and no CSRF header → still 403. (An earlier exemption keyed on
+    // "any Authorization header" and let this skip CSRF while authenticating from
+    // the cookie — the shared channel resolver closes that gap.)
+    const nonBearerPlusCookie = await rawRequest({
+      method: "POST",
+      path: "/api/fake",
+      body: "{}",
+      extraHeaders: { Authorization: "Basic Zm9vOmJhcg==", Cookie: authCookie },
+    });
+    expect(nonBearerPlusCookie.status).toBe(403);
+    expect(nonBearerPlusCookie.body).toMatch(/CSRF/i);
   });
 
   it("(2e) POST /api/* with matching CSRF cookie + header passes through middleware (to route 404)", async () => {

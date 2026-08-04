@@ -34,7 +34,7 @@ import {
   checkOrigin,
   parseHostAllowlist,
 } from "./boundary-checks.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, resolveDashboardSecret, getConfigPath } from "../config.js";
 import { log } from "../logger.js";
 import { requestContext } from "../request-context.js";
 import { ipInAnyCidr } from "../cidr.js";
@@ -360,6 +360,45 @@ export function assertBindSafety(host: string, httpSecret: string | null): void 
   );
 }
 
+/**
+ * ADR-0006 / ADR-0015 L4 — the SINGLE source of "which credential channel will
+ * this request authenticate through". `dashboardAuthCheck` consumes `.value` to
+ * verify the secret; `csrfCheck` consumes `.channel` to decide whether the
+ * request rides an AMBIENT credential (the cookie). ONE function makes the
+ * csrf-exemption ⇔ auth-channel equivalence STRUCTURAL rather than a comment kept
+ * true by hand — which it wasn't: an earlier pair of inline copies drifted (the
+ * exemption matched any `Authorization` header while the consumer accepted only
+ * `Bearer `, so `Authorization: Basic` skipped CSRF yet authenticated from the
+ * cookie). Precedence: Bearer header → ?auth query → relay_dashboard_auth cookie.
+ */
+type CredentialChannel = "bearer" | "query" | "cookie" | "none";
+function resolvePresentedCredential(req: Request): { value: string | null; channel: CredentialChannel } {
+  const headerAuth = req.headers.authorization;
+  if (typeof headerAuth === "string" && headerAuth.toLowerCase().startsWith("bearer ")) {
+    return { value: headerAuth.slice(7).trim(), channel: "bearer" };
+  }
+  const q = req.query.auth;
+  if (typeof q === "string" && q.length > 0) {
+    return { value: q, channel: "query" };
+  }
+  const cookieHeader = req.headers.cookie;
+  if (typeof cookieHeader === "string") {
+    const match = cookieHeader.match(/(?:^|;\s*)relay_dashboard_auth=([^;]+)/);
+    if (match) return { value: decodeURIComponent(match[1]), channel: "cookie" };
+  }
+  return { value: null, channel: "none" };
+}
+/**
+ * A channel is EXPLICIT (not ambient) when the client had to know the secret to
+ * set it — Bearer or ?auth. Those are never a CSRF vector: a wrong explicit
+ * credential 401s in dashboardAuthCheck rather than falling through to the
+ * cookie. Only the cookie is ambient (browser-auto-attached), which is exactly
+ * and only what CSRF defends. `none` has nothing to protect and 401s downstream.
+ */
+function isExplicitCredentialChannel(channel: CredentialChannel): boolean {
+  return channel === "bearer" || channel === "query";
+}
+
 export function startHttpServer(port: number, host: string): Server {
   // v2.1 Phase 4n: bind-safety check BEFORE any express setup so we fail
   // fast and never accidentally bind to a risky host.
@@ -470,6 +509,12 @@ export function startHttpServer(port: number, host: string): Server {
   app.use(express.json({ limit: process.env.RELAY_HTTP_BODY_LIMIT || "1mb" }));
 
   const config = loadConfig();
+  // P2a — capture the config PATH at boot, next to the config the daemon actually
+  // loaded. The recovery hint must name THIS file, not a live getConfigPath():
+  // after a `use-instance` switch the daemon keeps enforcing the booted config
+  // while getConfigPath() re-resolves the now-active instance, so a live call would
+  // point a locked-out operator at a file the daemon is not reading.
+  const bootConfigPath = getConfigPath();
 
   // Health check (auth-free)
   app.get("/health", (_req: Request, res: Response) => {
@@ -564,50 +609,61 @@ export function startHttpServer(port: number, host: string): Server {
   app.use(httpHostCheck);
   app.use(authMiddleware);
 
-  // v2.1 Phase 4d (A): dashboard auth gate. Priority:
-  //   1. RELAY_DASHBOARD_SECRET (dedicated)
-  //   2. RELAY_HTTP_SECRET (fallback — operators with an HTTP secret get
-  //      dashboard auth for free)
-  //   3. No secret + loopback host → dev-friendly allow
-  //   4. No secret + non-loopback host → 403 with hint
+  // ADR-0006 dashboard/operator secret resolution is the SHARED
+  // resolveDashboardSecret() from config.ts — ONE definition consumed by
+  // dashboardAuthCheck, csrfCheck, and operatorAuthCheck here AND by the
+  // dashboard WebSocket gate (websocket.ts), so the predicate cannot drift
+  // between surfaces (ADR-0015 L4). No http_secret fallback — that was a removed
+  // escalation path. All sites pass the captured `config`.
+
+  // v2.1 Phase 4d (A): dashboard auth gate (the READ surface). Priority:
+  //   1. RELAY_DASHBOARD_SECRET (env) or config.dashboard_secret (file)
+  //   2. No secret + loopback host → dev-friendly allow, but RESTRICTED:
+  //      res.locals.dashboardAuthenticated=false, so snapshotApi withholds
+  //      cross-agent decrypted content + process metadata. Reached only for
+  //      configs WITHOUT a dashboard_secret (legacy installs pre-`relay init`,
+  //      and tests). Secret-by-default (ADR-0006 a) means a fresh install always
+  //      has one, so a fresh loopback dashboard requires the printed secret.
+  //   3. No secret + non-loopback host → 403 with hint
+  // Operator-POWER endpoints layer operatorAuthCheck ON TOP of this and have NO
+  // loopback bypass (ADR-0006 b — location is not a principal).
   // Secret presentation channels: Authorization: Bearer <s>, ?auth=<s>, or
   // cookie `relay_dashboard_auth=<s>`. All constant-time compared.
   const dashboardAuthCheck = (req: Request, res: Response, next: NextFunction) => {
-    const dashboardSecret = process.env.RELAY_DASHBOARD_SECRET || config.http_secret || null;
+    const dashboardSecret = resolveDashboardSecret(config);
     if (!dashboardSecret) {
       // No secret configured. Loopback → allow; non-loopback → refuse.
       // Treat the socket peer as authoritative over Host header (Host is
       // attacker-controllable; socket IP is not).
       const peerIp = (req.socket.remoteAddress || "").toLowerCase();
       const peerIsLoopback = peerIp === "127.0.0.1" || peerIp === "::1" || peerIp === "::ffff:127.0.0.1" || peerIp === "localhost";
-      if (peerIsLoopback) return next();
+      if (peerIsLoopback) {
+        // Host-trust let this peer through — it presented NO credential.
+        // Downstream handlers (snapshotApi) must treat it as unauthenticated
+        // and withhold cross-agent decrypted content / process metadata.
+        res.locals.dashboardAuthenticated = false;
+        return next();
+      }
       res.status(403).json({
         error: "Dashboard requires a secret",
-        hint: "Set RELAY_DASHBOARD_SECRET=<strong-random-string> (or RELAY_HTTP_SECRET) to expose the dashboard on a non-loopback bind.",
+        hint: "Set RELAY_DASHBOARD_SECRET=<strong-random-string> (or run `relay init` to generate one) to expose the dashboard on a non-loopback bind.",
       });
       return;
     }
-    // A secret IS configured — require it.
-    const headerAuth = req.headers.authorization;
-    let presented: string | null = null;
-    if (headerAuth && headerAuth.toLowerCase().startsWith("bearer ")) {
-      presented = headerAuth.slice(7).trim();
-    }
-    if (!presented) {
-      const q = req.query.auth;
-      if (typeof q === "string" && q.length > 0) presented = q;
-    }
-    if (!presented) {
-      const cookieHeader = req.headers.cookie;
-      if (typeof cookieHeader === "string") {
-        const match = cookieHeader.match(/(?:^|;\s*)relay_dashboard_auth=([^;]+)/);
-        if (match) presented = decodeURIComponent(match[1]);
-      }
-    }
+    // A secret IS configured — require it. Resolve the presented credential via
+    // the SHARED channel resolver — the same function csrfCheck consumes, so
+    // "which channel authenticates" has ONE definition (ADR-0015 L4).
+    const { value: presented } = resolvePresentedCredential(req);
     if (!presented || !timingSafeStringEq(presented, dashboardSecret)) {
       res.status(401).json({
         error: "Dashboard secret required",
-        hint: "Present via `Authorization: Bearer <secret>`, `?auth=<secret>`, or cookie `relay_dashboard_auth=<secret>`.",
+        // P2b — this is the REACHABLE 401 when a secret IS configured (this branch
+        // only runs when one exists). Name WHERE it lives so an operator who missed
+        // the install-time print can recover it: there is no CLI to read the secret
+        // back, so the config file is the recovery path. Boot-captured path (P2a).
+        hint:
+          "Present via `Authorization: Bearer <secret>`, `?auth=<secret>`, or cookie `relay_dashboard_auth=<secret>`. " +
+          `The configured secret is stored under \`dashboard_secret\` in ${bootConfigPath} (printed once at \`relay init\`).`,
       });
       return;
     }
@@ -645,6 +701,9 @@ export function startHttpServer(port: number, host: string): Server {
     } else {
       res.setHeader("Set-Cookie", [String(existing), authCookie, csrfCookie]);
     }
+    // A real dashboard secret was verified — this caller IS authenticated and
+    // may receive decrypted content / process metadata in the snapshot.
+    res.locals.dashboardAuthenticated = true;
     next();
   };
 
@@ -666,13 +725,26 @@ export function startHttpServer(port: number, host: string): Server {
     if (!UNSAFE_METHODS.has(req.method)) return next();
     if (!req.path.startsWith("/api/")) return next();
     // v2.2.0: CSRF is meaningful only when a cookie-based dashboard session
-    // exists. In loopback dev mode (no RELAY_DASHBOARD_SECRET + no
-    // RELAY_HTTP_SECRET) dashboardAuthCheck skips auth entirely and never
-    // issues the relay_csrf cookie, so there is no session to protect —
-    // skip the check. The instant an operator sets either secret, CSRF
-    // re-activates on state-changing endpoints.
-    const dashboardSecret = process.env.RELAY_DASHBOARD_SECRET || loadConfig().http_secret || null;
+    // exists. In loopback dev mode (no dashboard secret configured)
+    // dashboardAuthCheck skips auth entirely and never issues the relay_csrf
+    // cookie, so there is no session to protect — skip the check. The instant a
+    // dashboard secret exists, CSRF re-activates on state-changing endpoints.
+    // Uses the SAME resolver as dashboardAuthCheck (not a fresh loadConfig()) so
+    // the two never disagree about whether a session can exist (ADR-0015 L4).
+    const dashboardSecret = resolveDashboardSecret(config);
     if (!dashboardSecret) return next();
+    // ADR-0006 — CSRF defends the AMBIENT-credential path ONLY (a browser tricked
+    // into riding its auto-attached cookie). Whether THIS request rides an ambient
+    // credential is answered by the SAME channel resolver dashboardAuthCheck uses
+    // to authenticate — so the exemption CANNOT drift from the auth channel
+    // (ADR-0015 L4). It used to: an earlier copy exempted any `Authorization`
+    // header while the consumer accepted only `Bearer `, so `Authorization: Basic`
+    // + cookie skipped CSRF yet authenticated from the cookie. Now both call one
+    // function: if the request authenticates through an EXPLICIT channel (Bearer /
+    // ?auth) it never rides the cookie (a wrong explicit credential 401s, no
+    // fallthrough), so CSRF is moot — exempt it (this is what lets the `relay send`
+    // CLI work without a browser handshake). Cookie / none → enforce.
+    if (isExplicitCredentialChannel(resolvePresentedCredential(req).channel)) return next();
     const cookieHeader = req.headers.cookie;
     let cookieToken: string | null = null;
     if (typeof cookieHeader === "string") {
@@ -696,6 +768,35 @@ export function startHttpServer(port: number, host: string): Server {
   // Wire globally — middleware internally gates on method + path.
   app.use(csrfCheck);
 
+  // ADR-0006 (b): operator-power endpoints (kill-agent, wake-agent,
+  // focus-terminal, send-message, set-status, operator-identity, keyring,
+  // dashboard-theme) are authed regardless of secret config OR network position
+  // — "location is not a principal." This gate REFUSES (401) unless
+  // dashboardAuthCheck VERIFIED a real dashboard secret on this request. There is
+  // NO loopback bypass here: unlike the read surface (which may serve a
+  // restricted view to a loopback peer), operator power requires proof of the
+  // operator principal. It consumes dashboardAuthCheck's RESULT
+  // (res.locals.dashboardAuthenticated) instead of re-resolving the secret, so
+  // the surface and the gate share ONE predicate (ADR-0015 L4). Fail-closed by
+  // enumerating the SUCCESS condition: authenticated === true → allow; every
+  // other state (loopback-no-secret → flag false; non-loopback → 403'd earlier;
+  // bad/absent secret → 401'd earlier) → refuse. Always chained AFTER
+  // dashboardAuthCheck so the flag is set before this reads it.
+  const operatorAuthCheck = (_req: Request, res: Response, next: NextFunction) => {
+    if (res.locals.dashboardAuthenticated === true) return next();
+    res.status(401).json({
+      error: "Operator authentication required",
+      hint:
+        "This endpoint performs an operator action (agent control / operator config) and is authed regardless of network position (ADR-0006). " +
+        // P2b — this branch is reached ONLY when NO dashboard secret is configured
+        // (a loopback caller dashboardAuthCheck let through unauthenticated), so do
+        // NOT claim an existing secret — there is none. The configured-but-not-
+        // presented case is handled by dashboardAuthCheck's 401, which names where
+        // the secret lives. Two states, two true messages.
+        "No operator/dashboard secret is configured, so operator endpoints are refused. Run `relay init` to generate a `dashboard_secret`, then restart the daemon to load it.",
+    });
+  };
+
   // v2.1.7 Item 1: httpHostCheck is now applied globally via app.use above,
   // so per-route wiring drops it. dashboardAuthCheck + originCheck stay.
   app.get("/", dashboardAuthCheck, originCheck, renderDashboard);
@@ -703,14 +804,14 @@ export function startHttpServer(port: number, host: string): Server {
   app.get("/api/snapshot", dashboardAuthCheck, originCheck, snapshotApi);
   // v2.1 Phase 4b.3: keyring info endpoint. Returns current + known key_ids
   // + per-column legacy-row counts. NEVER exposes raw keys.
-  app.get("/api/keyring", dashboardAuthCheck, originCheck, keyringApi);
+  app.get("/api/keyring", dashboardAuthCheck, operatorAuthCheck, originCheck, keyringApi);
 
   // v2.2.0 Phase 1: dashboard click-to-focus endpoint. Looks up the agent's
   // terminal_title_ref then dispatches to the platform focus driver
   // (osascript iTerm2 / wmctrl / PowerShell AppActivate). csrfCheck gates
   // the POST via the v2.1.7 double-submit infrastructure — the first
   // state-changing /api/* endpoint exercises the CSRF surface end-to-end.
-  app.post("/api/focus-terminal", dashboardAuthCheck, originCheck, async (req: Request, res: Response) => {
+  app.post("/api/focus-terminal", dashboardAuthCheck, operatorAuthCheck, originCheck, async (req: Request, res: Response) => {
     const parsed = FocusTerminalSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({
@@ -821,7 +922,7 @@ export function startHttpServer(port: number, host: string): Server {
   // The cookie beats RELAY_DASHBOARD_OPERATOR in the audit-log operator
   // marker so a shared deployment (one daemon, multiple humans) can still
   // attribute every mutation to the individual who ran it.
-  app.get("/api/operator-identity", dashboardAuthCheck, (req: Request, res: Response) => {
+  app.get("/api/operator-identity", dashboardAuthCheck, operatorAuthCheck, (req: Request, res: Response) => {
     const env = process.env.RELAY_DASHBOARD_OPERATOR || null;
     const cookieHeader = req.headers.cookie;
     let cookieVal: string | null = null;
@@ -839,7 +940,7 @@ export function startHttpServer(port: number, host: string): Server {
       cookie_value: cookieVal,
     });
   });
-  app.post("/api/operator-identity", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+  app.post("/api/operator-identity", dashboardAuthCheck, operatorAuthCheck, originCheck, (req: Request, res: Response) => {
     const raw = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>).identity : undefined;
     // Clearing is an explicit empty-string or null — resets to env/default.
     if (raw === "" || raw === null) {
@@ -910,7 +1011,7 @@ export function startHttpServer(port: number, host: string): Server {
   // POST /api/send-message — proxy to db.sendMessage. `from` must be an
   // existing registered agent; any already-existing dispatcher checks on
   // SENDER_NOT_REGISTERED surface through.
-  app.post("/api/send-message", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+  app.post("/api/send-message", dashboardAuthCheck, operatorAuthCheck, originCheck, (req: Request, res: Response) => {
     const parsed = ApiSendMessageSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
@@ -1083,7 +1184,7 @@ export function startHttpServer(port: number, host: string): Server {
   // `X-Relay-Confirm: yes` header as a double-check (dashboard JS sends
   // it after a confirm() dialog). Operator-level auth suffices; no
   // per-caller admin-cap check (the dashboard secret IS the admin).
-  app.post("/api/kill-agent", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+  app.post("/api/kill-agent", dashboardAuthCheck, operatorAuthCheck, originCheck, (req: Request, res: Response) => {
     const confirm = req.headers["x-relay-confirm"];
     if (confirm !== "yes") {
       logDashboardAudit(
@@ -1163,7 +1264,7 @@ export function startHttpServer(port: number, host: string): Server {
   // dashboard JS greys the button in that case; the endpoint also
   // returns a structured `markers_enabled: false` so a scripted caller
   // knows nothing happened). Audit-logged as dashboard.wake_agent.
-  app.post("/api/wake-agent", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+  app.post("/api/wake-agent", dashboardAuthCheck, operatorAuthCheck, originCheck, (req: Request, res: Response) => {
     const parsed = ApiWakeAgentSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
@@ -1242,7 +1343,7 @@ export function startHttpServer(port: number, host: string): Server {
 
   // POST /api/set-status — proxy to db.setAgentStatus. Operator chooses
   // the agent + new status. No token check; dashboard auth suffices.
-  app.post("/api/set-status", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+  app.post("/api/set-status", dashboardAuthCheck, operatorAuthCheck, originCheck, (req: Request, res: Response) => {
     const parsed = ApiSetStatusSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
@@ -1325,7 +1426,7 @@ export function startHttpServer(port: number, host: string): Server {
   // can optionally refetch; the current dashboard.ts reads server
   // prefs only on first-visit via /api/snapshot so this is forward-
   // looking.
-  app.post("/api/dashboard-theme", dashboardAuthCheck, originCheck, (req: Request, res: Response) => {
+  app.post("/api/dashboard-theme", dashboardAuthCheck, operatorAuthCheck, originCheck, (req: Request, res: Response) => {
     const parsed = ApiDashboardThemeSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
@@ -1736,6 +1837,32 @@ export function startHttpServer(port: number, host: string): Server {
       `  NOTE: stdio MCP clients (each Claude Code terminal with "type":"stdio" in ~/.claude.json spawns its own server process) are process-independent from this daemon. Restarting this daemon does NOT affect them; operator /mcp reconnect is only needed for "type":"http" MCP clients pointed at ${host}:${port}. See docs/transport-architecture.md.`
     );
   });
+
+  // v2.24 keepAliveTimeout — the server must never close an idle keep-alive
+  // socket before the client does, or a client that reuses the socket in the
+  // gap gets ECONNRESET on an otherwise-healthy connection. Node's default
+  // keepAliveTimeout is 5000ms, so on a bare app.listen() the SERVER closes
+  // first: measured on a throwaway daemon the socket FINs at ~6001ms idle and
+  // a raw reuse at 6003ms fails with ECONNRESET at ~6012ms. undici (the
+  // default agent our own clients use) evicts its pooled socket at ~4s, before
+  // the server's 5s, so it never sees this — which is why the impact is LOW:
+  // the exposed population is raw HTTP clients, proxies, and libraries without
+  // that client-side eviction.
+  //
+  // Fix (server-side only): hold idle keep-alive sockets past any plausible
+  // client window so the server is never the one to close first. 61s clears
+  // the common 60s proxy/library keep-alive; headersTimeout must sit above
+  // keepAliveTimeout (Node ordering requirement) so a slow-header request
+  // stays bounded above the new keep-alive window.
+  //
+  // Deliberately NOT paired with a client-side idempotent-retry-on-ECONNRESET:
+  // once the server stops closing first there is nothing legitimate left for
+  // such a retry to catch — only a silent regression of THIS tuning, which it
+  // would quietly convert from "keep-alive tuning broke" into "occasional
+  // invisible retry." If a reset ever returns it must stay loud (ADR-0015: no
+  // mechanism that masks the failure of the guard it sits behind).
+  server.keepAliveTimeout = 61000;
+  server.headersTimeout = 65000;
 
   // v2.2.0 Phase 2: attach the dashboard WebSocket server to the running
   // http.Server. Hijacks only /dashboard/ws upgrades; every other upgrade

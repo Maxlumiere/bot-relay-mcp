@@ -205,19 +205,26 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
 
-  // --- Resolve host/port + optional dashboard secret ---
+  // --- Resolve host/port + the OPERATOR (dashboard) secret ---
+  // /api/send-message is an operator-authed endpoint (ADR-0006), so present the
+  // dashboard/operator secret via the SHARED resolver — NOT http_secret. This was
+  // the fourth copy of the resolution logic; wiring it in fixes two bugs at once:
+  // it stops presenting an agent transport credential (which no longer
+  // authenticates operator endpoints — the removed escalation) and it reads the
+  // stored `dashboard_secret`, which the old `http_secret`-only path never did.
   let host = "127.0.0.1";
   let port = 3777;
-  let secret: string | null = process.env.RELAY_DASHBOARD_SECRET || process.env.RELAY_HTTP_SECRET || null;
+  let secret: string | null = null;
   try {
-    const { loadConfig } = await import("../config.js");
+    const { loadConfig, resolveDashboardSecret } = await import("../config.js");
     const cfg = loadConfig();
     host = cfg.http_host || host;
     port = cfg.http_port || port;
-    if (!secret) secret = cfg.http_secret || null;
+    secret = resolveDashboardSecret(cfg);
   } catch {
     host = process.env.RELAY_HTTP_HOST || host;
     port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
+    secret = process.env.RELAY_DASHBOARD_SECRET || null;
   }
 
   const url = `http://${host}:${port}/api/send-message`;
@@ -258,9 +265,30 @@ export async function run(argv: string[]): Promise<number> {
 
   if (args.json) {
     process.stdout.write((parsed ? JSON.stringify(parsed) : text.trim()) + "\n");
-  } else {
-    const id = parsed?.message_id ? ` (id ${parsed.message_id})` : "";
-    process.stdout.write(`✓ sent ${args.priority} message from "${from}" to "${args.to}"${id}\n`);
+    return 0;
   }
+
+  // Default path — STDOUT carries ONLY the real result, the message id, so
+  // `$(relay send TO MSG)` captures a clean, parseable value. A success response
+  // that carries NO usable message_id must NOT print an empty stdout and still
+  // exit 0: that is a SILENT CAPTURE of the empty string — the exact failure this
+  // id-only contract exists to prevent (the caller cannot tell "" from a real id,
+  // and an id-only stdout that can be empty at exit 0 is worthless). Require a
+  // non-empty string id; otherwise diagnose to STDERR and exit non-zero so the
+  // capture fails loudly instead of silently binding "".
+  const id = typeof parsed?.message_id === "string" ? parsed.message_id.trim() : "";
+  if (!id) {
+    process.stderr.write(
+      `relay send: daemon returned success but no usable message_id — refusing to emit an empty capture. ` +
+        `Response: ${text.slice(0, 300)}\n`
+    );
+    return 1;
+  }
+  // The human-friendly confirmation is DIAGNOSTIC → STDERR (visible interactively,
+  // never pollutes a capture); the bare id is the only thing on STDOUT.
+  process.stderr.write(
+    `✓ sent ${args.priority} message from "${from}" to "${args.to}" (id ${id})\n`
+  );
+  process.stdout.write(`${id}\n`);
   return 0;
 }

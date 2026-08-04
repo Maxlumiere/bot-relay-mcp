@@ -25,6 +25,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-2220-gcstamp-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -70,6 +71,10 @@ beforeAll(async () => {
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
+  // ADR-0006: the dashboard /api/send-message (path #5) is operator-power — it
+  // requires a VERIFIED dashboard secret + CSRF. Configure one so operatorPost
+  // authenticates. The MCP /mcp calls (no http_secret) are unaffected.
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   server = startHttpServer(0, "127.0.0.1");
   await new Promise((r) => setTimeout(r, 120));
   const addr = server.address();
@@ -80,6 +85,7 @@ afterAll(() => {
   try { server?.close(); } catch { /* ignore */ }
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+  delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
 describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller path", () => {
@@ -142,7 +148,7 @@ describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller 
     // successful authenticated path (enforceAuth #1) that re-registers the row.
     const reReg = await mcpCall("tools/call", {
       name: "register_agent",
-      arguments: { name: "reauth-a", role: "worker", capabilities: [], agent_token: token, force: true },
+      arguments: { name: "reauth-a", role: "worker", capabilities: [], agent_token: token, force: true, expected_session_id: getAgentAuthData("reauth-a")?.session_id },
     });
     expect(JSON.parse(reReg.result.content[0].text).success).toBe(true);
     // The re-auth MUST have stamped first_authed_at (this is the fix).
@@ -171,12 +177,12 @@ describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller 
     const token = await register("dash-from");
     await register("dash-to");
     expect(getAgentAuthData("dash-from")!.first_authed_at).toBeNull();
-    const res = await fetch(`${baseUrl}/api/send-message`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from: "dash-from", to: "dash-to", content: "hi", from_agent_token: token }),
-    });
-    expect(res.ok).toBe(true);
+    const res = await operatorPost(
+      Number(new URL(baseUrl).port),
+      "/api/send-message",
+      { from: "dash-from", to: "dash-to", content: "hi", from_agent_token: token },
+    );
+    expect(res.status).toBe(200);
     expect(getAgentAuthData("dash-from")!.first_authed_at).not.toBeNull();
   });
 });

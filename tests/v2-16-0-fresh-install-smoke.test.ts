@@ -97,7 +97,10 @@ describe("v2.16.0 — fresh-install smoke (adoption acceptance bar)", () => {
 
       const st = JSON.parse(fs.readFileSync(settings, "utf-8"));
       const ssCmd = st.hooks.SessionStart[0].hooks[0].command;
-      expect(ssCmd).toMatch(/\/hooks\/check-relay\.sh$/); // absolute hook path
+      // v2.23.0: init now ALWAYS single-quotes the hook command (codex #139 P1 —
+      // a raw path is a shell-injection surface). Strip the outer quotes, then the
+      // inner is the absolute hook path. (Mirrors v2-1-cli-tooling test 7.)
+      expect(ssCmd.replace(/^'|'$/g, "")).toMatch(/\/hooks\/check-relay\.sh$/);
       expect(st.hooks.SessionStart[0].hooks[0].timeout).toBe(10);
 
       // ---- 2. Re-run with UNRELATED canaries → structural no-op ----------
