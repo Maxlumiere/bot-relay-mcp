@@ -7,6 +7,7 @@ import {
   sendMessage,
   getMessages,
   getMessagesSummary,
+  getOutstanding,
   resolveMessages,
   broadcastMessage,
   postToCapability,
@@ -22,6 +23,7 @@ import type {
   SendMessageInput,
   GetMessagesInput,
   GetMessagesSummaryInput,
+  GetOutstandingInput,
   ResolveMessagesInput,
   BroadcastInput,
   PostToCapabilityInput,
@@ -66,7 +68,16 @@ export function handleSendMessage(input: SendMessageInput) {
   }
   const content = (hasContent ? input.content : input.message) as string;
   try {
-    const message = sendMessage(input.from, input.to, content, input.priority);
+    // ADR-0011: disposition defaults to 'log' (Zod). deadline is only meaningful
+    // for an 'obligation'; it's stored verbatim and consulted by get_outstanding.
+    const message = sendMessage(
+      input.from,
+      input.to,
+      content,
+      input.priority,
+      input.disposition,
+      input.deadline ?? null,
+    );
     fireWebhooks("message.sent", input.from, input.to, {
       content,
       message_id: message.id,
@@ -82,6 +93,7 @@ export function handleSendMessage(input: SendMessageInput) {
               from: message.from_agent,
               to: message.to_agent,
               priority: message.priority,
+              disposition: message.disposition,
               note: `Message sent to "${message.to_agent}"`,
             },
             null,
@@ -376,6 +388,58 @@ export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
             filter: input.status,
             since: input.since ?? null,
             since_bound: sinceIso,
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+/**
+ * ADR-0011 — the overdue bound (seconds) for ASKs and deadline-less OBLIGATIONs.
+ * TUNABLE via RELAY_OVERDUE_SECONDS (validated as a positive int at startup in
+ * config.ts integerEnvVars), defaulting CONSERVATIVE / err-long: 24h. The
+ * architect's rule is "err long, tune up" — a channel so noisy it's ignored is
+ * itself silence-as-failure — so the default is deliberately generous.
+ */
+const OVERDUE_BOUND_DEFAULT_SECONDS = 86_400;
+function overdueBoundSeconds(): number {
+  const raw = process.env.RELAY_OVERDUE_SECONDS;
+  const n = raw != null ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : OVERDUE_BOUND_DEFAULT_SECONDS;
+}
+
+/**
+ * ADR-0011 — get_outstanding: the SENDER's recap + the PULL source of truth for
+ * overdue drift. Returns the ask/obligation messages the caller SENT with their
+ * lifecycle state (unread / read-unresolved / resolved) and a REPORT-ONLY
+ * overdue flag. Pure read — it NEVER mutates a message (report-first, never
+ * auto-resolve, ADR-0005). A fresh orchestrator session reconstructs overdue
+ * state from this call alone; the optional read/resolved webhooks are
+ * push-on-top and never the source of truth.
+ */
+export function handleGetOutstanding(input: GetOutstandingInput) {
+  const bound = overdueBoundSeconds();
+  const outstanding = getOutstanding(input.agent_name, {
+    overdueBoundSeconds: bound,
+    includeResolved: input.include_resolved,
+  });
+  const overdue_count = outstanding.reduce((n, m) => n + (m.overdue ? 1 : 0), 0);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            agent: input.agent_name,
+            include_resolved: input.include_resolved,
+            overdue_bound_seconds: bound,
+            count: outstanding.length,
+            overdue_count,
+            outstanding,
           },
           null,
           2

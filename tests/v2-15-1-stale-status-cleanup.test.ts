@@ -116,7 +116,7 @@ describe("v2.15.1 — stale stored terminal-state cleanup migration", () => {
     setStoredStatus("pollution", "closed");
     reopenAtVersion18();
     expect(rawStatus("pollution").agent_status).toBe("idle"); // cleaned
-    expect(getSchemaVersion()).toBe(23); // version advanced to CURRENT_SCHEMA_VERSION (v22 Phase A server_version + v23 ADR-0005)
+    expect(getSchemaVersion()).toBe(24); // version advanced to CURRENT_SCHEMA_VERSION (v23 ADR-0005 + v24 ADR-0011 disposition)
 
     // Now an operator/dashboard sets a NEW sessionless offline AFTER the migration.
     registerAgent("post-mig", "builder", [], { host_id: OWN_HOST });

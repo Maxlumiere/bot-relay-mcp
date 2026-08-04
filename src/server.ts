@@ -24,6 +24,7 @@ import {
   SendMessageSchema,
   GetMessagesSchema,
   GetMessagesSummarySchema,
+  GetOutstandingSchema,
   ResolveMessagesSchema,
   BroadcastSchema,
   PostToCapabilitySchema,
@@ -73,7 +74,7 @@ import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
 import { ZodError } from "zod";
 import { authenticateAgent, verifyToken, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive } from "./auth.js";
 import { isReservedName } from "./reserved-names.js";
-import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleResolveMessages, handleBroadcast, handlePostToCapability } from "./tools/messaging.js";
+import { handleSendMessage, handleGetMessages, handleGetMessagesSummary, handleGetOutstanding, handleResolveMessages, handleBroadcast, handlePostToCapability } from "./tools/messaging.js";
 import { handlePostTask, handlePostTaskAuto, handleUpdateTask, handleGetTasks, handleGetTask, handleRegisterTaskSchema, handleTaskSchemaGet } from "./tools/tasks.js";
 import { handleRegisterWebhook, handleListWebhooks, handleDeleteWebhook } from "./tools/webhooks.js";
 import { processDueWebhookRetries } from "./webhooks.js";
@@ -163,6 +164,7 @@ export const TOOL_BUNDLES: Record<string, string> = {
   send_message: "core",
   get_messages: "core",
   get_messages_summary: "core",
+  get_outstanding: "core",
   // v2.12.0 — pending-vs-history. Own-mailbox primitive (no extra capability;
   // recipient-scoped by token→agent_name binding, like get_messages).
   resolve_messages: "core",
@@ -265,6 +267,7 @@ const TOOL_SCHEMAS: Record<string, unknown> = {
   send_message: SendMessageSchema,
   get_messages: GetMessagesSchema,
   get_messages_summary: GetMessagesSummarySchema,
+  get_outstanding: GetOutstandingSchema,
   resolve_messages: ResolveMessagesSchema,
   broadcast: BroadcastSchema,
   post_to_capability: PostToCapabilitySchema,
@@ -500,6 +503,16 @@ export function createServer(): Server {
           "Returns: `{ summaries: { id, from_agent, priority, status, created_at, content_preview, content_truncated }[], count, agent, filter, since, since_bound }`. `content_truncated=true` when the original content exceeded the 100-char preview cap.\n\n" +
           "Errors: `AUTH_FAILED`, `VALIDATION`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetMessagesSummarySchema),
+      },
+      {
+        name: "get_outstanding",
+        description:
+          "The SENDER's outstanding-ask recap + the pull source of truth for overdue drift (ADR-0011).\n\n" +
+          "When to use: an orchestrator (or any sender) reconstructing what it is owed — on a fresh session, or any time it wants the current picture of asks/obligations it SENT that haven't been resolved. This PULL is the source of truth; the optional `message.read`/`message.resolved` webhooks are push-on-top and may be missed.\n\n" +
+          "Behavior: returns the messages YOU sent with `disposition` in ('ask','obligation'), each with its sender-visible lifecycle `state` (unread / read-unresolved / resolved) and a REPORT-ONLY `overdue` flag computed at query time — it NEVER mutates a message (report-first, never auto-resolve). LOG messages are excluded (LOG never goes overdue). `overdue` = still-unresolved AND past its bound: an obligation past its `deadline`, else an ask/deadline-less-obligation past `created_at + RELAY_OVERDUE_SECONDS` (default 24h, tunable). `include_resolved=false` (default) returns only the outstanding set; true adds resolved rows for the full sender view. Auth: agent token; sender-scoped (you only see mail you sent).\n\n" +
+          "Returns: `{ success, agent, include_resolved, overdue_bound_seconds, count, overdue_count, outstanding: { id, to_agent, disposition, created_at, deadline, read_at, resolved_at, state, overdue, content_preview, content_truncated }[] }`.\n\n" +
+          "Errors: `AUTH_FAILED`, `VALIDATION`, `RATE_LIMITED`.",
+        inputSchema: zodToJsonSchema(GetOutstandingSchema),
       },
       {
         name: "resolve_messages",
@@ -881,6 +894,8 @@ export function createServer(): Server {
         return handleGetMessages(GetMessagesSchema.parse(args));
       case "get_messages_summary":
         return handleGetMessagesSummary(GetMessagesSummarySchema.parse(args));
+      case "get_outstanding":
+        return handleGetOutstanding(GetOutstandingSchema.parse(args));
       case "resolve_messages":
         return handleResolveMessages(ResolveMessagesSchema.parse(args));
       case "broadcast":
