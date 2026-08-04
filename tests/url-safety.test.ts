@@ -105,3 +105,25 @@ describe("URL safety — public destinations", () => {
     expect(r.resolvedIps!.length).toBeGreaterThan(0);
   });
 });
+
+describe("URL safety — alternate-spelling SSRF vectors (regression, codex 2026-08-04)", () => {
+  // Leading-zero / hex / decimal-integer / IPv4-mapped-IPv6 / NAT64 spellings that a naive
+  // string-match SSRF check would miss. url-safety.ts canonicalizes via WHATWG URL before
+  // classification (verified: 012.0.0.1 → 10.0.0.1, 0x7f.0.0.1 → 127.0.0.1, etc.), so each
+  // must still fail closed. Locks that behaviour so a future refactor cannot silently regress it.
+  const blocked: Array<[string, string]> = [
+    ["http://012.0.0.1/hook", "octal leading-zero → 10.0.0.1 (private)"],
+    ["http://127.1/hook", "short-form loopback"],
+    ["http://0x7f.0.0.1/hook", "hex loopback"],
+    ["http://2130706433/hook", "decimal-integer loopback"],
+    ["http://[::ffff:127.0.0.1]/hook", "IPv4-mapped IPv6 loopback"],
+    ["http://[::ffff:10.0.0.1]/hook", "IPv4-mapped IPv6 private"],
+    ["http://[64:ff9b::7f00:1]/hook", "NAT64 well-known prefix embedding 127.0.0.1"],
+  ];
+  for (const [url, why] of blocked) {
+    it(`rejects ${url} (${why})`, async () => {
+      const r = await validateWebhookUrl(url);
+      expect(r.ok, `${url} should fail closed: ${why}`).toBe(false);
+    });
+  }
+});

@@ -375,6 +375,20 @@ tests_drift_guard() {
 }
 step "tests/ drift guard (no current-version literals)" tests_drift_guard || exit 1
 
+# --- 5a-bis. README masthead version guard (2026-08-04) -----------------------
+# The README headline hard-coded "v2.22" and drifted silently while shipping 2.24.0,
+# and the Glama listing mirrors the README — so the staleness was public-facing.
+# Per-release facts live in the CHANGELOG; the masthead must not pin a version. This
+# fails the gate if a bold **vX.Y** version marker reappears in the first 15 lines.
+readme_masthead_version_guard() {
+  if head -15 "$PROJECT_ROOT/README.md" | grep -nE '\*\*v[0-9]+\.[0-9]+'; then
+    echo "  ^ README masthead re-introduced a hard-coded **vX.Y** version — de-version it (point to CHANGELOG)." >&2
+    return 1
+  fi
+  return 0
+}
+step "readme masthead version guard (no hard-coded **vX.Y** headline)" readme_masthead_version_guard || exit 1
+
 # --- 5b. Sanctioned-helper guard (v2.1 Phase 7q) -----------------------------
 # Reject raw `UPDATE agents` / `DELETE FROM agents` / `UPDATE agent_capabilities`
 # / `DELETE FROM agent_capabilities` tokens in src/*.ts OUTSIDE src/db.ts, which
