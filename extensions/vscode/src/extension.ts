@@ -57,6 +57,7 @@ import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { ConnectionLifecycle } from "./connection-lifecycle.js";
 import { HealthPoll } from "./health-poll.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
+import { decideNoDeliveryWarn, NO_WAKE_WARN_COOLDOWN_MS } from "./no-delivery-warn.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
 import {
   adapterFor,
@@ -823,8 +824,17 @@ async function injectInboxKeystroke(agentName: string): Promise<void> {
  * `setStatusBarMessage` (auto-clears) so it never clobbers the persistent
  * Tether status-bar item (normal / reconnecting / error states).
  */
+const noWakeWarnedAt = new Map<string, number>();
 function hintNoWake(message: string): void {
-  vscode.window.setStatusBarMessage(`$(mail) Tether: ${message}`, 8000);
+  // Lightweight breadcrumb (kept; now warning-flavoured).
+  vscode.window.setStatusBarMessage(`$(warning) Tether: ${message}`, 8000);
+  // #3: the 8s status-bar blip alone "never reaches a human" for a condition
+  // that persists for minutes. Raise a REAL warning that stays in the
+  // notifications list until dismissed — throttled per distinct condition so the
+  // per-poll-tick re-consideration cannot spam (see no-delivery-warn.ts).
+  if (decideNoDeliveryWarn(message, Date.now(), NO_WAKE_WARN_COOLDOWN_MS, noWakeWarnedAt)) {
+    void vscode.window.showWarningMessage(`Tether — undelivered mail: ${message}`);
+  }
 }
 
 function showToast(snapshot: InboxSnapshot, level: TetherConfig["notificationLevel"]): void {

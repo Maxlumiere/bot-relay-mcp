@@ -4,6 +4,7 @@
 // See LICENSE for full terms.
 
 import type { Request, Response } from "express";
+import { createHash } from "node:crypto";
 import { getAgents, listWebhooks, getDb, getDashboardPrefs, getInboxSummary } from "./db.js";
 import { getKeyringInfo, decryptContent } from "./encryption.js";
 import type { MessageRecord, TaskRecord } from "./types.js";
@@ -194,10 +195,28 @@ export function keyringApi(_req: Request, res: Response): void {
 }
 
 /**
+ * If-None-Match matcher for the snapshot's strong ETag. RFC 7232 conditional-GET
+ * (weak) comparison: `*` matches anything; otherwise the client's tag matches
+ * ours after stripping an optional `W/` prefix. Accepts a comma-separated list.
+ * Our ETag is strong; a well-behaved client echoes it verbatim.
+ */
+function ifNoneMatchSatisfies(header: string | string[] | undefined, etag: string): boolean {
+  if (!header) return false;
+  const value = Array.isArray(header) ? header.join(",") : header;
+  if (value.trim() === "*") return true;
+  return value.split(",").some((raw) => raw.trim().replace(/^W\//, "") === etag);
+}
+
+/**
  * JSON API for the dashboard — returns a snapshot of relay state.
  * GET /api/snapshot
+ *
+ * The body carries absolute timestamps only and NO server-now, so it is stable
+ * between substantive changes; a strong ETag over it + server-now in the `Date`
+ * header give a working If-None-Match / 304 contract (server-now rides the 304,
+ * which has no body). See the body-construction comment below.
  */
-export function snapshotApi(_req: Request, res: Response): void {
+export function snapshotApi(req: Request, res: Response): void {
   try {
     // ADR-0006 — "location is not a principal." Operator-power fields
     // (decrypted content previews + process-identifying agent metadata) are
@@ -285,8 +304,17 @@ export function snapshotApi(_req: Request, res: Response): void {
       dashboardPrefs = { ...dashboardPrefs, custom_json: null };
     }
 
-    res.json({
-      timestamp: new Date().toISOString(),
+    // The snapshot body carries ABSOLUTE timestamps only (agent last_seen,
+    // message/task created_at + updated_at, last_message_at — all DB values) —
+    // NO computed ages, and NO server-now in the body. Server-now lives in the
+    // HTTP `Date` header (below) so the body is STABLE between substantive
+    // changes and an ETag over it actually matches poll-to-poll. (lumen's
+    // correction of the original design: a server-now `timestamp` field IN the
+    // body changes on every poll, defeating the ETag entirely — the 304 path
+    // dies on arrival. A 304 carries `Date` but no body, so the client keeps an
+    // authoritative clock on a cache HIT — the exact moment a naive design would
+    // render a stale age as current.)
+    const bodyObj = {
       // ADR-0006 visibility signal — never silent: an unauthenticated caller
       // is told the operator-power fields were withheld, not left guessing.
       authenticated: authed,
@@ -297,7 +325,49 @@ export function snapshotApi(_req: Request, res: Response): void {
       active_tasks: tasksWithPreview,
       recent_completions: completionsWithPreview,
       dashboard_prefs: dashboardPrefs,
-    });
+    };
+    const payload = JSON.stringify(bodyObj);
+    // Strong ETag over a STABLE PROJECTION of the body — base64url of a SHA-256,
+    // computed explicitly (not via Express's `etag` app setting) so the 304
+    // contract is deterministic and directly testable.
+    //
+    // The ETag must cover SUBSTANTIVE state only. Per-agent `last_alive` is a
+    // genuine liveness observation on a ~5-second probe cycle
+    // (`positiveConfirmationISO`, src/db.ts — it refreshes on each positive probe
+    // and nulls out after `LIVENESS_PROBE_CACHE_MS`), so it legitimately changes
+    // ~every 5s on its own cadence. That is NOT substantive change for caching:
+    // if it fed the ETag the body would rehash every few seconds and the 304 path
+    // would stay dead (measured: with only `timestamp` excluded, 13 distinct
+    // bodies across 25 polls / 60s; excluding `last_alive` too → 1). So
+    // `last_alive` is excluded from the ETag INPUT — but it STAYS in the sent body
+    // (`payload` above), because it is real data lumen's board consumes. This is
+    // an ETag-input exclusion, NOT a field removal: do NOT "fix" it by dropping
+    // `last_alive` from the body — that would repeat the `timestamp` treatment on
+    // a field that is meant to be served.
+    const etagInput = {
+      ...bodyObj,
+      agents: bodyObj.agents.map((a) => {
+        const rest = { ...(a as Record<string, unknown>) };
+        delete rest.last_alive;
+        return rest;
+      }),
+    };
+    const etag = `"${createHash("sha256").update(JSON.stringify(etagInput)).digest("base64url")}"`;
+    // Server-now in the `Date` header — present on BOTH the 200 and the 304, so
+    // a cache HIT still delivers an authoritative clock (the whole point of the
+    // header-not-body split). Set explicitly so a 304 is never clock-less.
+    res.setHeader("Date", new Date().toUTCString());
+    res.setHeader("ETag", etag);
+    // Force revalidation: the client sends If-None-Match so the server takes the
+    // 304-vs-200 decision, rather than a cache serving a blind stale body.
+    res.setHeader("Cache-Control", "no-cache");
+    if (ifNoneMatchSatisfies(req.headers["if-none-match"], etag)) {
+      // 304: no body. Date + ETag already set above.
+      res.status(304).end();
+      return;
+    }
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.status(200).send(payload);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: msg });
@@ -525,6 +595,31 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
 
   // v2.2.1 P1: apply the selected theme to <html> via data-theme (for
   // named themes) or inline --* custom properties (for pasted custom).
+  // Defence-in-depth (READ side). The server WRITE path (isSafeCssColorValue in
+  // src/css-color.ts, via the theme schema) is the PRIMARY control; this guard
+  // catches a value written BEFORE that validation existed, or via direct DB
+  // access, so it never reaches setProperty un-checked — a token feeds the CSS
+  // background: shorthand, which accepts url() and would beacon.
+  //
+  // DELIBERATE DIVERGENCE — do NOT unify this with the write-side validator
+  // (ADR-0015 L4: two predicates are fine when the divergence is named). They
+  // answer DIFFERENT questions. WRITE asks "is this a known-GOOD form?" -> strict,
+  // closed named-colour set. READ asks "could this stored value BEACON?" ->
+  // looser: a bare alpha word passes, because with no parens it cannot url()-
+  // beacon and an invalid CSS colour is simply ignored by the browser. The read
+  // side MUST stay this permissive so a legitimate LEGACY theme (a named/system
+  // colour stored before the write guard existed) still applies. Tightening read
+  // to the strict set breaks those; loosening write to this weakens the primary
+  // control. Keep them separate.
+  function isSafeThemeColor(v) {
+    if (typeof v !== 'string') return false;
+    var s = v.trim();
+    if (!s || s.length > 64) return false;
+    if (/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(s)) return true;
+    if (/^(?:rgb|rgba|hsl|hsla)\(\s*[0-9.,%/\s]+\)$/i.test(s)) return true;
+    if (/^[a-z]+$/i.test(s)) return true;
+    return false;
+  }
   function applyTheme(theme, customJson) {
     const root = document.documentElement;
     if (theme === 'custom' && customJson) {
@@ -535,7 +630,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
       try {
         const obj = typeof customJson === 'string' ? JSON.parse(customJson) : customJson;
         for (const t of TOKENS) {
-          if (obj && typeof obj[t] === 'string') root.style.setProperty('--' + t, obj[t]);
+          if (obj && typeof obj[t] === 'string' && isSafeThemeColor(obj[t])) root.style.setProperty('--' + t, obj[t]);
         }
       } catch (_e) { /* silently fall back to catppuccin */ }
     } else {
@@ -570,6 +665,10 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
 
   // ---------- state ----------
   let snapshot = null;
+  // Authoritative clock comes from the response Date header (server-now), not
+  // from the body — the body no longer carries a timestamp (it must stay stable
+  // for the ETag). Captured on every fetch; used for the "updated" display.
+  let snapshotDate = null;
   let focusedAgent = null;
 
   // ---------- rendering ----------
@@ -797,14 +896,19 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
     renderMessages();
     renderMeta();
     renderFocused();
-    document.getElementById('updated').textContent = 'updated ' + fmtTime(snapshot && snapshot.timestamp);
+    document.getElementById('updated').textContent = 'updated ' + fmtTime(snapshotDate);
   }
 
   // ---------- data fetch ----------
   async function fetchSnapshot() {
     try {
-      const res = await fetch('/api/snapshot', { credentials: 'same-origin' });
+      // cache:'no-store' — the dashboard always takes a fresh 200 (never a
+      // browser-served 304), so res.json() always has a body and the Date header
+      // is server-now. The If-None-Match / 304 cache path is for external
+      // monitors (lumen), which manage the ETag themselves.
+      const res = await fetch('/api/snapshot', { credentials: 'same-origin', cache: 'no-store' });
       if (!res.ok) throw new Error('snapshot ' + res.status);
+      snapshotDate = res.headers.get('date');
       snapshot = await res.json();
       // v2.2.1 P1: if the operator hasn't picked a theme yet this session
       // (localStorage has no operator-set flag), adopt the server default.

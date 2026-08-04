@@ -36,10 +36,12 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { withDeadline } from "../http-deadline.js";
 import { execFileSync } from "child_process";
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
-import { createInstance, generateInstanceId } from "../instance.js";
+import { createInstance, generateInstanceId, resolveActiveInstanceId } from "../instance.js";
+import { getConfigPath } from "../config.js";
 import {
   readJsonSafe,
   atomicWriteJson,
@@ -298,33 +300,42 @@ export function installHook(hookScript: string, settingsPath: string = claudeSet
  */
 export async function probeHealth(port: number): Promise<HealthProbe> {
   const timeoutMs = Math.max(1, parseInt(process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS || "3000", 10));
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // NOT A BUG FIX — behaviour here was already correct, and deliberately so: the
+  // timer stayed live across the body read (see the note below), which MEASURES
+  // as bounded on Node v24.13.0. This is converted to the owned-deadline helper
+  // to remove a dependency on undici honouring abort mid-body, which was not
+  // verified on Node 20 — the version `engines` allows and CI exercises.
   try {
-    let res: Response;
-    try {
-      res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal: controller.signal });
-    } catch (err) {
-      const code =
-        (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
-        (err as { code?: string } | null)?.code;
-      if (code === "ECONNREFUSED") {
-        return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
+    return await withDeadline(timeoutMs, `health probe on 127.0.0.1:${port}`, async (signal) => {
+      let res: Response;
+      try {
+        res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal });
+      } catch (err) {
+        const code =
+          (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
+          (err as { code?: string } | null)?.code;
+        if (code === "ECONNREFUSED") {
+          return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
+        }
+        return { reachable: true, ok: false, parseable: false, body: null }; // reset/timeout/abort/DNS/unknown → fail closed
       }
-      return { reachable: true, ok: false, parseable: false, body: null }; // reset/timeout/abort/DNS/unknown → fail closed
-    }
-    // The body read is STILL under the same timer — a server that sends headers
-    // then stalls the body aborts res.json() here instead of hanging forever.
-    let body: unknown = null;
-    let parseable = true;
-    try {
-      body = await res.json();
-    } catch {
-      parseable = false; // malformed OR aborted-mid-body → unreadable → refuse
-    }
-    return { reachable: true, ok: res.ok, parseable, body };
-  } finally {
-    clearTimeout(timer);
+      // The body read is inside the same deadline — a server that sends headers
+      // then stalls is refused here instead of hanging forever.
+      let body: unknown = null;
+      let parseable = true;
+      try {
+        body = await res.json();
+      } catch {
+        parseable = false; // malformed OR aborted-mid-body → unreadable → refuse
+      }
+      return { reachable: true, ok: res.ok, parseable, body };
+    });
+  } catch {
+    // Deadline elapsed. FAIL CLOSED, identical to the previous abort path: a
+    // timeout must never report the port free, because only ECONNREFUSED proves
+    // that. Returning here (rather than letting the rejection escape) preserves
+    // probeHealth's contract — it answers, it does not throw.
+    return { reachable: true, ok: false, parseable: false, body: null };
   }
 }
 
@@ -399,14 +410,35 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
   }
 
   // Resolve the active instance_id + config path.
+  //
+  // P1 (2026-07): init MUST write the config to the SAME path the daemon
+  // RESOLVES, or a secret it writes is invisible to the running daemon while init
+  // still reports success (the dashboard_secret-not-read defect on an
+  // instance-scoped install). The daemon resolves via getConfigPath() →
+  // RELAY_CONFIG_PATH, then the ~/.bot-relay/active-instance symlink, then the
+  // flat legacy path. The pre-fix code defaulted to the FLAT path unless
+  // --instance-id / --multi-instance was passed, so a plain `relay init` on a
+  // machine with an active-instance symlink wrote a config the daemon never read.
+  // One predicate for both sides (ADR-0015 L4).
   let effectiveInstanceId: string | null = null;
-  if (args.instanceId) effectiveInstanceId = args.instanceId;
-  else if (args.multiInstance) effectiveInstanceId = generateInstanceId();
-  let configPath = defaultConfigPath();
+  let configPath: string;
   let perInstanceDir: string | null = null;
-  if (effectiveInstanceId) {
+  if (args.instanceId || args.multiInstance) {
+    // Explicit: CREATE / target a specific instance. This branch scaffolds the
+    // instance dir below (createInstance) and owns its config path.
+    effectiveInstanceId = args.instanceId ?? generateInstanceId();
     perInstanceDir = path.join(defaultBotRelayDir(), "instances", effectiveInstanceId);
     configPath = path.join(perInstanceDir, "config.json");
+  } else {
+    // No explicit flag: reconcile the ACTIVE install exactly as the daemon sees
+    // it. getConfigPath() honours the active-instance symlink, so init lands in
+    // the instance dir the daemon actually reads (or the flat path when there is
+    // no active instance). effectiveInstanceId is captured for messaging + the
+    // write-target check below; perInstanceDir stays null — the instance dir
+    // already exists (getConfigPath only resolves to one that does), so we do NOT
+    // re-scaffold it.
+    configPath = getConfigPath();
+    effectiveInstanceId = resolveActiveInstanceId();
   }
 
   const existingConfig = readJsonSafe(configPath);
@@ -434,7 +466,16 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
       transport = await promptWithDefault(rl, "Transport (stdio/http/both)", transport);
       const portStr = await promptWithDefault(rl, "HTTP port", String(port));
       port = parseInt(portStr, 10) || 3777;
-      const secAns = await rl.question(`HTTP secret (ENTER = none — 127.0.0.1 is local-trusted; set one only for a non-loopback bind): `);
+      // v2.24 P1: this is the TRANSPORT secret (agent messaging). A 127.0.0.1
+      // bind is loopback-safe for TRANSPORT without one (assertBindSafety) — but
+      // ADR-0006 retired "local is trusted" for OPERATOR actions: the dashboard /
+      // operator endpoints ALWAYS require the separate dashboard_secret (generated
+      // below), loopback or not. The prompt must not imply blanket local trust.
+      const secAns = await rl.question(
+        `HTTP transport secret (ENTER = none — a loopback bind needs none for agent transport; ` +
+          `operator/dashboard auth is a SEPARATE, always-required secret set up automatically. ` +
+          `Set this only for a non-loopback / team bind): `,
+      );
       if (secAns.trim()) secret = secAns.trim();
     } finally {
       rl.close();
@@ -473,6 +514,19 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     ensureSecureDir(perInstanceDir, 0o700);
     createInstance(effectiveInstanceId, "relay-init");
   }
+  // ADR-0006 (a) — secret-by-default. Operator-power endpoints are authed
+  // regardless of network position (ADR-0006 b), which requires an operator
+  // secret to ALWAYS exist. This is a dedicated DASHBOARD secret — a DIFFERENT
+  // principal from http_secret (the agent transport credential), so one secret
+  // never authorizes both. Only for an HTTP-serving install; a stdio-only daemon
+  // exposes no dashboard. Generated in-memory (crypto.randomBytes touches no
+  // disk) and written in the atomicWriteJson step below, which runs AFTER the
+  // preflight refusal — so the "nothing written on refusal" atomicity invariant
+  // holds. reconcileRelayConfig PRESERVES an existing dashboard_secret and only
+  // fills it when missing: re-runs never rotate it, and a legacy install gets one
+  // added on its next `relay init`.
+  const httpEnabled = transport === "http" || transport === "both";
+  const generatedDashboardSecret = crypto.randomBytes(32).toString("base64url");
   const defaults: Record<string, unknown> = {
     transport,
     http_port: port,
@@ -483,6 +537,9 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     // secret would 401 the SessionStart hook's register. Written only when the
     // operator explicitly passes --secret (non-loopback / team bind).
     ...(secret ? { http_secret: secret } : {}),
+    // ADR-0006 (a): operator/dashboard secret, generated by default for HTTP
+    // installs. reconcile preserves an existing one (never rotates on re-run).
+    ...(httpEnabled ? { dashboard_secret: generatedDashboardSecret } : {}),
     webhook_timeout_ms: 5000,
     rate_limit_messages_per_hour: 1000,
     rate_limit_tasks_per_hour: 200,
@@ -510,6 +567,94 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     `✓ config: ${configPath} ${existingConfig === null ? "(created)" : "(reconciled — secret preserved)"}\n`,
   );
   if (args.agent) process.stdout.write(`✓ default agent name: ${args.agent}\n`);
+
+  // ADR-0006 (a): announce a NEWLY-generated dashboard/operator secret. Printed
+  // only when this run actually created it (reconcile returned OUR generated
+  // value, i.e. none existed before) — never on a re-run that preserved one.
+  const writtenDashboardSecret =
+    typeof reconciled.root.dashboard_secret === "string" ? reconciled.root.dashboard_secret : null;
+  if (writtenDashboardSecret !== null && writtenDashboardSecret === generatedDashboardSecret) {
+    process.stdout.write(
+      `\n🔑 Dashboard / operator secret generated (ADR-0006):\n` +
+        `   ${generatedDashboardSecret}\n` +
+        `   Stored in ${configPath}. Operator actions (kill-agent / wake-agent /\n` +
+        `   set-status / focus-terminal / …) and the dashboard require it.\n` +
+        `   Present via \`Authorization: Bearer <secret>\`, \`?auth=<secret>\`, or the\n` +
+        `   \`relay_dashboard_auth\` cookie. Override with RELAY_DASHBOARD_SECRET.\n\n`,
+    );
+  }
+
+  const explicitInstance = !!(args.instanceId || args.multiInstance);
+
+  // ---- P1 env-only-instance guard: init resolved the FLAT config, but if
+  // instances/ exist with no active-instance symlink, a daemon launched with
+  // RELAY_INSTANCE_ID in its ENV is reading an instance config this shell cannot
+  // discover (getConfigPath has no env here). Rather than silently write a flat
+  // config the daemon ignores, WARN. When a symlink DOES exist, getConfigPath
+  // already resolved to the instance above — this only fires on the env-only gap.
+  if (
+    !explicitInstance &&
+    !process.env.RELAY_CONFIG_PATH &&
+    path.resolve(configPath) === path.resolve(defaultConfigPath())
+  ) {
+    let instanceDirs: string[] = [];
+    try {
+      instanceDirs = fs
+        .readdirSync(path.join(defaultBotRelayDir(), "instances"), { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+    } catch {
+      /* no instances/ dir → none */
+    }
+    if (instanceDirs.length > 0) {
+      process.stdout.write(
+        `\n⚠️  Wrote the FLAT config, but instance dir(s) exist (${instanceDirs.join(", ")}) with no ` +
+          `active-instance symlink. A daemon launched with RELAY_INSTANCE_ID set reads an instance config ` +
+          `this write will NOT reach. Run \`relay use-instance <id>\` to set the symlink, then re-run init.\n`,
+      );
+    }
+  }
+
+  // ---- P1 verify-after-write: is the config we wrote the one the daemon READS?
+  // Writing a credential and printing success WITHOUT confirming it is readable
+  // at the daemon's resolved path is the exact defect this closes (init wrote the
+  // flat path, the instance-scoped daemon read elsewhere, success printed). We
+  // verify at the FILESYSTEM — the path the daemon reads on its NEXT start — not
+  // against the running daemon, which loads config only at boot and would
+  // false-alarm on a correct write until it is restarted.
+  const daemonResolvedPath = getConfigPath();
+  const sameAsDaemon = path.resolve(daemonResolvedPath) === path.resolve(configPath);
+  if (httpEnabled) {
+    const readback = readJsonSafe(daemonResolvedPath) as Record<string, unknown> | null;
+    const secretReadable =
+      sameAsDaemon &&
+      readback !== null &&
+      typeof readback.dashboard_secret === "string" &&
+      (readback.dashboard_secret as string).length >= 32;
+    if (!secretReadable) {
+      if (!explicitInstance) {
+        // The common `relay init`: configPath IS getConfigPath() by construction,
+        // so a miss here means the write genuinely did not land — never a benign
+        // "different instance". Fail loud; do NOT let the success line stand.
+        process.stderr.write(
+          `\n✗ VERIFY FAILED: wrote ${configPath}, but the daemon's dashboard_secret is not readable at ` +
+            `its resolved path ${daemonResolvedPath}. Operator actions would 401. The write did not land as ` +
+            `expected — do NOT trust the success line above.\n`,
+        );
+        return 1;
+      }
+      // Explicit --instance-id / --multi-instance: configuring a NON-active
+      // instance is legitimate (set up now, activate later). Not fatal — but say
+      // plainly the running daemon will not read it until it is made active.
+      process.stdout.write(
+        `\n⚠️  Not the ACTIVE instance: the daemon resolves ${daemonResolvedPath}, not ${configPath}. ` +
+          `The dashboard_secret set here will NOT take effect until you run ` +
+          `\`relay use-instance ${effectiveInstanceId}\` and restart the daemon.\n`,
+      );
+    } else {
+      process.stdout.write(`✓ verified: the daemon resolves this config at ${daemonResolvedPath}\n`);
+    }
+  }
 
   if (args.configOnly) {
     process.stdout.write(`\nDone (config only). Your HTTP secret is in ${configPath}.\n`);

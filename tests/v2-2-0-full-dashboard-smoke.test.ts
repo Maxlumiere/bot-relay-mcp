@@ -31,6 +31,7 @@ import http from "http";
 import { WebSocket } from "ws";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v220-full-smoke-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -146,11 +147,22 @@ describe("v2.2.0 Phase 6 — dashboard end-to-end smoke (--full)", () => {
     expect(b).toBeDefined();
     expect(b.terminal_title_ref).toBeUndefined();
 
-    // 4. Focus endpoint: 409 on null ref, 404 on unknown.
-    const ghost = await post("/api/focus-terminal", { agent_name: "nonexistent" });
-    expect(ghost.status).toBe(404);
-    const nullRef = await post("/api/focus-terminal", { agent_name: "smoke-a" });
-    expect(nullRef.status).toBe(409);
+    // 4. Focus endpoint: 409 on null ref, 404 on unknown. ADR-0006:
+    // /api/focus-terminal is operator-power — it requires a VERIFIED dashboard
+    // secret + CSRF. The read surface above is deliberately exercised
+    // UNauthenticated (restricted snapshot), so authenticate ONLY this operator
+    // step: set a dashboard secret (resolveDashboardSecret reads env live, so the
+    // already-running server honors it immediately), drive the shipped operator
+    // handshake, then clear it before the unauthenticated WS + TOCTOU steps.
+    process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
+    try {
+      const ghost = await operatorPost(port, "/api/focus-terminal", { agent_name: "nonexistent" });
+      expect(ghost.status).toBe(404);
+      const nullRef = await operatorPost(port, "/api/focus-terminal", { agent_name: "smoke-a" });
+      expect(nullRef.status).toBe(409);
+    } finally {
+      delete process.env.RELAY_DASHBOARD_SECRET;
+    }
 
     // 5. WebSocket hello.
     const ws = new WebSocket(`ws://127.0.0.1:${port}/dashboard/ws`);

@@ -35,6 +35,7 @@
  */
 import fs from "fs";
 import path from "path";
+import { withDeadline } from "../http-deadline.js";
 
 interface Args {
   agent: string | null;
@@ -191,14 +192,22 @@ async function probeMarkerWriter(): Promise<MarkerWriterProbe> {
   const port = process.env.RELAY_HTTP_PORT ?? "3777";
   const host = process.env.RELAY_HTTP_HOST ?? "127.0.0.1";
   const where = `${host}:${port}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1000);
+  // NOT A BUG FIX — the timer was already live across the body read here, which
+  // measures as bounded on Node v24.13.0. Converted to the owned deadline so the
+  // bound does not depend on undici honouring abort mid-body, unverified on
+  // Node 20 (which `engines` allows and CI exercises). A deadline rejection is
+  // caught by the same `catch` below and reads as "no daemon reachable", which
+  // is the pre-existing behaviour for a timeout.
   try {
-    const res = await fetch(`http://${host}:${port}/health`, { signal: controller.signal });
-    if (!res.ok) {
-      return { live: false, reason: `daemon at ${where} answered /health with HTTP ${res.status}` };
+    const probe = await withDeadline(1000, `daemon /health at ${where}`, async (signal) => {
+      const res = await fetch(`http://${host}:${port}/health`, { signal });
+      if (!res.ok) return { ok: false as const, status: res.status };
+      return { ok: true as const, body: (await res.json()) as { filesystem_markers?: boolean } };
+    });
+    if (!probe.ok) {
+      return { live: false, reason: `daemon at ${where} answered /health with HTTP ${probe.status}` };
     }
-    const body = (await res.json()) as { filesystem_markers?: boolean };
+    const body = probe.body;
     if (body.filesystem_markers === true) return { live: true };
     if (body.filesystem_markers === false) {
       return {
@@ -215,8 +224,6 @@ async function probeMarkerWriter(): Promise<MarkerWriterProbe> {
     };
   } catch {
     return { live: false, reason: `no relay daemon reachable at ${where}, so nothing will ever write the marker` };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 

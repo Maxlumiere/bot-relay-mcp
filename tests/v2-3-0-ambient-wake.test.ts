@@ -22,6 +22,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v230-wake-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -30,6 +31,7 @@ process.env.RELAY_DB_PATH = TEST_DB_PATH;
 process.env.RELAY_MARKER_DIR = TEST_MARKER_DIR;
 delete process.env.RELAY_FILESYSTEM_MARKERS;
 delete process.env.RELAY_HTTP_SECRET;
+delete process.env.RELAY_DASHBOARD_SECRET;
 
 const {
   closeDb,
@@ -53,6 +55,10 @@ let port = 0;
 async function bootServer(): Promise<void> {
   if (server) { try { server.close(); } catch { /* ignore */ } }
   _resetDashboardWsForTests();
+  // ADR-0006: /api/wake-agent is operator-power — it requires a VERIFIED
+  // dashboard secret (no loopback bypass). Configure one so the operator
+  // handshake in operatorPost can authenticate.
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   server = startHttpServer(0, "127.0.0.1");
   await new Promise((r) => setTimeout(r, 60));
   const addr = server.address();
@@ -90,6 +96,7 @@ afterEach(() => {
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   if (fs.existsSync(TEST_MARKER_DIR)) fs.rmSync(TEST_MARKER_DIR, { recursive: true, force: true });
   delete process.env.RELAY_FILESYSTEM_MARKERS;
+  delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
 describe("v2.3.0 C.1 — schema migration", () => {
@@ -318,7 +325,7 @@ describe("v2.3.0 C.6 — wake-agent HTTP endpoint", () => {
   it("(C.6.1) POST /api/wake-agent disabled → markers_enabled=false in response", async () => {
     await bootServer();
     registerAgent("c6-target", "r", []);
-    const res = await postJson("/api/wake-agent", { agent_name: "c6-target" });
+    const res = await operatorPost(port, "/api/wake-agent", { agent_name: "c6-target" });
     expect(res.status).toBe(200);
     expect(res.json.success).toBe(true);
     expect(res.json.markers_enabled).toBe(false);
@@ -328,7 +335,7 @@ describe("v2.3.0 C.6 — wake-agent HTTP endpoint", () => {
     process.env.RELAY_FILESYSTEM_MARKERS = "1";
     await bootServer();
     registerAgent("c62-target", "r", []);
-    const res = await postJson("/api/wake-agent", { agent_name: "c62-target" });
+    const res = await operatorPost(port, "/api/wake-agent", { agent_name: "c62-target" });
     expect(res.status).toBe(200);
     expect(res.json.markers_enabled).toBe(true);
     expect(typeof res.json.marker_path).toBe("string");
@@ -347,7 +354,7 @@ describe("v2.3.0 C.6 — wake-agent HTTP endpoint", () => {
 
   it("(C.6.3) POST /api/wake-agent with invalid body → 400", async () => {
     await bootServer();
-    const res = await postJson("/api/wake-agent", { agent_name: "" });
+    const res = await operatorPost(port, "/api/wake-agent", { agent_name: "" });
     expect(res.status).toBe(400);
   });
 });
