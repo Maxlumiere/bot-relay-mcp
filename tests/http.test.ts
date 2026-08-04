@@ -98,7 +98,7 @@ describe("HTTP transport", () => {
     expect(body2.uptime_seconds).toBeGreaterThanOrEqual(body.uptime_seconds);
   });
 
-  it("tools/list returns all 36 tools (35 + abandon_registration [ADR-0005])", async () => {
+  it("tools/list returns all 37 tools (36 + get_outstanding [ADR-0011])", async () => {
     const result = await mcpCall("tools/list", {});
     expect(result.result.tools.length).toBe(37);
     const names = result.result.tools.map((t: any) => t.name);
