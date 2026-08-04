@@ -18,6 +18,8 @@
  *   log.error("webhook delivery failed", err);
  */
 
+import { redactRegisteredValues } from "./secret-registry.js";
+
 const PREFIX = "[bot-relay]";
 
 function ts(): string {
@@ -64,7 +66,7 @@ function minLevel(): number {
  */
 export function redactSecrets(line: string): string {
   if (!line || typeof line !== "string") return line;
-  return (
+  const anchored = (
     line
       // RELAY_AGENT_TOKEN=<value> (env-form; matches trailing
       // whitespace, comma, or end-of-string).
@@ -95,10 +97,15 @@ export function redactSecrets(line: string): string {
       // JSON-ish "<key>": "<value>" for common secret-bearing keys.
       // Catches both single + double quotes; non-greedy value match.
       .replace(
-        /("(?:token|agent_token|recovery_token|secret|http_secret|webhook_secret|password)"\s*:\s*)"([^"]+)"/gi,
+        /("(?:token|agent_token|recovery_token|new_token|registration_recovery|secret|http_secret|webhook_secret|password)"\s*:\s*)"([^"]+)"/gi,
         '$1"***"',
       )
   );
+  // PR C — layered value-registry pass, AFTER the anchor/field rules (in addition
+  // to them, never instead). Scrubs any MINTED/INGESTED secret VALUE that slipped
+  // past the field-name/anchor patterns — e.g. a token serialized inside a blob
+  // under an unlisted key. See src/secret-registry.ts.
+  return redactRegisteredValues(anchored);
 }
 
 function write(level: LogLevel, args: unknown[]): void {

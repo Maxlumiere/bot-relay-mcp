@@ -153,7 +153,9 @@ describe("v0.1.4 — bundle correctness", () => {
     // vault-path.ts (the per-instance vault-first token resolver), all
     // imported by extension.ts. v0.5.x added wake-routing.ts (ADR-0010 pure
     // state-routed wake decision) — imported by inbox-subscription.ts, where
-    // routeWake gates each wake, so it is a genuine bundle input.
+    // routeWake gates each wake, so it is a genuine bundle input. #3 (2026-07)
+    // added no-delivery-warn.ts (the human-facing throttle for the
+    // undelivered-mail surface), imported by extension.ts's hintNoWake.
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/catch-up-wake.ts",
@@ -165,6 +167,7 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/host-identity.ts",
       "src/inbox-subscription.ts",
       "src/llm-adapter.ts",
+      "src/no-delivery-warn.ts",
       "src/pid-binding.ts",
       "src/reconnect-supervisor.ts",
       "src/restart-policy.ts",

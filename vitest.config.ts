@@ -23,6 +23,15 @@ export default defineConfig({
     // 2026-07-23 worktree-clobber fix: fail any run that modifies the REAL
     // ~/.claude.json / ~/.claude/settings.json / ~/.bot-relay/config.json.
     globalSetup: ["./tests/global-user-config-tripwire.ts"],
+    // Hermetic config isolation for EVERY test file (runs in-worker before each
+    // file's module code): points RELAY_CONFIG_PATH at a private temp and clears
+    // ambient operator secrets, so no test reads the operator's real
+    // ~/.bot-relay/config.json or inherits a real dashboard secret. Closes the
+    // "suite only ever ran the no-config posture" defect (green in secret-free CI,
+    // ws-401/403 on a machine that has run `relay init`) from ONE site. A test that
+    // sets its own RELAY_CONFIG_PATH at its module top overrides it (asserted in
+    // tests/config-isolation.test.ts). Scoped to config+secrets, NOT RELAY_HOME.
+    setupFiles: ["./tests/_setup/hermetic-config.ts"],
     include: ["tests/**/*.test.ts"],
     exclude: [
       "node_modules/**",
