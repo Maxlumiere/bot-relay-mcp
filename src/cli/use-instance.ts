@@ -17,8 +17,13 @@
  */
 import { setActiveInstance, readInstance, resolveActiveInstanceId } from "../instance.js";
 
-function printUsage(): void {
-  process.stdout.write(
+function printUsage(requested = false): void {
+  // STREAM DISCIPLINE: usage is diagnostic on the ERROR path, so it goes to
+  // STDERR. On stdout it poisoned command substitutions — a failed
+  // $(relay mint-token ... --json) captured the help text and the agent
+  // launched with a garbage token that LOOKED like a value. `requested`
+  // (an explicit --help) is the one case where the text IS the data.
+  (requested ? process.stdout : process.stderr).write(
     "Usage: relay use-instance <instance-id>\n\n" +
       "Sets the active bot-relay instance for subsequent CLI calls.\n" +
       "Writes ~/.bot-relay/active-instance pointing at the chosen id.\n\n" +
@@ -32,7 +37,7 @@ export async function run(argv: string[]): Promise<number> {
   let id: string | null = null;
   for (const arg of argv) {
     if (arg === "--help" || arg === "-h") {
-      printUsage();
+      printUsage(true);
       return 0;
     }
     if (arg.startsWith("--")) {

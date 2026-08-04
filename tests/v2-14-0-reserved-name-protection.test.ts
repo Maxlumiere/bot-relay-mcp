@@ -275,8 +275,13 @@ describe("v2.14.0 — (D) legacy grace can't authenticate an actor", () => {
 
 // --- B: reserved names are exempt from the dead-agent purge ---
 
-describe("v2.14.0 — (B) reserved names survive the 30-day purge", () => {
-  it("a stale reserved name is kept; a stale ordinary agent is purged", () => {
+describe("v2.14.0 — (B) the 30-day purge is GONE: reserved and ordinary alike survive", () => {
+  it("a stale reserved name AND a stale ordinary agent both survive the purge tick", () => {
+    // Pre-ruling, this test asserted stale-bob was purged and only the
+    // reserved name was exempt. The ADR-0005 final ruling generalized the
+    // v2.14.0 insight: purging ANY row frees its name and reopens the
+    // bootstrap-claim window — the exemption's own rationale applied to
+    // every agent. Now nothing on the purge tick deletes an agent row.
     mintAgentToken("test-persona", "r", [], { description: null, force: false });
     registerAgent("stale-bob", "r", []);
     const longAgo = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(); // 40d
@@ -285,7 +290,7 @@ describe("v2.14.0 — (B) reserved names survive the 30-day purge", () => {
     purgeOldRecords(getDb());
 
     const names = getAgents().map((a) => a.name);
-    expect(names).toContain("test-persona"); // reserved → exempt
-    expect(names).not.toContain("stale-bob"); // ordinary → purged
+    expect(names).toContain("test-persona");
+    expect(names).toContain("stale-bob");
   });
 });

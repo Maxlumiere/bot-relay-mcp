@@ -13,6 +13,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { resolveInstanceDbPath, resolveInstanceConfigPath } from "../instance.js";
+import { withDeadline } from "../http-deadline.js";
 
 type Status = "PASS" | "WARN" | "FAIL";
 interface CheckResult {
@@ -138,19 +139,20 @@ async function checkDaemon(): Promise<CheckResult> {
   const port = parseInt(process.env.RELAY_HTTP_PORT || "3777", 10);
   const host = process.env.RELAY_HTTP_HOST || "127.0.0.1";
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 1000);
-    const res = await fetch(`http://${host}:${port}/health`, { signal: ctrl.signal });
-    clearTimeout(t);
-    if (res.ok) {
-      const data = (await res.json()) as { version?: string; protocol_version?: string };
+    const probe = await withDeadline(1000, "daemon /health", async (signal) => {
+      const res = await fetch(`http://${host}:${port}/health`, { signal });
+      if (!res.ok) return { ok: false as const, status: res.status };
+      // Body read inside the bound — `res.json()` used to sit past the cleared timer.
+      return { ok: true as const, data: (await res.json()) as { version?: string; protocol_version?: string } };
+    });
+    if (probe.ok) {
       return {
         name: "daemon /health",
         status: "PASS",
-        detail: `responding on http://${host}:${port} (version=${data.version ?? "?"}, protocol_version=${data.protocol_version ?? "?"})`,
+        detail: `responding on http://${host}:${port} (version=${probe.data.version ?? "?"}, protocol_version=${probe.data.protocol_version ?? "?"})`,
       };
     }
-    return { name: "daemon /health", status: "WARN", detail: `http://${host}:${port}/health returned ${res.status}` };
+    return { name: "daemon /health", status: "WARN", detail: `http://${host}:${port}/health returned ${probe.status}` };
   } catch {
     return { name: "daemon /health", status: "WARN", detail: `not running on http://${host}:${port} (that may be intentional)` };
   }
@@ -213,18 +215,19 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
   }
   let health: HealthBody | null = null;
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 5000);
-    const res = await fetch(`${base}/health`, { signal: ctrl.signal });
-    clearTimeout(t);
-    if (!res.ok) {
+    const probe = await withDeadline(5000, `hub ${base}/health`, async (signal) => {
+      const res = await fetch(`${base}/health`, { signal });
+      if (!res.ok) return { ok: false as const, status: res.status };
+      return { ok: true as const, body: (await res.json()) as HealthBody };
+    });
+    if (!probe.ok) {
       results.push({
         name: `hub ${base}/health`,
         status: "FAIL",
-        detail: `HTTP ${res.status}`,
+        detail: `HTTP ${probe.status}`,
       });
     } else {
-      health = (await res.json()) as HealthBody;
+      health = probe.body;
       results.push({
         name: `hub ${base}/health`,
         status: "PASS",
@@ -269,30 +272,33 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
   const token = process.env.RELAY_AGENT_TOKEN;
   if (token) {
     try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 5000);
-      const res = await fetch(`${base}/mcp`, {
-        method: "POST",
-        signal: ctrl.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json, text/event-stream",
-          "X-Agent-Token": token,
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "tools/call",
-          params: { name: "health_check", arguments: {} },
-        }),
+      const { body, httpStatus } = await withDeadline(5000, `hub ${base}/mcp token check`, async (signal) => {
+        const res = await fetch(`${base}/mcp`, {
+          method: "POST",
+          signal,
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            "X-Agent-Token": token,
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "health_check", arguments: {} },
+          }),
+        });
+        // SSE body — read inside the bound.
+        const text = await res.text();
+        const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
+        const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text || "{}");
+        const parsed = rpcResp?.result?.content?.[0]?.text
+          ? JSON.parse(rpcResp.result.content[0].text)
+          : rpcResp;
+        // httpStatus is carried OUT of the closure: the response object itself
+        // must not escape, or a caller could drain it past the deadline again.
+        return { body: parsed, httpStatus: res.status };
       });
-      clearTimeout(t);
-      const text = await res.text();
-      const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-      const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text || "{}");
-      const body = rpcResp?.result?.content?.[0]?.text
-        ? JSON.parse(rpcResp.result.content[0].text)
-        : rpcResp;
       if (body?.auth_error === true) {
         results.push({
           name: "token auth",
@@ -311,7 +317,7 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
         results.push({
           name: "token auth",
           status: "WARN",
-          detail: `unexpected health_check response (status=${res.status})`,
+          detail: `unexpected health_check response (status=${httpStatus})`,
         });
       }
     } catch (err) {

@@ -111,15 +111,20 @@ export function resolveAgentToken(
   fromEnv: string | undefined,
   fromLegacyConfig: string | undefined,
   secretsAvailable: boolean,
+  fromVault?: string | undefined,
 ): string {
-  const s = (fromSecret ?? "").trim();
-  if (s.length > 0) return s;
+  // v0.5.0 — precedence: explicit env > VAULT (hook-maintained, auto-syncs
+  // across a token rotation) > SecretStorage > legacy config. The explicit env
+  // override moves ABOVE SecretStorage so an operator can force a token, and
+  // the vault sits above the (previously stale) SecretStorage copy.
   const e = (fromEnv ?? "").trim();
   if (e.length > 0) return e;
-  // v0.1.3 R1 — refuse to read legacy plaintext when SecretStorage
-  // backend is unreachable. The whole point of v0.1.3 is that
-  // settings.json is no longer trusted for tokens; falling through
-  // here on Linux-without-libsecret would re-open the leak.
+  const v = (fromVault ?? "").trim();
+  if (v.length > 0) return v;
+  const s = (fromSecret ?? "").trim();
+  if (s.length > 0) return s;
+  // v0.1.3 R1 — refuse to read legacy plaintext when SecretStorage backend is
+  // unreachable; settings.json is no longer trusted for tokens.
   if (!secretsAvailable) return "";
   const c = (fromLegacyConfig ?? "").trim();
   if (c.length > 0) return c;
@@ -208,17 +213,22 @@ export function resolveAgentTokenEnvVar(agentName: string): string {
  * v0.2 — per-agent token resolution layered on the v0.1.3 R1
  * precedence + SecretStorage-unavailable contract.
  *
- * Precedence:
- *   1. fromSecret (per-agent SecretStorage value)
- *   2. per-agent env var (RELAY_AGENT_TOKEN_<NAME>)
- *   3. legacy singleton env var (RELAY_AGENT_TOKEN) — backward
- *      compat with v0.1.3 single-agent setups
- *   4. fromLegacyConfig (settings.json) — ONLY when
- *      secretsAvailable === true (R1 contract preserved)
+ * Precedence (v0.5.0 — vault-first for auto-sync across token rotation):
+ *   1. per-agent env var (RELAY_AGENT_TOKEN_<NAME>) — explicit operator override
+ *   2. legacy singleton env var (RELAY_AGENT_TOKEN) — explicit override
+ *   3. fromVault (the per-instance vault the SessionStart hook keeps CURRENT) —
+ *      NEW: this is what ends the manual "Set Agent Token" babysitting. When a
+ *      launcher rotates the DB token on relaunch, the hook rewrites the vault
+ *      and Tether picks it up on the next (re)connect — no stale SecretStorage.
+ *   4. fromSecret (per-agent SecretStorage value) — the old manual copy, now a
+ *      fallback below the vault (it was the source of the recurring desync).
+ *   5. fromLegacyConfig (settings.json) — ONLY when secretsAvailable === true.
  *
- * Returns "" when nothing resolves. The caller (typically the
- * AgentManager) decides whether to spawn idle, prompt for token,
- * or refuse.
+ * The explicit env overrides stay ON TOP so an operator can force a token for
+ * emergency/debug even when the vault has a different value.
+ *
+ * Returns "" when nothing resolves. The caller decides whether to spawn idle,
+ * prompt for token, or refuse.
  */
 export function resolvePerAgentToken(
   agentName: string,
@@ -226,14 +236,17 @@ export function resolvePerAgentToken(
   env: EnvRecord,
   fromLegacyConfig: string | undefined,
   secretsAvailable: boolean,
+  fromVault?: string | undefined,
 ): string {
-  const s = (fromSecret ?? "").trim();
-  if (s.length > 0) return s;
   const perAgentEnvName = resolveAgentTokenEnvVar(agentName);
   const perAgentEnv = (env[perAgentEnvName] ?? "").trim();
   if (perAgentEnv.length > 0) return perAgentEnv;
   const legacyEnv = (env.RELAY_AGENT_TOKEN ?? "").trim();
   if (legacyEnv.length > 0) return legacyEnv;
+  const vault = (fromVault ?? "").trim();
+  if (vault.length > 0) return vault;
+  const s = (fromSecret ?? "").trim();
+  if (s.length > 0) return s;
   if (!secretsAvailable) return "";
   const c = (fromLegacyConfig ?? "").trim();
   if (c.length > 0) return c;
@@ -261,6 +274,15 @@ export function resolveTetherConfig(
    * fine to use legacy during migration window."
    */
   secretsAvailable: boolean = true,
+  /**
+   * v0.5.0 — reads the per-instance vault token for a given agent name (the
+   * hook-maintained credential). Injected so this pure resolver stays
+   * VSCode/fs-free; production wires `readVaultToken(name, process.env,
+   * os.homedir(), log)`. Called AFTER the agent name is resolved so the vault
+   * is keyed correctly, and re-invoked on every readConfig — i.e. every
+   * (re)connect — so a rotated token auto-syncs with zero manual steps.
+   */
+  readVault?: (agentName: string) => string | null,
 ): TetherConfig {
   const endpoint = resolveEndpoint(cfg("endpoint") as string | undefined, env);
   const agentName = resolveString(
@@ -268,12 +290,27 @@ export function resolveTetherConfig(
     env.RELAY_AGENT_NAME,
     "",
   );
-  const agentToken = resolveAgentToken(
-    fromSecret,
-    env.RELAY_AGENT_TOKEN,
-    cfg("agentToken") as string | undefined,
-    secretsAvailable,
-  );
+  // v0.5.0 — thread the vault token through the shipped precedence. With a
+  // valid agent name, route through resolvePerAgentToken (per-agent env >
+  // legacy env > vault > SecretStorage > config); without one, the singleton
+  // resolveAgentToken applies (no per-agent key, so no vault to read).
+  const vaultToken = agentName && AGENT_NAME_RE.test(agentName) ? (readVault?.(agentName) ?? undefined) : undefined;
+  const agentToken =
+    agentName && AGENT_NAME_RE.test(agentName)
+      ? resolvePerAgentToken(
+          agentName,
+          fromSecret,
+          env,
+          cfg("agentToken") as string | undefined,
+          secretsAvailable,
+          vaultToken ?? undefined,
+        )
+      : resolveAgentToken(
+          fromSecret,
+          env.RELAY_AGENT_TOKEN,
+          cfg("agentToken") as string | undefined,
+          secretsAvailable,
+        );
   const autoInjectInbox = (cfg("autoInjectInbox") as boolean | undefined) ?? false;
   const notificationLevel =
     (cfg("notificationLevel") as "event" | "summary" | "none" | undefined) ?? "event";

@@ -4,18 +4,26 @@
 // See LICENSE for full terms.
 
 /**
- * v2.4.2 — TTY guard refinement.
+ * stdio TTY guard — EOF-driven, not timer-driven.
+ *
+ * The guard used to wait up to 1500ms (RELAY_TTY_GRACE_MS, since REMOVED) for
+ * bytes and exit 3 if the window expired. That predicate was undecidable and
+ * wrong for containers: a client connecting at 3000ms got exit 3 at ~1675ms
+ * against the published binary. It now waits on an EVENT — stdin readable
+ * (a client is there) vs stdin `end` (nobody is coming).
  *
  * Coverage (spawns `node dist/index.js` with varying stdin configurations,
- * captures exit code + stderr, asserts the refined guard behavior):
- *   - Background daemon attempt (stdin = /dev/null, no bytes) exits with
- *     code 3 within the grace window (RELAY_TTY_GRACE_MS=300 drives it
- *     tight to keep the test fast).
- *   - MCP-style launch (piped stdin, first bytes within grace window)
- *     does NOT exit — it proceeds to the MCP loop + lives until we kill it.
+ * captures exit code + stderr, asserts the guard behavior):
+ *   - Background daemon attempt (stdin = /dev/null → immediate EOF) exits
+ *     with code 3. This is the mistake the guard exists to catch and it must
+ *     keep working.
+ *   - MCP-style launch (piped stdin, bytes arrive) does NOT exit — it
+ *     proceeds to the MCP loop + lives until we kill it, with NO time limit.
  *   - `RELAY_SKIP_TTY_CHECK=1` bypasses the guard entirely; proceeds even
  *     with /dev/null stdin.
- *   - stdin-pipe-but-parent-sends-nothing — exits with code 3 within grace.
+ *   - stdin-pipe-held-open-but-silent must NOT exit: an open pipe with no
+ *     bytes is a client that has not spoken yet, which is exactly the
+ *     container case the timer used to kill.
  *   - Cross-platform: pure Node + process.stdin — no platform-specific
  *     syscalls. Tests are skipped on Windows because they pipe /dev/null
  *     directly; on Windows CI we rely on the darwin + linux job coverage.
@@ -82,7 +90,7 @@ beforeAll(() => {
 });
 
 describe("v2.4.2 — TTY guard", () => {
-  it("(T1) background daemon attempt (stdin=/dev/null) exits with code 3 within the grace window", async () => {
+  it("(T1) background daemon attempt (stdin=/dev/null) exits code 3 IMMEDIATELY on EOF", async () => {
     // Fresh in-memory-ish DB path so this test never touches ~/.bot-relay.
     const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
     const devNull = fs.openSync("/dev/null", "r");
@@ -92,7 +100,6 @@ describe("v2.4.2 — TTY guard", () => {
         ...process.env,
         RELAY_DB_PATH: path.join(tmpDir, "relay.db"),
         RELAY_TRANSPORT: "stdio",
-        RELAY_TTY_GRACE_MS: "300",
         RELAY_SKIP_TTY_CHECK: "",
       },
     }) as ChildProcessWithoutNullStreams;
@@ -102,13 +109,21 @@ describe("v2.4.2 — TTY guard", () => {
     const elapsed = Date.now() - start;
 
     expect(result.code).toBe(3);
-    expect(result.stderr).toMatch(/Transport is stdio but stdin is not a TTY/);
-    // v2.4.2 R1 LOW: the grace value in the error is interpolated from
-    // RELAY_TTY_GRACE_MS, not hardcoded. Assert the test's configured 300
-    // surfaces in the message so the LOW fix doesn't regress.
-    expect(result.stderr).toMatch(/no MCP client sent a frame within 300ms/);
-    // Grace is 300ms; leave headroom for node startup + exit flush.
-    expect(elapsed).toBeLessThan(5000);
+    expect(result.stderr).toMatch(/received no MCP client, and stdin closed immediately/);
+    // The message must be ACTIONABLE for the person who hits it — someone
+    // running us from systemd or a background tab. It names the HTTP remedy and
+    // deliberately never mentions TTYs, which were only ever a proxy for "is a
+    // human here" and read as a riddle to anyone in a container.
+    expect(result.stderr).toMatch(/RELAY_TRANSPORT=http/);
+    // Must not DIAGNOSE in terms of TTYs — "attach a real terminal" is a riddle
+    // to someone in a container who never typed anything. (RELAY_SKIP_TTY_CHECK
+    // still appears as the override's name; that is the variable, not advice.)
+    expect(result.stderr).not.toMatch(/not a TTY/);
+    expect(result.stderr).not.toMatch(/attach a real TTY/);
+    // DECIDED, not waited for: the old guard sat out a 1500ms grace before it
+    // could act. EOF is immediate, so this must be fast — and being fast is the
+    // observable proof that no timer is involved any more.
+    expect(elapsed).toBeLessThan(1200);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }, 10_000);
 
@@ -168,7 +183,6 @@ describe("v2.4.2 — TTY guard", () => {
         RELAY_DB_PATH: path.join(tmpDir, "relay.db"),
         RELAY_TRANSPORT: "stdio",
         RELAY_SKIP_TTY_CHECK: "1",
-        RELAY_TTY_GRACE_MS: "300",
       },
     }) as ChildProcessWithoutNullStreams;
 
@@ -179,12 +193,12 @@ describe("v2.4.2 — TTY guard", () => {
     // Either exits cleanly (0) or via SIGPIPE-ish clean handler; the
     // guard path is "code 3 + the specific stderr message", which is
     // what we're asserting does NOT happen.
-    expect(result.stderr).not.toMatch(/Transport is stdio but stdin is not a TTY/);
+    expect(result.stderr).not.toMatch(/received no MCP client, and stdin closed immediately/);
     expect(result.code).not.toBe(3);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }, 10_000);
 
-  it("(T4) stdin is a pipe but parent never writes — exits code 3 after grace", async () => {
+  it("(T4) parent CLOSES stdin without writing — exits code 3 (daemon-launch mistake)", async () => {
     const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
     const child = spawn(process.execPath, [ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -192,7 +206,6 @@ describe("v2.4.2 — TTY guard", () => {
         ...process.env,
         RELAY_DB_PATH: path.join(tmpDir, "relay.db"),
         RELAY_TRANSPORT: "stdio",
-        RELAY_TTY_GRACE_MS: "300",
         RELAY_SKIP_TTY_CHECK: "",
       },
     }) as ChildProcessWithoutNullStreams;
@@ -203,9 +216,49 @@ describe("v2.4.2 — TTY guard", () => {
 
     const result = await waitForExit(child);
     expect(result.code).toBe(3);
-    expect(result.stderr).toMatch(/Transport is stdio but stdin is not a TTY/);
+    expect(result.stderr).toMatch(/received no MCP client, and stdin closed immediately/);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }, 10_000);
+
+  it("(T6) parent HOLDS stdin OPEN and never writes — server STAYS ALIVE (was exit 3)", async () => {
+    // THE REGRESSION THAT WAS NEVER COVERED. Every container, supervisor and
+    // MCP proxy starts the server before a client speaks and holds stdin open.
+    // The old 1500ms grace killed that at ~1675ms, measured against the
+    // published binary. T4 above LOOKS like this case but is not: it calls
+    // stdin.end(), so it is really "parent closed without writing". The
+    // genuinely broken shape had no test at all, which is how it shipped.
+    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const child = spawn(process.execPath, [ENTRY], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, RELAY_DB_PATH: path.join(tmpDir, "relay.db"), RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "" },
+    }) as ChildProcessWithoutNullStreams;
+    let exited = false;
+    child.on("exit", () => { exited = true; });
+    await new Promise((r) => setTimeout(r, 2500)); // well past the old window
+    expect(exited, "server exited while a client was merely slow to connect").toBe(false);
+    child.kill();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }, 15_000);
+
+  it("(T7) client sends its first frame LATE — still served (was exit 3)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const child = spawn(process.execPath, [ENTRY], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, RELAY_DB_PATH: path.join(tmpDir, "relay.db"), RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "" },
+    }) as ChildProcessWithoutNullStreams;
+    let exited = false;
+    child.on("exit", () => { exited = true; });
+    await new Promise((r) => setTimeout(r, 2200));
+    expect(exited, "server died before the late client could speak").toBe(false);
+    child.stdin.write(JSON.stringify({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+    }) + "\n");
+    await new Promise((r) => setTimeout(r, 600));
+    expect(exited, "server died after the late client spoke").toBe(false);
+    child.kill();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }, 15_000);
 
   it("(T5) non-stdio transport (http) never engages the guard regardless of stdin", async () => {
     const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
@@ -223,7 +276,6 @@ describe("v2.4.2 — TTY guard", () => {
         // number so config validation accepts it.
         RELAY_HTTP_PORT: String(await getFreePort()),
         RELAY_SKIP_TTY_CHECK: "",
-        RELAY_TTY_GRACE_MS: "300",
       },
     }) as ChildProcessWithoutNullStreams;
 

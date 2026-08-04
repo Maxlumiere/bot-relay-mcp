@@ -110,11 +110,14 @@ export async function tearDownDaemon(handle: DaemonHandle): Promise<void> {
   fs.rmSync(handle.tmpDir, { recursive: true, force: true });
 }
 
-/** Parse the single SSE `data:` frame the stateless POST path returns. */
+/**
+ * Parse a stateless POST /mcp response body. ADR-0005 #3 made the one-shot
+ * (non-streaming) path reply with plain `application/json`; older SSE framing
+ * (`event: message\ndata: {…}`) is still handled for stateful paths.
+ */
 function parseSseRpc(raw: string): { result?: { content?: { text?: string }[] } } {
   const dataLine = raw.split("\n").find((line) => line.startsWith("data: "));
-  if (!dataLine) throw new Error(`no SSE data frame in response: ${raw}`);
-  return JSON.parse(dataLine.slice(6));
+  return JSON.parse(dataLine ? dataLine.slice(6) : raw);
 }
 
 export async function registerAgentViaHttp(
@@ -165,6 +168,32 @@ export async function sendMessageViaHttp(
     }),
   });
   if (!resp.ok) throw new Error(`send_message HTTP ${resp.status}: ${await resp.text()}`);
+  await resp.text(); // drain SSE
+}
+
+/** Drain an agent's pending mail (get_messages default auto-marks read →
+ *  pending_count returns to 0). The wake-idempotency tests use this to model
+ *  the agent consuming a queued injection between wakes. */
+export async function drainInboxViaHttp(
+  baseUrl: string,
+  agentName: string,
+  agentToken: string,
+): Promise<void> {
+  const resp = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      "X-Agent-Token": agentToken,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "get_messages", arguments: { agent_name: agentName, status: "pending" } },
+    }),
+  });
+  if (!resp.ok) throw new Error(`get_messages HTTP ${resp.status}: ${await resp.text()}`);
   await resp.text(); // drain SSE
 }
 

@@ -25,6 +25,7 @@ import type { SpawnAgentInput } from "../../types.js";
 import type { SpawnCommand, SpawnDriver, DriverContext } from "../types.js";
 import { buildChildEnv, normalizeCwd, escapeSingleQuotesPowershell } from "../validation.js";
 import { resolveInstanceDbPath } from "../../instance.js";
+import { getAgentCliProfile } from "../../agent-cli-profiles.js";
 
 const WINDOWS_SUB_DRIVERS = ["wt", "powershell", "cmd"] as const;
 type WindowsSubDriver = (typeof WINDOWS_SUB_DRIVERS)[number];
@@ -202,6 +203,24 @@ export const windowsDriver: SpawnDriver = {
     // append a KICKSTART prompt that points the spawned agent at the brief
     // file. Mirrors the bash script's behavior. When briefFilePath is absent,
     // behavior is unchanged from v2.1.4.
+    // v2.17.0 (P2): launcher-strategy CLIs (e.g. codex via bin/codex-relay) need
+    // a POSIX shell — the launcher is bash. Windows has no supported launcher
+    // path, so reject with a clear, actionable error rather than silently
+    // launching `claude` under a codex request. Fails fast, before terminal
+    // selection. Resolved from the registry — the strategy check is on a launch
+    // VALUE ("launcher"), not a CLI id, so the P3 drift-guard stays clean.
+    const profile = getAgentCliProfile(input.cli ?? "claude");
+    if (!profile) {
+      throw new Error(
+        `Windows spawn: unknown cli "${input.cli}" — no agent-CLI profile. See \`relay cli-profiles\`.`
+      );
+    }
+    if (profile.launch.strategy === "launcher") {
+      throw new Error(
+        `Windows spawn: cli "${profile.id}" launches via a POSIX launcher (${profile.launch.launcherScript}), which requires bash and is not supported on Windows. Spawn "${profile.id}" from macOS or Linux, or use cli=claude on Windows.`
+      );
+    }
+
     const sub = pickSubDriver(ctx);
     if (!sub) {
       throw new Error(
@@ -227,6 +246,7 @@ export const windowsDriver: SpawnDriver = {
     // safety net for any path where the prelude is empty (invalid agent
     // name, malformed instance dir).
     const env = buildChildEnv(input.name, input.role, input.capabilities, "win32", process.env);
+    env.RELAY_SPAWN_CLI = profile.id; // informational / audit parity with macOS
     const kickstart = buildKickstart(briefFilePath, process.env);
     const prelude = buildVaultPreludePowerShell(input.name);
 

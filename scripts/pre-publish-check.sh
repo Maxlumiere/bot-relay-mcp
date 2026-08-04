@@ -4,7 +4,7 @@
 # Orchestrates every check that must pass before `npm publish`:
 #   1. npx tsc --noEmit
 #   2. npx vitest run
-#   3. npm audit --audit-level=moderate
+#   3. npm audit (high+ threshold, via scripts/audit-with-retry.sh; moderate→high since v2.3.0)
 #   4. npm run build
 #   5. Drift guard: no hardcoded version literals in src/ outside src/version.ts
 #   5a. Tests-side drift guard (v2.6.3): no hardcoded literal of the CURRENT
@@ -47,6 +47,24 @@ step() {
     FAIL=1
     return 1
   fi
+}
+
+# Is this the CI SMOKE invocation (running the whole gate to exercise the
+# always-on steps), as opposed to an actual publish? The publish-only gates
+# (branch-identity, CI-green) are meaningless in CI — it checks out non-main PR
+# branches and cannot assert its own in-flight run is green — so they SKIP here.
+#
+# The signal is the DEDICATED, INTERNAL RELAY_SMOKE_ONLY=1 that ci.yml sets on the
+# smoke step — NOT a generic CI env var. `GITHUB_ACTIONS` was the first cut and it
+# is a SILENT BYPASS (codex #138 P1): `npm publish` inherits it in any CI-ish
+# shell, and anyone can `GITHUB_ACTIONS=true npm publish` locally to skip both
+# gates with no audit trail. A generic CI marker is not authorization for a manual
+# publish. Belt-and-suspenders: NEVER treat it as smoke during a real publish
+# (npm sets npm_lifecycle_event=prepublishOnly), so `RELAY_SMOKE_ONLY=1 npm
+# publish` cannot bypass either. The ONLY sanctioned off-main *publish* path is the
+# explicit RELAY_PUBLISH_ALLOW_NONMAIN=1, which prints both SHAs.
+_relay_is_ci_smoke() {
+  [ "${RELAY_SMOKE_ONLY:-}" = "1" ] && [ "${npm_lifecycle_event:-}" != "prepublishOnly" ]
 }
 
 # --- 1. TypeScript ---
@@ -426,6 +444,45 @@ ip_classifier_guard() {
 }
 step "ip-classifier guard (no duplicate CIDR logic)" ip_classifier_guard || exit 1
 
+# v2.17.0 P3 — CLI-profile branching drift guard. The agent-CLI profile registry
+# (src/agent-cli-profiles.ts) is the ONE place hardcoded claude/codex DECISION
+# LOGIC may live. A regex proved too leaky (codex's audit found 3 bypasses:
+# reversed equality, bare + noncapturing alternations), so detection is now a
+# narrow TS-AST walk (scripts/cli-profile-guard.mjs) shared with the vitest
+# drift-guard test — one implementation, both surfaces. It flags id-equality on
+# either operand, switch/case on a CLI id, and regex alternation of the ids; it
+# spares prose, ~/.claude/… paths, --flags, display strings, and registry
+# lookups by id. Escape hatch: `// CLI-PROFILE-ALLOWLIST: <reason>` on the line.
+cli_profile_guard() {
+  node "$PROJECT_ROOT/scripts/cli-profile-guard.mjs" "$PROJECT_ROOT/src"
+}
+step "cli-profile guard (no hardcoded claude|codex branching)" cli_profile_guard || exit 1
+
+# --- 5c. ADR-0003 auth-generation invalidation drift guard (v2.20.0) ----------
+# The verified-token cache (src/auth-cache.ts) is only safe if EVERY mutator
+# that changes a token's validity bumps the auth generation. A stale cache =
+# accepting a revoked token = auth bypass. This TS-AST walk asserts every
+# validity-changing `agents` mutator in src/db.ts calls bumpAuthGeneration (or
+# routes through applyAuthStateTransition). Shared with the vitest negative-
+# fixture test (tests/v2-20-0-auth-latency.test.ts) that proves the guard FAILS
+# when a bump is omitted — test the guard, not just the code (Victra Q3 gate).
+auth_gen_guard() {
+  node "$PROJECT_ROOT/scripts/auth-gen-guard.mjs" "$PROJECT_ROOT/src/db.ts"
+}
+step "auth-gen guard (every token/auth mutator invalidates the cache)" auth_gen_guard || exit 1
+
+# --- 5d. ADR-0002 agent-class taxonomy drift guard (v2.21.0) -----------------
+# src/agent-class.ts is the SSOT for the coordination-class taxonomy. This
+# TS-AST walk rejects a class-value literal branched-on (equality/switch) or a
+# parallel class vocabulary (array of >=2 class ids) defined anywhere else in
+# src/ — mirroring the cli-profile guard, preventing a taxonomy re-fork (the
+# class the orchestrator nearly shipped). Shared with the vitest negative-
+# fixture test that proves the guard FAILS on a synthetic re-fork.
+agent_class_guard() {
+  node "$PROJECT_ROOT/scripts/agent-class-guard.mjs" "$PROJECT_ROOT/src"
+}
+step "agent-class guard (no class taxonomy re-fork outside src/agent-class.ts)" agent_class_guard || exit 1
+
 # --- 6. 25-tool + CLI smoke against an isolated relay (v2.1 Phase 5a) ---
 # Inline cleanup (no RETURN trap) — simpler + avoids set-u pitfalls around
 # deferred variable lookup in trap strings.
@@ -491,6 +548,68 @@ smoke_25_isolated() {
 }
 step "25-tool + CLI smoke (isolated relay)" smoke_25_isolated || exit 1
 
+# --- 6a2. Branch-identity gate (v2.23.0) ---
+# The CI green-gate below asserts CI COLOUR — "is this commit's CI green?" — but
+# NOT BRANCH IDENTITY. A green FEATURE BRANCH therefore passes and publishes
+# silently as if it were main, shipping code no reviewer merged to every user.
+# That is the same silence-as-failure class as everything else this arc closed:
+# the gate proved the wrong thing and its success read as safety.
+#
+# So: HEAD must be EXACTLY origin/main. Deliberately exact-equality, NOT
+# `merge-base --is-ancestor` — ancestor-of would also pass an OLDER main commit,
+# letting a stale checkout re-ship superseded code under a fresh version number (a
+# silent code-downgrade). origin/main is FRESHENED from the remote first, so the
+# comparison is against the true remote tip, not a possibly-stale local ref.
+#
+# Escape hatch: RELAY_PUBLISH_ALLOW_NONMAIN=1 skips the check — but it is
+# deliberate, never the default, and it PRINTS exactly what it is overriding so an
+# off-main publish can never be silent.
+branch_identity_gate() {
+  # PUBLISH-ONLY. The 25-tool smoke runs the whole script on non-main PR branches;
+  # enforcing there would red every PR. Skip ONLY for the CI smoke, keyed on the
+  # dedicated RELAY_SMOKE_ONLY (see _relay_is_ci_smoke) — never on a generic CI var
+  # a publish would inherit. It ENFORCES for every actual publish + local
+  # pre-publish dry-run. A non-main *publish* still has exactly one sanctioned
+  # skip: the explicit RELAY_PUBLISH_ALLOW_NONMAIN=1 below, which prints both SHAs.
+  if _relay_is_ci_smoke; then
+    echo "  SKIP  branch-identity is a publish-only check; RELAY_SMOKE_ONLY set (CI smoke, not a publish)."
+    return 0
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    echo "  FAIL  git not available — cannot verify HEAD == origin/main."
+    return 1
+  fi
+  local head_sha origin_sha fetch_ok=1
+  head_sha=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")
+  # Freshen the remote tip (into FETCH_HEAD) so we compare against TRUE origin/main.
+  git -C "$PROJECT_ROOT" fetch --quiet origin main 2>/dev/null || fetch_ok=0
+  origin_sha=$(git -C "$PROJECT_ROOT" rev-parse FETCH_HEAD 2>/dev/null || echo "")
+
+  if [ "${RELAY_PUBLISH_ALLOW_NONMAIN:-}" = "1" ]; then
+    echo "  OVERRIDE  RELAY_PUBLISH_ALLOW_NONMAIN=1 — branch-identity check SKIPPED (deliberate)."
+    echo "            HEAD=${head_sha:-?}  origin/main=${origin_sha:-?}  (fetch_ok=$fetch_ok)"
+    echo "            You are publishing a commit NOT verified-equal to origin/main."
+    return 0
+  fi
+  if [ "$fetch_ok" -ne 1 ] || [ -z "$origin_sha" ]; then
+    echo "  FAIL  could not fetch/resolve origin/main — cannot verify HEAD is merged main."
+    echo "        Refusing to publish unverified. (RELAY_PUBLISH_ALLOW_NONMAIN=1 to override.)"
+    return 1
+  fi
+  if [ -z "$head_sha" ] || [ "$head_sha" != "$origin_sha" ]; then
+    echo "  FAIL  HEAD is NOT origin/main — refusing to publish unmerged/foreign code."
+    echo "        HEAD        = ${head_sha:-?}"
+    echo "        origin/main = $origin_sha"
+    echo "        Exact equality is required (not ancestor-of): anything else ships code no"
+    echo "        reviewer merged, or re-ships an older main as a new version."
+    echo "        (RELAY_PUBLISH_ALLOW_NONMAIN=1 to override — it prints what it overrides.)"
+    return 1
+  fi
+  echo "  HEAD == origin/main ($head_sha) — publishing verified merged main."
+  return 0
+}
+step "branch-identity gate (HEAD == origin/main, exact)" branch_identity_gate || exit 1
+
 # --- 6b. GitHub CI green-gate (v2.2.3) ---
 # Query GitHub for the CI conclusion of the current HEAD. Blocks shipping a
 # commit whose CI is known-red (the pre-v2.2.3 failure mode where local
@@ -530,8 +649,23 @@ ci_green_gate() {
       return 0
       ;;
     no-run)
-      echo "  WARN  GitHub has no run for $head_sha (not pushed?) — proceed at own risk"
-      return 0
+      # Promoted WARN→FAIL: "no CI run for this commit" is unverified, and
+      # unverified must not read as safe (the silence-as-failure class this whole
+      # line of work exists to end). A commit with no CI run has not been proven
+      # green on the matrix — refuse rather than "proceed at own risk". Push the
+      # commit and let CI run, or fix why the run is missing.
+      # EXCEPT for the CI smoke itself: it runs this gate while its own ci.yml run
+      # is in flight, and if gh can't resolve that run it reads "no-run" — a query
+      # artifact, not an unverified publish. Tolerated only under the dedicated
+      # RELAY_SMOKE_ONLY (see _relay_is_ci_smoke) — never a generic CI var, and
+      # never during an actual publish. The FAIL applies to a real local publish.
+      if _relay_is_ci_smoke; then
+        echo "  WARN  no ci.yml run resolved for $head_sha during the CI smoke (RELAY_SMOKE_ONLY) — tolerated; this run is in flight."
+        return 0
+      fi
+      echo "  FAIL  GitHub has NO ci.yml run for $head_sha — refusing to publish unverified."
+      echo "        Push HEAD and wait for CI, or investigate the missing run."
+      return 1
       ;;
     *)
       echo "  WARN  GitHub CI status unknown ($ci_status) for $head_sha — proceed at own risk"

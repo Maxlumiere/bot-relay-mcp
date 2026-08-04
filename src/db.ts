@@ -7,8 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
 import os from "os";
-import { getOwnHostId, isAgentProcessAlive } from "./liveness.js";
-import { isReservedName } from "./reserved-names.js";
+import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised } from "./liveness.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -20,8 +19,12 @@ import type {
   WebhookDeliveryRecord,
 } from "./types.js";
 import { VALID_TRANSITIONS, ACTION_TO_STATUS } from "./types.js";
-import { generateToken, hashToken } from "./auth.js";
+import { generateToken, hashToken, verifyToken } from "./auth.js";
+import { registerPersistedSecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
+import { computeTokenLookup } from "./token-lookup.js";
+import { normalizeAgentClass, TOPOLOGY_VISIBLE_CLASSES, TOPOLOGY_HIDDEN_CLASSES, TRANSIENT } from "./agent-class.js";
+import { authCacheGet, authCacheSet, authCacheTtlMs } from "./auth-cache.js";
 import { encryptContent, decryptContent } from "./encryption.js";
 import {
   type CompatDatabase,
@@ -31,9 +34,10 @@ import {
 } from "./sqlite-compat.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
-import { touchMarker } from "./filesystem-marker.js";
 import { resolveInstanceDbPath } from "./instance.js";
 import { emitInboxChanged } from "./inbox-events.js";
+import { VERSION } from "./version.js";
+import { getAgentCliProfile } from "./agent-cli-profiles.js";
 import { validateSchemaDocument, validateResult, type SchemaCheck } from "./task-schema-validator.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".bot-relay");
@@ -81,19 +85,26 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function computeStatus(lastSeen: string): "online" | "stale" | "offline" {
-  const diff = Date.now() - new Date(lastSeen).getTime();
-  const minutes = diff / 60_000;
-  if (minutes < 10) return "online";
-  if (minutes < 60) return "stale";
-  return "offline";
+// v2.19.0 — the coarse presence `status`, derived from the liveness VERDICT, NOT
+// from last_seen age. This RETIRES the age-based lie (root cause of the
+// "codex-5-5 reports offline while actively auditing" bug): staleness alone can
+// no longer render a live agent offline; the verdict maps alive→online,
+// dead→offline, unknown→unknown (a live-but-unanchored, or cross-host, agent
+// must NEVER read dead).
+// `last_seen` is now pure telemetry ("last write"), never a presence signal.
+function statusFromVerdict(verdict: LivenessVerdict): "online" | "offline" | "unknown" {
+  if (verdict === "alive") return "online";
+  if (verdict === "dead") return "offline";
+  return "unknown";
 }
 
 // v2.15.0 — the old age-based liveness helpers (AGENT_STATUS_STALE/OFFLINE_MINUTES,
 // getAliveWindowMs, isAliveFresh, getAgentAbandonMinutes) were REMOVED: the
 // presence verdict is now a live in-memory probe (computeLivenessVerdict), and
-// deriveAgentStatus no longer uses last_seen age at all. The v1.3 `status`
-// field (online/stale/offline) keeps its own thresholds in computeStatus.
+// deriveAgentStatus no longer uses last_seen age at all. v2.19.0 finished the job:
+// the coarse `status` field is now derived from the same VERDICT (statusFromVerdict),
+// NOT last_seen age — so no presence surface lies about a rate-limited-but-alive
+// agent anymore. last_seen is pure telemetry.
 const LIVENESS_PROBE_CACHE_MS = 5_000;
 
 const LEGACY_STATUS_MAP: Record<string, string> = {
@@ -193,6 +204,40 @@ function parseHostShellPids(raw: string | null | undefined): number[] | null {
   }
 }
 
+/**
+ * THE ROUTING PREDICATE — single source (audit HIGH #2, ADR-0015 L4). An agent
+ * can RECEIVE a task iff it holds a live session AND is not in a terminal status.
+ * postTaskAuto's SQL candidate query (ENFORCEMENT) and the `routable` /
+ * `routability` fields on the agent surface (what the OPERATOR reads) both
+ * derive from this, so the operator can never read a different predicate than
+ * the router enforces. This is DELIBERATELY not `computeLivenessVerdict`: that
+ * asks "is the process alive?", a strictly different question — a live process
+ * whose session dropped is alive-but-unroutable, and conflating the two is what
+ * this split fixes.
+ */
+export const ROUTABLE_TERMINAL_STATUSES = ["offline", "closed", "abandoned", "stale"] as const;
+export function isAgentRoutable(row: { session_id?: string | null; agent_status?: string | null }): boolean {
+  // Case-INSENSITIVE (codex HIGH #2 P1): a persisted 'OFFLINE' must read the same
+  // terminal state the lowercase display shows — otherwise `routable` disagrees
+  // with its own `agent_status` neighbour in the same row. This is now the ONE
+  // implementation the router (postTaskAuto) and the surface both call.
+  return row.session_id != null && !(ROUTABLE_TERMINAL_STATUSES as readonly string[]).includes((row.agent_status ?? "").toLowerCase());
+}
+export type Routability = "routable" | "unroutable_alive" | "unroutable_offline";
+/**
+ * Classify an agent's routability as ONE named state (not two fields to diff).
+ * `unroutable_alive` is the loud diagnostic: the process is alive yet holds no
+ * routable session, so the router will SILENTLY never give it work — the
+ * canonical failure shape wearing a healthy badge (audit HIGH #2).
+ */
+export function agentRoutability(
+  row: { session_id?: string | null; agent_status?: string | null },
+  verdict: LivenessVerdict,
+): Routability {
+  if (isAgentRoutable(row)) return "routable";
+  return verdict === "alive" ? "unroutable_alive" : "unroutable_offline";
+}
+
 function toAgentWithStatus(
   row: AgentRecord,
   verdict: LivenessVerdict = computeLivenessVerdict(row),
@@ -205,7 +250,7 @@ function toAgentWithStatus(
     capabilities: JSON.parse(row.capabilities) as string[],
     last_seen: row.last_seen,
     created_at: row.created_at,
-    status: computeStatus(row.last_seen),
+    status: statusFromVerdict(verdict),
     has_token: !!row.token_hash,
     agent_status: derivedAgentStatus,
     // v2.15.0 — presence surface. `liveness` (alive|dead|unknown) is the FIELD
@@ -219,13 +264,28 @@ function toAgentWithStatus(
     liveness: verdict,
     last_alive: positiveConfirmationISO(row.name),
     alive: verdict === "alive" && ACTIVE_AGENT_STATES.has(derivedAgentStatus),
+    // audit HIGH #2 — session-actionability, the SAME predicate postTaskAuto
+    // enforces (isAgentRoutable), surfaced so the operator reads what the router
+    // uses (ADR-0015 L4). `routability` is the loud named state; the alarming
+    // one, `unroutable_alive`, is a live process the router will silently starve.
+    routable: isAgentRoutable(row),
+    routability: agentRoutability(row, verdict),
     description: row.description ?? null,
+    // Phase A — version + CLI visibility. `health_check` reports the version of
+    // WHICHEVER SERVER ANSWERS, so an agent on a stale build asks, is told its
+    // own stale version, and cannot tell. Per-row makes skew answerable.
+    server_version: row.server_version ?? null,
+    cli_profile: row.cli_profile ?? null,
     session_id: row.session_id ?? null,
     terminal_title_ref: row.terminal_title_ref ?? null,
     // Tether v0.3 PID-handshake: parse the stored JSON chain → number[] (null +
     // malformed both surface as null, never throw).
     host_shell_pids: parseHostShellPids(row.host_shell_pids),
     host_id: row.host_id ?? null,
+    // ADR-0002: normalized coordination class (NULL/legacy → "unclassified").
+    // MUST be surfaced here — the projection, not SELECT *, gates what discovery
+    // (incl. view='topology') can see.
+    class: normalizeAgentClass(row.class),
   };
 }
 
@@ -274,6 +334,10 @@ export async function initializeDb(): Promise<void> {
   migrateSchemaToV2_15(_db);
   migrateSchemaToV2_16(_db);
   migrateSchemaToV2_19(_db);
+  migrateSchemaToV2_20(_db);
+  migrateSchemaToV2_21(_db);
+  migrateSchemaToV2_22(_db);
+  migrateSchemaToV2_23(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -316,6 +380,10 @@ export function getDb(): CompatDatabase {
   migrateSchemaToV2_15(_db);
   migrateSchemaToV2_16(_db);
   migrateSchemaToV2_19(_db);
+  migrateSchemaToV2_20(_db);
+  migrateSchemaToV2_21(_db);
+  migrateSchemaToV2_22(_db);
+  migrateSchemaToV2_23(_db);
   seedBuiltinTaskSchemas(_db);
   finalizeSchemaVersion(_db);
   purgeOldRecords(_db);
@@ -537,7 +605,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 19;
+export const CURRENT_SCHEMA_VERSION = 23;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -630,6 +698,10 @@ export function applyMigration(from: number, to: number): void {
     [16, 17],
     [17, 18],
     [18, 19],
+    [19, 20],
+    [20, 21],
+    [21, 22],
+    [22, 23],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1566,6 +1638,637 @@ function migrateSchemaToV2_19(db: CompatDatabase): void {
   ).run();
 }
 
+/**
+ * ADR-0003 (v2.20.0) — O(1) token-auth substrate. Additive + idempotent.
+ *
+ * Adds:
+ *   - `agents.token_lookup TEXT NULL` — HMAC-SHA256 digest of the CURRENT token
+ *     (an indexed locator; NEVER an auth decision — see src/token-lookup.ts).
+ *   - `agents.previous_token_lookup TEXT NULL` — digest of the PREVIOUS token,
+ *     populated only during rotation_grace (mirrors previous_token_hash).
+ *   - `idx_agents_token_lookup` — the index that turns the O(N) bcrypt scan
+ *     into a single-row candidate lookup.
+ *   - `auth_meta` — a single-row (CHECK id=1) monotonic `generation` counter.
+ *     ANY mutation that can change a token's validity bumps it; the verified-
+ *     token cache stamps the generation at insert and treats a bumped counter
+ *     as instant invalidation (see bumpAuthGeneration / getAuthGeneration).
+ *
+ * NO BACKFILL: `token_lookup` cannot be recomputed from the stored bcrypt hash
+ * (we don't hold the raw token). Existing rows stay NULL until their token is
+ * next minted/rotated/registered; the locator's O(N) fallback + lazy self-heal
+ * (see locateAgentByToken) keep every legacy agent authenticating meanwhile,
+ * so this is a zero-lockout, zero-data migration.
+ */
+function migrateSchemaToV2_20(db: CompatDatabase): void {
+  const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "token_lookup")) {
+    db.exec("ALTER TABLE agents ADD COLUMN token_lookup TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "previous_token_lookup")) {
+    db.exec("ALTER TABLE agents ADD COLUMN previous_token_lookup TEXT");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agents_token_lookup ON agents(token_lookup)");
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS auth_meta (" +
+      "id INTEGER PRIMARY KEY CHECK (id = 1), " +
+      "generation INTEGER NOT NULL DEFAULT 0)",
+  );
+  db.prepare("INSERT OR IGNORE INTO auth_meta (id, generation) VALUES (1, 0)").run();
+}
+
+/**
+ * ADR-0002 (v2.21.0) — agent coordination-class. Additive + idempotent.
+ * Adds `agents.class TEXT NULL` — the self-declared coarse coordination posture
+ * (SSOT: src/agent-class.ts). NULL on every existing row = zero data migration;
+ * a NULL/unknown value normalizes to `unclassified` on read (normalizeAgentClass),
+ * so legacy agents appear under `unclassified` and are hidden from the default
+ * topology who's-who until they re-declare a real class. `class` is a valid
+ * unquoted SQLite column name.
+ */
+function migrateSchemaToV2_21(db: CompatDatabase): void {
+  const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "class")) {
+    db.exec("ALTER TABLE agents ADD COLUMN class TEXT");
+  }
+}
+
+/**
+ * VERSION VISIBILITY (Phase A) — record which relay build is serving each agent.
+ *
+ * Every stdio MCP server is spawned per client session from `dist/` at the
+ * moment that session starts, and runs that build for its whole life. Rebuilding
+ * does nothing for an already-running session. Measured on the development
+ * machine: TWELVE relay servers alive at once running SEVEN distinct versions,
+ * 2.9.1 through 2.21.0, all against ONE database.
+ *
+ * The dangerous part is that this is INVISIBLE. A stdio server has no port and
+ * no endpoint, so nobody can ask it anything — and `health_check` answers with
+ * the version of whichever server handled the call, so an agent on a stale build
+ * asks, is told its own stale version, and has no way to know. That is
+ * silence-as-failure with a confident voice.
+ *
+ * Additive, defaulting to NULL, matching every other migration here: an older
+ * server writing this row simply omits the column.
+ *
+ * (Schema-number collision with PR #119 resolved at rebase: this migration —
+ * #121's — keeps v2_22; #119's ADR-0005 migration is renumbered to v2_23
+ * below, per the both-are-plain-ADD-COLUMNs / order-independent note that
+ * shipped with #121.)
+ */
+function migrateSchemaToV2_22(db: CompatDatabase): void {
+  const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "server_version")) {
+    db.exec("ALTER TABLE agents ADD COLUMN server_version TEXT");
+  }
+  // ONE migration for one row. `cli_profile` records WHICH agent-CLI the row
+  // registered through, and it is the enabling half of the server-side
+  // verdict-absence check: only a profile that actually installs a hook can OWE
+  // a verdict, so without this the server would have to either interrogate
+  // every agent or assume a default — and a wrong default is how a guard starts
+  // crying wolf. NULL means UNKNOWN and is never asked for a verdict.
+  if (!agentCols.some((c) => c.name === "cli_profile")) {
+    db.exec("ALTER TABLE agents ADD COLUMN cli_profile TEXT");
+  }
+}
+
+/**
+ * ADR-0005 (v2.22.0, schema v23) — safe orphan cleanup substrate. Additive +
+ * idempotent. Adds:
+ *   - `first_authed_at TEXT NULL` — set ONCE on an agent's first successful
+ *     token auth. NULL = the row has NEVER authenticated = the definition of an
+ *     orphan. This is the SECURITY KEYSTONE: abandon_registration + the orphan
+ *     GC only ever touch first_authed_at IS NULL rows, so a working agent (which
+ *     has authed ≥1x) self-excludes and can NEVER be reached.
+ *   - `registration_recovery_hash TEXT NULL` — bcrypt hash of a one-time,
+ *     name-scoped handle returned at first register, so the registrant can
+ *     abandon its OWN botched registration WITHOUT the destructive operator
+ *     endpoint. NULL after redemption / for authed rows.
+ *   - `registration_recovery_expires_at TEXT NULL` — short TTL for the handle.
+ * All NULL on existing rows = zero data migration.
+ */
+function migrateSchemaToV2_23(db: CompatDatabase): void {
+  const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentCols.some((c) => c.name === "first_authed_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN first_authed_at TEXT");
+    // victra pre-ship catch (2026-07-22): BACKFILL every row that exists at
+    // v22-migration time. Such a row predates the orphan concept entirely — an
+    // orphan is defined by a v2.22 `registration_recovery` handle, which no
+    // pre-v22 registration ever minted — so none is a legitimate
+    // abandon_registration / orphan-GC target. Without this, an upgrade leaves
+    // ALL existing agents at first_authed_at IS NULL until each re-authenticates
+    // and self-stamps; a live-but-session-less one could be false-reaped by the
+    // GC inside that window (the exact failure the keystone must prevent).
+    // Stamping them non-NULL closes the window by construction. Runs ONCE — it's
+    // guarded by the ADD COLUMN, so it never re-stamps a genuine post-v22 orphan.
+    db.exec("UPDATE agents SET first_authed_at = COALESCE(created_at, datetime('now')) WHERE first_authed_at IS NULL");
+  }
+  if (!agentCols.some((c) => c.name === "established_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN established_at TEXT");
+    // ADR-0005 lifecycle refinement (codex #115 recovery blocker). `established_at`
+    // is THE reap invariant: set the moment a row first becomes a legitimate
+    // IDENTITY via ANY establishment path — a successful TOKEN auth OR recovery
+    // completion (see markEstablished). It is a sibling to first_authed_at, which
+    // stays literally "first TOKEN auth" (kept for forensic value + honesty; the
+    // proxy first_authed_at IS NULL produced 3 reap blockers precisely because
+    // recovery establishes identity WITHOUT a token auth). REAPABLE_ORPHAN_WHERE
+    // keys on established_at. Same one-time backfill — every pre-v22 row predates
+    // the orphan concept, so it is established.
+    db.exec("UPDATE agents SET established_at = COALESCE(created_at, datetime('now')) WHERE established_at IS NULL");
+  }
+  if (!agentCols.some((c) => c.name === "registration_recovery_hash")) {
+    db.exec("ALTER TABLE agents ADD COLUMN registration_recovery_hash TEXT");
+  }
+  if (!agentCols.some((c) => c.name === "registration_recovery_expires_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN registration_recovery_expires_at TEXT");
+  }
+}
+
+/**
+ * Does this CLI profile OWE a verdict at session start?
+ *
+ * Derived from the registry rather than listed here, so the recording side and
+ * the expectation side cannot drift apart: a profile owes a verdict iff it
+ * installs a hook, because only then is there something that could have emitted
+ * one. An unknown / absent profile returns false — under-cover deliberately
+ * rather than train anyone to ignore a false alarm.
+ */
+export function profileOwesVerdict(cliProfile: string | null | undefined): boolean {
+  if (!cliProfile) return false;
+  const profile = getAgentCliProfile(cliProfile);
+  return Boolean(profile?.hookInstall);
+}
+
+/**
+ * Normalize a caller-supplied CLI profile id against the registry. Anything the
+ * registry does not know becomes NULL (= UNKNOWN), never a default.
+ */
+export function normalizeCliProfile(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  return getAgentCliProfile(raw) ? raw : null;
+}
+
+/**
+ * ADR-0003 — read the current auth generation. A single-row PK read
+ * (~microseconds), cheap enough to run on every auth (the verified-token cache
+ * saves the bcrypt, not this read). Returns 0 if the row is somehow absent
+ * (fail-safe: a 0 never matches a stamped positive gen → forces a re-verify).
+ */
+export function getAuthGeneration(): number {
+  const row = getDb().prepare("SELECT generation FROM auth_meta WHERE id = 1").get() as
+    | { generation?: number }
+    | undefined;
+  return row?.generation ?? 0;
+}
+
+/**
+ * ADR-0003 — bump the auth generation. MUST be called by every sanctioned
+ * mutator that can change a token's validity: a write to token_hash /
+ * auth_state / previous_token_hash / recovery_token_hash /
+ * rotation_grace_expires_at, or a delete of an agent row. It invalidates the
+ * ENTIRE verified-token cache logically — any entry stamped with a now-stale
+ * generation is rejected on its next hit, giving INSTANT revocation regardless
+ * of the entry's TTL. Coverage is enforced adversarially by the sanctioned-
+ * mutation drift guard (scripts/auth-gen-guard.mjs + its negative fixture).
+ */
+export function bumpAuthGeneration(): void {
+  getDb().prepare("UPDATE auth_meta SET generation = generation + 1 WHERE id = 1").run();
+}
+
+/**
+ * ADR-0003 — bcrypt-scan a set of candidate rows for the one the token belongs
+ * to, returning WHICH hash matched. Identification only — NO auth-state
+ * decision (so callers like checkToken can see a revoked row). bcrypt is the
+ * verifier; a digest collision that reaches here is rejected because the
+ * bcrypt.compareSync still fails. Order matters: token_hash before
+ * previous_token_hash (a grace window's NEW token wins).
+ */
+function matchTokenAgainstRows(
+  token: string,
+  rows: AgentRecord[],
+): { row: AgentRecord; matched: "current" | "previous" } | null {
+  for (const row of rows) {
+    if (row.token_hash && verifyToken(token, row.token_hash)) return { row, matched: "current" };
+    if (row.previous_token_hash && verifyToken(token, row.previous_token_hash)) {
+      return { row, matched: "previous" };
+    }
+  }
+  return null;
+}
+
+/**
+ * ADR-0003 — SHARED identification primitive for BOTH token-auth call sites
+ * (server.ts resolveCallerByToken via resolveAgentByToken, and status.ts
+ * checkToken). Finds the agent row a token belongs to in O(1) via the indexed
+ * HMAC digest, with an O(N) fallback that guarantees a legacy NULL-digest row
+ * (or a keyring-rotation straggler whose digest was computed under the old key)
+ * is never missed. `fromLocator` distinguishes the index hit from the fallback
+ * (drives lazy self-heal). Returns the row for ANY auth_state — the caller
+ * decides what the state means. Feeding both sites from here is what keeps the
+ * two auth paths from diverging.
+ */
+export function findAgentRowByToken(
+  token: string,
+): { row: AgentRecord; matched: "current" | "previous"; fromLocator: boolean } | null {
+  const digest = computeTokenLookup(token);
+  const db = getDb();
+  const candidates = db
+    .prepare("SELECT * FROM agents WHERE token_lookup = ? OR previous_token_lookup = ?")
+    .all(digest, digest) as AgentRecord[];
+  const hit = matchTokenAgainstRows(token, candidates);
+  if (hit) return { ...hit, fromLocator: true };
+  // Fallback: legacy NULL-digest rows / keyring-rotation stragglers.
+  const all = db.prepare("SELECT * FROM agents").all() as AgentRecord[];
+  const fb = matchTokenAgainstRows(token, all);
+  return fb ? { ...fb, fromLocator: false } : null;
+}
+
+/**
+ * ADR-0003 — apply the active/rotation_grace decision to an identified row,
+ * faithfully replicating the legacy O(N) scan's POSITIVE cases: a caller is
+ * returned ONLY for an `active` row (its current token), or a `rotation_grace`
+ * row where the current token OR the not-yet-expired previous token matched.
+ * revoked / recovery_pending / legacy_bootstrap → null. `graceExpiry` (epoch
+ * ms, or null) bounds the cache TTL for a previous-token match.
+ */
+function decideActiveGrace(
+  row: AgentRecord,
+  matched: "current" | "previous",
+): { capabilities: string[]; graceExpiry: number | null } | null {
+  const state = (row.auth_state ?? "active") as AuthStateInput;
+  if (state !== "active" && state !== "rotation_grace") return null;
+  let caps: string[];
+  try {
+    caps = JSON.parse(row.capabilities) as string[];
+  } catch {
+    caps = [];
+  }
+  if (matched === "current") {
+    // The current token authenticates in both `active` and `rotation_grace`.
+    return { capabilities: caps, graceExpiry: null };
+  }
+  // The previous token authenticates ONLY inside a non-expired grace window.
+  if (state === "rotation_grace") {
+    const expiry = row.rotation_grace_expires_at ? new Date(row.rotation_grace_expires_at).getTime() : 0;
+    const expired = expiry > 0 && Date.now() >= expiry;
+    if (!expired) return { capabilities: caps, graceExpiry: expiry > 0 ? expiry : null };
+  }
+  return null;
+}
+
+/** Absolute cache deadline: now+TTL, capped at a rotation-grace expiry when present. */
+function authCacheExpiry(now: number, graceExpiry: number | null): number {
+  const ttlDeadline = now + authCacheTtlMs();
+  return graceExpiry !== null ? Math.min(ttlDeadline, graceExpiry) : ttlDeadline;
+}
+
+/**
+ * ADR-0003 lazy self-heal — populate the matched lookup-digest column for a row
+ * the O(N) fallback matched (a legacy NULL-digest row, or a keyring-rotation
+ * straggler whose digest was computed under the old key). Bumps the auth
+ * generation (Q6 decision (a): the drift guard stays exception-free; the write
+ * does not change token validity but a bump is harmless + self-terminating).
+ * No-op when the column already holds the correct digest.
+ */
+function selfHealTokenLookup(
+  row: AgentRecord,
+  column: "token_lookup" | "previous_token_lookup",
+  digest: string,
+): void {
+  const existing = column === "token_lookup" ? row.token_lookup : row.previous_token_lookup;
+  if (existing === digest) return;
+  try {
+    if (column === "token_lookup") {
+      getDb().prepare("UPDATE agents SET token_lookup = ? WHERE name = ?").run(digest, row.name);
+    } else {
+      getDb().prepare("UPDATE agents SET previous_token_lookup = ? WHERE name = ?").run(digest, row.name);
+    }
+    bumpAuthGeneration();
+  } catch (err) {
+    log.warn(
+      `[token-lookup] self-heal failed for "${row.name}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * v2.20.1 SHARED verified-token cache GET — used by BOTH auth paths so they
+ * read + invalidate IDENTICALLY (anti-divergence is the security argument, per
+ * Victra's Q2 gate). `requireName`: on the explicit-caller path, only honor a
+ * hit whose cached identity equals the CLAIMED caller — a valid token for X
+ * must NEVER authenticate a claim to be Y (the impersonation gate). `null`
+ * (token-only path) accepts any cached name. The generation + TTL are enforced
+ * inside authCacheGet.
+ */
+function verifiedTokenCacheGet(
+  digest: string,
+  gen: number,
+  now: number,
+  requireName: string | null,
+): { name: string; capabilities: string[] } | null {
+  const c = authCacheGet(digest, gen, now);
+  if (!c) return null;
+  if (requireName !== null && c.name !== requireName) return null;
+  return c;
+}
+
+/**
+ * v2.20.1 SHARED store-or-heal after a bcrypt-verified POSITIVE verdict — used
+ * by BOTH auth paths. `indexed` true (the digest is already stored — a locator
+ * hit, or the row's column already equals the digest) → cache the verdict.
+ * `indexed` false (fallback / not-yet-indexed row) → lazily self-heal the
+ * digest column (which bumps the generation) and SKIP caching this call — the
+ * next call caches under the fresh generation. Only positive active/grace
+ * verdicts ever reach here, so revoked/recovery/legacy are never cached.
+ */
+function verifiedTokenCachePut(
+  digest: string,
+  gen: number,
+  now: number,
+  indexed: boolean,
+  row: AgentRecord,
+  matchedColumn: "token_lookup" | "previous_token_lookup",
+  name: string,
+  capabilities: string[],
+  graceExpiry: number | null,
+): void {
+  // ADR-0005: this funnel runs ONLY on a verified-token cache MISS (a fresh
+  // bcrypt verify) — so it is exactly "the agent just proved it holds a valid
+  // token." Stamp the first-auth marker (no-op after the first, via WHERE
+  // first_authed_at IS NULL). Cache HITS return before reaching here, so the
+  // 2.20.1 hot path is untouched. This is the security keystone: any agent that
+  // has authed ≥1x has a non-NULL first_authed_at → it self-excludes from
+  // abandon_registration (the sole orphan-deletion path; the auto-GC was cut
+  // by final ruling — see the comment above REAPABLE_ORPHAN_WHERE).
+  markAgentAuthenticated(name);
+  if (indexed) {
+    authCacheSet(digest, { name, capabilities }, gen, authCacheExpiry(now, graceExpiry));
+  } else {
+    selfHealTokenLookup(row, matchedColumn, digest);
+  }
+}
+
+/**
+ * ADR-0005 lifecycle refinement — THE reap-invariant stamp. Called the first time
+ * a row becomes a legitimate IDENTITY via ANY establishment path (a successful
+ * token auth OR recovery completion; a future SSO/pairing flow would call it too).
+ * Sets `established_at` (idempotent, WHERE established_at IS NULL) + retires the
+ * orphan handle. Does NOT bump the auth generation — establishment is not a
+ * token-validity change (outside the auth-gen guard's scope).
+ *
+ * The reap invariant (REAPABLE_ORPHAN_WHERE) keys on `established_at`, NOT
+ * first_authed_at: recovery + spawn establish a real identity WITHOUT a token
+ * auth, and anchoring reapability to token-auth alone reintroduced deletion risk
+ * (codex #115 recovery + spawn blockers). HONEST CEILING: there is NO single
+ * write-chokepoint — this is called at N sites, so it is call-site discipline.
+ * tests/v2-22-0-establishment-invariant.test.ts is a MANUALLY ENUMERATED checklist
+ * that proves every LISTED path stamps; it does NOT auto-discover an unlisted
+ * path (a new establishment path is silently absent until its case is added).
+ */
+export function markEstablished(name: string): void {
+  getDb()
+    .prepare(
+      "UPDATE agents SET established_at = ?, registration_recovery_hash = NULL, registration_recovery_expires_at = NULL " +
+        "WHERE name = ? AND established_at IS NULL",
+    )
+    .run(now(), name);
+}
+
+/**
+ * ADR-0005 — a successful TOKEN auth. Stamps first_authed_at (the forensic,
+ * literal "first TOKEN auth" marker; idempotent) AND establishes the identity
+ * via markEstablished (which carries the reap invariant + handle retirement).
+ */
+export function markAgentAuthenticated(name: string): void {
+  getDb()
+    .prepare("UPDATE agents SET first_authed_at = ? WHERE name = ? AND first_authed_at IS NULL")
+    .run(now(), name);
+  markEstablished(name);
+}
+
+/** ADR-0005 — orphan TTL (handle expiry + GC threshold). Default 30min (> any legit register→first-auth gap). Env: RELAY_ORPHAN_TTL_MINUTES. */
+const ORPHAN_TTL_DEFAULT_MINUTES = 30;
+function orphanTtlMs(): number {
+  const raw = process.env.RELAY_ORPHAN_TTL_MINUTES;
+  const n = raw !== undefined && raw !== "" ? Number(raw) : ORPHAN_TTL_DEFAULT_MINUTES;
+  return (Number.isFinite(n) && n > 0 ? n : ORPHAN_TTL_DEFAULT_MINUTES) * 60_000;
+}
+
+/**
+ * ADR-0005 — THE reapability invariant, defined ONCE. A row is a reapable orphan
+ * ONLY when it has NEVER become a legitimate identity (`established_at IS NULL` —
+ * no token auth AND no recovery completion) AND has no live session (`session_id
+ * IS NULL`). The sole deletion path — abandon_registration — deletes THROUGH
+ * `deleteReapableOrphan`, so it cannot silently omit a predicate: the
+ * safe-by-construction guarantee is physical, not a WHERE clause the call site
+ * restates from memory. (codex #115 blockers a+b were two independent omissions
+ * of this exact shape; the recovery blocker moved the invariant from the
+ * token-auth proxy first_authed_at onto the establishment marker established_at.)
+ *
+ * NOTE the invariant is an AUTHORIZATION CHECK, not an abandonment detector:
+ * it can prove a row is safe to delete when a principal ASKS (never
+ * established + no session ⇒ deleting cannot break a working identity), but
+ * it cannot prove the row is abandoned — that predicate is undecidable from
+ * row state, which is why the automatic GC was cut (see the ruling below).
+ */
+const REAPABLE_ORPHAN_WHERE = "established_at IS NULL AND session_id IS NULL";
+
+/**
+ * The ONLY sanctioned way to delete an agent row on the orphan-cleanup path,
+ * and abandon_registration is its ONLY caller — an agent-row deletion always
+ * traces back to a principal proving a one-time handle and asking.
+ * Carries the canonical predicate + re-asserts it in the DELETE WHERE (TOCTOU:
+ * a row that authenticates or acquires a session between check and delete is
+ * left intact). Deleting an agent invalidates its token, so it bumps the auth
+ * generation. Returns whether a row was removed.
+ */
+function deleteReapableOrphan(db: CompatDatabase, name: string): boolean {
+  const r = db.prepare(`DELETE FROM agents WHERE name = ? AND ${REAPABLE_ORPHAN_WHERE}`).run(name);
+  // v2.23.x #140 — an orphan-reap DELETE ends the name's liveness identity, so
+  // evict both probe caches unconditionally: a stale entry must not outlive the
+  // binding it described and mislabel a re-used name.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+  if (r.changes > 0) {
+    db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
+    bumpAuthGeneration();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * ADR-0005 — self-serve abandon of the caller's OWN botched (orphaned)
+ * registration, WITHOUT the destructive operator endpoint. SAFE BY
+ * CONSTRUCTION via the keystone invariant: it deletes ONLY a row that has NEVER
+ * authenticated (`first_authed_at IS NULL`) — a working agent (authed ≥1x)
+ * self-excludes and can NEVER be reached, handle or not. The name-scoped,
+ * one-time, TTL'd handle is the AUTHORIZATION (proves the caller is the
+ * registrant + covers the just-registered-not-yet-authed race). The keystone is
+ * RE-ASSERTED in the DELETE WHERE so a concurrent auth between the read and the
+ * delete cannot let us remove a now-authed row (TOCTOU-safe).
+ */
+export function abandonRegistration(name: string, handle: string): { abandoned: boolean; reason?: string } {
+  const db = getDb();
+  const row = db
+    .prepare(
+      "SELECT established_at, session_id, registration_recovery_hash, registration_recovery_expires_at FROM agents WHERE name = ?",
+    )
+    .get(name) as
+    | {
+        established_at: string | null;
+        session_id: string | null;
+        registration_recovery_hash: string | null;
+        registration_recovery_expires_at: string | null;
+      }
+    | undefined;
+  if (!row) return { abandoned: false, reason: "no such registration" };
+  // Reject a NON-ORPHAN — an ESTABLISHED identity (token auth OR recovery) OR a
+  // live session — BEFORE any bcrypt work. Abandon is ONLY for a never-established,
+  // session-less registration; these two guards mirror the two halves of
+  // REAPABLE_ORPHAN_WHERE that the shared DELETE then re-asserts (codex #115
+  // blocker b: the DELETE was missing the session_id half).
+  if (row.established_at !== null) {
+    return { abandoned: false, reason: "agent has an established identity — not an orphan. Use unregister_agent with its token." };
+  }
+  if (row.session_id !== null) {
+    return { abandoned: false, reason: "agent has a live session — not an orphan. Use unregister_agent with its token." };
+  }
+  if (!row.registration_recovery_hash) return { abandoned: false, reason: "no active registration-recovery handle for this name" };
+  if (
+    row.registration_recovery_expires_at &&
+    Date.now() >= new Date(row.registration_recovery_expires_at).getTime()
+  ) {
+    return { abandoned: false, reason: "registration-recovery handle expired. The row persists harmlessly; reclaim the name via register (fresh) or `relay recover`." };
+  }
+  if (!verifyToken(handle, row.registration_recovery_hash)) {
+    return { abandoned: false, reason: "invalid registration-recovery handle" };
+  }
+  // Delete THROUGH the shared helper — re-asserts BOTH predicates in the WHERE,
+  // closing the TOCTOU race (a concurrent auth OR session-acquire leaves it intact).
+  if (deleteReapableOrphan(db, name)) {
+    return { abandoned: true };
+  }
+  return { abandoned: false, reason: "agent authenticated or acquired a session concurrently — not abandoned" };
+}
+
+// ADR-0005 FINAL RULING (Maxime, 2026-07-23) — there is NO automatic orphan GC,
+// and one must not be reintroduced. Abandonment is UNDECIDABLE from row state:
+// a slow-spawned child, an idle recovered agent, and a genuinely abandoned
+// registration are byte-identical in the data. Five audit rounds each found a
+// different legitimate identity being reaped (force re-registration, live-
+// session abandon, credential recovery, spawn provisioning, operator CLI token
+// rotation) — every fix was correct and the bug simply relocated, because the
+// predicate itself cannot be decided by observation. THE RULE: do not attach an
+// irreversible action to a predicate that cannot be decided by observation.
+// Un-abandoned rows persist harmlessly: they are session-less, never
+// established, and the name stays reclaimable via unregister_agent or
+// `relay recover`. The only deletion on this path is abandon_registration —
+// a principal proving a one-time handle and ASKING. Regression:
+// tests/v2-22-0-no-auto-gc.test.ts proves the GC is gone, not disabled.
+
+/**
+ * ADR-0003 — O(1) token-only caller resolution (server.ts resolveCallerByToken).
+ *
+ * Path: shared verified-token cache → shared indexed locator
+ * (findAgentRowByToken) → active/grace decision → shared store-or-heal. On a
+ * locator MISS the shared fallback still finds the row; we then lazily self-heal
+ * the digest (which bumps the generation) and skip caching this call.
+ *
+ * v2.20.1: refactored onto the SAME verifiedTokenCacheGet/Put helpers the
+ * explicit-caller path uses — one cache layer, one invalidation. bcrypt stays
+ * the sole verifier (the digest only narrows candidates; the cache replays an
+ * already-verified, still-current verdict).
+ */
+export function resolveAgentByToken(token: string): { name: string; capabilities: string[] } | null {
+  const digest = computeTokenLookup(token);
+  const gen = getAuthGeneration();
+  const now = Date.now();
+
+  const cached = verifiedTokenCacheGet(digest, gen, now, null); // token-only: any name
+  if (cached) return cached;
+
+  const found = findAgentRowByToken(token);
+  if (!found) return null;
+  const decision = decideActiveGrace(found.row, found.matched);
+  if (!decision) return null; // revoked / recovery / legacy / expired-grace-previous → not a caller
+
+  verifiedTokenCachePut(
+    digest,
+    gen,
+    now,
+    found.fromLocator,
+    found.row,
+    found.matched === "current" ? "token_lookup" : "previous_token_lookup",
+    found.row.name,
+    decision.capabilities,
+    decision.graceExpiry,
+  );
+  return { name: found.row.name, capabilities: decision.capabilities };
+}
+
+/**
+ * v2.20.1 — verified-token cache GET for the EXPLICIT-CALLER auth path
+ * (server.ts enforceAuth: send_message.from, get_messages.agent_name, …).
+ * Impersonation-gated: returns a cached verdict ONLY when it belongs to
+ * `claimedName`. On a hit the caller skips its per-call bcrypt; on null the
+ * caller runs the full authenticateAgent flow (preserving all
+ * revoked/recovery/grace/legacy semantics), then calls explicitCallerCachePut.
+ */
+export function explicitCallerCacheGet(
+  token: string,
+  claimedName: string,
+): { name: string; capabilities: string[] } | null {
+  const digest = computeTokenLookup(token);
+  const gen = getAuthGeneration();
+  const now = Date.now();
+  return verifiedTokenCacheGet(digest, gen, now, claimedName);
+}
+
+/**
+ * v2.20.1 — store the explicit-caller path's bcrypt-verified verdict + lazily
+ * self-heal `claimedRow`'s lookup digest (Q1: every agent makes explicit-path
+ * calls, so this deterministically migrates the whole fleet to O(1) and closes
+ * the NULL-digest observation). Call ONLY after authenticateAgent returned ok
+ * (and not legacy). For an `active` row the current token matched (no extra
+ * bcrypt); only a rotation_grace row needs a one-row re-check to tell the
+ * current token from the grace-window previous token (for the correct TTL cap).
+ */
+export function explicitCallerCachePut(
+  token: string,
+  claimedRow: AgentRecord,
+  capabilities: string[],
+): void {
+  const digest = computeTokenLookup(token);
+  const gen = getAuthGeneration();
+  const now = Date.now();
+
+  let matchedColumn: "token_lookup" | "previous_token_lookup" = "token_lookup";
+  let graceExpiry: number | null = null;
+  if ((claimedRow.auth_state ?? "active") === "rotation_grace") {
+    const m = matchTokenAgainstRows(token, [claimedRow]);
+    if (m && m.matched === "previous") {
+      matchedColumn = "previous_token_lookup";
+      const e = claimedRow.rotation_grace_expires_at
+        ? new Date(claimedRow.rotation_grace_expires_at).getTime()
+        : 0;
+      graceExpiry = e > 0 ? e : null;
+    }
+  }
+  const stored =
+    matchedColumn === "token_lookup" ? claimedRow.token_lookup : claimedRow.previous_token_lookup;
+  verifiedTokenCachePut(
+    digest,
+    gen,
+    now,
+    stored === digest, // indexed?
+    claimedRow,
+    matchedColumn,
+    claimedRow.name,
+    capabilities,
+    graceExpiry,
+  );
+}
+
 export function purgeOldRecords(db: CompatDatabase): void {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -1573,6 +2276,10 @@ export function purgeOldRecords(db: CompatDatabase): void {
   db.prepare("DELETE FROM messages WHERE created_at < ?").run(sevenDaysAgo);
   db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'rejected', 'cancelled') AND updated_at < ?").run(thirtyDaysAgo);
   db.prepare("DELETE FROM webhook_delivery_log WHERE attempted_at < ?").run(sevenDaysAgo);
+  // ADR-0005 final ruling: NO automatic orphan GC here — deliberately. Agent
+  // rows are identities, not records with a retention window; abandonment is
+  // undecidable from row state, so nothing on this tick may delete one. See
+  // the ruling comment above abandonRegistration's invariant block.
   // v2.7 / Tether Phase 3 — outbox cleanup. Match the messages purge
   // window by default (7 days). Configurable via RELAY_OUTBOX_RETENTION_DAYS
   // for operators who want a longer audit trail; set to 0 to disable.
@@ -1591,20 +2298,20 @@ export function purgeOldRecords(db: CompatDatabase): void {
   purgeOldAuditLog(getAuditLogRetentionDays());
   // v2.0: purge old channel messages (same 7-day window as direct messages)
   db.prepare("DELETE FROM channel_messages WHERE created_at < ?").run(sevenDaysAgo);
-  // v2.0 final (#2): purge dead agents (offline >30 days) and their
-  // normalized capability rows. Hard kill + never re-registered = dead.
-  const staleAgents = db.prepare(
-    "SELECT name FROM agents WHERE last_seen < ?"
-  ).all(thirtyDaysAgo) as Array<{ name: string }>;
-  for (const a of staleAgents) {
-    // v2.14.0 — reserved names are NEVER auto-purged. Their row + token_hash IS
-    // their impersonation protection (re-register / send-from requires the
-    // token); purging would delete the row and reopen the bootstrap-claim
-    // window on the freed name. Operators prune reserved rows explicitly.
-    if (isReservedName(a.name)) continue;
-    // v2.1 Phase 7q: sanctioned teardown helper.
-    teardownAgent(a.name, "stale_purge");
-  }
+  // ADR-0005 final ruling, applied to the LAST autonomous row deleter: the
+  // v2.0 30-day dead-agent purge (last_seen < 30d → teardownAgent) is CUT.
+  // "Idle for 30 days" is the same undecidable abandonment proxy the orphan
+  // GC guessed on — and this one deleted ESTABLISHED identities. Worse, the
+  // v2.14.0 reserved-name exemption documented the security cost precisely:
+  // purging a row frees its name and reopens the bootstrap-claim window —
+  // which was true for EVERY name, not just reserved ones. An idle-40-days
+  // agent's identity could be squatted the moment the purge freed it.
+  // Dead rows persist harmlessly (liveness derivation already renders them
+  // offline/unknown); operators prune deliberately via `relay purge-agents`
+  // (dry-run by default, --apply + audit) — a principal asking.
+  // This tick deletes MESSAGES, TASKS, LOGS, EVENTS — records with retention
+  // windows. It deletes no agent row, ever. tests/v2-22-0-no-auto-gc.test.ts
+  // holds that line for both the created_at and last_seen axes.
 }
 
 /**
@@ -1816,20 +2523,20 @@ export function checkAndRecordRateLimit(
 /**
  * v2.1 Phase 7q — sanctioned teardown of an agent row.
  *
- * Owns the DELETE paths that are NOT session_id-scoped: `relay recover`
- * (operator-initiated forensic wipe of a stuck registration) and the
- * 30-day dead-agent purge inside `purgeOldRecords`. Each runs a single
- * transaction that removes the `agents` row AND its `agent_capabilities`
- * sidecar — consistent with the existing two-DELETE idiom those sites
- * already used inline.
+ * Owns the DELETE paths that are NOT session_id-scoped. Sole remaining
+ * caller: `relay recover` (operator-initiated forensic wipe of a stuck
+ * registration). The 30-day dead-agent purge that also called this was
+ * CUT under the ADR-0005 final ruling (see purgeOldRecords) — it was the
+ * last autonomous agent-row deletion, and "idle 30 days" is an
+ * undecidable abandonment proxy. Runs a single transaction that removes
+ * the `agents` row AND its `agent_capabilities` sidecar.
  *
  * NO CAS. DELETE is idempotent by design: a missing row returns
  * changes=0, which is not an error in any caller's contract. The
  * session_id-scoped CAS DELETE is deliberately NOT folded here — that
  * path (`unregisterAgent`) protects against stale-SIGINT races which
- * teardownAgent callers by definition are not subject to (recover CLI
- * is operator-invoked; purge runs over rows that have been offline
- * >30 days, so there is no live session to race with).
+ * teardownAgent's caller by definition is not subject to (recover CLI
+ * is operator-invoked).
  *
  * `reason` is telemetry-only in v2.1.0 — future cascade side-effects
  * (e.g. audit-log entry per teardown, fire `agent.torn_down` webhook)
@@ -1838,7 +2545,7 @@ export function checkAndRecordRateLimit(
  */
 export function teardownAgent(
   name: string,
-  reason: "unregister" | "recover" | "stale_purge"
+  reason: "unregister" | "recover"
 ): void {
   const db = getDb();
   // Keep `reason` referenced so TS doesn't strip it — future cascade ops land here.
@@ -1848,6 +2555,13 @@ export function teardownAgent(
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
   });
   tx();
+  // v2.23.x #140 — a teardown DELETE ends the name's liveness identity, so evict
+  // both probe caches unconditionally (same rationale as unregisterAgent): a
+  // stale NEGATIVE entry left on this sibling delete path would suppress an
+  // argv-scan alive signal after the name re-registers.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+  bumpAuthGeneration(); // ADR-0003: agent row removed → any cached verdict invalid
 }
 
 /**
@@ -1879,6 +2593,12 @@ export function applyAuthStateTransition(
   updates: {
     token_hash?: string | null;
     previous_token_hash?: string | null;
+    // ADR-0003 (schema v20): callers that change token_hash / previous_token_hash
+    // MUST pass the mirroring lookup digest(s) so the O(1) locator index stays
+    // consistent (e.g. sweepExpiredRotationGrace nulls previous_token_lookup
+    // alongside previous_token_hash).
+    token_lookup?: string | null;
+    previous_token_lookup?: string | null;
     rotation_grace_expires_at?: string | null;
     recovery_token_hash?: string | null;
     revoked_at?: string | null;
@@ -1902,6 +2622,9 @@ export function applyAuthStateTransition(
   }
   const sql = `UPDATE agents SET ${setCols.join(", ")} WHERE ${whereClause}`;
   const r = db.prepare(sql).run(...setVals, ...whereVals);
+  // ADR-0003: any successful auth-state transition can change a token's
+  // validity → invalidate the verified-token cache.
+  if (r.changes === 1) bumpAuthGeneration();
   return { changed: r.changes === 1 };
 }
 
@@ -1972,7 +2695,13 @@ export function setAgentLivenessAnchor(
       "UPDATE agents SET agent_pid = ?, agent_pid_start = ?, host_id = COALESCE(host_id, ?) WHERE name = ?",
     )
     .run(pid, startedAt, ownHost, name);
-  if (r.changes > 0) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
+  // left _negativeProbeCache intact on r.changes===0, where a concurrent write may
+  // already have moved the session/anchor — so a stale NEGATIVE entry labelled the
+  // now-fresh live row `dead` until the TTL. Bracing preserves the harm;
+  // unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return r.changes > 0;
 }
 
@@ -2021,7 +2750,69 @@ export function markAgentOffline(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(name, expectedSessionId);
-  if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x: invalidate BOTH probe caches UNCONDITIONALLY. The old unbraced `if`
+  // left _negativeProbeCache intact on r.changes===0 (a CAS loser) — where a
+  // concurrent rebind already moved the session/anchor — so a stale NEGATIVE entry
+  // labelled the now-fresh live row `dead` until the TTL. Bracing preserves the
+  // harm; unconditional fixes it (≤ one extra probe; matches releaseAgentBinding).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+  return { changed: r.changes === 1 };
+}
+
+/**
+ * ADR-0012 (Fork B) — non-destructive BINDING RELEASE.
+ *
+ * The dead-anchor diagnostic (hooks/check-relay.sh) detects a STALE BINDING — a
+ * fast resummon left a dead terminal's `host_shell_pids` + a dead `agent_pid`
+ * anchor, so Tether can't wake the agent ("no bound terminal") — and REFUSES to
+ * auto-recover (Fork B ships no automatic takeover). It names THIS as the exact
+ * operator remedy.
+ *
+ * Clears EXACTLY the binding — `session_id` + the Tether terminal chain
+ * (`host_shell_pids`) + the same-host liveness anchor (`agent_pid` /
+ * `agent_pid_start` / `last_alive`) — and PRESERVES the IDENTITY: `token_hash`,
+ * `auth_state`, `name`, `capabilities`, `host_id`, `description`, `last_seen`. So
+ * the next SessionStart takes the register path (`session_id IS NULL` → the 120s
+ * LIVE-gate reads STALE) and re-binds with a fresh chain — WITHOUT freeing the
+ * name, invalidating the token, or resetting the immutable capabilities. Those
+ * three hazards are exactly why `relay recover` (a destructive DELETE) was
+ * REJECTED as the remedy; see ADR-0012 amended.
+ *
+ * CAS ON THE OBSERVED BINDING (codex #136 P1 — the TOCTOU this arc exists to
+ * kill, at the recovery layer). The caller probed liveness on a row it READ; the
+ * release must prove "the row I am writing is the row I looked at." Without it,
+ * a legitimate fresh rebind landing between the probe and the write (a new
+ * terminal wins `register(force, expected_session_id=<observed>)` → rotates
+ * session_id + overwrites the anchor) gets its LIVE binding cleared and the
+ * command reports SUCCESS — stranding a healthy terminal unwakeable, the exact
+ * outcome the liveness gate was added to prevent. So the UPDATE is predicated on
+ * the full observed binding identity: `session_id` AND `agent_pid` AND
+ * `agent_pid_start`, all `IS`-compared (null-safe) against what the caller read.
+ * changes=0 means the binding moved under us → the caller REFUSES (re-read, not
+ * released) — the same shape as a `FORCE_PRECONDITION_FAILED` loser, deliberately.
+ *
+ * SAFETY BOUNDARY: this helper enforces the write-race guard but trusts its
+ * caller for the LIVENESS decision. The gate that refuses to release a LIVE
+ * binding (which would strand a healthy idle agent unwakeable — the
+ * self-inflicted silent-mute this arc exists to kill) lives in the `relay
+ * release-binding` CLI (src/cli/release-binding.ts), which calls this ONLY after
+ * `anchorLivenessVerdict` reads OBSERVED-DEAD (or an explicit `--override`). Do
+ * NOT wire a new caller to this helper without that gate.
+ */
+export function releaseAgentBinding(
+  name: string,
+  expected: { session_id: string | null; agent_pid: number | null; agent_pid_start: string | null }
+): { changed: boolean } {
+  const db = getDb();
+  const r = db.prepare(
+    "UPDATE agents SET session_id = NULL, host_shell_pids = NULL, agent_pid = NULL, " +
+    "agent_pid_start = NULL, last_alive = NULL, agent_status = 'offline', busy_expires_at = NULL " +
+    "WHERE name = ? AND session_id IS ? AND agent_pid IS ? AND agent_pid_start IS ?"
+  ).run(name, expected.session_id, expected.agent_pid, expected.agent_pid_start);
+  // Any anchor/session change invalidates BOTH cached probe verdicts → re-probe.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2057,31 +2848,38 @@ export function closeAgentSession(
   signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null = null,
 ): { changed: boolean } {
   const db = getDb();
-  // Conditional UPDATE so non-signal callers preserve the legacy
-  // behavior: signal_received_at + signal_kind stay NULL unless this
-  // call carries one. Two SQL forms are cheaper to maintain than a
-  // dynamic builder + safer than a single COALESCE form that could
-  // smuggle a NULL through and clear an already-set signal stamp.
+  // Conditional UPDATE so non-signal callers preserve the legacy behavior:
+  // signal_received_at + signal_kind stay NULL unless this call carries one. Two
+  // SQL forms are cheaper to maintain than a dynamic builder + safer than a
+  // single COALESCE form that could smuggle a NULL through and clear an
+  // already-set signal stamp.
   // v2.13.0 — clear the liveness anchor (last_alive + agent_pid + start) in the
-  // SAME CAS as the close so a same-host probe can't restamp last_alive and
-  // mask the close. Applies to both SQL forms.
+  // SAME CAS as the close so a same-host probe can't restamp last_alive and mask
+  // the close. Applies to both SQL forms.
+  let r: { changes: number };
   if (signalKind === null) {
-    const r = db.prepare(
+    r = db.prepare(
       "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
       "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
       "WHERE name = ? AND session_id = ?"
     ).run(name, expectedSessionId);
-    if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
-    return { changed: r.changes === 1 };
+  } else {
+    const nowMs = Date.now();
+    r = db.prepare(
+      "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
+      "signal_received_at = ?, signal_kind = ?, " +
+      "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
+      "WHERE name = ? AND session_id = ?"
+    ).run(nowMs, signalKind, name, expectedSessionId);
   }
-  const nowMs = Date.now();
-  const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'closed', busy_expires_at = NULL, " +
-    "signal_received_at = ?, signal_kind = ?, " +
-    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
-    "WHERE name = ? AND session_id = ?"
-  ).run(nowMs, signalKind, name, expectedSessionId);
-  if (r.changes === 1) _negativeProbeCache.delete(name); _positiveProbeCache.delete(name); // v2.15.0: any anchor/session change invalidates BOTH cached verdicts → force a re-probe
+  // v2.23.x #140 — SINGLE unconditional dual eviction covering BOTH SQL forms,
+  // hoisted to the common tail (the prior per-branch null-branch eviction was
+  // nested one level down, so it was easy to miss that it ran on only one path).
+  // On a CAS loser (r.changes===0 — a concurrent rebind moved the session/anchor)
+  // a stale NEGATIVE entry must not survive to label the now-fresh live row
+  // `dead`. Bracing preserves the harm; unconditional fixes it (≤ one extra probe).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2132,10 +2930,16 @@ export function endAgentSessionOnSignal(
     "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
     "WHERE name = ? AND session_id = ?"
   ).run(nowMs, signalKind, name, expectedSessionId);
-  if (r.changes === 1) {
-    _negativeProbeCache.delete(name);
-    _positiveProbeCache.delete(name);
-  }
+  // v2.23.x #140 — the FIFTH site, and the one four reviewers missed because it
+  // was BRACED (looked correct). Same defect as the four unbraced ones: on a CAS
+  // loser (r.changes===0 — a concurrent rebind already moved the session/anchor)
+  // the guarded `if` left a stale NEGATIVE entry intact, so the fresh live row
+  // read `dead`, or its argv-scan alive signal was SUPPRESSED (computeLiveness-
+  // Verdict returns at the negative-cache hit before reaching the argv probe),
+  // until the ~5s TTL. UNCONDITIONAL dual eviction — a CAS loser must not retain
+  // a verdict about a binding it failed to mutate (≤ one extra probe).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   return { changed: r.changes === 1 };
 }
 
@@ -2205,6 +3009,9 @@ export function expandAgentCapabilities(
     }
   });
   tx();
+  // ADR-0003: resolveAgentByToken returns capabilities, so a cached verdict
+  // would carry stale authz — invalidate on a caps change.
+  bumpAuthGeneration();
   return { added, current: unionCaps };
 }
 
@@ -2260,6 +3067,7 @@ export function mintAgentToken(
   const plaintext_token = generateToken();
   const token_hash = hashToken(plaintext_token);
 
+  let created: boolean;
   if (!existing) {
     const id = uuidv4();
     const session_id = uuidv4();
@@ -2267,9 +3075,9 @@ export function mintAgentToken(
     const capsJson = JSON.stringify(capabilities);
     const tx = db.transaction(() => {
       db.prepare(
-        "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed, terminal_title_ref) " +
-          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', 0, NULL)"
-      ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description);
+        "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', 0, NULL)"
+      ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description);
       const insertCap = db.prepare(
         "INSERT OR IGNORE INTO agent_capabilities (agent_name, capability) VALUES (?, ?)"
       );
@@ -2278,50 +3086,57 @@ export function mintAgentToken(
       }
     });
     tx();
-
-    const fresh = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
-    return {
-      agent: toAgentWithStatus(fresh),
-      plaintext_token,
-      created: true,
-    };
-  }
-
-  if (!options.force) {
-    throw new Error(
-      `Agent "${name}" already exists. Pass --force to mint a new token (rotates + invalidates the existing token, clears session, sets status=offline).`
-    );
-  }
-
-  // Force-rotate: token-only. Caps + role preserved (immutability + safety).
-  // Description is preserved when not supplied; if explicitly supplied (even
-  // null) the caller is updating it. CLI doesn't expose --description on the
-  // rotate path in v2.6.0 to keep the surface tight; future-add via this hook.
-  const newDescription =
-    options.description !== undefined ? options.description : existing.description ?? null;
-  const tx = db.transaction(() => {
-    const r = db.prepare(
-      "UPDATE agents SET last_seen = ?, token_hash = ?, session_id = NULL, " +
-        "agent_status = 'offline', auth_state = 'active', " +
-        "previous_token_hash = NULL, rotation_grace_expires_at = NULL, " +
-        "recovery_token_hash = NULL, revoked_at = NULL, " +
-        "description = ? " +
-        "WHERE name = ?"
-    ).run(timestamp, token_hash, newDescription, name);
-    if (r.changes !== 1) {
+    bumpAuthGeneration(); // ADR-0003: new token_hash + token_lookup written
+    created = true;
+  } else {
+    if (!options.force) {
       throw new Error(
-        `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
+        `Agent "${name}" already exists. Pass --force to mint a new token (rotates + invalidates the existing token, clears session, sets status=offline).`
       );
     }
-  });
-  tx();
+    // Force-rotate: token-only. Caps + role preserved (immutability + safety).
+    // Description is preserved when not supplied; if explicitly supplied (even
+    // null) the caller is updating it. CLI doesn't expose --description on the
+    // rotate path in v2.6.0 to keep the surface tight; future-add via this hook.
+    const newDescription =
+      options.description !== undefined ? options.description : existing.description ?? null;
+    const tx = db.transaction(() => {
+      const r = db.prepare(
+        "UPDATE agents SET last_seen = ?, token_hash = ?, token_lookup = ?, session_id = NULL, " +
+          "agent_status = 'offline', auth_state = 'active', " +
+          "previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL, " +
+          "recovery_token_hash = NULL, revoked_at = NULL, " +
+          "description = ? " +
+          "WHERE name = ?"
+      ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name);
+      if (r.changes !== 1) {
+        throw new Error(
+          `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
+        );
+      }
+    });
+    tx();
+    bumpAuthGeneration(); // ADR-0003: token rotated (new token_hash/token_lookup, old invalidated)
+    created = false;
+  }
 
-  const updated = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
-  return {
-    agent: toAgentWithStatus(updated),
-    plaintext_token,
-    created: false,
-  };
+  // v2.23.x #140 — mint CREATES (first-mint INSERT) or REPLACES (force-rotate
+  // clears session_id) the name's liveness identity, so evict both probe caches
+  // unconditionally. Found during #140 by sweeping for identity writers by
+  // behaviour rather than syntax — mint is neither one of the five teardown sites
+  // nor register/unregister, yet it resets the same identity the caches key on.
+  // (Throw paths above bypass this: a non-force collision or a changes!==1 rotate
+  // mutated nothing, so there is no fresh binding whose cache could be stale.)
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+
+  // PR C v2 — register the persisted token AFTER both success branches committed
+  // (the non-force collision and changes!==1 throw paths above return early), so
+  // a failed mint never plants a throwaway. See registerPersistedSecret.
+  registerPersistedSecret(name, plaintext_token);
+
+  const row = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord;
+  return { agent: toAgentWithStatus(row), plaintext_token, created };
 }
 
 /**
@@ -2350,6 +3165,10 @@ export function registerAgent(
   options: {
     description?: string;
     managed?: boolean;
+    /** Which agent-CLI this row registered through (validated against the profile registry; unknown → NULL = UNKNOWN, never a default). Enables the server-side verdict-absence check. */
+    cli_profile?: string | null;
+    /** ADR-0002: self-declared coordination class. Set on FIRST register only; a re-register silently preserves the original (immutable, like managed/capabilities). Validated against AGENT_CLASSES at the handler (Zod). */
+    class?: string;
     /** v2.2.0: window title for the dashboard click-to-focus driver. Mutable on re-register. */
     terminal_title_ref?: string | null;
     /**
@@ -2376,8 +3195,19 @@ export function registerAgent(
     host_shell_pids?: number[];
     /** Tether v0.3 PID-handshake: OS machine GUID. v2.11.0 GAP 1: session-refreshable on an authenticated re-register (provided→overwrite, omitted→preserve), mirroring host_shell_pids. Captured on first registration; the token-holder may refresh it on relaunch (e.g. to populate an empty host_id or after a machine move). */
     host_id?: string;
+    /**
+     * ADR-0012 — CAS precondition for a force TAKEOVER. When provided (including
+     * an explicit `null` = "expect an offline row"), the re-register UPDATE gains
+     * `AND session_id IS ?`, so the write lands ONLY if the row's session_id
+     * still equals this value. changes==0 with a session mismatch → the takeover
+     * LOST the race → ForcePreconditionError (distinct from the auth-race
+     * ConcurrentUpdateError). `undefined` = no session CAS (a normal re-register).
+     * The handler (handleRegisterAgent) REQUIRES this whenever force=true — there
+     * is no unconditional-force bypass left at the MCP surface.
+     */
+    expected_session_id?: string | null;
   } = {}
-): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[] } {
+): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[]; registration_recovery: string | null } {
   const db = getDb();
   const timestamp = now();
   const capsJson = JSON.stringify(capabilities);
@@ -2391,6 +3221,8 @@ export function registerAgent(
 
   let agentWithStatus: AgentWithStatus;
   let plaintext_token: string | null = null;
+  // ADR-0005: one-time registration-recovery handle — set ONLY on first register.
+  let registration_recovery: string | null = null;
 
   if (existing) {
     // v2.0.1 (Codex MEDIUM 5): warn when we're about to overwrite an ONLINE
@@ -2497,7 +3329,14 @@ export function registerAgent(
     // or the next valid registration after a force token rotation) comes back
     // available instead of staying stuck offline. Active states are preserved.
     const newAgentStatus = statusAfterReregister(existing.agent_status);
-    const r = db.prepare(
+    // ADR-0012 — force TAKEOVER compare-and-swap. When the caller supplies
+    // expected_session_id (the handler REQUIRES it whenever force=true), the
+    // re-register lands ONLY if the row's session_id still equals it → exactly
+    // one of two racing relaunches wins; the loser matches 0 rows and is mapped
+    // to ForcePreconditionError (distinct from the auth-race ConcurrentUpdate).
+    // `undefined` = no session CAS (a normal, non-force re-register).
+    const applySessionCas = options.expected_session_id !== undefined;
+    const reregisterSql =
       // v2.15.2 — CLEAR signal_received_at / signal_kind in the SAME statement
       // that rotates session_id / session_started_at, so a signal stamp from a
       // PRIOR session can't outlive it and drive deriveDashboardState to
@@ -2505,21 +3344,57 @@ export function registerAgent(
       // stays 'unknown', so the dashboard's liveness gate alone would still
       // read the stale stamp as closed). The stamp is session-scoped;
       // long-term forensics live in audit_log (stdio.session_ended_on_signal).
-      "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, session_id = ?, session_started_at = ?, description = ?, " +
+      "UPDATE agents SET role = ?, last_seen = ?, token_hash = ?, token_lookup = ?, session_id = ?, session_started_at = ?, description = ?, " +
       "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, agent_status = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ?, " +
-      "signal_received_at = NULL, signal_kind = NULL " +
-      "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?"
-    ).run(
-      role, timestamp, newHash, session_id, timestamp, newDescription,
+      "signal_received_at = NULL, signal_kind = NULL, server_version = ?, " +
+      "cli_profile = COALESCE(?, cli_profile) " +
+      "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?" +
+      (applySessionCas ? " AND session_id IS ?" : "");
+    const r = db.prepare(reregisterSql).run(
+      role, timestamp, newHash,
+      // ADR-0003: rotate the lookup digest only when a NEW token was issued;
+      // an unchanged token keeps its existing digest.
+      plaintext_token !== null ? computeTokenLookup(plaintext_token) : existing.token_lookup ?? null,
+      session_id, timestamp, newDescription,
       newTitleRef, newHostShellPids, newHostId, newAgentStatus,
       newAuthState, newRecoveryHash, newRevokedAt,
-      name, existingState, existing.token_hash, casRecoveryHash
+      VERSION,
+      // COALESCE: a re-register that does not know its profile must not ERASE a
+      // profile an earlier register established.
+      normalizeCliProfile(options.cli_profile),
+      name, existingState, existing.token_hash, casRecoveryHash,
+      ...(applySessionCas ? [options.expected_session_id ?? null] : [])
     );
     if (r.changes !== 1) {
+      if (applySessionCas) {
+        // ADR-0012 — disambiguate a LOST TAKEOVER (session_id moved off the
+        // expected value — another relaunch won, or the row went live) from a
+        // concurrent auth race. Best-effort re-read: the row may churn again,
+        // but the caller re-reads regardless; this only picks the right code.
+        const cur = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(name) as
+          | { session_id: string | null }
+          | undefined;
+        const expected = options.expected_session_id ?? null;
+        if (!cur || cur.session_id !== expected) {
+          throw new ForcePreconditionError(name, expected, cur?.session_id ?? null);
+        }
+      }
       throw new ConcurrentUpdateError(
         `register_agent failed for "${name}": auth_state / token_hash / recovery_token_hash changed since we read it (concurrent rotate_token / revoke_token / unregister_agent / recovery reissue). Re-auth and retry.`
       );
+    }
+    bumpAuthGeneration(); // ADR-0003: re-register can change token/auth_state validity
+    if (existingState === "recovery_pending") {
+      // ADR-0005 (codex #115 recovery blocker): recovery completion is an
+      // identity-ESTABLISHMENT event — the agent proved authorization via the
+      // operator's recovery_token (enforceAuth verified it; the CAS above pins
+      // it). Stamp established_at HERE, at the state transition that actually
+      // completes recovery, so the orphan-GC can never reap the recovered row
+      // once its session ends. (Recovery is NOT a token auth, so first_authed_at
+      // is intentionally left NULL until the agent authenticates with its new
+      // token — the two markers stay honest.)
+      markEstablished(name);
     }
 
     agentWithStatus = toAgentWithStatus({
@@ -2541,6 +3416,13 @@ export function registerAgent(
     // First registration — always generate a token.
     plaintext_token = generateToken();
     const token_hash = hashToken(plaintext_token);
+    // ADR-0005: issue a one-time, name-scoped registration-recovery HANDLE so
+    // the registrant can abandon its OWN botched registration (lost token)
+    // without the destructive operator endpoint. Stored bcrypt-hashed with a
+    // short TTL; retired on first successful auth (markAgentAuthenticated).
+    registration_recovery = generateToken();
+    const regRecoveryHash = hashToken(registration_recovery);
+    const regRecoveryExpiresAt = new Date(Date.now() + orphanTtlMs()).toISOString();
     const id = uuidv4();
     const description = options.description ?? null;
     // v2.1 Phase 4b.2: managed flag captured at first registration + immutable
@@ -2559,8 +3441,11 @@ export function registerAgent(
       // v2.1.6: session_started_at = timestamp for first-register anchor.
       // v2.2.0: terminal_title_ref captured on first register (may be null).
       // schema v16: host_shell_pids (JSON) + host_id captured on first register.
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId);
+      // ADR-0002: `class` captured on FIRST register (NULL if undeclared →
+      // read as 'unclassified'). A re-register never writes it (immutable).
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id, class, server_version, cli_profile, registration_recovery_hash, registration_recovery_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId, options.class ?? null, VERSION, normalizeCliProfile(options.cli_profile), regRecoveryHash, regRecoveryExpiresAt);
+    bumpAuthGeneration(); // ADR-0003: fresh token_hash + token_lookup written
 
     // v2.0: populate normalized agent_capabilities table.
     const insertCap = db.prepare("INSERT OR IGNORE INTO agent_capabilities (agent_name, capability) VALUES (?, ?)");
@@ -2581,8 +3466,27 @@ export function registerAgent(
       agent_status: "idle", // v2.1.3 (I6)
       managed,
       terminal_title_ref: titleRef,
+      // ADR-0002 (codex #114 blocker): the INSERT above persists the declared
+      // class, but this in-memory row is projected straight to the FIRST
+      // register_agent response — omitting it made toAgentWithStatus read
+      // row.class===undefined → normalizeAgentClass → 'unclassified'. Mirror the
+      // persisted value so the initial response matches the row + next read.
+      class: options.class ?? null,
     });
   }
+
+  // v2.23.x #140 — registration CREATES (first INSERT) or REPLACES (re-register
+  // rotates session_id) the name's liveness identity, so evict both probe caches
+  // unconditionally on the success path. Concrete harm
+  // prevented: a crashed terminal left a dead-anchor NEGATIVE entry; the relaunch
+  // re-registers HERE before its hook restamps the anchor — without this evict the
+  // stale negative would SUPPRESS the argv-scan alive signal (computeLiveness-
+  // Verdict returns at the negative-cache hit before the argv probe) for the ~5s
+  // TTL. setAgentLivenessAnchor also evicts when the fresh anchor lands, but that
+  // can trail the register, so close the window here too. (CAS-loser register
+  // paths throw above → no identity change → nothing stale to clear.)
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
 
   // v2.0 beta.1 (Codex HIGH 4): auto-assign queued tasks at the DB layer so
   // every caller of registerAgent (tool handler, future hooks, direct scripts)
@@ -2590,7 +3494,13 @@ export function registerAgent(
   // the returned list — circular-import-safe.
   const auto_assigned = tryAssignQueuedTasksTo(agentWithStatus.name, agentWithStatus.capabilities);
 
-  return { agent: agentWithStatus, plaintext_token, auto_assigned };
+  // PR C v2 — register the persisted secrets AFTER the CAS/INSERT committed (the
+  // ForcePrecondition / ConcurrentUpdate throw paths above return early). Both
+  // branches converge here: re-register sets plaintext_token (null when the token
+  // was preserved → skipped), first-registration sets both token + recovery.
+  // Never before commit; a failed re-register plants no throwaway.
+  registerPersistedSecret(name, plaintext_token, registration_recovery);
+  return { agent: agentWithStatus, plaintext_token, auto_assigned, registration_recovery };
 }
 
 /** Fetch an agent's auth record (includes token_hash) by name. */
@@ -2654,22 +3564,30 @@ export function rotateAgentToken(
       // Hard-cut — no grace column, skip straight to active with new hash.
       const r = db
         .prepare(
-          "UPDATE agents SET token_hash = ? WHERE name = ? AND token_hash = ? AND auth_state = 'active' AND managed = 1"
+          "UPDATE agents SET token_hash = ?, token_lookup = ?, previous_token_lookup = NULL " +
+            "WHERE name = ? AND token_hash = ? AND auth_state = 'active' AND managed = 1"
         )
-        .run(newHash, name, expectedOldHash);
+        .run(newHash, computeTokenLookup(newPlaintextToken), name, expectedOldHash);
       if (r.changes !== 1) {
         throw new ConcurrentUpdateError(
           `rotate_token failed for "${name}": state or hash changed mid-flight. Re-auth and retry.`
         );
       }
+      bumpAuthGeneration(); // ADR-0003: token rotated (hard-cut)
+      registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
       return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt: null };
     }
 
+    // ADR-0003: mirror previous_token_hash = token_hash with
+    // previous_token_lookup = token_lookup so the OLD token stays O(1)-findable
+    // during the grace window.
     const r = db
       .prepare(
         `UPDATE agents SET
            token_hash = ?,
+           token_lookup = ?,
            previous_token_hash = token_hash,
+           previous_token_lookup = token_lookup,
            auth_state = 'rotation_grace',
            rotation_grace_expires_at = ?
          WHERE name = ?
@@ -2677,26 +3595,31 @@ export function rotateAgentToken(
            AND token_hash = ?
            AND managed = 1`
       )
-      .run(newHash, graceExpiresAt, name, expectedOldHash);
+      .run(newHash, computeTokenLookup(newPlaintextToken), graceExpiresAt, name, expectedOldHash);
     if (r.changes !== 1) {
       throw new ConcurrentUpdateError(
         `rotate_token failed for "${name}": state or hash changed mid-flight (concurrent rotate / revoke / unregister). Re-auth and retry.`
       );
     }
+    bumpAuthGeneration(); // ADR-0003: token rotated (grace)
+    registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
     return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt };
   }
 
   // Unmanaged path — straight swap, no grace, no push.
   const r = db
     .prepare(
-      "UPDATE agents SET token_hash = ? WHERE name = ? AND token_hash = ? AND auth_state = 'active' AND managed = 0"
+      "UPDATE agents SET token_hash = ?, token_lookup = ?, previous_token_lookup = NULL " +
+        "WHERE name = ? AND token_hash = ? AND auth_state = 'active' AND managed = 0"
     )
-    .run(newHash, name, expectedOldHash);
+    .run(newHash, computeTokenLookup(newPlaintextToken), name, expectedOldHash);
   if (r.changes !== 1) {
     throw new ConcurrentUpdateError(
       `rotate_token failed for "${name}": token_hash or auth_state changed since we read it (concurrent rotate_token / revoke_token / unregister_agent). Re-auth and retry.`
     );
   }
+  bumpAuthGeneration(); // ADR-0003: token rotated (unmanaged)
+  registerPersistedSecret(name, newPlaintextToken); // PR C v2 — persisted, post-commit
   return { newPlaintextToken, newHash, agentClass: "unmanaged", graceExpiresAt: null };
 }
 
@@ -2734,14 +3657,17 @@ export function rotateAgentTokenAdmin(
     if (graceSec === 0) {
       const r = db
         .prepare(
-          "UPDATE agents SET token_hash = ? WHERE name = ? AND auth_state = 'active' AND managed = 1"
+          "UPDATE agents SET token_hash = ?, token_lookup = ?, previous_token_lookup = NULL " +
+            "WHERE name = ? AND auth_state = 'active' AND managed = 1"
         )
-        .run(newHash, targetName);
+        .run(newHash, computeTokenLookup(newPlaintextToken), targetName);
       if (r.changes !== 1) {
         throw new ConcurrentUpdateError(
           `rotate_token_admin failed for "${targetName}": target state changed mid-flight.`
         );
       }
+      bumpAuthGeneration(); // ADR-0003: admin token rotated (hard-cut)
+      registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
       return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt: null };
     }
 
@@ -2749,32 +3675,39 @@ export function rotateAgentTokenAdmin(
       .prepare(
         `UPDATE agents SET
            token_hash = ?,
+           token_lookup = ?,
            previous_token_hash = token_hash,
+           previous_token_lookup = token_lookup,
            auth_state = 'rotation_grace',
            rotation_grace_expires_at = ?
          WHERE name = ?
            AND auth_state = 'active'
            AND managed = 1`
       )
-      .run(newHash, graceExpiresAt, targetName);
+      .run(newHash, computeTokenLookup(newPlaintextToken), graceExpiresAt, targetName);
     if (r.changes !== 1) {
       throw new ConcurrentUpdateError(
         `rotate_token_admin failed for "${targetName}": target state changed mid-flight.`
       );
     }
+    bumpAuthGeneration(); // ADR-0003: admin token rotated (grace)
+    registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
     return { newPlaintextToken, newHash, agentClass: "managed", graceExpiresAt };
   }
 
   const r = db
     .prepare(
-      "UPDATE agents SET token_hash = ? WHERE name = ? AND auth_state = 'active' AND managed = 0"
+      "UPDATE agents SET token_hash = ?, token_lookup = ?, previous_token_lookup = NULL " +
+        "WHERE name = ? AND auth_state = 'active' AND managed = 0"
     )
-    .run(newHash, targetName);
+    .run(newHash, computeTokenLookup(newPlaintextToken), targetName);
   if (r.changes !== 1) {
     throw new ConcurrentUpdateError(
       `rotate_token_admin failed for "${targetName}": target state changed mid-flight.`
     );
   }
+  bumpAuthGeneration(); // ADR-0003: admin token rotated (unmanaged)
+  registerPersistedSecret(targetName, newPlaintextToken); // PR C v2 — persisted, post-commit
   return { newPlaintextToken, newHash, agentClass: "unmanaged", graceExpiresAt: null };
 }
 
@@ -2807,10 +3740,11 @@ export function sweepExpiredRotationGrace(): number {
       "active",
       {
         previous_token_hash: null,
+        previous_token_lookup: null, // ADR-0003: old token dies at grace expiry
         rotation_grace_expires_at: null,
       }
     );
-    if (r.changed) swept++;
+    if (r.changed) swept++; // applyAuthStateTransition bumps the auth generation on change
   }
   return swept;
 }
@@ -2859,9 +3793,18 @@ export function revokeAgentToken(
   const r = db.prepare(
     "UPDATE agents " +
     "SET auth_state = ?, revoked_at = ?, recovery_token_hash = ?, " +
-    "    previous_token_hash = NULL, rotation_grace_expires_at = NULL " +
+    "    previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL " +
     "WHERE name = ? AND auth_state IN ('active','legacy_bootstrap','recovery_pending','rotation_grace')"
   ).run(newState, revokedAt, recoveryHash, targetName);
+  // ADR-0003: revoke keeps token_hash for forensics, so the token still
+  // bcrypt-matches — only auth_state makes it invalid. The cache keys validity
+  // on generation, so we MUST bump here or a revoked token would keep passing
+  // from cache. (The revoke-trap.)
+  if (r.changes > 0) bumpAuthGeneration();
+  // PR C v2 — register the recovery token only if it was actually PERSISTED (the
+  // CAS updated a row AND a recovery token was issued). A no-op revoke on an
+  // already-revoked row (changes===0) persisted no secret → nothing to register.
+  if (r.changes > 0 && recoveryToken) registerPersistedSecret(targetName, recoveryToken);
 
   return {
     revoked: r.changes > 0,
@@ -2906,7 +3849,7 @@ export function getAgentAuthData(name: string): AgentRecord | null {
  * quiet, recently dispatched) from `waiting` (just idle), so adding
  * roles widens the `stale` surface.
  */
-export const DISPATCH_RELEVANT_ROLES: ReadonlySet<string> = new Set([
+export const DISPATCH_RELEVANT_ROLES: ReadonlySet<string> = new Set([ // AGENT-CLASS-ALLOWLIST: this is the ROLE axis (dashboard dispatch), not the class taxonomy — 'builder'/'auditor' overlap lexically only; per ADR-0002 the three axes (role/class/capability) are orthogonal and role vocabs stay as-is.
   "builder",
   "auditor",
   "researcher",
@@ -3002,6 +3945,10 @@ export function getDashboardAgentSnapshots(
          (SELECT COUNT(*) FROM messages m
            WHERE m.to_agent = a.name
              AND m.status = 'pending'
+             -- status alone is NOT a proxy for unresolved: resolve_messages
+             -- stamps resolved_at and deliberately leaves status alone, so
+             -- resolved mail stayed counted here. See getInboxSummary.
+             AND m.resolved_at IS NULL
              AND m.created_at < ?) AS pending_count_old
        FROM agents a`,
     )
@@ -3048,11 +3995,20 @@ export function unregisterAgent(name: string, expectedSessionId?: string): boole
   } else {
     result = db.prepare("DELETE FROM agents WHERE name = ?").run(name);
   }
+  // v2.23.x #140 — deleting a row ENDS the name's liveness identity, so evict
+  // both probe caches unconditionally. This is not a false-`dead` source (a
+  // re-registered name has no anchor yet → computeLivenessVerdict returns
+  // `unknown`, never `dead`), but a stale NEGATIVE entry would SUPPRESS the
+  // argv-scan alive signal during the brief unanchored interval after a
+  // re-register (the negative-cache hit returns before the argv probe runs).
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
   // Only clean up normalized capabilities when the agent row actually went
   // away — important for the session_id-scoped case where we might not have
   // deleted anything.
   if (result.changes > 0) {
     db.prepare("DELETE FROM agent_capabilities WHERE agent_name = ?").run(name);
+    bumpAuthGeneration(); // ADR-0003: agent row removed → any cached verdict invalid
   }
   return result.changes > 0;
 }
@@ -3261,6 +4217,13 @@ export function _getLivenessProbeCountForTests(): number {
   return _livenessProbeCount;
 }
 
+/** Test-only: seed the in-memory positive-probe cache, so `last_alive`
+ *  (positiveConfirmationISO) can be driven to CHANGE between reads without a
+ *  live process on a real ~5s probe cycle. Mirrors the reset/count hooks. */
+export function _setPositiveProbeForTests(name: string, atMs: number): void {
+  _positiveProbeCache.set(name, atMs);
+}
+
 /** v2.15.0 — the three-way presence verdict. `unknown` = no positive AND no
  *  negative signal (agent_pid absent, or cross-host so we can't probe) — it is
  *  the honest "we don't know", NEVER treated as death. */
@@ -3281,24 +4244,54 @@ export function computeLivenessVerdict(row: {
   host_id?: string | null;
   agent_pid?: number | null;
   agent_pid_start?: string | null;
+  host_shell_pids?: string | null;
 }): LivenessVerdict {
-  if (typeof row.agent_pid !== "number" || row.agent_pid <= 0) return "unknown"; // no anchor
+  // Host-scope FIRST (was AFTER the agent_pid gate — the bug: a missing agent_pid
+  // short-circuited to `unknown` before we could try the other host-local
+  // signals). A daemon can only PID-probe agents on its OWN host; cross-host /
+  // no-GUID → unknown (federation boundary, parked; never guessed dead).
   const ownHost = getOwnHostId();
-  if (!ownHost || !row.host_id || row.host_id !== ownHost) return "unknown"; // cross-host / can't host-scope
+  if (!ownHost || !row.host_id || row.host_id !== ownHost) return "unknown";
+
+  const hasAnchor = typeof row.agent_pid === "number" && row.agent_pid > 0;
   const nowMs = Date.now();
+
+  // Cache. Positive = confirmed alive. Negative = "probed, NOT alive"; its
+  // verdict depends on whether an anchor existed: an anchored pid that is gone →
+  // dead (a crash); no anchor + no live signal → unknown (never guess dead).
   const aliveAt = _positiveProbeCache.get(row.name);
   if (aliveAt !== undefined && nowMs - aliveAt < LIVENESS_PROBE_CACHE_MS) return "alive";
-  const deadAt = _negativeProbeCache.get(row.name);
-  if (deadAt !== undefined && nowMs - deadAt < LIVENESS_PROBE_CACHE_MS) return "dead";
+  const notAliveAt = _negativeProbeCache.get(row.name);
+  if (notAliveAt !== undefined && nowMs - notAliveAt < LIVENESS_PROBE_CACHE_MS) {
+    return hasAnchor ? "dead" : "unknown";
+  }
+
+  // Cascade — ALIVE-only signals, strongest/cheapest first; ANY hit → alive.
+  //   1. the agent's OWN pid (start-time-matched — no PID-reuse false-alive);
+  //   2. argv scan: a live process advertising RELAY_AGENT_NAME="<name>" — this
+  //      identifies the agent's OWN process by its name marker (the codex-5-5
+  //      case: no agent_pid, but the process carries the name in argv).
+  //
+  // DELIBERATELY NOT host_shell_pids (Victra's spec step 2): the v2.13.0 contract
+  // (tests/v2-13-0-presence-liveness.test.ts §3) proves a live shell ANCESTOR must
+  // NOT keep a dead agent alive — host_shell_pids is the Tether ancestry chain
+  // (terminal → shell → agent → …) and the terminal/shell OUTLIVE the agent, so
+  // "any host_shell_pid alive" false-reads a crashed-agent-in-an-open-terminal as
+  // alive. The argv scan gets the same fix (codex-5-5) via the agent's OWN
+  // process, without that false-alive. (Flagged to Victra — deviation from spec.)
   _livenessProbeCount++;
-  if (isAgentProcessAlive(row.agent_pid, row.agent_pid_start ?? null)) {
+  const alive =
+    (hasAnchor && isAgentProcessAlive(row.agent_pid as number, row.agent_pid_start ?? null)) ||
+    agentProcessAdvertised(row.name);
+
+  if (alive) {
     _positiveProbeCache.set(row.name, nowMs);
     _negativeProbeCache.delete(row.name);
     return "alive";
   }
   _negativeProbeCache.set(row.name, nowMs);
   _positiveProbeCache.delete(row.name);
-  return "dead";
+  return hasAnchor ? "dead" : "unknown";
 }
 
 /** The ISO timestamp of the last positive confirmation for `name`, for the
@@ -3323,6 +4316,47 @@ export function getAgents(role?: string): AgentWithStatus[] {
   // v2.15.0 — compute the liveness verdict PURELY (in-memory probe + caches,
   // zero DB writes) and derive status from it. No read-path mutation.
   return rows.map((row) => toAgentWithStatus(row, computeLivenessVerdict(row)));
+}
+
+/**
+ * ADR-0002 — the live team "who's-who" grouped by coordination class, for
+ * discover_agents view='topology'. TWO independent exclusions (per the gate):
+ *   1. dead/terminal (LIVENESS): status === 'offline' (the dead verdict) is dropped.
+ *   2. hidden CLASSES: `transient` (alive-but-ephemeral) + `unclassified` (no
+ *      declared posture) are dropped from the who's-who.
+ * Everything else is grouped FLAT within its class {name, role, class, status}.
+ * Groups are seeded in TOPOLOGY_VISIBLE_CLASSES order; excluded counts are
+ * reported (no silent truncation). Read-only.
+ */
+export function buildAgentTopology(): {
+  view: "topology";
+  topology: Record<string, Array<{ name: string; role: string; class: string; status: string }>>;
+  counts: Record<string, number>;
+  excluded: { offline: number; transient: number; unclassified: number };
+  total_shown: number;
+} {
+  const topology: Record<string, Array<{ name: string; role: string; class: string; status: string }>> = {};
+  for (const c of TOPOLOGY_VISIBLE_CLASSES) topology[c] = [];
+  const excluded = { offline: 0, transient: 0, unclassified: 0 };
+  let total_shown = 0;
+
+  for (const a of getAgents()) {
+    if (a.status === "offline") {
+      excluded.offline++; // dead/terminal — liveness exclusion
+      continue;
+    }
+    if (TOPOLOGY_HIDDEN_CLASSES.has(a.class)) {
+      if (a.class === TRANSIENT) excluded.transient++;
+      else excluded.unclassified++;
+      continue;
+    }
+    (topology[a.class] ??= []).push({ name: a.name, role: a.role, class: a.class, status: a.status });
+    total_shown++;
+  }
+
+  const counts: Record<string, number> = {};
+  for (const c of Object.keys(topology)) counts[c] = topology[c].length;
+  return { view: "topology", topology, counts, excluded, total_shown };
 }
 
 /**
@@ -3357,7 +4391,7 @@ export function getInboxSummary(): Array<{
       // NOT miscounted as unread — SQL NULL IS NULL evaluates true, which
       // would inflate unread_count by 1 per mail-less agent.
       `SELECT a.name AS agent_name,
-              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.status = 'pending' AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS pending_count,
               COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.seq IS NULL        THEN 1 ELSE 0 END), 0) AS unread_count,
               MAX(m.created_at) AS last_message_at
          FROM agents a
@@ -3467,15 +4501,14 @@ export function sendMessage(
   });
   tx();
 
-  // v2.3.0 Part C.4 — touch the filesystem marker for the recipient so
-  // ambient-wake clients watching the marker path get a low-latency
-  // wake signal. Off by default (RELAY_FILESYSTEM_MARKERS=1 to enable).
-  // Never throws — pure hint.
-  try {
-    touchMarker(to);
-  } catch {
-    /* marker is best-effort */
-  }
+  // MARKER WRITE DELIBERATELY REMOVED — see src/outbox-tail.ts writeWakeMarker().
+  // This used to call touchMarker(to) in-process. That silently produced two
+  // behaviours from one call site: `touchMarker` gates on
+  // RELAY_FILESYSTEM_MARKERS read from the EXECUTING process, which the daemon
+  // sets and a stdio MCP server does not. Identical code, identical mailbox,
+  // and only the daemon-side send ever woke the recipient. The outbox tail now
+  // owns marker writes as the single component that observes every commit
+  // cross-process. Do NOT reintroduce a marker write here.
 
   // v2.5.0 Tether Phase 1 — Part S — MCP subscription fan-out for
   // relay://inbox/<to>. Emit AFTER the SQL commit + marker touch so
@@ -4049,6 +5082,13 @@ export function deleteAgentIfAbandoned(name: string, cutoffIso: string): boolean
   const r = db
     .prepare("DELETE FROM agents WHERE name = ? AND last_seen < ?")
     .run(name, cutoffIso);
+  // v2.23.x #140 — a purge DELETE ends the name's liveness identity; evict both
+  // probe caches unconditionally, applied uniformly to every delete-of-identity
+  // path. A row this stale (last_seen past the cutoff) has no live ~5s cache entry
+  // in practice; the eviction is harmless there and keeps the treatment uniform.
+  _negativeProbeCache.delete(name);
+  _positiveProbeCache.delete(name);
+  if (r.changes > 0) bumpAuthGeneration(); // ADR-0003: agent row removed
   return r.changes > 0;
 }
 
@@ -4478,6 +5518,33 @@ export class ConcurrentUpdateError extends Error {
 }
 
 /**
+ * ADR-0012 — thrown by `registerAgent` when a force TAKEOVER loses its
+ * compare-and-swap: the caller passed `expected_session_id` (the session_id it
+ * READ from the row) but the row's session_id no longer equals it — another
+ * relaunch won the takeover, or the row went live between the caller's read and
+ * this write. There is exactly ONE winner by construction; every other racer
+ * lands here. The handler maps this to FORCE_PRECONDITION_FAILED; the caller
+ * MUST re-read (its LIVE gate then skips) and surface LOUDLY — never retry-force,
+ * never come up mute (silence-as-failure). This is the concurrency guarantee
+ * that replaces the old unconditional force bypass (codex-5-5's #131 TOCTOU).
+ */
+export class ForcePreconditionError extends Error {
+  public readonly expectedSessionId: string | null;
+  public readonly actualSessionId: string | null;
+  constructor(name: string, expectedSessionId: string | null, actualSessionId: string | null) {
+    super(
+      `Force takeover of "${name}" lost the compare-and-swap: expected session_id=${expectedSessionId ?? "NULL"} ` +
+      `but the row is now session_id=${actualSessionId ?? "NULL"}. Another live session holds this name ` +
+      `(a concurrent relaunch won, or the row went live). Re-read — do NOT retry force. If this is a genuine ` +
+      `duplicate relaunch, scope the name (distinct RELAY_AGENT_NAME) rather than racing the mailbox drain.`
+    );
+    this.name = "ForcePreconditionError";
+    this.expectedSessionId = expectedSessionId;
+    this.actualSessionId = actualSessionId;
+  }
+}
+
+/**
  * v2.1.3 — thrown by sendMessage (and any future sender-originating write)
  * when the named sender row does not exist at write time. Surfaces the
  * silent-UPDATE path the predecessor session hit during the post-recover
@@ -4745,8 +5812,28 @@ export function postTaskAuto(
     const bindArgs: (string | number)[] = [...requiredCapabilities];
     if (!allowSelfAssign) bindArgs.push(from);
     bindArgs.push(requiredCapabilities.length);
+    // v2.24 (audit HIGH #2) — ROUTE ONLY TO A LIVE AGENT. Previously the
+    // candidate set was capability-only, so a registered-but-closed agent (its
+    // terminal gone, session dropped) stayed a candidate and — with load 0 —
+    // sorted AHEAD of live busy agents, so post_task_auto handed work to a
+    // corpse that never accepted and was never requeued: a silent black hole,
+    // while the caller got routed=true.
+    //
+    // SINGLE PREDICATE (codex HIGH #2 P1 / ADR-0015 L4): both the router here and
+    // the operator surface (`routable`/`routability` on the agent row) call the
+    // SAME isAgentRoutable() — ONE implementation, so they cannot disagree. The
+    // SQL deliberately NO LONGER duplicates the session/status filter: a
+    // case-sensitive SQL `NOT IN` let a persisted 'OFFLINE' route while the
+    // display normalized it to 'offline' — `routable` disagreeing with its own
+    // neighbour in the same row. The registry is tens of rows, so we fetch the
+    // capability matches (with the columns isAgentRoutable needs) and filter in
+    // JS. Deliberately NOT computeLivenessVerdict — that is the argv/PID
+    // *presence* probe (a display signal that reads a dropped-session live
+    // process as "alive"); a task is delivered THROUGH the session, so
+    // session-holding is the authorization answer. No routable candidate → the
+    // queued path below (routed:false), healed by tryAssignQueuedTasksTo later.
     const candidates = db.prepare(
-      `SELECT a.name, a.last_seen,
+      `SELECT a.name, a.last_seen, a.session_id, a.agent_status,
               (SELECT COUNT(*) FROM tasks t
                  WHERE t.to_agent = a.name AND t.status IN ('posted','accepted')) AS load
          FROM agents a
@@ -4754,12 +5841,15 @@ export function postTaskAuto(
         WHERE ac.capability IN (${placeholders})${excludeSenderClause}
         GROUP BY a.name
        HAVING COUNT(DISTINCT ac.capability) = ?
-        ORDER BY load ASC, a.last_seen DESC
-        LIMIT 10`
-    ).all(...bindArgs) as Array<{ name: string; last_seen: string; load: number }>;
+        ORDER BY load ASC, a.last_seen DESC`
+    ).all(...bindArgs) as Array<{
+      name: string; last_seen: string; session_id: string | null; agent_status: string | null; load: number;
+    }>;
+    // The ONE routability predicate — identical to the operator surface's.
+    const routableCandidates = candidates.filter((c) => isAgentRoutable(c));
 
-    if (candidates.length === 0) {
-      log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] candidates=0 → queued`);
+    if (routableCandidates.length === 0) {
+      log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] routable=0/${candidates.length} → queued`);
       db.prepare(
         "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, NULL, ?, ?, ?, 'queued', NULL, ?, ?, ?)"
       ).run(id, from, title, encDescription, priority, timestamp, timestamp, capsJson);
@@ -4775,8 +5865,8 @@ export function postTaskAuto(
       };
     }
 
-    const pick = candidates[0];
-    log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] candidates=${candidates.length} picked=${pick.name} (load=${pick.load})`);
+    const pick = routableCandidates[0];
+    log.debug(`[route] post_task_auto from=${from} caps=[${requiredCapabilities.join(",")}] routable=${routableCandidates.length}/${candidates.length} picked=${pick.name} (load=${pick.load})`);
     db.prepare(
       "INSERT INTO tasks (id, from_agent, to_agent, title, description, priority, status, result, created_at, updated_at, required_capabilities) VALUES (?, ?, ?, ?, ?, ?, 'posted', NULL, ?, ?, ?)"
     ).run(id, from, pick.name, title, encDescription, priority, timestamp, timestamp, capsJson);
@@ -4793,7 +5883,7 @@ export function postTaskAuto(
       },
       routed: true,
       assigned_to: pick.name,
-      candidate_count: candidates.length,
+      candidate_count: routableCandidates.length,
     };
   });
 
@@ -4878,6 +5968,12 @@ export interface HealthReassignment {
   triggered_by: string;
   from_agent: string;
   required_capabilities: string[] | null;
+  /** Why the task was requeued — 'lease-expired' (an accepted task whose
+   *  assignee stopped renewing its lease) or 'assignee-gone-before-accept' (a
+   *  task routed to an agent whose session dropped before it accepted — audit
+   *  HIGH #2). Lets callers/webhooks distinguish a normal lease timeout from a
+   *  route to a vanished agent. */
+  reason: "lease-expired" | "assignee-gone-before-accept";
 }
 
 /**
@@ -4908,6 +6004,75 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
   //   (c) assignee is NOT in busy/away with an unexpired TTL
   // busy_expires_at < now → shield has lapsed, agent is no longer protected.
   const nowIsoForStatus = now();
+  const scanLimit = Math.max(1, Math.min(500, parseInt(process.env.RELAY_HEALTH_SCAN_LIMIT || "50", 10)));
+  const requeued: HealthReassignment[] = [];
+
+  // ===== POSTED-BUT-NEVER-ACCEPTED ORPHANS (audit HIGH #2) — always runs =====
+  // postTaskAuto now routes only to a live-session agent, but an agent can drop
+  // its session in the window between 'posted' and 'accepted' (a VS Code reload,
+  // a crash). Such a task is status='posted' with lease_renewed_at NULL, so the
+  // accepted-lease scan below never matches it and it dead-ends forever.
+  // Requeue it to the pool — LOUDLY: routing to an agent that then vanished is
+  // an anomaly the operator must SEE, not a silent redirect (the black hole in
+  // a new guise). Same session predicate as the postTaskAuto candidate filter:
+  // assignee unregistered OR holding no session. A short grace lets a
+  // just-posted task be accepted / a brief reconnect recover before we step in.
+  const postedGraceSec = Math.max(1, parseInt(process.env.RELAY_POSTED_ORPHAN_GRACE_SECONDS || "120", 10));
+  const postedThreshold = new Date(Date.now() - postedGraceSec * 1000).toISOString();
+  const postedOrphans = db.prepare(
+    `SELECT t.id, t.to_agent, t.from_agent, t.required_capabilities
+       FROM tasks t
+      WHERE t.status = 'posted'
+        AND t.lease_renewed_at IS NULL
+        AND t.to_agent IS NOT NULL
+        AND t.updated_at < ?
+        AND (
+          t.to_agent NOT IN (SELECT name FROM agents)
+          OR t.to_agent IN (SELECT name FROM agents WHERE session_id IS NULL)
+        )
+      ORDER BY t.updated_at ASC
+      LIMIT ?`,
+  ).all(postedThreshold, scanLimit) as Array<{
+    id: string; to_agent: string; from_agent: string; required_capabilities: string | null;
+  }>;
+  if (postedOrphans.length > 0) {
+    // CAS re-checks status='posted' + lease NULL + assignee-still-gone, so an
+    // agent that accepted or reconnected between SELECT and UPDATE keeps its task.
+    const casRequeuePosted = db.prepare(
+      `UPDATE tasks SET to_agent = NULL, status = 'queued', updated_at = ?
+        WHERE id = ?
+          AND status = 'posted'
+          AND lease_renewed_at IS NULL
+          AND to_agent = ?
+          AND (
+            to_agent NOT IN (SELECT name FROM agents)
+            OR to_agent IN (SELECT name FROM agents WHERE session_id IS NULL)
+          )`,
+    );
+    for (const row of postedOrphans) {
+      const result = casRequeuePosted.run(now(), row.id, row.to_agent);
+      if (result.changes === 1) {
+        log.warn(
+          `[health] task ${row.id} was routed to "${row.to_agent}" which is gone (no live session) and never accepted it — requeued to the pool (triggered_by=${triggeredBy})`,
+        );
+        let reqCaps: string[] | null = null;
+        if (row.required_capabilities) {
+          try { reqCaps = JSON.parse(row.required_capabilities) as string[]; } catch { reqCaps = null; }
+        }
+        requeued.push({
+          task_id: row.id,
+          previous_agent: row.to_agent,
+          triggered_by: triggeredBy,
+          from_agent: row.from_agent,
+          required_capabilities: reqCaps,
+          reason: "assignee-gone-before-accept",
+        });
+      }
+      // changes===0 → agent accepted or reconnected between SELECT and UPDATE; correct to skip.
+    }
+  }
+
+  // ===== ACCEPTED-LEASE-EXPIRED scan (existing v2.0 / #26 path) =====
   const staleCount = db.prepare(
     `SELECT COUNT(*) AS c
        FROM tasks t
@@ -4932,9 +6097,8 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
           )
         )`
   ).get(threshold, threshold, nowIsoForStatus) as { c: number };
-  if (staleCount.c === 0) return [];
+  if (staleCount.c === 0) return requeued;
 
-  const scanLimit = parseInt(process.env.RELAY_HEALTH_SCAN_LIMIT || "50", 10);
   const stale = db.prepare(
     `SELECT t.id, t.to_agent, t.from_agent, t.lease_renewed_at, t.required_capabilities
        FROM tasks t
@@ -4960,11 +6124,10 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
         )
       ORDER BY t.lease_renewed_at ASC
       LIMIT ?`
-  ).all(threshold, threshold, nowIsoForStatus, Math.max(1, Math.min(500, scanLimit))) as Array<{
+  ).all(threshold, threshold, nowIsoForStatus, scanLimit) as Array<{
     id: string; to_agent: string; from_agent: string; lease_renewed_at: string; required_capabilities: string | null;
   }>;
 
-  const requeued: HealthReassignment[] = [];
   // CAS ensures we only requeue the exact row we inspected. Re-check agent
   // liveness AND agent_status/TTL inside the CAS as belt-and-suspenders — a
   // concurrent touchAgent can bump last_seen between SELECT and UPDATE, and
@@ -5010,6 +6173,7 @@ export function runHealthMonitorTick(triggeredBy: string): HealthReassignment[] 
         triggered_by: triggeredBy,
         from_agent: row.from_agent,
         required_capabilities: reqCaps,
+        reason: "lease-expired",
       });
     }
     // changes===0 means the assignee heartbeated between our SELECT and UPDATE — no requeue, correct outcome.

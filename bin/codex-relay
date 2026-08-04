@@ -1,0 +1,178 @@
+#!/bin/bash
+# bot-relay-mcp — Codex cold-start launcher (v2.16.x)
+#
+# THE GAP this closes: Codex runs its SessionStart hook's register_agent at the
+# FIRST TURN, not at pure idle launch. So a freshly-summoned, idle Codex has no
+# host_shell_pids registered until the user takes a turn → Tether can't PID-bind
+# it → the autowake "does nothing" until you talk to it.
+#
+# THE FIX (cause-independent): pre-register <agent-name>'s Tether v0.3 PID
+# handshake FROM THE SHELL, before exec'ing Codex. This process is a child of the
+# launching shell, so its ancestry (relay_pid_chain) INCLUDES the VS Code
+# Terminal.processId Tether reads — host_shell_pids is populated at pure launch,
+# Tether binds + wakes immediately, zero manual turn.
+#
+# HANDOFF (avoids the wrapper→hook double-register collision):
+#   - The launch register is NON-force. If a genuinely-live same-name session
+#     holds the name, it is correctly REJECTED (duplicate-session protection).
+#   - On success we capture the registered session_id and export it as
+#     RELAY_LAUNCH_SESSION. Codex's SessionStart hook (codex-session-start.sh)
+#     SKIPS its own register ONLY when that marker matches its row's current
+#     session_id (proof THIS launch registered THIS row) — never on DB-state
+#     alone. On any failure/timeout we exec WITHOUT the marker and the hook
+#     registers normally (fallback = today's first-turn behavior).
+#
+# agent_pid is deliberately NOT sent here: the contract requires the agent's OWN
+# Codex process (dies on agent exit), which only exists after exec. Codex's stdio
+# MCP server stamps the exact detected Codex process on startup
+# (src/transport/stdio.ts) — the universal capture point — so liveness is
+# handled without a semantically-wrong wrapper ancestor pid.
+#
+# Generalizes to ANY summoned Codex — the agent name is the first argument. Uses
+# the SAME shared helpers as the hooks (hooks/_vault-helpers.sh:
+# relay_pid_chain / relay_machine_guid) — one source, no drift.
+#
+# Usage (from a launch alias):
+#   codex-relay <agent-name> [extra codex args...]
+#
+# The register is BOUNDED-SYNC (tight deadline) and BEST-EFFORT: a down/slow
+# daemon, no token, or a live-collision is a no-op and Codex still launches
+# promptly. RELAY_CODEX_LAUNCHER overrides the launched binary.
+set -u
+
+# --- args + env (mirrors the hooks) -----------------------------------------
+AGENT_NAME="${1:-${RELAY_AGENT_NAME:-}}"
+[ "$#" -gt 0 ] && shift   # remaining args forward to codex
+
+AGENT_ROLE="${RELAY_AGENT_ROLE:-user}"
+AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
+HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
+HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HOOKS_DIR="$SCRIPT_DIR/../hooks"
+
+# Clear any INHERITED RELAY_LAUNCH_SESSION at entry (codex-5-5 PR#98 H1). A parent
+# process, a rapid relaunch, or an explicit env supply could otherwise leak a
+# stale / other-session marker straight through to the exec'd Codex. We re-export
+# it ONLY after THIS invocation's OWN successful register (bottom of file), so the
+# hook can never inherit a marker we did not just create — closing the accidental
+# inherited-marker corruption where a 2nd terminal's failed (collision) register
+# still let its hook skip against the live row.
+#
+# Threat-model note (local-trust, Option A): the marker is the row's session_id,
+# which unauthenticated discover_agents exposes. An ADVERSARIAL same-user process
+# could read + supply it directly (bypassing this wrapper) to forge a skip. That is
+# accepted under the relay's existing local-trust boundary — a same-user attacker
+# already reads the per-instance token vault (0600) and can fully act as the agent
+# via get_messages/send_message, so the marker adds no new exposure. See
+# docs/agents/codex-autowake.md.
+unset RELAY_LAUNCH_SESSION
+
+# Set by register_at_launch on success → exported to Codex as the handoff marker.
+RELAY_LAUNCH_SESSION_MARKER=""
+
+# --- bounded-sync launch register (never aborts / long-delays the launch) ----
+register_at_launch() {
+  # Same allowlists as the hooks. Any rejection → silent no-op.
+  [ -z "$AGENT_NAME" ] && return 0
+  echo "$AGENT_NAME" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$' || return 0
+  echo "$AGENT_ROLE" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$' || AGENT_ROLE="user"
+  echo "$HTTP_HOST"  | grep -Eq '^[A-Za-z0-9_.:-]{1,253}$' || return 0
+  echo "$HTTP_PORT"  | grep -Eq '^[0-9]{1,5}$' || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+
+  [ -f "$HOOKS_DIR/_vault-helpers.sh" ] || return 0
+  # shellcheck source=../hooks/_vault-helpers.sh
+  . "$HOOKS_DIR/_vault-helpers.sh"
+
+  # Token: env, else the per-instance vault (shared with the hooks). Optional —
+  # an existing active agent needs it to re-register; a brand-new agent's first
+  # register is auth-free and we vault the minted token below. Malformed → drop.
+  local token="${RELAY_AGENT_TOKEN:-}"
+  if [ -z "$token" ] && command -v read_relay_token_from_vault >/dev/null 2>&1; then
+    token=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null) || token=""
+  fi
+  if [ -n "$token" ] && ! echo "$token" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}$'; then
+    token=""
+  fi
+
+  # Daemon reachable? Tight bound — a hung daemon must not delay the launch.
+  curl -fsS --connect-timeout 1 --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1 || return 0
+
+  # THE POINT: host_shell_pids from THIS process (a child of the launching shell)
+  # → its ancestry includes the terminal's controlling shell PID = the
+  # vscode.Terminal.processId Tether reads. Computed synchronously (fast local ps).
+  local chain guid
+  chain=$(relay_pid_chain 2>/dev/null || printf '')
+  [ "$chain" = "[]" ] && chain=""
+  guid=$(relay_machine_guid 2>/dev/null || printf '')
+
+  # terminal_title_ref: validate against the server's allowlist; drop if it
+  # doesn't match (identical hardening to codex-session-start.sh — a hostile
+  # title must never malform the payload or take the register down with it).
+  local title_val="${RELAY_TERMINAL_TITLE:-}"
+  local title_re='^[A-Za-z0-9_. -]{1,100}$'
+  if [ -n "$title_val" ] && ! [[ "$title_val" =~ $title_re ]]; then
+    title_val=""
+  fi
+
+  # Capabilities JSON. Separator uses the EMITTED count (not the field index) so
+  # a leading/interior invalid item can't produce invalid JSON like [,"x"].
+  local caps_json="[]"
+  if [ -n "$AGENT_CAPS" ]; then
+    caps_json=$(echo "$AGENT_CAPS" | awk -F',' '{
+      printf "[";
+      n = 0;
+      for (i = 1; i <= NF; i++) {
+        gsub(/^ +| +$/, "", $i);
+        if ($i !~ /^[A-Za-z0-9_.-]+$/) continue;
+        printf "%s\"%s\"", (n++ ? "," : ""), $i;
+      }
+      printf "]";
+    }')
+  fi
+
+  local reg_headers=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
+  [ -n "$token" ] && reg_headers+=(-H "X-Agent-Token: ${token}")
+
+  # NON-force, NO agent_pid. A live same-name session correctly rejects this
+  # (duplicate-session protection intact) → no marker → hook fallback.
+  local body reg_body
+  body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${caps_json}${title_val:+,\"terminal_title_ref\":\"${title_val}\"}${chain:+,\"host_shell_pids\":${chain}}${guid:+,\"host_id\":\"${guid}\"}}}}"
+  reg_body=$(curl -fsS --connect-timeout 1 --max-time 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    "${reg_headers[@]}" \
+    --data "$body" 2>/dev/null) || return 0
+
+  # A collision (live same-name session) or any error → not a success envelope →
+  # no session_id captured → no marker → the hook registers normally. Only a
+  # `"success": true` (SSE-escaped) envelope proceeds.
+  echo "$reg_body" | grep -q '\\"success\\":[[:space:]]*true' || return 0
+
+  # First register on a brand-new name mints a token — capture + vault it (same
+  # SSE-escaped shape + parser as codex-session-start.sh).
+  if [ -z "$token" ] && command -v write_relay_token_to_vault >/dev/null 2>&1; then
+    local minted
+    minted=$(echo "$reg_body" | grep -oE '\\"agent_token\\":[[:space:]]*\\"[A-Za-z0-9_=.-]{8,128}\\"' | head -1 | sed -E 's/.*\\"([A-Za-z0-9_=.-]{8,128})\\"$/\1/')
+    [ -n "$minted" ] && write_relay_token_to_vault "$AGENT_NAME" "$minted" >/dev/null 2>&1 || true
+  fi
+
+  # Capture the registered session_id (nested agent.session_id, SSE-escaped) as
+  # the handoff marker. The hook skips its register ONLY if this equals the row's
+  # current session_id — proof THIS launch registered THIS row.
+  local sid
+  sid=$(echo "$reg_body" | grep -oE '\\"session_id\\":[[:space:]]*\\"[0-9a-fA-F-]{8,64}\\"' | head -1 | sed -E 's/.*\\"([0-9a-fA-F-]{8,64})\\"$/\1/')
+  [ -n "$sid" ] && RELAY_LAUNCH_SESSION_MARKER="$sid"
+  return 0
+}
+register_at_launch || true
+
+# --- exec Codex with the per-agent -c identity override (MCP auth) -----------
+# The override injects RELAY_AGENT_NAME into the bot-relay MCP server's env so
+# Codex's own get_messages/send_message authenticate (token resolves from the
+# vault). Export the handoff marker only when the launch register actually
+# succeeded, so the hook can prove-and-skip (else it registers normally).
+[ -n "$RELAY_LAUNCH_SESSION_MARKER" ] && export RELAY_LAUNCH_SESSION="$RELAY_LAUNCH_SESSION_MARKER"
+CODEX_LAUNCHER="${RELAY_CODEX_LAUNCHER:-npx @openai/codex}"
+# shellcheck disable=SC2086  # intentional word-split of the launcher command
+exec $CODEX_LAUNCHER -c "mcp_servers.bot-relay.env.RELAY_AGENT_NAME=\"${AGENT_NAME}\"" "$@"

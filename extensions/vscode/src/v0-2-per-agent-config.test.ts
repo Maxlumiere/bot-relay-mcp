@@ -69,18 +69,29 @@ describe("v0.2 — resolvePerAgentToken precedence", () => {
   const NAME = "build-agent";
   const PER_AGENT_ENV = "RELAY_AGENT_TOKEN_BUILD_AGENT";
 
-  it("(C9) returns the per-agent SecretStorage value first when set", () => {
-    const t = resolvePerAgentToken(
-      NAME,
-      "from-secret-storage",
-      {
-        [PER_AGENT_ENV]: "from-per-agent-env",
-        RELAY_AGENT_TOKEN: "from-singleton-env",
-      },
-      "from-legacy-config",
-      true,
-    );
-    expect(t).toBe("from-secret-storage");
+  it("(C9) v0.5.0 precedence ladder — per-agent env > legacy env > VAULT > SecretStorage > config", () => {
+    // Full ladder set → the explicit per-agent env override wins.
+    expect(
+      resolvePerAgentToken(
+        NAME,
+        "from-secret-storage",
+        { [PER_AGENT_ENV]: "from-per-agent-env", RELAY_AGENT_TOKEN: "from-singleton-env" },
+        "from-legacy-config",
+        true,
+        "from-vault",
+      ),
+    ).toBe("from-per-agent-env");
+    // No per-agent env → legacy singleton env wins.
+    expect(
+      resolvePerAgentToken(NAME, "from-secret-storage", { RELAY_AGENT_TOKEN: "from-singleton-env" }, "from-legacy-config", true, "from-vault"),
+    ).toBe("from-singleton-env");
+    // No env → the VAULT beats the (stale) SecretStorage copy. THIS is the fix:
+    // the hook-maintained vault token wins over the manually-set secret.
+    expect(resolvePerAgentToken(NAME, "from-secret-storage", {}, "from-legacy-config", true, "from-vault")).toBe("from-vault");
+    // No env, no vault → SecretStorage (back-compat fallback).
+    expect(resolvePerAgentToken(NAME, "from-secret-storage", {}, "from-legacy-config", true, undefined)).toBe("from-secret-storage");
+    // Only legacy config (secretsAvailable) → config.
+    expect(resolvePerAgentToken(NAME, undefined, {}, "from-legacy-config", true, undefined)).toBe("from-legacy-config");
   });
 
   it("(C10) falls through to per-agent env when secret is empty", () => {

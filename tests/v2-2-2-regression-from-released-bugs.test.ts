@@ -114,7 +114,7 @@ describe("v2.2.2 regression-from-released-bugs", () => {
   it("(4) NAME_COLLISION_ACTIVE — re-registering an online agent rejects unless force=true", () => {
     // First registration seeds token; re-register without the real
     // token OR force will hit NAME_COLLISION_ACTIVE.
-    const { plaintext_token } = registerAgent("r4", "r", []);
+    const { plaintext_token, agent: r4Agent } = registerAgent("r4", "r", []);
     expect(plaintext_token).toBeTruthy();
     // Re-register without force + without token → rejected.
     const reject = handleRegisterAgent({
@@ -132,6 +132,7 @@ describe("v2.2.2 regression-from-released-bugs", () => {
       role: "r",
       capabilities: [],
       force: true,
+      expected_session_id: r4Agent.session_id, // ADR-0012 CAS — the session we read
     } as any);
     const forceJson = JSON.parse(forceOk.content[0].text);
     expect(forceJson.success).toBe(true);

@@ -242,6 +242,102 @@ export function resolveInstanceDbPath(): string {
   return path.join(dir, "relay.db");
 }
 
+/** What this process actually resolved to, for assertion + announcement. */
+export interface InstanceResolution {
+  instanceId: string | null;
+  dbPath: string;
+  /** This MACHINE is set up for multi-instance (env, active link, or instances/ dirs). */
+  multiInstance: boolean;
+  /** The dangerous state: machine is multi-instance, yet WE resolved to the flat legacy DB. */
+  legacyFallback: boolean;
+  /** Set when RELAY_DB_PATH overrode everything — an explicit operator choice, never a fault. */
+  explicitDbPathOverride: boolean;
+}
+
+/** Describe — never throws. Safe for diagnostics (`relay doctor`, health output). */
+export function describeInstanceResolution(): InstanceResolution {
+  const explicitDbPathOverride = Boolean(process.env.RELAY_DB_PATH);
+  const instanceId = resolveActiveInstanceId();
+  const multiInstance = isMultiInstanceMode();
+  return {
+    instanceId,
+    dbPath: resolveInstanceDbPath(),
+    multiInstance,
+    // An explicit RELAY_DB_PATH is a deliberate override, so it is never a fault.
+    legacyFallback: !explicitDbPathOverride && multiInstance && instanceId === null,
+    explicitDbPathOverride,
+  };
+}
+
+/**
+ * REFUSE TO RUN MUTE — startup assertion.
+ *
+ * The injury this prevents is NOT "wrong path". A wrong path is loud: the
+ * process fails to start and somebody notices. The injury is a QUIET REDIRECT
+ * TO A DIFFERENT DATABASE — the process starts perfectly, registers, reports
+ * healthy, and reads an empty mailbox forever, because it resolved to the flat
+ * legacy `~/.bot-relay/relay.db` on a machine whose real data lives under
+ * `~/.bot-relay/instances/<id>/`. Every symptom of that looks like "quiet
+ * inbox". It cost this project nine days of invisible message loss.
+ *
+ * The check is the CONTRADICTION, not a missing env var:
+ *   isMultiInstanceMode() === true  AND  resolveActiveInstanceId() === null
+ * i.e. this machine is demonstrably set up for instances, yet THIS process
+ * found none. Keying on the contradiction is what makes the assertion safe for
+ * legitimate single-instance users — they have no instances/ dir and no active
+ * link, so `multiInstance` is false and this never fires for them. A blanket
+ * "RELAY_INSTANCE_ID is required" would break every legacy and fresh install.
+ *
+ * Escape hatch: RELAY_ALLOW_LEGACY_FALLBACK=1 downgrades the refusal to a
+ * shouted warning, for an operator who genuinely means to run against the flat
+ * DB while instances exist. It warns rather than going silent, because silence
+ * is the thing being fixed.
+ */
+export function assertInstanceResolution(
+  emit: (msg: string) => void,
+): InstanceResolution {
+  const res = describeInstanceResolution();
+
+  if (res.legacyFallback) {
+    let available: string[] = [];
+    try {
+      available = fs
+        .readdirSync(instancesRoot(), { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+    } catch { /* best-effort — the message is still actionable without it */ }
+
+    const detail =
+      "bot-relay: REFUSING TO START — instance resolution is ambiguous.\n" +
+      "  This machine is configured for MULTI-INSTANCE mode, but this process\n" +
+      "  resolved NO instance and would have silently used the legacy flat DB:\n" +
+      `    would use : ${res.dbPath}\n` +
+      `    instances : ${available.length ? available.join(", ") : "(present but unreadable)"}\n` +
+      "  Starting anyway would give you a process that looks healthy and reads an\n" +
+      "  EMPTY mailbox — silent message loss, not a visible failure.\n" +
+      "  Fix with EITHER:\n" +
+      "    * set RELAY_INSTANCE_ID=<id> in this process's environment, or\n" +
+      "    * run `relay use-instance <id>` to set ~/.bot-relay/active-instance\n" +
+      "  Override (warns, does not fail): RELAY_ALLOW_LEGACY_FALLBACK=1";
+
+    if (process.env.RELAY_ALLOW_LEGACY_FALLBACK === "1") {
+      emit(detail.replace("REFUSING TO START", "WARNING (override active)"));
+      return res;
+    }
+    throw new Error(detail);
+  }
+
+  // Always ANNOUNCE what we landed on. The nine-day failure was survivable at
+  // every single moment except one: nobody could see which DB an agent was on.
+  emit(
+    "[bot-relay] instance=" +
+      (res.instanceId ?? "(legacy single-instance)") +
+      " db=" + res.dbPath +
+      (res.explicitDbPathOverride ? " (RELAY_DB_PATH override)" : ""),
+  );
+  return res;
+}
+
 /**
  * v2.4.0 Codex HIGH #2 patch — resolve the effective config path for
  * the active instance. Mirrors `resolveInstanceDbPath` exactly so DB

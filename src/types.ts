@@ -4,6 +4,9 @@
 // See LICENSE for full terms.
 
 import { z } from "zod";
+import { isSafeCssColorValue } from "./css-color.js";
+import { getAgentCliProfile } from "./agent-cli-profiles.js";
+import { AgentClassEnum, type AgentClass } from "./agent-class.js";
 
 // --- Zod Schemas for tool inputs ---
 
@@ -110,28 +113,57 @@ export const RegisterAgentSchema = z.object({
     ),
   recovery_token: z.string().min(1).optional().describe("v2.1 Phase 4b.1 v2: required when re-registering an agent whose auth_state is 'recovery_pending'. Obtained from the revoker's revoke_token response (shown ONCE) and handed off to the operator out-of-band."),
   managed: z.boolean().default(false).describe("v2.1 Phase 4b.2: true = agent is a Managed Agent wrapper that can parse push-token messages + self-update its local config on rotation. false (default) = Claude Code terminal or equivalent (restart-required on rotation). Immutable after first registration — change requires unregister + fresh register."),
+  cli_profile: z.string().max(64).optional().describe("Which agent-CLI this session runs under (e.g. \"claude\", \"codex\"). Set by the SessionStart hook; VALIDATED against the agent-CLI profile registry and stored as NULL when unrecognised — never defaulted, because a wrong default would make the verdict-absence check fire on healthy agents. Enables the server to know whether this agent OWES a session-start verdict."),
+  class: AgentClassEnum.optional().describe("ADR-0002 (v2.21.0): the agent's COARSE coordination posture — one of orchestrator | builder | advisory | auditor | transient (SSOT: src/agent-class.ts). Self-declared; IMMUTABLE after first registration (same rule as managed/host_id). Orthogonal to `role` (free-text label) and `capabilities` (what it does). Omit → `unclassified`; surfaced in discover_agents view='topology'."),
   /**
-   * v2.2.1 B2: bypass the duplicate-name active-session collision check.
-   * Default false → re-register on an actively-held name returns
-   * NAME_COLLISION_ACTIVE (forces operators to scope names distinctly, which
-   * kills the get_messages mailbox-drain race when two terminals share a
-   * RELAY_AGENT_NAME + token). Operators who genuinely need to force a
-   * takeover (e.g. previous session crashed + they can't wait for
-   * staleness or run `relay recover`) can pass force=true explicitly.
-   * Undocumented on the public tool description — it's an escape hatch,
-   * not a feature.
+   * v2.2.1 B2 → ADR-0012: request a CAS TAKEOVER of the name (NOT an
+   * unconditional bypass). Default false → re-register on an actively-held name
+   * returns NAME_COLLISION_ACTIVE. force=true is a CONDITIONAL takeover that
+   * MUST carry `expected_session_id` (see below): the server performs an atomic
+   * compare-and-swap on the row's session_id, so exactly one of two racing
+   * relaunches wins and the loser is rejected — there is NO lost-update path.
+   * Bare force=true (without expected_session_id) is rejected as malformed.
    */
-  force: z.boolean().default(false).optional().describe("Escape hatch — bypass the duplicate-name active-session collision check. Default false rejects re-registration on an actively-held name with NAME_COLLISION_ACTIVE so concurrent terminals don't race the get_messages mailbox-drain. Set true only when the prior session is unreachable (crashed terminal, stale-but-not-yet-aged-out session) and you cannot wait for the staleness window or run `relay recover`."),
+  force: z.boolean().default(false).optional().describe("ADR-0012: request a CAS TAKEOVER of an actively-held name (NOT an unconditional bypass). MUST be accompanied by expected_session_id (the session_id you READ from the row; null = expect an offline row). The takeover is an atomic compare-and-swap on that session_id — exactly one of two racing relaunches wins; the loser gets FORCE_PRECONDITION_FAILED and re-reads (never retry-force). Default false rejects re-registration on an actively-held name with NAME_COLLISION_ACTIVE. Set true only when the prior session is unreachable (crashed/relaunched terminal); a live concurrent terminal still wins the CAS and you correctly lose."),
+  /**
+   * ADR-0012: CAS precondition for a force takeover. REQUIRED when force=true;
+   * `null` is a valid EXPLICIT value meaning "I expect an offline row"
+   * (CAS matches `session_id IS NULL`). Absent + force=true → malformed reject.
+   */
+  expected_session_id: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("ADR-0012 CAS precondition for a force takeover. REQUIRED whenever force=true: the session_id the caller READ from the row it intends to take over (pass null to mean \"I expect an OFFLINE row\" → CAS matches session_id IS NULL). The re-register lands ONLY if the row's session_id still equals this value, so exactly one of two racing relaunches wins; the loser is rejected with FORCE_PRECONDITION_FAILED and MUST re-read (never retry-force, never come up mute). force=true WITHOUT this field is rejected as malformed — there is NO unconditional-force bypass, which would reopen the lost-update TOCTOU ADR-0012 eliminates."),
 });
 
 export const DiscoverAgentsSchema = z.object({
   role: z.string().optional().describe("Filter by role"),
+  view: z
+    .enum(["list", "topology"])
+    .default("list")
+    .describe("ADR-0002: 'list' (default) = flat agent list (unchanged). 'topology' = the live team grouped by coordination class (orchestrator/builder/advisory/auditor), flat within each; transient + unclassified + dead/terminal agents are excluded from the who's-who."),
   agent_token: AgentTokenField,
 });
 
 export const UnregisterAgentSchema = z.object({
   name: z.string().min(1).max(64).describe("Agent name to unregister"),
   agent_token: AgentTokenField,
+});
+
+/**
+ * ADR-0005 (v2.22.0): self-serve cleanup of a BOTCHED (orphaned) registration —
+ * a row that registered but whose caller lost the agent_token before ever
+ * authenticating (e.g. a truncated curl capture). Authenticated by the
+ * one-time, name-scoped `recovery_handle` returned at register (NOT the lost
+ * agent_token), so it needs NO auth token (the handle is the proof). SAFE by
+ * the keystone: it can ONLY remove a NEVER-authenticated row, so it can never
+ * reach a working agent — that's what makes it a safe alternative to the
+ * operator kill endpoint. A live agent that lost its token uses rotate/recover.
+ */
+export const AbandonRegistrationSchema = z.object({
+  name: z.string().min(1).max(64).describe("The agent name whose orphaned registration to abandon."),
+  recovery_handle: z.string().min(1).describe("The one-time registration-recovery handle returned in the register_agent response (the `registration_recovery` field). Name-scoped + short-lived."),
 });
 
 // Defense-in-depth (v1.6.2): these patterns MUST match the validation in
@@ -179,13 +211,32 @@ export const SpawnAgentSchema = z.object({
     .refine((v) => !SPAWN_BRIEF_PATH_FORBIDDEN.test(v), "brief_file_path contains a forbidden character (shell metachar or control char)")
     .optional()
     .describe("v2.1.4 (I10): absolute path to a task-brief file the spawned agent should read FIRST. The relay validates that the file exists at spawn time, is readable, and is <=10KB. When set, the default KICKSTART prompt appends a sentence telling the agent to read this file as the canonical source for its task scope — trust-anchored fix for respawned-agent context loss (inbox messages are not durable). macOS only for v2.1.4; Linux/Windows drivers ignore (no KICKSTART on those platforms yet)."),
+  // v2.17.0 (P2 — LLM-agnostic spawn): which agent CLI to launch. A registered
+  // agent-CLI profile id (see src/agent-cli-profiles.ts / `relay cli-profiles`).
+  // Default "claude" keeps every existing spawn_agent call byte-identical. The
+  // .refine() rejects an unknown CLI at the MCP boundary; the driver resolves
+  // the launch strategy from the profile registry (no hardcoded branch).
+  cli: z.string()
+    .min(1).max(32)
+    .regex(/^[A-Za-z0-9_-]+$/, "cli must match [A-Za-z0-9_-]+ (no spaces / shell metachars)")
+    .refine((v) => getAgentCliProfile(v) !== undefined, "cli must be a known agent-CLI profile id — see `relay cli-profiles` (claude|codex)")
+    .default("claude")
+    .describe("Which agent CLI to launch for the new terminal: a registered agent-CLI profile id — 'claude' (default) or 'codex'. Codex launches via bin/codex-relay (POSIX; macOS + Linux). See `relay cli-profiles`."),
   agent_token: AgentTokenField,
 });
 
 export const SendMessageSchema = z.object({
   from: z.string().min(1).describe("Sender agent name"),
   to: z.string().min(1).describe("Recipient agent name"),
-  content: payloadField("content").describe("Message content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES)"),
+  // v2.22.0 (#5): the MCP tool now accepts EITHER `content` (historical) OR
+  // `message` (the field the agent-team SendMessage + the REST
+  // /api/send-message both use) — one send vocabulary across every surface.
+  // Both are optional at the schema layer; handleSendMessage requires EXACTLY
+  // one (rejecting neither, and both-with-different-values) and normalizes to
+  // content. Kept as a plain object (not a .transform) so the generated MCP
+  // tool inputSchema stays clean.
+  content: payloadField("content").optional().describe("Message content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES). Alias: `message`."),
+  message: payloadField("message").optional().describe("Alias for `content` (parity with the REST /api/send-message endpoint + the agent-team SendMessage tool)."),
   priority: z.enum(["normal", "high"]).default("normal").describe("Message priority"),
   agent_token: AgentTokenField,
 });
@@ -680,22 +731,47 @@ export type FocusTerminalInput = z.infer<typeof FocusTerminalSchema>;
  * also have an admin-cap agent token, which defeats the "operator
  * dashboard" semantic.
  */
-export const ApiSendMessageSchema = z.object({
-  from: z.string().min(1).max(64).describe("Sender agent name (must be a registered agent)"),
-  to: z.string().min(1).max(64).describe("Recipient agent name"),
-  content: payloadField("content"),
-  priority: z.enum(["normal", "high"]).default("normal"),
-  /**
-   * v2.2.2 A1 — Option (b) defense-in-depth. Optional: when present, the
-   * server verifies against the from-agent's stored token_hash + the
-   * audit-log entry records `from_authenticated: true`. When absent, the
-   * v2.2.1 Option (a) audit-only model applies: dashboard-secret gate is
-   * the only check + `from_authenticated: false` is recorded so incident
-   * review can distinguish operator-impersonation from token-verified
-   * sends. Also acceptable via `X-From-Agent-Token` header.
-   */
-  from_agent_token: z.string().min(8).max(128).optional(),
-});
+export const ApiSendMessageSchema = z
+  .object({
+    from: z.string().min(1).max(64).describe("Sender agent name (must be a registered agent)"),
+    to: z.string().min(1).max(64).describe("Recipient agent name"),
+    // v2.17.1: the message body accepts EITHER `content` (this endpoint's
+    // historical field) OR `message` (the field the MCP `send_message` tool and
+    // the agent-team `SendMessage` both use) — one send vocabulary across all
+    // three surfaces. Exactly one must be present; supplying BOTH with DIFFERENT
+    // values is rejected (no silent precedence). The transform below normalizes
+    // to `content` so the handler is unchanged.
+    content: payloadField("content").optional(),
+    message: payloadField("message").optional().describe("Alias for `content` (parity with MCP send_message / SendMessage)"),
+    priority: z.enum(["normal", "high"]).default("normal"),
+    /**
+     * v2.2.2 A1 — Option (b) defense-in-depth. Optional: when present, the
+     * server verifies against the from-agent's stored token_hash + the
+     * audit-log entry records `from_authenticated: true`. When absent, the
+     * v2.2.1 Option (a) audit-only model applies: dashboard-secret gate is
+     * the only check + `from_authenticated: false` is recorded so incident
+     * review can distinguish operator-impersonation from token-verified
+     * sends. Also acceptable via `X-From-Agent-Token` header.
+     */
+    from_agent_token: z.string().min(8).max(128).optional(),
+  })
+  .transform((v, ctx) => {
+    const hasContent = typeof v.content === "string";
+    const hasMessage = typeof v.message === "string";
+    if (!hasContent && !hasMessage) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "either `content` or `message` is required" });
+      return z.NEVER;
+    }
+    if (hasContent && hasMessage && v.content !== v.message) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "provide only one of `content` / `message` — both were sent with different values",
+      });
+      return z.NEVER;
+    }
+    const { message: _drop, ...rest } = v;
+    return { ...rest, content: (hasContent ? v.content : v.message) as string };
+  });
 export type ApiSendMessageInput = z.infer<typeof ApiSendMessageSchema>;
 
 export const ApiKillAgentSchema = z.object({
@@ -728,11 +804,22 @@ export type ApiSetStatusInput = z.infer<typeof ApiSetStatusSchema>;
  * `src/dashboard-styles.ts` :root selector. A theme object MUST set every
  * token; partial themes are rejected at the Zod boundary so the dashboard
  * never ends up with a mix-of-themes visual (e.g. dark backgrounds + light
- * tag colors). Each token is a CSS color string — no format validation
- * beyond "non-empty string" because CSS accepts many forms (#hex,
- * rgb(), hsl(), color()).
+ * tag colors). Each token is a CSS color string, VALIDATED against a positive
+ * grammar (hex / numeric rgb()/rgba()/hsl()/hsla() / a closed named-color set)
+ * — see src/css-color.ts. This is the WRITE-path primary control: the stored
+ * value feeds a CSS `background:` shorthand, which accepts `url(...)`, so an
+ * unvalidated token was a CSS-beaconing / defacement vector (LOW — authed write).
+ * Refusing everything but the permitted forms means url()/var()/color()/escapes/
+ * comments are refused by default.
  */
-const THEME_TOKEN_FIELD = z.string().min(1).max(64);
+const THEME_TOKEN_FIELD = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine(isSafeCssColorValue, {
+    message:
+      "must be a CSS color: #hex, rgb()/rgba()/hsl()/hsla() with a numeric interior, or a named color — url()/var()/escapes/comments are refused",
+  });
 export const CustomThemeSchema = z.object({
   bg: THEME_TOKEN_FIELD,
   panel: THEME_TOKEN_FIELD,
@@ -788,6 +875,7 @@ export type ApiDashboardThemeInput = z.infer<typeof ApiDashboardThemeSchema>;
 export type RegisterAgentInput = z.infer<typeof RegisterAgentSchema>;
 export type DiscoverAgentsInput = z.infer<typeof DiscoverAgentsSchema>;
 export type UnregisterAgentInput = z.infer<typeof UnregisterAgentSchema>;
+export type AbandonRegistrationInput = z.infer<typeof AbandonRegistrationSchema>;
 export type SpawnAgentInput = z.infer<typeof SpawnAgentSchema>;
 export type SendMessageInput = z.infer<typeof SendMessageSchema>;
 export type GetMessagesInput = z.infer<typeof GetMessagesSchema>;
@@ -857,10 +945,27 @@ export interface AgentRecord {
   recovery_token_hash?: string | null;
   /** v2.1 Phase 4b.2: true = Managed Agent wrapper (can self-update from push-token messages). Immutable after first register (same as capabilities). */
   managed?: number;
+  /** ADR-0002 (schema v21): self-declared coarse coordination posture (SSOT src/agent-class.ts). NULL on legacy rows → normalized to `unclassified` on read. Immutable after first register. */
+  class?: string | null;
+  /** Phase A (schema v22): relay build that SERVED this row's last register. Stdio servers are spawned per session from dist and run that build for life, so a machine routinely runs several versions at once — and until this column there was no way to ask a stdio server which one it was. */
+  server_version?: string | null;
+  /** Phase A (schema v22): which agent-CLI this row registered through, validated against the profile registry. NULL = UNKNOWN and is never asked for a session-start verdict. */
+  cli_profile?: string | null;
   /** v2.1 Phase 4b.2: ISO timestamp of rotation grace window expiry. Populated iff state=rotation_grace. */
   rotation_grace_expires_at?: string | null;
   /** v2.1 Phase 4b.2: bcrypt hash of pre-rotation token. Populated iff state=rotation_grace; allows the old token to auth alongside the new token during the grace window. */
   previous_token_hash?: string | null;
+  /** ADR-0003 (schema v20): HMAC-SHA256 lookup digest of the CURRENT token — an indexed O(1) locator, NEVER an auth decision (bcrypt on token_hash stays the verifier). NULL on legacy rows until the token is next minted/rotated or lazily self-healed on the O(N) fallback path. */
+  token_lookup?: string | null;
+  /** ADR-0003 (schema v20): lookup digest of the PREVIOUS token; populated only during rotation_grace (mirrors previous_token_hash). NULL otherwise. */
+  previous_token_lookup?: string | null;
+  /** ADR-0005 (schema v22): ISO timestamp of the agent's FIRST successful token auth. NULL = NEVER authenticated = an orphan — the abandon_registration + orphan-GC keystone. */
+  first_authed_at?: string | null;
+  established_at?: string | null;
+  /** ADR-0005 (schema v22): bcrypt hash of the one-time, name-scoped registration-recovery handle (self-serve orphan cleanup). NULL after redemption / first auth. */
+  registration_recovery_hash?: string | null;
+  /** ADR-0005 (schema v22): TTL for the registration-recovery handle. */
+  registration_recovery_expires_at?: string | null;
   /** v2.1.6: ISO timestamp of the agent's current session start (last register_agent). NULL on rows registered before v2.1.6. */
   session_started_at?: string | null;
   /** v2.2.0: window title the agent's terminal was spawned with. Used by the dashboard's click-to-focus driver. NULL on rows spawned before v2.2.0 or rows that did not thread the value through the register call. */
@@ -869,9 +974,9 @@ export interface AgentRecord {
   host_shell_pids?: string | null;
   /** Tether v0.3 PID-handshake (schema v16): stable OS machine GUID, host-scopes the PID match. NULL on legacy rows. Immutable after first registration. */
   host_id?: string | null;
-  /** v2.13.0 (schema v18): ISO timestamp of the most recent POSITIVE liveness confirmation (same-host PID probe / future heartbeat). NULL = no liveness signal → age-based derivation. Distinct from last_seen (activity). */
+  /** v2.13.0 (schema v18): ISO timestamp of the most recent POSITIVE liveness confirmation (same-host PID probe / future heartbeat). NULL = no liveness signal → verdict is unknown (age-based derivation retired in v2.19.0). Distinct from last_seen (activity). */
   last_alive?: string | null;
-  /** v2.13.0 (schema v18): the agent's OWN process id (claude/codex CLI), identified by the stdio server's ancestry walk or self-reported on register. The process the same-host liveness probe checks — NOT the host_shell_pids chain. NULL = no anchor → age-based. */
+  /** v2.13.0 (schema v18): the agent's OWN process id (claude/codex CLI), identified by the stdio server's ancestry walk or self-reported on register. The process the same-host liveness probe checks — NOT the host_shell_pids chain. NULL = no anchor → verdict unknown unless the agent advertises RELAY_AGENT_NAME in its argv (v2.19.0). */
   agent_pid?: number | null;
   /** v2.13.0 (schema v18): start-time token of `agent_pid` (PID-reuse guard). A recycled PID with a different start-time reads dead. */
   agent_pid_start?: string | null;
@@ -879,8 +984,12 @@ export interface AgentRecord {
 
 export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "token_hash" | "session_id" | "agent_status" | "description" | "host_shell_pids" | "host_id"> {
   capabilities: string[];
-  /** v1.3 presence: computed from last_seen. Distinct from agent_status. */
-  status: "online" | "stale" | "offline";
+  /** Coarse presence, derived from the liveness VERDICT (v2.19.0 — NOT from
+   *  last_seen age, which lied) — alive→online, dead→offline, unknown→unknown.
+   *  A live agent NEVER reads offline; last_seen is pure telemetry. */
+  status: "online" | "offline" | "unknown";
+  /** ADR-0002: normalized coordination posture (NULL/unknown → "unclassified"). Surfaced through the projection so discover_agents view='topology' can group on it. */
+  class: AgentClass;
   /** v1.7: whether the agent has a token (false = legacy pre-v1.7 agent) */
   has_token: boolean;
   /**
@@ -924,6 +1033,15 @@ export interface AgentWithStatus extends Omit<AgentRecord, "capabilities" | "tok
    * "dead" — use `liveness` to distinguish dead from unknown.
    */
   alive: boolean;
+  /**
+   * audit HIGH #2 — session-actionability, the SAME predicate `post_task_auto`
+   * enforces (a live session + non-terminal status), surfaced so the operator
+   * reads what the router uses (ADR-0015 L4). `routable` is the boolean;
+   * `routability` is the one named state — `unroutable_alive` is the loud
+   * diagnostic: a live process the router will silently never give work.
+   */
+  routable: boolean;
+  routability: "routable" | "unroutable_alive" | "unroutable_offline";
 }
 
 export interface MessageRecord {

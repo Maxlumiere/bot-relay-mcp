@@ -188,6 +188,7 @@ describe("§5.1 state × op matrix — active row", () => {
       capabilities: ["broadcast"],
       agent_token: tok,
       force: true,
+      expected_session_id: getAgentAuthData("act-2")?.session_id, // ADR-0012 CAS
     });
     expect(r.success).toBe(true);
     expect(getAgentAuthData("act-2")?.token_hash).toBe(preHash);

@@ -149,8 +149,13 @@ describe("v0.1.4 — bundle correctness", () => {
     // transport-diagnostics) preserved. v0.3.x added llm-adapter.ts (per-LLM
     // wake adapters, imported by extension.ts). v0.4.1 added
     // connection-lifecycle.ts (the auto-reconnect-on-close guard seam) +
-    // health-poll.ts (the reachability/health backstop), both imported by
-    // extension.ts.
+    // health-poll.ts (the reachability/health backstop). v0.5.0 added
+    // vault-path.ts (the per-instance vault-first token resolver), all
+    // imported by extension.ts. v0.5.x added wake-routing.ts (ADR-0010 pure
+    // state-routed wake decision) — imported by inbox-subscription.ts, where
+    // routeWake gates each wake, so it is a genuine bundle input. #3 (2026-07)
+    // added no-delivery-warn.ts (the human-facing throttle for the
+    // undelivered-mail surface), imported by extension.ts's hintNoWake.
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/catch-up-wake.ts",
@@ -162,12 +167,15 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/host-identity.ts",
       "src/inbox-subscription.ts",
       "src/llm-adapter.ts",
+      "src/no-delivery-warn.ts",
       "src/pid-binding.ts",
       "src/reconnect-supervisor.ts",
       "src/restart-policy.ts",
       "src/switch-agent.ts",
       "src/terminal-targeting.ts",
       "src/transport-diagnostics.ts",
+      "src/vault-path.ts",
+      "src/wake-routing.ts",
     ]);
   });
 

@@ -218,6 +218,32 @@ applescript_escape() {
   printf '%s' "$s"
 }
 
+# v2.17.0 (P2, codex audit fix) — fully canonicalize a file path, resolving the
+# ENTIRE symlink chain of the final component (not just the parent dir). macOS
+# has no `readlink -f`, so this follows symlinks one level at a time with the
+# portable BSD/GNU `readlink` and canonicalizes the containing dir with the
+# existing `cd && pwd -P` idiom. Prints the canonical absolute path on success,
+# nothing on failure (missing dir / broken link / symlink cycle). The bounded
+# loop guards against cycles. This is the security-critical primitive: a symlink
+# physically inside bin/ pointing outside it resolves to its REAL target here, so
+# the caller's under-bin check sees the real location.
+canonicalize_file() {
+  local p="$1" target dir i=0
+  while [ -L "$p" ] && [ "$i" -lt 40 ]; do
+    target=$(readlink "$p" 2>/dev/null) || return 0
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+    i=$((i + 1))
+  done
+  # A remaining symlink after 40 hops = a cycle → refuse to canonicalize.
+  [ -L "$p" ] && return 0
+  dir=$(cd "$(dirname "$p")" 2>/dev/null && pwd -P 2>/dev/null || true)
+  [ -z "$dir" ] && return 0
+  printf '%s/%s' "$dir" "$(basename "$p")"
+}
+
 # --- Build the inner command using printf %q for shell-safe quoting ---
 # The new terminal will run this as its first command.
 Q_NAME=$(printf '%q' "$NAME")
@@ -310,7 +336,73 @@ case "$EFFORT" in
 esac
 Q_EFFORT=$(printf '%q' "$EFFORT")
 
-if [ "${RELAY_SPAWN_NO_KICKSTART:-}" = "1" ]; then
+# v2.17.0 (P2 — LLM-agnostic spawn): launcher-strategy CLIs. When the TS driver
+# (resolving the profile registry) sets RELAY_SPAWN_LAUNCHER, the spawned
+# terminal runs that repo launcher instead of `claude`. The launcher (e.g.
+# bin/codex-relay) pre-registers the relay handshake (host_shell_pids) FROM THE
+# LAUNCHED SHELL, then execs the CLI — the 2.16.4 cold-start property for a
+# SPAWNED agent. Everything above (name/role/caps/cwd allowlist + control-char +
+# symlink-root defense, osascript escaping, vault hydration, manifest, terminal
+# detection) is CLI-AGNOSTIC and reused verbatim. There is deliberately NO CLI
+# literal here — the branch is on launcher-PRESENCE, so a future launcher-CLI
+# needs zero change to this script.
+#
+# Defense-in-depth on RELAY_SPAWN_LAUNCHER (the driver already resolved it from
+# the TRUSTED registry; this still validates it, mirroring the cwd hardening):
+# absolute, no control chars, no shell metacharacters, resolves to a regular
+# executable file WITHIN this script's own bin/ directory.
+if [ -n "${RELAY_SPAWN_LAUNCHER:-}" ]; then
+  LAUNCHER="$RELAY_SPAWN_LAUNCHER"
+  case "$LAUNCHER" in
+    /*) ;;
+    *) echo "[spawn-agent] RELAY_SPAWN_LAUNCHER must be an absolute path. Got: $LAUNCHER" >&2; exit 2 ;;
+  esac
+  if [ "${#LAUNCHER}" -gt 1024 ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER exceeds 1024 chars" >&2; exit 2
+  fi
+  launcher_stripped=$(printf '%s' "$LAUNCHER" | tr -d '\n\r\t\0')
+  if [ "${#launcher_stripped}" -ne "${#LAUNCHER}" ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER contains a newline, carriage return, tab, or null byte" >&2; exit 2
+  fi
+  case "$LAUNCHER" in
+    *[\`\;\$\&\|\<\>\"\'\*\?]*)
+      echo "[spawn-agent] RELAY_SPAWN_LAUNCHER contains disallowed shell metacharacters" >&2; exit 2 ;;
+  esac
+  # Canonicalize BOTH the repo bin/ AND the launcher's FINAL target (following
+  # the whole symlink chain), then compare resolved prefixes. Validating only
+  # the parent dir + reconstructing `$dir/$(basename)` was the codex P2 audit
+  # hole: a symlink physically inside bin/ (bin/x -> /bin/sh) passed the
+  # prefix + `-x` checks and got executed. Now the symlink resolves to its REAL
+  # target and the under-bin check sees /bin/sh → reject. `|| true` keeps a
+  # failed cd from tripping set -e mid-assignment (we want the clean exit-2).
+  BIN_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P 2>/dev/null || true)"
+  if [ -z "$BIN_DIR" ]; then
+    echo "[spawn-agent] repo bin/ could not be resolved" >&2; exit 2
+  fi
+  CANON_LAUNCHER="$(canonicalize_file "$LAUNCHER")"
+  if [ -z "$CANON_LAUNCHER" ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER could not be resolved (missing dir, broken link, or symlink cycle): $LAUNCHER" >&2; exit 2
+  fi
+  # The RESOLVED target must be physically under the canonical repo bin/…
+  case "$CANON_LAUNCHER" in
+    "$BIN_DIR"/*) ;;
+    *) echo "[spawn-agent] RELAY_SPAWN_LAUNCHER resolves to '$CANON_LAUNCHER', outside the repo bin/ ($BIN_DIR)" >&2; exit 2 ;;
+  esac
+  # …and be a REGULAR, EXECUTABLE file (not a dir, device, or dangling link;
+  # the chain is fully resolved so -f/-x see the real target).
+  if [ ! -f "$CANON_LAUNCHER" ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER is not a regular file: $CANON_LAUNCHER" >&2; exit 2
+  fi
+  if [ ! -x "$CANON_LAUNCHER" ]; then
+    echo "[spawn-agent] RELAY_SPAWN_LAUNCHER is not executable: $CANON_LAUNCHER" >&2; exit 2
+  fi
+  # Execute the CANONICAL validated path, never the (possibly symlink) input.
+  Q_LAUNCHER=$(printf '%q' "$CANON_LAUNCHER")
+  # The launcher self-configures identity/handshake and takes the agent name as
+  # its first arg (codex-relay <name>). No claude --permission-mode/--effort/
+  # kickstart — those are Claude-specific; the launcher CLI wakes via Tether.
+  CMD="$CMD cd $Q_CWD; $Q_LAUNCHER $Q_NAME"
+elif [ "${RELAY_SPAWN_NO_KICKSTART:-}" = "1" ]; then
   CMD="$CMD cd $Q_CWD; claude --permission-mode $Q_PERM --effort $Q_EFFORT --name $Q_DISPLAY"
 else
   # v2.7.4 — default kickstart MUST stay apostrophe-free (defense-in-depth

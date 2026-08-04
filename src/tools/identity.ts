@@ -6,7 +6,9 @@
 import {
   registerAgent,
   getAgents,
+  buildAgentTopology,
   unregisterAgent,
+  abandonRegistration,
   rotateAgentToken,
   rotateAgentTokenAdmin,
   revokeAgentToken,
@@ -14,6 +16,7 @@ import {
   sendMessage,
   logAudit,
   ConcurrentUpdateError,
+  ForcePreconditionError,
   expandAgentCapabilities,
   setAgentLivenessAnchor,
   NameCollisionActiveError,
@@ -30,6 +33,7 @@ import type {
   RegisterAgentInput,
   DiscoverAgentsInput,
   UnregisterAgentInput,
+  AbandonRegistrationInput,
   RotateTokenInput,
   RotateTokenAdminInput,
   RevokeTokenInput,
@@ -48,6 +52,35 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     | "revoked"
     | "recovery_pending"
     | null;
+
+  // ADR-0012 — force is a CONDITIONAL CAS takeover, never an unconditional
+  // bypass. force=true MUST carry expected_session_id (the session_id the caller
+  // READ from the row; null = "expect an offline row"). Absent → malformed:
+  // reject rather than fall back to a bypass, so no lost-update path (codex-5-5's
+  // #131 TOCTOU) can ever reopen. An operator force-claiming reads the row first,
+  // then passes its session_id (read-then-CAS).
+  if (input.force === true && input.expected_session_id === undefined) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              error:
+                `register_agent force=true requires expected_session_id (ADR-0012). Pass the session_id you ` +
+                `READ from the row you intend to take over (or null to expect an offline row). There is no ` +
+                `unconditional-force bypass — read the current session_id first, then force with it.`,
+              error_code: ERROR_CODES.VALIDATION,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
 
   // v2.2.1 B2: hard-reject re-registration against an actively-held name.
   // Pre-v2.2.1 this silently rotated session_id and dropped mail on the
@@ -110,27 +143,65 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   // landing between verify and UPDATE. Undefined when not a recovery flow.
   const expectedRecoveryHash = currentContext().verifiedRecoveryHash;
 
-  const { agent, plaintext_token, auto_assigned } = registerAgent(
-    input.name,
-    input.role,
-    input.capabilities,
-    {
-      description: input.description,
-      managed: input.managed,
-      terminal_title_ref: input.terminal_title_ref,
-      expectedRecoveryHash,
-      // v2.2.1 B2: when force=true the db-layer warn is also suppressed to
-      // keep the escape-hatch path quiet. `force` never reaches the DB
-      // beyond this.
-      force: input.force === true,
-      // Tether v0.3 PID-handshake. Governance: writing these under a name
-      // requires that name's token — the dispatcher (server.ts, authenticateAgent
-      // on the active branch) rejects an unauthenticated re-register BEFORE this
-      // handler runs, so the PID write inherits the existing name-auth.
-      host_shell_pids: input.host_shell_pids,
-      host_id: input.host_id,
+  let registerResult: ReturnType<typeof registerAgent>;
+  try {
+    registerResult = registerAgent(
+      input.name,
+      input.role,
+      input.capabilities,
+      {
+        description: input.description,
+        managed: input.managed,
+        // ADR-0002: self-declared coordination class (Zod-validated against
+        // AGENT_CLASSES). Immutable — the DB layer only writes it on first register.
+        class: input.class,
+        cli_profile: input.cli_profile,
+        terminal_title_ref: input.terminal_title_ref,
+        expectedRecoveryHash,
+        // v2.2.1 B2: when force=true the db-layer warn is also suppressed to
+        // keep the escape-hatch path quiet. `force` never reaches the DB
+        // beyond this.
+        force: input.force === true,
+        // ADR-0012 — carry the CAS precondition ONLY on the force path. The
+        // validation above guarantees it is present (string|null) when force=true;
+        // a non-force re-register passes undefined → no session CAS applies.
+        expected_session_id: input.force === true ? input.expected_session_id : undefined,
+        // Tether v0.3 PID-handshake. Governance: writing these under a name
+        // requires that name's token — the dispatcher (server.ts, authenticateAgent
+        // on the active branch) rejects an unauthenticated re-register BEFORE this
+        // handler runs, so the PID write inherits the existing name-auth.
+        host_shell_pids: input.host_shell_pids,
+        host_id: input.host_id,
+      }
+    );
+  } catch (err) {
+    // ADR-0012 — a force TAKEOVER lost its compare-and-swap (another relaunch
+    // won, or the row went live). Surface a DISTINCT code so the client re-reads
+    // + warns LOUDLY, never retry-force, never come up mute.
+    if (err instanceof ForcePreconditionError) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error: err.message,
+                error_code: ERROR_CODES.FORCE_PRECONDITION_FAILED,
+                expected_session_id: err.expectedSessionId,
+                actual_session_id: err.actualSessionId,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: true,
+      };
     }
-  );
+    throw err;
+  }
+  const { agent, plaintext_token, auto_assigned, registration_recovery } = registerResult;
 
   const recoveryCompleted = preState === "recovery_pending";
   if (recoveryCompleted) {
@@ -256,15 +327,26 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
         type: "text" as const,
         text: JSON.stringify(
           {
-            success: true,
-            agent,
-            protocol_version: PROTOCOL_VERSION,
+            // v2.22.0 (#2): agent_token FIRST so curl/script callers capture it
+            // reliably (a truncated `head -c` read still gets it; `.agent_token`
+            // is the leading key) — it was previously buried 4th and a botched
+            // capture orphaned the registration. Shown ONCE; the server stores
+            // only a bcrypt hash.
             ...(plaintext_token
               ? {
                   agent_token: plaintext_token,
                   auth_note: `Save this agent_token in the RELAY_AGENT_TOKEN env var. It is shown only on this response; the server stores a bcrypt hash.`,
                 }
               : {}),
+            // ADR-0005: one-time registration-recovery handle (first register
+            // only). If you lose agent_token before authenticating, call
+            // abandon_registration(name, recovery_handle) to self-clean the
+            // orphan — no operator endpoint needed. Short-lived; retired on
+            // first successful auth.
+            ...(registration_recovery ? { registration_recovery } : {}),
+            success: true,
+            agent,
+            protocol_version: PROTOCOL_VERSION,
             ...(capsNote ? { capabilities_note: capsNote } : {}),
             ...(auto_assigned.length > 0 ? { auto_assigned_tasks: auto_assigned.map((a) => ({ task_id: a.task_id, title: a.title, priority: a.priority })) } : {}),
             ...(recoveryCompleted ? { recovery_completed: true } : {}),
@@ -301,6 +383,38 @@ export function handleUnregisterAgent(input: UnregisterAgentInput) {
         ),
       },
     ],
+  };
+}
+
+/**
+ * ADR-0005 — abandon_registration: self-serve cleanup of the caller's OWN
+ * orphaned registration via the one-time registration-recovery handle (NOT the
+ * lost agent_token). No auth token required — the handle is the proof, and the
+ * keystone (only-never-authed rows) makes it safe by construction. See
+ * db.abandonRegistration.
+ */
+export function handleAbandonRegistration(input: AbandonRegistrationInput) {
+  const result = abandonRegistration(input.name, input.recovery_handle);
+  if (result.abandoned) {
+    fireWebhooks("agent.unregistered", input.name, input.name, {});
+    logAudit(input.name, "abandon_registration", `orphan abandoned target=${input.name}`, true, null, currentContext().transport, {
+      tool: "abandon_registration",
+    });
+  }
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          result.abandoned
+            ? { success: true, name: input.name, abandoned: true, note: `Orphaned registration "${input.name}" abandoned.` }
+            : { success: false, name: input.name, abandoned: false, error: result.reason, error_code: ERROR_CODES.AUTH_FAILED },
+          null,
+          2
+        ),
+      },
+    ],
+    ...(result.abandoned ? {} : { isError: true }),
   };
 }
 
@@ -850,6 +964,15 @@ export function handleRevokeToken(input: RevokeTokenInput) {
 }
 
 export function handleDiscoverAgents(input: DiscoverAgentsInput) {
+  // ADR-0002: view='topology' → the live team grouped by coordination class
+  // (transient + unclassified + dead excluded). Default 'list' is unchanged.
+  if (input.view === "topology") {
+    return {
+      content: [
+        { type: "text" as const, text: JSON.stringify(buildAgentTopology(), null, 2) },
+      ],
+    };
+  }
   const agents = getAgents(input.role);
   return {
     content: [

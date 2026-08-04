@@ -19,6 +19,7 @@ import {
   RegisterAgentSchema,
   DiscoverAgentsSchema,
   UnregisterAgentSchema,
+  AbandonRegistrationSchema,
   SpawnAgentSchema,
   SendMessageSchema,
   GetMessagesSchema,
@@ -56,6 +57,7 @@ import {
   handleRegisterAgent,
   handleDiscoverAgents,
   handleUnregisterAgent,
+  handleAbandonRegistration,
   handleRotateToken,
   handleRotateTokenAdmin,
   handleRevokeToken,
@@ -63,7 +65,7 @@ import {
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
 import { defaultTokenStore } from "./token-store.js";
-import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents } from "./db.js";
+import { logAudit, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken, explicitCallerCacheGet, explicitCallerCachePut, markAgentAuthenticated } from "./db.js";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { currentContext, requestContext } from "./request-context.js";
@@ -156,6 +158,7 @@ export const TOOL_BUNDLES: Record<string, string> = {
   // core
   register_agent: "core",
   unregister_agent: "core",
+  abandon_registration: "core",
   discover_agents: "core",
   send_message: "core",
   get_messages: "core",
@@ -257,6 +260,7 @@ const TOOL_SCHEMAS: Record<string, unknown> = {
   register_agent: RegisterAgentSchema,
   discover_agents: DiscoverAgentsSchema,
   unregister_agent: UnregisterAgentSchema,
+  abandon_registration: AbandonRegistrationSchema,
   spawn_agent: SpawnAgentSchema,
   send_message: SendMessageSchema,
   get_messages: GetMessagesSchema,
@@ -447,6 +451,15 @@ export function createServer(): Server {
           "Returns: `{ success: true, name, removed: boolean, note }`. `removed=false` indicates the name was already absent (idempotent no-op) and is NOT an error.\n\n" +
           "Errors: `AUTH_FAILED` (token missing or wrong owner), `INVALID_INPUT`.",
         inputSchema: zodToJsonSchema(UnregisterAgentSchema),
+      },
+      {
+        name: "abandon_registration",
+        description:
+          "Self-clean YOUR OWN botched (orphaned) registration when you lost the agent_token before ever authenticating — e.g. a curl/script caller truncated the register response. Authenticated by the one-time `registration_recovery` handle returned in the register_agent response (NOT the lost token), so it needs no auth token.\n\n" +
+          "When to use: you registered but never captured/used the token, and the row is now an orphan you can't unregister (unregister needs the token you lost). NOT for a live agent that lost its token mid-session — that agent has authenticated, so this is refused; use `rotate_token` / `relay recover` instead.\n\n" +
+          "Behavior: verifies the `registration_recovery` handle (bcrypt, name-scoped, one-time, TTL-bound) and — ONLY if the target row has NEVER authenticated (the keystone) — deletes it, bumps the auth generation, and fires an `agent.unregistered` webhook. The keystone is re-asserted inside the DELETE, so it can never reach a working agent (a row that authenticates between check and delete is left intact) — the safe, self-serve alternative to the operator kill endpoint. Orphans are also auto-GC'd after ~30min (never-authed + session-less + older than the orphan TTL) as a backstop.\n\n" +
+          "Returns: `{ success, name, abandoned }`. Errors (AUTH_FAILED): agent has authenticated (not an orphan), invalid/expired handle, or no such registration.",
+        inputSchema: zodToJsonSchema(AbandonRegistrationSchema),
       },
       {
         name: "spawn_agent",
@@ -858,6 +871,8 @@ export function createServer(): Server {
         return handleDiscoverAgents(DiscoverAgentsSchema.parse(args));
       case "unregister_agent":
         return handleUnregisterAgent(UnregisterAgentSchema.parse(args));
+      case "abandon_registration":
+        return handleAbandonRegistration(AbandonRegistrationSchema.parse(args));
       case "spawn_agent":
         return handleSpawnAgent(SpawnAgentSchema.parse(args));
       case "send_message":
@@ -1030,46 +1045,16 @@ export function createServer(): Server {
   /**
    * For tools that don't have an explicit caller-name field (spawn_agent,
    * register_webhook, list_webhooks, delete_webhook, discover_agents,
-   * get_task), identify the caller by matching the presented token against
-   * all registered agents. O(N) bcrypt, fine for small deployments. Defer
-   * O(1) token-index lookup to v1.7.x if N grows.
+   * get_task), identify the caller by the presented token.
+   *
+   * ADR-0003 (v2.20.0): delegates to the O(1) resolver in db.ts — verified-
+   * token cache → indexed HMAC locator → single bcrypt confirm, with an O(N)
+   * fallback that guarantees no legacy agent is locked out. Faithful
+   * replacement for the former inline O(N) bcrypt scan: a caller is returned
+   * ONLY for an `active` row or a valid `rotation_grace` window.
    */
   function resolveCallerByToken(token: string): { name: string; capabilities: string[] } | null {
-    const agents = getAgents();
-    for (const a of agents) {
-      const auth = getAgentAuthData(a.name);
-      if (!auth) continue;
-      // v2.1 Phase 4b.1 v2: token_hash is preserved post-revoke (forensic
-      // integrity + CAS contract), so a hash-match alone is insufficient —
-      // state must be 'active' (or rotation_grace, v2.1 Phase 4b.2) for the
-      // token to authenticate.
-      const state = (auth.auth_state ?? "active") as
-        | "active"
-        | "legacy_bootstrap"
-        | "revoked"
-        | "recovery_pending"
-        | "rotation_grace";
-      if (state === "active" && auth.token_hash && verifyToken(token, auth.token_hash)) {
-        return { name: a.name, capabilities: a.capabilities };
-      }
-      // v2.1 Phase 4b.2: during rotation_grace, both the NEW token
-      // (token_hash) and the PREVIOUS token (previous_token_hash) validate
-      // the caller — until rotation_grace_expires_at. Piggyback cleanup
-      // elsewhere will auto-expire the state.
-      if (state === "rotation_grace") {
-        const expiry = auth.rotation_grace_expires_at
-          ? new Date(auth.rotation_grace_expires_at).getTime()
-          : 0;
-        const expired = expiry > 0 && Date.now() >= expiry;
-        if (auth.token_hash && verifyToken(token, auth.token_hash)) {
-          return { name: a.name, capabilities: a.capabilities };
-        }
-        if (!expired && auth.previous_token_hash && verifyToken(token, auth.previous_token_hash)) {
-          return { name: a.name, capabilities: a.capabilities };
-        }
-      }
-    }
-    return null;
+    return resolveAgentByToken(token);
   }
 
   /**
@@ -1182,6 +1167,11 @@ export function createServer(): Server {
         }
         return authError(result.reason!);
       }
+      // ADR-0005 (codex #115 blocker a): a successful active-row re-register is a
+      // real token verification, but register_agent never routes through the
+      // dispatcher's verified-token cache-put — so this exit is where it must
+      // stamp first_authed_at, or the orphan-GC would reap a live re-authed agent.
+      if (!result.legacy) markAgentAuthenticated(claimedName);
       return null;
     }
 
@@ -1200,36 +1190,56 @@ export function createServer(): Server {
       if (!auth) {
         return authError(`Agent "${explicitCaller}" is not registered. Call register_agent first.`);
       }
-      const explicitState = (auth.auth_state ?? "active") as
-        | "active"
-        | "legacy_bootstrap"
-        | "revoked"
-        | "recovery_pending"
-        | "rotation_grace";
-      // v2.1 Phase 4b.2: pass grace inputs so rotation_grace rows can
-      // verify the old token via previous_token_hash until expiry.
-      const result = authenticateAgent(explicitCaller, token, auth.token_hash, explicitState, {
-        previousTokenHash: auth.previous_token_hash ?? null,
-        rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
-      });
-      if (!result.ok) return authError(result.reason!);
-      // v2.14.0 — impersonation tighten: an explicit caller field (from/
-      // agent_name/creator) is an ACTOR claim. The legacy-grace path
-      // authenticates a token-less legacy_bootstrap row WITHOUT proving
-      // identity, so under RELAY_ALLOW_LEGACY a caller could stamp
-      // from=<legacy persona> and speak as it. Grace is for the no-actor
-      // bootstrap path only — it must NOT authenticate an actor identity.
-      // The legacy agent must mint a token (re-register) before using
-      // actor-stamping tools.
-      if (result.legacy) {
-        return authError(
-          `Agent "${explicitCaller}" has no token (legacy pre-v1.7 row). Legacy grace cannot authenticate an actor identity — ` +
-          `register a token (re-register, or 'relay mint-token ${explicitCaller}') before using actor-stamping tools.`,
-          ERROR_CODES.AUTH_FAILED
-        );
+      // v2.20.1 — verified-token cache short-circuit for the explicit-caller HOT
+      // PATH. Impersonation-gated: a hit is honored ONLY when the cached verdict
+      // belongs to `explicitCaller` (a valid token for X cannot authenticate
+      // from=Y). A hit skips the per-call bcrypt; a miss falls through to the
+      // full authenticateAgent flow below (all revoked/recovery/grace/legacy
+      // semantics preserved), which re-verifies + re-populates the cache. The
+      // generation counter (bumped on every token/auth mutation) makes a hit
+      // safe: a revoked/rotated token → generation moved → cache miss → the
+      // authenticateAgent path returns the correct error.
+      const cachedVerdict = token ? explicitCallerCacheGet(token, explicitCaller) : null;
+      if (cachedVerdict) {
+        callerName = explicitCaller;
+        callerCaps = cachedVerdict.capabilities;
+      } else {
+        const explicitState = (auth.auth_state ?? "active") as
+          | "active"
+          | "legacy_bootstrap"
+          | "revoked"
+          | "recovery_pending"
+          | "rotation_grace";
+        // v2.1 Phase 4b.2: pass grace inputs so rotation_grace rows can
+        // verify the old token via previous_token_hash until expiry.
+        const result = authenticateAgent(explicitCaller, token, auth.token_hash, explicitState, {
+          previousTokenHash: auth.previous_token_hash ?? null,
+          rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
+        });
+        if (!result.ok) return authError(result.reason!);
+        // v2.14.0 — impersonation tighten: an explicit caller field (from/
+        // agent_name/creator) is an ACTOR claim. The legacy-grace path
+        // authenticates a token-less legacy_bootstrap row WITHOUT proving
+        // identity, so under RELAY_ALLOW_LEGACY a caller could stamp
+        // from=<legacy persona> and speak as it. Grace is for the no-actor
+        // bootstrap path only — it must NOT authenticate an actor identity.
+        // The legacy agent must mint a token (re-register) before using
+        // actor-stamping tools. (Never cached — see below — so this gate is
+        // ALWAYS reached for a legacy row.)
+        if (result.legacy) {
+          return authError(
+            `Agent "${explicitCaller}" has no token (legacy pre-v1.7 row). Legacy grace cannot authenticate an actor identity — ` +
+            `register a token (re-register, or 'relay mint-token ${explicitCaller}') before using actor-stamping tools.`,
+            ERROR_CODES.AUTH_FAILED
+          );
+        }
+        callerName = explicitCaller;
+        callerCaps = JSON.parse(auth.capabilities) as string[];
+        // v2.20.1 — cache the verified verdict (+ self-heal the digest, Q1) so
+        // repeat calls skip bcrypt. Only reached on ok && !legacy, so only
+        // positive active/grace verdicts are ever cached.
+        if (token) explicitCallerCachePut(token, auth, callerCaps);
       }
-      callerName = explicitCaller;
-      callerCaps = JSON.parse(auth.capabilities) as string[];
     } else {
       // Tools without an explicit caller field — identify by token.
       if (!token) {

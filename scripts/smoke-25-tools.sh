@@ -76,8 +76,13 @@ mcp_call() {
   local body
   body=$(jq -nc --arg name "$name" --argjson args "$args" \
     '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:$name, arguments:$args}}')
-  curl -sS -X POST "$MCP_URL" "${headers[@]}" -d "$body" \
-    | sed -n 's/^data: //p' | head -n 1
+  local resp dataline
+  resp=$(curl -sS -X POST "$MCP_URL" "${headers[@]}" -d "$body")
+  # ADR-0005 #3: one-shot POSTs now return plain application/json (no SSE
+  # `event: message\ndata: {…}` frame). Use the data: line when present (older
+  # SSE framing / stateful paths), else fall back to the raw JSON body.
+  dataline=$(printf '%s\n' "$resp" | sed -n 's/^data: //p' | head -n 1)
+  if [ -n "$dataline" ]; then printf '%s' "$dataline"; else printf '%s' "$resp"; fi
 }
 
 extract_result() {

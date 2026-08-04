@@ -42,10 +42,33 @@ function runHealthMonitor(triggeredBy: string): void {
 }
 
 export function handleSendMessage(input: SendMessageInput) {
+  // v2.22.0 (#5): accept `content` OR its alias `message` — require EXACTLY one
+  // (rejecting neither, and both-with-different-values, mirroring the REST
+  // ApiSendMessageSchema), then normalize to `content`.
+  const hasContent = typeof input.content === "string";
+  const hasMessage = typeof input.message === "string";
+  const validationError =
+    !hasContent && !hasMessage
+      ? "either `content` or `message` is required"
+      : hasContent && hasMessage && input.content !== input.message
+        ? "provide only one of `content` / `message` — both were sent with different values"
+        : null;
+  if (validationError) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ success: false, error: validationError, error_code: ERROR_CODES.VALIDATION }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+  const content = (hasContent ? input.content : input.message) as string;
   try {
-    const message = sendMessage(input.from, input.to, input.content, input.priority);
+    const message = sendMessage(input.from, input.to, content, input.priority);
     fireWebhooks("message.sent", input.from, input.to, {
-      content: input.content,
+      content,
       message_id: message.id,
     });
     return {

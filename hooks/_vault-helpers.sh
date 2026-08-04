@@ -379,3 +379,129 @@ relay_pid_start() {
   [ -n "$pid" ] || return
   LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
+
+# Is PID a live process on THIS host? The signal-0 probe, mirroring src/liveness.ts
+# isPidAlive() EXACTLY so the bash gate and the TS gate never disagree:
+#   - signalable            → alive (0)
+#   - EPERM (cross-user)    → alive — the process EXISTS, it just isn't ours
+#   - ESRCH / anything else → dead (1)
+#   - non-integer / non-positive pid → dead (1)
+# The EPERM branch is not academic: without it a cross-user process at the
+# recorded PID reads DEAD here while isPidAlive reads ALIVE — the exact TS/bash
+# split that turns the diagnostic→release-binding handoff into a deadlock. Bare
+# `kill -0` returns failure for BOTH EPERM and ESRCH, so we re-probe and inspect
+# the strerror text; LC_ALL=C pins it to "Operation not permitted" (locale-stable,
+# same pin relay_pid_start already relies on).
+relay_pid_alive() {
+  local pid="$1"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" -gt 0 ] 2>/dev/null || return 1
+  if kill -0 "$pid" 2>/dev/null; then return 0; fi
+  case "$(LC_ALL=C kill -0 "$pid" 2>&1)" in
+    *'not permitted'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ANCHOR-ONLY liveness verdict — the bash TWIN of src/liveness.ts
+# anchorLivenessVerdict(), pinned byte-for-verdict by the conformance test
+# (tests/anchor-liveness-conformance). This is the SHARED rule for the dead-anchor
+# diagnostic (below in check-relay.sh) AND the `relay release-binding` gate, so the
+# thing the diagnostic tells the operator to run can never refuse what the
+# diagnostic diagnosed.
+#
+# Args (all positional, no env, no ambient reads — a PURE function of its inputs so
+# it is testable in isolation):
+#   $1 agent_pid        the stored liveness anchor PID
+#   $2 agent_pid_start  the stored start-time token (PID-reuse guard); may be empty
+#   $3 row_host_id      the agent row's host_id
+#   $4 own_host_id      THIS host's machine GUID (relay_machine_guid)
+# Emits exactly one of: dead | alive | unverifiable  (on stdout, no newline).
+#
+# DELIBERATELY NOT the presence cascade (computeLivenessVerdict / relay_agent_pid's
+# argv scan). PRESENCE asks "is there ANY process for this agent?" (argv-inclusive,
+# for the dashboard); ELIGIBILITY asks "is THIS binding's anchor dead?"
+# (anchor-only, for the gate + diagnostic). An argv-advertised agent (every codex
+# terminal carries RELAY_AGENT_NAME in its argv) would read presence-alive on a
+# dead anchor and make its stale binding unrecoverable. So this probes the anchor
+# and NOTHING else. Mirrors isAgentProcessAlive's narrow-dead rule:
+#   - cross-host / missing GUID / non-probe-able pid → unverifiable (never guess)
+#   - pid not alive                                  → dead
+#   - pid alive, no start anchor                     → alive (PID-liveness only)
+#   - pid alive, start unreadable                    → alive (can't validate → trust PID)
+#   - pid alive, start MATCHES                        → alive
+#   - pid alive, start MISMATCH (PID reuse)           → dead
+relay_anchor_liveness() {
+  local agent_pid="$1" agent_pid_start="$2" row_host="$3" own_host="$4" cur
+  if [ -z "$own_host" ] || [ -z "$row_host" ] || [ "$row_host" != "$own_host" ]; then
+    printf 'unverifiable'; return
+  fi
+  case "$agent_pid" in ''|*[!0-9]*) printf 'unverifiable'; return ;; esac
+  [ "$agent_pid" -gt 0 ] 2>/dev/null || { printf 'unverifiable'; return; }
+  if ! relay_pid_alive "$agent_pid"; then printf 'dead'; return; fi
+  if [ -z "$agent_pid_start" ]; then printf 'alive'; return; fi
+  cur=$(relay_pid_start "$agent_pid")
+  if [ -z "$cur" ]; then printf 'alive'; return; fi
+  if [ "$cur" = "$agent_pid_start" ]; then printf 'alive'; else printf 'dead'; fi
+}
+
+# --- v2.16.3: Tether v0.3 PID-handshake helpers (shared — moved out of
+# check-relay.sh so the Codex SessionStart hook can report the SAME handshake
+# and Tether can PID-bind Codex terminals, not just Claude ones) --------------
+#
+# Compute the agent's machine GUID + process-ancestry PID chain so Tether can
+# bind THIS terminal to THIS agent by process id (no manual naming). Both MUST
+# match the extension's TypeScript readers (extensions/vscode/src/host-identity.ts)
+# byte-for-byte — same OS source, same extraction — or the two host_ids won't
+# agree and host-scoped matching silently fails. For a well-formed OS machine id
+# (a 32-hex /etc/machine-id or a real IOPlatformUUID — the only case on a real
+# host) the bash strip-whitespace here and the TS 32-hex-first-line extraction
+# resolve the SAME value (exercised: tests/v2-16-3 C5, bash == TS on this host).
+# A malformed id could diverge, but that only degrades to a host-scope miss →
+# name-match fallback, never a wrong wake. POSIX is the real path
+# (macOS / Linux); the Windows (git-bash) branches mirror the documented
+# wmic/reg shapes but are not runtime-tested (no Windows host). Any failure →
+# empty output → the field is omitted from the register call (graceful: Tether
+# falls back to name matching).
+relay_machine_guid() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+        | sed -nE 's/.*"IOPlatformUUID" = "([^"]+)".*/\1/p' | head -1 ;;
+    Linux)
+      head -1 /etc/machine-id 2>/dev/null | tr -d '[:space:]' ;;
+    MINGW*|MSYS*|CYGWIN*)
+      reg query 'HKLM\SOFTWARE\Microsoft\Cryptography' //v MachineGuid 2>/dev/null \
+        | sed -nE 's/.*MachineGuid[[:space:]]+REG_SZ[[:space:]]+([^[:space:]]+).*/\1/p' | head -1 ;;
+  esac
+}
+
+# Walk parent PIDs from this hook shell ($$) up toward init, emitting a JSON
+# array "[pid1,pid2,...]". The hook is a descendant of the agent (claude/codex),
+# which is a descendant of the controlling shell (= VS Code Terminal.processId),
+# so that shell PID is always in the chain regardless of launch path. Bounded +
+# stops at init.
+relay_pid_chain() {
+  local pid=$$ chain="" depth=0 ppid wtable
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      wtable=$(wmic process get ProcessId,ParentProcessId /format:csv 2>/dev/null)
+      [ -z "$wtable" ] && { printf '[]'; return; }
+      while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+        chain="${chain:+$chain,}$pid"
+        ppid=$(printf '%s\n' "$wtable" | awk -F, -v p="$pid" 'NR>1 && $3+0==p {gsub(/[^0-9]/,"",$2); print $2; exit}')
+        case "$ppid" in ''|*[!0-9]*) break ;; esac
+        [ "$ppid" -le 1 ] && break
+        pid="$ppid"; depth=$((depth+1))
+      done ;;
+    *)
+      while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+        chain="${chain:+$chain,}$pid"
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        case "$ppid" in ''|*[!0-9]*) break ;; esac
+        [ "$ppid" -le 1 ] && break
+        pid="$ppid"; depth=$((depth+1))
+      done ;;
+  esac
+  printf '[%s]' "$chain"
+}

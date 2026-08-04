@@ -165,26 +165,30 @@ describe("v2.0 final #7 — payload size limit", () => {
 // #2 — Dead agent purge
 // ============================================================================
 
-describe("v2.0 final #2 — dead agent purge on startup", () => {
-  it("purges agents offline >30 days during purgeOldRecords (called by getDb)", () => {
-    // Register a fresh agent.
+describe("v2.0 final #2 — INVERTED by the ADR-0005 final ruling: startup purges NO agent row", () => {
+  it("an agent offline >30 days SURVIVES purgeOldRecords (identity is not a record with a retention window)", () => {
+    // This test used to assert the opposite (the 30-day dead-agent purge
+    // reaped stale-agent on startup). Cut by ruling: "idle 30 days" is an
+    // undecidable abandonment proxy, the purge deleted ESTABLISHED
+    // identities, and freeing the name reopened the bootstrap-claim window
+    // for anyone. Operators prune deliberately via `relay purge-agents`.
     registerAgent("fresh", "r", ["x"]);
-    // Directly age another agent into the dead zone via raw SQL.
+    // Directly age another agent deep into the previously-dead zone.
     const db = getDb();
     db.prepare(
       "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, session_id, agent_status) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'online')"
     ).run("stale-id", "stale-agent", "r", "[]", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "stale-sess");
     db.prepare("INSERT INTO agent_capabilities (agent_name, capability) VALUES (?, ?)").run("stale-agent", "cap1");
 
-    // Close + reopen to re-trigger startup purge.
+    // Close + reopen to re-trigger the startup purge tick.
     closeDb();
     const freshDb = getDb();
-    const agents = getAgents();
-    expect(agents.find((a) => a.name === "fresh")).toBeTruthy();
-    expect(agents.find((a) => a.name === "stale-agent")).toBeUndefined();
-    // Normalized caps are cleaned up.
+    const row = freshDb.prepare("SELECT name FROM agents WHERE name = 'stale-agent'").get();
+    expect(row).toBeTruthy();
+    // The capability sidecar survives with it.
     const caps = freshDb.prepare("SELECT * FROM agent_capabilities WHERE agent_name = ?").all("stale-agent") as unknown[];
-    expect(caps.length).toBe(0);
+    expect(caps.length).toBe(1);
+    expect(getAgents().find((a) => a.name === "fresh")).toBeTruthy();
   });
 });
 

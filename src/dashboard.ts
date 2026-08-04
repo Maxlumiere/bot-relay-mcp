@@ -4,6 +4,7 @@
 // See LICENSE for full terms.
 
 import type { Request, Response } from "express";
+import { createHash } from "node:crypto";
 import { getAgents, listWebhooks, getDb, getDashboardPrefs, getInboxSummary } from "./db.js";
 import { getKeyringInfo, decryptContent } from "./encryption.js";
 import type { MessageRecord, TaskRecord } from "./types.js";
@@ -11,12 +12,15 @@ import { DASHBOARD_BASE_STYLES, DASHBOARD_THEMES } from "./dashboard-styles.js";
 
 /**
  * v2.2.0 Phase 3: decrypt + truncate a content field for dashboard display.
- * 100-char cap matches get_messages_summary (v2.1.6). Narrow expansion of
- * the v2.1 Phase 4d encryption-policy comment: the dashboard is behind
- * dashboardAuthCheck + originCheck + httpHostCheck, so this preview is
- * only reachable by someone who could already call get_messages. Full
- * ciphertext stays untouched in the `content` / `description` / `result`
- * fields for clients that want the raw on-disk form.
+ * 100-char cap matches get_messages_summary (v2.1.6).
+ *
+ * ADR-0006 (2026-07-25): a decrypted preview is OPERATOR-POWER — it exposes
+ * one agent's plaintext mail to whoever holds it, which get_messages grants
+ * ONLY to that agent's own token. It is therefore emitted solely to an
+ * authenticated dashboard caller (see snapshotApi); a caller admitted on
+ * loopback position alone is NOT a principal and never receives it. The raw
+ * column ships ONLY in the authenticated response (ciphertext if a keyring is
+ * set, else plaintext); the unauthenticated view omits it entirely.
  */
 const PREVIEW_CAP = 100;
 function previewField(raw: string | null | undefined): string | null {
@@ -24,6 +28,86 @@ function previewField(raw: string | null | undefined): string | null {
   const decrypted = decryptContent(raw) ?? raw;
   if (decrypted.length <= PREVIEW_CAP) return decrypted;
   return decrypted.slice(0, PREVIEW_CAP);
+}
+
+/**
+ * ADR-0006 (2026-07-25) — the UNauthenticated snapshot is built from an explicit
+ * ALLOWLIST of fields classified SAFE, not by redacting known-bad ones.
+ *
+ * THE CLASSIFICATION RULE — apply to EVERY field before adding it here: is the
+ * value OPERATOR-AUTHORED FREE TEXT, or STRUCTURAL (drawn from a fixed
+ * vocabulary the system controls)? Free text can carry an arbitrary secret
+ * regardless of the field's NAME, so it is content and must NOT appear here. A
+ * denylist missed this twice: first the raw `content` column (plaintext without
+ * a keyring), then the free-text `description` / `title` fields that are content
+ * despite innocuous names. Structural values — enums, timestamps, uuids,
+ * booleans, system-computed presence, registry-validated ids — cannot carry a
+ * secret.
+ *
+ * DELIBERATE, DOCUMENTED exposures (constrained, but required for the dashboard
+ * to function at all): the agent-name addressing keys `name` / `from_agent` /
+ * `to_agent`. They are regex-constrained to AGENT_NAME_PATTERN ([A-Za-z0-9_.-],
+ * no spaces, no prose) and ARE the public addressing layer — you cannot display
+ * or address an agent without its name.
+ *
+ * Verified FREE TEXT and therefore EXCLUDED (src/types.ts): agent `role`
+ * (string≤64, no pattern), `capabilities` (array of free strings), `description`
+ * (string≤512); task `title` (string≤256), `required_capabilities` (array of
+ * free strings); message `routed_capability` (a free capability token).
+ * `server_version` is excluded as ambiguous-provenance — not worth the risk for
+ * an operational view. CONTENT columns (content/description/result) and process
+ * locators (session_id, host_shell_pids, host_id, terminal_title_ref) are
+ * excluded as before.
+ *
+ * If a future field is free text AND genuinely required unauthenticated, add it
+ * here WITH a one-line justification. An honest documented exposure is fine; an
+ * unexamined one is the class we keep removing.
+ */
+const AGENT_PUBLIC_FIELDS = [
+  "name", // addressing key — deliberate documented exposure (regex-constrained id)
+  "status", "agent_status", // structural: derived-status enums
+  "liveness", "alive", "last_alive", // structural: system-computed presence
+  "routable", "routability", // structural: routing-actionability (audit HIGH #2)
+  "last_seen", "created_at", // structural: timestamps
+  "has_token", // structural: boolean
+  "class", // structural: fixed 5-value enum
+  "cli_profile", // structural: validated against the CLI registry (or null)
+] as const;
+const MESSAGE_PUBLIC_FIELDS = [
+  "id", // structural: uuid
+  "from_agent", "to_agent", // addressing keys — deliberate documented exposure
+  "priority", "status", "disposition", // structural: enums
+  "created_at", "deadline", "read_at", "resolved_at", // structural: timestamps
+  "seq", // structural: integer
+] as const;
+const TASK_PUBLIC_FIELDS = [
+  "id", // structural: uuid
+  "from_agent", "to_agent", // addressing keys — deliberate documented exposure
+  "priority", "status", // structural: enums
+  "created_at", "updated_at", "lease_renewed_at", // structural: timestamps
+] as const;
+/** Build an object from ONLY the named fields that are present on the source. */
+function pickPublic(obj: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const f of fields) if (f in obj) out[f] = obj[f];
+  return out;
+}
+
+/**
+ * The HOST of a webhook URL for the unauthenticated view — never the path,
+ * query, or userinfo. A webhook URL like `https://user:pass@host/services/TOKEN`
+ * carries the credential in exactly those parts; `URL.hostname` yields ONLY the
+ * host (no userinfo, no port, no path), so a parser — never a regex that grabs
+ * "everything after :// up to /" — is the safe extractor. A malformed URL → null
+ * (never throw, never fall back to the raw string, which would leak it).
+ */
+function hostOnly(rawUrl: string | null | undefined): string | null {
+  if (!rawUrl) return null;
+  try {
+    return new URL(rawUrl).hostname || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -35,20 +119,31 @@ function previewField(raw: string | null | undefined): string | null {
  *   - agents: `AgentWithStatus` (`toAgentWithStatus` in db.ts) strips
  *     `token_hash` and exposes `has_token: boolean`. NEVER surfaces the
  *     bcrypt hash or any raw token.
- *   - webhooks: raw `WebhookRecord.secret` is replaced with
- *     `has_secret: boolean` by the dashboard mapper below. NEVER surfaces
- *     the raw HMAC secret.
- *   - messages / tasks: raw `content` / `description` / `result` columns
- *     remain at-rest-encrypted ciphertext (`enc1:…` / `enc:<kid>:…`)
- *     in the response, unchanged from v2.1. v2.2.0 ADDS sibling
- *     `content_preview` / `description_preview` / `result_preview`
- *     fields — 100-char decrypted previews for the reactive dashboard.
- *     Narrow Phase 4d policy expansion: the dashboard is gated by
- *     `dashboardAuthCheck` + `originCheck` + `httpHostCheck` + CSRF on
- *     state-changing endpoints, so any caller reaching the preview could
- *     already call `get_messages` for the same decrypted content. See
- *     CHANGELOG v2.2.0 "Policy change for operators" callout for the
- *     operator-facing guidance.
+ *   - webhooks: the HMAC `secret` IS NOT THE ONLY CREDENTIAL. A webhook `url`
+ *     for an incoming-hook service (Slack/Discord/…) IS itself a credential —
+ *     possession of the string is enough to post as the operator, so an
+ *     unauthenticated caller reading it ACQUIRES that power (ADR-0006: power
+ *     from identity, never network position; who AUTHORED the value is
+ *     irrelevant). This comment's prior version redacted only the field NAMED
+ *     `secret`, declared webhooks handled, and shipped the credential in the
+ *     adjacent `url` — field-name-as-proxy, the birthplace of this leak. By
+ *     classification: `has_secret` (bool) + `event` (WebhookEventEnum, a
+ *     declared set) are structural and exposed; the raw HMAC `secret` never is;
+ *     the `url` is reduced to its `url_host` for an unauthenticated caller (full
+ *     `url` only when authenticated); and the free-text `filter` is excluded.
+ *   - messages / tasks: an AUTHENTICATED caller (verified dashboard secret) gets
+ *     the full rows — raw `content` / `description` / `result` (ciphertext only
+ *     IF a keyring is configured; PLAINTEXT otherwise, since at-rest encryption
+ *     is opt-in) plus decrypted `*_preview` fields. An UNAUTHENTICATED caller
+ *     gets an ALLOWLISTED metadata view (see `*_PUBLIC_FIELDS`) with NO content
+ *     column of any kind — shipping the raw column would leak plaintext by
+ *     default. ADR-0006 (2026-07-25) corrects the prior v2.2.0 note twice over:
+ *     it claimed any caller reaching the preview "could already call
+ *     get_messages for the same content" (FALSE — get_messages is scoped to the
+ *     caller's OWN token-bound inbox, never another agent's), AND it assumed the
+ *     raw column was safe because "encrypted" (FALSE by default). Location is
+ *     not a principal: unauthenticated → `restricted`, and `restricted` means
+ *     the content is genuinely absent from the body, not merely un-previewed.
  *   - webhook_delivery_log with its `error_text` is NOT returned by
  *     snapshotApi. If a future change adds it, redact internal-looking
  *     paths + IPs before surfacing.
@@ -100,11 +195,37 @@ export function keyringApi(_req: Request, res: Response): void {
 }
 
 /**
+ * If-None-Match matcher for the snapshot's strong ETag. RFC 7232 conditional-GET
+ * (weak) comparison: `*` matches anything; otherwise the client's tag matches
+ * ours after stripping an optional `W/` prefix. Accepts a comma-separated list.
+ * Our ETag is strong; a well-behaved client echoes it verbatim.
+ */
+function ifNoneMatchSatisfies(header: string | string[] | undefined, etag: string): boolean {
+  if (!header) return false;
+  const value = Array.isArray(header) ? header.join(",") : header;
+  if (value.trim() === "*") return true;
+  return value.split(",").some((raw) => raw.trim().replace(/^W\//, "") === etag);
+}
+
+/**
  * JSON API for the dashboard — returns a snapshot of relay state.
  * GET /api/snapshot
+ *
+ * The body carries absolute timestamps only and NO server-now, so it is stable
+ * between substantive changes; a strong ETag over it + server-now in the `Date`
+ * header give a working If-None-Match / 304 contract (server-now rides the 304,
+ * which has no body). See the body-construction comment below.
  */
-export function snapshotApi(_req: Request, res: Response): void {
+export function snapshotApi(req: Request, res: Response): void {
   try {
+    // ADR-0006 — "location is not a principal." Operator-power fields
+    // (decrypted content previews + process-identifying agent metadata) are
+    // served ONLY to a caller authenticated with a real dashboard secret.
+    // dashboardAuthCheck sets this true only on a verified secret; a caller
+    // admitted on loopback position alone leaves it false and receives a
+    // `restricted` snapshot. Agent-trust (presence/status/counts) is separate
+    // and stays visible so the operational dashboard works without a secret.
+    const authed = res.locals?.dashboardAuthenticated === true;
     const db = getDb();
     const agentsBase = getAgents();
     // v2.4.1 — per-agent inbox rollup. Additive fields only; the rest of
@@ -113,21 +234,21 @@ export function snapshotApi(_req: Request, res: Response): void {
     const inboxByName = new Map(inboxRows.map((r) => [r.agent_name, r]));
     const agents = agentsBase.map((a) => {
       const ix = inboxByName.get(a.name);
-      return {
-        ...a,
+      // Counts are non-sensitive flow metadata — safe in both views.
+      const counts = {
         pending_count: ix ? ix.pending_count : 0,
         unread_count: ix ? ix.unread_count : 0,
         last_message_at: ix ? ix.last_message_at : null,
       };
+      return authed
+        ? { ...a, ...counts }
+        : { ...pickPublic(a as unknown as Record<string, unknown>, AGENT_PUBLIC_FIELDS), ...counts };
     });
-    const webhooks = listWebhooks().map((w) => ({
-      id: w.id,
-      url: w.url,
-      event: w.event,
-      filter: w.filter,
-      has_secret: !!w.secret,
-      created_at: w.created_at,
-    }));
+    const webhooks = listWebhooks().map((w) =>
+      authed
+        ? { id: w.id, url: w.url, event: w.event, filter: w.filter, has_secret: !!w.secret, created_at: w.created_at }
+        : { id: w.id, url_host: hostOnly(w.url), event: w.event, has_secret: !!w.secret, created_at: w.created_at },
+    );
 
     const messages = db
       .prepare("SELECT * FROM messages ORDER BY created_at DESC LIMIT 20")
@@ -144,19 +265,26 @@ export function snapshotApi(_req: Request, res: Response): void {
     // v2.2.0 Phase 3: attach 100-char decrypted previews alongside the
     // raw (encrypted) content/description/result fields. Frontend renders
     // the preview; raw stays available for clients that want it.
-    const messagesWithPreview = messages.map((m) => ({
-      ...m,
-      content_preview: previewField(m.content),
-    }));
-    const tasksWithPreview = activeTasks.map((t) => ({
-      ...t,
-      description_preview: previewField(t.description),
-    }));
-    const completionsWithPreview = recentCompletions.map((t) => ({
-      ...t,
-      description_preview: previewField(t.description),
-      result_preview: previewField(t.result),
-    }));
+    // CONTENT is operator-power (ADR-0006). An authenticated caller gets the
+    // full row + decrypted previews. An UNauthenticated caller gets ONLY the
+    // allowlisted metadata — NO content/description/result column at all (they
+    // are plaintext without a keyring), so there is nothing to leak, by
+    // construction, even for a column added later.
+    const messagesWithPreview = messages.map((m) =>
+      authed
+        ? { ...m, content_preview: previewField(m.content) }
+        : pickPublic(m as unknown as Record<string, unknown>, MESSAGE_PUBLIC_FIELDS),
+    );
+    const tasksWithPreview = activeTasks.map((t) =>
+      authed
+        ? { ...t, description_preview: previewField(t.description) }
+        : pickPublic(t as unknown as Record<string, unknown>, TASK_PUBLIC_FIELDS),
+    );
+    const completionsWithPreview = recentCompletions.map((t) =>
+      authed
+        ? { ...t, description_preview: previewField(t.description), result_preview: previewField(t.result) }
+        : pickPublic(t as unknown as Record<string, unknown>, TASK_PUBLIC_FIELDS),
+    );
 
     // v2.2.1 P1: surface the server-side default theme alongside the rest
     // of the snapshot. The dashboard client reads it on first connect when
@@ -168,16 +296,78 @@ export function snapshotApi(_req: Request, res: Response): void {
     } catch {
       dashboardPrefs = { theme: "catppuccin", custom_json: null, updated_at: null };
     }
+    // ADR-0006: `custom_json` is an operator-authored FREE-TEXT theme blob —
+    // withhold it from an unauthenticated caller. The named `theme` is a known
+    // value and stays, so the restricted dashboard still themes. (Applying the
+    // free-text/structural rule past the agent/message/task/webhook lists.)
+    if (!authed && dashboardPrefs && typeof dashboardPrefs === "object") {
+      dashboardPrefs = { ...dashboardPrefs, custom_json: null };
+    }
 
-    res.json({
-      timestamp: new Date().toISOString(),
+    // The snapshot body carries ABSOLUTE timestamps only (agent last_seen,
+    // message/task created_at + updated_at, last_message_at — all DB values) —
+    // NO computed ages, and NO server-now in the body. Server-now lives in the
+    // HTTP `Date` header (below) so the body is STABLE between substantive
+    // changes and an ETag over it actually matches poll-to-poll. (lumen's
+    // correction of the original design: a server-now `timestamp` field IN the
+    // body changes on every poll, defeating the ETag entirely — the 304 path
+    // dies on arrival. A 304 carries `Date` but no body, so the client keeps an
+    // authoritative clock on a cache HIT — the exact moment a naive design would
+    // render a stale age as current.)
+    const bodyObj = {
+      // ADR-0006 visibility signal — never silent: an unauthenticated caller
+      // is told the operator-power fields were withheld, not left guessing.
+      authenticated: authed,
+      content_visibility: authed ? "full" : "restricted",
       agents,
       webhooks,
       messages: messagesWithPreview,
       active_tasks: tasksWithPreview,
       recent_completions: completionsWithPreview,
       dashboard_prefs: dashboardPrefs,
-    });
+    };
+    const payload = JSON.stringify(bodyObj);
+    // Strong ETag over a STABLE PROJECTION of the body — base64url of a SHA-256,
+    // computed explicitly (not via Express's `etag` app setting) so the 304
+    // contract is deterministic and directly testable.
+    //
+    // The ETag must cover SUBSTANTIVE state only. Per-agent `last_alive` is a
+    // genuine liveness observation on a ~5-second probe cycle
+    // (`positiveConfirmationISO`, src/db.ts — it refreshes on each positive probe
+    // and nulls out after `LIVENESS_PROBE_CACHE_MS`), so it legitimately changes
+    // ~every 5s on its own cadence. That is NOT substantive change for caching:
+    // if it fed the ETag the body would rehash every few seconds and the 304 path
+    // would stay dead (measured: with only `timestamp` excluded, 13 distinct
+    // bodies across 25 polls / 60s; excluding `last_alive` too → 1). So
+    // `last_alive` is excluded from the ETag INPUT — but it STAYS in the sent body
+    // (`payload` above), because it is real data lumen's board consumes. This is
+    // an ETag-input exclusion, NOT a field removal: do NOT "fix" it by dropping
+    // `last_alive` from the body — that would repeat the `timestamp` treatment on
+    // a field that is meant to be served.
+    const etagInput = {
+      ...bodyObj,
+      agents: bodyObj.agents.map((a) => {
+        const rest = { ...(a as Record<string, unknown>) };
+        delete rest.last_alive;
+        return rest;
+      }),
+    };
+    const etag = `"${createHash("sha256").update(JSON.stringify(etagInput)).digest("base64url")}"`;
+    // Server-now in the `Date` header — present on BOTH the 200 and the 304, so
+    // a cache HIT still delivers an authoritative clock (the whole point of the
+    // header-not-body split). Set explicitly so a 304 is never clock-less.
+    res.setHeader("Date", new Date().toUTCString());
+    res.setHeader("ETag", etag);
+    // Force revalidation: the client sends If-None-Match so the server takes the
+    // 304-vs-200 decision, rather than a cache serving a blind stale body.
+    res.setHeader("Cache-Control", "no-cache");
+    if (ifNoneMatchSatisfies(req.headers["if-none-match"], etag)) {
+      // 304: no body. Date + ETag already set above.
+      res.status(304).end();
+      return;
+    }
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.status(200).send(payload);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: msg });
@@ -405,6 +595,31 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
 
   // v2.2.1 P1: apply the selected theme to <html> via data-theme (for
   // named themes) or inline --* custom properties (for pasted custom).
+  // Defence-in-depth (READ side). The server WRITE path (isSafeCssColorValue in
+  // src/css-color.ts, via the theme schema) is the PRIMARY control; this guard
+  // catches a value written BEFORE that validation existed, or via direct DB
+  // access, so it never reaches setProperty un-checked — a token feeds the CSS
+  // background: shorthand, which accepts url() and would beacon.
+  //
+  // DELIBERATE DIVERGENCE — do NOT unify this with the write-side validator
+  // (ADR-0015 L4: two predicates are fine when the divergence is named). They
+  // answer DIFFERENT questions. WRITE asks "is this a known-GOOD form?" -> strict,
+  // closed named-colour set. READ asks "could this stored value BEACON?" ->
+  // looser: a bare alpha word passes, because with no parens it cannot url()-
+  // beacon and an invalid CSS colour is simply ignored by the browser. The read
+  // side MUST stay this permissive so a legitimate LEGACY theme (a named/system
+  // colour stored before the write guard existed) still applies. Tightening read
+  // to the strict set breaks those; loosening write to this weakens the primary
+  // control. Keep them separate.
+  function isSafeThemeColor(v) {
+    if (typeof v !== 'string') return false;
+    var s = v.trim();
+    if (!s || s.length > 64) return false;
+    if (/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(s)) return true;
+    if (/^(?:rgb|rgba|hsl|hsla)\(\s*[0-9.,%/\s]+\)$/i.test(s)) return true;
+    if (/^[a-z]+$/i.test(s)) return true;
+    return false;
+  }
   function applyTheme(theme, customJson) {
     const root = document.documentElement;
     if (theme === 'custom' && customJson) {
@@ -415,7 +630,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
       try {
         const obj = typeof customJson === 'string' ? JSON.parse(customJson) : customJson;
         for (const t of TOKENS) {
-          if (obj && typeof obj[t] === 'string') root.style.setProperty('--' + t, obj[t]);
+          if (obj && typeof obj[t] === 'string' && isSafeThemeColor(obj[t])) root.style.setProperty('--' + t, obj[t]);
         }
       } catch (_e) { /* silently fall back to catppuccin */ }
     } else {
@@ -450,6 +665,10 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
 
   // ---------- state ----------
   let snapshot = null;
+  // Authoritative clock comes from the response Date header (server-now), not
+  // from the body — the body no longer carries a timestamp (it must stay stable
+  // for the ETag). Captured on every fetch; used for the "updated" display.
+  let snapshotDate = null;
   let focusedAgent = null;
 
   // ---------- rendering ----------
@@ -561,12 +780,19 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
         : 'Inbox: no messages yet';
       const inboxCls = pending > 0 ? 'inbox-badge inbox-badge-warn' : 'inbox-badge inbox-badge-zero';
       const inboxLabel = pending > 0 ? pending + ' pending' : '0';
+      // audit HIGH #2 — LOUD, distinct, named state. unroutable_alive = a live
+      // process the router will silently never give work; surface it as its own
+      // badge so an operator sees it at a glance, not by diffing two fields.
+      const routWarn = a.routability === 'unroutable_alive'
+        ? '<div class="state"><span class="badge" style="background:#c0392b;color:#fff" title="Live process but NO session — the router will never give this agent work until it re-registers.">⚠ unroutable</span></div>'
+        : '';
       return '<div class="agent-card' + isFocused + '" role="button" tabindex="0" data-agent="' + esc(a.name) + '"' + style + resized + '>' +
         '<button class="card-reset" type="button" aria-label="Reset card size" data-action="reset-size" data-agent-name="' + esc(a.name) + '" title="Reset size">×</button>' +
         '<div class="name">' + esc(a.name) + '</div>' +
-        '<div class="role">' + esc(a.role) + '</div>' +
+        '<div class="role">' + esc(a.role || '') + '</div>' +
         '<div class="inbox" title="' + esc(inboxTip) + '"><span class="' + inboxCls + '" data-pending="' + pending + '" data-unread="' + unread + '">' + esc(inboxLabel) + '</span></div>' +
         '<div class="state"><span class="badge badge-' + esc(s) + '">' + esc(s) + '</span></div>' +
+        routWarn +
         '<div class="seen">last seen ' + fmtTime(a.last_seen) + '</div>' +
         '<span class="card-resize" data-action="resize-handle" data-agent-name="' + esc(a.name) + '" title="Drag to resize (snaps to grid)">↘</span>' +
       '</div>';
@@ -634,7 +860,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
       html += '<div class="row"><div class="row-head">' +
         '<span class="row-title">🪝 ' + esc(w.event) + (w.filter ? ' (filter: ' + esc(w.filter) + ')' : '') + '</span>' +
         '<span class="row-meta">' + fmtTime(w.created_at) + '</span></div>' +
-        '<div class="row-body"><code>' + esc(w.url) + '</code>' + (w.has_secret ? ' · signed' : '') + '</div></div>';
+        '<div class="row-body"><code>' + esc(w.url || w.url_host || '') + '</code>' + (w.has_secret ? ' · signed' : '') + '</div></div>';
     });
     completions.forEach((t) => {
       const preview = t.result_preview || t.description_preview || '';
@@ -670,14 +896,19 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
     renderMessages();
     renderMeta();
     renderFocused();
-    document.getElementById('updated').textContent = 'updated ' + fmtTime(snapshot && snapshot.timestamp);
+    document.getElementById('updated').textContent = 'updated ' + fmtTime(snapshotDate);
   }
 
   // ---------- data fetch ----------
   async function fetchSnapshot() {
     try {
-      const res = await fetch('/api/snapshot', { credentials: 'same-origin' });
+      // cache:'no-store' — the dashboard always takes a fresh 200 (never a
+      // browser-served 304), so res.json() always has a body and the Date header
+      // is server-now. The If-None-Match / 304 cache path is for external
+      // monitors (lumen), which manage the ETag themselves.
+      const res = await fetch('/api/snapshot', { credentials: 'same-origin', cache: 'no-store' });
       if (!res.ok) throw new Error('snapshot ' + res.status);
+      snapshotDate = res.headers.get('date');
       snapshot = await res.json();
       // v2.2.1 P1: if the operator hasn't picked a theme yet this session
       // (localStorage has no operator-set flag), adopt the server default.

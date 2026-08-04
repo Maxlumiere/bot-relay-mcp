@@ -70,6 +70,11 @@ export const ERROR_CODES = {
   // State / concurrency -----------------------------------------------------
   /** CAS write lost a race — re-read and retry. */
   CONCURRENT_UPDATE: "CONCURRENT_UPDATE",
+  /** ADR-0012 — a force TAKEOVER lost its compare-and-swap: the row's
+   * session_id no longer equals the caller's expected_session_id (another
+   * relaunch won, or the row went live). The caller MUST re-read (its LIVE gate
+   * then skips) and surface loudly — NEVER retry-force, NEVER come up mute. */
+  FORCE_PRECONDITION_FAILED: "FORCE_PRECONDITION_FAILED",
   /** State-transition violation (e.g., cancel a completed task). */
   INVALID_STATE: "INVALID_STATE",
 

@@ -7,8 +7,23 @@
 // and WHICH terminal to wake; the adapter decides WHAT to inject and HOW to
 // submit it for a given CLI agent.
 //
-// Adding support for another injectable CLI agent = one more adapter here; the
-// generic core does not change.
+// v0.6.0 (P4 — data-driven Tether): the per-CLI WAKE VALUES (wakeText, submit
+// key/method, submit delay) mirror the relay's agent-CLI profile registry
+// (src/agent-cli-profiles.ts). The extension source can't import that registry
+// directly (it lives outside the extension's tsconfig rootDir), so TETHER_LLM
+// below is a MIRROR kept byte-in-sync by a drift-guard test that DOES import the
+// registry (llm-adapter-registry-parity.test.ts). Adding an injectable CLI = one
+// registry entry + one mirror row (with its TUI wake `style`); adapterFor()
+// resolves it data-drivenly — no per-CLI branch.
+//
+// What is NOT registry-driven, by design: the wake `style` (how the TUI accepts
+// a submit — a single newline-appended sendText vs a typed instruction followed
+// by a SEPARATE submit event after a paste-settle delay). That is terminal-UX
+// knowledge specific to Tether's injection layer, not a relay data concern, and
+// (crucially) it is NOT derivable from the WakeSpec fields — a codex-style
+// adapter can carry submitMethod "sendText"/delay 0 and STILL require the
+// separate submit. So `style` lives in the mirror, the drift guard checks only
+// the registry-owned VALUES.
 
 /** Minimal VSCode-free terminal surface a wake needs (so adapters unit-test
  *  without a real `vscode.Terminal`). Mirrors the `vscode.Terminal` members
@@ -31,6 +46,13 @@ export type SubmitKey = "\r" | "\n";
  *  ignore a sendText'd CR. */
 export type SubmitMethod = "sendText" | "sendSequence";
 
+/** How a CLI's TUI accepts a wake. Extension-side (injection) knowledge, NOT a
+ *  registry field:
+ *   - "inline-newline": one `sendText(wakeText, true)` types AND submits (Claude);
+ *   - "type-then-submit": type wakeText WITHOUT a newline, WAIT `submitDelayMs`
+ *     for the paste block to close, then submit via a SEPARATE event (Codex). */
+export type WakeStyle = "inline-newline" | "type-then-submit";
+
 /** Side-effecting context the extension supplies; injectable so adapters
  *  unit-test without VSCode or real timers. */
 export interface WakeContext {
@@ -51,26 +73,116 @@ export interface LlmAdapter {
   wake(ctx: WakeContext): Promise<void>;
 }
 
-/**
- * Claude Code's TUI accepts a wake word with an appended newline cleanly, so a
- * single `sendText(word, true)` both types AND submits it. Original (proven)
- * Tether behaviour, now behind the adapter seam.
- */
-export const claudeAdapter: LlmAdapter = {
-  id: "claude",
-  wakeWord: "inbox",
-  wake: async (ctx) => {
-    ctx.terminal.sendText("inbox", true);
-  },
-};
+/** The registry-owned wake VALUES (mirror of src/agent-cli-profiles.ts WakeSpec).
+ *  These are what the drift guard checks byte-for-byte against the registry. */
+export interface WakeValues {
+  wakeText: string;
+  submitKey: SubmitKey;
+  submitMethod: SubmitMethod;
+  submitDelayMs: number;
+  nativeSelfWake: boolean;
+}
+
+/** One mirror row: the registry wake VALUES + the extension-side TUI `style` +
+ *  a short human `wakeWord` label for logs. */
+interface TetherLlmEntry {
+  id: string;
+  wakeWord: string;
+  style: WakeStyle;
+  wake: WakeValues;
+}
 
 /** Default Codex wake INSTRUCTION. Codex has no `inbox`-style convention, so a
  *  bare wake token just makes it reply ("pong") rather than drain its inbox — it
  *  must be told what to do. The extension templates the agent name into the
- *  configured prompt; this generic fallback is used when none is supplied. */
+ *  configured prompt; this generic fallback is used when none is supplied.
+ *
+ *  This literal is the source the relay registry's codex `wakeText` is kept
+ *  byte-identical to (tests/v2-17-1-wakespec.test.ts reads it). Keep it a plain
+ *  string literal so that reader keeps working. */
 export const DEFAULT_CODEX_WAKE_TEXT =
   'Relay mail arrived — call get_messages(status="pending"), act on every message, then continue.';
 
+/**
+ * The mirror of the relay agent-CLI profile registry's wake data. The `wake`
+ * VALUES here are kept byte-in-sync with src/agent-cli-profiles.ts by
+ * llm-adapter-registry-parity.test.ts (which imports the real registry). `style`
+ * + `wakeWord` are extension-side.
+ */
+export const TETHER_LLM: readonly TetherLlmEntry[] = [
+  {
+    id: "claude",
+    wakeWord: "inbox",
+    // v0.7.0: WAS "inline-newline" — the appended newline never submitted.
+    // Claude Code's TUI takes a newline arriving inside the typed chunk as
+    // literal input, so `sendText("inbox", true)` filled the box and sat there
+    // until a human pressed Enter; every new message stacked another dead
+    // "inbox" (observed 14 deep, 2026-07-24). Same TUI lesson Codex taught on
+    // 2026-06-26 — type, let the paste block close, submit as a SEPARATE event.
+    // submitMethod stays "sendText" (targets the bound terminal, no focus
+    // steal); flip bot-relay.tether.claudeSubmitMethod to "sendSequence" if a
+    // sendText'd CR proves absorbed like Codex's was.
+    style: "type-then-submit",
+    wake: {
+      wakeText: "inbox",
+      submitKey: "\r",
+      submitMethod: "sendText",
+      submitDelayMs: 150,
+      nativeSelfWake: false,
+    },
+  },
+  {
+    id: "codex",
+    wakeWord: "ping-off",
+    style: "type-then-submit",
+    wake: {
+      wakeText: DEFAULT_CODEX_WAKE_TEXT,
+      submitKey: "\r",
+      submitMethod: "sendSequence",
+      submitDelayMs: 150,
+      nativeSelfWake: false,
+    },
+  },
+];
+
+function entryFor(id: string | undefined): TetherLlmEntry {
+  const found = id ? TETHER_LLM.find((e) => e.id === id) : undefined;
+  // Unknown / undefined id → Claude (a short wake word + separate CR into an
+  // idle prompt is the least-harmful default for an unrecognized TUI).
+  return found ?? TETHER_LLM[0];
+}
+
+/** Build the wake function for a `style` + resolved wake values. Data-driven —
+ *  the ordered op sequence is determined by `style`, never by the CLI id. */
+function buildWake(style: WakeStyle, v: WakeValues): (ctx: WakeContext) => Promise<void> {
+  if (style === "inline-newline") {
+    // No shipped CLI uses this style anymore. Claude did until v0.7.0, on the
+    // belief the appended newline submitted — it doesn't (the TUI treats a
+    // newline inside the typed chunk as literal input; the wake sat in the box
+    // until a human pressed Enter). Kept for a future CLI whose input is a
+    // plain line-buffered readline, where text+newline genuinely submits.
+    return async (ctx) => {
+      ctx.terminal.sendText(v.wakeText, true);
+    };
+  }
+  // "type-then-submit" (Claude + Codex): the TUI swallows a newline embedded in
+  // the same paste block AND a submit key sent before the paste settles. So:
+  // type the instruction (no newline) → WAIT for the paste block to close →
+  // submit as a SEPARATE event (per-terminal sendText CR for Claude; a focused
+  // standalone CR via sendSequence for Codex, the only thing proven to make
+  // Codex submit).
+  return async (ctx) => {
+    ctx.terminal.sendText(v.wakeText, false);
+    if (v.submitDelayMs > 0) await ctx.delay(v.submitDelayMs);
+    if (v.submitMethod === "sendSequence") {
+      await ctx.sendSequenceToTerminal(v.submitKey);
+    } else {
+      ctx.terminal.sendText(v.submitKey, false);
+    }
+  };
+}
+
+/** Per-call overrides the extension threads from config (Codex tuning). */
 export interface CodexAdapterOptions {
   /** The full text injected into the Codex terminal — an INSTRUCTION, not a bare
    *  token. The extension templates the agent name in; defaults to
@@ -81,63 +193,64 @@ export interface CodexAdapterOptions {
   /** Delay between typing the word and sending the submit key, so the paste
    *  block closes first (default 150ms). */
   submitDelayMs?: number;
-  /** How to deliver the submit key (default "sendSequence" — focus + a standalone
-   *  CR, the programmatic twin of a real keyboard Enter, which is the only thing
-   *  proven to make Codex submit). */
+  /** How to deliver the submit key (default "sendSequence"). */
   submitMethod?: SubmitMethod;
 }
 
-/**
- * Codex's TUI does not submit a wake word the way Claude's does:
- *   1. A newline embedded in the SAME paste block as the word is swallowed
- *      (`sendText(word, true)` → the word is typed but not sent).
- *   2. A submit key sent IMMEDIATELY after the word is also absorbed — the
- *      paste block is still open. Empirically (2026-06-26) a real Enter pressed
- *      AFTER the paste settles DOES submit ("pong").
- *
- * So the wake = type the word (no newline) → WAIT for the paste block to close →
- * send the submit key as a SEPARATE event. Two delivery methods, both tunable
- * via settings without a rebuild:
- *   - "sendText" (default): per-terminal `sendText(submitKey, false)` — targets
- *     the bound terminal directly.
- *   - "sendSequence": focus the terminal, then VSCode's sendSequence to the now-
- *     active terminal — for TUIs that ignore a sendText'd CR.
- */
-export function makeCodexAdapter(opts?: CodexAdapterOptions): LlmAdapter {
-  const wakeText = opts?.wakeText ?? DEFAULT_CODEX_WAKE_TEXT;
-  const submitKey: SubmitKey = opts?.submitKey ?? "\r";
-  const submitDelayMs = opts?.submitDelayMs ?? 150;
-  const submitMethod: SubmitMethod = opts?.submitMethod ?? "sendSequence";
+/** Per-call Claude tuning (v0.7.0). Submit-mechanics only — the wake TEXT is
+ *  Claude's `inbox` convention and is deliberately not configurable, so a
+ *  misconfigured prompt can't break the drain contract. */
+export type ClaudeAdapterOptions = Pick<
+  CodexAdapterOptions,
+  "submitKey" | "submitDelayMs" | "submitMethod"
+>;
+
+function applyOpts(v: WakeValues, opts?: CodexAdapterOptions): WakeValues {
+  if (!opts) return v;
   return {
-    id: "codex",
-    // Short label for logs/UX; the injected text is the full `wakeText` instruction.
-    wakeWord: "ping-off",
-    wake: async (ctx) => {
-      // 1) type the INSTRUCTION, no auto-newline (avoid the embedded-CR swallow)
-      ctx.terminal.sendText(wakeText, false);
-      // 2) let the paste block close before submitting
-      if (submitDelayMs > 0) await ctx.delay(submitDelayMs);
-      // 3) submit as a SEPARATE event
-      if (submitMethod === "sendSequence") {
-        await ctx.sendSequenceToTerminal(submitKey);
-      } else {
-        ctx.terminal.sendText(submitKey, false);
-      }
-    },
+    wakeText: opts.wakeText ?? v.wakeText,
+    submitKey: opts.submitKey ?? v.submitKey,
+    submitMethod: opts.submitMethod ?? v.submitMethod,
+    submitDelayMs: opts.submitDelayMs ?? v.submitDelayMs,
+    nativeSelfWake: v.nativeSelfWake,
   };
+}
+
+/**
+ * Resolve the adapter for a configured LLM id, data-drivenly from TETHER_LLM.
+ * Unknown / undefined ids fall back to Claude (the safest default). `opts.codex`
+ * / `opts.claude` thread per-call tuning onto the resolved entry's wake values.
+ */
+export function adapterFor(
+  id: string | undefined,
+  opts?: { codex?: CodexAdapterOptions; claude?: ClaudeAdapterOptions },
+): LlmAdapter {
+  const entry = entryFor(id);
+  // GATED ON THE RESOLVED ENTRY, NOT ON WHAT THE CALLER PASSED. resolveWakeAdapter()
+  // always builds populated tuning blocks (it cannot know the llm before calling
+  // us), so applying them unconditionally handed the CODEX instruction to every
+  // claude-configured agent — they got 'Relay mail arrived — call get_messages(
+  // agent_name="…")' instead of the bare `inbox` their profile specifies. Each
+  // profile takes ONLY its own block; one profile must never be reshaped by
+  // another profile's options.
+  const values = applyOpts(
+    entry.wake,
+    entry.id === "codex" ? opts?.codex : entry.id === "claude" ? opts?.claude : undefined,
+  );
+  return {
+    id: entry.id,
+    wakeWord: entry.wakeWord,
+    wake: buildWake(entry.style, values),
+  };
+}
+
+/** Default Claude adapter (single newline-appended `inbox`). */
+export const claudeAdapter: LlmAdapter = adapterFor("claude");
+
+/** Build a Codex adapter with optional tuning (CR/150ms/sendSequence defaults). */
+export function makeCodexAdapter(opts?: CodexAdapterOptions): LlmAdapter {
+  return adapterFor("codex", { codex: opts });
 }
 
 /** Default Codex adapter (CR, 150ms, sendSequence). */
 export const codexAdapter: LlmAdapter = makeCodexAdapter();
-
-/**
- * Resolve the adapter for a configured LLM id. Unknown ids fall back to Claude
- * (the safest default — single newline-appended wake).
- */
-export function adapterFor(
-  id: string | undefined,
-  opts?: { codex?: CodexAdapterOptions },
-): LlmAdapter {
-  if (id === "codex") return makeCodexAdapter(opts?.codex);
-  return claudeAdapter;
-}

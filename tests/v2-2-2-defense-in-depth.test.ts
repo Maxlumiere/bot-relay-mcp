@@ -25,6 +25,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import type { Server as HttpServer } from "http";
+import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v222-a1-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -47,6 +48,11 @@ let port: number;
 async function bootServer(): Promise<void> {
   if (server) { try { server.close(); } catch { /* ignore */ } }
   _resetDashboardWsForTests();
+  // ADR-0006: /api/send-message is operator-power — it requires a VERIFIED
+  // dashboard secret + CSRF. Configure one so operatorPost authenticates;
+  // the from_agent_token impersonation gate is layered UNDERNEATH and its
+  // assertions below are unchanged.
+  process.env.RELAY_DASHBOARD_SECRET = OPERATOR_SECRET;
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
   server = startHttpServer(0, "127.0.0.1");
@@ -96,6 +102,7 @@ afterEach(() => {
   _resetDashboardWsForTests();
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+  delete process.env.RELAY_DASHBOARD_SECRET;
 });
 
 describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
@@ -103,7 +110,7 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
     const { plaintext_token } = registerAgent("a1-from", "r", []);
     registerAgent("a1-to", "r", []);
     expect(plaintext_token).toBeTruthy();
-    const res = await postJson("/api/send-message", {
+    const res = await operatorPost(port, "/api/send-message", {
       from: "a1-from",
       to: "a1-to",
       content: "verified send",
@@ -120,10 +127,11 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
   it("(A1.1b) header X-From-Agent-Token also yields from_authenticated=true", async () => {
     const { plaintext_token } = registerAgent("a1h-from", "r", []);
     registerAgent("a1h-to", "r", []);
-    const res = await postJson(
+    const res = await operatorPost(
+      port,
       "/api/send-message",
       { from: "a1h-from", to: "a1h-to", content: "header path" },
-      { "X-From-Agent-Token": String(plaintext_token) },
+      { extraHeaders: { "X-From-Agent-Token": String(plaintext_token) } },
     );
     expect(res.status).toBe(200);
     const row = latestSendAudit();
@@ -143,7 +151,7 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
     // default, so a2-from has a token_hash and the gate fires.
     registerAgent("a2-from", "r", []);
     registerAgent("a2-to", "r", []);
-    const res = await postJson("/api/send-message", {
+    const res = await operatorPost(port, "/api/send-message", {
       from: "a2-from",
       to: "a2-to",
       content: "no token supplied",
@@ -159,7 +167,7 @@ describe("v2.2.2 A1 — /api/send-message optional from_agent_token", () => {
   it("(A1.3) present-and-invalid token → 403 AUTH_FAILED + audit success=0 + dual-channel from_authenticated=false marker", async () => {
     registerAgent("a3-from", "r", []);
     registerAgent("a3-to", "r", []);
-    const res = await postJson("/api/send-message", {
+    const res = await operatorPost(port, "/api/send-message", {
       from: "a3-from",
       to: "a3-to",
       content: "bad token",

@@ -179,6 +179,7 @@ describe("v2.2.1 B2 — duplicate-name register race", () => {
       capabilities: [],
       managed: false,
       force: true,
+      expected_session_id: first.agent.session_id, // ADR-0012 CAS
     } as any);
     const body = parseResult(r);
     expect(body.success).toBe(true);
@@ -229,7 +230,7 @@ describe("v2.2.1 B3 — daemon non-TTY fallback", () => {
       }
     );
     expect(r.status).toBe(3);
-    expect(r.stderr).toMatch(/Transport is stdio but stdin is not a TTY/);
+    expect(r.stderr).toMatch(/received no MCP client, and stdin closed immediately/);
     expect(r.stderr).toMatch(/RELAY_TRANSPORT=http/);
   });
 
@@ -253,7 +254,7 @@ describe("v2.2.1 B3 — daemon non-TTY fallback", () => {
     );
     // Exit code is whatever the kill-by-timeout produces, NOT 3.
     expect(r.status).not.toBe(3);
-    expect(r.stderr).not.toMatch(/Transport is stdio but stdin is not a TTY/);
+    expect(r.stderr).not.toMatch(/received no MCP client, and stdin closed immediately/);
   });
 });
 

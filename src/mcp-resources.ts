@@ -171,7 +171,7 @@ function buildInboxSnapshot(agentName: string): {
     .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ?")
     .get(agentName) as { c: number }).c;
   const pending = (db
-    .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND status = 'pending'")
+    .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND status = 'pending' AND resolved_at IS NULL")
     .get(agentName) as { c: number }).c;
   const last = db
     .prepare(
@@ -227,7 +227,7 @@ function buildCurrentState(): {
   const agents = getAgents();
   const pending = db
     .prepare(
-      "SELECT to_agent, COUNT(*) AS c FROM messages WHERE status = 'pending' GROUP BY to_agent",
+      "SELECT to_agent, COUNT(*) AS c FROM messages WHERE status = 'pending' AND resolved_at IS NULL GROUP BY to_agent",
     )
     .all() as { to_agent: string; c: number }[];
   const pendingByAgent = new Map(pending.map((r) => [r.to_agent, r.c]));

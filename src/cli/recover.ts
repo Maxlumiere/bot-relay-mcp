@@ -52,8 +52,12 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function printUsage(): void {
-  process.stdout.write(
+function printUsage(requested = false): void {
+  // STREAM DISCIPLINE: usage is DIAGNOSTIC on the error path → STDERR, so a
+  // failed `$(relay recover …)` capture yields EMPTY (fails loud) instead of
+  // help text that reads as a value. Only an explicit --help is `requested`
+  // and belongs on stdout.
+  (requested ? process.stdout : process.stderr).write(
     "Usage: relay recover <agent-name> [--yes] [--dry-run] [--db-path PATH]\n\n" +
       "Clears an agent's registration so the operator can re-bootstrap via\n" +
       "register_agent. Use this when the agent's RELAY_AGENT_TOKEN was lost\n" +
@@ -109,7 +113,7 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   if (args.help) {
-    printUsage();
+    printUsage(true);
     return 0;
   }
   if (!args.name) {

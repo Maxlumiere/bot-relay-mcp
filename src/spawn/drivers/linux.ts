@@ -23,6 +23,7 @@
  * so there is no shell interpolation of the agent identity.
  */
 import path from "path";
+import { fileURLToPath } from "url";
 import type { SpawnAgentInput } from "../../types.js";
 import type { SpawnCommand, SpawnDriver, DriverContext } from "../types.js";
 import {
@@ -33,6 +34,10 @@ import {
 } from "../validation.js";
 import { log } from "../../logger.js";
 import { resolveInstanceDbPath } from "../../instance.js";
+import { getAgentCliProfile } from "../../agent-cli-profiles.js";
+
+// dist/spawn/drivers/linux.js → dist/spawn/drivers → dist/spawn → dist → root.
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 const LINUX_SUB_DRIVERS = ["gnome-terminal", "konsole", "xterm", "tmux"] as const;
 type LinuxSubDriver = (typeof LINUX_SUB_DRIVERS)[number];
@@ -101,7 +106,18 @@ function buildKickstart(
  * v2.1.5: optional kickstart prompt is appended as a single-quoted positional
  * arg to `claude`, matching the bash script's `claude ... $Q_KICKSTART` form.
  */
-function buildLaunchCommand(cwd: string, kickstart: string | null, agentName?: string): string {
+function buildLaunchCommand(
+  cwd: string,
+  kickstart: string | null,
+  agentName?: string,
+  /**
+   * v2.17.0 (P2): absolute path to a launcher-strategy CLI's launcher (e.g.
+   * bin/codex-relay), resolved from the profile registry, or null for the
+   * binary-strategy default (`claude`). Branch is on launcher-PRESENCE — no
+   * CLI literal — so a future launcher-CLI needs no change here.
+   */
+  launcherAbs?: string | null
+): string {
   const safeCwd = escapeSingleQuotesPosix(cwd);
   // v2.6.1 R1 — vault prelude: read RELAY_AGENT_TOKEN from the per-instance
   // file vault into the LAUNCHING shell's env BEFORE `exec claude`. Codex
@@ -110,10 +126,23 @@ function buildLaunchCommand(cwd: string, kickstart: string | null, agentName?: s
   // best-effort no-op when the agent name doesn't validate or the vault
   // file doesn't exist — the daemon's resolveToken vault fallback (FIX 2)
   // handles every failure mode. Agent name pre-validated upstream by Zod.
+  // (For a launcher CLI the prelude is harmless — codex-relay also reads the
+  // vault itself; keeping it means the launched shell has the token pre-set.)
   const prelude = agentName ? buildVaultPrelude(agentName) : "";
-  const tail = kickstart
-    ? `cd '${safeCwd}' && exec claude '${escapeSingleQuotesPosix(kickstart)}'`
-    : `cd '${safeCwd}' && exec claude`;
+  let tail: string;
+  if (launcherAbs) {
+    // launcher-strategy CLI: the launcher self-registers the relay handshake
+    // then execs the CLI. Name is arg1; no claude flags / kickstart. Both the
+    // launcher path (registry-derived, trusted) and the name (Zod-validated)
+    // are POSIX-quote-escaped defensively — same rule as the cwd.
+    const safeLauncher = escapeSingleQuotesPosix(launcherAbs);
+    const safeName = escapeSingleQuotesPosix(agentName ?? "");
+    tail = `cd '${safeCwd}' && exec '${safeLauncher}' '${safeName}'`;
+  } else {
+    tail = kickstart
+      ? `cd '${safeCwd}' && exec claude '${escapeSingleQuotesPosix(kickstart)}'`
+      : `cd '${safeCwd}' && exec claude`;
+  }
   return prelude ? `${prelude} ${tail}` : tail;
 }
 
@@ -175,11 +204,25 @@ export const linuxDriver: SpawnDriver = {
 
     const cwd = normalizeCwd(input.cwd || process.env.HOME || "/", "linux");
     const kickstart = buildKickstart(briefFilePath, process.env);
-    const launch = buildLaunchCommand(cwd, kickstart, input.name);
+    // v2.17.0 (P2): resolve the launch strategy from the profile registry — no
+    // per-CLI branch. binary → `exec claude` (unchanged). launcher → the repo
+    // launcher (bin/codex-relay); codex-relay is POSIX so it runs on Linux.
+    const profile = getAgentCliProfile(input.cli ?? "claude");
+    if (!profile) {
+      throw new Error(
+        `Linux spawn: unknown cli "${input.cli}" — no agent-CLI profile. See \`relay cli-profiles\`.`
+      );
+    }
+    const launcherAbs =
+      profile.launch.strategy === "launcher" && profile.launch.launcherScript
+        ? path.join(PROJECT_ROOT, profile.launch.launcherScript)
+        : null;
+    const launch = buildLaunchCommand(cwd, kickstart, input.name, launcherAbs);
     // v2.6.1: token no longer flows via env. The hook resolves identity from
     // the per-instance file vault written by handleSpawnAgent before driver
     // dispatch. Closes the spawn-without-pre-mint failure mode.
     const env = buildChildEnv(input.name, input.role, input.capabilities, "linux", process.env);
+    env.RELAY_SPAWN_CLI = profile.id; // informational / audit parity with macOS
 
     let exec: string;
     let args: string[];

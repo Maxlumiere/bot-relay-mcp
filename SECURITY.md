@@ -1,9 +1,11 @@
 # Security Policy
 
 **Project:** bot-relay-mcp
-**Last updated:** 2026-04-21 (v2.1.7)
+**Last updated:** 2026-07-22 (latest release: v2.20.0)
 
 ---
+
+> **Post-v2.1.7 hardening is tracked per-release in the [CHANGELOG](./CHANGELOG.md).** Highlights since this document's v2.1.7 baseline: the **v2.20.0 `fast-uri` HIGH advisory pin** (GHSA-4c8g-83qw-93j6 + GHSA-v2hh-gcrm-f6hx, CVSS 7.5 — URI host-confusion, pinned to 3.1.4 via `overrides`); the **ADR-0003 O(1) auth path** (indexed HMAC token locator + verified-token cache — **bcrypt remains the sole verifier**, with an adversarial drift guard enforcing cache invalidation on every token mutation); and the **v2.19.0 presence-derivation** fix. The v2.1.7 external review below is retained as the baseline hardening record.
 
 ## v2.1.7 external review (external reviewer + Codex)
 
@@ -44,7 +46,7 @@ Future server-side regex scrubbing of known secret shapes is tracked as a v2.1.8
 
 ### CSRF is skipped on loopback-dev permissive mode (v2.2.1)
 
-The v2.1.7 CSRF double-submit middleware (`csrfCheck` in `src/transport/http.ts`) enforces on `POST /api/*` only when a dashboard-auth secret is configured (`RELAY_DASHBOARD_SECRET` or `RELAY_HTTP_SECRET` as fallback). In the default loopback-dev posture — no secret set, `dashboardAuthCheck` short-circuits on a 127.0.0.1 peer — CSRF is skipped because there is no cookie-based session to protect.
+The v2.1.7 CSRF double-submit middleware (`csrfCheck` in `src/transport/http.ts`) enforces on `POST /api/*` only when a dashboard-auth secret is configured (`RELAY_DASHBOARD_SECRET` or the `dashboard_secret` config — `http_secret` is NOT a fallback; that escalation was removed, ADR-0006) AND the request authenticates via the ambient cookie. Since ADR-0006 `relay init` generates a `dashboard_secret` by default, the no-secret posture below is now a legacy/opt-out state, not the default. **CSRF is scoped to the ambient-cookie path:** a request presenting an explicit `Authorization: Bearer` credential is CSRF-exempt (a Bearer is never auto-attached by a browser, and a wrong Bearer 401s rather than falling through to the cookie, so it is not a CSRF vector — this is what lets the `relay send` CLI work without a browser handshake). In the legacy loopback-dev posture — no secret set, `dashboardAuthCheck` short-circuits on a 127.0.0.1 peer — CSRF is skipped because there is no cookie-based session to protect.
 
 v2.2.0 shipped the first state-changing `/api/*` endpoint (`/api/focus-terminal`). v2.2.1 adds three more (`/api/send-message`, `/api/kill-agent`, `/api/set-status`). Concrete implication for loopback-dev mode: a JavaScript page loaded from ANY origin served on the same machine (local webserver, another browser tab, a dev sandbox) can POST to these endpoints with cookies+credentials `same-origin` and fire state-changing requests. The Host-header + Origin checks still apply — a page served from `http://127.0.0.1:8080/foo.html` targeting `/api/kill-agent` on `127.0.0.1:3777` counts as a cross-origin browser request and gets a 403 from `originCheck` (`allowed_dashboard_origins` defaults to `localhost`/`127.0.0.1` on any port, so an attacker-chosen path under that same origin pattern IS allowed — a real foot-gun).
 

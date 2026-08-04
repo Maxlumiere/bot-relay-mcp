@@ -44,7 +44,7 @@ process.env.RELAY_DECAY_TICK_DISABLED = "1";
 
 const { startHttpServer } = await import("../src/transport/http.js");
 const { _resetDashboardWsForTests } = await import("../src/transport/websocket.js");
-const { closeDb } = await import("../src/db.js");
+const { closeDb, getAgentAuthData } = await import("../src/db.js");
 
 import { connectWs as baseConnectWs } from "./_helpers/ws.js";
 
@@ -99,8 +99,9 @@ async function rpc(
   // SSE-wrapped JSON: locate the `data:` line and parse the inner shape.
   const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
   let json: Record<string, unknown> | null = null;
-  if (dataLine) {
-    const inner = JSON.parse(dataLine.slice(5).trim()) as {
+  {
+    // ADR-0005 #3: one-shot POSTs now return plain JSON (no `data:` frame) — fall back to raw text.
+    const inner = JSON.parse(dataLine ? dataLine.slice(5).trim() : text) as {
       result?: { content?: Array<{ text?: string }> };
     };
     const innerText = inner.result?.content?.[0]?.text;
@@ -202,6 +203,7 @@ describe("v2.8 — wire-emit-sites — register_agent", () => {
         role: "builder",
         capabilities: ["build"],
         force: true,
+        expected_session_id: getAgentAuthData("wire-2")?.session_id, // ADR-0012 CAS
       },
       token,
     );

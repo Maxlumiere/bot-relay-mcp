@@ -5,7 +5,7 @@
 
 A local-first coordination bus for AI coding agents. Durable inboxes, task queues, and wakeups for Claude Code, Cursor, Cline, Codex-style CLIs, scripts, and webhooks. Two interfaces, one shared SQLite database, zero infrastructure.
 
-**v2.12.** 34 MCP tools. The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the phase-by-phase arc, including the v2.1 architectural sweep (auth-state machine, keyring encryption, unified `relay` CLI), the v2.7 cross-process delivery layer, and the v2.12 pending-vs-history resolved plane.
+**v2.22.** 36 MCP tools. The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the phase-by-phase arc, including the v2.1 architectural sweep (auth-state machine, keyring encryption, unified `relay` CLI), the v2.7 cross-process delivery layer, LLM-agnostic spawn parity (v2.17), the `relay watch` **Sentinel** autowake for non-VSCode terminals (v2.18), the liveness/presence-derivation fix (v2.19), **O(1) token authentication** (v2.20), the agent **class/topology** map (v2.21), and **curl/script-caller DX hardening** (v2.22).
 
 ## What is this?
 
@@ -35,7 +35,7 @@ If your stack is Claude-only and stays that way, use Agent Teams. If it isn't, o
 
 ## Quick Start (30 seconds)
 
-Once published to npm, setup is a single config entry — no cloning, no compiling, no absolute paths.
+The relay is [published on npm](https://www.npmjs.com/package/bot-relay-mcp) — setup is a single config entry, no cloning, no compiling, no absolute paths.
 
 Add to your `~/.claude.json`:
 
@@ -62,7 +62,21 @@ npm install
 npm run build
 ```
 
-Add to `~/.claude.json`:
+### One-command setup (`relay init`)
+
+After building, run the installer:
+
+```bash
+./bin/relay init
+```
+
+It reconciles your `~/.claude.json` (mcpServers entry), `~/.claude/settings.json` (SessionStart hook), and — on macOS — installs a keep-alive launchd daemon. It never touches your agent tokens, and re-running is always safe (idempotent). Use `--config-only` / `--skip-hooks` / `--skip-daemon` to opt out of any step.
+
+> **⚠️ Security — the default is local-trust.** A default `relay init` install has **no HTTP secret**: the relay binds to `127.0.0.1` and trusts every process on the same machine. Any local process can then reach the loopback HTTP surface — including the dashboard operator endpoints (`/api/snapshot`, `set-status`, `wake-agent`, `kill-agent`, `operator-identity`). Per-agent tokens protect *who you can act as* (you can't impersonate another agent), but they do **not** gate the whole surface. This is a reasonable boundary on a personal, single-user machine (a local process already has OS-level access to the same data), and non-loopback binds are still refused without a secret.
+>
+> **On a shared machine, or any non-loopback / team / remote setup, gate it:** run `relay init --secret <strong-random>` (or export `RELAY_DASHBOARD_SECRET`). The daemon *requires* a secret to bind to any non-loopback host.
+
+Alternatively, wire it up by hand — add to `~/.claude.json`:
 
 ```json
 {
@@ -110,6 +124,18 @@ code --install-extension lumiere-ventures.bot-relay-tether
 
 Or browse [marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether). Source for the extension lives at `extensions/vscode/` in this repo for users who want to build from source. The extension surfaces pending count + last-message recency in the status bar, opens a webview with the last message preview on click, and optionally auto-types `inbox` into the integrated terminal so Claude Code wakes up. See `extensions/vscode/README.md` for install + config and `docs/tether-roadmap.md` for the free-vs-paid scope line.
 
+## Sentinel — `relay watch` (v2.18)
+
+Tether is push-wake **inside VSCode**. **Sentinel is wake-anywhere** — the poll/marker-based sibling for agents *not* in VSCode: iTerm2 personas, plain terminals, remote SSH sessions.
+
+```bash
+relay watch <agent> [--interval S] [--once] [--json]
+```
+
+It stands watch over `<agent>`'s inbox and prints a wake line the moment new mail arrives, so a harness (or you) can nudge the agent to read it — the shipped replacement for a hand-rolled inbox-polling loop. When the daemon writes filesystem delivery markers (`RELAY_FILESYSTEM_MARKERS=1`), it waits on the marker via `fs.watch` (near-zero idle cost) with a slow fallback re-check so a dropped event is never a silent miss; otherwise it falls back to bounded polling. It reads the active per-instance DB directly under the local-trust boundary (no token), and `--once` / `--json` make it scriptable.
+
+**Tether = push-wake in VSCode; Sentinel = wake anywhere.**
+
 ## Tools
 
 ### Identity
@@ -118,7 +144,7 @@ Or browse [marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-rela
 |------|--------|-------------|
 | `register_agent` | `name`, `role`, `capabilities[]` | Register this terminal as a named agent. Uses upsert — safe to call multiple times. |
 | `unregister_agent` | `name` | Remove an agent from the relay. Idempotent. Fires `agent.unregistered` webhook on success. |
-| `discover_agents` | `role` (optional) | List all registered agents with status (online/stale/offline). |
+| `discover_agents` | `role` (optional) | List all registered agents with status (online/offline/unknown). |
 | `spawn_agent` | `name`, `role`, `capabilities`, `cwd?`, `initial_message?` | Spawn a new Claude Code terminal pre-configured as a relay agent. Cross-platform (v1.9): macOS (iTerm2/Terminal.app), Linux (gnome-terminal/konsole/xterm/tmux fallback chain — tmux covers headless servers), Windows (wt.exe/powershell.exe/cmd.exe). See `docs/cross-platform-spawn.md`. |
 
 ### Messaging
@@ -245,7 +271,7 @@ RELAY_TRANSPORT=http RELAY_HTTP_SECRET=your-shared-secret node dist/index.js
 Endpoints:
 - `POST /mcp` — JSON-RPC (the MCP protocol over HTTP+SSE). Requires `Authorization: Bearer <secret>` if `http_secret` is configured.
 - `GET /health` — server status (always open, no auth)
-- `GET /` — built-in dashboard (live view of agents, messages, tasks, webhooks). **v2.1 Phase 4d:** protected by Host-header allowlist (DNS-rebinding defense) + auth gate (`RELAY_DASHBOARD_SECRET` or `RELAY_HTTP_SECRET` fallback). Loopback binds allow no-secret access for dev; non-loopback binds require a secret. Full policy in [`docs/dashboard-security.md`](./docs/dashboard-security.md).
+- `GET /` — built-in dashboard (live view of agents, messages, tasks, webhooks). **ADR-0006:** protected by a Host-header allowlist (DNS-rebinding defense) + an auth gate (`RELAY_DASHBOARD_SECRET` or the `dashboard_secret` config, generated by default at `relay init`). Operator-power endpoints (kill-agent, wake-agent, set-status, …) require it regardless of network position. Loopback binds allow a restricted, secret-free read view; non-loopback binds require the secret. `http_secret` no longer authenticates the dashboard — that fallback was a removed privilege-escalation. Full policy in [`docs/dashboard-security.md`](./docs/dashboard-security.md).
 - `GET /api/snapshot` — JSON snapshot of relay state (same gates as `/`)
 
 Three transport modes:
@@ -569,9 +595,9 @@ The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is
 
 **Honest limitation:** idle terminals get no delivery. The hook only fires when the agent is actively running tool calls. For long-idle windows, still rely on SessionStart + human attention.
 
-## Turn-End Mail Delivery (v2.1)
+## Turn-Boundary Wake (v2.1, rewritten v2.23)
 
-`PostToolUse` only fires on turns that include at least one tool call. A text-only turn (Claude responds with no tool invocation) does not trigger it. The `Stop` hook — `hooks/stop-check.sh` — closes that gap by firing on every turn-end, whether or not the turn invoked tools. Install both together in your project's `.claude/settings.json`:
+`PostToolUse` only fires on turns that include at least one tool call. A text-only turn (Claude responds with no tool invocation) does not trigger it. The `Stop` hook — `hooks/stop-check.sh` — closes that gap by firing at every turn end, whether or not the turn invoked tools. It is a **read-only wake**: it peeks at the mailbox and, if mail is pending, emits `decision:"block"` so the agent continues immediately and fetches its own mail via `get_messages`. The hook itself never marks anything read — a wake that cannot prove delivery must not consume (`additionalContext` on Stop is queued for a next turn that may never come, so the original mark-read-and-inject shape was a silent data-loss path). Install both together in your project's `.claude/settings.json`:
 
 ```json
 {
@@ -592,7 +618,7 @@ The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is
 }
 ```
 
-Same single-quote-the-path-if-it-contains-spaces rule, same env vars, same HTTP/sqlite fallback, same silent-fail contract as `PostToolUse`. Full docs + troubleshooting in [`docs/stop-hook.md`](./docs/stop-hook.md).
+Same single-quote-the-path-if-it-contains-spaces rule, same env vars, same HTTP/sqlite fallback (both non-mutating: `peek:true` over HTTP, a bare SELECT over sqlite — no mutating SQL exists in the script), same silent-fail contract as `PostToolUse`. Two loop guards bound the blocking: `stop_hook_active` in the hook payload (one wake per natural stop) and a time damper (`RELAY_STOP_WAKE_DAMPER_SECS`, default 120s) that applies only when the payload lacks a parseable `stop_hook_active`. All guards leave mail pending when they suppress — a delayed wake, never a lost one. Full docs + troubleshooting in [`docs/stop-hook.md`](./docs/stop-hook.md).
 
 **Honest limitation:** `Stop` does NOT wake truly idle terminals. If no turn is in progress, neither hook fires. For long-idle windows, use the Layer 2 Managed Agent reference (`examples/managed-agent-reference/`).
 
@@ -687,7 +713,7 @@ Full install requirements per platform + manual smoke-test checklists + troubles
 
 ## Layer 2: Managed Agents (v1.10)
 
-Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 34 MCP tools (v2.12), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
+Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 36 MCP tools (v2.22), and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
 
 Full integration guide with mental model, auth flow, lifecycle, error patterns, and security notes: [`docs/managed-agent-integration.md`](./docs/managed-agent-integration.md).
 
@@ -729,13 +755,20 @@ Both drivers read the same `relay.db` file format. Full details, performance not
 - **v2.0**: Plug-and-play — channels, smart routing (`post_task_auto`), task leases + heartbeat, lazy health monitor, session-aware reads, busy/DND, `health_check`, webhook retry with CAS, payload size limits, config validation, auto-unregister, dead-agent purge, debug mode. 22 tools.
 - **v2.1**: Architectural completion — explicit `auth_state` machine, managed-agent rotation grace, versioned ciphertext + keyring with online rotation (`relay re-encrypt`), lost-token recovery CLI (`relay recover`), admin-initiated cross-agent rotation (`rotate_token_admin`), structured error_code catalog, protocol_version surface, Phase 4p webhook-secret encryption, Phase 4b.1 v2 revoke/recovery redesign. 25 tools. 14 of 14 Codex architectural findings closed.
 - **v2.7**: Tether-ready cross-process inbox notifications. Durable `inbox_events` outbox table (schema v11→v12, idempotent migration); HTTP daemon polls + dispatches to `relay://inbox/<agent>` subscribers regardless of which OS process wrote the message. Reaper now skips sessions with active SSE GET streams (`openGetStreams` count). Daemon emits `:keepalive\n\n` SSE comment frames every `RELAY_SSE_KEEPALIVE_MS` (default 20s) so Electron-based clients (VS Code Tether extension) don't idle-disconnect at ~2.5min. External-review-flagged `get_messages` filter-after-mark P1 fix — `since` filter now applies in SQL BEFORE the read-mark mutation. 30 tools. Pairs with Tether VSCode extension v0.1.2+ on the marketplace.
-- **v2.12 (current)**: Hands-free, LLM-agnostic autowake. The multi-agent Tether watch-all wakes Claude and Codex agents on relay mail and auto-submits, no manual polling (dogfood-proven: the relay now coordinates its own development). Plus the pending-vs-history resolved plane (`resolve_messages` + an `ack` flag, so handled mail stops re-flooding fresh sessions; tool #34) and a central schema-scoped auth fix closing a stray-field impersonation hole. 34 tools.
+- **v2.12**: Hands-free, LLM-agnostic autowake. The multi-agent Tether watch-all wakes Claude and Codex agents on relay mail and auto-submits, no manual polling (dogfood-proven: the relay now coordinates its own development). Plus the pending-vs-history resolved plane (`resolve_messages` + an `ack` flag, so handled mail stops re-flooding fresh sessions) and a central schema-scoped auth fix closing a stray-field impersonation hole.
+- **v2.13–v2.16**: Presence liveness — a same-host process probe (`agent_pid`) so an idle-but-alive agent stops reading as offline (schema v16→v18) — plus the Tether-wakes-Codex PID handshake and the `bin/codex-relay` cold-start launcher (zero-turn cold summon of a Codex agent).
+- **v2.17**: LLM-agnostic spawn parity. `spawn_agent(cli: "codex")` launches a Codex CLI (macOS/Linux), driven by a central agent-CLI profile registry with an AST drift guard; Tether wake behavior is data-driven from the same registry.
+- **v2.18**: **Sentinel** (`relay watch <agent>`) — poll/marker-based autowake for terminals *not* in VSCode/Tether (iTerm2 personas, plain terminals, remote sessions). The wake-anywhere sibling of Tether's push-wake.
+- **v2.19**: Liveness derivation — presence that stops lying. The coarse agent status is now derived from the liveness verdict (online/offline/unknown), never from `last_seen` age, so a rate-limited-but-alive agent no longer reads offline.
+- **v2.20**: **O(1) token authentication.** An indexed HMAC token locator + a verified-token cache replace the O(N) per-call bcrypt scan (bcrypt stays the sole verifier); instant revocation via a generation counter; zero-lockout migration. 35 tools.
+- **v2.21**: **ADR-0002 — agent class/flare topology.** Agents declare an immutable coordination `class` at `register_agent` (`orchestrator | builder | advisory | auditor | transient`), a third axis orthogonal to `role` and `capabilities`. `discover_agents view='topology'` renders the live team grouped by class (default `view='list'` is unchanged), plus an opt-in SessionStart onboarding map (`RELAY_ONBOARD_TOPOLOGY=1`, default off) and a taxonomy drift guard in the pre-publish gate. Still 35 tools — a `view` parameter, not a new tool.
+- **v2.22 (current)**: **Curl/script-caller DX hardening (ADR-0005).** One-shot `POST /mcp` returns plain JSON, `agent_token` is the first field of the register response, `send_message` accepts a `message` alias, and `abandon_registration` lets a script self-clean a botched (never-authenticated) registration via a one-time recovery handle — safe by construction (only ever removes a row that has never authenticated). 36 tools.
 - **Beyond**: cross-machine federation (hub/edge) so multiple self-hosted relays mesh without a shared namespace, plus an App Server push path for low-latency remote wake.
 
 ## Dashboard
 
 When running in `http` or `both` mode, open `http://127.0.0.1:3777/` in a browser. You'll see:
-- Live agent presence (online / stale / offline)
+- Live agent presence (online / offline / unknown), derived from a liveness verdict — not `last_seen` age (v2.19)
 - Active tasks with priority and assignment
 - Recent messages
 - Registered webhooks

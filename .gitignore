@@ -41,3 +41,7 @@ CLAUDE.md
 coverage/
 .nyc_output/
 tmp/
+
+# prebuild production-tree guard: machine-local marker, NEVER committed (a committed
+# marker would ride every checkout/worktree and refuse legitimate builds everywhere).
+.relay-prod-tree

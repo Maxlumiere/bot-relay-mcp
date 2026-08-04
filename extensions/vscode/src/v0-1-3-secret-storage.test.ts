@@ -65,11 +65,24 @@ function cfgWith(legacyToken: string): (key: string) => string | boolean | undef
   return (key) => (key === "agentToken" ? legacyToken : undefined);
 }
 
-describe("v0.1.3 — resolveTetherConfig agentToken precedence (SecretStorage > env > legacy config)", () => {
-  it("SecretStorage value wins over everything", () => {
+describe("v0.5.0 — resolveTetherConfig agentToken precedence (env > vault > SecretStorage > legacy config)", () => {
+  it("explicit env WINS over SecretStorage (v0.5.0 — env is the emergency override on top)", () => {
+    // v0.5.0 flipped env above SecretStorage: an explicit RELAY_AGENT_TOKEN is a
+    // deliberate operator override for debug/emergency, so it now beats a
+    // (possibly stale) SecretStorage copy. (No agentName here → the singleton
+    // resolveAgentToken path; the vault only applies when an agent name keys it.)
     const r: TetherConfig = resolveTetherConfig(
       cfgWith("tok_from_legacy_config"),
       { RELAY_AGENT_TOKEN: "tok_from_env" },
+      "tok_from_secretstorage",
+    );
+    expect(r.agentToken).toBe("tok_from_env");
+  });
+
+  it("SecretStorage wins when no env is set (back-compat fallback below the vault)", () => {
+    const r: TetherConfig = resolveTetherConfig(
+      cfgWith("tok_from_legacy_config"),
+      {},
       "tok_from_secretstorage",
     );
     expect(r.agentToken).toBe("tok_from_secretstorage");
@@ -162,15 +175,13 @@ describe("v0.1.3 R1 [P2 codex] — resolveAgentToken refuses legacy plaintext wh
     ).toBe("tok_env_value");
   });
 
-  it("(precedence unchanged) secret populated wins regardless of secretsAvailable flag", () => {
-    // If the secret value somehow reached the resolver, that's the
-    // canonical happy path. The flag only gates the legacy fallback.
-    expect(
-      resolveAgentToken("tok_secret", "tok_env", "tok_legacy", false),
-    ).toBe("tok_secret");
-    expect(
-      resolveAgentToken("tok_secret", "tok_env", "tok_legacy", true),
-    ).toBe("tok_secret");
+  it("(v0.5.0 precedence) explicit env beats secret; secret wins only when env is absent", () => {
+    // v0.5.0 — env moved ABOVE SecretStorage (emergency override). The
+    // secretsAvailable flag still only gates the legacy-config fallback.
+    expect(resolveAgentToken("tok_secret", "tok_env", "tok_legacy", false)).toBe("tok_env");
+    expect(resolveAgentToken("tok_secret", "tok_env", "tok_legacy", true)).toBe("tok_env");
+    // With no env, SecretStorage wins (still above legacy config).
+    expect(resolveAgentToken("tok_secret", undefined, "tok_legacy", true)).toBe("tok_secret");
   });
 
   it("secret undefined + env empty + legacy populated + secretsAvailable=true → legacy (migration-window fallback PRESERVED)", () => {
@@ -251,7 +262,8 @@ describe("v0.1.3 — non-token config resolution unchanged from v0.1.2", () => {
     expect(r.agentName).toBe("alice");
     expect(r.autoInjectInbox).toBe(true);
     expect(r.notificationLevel).toBe("summary");
-    // Token still routes through the new precedence.
-    expect(r.agentToken).toBe("tok_secret");
+    // v0.5.0 — token routes through the new precedence: with agentName "alice"
+    // set + RELAY_AGENT_TOKEN present, the explicit env beats SecretStorage.
+    expect(r.agentToken).toBe("tok_env");
   });
 });

@@ -282,6 +282,30 @@ export function getKeyringInfo(): { current: string | null; known_key_ids: strin
 }
 
 /**
+ * ADR-0003 (v2.20.0): derive a purpose-bound subkey from the keyring's CURRENT
+ * key via HKDF-SHA256, WITHOUT exposing the raw keyring key outside this module
+ * (the raw AES keys never leave encryption.ts — callers get only a domain-
+ * separated derivative). Used by the token-lookup index to key its HMAC so a
+ * DB-only read cannot offline-match a stolen token list against `token_lookup`.
+ *
+ * `info` is the HKDF context string — pass a stable, unique domain label per
+ * use (e.g. "bot-relay/token-lookup/v1"). Returns a 32-byte subkey, or `null`
+ * when no keyring is configured (plaintext mode) — callers must have their own
+ * no-keyring fallback. The subkey rotates with the keyring: derivation reads
+ * `kr.current`, so a keyring rotation yields a new subkey (and the token-lookup
+ * layer re-populates lazily on the O(N) fallback path — the same graceful
+ * behavior as first-time migration).
+ */
+export function deriveKeyringSubkey(info: string): Buffer | null {
+  const kr = loadKeyring();
+  if (!kr) return null;
+  const ikm = kr.keys[kr.current];
+  // hkdfSync returns an ArrayBuffer; wrap for a Buffer API. Empty salt is fine
+  // for HKDF when the ikm is already a high-entropy 32-byte key (RFC 5869 §3.1).
+  return Buffer.from(crypto.hkdfSync("sha256", ikm, Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
+}
+
+/**
  * Whether `RELAY_ENCRYPTION_KEY` is being used — flag so callers can emit
  * the one-time deprecation warning at startup.
  */

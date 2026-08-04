@@ -1,5 +1,376 @@
 # Changelog
 
+## v2.24.0 — 2026-07-28 — Security hardening: operator auth, dashboard content isolation, orchestration integrity
+
+<!--
+  VERSION: 2.24.0, locked by Maxime this session. Strict semver would make this a
+  MAJOR (3.0.0) because #142 is a breaking change, but a major bump signals a
+  rewrite to anyone browsing npm and this is a hardening release, not that — so
+  2.24.0 WITH the loud upgrade note below. This is the RELEASE PR: content is final
+  and package.json is bumped to 2.24.0 — ready to cut once merged + published.
+-->
+
+Sixteen merges since 2.23.0. The spine is a security cluster: operator power can no
+longer be inferred from being on the box, the dashboard no longer hands message
+content to unauthenticated callers, the orchestrator no longer loses work to a dead
+agent or a stale daemon, and the diagnostic traffic recorder no longer captures live
+tokens. The rest harden the tooling around the release — one shared structural
+detector for the must-call guards, a network deadline that covers the whole
+exchange, a build-time guard against an accidental production-tree deploy, a
+config-path fix so `init` and the daemon agree, and cacheable snapshot output for
+the fleet board.
+
+### ⚠️ BREAKING — the operator dashboard now requires a secret (one action needed on upgrade)
+
+**Required step — existing installs AND fresh installs: run `relay init`.**
+Operator actions in the dashboard — kill/wake an agent, send a message, focus a
+terminal, set status, change the theme, the keyring — return **401 until a
+dashboard secret exists**, and **a fresh install ships with no secret, so it has
+no working operator actions at all until you run it.** `relay init` generates one
+(printed once, preserved on re-run, added to legacy installs automatically). This
+is a required setup step, not a footnote — without it the dashboard's operator
+controls are inert. **If your dashboard starts refusing actions right after
+upgrading, this is the reason — not a regression.**
+
+Why it changed (**#142**, ADR-0006): before this, in the default loopback
+deployment, **any local process that could reach the dashboard port could invoke
+operator powers** — kill or wake agents, send messages as you, focus terminals —
+with no operator credential. Worse, the shared `http_secret` that *every* HTTP
+agent already holds was accepted as operator authorization, so a mere agent
+transport credential silently granted operator power. Power was derived from
+network position plus a transport secret, not from an operator identity. ADR-0006
+("location is not a principal") closes it: operator endpoints now require a
+**verified dashboard secret regardless of network position**, and the
+`http_secret`→operator escalation is removed at every site.
+
+> **◆ FLAGGED FOR MAXIME — a possible SECOND breaking change for this release, not yet decided.**
+> Node 20 reached **end-of-life on 2026-04-30** (Node.js release schedule) and no
+> longer receives security patches; Node 22 is supported to 2027-04-30. The pending
+> better-sqlite3 major (**#81**, 11.x → 13.0.1) declares `engines: node >=22` and,
+> verified in CI this session, failed **only** the Node 20 cell (Node 22 + macOS
+> passed). Taking it moves this package's own `engines` from `>=20` to `>=22` and
+> drops Node 20 from the support matrix — itself a breaking change that belongs in
+> these notes. The slot is left ready here rather than bolted on afterward. **Not
+> decided.**
+
+### Security
+
+- **The dashboard no longer serves message content to unauthenticated callers (#141).**
+  In the default loopback deployment, the dashboard's snapshot endpoint served
+  **decrypted previews of every agent's messages and tasks — plus each agent's
+  session and process identifiers — to anyone who could reach the port, with no
+  password.** That defeated the per-agent token isolation `get_messages` enforces,
+  and where at-rest encryption was not configured (the default) it exposed
+  plaintext. The unauthenticated snapshot is now built from an explicit
+  **allowlist** of non-sensitive identity/presence fields; message and task
+  content and process locators are **absent by construction** (a first denylist
+  attempt still shipped the raw content column and was caught and replaced).
+  Authenticated operators still get full previews.
+- **Operator power now requires operator authentication, everywhere (#142).** (See
+  the BREAKING note above.) The `http_secret`→operator-auth escalation is removed
+  at all three sites; a single resolver decides operator auth from the dashboard
+  secret and nothing else.
+- **Tasks are never handed to a dead agent (#141).** `post_task_auto` could route a
+  task to a **registered-but-closed** agent; the task then dead-ended forever
+  while the caller was told `routed=true` — **silent work loss on the core
+  orchestration path**. Routing now targets only agents with a live session, and a
+  task orphaned by an agent vanishing between post and accept is **loudly
+  requeued**, never silently redirected.
+- **A stale daemon after an upgrade is surfaced, not silently kept (#141).** After
+  `npm update`, the already-running daemon kept serving every HTTP client on the
+  **old code until reboot** (launchd does not restart on a code change), with no
+  warning — the "merged but never takes effect" trap at the daemon layer. `relay
+  init` now **loudly flags a version drift** with the exact remedy, and a new
+  operator-invoked **`relay restart`** (with `--dry-run` to preview) applies it. It
+  never auto-restarts — bouncing a shared daemon mid-session is the operator's
+  call.
+- **Token redaction — the traffic recorder no longer leaks secrets (#145).** The
+  diagnostic traffic recorder could write agent tokens (and other secret values)
+  verbatim into its capture. A central **redact-by-value registry** now scrubs known
+  secret values from recorded traffic, so a captured exchange cannot expose a live
+  credential.
+
+### Fixed
+
+- **Tether: `claude wake` now actually submits the prompt (#129, Tether v0.7.0).**
+  The VS Code wake typed the prompt into the terminal but **never submitted it**
+  (the newline rode in the same chunk and did not register as Enter), so a woken
+  agent sat with an unsent prompt and looked like it had ignored the wake. It now
+  types, settles briefly, then sends the Enter as a separate keystroke.
+- **The server no longer closes an idle keep-alive socket first (#149).** The HTTP
+  server's keep-alive timeout sat below the idle window a pooling client may hold a
+  connection, so under load the server could close a socket the client was about to
+  reuse — surfacing as an intermittent `ECONNRESET` on the next request. The
+  timeout is raised (to 61s, with the header-read timeout above it) so the client
+  always closes first. Affects raw/proxy/non-undici HTTP clients regardless of
+  platform (LOW).
+- **Network calls bound the WHOLE exchange, not just the headers (#155).** The
+  request deadline capped the header-read phase but left the response body/exchange
+  unbounded, so a peer that accepted the request and then stalled mid-body could
+  hang the caller indefinitely. The deadline now covers the entire request→response
+  exchange, so a stalled peer fails fast instead of hanging.
+- **`relay init` writes config to the daemon's RESOLVED path (#153, P1).** `init`
+  wrote `config.json` to the flat default location instead of the per-instance path
+  the running daemon actually resolves, so a configured setting could silently land
+  where the daemon never reads it. `init` now writes to the resolved path, so config
+  and daemon agree.
+- **Tether surfaces a no-delivery condition to a human, not an 8-second blip (#154,
+  Tether #3).** When a wake or message failed to deliver, Tether showed only a
+  transient ~8s status-bar note that was easy to miss; the condition is now surfaced
+  persistently, so a human actually sees that delivery did not happen.
+
+### Internal / hardening
+
+- **Dashboard theme values validated against a CSS-color grammar (#147):** the
+  dashboard theme endpoint now rejects theme token values that are not well-formed
+  CSS colors, closing a stored-value injection vector on an operator-settable field
+  (LOW).
+- **From-source native-build CI gate (#148):** CI now compiles `better-sqlite3`
+  from source on the matrix, closing a prebuilt-only blind spot — a dependency that
+  breaks on a from-source build (or drops a Node version) now reds CI instead of
+  passing on a cached prebuilt.
+- **Liveness probe caches evicted on every state change (#140):** the five writers
+  that change an agent's session/anchor now evict the probe caches unconditionally,
+  so a stale cached verdict cannot outlive the change.
+- **Backup test asserts the harm, not a proxy (#144):** the backup test asserts the
+  atomic-swap **harm** directly instead of a poll-count proxy (ADR-0015).
+- **Docs (#146):** ADR-0007 (control-plane target architecture) committed to
+  version control.
+- **Must-call guards share one structural detector (#151):** the guards that
+  assert a required call is present now use a single AST-based helper, closing
+  comment-, alias-, and class-field-shaped evasions a per-guard textual check
+  missed. One detector, so the guards cannot drift apart.
+- **Prebuild guard against an accidental production-tree build (#156):** an npm
+  `prebuild` hook refuses `npm run build` in the live-serving tree — where a build
+  silently overwrites the `dist` the daemon and the whole stdio fleet load — unless
+  `RELAY_ALLOW_PROD_BUILD=1`. Positive-match only, so CI checkouts and throwaway
+  worktrees build freely; repo/dev tooling only (excluded from the npm package).
+- **Stable snapshot body + ETag/Date caching for `/api/snapshot` (#152):** the
+  dashboard snapshot endpoint now emits a stable body with `ETag`/`Date`, so a
+  polling consumer (the lumen fleet board) can cache and conditionally re-fetch
+  (304) instead of re-pulling the full snapshot every tick. `last_alive` is excluded
+  from the ETag input so a liveness-only heartbeat does not churn the cache.
+
+## v2.23.0 — 2026-07-25 — Config-clobber closed, orchestration-anchor safety, DX + a HIGH dependency advisory
+
+> _**Backfilled 2026-07-27.** 2.23.0 shipped without release notes; this entry was
+> reconstructed after the fact from the first-parent commit log between v2.22.0
+> (`1f64ec8`) and the **published** 2.23.0 commit (`22c92db` — the npm `gitHead`
+> for 2.23.0, which is two commits past the `2.22.0 → 2.23.0` version bump and so
+> includes #138 and #139) — it is **not** contemporaneous. The PRs are named per
+> item; for the precise diff see those commits._
+
+The load-bearing one is a **shipping defect that anyone who ran the test suite hit.**
+
+- **`npm test` no longer rewrites your real Claude config (#125).** **Anyone who
+  cloned this repo and ran `npm test` had their real `~/.claude.json` and
+  `~/.claude/settings.json` silently rewritten to point at their checkout — no
+  warning, no error.** On dev machines it quietly pointed every agent at an
+  unmerged build for nine days; run from a path containing a space it wrote a
+  percent-encoded path (`%20`) that does not exist, so it failed mutely rather than
+  loudly. **If you ran this repo's test suite before 2.23.0, check your
+  `~/.claude.json` MCP entries.** Fixed in four layers, each with a proven-failing
+  negative control: HOME sandboxes for the three offending test environments, a
+  chokepoint guard that throws on any real-user-config write under test, a
+  suite-wide tripwire hashing the real config files, and the `%20` path fix.
+- **The user-config tripwire compares only relay-owned regions (#139).** A
+  follow-up to #125: that suite-wide tripwire's whole-file byte comparison
+  false-tripped on unrelated user edits to `~/.claude.json`, so it now compares only
+  the relay-owned config regions — a legitimate user edit no longer reds the suite.
+- **Security — postcss HIGH advisory patched (#134, GHSA-r28c-9q8g-f849).** A
+  path-traversal advisory (CVSS 7.5) landed on `postcss <= 8.5.17`. It reaches this
+  project only as a **dev-only transitive dependency** (vitest → vite → postcss;
+  production deps are empty), so runtime exposure is nil — but it reds the `npm
+  audit --audit-level=high` gate. Patched lockfile-only (postcss 8.5.15 → 8.5.23),
+  no production or SDK change.
+- **Anchor takeover is CAS-guarded; no silent auto-takeover (#136, ADR-0012).**
+  `force` re-anchoring uses a compare-and-swap plus a dead-anchor diagnostic
+  instead of an unconditional takeover, so two agents racing for the same identity
+  anchor cannot silently clobber each other.
+- **Publish gate hardened (#138).** The pre-publish gate refuses to publish from
+  the wrong branch and treats a **missing CI run as a failure**, not a pass —
+  closing a stacked-PR hole where an empty CI rollup read as clean/mergeable.
+- **`relay resolve` — a CLI ack for MCP-mute sessions (#133).** A session that
+  cannot call the MCP tool (e.g. a plain terminal) can still acknowledge/resolve
+  messages from the command line.
+- **`relay send` stdout hygiene (#130).** Usage/help now goes to stderr and `relay
+  send` prints a clean message id on stdout, so a script can capture the id without
+  parsing noise.
+- **Tether wakes routed by observed agent-state; wake-stacking ended (#126).** A
+  "landed" gate stops the extension from stacking repeated wakes on an agent that
+  has already been woken and is working.
+- **Stop-hook is a read-only wake (#124).** The stop-check hook never consumes mail
+  it cannot prove it delivered — a silence-as-failure guard so a wake can never
+  quietly eat a message.
+
+## v2.22.0 — 2026-07-22 — ADR-0005: relay DX hardening (curl/script-caller friction)
+
+Five fixes for callers driving the relay over raw HTTP (no MCP client wired in), from a real friction report. The load-bearing one is a **safe self-serve orphan cleanup**.
+
+- **Safe orphan cleanup (#4) — `abandon_registration` (caller-initiated ONLY; no auto-GC).** A caller who registered but lost the `agent_token` before ever authenticating (e.g. a truncated `curl` capture) orphaned a row it couldn't unregister (unregister needs the lost token) — and had to reach for the *destructive operator endpoint*. Now: register returns a one-time, name-scoped **`registration_recovery`** handle; `abandon_registration(name, handle)` self-cleans the orphan without a token. **Safe by construction** via the establishment keystone — an `established_at` marker (stamped at token auth, credential recovery, and spawn provisioning) means abandon can **only ever** remove a row that has NEVER become a legitimate identity, so a working agent self-excludes and can never be reached (the handle proves the caller is the registrant + covers the just-registered race). **An automatic orphan GC was designed, adversarially audited five rounds, and CUT by final ruling:** abandonment is undecidable from row state — a slow-spawned child, an idle recovered agent, and a genuinely abandoned registration are byte-identical in the data, and each audit round found a different legitimate identity being reaped. The rule that came out of it: *do not attach an irreversible action to a predicate that cannot be decided by observation.* Un-abandoned rows persist harmlessly (session-less, never established, name reclaimable via unregister or `relay recover`); `tests/v2-22-0-no-auto-gc.test.ts` proves the GC is gone, not disabled. Architect-designed (ADR-0005); the keystone invariant is adversarially tested.
+- **Reliable token capture (#2).** `agent_token` is now the **first** field of the register response, so a truncated `head -c` read still captures it (it was buried 4th).
+- **Plain JSON for one-shots (#3).** A non-streaming one-shot `POST /mcp` now returns `application/json`, not an `event: message\ndata: {…}` SSE frame — curl/script callers can `JSON.parse` the body directly. The stateful/streaming (Tether SSE) path is unchanged.
+- **`send_message` accepts `message` (#5).** The MCP tool now takes `content` **or** its alias `message` (exactly one; both-with-different-values rejected), matching the REST endpoint + the agent-team `SendMessage` — one send vocabulary across every surface.
+- **HTTP one-shot recipe (#1).** New `docs/http-one-shot.md`: register → capture → send → self-clean over `curl`.
+
+- **The v2.0 30-day dead-agent purge is also CUT (same ruling, worse instance).** `purgeOldRecords` deleted any agent row with `last_seen` older than 30 days — no principal asking, establishment not even checked, so a working token-authed agent that went idle 31 days was deleted and its name freed for anyone to claim (the v2.14.0 reserved-name exemption had already documented that freeing a name reopens the bootstrap-claim window — the rationale applied to every name, not just reserved ones). Found by codex's re-audit of the orphan-GC cut as the last remaining autonomous agent-row deletion. The purge tick now deletes messages/tasks/logs/events — records with retention windows — and **no agent row, ever**. Deliberate pruning stays available via `relay purge-agents` (dry-run by default, `--apply` + audit).
+
+Schema v22 (`first_authed_at` + `registration_recovery_hash`/`_expires_at`, additive). 36 MCP tools (adds `abandon_registration`). Native + wasm parity.
+
+## v2.21.0 — 2026-07-22 — ADR-0002: agent class/flare topology
+
+Agents can now declare a **coordination class** — a coarse "flare" of their posture in the team — and `discover_agents` gains a **`view='topology'`** that renders the live team grouped by class. A fresh agent can also learn its peers on session start (opt-in).
+
+- **`class` — a self-declared, immutable coordination posture (schema v21).** One of `orchestrator | builder | advisory | auditor | transient`, declared at `register_agent` and immutable thereafter (the `managed`/`host_id` precedent). It is a THIRD axis, orthogonal to `role` (free-text label) and `capabilities` (what an agent does) — kept deliberately coarse so it never collapses into capability. Undeclared/legacy rows read as `unclassified`; `bridge` is reserved for a future federation node. Single source of truth: **`src/agent-class.ts`**.
+- **`discover_agents view='topology'`** (default `view='list'` is 100% back-compat) groups the live team by class, flat within each `{name, role, class, status}`. **Two independent exclusions:** dead/terminal agents (liveness verdict) and the `transient` + `unclassified` classes are omitted from the who's-who (with honest excluded-counts — no silent truncation). The `class` field is surfaced through the discovery projection (the gate that silently drops `managed`/`visibility`), so it actually reaches clients.
+- **Opt-in SessionStart onboarding map** (`RELAY_ONBOARD_TOPOLOGY=1`, default OFF) — a compact "team by class" roster delivered to a freshly-started agent via `check-relay.sh`. Off by default so existing installs' session output is unchanged.
+- **Taxonomy drift guard** (`scripts/agent-class-guard.mjs`, wired into the pre-publish gate) — a TS-AST walk that rejects a class-value branch (equality/switch) or a parallel class vocabulary (an array of ≥2 class ids) defined anywhere outside `src/agent-class.ts`, mirroring the cli-profile guard. It prevents a taxonomy re-fork; an adversarial negative-fixture test proves it fails on a synthetic re-fork. Native + wasm parity. No new tool (a `view` param on `discover_agents`); not security-critical.
+
+## v2.20.1 — 2026-07-22 — Verified-token cache on the explicit-caller auth path
+
+ADR-0003 made the O(N) **token-only** auth scan O(1). This extends the same verified-token cache to the **explicit-caller** path (`enforceAuth` for tools that name their caller — `send_message.from`, `get_messages.agent_name`, … — the orchestration hot path), which still bcrypt-verified on every call.
+
+- **Cache short-circuit, impersonation-gated.** The explicit-caller branch now consults the same verified-token cache first; a hit skips the per-call bcrypt. A hit is honored **only when the cached verdict belongs to the claimed caller** — a valid token for agent X can **never** authenticate a claim `from: Y`, even with a warm cache (the name-match gate). A miss falls through to the unchanged `authenticateAgent` flow, so every revoked / recovery / rotation-grace / legacy-can't-actor-stamp behavior is preserved, then re-populates the cache.
+- **One cache layer, one invalidation.** Both auth paths now route through the same `verifiedTokenCacheGet` / store-or-heal helpers (a security argument, not just DRY — two paths that must invalidate identically shouldn't be maintained separately). The generation counter still gives instant revocation on both: a revoked/rotated token → generation moved → cache miss → the correct error. bcrypt remains the sole verifier.
+- **Deterministic O(1) migration.** The explicit-path miss now lazily **self-heals** the caller's lookup digest too. Since every agent makes explicit-path calls, the whole fleet's `token_lookup` populates on first send — so token-only calls also go O(1), closing the NULL-digest gap left by ADR-0003 (which only self-healed on the token-only path). Native + wasm parity. No new tools, no API change.
+
+## v2.20.0 — 2026-07-22 — ADR-0003: O(1) token auth (indexed HMAC locator + verified-token cache)
+
+Token-only tool calls no longer scan every agent with bcrypt. Two O(N) linear bcrypt scans (`resolveCallerByToken` for the dispatcher, `checkToken` for `health_check`) are replaced by an O(1) indexed lookup plus a verified-token cache — bcrypt stays the sole verifier throughout.
+
+- **O(1) HMAC locator (schema v20).** New `agents.token_lookup` / `previous_token_lookup` columns hold `HMAC-SHA256(lookup_key, token)` (hex), indexed by `idx_agents_token_lookup`. Auth resolves the candidate row via a single indexed SELECT, then **bcrypt confirms** — the digest only narrows candidates, never authorizes (a digest collision is rejected by the bcrypt check). The lookup key is a dedicated HKDF subkey of the encryption keyring when one is configured (key-separated from `http_secret` + the record key; rotates with the keyring), or a persisted per-instance secret (`<instance>/token-lookup.key`, 0600) in plaintext mode.
+- **Verified-token cache (`src/auth-cache.ts`).** Per-process, LRU-bounded, TTL-capped cache of positive verdicts keyed on the digest — never the plaintext token, never the bcrypt hash. A hit skips the locator + bcrypt.
+- **Invalidation via a global `auth_meta.generation` counter — the correctness mechanism.** Every mutation that can change a token's validity bumps it; a cache entry is served only when its stamped generation still matches, giving **instant revocation** regardless of TTL. The classic trap is covered: `revoke_token` keeps `token_hash` for forensics (the token still bcrypt-matches), so validity is keyed on generation, not hash presence — a revoked token is denied on its very next call. A build-time drift guard (`scripts/auth-gen-guard.mjs`, with an adversarial negative-fixture test) fails the build if any token/auth mutator omits its bump.
+- **Zero-lockout migration.** `token_lookup` can't be backfilled from a bcrypt hash, so legacy rows stay NULL and authenticate via an O(N) fallback that **lazily self-heals** the digest on first authenticated call — each agent goes O(1) thereafter. Native + wasm driver parity covered.
+- No new tools, no API changes; auth semantics (active / rotation_grace / revoked / recovery / legacy) are byte-for-byte preserved.
+
+## v2.19.0 — 2026-07-22 — Liveness derivation: presence that stops lying
+
+Fixes the presence **lie**: a rate-limited-but-alive agent (e.g. an agent mid-audit) reported `status=offline` because presence was still derived from `last_seen` **age**, and the liveness verdict anchored **only** on a registered `agent_pid`. Consumers misread "offline" as "dead."
+
+> **⚠ Presence-semantics contract change** (minor-version bump). `computeStatus` (the age→status mapper) is **removed**; the coarse `status` is now PID/verdict-derived. A programmatic register with **no** `host_id`/`agent_pid` anchor now reads `unknown` (was age-based `online`) — real hook/Tether registrations stamp an anchor and read `online`. The `status` enum drops `stale` (`online | offline | unknown`). External snapshot readers keying on `status` should treat `unknown` as "no liveness signal," never as offline/dead.
+
+- **Security — `fast-uri` HIGH advisory pinned out.** Pins `overrides.fast-uri = 3.1.4` to clear **GHSA-4c8g-83qw-93j6** and **GHSA-v2hh-gcrm-f6hx** (CVSS 7.5 each — URI host-confusion via failed IDN canonicalization + literal-backslash authority delimiter; both affect fast-uri `3.0.0`–`3.1.3`). It reaches us transitively via `ajv@8.20.0`, which declares `fast-uri ^3.0.1`, so `3.1.4` is in-range and non-breaking (the MCP SDK is untouched — `npm audit fix` was rejected because it force-upgrades the SDK to a breaking major). Repo-wide `npm audit (high+)` in CI now passes.
+
+- **The coarse `status` is now derived from the liveness VERDICT, not `last_seen` age.** `alive → online`, `dead → offline`, `unknown → unknown`. A live agent **never** reads `offline`; `last_seen` is pure telemetry. (The verdict-based `agent_status` already dropped age in v2.15.0; this finishes the job for the last age-based surface. The `status` enum is now `online | offline | unknown`, was `online | stale | offline`.)
+- **The liveness verdict gained an argv-scan fallback.** When an agent has no (or a stale) `agent_pid`, the verdict also confirms *alive* by finding a live process on **this host** that advertises `RELAY_AGENT_NAME="<name>"` in its argv — the agent's **own** process. Both-side anchored + a **literal** substring search (not a `pgrep -f` regex), so `foo` never matches `foobar`/`foo-x`, and a name metacharacter can't inject. Host-scoped + behind the 5 s probe cache.
+- **`host_shell_pids` is deliberately NOT probed** as a fallback: the Tether ancestry chain includes the terminal/shell, which outlive the agent — probing it would false-read a crashed-agent-in-an-open-terminal *alive* (the v2.13.0 §3 contract). The argv scan fixes the same case via the agent's own process, without that false-alive.
+- On-read (no periodic sweep). Remote/federated agents stay `unknown` (a daemon can't PID-probe another host) — a cross-host heartbeat is a parked follow-on.
+- Acceptance test reproduces the exact failing shape (agent_pid null, process alive with the name in argv) and asserts the surface shows **alive**, not offline.
+
+## v2.18.0 — 2026-07-21 — Sentinel: `relay watch` — autowake for any terminal
+
+Sentinel is the relay's built-in autowake for terminal agents **not** in VS Code/Tether (iTerm2 personas, plain terminals, remote sessions) — the poll/marker-based sibling of Tether's push-based wake. It's the shipped replacement for the hand-armed inbox-watcher bash loop. Pairs with Tether: **Tether = push-wake in VS Code; Sentinel = wake anywhere.**
+
+- **`relay watch <agent> [--interval S] [--once] [--json]`** — stands watch over `<agent>`'s inbox and prints a wake line when new mail arrives, so a harness Monitor (or you) can nudge the agent to read it. It consumes the sanctioned cheap primitive `peekMailboxVersion` **in-process** (a single indexed `COUNT`, not a raw `sqlite`-every-Ns scan loop); the wake signal is `total_unread_count` **rising** (`last_seq` is unreliable before first observation — v2.3.0 Codex HIGH #2). `--once` checks + exits (scripts/smoke); `--json` emits machine-consumable wake lines.
+- **Event-driven when `RELAY_FILESYSTEM_MARKERS=1`:** waits on the daemon-written delivery marker (`~/.bot-relay/marker/<agent>.touch`) via `fs.watch` (near-zero idle cost), with a slow fallback re-check so a **dropped** fs event is never a silent permanent miss (the marker is a HINT, not a queue). Falls back to bounded polling otherwise — no busy-spin.
+- **Local-trust auth** (filesystem authority, like `mint-token`/`recover`): reads the **ACTIVE per-instance DB** directly — no token. It resolves the instance DB exactly as the daemon does (`resolveInstanceDbPath`), **never** the legacy `~/.bot-relay/relay.db` (the stdio-legacy-DB-split trap), so the marker and the count read describe the same live instance. A token-authenticated `--remote` path is documented forward-compat, not built (YAGNI).
+- **`check-relay.sh` JSON hardening (fast-follow).** The 2 latent register-JSON bugs left in the Claude hook when the same fixes landed in the Codex hook: (1) a hostile `RELAY_TERMINAL_TITLE` (quote/backslash/newline) was raw-interpolated into the `register_agent` payload → malformed JSON → the whole register + mail delivery failed; now validated against the server allowlist and **dropped** if it doesn't match. (2) the capabilities→JSON `awk` used `next` (which skips the whole record, dropping the closing `]`) + an index-based separator; an **empty token** (a double/leading/trailing comma) triggered malformed caps JSON → register failed; now `continue` + a count-based separator → always valid JSON. Both are byte-parity with the Codex hook and proven end-to-end against a real daemon.
+
+## v2.17.1 — 2026-07-21 — WakeSpec reconciliation + transient-send retro quick wins
+
+Fast relay patch. Corrects the 2.17.0 interim WakeSpec placeholders to the Tether extension's **proven** wake behavior (so the data-driven Tether 0.6.0 reads real values), plus three one-line-send DX wins from the transient-send retro.
+
+- **WakeSpec reconciled** (`src/agent-cli-profiles.ts`): codex `wakeText` is now **byte-identical** to the extension's `DEFAULT_CODEX_WAKE_TEXT` (kept in sync by a drift-guard test that reads the extension source), `submitMethod: "sendSequence"` + a new **`submitDelayMs: 150`** match the tuned `codexAdapter`, and claude wakes by typing `inbox` inline (`sendText`, 0 ms). The interim-placeholder marker is **removed** — these are the real values now.
+- **`relay send <to> <content>`** — one-line send. Resolves the sender's token (`$RELAY_AGENT_TOKEN` → per-instance vault → `--mint-if-missing`) and POSTs `/api/send-message`; `--from NAME` sets the sender (default `$RELAY_AGENT_NAME`). **Never sends a bad credential** — it sends `from_agent_token` (the impersonation gate still applies), and it refuses **locally** (exit 2, no POST) on every path when no token resolves OR the vault token does not authenticate against the DB (stale/missing/mismatched) — the mismatched credential is never handed to the daemon.
+- **`mint-token --json`** verified to emit **only** JSON on stdout (the daemon advisory + init logs already go to stderr); locked with a regression test.
+- **`/api/send-message` accepts `message` as an alias for `content`** — one send vocabulary across the MCP `send_message` tool, the agent-team `SendMessage`, and the HTTP endpoint. Exactly one is required; sending **both with different values is rejected** (no silent precedence).
+
+## v2.17.0 — 2026-07-20 — LLM-agnostic parity (P1–P4)
+
+The LLM-agnostic parity arc (`audit-findings/llm-agnostic-parity-scope-brief.md`; P0 = the Codex Tether handshake + cold-start launcher, 2.16.3/2.16.4). Bundled into one minor across the relay phases (P1, P3, P2); the Tether extension change (P4) ships separately as a Tether VSIX minor.
+
+> **Interim data note (honest scope).** The profile registry's `wake` values (`src/agent-cli-profiles.ts`) are **interim placeholders** in 2.17.0 — populated in P3 to freeze the shape. **No shipped relay code consumes them** (Tether 0.5.0 does not read the registry), so this is documented-interim data, not silent-wrong data. They are reconciled to the extension's proven wake behavior (tuned codex `wakeText` + 150 ms submit delay + correct `submitMethod`) in **2.17.1**, and the data-driven Tether **0.6.0** reads only the corrected registry.
+
+**P1 — Codex hook generation.**
+- **`relay generate-hooks --codex`** — emits a `~/.codex/config.toml` fragment with a **register-only** SessionStart hook (points at `hooks/codex/codex-session-start.sh`). Reconciled to the current no-poller model: Codex wakes via Tether + `bin/codex-relay`, so there is **no Stop-hook poll loop** (the `codex-stop.sh` poller was removed in 2.16.4). The output documents the cold-start launcher + the MCP-server requirement inline.
+- **`--all`** emits both the Claude JSON and Codex TOML, each in its own labeled section. Default (no flag) and `--full` are unchanged — Claude Code, back-compat.
+- **Honest hook-model mapping** (no forced symmetry): Claude Code uses SessionStart + PostToolUse + Stop; Codex uses a single register-only SessionStart hook (its wake is Tether-driven, not a hook poll loop). PostToolUse/Stop have no Codex analog by design — documented in `--help`.
+- Parser-based tests (`tests/v2-1-cli-tooling.test.ts` 8b–8e): `--codex` and both `--all` payloads are TOML/JSON-parsed and asserted register-only; TOML basic-string escaping covers all control chars (round-trip regression).
+
+**P3 — CLI-profile registry (registry-first, ahead of P2 spawn).**
+- **`src/agent-cli-profiles.ts`** — one declarative registry (claude + codex; schema extensible = new CLI is one entry) carrying each CLI's `processPattern`, `hookInstall`, `launch` (consumed by P2 spawn) and `wake` (consumed by P4 Tether). The shared machine-GUID / `host_id` derivation is deliberately **not** per-profile (the federation-safety invariant).
+- **`relay cli-profiles [--json]`** — prints the registry (human summary or JSON for cross-boundary reads).
+- **Refactors** `generate-hooks` (output byte-identical) and `liveness.ts:DEFAULT_AGENT_PATTERN` to read the registry — every hardcoded `claude|codex` branch in those consumers is gone.
+- **Drift guards** (vitest + pre-publish share one TS-AST walk, `scripts/cli-profile-guard.mjs`): reject hardcoded claude/codex *decision logic* in `src/` outside the registry — id-equality on **either** operand, switch/case on a CLI id, or a regex alternation of the ids — with planted regressions for each dangerous form (incl. the three regex bypasses codex's audit found). A bash-mirror guard also asserts the `_vault-helpers.sh` PID-finder pattern's CLI tokens track the registry (kept a mirror, not read on the per-hook hot path).
+
+**P2 — LLM-agnostic spawn (registry-driven).**
+- **`spawn_agent` gains a `cli` field** (`SpawnAgentSchema`): `"claude"` (default — every existing call is byte-identical) or `"codex"`, validated against the profile registry at the MCP boundary (an unknown CLI is rejected). The drivers resolve the launch **strategy** from the registry — no hardcoded `claude|codex` branch (the P3 drift guard stays clean).
+- **`LaunchSpec` extended (additive):** `strategy: "binary" | "launcher"` + `launcherScript`. `binary` runs the CLI directly (Claude, unchanged); `launcher` runs a repo POSIX launcher that self-registers the relay handshake then execs the CLI. Codex → `bin/codex-relay`, so a **spawned** Codex gets the 2.16.4 cold-start `host_shell_pids` handshake **at launch**.
+- **macOS** (`bin/spawn-agent.sh`): one hardened path, now generic — when the driver sets `RELAY_SPAWN_LAUNCHER` it runs that launcher instead of `claude`; otherwise the claude line is **byte-identical** to before. All identity/cwd hardening (allowlist, control-char + symlink-root defense, osascript escaping, vault hydration) is CLI-agnostic and reused; the launcher path gets its own defense-in-depth validation (absolute, no metachars, resolves to an executable **within the repo `bin/`**). There is no CLI literal in the bash — it branches on launcher-presence.
+- **Linux**: `exec claude` generalized to the registry launch target; Codex runs `bin/codex-relay` (POSIX) across every emulator, name/cwd POSIX-quote-escaped. **Windows**: a launcher-strategy CLI throws a clear "not supported on Windows (codex-relay is POSIX)" error — Claude spawn is unchanged.
+- **Security**: no escaping relaxation anywhere. The launcher path is **fully canonicalized** (the whole symlink chain of the final target, portable pure-bash — a symlink physically inside `bin/` pointing outside it now resolves to its real target and is rejected; the codex P2 audit hole) and must be a **regular executable** under the canonical `bin/`; the canonical path is what runs. New adversarial coverage — codex-launcher path escapes hostile name/cwd (defense-in-depth); the real-bash suite rejects launcher path-escape / metachars / non-executable / traversal / **symlink-out / symlink-cycle** while still enforcing name/cwd hardening on the codex path. Back-compat asserted byte-identical across the env matrix.
+- **Tracked follow-ups (documented limitations, non-blocking):** (1) **Windows codex-spawn parity** — `codex-relay` is POSIX, so Windows codex-spawn errors clearly; a PowerShell codex-relay equivalent is the follow-up to close full cross-platform parity. (2) **Codex-spawn kickstart** — a spawned codex is not handed a startup prompt (codex's positional-prompt CLI contract is not guessed on the security path); it registers + Tether-wakes. Both slated post-P4.
+
+## v2.16.4 — 2026-07-20 — Codex cold-start launcher (autowake at pure launch)
+
+Closes the last gap in the Codex autowake story. The P0 handshake (2.16.3) works, but Codex runs the SessionStart hook's `register_agent` at the **first turn**, not at idle launch — so a freshly-summoned Codex has no `host_shell_pids` until you take a turn, and Tether can't PID-bind it until then ("summon → nothing happens until you talk to it").
+
+- **`bin/codex-relay <agent-name>`** — a cold-start launcher that pre-registers the Tether handshake (`host_shell_pids` + `host_id`) **from the shell**, before exec'ing Codex. Because it runs as a child of the launching shell, its ancestry (`relay_pid_chain`) includes the VS Code `Terminal.processId`, so `host_shell_pids` is populated at **pure launch** → Tether binds + wakes immediately, zero manual turn. Uses the SAME shared helpers as the hook (`hooks/_vault-helpers.sh`, no drift). Cause-independent — it sidesteps Codex's hook-lifecycle timing entirely. Generalizes to any summoned Codex (the agent name is the first arg); brand-new agents register auth-free at first launch and the launcher vaults the minted token.
+- **The wrapper→hook handoff (no double-register collision, no force).** The launch register is **non-force** — a genuinely-live same-name session correctly rejects it (duplicate-session protection intact). On success the launcher captures the registered `session_id` and exports it as `RELAY_LAUNCH_SESSION`; Codex's `SessionStart` hook then **skips its own register only when that marker equals its row's current `session_id`** (proof *this* launch registered *this* row — never on DB-state alone), and **otherwise registers normally with `host_shell_pids`** (the plain-`codex` / failed-launch fallback). The launcher **unsets any inherited `RELAY_LAUNCH_SESSION` at entry** and re-exports it only on its own successful register, so a stale/leaked marker can't cause a wrong skip.
+- **Liveness via the stdio server.** The launcher does **not** send `agent_pid` (the contract requires the exact Codex process, which only exists after `exec`). Codex's stdio MCP server stamps the exact detected Codex process on startup (`src/transport/stdio.ts`, v2.13.0) — the universal capture point.
+- **Time-bounded — never stalls the launch.** The pre-register is a bounded **synchronous** health + register (`--connect-timeout 1 --max-time 2`, ~3s worst case), then Codex `exec`s regardless of daemon state: down/hung daemon → prompt `exec`, no marker.
+- **Local-trust note.** The marker is the row's `session_id` (exposed by unauthenticated `discover_agents`), so a hostile same-user process could forge a skip. Accepted under the relay's existing local-trust boundary — a same-user attacker already reads the `0600` token vault and can act as any agent — so no cryptographic launch-nonce was added. Documented in `docs/agents/codex-autowake.md`.
+- **Tested** (`tests/v2-16-4-codex-coldstart-launch-register.test.ts`, real launcher + hook vs a real daemon): wrapper marker == row `session_id` + `host_shell_pids` contains the launching PID; marker-match → hook skips; marker-mismatch / no-marker / cross-agent marker → hook registers WITH `host_shell_pids`; a real duplicate-live collision + inherited marker → cleared, live row untouched; daemon down/hung → prompt bounded `exec`; `-c` identity override + arg forwarding.
+- Doc: `docs/agents/codex-autowake.md` gains a "Cold-start" section (handoff + trust boundary) + the launcher alias. JSON-separator hardening in `bin/codex-relay` + `codex-session-start.sh` (count-based, so a leading invalid capability can't emit invalid JSON).
+
+## v2.16.3 — 2026-07-20 — Tether wakes Codex terminals (P0 LLM-agnostic parity)
+
+Restores the reported break — **"Tether stopped waking Codex."** It was a registration-contract gap, not wake logic. Tether binds a VS Code terminal to an agent by **PID**, host-scoped (`pid-binding.ts` needs the agent's `host_shell_pids` + a `host_id` matching this machine). The Claude hook (`check-relay.sh`) has always sent them; the Codex `SessionStart` hook sent **only** `agent_pid` — its comment (*"Tether is Claude/VSCode-only"*) was frozen from before Tether went LLM-agnostic (v0.4.0). So Tether abstained on Codex and fell back to fragile terminal-name matching, which broke when a workspace move / alias change renamed the terminal.
+
+- **Shared helpers.** `relay_machine_guid()` + `relay_pid_chain()` moved out of `hooks/check-relay.sh` into the shared `hooks/_vault-helpers.sh` (byte-identical behavior for Claude — no inline copy), so the Codex hook can report the **same** handshake.
+- **Codex handshake.** `hooks/codex/codex-session-start.sh` now sends `host_shell_pids` + `host_id` + `terminal_title_ref` on register — byte-parity with the Claude hook, so a Codex agent's `host_id` agrees with the extension reader (`extensions/vscode/src/host-identity.ts`). Tether can now PID-bind and wake Codex terminals **token-free** (the extension does the idle waiting, not the model).
+- **No poll loop.** This is a **register-only** `SessionStart` change. The token-burning `Stop`-hook keep-alive poller (which re-prompted the model every ~90s and blocked terminal input) stays **removed** — Tether does the waking; Codex spends tokens only when there is actually mail. The now-orphaned `hooks/codex/codex-stop.sh` script is deleted (zero references remained; git history retains it).
+- **Hardened `terminal_title_ref`.** The Codex hook validates the title against the server's `TERMINAL_TITLE_REF_PATTERN` allowlist (`[A-Za-z0-9_.- ]`) and drops it if it fails, so a hostile title (quote / backslash / newline / JSON fragment) can never malform the register payload — or be rejected server-side — and take the handshake down with it. The `SessionStart` context also no longer references a Stop-hook waker (it names Tether).
+- **Test.** `tests/v2-16-3-codex-tether-handshake.test.ts` drives the shipped Codex hook against a real daemon and asserts the register payload lands `host_shell_pids` + `host_id`, and that the Codex `host_id` is byte-identical to the Claude hook's (shared-helper, no drift).
+- **Doc.** `docs/agents/codex-autowake.md` rewritten to the Tether-wake model (no poll loop).
+- Ships as a hooks-only relay patch — no Tether VSIX republish (hooks travel with the npm package). Scope is P0 only; broader LLM-agnostic parity (spawn, hook generation, profile registry) is P1–P4 in `audit-findings/llm-agnostic-parity-scope-brief.md`.
+
+## v2.16.2 — 2026-07-13 — Publish-gate fix for Node 24 / npm 11 (carries 2.16.1)
+
+A release-tooling patch: **2.16.1 never reached npm** because the pre-publish gate failed on Node 24 / npm 11, so 2.16.2 is what ships and it **carries all of 2.16.1** (stable mint-once-reuse, below) plus this fix.
+
+- **The block.** The extension's VSIX-contents drift guard (`v0-1-4-vsix-contents.test.ts`) shells out to `vsce ls` / `vsce package`, which internally run `npm list --production --parseable --depth=99999`. Under npm 11 that scan **exits 1** on a false-positive `ELSPROBLEMS` (the `qs`/`form-data` `overrides` mark `call-bind-apply-helpers` / `get-intrinsic` "invalid" though the installed versions satisfy their ranges). npm 20/22 accept it, so CI stayed green while the gate — which Maxime runs on Node 24 — went red on all 11 assertions.
+- **The fix.** Both vsce invocations now pass `--no-dependencies`, skipping the dependency scan. The extension is esbuild-bundled, so runtime deps never ship in the VSIX — the packaged file list and byte ceiling the guard asserts are unchanged; only the spurious scan is gone. Verified passing on Node 24 / npm 11.
+- **Known follow-up (flagged, not in this patch):** the *relay* pre-publish gate runs this *extension* VSIX test, so a Tether-tooling failure can block a relay npm publish. Decoupling the two gates (or making the shared gate Node-version-robust) is a tracked follow-up.
+
+## v2.16.1 — 2026-07-13 — Stable agent tokens (the relay half of the durable autowake fix)
+
+The recurring "autowake stops working after a relaunch" bug had two halves. The relay half: a launcher running `relay mint-token --force` on **every** relaunch rotated the agent's token, invalidating any holder of the old one. `relay mint-token` now defaults to **stable mint-once-reuse**:
+
+- **No agent yet** → mint a token **and write it to the vault** (closing a long-standing gap where the CLI minted a token but never wrote the vault the SessionStart hook reads).
+- **Agent exists and its vault token still authenticates** → **reuse it** — the `token_hash` is byte-stable, no rotation, no churn.
+- **Agent exists but its vault token can't authenticate** (missing / stale / mismatched) → **refuse**, with guidance (`--force` to rotate deliberately, or `relay recover`). It never silently rotates — that would invalidate a possibly-live token and mask a stale/compromised credential.
+
+`--force` still rotates on demand for the genuine "I want a new token" case (and now also writes the vault). Paired with the Tether 0.5.0 vault-first token read, this ends the manual "Set Agent Token" babysitting for good.
+
+## v2.16.0 — 2026-07-10 — One-command install (`relay init`), the adoption gate
+
+Getting a working relay used to take ~6 disjoint manual steps across three files plus a hand-authored launchd plist. `relay init` is now the single idempotent macOS install path: a stranger runs one command and gets a working relay + autowake loop, and re-running is always safe.
+
+### What `relay init` now does (all reconcile-not-clobber, safe to re-run)
+
+1. **`~/.bot-relay/config.json`** — reconciles: PRESERVES an existing `http_secret`, `instance_id`, and any operator edits; adds only missing defaults. Records a `default_agent_name` (`--agent NAME`) the SessionStart hook falls back to.
+2. **`~/.claude.json`** — deep-merges the `bot-relay` stdio `mcpServers` entry (absolute path), preserving other servers.
+3. **`~/.claude/settings.json`** — deep-merges the SessionStart hook, deduped by command path, preserving unrelated hooks.
+4. **macOS launchd** — installs + bootstraps a `KeepAlive` daemon plist, but SKIPS if `:3777` is already served by any relay (collision-safe, label-agnostic — never double-loads an existing supervisor).
+
+Opt-outs: `--config-only`, `--skip-hooks`, `--skip-daemon`, `--skip-mcp`. Deep-merges are structural + atomic (tmp+rename+`.bak`); a second run is a strict no-op.
+
+### Token-safety — the load-bearing invariant
+
+`relay init` is **token-blind by construction**: it imports no token/db module and never mints, rotates, registers, recovers, or writes/deletes a token or touches the agents token-hash column / the vault. So init / deploy / bounce can never desync a live agent's credential. Agent identity is established by the already-token-safe SessionStart hook on first launch (vault-first read; register captures the minted token → writes the vault). Guarded by a source+compiled token-blind scan and a regression that seeds a matching vault, runs init twice, and asserts both the DB hash and the plaintext vault stay byte-stable + authenticating (a negative control proves the assertion catches a rotate).
+
+### Local installs are secret-free — a deliberate local-trust default
+
+A default local install OMITS `http_secret`: the daemon treats a `127.0.0.1` bind as local-only (a transport secret would 401 the SessionStart hook's register and break the loop). **Be clear-eyed about what this means: the default trusts every process on the same machine.** With no secret, any local process can reach the loopback HTTP surface, including the dashboard operator endpoints (`/api/snapshot` read, `set-status`, `wake-agent`, `kill-agent`, `operator-identity`). Per-agent tokens + gate-11 from-verification protect only agent **identity** — you still can't send or act *as* another agent without its token — but they do **not** gate the whole surface.
+
+This is a reasonable boundary for a single-user machine: a local process already has OS-level access to the same data (PIDs via `ps`, the DB file). It is enforced conservatively — non-loopback binds are still **refused** without a secret, and the loopback-literal Host check still blocks DNS-rebind / malicious-webpage access on every route.
+
+**On a shared machine, or any non-loopback / team / remote setup, set a secret:** `relay init --secret <strong-random>` (or export `RELAY_DASHBOARD_SECRET`) to gate the surface. The daemon *requires* a secret to bind to any non-loopback host.
+
+macOS-first: Linux/Windows daemon supervision is "coming" (init prints manual guidance there, not gated). D2: the config `default_agent_name` never overrides an explicit `RELAY_AGENT_NAME` or spawn manifest.
+
 ## v2.15.2 — 2026-07-07 — Signal teardown stops re-polluting terminal states
 
 v2.15.1 was a one-time cleanup of stale stored terminal states. This closes the source that *re-creates* them: the stdio signal handler. A `SIGHUP`/`SIGINT`/`SIGTERM` is delivered to the agent's **MCP-server process**, not to the agent itself (the agent — `claude`/`codex`, tracked by `agent_pid` — can survive a terminal reflow / editor reload and relaunch its MCP server). The pre-v2.15.2 handler stamped a terminal `agent_status` on that signal, which stuck on two surfaces and phantom-closed a surviving agent:
