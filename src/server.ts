@@ -419,7 +419,7 @@ export function createServer(): Server {
   //   Returns shape. Errors (error_code → cause).
   // Markdown-style line breaks (\n\n) are preserved by the MCP SDK and
   // render in clients that surface tool descriptions to humans (Glama,
-  // mcp-inspector). Length is uniform across the 30 tools so the Glama
+  // mcp-inspector). Length is uniform across all tools so the Glama
   // TDQS MIN-weighted (40%) score isn't dragged by a one-liner.
   const ALL_TOOLS_DEFINITION = [
       {
