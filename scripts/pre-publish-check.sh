@@ -14,10 +14,11 @@
 #   6. End-to-end 25-tool smoke + CLI subcommand smoke against an isolated relay
 #
 # POST-PUBLISH (same day as `npm publish`, Maxime): tag vX.Y.Z at the published
-# gitHead and create the matching GitHub Release from the CHANGELOG section. The
-# "Latest" badge AND npmjs.com's rendered README both derive from the release/tag —
-# skipping it is how GitHub sat at "Latest = v2.20.0" while npm had shipped 2.24.0
-# (fixed 2026-08-05). Not a pre-publish gate step; a release-protocol reminder.
+# gitHead and create the matching GitHub Release from the CHANGELOG section. GitHub's
+# "Latest" badge derives from the GitHub Release/tag; npmjs.com's rendered README comes
+# instead from the PUBLISHED TARBALL's README (so it updates on `npm publish`, not on the
+# tag). Skipping the tag+Release is how GitHub sat at "Latest = v2.20.0" while npm had
+# shipped 2.24.0 (fixed 2026-08-05). Not a pre-publish gate step; a release-protocol reminder.
 #
 # Wired via package.json "prepublishOnly" so `npm publish` will refuse to ship
 # unless every check passes. Also runnable standalone for operator confidence.
