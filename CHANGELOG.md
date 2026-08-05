@@ -30,8 +30,9 @@ masthead behind a drift-guard, a locked SSRF regression, extension-tree parity).
 - **Three new HIGH advisories cleared — they had silently blocked the entire merge
   queue (#159).** The advisory DB moved after 2.24.0 published: `fast-uri`
   (host-confusion, GHSA-7p8r) — which our own `overrides.fast-uri: 3.1.4` **pinned to
-  the vulnerable version** — `ajv` (transitively via fast-uri), and `ip-address`
-  (SSRF / trust-boundary bypass). The audit-high step runs inside the required Test
+  the vulnerable version** — **`ajv`**, flagged high because our **direct** `ajv@8.20.0`
+  dependency pulls that same vulnerable `fast-uri` (it declares `fast-uri ^3.0.1`) — and
+  `ip-address` (SSRF / trust-boundary bypass). The audit-high step runs inside the required Test
   jobs, so under strict branch protection every open PR failed CI identically until
   this landed. Fix: `fast-uri` override → 3.1.5, `ip-address` → ^10.4.0. **Measured:
   published-2.24.0 *consumers* were never exposed** — npm overrides do not travel to a
