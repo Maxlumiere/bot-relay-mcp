@@ -13,6 +13,13 @@
 #       the src/-only check until v2.6.0 publish-prep --full gate caught one
 #   6. End-to-end 25-tool smoke + CLI subcommand smoke against an isolated relay
 #
+# POST-PUBLISH (same day as `npm publish`, Maxime): tag vX.Y.Z at the published
+# gitHead and create the matching GitHub Release from the CHANGELOG section. GitHub's
+# "Latest" badge derives from the GitHub Release/tag; npmjs.com's rendered README comes
+# instead from the PUBLISHED TARBALL's README (so it updates on `npm publish`, not on the
+# tag). Skipping the tag+Release is how GitHub sat at "Latest = v2.20.0" while npm had
+# shipped 2.24.0 (fixed 2026-08-05). Not a pre-publish gate step; a release-protocol reminder.
+#
 # Wired via package.json "prepublishOnly" so `npm publish` will refuse to ship
 # unless every check passes. Also runnable standalone for operator confidence.
 #
@@ -381,13 +388,25 @@ step "tests/ drift guard (no current-version literals)" tests_drift_guard || exi
 # Per-release facts live in the CHANGELOG; the masthead must not pin a version. This
 # fails the gate if a bold **vX.Y** version marker reappears in the first 15 lines.
 readme_masthead_version_guard() {
+  local fail=0
   if head -15 "$PROJECT_ROOT/README.md" | grep -nE '\*\*v[0-9]+\.[0-9]+'; then
     echo "  ^ README masthead re-introduced a hard-coded **vX.Y** version — de-version it (point to CHANGELOG)." >&2
-    return 1
+    fail=1
   fi
-  return 0
+  # The history-section "(current)" label must track package.json. It read
+  # "v2.22 (current)" while shipping 2.24.0 (this exact drift, twice, is why this
+  # check exists). Assert major.minor of the "(current)" entry == package.json.
+  local cur pkgmm
+  cur=$(grep -oE '\*\*v[0-9]+\.[0-9]+ \(current\)\*\*' "$PROJECT_ROOT/README.md" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  pkgmm=$(node -e "console.log(require('$PROJECT_ROOT/package.json').version.split('.').slice(0,2).join('.'))")
+  if [ -z "$cur" ]; then
+    echo "  README history has no '**vX.Y (current)**' marker — the shipping release entry must carry it." >&2; fail=1
+  elif [ "$cur" != "$pkgmm" ]; then
+    echo "  README history '(current)' is v$cur but package.json is $pkgmm.x — move '(current)' to the shipping release entry." >&2; fail=1
+  fi
+  return $fail
 }
-step "readme masthead version guard (no hard-coded **vX.Y** headline)" readme_masthead_version_guard || exit 1
+step "readme version guard (no **vX.Y** masthead; history '(current)' tracks package.json)" readme_masthead_version_guard || exit 1
 
 # --- 5b. Sanctioned-helper guard (v2.1 Phase 7q) -----------------------------
 # Reject raw `UPDATE agents` / `DELETE FROM agents` / `UPDATE agent_capabilities`

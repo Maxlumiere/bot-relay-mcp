@@ -1,5 +1,77 @@
 # Changelog
 
+## v2.25.0 — 2026-08-05 — ADR-0011 message disposition + read-receipts; a security-advisory sweep; dependency majors
+
+<!--
+  VERSION: 2.25.0. Sixteen merges since 2.24.0. Additive feature release (ADR-0011,
+  schema v24 auto-migrates) plus a security-advisory sweep and dependency majors —
+  no breaking change, so a MINOR bump. This is the RELEASE PR: content is final and
+  package.json is bumped to 2.25.0 — ready to cut once merged + published.
+-->
+
+Sixteen merges since 2.24.0. The headline is **ADR-0011 — message disposition +
+read-receipts** (schema v24, the new `get_outstanding` tool, now **37 MCP tools**).
+Around it: a security-advisory sweep that unblocked the whole merge queue — three new
+HIGH advisories had entered the tree and red-failed the audit gate on every open PR —
+the dependency majors that arrived with it (uuid 14, TypeScript 6, `@types/bcryptjs`
+3), and docs/tooling hardening that keeps the release honest (a de-versioned README
+masthead behind a drift-guard, a locked SSRF regression, extension-tree parity).
+
+### Messaging
+
+- **ADR-0011 — message disposition + read-receipts (#127).** Messages now carry a
+  disposition and a write-once `read_at`; the new **`get_outstanding`** tool
+  (sender-scoped, auth-gated) surfaces what a recipient has not yet acted on.
+  Schema **v24** — additive, auto-migrates from any prior version. Tool count is now
+  **37** (36 + `get_outstanding`). Resolution and read-state are orthogonal.
+
+### Security
+
+- **Three new HIGH advisories cleared — they had silently blocked the entire merge
+  queue (#159).** The advisory DB moved after 2.24.0 published: `fast-uri`
+  (host-confusion, GHSA-7p8r) — which our own `overrides.fast-uri: 3.1.4` **pinned to
+  the vulnerable version** — **`ajv`**, flagged high because our **direct** `ajv@8.20.0`
+  dependency pulls that same vulnerable `fast-uri` (it declares `fast-uri ^3.0.1`) — and
+  `ip-address` (SSRF / trust-boundary bypass). The audit-high step runs inside the required Test
+  jobs, so under strict branch protection every open PR failed CI identically until
+  this landed. Fix: `fast-uri` override → 3.1.5, `ip-address` → ^10.4.0. **Measured:
+  published-2.24.0 *consumers* were never exposed** — npm overrides do not travel to a
+  package's dependents, so consumers resolved the patched versions through normal
+  range resolution; the pin only ever affected our own dev/CI. A security pin without
+  an expiry re-check had become the sole hazard.
+- **SSRF alternate-spelling rejection locked (#167).** Test-only regression covering
+  the leading-zero / hex / decimal-integer / IPv4-mapped-IPv6 / NAT64 spellings
+  (`012.0.0.1`, `127.1`, `0x7f.0.0.1`, `2130706433`, `[::ffff:…]`, `[64:ff9b::…]`) —
+  all already fail closed via WHATWG-URL canonicalization; this locks it against a
+  silent refactor regression.
+- **Publish-gate hygiene (#156/#157, #158).** The prebuild-guard test no longer leaks
+  an inherited `RELAY_ALLOW_PROD_BUILD` into its spawned guard (a false green), and the
+  gate's stale "audit-level=moderate" header comment is corrected to the actual `high`
+  threshold it enforces.
+
+### Dependencies
+
+- **uuid 11 → 14 (#80).** We call only `v4`; clean bump; kills the moderate uuid<14 line.
+- **TypeScript → 6.0.3 (#164), NOT 7.x.** 6.0.3 is the latest *classic-compiler* major.
+  TypeScript 7.0 is the native "Corsa" rewrite and **drops the classic JS compiler API**
+  (`ts.SyntaxKind`, `ts.ScriptTarget`, `ts.createSourceFile`) that our AST-walk guard
+  scripts consume — so 7.x is a deliberate guard-port task, not a dependency bump.
+  Recorded so the next bump does not re-learn it.
+- **`@types/bcryptjs` → 3.0.0 (#165)**, dev types only. **Extension-tree parity:**
+  `fast-uri` → 3.1.5 and `ip-address` → 10.4.0 in `extensions/vscode` (#161/#162),
+  matching the root security fix; plus `brace-expansion` / `linkify-it` / `postcss`
+  (#104/#110/#135) and CI `actions/checkout` + `setup-node` → 7 (#68/#96).
+
+### Docs & tooling
+
+- **README masthead de-versioned + retired badge fixed + drift-guarded (#166).** The
+  masthead hard-coded "v2.22" and had gone stale while shipping 2.24.0 — and the public
+  Glama listing mirrors the README. Per-release facts now live in the CHANGELOG; the
+  masthead states the (test-guarded, accurate) tool count and points there. The retired
+  shields.io VSCode-Marketplace version badge is replaced with a static one that always
+  renders. A new pre-publish **masthead version-guard** fails the gate if a bold
+  `**vX.Y**` version marker ever reappears in the first 15 README lines.
+
 ## v2.24.0 — 2026-07-28 — Security hardening: operator auth, dashboard content isolation, orchestration integrity
 
 <!--
