@@ -3,9 +3,11 @@
 #
 # Orchestrates every check that must pass before `npm publish`:
 #   1. npx tsc --noEmit
-#   2. npx vitest run
-#   3. npm audit (high+ threshold, via scripts/audit-with-retry.sh; moderate→high since v2.3.0)
-#   4. npm run build
+#   2. npm run build  (dist/ — MUST precede the vitest steps: the suite spawns
+#      children that import from dist/, so a fresh clone with no dist fails every
+#      such test if the build runs later; this is the 2.25.0 R1 reorder)
+#   3. npx vitest run  (v2.8 fast smoke, then the full sequential sweep)
+#   4. npm audit (high+ threshold, via scripts/audit-with-retry.sh; moderate→high since v2.3.0)
 #   5. Drift guard: no hardcoded version literals in src/ outside src/version.ts
 #   5a. Tests-side drift guard (v2.6.3): no hardcoded literal of the CURRENT
 #       package.json version in tests/ — catches assertions like
@@ -22,6 +24,13 @@
 #
 # Wired via package.json "prepublishOnly" so `npm publish` will refuse to ship
 # unless every check passes. Also runnable standalone for operator confidence.
+#
+# RUNNING FROM A FRESH CLONE (the real `npm publish` path): run `npm ci` FIRST to
+# install dependencies, then `npm publish` (which invokes this gate) or the gate
+# standalone. You do NOT need a manual `npm run build` first — the gate builds
+# dist/ itself (step 2) before any test. Both stumbles that hit the 2.25.0 publish
+# from a fresh checkout are covered here: missing node_modules (→ `npm ci`) and
+# missing dist (→ the step-2 build-before-tests ordering).
 #
 # Exit 0 only if every step is green. On failure, prints a PASS/FAIL summary
 # and exits 1 at the first red step to keep feedback tight.
@@ -118,7 +127,21 @@ extension_bundle() {
 }
 step "extension bundle (extensions/vscode → out/extension.js via esbuild)" extension_bundle || exit 1
 
-# --- 2. Unit/integration tests ---
+# --- 2. Production build (dist/) — MUST run before any vitest step ------------
+# v2.25.0 R1: the root build was previously step 4, AFTER the vitest steps.
+# That passed everywhere dist/ already existed (the dev tree; every CI job runs
+# `npm run build` before the gate) and FAILED only in a fresh clone with no dist
+# — exactly the shape of an `npm publish` from a fresh checkout, which is how
+# Maxime hit it live during the 2.25.0 publish (workaround: build first). ~38
+# test files under tests/ spawn a child that imports from dist/ (e.g.
+# tests/v2-8-sighup-handler.test.ts shells out to `node dist/index.js`), so
+# every one of them fails with no dist. Building here makes the gate
+# self-sufficient: it produces its own dist/ before the first test runs.
+# (The CI `smoke` job deliberately does NOT pre-build, so this ordering stays
+#  honest — reintroducing a test-before-build order would red that job.)
+step "npm run build" npm run build || exit 1
+
+# --- 3. Unit/integration tests ---
 # v2.8 — fast-feedback smoke for the dashboard state machine + SIGHUP +
 # decay broadcaster + wire-emit sites. Runs the v2-8 test files
 # specifically BEFORE the full vitest sweep so a regression in this
@@ -171,8 +194,8 @@ step "vitest run" npx vitest run --pool=forks --no-file-parallelism || exit 1
 # real advisories). Real high+ vuln findings still exit 1 immediately.
 step "npm audit (high+)" bash "$PROJECT_ROOT/scripts/audit-with-retry.sh" high || exit 1
 
-# --- 4. Production build ---
-step "npm run build" npm run build || exit 1
+# --- 4. Production build --- (moved to step 2, above — the vitest steps import
+#      from dist/ and must run against a freshly-built tree; see the note there.)
 
 # --- 4b. v2.5.0 R1 — VSCode extension compile guard ---
 # Codex R1 audit caught that R0's pre-push gate didn't cover the

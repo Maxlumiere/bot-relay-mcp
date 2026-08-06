@@ -173,13 +173,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      # NOTE: intentionally NO `npm run build` step here. This job is the
+      # fresh-clone regression lock for the gate's own ordering (v2.25.0 R1):
+      # the gate must build dist/ itself before its vitest steps, because the
+      # real `npm publish` runs from a fresh checkout with no dist. Pre-building
+      # here (as every other CI job does) would mask a test-before-build
+      # regression — exactly the class that failed Maxime's 2.25.0 publish live.
+      # If someone reorders the gate so a test runs before the build, this job
+      # goes red (no dist → the dist-importing tests fail). Keep it build-less.
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Run 25-tool smoke against isolated relay
+      - name: Run 25-tool smoke against isolated relay (fresh-clone gate — no pre-build)
         # RELAY_SMOKE_ONLY marks this as the CI SMOKE invocation (exercise the
         # always-on gate steps), so the publish-only gates (branch-identity,
         # CI-green) SKIP here — CI checks out non-main PR branches and cannot
