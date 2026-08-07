@@ -257,6 +257,36 @@ If you run `npm audit` in a project that depends on **bot-relay-mcp**, you may s
 
 If you believe one of these *is* reachable through bot-relay-mcp, please report it (below) with the call path — a demonstrated reachable path changes the triage.
 
+### Dependency `overrides` — rationale & retirement (standing practice)
+
+**An npm `override` DEFEATS Dependabot's security auto-fix for that package.** Measured 2026-08-07: Dependabot's security update for `js-yaml` in `/extensions/vscode` (actions run 31167590033) died with a `conflicting-dependencies` error — its updater is direct-only and cannot move a version our override pins — and that failure is *silent* (no PR, no red on a branch). So an override that outlives its reason stops being a pin and becomes a **permanent silent blocker on security updates** — which is exactly how a HIGH can sit unfixed with nothing complaining.
+
+Two consequences, both now standing practice:
+
+1. **Every `override` is recorded below with WHY it exists and WHAT retires it — and a guard enforces the completeness of this table.** `tests/v2-25-override-inventory-guard.test.ts` reds CI whenever the overrides in `package.json` / `extensions/vscode/package.json` and this table drift apart — a new override with no row, or a row for an override that no longer exists. A hand-maintained "this is the complete list" claim drifts silently the moment someone adds override #14; this one cannot. (This table itself was born incomplete — 4 of 13 — and codex caught the false-completeness claim; the guard is why it can't recur.)
+2. **The extension `npm audit` (high+) gate** in `scripts/pre-publish-check.sh` is the compensating detector: it reds the build on any extension HIGH *regardless* of Dependabot, at the same `high` threshold as the root audit (moderates report, never gate — see above). We stop depending on the channel that fails silently.
+
+Rationales below are established from git history, not reconstructed. "security pin" means the override forces a transitive to a patched version; the retirement check is uniform (see the paragraph after the table). `esbuild` is the one non-security override.
+
+Count: there are **13 override entries** across the two manifests but **12 unique packages** — `hono` is overridden in both `package.json` (root) and `extensions/vscode/package.json`, so it has a single row here (tree = "root + ext"). The guard matches by unique package name, and the table has one row per unique name.
+
+| override | tree | why (git-established) | retires when |
+|---|---|---|---|
+| `js-yaml ^4.3.1` | ext | security: DoS <4.3.1 (transitive via secretlint) — #175 | ecosystem resolves ≥4.3.1 without the pin (see check below) |
+| `undici ^7.29.0` | ext | security: GHSA <7.29.0 (via @vscode/vsce→cheerio) — #175 | ecosystem resolves ≥7.29.0 without the pin |
+| `brace-expansion ^5.0.9` | ext | security: DoS 4.0.0–5.0.8 (via @vscode/vsce + glob) — #175 | ecosystem resolves ≥5.0.9 without the pin |
+| `hono ^4.12.34` | root + ext | security: GHSA <4.12.34 (via @modelcontextprotocol/sdk) — #175 | the MCP SDK's range resolves ≥4.12.34 without the pin |
+| `fast-uri 3.1.5` | root | security: host-confusion advisory — value set in #159 (override introduced #108) | ecosystem resolves ≥3.1.5 without the pin |
+| `ip-address ^10.4.0` | root | security: SSRF / trust-boundary advisory — #159 | ecosystem resolves ≥10.4.0 without the pin |
+| `tmp 0.2.7` | ext | security: part of #79's consolidated bump (cleared a critical + highs) | ecosystem resolves the patched version without the pin |
+| `form-data 4.0.6` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
+| `markdown-it 14.2.0` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
+| `vite 7.3.5` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
+| `qs 6.15.2` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
+| `esbuild $esbuild` | ext | dedup (NOT security): the `$esbuild` reference forces the extension's esbuild to the parent's version — #79 | a single esbuild version resolves across the tree without the reference |
+
+To check a retirement: delete the override, `npm install --package-lock-only`, `npm audit --audit-level=high` — if clean, the ecosystem has caught up and the override is redundant.
+
 ---
 
 ## Disclosure
