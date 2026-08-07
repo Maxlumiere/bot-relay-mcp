@@ -75,4 +75,47 @@ describe("#47 pinned-parser gate — a file the pinned parser cannot fully parse
     // exit 2 = parse/usage error per each guard's convention; the point is NOT 0.
     expect(code).not.toBe(0);
   });
+
+  it("refuses a CLEAN root file whose one-hop import TARGET is malformed (import-target fail-closed)", () => {
+    // Proves guard-ast parseModule's new branch: a partial parse of an import
+    // TARGET returns null (refuse) instead of a trusted partial tree, so a
+    // required primitive imported from a file the pinned parser cannot fully
+    // parse reads as UNRESOLVABLE → PREMISE VIOLATED → non-zero, never clean.
+    // The target declares registerPersistedSecret VALIDLY but has a parse error
+    // elsewhere, so ONLY the diagnostic-refuse — not a missing declaration —
+    // can produce the failure. (Without the refuse, the intact decl would be
+    // found in the partial tree and the guard would pass CLEAN: the silent hole.)
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-import-target-"));
+    fs.writeFileSync(
+      path.join(dir, "db.ts"),
+      `import { generateToken } from "./auth.js";\n` +
+        `import { registerPersistedSecret } from "./secret-registry.js";\n` +
+        `export function mint() { const t = generateToken(); registerPersistedSecret("p", t); return t; }\n`,
+    );
+    // Clean target for the OTHER primitive, so only secret-registry.ts's parse
+    // error is in play.
+    fs.writeFileSync(path.join(dir, "auth.ts"), `export function generateToken() { return "tok"; }\n`);
+    // VALID registerPersistedSecret declaration + a parse error elsewhere.
+    fs.writeFileSync(
+      path.join(dir, "secret-registry.ts"),
+      `export function registerPersistedSecret(p: string, s: string) { return; }\n` +
+        `const BROKEN = ;\n@@@ not valid typescript @@@\n`,
+    );
+    let code = 0;
+    let stderr = "";
+    try {
+      execFileSync(
+        "node",
+        [path.join(REPO_ROOT, "scripts/secret-register-guard.mjs"), path.join(dir, "db.ts")],
+        { stdio: "pipe", cwd: REPO_ROOT },
+      );
+    } catch (e: any) {
+      code = e.status ?? 1;
+      stderr = String(e.stderr ?? "");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    expect(code).not.toBe(0); // never CLEAN when a primitive's import target won't fully parse
+    expect(stderr).toMatch(/PREMISE VIOLATED|registerPersistedSecret/);
+  });
 });
