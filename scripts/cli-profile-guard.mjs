@@ -55,7 +55,7 @@
  * Usage:   node scripts/cli-profile-guard.mjs <dir> [<dir> ...]
  * Exit:    0 = clean · 1 = violations (printed to stderr) · 2 = usage/parse error
  */
-import ts from "typescript";
+import { ts, parseGuardSource } from "./lib/guard-parse.mjs";
 import fs from "fs";
 import path from "path";
 
@@ -108,7 +108,7 @@ function scanFile(file, violations) {
     if (l.includes(ALLOW_MARK)) allowedLines.add(i + 1);
   });
 
-  const sf = ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const sf = parseGuardSource(file, src); // pinned-parser gate: throws on parse diagnostics → main() exits 2
 
   const report = (node, kind) => {
     const ln = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;

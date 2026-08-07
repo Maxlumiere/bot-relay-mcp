@@ -68,7 +68,7 @@
  * Exit: 0 = clean · 1 = violations (stderr) · 2 = usage/parse error
  * Usage: node scripts/secret-register-guard.mjs <db.ts> [<file> ...]
  */
-import ts from "typescript";
+import { ts, parseGuardSource } from "./lib/guard-parse.mjs";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -118,7 +118,7 @@ const EXEMPT = new Set(["registerPersistedSecret", "registerIdentitySecret"]);
  * @fixture "trigger and required call both resolve through imports"
  */
 export function findSecretRegisterViolations(source, fileName = "db.ts") {
-  const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const sf = parseGuardSource(fileName, source); // pinned-parser gate: throws on parse diagnostics → main() exits 2
   const violations = [];
   forEachFunctionUnit(sf, (name, bodyNode, nameNode) => {
     if (!name) return;
@@ -156,7 +156,7 @@ function main() {
       // (moved behind a barrel, re-exported, renamed at the import site), every
       // minter would read as unregistered and the failure would look like the
       // codebase broke rather than the guard's premise. Say which, and refuse.
-      const premiseSf = ts.createSourceFile(abs, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      const premiseSf = parseGuardSource(abs, src); // pinned-parser gate: throws on parse diagnostics → main() exits 2
       const unresolvable = findUnresolvablePrimitives(premiseSf, REQUIRED_PRIMITIVES);
       if (unresolvable.length > 0) {
         process.stderr.write(

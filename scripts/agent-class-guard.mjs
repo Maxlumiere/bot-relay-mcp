@@ -33,7 +33,7 @@
  * Exit: 0 = clean · 1 = violations (stderr) · 2 = usage/parse error.
  * Usage: node scripts/agent-class-guard.mjs <dir> [<dir> ...]
  */
-import ts from "typescript";
+import { ts, parseGuardSource } from "./lib/guard-parse.mjs";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -68,7 +68,7 @@ function isClassLiteral(node) {
 
 /** Analyze source text; return [{line, kind, snippet}] violations. Exported for the negative-fixture test. */
 export function findAgentClassViolations(source, fileName = "f.ts") {
-  const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const sf = parseGuardSource(fileName, source); // pinned-parser gate: throws on parse diagnostics → main() exits 2
   const allowed = new Set();
   source.split("\n").forEach((l, i) => {
     if (l.includes(ALLOW_MARK)) allowed.add(i + 1);
