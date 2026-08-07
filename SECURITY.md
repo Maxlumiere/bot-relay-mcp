@@ -243,6 +243,22 @@ Trust-model consequences you must accept before deploying a centralized hub:
 
 ---
 
+## Dependency advisories & consumer-audit triage
+
+If you run `npm audit` in a project that depends on **bot-relay-mcp**, you may see an advisory attributed to `bot-relay-mcp` that comes from a *transitive* dependency. We triage these by **reachability**, not just presence — an advisory in the tree is not automatically exploitable through this package.
+
+**Currently present, not reachable (accepted):**
+
+- **`@hono/node-server` < 2.0.5 — MODERATE** ([GHSA-frvp-7c67-39w9](https://github.com/advisories/GHSA-frvp-7c67-39w9): path traversal in `serve-static` on Windows via an encoded backslash `%5C`). It reaches your tree transitively through **`@modelcontextprotocol/sdk`** (range `^1.19.9`). **bot-relay-mcp does not use hono's `serve-static`** — the HTTP transport is Express — so the vulnerable code path is never invoked by this package.
+  - **Why it is not patched here:** the fix requires `@hono/node-server` 2.x, which the MCP SDK's `^1.19.9` range does not admit. Forcing 2.x via an npm `override` would risk breaking the SDK, trading a non-reachable advisory for a real breakage. We **accept and track** it instead.
+  - **Re-check trigger:** the MCP SDK widening its `@hono/node-server` range to admit 2.x. At that point we drop the acceptance and take the bump.
+
+**Not in the published npm package at all:** advisories against the Tether VS Code extension's build tooling (e.g. `js-yaml`, `undici`, `brace-expansion` via `@vscode/vsce` / `secretlint` / `glob`) live in that extension's `devDependencies` and are **not** part of the published `bot-relay-mcp` npm tree — they cannot appear in a consumer audit of this package, and they are not present in the shipped extension bundle either.
+
+If you believe one of these *is* reachable through bot-relay-mcp, please report it (below) with the call path — a demonstrated reachable path changes the triage.
+
+---
+
 ## Disclosure
 
 Report vulnerabilities by email to **contact@lumiereventures.co** or via the project's GitHub Security tab (if published). Please:
