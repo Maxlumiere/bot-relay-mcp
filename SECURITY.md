@@ -268,6 +268,8 @@ Two consequences, both now standing practice:
 
 Rationales below are established from git history, not reconstructed. "security pin" means the override forces a transitive to a patched version; the retirement check is uniform (see the paragraph after the table). `esbuild` is the one non-security override.
 
+Count: there are **13 override entries** across the two manifests but **12 unique packages** — `hono` is overridden in both `package.json` (root) and `extensions/vscode/package.json`, so it has a single row here (tree = "root + ext"). The guard matches by unique package name, and the table has one row per unique name.
+
 | override | tree | why (git-established) | retires when |
 |---|---|---|---|
 | `js-yaml ^4.3.1` | ext | security: DoS <4.3.1 (transitive via secretlint) — #175 | ecosystem resolves ≥4.3.1 without the pin (see check below) |
