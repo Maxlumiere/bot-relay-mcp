@@ -7,6 +7,10 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
 import os from "os";
+// ESM-safe synchronous require for the native driver. The package is
+// "type":"module", so a bare `require(...)` is undefined at runtime — importing
+// createRequire from "module" is the supported way to do a sync require in ESM.
+import { createRequire } from "module";
 import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised } from "./liveness.js";
 import type {
   AgentRecord,
@@ -352,7 +356,15 @@ export function getDb(): CompatDatabase {
   // v2.1 Phase 4c.4: same dir + file perm narrowing as the eager init path.
   ensureSecureDir(dir, 0o700);
 
-  const { createRequire } = require("module");
+  // Native lazy-init fallback for callers that reach getDb() before
+  // initializeDb() (the server and every CLI subcommand `await initializeDb()`
+  // first; only some tests skip it and rely on this path). It is native-only by
+  // nature — a *synchronous* accessor cannot perform the wasm driver's async
+  // load — so RELAY_SQLITE_DRIVER=wasm callers MUST go through initializeDb().
+  // createRequire is imported at top-of-file: a bare `require(...)` is undefined
+  // in this "type":"module" build, which is the "require is not defined" bug
+  // this replaces (it only ever fired in a real ESM runtime, not under vitest,
+  // and only on this pre-init path — the server never hits it).
   const req = createRequire(import.meta.url);
   const Database = req("better-sqlite3");
   _db = new Database(dbPath) as unknown as CompatDatabase;
