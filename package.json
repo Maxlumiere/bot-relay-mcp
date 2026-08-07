@@ -70,6 +70,7 @@
     "@types/ws": "^8.18.1",
     "fast-check": "^4.7.0",
     "typescript": "^6.0.3",
+    "typescript-legacy": "npm:typescript@^6.0.0",
     "vitest": "^4.1.8"
   },
   "optionalDependencies": {

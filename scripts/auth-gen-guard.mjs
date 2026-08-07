@@ -47,7 +47,7 @@
  * Exit: 0 = clean · 1 = violations (stderr) · 2 = usage/parse error
  * Usage: node scripts/auth-gen-guard.mjs <db.ts> [<file> ...]
  */
-import ts from "typescript";
+import { ts, parseGuardSource } from "./lib/guard-parse.mjs";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -134,7 +134,7 @@ function hasValidityChangingMutation(bodyText) {
  * read the hardened call side as making the guard strong overall.
  */
 export function findAuthGenViolations(source, fileName = "db.ts") {
-  const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const sf = parseGuardSource(fileName, source); // pinned-parser gate: throws on parse diagnostics → main() exits 2
   const violations = [];
   forEachFunctionUnit(sf, (name, bodyNode, nameNode) => {
     if (!name) return;
@@ -182,13 +182,8 @@ function main() {
       // guard would still fail — but as an avalanche of violations that reads
       // like the codebase broke, not like the guard's premise did. Say which it
       // is, and refuse to run rather than guess.
-      const premiseSf = ts.createSourceFile(
-        path.basename(abs),
-        src,
-        ts.ScriptTarget.Latest,
-        true,
-        ts.ScriptKind.TS,
-      );
+      // pinned-parser gate: throws on parse diagnostics → main() exits 2
+      const premiseSf = parseGuardSource(path.basename(abs), src);
       const missing = findUnsatisfiedPrimitives(premiseSf, SELF_BUMPERS);
       if (missing.length > 0) {
         process.stderr.write(

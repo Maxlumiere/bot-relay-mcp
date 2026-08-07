@@ -169,7 +169,7 @@
  *     is the behavioural tests' job.
  *     @fixture "ACCEPTED RISK ... an if(false) bump still passes"
  */
-import ts from "typescript";
+import { ts } from "./guard-parse.mjs";
 import fs from "fs";
 import path from "path";
 
@@ -219,6 +219,15 @@ function parseModule(absPath) {
       true,
       ts.ScriptKind.TS,
     );
+    // Pinned-parser gate for the one-hop import TARGET. createSourceFile is
+    // error-tolerant (returns a partial tree, does not throw), so a target using
+    // syntax newer than the pin would parse partially and could make a primitive
+    // falsely resolve/not-resolve. A partial parse cannot be trusted → refuse
+    // (return null). Unlike a SCANNED file this does not hard-fail: a call that
+    // fails to resolve here already makes the guard OVER-flag (loud red), the
+    // safe direction. The scanned file itself is gated in each guard's main via
+    // parseGuardSource, which throws.
+    if (parsed && (parsed.parseDiagnostics?.length ?? 0) > 0) parsed = null;
   } catch {
     parsed = null; // unreadable → refuse
   }
