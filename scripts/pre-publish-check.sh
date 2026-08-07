@@ -253,6 +253,37 @@ extension_test_unit() {
 }
 step "extension vitest run (extensions/vscode — bundle + VSIX drift guards)" extension_test_unit || exit 1
 
+# --- 4c.2. v2.25.x — extension npm audit (HIGH+, parity with the root audit at
+# step 3). WHY THIS EXISTS: an extension advisory was, until this gate, caught by
+# NEITHER Dependabot NOR CI. Dependabot's security updater is direct-only and
+# CANNOT bump an override-pinned transitive — MEASURED 2026-08-07: its js-yaml
+# security run (actions run 31167590033) died with a "conflicting-dependencies"
+# error because our override pins the version, and that failure is SILENT (no PR,
+# no red on a branch — a separate "Dependabot Updates" workflow). Meanwhile the
+# root audit (step 3) only covers the root tree. So an extension HIGH would sit
+# unfixed with nothing complaining. This gate makes the VULNERABILITY itself red
+# the build, independent of Dependabot — first-order, not detect-the-detector-
+# failed. Same shape as the fresh-clone smoke gate: an already-required check
+# guards the class.
+#
+# THRESHOLD: high+critical ONLY — the SAME wrapper and level as the root audit
+# (audit-with-retry.sh defaults to `high`), so the two gates are consistent by
+# construction. Moderates REPORT but do NOT gate: we carry a deliberately-
+# accepted MODERATE (@hono/node-server <2.0.5 — no clean fix until the MCP SDK
+# widens its ^1.19.9 range; not runtime-reachable, we use express not hono's
+# serve-static). Gating on moderate would keep CI permanently red on an accepted
+# item and train everyone to ignore the board — an alarm that cries wolf. See
+# SECURITY.md "Dependency advisories & consumer-audit triage".
+extension_audit() {
+  local ext_dir="$PROJECT_ROOT/extensions/vscode"
+  if [ ! -d "$ext_dir" ] || [ ! -f "$ext_dir/package.json" ]; then
+    echo "  SKIP  extensions/vscode not present"
+    return 0
+  fi
+  ( cd "$ext_dir" && bash "$PROJECT_ROOT/scripts/audit-with-retry.sh" high )
+}
+step "extension npm audit (high+, parity with root)" extension_audit || exit 1
+
 # --- 4d. Lockfile version-sync guard (v2.8.0 R1) ----------------------------
 #
 # Catches the v2.8.0 R0 drift class: package.json says version X.Y.Z but

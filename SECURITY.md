@@ -257,6 +257,24 @@ If you run `npm audit` in a project that depends on **bot-relay-mcp**, you may s
 
 If you believe one of these *is* reachable through bot-relay-mcp, please report it (below) with the call path — a demonstrated reachable path changes the triage.
 
+### Dependency `overrides` — rationale & retirement (standing practice)
+
+**An npm `override` DEFEATS Dependabot's security auto-fix for that package.** Measured 2026-08-07: Dependabot's security update for `js-yaml` in `/extensions/vscode` (actions run 31167590033) died with a `conflicting-dependencies` error — its updater is direct-only and cannot move a version our override pins — and that failure is *silent* (no PR, no red on a branch). So an override that outlives its reason stops being a pin and becomes a **permanent silent blocker on security updates** — which is exactly how a HIGH can sit unfixed with nothing complaining.
+
+Two consequences, both now standing practice:
+
+1. **Every `override` must record WHY it exists and WHAT CONDITION retires it** (this table). An override with no recorded retirement is a latent silent blocker.
+2. **The extension `npm audit` (high+) gate** in `scripts/pre-publish-check.sh` is the compensating detector: it reds the build on any extension HIGH *regardless* of Dependabot, at the same `high` threshold as the root audit (moderates report, never gate — see above). We stop depending on the channel that fails silently.
+
+| override | tree | why (advisory pinned past) | retires when |
+|---|---|---|---|
+| `js-yaml ^4.3.1` | ext | DoS <4.3.1 (transitive via secretlint) | removing it + regen keeps `npm audit` clean (secretlint's tree resolves ≥4.3.1 on its own) |
+| `undici ^7.29.0` | ext | GHSA <7.29.0 (transitive via @vscode/vsce→cheerio) | vsce/cheerio resolve ≥7.29.0 without the pin |
+| `brace-expansion ^5.0.9` | ext | DoS 4.0.0–5.0.8 (transitive via @vscode/vsce + glob) | the pullers resolve ≥5.0.9 without the pin |
+| `hono ^4.12.34` | root + ext | GHSA <4.12.34 (transitive via @modelcontextprotocol/sdk) | the MCP SDK's range resolves ≥4.12.34 without the pin |
+
+To check a retirement: delete the override, `npm install --package-lock-only`, `npm audit --audit-level=high` — if clean, the ecosystem has caught up and the override is redundant.
+
 ---
 
 ## Disclosure
