@@ -739,6 +739,35 @@ RELAY_SQLITE_DRIVER=wasm node dist/index.js
 
 Both drivers read the same `relay.db` file format. Full details, performance notes, and limitations: [`docs/sqlite-wasm-driver.md`](./docs/sqlite-wasm-driver.md).
 
+### Installing under npm v12+ (install scripts disabled by default)
+
+npm **v12** (released 2026-07-08) disables dependency **install scripts** by default (`allowScripts` off) — including native `node-gyp`/prebuild builds. The default `native` driver (`better-sqlite3`) fetches its prebuilt binary via an install script, so under npm 12's defaults that binary is never fetched and the relay fails at startup with:
+
+```
+Error: Could not locate the bindings file
+```
+
+Two ways to fix it:
+
+**A — keep `native` (best for multi-terminal stdio):** approve better-sqlite3's install script once. The approval is recorded in your `package.json` allowlist — commit it.
+
+```bash
+npm install                                   # installs; records which deps have scripts
+npm approve-scripts --allow-scripts-pending   # review what's pending
+npm approve-scripts better-sqlite3            # approve it
+npm rebuild                                    # build the native binary
+```
+
+**B — switch to `wasm` (zero approval):** `sql.js` is pure WebAssembly — no native build, no install script.
+
+```bash
+RELAY_SQLITE_DRIVER=wasm node dist/index.js
+```
+
+`wasm` is **single-process only** (see the note above — not for multi-terminal stdio). `sql.js` is an installed *optional* dependency; if you installed with `--omit=optional`, add it back with `npm install sql.js`.
+
+`--allow-git` / `--allow-remote` (also default `none` in npm 11.10+/11.15+) don't affect the relay — every dependency resolves from the npm registry, none from git or tarball URLs. Full details: [`docs/sqlite-wasm-driver.md`](./docs/sqlite-wasm-driver.md#npm-v12-and-install-scripts).
+
 ## Roadmap
 
 - **v1.1**: Local relay, 9 tools, SQLite, auto-purge

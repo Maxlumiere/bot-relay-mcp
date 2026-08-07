@@ -4,11 +4,35 @@
 
 Under the hood it uses [sql.js](https://github.com/sql-js/sql.js) — SQLite compiled to WebAssembly. Same SQL, same schema, same queries. Trade-off: slightly slower on writes (wasm overhead + write-back-to-file), but well within acceptable range for relay workloads (< 50 agents, < 100 concurrent operations).
 
+## npm v12+ and install scripts
+
+npm **v12** (released 2026-07-08) disables dependency **install scripts** by default (`allowScripts` off) — including native `node-gyp` / prebuild builds. `better-sqlite3` (the `native` driver) fetches its prebuilt binary via an install script, so under npm 12's defaults that binary is never fetched and the relay fails at startup with:
+
+```
+Error: Could not locate the bindings file
+```
+
+This is not live until you're on npm 12 — npm 11.x still runs install scripts (with opt-in warnings from 11.16.0+). Consumers on npm 12 have two fixes:
+
+**A — keep the native driver (required for multi-terminal stdio).** Approve better-sqlite3's install script once; the approval is written to your `package.json` allowlist (commit it):
+
+```bash
+npm install                                   # installs; records which deps have scripts
+npm approve-scripts --allow-scripts-pending   # review what's pending
+npm approve-scripts better-sqlite3            # approve it
+npm rebuild                                    # build the native binary
+```
+
+**B — use the wasm driver (zero approval).** `sql.js` is pure WebAssembly — no native build, no install script — so it is unaffected by the new default. Set `RELAY_SQLITE_DRIVER=wasm` (see "How to switch" below). `sql.js` is an installed *optional* dependency; if you installed with `--omit=optional`, add it back with `npm install sql.js`. Remember the single-process limit (see "Limitations").
+
+The other npm 12 defaults — `--allow-git` / `--allow-remote` now `none` (from npm 11.10+ / 11.15+) — don't affect the relay: every dependency resolves from the npm registry, none from git or tarball URLs.
+
 ## When to use
 
 | Scenario | Driver |
 |---|---|
 | Standard install (macOS, Ubuntu, Node 18+) | `native` (default) |
+| npm 12+ without approving install scripts | `wasm` (or approve — see above) |
 | Windows without VS Build Tools | `wasm` |
 | Alpine / musl Linux Docker image | `wasm` |
 | CI without compiler toolchain | `wasm` |
@@ -71,6 +95,8 @@ Every write operation triggers a full database export + `fs.writeFileSync()`. At
 If the process crashes between a write and the write-back flush, the last write is lost. This is the same durability model as better-sqlite3 with WAL (WAL may not be checkpointed on crash). In practice, relay operations are not financially critical — a lost message can be re-sent.
 
 ## Troubleshooting
+
+**"Could not locate the bindings file"** — `better-sqlite3`'s native binary was never built. Most often this is npm 12's install-scripts-off default (see "npm v12+ and install scripts" above): either approve the script (`npm approve-scripts better-sqlite3 && npm rebuild`) or switch to the wasm driver (`RELAY_SQLITE_DRIVER=wasm`). On older npm it means the compile failed at install — check for a C++ toolchain, or use wasm.
 
 **"sql.js is not installed"** — you set `RELAY_SQLITE_DRIVER=wasm` but sql.js is not in `node_modules`. Run `npm install sql.js`.
 
