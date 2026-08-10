@@ -43,7 +43,7 @@ jobs:
         node: ['20', '22'] # the two Node ABIs ci.yml claims to support
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js ${{ matrix.node }}
         uses: actions/setup-node@v4
