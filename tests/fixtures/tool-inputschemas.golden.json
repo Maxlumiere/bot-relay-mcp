@@ -1,0 +1,1426 @@
+{
+  "abandon_registration": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "The agent name whose orphaned registration to abandon."
+      },
+      "recovery_handle": {
+        "type": "string",
+        "minLength": 1,
+        "description": "The one-time registration-recovery handle returned in the register_agent response (the `registration_recovery` field). Name-scoped + short-lived."
+      }
+    },
+    "required": [
+      "name",
+      "recovery_handle"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "broadcast": {
+    "type": "object",
+    "properties": {
+      "from": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Sender agent name"
+      },
+      "content": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Broadcast content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES)"
+      },
+      "role": {
+        "type": "string",
+        "description": "Only send to agents with this role"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "from",
+      "content"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "create_channel": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]?$",
+        "description": "Channel name (lowercase, alphanumeric + hyphens)"
+      },
+      "description": {
+        "type": "string",
+        "maxLength": 256,
+        "description": "Channel description"
+      },
+      "creator": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Agent creating the channel"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "name",
+      "creator"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "delete_webhook": {
+    "type": "object",
+    "properties": {
+      "webhook_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Webhook subscription ID to delete"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "webhook_id"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "discover_agents": {
+    "type": "object",
+    "properties": {
+      "role": {
+        "type": "string",
+        "description": "Filter by role"
+      },
+      "view": {
+        "type": "string",
+        "enum": [
+          "list",
+          "topology"
+        ],
+        "default": "list",
+        "description": "ADR-0002: 'list' (default) = flat agent list (unchanged). 'topology' = the live team grouped by coordination class (orchestrator/builder/advisory/auditor), flat within each; transient + unclassified + dead/terminal agents are excluded from the who's-who."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "expand_capabilities": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "Your agent name. Must match the row your token authenticates to."
+      },
+      "new_capabilities": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "minItems": 1,
+        "description": "The full new capability set. Must be a superset of the agent's current caps — additive only."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name",
+      "new_capabilities"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "get_channel_messages": {
+    "type": "object",
+    "properties": {
+      "channel_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Channel to read from"
+      },
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Agent reading (must be a member)"
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 20,
+        "description": "Max messages to return"
+      },
+      "since": {
+        "type": "string",
+        "description": "ISO timestamp — only return messages after this time"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "channel_name",
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "get_messages": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Your agent name"
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "read",
+          "all",
+          "history",
+          "resolved"
+        ],
+        "default": "pending",
+        "description": "Filter by status. 'pending' (default) = unresolved + not-read-by-this-session (the action queue). 'read' = read by this session. 'all'/'history' = the full durable record incl. resolved. 'resolved' = only messages you've acked (v2.12.0)."
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 20,
+        "description": "Max messages to return"
+      },
+      "since": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": "24h",
+        "description": "v2.1.6: time-window filter. Accepts duration ('15m'|'1h'|'24h'|'3d'), ISO8601 timestamp, 'session_start' sentinel, or 'all'/null to disable. Default '24h' trims stale backlog when an agent name is reused."
+      },
+      "ack": {
+        "type": "boolean",
+        "default": false,
+        "description": "v2.12.0: when true, permanently resolve the returned messages (atomic with the read-mark) so a fresh session won't re-surface them. Only applies to status='pending'. Default false = unchanged behavior."
+      },
+      "peek": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, skip the mark-as-read side effect so repeated status='pending' polls return the same messages. Default false (consume-once)."
+      },
+      "lane": {
+        "type": "string",
+        "enum": [
+          "all",
+          "direct",
+          "capability"
+        ],
+        "default": "all",
+        "description": "Filter by message lane: 'all' (default), 'direct' (point-to-point only), or 'capability' (capability-routed FYI only)."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "get_messages_summary": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Your agent name"
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "read",
+          "all",
+          "history",
+          "resolved"
+        ],
+        "default": "pending",
+        "description": "Filter by status (same surface as get_messages). 'pending' excludes resolved mail (v2.12.0) so the preview agrees with the mutating drain."
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 20,
+        "description": "Max message summaries to return"
+      },
+      "since": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": "24h",
+        "description": "v2.1.6: time-window filter. Accepts duration ('15m'|'1h'|'24h'|'3d'), ISO8601 timestamp, 'session_start' sentinel, or 'all'/null to disable. Default '24h' trims stale backlog when an agent name is reused."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "get_outstanding": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Your agent name — the SENDER whose outstanding asks/obligations to recap"
+      },
+      "include_resolved": {
+        "type": "boolean",
+        "default": false,
+        "description": "false (default) = only still-outstanding (unresolved) ask/obligation messages YOU sent — the recap. true = the full sender view incl. resolved rows (unread/read-unresolved/resolved)."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "get_standup": {
+    "type": "object",
+    "properties": {
+      "since": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Window start: either a duration string ('15m' | '1h' | '3h' | '1d') or an ISO8601 timestamp. Duration shorthands: m=minutes, h=hours, d=days."
+      },
+      "filter": {
+        "type": "object",
+        "properties": {
+          "agents": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Restrict to these agent names."
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Restrict to these roles."
+          },
+          "include_offline": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include agents with agent_status='offline' in active_agents."
+          }
+        },
+        "additionalProperties": false,
+        "description": "Optional narrowing filter for the standup snapshot. Combine `agents` (restrict to names) and `roles` (restrict to roles); both filters AND together. `include_offline` flips the default that drops offline agents from active_agents."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "since"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "get_task": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Task ID to look up"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "task_id"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "get_tasks": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Your agent name"
+      },
+      "role": {
+        "type": "string",
+        "enum": [
+          "assigned",
+          "posted"
+        ],
+        "default": "assigned",
+        "description": "'assigned' = tasks for you, 'posted' = tasks you created"
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "posted",
+          "accepted",
+          "completed",
+          "rejected",
+          "cancelled",
+          "all"
+        ],
+        "default": "all",
+        "description": "Filter by task status"
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 20,
+        "description": "Max tasks to return"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "health_check": {
+    "type": "object",
+    "properties": {
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "join_channel": {
+    "type": "object",
+    "properties": {
+      "channel_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Channel to join"
+      },
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Agent joining"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "channel_name",
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "leave_channel": {
+    "type": "object",
+    "properties": {
+      "channel_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Channel to leave"
+      },
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Agent leaving"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "channel_name",
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "list_webhooks": {
+    "type": "object",
+    "properties": {
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "peek_inbox_version": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "The agent whose mailbox to observe"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "post_task": {
+    "type": "object",
+    "properties": {
+      "from": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Requester agent name"
+      },
+      "to": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Assigned agent name"
+      },
+      "title": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "Short task title"
+      },
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Full task description (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES)"
+      },
+      "priority": {
+        "type": "string",
+        "enum": [
+          "low",
+          "normal",
+          "high",
+          "critical"
+        ],
+        "default": "normal",
+        "description": "Task priority"
+      },
+      "schema_id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "description": "v2.10: id of a registered task_schema that the assignee's completion result must conform to (schema-gated completion). Omit for an un-gated task."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "from",
+      "to",
+      "title",
+      "description"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "post_task_auto": {
+    "type": "object",
+    "properties": {
+      "from": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Requester agent name"
+      },
+      "title": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "Short task title"
+      },
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Full task description (max 64KB by default)"
+      },
+      "required_capabilities": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "minItems": 1,
+        "description": "Capabilities the assigned agent must have (ALL must match). Also used to auto-assign from the queue when a capable agent registers later."
+      },
+      "priority": {
+        "type": "string",
+        "enum": [
+          "low",
+          "normal",
+          "high",
+          "critical"
+        ],
+        "default": "normal",
+        "description": "Task priority"
+      },
+      "allow_self_assign": {
+        "type": "boolean",
+        "default": false,
+        "description": "v2.1: opt-in flag to let the sender self-assign the task when they match the required capabilities. Default false — sender is excluded from routing so auto-routed work reaches peers."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "from",
+      "title",
+      "description",
+      "required_capabilities"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "post_to_capability": {
+    "type": "object",
+    "properties": {
+      "from": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Sender agent name"
+      },
+      "capability": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "description": "The single domain/capability tag to route on (exact-match against registered agent capabilities)"
+      },
+      "content": {
+        "type": "string",
+        "minLength": 1,
+        "description": "FYI/coordination content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES)"
+      },
+      "priority": {
+        "type": "string",
+        "enum": [
+          "normal",
+          "high"
+        ],
+        "default": "normal",
+        "description": "Message priority"
+      },
+      "exclude_self": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true (default), the sender is excluded from recipients even if it owns the capability."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "from",
+      "capability",
+      "content"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "post_to_channel": {
+    "type": "object",
+    "properties": {
+      "channel_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Channel to post to"
+      },
+      "from": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Sender agent name"
+      },
+      "content": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Channel message content (max 64KB by default)"
+      },
+      "priority": {
+        "type": "string",
+        "enum": [
+          "normal",
+          "high"
+        ],
+        "default": "normal",
+        "description": "Message priority"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "channel_name",
+      "from",
+      "content"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "register_agent": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+        "description": "Human-readable agent name — [A-Za-z0-9_.-]{1,64} (ASCII only)"
+      },
+      "role": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "Agent role (e.g. orchestrator, builder, ops)"
+      },
+      "capabilities": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "List of capabilities"
+      },
+      "description": {
+        "type": "string",
+        "maxLength": 512,
+        "description": "v2.0: optional human-readable description (max 512 chars). Shown in discover_agents + dashboard. Mutable on re-register — if omitted, previous value preserved."
+      },
+      "terminal_title_ref": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100,
+        "pattern": "^[A-Za-z0-9_.\\- ]+$",
+        "description": "v2.2.0: window title the agent's terminal was spawned with. Used by the dashboard's click-to-focus driver. Typically equals the agent's `--name`. Mutable on re-register (updates to reflect the current session's title)."
+      },
+      "host_shell_pids": {
+        "type": "array",
+        "items": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxItems": 64,
+        "description": "Tether v0.3 PID-handshake (schema v16): the agent's process-ancestry PID chain (own PID → … → init/launchd). Tether reads vscode.Terminal.processId for each terminal and intersects with this chain (host-scoped by host_id) to bind a terminal to this agent — no manual naming. Mutable on re-register: OVERWRITES the stored chain (replaces, not appends). Writing it under an existing name requires that name's token (same auth as any re-register)."
+      },
+      "host_id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "description": "Tether v0.3 PID-handshake (schema v16): stable OS machine GUID (macOS IOPlatformUUID / Linux /etc/machine-id / Windows MachineGuid). Host-scopes the PID match so equal PIDs on different hosts never false-match (federation-safe). Immutable after first registration (same rule as `managed`)."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      },
+      "agent_pid": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "description": "v2.13.0 presence liveness: the agent's OWN process id (this CLI/wrapper's PID). Lets the relay confirm the agent is alive-and-idle via a same-host probe instead of misreading idle silence as closed. Self-reported by managed/script agents; stdio MCP agents have it captured automatically by the relay stdio server. Host-scoped by host_id; cleared on close. Omit if unknown → age-based presence (unchanged)."
+      },
+      "agent_pid_start": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "description": "v2.13.0 presence liveness: an opaque start-time token for agent_pid (e.g. the process start clock time) used as a PID-reuse guard — a recycled PID with a different start-time reads dead. Optional; omit if unavailable."
+      },
+      "recovery_token": {
+        "type": "string",
+        "minLength": 1,
+        "description": "v2.1 Phase 4b.1 v2: required when re-registering an agent whose auth_state is 'recovery_pending'. Obtained from the revoker's revoke_token response (shown ONCE) and handed off to the operator out-of-band."
+      },
+      "managed": {
+        "type": "boolean",
+        "default": false,
+        "description": "v2.1 Phase 4b.2: true = agent is a Managed Agent wrapper that can parse push-token messages + self-update its local config on rotation. false (default) = Claude Code terminal or equivalent (restart-required on rotation). Immutable after first registration — change requires unregister + fresh register."
+      },
+      "cli_profile": {
+        "type": "string",
+        "maxLength": 64,
+        "description": "Which agent-CLI this session runs under (e.g. \"claude\", \"codex\"). Set by the SessionStart hook; VALIDATED against the agent-CLI profile registry and stored as NULL when unrecognised — never defaulted, because a wrong default would make the verdict-absence check fire on healthy agents. Enables the server to know whether this agent OWES a session-start verdict."
+      },
+      "class": {
+        "type": "string",
+        "enum": [
+          "orchestrator",
+          "builder",
+          "advisory",
+          "auditor",
+          "transient"
+        ],
+        "description": "ADR-0002 (v2.21.0): the agent's COARSE coordination posture — one of orchestrator | builder | advisory | auditor | transient (SSOT: src/agent-class.ts). Self-declared; IMMUTABLE after first registration (same rule as managed/host_id). Orthogonal to `role` (free-text label) and `capabilities` (what it does). Omit → `unclassified`; surfaced in discover_agents view='topology'."
+      },
+      "force": {
+        "type": "boolean",
+        "default": false,
+        "description": "ADR-0012: request a CAS TAKEOVER of an actively-held name (NOT an unconditional bypass). MUST be accompanied by expected_session_id (the session_id you READ from the row; null = expect an offline row). The takeover is an atomic compare-and-swap on that session_id — exactly one of two racing relaunches wins; the loser gets FORCE_PRECONDITION_FAILED and re-reads (never retry-force). Default false rejects re-registration on an actively-held name with NAME_COLLISION_ACTIVE. Set true only when the prior session is unreachable (crashed/relaunched terminal); a live concurrent terminal still wins the CAS and you correctly lose."
+      },
+      "expected_session_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "ADR-0012 CAS precondition for a force takeover. REQUIRED whenever force=true: the session_id the caller READ from the row it intends to take over (pass null to mean \"I expect an OFFLINE row\" → CAS matches session_id IS NULL). The re-register lands ONLY if the row's session_id still equals this value, so exactly one of two racing relaunches wins; the loser is rejected with FORCE_PRECONDITION_FAILED and MUST re-read (never retry-force, never come up mute). force=true WITHOUT this field is rejected as malformed — there is NO unconditional-force bypass, which would reopen the lost-update TOCTOU ADR-0012 eliminates."
+      }
+    },
+    "required": [
+      "name",
+      "role",
+      "capabilities"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "register_task_schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "description": "Schema id, name-as-version (e.g. 'ship_pong_v1'). Immutable once registered."
+      },
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": {},
+        "description": "The JSON Schema document (object). Meta-validated + hardened before compile; $ref/$dynamicRef/$recursiveRef/$data are rejected."
+      },
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Registering agent name"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "name",
+      "json_schema",
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "register_webhook": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "format": "uri",
+        "description": "HTTP(S) URL to POST events to"
+      },
+      "event": {
+        "type": "string",
+        "enum": [
+          "message.sent",
+          "message.broadcast",
+          "message.capability_routed",
+          "task.posted",
+          "task.accepted",
+          "task.completed",
+          "task.rejected",
+          "task.cancelled",
+          "task.auto_routed",
+          "task.health_reassigned",
+          "agent.unregistered",
+          "agent.spawned",
+          "agent.health_timeout",
+          "channel.message_posted",
+          "webhook.delivery_failed",
+          "*"
+        ],
+        "description": "Event to subscribe to, or '*' for all events"
+      },
+      "filter": {
+        "type": "string",
+        "description": "Optional agent name filter (only fire if from_agent or to_agent matches)"
+      },
+      "secret": {
+        "type": "string",
+        "description": "Optional secret for HMAC signature (sent in X-Relay-Signature header)"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "url",
+      "event"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "report_liveness": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Your agent name (must match your token)"
+      },
+      "agent_pid": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "description": "The agent CLI's own OS process id (from the hook's ancestry walk)"
+      },
+      "agent_pid_start": {
+        "anyOf": [
+          {
+            "type": "string",
+            "maxLength": 128
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "The process start-time token (LC_ALL=C `ps -o lstart=`), or null if unreadable — PID-liveness only in that case"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name",
+      "agent_pid"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "resolve_messages": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Your agent name (the recipient; only your own mail can be resolved)"
+      },
+      "message_ids": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "minItems": 1,
+        "maxItems": 100,
+        "description": "The message ids to permanently resolve (ack). Only ids addressed to you are affected; unknown/foreign ids are silently skipped."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name",
+      "message_ids"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "revoke_token": {
+    "type": "object",
+    "properties": {
+      "target_agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Name of the agent whose token to revoke."
+      },
+      "revoker_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Name of the agent performing the revoke — must hold the 'admin' capability."
+      },
+      "issue_recovery": {
+        "type": "boolean",
+        "default": true,
+        "description": "v2.1 Phase 4b.1 v2: if true (default), issue a one-time recovery_token returned on this response (shown ONCE). Target can re-register with that token to resume as 'active'. If false, revocation is terminal — operator must unregister_agent + register_agent to recreate the row."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "target_agent_name",
+      "revoker_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "rotate_token": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Agent name — must match the token's owner"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      },
+      "grace_seconds": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 3600,
+        "description": "v2.1 Phase 4b.2: override the grace window length for managed agents. Clamped to [0, 3600]. 0 forces hard-cut (immediate invalidation) even for managed agents. Unmanaged agents ignore this field (no grace applicable). Default: RELAY_ROTATION_GRACE_SECONDS env var (fallback 900)."
+      }
+    },
+    "required": [
+      "agent_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "rotate_token_admin": {
+    "type": "object",
+    "properties": {
+      "target_agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Name of the agent whose token to rotate. Must differ from rotator_name — self-rotation uses rotate_token."
+      },
+      "rotator_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Name of the admin-capable agent performing the rotation. Must hold 'rotate_others' capability."
+      },
+      "grace_seconds": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 3600,
+        "description": "v2.1 Phase 4b.2: override the grace window length for managed targets. Clamped to [0, 3600]. 0 forces hard-cut. Unmanaged targets ignore this field. Default: RELAY_ROTATION_GRACE_SECONDS env var (fallback 900)."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "target_agent_name",
+      "rotator_name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "send_message": {
+    "type": "object",
+    "properties": {
+      "from": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Sender agent name"
+      },
+      "to": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Recipient agent name"
+      },
+      "content": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Message content (max 64KB by default; see RELAY_MAX_PAYLOAD_BYTES). Alias: `message`."
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Alias for `content` (parity with the REST /api/send-message endpoint + the agent-team SendMessage tool)."
+      },
+      "priority": {
+        "type": "string",
+        "enum": [
+          "normal",
+          "high"
+        ],
+        "default": "normal",
+        "description": "Message priority"
+      },
+      "disposition": {
+        "type": "string",
+        "enum": [
+          "log",
+          "ask",
+          "obligation"
+        ],
+        "default": "log",
+        "description": "ADR-0011 disposition: 'log' (default, FYI, never overdue) | 'ask' (expects a reply/resolve) | 'obligation' (an action owed; pair with optional `deadline`). Overdue is report-only — query it via get_outstanding."
+      },
+      "deadline": {
+        "type": "string",
+        "minLength": 1,
+        "description": "ADR-0011: optional ISO8601 deadline for an 'obligation'. Overdue is reported strictly past this instant; omit to use the tunable default bound (RELAY_OVERDUE_SECONDS). Ignored for log/ask."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "from",
+      "to"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "set_dashboard_theme": {
+    "type": "object",
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": [
+          "catppuccin",
+          "dark",
+          "light",
+          "custom"
+        ],
+        "description": "Theme mode. catppuccin is the default; dark/light are tool-neutral; custom requires custom_json."
+      },
+      "custom_json": {
+        "type": "object",
+        "properties": {
+          "bg": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "panel": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "panel-2": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "border": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "text": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "muted": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "accent": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "online": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "stale": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "offline": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "critical": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "high": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "normal": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          },
+          "low": {
+            "$ref": "#/properties/custom_json/properties/bg"
+          }
+        },
+        "required": [
+          "bg",
+          "panel",
+          "panel-2",
+          "border",
+          "text",
+          "muted",
+          "accent",
+          "online",
+          "stale",
+          "offline",
+          "critical",
+          "high",
+          "normal",
+          "low"
+        ],
+        "additionalProperties": false,
+        "description": "Required when mode='custom'. JSON object with all 13 CSS-token fields (bg, panel, panel-2, border, text, muted, accent, online, stale, offline, critical, high, normal, low)."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "mode"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "set_status": {
+    "type": "object",
+    "properties": {
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Your agent name"
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "idle",
+          "working",
+          "blocked",
+          "waiting_user",
+          "offline",
+          "online",
+          "busy",
+          "away"
+        ],
+        "description": "Operational status — v2.1.3 widened enum: idle (default active state), working (actively executing a task; exempts from health-monitor reassignment), blocked (cannot proceed; also exempt), waiting_user (paused pending operator input), offline (graceful shutdown). Legacy aliases still accepted: online→idle, busy→working, away→blocked. `stale` is relay-computed, not agent-settable."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "agent_name",
+      "status"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "spawn_agent": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9_.-]+$",
+        "description": "Name for the new agent — [A-Za-z0-9_.-]+, max 64 chars"
+      },
+      "role": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9_.-]+$",
+        "description": "Role of the new agent — [A-Za-z0-9_.-]+, max 64 chars"
+      },
+      "capabilities": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "default": [],
+        "description": "Capabilities of the new agent"
+      },
+      "cwd": {
+        "type": "string",
+        "maxLength": 1024,
+        "pattern": "^\\/[A-Za-z0-9_./ -]+$",
+        "description": "Absolute path working directory for the new terminal. Defaults to user's home."
+      },
+      "initial_message": {
+        "type": "string",
+        "maxLength": 10000,
+        "description": "Optional message to queue for the new agent before it spawns. It will see this on session start."
+      },
+      "brief_file_path": {
+        "type": "string",
+        "maxLength": 1024,
+        "pattern": "^\\/[A-Za-z0-9_./ -]+$",
+        "description": "v2.1.4 (I10): absolute path to a task-brief file the spawned agent should read FIRST. The relay validates that the file exists at spawn time, is readable, and is <=10KB. When set, the default KICKSTART prompt appends a sentence telling the agent to read this file as the canonical source for its task scope — trust-anchored fix for respawned-agent context loss (inbox messages are not durable). macOS only for v2.1.4; Linux/Windows drivers ignore (no KICKSTART on those platforms yet)."
+      },
+      "cli": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32,
+        "pattern": "^[A-Za-z0-9_-]+$",
+        "default": "claude",
+        "description": "Which agent CLI to launch for the new terminal: a registered agent-CLI profile id — 'claude' (default) or 'codex'. Codex launches via bin/codex-relay (POSIX; macOS + Linux). See `relay cli-profiles`."
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "name",
+      "role"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "task_schema_get": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "description": "Schema id to fetch"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "unregister_agent": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "Agent name to unregister"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "update_task": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Task ID to update"
+      },
+      "agent_name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Your agent name"
+      },
+      "action": {
+        "type": "string",
+        "enum": [
+          "accept",
+          "complete",
+          "reject",
+          "cancel",
+          "heartbeat"
+        ],
+        "description": "Action to take. accept/complete/reject/heartbeat are assignee actions; cancel is requester-only."
+      },
+      "result": {
+        "type": "string",
+        "description": "Completion notes, rejection reason, or cancellation reason (max 64KB by default)"
+      },
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token (from register_agent response). Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header."
+      }
+    },
+    "required": [
+      "task_id",
+      "agent_name",
+      "action"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+}
