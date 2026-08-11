@@ -118,6 +118,23 @@ function hasValidityChangingMutation(bodyText) {
 }
 
 /**
+ * Does this resolved text PROVE it is a read statement — does its resolved prefix
+ * start with SELECT or WITH? Used for the prepare()-argument carve-out (#194
+ * sub-decision 1, SQLite-verified): SQLite forbids a substitution from appending a
+ * SECOND statement to a prepared SELECT (`prepare("SELECT …; UPDATE …")` THROWS),
+ * so a prepare() argument that provably STARTS as a read cannot become an agents
+ * mutation and does not refuse on an unresolvable piece. An argument whose resolved
+ * text is EMPTY (a bare parameter / free name) or does not start with a read
+ * keyword proves NOTHING and still REFUSES (codex #194 — never silently clean).
+ * exec() gets NO carve-out (`exec("SELECT 1; UPDATE agents SET token_hash=NULL")`
+ * RUNS the UPDATE), so an exec() argument with any unresolvable piece refuses.
+ */
+function isProvablyRead(text) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return /^SELECT\b/i.test(compact) || /^WITH\b/i.test(compact);
+}
+
+/**
  * Analyze source text; return an array of { name, line } for functions that
  * mutate token/auth validity but do not bump the generation. Exported so the
  * negative-fixture test can prove the guard FAILS on an omitted bump.
@@ -198,7 +215,15 @@ function classifyUnits(sf) {
       if (a.kind === "literal") parts.push(a.text); // FOLD: split position no longer matters
       else if (a.kind === "refuse") {
         parts.push(a.partial || ""); // the runs that DID resolve, so a visible violation still shows
-        if (!firstRefuse) firstRefuse = a;
+        // SUB-DECISION 1 (victra #194, SQLite-verified): a prepare() argument that
+        // provably STARTS as a read (SELECT/WITH) cannot become a validity mutation
+        // — SQLite rejects a second statement appended by any substitution
+        // (prepare("SELECT …; UPDATE …") THROWS), so a resolved-read prepare arg with
+        // an unresolvable piece does NOT refuse. An empty/non-read resolved prefix
+        // (a bare parameter) proves nothing → refuse. exec() runs multiple
+        // statements (exec("SELECT 1; UPDATE agents SET token_hash=NULL") executes
+        // the UPDATE) → an exec() arg with any unresolvable piece REFUSES.
+        if (!firstRefuse && (a.method === "exec" || !isProvablyRead(a.partial || ""))) firstRefuse = a;
       }
     }
     const bumps = bodyCallsFunction(bodyNode, sf, SELF_BUMPERS);

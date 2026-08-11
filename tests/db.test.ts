@@ -402,6 +402,30 @@ describe("updateAgentMetadata (Phase 7q)", () => {
     expect(rowAfter?.last_seen).toBe(rowBefore?.last_seen);
   });
 
+  // #59 — the literal-CASE rewrite (no dynamic column list) must preserve the
+  // original per-field semantics EXACTLY (proven OLD≡NEW across every input shape).
+  it("each field updates independently and an absent field does not clobber its column", () => {
+    registerAgent("indep", "r", []);
+    updateAgentMetadata("indep", { last_seen: "L", agent_status: "S", busy_expires_at: "B", last_alive: "A" });
+    const before = getAgentAuthData("indep");
+    updateAgentMetadata("indep", { agent_status: "S2" }); // ONLY agent_status
+    const after = getAgentAuthData("indep");
+    expect(after?.agent_status).toBe("S2");
+    expect(after?.last_seen).toBe(before?.last_seen);
+    expect(after?.busy_expires_at).toBe(before?.busy_expires_at);
+    expect(after?.last_alive).toBe(before?.last_alive);
+  });
+
+  it("undefined SKIPS a field but an explicit null CLEARS it (busy_expires_at)", () => {
+    registerAgent("clearbusy", "r", []);
+    updateAgentMetadata("clearbusy", { busy_expires_at: "SET" });
+    expect(getAgentAuthData("clearbusy")?.busy_expires_at).toBe("SET");
+    updateAgentMetadata("clearbusy", { last_alive: "A" }); // busy_expires_at absent → untouched
+    expect(getAgentAuthData("clearbusy")?.busy_expires_at).toBe("SET");
+    updateAgentMetadata("clearbusy", { busy_expires_at: null }); // explicit null → cleared
+    expect(getAgentAuthData("clearbusy")?.busy_expires_at).toBeNull();
+  });
+
   it("missing agent returns false (no throw)", () => {
     const result = updateAgentMetadata("ghost", { last_seen: new Date().toISOString() });
     expect(result).toBe(false);

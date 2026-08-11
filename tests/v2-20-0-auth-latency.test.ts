@@ -726,4 +726,31 @@ describe("ADR-0003 G — fold + scoped refusal at prepare()/exec() (#59, issue #
     expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
     expect(findUnresolvableBindings(src, "t.ts")).toEqual([]);
   });
+
+  // ── codex #194 + victra: an interpolated template is a COMPOSITE (folded like a
+  // concatenation), plus the SQLite prepare()-vs-exec() carve-out (both engine-
+  // verified: prepare rejects a second statement, exec runs it).
+  it("REFUSE: a parameter interpolated as a column in a prepare() UPDATE", () => {
+    const src = `${H}export function m(col: string, n: string): void { getDb().prepare(\`UPDATE agents SET \${col} = NULL WHERE name = ?\`).run(n); }`;
+    expect(refuses(src)).toContain("m");
+  });
+  it("FLAG: a resolvable const substitution in a template UPDATE folds and flags", () => {
+    const src = `${H}const COL = "token_hash";
+      export function m(n: string): void { getDb().prepare(\`UPDATE agents SET \${COL} = NULL WHERE name = ?\`).run(n); }`;
+    expect(flags(src)).toContain("m");
+  });
+  it("PRECEDENCE: a violation visible in a template span FLAGS despite a dynamic substitution", () => {
+    const src = `${H}export function m(suffix: string, n: string): void { getDb().prepare(\`UPDATE agents SET token_hash = NULL WHERE name = \${suffix}\`).run(n); }`;
+    expect(flags(src)).toContain("m");
+    expect(refuses(src)).not.toContain("m");
+  });
+  it("prepare() SELECT with a dynamic clause is CLEAN (SQLite forbids an appended statement)", () => {
+    const src = `${H}export function m(clause: string, n: string): void { getDb().prepare(\`SELECT * FROM messages WHERE x = ? \${clause}\`).run(n); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
+    expect(findUnresolvableBindings(src, "t.ts")).toEqual([]);
+  });
+  it("exec() with a dynamic clause REFUSES even starting as a SELECT (exec runs multiple statements)", () => {
+    const src = `${H}export function m(clause: string, n: string): void { getDb().exec(\`SELECT * FROM messages WHERE x = ? \${clause}\`); }`;
+    expect(refuses(src)).toContain("m");
+  });
 });

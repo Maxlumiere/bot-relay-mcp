@@ -783,9 +783,11 @@ export function bodyCallsFunction(bodyNode, sf, names) {
 //      reconstruction, so SPLIT POSITION does not affect detection. A concatenation
 //      with any operand that does NOT resolve to a literal (a cross-module import,
 //      a function-call result, a reference cycle, a parameter) reaching a DB call
-//      is REFUSED (exit 2), not passed. A TEMPLATE LITERAL WITH INTERPOLATION is a
-//      DISTINCT case that IS handled (its literal parts are matched) — "template"
-//      and "concatenation" get used interchangeably and only one folds.
+//      is REFUSED (exit 2), not passed. A TEMPLATE LITERAL WITH INTERPOLATION is
+//      the SAME thing as a concatenation wearing different syntax (victra #194):
+//      its static spans and every ${substitution} are folded identically, and a
+//      single unresolvable substitution REFUSES — `${col}` where col is a
+//      parameter can be token_hash at runtime, so it is not a literal.
 //      ⚠ Away from a prepare()/exec() argument the whole-body pass is DIFFERENT and
 //      must not be relied on. It splices the expression's RAW TEXT verbatim, and
 //      hasValidityChangingMutation is TWO INDEPENDENT sub-matches (/UPDATE\s+agents
@@ -1052,14 +1054,39 @@ function foldVarBinding(decl, sf, seen) {
  * A DYNAMIC value — a bare parameter, a free name, a reassignable local whose
  * assignment set is incomplete — REFUSES (codex #194): an unresolvable SQL
  * argument at a DB call is never silently clean.
+ *
+ * ⚠ THE INVARIANT (victra #194, after seven shapes of one defect): SYNTACTIC FORM
+ * DOES NOT DECIDE — COMPLETENESS DOES. A node returns `literal` ONLY when every
+ * sub-piece resolves: a concatenation's operands, a TEMPLATE's static spans AND
+ * every substitution, a resolvable identifier's binding, an object/array member.
+ * A COMPOSITE with any unresolved piece REFUSES, whatever its syntax —
+ * concatenation and string interpolation are the same thing wearing different
+ * syntax, and a `TemplateExpression` with substitutions is NOT a literal. Do not
+ * add a per-form "handled" shortcut; that is how the seventh shape got in.
  */
 function foldSqlArg(node, sf, seen) {
   node = skipParens(node);
   if (!node) return dynRefuse("an empty argument");
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return { kind: "literal", text: node.text, partial: node.text };
   if (ts.isTemplateExpression(node)) {
-    const t = node.getText(sf); // a template WITH interpolation is a DISTINCT case that IS handled: its literal parts are matched
-    return { kind: "literal", text: t, partial: t };
+    // A template WITH substitutions is a COMPOSITE, not a literal (victra #194 /
+    // codex): identical to a concatenation of its static spans and its ${...}
+    // pieces. Fold every piece; a single unresolvable substitution REFUSES, with
+    // the resolved spans carried in `partial` so a violation visible in a span
+    // still wins exit-1. `${token_hash}` from a parameter can revoke at runtime.
+    let text = node.head.text;
+    let refused = null;
+    for (const span of node.templateSpans) {
+      const sub = foldSqlArg(span.expression, sf, seen);
+      if (sub.kind === "literal") text += sub.text;
+      else {
+        if (!refused) refused = sub;
+        text += " " + (sub.partial || "") + " "; // gap: a matched token cannot cross an unresolved substitution
+      }
+      text += span.literal.text;
+    }
+    if (refused) return { kind: "refuse", reason: refused.reason || "a template substitution does not resolve to a literal", partial: text };
+    return { kind: "literal", text, partial: text };
   }
   if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
     const l = foldSqlArg(node.left, sf, seen);
@@ -1129,7 +1156,10 @@ function foldSqlArg(node, sf, seen) {
 
 /**
  * Fold every prepare()/exec() SQL argument in this unit's own body. Returns one
- * result per DB-call argument ({ kind, text?, reason?, partial, line, argText }).
+ * result per DB-call argument: { kind, text?, reason?, partial, line, argText,
+ * method }. `method` is "prepare" or "exec" — the caller uses it for the SQLite
+ * multi-statement carve-out (a prepare() SELECT cannot become a mutation; exec()
+ * can — verified, victra #194).
  */
 export function foldDbCallArgs(bodyNode, sf) {
   const results = [];
@@ -1144,7 +1174,12 @@ export function foldDbCallArgs(bodyNode, sf) {
     ) {
       const arg = node.arguments[0];
       const r = foldSqlArg(arg, sf, new Set());
-      results.push({ ...r, line: sf.getLineAndCharacterOfPosition(arg.getStart(sf)).line + 1, argText: arg.getText(sf) });
+      results.push({
+        ...r,
+        method: callee.name.text,
+        line: sf.getLineAndCharacterOfPosition(arg.getStart(sf)).line + 1,
+        argText: arg.getText(sf),
+      });
     }
   });
   return results;
