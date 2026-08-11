@@ -89,9 +89,16 @@ export function registerIdentitySecret(principal: string, value: unknown): void 
  * secrets at once (durable token + recovery handle); null/ineligible values are
  * skipped by registerIdentitySecret.
  *
- * ENFORCED at build time: scripts/secret-register-guard.mjs fails the build if a
- * db.ts function mints a token (generateToken) but never calls this — so a NEW
- * mutator cannot silently skip redaction. See that guard for its exact boundary.
+ * ENFORCED, two independent paths (#61) — a db.ts function that mints a token
+ * (generateToken) but never calls this reddens the build BEFORE merge, so a NEW
+ * mutator cannot silently skip redaction:
+ *   1. tests/v2-24-7-secret-register-guard.test.ts runs
+ *      scripts/secret-register-guard.mjs against the REAL src/db.ts on every PR in
+ *      the CI job "Test (Node 20/22)" (`npx vitest run`), and also proves the guard
+ *      FAILS on a synthetic unregistered minter (test the guard, not just the code).
+ *   2. scripts/pre-publish-check.sh runs the same guard as a pre-publish step.
+ * NOTE: `npm run build` does NOT run it — the enforcement is the test + the
+ * pre-publish gate, not tsc. See that guard for its exact boundary.
  */
 export function registerPersistedSecret(principal: string, ...values: unknown[]): void {
   for (const v of values) registerIdentitySecret(principal, v);
