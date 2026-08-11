@@ -4415,10 +4415,14 @@ export function buildAgentTopology(): {
  * Semantics:
  *   - pending_count — messages still in status='pending' (not yet drained
  *     by a get_messages call that flipped them to 'read').
- *   - unread_count  — messages whose seq is still NULL. Mirrors the
- *     peek_inbox_version v2.3 signal: seq is assigned the moment a
- *     recipient observes the message, so seq IS NULL is the authoritative
- *     "never-observed" count regardless of later status transitions.
+ *   - unread_count  — the CANONICAL session-agnostic unread (#56):
+ *     read_by_session IS NULL AND resolved_at IS NULL (= pendingGlobalClause,
+ *     "not read by any session and not resolved"). Was `seq IS NULL` (mirroring
+ *     peek's v2.3 signal), but seq is stamped by ANY observation — including a
+ *     NON-consuming browse (get_messages peek=true / status='all') that never
+ *     drains — so the seq count silently DISAGREED with the drain and the other
+ *     SSOT surfaces. read_by_session moves with the drain, so this now agrees
+ *     with pending_count.
  *   - last_message_at — ISO of MAX(created_at) across any status; NULL
  *     when the agent has no inbox history.
  */
