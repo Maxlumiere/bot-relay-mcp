@@ -160,21 +160,41 @@ describe("#190 requested-vs-actual driver seam — dispatch follows the LIVE con
 });
 
 describe("#190 r2 — tracker completeness (sync fallback) + restore ordering (no manufacture)", () => {
-  it("FINDING 1: a DB reached via the SYNCHRONOUS getDb() fallback still exports (the tracker now sees that path)", async () => {
+  it("FINDING 1: a DB reached via the SYNCHRONOUS getDb() fallback still exports (driverOf reads the object, no tracker)", async () => {
     process.env.RELAY_SQLITE_DRIVER = "native";
     closeDb();
     // Reach the DB via getDb()'s synchronous native fallback — it sets db.ts _db
-    // directly and bypasses initializeDb, so pre-#190-r2 getActiveDriver() stayed
-    // null and export threw "no active SQLite driver". The fallback now registers
-    // native with the tracker.
+    // directly and bypasses initializeDb, so getActiveDriver() stays null. r2
+    // patched the tracker; r3 removed that — snapshotToFile/openReadOnly read the
+    // driver from the OBJECT (driverOf(getDb())), so export works with no reliance
+    // on the tracker at all.
     getDb();
-    expect(getActiveDriver(), "the tracker must see the sync fallback path").toBe("native");
     registerAgent("sync-seed", "role", []);
     sendMessage("sync-seed", "sync-seed", "via-sync-getdb", "normal");
     const res = await exportRelayState();
     expect(fs.existsSync(res.archive_path)).toBe(true);
     const { agents } = await restoreAndRead(res.archive_path, "native");
     expect(agents).toContain("sync-seed");
+    closeDb();
+  });
+
+  it("IMPORT under the mutation seam: a WASM restore with the env mutated to native binds the probe to the ACTUAL driver", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    closeDb();
+    await initializeDb();
+    registerAgent("imp-seam", "role", []);
+    const res = await exportRelayState(); // wasm-made archive; an existing wasm DB is on disk
+    closeDb();
+    // Mutate the env to native WITHOUT re-init. importRelayState captures the probe
+    // driver via driverOf(getDb()) from the safety-backup's LIVE wasm connection —
+    // BEFORE Step 2 closes it — so the Step-5 probe binds to wasm, not the mutated
+    // env. (In a scripts-off deployment the native binary is absent and a native
+    // probe would fail; here both drivers exist, so this asserts the restore
+    // succeeds and data survives under the env mutation.)
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    await importRelayState(res.archive_path, { force: true });
+    await initializeDb();
+    expect(getAgents().map((a: { name: string }) => a.name)).toContain("imp-seam");
     closeDb();
   });
 

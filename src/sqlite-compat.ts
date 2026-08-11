@@ -341,18 +341,20 @@ export function snapshotToFile(db: CompatDatabase, destPath: string): void {
  * - wasm: load the file bytes into a fresh sql.js instance. (Probe-only; close()
  *   re-writes the identical bytes, which is a harmless no-op on a temp file.)
  *
- * Resolves the driver from ACTUAL state: getActiveDriver() when a live connection
- * exists (so a mutated RELAY_SQLITE_DRIVER env can't mis-select the driver, #190),
- * falling back to the configured driver ONLY when nothing is initialized (a
- * first-ever restore has no connection). Opens the GIVEN file; it does NOT create
- * or init the main DB — so validating a corrupt archive manufactures no state
- * (#190 r2: on the restore path the ordering is the safety property).
+ * The `driver` is an EXPLICIT PARAMETER, never inferred (#190 r3 ruling). Restore
+ * deliberately closes the live DB before probing the archive, so there is NO live
+ * state to read in that window — "read the state" has no answer once the state is
+ * destroyed on purpose. The caller captures the driver identity WHILE the
+ * connection is live (driverOf(db)) and passes it, or uses configuredDriver() in
+ * the truly-fresh no-connection path. You cannot call this without having decided
+ * — the same make-impossible property as keeping getDriverType private. Opens the
+ * GIVEN file; does NOT create or init the main DB, so validating a corrupt archive
+ * manufactures no state.
  */
-export async function openReadOnly(dbPath: string): Promise<CompatDatabase> {
+export async function openReadOnly(dbPath: string, driver: SqliteDriver): Promise<CompatDatabase> {
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
-  const driver = getActiveDriver() ?? getDriverType();
   if (driver === "wasm") {
     let initSqlJs: any;
     try {
@@ -419,16 +421,24 @@ export function getActiveDriver(): SqliteDriver | null {
 }
 
 /**
- * #190 r2 — TRACKER COMPLETENESS. getActiveDriver() is only trustworthy if EVERY
- * connection-creating path registers with it. db.getDb()'s SYNCHRONOUS native
- * fallback sets db.ts `_db` directly and bypasses initializeDb (a sync accessor
- * can't await the wasm load), so it never reached _driverUsed — leaving the
- * tracker blind to one of its own paths (the same one-concept-many-creation-
- * sites shape as the pending predicate). That path is native by construction, so
- * it registers "native" here. Idempotent: a real driver already recorded wins.
+ * The driver of an OPEN connection, read from the object itself — the truest
+ * state, no global, no env, no tracker that can go stale. Used to capture the
+ * driver identity WHILE a connection is live, to hand to openReadOnly (which
+ * never infers). #190 r3.
  */
-export function registerNativeFallbackDriver(): void {
-  if (_driverUsed === null) _driverUsed = "native";
+export function driverOf(db: CompatDatabase): SqliteDriver {
+  return db instanceof WasmDatabase ? "wasm" : "native";
+}
+
+/**
+ * The CONFIGURED driver for a COLD open — the ONLY legitimate read of the
+ * requested env: when there is NO live connection to read (a first-ever restore
+ * probing an archive before any DB is initialized). Here the request IS the
+ * reality: it is the driver the process will instantiate. NEVER use this where a
+ * live connection exists — use driverOf(db) there. #190 r3.
+ */
+export function configuredDriver(): SqliteDriver {
+  return getDriverType();
 }
 
 /**

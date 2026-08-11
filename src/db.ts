@@ -35,7 +35,6 @@ import {
   initializeDb as initDriver,
   getInitializedDb,
   closeInitializedDb,
-  registerNativeFallbackDriver,
 } from "./sqlite-compat.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
@@ -341,10 +340,6 @@ export function getDb(): CompatDatabase {
   const req = createRequire(import.meta.url);
   const Database = req("better-sqlite3");
   _db = new Database(dbPath) as unknown as CompatDatabase;
-  // #190 r2 — register this native connection with the driver tracker. This sync
-  // fallback bypasses sqlite-compat.initializeDb, so without this getActiveDriver()
-  // stays null even with a live native DB (the tracker-blind-to-its-own-path gap).
-  registerNativeFallbackDriver();
   ensureSecureFile(dbPath, 0o600);
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.

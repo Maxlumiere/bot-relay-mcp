@@ -36,7 +36,7 @@ import { spawnSync } from "child_process";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
-import { snapshotToFile, openReadOnly } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { ERROR_CODES } from "./error-codes.js";
@@ -162,13 +162,12 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // while the daemon writes); wasm → atomic export() bytes (tear-proof — a
     // plain copy of the write-back file could observe a half-written flush). See
     // sqlite-compat.snapshotToFile. Works on BOTH drivers.
-    // #171/#190: snapshotToFile branches on the ACTUAL db object (WasmDatabase vs
-    // native), openReadOnly resolves the driver from live state — both work on
-    // either driver with no captured/requested value to go stale.
+    // #171/#190: snapshotToFile branches on the ACTUAL db object; openReadOnly
+    // takes the driver EXPLICITLY — driverOf reads it from the live connection.
     snapshotToFile(getDb(), snapshotDbPath);
 
     // Row counts from the snapshot (not the live DB) so they match the archive.
-    const snap = await openReadOnly(snapshotDbPath);
+    const snap = await openReadOnly(snapshotDbPath, driverOf(getDb()));
     const row_counts: Record<string, number> = {};
     const tables = ["agents", "messages", "tasks", "channels", "channel_members", "channel_messages", "webhook_subscriptions", "webhook_delivery_log", "agent_capabilities", "audit_log"];
     for (const t of tables) {
@@ -279,13 +278,15 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     }
   }
 
-  // --- Step 1: safety-backup the current DB (unless there isn't one yet) ---
-  // #190 r2 (Finding 2): NO eager init here — a first-ever restore must create
-  // NOTHING until the archive is validated (Step 5). The integrity probe resolves
-  // its driver from live state or the configured default WITHOUT touching the main
-  // DB, so a corrupt archive manufactures no state. Ordering is the safety
-  // property on the recovery path.
+  // --- Step 1: safety-backup + capture the probe driver WHILE the connection is live ---
+  // #190 r3: the Step-5 integrity probe (openReadOnly) takes the driver EXPLICITLY
+  // — it cannot infer, because Step 2 closes the live DB before the probe (there is
+  // nothing to read then). Capture the driver here from the safety-backup's open
+  // handle. A truly-fresh restore has no existing DB (Finding 2: init nothing,
+  // manufacture nothing until validation); there the CONFIGURED driver IS the
+  // reality the process will instantiate — the one legitimate cold read of the env.
   let previousBackupPath = "";
+  let probeDriver: SqliteDriver;
   const srcDbPath = getDbPath();
   if (fs.existsSync(srcDbPath)) {
     const backupsDir = getBackupsDir();
@@ -293,9 +294,12 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // the primary export path; safety backups get 0700 directory treatment.
     ensureSecureDir(backupsDir, 0o700);
     const safetyPath = path.join(backupsDir, `pre-restore-${isoTimestamp()}.tar.gz`);
-    const pre = await exportRelayState({ destinationPath: safetyPath });
+    const pre = await exportRelayState({ destinationPath: safetyPath }); // inits + opens the live DB
     // exportRelayState already chmod'd the file; no extra call needed here.
     previousBackupPath = pre.archive_path;
+    probeDriver = driverOf(getDb()); // read from the LIVE connection, before Step 2 closes it
+  } else {
+    probeDriver = configuredDriver(); // truly fresh: no connection to read; request == reality
   }
 
   // --- Step 2: close our DB handle so the swap can rename the file ---
@@ -340,10 +344,11 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     }
 
     // --- Step 5: integrity check the extracted DB ---
-    // #171/#190: driver-aware read-only open of the ARCHIVE (native better-sqlite3
-    // / wasm sql.js), resolved from live state — no main-DB init, so a corrupt
-    // archive manufactures no state.
-    const probe = await openReadOnly(extractedDbPath);
+    // #171/#190: driver-aware read-only open of the ARCHIVE, driver passed
+    // EXPLICITLY — captured in Step 1 while the connection was live (or the
+    // configured driver on a fresh restore). No main-DB init, so a corrupt archive
+    // manufactures no state.
+    const probe = await openReadOnly(extractedDbPath, probeDriver);
     try {
       const check = probe.prepare("PRAGMA integrity_check").get() as { integrity_check: string } | undefined;
       if (!check || check.integrity_check !== "ok") {
