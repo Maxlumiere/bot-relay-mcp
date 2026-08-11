@@ -47,6 +47,14 @@ export function listTools(): ToolDef[] {
             RELAY_DB_PATH: path.join(tmp, 'relay.db'),
             RELAY_TRANSPORT: 'stdio',
             RELAY_SKIP_TTY_CHECK: '1',
+            // Force the CONFIGLESS / all-bundles default surface, deterministically.
+            // RELAY_CONFIG_PATH always wins over any instance config (config.ts,
+            // instance.ts), so pointing it at a nonexistent file inside this
+            // throwaway temp dir isolates the listing from the caller's ambient
+            // config (RELAY_CONFIG_PATH / RELAY_INSTANCE_ID). Without this a
+            // surface-shaping operator config leaks in and tools/list returns a
+            // FILTERED set (e.g. a core-only feature_bundles → 21, not 37).
+            RELAY_CONFIG_PATH: path.join(tmp, 'no-such-config.json'),
           },
         });
         const c = new Client({ name: 'list-tools-helper', version: '0.0.0' }, { capabilities: {} });
