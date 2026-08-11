@@ -54,8 +54,11 @@ const guards = readdirSync(SCRIPTS)
 
 // The gates, also read from disk: scripts/pre-publish-check.sh (the pre-publish
 // gate) and package.json (its `prebuild` lifecycle runs prebuild-guard). A guard
-// counts as invoked when a `node` command in either actually runs it — a mention
-// in a comment does not qualify (that is how a stale claim survives).
+// counts as "invoked" HERE when a `node …<guard>` command TEXT appears in either
+// file — a textual match, NOT proof of runtime execution. Per the BOUNDARY in the
+// header, that necessarily includes a commented-out `# node …guard.mjs` (the regex
+// matches it) and an invocation in dead/unreached code — both PASS. Closing that
+// gap is the run-list fix filed as #197, not a cleverer regex here.
 const gates =
   readFileSync(path.join(SCRIPTS, "pre-publish-check.sh"), "utf-8") +
   "\n" +
