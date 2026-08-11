@@ -592,3 +592,95 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(findAuthGenViolations(directBump, "cb2.ts")).toEqual([]);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("ADR-0003 G — fold + scoped refusal at prepare()/exec() (#59, issue #193)", () => {
+  const H = `export function bumpAuthGeneration(): void {}\nexport function applyAuthStateTransition(): void {}\n`;
+  const flags = (src: string) => findAuthGenViolations(src, "t.ts").map((x: { name: string }) => x.name);
+  const refuses = (src: string) => findUnresolvableBindings(src, "t.ts").map((x: { name: string }) => x.name);
+
+  // FOLD — the acceptance bar is the SPLIT POINT, not the presence of concatenation
+  // (victra + the-fixer): for each protected column, a split INSIDE the column name
+  // AND a split inside a SQL keyword must flag. A clean-boundary-only set would
+  // certify the very accident this fix removes.
+  for (const col of ["token_hash", "auth_state", "token_lookup"]) {
+    it(`FOLD: a concat split INSIDE the column "${col}" flags`, () => {
+      const mid = Math.ceil(col.length / 2);
+      const src = `${H}const A = "UPDATE agents SET ${col.slice(0, mid)}"; const B = "${col.slice(mid)} = NULL WHERE name = ?"; const Q = A + B;
+        export function m(n: string): void { getDb().prepare(Q).run(n); }`;
+      expect(flags(src)).toContain("m");
+    });
+  }
+  it("FOLD: a concat split INSIDE the keyword UPDATE flags", () => {
+    expect(flags(`${H}export function m(n: string): void { getDb().prepare("UPD" + "ATE agents SET token_hash = NULL WHERE name = ?").run(n); }`)).toContain("m");
+  });
+  it("FOLD: a concat split INSIDE the keyword DELETE flags", () => {
+    expect(flags(`${H}export function m(n: string): void { getDb().prepare("DEL" + "ETE FROM agents WHERE name = ?").run(n); }`)).toContain("m");
+  });
+  // The real-file shape that had an UNEARNED green: revokeAgentToken splits between
+  // "UPDATE agents " and "SET auth_state = ?, ...". No operand holds "UPDATE agents
+  // SET"; only the fold reconstructs it. (The transition — removing the real bump
+  // now FLAGS — is proven on the actual src/db.ts in the guard PR notes.)
+  it("FOLD: the revokeAgentToken split shape flags without a bump", () => {
+    expect(flags(`${H}export function revokeShape(n: string): void { getDb().prepare("UPDATE agents " + "SET auth_state = ?, revoked_at = ? WHERE name = ?").run("revoked", "t", n); }`)).toContain("revokeShape");
+  });
+
+  // EXHAUSTIVE PARTITION — a concat reaching a DB call folds OR refuses, never a
+  // silent third: each refuse form is exit 2, never []. (import / fn-call / cycle /
+  // non-literal operand.)
+  it("REFUSE: a cross-module import reaching prepare() refuses, not silently clean", () => {
+    const src = `${H}import { REVOKE } from "./sql.js"; const R = REVOKE;
+      export function m(n: string): void { getDb().prepare(R).run(n); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]); // not a provable violation ...
+    expect(refuses(src)).toContain("m"); // ... but REFUSED, never silent
+  });
+  it("REFUSE: a function-call result reaching prepare() refuses", () => {
+    expect(refuses(`${H}function mk(): string { return "x"; } const Q = mk();
+      export function m(n: string): void { getDb().prepare(Q).run(n); }`)).toContain("m");
+  });
+  it("REFUSE: a reference cycle reaching prepare() terminates and refuses", () => {
+    const src = `${H}const A: string = B; const B: string = A;
+      export function m(n: string): void { getDb().prepare(A).run(n); }`;
+    expect(() => findUnresolvableBindings(src, "t.ts")).not.toThrow();
+    expect(refuses(src)).toContain("m");
+  });
+  it("REFUSE: a concat with a non-literal operand (no visible violation) refuses", () => {
+    expect(refuses(`${H}export function m(sql: string, n: string): void { getDb().prepare("UPDATE agents SET " + sql).run(n); }`)).toContain("m");
+  });
+
+  // PRECEDENCE — PROOF BEATS UNCERTAINTY BEATS SILENCE.
+  it("PRECEDENCE: a violation visible in a resolved operand FLAGS even when another operand is unresolvable", () => {
+    const src = `${H}function mk(): string { return "y"; }
+      export function m(n: string): void { getDb().prepare("UPDATE agents SET token_hash = NULL WHERE name = ?" + mk()).run(n); }`;
+    expect(flags(src)).toContain("m"); // exit 1 wins
+    expect(refuses(src)).not.toContain("m"); // NOT downgraded to exit 2
+  });
+  it("PRECEDENCE: an unresolvable operand with NO visible violation refuses (never silent)", () => {
+    const src = `${H}function mk(): string { return "y"; }
+      export function m(n: string): void { getDb().prepare("UPDATE agents SET " + mk()).run(n); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
+    expect(refuses(src)).toContain("m");
+  });
+  it("a unit that BUMPS is clean even with an unresolvable SQL arg (safe regardless)", () => {
+    const src = `${H}function mk(): string { return "y"; }
+      export function m(n: string): void { getDb().prepare(mk()).run(n); bumpAuthGeneration(); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
+    expect(findUnresolvableBindings(src, "t.ts")).toEqual([]);
+  });
+
+  // GREEN BAR — the whole safety argument for the scoping: the real file stays exit
+  // 0 on BOTH axes, zero refusals and zero new flags.
+  it("real src/db.ts: zero violations AND zero refusals (scoped refusal costs nothing on the real file)", () => {
+    const dbSource = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/db.ts"), "utf-8");
+    expect(findAuthGenViolations(dbSource, "db.ts")).toEqual([]);
+    expect(findUnresolvableBindings(dbSource, "db.ts")).toEqual([]);
+  });
+
+  it("the refusal message names the reason and a remedy", () => {
+    const src = `${H}import { REVOKE } from "./sql.js"; const R = REVOKE;
+      export function m(n: string): void { getDb().prepare(R).run(n); }`;
+    const msg = formatRefusal(findUnresolvableBindings(src, "t.ts"));
+    expect(msg).toMatch(/import|function-call|cycle|non-literal|let|reassign/i); // WHY
+    expect(msg).toMatch(/inline|const/i); // REMEDY
+  });
+});
