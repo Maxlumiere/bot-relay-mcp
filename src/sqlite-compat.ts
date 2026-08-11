@@ -34,11 +34,26 @@ export interface CompatDatabase {
   pragma(source: string, options?: any): any;
   transaction<T>(fn: () => T): () => T;
   close(): void;
+  /**
+   * #171: atomic in-memory serialization of the DB image (wasm driver). Present
+   * on the wasm adapter; better-sqlite3 also exposes a compatible `serialize()`.
+   * Used by `snapshotToFile` for a tear-proof backup snapshot.
+   */
+  serialize?(): Uint8Array;
 }
 
 export type SqliteDriver = "native" | "wasm";
 
-export function getDriverType(): SqliteDriver {
+/**
+ * The REQUESTED driver (RELAY_SQLITE_DRIVER env). DELIBERATELY NOT EXPORTED
+ * (#190/codex): its only legitimate use is driver SELECTION at init (below). The
+ * env is mutable and can diverge from the live connection, so branching on it at
+ * a DISPATCH site is the read-the-state-not-the-request defect (#172/#190 class).
+ * Dispatch sites must import getActiveDriver() (the ACTUAL instantiated driver)
+ * instead — keeping this module-private makes the wrong primitive unreachable
+ * from them by construction, not by remembering to avoid it.
+ */
+function getDriverType(): SqliteDriver {
   const raw = process.env.RELAY_SQLITE_DRIVER || "native";
   if (raw === "wasm") return "wasm";
   return "native";
@@ -222,6 +237,16 @@ class WasmDatabase implements CompatDatabase {
     this.db.close();
   }
 
+  /**
+   * #171: atomic in-memory serialization — the whole DB image as bytes, produced
+   * synchronously from memory with no filesystem touch. Tear-proof by
+   * construction (unlike copying the write-back file, whose flush is a bare
+   * non-atomic fs.writeFileSync). Backs `snapshotToFile` on the wasm driver.
+   */
+  serialize(): Uint8Array {
+    return this.db.export();
+  }
+
   // v1.11.1: flush propagates REAL errors (fail-closed for disk-write
   // failures like ENOSPC). Emscripten internal FS errors from db.export()
   // are caught and retried — sql.js's wasm layer sometimes throws ErrnoError
@@ -279,6 +304,75 @@ async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
   return new WasmDatabase(rawDb, dbPath);
 }
 
+// --- #171: driver-aware DB-file operations for backup/restore ---
+
+/**
+ * Write a consistent point-in-time snapshot of `db` to `destPath`, driver-aware.
+ * - native: `VACUUM INTO` — a live-consistent online copy, safe even while the
+ *   daemon writes.
+ * - wasm: serialize the in-memory image atomically (`serialize()` → sql.js
+ *   `.export()`) and write the bytes. TEAR-PROOF regardless of caller. A plain
+ *   copy of the write-back file would NOT be: the wasm flush is a bare
+ *   `fs.writeFileSync` (no temp-and-rename, no lock), so a concurrent reader can
+ *   observe it half-written — and a torn backup fails silently at restore.
+ *
+ * Branches on the ACTUAL db object handed in (`db instanceof WasmDatabase`), the
+ * truest read-the-state: no env, no global, no captured driver that could go
+ * stale — just the live connection. This also sidesteps the getActiveDriver()
+ * gap where db.getDb()'s synchronous native fallback sets db.ts `_db` directly
+ * and never registers a driver (#190 r2): the object itself is unambiguous.
+ */
+export function snapshotToFile(db: CompatDatabase, destPath: string): void {
+  const dir = path.dirname(destPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (db instanceof WasmDatabase) {
+    fs.writeFileSync(destPath, Buffer.from(db.serialize()));
+  } else {
+    db.exec(`VACUUM INTO '${destPath.replace(/'/g, "''")}'`);
+  }
+}
+
+/**
+ * Open an EXISTING SQLite file read-only, driver-aware. Backs the backup manifest
+ * row-count read and the restore `PRAGMA integrity_check` — so both work under
+ * the wasm driver, where the native better-sqlite3 binary is absent (the exact
+ * npm-12 scripts-off scenario the wasm driver works around).
+ * - native: better-sqlite3 `{ readonly: true }`.
+ * - wasm: load the file bytes into a fresh sql.js instance. (Probe-only; close()
+ *   re-writes the identical bytes, which is a harmless no-op on a temp file.)
+ *
+ * The `driver` is an EXPLICIT PARAMETER, never inferred (#190 r3 ruling). Restore
+ * deliberately closes the live DB before probing the archive, so there is NO live
+ * state to read in that window — "read the state" has no answer once the state is
+ * destroyed on purpose. The caller captures the driver identity WHILE the
+ * connection is live (driverOf(db)) and passes it, or uses configuredDriver() in
+ * the truly-fresh no-connection path. You cannot call this without having decided
+ * — the same make-impossible property as keeping getDriverType private. Opens the
+ * GIVEN file; does NOT create or init the main DB, so validating a corrupt archive
+ * manufactures no state.
+ */
+export async function openReadOnly(dbPath: string, driver: SqliteDriver): Promise<CompatDatabase> {
+  if (!fs.existsSync(dbPath)) {
+    throw new Error(`openReadOnly: file not found at '${dbPath}'`);
+  }
+  if (driver === "wasm") {
+    let initSqlJs: any;
+    try {
+      const mod = await import("sql.js");
+      initSqlJs = mod.default;
+    } catch {
+      throw new Error(
+        "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
+        "Install it with: npm install sql.js",
+      );
+    }
+    const SQL = await initSqlJs();
+    return new WasmDatabase(new SQL.Database(fs.readFileSync(dbPath)), dbPath);
+  }
+  const { default: Database } = await import("better-sqlite3");
+  return new Database(dbPath, { readonly: true }) as unknown as CompatDatabase;
+}
+
 // --- Public API ---
 
 let _initializedDb: CompatDatabase | null = null;
@@ -324,6 +418,27 @@ export function getInitializedDb(): CompatDatabase | null {
 
 export function getActiveDriver(): SqliteDriver | null {
   return _driverUsed;
+}
+
+/**
+ * The driver of an OPEN connection, read from the object itself — the truest
+ * state, no global, no env, no tracker that can go stale. Used to capture the
+ * driver identity WHILE a connection is live, to hand to openReadOnly (which
+ * never infers). #190 r3.
+ */
+export function driverOf(db: CompatDatabase): SqliteDriver {
+  return db instanceof WasmDatabase ? "wasm" : "native";
+}
+
+/**
+ * The CONFIGURED driver for a COLD open — the ONLY legitimate read of the
+ * requested env: when there is NO live connection to read (a first-ever restore
+ * probing an archive before any DB is initialized). Here the request IS the
+ * reality: it is the driver the process will instantiate. NEVER use this where a
+ * live connection exists — use driverOf(db) there. #190 r3.
+ */
+export function configuredDriver(): SqliteDriver {
+  return getDriverType();
 }
 
 /**

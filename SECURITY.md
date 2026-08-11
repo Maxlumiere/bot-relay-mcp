@@ -229,7 +229,7 @@ Trust-model consequences you must accept before deploying a centralized hub:
 - **Per-agent tokens are issued by the hub, not the client.** If the hub is compromised, every client's token is compromised. Rotation is via `relay recover <name>` on the hub + re-run `relay pair` on each client.
 - **Recommended deployments:** families and small trusted teams (shared ownership of the hub), personal multi-machine setups (you own the hub + every client), CI + dev coordination within one team.
 - **NOT recommended:** mutually distrustful parties sharing a single hub, compliance-bound workloads where in-RAM access by the operator is a policy violation, or adversarial environments (the hub operator is in the trust boundary by design). Wait for v2.3 hub federation + v3 E2E.
-- **Operational parity:** `relay backup`, `relay re-encrypt`, key rotation, audit log retention, and `relay doctor` (with `--remote <url>`) all work identically in centralized deployments as in single-machine ones. No new operator skillset required. **Driver caveat:** this parity is across deployment topologies, not SQLite drivers — `relay backup`/`relay restore` are currently **native-only** and unavailable on the optional `sql.js` wasm driver (the npm-12 install remedy); see [`docs/sqlite-wasm-driver.md`](docs/sqlite-wasm-driver.md#backup-and-restore-unavailable).
+- **Operational parity:** `relay backup`, `relay re-encrypt`, key rotation, audit log retention, and `relay doctor` (with `--remote <url>`) all work identically in centralized deployments as in single-machine ones, and on both the native and `sql.js` wasm SQLite drivers (#171). No new operator skillset required.
 
 ---
 

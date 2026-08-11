@@ -14,13 +14,11 @@
  *     daemon unless force=true.
  *
  * Design notes:
- *   - VACUUM INTO is the snapshot mechanism — NATIVE DRIVER ONLY. The prior note
- *     claimed it "runs identically" on the wasm driver; it does NOT, and was
- *     never exercised under wasm (#171 triage). sql.js runs in an in-memory
- *     Emscripten FS and cannot VACUUM INTO a host path, and the row-count +
- *     integrity probes below open the snapshot with the native better-sqlite3
- *     binary. So backup/restore are native-only pending a driver-aware rewrite —
- *     see docs/sqlite-wasm-driver.md#backup-and-restore-unavailable.
+ *   - The snapshot + the read-only probes are DRIVER-AWARE (#171): native uses
+ *     VACUUM INTO + better-sqlite3; wasm serializes the in-memory image
+ *     atomically (sql.js .export()) and opens probe files via sql.js. Both route
+ *     through sqlite-compat.snapshotToFile + openReadOnly, so this module holds
+ *     NO native dependency of its own. Backup/restore work on BOTH drivers.
  *   - Schema version is a hardcoded constant here; Phase 4c will retrofit it
  *     to a schema_info table.
  *   - Tar is invoked via child_process (no shell, arg-array) — avoids a new
@@ -36,9 +34,9 @@ import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
 import { withDeadline } from "./http-deadline.js";
-import Database from "better-sqlite3";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
+import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { ERROR_CODES } from "./error-codes.js";
@@ -160,15 +158,16 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   try {
     const snapshotDbPath = path.join(stagingDir, "relay.db");
 
-    // VACUUM INTO gives a consistent point-in-time copy — NATIVE DRIVER ONLY.
-    // sql.js (RELAY_SQLITE_DRIVER=wasm) runs in an in-memory Emscripten FS and
-    // throws "unable to open database" here (#171 triage). Uses the shared
-    // connection rather than opening a second one — SQLite's own locking
-    // coordinates the snapshot.
-    getDb().exec(`VACUUM INTO '${snapshotDbPath.replace(/'/g, "''")}'`);
+    // #171: driver-aware consistent snapshot. native → VACUUM INTO (online-safe
+    // while the daemon writes); wasm → atomic export() bytes (tear-proof — a
+    // plain copy of the write-back file could observe a half-written flush). See
+    // sqlite-compat.snapshotToFile. Works on BOTH drivers.
+    // #171/#190: snapshotToFile branches on the ACTUAL db object; openReadOnly
+    // takes the driver EXPLICITLY — driverOf reads it from the live connection.
+    snapshotToFile(getDb(), snapshotDbPath);
 
     // Row counts from the snapshot (not the live DB) so they match the archive.
-    const snap = new Database(snapshotDbPath, { readonly: true });
+    const snap = await openReadOnly(snapshotDbPath, driverOf(getDb()));
     const row_counts: Record<string, number> = {};
     const tables = ["agents", "messages", "tasks", "channels", "channel_members", "channel_messages", "webhook_subscriptions", "webhook_delivery_log", "agent_capabilities", "audit_log"];
     for (const t of tables) {
@@ -279,8 +278,15 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     }
   }
 
-  // --- Step 1: safety-backup the current DB (unless there isn't one yet) ---
+  // --- Step 1: safety-backup + capture the probe driver WHILE the connection is live ---
+  // #190 r3: the Step-5 integrity probe (openReadOnly) takes the driver EXPLICITLY
+  // — it cannot infer, because Step 2 closes the live DB before the probe (there is
+  // nothing to read then). Capture the driver here from the safety-backup's open
+  // handle. A truly-fresh restore has no existing DB (Finding 2: init nothing,
+  // manufacture nothing until validation); there the CONFIGURED driver IS the
+  // reality the process will instantiate — the one legitimate cold read of the env.
   let previousBackupPath = "";
+  let probeDriver: SqliteDriver;
   const srcDbPath = getDbPath();
   if (fs.existsSync(srcDbPath)) {
     const backupsDir = getBackupsDir();
@@ -288,9 +294,12 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // the primary export path; safety backups get 0700 directory treatment.
     ensureSecureDir(backupsDir, 0o700);
     const safetyPath = path.join(backupsDir, `pre-restore-${isoTimestamp()}.tar.gz`);
-    const pre = await exportRelayState({ destinationPath: safetyPath });
+    const pre = await exportRelayState({ destinationPath: safetyPath }); // inits + opens the live DB
     // exportRelayState already chmod'd the file; no extra call needed here.
     previousBackupPath = pre.archive_path;
+    probeDriver = driverOf(getDb()); // read from the LIVE connection, before Step 2 closes it
+  } else {
+    probeDriver = configuredDriver(); // truly fresh: no connection to read; request == reality
   }
 
   // --- Step 2: close our DB handle so the swap can rename the file ---
@@ -335,7 +344,11 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     }
 
     // --- Step 5: integrity check the extracted DB ---
-    const probe = new Database(extractedDbPath, { readonly: true });
+    // #171/#190: driver-aware read-only open of the ARCHIVE, driver passed
+    // EXPLICITLY — captured in Step 1 while the connection was live (or the
+    // configured driver on a fresh restore). No main-DB init, so a corrupt archive
+    // manufactures no state.
+    const probe = await openReadOnly(extractedDbPath, probeDriver);
     try {
       const check = probe.prepare("PRAGMA integrity_check").get() as { integrity_check: string } | undefined;
       if (!check || check.integrity_check !== "ok") {

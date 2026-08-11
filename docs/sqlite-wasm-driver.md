@@ -82,10 +82,6 @@ The wasm driver operates on an in-memory copy of the database. Two processes sha
 - Single-terminal stdio: safe.
 - Multi-terminal stdio (multiple MCP processes sharing the same DB): **NOT SAFE. Use native.**
 
-### Backup and restore unavailable
-
-`relay backup` and `relay restore` do **not** work on the wasm driver. Two reasons: the snapshot step is `VACUUM INTO '<path>'`, and sql.js runs in an in-memory (Emscripten) virtual filesystem — it cannot write that snapshot to a real host path; and the archive's row-count + `PRAGMA integrity_check` probes open the snapshot with the **native** `better-sqlite3` binary, which is exactly what is absent in the npm-12 scripts-off scenario this driver exists to work around. Until a driver-aware snapshot lands, take a backup with the relay **stopped** by copying `~/.bot-relay/relay.db` directly (it is a standard SQLite file), or run the native driver for backup/restore operations.
-
 ### No WAL mode
 
 The wasm driver sets `PRAGMA journal_mode=DELETE` (SQLite's default rollback journal). WAL mode is meaningless for an in-memory database with write-back. At our scale, the performance difference is negligible.
@@ -97,6 +93,10 @@ Every write operation triggers a full database export + `fs.writeFileSync()`. At
 ### Crash durability
 
 If the process crashes between a write and the write-back flush, the last write is lost. This is the same durability model as better-sqlite3 with WAL (WAL may not be checkpointed on crash). In practice, relay operations are not financially critical — a lost message can be re-sent.
+
+## Backup and restore
+
+`relay backup` and `relay restore` work on the wasm driver (#171). The snapshot is taken via sql.js's atomic in-memory serialization (`.export()`) instead of `VACUUM INTO` (which can't write through the Emscripten virtual filesystem), and the manifest/integrity probes open through the active driver — so no native `better-sqlite3` binary is required. The `.export()` image is captured atomically, so a snapshot can't tear even if writes are in flight. Archives are standard SQLite files and **interoperate across drivers**: a backup made on native restores on wasm and vice versa, so switching drivers (e.g. adopting wasm after the npm-12 change) doesn't strand your existing archives.
 
 ## Troubleshooting
 
