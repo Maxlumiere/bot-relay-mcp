@@ -482,25 +482,34 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(s).not.toContain("goodOne");
   });
 
-  // Ruling 3 + "the message is part of the fix" — fail-closed, premise-style (B):
-  // exit 2, its own diagnosis. Seam: findUnresolvableBindings + formatRefusal.
-  it("HOISTED SQL: an unresolvable binding is REFUSED, and the refusal is actionable", () => {
-    const loose = `
+  // #59 Option A — a let's WHOLE assignment set is followed, fail-closed.
+  it("a let reassigned to an all-literal revoke FLAGS; a let assigned from a call REFUSES", () => {
+    // Every assignment resolves to a literal → resolve and match the union; the
+    // revoke assignment is visible and the unit does not bump → provable VIOLATION
+    // (exit 1). Not a refuse: PROOF beats uncertainty when the mutation is in-file.
+    const literalReassign = `
       export function bumpAuthGeneration(): void {}
       let REVOKE_SQL = "SELECT 1";
       REVOKE_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
       export function l2(n: string): void { getDb().prepare(REVOKE_SQL).run(n); }`;
-    const refusals = findUnresolvableBindings(loose, "loose.ts");
-    expect(refusals).toHaveLength(1);
+    expect(findAuthGenViolations(literalReassign, "loose.ts").map((x: { name: string }) => x.name)).toContain("l2");
+    expect(findUnresolvableBindings(literalReassign, "loose.ts")).toEqual([]);
 
+    // An assignment the guard cannot enumerate (a function-call result) makes the
+    // set incomplete → the whole binding is REFUSED (exit 2), fail-closed. The
+    // message names the reason and the remedy.
+    const callReassign = `
+      export function bumpAuthGeneration(): void {}
+      function build(): string { return "x"; }
+      let SQL = "SELECT 1";
+      SQL = build();
+      export function u(n: string): void { getDb().prepare(SQL).run(n); }`;
+    const refusals = findUnresolvableBindings(callReassign, "loose2.ts");
+    expect(refusals.map((x: { name: string }) => x.name)).toContain("u");
     const msg = formatRefusal(refusals);
-    expect(msg).toContain("REVOKE_SQL"); // NAMES the binding
-    expect(msg).toMatch(/let|reassign/i); // says WHY it cannot be resolved
-    expect(msg).toMatch(/const|inline/i); // says WHAT TO DO instead
-
-    // The exit-1 violation scan stays clean for the same file: the let is handled
-    // by the refusal path, not attributed as a mutation-without-bump.
-    expect(findAuthGenViolations(loose, "loose.ts")).toEqual([]);
+    expect(msg).toMatch(/let|reassign|function-call|import|dynamic/i); // WHY
+    expect(msg).toMatch(/const|inline/i); // REMEDY
+    expect(findAuthGenViolations(callReassign, "loose2.ts")).toEqual([]);
   });
 
   // ── codex #192 re-review: DESTRUCTURING axis (kind × binding-form) ──────────
@@ -556,14 +565,15 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(s).toContain("badOne");
     expect(s).not.toContain("goodOne");
 
-    // Soft (let/var) destructuring that reaches SQL is REFUSED, not read.
+    // A reassignable (let/var) destructured binding reaching a DB call is REFUSED,
+    // not read — the refusal is keyed by the UNIT that reaches it (fail-closed).
     const softDestr = `
       export function bumpAuthGeneration(): void {}
       export function applyAuthStateTransition(): void {}
       let { r: X } = { r: "SELECT 1" };
       X = "UPDATE agents SET token_hash = NULL WHERE name = ?";
       export function u(n: string): void { getDb().prepare(X).run(n); }`;
-    expect(findUnresolvableBindings(softDestr, "softd.ts").map((x: { name: string }) => x.name)).toContain("X");
+    expect(findUnresolvableBindings(softDestr, "softd.ts").map((x: { name: string }) => x.name)).toContain("u");
   });
 
   // ── DIRECTION-OF-FAILURE PIN (victra): the SHARED resolver's destructuring
@@ -590,5 +600,171 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
         bumpAuthGeneration();
       }`;
     expect(findAuthGenViolations(directBump, "cb2.ts")).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("ADR-0003 G — fold + scoped refusal at prepare()/exec() (#59, issue #193)", () => {
+  const H = `export function bumpAuthGeneration(): void {}\nexport function applyAuthStateTransition(): void {}\n`;
+  const flags = (src: string) => findAuthGenViolations(src, "t.ts").map((x: { name: string }) => x.name);
+  const refuses = (src: string) => findUnresolvableBindings(src, "t.ts").map((x: { name: string }) => x.name);
+
+  // FOLD — the acceptance bar is the SPLIT POINT, not the presence of concatenation
+  // (victra + the-fixer): for each protected column, a split INSIDE the column name
+  // AND a split inside a SQL keyword must flag. A clean-boundary-only set would
+  // certify the very accident this fix removes.
+  for (const col of ["token_hash", "auth_state", "token_lookup"]) {
+    it(`FOLD: a concat split INSIDE the column "${col}" flags`, () => {
+      const mid = Math.ceil(col.length / 2);
+      const src = `${H}const A = "UPDATE agents SET ${col.slice(0, mid)}"; const B = "${col.slice(mid)} = NULL WHERE name = ?"; const Q = A + B;
+        export function m(n: string): void { getDb().prepare(Q).run(n); }`;
+      expect(flags(src)).toContain("m");
+    });
+  }
+  it("FOLD: a concat split INSIDE the keyword UPDATE flags", () => {
+    expect(flags(`${H}export function m(n: string): void { getDb().prepare("UPD" + "ATE agents SET token_hash = NULL WHERE name = ?").run(n); }`)).toContain("m");
+  });
+  it("FOLD: a concat split INSIDE the keyword DELETE flags", () => {
+    expect(flags(`${H}export function m(n: string): void { getDb().prepare("DEL" + "ETE FROM agents WHERE name = ?").run(n); }`)).toContain("m");
+  });
+  // The real-file shape that had an UNEARNED green: revokeAgentToken splits between
+  // "UPDATE agents " and "SET auth_state = ?, ...". No operand holds "UPDATE agents
+  // SET"; only the fold reconstructs it. (The transition — removing the real bump
+  // now FLAGS — is proven on the actual src/db.ts in the guard PR notes.)
+  it("FOLD: the revokeAgentToken split shape flags without a bump", () => {
+    expect(flags(`${H}export function revokeShape(n: string): void { getDb().prepare("UPDATE agents " + "SET auth_state = ?, revoked_at = ? WHERE name = ?").run("revoked", "t", n); }`)).toContain("revokeShape");
+  });
+
+  // EXHAUSTIVE PARTITION — a concat reaching a DB call folds OR refuses, never a
+  // silent third: each refuse form is exit 2, never []. (import / fn-call / cycle /
+  // non-literal operand.)
+  it("REFUSE: a cross-module import reaching prepare() refuses, not silently clean", () => {
+    const src = `${H}import { REVOKE } from "./sql.js"; const R = REVOKE;
+      export function m(n: string): void { getDb().prepare(R).run(n); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]); // not a provable violation ...
+    expect(refuses(src)).toContain("m"); // ... but REFUSED, never silent
+  });
+  it("REFUSE: a function-call result reaching prepare() refuses", () => {
+    expect(refuses(`${H}function mk(): string { return "x"; } const Q = mk();
+      export function m(n: string): void { getDb().prepare(Q).run(n); }`)).toContain("m");
+  });
+  it("REFUSE: a reference cycle reaching prepare() terminates and refuses", () => {
+    const src = `${H}const A: string = B; const B: string = A;
+      export function m(n: string): void { getDb().prepare(A).run(n); }`;
+    expect(() => findUnresolvableBindings(src, "t.ts")).not.toThrow();
+    expect(refuses(src)).toContain("m");
+  });
+  it("REFUSE: a concat with a non-literal operand (no visible violation) refuses", () => {
+    expect(refuses(`${H}export function m(sql: string, n: string): void { getDb().prepare("UPDATE agents SET " + sql).run(n); }`)).toContain("m");
+  });
+
+  // PRECEDENCE — PROOF BEATS UNCERTAINTY BEATS SILENCE.
+  it("PRECEDENCE: a violation visible in a resolved operand FLAGS even when another operand is unresolvable", () => {
+    const src = `${H}function mk(): string { return "y"; }
+      export function m(n: string): void { getDb().prepare("UPDATE agents SET token_hash = NULL WHERE name = ?" + mk()).run(n); }`;
+    expect(flags(src)).toContain("m"); // exit 1 wins
+    expect(refuses(src)).not.toContain("m"); // NOT downgraded to exit 2
+  });
+  it("PRECEDENCE: an unresolvable operand with NO visible violation refuses (never silent)", () => {
+    const src = `${H}function mk(): string { return "y"; }
+      export function m(n: string): void { getDb().prepare("UPDATE agents SET " + mk()).run(n); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
+    expect(refuses(src)).toContain("m");
+  });
+  it("a unit that BUMPS is clean even with an unresolvable SQL arg (safe regardless)", () => {
+    const src = `${H}function mk(): string { return "y"; }
+      export function m(n: string): void { getDb().prepare(mk()).run(n); bumpAuthGeneration(); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
+    expect(findUnresolvableBindings(src, "t.ts")).toEqual([]);
+  });
+
+  // GREEN BAR — the whole safety argument for the scoping: the real file stays exit
+  // 0 on BOTH axes, zero refusals and zero new flags.
+  it("real src/db.ts: zero violations AND zero refusals (scoped refusal costs nothing on the real file)", () => {
+    const dbSource = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/db.ts"), "utf-8");
+    expect(findAuthGenViolations(dbSource, "db.ts")).toEqual([]);
+    expect(findUnresolvableBindings(dbSource, "db.ts")).toEqual([]);
+  });
+
+  it("the refusal message names the reason and a remedy", () => {
+    const src = `${H}import { REVOKE } from "./sql.js"; const R = REVOKE;
+      export function m(n: string): void { getDb().prepare(R).run(n); }`;
+    const msg = formatRefusal(findUnresolvableBindings(src, "t.ts"));
+    expect(msg).toMatch(/import|function-call|cycle|non-literal|let|reassign/i); // WHY
+    expect(msg).toMatch(/inline|const/i); // REMEDY
+  });
+
+  // ── codex #194 (Option A): EVERY argument reaching a DB call, of any shape,
+  // resolves-and-matches OR refuses — never silently clean. A bare dynamic value
+  // is the no-concat twin of the non-literal concat operand.
+  it("REFUSE: a bare parameter passed to prepare() is refused, not silently clean", () => {
+    const src = `${H}export function dyn(sql: string, n: string): void { getDb().prepare(sql).run(n); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]); // no provable violation ...
+    expect(refuses(src)).toContain("dyn"); // ... but never silent
+  });
+  it("REFUSE: a free / dynamic identifier passed to prepare() is refused", () => {
+    const src = `${H}export function m(n: string): void { getDb().prepare(externalSql).run(n); }`;
+    expect(refuses(src)).toContain("m");
+  });
+  // PRECEDENCE twin for the dynamic case: a visible violation beside a bare
+  // parameter still FLAGS (proof beats uncertainty), it is not downgraded to refuse.
+  it("PRECEDENCE: a visible violation concatenated with a bare parameter FLAGS", () => {
+    const src = `${H}export function m(extra: string, n: string): void {
+      getDb().prepare("UPDATE agents SET token_hash = NULL WHERE name = ?" + extra).run(n);
+    }`;
+    expect(flags(src)).toContain("m");
+    expect(refuses(src)).not.toContain("m");
+  });
+  // getMessagesSummary's SHAPE (a local let assigned SELECT branches) must stay
+  // GREEN through the new local-let resolution — both branches resolve, both SELECT.
+  it("a local let assigned only SELECT branches stays clean (getMessagesSummary shape)", () => {
+    const src = `${H}export function summary(pending: boolean, n: string): void {
+      let sql = "SELECT * FROM messages WHERE to_agent = ?";
+      if (pending) { sql = "SELECT * FROM messages WHERE to_agent = ? AND resolved_at IS NULL"; }
+      getDb().prepare(sql).run(n);
+    }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
+    expect(findUnresolvableBindings(src, "t.ts")).toEqual([]);
+  });
+
+  // ── codex #194 + victra: an interpolated template is a COMPOSITE (folded like a
+  // concatenation), plus the SQLite prepare()-vs-exec() carve-out (both engine-
+  // verified: prepare rejects a second statement, exec runs it).
+  it("REFUSE: a parameter interpolated as a column in a prepare() UPDATE", () => {
+    const src = `${H}export function m(col: string, n: string): void { getDb().prepare(\`UPDATE agents SET \${col} = NULL WHERE name = ?\`).run(n); }`;
+    expect(refuses(src)).toContain("m");
+  });
+  it("FLAG: a resolvable const substitution in a template UPDATE folds and flags", () => {
+    const src = `${H}const COL = "token_hash";
+      export function m(n: string): void { getDb().prepare(\`UPDATE agents SET \${COL} = NULL WHERE name = ?\`).run(n); }`;
+    expect(flags(src)).toContain("m");
+  });
+  it("PRECEDENCE: a violation visible in a template span FLAGS despite a dynamic substitution", () => {
+    const src = `${H}export function m(suffix: string, n: string): void { getDb().prepare(\`UPDATE agents SET token_hash = NULL WHERE name = \${suffix}\`).run(n); }`;
+    expect(flags(src)).toContain("m");
+    expect(refuses(src)).not.toContain("m");
+  });
+  it("prepare() SELECT with a dynamic clause is CLEAN (SQLite forbids an appended statement)", () => {
+    const src = `${H}export function m(clause: string, n: string): void { getDb().prepare(\`SELECT * FROM messages WHERE x = ? \${clause}\`).run(n); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
+    expect(findUnresolvableBindings(src, "t.ts")).toEqual([]);
+  });
+  it("exec() with a dynamic clause REFUSES even starting as a SELECT (exec runs multiple statements)", () => {
+    const src = `${H}export function m(clause: string, n: string): void { getDb().exec(\`SELECT * FROM messages WHERE x = ? \${clause}\`); }`;
+    expect(refuses(src)).toContain("m");
+  });
+  // codex #194 regression — the carve-out prefix is SELECT ONLY. A CTE can prefix a
+  // DML statement as ONE statement, so `WITH … UPDATE agents SET token_hash = NULL`
+  // prepares AND mutates (SQLite-verified). WITH proves nothing about read-only.
+  it("REFUSE: a WITH-prefixed prepare() with a dynamic tail (WITH is not read-only)", () => {
+    const src = `${H}export function m(suffix: string): void { getDb().prepare(\`WITH c AS (SELECT 1) \${suffix}\`).run(); }`;
+    expect(refuses(src)).toContain("m");
+  });
+  // victra #194 — the SELECT prefix must be PROVABLY the start: an unresolvable
+  // substitution BEFORE the SELECT token means the read prefix is not established,
+  // so `${x} SELECT …` REFUSES (else it walks through the same door).
+  it("REFUSE: a dynamic substitution BEFORE the SELECT token defeats the carve-out", () => {
+    const src = `${H}export function m(x: string, n: string): void { getDb().prepare(\`\${x} SELECT * FROM t WHERE n = ?\`).run(n); }`;
+    expect(refuses(src)).toContain("m");
   });
 });

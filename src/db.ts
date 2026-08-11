@@ -2697,18 +2697,41 @@ export function updateAgentMetadata(
   }
 ): boolean {
   const db = getDb();
-  const setCols: string[] = [];
-  const vals: unknown[] = [];
-  for (const [col, val] of Object.entries(fields)) {
-    if (val !== undefined) {
-      setCols.push(`${col} = ?`);
-      vals.push(val);
-    }
-  }
-  if (setCols.length === 0) return true;
-  const r = db.prepare(
-    `UPDATE agents SET ${setCols.join(", ")} WHERE name = ?`
-  ).run(...vals, name);
+  // #59 — a FULLY LITERAL statement (no dynamic column list) so the ADR-0003
+  // auth-gen guard can statically prove this never mutates a validity column.
+  // Behaviour-preserving vs the previous `SET ${setCols.join(", ")}`: each field
+  // updates IFF present (undefined -> skip, via the CASE flag); an explicit `null`
+  // still CLEARS its column (busy_expires_at is `string | null`); an all-undefined
+  // call is still a no-op that returns true; r.changes counts the row matched by
+  // `WHERE name = ?` exactly as before (SQLite counts a matched row as changed even
+  // when a CASE branch writes a column back to itself).
+  const has = {
+    last_seen: fields.last_seen !== undefined,
+    agent_status: fields.agent_status !== undefined,
+    busy_expires_at: fields.busy_expires_at !== undefined,
+    last_alive: fields.last_alive !== undefined,
+  };
+  if (!has.last_seen && !has.agent_status && !has.busy_expires_at && !has.last_alive) return true;
+  const r = db
+    .prepare(
+      `UPDATE agents SET
+         last_seen = CASE WHEN ? THEN ? ELSE last_seen END,
+         agent_status = CASE WHEN ? THEN ? ELSE agent_status END,
+         busy_expires_at = CASE WHEN ? THEN ? ELSE busy_expires_at END,
+         last_alive = CASE WHEN ? THEN ? ELSE last_alive END
+       WHERE name = ?`,
+    )
+    .run(
+      has.last_seen ? 1 : 0,
+      fields.last_seen ?? null,
+      has.agent_status ? 1 : 0,
+      fields.agent_status ?? null,
+      has.busy_expires_at ? 1 : 0,
+      fields.busy_expires_at ?? null,
+      has.last_alive ? 1 : 0,
+      fields.last_alive ?? null,
+      name,
+    );
   return r.changes > 0;
 }
 

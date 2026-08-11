@@ -57,9 +57,20 @@ import {
   isTopLevelFunctionDeclaration,
   findUnsatisfiedPrimitives,
   resolveUnitSqlText,
-  findSqlBackedSoftBindings,
+  foldDbCallArgs,
 } from "./lib/guard-ast.mjs";
 
+// Columns whose mutation changes a token's VALIDITY and therefore MUST bump the
+// generation. EXCLUDED WITH ITS REASON (#59, victra + the-fixer measured it):
+//   • revoked_at is NOT here on purpose. It is an audit timestamp — resolveAgent-
+//     ByToken decides revoked/active from auth_state + `token_hash IS NULL AND
+//     auth_state = 'active'`, and NOTHING reads revoked_at in a validity decision.
+//     A revoked_at-only write does not move the verified-token cache, so demanding
+//     a bump for it would OVER-flag. In the real file it is always co-mutated with
+//     auth_state (which IS here), so it is covered incidentally.
+//   ⚠ IF YOU ADD A CODE PATH THAT CONSULTS revoked_at TO DECIDE VALIDITY, add
+//     "revoked_at" to this list in the same change — the exclusion's premise
+//     (nothing reads it) will no longer hold.
 const SENSITIVE_COLS = [
   "token_hash",
   "auth_state",
@@ -107,6 +118,44 @@ function hasValidityChangingMutation(bodyText) {
 }
 
 /**
+ * Does this resolved text PROVE it is a read statement — does its resolved prefix
+ * start with SELECT? DEFAULT-DENY, the same principle the call side uses: prove it
+ * is SAFE, do not fail-to-prove it is dangerous. Used for the prepare()-argument
+ * carve-out (#194 sub-decision 1, SQLite-verified): SQLite forbids a substitution
+ * from appending a SECOND statement to a prepared SELECT (`prepare("SELECT …;
+ * UPDATE …")` THROWS), and a single SELECT statement cannot mutate — so a prepare()
+ * argument that provably STARTS as a SELECT cannot become an agents mutation and
+ * does not refuse on an unresolvable clause.
+ *
+ * ⚠ ONLY `SELECT`, NOT `WITH` (codex #194, verified): a CTE can PREFIX a DML
+ * statement as one statement — `WITH c AS (SELECT 1) UPDATE agents SET token_hash
+ * = NULL` prepares AND executes and mutates validity. `WITH` therefore proves
+ * nothing about read-only; accepting it by prefix was a hole. An argument whose
+ * resolved prefix is EMPTY (a bare parameter), or is `WITH`/`UPDATE`/`DELETE`/
+ * anything but `SELECT`, proves nothing → it still REFUSES (never silently clean).
+ * exec() gets NO carve-out at all (`exec("SELECT 1; UPDATE agents …")` RUNS the
+ * UPDATE), so an exec() argument with any unresolvable piece refuses.
+ *
+ * ⚠ A CARVE-OUT IS AN ALLOWLIST, AND AN ALLOWLIST OF N PREFIXES IS N SEPARATE
+ * CLAIMS about the SQLite engine — each must be independently VERIFIED, not
+ * pattern-matched by resemblance to a safe one. `WITH` was added because it
+ * "looks like a read" and was a hole. If a future prefix is proposed, the bar is
+ * an executed proof that it cannot carry a mutation, not that it usually does not.
+ *
+ * TWO STATED PROPERTIES (victra #194, both measured):
+ *   • CASE-INSENSITIVE — SQL keywords are, and real code is inconsistent, so
+ *     `select * FROM agents ${x}` clears the same as `SELECT`.
+ *   • A LEADING COMMENT does NOT qualify. Only whitespace is skipped before the
+ *     SELECT token, not a comment, so a SQL block comment (slash-star … star-slash)
+ *     placed before SELECT makes the prefix REFUSE. That is the safe direction (a
+ *     comment is not provably a read prefix); the refusal message says how to fix
+ *     it — move the leading comment outside the SQL string.
+ */
+function isProvablyRead(text) {
+  return /^SELECT\b/i.test(text.replace(/\s+/g, " ").trim());
+}
+
+/**
  * Analyze source text; return an array of { name, line } for functions that
  * mutate token/auth validity but do not bump the generation. Exported so the
  * negative-fixture test can prove the guard FAILS on an omitted bump.
@@ -138,90 +187,132 @@ function hasValidityChangingMutation(bodyText) {
  *   • object/array constant -> the WHOLE initializer is spliced (coarser than
  *     property-precise): OVER-includes, the safe direction, and the per-unit bump
  *     check still flags only the guilty sibling (KT3).
- *   • let/var-backed SQL -> deliberately NOT read (its initializer does not
- *     establish what runs — it can be reassigned). Surfaced by
- *     findUnresolvableBindings and REFUSED loudly (exit 2), never passed.
- *   • CONCATENATION and CROSS-MODULE imports -> out of scope by design (see
- *     guard-ast.mjs): concatenation is not routine-accidental drift; cross-module
- *     identity needs a TypeChecker. Named boundaries, not gaps.
+ *   • let/var-backed SQL at a prepare()/exec() arg -> its WHOLE assignment set is
+ *     followed (foldVarBinding, #59 Option A): every assignment resolves to a
+ *     literal -> resolve and match the union; ANY assignment unresolvable -> REFUSE
+ *     (exit 2), fail-closed. (Not "never read" — reassignment is now enumerated.)
+ *   • CONCATENATION -> at a prepare()/exec() arg it is FOLDED (reconstructed) so
+ *     split position does not matter; a non-literal operand REFUSES. Away from a DB
+ *     call the whole-body pass catches it only INCIDENTALLY — two non-contiguous
+ *     sub-matches over raw text (issue #193) — split-dependent, never to be relied
+ *     on. Neither "out of scope" nor "caught": see guard-ast RESOLVER COVERAGE.
+ *   • a bare parameter / dynamic value at a DB call -> REFUSED (never silently
+ *     clean, codex #194); CROSS-MODULE imported identity -> out of scope (needs a
+ *     TypeChecker), refused at a DB call. Named boundaries, not gaps.
  *
  * The hoisted-constant gap is CLOSED, and was measured LATENT at 0294854 (zero
  * module-scope validity SQL in the real src/db.ts), so a correct fix changes
  * nothing about the real file — if real db.ts starts flagging, the fix is
  * over-flagging, not the codebase drifting.
  */
-export function findAuthGenViolations(source, fileName = "db.ts") {
-  const sf = parseGuardSource(fileName, source); // pinned-parser gate: throws on parse diagnostics → main() exits 2
+/**
+ * Per-unit verdict with precedence baked in (#59 — PROOF BEATS UNCERTAINTY BEATS
+ * SILENCE). Each unit gets EXACTLY ONE verdict, so exit-1 and exit-2 can never
+ * both fire on one statement:
+ *   • PROVABLE VIOLATION — the resolved text (the whole-body binding-resolved text
+ *     of #57/#192, PLUS every FOLDED prepare()/exec() literal so a mid-token concat
+ *     "token_" + "hash" reconstructs to "token_hash", PLUS the literal RUNS that
+ *     resolved inside an otherwise-refused arg) shows a validity mutation and the
+ *     unit does not bump → VIOLATION (exit 1), even if part of the statement is
+ *     unresolvable: unknown text cannot un-mutate a visible mutation.
+ *   • else any DB-call arg is unresolvable AND the unit does not bump → REFUSE
+ *     (exit 2): the honest "I could not read all of it," never a silent all-clear.
+ *     A bumping unit is safe regardless of what it does → clean, not refused.
+ *   • else clean (exit 0).
+ * ROOT G exemption unchanged: only the sanctioned primitive's own top-level
+ * function declaration is exempt, not anything sharing its spelling.
+ */
+function classifyUnits(sf) {
   const violations = [];
+  const refusals = [];
   forEachFunctionUnit(sf, (name, bodyNode, nameNode) => {
     if (!name) return;
-    // ROOT G (codex, #151 round 2): this exemption used to key on the NAME
-    // alone, so ANY unit spelled `bumpAuthGeneration` — a class field, a method,
-    // an object-literal property — was exempt wholesale. A mutator could do the
-    // harmful UPDATE and skip the guard entirely just by being named after the
-    // primitive. The exemption must mean "IS the sanctioned primitive," which is
-    // the TOP-LEVEL FUNCTION DECLARATION, not anything sharing its spelling.
-    // Same disease as the callee side: identity by spelling instead of binding.
     if ((SELF_BUMPERS.has(name) || INIT_ONLY_ALLOWLIST.has(name)) && isTopLevelFunctionDeclaration(nameNode)) {
       return;
     }
-    // #57/#192 — the unit's body text PLUS the initializer text of every
-    // module-scope CONST it binding-resolves to (transitive), so hoisted SQL is
-    // seen as if inline. A let/var-backed SQL binding is handled by the refusal
-    // path (findUnresolvableBindings), not here.
-    const bodyText = resolveUnitSqlText(bodyNode, sf, null);
-    // TRIGGER: text (over-trigger-safe). REQUIRED CALL: structural (a real
-    // CallExpression to bumpAuthGeneration / applyAuthStateTransition or a direct
-    // local alias) — comments and strings are structurally incapable of it.
-    if (hasValidityChangingMutation(bodyText) && !bodyCallsFunction(bodyNode, sf, SELF_BUMPERS)) {
-      violations.push({ name, line: sf.getLineAndCharacterOfPosition(nameNode.getStart(sf)).line + 1 });
+    const parts = [resolveUnitSqlText(bodyNode, sf, null)];
+    let firstRefuse = null;
+    for (const a of foldDbCallArgs(bodyNode, sf)) {
+      if (a.kind === "literal") parts.push(a.text); // FOLD: split position no longer matters
+      else if (a.kind === "refuse") {
+        parts.push(a.partial || ""); // the runs that DID resolve, so a visible violation still shows
+        // SUB-DECISION 1 (victra #194, SQLite-verified): a prepare() argument that
+        // provably STARTS as a read (SELECT ONLY — NOT `WITH`, a CTE can prefix a
+        // mutation as one statement) cannot become a validity mutation, because
+        // SQLite rejects a second statement appended by any substitution
+        // (prepare("SELECT …; UPDATE …") THROWS), so a resolved-SELECT prepare arg
+        // with an unresolvable piece does NOT refuse. An empty/non-SELECT resolved
+        // prefix (a bare parameter, or `WITH …`) proves nothing → refuse. exec()
+        // runs multiple statements (exec("SELECT 1; UPDATE agents SET token_hash=
+        // NULL") executes the UPDATE) → an exec() arg with any unresolvable piece
+        // REFUSES. Prefix test: isProvablyRead (SELECT-only, provably at the start).
+        if (!firstRefuse && (a.method === "exec" || !isProvablyRead(a.partial || ""))) firstRefuse = a;
+      }
+    }
+    const bumps = bodyCallsFunction(bodyNode, sf, SELF_BUMPERS);
+    const line = sf.getLineAndCharacterOfPosition(nameNode.getStart(sf)).line + 1;
+    if (hasValidityChangingMutation(parts.join(" ")) && !bumps) {
+      violations.push({ name, line }); // PROOF beats uncertainty
+      return;
+    }
+    if (firstRefuse && !bumps) {
+      refusals.push({ name, line: firstRefuse.line, reason: firstRefuse.reason }); // uncertainty beats silence
     }
   });
-  return violations;
+  return { violations, refusals };
 }
 
 /**
- * The fail-closed REFUSAL set (#192 ruling 3): module-scope let/var bindings whose
- * initializer OR any assignment reaches validity SQL. Returns { name, line } for
- * each. A SEPARATE pure function from findAuthGenViolations, mirroring the
- * findUnsatisfiedPrimitives / main split — so the refusal MESSAGE is testable and
- * the exit-1 ("your code is wrong") vs exit-2 ("I cannot analyse this")
- * distinction is preserved (#192: collapsing them is how guards get disabled).
- *
- * WHY let/var is refused and not resolved: a let can be reassigned, so its
- * initializer does not establish what the use site reads. the-fixer's L2 — a
- * benign initializer reassigned to a token-revoking statement — makes it concrete:
- * resolving the initializer reads "SELECT 1" and reports CLEAN while the statement
- * that runs revokes a token. Under-detection produced by the resolver's own logic.
- * Fail-closed is the only sound verdict; the ACCEPTED COST is that a const->let
- * refactor of a SQL literal fails the build, which is the intended behaviour.
+ * Functions that mutate token/auth validity but do not bump the generation
+ * (exit 1). Exported so the negative-fixture test can prove the guard FAILS on an
+ * omitted bump. See classifyUnits for the trigger, the fold, and the precedence.
+ */
+export function findAuthGenViolations(source, fileName = "db.ts") {
+  const sf = parseGuardSource(fileName, source); // pinned-parser gate: throws on parse diagnostics → main() exits 2
+  return classifyUnits(sf).violations;
+}
+
+/**
+ * The fail-closed REFUSAL set (exit 2): units whose prepare()/exec() SQL ARGUMENT,
+ * of ANY shape, cannot be resolved to a literal — a bare parameter or other
+ * dynamic value, a cross-module import, a function-call result, a reference cycle,
+ * a concatenation with a non-literal operand, or a reassignable let/var whose
+ * assignment set is not all-literal (#59, victra Option A; supersedes the #192
+ * file-level let/var scan — the module let/var refusal is now handled prepare-
+ * scoped inside foldSqlArg). A SEPARATE exit code from a violation because "I
+ * cannot analyse this" is a different fact from "your code is wrong". SCOPED to
+ * arguments that reach a DB call — the-fixer measured a blanket version at 20
+ * false refusals on real db.ts, this scoping at 0.
  */
 export function findUnresolvableBindings(source, fileName = "db.ts") {
   const sf = parseGuardSource(fileName, source);
-  return findSqlBackedSoftBindings(sf, hasValidityChangingMutation).map((decl) => ({
-    name: decl.name.getText(sf),
-    line: sf.getLineAndCharacterOfPosition(decl.name.getStart(sf)).line + 1,
-  }));
+  return classifyUnits(sf).refusals;
 }
 
 /**
- * Premise-style refusal message (#192: "the message is part of the fix"). NAMES
- * each binding, says WHY it cannot be resolved (let/var is reassignable), and
- * states the REMEDY (make it const, or inline the literal) — so the cheaper path
- * out of the failed build is fixing the binding, not deleting the check. Never a
- * bare "refusing".
+ * Premise-style refusal message (#192/#59: "the message is part of the fix").
+ * NAMES each unit/binding, says WHY it cannot be resolved (per-reason), and states
+ * the REMEDY (inline the literal, or build it from in-file const literals) — so
+ * the cheaper path out of the failed build is fixing the SQL's identity, not
+ * deleting the check. Never a bare "refusing".
  */
 export function formatRefusal(refusals) {
-  const lines = refusals.map((r) => `    ${r.name}  (declared at line ${r.line})`);
+  const lines = refusals.map((r) => `    ${r.name}  (line ${r.line})${r.reason ? " — " + r.reason : ""}`);
   return (
-    "  A token/auth SQL statement is held in a reassignable `let`/`var` binding:\n" +
+    "  Token/auth SQL reaches a DB call through something this guard cannot resolve to a\n" +
+    "  literal:\n" +
     lines.join("\n") +
-    "\n\n  A `let`/`var` can be reassigned, so its initializer does not establish what the\n" +
-    "  statement actually executes: reading it could report a false all-clear while a\n" +
-    "  later reassignment revokes a token. This guard refuses to guess rather than miss\n" +
-    "  a bump (exit 2 = cannot analyse, NOT exit 1 = your code is wrong).\n" +
-    "  Remedy: make the binding a `const`, or inline the SQL literal at the call site,\n" +
-    "  so the statement's identity is fixed where it is used.\n"
+    "\n\n  The guard reconstructs SQL only from in-file `const` string literals (and\n" +
+    "  concatenations of them, folded). It refuses rather than guess when the SQL comes\n" +
+    "  from a reassignable `let`/`var`, a cross-module import, a function-call result, a\n" +
+    "  reference cycle, or a concatenation with a non-literal operand — reading such a\n" +
+    "  value could report a false all-clear while the statement that runs revokes a token.\n" +
+    "  Exit 2 = \"cannot analyse this\", deliberately NOT exit 1 = \"your code is wrong\".\n" +
+    "  Remedy: inline the SQL literal at the prepare()/exec() call, or build it from\n" +
+    "  in-file `const` string literals, so its identity is fixed where it is used.\n" +
+    "  (A prepare() argument is exempt only if it PROVABLY starts with SELECT — a\n" +
+    "  leading SQL comment or a dynamic value before SELECT breaks that proof; move a\n" +
+    "  leading comment OUTSIDE the SQL string.)\n"
   );
 }
 
@@ -232,6 +323,7 @@ function main() {
     process.exit(2);
   }
   const all = [];
+  const allRefusals = [];
   try {
     for (const f of files) {
       const abs = path.resolve(f);
@@ -264,21 +356,15 @@ function main() {
         );
         process.exit(2);
       }
-      // FAIL-CLOSED REFUSAL (#192 ruling 3), premise-style: exit 2, its own
-      // diagnosis, BEFORE the exit-1 violation scan. A token/auth SQL statement
-      // held in a reassignable let/var cannot be soundly analysed, so refuse with
-      // an actionable message rather than read a stale initializer and pass. Exit
-      // 2 = "I cannot analyse this", kept distinct from exit 1 = "your code is
-      // wrong" — the false-all-clear the exit-1 wording would imply is exactly the
-      // stale cache this guard exists to prevent.
-      const refusals = findUnresolvableBindings(src, path.basename(abs));
-      if (refusals.length > 0) {
-        process.stderr.write(`auth-gen-guard: CANNOT ANALYSE ${abs}\n` + formatRefusal(refusals));
-        process.exit(2);
-      }
-      for (const v of findAuthGenViolations(src, path.basename(abs))) {
-        all.push({ file: abs, ...v });
-      }
+      // PRECEDENCE (#59 — PROOF BEATS UNCERTAINTY BEATS SILENCE): collect BOTH the
+      // provable violations (exit 1) and the refusals (exit 2). A provable
+      // violation outranks a refusal — a mutation visible in the resolved text is
+      // established fact — so nothing is decided until every file is scanned. Exit
+      // 1 = "your code is wrong", exit 2 = "I cannot analyse this"; the two are
+      // deliberately distinct (#192), and an unresolvable statement is never
+      // silently clean — it flags or it refuses.
+      for (const v of findAuthGenViolations(src, path.basename(abs))) all.push({ file: abs, ...v });
+      for (const r of findUnresolvableBindings(src, path.basename(abs))) allRefusals.push({ file: abs, ...r });
     }
   } catch (err) {
     // Labelled "analysis error", not "parse error": this catch covers the whole
@@ -308,6 +394,13 @@ function main() {
         "The remedy is the direct call: `bumpAuthGeneration();` after the mutation.\n",
     );
     process.exit(1);
+  }
+  // No provable violation anywhere → now the refusals decide (exit 2). Reached
+  // only when nothing is exit-1, so PROOF has already had its precedence.
+  if (allRefusals.length > 0) {
+    const where = allRefusals.length ? allRefusals[0].file : "";
+    process.stderr.write(`auth-gen-guard: CANNOT ANALYSE ${where}\n` + formatRefusal(allRefusals));
+    process.exit(2);
   }
   process.stdout.write("All token/auth mutators bump the auth generation — verified-token cache invalidation intact\n");
   process.exit(0);

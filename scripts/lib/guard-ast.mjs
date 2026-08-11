@@ -85,11 +85,14 @@
  * other — it does not raise it. The trigger side is now ALSO binding-resolved:
  * resolveUnitSqlText (below) follows a mutator's identifiers through module-scope
  * CONST bindings — aliases, objects, arrays, transitively — using this same
- * resolver, and findSqlBackedSoftBindings makes a let/var-backed SQL binding a
- * loud refusal rather than a silent miss (#57 / #192). SQL still reaches the
- * trigger only as a literal in this file: string CONCATENATION and CROSS-MODULE
- * imports remain out of scope by design (concatenation is not routine-accidental;
- * cross-module identity needs a TypeChecker — the same boundary as the call side).
+ * resolver (#57 / #192). At a prepare()/exec() SQL argument foldSqlArg goes further
+ * (#59, victra Option A): it RECONSTRUCTS concatenations of resolvable literals so
+ * split position stops mattering, follows a let/var's whole assignment set
+ * (fail-closed), and REFUSES any argument that does not resolve to a literal — an
+ * import / function-call / cycle / non-literal operand / bare dynamic value
+ * — see the CONCATENATION note in RESOLVER COVERAGE. CROSS-MODULE imported
+ * identity stays out of scope by design (needs a TypeChecker — same boundary as
+ * the call side); it is refused at a DB call rather than silently passed.
  *
  * ── ⚠ WHAT DOES THIS RESOLVER TREAT AS OUTSIDE ITS WORLD? ────────────────────
  * Standing question for the next person, because this is how round 3 failed:
@@ -773,9 +776,30 @@ export function bodyCallsFunction(bodyNode, sf, names) {
 //      binding is simply not spliced ⇒ the SQL is not there ⇒ UNDER-detect ⇒
 //      DANGEROUS, which is why this side must accept broadly and errs toward
 //      over-splicing whole objects/arrays.
-//    OUT of scope on BOTH sides, by design: string CONCATENATION (not accidental
-//    drift) and CROSS-MODULE imported identity (needs a TypeChecker). Named
-//    boundaries, not gaps.
+//    CONCATENATION — measured, stated precisely (#59 / issue #193), because it is
+//      neither "out of scope" nor "caught" and both wordings mislead. At a
+//      prepare()/exec() SQL argument, foldSqlArg RECONSTRUCTS a concatenation of
+//      resolvable literals ("token_" + "hash" -> "token_hash") and matches the
+//      reconstruction, so SPLIT POSITION does not affect detection. A concatenation
+//      with any operand that does NOT resolve to a literal (a cross-module import,
+//      a function-call result, a reference cycle, a parameter) reaching a DB call
+//      is REFUSED (exit 2), not passed. A TEMPLATE LITERAL WITH INTERPOLATION is
+//      the SAME thing as a concatenation wearing different syntax (victra #194):
+//      its static spans and every ${substitution} are folded identically, and a
+//      single unresolvable substitution REFUSES — `${col}` where col is a
+//      parameter can be token_hash at runtime, so it is not a literal.
+//      ⚠ Away from a prepare()/exec() argument the whole-body pass is DIFFERENT and
+//      must not be relied on. It splices the expression's RAW TEXT verbatim, and
+//      hasValidityChangingMutation is TWO INDEPENDENT sub-matches (/UPDATE\s+agents
+//      \s+SET\b/ or DELETE-FROM-agents, AND /\b<sensitive_col>\b/) that need NOT be
+//      contiguous — so a concatenation there matches ACROSS operands UNLESS a
+//      matched TOKEN itself is split (measured, victra @ #194). That is INCIDENTAL
+//      and split-position-dependent, NOT "per-operand" and NOT a boundary anyone can
+//      reason from; the fold above is the only place concatenation is handled by
+//      construction rather than by accident.
+//    OUT of scope on BOTH sides, by design: CROSS-MODULE imported identity (needs a
+//      TypeChecker) — refused at a DB call, over-flagged on the must-CALL side.
+//      Named boundaries, not gaps.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -807,30 +831,6 @@ function moduleBindingInfo(decl) {
   if (!stmt || !ts.isVariableStatement(stmt)) return null;
   if (!stmt.parent || !ts.isSourceFile(stmt.parent)) return null; // MODULE scope only
   return { kind: (list.flags & ts.NodeFlags.Const) !== 0 ? "const" : "soft", initNode: varDecl.initializer ?? null };
-}
-
-/**
- * Invoke `cb(boundDecl)` for each name a top-level VariableDeclaration binds: the
- * VariableDeclaration itself for a simple `X`, or each leaf BindingElement for a
- * destructuring pattern (including aliases `{ a: X }` and nested patterns). This
- * is the SAME set resolveName resolves a destructured use to, so the refusal side
- * and the resolve side agree on what a module binding is.
- */
-function eachModuleBoundDecl(decl, cb) {
-  if (ts.isIdentifier(decl.name)) {
-    cb(decl);
-    return;
-  }
-  const walk = (pat) => {
-    if (ts.isObjectBindingPattern(pat) || ts.isArrayBindingPattern(pat)) {
-      for (const el of pat.elements) {
-        if (!ts.isBindingElement(el)) continue;
-        if (ts.isIdentifier(el.name)) cb(el);
-        else walk(el.name); // nested pattern
-      }
-    }
-  };
-  walk(decl.name);
 }
 
 /**
@@ -942,65 +942,252 @@ export function resolveUnitSqlText(bodyNode, sf, softHitOut) {
   return parts.join(" ");
 }
 
-/**
- * Does module-scope let/var `decl` reach validity SQL through its initializer OR
- * any assignment `name = <expr>` to it (binding-correct: the assignment's target
- * must resolve to THIS decl)? Const-resolves both sides so `let X = AUTH_SQL`
- * (L1, alias) and `let X = "SELECT 1"; X = "<revoke>"` (L2, reassignment) are
- * both caught. `predicate(text)` is the SQL test.
- */
-function moduleSoftBindingReachesSql(decl, sf, predicate) {
-  const names = moduleBindingNames(sf);
-  const texts = [];
-  const info = moduleBindingInfo(decl); // works for a VariableDeclaration or a BindingElement
-  if (info && info.initNode) {
-    texts.push(info.initNode.getText(sf));
-    resolveConstText(info.initNode, sf, texts, new Set(), null, names);
+// NOTE: the #192 file-level let/var refusal (findSqlBackedSoftBindings /
+// moduleSoftBindingReachesSql) was REMOVED in #59 — the let/var refusal is now
+// prepare()/exec()-scoped inside foldSqlArg/foldVarBinding (victra Option A), which
+// both narrows it to arguments that reach a DB call (0 false refusals on real
+// db.ts) and follows the whole assignment set fail-closed.
+
+// ── prepare()/exec() SQL-argument FOLD + REFUSE (#59 / issue #193) ────────────
+// The whole-body trigger is TWO INDEPENDENT sub-matches over spliced RAW TEXT
+// (/UPDATE\s+agents\s+SET\b/ AND /\b<sensitive_col>\b/, not necessarily
+// contiguous), so a concatenated statement is caught INCIDENTALLY — only when
+// neither matched TOKEN is itself split — and every real mutation in db.ts is a
+// concatenation (issue #193). That is split-position-dependent, not a boundary.
+// So at each prepare()/exec() SQL argument we FOLD the expression to its literal
+// string, RECONSTRUCTING concatenations ("token_" + "hash" -> "token_hash") so the
+// split position stops mattering. Every argument, OF ANY SHAPE, then lands in
+// resolved-and-matched or REFUSE (exit 2) — no silent third: a dynamic value (a
+// bare parameter, a free name, a reassignable local whose assignment set is not
+// all-literal), a cross-module import, a function-call result, a reference cycle,
+// or a concatenation with a non-literal operand all REFUSE. SCOPED to DB-call
+// arguments so benign consts never refuse (the-fixer measured a blanket version at
+// 20 false refusals on real db.ts, this scoping at 0; victra measured 262 literal
+// / 0 refuse / 1 opaque, the 1 a local let resolved by foldVarBinding → 0). A
+// REFUSE still carries `partial` — the literal text that DID resolve — so a
+// violation provable from a resolved operand outranks the refuse (PROOF BEATS
+// UNCERTAINTY BEATS SILENCE): an unresolvable statement is never silently clean.
+const DB_SQL_METHODS = new Set(["prepare", "exec"]); // better-sqlite3 SQL-taking calls (.run/.get/.all take params, not SQL)
+// A non-whitespace marker standing in for an UNRESOLVABLE piece inside a `partial`.
+// Two jobs (#194): (1) it survives String.trim(), so a substitution BEFORE the SELECT
+// token — `${x} SELECT …` — leaves a leading marker and the prepare() read carve-out
+// is NOT established (victra: the prefix must be provably the start); (2) a matched
+// SQL token cannot cross it, so a concat/interpolation cannot forge `UPDATE agents
+// SET token_hash` across an unresolved gap. It is neither whitespace nor a word char.
+const UNRESOLVED_GAP = String.fromCharCode(1); // 0x01: non-whitespace, non-word
+
+function skipParens(n) {
+  while (n && ts.isParenthesizedExpression(n)) n = n.expression;
+  return n;
+}
+function isImportBinding(d) {
+  return ts.isImportSpecifier(d) || ts.isImportClause(d) || ts.isNamespaceImport(d) || ts.isImportEqualsDeclaration(d);
+}
+function enclosingVarDecl(decl) {
+  let n = decl;
+  if (n && ts.isBindingElement(n)) while (n && !ts.isVariableDeclaration(n)) n = n.parent;
+  return n && ts.isVariableDeclaration(n) ? n : null;
+}
+function constInitializerOf(node, sf, seen) {
+  // Follow a `const` identifier to its initializer node; { refuse } for an import.
+  node = skipParens(node);
+  if (!ts.isIdentifier(node)) return { node };
+  const decls = resolveName(node.text, node);
+  if (decls.length !== 1) return { node: null };
+  if (isImportBinding(decls[0])) return { refuse: `a cross-module import (${node.text})` };
+  const vd = enclosingVarDecl(decls[0]);
+  if (vd && vd.parent && ts.isVariableDeclarationList(vd.parent) && (vd.parent.flags & ts.NodeFlags.Const) !== 0 && vd.initializer) {
+    return constInitializerOf(vd.initializer, sf, seen);
   }
-  if (ts.isBindingElement(decl) && decl.initializer) {
-    texts.push(decl.initializer.getText(sf)); // destructuring default value
-    resolveConstText(decl.initializer, sf, texts, new Set(), null, names);
-  }
-  const walk = (node) => {
-    if (
-      ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      ts.isIdentifier(node.left)
-    ) {
-      const target = resolveName(node.left.text, node.left);
-      if (target.length === 1 && target[0] === decl) {
-        texts.push(node.right.getText(sf));
-        resolveConstText(node.right, sf, texts, new Set(), null, names);
-      }
-    }
-    ts.forEachChild(node, walk);
-  };
-  walk(sf);
-  return predicate(texts.join(" "));
+  return { node: null };
+}
+
+/** A dynamic / unresolvable value reaching a DB call — REFUSED, never silent. */
+function dynRefuse(reason) {
+  return { kind: "refuse", reason, partial: "" };
 }
 
 /**
- * Module-scope let/var bindings whose initializer or any assignment reaches
- * validity SQL (`predicate`) — the fail-closed REFUSAL set (#192 ruling 3). A
- * const→let refactor of a SQL literal lands here and the build fails LOUDLY (the
- * caller exits 2, premise-style), rather than the guard reading a stale/benign
- * initializer and reporting a false all-clear while the reassigned statement
- * revokes a token. `_db` and plain counters never reach SQL, so the real db.ts
+ * Fold a `let`/`var` binding by its initializer AND every in-file assignment to
+ * it (#59, victra Option A). FAIL-CLOSED: if ANY assigned value does not resolve
+ * to a literal — a call, a parameter, a value from outside the function, a
+ * reassignment we cannot enumerate — REFUSE the whole binding rather than resolve
+ * the visible ones and stay silent about the rest (that is the per-operand mistake
+ * in a new costume). Because a `let` may hold any of its assigned values at the
+ * use site, the union is matched: if ANY assigned value is a validity mutation the
+ * unit flags; a binding all of whose branches are SELECTs (getMessagesSummary)
  * stays clean.
- * @fixture "an unresolvable binding is REFUSED, and the refusal is actionable"
  */
-export function findSqlBackedSoftBindings(sf, predicate) {
-  const out = [];
-  for (const stmt of sf.statements) {
-    if (!ts.isVariableStatement(stmt)) continue;
-    const list = stmt.declarationList;
-    if ((list.flags & ts.NodeFlags.Const) !== 0) continue; // only let/var
-    for (const decl of list.declarations) {
-      // Each bound name (simple id OR each destructuring BindingElement).
-      eachModuleBoundDecl(decl, (boundDecl) => {
-        if (moduleSoftBindingReachesSql(boundDecl, sf, predicate)) out.push(boundDecl);
+function foldVarBinding(decl, sf, seen) {
+  const texts = [];
+  const name = ts.isIdentifier(decl.name) ? decl.name.text : "binding";
+  const take = (rhs) => {
+    const r = foldSqlArg(rhs, sf, seen);
+    if (r.kind === "refuse") return r; // propagate import / fn-call / cycle / dynamic — fail closed
+    texts.push(r.text);
+    return null;
+  };
+  if (decl.initializer) {
+    const stop = take(decl.initializer);
+    if (stop) return stop;
+  }
+  let stop = null;
+  const walk = (n) => {
+    if (stop) return;
+    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(n.left)) {
+      const t = resolveName(n.left.text, n.left);
+      if (t.length === 1 && t[0] === decl) {
+        const s = take(n.right);
+        if (s) stop = s;
+      }
+    }
+    ts.forEachChild(n, walk);
+  };
+  walk(sf);
+  if (stop) return stop;
+  if (texts.length === 0) return dynRefuse(`a ${name} declared but never assigned an in-file literal`);
+  const joined = texts.join(" ");
+  return { kind: "literal", text: joined, partial: joined };
+}
+
+/**
+ * Fold a prepare()/exec() SQL argument (or a concat operand), OF ANY SHAPE, to
+ * concrete literal text. The partition over ARGUMENTS is exhaustive — every one
+ * lands in exactly one of TWO verdicts, there is NO silent third:
+ *   { kind: "literal", text, partial } — fully resolved (partial === text)
+ *   { kind: "refuse", reason, partial } — unresolvable; `partial` = the literal
+ *       RUNS that DID resolve, so a violation visible in a resolved run outranks
+ *       the refuse at the call site (PROOF BEATS UNCERTAINTY BEATS SILENCE).
+ * A DYNAMIC value — a bare parameter, a free name, a reassignable local whose
+ * assignment set is incomplete — REFUSES (codex #194): an unresolvable SQL
+ * argument at a DB call is never silently clean.
+ *
+ * ⚠ THE INVARIANT (victra #194, after seven shapes of one defect): SYNTACTIC FORM
+ * DOES NOT DECIDE — COMPLETENESS DOES. A node returns `literal` ONLY when every
+ * sub-piece resolves: a concatenation's operands, a TEMPLATE's static spans AND
+ * every substitution, a resolvable identifier's binding, an object/array member.
+ * A COMPOSITE with any unresolved piece REFUSES, whatever its syntax —
+ * concatenation and string interpolation are the same thing wearing different
+ * syntax, and a `TemplateExpression` with substitutions is NOT a literal. Do not
+ * add a per-form "handled" shortcut; that is how the seventh shape got in.
+ */
+function foldSqlArg(node, sf, seen) {
+  node = skipParens(node);
+  if (!node) return dynRefuse("an empty argument");
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return { kind: "literal", text: node.text, partial: node.text };
+  if (ts.isTemplateExpression(node)) {
+    // A template WITH substitutions is a COMPOSITE, not a literal (victra #194 /
+    // codex): identical to a concatenation of its static spans and its ${...}
+    // pieces. Fold every piece; a single unresolvable substitution REFUSES, with
+    // the resolved spans carried in `partial` so a violation visible in a span
+    // still wins exit-1. `${token_hash}` from a parameter can revoke at runtime.
+    let text = node.head.text;
+    let refused = null;
+    for (const span of node.templateSpans) {
+      const sub = foldSqlArg(span.expression, sf, seen);
+      if (sub.kind === "literal") text += sub.text;
+      else {
+        if (!refused) refused = sub;
+        text += UNRESOLVED_GAP + (sub.partial || "") + UNRESOLVED_GAP; // gap: token can't cross, and a leading gap defeats the SELECT-prefix carve-out
+      }
+      text += span.literal.text;
+    }
+    if (refused) return { kind: "refuse", reason: refused.reason || "a template substitution does not resolve to a literal", partial: text };
+    return { kind: "literal", text, partial: text };
+  }
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const l = foldSqlArg(node.left, sf, seen);
+    const r = foldSqlArg(node.right, sf, seen);
+    if (l.kind === "literal" && r.kind === "literal") return { kind: "literal", text: l.text + r.text, partial: l.text + r.text }; // FOLD, no separator
+    const reason = (l.kind === "refuse" && l.reason) || (r.kind === "refuse" && r.reason) || "a concatenation operand does not resolve to a literal";
+    return { kind: "refuse", reason, partial: (l.partial || "") + UNRESOLVED_GAP + (r.partial || "") };
+  }
+  if (ts.isConditionalExpression(node)) {
+    const a = foldSqlArg(node.whenTrue, sf, seen);
+    const b = foldSqlArg(node.whenFalse, sf, seen);
+    const partial = (a.partial || "") + UNRESOLVED_GAP + (b.partial || "");
+    if (a.kind === "literal" && b.kind === "literal") return { kind: "literal", text: partial, partial };
+    return { kind: "refuse", reason: (a.kind === "refuse" && a.reason) || (b.kind === "refuse" && b.reason) || "a ternary branch does not resolve to a literal", partial };
+  }
+  if (ts.isCallExpression(node)) return dynRefuse("the SQL comes from a function-call result");
+  if (ts.isPropertyAccessExpression(node)) {
+    const c = constInitializerOf(node.expression, sf, seen);
+    if (c.refuse) return dynRefuse(c.refuse);
+    if (c.node && ts.isObjectLiteralExpression(c.node) && ts.isIdentifier(node.name)) {
+      const p = c.node.properties.find((pr) => ts.isPropertyAssignment(pr) && ts.isIdentifier(pr.name) && pr.name.text === node.name.text);
+      if (p && ts.isPropertyAssignment(p)) return foldSqlArg(p.initializer, sf, seen);
+    }
+    return dynRefuse("a property access that does not resolve to an in-file object literal");
+  }
+  if (ts.isElementAccessExpression(node)) {
+    const c = constInitializerOf(node.expression, sf, seen);
+    if (c.refuse) return dynRefuse(c.refuse);
+    if (c.node && ts.isArrayLiteralExpression(c.node) && node.argumentExpression && ts.isNumericLiteral(node.argumentExpression)) {
+      const el = c.node.elements[Number(node.argumentExpression.text)];
+      if (el) return foldSqlArg(el, sf, seen);
+    }
+    return dynRefuse("an element access that does not resolve to an in-file array literal");
+  }
+  if (ts.isIdentifier(node)) {
+    const decls = resolveName(node.text, node);
+    if (decls.length !== 1) return dynRefuse(`a dynamic or unresolvable reference (${node.text})`); // free / ambiguous
+    const decl = decls[0];
+    if (isImportBinding(decl)) return dynRefuse(`the value comes from a cross-module import (${node.text})`);
+    if (seen.has(decl)) return dynRefuse(`a reference cycle among bindings (${node.text})`);
+    // A destructured binding: resolve the WHOLE enclosing const container's
+    // initializer text (coarse, over-includes — the safe direction). The whole-body
+    // pass supplies the actual attribution; this keeps a benign destructure from
+    // being refused while the guard STILL flags a destructured mutation.
+    if (ts.isBindingElement(decl)) {
+      const info = moduleBindingInfo(decl);
+      if (info && info.kind === "const" && info.initNode) {
+        const t = info.initNode.getText(sf);
+        return { kind: "literal", text: t, partial: t };
+      }
+      return dynRefuse(`a reassignable or unresolvable destructured binding (${node.text})`);
+    }
+    const vd = enclosingVarDecl(decl);
+    if (!vd) return dynRefuse(`a dynamic value (parameter / function / class reference: ${node.text})`);
+    const isConst = vd.parent && ts.isVariableDeclarationList(vd.parent) && (vd.parent.flags & ts.NodeFlags.Const) !== 0;
+    seen.add(decl);
+    const res = isConst
+      ? vd.initializer
+        ? foldSqlArg(vd.initializer, sf, seen)
+        : dynRefuse(`an uninitialised const (${node.text})`)
+      : foldVarBinding(decl, sf, seen); // let/var: follow the WHOLE assignment set, fail-closed
+    seen.delete(decl);
+    return res;
+  }
+  return dynRefuse("an unrecognised expression shape");
+}
+
+/**
+ * Fold every prepare()/exec() SQL argument in this unit's own body. Returns one
+ * result per DB-call argument: { kind, text?, reason?, partial, line, argText,
+ * method }. `method` is "prepare" or "exec" — the caller uses it for the SQLite
+ * multi-statement carve-out (a prepare() SELECT cannot become a mutation; exec()
+ * can — verified, victra #194).
+ */
+export function foldDbCallArgs(bodyNode, sf) {
+  const results = [];
+  forEachOwnBodyNode(bodyNode, (node) => {
+    if (!ts.isCallExpression(node)) return;
+    const callee = node.expression;
+    if (
+      ts.isPropertyAccessExpression(callee) &&
+      ts.isIdentifier(callee.name) &&
+      DB_SQL_METHODS.has(callee.name.text) &&
+      node.arguments.length > 0
+    ) {
+      const arg = node.arguments[0];
+      const r = foldSqlArg(arg, sf, new Set());
+      results.push({
+        ...r,
+        method: callee.name.text,
+        line: sf.getLineAndCharacterOfPosition(arg.getStart(sf)).line + 1,
+        argText: arg.getText(sf),
       });
     }
-  }
-  return out;
+  });
+  return results;
 }
