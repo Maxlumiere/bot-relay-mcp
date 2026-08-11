@@ -453,7 +453,15 @@ describe("v2.12.0 — (7) idempotent resolution (no double-count, no drop)", () 
   // BEGIN IMMEDIATE tx + `resolved_at IS NULL` guard must make each id resolve
   // EXACTLY once — so the children's resolved_counts sum to N (no double-count)
   // and every message ends resolved (no drop), regardless of interleaving.
-  it("two OS processes ack-resolving the same set — each id resolved exactly once", async () => {
+  //
+  // #171 triage: SKIPPED under the wasm driver BY DESIGN, not oversight. This
+  // needs REAL cross-process file locking; the wasm driver (sql.js) is
+  // single-process only with NO file-level locking (docs/sqlite-wasm-driver.md
+  // "Single-process only"), so two processes mutate independent in-memory copies
+  // and double-count. That is the documented limitation, not a defect — native
+  // must still pass. Labelled so this reads as a recorded decision six months on.
+  const skipUnderWasm = process.env.RELAY_SQLITE_DRIVER === "wasm";
+  it.skipIf(skipUnderWasm)("two OS processes ack-resolving the same set — each id resolved exactly once", async () => {
     const N = 40;
     getDb();
     registerAgent("sender", "r", []);

@@ -82,6 +82,10 @@ The wasm driver operates on an in-memory copy of the database. Two processes sha
 - Single-terminal stdio: safe.
 - Multi-terminal stdio (multiple MCP processes sharing the same DB): **NOT SAFE. Use native.**
 
+### Backup and restore unavailable
+
+`relay backup` and `relay restore` do **not** work on the wasm driver. Two reasons: the snapshot step is `VACUUM INTO '<path>'`, and sql.js runs in an in-memory (Emscripten) virtual filesystem — it cannot write that snapshot to a real host path; and the archive's row-count + `PRAGMA integrity_check` probes open the snapshot with the **native** `better-sqlite3` binary, which is exactly what is absent in the npm-12 scripts-off scenario this driver exists to work around. Until a driver-aware snapshot lands, take a backup with the relay **stopped** by copying `~/.bot-relay/relay.db` directly (it is a standard SQLite file), or run the native driver for backup/restore operations.
+
 ### No WAL mode
 
 The wasm driver sets `PRAGMA journal_mode=DELETE` (SQLite's default rollback journal). WAL mode is meaningless for an in-memory database with write-back. At our scale, the performance difference is negligible.

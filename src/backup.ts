@@ -14,8 +14,13 @@
  *     daemon unless force=true.
  *
  * Design notes:
- *   - VACUUM INTO is the single snapshot mechanism for both native and wasm
- *     drivers — it's plain SQL and runs identically through CompatDatabase.
+ *   - VACUUM INTO is the snapshot mechanism — NATIVE DRIVER ONLY. The prior note
+ *     claimed it "runs identically" on the wasm driver; it does NOT, and was
+ *     never exercised under wasm (#171 triage). sql.js runs in an in-memory
+ *     Emscripten FS and cannot VACUUM INTO a host path, and the row-count +
+ *     integrity probes below open the snapshot with the native better-sqlite3
+ *     binary. So backup/restore are native-only pending a driver-aware rewrite —
+ *     see docs/sqlite-wasm-driver.md#backup-and-restore-unavailable.
  *   - Schema version is a hardcoded constant here; Phase 4c will retrofit it
  *     to a schema_info table.
  *   - Tar is invoked via child_process (no shell, arg-array) — avoids a new
@@ -155,9 +160,11 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   try {
     const snapshotDbPath = path.join(stagingDir, "relay.db");
 
-    // VACUUM INTO gives a consistent point-in-time copy on both native and
-    // wasm drivers. Use the shared connection rather than opening a second
-    // one — SQLite's own locking coordinates the snapshot.
+    // VACUUM INTO gives a consistent point-in-time copy — NATIVE DRIVER ONLY.
+    // sql.js (RELAY_SQLITE_DRIVER=wasm) runs in an in-memory Emscripten FS and
+    // throws "unable to open database" here (#171 triage). Uses the shared
+    // connection rather than opening a second one — SQLite's own locking
+    // coordinates the snapshot.
     getDb().exec(`VACUUM INTO '${snapshotDbPath.replace(/'/g, "''")}'`);
 
     // Row counts from the snapshot (not the live DB) so they match the archive.

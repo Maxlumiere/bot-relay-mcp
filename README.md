@@ -632,7 +632,7 @@ relay-backup --output /srv/backup.tgz     # custom path
 relay-restore ~/.bot-relay/backups/relay-backup-<iso>.tar.gz
 ```
 
-`relay-backup` produces a `tar.gz` of the live DB (via a consistent `VACUUM INTO` snapshot — safe while the daemon is running), the optional `config.json`, and a `manifest.json` with schema version and row counts. Works identically on the native `better-sqlite3` driver and the optional `sql.js` wasm driver.
+`relay-backup` produces a `tar.gz` of the live DB (via a consistent `VACUUM INTO` snapshot — safe while the daemon is running), the optional `config.json`, and a `manifest.json` with schema version and row counts. **Native driver only:** `relay backup`/`relay restore` are currently **unavailable on the `sql.js` wasm driver** — the `VACUUM INTO` snapshot can't write through sql.js's in-memory filesystem and the archive's integrity probe needs the native `better-sqlite3` binary ([details](./docs/sqlite-wasm-driver.md#backup-and-restore-unavailable)). To snapshot a wasm-driver relay, stop it and copy `~/.bot-relay/relay.db` (a standard SQLite file).
 
 `relay-restore` always safety-backs-up the current DB first (to `~/.bot-relay/backups/pre-restore-<iso>.tar.gz`). If that safety backup fails, the restore aborts untouched. It then refuses if the daemon appears to be running (`/health` probe, best-effort), refuses schema-version mismatches (higher = hard refuse, lower = `--force` overrides), runs `PRAGMA integrity_check` on the extracted DB, and finally atomic-swaps the new DB into place.
 
@@ -728,7 +728,7 @@ Both demonstrate: register, send/receive messages, accept + complete tasks, disc
 The relay uses SQLite for persistent state. Two drivers are available:
 
 - **`native` (default)** — `better-sqlite3`, a compiled C addon. Fast, supports WAL mode, multi-process safe. Requires a C++ compiler at `npm install` time.
-- **`wasm`** — `sql.js`, SQLite compiled to WebAssembly. Zero native compilation. Slightly slower writes (in-memory + write-back-to-file). **Single-process only** (not safe for multi-terminal stdio).
+- **`wasm`** — `sql.js`, SQLite compiled to WebAssembly. Zero native compilation. Slightly slower writes (in-memory + write-back-to-file). **Single-process only** (not safe for multi-terminal stdio). `relay backup`/`relay restore` are currently **native-only** on this driver ([why](./docs/sqlite-wasm-driver.md#backup-and-restore-unavailable)).
 
 Switch with one env var:
 
