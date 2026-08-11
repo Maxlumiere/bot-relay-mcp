@@ -570,6 +570,19 @@ auth_gen_guard() {
 }
 step "auth-gen guard (every token/auth mutator invalidates the cache)" auth_gen_guard || exit 1
 
+# --- 5c.1 #145 secret-register drift guard (redaction) ----------------------
+# A db.ts function that MINTS a token (generateToken) must call
+# registerPersistedSecret so the value is redacted from logs / snapshots. This
+# TS-AST walk (structural, one-hop import resolution) asserts it. Shared with the
+# vitest test (tests/v2-24-7-secret-register-guard.test.ts) that runs it on the
+# real src/db.ts AND proves it FAILS on a synthetic unregistered minter. Wired
+# here as a SECOND independent path (#61) so enforcement survives losing either —
+# renaming/.skip-ing the test can no longer silently disable it.
+secret_register_guard() {
+  node "$PROJECT_ROOT/scripts/secret-register-guard.mjs" "$PROJECT_ROOT/src/db.ts"
+}
+step "secret-register guard (every token minter registers for redaction)" secret_register_guard || exit 1
+
 # --- 5d. ADR-0002 agent-class taxonomy drift guard (v2.21.0) -----------------
 # src/agent-class.ts is the SSOT for the coordination-class taxonomy. This
 # TS-AST walk rejects a class-value literal branched-on (equality/switch) or a
