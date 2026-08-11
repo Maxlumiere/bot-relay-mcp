@@ -23,7 +23,7 @@
  * chain has exactly one call site (in applySchemaSetup), so a future re-duplication
  * reds here rather than drifting silently.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -32,9 +32,20 @@ import { fileURLToPath } from "node:url";
 const TEST_DIR = path.join(os.tmpdir(), "bot-relay-migchain-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(TEST_DIR, "relay.db");
 
+// #171 / codex isolation fix: PIN the driver to native BEFORE importing db.js.
+// This is a native-initializeDb() vs native-getDb()-fallback equivalence proof.
+// Without the pin, an ambient RELAY_SQLITE_DRIVER=wasm silently makes Path A
+// (initializeDb) run on WASM while Path B (getDb fallback) is ALWAYS native — the
+// test would then pass as a cross-driver comparison, for the wrong reason. WASM
+// schema coverage lives separately in tests/db-wasm.test.ts. Saved + restored
+// (afterAll) so this file never leaks the override to another suite in the worker.
+const PRIOR_SQLITE_DRIVER = process.env.RELAY_SQLITE_DRIVER;
+process.env.RELAY_SQLITE_DRIVER = "native";
+
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const { closeDb, getDb, initializeDb, CURRENT_SCHEMA_VERSION } = await import("../src/db.js");
+const { getActiveDriver } = await import("../src/sqlite-compat.js");
 
 interface SchemaShape {
   objects: Array<{ type: string; name: string; sql: string | null }>;
@@ -72,6 +83,11 @@ afterEach(() => {
   try { fs.rmSync(TEST_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
+afterAll(() => {
+  if (PRIOR_SQLITE_DRIVER === undefined) delete process.env.RELAY_SQLITE_DRIVER;
+  else process.env.RELAY_SQLITE_DRIVER = PRIOR_SQLITE_DRIVER;
+});
+
 describe("#171 migration-chain equivalence — initializeDb() vs getDb() native fallback", () => {
   it("both init paths produce an IDENTICAL schema (objects + columns) and schema_info.version", async () => {
     // Path A — the eager, driver-aware initializeDb().
@@ -79,6 +95,12 @@ describe("#171 migration-chain equivalence — initializeDb() vs getDb() native 
     process.env.RELAY_DB_PATH = pathA;
     closeDb();
     await initializeDb();
+    // PIN AND ASSERT: self-verify the native pin actually took, so this can never
+    // silently degrade into a cross-driver comparison under an ambient
+    // RELAY_SQLITE_DRIVER=wasm (codex's repro). getActiveDriver() reports the
+    // driver initializeDb() truly instantiated — pinning without asserting is
+    // half the job (the pin can silently fail to take).
+    expect(getActiveDriver()).toBe("native");
     const a = schemaShape(getDb()); // getDb() returns the already-initialized _db
     closeDb();
 
