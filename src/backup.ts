@@ -14,13 +14,11 @@
  *     daemon unless force=true.
  *
  * Design notes:
- *   - VACUUM INTO is the snapshot mechanism — NATIVE DRIVER ONLY. The prior note
- *     claimed it "runs identically" on the wasm driver; it does NOT, and was
- *     never exercised under wasm (#171 triage). sql.js runs in an in-memory
- *     Emscripten FS and cannot VACUUM INTO a host path, and the row-count +
- *     integrity probes below open the snapshot with the native better-sqlite3
- *     binary. So backup/restore are native-only pending a driver-aware rewrite —
- *     see docs/sqlite-wasm-driver.md#backup-and-restore-unavailable.
+ *   - The snapshot + the read-only probes are DRIVER-AWARE (#171): native uses
+ *     VACUUM INTO + better-sqlite3; wasm serializes the in-memory image
+ *     atomically (sql.js .export()) and opens probe files via sql.js. Both route
+ *     through sqlite-compat.snapshotToFile + openReadOnly, so this module holds
+ *     NO native dependency of its own. Backup/restore work on BOTH drivers.
  *   - Schema version is a hardcoded constant here; Phase 4c will retrofit it
  *     to a schema_info table.
  *   - Tar is invoked via child_process (no shell, arg-array) — avoids a new
@@ -36,9 +34,9 @@ import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
 import { withDeadline } from "./http-deadline.js";
-import Database from "better-sqlite3";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
+import { snapshotToFile, openReadOnly } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { ERROR_CODES } from "./error-codes.js";
@@ -160,15 +158,15 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   try {
     const snapshotDbPath = path.join(stagingDir, "relay.db");
 
-    // VACUUM INTO gives a consistent point-in-time copy — NATIVE DRIVER ONLY.
-    // sql.js (RELAY_SQLITE_DRIVER=wasm) runs in an in-memory Emscripten FS and
-    // throws "unable to open database" here (#171 triage). Uses the shared
-    // connection rather than opening a second one — SQLite's own locking
-    // coordinates the snapshot.
-    getDb().exec(`VACUUM INTO '${snapshotDbPath.replace(/'/g, "''")}'`);
+    // #171: driver-aware consistent snapshot. native → VACUUM INTO (online-safe
+    // while the daemon writes); wasm → atomic export() bytes (tear-proof — a
+    // plain copy of the write-back file could observe a half-written flush). See
+    // sqlite-compat.snapshotToFile. Works on BOTH drivers.
+    snapshotToFile(getDb(), snapshotDbPath);
 
     // Row counts from the snapshot (not the live DB) so they match the archive.
-    const snap = new Database(snapshotDbPath, { readonly: true });
+    // #171: openReadOnly is driver-aware (native better-sqlite3 / wasm sql.js).
+    const snap = await openReadOnly(snapshotDbPath);
     const row_counts: Record<string, number> = {};
     const tables = ["agents", "messages", "tasks", "channels", "channel_members", "channel_messages", "webhook_subscriptions", "webhook_delivery_log", "agent_capabilities", "audit_log"];
     for (const t of tables) {
@@ -335,7 +333,9 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     }
 
     // --- Step 5: integrity check the extracted DB ---
-    const probe = new Database(extractedDbPath, { readonly: true });
+    // #171: driver-aware read-only open (native better-sqlite3 / wasm sql.js) so
+    // restore's integrity check works on the wasm driver too.
+    const probe = await openReadOnly(extractedDbPath);
     try {
       const check = probe.prepare("PRAGMA integrity_check").get() as { integrity_check: string } | undefined;
       if (!check || check.integrity_check !== "ok") {

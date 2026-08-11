@@ -34,6 +34,12 @@ export interface CompatDatabase {
   pragma(source: string, options?: any): any;
   transaction<T>(fn: () => T): () => T;
   close(): void;
+  /**
+   * #171: atomic in-memory serialization of the DB image (wasm driver). Present
+   * on the wasm adapter; better-sqlite3 also exposes a compatible `serialize()`.
+   * Used by `snapshotToFile` for a tear-proof backup snapshot.
+   */
+  serialize?(): Uint8Array;
 }
 
 export type SqliteDriver = "native" | "wasm";
@@ -222,6 +228,16 @@ class WasmDatabase implements CompatDatabase {
     this.db.close();
   }
 
+  /**
+   * #171: atomic in-memory serialization — the whole DB image as bytes, produced
+   * synchronously from memory with no filesystem touch. Tear-proof by
+   * construction (unlike copying the write-back file, whose flush is a bare
+   * non-atomic fs.writeFileSync). Backs `snapshotToFile` on the wasm driver.
+   */
+  serialize(): Uint8Array {
+    return this.db.export();
+  }
+
   // v1.11.1: flush propagates REAL errors (fail-closed for disk-write
   // failures like ENOSPC). Emscripten internal FS errors from db.export()
   // are caught and retried — sql.js's wasm layer sometimes throws ErrnoError
@@ -277,6 +293,62 @@ async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
   }
 
   return new WasmDatabase(rawDb, dbPath);
+}
+
+// --- #171: driver-aware DB-file operations for backup/restore ---
+
+/**
+ * Write a consistent point-in-time snapshot of `db` to `destPath`, driver-aware.
+ * - native: `VACUUM INTO` — a live-consistent online copy, safe even while the
+ *   daemon writes.
+ * - wasm: serialize the in-memory image atomically (`serialize()` → sql.js
+ *   `.export()`) and write the bytes. TEAR-PROOF regardless of caller. A plain
+ *   copy of the write-back file would NOT be: the wasm flush is a bare
+ *   `fs.writeFileSync` (no temp-and-rename, no lock), so a concurrent reader can
+ *   observe it half-written — and a torn backup fails silently at restore.
+ */
+export function snapshotToFile(db: CompatDatabase, destPath: string): void {
+  const dir = path.dirname(destPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (getDriverType() === "wasm") {
+    if (typeof db.serialize !== "function") {
+      throw new Error("snapshotToFile: wasm driver did not expose serialize()");
+    }
+    fs.writeFileSync(destPath, Buffer.from(db.serialize()));
+  } else {
+    db.exec(`VACUUM INTO '${destPath.replace(/'/g, "''")}'`);
+  }
+}
+
+/**
+ * Open an EXISTING SQLite file read-only, driver-aware. Backs the backup manifest
+ * row-count read and the restore `PRAGMA integrity_check` — so both work under
+ * the wasm driver, where the native better-sqlite3 binary is absent (the exact
+ * npm-12 scripts-off scenario the wasm driver works around).
+ * - native: better-sqlite3 `{ readonly: true }`.
+ * - wasm: load the file bytes into a fresh sql.js instance. (Probe-only; close()
+ *   re-writes the identical bytes, which is a harmless no-op on a temp file.)
+ */
+export async function openReadOnly(dbPath: string): Promise<CompatDatabase> {
+  if (!fs.existsSync(dbPath)) {
+    throw new Error(`openReadOnly: file not found at '${dbPath}'`);
+  }
+  if (getDriverType() === "wasm") {
+    let initSqlJs: any;
+    try {
+      const mod = await import("sql.js");
+      initSqlJs = mod.default;
+    } catch {
+      throw new Error(
+        "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
+        "Install it with: npm install sql.js",
+      );
+    }
+    const SQL = await initSqlJs();
+    return new WasmDatabase(new SQL.Database(fs.readFileSync(dbPath)), dbPath);
+  }
+  const { default: Database } = await import("better-sqlite3");
+  return new Database(dbPath, { readonly: true }) as unknown as CompatDatabase;
 }
 
 // --- Public API ---
