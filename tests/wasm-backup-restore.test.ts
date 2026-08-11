@@ -41,7 +41,7 @@ delete process.env.RELAY_AGENT_CAPABILITIES;
 
 const PRIOR_DRIVER = process.env.RELAY_SQLITE_DRIVER;
 
-const { closeDb, initializeDb, registerAgent, sendMessage, getAgents, getMessages } =
+const { closeDb, initializeDb, getDb, registerAgent, sendMessage, getAgents, getMessages } =
   await import("../src/db.js");
 const { getActiveDriver } = await import("../src/sqlite-compat.js");
 const { exportRelayState, importRelayState } = await import("../src/backup.js");
@@ -155,6 +155,40 @@ describe("#190 requested-vs-actual driver seam — dispatch follows the LIVE con
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     const res = await exportRelayState();
     expect(fs.existsSync(res.archive_path), "native-initialized export must succeed despite the wasm env").toBe(true);
+    closeDb();
+  });
+});
+
+describe("#190 r2 — tracker completeness (sync fallback) + restore ordering (no manufacture)", () => {
+  it("FINDING 1: a DB reached via the SYNCHRONOUS getDb() fallback still exports (the tracker now sees that path)", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    closeDb();
+    // Reach the DB via getDb()'s synchronous native fallback — it sets db.ts _db
+    // directly and bypasses initializeDb, so pre-#190-r2 getActiveDriver() stayed
+    // null and export threw "no active SQLite driver". The fallback now registers
+    // native with the tracker.
+    getDb();
+    expect(getActiveDriver(), "the tracker must see the sync fallback path").toBe("native");
+    registerAgent("sync-seed", "role", []);
+    sendMessage("sync-seed", "sync-seed", "via-sync-getdb", "normal");
+    const res = await exportRelayState();
+    expect(fs.existsSync(res.archive_path)).toBe(true);
+    const { agents } = await restoreAndRead(res.archive_path, "native");
+    expect(agents).toContain("sync-seed");
+    closeDb();
+  });
+
+  it("FINDING 2: a corrupt archive on a FRESH machine (no DB) fails WITHOUT manufacturing a database", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    closeDb();
+    const dbPath = process.env.RELAY_DB_PATH as string;
+    expect(fs.existsSync(dbPath), "precondition: fresh machine, no DB yet").toBe(false);
+    const badArchive = path.join(TEST_ROOT, "corrupt.tar.gz");
+    fs.writeFileSync(badArchive, "this is not a valid relay archive");
+    await expect(importRelayState(badArchive, { force: true })).rejects.toThrow();
+    // THE SAFETY PROPERTY: validation failed before anything was created. Pre-fix,
+    // the eager init created a blank DB before the archive was ever validated.
+    expect(fs.existsSync(dbPath), "a failed restore must not manufacture a DB").toBe(false);
     closeDb();
   });
 });

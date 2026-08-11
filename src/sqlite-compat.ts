@@ -316,20 +316,16 @@ async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
  *   `fs.writeFileSync` (no temp-and-rename, no lock), so a concurrent reader can
  *   observe it half-written — and a torn backup fails silently at restore.
  *
- * `driver` MUST be the ACTUAL instantiated driver (getActiveDriver()), NOT
- * getDriverType() (the requested RELAY_SQLITE_DRIVER env). The env is mutable and
- * can diverge from the live connection after init — branching on it would take
- * the native VACUUM INTO path against a live WasmDatabase (the #172 actual-vs-
- * requested class). Callers capture the active driver after initializeDb() and
- * pass it in.
+ * Branches on the ACTUAL db object handed in (`db instanceof WasmDatabase`), the
+ * truest read-the-state: no env, no global, no captured driver that could go
+ * stale — just the live connection. This also sidesteps the getActiveDriver()
+ * gap where db.getDb()'s synchronous native fallback sets db.ts `_db` directly
+ * and never registers a driver (#190 r2): the object itself is unambiguous.
  */
-export function snapshotToFile(db: CompatDatabase, destPath: string, driver: SqliteDriver): void {
+export function snapshotToFile(db: CompatDatabase, destPath: string): void {
   const dir = path.dirname(destPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (driver === "wasm") {
-    if (typeof db.serialize !== "function") {
-      throw new Error("snapshotToFile: wasm driver did not expose serialize()");
-    }
+  if (db instanceof WasmDatabase) {
     fs.writeFileSync(destPath, Buffer.from(db.serialize()));
   } else {
     db.exec(`VACUUM INTO '${destPath.replace(/'/g, "''")}'`);
@@ -345,13 +341,18 @@ export function snapshotToFile(db: CompatDatabase, destPath: string, driver: Sql
  * - wasm: load the file bytes into a fresh sql.js instance. (Probe-only; close()
  *   re-writes the identical bytes, which is a harmless no-op on a temp file.)
  *
- * `driver` MUST be the ACTUAL instantiated driver (getActiveDriver()), not the
- * requested env — see snapshotToFile. Callers capture it after initializeDb().
+ * Resolves the driver from ACTUAL state: getActiveDriver() when a live connection
+ * exists (so a mutated RELAY_SQLITE_DRIVER env can't mis-select the driver, #190),
+ * falling back to the configured driver ONLY when nothing is initialized (a
+ * first-ever restore has no connection). Opens the GIVEN file; it does NOT create
+ * or init the main DB — so validating a corrupt archive manufactures no state
+ * (#190 r2: on the restore path the ordering is the safety property).
  */
-export async function openReadOnly(dbPath: string, driver: SqliteDriver): Promise<CompatDatabase> {
+export async function openReadOnly(dbPath: string): Promise<CompatDatabase> {
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
+  const driver = getActiveDriver() ?? getDriverType();
   if (driver === "wasm") {
     let initSqlJs: any;
     try {
@@ -415,6 +416,19 @@ export function getInitializedDb(): CompatDatabase | null {
 
 export function getActiveDriver(): SqliteDriver | null {
   return _driverUsed;
+}
+
+/**
+ * #190 r2 — TRACKER COMPLETENESS. getActiveDriver() is only trustworthy if EVERY
+ * connection-creating path registers with it. db.getDb()'s SYNCHRONOUS native
+ * fallback sets db.ts `_db` directly and bypasses initializeDb (a sync accessor
+ * can't await the wasm load), so it never reached _driverUsed — leaving the
+ * tracker blind to one of its own paths (the same one-concept-many-creation-
+ * sites shape as the pending predicate). That path is native by construction, so
+ * it registers "native" here. Idempotent: a real driver already recorded wins.
+ */
+export function registerNativeFallbackDriver(): void {
+  if (_driverUsed === null) _driverUsed = "native";
 }
 
 /**
