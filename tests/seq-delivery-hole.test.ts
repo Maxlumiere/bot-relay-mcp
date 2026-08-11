@@ -37,7 +37,7 @@ delete process.env.RELAY_AGENT_CAPABILITIES;
 const { registerAgent, sendMessage, getMessages, getDb, closeDb } = await import(
   "../src/db.js"
 );
-const { handleGetMessagesSummary } = await import("../src/tools/messaging.js");
+const { handleGetMessagesSummary, handleGetMessages } = await import("../src/tools/messaging.js");
 const { sampleGetMessagesConsistency, _resetProbeCounterForTests, _probeDivergenceCountForTests } =
   await import("../src/transport/consistency-probe.js");
 
@@ -217,5 +217,28 @@ describe("#198 — consistency probe on the shared helper cannot go blind", () =
       .prepare("SELECT id FROM messages WHERE to_agent = 'recipient' AND resolved_at IS NULL AND read_by_session IS NULL AND created_at >= ?")
       .all(since) as Array<{ id: string }>).map((r) => r.id);
     expect(stale).not.toContain("aged-unseen");
+  });
+});
+
+/**
+ * #198 — the get_messages `since` HINT's firing condition observably narrowed: the
+ * hint fires only when a pending drain returns 0. Post-#198 an aged never-observed
+ * message is RETURNED (count > 0), so the hint no longer fires for it — which is
+ * why the tool description + hint text no longer claim `since` hides "older pending
+ * messages" in general (codex #199 doc hold). It hides only already-SEEN history.
+ */
+describe("#198 — the `since` hint no longer claims to hide never-observed mail", () => {
+  it("an aged never-observed message is RETURNED by handleGetMessages(since='15m'); no hint fires (count > 0)", () => {
+    registerAgent("sender", "role", []);
+    registerAgent("recipient", "role", []);
+    getDb().prepare("UPDATE agents SET session_id = 'sess-1' WHERE name = 'recipient'").run();
+    seedNeverObserved("recipient", "aged-unseen", 1); // 1h old > 15m window, never observed
+
+    const res = JSON.parse(
+      handleGetMessages({ agent_name: "recipient", status: "pending", limit: 100, since: "15m" } as Parameters<typeof handleGetMessages>[0]).content[0].text
+    );
+    const ids = (res.messages ?? []).map((m: { id: string }) => m.id);
+    expect(ids).toContain("aged-unseen"); // never-observed mail is delivered, not hidden
+    expect(res.hint).toBeUndefined(); // count > 0 → the "hides older pending" hint does not fire
   });
 });
