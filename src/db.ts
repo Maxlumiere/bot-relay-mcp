@@ -4899,6 +4899,21 @@ export function getMessages(
   // src/db.ts:3037: same `AND created_at >= ?` clause stitched into each
   // branch.
   const sinceClause = sinceIso ? "AND created_at >= ?" : "";
+  // #198 — the PENDING drain must never silently drop NEVER-OBSERVED mail that
+  // has aged past `since`. seq is assigned only on first observation (the seq
+  // block below), and this SELECT is what performs that observation — so a
+  // message older than the window that was never drained is filtered here, never
+  // returned, and therefore never seq'd: permanent silent non-delivery via the
+  // default path (default since='24h'), recoverable only by an explicit
+  // since='all'. Gating the window on ALREADY-OBSERVED rows only —
+  // `(seq IS NULL OR created_at >= ?)` — keeps `since` doing its real job
+  // (trimming already-seen backlog on name reuse) while guaranteeing undelivered
+  // mail is always eligible. Same single bound param. Verified via EXPLAIN QUERY
+  // PLAN that the access path is UNCHANGED: the `to_agent = ?` equality still
+  // drives the index seek (idx_messages_to_seq), so the OR cannot force a table
+  // scan. Pending branch ONLY — the history reads (all/resolved/read) legitimately
+  // window observed mail.
+  const pendingSinceClause = sinceIso ? "AND (seq IS NULL OR created_at >= ?)" : "";
   // v2.10 — lane filter. Fixed clauses (no param binding, no injection
   // surface) so an orchestrator can drain the action lane (direct,
   // routed_capability IS NULL) separately from the FYI lane (capability,
@@ -4964,7 +4979,7 @@ export function getMessages(
     rows = db.prepare(
       `SELECT * FROM messages WHERE to_agent = ?
          AND ${pc.sql}
-         ${sinceClause}
+         ${pendingSinceClause}
          ${laneClause}
          ${priorityOrder}`
     ).all(...params) as MessageRecord[];

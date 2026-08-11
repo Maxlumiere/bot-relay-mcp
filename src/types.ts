@@ -282,9 +282,12 @@ const GetMessagesSinceField = z
   .optional()
   .default("24h")
   .describe(
-    "v2.1.6: time-window filter. Accepts duration ('15m'|'1h'|'24h'|'3d'), " +
-      "ISO8601 timestamp, 'session_start' sentinel, or 'all'/null to disable. " +
-      "Default '24h' trims stale backlog when an agent name is reused."
+    "v2.1.6: time-window filter over ALREADY-OBSERVED history. Accepts duration " +
+      "('15m'|'1h'|'24h'|'3d'), ISO8601 timestamp, 'session_start' sentinel, or " +
+      "'all'/null to disable. Default '24h' trims stale backlog when an agent name " +
+      "is reused. #198: this bound applies ONLY to mail this recipient has already " +
+      "seen — a PENDING drain ALWAYS returns never-observed (undelivered) mail " +
+      "regardless of `since`, so undelivered mail can never age out of reach."
   );
 
 /**
