@@ -237,13 +237,15 @@ function classifyUnits(sf) {
       else if (a.kind === "refuse") {
         parts.push(a.partial || ""); // the runs that DID resolve, so a visible violation still shows
         // SUB-DECISION 1 (victra #194, SQLite-verified): a prepare() argument that
-        // provably STARTS as a read (SELECT/WITH) cannot become a validity mutation
-        // — SQLite rejects a second statement appended by any substitution
-        // (prepare("SELECT …; UPDATE …") THROWS), so a resolved-read prepare arg with
-        // an unresolvable piece does NOT refuse. An empty/non-read resolved prefix
-        // (a bare parameter) proves nothing → refuse. exec() runs multiple
-        // statements (exec("SELECT 1; UPDATE agents SET token_hash=NULL") executes
-        // the UPDATE) → an exec() arg with any unresolvable piece REFUSES.
+        // provably STARTS as a read (SELECT ONLY — NOT `WITH`, a CTE can prefix a
+        // mutation as one statement) cannot become a validity mutation, because
+        // SQLite rejects a second statement appended by any substitution
+        // (prepare("SELECT …; UPDATE …") THROWS), so a resolved-SELECT prepare arg
+        // with an unresolvable piece does NOT refuse. An empty/non-SELECT resolved
+        // prefix (a bare parameter, or `WITH …`) proves nothing → refuse. exec()
+        // runs multiple statements (exec("SELECT 1; UPDATE agents SET token_hash=
+        // NULL") executes the UPDATE) → an exec() arg with any unresolvable piece
+        // REFUSES. Prefix test: isProvablyRead (SELECT-only, provably at the start).
         if (!firstRefuse && (a.method === "exec" || !isProvablyRead(a.partial || ""))) firstRefuse = a;
       }
     }
