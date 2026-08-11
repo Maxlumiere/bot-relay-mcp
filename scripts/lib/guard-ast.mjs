@@ -968,6 +968,13 @@ export function resolveUnitSqlText(bodyNode, sf, softHitOut) {
 // violation provable from a resolved operand outranks the refuse (PROOF BEATS
 // UNCERTAINTY BEATS SILENCE): an unresolvable statement is never silently clean.
 const DB_SQL_METHODS = new Set(["prepare", "exec"]); // better-sqlite3 SQL-taking calls (.run/.get/.all take params, not SQL)
+// A non-whitespace marker standing in for an UNRESOLVABLE piece inside a `partial`.
+// Two jobs (#194): (1) it survives String.trim(), so a substitution BEFORE the SELECT
+// token — `${x} SELECT …` — leaves a leading marker and the prepare() read carve-out
+// is NOT established (victra: the prefix must be provably the start); (2) a matched
+// SQL token cannot cross it, so a concat/interpolation cannot forge `UPDATE agents
+// SET token_hash` across an unresolved gap. It is neither whitespace nor a word char.
+const UNRESOLVED_GAP = String.fromCharCode(1); // 0x01: non-whitespace, non-word
 
 function skipParens(n) {
   while (n && ts.isParenthesizedExpression(n)) n = n.expression;
@@ -1081,7 +1088,7 @@ function foldSqlArg(node, sf, seen) {
       if (sub.kind === "literal") text += sub.text;
       else {
         if (!refused) refused = sub;
-        text += " " + (sub.partial || "") + " "; // gap: a matched token cannot cross an unresolved substitution
+        text += UNRESOLVED_GAP + (sub.partial || "") + UNRESOLVED_GAP; // gap: token can't cross, and a leading gap defeats the SELECT-prefix carve-out
       }
       text += span.literal.text;
     }
@@ -1093,12 +1100,12 @@ function foldSqlArg(node, sf, seen) {
     const r = foldSqlArg(node.right, sf, seen);
     if (l.kind === "literal" && r.kind === "literal") return { kind: "literal", text: l.text + r.text, partial: l.text + r.text }; // FOLD, no separator
     const reason = (l.kind === "refuse" && l.reason) || (r.kind === "refuse" && r.reason) || "a concatenation operand does not resolve to a literal";
-    return { kind: "refuse", reason, partial: (l.partial || "") + " " + (r.partial || "") };
+    return { kind: "refuse", reason, partial: (l.partial || "") + UNRESOLVED_GAP + (r.partial || "") };
   }
   if (ts.isConditionalExpression(node)) {
     const a = foldSqlArg(node.whenTrue, sf, seen);
     const b = foldSqlArg(node.whenFalse, sf, seen);
-    const partial = (a.partial || "") + " " + (b.partial || "");
+    const partial = (a.partial || "") + UNRESOLVED_GAP + (b.partial || "");
     if (a.kind === "literal" && b.kind === "literal") return { kind: "literal", text: partial, partial };
     return { kind: "refuse", reason: (a.kind === "refuse" && a.reason) || (b.kind === "refuse" && b.reason) || "a ternary branch does not resolve to a literal", partial };
   }

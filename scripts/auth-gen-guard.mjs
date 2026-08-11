@@ -119,19 +119,31 @@ function hasValidityChangingMutation(bodyText) {
 
 /**
  * Does this resolved text PROVE it is a read statement — does its resolved prefix
- * start with SELECT or WITH? Used for the prepare()-argument carve-out (#194
- * sub-decision 1, SQLite-verified): SQLite forbids a substitution from appending a
- * SECOND statement to a prepared SELECT (`prepare("SELECT …; UPDATE …")` THROWS),
- * so a prepare() argument that provably STARTS as a read cannot become an agents
- * mutation and does not refuse on an unresolvable piece. An argument whose resolved
- * text is EMPTY (a bare parameter / free name) or does not start with a read
- * keyword proves NOTHING and still REFUSES (codex #194 — never silently clean).
- * exec() gets NO carve-out (`exec("SELECT 1; UPDATE agents SET token_hash=NULL")`
- * RUNS the UPDATE), so an exec() argument with any unresolvable piece refuses.
+ * start with SELECT? DEFAULT-DENY, the same principle the call side uses: prove it
+ * is SAFE, do not fail-to-prove it is dangerous. Used for the prepare()-argument
+ * carve-out (#194 sub-decision 1, SQLite-verified): SQLite forbids a substitution
+ * from appending a SECOND statement to a prepared SELECT (`prepare("SELECT …;
+ * UPDATE …")` THROWS), and a single SELECT statement cannot mutate — so a prepare()
+ * argument that provably STARTS as a SELECT cannot become an agents mutation and
+ * does not refuse on an unresolvable clause.
+ *
+ * ⚠ ONLY `SELECT`, NOT `WITH` (codex #194, verified): a CTE can PREFIX a DML
+ * statement as one statement — `WITH c AS (SELECT 1) UPDATE agents SET token_hash
+ * = NULL` prepares AND executes and mutates validity. `WITH` therefore proves
+ * nothing about read-only; accepting it by prefix was a hole. An argument whose
+ * resolved prefix is EMPTY (a bare parameter), or is `WITH`/`UPDATE`/`DELETE`/
+ * anything but `SELECT`, proves nothing → it still REFUSES (never silently clean).
+ * exec() gets NO carve-out at all (`exec("SELECT 1; UPDATE agents …")` RUNS the
+ * UPDATE), so an exec() argument with any unresolvable piece refuses.
+ *
+ * ⚠ A CARVE-OUT IS AN ALLOWLIST, AND AN ALLOWLIST OF N PREFIXES IS N SEPARATE
+ * CLAIMS about the SQLite engine — each must be independently VERIFIED, not
+ * pattern-matched by resemblance to a safe one. `WITH` was added because it
+ * "looks like a read" and was a hole. If a future prefix is proposed, the bar is
+ * an executed proof that it cannot carry a mutation, not that it usually does not.
  */
 function isProvablyRead(text) {
-  const compact = text.replace(/\s+/g, " ").trim();
-  return /^SELECT\b/i.test(compact) || /^WITH\b/i.test(compact);
+  return /^SELECT\b/i.test(text.replace(/\s+/g, " ").trim());
 }
 
 /**

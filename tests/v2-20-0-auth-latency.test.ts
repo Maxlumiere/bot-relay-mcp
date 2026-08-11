@@ -753,4 +753,18 @@ describe("ADR-0003 G — fold + scoped refusal at prepare()/exec() (#59, issue #
     const src = `${H}export function m(clause: string, n: string): void { getDb().exec(\`SELECT * FROM messages WHERE x = ? \${clause}\`); }`;
     expect(refuses(src)).toContain("m");
   });
+  // codex #194 regression — the carve-out prefix is SELECT ONLY. A CTE can prefix a
+  // DML statement as ONE statement, so `WITH … UPDATE agents SET token_hash = NULL`
+  // prepares AND mutates (SQLite-verified). WITH proves nothing about read-only.
+  it("REFUSE: a WITH-prefixed prepare() with a dynamic tail (WITH is not read-only)", () => {
+    const src = `${H}export function m(suffix: string): void { getDb().prepare(\`WITH c AS (SELECT 1) \${suffix}\`).run(); }`;
+    expect(refuses(src)).toContain("m");
+  });
+  // victra #194 — the SELECT prefix must be PROVABLY the start: an unresolvable
+  // substitution BEFORE the SELECT token means the read prefix is not established,
+  // so `${x} SELECT …` REFUSES (else it walks through the same door).
+  it("REFUSE: a dynamic substitution BEFORE the SELECT token defeats the carve-out", () => {
+    const src = `${H}export function m(x: string, n: string): void { getDb().prepare(\`\${x} SELECT * FROM t WHERE n = ?\`).run(n); }`;
+    expect(refuses(src)).toContain("m");
+  });
 });
