@@ -4158,9 +4158,14 @@ export interface HealthSnapshot {
 export function getHealthSnapshot(): HealthSnapshot {
   const db = getDb();
   const agentCount = (db.prepare("SELECT COUNT(*) AS c FROM agents").get() as { c: number }).c;
+  // #53 — route through the canonical session-agnostic backlog predicate.
+  // Pre-#53 this was a bare `read_by_session IS NULL` that omitted the
+  // `resolved_at IS NULL` guard, so an already-resolved (acked) message still
+  // counted as pending backlog. pendingGlobalClause is the SSOT reduction.
+  const pendingBacklog = pendingGlobalClause();
   const messageCountPending = (db.prepare(
-    "SELECT COUNT(*) AS c FROM messages WHERE read_by_session IS NULL"
-  ).get() as { c: number }).c;
+    `SELECT COUNT(*) AS c FROM messages WHERE ${pendingBacklog.sql}`
+  ).get(...pendingBacklog.params) as { c: number }).c;
   const taskCountActive = (db.prepare(
     "SELECT COUNT(*) AS c FROM tasks WHERE status IN ('posted','accepted')"
   ).get() as { c: number }).c;
@@ -4717,6 +4722,60 @@ export function getOrCreateMailbox(
 }
 
 /**
+ * #53 (mustang [DEFECT]) — the CANONICAL "pending" predicate: the single source
+ * of truth every mailbox surface derives its pending/unread set from.
+ *
+ * Before this, four surfaces each had their OWN definition of "pending":
+ *   - peek_inbox_version wake signal: `seq IS NULL`
+ *   - get_messages(pending) drain:    per-session `read_by_session`
+ *   - health_check count:             global `read_by_session IS NULL`
+ *   - the SessionStart hook delivery:  the binary `status` column
+ * That predicate sprawl is exactly what let the wake signal and the drain queue
+ * disagree — a wake reported N unread while `get_messages` pending returned 0,
+ * because "unread" (seq) and "pending" (read_by_session) are different planes,
+ * and a non-consuming browse (or a premature drain) silently zeroed one while
+ * the other still held mail. One core, two forms:
+ *
+ *   PENDING_NOT_RESOLVED_SQL — `resolved_at IS NULL`. A resolved (acked) message
+ *     is NEVER pending, on ANY surface. (Pre-#53 the peek + health counts both
+ *     omitted this — a resolved message still counted as unread backlog.)
+ *
+ *   pendingForSessionClause(s) — NOT_RESOLVED and not read by session `s`. The
+ *     per-session action queue: re-pends a prior session's unfinished mail to a
+ *     fresh terminal (v2.0 #6 handover), hides what THIS session already read.
+ *     Used by get_messages(pending), the peek wake signal, and the hook.
+ *   pendingGlobalClause() — NOT_RESOLVED and read by NO session. The session-
+ *     agnostic backlog used by health_check's system-wide count.
+ *
+ * SCOPE (#53 / architect-gated Option 1): this unifies the DEFINITION of pending
+ * so wake and drain cannot disagree. It deliberately does NOT change WHEN a
+ * message is marked read (still on the get_messages fetch) — decoupling fetch
+ * from consume is a behavioural contract change on a published package, deferred
+ * to the architect. No tool schema changes here.
+ */
+export const PENDING_NOT_RESOLVED_SQL = "resolved_at IS NULL";
+
+/** Canonical per-session pending predicate (SSOT). `session` may be "" (no
+ *  session) — then `read_by_session != ''` is only true for a genuinely-read
+ *  row, so the clause reduces to "unresolved and (unread-by-anyone or read-by-
+ *  some-other-session)", matching get_messages' historical `?? ""` behaviour. */
+export function pendingForSessionClause(session: string): { sql: string; params: string[] } {
+  return {
+    sql: `${PENDING_NOT_RESOLVED_SQL} AND (read_by_session IS NULL OR read_by_session != ?)`,
+    params: [session],
+  };
+}
+
+/** Canonical session-agnostic backlog predicate (SSOT): unresolved AND not read
+ *  by ANY session. Used where there is no single caller session (health_check). */
+export function pendingGlobalClause(): { sql: string; params: string[] } {
+  return {
+    sql: `${PENDING_NOT_RESOLVED_SQL} AND read_by_session IS NULL`,
+    params: [],
+  };
+}
+
+/**
  * v2.3.0 Part C — peek helper backing the `peek_inbox_version` MCP tool.
  * Pure observation — no mutation. Returns the current mailbox shape +
  * an observed count of messages addressed to the agent.
@@ -4733,16 +4792,22 @@ export function peekMailboxVersion(agentName: string): {
   const count = (db
     .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ?")
     .get(agentName) as { c: number }).c;
-  // v2.3.0 Codex HIGH #2 patch — total_unread_count is the field clients
-  // watch for new-mail detection. `last_seq` only advances when the
-  // recipient CALLS get_messages (seq is assigned on first observation
-  // inside the get_messages drain path at :3181-3199 — NOT on send,
-  // NOT on delivery), so last_seq is stale for pre-first-observation
-  // new mail. `seq IS NULL` is the authoritative "not-yet-observed"
-  // signal + bumps on every sendMessage.
+  // #53 — total_unread_count is THE wake signal (src/cli/watch.ts diffs it to
+  // decide "does this agent have new mail?"). It MUST count the SAME set
+  // get_messages(pending) would drain for this agent's CURRENT session, or the
+  // wake and the drain disagree (mustang [DEFECT]: wake said 1, pending said 0).
+  // Pre-#53 this counted `seq IS NULL` — a DIFFERENT plane that any drain OR a
+  // non-consuming browse silently zeroed (seq is stamped on first observation)
+  // while the mail was still pending for the session that had not seen it. Route
+  // through the canonical pendingForSessionClause, resolving the agent's session
+  // the exact way get_messages does (agents.session_id).
+  const agentRow = db
+    .prepare("SELECT session_id FROM agents WHERE name = ?")
+    .get(agentName) as { session_id: string | null } | undefined;
+  const pc = pendingForSessionClause(agentRow?.session_id ?? "");
   const unread = (db
-    .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND seq IS NULL")
-    .get(agentName) as { c: number }).c;
+    .prepare(`SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND ${pc.sql}`)
+    .get(agentName, ...pc.params) as { c: number }).c;
   return {
     mailbox_id: m.mailbox_id,
     epoch: m.epoch,
@@ -4867,13 +4932,17 @@ export function getMessages(
     // HANDLED mail out of the action queue permanently, killing the
     // cross-session re-flood for resolved items without touching the
     // session-scoped read semantics.
-    const params: unknown[] = [agentName, currentSession ?? ""];
+    // #53 — canonical per-session pending predicate (SSOT). The peek wake
+    // signal and the SessionStart hook derive from this SAME clause, so the
+    // count you wake on and the queue you drain cannot disagree. Logically
+    // identical to the prior inline `(read_by_session …) AND resolved_at IS NULL`.
+    const pc = pendingForSessionClause(currentSession ?? "");
+    const params: unknown[] = [agentName, ...pc.params];
     if (sinceIso) params.push(sinceIso);
     params.push(limit);
     rows = db.prepare(
       `SELECT * FROM messages WHERE to_agent = ?
-         AND (read_by_session IS NULL OR read_by_session != ?)
-         AND resolved_at IS NULL
+         AND ${pc.sql}
          ${sinceClause}
          ${laneClause}
          ${priorityOrder}`

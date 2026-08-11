@@ -21,7 +21,7 @@
  *
  * Observation-only. No production behavior depends on the probe.
  */
-import { getDb } from "../db.js";
+import { getDb, pendingGlobalClause } from "../db.js";
 import { log } from "../logger.js";
 import type { MessageRecord } from "../types.js";
 
@@ -86,24 +86,27 @@ export function sampleGetMessagesConsistency(args: {
   if (args.status !== "pending") return;
   try {
     const db = getDb();
-    // SUPERSET query: all rows addressed to this agent where the row
-    // itself still looks pending (status column or null read_by_session).
-    // Intentionally ignores session-partition — the MCP path's session
-    // filter can legitimately hide rows read by THIS session, but it
-    // should NOT hide rows that no session has read. If SQL sees any
-    // such rows that MCP dropped, that's a v2.2.1-style divergence.
+    // SUPERSET query: rows that MUST appear in ANY session's pending drain —
+    // #53 derives this from the CANONICAL pendingGlobalClause (unresolved AND
+    // read_by_session IS NULL). A row unread by EVERY session and not resolved
+    // is pending for everyone, so the MCP path can never legitimately hide it;
+    // its absence from the result is a true cross-surface divergence (the class
+    // that shipped in v2.2.1). This replaces the pre-#53 ad-hoc
+    // `(read_by_session IS NULL OR status='pending')` and routes the probe
+    // through the same single source of truth every mailbox surface now shares.
     //
     // The `since` clause MIRRORS the MCP path's filter so the probe
     // doesn't flag rows the caller legitimately asked to exclude.
+    const pc = pendingGlobalClause();
     const sinceClause = args.sinceIso ? "AND created_at >= ?" : "";
-    const params: unknown[] = [args.agentName];
+    const params: unknown[] = [args.agentName, ...pc.params];
     if (args.sinceIso) params.push(args.sinceIso);
     params.push(Math.max(args.limit, 100));
     const sqlRows = db
       .prepare(
         "SELECT id FROM messages " +
           "WHERE to_agent = ? " +
-          "  AND (read_by_session IS NULL OR status = 'pending') " +
+          "  AND " + pc.sql + " " +
           "  " + sinceClause + " " +
           "LIMIT ?",
       )

@@ -115,7 +115,12 @@ function initMinimalDb(dbPath: string): void {
       priority TEXT DEFAULT 'normal',
       status TEXT DEFAULT 'pending',
       created_at TEXT,
-      resolved_at TEXT
+      resolved_at TEXT,
+      -- #53: the hook now delivers on the canonical per-session pending
+      -- predicate (resolved_at IS NULL AND not-read-by-this-session), not the
+      -- binary status column. This minimal fixture must carry read_by_session
+      -- or the hook delivery query errors out (no such column).
+      read_by_session TEXT
     );
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
@@ -239,6 +244,33 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     });
     expect(r.status).toBe(0);
     expect(stripVerdict(r.stdout)).toBe("");
+  });
+
+  it("(C2-seam #53) NULL session_id + a prior-session-read UNRESOLVED message → hook DELIVERS it, mirroring get_messages re-pend", () => {
+    // The NULL-session seam codex caught: get_messages computes `currentSession
+    // ?? ""` so a row read by a prior session S1 re-pends (`'S1' != ''`). The hook
+    // must match via COALESCE(session_id, ''); without it `!= NULL` is SQL NULL and
+    // the row is silently hidden precisely in the fresh/pre-register state — an
+    // agent's FIRST mail, the worst place to drop a message. This EXECUTES the real
+    // hook (source-scans can't catch a SQL-semantics divergence).
+    const { root, dbPath } = freshTestRoot();
+    initMinimalDb(dbPath);
+    const db = new Database(dbPath);
+    // Fresh/pre-register agent: session_id IS NULL.
+    db.prepare(
+      "INSERT INTO agents (name, role, capabilities, auth_state, session_id) VALUES (?, ?, ?, ?, NULL)",
+    ).run("seam-agent", "tester", "[]", "active");
+    // Unresolved mail already READ by a PRIOR session S1 (that drain flipped
+    // status→'read' and set read_by_session='S1'; resolved_at stays NULL).
+    db.prepare(
+      "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at, resolved_at, read_by_session) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+    ).run("seam-msg", "orchestrator", "seam-agent", "re-pend me across the seam", "normal", "read", new Date().toISOString(), "S1");
+    db.close();
+    const r = runHook({ hook: HOOK_CHECK_RELAY, agentName: "seam-agent", home: root, dbPath, httpPort: 1 });
+    // Delivered iff the hook mirrors the drain. Reds on the pre-fix `!= NULL`
+    // seam AND on the pre-#53 binary status='pending' predicate (status is 'read').
+    expect(r.stdout).toContain("[RELAY] Pending messages for seam-agent");
+    expect(r.stdout).toContain("re-pend me across the seam");
   });
 
   it("(C2) DB present + matching agent + pending message → stdout includes [RELAY] Pending messages line", () => {
