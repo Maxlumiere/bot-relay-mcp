@@ -24,7 +24,7 @@
  * HOME is sandboxed so the mandatory pre-restore safety-backup never touches the
  * real ~/.bot-relay.
  */
-import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -43,7 +43,8 @@ const PRIOR_DRIVER = process.env.RELAY_SQLITE_DRIVER;
 
 const { closeDb, initializeDb, getDb, registerAgent, sendMessage, getAgents, getMessages } =
   await import("../src/db.js");
-const { getActiveDriver } = await import("../src/sqlite-compat.js");
+const compat = await import("../src/sqlite-compat.js");
+const { getActiveDriver } = compat;
 const { exportRelayState, importRelayState } = await import("../src/backup.js");
 
 type Driver = "native" | "wasm";
@@ -159,7 +160,7 @@ describe("#190 requested-vs-actual driver seam — dispatch follows the LIVE con
   });
 });
 
-describe("#190 r2 — tracker completeness (sync fallback) + restore ordering (no manufacture)", () => {
+describe("#190 — sync-fallback export, import mutation seam (capture-across-close), restore ordering", () => {
   it("FINDING 1: a DB reached via the SYNCHRONOUS getDb() fallback still exports (driverOf reads the object, no tracker)", async () => {
     process.env.RELAY_SQLITE_DRIVER = "native";
     closeDb();
@@ -178,21 +179,31 @@ describe("#190 r2 — tracker completeness (sync fallback) + restore ordering (n
     closeDb();
   });
 
-  it("IMPORT under the mutation seam: a WASM restore with the env mutated to native binds the probe to the ACTUAL driver", async () => {
+  it("IMPORT under the mutation seam: the probe is handed the LIVE wasm driver, not the mutated native env", async () => {
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     closeDb();
     await initializeDb();
     registerAgent("imp-seam", "role", []);
-    const res = await exportRelayState(); // wasm-made archive; an existing wasm DB is on disk
-    closeDb();
-    // Mutate the env to native WITHOUT re-init. importRelayState captures the probe
-    // driver via driverOf(getDb()) from the safety-backup's LIVE wasm connection —
-    // BEFORE Step 2 closes it — so the Step-5 probe binds to wasm, not the mutated
-    // env. (In a scripts-off deployment the native binary is absent and a native
-    // probe would fail; here both drivers exist, so this asserts the restore
-    // succeeds and data survives under the env mutation.)
+    const res = await exportRelayState();
+    // DO NOT closeDb — keep the LIVE wasm connection open across the import so
+    // Step 1 does NOT re-init from the mutated env (codex r3-review: closing here
+    // let Step 1 legitimately re-init native, so the seam was never exercised).
+    // This is the real seam: live connection = wasm, requested env = native.
+    expect(getActiveDriver()).toBe("wasm");
     process.env.RELAY_SQLITE_DRIVER = "native";
+
+    // OBSERVE the explicit driver arg openReadOnly is handed. The fix captures it
+    // from the LIVE wasm connection (driverOf) BEFORE Step 2's closeDb; the r2
+    // inference bug resolved native from the mutated env AFTER the close. Both
+    // drivers exist here so outcome alone can't distinguish them — the arg does.
+    const spy = vi.spyOn(compat, "openReadOnly");
     await importRelayState(res.archive_path, { force: true });
+    expect(spy, "the restore integrity probe must run").toHaveBeenCalled();
+    for (const call of spy.mock.calls) {
+      expect(call[1], "the probe must bind to the ACTUAL wasm driver, not the mutated native env").toBe("wasm");
+    }
+    spy.mockRestore();
+
     await initializeDb();
     expect(getAgents().map((a: { name: string }) => a.name)).toContain("imp-seam");
     closeDb();
