@@ -141,6 +141,15 @@ function hasValidityChangingMutation(bodyText) {
  * pattern-matched by resemblance to a safe one. `WITH` was added because it
  * "looks like a read" and was a hole. If a future prefix is proposed, the bar is
  * an executed proof that it cannot carry a mutation, not that it usually does not.
+ *
+ * TWO STATED PROPERTIES (victra #194, both measured):
+ *   • CASE-INSENSITIVE — SQL keywords are, and real code is inconsistent, so
+ *     `select * FROM agents ${x}` clears the same as `SELECT`.
+ *   • A LEADING COMMENT does NOT qualify. Only whitespace is skipped before the
+ *     SELECT token, not a comment, so a SQL block comment (slash-star … star-slash)
+ *     placed before SELECT makes the prefix REFUSE. That is the safe direction (a
+ *     comment is not provably a read prefix); the refusal message says how to fix
+ *     it — move the leading comment outside the SQL string.
  */
 function isProvablyRead(text) {
   return /^SELECT\b/i.test(text.replace(/\s+/g, " ").trim());
@@ -298,7 +307,10 @@ export function formatRefusal(refusals) {
     "  value could report a false all-clear while the statement that runs revokes a token.\n" +
     "  Exit 2 = \"cannot analyse this\", deliberately NOT exit 1 = \"your code is wrong\".\n" +
     "  Remedy: inline the SQL literal at the prepare()/exec() call, or build it from\n" +
-    "  in-file `const` string literals, so its identity is fixed where it is used.\n"
+    "  in-file `const` string literals, so its identity is fixed where it is used.\n" +
+    "  (A prepare() argument is exempt only if it PROVABLY starts with SELECT — a\n" +
+    "  leading SQL comment or a dynamic value before SELECT breaks that proof; move a\n" +
+    "  leading comment OUTSIDE the SQL string.)\n"
   );
 }
 
