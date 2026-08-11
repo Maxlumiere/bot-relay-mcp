@@ -27,6 +27,7 @@ process.env.RELAY_SQLITE_DRIVER = "wasm";
 const {
   closeDb,
   getDb,
+  initializeDb,
   getSchemaVersion,
   registerAgent,
   sendMessage,
@@ -34,17 +35,38 @@ const {
   resolveMessages,
   getOutstanding,
 } = await import("../src/db.js");
+// #172: the ACTUAL driver the process initialized (null until initializeDb ran,
+// "native"/"wasm" after). This is what distinguishes a real sql.js run from a
+// silent native fallback — getDriverType() only reports the REQUESTED env value.
+const { getActiveDriver } = await import("../src/sqlite-compat.js");
 
 function cleanup() {
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
 }
-beforeEach(() => cleanup());
+// #172 — this test was a FALSE-GREEN: it set RELAY_SQLITE_DRIVER=wasm but only
+// ever called getDb() with no initializeDb(), so the sync NATIVE fallback ran and
+// the suite passed on better-sqlite3 — claiming wasm coverage it did not have.
+// The fix is two-part: (1) initialize the driver for real (async — sql.js loads
+// asynchronously); (2) ASSERT the driver actually in use. `getActiveDriver()`
+// reports what initializeDb() truly instantiated, so if sql.js ever fails to load
+// and the code reaches native, this beforeEach throws and the WHOLE suite fails
+// loudly — it can never silently pass on native again.
+beforeEach(async () => {
+  cleanup();
+  await initializeDb();
+  expect(getActiveDriver()).toBe("wasm");
+});
 afterEach(() => cleanup());
 
 describe("ADR-0011 (wasm) — migration + read-receipt + overdue on sql.js", () => {
+  it("actually runs on the sql.js (wasm) driver, not a native fallback (#172)", () => {
+    // The beforeEach already gates the whole suite on this; stated as its own
+    // test so the guarantee is visible in the report, not just its effect.
+    expect(getActiveDriver()).toBe("wasm");
+  });
+
   it("migrates to v24 and the NOT NULL DEFAULT backfills disposition='log'", () => {
-    getDb();
     expect(getSchemaVersion()).toBe(24);
     registerAgent("alice", "r", []);
     registerAgent("bob", "r", []);
