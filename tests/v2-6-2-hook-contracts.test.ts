@@ -115,7 +115,12 @@ function initMinimalDb(dbPath: string): void {
       priority TEXT DEFAULT 'normal',
       status TEXT DEFAULT 'pending',
       created_at TEXT,
-      resolved_at TEXT
+      resolved_at TEXT,
+      -- #53: the hook now delivers on the canonical per-session pending
+      -- predicate (resolved_at IS NULL AND not-read-by-this-session), not the
+      -- binary status column. This minimal fixture must carry read_by_session
+      -- or the hook delivery query errors out (no such column).
+      read_by_session TEXT
     );
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
