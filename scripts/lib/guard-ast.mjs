@@ -82,9 +82,14 @@
  * still a TEXT match. **A two-sided predicate is only as strong as its weaker
  * side: if the trigger never fires, no bump is ever demanded and everything
  * below never runs.** Hardening one side MOVES the guard's real strength to the
- * other — it does not raise it. Known live gap: SQL hoisted into a module-level
- * constant is not seen as a mutation (queued as its own item; measured LATENT —
- * every `UPDATE agents SET` in today's src/db.ts sits inside a function unit).
+ * other — it does not raise it. The trigger side is now ALSO binding-resolved:
+ * resolveUnitSqlText (below) follows a mutator's identifiers through module-scope
+ * CONST bindings — aliases, objects, arrays, transitively — using this same
+ * resolver, and findSqlBackedSoftBindings makes a let/var-backed SQL binding a
+ * loud refusal rather than a silent miss (#57 / #192). SQL still reaches the
+ * trigger only as a literal in this file: string CONCATENATION and CROSS-MODULE
+ * imports remain out of scope by design (concatenation is not routine-accidental;
+ * cross-module identity needs a TypeChecker — the same boundary as the call side).
  *
  * ── ⚠ WHAT DOES THIS RESOLVER TREAT AS OUTSIDE ITS WORLD? ────────────────────
  * Standing question for the next person, because this is how round 3 failed:
@@ -376,7 +381,10 @@ function eachBoundName(nameNode, add) {
  *     is recursion, not the primitive.
  *     @fixture "ROOT F4: a named function expression's own binding is recursion"
  */
+const _scopeBindingsCache = new WeakMap();
 function scopeBindings(scope) {
+  const cached = _scopeBindingsCache.get(scope);
+  if (cached) return cached;
   const map = new Map();
   const add = (name, decl) => {
     const arr = map.get(name);
@@ -433,6 +441,7 @@ function scopeBindings(scope) {
     });
   };
   walk(scope, 0);
+  _scopeBindingsCache.set(scope, map);
   return map;
 }
 
@@ -701,4 +710,297 @@ export function bodyCallsFunction(bodyNode, sf, names) {
     if (ts.isIdentifier(callee) && reaches(callee.text, callee, true)) found = true;
   });
   return found;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRIGGER-SIDE BINDING RESOLUTION (#57 / #192) — the DOES-IT-MUTATE half.
+//
+// The must-CALL half above resolves a bare callee to ONE declaration node. The
+// does-it-mutate half has the mirror-image job: decide whether a unit's body
+// reaches validity SQL, INCLUDING SQL hoisted to a module-scope binding. It is
+// built on the SAME resolver (resolveName) for the SAME reason — the property is
+// about a BINDING, not a spelling. A name that resolves to a local const, a
+// parameter, an import, or a nested-function binding is NOT the module constant,
+// so a mutator whose `REVOKE_SQL` is a parameter is correctly NOT attributed the
+// module SQL (#192 ruling 2 — the S1/S2 shadow bar). Resolving by NAME instead
+// would be ROOT G again, one costume over.
+//
+// DIRECTION-OF-FAILURE, per case (mechanical rule 2 — name the direction):
+//   • const chain / object / array → resolved to the terminal literal text and
+//     spliced. Coarser than property-precise: a WHOLE object/array initializer is
+//     spliced, not just the member used. That OVER-includes — the SAFE direction
+//     for a must-CALL trigger — and the per-unit must-bump check still attributes
+//     correctly (a sibling that bumps is clean, the one that does not is flagged).
+//     @fixture "object-property and array-element constants are resolved"
+//     @fixture "property resolution must not over-flag (... attribution)"
+//   • let / var → NOT resolved. Its initializer does not establish what the use
+//     site reads (it can be reassigned), so reading it UNDER-detects in the
+//     dangerous direction (benign initializer, revoke reassignment). Surfaced for
+//     the caller to REFUSE loudly (fail-closed, exit 2), never read as a value.
+//     @fixture "an unresolvable binding is REFUSED, and the refusal is actionable"
+//   • local / param / import / fn / class binding → resolves to a NON-module
+//     decl and contributes nothing: the shadow is respected structurally.
+//     @fixture "a SHADOWED name must not be attributed to the module constant"
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── RESOLVER COVERAGE — STATED, not discovered (victra, #192 round 3) ─────────
+// Six review rounds each found a binding form the resolver did not handle, so the
+// boundary is written down here rather than rediscovered. Two facts, both MEASURED
+// (see the destructuring + call-side fixtures), not assumed:
+//
+// 1. resolveName (via scopeBindings/eachBoundName) REGISTERS a broad set — it
+//    returns the declaration NODE for: a simple `const/let/var X`; EVERY
+//    destructuring form — object `{a}`, renamed `{a:b}`, array `[a]`, nested,
+//    rest `{...r}`/`[...r]`, and defaults `{a = …}` (the leaf is a BindingElement);
+//    destructured parameters; function/class/enum declarations; imports (by LOCAL
+//    name); catch variables; a named function-expression's own name. It returns
+//    [] for a free/global/unbound name and MORE THAN ONE decl for an ambiguous
+//    (re-bound) name. So destructuring was never invisible to resolveName — the
+//    round-2/round-3 gaps were in the CONSUMERS, which did not handle the
+//    BindingElement node it returns.
+//
+// 2. Meaning is the CONSUMER's, and each consumer's DEFAULT DIRECTION is what makes
+//    the same resolver safe on one side and dangerous on the other:
+//    • must-CALL (bodyCallsFunction → isPrimitiveDeclaration / constAliasInitializer):
+//      accepts ONLY a top-level FunctionDeclaration, or a simple `const <id> =
+//      <primitive>` alias. EVERYTHING else — including a destructured bump alias
+//      `const { bumpAuthGeneration: bump } = m` — is REJECTED, which OVER-flags.
+//      Unhandled ⇒ over-flag ⇒ SAFE. @fixture "call side over-flags a destructured
+//      bump alias (safe direction)".
+//    • does-it-mutate (resolveUnitSqlText → moduleBindingInfo): accepts a module
+//      VariableDeclaration AND a module BindingElement (all destructuring forms +
+//      defaults); const ⇒ splice (transitive), let/var ⇒ refuse. Here an UNSEEN
+//      binding is simply not spliced ⇒ the SQL is not there ⇒ UNDER-detect ⇒
+//      DANGEROUS, which is why this side must accept broadly and errs toward
+//      over-splicing whole objects/arrays.
+//    OUT of scope on BOTH sides, by design: string CONCATENATION (not accidental
+//    drift) and CROSS-MODULE imported identity (needs a TypeChecker). Named
+//    boundaries, not gaps.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * For a RESOLVED module-scope binding — a plain `const/let X = …` VariableDeclaration
+ * OR a destructuring BindingElement (`const { revoke: X } = Q`, `const [Y] = LIST`)
+ * — return { kind: "const"|"soft", initNode } or null if it is not module-scope.
+ *
+ * A destructured name (#192 re-review, codex) is an ordinary property/array alias,
+ * so it is IN scope. Consistent with the coarse whole-initializer splice for a
+ * const object/array, the thing spliced for a BindingElement is the ENCLOSING
+ * declaration's initializer (the whole `Q` / `LIST`), which resolveConstText then
+ * follows to the literal — property-precise pick is deliberately not attempted
+ * (OVER-includes = the safe direction). The kind comes from the enclosing
+ * VariableDeclarationList, so a destructured `let` is still `soft` (refused).
+ */
+function moduleBindingInfo(decl) {
+  let varDecl = null;
+  if (ts.isVariableDeclaration(decl)) {
+    varDecl = decl;
+  } else if (ts.isBindingElement(decl)) {
+    let n = decl.parent;
+    while (n && !ts.isVariableDeclaration(n)) n = n.parent; // up through (possibly nested) binding patterns
+    varDecl = n && ts.isVariableDeclaration(n) ? n : null;
+  }
+  if (!varDecl) return null;
+  const list = varDecl.parent; // VariableDeclarationList
+  if (!list || !ts.isVariableDeclarationList(list)) return null;
+  const stmt = list.parent; // VariableStatement
+  if (!stmt || !ts.isVariableStatement(stmt)) return null;
+  if (!stmt.parent || !ts.isSourceFile(stmt.parent)) return null; // MODULE scope only
+  return { kind: (list.flags & ts.NodeFlags.Const) !== 0 ? "const" : "soft", initNode: varDecl.initializer ?? null };
+}
+
+/**
+ * Invoke `cb(boundDecl)` for each name a top-level VariableDeclaration binds: the
+ * VariableDeclaration itself for a simple `X`, or each leaf BindingElement for a
+ * destructuring pattern (including aliases `{ a: X }` and nested patterns). This
+ * is the SAME set resolveName resolves a destructured use to, so the refusal side
+ * and the resolve side agree on what a module binding is.
+ */
+function eachModuleBoundDecl(decl, cb) {
+  if (ts.isIdentifier(decl.name)) {
+    cb(decl);
+    return;
+  }
+  const walk = (pat) => {
+    if (ts.isObjectBindingPattern(pat) || ts.isArrayBindingPattern(pat)) {
+      for (const el of pat.elements) {
+        if (!ts.isBindingElement(el)) continue;
+        if (ts.isIdentifier(el.name)) cb(el);
+        else walk(el.name); // nested pattern
+      }
+    }
+  };
+  walk(decl.name);
+}
+
+/**
+ * Visit every value-position identifier reference in `root`'s OWN execution unit
+ * (STOPS at nested function units, like forEachOwnBodyNode). Skips the non-
+ * reference identifier positions that would otherwise resolve by coincidence: the
+ * member of `a.b`, the right of a qualified name, an object-literal property KEY,
+ * and binding NAMES. Shorthand `{ x }` IS a reference, so it is kept.
+ */
+function forEachValueIdentifier(root, cb) {
+  const walk = (node) => {
+    ts.forEachChild(node, (child) => {
+      if (isFunctionNode(child)) return; // separate unit (its text is spliced wholesale if it is an initializer)
+      if (ts.isPropertyAccessExpression(node) && child === node.name) return;
+      if (ts.isQualifiedName(node) && child === node.right) return;
+      if (ts.isPropertyAssignment(node) && child === node.name) return;
+      if (
+        (ts.isVariableDeclaration(node) ||
+          ts.isParameter(node) ||
+          ts.isBindingElement(node) ||
+          ts.isPropertyDeclaration(node) ||
+          ts.isFunctionDeclaration(node) ||
+          ts.isClassDeclaration(node)) &&
+        child === node.name
+      ) {
+        return;
+      }
+      if (ts.isIdentifier(child)) cb(child);
+      else walk(child);
+    });
+  };
+  if (ts.isIdentifier(root)) cb(root);
+  else walk(root);
+}
+
+/**
+ * Every name declared by a top-level `const`/`let`/`var` in this file. A cheap
+ * pre-filter (cached per SourceFile): an identifier NOT spelled like any of these
+ * cannot resolve to a module binding, so resolveConstText skips resolving it —
+ * this keeps the trigger-side pass linear in a unit's SIZE, not in the whole
+ * file's scope depth, which is the difference between a fast guard and one that
+ * re-walks the 4 000-line db.ts scope tree for every identifier. Filtering by
+ * NAME loses nothing: a skipped identifier would resolve to a local/param
+ * (skipped anyway) or to nothing.
+ */
+const _moduleNamesCache = new WeakMap();
+function moduleBindingNames(sf) {
+  const cached = _moduleNamesCache.get(sf);
+  if (cached) return cached;
+  const names = new Set();
+  for (const stmt of sf.statements) {
+    if (!ts.isVariableStatement(stmt)) continue;
+    // eachBoundName covers simple ids AND destructuring (object/array, renamed,
+    // nested, rest, defaults), matching what resolveName registers.
+    for (const decl of stmt.declarationList.declarations) {
+      eachBoundName(decl.name, (n) => names.add(n));
+    }
+  }
+  _moduleNamesCache.set(sf, names);
+  return names;
+}
+
+/**
+ * Splice into `parts` the initializer text of every module-scope CONST reachable
+ * (binding-correct, transitively, cycle-safe) from the value identifiers in
+ * `node`. `names` is the module-binding-name pre-filter (moduleBindingNames).
+ * Follows const→const/property aliases to the terminal literal at ARBITRARY depth
+ * — there is no hop limit, because a hop limit only relocates the gap (#192). The
+ * `seen` set (keyed on decl NODES) bounds the closure to O(#module-consts) and
+ * makes A = B, B = A terminate instead of hang. A `soft` (let/var) module binding
+ * is recorded in `softHit` and deliberately NOT read.
+ */
+function resolveConstText(node, sf, parts, seen, softHit, names) {
+  forEachValueIdentifier(node, (id) => {
+    if (!names.has(id.text)) return; // cheap: not spelled like any module binding → cannot be one
+    const decls = resolveName(id.text, id);
+    if (decls.length !== 1) return; // free / ambiguous / import → out of this resolver's world
+    const decl = decls[0]; // a VariableDeclaration (simple) or a BindingElement (destructured)
+    const info = moduleBindingInfo(decl);
+    if (!info) return; // param / local / fn / class / import / non-module → shadow-correct skip
+    if (seen.has(decl)) return;
+    seen.add(decl);
+    if (info.kind === "soft") {
+      if (softHit) softHit.add(decl.name.getText(sf));
+      return;
+    }
+    if (info.initNode) {
+      parts.push(info.initNode.getText(sf)); // whole initializer (object/array included — coarse, over-includes)
+      resolveConstText(info.initNode, sf, parts, seen, softHit, names); // transitive: follow the alias onward
+    }
+    // A destructuring DEFAULT (const { x: R = <sql> } = obj) supplies the value when
+    // the source lacks the key — splice it too (over-include = the safe direction).
+    if (ts.isBindingElement(decl) && decl.initializer) {
+      parts.push(decl.initializer.getText(sf));
+      resolveConstText(decl.initializer, sf, parts, seen, softHit, names);
+    }
+  });
+}
+
+/**
+ * The effective SQL-relevant text of a function unit: its own body text PLUS the
+ * initializer text of every module-scope CONST it binding-resolves to
+ * (transitively). Any module let/var it resolves to is added to `softHitOut` (a
+ * Set of names) for the caller's fail-closed refusal — never read as a value.
+ */
+export function resolveUnitSqlText(bodyNode, sf, softHitOut) {
+  const parts = [bodyNode.getText(sf)];
+  resolveConstText(bodyNode, sf, parts, new Set(), softHitOut ?? null, moduleBindingNames(sf));
+  return parts.join(" ");
+}
+
+/**
+ * Does module-scope let/var `decl` reach validity SQL through its initializer OR
+ * any assignment `name = <expr>` to it (binding-correct: the assignment's target
+ * must resolve to THIS decl)? Const-resolves both sides so `let X = AUTH_SQL`
+ * (L1, alias) and `let X = "SELECT 1"; X = "<revoke>"` (L2, reassignment) are
+ * both caught. `predicate(text)` is the SQL test.
+ */
+function moduleSoftBindingReachesSql(decl, sf, predicate) {
+  const names = moduleBindingNames(sf);
+  const texts = [];
+  const info = moduleBindingInfo(decl); // works for a VariableDeclaration or a BindingElement
+  if (info && info.initNode) {
+    texts.push(info.initNode.getText(sf));
+    resolveConstText(info.initNode, sf, texts, new Set(), null, names);
+  }
+  if (ts.isBindingElement(decl) && decl.initializer) {
+    texts.push(decl.initializer.getText(sf)); // destructuring default value
+    resolveConstText(decl.initializer, sf, texts, new Set(), null, names);
+  }
+  const walk = (node) => {
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left)
+    ) {
+      const target = resolveName(node.left.text, node.left);
+      if (target.length === 1 && target[0] === decl) {
+        texts.push(node.right.getText(sf));
+        resolveConstText(node.right, sf, texts, new Set(), null, names);
+      }
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(sf);
+  return predicate(texts.join(" "));
+}
+
+/**
+ * Module-scope let/var bindings whose initializer or any assignment reaches
+ * validity SQL (`predicate`) — the fail-closed REFUSAL set (#192 ruling 3). A
+ * const→let refactor of a SQL literal lands here and the build fails LOUDLY (the
+ * caller exits 2, premise-style), rather than the guard reading a stale/benign
+ * initializer and reporting a false all-clear while the reassigned statement
+ * revokes a token. `_db` and plain counters never reach SQL, so the real db.ts
+ * stays clean.
+ * @fixture "an unresolvable binding is REFUSED, and the refusal is actionable"
+ */
+export function findSqlBackedSoftBindings(sf, predicate) {
+  const out = [];
+  for (const stmt of sf.statements) {
+    if (!ts.isVariableStatement(stmt)) continue;
+    const list = stmt.declarationList;
+    if ((list.flags & ts.NodeFlags.Const) !== 0) continue; // only let/var
+    for (const decl of list.declarations) {
+      // Each bound name (simple id OR each destructuring BindingElement).
+      eachModuleBoundDecl(decl, (boundDecl) => {
+        if (moduleSoftBindingReachesSql(boundDecl, sf, predicate)) out.push(boundDecl);
+      });
+    }
+  }
+  return out;
 }

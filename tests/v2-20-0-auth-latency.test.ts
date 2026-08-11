@@ -58,7 +58,9 @@ const {
   authCacheSize,
   AUTH_CACHE_MAX_ENTRIES,
 } = await import("../src/auth-cache.js");
-const { findAuthGenViolations } = await import("../scripts/auth-gen-guard.mjs");
+const { findAuthGenViolations, findUnresolvableBindings, formatRefusal } = await import(
+  "../scripts/auth-gen-guard.mjs"
+);
 
 function reset() {
   closeDb();
@@ -331,5 +333,262 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(v).toContain("arrowRevoke");
     expect(v).toContain("exprDelete");
     expect(v).toContain("methodRotate");
+  });
+
+  // ── the-fixer, 2026-08-11: hoisted-SQL under-detection (#57) ───────────────
+  // The trigger side of the predicate reads ONE function unit's body text, so
+  // SQL hoisted to module scope is invisible to it and the hardened must-bump
+  // side never runs. Measured LATENT at 0294854 (zero module-scope validity SQL
+  // in src/db.ts) — the trigger is a routine readability refactor, not an
+  // attack. Direction of failure is UNDER-detection: no bump is ever demanded.
+  it("HOISTED SQL: a module-scope validity-SQL constant does NOT evade the trigger", () => {
+    const evasion = `
+      export function bumpAuthGeneration(): void {}
+      const REVOKE_SQL =
+        "UPDATE agents SET token_hash = NULL, auth_state = 'revoked' WHERE name = ?";
+      const PURGE_SQL = \`DELETE FROM agents WHERE name = ?\`;
+      export function hoistedRevoke(name: string): void {
+        getDb().prepare(REVOKE_SQL).run(name);
+      }
+      export function hoistedPurge(name: string): void {
+        getDb().prepare(PURGE_SQL).run(name);
+      }
+      class Store {
+        methodRevoke(name: string): void { getDb().prepare(REVOKE_SQL).run(name); }
+      }`;
+    const v = findAuthGenViolations(evasion, "hoist.ts").map((x: { name: string }) => x.name);
+    expect(v).toContain("hoistedRevoke");  // V1 string const
+    expect(v).toContain("hoistedPurge");   // V2/V4 template const + DELETE
+    expect(v).toContain("methodRevoke");   // V3 class method
+  });
+
+  // ATTRIBUTION. A shared module-scope const must blame the unit that skipped
+  // the bump and NOT the one that made it — "attribute the SQL to a unit", not
+  // "the file contains SQL somewhere".
+  it("HOISTED SQL: a shared constant blames only the unit that skipped the bump", () => {
+    const shared = `
+      export function bumpAuthGeneration(): void {}
+      const SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function goodUser(name: string): void { getDb().prepare(SQL).run(name); bumpAuthGeneration(); }
+      export function badUser(name: string): void  { getDb().prepare(SQL).run(name); }`;
+    const s = findAuthGenViolations(shared, "shared.ts").map((x: { name: string }) => x.name);
+    expect(s).toContain("badUser");        // V9: the guilty unit
+    expect(s).not.toContain("goodUser");   // V9: and ONLY the guilty unit
+  });
+
+  // THE REGRESSION BAR — must never go red. A whole-file scan that flags every
+  // non-bumping unit would satisfy the two tests above and break this one, which
+  // is a louder guard rather than a more correct one.
+  it("HOISTED SQL: the fix must not over-flag (bump present / benign column / unused const)", () => {
+    const benign = `
+      export function bumpAuthGeneration(): void {}
+      const ROTATE_SQL = "UPDATE agents SET token_hash = ? WHERE name = ?";
+      const TOUCH_SQL  = "UPDATE agents SET last_seen = ? WHERE name = ?";
+      const UNUSED_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function properRotate(name: string): void {          // V7: bumps
+        getDb().prepare(ROTATE_SQL).run("h", name);
+        bumpAuthGeneration();
+      }
+      export function touchLastSeen(name: string): void {         // V8: not sensitive
+        getDb().prepare(TOUCH_SQL).run("t", name);
+      }`;
+    // V7 + V8 + V10 (UNUSED_SQL names no unit — nothing may be invented).
+    expect(findAuthGenViolations(benign, "benign.ts")).toEqual([]);
+  });
+
+  // ── codex #192 + victra + the-fixer (Addenda 1+2): paste-ready bars ─────────
+  // The indirection axis (depth) and the kind axis (object/array/property) plus
+  // the shadow/let over-detection bars. The resolver is BINDING-correct — it
+  // reuses guard-ast's resolveName — so shadows stay green STRUCTURALLY, not by a
+  // name patrol. Proven-to-bite on the targets and stay-green on the twins is
+  // measured in the same commit (see the guard's PR notes).
+
+  it("HOISTED SQL: alias chains resolve transitively, and cycles terminate", () => {
+    const chain = `
+      export function bumpAuthGeneration(): void {}
+      const AUTH_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      const REVOKE_SQL = AUTH_SQL;
+      const AGAIN_SQL = REVOKE_SQL;
+      export function oneHop(n: string): void { getDb().prepare(REVOKE_SQL).run(n); }
+      export function twoHop(n: string): void { getDb().prepare(AGAIN_SQL).run(n); }`;
+    const c = findAuthGenViolations(chain, "chain.ts").map((x: { name: string }) => x.name);
+    expect(c).toContain("oneHop");
+    expect(c).toContain("twoHop");
+
+    // Cycles must not hang or throw — the assertion is that this RETURNS.
+    const cyclic = `
+      export function bumpAuthGeneration(): void {}
+      const A: string = B;
+      const B: string = A;
+      export function cyc(n: string): void { getDb().prepare(A).run(n); }`;
+    expect(() => findAuthGenViolations(cyclic, "cyc.ts")).not.toThrow();
+  });
+
+  // GREEN TODAY — regression bar. Resolve by BINDING, not name (ruling 2).
+  it("HOISTED SQL: a SHADOWED name must not be attributed to the module constant", () => {
+    const shadowed = `
+      export function bumpAuthGeneration(): void {}
+      const REVOKE_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function localShadow(n: string): void {
+        const REVOKE_SQL = "SELECT 1";
+        getDb().prepare(REVOKE_SQL).run(n);
+      }
+      export function paramShadow(REVOKE_SQL: string, n: string): void {
+        getDb().prepare(REVOKE_SQL).run(n);
+      }`;
+    expect(findAuthGenViolations(shadowed, "shadow.ts")).toEqual([]);
+  });
+
+  it("HOISTED SQL: object-property and array-element constants are resolved (ADR-0003 ruling 4)", () => {
+    const kinds = `
+      export function bumpAuthGeneration(): void {}
+      const Q = { revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?" };
+      const NESTED = { sql: { purge: "DELETE FROM agents WHERE name = ?" } };
+      const LIST = ["UPDATE agents SET auth_state = 'revoked' WHERE name = ?"];
+      const ALIASED = Q.revoke;
+      export function viaProp(n: string): void   { getDb().prepare(Q.revoke).run(n); }
+      export function viaNested(n: string): void { getDb().prepare(NESTED.sql.purge).run(n); }
+      export function viaIndex(n: string): void  { getDb().prepare(LIST[0]).run(n); }
+      export function viaAlias(n: string): void  { getDb().prepare(ALIASED).run(n); }`;
+    const v = findAuthGenViolations(kinds, "kinds.ts").map((x: { name: string }) => x.name);
+    expect(v).toEqual(expect.arrayContaining(["viaProp", "viaNested", "viaIndex", "viaAlias"]));
+  });
+
+  // The over-detection twins for the kind axis. VACUOUSLY green before the
+  // resolver landed (nothing resolved) — they only start testing anything now
+  // that it exists: local shadow, benign column, and per-unit attribution.
+  it("HOISTED SQL: property resolution must not over-flag (shadowing / benign column / attribution)", () => {
+    const benign = `
+      export function bumpAuthGeneration(): void {}
+      const Q = { revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?" };
+      const T = { touch: "UPDATE agents SET last_seen = ? WHERE name = ?" };
+      export function shadowed(n: string): void {
+        const Q = { revoke: "SELECT 1" };      // local shadows the module object
+        getDb().prepare(Q.revoke).run(n);
+      }
+      export function touchOnly(n: string): void { getDb().prepare(T.touch).run(n); }`;
+    expect(findAuthGenViolations(benign, "benign2.ts")).toEqual([]);
+
+    const siblings = `
+      export function bumpAuthGeneration(): void {}
+      const Q = {
+        revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?",
+        purge: "DELETE FROM agents WHERE name = ?",
+      };
+      export function goodOne(n: string): void { getDb().prepare(Q.revoke).run(n); bumpAuthGeneration(); }
+      export function badOne(n: string): void  { getDb().prepare(Q.purge).run(n); }`;
+    const s = findAuthGenViolations(siblings, "sib.ts").map((x: { name: string }) => x.name);
+    expect(s).toContain("badOne");
+    expect(s).not.toContain("goodOne");
+  });
+
+  // Ruling 3 + "the message is part of the fix" — fail-closed, premise-style (B):
+  // exit 2, its own diagnosis. Seam: findUnresolvableBindings + formatRefusal.
+  it("HOISTED SQL: an unresolvable binding is REFUSED, and the refusal is actionable", () => {
+    const loose = `
+      export function bumpAuthGeneration(): void {}
+      let REVOKE_SQL = "SELECT 1";
+      REVOKE_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function l2(n: string): void { getDb().prepare(REVOKE_SQL).run(n); }`;
+    const refusals = findUnresolvableBindings(loose, "loose.ts");
+    expect(refusals).toHaveLength(1);
+
+    const msg = formatRefusal(refusals);
+    expect(msg).toContain("REVOKE_SQL"); // NAMES the binding
+    expect(msg).toMatch(/let|reassign/i); // says WHY it cannot be resolved
+    expect(msg).toMatch(/const|inline/i); // says WHAT TO DO instead
+
+    // The exit-1 violation scan stays clean for the same file: the let is handled
+    // by the refusal path, not attributed as a mutation-without-bump.
+    expect(findAuthGenViolations(loose, "loose.ts")).toEqual([]);
+  });
+
+  // ── codex #192 re-review: DESTRUCTURING axis (kind × binding-form) ──────────
+  // Object/array destructuring is an ordinary property/array alias — resolveName
+  // returns the BindingElement; the resolver must accept it or the SQL is unseen
+  // (UNDER-detect). All forms measured.
+  it("HOISTED SQL: object/array destructuring aliases are resolved (all forms)", () => {
+    const forms = `
+      export function bumpAuthGeneration(): void {}
+      const QUERIES = { revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?" };
+      const { revoke: REVOKE_SQL } = QUERIES;                 // object, renamed
+      const LIST = ["DELETE FROM agents WHERE name = ?"];
+      const [PURGE_SQL] = LIST;                               // array element
+      const NESTED = { sql: { drop: "UPDATE agents SET auth_state = 'revoked' WHERE name = ?" } };
+      const { sql: { drop: DROP_SQL } } = NESTED;             // nested pattern
+      const REST_SRC = { r: "UPDATE agents SET previous_token_hash = NULL WHERE name = ?" };
+      const { ...REST } = REST_SRC;                           // rest
+      const EMPTY: { d?: string } = {};
+      const { d: DEF_SQL = "UPDATE agents SET recovery_token_hash = NULL WHERE name = ?" } = EMPTY; // default
+      export function a(n: string): void { getDb().prepare(REVOKE_SQL).run(n); }
+      export function b(n: string): void { getDb().prepare(PURGE_SQL).run(n); }
+      export function c(n: string): void { getDb().prepare(DROP_SQL).run(n); }
+      export function d(n: string): void { getDb().prepare(REST.r).run(n); }
+      export function e(n: string): void { getDb().prepare(DEF_SQL).run(n); }`;
+    const v = findAuthGenViolations(forms, "destr.ts").map((x: { name: string }) => x.name);
+    expect(v).toEqual(expect.arrayContaining(["a", "b", "c", "d", "e"]));
+  });
+
+  // The destructuring over-detection twins — same three bars as the property axis.
+  it("HOISTED SQL: destructuring must not over-flag (local shadow / benign column / attribution)", () => {
+    const benign = `
+      export function bumpAuthGeneration(): void {}
+      const Q = { revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?" };
+      const T = { touch: "UPDATE agents SET last_seen = ? WHERE name = ?" };
+      const { touch: TOUCH_SQL } = T;                         // benign column
+      export function shadowed(n: string): void {
+        const { revoke: X } = { revoke: "SELECT 1" };         // local destructure shadows nothing sensitive
+        getDb().prepare(X).run(n);
+      }
+      export function touchOnly(n: string): void { getDb().prepare(TOUCH_SQL).run("t", n); }`;
+    expect(findAuthGenViolations(benign, "dtwin.ts")).toEqual([]);
+
+    const siblings = `
+      export function bumpAuthGeneration(): void {}
+      const Q = {
+        revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?",
+        purge: "DELETE FROM agents WHERE name = ?",
+      };
+      const { revoke: A, purge: B } = Q;
+      export function goodOne(n: string): void { getDb().prepare(A).run(n); bumpAuthGeneration(); }
+      export function badOne(n: string): void  { getDb().prepare(B).run(n); }`;
+    const s = findAuthGenViolations(siblings, "dsib.ts").map((x: { name: string }) => x.name);
+    expect(s).toContain("badOne");
+    expect(s).not.toContain("goodOne");
+
+    // Soft (let/var) destructuring that reaches SQL is REFUSED, not read.
+    const softDestr = `
+      export function bumpAuthGeneration(): void {}
+      export function applyAuthStateTransition(): void {}
+      let { r: X } = { r: "SELECT 1" };
+      X = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function u(n: string): void { getDb().prepare(X).run(n); }`;
+    expect(findUnresolvableBindings(softDestr, "softd.ts").map((x: { name: string }) => x.name)).toContain("X");
+  });
+
+  // ── DIRECTION-OF-FAILURE PIN (victra): the SHARED resolver's destructuring
+  // limitation is SAFE on the must-CALL side because that side default-DENIES.
+  // A mutator that DOES bump via a destructured alias is OVER-flagged (loud false
+  // build failure), never passed clean. This pins the safe direction so a future
+  // refactor cannot silently flip it into a missed-hole.
+  it("call side over-flags a mutator that bumps via a destructured alias (safe direction)", () => {
+    const destructuredBump = `
+      export function bumpAuthGeneration(): void {}
+      const src = { bumpAuthGeneration: () => {} };
+      const { bumpAuthGeneration: bump } = src;
+      export function m(n: string): void {
+        getDb().prepare("UPDATE agents SET token_hash = NULL WHERE name = ?").run(n);
+        bump();
+      }`;
+    // OVER-flagged (the required call is not credited), NOT a false clean.
+    expect(findAuthGenViolations(destructuredBump, "cb.ts").map((x: { name: string }) => x.name)).toContain("m");
+    // Control: the same mutator bumping via the DIRECT call is clean.
+    const directBump = `
+      export function bumpAuthGeneration(): void {}
+      export function m(n: string): void {
+        getDb().prepare("UPDATE agents SET token_hash = NULL WHERE name = ?").run(n);
+        bumpAuthGeneration();
+      }`;
+    expect(findAuthGenViolations(directBump, "cb2.ts")).toEqual([]);
   });
 });
