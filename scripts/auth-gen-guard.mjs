@@ -47,7 +47,7 @@
  * Exit: 0 = clean · 1 = violations (stderr) · 2 = usage/parse error
  * Usage: node scripts/auth-gen-guard.mjs <db.ts> [<file> ...]
  */
-import { ts, parseGuardSource } from "./lib/guard-parse.mjs";
+import { parseGuardSource } from "./lib/guard-parse.mjs";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -56,6 +56,8 @@ import {
   bodyCallsFunction,
   isTopLevelFunctionDeclaration,
   findUnsatisfiedPrimitives,
+  resolveUnitSqlText,
+  findSqlBackedSoftBindings,
 } from "./lib/guard-ast.mjs";
 
 const SENSITIVE_COLS = [
@@ -105,121 +107,51 @@ function hasValidityChangingMutation(bodyText) {
 }
 
 /**
- * #57 — module-scope const bindings: name -> { text, node } of its initializer.
- * The SQL trigger reads a unit's body TEXT, so SQL hoisted to a module-level const
- * is invisible (the body holds the identifier, not the literal). We keep the
- * initializer NODE too so a const-to-const alias (const B = A) can be followed
- * TRANSITIVELY to the literal — see bodyTextWithModuleConsts (codex #192). Collect
- * ONLY top-level consts; a const inside an enclosing function is already covered by
- * that outer unit's body text — an over-flag, the safe direction (boundary V5).
- */
-function collectModuleScopeConsts(sf) {
-  const map = new Map();
-  for (const stmt of sf.statements) {
-    if (!ts.isVariableStatement(stmt)) continue;
-    if (!(stmt.declarationList.flags & ts.NodeFlags.Const)) continue;
-    for (const decl of stmt.declarationList.declarations) {
-      if (decl.initializer && ts.isIdentifier(decl.name)) {
-        map.set(decl.name.text, { text: decl.initializer.getText(sf), node: decl.initializer });
-      }
-    }
-  }
-  return map;
-}
-
-/**
- * #57 — splice the initializer text of every module-scope const THIS unit's body
- * references into the body text, so the trigger sees a hoisted literal exactly as
- * if it were inline.
- *
- * TRANSITIVE to the terminal literal, at ARBITRARY DEPTH (codex #192, victra): an
- * alias is the same scope at a deeper INDIRECTION — `const B = A; const C = B` is
- * an ordinary refactor, not the string-concat exclusion — so we follow each
- * spliced const's OWN references onward until no module-const identifiers remain.
- * There is NO depth limit, stated so no silent bound hides here: the walk is a
- * transitive closure over a FINITE set (the module consts), and the `seen` set
- * splices each at most once, which both bounds the total work to O(#consts) and
- * makes a reference cycle (A = B, B = A) terminate instead of hang.
- *
- * Per-unit by construction: the walk STARTS from this unit's body, so a shared
- * const is resolved only for the units that reference it — it flags the one that
- * skips the bump and not the one that makes it (boundary V9) — and a const no unit
- * references is spliced nowhere, so it flags nothing (V10). Follows the BINDING by
- * name; shadowing is an adversarial case the guard's freeze deliberately excludes.
- */
-function bodyTextWithModuleConsts(bodyNode, sf, moduleConsts) {
-  const bodyText = bodyNode.getText(sf);
-  if (moduleConsts.size === 0) return bodyText;
-  const seen = new Set();
-  const queue = [];
-  const enqueueRefs = (node) => {
-    const visit = (n) => {
-      if (ts.isIdentifier(n) && moduleConsts.has(n.text)) queue.push(n.text);
-      ts.forEachChild(n, visit);
-    };
-    visit(node);
-  };
-  enqueueRefs(bodyNode);
-  let extra = "";
-  while (queue.length > 0) {
-    const name = queue.shift();
-    if (seen.has(name)) continue; // finite closure + cycle break: splice each const once
-    seen.add(name);
-    const entry = moduleConsts.get(name);
-    extra += " " + entry.text;
-    enqueueRefs(entry.node); // follow const-to-const aliases onward to the terminal literal
-  }
-  return seen.size === 0 ? bodyText : bodyText + extra;
-}
-
-/**
  * Analyze source text; return an array of { name, line } for functions that
  * mutate token/auth validity but do not bump the generation. Exported so the
  * negative-fixture test can prove the guard FAILS on an omitted bump.
  *
- * v2.24 hardening — the required-bump check is now STRUCTURAL (bodyCallsFunction,
+ * v2.24 hardening — the required-bump check is STRUCTURAL (bodyCallsFunction,
  * a resolved CallExpression) via the shared scripts/lib/guard-ast.mjs, closing
  * the comment / alias / class-field evasions codex found in the copied
  * regex-over-body-text shape. Node coverage also widened (class fields,
  * accessors, constructors — see forEachFunctionUnit).
  *
- * ⚠ THE SQL TRIGGER (hasValidityChangingMutation) IS STILL A TEXT MATCH, AND ITS
- * DIRECTION CUTS BOTH WAYS. The old note here said only that it "over-triggers
- * on a comment mentioning the SQL, which is the SAFE direction." That is true
- * and it is HALF THE STORY — a half-stated direction is a false claim wearing a
- * technicality. Stated in full, per case:
- *   • a comment/string that merely MENTIONS the SQL  -> OVER-triggers (safe: a
- *     false demand to bump, never a missed one).
- *   • SQL that is NOT textually in the body — hoisted into a module-level
- *     constant, or built by concatenation -> would UNDER-detect: no bump is
- *     demanded, so the fully-hardened must-bump side never runs. Split by case:
- *       - HOISTED CONSTANT + ALIAS CHAIN: CLOSED (#57). collectModuleScopeConsts +
- *         bodyTextWithModuleConsts splice the initializer text of each
- *         module-scope const a unit references into THAT unit's effective body
- *         text — following const-to-const aliases (const B = A; const C = B)
- *         TRANSITIVELY to the terminal literal at arbitrary depth, cycle-safe
- *         (codex #192): an alias is the same scope at a deeper indirection, not a
- *         new scope, so a hop limit would just relocate the gap. A hoisted literal
- *         then reaches the trigger exactly as if inline, and attribution stays
- *         per-unit — a shared const blames only the unit that skipped the bump,
- *         never the one that made it. Was measured LATENT when closed (zero
- *         module-level mutation constants in src/db.ts), so a correct fix changes
- *         nothing about the real file: if real db.ts starts flagging, the fix is
- *         over-flagging, not the codebase drifting.
- *       - CONCATENATION ("UPDATE agents " + "SET …"): still UNDER-detects, and
- *         is out of scope BY DESIGN (below) — the whack-a-mole the freeze exists
- *         to prevent. Do NOT grow the #57 fix into it.
- * The trigger is still a text match; #57 widened the text it sees to a unit's
- * body PLUS the consts it names, not the whole file (that would over-flag V8–V10
- * — a benign-column update, an innocent shared-const user, an unused const). It
- * remains the WEAKER SIDE of a two-sided predicate — see guard-ast.mjs. Do not
- * read the hardened call side as making the guard strong overall.
+ * TWO-SIDED PREDICATE — both sides now BINDING-RESOLVED (guard-ast.mjs), which
+ * matters because a two-sided predicate is only as strong as its weaker side:
+ *   • REQUIRED CALL — resolves a bare call to the ONE sanctioned top-level
+ *     function declaration (or a const alias of it).
+ *   • DOES-IT-MUTATE (#57 / #192) — the SQL trigger no longer reads only a unit's
+ *     literal body text. resolveUnitSqlText follows the unit's identifiers through
+ *     module-scope CONST bindings — aliases, objects, arrays, TRANSITIVELY to the
+ *     terminal literal — using the SAME resolver as the call side, so a hoisted
+ *     `const REVOKE_SQL = "UPDATE agents SET token_hash …"` is seen as if inline.
+ *     Resolution is by BINDING, not name: an identifier resolving to a LOCAL
+ *     const, a PARAMETER, an import, or a nested-function binding is NOT the
+ *     module constant, so a mutator whose `REVOKE_SQL` is a parameter is correctly
+ *     NOT flagged (the S1/S2 shadow bar). Name-matching instead is ROOT G reborn.
+ *
+ * DIRECTIONS, per case (each sits beside its fixture in
+ * tests/v2-20-0-auth-latency.test.ts, ADR-0003 F):
+ *   • a comment/string that merely MENTIONS the SQL -> OVER-triggers (safe).
+ *   • object/array constant -> the WHOLE initializer is spliced (coarser than
+ *     property-precise): OVER-includes, the safe direction, and the per-unit bump
+ *     check still flags only the guilty sibling (KT3).
+ *   • let/var-backed SQL -> deliberately NOT read (its initializer does not
+ *     establish what runs — it can be reassigned). Surfaced by
+ *     findUnresolvableBindings and REFUSED loudly (exit 2), never passed.
+ *   • CONCATENATION and CROSS-MODULE imports -> out of scope by design (see
+ *     guard-ast.mjs): concatenation is not routine-accidental drift; cross-module
+ *     identity needs a TypeChecker. Named boundaries, not gaps.
+ *
+ * The hoisted-constant gap is CLOSED, and was measured LATENT at 0294854 (zero
+ * module-scope validity SQL in the real src/db.ts), so a correct fix changes
+ * nothing about the real file — if real db.ts starts flagging, the fix is
+ * over-flagging, not the codebase drifting.
  */
 export function findAuthGenViolations(source, fileName = "db.ts") {
   const sf = parseGuardSource(fileName, source); // pinned-parser gate: throws on parse diagnostics → main() exits 2
   const violations = [];
-  // #57 — resolve module-scope const bindings so hoisted SQL reaches the trigger.
-  const moduleConsts = collectModuleScopeConsts(sf);
   forEachFunctionUnit(sf, (name, bodyNode, nameNode) => {
     if (!name) return;
     // ROOT G (codex, #151 round 2): this exemption used to key on the NAME
@@ -232,9 +164,11 @@ export function findAuthGenViolations(source, fileName = "db.ts") {
     if ((SELF_BUMPERS.has(name) || INIT_ONLY_ALLOWLIST.has(name)) && isTopLevelFunctionDeclaration(nameNode)) {
       return;
     }
-    // #57 — the unit's body text WITH the initializer text of any module-scope
-    // const it references spliced in, so hoisted SQL is seen as if inline.
-    const bodyText = bodyTextWithModuleConsts(bodyNode, sf, moduleConsts);
+    // #57/#192 — the unit's body text PLUS the initializer text of every
+    // module-scope CONST it binding-resolves to (transitive), so hoisted SQL is
+    // seen as if inline. A let/var-backed SQL binding is handled by the refusal
+    // path (findUnresolvableBindings), not here.
+    const bodyText = resolveUnitSqlText(bodyNode, sf, null);
     // TRIGGER: text (over-trigger-safe). REQUIRED CALL: structural (a real
     // CallExpression to bumpAuthGeneration / applyAuthStateTransition or a direct
     // local alias) — comments and strings are structurally incapable of it.
@@ -243,6 +177,51 @@ export function findAuthGenViolations(source, fileName = "db.ts") {
     }
   });
   return violations;
+}
+
+/**
+ * The fail-closed REFUSAL set (#192 ruling 3): module-scope let/var bindings whose
+ * initializer OR any assignment reaches validity SQL. Returns { name, line } for
+ * each. A SEPARATE pure function from findAuthGenViolations, mirroring the
+ * findUnsatisfiedPrimitives / main split — so the refusal MESSAGE is testable and
+ * the exit-1 ("your code is wrong") vs exit-2 ("I cannot analyse this")
+ * distinction is preserved (#192: collapsing them is how guards get disabled).
+ *
+ * WHY let/var is refused and not resolved: a let can be reassigned, so its
+ * initializer does not establish what the use site reads. the-fixer's L2 — a
+ * benign initializer reassigned to a token-revoking statement — makes it concrete:
+ * resolving the initializer reads "SELECT 1" and reports CLEAN while the statement
+ * that runs revokes a token. Under-detection produced by the resolver's own logic.
+ * Fail-closed is the only sound verdict; the ACCEPTED COST is that a const->let
+ * refactor of a SQL literal fails the build, which is the intended behaviour.
+ */
+export function findUnresolvableBindings(source, fileName = "db.ts") {
+  const sf = parseGuardSource(fileName, source);
+  return findSqlBackedSoftBindings(sf, hasValidityChangingMutation).map((decl) => ({
+    name: decl.name.getText(sf),
+    line: sf.getLineAndCharacterOfPosition(decl.name.getStart(sf)).line + 1,
+  }));
+}
+
+/**
+ * Premise-style refusal message (#192: "the message is part of the fix"). NAMES
+ * each binding, says WHY it cannot be resolved (let/var is reassignable), and
+ * states the REMEDY (make it const, or inline the literal) — so the cheaper path
+ * out of the failed build is fixing the binding, not deleting the check. Never a
+ * bare "refusing".
+ */
+export function formatRefusal(refusals) {
+  const lines = refusals.map((r) => `    ${r.name}  (declared at line ${r.line})`);
+  return (
+    "  A token/auth SQL statement is held in a reassignable `let`/`var` binding:\n" +
+    lines.join("\n") +
+    "\n\n  A `let`/`var` can be reassigned, so its initializer does not establish what the\n" +
+    "  statement actually executes: reading it could report a false all-clear while a\n" +
+    "  later reassignment revokes a token. This guard refuses to guess rather than miss\n" +
+    "  a bump (exit 2 = cannot analyse, NOT exit 1 = your code is wrong).\n" +
+    "  Remedy: make the binding a `const`, or inline the SQL literal at the call site,\n" +
+    "  so the statement's identity is fixed where it is used.\n"
+  );
 }
 
 function main() {
@@ -282,6 +261,18 @@ function main() {
             `  Fix: keep the primitive a top-level function declaration, or rework this guard\n` +
             `  to resolve cross-module identity (needs a TypeChecker — see guard-ast.mjs).\n`,
         );
+        process.exit(2);
+      }
+      // FAIL-CLOSED REFUSAL (#192 ruling 3), premise-style: exit 2, its own
+      // diagnosis, BEFORE the exit-1 violation scan. A token/auth SQL statement
+      // held in a reassignable let/var cannot be soundly analysed, so refuse with
+      // an actionable message rather than read a stale initializer and pass. Exit
+      // 2 = "I cannot analyse this", kept distinct from exit 1 = "your code is
+      // wrong" — the false-all-clear the exit-1 wording would imply is exactly the
+      // stale cache this guard exists to prevent.
+      const refusals = findUnresolvableBindings(src, path.basename(abs));
+      if (refusals.length > 0) {
+        process.stderr.write(`auth-gen-guard: CANNOT ANALYSE ${abs}\n` + formatRefusal(refusals));
         process.exit(2);
       }
       for (const v of findAuthGenViolations(src, path.basename(abs))) {

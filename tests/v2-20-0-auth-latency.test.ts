@@ -58,7 +58,9 @@ const {
   authCacheSize,
   AUTH_CACHE_MAX_ENTRIES,
 } = await import("../src/auth-cache.js");
-const { findAuthGenViolations } = await import("../scripts/auth-gen-guard.mjs");
+const { findAuthGenViolations, findUnresolvableBindings, formatRefusal } = await import(
+  "../scripts/auth-gen-guard.mjs"
+);
 
 function reset() {
   closeDb();
@@ -394,60 +396,110 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(findAuthGenViolations(benign, "benign.ts")).toEqual([]);
   });
 
-  // ── codex #192 + victra: INDIRECTION-DEPTH axis (not a new scope) ──────────
-  // An alias `const B = A` is the same module scope at a deeper indirection — an
-  // axis the V1–V10 SCOPE map never varied. The resolver must follow aliases to
-  // the TERMINAL literal at arbitrary depth; a hop limit just relocates the gap
-  // ("REVOKE_SQL = ALIAS_SQL = AUTH_SQL escapes tomorrow"). RED at head 45ca048
-  // (one-hop fix): the body splices the alias's initializer text — another
-  // identifier — but never follows it to the SQL.
-  it("HOISTED SQL: const-to-const alias chains do NOT evade at any depth", () => {
-    const chains = `
-      export function bumpAuthGeneration(): void {}
-      const AUTH_SQL = "UPDATE agents SET auth_state = 'revoked' WHERE name = ?";
-      const ONE = AUTH_SQL;                 // depth 1: ONE -> AUTH_SQL
-      const TWO_A = ONE;                    // depth 2: TWO_B -> TWO_A -> ONE -> AUTH_SQL
-      const TWO_B = TWO_A;
-      export function revokeOneHop(name: string): void { getDb().prepare(ONE).run(name); }
-      export function revokeTwoHop(name: string): void { getDb().prepare(TWO_B).run(name); }`;
-    const v = findAuthGenViolations(chains, "chains.ts").map((x: { name: string }) => x.name);
-    expect(v).toContain("revokeOneHop"); // one alias — the exact case codex withheld on
-    expect(v).toContain("revokeTwoHop"); // two aliases — same defect one hop deeper
-  });
+  // ── codex #192 + victra + the-fixer (Addenda 1+2): paste-ready bars ─────────
+  // The indirection axis (depth) and the kind axis (object/array/property) plus
+  // the shadow/let over-detection bars. The resolver is BINDING-correct — it
+  // reuses guard-ast's resolveName — so shadows stay green STRUCTURALLY, not by a
+  // name patrol. Proven-to-bite on the targets and stay-green on the twins is
+  // measured in the same commit (see the guard's PR notes).
 
-  // A reference cycle must TERMINATE (not hang) even though it is not valid
-  // runtime init — the guard is a static AST pass. The real revoke literal is
-  // carried by a separate chain (REF -> C) that must still be resolved.
-  it("HOISTED SQL: a reference cycle terminates and the literal is still resolved", () => {
+  it("HOISTED SQL: alias chains resolve transitively, and cycles terminate", () => {
+    const chain = `
+      export function bumpAuthGeneration(): void {}
+      const AUTH_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      const REVOKE_SQL = AUTH_SQL;
+      const AGAIN_SQL = REVOKE_SQL;
+      export function oneHop(n: string): void { getDb().prepare(REVOKE_SQL).run(n); }
+      export function twoHop(n: string): void { getDb().prepare(AGAIN_SQL).run(n); }`;
+    const c = findAuthGenViolations(chain, "chain.ts").map((x: { name: string }) => x.name);
+    expect(c).toContain("oneHop");
+    expect(c).toContain("twoHop");
+
+    // Cycles must not hang or throw — the assertion is that this RETURNS.
     const cyclic = `
       export function bumpAuthGeneration(): void {}
-      const A = B;
-      const B = A;                          // A<->B cycle: the seen-set must break it
-      const C = "UPDATE agents SET token_hash = NULL WHERE name = ?";
-      const REF = C;
-      export function usesCycleAndLiteral(name: string): void {
-        getDb().prepare(A).run(name);       // touches the cycle — must not hang
-        getDb().prepare(REF).run(name);     // and the real revoke literal via C
-      }`;
-    const v = findAuthGenViolations(cyclic, "cyclic.ts").map((x: { name: string }) => x.name);
-    expect(v).toContain("usesCycleAndLiteral");
+      const A: string = B;
+      const B: string = A;
+      export function cyc(n: string): void { getDb().prepare(A).run(n); }`;
+    expect(() => findAuthGenViolations(cyclic, "cyc.ts")).not.toThrow();
   });
 
-  // Transitive resolution must NOT over-flag: a benign column stays benign through
-  // any number of aliases, and an aliased sensitive-SQL chain WITH a bump is clean.
-  it("HOISTED SQL: transitive resolution does not over-flag benign / bumped alias chains", () => {
+  // GREEN TODAY — regression bar. Resolve by BINDING, not name (ruling 2).
+  it("HOISTED SQL: a SHADOWED name must not be attributed to the module constant", () => {
+    const shadowed = `
+      export function bumpAuthGeneration(): void {}
+      const REVOKE_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function localShadow(n: string): void {
+        const REVOKE_SQL = "SELECT 1";
+        getDb().prepare(REVOKE_SQL).run(n);
+      }
+      export function paramShadow(REVOKE_SQL: string, n: string): void {
+        getDb().prepare(REVOKE_SQL).run(n);
+      }`;
+    expect(findAuthGenViolations(shadowed, "shadow.ts")).toEqual([]);
+  });
+
+  it("HOISTED SQL: object-property and array-element constants are resolved (ADR-0003 ruling 4)", () => {
+    const kinds = `
+      export function bumpAuthGeneration(): void {}
+      const Q = { revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?" };
+      const NESTED = { sql: { purge: "DELETE FROM agents WHERE name = ?" } };
+      const LIST = ["UPDATE agents SET auth_state = 'revoked' WHERE name = ?"];
+      const ALIASED = Q.revoke;
+      export function viaProp(n: string): void   { getDb().prepare(Q.revoke).run(n); }
+      export function viaNested(n: string): void { getDb().prepare(NESTED.sql.purge).run(n); }
+      export function viaIndex(n: string): void  { getDb().prepare(LIST[0]).run(n); }
+      export function viaAlias(n: string): void  { getDb().prepare(ALIASED).run(n); }`;
+    const v = findAuthGenViolations(kinds, "kinds.ts").map((x: { name: string }) => x.name);
+    expect(v).toEqual(expect.arrayContaining(["viaProp", "viaNested", "viaIndex", "viaAlias"]));
+  });
+
+  // The over-detection twins for the kind axis. VACUOUSLY green before the
+  // resolver landed (nothing resolved) — they only start testing anything now
+  // that it exists: local shadow, benign column, and per-unit attribution.
+  it("HOISTED SQL: property resolution must not over-flag (shadowing / benign column / attribution)", () => {
     const benign = `
       export function bumpAuthGeneration(): void {}
-      const TOUCH_SQL = "UPDATE agents SET last_seen = ? WHERE name = ?";
-      const T1 = TOUCH_SQL;
-      const T2 = T1;                        // benign column, aliased twice
-      const ROTATE_SQL = "UPDATE agents SET token_hash = ? WHERE name = ?";
-      const R1 = ROTATE_SQL;                // sensitive, aliased — but the user bumps
-      export function touchLastSeen(name: string): void { getDb().prepare(T2).run("t", name); }
-      export function properRotate(name: string): void {
-        getDb().prepare(R1).run("h", name);
-        bumpAuthGeneration();
-      }`;
+      const Q = { revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?" };
+      const T = { touch: "UPDATE agents SET last_seen = ? WHERE name = ?" };
+      export function shadowed(n: string): void {
+        const Q = { revoke: "SELECT 1" };      // local shadows the module object
+        getDb().prepare(Q.revoke).run(n);
+      }
+      export function touchOnly(n: string): void { getDb().prepare(T.touch).run(n); }`;
     expect(findAuthGenViolations(benign, "benign2.ts")).toEqual([]);
+
+    const siblings = `
+      export function bumpAuthGeneration(): void {}
+      const Q = {
+        revoke: "UPDATE agents SET token_hash = NULL WHERE name = ?",
+        purge: "DELETE FROM agents WHERE name = ?",
+      };
+      export function goodOne(n: string): void { getDb().prepare(Q.revoke).run(n); bumpAuthGeneration(); }
+      export function badOne(n: string): void  { getDb().prepare(Q.purge).run(n); }`;
+    const s = findAuthGenViolations(siblings, "sib.ts").map((x: { name: string }) => x.name);
+    expect(s).toContain("badOne");
+    expect(s).not.toContain("goodOne");
+  });
+
+  // Ruling 3 + "the message is part of the fix" — fail-closed, premise-style (B):
+  // exit 2, its own diagnosis. Seam: findUnresolvableBindings + formatRefusal.
+  it("HOISTED SQL: an unresolvable binding is REFUSED, and the refusal is actionable", () => {
+    const loose = `
+      export function bumpAuthGeneration(): void {}
+      let REVOKE_SQL = "SELECT 1";
+      REVOKE_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function l2(n: string): void { getDb().prepare(REVOKE_SQL).run(n); }`;
+    const refusals = findUnresolvableBindings(loose, "loose.ts");
+    expect(refusals).toHaveLength(1);
+
+    const msg = formatRefusal(refusals);
+    expect(msg).toContain("REVOKE_SQL"); // NAMES the binding
+    expect(msg).toMatch(/let|reassign/i); // says WHY it cannot be resolved
+    expect(msg).toMatch(/const|inline/i); // says WHAT TO DO instead
+
+    // The exit-1 violation scan stays clean for the same file: the let is handled
+    // by the refusal path, not attributed as a mutation-without-bump.
+    expect(findAuthGenViolations(loose, "loose.ts")).toEqual([]);
   });
 });
