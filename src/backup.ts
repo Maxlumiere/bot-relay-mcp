@@ -36,7 +36,7 @@ import { spawnSync } from "child_process";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
-import { snapshotToFile, openReadOnly } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, getActiveDriver } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { ERROR_CODES } from "./error-codes.js";
@@ -137,6 +137,14 @@ interface ExportOptions {
  */
 export async function exportRelayState(options: ExportOptions = {}): Promise<ExportResult> {
   await initializeDb();
+  // #171/codex: dispatch on the ACTUAL driver in use, never getDriverType() (the
+  // requested RELAY_SQLITE_DRIVER env can diverge from the live connection after
+  // init — the #172 read-the-state-not-the-request class). getActiveDriver() is
+  // the primitive #172's fix used; non-null after initializeDb (defensive guard).
+  const activeDriver = getActiveDriver();
+  if (!activeDriver) {
+    throw new Error("exportRelayState: no active SQLite driver after initializeDb()");
+  }
   const srcDbPath = getDbPath();
   if (!fs.existsSync(srcDbPath)) {
     throw new Error(`Source DB not found at '${srcDbPath}'. Nothing to back up.`);
@@ -162,11 +170,12 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // while the daemon writes); wasm → atomic export() bytes (tear-proof — a
     // plain copy of the write-back file could observe a half-written flush). See
     // sqlite-compat.snapshotToFile. Works on BOTH drivers.
-    snapshotToFile(getDb(), snapshotDbPath);
+    snapshotToFile(getDb(), snapshotDbPath, activeDriver);
 
     // Row counts from the snapshot (not the live DB) so they match the archive.
-    // #171: openReadOnly is driver-aware (native better-sqlite3 / wasm sql.js).
-    const snap = await openReadOnly(snapshotDbPath);
+    // #171: openReadOnly is driver-aware (native better-sqlite3 / wasm sql.js),
+    // dispatched on the ACTUAL active driver.
+    const snap = await openReadOnly(snapshotDbPath, activeDriver);
     const row_counts: Record<string, number> = {};
     const tables = ["agents", "messages", "tasks", "channels", "channel_members", "channel_messages", "webhook_subscriptions", "webhook_delivery_log", "agent_capabilities", "audit_log"];
     for (const t of tables) {
@@ -277,10 +286,22 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     }
   }
 
+  // #171/codex: capture the ACTUAL driver up front — BEFORE step 2's closeDb
+  // resets it — so the integrity probe binds to the real connection, not the
+  // mutable requested env (read-the-state-not-the-request). initializeDb is
+  // idempotent; `dbExistedBefore` preserves the "no safety-backup on a first-ever
+  // restore" behavior despite this eager init.
+  const srcDbPath = getDbPath();
+  const dbExistedBefore = fs.existsSync(srcDbPath);
+  await initializeDb();
+  const activeDriver = getActiveDriver();
+  if (!activeDriver) {
+    throw new Error("importRelayState: no active SQLite driver after initializeDb()");
+  }
+
   // --- Step 1: safety-backup the current DB (unless there isn't one yet) ---
   let previousBackupPath = "";
-  const srcDbPath = getDbPath();
-  if (fs.existsSync(srcDbPath)) {
+  if (dbExistedBefore) {
     const backupsDir = getBackupsDir();
     // v2.1 Phase 4c.4: ensureSecureDir (vs bare mkdirSync) — same pattern as
     // the primary export path; safety backups get 0700 directory treatment.
@@ -334,8 +355,9 @@ export async function importRelayState(archivePath: string, options: ImportOptio
 
     // --- Step 5: integrity check the extracted DB ---
     // #171: driver-aware read-only open (native better-sqlite3 / wasm sql.js) so
-    // restore's integrity check works on the wasm driver too.
-    const probe = await openReadOnly(extractedDbPath);
+    // restore's integrity check works on the wasm driver too — dispatched on the
+    // ACTUAL driver captured before closeDb, not the requested env.
+    const probe = await openReadOnly(extractedDbPath, activeDriver);
     try {
       const check = probe.prepare("PRAGMA integrity_check").get() as { integrity_check: string } | undefined;
       if (!check || check.integrity_check !== "ok") {

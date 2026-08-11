@@ -122,3 +122,39 @@ describe("#171 backup/restore on the wasm driver + cross-driver interop", () => 
     expect(hasMessage).toBe(true);
   });
 });
+
+describe("#190 requested-vs-actual driver seam — dispatch follows the LIVE connection, not the mutable env", () => {
+  it("WASM-initialized, RELAY_SQLITE_DRIVER mutated to native WITHOUT closeDb → export still succeeds", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    closeDb();
+    await initializeDb();
+    expect(getActiveDriver()).toBe("wasm");
+    registerAgent("seam-w", "role", []);
+    sendMessage("seam-w", "seam-w", "seam", "normal");
+    // Mutate the REQUESTED env WITHOUT re-initializing. Pre-#190, snapshotToFile
+    // branched on getDriverType() (env) → it would take native's VACUUM INTO
+    // path against the live WasmDatabase and throw "unable to open database".
+    // The fix dispatches on getActiveDriver() (the live connection), so export
+    // succeeds. Reds on the pre-fix env-based dispatch.
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    const res = await exportRelayState();
+    expect(fs.existsSync(res.archive_path), "wasm-initialized export must succeed despite the native env").toBe(true);
+    closeDb();
+  });
+
+  it("NATIVE-initialized, RELAY_SQLITE_DRIVER mutated to wasm WITHOUT closeDb → export still succeeds", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    closeDb();
+    await initializeDb();
+    expect(getActiveDriver()).toBe("native");
+    registerAgent("seam-n", "role", []);
+    sendMessage("seam-n", "seam-n", "seam", "normal");
+    // The mirror seam: a native connection with the env mutated to wasm must
+    // still VACUUM INTO (the live driver), not try wasm serialize on a
+    // better-sqlite3 handle (which lacks serialize()).
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const res = await exportRelayState();
+    expect(fs.existsSync(res.archive_path), "native-initialized export must succeed despite the wasm env").toBe(true);
+    closeDb();
+  });
+});

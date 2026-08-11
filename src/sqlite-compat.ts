@@ -44,7 +44,16 @@ export interface CompatDatabase {
 
 export type SqliteDriver = "native" | "wasm";
 
-export function getDriverType(): SqliteDriver {
+/**
+ * The REQUESTED driver (RELAY_SQLITE_DRIVER env). DELIBERATELY NOT EXPORTED
+ * (#190/codex): its only legitimate use is driver SELECTION at init (below). The
+ * env is mutable and can diverge from the live connection, so branching on it at
+ * a DISPATCH site is the read-the-state-not-the-request defect (#172/#190 class).
+ * Dispatch sites must import getActiveDriver() (the ACTUAL instantiated driver)
+ * instead — keeping this module-private makes the wrong primitive unreachable
+ * from them by construction, not by remembering to avoid it.
+ */
+function getDriverType(): SqliteDriver {
   const raw = process.env.RELAY_SQLITE_DRIVER || "native";
   if (raw === "wasm") return "wasm";
   return "native";
@@ -306,11 +315,18 @@ async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
  *   copy of the write-back file would NOT be: the wasm flush is a bare
  *   `fs.writeFileSync` (no temp-and-rename, no lock), so a concurrent reader can
  *   observe it half-written — and a torn backup fails silently at restore.
+ *
+ * `driver` MUST be the ACTUAL instantiated driver (getActiveDriver()), NOT
+ * getDriverType() (the requested RELAY_SQLITE_DRIVER env). The env is mutable and
+ * can diverge from the live connection after init — branching on it would take
+ * the native VACUUM INTO path against a live WasmDatabase (the #172 actual-vs-
+ * requested class). Callers capture the active driver after initializeDb() and
+ * pass it in.
  */
-export function snapshotToFile(db: CompatDatabase, destPath: string): void {
+export function snapshotToFile(db: CompatDatabase, destPath: string, driver: SqliteDriver): void {
   const dir = path.dirname(destPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (getDriverType() === "wasm") {
+  if (driver === "wasm") {
     if (typeof db.serialize !== "function") {
       throw new Error("snapshotToFile: wasm driver did not expose serialize()");
     }
@@ -328,12 +344,15 @@ export function snapshotToFile(db: CompatDatabase, destPath: string): void {
  * - native: better-sqlite3 `{ readonly: true }`.
  * - wasm: load the file bytes into a fresh sql.js instance. (Probe-only; close()
  *   re-writes the identical bytes, which is a harmless no-op on a temp file.)
+ *
+ * `driver` MUST be the ACTUAL instantiated driver (getActiveDriver()), not the
+ * requested env — see snapshotToFile. Callers capture it after initializeDb().
  */
-export async function openReadOnly(dbPath: string): Promise<CompatDatabase> {
+export async function openReadOnly(dbPath: string, driver: SqliteDriver): Promise<CompatDatabase> {
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
-  if (getDriverType() === "wasm") {
+  if (driver === "wasm") {
     let initSqlJs: any;
     try {
       const mod = await import("sql.js");
