@@ -760,9 +760,13 @@ fi
 # even though its own get_messages(pending) would re-surface them (v2.0 #6). The
 # correlated subselect binds THIS agent's current session so the preview matches
 # exactly what get_messages(pending) returns: unresolved AND (never read, OR read
-# by a DIFFERENT session). A NULL session_id (pre-register) degrades safely to
-# "never read" (read_by_session != NULL is NULL), the conservative fresh-mail
-# view. Guarded by tests/v2-26-pending-predicate-ssot.test.ts.
+# by a DIFFERENT session). COALESCE(session_id, '') mirrors get_messages'
+# `currentSession ?? ""` EXACTLY — with a NULL/missing session it becomes
+# `read_by_session != ''`, so a row read by a PRIOR session still re-pends (the
+# v2.0 #6 handover), identical to the drain. Without the COALESCE, `!= NULL`
+# is SQL NULL and would silently hide that row in the pre-register state — a
+# wake-vs-drain divergence, the exact class this predicate exists to kill.
+# Executed-hook coverage in tests/v2-26-pending-predicate-ssot.test.ts.
 MESSAGES=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT '  From: ' || from_agent || ' | ' || content || ' (' || created_at || ')'
@@ -770,7 +774,7 @@ FROM messages
 WHERE to_agent = :name
   AND resolved_at IS NULL
   AND (read_by_session IS NULL
-       OR read_by_session != (SELECT session_id FROM agents WHERE name = :name))
+       OR read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = :name), ''))
 ORDER BY created_at DESC LIMIT 10;
 SQL
 )

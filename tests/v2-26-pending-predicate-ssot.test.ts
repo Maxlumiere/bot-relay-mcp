@@ -17,6 +17,10 @@
  * into stderr) to an ENFORCED invariant: the peek wake signal, the get_messages
  * pending drain, health's backlog count, and the canonical predicate helpers
  * (`pendingForSessionClause` / `pendingGlobalClause`) must AGREE across scenarios.
+ * The suite ALSO invokes the probe directly (`sampleGetMessagesConsistency`): it
+ * detects a dropped pending row, and — now that the probe's superset derives from
+ * the SSOT — no longer false-positives on a dropped RESOLVED one. The promotion
+ * is exercised here, not merely asserted.
  * Two of the assertions are NEGATIVE CONTROLS — they compute the OLD, buggy
  * predicate alongside the new one and prove the old one would report the wrong
  * number. That makes the guard load-bearing: if a surface is reverted to a
@@ -64,6 +68,13 @@ const {
   pendingGlobalClause,
 } = await import("../src/db.js");
 
+// The promoted consistency-probe — invoked directly below, not merely claimed.
+const {
+  sampleGetMessagesConsistency,
+  _resetProbeCounterForTests,
+  _probeDivergenceCountForTests,
+} = await import("../src/transport/consistency-probe.js");
+
 /** The agent's current session as get_messages/peek resolve it. */
 function agentSession(agent: string): string {
   const row = getDb()
@@ -90,6 +101,8 @@ beforeEach(() => {
 afterEach(() => {
   try { closeDb(); } catch { /* ignore */ }
   try { fs.rmSync(TEST_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
+  delete process.env.RELAY_CONSISTENCY_PROBE;
+  delete process.env.RELAY_CONSISTENCY_PROBE_RATE;
 });
 
 describe("#53 pending predicate SSOT — every surface derives from one definition", () => {
@@ -190,10 +203,12 @@ describe("#53 pending predicate SSOT — every surface derives from one definiti
 
   it("check-relay.sh delivers on the canonical per-session predicate, not the binary status column", () => {
     const hook = fs.readFileSync(path.join(PROJECT_ROOT, "hooks/check-relay.sh"), "utf8");
-    // The delivery query must use the canonical predicate…
+    // The delivery query must use the canonical predicate, with COALESCE(…, '')
+    // so a NULL/missing session mirrors get_messages' `currentSession ?? ""`
+    // (re-pends a prior session's unresolved mail) rather than hiding it.
     expect(hook).toContain("resolved_at IS NULL");
     expect(hook).toMatch(
-      /read_by_session IS NULL\s+OR\s+read_by_session != \(SELECT session_id FROM agents WHERE name = :name\)/,
+      /read_by_session IS NULL\s+OR\s+read_by_session != COALESCE\(\(SELECT session_id FROM agents WHERE name = :name\), ''\)/,
     );
     // …and must NOT deliver on the pre-#53 binary `status='pending'` filter.
     expect(hook).not.toMatch(/FROM messages WHERE to_agent = :name AND status\s*=\s*'pending'/);
@@ -207,5 +222,51 @@ describe("#53 pending predicate SSOT — every surface derives from one definiti
     expect(stop).toMatch(/status = 'pending'/); // stop-check.sh still binary-status (residual)
     const db = fs.readFileSync(path.join(PROJECT_ROOT, "src/db.ts"), "utf8");
     expect(db).toMatch(/m\.seq IS NULL\s+THEN 1/); // getInboxSummary.unread_count still seq-based (residual)
+  });
+});
+
+describe("#53 consistency-probe — promoted to an ENFORCED invariant (invoked, not merely claimed)", () => {
+  it("detects a DROPPED pending row via the SSOT superset (the v2.2.1 class it was built for)", () => {
+    process.env.RELAY_CONSISTENCY_PROBE = "1";
+    process.env.RELAY_CONSISTENCY_PROBE_RATE = "1";
+    _resetProbeCounterForTests();
+    registerAgent("probe-from", "role", []);
+    registerAgent("probe-to", "role", []);
+    sendMessage("probe-from", "probe-to", "live-pending", "normal");
+    // The MCP path erroneously returns nothing though a pending row exists —
+    // exactly the drops-pending regression. The probe's SSOT superset
+    // (pendingGlobalClause) sees the row and flags the divergence.
+    sampleGetMessagesConsistency({
+      agentName: "probe-to",
+      status: "pending",
+      limit: 100,
+      peek: false,
+      mcpResult: [],
+    });
+    expect(_probeDivergenceCountForTests()).toBe(1);
+  });
+
+  it("does NOT flag a dropped RESOLVED message — the probe now respects resolved_at (SSOT), where the pre-#53 predicate false-positived", () => {
+    process.env.RELAY_CONSISTENCY_PROBE = "1";
+    process.env.RELAY_CONSISTENCY_PROBE_RATE = "1";
+    _resetProbeCounterForTests();
+    registerAgent("probe2-from", "role", []);
+    registerAgent("probe2-to", "role", []);
+    const id = sendMessage("probe2-from", "probe2-to", "handled", "normal").id;
+    // resolveMessages stamps resolved_at, leaves status='pending' + read_by_session NULL.
+    resolveMessages("probe2-to", [id]);
+    // The MCP path CORRECTLY returns nothing (resolved => not pending). The
+    // pre-#53 probe superset (`read_by_session IS NULL OR status='pending'`) would
+    // have SEEN this row and falsely flagged a divergence; the SSOT superset
+    // (pendingGlobalClause, resolved_at IS NULL) excludes it. This is the probe's
+    // SSOT-routing bite.
+    sampleGetMessagesConsistency({
+      agentName: "probe2-to",
+      status: "pending",
+      limit: 100,
+      peek: false,
+      mcpResult: [],
+    });
+    expect(_probeDivergenceCountForTests()).toBe(0);
   });
 });
