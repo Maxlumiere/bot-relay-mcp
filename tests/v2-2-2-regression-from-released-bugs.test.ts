@@ -90,13 +90,22 @@ describe("v2.2.2 regression-from-released-bugs", () => {
   });
 
   // ─── v2.2.1 B4 ──────────────────────────────────────────────────────
-  it("(3) since-filter trap — get_messages returns hint when narrow window hides pending mail", () => {
+  it("(3) since-filter trap — get_messages returns hint when a narrow window hides ALREADY-SEEN pending mail (#198: never-observed mail is delivered, not hidden, so this uses observed mail)", () => {
     registerAgent("r3-from", "r", []);
     registerAgent("r3-to", "r", []);
-    // Backdate a pending message by 25 minutes.
+    const db = getDb();
+    db.prepare("UPDATE agents SET session_id = 'r3-sess-a' WHERE name = 'r3-to'").run();
     sendMessage("r3-from", "r3-to", "stale-pending", "normal");
+    // Observe it once (session A) so it is already-SEEN: seq assigned, read_by_session set.
+    // Pre-#198 this test used a NEVER-observed message; #198 now DELIVERS such mail
+    // regardless of `since` (see tests/seq-delivery-hole.test.ts), so the trap the
+    // hint guards against — a narrow window silently hiding pending mail — now only
+    // applies to already-observed mail re-pending for a fresh session.
+    handleGetMessages({ agent_name: "r3-to", status: "pending", limit: 20 } as any);
+    // Fresh terminal (session B) → the observed message re-pends; backdate it 25 min.
+    db.prepare("UPDATE agents SET session_id = 'r3-sess-b' WHERE name = 'r3-to'").run();
     const stamp = new Date(Date.now() - 25 * 60 * 1000).toISOString();
-    getDb().prepare("UPDATE messages SET created_at = ? WHERE to_agent = ?").run(stamp, "r3-to");
+    db.prepare("UPDATE messages SET created_at = ? WHERE to_agent = ?").run(stamp, "r3-to");
     const res = handleGetMessages({
       agent_name: "r3-to",
       status: "pending",
@@ -105,8 +114,8 @@ describe("v2.2.2 regression-from-released-bugs", () => {
       peek: false,
     } as any);
     const parsed = JSON.parse(res.content[0].text);
-    expect(parsed.count).toBe(0);
-    expect(parsed.hint).toBeTruthy();
+    expect(parsed.count).toBe(0); // observed-old mail is window-trimmed for session B
+    expect(parsed.hint).toBeTruthy(); // ...and the hint fires to say so
     expect(parsed.hint).toMatch(/since/i);
   });
 
