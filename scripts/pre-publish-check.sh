@@ -192,6 +192,18 @@ step "vitest run" npx vitest run --pool=forks --no-file-parallelism || exit 1
 # transient registry errors with backoff and soft-fails on three-in-a-row
 # transient classifications (Dependabot remains the defense-in-depth for
 # real advisories). Real high+ vuln findings still exit 1 immediately.
+#
+# ── WHEN THIS GATE REDS, FIX FORWARD — NEVER WAIVE. ─────────────────────────
+# A new advisory reding this gate and blocking otherwise-unrelated work is the
+# gate WORKING, not misfiring: the last silent HIGH sat unnoticed for days until
+# someone happened to look; the audit gate stops one within hours, loudly, with
+# the package named. The answer is ALWAYS to RESOLVE the advisory — bump the dep,
+# or (preferred) let natural range-resolution pick the patched version, since an
+# override silently defeats Dependabot's future auto-fix for that package (see
+# SECURITY.md "Dependency overrides"). It is NEVER to exempt the PR, downgrade
+# this threshold, or add an allowlist entry to get moving. A gate that can be
+# waived under deadline pressure is decoration. If an advisory has NO clean fix,
+# that is an escalation to the maintainer — not a waiver.
 step "npm audit (high+)" bash "$PROJECT_ROOT/scripts/audit-with-retry.sh" high || exit 1
 
 # --- 4. Production build --- (moved to step 2, above — the vitest steps import
