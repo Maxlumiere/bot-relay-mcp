@@ -16,6 +16,28 @@
  * file — a check that carries its own copy of "the guards" can go stale against
  * the thing it checks, which is the same defect class it exists to catch. Add a
  * new scripts/*-guard.mjs and this test fails until a gate invokes it.
+ *
+ * BOUNDARY — MEASURED, NOT REASONED (victra, #196). This check asserts that a
+ * `node …<guard>` invocation STRING exists somewhere in a gate file. That is a
+ * TEXTUAL PROXY for execution, and its limit was measured, not argued: a guard
+ * wired into a shell function that no `step` line ever calls — e.g.
+ * scripts/_dead-guard.mjs behind `_never_called_step() { node …_dead-guard.mjs; }`
+ * with no `step "…" _never_called_step` line — makes this suite PASS.
+ *   - What it ESTABLISHES: a guard file present on disk with NO invocation text
+ *     anywhere in the gates reddens the build. That is the real defect class this
+ *     exists for — "add a guard file, forget to wire it at all" — and it is closed.
+ *   - What it does NOT establish: that the matched invocation is actually REACHED
+ *     at gate runtime. An invocation that is dead (inside a function no `step`
+ *     calls — measured above), commented out (`# node …guard.mjs` still matches
+ *     the regex), or in a branch that never runs will PASS. Presence-of-text,
+ *     not execution.
+ * This is the day's lesson one level up: a textual proxy standing in for
+ * behaviour — the same shape as the ADR-0003 auth-gen guard matching SQL text for
+ * what a statement DOES. The execution-based fix — assert each guard in the gate's
+ * actual RUN LIST, not its source text — is filed as #197 for the backlog, gated
+ * on first MEASURING the cost of running the gate inside a test (a slow/flaky gate
+ * is worse than this textual check with its boundary stated). Do not "harden" this
+ * regex to chase dead code; the honest fix is run-list, not a smarter proxy.
  */
 import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync } from "fs";
