@@ -9,7 +9,8 @@
  * Coverage:
  *   - getInboxSummary() returns a row for every registered agent, including
  *     agents with zero mail (pending=0, unread=0, last_message_at=null).
- *   - pending_count + unread_count reflect status='pending' / seq IS NULL.
+ *   - pending_count reflects status='pending'; unread_count reflects the canonical
+ *     read_by_session IS NULL AND resolved_at IS NULL (pendingGlobalClause), #56.
  *   - Drain (getMessages) flips pending_count to 0 but last_message_at is
  *     retained — a drained inbox still shows history.
  *   - snapshotApi enriches agents[] with the three new fields without

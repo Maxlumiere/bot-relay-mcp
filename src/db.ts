@@ -4415,10 +4415,14 @@ export function buildAgentTopology(): {
  * Semantics:
  *   - pending_count — messages still in status='pending' (not yet drained
  *     by a get_messages call that flipped them to 'read').
- *   - unread_count  — messages whose seq is still NULL. Mirrors the
- *     peek_inbox_version v2.3 signal: seq is assigned the moment a
- *     recipient observes the message, so seq IS NULL is the authoritative
- *     "never-observed" count regardless of later status transitions.
+ *   - unread_count  — the CANONICAL session-agnostic unread (#56):
+ *     read_by_session IS NULL AND resolved_at IS NULL (= pendingGlobalClause,
+ *     "not read by any session and not resolved"). Was `seq IS NULL` (mirroring
+ *     peek's v2.3 signal), but seq is stamped by ANY observation — including a
+ *     NON-consuming browse (get_messages peek=true / status='all') that never
+ *     drains — so the seq count silently DISAGREED with the drain and the other
+ *     SSOT surfaces. read_by_session moves with the drain, so this now agrees
+ *     with pending_count.
  *   - last_message_at — ISO of MAX(created_at) across any status; NULL
  *     when the agent has no inbox history.
  */
@@ -4437,7 +4441,12 @@ export function getInboxSummary(): Array<{
       // would inflate unread_count by 1 per mail-less agent.
       `SELECT a.name AS agent_name,
               COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.status = 'pending' AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS pending_count,
-              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.seq IS NULL        THEN 1 ELSE 0 END), 0) AS unread_count,
+              -- #56: canonical session-agnostic unread = pendingGlobalClause
+              -- (read_by_session IS NULL AND resolved_at IS NULL), not seq IS NULL.
+              -- seq is stamped by any observation (incl. a non-consuming browse),
+              -- so it silently disagreed with the other SSOT surfaces; read_by_session
+              -- moves with the drain, so this now agrees with pending_count above.
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.read_by_session IS NULL AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS unread_count,
               MAX(m.created_at) AS last_message_at
          FROM agents a
          LEFT JOIN messages m ON m.to_agent = a.name
