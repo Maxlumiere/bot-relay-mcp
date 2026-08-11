@@ -314,38 +314,10 @@ export async function initializeDb(): Promise<void> {
   // And narrow the DB file itself to 0600 right after create.
   ensureSecureFile(dbPath, 0o600);
 
-  _db.pragma("journal_mode = WAL");
-  _db.pragma("foreign_keys = ON");
-  _db.pragma("busy_timeout = 5000");
-
-  initSchema(_db);
-  migrateSchemaToV1_7(_db);
-  migrateSchemaToV2_0(_db);
-  migrateSchemaToV2_1(_db);
-  migrateSchemaToV2_2(_db);
-  migrateSchemaToV2_3(_db);
-  migrateSchemaToV2_4(_db);
-  migrateSchemaToV2_5(_db);
-  migrateSchemaToV2_6(_db);
-  migrateSchemaToV2_7(_db);
-  migrateSchemaToV2_8(_db);
-  migrateSchemaToV2_9(_db);
-  migrateSchemaToV2_10(_db);
-  migrateSchemaToV2_11(_db);
-  migrateSchemaToV2_12(_db);
-  migrateSchemaToV2_13(_db);
-  migrateSchemaToV2_14(_db);
-  migrateSchemaToV2_15(_db);
-  migrateSchemaToV2_16(_db);
-  migrateSchemaToV2_19(_db);
-  migrateSchemaToV2_20(_db);
-  migrateSchemaToV2_21(_db);
-  migrateSchemaToV2_22(_db);
-  migrateSchemaToV2_23(_db);
-  migrateSchemaToV2_24(_db);
-  seedBuiltinTaskSchemas(_db);
-  finalizeSchemaVersion(_db);
-  purgeOldRecords(_db);
+  // #171 — single-sourced schema setup (pragmas + full migration chain + seed +
+  // finalize + purge). Shared with getDb()'s native fallback so the two paths
+  // cannot drift; see applySchemaSetup below.
+  applySchemaSetup(_db);
 }
 
 export function getDb(): CompatDatabase {
@@ -369,40 +341,57 @@ export function getDb(): CompatDatabase {
   const Database = req("better-sqlite3");
   _db = new Database(dbPath) as unknown as CompatDatabase;
   ensureSecureFile(dbPath, 0o600);
-  _db.pragma("journal_mode = WAL");
-  _db.pragma("foreign_keys = ON");
-  _db.pragma("busy_timeout = 5000");
-
-  initSchema(_db);
-  migrateSchemaToV1_7(_db);
-  migrateSchemaToV2_0(_db);
-  migrateSchemaToV2_1(_db);
-  migrateSchemaToV2_2(_db);
-  migrateSchemaToV2_3(_db);
-  migrateSchemaToV2_4(_db);
-  migrateSchemaToV2_5(_db);
-  migrateSchemaToV2_6(_db);
-  migrateSchemaToV2_7(_db);
-  migrateSchemaToV2_8(_db);
-  migrateSchemaToV2_9(_db);
-  migrateSchemaToV2_10(_db);
-  migrateSchemaToV2_11(_db);
-  migrateSchemaToV2_12(_db);
-  migrateSchemaToV2_13(_db);
-  migrateSchemaToV2_14(_db);
-  migrateSchemaToV2_15(_db);
-  migrateSchemaToV2_16(_db);
-  migrateSchemaToV2_19(_db);
-  migrateSchemaToV2_20(_db);
-  migrateSchemaToV2_21(_db);
-  migrateSchemaToV2_22(_db);
-  migrateSchemaToV2_23(_db);
-  migrateSchemaToV2_24(_db);
-  seedBuiltinTaskSchemas(_db);
-  finalizeSchemaVersion(_db);
-  purgeOldRecords(_db);
+  // #171 — same single-sourced schema setup the eager initializeDb() path runs.
+  // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.
+  applySchemaSetup(_db);
 
   return _db;
+}
+
+/**
+ * #171 — the SINGLE source of truth for schema setup: pragmas, the base schema,
+ * the FULL ordered migration chain, built-in task-schema seeding, version
+ * finalization, and record purge. Extracted so the two init paths — the async
+ * driver-aware `initializeDb()` and `getDb()`'s synchronous native fallback —
+ * run the EXACT same sequence and cannot drift: a new migration (e.g. a future
+ * `migrateSchemaToV2_25`) is added here ONCE. Every step is idempotent and
+ * driver-agnostic (operates on the CompatDatabase interface), so it is safe on a
+ * fresh DB and on re-entry. Path equivalence is guarded by
+ * tests/migration-chain-equivalence.test.ts (codex #171 acceptance).
+ */
+function applySchemaSetup(db: CompatDatabase): void {
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  db.pragma("busy_timeout = 5000");
+
+  initSchema(db);
+  migrateSchemaToV1_7(db);
+  migrateSchemaToV2_0(db);
+  migrateSchemaToV2_1(db);
+  migrateSchemaToV2_2(db);
+  migrateSchemaToV2_3(db);
+  migrateSchemaToV2_4(db);
+  migrateSchemaToV2_5(db);
+  migrateSchemaToV2_6(db);
+  migrateSchemaToV2_7(db);
+  migrateSchemaToV2_8(db);
+  migrateSchemaToV2_9(db);
+  migrateSchemaToV2_10(db);
+  migrateSchemaToV2_11(db);
+  migrateSchemaToV2_12(db);
+  migrateSchemaToV2_13(db);
+  migrateSchemaToV2_14(db);
+  migrateSchemaToV2_15(db);
+  migrateSchemaToV2_16(db);
+  migrateSchemaToV2_19(db);
+  migrateSchemaToV2_20(db);
+  migrateSchemaToV2_21(db);
+  migrateSchemaToV2_22(db);
+  migrateSchemaToV2_23(db);
+  migrateSchemaToV2_24(db);
+  seedBuiltinTaskSchemas(db);
+  finalizeSchemaVersion(db);
+  purgeOldRecords(db);
 }
 
 /**
