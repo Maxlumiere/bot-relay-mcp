@@ -336,18 +336,27 @@ sqlite_peek() {
   command -v sqlite3 >/dev/null 2>&1 || return 1
   command -v python3 >/dev/null 2>&1 || return 1
 
-  # `resolved_at IS NULL` mirrors the authoritative get_messages pending
-  # query: resolve_messages stamps resolved_at WITHOUT touching status, so a
-  # status-only filter would wake the agent for mail get_messages will not
-  # return — a block loop with nothing to drain (codex #124). The column
-  # exists since v2.12; on a pre-v2.12 legacy DB the query errors and we
-  # retry without the filter rather than silently losing the whole fallback.
+  # #56 — canonical per-session pending predicate (SSOT: src/db.ts
+  # pendingForSessionClause), replicated in SQL because a shell hook can't call
+  # the TS helper. This is exactly what get_messages(pending) returns for this
+  # agent's CURRENT session: unresolved AND (never read, OR read by a DIFFERENT
+  # session). COALESCE(session_id,'') mirrors get_messages' `currentSession ?? ""`
+  # (a NULL/missing session re-pends a prior session's unresolved mail). Pre-#56
+  # this keyed on the binary `status` column, which flips to 'read' GLOBALLY on
+  # the first MCP drain by ANY session — so a fresh Stop-hook wake under-reported
+  # re-pendable mail (codex #124's resolved_at guard is now subsumed here).
+  # read_by_session + resolved_at exist since v2.0 / v2.12; on an older legacy DB
+  # the query errors and we retry with the bare-status fallback below (the only
+  # signal such a DB has).
   local rows
   rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 .parameter set :lim $MAX_MESSAGES
 SELECT from_agent, priority
-FROM messages WHERE to_agent = :name AND status = 'pending' AND resolved_at IS NULL
+FROM messages WHERE to_agent = :name
+  AND resolved_at IS NULL
+  AND (read_by_session IS NULL
+       OR read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = :name), ''))
 ORDER BY created_at DESC LIMIT :lim;
 SQL
 )

@@ -4437,7 +4437,12 @@ export function getInboxSummary(): Array<{
       // would inflate unread_count by 1 per mail-less agent.
       `SELECT a.name AS agent_name,
               COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.status = 'pending' AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS pending_count,
-              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.seq IS NULL        THEN 1 ELSE 0 END), 0) AS unread_count,
+              -- #56: canonical session-agnostic unread = pendingGlobalClause
+              -- (read_by_session IS NULL AND resolved_at IS NULL), not seq IS NULL.
+              -- seq is stamped by any observation (incl. a non-consuming browse),
+              -- so it silently disagreed with the other SSOT surfaces; read_by_session
+              -- moves with the drain, so this now agrees with pending_count above.
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.read_by_session IS NULL AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS unread_count,
               MAX(m.created_at) AS last_message_at
          FROM agents a
          LEFT JOIN messages m ON m.to_agent = a.name

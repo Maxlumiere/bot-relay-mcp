@@ -31,14 +31,14 @@
  * get_messages(pending), getHealthSnapshot.message_count_pending, hooks/check-relay.sh,
  * src/transport/consistency-probe.ts.
  *
- * KNOWN RESIDUALS (explicitly OUT of #53's named scope — NOT silently claimed
- * unified; see the diagnosis doc + PR body):
- *   - hooks/stop-check.sh   — the #124 Stop-hook read-only wake still keys on the
- *                             binary `status` column. Fast-follow.
- *   - getInboxSummary.unread_count — the dashboard's seq-based "unread" column
- *                             (its pending_count was already resolved-fixed).
- * The residual tripwire at the end fires when either is unified, so this guard's
- * scope stays honest.
+ * FORMERLY-RESIDUAL surfaces, now UNIFIED (#56 finished the SSOT):
+ *   - hooks/stop-check.sh (#124 Stop-hook) — its PRIMARY pending query now uses
+ *     the per-session predicate; only the bare-status LEGACY fallback (for
+ *     pre-v2.0/v2.12 DBs with no read_by_session/resolved_at column) keeps `status`.
+ *   - getInboxSummary.unread_count — now `read_by_session IS NULL AND resolved_at
+ *     IS NULL` (pendingGlobalClause), not `seq IS NULL`.
+ * The tripwire at the end now asserts these are canonical — it would red if
+ * either regressed to the old binary-status/seq predicate.
  *
  * SCOPE: this unifies the DEFINITION of pending. It does NOT change WHEN a
  * message is marked read (still on the get_messages fetch) — decoupling fetch
@@ -66,6 +66,7 @@ const {
   resolveMessages,
   pendingForSessionClause,
   pendingGlobalClause,
+  getInboxSummary,
 } = await import("../src/db.js");
 
 // The promoted consistency-probe — invoked directly below, not merely claimed.
@@ -214,14 +215,36 @@ describe("#53 pending predicate SSOT — every surface derives from one definiti
     expect(hook).not.toMatch(/FROM messages WHERE to_agent = :name AND status\s*=\s*'pending'/);
   });
 
-  it("RESIDUAL TRIPWIRE — records the surfaces #53 deliberately left for a fast-follow", () => {
-    // This does NOT endorse the residual; it marks the guard's scope boundary so
-    // it stays honest (no silent caps). When a follow-up unifies either surface,
-    // this assertion fires and prompts updating the SSOT scope above.
+  it("#56 BITE: getInboxSummary.unread_count no longer zeroes on a non-consuming browse (agrees with the drain, not seq)", () => {
+    registerAgent("gis-from", "role", []);
+    registerAgent("gis-to", "role", []);
+    sendMessage("gis-from", "gis-to", "still-unseen", "normal");
+    // A history browse (peek=true) stamps seq but marks NO read_by_session.
+    getMessages("gis-to", "all", 100, true);
+
+    // NEGATIVE CONTROL — the OLD seq-based unread_count now reports 0 (wrong).
+    const seqBased = (getDb()
+      .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND seq IS NULL")
+      .get("gis-to") as { c: number }).c;
+    expect(seqBased).toBe(0);
+
+    // THE CONTRACT — the canonical unread_count still reports 1, agreeing with the
+    // drain and the other SSOT surfaces (read_by_session IS NULL AND resolved_at IS NULL).
+    const row = getInboxSummary().find((r: { agent_name: string }) => r.agent_name === "gis-to");
+    expect(row?.unread_count, "unread_count must not drop on a non-consuming browse").toBe(1);
+  });
+
+  it("FORMERLY-RESIDUAL surfaces are now CANONICAL (#56 finished the SSOT)", () => {
+    // stop-check.sh's PRIMARY pending query now uses the per-session predicate;
+    // any bare `status='pending'` that remains is ONLY the legacy-DB fallback.
     const stop = fs.readFileSync(path.join(PROJECT_ROOT, "hooks/stop-check.sh"), "utf8");
-    expect(stop).toMatch(/status = 'pending'/); // stop-check.sh still binary-status (residual)
+    expect(stop).toMatch(
+      /read_by_session != COALESCE\(\(SELECT session_id FROM agents WHERE name = :name\), ''\)/,
+    );
+    // getInboxSummary.unread_count now keys on read_by_session + resolved_at, not seq.
     const db = fs.readFileSync(path.join(PROJECT_ROOT, "src/db.ts"), "utf8");
-    expect(db).toMatch(/m\.seq IS NULL\s+THEN 1/); // getInboxSummary.unread_count still seq-based (residual)
+    expect(db).toMatch(/m\.read_by_session IS NULL AND m\.resolved_at IS NULL THEN 1 ELSE 0 END\), 0\) AS unread_count/);
+    expect(db).not.toMatch(/m\.seq IS NULL\s+THEN 1 ELSE 0 END\), 0\) AS unread_count/);
   });
 });
 
