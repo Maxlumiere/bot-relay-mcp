@@ -482,25 +482,34 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(s).not.toContain("goodOne");
   });
 
-  // Ruling 3 + "the message is part of the fix" — fail-closed, premise-style (B):
-  // exit 2, its own diagnosis. Seam: findUnresolvableBindings + formatRefusal.
-  it("HOISTED SQL: an unresolvable binding is REFUSED, and the refusal is actionable", () => {
-    const loose = `
+  // #59 Option A — a let's WHOLE assignment set is followed, fail-closed.
+  it("a let reassigned to an all-literal revoke FLAGS; a let assigned from a call REFUSES", () => {
+    // Every assignment resolves to a literal → resolve and match the union; the
+    // revoke assignment is visible and the unit does not bump → provable VIOLATION
+    // (exit 1). Not a refuse: PROOF beats uncertainty when the mutation is in-file.
+    const literalReassign = `
       export function bumpAuthGeneration(): void {}
       let REVOKE_SQL = "SELECT 1";
       REVOKE_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
       export function l2(n: string): void { getDb().prepare(REVOKE_SQL).run(n); }`;
-    const refusals = findUnresolvableBindings(loose, "loose.ts");
-    expect(refusals).toHaveLength(1);
+    expect(findAuthGenViolations(literalReassign, "loose.ts").map((x: { name: string }) => x.name)).toContain("l2");
+    expect(findUnresolvableBindings(literalReassign, "loose.ts")).toEqual([]);
 
+    // An assignment the guard cannot enumerate (a function-call result) makes the
+    // set incomplete → the whole binding is REFUSED (exit 2), fail-closed. The
+    // message names the reason and the remedy.
+    const callReassign = `
+      export function bumpAuthGeneration(): void {}
+      function build(): string { return "x"; }
+      let SQL = "SELECT 1";
+      SQL = build();
+      export function u(n: string): void { getDb().prepare(SQL).run(n); }`;
+    const refusals = findUnresolvableBindings(callReassign, "loose2.ts");
+    expect(refusals.map((x: { name: string }) => x.name)).toContain("u");
     const msg = formatRefusal(refusals);
-    expect(msg).toContain("REVOKE_SQL"); // NAMES the binding
-    expect(msg).toMatch(/let|reassign/i); // says WHY it cannot be resolved
-    expect(msg).toMatch(/const|inline/i); // says WHAT TO DO instead
-
-    // The exit-1 violation scan stays clean for the same file: the let is handled
-    // by the refusal path, not attributed as a mutation-without-bump.
-    expect(findAuthGenViolations(loose, "loose.ts")).toEqual([]);
+    expect(msg).toMatch(/let|reassign|function-call|import|dynamic/i); // WHY
+    expect(msg).toMatch(/const|inline/i); // REMEDY
+    expect(findAuthGenViolations(callReassign, "loose2.ts")).toEqual([]);
   });
 
   // ── codex #192 re-review: DESTRUCTURING axis (kind × binding-form) ──────────
@@ -556,14 +565,15 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(s).toContain("badOne");
     expect(s).not.toContain("goodOne");
 
-    // Soft (let/var) destructuring that reaches SQL is REFUSED, not read.
+    // A reassignable (let/var) destructured binding reaching a DB call is REFUSED,
+    // not read — the refusal is keyed by the UNIT that reaches it (fail-closed).
     const softDestr = `
       export function bumpAuthGeneration(): void {}
       export function applyAuthStateTransition(): void {}
       let { r: X } = { r: "SELECT 1" };
       X = "UPDATE agents SET token_hash = NULL WHERE name = ?";
       export function u(n: string): void { getDb().prepare(X).run(n); }`;
-    expect(findUnresolvableBindings(softDestr, "softd.ts").map((x: { name: string }) => x.name)).toContain("X");
+    expect(findUnresolvableBindings(softDestr, "softd.ts").map((x: { name: string }) => x.name)).toContain("u");
   });
 
   // ── DIRECTION-OF-FAILURE PIN (victra): the SHARED resolver's destructuring
@@ -682,5 +692,38 @@ describe("ADR-0003 G — fold + scoped refusal at prepare()/exec() (#59, issue #
     const msg = formatRefusal(findUnresolvableBindings(src, "t.ts"));
     expect(msg).toMatch(/import|function-call|cycle|non-literal|let|reassign/i); // WHY
     expect(msg).toMatch(/inline|const/i); // REMEDY
+  });
+
+  // ── codex #194 (Option A): EVERY argument reaching a DB call, of any shape,
+  // resolves-and-matches OR refuses — never silently clean. A bare dynamic value
+  // is the no-concat twin of the non-literal concat operand.
+  it("REFUSE: a bare parameter passed to prepare() is refused, not silently clean", () => {
+    const src = `${H}export function dyn(sql: string, n: string): void { getDb().prepare(sql).run(n); }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]); // no provable violation ...
+    expect(refuses(src)).toContain("dyn"); // ... but never silent
+  });
+  it("REFUSE: a free / dynamic identifier passed to prepare() is refused", () => {
+    const src = `${H}export function m(n: string): void { getDb().prepare(externalSql).run(n); }`;
+    expect(refuses(src)).toContain("m");
+  });
+  // PRECEDENCE twin for the dynamic case: a visible violation beside a bare
+  // parameter still FLAGS (proof beats uncertainty), it is not downgraded to refuse.
+  it("PRECEDENCE: a visible violation concatenated with a bare parameter FLAGS", () => {
+    const src = `${H}export function m(extra: string, n: string): void {
+      getDb().prepare("UPDATE agents SET token_hash = NULL WHERE name = ?" + extra).run(n);
+    }`;
+    expect(flags(src)).toContain("m");
+    expect(refuses(src)).not.toContain("m");
+  });
+  // getMessagesSummary's SHAPE (a local let assigned SELECT branches) must stay
+  // GREEN through the new local-let resolution — both branches resolve, both SELECT.
+  it("a local let assigned only SELECT branches stays clean (getMessagesSummary shape)", () => {
+    const src = `${H}export function summary(pending: boolean, n: string): void {
+      let sql = "SELECT * FROM messages WHERE to_agent = ?";
+      if (pending) { sql = "SELECT * FROM messages WHERE to_agent = ? AND resolved_at IS NULL"; }
+      getDb().prepare(sql).run(n);
+    }`;
+    expect(findAuthGenViolations(src, "t.ts")).toEqual([]);
+    expect(findUnresolvableBindings(src, "t.ts")).toEqual([]);
   });
 });

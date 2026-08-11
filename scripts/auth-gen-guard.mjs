@@ -57,7 +57,6 @@ import {
   isTopLevelFunctionDeclaration,
   findUnsatisfiedPrimitives,
   resolveUnitSqlText,
-  findSqlBackedSoftBindings,
   foldDbCallArgs,
 } from "./lib/guard-ast.mjs";
 
@@ -150,12 +149,18 @@ function hasValidityChangingMutation(bodyText) {
  *   • object/array constant -> the WHOLE initializer is spliced (coarser than
  *     property-precise): OVER-includes, the safe direction, and the per-unit bump
  *     check still flags only the guilty sibling (KT3).
- *   • let/var-backed SQL -> deliberately NOT read (its initializer does not
- *     establish what runs — it can be reassigned). Surfaced by
- *     findUnresolvableBindings and REFUSED loudly (exit 2), never passed.
- *   • CONCATENATION and CROSS-MODULE imports -> out of scope by design (see
- *     guard-ast.mjs): concatenation is not routine-accidental drift; cross-module
- *     identity needs a TypeChecker. Named boundaries, not gaps.
+ *   • let/var-backed SQL at a prepare()/exec() arg -> its WHOLE assignment set is
+ *     followed (foldVarBinding, #59 Option A): every assignment resolves to a
+ *     literal -> resolve and match the union; ANY assignment unresolvable -> REFUSE
+ *     (exit 2), fail-closed. (Not "never read" — reassignment is now enumerated.)
+ *   • CONCATENATION -> at a prepare()/exec() arg it is FOLDED (reconstructed) so
+ *     split position does not matter; a non-literal operand REFUSES. Away from a DB
+ *     call the whole-body pass catches it only INCIDENTALLY — two non-contiguous
+ *     sub-matches over raw text (issue #193) — split-dependent, never to be relied
+ *     on. Neither "out of scope" nor "caught": see guard-ast RESOLVER COVERAGE.
+ *   • a bare parameter / dynamic value at a DB call -> REFUSED (never silently
+ *     clean, codex #194); CROSS-MODULE imported identity -> out of scope (needs a
+ *     TypeChecker), refused at a DB call. Named boundaries, not gaps.
  *
  * The hoisted-constant gap is CLOSED, and was measured LATENT at 0294854 (zero
  * module-scope validity SQL in the real src/db.ts), so a correct fix changes
@@ -220,27 +225,20 @@ export function findAuthGenViolations(source, fileName = "db.ts") {
 }
 
 /**
- * The fail-closed REFUSAL set (exit 2): units whose prepare()/exec() SQL cannot be
- * resolved to literals — a cross-module import, a function-call result, a
- * reference cycle, or a concatenation with a non-literal operand (#59) — PLUS
- * module-scope let/var bindings that hold token/auth SQL (#192, findSqlBacked-
- * SoftBindings). A SEPARATE exit code from a violation because "I cannot analyse
- * this" is a different fact from "your code is wrong"; collapsing them is how
- * guards get disabled. Refusal is SCOPED to bindings that reach a DB call — the-
- * fixer measured a blanket version at 20 false refusals on real db.ts, this
- * scoping at 0.
+ * The fail-closed REFUSAL set (exit 2): units whose prepare()/exec() SQL ARGUMENT,
+ * of ANY shape, cannot be resolved to a literal — a bare parameter or other
+ * dynamic value, a cross-module import, a function-call result, a reference cycle,
+ * a concatenation with a non-literal operand, or a reassignable let/var whose
+ * assignment set is not all-literal (#59, victra Option A; supersedes the #192
+ * file-level let/var scan — the module let/var refusal is now handled prepare-
+ * scoped inside foldSqlArg). A SEPARATE exit code from a violation because "I
+ * cannot analyse this" is a different fact from "your code is wrong". SCOPED to
+ * arguments that reach a DB call — the-fixer measured a blanket version at 20
+ * false refusals on real db.ts, this scoping at 0.
  */
 export function findUnresolvableBindings(source, fileName = "db.ts") {
   const sf = parseGuardSource(fileName, source);
-  const { refusals } = classifyUnits(sf);
-  for (const decl of findSqlBackedSoftBindings(sf, hasValidityChangingMutation)) {
-    refusals.push({
-      name: decl.name.getText(sf),
-      line: sf.getLineAndCharacterOfPosition(decl.name.getStart(sf)).line + 1,
-      reason: "a reassignable let/var binding holding token/auth SQL",
-    });
-  }
-  return refusals;
+  return classifyUnits(sf).refusals;
 }
 
 /**
