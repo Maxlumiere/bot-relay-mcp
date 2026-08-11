@@ -742,16 +742,95 @@ export function bodyCallsFunction(bodyNode, sf, names) {
 //     decl and contributes nothing: the shadow is respected structurally.
 //     @fixture "a SHADOWED name must not be attributed to the module constant"
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// ── RESOLVER COVERAGE — STATED, not discovered (victra, #192 round 3) ─────────
+// Six review rounds each found a binding form the resolver did not handle, so the
+// boundary is written down here rather than rediscovered. Two facts, both MEASURED
+// (see the destructuring + call-side fixtures), not assumed:
+//
+// 1. resolveName (via scopeBindings/eachBoundName) REGISTERS a broad set — it
+//    returns the declaration NODE for: a simple `const/let/var X`; EVERY
+//    destructuring form — object `{a}`, renamed `{a:b}`, array `[a]`, nested,
+//    rest `{...r}`/`[...r]`, and defaults `{a = …}` (the leaf is a BindingElement);
+//    destructured parameters; function/class/enum declarations; imports (by LOCAL
+//    name); catch variables; a named function-expression's own name. It returns
+//    [] for a free/global/unbound name and MORE THAN ONE decl for an ambiguous
+//    (re-bound) name. So destructuring was never invisible to resolveName — the
+//    round-2/round-3 gaps were in the CONSUMERS, which did not handle the
+//    BindingElement node it returns.
+//
+// 2. Meaning is the CONSUMER's, and each consumer's DEFAULT DIRECTION is what makes
+//    the same resolver safe on one side and dangerous on the other:
+//    • must-CALL (bodyCallsFunction → isPrimitiveDeclaration / constAliasInitializer):
+//      accepts ONLY a top-level FunctionDeclaration, or a simple `const <id> =
+//      <primitive>` alias. EVERYTHING else — including a destructured bump alias
+//      `const { bumpAuthGeneration: bump } = m` — is REJECTED, which OVER-flags.
+//      Unhandled ⇒ over-flag ⇒ SAFE. @fixture "call side over-flags a destructured
+//      bump alias (safe direction)".
+//    • does-it-mutate (resolveUnitSqlText → moduleBindingInfo): accepts a module
+//      VariableDeclaration AND a module BindingElement (all destructuring forms +
+//      defaults); const ⇒ splice (transitive), let/var ⇒ refuse. Here an UNSEEN
+//      binding is simply not spliced ⇒ the SQL is not there ⇒ UNDER-detect ⇒
+//      DANGEROUS, which is why this side must accept broadly and errs toward
+//      over-splicing whole objects/arrays.
+//    OUT of scope on BOTH sides, by design: string CONCATENATION (not accidental
+//    drift) and CROSS-MODULE imported identity (needs a TypeChecker). Named
+//    boundaries, not gaps.
+// ─────────────────────────────────────────────────────────────────────────────
 
-/** Module-scope variable kind for a RESOLVED decl: "const" | "soft" (let/var) | null. */
-function moduleVarKind(decl) {
-  if (!decl || !ts.isVariableDeclaration(decl)) return null;
-  const list = decl.parent; // VariableDeclarationList
+/**
+ * For a RESOLVED module-scope binding — a plain `const/let X = …` VariableDeclaration
+ * OR a destructuring BindingElement (`const { revoke: X } = Q`, `const [Y] = LIST`)
+ * — return { kind: "const"|"soft", initNode } or null if it is not module-scope.
+ *
+ * A destructured name (#192 re-review, codex) is an ordinary property/array alias,
+ * so it is IN scope. Consistent with the coarse whole-initializer splice for a
+ * const object/array, the thing spliced for a BindingElement is the ENCLOSING
+ * declaration's initializer (the whole `Q` / `LIST`), which resolveConstText then
+ * follows to the literal — property-precise pick is deliberately not attempted
+ * (OVER-includes = the safe direction). The kind comes from the enclosing
+ * VariableDeclarationList, so a destructured `let` is still `soft` (refused).
+ */
+function moduleBindingInfo(decl) {
+  let varDecl = null;
+  if (ts.isVariableDeclaration(decl)) {
+    varDecl = decl;
+  } else if (ts.isBindingElement(decl)) {
+    let n = decl.parent;
+    while (n && !ts.isVariableDeclaration(n)) n = n.parent; // up through (possibly nested) binding patterns
+    varDecl = n && ts.isVariableDeclaration(n) ? n : null;
+  }
+  if (!varDecl) return null;
+  const list = varDecl.parent; // VariableDeclarationList
   if (!list || !ts.isVariableDeclarationList(list)) return null;
   const stmt = list.parent; // VariableStatement
   if (!stmt || !ts.isVariableStatement(stmt)) return null;
   if (!stmt.parent || !ts.isSourceFile(stmt.parent)) return null; // MODULE scope only
-  return (list.flags & ts.NodeFlags.Const) !== 0 ? "const" : "soft";
+  return { kind: (list.flags & ts.NodeFlags.Const) !== 0 ? "const" : "soft", initNode: varDecl.initializer ?? null };
+}
+
+/**
+ * Invoke `cb(boundDecl)` for each name a top-level VariableDeclaration binds: the
+ * VariableDeclaration itself for a simple `X`, or each leaf BindingElement for a
+ * destructuring pattern (including aliases `{ a: X }` and nested patterns). This
+ * is the SAME set resolveName resolves a destructured use to, so the refusal side
+ * and the resolve side agree on what a module binding is.
+ */
+function eachModuleBoundDecl(decl, cb) {
+  if (ts.isIdentifier(decl.name)) {
+    cb(decl);
+    return;
+  }
+  const walk = (pat) => {
+    if (ts.isObjectBindingPattern(pat) || ts.isArrayBindingPattern(pat)) {
+      for (const el of pat.elements) {
+        if (!ts.isBindingElement(el)) continue;
+        if (ts.isIdentifier(el.name)) cb(el);
+        else walk(el.name); // nested pattern
+      }
+    }
+  };
+  walk(decl.name);
 }
 
 /**
@@ -804,8 +883,10 @@ function moduleBindingNames(sf) {
   const names = new Set();
   for (const stmt of sf.statements) {
     if (!ts.isVariableStatement(stmt)) continue;
+    // eachBoundName covers simple ids AND destructuring (object/array, renamed,
+    // nested, rest, defaults), matching what resolveName registers.
     for (const decl of stmt.declarationList.declarations) {
-      if (ts.isIdentifier(decl.name)) names.add(decl.name.text);
+      eachBoundName(decl.name, (n) => names.add(n));
     }
   }
   _moduleNamesCache.set(sf, names);
@@ -827,17 +908,25 @@ function resolveConstText(node, sf, parts, seen, softHit, names) {
     if (!names.has(id.text)) return; // cheap: not spelled like any module binding → cannot be one
     const decls = resolveName(id.text, id);
     if (decls.length !== 1) return; // free / ambiguous / import → out of this resolver's world
-    const decl = decls[0];
-    const kind = moduleVarKind(decl);
-    if (!kind || !decl.initializer) return; // param / local / fn / class / non-module → shadow-correct skip
+    const decl = decls[0]; // a VariableDeclaration (simple) or a BindingElement (destructured)
+    const info = moduleBindingInfo(decl);
+    if (!info) return; // param / local / fn / class / import / non-module → shadow-correct skip
     if (seen.has(decl)) return;
     seen.add(decl);
-    if (kind === "soft") {
+    if (info.kind === "soft") {
       if (softHit) softHit.add(decl.name.getText(sf));
       return;
     }
-    parts.push(decl.initializer.getText(sf));
-    resolveConstText(decl.initializer, sf, parts, seen, softHit, names); // transitive: follow the alias onward
+    if (info.initNode) {
+      parts.push(info.initNode.getText(sf)); // whole initializer (object/array included — coarse, over-includes)
+      resolveConstText(info.initNode, sf, parts, seen, softHit, names); // transitive: follow the alias onward
+    }
+    // A destructuring DEFAULT (const { x: R = <sql> } = obj) supplies the value when
+    // the source lacks the key — splice it too (over-include = the safe direction).
+    if (ts.isBindingElement(decl) && decl.initializer) {
+      parts.push(decl.initializer.getText(sf));
+      resolveConstText(decl.initializer, sf, parts, seen, softHit, names);
+    }
   });
 }
 
@@ -863,8 +952,13 @@ export function resolveUnitSqlText(bodyNode, sf, softHitOut) {
 function moduleSoftBindingReachesSql(decl, sf, predicate) {
   const names = moduleBindingNames(sf);
   const texts = [];
-  if (decl.initializer) {
-    texts.push(decl.initializer.getText(sf));
+  const info = moduleBindingInfo(decl); // works for a VariableDeclaration or a BindingElement
+  if (info && info.initNode) {
+    texts.push(info.initNode.getText(sf));
+    resolveConstText(info.initNode, sf, texts, new Set(), null, names);
+  }
+  if (ts.isBindingElement(decl) && decl.initializer) {
+    texts.push(decl.initializer.getText(sf)); // destructuring default value
     resolveConstText(decl.initializer, sf, texts, new Set(), null, names);
   }
   const walk = (node) => {
@@ -902,8 +996,10 @@ export function findSqlBackedSoftBindings(sf, predicate) {
     const list = stmt.declarationList;
     if ((list.flags & ts.NodeFlags.Const) !== 0) continue; // only let/var
     for (const decl of list.declarations) {
-      if (!ts.isIdentifier(decl.name)) continue;
-      if (moduleSoftBindingReachesSql(decl, sf, predicate)) out.push(decl);
+      // Each bound name (simple id OR each destructuring BindingElement).
+      eachModuleBoundDecl(decl, (boundDecl) => {
+        if (moduleSoftBindingReachesSql(boundDecl, sf, predicate)) out.push(boundDecl);
+      });
     }
   }
   return out;

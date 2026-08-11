@@ -123,8 +123,9 @@ function hasValidityChangingMutation(bodyText) {
  *     function declaration (or a const alias of it).
  *   • DOES-IT-MUTATE (#57 / #192) — the SQL trigger no longer reads only a unit's
  *     literal body text. resolveUnitSqlText follows the unit's identifiers through
- *     module-scope CONST bindings — aliases, objects, arrays, TRANSITIVELY to the
- *     terminal literal — using the SAME resolver as the call side, so a hoisted
+ *     module-scope CONST bindings — aliases, objects, arrays, and destructuring
+ *     (object/array/renamed/nested/rest/default) — TRANSITIVELY to the terminal
+ *     literal, using the SAME resolver as the call side, so a hoisted
  *     `const REVOKE_SQL = "UPDATE agents SET token_hash …"` is seen as if inline.
  *     Resolution is by BINDING, not name: an identifier resolving to a LOCAL
  *     const, a PARAMETER, an import, or a nested-function binding is NOT the
