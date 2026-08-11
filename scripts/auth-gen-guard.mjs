@@ -105,6 +105,51 @@ function hasValidityChangingMutation(bodyText) {
 }
 
 /**
+ * #57 — module-scope const bindings: name -> initializer source text. The SQL
+ * trigger reads a unit's body TEXT, so SQL hoisted to a module-level const is
+ * invisible (the body holds the identifier, not the literal). Collect ONLY
+ * top-level consts; a const inside an enclosing function is already covered by
+ * that outer unit's body text — an over-flag, the safe direction (boundary V5).
+ */
+function collectModuleScopeConsts(sf) {
+  const map = new Map();
+  for (const stmt of sf.statements) {
+    if (!ts.isVariableStatement(stmt)) continue;
+    if (!(stmt.declarationList.flags & ts.NodeFlags.Const)) continue;
+    for (const decl of stmt.declarationList.declarations) {
+      if (decl.initializer && ts.isIdentifier(decl.name)) {
+        map.set(decl.name.text, decl.initializer.getText(sf));
+      }
+    }
+  }
+  return map;
+}
+
+/**
+ * #57 — splice the initializer text of every module-scope const THIS unit's body
+ * references into the body text, so the trigger sees a hoisted literal exactly as
+ * if it were inline. Per-unit by construction: a shared const is spliced only into
+ * the units that reference it — so it flags the one that skips the bump and not
+ * the one that makes it (boundary V9) — and a const no unit references is spliced
+ * nowhere, so it flags nothing (V10). Follows the BINDING by name; shadowing is an
+ * adversarial case the guard's freeze deliberately excludes.
+ */
+function bodyTextWithModuleConsts(bodyNode, sf, moduleConsts) {
+  const bodyText = bodyNode.getText(sf);
+  if (moduleConsts.size === 0) return bodyText;
+  const referenced = new Set();
+  const visit = (node) => {
+    if (ts.isIdentifier(node) && moduleConsts.has(node.text)) referenced.add(node.text);
+    ts.forEachChild(node, visit);
+  };
+  visit(bodyNode);
+  if (referenced.size === 0) return bodyText;
+  let extra = "";
+  for (const name of referenced) extra += " " + moduleConsts.get(name);
+  return bodyText + extra;
+}
+
+/**
  * Analyze source text; return an array of { name, line } for functions that
  * mutate token/auth validity but do not bump the generation. Exported so the
  * negative-fixture test can prove the guard FAILS on an omitted bump.
@@ -123,19 +168,31 @@ function hasValidityChangingMutation(bodyText) {
  *   • a comment/string that merely MENTIONS the SQL  -> OVER-triggers (safe: a
  *     false demand to bump, never a missed one).
  *   • SQL that is NOT textually in the body — hoisted into a module-level
- *     constant, or built by concatenation -> UNDER-detects: no bump is ever
- *     demanded, so the fully-hardened must-bump side never runs. Concatenation
- *     is documented out of scope by design (below); the HOISTED CONSTANT is a
- *     genuine gap inside the accidental-drift model and is queued as its own
- *     item. Measured LATENT, not active: every `UPDATE agents SET` in today's
- *     src/db.ts sits inside a function unit, and there are zero module-level
- *     mutation constants.
- * This is the WEAKER SIDE of a two-sided predicate — see guard-ast.mjs. Do not
+ *     constant, or built by concatenation -> would UNDER-detect: no bump is
+ *     demanded, so the fully-hardened must-bump side never runs. Split by case:
+ *       - HOISTED CONSTANT: CLOSED (#57). collectModuleScopeConsts +
+ *         bodyTextWithModuleConsts splice the initializer text of each
+ *         module-scope const a unit references into THAT unit's effective body
+ *         text, so a hoisted literal reaches the trigger exactly as if inline,
+ *         and attribution stays per-unit — a shared const blames only the unit
+ *         that skipped the bump, never the one that made it. Was measured LATENT
+ *         when closed (zero module-level mutation constants in src/db.ts), so a
+ *         correct fix changes nothing about the real file: if real db.ts starts
+ *         flagging, the fix is over-flagging, not the codebase drifting.
+ *       - CONCATENATION ("UPDATE agents " + "SET …"): still UNDER-detects, and
+ *         is out of scope BY DESIGN (below) — the whack-a-mole the freeze exists
+ *         to prevent. Do NOT grow the #57 fix into it.
+ * The trigger is still a text match; #57 widened the text it sees to a unit's
+ * body PLUS the consts it names, not the whole file (that would over-flag V8–V10
+ * — a benign-column update, an innocent shared-const user, an unused const). It
+ * remains the WEAKER SIDE of a two-sided predicate — see guard-ast.mjs. Do not
  * read the hardened call side as making the guard strong overall.
  */
 export function findAuthGenViolations(source, fileName = "db.ts") {
   const sf = parseGuardSource(fileName, source); // pinned-parser gate: throws on parse diagnostics → main() exits 2
   const violations = [];
+  // #57 — resolve module-scope const bindings so hoisted SQL reaches the trigger.
+  const moduleConsts = collectModuleScopeConsts(sf);
   forEachFunctionUnit(sf, (name, bodyNode, nameNode) => {
     if (!name) return;
     // ROOT G (codex, #151 round 2): this exemption used to key on the NAME
@@ -148,7 +205,9 @@ export function findAuthGenViolations(source, fileName = "db.ts") {
     if ((SELF_BUMPERS.has(name) || INIT_ONLY_ALLOWLIST.has(name)) && isTopLevelFunctionDeclaration(nameNode)) {
       return;
     }
-    const bodyText = bodyNode.getText(sf);
+    // #57 — the unit's body text WITH the initializer text of any module-scope
+    // const it references spliced in, so hoisted SQL is seen as if inline.
+    const bodyText = bodyTextWithModuleConsts(bodyNode, sf, moduleConsts);
     // TRIGGER: text (over-trigger-safe). REQUIRED CALL: structural (a real
     // CallExpression to bumpAuthGeneration / applyAuthStateTransition or a direct
     // local alias) — comments and strings are structurally incapable of it.

@@ -332,4 +332,65 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(v).toContain("exprDelete");
     expect(v).toContain("methodRotate");
   });
+
+  // ── the-fixer, 2026-08-11: hoisted-SQL under-detection (#57) ───────────────
+  // The trigger side of the predicate reads ONE function unit's body text, so
+  // SQL hoisted to module scope is invisible to it and the hardened must-bump
+  // side never runs. Measured LATENT at 0294854 (zero module-scope validity SQL
+  // in src/db.ts) — the trigger is a routine readability refactor, not an
+  // attack. Direction of failure is UNDER-detection: no bump is ever demanded.
+  it("HOISTED SQL: a module-scope validity-SQL constant does NOT evade the trigger", () => {
+    const evasion = `
+      export function bumpAuthGeneration(): void {}
+      const REVOKE_SQL =
+        "UPDATE agents SET token_hash = NULL, auth_state = 'revoked' WHERE name = ?";
+      const PURGE_SQL = \`DELETE FROM agents WHERE name = ?\`;
+      export function hoistedRevoke(name: string): void {
+        getDb().prepare(REVOKE_SQL).run(name);
+      }
+      export function hoistedPurge(name: string): void {
+        getDb().prepare(PURGE_SQL).run(name);
+      }
+      class Store {
+        methodRevoke(name: string): void { getDb().prepare(REVOKE_SQL).run(name); }
+      }`;
+    const v = findAuthGenViolations(evasion, "hoist.ts").map((x: { name: string }) => x.name);
+    expect(v).toContain("hoistedRevoke");  // V1 string const
+    expect(v).toContain("hoistedPurge");   // V2/V4 template const + DELETE
+    expect(v).toContain("methodRevoke");   // V3 class method
+  });
+
+  // ATTRIBUTION. A shared module-scope const must blame the unit that skipped
+  // the bump and NOT the one that made it — "attribute the SQL to a unit", not
+  // "the file contains SQL somewhere".
+  it("HOISTED SQL: a shared constant blames only the unit that skipped the bump", () => {
+    const shared = `
+      export function bumpAuthGeneration(): void {}
+      const SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function goodUser(name: string): void { getDb().prepare(SQL).run(name); bumpAuthGeneration(); }
+      export function badUser(name: string): void  { getDb().prepare(SQL).run(name); }`;
+    const s = findAuthGenViolations(shared, "shared.ts").map((x: { name: string }) => x.name);
+    expect(s).toContain("badUser");        // V9: the guilty unit
+    expect(s).not.toContain("goodUser");   // V9: and ONLY the guilty unit
+  });
+
+  // THE REGRESSION BAR — must never go red. A whole-file scan that flags every
+  // non-bumping unit would satisfy the two tests above and break this one, which
+  // is a louder guard rather than a more correct one.
+  it("HOISTED SQL: the fix must not over-flag (bump present / benign column / unused const)", () => {
+    const benign = `
+      export function bumpAuthGeneration(): void {}
+      const ROTATE_SQL = "UPDATE agents SET token_hash = ? WHERE name = ?";
+      const TOUCH_SQL  = "UPDATE agents SET last_seen = ? WHERE name = ?";
+      const UNUSED_SQL = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      export function properRotate(name: string): void {          // V7: bumps
+        getDb().prepare(ROTATE_SQL).run("h", name);
+        bumpAuthGeneration();
+      }
+      export function touchLastSeen(name: string): void {         // V8: not sensitive
+        getDb().prepare(TOUCH_SQL).run("t", name);
+      }`;
+    // V7 + V8 + V10 (UNUSED_SQL names no unit — nothing may be invented).
+    expect(findAuthGenViolations(benign, "benign.ts")).toEqual([]);
+  });
 });
