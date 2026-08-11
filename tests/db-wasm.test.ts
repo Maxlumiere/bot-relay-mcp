@@ -45,6 +45,10 @@ const {
   closeDb,
   getDb,
 } = await import("../src/db.js");
+// #172: assert the ACTUAL driver so this wasm suite can't silently fall back to
+// native. getDriverType() reports only the requested env; getActiveDriver()
+// reports what initializeDb() truly instantiated.
+const { getActiveDriver } = await import("../src/sqlite-compat.js");
 
 function cleanup() {
   closeDb();
@@ -56,6 +60,7 @@ function cleanup() {
 beforeEach(async () => {
   cleanup();
   await initializeDb();
+  expect(getActiveDriver()).toBe("wasm"); // #172: fail loudly on a native fallback, never green-on-native
 });
 
 afterEach(() => {
