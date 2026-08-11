@@ -393,4 +393,61 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     // V7 + V8 + V10 (UNUSED_SQL names no unit — nothing may be invented).
     expect(findAuthGenViolations(benign, "benign.ts")).toEqual([]);
   });
+
+  // ── codex #192 + victra: INDIRECTION-DEPTH axis (not a new scope) ──────────
+  // An alias `const B = A` is the same module scope at a deeper indirection — an
+  // axis the V1–V10 SCOPE map never varied. The resolver must follow aliases to
+  // the TERMINAL literal at arbitrary depth; a hop limit just relocates the gap
+  // ("REVOKE_SQL = ALIAS_SQL = AUTH_SQL escapes tomorrow"). RED at head 45ca048
+  // (one-hop fix): the body splices the alias's initializer text — another
+  // identifier — but never follows it to the SQL.
+  it("HOISTED SQL: const-to-const alias chains do NOT evade at any depth", () => {
+    const chains = `
+      export function bumpAuthGeneration(): void {}
+      const AUTH_SQL = "UPDATE agents SET auth_state = 'revoked' WHERE name = ?";
+      const ONE = AUTH_SQL;                 // depth 1: ONE -> AUTH_SQL
+      const TWO_A = ONE;                    // depth 2: TWO_B -> TWO_A -> ONE -> AUTH_SQL
+      const TWO_B = TWO_A;
+      export function revokeOneHop(name: string): void { getDb().prepare(ONE).run(name); }
+      export function revokeTwoHop(name: string): void { getDb().prepare(TWO_B).run(name); }`;
+    const v = findAuthGenViolations(chains, "chains.ts").map((x: { name: string }) => x.name);
+    expect(v).toContain("revokeOneHop"); // one alias — the exact case codex withheld on
+    expect(v).toContain("revokeTwoHop"); // two aliases — same defect one hop deeper
+  });
+
+  // A reference cycle must TERMINATE (not hang) even though it is not valid
+  // runtime init — the guard is a static AST pass. The real revoke literal is
+  // carried by a separate chain (REF -> C) that must still be resolved.
+  it("HOISTED SQL: a reference cycle terminates and the literal is still resolved", () => {
+    const cyclic = `
+      export function bumpAuthGeneration(): void {}
+      const A = B;
+      const B = A;                          // A<->B cycle: the seen-set must break it
+      const C = "UPDATE agents SET token_hash = NULL WHERE name = ?";
+      const REF = C;
+      export function usesCycleAndLiteral(name: string): void {
+        getDb().prepare(A).run(name);       // touches the cycle — must not hang
+        getDb().prepare(REF).run(name);     // and the real revoke literal via C
+      }`;
+    const v = findAuthGenViolations(cyclic, "cyclic.ts").map((x: { name: string }) => x.name);
+    expect(v).toContain("usesCycleAndLiteral");
+  });
+
+  // Transitive resolution must NOT over-flag: a benign column stays benign through
+  // any number of aliases, and an aliased sensitive-SQL chain WITH a bump is clean.
+  it("HOISTED SQL: transitive resolution does not over-flag benign / bumped alias chains", () => {
+    const benign = `
+      export function bumpAuthGeneration(): void {}
+      const TOUCH_SQL = "UPDATE agents SET last_seen = ? WHERE name = ?";
+      const T1 = TOUCH_SQL;
+      const T2 = T1;                        // benign column, aliased twice
+      const ROTATE_SQL = "UPDATE agents SET token_hash = ? WHERE name = ?";
+      const R1 = ROTATE_SQL;                // sensitive, aliased — but the user bumps
+      export function touchLastSeen(name: string): void { getDb().prepare(T2).run("t", name); }
+      export function properRotate(name: string): void {
+        getDb().prepare(R1).run("h", name);
+        bumpAuthGeneration();
+      }`;
+    expect(findAuthGenViolations(benign, "benign2.ts")).toEqual([]);
+  });
 });

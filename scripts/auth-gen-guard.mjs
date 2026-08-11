@@ -105,10 +105,12 @@ function hasValidityChangingMutation(bodyText) {
 }
 
 /**
- * #57 — module-scope const bindings: name -> initializer source text. The SQL
- * trigger reads a unit's body TEXT, so SQL hoisted to a module-level const is
- * invisible (the body holds the identifier, not the literal). Collect ONLY
- * top-level consts; a const inside an enclosing function is already covered by
+ * #57 — module-scope const bindings: name -> { text, node } of its initializer.
+ * The SQL trigger reads a unit's body TEXT, so SQL hoisted to a module-level const
+ * is invisible (the body holds the identifier, not the literal). We keep the
+ * initializer NODE too so a const-to-const alias (const B = A) can be followed
+ * TRANSITIVELY to the literal — see bodyTextWithModuleConsts (codex #192). Collect
+ * ONLY top-level consts; a const inside an enclosing function is already covered by
  * that outer unit's body text — an over-flag, the safe direction (boundary V5).
  */
 function collectModuleScopeConsts(sf) {
@@ -118,7 +120,7 @@ function collectModuleScopeConsts(sf) {
     if (!(stmt.declarationList.flags & ts.NodeFlags.Const)) continue;
     for (const decl of stmt.declarationList.declarations) {
       if (decl.initializer && ts.isIdentifier(decl.name)) {
-        map.set(decl.name.text, decl.initializer.getText(sf));
+        map.set(decl.name.text, { text: decl.initializer.getText(sf), node: decl.initializer });
       }
     }
   }
@@ -128,25 +130,46 @@ function collectModuleScopeConsts(sf) {
 /**
  * #57 — splice the initializer text of every module-scope const THIS unit's body
  * references into the body text, so the trigger sees a hoisted literal exactly as
- * if it were inline. Per-unit by construction: a shared const is spliced only into
- * the units that reference it — so it flags the one that skips the bump and not
- * the one that makes it (boundary V9) — and a const no unit references is spliced
- * nowhere, so it flags nothing (V10). Follows the BINDING by name; shadowing is an
- * adversarial case the guard's freeze deliberately excludes.
+ * if it were inline.
+ *
+ * TRANSITIVE to the terminal literal, at ARBITRARY DEPTH (codex #192, victra): an
+ * alias is the same scope at a deeper INDIRECTION — `const B = A; const C = B` is
+ * an ordinary refactor, not the string-concat exclusion — so we follow each
+ * spliced const's OWN references onward until no module-const identifiers remain.
+ * There is NO depth limit, stated so no silent bound hides here: the walk is a
+ * transitive closure over a FINITE set (the module consts), and the `seen` set
+ * splices each at most once, which both bounds the total work to O(#consts) and
+ * makes a reference cycle (A = B, B = A) terminate instead of hang.
+ *
+ * Per-unit by construction: the walk STARTS from this unit's body, so a shared
+ * const is resolved only for the units that reference it — it flags the one that
+ * skips the bump and not the one that makes it (boundary V9) — and a const no unit
+ * references is spliced nowhere, so it flags nothing (V10). Follows the BINDING by
+ * name; shadowing is an adversarial case the guard's freeze deliberately excludes.
  */
 function bodyTextWithModuleConsts(bodyNode, sf, moduleConsts) {
   const bodyText = bodyNode.getText(sf);
   if (moduleConsts.size === 0) return bodyText;
-  const referenced = new Set();
-  const visit = (node) => {
-    if (ts.isIdentifier(node) && moduleConsts.has(node.text)) referenced.add(node.text);
-    ts.forEachChild(node, visit);
+  const seen = new Set();
+  const queue = [];
+  const enqueueRefs = (node) => {
+    const visit = (n) => {
+      if (ts.isIdentifier(n) && moduleConsts.has(n.text)) queue.push(n.text);
+      ts.forEachChild(n, visit);
+    };
+    visit(node);
   };
-  visit(bodyNode);
-  if (referenced.size === 0) return bodyText;
+  enqueueRefs(bodyNode);
   let extra = "";
-  for (const name of referenced) extra += " " + moduleConsts.get(name);
-  return bodyText + extra;
+  while (queue.length > 0) {
+    const name = queue.shift();
+    if (seen.has(name)) continue; // finite closure + cycle break: splice each const once
+    seen.add(name);
+    const entry = moduleConsts.get(name);
+    extra += " " + entry.text;
+    enqueueRefs(entry.node); // follow const-to-const aliases onward to the terminal literal
+  }
+  return seen.size === 0 ? bodyText : bodyText + extra;
 }
 
 /**
@@ -170,15 +193,19 @@ function bodyTextWithModuleConsts(bodyNode, sf, moduleConsts) {
  *   • SQL that is NOT textually in the body — hoisted into a module-level
  *     constant, or built by concatenation -> would UNDER-detect: no bump is
  *     demanded, so the fully-hardened must-bump side never runs. Split by case:
- *       - HOISTED CONSTANT: CLOSED (#57). collectModuleScopeConsts +
+ *       - HOISTED CONSTANT + ALIAS CHAIN: CLOSED (#57). collectModuleScopeConsts +
  *         bodyTextWithModuleConsts splice the initializer text of each
  *         module-scope const a unit references into THAT unit's effective body
- *         text, so a hoisted literal reaches the trigger exactly as if inline,
- *         and attribution stays per-unit — a shared const blames only the unit
- *         that skipped the bump, never the one that made it. Was measured LATENT
- *         when closed (zero module-level mutation constants in src/db.ts), so a
- *         correct fix changes nothing about the real file: if real db.ts starts
- *         flagging, the fix is over-flagging, not the codebase drifting.
+ *         text — following const-to-const aliases (const B = A; const C = B)
+ *         TRANSITIVELY to the terminal literal at arbitrary depth, cycle-safe
+ *         (codex #192): an alias is the same scope at a deeper indirection, not a
+ *         new scope, so a hop limit would just relocate the gap. A hoisted literal
+ *         then reaches the trigger exactly as if inline, and attribution stays
+ *         per-unit — a shared const blames only the unit that skipped the bump,
+ *         never the one that made it. Was measured LATENT when closed (zero
+ *         module-level mutation constants in src/db.ts), so a correct fix changes
+ *         nothing about the real file: if real db.ts starts flagging, the fix is
+ *         over-flagging, not the codebase drifting.
  *       - CONCATENATION ("UPDATE agents " + "SET …"): still UNDER-detects, and
  *         is out of scope BY DESIGN (below) — the whack-a-mole the freeze exists
  *         to prevent. Do NOT grow the #57 fix into it.
