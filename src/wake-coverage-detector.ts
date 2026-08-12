@@ -26,12 +26,13 @@
  *                    NOT since the stuck mail arrived. It was being woken and now
  *                    is not: the S2 regression. Reported as an alarm.
  *   - UNOBSERVABLE — the agent's durable last-drain marker is unset: NO drain is
- *                    recorded for this identity. That has more than one cause — a
- *                    genuine out-of-band reader (direct DB/CLI / non-MCP), OR an agent
- *                    row re-created by unregister/reap that has not drained since — so
- *                    the report states what is KNOWN and offers the causes rather than
- *                    asserting a behaviour. Either way the detector cannot judge its
- *                    coverage AT ALL. Reported,
+ *                    recorded for this identity. That has SEVERAL causes — an out-of-band
+ *                    reader (direct DB/CLI / non-MCP), a re-created row (unregister/reap)
+ *                    not drained since, or a pre-existing identity whose drains predate
+ *                    the marker (the TRANSITIONAL LIMIT below) — so the report states
+ *                    what is KNOWN and offers the causes NON-EXHAUSTIVELY rather than
+ *                    asserting a behaviour or a closed dichotomy. Either way the detector
+ *                    cannot judge its coverage AT ALL. Reported,
  *                    but NEVER as uncovered —
  *                    "I cannot observe this" is a different fact from "this is
  *                    broken," and collapsing them is the exact error the whole
@@ -186,10 +187,13 @@ export function classifyWakeCoverage(
   opts: WakeCoverageOptions,
 ): WakeCoverageFinding[] {
   const { nowMs, boundMs, antiFlapMarginMs } = opts;
-  // Effective fire threshold = bound + anti-flap margin. A message older than this,
-  // still pending-global, is a candidate. created_at is TEXT ISO8601-Z (lexicographic
-  // order == chronological), so a string upper bound is a correct age filter.
-  const fireBeforeIso = isoAtOrBefore(nowMs, boundMs + antiFlapMarginMs);
+  // Effective fire threshold = bound + anti-flap margin. Bound ONCE here (codex #202)
+  // so the query filter and the operator-facing render cannot drift: the same value
+  // gates the SQL and is carried on the finding as thresholdMs. A message older than
+  // this, still pending-global, is a candidate. created_at is TEXT ISO8601-Z
+  // (lexicographic order == chronological), so a string upper bound is a correct age filter.
+  const effectiveThresholdMs = boundMs + antiFlapMarginMs;
+  const fireBeforeIso = isoAtOrBefore(nowMs, effectiveThresholdMs);
   const pg = pendingGlobalClause(); // resolved_at IS NULL AND read_by_session IS NULL
 
   // Candidate stuck messages grouped by recipient. pg.params is [] today, but
@@ -238,7 +242,7 @@ export function classifyWakeCoverage(
       pendingCount: row.pending_count,
       oldestCreatedAt: row.oldest_created_at,
       oldestAgeMs: nowMs - new Date(row.oldest_created_at).getTime(),
-      thresholdMs: boundMs + antiFlapMarginMs,
+      thresholdMs: effectiveThresholdMs,
     });
   }
   return findings;
@@ -271,15 +275,19 @@ export function formatWakeCoverageFindings(findings: readonly WakeCoverageFindin
       );
     }
     // unobservable — informational, explicitly NOT an alarm. State what is KNOWN (no
-    // drain recorded for this identity) and OFFER the causes; do not assert a behaviour
-    // — a NULL marker is also produced by a re-created agent row (unregister/reap), so
-    // "has never drained via MCP / reads out-of-band" would be false for a re-registered
-    // heavy drainer, on the alarm-SUPPRESSING verdict (finding 3).
+    // drain recorded for this identity) and OFFER the causes NON-EXHAUSTIVELY; do not
+    // assert a behaviour or a closed dichotomy. A NULL marker has at least three causes
+    // (finding 3 + codex #202): a genuine out-of-band reader, a re-created agent row
+    // (unregister/reap), OR a pre-existing identity whose drains predate the marker and
+    // could not be reconstructed from expired history (the TRANSITIONAL LIMIT in the
+    // header). "either X or Y" would be a false dichotomy on the alarm-SUPPRESSING
+    // verdict, so the phrasing is "several causes — e.g. …".
     return (
       `[wake-coverage] UNOBSERVABLE — ${f.agent}: ${f.pendingCount} message(s) pending >= ${threshold} ` +
       `(oldest ${age}), but no MCP drain is recorded for this identity (its durable last-drain marker ` +
-      `is unset) — either it reads out-of-band (direct DB/CLI / non-MCP), or its agent row was ` +
-      `re-created (unregister / reap) and has not drained since. The detector cannot judge this ` +
+      `is unset). That has several causes — e.g. it reads out-of-band (direct DB/CLI / non-MCP), its ` +
+      `agent row was re-created (unregister / reap) and has not drained since, or its drains predate ` +
+      `the marker and could not be reconstructed from expired history. The detector cannot judge this ` +
       `agent's coverage and does NOT report it as uncovered.`
     );
   });
