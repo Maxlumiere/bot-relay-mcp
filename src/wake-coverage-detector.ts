@@ -25,9 +25,13 @@
  *   - UNCOVERED    — the agent HAS drained before (has message_read history) but
  *                    NOT since the stuck mail arrived. It was being woken and now
  *                    is not: the S2 regression. Reported as an alarm.
- *   - UNOBSERVABLE — the agent's durable last-drain marker is unset: it has never
- *                    drained via MCP. It reads out-of-band (direct DB/CLI / non-MCP),
- *                    so the detector cannot judge its coverage AT ALL. Reported,
+ *   - UNOBSERVABLE — the agent's durable last-drain marker is unset: NO drain is
+ *                    recorded for this identity. That has more than one cause — a
+ *                    genuine out-of-band reader (direct DB/CLI / non-MCP), OR an agent
+ *                    row re-created by unregister/reap that has not drained since — so
+ *                    the report states what is KNOWN and offers the causes rather than
+ *                    asserting a behaviour. Either way the detector cannot judge its
+ *                    coverage AT ALL. Reported,
  *                    but NEVER as uncovered —
  *                    "I cannot observe this" is a different fact from "this is
  *                    broken," and collapsing them is the exact error the whole
@@ -141,6 +145,13 @@ export interface WakeCoverageFinding {
   readonly oldestCreatedAt: string;
   /** Age of the oldest such message in ms, at evaluation time. */
   readonly oldestAgeMs: number;
+  /**
+   * The EFFECTIVE fire threshold actually applied (`boundMs + antiFlapMarginMs`), in ms.
+   * Carried so the operator-facing line renders the threshold that was USED, not the
+   * name of one of its two inputs — "bound" (24h) alone is a lie when 48h fired
+   * (the-fixer finding 2; same class as the grace-log report-what-was-used fix).
+   */
+  readonly thresholdMs: number;
 }
 
 export interface WakeCoverageOptions {
@@ -214,9 +225,12 @@ export function classifyWakeCoverage(
     // arrived (awake since; a message still sitting is a routing question, not a wake
     // one). ISO8601-Z strings compare chronologically. Not reported.
     if (lastDrainAt !== null && lastDrainAt >= row.oldest_created_at) continue;
-    // UNOBSERVABLE — the durable marker is unset: never drained via MCP, so the
-    // detector cannot judge. Else UNCOVERED — drained before but not since the stuck
-    // mail: the S2 regression.
+    // UNOBSERVABLE — the durable marker is unset: NO drain is recorded for this
+    // identity, so the detector cannot judge. A NULL marker has more than one cause
+    // (a genuine out-of-band reader, OR an agent row re-created by unregister/reap that
+    // has not drained since — see line ~205), so the operator line states what is KNOWN
+    // and offers the causes rather than asserting a behaviour (the-fixer finding 3).
+    // Else UNCOVERED — drained before but not since the stuck mail: the S2 regression.
     const verdict: WakeVerdict = lastDrainAt !== null ? "uncovered" : "unobservable";
     findings.push({
       agent: row.agent,
@@ -224,6 +238,7 @@ export function classifyWakeCoverage(
       pendingCount: row.pending_count,
       oldestCreatedAt: row.oldest_created_at,
       oldestAgeMs: nowMs - new Date(row.oldest_created_at).getTime(),
+      thresholdMs: boundMs + antiFlapMarginMs,
     });
   }
   return findings;
@@ -243,20 +258,28 @@ function fmtHours(ms: number): string {
 export function formatWakeCoverageFindings(findings: readonly WakeCoverageFinding[]): string[] {
   return findings.map((f) => {
     const age = fmtHours(f.oldestAgeMs);
+    // Report the EFFECTIVE threshold that actually fired (bound + margin), never the
+    // bare word "bound" — that names 24h while 48h is what was applied (finding 2).
+    const threshold = fmtHours(f.thresholdMs);
     if (f.verdict === "uncovered") {
       return (
         `[wake-coverage] UNCOVERED — ${f.agent}: ${f.pendingCount} message(s) pending ` +
-        `>= bound (oldest ${age}, arrived ${f.oldestCreatedAt}), and ${f.agent} has emitted ` +
+        `>= ${threshold} (oldest ${age}, arrived ${f.oldestCreatedAt}), and ${f.agent} has emitted ` +
         `no mailbox-drain event since it arrived, though it has drained before. Possible ` +
         `wake-path regression (dead Stop/PostToolUse hook, stopped watcher). Not proof of ` +
         `fault — first check whether ${f.agent} has drained anything since, then check its wake path.`
       );
     }
-    // unobservable — informational, explicitly NOT an alarm.
+    // unobservable — informational, explicitly NOT an alarm. State what is KNOWN (no
+    // drain recorded for this identity) and OFFER the causes; do not assert a behaviour
+    // — a NULL marker is also produced by a re-created agent row (unregister/reap), so
+    // "has never drained via MCP / reads out-of-band" would be false for a re-registered
+    // heavy drainer, on the alarm-SUPPRESSING verdict (finding 3).
     return (
-      `[wake-coverage] UNOBSERVABLE — ${f.agent}: ${f.pendingCount} message(s) pending >= bound ` +
-      `(oldest ${age}), but ${f.agent} has never drained via MCP (its durable last-drain marker ` +
-      `is unset); it reads out-of-band (direct DB/CLI / non-MCP). The detector cannot judge this ` +
+      `[wake-coverage] UNOBSERVABLE — ${f.agent}: ${f.pendingCount} message(s) pending >= ${threshold} ` +
+      `(oldest ${age}), but no MCP drain is recorded for this identity (its durable last-drain marker ` +
+      `is unset) — either it reads out-of-band (direct DB/CLI / non-MCP), or its agent row was ` +
+      `re-created (unregister / reap) and has not drained since. The detector cannot judge this ` +
       `agent's coverage and does NOT report it as uncovered.`
     );
   });
