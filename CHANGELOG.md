@@ -1,5 +1,99 @@
 # Changelog
 
+## v3.0.0 — 2026-08-12 — BREAKING: `since` strict-cursor contract withdrawn; wake-coverage detector; undelivered-mail durability
+
+<!--
+  VERSION: 3.0.0. Twenty-two merges since 2.25.0. MAJOR because a PUBLISHED public contract
+  changed: 2.25.0's `since` field described "only return messages after this time" (a
+  strict cursor), and #198 makes a pending drain return never-observed mail regardless of
+  `since` — a consumer coded to that sentence now receives rows created BEFORE their
+  cursor. Backward-incompatible whatever the intent, so a major bump, not a minor: the
+  version number is a claim, and a MINOR release that tells users to audit for a
+  behavioural break would contradict its own notes. The change itself is correct — the old
+  promise could only be kept by leaving mail permanently undeliverable — so we label it
+  honestly rather than shipping it quietly. Also ships a new default-on feature (the
+  wake-coverage detector) and a retention change (undelivered mail held to a 30-day grace).
+  This is the RELEASE PR: content is final and package.json is bumped to 3.0.0 — ready to
+  cut once merged + published.
+-->
+
+Twenty-two merges since 2.25.0. **This is a major release for one reason: a published
+`since` contract changed.** Around that break, wake-coverage detection is now durable and
+undelivered mail is no longer silently deleted at seven days — plus a pending-predicate
+SSOT unification, guard hardening, and a security-advisory + dependency sweep.
+
+### ⚠ BREAKING — the `since` strict-cursor promise is withdrawn (#198/#199)
+
+2.25.0 documented `since` as "only return messages after this time." **That is no longer
+true for a pending drain.** A pending `get_messages` drain now returns mail that was never
+observed by anyone **regardless of `since`** — `since` bounds only already-OBSERVED
+history. A consumer that used `since` as a strict pagination cursor on a pending drain
+will now receive messages whose `created_at` predates the cursor (the never-delivered
+ones). **Audit any pending-drain `since`-cursor logic before upgrading.** History reads
+(`all` / `read` / `resolved`) keep the plain `created_at >= since` bound and are
+unaffected, as is `peek=true`.
+
+Why it changed, and why it could not stay: the old promise could only be honoured by
+leaving never-observed mail permanently undeliverable — a message older than the caller's
+window was never returned, never seq'd, and eventually purged (silent non-delivery).
+Delivering owed mail and honouring a strict cursor are mutually exclusive here; we chose
+delivery and are versioning the break honestly rather than shipping it quietly under a
+minor. No tool signature changed.
+
+### Messaging
+
+- **One pending predicate, everywhere (#56/#187/#191).** Wake and drain can no longer
+  disagree about what "pending" means — `resolved_at IS NULL AND read_by_session IS NULL`
+  is a single SSOT (`pendingGlobalClause`) routed through every surface (drain, wake,
+  `stop-check.sh`, `getInboxSummary`, and the purge exemption below).
+
+### Durability — undelivered mail is an obligation, not history (#201/#203)
+
+- **Undelivered mail is no longer deleted at 7 days.** A message **no recipient has
+  drained** (`pendingGlobalClause` — the SAME predicate the wake detector uses as its
+  candidate set, so the two cannot drift) is an undelivered *obligation*, and the 7-day
+  transient purge now **exempts** it, holding it to a bounded **30-day** operational-tier
+  grace (`RELAY_UNDELIVERED_GRACE_DAYS`, default 30; `0` disables the extension but never
+  the announcement). This includes mail that was *peeked but never drained* — the wake
+  regression the detector reports on.
+- **Deadletter announcement.** When an undelivered obligation is finally dropped at the
+  grace horizon, a `deadletter:` line is written to **stderr** (recipient, age, id,
+  effective grace) — the only record that survives the row's deletion. Operators who
+  parse logs will see this new message type. It is unconditional (fires at any bound,
+  including `grace=0`), emitted after the drop commits.
+
+### Wake-coverage detector (new, default-on) (#60/#200/#202)
+
+- A periodic daemon sweep classifies each agent with mail stuck past the **effective
+  threshold** (`RELAY_WAKE_BOUND_MS` + `RELAY_WAKE_ANTI_FLAP_MARGIN_MS`, default 24h+24h =
+  48h) into **three verdicts** — *covered* (draining since the mail arrived; not
+  reported), *uncovered* (drained before but not since — a possible wake-path regression,
+  reported as an alarm), and *unobservable* (no MCP drain recorded for the identity —
+  reported, but **never** as uncovered). It emits to **stderr** (REPORT-FIRST — a human
+  decides), never mutates the DB, and is default-on (`RELAY_WAKE_DETECTOR=0` to disable).
+- New durable **`agents.last_drain_at`** column (schema auto-migrates; a one-time
+  best-effort backfill from retained drain events). Reserved-for-forward correctness: an
+  identity dark past event retention at migration reads *unobservable* until it next
+  drains.
+
+### Guards + hardening
+
+- Auth-generation drift guard now sees SQL hoisted to module-scope consts and refuses
+  concatenated/cross-module SQL at `prepare()`/`exec()` (#57/#59). Secret-register guard
+  wired into a gate with a filesystem-driven wiring meta-check (#61). AST guards pinned to
+  `typescript-legacy` behind a loud-fail parse gate, unblocking a future TS7 bump (#174).
+- `relay backup`/`restore` work on the wasm driver (#171/#190); the schema migration
+  chain is single-sourced across both init paths (#171/#188); a golden-snapshot guard
+  locks the 37 tools' emitted input schemas as an external contract (#186).
+
+### Dependencies + CI
+
+- Security-advisory sweep: `js-yaml` / `undici` / `brace-expansion` HIGH + `hono` MED
+  override pins (#175), `nanoid` 3.3.16→3.3.18 HIGH (#184); an extension `npm-audit`-high
+  CI gate with override-retirement discipline (#176). ESM-safe `createRequire` in the
+  `getDb()` native fallback (#170); the pre-publish gate builds `dist/` before vitest so
+  it passes from a fresh clone (#169).
+
 ## v2.25.0 — 2026-08-05 — ADR-0011 message disposition + read-receipts; a security-advisory sweep; dependency majors
 
 <!--
