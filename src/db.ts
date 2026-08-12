@@ -2329,11 +2329,113 @@ export function explicitCallerCachePut(
   );
 }
 
-export function purgeOldRecords(db: CompatDatabase): void {
-  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+// Warn-once guard for RELAY_UNDELIVERED_GRACE_DAYS coercion/clamp. purgeOldRecords
+// runs per-tick, so a per-tick warning would spam; the env is fixed for a process's
+// lifetime, so once is the correct cardinality.
+let undeliveredGraceWarned = false;
 
-  db.prepare("DELETE FROM messages WHERE created_at < ?").run(sevenDaysAgo);
+export function purgeOldRecords(db: CompatDatabase): void {
+  const now = Date.now();
+  const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+  // PRIMARY defect fix — undelivered-mail purge exclusion (seq 859-861). The 7-day
+  // messages purge is TRANSIENT-history cleanup, but a NEVER-OBSERVED message
+  // (`seq IS NULL` = never drained NOR peeked by anyone, unresolved and unread) is
+  // an undelivered OBLIGATION, not history. Deleting it at 7d is silent data loss on
+  // a message bus — it destroyed conduit's message (2026-08-05, ~6d dark) the night
+  // before this fix. The ADR-0005 distinction the comment below draws for agent
+  // IDENTITIES applies one table over, with the one difference that BOUNDS it: an
+  // identity has no natural expiry, but a message has a delivery deadline, so the
+  // obligation is held for a bounded grace, not forever. The grace is the codebase's
+  // OPERATIONAL retention tier (30d, same as completed tasks) — not the TRANSIENT 7d
+  // tier it wrongly sat in, nor the 90d forensic tier — which covers the ~6d conduit
+  // outage ~5x. Configurable; 0 removes the extension (purge at the normal 7d).
+  const rawGrace = process.env.RELAY_UNDELIVERED_GRACE_DAYS;
+  let graceDays = 30;
+  let graceNote = "";
+  if (rawGrace !== undefined && rawGrace !== "") {
+    const n = Number(rawGrace);
+    if (Number.isFinite(n) && n >= 0) {
+      graceDays = n;
+    } else {
+      graceNote = `RELAY_UNDELIVERED_GRACE_DAYS="${rawGrace}" is not a non-negative number; using the 30d default`;
+    }
+  }
+  // A grace shorter than the 7d base retention is meaningless (the base purge already
+  // covers it) so it clamps UP to 7 — but NOT silently: a config value that quietly
+  // does other than it says is the defect class we have closed repeatedly this week.
+  // grace=0 is the documented "disable the extension" value, not a clamp, so it does
+  // not warn. Invalid input coerces to 30, also with a warning.
+  const effectiveGraceDays = graceDays === 0 ? 7 : Math.max(graceDays, 7);
+  if (!graceNote && graceDays > 0 && graceDays < 7) {
+    graceNote = `RELAY_UNDELIVERED_GRACE_DAYS=${graceDays} is below the 7d base retention; using ${effectiveGraceDays}`;
+  }
+  if (graceNote && !undeliveredGraceWarned) {
+    undeliveredGraceWarned = true;
+    log.warn(`config: ${graceNote}`);
+  }
+  const graceCutoff = new Date(now - effectiveGraceDays * 24 * 60 * 60 * 1000).toISOString();
+  const UNOBSERVED = "seq IS NULL AND resolved_at IS NULL AND read_by_session IS NULL";
+
+  // ATOMICITY (codex, seq 863) — the doomed SELECT and the DELETE run in ONE
+  // transaction so no other connection can observe/resolve a candidate in the gap
+  // between them. Without it the announcement LIES: a message delivered a millisecond
+  // before the DELETE would still be logged "never observed" in the one artifact that
+  // outlives the row. `dropped ⊆ deleted` is guaranteed by the shared snapshot — a
+  // candidate (created_at < graceCutoff, UNOBSERVED) satisfies the DELETE predicate
+  // (created_at < 7d since graceCutoff <= 7d-ago, and NOT-exempt since created_at <
+  // graceCutoff). Logged AFTER commit, so a DELETE failure rolls back and throws
+  // before any line is emitted — never announcing a drop that did not happen.
+  let dropped: Array<{ id: string; from_agent: string; to_agent: string | null; created_at: string }> = [];
+  const purgeMessagesTx = db.transaction(() => {
+    dropped = db
+      .prepare(`SELECT id, from_agent, to_agent, created_at FROM messages WHERE created_at < ? AND ${UNOBSERVED}`)
+      .all(graceCutoff) as typeof dropped;
+    // Purge messages older than 7d EXCEPT a never-observed obligation still within the
+    // grace window (exempt/retained until it too crosses the grace, then dropped here).
+    db.prepare(
+      `DELETE FROM messages WHERE created_at < ? AND NOT (${UNOBSERVED} AND created_at >= ?)`,
+    ).run(sevenDaysAgo, graceCutoff);
+  });
+  // BEGIN IMMEDIATE via better-sqlite3's .immediate() so a concurrent drain/resolve
+  // serializes at tx START rather than racing the SELECT→DELETE gap. Fall back to the
+  // default mode on wasm (single-connection, no cross-process races) — same idiom as
+  // the getMessages drain.
+  const purgeImmediate = (purgeMessagesTx as unknown as { immediate?: () => void }).immediate;
+  if (typeof purgeImmediate === "function") {
+    (purgeMessagesTx as unknown as { immediate: () => void }).immediate();
+  } else {
+    purgeMessagesTx();
+  }
+
+  // DEADLETTER ANNOUNCEMENT (seq 861/864) — this week's rule one horizon out: a
+  // deletion that destroys an obligation must not be silent AT ANY BOUND. It is the
+  // only evidence that survives the row's deletion (the conduit case left none, which
+  // is why nobody noticed until we went looking). UNCONDITIONAL — deliberately NOT
+  // gated by the grace knob, and a `grace=0 means silent` option is deliberately NOT
+  // offered: that switch would be an EXEMPTION LEVER (the #196 reviewed-exemption
+  // class — first use correct, fourth routes around a red build) letting a future
+  // operator re-create this exact silent-data-loss defect by setting a number, no
+  // review. So grace=0 means only "purge on the normal 7d schedule, AND say so." The
+  // knob controls how long we hold; never whether we admit the drop. Prints the
+  // EFFECTIVE grace, never the requested one — with grace=3 clamped to 7, a "grace=3d"
+  // line would state a horizon never applied about a row that no longer exists to
+  // check (read-the-state-not-the-request, seq 864).
+  //   KNOWN LIMIT (durable-record DECLINED, seq 864): a crash between the COMMIT above
+  // and the stderr write below loses THAT announcement — the drop still happened and
+  // no record survives it. A durable deadletter TABLE would close it but would itself
+  // need a retention policy, reproducing this very regress one table over (or growing
+  // unbounded); the honest closure is a durable outbox with a defined lifecycle, not a
+  // table bolted onto this fix. Narrow, stated, cheaper than the regress.
+  for (const m of dropped) {
+    const ageDays = ((now - Date.parse(m.created_at)) / (24 * 60 * 60 * 1000)).toFixed(1);
+    log.warn(
+      `deadletter: dropping never-observed undelivered message id=${m.id} ` +
+        `to=${m.to_agent ?? "(broadcast)"} from=${m.from_agent} age=${ageDays}d ` +
+        `grace=${effectiveGraceDays}d — never delivered, never observed`,
+    );
+  }
   db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'rejected', 'cancelled') AND updated_at < ?").run(thirtyDaysAgo);
   db.prepare("DELETE FROM webhook_delivery_log WHERE attempted_at < ?").run(sevenDaysAgo);
   // ADR-0005 final ruling: NO automatic orphan GC here — deliberately. Agent
