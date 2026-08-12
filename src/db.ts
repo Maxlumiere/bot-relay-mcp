@@ -2330,10 +2330,64 @@ export function explicitCallerCachePut(
 }
 
 export function purgeOldRecords(db: CompatDatabase): void {
-  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const now = Date.now();
+  const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-  db.prepare("DELETE FROM messages WHERE created_at < ?").run(sevenDaysAgo);
+  // PRIMARY defect fix — undelivered-mail purge exclusion (seq 859-861). The 7-day
+  // messages purge is TRANSIENT-history cleanup, but a NEVER-OBSERVED message
+  // (`seq IS NULL` = never drained NOR peeked by anyone, unresolved and unread) is
+  // an undelivered OBLIGATION, not history. Deleting it at 7d is silent data loss on
+  // a message bus — it destroyed conduit's message (2026-08-05, ~6d dark) the night
+  // before this fix. The ADR-0005 distinction the comment below draws for agent
+  // IDENTITIES applies one table over, with the one difference that BOUNDS it: an
+  // identity has no natural expiry, but a message has a delivery deadline, so the
+  // obligation is held for a bounded grace, not forever. The grace is the codebase's
+  // OPERATIONAL retention tier (30d, same as completed tasks) — not the TRANSIENT 7d
+  // tier it wrongly sat in, nor the 90d forensic tier — which covers the ~6d conduit
+  // outage ~5x. Configurable; 0 removes the extension (purge at the normal 7d).
+  const graceDays = (() => {
+    const raw = process.env.RELAY_UNDELIVERED_GRACE_DAYS;
+    if (raw === undefined || raw === "") return 30;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 30;
+  })();
+  const effectiveGraceDays = graceDays === 0 ? 7 : Math.max(graceDays, 7);
+  const graceCutoff = new Date(now - effectiveGraceDays * 24 * 60 * 60 * 1000).toISOString();
+  const UNOBSERVED = "seq IS NULL AND resolved_at IS NULL AND read_by_session IS NULL";
+
+  // DEADLETTER ANNOUNCEMENT (seq 861) — this week's rule applied one horizon out: a
+  // deletion that destroys an obligation must not be silent AT ANY BOUND. When a
+  // never-observed message is finally dropped at the grace horizon, log it — the only
+  // evidence that survives the row's deletion (the conduit case left none, which is
+  // why nobody noticed until we went looking). Emitted BEFORE the DELETE so the row
+  // still exists to read. log.warn redacts.
+  //   The announcement is UNCONDITIONAL — deliberately NOT gated by the grace knob,
+  // and a `grace=0 means fully-legacy-including-silent` option is deliberately NOT
+  // offered. Such a switch would be an EXEMPTION LEVER (the #196 reviewed-exemption
+  // class: the first use is correct, the fourth routes around a red build at 2am) —
+  // it would let a future operator re-create this exact silent-data-loss defect by
+  // setting a number, with no code change and no review. So grace=0 means only "purge
+  // undelivered mail on the normal 7d schedule, AND say so when you do" — a legitimate
+  // config, strictly better than today (today's 7d drop is silent too). The knob
+  // controls how long we hold; it never controls whether we admit the drop.
+  const dropped = db.prepare(
+    `SELECT id, from_agent, to_agent, created_at FROM messages WHERE created_at < ? AND ${UNOBSERVED}`,
+  ).all(graceCutoff) as Array<{ id: string; from_agent: string; to_agent: string | null; created_at: string }>;
+  for (const m of dropped) {
+    const ageDays = ((now - Date.parse(m.created_at)) / (24 * 60 * 60 * 1000)).toFixed(1);
+    log.warn(
+      `deadletter: dropping never-observed undelivered message id=${m.id} ` +
+        `to=${m.to_agent ?? "(broadcast)"} from=${m.from_agent} age=${ageDays}d ` +
+        `grace=${graceDays === 0 ? 7 : graceDays}d — never delivered, never observed`,
+    );
+  }
+
+  // Purge messages older than 7d EXCEPT a never-observed obligation still within the
+  // grace window (exempt/retained until it too crosses the grace, then dropped above).
+  db.prepare(
+    `DELETE FROM messages WHERE created_at < ? AND NOT (${UNOBSERVED} AND created_at >= ?)`,
+  ).run(sevenDaysAgo, graceCutoff);
   db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'rejected', 'cancelled') AND updated_at < ?").run(thirtyDaysAgo);
   db.prepare("DELETE FROM webhook_delivery_log WHERE attempted_at < ?").run(sevenDaysAgo);
   // ADR-0005 final ruling: NO automatic orphan GC here — deliberately. Agent
