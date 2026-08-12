@@ -68,7 +68,24 @@ describe("#60 — wake-coverage detector: injected S2 harm + three verdicts + an
     const [line] = formatWakeCoverageFindings([f!]);
     expect(line).toContain("[wake-coverage] UNCOVERED — regressed");
     expect(line).toContain("has drained before");
+    // FINDING 2: render the EFFECTIVE threshold, never the bare word "bound".
+    expect(line).toContain(">= 48.0h");
+    expect(line).not.toContain(">= bound");
     expect(line).toMatch(/first check whether regressed has drained anything since, then check its wake path/);
+  });
+
+  it("FINDING 2: the rendered threshold is bound+margin (the value USED), never 'bound' or either input alone", () => {
+    registerAgent("regressed2", "r", []);
+    seedDrain("regressed2", 72);
+    seedPending("regressed2", "stuck-f2", 20); // 20h > 15h effective (10+5)
+    const customOpts = { nowMs: NOW, boundMs: 10 * HOUR, antiFlapMarginMs: 5 * HOUR }; // effective = 15h
+    const f = classifyWakeCoverage(getDb(), customOpts).find((x) => x.agent === "regressed2");
+    expect(f, "20h > 15h effective threshold").toBeTruthy();
+    expect(f!.thresholdMs).toBe(15 * HOUR);
+    const [line] = formatWakeCoverageFindings([f!]);
+    expect(line).toContain(">= 15.0h"); // bound + margin, the value actually applied
+    expect(line).not.toContain(">= bound"); // never the variable name
+    expect(line).not.toContain(">= 10.0h"); // never the bound alone (what "bound" would have named)
   });
 
   it("UNOBSERVABLE: an agent that has NEVER drained is reported unobservable, NEVER uncovered, and the line names why", () => {
@@ -83,10 +100,37 @@ describe("#60 — wake-coverage detector: injected S2 harm + three verdicts + an
 
     const [line] = formatWakeCoverageFindings([f!]);
     expect(line).toContain("[wake-coverage] UNOBSERVABLE — muted");
-    expect(line).toContain("has never drained via MCP"); // durable-marker language
+    // FINDING 3: state what is KNOWN and OFFER causes NON-EXHAUSTIVELY; assert NEITHER a
+    // behaviour NOR a closed dichotomy. A NULL marker has >= 3 causes (codex #202).
+    expect(line).toContain("no MCP drain is recorded for this identity");
+    expect(line).toContain("several causes"); // non-exhaustive signal, not "either X or Y"
+    expect(line).toContain("reads out-of-band"); // cause 1 offered
+    expect(line).toContain("re-created (unregister / reap)"); // cause 2 offered
+    expect(line).toContain("predate the marker"); // cause 3 (migration-transitional) offered
+    expect(line).not.toContain("has never drained via MCP"); // no behaviour asserted from a NULL marker
+    // FINDING 2: render the EFFECTIVE threshold (48h), never the bare word "bound".
+    expect(line).toContain(">= 48.0h");
+    expect(line).not.toContain(">= bound");
     expect(line).toContain("does NOT"); // explicitly not rendered as uncovered
     // The two verdicts must never render the same way.
     expect(line).not.toContain("UNCOVERED");
+  });
+
+  it("FINDING 3 (codex #202): a pre-existing identity with EXPIRED history reads UNOBSERVABLE with the SAME non-exhaustive line — no false dichotomy", () => {
+    // The migration-transitional cause: an identity already dark past inbox_events
+    // retention when last_drain_at was introduced has no reconstructable drains and
+    // stays NULL until its next drain. It is neither re-created nor necessarily
+    // out-of-band, so a two-way "either/or" line would be false for it.
+    registerAgent("legacy", "r", []);
+    // NULL marker + NO inbox_events (expired history) — the migration case, seeded.
+    seedPending("legacy", "stuck-legacy", 60);
+    const f = classifyWakeCoverage(getDb(), OPTS).find((x) => x.agent === "legacy");
+    expect(f!.verdict).toBe("unobservable");
+    const [line] = formatWakeCoverageFindings([f!]);
+    // The migration cause is offered, and the phrasing is non-exhaustive (so a fourth
+    // cause would not reopen the defect) — it does NOT claim an exhaustive either/or.
+    expect(line).toContain("predate the marker and could not be reconstructed from expired history");
+    expect(line).toContain("several causes");
   });
 
   it("COVERED: an agent that drained SINCE the stuck mail arrived is NOT reported (awake; the sitting message is a routing question)", () => {
