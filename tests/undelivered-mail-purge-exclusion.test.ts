@@ -3,14 +3,17 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-// PRIMARY defect (the-fixer finding 1 / victra seq 859-861): purgeOldRecords deleted
-// UNDELIVERED mail at 7 days — it destroyed conduit's never-delivered message, the
-// case #198 exists for. The fix exempts NEVER-OBSERVED obligations (`seq IS NULL` =
-// never drained NOR peeked, unresolved+unread) from the 7d transient purge, holding
-// them for a bounded operational-tier grace (default 30d, RELAY_UNDELIVERED_GRACE_DAYS,
+// PRIMARY defect (the-fixer finding 1 / victra seq 859-867+): purgeOldRecords deleted
+// UNDELIVERED mail at 7 days — it destroyed conduit's never-delivered message, the case
+// #198 exists for. The fix exempts UNDELIVERED obligations — mail NOT DRAINED by any
+// recipient (pendingGlobalClause: resolved_at IS NULL AND read_by_session IS NULL, the
+// SAME SSOT the wake detector uses as its candidate set) — from the 7d transient purge,
+// holding them for a bounded operational-tier grace (default 30d, RELAY_UNDELIVERED_GRACE_DAYS,
 // 0 = purge at the normal 7d), and — at ANY bound, INVARIANT, not knob-gated — emits a
 // deadletter announcement when an obligation is finally dropped (the only evidence that
-// survives the row's deletion; the conduit case left none).
+// survives the row's deletion; the conduit case left none). "Undelivered" is NOT DRAINED,
+// not "never observed": a PEEKED-but-undrained message is exempt (it is the detector's
+// diagnostic class); an earlier `seq IS NULL` predicate wrongly purged it at 7d.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
@@ -134,7 +137,7 @@ describe("undelivered-mail purge exclusion (PRIMARY defect)", () => {
     expect(exists(id)).toBe(false);
   });
 
-  it("ANNOUNCES the deadletter when an obligation is dropped — recipient, age, id, never-observed", () => {
+  it("ANNOUNCES the deadletter when an obligation is dropped — recipient, age, id, undelivered", () => {
     const id = seed("sender-x", "recipient-y", "doomed", { ageDays: 40 });
     const err = captureStderr(() => purgeOldRecords(getDb()));
     expect(exists(id)).toBe(false);
@@ -143,16 +146,25 @@ describe("undelivered-mail purge exclusion (PRIMARY defect)", () => {
     expect(err).toContain("to=recipient-y");
     expect(err).toContain("from=sender-x");
     expect(err).toContain("age=40.0d");
-    expect(err).toContain("never delivered, never observed");
+    expect(err).toContain("undelivered (no recipient has drained it)");
+    expect(err).not.toContain("never observed"); // a dropped message MAY have been peeked
   });
 
-  it("P-TIGHT: a PEEKED (seq-set, unread) message is NOT exempt — purges at 7d (bounds the orchestrator artifact)", () => {
-    // seq set = observed via peek. A peeked message is not an undelivered obligation,
-    // so it purges on the normal 7d schedule — this is what keeps victra's 141 peeked
-    // rows from being retained forever.
+  it("P-LOOSE: a PEEKED-but-never-DRAINED message IS exempt — it is the detector's diagnostic class", () => {
+    // read_by_session NULL = NOT DRAINED; seq set = peeked. "Peeked but never drained" is
+    // the wake-path regression the detector reports on, so it MUST survive to be reported.
+    // The exemption predicate IS the detector's candidate set (pendingGlobalClause), so an
+    // earlier seq-based predicate that purged this at 7d silenced the detector's own class.
     const id = seed("a", "victra", "peeked but not drained", { ageDays: 10, seq: 42, readBy: null });
     purgeOldRecords(getDb());
-    expect(exists(id)).toBe(false);
+    expect(exists(id)).toBe(true); // retained to the 30d grace, NOT purged at 7d
+  });
+
+  it("a peeked-but-never-drained message PAST the grace IS dropped (bounded) and announced", () => {
+    const id = seed("a", "victra", "peeked, aged out", { ageDays: 40, seq: 42, readBy: null });
+    const err = captureStderr(() => purgeOldRecords(getDb()));
+    expect(exists(id)).toBe(false); // bounded — the cost is 30d, not forever
+    expect(err).toContain(`id=${id}`); // announced: it is an undelivered obligation
   });
 
   it("a DELIVERED (drained) message older than 7d purges normally — transient history unchanged", () => {

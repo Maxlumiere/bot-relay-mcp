@@ -2340,17 +2340,28 @@ export function purgeOldRecords(db: CompatDatabase): void {
   const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
 
   // PRIMARY defect fix — undelivered-mail purge exclusion (seq 859-861). The 7-day
-  // messages purge is TRANSIENT-history cleanup, but a NEVER-OBSERVED message
-  // (`seq IS NULL` = never drained NOR peeked by anyone, unresolved and unread) is
-  // an undelivered OBLIGATION, not history. Deleting it at 7d is silent data loss on
-  // a message bus — it destroyed conduit's message (2026-08-05, ~6d dark) the night
-  // before this fix. The ADR-0005 distinction the comment below draws for agent
-  // IDENTITIES applies one table over, with the one difference that BOUNDS it: an
-  // identity has no natural expiry, but a message has a delivery deadline, so the
-  // obligation is held for a bounded grace, not forever. The grace is the codebase's
-  // OPERATIONAL retention tier (30d, same as completed tasks) — not the TRANSIENT 7d
-  // tier it wrongly sat in, nor the 90d forensic tier — which covers the ~6d conduit
-  // outage ~5x. Configurable; 0 removes the extension (purge at the normal 7d).
+  // messages purge is TRANSIENT-history cleanup, but an UNDELIVERED message — one no
+  // recipient has DRAINED (pendingGlobalClause: resolved_at IS NULL AND read_by_session
+  // IS NULL) — is an obligation, not history. Deleting it at 7d is silent data loss on a
+  // message bus — it destroyed conduit's message (2026-08-05, ~6d dark) the night before
+  // this fix. The ADR-0005 distinction the comment below draws for agent IDENTITIES
+  // applies one table over, with the one difference that BOUNDS it: an identity has no
+  // natural expiry, but a message has a delivery deadline, so the obligation is held for
+  // a bounded grace, not forever. The grace is the codebase's OPERATIONAL retention tier
+  // (30d, same as completed tasks) — not the TRANSIENT 7d tier it wrongly sat in, nor the
+  // 90d forensic tier — which covers the ~6d conduit outage ~5x. Configurable; 0 removes
+  // the extension (purge at the normal 7d).
+  //   THE PREDICATE IS THE WAKE DETECTOR'S CANDIDATE SET, BY CONSTRUCTION (the-fixer /
+  // victra, seq 867+). "Undelivered" means NOT DRAINED — NOT "never observed". A message
+  // PEEKED but never drained (seq set, read_by_session NULL) is the wake-path regression
+  // the detector cares about MOST: something looked at the mailbox and nothing consumed
+  // it. An earlier `seq IS NULL` predicate (never-OBSERVED only) left that diagnostic
+  // half OUTSIDE the exemption yet INSIDE the detector's candidate set, so it was deleted
+  // at 7d and the detector went silent on exactly the class it exists to catch. Reusing
+  // pendingGlobalClause() — the SAME SSOT the detector's candidate query uses — makes the
+  // exemption set and the candidate set ONE predicate that cannot drift: anything the
+  // detector can report on survives long enough to be reported. Cost, stated not hidden:
+  // peeked-but-undrained mail now survives to the 30d grace instead of 7d — bounded.
   const rawGrace = process.env.RELAY_UNDELIVERED_GRACE_DAYS;
   let graceDays = 30;
   let graceNote = "";
@@ -2376,27 +2387,29 @@ export function purgeOldRecords(db: CompatDatabase): void {
     log.warn(`config: ${graceNote}`);
   }
   const graceCutoff = new Date(now - effectiveGraceDays * 24 * 60 * 60 * 1000).toISOString();
-  const UNOBSERVED = "seq IS NULL AND resolved_at IS NULL AND read_by_session IS NULL";
+  // Exemption predicate = the wake detector's candidate set, the SAME SSOT function, so
+  // the two cannot drift (the root of the P-tight defect was two separate predicates).
+  const undelivered = pendingGlobalClause(); // resolved_at IS NULL AND read_by_session IS NULL
 
   // ATOMICITY (codex, seq 863) — the doomed SELECT and the DELETE run in ONE
-  // transaction so no other connection can observe/resolve a candidate in the gap
-  // between them. Without it the announcement LIES: a message delivered a millisecond
-  // before the DELETE would still be logged "never observed" in the one artifact that
+  // transaction so no other connection can drain/resolve a candidate in the gap
+  // between them. Without it the announcement LIES: a message drained a millisecond
+  // before the DELETE would still be logged "undelivered" in the one artifact that
   // outlives the row. `dropped ⊆ deleted` is guaranteed by the shared snapshot — a
-  // candidate (created_at < graceCutoff, UNOBSERVED) satisfies the DELETE predicate
+  // candidate (created_at < graceCutoff, undelivered) satisfies the DELETE predicate
   // (created_at < 7d since graceCutoff <= 7d-ago, and NOT-exempt since created_at <
   // graceCutoff). Logged AFTER commit, so a DELETE failure rolls back and throws
   // before any line is emitted — never announcing a drop that did not happen.
   let dropped: Array<{ id: string; from_agent: string; to_agent: string | null; created_at: string }> = [];
   const purgeMessagesTx = db.transaction(() => {
     dropped = db
-      .prepare(`SELECT id, from_agent, to_agent, created_at FROM messages WHERE created_at < ? AND ${UNOBSERVED}`)
-      .all(graceCutoff) as typeof dropped;
-    // Purge messages older than 7d EXCEPT a never-observed obligation still within the
+      .prepare(`SELECT id, from_agent, to_agent, created_at FROM messages WHERE created_at < ? AND ${undelivered.sql}`)
+      .all(graceCutoff, ...undelivered.params) as typeof dropped;
+    // Purge messages older than 7d EXCEPT an undelivered obligation still within the
     // grace window (exempt/retained until it too crosses the grace, then dropped here).
     db.prepare(
-      `DELETE FROM messages WHERE created_at < ? AND NOT (${UNOBSERVED} AND created_at >= ?)`,
-    ).run(sevenDaysAgo, graceCutoff);
+      `DELETE FROM messages WHERE created_at < ? AND NOT (${undelivered.sql} AND created_at >= ?)`,
+    ).run(sevenDaysAgo, ...undelivered.params, graceCutoff);
   });
   // BEGIN IMMEDIATE via better-sqlite3's .immediate() so a concurrent drain/resolve
   // serializes at tx START rather than racing the SELECT→DELETE gap. Fall back to the
@@ -2431,9 +2444,9 @@ export function purgeOldRecords(db: CompatDatabase): void {
   for (const m of dropped) {
     const ageDays = ((now - Date.parse(m.created_at)) / (24 * 60 * 60 * 1000)).toFixed(1);
     log.warn(
-      `deadletter: dropping never-observed undelivered message id=${m.id} ` +
+      `deadletter: dropping undelivered message id=${m.id} ` +
         `to=${m.to_agent ?? "(broadcast)"} from=${m.from_agent} age=${ageDays}d ` +
-        `grace=${effectiveGraceDays}d — never delivered, never observed`,
+        `grace=${effectiveGraceDays}d — undelivered (no recipient has drained it)`,
     );
   }
   db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'rejected', 'cancelled') AND updated_at < ?").run(thirtyDaysAgo);
