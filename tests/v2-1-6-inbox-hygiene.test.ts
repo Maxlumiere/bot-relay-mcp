@@ -86,11 +86,11 @@ describe("v2.1.6 — get_messages `since` filter", () => {
     expect(data.count).toBe(1);
   });
 
-  it("(1b) explicit since:'1s' (future) filters out older messages", () => {
+  it("(1b) a since window admits NEVER-OBSERVED older mail (#198) — undelivered mail is not history", () => {
     handleRegisterAgent({ name: "sender", role: "r", capabilities: [] });
     handleRegisterAgent({ name: "receiver", role: "r", capabilities: [] });
 
-    // Insert a message dated 2 days ago — older than any short since window.
+    // Insert a message dated 2 days ago — older than the since window, never observed.
     const db = getDb();
     const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
     db.prepare(
@@ -101,7 +101,10 @@ describe("v2.1.6 — get_messages `since` filter", () => {
     const data = parseResult(
       handleGetMessages({ agent_name: "receiver", status: "pending", limit: 20, since: "1h" } as any)
     );
-    expect(data.count).toBe(1);
+    // #198: `since` bounds already-OBSERVED history, not undelivered mail. The
+    // 2-day-old message is never-observed, so a since='1h' pending drain now
+    // DELIVERS it (pre-#198 this count was 1). Newest-first ordering: fresh leads.
+    expect(data.count).toBe(2);
     expect(data.messages[0].content).toBe("fresh");
     expect(data.since).toBe("1h");
     expect(data.since_bound).toBeTruthy();

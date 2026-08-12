@@ -21,7 +21,7 @@
  *
  * Observation-only. No production behavior depends on the probe.
  */
-import { getDb, pendingGlobalClause } from "../db.js";
+import { getDb, pendingGlobalClause, pendingSinceClause } from "../db.js";
 import { log } from "../logger.js";
 import type { MessageRecord } from "../types.js";
 
@@ -95,19 +95,23 @@ export function sampleGetMessagesConsistency(args: {
     // `(read_by_session IS NULL OR status='pending')` and routes the probe
     // through the same single source of truth every mailbox surface now shares.
     //
-    // The `since` clause MIRRORS the MCP path's filter so the probe
-    // doesn't flag rows the caller legitimately asked to exclude.
+    // The `since` clause MIRRORS the MCP pending drain via the SAME
+    // pendingSinceClause SSOT helper the drain uses (#198), NOT a local copy —
+    // a probe that duplicates the predicate it checks drifts from it and goes
+    // blind to precisely the divergence it exists to catch. Building the superset
+    // on the shared helper makes drain/probe agreement structural: the aged
+    // never-observed row the drain now delivers is in the superset too, so a
+    // regression that DROPPED it from the drain would surface as `missingFromMcp`.
     const pc = pendingGlobalClause();
-    const sinceClause = args.sinceIso ? "AND created_at >= ?" : "";
-    const params: unknown[] = [args.agentName, ...pc.params];
-    if (args.sinceIso) params.push(args.sinceIso);
+    const psc = pendingSinceClause(args.sinceIso);
+    const params: unknown[] = [args.agentName, ...pc.params, ...psc.params];
     params.push(Math.max(args.limit, 100));
     const sqlRows = db
       .prepare(
         "SELECT id FROM messages " +
           "WHERE to_agent = ? " +
           "  AND " + pc.sql + " " +
-          "  " + sinceClause + " " +
+          "  " + psc.sql + " " +
           "LIMIT ?",
       )
       .all(...params) as { id: string }[];

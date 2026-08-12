@@ -4797,6 +4797,30 @@ export function pendingGlobalClause(): { sql: string; params: string[] } {
 }
 
 /**
+ * #198 — canonical WINDOW rule for a PENDING drain, beside the pending PREDICATE
+ * helpers above. A pending drain must return NEVER-OBSERVED (undelivered) mail
+ * regardless of `since`: seq is assigned on first observation, so an un-drained
+ * message older than the window would never be observed → never delivered, never
+ * seq'd (silent non-delivery). The `since` window therefore bounds ONLY
+ * already-observed history. Every pending surface — the get_messages drain,
+ * getMessagesSummary's pending preview, and the consistency probe's superset —
+ * routes its window through this ONE helper, so the age rule is inherited by
+ * construction and no surface can silently drift (the #53 class, on the window
+ * axis — #191 unified the pending PREDICATE but left window handling duplicated
+ * per call site). History reads (all/read/resolved) keep a plain
+ * `created_at >= ?` — the window is correct there, which is exactly why this is a
+ * NAMED pending-only helper, not a global change. Empty when no bound is set
+ * (since='all'/null): an unbounded pending drain returns everything
+ * unresolved-and-unread, unchanged. Plan-verified: OR'd against the `to_agent`
+ * equality it does not change the index seek (EXPLAIN QUERY PLAN identical).
+ */
+export function pendingSinceClause(sinceIso: string | null): { sql: string; params: string[] } {
+  return sinceIso
+    ? { sql: "AND (seq IS NULL OR created_at >= ?)", params: [sinceIso] }
+    : { sql: "", params: [] };
+}
+
+/**
  * v2.3.0 Part C — peek helper backing the `peek_inbox_version` MCP tool.
  * Pure observation — no mutation. Returns the current mailbox shape +
  * an observed count of messages addressed to the agent.
@@ -4898,6 +4922,9 @@ export function getMessages(
   // silent data loss. Mirror getMessagesSummary's pattern at
   // src/db.ts:3037: same `AND created_at >= ?` clause stitched into each
   // branch.
+  // sinceClause is the plain window for the HISTORY reads (all/read/resolved).
+  // The pending branch below routes its window through the pendingSinceClause
+  // SSOT helper instead (#198) so never-observed mail is always eligible.
   const sinceClause = sinceIso ? "AND created_at >= ?" : "";
   // v2.10 — lane filter. Fixed clauses (no param binding, no injection
   // surface) so an orchestrator can drain the action lane (direct,
@@ -4958,13 +4985,13 @@ export function getMessages(
     // count you wake on and the queue you drain cannot disagree. Logically
     // identical to the prior inline `(read_by_session …) AND resolved_at IS NULL`.
     const pc = pendingForSessionClause(currentSession ?? "");
-    const params: unknown[] = [agentName, ...pc.params];
-    if (sinceIso) params.push(sinceIso);
+    const psc = pendingSinceClause(sinceIso); // #198 SSOT window helper
+    const params: unknown[] = [agentName, ...pc.params, ...psc.params];
     params.push(limit);
     rows = db.prepare(
       `SELECT * FROM messages WHERE to_agent = ?
          AND ${pc.sql}
-         ${sinceClause}
+         ${psc.sql}
          ${laneClause}
          ${priorityOrder}`
     ).all(...params) as MessageRecord[];
@@ -5231,6 +5258,12 @@ export function getMessagesSummary(
   const priorityOrder =
     `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
 
+  // sinceClause = the plain window for the HISTORY reads (all/read/resolved). The
+  // pending branch below routes its window through the pendingSinceClause SSOT
+  // helper (#198) so the cheap preview AGREES with the mutating drain on aged
+  // never-observed mail (GetMessagesSummarySchema's "agrees with the mutating
+  // drain" contract) — else an aged seq-NULL unresolved message previews as 0
+  // while get_messages(pending) returns it.
   const sinceClause = sinceIso ? "AND created_at >= ?" : "";
   const params: unknown[] = [agentName];
 
@@ -5258,14 +5291,17 @@ export function getMessagesSummary(
     // "pending" — (never read OR read by a different session) AND not yet
     // resolved. v2.12.0: the `resolved_at IS NULL` clause mirrors getMessages
     // so the cheap preview and the mutating drain agree on the pending set
-    // (an already-resolved item never shows as pending in either path).
+    // (an already-resolved item never shows as pending in either path). #198:
+    // the WINDOW mirrors the drain via the same pendingSinceClause SSOT helper,
+    // so aged never-observed mail previews exactly as it drains.
+    const psc = pendingSinceClause(sinceIso);
     sql = `SELECT * FROM messages WHERE to_agent = ?
        AND (read_by_session IS NULL OR read_by_session != ?)
        AND resolved_at IS NULL
-       ${sinceClause}
+       ${psc.sql}
        ${priorityOrder}`;
     params.push(currentSession ?? "");
-    if (sinceIso) params.push(sinceIso);
+    params.push(...psc.params);
   }
   params.push(limit);
 
