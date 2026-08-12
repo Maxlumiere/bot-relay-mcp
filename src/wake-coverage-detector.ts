@@ -83,15 +83,32 @@
  * re-run the backtest against post-#198 data after ~a week of real operation to
  * replace the estimate with a measurement.
  *
- * ⚠ DURABLE EVIDENCE — A VERDICT THAT SUPPRESSES AN ALARM MUST NEVER DEPEND ON DATA
- * THAT EXPIRES (victra, codex #200). Both COVERED and UNOBSERVABLE suppress the
- * alarm, so both read the DURABLE `agents.last_drain_at`, never the `inbox_events`
- * message_read stream, which purges at 7 days. Counting the event stream would go
- * blind exactly for the longest outages: an agent dark > 7 days loses its drain
- * events, would read "never drained" → UNOBSERVABLE (non-alarming), and the real
- * regression would be silenced precisely where the harm is greatest. The marker is
- * written on every !peek drain and lives on `agents` (not `mailbox`) so it resets on
- * unregister — durable past retention without outliving the identity.
+ * ⚠ DURABLE EVIDENCE. Both checks read the DURABLE `agents.last_drain_at`, never the
+ * `inbox_events` message_read stream (7-day purge) — but for TWO DIFFERENT reasons,
+ * and conflating them would misremember the rule:
+ *   - UNOBSERVABLE is the alarm-SUPPRESSING verdict, and A VERDICT THAT SUPPRESSES AN
+ *     ALARM MUST NEVER DEPEND ON DATA THAT EXPIRES (victra, codex #200). Computed from
+ *     inbox_events it would go blind exactly for the longest outages: an agent dark
+ *     > 7 days loses its drain events, reads "never drained" → UNOBSERVABLE, and the
+ *     real regression is SILENCED precisely where the harm is greatest. Silence is the
+ *     failure you cannot see, so its input must outlive the condition (unbounded).
+ *   - The COVERED check (drainSinceArrival) reads the same marker, but NOT for the
+ *     suppression rule: if it read the expiring inbox_events, expiry would make it read
+ *     FALSE → the agent ALARMS (noise, the SAFE direction), never silence. Its real
+ *     hazard is a CROSS-KNOB INVARIANT: RELAY_OUTBOX_RETENTION_DAYS and the effective
+ *     threshold (boundMs+antiFlapMarginMs) are two INDEPENDENTLY configurable settings
+ *     whose RELATIVE values would silently decide correctness — set retention below the
+ *     threshold and the detector alarms on agents that drained normally, with nothing
+ *     connecting the two knobs. Reading last_drain_at REMOVES that latent invariant
+ *     entirely (make-impossible) instead of documenting a rule nobody would check.
+ *
+ * BOUNDARY of the signal: `last_drain_at >= arrival` establishes the agent DRAINED
+ * AFTER this message arrived — AGENT-LEVEL (awake since), NOT proof THIS message was in
+ * that drain; a still-sitting message is then a routing question, not a wake one.
+ * (Equally true of the prior inbox_events form — not a regression, just re-anchored.)
+ *
+ * The marker is written on every !peek drain and lives on `agents` (not `mailbox`) so
+ * it resets on unregister — durable past retention without outliving the identity.
  * TRANSITIONAL LIMIT (inherent, not a defect): an agent ALREADY dark longer than the
  * inbox_events retention at migration time has no reconstructable drain history
  * (backfill is best-effort from the retained events), so it reads UNOBSERVABLE until
@@ -169,16 +186,13 @@ export function classifyWakeCoverage(
     oldest_created_at: string;
   }>;
 
-  // #60 DURABILITY FIX (codex #200): BOTH alarm-SUPPRESSING branches — COVERED and
-  // UNOBSERVABLE — read the DURABLE per-agent `agents.last_drain_at`, NEVER
-  // inbox_events. inbox_events purges at 7d; a >7d-dark agent's message_read rows
-  // are gone, so counting them would falsely read "never drained" → UNOBSERVABLE
-  // (non-alarming) and SILENCE the alarm for exactly the longest outages — the ones
-  // this detector exists to catch. A VERDICT THAT SUPPRESSES AN ALARM MUST NEVER
-  // DEPEND ON DATA THAT EXPIRES (victra). `last_drain_at` is written on every !peek
-  // drain (db.ts) and lives on `agents` (reset on unregister/reap), so it is durable
-  // past event retention yet does NOT outlive the agent's own identity — a
-  // re-registered name starts NULL, correctly UNOBSERVABLE until its first drain.
+  // #60 DURABILITY FIX (codex #200): both checks read the DURABLE per-agent
+  // `agents.last_drain_at`, never the 7-day inbox_events stream — for the two DISTINCT
+  // reasons spelled out in the DURABLE EVIDENCE note in the header (UNOBSERVABLE: the
+  // silence-must-not-expire rule; COVERED/drainSinceArrival: removing the cross-knob
+  // retention-vs-threshold invariant), plus the agent-level boundary of the signal.
+  // Written on every !peek drain (db.ts), on `agents` (reset on unregister/reap) so a
+  // re-registered name starts NULL, correctly UNOBSERVABLE until its first real drain.
   const lastDrainStmt = db.prepare("SELECT last_drain_at FROM agents WHERE name = ?");
 
   const findings: WakeCoverageFinding[] = [];
