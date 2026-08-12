@@ -9,11 +9,12 @@
  * never wakes anyone, never mutates the DB — pure observation.
  *
  * THE OBSERVABLE IS THE WAKE'S EFFECT, NOT THE ATTEMPT (victra ruling). A wake is
- * "observed" only when the agent actually DRAINED its mailbox — an
- * `inbox_events(reason='message_read')` row, emitted on the get_messages drain.
- * A running watcher, a live process, a self-reported status: none count. A wake
- * that fires and produces no drain SHOULD read as uncovered. That is
- * read-the-state applied to coverage.
+ * "observed" only when the agent actually DRAINED its mailbox via MCP get_messages.
+ * A running watcher, a live process, a self-reported status: none count. A wake that
+ * fires and produces no drain SHOULD read as uncovered. That is read-the-state
+ * applied to coverage. The DURABLE record of that drain is `agents.last_drain_at`
+ * (written on every !peek drain), NOT the `inbox_events` message_read stream — see
+ * the DURABLE EVIDENCE note below for why the distinction is load-bearing.
  *
  * THREE VERDICTS, derived from the SAME table the detector reads — no allowlist,
  * no exemption lever. For an agent with mail pending past the bound:
@@ -24,9 +25,10 @@
  *   - UNCOVERED    — the agent HAS drained before (has message_read history) but
  *                    NOT since the stuck mail arrived. It was being woken and now
  *                    is not: the S2 regression. Reported as an alarm.
- *   - UNOBSERVABLE — the agent has NEVER emitted a message_read event. It reads
- *                    out-of-band (direct DB/CLI / non-MCP), so the detector cannot
- *                    judge its coverage AT ALL. Reported, but NEVER as uncovered —
+ *   - UNOBSERVABLE — the agent's durable last-drain marker is unset: it has never
+ *                    drained via MCP. It reads out-of-band (direct DB/CLI / non-MCP),
+ *                    so the detector cannot judge its coverage AT ALL. Reported,
+ *                    but NEVER as uncovered —
  *                    "I cannot observe this" is a different fact from "this is
  *                    broken," and collapsing them is the exact error the whole
  *                    ADR set exists to prevent (the exit-1 vs exit-2 distinction,
@@ -80,6 +82,21 @@
  * default-on is safe; but "should" is a prediction. FOLLOW-UP (not a blocker):
  * re-run the backtest against post-#198 data after ~a week of real operation to
  * replace the estimate with a measurement.
+ *
+ * ⚠ DURABLE EVIDENCE — A VERDICT THAT SUPPRESSES AN ALARM MUST NEVER DEPEND ON DATA
+ * THAT EXPIRES (victra, codex #200). Both COVERED and UNOBSERVABLE suppress the
+ * alarm, so both read the DURABLE `agents.last_drain_at`, never the `inbox_events`
+ * message_read stream, which purges at 7 days. Counting the event stream would go
+ * blind exactly for the longest outages: an agent dark > 7 days loses its drain
+ * events, would read "never drained" → UNOBSERVABLE (non-alarming), and the real
+ * regression would be silenced precisely where the harm is greatest. The marker is
+ * written on every !peek drain and lives on `agents` (not `mailbox`) so it resets on
+ * unregister — durable past retention without outliving the identity.
+ * TRANSITIONAL LIMIT (inherent, not a defect): an agent ALREADY dark longer than the
+ * inbox_events retention at migration time has no reconstructable drain history
+ * (backfill is best-effort from the retained events), so it reads UNOBSERVABLE until
+ * it next drains — which a dark agent will not do. Expired history is unrecoverable;
+ * the marker guarantees correctness GOING FORWARD, which is what the rule requires.
  */
 import type { CompatDatabase } from "./sqlite-compat.js";
 import { pendingGlobalClause } from "./db.js";
@@ -152,20 +169,30 @@ export function classifyWakeCoverage(
     oldest_created_at: string;
   }>;
 
-  const hasAnyDrainStmt = db.prepare(
-    "SELECT 1 FROM inbox_events WHERE agent_name = ? AND reason = 'message_read' LIMIT 1",
-  );
-  const drainSinceStmt = db.prepare(
-    "SELECT 1 FROM inbox_events WHERE agent_name = ? AND reason = 'message_read' AND created_at >= ? LIMIT 1",
-  );
+  // #60 DURABILITY FIX (codex #200): BOTH alarm-SUPPRESSING branches — COVERED and
+  // UNOBSERVABLE — read the DURABLE per-agent `agents.last_drain_at`, NEVER
+  // inbox_events. inbox_events purges at 7d; a >7d-dark agent's message_read rows
+  // are gone, so counting them would falsely read "never drained" → UNOBSERVABLE
+  // (non-alarming) and SILENCE the alarm for exactly the longest outages — the ones
+  // this detector exists to catch. A VERDICT THAT SUPPRESSES AN ALARM MUST NEVER
+  // DEPEND ON DATA THAT EXPIRES (victra). `last_drain_at` is written on every !peek
+  // drain (db.ts) and lives on `agents` (reset on unregister/reap), so it is durable
+  // past event retention yet does NOT outlive the agent's own identity — a
+  // re-registered name starts NULL, correctly UNOBSERVABLE until its first drain.
+  const lastDrainStmt = db.prepare("SELECT last_drain_at FROM agents WHERE name = ?");
 
   const findings: WakeCoverageFinding[] = [];
   for (const row of stuck) {
-    const drainedSinceArrival = drainSinceStmt.get(row.agent, row.oldest_created_at) != null;
-    if (drainedSinceArrival) continue; // COVERED — awake since the mail arrived; not reported.
-
-    const hasAnyDrain = hasAnyDrainStmt.get(row.agent) != null;
-    const verdict: WakeVerdict = hasAnyDrain ? "uncovered" : "unobservable";
+    const agentRow = lastDrainStmt.get(row.agent) as { last_drain_at: string | null } | undefined;
+    const lastDrainAt = agentRow?.last_drain_at ?? null;
+    // COVERED — the durable marker shows a drain at/after the oldest stuck message
+    // arrived (awake since; a message still sitting is a routing question, not a wake
+    // one). ISO8601-Z strings compare chronologically. Not reported.
+    if (lastDrainAt !== null && lastDrainAt >= row.oldest_created_at) continue;
+    // UNOBSERVABLE — the durable marker is unset: never drained via MCP, so the
+    // detector cannot judge. Else UNCOVERED — drained before but not since the stuck
+    // mail: the S2 regression.
+    const verdict: WakeVerdict = lastDrainAt !== null ? "uncovered" : "unobservable";
     findings.push({
       agent: row.agent,
       verdict,
@@ -203,9 +230,9 @@ export function formatWakeCoverageFindings(findings: readonly WakeCoverageFindin
     // unobservable — informational, explicitly NOT an alarm.
     return (
       `[wake-coverage] UNOBSERVABLE — ${f.agent}: ${f.pendingCount} message(s) pending >= bound ` +
-      `(oldest ${age}), but ${f.agent} has never emitted a drain event; it reads out-of-band ` +
-      `(direct DB/CLI / non-MCP). The detector cannot judge this agent's coverage and does NOT ` +
-      `report it as uncovered.`
+      `(oldest ${age}), but ${f.agent} has never drained via MCP (its durable last-drain marker ` +
+      `is unset); it reads out-of-band (direct DB/CLI / non-MCP). The detector cannot judge this ` +
+      `agent's coverage and does NOT report it as uncovered.`
     );
   });
 }

@@ -22,7 +22,7 @@ const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-wake-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
 delete process.env.RELAY_AGENT_TOKEN;
 
-const { getDb, registerAgent, closeDb } = await import("../src/db.js");
+const { getDb, registerAgent, sendMessage, getMessages, closeDb } = await import("../src/db.js");
 const { log } = await import("../src/logger.js");
 const { classifyWakeCoverage, formatWakeCoverageFindings, startWakeCoverageSweep, wakeConfigFromEnv } =
   await import("../src/wake-coverage-detector.js");
@@ -47,13 +47,10 @@ function seedPending(to: string, id: string, hoursAgo: number): void {
     )
     .run(id, to, isoAgo(hoursAgo));
 }
-/** Plant an observed-drain event (what get_messages emits) at an explicit time. */
+/** Set the agent's DURABLE last-drain marker (what the detector reads — NOT the
+ *  7-day inbox_events stream). The agent must already be registered so its row exists. */
 function seedDrain(agent: string, hoursAgo: number): void {
-  getDb()
-    .prepare(
-      "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, 'message_read', ?, 1)",
-    )
-    .run(agent, isoAgo(hoursAgo));
+  getDb().prepare("UPDATE agents SET last_drain_at = ? WHERE name = ?").run(isoAgo(hoursAgo), agent);
 }
 
 describe("#60 — wake-coverage detector: injected S2 harm + three verdicts + anti-flap margin", () => {
@@ -86,7 +83,7 @@ describe("#60 — wake-coverage detector: injected S2 harm + three verdicts + an
 
     const [line] = formatWakeCoverageFindings([f!]);
     expect(line).toContain("[wake-coverage] UNOBSERVABLE — muted");
-    expect(line).toContain("has never emitted a drain event");
+    expect(line).toContain("has never drained via MCP"); // durable-marker language
     expect(line).toContain("does NOT"); // explicitly not rendered as uncovered
     // The two verdicts must never render the same way.
     expect(line).not.toContain("UNCOVERED");
@@ -124,6 +121,33 @@ describe("#60 — wake-coverage detector: injected S2 harm + three verdicts + an
 
     const findings = classifyWakeCoverage(getDb(), OPTS);
     expect(findings.find((x) => x.agent === "clean")).toBeUndefined();
+  });
+
+  it("DURABILITY (codex #200): a drained agent whose inbox_events were PURGED still reads UNCOVERED — the verdict never depends on the expiring event stream", () => {
+    registerAgent("long-dark", "r", []);
+    // Drained 10 DAYS ago (durable marker set); its message_read events would have
+    // been purged at the 7d retention. Simulate the purge: seed then DELETE them.
+    seedDrain("long-dark", 10 * 24); // agents.last_drain_at = 10d ago (durable)
+    getDb().prepare("INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES ('long-dark','message_read',?,1)").run(isoAgo(10 * 24));
+    getDb().prepare("DELETE FROM inbox_events WHERE agent_name = 'long-dark'").run(); // the 7-day purge
+    expect((getDb().prepare("SELECT COUNT(*) c FROM inbox_events WHERE agent_name='long-dark'").get() as { c: number }).c).toBe(0);
+    seedPending("long-dark", "stuck-dark", 50); // still-pending 50h message
+
+    const f = classifyWakeCoverage(getDb(), OPTS).find((x) => x.agent === "long-dark");
+    // Pre-fix this read UNOBSERVABLE (no inbox_events) and SILENCED the alarm for the
+    // longest outage; the durable marker keeps it UNCOVERED — regression preserved.
+    expect(f?.verdict).toBe("uncovered");
+  });
+
+  it("DRAIN PATH: a real !peek get_messages drain sets the durable agents.last_drain_at", () => {
+    registerAgent("sender", "r", []);
+    registerAgent("drainer", "r", []);
+    getDb().prepare("UPDATE agents SET session_id = 's1' WHERE name = 'drainer'").run();
+    expect((getDb().prepare("SELECT last_drain_at FROM agents WHERE name='drainer'").get() as { last_drain_at: string | null }).last_drain_at).toBeNull();
+    sendMessage("sender", "drainer", "hi", "normal");
+    getMessages("drainer", "pending", 20); // real drain (non-peek) marks read + sets the marker
+    const after = (getDb().prepare("SELECT last_drain_at FROM agents WHERE name='drainer'").get() as { last_drain_at: string | null }).last_drain_at;
+    expect(after).not.toBeNull();
   });
 });
 

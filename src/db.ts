@@ -1403,6 +1403,26 @@ function migrateSchemaToV2_10(db: CompatDatabase): void {
     CREATE INDEX IF NOT EXISTS idx_inbox_events_id_after ON inbox_events(id);
     CREATE INDEX IF NOT EXISTS idx_inbox_events_agent_id ON inbox_events(agent_name, id);
   `);
+  // #60 — DURABLE per-agent last-MCP-drain marker. Placed HERE (not with the earlier
+  // agents-column migrations) because its one-time backfill reads `inbox_events`,
+  // which this same function creates just above. On `agents` (NOT `mailbox`): agents
+  // rows are deleted on unregister/orphan-reap, so a re-registered identity starts
+  // NULL rather than inheriting a stale marker — the durability we need is "survives
+  // 7-day event retention," not "survives the agent." Written on every !peek drain via
+  // the sanctioned updateAgentMetadata (this one-time raw UPDATE is in db.ts, the
+  // single sanctioned agents-mutation site). Backfilled ONCE from the retained (~7d)
+  // message_read events. Transitional limit (inherent, not a defect): an agent already
+  // dark longer than the inbox_events retention has no reconstructable drain history
+  // and stays NULL — reading UNOBSERVABLE — until it next drains.
+  const agentColsWake = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!agentColsWake.some((c) => c.name === "last_drain_at")) {
+    db.exec("ALTER TABLE agents ADD COLUMN last_drain_at TEXT");
+    db.exec(
+      "UPDATE agents SET last_drain_at = " +
+        "(SELECT MAX(e.created_at) FROM inbox_events e WHERE e.agent_name = agents.name AND e.reason = 'message_read') " +
+        "WHERE EXISTS (SELECT 1 FROM inbox_events e WHERE e.agent_name = agents.name AND e.reason = 'message_read')",
+    );
+  }
 }
 
 /**
@@ -2694,6 +2714,16 @@ export function updateAgentMetadata(
     // v2.13.0 — positive-liveness timestamp (same-host PID probe / heartbeat).
     // Non-auth-state field, same single-site writer as the rest.
     last_alive?: string;
+    // #60 — DURABLE per-agent last-MCP-drain timestamp. Written on the !peek
+    // get_messages drain (the exact drain-specific event, alongside read_by_session
+    // + the message_read inbox_event). The wake-coverage detector's suppressing
+    // verdicts (COVERED / UNOBSERVABLE) read from THIS, never from inbox_events —
+    // which purges at 7d, so a >7d-dark agent would otherwise read as "never
+    // drained" and its alarm be silenced (a verdict that suppresses an alarm must
+    // never depend on data that expires). Lives on `agents` (deleted on unregister)
+    // so a re-registered identity correctly starts NULL, not inheriting a stale bit.
+    // Non-auth-state field.
+    last_drain_at?: string;
   }
 ): boolean {
   const db = getDb();
@@ -2710,15 +2740,17 @@ export function updateAgentMetadata(
     agent_status: fields.agent_status !== undefined,
     busy_expires_at: fields.busy_expires_at !== undefined,
     last_alive: fields.last_alive !== undefined,
+    last_drain_at: fields.last_drain_at !== undefined,
   };
-  if (!has.last_seen && !has.agent_status && !has.busy_expires_at && !has.last_alive) return true;
+  if (!has.last_seen && !has.agent_status && !has.busy_expires_at && !has.last_alive && !has.last_drain_at) return true;
   const r = db
     .prepare(
       `UPDATE agents SET
          last_seen = CASE WHEN ? THEN ? ELSE last_seen END,
          agent_status = CASE WHEN ? THEN ? ELSE agent_status END,
          busy_expires_at = CASE WHEN ? THEN ? ELSE busy_expires_at END,
-         last_alive = CASE WHEN ? THEN ? ELSE last_alive END
+         last_alive = CASE WHEN ? THEN ? ELSE last_alive END,
+         last_drain_at = CASE WHEN ? THEN ? ELSE last_drain_at END
        WHERE name = ?`,
     )
     .run(
@@ -2730,6 +2762,8 @@ export function updateAgentMetadata(
       fields.busy_expires_at ?? null,
       has.last_alive ? 1 : 0,
       fields.last_alive ?? null,
+      has.last_drain_at ? 1 : 0,
+      fields.last_drain_at ?? null,
       name,
     );
   return r.changes > 0;
@@ -5078,6 +5112,13 @@ export function getMessages(
   // (e.g. status='all' / 'read' filters never mark anything new).
   if (drainedRows > 0) {
     emitInboxChanged({ agent_name: agentName, reason: "message_read", id: outboxId });
+    // #60 — DURABLE per-agent last-MCP-drain marker, via the sanctioned writer
+    // (updateAgentMetadata). Fires on the exact drain-specific event: a !peek drain
+    // that marked >=1 row read and emitted the message_read inbox_event. The
+    // wake-coverage detector reads `agents.last_drain_at`, NOT inbox_events, so its
+    // alarm-suppressing verdicts (COVERED / UNOBSERVABLE) survive the 7-day event
+    // purge — a verdict that suppresses an alarm must never depend on data that expires.
+    updateAgentMetadata(agentName, { last_drain_at: now() });
   }
 
   // v2.3.0 Part C.2 — first-observation seq assignment. Per Codex Q9 lock:
