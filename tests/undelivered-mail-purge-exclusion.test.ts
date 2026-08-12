@@ -77,6 +77,28 @@ function captureStderr(fn: () => void): string {
   return chunks.join("");
 }
 
+/** Capture stderr AND report whether fn threw (needed for the atomicity/rollback
+ *  case, where purge is expected to throw yet we must still inspect what — if
+ *  anything — was announced before the throw). */
+function captureStderrAllowThrow(fn: () => void): { out: string; threw: boolean } {
+  const chunks: string[] = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (process.stderr as any).write = (chunk: any) => {
+    chunks.push(String(chunk));
+    return true;
+  };
+  let threw = false;
+  try {
+    fn();
+  } catch {
+    threw = true;
+  } finally {
+    (process.stderr as any).write = orig;
+  }
+  return { out: chunks.join(""), threw };
+}
+
 function cleanup() {
   closeDb();
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
@@ -175,5 +197,74 @@ describe("undelivered-mail purge exclusion (PRIMARY defect)", () => {
     expect(exists(dropped)).toBe(false);
     expect(err).toContain(`id=${dropped}`);
     expect(err).not.toContain(`id=${kept}`);
+  });
+
+  it("CONTRACT: every announced id is actually deleted; no retained or observed row is announced (dropped ⊆ deleted)", () => {
+    const droppedIds = [seed("a", "b", "d1", { ageDays: 35 }), seed("a", "c", "d2", { ageDays: 50 })];
+    const keptIds = [seed("a", "b", "k1", { ageDays: 10 }), seed("a", "c", "k2", { ageDays: 20 })];
+    // Observed history older than 7d: deleted by the normal purge, but NOT an obligation.
+    const historyId = seed("a", "b", "h1", { ageDays: 12, seq: 9, readBy: "s1" });
+    const { out } = captureStderrAllowThrow(() => purgeOldRecords(getDb()));
+    for (const id of droppedIds) {
+      expect(exists(id)).toBe(false); // announced ⇒ actually gone
+      expect(out).toContain(`id=${id}`);
+    }
+    for (const id of keptIds) {
+      expect(exists(id)).toBe(true); // retained obligation …
+      expect(out).not.toContain(`id=${id}`); // … never announced
+    }
+    expect(exists(historyId)).toBe(false); // observed history purged …
+    expect(out).not.toContain(`id=${historyId}`); // … but not announced as an obligation
+  });
+
+  it("ATOMICITY: a failed DELETE rolls back AND emits no announcement (SELECT+DELETE in one tx, log after commit)", () => {
+    // Inject a failure at the messages DELETE. If the announcement were emitted before
+    // the delete (the old shape codex flagged), it would print a "dropped" line for a
+    // row that survives — a lie in the artifact that outlives the row. Here the tx
+    // rolls back and the log loop (after commit) never runs.
+    const id = seed("a", "b", "abort-injected", { ageDays: 40 });
+    getDb().exec("CREATE TEMP TRIGGER purge_abort BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'injected'); END");
+    const { out, threw } = captureStderrAllowThrow(() => purgeOldRecords(getDb()));
+    try {
+      getDb().exec("DROP TRIGGER purge_abort");
+    } catch {
+      /* connection may have been torn down */
+    }
+    expect(threw).toBe(true); // the DELETE failure propagates
+    expect(exists(id)).toBe(true); // rolled back — the obligation survives
+    expect(out).not.toContain("deadletter"); // and was NEVER announced as dropped
+  });
+
+  it("clamp below 7d: warns once AND the deadletter reports the EFFECTIVE grace, not the requested", () => {
+    // Force DB init NOW (getDb() runs a startup purge via applySchemaSetup). With the
+    // default grace that startup purge does not warn, so the warn-once budget is intact
+    // for the grace=3 purge below — otherwise the init purge would spend it uncaptured.
+    getDb();
+    process.env.RELAY_UNDELIVERED_GRACE_DAYS = "3";
+    const id = seed("a", "b", "clamped", { ageDays: 10 });
+    const err1 = captureStderr(() => purgeOldRecords(getDb()));
+    expect(exists(id)).toBe(false);
+    // effective-grace-in-log (the sharp defect): reports 7d (applied), never 3d (requested)
+    expect(err1).toContain("grace=7d");
+    expect(err1).not.toContain("grace=3d");
+    // silent-clamp fix: the coercion is announced …
+    expect(err1).toContain("config:");
+    expect(err1).toContain("below the 7d base retention");
+    // … exactly once (a second purge does not re-warn)
+    const id2 = seed("a", "b", "clamped-2", { ageDays: 11 });
+    const err2 = captureStderr(() => purgeOldRecords(getDb()));
+    expect(err2).not.toContain("config:");
+    // (the second drop is still announced — only the config warning is once)
+    expect(err2).toContain(`id=${id2}`);
+  });
+
+  it("invalid RELAY_UNDELIVERED_GRACE_DAYS coerces to the 30d default (behaviour)", () => {
+    process.env.RELAY_UNDELIVERED_GRACE_DAYS = "banana";
+    const within30 = seed("a", "b", "within-default", { ageDays: 20 }); // < 30d default → retained
+    const past30 = seed("a", "b", "past-default", { ageDays: 40 }); // > 30d default → dropped
+    const err = captureStderr(() => purgeOldRecords(getDb()));
+    expect(exists(within30)).toBe(true);
+    expect(exists(past30)).toBe(false);
+    expect(err).toContain("grace=30d"); // effective = 30, not the garbage input
   });
 });
