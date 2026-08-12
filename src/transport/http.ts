@@ -20,6 +20,7 @@ import {
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
 import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated } from "../db.js";
 import { verifyToken } from "../auth.js";
+import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "./websocket.js";
 import { attachDashboardWs } from "./websocket.js";
@@ -1570,6 +1571,14 @@ export function startHttpServer(port: number, host: string): Server {
   // Unref so the timer never blocks process shutdown.
   const reaper = setInterval(reapIdleSessions, HTTP_REAPER_INTERVAL_MS);
   if (typeof reaper.unref === "function") reaper.unref();
+
+  // #60 — S2 wake-coverage detector (ADR-0023). HTTP DAEMON ONLY (this is the
+  // long-lived shared process; a per-terminal stdio server must NOT run a
+  // fleet-wide sweep). REPORT-FIRST to stderr, default-on (disable with
+  // RELAY_WAKE_DETECTOR=0). The timer is unref'd inside the helper and the process
+  // outlives it, so — like the reaper — we do not thread a stop handle through
+  // shutdown here.
+  void startWakeCoverageSweep(getDb());
 
   function isInitializeBody(body: unknown): boolean {
     return (
