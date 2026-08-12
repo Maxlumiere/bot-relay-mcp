@@ -149,6 +149,44 @@ describe("#60 — wake-coverage detector: injected S2 harm + three verdicts + an
     const after = (getDb().prepare("SELECT last_drain_at FROM agents WHERE name='drainer'").get() as { last_drain_at: string | null }).last_drain_at;
     expect(after).not.toBeNull();
   });
+
+  it("ATOMICITY (codex #200): the marker commits IN THE SAME tx as the drain — a failure at the marker rolls the WHOLE drain back", () => {
+    registerAgent("sender", "r", []);
+    registerAgent("atomic", "r", []);
+    const db = getDb();
+    db.prepare("UPDATE agents SET session_id = 's1' WHERE name = 'atomic'").run();
+    const msg = sendMessage("sender", "atomic", "hi", "normal");
+    // Inject a failure at the marker write: a trigger that ABORTs any last_drain_at UPDATE.
+    // Because the marker write is INSIDE the drain tx, the abort throws out of the tx
+    // callback and better-sqlite3 rolls back the ENTIRE drain. With a post-tx marker
+    // (the bug), the drain would have committed FIRST, leaving a message_read event with
+    // a NULL marker → UNOBSERVABLE → suppressed — so this test bites on that regression.
+    db.exec("CREATE TEMP TRIGGER wake_atomic_inject BEFORE UPDATE OF last_drain_at ON agents BEGIN SELECT RAISE(ABORT, 'inject-marker-failure'); END");
+    let threw = false;
+    try { getMessages("atomic", "pending", 20); } catch { threw = true; }
+    db.exec("DROP TRIGGER wake_atomic_inject");
+    expect(threw).toBe(true); // the drain tx aborted at the marker write
+
+    // ATOMIC: the whole drain rolled back — message STILL pending, no message_read event, marker unset.
+    expect((db.prepare("SELECT read_by_session FROM messages WHERE id = ?").get(msg.id) as { read_by_session: string | null }).read_by_session).toBeNull();
+    expect((db.prepare("SELECT COUNT(*) c FROM inbox_events WHERE agent_name = 'atomic' AND reason = 'message_read'").get() as { c: number }).c).toBe(0);
+    expect((db.prepare("SELECT last_drain_at FROM agents WHERE name = 'atomic'").get() as { last_drain_at: string | null }).last_drain_at).toBeNull();
+
+    // With the injection removed, a normal drain marks read AND stamps the marker together.
+    getMessages("atomic", "pending", 20);
+    const ok = db.prepare("SELECT m.read_by_session AS rbs, a.last_drain_at AS lda FROM messages m, agents a WHERE m.id = ? AND a.name = 'atomic'").get(msg.id) as { rbs: string | null; lda: string | null };
+    expect(ok.rbs).not.toBeNull();
+    expect(ok.lda).not.toBeNull();
+  });
+
+  it("PEEK does not stamp last_drain_at (observation is not a drain)", () => {
+    registerAgent("sender", "r", []);
+    registerAgent("peeker", "r", []);
+    getDb().prepare("UPDATE agents SET session_id = 's1' WHERE name = 'peeker'").run();
+    sendMessage("sender", "peeker", "hi", "normal");
+    getMessages("peeker", "pending", 20, /* peek */ true);
+    expect((getDb().prepare("SELECT last_drain_at FROM agents WHERE name='peeker'").get() as { last_drain_at: string | null }).last_drain_at).toBeNull();
+  });
 });
 
 describe("#60 — detector wiring + lifecycle", () => {

@@ -83,15 +83,26 @@
  * re-run the backtest against post-#198 data after ~a week of real operation to
  * replace the estimate with a measurement.
  *
- * ⚠ DURABLE EVIDENCE. Both checks read the DURABLE `agents.last_drain_at`, never the
- * `inbox_events` message_read stream (7-day purge) — but for TWO DIFFERENT reasons,
- * and conflating them would misremember the rule:
- *   - UNOBSERVABLE is the alarm-SUPPRESSING verdict, and A VERDICT THAT SUPPRESSES AN
- *     ALARM MUST NEVER DEPEND ON DATA THAT EXPIRES (victra, codex #200). Computed from
- *     inbox_events it would go blind exactly for the longest outages: an agent dark
- *     > 7 days loses its drain events, reads "never drained" → UNOBSERVABLE, and the
- *     real regression is SILENCED precisely where the harm is greatest. Silence is the
- *     failure you cannot see, so its input must outlive the condition (unbounded).
+ * ⚠ SILENCE-SAFE EVIDENCE (the rule, WIDENED after a real miss). Both checks read the
+ * DURABLE `agents.last_drain_at`, never the `inbox_events` message_read stream (7-day
+ * purge) — but for TWO DIFFERENT reasons, and conflating them would misremember the
+ * rule:
+ *   - UNOBSERVABLE is the alarm-SUPPRESSING verdict, and A VERDICT THAT PRODUCES
+ *     SILENCE MUST NOT DEPEND ON EVIDENCE THAT CAN BE ABSENT — from expiry, from a
+ *     crash window, or from a partial failure. Such evidence must be written
+ *     ATOMICALLY WITH THE EVENT IT RECORDS, AND outlive the condition it silences
+ *     (victra). The rule was WIDENED from "must not depend on data that EXPIRES" after
+ *     codex #200: the durability half was specified, the atomicity half was not, and a
+ *     marker written just AFTER the drain transaction had a crash window that would
+ *     leave a real drain looking "never drained" → UNOBSERVABLE → silenced. Earned,
+ *     not composed. The two halves as implemented:
+ *       · DURABILITY — last_drain_at lives on `agents`, past the 7-day event purge, so
+ *         a >7d-dark agent is not falsely read as never-drained (the longest outages
+ *         are exactly where the harm is greatest).
+ *       · ATOMICITY — last_drain_at is stamped INSIDE the same BEGIN IMMEDIATE drain
+ *         transaction as the read-mark + message_read insert (src/db.ts getMessages),
+ *         so a crash can never record a drain without its marker; they commit or roll
+ *         back together.
  *   - The COVERED check (drainSinceArrival) reads the same marker, but NOT for the
  *     suppression rule: if it read the expiring inbox_events, expiry would make it read
  *     FALSE → the agent ALARMS (noise, the SAFE direction), never silence. Its real

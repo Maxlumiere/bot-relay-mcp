@@ -5093,6 +5093,16 @@ export function getMessages(
           "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
         ).run(agentName, "message_read", now(), process.pid);
         outboxId = Number(ins.lastInsertRowid);
+        // #60 (codex #200) — stamp the DURABLE last-drain marker INSIDE this same
+        // BEGIN IMMEDIATE tx, atomically with the read-mark + message_read insert. A
+        // verdict that produces SILENCE must not depend on evidence that can be ABSENT
+        // — including from a crash window between the drain commit and a post-tx write:
+        // that gap would leave a real drain looking "never drained" → UNOBSERVABLE →
+        // alarm suppressed. updateAgentMetadata's prepare/run is on the SAME db
+        // connection, so it joins this transaction and commits or rolls back WITH the
+        // drain — while still being the sanctioned agents-mutation helper (the
+        // fully-literal CASE keeps it auth-gen-guard-safe).
+        updateAgentMetadata(agentName, { last_drain_at: now() });
       }
     });
     // BEGIN IMMEDIATE via better-sqlite3's .immediate() modifier so
@@ -5111,14 +5121,10 @@ export function getMessages(
   // Skipped on peek (no mutation) and skipped when zero rows transitioned
   // (e.g. status='all' / 'read' filters never mark anything new).
   if (drainedRows > 0) {
+    // Post-commit NOTIFICATION only (a side-channel wake, not durable evidence) — the
+    // durable last_drain_at marker is written INSIDE the tx above, atomically with the
+    // drain (#60 / codex #200), so it can never lag or be lost relative to the drain.
     emitInboxChanged({ agent_name: agentName, reason: "message_read", id: outboxId });
-    // #60 — DURABLE per-agent last-MCP-drain marker, via the sanctioned writer
-    // (updateAgentMetadata). Fires on the exact drain-specific event: a !peek drain
-    // that marked >=1 row read and emitted the message_read inbox_event. The
-    // wake-coverage detector reads `agents.last_drain_at`, NOT inbox_events, so its
-    // alarm-suppressing verdicts (COVERED / UNOBSERVABLE) survive the 7-day event
-    // purge — a verdict that suppresses an alarm must never depend on data that expires.
-    updateAgentMetadata(agentName, { last_drain_at: now() });
   }
 
   // v2.3.0 Part C.2 — first-observation seq assignment. Per Codex Q9 lock:
