@@ -4925,13 +4925,27 @@ export function getOrCreateMailbox(
  */
 export const PENDING_NOT_RESOLVED_SQL = "resolved_at IS NULL";
 
+/**
+ * The DELIVERED axis (SSOT). A message is DELIVERED once some session has DRAINED it,
+ * which stamps `read_by_session`; `NEVER_DRAINED_SQL` = no session has — the canonical
+ * "undelivered obligation" condition, shared by the purge exemption (pendingGlobalClause),
+ * the wake detector's candidate set (pendingGlobalClause), AND the drain's since-escape
+ * (pendingSinceClause below), so the three cannot disagree about what a peeked-but-undrained
+ * message is. They DID disagree in 3.0.0: the drain keyed its escape on the OBSERVED axis
+ * (`seq`, stamped on first observation INCLUDING a non-consuming peek), so a peek — what
+ * every watcher does — flipped aged undelivered mail out of the recipient's own drain
+ * while the purge protected it and the detector counted it pending. `seq` is the OBSERVED
+ * axis; delivery is `read_by_session`. Undelivered means NOT DRAINED, not "not looked at".
+ */
+export const NEVER_DRAINED_SQL = "read_by_session IS NULL";
+
 /** Canonical per-session pending predicate (SSOT). `session` may be "" (no
  *  session) — then `read_by_session != ''` is only true for a genuinely-read
  *  row, so the clause reduces to "unresolved and (unread-by-anyone or read-by-
  *  some-other-session)", matching get_messages' historical `?? ""` behaviour. */
 export function pendingForSessionClause(session: string): { sql: string; params: string[] } {
   return {
-    sql: `${PENDING_NOT_RESOLVED_SQL} AND (read_by_session IS NULL OR read_by_session != ?)`,
+    sql: `${PENDING_NOT_RESOLVED_SQL} AND (${NEVER_DRAINED_SQL} OR read_by_session != ?)`,
     params: [session],
   };
 }
@@ -4940,32 +4954,38 @@ export function pendingForSessionClause(session: string): { sql: string; params:
  *  by ANY session. Used where there is no single caller session (health_check). */
 export function pendingGlobalClause(): { sql: string; params: string[] } {
   return {
-    sql: `${PENDING_NOT_RESOLVED_SQL} AND read_by_session IS NULL`,
+    sql: `${PENDING_NOT_RESOLVED_SQL} AND ${NEVER_DRAINED_SQL}`,
     params: [],
   };
 }
 
 /**
- * #198 — canonical WINDOW rule for a PENDING drain, beside the pending PREDICATE
- * helpers above. A pending drain must return NEVER-OBSERVED (undelivered) mail
- * regardless of `since`: seq is assigned on first observation, so an un-drained
- * message older than the window would never be observed → never delivered, never
- * seq'd (silent non-delivery). The `since` window therefore bounds ONLY
- * already-observed history. Every pending surface — the get_messages drain,
- * getMessagesSummary's pending preview, and the consistency probe's superset —
- * routes its window through this ONE helper, so the age rule is inherited by
- * construction and no surface can silently drift (the #53 class, on the window
- * axis — #191 unified the pending PREDICATE but left window handling duplicated
- * per call site). History reads (all/read/resolved) keep a plain
- * `created_at >= ?` — the window is correct there, which is exactly why this is a
- * NAMED pending-only helper, not a global change. Empty when no bound is set
- * (since='all'/null): an unbounded pending drain returns everything
- * unresolved-and-unread, unchanged. Plan-verified: OR'd against the `to_agent`
- * equality it does not change the index seek (EXPLAIN QUERY PLAN identical).
+ * #198 + 3.0.1 — canonical WINDOW rule for a PENDING drain, beside the pending PREDICATE
+ * helpers above. A pending drain must return UNDELIVERED mail regardless of `since`;
+ * `since` bounds ONLY DELIVERED history. "Undelivered" is NOT DRAINED (NEVER_DRAINED_SQL —
+ * the shared DELIVERED-axis SSOT), NOT "never observed".
+ *
+ * 3.0.1 FIX: #198 keyed this escape on `seq IS NULL` (the OBSERVED axis), which a
+ * non-consuming PEEK stamps. So peeking an aged undelivered message set its `seq`, lapsed
+ * the escape, and the window then HID it from the recipient's own drain — silent
+ * non-delivery, the exact class #198 exists to kill, reached through the call our docs
+ * called side-effect-free, and worse because peek is what every watcher (Sentinel, the
+ * dashboard, `relay watch`) does. `seq` is the OBSERVED axis (set by peek OR drain);
+ * delivery is `read_by_session` (set only by a drain). Routing this escape through
+ * NEVER_DRAINED_SQL makes the drain agree with the purge exemption and the wake detector,
+ * which already key on it — so the three can no longer disagree, and a peek stops removing
+ * mail from reach.
+ *
+ * Every pending surface — the get_messages drain, getMessagesSummary's pending preview, and
+ * the consistency probe's superset — routes its window through this ONE helper, so the age
+ * rule is inherited by construction and no surface can drift. History reads
+ * (all/read/resolved) keep a plain `created_at >= ?`. Empty when no bound is set
+ * (since='all'/null): an unbounded pending drain returns everything unresolved-and-undrained.
+ * Plan-verified: OR'd against the `to_agent` equality it does not change the index seek.
  */
 export function pendingSinceClause(sinceIso: string | null): { sql: string; params: string[] } {
   return sinceIso
-    ? { sql: "AND (seq IS NULL OR created_at >= ?)", params: [sinceIso] }
+    ? { sql: `AND (${NEVER_DRAINED_SQL} OR created_at >= ?)`, params: [sinceIso] }
     : { sql: "", params: [] };
 }
 

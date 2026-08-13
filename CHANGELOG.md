@@ -1,5 +1,35 @@
 # Changelog
 
+## v3.0.1 — 2026-08-13 — patch: a peek no longer hides a recipient's aged undelivered mail
+
+<!--
+  VERSION: 3.0.1. PATCH — one shipped-in-3.0.0 silent-non-delivery fix, its wording, and a
+  changelog cleanup; nothing else. The 3.0.0 undelivered-mail work keyed the DRAIN's
+  since-escape on the OBSERVED axis (`seq`, stamped by a non-consuming peek) while the purge
+  exemption and wake detector keyed on the DELIVERED axis (`read_by_session`), so a peek
+  flipped an aged undelivered message out of the recipient's own drain. Routes all three
+  through one NEVER_DRAINED_SQL SSOT so they cannot disagree again.
+-->
+
+A patch for a silent-non-delivery path shipped in 3.0.0.
+
+### Fixed — a peek no longer removes aged undelivered mail from a drain (#198 follow-up)
+
+3.0.0 made a pending drain return undelivered mail regardless of `since`, but keyed
+"undelivered" on `seq IS NULL` (never *observed*). A `peek` — which every watcher does
+(Sentinel, the dashboard, `relay watch`) — stamps `seq` without delivering, so peeking an
+aged undelivered message lapsed that escape and the `since` window then hid it from the
+recipient's own default drain (recoverable only via `since='all'`). The drain's escape now
+keys on `read_by_session IS NULL` (NOT DRAINED — the same `NEVER_DRAINED_SQL` SSOT the purge
+exemption and the wake detector already use), so a peek can no longer remove mail from
+reach. Undelivered means not drained, not "not looked at."
+
+### Docs
+
+- The `get_messages` `peek=true` description no longer claims it "suppresses the
+  read-side-effect entirely" — it suppresses the read-MARK but still stamps the observation
+  cursor (`seq`), like any first view. It now says what it does.
+
 ## v3.0.0 — 2026-08-12 — BREAKING: `since` strict-cursor contract withdrawn; wake-coverage detector; undelivered-mail durability
 
 <!--
@@ -13,8 +43,6 @@
   promise could only be kept by leaving mail permanently undeliverable — so we label it
   honestly rather than shipping it quietly. Also ships a new default-on feature (the
   wake-coverage detector) and a retention change (undelivered mail held to a 30-day grace).
-  This is the RELEASE PR: content is final and package.json is bumped to 3.0.0 — ready to
-  cut once merged + published.
 -->
 
 Twenty-two merges since 2.25.0. **This is a major release for one reason: a published

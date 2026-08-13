@@ -198,7 +198,7 @@ describe("v2.4.4 — tool description quality", () => {
       discover_agents: "1cc22950fa7478fee94c7549a0b8c46d76c59165b0f128aa07b0461b4c8d18a4",
       expand_capabilities: "f68e3c05bc1779d8bef11669895c21e14a2f1844c3e01ae1f57e39f48ebb8d09",
       get_channel_messages: "06592f4a9f58da0d111640ff64829ae49f3e388c00c9ffa9c9c7230b81f1c522",
-      get_messages: "e62f46df1bd09130a5e3246810c65beb9ae2e3dbda5cc2064283ed6431953071",
+      get_messages: "c4b0f7089f628fd388388e263100c031158ab4907adc9739a6329e41d190d749",
       get_messages_summary: "fc5408be92b67606153c829f0dac464afeb3c465f75dd4abb3d36a9e8884d2bf",
       get_outstanding: "ab417813324bc5d419fb68cd0044cde9b0cc718205e281905454646a8941f727",
       get_standup: "50fc69fcf51b6d21632b5e9be632f570c7cee8b1cbc18999a82d0a34dc2b1519",
