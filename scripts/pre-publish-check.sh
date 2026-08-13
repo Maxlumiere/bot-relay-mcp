@@ -45,14 +45,37 @@ cd "$PROJECT_ROOT"
 # the default gate. REQUIRED before npm publish, NOT required on dev loops
 # (chaos tests spawn subprocesses + take 30-60s end-to-end).
 FULL_MODE=0
+# #197b: --list-steps prints the gate's RUN LIST (every step label that would execute)
+# WITHOUT running any step command — so a test can assert each guard is actually REACHED
+# (execution-based coverage), not merely mentioned in the source (the #196 textual proxy).
+# Its honesty rests on the step-gate premise enforced by scripts/step-gate-guard.mjs.
+LIST_STEPS_MODE=0
 for arg in "$@"; do
   if [ "$arg" = "--full" ]; then FULL_MODE=1; fi
+  if [ "$arg" = "--list-steps" ]; then LIST_STEPS_MODE=1; fi
 done
 
 FAIL=0
 STEPS=()
 step() {
   local label="$1"; shift
+  # --list-steps: record the label and SKIP the command "$@". Emitting the label without
+  # executing is what makes the run list cheap (no build / vitest / network) and — GIVEN
+  # the step convention holds (all heavy/side-effecting work lives in "$@", never bare at
+  # top level; see the LIMIT in scripts/step-gate-guard.mjs) — side-effect-free. Returns 0
+  # so the surrounding `|| exit 1` does not fire.
+  if [ "$LIST_STEPS_MODE" = "1" ]; then
+    # Emit the LABEL, the COMMAND ($1 after the label shift), and the SCRIPT POSITION ($2 —
+    # the first argument, i.e. the file `node` would execute), each a separate field. The
+    # coverage test binds a guard ONLY when a reached step has cmd=`node` AND script=that
+    # guard file — the EXECUTED node-script position, not an arbitrary argv substring
+    # (codex #206 bypass 2/4: `echo "$PROJECT_ROOT/scripts/x-guard.mjs"` must NOT bind).
+    # $2 is one shell word, so a PROJECT_ROOT path with spaces stays intact as the last
+    # field. `${1:-}` / `${2:-}` are safe under set -u.
+    STEPS+=("STEP  ${label}")
+    echo "list-step: ${label} :: cmd=${1:-} :: script=${2:-}"
+    return 0
+  fi
   echo ""
   echo "=== pre-publish: ${label} ==="
   if "$@"; then
@@ -552,10 +575,10 @@ step "ip-classifier guard (no duplicate CIDR logic)" ip_classifier_guard || exit
 # either operand, switch/case on a CLI id, and regex alternation of the ids; it
 # spares prose, ~/.claude/… paths, --flags, display strings, and registry
 # lookups by id. Escape hatch: `// CLI-PROFILE-ALLOWLIST: <reason>` on the line.
-cli_profile_guard() {
-  node "$PROJECT_ROOT/scripts/cli-profile-guard.mjs" "$PROJECT_ROOT/src"
-}
-step "cli-profile guard (no hardcoded claude|codex branching)" cli_profile_guard || exit 1
+# #197b: invoked DIRECTLY (no wrapper) so the step's argv IS the guard command — the
+# run-list coverage test binds the guard to the reached step by its actual argv, not a
+# source regex + label convention (codex #206 bypass 2).
+step "cli-profile guard (no hardcoded claude|codex branching)" node "$PROJECT_ROOT/scripts/cli-profile-guard.mjs" "$PROJECT_ROOT/src" || exit 1
 
 # --- 5c. ADR-0003 auth-generation invalidation drift guard (v2.20.0) ----------
 # The verified-token cache (src/auth-cache.ts) is only safe if EVERY mutator
@@ -565,10 +588,7 @@ step "cli-profile guard (no hardcoded claude|codex branching)" cli_profile_guard
 # routes through applyAuthStateTransition). Shared with the vitest negative-
 # fixture test (tests/v2-20-0-auth-latency.test.ts) that proves the guard FAILS
 # when a bump is omitted — test the guard, not just the code (Victra Q3 gate).
-auth_gen_guard() {
-  node "$PROJECT_ROOT/scripts/auth-gen-guard.mjs" "$PROJECT_ROOT/src/db.ts"
-}
-step "auth-gen guard (every token/auth mutator invalidates the cache)" auth_gen_guard || exit 1
+step "auth-gen guard (every token/auth mutator invalidates the cache)" node "$PROJECT_ROOT/scripts/auth-gen-guard.mjs" "$PROJECT_ROOT/src/db.ts" || exit 1
 
 # --- 5c.1 #145 secret-register drift guard (redaction) ----------------------
 # A db.ts function that MINTS a token (generateToken) must call
@@ -578,10 +598,7 @@ step "auth-gen guard (every token/auth mutator invalidates the cache)" auth_gen_
 # real src/db.ts AND proves it FAILS on a synthetic unregistered minter. Wired
 # here as a SECOND independent path (#61) so enforcement survives losing either —
 # renaming/.skip-ing the test can no longer silently disable it.
-secret_register_guard() {
-  node "$PROJECT_ROOT/scripts/secret-register-guard.mjs" "$PROJECT_ROOT/src/db.ts"
-}
-step "secret-register guard (every token minter registers for redaction)" secret_register_guard || exit 1
+step "secret-register guard (every token minter registers for redaction)" node "$PROJECT_ROOT/scripts/secret-register-guard.mjs" "$PROJECT_ROOT/src/db.ts" || exit 1
 
 # --- 5d. ADR-0002 agent-class taxonomy drift guard (v2.21.0) -----------------
 # src/agent-class.ts is the SSOT for the coordination-class taxonomy. This
@@ -590,10 +607,13 @@ step "secret-register guard (every token minter registers for redaction)" secret
 # src/ — mirroring the cli-profile guard, preventing a taxonomy re-fork (the
 # class the orchestrator nearly shipped). Shared with the vitest negative-
 # fixture test that proves the guard FAILS on a synthetic re-fork.
-agent_class_guard() {
-  node "$PROJECT_ROOT/scripts/agent-class-guard.mjs" "$PROJECT_ROOT/src"
-}
-step "agent-class guard (no class taxonomy re-fork outside src/agent-class.ts)" agent_class_guard || exit 1
+step "agent-class guard (no class taxonomy re-fork outside src/agent-class.ts)" node "$PROJECT_ROOT/scripts/agent-class-guard.mjs" "$PROJECT_ROOT/src" || exit 1
+
+# --- 5e. #197b step-gate premise. Assert no `step` is result-gated, so `--list-steps`
+# (the run list the coverage test reads) equals the EXECUTED run. This step reads THIS
+# file — including its own line, which is unconditional (column 0), so the guard passes
+# on itself. See scripts/step-gate-guard.mjs for the design (2a, fail-closed) + the P2 limit.
+step "step-gate premise (no result-gated steps in the gate)" node "$PROJECT_ROOT/scripts/step-gate-guard.mjs" "$PROJECT_ROOT/scripts/pre-publish-check.sh" || exit 1
 
 # --- 6. 25-tool + CLI smoke against an isolated relay (v2.1 Phase 5a) ---
 # Inline cleanup (no RETURN trap) — simpler + avoids set-u pitfalls around
