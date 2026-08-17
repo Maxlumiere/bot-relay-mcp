@@ -215,7 +215,7 @@
  * Exit: 0 = clean · 1 = violations (stderr) · 2 = usage/parse error
  * Usage: node scripts/sanctioned-mutation-guard.mjs <src-dir-or-file> [...]
  */
-import ts from "typescript";
+import { ts, parseGuardSource } from "./lib/guard-parse.mjs";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -514,17 +514,20 @@ const isConcatParent = (node) =>
  */
 export function findSanctionedMutationViolations(source, fileName = "file.ts", opts = {}) {
   if (SANCTIONED(fileName, opts.srcRoot)) return [];
-  const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  // FAIL CLOSED on a parse failure. createSourceFile does NOT throw on malformed
-  // TS — it records syntax errors in `parseDiagnostics` and returns an
-  // error-recovery tree the guard cannot trust (a mutation may or may not survive
-  // recovery, input-dependent). The guard already exits 2 when it cannot READ a
-  // file; an unreadable-vs-unparseable split (fail-closed on read, fail-OPEN on
-  // parse) is the exact audit-state-freshness.sh defect. Throw so main() maps it
-  // to exit 2. Real source that compiles under tsc has zero parseDiagnostics.
-  if (sf.parseDiagnostics && sf.parseDiagnostics.length > 0) {
-    throw new Error(`unparseable TypeScript (${sf.parseDiagnostics.length} syntax error(s)) — cannot soundly scan`);
-  }
+  // PINNED PARSER + FAIL-CLOSED via the shared #47 gate (scripts/lib/guard-parse.mjs).
+  // A guard must NEVER own its parser — that is the ADR-0015 anti-pattern ONE LEVEL UP from
+  // the text-proxy this guard removes; owning the predicate is the guard's job, owning the
+  // grammar is not (#47). parseGuardSource parses with the PINNED `typescript-legacy` (so the
+  // build's `typescript` is free to bump to 7 without breaking this guard) and THROWS
+  // GuardParseError on ANY parse diagnostic — createSourceFile is error-TOLERANT and returns a
+  // partial tree the guard cannot trust (a mutation may or may not survive error recovery). It
+  // parses with the SAME args the inline gate used (ScriptTarget.Latest, setParentNodes=true,
+  // ScriptKind.TS), so the tree here is identical. main()'s catch maps the throw to exit 2,
+  // identical to the prior inline `throw new Error(...)`: FAIL-CLOSED IS PRESERVED. The only
+  // observable change is a DECLARED contract change on the FAILURE PATH — the throw is now
+  // GuardParseError with a pinned-parser message, not `Error("unparseable TypeScript …")`
+  // (asserted in the test's FAIL-CLOSED case; before/after stated in the PR body).
+  const sf = parseGuardSource(fileName, source);
   const lines = source.split("\n");
   const violations = [];
   const seen = new Set();

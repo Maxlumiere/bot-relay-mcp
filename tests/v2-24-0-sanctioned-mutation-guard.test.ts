@@ -26,6 +26,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
+import { GuardParseError } from "../scripts/lib/guard-parse.mjs";
 
 const { findSanctionedMutationViolations, mutatesAgentsTable, assertGuardedNamesProvable } = await import(
   "../scripts/sanctioned-mutation-guard.mjs"
@@ -220,9 +221,30 @@ describe("#143 P1 hardening — codex's EXECUTED bypasses (each red against the 
   });
 
   // ── Fail-closed on parse failure (was fail-OPEN — audit-state-freshness split) ──
-  it("FAIL-CLOSED: malformed TypeScript makes the guard THROW (→ exit 2), never silently pass", () => {
+  // CONTRACT CHANGE (v2.24 #47 fold): the parse-failure throw is now GuardParseError from the
+  // shared PINNED-parser gate (scripts/lib/guard-parse.mjs), NOT `Error("unparseable TypeScript …")`.
+  // The OBSERVABLE that matters — a malformed input THROWS (fail-closed), never silently passes, and
+  // main() maps it to exit 2 — is UNCHANGED (proven by the executed CLI exit-2 fixture just below,
+  // which is type/message-agnostic). Only the throw type + message changed, deliberately, to adopt
+  // the pinned `typescript-legacy` parser so the build's `typescript` can bump to 7.
+  it("FAIL-CLOSED: malformed TypeScript makes the guard THROW GuardParseError (→ exit 2), never silently pass", () => {
     const malformed = `export function broken(db {  db.exec("SELECT 1")  `; // unbalanced parens
-    expect(() => findSanctionedMutationViolations(malformed, "src/bad.ts")).toThrow(/unparseable/i);
+    expect(() => findSanctionedMutationViolations(malformed, "src/bad.ts")).toThrow(GuardParseError);
+  });
+
+  it("FAIL-CLOSED through the SHIPPED CLI: a malformed src file exits 2 (observable preserved across the #47 parser fold)", () => {
+    const guard = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "sanctioned-mutation-guard.mjs");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-parsefail-"));
+    fs.mkdirSync(path.join(dir, "src"));
+    fs.writeFileSync(path.join(dir, "src", "bad.ts"), `export function broken(db {  db.exec("SELECT 1")  \n`); // unbalanced parens
+    let exit = 0;
+    try {
+      execFileSync("node", [guard, path.join(dir, "src")], { stdio: "pipe" });
+    } catch (e) {
+      exit = (e as { status?: number }).status ?? -1;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect(exit, "a file the pinned parser cannot fully parse must FAIL CLOSED (exit 2), never pass").toBe(2);
   });
 
   // ── Tokenizer soundness — the statement split's whole correctness rests here ──
