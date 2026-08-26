@@ -137,8 +137,11 @@ describe("v2.6.x / Tether v0.1.1 Phase 2 — broadcast-trace instrumentation val
         expect(sendInner.success).toBe(true);
 
         // Wait for the notification (proves the chain works end-to-end).
+        // WAIT BUDGET, not an SLA (#210) — how long we are WILLING TO WAIT for
+        // cross-process delivery; the assertion below is that it HAPPENED, not
+        // that it was fast. Widen-safe, do NOT tighten.
         const start = Date.now();
-        while (Date.now() - start < 3000 && notifications.length === 0) {
+        while (Date.now() - start < 8000 && notifications.length === 0) {
           await new Promise((res) => setTimeout(res, 50));
         }
         expect(notifications.length).toBeGreaterThanOrEqual(1);

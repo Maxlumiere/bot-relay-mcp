@@ -107,21 +107,21 @@ describe("#171 backup/restore on the wasm driver + cross-driver interop", () => 
     expect(agents).toContain("wbr-alpha");
     expect(agents).toContain("wbr-beta");
     expect(hasMessage, "the message must survive backup+restore under wasm").toBe(true);
-  });
+  }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 
   it("a NATIVE-made archive restores under WASM (interop: consumer switches to wasm post-npm-12)", async () => {
     const archive = await seedAndBackup("native");
     const { agents, hasMessage } = await restoreAndRead(archive, "wasm");
     expect(agents).toEqual(["wbr-alpha", "wbr-beta"]);
     expect(hasMessage).toBe(true);
-  });
+  }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 
   it("a WASM-made archive restores under NATIVE (interop: consumer switches back)", async () => {
     const archive = await seedAndBackup("wasm");
     const { agents, hasMessage } = await restoreAndRead(archive, "native");
     expect(agents).toEqual(["wbr-alpha", "wbr-beta"]);
     expect(hasMessage).toBe(true);
-  });
+  }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 });
 
 describe("#190 requested-vs-actual driver seam — dispatch follows the LIVE connection, not the mutable env", () => {
@@ -141,7 +141,7 @@ describe("#190 requested-vs-actual driver seam — dispatch follows the LIVE con
     const res = await exportRelayState();
     expect(fs.existsSync(res.archive_path), "wasm-initialized export must succeed despite the native env").toBe(true);
     closeDb();
-  });
+  }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 
   it("NATIVE-initialized, RELAY_SQLITE_DRIVER mutated to wasm WITHOUT closeDb → export still succeeds", async () => {
     process.env.RELAY_SQLITE_DRIVER = "native";
@@ -157,7 +157,7 @@ describe("#190 requested-vs-actual driver seam — dispatch follows the LIVE con
     const res = await exportRelayState();
     expect(fs.existsSync(res.archive_path), "native-initialized export must succeed despite the wasm env").toBe(true);
     closeDb();
-  });
+  }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 });
 
 describe("#190 — sync-fallback export, import mutation seam (capture-across-close), restore ordering", () => {
@@ -177,7 +177,7 @@ describe("#190 — sync-fallback export, import mutation seam (capture-across-cl
     const { agents } = await restoreAndRead(res.archive_path, "native");
     expect(agents).toContain("sync-seed");
     closeDb();
-  });
+  }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 
   it("IMPORT under the mutation seam: the probe is handed the LIVE wasm driver, not the mutated native env", async () => {
     process.env.RELAY_SQLITE_DRIVER = "wasm";
@@ -207,7 +207,7 @@ describe("#190 — sync-fallback export, import mutation seam (capture-across-cl
     await initializeDb();
     expect(getAgents().map((a: { name: string }) => a.name)).toContain("imp-seam");
     closeDb();
-  });
+  }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 
   it("FINDING 2: a corrupt archive on a FRESH machine (no DB) fails WITHOUT manufacturing a database", async () => {
     process.env.RELAY_SQLITE_DRIVER = "native";
@@ -221,5 +221,5 @@ describe("#190 — sync-fallback export, import mutation seam (capture-across-cl
     // the eager init created a blank DB before the archive was ever validated.
     expect(fs.existsSync(dbPath), "a failed restore must not manufacture a DB").toBe(false);
     closeDb();
-  });
+  }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 });

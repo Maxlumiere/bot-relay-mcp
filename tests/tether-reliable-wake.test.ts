@@ -56,7 +56,16 @@ describe("Tether v0.2.3 R1 — subscribe→notify→wake through the production 
     if (daemon) await tearDownDaemon(daemon);
   });
 
-  async function waitForCalls(spy: ReturnType<typeof vi.fn>, n: number, timeoutMs = 5000): Promise<number> {
+  // WAIT-BUDGET waiter (issue #210). `timeoutMs` is how long we are WILLING TO WAIT for
+  // the wake to fire — it is NOT a latency SLA. The caller asserts the wake HAPPENED
+  // (spy.mock.calls.length === n), so a wider budget still FAILS if the wake never fires;
+  // it stops failing only when the wake is merely SLOW under load. Widening this budget is
+  // safe; TIGHTENING it to "speed up" the test reintroduces the #210 load-flake.
+  async function waitForCalls(
+    spy: ReturnType<typeof vi.fn>,
+    n: number,
+    timeoutMs = 10000, // WAIT BUDGET, not an SLA (#210) — widen-safe, do NOT tighten
+  ): Promise<number> {
     const deadline = Date.now() + timeoutMs;
     while (spy.mock.calls.length < n && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 25));

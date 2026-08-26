@@ -57,6 +57,23 @@ function fakeResponse(): FakeRes {
   return res;
 }
 
+// #210 DETERMINISTIC keepalive driver. setupSseKeepalive accepts an injectable scheduler
+// (production uses the real setInterval); here we capture the tick callback and fire it
+// MANUALLY, so sub-second keepalive behavior is tested with EXACT tick counts instead of racing
+// real 25-30ms timers in a 35-120ms window — which coalesce to 0 ticks on a starved machine
+// (the #210 flake). One tick() == one keepalive interval elapsing. This is the v2-8
+// ManualScheduler pattern; it replaces real-time sampling, and is STRONGER (exact, not >=).
+function manualScheduler() {
+  let cb: (() => void) | null = null;
+  return {
+    setInterval: (fn: () => void, _ms: number) => { cb = fn; return { fake: true }; },
+    clearInterval: (_h: unknown) => { cb = null; },
+    /** Fire exactly one keepalive interval (a no-op once the helper has cleared it). */
+    tick: () => { if (cb) cb(); },
+    active: () => cb !== null,
+  };
+}
+
 describe("v2.7 Tether Phase 5 — setupSseKeepalive (pure helper)", () => {
   it("intervalMs=0 → no timer, returns no-op cleanup, no writes ever fire", async () => {
     const res = fakeResponse();
@@ -74,75 +91,83 @@ describe("v2.7 Tether Phase 5 — setupSseKeepalive (pure helper)", () => {
     expect(res._writes).toEqual([]);
   });
 
-  it("intervalMs=30 → write fires repeatedly with ': keepalive\\n\\n' content", async () => {
+  it("intervalMs=30 → write fires repeatedly with ': keepalive\\n\\n' content", () => {
     const res = fakeResponse();
-    const cleanup = setupSseKeepalive(res, 30);
-    // Wait ~120 ms; expect at least 2 writes (timing is forgiving to CI).
-    await new Promise((r) => setTimeout(r, 120));
-    expect(res._writes.length).toBeGreaterThanOrEqual(2);
+    const sched = manualScheduler();
+    const cleanup = setupSseKeepalive(res, 30, sched);
+    // DETERMINISTIC (#210): drive 3 keepalive intervals manually rather than racing real 30ms
+    // timers in a 120ms window (which coalesce to <2 ticks under load). Exact count, no flake.
+    sched.tick();
+    sched.tick();
+    sched.tick();
+    expect(res._writes.length).toBe(3);
     expect(res._writes[0]).toBe(": keepalive\n\n");
     expect(res._writes.every((w) => w === ": keepalive\n\n")).toBe(true);
     cleanup();
   });
 
-  it("res.close → cleanup fires automatically, no further writes after", async () => {
+  it("res.close → cleanup fires automatically, no further writes after", () => {
     const res = fakeResponse();
-    setupSseKeepalive(res, 25);
-    await new Promise((r) => setTimeout(r, 70)); // ~2-3 writes
+    const sched = manualScheduler();
+    setupSseKeepalive(res, 25, sched);
+    sched.tick();
+    sched.tick();
     const writesBefore = res._writes.length;
-    expect(writesBefore).toBeGreaterThanOrEqual(1);
-    res._triggerClose();
-    await new Promise((r) => setTimeout(r, 100));
-    const writesAfter = res._writes.length;
-    expect(writesAfter).toBe(writesBefore);
+    expect(writesBefore).toBe(2);
+    res._triggerClose(); // close handler → cleanup → scheduler cleared
+    sched.tick(); // would write if the timer were still live
+    expect(res._writes.length).toBe(writesBefore); // no growth after close
+    expect(sched.active()).toBe(false);
   });
 
-  it("explicit cleanup() → idempotent: second invocation is a no-op", async () => {
+  it("explicit cleanup() → idempotent: second invocation is a no-op", () => {
     const res = fakeResponse();
-    const cleanup = setupSseKeepalive(res, 25);
-    await new Promise((r) => setTimeout(r, 70));
+    const sched = manualScheduler();
+    const cleanup = setupSseKeepalive(res, 25, sched);
+    sched.tick();
+    sched.tick();
     const writesBefore = res._writes.length;
     cleanup();
     cleanup(); // calling twice MUST be safe (matches the close-handler-also-fires path)
-    await new Promise((r) => setTimeout(r, 100));
+    sched.tick(); // cleared → no-op
     expect(res._writes.length).toBe(writesBefore);
   });
 
-  it("writableEnded becomes true mid-tick → keepalive self-cancels without throwing", async () => {
+  it("writableEnded becomes true mid-tick → keepalive self-cancels without throwing", () => {
     const res = fakeResponse();
-    setupSseKeepalive(res, 25);
-    await new Promise((r) => setTimeout(r, 35));
-    expect(res._writes.length).toBeGreaterThanOrEqual(1);
+    const sched = manualScheduler();
+    setupSseKeepalive(res, 25, sched);
+    sched.tick();
+    expect(res._writes.length).toBe(1);
     res.writableEnded = true;
-    await new Promise((r) => setTimeout(r, 100));
-    // After writableEnded flips, no further writes should accumulate.
-    // The first tick after the flip may detect writableEnded and self-
-    // cancel — we accept any non-growth.
+    sched.tick(); // detects writableEnded → self-cancels, no write
     const writesAfter = res._writes.length;
-    await new Promise((r) => setTimeout(r, 100));
+    expect(writesAfter).toBe(1); // no growth after the writableEnded flip
+    sched.tick(); // cleared → no-op
     expect(res._writes.length).toBe(writesAfter);
+    expect(sched.active()).toBe(false);
   });
 
-  it("res.write that throws → keepalive self-cancels gracefully", async () => {
+  it("res.write that throws → keepalive self-cancels gracefully", () => {
     const res = fakeResponse();
+    const sched = manualScheduler();
     let throwOnNext = false;
     res.write = (chunk: string) => {
       if (throwOnNext) throw new Error("simulated stream-torn-down");
       res._writes.push(chunk);
       return true;
     };
-    setupSseKeepalive(res, 25);
-    await new Promise((r) => setTimeout(r, 35));
-    expect(res._writes.length).toBeGreaterThanOrEqual(1);
+    setupSseKeepalive(res, 25, sched);
+    sched.tick();
+    expect(res._writes.length).toBe(1);
     throwOnNext = true;
-    await new Promise((r) => setTimeout(r, 100));
-    // Subsequent writes are blocked by the throw — and the helper
-    // should have stopped the interval entirely. Re-arm without
-    // throwing to prove the timer is truly gone.
+    sched.tick(); // write throws → the helper catches it and self-cancels the interval
+    // Re-arm without throwing to prove the timer is truly gone (cleared scheduler → no-op).
     throwOnNext = false;
     const before = res._writes.length;
-    await new Promise((r) => setTimeout(r, 100));
+    sched.tick();
     expect(res._writes.length).toBe(before);
+    expect(sched.active()).toBe(false);
   });
 });
 

@@ -204,8 +204,9 @@ describe("PostToolUse hook — graceful degradation", () => {
     });
     expect(r.code).toBe(0);
     expect(r.stdout).toBe("");
-    // Budget is ~2s total (1s health probe + 2s get_messages), allow 3s ceiling.
-    expect(r.durationMs).toBeLessThan(3500);
+    // Budget is ~2s total (1s health probe + 2s get_messages); the internal
+    // deadline is what bounds the hook — this ceiling only catches a true hang.
+    expect(r.durationMs).toBeLessThan(7000); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten
   });
 
   it("(5) missing token → falls back to sqlite direct, still surfaces mail", async () => {

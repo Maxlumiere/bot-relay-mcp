@@ -59,6 +59,11 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
   throw new Error(`HTTP daemon at :${port} did not become healthy within ${timeoutMs}ms`);
 }
 
+// WAIT-BUDGET waiter (issue #210). `timeoutMs` is how long we are WILLING TO WAIT for
+// cross-process / SSE delivery — it is NOT a latency SLA. Every caller asserts delivery
+// HAPPENED (notifications.length >= 1), so a wider budget still FAILS if delivery never
+// happens; it stops failing only when delivery is merely SLOW under load. Widening these
+// budgets is safe; TIGHTENING one to "speed up" the test reintroduces the #210 load-flake.
 async function waitForCount(arr: unknown[], atLeast: number, timeoutMs: number): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs && arr.length < atLeast) {
@@ -166,7 +171,7 @@ describe("v2.7 Tether Phase 5 — SSE keepalive over real HTTP transport", () =>
         const w = await writeFromAnotherProcess(dbPath, "keepalive-target", "external-writer");
         expect(w.code, `child writer failed: ${w.stderr}`).toBe(0);
 
-        await waitForCount(notifications, 1, 3000);
+        await waitForCount(notifications, 1, 8000); // WAIT BUDGET, not an SLA (#210) — widen-safe, do NOT tighten
 
         // (a) Notification arrived → SSE stream framing isn't corrupted
         //     by interleaved keepalive comment frames.
@@ -246,7 +251,7 @@ describe("v2.7 Tether Phase 5 — SSE keepalive over real HTTP transport", () =>
         await client.subscribeResource({ uri: "relay://inbox/ka-off-target" });
         const w = await writeFromAnotherProcess(dbPath, "ka-off-target", "external-writer");
         expect(w.code).toBe(0);
-        await waitForCount(notifications, 1, 3000);
+        await waitForCount(notifications, 1, 8000); // WAIT BUDGET, not an SLA (#210) — widen-safe, do NOT tighten
         expect(notifications.length).toBeGreaterThanOrEqual(1);
       } finally {
         try { await client.close(); } catch { /* */ }

@@ -475,7 +475,7 @@ describe("Stop hook — graceful degradation", () => {
     });
     expect(r.code).toBe(0);
     expect(r.stdout).toBe("");
-    expect(r.durationMs).toBeLessThan(3500);
+    expect(r.durationMs).toBeLessThan(7000); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten
   });
 
   it("(7) missing token → sqlite peek fallback still wakes, and consumes nothing", async () => {

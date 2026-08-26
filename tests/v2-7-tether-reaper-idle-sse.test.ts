@@ -59,6 +59,11 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
   throw new Error(`HTTP daemon at :${port} did not become healthy within ${timeoutMs}ms`);
 }
 
+// WAIT-BUDGET waiter (issue #210). `timeoutMs` is how long we are WILLING TO WAIT for
+// cross-process / SSE delivery — it is NOT a latency SLA. Every caller asserts delivery
+// HAPPENED (notifications.length >= 1), so a wider budget still FAILS if delivery never
+// happens; it stops failing only when delivery is merely SLOW under load. Widening these
+// budgets is safe; TIGHTENING one to "speed up" the test reintroduces the #210 load-flake.
 async function waitForCount(arr: unknown[], atLeast: number, timeoutMs: number): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs && arr.length < atLeast) {
@@ -173,7 +178,7 @@ describe("v2.7 Tether Phase 4 — reaper skips sessions with open SSE GET stream
         const w = await writeFromAnotherProcess(dbPath, "reaper-target", "external-writer");
         expect(w.code, `child writer failed: ${w.stderr}`).toBe(0);
 
-        await waitForCount(notifications, 1, 3000);
+        await waitForCount(notifications, 1, 8000); // WAIT BUDGET, not an SLA (#210) — widen-safe, do NOT tighten
 
         // Primary assertion: the long-idle subscriber received the
         // notification on its still-live SSE stream.

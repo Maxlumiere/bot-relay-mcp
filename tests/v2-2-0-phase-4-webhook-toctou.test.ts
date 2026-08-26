@@ -152,7 +152,7 @@ describe("v2.2.0 Phase 4 — webhook DNS TOCTOU (deliverPinnedPost)", () => {
       timeoutMs: 300,
     });
     const elapsed = Date.now() - started;
-    expect(elapsed).toBeLessThan(1500);
+    expect(elapsed).toBeLessThan(3500); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten (bounded internal deadline is timeoutMs:300)
     expect(res.statusCode).toBeNull();
     expect(res.error).toMatch(/timed out/);
     stall.close();

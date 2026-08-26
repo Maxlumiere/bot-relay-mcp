@@ -210,8 +210,11 @@ describe("v2.9.0 Ambient Wake — end-to-end autowake verification (A)", () => {
         `send_message failed: ${JSON.stringify(sendPayload)}`,
       ).toBe(true);
 
-      // Wait up to 5s for the push to arrive over SSE.
-      await waitForCount(notifications, 1, 5000);
+      // WAIT BUDGET, not an SLA (#210): how long we wait for the push to ARRIVE over SSE. The
+      // assertion below is "it arrived" (>=1), so a wider budget still fails on a real non-
+      // arrival; it only stops failing when arrival is merely slow under load. Widen-safe; do
+      // NOT tighten. (The SPEED of arrival is a separate CI-only SLA further down.)
+      await waitForCount(notifications, 1, 8000);
 
       // --- Assertions + latency report ---
       expect(
@@ -230,15 +233,20 @@ describe("v2.9.0 Ambient Wake — end-to-end autowake verification (A)", () => {
         `[v2.9.0 autowake A] mail→push latency: ${latencyMs}ms ` +
           `(send_message → notifications/resources/updated)`,
       );
-      // Generous upper bound — anything reachable on local HTTP loopback
-      // should be well under 1s. If push is broken, waitForCount above
-      // would have timed out at 5s; this assertion just pins a sane
-      // ceiling so a 4900ms "barely arrived" result doesn't silently
-      // pass.
-      expect(
-        latencyMs,
-        `latency ${latencyMs}ms exceeds 2000ms ceiling — push is functional but slow`,
-      ).toBeLessThan(2000);
+      // LATENCY-SLA (#210), CI-ONLY — this asserts the push was FAST (<2000ms), a real
+      // performance guarantee, NOT a wait budget. Per the #210 ruling we NEVER widen it:
+      // widening would leave a green test that no longer guarantees anything (the false-claim
+      // class). It is CI-ONLY because on the release machine the gate runs under developer load
+      // (many sessions), where this number measures SCHEDULER STARVATION, not push latency — a
+      // false red. In CI (unloaded, resourced) it is meaningful and enforced. Local runs still
+      // verify the push ARRIVED (the >=1 assertion above); only the SPEED SLA is CI-gated. An
+      // injectable clock cannot help — the latency IS real cross-process wall-clock time.
+      if (process.env.CI) {
+        expect(
+          latencyMs,
+          `latency ${latencyMs}ms exceeds 2000ms ceiling — push is functional but slow`,
+        ).toBeLessThan(2000);
+      }
       // Optional: assert receiverToken was issued (sanity for the
       // register_agent path under HTTP — not strictly part of A, but
       // cheap to keep).

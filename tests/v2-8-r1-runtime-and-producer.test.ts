@@ -224,23 +224,47 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     // Wait 1.5s for last_seen to age past the 1s activeWindow.
     await new Promise((r) => setTimeout(r, 1500));
 
-    // The broadcaster has ticked many times by now. Drain hello +
-    // collect up to 5 frames; we expect at least one with
-    // entity_id=rt-time-only AND kind=waiting (the time-only
-    // transition).
-    const frames = await collectFrames(wsHandle, 5);
-    const waitingFrame = frames.find(
-      (f) =>
+    // WAIT BUDGET, not an SLA (#210): collect frames UNTIL the time-only `waiting` transition is
+    // observed, bounded by a total deadline, and STOP as soon as it's seen. Do NOT wait for a
+    // fixed frame COUNT: collectFrames(5, …) idles the full per-frame timeout waiting for frames
+    // that never arrive (only active+waiting are emitted), which pushed this test to ~9.8s against
+    // its own 10s ceiling — the widen was self-defeating (codex #214). The assert is "the waiting
+    // frame appeared", so a wider budget still fails if it never appears; it only stops failing
+    // when the broadcaster tick + WS delivery are merely slow under load. Widen-safe; do NOT
+    // tighten. (Injectable clock can't reach the spawned daemon's broadcaster, so this is a
+    // bounded widen per the #210 ruling.)
+    await wsHandle.nextMessage(); // drain hello
+    const RT1_WAIT_BUDGET_MS = 10_000;
+    const rt1Start = Date.now();
+    let waitingFrame: BroadcastFrame | undefined;
+    while (Date.now() - rt1Start < RT1_WAIT_BUDGET_MS) {
+      let raw: string;
+      try {
+        raw = await wsHandle.nextMessage(
+          Math.max(250, RT1_WAIT_BUDGET_MS - (Date.now() - rt1Start)),
+        );
+      } catch {
+        break; // no frame within the remaining budget
+      }
+      const f = JSON.parse(raw) as BroadcastFrame;
+      if (
         f.event === "agent.status_changed" &&
         f.entity_id === "rt-time-only" &&
-        f.kind === "waiting",
-    );
+        f.kind === "waiting"
+      ) {
+        waitingFrame = f;
+        break;
+      }
+    }
     expect(
       waitingFrame,
-      `expected agent.status_changed:waiting for rt-time-only. Saw frames: ${JSON.stringify(frames)}`,
+      `expected agent.status_changed:waiting for rt-time-only within ${RT1_WAIT_BUDGET_MS}ms of aging`,
     ).toBeDefined();
     wsHandle.ws.close();
-  }, 10_000);
+    // per-test timeout (#210): coherently accommodates the 10s wait budget above + the 1.5s aging
+    // + daemon/WS setup, with headroom. The old 10s ceiling sat BELOW the wait budget → the test
+    // could time out before its own assertion (codex #214). Not an SLA; the wait budget is the bound.
+  }, 20_000);
 
   it("(RT2) Dedup correctness: broadcaster does NOT re-emit waiting on subsequent ticks once state has stabilized", async () => {
     await rpc("register_agent", {
@@ -248,13 +272,56 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
       role: "user",
       capabilities: ["build"],
     });
-    await new Promise((r) => setTimeout(r, 1500)); // age past activeWindow
+    // ORDERING RESTRUCTURE (#210, architect-approved). The dedup property is: "once the waiting
+    // transition has been BROADCAST, a NEW subscriber sees no re-emit." The old test assumed that
+    // transition fired during a fixed 1500ms sleep BEFORE connecting — an unguaranteed
+    // happens-before that load breaks: the 100ms broadcaster ticks slip, so the transition can
+    // fire AFTER connect → a spurious frame → a FALSE failure of a real property. This is not a
+    // too-tight deadline (widening buys probability, not correctness) — it is an ORDERING
+    // assumption, so we make the ordering DETERMINISTIC. NOTE the time-only `waiting` transition
+    // is COMPUTED (no DB mutation), so discover_agents (raw stored status) cannot confirm it — the
+    // BROADCAST frame is the only reliable "it fired" signal. So a throwaway subscriber OBSERVES
+    // the transition frame (establishing the ordering), then we connect a FRESH subscriber and
+    // assert ZERO — the actual dedup property, now race-free.
+    const confirmWs = await connectWs();
+    await confirmWs.nextMessage(); // drain hello
+    // ORDERING DEADLINE, not an SLA (#210): how long we wait for the transition to be broadcast.
+    // A timeout here is a GENUINE failure — "the time-only transition never fired" is a real
+    // defect — so it fails LOUD below, never silently absorbed. Bounded; not a latency budget.
+    const ORDERING_DEADLINE_MS = 12_000;
+    const confirmStart = Date.now();
+    let sawTransition = false;
+    while (Date.now() - confirmStart < ORDERING_DEADLINE_MS) {
+      let raw: string;
+      try {
+        raw = await confirmWs.nextMessage(
+          Math.max(250, ORDERING_DEADLINE_MS - (Date.now() - confirmStart)),
+        );
+      } catch {
+        break; // no frame within the remaining budget
+      }
+      const f = JSON.parse(raw) as BroadcastFrame;
+      if (
+        f.event === "agent.status_changed" &&
+        f.entity_id === "rt-dedup" &&
+        f.kind === "waiting"
+      ) {
+        sawTransition = true;
+        break;
+      }
+    }
+    confirmWs.ws.close();
+    expect(
+      sawTransition,
+      "rt-dedup time-only `waiting` transition never broadcast within the ordering deadline — " +
+        "a REAL defect (the transition/broadcast failed), not flake.",
+    ).toBe(true);
 
-    // Connect AFTER the transition has already fired. Should see ZERO
-    // further agent.status_changed frames for rt-dedup because state
-    // hasn't changed since last tick.
+    // Now connect a FRESH subscriber AFTER the transition provably fired + deduped. Dedup ⇒ ZERO
+    // re-emit. The zero-assertion is race-free now, and the collect window is kept TIGHT on
+    // purpose: on a zero-assert a WIDER window is MORE exposure, not less (#210) — any rt-dedup
+    // frame here is a genuine dedup bug, not slowness.
     const wsHandle = await connectWs();
-    await new Promise((r) => setTimeout(r, 600)); // 6 more ticks at 100ms
     const frames = await collectFrames(wsHandle, 5, 500);
     const rtDedupFrames = frames.filter(
       (f) => f.entity_id === "rt-dedup" && f.event === "agent.status_changed",
@@ -264,7 +331,12 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
       `dedup violated: expected 0 status_changed frames for rt-dedup, got ${rtDedupFrames.length}`,
     ).toEqual([]);
     wsHandle.ws.close();
-  }, 10_000);
+    // per-test timeout (#210): a HARNESS budget, not an SLA — sized to accommodate the ordering-
+    // confirm wait (≤12s) + the fresh-subscriber collect + daemon/WS setup, with headroom. A
+    // timeout here would mean the ordering confirm never completed, which its own loud assertion
+    // above already surfaces as a real defect (not flake). Widen-safe; do NOT tighten below the
+    // 12s ordering deadline it must contain.
+  }, 25_000);
 
   it("(RT3) RELAY_DECAY_TICK_DISABLED=1 disables the broadcaster — NO time-only emits", async () => {
     // Restart the server with the broadcaster opt-out flag set.

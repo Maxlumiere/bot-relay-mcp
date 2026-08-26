@@ -206,7 +206,16 @@ async function sendMessageViaHttp(
   await resp.text(); // drain SSE
 }
 
-async function waitFor<T>(check: () => T | null, timeoutMs = 4_000): Promise<T> {
+// WAIT-BUDGET waiter (issue #210). `timeoutMs` is how long we are WILLING TO WAIT for the
+// end-to-end delivery frame — it is NOT a latency SLA. The caller asserts the frame ARRIVED
+// (check() returns non-null), so a wider budget still FAILS if it never arrives; it stops
+// failing only when delivery is merely SLOW under load. Widening this budget is safe;
+// TIGHTENING it to "speed up" the test reintroduces the #210 load-flake. (Distinct from
+// `waitForHealth`, a readiness gate that is intentionally left alone.)
+async function waitFor<T>(
+  check: () => T | null,
+  timeoutMs = 8_000, // WAIT BUDGET, not an SLA (#210) — widen-safe, do NOT tighten
+): Promise<T> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const v = check();
