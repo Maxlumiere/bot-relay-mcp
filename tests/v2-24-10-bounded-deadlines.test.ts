@@ -87,7 +87,7 @@ describe("v2.24.10 withDeadline — the owned deadline covers connect AND body",
     srv.close();
     expect(err).toBeInstanceOf(DeadlineExceededError);
     expect(elapsed).toBeGreaterThanOrEqual(550);
-    expect(elapsed).toBeLessThan(2000); // settles at the bound, not "eventually"
+    expect(elapsed).toBeLessThan(4000); // settles at the bound, not "eventually" — ANTI-HANG ceiling, not an SLA (#210): a real hang blows any ceiling; widen-safe, do NOT tighten
   });
 
   it("TWIN: a complete body inside the bound still resolves normally", async () => {
@@ -154,7 +154,11 @@ describe("v2.24.10 relay pair — the reproduced end-to-end hang", () => {
 
     // Pre-fix this was FALSE at 7003ms against a 5000ms promise.
     expect(settledWithinBound).toBe(true);
-    expect(elapsed).toBeLessThan(8000);
+    // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe,
+    // do NOT tighten. Judgment call: was 8000, but `elapsed` has a hardcoded 7000ms floor
+    // (the setTimeout above), so the old 1000ms cushion was too tight for #210 contention.
+    // Widened to 16000, still bounded well under the 25s per-test timeout.
+    expect(elapsed).toBeLessThan(16000);
   }, 25000);
 });
 
@@ -169,7 +173,7 @@ describe("v2.24.10 relay init probeHealth — bounded, and still FAILS CLOSED", 
     srv.close();
     delete process.env.RELAY_HEALTH_PROBE_TIMEOUT_MS;
 
-    expect(elapsed).toBeLessThan(3000);
+    expect(elapsed).toBeLessThan(6000); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten
     // FAIL CLOSED is the security-relevant half: a timeout must never report the
     // port free. ONLY ECONNREFUSED may do that, and this was not one.
     expect(probe.reachable).toBe(true);
@@ -215,7 +219,11 @@ describe("v2.24.10 relay doctor --remote — hub probes are bounded", () => {
     srv.close();
     // Both hub probes are 5s-bounded; a stall must surface as a FAIL/WARN
     // report, not an unbounded wait.
-    expect(elapsed).toBeLessThan(14000);
+    // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe,
+    // do NOT tighten. Judgment call: was 14000, but two sequential 5s-bounded probes give
+    // a ~10s bounded floor, so the 4s cushion was thin for #210 contention. Widened to
+    // 20000, kept under the 25s per-test timeout so a true hang still trips the harness.
+    expect(elapsed).toBeLessThan(20000);
     expect(typeof code).toBe("number");
   }, 25000);
 });

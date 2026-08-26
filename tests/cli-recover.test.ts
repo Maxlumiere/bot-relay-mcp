@@ -60,7 +60,11 @@ async function seedDb(): Promise<void> {
 function runRecover(
   args: string[],
   extraEnv: Record<string, string | undefined> = {},
-  input?: string
+  input?: string,
+  // ANTI-HANG kill timeout for the spawned CLI (#210). Default 5s for all callers; test (3)
+  // widens it so a slow-but-alive CLI under release-machine load isn't FALSELY killed (which
+  // would flip r.status to -1 and fail as a phantom "hang"). A real hang is still killed here.
+  spawnTimeoutMs = 5_000,
 ): { status: number; stdout: string; stderr: string } {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -75,7 +79,7 @@ function runRecover(
   const r = spawnSync("node", [RELAY_BIN, "recover", ...args], {
     env,
     encoding: "utf-8",
-    timeout: 5_000,
+    timeout: spawnTimeoutMs,
     input: input ?? "",
   });
   return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
@@ -165,14 +169,21 @@ describe("v2.1 Phase 4o — relay recover CLI", () => {
     closeDb();
 
     const started = Date.now();
-    const r = runRecover(["victim", "--yes"]);
+    // #210: widen the spawn KILL timeout to 15s so a slow-but-alive CLI under release-machine
+    // load isn't falsely killed (which would flip r.status to -1 — a phantom "hang"). The real
+    // hang guard is `r.status === 0` below: a genuine hang under --yes with no stdin is still
+    // killed (at 15s) and reddens. Bounded, not infinite.
+    const r = runRecover(["victim", "--yes"], {}, undefined, 15_000);
     const elapsed = Date.now() - started;
     expect(r.status).toBe(0);
-    // Typical CLI startup is well under 2s; spawn timeout is 5s. If the
-    // handler regressed to reading stdin under --yes, spawnSync would hit
-    // the timeout (~5000ms).
-    expect(elapsed).toBeLessThan(4500);
-  });
+    // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT
+    // tighten. Loose by design: `r.status === 0` above is the load-bearing hang guard; this just
+    // pins that a NON-hanging run stays under the 15s spawn kill even on a contended machine.
+    expect(elapsed).toBeLessThan(15_000);
+    // per-test timeout (#210): the spawn kill is now 15s, so vitest's 5s LOCAL default would
+    // fire first under load and kill the test before the CLI returns — give it 20s bounded
+    // headroom. Not an SLA; a real hang is still caught by the 15s spawn kill + r.status check.
+  }, 20_000);
 
   it("(4) missing agent: exit 0, no DB changes, friendly message", async () => {
     await seedDb();

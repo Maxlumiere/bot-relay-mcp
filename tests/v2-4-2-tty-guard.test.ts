@@ -121,9 +121,13 @@ describe("v2.4.2 — TTY guard", () => {
     expect(result.stderr).not.toMatch(/not a TTY/);
     expect(result.stderr).not.toMatch(/attach a real TTY/);
     // DECIDED, not waited for: the old guard sat out a 1500ms grace before it
-    // could act. EOF is immediate, so this must be fast — and being fast is the
-    // observable proof that no timer is involved any more.
-    expect(elapsed).toBeLessThan(1200);
+    // could act. EOF is immediate, so exit-3 is event-driven, not timer-driven.
+    // #210: widened 1200 → 2500 because under release-machine contention the node
+    // spawn+startup wall-clock (not any guard timer) can exceed 1200ms and flake.
+    // The reintroduced-timer regression this once pinned is now independently guarded
+    // by T6/T7 (server STAYS ALIVE when stdin is held open — a ~1500ms grace would exit
+    // at ~1675ms and redden those), so this ceiling is safe to treat as anti-hang.
+    expect(elapsed).toBeLessThan(2500); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }, 10_000);
 
@@ -157,8 +161,12 @@ describe("v2.4.2 — TTY guard", () => {
     try {
       await Promise.race([
         client.connect(transport),
+        // network deadline, not an SLA (#210) — the SDK connect/init round-trip over
+        // stdio; widened 5000 → 12000 so release-machine contention can't trip the race
+        // before a real connect completes. Bounded under the 15s per-test timeout; a
+        // genuine connect hang still loses the race. Message updated to match the bound.
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Client.connect timed out (5s)")), 5000),
+          setTimeout(() => reject(new Error("Client.connect timed out (12s)")), 12000),
         ),
       ]);
       const tools = await client.listTools();

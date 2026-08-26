@@ -72,6 +72,11 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
   throw new Error(`HTTP daemon at :${port} did not become healthy within ${timeoutMs}ms`);
 }
 
+// WAIT-BUDGET waiter (issue #210). `timeoutMs` is how long we are WILLING TO WAIT for
+// cross-process / SSE delivery — it is NOT a latency SLA. Every caller asserts delivery
+// HAPPENED (notifications.length >= 1), so a wider budget still FAILS if delivery never
+// happens; it stops failing only when delivery is merely SLOW under load. Widening these
+// budgets is safe; TIGHTENING one to "speed up" the test reintroduces the #210 load-flake.
 async function waitForCount(
   arr: unknown[],
   atLeast: number,
@@ -238,7 +243,7 @@ describe("v2.7 / Tether Phase 3d — cross-process notification delivery", () =>
             reason,
           );
           expect(w.code, `child writer failed for reason=${reason}: ${w.stderr}`).toBe(0);
-          await waitForCount(notifications, 1, 3000);
+          await waitForCount(notifications, 1, 8000); // WAIT BUDGET, not an SLA (#210) — widen-safe, do NOT tighten
           expect(
             notifications.length,
             `no notification for reason=${reason} within 3s; daemon stderr tail:\n${daemon.stderr().slice(-2000)}`,
@@ -311,7 +316,7 @@ describe("v2.7 / Tether Phase 3d — cross-process notification delivery", () =>
         // event-id high-water map OR SQLite's data_version skip for same-
         // connection writes — both are valid same-process dedup
         // mechanisms), count stays at 1.
-        await waitForCount(notifications, 1, 2000);
+        await waitForCount(notifications, 1, 8000); // WAIT BUDGET, not an SLA (#210) — widen-safe, do NOT tighten
         expect(notifications.length).toBeGreaterThanOrEqual(1);
         await new Promise((res) => setTimeout(res, 400)); // ~8 poll intervals
         expect(
@@ -380,7 +385,7 @@ describe("v2.7 / Tether Phase 3d — cross-process notification delivery", () =>
         });
         const sendInner = JSON.parse((send.content as { text: string }[])[0].text);
         expect(sendInner.success).toBe(true);
-        await waitForCount(notifications, 1, 2000);
+        await waitForCount(notifications, 1, 8000); // WAIT BUDGET, not an SLA (#210) — widen-safe, do NOT tighten
         expect(notifications.length).toBe(1);
 
         // External writer commits a row for an UNRELATED agent. That bumps

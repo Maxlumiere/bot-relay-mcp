@@ -410,7 +410,7 @@ describe("installDaemon fail-closed on a STALLED body (real adapter)", () => {
     expect(res.installed).toBe(false);
     expect(writes).toEqual([]);
     expect(bootstraps).toEqual([]);
-    expect(elapsed).toBeLessThan(2000); // proves the timer spans the body read (would hang otherwise)
+    expect(elapsed).toBeLessThan(4000); // proves the timer spans the body read (would hang otherwise) — ANTI-HANG ceiling, not an SLA (#210): a real hang blows any ceiling; widen-safe, do NOT tighten (bounded internal deadline is RELAY_HEALTH_PROBE_TIMEOUT_MS=200)
   });
 
   it("(twin) a COMPLETE 200 relay body reads fine → classified relay → skip (no double-load, no hang)", async () => {

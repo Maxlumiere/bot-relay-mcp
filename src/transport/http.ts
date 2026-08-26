@@ -83,13 +83,31 @@ type WritableLike = {
   readonly writableEnded?: boolean;
 };
 
+/**
+ * #210 injectable timer seam. Production passes NOTHING, so keepalive uses the real global
+ * setInterval/clearInterval (REAL_KEEPALIVE_SCHEDULER below) and runtime behavior is UNCHANGED.
+ * A unit test may pass a manual scheduler to drive keepalive ticks DETERMINISTICALLY instead of
+ * racing real sub-second wall-clock timers under load (the #210 sub-second-tick flake — a 25ms
+ * interval sampled in a 35ms window coalesces to 0 ticks on a starved machine). This is the
+ * v2-8 ManualScheduler pattern applied to the keepalive timer — reuse, not new machinery.
+ */
+export type KeepaliveScheduler = {
+  setInterval: (fn: () => void, ms: number) => unknown;
+  clearInterval: (handle: unknown) => void;
+};
+const REAL_KEEPALIVE_SCHEDULER: KeepaliveScheduler = {
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: (h) => clearInterval(h as ReturnType<typeof setInterval>),
+};
+
 export function setupSseKeepalive(
   res: WritableLike,
   intervalMs: number,
+  scheduler: KeepaliveScheduler = REAL_KEEPALIVE_SCHEDULER,
 ): () => void {
   if (intervalMs <= 0) return () => { /* no-op */ };
   let cleared = false;
-  const timer = setInterval(() => {
+  const timer = scheduler.setInterval(() => {
     if (cleared) return;
     if (res.writableEnded) {
       cleanup();
@@ -103,14 +121,15 @@ export function setupSseKeepalive(
       cleanup();
     }
   }, intervalMs);
-  // Don't hold the event loop alive solely for keepalive ticks.
+  // Don't hold the event loop alive solely for keepalive ticks (real timers only;
+  // a manual scheduler's handle has no unref, hence the guard).
   if (typeof (timer as { unref?: () => void }).unref === "function") {
     (timer as { unref: () => void }).unref();
   }
   const cleanup = () => {
     if (cleared) return;
     cleared = true;
-    clearInterval(timer);
+    scheduler.clearInterval(timer);
   };
   res.once("close", cleanup);
   return cleanup;
