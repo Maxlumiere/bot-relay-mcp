@@ -20,6 +20,10 @@ import os from "os";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-wake-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
+// ADR-0026 seq 925: startWakeCoverageSweep now writes a durable status file; point it at a TMP
+// path so this test never writes the live default (~/.bot-relay/wake-coverage-status.json). The
+// writeWakeCoverageStatus guard hard-errors if a test resolves the default under vitest.
+process.env.RELAY_WAKE_COVERAGE_STATUS_PATH = path.join(TEST_DB_DIR, "wake-coverage-status.json");
 delete process.env.RELAY_AGENT_TOKEN;
 
 const { getDb, registerAgent, sendMessage, getMessages, closeDb } = await import("../src/db.js");

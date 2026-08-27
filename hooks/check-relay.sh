@@ -803,6 +803,46 @@ if [ -n "$TASKS" ]; then
   echo "[bot-relay] $AGENT_NAME has active tasks (delivered to context)." >&2
 fi
 
+# --- ADR-0026 item 1: wake-coverage briefing line (READ the durable sink) ---
+# Reached only on the SUCCESS path (valid identity + DB present; the invalid-name / out-of-
+# bounds / missing-DB guards above all `exit 0` before here), so it honors the hook's output
+# contract: stdout stays verdict-only when the session is degraded. On a healthy start it emits
+# ONE [RELAY] line via the SAME tested SSOT the daemon-briefing uses (formatWakeCoverageStatusLine
+# in the db-free dist/wake-coverage-status.js) — a missing/stale/unparseable sink reads UNKNOWN
+# (silence-as-failure, never "all clear"), and a poisoned/ancient finding is never shown as a
+# live alert. Non-fatal and node-only; it never opens the DB or contacts the daemon. The status
+# module is import-light on purpose (fs/path/os): importing the full detector here would drag
+# native better-sqlite3 into every session start and silently drop this line on wasm machines.
+if command -v node >/dev/null 2>&1; then
+  RELAY_REPO_ROOT="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)"
+  RELAY_WC_MODULE="$RELAY_REPO_ROOT/dist/wake-coverage-status.js"
+  if [ -n "$RELAY_REPO_ROOT" ] && [ -r "$RELAY_WC_MODULE" ]; then
+    # Gate on node's EXIT (via `if`) AND validate the [RELAY] shape before echoing: a node that
+    # fails or is hijacked (wrong binary on PATH) must never have its partial stdout leaked into
+    # session context — the same untrusted-partial-output class the mute self-check guards. The
+    # `if` also keeps a non-zero node exit from tripping any errexit.
+    if RELAY_WC_LINE=$(RELAY_WC_MODULE="$RELAY_WC_MODULE" node -e '
+      const { pathToFileURL } = require("node:url");
+      import(pathToFileURL(process.env.RELAY_WC_MODULE).href).then((mod) => {
+        const status = mod.readWakeCoverageStatus();     // honors RELAY_WAKE_COVERAGE_STATUS_PATH, else the default sink
+        const STALE_AFTER_MS = 3 * 60 * 60 * 1000;        // hourly sweep => older than 3h reads UNKNOWN
+        const line = mod.formatWakeCoverageStatusLine(status, Date.now(), STALE_AFTER_MS);
+        // Single-line guarantee at the hook boundary (codex P2): the formatter already sanitizes
+        // finding data; collapse any residual CR/LF here so a crafted/corrupt record can never
+        // inject an extra stdout line into the verdict-only contract.
+        const oneLine = String(line == null ? "" : line).replace(/[\r\n]+/g, " ").trim();
+        if (oneLine) process.stdout.write(oneLine + "\n");
+      }).catch(() => {});
+    ' 2>/dev/null); then
+      # Emit ONLY the first [RELAY] line (codex P2) — node already collapsed CR/LF; taking the
+      # first line here enforces the one-line/verdict contract at the hook boundary itself.
+      case "$RELAY_WC_LINE" in
+        "[RELAY]"*) printf '%s\n' "${RELAY_WC_LINE%%$'\n'*}" ;;
+      esac
+    fi
+  fi
+fi
+
 # --- ADR-0002: opt-in team onboarding map (default OFF) ---
 # Enable with RELAY_ONBOARD_TOPOLOGY=1. A compact who's-who grouped by
 # coordination class, so a freshly-started agent knows its peers. Rough liveness
