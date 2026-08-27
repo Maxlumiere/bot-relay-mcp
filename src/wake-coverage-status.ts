@@ -39,6 +39,10 @@ export function resolveWakeCoverageStatusPath(): string {
 }
 
 export interface WakeCoverageStatus {
+  /** Schema version. A record with NO v (or a different v) is UNINTERPRETABLE, not assumed-
+   *  current — it MUST read UNKNOWN. Defaulting a missing version to 1 would be the same
+   *  default-to-healthy bug the validation exists to catch. Bump on any shape change. */
+  readonly v: 1;
   /** ISO8601 of the evaluation that produced these findings. A stale generatedAt is a
    *  reader's signal that the sweep stopped — it MUST be treated as UNKNOWN, not healthy. */
   readonly generatedAt: string;
@@ -73,12 +77,41 @@ export function writeWakeCoverageStatus(statusPath: string, status: WakeCoverage
 }
 
 /**
- * Read the status sink, or null if absent/unparseable. A consumer MUST treat null (and a
- * stale generatedAt) as UNKNOWN, never as healthy — silence-as-failure is the whole point.
+ * Runtime schema guard — the ONE gate shared by the reader and the formatter so the two cannot
+ * drift. A valid record is an object with the EXACT field types AND schema version v===1. A
+ * MISSING version reads UNKNOWN, never assumed-v1 (`v ?? 1` would re-introduce the default-to-
+ * healthy bug this guard exists to catch), and sink files from earlier builds/test runs may
+ * already sit on disk without it. Anything that fails here degrades to UNKNOWN exactly like an
+ * absent file — a malformed record is silence too, never "healthy" (codex P1 #2).
+ */
+export function isValidWakeCoverageStatus(x: unknown): x is WakeCoverageStatus {
+  if (typeof x !== "object" || x === null) return false;
+  const s = x as Record<string, unknown>;
+  return (
+    s.v === 1 &&
+    typeof s.generatedAt === "string" &&
+    typeof s.thresholdMs === "number" &&
+    typeof s.uncoveredCount === "number" &&
+    Array.isArray(s.findings) &&
+    s.findings.every((f) => {
+      if (typeof f !== "object" || f === null) return false;
+      const ff = f as Record<string, unknown>;
+      return typeof ff.agent === "string" && typeof ff.verdict === "string";
+    })
+  );
+}
+
+/**
+ * Read the status sink, or null if absent/unparseable/malformed/wrong-schema. A consumer MUST
+ * treat null (and a stale or future-skewed generatedAt) as UNKNOWN, never as healthy —
+ * silence-as-failure is the whole point, and a malformed record is a kind of silence.
  */
 export function readWakeCoverageStatus(statusPath?: string): WakeCoverageStatus | null {
   try {
-    return JSON.parse(fs.readFileSync(statusPath ?? resolveWakeCoverageStatusPath(), "utf-8")) as WakeCoverageStatus;
+    const parsed: unknown = JSON.parse(
+      fs.readFileSync(statusPath ?? resolveWakeCoverageStatusPath(), "utf-8"),
+    );
+    return isValidWakeCoverageStatus(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -97,6 +130,30 @@ function humanAge(ms: number): string {
   return `${Math.round(m / 86_400_000)}d`;
 }
 
+/** Strip CR/LF and other control chars from interpolated finding data so a crafted or corrupt
+ *  agent name can never inject extra lines into the single-line [RELAY] briefing (codex P2). */
+function sanitizeLine(s: string): string {
+  // Replace any control char (code point < 0x20, or 0x7f DEL) with a space — computed
+  // numerically so no raw control byte ever lives in this source. A crafted or corrupt agent
+  // name can never inject extra lines into the single-line [RELAY] briefing.
+  let out = "";
+  for (const ch of s) {
+    const c = ch.codePointAt(0) ?? 0;
+    out += c < 0x20 || c === 0x7f ? " " : ch;
+  }
+  return out.trim();
+}
+
+/**
+ * FUTURE-SKEW TOLERANCE. A generatedAt AHEAD of now is not "very fresh" — it is evidence of a
+ * broken writer or a wrong clock, and left unchecked a healthy-looking record could read OK for
+ * years until local time catches up (codex P1). But small negative ages are ordinary NTP/process
+ * jitter and must stay OK, or healthy machines manufacture false UNKNOWNs and the detector cries
+ * wolf. 60s sits comfortably above jitter yet far below any real staleness. DO NOT tidy this to
+ * 0 — a zero tolerance re-creates the false-UNKNOWN failure mode. Tested on BOTH sides.
+ */
+const FUTURE_SKEW_MS = 60_000;
+
 /**
  * The SessionStart / briefing LINE (ADR-0026 item 1) — a STALENESS-ENFORCING reader. Turns the
  * durable status into the exact `[RELAY]` line injected into session context:
@@ -112,19 +169,38 @@ export function formatWakeCoverageStatusLine(
   nowMs: number,
   staleAfterMs: number,
 ): string {
+  // ABSENT or MALFORMED/WRONG-SCHEMA → UNKNOWN, using the SAME guard the reader uses so the two
+  // cannot drift: a partial record, a wrong-typed field, or a missing/unknown schema version is
+  // silence too, never "healthy" (codex P1 #2).
   if (status === null) {
     return "[RELAY] wake-coverage: UNKNOWN — no status file (the detector may not have run). Treat as unknown, not healthy.";
   }
-  const gen = Date.parse(status.generatedAt);
-  if (!Number.isFinite(gen) || nowMs - gen > staleAfterMs) {
-    const age = Number.isFinite(gen) ? `${humanAge(nowMs - gen)} ago` : "an unparseable time";
-    return `[RELAY] wake-coverage: UNKNOWN — status is STALE (generated ${age}); the hourly sweep may have stopped. Treat as unknown, not healthy.`;
+  if (!isValidWakeCoverageStatus(status)) {
+    return "[RELAY] wake-coverage: UNKNOWN — status record is malformed or a different schema version. Treat as unknown, not healthy.";
   }
-  if ((status.uncoveredCount ?? 0) > 0) {
-    const names = status.findings.filter((f) => f.verdict === "uncovered").map((f) => f.agent).join(", ");
+  // STALE (past) OR FUTURE-SKEWED (ahead of now beyond FUTURE_SKEW_MS) → UNKNOWN. A future
+  // generatedAt would otherwise escape the past-only staleness check and read OK indefinitely
+  // (codex P1). Small negative ages (NTP jitter) stay within tolerance and read OK below.
+  const gen = Date.parse(status.generatedAt);
+  const ageMs = nowMs - gen;
+  if (!Number.isFinite(gen) || ageMs > staleAfterMs || ageMs < -FUTURE_SKEW_MS) {
+    let age: string;
+    if (!Number.isFinite(gen)) age = "an unparseable time";
+    else if (ageMs < 0) age = `${humanAge(-ageMs)} in the future`;
+    else age = `${humanAge(ageMs)} ago`;
+    return `[RELAY] wake-coverage: UNKNOWN — status is STALE or clock-skewed (generated ${age}); the sweep may have stopped or the writer's clock is wrong. Treat as unknown, not healthy.`;
+  }
+  // uncoveredCount is a validated number here (the guard rejects non-numbers) — NO `?? 0` default,
+  // which would turn "I don't know" into "0 uncovered = healthy" (the default IS the bug). Finding
+  // data is sanitized so a crafted/corrupt agent name cannot make this a multi-line briefing.
+  if (status.uncoveredCount > 0) {
+    const names = status.findings
+      .filter((f) => f.verdict === "uncovered")
+      .map((f) => sanitizeLine(String(f.agent)))
+      .join(", ");
     return `[RELAY] *** wake-coverage: ${status.uncoveredCount} agent(s) UNCOVERED — mail is piling up unwoken: ${names}. A wake path is broken. ***`;
   }
   // ALWAYS emit OK (a sink that speaks only on failure is indistinguishable from a dead sink),
   // and CARRY THE AGE so a drifting age exposes a stopped-but-still-"OK" sweep (victra Q1).
-  return `[RELAY] wake-coverage: OK (as of ${humanAge(nowMs - gen)}).`;
+  return `[RELAY] wake-coverage: OK (as of ${humanAge(ageMs)}).`;
 }

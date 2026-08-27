@@ -329,6 +329,7 @@ export function runWakeCoverageSweep(
   // must not take down the daemon, but it degrades to trace-only, which the reader reports as stale.
   try {
     writeWakeCoverageStatus(opts.statusPath ?? resolveWakeCoverageStatusPath(), {
+      v: 1,
       generatedAt: new Date(opts.nowMs).toISOString(),
       thresholdMs: opts.boundMs + opts.antiFlapMarginMs,
       uncoveredCount: findings.filter((f) => f.verdict === "uncovered").length,

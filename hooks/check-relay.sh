@@ -827,11 +827,17 @@ if command -v node >/dev/null 2>&1; then
         const status = mod.readWakeCoverageStatus();     // honors RELAY_WAKE_COVERAGE_STATUS_PATH, else the default sink
         const STALE_AFTER_MS = 3 * 60 * 60 * 1000;        // hourly sweep => older than 3h reads UNKNOWN
         const line = mod.formatWakeCoverageStatusLine(status, Date.now(), STALE_AFTER_MS);
-        if (line) process.stdout.write(line + "\n");
+        // Single-line guarantee at the hook boundary (codex P2): the formatter already sanitizes
+        // finding data; collapse any residual CR/LF here so a crafted/corrupt record can never
+        // inject an extra stdout line into the verdict-only contract.
+        const oneLine = String(line == null ? "" : line).replace(/[\r\n]+/g, " ").trim();
+        if (oneLine) process.stdout.write(oneLine + "\n");
       }).catch(() => {});
     ' 2>/dev/null); then
+      # Emit ONLY the first [RELAY] line (codex P2) — node already collapsed CR/LF; taking the
+      # first line here enforces the one-line/verdict contract at the hook boundary itself.
       case "$RELAY_WC_LINE" in
-        "[RELAY]"*) echo "$RELAY_WC_LINE" ;;
+        "[RELAY]"*) printf '%s\n' "${RELAY_WC_LINE%%$'\n'*}" ;;
       esac
     fi
   fi

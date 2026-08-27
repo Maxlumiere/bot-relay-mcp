@@ -100,7 +100,7 @@ type StatusArg = Parameters<typeof formatWakeCoverageStatusLine>[0];
 
 describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-enforcing reader", () => {
   it("GUARD (make-impossible, not a convention): writing the DEFAULT live path from a test harness HARD-ERRORS", () => {
-    const status = { generatedAt: new Date(NOW).toISOString(), thresholdMs: 1, uncoveredCount: 0, findings: [] };
+    const status = { v: 1, generatedAt: new Date(NOW).toISOString(), thresholdMs: 1, uncoveredCount: 0, findings: [] };
     // This is the structural stop for the mistake that poisoned the live sink — a convention you
     // must remember is a bug (victra). Under vitest, the default path is refused, loudly.
     expect(() => writeWakeCoverageStatus(defaultWakeCoverageStatusPath(), status as StatusArg as never)).toThrow(
@@ -110,6 +110,7 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
 
   it("STALE reader: the exact poison shape (15-day-old generatedAt + fictional uncovered) reads UNKNOWN, NOT a live alert", () => {
     const ancient = {
+      v: 1,
       generatedAt: "2026-08-12T00:00:00.000Z",
       thresholdMs: 172_800_000,
       uncoveredCount: 1,
@@ -123,6 +124,7 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
 
   it("FRESH reader: a FRESH uncovered finding IS surfaced loudly (the reader isn't just always-UNKNOWN)", () => {
     const fresh = {
+      v: 1,
       generatedAt: new Date(NOW).toISOString(),
       thresholdMs: 172_800_000,
       uncoveredCount: 1,
@@ -139,6 +141,7 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
     // visible in the line, not buried in a log. Sub-hour granularity is the point — "0h ago"
     // hides a 4m vs 55m difference. RED on the pre-refinement hour-rounded line.
     const fresh = {
+      v: 1,
       generatedAt: new Date(NOW).toISOString(),
       thresholdMs: 172_800_000,
       uncoveredCount: 0,

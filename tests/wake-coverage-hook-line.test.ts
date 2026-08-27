@@ -91,8 +91,11 @@ function initMinimalDb(p: string): void {
   db.close();
 }
 
-function writeStatus(obj: unknown): void {
-  fs.writeFileSync(statusPath, JSON.stringify(obj, null, 2));
+function writeStatus(obj: Record<string, unknown>): void {
+  // Inject the schema version so these fixtures are VALID records (post codex P1 #2 schema guard);
+  // the hook-line tests exercise fresh/missing/stale, not the malformed path (that's the
+  // robustness suite). A test that wants a version-less record writes the file directly.
+  fs.writeFileSync(statusPath, JSON.stringify({ v: 1, ...obj }, null, 2));
 }
 
 const HOUR = 60 * 60 * 1000;
