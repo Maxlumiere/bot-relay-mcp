@@ -32,6 +32,7 @@ const { log } = await import("../src/logger.js");
 const {
   runWakeCoverageSweep,
   writeWakeCoverageStatus,
+  readWakeCoverageStatus,
   defaultWakeCoverageStatusPath,
   formatWakeCoverageStatusLine,
 } = await import("../src/wake-coverage-detector.js");
@@ -64,7 +65,33 @@ function seedUncovered(agent: string): void {
     .run("stuck-1", agent, isoAgo(50)); // 50h > 48h, no drain since → UNCOVERED
 }
 
+function seedUnobservable(agent: string): void {
+  registerAgent(agent, "r", []);
+  // NO drain marker → the detector cannot judge coverage → verdict "unobservable" (detector: lastDrainAt===null).
+  getDb().prepare("UPDATE agents SET last_drain_at = NULL WHERE name = ?").run(agent);
+  getDb()
+    .prepare(
+      "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, 'x', ?, 'm', 'normal', 'pending', ?)",
+    )
+    .run("stuck-unobs", agent, isoAgo(50)); // 50h > 48h stuck, no drain marker → UNOBSERVABLE
+}
+
 describe("ADR-0026 item 1 — wake-coverage findings reach a durable, fail-independent sink", () => {
+  it("E2E writer→sink→formatter: a stuck agent with NO drain marker (UNOBSERVABLE) VALIDATES and reads UNKNOWN, never OK", () => {
+    // codex #6: the SHIPPED writer emits this NORMAL state (no last_drain_at → 'unobservable'). Its own
+    // output must pass validation (no over-strict false UNKNOWN) AND must not collapse into OK — the
+    // founding defect of this PR was exactly UNOBSERVABLE being lost. Only an EMPTY findings list is healthy.
+    seedUnobservable("cannot-judge");
+    const statusPath = path.join(TEST_DB_DIR, "wake-coverage-status.json");
+    runWakeCoverageSweep(getDb(), { ...OPTS, statusPath });
+    const parsed = readWakeCoverageStatus(statusPath);
+    expect(parsed, "the shipped writer's own output must pass isValidWakeCoverageStatus").not.toBeNull();
+    const line = formatWakeCoverageStatusLine(parsed, NOW + 60_000, 3 * HOUR); // fresh read
+    expect(line, "unjudgeable stuck mail is NOT checked-and-healthy").not.toMatch(/wake-coverage: OK/);
+    expect(line).toMatch(/UNOBSERVABLE|UNKNOWN/);
+    expect(line).toMatch(/cannot-judge/);
+  });
+
   it("SINK: runWakeCoverageSweep writes the UNCOVERED finding to a durable status file a consumer can read", () => {
     seedUncovered("regressed");
     const statusPath = path.join(TEST_DB_DIR, "wake-coverage-status.json");

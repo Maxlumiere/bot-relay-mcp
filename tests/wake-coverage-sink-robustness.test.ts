@@ -228,9 +228,61 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
     ).toMatch(/UNKNOWN/);
   });
 
-  it("non-integer thresholdMs → UNKNOWN", () => {
+  // ---- codex #6 + victra: ONLY an EMPTY findings list is healthy — derive by EXCLUSION ----
+  // An `unobservable` finding (stuck mail, no drain marker — coverage UNJUDGEABLE) is a NORMAL writer
+  // output; it must NOT collapse into OK. The founding defect of this PR was UNOBSERVABLE lost in
+  // stderr for 500h — converting it to OK is the same disease at the display layer. OK is reached ONLY
+  // when findings is empty; ANY finding of a verdict we haven't affirmatively classified as healthy is
+  // not-OK (so a future verdict defaults to visible/not-OK, never invisible/healthy).
+  it("UNOBSERVABLE finding → UNKNOWN, never OK (unjudgeable stuck mail is not checked-and-healthy)", () => {
+    const line = formatWakeCoverageStatusLine(
+      asStatus(healthy({ findings: [{ agent: "cannot-judge", verdict: "unobservable" }] })),
+      NOW + 60_000,
+      STALE_AFTER,
+    );
+    expect(line, "unobservable stuck mail must not read OK").not.toMatch(/wake-coverage: OK/);
+    expect(line).toMatch(/UNOBSERVABLE|UNKNOWN/);
+    expect(line, "the affected agent must be named").toMatch(/cannot-judge/);
+  });
+
+  // ---- OVER-STRICTNESS (victra): benign variation must NOT manufacture a FALSE UNKNOWN ----
+  it("FLOAT thresholdMs stays OK — the shipped writer's boundMs+antiFlapMarginMs can be a float", () => {
+    const line = formatWakeCoverageStatusLine(
+      asStatus(healthy({ thresholdMs: 172_800_000.5 })),
+      NOW + 60_000,
+      STALE_AFTER,
+    );
+    expect(line, "a benign float threshold must not cry wolf as UNKNOWN").toMatch(/wake-coverage: OK/);
+    expect(line).not.toMatch(/UNKNOWN/);
+  });
+
+  it("unicode in an agent name is preserved and surfaced (not rejected, not stripped)", () => {
+    const line = formatWakeCoverageStatusLine(
+      asStatus(healthy({ findings: [{ agent: "café-agent-日本語", verdict: "uncovered" }] })),
+      NOW + 60_000,
+      STALE_AFTER,
+    );
+    expect(line).toMatch(/UNCOVERED/);
+    expect(line).toMatch(/café-agent-日本語/);
+  });
+
+  it("key order does not matter (closed schema is by membership, not position)", () => {
+    const reordered = { findings: [], thresholdMs: 48 * HOUR, generatedAt: new Date(NOW).toISOString(), v: 1 };
+    const line = formatWakeCoverageStatusLine(asStatus(reordered), NOW + 60_000, STALE_AFTER);
+    expect(line).toMatch(/wake-coverage: OK/);
+    expect(line).not.toMatch(/UNKNOWN/);
+  });
+
+  // thresholdMs INVALID cases still reject (finite, non-negative): NaN / Infinity / negative → UNKNOWN.
+  it("NaN thresholdMs → UNKNOWN", () => {
+    expect(formatWakeCoverageStatusLine(asStatus(healthy({ thresholdMs: NaN })), NOW + 60_000, STALE_AFTER)).toMatch(
+      /UNKNOWN/,
+    );
+  });
+
+  it("Infinity thresholdMs → UNKNOWN", () => {
     expect(
-      formatWakeCoverageStatusLine(asStatus(healthy({ thresholdMs: 1.5 })), NOW + 60_000, STALE_AFTER),
+      formatWakeCoverageStatusLine(asStatus(healthy({ thresholdMs: Infinity })), NOW + 60_000, STALE_AFTER),
     ).toMatch(/UNKNOWN/);
   });
 

@@ -110,10 +110,12 @@ export function isValidWakeCoverageStatus(x: unknown): x is WakeCoverageStatus {
     Object.keys(s).every((k) => ALLOWED_TOP_KEYS.has(k)) &&
     s.v === 1 &&
     typeof s.generatedAt === "string" &&
-    // thresholdMs is the only surviving numeric field — a finite non-negative integer (rejects
-    // NaN/Infinity/float/negative). There is NO uncoveredCount: the count is DERIVED from findings at
-    // read time, never stored, so the count/findings inconsistency cannot be represented at all.
-    Number.isInteger(s.thresholdMs) &&
+    // thresholdMs is the only surviving numeric field — a finite non-negative NUMBER. Deliberately
+    // NOT Number.isInteger: the shipped writer computes boundMs+antiFlapMarginMs from env-configurable
+    // values that can be floats, and a benign float must NOT manufacture a FALSE UNKNOWN (a detector
+    // that cries wolf loses the next outage as surely as a silent one). Finite rejects NaN/Infinity/
+    // non-number; >=0 rejects negative. There is NO uncoveredCount — the count is DERIVED from findings.
+    Number.isFinite(s.thresholdMs) &&
     (s.thresholdMs as number) >= 0 &&
     Array.isArray(s.findings) &&
     s.findings.every((f) => {
@@ -225,6 +227,14 @@ export function formatWakeCoverageStatusLine(
   if (uncovered.length > 0) {
     const names = uncovered.map((f) => sanitizeLine(String(f.agent))).join(", ");
     return `[RELAY] *** wake-coverage: ${uncovered.length} agent(s) UNCOVERED — mail is piling up unwoken: ${names}. A wake path is broken. ***`;
+  }
+  // ONLY an EMPTY findings list is healthy. A finding means an agent has mail STUCK past the
+  // threshold; if none are "uncovered" the rest are UNOBSERVABLE — stuck mail whose coverage the
+  // detector cannot judge (no durable drain marker). Unjudgeable is NOT checked-and-healthy (codex):
+  // surface it and name the agents; never collapse "I can't tell, and there IS stuck mail" into OK.
+  if (status.findings.length > 0) {
+    const names = status.findings.map((f) => sanitizeLine(String(f.agent))).join(", ");
+    return `[RELAY] wake-coverage: UNKNOWN — ${status.findings.length} agent(s) with mail stuck past the threshold cannot be judged (UNOBSERVABLE — no drain marker): ${names}. Coverage unconfirmed, not healthy.`;
   }
   // ALWAYS emit OK (a sink that speaks only on failure is indistinguishable from a dead sink),
   // and CARRY THE AGE so a drifting age exposes a stopped-but-still-"OK" sweep (victra Q1).
