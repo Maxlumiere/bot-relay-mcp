@@ -246,14 +246,12 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
   });
 
   // ---- OVER-STRICTNESS (victra): benign variation must NOT manufacture a FALSE UNKNOWN ----
-  it("FLOAT thresholdMs stays OK — the shipped writer's boundMs+antiFlapMarginMs can be a float", () => {
-    const line = formatWakeCoverageStatusLine(
-      asStatus(healthy({ thresholdMs: 172_800_000.5 })),
-      NOW + 60_000,
-      STALE_AFTER,
-    );
-    expect(line, "a benign float threshold must not cry wolf as UNKNOWN").toMatch(/wake-coverage: OK/);
-    expect(line).not.toMatch(/UNKNOWN/);
+  it("raw FLOAT thresholdMs → UNKNOWN — the WRITER normalizes to integer, so a fractional on-disk value is non-conforming", () => {
+    // NOT over-strict: the writer (Math.round) guarantees integer on-disk, so this rejects only records
+    // NO writer produces. The writer-side proof that float OPTIONS still yield a valid record lives in
+    // tests/wake-coverage-sink.test.ts (WRITER normalizes thresholdMs).
+    const line = formatWakeCoverageStatusLine(asStatus(healthy({ thresholdMs: 172_800_000.5 })), NOW + 60_000, STALE_AFTER);
+    expect(line, "a fractional threshold is not a writer-produced v:1 record").toMatch(/UNKNOWN/);
   });
 
   it("unicode in an agent name is preserved and surfaced (not rejected, not stripped)", () => {

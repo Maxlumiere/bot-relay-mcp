@@ -76,6 +76,19 @@ function seedUnobservable(agent: string): void {
     .run("stuck-unobs", agent, isoAgo(50)); // 50h > 48h stuck, no drain marker → UNOBSERVABLE
 }
 
+function seedCovered(agent: string): void {
+  registerAgent(agent, "r", []);
+  // Stuck mail (50h old) BUT drained SINCE it arrived (10h ago >= 50h ago) → the detector's
+  // drainSinceArrival check EXCLUDES it from findings (COVERED — awake, a still-sitting message is a
+  // routing question, not a wake one). This is the ONE verdict the writer never puts in findings.
+  getDb().prepare("UPDATE agents SET last_drain_at = ? WHERE name = ?").run(isoAgo(10), agent);
+  getDb()
+    .prepare(
+      "INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, 'x', ?, 'm', 'normal', 'pending', ?)",
+    )
+    .run("stuck-cov", agent, isoAgo(50));
+}
+
 describe("ADR-0026 item 1 — wake-coverage findings reach a durable, fail-independent sink", () => {
   it("E2E writer→sink→formatter: a stuck agent with NO drain marker (UNOBSERVABLE) VALIDATES and reads UNKNOWN, never OK", () => {
     // codex #6: the SHIPPED writer emits this NORMAL state (no last_drain_at → 'unobservable'). Its own
@@ -90,6 +103,50 @@ describe("ADR-0026 item 1 — wake-coverage findings reach a durable, fail-indep
     expect(line, "unjudgeable stuck mail is NOT checked-and-healthy").not.toMatch(/wake-coverage: OK/);
     expect(line).toMatch(/UNOBSERVABLE|UNKNOWN/);
     expect(line).toMatch(/cannot-judge/);
+  });
+
+  // ENUMERATION (victra): every verdict the writer can emit gets a defined display state AND an
+  // end-to-end writer→sink→read→formatter test. classifyWakeCoverage emits exactly two into findings
+  // (uncovered, unobservable); covered is excluded (continue at detector.ts:249). One e2e per verdict:
+  //   uncovered   → UNCOVERED (alarm, named)       [this test]
+  //   unobservable→ UNKNOWN (unjudgeable, named)    [the test above]
+  //   covered     → excluded from findings → OK     [the test below]
+  it("E2E writer→sink→read→formatter: an UNCOVERED agent VALIDATES and formats UNCOVERED, never OK/UNKNOWN (alarm path)", () => {
+    // codex r5: the alarm path had only a writer→sink assertion, never a full read+format regression —
+    // a future writer/wire drift could slip through unnoticed. This closes it end-to-end.
+    seedUncovered("regressed-e2e");
+    const statusPath = path.join(TEST_DB_DIR, "wake-coverage-status.json");
+    runWakeCoverageSweep(getDb(), { ...OPTS, statusPath });
+    const parsed = readWakeCoverageStatus(statusPath);
+    expect(parsed, "the shipped writer's ALARM-path output must pass validation").not.toBeNull();
+    const line = formatWakeCoverageStatusLine(parsed, NOW + 60_000, 3 * HOUR);
+    expect(line).toMatch(/UNCOVERED/);
+    expect(line).toMatch(/regressed-e2e/);
+    expect(line).not.toMatch(/wake-coverage: OK/);
+  });
+
+  it("E2E writer→sink→read→formatter: a COVERED agent is EXCLUDED from findings → OK (the healthy path is writer-driven, not assumed)", () => {
+    seedCovered("drained-since");
+    const statusPath = path.join(TEST_DB_DIR, "wake-coverage-status.json");
+    runWakeCoverageSweep(getDb(), { ...OPTS, statusPath });
+    const parsed = readWakeCoverageStatus(statusPath);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.findings.length, "a covered agent must never appear in findings").toBe(0);
+    const line = formatWakeCoverageStatusLine(parsed, NOW + 60_000, 3 * HOUR);
+    expect(line).toMatch(/wake-coverage: OK/);
+    expect(line).not.toMatch(/UNKNOWN|UNCOVERED/);
+  });
+
+  it("WRITER normalizes thresholdMs to an integer — even FLOAT options cannot produce a record the strict reader rejects (make-impossible)", () => {
+    // The env path parseInt's bound/margin (integers); a float is reachable only by a programmatic
+    // caller of the exported sweep. The writer Math.round-normalizes, so the on-disk v:1 contract is
+    // always integer and the strict reader never false-alarms on the writer's OWN output (victra 3rd option).
+    seedUncovered("norm-agent");
+    const statusPath = path.join(TEST_DB_DIR, "wake-coverage-status.json");
+    runWakeCoverageSweep(getDb(), { nowMs: NOW, boundMs: 24 * HOUR + 0.5, antiFlapMarginMs: 24 * HOUR + 0.25, statusPath });
+    const parsed = readWakeCoverageStatus(statusPath);
+    expect(parsed, "the writer's output must ALWAYS validate, float options or not").not.toBeNull();
+    expect(Number.isInteger(parsed!.thresholdMs), "on-disk thresholdMs must be an integer").toBe(true);
   });
 
   it("SINK: runWakeCoverageSweep writes the UNCOVERED finding to a durable status file a consumer can read", () => {

@@ -110,12 +110,13 @@ export function isValidWakeCoverageStatus(x: unknown): x is WakeCoverageStatus {
     Object.keys(s).every((k) => ALLOWED_TOP_KEYS.has(k)) &&
     s.v === 1 &&
     typeof s.generatedAt === "string" &&
-    // thresholdMs is the only surviving numeric field — a finite non-negative NUMBER. Deliberately
-    // NOT Number.isInteger: the shipped writer computes boundMs+antiFlapMarginMs from env-configurable
-    // values that can be floats, and a benign float must NOT manufacture a FALSE UNKNOWN (a detector
-    // that cries wolf loses the next outage as surely as a silent one). Finite rejects NaN/Infinity/
-    // non-number; >=0 rejects negative. There is NO uncoveredCount — the count is DERIVED from findings.
-    Number.isFinite(s.thresholdMs) &&
+    // thresholdMs is the only surviving numeric field — a finite non-negative INTEGER. The env config
+    // path parseInt's bound/margin, and the WRITER Math.round-normalizes the sum before writing, so the
+    // on-disk v:1 contract is ALWAYS an integer — even a programmatic caller passing float options
+    // cannot produce a record this strict reader would false-alarm on (the false-UNKNOWN is fixed at
+    // the writer, not by loosening here). A raw fractional/NaN/Infinity/negative thresholdMs is
+    // therefore non-conforming -> UNKNOWN. There is NO uncoveredCount — the count is DERIVED from findings.
+    Number.isInteger(s.thresholdMs) &&
     (s.thresholdMs as number) >= 0 &&
     Array.isArray(s.findings) &&
     s.findings.every((f) => {

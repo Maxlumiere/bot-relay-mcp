@@ -331,7 +331,11 @@ export function runWakeCoverageSweep(
     writeWakeCoverageStatus(opts.statusPath ?? resolveWakeCoverageStatusPath(), {
       v: 1,
       generatedAt: new Date(opts.nowMs).toISOString(),
-      thresholdMs: opts.boundMs + opts.antiFlapMarginMs,
+      // NORMALIZE to an integer at the WRITER (codex r5 / victra 3rd option). The env path parseInt's
+      // bound/margin so it is already integer, but the exported runWakeCoverageSweep can be called
+      // programmatically with float options. Rounding here makes the on-disk v:1 contract ALWAYS an
+      // integer, so a strict integer reader can never false-alarm (UNKNOWN) on our OWN writer's output.
+      thresholdMs: Math.round(opts.boundMs + opts.antiFlapMarginMs),
       // NO uncoveredCount — the count is derived from findings at read time (see WakeCoverageStatus).
       findings,
     });
