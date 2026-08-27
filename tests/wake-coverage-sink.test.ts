@@ -133,6 +133,22 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
     expect(line).toMatch(/realagent/);
   });
 
+  it("OK line carries a PRECISE age (as of Nm) — a bare/hour-rounded OK hides a sweep that has stopped", () => {
+    // victra Q1 ruling: a sink that speaks only on failure is indistinguishable from a dead sink;
+    // ALWAYS emit OK, and CARRY THE AGE so a drifting age (detector stopped but still 'OK') is
+    // visible in the line, not buried in a log. Sub-hour granularity is the point — "0h ago"
+    // hides a 4m vs 55m difference. RED on the pre-refinement hour-rounded line.
+    const fresh = {
+      generatedAt: new Date(NOW).toISOString(),
+      thresholdMs: 172_800_000,
+      uncoveredCount: 0,
+      findings: [],
+    };
+    const line = formatWakeCoverageStatusLine(fresh as StatusArg, NOW + 2 * 60 * 1000, 3 * HOUR); // 2 min old
+    expect(line).toMatch(/wake-coverage: OK/);
+    expect(line, "the OK line must show a precise sub-hour age").toMatch(/as of 2m/);
+  });
+
   it("MISSING reader: null status → UNKNOWN, never healthy (silence-as-failure)", () => {
     expect(formatWakeCoverageStatusLine(null, NOW, 3 * HOUR)).toMatch(/UNKNOWN/);
   });

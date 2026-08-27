@@ -85,6 +85,19 @@ export function readWakeCoverageStatus(statusPath?: string): WakeCoverageStatus 
 }
 
 /**
+ * Compact human age for the briefing line. Sub-hour granularity is deliberate: an age that
+ * drifts up is how you SEE a sweep that has stopped while the file still says "OK" — that must
+ * be visible in the line, not buried in a log (victra Q1 ruling). Hour-rounding ("0h") hid it.
+ */
+function humanAge(ms: number): string {
+  const m = ms < 0 ? 0 : ms;
+  if (m < 60_000) return `${Math.round(m / 1000)}s`;
+  if (m < 3_600_000) return `${Math.round(m / 60_000)}m`;
+  if (m < 86_400_000) return `${Math.round(m / 3_600_000)}h`;
+  return `${Math.round(m / 86_400_000)}d`;
+}
+
+/**
  * The SessionStart / briefing LINE (ADR-0026 item 1) — a STALENESS-ENFORCING reader. Turns the
  * durable status into the exact `[RELAY]` line injected into session context:
  *  - null (no/unreadable file) → UNKNOWN (never healthy — silence-as-failure).
@@ -104,13 +117,14 @@ export function formatWakeCoverageStatusLine(
   }
   const gen = Date.parse(status.generatedAt);
   if (!Number.isFinite(gen) || nowMs - gen > staleAfterMs) {
-    const ageH = Number.isFinite(gen) ? `${Math.round((nowMs - gen) / 3_600_000)}h` : "unparseable";
-    return `[RELAY] wake-coverage: UNKNOWN — status is STALE (generated ${ageH} ago); the hourly sweep may have stopped. Treat as unknown, not healthy.`;
+    const age = Number.isFinite(gen) ? `${humanAge(nowMs - gen)} ago` : "an unparseable time";
+    return `[RELAY] wake-coverage: UNKNOWN — status is STALE (generated ${age}); the hourly sweep may have stopped. Treat as unknown, not healthy.`;
   }
-  const ageH = Math.round((nowMs - gen) / 3_600_000);
   if ((status.uncoveredCount ?? 0) > 0) {
     const names = status.findings.filter((f) => f.verdict === "uncovered").map((f) => f.agent).join(", ");
     return `[RELAY] *** wake-coverage: ${status.uncoveredCount} agent(s) UNCOVERED — mail is piling up unwoken: ${names}. A wake path is broken. ***`;
   }
-  return `[RELAY] wake-coverage: OK (${ageH}h ago, 0 uncovered).`;
+  // ALWAYS emit OK (a sink that speaks only on failure is indistinguishable from a dead sink),
+  // and CARRY THE AGE so a drifting age exposes a stopped-but-still-"OK" sweep (victra Q1).
+  return `[RELAY] wake-coverage: OK (as of ${humanAge(nowMs - gen)}).`;
 }
