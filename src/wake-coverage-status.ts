@@ -76,6 +76,11 @@ export function writeWakeCoverageStatus(statusPath: string, status: WakeCoverage
   fs.renameSync(tmp, statusPath);
 }
 
+/** The verdicts the detector can emit (mirrors WakeVerdict in wake-coverage-detector.ts). A
+ *  finding carrying any other verdict is a corrupt record — rejected, not silently treated as
+ *  "not uncovered". Keep in sync if WakeVerdict grows. */
+const KNOWN_VERDICTS = new Set(["covered", "uncovered", "unobservable"]);
+
 /**
  * Runtime schema guard — the ONE gate shared by the reader and the formatter so the two cannot
  * drift. A valid record is an object with the EXACT field types AND schema version v===1. A
@@ -91,12 +96,14 @@ export function isValidWakeCoverageStatus(x: unknown): x is WakeCoverageStatus {
     s.v === 1 &&
     typeof s.generatedAt === "string" &&
     typeof s.thresholdMs === "number" &&
-    typeof s.uncoveredCount === "number" &&
+    Number.isInteger(s.uncoveredCount) &&
+    (s.uncoveredCount as number) >= 0 &&
     Array.isArray(s.findings) &&
     s.findings.every((f) => {
       if (typeof f !== "object" || f === null) return false;
       const ff = f as Record<string, unknown>;
-      return typeof ff.agent === "string" && typeof ff.verdict === "string";
+      const verdict = ff.verdict;
+      return typeof ff.agent === "string" && typeof verdict === "string" && KNOWN_VERDICTS.has(verdict);
     })
   );
 }
@@ -193,12 +200,14 @@ export function formatWakeCoverageStatusLine(
   // uncoveredCount is a validated number here (the guard rejects non-numbers) — NO `?? 0` default,
   // which would turn "I don't know" into "0 uncovered = healthy" (the default IS the bug). Finding
   // data is sanitized so a crafted/corrupt agent name cannot make this a multi-line briefing.
-  if (status.uncoveredCount > 0) {
-    const names = status.findings
-      .filter((f) => f.verdict === "uncovered")
-      .map((f) => sanitizeLine(String(f.agent)))
-      .join(", ");
-    return `[RELAY] *** wake-coverage: ${status.uncoveredCount} agent(s) UNCOVERED — mail is piling up unwoken: ${names}. A wake path is broken. ***`;
+  // DERIVE the coverage verdict from the FINDINGS — the authoritative evidence — NOT the redundant
+  // stored uncoveredCount (codex P1 r2). A fresh, versioned, schema-valid record whose count says 0
+  // while its findings list an uncovered agent must NOT read OK: trust the evidence, never the
+  // denormalized field, which can disagree with the very findings it claims to summarize.
+  const uncovered = status.findings.filter((f) => f.verdict === "uncovered");
+  if (uncovered.length > 0) {
+    const names = uncovered.map((f) => sanitizeLine(String(f.agent))).join(", ");
+    return `[RELAY] *** wake-coverage: ${uncovered.length} agent(s) UNCOVERED — mail is piling up unwoken: ${names}. A wake path is broken. ***`;
   }
   // ALWAYS emit OK (a sink that speaks only on failure is indistinguishable from a dead sink),
   // and CARRY THE AGE so a drifting age exposes a stopped-but-still-"OK" sweep (victra Q1).

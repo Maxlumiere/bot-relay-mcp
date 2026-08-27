@@ -188,4 +188,41 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
     );
     expect(line.split("\n"), "the [RELAY] briefing must be exactly one line").toHaveLength(1);
   });
+
+  // ---- codex P1 round 2: the count/findings INVARIANT — trust the EVIDENCE, not the redundant field ----
+  it("inconsistent record (uncoveredCount:0 but a finding says 'uncovered') → UNCOVERED, never OK", () => {
+    // The worst failure: a fresh, versioned, schema-valid record whose denormalized count disagrees
+    // with its own findings. The decision must derive from the findings (the evidence), so this reads
+    // UNCOVERED and names the agent — it must NEVER read OK.
+    const line = formatWakeCoverageStatusLine(
+      asStatus(healthy({ uncoveredCount: 0, findings: [{ agent: "actually-uncovered", verdict: "uncovered" }] })),
+      NOW + 60_000,
+      STALE_AFTER,
+    );
+    expect(line, "a versioned sink must not say OK while its own findings say uncovered").toMatch(/UNCOVERED/);
+    expect(line).toMatch(/actually-uncovered/);
+    expect(line).not.toMatch(/wake-coverage: OK/);
+  });
+
+  it("unknown verdict → UNKNOWN (only known verdicts are valid)", () => {
+    expect(
+      formatWakeCoverageStatusLine(
+        asStatus(healthy({ uncoveredCount: 1, findings: [{ agent: "x", verdict: "definitely-not-a-verdict" }] })),
+        NOW + 60_000,
+        STALE_AFTER,
+      ),
+    ).toMatch(/UNKNOWN/);
+  });
+
+  it("non-integer uncoveredCount → UNKNOWN", () => {
+    expect(
+      formatWakeCoverageStatusLine(asStatus(healthy({ uncoveredCount: 1.5 })), NOW + 60_000, STALE_AFTER),
+    ).toMatch(/UNKNOWN/);
+  });
+
+  it("negative uncoveredCount → UNKNOWN", () => {
+    expect(
+      formatWakeCoverageStatusLine(asStatus(healthy({ uncoveredCount: -1 })), NOW + 60_000, STALE_AFTER),
+    ).toMatch(/UNKNOWN/);
+  });
 });
