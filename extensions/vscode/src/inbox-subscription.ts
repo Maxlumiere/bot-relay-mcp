@@ -20,6 +20,7 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { decideWake, type WakeInboxView } from "./catch-up-wake.js";
 import { routeWake, type ObservedAgentState } from "./wake-routing.js";
+import type { WakeDecisionRecord } from "./wake-decline-log.js";
 
 /** What the router needs to observe at decision time (ADR-0010). Supplied by
  *  the caller per consideration — the gate stays pure of VSCode + MCP. */
@@ -93,7 +94,14 @@ export class WakeGate {
 
   constructor(
     private readonly onWake: (agentName: string) => void,
-    private readonly opts: { outstandingTtlMs?: number; now?: () => number } = {},
+    private readonly opts: {
+      outstandingTtlMs?: number;
+      now?: () => number;
+      /** ADR-0026/M3 sink: called for EVERY routing decision with its inputs (see
+       *  wake-decline-log.ts). Optional — absent in tests/older callers = no recording. The
+       *  gate stays pure of fs; the caller owns the durable write. */
+      recordDecision?: (record: WakeDecisionRecord) => void;
+    } = {},
   ) {}
 
   /**
@@ -198,6 +206,30 @@ export class WakeGate {
       busyCoveredByHook: observed.busyCoveredByHook,
       outstanding: this.outstandingSince !== null,
     });
+    // ADR-0026/M3: record the decision + its INPUTS to the durable sink BEFORE acting on it, so a
+    // decline (or an inject) is observable with the premises that produced it — a reader can then
+    // FALSIFY the routing, not just replay it. `state` is the full idle/busy/unknown (never a
+    // boolean): a decline on state="unknown" is its own bucket (an undecidable-predicate wake).
+    // Best-effort + isolated: a sink failure must never disturb the wake path it observes.
+    if (this.opts.recordDecision) {
+      try {
+        this.opts.recordDecision({
+          kind: "decision",
+          v: 1,
+          agentName,
+          decided_at: new Date(now()).toISOString(),
+          action: route.action,
+          reason: route.reason,
+          last_message_at: snapshot.last_message_at,
+          pending_count: snapshot.pending_count,
+          state: observed.state,
+          busyCoveredByHook: observed.busyCoveredByHook,
+          injectionOutstanding: this.outstandingSince !== null,
+        });
+      } catch {
+        /* sink failure must not disturb routing */
+      }
+    }
     // Suppression never advances the watermark — it means "newest message we
     // WOKE for", and we didn't. The poll-tick re-route picks it up later.
     if (route.action === "suppress") return false;

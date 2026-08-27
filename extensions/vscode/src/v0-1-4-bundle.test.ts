@@ -155,7 +155,9 @@ describe("v0.1.4 — bundle correctness", () => {
     // state-routed wake decision) — imported by inbox-subscription.ts, where
     // routeWake gates each wake, so it is a genuine bundle input. #3 (2026-07)
     // added no-delivery-warn.ts (the human-facing throttle for the
-    // undelivered-mail surface), imported by extension.ts's hintNoWake.
+    // undelivered-mail surface), imported by extension.ts's hintNoWake. ADR-0026/M3
+    // added wake-decline-log.ts (the wake-decision observability sink), imported by
+    // extension.ts's activate() (activation record + the per-WakeGate recordDecision sink).
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/catch-up-wake.ts",
@@ -175,6 +177,7 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/terminal-targeting.ts",
       "src/transport-diagnostics.ts",
       "src/vault-path.ts",
+      "src/wake-decline-log.ts",
       "src/wake-routing.ts",
     ]);
   });

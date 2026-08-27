@@ -42,6 +42,12 @@ import {
 import { readVaultToken } from "./vault-path.js";
 import { wireTransportDiagnostics } from "./transport-diagnostics.js";
 import { WakeGate, subscribeInboxes, type WakeObservation } from "./inbox-subscription.js";
+import {
+  appendWakeLogRecord,
+  writeActivationRecord,
+  defaultWakeLogPath,
+  type WakeDecisionRecord,
+} from "./wake-decline-log.js";
 import { parseAgentNames, applyAgentSwitch } from "./switch-agent.js";
 import {
   AgentManager,
@@ -317,18 +323,22 @@ const outstandingWakeTerminals = new Map<string, vscode.Terminal>();
 // ITS injection is still the current one — terminal identity can't tell two
 // successive injects into the same terminal apart; a counter can.
 const injectionEpoch = new Map<string, number>();
+// ADR-0026/M3 — the wake-decision observability sink, set at activate() to append every gate
+// decision (with its inputs) to a durable NDJSON log under the extension's global storage. The
+// gate stays pure of fs; this is the caller-owned durable write. undefined until activate().
+let wakeDecisionSink: ((record: WakeDecisionRecord) => void) | undefined;
 function getWakeGate(agentName: string): WakeGate {
   let g = wakeGates.get(agentName);
   if (!g) {
     const ttl = vscode.workspace
       .getConfiguration("bot-relay")
       .get<number>("tether.wakeOutstandingTtlMs");
-    g = new WakeGate(
-      (name) => {
-        void injectInboxKeystroke(name);
-      },
-      typeof ttl === "number" && ttl > 0 ? { outstandingTtlMs: ttl } : {},
-    );
+    const opts: { outstandingTtlMs?: number; recordDecision?: (r: WakeDecisionRecord) => void } = {};
+    if (typeof ttl === "number" && ttl > 0) opts.outstandingTtlMs = ttl;
+    if (wakeDecisionSink) opts.recordDecision = wakeDecisionSink;
+    g = new WakeGate((name) => {
+      void injectInboxKeystroke(name);
+    }, opts);
     wakeGates.set(agentName, g);
   }
   return g;
@@ -1421,6 +1431,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBarItem.text = "Tether: starting...";
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
+
+  // ADR-0026/M3 — wake-decision observability sink. Write the ACTIVATION record FIRST so presence
+  // is the norm: a MISSING log then means the sink itself is broken, not "no declines yet". Then arm
+  // the per-decision sink every WakeGate appends to (a separate fs write, independent of the wake
+  // path it observes). Best-effort throughout — a log failure, OR an unavailable global-storage dir,
+  // must never break activation, so the storage-path resolution is GUARDED (an undefined fsPath in a
+  // degraded host would otherwise throw before the try/catch). Sink stays undefined if unavailable.
+  const wakeStorageDir = context.globalStorageUri?.fsPath;
+  if (typeof wakeStorageDir === "string" && wakeStorageDir.length > 0) {
+    const wakeLogPath = defaultWakeLogPath(wakeStorageDir);
+    try {
+      writeActivationRecord(wakeLogPath, Date.now());
+    } catch (e) {
+      log(`wake-decision-log: activation record write failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+    }
+    wakeDecisionSink = (record) => {
+      try {
+        appendWakeLogRecord(wakeLogPath, record);
+      } catch {
+        /* best-effort — a sink failure must not disturb the wake path */
+      }
+    };
+  }
 
   // v0.2 — AgentManager. Constructed at activation so the
   // onDidChange listener wires up before any Spawn Agent command
