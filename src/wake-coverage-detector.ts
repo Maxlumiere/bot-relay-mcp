@@ -134,6 +134,18 @@
 import type { CompatDatabase } from "./sqlite-compat.js";
 import { pendingGlobalClause } from "./db.js";
 import { log } from "./logger.js";
+// ADR-0026 item 1 — the durable status sink's pure I/O + staleness-enforcing reader live in a
+// db-free module (wake-coverage-status.ts) so the SessionStart hook can import them WITHOUT
+// pulling this file's native-sqlite graph (db.js) in. This file remains the single WRITER
+// (runWakeCoverageSweep) and re-exports the rest so existing importers are unchanged.
+import { writeWakeCoverageStatus, resolveWakeCoverageStatusPath } from "./wake-coverage-status.js";
+export {
+  defaultWakeCoverageStatusPath,
+  readWakeCoverageStatus,
+  formatWakeCoverageStatusLine,
+} from "./wake-coverage-status.js";
+export { writeWakeCoverageStatus, resolveWakeCoverageStatusPath };
+export type { WakeCoverageStatus } from "./wake-coverage-status.js";
 
 export type WakeVerdict = "covered" | "uncovered" | "unobservable";
 
@@ -158,6 +170,12 @@ export interface WakeCoverageFinding {
 export interface WakeCoverageOptions {
   /** Evaluation "now" in epoch ms. Injected for testability. */
   readonly nowMs: number;
+  /**
+   * ADR-0026 item 1 — where the DURABLE status sink is written. Default:
+   * resolveWakeCoverageStatusPath() (~/.bot-relay/wake-coverage-status.json).
+   * Injected in tests so the fail-independent sink can be asserted.
+   */
+  readonly statusPath?: string;
   /** Age past which pending-global mail is "stuck." Default 24h. */
   readonly boundMs: number;
   /**
@@ -305,7 +323,20 @@ export function runWakeCoverageSweep(
   opts: WakeCoverageOptions,
 ): WakeCoverageFinding[] {
   const findings = classifyWakeCoverage(db, opts);
-  for (const line of formatWakeCoverageFindings(findings)) log.warn(line);
+  for (const line of formatWakeCoverageFindings(findings)) log.warn(line); // stderr TRACE — never the sink
+  // ADR-0026 item 1: the DURABLE sink. Independent of the stderr trace above (silence-the-sink
+  // test proves it) and of the wake path it watches. Non-fatal on FS error — a lost status write
+  // must not take down the daemon, but it degrades to trace-only, which the reader reports as stale.
+  try {
+    writeWakeCoverageStatus(opts.statusPath ?? resolveWakeCoverageStatusPath(), {
+      generatedAt: new Date(opts.nowMs).toISOString(),
+      thresholdMs: opts.boundMs + opts.antiFlapMarginMs,
+      uncoveredCount: findings.filter((f) => f.verdict === "uncovered").length,
+      findings,
+    });
+  } catch (err) {
+    log.warn("[wake-coverage] status-file write failed (non-fatal, degraded to trace-only): " + String(err));
+  }
   return findings;
 }
 
