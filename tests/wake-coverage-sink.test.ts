@@ -100,7 +100,7 @@ type StatusArg = Parameters<typeof formatWakeCoverageStatusLine>[0];
 
 describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-enforcing reader", () => {
   it("GUARD (make-impossible, not a convention): writing the DEFAULT live path from a test harness HARD-ERRORS", () => {
-    const status = { v: 1, generatedAt: new Date(NOW).toISOString(), thresholdMs: 1, uncoveredCount: 0, findings: [] };
+    const status = { v: 1, generatedAt: new Date(NOW).toISOString(), thresholdMs: 1, findings: [] };
     // This is the structural stop for the mistake that poisoned the live sink — a convention you
     // must remember is a bug (victra). Under vitest, the default path is refused, loudly.
     expect(() => writeWakeCoverageStatus(defaultWakeCoverageStatusPath(), status as StatusArg as never)).toThrow(
@@ -113,7 +113,6 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
       v: 1,
       generatedAt: "2026-08-12T00:00:00.000Z",
       thresholdMs: 172_800_000,
-      uncoveredCount: 1,
       findings: [{ agent: "regressed", verdict: "uncovered" }],
     };
     const nowLater = Date.parse("2026-08-27T00:00:00.000Z"); // 15 days after generatedAt
@@ -127,7 +126,6 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
       v: 1,
       generatedAt: new Date(NOW).toISOString(),
       thresholdMs: 172_800_000,
-      uncoveredCount: 1,
       findings: [{ agent: "realagent", verdict: "uncovered" }],
     };
     const line = formatWakeCoverageStatusLine(fresh as StatusArg, NOW + 60_000, 3 * HOUR); // 1 min old = fresh
@@ -144,7 +142,6 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
       v: 1,
       generatedAt: new Date(NOW).toISOString(),
       thresholdMs: 172_800_000,
-      uncoveredCount: 0,
       findings: [],
     };
     const line = formatWakeCoverageStatusLine(fresh as StatusArg, NOW + 2 * 60 * 1000, 3 * HOUR); // 2 min old

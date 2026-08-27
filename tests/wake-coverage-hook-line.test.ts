@@ -122,7 +122,6 @@ describe("ADR-0026 item 1 — check-relay.sh emits the wake-coverage briefing li
     writeStatus({
       generatedAt: isoAgo(2 * 60 * 1000), // 2 min old = fresh
       thresholdMs: 48 * HOUR,
-      uncoveredCount: 1,
       findings: [{ agent: "regressed", verdict: "uncovered" }],
     });
     const { stdout } = runHook();
@@ -142,7 +141,6 @@ describe("ADR-0026 item 1 — check-relay.sh emits the wake-coverage briefing li
     writeStatus({
       generatedAt: isoAgo(15 * 24 * HOUR), // 15 days old
       thresholdMs: 48 * HOUR,
-      uncoveredCount: 1,
       findings: [{ agent: "stale-ghost", verdict: "uncovered" }],
     });
     const { stdout } = runHook();
@@ -162,7 +160,6 @@ describe("ADR-0026 item 1 — check-relay.sh emits the wake-coverage briefing li
     writeStatus({
       generatedAt: isoAgo(2 * 60 * 1000),
       thresholdMs: 48 * HOUR,
-      uncoveredCount: 0,
       findings: [],
     });
     const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-fakenode-wc-"));

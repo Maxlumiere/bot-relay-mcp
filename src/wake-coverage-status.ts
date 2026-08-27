@@ -48,7 +48,13 @@ export interface WakeCoverageStatus {
   readonly generatedAt: string;
   /** Effective fire threshold (boundMs + antiFlapMarginMs) the findings were judged against. */
   readonly thresholdMs: number;
-  readonly uncoveredCount: number;
+  /**
+   * The findings ARE the coverage state; there is deliberately NO stored uncovered COUNT. A count
+   * would be a summary of `findings`, and two fields that must agree are a bug waiting for a third
+   * writer to forget the invariant (codex found exactly that: count:0 while a finding said
+   * uncovered). The count is DERIVED at read time from `findings`, so the inconsistent state cannot
+   * be represented — an illegal state that cannot exist beats one that is checked for.
+   */
   readonly findings: readonly WakeCoverageFinding[];
 }
 
@@ -81,6 +87,11 @@ export function writeWakeCoverageStatus(statusPath: string, status: WakeCoverage
  *  "not uncovered". Keep in sync if WakeVerdict grows. */
 const KNOWN_VERDICTS = new Set(["covered", "uncovered", "unobservable"]);
 
+/** The EXACT top-level keys a v:1 record may carry. A CLOSED schema: any other key (a legacy
+ *  uncoveredCount, a typo, injected data) makes the record UNKNOWN rather than silently accepted —
+ *  a reader must never discard a field a writer populated with meaning. */
+const ALLOWED_TOP_KEYS = new Set(["v", "generatedAt", "thresholdMs", "findings"]);
+
 /**
  * Runtime schema guard — the ONE gate shared by the reader and the formatter so the two cannot
  * drift. A valid record is an object with the EXACT field types AND schema version v===1. A
@@ -93,11 +104,17 @@ export function isValidWakeCoverageStatus(x: unknown): x is WakeCoverageStatus {
   if (typeof x !== "object" || x === null) return false;
   const s = x as Record<string, unknown>;
   return (
+    // CLOSED schema for v:1 — EXACTLY these keys. A stray field (notably a legacy uncoveredCount) is
+    // REJECTED, never silently ignored: a reader that discards a field a writer populated with meaning
+    // is precisely how the count/findings mismatch hid (both directions). Extra data => UNKNOWN.
+    Object.keys(s).every((k) => ALLOWED_TOP_KEYS.has(k)) &&
     s.v === 1 &&
     typeof s.generatedAt === "string" &&
-    typeof s.thresholdMs === "number" &&
-    Number.isInteger(s.uncoveredCount) &&
-    (s.uncoveredCount as number) >= 0 &&
+    // thresholdMs is the only surviving numeric field — a finite non-negative integer (rejects
+    // NaN/Infinity/float/negative). There is NO uncoveredCount: the count is DERIVED from findings at
+    // read time, never stored, so the count/findings inconsistency cannot be represented at all.
+    Number.isInteger(s.thresholdMs) &&
+    (s.thresholdMs as number) >= 0 &&
     Array.isArray(s.findings) &&
     s.findings.every((f) => {
       if (typeof f !== "object" || f === null) return false;

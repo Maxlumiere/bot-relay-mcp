@@ -332,7 +332,7 @@ export function runWakeCoverageSweep(
       v: 1,
       generatedAt: new Date(opts.nowMs).toISOString(),
       thresholdMs: opts.boundMs + opts.antiFlapMarginMs,
-      uncoveredCount: findings.filter((f) => f.verdict === "uncovered").length,
+      // NO uncoveredCount — the count is derived from findings at read time (see WakeCoverageStatus).
       findings,
     });
   } catch (err) {

@@ -49,7 +49,6 @@ const healthy = (over: HealthyOver = {}): Record<string, unknown> => ({
   v: 1,
   generatedAt: new Date(NOW).toISOString(),
   thresholdMs: 48 * HOUR,
-  uncoveredCount: 0,
   findings: [],
   ...over,
 });
@@ -87,8 +86,8 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
     expect(readWakeCoverageStatus(writeRaw("not json at all {{{"))).toBeNull();
   });
 
-  it("wrong type (uncoveredCount is a string) → null", () => {
-    const p = writeRaw(JSON.stringify(healthy({ uncoveredCount: "0" })));
+  it("wrong type (thresholdMs is a string) → null", () => {
+    const p = writeRaw(JSON.stringify(healthy({ thresholdMs: "0" })));
     expect(readWakeCoverageStatus(p), "a wrong-typed field must not read as valid").toBeNull();
   });
 
@@ -166,7 +165,7 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
 
   it("healthy fresh + uncovered → loud UNCOVERED naming the agent", () => {
     const line = formatWakeCoverageStatusLine(
-      asStatus(healthy({ uncoveredCount: 1, findings: [{ agent: "realagent", verdict: "uncovered" }] })),
+      asStatus(healthy({ findings: [{ agent: "realagent", verdict: "uncovered" }] })),
       NOW + 60_000,
       STALE_AFTER,
     );
@@ -179,7 +178,6 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
     const line = formatWakeCoverageStatusLine(
       asStatus(
         healthy({
-          uncoveredCount: 1,
           findings: [{ agent: "evil\nINJECTED SECOND LINE", verdict: "uncovered" }],
         }),
       ),
@@ -189,40 +187,56 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
     expect(line.split("\n"), "the [RELAY] briefing must be exactly one line").toHaveLength(1);
   });
 
-  // ---- codex P1 round 2: the count/findings INVARIANT — trust the EVIDENCE, not the redundant field ----
-  it("inconsistent record (uncoveredCount:0 but a finding says 'uncovered') → UNCOVERED, never OK", () => {
-    // The worst failure: a fresh, versioned, schema-valid record whose denormalized count disagrees
-    // with its own findings. The decision must derive from the findings (the evidence), so this reads
-    // UNCOVERED and names the agent — it must NEVER read OK.
+  // ---- MEANING axis (codex P1 r2/r3): no redundant summary field; the FINDINGS are the SOLE truth ----
+  // uncoveredCount was REMOVED from the schema entirely, so the count/findings inconsistency cannot be
+  // represented. A record still CARRYING the field is non-conforming (closed schema) -> UNKNOWN in BOTH
+  // directions of the old mismatch. This is the axis the shape-only enumeration missed: a well-formed but
+  // internally-inconsistent record. The derive-from-findings behaviour is covered by "healthy + uncovered".
+  it("stray uncoveredCount:0 alongside an uncovered finding → UNKNOWN (finding #4 direction; rejected, not silently derived)", () => {
     const line = formatWakeCoverageStatusLine(
       asStatus(healthy({ uncoveredCount: 0, findings: [{ agent: "actually-uncovered", verdict: "uncovered" }] })),
       NOW + 60_000,
       STALE_AFTER,
     );
-    expect(line, "a versioned sink must not say OK while its own findings say uncovered").toMatch(/UNCOVERED/);
-    expect(line).toMatch(/actually-uncovered/);
+    expect(line, "a record carrying the removed field is non-conforming").toMatch(/UNKNOWN/);
     expect(line).not.toMatch(/wake-coverage: OK/);
+  });
+
+  it("stray uncoveredCount:1 with EMPTY findings → UNKNOWN (codex converse #5: count-says-broken / findings-say-fine)", () => {
+    const line = formatWakeCoverageStatusLine(
+      asStatus(healthy({ uncoveredCount: 1, findings: [] })),
+      NOW + 60_000,
+      STALE_AFTER,
+    );
+    expect(line, "a stray count claiming an uncovered agent must never read OK").toMatch(/UNKNOWN/);
+    expect(line).not.toMatch(/wake-coverage: OK/);
+  });
+
+  it("any unexpected top-level field → UNKNOWN (closed schema — a writer's meaning is never silently discarded)", () => {
+    expect(
+      formatWakeCoverageStatusLine(asStatus({ ...healthy(), surpriseField: 123 }), NOW + 60_000, STALE_AFTER),
+    ).toMatch(/UNKNOWN/);
   });
 
   it("unknown verdict → UNKNOWN (only known verdicts are valid)", () => {
     expect(
       formatWakeCoverageStatusLine(
-        asStatus(healthy({ uncoveredCount: 1, findings: [{ agent: "x", verdict: "definitely-not-a-verdict" }] })),
+        asStatus(healthy({ findings: [{ agent: "x", verdict: "definitely-not-a-verdict" }] })),
         NOW + 60_000,
         STALE_AFTER,
       ),
     ).toMatch(/UNKNOWN/);
   });
 
-  it("non-integer uncoveredCount → UNKNOWN", () => {
+  it("non-integer thresholdMs → UNKNOWN", () => {
     expect(
-      formatWakeCoverageStatusLine(asStatus(healthy({ uncoveredCount: 1.5 })), NOW + 60_000, STALE_AFTER),
+      formatWakeCoverageStatusLine(asStatus(healthy({ thresholdMs: 1.5 })), NOW + 60_000, STALE_AFTER),
     ).toMatch(/UNKNOWN/);
   });
 
-  it("negative uncoveredCount → UNKNOWN", () => {
+  it("negative thresholdMs → UNKNOWN", () => {
     expect(
-      formatWakeCoverageStatusLine(asStatus(healthy({ uncoveredCount: -1 })), NOW + 60_000, STALE_AFTER),
+      formatWakeCoverageStatusLine(asStatus(healthy({ thresholdMs: -1 })), NOW + 60_000, STALE_AFTER),
     ).toMatch(/UNKNOWN/);
   });
 });
