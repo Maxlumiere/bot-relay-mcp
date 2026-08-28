@@ -23,6 +23,7 @@ import {
   writeActivationRecord,
   readWakeLog,
   defaultWakeLogPath,
+  makeDroppingDecisionSink,
   type WakeDecisionRecord,
 } from "./wake-decline-log.js";
 
@@ -49,6 +50,7 @@ describe("M3 — WakeGate.consider() records every decision with its INPUTS", ()
     expect(r.kind).toBe("decision");
     expect(r.v).toBe(1); // versioned from record one (lesson 4)
     expect(r.action).toBe("suppress");
+    expect(r.woke, "suppressed => no wake fired (actual outcome)").toBe(false);
     expect(r.reason).toMatch(/hook-covered/);
     expect(r.agentName).toBe("builder-1");
     expect(r.pending_count).toBe(3);
@@ -85,6 +87,7 @@ describe("M3 — WakeGate.consider() records every decision with its INPUTS", ()
     gate.consider(view(1, "2026-08-27T11:00:00.000Z"), "b4", true, { state: "idle", busyCoveredByHook: false });
     expect(records).toHaveLength(1);
     expect(records[0].action).toBe("inject");
+    expect(records[0].woke, "autoInject on + fresh mail + idle => actually woke").toBe(true);
     expect(records[0].state).toBe("idle");
   });
 
@@ -101,6 +104,22 @@ describe("M3 — WakeGate.consider() records every decision with its INPUTS", ()
     expect(reasons.some((r) => /hook-covered/.test(r)), "busy+hook-covered captured").toBe(true);
     expect(reasons.some((r) => /Tether owns this wake/.test(r)), "inject captured").toBe(true);
     expect(reasons.some((r) => /already outstanding/.test(r)), "injection-outstanding captured").toBe(true);
+  });
+
+  it("P2: records the ACTUAL outcome, not just the proposal — autoInjectInbox=false (the DEFAULT) => action:'inject' but woke:false", () => {
+    // routeWake PROPOSES inject (pending + idle + no outstanding); decideWake DISPOSES: shouldWake is
+    // false when autoInjectInbox is off. The record must show the GAP (proposed inject, no wake fired),
+    // never claim a delivery that did not happen — that would invert the very defect M3 measures.
+    const records: WakeDecisionRecord[] = [];
+    const gate = new WakeGate(() => {}, { recordDecision: (r) => records.push(r), now: () => 1000 });
+    const woke = gate.consider(view(2, "2026-08-27T11:00:00.000Z"), "a", false /* autoInjectInbox OFF */, {
+      state: "idle",
+      busyCoveredByHook: false,
+    });
+    expect(woke, "no wake actually fired (autoInject off)").toBe(false);
+    expect(records).toHaveLength(1);
+    expect(records[0].action, "routeWake PROPOSED inject").toBe("inject");
+    expect(records[0].woke, "but decideWake refused — the gap is the finding").toBe(false);
   });
 });
 
@@ -123,6 +142,7 @@ describe("M3 — wake-decision-log sink (durable NDJSON, fail-independent of the
       decided_at: "2026-08-27T12:00:00.000Z",
       action: "suppress",
       reason: "busy + hook-covered — PostToolUse owns delivery",
+      woke: false,
       last_message_at: "2026-08-27T11:00:00.000Z",
       pending_count: 5,
       state: "busy",
@@ -137,6 +157,30 @@ describe("M3 — wake-decision-log sink (durable NDJSON, fail-independent of the
     expect(back[1]).toMatchObject({ action: "inject", state: "idle" });
   });
 
+  it("P1b: a FAILING append does not vanish — the loss is stamped (droppedSince) into the next record that writes", () => {
+    const written: WakeDecisionRecord[] = [];
+    let failNext = false;
+    const append = (r: WakeDecisionRecord): void => {
+      if (failNext) throw new Error("EACCES (simulated)");
+      written.push(r);
+    };
+    const sink = makeDroppingDecisionSink(append);
+    const base = (id: string): WakeDecisionRecord => ({
+      kind: "decision", v: 1, agentName: id, decided_at: "t", action: "suppress", reason: "r",
+      woke: false, last_message_at: null, pending_count: 0, state: "idle",
+      busyCoveredByHook: false, injectionOutstanding: false,
+    });
+    sink(base("ok1")); // writes
+    failNext = true;
+    sink(base("lost1")); // fails at the fs layer — but the loss is NOT silent
+    sink(base("lost2")); // fails again
+    failNext = false;
+    sink(base("ok2")); // writes, and STAMPS the two prior losses so a reader can see them
+    expect(written.map((r) => r.agentName)).toEqual(["ok1", "ok2"]);
+    expect(written[0].droppedSince, "no loss before the first record").toBeUndefined();
+    expect(written[1].droppedSince, "two lost records survive into the artifact").toBe(2);
+  });
+
   it("activation record is written at activation — presence is the norm so absence is a signal", () => {
     writeActivationRecord(file, Date.parse("2026-08-27T09:00:00.000Z"));
     const back = readWakeLog(file);
@@ -148,19 +192,23 @@ describe("M3 — wake-decision-log sink (durable NDJSON, fail-independent of the
     expect(readWakeLog(path.join(dir, "nope.ndjson"))).toEqual([]);
   });
 
-  it("readWakeLog SKIPS unversioned / wrong-version / bad-state / torn records — never coerces them (missing version = UNKNOWN, not v1)", () => {
+  it("readWakeLog SKIPS unversioned / wrong-version / bad-state / missing-woke / torn records — never coerces them", () => {
     const valid = JSON.stringify({ kind: "activation", at: "2026-08-27T09:00:00.000Z", v: 1 });
     const noVersion = JSON.stringify({
-      kind: "decision", agentName: "a", decided_at: "x", action: "suppress", reason: "r",
+      kind: "decision", agentName: "a", decided_at: "x", action: "suppress", reason: "r", woke: false,
       last_message_at: null, pending_count: 0, state: "idle", busyCoveredByHook: false, injectionOutstanding: false,
     }); // NO v — must NOT be assumed v1
     const wrongVersion = JSON.stringify({ kind: "activation", at: "x", v: 2 });
     const badState = JSON.stringify({
-      kind: "decision", v: 1, agentName: "a", decided_at: "x", action: "suppress", reason: "r",
+      kind: "decision", v: 1, agentName: "a", decided_at: "x", action: "suppress", reason: "r", woke: false,
       last_message_at: null, pending_count: 0, state: "sleepy", busyCoveredByHook: false, injectionOutstanding: false,
     }); // state outside the closed tri-state
+    const noWoke = JSON.stringify({
+      kind: "decision", v: 1, agentName: "a", decided_at: "x", action: "inject", reason: "r",
+      last_message_at: null, pending_count: 1, state: "idle", busyCoveredByHook: false, injectionOutstanding: false,
+    }); // NO woke — the ACTUAL-outcome field is required; a proposal-only record is incomplete (P2)
     const torn = '{"kind":"decision","v":1,"agentN';
-    fs.writeFileSync(file, [valid, noVersion, wrongVersion, badState, torn].join("\n") + "\n");
+    fs.writeFileSync(file, [valid, noVersion, wrongVersion, badState, noWoke, torn].join("\n") + "\n");
     const back = readWakeLog(file);
     expect(back, "only the valid v:1 record survives").toHaveLength(1);
     expect(back[0]).toMatchObject({ kind: "activation", v: 1 });

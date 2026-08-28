@@ -58,6 +58,11 @@ export interface WakeDecisionRecord {
    *  Recorded VERBATIM (not classified here) so a NEW reason added upstream is captured and VISIBLE
    *  in the log, never silently dropped into a benign bucket (derive-by-exclusion, lesson 2). */
   readonly reason: string;
+  /** The ACTUAL outcome: did a wake actually FIRE this consideration? routeWake PROPOSES (`action`);
+   *  decideWake DISPOSES. The GAP — action:"inject" while woke:false (e.g. autoInjectInbox off by
+   *  DEFAULT, or an already-woken watermark) — is itself a finding: a wake nobody else can see. So the
+   *  record carries BOTH the proposal and the outcome, never just what routeWake wanted. */
+  readonly woke: boolean;
   /** The WATERMARK: newest-message timestamp (MAX(created_at)); null when the inbox is empty. */
   readonly last_message_at: string | null;
   /** Pending (undrained) mail count — separates a benign "declined, 0 pending" from the defect
@@ -70,6 +75,11 @@ export interface WakeDecisionRecord {
   readonly busyCoveredByHook: boolean;
   /** Was a prior injection outstanding at decision time (a routing premise)? */
   readonly injectionOutstanding: boolean;
+  /** Present ONLY when records were LOST before this one (a sink write failed, e.g. EACCES). N
+   *  decisions vanished between the previous logged record and this one — so the FACT of loss
+   *  survives into the artifact even though the failed writes left nothing behind. A lossy log that
+   *  looks healthy is worse than no log; this is how a reader sees "I don't know", not "I checked". */
+  readonly droppedSince?: number;
 }
 
 /**
@@ -110,6 +120,30 @@ export function writeActivationRecord(filePath: string, atMs: number): void {
 }
 
 /**
+ * Wrap an `append` into a DROP-TRACKING decision sink. If a write fails (e.g. EACCES) the record is
+ * lost — but a lossy log that LOOKS healthy is worse than no log, so the FACT of loss must survive
+ * into the artifact: keep an in-memory lost-count and stamp `droppedSince: N` onto the next record
+ * that DOES write. A reader then sees the loss even though the failed writes left nothing behind. The
+ * append is NEVER allowed to throw out of here — a logging fault must not disturb the wake path (but
+ * unlike a bare swallow, the loss is not silent). If NOTHING can ever be written, that is the loud
+ * activation-unavailable case, handled at activate().
+ */
+export function makeDroppingDecisionSink(
+  append: (record: WakeDecisionRecord) => void,
+): (record: WakeDecisionRecord) => void {
+  let droppedSince = 0;
+  return (record) => {
+    const toWrite = droppedSince > 0 ? { ...record, droppedSince } : record;
+    try {
+      append(toWrite);
+      droppedSince = 0; // the loss count is now durable in the artifact
+    } catch {
+      droppedSince += 1; // this record was lost; the FACT survives in memory until the next write lands
+    }
+  };
+}
+
+/**
  * A record is valid only with a KNOWN kind and schema version v===1. A record with no version (or a
  * different version, or an unknown kind, or a wrong-typed field) is UNINTERPRETABLE — it is SKIPPED,
  * never coerced into a typed record it does not match (the #215 unchecked-`as` lesson, one layer
@@ -126,11 +160,13 @@ export function isValidWakeLogRecord(x: unknown): x is WakeLogRecord {
       typeof r.decided_at === "string" &&
       (r.action === "suppress" || r.action === "inject") &&
       typeof r.reason === "string" &&
+      typeof r.woke === "boolean" &&
       (r.last_message_at === null || typeof r.last_message_at === "string") &&
       typeof r.pending_count === "number" &&
       (r.state === "idle" || r.state === "busy" || r.state === "unknown") &&
       typeof r.busyCoveredByHook === "boolean" &&
-      typeof r.injectionOutstanding === "boolean"
+      typeof r.injectionOutstanding === "boolean" &&
+      (r.droppedSince === undefined || typeof r.droppedSince === "number")
     );
   }
   return false;

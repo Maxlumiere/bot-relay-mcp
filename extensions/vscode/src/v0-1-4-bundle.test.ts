@@ -276,7 +276,7 @@ describe("v0.1.4 — bundle correctness", () => {
   // Per codex's preference: automated idle-activation call instead of
   // "rename B7 honestly + manual smoke" (manual VSCode smoke is
   // DEFERRED-USER already).
-  it("(B8) bundled activate() reaches the idle path without throwing when no agentName is configured", async () => {
+  it("(B8) bundled activate() reaches idle without throwing AND emits a LOUD diagnostic when globalStorageUri.fsPath is unavailable", async () => {
     // Structured vscode mock — needs to satisfy real activate() shape:
     //   - window.createOutputChannel returning { appendLine, dispose, ... }
     //   - window.createStatusBarItem returning a mutable item with
@@ -471,6 +471,16 @@ describe("v0.1.4 — bundle correctness", () => {
       expect(registeredCommands).toContain("botRelayTether.restartAgent");
       // v0.2.3 — Switch Agent command must be registered by activate().
       expect(registeredCommands).toContain("botRelayTether.switchAgent");
+
+      // (B8 invariant 3, codex P1a) — this mock's globalStorageUri has NO fsPath, a DEGRADED state.
+      // It must be LOUD, not silent: the wake-decision-log emits a visible diagnostic through the
+      // surviving output channel so a missing log cannot be mistaken for "no declines" or "never
+      // activated". A quiet pass here would convert an open question into a FALSE assurance — the exact
+      // ambiguity the activation record exists to kill. (Activation still completes without throwing.)
+      expect(
+        outputLines.some((l) => /wake-decision-log: DEGRADED.*global storage/.test(l)),
+        `unavailable fsPath must emit a LOUD diagnostic; output lines: ${JSON.stringify(outputLines)}`,
+      ).toBe(true);
     } finally {
       restore();
       if (savedRelayAgentName !== undefined) {

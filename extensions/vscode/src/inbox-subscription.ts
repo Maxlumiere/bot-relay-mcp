@@ -200,17 +200,44 @@ export class WakeGate {
       const ttl = this.opts.outstandingTtlMs ?? DEFAULT_WAKE_OUTSTANDING_TTL_MS;
       if (now() - this.outstandingSince >= ttl) this.markLost();
     }
+    // Capture the routing PREMISE (was an injection outstanding?) BEFORE this decision can fire a wake
+    // and mutate it — so the routeWake input and the recorded premise reflect the same instant.
+    const injectionOutstandingAtDecision = this.outstandingSince !== null;
     const route = routeWake({
       pendingMail: snapshot.pending_count > 0,
       state: observed.state,
       busyCoveredByHook: observed.busyCoveredByHook,
-      outstanding: this.outstandingSince !== null,
+      outstanding: injectionOutstandingAtDecision,
     });
-    // ADR-0026/M3: record the decision + its INPUTS to the durable sink BEFORE acting on it, so a
-    // decline (or an inject) is observable with the premises that produced it — a reader can then
-    // FALSIFY the routing, not just replay it. `state` is the full idle/busy/unknown (never a
-    // boolean): a decline on state="unknown" is its own bucket (an undecidable-predicate wake).
-    // Best-effort + isolated: a sink failure must never disturb the wake path it observes.
+    // routeWake PROPOSES; decideWake DISPOSES. Run the FULL decision so we know the ACTUAL outcome:
+    // decideWake returns shouldWake:false whenever autoInjectInbox is off (the DEFAULT), so a proposed
+    // inject can end in NO wake. Suppression never advances the watermark ("newest message we WOKE
+    // for", and we didn't); the poll-tick re-route picks it up later.
+    let woke = false;
+    if (route.action !== "suppress") {
+      const decision = decideWake(snapshot, {
+        autoInjectInbox,
+        lastWokenAt: this.lastWokenAt,
+      });
+      // Hold the mark AS IT STANDS before this injection advances it, so LOSS EVIDENCE
+      // (clearOutstanding / TTL) can roll it back — a wake that never lands must not count as "woken
+      // for" (codex #126). In every decideWake no-wake branch newMark === lastWokenAt, so this
+      // assignment is a no-op there; it only advances on an actual wake.
+      const markBeforeThisWake = this.lastWokenAt;
+      this.lastWokenAt = decision.newMark;
+      if (decision.shouldWake) {
+        this.markBeforeOutstanding = markBeforeThisWake;
+        this.outstandingSince = now();
+        this.outstandingLanded = false; // scheduled, not yet landed — awaits the delivery ack
+        this.onWake(agentName);
+        woke = true;
+      }
+    }
+    // ADR-0026/M3: record AFTER the outcome is known — BOTH the router's PROPOSAL (action/reason) AND
+    // the ACTUAL outcome (woke). The gap (action:"inject" while woke:false — e.g. autoInjectInbox off
+    // by default) is a wake failure nobody else can see. `state` is the full idle/busy/unknown so a
+    // decline on "unknown" is its own bucket. Isolated + best-effort: a sink fault must not disturb the
+    // wake path — but the sink tracks its OWN losses (droppedSince), so this is not a silent swallow.
     if (this.opts.recordDecision) {
       try {
         this.opts.recordDecision({
@@ -220,38 +247,18 @@ export class WakeGate {
           decided_at: new Date(now()).toISOString(),
           action: route.action,
           reason: route.reason,
+          woke,
           last_message_at: snapshot.last_message_at,
           pending_count: snapshot.pending_count,
           state: observed.state,
           busyCoveredByHook: observed.busyCoveredByHook,
-          injectionOutstanding: this.outstandingSince !== null,
+          injectionOutstanding: injectionOutstandingAtDecision,
         });
       } catch {
-        /* sink failure must not disturb routing */
+        /* sink failure must not disturb routing (the sink records its own losses) */
       }
     }
-    // Suppression never advances the watermark — it means "newest message we
-    // WOKE for", and we didn't. The poll-tick re-route picks it up later.
-    if (route.action === "suppress") return false;
-    const decision = decideWake(snapshot, {
-      autoInjectInbox,
-      lastWokenAt: this.lastWokenAt,
-    });
-    // Hold the mark AS IT STANDS before this injection advances it, so LOSS
-    // EVIDENCE (clearOutstanding / TTL) can roll it back — a wake that never
-    // lands must not count as "woken for" (codex #126). In every decideWake
-    // no-wake branch newMark === lastWokenAt, so this assignment is a no-op
-    // there; it only advances on an actual wake.
-    const markBeforeThisWake = this.lastWokenAt;
-    this.lastWokenAt = decision.newMark;
-    if (decision.shouldWake) {
-      this.markBeforeOutstanding = markBeforeThisWake;
-      this.outstandingSince = now();
-      this.outstandingLanded = false; // scheduled, not yet landed — awaits the delivery ack
-      this.onWake(agentName);
-      return true;
-    }
-    return false;
+    return woke;
   }
 }
 

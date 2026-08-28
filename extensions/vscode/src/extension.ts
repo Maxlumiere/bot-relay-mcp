@@ -46,6 +46,7 @@ import {
   appendWakeLogRecord,
   writeActivationRecord,
   defaultWakeLogPath,
+  makeDroppingDecisionSink,
   type WakeDecisionRecord,
 } from "./wake-decline-log.js";
 import { parseAgentNames, applyAgentSwitch } from "./switch-agent.js";
@@ -1446,13 +1447,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     } catch (e) {
       log(`wake-decision-log: activation record write failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
     }
-    wakeDecisionSink = (record) => {
-      try {
-        appendWakeLogRecord(wakeLogPath, record);
-      } catch {
-        /* best-effort — a sink failure must not disturb the wake path */
-      }
-    };
+    // Drop-tracking sink (codex P1b): a failed append does NOT vanish silently — the loss is stamped
+    // into the next record that DOES write (droppedSince), so a lossy log cannot look healthy.
+    wakeDecisionSink = makeDroppingDecisionSink((record) => appendWakeLogRecord(wakeLogPath, record));
+  } else {
+    // LOUD (codex P1a): an unavailable global-storage dir is a DEGRADED state, not a normal one —
+    // declines will NOT be recorded this session. Say so through the surviving log channel so a
+    // missing log cannot be mistaken for "no declines" or "never activated". Activation still proceeds.
+    log(
+      "wake-decision-log: DEGRADED — global storage dir unavailable (no globalStorageUri.fsPath); " +
+        "wake declines will NOT be recorded this session.",
+    );
   }
 
   // v0.2 — AgentManager. Constructed at activation so the
