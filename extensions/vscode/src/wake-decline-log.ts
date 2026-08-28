@@ -119,26 +119,51 @@ export function writeActivationRecord(filePath: string, atMs: number): void {
   appendWakeLogRecord(filePath, { kind: "activation", at: new Date(atMs).toISOString(), v: 1 });
 }
 
+/** A sink degraded/recovered transition — reported through a channel INDEPENDENT of the failing log
+ *  artifact (the same output channel the P1a activation-unavailable diagnostic uses), so a PERSISTENT
+ *  write fault is observable even when nothing can be persisted. */
+export type WakeSinkReport = { kind: "degraded" } | { kind: "recovered"; dropped: number };
+
 /**
- * Wrap an `append` into a DROP-TRACKING decision sink. If a write fails (e.g. EACCES) the record is
- * lost — but a lossy log that LOOKS healthy is worse than no log, so the FACT of loss must survive
- * into the artifact: keep an in-memory lost-count and stamp `droppedSince: N` onto the next record
- * that DOES write. A reader then sees the loss even though the failed writes left nothing behind. The
- * append is NEVER allowed to throw out of here — a logging fault must not disturb the wake path (but
- * unlike a bare swallow, the loss is not silent). If NOTHING can ever be written, that is the loud
- * activation-unavailable case, handled at activate().
+ * Wrap an `append` into a DROP-TRACKING decision sink. A lossy log that LOOKS healthy is worse than no
+ * log, so loss is made visible TWO independent ways, for two DIFFERENT failure timings:
+ *  - TRANSIENT (a write fails, a later write lands): stamp `droppedSince: N` onto the record that DOES
+ *    write, so the loss survives INTO the artifact for an offline reader.
+ *  - PERSISTENT (storage was writable AT activate, then permanently fails — the WORSE case, because the
+ *    activation record already made the log look initialized/healthy while every later decline vanishes):
+ *    droppedSince would be trapped in this closure forever (no future success to carry it), so it emits
+ *    a `report` through a channel INDEPENDENT of the failing artifact — the same P1a doctrine, applied a
+ *    second time: the reporter must fail independently of the failure it reports. (This is DISTINCT from
+ *    storage-unavailable AT activate(), which the DEGRADED diagnostic at activate() handles.)
+ * Reported ON STATE TRANSITION only — once on healthy->degraded, once on recovery — never per-failure, or
+ * a persistent fault turns a signal into ignored noise. The append NEVER throws out of here; a logging
+ * fault must not disturb the wake path.
  */
 export function makeDroppingDecisionSink(
   append: (record: WakeDecisionRecord) => void,
+  report?: (event: WakeSinkReport) => void,
 ): (record: WakeDecisionRecord) => void {
   let droppedSince = 0;
+  let degraded = false;
   return (record) => {
     const toWrite = droppedSince > 0 ? { ...record, droppedSince } : record;
     try {
       append(toWrite);
+      if (degraded) {
+        // RECOVERY (degraded -> healthy): report ONCE with the total lost. The stamp above already put
+        // droppedSince into the record that landed, so the artifact carries it for the transient reader.
+        report?.({ kind: "recovered", dropped: droppedSince });
+        degraded = false;
+      }
       droppedSince = 0; // the loss count is now durable in the artifact
     } catch {
-      droppedSince += 1; // this record was lost; the FACT survives in memory until the next write lands
+      droppedSince += 1; // this record was lost
+      if (!degraded) {
+        // FIRST failure (healthy -> degraded): report ONCE via the INDEPENDENT channel so a PERSISTENT
+        // fault (no future success to carry droppedSince) is still observable. Later failures stay silent.
+        report?.({ kind: "degraded" });
+        degraded = true;
+      }
     }
   };
 }

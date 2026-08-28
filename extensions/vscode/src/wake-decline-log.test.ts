@@ -25,6 +25,7 @@ import {
   defaultWakeLogPath,
   makeDroppingDecisionSink,
   type WakeDecisionRecord,
+  type WakeSinkReport,
 } from "./wake-decline-log.js";
 
 const view = (pending_count: number, last_message_at: string | null): WakeInboxView => ({
@@ -179,6 +180,51 @@ describe("M3 — wake-decision-log sink (durable NDJSON, fail-independent of the
     expect(written.map((r) => r.agentName)).toEqual(["ok1", "ok2"]);
     expect(written[0].droppedSince, "no loss before the first record").toBeUndefined();
     expect(written[1].droppedSince, "two lost records survive into the artifact").toBe(2);
+  });
+
+  it("P1b PERSISTENT: a permanently-failing sink reports DEGRADED once through the INDEPENDENT channel — loss is observable with 0 records persisted", () => {
+    const written: WakeDecisionRecord[] = [];
+    const reports: WakeSinkReport[] = [];
+    const append = (_r: WakeDecisionRecord): void => {
+      throw new Error("EACCES (persistent)");
+    };
+    const sink = makeDroppingDecisionSink(append, (e) => reports.push(e));
+    const rec = (id: string): WakeDecisionRecord => ({
+      kind: "decision", v: 1, agentName: id, decided_at: "t", action: "suppress", reason: "r",
+      woke: false, last_message_at: null, pending_count: 0, state: "idle",
+      busyCoveredByHook: false, injectionOutstanding: false,
+    });
+    sink(rec("a"));
+    sink(rec("b"));
+    sink(rec("c")); // all fail persistently — droppedSince would be trapped in the closure forever
+    void written;
+    expect(written, "nothing can be persisted").toHaveLength(0);
+    expect(
+      reports.filter((e) => e.kind === "degraded"),
+      "a PERSISTENT fault must be reported via the independent channel even with 0 records written — and exactly ONCE",
+    ).toHaveLength(1);
+  });
+
+  it("P1b reports ON STATE TRANSITION only — once on healthy->degraded, once on recovery (carrying the total), never per-failure", () => {
+    const reports: WakeSinkReport[] = [];
+    let failNext = false;
+    const append = (_r: WakeDecisionRecord): void => {
+      if (failNext) throw new Error("EACCES");
+    };
+    const sink = makeDroppingDecisionSink(append, (e) => reports.push(e));
+    const rec = (id: string): WakeDecisionRecord => ({
+      kind: "decision", v: 1, agentName: id, decided_at: "t", action: "suppress", reason: "r",
+      woke: false, last_message_at: null, pending_count: 0, state: "idle",
+      busyCoveredByHook: false, injectionOutstanding: false,
+    });
+    sink(rec("ok")); // healthy, no report
+    failNext = true;
+    sink(rec("l1"));
+    sink(rec("l2"));
+    sink(rec("l3")); // 3 failures — DEGRADED reported ONCE, not three times
+    failNext = false;
+    sink(rec("ok2")); // recovery — RECOVERED reported ONCE, carrying the 3 losses
+    expect(reports).toEqual([{ kind: "degraded" }, { kind: "recovered", dropped: 3 }]);
   });
 
   it("activation record is written at activation — presence is the norm so absence is a signal", () => {

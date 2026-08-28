@@ -1447,9 +1447,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     } catch (e) {
       log(`wake-decision-log: activation record write failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
     }
-    // Drop-tracking sink (codex P1b): a failed append does NOT vanish silently — the loss is stamped
-    // into the next record that DOES write (droppedSince), so a lossy log cannot look healthy.
-    wakeDecisionSink = makeDroppingDecisionSink((record) => appendWakeLogRecord(wakeLogPath, record));
+    // Drop-tracking sink (codex P1b): a failed append does NOT vanish silently. Transient loss is
+    // stamped into the next record that writes (droppedSince); a PERSISTENT fault (writable at activate,
+    // then permanently failing) is reported via the SAME independent output channel P1a uses — so loss
+    // is observable even when nothing can be persisted, and the log cannot look healthy while losing.
+    wakeDecisionSink = makeDroppingDecisionSink(
+      (record) => appendWakeLogRecord(wakeLogPath, record),
+      (event) =>
+        log(
+          event.kind === "degraded"
+            ? "wake-decision-log: DEGRADED — a wake-decision write FAILED; declines are being LOST until it " +
+                "recovers (the log looks initialized but is losing records)."
+            : `wake-decision-log: recovered — resumed writing after ${event.dropped} lost decision(s).`,
+        ),
+    );
   } else {
     // LOUD (codex P1a): an unavailable global-storage dir is a DEGRADED state, not a normal one —
     // declines will NOT be recorded this session. Say so through the surviving log channel so a
