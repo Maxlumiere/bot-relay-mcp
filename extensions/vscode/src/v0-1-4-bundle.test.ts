@@ -155,7 +155,9 @@ describe("v0.1.4 — bundle correctness", () => {
     // state-routed wake decision) — imported by inbox-subscription.ts, where
     // routeWake gates each wake, so it is a genuine bundle input. #3 (2026-07)
     // added no-delivery-warn.ts (the human-facing throttle for the
-    // undelivered-mail surface), imported by extension.ts's hintNoWake.
+    // undelivered-mail surface), imported by extension.ts's hintNoWake. ADR-0026/M3
+    // added wake-decline-log.ts (the wake-decision observability sink), imported by
+    // extension.ts's activate() (activation record + the per-WakeGate recordDecision sink).
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/catch-up-wake.ts",
@@ -175,6 +177,7 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/terminal-targeting.ts",
       "src/transport-diagnostics.ts",
       "src/vault-path.ts",
+      "src/wake-decline-log.ts",
       "src/wake-routing.ts",
     ]);
   });
@@ -273,7 +276,7 @@ describe("v0.1.4 — bundle correctness", () => {
   // Per codex's preference: automated idle-activation call instead of
   // "rename B7 honestly + manual smoke" (manual VSCode smoke is
   // DEFERRED-USER already).
-  it("(B8) bundled activate() reaches the idle path without throwing when no agentName is configured", async () => {
+  it("(B8) bundled activate() reaches idle without throwing AND emits a LOUD diagnostic when globalStorageUri.fsPath is unavailable", async () => {
     // Structured vscode mock — needs to satisfy real activate() shape:
     //   - window.createOutputChannel returning { appendLine, dispose, ... }
     //   - window.createStatusBarItem returning a mutable item with
@@ -468,6 +471,16 @@ describe("v0.1.4 — bundle correctness", () => {
       expect(registeredCommands).toContain("botRelayTether.restartAgent");
       // v0.2.3 — Switch Agent command must be registered by activate().
       expect(registeredCommands).toContain("botRelayTether.switchAgent");
+
+      // (B8 invariant 3, codex P1a) — this mock's globalStorageUri has NO fsPath, a DEGRADED state.
+      // It must be LOUD, not silent: the wake-decision-log emits a visible diagnostic through the
+      // surviving output channel so a missing log cannot be mistaken for "no declines" or "never
+      // activated". A quiet pass here would convert an open question into a FALSE assurance — the exact
+      // ambiguity the activation record exists to kill. (Activation still completes without throwing.)
+      expect(
+        outputLines.some((l) => /wake-decision-log: DEGRADED.*global storage/.test(l)),
+        `unavailable fsPath must emit a LOUD diagnostic; output lines: ${JSON.stringify(outputLines)}`,
+      ).toBe(true);
     } finally {
       restore();
       if (savedRelayAgentName !== undefined) {
