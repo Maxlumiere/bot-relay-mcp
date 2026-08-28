@@ -145,24 +145,47 @@ export function makeDroppingDecisionSink(
 ): (record: WakeDecisionRecord) => void {
   let droppedSince = 0;
   let degraded = false;
+  // NON-THROWING BY CONSTRUCTION (codex r3): the reporter runs in its OWN swallowing try/catch, OUTSIDE
+  // the append boundary. Channel-independence (the reporter is a different sink from the NDJSON file) is
+  // NOT failure-accounting-independence: if a report throw shared the append's catch, a SUCCESSFULLY
+  // written record would be miscounted as dropped and `degraded` would never clear. So state + count
+  // derive from the APPEND outcome ONLY — the reporter's success has ZERO influence on them.
+  // This is where the "what does ITS failure look like?" recursion BOTTOMS OUT: a reporter that cannot
+  // report cannot report its OWN failure — genuinely terminal, so we make it unable to throw rather than
+  // watch it. Acceptable because the reporter is the outputChannel (already independent of the NDJSON
+  // storage) and it fails only if the extension host is going down, when nothing else is working either.
+  const safeReport = (event: WakeSinkReport): void => {
+    try {
+      report?.(event);
+    } catch {
+      /* the reporter's own failure is terminal + unobservable by construction */
+    }
+  };
   return (record) => {
     const toWrite = droppedSince > 0 ? { ...record, droppedSince } : record;
+    let appended = false;
     try {
       append(toWrite);
-      if (degraded) {
-        // RECOVERY (degraded -> healthy): report ONCE with the total lost. The stamp above already put
-        // droppedSince into the record that landed, so the artifact carries it for the transient reader.
-        report?.({ kind: "recovered", dropped: droppedSince });
-        degraded = false;
-      }
-      droppedSince = 0; // the loss count is now durable in the artifact
+      appended = true;
     } catch {
+      appended = false;
+    }
+    // STATE + COUNT derive from the APPEND outcome ONLY — never from whether the reporter succeeded.
+    if (appended) {
+      const wasDegraded = degraded;
+      const recoveredCount = droppedSince;
+      degraded = false;
+      droppedSince = 0; // the loss count is now durable in the artifact (stamped on toWrite above)
+      // RECOVERY (degraded -> healthy): report ONCE, AFTER state is already cleared, so a throwing
+      // reporter cannot revert it. A successfully-written record is NEVER marked dropped.
+      if (wasDegraded) safeReport({ kind: "recovered", dropped: recoveredCount });
+    } else {
       droppedSince += 1; // this record was lost
       if (!degraded) {
-        // FIRST failure (healthy -> degraded): report ONCE via the INDEPENDENT channel so a PERSISTENT
-        // fault (no future success to carry droppedSince) is still observable. Later failures stay silent.
-        report?.({ kind: "degraded" });
-        degraded = true;
+        degraded = true; // FIRST failure (healthy -> degraded)
+        // Report ONCE via the independent channel so a PERSISTENT fault is observable; later failures
+        // stay silent (a persistent fault is a signal, not per-decline noise).
+        safeReport({ kind: "degraded" });
       }
     }
   };

@@ -227,6 +227,38 @@ describe("M3 — wake-decision-log sink (durable NDJSON, fail-independent of the
     expect(reports).toEqual([{ kind: "degraded" }, { kind: "recovered", dropped: 3 }]);
   });
 
+  it("P1b report-throws: a SUCCESSFUL append whose reporter THROWS is NOT marked dropped, and degraded still clears (channel-independence is not failure-accounting-independence)", () => {
+    // codex r3: if report() shares the append's try/catch, a reporter throw AFTER a successful append
+    // falls into the catch — the written record is falsely counted as dropped and `degraded` never
+    // clears. State + count must derive from the APPEND outcome ONLY; the reporter cannot corrupt them.
+    const written: WakeDecisionRecord[] = [];
+    let appendFails = false;
+    const append = (r: WakeDecisionRecord): void => {
+      if (appendFails) throw new Error("EACCES");
+      written.push(r);
+    };
+    const report = (): never => {
+      throw new Error("reporter is down"); // the reporter ALWAYS throws
+    };
+    const sink = makeDroppingDecisionSink(append, report);
+    const rec = (id: string): WakeDecisionRecord => ({
+      kind: "decision", v: 1, agentName: id, decided_at: "t", action: "suppress", reason: "r",
+      woke: false, last_message_at: null, pending_count: 0, state: "idle",
+      busyCoveredByHook: false, injectionOutstanding: false,
+    });
+    appendFails = true;
+    sink(rec("lost1")); // append fails -> droppedSince=1, degraded (the degraded report throws, swallowed)
+    appendFails = false;
+    sink(rec("ok2")); // append SUCCEEDS but the recovery report THROWS -> must still count as recovered
+    sink(rec("ok3")); // append succeeds, healthy again -> must be CLEAN, not falsely droppedSince:2
+    expect(written.map((r) => r.agentName)).toEqual(["ok2", "ok3"]);
+    expect(written[0].droppedSince, "ok2: one real loss before it").toBe(1);
+    expect(
+      written[1].droppedSince,
+      "ok3: successfully written, NEVER marked dropped despite a throwing reporter — degraded cleared",
+    ).toBeUndefined();
+  });
+
   it("activation record is written at activation — presence is the norm so absence is a signal", () => {
     writeActivationRecord(file, Date.parse("2026-08-27T09:00:00.000Z"));
     const back = readWakeLog(file);
