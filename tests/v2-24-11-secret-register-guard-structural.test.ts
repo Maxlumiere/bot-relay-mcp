@@ -163,14 +163,17 @@ describe("v2.24.11 TRIGGER side — hardened too, with its boundary MEASURED and
 
 describe("v2.24.11 premise enforcement", () => {
   it("PREMISE: an unresolvable primitive is reported by name", async () => {
-    const ts = (await import("typescript")).default;
+    // PINNED PARSER (#212): typescript-legacy, matching the guard under test — not the
+    // bumpable `typescript`, which would parse with a different compiler once it bumps to 7.
+    const ts = (await import("typescript-legacy")).default;
     const src = `import { registerPersistedSecret } from "./nope.js";\n`;
     const sf = ts.createSourceFile(path.join(dir, "db.ts"), src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     expect(findUnresolvablePrimitives(sf, new Set(["registerPersistedSecret"]))).toEqual(["registerPersistedSecret"]);
   });
 
   it("PREMISE: a real one-hop import satisfies it", async () => {
-    const ts = (await import("typescript")).default;
+    // PINNED PARSER (#212): typescript-legacy, matching the guard under test.
+    const ts = (await import("typescript-legacy")).default;
     const sf = ts.createSourceFile(path.join(dir, "db.ts"), IMP, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     expect(findUnresolvablePrimitives(sf, new Set(["generateToken", "registerPersistedSecret"]))).toEqual([]);
   });

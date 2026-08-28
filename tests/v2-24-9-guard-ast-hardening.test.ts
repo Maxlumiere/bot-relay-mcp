@@ -27,7 +27,10 @@
  * is the SAFE direction (it flags, demanding the call be written plainly).
  */
 import { describe, it, expect } from "vitest";
-import ts from "typescript";
+// PINNED PARSER (#212): build SourceFiles with the SAME typescript-legacy the guard
+// under test parses with (scripts/lib/guard-ast.mjs -> guard-parse.mjs), NOT the
+// bumpable `typescript` — else this test diverges the moment `typescript` bumps to 7.
+import ts from "typescript-legacy";
 
 const { forEachFunctionUnit, bodyCallsFunction, findUnsatisfiedPrimitives } = await import("../scripts/lib/guard-ast.mjs");
 const { findAuthGenViolations } = await import("../scripts/auth-gen-guard.mjs");
