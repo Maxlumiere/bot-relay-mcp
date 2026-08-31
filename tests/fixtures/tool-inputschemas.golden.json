@@ -325,7 +325,7 @@
       "include_resolved": {
         "type": "boolean",
         "default": false,
-        "description": "false (default) = only still-outstanding (unresolved) ask/obligation messages YOU sent — the recap. true = the full sender view incl. resolved rows (unread/read-unresolved/resolved)."
+        "description": "false (default) = only still-outstanding (unresolved) ask/obligation messages YOU sent — the recap. true = the full sender view incl. resolved rows (undrained/drained-unresolved/resolved)."
       },
       "agent_token": {
         "type": "string",

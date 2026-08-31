@@ -200,7 +200,7 @@ describe("v2.4.4 — tool description quality", () => {
       get_channel_messages: "06592f4a9f58da0d111640ff64829ae49f3e388c00c9ffa9c9c7230b81f1c522",
       get_messages: "c4b0f7089f628fd388388e263100c031158ab4907adc9739a6329e41d190d749",
       get_messages_summary: "fc5408be92b67606153c829f0dac464afeb3c465f75dd4abb3d36a9e8884d2bf",
-      get_outstanding: "ab417813324bc5d419fb68cd0044cde9b0cc718205e281905454646a8941f727",
+      get_outstanding: "c8afb6aef443fd40b79a4d077b410023ff61f435192d8c3da3862e32b49a0dd5", // #inbox-read-at: state enum unread->undrained / read-unresolved->drained-unresolved (delivery-path, not read/seen)
       get_standup: "50fc69fcf51b6d21632b5e9be632f570c7cee8b1cbc18999a82d0a34dc2b1519",
       get_task: "de353b956b82f757829007fd6b9d7b7c7b89500dbf6b60681cf7080b574fce9b",
       get_tasks: "1e1416a86554d1e17346d3cc661453a4536768dfad4ef492ce60beb9aa597e7e",

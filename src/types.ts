@@ -263,7 +263,7 @@ export const SendMessageSchema = z.object({
 export const GetOutstandingSchema = z.object({
   agent_name: z.string().min(1).describe("Your agent name — the SENDER whose outstanding asks/obligations to recap"),
   include_resolved: z.boolean().optional().default(false).describe(
-    "false (default) = only still-outstanding (unresolved) ask/obligation messages YOU sent — the recap. true = the full sender view incl. resolved rows (unread/read-unresolved/resolved)."
+    "false (default) = only still-outstanding (unresolved) ask/obligation messages YOU sent — the recap. true = the full sender view incl. resolved rows (undrained/drained-unresolved/resolved)."
   ),
   agent_token: AgentTokenField,
 });
@@ -1083,7 +1083,12 @@ export interface MessageRecord {
   priority: string;
   status: string;
   created_at: string;
-  /** v2.0 final: session that read this message. Null = unread. Used for session-aware read receipts (#6). */
+  /**
+   * v2.0 final (#6) — the session that DRAINED this message via the consuming get_messages path.
+   * Null = not drained by THIS session, which is what DRIVES pending (the message re-surfaces for a
+   * fresh session) — NOT a claim the recipient has not SEEN it: a peek / CLI / direct-DB read never
+   * sets it. (Same delivery-path-not-cognitive distinction as `read_at`; see #inbox-read-at.)
+   */
   read_by_session?: string | null;
   /**
    * v2.3.0 Part C — per-recipient monotonic sequence assigned at first
@@ -1131,12 +1136,15 @@ export interface MessageRecord {
    */
   deadline?: string | null;
   /**
-   * ADR-0011 — the SENDER's sticky, AGENT-LEVEL read receipt: ISO timestamp set
-   * WRITE-ONCE the first time ANY recipient session drains the message through
-   * get_messages, and NEVER cleared (monotonic). ORTHOGONAL to `read_by_session`
-   * above (per-session, re-pends for a fresh session). NULL = not yet read via
-   * the normal MCP path — note a direct-DB/CLI read does NOT stamp it (the
-   * receipt means "read via the MCP path," not "seen by any means").
+   * ADR-0011 / #inbox-read-at — a DELIVERY-PATH marker, NOT a read/seen receipt. ISO timestamp
+   * set WRITE-ONCE the first time ANY recipient session DRAINS this message through the consuming
+   * get_messages path, and never cleared (monotonic). It records that the message left the queue
+   * via that path — NOT that the recipient has cognitively read it. NULL means "not drained via
+   * the consuming path", which is NOT the same as "unread"/"unseen": a recipient reading via peek,
+   * the CLI, or direct SQLite never stamps read_at yet may have seen and acted on the message. Do
+   * NOT infer "the agent has not seen this" from a null read_at. Orthogonal to `read_by_session`
+   * (per-session, re-pends for a fresh session). The name `read_at` is a legacy misnomer kept for
+   * back-compat; read it as `drained_at`.
    */
   read_at?: string | null;
 }
