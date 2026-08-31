@@ -6,6 +6,7 @@
 import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData, setAgentLivenessAnchor, findAgentRowByToken, markAgentAuthenticated } from "../db.js";
 import type { SetStatusInput, HealthCheckInput, ReportLivenessInput } from "../types.js";
 import { VERSION } from "../version.js";
+import { resolveSurfaceSummary } from "../surface-shape.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { ERROR_CODES } from "../error-codes.js";
 import { authenticateAgent, verifyToken } from "../auth.js";
@@ -252,6 +253,13 @@ export function handleHealthCheck(input: HealthCheckInput) {
             transport: process.env.RELAY_TRANSPORT || "stdio",
             uptime_seconds,
             legacy_grace_active: process.env.RELAY_ALLOW_LEGACY === "1",
+            // #tools-list-visibility — make the profile-filtered tool surface OBSERVABLE. tools/list is
+            // a bare protocol array we cannot extend, so a hidden tool leaves no signal there; this
+            // reports the active profile, the bundles in effect, and the tool names hidden by them, so an
+            // agent can tell "hidden by profile" (name in hidden_tools) from "does not exist" (name
+            // absent from the inventory) from "not connected" (no health_check response at all). Always
+            // reachable — health_check is visible in every profile.
+            surface: resolveSurfaceSummary(),
             ...(tokenCheck
               ? {
                   token_validated: true,

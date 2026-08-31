@@ -204,7 +204,7 @@ describe("v2.4.4 — tool description quality", () => {
       get_standup: "50fc69fcf51b6d21632b5e9be632f570c7cee8b1cbc18999a82d0a34dc2b1519",
       get_task: "de353b956b82f757829007fd6b9d7b7c7b89500dbf6b60681cf7080b574fce9b",
       get_tasks: "1e1416a86554d1e17346d3cc661453a4536768dfad4ef492ce60beb9aa597e7e",
-      health_check: "9558d9d8d499dfaedeb980a25bc02d4c969353a919a5080fafdcee232704f465",
+      health_check: "afa739887b607ad5aabb79acb580dde646622fd0e1fed4052ca74f11ddafa3e4", // #tools-list-visibility: breadcrumb pointing at the `surface` field (profile + hidden tools) — the pointer lives in tools/list even though the data cannot
       join_channel: "46b2b3247d5a1115e1f72635bdfae99b63e88b344bbf3482fce93410321de45f",
       leave_channel: "654ef16a3e05b55712b155643cc92b8536b9795fa68037f203f1fb5cb7b3f9d0",
       list_webhooks: "8c0a676339308cdf9591e789636ec49ab681eed8ff662815c2bf2a9de5f87449",
