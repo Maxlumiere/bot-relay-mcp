@@ -7,6 +7,7 @@ import {
   postTask,
   updateTask,
   getTasks,
+  countTasks,
   getTask,
   postTaskAuto,
   runHealthMonitorTick,
@@ -245,6 +246,9 @@ export function handlePostTaskAuto(input: PostTaskAutoInput) {
 export function handleGetTasks(input: GetTasksInput) {
   runHealthMonitor("get_tasks");
   const tasks = getTasks(input.agent_name, input.role, input.status, input.limit);
+  // #completeness-signal — a busy task board is LIMIT-capped; report has_more/total from the SAME
+  // buildTaskWhere SSOT so an agent cannot silently miss tasks past the cap (a coordination surface).
+  const total = countTasks(input.agent_name, input.role, input.status);
   return {
     content: [
       {
@@ -253,6 +257,8 @@ export function handleGetTasks(input: GetTasksInput) {
           {
             tasks,
             count: tasks.length,
+            has_more: total > tasks.length,
+            total,
             agent: input.agent_name,
             role: input.role,
             filter: input.status,

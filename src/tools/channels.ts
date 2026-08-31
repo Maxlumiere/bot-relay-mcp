@@ -15,6 +15,7 @@ import {
   leaveChannel,
   postToChannel,
   getChannelMessages,
+  countChannelMessages,
   listChannels,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
@@ -117,9 +118,15 @@ export function handleGetChannelMessages(input: GetChannelMessagesInput) {
       input.limit,
       input.since
     );
+    // #completeness-signal — a busy channel read is LIMIT-capped; report has_more/total from the
+    // SAME resolveChannelReadScope SSOT so the capped read cannot look complete. Agents drain channel
+    // history like an inbox, so this is the get_messages subset defect on a different table.
+    const total = countChannelMessages(input.channel_name, input.agent_name, input.since);
     return jsonResponse({
       messages,
       count: messages.length,
+      has_more: total > messages.length,
+      total,
       channel_name: input.channel_name,
       agent: input.agent_name,
     });
