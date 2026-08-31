@@ -27,6 +27,7 @@
  */
 import { getDb, getAgents } from "./db.js";
 import { decryptContent } from "./encryption.js";
+import { truncatedPreview } from "./preview.js";
 import { agentNameFromInboxUri, inboxUriFor } from "./mcp-subscriptions.js";
 
 export interface McpResourceDescriptor {
@@ -143,8 +144,12 @@ export function readResource(uri: string): {
  *                               null if the inbox is empty
  *   - last_message_from       — sender of the most-recent message
  *   - last_message_priority   — 'normal' | 'high'
- *   - last_message_preview    — first INBOX_PREVIEW_MAX chars of body
- *   - last_message_truncated  — true when content overflowed the preview cap
+ *   - last_message_preview    — first INBOX_PREVIEW_MAX chars of body; when the body overflows the
+ *                               cap the preview TEXT carries a visible "…[+N chars truncated…]"
+ *                               marker (#inbox-preview-fragment) so a reader of the text alone
+ *                               cannot mistake a fragment for the whole
+ *   - last_message_truncated  — true when content overflowed the preview cap (also visible in the
+ *                               preview text itself; kept for consumers that branch on it)
  *
  * Returning a stable snapshot for an unknown agent (rather than throwing)
  * lets MCP clients subscribe BEFORE the agent registers — same idiom as
@@ -203,7 +208,10 @@ function buildInboxSnapshot(agentName: string): {
   // in last_message_preview. Safe-no-op for plaintext rows by decryptContent
   // contract (returns null on non-enc1 input → fallback to original).
   const plaintext = decryptContent(last.content) ?? last.content;
-  const truncated = plaintext.length > INBOX_PREVIEW_MAX;
+  // #inbox-preview-fragment — the marker is embedded IN last_message_preview, so a renderer that
+  // shows the text without reading last_message_truncated (the Tether notification does exactly this)
+  // still surfaces the fragment AS a fragment. The boolean is kept for consumers that branch on it.
+  const { preview, truncated } = truncatedPreview(plaintext, INBOX_PREVIEW_MAX);
   return {
     agent_name: agentName,
     agent_known: known,
@@ -212,7 +220,7 @@ function buildInboxSnapshot(agentName: string): {
     last_message_at: last.created_at,
     last_message_from: last.from_agent,
     last_message_priority: last.priority,
-    last_message_preview: truncated ? plaintext.slice(0, INBOX_PREVIEW_MAX) : plaintext,
+    last_message_preview: preview,
     last_message_truncated: truncated,
   };
 }
