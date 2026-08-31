@@ -10,9 +10,10 @@
  *      null preserve pre-v2.1.6 unlimited behavior, "session_start" anchors
  *      on agents.session_started_at).
  *   2. new MCP tool get_messages_summary returns {id, from_agent, priority,
- *      status, created_at, content_preview} with 100-char truncation and
- *      the same since + status filter surface. Pure observation — does not
- *      mutate read_by_session.
+ *      status, created_at, content_preview} — the preview is the first 100 chars plus a
+ *      visible "…[+N chars truncated…]" marker in the text when the body overflows
+ *      (#inbox-preview-fragment) — and the same since + status filter surface. Pure
+ *      observation — does not mutate read_by_session.
  *   3. CLI subcommand `relay purge-history <name>` deletes messages + tasks
  *      where the agent is sender or recipient. Preserves the agent row and
  *      audit_log entries. Idempotent.
@@ -184,7 +185,7 @@ describe("v2.1.6 — get_messages `since` filter", () => {
 // --- 2. get_messages_summary ---
 
 describe("v2.1.6 — get_messages_summary tool", () => {
-  it("(2a) returns headers + 100-char preview and does NOT mark messages read", () => {
+  it("(2a) returns headers + a truncated preview WITH an in-text marker, and does NOT mark messages read", () => {
     handleRegisterAgent({ name: "sender", role: "r", capabilities: [] });
     handleRegisterAgent({ name: "receiver", role: "r", capabilities: [] });
     const long = "X".repeat(500);
@@ -198,7 +199,10 @@ describe("v2.1.6 — get_messages_summary tool", () => {
       } as any)
     );
     expect(data.count).toBe(1);
-    expect(data.summaries[0].content_preview.length).toBe(100);
+    // #inbox-preview-fragment — the preview is the first 100 chars PLUS a visible truncation marker
+    // in the text itself, so a reader who ignores content_truncated cannot mistake it for the whole.
+    expect(data.summaries[0].content_preview.startsWith("X".repeat(100))).toBe(true);
+    expect(data.summaries[0].content_preview).toMatch(/\[\+400 chars truncated/);
     expect(data.summaries[0].content_truncated).toBe(true);
     expect(data.summaries[0].priority).toBe("high");
     expect(data.summaries[0].from_agent).toBe("sender");

@@ -30,6 +30,7 @@ import { computeTokenLookup } from "./token-lookup.js";
 import { normalizeAgentClass, TOPOLOGY_VISIBLE_CLASSES, TOPOLOGY_HIDDEN_CLASSES, TRANSIENT } from "./agent-class.js";
 import { authCacheGet, authCacheSet, authCacheTtlMs } from "./auth-cache.js";
 import { encryptContent, decryptContent } from "./encryption.js";
+import { truncatedPreview } from "./preview.js";
 import {
   type CompatDatabase,
   initializeDb as initDriver,
@@ -4738,7 +4739,9 @@ export function getOutstanding(
       }
     }
     const decrypted = decryptContent(r.content) ?? r.content;
-    const truncated = decrypted.length > OUTSTANDING_PREVIEW_MAX;
+    // #inbox-preview-fragment — marker embedded in content_preview so a reader of the text alone
+    // cannot mistake a fragment for the whole; content_truncated kept for consumers that branch on it.
+    const { preview, truncated } = truncatedPreview(decrypted, OUTSTANDING_PREVIEW_MAX);
     return {
       id: r.id,
       to_agent: r.to_agent,
@@ -4749,7 +4752,7 @@ export function getOutstanding(
       resolved_at: r.resolved_at ?? null,
       state,
       overdue,
-      content_preview: truncated ? decrypted.slice(0, OUTSTANDING_PREVIEW_MAX) : decrypted,
+      content_preview: preview,
       content_truncated: truncated,
     };
   });

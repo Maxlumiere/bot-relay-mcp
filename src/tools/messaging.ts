@@ -20,6 +20,7 @@ import { fireWebhooks } from "../webhooks.js";
 import { ERROR_CODES } from "../error-codes.js";
 import { parseSince } from "./standup.js";
 import { sampleGetMessagesConsistency } from "../transport/consistency-probe.js";
+import { truncatedPreview } from "../preview.js";
 import type {
   SendMessageInput,
   GetMessagesInput,
@@ -388,18 +389,20 @@ export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
     };
   }
   const rows = getMessagesSummary(input.agent_name, input.status, input.limit, sinceIso);
-  const summaries = rows.map((r) => ({
-    id: r.id,
-    from_agent: r.from_agent,
-    priority: r.priority,
-    status: r.status,
-    created_at: r.created_at,
-    content_preview:
-      r.content.length > SUMMARY_PREVIEW_MAX
-        ? r.content.slice(0, SUMMARY_PREVIEW_MAX)
-        : r.content,
-    content_truncated: r.content.length > SUMMARY_PREVIEW_MAX,
-  }));
+  const summaries = rows.map((r) => {
+    // #inbox-preview-fragment — the truncation marker is embedded IN content_preview so a reader of
+    // the text alone cannot mistake a fragment for the whole; content_truncated is kept alongside.
+    const { preview, truncated } = truncatedPreview(r.content, SUMMARY_PREVIEW_MAX);
+    return {
+      id: r.id,
+      from_agent: r.from_agent,
+      priority: r.priority,
+      status: r.status,
+      created_at: r.created_at,
+      content_preview: preview,
+      content_truncated: truncated,
+    };
+  });
   return {
     content: [
       {
