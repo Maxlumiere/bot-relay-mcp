@@ -6,6 +6,7 @@
 import {
   sendMessage,
   getMessages,
+  countMatchingMessages,
   getMessagesSummary,
   getOutstanding,
   resolveMessages,
@@ -210,6 +211,17 @@ export function handleGetMessages(input: GetMessagesInput) {
       isError: true,
     };
   }
+  // #inbox-subset (victra seq 961) — the completeness signal. Count ALL messages matching
+  // this exact query (same SSOT predicate as the drain) BEFORE getMessages marks the returned
+  // pending rows read — counting after would undercount the queue. `has_more` then makes a
+  // capped drain structurally unable to claim it returned everything: the wake signal and the
+  // drain can no longer count different sets without the caller being told.
+  const totalMatching = countMatchingMessages(
+    input.agent_name,
+    input.status,
+    sinceIso,
+    input.lane ?? "all",
+  );
   const raw = getMessages(
     input.agent_name,
     input.status,
@@ -222,6 +234,7 @@ export function handleGetMessages(input: GetMessagesInput) {
     input.ack ?? false,
   );
   const messages = raw;
+  const hasMore = totalMatching > messages.length;
   // v2.3.0 Part A.2 — live consistency probe. Off by default; when
   // enabled via RELAY_CONSISTENCY_PROBE=1, samples every Nth call and
   // logs a stderr warning if a raw SQL superset query sees pending
@@ -284,6 +297,15 @@ export function handleGetMessages(input: GetMessagesInput) {
           {
             messages,
             count: messages.length,
+            // #inbox-subset — for a PENDING drain (the action queue the wake counts), ALWAYS
+            // emit both fields so the response is structurally unable to claim a completeness
+            // it does not have: `has_more` true ⇒ the LIMIT truncated the result; `total_pending`
+            // is the full queue size the wake sees. count < total_pending means the wake fired
+            // for mail this drain did not return. Within the pending contract the fields cannot
+            // be absent, so a caller reading `count` cannot silently believe it holds everything.
+            // Non-pending history reads keep their byte-identical shape (bounded by `since`, a
+            // different semantic); if they ever need the same signal it is an additive follow-up.
+            ...(input.status === "pending" ? { has_more: hasMore, total_pending: totalMatching } : {}),
             agent: input.agent_name,
             filter: input.status,
             since: input.since ?? null,

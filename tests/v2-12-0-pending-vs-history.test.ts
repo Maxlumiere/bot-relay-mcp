@@ -23,8 +23,9 @@
  *      read-mark + resolve move together.
  *   4. resolve_messages resolves only the named ids, only for the recipient.
  *   5. Authz (adversarial): agent B's token CANNOT resolve agent A's mail.
- *   6. Back-compat: ack=false ⇒ byte-identical response shape + the
- *      session-scoped handover re-surface is preserved.
+ *   6. Back-compat: ack=false adds NO acked/resolved_count fields (the ack surface stays
+ *      off) + the session-scoped handover re-surface is preserved. (Since #inbox-subset a
+ *      pending drain always also carries has_more + total_pending — the completeness signal.)
  *   7. Concurrency-safe resolution is idempotent (BEGIN IMMEDIATE +
  *      `resolved_at IS NULL` guard): a second drain/resolve neither
  *      double-counts nor drops.
@@ -363,15 +364,20 @@ describe("v2.12.0 — (5) authz: B's token cannot resolve A's mail", () => {
 // --- 6. Back-compat: ack=false is byte-identical + preserves handover ---
 
 describe("v2.12.0 — (6) back-compat when ack=false", () => {
-  it("ack=false response has NO acked/resolved_count fields (byte-identical shape)", () => {
+  it("ack=false pending response carries the completeness signal but NO acked/resolved_count fields", () => {
     registerAgent("sender", "r", []);
     registerAgent("alice", "r", []);
     seed("sender", "alice", 1);
 
     const data = parse(handleGetMessages({ agent_name: "alice", status: "pending", limit: 20 } as any));
+    // #inbox-subset — a PENDING drain now ALWAYS carries has_more + total_pending so a capped
+    // drain cannot look complete (absence made impossible within the pending contract). The
+    // ack fields stay absent when ack=false — that no-ack invariant is what this test guards.
     expect(Object.keys(data).sort()).toEqual(
-      ["agent", "count", "filter", "messages", "since", "since_bound"].sort(),
+      ["agent", "count", "filter", "has_more", "messages", "since", "since_bound", "total_pending"].sort(),
     );
+    expect(data.has_more).toBe(false); // 1 message, nothing truncated
+    expect(data.total_pending).toBe(1);
     expect("acked" in data).toBe(false);
     expect("resolved_count" in data).toBe(false);
   });
