@@ -125,6 +125,7 @@ import { handlePeekInboxVersion } from "./tools/peek-inbox-version.js";
 import { recordCall } from "./transport/traffic-recorder.js";
 import { listPrompts, getPrompt } from "./mcp-prompts.js";
 import { listResources, readResource } from "./mcp-resources.js";
+import { TOOL_BUNDLES, isToolVisible, resolveSurfaceShape } from "./surface-shape.js";
 import {
   subscribe as subscribeResource,
   unsubscribe as unsubscribeResource,
@@ -155,98 +156,11 @@ import { VERSION } from "./version.js";
  * hiding functional tools — the CI surface-shape test asserts every
  * tool IS in this map.
  */
-export const TOOL_BUNDLES: Record<string, string> = {
-  // core
-  register_agent: "core",
-  unregister_agent: "core",
-  abandon_registration: "core",
-  discover_agents: "core",
-  send_message: "core",
-  get_messages: "core",
-  get_messages_summary: "core",
-  get_outstanding: "core",
-  // v2.12.0 — pending-vs-history. Own-mailbox primitive (no extra capability;
-  // recipient-scoped by token→agent_name binding, like get_messages).
-  resolve_messages: "core",
-  broadcast: "core",
-  // v2.10 — capability-routed messaging (FYI/coordination lane). Core primitive.
-  post_to_capability: "core",
-  post_task: "core",
-  post_task_auto: "core",
-  update_task: "core",
-  get_tasks: "core",
-  get_task: "core",
-  set_status: "core",
-  report_liveness: "core",
-  health_check: "core",
-  // webhooks
-  register_webhook: "webhooks",
-  list_webhooks: "webhooks",
-  delete_webhook: "webhooks",
-  // channels
-  create_channel: "channels",
-  join_channel: "channels",
-  leave_channel: "channels",
-  post_to_channel: "channels",
-  get_channel_messages: "channels",
-  // admin
-  rotate_token: "admin",
-  rotate_token_admin: "admin",
-  revoke_token: "admin",
-  expand_capabilities: "admin",
-  set_dashboard_theme: "admin",
-  spawn_agent: "admin",
-  // managed-agents
-  get_standup: "managed-agents",
-  // v2.3.0 Part C.3 — ambient-wake peek tool, a core mailbox primitive.
-  peek_inbox_version: "core",
-  // v2.10 — schema-gated task completion. register is admin-bundled + cap-gated
-  // (manage_schemas); the schema read is a core primitive.
-  register_task_schema: "admin",
-  task_schema_get: "core",
-  // federation — reserved (empty)
-};
 
-export function isToolVisible(
-  toolName: string,
-  bundles: string[],
-  hiddenList: string[] = [],
-): boolean {
-  if (hiddenList.includes(toolName)) return false;
-  const bundle = TOOL_BUNDLES[toolName] ?? "core"; // fail-open on drift
-  // health_check + discover_agents are always visible — diagnostic/routing
-  // primitives every profile needs (ops, debugging, first-run discovery).
-  if (toolName === "health_check" || toolName === "discover_agents") return true;
-  return bundles.includes(bundle);
-}
-
-/**
- * v2.3.0 Part B.2 — resolve the active feature bundles + hidden list from
- * config. Falls back to all-bundles-visible when the config is pre-v2.3.0
- * (no profile field → no shaping applied). Deliberately permissive to
- * avoid breaking existing installs on upgrade.
- */
-export function resolveSurfaceShape(): { bundles: string[]; hidden: string[] } {
-  try {
-    const cfg = loadConfig() as unknown as {
-      feature_bundles?: string[];
-      tool_visibility?: { hidden?: string[] };
-    };
-    if (Array.isArray(cfg.feature_bundles) && cfg.feature_bundles.length > 0) {
-      return {
-        bundles: cfg.feature_bundles,
-        hidden: cfg.tool_visibility?.hidden ?? [],
-      };
-    }
-  } catch {
-    /* fall through — no config or invalid shape */
-  }
-  // Default: everything visible (pre-v2.3.0 install or config-less run).
-  return {
-    bundles: ["core", "webhooks", "channels", "admin", "managed-agents"],
-    hidden: [],
-  };
-}
+// #tools-list-visibility — surface-shaping (TOOL_BUNDLES / isToolVisible / resolveSurfaceShape) moved
+// to the leaf module src/surface-shape.ts so the health_check handler can read the same summary
+// without a server↔status import cycle. Imported at the top; re-exported here for existing importers.
+export { TOOL_BUNDLES, isToolVisible, resolveSurfaceShape };
 
 /**
  * v2.12.0 (authz hardening) — map each tool to its input schema so the
@@ -721,7 +635,7 @@ export function createServer(): Server {
         description:
           "Report relay process health + live counts.\n\n" +
           "When to use: liveness probes (`/health` HTTP endpoint mirrors this surface), version-pinning checks during upgrades, dashboard footers. Cheaper than `get_standup` for binary up/down questions.\n\n" +
-          "Behavior: pure read. Counts agents by presence, pending messages, active and queued tasks, channels, and webhook subscriptions. Reports `version` (from `package.json` via the v2.1 Phase 4a single source of truth) + `protocol_version` (the client-compat surface, distinct from package version). Works on stdio AND HTTP transports. No capability required, intentionally observable.\n\n" +
+          "Behavior: pure read. Counts agents by presence, pending messages, active and queued tasks, channels, and webhook subscriptions. Reports `version` (from `package.json` via the v2.1 Phase 4a single source of truth) + `protocol_version` (the client-compat surface, distinct from package version). Works on stdio AND HTTP transports. No capability required, intentionally observable. Also reports `surface` — your active profile, the tool bundles in effect, and which tools those bundles HIDE — so a capability missing from `tools/list` can be told apart from one that does not exist.\n\n" +
           "Returns: `{ status: 'ok', version, protocol_version, transport, uptime_seconds, legacy_grace_active, agents: {...counts}, messages: {...counts}, tasks: {...counts}, channels, webhooks }`. When the caller presents a token (arg / header / env), the response also includes `token_validated: true`, `auth_error: boolean`, and (on validation failure) `auth_error_reason`, plus `agent_name` + `auth_state` on success.\n\n" +
           "Errors: none expected (`status='ok'` is the only success shape).",
         inputSchema: zodToJsonSchema(HealthCheckSchema),

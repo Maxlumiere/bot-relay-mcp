@@ -155,5 +155,14 @@ describe("v2.3.0 B.2 — surface shaping", () => {
     for (const n of names) {
       expect(TOOL_BUNDLES[n], `tool "${n}" missing from TOOL_BUNDLES`).toBeTruthy();
     }
+    // #tools-list-visibility — BIDIRECTIONAL: TOOL_BUNDLES must be EXACTLY the registered set (no
+    // stale/extra keys), else resolveSurfaceSummary's tools_total over-counts and health_check's
+    // "N of M" lies. The forward check above already gives registered ⊆ TOOL_BUNDLES; this adds
+    // TOOL_BUNDLES ⊆ registered, so the count that health_check reports cannot drift from tools/list.
+    const registered = new Set(names);
+    for (const k of Object.keys(TOOL_BUNDLES)) {
+      expect(registered.has(k), `TOOL_BUNDLES has "${k}" but no such registered tool (stale entry)`).toBe(true);
+    }
+    expect(Object.keys(TOOL_BUNDLES).length, "TOOL_BUNDLES must be exactly the registered tool set").toBe(registered.size);
   });
 });
