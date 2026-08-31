@@ -438,7 +438,8 @@ function overdueBoundSeconds(): number {
 /**
  * ADR-0011 — get_outstanding: the SENDER's recap + the PULL source of truth for
  * overdue drift. Returns the ask/obligation messages the caller SENT with their
- * lifecycle state (unread / read-unresolved / resolved) and a REPORT-ONLY
+ * lifecycle state (undrained / drained-unresolved / resolved — a delivery-path
+ * state, not read/seen) and a REPORT-ONLY
  * overdue flag. Pure read — it NEVER mutates a message (report-first, never
  * auto-resolve, ADR-0005). A fresh orchestrator session reconstructs overdue
  * state from this call alone; the optional read/resolved webhooks are

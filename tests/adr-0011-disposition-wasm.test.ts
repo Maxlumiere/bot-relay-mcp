@@ -82,13 +82,13 @@ describe("ADR-0011 (wasm) — migration + read-receipt + overdue on sql.js", () 
 
     // Unread + overdue (past deadline).
     let out = getOutstanding("alice", { overdueBoundSeconds: 86_400 });
-    expect(out[0].state).toBe("unread");
+    expect(out[0].state).toBe("undrained");
     expect(out[0].overdue).toBe(true);
 
     // Drain in S1 → read_at stamped.
     getMessages("bob", "pending", 20);
     out = getOutstanding("alice", { overdueBoundSeconds: 86_400 });
-    expect(out[0].state).toBe("read-unresolved");
+    expect(out[0].state).toBe("drained-unresolved");
     const stamped = out[0].read_at;
     expect(stamped).not.toBeNull();
 

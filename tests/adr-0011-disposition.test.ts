@@ -75,7 +75,7 @@ describe("ADR-0011 tool integration — get_outstanding + send_message dispositi
       });
       expect(body(log).disposition).toBe("log");
 
-      // An ASK — must appear, state 'unread', not overdue (within the 24h default).
+      // An ASK — must appear, state 'undrained', not overdue (within the 24h default).
       const ask: any = await client.callTool({
         name: "send_message",
         arguments: { from: "alice", to: "bob", message: "please reply", disposition: "ask", agent_token: alice.plaintext_token },
@@ -90,7 +90,7 @@ describe("ADR-0011 tool integration — get_outstanding + send_message dispositi
       expect(rec.success).toBe(true);
       expect(rec.count).toBe(1); // the ask only — the log is excluded
       expect(rec.outstanding[0].disposition).toBe("ask");
-      expect(rec.outstanding[0].state).toBe("unread");
+      expect(rec.outstanding[0].state).toBe("undrained");
       expect(rec.outstanding[0].overdue).toBe(false);
       expect(rec.overdue_count).toBe(0);
       expect(rec.overdue_bound_seconds).toBe(86_400);

@@ -1817,14 +1817,16 @@ function migrateSchemaToV2_23(db: CompatDatabase): void {
  *     Only an EXPLICIT ask/obligation is ever overdue.
  *   - `deadline TEXT NULL` — optional ISO deadline for an OBLIGATION. NULL for
  *     log/ask (ask uses the config bound).
- *   - `read_at TEXT NULL` — the SENDER's STICKY, AGENT-LEVEL read receipt: set
- *     ONCE (COALESCE, write-once) the first time ANY recipient session drains
- *     the message, and NEVER cleared — monotonic. Orthogonal to the per-session
- *     `read_by_session` plane (which re-pends the message for a fresh session);
- *     a message can be read_at-stamped (sender sees "read") AND pending for a
- *     new session at once. The per-session re-pend path must never touch read_at.
+ *   - `read_at TEXT NULL` — a STICKY, AGENT-LEVEL DELIVERY-PATH marker (NOT a read/seen
+ *     receipt; #inbox-read-at): set ONCE (COALESCE, write-once) the first time ANY recipient
+ *     session DRAINS the message through the consuming get_messages path, and NEVER cleared —
+ *     monotonic. Orthogonal to the per-session `read_by_session` plane (which re-pends the
+ *     message for a fresh session); a message can be read_at-stamped (drained via the consuming
+ *     path) AND pending for a new session at once. NULL means "not drained via that path", NOT
+ *     "unread/unseen" — a peek/CLI/direct-DB read never stamps it. The per-session re-pend path
+ *     must never touch read_at.
  * All existing rows: disposition='log' (backfilled by the DEFAULT), deadline &
- * read_at NULL = zero data migration, nothing overdue, nothing pre-read.
+ * read_at NULL = zero data migration, nothing overdue, nothing pre-drained.
  */
 function migrateSchemaToV2_24(db: CompatDatabase): void {
   const msgCols = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
@@ -4650,8 +4652,16 @@ export interface OutstandingMessage {
   deadline: string | null;
   read_at: string | null;
   resolved_at: string | null;
-  /** Sender-visible lifecycle state, derived at query time. */
-  state: "unread" | "read-unresolved" | "resolved";
+  /**
+   * Sender-visible lifecycle state, derived at query time from the DELIVERY-PATH marker
+   * (read_at), NOT from whether the recipient has cognitively read the message. #inbox-read-at:
+   *  - "undrained": not yet drained through the consuming get_messages path. This is NOT
+   *    "unread"/"unseen" — a recipient reading via peek, the CLI, or direct SQLite never stamps
+   *    read_at, so an undrained message may well have been seen and acted on.
+   *  - "drained-unresolved": drained through the consuming path but not yet resolved/acked.
+   *  - "resolved": explicitly resolved.
+   */
+  state: "undrained" | "drained-unresolved" | "resolved";
   /** REPORT-ONLY: past its bound and still unresolved. NEVER stored/mutated. */
   overdue: boolean;
   content_preview: string;
@@ -4661,7 +4671,8 @@ export interface OutstandingMessage {
 /**
  * ADR-0011 — the SENDER's outstanding-ask recap, and the PULL source of truth
  * for overdue drift. Returns the ask/obligation messages the caller SENT, each
- * with its sender-visible lifecycle state (unread / read-unresolved / resolved)
+ * with its sender-visible lifecycle state (undrained / drained-unresolved / resolved —
+ * a DELIVERY-PATH state, not a read/seen one; see OutstandingMessage.state)
  * and a REPORT-ONLY `overdue` flag computed AT QUERY TIME. It NEVER mutates a
  * message — report-first, never auto-resolve/auto-delete (ADR-0005). A fresh
  * orchestrator session reconstructs overdue state purely by calling this; the
@@ -4704,11 +4715,15 @@ export function getOutstanding(
       resolved_at: string | null;
     }>;
   return rows.map((r) => {
+    // #inbox-read-at — read_at is a DELIVERY-PATH marker (drained via the consuming
+    // get_messages path), NOT a read/seen receipt. So NULL is surfaced as "undrained",
+    // NEVER "unread": a recipient reading via peek/CLI/direct-sqlite never stamps it, and
+    // labelling that "unread" is the exact false inference this rename removes.
     const state: OutstandingMessage["state"] = r.resolved_at
       ? "resolved"
       : r.read_at
-        ? "read-unresolved"
-        : "unread";
+        ? "drained-unresolved"
+        : "undrained";
     // Report-only overdue, computed here and never written back. A resolved
     // message is never overdue. Obligation w/ explicit deadline → past it.
     // Obligation w/o deadline, or an ask → past created_at + the config bound.
@@ -5198,7 +5213,8 @@ export function getMessages(
     // racing drains; the tx is promoted to BEGIN IMMEDIATE below so two
     // ack drains serialize at tx start (same pattern as the seq tx) and
     // neither double-counts nor drops.
-    // ADR-0011: the SENDER's sticky read receipt. `read_at` is stamped here, on
+    // ADR-0011 / #inbox-read-at: a sticky, agent-level DELIVERY-PATH marker (NOT a read/seen
+    // receipt — do not read it as "the recipient saw this"). `read_at` is stamped here, on
     // the pending→read DRAIN, via COALESCE(read_at, ?) — WRITE-ONCE/monotonic:
     // the FIRST session to drain sets it; every later drain (any session) and
     // every re-pend leaves it. It is AGENT-LEVEL, orthogonal to the per-session

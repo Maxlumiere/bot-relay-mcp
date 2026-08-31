@@ -113,16 +113,16 @@ describe("ADR-0011 (2) sticky agent-level read — survives session death, never
     registerAgent("bob", "r", []); // session S1
     const m = sendMessage("alice", "bob", "please reply", "normal", "ask");
 
-    // Before any read: sender sees 'unread'.
+    // Before any consuming drain: sender sees 'undrained'.
     let out = getOutstanding("alice", { overdueBoundSeconds: 86_400 });
     expect(out).toHaveLength(1);
-    expect(out[0].state).toBe("unread");
+    expect(out[0].state).toBe("undrained");
     expect(out[0].read_at).toBeNull();
 
     // S1 drains it → read_at stamped.
     getMessages("bob", "pending", 20);
     out = getOutstanding("alice", { overdueBoundSeconds: 86_400 });
-    expect(out[0].state).toBe("read-unresolved");
+    expect(out[0].state).toBe("drained-unresolved");
     const stampedReadAt = out[0].read_at;
     expect(stampedReadAt).not.toBeNull();
 
@@ -133,7 +133,7 @@ describe("ADR-0011 (2) sticky agent-level read — survives session death, never
 
     // ...yet the SENDER's receipt is UNCHANGED — monotonic, never flipped back.
     out = getOutstanding("alice", { overdueBoundSeconds: 86_400 });
-    expect(out[0].state).toBe("read-unresolved");
+    expect(out[0].state).toBe("drained-unresolved");
     expect(out[0].read_at).toBe(stampedReadAt);
 
     // Even after S2 ALSO drains it, read_at is still the FIRST stamp (COALESCE).
@@ -141,14 +141,19 @@ describe("ADR-0011 (2) sticky agent-level read — survives session death, never
     expect(getOutstanding("alice", { overdueBoundSeconds: 86_400 })[0].read_at).toBe(stampedReadAt);
   });
 
-  it("peek=true is a non-consuming read → leaves read_at NULL (victra note #2)", () => {
+  it("a PEEKED (observed) message reads 'undrained', NEVER 'unread' — read_at NULL is a delivery-path fact, not 'unseen' (#inbox-read-at)", () => {
     registerAgent("alice", "r", []);
     registerAgent("bob", "r", []);
     const m = sendMessage("alice", "bob", "peek me", "normal", "ask");
-    // A non-mutating survey must NOT stamp the receipt.
+    // A peek is exactly the case that broke the old label: the recipient (or its watcher) HAS
+    // observed the message, but a non-consuming read never stamps read_at. Labelling that
+    // "unread" asserts the recipient has NOT seen it — the false inference this rename removes.
+    // This tests the CLAIM (state is not the cognitive one), not just the renamed string.
     getMessages("bob", "pending", 20, /* peek */ true);
-    expect(row(m.id).read_at).toBeNull();
-    expect(getOutstanding("alice", { overdueBoundSeconds: 86_400 })[0].state).toBe("unread");
+    expect(row(m.id).read_at).toBeNull(); // peek does not stamp — correct, unchanged
+    const out = getOutstanding("alice", { overdueBoundSeconds: 86_400 });
+    expect(out[0].state, "the honest delivery-path label").toBe("undrained");
+    expect(out[0].state, "the API must NEVER assert 'unread'/'unseen' for a message it cannot know was unseen").not.toBe("unread");
   });
 });
 
