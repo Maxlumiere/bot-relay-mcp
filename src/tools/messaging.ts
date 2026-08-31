@@ -304,9 +304,12 @@ export function handleGetMessages(input: GetMessagesInput) {
             // is the full queue size the wake sees. count < total_pending means the wake fired
             // for mail this drain did not return. Within the pending contract the fields cannot
             // be absent, so a caller reading `count` cannot silently believe it holds everything.
-            // Non-pending history reads keep their byte-identical shape (bounded by `since`, a
-            // different semantic); if they ever need the same signal it is an additive follow-up.
-            ...(input.status === "pending" ? { has_more: hasMore, total_pending: totalMatching } : {}),
+            // #completeness-signal — every status now carries the signal (closing #1a's pending-only
+            // scope): pending keeps `total_pending` (unchanged), history reads gain `total`. Both are
+            // additive; a caller reading `count` on ANY status can no longer believe it holds everything.
+            ...(input.status === "pending"
+              ? { has_more: hasMore, total_pending: totalMatching }
+              : { has_more: hasMore, total: totalMatching }),
             agent: input.agent_name,
             filter: input.status,
             since: input.since ?? null,
@@ -388,6 +391,9 @@ export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
       isError: true,
     };
   }
+  // #completeness-signal — the cheap preview is LIMIT-capped like the drain; report has_more/total
+  // from the SAME buildMessageWhere-derived count so a busy inbox's summary cannot look complete.
+  const totalMatching = countMatchingMessages(input.agent_name, input.status, sinceIso, "all");
   const rows = getMessagesSummary(input.agent_name, input.status, input.limit, sinceIso);
   const summaries = rows.map((r) => {
     // #inbox-preview-fragment — the truncation marker is embedded IN content_preview so a reader of
@@ -411,6 +417,8 @@ export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
           {
             summaries,
             count: summaries.length,
+            has_more: totalMatching > summaries.length,
+            total: totalMatching,
             agent: input.agent_name,
             filter: input.status,
             since: input.since ?? null,

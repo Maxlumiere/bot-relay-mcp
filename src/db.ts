@@ -5456,54 +5456,13 @@ export function getMessagesSummary(
   const priorityOrder =
     `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
 
-  // sinceClause = the plain window for the HISTORY reads (all/read/resolved). The
-  // pending branch below routes its window through the pendingSinceClause SSOT
-  // helper (#198) so the cheap preview AGREES with the mutating drain on aged
-  // never-observed mail (GetMessagesSummarySchema's "agrees with the mutating
-  // drain" contract) — else an aged seq-NULL unresolved message previews as 0
-  // while get_messages(pending) returns it.
-  const sinceClause = sinceIso ? "AND created_at >= ?" : "";
-  const params: unknown[] = [agentName];
-
-  let sql: string;
-  if (status === "all" || status === "history") {
-    // "all" / "history" (alias) — full durable record incl. resolved mail.
-    sql = `SELECT * FROM messages WHERE to_agent = ? ${sinceClause} ${priorityOrder}`;
-    if (sinceIso) params.push(sinceIso);
-  } else if (status === "resolved") {
-    // v2.12.0 — only permanently-resolved (acked) mail.
-    sql = `SELECT * FROM messages WHERE to_agent = ?
-       AND resolved_at IS NOT NULL
-       ${sinceClause}
-       ${priorityOrder}`;
-    if (sinceIso) params.push(sinceIso);
-  } else if (status === "read") {
-    sql = `SELECT * FROM messages WHERE to_agent = ?
-       AND read_by_session IS NOT NULL
-       AND read_by_session = ?
-       ${sinceClause}
-       ${priorityOrder}`;
-    params.push(currentSession ?? "");
-    if (sinceIso) params.push(sinceIso);
-  } else {
-    // "pending" — (never read OR read by a different session) AND not yet
-    // resolved. v2.12.0: the `resolved_at IS NULL` clause mirrors getMessages
-    // so the cheap preview and the mutating drain agree on the pending set
-    // (an already-resolved item never shows as pending in either path). #198:
-    // the WINDOW mirrors the drain via the same pendingSinceClause SSOT helper,
-    // so aged never-observed mail previews exactly as it drains.
-    const psc = pendingSinceClause(sinceIso);
-    sql = `SELECT * FROM messages WHERE to_agent = ?
-       AND (read_by_session IS NULL OR read_by_session != ?)
-       AND resolved_at IS NULL
-       ${psc.sql}
-       ${priorityOrder}`;
-    params.push(currentSession ?? "");
-    params.push(...psc.params);
-  }
-  params.push(limit);
-
-  const rows = db.prepare(sql).all(...(params as any[])) as MessageRecord[];
+  // #completeness-signal — the cheap preview now derives its WHERE from the SAME buildMessageWhere
+  // SSOT as the mutating get_messages drain, instead of a hand-duplicated status branch, so the two
+  // can never drift on which rows count (the "agrees with the drain" contract is now structural, and
+  // the #198 pending-window + resolved-mirror rules are inherited from the shared helper). lane is
+  // "all" — the summary has no lane surface. countMatchingMessages then gives it an honest has_more.
+  const { where, params } = buildMessageWhere(agentName, status, sinceIso, "all", currentSession);
+  const rows = db.prepare(`SELECT * FROM messages WHERE ${where} ${priorityOrder}`).all(...params, limit) as MessageRecord[];
   return rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content }));
 }
 
@@ -5957,6 +5916,17 @@ export function postTask(
   };
 }
 
+/**
+ * #completeness-signal — SSOT for the get_tasks WHERE: `role` picks the column (posted→from_agent,
+ * else to_agent), `status` optionally narrows. getTasks and countTasks both derive from THIS so the
+ * capped list and its has_more/total cannot count different rows.
+ */
+function buildTaskWhere(agentName: string, role: string, status: string): { where: string; params: unknown[] } {
+  const column = role === "posted" ? "from_agent" : "to_agent";
+  if (status === "all") return { where: `${column} = ?`, params: [agentName] };
+  return { where: `${column} = ? AND status = ?`, params: [agentName, status] };
+}
+
 export function getTasks(
   agentName: string,
   role: string,
@@ -5965,27 +5935,23 @@ export function getTasks(
 ): TaskRecord[] {
   const db = getDb();
   // No touchAgent here — observation is not liveness (v1.3 presence fix)
-
-  const column = role === "posted" ? "from_agent" : "to_agent";
-
   // v2.0: priority ordering (high > normal > low, then by updated_at)
   const priorityOrder = `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, updated_at DESC LIMIT ?`;
-  let rows: TaskRecord[];
-  if (status === "all") {
-    rows = db.prepare(
-      `SELECT * FROM tasks WHERE ${column} = ? ${priorityOrder}`
-    ).all(agentName, limit) as TaskRecord[];
-  } else {
-    rows = db.prepare(
-      `SELECT * FROM tasks WHERE ${column} = ? AND status = ? ${priorityOrder}`
-    ).all(agentName, status, limit) as TaskRecord[];
-  }
+  const { where, params } = buildTaskWhere(agentName, role, status);
+  const rows = db.prepare(`SELECT * FROM tasks WHERE ${where} ${priorityOrder}`).all(...params, limit) as TaskRecord[];
   // v1.7: decrypt description + result on read (safe-no-op for plaintext rows)
   return rows.map((r) => ({
     ...r,
     description: decryptContent(r.description) ?? r.description,
     result: r.result != null ? (decryptContent(r.result) ?? r.result) : null,
   }));
+}
+
+/** #completeness-signal — count all tasks matching a get_tasks query (same WHERE, no LIMIT). */
+export function countTasks(agentName: string, role: string, status: string): number {
+  const db = getDb();
+  const { where, params } = buildTaskWhere(agentName, role, status);
+  return (db.prepare(`SELECT COUNT(*) AS c FROM tasks WHERE ${where}`).get(...params) as { c: number }).c;
 }
 
 export function getTask(taskId: string): TaskRecord | null {
@@ -7023,6 +6989,29 @@ export function postToChannel(
   return { id, channel_id: channel.id, from_agent: fromAgent, content, priority, created_at: timestamp };
 }
 
+/**
+ * #completeness-signal — SSOT for a member's channel-read SCOPE: the channel id and the created_at
+ * FLOOR a member may see (max(since, joined_at)). getChannelMessages and countChannelMessages both
+ * derive their WHERE from THIS + CHANNEL_MSG_WHERE, so a capped read and its has_more/total can never
+ * count different rows (the drift between two predicates was the get_messages subset defect's root).
+ */
+const CHANNEL_MSG_WHERE = "channel_id = ? AND created_at >= ?";
+function resolveChannelReadScope(
+  channelName: string,
+  agentName: string,
+  since?: string,
+): { channelId: string; floor: string } {
+  const db = getDb();
+  const channel = db.prepare("SELECT id FROM channels WHERE name = ?").get(channelName) as { id: string } | undefined;
+  if (!channel) throw new Error(`Channel "${channelName}" does not exist.`);
+  const membership = db
+    .prepare("SELECT joined_at FROM channel_members WHERE channel_id = ? AND agent_name = ?")
+    .get(channel.id, agentName) as { joined_at: string } | undefined;
+  if (!membership) throw new Error(`Agent "${agentName}" is not a member of channel "${channelName}".`);
+  const floor = since && since > membership.joined_at ? since : membership.joined_at;
+  return { channelId: channel.id, floor };
+}
+
 export function getChannelMessages(
   channelName: string,
   agentName: string,
@@ -7030,19 +7019,28 @@ export function getChannelMessages(
   since?: string
 ): ChannelMessageRecord[] {
   const db = getDb();
-  const channel = db.prepare("SELECT id FROM channels WHERE name = ?").get(channelName) as { id: string } | undefined;
-  if (!channel) throw new Error(`Channel "${channelName}" does not exist.`);
-  const membership = db.prepare(
-    "SELECT joined_at FROM channel_members WHERE channel_id = ? AND agent_name = ?"
-  ).get(channel.id, agentName) as { joined_at: string } | undefined;
-  if (!membership) throw new Error(`Agent "${agentName}" is not a member of channel "${channelName}".`);
-  const floor = since && since > membership.joined_at ? since : membership.joined_at;
+  const { channelId, floor } = resolveChannelReadScope(channelName, agentName, since);
   const rows = db.prepare(
-    `SELECT * FROM channel_messages WHERE channel_id = ? AND created_at >= ?
+    `SELECT * FROM channel_messages WHERE ${CHANNEL_MSG_WHERE}
      ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
               created_at DESC LIMIT ?`
-  ).all(channel.id, floor, limit) as ChannelMessageRecord[];
+  ).all(channelId, floor, limit) as ChannelMessageRecord[];
   return rows.map((r) => ({ ...r, content: decryptContent(r.content) || r.content }));
+}
+
+/**
+ * #completeness-signal — count all channel messages a member can see (the SAME scope as
+ * getChannelMessages, minus the LIMIT), so get_channel_messages can report has_more/total and a
+ * busy channel's capped read cannot look complete.
+ */
+export function countChannelMessages(channelName: string, agentName: string, since?: string): number {
+  const db = getDb();
+  const { channelId, floor } = resolveChannelReadScope(channelName, agentName, since);
+  return (
+    db.prepare(`SELECT COUNT(*) AS c FROM channel_messages WHERE ${CHANNEL_MSG_WHERE}`).get(channelId, floor) as {
+      c: number;
+    }
+  ).c;
 }
 
 export function listChannels(): ChannelRecord[] {
