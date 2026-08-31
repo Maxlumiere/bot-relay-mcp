@@ -5057,6 +5057,75 @@ export function rotateAllMailboxEpochs(): number {
   return rows.length;
 }
 
+/**
+ * #inbox-subset (victra seq 961) — SSOT for the get_messages WHERE predicate.
+ *
+ * The pending drain (getMessages) and the completeness count (countMatchingMessages) MUST
+ * derive the same set from the same clause: a `has_more` computed against a predicate that
+ * differs from the drain's is itself the "partial answer that looks complete" defect. So
+ * both build their WHERE here — the ONLY place the four status planes are expressed. Returns
+ * the WHERE body (no ORDER/LIMIT) + its bound params, in placeholder order.
+ */
+function buildMessageWhere(
+  agentName: string,
+  status: string,
+  sinceIso: string | null,
+  lane: "all" | "direct" | "capability",
+  currentSession: string | null,
+): { where: string; params: unknown[] } {
+  const sinceClause = sinceIso ? "AND created_at >= ?" : "";
+  const laneClause =
+    lane === "direct"
+      ? "AND routed_capability IS NULL"
+      : lane === "capability"
+        ? "AND routed_capability IS NOT NULL"
+        : "";
+  if (status === "all" || status === "history") {
+    const params: unknown[] = [agentName];
+    if (sinceIso) params.push(sinceIso);
+    return { where: `to_agent = ? ${sinceClause} ${laneClause}`, params };
+  } else if (status === "resolved") {
+    const params: unknown[] = [agentName];
+    if (sinceIso) params.push(sinceIso);
+    return { where: `to_agent = ? AND resolved_at IS NOT NULL ${sinceClause} ${laneClause}`, params };
+  } else if (status === "read") {
+    const params: unknown[] = [agentName, currentSession ?? ""];
+    if (sinceIso) params.push(sinceIso);
+    return {
+      where: `to_agent = ? AND read_by_session IS NOT NULL AND read_by_session = ? ${sinceClause} ${laneClause}`,
+      params,
+    };
+  }
+  // pending — the per-session action queue (#53 SSOT predicate + #198 window helper).
+  const pc = pendingForSessionClause(currentSession ?? "");
+  const psc = pendingSinceClause(sinceIso);
+  const params: unknown[] = [agentName, ...pc.params, ...psc.params];
+  return { where: `to_agent = ? AND ${pc.sql} ${psc.sql} ${laneClause}`, params };
+}
+
+/**
+ * #inbox-subset — count ALL messages matching a get_messages query, WITHOUT the LIMIT.
+ * The completeness signal (`total_pending` / `has_more`) is derived from this so a capped
+ * drain can never claim it returned everything. Uses the SAME buildMessageWhere predicate as
+ * the drain, and resolves the caller's session the same way, so the count and the drain
+ * cannot disagree. Read-only (no mark) — call it BEFORE the drain so the pending total
+ * reflects the pre-drain queue, not the post-mark remainder.
+ */
+export function countMatchingMessages(
+  agentName: string,
+  status: string,
+  sinceIso: string | null = null,
+  lane: "all" | "direct" | "capability" = "all",
+): number {
+  const db = getDb();
+  const agentRow = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(agentName) as
+    | { session_id: string | null }
+    | undefined;
+  const currentSession = agentRow?.session_id ?? null;
+  const { where, params } = buildMessageWhere(agentName, status, sinceIso, lane, currentSession);
+  return (db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE ${where}`).get(...params) as { c: number }).c;
+}
+
 export function getMessages(
   agentName: string,
   status: string,
@@ -5080,91 +5149,19 @@ export function getMessages(
   const agentRow = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(agentName) as { session_id: string | null } | undefined;
   const currentSession = agentRow?.session_id ?? null;
 
-  let rows: MessageRecord[];
-
   const priorityOrder = `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
   // v2.7.0 external-review-flagged P1 fix — `since` filter MUST run in SQL BEFORE
-  // the mark-as-read mutation below, otherwise messages older than the
-  // bound get marked read silently and never resurface to this session.
-  // Pre-v2.7.0 the filter ran in JS (src/tools/messaging.ts filterBySince,
-  // since removed) AFTER getMessages had already mutated read_by_session —
-  // silent data loss. Mirror getMessagesSummary's pattern at
-  // src/db.ts:3037: same `AND created_at >= ?` clause stitched into each
-  // branch.
-  // sinceClause is the plain window for the HISTORY reads (all/read/resolved).
-  // The pending branch below routes its window through the pendingSinceClause
-  // SSOT helper instead (#198) so never-observed mail is always eligible.
-  const sinceClause = sinceIso ? "AND created_at >= ?" : "";
-  // v2.10 — lane filter. Fixed clauses (no param binding, no injection
-  // surface) so an orchestrator can drain the action lane (direct,
-  // routed_capability IS NULL) separately from the FYI lane (capability,
-  // routed_capability IS NOT NULL). Default 'all' preserves prior behavior.
-  const laneClause =
-    lane === "direct"
-      ? "AND routed_capability IS NULL"
-      : lane === "capability"
-        ? "AND routed_capability IS NOT NULL"
-        : "";
-
-  if (status === "all" || status === "history") {
-    // "all" / "history" (alias) = the full durable record, incl. resolved
-    // mail. The on-demand HISTORY plane for cross-session handover pulls.
-    const params: unknown[] = [agentName];
-    if (sinceIso) params.push(sinceIso);
-    params.push(limit);
-    rows = db.prepare(
-      `SELECT * FROM messages WHERE to_agent = ? ${sinceClause} ${laneClause} ${priorityOrder}`
-    ).all(...params) as MessageRecord[];
-  } else if (status === "resolved") {
-    // v2.12.0 — only messages the recipient has permanently resolved
-    // (acked). "show me what I've already handled." Session-independent.
-    const params: unknown[] = [agentName];
-    if (sinceIso) params.push(sinceIso);
-    params.push(limit);
-    rows = db.prepare(
-      `SELECT * FROM messages WHERE to_agent = ?
-         AND resolved_at IS NOT NULL
-         ${sinceClause}
-         ${laneClause}
-         ${priorityOrder}`
-    ).all(...params) as MessageRecord[];
-  } else if (status === "read") {
-    // "read" = this session has already observed these messages.
-    const params: unknown[] = [agentName, currentSession ?? ""];
-    if (sinceIso) params.push(sinceIso);
-    params.push(limit);
-    rows = db.prepare(
-      `SELECT * FROM messages WHERE to_agent = ?
-         AND read_by_session IS NOT NULL
-         AND read_by_session = ?
-         ${sinceClause}
-         ${laneClause}
-         ${priorityOrder}`
-    ).all(...params) as MessageRecord[];
-  } else {
-    // "pending" = (never read, OR read by a different session) AND not yet
-    // resolved. The session-scoped clause re-surfaces a prior session's
-    // UNFINISHED work to a fresh terminal (handovers don't drop mail, v2.0
-    // final #6); the v2.12.0 `resolved_at IS NULL` clause keeps ALREADY-
-    // HANDLED mail out of the action queue permanently, killing the
-    // cross-session re-flood for resolved items without touching the
-    // session-scoped read semantics.
-    // #53 — canonical per-session pending predicate (SSOT). The peek wake
-    // signal and the SessionStart hook derive from this SAME clause, so the
-    // count you wake on and the queue you drain cannot disagree. Logically
-    // identical to the prior inline `(read_by_session …) AND resolved_at IS NULL`.
-    const pc = pendingForSessionClause(currentSession ?? "");
-    const psc = pendingSinceClause(sinceIso); // #198 SSOT window helper
-    const params: unknown[] = [agentName, ...pc.params, ...psc.params];
-    params.push(limit);
-    rows = db.prepare(
-      `SELECT * FROM messages WHERE to_agent = ?
-         AND ${pc.sql}
-         ${psc.sql}
-         ${laneClause}
-         ${priorityOrder}`
-    ).all(...params) as MessageRecord[];
-  }
+  // the mark-as-read mutation below, otherwise messages older than the bound get
+  // marked read silently and never resurface to this session.
+  // #inbox-subset — the WHERE predicate (all four status planes, the sinceClause, the
+  // lane filter, the #53/#198 pending helpers) is built by the SHARED buildMessageWhere
+  // so the drain and countMatchingMessages (the has_more signal) express ONE predicate and
+  // cannot drift. The window rule inside it: history reads use a plain `created_at >= ?`;
+  // the pending branch routes through pendingSinceClause so never-drained mail stays eligible.
+  const { where, params } = buildMessageWhere(agentName, status, sinceIso, lane, currentSession);
+  const rows = db.prepare(
+    `SELECT * FROM messages WHERE ${where} ${priorityOrder}`
+  ).all(...params, limit) as MessageRecord[];
 
   // Mark messages as read by THIS session. The old binary `status` column
   // remains populated for back-compat readers but is no longer authoritative.
