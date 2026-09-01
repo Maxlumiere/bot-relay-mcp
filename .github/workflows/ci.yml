@@ -23,10 +23,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v2.7.3: Node 18 dropped — vitest@4 requires Node 20+
-        # (uses node:util.styleText, added in Node 20.12). Node 18 went
-        # EOL April 30, 2025; users on Node 18 stay pinned to v2.7.2.
-        node: ['20', '22']
+        # v2.7.3: Node 18 dropped — vitest@4 requires Node 20+.
+        # #182 (2026-09): Node 20 dropped too. It went EOL 2026-04-30, and
+        # better-sqlite3 13 (a native module) requires Node >=22; engines.node is
+        # now ">=22.0.0". Testing a runtime we no longer support would make green
+        # meaningless. Users on Node 18/20 stay pinned to the last 3.x line.
+        node: ['22']
     steps:
       - name: Checkout
         uses: actions/checkout@v7

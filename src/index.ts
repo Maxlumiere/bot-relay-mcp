@@ -13,19 +13,15 @@ import { assertInstanceResolution } from "./instance.js";
 import { startOutboxTail, stopOutboxTail } from "./outbox-tail.js";
 import { log } from "./logger.js";
 import { parseCliFlags, applyCliToEnv, usage } from "./cli.js";
+import { nodeVersionError } from "./node-version.js";
 import { VERSION } from "./version.js";
 import type { Server as HttpServer } from "http";
 import { PassThrough } from "node:stream";
 
-const MIN_NODE_MAJOR = 18;
-
 function checkNodeVersion(): void {
-  const major = parseInt(process.versions.node.split(".")[0], 10);
-  if (isNaN(major) || major < MIN_NODE_MAJOR) {
-    process.stderr.write(
-      `bot-relay-mcp requires Node.js ${MIN_NODE_MAJOR}+ (you have ${process.versions.node}).\n` +
-      `Install a newer Node from https://nodejs.org/ or use nvm.\n`
-    );
+  const err = nodeVersionError(process.versions.node);
+  if (err) {
+    process.stderr.write(err);
     process.exit(1);
   }
 }
