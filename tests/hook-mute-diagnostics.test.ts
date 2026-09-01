@@ -44,9 +44,27 @@ let home: string;
 
 /** Run the hook against a synthetic HOME; returns merged stdout+stderr. */
 function runHook(env: Record<string, string> = {}): string {
+  // #226 — test isolation. The hook resolves its relay root + DB path from HOME and
+  // the RELAY_* environment (RELAY_ROOT="${RELAY_HOME:-$HOME/.bot-relay}"; RELAY_DB_PATH
+  // is honoured as a deliberate operator override). Inheriting the *ambient* RELAY_* —
+  // a developer shell that exports RELAY_DB_PATH, or a sibling test that set it on
+  // process.env during a full-suite run — silently redirected the hook off this test's
+  // temp HOME and flipped the two default-resolution verdicts (WRONG INSTANCE / MUTE).
+  // The suite was therefore green only on a clean CI runner (no ambient RELAY_*, no real
+  // ~/.bot-relay) and flaky on the machine where people actually work.
+  //
+  // Fix is STRUCTURAL, not detective: scrub the entire RELAY_* namespace from the
+  // inherited env so the ONLY relay state the hook can reach is this test's temp HOME
+  // plus whatever the test explicitly passes. Reaching the real root is unreachable, not
+  // merely unlikely. This changes WHERE the hook reads from — never what the verdicts
+  // mean; the hook's RELAY_DB_PATH-honouring (codex HIGH 1) is intentionally left intact.
+  const inherited: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && !k.startsWith("RELAY_")) inherited[k] = v;
+  }
   try {
     return execFileSync("bash", [HOOK], {
-      env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", ...env },
+      env: { ...inherited, HOME: home, RELAY_AGENT_NAME: "probe", ...env },
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -314,4 +332,40 @@ describe("the diagnostics must never break the hook they ride on", () => {
       expect(out).not.toContain("WRONG INSTANCE");
     });
   }
+});
+
+describe("#226 — the harness isolates ambient RELAY_*, so a polluted env cannot flip a verdict", () => {
+  // Regression guard for the exact full-suite flake this file caused: a sibling test (or
+  // the developer's own shell) exports RELAY_DB_PATH / RELAY_HOME on process.env, which —
+  // before the RELAY_* scrub in runHook — leaked into the hook and silenced the two
+  // default-resolution verdicts. The suite was then green only on a clean CI runner and
+  // red where people work. Here we DELIBERATELY seed that pollution and assert the two
+  // verdicts still fire, so re-introducing the leak (e.g. reverting runHook to spread
+  // ...process.env) reddens instead of going quietly green.
+  const POLLUTION: Record<string, string> = {
+    RELAY_DB_PATH: "/private/tmp/relay-226-ambient-leak.db",
+    RELAY_HOME: "/private/tmp/relay-226-ambient-home/.bot-relay",
+    RELAY_INSTANCE_ID: "ambient-leak-instance",
+  };
+  let saved: Record<string, string | undefined>;
+  beforeEach(() => {
+    saved = {};
+    for (const k of Object.keys(POLLUTION)) { saved[k] = process.env[k]; process.env[k] = POLLUTION[k]; }
+  });
+  afterEach(() => {
+    for (const k of Object.keys(POLLUTION)) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  });
+
+  it("still shouts WRONG INSTANCE despite an ambient RELAY_DB_PATH leak (no explicit override)", () => {
+    const out = runHook();
+    expect(out).toContain("WRONG INSTANCE");
+  });
+
+  it("still resolves MUTE despite an ambient RELAY_DB_PATH leak (legacy DB while instances exist)", () => {
+    writeConfig({ mcpServers: { "bot-relay": { type: "http", url: "http://127.0.0.1:3777/mcp" } } });
+    const m = runHook().match(/VERDICT=([A-Z-]+)/);
+    expect(m && m[1]).toBe("MUTE");
+  });
 });
