@@ -24,6 +24,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { getFreePort } from "./_helpers/port.js";
 
@@ -68,7 +69,7 @@ beforeAll(() => {
 
 describe("transport:http-from-config warning", () => {
   it("(W1) config FILE sets transport:http → the binary warns loudly on stderr", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".thttp-warn-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".thttp-warn-"));
     const port = await getFreePort();
     const cfgPath = path.join(tmpDir, "config.json");
     // transport:http lives in the FILE, so sources.transport === "config".
@@ -98,7 +99,7 @@ describe("transport:http-from-config warning", () => {
     // Negative control: an operator who sets RELAY_TRANSPORT=http made a
     // deliberate choice — the file-source warning must stay silent, or it would
     // cry wolf on every daemon start.
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".thttp-warn-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".thttp-warn-"));
     const port = await getFreePort();
     const devNull = fs.openSync("/dev/null", "r");
     const child = spawn(process.execPath, [ENTRY], {

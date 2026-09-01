@@ -38,7 +38,13 @@ export function listTools(): ToolDef[] {
         const { StdioClientTransport } = await import('${path.join(PROJECT_ROOT, "node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js")}');
         const fs = await import('node:fs');
         const path = await import('node:path');
-        const tmp = fs.mkdtempSync(path.join(process.cwd(), '.listtools-'));
+        const os = await import('node:os');
+        // os.tmpdir(), NOT process.cwd(): the temp DB must sit under an
+        // APPROVED_ROOT (db.ts) — process.cwd() is only approved because it
+        // happens to be under os.homedir(); a project moved elsewhere (or a
+        // harness that redirects HOME) makes RELAY_DB_PATH resolve outside the
+        // approved roots and the spawned server refuses to start.
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), '.listtools-'));
         const t = new StdioClientTransport({
           command: process.execPath,
           args: ['${path.join(PROJECT_ROOT, "dist/index.js")}'],
