@@ -87,7 +87,11 @@ jobs:
           npm run test:unit
 
       - name: Run test suite
-        run: npx vitest run
+        # #235: cap workers so the timing-sensitive spawn tests are not CPU-starved
+        # on a 4-vCPU runner (they each spawn a daemon subprocess). Measured: default
+        # file-parallelism oversubscribes and flakes; the pre-publish gate
+        # (--no-file-parallelism) never does. This keeps most parallelism.
+        run: npx vitest run --maxWorkers=2
 
       - name: npm audit (high+) — via resilience wrapper
         # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
@@ -146,7 +150,11 @@ jobs:
           fi
 
       - name: Run test suite
-        run: npx vitest run
+        # #235: cap workers so the timing-sensitive spawn tests are not CPU-starved
+        # on a 4-vCPU runner (they each spawn a daemon subprocess). Measured: default
+        # file-parallelism oversubscribes and flakes; the pre-publish gate
+        # (--no-file-parallelism) never does. This keeps most parallelism.
+        run: npx vitest run --maxWorkers=2
 
       - name: Assert the suite installed NO real launchd service
         run: |
