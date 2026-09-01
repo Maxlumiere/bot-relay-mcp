@@ -35,6 +35,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -92,7 +93,7 @@ beforeAll(() => {
 describe("v2.4.2 — TTY guard", () => {
   it("(T1) background daemon attempt (stdin=/dev/null) exits code 3 IMMEDIATELY on EOF", async () => {
     // Fresh in-memory-ish DB path so this test never touches ~/.bot-relay.
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".tty-guard-"));
     const devNull = fs.openSync("/dev/null", "r");
     const child = spawn(process.execPath, [ENTRY], {
       stdio: [devNull, "pipe", "pipe"],
@@ -141,7 +142,7 @@ describe("v2.4.2 — TTY guard", () => {
     // @modelcontextprotocol/sdk Client must complete connect() + list
     // tools through the spawned binary with the guard ENGAGED. Anything
     // less is testing a proxy, not the path operators actually use.
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".tty-guard-"));
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [ENTRY],
@@ -182,7 +183,7 @@ describe("v2.4.2 — TTY guard", () => {
   }, 15_000);
 
   it("(T3) RELAY_SKIP_TTY_CHECK=1 bypasses the guard even with /dev/null stdin", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".tty-guard-"));
     const devNull = fs.openSync("/dev/null", "r");
     const child = spawn(process.execPath, [ENTRY], {
       stdio: [devNull, "pipe", "pipe"],
@@ -207,7 +208,7 @@ describe("v2.4.2 — TTY guard", () => {
   }, 10_000);
 
   it("(T4) parent CLOSES stdin without writing — exits code 3 (daemon-launch mistake)", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".tty-guard-"));
     const child = spawn(process.execPath, [ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
@@ -235,7 +236,7 @@ describe("v2.4.2 — TTY guard", () => {
     // published binary. T4 above LOOKS like this case but is not: it calls
     // stdin.end(), so it is really "parent closed without writing". The
     // genuinely broken shape had no test at all, which is how it shipped.
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".tty-guard-"));
     const child = spawn(process.execPath, [ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, RELAY_DB_PATH: path.join(tmpDir, "relay.db"), RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "" },
@@ -249,7 +250,7 @@ describe("v2.4.2 — TTY guard", () => {
   }, 15_000);
 
   it("(T7) client sends its first frame LATE — still served (was exit 3)", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".tty-guard-"));
     const child = spawn(process.execPath, [ENTRY], {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, RELAY_DB_PATH: path.join(tmpDir, "relay.db"), RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "" },
@@ -269,7 +270,7 @@ describe("v2.4.2 — TTY guard", () => {
   }, 15_000);
 
   it("(T5) non-stdio transport (http) never engages the guard regardless of stdin", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tty-guard-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), ".tty-guard-"));
     const devNull = fs.openSync("/dev/null", "r");
     const child = spawn(process.execPath, [ENTRY], {
       stdio: [devNull, "pipe", "pipe"],
