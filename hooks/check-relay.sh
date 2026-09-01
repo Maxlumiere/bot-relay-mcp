@@ -740,11 +740,32 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
       echo "[relay] Bootstrap failed for $AGENT_NAME — register_agent succeeded but vault write failed. Run \`relay recover $AGENT_NAME\` and re-spawn." >&2
     fi
   fi
+  # Silent-failure class (onboarding launch gate): a FIRST-spawn registration that
+  # FAILED leaves the agent token-less and mute. On a first spawn there is no token,
+  # so the health_check auth probe above was skipped; if register_agent then fails
+  # for a non-auth reason — realistically NAME_COLLISION_ACTIVE, another live agent
+  # already holds the name — the daemon returns `isError:true` with NO agent_token
+  # (a 200-with-isError, NOT a non-200), we mint nothing, and RELAY_AGENT_TOKEN
+  # stays empty. The agent can still READ mail (the sqlite3 path below) but every
+  # SEND fails AUTH_FAILED — registered-looking, mute, and until now unannounced.
+  # Announce it: an agent that cannot send must not read as connected. Gated on
+  # token-STILL-empty AND isError, so a successful re-register (token preserved,
+  # isError absent) and a clean first-mint (token now set) both stay silent.
+  # NOTE: `isError` sits at the JSON-RPC RESULT level, so it is UNESCAPED
+  # (`"isError":true`) — unlike error_code/auth_error which live inside the
+  # stringified tool content and carry `\"…\"`. Verified against the live wire.
+  if [ -z "${RELAY_AGENT_TOKEN:-}" ] && printf '%s' "$REG_BODY" | grep -qE '"isError":[[:space:]]*true'; then
+    echo "[RELAY] *** REGISTRATION FAILED — you can read mail but CANNOT SEND ***" >&2
+    echo "[relay] register_agent issued no token for \"$AGENT_NAME\" (the server returned an error)." >&2
+    echo "[relay] You can READ mail, but every SEND this session will fail with AUTH_FAILED." >&2
+    echo "[relay] Most likely: the name \"$AGENT_NAME\" is already held by another ACTIVE agent." >&2
+    echo "[relay] Choose a unique RELAY_AGENT_NAME and restart, or set RELAY_HOOK_DEBUG=1 to see the server's reason." >&2
+  fi
   # If $RELAY_HOOK_DEBUG is set, print the full response for troubleshooting.
-  # Otherwise swallow silently — non-200 means the server refused (stale
-  # token, revoked state, etc.), which is fine: the earlier health_check
-  # probe will already have surfaced actionable messages to the operator.
-  # We just don't want to corrupt the DB with a fallback sqlite3 write.
+  # Otherwise stay quiet: the token-less failure case is announced just above, and
+  # a stale/revoked-token case was already surfaced (with exit 1) by the earlier
+  # health_check probe. We just don't want to corrupt the DB with a fallback
+  # sqlite3 write.
   if [ -n "${RELAY_HOOK_DEBUG:-}" ]; then
     echo "[bot-relay hook debug] register_agent response:" >&2
     echo "$REG_BODY" >&2
