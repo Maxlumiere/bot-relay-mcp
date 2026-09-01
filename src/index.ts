@@ -79,6 +79,29 @@ async function main(): Promise<void> {
       `(source: ${sources.config_path})`
   );
 
+  // Silent-failure class (onboarding launch gate): a config FILE that sets
+  // transport:"http" is the quietest way to make a stdio-spawned MCP server mute.
+  // The HTTP branch below runs, the stdio branch is skipped, and the client that
+  // spawned us (e.g. from ~/.claude.json) gets zero tools + a 30s timeout with no
+  // diagnostic — the stdio daemon-launch guard is gated on transport==="stdio", so
+  // it never fires here. The daemon takes its transport from RELAY_TRANSPORT (env),
+  // so a FILE-sourced http value is useless for the daemon AND fatal for every
+  // stdio spawn. Announce it rather than fail silent. Only the "config" source
+  // trips this: an env/CLI http choice is deliberate (the daemon path) and stays
+  // quiet, so this never cries wolf on a real HTTP server.
+  if (config.transport === "http" && sources.transport === "config") {
+    process.stderr.write(
+      `[bot-relay] WARNING: transport="http" was read from the config FILE ` +
+        `(${process.env.RELAY_CONFIG_PATH ?? "~/.bot-relay/config.json"}).\n` +
+        `  If this process was spawned as a stdio MCP server (e.g. from ~/.claude.json), it will NOT\n` +
+        `  speak MCP on stdin/stdout — the client gets zero relay tools and times out after 30s.\n` +
+        `  The daemon sets its transport via the RELAY_TRANSPORT environment variable, so this file\n` +
+        `  key is useless for the daemon and breaks every stdio spawn.\n` +
+        `  Fix: remove "transport" from the config file. A deliberate HTTP server should set\n` +
+        `  RELAY_TRANSPORT=http (env) or pass --transport=http instead.\n`,
+    );
+  }
+
   // v2.0 final (#18): validate config + env BEFORE any init side effects
   // (DB open, port bind, wasm load). Clear aggregate error messages.
   try {
