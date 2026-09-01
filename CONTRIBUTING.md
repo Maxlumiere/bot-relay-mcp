@@ -73,6 +73,14 @@ Never start v(N+1) while v(N) has PARTIAL or DRIFT items from review. Ship patch
 
 A recurring discipline (precedent: Phase 4b.1 v2's `authenticateAgent`, Phase 4b.2's rotation_grace cleanup, Phase 4b.3's `decryptContent`): read helpers do NOT mutate state. Side effects live in write paths, dedicated piggyback ticks, or explicit CLI operations. If you're proposing a read-with-side-effect in a new phase, flag this discipline in the pre-code checkpoint and require explicit sign-off to deviate.
 
+### 7. An open ticket is a claim about the past
+
+An issue describes the repo on the day it was filed, not today. Before building anything from one, **verify the described defect still exists on `main` now** — and say so in your first line. A state check that errors or returns empty is **not** a pass; re-run it before it can license work. (Learned the hard way: a whole work session spent re-doing a refactor that had already merged, because the check — a `grep` with a glob the shell rejected — returned nothing, and "no output" was read as "nothing to find." The probe failed open and dispatched on the issue text alone.)
+
+### 8. CI green is a claim about a base, not a branch
+
+A green check proves the branch passed *against the base it ran on*. Merging any PR moves `main` and invalidates every other open PR's evidence — their green now belongs to a base that no longer exists. So for each PR: rebase onto the current tip, let CI fully re-run, and re-confirm the head commit's parent equals the live `main` tip **at the moment you report or merge** — never trust a pre-move green. (Learned the hard way: two "all green" dependency PRs, verified minutes apart; the first merge moved `main` and the second was refused with `N of N required status checks are expected`. Both verifications were correct *and* stale within seconds.)
+
 ---
 
 ## Pre-publish gate
