@@ -56,6 +56,11 @@ import { installDaemon, type InstallDeps, type HealthProbe } from "./launchd.js"
 
 function defaultBotRelayDir(): string {
   // v2.4.0 Part E — honor RELAY_HOME override (test harnesses + ops sandboxes).
+  // NAME COLLISION WARNING (#240): RELAY_HOME = where relay STATE lives
+  // (relay.db, config.json, instances/, marker/, wake-coverage). It is NOT the
+  // same knob as RELAY_CLAUDE_HOME (Claude Code config — see claudeHome() below);
+  // neither implies the other. To sandbox relay state in a test/ops run set
+  // RELAY_HOME (or real HOME); RELAY_CLAUDE_HOME does NOT redirect this path.
   if (process.env.RELAY_HOME) return process.env.RELAY_HOME;
   return path.join(os.homedir(), ".bot-relay");
 }
@@ -65,7 +70,12 @@ function defaultConfigPath(): string {
 }
 
 /** v2.16.0 — Claude Code config locations. RELAY_CLAUDE_HOME overrides the
- *  home root (test harnesses) so init never touches a developer's real files. */
+ *  home root (test harnesses) so init never touches a developer's real files.
+ *  NAME COLLISION WARNING (#240): RELAY_CLAUDE_HOME = where Claude Code's config
+ *  lives (~/.claude.json, ~/.claude/). It is NOT the relay-state knob — that is
+ *  RELAY_HOME (see defaultBotRelayDir() above). The names collide; neither
+ *  implies the other. Setting RELAY_CLAUDE_HOME does NOT sandbox ~/.bot-relay, so
+ *  a harness that sets only it still reaches the live relay DB + :3777 daemon. */
 function claudeHome(): string {
   return process.env.RELAY_CLAUDE_HOME || os.homedir();
 }

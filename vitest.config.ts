@@ -31,7 +31,16 @@ export default defineConfig({
     // ws-401/403 on a machine that has run `relay init`) from ONE site. A test that
     // sets its own RELAY_CONFIG_PATH at its module top overrides it (asserted in
     // tests/config-isolation.test.ts). Scoped to config+secrets, NOT RELAY_HOME.
-    setupFiles: ["./tests/_setup/hermetic-config.ts"],
+    // hermetic-config isolates CONFIG + SECRETS; relay-home-sandbox isolates
+    // relay STATE by redirecting HOME (→ os.homedir() → every default ~/.bot-relay
+    // path: the DB, the wake-coverage sink, the CLI) so no test reaches the
+    // operator's real ~/.bot-relay + live :3777 daemon (issue #240). HOME, not
+    // RELAY_HOME — the latter breaks tests that assert the RELAY_HOME-absent
+    // resolver. Guarded by tests/relay-home-sandbox-negative-control.test.ts.
+    setupFiles: [
+      "./tests/_setup/hermetic-config.ts",
+      "./tests/_setup/relay-home-sandbox.ts",
+    ],
     include: ["tests/**/*.test.ts"],
     exclude: [
       "node_modules/**",
