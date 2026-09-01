@@ -40,6 +40,7 @@ export const TOOL_BUNDLES: Record<string, string> = {
   get_task: "core",
   set_status: "core",
   report_liveness: "core",
+  whoami: "core",
   health_check: "core",
   // webhooks
   register_webhook: "webhooks",

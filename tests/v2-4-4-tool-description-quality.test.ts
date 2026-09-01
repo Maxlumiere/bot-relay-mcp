@@ -94,7 +94,7 @@ describe("v2.4.4 — tool description quality", () => {
   const tools = listTools();
 
   it("(Q1) every tool has a description with sufficient length", () => {
-    expect(tools.length).toBe(37); // 35 + abandon_registration (ADR-0005 #4) + get_outstanding (ADR-0011)
+    expect(tools.length).toBe(38); // 35 + abandon_registration (ADR-0005 #4) + get_outstanding (ADR-0011) + whoami (onboarding)
     const offenders = tools
       .filter((t) => !t.description || t.description.length < MIN_DESCRIPTION_CHARS)
       .map((t) => `${t.name}: ${t.description?.length ?? 0} chars`);
@@ -228,6 +228,7 @@ describe("v2.4.4 — tool description quality", () => {
       task_schema_get: "4ec18861f288b8e7122e43834d86715da037eecd623bd98eec4ce368460b699f",
       unregister_agent: "dcd94807ba629527459cb0df2b5d73427d0b09bea7f756a47700e000685736ee",
       update_task: "05aacb80e85bf615a033a7611bb58d673dbb7bd86e5e33f846243f323cd02931",
+      whoami: "ea95167d6d8c3f910c70faf842fafae2f9b8d4bdd5ebe0b1a93a67ae22c3a828",
     };
 
     const actualHashes: Record<string, string> = {};

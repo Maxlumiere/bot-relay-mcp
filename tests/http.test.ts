@@ -98,9 +98,9 @@ describe("HTTP transport", () => {
     expect(body2.uptime_seconds).toBeGreaterThanOrEqual(body.uptime_seconds);
   });
 
-  it("tools/list returns all 37 tools (36 + get_outstanding [ADR-0011])", async () => {
+  it("tools/list returns all 38 tools (37 + whoami [onboarding])", async () => {
     const result = await mcpCall("tools/list", {});
-    expect(result.result.tools.length).toBe(37);
+    expect(result.result.tools.length).toBe(38);
     const names = result.result.tools.map((t: any) => t.name);
     expect(names).toContain("register_agent");
     expect(names).toContain("abandon_registration");

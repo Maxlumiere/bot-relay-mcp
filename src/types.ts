@@ -553,6 +553,48 @@ export const ReportLivenessSchema = z.object({
 });
 export type ReportLivenessInput = z.infer<typeof ReportLivenessSchema>;
 
+/**
+ * whoami — a connected agent asks the relay what IT is. No caller field: the
+ * presented token identifies the caller, so the answer is always about the caller
+ * and never about another agent.
+ */
+export const WhoamiSchema = z.object({
+  agent_token: z
+    .string()
+    .optional()
+    .describe("Your agent token. Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header. The token IS the identity; whoami reports the agent it belongs to."),
+});
+export type WhoamiInput = z.infer<typeof WhoamiSchema>;
+
+/**
+ * The CLOSED identity surface `whoami` returns.
+ *
+ * ⛔ SECURITY BOUNDARY, ENFORCED BY THIS TYPE — not by the current implementation.
+ * The onboarding measurement found six facts an agent must be told and cannot ask
+ * for. THREE of them are DELIBERATELY absent here and this shape MUST NOT grow to
+ * carry them — not by a spread, a refactor, or a helpful addition at 2am:
+ *   • token — stored only as a bcrypt HASH; it is unrecoverable BY CONSTRUCTION, so
+ *     it cannot be returned even in principle. (Loss is recovered via the
+ *     filesystem `relay recover` path, deliberately, not over the wire.)
+ *   • http_secret / dashboard_secret — OPERATOR credentials. An agent token that
+ *     yields an operator secret is privilege escalation and would collapse the
+ *     trust boundary the whole auth model rests on.
+ * "An agent cannot ask for this" and "that is a gap" are different statements: the
+ * first three are the gap whoami closes; these three are boundaries it must keep.
+ * The type is CLOSED (no index signature, no `[k: string]: unknown`) so a forbidden
+ * field is UNREPRESENTABLE, not merely omitted — "the type cannot carry it" is a
+ * guarantee where "we didn't include it" is only a promise. Guarded by
+ * tests/whoami-boundary.test.ts.
+ */
+export interface WhoamiResult {
+  agent_name: string;
+  role: string;
+  capabilities: string[];
+  instance_id: string | null;
+  db_path: string;
+  host_id: string | null;
+}
+
 export const HealthCheckSchema = z.object({
   agent_token: AgentTokenField,
 });

@@ -4,7 +4,8 @@
 // See LICENSE for full terms.
 
 import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData, setAgentLivenessAnchor, findAgentRowByToken, markAgentAuthenticated } from "../db.js";
-import type { SetStatusInput, HealthCheckInput, ReportLivenessInput } from "../types.js";
+import type { SetStatusInput, HealthCheckInput, ReportLivenessInput, WhoamiResult } from "../types.js";
+import { resolveActiveInstanceId, resolveInstanceDbPath } from "../instance.js";
 import { VERSION } from "../version.js";
 import { resolveSurfaceSummary } from "../surface-shape.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
@@ -275,5 +276,44 @@ export function handleHealthCheck(input: HealthCheckInput) {
         ),
       },
     ],
+  };
+}
+
+/**
+ * whoami — report the CALLER's own identity + instance. The dispatcher has already
+ * authenticated the token and exposed the resolved caller via request-context, so
+ * this NEVER trusts a client-supplied name. It builds the CLOSED `WhoamiResult`
+ * field-by-field from the agent row + the instance resolvers and NEVER spreads the
+ * raw row (which carries token_hash etc.) — so no secret is reachable in the reply.
+ * The three withheld facts (token, http_secret, dashboard_secret) are a security
+ * boundary documented on the WhoamiResult type; see tests/whoami-boundary.test.ts.
+ */
+export function handleWhoami() {
+  const callerName = currentContext().callerName;
+  if (!callerName) {
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "whoami could not resolve the caller from the presented token.", error_code: ERROR_CODES.AUTH_FAILED }, null, 2) }],
+      isError: true,
+    };
+  }
+  const row = getAgents().find((a) => a.name === callerName);
+  if (!row) {
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: `Agent "${callerName}" is not registered.`, error_code: ERROR_CODES.NOT_FOUND }, null, 2) }],
+      isError: true,
+    };
+  }
+  // Explicit, field-by-field — NEVER `...row` (the row carries token_hash). The
+  // closed WhoamiResult type makes a secret field unrepresentable in the response.
+  const identity: WhoamiResult = {
+    agent_name: row.name,
+    role: row.role,
+    capabilities: row.capabilities,
+    instance_id: resolveActiveInstanceId(),
+    db_path: resolveInstanceDbPath(),
+    host_id: row.host_id ?? null,
+  };
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ success: true, ...identity }, null, 2) }],
   };
 }
