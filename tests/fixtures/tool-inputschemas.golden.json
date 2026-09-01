@@ -1422,5 +1422,16 @@
     ],
     "additionalProperties": false,
     "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "whoami": {
+    "type": "object",
+    "properties": {
+      "agent_token": {
+        "type": "string",
+        "description": "Your agent token. Optional here — also resolvable from RELAY_AGENT_TOKEN env or X-Agent-Token header. The token IS the identity; whoami reports the agent it belongs to."
+      }
+    },
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
   }
 }

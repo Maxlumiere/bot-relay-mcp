@@ -45,6 +45,7 @@ import {
   GetChannelMessagesSchema,
   SetStatusSchema,
   ReportLivenessSchema,
+  WhoamiSchema,
   HealthCheckSchema,
   RotateTokenSchema,
   RotateTokenAdminSchema,
@@ -118,7 +119,7 @@ import {
   handleGetChannelMessages,
   handleListChannels,
 } from "./tools/channels.js";
-import { handleSetStatus, handleHealthCheck, handleReportLiveness } from "./tools/status.js";
+import { handleSetStatus, handleHealthCheck, handleReportLiveness, handleWhoami } from "./tools/status.js";
 import { handleGetStandup } from "./tools/standup.js";
 import { handleSetDashboardTheme } from "./tools/dashboard.js";
 import { handlePeekInboxVersion } from "./tools/peek-inbox-version.js";
@@ -201,6 +202,7 @@ const TOOL_SCHEMAS: Record<string, unknown> = {
   get_channel_messages: GetChannelMessagesSchema,
   set_status: SetStatusSchema,
   report_liveness: ReportLivenessSchema,
+  whoami: WhoamiSchema,
   health_check: HealthCheckSchema,
   rotate_token: RotateTokenSchema,
   rotate_token_admin: RotateTokenAdminSchema,
@@ -631,6 +633,17 @@ export function createServer(): Server {
         inputSchema: zodToJsonSchema(ReportLivenessSchema),
       },
       {
+        name: "whoami",
+        description:
+          "Ask the relay what YOU are — your own identity + instance, resolved from your token.\n\n" +
+          "When to use: a freshly-spawned agent that was handed a token but not told its name, instance id, or DB path can discover them here instead of being told — the smallest step toward zero-config onboarding. No caller field: the presented token IS the identity, so the answer is always about YOU and never another agent.\n\n" +
+          "Behavior: pure read. Returns your `agent_name`, `role`, `capabilities`, and the resolved `instance_id`, `db_path`, and `host_id`. Auth: your own agent token (arg / X-Agent-Token header / RELAY_AGENT_TOKEN env).\n\n" +
+          "⛔ SECURITY BOUNDARY — three facts are DELIBERATELY not returned and cannot be. Your TOKEN is stored only as a bcrypt hash, unrecoverable by construction (recover a lost token via `relay recover` on the filesystem, never over the wire). The operator `http_secret` / `dashboard_secret` are NOT an agent's to read — an agent token yielding an operator secret would be privilege escalation. The response type is closed so these can never appear in it.\n\n" +
+          "Returns: `{ success: true, agent_name, role, capabilities, instance_id, db_path, host_id }`.\n\n" +
+          "Errors: `AUTH_FAILED` (no/invalid token), `NOT_FOUND` (the caller's agent row is absent).",
+        inputSchema: zodToJsonSchema(WhoamiSchema),
+      },
+      {
         name: "health_check",
         description:
           "Report relay process health + live counts.\n\n" +
@@ -851,6 +864,8 @@ export function createServer(): Server {
         return handleSetStatus(SetStatusSchema.parse(args));
       case "report_liveness":
         return handleReportLiveness(ReportLivenessSchema.parse(args));
+      case "whoami":
+        return handleWhoami();
       case "health_check":
         return handleHealthCheck(HealthCheckSchema.parse(args));
       case "rotate_token":
