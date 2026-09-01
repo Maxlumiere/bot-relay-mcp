@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22'] # the two Node ABIs ci.yml claims to support
+        node: ['22'] # the one Node ABI ci.yml supports (Node 20 dropped in #182; better-sqlite3 13 needs >=22)
     steps:
       - name: Checkout
         uses: actions/checkout@v7
