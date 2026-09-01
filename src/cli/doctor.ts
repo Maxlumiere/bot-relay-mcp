@@ -55,6 +55,84 @@ async function checkConfig(): Promise<CheckResult> {
   }
 }
 
+/**
+ * Silent-failure detector (onboarding launch gate). A stdio bot-relay entry in
+ * `~/.claude.json` spawns `node <args[0]>`; if that path is percent-encoded (the
+ * `%20` fossil the old installer wrote for a root with spaces) or simply gone,
+ * node cannot spawn it and the session comes up with ZERO relay tools — a TOTAL
+ * failure with NO signal: nothing at session-start looks at this path. `relay
+ * init` catches it at write-time via the config-merge tripwire, but a
+ * PRE-EXISTING fossil is never re-examined. This check is that examination.
+ *
+ * A DETECTOR's target is absent by definition — the check is justified even when
+ * this machine's path is clean, because a diagnostic exists for the machines that
+ * are not this one. The negative control is load-bearing: a CLEAN, existing path
+ * must return PASS, never WARN — a doctor that flags healthy configs gets ignored.
+ *
+ * `claudeJsonPath` is injectable so tests exercise fixtures, never a real config.
+ */
+function resolveClaudeJsonPath(): string {
+  const home = process.env.RELAY_CLAUDE_HOME || os.homedir();
+  return path.join(home, ".claude.json");
+}
+
+export function checkMcpServerPath(claudeJsonPath: string = resolveClaudeJsonPath()): CheckResult {
+  const name = "mcp spawn path (~/.claude.json)";
+  if (!fs.existsSync(claudeJsonPath)) {
+    return { name, status: "PASS", detail: `no ${claudeJsonPath} — no client MCP config to check` };
+  }
+  let cfg: { mcpServers?: Record<string, unknown> };
+  try {
+    cfg = JSON.parse(fs.readFileSync(claudeJsonPath, "utf-8"));
+  } catch (err) {
+    return { name, status: "WARN", detail: `${claudeJsonPath} is unparseable: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const entry = cfg?.mcpServers?.["bot-relay"] as
+    | { type?: string; url?: string; command?: string; args?: unknown[] }
+    | undefined;
+  if (!entry || typeof entry !== "object") {
+    return { name, status: "PASS", detail: `no bot-relay entry in ${claudeJsonPath} — nothing to check` };
+  }
+  if (entry.type === "http" || typeof entry.url === "string") {
+    return { name, status: "PASS", detail: "bot-relay is an HTTP entry — no local spawn path to check" };
+  }
+  // stdio: the script is args[0] when command is a node launcher, else command itself.
+  const args = Array.isArray(entry.args) ? entry.args : [];
+  const scriptPath =
+    typeof entry.command === "string" && /(^|[/\\])node(\.exe)?$/.test(entry.command) && typeof args[0] === "string"
+      ? (args[0] as string)
+      : typeof entry.command === "string"
+        ? entry.command
+        : undefined;
+  if (typeof scriptPath !== "string" || scriptPath.length === 0) {
+    return { name, status: "WARN", detail: `bot-relay stdio entry in ${claudeJsonPath} has no resolvable spawn path` };
+  }
+  // Percent-encoding fossil (`%20` for a space, etc.): node cannot resolve it.
+  if (/%[0-9A-Fa-f]{2}/.test(scriptPath)) {
+    let decoded = scriptPath;
+    try { decoded = decodeURIComponent(scriptPath); } catch { /* keep raw if malformed */ }
+    return {
+      name,
+      status: "FAIL",
+      detail:
+        `percent-encoded path will NOT spawn — this session gets ZERO relay tools, silently. ` +
+        `Found: "${scriptPath}". It should be the DECODED path: "${decoded}". ` +
+        `Fix: set mcpServers."bot-relay".args to the decoded path in ${claudeJsonPath}, or re-run \`relay init\`.`,
+    };
+  }
+  // Not encoded, but the file is gone → node cannot spawn it either.
+  if (!fs.existsSync(scriptPath)) {
+    return {
+      name,
+      status: "FAIL",
+      detail:
+        `spawn path does not exist — this session gets ZERO relay tools, silently. ` +
+        `Path: "${scriptPath}". Fix: correct mcpServers."bot-relay".args in ${claudeJsonPath}, or re-run \`relay init\`.`,
+    };
+  }
+  return { name, status: "PASS", detail: `spawn path OK (${scriptPath})` };
+}
+
 async function checkDb(): Promise<CheckResult[]> {
   const p = getDbPath();
   const results: CheckResult[] = [];
@@ -392,6 +470,7 @@ export async function run(argv: string[]): Promise<number> {
   results.push(await checkDiskSpace());
   results.push(await checkDaemon());
   results.push(checkHooks());
+  results.push(checkMcpServerPath());
 
   process.stdout.write("=== relay doctor ===\n");
   let failCount = 0;
