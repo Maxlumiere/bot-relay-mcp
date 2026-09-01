@@ -1,25 +1,28 @@
-name: Native build (from-source ABI gate)
+name: Native binary (bundled prebuild + integrity)
 
-# WHY THIS EXISTS (separate from ci.yml):
-#   ci.yml runs `npm ci`, which on ubuntu-latest + Node 20/22 installs a PREBUILT
-#   better-sqlite3 binary — CI never COMPILES the native addon. So CI is the
-#   configuration LEAST likely to catch a native ABI / compile break, while the
-#   exposed users (musl/Alpine, ARM, an off-matrix Node minor) are exactly the
-#   ones who compile from source and get zero coverage. This job FORCES the
-#   from-source compile and runs the full suite against the compiled binary, so a
-#   break in better-sqlite3's native layer fails HERE instead of on a user's box.
+# WHY THIS EXISTS (separate from ci.yml) — and what it now verifies:
+#   Our native dependency (better-sqlite3) changed its distribution model at v13:
+#   it SHIPS bundled prebuilt binaries in its tarball (prebuilds/<platform>-<arch>.node)
+#   and no longer compiles at install (its install-time node-gyp is a stamp no-op).
+#   So we no longer build the native addon ourselves — we accept a binary from the
+#   tarball. That is a deliberate SUPPLY-CHAIN POSTURE: the guarantee moved from
+#   "we compiled it from source we can read" to "the exact tarball is pinned by an
+#   integrity hash."
 #
-# WHY NOT EVERY PR (the argument):
-#   Our TypeScript changes cannot introduce a native-ABI break — the binary
-#   depends on the better-sqlite3 version + the Node ABI, not on our code. So
-#   every-PR would tax every unrelated PR for a failure it structurally cannot
-#   cause. A native break ORIGINATES from (a) a dependency bump — caught by the
-#   package.json / package-lock path filter (this also auto-gates the pending
-#   better-sqlite3 major, PR #81); (b) a Node-matrix change — caught by the ci.yml
-#   path filter; or (c) runner-image / toolchain / upstream drift not tied to any
-#   PR — caught by the weekly schedule. workflow_dispatch covers on-demand checks.
-#   NOTE: this is NOT wired as a required status check — that is a branch-protection
-#   decision. As a path-filtered job it simply does not run on unrelated PRs.
+#   Retiring this job would leave NOTHING watching the artefact that actually runs —
+#   strictly less coverage. So it now verifies the two properties that carry the
+#   guarantee today (scripts/verify-native-binary.mjs), and is NAMED for exactly them:
+#     1. INTEGRITY — better-sqlite3 is pinned to an EXACT version by a registry
+#        `integrity` hash. Compiling was never really about the compile; it was about
+#        knowing what the binary CONTAINS. With v13 that knowledge is this hash.
+#     2. LOADS — the bundled prebuild for this platform loads and answers a query.
+#        That is the path users run — including musl/Alpine/ARM users, who were the
+#        MOST exposed under the old compile model and now get a working bundled binary.
+#
+# WHY NOT EVERY PR: a native break originates from a dependency bump or a Node-matrix
+#   change — both caught by the package.json / package-lock / workflow path filters
+#   below — plus a weekly schedule for runner/toolchain/upstream drift. This is NOT
+#   wired as a required status check; that is a branch-protection decision.
 
 on:
   pull_request:
@@ -27,6 +30,7 @@ on:
     paths:
       - 'package.json'
       - 'package-lock.json'
+      - 'scripts/verify-native-binary.mjs'
       - '.github/workflows/native-build.yml'
       - '.github/workflows/ci.yml'
   schedule:
@@ -35,7 +39,7 @@ on:
 
 jobs:
   native-build:
-    name: from-source (Node ${{ matrix.node }})
+    name: native-binary (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -51,38 +55,13 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: 'npm'
 
-      # Force node-gyp to COMPILE better-sqlite3 rather than download a prebuilt.
-      # Env is scoped to THIS step so it applies to the root install only — the
-      # ext install below (esbuild etc.) is left on its normal prebuilt path.
-      # foreground-scripts surfaces the compile output so the verify step can read
-      # it. `set -o pipefail` so a compile failure fails the step (the tee pipe
-      # would otherwise mask npm's non-zero exit).
-      - name: Install (forced from-source) + capture compile log
-        env:
-          npm_config_build_from_source: 'true'
-          npm_config_foreground_scripts: 'true'
-        run: |
-          set -o pipefail
-          npm ci 2>&1 | tee native-install.log
+      # v13 ships a bundled prebuild and no longer compiles at install, so a plain
+      # `npm ci` is exactly what a user gets — that is the artefact we then verify.
+      - name: Install (uses the bundled prebuild — v13 does not compile at install)
+        run: npm ci
 
-      # VERIFY BY OBSERVATION, not by the flag's presence — setting the flag is not
-      # proof it took effect. Fail CLOSED: require positive evidence node-gyp
-      # actually compiled AND that no prebuilt was downloaded. If we cannot SEE the
-      # compile, the gate did not exercise the native path — that is a failure, not
-      # a pass.
-      - name: Verify better-sqlite3 was COMPILED, not downloaded
-        run: |
-          if ! grep -qE 'gyp info spawn|node-gyp rebuild' native-install.log; then
-            echo "::error::better-sqlite3 shows NO node-gyp compile evidence — the from-source gate did not exercise the native compile path"
-            exit 1
-          fi
-          if grep -qiE 'prebuild-install[^\n]*(downloading|http request|GET )' native-install.log; then
-            echo "::error::better-sqlite3 downloaded a PREBUILT binary despite build-from-source — the gate is ineffective"
-            exit 1
-          fi
-          test -f node_modules/better-sqlite3/build/Release/better_sqlite3.node \
-            || { echo "::error::compiled better_sqlite3.node is missing"; exit 1; }
-          node -e "const D=require('better-sqlite3');const db=new D(':memory:');if(db.prepare('select 1 as x').get().x!==1)process.exit(1);console.log('from-source better-sqlite3 loads + queries OK')"
+      - name: Verify what ships — better-sqlite3 integrity pin + bundled prebuild loads
+        run: node scripts/verify-native-binary.mjs
 
       - name: Build
         run: npm run build
@@ -99,5 +78,5 @@ jobs:
           npm run typecheck
           npm run bundle
 
-      - name: Run test suite (against the from-source better-sqlite3)
+      - name: Run test suite (against the shipped better-sqlite3 binary)
         run: npx vitest run
