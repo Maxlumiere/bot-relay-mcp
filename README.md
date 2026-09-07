@@ -122,7 +122,7 @@ The bundled VSCode extension ships on the marketplace:
 code --install-extension lumiere-ventures.bot-relay-tether
 ```
 
-Or browse [marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether). Source for the extension lives at `extensions/vscode/` in this repo for users who want to build from source. The extension surfaces pending count + last-message recency in the status bar, opens a webview with the last message preview on click, and optionally auto-types `inbox` into the integrated terminal so Claude Code wakes up. See `extensions/vscode/README.md` for install + config and `docs/tether-roadmap.md` for the free-vs-paid scope line.
+Or browse [marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether). Source for the extension lives at `extensions/vscode/` in this repo for users who want to build from source. The extension surfaces pending count + last-message recency in the status bar, opens a webview with the last message preview on click, and optionally auto-types `inbox` into the integrated terminal so Claude Code wakes up. See `extensions/vscode/README.md` for install + config.
 
 ## Sentinel — `relay watch` (v2.18)
 

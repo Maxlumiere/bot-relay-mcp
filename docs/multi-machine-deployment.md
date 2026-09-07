@@ -262,14 +262,13 @@ Revoke a specific agent cross-hub via the `revoke_token` MCP tool (admin capabil
 - [`docs/key-rotation.md`](./key-rotation.md) — encryption key rotation operator runbook.
 - [`docs/migration-v1-to-v2.md`](./migration-v1-to-v2.md) — version-to-version upgrade procedure.
 - [`README.md` §Multi-machine: centralized deployment](../README.md) — user-facing summary that links back here for the full runbook.
-- [`docs/federation-envelope-v1.md`](./federation-envelope-v1.md) — frozen paper spec reserving shape for the v2.3 hub federation story. v2.1.0 does not implement it.
 
 ---
 
 ## 8. Known limitations (v2.1.0)
 
 - **Single-hub only** — no multi-hub bridging. Plan: v2.3 edge/hub split + v3 multi-hub pilot.
-- **Operator sees plaintext in hub RAM** — on-disk encryption via `RELAY_ENCRYPTION_KEY` does not reach the routing layer. End-to-end encryption is a v3+ item (see `docs/federation-envelope-v1.md` §3.1).
+- **Operator sees plaintext in hub RAM** — on-disk encryption via `RELAY_ENCRYPTION_KEY` does not reach the routing layer. End-to-end encryption is a v3+ item.
 - **TLS is your job** — bot-relay-mcp does not bundle certbot or similar. Run Caddy/nginx as the reverse proxy.
 - **No per-client rate limits distinct from per-agent** — quota is keyed on `agent_name`, so a client with many agents shares the pool.
 - **Hub is SPOF for cross-machine traffic** — local-only operations within each client's stdio MCP config still work if the hub is down, but cross-machine coordination halts.

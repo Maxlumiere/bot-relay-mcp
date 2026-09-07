@@ -224,7 +224,7 @@ The single-machine default (stdio transport, per-terminal process) assumes the o
 
 Trust-model consequences you must accept before deploying a centralized hub:
 
-- **The hub operator can read plaintext messages in RAM.** Even with `RELAY_ENCRYPTION_KEY` set, decryption happens server-side for routing decisions. On-disk encryption protects the DB file, backup tarballs, and raw `sqlite3` access — NOT the hub operator. End-to-end encryption where the hub only sees ciphertext is a v3+ scope item (see `docs/federation-envelope-v1.md` §3.1).
+- **The hub operator can read plaintext messages in RAM.** Even with `RELAY_ENCRYPTION_KEY` set, decryption happens server-side for routing decisions. On-disk encryption protects the DB file, backup tarballs, and raw `sqlite3` access — NOT the hub operator. End-to-end encryption where the hub only sees ciphertext is a v3+ scope item.
 - **The hub is a single point of failure for cross-machine coordination.** If the hub drops, agents on different machines cannot `send_message`, post tasks, or broadcast to each other until it comes back. Agents on the SAME machine still work via local stdio if that machine's MCP config includes a stdio entry.
 - **Per-agent tokens are issued by the hub, not the client.** If the hub is compromised, every client's token is compromised. Rotation is via `relay recover <name>` on the hub + re-run `relay pair` on each client.
 - **Recommended deployments:** families and small trusted teams (shared ownership of the hub), personal multi-machine setups (you own the hub + every client), CI + dev coordination within one team.
@@ -309,5 +309,4 @@ Acknowledged reports get a commit reference + credit in CHANGELOG unless the rep
 - `src/encryption.ts` — keyring + AES-256-GCM + versioned ciphertext.
 - `docs/key-rotation.md` — key rotation operator runbook.
 - `docs/migration-v1-to-v2.md` — upgrade guide between major versions.
-- `docs/federation-envelope-v1.md` — **frozen** cross-edge event envelope shape reserved for v2.3 hub federation + v3 P2P. Paper spec only; no code in v2.1.0 reads or writes it. Signing is ed25519; signatures cover canonical envelope bytes minus the signature field itself. Replay safety via `(origin_edge, event_id)` seen-set.
 - `tests/regression-plug-and-play.test.ts` — canary regressions; if any CANARY test goes red, publish is NOT safe.
