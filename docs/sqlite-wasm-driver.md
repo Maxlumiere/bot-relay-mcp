@@ -31,7 +31,7 @@ The other npm 12 defaults — `--allow-git` / `--allow-remote` now `none` (from 
 
 | Scenario | Driver |
 |---|---|
-| Standard install (macOS, Ubuntu, Node 18+) | `native` (default) |
+| Standard install (macOS, Ubuntu, Node 22+) | `native` (default) |
 | npm 12+ without approving install scripts | `wasm` (or approve — see above) |
 | Windows without VS Build Tools | `wasm` |
 | Alpine / musl Linux Docker image | `wasm` |

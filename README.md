@@ -53,6 +53,13 @@ Add to your `~/.claude.json`:
 
 The first invocation fetches the package and starts the server. Subsequent launches are instant.
 
+### Get hands-free autowake (the headline feature)
+
+The Quick Start above gives you the 37 tools and **manual** coordination — you ask an agent to `check my messages`. The **hands-free autowake** headline (agents wake *themselves* on new mail) needs two more, both optional:
+
+1. **The Tether VSCode extension** — `code --install-extension lumiere-ventures.bot-relay-tether` — wakes the agent's terminal when mail arrives. Outside VSCode, use `relay watch <agent>` (Sentinel) instead.
+2. **The keep-alive HTTP daemon + SessionStart hooks**, which deliver cross-process wakes (a message from one terminal waking a subscriber in another). Install them with `relay init`. From an npm install, `npm install -g bot-relay-mcp` puts `relay` on your PATH, then `relay init` (idempotent, never touches your tokens; `--skip-daemon` / `--skip-hooks` opt out). See [`docs/getting-started.md`](./docs/getting-started.md) and the security note below — and on Linux/Windows the daemon is not yet supervised (start it manually; see [`docs/cross-platform-spawn.md`](./docs/cross-platform-spawn.md)).
+
 ### Quick Start (from source)
 
 ```bash
@@ -821,8 +828,17 @@ Three ways to apply a role: paste into project `CLAUDE.md`, pass as `initial_mes
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 22+
 - Claude Code (or any MCP-compatible client)
+
+## Feedback & Questions
+
+- **Feature requests, "does it support X?", show-and-tell** → [GitHub Discussions](https://github.com/Maxlumiere/bot-relay-mcp/discussions).
+- **Bugs** → [open an issue](https://github.com/Maxlumiere/bot-relay-mcp/issues).
+- **Security** → see [`SECURITY.md`](./SECURITY.md).
+- **Email** → contact@lumiereventures.co.
+
+Using it with a client we don't list yet (Copilot, Cursor, Zed, a home-grown CLI)? Tell us in Discussions — real setups shape what ships next.
 
 ## License
 

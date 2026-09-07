@@ -14,7 +14,7 @@ npm run build
 npm test
 ```
 
-Node ≥ 18. The project uses `better-sqlite3` (native) by default; `sql.js` (WebAssembly) is an optional fallback driver — see `docs/sqlite-wasm-driver.md`.
+Node ≥ 22. The project uses `better-sqlite3` (native) by default; `sql.js` (WebAssembly) is an optional fallback driver — see `docs/sqlite-wasm-driver.md`.
 
 Run the dev relay in HTTP mode:
 
@@ -82,6 +82,10 @@ An issue describes the repo on the day it was filed, not today. Before building 
 ### 8. CI green is a claim about a base, not a branch
 
 A green check proves the branch passed *against the base it ran on*. Merging any PR moves `main` and invalidates every other open PR's evidence — their green now belongs to a base that no longer exists. So for each PR: rebase onto the current tip, let CI fully re-run, and re-confirm the head commit's parent equals the live `main` tip **at the moment you report or merge** — never trust a pre-move green. (Learned the hard way: two "all green" dependency PRs, verified minutes apart; the first merge moved `main` and the second was refused with `N of N required status checks are expected`. Both verifications were correct *and* stale within seconds.)
+
+**And the base is not only the commit graph — it is the state of every external oracle the gate consults.** `npm audit` (the `--audit-level=high` step) queries the npm advisory registry *at run time*, so its verdict tracks the state of the world, not the state of your code. A branch that was green yesterday reds today the moment a new advisory is published against an already-installed dependency — nothing of yours moved. Worse, `npm audit fix` cannot help when the vulnerable version is held by an `overrides` pin (an override defeats the auto-fix), so the only path is bumping the pinned version yourself. The tell is diagnostic and worth banking: **the same step failing *identically* across independent branches means the mover is outside the work.** Before you debug your own diff, check whether an unrelated open PR fails the same way — if it does, fix it once at the root and rebase the rest onto that base, never N times in parallel. (Learned the hard way: three unrelated onboarding PRs all red on `npm audit (high+)` the same morning; the cause was a fresh `fast-uri` advisory reaching us through `ajv`'s transitive dep, not any of the three diffs — #253 bumped the `overrides` pin `3.1.5 → 4.1.4` at the root and the other three went green on rebase.)
+
+**And a corollary about partial greens: N-of-M checks green is not (M−N)/M of the evidence — because each check answers a question about a different surface.** When some checks pass and one fails, do not read it as "almost there." Ask what surface each green actually covers versus the red: a partial green can be 100% of the *narrow* answer and 0% of the *wide* one. (Learned the hard way: on #253's first push, three of four required checks were green — but those three audit the **root** dependency tree only, while the fourth, the 25-tool smoke, runs the full pre-publish gate over **root + the `extensions/vscode` parity audit**. The root fix cleared the three and the smoke caught a second vulnerable tree the root override could not reach. "3 of 4 green" was not 75% done — it was the complete answer to "is root clean?" and no answer at all to "is the extension clean?" **Reporting the honest "3/4, 4th still running" instead of rounding to green is what surfaced the second defect before a merge could bury it.**)
 
 ### 9. A required CI check that no longer runs blocks the branch forever
 
