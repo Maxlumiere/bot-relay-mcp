@@ -335,7 +335,7 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(v).toContain("methodRotate");
   });
 
-  // ── the-fixer, 2026-08-11: hoisted-SQL under-detection (#57) ───────────────
+  // ── a review, 2026-08-11: hoisted-SQL under-detection (#57) ───────────────
   // The trigger side of the predicate reads ONE function unit's body text, so
   // SQL hoisted to module scope is invisible to it and the hardened must-bump
   // side never runs. Measured LATENT at 0294854 (zero module-scope validity SQL
@@ -396,7 +396,7 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(findAuthGenViolations(benign, "benign.ts")).toEqual([]);
   });
 
-  // ── codex #192 + victra + the-fixer (Addenda 1+2): paste-ready bars ─────────
+  // ── codex #192 + test-agent + a review (Addenda 1+2): paste-ready bars ─────────
   // The indirection axis (depth) and the kind axis (object/array/property) plus
   // the shadow/let over-detection bars. The resolver is BINDING-correct — it
   // reuses guard-ast's resolveName — so shadows stay green STRUCTURALLY, not by a
@@ -576,7 +576,7 @@ describe("ADR-0003 F — adversarial drift guard (test the guard, not just the c
     expect(findUnresolvableBindings(softDestr, "softd.ts").map((x: { name: string }) => x.name)).toContain("u");
   });
 
-  // ── DIRECTION-OF-FAILURE PIN (victra): the SHARED resolver's destructuring
+  // ── DIRECTION-OF-FAILURE PIN: the SHARED resolver's destructuring
   // limitation is SAFE on the must-CALL side because that side default-DENIES.
   // A mutator that DOES bump via a destructured alias is OVER-flagged (loud false
   // build failure), never passed clean. This pins the safe direction so a future
@@ -610,7 +610,7 @@ describe("ADR-0003 G — fold + scoped refusal at prepare()/exec() (#59, issue #
   const refuses = (src: string) => findUnresolvableBindings(src, "t.ts").map((x: { name: string }) => x.name);
 
   // FOLD — the acceptance bar is the SPLIT POINT, not the presence of concatenation
-  // (victra + the-fixer): for each protected column, a split INSIDE the column name
+  // (test-agent + a review): for each protected column, a split INSIDE the column name
   // AND a split inside a SQL keyword must flag. A clean-boundary-only set would
   // certify the very accident this fix removes.
   for (const col of ["token_hash", "auth_state", "token_lookup"]) {
@@ -727,7 +727,7 @@ describe("ADR-0003 G — fold + scoped refusal at prepare()/exec() (#59, issue #
     expect(findUnresolvableBindings(src, "t.ts")).toEqual([]);
   });
 
-  // ── codex #194 + victra: an interpolated template is a COMPOSITE (folded like a
+  // ── codex #194 + test-agent: an interpolated template is a COMPOSITE (folded like a
   // concatenation), plus the SQLite prepare()-vs-exec() carve-out (both engine-
   // verified: prepare rejects a second statement, exec runs it).
   it("REFUSE: a parameter interpolated as a column in a prepare() UPDATE", () => {
@@ -760,7 +760,7 @@ describe("ADR-0003 G — fold + scoped refusal at prepare()/exec() (#59, issue #
     const src = `${H}export function m(suffix: string): void { getDb().prepare(\`WITH c AS (SELECT 1) \${suffix}\`).run(); }`;
     expect(refuses(src)).toContain("m");
   });
-  // victra #194 — the SELECT prefix must be PROVABLY the start: an unresolvable
+  // #194 — the SELECT prefix must be PROVABLY the start: an unresolvable
   // substitution BEFORE the SELECT token means the read prefix is not established,
   // so `${x} SELECT …` REFUSES (else it walks through the same door).
   it("REFUSE: a dynamic substitution BEFORE the SELECT token defeats the carve-out", () => {

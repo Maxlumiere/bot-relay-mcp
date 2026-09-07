@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-// PRIMARY defect (the-fixer finding 1 / victra seq 859-867+): purgeOldRecords deleted
+// PRIMARY defect (finding 1 / seq 859-867+): purgeOldRecords deleted
 // UNDELIVERED mail at 7 days — it destroyed conduit's never-delivered message, the case
 // #198 exists for. The fix exempts UNDELIVERED obligations — mail NOT DRAINED by any
 // recipient (pendingGlobalClause: resolved_at IS NULL AND read_by_session IS NULL, the
@@ -155,13 +155,13 @@ describe("undelivered-mail purge exclusion (PRIMARY defect)", () => {
     // the wake-path regression the detector reports on, so it MUST survive to be reported.
     // The exemption predicate IS the detector's candidate set (pendingGlobalClause), so an
     // earlier seq-based predicate that purged this at 7d silenced the detector's own class.
-    const id = seed("a", "victra", "peeked but not drained", { ageDays: 10, seq: 42, readBy: null });
+    const id = seed("a", "test-agent", "peeked but not drained", { ageDays: 10, seq: 42, readBy: null });
     purgeOldRecords(getDb());
     expect(exists(id)).toBe(true); // retained to the 30d grace, NOT purged at 7d
   });
 
   it("a peeked-but-never-drained message PAST the grace IS dropped (bounded) and announced", () => {
-    const id = seed("a", "victra", "peeked, aged out", { ageDays: 40, seq: 42, readBy: null });
+    const id = seed("a", "test-agent", "peeked, aged out", { ageDays: 40, seq: 42, readBy: null });
     const err = captureStderr(() => purgeOldRecords(getDb()));
     expect(exists(id)).toBe(false); // bounded — the cost is 30d, not forever
     expect(err).toContain(`id=${id}`); // announced: it is an undelivered obligation

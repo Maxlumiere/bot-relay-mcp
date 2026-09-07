@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-// #inbox-preview-fragment (victra defect #3, 2026-08-31) — the notification/inbox PREVIEW must not
+// #inbox-preview-fragment (defect #3, 2026-08-31) — the notification/inbox PREVIEW must not
 // be a fragment a reader can mistake for the whole. buildInboxSnapshot (the relay://inbox/<agent>
 // resource the Tether wake-notification subscribes to), get_messages_summary, and get_outstanding
 // each used to emit a bare truncated slice plus a SEPARATE `*_truncated` boolean. A renderer/reader

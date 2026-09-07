@@ -90,7 +90,7 @@ describe("WakeGate ADR-0010 state-routed wakes (the 14-stacked-wakes fix)", () =
     for (let i = 1; i <= 14; i++) {
       gate.consider(
         snap(i, `2026-07-23T16:${String(i).padStart(2, "0")}:00Z`),
-        "victra-build",
+        "demo-builder",
         true,
         busyCovered,
       );

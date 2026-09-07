@@ -61,7 +61,7 @@ import {
 } from "./lib/guard-ast.mjs";
 
 // Columns whose mutation changes a token's VALIDITY and therefore MUST bump the
-// generation. EXCLUDED WITH ITS REASON (#59, victra + the-fixer measured it):
+// generation. EXCLUDED WITH ITS REASON (#59, measured):
 //   • revoked_at is NOT here on purpose. It is an audit timestamp — resolveAgent-
 //     ByToken decides revoked/active from auth_state + `token_hash IS NULL AND
 //     auth_state = 'active'`, and NOTHING reads revoked_at in a validity decision.
@@ -142,7 +142,7 @@ function hasValidityChangingMutation(bodyText) {
  * "looks like a read" and was a hole. If a future prefix is proposed, the bar is
  * an executed proof that it cannot carry a mutation, not that it usually does not.
  *
- * TWO STATED PROPERTIES (victra #194, both measured):
+ * TWO STATED PROPERTIES (#194, both measured):
  *   • CASE-INSENSITIVE — SQL keywords are, and real code is inconsistent, so
  *     `select * FROM agents ${x}` clears the same as `SELECT`.
  *   • A LEADING COMMENT does NOT qualify. Only whitespace is skipped before the
@@ -236,7 +236,7 @@ function classifyUnits(sf) {
       if (a.kind === "literal") parts.push(a.text); // FOLD: split position no longer matters
       else if (a.kind === "refuse") {
         parts.push(a.partial || ""); // the runs that DID resolve, so a visible violation still shows
-        // SUB-DECISION 1 (victra #194, SQLite-verified): a prepare() argument that
+        // SUB-DECISION 1 (#194, SQLite-verified): a prepare() argument that
         // provably STARTS as a read (SELECT ONLY — NOT `WITH`, a CTE can prefix a
         // mutation as one statement) cannot become a validity mutation, because
         // SQLite rejects a second statement appended by any substitution
@@ -277,11 +277,11 @@ export function findAuthGenViolations(source, fileName = "db.ts") {
  * of ANY shape, cannot be resolved to a literal — a bare parameter or other
  * dynamic value, a cross-module import, a function-call result, a reference cycle,
  * a concatenation with a non-literal operand, or a reassignable let/var whose
- * assignment set is not all-literal (#59, victra Option A; supersedes the #192
+ * assignment set is not all-literal (#59, Option A; supersedes the #192
  * file-level let/var scan — the module let/var refusal is now handled prepare-
  * scoped inside foldSqlArg). A SEPARATE exit code from a violation because "I
  * cannot analyse this" is a different fact from "your code is wrong". SCOPED to
- * arguments that reach a DB call — the-fixer measured a blanket version at 20
+ * arguments that reach a DB call — measured a blanket version at 20
  * false refusals on real db.ts, this scoping at 0.
  */
 export function findUnresolvableBindings(source, fileName = "db.ts") {

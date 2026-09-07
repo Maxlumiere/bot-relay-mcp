@@ -8,7 +8,7 @@
  * gap LOUD and lets a human decide (ADR-0007/ADR-0005). It never changes routing,
  * never wakes anyone, never mutates the DB — pure observation.
  *
- * THE OBSERVABLE IS THE WAKE'S EFFECT, NOT THE ATTEMPT (victra ruling). A wake is
+ * THE OBSERVABLE IS THE WAKE'S EFFECT, NOT THE ATTEMPT (design ruling). A wake is
  * "observed" only when the agent actually DRAINED its mailbox via MCP get_messages.
  * A running watcher, a live process, a self-reported status: none count. A wake that
  * fires and produces no drain SHOULD read as uncovered. That is read-the-state
@@ -37,12 +37,12 @@
  *                    "I cannot observe this" is a different fact from "this is
  *                    broken," and collapsing them is the exact error the whole
  *                    ADR set exists to prevent (the exit-1 vs exit-2 distinction,
- *                    one layer out). victra measured this class has exactly one
+ *                    one layer out). measured this class has exactly one
  *                    live member — the orchestrator itself — which is why a
  *                    detector that rendered it as "uncovered" would alarm on its
  *                    own operator from day one and be muted by week three.
  *
- * FLAT BOUND + ANTI-FLAP MARGIN (victra ruling, Option A). The discriminator is a
+ * FLAT BOUND + ANTI-FLAP MARGIN (Option A). The discriminator is a
  * flat fleet-wide age bound (`boundMs`, default 24h) — measured on 7 days of real
  * history, a 24h bound yields exactly one alarm (a genuinely 6.9-day-stuck message)
  * and zero false, so per-agent baselines were rejected on evidence (a subject-derived
@@ -56,7 +56,7 @@
  * condition — "no drain since the mail arrived" — is CUMULATIVE over the whole
  * span: one evaluation at age >= boundMs+margin already establishes that nothing
  * drained across that entire window, so a second observation would add state and a
- * missed-evaluation edge case while adding no information (victra).
+ * missed-evaluation edge case while adding no information.
  *
  * MEASURED RANGE — where the evidence stops: the 7-day sweep gave exactly one true
  * positive and zero false at BOTH a 24h and a 48h effective threshold, so any
@@ -96,7 +96,7 @@
  *     SILENCE MUST NOT DEPEND ON EVIDENCE THAT CAN BE ABSENT — from expiry, from a
  *     crash window, or from a partial failure. Such evidence must be written
  *     ATOMICALLY WITH THE EVENT IT RECORDS, AND outlive the condition it silences
- *     (victra). The rule was WIDENED from "must not depend on data that EXPIRES" after
+ *    . The rule was WIDENED from "must not depend on data that EXPIRES" after
  *     codex #200: the durability half was specified, the atomicity half was not, and a
  *     marker written just AFTER the drain transaction had a crash window that would
  *     leave a real drain looking "never drained" → UNOBSERVABLE → silenced. Earned,
@@ -162,7 +162,7 @@ export interface WakeCoverageFinding {
    * The EFFECTIVE fire threshold actually applied (`boundMs + antiFlapMarginMs`), in ms.
    * Carried so the operator-facing line renders the threshold that was USED, not the
    * name of one of its two inputs — "bound" (24h) alone is a lie when 48h fired
-   * (the-fixer finding 2; same class as the grace-log report-what-was-used fix).
+   * (finding 2; same class as the grace-log report-what-was-used fix).
    */
   readonly thresholdMs: number;
 }
@@ -251,7 +251,7 @@ export function classifyWakeCoverage(
     // identity, so the detector cannot judge. A NULL marker has more than one cause
     // (a genuine out-of-band reader, OR an agent row re-created by unregister/reap that
     // has not drained since — see line ~205), so the operator line states what is KNOWN
-    // and offers the causes rather than asserting a behaviour (the-fixer finding 3).
+    // and offers the causes rather than asserting a behaviour (finding 3).
     // Else UNCOVERED — drained before but not since the stuck mail: the S2 regression.
     const verdict: WakeVerdict = lastDrainAt !== null ? "uncovered" : "unobservable";
     findings.push({
@@ -331,7 +331,7 @@ export function runWakeCoverageSweep(
     writeWakeCoverageStatus(opts.statusPath ?? resolveWakeCoverageStatusPath(), {
       v: 1,
       generatedAt: new Date(opts.nowMs).toISOString(),
-      // NORMALIZE to an integer at the WRITER (codex r5 / victra 3rd option). The env path parseInt's
+      // NORMALIZE to an integer at the WRITER (3rd option). The env path parseInt's
       // bound/margin so it is already integer, but the exported runWakeCoverageSweep can be called
       // programmatically with float options. Rounding here makes the on-disk v:1 contract ALWAYS an
       // integer, so a strict integer reader can never false-alarm (UNKNOWN) on our OWN writer's output.
@@ -381,7 +381,7 @@ export function wakeConfigFromEnv(): WakeDetectorConfig {
     return Number.isFinite(n) && n >= 0 ? n : def;
   };
   return {
-    // DEFAULT-ON (victra): opt-in would recreate the "guard nobody invokes" class
+    // DEFAULT-ON: opt-in would recreate the "guard nobody invokes" class
     // (#196) — a detector no one enables passes its own tests and protects nothing.
     // Disable explicitly with RELAY_WAKE_DETECTOR=0. The cost of a wrong default
     // here is a stderr log line: REPORT-FIRST, no mutation, no page.

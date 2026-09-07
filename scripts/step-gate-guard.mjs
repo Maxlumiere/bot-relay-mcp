@@ -15,7 +15,7 @@
  * real gate might never reach it — the list would OVER-report, in the dangerous direction
  * (a guard read as "wired" that never actually runs).
  *
- * DESIGN 2a (victra ruling), FAIL-CLOSED: every `step "…"` must be UNCONDITIONAL — at
+ * DESIGN 2a (design ruling), FAIL-CLOSED: every `step "…"` must be UNCONDITIONAL — at
  * column 0 — EXCEPT the single vetted `if [ "$FULL_MODE" = "1" ]` block (a MODE FLAG: an
  * INPUT identical in the list and real runs, not a command result). ANY other shape — an
  * indented step outside that block, or a `cmd && step` / `if <cmd>; then step` — reddens
@@ -25,7 +25,7 @@
  * conditions (design 2b) — 24 of 27 steps are already unconditional, so the extra
  * machinery would buy nothing while adding a subtle surface to get wrong.
  *
- * ⚠ LIMIT — P2 (victra: STATE IT, DO NOT GUARD IT). --list-steps' cheapness/safety ALSO
+ * ⚠ LIMIT — P2 (STATE IT, DO NOT GUARD IT). --list-steps' cheapness/safety ALSO
  * assumes no BARE heavy or side-effecting command runs at top level (a future bare
  * `node dist/index.js &` would actually execute during a list-steps run). This guard does
  * NOT enforce that, on purpose: a shell script is mostly bare top-level commands
@@ -34,7 +34,7 @@
  * runs inside a vitest test, not production, so a leaked process is a CI annoyance, not a
  * fleet hazard. If it ever bites, design against the real incident rather than guessing now.
  *
- * BOUNDARY — the CLAIM, in precise words (victra ratification, codex #206). This does NOT
+ * BOUNDARY — the CLAIM, in precise words (ratification, codex #206). This does NOT
  * claim "no bypass exists". It claims: WITHIN the literal-`step` convention this gate
  * follows, the --list-steps run list matches what actually executes, AND any DEPARTURE from
  * that convention reddens here — a result-gated literal step, a step nested inside the

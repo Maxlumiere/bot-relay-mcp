@@ -212,7 +212,7 @@ export function handleGetMessages(input: GetMessagesInput) {
       isError: true,
     };
   }
-  // #inbox-subset (victra seq 961) — the completeness signal. Count ALL messages matching
+  // #inbox-subset (seq 961) — the completeness signal. Count ALL messages matching
   // this exact query (same SSOT predicate as the drain) BEFORE getMessages marks the returned
   // pending rows read — counting after would undercount the queue. `has_more` then makes a
   // capped drain structurally unable to claim it returned everything: the wake signal and the

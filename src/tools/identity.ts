@@ -56,7 +56,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   // ADR-0012 — force is a CONDITIONAL CAS takeover, never an unconditional
   // bypass. force=true MUST carry expected_session_id (the session_id the caller
   // READ from the row; null = "expect an offline row"). Absent → malformed:
-  // reject rather than fall back to a bypass, so no lost-update path (codex-5-5's
+  // reject rather than fall back to a bypass, so no lost-update path (the auditor's
   // #131 TOCTOU) can ever reopen. An operator force-claiming reads the row first,
   // then passes its session_id (read-then-CAS).
   if (input.force === true && input.expected_session_id === undefined) {

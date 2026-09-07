@@ -345,15 +345,15 @@ relay watch "$RELAY_AGENT_NAME" &      # event-driven with RELAY_FILESYSTEM_MARK
 
 A harness Monitor (or the operator) consumes the wake line and nudges the REPL to drain its inbox. This is the poll/marker sibling of Tether's push-wake: **Tether = VS Code; Sentinel = anywhere.**
 
-## Roadmap — any-terminal opt-in polling → `relay watch` (Maxime, 2026-07-15) — DELIVERED
+## Roadmap — any-terminal opt-in polling → `relay watch` — DELIVERED
 
-**Goal (met by v2.18.0 above):** any relay-connected terminal (not just Tether/VS Code) can *turn polling on* as a supported option. Today path β is a `/loop` template you copy by hand, and bare terminals (iTerm2 personas like victra) fall back to an operator hand-arming a Monitor. Per [[feedback_relay_plug_and_play]] a convention the user must remember = a relay bug, and per [[feedback_relay_over_memory]] this mechanical step should become a shipped feature.
+**Goal (met by v2.18.0 above):** any relay-connected terminal (not just Tether/VS Code) can *turn polling on* as a supported option. Today path β is a `/loop` template you copy by hand, and bare terminals (e.g. iTerm2) fall back to an operator hand-arming a Monitor. Per [[feedback_relay_plug_and_play]] a convention the user must remember = a relay bug, and per [[feedback_relay_over_memory]] this mechanical step should become a shipped feature.
 
 **Step 1 — opt-in polling for any terminal (near-term, low-effort).** Ship `relay watch <agent>` as a first-class CLI subcommand: runs the cheap `peek_inbox_version` loop (NOT a raw DB poke), and on an unread-count increase emits a standard wake signal — filesystem marker (turn on `RELAY_FILESYSTEM_MARKERS`, module already coded in `src/filesystem-marker.ts`) and/or a stdout line a harness Monitor can consume. One-line launcher gives polling to any surface. Reuses the Phase 4s primitives already built; no new detection layer.
 
 **Step 2 — per-surface wake shims consume the signal.** The relay ships the detector + signal; the last hop (nudge the specific REPL to read its inbox) stays surface-specific — Tether for VS Code, a Claude Code Monitor/hook for CLI, etc. The relay can't inject into an arbitrary runtime, so "polling comes with the relay" = watcher + standard signal shipped, thin shim per harness.
 
-**Priority:** low-effort; slot to victra-build on a building day, after the Codex-autowake item. Scoped task mirrored in `tasks/open.md`.
+**Priority:** low-effort, after the Codex-autowake item.
 
 ## See also
 

@@ -23,7 +23,7 @@
  * It deliberately does NOT flag prose, ~/.claude/… paths, --flags, display
  * strings ("Codex CLI"), longer identifiers ("claude-scope-planner"), or
  * registry lookups by id (`getAgentCliProfile("codex")`) — none of those are a
- * branch. Per the codex + victra gate: stay TARGETED, no blanket-literal guard.
+ * branch. Per the review gate: stay TARGETED, no blanket-literal guard.
  *
  * THREAT MODEL (deliberate, Victra-ratified scope boundary): this is a dev-time
  * hygiene guard against ACCIDENTAL drift, not a security sandbox. It resolves

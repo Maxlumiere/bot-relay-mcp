@@ -86,7 +86,7 @@
  * resolveUnitSqlText (below) follows a mutator's identifiers through module-scope
  * CONST bindings — aliases, objects, arrays, transitively — using this same
  * resolver (#57 / #192). At a prepare()/exec() SQL argument foldSqlArg goes further
- * (#59, victra Option A): it RECONSTRUCTS concatenations of resolvable literals so
+ * (#59, Option A): it RECONSTRUCTS concatenations of resolvable literals so
  * split position stops mattering, follows a let/var's whole assignment set
  * (fail-closed), and REFUSES any argument that does not resolve to a literal — an
  * import / function-call / cycle / non-literal operand / bare dynamic value
@@ -746,7 +746,7 @@ export function bodyCallsFunction(bodyNode, sf, names) {
 //     @fixture "a SHADOWED name must not be attributed to the module constant"
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// ── RESOLVER COVERAGE — STATED, not discovered (victra, #192 round 3) ─────────
+// ── RESOLVER COVERAGE — STATED, not discovered (#192 round 3) ─────────
 // Six review rounds each found a binding form the resolver did not handle, so the
 // boundary is written down here rather than rediscovered. Two facts, both MEASURED
 // (see the destructuring + call-side fixtures), not assumed:
@@ -784,7 +784,7 @@ export function bodyCallsFunction(bodyNode, sf, names) {
 //      with any operand that does NOT resolve to a literal (a cross-module import,
 //      a function-call result, a reference cycle, a parameter) reaching a DB call
 //      is REFUSED (exit 2), not passed. A TEMPLATE LITERAL WITH INTERPOLATION is
-//      the SAME thing as a concatenation wearing different syntax (victra #194):
+//      the SAME thing as a concatenation wearing different syntax (#194):
 //      its static spans and every ${substitution} are folded identically, and a
 //      single unresolvable substitution REFUSES — `${col}` where col is a
 //      parameter can be token_hash at runtime, so it is not a literal.
@@ -793,7 +793,7 @@ export function bodyCallsFunction(bodyNode, sf, names) {
 //      hasValidityChangingMutation is TWO INDEPENDENT sub-matches (/UPDATE\s+agents
 //      \s+SET\b/ or DELETE-FROM-agents, AND /\b<sensitive_col>\b/) that need NOT be
 //      contiguous — so a concatenation there matches ACROSS operands UNLESS a
-//      matched TOKEN itself is split (measured, victra @ #194). That is INCIDENTAL
+//      matched TOKEN itself is split (measured, #194). That is INCIDENTAL
 //      and split-position-dependent, NOT "per-operand" and NOT a boundary anyone can
 //      reason from; the fold above is the only place concatenation is handled by
 //      construction rather than by accident.
@@ -944,7 +944,7 @@ export function resolveUnitSqlText(bodyNode, sf, softHitOut) {
 
 // NOTE: the #192 file-level let/var refusal (findSqlBackedSoftBindings /
 // moduleSoftBindingReachesSql) was REMOVED in #59 — the let/var refusal is now
-// prepare()/exec()-scoped inside foldSqlArg/foldVarBinding (victra Option A), which
+// prepare()/exec()-scoped inside foldSqlArg/foldVarBinding (Option A), which
 // both narrows it to arguments that reach a DB call (0 false refusals on real
 // db.ts) and follows the whole assignment set fail-closed.
 
@@ -961,8 +961,8 @@ export function resolveUnitSqlText(bodyNode, sf, softHitOut) {
 // bare parameter, a free name, a reassignable local whose assignment set is not
 // all-literal), a cross-module import, a function-call result, a reference cycle,
 // or a concatenation with a non-literal operand all REFUSE. SCOPED to DB-call
-// arguments so benign consts never refuse (the-fixer measured a blanket version at
-// 20 false refusals on real db.ts, this scoping at 0; victra measured 262 literal
+// arguments so benign consts never refuse (measured a blanket version at
+// 20 false refusals on real db.ts, this scoping at 0; measured 262 literal
 // / 0 refuse / 1 opaque, the 1 a local let resolved by foldVarBinding → 0). A
 // REFUSE still carries `partial` — the literal text that DID resolve — so a
 // violation provable from a resolved operand outranks the refuse (PROOF BEATS
@@ -971,7 +971,7 @@ const DB_SQL_METHODS = new Set(["prepare", "exec"]); // better-sqlite3 SQL-takin
 // A non-whitespace marker standing in for an UNRESOLVABLE piece inside a `partial`.
 // Two jobs (#194): (1) it survives String.trim(), so a substitution BEFORE the SELECT
 // token — `${x} SELECT …` — leaves a leading marker and the prepare() read carve-out
-// is NOT established (victra: the prefix must be provably the start); (2) a matched
+// is NOT established (the prefix must be provably the start); (2) a matched
 // SQL token cannot cross it, so a concat/interpolation cannot forge `UPDATE agents
 // SET token_hash` across an unresolved gap. It is neither whitespace nor a word char.
 const UNRESOLVED_GAP = String.fromCharCode(1); // 0x01: non-whitespace, non-word
@@ -1009,7 +1009,7 @@ function dynRefuse(reason) {
 
 /**
  * Fold a `let`/`var` binding by its initializer AND every in-file assignment to
- * it (#59, victra Option A). FAIL-CLOSED: if ANY assigned value does not resolve
+ * it (#59, Option A). FAIL-CLOSED: if ANY assigned value does not resolve
  * to a literal — a call, a parameter, a value from outside the function, a
  * reassignment we cannot enumerate — REFUSE the whole binding rather than resolve
  * the visible ones and stay silent about the rest (that is the per-operand mistake
@@ -1062,7 +1062,7 @@ function foldVarBinding(decl, sf, seen) {
  * assignment set is incomplete — REFUSES (codex #194): an unresolvable SQL
  * argument at a DB call is never silently clean.
  *
- * ⚠ THE INVARIANT (victra #194, after seven shapes of one defect): SYNTACTIC FORM
+ * ⚠ THE INVARIANT (#194, after seven shapes of one defect): SYNTACTIC FORM
  * DOES NOT DECIDE — COMPLETENESS DOES. A node returns `literal` ONLY when every
  * sub-piece resolves: a concatenation's operands, a TEMPLATE's static spans AND
  * every substitution, a resolvable identifier's binding, an object/array member.
@@ -1076,7 +1076,7 @@ function foldSqlArg(node, sf, seen) {
   if (!node) return dynRefuse("an empty argument");
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return { kind: "literal", text: node.text, partial: node.text };
   if (ts.isTemplateExpression(node)) {
-    // A template WITH substitutions is a COMPOSITE, not a literal (victra #194 /
+    // A template WITH substitutions is a COMPOSITE, not a literal (#194 /
     // codex): identical to a concatenation of its static spans and its ${...}
     // pieces. Fold every piece; a single unresolvable substitution REFUSES, with
     // the resolved spans carried in `partial` so a violation visible in a span
@@ -1166,7 +1166,7 @@ function foldSqlArg(node, sf, seen) {
  * result per DB-call argument: { kind, text?, reason?, partial, line, argText,
  * method }. `method` is "prepare" or "exec" — the caller uses it for the SQLite
  * multi-statement carve-out (a prepare() SELECT cannot become a mutation; exec()
- * can — verified, victra #194).
+ * can — verified, #194).
  */
 export function foldDbCallArgs(bodyNode, sf) {
   const results = [];

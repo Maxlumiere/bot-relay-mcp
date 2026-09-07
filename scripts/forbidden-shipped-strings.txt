@@ -1,0 +1,22 @@
+# Forbidden strings in the SHIPPED npm tarball — internal personas, codenames,
+# and the maintainer's name/home path. The published package is what a stranger
+# sees in their node_modules; these must NEVER appear in it.
+#
+# SCOPE: this guards the TARBALL, not the source tree. Internal names in a
+# developer comment in src/ are fine — removeComments keeps them out of dist,
+# and what lives in the repo for humans is a separate question from what ships.
+#
+# FORMAT: one JavaScript regex per line. Blank lines and #-comments ignored.
+# Adding a future persona/codename is ONE line here — no code change.
+# `\b` word-boundaries keep `Maxime` from matching `Maxlumiere` (the public
+# GitHub handle) and `architect` from matching `architecture`.
+\bMaxime\b
+victra
+mustang
+the-fixer
+codex-5-5
+argus
+conduit
+concierge
+\barchitect\b
+/Users/maxime

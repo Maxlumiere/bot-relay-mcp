@@ -105,7 +105,7 @@ describe("ADR-0026 item 1 — wake-coverage findings reach a durable, fail-indep
     expect(line).toMatch(/cannot-judge/);
   });
 
-  // ENUMERATION (victra): every verdict the writer can emit gets a defined display state AND an
+  // ENUMERATION: every verdict the writer can emit gets a defined display state AND an
   // end-to-end writer→sink→read→formatter test. classifyWakeCoverage emits exactly two into findings
   // (uncovered, unobservable); covered is excluded (continue at detector.ts:249). One e2e per verdict:
   //   uncovered   → UNCOVERED (alarm, named)       [this test]
@@ -140,7 +140,7 @@ describe("ADR-0026 item 1 — wake-coverage findings reach a durable, fail-indep
   it("WRITER normalizes thresholdMs to an integer — even FLOAT options cannot produce a record the strict reader rejects (make-impossible)", () => {
     // The env path parseInt's bound/margin (integers); a float is reachable only by a programmatic
     // caller of the exported sweep. The writer Math.round-normalizes, so the on-disk v:1 contract is
-    // always integer and the strict reader never false-alarms on the writer's OWN output (victra 3rd option).
+    // always integer and the strict reader never false-alarms on the writer's OWN output (test-agent 3rd option).
     seedUncovered("norm-agent");
     const statusPath = path.join(TEST_DB_DIR, "wake-coverage-status.json");
     runWakeCoverageSweep(getDb(), { nowMs: NOW, boundMs: 24 * HOUR + 0.5, antiFlapMarginMs: 24 * HOUR + 0.25, statusPath });
@@ -186,7 +186,7 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
   it("GUARD (make-impossible, not a convention): writing the DEFAULT live path from a test harness HARD-ERRORS", () => {
     const status = { v: 1, generatedAt: new Date(NOW).toISOString(), thresholdMs: 1, findings: [] };
     // This is the structural stop for the mistake that poisoned the live sink — a convention you
-    // must remember is a bug (victra). Under vitest, the default path is refused, loudly.
+    // must remember is a bug. Under vitest, the default path is refused, loudly.
     expect(() => writeWakeCoverageStatus(defaultWakeCoverageStatusPath(), status as StatusArg as never)).toThrow(
       /DEFAULT live status path/,
     );
@@ -218,7 +218,7 @@ describe("ADR-0026 item 1 — poison prevention: default-path guard + staleness-
   });
 
   it("OK line carries a PRECISE age (as of Nm) — a bare/hour-rounded OK hides a sweep that has stopped", () => {
-    // victra Q1 ruling: a sink that speaks only on failure is indistinguishable from a dead sink;
+    // test-agent Q1 ruling: a sink that speaks only on failure is indistinguishable from a dead sink;
     // ALWAYS emit OK, and CARRY THE AGE so a drifting age (detector stopped but still 'OK') is
     // visible in the line, not buried in a log. Sub-hour granularity is the point — "0h ago"
     // hides a 4m vs 55m difference. RED on the pre-refinement hour-rounded line.

@@ -52,7 +52,7 @@ HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOOKS_DIR="$SCRIPT_DIR/../hooks"
 
-# Clear any INHERITED RELAY_LAUNCH_SESSION at entry (codex-5-5 PR#98 H1). A parent
+# Clear any INHERITED RELAY_LAUNCH_SESSION at entry (PR#98 H1). A parent
 # process, a rapid relaunch, or an explicit env supply could otherwise leak a
 # stale / other-session marker straight through to the exec'd Codex. We re-export
 # it ONLY after THIS invocation's OWN successful register (bottom of file), so the

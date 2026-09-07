@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 /**
- * #60 — S2 wake-coverage detector. The evidence victra required is INJECTED, not
+ * #60 — S2 wake-coverage detector. The evidence test-agent required is INJECTED, not
  * harvested from history: we plant the S2 harm — an agent that drained before,
  * then mail piles up and it stops draining across two evaluations — and prove the
  * detector REPORTS it as UNCOVERED with the exact wording it would emit. (Once
