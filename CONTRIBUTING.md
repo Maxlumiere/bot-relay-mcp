@@ -14,7 +14,7 @@ npm run build
 npm test
 ```
 
-Node ≥ 18. The project uses `better-sqlite3` (native) by default; `sql.js` (WebAssembly) is an optional fallback driver — see `docs/sqlite-wasm-driver.md`.
+Node ≥ 22. The project uses `better-sqlite3` (native) by default; `sql.js` (WebAssembly) is an optional fallback driver — see `docs/sqlite-wasm-driver.md`.
 
 Run the dev relay in HTTP mode:
 

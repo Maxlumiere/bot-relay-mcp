@@ -2,7 +2,7 @@
 
 **Phase:** v2.1.0 Phase 7r
 **Scope:** Package the "one hosted bot-relay-mcp + many thin MCP clients" deployment pattern as a first-class story.
-**Prerequisites:** Node 20+ on the hub; at least one MCP-compatible client (Claude Code / Cursor / Aider / custom) on each machine.
+**Prerequisites:** Node 22+ on the hub; at least one MCP-compatible client (Claude Code / Cursor / Aider / custom) on each machine.
 
 ---
 
@@ -25,7 +25,7 @@ Deployment target: a $5/mo DigitalOcean droplet (Singapore, Ubuntu 22.04) reacha
 ### 2.1 On the VPS
 
 ```bash
-# 1. Install Node 20+ (nvm, nodesource, or pkg — whatever you prefer).
+# 1. Install Node 22+ (nvm, nodesource, or pkg — whatever you prefer).
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
