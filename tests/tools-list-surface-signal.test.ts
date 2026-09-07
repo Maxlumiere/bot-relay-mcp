@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-// #tools-list-visibility (victra delivery review, 2026-08-31) — tools/list is a bare MCP protocol
+// #tools-list-visibility (test-agent delivery review, 2026-08-31) — tools/list is a bare MCP protocol
 // array we cannot extend, so a profile-hidden tool leaves NO signal there: an agent cannot tell
 // "hidden by my profile" from "does not exist" from "not connected", and a missing CAPABILITY is
 // never noticed because nobody looks for a tool they do not know exists. The signal goes into the

@@ -6,7 +6,7 @@
 /**
  * ADR-0005 (v2.22.0) — orphan-GC keystone, proven against the REAL auth paths.
  *
- * victra's pre-ship catch (2026-07-22): the orphan-GC safety rests entirely on
+ * test-agent's pre-ship catch (2026-07-22): the orphan-GC safety rests entirely on
  * "authed ≥1x ⇒ first_authed_at IS NOT NULL ⇒ never reaped." If the marker is
  * NOT stamped on the path orchestrators actually use — the EXPLICIT-CALLER path
  * (send_message.from / get_messages.agent_name, verified via
@@ -89,7 +89,7 @@ afterAll(() => {
 });
 
 describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller path", () => {
-  it("send_message (explicit-caller auth) STAMPS first_authed_at — the orchestrator path victra uses", async () => {
+  it("send_message (explicit-caller auth) STAMPS first_authed_at — the orchestrator path test-agent uses", async () => {
     const token = await register("gc-orch");
     await register("gc-rcpt");
     // Fresh registration is an orphan: never authenticated.
@@ -169,7 +169,7 @@ describe("ADR-0005 — the orphan-GC keystone holds on the REAL explicit-caller 
   });
 
   it("dashboard /api/send-message with a verified from_agent_token stamps (inventory path #5 — the `relay send` path)", async () => {
-    // victra's live production case: an orchestrator that authenticates ONLY via
+    // test-agent's live production case: an orchestrator that authenticates ONLY via
     // `relay send` (→ /api/send-message, path #5) had first_authed_at EMPTY on the
     // 2.20.0 daemon — so once 2.22.0 ships it would GC ITSELF the moment its
     // session nulled. This asserts the fix: an agent whose ONLY auth is #5 ends

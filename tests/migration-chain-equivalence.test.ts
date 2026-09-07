@@ -119,7 +119,7 @@ describe("#171 migration-chain equivalence — initializeDb() vs getDb() native 
     // The contract: identical table/column set and identical object DDL. If a
     // migration is ever added to one path but not the other, this diff reds.
     //
-    // DEMONSTRATED NON-VACUOUS (2026-09-01, victra review of #171): this assertion
+    // DEMONSTRATED NON-VACUOUS (2026-09-01, test-agent review of #171): this assertion
     // was proven load-bearing, not assumed so. Re-inlining the chain into getDb()'s
     // native fallback ONE MIGRATION BEHIND (omitting migrateSchemaToV2_24) drove
     // Path B a version behind Path A, and this `columns` diff went RED naming the

@@ -160,7 +160,7 @@ describe("profile isolation — codex options must not reshape the claude profil
   it("adapterFor('claude', {codex:…}) still types the bare `inbox` with claude's own submit mechanics", async () => {
     const adapter = adapterFor("claude", {
       codex: {
-        wakeText: 'Relay mail arrived — call get_messages(agent_name="victra-build", …)',
+        wakeText: 'Relay mail arrived — call get_messages(agent_name="demo-builder", …)',
         submitKey: "\n",
         submitDelayMs: 999,
         submitMethod: "sendSequence",

@@ -186,7 +186,7 @@ describe("`relay send` puts a CLEAN id on stdout, the confirmation on stderr", (
   });
 
   it("a success response WITHOUT a message_id → NON-ZERO exit + EMPTY stdout (never a silent empty capture)", async () => {
-    // codex-5-5's #130 re-audit repro: HTTP 200 + {success:true} but NO
+    // #130 re-audit repro: HTTP 200 + {success:true} but NO
     // message_id. The old default path printed the id only when present yet
     // returned 0 unconditionally → `id=$(relay send …)` captured "" at exit 0 —
     // the exact silent-capture failure the id-only contract exists to prevent.

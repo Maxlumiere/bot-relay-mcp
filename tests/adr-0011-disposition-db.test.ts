@@ -8,7 +8,7 @@
  * contract. Additive on the messages table: `disposition` (log|ask|obligation,
  * default log), `deadline`, and the sender's sticky agent-level `read_at`.
  *
- * The 5 LOAD-BEARING invariants victra's gate names, each asserted on the
+ * The 5 LOAD-BEARING invariants test-agent's gate names, each asserted on the
  * CONTRACT (not a proxy):
  *   1. MIGRATION-SAFE — default 'log' by construction; LOG is excluded from the
  *      outstanding recap, so a historical/undeclared message can NEVER be overdue.
@@ -20,7 +20,7 @@
  *   4. PULL-QUERYABLE OVERDUE — get_outstanding reconstructs overdue state from a
  *      cold call, with zero reliance on a webhook that may not have been heard.
  *   5. REPORT-ONLY — computing overdue NEVER mutates a message.
- * Plus: peek=true is a non-consuming read → leaves read_at NULL (victra note #2).
+ * Plus: peek=true is a non-consuming read → leaves read_at NULL (test-agent note #2).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";

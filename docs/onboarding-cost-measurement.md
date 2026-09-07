@@ -79,7 +79,7 @@ Fully silent: **a, d, f** (+ g until the first failed call). Partial: **b, c, g*
 5. **`http_secret`** (Channel B) — daemon transport credential, told out-of-band (`http.ts:263`)
 6. **`dashboard_secret`** (Channel C) — operator principal; only `relay init` generates it and there is **no CLI to read it back** (`http.ts:664`)
 
-An agent can ask the relay for none of these six. Each is, by victra's definition, a zero-config blocker.
+An agent can ask the relay for none of these six. Each is, by this definition, a zero-config blocker.
 
 ---
 

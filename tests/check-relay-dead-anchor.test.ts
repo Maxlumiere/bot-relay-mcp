@@ -7,7 +7,7 @@
  * ADR-0012 (Fork B) — the SessionStart dead-anchor diagnostic in
  * hooks/check-relay.sh, exercised through the SHIPPED hook (not a surrogate).
  *
- * THE NEGATIVE CONTROL (victra's gate): a row that reads LIVE to the 120s skip
+ * THE NEGATIVE CONTROL (test-agent's gate): a row that reads LIVE to the 120s skip
  * gate (session_id + fresh last_seen + host_shell_pids) but whose recorded
  * agent_pid anchor is DEAD on this host is UNWAKEABLE — yet the config-level
  * self-check still upgrades the verdict to HEALTHY. This test seeds a HEALTHY

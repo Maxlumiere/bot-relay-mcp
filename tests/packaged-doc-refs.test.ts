@@ -14,7 +14,7 @@
  * This guard fails CI whenever a PACKAGED doc references a repo doc that is
  * NOT itself packaged. It scans every shipped `.md` (per `files[]`) EXCEPT
  * `CHANGELOG.md` — a changelog legitimately names files that were later
- * removed, as history (victra: historical CHANGELOG mentions stay as-is).
+ * removed, as history (historical CHANGELOG mentions stay as-is).
  */
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";

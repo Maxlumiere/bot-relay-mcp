@@ -147,7 +147,7 @@ export function readWakeCoverageStatus(statusPath?: string): WakeCoverageStatus 
 /**
  * Compact human age for the briefing line. Sub-hour granularity is deliberate: an age that
  * drifts up is how you SEE a sweep that has stopped while the file still says "OK" — that must
- * be visible in the line, not buried in a log (victra Q1 ruling). Hour-rounding ("0h") hid it.
+ * be visible in the line, not buried in a log (design ruling). Hour-rounding ("0h") hid it.
  */
 function humanAge(ms: number): string {
   const m = ms < 0 ? 0 : ms;
@@ -238,6 +238,6 @@ export function formatWakeCoverageStatusLine(
     return `[RELAY] wake-coverage: UNKNOWN — ${status.findings.length} agent(s) with mail stuck past the threshold cannot be judged (UNOBSERVABLE — no drain marker): ${names}. Coverage unconfirmed, not healthy.`;
   }
   // ALWAYS emit OK (a sink that speaks only on failure is indistinguishable from a dead sink),
-  // and CARRY THE AGE so a drifting age exposes a stopped-but-still-"OK" sweep (victra Q1).
+  // and CARRY THE AGE so a drifting age exposes a stopped-but-still-"OK" sweep (Q1).
   return `[RELAY] wake-coverage: OK (as of ${humanAge(ageMs)}).`;
 }

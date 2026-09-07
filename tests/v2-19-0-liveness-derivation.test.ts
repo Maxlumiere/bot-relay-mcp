@@ -13,7 +13,7 @@
  *       agent_pid read "unknown". Now an argv scan (RELAY_AGENT_NAME="<name>")
  *       finds the agent's OWN process.
  *
- * The ACCEPTANCE test reproduces codex-5-5's exact situation (agent_pid null,
+ * The ACCEPTANCE test reproduces the auditor's exact situation (agent_pid null,
  * process alive with the name in argv) and asserts snapshot/discover show ALIVE.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -31,7 +31,7 @@ describe("v2.19.0 — agentProcessAdvertised (argv scan, both-side anchored, lit
       lines.join("\n");
 
   it("matches a name advertised EXACTLY in argv", () => {
-    expect(agentProcessAdvertised("codex-5-5", runWith(['node app RELAY_AGENT_NAME="codex-5-5" --x']))).toBe(true);
+    expect(agentProcessAdvertised("codex-agent", runWith(['node app RELAY_AGENT_NAME="codex-agent" --x']))).toBe(true);
   });
 
   it("HARD: does NOT prefix-substring match (foo ≠ foobar / foo-x)", () => {
@@ -97,7 +97,7 @@ describe("v2.19.0 — verdict cascade + status retire (acceptance)", () => {
     }
   });
 
-  /** Register `name`, then force the codex-5-5 shape: agent_pid NULL + host_id = OWN. */
+  /** Register `name`, then force the codex-agent shape: agent_pid NULL + host_id = OWN. */
   async function registerAsUnanchored(name: string): Promise<void> {
     const { registerAgent, getDb } = await import("../src/db.js");
     registerAgent(name, "auditor", []);
@@ -109,7 +109,7 @@ describe("v2.19.0 — verdict cascade + status retire (acceptance)", () => {
     return getAgents().find((a) => a.name === name);
   }
 
-  it("ACCEPTANCE (codex-5-5): agent_pid NULL but process advertises the name → ALIVE / online, NOT offline", async () => {
+  it("ACCEPTANCE : agent_pid NULL but process advertises the name → ALIVE / online, NOT offline", async () => {
     const name = "acc-agent";
     // A live process carrying RELAY_AGENT_NAME="acc-agent" in its argv (exactly
     // how the codex launch advertises it) — NOT this test's own process.

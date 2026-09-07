@@ -22,7 +22,7 @@
  * handshake landed in the DB (register carried it). Test path == shipped path:
  * the seam under test is the bash hook itself, not a TS/SQL surrogate.
  *
- * INVARIANT (victra P0): the hook's host_id must equal this machine's GUID from
+ * INVARIANT (test-agent P0): the hook's host_id must equal this machine's GUID from
  * the SAME OS source the extension reader uses (host-identity.ts) — asserted
  * against machineGuid() below, which mirrors relay_machine_guid().
  */

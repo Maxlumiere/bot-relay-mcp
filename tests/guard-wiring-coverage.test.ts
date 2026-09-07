@@ -9,7 +9,7 @@
  * still claim it is "enforced", and nothing errors — exactly how secret-register-guard.mjs
  * was wired into no gate while src/secret-registry.ts asserted it failed the build.
  *
- * FILESYSTEM-DRIVEN, the acceptance criterion (the-fixer, victra): guards are GLOB'D from
+ * FILESYSTEM-DRIVEN, the acceptance criterion (a review, test-agent): guards are GLOB'D from
  * disk, gates are READ from disk. NO hand-maintained list of guard names — a check that
  * carries its own copy of "the guards" goes stale against the thing it checks, the same
  * defect class it exists to catch.
@@ -51,7 +51,7 @@ const guards = readdirSync(SCRIPTS)
   .sort();
 
 const pkgJson: { scripts?: Record<string, string> } = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf-8"));
-// PACKAGE BUILD-HOOK FALLBACK — dev-time hygiene, NOT enforcement (victra-ratified boundary,
+// PACKAGE BUILD-HOOK FALLBACK — dev-time hygiene, NOT enforcement (test-agent-ratified boundary,
 // codex #206; the same threat model the step-gate and cli-profile guards carry).
 //   CATCHES: ACCIDENTAL non-wiring — a guard on disk never referenced as the `scripts.prebuild`
 //     command (the #61 establish-case: "added a guard file, forgot to wire it"). Within
@@ -141,7 +141,7 @@ describe("#61/#197b — every scripts/*-guard.mjs actually runs in a gate (execu
   }
 });
 
-// The negative fixtures ARE the deliverable (victra ruling), not the parser: a boundary
+// The negative fixtures ARE the deliverable (design ruling), not the parser: a boundary
 // claim needs an executed fixture proving WHICH DIRECTION it errs. A prebuild the parser
 // rejects makes the coverage fallback return false → coverage REDS for that guard
 // (fail-closed). Grammar, scoped to ORDINARY SINGLE-LINE syntax: a single direct
@@ -160,7 +160,7 @@ describe("#197b — package build-hook fallback: constrained prebuild grammar (e
   it("binds a direct `node scripts/prebuild-guard.mjs`", () => expect(runs("node scripts/prebuild-guard.mjs")).toBe(true));
   it("binds it with args", () => expect(runs("node scripts/prebuild-guard.mjs --strict")).toBe(true));
 
-  // NEGATIVE — each MUST NOT bind (victra's required set + more). Each is a real prebuild
+  // NEGATIVE — each MUST NOT bind (test-agent's required set + more). Each is a real prebuild
   // that a compromised/careless author could write; each makes `npm run build` succeed
   // WITHOUT running the guard, so binding it would be a false "guard is wired" claim.
   it("rejects `true || node …guard` — the || RHS is unreachable (codex #206 round 3)", () => expect(runs("true || node scripts/prebuild-guard.mjs")).toBe(false));
@@ -172,7 +172,7 @@ describe("#197b — package build-hook fallback: constrained prebuild grammar (e
   it("rejects `true`", () => expect(runs("true")).toBe(false));
   it("rejects a piped guard `node …guard | cat`", () => expect(runs("node scripts/prebuild-guard.mjs | cat")).toBe(false));
 
-  // BOUNDARY, DOCUMENTED not asserted (victra ruling, codex #206). This shape is PERMITTED
+  // BOUNDARY, DOCUMENTED not asserted (test-agent ruling, codex #206). This shape is PERMITTED
   // deliberately: `node …guard\ntrue` is a newline-separated two-command prebuild — the guard
   // RUNS but `true` masks its exit, so its FAILURE is silently bypassed. We do NOT block it:
   // it is a deliberately crafted string, out of scope by the threat model above (code review,

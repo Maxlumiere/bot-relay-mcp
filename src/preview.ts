@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 /**
- * #inbox-preview-fragment (victra defect #3) — build a message preview whose TEXT ITSELF reveals
+ * #inbox-preview-fragment (defect #3) — build a message preview whose TEXT ITSELF reveals
  * truncation, so a reader cannot mistake a fragment for the whole message.
  *
  * A preview accompanied ONLY by a separate `truncated` boolean lets any renderer or reader that

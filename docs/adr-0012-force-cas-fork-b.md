@@ -1,6 +1,6 @@
 # ADR-0012 — force = CAS takeover (amended), and the dead-anchor diagnostic (Fork B)
 
-**Target:** v2.22.x · **Status:** BUILT — awaiting codex-5-5 dual-audit + Victra gate · **Security-adjacent (auth-model boundary)**
+**Target:** v2.22.x · **Status:** BUILT — awaiting codex-agent dual-audit + the review gate · **Security-adjacent (auth-model boundary)**
 **Grounding:** full read of the register/force path, the presence-liveness cascade, the SessionStart hook, and the token-vault model (file:line refs inline). Supersedes the rejected #132 (`feat(ADR-0012): force = CAS takeover, not bypass`).
 
 ## 1. Problem / intent
@@ -9,7 +9,7 @@ Two defects, one arc:
 
 1. **The origin bug (what stranded a live builder).** On a fast (<120s) re-summon of a NEW terminal for an agent whose PRIOR terminal died, the agent row still carries the dead prior session's `session_id` + `host_shell_pids` + `agent_pid`, and `last_seen` is <120s old. The SessionStart LIVE-gate in `hooks/check-relay.sh` therefore reads the row as LIVE and SKIPS re-register — so the new terminal stays bound to a dead chain. Tether cannot bind a terminal to it, no wake reaches it, and the config self-check still prints `VERDICT=HEALTHY`. It is **unwakeable, and it looks healthy** — the silence-as-health failure this whole line of work exists to end.
 
-2. **Why #132's automatic takeover was rejected.** #132 made `force` a CAS takeover and had the SessionStart hook auto-force on relaunch when a liveness heuristic said the prior session was dead. Dual-audit (codex-5-5) + the architect rejected it: **the CAS is necessary but not sufficient.**
+2. **Why #132's automatic takeover was rejected.** #132 made `force` a CAS takeover and had the SessionStart hook auto-force on relaunch when a liveness heuristic said the prior session was dead. Dual-audit  + the architect rejected it: **the CAS is necessary but not sufficient.**
    - The CAS serializes the registration WRITE (it kills the double-force lost-update). That part is correct and permanent.
    - But B2's actual harm is the **mailbox drain** — two same-name terminals draining one inbox — and that lives at the **mailbox-auth layer**. `get_messages` authenticates by token/NAME and reads `session_id` *dynamically*; the CAS never touches it.
    - **P1a:** `{force, expected_session_id = <the LIVE current sid>}` matches the CAS (sid unchanged) → clobbers a LIVE terminal. sid-match ≠ dead.
@@ -19,7 +19,7 @@ Two defects, one arc:
 
 ## 2. The ruling — Fork B ("honest-smaller")
 
-Recommended jointly by codex-5-5 (audit) and the architect, approved by Maxime 2026-07-25. Fork A (automatic takeover) is explicitly **deferred**, not partially built.
+Recommended jointly by codex-agent (audit) and the architect, approved 2026-07-25. Fork A (automatic takeover) is explicitly **deferred**, not partially built.
 
 Build exactly three things:
 
@@ -55,7 +55,7 @@ The thing that is broken is the BINDING, not the IDENTITY. So the remedy clears 
 
 `relay recover <name> --yes` was rejected as the named remedy for **three reasons**, recorded here so the error message can never regress into shipping the cut behaviour back through the front door:
 
-1. **It frees the name.** Maxime already ruled on exactly this hazard: #119 cut the 30-day purge *because* freeing an authed agent's name reopens the bootstrap-claim window (v2.14.0). A remedy that frees the name reintroduces a deliberately-removed hazard.
+1. **It frees the name.** the maintainer already ruled on exactly this hazard: #119 cut the 30-day purge *because* freeing an authed agent's name reopens the bootstrap-claim window (v2.14.0). A remedy that frees the name reintroduces a deliberately-removed hazard.
 2. **It destroys the token.** A relaunch then needs a NEW credential, so the vault must be updated or the agent comes up mute — a two-step with a silent-failure gap between the steps, the exact class this arc exists to kill.
 3. **It destroys capabilities.** Capabilities are immutable after first register; blowing the row away is the one way to silently reset them.
 
@@ -97,7 +97,7 @@ The dead-anchor probe IS the substrate for Fork A's eligibility leg (codex TIER-
 - Anchor conformance — `tests/anchor-liveness-conformance.test.ts` (TS≡bash≡expected; argv-advertised divergence guard).
 - Diagnostic + **negative control** — `tests/check-relay-dead-anchor.test.ts` proves the verdict flips HEALTHY→UNWAKEABLE, and (verified by reverting the diagnostic) that WITHOUT the fix the row prints `VERDICT=HEALTHY` — the false-HEALTHY. Plus no-false-fire (live anchor stays HEALTHY) and unverifiable→`--override`.
 - Remedy — `tests/cli-release-binding.test.ts`: preserves token/name/caps/host_id; REFUSES on a live anchor and mutates nothing; refuses cross-host (unverifiable); `--override` releases with a loud note; sufficiency (post-release LIVE-gate reads STALE → SessionStart re-registers); and the **RACE regression** (§3.6) — a fresh rebind after the probe SURVIVES the release, verified to FAIL without the CAS.
-- Full CI at HEAD (root + extensions/vscode + `npm audit`, GitHub-green at the real HEAD, `npm ci` in the pre-merge gate), then codex-5-5 dual-audit before merge. No npm-publish (Maxime's 2FA gate; version bump deferred to release).
+- Full CI at HEAD (root + extensions/vscode + `npm audit`, GitHub-green at the real HEAD, `npm ci` in the pre-merge gate), then codex-agent dual-audit before merge. No npm-publish (the maintainer's 2FA gate; version bump deferred to release).
 
 ## 7. Accepted residual
 

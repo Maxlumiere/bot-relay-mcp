@@ -101,9 +101,9 @@ per-agent `-c` MCP identity override:
 
 ```bash
 alias codex5.5='cd "/path/to/workspace" && \
-  RELAY_AGENT_NAME=codex-5-5 RELAY_AGENT_TOKEN=<token> RELAY_AGENT_ROLE=auditor \
+  RELAY_AGENT_NAME=codex-agent RELAY_AGENT_TOKEN=<token> RELAY_AGENT_ROLE=auditor \
   RELAY_AGENT_CAPABILITIES=audit,review \
-  /path/to/bot-relay-mcp/bin/codex-relay codex-5-5'
+  /path/to/bot-relay-mcp/bin/codex-relay codex-agent'
 ```
 
 `RELAY_AGENT_NAME` (also the launcher's first argument) is required; `RELAY_AGENT_ROLE`
@@ -156,7 +156,7 @@ server one of two ways:
 - **Per-launch (multi-agent safe):** pass it on the codex launch as a config
   override so each alias declares its own agent:
   ```
-  codex -c 'mcp_servers.bot-relay.env.RELAY_AGENT_NAME="codex-5-5"'
+  codex -c 'mcp_servers.bot-relay.env.RELAY_AGENT_NAME="codex-agent"'
   ```
 - **Hardcoded in config** (single-agent only): set `RELAY_AGENT_NAME` in
   `[mcp_servers.bot-relay.env]`. Do **not** hardcode the token — the vault

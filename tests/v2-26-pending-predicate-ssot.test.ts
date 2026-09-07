@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 /**
- * #53 (mustang [DEFECT]) — PENDING PREDICATE SSOT: cross-surface invariant guard.
+ * #53 ([DEFECT]) — PENDING PREDICATE SSOT: cross-surface invariant guard.
  *
  * "Pending" is ONE concept. Before #53 it had four definitions — the peek wake
  * signal (`seq IS NULL`), the get_messages drain (per-session `read_by_session`),

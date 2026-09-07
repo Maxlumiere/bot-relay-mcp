@@ -6,7 +6,7 @@
 /**
  * ADR-0012 — FORCE = CAS TAKEOVER, NOT BYPASS.
  *
- * codex-5-5's #131 P1b: the old `force` was an unconditional bypass — a
+ * #131 P1b: the old `force` was an unconditional bypass — a
  * lost-update primitive. Two simultaneous relaunches both read the same stale
  * session, both forced, and the db CAS guarded auth/token but NOT session_id, so
  * the last writer clobbered the first. force is REDEFINED as a conditional CAS:

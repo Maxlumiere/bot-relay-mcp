@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-// #completeness-signal (victra, delivery review, 2026-08-31) — the get_messages(pending) subset
+// #completeness-signal (test-agent, delivery review, 2026-08-31) — the get_messages(pending) subset
 // defect (#1a) had live SIBLINGS: every LIMIT-capped list surface returned `count` with no signal
 // that more matched. This closes the CLASS via #1a's SAME shared-predicate mechanism: each surface's
 // WHERE lives in ONE builder (buildMessageWhere / buildTaskWhere / resolveChannelReadScope) that both

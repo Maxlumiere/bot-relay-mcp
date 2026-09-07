@@ -10,7 +10,7 @@ import { decideNoDeliveryWarn, NO_WAKE_WARN_COOLDOWN_MS } from "./no-delivery-wa
 describe("#3 no-delivery warn throttle", () => {
   it("HARM surfaced: the first no-delivery for an agent WARNS (the line finally reaches a human)", () => {
     const m = new Map<string, number>();
-    expect(decideNoDeliveryWarn('codex-5-5 has mail — no bound terminal', 1_000, NO_WAKE_WARN_COOLDOWN_MS, m)).toBe(true);
+    expect(decideNoDeliveryWarn('codex-agent has mail — no bound terminal', 1_000, NO_WAKE_WARN_COOLDOWN_MS, m)).toBe(true);
   });
 
   it("throttle: the same condition within the cooldown is SUPPRESSED (no per-poll-tick spam)", () => {

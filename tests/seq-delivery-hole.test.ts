@@ -15,7 +15,7 @@
  * conduit's 6.4-day message. Fix: gate the window on ALREADY-OBSERVED rows only —
  * `AND (seq IS NULL OR created_at >= ?)` — so undelivered mail is always eligible.
  *
- * These two cases are the acceptance bar (victra): the POSITIVE control proves the
+ * These two cases are the acceptance bar: the POSITIVE control proves the
  * fix delivers the aged undelivered message; the NEGATIVE control proves the fix
  * did NOT do it by disabling the window — an already-OBSERVED old message must
  * still be trimmed by `since`. Without the negative, the positive could pass with

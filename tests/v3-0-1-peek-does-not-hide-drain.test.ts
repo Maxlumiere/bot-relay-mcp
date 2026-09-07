@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-// 3.0.1 (the-fixer / victra seq 883): a shipped 3.0.0 silent-non-delivery defect. #198 made
+// 3.0.1 (review seq 883): a shipped 3.0.0 silent-non-delivery defect. #198 made
 // a pending drain return undelivered mail regardless of `since`, but keyed "undelivered" on
 // the OBSERVED axis (`seq IS NULL`). A non-consuming PEEK — what every watcher does
 // (Sentinel, the dashboard, `relay watch`) — stamps `seq` without delivering, so peeking an

@@ -197,7 +197,7 @@ masthead behind a drift-guard, a locked SSRF regression, extension-tree parity).
 ## v2.24.0 — 2026-07-28 — Security hardening: operator auth, dashboard content isolation, orchestration integrity
 
 <!--
-  VERSION: 2.24.0, locked by Maxime this session. Strict semver would make this a
+  VERSION: 2.24.0, locked this session. Strict semver would make this a
   MAJOR (3.0.0) because #142 is a breaking change, but a major bump signals a
   rewrite to anyone browsing npm and this is a hardening release, not that — so
   2.24.0 WITH the loud upgrade note below. This is the RELEASE PR: content is final
@@ -524,7 +524,7 @@ Restores the reported break — **"Tether stopped waking Codex."** It was a regi
 
 A release-tooling patch: **2.16.1 never reached npm** because the pre-publish gate failed on Node 24 / npm 11, so 2.16.2 is what ships and it **carries all of 2.16.1** (stable mint-once-reuse, below) plus this fix.
 
-- **The block.** The extension's VSIX-contents drift guard (`v0-1-4-vsix-contents.test.ts`) shells out to `vsce ls` / `vsce package`, which internally run `npm list --production --parseable --depth=99999`. Under npm 11 that scan **exits 1** on a false-positive `ELSPROBLEMS` (the `qs`/`form-data` `overrides` mark `call-bind-apply-helpers` / `get-intrinsic` "invalid" though the installed versions satisfy their ranges). npm 20/22 accept it, so CI stayed green while the gate — which Maxime runs on Node 24 — went red on all 11 assertions.
+- **The block.** The extension's VSIX-contents drift guard (`v0-1-4-vsix-contents.test.ts`) shells out to `vsce ls` / `vsce package`, which internally run `npm list --production --parseable --depth=99999`. Under npm 11 that scan **exits 1** on a false-positive `ELSPROBLEMS` (the `qs`/`form-data` `overrides` mark `call-bind-apply-helpers` / `get-intrinsic` "invalid" though the installed versions satisfy their ranges). npm 20/22 accept it, so CI stayed green while the gate — run locally on Node 24 — went red on all 11 assertions.
 - **The fix.** Both vsce invocations now pass `--no-dependencies`, skipping the dependency scan. The extension is esbuild-bundled, so runtime deps never ship in the VSIX — the packaged file list and byte ceiling the guard asserts are unchanged; only the spurious scan is gone. Verified passing on Node 24 / npm 11.
 - **Known follow-up (flagged, not in this patch):** the *relay* pre-publish gate runs this *extension* VSIX test, so a Tether-tooling failure can block a relay npm publish. Decoupling the two gates (or making the shared gate Node-version-robust) is a tracked follow-up.
 

@@ -587,6 +587,16 @@ step "auth-gen guard (every token/auth mutator invalidates the cache)" node "$PR
 # renaming/.skip-ing the test can no longer silently disable it.
 step "secret-register guard (every token minter registers for redaction)" node "$PROJECT_ROOT/scripts/secret-register-guard.mjs" "$PROJECT_ROOT/src/db.ts" || exit 1
 
+# --- 5c-2. Shipped-content guard (2026-09-07) — the THIRD category ------------
+# The gate asked "is it broken?" (tsc/build/vitest/audit/smoke) and the
+# secret-register guard asked "does it leak a TOKEN?"; neither asked "what does
+# the tarball say ABOUT US?". Internal names/personas/paths shipped in compiled
+# dist/ for weeks because a source scan reports clean while the artifact carries
+# them. This packs, EXTRACTS, and scans the tarball (not the source tree) for the
+# forbidden set in scripts/forbidden-shipped-strings.txt. Both-way control +
+# file:line messages proven in tests/shipped-surface-persona-free.test.ts.
+step "shipped-content guard (no personas/name/paths in the npm tarball)" node "$PROJECT_ROOT/scripts/shipped-content-guard.mjs" || exit 1
+
 # --- 5d. ADR-0002 agent-class taxonomy drift guard (v2.21.0) -----------------
 # src/agent-class.ts is the SSOT for the coordination-class taxonomy. This
 # TS-AST walk rejects a class-value literal branched-on (equality/switch) or a

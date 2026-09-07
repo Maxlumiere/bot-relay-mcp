@@ -12,7 +12,7 @@
  * takes a turn → Tether can't PID-bind it. bin/codex-relay closes it by
  * pre-registering the handshake FROM THE SHELL, before exec'ing Codex.
  *
- * THE HANDOFF (codex-5-5's PR #98 audit): the wrapper's launch register + the
+ * THE HANDOFF (the auditor's PR #98 audit): the wrapper's launch register + the
  * hook's first-turn register must NOT collide, must NOT reopen the duplicate-
  * live-session hole, and must let host_shell_pids + the exact agent_pid coexist.
  * Design:

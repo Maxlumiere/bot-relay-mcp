@@ -228,7 +228,7 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
     ).toMatch(/UNKNOWN/);
   });
 
-  // ---- codex #6 + victra: ONLY an EMPTY findings list is healthy — derive by EXCLUSION ----
+  // ---- codex #6 + test-agent: ONLY an EMPTY findings list is healthy — derive by EXCLUSION ----
   // An `unobservable` finding (stuck mail, no drain marker — coverage UNJUDGEABLE) is a NORMAL writer
   // output; it must NOT collapse into OK. The founding defect of this PR was UNOBSERVABLE lost in
   // stderr for 500h — converting it to OK is the same disease at the display layer. OK is reached ONLY
@@ -245,7 +245,7 @@ describe("wake-coverage sink robustness — UNKNOWN for every malformation, OK o
     expect(line, "the affected agent must be named").toMatch(/cannot-judge/);
   });
 
-  // ---- OVER-STRICTNESS (victra): benign variation must NOT manufacture a FALSE UNKNOWN ----
+  // ---- OVER-STRICTNESS: benign variation must NOT manufacture a FALSE UNKNOWN ----
   it("raw FLOAT thresholdMs → UNKNOWN — the WRITER normalizes to integer, so a fractional on-disk value is non-conforming", () => {
     // NOT over-strict: the writer (Math.round) guarantees integer on-disk, so this rejects only records
     // NO writer produces. The writer-side proof that float OPTIONS still yield a valid record lives in

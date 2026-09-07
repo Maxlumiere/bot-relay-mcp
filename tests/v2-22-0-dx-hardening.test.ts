@@ -203,7 +203,7 @@ describe("ADR-0005 #5 — MCP send_message accepts `content` OR `message`", () =
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// victra pre-ship catch (2026-07-22): the v22 migration must BACKFILL every
+// pre-ship catch (2026-07-22): the v22 migration must BACKFILL every
 // row that predates the orphan concept, or an upgrade leaves all existing
 // agents at first_authed_at IS NULL and the orphan-GC could false-reap a
 // live-but-session-less one before it re-authenticates.

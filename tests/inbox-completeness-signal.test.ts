@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-// #inbox-subset (victra seq 961, 2026-08-31) — get_messages(pending) returns a
+// #inbox-subset (seq 961, 2026-08-31) — get_messages(pending) returns a
 // priority-ordered, LIMIT-capped subset whose response was INDISTINGUISHABLE from a
 // complete one. The defect is NOT the limit (a defensible design choice); it is that
 // `count: messages.length` carried no has_more / total_pending signal, so the WAKE SIGNAL

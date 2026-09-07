@@ -92,7 +92,7 @@ function now(): string {
 
 // v2.19.0 — the coarse presence `status`, derived from the liveness VERDICT, NOT
 // from last_seen age. This RETIRES the age-based lie (root cause of the
-// "codex-5-5 reports offline while actively auditing" bug): staleness alone can
+// "an actively-auditing agent reports offline" bug): staleness alone can
 // no longer render a live agent offline; the verdict maps alive→online,
 // dead→offline, unknown→unknown (a live-but-unanchored, or cross-host, agent
 // must NEVER read dead).
@@ -1775,7 +1775,7 @@ function migrateSchemaToV2_23(db: CompatDatabase): void {
   const agentCols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
   if (!agentCols.some((c) => c.name === "first_authed_at")) {
     db.exec("ALTER TABLE agents ADD COLUMN first_authed_at TEXT");
-    // victra pre-ship catch (2026-07-22): BACKFILL every row that exists at
+    // pre-ship catch (2026-07-22): BACKFILL every row that exists at
     // v22-migration time. Such a row predates the orphan concept entirely — an
     // orphan is defined by a v2.22 `registration_recovery` handle, which no
     // pre-v22 registration ever minted — so none is a legitimate
@@ -2214,7 +2214,7 @@ export function abandonRegistration(name: string, handle: string): { abandoned: 
   return { abandoned: false, reason: "agent authenticated or acquired a session concurrently — not abandoned" };
 }
 
-// ADR-0005 FINAL RULING (Maxime, 2026-07-23) — there is NO automatic orphan GC,
+// ADR-0005 FINAL RULING — there is NO automatic orphan GC,
 // and one must not be reintroduced. Abandonment is UNDECIDABLE from row state:
 // a slow-spawned child, an idle recovered agent, and a genuinely abandoned
 // registration are byte-identical in the data. Five audit rounds each found a
@@ -2354,8 +2354,8 @@ export function purgeOldRecords(db: CompatDatabase): void {
   // (30d, same as completed tasks) — not the TRANSIENT 7d tier it wrongly sat in, nor the
   // 90d forensic tier — which covers the ~6d conduit outage ~5x. Configurable; 0 removes
   // the extension (purge at the normal 7d).
-  //   THE PREDICATE IS THE WAKE DETECTOR'S CANDIDATE SET, BY CONSTRUCTION (the-fixer /
-  // victra, seq 867+). "Undelivered" means NOT DRAINED — NOT "never observed". A message
+  //   THE PREDICATE IS THE WAKE DETECTOR'S CANDIDATE SET, BY CONSTRUCTION
+  //   (seq 867+). "Undelivered" means NOT DRAINED — NOT "never observed". A message
   // PEEKED but never drained (seq set, read_by_session NULL) is the wake-path regression
   // the detector cares about MOST: something looked at the mailbox and nothing consumed
   // it. An earlier `seq IS NULL` predicate (never-OBSERVED only) left that diagnostic
@@ -4489,7 +4489,7 @@ export function computeLivenessVerdict(row: {
   // Cascade — ALIVE-only signals, strongest/cheapest first; ANY hit → alive.
   //   1. the agent's OWN pid (start-time-matched — no PID-reuse false-alive);
   //   2. argv scan: a live process advertising RELAY_AGENT_NAME="<name>" — this
-  //      identifies the agent's OWN process by its name marker (the codex-5-5
+  //      identifies the agent's OWN process by its name marker (the fix
   //      case: no agent_pid, but the process carries the name in argv).
   //
   // DELIBERATELY NOT host_shell_pids (Victra's spec step 2): the v2.13.0 contract
@@ -4497,7 +4497,7 @@ export function computeLivenessVerdict(row: {
   // NOT keep a dead agent alive — host_shell_pids is the Tether ancestry chain
   // (terminal → shell → agent → …) and the terminal/shell OUTLIVE the agent, so
   // "any host_shell_pid alive" false-reads a crashed-agent-in-an-open-terminal as
-  // alive. The argv scan gets the same fix (codex-5-5) via the agent's OWN
+  // alive. The argv scan gets the same fix  via the agent's OWN
   // process, without that false-alive. (Flagged to Victra — deviation from spec.)
   _livenessProbeCount++;
   const alive =
@@ -4910,7 +4910,7 @@ export function getOrCreateMailbox(
 }
 
 /**
- * #53 (mustang [DEFECT]) — the CANONICAL "pending" predicate: the single source
+ * #53 ([DEFECT]) — the CANONICAL "pending" predicate: the single source
  * of truth every mailbox surface derives its pending/unread set from.
  *
  * Before this, four surfaces each had their OWN definition of "pending":
@@ -5027,7 +5027,7 @@ export function peekMailboxVersion(agentName: string): {
   // #53 — total_unread_count is THE wake signal (src/cli/watch.ts diffs it to
   // decide "does this agent have new mail?"). It MUST count the SAME set
   // get_messages(pending) would drain for this agent's CURRENT session, or the
-  // wake and the drain disagree (mustang [DEFECT]: wake said 1, pending said 0).
+  // wake and the drain disagree ([DEFECT]: wake said 1, pending said 0).
   // Pre-#53 this counted `seq IS NULL` — a DIFFERENT plane that any drain OR a
   // non-consuming browse silently zeroed (seq is stamped on first observation)
   // while the mail was still pending for the session that had not seen it. Route
@@ -5076,7 +5076,7 @@ export function rotateAllMailboxEpochs(): number {
 }
 
 /**
- * #inbox-subset (victra seq 961) — SSOT for the get_messages WHERE predicate.
+ * #inbox-subset (seq 961) — SSOT for the get_messages WHERE predicate.
  *
  * The pending drain (getMessages) and the completeness count (countMatchingMessages) MUST
  * derive the same set from the same clause: a `has_more` computed against a predicate that
@@ -5224,7 +5224,7 @@ export function getMessages(
     // `read_by_session` above (which this same UPDATE overwrites so the message
     // re-pends for a fresh session). HONEST BOUNDARY: read_at only stamps a read
     // observed through THIS get_messages drain (the normal MCP path). A recipient
-    // reading its mail by any OTHER means — a direct DB/CLI read, e.g. victra-build's
+    // reading its mail by any OTHER means — a direct DB/CLI read, e.g. the agent's
     // own MCP-muted session that drains via sqlite — does NOT stamp read_at. So the
     // receipt means "read via the normal MCP path," NOT "seen by any means"; a
     // sender must fall back to an explicit ack when the recipient is off that path.
@@ -5988,7 +5988,7 @@ export class ConcurrentUpdateError extends Error {
  * lands here. The handler maps this to FORCE_PRECONDITION_FAILED; the caller
  * MUST re-read (its LIVE gate then skips) and surface LOUDLY — never retry-force,
  * never come up mute (silence-as-failure). This is the concurrency guarantee
- * that replaces the old unconditional force bypass (codex-5-5's #131 TOCTOU).
+ * that replaces the old unconditional force bypass (#131 TOCTOU).
  */
 export class ForcePreconditionError extends Error {
   public readonly expectedSessionId: string | null;

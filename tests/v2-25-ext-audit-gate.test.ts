@@ -12,7 +12,7 @@
  * scripts/pre-publish-check.sh now runs `audit-with-retry.sh high` in the
  * extension dir — the SAME wrapper and level as the root audit.
  *
- * These are the executed proofs victra required:
+ * These are the executed proofs test-agent required:
  *  - PROVE IT BITES: a HIGH (or CRITICAL) makes the gate exit non-zero.
  *  - NEVER CRY WOLF: a moderate-only result must PASS (0). We carry a
  *    deliberately-accepted MODERATE (@hono/node-server); gating on moderate would
