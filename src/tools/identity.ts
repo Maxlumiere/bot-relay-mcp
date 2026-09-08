@@ -20,6 +20,8 @@ import {
   expandAgentCapabilities,
   setAgentLivenessAnchor,
   NameCollisionActiveError,
+  isNameActivelyHeld,
+  resolveAvailableInstanceName,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
@@ -45,13 +47,11 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   // surface `recovery_completed: true` in the response. The source of truth
   // is the atomic transition inside registerAgent (CAS-gated) — this read is
   // informational for the caller's hook flow, not load-bearing.
-  const preRow = getAgentAuthData(input.name);
-  const preState = (preRow?.auth_state ?? null) as
-    | "active"
-    | "legacy_bootstrap"
-    | "revoked"
-    | "recovery_pending"
-    | null;
+  // v2.26 auto-suffix: the row for the REQUESTED name drives collision
+  // detection; the row for the name we ACTUALLY register (`effectiveName`,
+  // possibly a relay-assigned `<name>-N` instance) drives recovery/preState,
+  // computed below once effectiveName is known.
+  const requestedRow = getAgentAuthData(input.name);
 
   // ADR-0012 — force is a CONDITIONAL CAS takeover, never an unconditional
   // bypass. force=true MUST carry expected_session_id (the session_id the caller
@@ -99,43 +99,86 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   //   - auth_state legacy_bootstrap: pre-v1.7 rows being migrated; no token
   //     exists yet, by definition no concurrent session.
   //   - force=true: explicit operator opt-in.
-  const ACTIVE_STATES = new Set(["idle", "working", "blocked", "waiting_user", "online", "busy"]);
-  const SESSION_TIMEOUT_SEC = 120; // matches the legacy warn window's tight lower bound
   const EXEMPT_AUTH_STATES = new Set(["recovery_pending", "legacy_bootstrap"]);
-  if (!input.force && preRow && !EXEMPT_AUTH_STATES.has(preRow.auth_state ?? "active")) {
-    const ageSec = (Date.now() - new Date(preRow.last_seen).getTime()) / 1000;
-    const isActivelyHeld =
-      preRow.session_id != null &&
-      ageSec < SESSION_TIMEOUT_SEC &&
-      ACTIVE_STATES.has(preRow.agent_status ?? "idle");
-    if (isActivelyHeld) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
+  // v2.26 auto-suffix: `effectiveName` is the name we actually register — the
+  // requested name unless it is actively held AND the caller opted into
+  // on_name_collision="suffix", in which case a relay-assigned `<name>-N`.
+  let effectiveName = input.name;
+  let assignedSuffix = false;
+  if (!input.force && requestedRow && !EXEMPT_AUTH_STATES.has(requestedRow.auth_state ?? "active")) {
+    // isNameActivelyHeld is the SSOT active-held triple (session_id + last_seen
+    // freshness + active status), NOT the `status` column. resolveAvailableInstanceName
+    // uses the SAME predicate for reuse, so the suffix path can never disagree
+    // with the collision path and hand a live instance's name to a new caller.
+    if (isNameActivelyHeld(requestedRow)) {
+      if (input.on_name_collision === "suffix") {
+        const suffixed = resolveAvailableInstanceName(input.name);
+        if (suffixed === null) {
+          return {
+            content: [
               {
-                success: false,
-                error:
-                  `Agent "${input.name}" is already registered and online on another session ` +
-                  `(session_id=${preRow.session_id}, last_seen=${preRow.last_seen}). ` +
-                  `Two terminals running under the same name will race on get_messages and silently drop mail. ` +
-                  `Resolution: (a) scope your name (e.g. "${input.name}-mcp", "${input.name}-outreach") so each terminal has a distinct identity; ` +
-                  `(b) close the holding terminal and let it mark the row offline on exit; or ` +
-                  `(c) run "relay recover ${input.name} --yes" to force-release + re-register fresh.`,
-                error_code: ERROR_CODES.NAME_COLLISION_ACTIVE,
-                existing_session_id: preRow.session_id,
-                existing_last_seen: preRow.last_seen,
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error:
+                      `Agent "${input.name}" is actively held and no relay-assigned instance slot ` +
+                      `"${input.name}-N" (N=2..64) is available — all are live or holding undelivered mail. ` +
+                      `Register with a distinct, stable name instead (e.g. "${input.name}-worker1").`,
+                    error_code: ERROR_CODES.NAME_COLLISION_ACTIVE,
+                    existing_session_id: requestedRow.session_id,
+                    existing_last_seen: requestedRow.last_seen,
+                  },
+                  null,
+                  2
+                ),
               },
-              null,
-              2
-            ),
-          },
-        ],
-        isError: true,
-      };
+            ],
+            isError: true,
+          };
+        }
+        effectiveName = suffixed;
+        assignedSuffix = true;
+      } else {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error:
+                    `Agent "${input.name}" is already registered and online on another session ` +
+                    `(session_id=${requestedRow.session_id}, last_seen=${requestedRow.last_seen}). ` +
+                    `Two terminals running under the same name will race on get_messages and silently drop mail. ` +
+                    `Resolution: (a) scope your name (e.g. "${input.name}-mcp", "${input.name}-outreach") so each terminal has a distinct identity; ` +
+                    `(b) pass on_name_collision:"suffix" to auto-register as a relay-assigned instance "${input.name}-N" (⚠ NOT stable across restarts — re-discover via discover_agents); ` +
+                    `(c) close the holding terminal and let it mark the row offline on exit; or ` +
+                    `(d) run "relay recover ${input.name} --yes" to force-release + re-register fresh.`,
+                  error_code: ERROR_CODES.NAME_COLLISION_ACTIVE,
+                  existing_session_id: requestedRow.session_id,
+                  existing_last_seen: requestedRow.last_seen,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   }
+
+  // Recovery/preState key on the name we ACTUALLY register. A suffixed instance
+  // is a fresh (or safely-reused + drained) row, so preState is typically null.
+  const preRow = effectiveName === input.name ? requestedRow : getAgentAuthData(effectiveName);
+  const preState = (preRow?.auth_state ?? null) as
+    | "active"
+    | "legacy_bootstrap"
+    | "revoked"
+    | "recovery_pending"
+    | null;
 
   // v2.1 Phase 7p HIGH #2: plumb the dispatcher-verified recovery hash through
   // to the db layer so the CAS anchors on the hash the CALLER's ticket was
@@ -146,7 +189,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   let registerResult: ReturnType<typeof registerAgent>;
   try {
     registerResult = registerAgent(
-      input.name,
+      effectiveName,
       input.role,
       input.capabilities,
       {
@@ -346,6 +389,23 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
             ...(registration_recovery ? { registration_recovery } : {}),
             success: true,
             agent,
+            // v2.26 auto-suffix: when on_name_collision="suffix" assigned a
+            // relay instance name, surface it UNMISSABLY + warn that it is not
+            // restart-stable (an order/occupancy-dependent handle that LOOKS
+            // stable is the dangerous artefact — someone scripts against it and
+            // it silently becomes a different agent after a restart).
+            ...(assignedSuffix
+              ? {
+                  requested_name: input.name,
+                  assigned_name: agent.name,
+                  instance_warning:
+                    `Requested name "${input.name}" was actively held; you are registered as the ` +
+                    `relay-assigned instance "${agent.name}". ⚠ This name is NOT stable across restarts — ` +
+                    `it is assigned by registration order/occupancy. Do NOT hard-code it: re-discover your ` +
+                    `instance via discover_agents each session, or register with a distinct stable name ` +
+                    `(e.g. "${input.name}-worker1") if you need a fixed identity.`,
+                }
+              : {}),
             protocol_version: PROTOCOL_VERSION,
             ...(capsNote ? { capabilities_note: capsNote } : {}),
             ...(auto_assigned.length > 0 ? { auto_assigned_tasks: auto_assigned.map((a) => ({ task_id: a.task_id, title: a.title, priority: a.priority })) } : {}),

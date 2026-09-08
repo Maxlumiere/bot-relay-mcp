@@ -135,6 +135,11 @@ export const RegisterAgentSchema = z.object({
     .nullable()
     .optional()
     .describe("ADR-0012 CAS precondition for a force takeover. REQUIRED whenever force=true: the session_id the caller READ from the row it intends to take over (pass null to mean \"I expect an OFFLINE row\" → CAS matches session_id IS NULL). The re-register lands ONLY if the row's session_id still equals this value, so exactly one of two racing relaunches wins; the loser is rejected with FORCE_PRECONDITION_FAILED and MUST re-read (never retry-force, never come up mute). force=true WITHOUT this field is rejected as malformed — there is NO unconditional-force bypass, which would reopen the lost-update TOCTOU ADR-0012 eliminates."),
+  on_name_collision: z
+    .enum(["reject", "suffix"])
+    .default("reject")
+    .optional()
+    .describe("v2.26: behavior when the requested `name` is ACTIVELY HELD by another live session (same active-held test as NAME_COLLISION_ACTIVE). \"reject\" (default) = today's behavior exactly: fail with NAME_COLLISION_ACTIVE. \"suffix\" = instead register under a relay-assigned instance name \"<name>-N\" (lowest free N≥2 in [A-Za-z0-9_.-], reusing an offline+drained slot when safe, never inheriting mail) and return it as `assigned_name` in the response. Use for several CLIs sharing ONE agent definition that all register the same name. ⚠ The suffixed name is NOT stable across restarts — it is assigned by registration order/occupancy; do NOT hard-code it, re-discover via discover_agents each session. Does NOT apply to force takeovers (force+expected_session_id still wins). For a FIXED per-instance identity, register with a distinct stable name instead (e.g. \"<name>-worker1\")."),
 });
 
 export const DiscoverAgentsSchema = z.object({
