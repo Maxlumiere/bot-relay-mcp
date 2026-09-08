@@ -838,7 +838,7 @@ Three ways to apply a role: paste into project `CLAUDE.md`, pass as `initial_mes
 - **Security** → see [`SECURITY.md`](./SECURITY.md).
 - **Email** → contact@lumiereventures.co.
 
-Using it with a client we don't list yet (Copilot, Cursor, Zed, a home-grown CLI)? Tell us in Discussions — real setups shape what ships next.
+Using it with a client we don't list yet (Copilot, Zed, a home-grown CLI)? Tell us in Discussions — real setups shape what ships next.
 
 ## License
 
