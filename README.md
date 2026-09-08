@@ -5,7 +5,7 @@
 
 A local-first coordination bus for AI coding agents. Durable inboxes, task queues, and wakeups for Claude Code, Cursor, Cline, Codex-style CLIs, scripts, and webhooks. Two interfaces, one shared SQLite database, zero infrastructure.
 
-**37 MCP tools.** The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the full phase-by-phase arc.
+**Dozens of MCP tools.** The headline feature is **hands-free, LLM-agnostic autowake**: agents running on different models (Claude Code, Codex) wake on relay mail and coordinate as a team without manual polling, via the [Tether VSCode extension](https://marketplace.visualstudio.com/items?itemName=lumiere-ventures.bot-relay-tether) plus a durable cross-process outbox, so an inbox change in one process wakes subscribers in another. See the [CHANGELOG](./CHANGELOG.md) for the full phase-by-phase arc.
 
 ## What is this?
 
@@ -55,7 +55,7 @@ The first invocation fetches the package and starts the server. Subsequent launc
 
 ### Get hands-free autowake (the headline feature)
 
-The Quick Start above gives you the 37 tools and **manual** coordination — you ask an agent to `check my messages`. The **hands-free autowake** headline (agents wake *themselves* on new mail) needs two more, both optional:
+The Quick Start above gives you the full toolset and **manual** coordination — you ask an agent to `check my messages`. The **hands-free autowake** headline (agents wake *themselves* on new mail) needs two more, both optional:
 
 1. **The Tether VSCode extension** — `code --install-extension lumiere-ventures.bot-relay-tether` — wakes the agent's terminal when mail arrives. Outside VSCode, use `relay watch <agent>` (Sentinel) instead.
 2. **The keep-alive HTTP daemon + SessionStart hooks**, which deliver cross-process wakes (a message from one terminal waking a subscriber in another). Install them with `relay init`. From an npm install, `npm install -g bot-relay-mcp` puts `relay` on your PATH, then `relay init` (idempotent, never touches your tokens; `--skip-daemon` / `--skip-hooks` opt out). See [`docs/getting-started.md`](./docs/getting-started.md) and the security note below — and on Linux/Windows the daemon is not yet supervised (start it manually; see [`docs/cross-platform-spawn.md`](./docs/cross-platform-spawn.md)).
@@ -720,7 +720,7 @@ Full install requirements per platform + manual smoke-test checklists + troubles
 
 ## Layer 2: Managed Agents (v1.10)
 
-Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same 37 MCP tools, and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
+Agents that are NOT Claude Code terminals — Python daemons, Node workers, Ollama/vLLM integrations, custom scripts. They connect to the relay via HTTP (recommended) or direct SQLite, use the same MCP tools, and authenticate with per-agent tokens. If registered with `managed:true`, they also receive token-rotation push-messages over the normal `get_messages` channel — see [`docs/managed-agent-protocol.md`](./docs/managed-agent-protocol.md).
 
 Full integration guide with mental model, auth flow, lifecycle, error patterns, and security notes: [`docs/managed-agent-integration.md`](./docs/managed-agent-integration.md).
 
@@ -838,7 +838,7 @@ Three ways to apply a role: paste into project `CLAUDE.md`, pass as `initial_mes
 - **Security** → see [`SECURITY.md`](./SECURITY.md).
 - **Email** → contact@lumiereventures.co.
 
-Using it with a client we don't list yet (Copilot, Cursor, Zed, a home-grown CLI)? Tell us in Discussions — real setups shape what ships next.
+Using it with a client we don't list yet (Copilot, a home-grown CLI)? Tell us in Discussions — real setups shape what ships next.
 
 ## License
 
