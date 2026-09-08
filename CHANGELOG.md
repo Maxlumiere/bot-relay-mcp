@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added — opt-in same-name instance addressing via auto-suffix (`register_agent` `on_name_collision`)
+
+Several CLIs sharing ONE agent definition all register the same name and are hard-rejected with `NAME_COLLISION_ACTIVE`. New OPT-IN input `on_name_collision: "reject" | "suffix"` (default `"reject"` — today's behavior exactly, silence changes nothing). With `"suffix"`, an actively-held name registers instead as a relay-assigned instance `<name>-N` (lowest free N≥2), returned as `assigned_name` alongside an unmissable **not-restart-stable** warning (also stated in the tool description, so an LLM client reads it in the schema).
+
+Design notes:
+- **Delimiter `-` (in-set).** The suffix stays inside `AGENT_NAME_PATTERN` (`[A-Za-z0-9_.-]`), so `encodeURIComponent` is a no-op and the inbox-resource URI matches byte-for-byte between client and server — no fragment/encoding asymmetry. `#`/`~` were rejected: both violate the name invariant that `bin/codex-relay` hard-validates (a `#`-suffixed Codex instance would silently never register) and `#` is a URI fragment delimiter.
+- **Reuse cannot disagree with the collision check.** A `<name>-N` slot is reused only if it FAILS the same active-held predicate the collision path uses (`isNameActivelyHeld` — session_id + last_seen freshness + active status, **never** the stale `status` column) AND holds zero unresolved mail. So it can never hand a live instance's name to a new caller (the two-live-one-name state `NAME_COLLISION_ACTIVE` prevents), and never inherits undelivered mail. This bounds N to (concurrent-live + parked-holding-mail) instances rather than total-restarts-ever.
+- `force`+`expected_session_id` CAS takeover still takes precedence over the suffix.
+- "Address a specific instance" already worked via distinct names + `discover_agents`; this removes the papercut for the shared-definition case only. No schema migration, no version bump.
+
 ## v3.0.1 — 2026-08-13 — patch: a peek no longer hides a recipient's aged undelivered mail
 
 <!--

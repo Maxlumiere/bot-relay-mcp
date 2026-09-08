@@ -4034,6 +4034,73 @@ export function getAgentAuthData(name: string): AgentRecord | null {
   return row ?? null;
 }
 
+// v2.26 auto-suffix — SSOT for "is this agent row an actively-held live
+// session". This is the EXACT predicate handleRegisterAgent uses to reject a
+// same-name re-register (the isActivelyHeld triple at identity.ts). It is
+// deliberately NOT the `status` column: a standing finding is that presence
+// flags go stale, so a live agent can read `offline`. The triple —
+// session_id present + last_seen fresh (< SESSION_ACTIVE_TIMEOUT_SEC) +
+// agent_status in the active set — is the system's own definition of "held".
+// The auto-suffix reuse probe MUST call THIS so the suffix logic can never
+// disagree with the collision logic (the bug class where two checks answer the
+// same question differently, here producing two live instances on one name).
+const SESSION_ACTIVE_TIMEOUT_SEC = 120;
+const SESSION_ACTIVE_STATES = new Set([
+  "idle",
+  "working",
+  "blocked",
+  "waiting_user",
+  "online",
+  "busy",
+]);
+export function isNameActivelyHeld(
+  row: Pick<AgentRecord, "session_id" | "last_seen" | "agent_status"> | null | undefined
+): boolean {
+  if (!row) return false;
+  const ageSec = (Date.now() - new Date(row.last_seen).getTime()) / 1000;
+  return (
+    row.session_id != null &&
+    ageSec < SESSION_ACTIVE_TIMEOUT_SEC &&
+    SESSION_ACTIVE_STATES.has(row.agent_status ?? "idle")
+  );
+}
+
+/**
+ * v2.26 auto-suffix — resolve a relay-assigned instance name `<baseName>-N`
+ * (lowest N≥2) for the opt-in on_name_collision="suffix" path. Returns:
+ *   - a NON-EXISTENT `<baseName>-N` (caller will INSERT a fresh row), or
+ *   - an existing `<baseName>-N` that is SAFE TO REUSE — i.e. NOT actively held
+ *     (isNameActivelyHeld === false, the same test the collision check uses)
+ *     AND holding ZERO unresolved mail (`resolved_at IS NULL` count = 0, so a
+ *     reuse can never inherit another instance's undelivered messages), or
+ *   - null if no slot is available within [2, maxN] (or the name would exceed
+ *     the 64-char AGENT_NAME_PATTERN bound) → caller rejects.
+ *
+ * Reuse bounds N to (concurrent-live + parked-holding-mail) instances rather
+ * than total-registrations-ever: a clean restart leaves the old slot
+ * not-actively-held + drained, so it is reused and N stays small. Only an
+ * instance that died holding undelivered mail pushes N up — correct, because
+ * that mail must be preserved.
+ */
+export function resolveAvailableInstanceName(baseName: string, maxN = 64): string | null {
+  const db = getDb();
+  for (let n = 2; n <= maxN; n++) {
+    const candidate = `${baseName}-${n}`;
+    if (candidate.length > 64) return null; // preserve the AGENT_NAME_PATTERN length bound
+    const row = db.prepare("SELECT * FROM agents WHERE name = ?").get(candidate) as
+      | AgentRecord
+      | undefined;
+    if (!row) return candidate; // free → INSERT
+    if (isNameActivelyHeld(row)) continue; // held (same test as collision) → skip
+    const pending = db
+      .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND resolved_at IS NULL")
+      .get(candidate) as { c: number };
+    if (pending.c === 0) return candidate; // not-held + drained → safe reuse (UPDATE)
+    // not-held but holding undelivered mail → skip to preserve it
+  }
+  return null; // exhausted
+}
+
 /**
  * v2.0.1 (Codex HIGH 1): optional `expectedSessionId` scopes the delete so a
  * stale stdio process cannot wipe a fresh session of the same agent name.
