@@ -273,7 +273,7 @@ Count: there are **13 override entries** across the two manifests but **12 uniqu
 
 | override | tree | why (git-established) | retires when |
 |---|---|---|---|
-| `js-yaml ^4.3.1` | ext | security: DoS <4.3.1 (transitive via secretlint) — #175 | ecosystem resolves ≥4.3.1 without the pin (see check below) |
+| `js-yaml ^4.3.2` | ext | security: CPU-DoS <4.3.2 (GHSA-2883-xcg3-v3hh, maxTotalMergeKeys; transitive via @vscode/vsce→secretlint) — bumped from the original `^4.3.1` pin (#175, DoS <4.3.1) when the ^4.3.1 lockfile resolution became the silent blocker for this newer advisory | ecosystem resolves ≥4.3.2 without the pin (see check below) |
 | `undici ^7.29.0` | ext | security: GHSA <7.29.0 (via @vscode/vsce→cheerio) — #175 | ecosystem resolves ≥7.29.0 without the pin |
 | `brace-expansion ^5.0.9` | ext | security: DoS 4.0.0–5.0.8 (via @vscode/vsce + glob) — #175 | ecosystem resolves ≥5.0.9 without the pin |
 | `hono ^4.12.34` | root + ext | security: GHSA <4.12.34 (via @modelcontextprotocol/sdk) — #175 | the MCP SDK's range resolves ≥4.12.34 without the pin |
