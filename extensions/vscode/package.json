@@ -209,7 +209,7 @@
     "tmp": "0.2.7",
     "form-data": "4.0.6",
     "markdown-it": "14.2.0",
-    "js-yaml": "^4.3.1",
+    "js-yaml": "^4.3.2",
     "vite": "7.3.5",
     "esbuild": "$esbuild",
     "hono": "^4.12.34",
