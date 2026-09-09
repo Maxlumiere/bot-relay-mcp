@@ -88,6 +88,25 @@ export async function pushKanbanSnapshotOnce(opts?: {
   const url = cfg.dashboard_push_url ?? null;
   if (!url) return { pushed: false, reason: "dashboard_push_url not configured" };
 
+  // The board is a DECISION SURFACE — Maxime reads it to decide what is real.
+  // An endpoint that accepts unsigned POSTs is one leaked URL away from writing
+  // false agent status / false pending items onto a board he trusts, and "the
+  // URL is a secret" is not authentication (it travels in config, logs, errors).
+  // So a shared secret is REQUIRED: refuse to push unsigned rather than silently
+  // degrade. The receiver (the Vercel page) rejects unsigned/bad-sig POSTs too,
+  // and surfaces the rejection ON THE PAGE so a misconfigured push cannot be
+  // mistaken for an idle fleet. (Defense-in-depth: the daemon also declines to
+  // ARM the push tick when the secret is absent — see transport/http.ts.)
+  const secret = cfg.dashboard_push_secret ?? null;
+  if (!secret) {
+    log.warn(
+      "[dashboard-push] refusing to push — dashboard_push_url is set but " +
+        "dashboard_push_secret is missing. The board is a decision surface; an " +
+        "unsigned push is refused. Set RELAY_DASHBOARD_PUSH_SECRET to enable.",
+    );
+    return { pushed: false, reason: "dashboard_push_secret missing — refusing to push unsigned" };
+  }
+
   const nowIso = opts?.nowIso ?? new Date().toISOString();
   let body: string;
   try {
@@ -112,8 +131,8 @@ export async function pushKanbanSnapshotOnce(opts?: {
     "X-Relay-Dashboard": "kanban.v1",
     Date: new Date().toUTCString(),
   };
-  const secret = cfg.dashboard_push_secret ?? null;
-  if (secret) headers["X-Relay-Signature"] = sign(body, secret);
+  // Always signed — the unsigned path was refused above.
+  headers["X-Relay-Signature"] = sign(body, secret);
 
   try {
     const res = await deliverPinnedPost({

@@ -77,10 +77,26 @@ describe("v1 Kanban — snapshot shape (buildKanbanSnapshot)", () => {
   });
 });
 
-describe("v1 Kanban — outbound push is off by default", () => {
-  it("pushKanbanSnapshotOnce is a no-op (pushed:false) when dashboard_push_url is unconfigured", async () => {
+describe("v1 Kanban — outbound push safety gates", () => {
+  it("is a no-op (pushed:false) when dashboard_push_url is unconfigured", async () => {
     const r = await pushKanbanSnapshotOnce();
     expect(r.pushed).toBe(false);
     expect(r.reason).toMatch(/not configured/i);
+  });
+
+  it("REFUSES to push unsigned when a URL is set but no secret is configured (decision surface)", async () => {
+    // The board is a decision surface — an unsigned POST endpoint is one leaked
+    // URL away from writing false state onto a board Maxime trusts. A URL without
+    // a secret must DISABLE the push, not silently degrade to unsigned.
+    process.env.RELAY_DASHBOARD_PUSH_URL = "https://example.com/ingest";
+    delete process.env.RELAY_DASHBOARD_PUSH_SECRET;
+    try {
+      const r = await pushKanbanSnapshotOnce();
+      expect(r.pushed).toBe(false);
+      expect(r.reason).toMatch(/secret/i);
+      expect(r.reason).toMatch(/unsigned|refus/i);
+    } finally {
+      delete process.env.RELAY_DASHBOARD_PUSH_URL;
+    }
   });
 });

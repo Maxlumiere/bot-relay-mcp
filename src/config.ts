@@ -48,9 +48,12 @@ export interface RelayConfig {
    */
   dashboard_push_url: string | null;
   /**
-   * v1 Kanban dashboard — HMAC secret for the snapshot push. When set, each push
-   * carries `X-Relay-Signature: sha256=…` over the body so the Vercel receiver
-   * can verify authenticity. Env override: RELAY_DASHBOARD_PUSH_SECRET.
+   * v1 Kanban dashboard — HMAC secret for the snapshot push. REQUIRED whenever
+   * `dashboard_push_url` is set: the board is a decision surface, so the daemon
+   * REFUSES to push unsigned — a URL set with this unset DISABLES the push (and
+   * logs why) rather than silently degrading. When enabled, each push carries
+   * `X-Relay-Signature: sha256=…` over the body so the Vercel receiver can verify
+   * authenticity. Env override: RELAY_DASHBOARD_PUSH_SECRET.
    */
   dashboard_push_secret: string | null;
   /** Messages per agent per hour. 0 disables the limit. */
