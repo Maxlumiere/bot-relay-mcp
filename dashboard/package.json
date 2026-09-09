@@ -1,0 +1,13 @@
+{
+  "name": "bot-relay-kanban-board",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "External (Vercel) read-only Kanban board for bot-relay-mcp — receives outbound-pushed kanban.v1 snapshots, verifies their HMAC, and renders the fleet's agent headers + pending-on-human lane. Fed by the relay's dashboard_push (no inbound hole into the relay).",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
