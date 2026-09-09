@@ -12,6 +12,13 @@ import { kvGet, kvConfigured, KEYS } from "../lib/kv.js";
 import { renderBoard } from "../lib/render.js";
 
 export default async function handler(req, res) {
+  // The view token rides in the URL (zero-friction from a phone or another LLM),
+  // so harden the realistic leak paths on EVERY response: no Referer on any link
+  // clicked from the board, and keep this public Vercel URL out of search indexes.
+  // (The write path — /api/ingest — is the security-critical one and is HMAC-gated.)
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+
   const expected = process.env.VIEW_TOKEN;
   if (!expected) {
     res.status(500).send("VIEW_TOKEN is not configured on this deployment.");
