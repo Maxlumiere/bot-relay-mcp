@@ -40,6 +40,22 @@ export interface RelayConfig {
    * re-add it as a convenience.
    */
   dashboard_secret: string | null;
+  /**
+   * v1 Kanban dashboard — OUTBOUND snapshot push. When set, the daemon POSTs a
+   * read-only board snapshot to this URL every ~30s (OUTBOUND only — no inbound
+   * hole; SSRF-validated + DNS-pinned at push time). Unset (default null) = the
+   * feature is OFF. Env override: RELAY_DASHBOARD_PUSH_URL.
+   */
+  dashboard_push_url: string | null;
+  /**
+   * v1 Kanban dashboard — HMAC secret for the snapshot push. REQUIRED whenever
+   * `dashboard_push_url` is set: the board is a decision surface, so the daemon
+   * REFUSES to push unsigned — a URL set with this unset DISABLES the push (and
+   * logs why) rather than silently degrading. When enabled, each push carries
+   * `X-Relay-Signature: sha256=…` over the body so the Vercel receiver can verify
+   * authenticity. Env override: RELAY_DASHBOARD_PUSH_SECRET.
+   */
+  dashboard_push_secret: string | null;
   /** Messages per agent per hour. 0 disables the limit. */
   rate_limit_messages_per_hour: number;
   /** Tasks posted per agent per hour. 0 disables. */
@@ -72,6 +88,8 @@ export const DEFAULT_CONFIG: RelayConfig = {
   http_secret: null,
   http_secrets_previous: [],
   dashboard_secret: null,
+  dashboard_push_url: null,
+  dashboard_push_secret: null,
   rate_limit_messages_per_hour: 1000,
   rate_limit_tasks_per_hour: 200,
   rate_limit_spawns_per_hour: 50,
@@ -175,6 +193,9 @@ export function loadConfig(): RelayConfig {
   const envProxies = process.env.RELAY_TRUSTED_PROXIES
     ? process.env.RELAY_TRUSTED_PROXIES.split(",").map((s) => s.trim()).filter(Boolean)
     : undefined;
+  // v1 Kanban dashboard — outbound snapshot push (off unless a URL is set).
+  const envPushUrl = process.env.RELAY_DASHBOARD_PUSH_URL;
+  const envPushSecret = process.env.RELAY_DASHBOARD_PUSH_SECRET;
 
   return {
     ...DEFAULT_CONFIG,
@@ -184,6 +205,8 @@ export function loadConfig(): RelayConfig {
     ...(envHost ? { http_host: envHost } : {}),
     ...(envSecret ? { http_secret: envSecret } : {}),
     ...(envDashboardSecret ? { dashboard_secret: envDashboardSecret } : {}),
+    ...(envPushUrl ? { dashboard_push_url: envPushUrl } : {}),
+    ...(envPushSecret ? { dashboard_push_secret: envPushSecret } : {}),
     ...(envPrevSecrets ? { http_secrets_previous: envPrevSecrets } : {}),
     ...(envProxies ? { trusted_proxies: envProxies } : {}),
   };

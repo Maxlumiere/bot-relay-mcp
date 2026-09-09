@@ -37,6 +37,7 @@ import {
 } from "./boundary-checks.js";
 import { loadConfig, resolveDashboardSecret, getConfigPath } from "../config.js";
 import { log } from "../logger.js";
+import { pushKanbanSnapshotOnce } from "../dashboard-push.js";
 import { requestContext } from "../request-context.js";
 import { ipInAnyCidr } from "../cidr.js";
 import { VERSION } from "../version.js";
@@ -1926,6 +1927,39 @@ export function startHttpServer(port: number, host: string): Server {
     server.once("close", () => {
       broadcaster.stop();
     });
+  }
+
+  // v1 Kanban dashboard — OUTBOUND snapshot push. Off unless `dashboard_push_url`
+  // is configured. Cadence = RELAY_DASHBOARD_PUSH_INTERVAL_MS (default 30000).
+  // Outbound only (no inbound hole); SSRF-validated + DNS-pinned per push;
+  // best-effort (pushKanbanSnapshotOnce never rejects into us). HTTP-process only.
+  // Fires once immediately so the board is live without waiting a full interval.
+  //
+  // The board is a DECISION SURFACE, so a shared secret is REQUIRED: if a URL is
+  // set but `dashboard_push_secret` is missing we DISABLE the push (and say why
+  // loudly) rather than silently emit unsigned snapshots to a board Maxime trusts.
+  {
+    const cfg = loadConfig();
+    if (cfg.dashboard_push_url && !cfg.dashboard_push_secret) {
+      log.warn(
+        "[dashboard-push] dashboard_push_url is configured but dashboard_push_secret " +
+          "is missing — board push DISABLED. The board is a decision surface; unsigned " +
+          "pushes to it are refused. Set RELAY_DASHBOARD_PUSH_SECRET to enable.",
+      );
+    } else if (cfg.dashboard_push_url) {
+      const rawMs = process.env.RELAY_DASHBOARD_PUSH_INTERVAL_MS;
+      const parsed = rawMs ? parseInt(rawMs, 10) : NaN;
+      const pushMs = Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
+      const fire = () => {
+        void pushKanbanSnapshotOnce().catch((err) =>
+          log.warn(`[dashboard-push] tick error: ${(err as Error)?.message ?? err}`),
+        );
+      };
+      fire();
+      const pushHandle = setInterval(fire, pushMs);
+      if (typeof pushHandle.unref === "function") pushHandle.unref();
+      server.once("close", () => clearInterval(pushHandle));
+    }
   }
 
   return server;

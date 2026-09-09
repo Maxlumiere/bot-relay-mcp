@@ -4755,6 +4755,65 @@ export interface OutstandingMessage {
  * true returns the full C-view including resolved rows. `nowIso` is injectable
  * for deterministic tests.
  */
+/**
+ * v1 Kanban board — the "pending on a human" lane. Obligations/asks addressed to
+ * a recipient that has NO agent row (a human, e.g. "maxime") and not yet resolved,
+ * across ALL senders. Recipient-side mirror of getOutstanding (which is sender-
+ * scoped). Read-only; content is decrypted + previewed (the board is token-gated).
+ * A registered agent's own obligations are deliberately excluded here — those
+ * belong in that agent's column, not the human lane.
+ */
+export function getHumanPendingObligations(nowIso?: string): Array<{
+  id: string;
+  to_agent: string;
+  from_agent: string;
+  disposition: string;
+  content_preview: string;
+  created_at: string;
+  deadline: string | null;
+  overdue: boolean;
+}> {
+  const db = getDb();
+  const nowMs = Date.parse(nowIso ?? now());
+  const rows = db
+    .prepare(
+      `SELECT id, from_agent, to_agent, content, disposition, created_at, deadline
+         FROM messages
+        WHERE disposition IN ('ask', 'obligation')
+          AND resolved_at IS NULL
+          AND to_agent NOT IN (SELECT name FROM agents)
+        ORDER BY to_agent ASC, created_at ASC`,
+    )
+    .all() as Array<{
+      id: string;
+      from_agent: string;
+      to_agent: string;
+      content: string;
+      disposition: string;
+      created_at: string;
+      deadline: string | null;
+    }>;
+  return rows.map((r) => {
+    let overdue = false;
+    if (r.disposition === "obligation" && r.deadline) {
+      const dl = Date.parse(r.deadline);
+      overdue = Number.isFinite(dl) && nowMs > dl;
+    }
+    const decrypted = decryptContent(r.content) ?? r.content;
+    const { preview } = truncatedPreview(decrypted, OUTSTANDING_PREVIEW_MAX);
+    return {
+      id: r.id,
+      to_agent: r.to_agent,
+      from_agent: r.from_agent,
+      disposition: r.disposition,
+      content_preview: preview,
+      created_at: r.created_at,
+      deadline: r.deadline,
+      overdue,
+    };
+  });
+}
+
 export function getOutstanding(
   senderName: string,
   opts: { overdueBoundSeconds: number; includeResolved?: boolean; nowIso?: string },
