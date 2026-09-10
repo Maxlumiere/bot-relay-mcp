@@ -992,7 +992,7 @@
       "agent_name": {
         "type": "string",
         "minLength": 1,
-        "description": "Your agent name (the recipient; only your own mail can be resolved)"
+        "description": "Your agent name — you can resolve mail addressed to you, or an obligation you sent to a non-agent recipient"
       },
       "message_ids": {
         "type": "array",
