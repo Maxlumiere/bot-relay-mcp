@@ -73,7 +73,6 @@
     "ajv": "^8.20.0"
   },
   "devDependencies": {
-    "@types/bcryptjs": "^3.0.0",
     "@types/better-sqlite3": "^9.6.0",
     "@types/express": "^5.0.6",
     "@types/ws": "^8.18.1",
