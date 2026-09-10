@@ -88,6 +88,37 @@ Then restart the relay daemon. Within ~30s the board's banner flips from **waiti
 to **ok**. (If the relay has a URL set but no secret, it refuses to push — the board
 stays **waiting** and the relay logs why.)
 
+### 6. Verify it worked — one command
+
+Instead of staring at the banner and guessing, run the verifier. It proves the
+chain end to end and, if something is wrong, **names which cause** it is (wrong URL ·
+bad secret · KV not provisioned · push refused · relay not restarted · page cached).
+Secrets come from the **environment** (not argv, which leaks into `ps`/history) and
+are **never printed**.
+
+```sh
+cd dashboard
+BOARD_URL="<the production URL>" \
+DASHBOARD_PUSH_SECRET="<the hex-32 from step 1>" \
+VIEW_TOKEN="<the hex-24 from step 1>" \
+RELAY_DASHBOARD_PUSH_URL="<what you set on the relay in step 5>" \
+RELAY_DASHBOARD_PUSH_SECRET="<the same hex-32>" \
+node verify-deploy.mjs
+```
+
+It checks, in order: the page is reachable and token-gated; **unsigned and
+bad-signature pushes are rejected** (the load-bearing check — a receiver that
+accepted anything would still show a pretty board); a correctly-signed test push is
+accepted and appears; and the relay's URL/secret match this board. Exit code 0 means
+the **deployed page** is proven. It does **not** confirm the running daemon has
+reloaded its config — that is the one thing it can't see, so after it passes,
+restart the relay and watch the board's own banner show a real **ok**.
+
+The test push is labelled `__deploy-check__` so it can't be mistaken for real fleet
+state; the relay's first real push replaces it. (The verifier is covered by the
+`dashboard/` test suite against a local mock; the live Vercel/KV path is exercised
+only when you run the command above.)
+
 ### Rotating the push secret
 
 Set the new value on both sides (relay `RELAY_DASHBOARD_PUSH_SECRET` and the page's
