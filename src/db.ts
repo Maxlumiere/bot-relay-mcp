@@ -5516,29 +5516,51 @@ export function getMessages(
 export function resolveMessages(
   agentName: string,
   messageIds: string[],
-): { resolved_ids: string[]; resolved_count: number; requested_count: number } {
+): {
+  resolved_ids: string[];
+  resolved_count: number;
+  requested_count: number;
+  blocked_by_recipient_registration: Array<{ id: string; to_agent: string }>;
+} {
   const db = getDb();
   const requested = Array.from(new Set(messageIds));
   if (requested.length === 0) {
-    return { resolved_ids: [], resolved_count: 0, requested_count: 0 };
+    return {
+      resolved_ids: [],
+      resolved_count: 0,
+      requested_count: 0,
+      blocked_by_recipient_registration: [],
+    };
   }
   const placeholders = requested.map(() => "?").join(",");
   const resolvedAt = now();
-  // Single immediate tx: SELECT the owned-and-unresolved ids, then flip them.
-  // The SELECT is scoped by to_agent so the returned id list reflects only
-  // what THIS recipient actually resolved (not foreign/unknown ids).
+  // A message is resolvable by `agentName` if EITHER:
+  //   (recipient-resolve) it was addressed to them — the original contract; OR
+  //   (sender-resolve of a human obligation) THEY sent it to a recipient that is
+  //     not a registered agent.
+  // Why the second clause: an obligation to a human (e.g. "maxime") is accepted
+  // precisely because there is no recipient-existence check — but that human has
+  // no agent row and thus no token, so under recipient-only scoping NOBODY could
+  // ever clear it and the pending-on-a-human lane would be WRITE-ONLY (grows,
+  // never drains). The sender is the party who learns out-of-band that the wait
+  // is over, so the sender closes it. The `to_agent NOT IN (SELECT name FROM
+  // agents)` guard is LOAD-BEARING and structural: a sender CANNOT resolve mail
+  // addressed to a REAL agent (that stays the recipient's to clear) — the clause
+  // simply does not match, so the boundary cannot regress via a check we forgot.
+  // (The dispatcher binds `agentName` to the caller's token, so `from_agent = ?`
+  // is the authenticated sender — no impersonation path.)
+  const eligibleClause =
+    "AND resolved_at IS NULL AND (to_agent = ? OR (from_agent = ? AND to_agent NOT IN (SELECT name FROM agents)))";
   let resolvedIds: string[] = [];
   const tx = db.transaction(() => {
     const owned = db
-      .prepare(
-        `SELECT id FROM messages WHERE id IN (${placeholders}) AND to_agent = ? AND resolved_at IS NULL`,
-      )
-      .all(...requested, agentName) as { id: string }[];
+      .prepare(`SELECT id FROM messages WHERE id IN (${placeholders}) ${eligibleClause}`)
+      .all(...requested, agentName, agentName) as { id: string }[];
     resolvedIds = owned.map((r) => r.id);
     if (resolvedIds.length > 0) {
       db.prepare(
-        `UPDATE messages SET resolved_at = ? WHERE id IN (${placeholders}) AND to_agent = ? AND resolved_at IS NULL`,
-      ).run(resolvedAt, ...requested, agentName);
+        `UPDATE messages SET resolved_at = ? WHERE id IN (${placeholders}) ${eligibleClause}`,
+      ).run(resolvedAt, ...requested, agentName, agentName);
     }
   });
   const immediateCaller = (tx as unknown as { immediate?: () => void }).immediate;
@@ -5547,10 +5569,29 @@ export function resolveMessages(
   } else {
     tx();
   }
+  // Legible-zero diagnostic (the retroactive-flip edge): the `to_agent NOT IN
+  // agents` guard is evaluated at RESOLVE time, so if a human recipient has SINCE
+  // registered as an agent (human-named agents are an established pattern — e.g.
+  // `concierge`), a sender-resolve that used to work now matches nothing, silently.
+  // Surface exactly that case so the zero explains itself instead of looking like
+  // the feature broke. Pure diagnostic — it changes nothing about what resolved.
+  let blockedByRecipientRegistration: Array<{ id: string; to_agent: string }> = [];
+  const unresolved = requested.filter((id) => !resolvedIds.includes(id));
+  if (unresolved.length > 0) {
+    const ph2 = unresolved.map(() => "?").join(",");
+    blockedByRecipientRegistration = db
+      .prepare(
+        `SELECT id, to_agent FROM messages
+           WHERE id IN (${ph2}) AND from_agent = ? AND resolved_at IS NULL
+             AND to_agent <> ? AND to_agent IN (SELECT name FROM agents)`,
+      )
+      .all(...unresolved, agentName, agentName) as { id: string; to_agent: string }[];
+  }
   return {
     resolved_ids: resolvedIds,
     resolved_count: resolvedIds.length,
     requested_count: requested.length,
+    blocked_by_recipient_registration: blockedByRecipientRegistration,
   };
 }
 

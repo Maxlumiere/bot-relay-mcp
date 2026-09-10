@@ -107,3 +107,28 @@ test("renderBoard escapes a hostile agent name and obligation preview", () => {
   assert.ok(html.includes("&lt;script&gt;"), "name should be escaped");
   assert.ok(html.includes("maxime"), "pending lane renders the human");
 });
+
+test("pending lane shows AGE, and emphasizes items open > 24h", () => {
+  const mk = (createdAt) => ({
+    received_at: "2026-09-09T12:00:00.000Z",
+    snapshot: {
+      schema: "kanban.v1",
+      generated_at: "2026-09-09T12:00:00.000Z",
+      agents: [],
+      pending_on_human: [
+        { to_agent: "maxime", from_agent: "victra", disposition: "obligation",
+          content_preview: "q", created_at: createdAt, deadline: null, overdue: false },
+      ],
+      task_detail_available: false,
+      note: "",
+    },
+  });
+  // Check the age SPAN's class, not a bare substring (the CSS <style> block also
+  // contains ".age-stale"). 1h old → <span class="age">open 60m</span>, not stale.
+  const fresh = renderBoard({ latest: mk("2026-09-09T11:00:00.000Z"), lastRejection: null, nowMs: NOW });
+  assert.match(fresh, /class="age">open 60m/, "1h item shows age (fmtAge renders <90min as minutes)");
+  assert.ok(!/class="age age-stale"/.test(fresh), "1h old item's span must not carry age-stale");
+  // 3 days old → <span class="age age-stale">open 3d</span>
+  const old = renderBoard({ latest: mk("2026-09-06T12:00:00.000Z"), lastRejection: null, nowMs: NOW });
+  assert.match(old, /class="age age-stale">open 3d/, "3d item shows stale-emphasized age");
+});

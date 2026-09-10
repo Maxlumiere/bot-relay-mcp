@@ -327,14 +327,35 @@ export function handleGetMessages(input: GetMessagesInput) {
 
 /**
  * v2.12.0 — pending-vs-history. Explicitly resolve (ack) specific messages so
- * they leave the cross-session pending queue. Recipient-scoped at two layers:
- * the dispatcher binds the caller's token to `agent_name` (so a foreign token
- * can't even call this for another agent), and resolveMessages additionally
- * scopes its UPDATE by `to_agent = agent_name`. Idempotent: re-resolving or
- * passing unknown/foreign ids is a no-op (reported via the counts).
+ * they leave the cross-session pending queue. Scoped at two layers: the
+ * dispatcher binds the caller's token to `agent_name` (so a foreign token can't
+ * even call this for another agent), and resolveMessages scopes its UPDATE so a
+ * caller may clear EITHER mail addressed to them (recipient-resolve) OR an
+ * obligation THEY sent to a recipient that is not a registered agent — a human
+ * has no token, so otherwise the pending-on-a-human lane could never drain. A
+ * sender can NEVER clear mail addressed to a real agent. Idempotent: re-resolving
+ * or passing unknown/foreign ids is a no-op (reported via the counts).
+ *
+ * Because the non-agent guard is evaluated at resolve time, if a human recipient
+ * has since registered as an agent, the sender can no longer resolve it — the
+ * `note` names that case explicitly so a legitimate zero doesn't read as a bug.
  */
 export function handleResolveMessages(input: ResolveMessagesInput) {
   const result = resolveMessages(input.agent_name, input.message_ids);
+  const blocked = result.blocked_by_recipient_registration;
+  const blockedNames = [...new Set(blocked.map((b) => b.to_agent))].map((n) => `'${n}'`).join(", ");
+  let note: string;
+  if (blocked.length > 0) {
+    note =
+      `Resolved ${result.resolved_count} of ${result.requested_count}. ` +
+      `${blocked.length} could not be resolved by you because their recipient(s) are now registered agents (${blockedNames}) — ` +
+      `a registered agent resolves its own mail. This is the retroactive-registration edge, not a failure.`;
+  } else if (result.resolved_count === 0) {
+    note =
+      `Resolved 0 of ${result.requested_count} (already resolved, unknown ids, or not addressed to you / not an obligation you sent to a non-agent).`;
+  } else {
+    note = `Resolved ${result.resolved_count} of ${result.requested_count} message(s); they will not re-surface as pending.`;
+  }
   return {
     content: [
       {
@@ -346,10 +367,8 @@ export function handleResolveMessages(input: ResolveMessagesInput) {
             resolved_ids: result.resolved_ids,
             resolved_count: result.resolved_count,
             requested_count: result.requested_count,
-            note:
-              result.resolved_count === 0
-                ? "No messages resolved (already resolved, unknown ids, or not addressed to you)."
-                : `Resolved ${result.resolved_count} message(s); they will not re-surface as pending.`,
+            blocked_by_recipient_registration: blocked,
+            note,
           },
           null,
           2

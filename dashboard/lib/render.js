@@ -43,11 +43,17 @@ function agentCardHtml(a) {
   </div>`;
 }
 
-function pendingItemHtml(p) {
+function pendingItemHtml(p, nowMs) {
   const overdue = p.overdue ? ' <span class="overdue">OVERDUE</span>' : "";
   const deadline = p.deadline ? `<span class="meta">due ${escapeHtml(p.deadline)}</span>` : "";
+  // Age is the difference between "waiting" and "ignored" — the thing Maxime said
+  // he could not see. Emphasize anything open longer than a day.
+  const createdMs = Date.parse(p.created_at);
+  const ageMs = Number.isFinite(createdMs) ? Math.max(0, nowMs - createdMs) : null;
+  const stale = ageMs != null && ageMs > 24 * 60 * 60 * 1000;
+  const age = ageMs != null ? `<span class="age${stale ? " age-stale" : ""}">open ${escapeHtml(fmtAge(ageMs))}</span>` : "";
   return `<li class="pending-item${p.overdue ? " is-overdue" : ""}">
-    <div class="pending-head"><strong>${escapeHtml(p.to_agent)}</strong>${overdue} <span class="meta">← ${escapeHtml(p.from_agent)}</span></div>
+    <div class="pending-head"><strong>${escapeHtml(p.to_agent)}</strong>${overdue} ${age} <span class="meta">← ${escapeHtml(p.from_agent)}</span></div>
     <div class="pending-body">${escapeHtml(p.content_preview)}</div>
     <div class="pending-foot"><span class="meta">${escapeHtml(p.disposition)} · ${escapeHtml(p.created_at)}</span>${deadline}</div>
   </li>`;
@@ -71,7 +77,7 @@ export function renderBoard({ latest, lastRejection, nowMs }) {
       : `<div class="empty">No snapshot yet.</div>`;
 
   const pendingHtml = pending.length
-    ? `<ul class="pending-list">${pending.map(pendingItemHtml).join("\n")}</ul>`
+    ? `<ul class="pending-list">${pending.map((p) => pendingItemHtml(p, nowMs)).join("\n")}</ul>`
     : `<div class="empty">Nothing is blocked on a human right now.</div>`;
 
   const note = snap && snap.note ? `<section class="note">${escapeHtml(snap.note)}</section>` : "";
@@ -114,6 +120,8 @@ export function renderBoard({ latest, lastRejection, nowMs }) {
   .pending-body { font-size:13px; margin:4px 0; white-space:pre-wrap; word-break:break-word; }
   .pending-foot { display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; }
   .overdue { color:#ffc2c2; font-size:11px; font-weight:700; border:1px solid #b22222; border-radius:4px; padding:0 4px; }
+  .age { color:#8b949e; font-size:11px; border:1px solid #30363d; border-radius:4px; padding:0 5px; }
+  .age-stale { color:#ffe39a; border-color:#a5820f; font-weight:600; }
   .note { background:#161b22; border:1px dashed #30363d; border-radius:8px; padding:10px 14px; margin-top:18px;
           color:#c9d1d9; font-size:12px; }
   .empty { color:#8b949e; font-style:italic; padding:8px 0; }
