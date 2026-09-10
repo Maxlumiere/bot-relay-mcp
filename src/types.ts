@@ -380,14 +380,19 @@ export const GetMessagesSummarySchema = z.object({
 
 /**
  * v2.12.0 — pending-vs-history. Explicitly RESOLVE (ack) specific messages so
- * they leave the cross-session pending queue permanently. Recipient-scoped:
- * the dispatcher binds the caller's token to `agent_name`, and the DB layer
- * additionally scopes the UPDATE by `to_agent = agent_name`, so an agent can
- * only resolve its OWN mail. Use this for partial handling; use
- * get_messages(ack=true) to resolve a whole drain in one call.
+ * they leave the cross-session pending queue permanently. The dispatcher binds
+ * the caller's token to `agent_name`; the DB layer lets that caller resolve mail
+ * addressed to them OR an obligation they SENT to a recipient that is not a
+ * registered agent (a human with no token — otherwise the pending-on-a-human
+ * lane could never drain). A sender can never resolve mail addressed to a real
+ * agent. Use this for partial handling; use get_messages(ack=true) to resolve a
+ * whole drain in one call.
  */
 export const ResolveMessagesSchema = z.object({
-  agent_name: z.string().min(1).describe("Your agent name (the recipient; only your own mail can be resolved)"),
+  agent_name: z
+    .string()
+    .min(1)
+    .describe("Your agent name — you can resolve mail addressed to you, or an obligation you sent to a non-agent recipient"),
   message_ids: z
     .array(z.string().min(1))
     .min(1)
