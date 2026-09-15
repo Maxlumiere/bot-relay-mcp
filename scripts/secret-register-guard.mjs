@@ -69,9 +69,9 @@
  * Usage: node scripts/secret-register-guard.mjs <db.ts> [<file> ...]
  */
 import { ts, parseGuardSource } from "./lib/guard-parse.mjs";
+import { isDirectRun } from "./lib/entrypoint.mjs";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
 import {
   forEachFunctionUnit,
   bodyCallsFunction,
@@ -194,7 +194,7 @@ function main() {
   process.exit(0);
 }
 
-// Run as CLI only when invoked directly (not when imported by the test). Compare
-// resolved filesystem paths (fileURLToPath decodes %20 etc.) so a working
-// directory with spaces — e.g. "…/Claude AI/…" — still triggers main().
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
+// Run as CLI only when invoked directly (not when imported by the test). isDirectRun
+// resolves argv[1] through realpath, so a working directory with spaces
+// ("…/Claude AI/…") AND a symlinked path both still trigger main().
+if (isDirectRun(import.meta.url)) main();

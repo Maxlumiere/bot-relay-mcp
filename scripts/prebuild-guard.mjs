@@ -42,7 +42,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { fileURLToPath } from "url";
+import { isDirectRun } from "./lib/entrypoint.mjs";
 
 /** Does `text` (a plist / claude.json body) reference THIS tree's dist entrypoint?
  *  Tolerant of the `%20` percent-encoded fossil form a spaced path can take. */
@@ -128,10 +128,10 @@ function main() {
   process.exit(1);
 }
 
-// Only run main() when invoked directly (not when imported by the test). Use
-// fileURLToPath, NOT `new URL(...).pathname` — the latter percent-encodes a spaced
-// path (the `%20` fossil) so the compare would fail on `…/Claude AI/…` and the
-// guard would silently no-op in the exact tree it must protect.
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Only run main() when invoked directly (not when imported by the test). isDirectRun
+// resolves argv[1] through realpath, so a spaced path ("…/Claude AI/…") and a symlinked
+// one both run main(); the old path.resolve compare silently no-op'd through a symlink,
+// in the exact tree this guard must protect.
+if (isDirectRun(import.meta.url)) {
   main();
 }

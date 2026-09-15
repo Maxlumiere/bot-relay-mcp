@@ -38,7 +38,10 @@
 set -u
 set -o pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# pwd -P = the PHYSICAL path. Started through a symlinked directory (on the maintainer Mac,
+# ~/bot-relay-mcp is one), plain `pwd` kept the symlink path, so the guards below were
+# invoked through it, where their entrypoint check skipped main() and exited 0 unchecked.
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$PROJECT_ROOT"
 
 # v2.1 Phase 5b: --full flag runs load / chaos / cross-version on top of
