@@ -86,6 +86,16 @@ jobs:
           cd extensions/vscode
           npm run test:unit
 
+      # The external Vercel board (dashboard/) has its own node:test suite with no
+      # dependencies. It never ran in CI, so a regression in the post-deploy verifier —
+      # e.g. its entrypoint check silently skipping every check and exiting 0 when the
+      # checkout path contains a space or a symlink — had no gate that could not be
+      # skipped. Root vitest does not cover it (its include is tests/**/*.test.ts).
+      - name: Run dashboard (board) tests
+        run: |
+          cd dashboard
+          node --test test/*.test.mjs
+
       - name: Run test suite
         # #235: cap workers so the timing-sensitive spawn tests are not CPU-starved
         # on a 4-vCPU runner (they each spawn a daemon subprocess). Measured: default
