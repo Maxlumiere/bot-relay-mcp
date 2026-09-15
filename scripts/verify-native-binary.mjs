@@ -28,7 +28,7 @@
  */
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
+import { isDirectRun } from "./lib/entrypoint.mjs";
 
 const DEP = "better-sqlite3";
 
@@ -92,6 +92,7 @@ function main() {
   process.exit(failed ? 1 : 0);
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+// isDirectRun resolves argv[1] through realpath, so a symlinked path still runs main().
+if (isDirectRun(import.meta.url)) {
   main();
 }

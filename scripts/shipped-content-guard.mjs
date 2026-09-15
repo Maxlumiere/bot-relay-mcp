@@ -32,6 +32,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDirectRun } from "./lib/entrypoint.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const PATTERN_FILE = path.join(HERE, "forbidden-shipped-strings.txt");
@@ -92,7 +93,8 @@ export function scanPackedTarball(cwd, patterns) {
 }
 
 // ── CLI (used by the pre-publish gate) ────────────────────────────────────────
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+// isDirectRun resolves argv[1] through realpath, so a symlinked path still runs the CLI.
+if (isDirectRun(import.meta.url)) {
   const ROOT = path.resolve(HERE, "..");
   const patterns = loadPatterns();
   const offenders = scanPackedTarball(ROOT, patterns);
