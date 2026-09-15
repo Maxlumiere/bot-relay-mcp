@@ -523,7 +523,7 @@ step "readme version guard (no **vX.Y** masthead; history '(current)' tracks pac
 # guard-wiring-coverage.test.ts binds this guard to its reached step. A wrapper (`step "…"
 # fn`) would record cmd=<fn>/script=<empty>, bind nothing, and redden the coverage check.
 # Column 0 + unconditional, per scripts/step-gate-guard.mjs.
-step "sanctioned-mutation guard (no raw agents/agent_capabilities writes outside src/db.ts)" node "$PROJECT_ROOT/scripts/sanctioned-mutation-guard.mjs" "$PROJECT_ROOT/src" || exit 1
+step "sanctioned-mutation guard (no raw agents/agent_capabilities/agent_bindings writes outside src/db.ts)" node "$PROJECT_ROOT/scripts/sanctioned-mutation-guard.mjs" "$PROJECT_ROOT/src" || exit 1
 
 # --- 5c. IP-classifier consolidation guard (v2.2.0 Phase 5 / Codex Item 9) ---
 # Classification CIDR literals (like "127.0.0.0/8", "fe80::/10") belong in
