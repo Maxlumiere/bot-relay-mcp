@@ -94,6 +94,13 @@ function messageRow(to: string, content: string): { status: string; read_by_sess
     .get(to, content) as { status: string; read_by_session: string | null; read_at: string | null };
 }
 
+function lastDrainAt(agent: string): string | null {
+  const row = getDb().prepare("SELECT last_drain_at FROM agents WHERE name = ?").get(agent) as
+    | { last_drain_at: string | null }
+    | undefined;
+  return row ? row.last_drain_at : null;
+}
+
 function expectStillPending(to: string, content: string): void {
   const row = messageRow(to, content);
   expect(row, "message row exists").toBeTruthy();
@@ -249,11 +256,14 @@ describe("ADR-0037 — innocent twin: the model's own get_messages delivers and 
     await send("a37-sender-3", "a37-recv-3", "delivered only by the model", s);
 
     await runHook(httpEnv("a37-recv-3", t));
+    // ADR-0026's wake-coverage evidence: a hook run must not look like a drain.
+    expect(lastDrainAt("a37-recv-3"), "the hook must not stamp last_drain_at").toBeNull();
 
     const drained = await tool("get_messages", { agent_name: "a37-recv-3", status: "pending", agent_token: t });
     const contents = (drained.messages as Array<{ content: string }>).map((m) => m.content);
     expect(contents).toContain("delivered only by the model");
     expect(messageRow("a37-recv-3", "delivered only by the model").read_at).not.toBeNull();
+    expect(lastDrainAt("a37-recv-3"), "the model's own drain stamps last_drain_at").not.toBeNull();
   });
 });
 
