@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — the fleet board claimed "Nothing is blocked on a human" when it could not know
+
+Measured on the live board: with no snapshot received yet, the banner said "Waiting for the first snapshot" while the **Pending on a human** lane said "Nothing is blocked on a human right now". That is silence shown as health, on the lane most likely to be trusted. The agents lane had the same pattern: "No agents registered right now" from an out-of-date snapshot.
+
+- An empty lane now shows its all-clear only when the snapshot is **fresh** (banner "ok") and the list is really present.
+- In every other case the lane says **Unknown** and why: no snapshot yet, the latest push was rejected (the board is frozen), the last snapshot is stale (with its age), or the snapshot has no such list.
+- Items that do exist still show from a stale snapshot; the banner already gives its age.
+- New `dashboard/test/render-empty-states.test.mjs`: 8 cases that must not show an all-clear, all seen failing on the old renderer, plus 4 cases the old renderer already got right, which still pass.
+
 ### Added — opt-in same-name instance addressing via auto-suffix (`register_agent` `on_name_collision`)
 
 Several CLIs sharing ONE agent definition all register the same name and are hard-rejected with `NAME_COLLISION_ACTIVE`. New OPT-IN input `on_name_collision: "reject" | "suffix"` (default `"reject"` — today's behavior exactly, silence changes nothing). With `"suffix"`, an actively-held name registers instead as a relay-assigned instance `<name>-N` (lowest free N≥2), returned as `assigned_name` alongside an unmissable **not-restart-stable** warning (also stated in the tool description, so an LLM client reads it in the schema).
