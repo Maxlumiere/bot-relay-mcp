@@ -17,8 +17,9 @@
  * red. That is the false-HEALTHY the whole arc exists to kill.
  *
  * Plus the two non-fire / honest-refusal cases: a genuinely-live anchor must NOT
- * false-fire (stays HEALTHY — the crux that makes this safe on a real concurrent
- * terminal), and a no-anchor LIVE row must read UNVERIFIABLE (never guessed dead,
+ * false-fire (no UNWAKEABLE — the crux that makes this safe on a real concurrent
+ * terminal; this harness has no daemon, so since ADR-0036 S1 that run's verdict is
+ * DEGRADED), and a no-anchor LIVE row must read UNVERIFIABLE (never guessed dead,
  * never auto-taken-over), naming the --override remedy.
  *
  * Same-host cases need a resolvable machine GUID (the gate is same-host by
@@ -149,11 +150,14 @@ describe.skipIf(!GUID)("ADR-0012 Fork B — dead-anchor diagnostic (same-host)",
     expect(r.stdout).toMatch(/STALE BINDING/);
   });
 
-  it("NO FALSE FIRE: LIVE-reading row + genuinely-LIVE anchor → stays HEALTHY (concurrent-terminal crux)", async () => {
+  it("NO FALSE FIRE: LIVE-reading row + genuinely-LIVE anchor → no UNWAKEABLE (concurrent-terminal crux)", async () => {
     await seedLiveRow({ pid: LIVE_PID, start: pidStart(LIVE_PID), host: GUID });
     const r = runHook();
 
-    expect(r.stdout, r.stderr).toMatch(/VERDICT=HEALTHY/);
+    // This harness has no daemon (port 54997), so since ADR-0036 S1 (§8a D7 f) the truthful
+    // verdict is DEGRADED rather than HEALTHY. What this test guards is unchanged: a live
+    // anchor must not false-fire the dead-anchor diagnostic.
+    expect(r.stdout, r.stderr).toMatch(/VERDICT=DEGRADED/);
     expect(r.stdout).not.toMatch(/UNWAKEABLE/);
     expect(r.stdout).not.toMatch(/STALE BINDING/);
   });

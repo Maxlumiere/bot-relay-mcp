@@ -428,6 +428,10 @@ fi
 AUTH_ERROR=0
 AUTH_STATE=""
 RECOVERY_COMPLETED=0
+# ADR-0036 S1 (§8a D7 f): did the daemon answer? Recorded by the first HTTP call that
+# proves it either way ("" = not known yet, 1 = answered, 0 = unreachable). The verdict
+# block after register reads it, so a daemon that never came up cannot print HEALTHY.
+DAEMON_REACHABLE=""
 if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
   HEALTH_BODY=$(curl -s -m 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
@@ -435,6 +439,9 @@ if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
     -H "X-Agent-Token: ${RELAY_AGENT_TOKEN}" \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}' 2>/dev/null)
   if [ -n "$HEALTH_BODY" ]; then
+    # A body proves the daemon answered. An EMPTY body proves nothing (refused or timed
+    # out), so it leaves DAEMON_REACHABLE unknown for the later checks to settle.
+    DAEMON_REACHABLE=1
     # v2.6.4 — daemon's SSE-wrapped MCP response stringifies the inner JSON
     # via JSON.stringify with pretty-printing. The bytes the grep sees are
     # `\"key\": value` (escaped quote + space after colon), NOT the
@@ -497,6 +504,9 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
       fi
     else
       echo "[relay] Recovery attempt failed for \"$AGENT_NAME\". Response: $(echo "$RECOVERY_BODY" | head -c 200)" >&2
+      # ADR-0036 S1 (D7): the EXIT trap would otherwise print the HEALTHY set above.
+      [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2>&1 \
+        && relay_verdict_set "AUTH_FAILED" "recovery with RELAY_RECOVERY_TOKEN failed" " agent=\"$AGENT_NAME\""
       exit 1
     fi
   else
@@ -504,6 +514,9 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
     echo "[relay] Agent \"$AGENT_NAME\" has a stale or revoked token (health_check returned auth_error)." >&2
     echo "[relay] If an admin issued a recovery token for this agent, set RELAY_RECOVERY_TOKEN=<token> and restart this terminal." >&2
     echo "[relay] Otherwise, request a recovery_token via revoke_token(issue_recovery=true) from an admin-capable agent." >&2
+    # ADR-0036 S1 (D7): the EXIT trap would otherwise print the HEALTHY set above.
+    [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2>&1 \
+      && relay_verdict_set "AUTH_FAILED" "stale or revoked token (health_check returned auth_error)" " agent=\"$AGENT_NAME\""
     exit 1
   fi
 fi
@@ -769,6 +782,40 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   if [ -n "${RELAY_HOOK_DEBUG:-}" ]; then
     echo "[bot-relay hook debug] register_agent response:" >&2
     echo "$REG_BODY" >&2
+  fi
+fi
+
+# --- ADR-0036 S1 (§8a D7 f): the verdict reflects what register actually did ---
+# The config self-check above may already have upgraded to HEALTHY, before register ran.
+# Settle whether the daemon answered, then REPLACE HEALTHY (never a louder verdict) when
+# it did not, or when register itself failed. A HEALTHY printed after a reboot where the
+# daemon never came up is the false-comfort class this exists to remove.
+REGISTER_ATTEMPTED=0
+if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
+  REGISTER_ATTEMPTED=1
+  # The register curl appends "HTTP_STATUS:<code>"; 000 = connection refused or timed out.
+  if printf '%s\n' "${REG_BODY:-}" | grep -q '^HTTP_STATUS:000$'; then
+    DAEMON_REACHABLE=0
+  elif printf '%s\n' "${REG_BODY:-}" | grep -qE '^HTTP_STATUS:[1-9][0-9]{2}$'; then
+    DAEMON_REACHABLE=1
+  fi
+fi
+if [ -z "$DAEMON_REACHABLE" ] && command -v curl >/dev/null 2>&1; then
+  # Register was skipped (a LIVE row or a completed recovery), so nothing above proved
+  # the daemon is up. One bounded probe settles it.
+  if curl -fsS --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+    DAEMON_REACHABLE=1
+  else
+    DAEMON_REACHABLE=0
+  fi
+fi
+if [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2>&1; then
+  if ! command -v curl >/dev/null 2>&1; then
+    relay_verdict_set "DEGRADED" "curl unavailable: register skipped, wake may be unavailable" " agent=\"$AGENT_NAME\""
+  elif [ "$DAEMON_REACHABLE" = "0" ]; then
+    relay_verdict_set "DEGRADED" "daemon unreachable: register skipped, wake may be unavailable" " agent=\"$AGENT_NAME\" port=\"$HTTP_PORT\""
+  elif [ "$REGISTER_ATTEMPTED" -eq 1 ] && printf '%s' "${REG_BODY:-}" | grep -qE '"isError":[[:space:]]*true'; then
+    relay_verdict_set "REGISTER_FAILED" "register_agent returned an error (for example the name is held by another live agent)" " agent=\"$AGENT_NAME\""
   fi
 fi
 
