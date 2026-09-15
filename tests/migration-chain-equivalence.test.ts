@@ -141,8 +141,10 @@ describe("#171 migration-chain equivalence — initializeDb() vs getDb() native 
     const src = fs.readFileSync(path.join(PROJECT_ROOT, "src/db.ts"), "utf8");
     // The last migration in the chain must be invoked exactly ONCE (in
     // applySchemaSetup). Before #171 it appeared twice (both init paths).
-    const chainCalls = (src.match(/migrateSchemaToV2_24\((?:_?db)\)/g) ?? []).length;
-    expect(chainCalls, "migrateSchemaToV2_24 should have exactly ONE call site (in applySchemaSetup)").toBe(1);
+    // Tracks the NEWEST link (v25, ADR-0036 S1). Pinning an older link would stay
+    // green while the chain's tail drifted.
+    const chainCalls = (src.match(/migrateSchemaToV2_25\((?:_?db)\)/g) ?? []).length;
+    expect(chainCalls, "migrateSchemaToV2_25 should have exactly ONE call site (in applySchemaSetup)").toBe(1);
     // Both init paths must delegate to the shared helper.
     expect(src).toMatch(/export async function initializeDb[\s\S]*?applySchemaSetup\(_db\)[\s\S]*?\n}/);
     expect(src).toMatch(/export function getDb[\s\S]*?applySchemaSetup\(_db\)[\s\S]*?return _db/);

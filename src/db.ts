@@ -390,6 +390,7 @@ function applySchemaSetup(db: CompatDatabase): void {
   migrateSchemaToV2_22(db);
   migrateSchemaToV2_23(db);
   migrateSchemaToV2_24(db);
+  migrateSchemaToV2_25(db);
   seedBuiltinTaskSchemas(db);
   finalizeSchemaVersion(db);
   purgeOldRecords(db);
@@ -609,7 +610,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 24;
+export const CURRENT_SCHEMA_VERSION = 25;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -707,6 +708,7 @@ export function applyMigration(from: number, to: number): void {
     [21, 22],
     [22, 23],
     [23, 24],
+    [24, 25],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1844,6 +1846,52 @@ function migrateSchemaToV2_24(db: CompatDatabase): void {
   // Sender-recap query (get_outstanding) filters WHERE from_agent = ? AND
   // disposition IN ('ask','obligation') AND resolved_at IS NULL.
   db.exec("CREATE INDEX IF NOT EXISTS idx_messages_from_disposition ON messages(from_agent, disposition)");
+}
+
+/**
+ * ADR-0036 S1 (schema v25) — `agent_bindings`, the window-bound identity RECORD.
+ * S1 records and lists; no auth path reads this table yet.
+ *   - One current row per WINDOW ANCHOR (host_id, window_pid, window_pid_start) on
+ *     its current Claude Code conversation. Superseded rows are history, never
+ *     deleted.
+ *   - `conversation_id` is NOT NULL: a bind that cannot read the conversation id
+ *     writes nothing (BIND_FAILED), never a guessed or NULL id (§8a D3). Likewise
+ *     the anchor columns.
+ *   - `conversation_title` is display-only ("as named in Claude Code"), never identity.
+ *   - `end_reason` = Claude Code's verbatim SessionEnd reason (NULL if none observed).
+ *     `supersede_reason` = relay-authored (resume-switch, clear-carry, handoff).
+ *     Status derivation reads end_reason only (§8a D2).
+ *   - NO status column: live / exited / needs-resume is derived at read time from
+ *     anchorLivenessVerdict (§2.2), so a stored status can never drift from the anchor.
+ *   - NO unique-per-name constraint: per-name exclusivity is S3's claim-time rule,
+ *     never schema (§8a D1).
+ * Additive: a new table and its indexes; no existing row changes.
+ */
+function migrateSchemaToV2_25(db: CompatDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_bindings (
+      binding_id TEXT PRIMARY KEY,
+      binding_version INTEGER NOT NULL DEFAULT 1,
+      agent_name TEXT,
+      agent_class TEXT,
+      conversation_id TEXT NOT NULL,
+      conversation_title TEXT,
+      cwd TEXT,
+      host_id TEXT NOT NULL,
+      window_pid INTEGER NOT NULL,
+      window_pid_start TEXT NOT NULL,
+      bound_via TEXT NOT NULL,
+      bound_at TEXT NOT NULL,
+      last_verified_at TEXT,
+      superseded_at TEXT,
+      superseded_by TEXT,
+      end_reason TEXT,
+      supersede_reason TEXT
+    )
+  `);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_anchor ON agent_bindings(host_id, window_pid, window_pid_start)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_agent_name ON agent_bindings(agent_name)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_conversation ON agent_bindings(conversation_id)");
 }
 
 /**
