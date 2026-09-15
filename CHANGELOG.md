@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — the PostToolUse hook marked mail read that the agent never saw (ADR-0037)
+
+`hooks/post-tool-use-check.sh` drained the mailbox on every tool call (an HTTP `get_messages`, or a sqlite `UPDATE status='read'`) and injected the message bodies as `additionalContext`. A hook cannot prove delivery. The injection has no acknowledgement and can be truncated or dropped, and `PostToolUse` also fires for a **subagent's** tool calls. So mail was marked read while the model never saw it, and the recipient's own `get_messages` came back empty. Measured on 2026-09-15: a deploy go-ahead landed in a subagent's context and vanished from its recipient's pending mail.
+
+- **Peek only.** The HTTP path calls `get_messages` with `peek: true`; the sqlite fallback is a plain `SELECT`. The hook no longer contains any code that marks, resolves or updates a message. The agent's own `get_messages` call is the delivery. This also stops a hook read from stamping the drain time that wake coverage (ADR-0026) relies on.
+- **A notice, not bodies.** `relay: N unread for <agent>, from <senders> (K high). newest first line (≤100 chars): "…". Unread until get_messages is called.` Content encrypted at rest is never quoted.
+- **Subagent calls are skipped.** When the hook's stdin carries `agent_id` or `agent_type` (present only on subagent tool calls), no mail path runs. Stdin that cannot be parsed is treated the same way.
+- **Damper.** A notice repeats only when the unread set changes or the remind interval passes: `RELAY_HOOK_NOTICE_REMIND_SECS`, default 600s, at most 120s while anything unread is high priority. `0` disables damping; invalid values fall back to the default. State is keyed per agent and Claude session in `$RELAY_HOME/hook-state/`. If it cannot be written, the hook notifies rather than staying silent.
+- Tests: `tests/adr-0037-post-tool-use-peek-only.test.ts`. Each case asserts the mail is still pending after the hook runs, and each was seen failing on the draining hook. `tests/hooks-post-tool-use.test.ts` case (3) previously pinned the drain ("the second run returns empty because the first marked it read") and now pins the opposite.
+
 ### Added — opt-in same-name instance addressing via auto-suffix (`register_agent` `on_name_collision`)
 
 Several CLIs sharing ONE agent definition all register the same name and are hard-rejected with `NAME_COLLISION_ACTIVE`. New OPT-IN input `on_name_collision: "reject" | "suffix"` (default `"reject"` — today's behavior exactly, silence changes nothing). With `"suffix"`, an actively-held name registers instead as a relay-assigned instance `<name>-N` (lowest free N≥2), returned as `assigned_name` alongside an unmissable **not-restart-stable** warning (also stated in the tool description, so an LLM client reads it in the schema).

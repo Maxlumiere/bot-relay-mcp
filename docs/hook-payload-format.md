@@ -108,6 +108,11 @@ Tool-specific fields:
   name).
 - `tool_input` — the arguments the tool was called with.
 - `tool_response` — the tool's return value (shape varies per tool).
+- `agent_id`, `agent_type` — present **only** when the tool call was made by a
+  **subagent** (for example `"agent_type": "general-purpose"`); `session_id` is
+  then the parent's. A main-agent call has neither key. Measured on Claude Code
+  2.1.272. `hooks/post-tool-use-check.sh` uses this to skip its mail notice for
+  subagent calls (ADR-0037).
 
 **Stdout convention:** stdout content is appended to the session context
 as a tool-use continuation. Keep quiet unless you want the content visible

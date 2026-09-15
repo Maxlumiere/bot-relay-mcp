@@ -1,29 +1,57 @@
 #!/bin/bash
-# bot-relay-mcp: PostToolUse hook — near-real-time mailbox check (v1.8)
+# bot-relay-mcp: PostToolUse hook — mid-task mail NOTICE (v1.8; peek-only since ADR-0037)
 #
 # Fires after every Claude Code tool call. If this agent (RELAY_AGENT_NAME)
-# has pending mail in the relay, surface it as additionalContext so the
-# running Claude Code session sees it WITHOUT waiting for SessionStart or a
-# human-bridged "check mail".
+# has unread mail in the relay, inject a short NOTICE as additionalContext: the
+# unread count, the senders, and a bounded quoted first line of the newest
+# message. Never message bodies, and never a read-mark.
 #
-# Transport selection:
-#   1. HTTP (preferred) — if relay daemon responds on RELAY_HTTP_HOST:RELAY_HTTP_PORT
-#      AND RELAY_AGENT_TOKEN is set. Goes through full auth/rate-limit/audit pipeline.
-#   2. Sqlite direct (fallback) — direct read + mark-as-read on RELAY_DB_PATH.
-#      Used when HTTP is unreachable or when no token is present (stdio-only setups).
+# ADR-0037 — ONLY THE MODEL MOVES MAIL TO READ. This hook used to DRAIN the
+# mailbox (HTTP get_messages, or a sqlite UPDATE status='read') and inject the
+# bodies. A hook cannot prove delivery: additionalContext has no acknowledgement,
+# it can be truncated or dropped, and PostToolUse also fires for SUBAGENT tool
+# calls. So mail was marked read while the model never saw it (measured
+# 2026-09-15: a deploy GO landed in a subagent's context and vanished from the
+# recipient's pending drain). Both paths now PEEK. The agent's own get_messages
+# call is the delivery, and its tool result is the proof of receipt. Same
+# contract as stop-check.sh (#124).
+#
+# Transport selection (both read-only):
+#   1. HTTP (preferred) — get_messages with peek:true, if the daemon responds on
+#      RELAY_HTTP_HOST:RELAY_HTTP_PORT AND a token is available. The same code
+#      path as the agent's own drain minus the mark, so the notice clears exactly
+#      when that drain takes the mail.
+#   2. Sqlite direct (fallback) — a bare SELECT on RELAY_DB_PATH, mirroring
+#      stop-check.sh's per-session pending predicate.
+#
+# Stdin (the PostToolUse payload) is read for two things only:
+#   - agent_id / agent_type: present only on a SUBAGENT's tool call (measured on
+#     Claude Code 2.1.272). A subagent call runs NO mail path. A non-empty payload
+#     that cannot be parsed is treated the same way: a subagent cannot be ruled
+#     out, and skipping only delays a notice — the mail stays pending.
+#   - session_id: keys the notice damper per (agent, Claude session), so two
+#     windows on one agent never silence each other and /clear re-notifies.
+#
+# Damper: a notice repeats only when the unread set changes, or once the remind
+# interval has passed: RELAY_HOOK_NOTICE_REMIND_SECS (default 600, max 3600),
+# capped at 120 while any unread message is high priority. 0 disables damping; a
+# non-numeric, negative or oversized value falls back to the default, so damping
+# is never unbounded. State lives in ${RELAY_HOME:-$HOME/.bot-relay}/hook-state/.
+# If that state cannot be read or written, the notice is emitted: suppression
+# needs durable evidence.
 #
 # Output contract (Claude Code PostToolUse hook):
-#   - No mail OR any error → empty stdout, exit 0. Silent no-op.
-#   - Mail present → single-line JSON to stdout with additionalContext, exit 0.
+#   - No mail, damped, subagent call, or any error → empty stdout, exit 0.
+#   - Unread mail → single-line JSON to stdout with additionalContext, exit 0.
 #   Stderr is operator-visible; use sparingly.
 #
 # Security / discipline:
 #   - Never re-register. SessionStart handles that.
+#   - Never mark, resolve or otherwise write message state (ADR-0037).
 #   - Validate every env-var input against an allowlist BEFORE use.
 #   - Never write partial JSON, error text, or stack traces to stdout.
-#   - 2s total budget (1s health probe + 2s get_messages). Claude Code enforces
-#     hook timeout from settings.json on top of this.
-#   - No stdin reading (the tool-call payload is ignored — mail check is tool-agnostic).
+#   - Per-call budget: 1s health probe + 2s get_messages. Claude Code enforces
+#     the hook timeout from settings.json on top of this.
 
 # v2.0 final (#19): self-check for path truncation. Stderr warn so operators
 # see setup mistakes without breaking the hook contract (stdout stays clean).
@@ -75,12 +103,13 @@ HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 DB_PATH=$(resolve_relay_db_path) || {
   # Malformed active-instance content — refuse to fall back silently. A
   # broken setup should be loud, not hidden under legacy. The hook's
-  # other side effects (HTTP register/health, mail delivery) are gated
-  # behind DB_PATH being readable below; null DB_PATH falls cleanly to
-  # the existing "no DB → exit 0" path.
+  # other side effects (HTTP health probe, peek) are gated behind DB_PATH
+  # being readable below; null DB_PATH falls cleanly to the existing
+  # "no DB → exit 0" path.
   DB_PATH=""
 }
 MAX_MESSAGES="${RELAY_HOOK_MAX_MESSAGES:-20}"
+REMIND_SECS="${RELAY_HOOK_NOTICE_REMIND_SECS:-600}"
 
 # --- Guard: no agent name means nothing to do ---
 
@@ -116,6 +145,13 @@ if ! echo "$MAX_MESSAGES" | grep -Eq '^[0-9]{1,3}$' || [ "$MAX_MESSAGES" -lt 1 ]
   MAX_MESSAGES=20
 fi
 
+# Only a plain decimal 0..3600 is honoured; anything else is the default, never
+# "disabled". 10# strips leading zeros so shell arithmetic cannot read octal.
+if ! echo "$REMIND_SECS" | grep -Eq '^[0-9]{1,4}$' || [ "$REMIND_SECS" -gt 3600 ]; then
+  REMIND_SECS=600
+fi
+REMIND_SECS=$((10#$REMIND_SECS))
+
 # Token shape: base64url-ish, 8-128 chars, strictly alnum/_/=/./- (no whitespace,
 # no control chars — blocks header-injection via newlines in env var).
 if [ -n "$AGENT_TOKEN" ]; then
@@ -133,43 +169,176 @@ else
   DB_PATH="$RESOLVED_DB_PATH"
 fi
 
+# Everything below (stdin parse, notice rendering, JSON output) needs python3.
+if ! command -v python3 >/dev/null 2>&1; then
+  command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "python3 unavailable" " agent=\"${AGENT_NAME}\""
+  exit 0
+fi
+
 # --- Helper: emit the hook JSON with readable additionalContext ---
-# Arg $1 is the plain-text block to inject. Uses python3 to escape safely.
+# Arg $1 is the plain-text block to inject. Body goes via env var (not argv) and
+# is decoded as UTF-8 explicitly, so no locale can turn it into an error.
 emit_hook_json() {
   local body="$1"
   if [ -z "$body" ]; then return 0; fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    return 1
-  fi
-  # Pass body via env var (not argv) to avoid any shell-quote surprises.
   BODY="$body" python3 -c '
 import json, os, sys
+body = os.environb.get(b"BODY", b"").decode("utf-8", "replace")
 out = {
   "continue": True,
   "hookSpecificOutput": {
     "hookEventName": "PostToolUse",
-    "additionalContext": os.environ.get("BODY", ""),
+    "additionalContext": body,
   },
 }
 sys.stdout.write(json.dumps(out))
 ' 2>/dev/null
 }
 
-# --- HTTP path (preferred) ---
+# --- Stdin parser: prints "MODE<US>SESSION_ID" -----------------------------------
+# MODE is main | subagent | absent | invalid. Python reads fd 0 in chunks with a
+# 1s idle deadline: Claude Code writes the payload and closes the pipe, so this
+# is instant in practice, and a caller that never closes stdin costs one second
+# rather than a hang. Top-level keys only, from a real JSON parse: an "agent_id"
+# string inside tool_response must not count.
+STDIN_PY='
+import json, os, re, select, sys
+buf = bytearray()
+cap = 16 * 1024 * 1024
+while True:
+    try:
+        ready, _, _ = select.select([0], [], [], 1.0)
+    except Exception:
+        break
+    if not ready:
+        break
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    if len(buf) > cap:
+        sys.stdout.write("invalid\x1f")
+        sys.exit(0)
+if not bytes(buf).strip():
+    sys.stdout.write("absent\x1f")
+    sys.exit(0)
+try:
+    d = json.loads(bytes(buf).decode("utf-8", "replace"))
+except Exception:
+    sys.stdout.write("invalid\x1f")
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.stdout.write("invalid\x1f")
+    sys.exit(0)
+sid = d.get("session_id")
+if not (isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid)):
+    sid = ""
+sub = any(d.get(k) not in (None, "") for k in ("agent_id", "agent_type"))
+sys.stdout.write(("subagent" if sub else "main") + "\x1f" + sid)
+'
 
-http_try() {
+# --- Notice renderer: reads the peek result on stdin, prints "FPR<US>TOP<US>NOTICE" --
+# SRC=http  → stdin is the StreamableHTTP get_messages response.
+# SRC=sqlite → stdin is rows "id<US>from<US>priority<US>created_at<US>content<RS>...".
+# Exit 1 = the read failed (caller falls back / stays CANNOT-JUDGE); exit 0 with
+# no output = empty mailbox. FPR fingerprints the unread set for the damper.
+# Piped rather than passed in an env var: a full get_messages response can exceed
+# Linux's 128KB per-string exec limit.
+NOTICE_PY='
+import hashlib, json, os, re, sys
+
+src = os.environ.get("SRC", "")
+an = os.environ.get("AN", "?")
+try:
+    lim = int(os.environ.get("LIM", "20"))
+except ValueError:
+    lim = 20
+raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+
+recs = []
+if src == "http":
+    payload = None
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+            break
+    if payload is None:
+        payload = raw.strip()
+    try:
+        rpc = json.loads(payload)
+        data = json.loads(rpc["result"]["content"][0]["text"])
+        msgs = data["messages"]
+    except Exception:
+        sys.exit(1)
+    if not isinstance(msgs, list):
+        sys.exit(1)
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        recs.append((str(m.get("id", "")), str(m.get("from_agent", "?")),
+                     str(m.get("priority", "normal")), str(m.get("created_at", "")),
+                     c if isinstance(c, str) else ""))
+elif src == "sqlite":
+    for rec in raw.split("\x1e"):
+        rec = rec.strip("\n\r")
+        if not rec:
+            continue
+        parts = rec.split("\x1f", 4)
+        if len(parts) == 5:
+            recs.append(tuple(parts))
+else:
+    sys.exit(1)
+
+if not recs:
+    sys.exit(0)
+
+def clean(s, cap):
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", s).strip()
+    return s if len(s) <= cap else s[: cap - 1] + "…"
+
+n = len(recs)
+count = ("%d+" % n) if n >= lim else ("%d" % n)
+fpr = hashlib.sha256("\n".join(sorted(r[0] for r in recs)).encode("utf-8", "replace")).hexdigest()[:32]
+top = "high" if any(r[2] == "high" for r in recs) else "normal"
+newest_first = sorted(recs, key=lambda r: r[3], reverse=True)
+order, highs = [], {}
+for r in newest_first:
+    who = clean(r[1], 64) or "?"
+    if who not in highs:
+        order.append(who)
+        highs[who] = 0
+    if r[2] == "high":
+        highs[who] += 1
+shown = [("%s (%d high)" % (w, highs[w])) if highs[w] else w for w in order[:5]]
+if len(order) > 5:
+    shown.append("+%d more" % (len(order) - 5))
+content = newest_first[0][4]
+if src == "sqlite" and (content.startswith("enc:") or content.startswith("enc1:")):
+    first = "(encrypted at rest, not shown)"
+else:
+    first = next((l for l in content.splitlines() if l.strip()), "")
+    first = json.dumps(clean(first, 100), ensure_ascii=False)
+notice = ("relay: %s unread for %s, from %s. newest first line (≤100 chars): %s. "
+          "Unread until get_messages is called.") % (count, an, ", ".join(shown), first)
+sys.stdout.buffer.write(("%s\x1f%s\x1f%s" % (fpr, top, notice)).encode("utf-8", "replace"))
+'
+
+# --- HTTP peek (preferred) ---
+
+http_peek() {
   [ -z "$AGENT_TOKEN" ] && return 1
   command -v curl >/dev/null 2>&1 || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
 
   # Probe /health with a tight budget. If no response in 1s, assume no daemon.
   if ! curl -fsS --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
     return 1
   fi
 
-  # Compose the get_messages JSON-RPC payload via python3 so we don't have to
-  # shell-escape AGENT_NAME/AGENT_TOKEN manually (they are already validated,
-  # but json.dumps is belt-and-suspenders).
+  # peek:true is the whole fix on this path: the same get_messages the agent
+  # calls, minus the read-mark. json.dumps is belt-and-suspenders on top of the
+  # allowlist validation above.
   local payload
   payload=$(AN="$AGENT_NAME" AT="$AGENT_TOKEN" LIM="$MAX_MESSAGES" python3 -c '
 import json, os
@@ -182,6 +351,7 @@ print(json.dumps({
       "agent_name": os.environ["AN"],
       "status": "pending",
       "limit": int(os.environ["LIM"]),
+      "peek": True,
       "agent_token": os.environ["AT"],
     },
   },
@@ -196,134 +366,47 @@ print(json.dumps({
     -H "X-Agent-Token: $AGENT_TOKEN" \
     --data "$payload" 2>/dev/null) || return 1
 
-  # Parse the SSE-framed JSON-RPC result, extract messages array, format.
-  RESP="$response" AN="$AGENT_NAME" python3 <<'PYEOF' 2>/dev/null
-import json, os, sys
-
-raw = os.environ.get("RESP", "").strip()
-# StreamableHTTP wraps the JSON-RPC response in SSE: "event: message\ndata: {..}".
-# Extract the data: line(s) — pick the first.
-payload = None
-for line in raw.splitlines():
-    line = line.strip()
-    if line.startswith("data:"):
-        payload = line[5:].strip()
-        break
-if payload is None:
-    # Maybe the server returned plain JSON (non-SSE). Try parsing whole body.
-    payload = raw
-try:
-    rpc = json.loads(payload)
-except Exception:
-    sys.exit(1)
-# Drill into result.content[0].text which is itself a JSON string.
-try:
-    inner = rpc["result"]["content"][0]["text"]
-    data = json.loads(inner)
-except Exception:
-    sys.exit(1)
-msgs = data.get("messages", [])
-if not msgs:
-    sys.exit(0)  # empty — success but nothing to surface
-lines = [f"[RELAY] New mail for {os.environ['AN']} ({len(msgs)} message{'s' if len(msgs) != 1 else ''}):"]
-for m in msgs:
-    prio = m.get("priority", "normal")
-    frm = m.get("from_agent", "?")
-    when = m.get("created_at", "")
-    content = m.get("content", "")
-    # Trim absurdly long messages to keep context sane — 2KB per message cap.
-    if len(content) > 2048:
-        content = content[:2048] + "... [truncated]"
-    lines.append(f"  [{prio}] from {frm} at {when}:")
-    for l in content.splitlines() or [""]:
-        lines.append(f"    {l}")
-sys.stdout.write("\n".join(lines))
-PYEOF
-  local rc=$?
-  return $rc
+  printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null
 }
 
-# --- Sqlite direct fallback ---
+# --- Sqlite peek (fallback) ---
+# SELECT only. #56 canonical per-session pending predicate (SSOT: src/db.ts
+# pendingForSessionClause), the same replica stop-check.sh uses: unresolved AND
+# (never read, OR read by a DIFFERENT session). On a legacy DB without those
+# columns the query errors and the bare-status form runs instead.
 
-sqlite_try() {
+sqlite_peek() {
   [ -z "$DB_PATH" ] && return 1
   [ -f "$DB_PATH" ] || return 1
   command -v sqlite3 >/dev/null 2>&1 || return 1
 
-  # Select pending messages for this agent into a piped format: id|from|prio|created|content
-  # Content may contain newlines, so use a field-separator SELECT then parse in python3.
-  # -separator chosen to be a control char unlikely in content.
   local rows
   rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 .parameter set :lim $MAX_MESSAGES
-SELECT id, from_agent, priority, created_at, content
-FROM messages WHERE to_agent = :name AND status = 'pending'
+SELECT id, from_agent, priority, created_at, substr(content, 1, 2048)
+FROM messages WHERE to_agent = :name
+  AND resolved_at IS NULL
+  AND (read_by_session IS NULL
+       OR read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = :name), ''))
 ORDER BY created_at DESC LIMIT :lim;
 SQL
 )
+  if [ $? -ne 0 ]; then
+    rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+.parameter set :lim $MAX_MESSAGES
+SELECT id, from_agent, priority, created_at, substr(content, 1, 2048)
+FROM messages WHERE to_agent = :name AND status = 'pending'
+ORDER BY created_at DESC LIMIT :lim;
+SQL
+) || return 1
+  fi
   if [ -z "$rows" ]; then
     return 0  # empty — nothing to surface
   fi
 
-  # Parse rows in python3. Emit two sections:
-  #   "<<IDS>> id1 id2 ...\n<<BODY>>\n<text>"
-  # Shell splits them back out via sed so mark-as-read knows which IDs to update.
-  local combined
-  combined=$(ROWS="$rows" AN="$AGENT_NAME" python3 <<'PYEOF' 2>/dev/null
-import os, sys
-raw = os.environ.get("ROWS", "")
-if not raw.strip():
-    sys.exit(0)
-records = []
-for rec in raw.split("\x1e"):
-    rec = rec.strip("\n\r")
-    if not rec:
-        continue
-    parts = rec.split("\x1f", 4)
-    if len(parts) != 5:
-        continue
-    records.append(parts)
-if not records:
-    sys.exit(0)
-lines = [f"[RELAY] New mail for {os.environ['AN']} ({len(records)} message{'s' if len(records) != 1 else ''}):"]
-for (_, frm, prio, when, content) in records:
-    if len(content) > 2048:
-        content = content[:2048] + "... [truncated]"
-    lines.append(f"  [{prio}] from {frm} at {when}:")
-    for l in content.splitlines() or [""]:
-        lines.append(f"    {l}")
-ids = " ".join(r[0] for r in records)
-# Sentinel: "<<IDS>> id1 id2 ...\n<<BODY>>\n<text>"
-sys.stdout.write("<<IDS>> " + ids + "\n<<BODY>>\n" + "\n".join(lines))
-PYEOF
-)
-  if [ -z "$combined" ]; then
-    return 0
-  fi
-
-  local ids_line
-  ids_line=$(echo "$combined" | sed -n '1s/^<<IDS>> //p')
-  body=$(echo "$combined" | sed -n '/^<<BODY>>$/,$p' | sed '1d')
-
-  if [ -z "$body" ]; then
-    return 0
-  fi
-
-  # Mark the specific IDs we surfaced as read. Validate each ID is UUID-shape
-  # before interpolating to avoid any SQL surprise (defense-in-depth — IDs come
-  # from our own DB so should already be UUIDs, but be strict).
-  for id in $ids_line; do
-    if echo "$id" | grep -Eq '^[A-Za-z0-9-]{8,64}$'; then
-      sqlite3 "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :id '$id'
-UPDATE messages SET status = 'read' WHERE id = :id AND status = 'pending';
-SQL
-    fi
-  done
-
-  echo "$body"
-  return 0
+  printf '%s' "$rows" | SRC=sqlite AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null
 }
 
 # --- v2.15.0: presence self-heal (narrow, metadata-only) ---
@@ -335,11 +418,10 @@ SQL
 # can re-surface already-read mail; report_liveness touches only agent_pid +
 # start). Gated on a real mismatch → zero churn in steady state. Best-effort +
 # silent: any failure is a no-op that never affects the hook contract or the
-# mail delivery below. relay_agent_pid/relay_pid_start come from _vault-helpers.sh.
+# mail notice below. relay_agent_pid/relay_pid_start come from _vault-helpers.sh.
 liveness_self_heal() {
   [ -z "$AGENT_TOKEN" ] && return 0
   command -v curl >/dev/null 2>&1 || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
   command -v relay_agent_pid >/dev/null 2>&1 || return 0
   local cur_pid cur_start stored_pid stored_start
   cur_pid=$(relay_agent_pid 2>/dev/null || printf '')
@@ -388,32 +470,116 @@ print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":
   return 0
 }
 
-# --- Main: self-heal presence (best-effort), then try HTTP, fall back to sqlite ---
+# --- Damper helpers -------------------------------------------------------------
+# notice_is_damped returns 0 (suppress) ONLY on positive evidence: a readable
+# state file holding the SAME fingerprint, with an mtime inside the window and
+# not in the future. Any missing or unreadable piece means emit.
+notice_is_damped() {
+  [ "$REMIND_SECS" -eq 0 ] && return 1
+  case "$FPR" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ -f "$STATE_FILE" ] || return 1
+  local window="$REMIND_SECS" now last prev
+  if [ "$TOP" = "high" ] && [ "$window" -gt 120 ]; then
+    window=120
+  fi
+  prev=$(head -c 64 "$STATE_FILE" 2>/dev/null) || return 1
+  [ "$prev" = "$FPR" ] || return 1
+  now=$(date +%s)
+  # mtime, portably. GNU stat -f is "filesystem status" and SUCCEEDS with the
+  # mount point for %m, so accept the BSD answer only if it is numeric (codex #124).
+  last=$(stat -f %m "$STATE_FILE" 2>/dev/null)
+  case "$last" in ''|*[!0-9]*) last=$(stat -c %Y "$STATE_FILE" 2>/dev/null) ;; esac
+  case "$last" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$now" -ge "$last" ] || return 1
+  [ $((now - last)) -lt "$window" ]
+}
+
+# Records "notified" by writing the fingerprint atomically; the file's mtime is
+# the notice time. Best-effort: a failure here only means the next call notifies.
+record_notice() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  local tmp="$STATE_FILE.$$"
+  if printf '%s' "$FPR" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  fi
+  return 0
+}
+
+# --- Main ---------------------------------------------------------------------
+
+# Hook input first, before anything else could read stdin.
+HOOK_MODE="absent"
+HOOK_SESSION=""
+if [ ! -t 0 ]; then
+  _parsed=$(python3 -c "$STDIN_PY" 2>/dev/null)
+  HOOK_MODE="${_parsed%%$'\x1f'*}"
+  HOOK_SESSION="${_parsed#*$'\x1f'}"
+fi
+if ! echo "$HOOK_SESSION" | grep -Eq '^[A-Za-z0-9_-]{1,128}$'; then
+  HOOK_SESSION=""
+fi
 
 liveness_self_heal
 
-BODY=$(http_try)
+# A subagent's tool call runs no mail path at all (ADR-0037 clause 2). Neither
+# does a payload that cannot be parsed. The verdict says why nothing was judged.
+case "$HOOK_MODE" in
+  main|absent) ;;
+  subagent)
+    command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "subagent tool call: mail check skipped (ADR-0037)" " agent=\"${AGENT_NAME}\""
+    exit 0
+    ;;
+  *)
+    command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "hook stdin unparseable: mail check skipped (ADR-0037)" " agent=\"${AGENT_NAME}\""
+    exit 0
+    ;;
+esac
+
+SUMMARY=$(http_peek)
 RC=$?
 READ_OK=0
 [ $RC -eq 0 ] && READ_OK=1
-if [ $RC -ne 0 ] || [ -z "$BODY" ]; then
-  BODY=$(sqlite_try)
-  # sqlite_try returning 0 with empty BODY = empty mailbox, which is fine.
+if [ $RC -ne 0 ] || [ -z "$SUMMARY" ]; then
+  SUMMARY=$(sqlite_peek)
+  # sqlite_peek returning 0 with empty SUMMARY = empty mailbox, which is fine.
   [ $? -eq 0 ] && READ_OK=1
 fi
 
 # THE ONLY UPGRADE. Positive evidence is a mailbox read that SUCCEEDED — via
-# HTTP or via the sqlite fallback. An empty BODY alone is NOT evidence: it is
-# ambiguous between "no mail" and "could not read", and treating ambiguity as
-# health is the exact conflation this whole mechanism removes. If both paths
-# failed, CANNOT-JUDGE stands.
+# HTTP or via the sqlite fallback (both peeks). An empty SUMMARY alone is NOT
+# evidence: it is ambiguous between "no mail" and "could not read", and treating
+# ambiguity as health is the exact conflation this whole mechanism removes. If
+# both paths failed, CANNOT-JUDGE stands.
 if [ "$READ_OK" -eq 1 ] && command -v relay_verdict_set >/dev/null 2>&1; then
   relay_verdict_set "HEALTHY" "mailbox read succeeded" " agent=\"${AGENT_NAME:-?}\""
 fi
 
-if [ -z "$BODY" ]; then
+# Damper state is keyed by (agent, Claude session). "@" is outside both
+# allowlists, so an agent-only key can never collide with a session key.
+STATE_DIR="${RELAY_HOME:-$HOME/.bot-relay}/hook-state"
+if [ -n "$HOOK_SESSION" ]; then
+  STATE_FILE="$STATE_DIR/ptu-notice-${AGENT_NAME}@${HOOK_SESSION}"
+else
+  STATE_FILE="$STATE_DIR/ptu-notice-${AGENT_NAME}"
+fi
+
+if [ -z "$SUMMARY" ]; then
+  # A read that succeeded and found nothing retires this key's state.
+  if [ "$READ_OK" -eq 1 ]; then
+    rm -f "$STATE_FILE" 2>/dev/null
+  fi
   exit 0
 fi
 
-emit_hook_json "$BODY"
+FPR="${SUMMARY%%$'\x1f'*}"
+_rest="${SUMMARY#*$'\x1f'}"
+TOP="${_rest%%$'\x1f'*}"
+NOTICE="${_rest#*$'\x1f'}"
+
+if notice_is_damped; then
+  exit 0
+fi
+
+emit_hook_json "$NOTICE" || exit 0
+record_notice
 exit 0
