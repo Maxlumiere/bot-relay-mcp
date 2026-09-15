@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — the fleet board claimed "Nothing is blocked on a human" when it could not know
+
+Measured on the live board: with no snapshot received yet, the banner said "Waiting for the first snapshot" while the **Pending on a human** lane said "Nothing is blocked on a human right now". That is silence shown as health, on the lane most likely to be trusted. The agents lane had the same pattern: "No agents registered right now" from an out-of-date snapshot.
+
+- An empty lane now shows its all-clear only when the snapshot is **fresh** (banner "ok") and the list is really present.
+- In every other case the lane says **Unknown** and why: no snapshot yet, the latest push was rejected (the board is frozen), the last snapshot is stale (with its age), or the snapshot has no such list.
+- Items that do exist still show from a stale snapshot; the banner already gives its age.
+- New `dashboard/test/render-empty-states.test.mjs`: 8 cases that must not show an all-clear, all seen failing on the old renderer, plus 4 cases the old renderer already got right, which still pass.
+
 ### Fixed — the board's post-deploy verifier could "pass" without running a single check
 
 `dashboard/verify-deploy.mjs` decided whether it was being run directly by comparing `import.meta.url` with `` `file://${process.argv[1]}` ``. The module URL is symlink-resolved and percent-encoded; `argv[1]` is neither. So from a checkout path containing a space, through a symlinked file, or under a symlinked directory (on macOS `/tmp` and `/var/folders` are themselves symlinks), the script skipped `main()` and exited 0 with no output: a green verifier that had verified nothing.
