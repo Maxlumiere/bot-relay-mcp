@@ -21,6 +21,9 @@
 // only — it cannot see whether the running daemon has reloaded, so it tells you to
 // restart and watch the board's own banner.
 
+import { realpathSync } from "node:fs";
+import { basename } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { sign, timingSafeEqualStr } from "./lib/sign.js";
 
 export const TEST_AGENT = "__deploy-check__";
@@ -294,7 +297,10 @@ function main() {
           "    restart the daemon and confirm the board's OWN banner shows a real 'ok' (not the test marker).\n" +
           `  • The test push is labelled "${TEST_AGENT}"; the relay's first real push replaces it.`,
       );
-      process.exit(ok && aborted == null ? 0 : 1);
+      if (!Array.isArray(results) || results.length === 0) {
+        console.log("⛔ No checks ran — refusing to report success.");
+      }
+      process.exit(exitCodeFor({ results, ok, aborted }));
     })
     .catch((err) => {
       console.error("verification crashed:", err && err.message);
@@ -302,4 +308,44 @@ function main() {
     });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main();
+/**
+ * Exit code for a finished run: 0 only when checks actually ran and all of them
+ * passed. A verifier that exits 0 having verified nothing is the one failure it
+ * must never have.
+ */
+export function exitCodeFor({ results, ok, aborted }) {
+  if (!Array.isArray(results) || results.length === 0) return 2;
+  return ok && aborted == null ? 0 : 1;
+}
+
+/**
+ * How this module was loaded, judged from `argv[1]`:
+ *   "main"     — argv[1] resolves to this very file → run the CLI;
+ *   "imported" — argv[1] is some other program (e.g. a test runner) → stay quiet;
+ *   "mismatch" — argv[1] names a verify-deploy.mjs that is NOT this module.
+ * The old check compared import.meta.url with `file://${argv[1]}`. The module URL
+ * is percent-encoded and symlink-resolved, argv[1] is neither, so from a path with
+ * a space or a symlink a direct run silently skipped main() and exited 0.
+ */
+export function entrypointStatus(moduleUrl, argv1) {
+  if (!argv1) return "imported";
+  let resolved = null;
+  try {
+    resolved = pathToFileURL(realpathSync(argv1)).href;
+  } catch {
+    // unreadable argv path — fall through to the name comparison
+  }
+  if (resolved === moduleUrl) return "main";
+  return basename(argv1) === basename(fileURLToPath(moduleUrl)) ? "mismatch" : "imported";
+}
+
+const entry = entrypointStatus(import.meta.url, process.argv[1]);
+if (entry === "main") {
+  main();
+} else if (entry === "mismatch") {
+  console.error(
+    "verify-deploy: this looks like a direct run, but the entrypoint could not be confirmed — " +
+      "refusing to exit 0 with zero checks run. Re-run it as: node verify-deploy.mjs",
+  );
+  process.exitCode = 2;
+}
