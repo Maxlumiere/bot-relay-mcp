@@ -34,9 +34,9 @@
  * Usage: node scripts/agent-class-guard.mjs <dir> [<dir> ...]
  */
 import { ts, parseGuardSource } from "./lib/guard-parse.mjs";
+import { isDirectRun } from "./lib/entrypoint.mjs";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
 
 // The full canonical taxonomy (declarable + sentinel + reserved). Any of these
 // as a branch/vocab OUTSIDE the SSOT is drift.
@@ -144,4 +144,6 @@ function main() {
   process.exit(0);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
+// Run as CLI only when invoked directly. isDirectRun resolves argv[1] through realpath, so a
+// symlinked or spaced path still runs main() (scripts/lib/entrypoint.mjs).
+if (isDirectRun(import.meta.url)) main();
