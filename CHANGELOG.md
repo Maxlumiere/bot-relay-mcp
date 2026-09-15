@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — release guards could pass without running when started through a symlinked path
+
+Seven scripts under `scripts/` decided whether they were being run directly by comparing `process.argv[1]` with `import.meta.url`. The module URL is symlink-resolved; `argv[1]` is not. So when started through a symlinked directory, `main()` never ran and the script exited 0 with no output: a release gate that reported a pass without checking anything. Measured on all seven: the `agent-class`, `auth-gen`, `prebuild`, `sanctioned-mutation`, `secret-register` and `shipped-content` guards, and `verify-native-binary.mjs`.
+
+- New `scripts/lib/entrypoint.mjs`: `isDirectRun(import.meta.url)` resolves `argv[1]` through `realpath`, so a symlinked path and a path containing a space both run. A run that looks direct (same file name) but cannot be confirmed prints why and exits 2 instead of passing silently. All seven scripts use it.
+- `scripts/pre-publish-check.sh` resolves its project root with `pwd -P`, so the gate invokes every guard by its physical path even when it is started through a symlink.
+- Tests:
+  - `tests/release-guards-symlink-entrypoint.test.ts` runs each script through a symlinked directory and requires the same exit code and output as the real path. It also checks that every guard path `--list-steps` reports is physical. All 8 cases were seen failing on the old code.
+  - `tests/scripts-lib-entrypoint.test.ts` covers the helper itself: a path with a space, a symlinked directory, an import from another script, and a same-named file elsewhere.
+
 ### Fixed — the PostToolUse hook marked mail read that the agent never saw (ADR-0037)
 
 `hooks/post-tool-use-check.sh` drained the mailbox on every tool call (an HTTP `get_messages`, or a sqlite `UPDATE status='read'`) and injected the message bodies as `additionalContext`. A hook cannot prove delivery. The injection has no acknowledgement and can be truncated or dropped, and `PostToolUse` also fires for a **subagent's** tool calls. So mail was marked read while the model never saw it, and the recipient's own `get_messages` came back empty. Measured on 2026-09-15: a deploy go-ahead landed in a subagent's context and vanished from its recipient's pending mail.
