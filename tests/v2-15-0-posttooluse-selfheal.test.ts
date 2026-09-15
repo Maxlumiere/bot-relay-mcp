@@ -133,12 +133,12 @@ describe("v2.15.0 — PostToolUse self-heal gates on the FULL (agent_pid, agent_
       expect(sid.length).toBeGreaterThan(0);
 
       // Seed the message/read plane: one already-READ (for this session) + one
-      // still-PENDING. Deliver the pending one via a FIRST hook run so the
-      // mailbox is settled; from here on the mail-delivery path is a no-op and
-      // only the self-heal can move anything.
+      // still-PENDING. Run the hook once so the mailbox is settled. Since
+      // ADR-0037 the mail path only PEEKS ('m-pend' stays pending), so from
+      // here on only the self-heal could move anything.
       sql(h.dbPath, `INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at, read_by_session) VALUES ('m-read', 'system', '${name}', 'already read', 'normal', 'read', datetime('now'), '${sid}');`);
       sql(h.dbPath, `INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES ('m-pend', 'system', '${name}', 'still pending', 'normal', 'pending', datetime('now'));`);
-      runPostToolUse(h, name, token); // delivers 'm-pend' (normal delivery, not the self-heal)
+      runPostToolUse(h, name, token); // notices 'm-pend' without consuming it (ADR-0037)
 
       // Now snapshot the WHOLE message/read plane + session, corrupt ONLY the
       // start-time to force a self-heal, and run again. The self-heal fires but

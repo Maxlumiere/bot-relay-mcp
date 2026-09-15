@@ -567,7 +567,7 @@ Add a `SessionStart` hook so every terminal automatically checks the relay for p
 
 The `SessionStart` hook only fires when a terminal opens. If an agent is actively working and mail arrives mid-session, it does not see the message until next startup (or a human pastes it in).
 
-v1.8 adds a `PostToolUse` hook — `hooks/post-tool-use-check.sh` — that fires after every tool call, checks the mailbox, and injects pending messages as `additionalContext` so the running session picks them up immediately.
+v1.8 adds a `PostToolUse` hook — `hooks/post-tool-use-check.sh` — that fires after every tool call, peeks at the mailbox, and injects a short notice as `additionalContext` (unread count, senders, a bounded first line of the newest message) so the running session knows to call `get_messages`. The hook never marks mail read and does not run for subagent tool calls: a hook cannot prove the model saw what it injected, so only the agent's own `get_messages` call consumes mail (ADR-0037).
 
 Install per-project (NOT global), in `<project>/.claude/settings.json`:
 
@@ -598,7 +598,7 @@ Install per-project (NOT global), in `<project>/.claude/settings.json`:
 >
 > The outer double-quotes are JSON; the inner single-quotes are shell. Paths with no spaces do not need this treatment.
 
-The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is running (full auth + audit), falling back to direct sqlite on `RELAY_DB_PATH` otherwise. It does NOT re-register (SessionStart handles that), does NOT check tasks (simpler focus, less context pressure), and silent-exits when there is no mail. Full docs + troubleshooting in [`docs/post-tool-use-hook.md`](./docs/post-tool-use-hook.md).
+The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is running (full auth + audit), falling back to direct sqlite on `RELAY_DB_PATH` otherwise. It does NOT re-register (SessionStart handles that), does NOT check tasks (simpler focus, less context pressure), silent-exits when there is no mail, and stays quiet while the unread set is unchanged (`RELAY_HOOK_NOTICE_REMIND_SECS`, default 600s, at most 120s when anything unread is high priority). Full docs + troubleshooting in [`docs/post-tool-use-hook.md`](./docs/post-tool-use-hook.md).
 
 **Honest limitation:** idle terminals get no delivery. The hook only fires when the agent is actively running tool calls. For long-idle windows, still rely on SessionStart + human attention.
 
