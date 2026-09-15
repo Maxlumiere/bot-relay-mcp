@@ -395,6 +395,13 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       expect(parsed.continue).toBe(true);
       expect(parsed.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
       expect(parsed.hookSpecificOutput?.additionalContext).toContain("Hello from P3");
+      // ADR-0037 — READ MUST MEAN RECEIVED: the notice consumed nothing.
+      const db = new Database(dbPath, { readonly: true });
+      const row = db
+        .prepare("SELECT COUNT(*) AS n FROM messages WHERE to_agent = 'post-test-agent' AND status = 'pending'")
+        .get() as { n: number };
+      db.close();
+      expect(row.n).toBe(1);
     } else {
       // Sqlite fallback may degrade silently if python3 / sqlite3 unavailable
       // in the test sandbox; clean degrade is acceptable per the hook's
