@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added — a window now RECORDS which identity it holds, and says so (`relay bind` + `relay fleet`, ADR-0036 S1)
+
+A terminal could become agent X without anything observable happening: no record of which window held which name, on which conversation, and no way to ask. When that binding went stale the only symptom was mail that never arrived. S1 **records and lists**; it changes no auth and performs **no** automatic rebind (that is S3-lite).
+
+- **`relay bind`** records this window's binding from the SessionStart payload on stdin: the conversation, the window anchor (`CLAUDE_PID` cross-checked against the process walk), and the cwd. `--end` records SessionEnd's `reason` verbatim. New `agent_bindings` table (schema **v25**, additive and idempotent).
+- **`relay fleet`** lists every recorded binding with its liveness. **Liveness is DERIVED from the anchor on every run, never stored** — the schema deliberately has no `status`/`is_live` column, because a stored status keeps reporting health after the window it describes is gone.
+- **The SessionStart hook announces the bind** on stdout, where a human and the next agent both read it. A window that becomes X without saying so is the same silence-as-health failure the rest of that hook exists to end.
+- **Refusals are pinned as hard as the happy path.** A bind writes the window's real anchor or it writes nothing: a missing/malformed payload, no `session_id`, or an anchor whose two sources **disagree** all refuse loudly and record nothing. A binding on the wrong window is worse than no binding, because the fleet list would then point at the wrong terminal.
+- **Works with the daemon down** (§2.2, pinned by a test using a dead port): bind is DB-direct, so a daemon slow to start after a reboot cannot cause a missed bind. It never migrates — a pre-v25 DB refuses with `schema not migrated` rather than skipping silently, and that case is systemic (no window anywhere is recorded) so it degrades the session verdict.
+
+Two notes for anyone reading the hook diff:
+
+- The payload read is bounded by **time**, not size. A size bound (`head -c`) blocks until the writer closes, and `spawn(cmd, {})` with no `stdio` option hands the child a pipe nobody ever closes — which hung SessionStart against its 10s timeout and was caught by CANARY 6. Where no bounded read is available the payload is **skipped**: one unrecorded window costs less than a hung session start.
+- `docs/hook-payload-format.md` listed `hook_event_name` as "One of: …", an exhaustive set that omitted `SessionEnd` — an affirmative claim it did not exist. Now non-exhaustive, with a SessionEnd section and a SessionStart `source` table (`startup`/`resume`/`fork`/`clear`/`compact`), including that `clear` and `fork` change the conversation id while `compact` does not, that SessionEnd's `clear` carries the **old** id, that `/compact` fires no SessionEnd at all, and that a reboot's SIGTERM arrives as `other` — indistinguishable from a terminal close.
+
 ### Added — opt-in same-name instance addressing via auto-suffix (`register_agent` `on_name_collision`)
 
 Several CLIs sharing ONE agent definition all register the same name and are hard-rejected with `NAME_COLLISION_ACTIVE`. New OPT-IN input `on_name_collision: "reject" | "suffix"` (default `"reject"` — today's behavior exactly, silence changes nothing). With `"suffix"`, an actively-held name registers instead as a relay-assigned instance `<name>-N` (lowest free N≥2), returned as `assigned_name` alongside an unmissable **not-restart-stable** warning (also stated in the tool description, so an LLM client reads it in the schema).

@@ -2945,6 +2945,224 @@ export function updateAgentMetadata(
  * so a freshly-relaunched agent isn't briefly dead-cached. No-op (false) if the
  * row doesn't exist yet. Sanctioned single-site agents mutation (lives in db.ts).
  */
+/**
+ * ADR-0036 S1 — the `agent_bindings` writer.
+ *
+ * TAKES A HANDLE, never `getDb()` (victra's RULING 1, 2026-09-16): `relay bind`
+ * and `relay fleet` open a RAW handle with busy_timeout only and never run
+ * `applySchemaSetup`, so a schema migration and a record purge can never ride a
+ * path that fires dozens of times a day under a 10s hook timeout, beside old
+ * code mid-rollout. The SQL lives HERE because `agent_bindings` is a guarded
+ * identity table and db.ts is its only sanctioned writer
+ * (scripts/sanctioned-mutation-guard.mjs) — a raw write elsewhere could forge or
+ * erase the record of which window holds which name.
+ */
+export interface BindingAnchor {
+  hostId: string;
+  windowPid: number;
+  windowPidStart: string;
+}
+
+export interface BindingWrite extends BindingAnchor {
+  agentName: string | null;
+  agentClass: string | null;
+  conversationId: string;
+  conversationTitle: string | null;
+  cwd: string | null;
+  boundVia: string;
+}
+
+export type BindingAction = "created" | "refreshed" | "superseded-and-created";
+
+export interface BindingResult {
+  action: BindingAction;
+  bindingId: string;
+  bindingVersion: number;
+  supersededBindingId: string | null;
+}
+
+interface BindingRow {
+  binding_id: string;
+  binding_version: number;
+  conversation_id: string;
+  agent_name: string | null;
+  last_verified_at: string | null;
+}
+
+/**
+ * Is the v25 table present? A bind against a pre-v25 DB must refuse LOUDLY
+ * (BIND_FAILED "schema not migrated"), never migrate and never skip silently.
+ */
+export function hasAgentBindingsTable(db: CompatDatabase): boolean {
+  const row = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_bindings'")
+    .get();
+  return !!row;
+}
+
+/** This window's CURRENT (not superseded) binding, or undefined. */
+export function getCurrentBinding(db: CompatDatabase, anchor: BindingAnchor): BindingRow | undefined {
+  return db
+    .prepare(
+      "SELECT binding_id, binding_version, conversation_id, agent_name, last_verified_at FROM agent_bindings " +
+        "WHERE host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL " +
+        "ORDER BY bound_at DESC LIMIT 1",
+    )
+    .get(anchor.hostId, anchor.windowPid, anchor.windowPidStart) as BindingRow | undefined;
+}
+
+/**
+ * Record this window on this conversation. One current row per WINDOW ANCHOR
+ * (§8a D1 — cardinality is per anchor, never per name; per-name exclusivity is
+ * S3's claim-time job and is never enforced by schema).
+ *
+ *   no current row                    → INSERT                      ("created")
+ *   current row, SAME conversation    → refresh last_verified_at    ("refreshed")
+ *   current row, DIFFERENT conversation → supersede + INSERT        ("superseded-and-created")
+ *
+ * The supersede and the insert commit in ONE transaction: a window must never be
+ * observable with two current rows, nor with none.
+ */
+export function upsertAgentBinding(
+  db: CompatDatabase,
+  w: BindingWrite,
+  opts: { supersedeReason?: string } = {},
+): BindingResult {
+  const ts = now();
+  const current = getCurrentBinding(db, w);
+
+  if (!current) {
+    const bindingId = uuidv4();
+    db.prepare(
+      "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, agent_class, conversation_id, " +
+        "conversation_title, cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at) " +
+        "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      bindingId,
+      w.agentName,
+      w.agentClass,
+      w.conversationId,
+      w.conversationTitle,
+      w.cwd,
+      w.hostId,
+      w.windowPid,
+      w.windowPidStart,
+      w.boundVia,
+      ts,
+      ts,
+    );
+    return { action: "created", bindingId, bindingVersion: 1, supersededBindingId: null };
+  }
+
+  if (current.conversation_id === w.conversationId) {
+    db.prepare("UPDATE agent_bindings SET last_verified_at = ? WHERE binding_id = ?").run(ts, current.binding_id);
+    return {
+      action: "refreshed",
+      bindingId: current.binding_id,
+      bindingVersion: current.binding_version,
+      supersededBindingId: null,
+    };
+  }
+
+  const bindingId = uuidv4();
+  const nextVersion = current.binding_version + 1;
+  // `supersede_reason` is the RELAY's word (resume-switch / clear-carry / handoff).
+  // `end_reason` stays reserved for Claude Code's verbatim SessionEnd reason (§8a D2),
+  // so the two vocabularies can never be confused for one another.
+  const supersedeReason = opts.supersedeReason ?? "resume-switch";
+  const tx = db.transaction(() => {
+    db.prepare(
+      "UPDATE agent_bindings SET superseded_at = ?, superseded_by = ?, supersede_reason = ? WHERE binding_id = ?",
+    ).run(ts, bindingId, supersedeReason, current.binding_id);
+    db.prepare(
+      "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, agent_class, conversation_id, " +
+        "conversation_title, cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      bindingId,
+      nextVersion,
+      w.agentName,
+      w.agentClass,
+      w.conversationId,
+      w.conversationTitle,
+      w.cwd,
+      w.hostId,
+      w.windowPid,
+      w.windowPidStart,
+      w.boundVia,
+      ts,
+      ts,
+    );
+  });
+  tx();
+
+  return {
+    action: "superseded-and-created",
+    bindingId,
+    bindingVersion: nextVersion,
+    supersededBindingId: current.binding_id,
+  };
+}
+
+/**
+ * Record SessionEnd's reason VERBATIM on this window's current binding (§8a D2:
+ * stored as Claude Code said it, never translated). Adds no row. Returns false
+ * when the window has no current binding — the caller says so loudly rather than
+ * inventing one.
+ */
+export function endAgentBinding(db: CompatDatabase, anchor: BindingAnchor, endReason: string): boolean {
+  const current = getCurrentBinding(db, anchor);
+  if (!current) return false;
+  const r = db
+    .prepare("UPDATE agent_bindings SET end_reason = ?, last_verified_at = ? WHERE binding_id = ?")
+    .run(endReason, now(), current.binding_id);
+  return r.changes > 0;
+}
+
+/**
+ * Every CURRENT binding, newest first — the read side of ADR-0036 S1 ("S1
+ * records and LISTS"), and what makes `relay fleet` able to show that a window
+ * became X. READ-ONLY: it writes nothing, so it does not touch the sanctioned-
+ * writer invariant that keeps db.ts the only mutator of this guarded table.
+ *
+ * Deliberately NOT reusing BindingRow. That type is shaped for the supersede
+ * decision in upsertAgentBinding (5 columns, no display fields); widening it
+ * would drag presentation concerns into the write path, where an extra column
+ * is a chance to get cardinality wrong. A listing is a different question, so
+ * it gets its own row type.
+ *
+ * Superseded rows are excluded: they are history, and a fleet list that mixes
+ * the window's current identity with the ones it used to hold would be exactly
+ * the ambiguity the per-anchor cardinality rule exists to remove.
+ */
+export interface BindingListRow {
+  binding_id: string;
+  binding_version: number;
+  agent_name: string | null;
+  agent_class: string | null;
+  conversation_id: string;
+  conversation_title: string | null;
+  cwd: string | null;
+  host_id: string;
+  window_pid: number;
+  window_pid_start: string;
+  bound_via: string;
+  bound_at: string;
+  last_verified_at: string | null;
+  end_reason: string | null;
+}
+
+export function listAgentBindings(db: CompatDatabase): BindingListRow[] {
+  if (!hasAgentBindingsTable(db)) return [];
+  return db
+    .prepare(
+      "SELECT binding_id, binding_version, agent_name, agent_class, conversation_id, conversation_title, " +
+        "cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at, end_reason " +
+        "FROM agent_bindings WHERE superseded_at IS NULL ORDER BY bound_at DESC, binding_id",
+    )
+    .all() as BindingListRow[];
+}
+
 export function setAgentLivenessAnchor(
   name: string,
   pid: number,
