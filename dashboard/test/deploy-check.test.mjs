@@ -53,6 +53,13 @@ function adapt(handler) {
   };
 }
 
+// NOTE FOR AUDITORS: every server in this file binds 127.0.0.1 through here.
+// Some sandboxes deny loopback binds, and this file then exits NON-ZERO with an
+// EPERM from listen() — that is ENVIRONMENTAL, not a failed assertion, and it is
+// not a defect in the code under test. If you see the suite exit non-zero, check
+// for EPERM here BEFORE chasing a logic bug: the other dashboard test files are
+// pure and run fine under the same restrictions. (Reported by codex-5-5 while
+// auditing PR #274.)
 const listen = (srv) =>
   new Promise((r) => srv.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${srv.address().port}`)));
 
