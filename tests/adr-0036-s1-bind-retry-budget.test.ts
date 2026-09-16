@@ -145,18 +145,27 @@ const EXPECTED_WORST_CASE_MS = EXPECTED_BUDGET_MS + EXPECTED_MAX_LOCKING_STATEME
 
 /**
  * Opens the contended handle carrying `busy_timeout = 5000` — the value the CLI
- * shipped before the correction — so the fixture hands the writer the LARGEST
- * engine wait it could ever meet, rather than the repaired one.
+ * shipped before the correction — so the fixture never flatters the writer by
+ * handing it an already-repaired handle.
  *
  * Note what this does NOT create: a long stall. Under WAL this writer reads
  * before it writes, so the upgrade is refused as a snapshot conflict in ~0ms and
- * `busy_timeout` is never consulted (see the header). The 5000 stays because it
- * is the adversarial value: if the per-attempt override were ever removed, the
- * handle's own large timeout would be free to apply and the elapsed bar below
- * would catch it. A repaired value here would make that regression invisible.
+ * `busy_timeout` is never consulted (see the header).
  *
- * The fixed writer OVERRIDES this per attempt from its remaining deadline; that
- * override is exactly the behaviour under test.
+ * AND THEREFORE NOTE WHAT IT DOES NOT COVER. An earlier version of this comment
+ * claimed the elapsed bar below would catch removal of the writer's per-attempt
+ * override. That was FALSE, for the very reason stated one paragraph above
+ * (audit, codex-5-5): EVERY contended case in this file takes the
+ * snapshot-conflict path, so none of them consults `busy_timeout` at all.
+ * Removing the override would still finish quickly and nothing here would
+ * notice. The override is correct-by-construction for a writer that ever becomes
+ * write-first, but against today's read-first writer it is INERT — and no test
+ * in this file is evidence otherwise.
+ *
+ * So the 5000 stays purely as fidelity to the unrepaired shape. That is a weaker
+ * reason than the one it replaces, and it is the true one.
+ *
+ * The fixed writer OVERRIDES this per attempt from its remaining deadline.
  */
 async function openRawHandle(): Promise<import("../src/sqlite-compat.js").CompatDatabase> {
   const Better = (await import("better-sqlite3")).default;
