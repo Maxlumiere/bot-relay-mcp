@@ -19,6 +19,14 @@
  *   relay restore PATH        Restore from a tar.gz archive.
  *   relay recover NAME        Clear an agent's registration so it can re-bootstrap
  *                             (filesystem-gated, for lost-token recovery).
+ *   relay bind                Record THIS window's identity binding from the hook
+ *                             payload on stdin (ADR-0036 S1). Records and lists
+ *                             only — it never rebinds; automatic rebind is S3-lite.
+ *   relay fleet               List every window binding the relay has recorded:
+ *                             which window holds which identity, on which
+ *                             conversation, and whether that window is still
+ *                             alive. Liveness is DERIVED from the anchor on every
+ *                             run (§2.2), never stored, so it cannot drift.
  *   relay mint-token NAME     Mint an agent token directly via filesystem access
  *                             (v2.6.0). For external CLI agents whose safety
  *                             monitors block register_agent → use-token in one
@@ -59,6 +67,8 @@ const SUBCOMMANDS = {
   backup: "../dist/cli/backup.js",
   restore: "../dist/cli/restore.js",
   recover: "../dist/cli/recover.js",
+  bind: "../dist/cli/bind.js",
+  fleet: "../dist/cli/fleet.js",
   "release-binding": "../dist/cli/release-binding.js",
   "mint-token": "../dist/cli/mint-token.js",
   "purge-history": "../dist/cli/purge-history.js",
@@ -103,6 +113,8 @@ function printHelp(requested) {
       "  backup           Snapshot the DB + config into a tar.gz archive.\n" +
       "  restore PATH     Restore from a tar.gz archive.\n" +
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +
+      "  bind             Record THIS window's identity binding from the hook payload on stdin (ADR-0036 S1).\n" +
+      "  fleet            List every recorded window binding, with liveness derived from the anchor.\n" +
       "  release-binding NAME  Clear a STALE binding (refuses on a live anchor) so the next launch re-binds; preserves identity.\n" +
       "  mint-token NAME  Mint an agent token via filesystem (external-CLI setup).\n" +
       "  purge-history NAME  Delete every message + task where the agent is sender or recipient.\n" +

@@ -63,6 +63,51 @@ if [[ "$0" != *"/bot-relay-mcp/hooks/"* ]]; then
   echo "[bot-relay hook WARNING] \$0 does not contain '/bot-relay-mcp/hooks/' — the install path may be truncated. Quote the command string in .claude/settings.json if the path contains spaces. \$0='$0'" >&2
 fi
 
+# --- ADR-0036 S1: capture the hook payload ONCE, with a BOUNDED read ----------
+# This hook has never read its stdin (every prior `session_id` use is SQL against
+# the agents table). `relay bind` needs the payload, so we capture it here — as
+# early as possible, so nothing downstream can consume it first — and hand the
+# text to the bind block further down.
+#
+# WHY NOT `cat`: SessionStart runs under a 10s hook timeout. A bare `cat` blocks
+# until the writer closes; a hook that hangs costs the ENTIRE session start, which
+# is a far worse failure than the silence the announce fixes. So:
+#   - a TTY (manual run, no redirect) is "no payload", instantly;
+#   - otherwise read with a SHORT idle deadline and take whatever arrived.
+# `head -c` bounds the size so a hostile or runaway writer cannot balloon memory.
+# Absent payload is NOT an error here (see the bind block): it is what a manual
+# run or a non-SessionStart caller looks like.
+# MEASURED, and this cost a red canary: a size bound is NOT a time bound.
+# `head -c N` returns when it has N bytes OR when the writer closes — against a
+# pipe nobody ever writes to it blocks forever. Node's `spawn(cmd, {})` with no
+# stdio option hands the child exactly that pipe, which is how CANARY 6
+# (regression-plug-and-play) spawns this hook. So the read must be bounded by
+# TIME, not bytes. macOS has no `timeout`/`gtimeout` (verified: bash 3.2,
+# /usr/bin/perl present), and perl's alarm interrupts a blocking slurp — measured
+# at 2s against a FIFO with a live writer that never closes.
+RELAY_HOOK_PAYLOAD=""
+if [ ! -t 0 ]; then
+  if command -v perl >/dev/null 2>&1; then
+    RELAY_HOOK_PAYLOAD=$(perl -e '
+      eval {
+        local $SIG{ALRM} = sub { die "relay-stdin-timeout\n" };
+        alarm 2;
+        my $d = do { local $/; <STDIN> };
+        alarm 0;
+        print substr($d, 0, 1048576) if defined $d;
+      };
+    ' 2>/dev/null || printf '')
+  elif command -v timeout >/dev/null 2>&1; then
+    RELAY_HOOK_PAYLOAD=$(timeout 2 head -c 1048576 2>/dev/null || printf '')
+  elif command -v gtimeout >/dev/null 2>&1; then
+    RELAY_HOOK_PAYLOAD=$(gtimeout 2 head -c 1048576 2>/dev/null || printf '')
+  fi
+  # NO unbounded fallback. With no way to bound the read, SKIP the payload: the
+  # cost of no bind is one unrecorded window, and the cost of a hang is the whole
+  # session start. A partial read that timed out is treated as absent too — a
+  # truncated payload is not valid JSON and would only produce a confusing refusal.
+fi
+
 AGENT_NAME="${RELAY_AGENT_NAME:-default}"
 AGENT_ROLE="${RELAY_AGENT_ROLE:-user}"
 AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
@@ -818,6 +863,80 @@ if [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2
     relay_verdict_set "REGISTER_FAILED" "register_agent returned an error (for example the name is held by another live agent)" " agent=\"$AGENT_NAME\""
   fi
 fi
+
+# --- ADR-0036 S1: RECORD this window's binding, and SAY SO ---------------------
+# A window that becomes X without saying so is the same silence-as-health failure
+# the rest of this hook exists to end. So the bind ANNOUNCES on stdout, where both
+# a human and the next agent read it.
+#
+# PLACED HERE deliberately: after register has run and after the verdict above
+# has settled what the daemon actually did, but BEFORE mail delivery — so the
+# context reads "who am I" before "what is waiting for me".
+#
+# DB-DIRECT, NEVER THROUGH THE DAEMON (ADR-0036 §2.2): a daemon slow to start
+# after a reboot must not be able to cause a missed bind. Nothing below contacts
+# the daemon, and the bind is expected to succeed with the daemon down.
+#
+# THREE OUTCOMES, deliberately NOT treated alike:
+#   absent payload      → silent. A manual run or a non-SessionStart caller is
+#                         not a failure, and warning on it would train the
+#                         operator to ignore this line.
+#   refused (malformed, → LOUD on stderr, verdict UNTOUCHED. This session is
+#   no session_id, bad    otherwise fine; degrading it would mask a real
+#   anchor)               problem behind a payload quirk.
+#   schema not migrated → SYSTEMIC (RULING 1): mid-rollout, NO window anywhere is
+#                         being recorded, so it goes into the VERDICT. Only
+#                         replaces HEALTHY/DEGRADED-for-a-softer-reason; it never
+#                         masks a louder verdict such as MUTE or UNWAKEABLE.
+# STREAM DISCIPLINE: the announcement is stdout (it is context); every refusal is
+# stderr. The one-VERDICT-line contract on stdout is unchanged.
+if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
+  RELAY_BIND_BIN="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+  RELAY_BIND_OUT=""
+  RELAY_BIND_ERR=""
+  RELAY_BIND_RC=1
+  RELAY_BIND_ERRFILE="$(mktemp 2>/dev/null || printf '')"
+  if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1; then
+    if [ -n "$RELAY_BIND_ERRFILE" ]; then
+      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | node "$RELAY_BIND_BIN" bind 2>"$RELAY_BIND_ERRFILE")
+      RELAY_BIND_RC=$?
+      RELAY_BIND_ERR=$(cat "$RELAY_BIND_ERRFILE" 2>/dev/null || printf '')
+      rm -f "$RELAY_BIND_ERRFILE" 2>/dev/null
+    else
+      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | node "$RELAY_BIND_BIN" bind 2>/dev/null)
+      RELAY_BIND_RC=$?
+    fi
+  else
+    RELAY_BIND_RC=127
+    RELAY_BIND_ERR="BIND_FAILED: no runnable relay CLI beside this hook (looked for $RELAY_BIND_BIN)"
+  fi
+
+  if [ "$RELAY_BIND_RC" -eq 0 ]; then
+    # One line, already shaped as "[RELAY] bound <who> to conversation <id> (...)".
+    # Collapse any stray CR/LF so a crafted conversation title can never inject an
+    # extra stdout line into the verdict-only contract (same guard the wake-coverage
+    # line applies at this boundary).
+    RELAY_BIND_LINE=$(printf '%s' "$RELAY_BIND_OUT" | tr '\r\n' '  ')
+    case "$RELAY_BIND_LINE" in
+      "[RELAY]"*) printf '%s\n' "$RELAY_BIND_LINE" ;;
+    esac
+  else
+    # Loud, never silent — the operator sees WHY this window was not recorded.
+    [ -n "$RELAY_BIND_ERR" ] && printf '%s\n' "$RELAY_BIND_ERR" >&2
+    case "$RELAY_BIND_ERR" in
+      *"schema not migrated"*)
+        if command -v relay_verdict_set >/dev/null 2>&1; then
+          case "$RELAY_VERDICT" in
+            HEALTHY|DEGRADED)
+              relay_verdict_set "DEGRADED" "bind failed: agent_bindings missing (schema not migrated) — this window is NOT recorded" " agent=\"$AGENT_NAME\""
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  fi
+fi
+# --- end ADR-0036 S1 bind ------------------------------------------------------
 
 # --- Deliver pending messages (parameter-bound) ---
 # #53 — the CANONICAL per-session pending predicate (SSOT: src/db.ts
