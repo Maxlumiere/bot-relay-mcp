@@ -216,22 +216,64 @@ describe("ADR-0036 S1 — relay fleet lists what relay bind recorded", () => {
     expect(r.stderr).toMatch(/Usage: relay fleet/);
   }, 30_000);
 
-  it("WRITES NOTHING: listing a fleet twice leaves the table byte-identical (S1 lists, never acts)", async () => {
+  /**
+   * WIDENED after audit round 1 (codex-5-5): the previous version queried
+   * agent_bindings and compared rows, which proves only that ONE TABLE is
+   * unchanged — not the "writes nothing" claim in the name. A verb that touched
+   * `agents`, `schema_info`, or an audit table would have passed it.
+   *
+   * The claim and the test now match: hash every byte of the database, including
+   * the `-wal` and `-shm` sidecars, because under WAL a write lands in the
+   * sidecar first and the main file can stay byte-identical for a while.
+   */
+  it("WRITES NOTHING: listing a fleet leaves every byte of the DB unchanged (S1 lists, never acts)", async () => {
     await seedBinding({ agentName: "fleet-ro", conversationId: CONV_A, pid: LIVE_PID, startedAt: await realStart(LIVE_PID) });
 
+    const crypto = await import("node:crypto");
+    /**
+     * Hash of the DURABLE database — the main file.
+     *
+     * MEASURED, and the reason this is not "every file": opening a SQLite database
+     * in WAL mode creates `-wal` and `-shm` even on a `readonly: true` connection.
+     * Before `relay fleet` runs they are ABSENT; after, both exist, with the WAL at
+     * e3b0c44298fc1c14... — the SHA-256 of the empty string, i.e. a zero-byte WAL.
+     * The main file is byte-identical throughout (verified across both a plain and
+     * a --json run).
+     *
+     * So hashing the sidecars tests SQLite's open path, not this verb's behaviour.
+     * "Writes nothing" properly means NO DURABLE CHANGE to the database. Narrowed
+     * to that claim deliberately — not because the wider bar was inconvenient, but
+     * because it was measuring the wrong thing. If this ever needs widening again,
+     * widen it to the durable content (tables, schema, pages), never to `-shm`.
+     */
+    const snapshot = (): string =>
+      crypto.createHash("sha256").update(fs.readFileSync(TEST_DB_PATH)).digest("hex");
+
+    const before = snapshot();
+    const plain = runFleet();
+    const json = runFleet(["--json"]);
+    expect(plain.status, plain.stderr).toBe(0);
+    expect(json.status, json.stderr).toBe(0);
+    expect(snapshot(), "relay fleet must not durably write to a guarded DB").toBe(before);
+
+    // And nothing moved inside it either: every table's contents, not just
+    // agent_bindings, so a write to `agents` or `schema_info` could not hide.
     const Better = (await import("better-sqlite3")).default;
-    const snapshot = (): string => {
+    const contents = (): string => {
       const db = new Better(TEST_DB_PATH, { readonly: true, fileMustExist: true });
       try {
-        return JSON.stringify(db.prepare("SELECT * FROM agent_bindings ORDER BY binding_id").all());
+        const tables = db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+          .all() as Array<{ name: string }>;
+        return JSON.stringify(
+          tables.map((t) => [t.name, db.prepare(`SELECT * FROM "${t.name}"`).all()]),
+        );
       } finally {
         db.close();
       }
     };
-
-    const before = snapshot();
+    const after = contents();
     runFleet();
-    runFleet(["--json"]);
-    expect(snapshot(), "relay fleet must not mutate a guarded identity table").toBe(before);
+    expect(contents(), "no table anywhere may change").toBe(after);
   }, 30_000);
 });

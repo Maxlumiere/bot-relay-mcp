@@ -276,6 +276,25 @@ describe("ADR-0036 S1 — the SessionStart hook records the binding and announce
 
   it("agent_bindings ABSENT (mid-rollout v24 DB) is SYSTEMIC → written into the verdict (RULING 1)", async () => {
     const port = await getFreePort();
+
+    // PRECONDITION, added after audit round 1 (codex-5-5): bind resolves the
+    // ANCHOR before it probes the schema, so in an environment where the anchor
+    // cannot be resolved — no own-host machine id, or an unreadable start time —
+    // this test would refuse EARLIER and still see a non-zero exit plus a
+    // BIND_FAILED. It would pass for a reason that has nothing to do with the
+    // schema branch it claims to cover: another vacuous bar.
+    //
+    // So assert the anchor really resolves here. If it cannot, this FAILS loudly
+    // and names why, rather than quietly certifying a branch it never reached.
+    const { resolveWindowAnchor } = await import("../src/binding.js");
+    const { getOwnHostId } = await import("../src/liveness.js");
+    const anchorOk = resolveWindowAnchor({ claudePid: ANCHOR_PID, detected: DETECTED });
+    expect(
+      anchorOk.ok,
+      `this fixture cannot reach the schema branch: the window anchor did not resolve (${anchorOk.ok ? "" : anchorOk.reason})`,
+    ).toBe(true);
+    expect(getOwnHostId(), "this fixture needs a resolvable own-host id to reach the schema branch").toBeTruthy();
+
     await downgradeToV24();
 
     const r = runHook({ port, input: sessionStart("startup") });
