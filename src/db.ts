@@ -3109,33 +3109,61 @@ function isBindContentionError(err: unknown): boolean {
  * reports BIND_FAILED loudly, naming the elapsed time, rather than hanging.
  */
 /**
- * THE BIND RETRY BUDGET IS A DEADLINE, NOT AN ATTEMPT COUNT.
+ * THE BIND RETRY BUDGET — what it actually guarantees, stated exactly.
  *
- * The previous version bounded attempts (6) and its own sleeps (~115ms) and
- * claimed that as the worst case. It was wrong by ~250x: `relay bind` opened its
- * handle with `busy_timeout = 5000`, so EACH failed attempt could sit inside
- * SQLite's own busy wait for a further 5s before the JavaScript catch block ever
- * ran — a real ceiling near 25-30s against a MEASURED 10s SessionStart hook
- * timeout (`~/.claude/settings.json`). Two clocks, one budget, and only one of
- * them was being counted.
+ * This is **best-effort budgeting with a bounded per-statement envelope**, NOT a
+ * strict whole-operation deadline. Saying otherwise would be a claim the
+ * mechanism does not give (audit, codex-5-5):
+ *   - the deadline is checked BETWEEN attempts, not inside one;
+ *   - `busy_timeout` is set once per ATTEMPT, not per statement;
+ *   - so a synchronous statement can consume its own bounded wait AFTER the last
+ *     deadline check, and one attempt may contain several such statements.
  *
- * So: ONE deadline, computed once at entry, and EVERY wait is drawn from it —
- * SQLite's internal wait included, by setting `busy_timeout` per attempt from the
- * REMAINING budget rather than a fixed value.
+ * WORST CASE, computed rather than estimated:
+ *     total <= BIND_BUDGET_MS + (MAX_LOCKING_STATEMENTS * BIND_BUSY_CAP_MS)
+ *            = 3000 + (3 * 400) = 4200ms
+ * MAX_LOCKING_STATEMENTS = 3 is read off the longest write path, the supersede
+ * branch: UPDATE (supersede) + INSERT (new row) + COMMIT. `getCurrentBinding`'s
+ * SELECT does not block under WAL. The created and refreshed branches run two.
+ * In practice the figure is lower, because the per-attempt cap is drawn from what
+ * REMAINS (`min(remaining - floor, cap)`) and so shrinks as the deadline nears.
+ * 4200ms sits inside the MEASURED 10s SessionStart hook timeout
+ * (`~/.claude/settings.json`), leaving room for the health curl, the register
+ * curl, the sqlite reads and the wake-coverage subprocess check-relay.sh spends.
  *
- * 3000ms of the 10s ceiling: `check-relay.sh` also spends a bounded health curl,
- * a register curl, several sqlite reads and a node subprocess for wake-coverage,
- * so roughly a third of the budget for the bind leaves the rest intact.
+ * WHY A DEADLINE AT ALL, since the previous version's feared ceiling proved
+ * unreachable: the old code bounded its ATTEMPTS (6) and its OWN sleeps (~115ms)
+ * and documented that as the worst case, while `busy_timeout = 5000` ran a second
+ * uncounted clock inside the driver. Bounding the operation rather than one's own
+ * contribution to it is the correction, and it holds regardless of which path
+ * turns out to be reachable.
  *
  * NOTE for the wasm driver: `busy_timeout` is a documented no-op there
  * (sqlite-compat.ts:177-178 — single process, no locking), so the pragma may do
- * nothing. The deadline check is therefore the authority, never the pragma.
+ * nothing at all. The deadline check is the authority, never the pragma.
+ *
+ * WHY NOT A STRICT WHOLE-OPERATION DEADLINE (ruled, so it is not revisited as an
+ * oversight): threading the deadline through the writer and firing a pragma before
+ * every statement buys a bound that is STILL approximate — a statement starting
+ * with 50ms left can overrun — costs a pragma on every write, and is a complete
+ * no-op on the wasm driver, where it would add machinery, keep the approximation,
+ * and lend a false impression of rigour.
+ * AN HONEST BOUND WITH STATED SLACK BEATS A STRICTER-SOUNDING ONE THAT IS STILL
+ * APPROXIMATE.
  */
 export const BIND_BUDGET_MS = 3000;
 /** Below this much remaining, do not start another attempt — it cannot finish. */
 const BIND_MIN_ATTEMPT_MS = 120;
-/** No single attempt may swallow the whole envelope waiting on a lock. */
-const BIND_BUSY_CAP_MS = 750;
+/**
+ * Per-attempt cap on SQLite's own wait. Lowered 750 -> 400 to shrink the
+ * worst-case slack BY CONSTRUCTION rather than by analysis: the overshoot is
+ * MAX_LOCKING_STATEMENTS * this value, so 400 caps it at 1200ms.
+ */
+const BIND_BUSY_CAP_MS = 400;
+/** Longest write path: supersede UPDATE + INSERT + COMMIT. See the note above. */
+export const BIND_MAX_LOCKING_STATEMENTS = 3;
+/** The honest, publishable ceiling for one `upsertAgentBinding` call. */
+export const BIND_WORST_CASE_MS = BIND_BUDGET_MS + BIND_MAX_LOCKING_STATEMENTS * BIND_BUSY_CAP_MS;
 
 /**
  * Backoff between attempts, CAPPED BY WHAT IS LEFT. Without any backoff, eight

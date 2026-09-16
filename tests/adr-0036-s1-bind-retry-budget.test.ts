@@ -108,16 +108,28 @@ async function seedSchema(): Promise<void> {
 }
 
 /**
- * The budget, as a LOCAL LITERAL rather than an import from db.ts.
+ * The bound, as LOCAL LITERALS rather than imports from db.ts.
  *
  * Deliberate: the red-first check for this file stashes src/db.ts, and an
- * imported `BIND_BUDGET_MS` then arrives `undefined`, turning `budget + 2000`
- * into NaN and `toBeLessThan(NaN)` into a assertion that fails for EVERY input —
- * including a correct one. The test would "go red" while proving nothing. A bar
- * must fail for the reason its name claims, so the number lives here.
- * Keep in step with BIND_BUDGET_MS in src/db.ts.
+ * imported constant then arrives `undefined`, turning `budget + slack` into NaN
+ * and `toBeLessThan(NaN)` into an assertion that fails for EVERY input — including
+ * a correct one. The test would "go red" while proving nothing. A bar must fail
+ * for the reason its name claims, so the numbers live here.
+ * Keep in step with src/db.ts.
+ *
+ * WHAT IS BEING ASSERTED, precisely: not a strict whole-operation deadline. The
+ * deadline is checked BETWEEN attempts and `busy_timeout` is set per ATTEMPT, so
+ * a statement can consume its own bounded wait after the last check and one
+ * attempt may hold several. The honest ceiling is therefore
+ *   BUDGET + (MAX_LOCKING_STATEMENTS * BUSY_CAP) = 3000 + 3*400 = 4200ms
+ * where 3 is the longest write path (supersede UPDATE + INSERT + COMMIT; the
+ * SELECT does not block under WAL). Asserting 4200 pins the real guarantee;
+ * the previous `budget + 2000` merely ADMITTED the slack without naming it.
  */
 const EXPECTED_BUDGET_MS = 3000;
+const EXPECTED_BUSY_CAP_MS = 400;
+const EXPECTED_MAX_LOCKING_STATEMENTS = 3;
+const EXPECTED_WORST_CASE_MS = EXPECTED_BUDGET_MS + EXPECTED_MAX_LOCKING_STATEMENTS * EXPECTED_BUSY_CAP_MS;
 
 /**
  * Opens the contended handle the way `relay bind` SHIPPED WHEN THE DEFECT
@@ -194,13 +206,24 @@ describe("ADR-0036 S1 — a contended bind fails inside its budget, not the hook
 
     expect(threw, "a bind against a held write lock must FAIL, not hang or silently succeed").toBeTruthy();
 
-    // THE BOUND ITSELF. Generous headroom for scheduling, but far below both the
-    // ~25-30s pre-fix ceiling and the 10s hook timeout. This is the assertion the
-    // concurrency suite could not make, because it only checked the outcome.
+    // THE BOUND ITSELF — and an honest note about what this line proves.
+    //
+    // NOT RED-FIRST EVIDENCE. This fixture drives the read-then-write path, which
+    // fails with an immediate SQLITE_BUSY (snapshot conflict, no busy wait), so
+    // the PRE-FIX writer also finishes well inside this bound: only the message
+    // assertion below goes red on old code. Anyone reading this test must not
+    // infer that it ever demonstrated a long stall — it did not, and the feared
+    // ~25-30s in-loop ceiling was shown to be unreachable through this writer.
+    //
+    // What it DOES pin: the published ceiling, so a future change that widens the
+    // envelope (a bigger cap, another locking statement in the write path, a
+    // deadline check removed) fails here.
     expect(
       elapsed,
-      `took ${elapsed}ms — the budget is ${EXPECTED_BUDGET_MS}ms and the hook's ceiling is 10000ms`,
-    ).toBeLessThan(EXPECTED_BUDGET_MS + 2000);
+      `took ${elapsed}ms — published ceiling is ${EXPECTED_WORST_CASE_MS}ms ` +
+        `(budget ${EXPECTED_BUDGET_MS} + ${EXPECTED_MAX_LOCKING_STATEMENTS}x${EXPECTED_BUSY_CAP_MS} cap), ` +
+        `hook timeout is 10000ms`,
+    ).toBeLessThan(EXPECTED_WORST_CASE_MS);
 
     // And it must say WHY, with the figure, so an operator is not left guessing.
     const msg = threw instanceof Error ? threw.message : String(threw);
