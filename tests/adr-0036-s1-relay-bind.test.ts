@@ -327,6 +327,20 @@ describe("ADR-0036 S1 — relay bind REFUSES loudly and writes NOTHING", () => {
   });
 
   it("agent_bindings absent (v24-shaped DB) → BIND_FAILED naming the schema, never a silent skip (RULING 1)", async () => {
+    // PRECONDITION (audit round 1, codex-5-5): bind resolves the ANCHOR before it
+    // probes the schema. Where the anchor cannot resolve — no own-host machine id,
+    // or an unreadable start time — this test would refuse EARLIER, still see a
+    // non-zero exit and a BIND_FAILED, and pass without ever reaching the schema
+    // branch it is named for. Assert the precondition so it fails loudly instead.
+    const { resolveWindowAnchor } = await import("../src/binding.js");
+    const { getOwnHostId } = await import("../src/liveness.js");
+    const anchorOk = resolveWindowAnchor({ claudePid: ANCHOR_PID, detected: DETECTED });
+    expect(
+      anchorOk.ok,
+      `cannot reach the schema branch: the anchor did not resolve (${anchorOk.ok ? "" : anchorOk.reason})`,
+    ).toBe(true);
+    expect(getOwnHostId(), "this fixture needs a resolvable own-host id to reach the schema branch").toBeTruthy();
+
     const Better = (await import("better-sqlite3")).default;
     const db = new Better(TEST_DB_PATH);
     db.exec("DROP TABLE IF EXISTS agent_bindings");

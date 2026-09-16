@@ -1890,6 +1890,30 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
     )
   `);
   db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_anchor ON agent_bindings(host_id, window_pid, window_pid_start)");
+  // ONE CURRENT ROW PER WINDOW ANCHOR, ENFORCED BY THE DATABASE (audit round 1,
+  // codex-5-5). upsertAgentBinding used to READ getCurrentBinding() outside the
+  // transaction and then decide insert-vs-supersede, so two concurrent binds could
+  // each observe "no current row" and each INSERT. SQLite serialises individual
+  // writes, NOT a read-then-write decision spread across autocommit statements —
+  // and the plain index above cannot refuse the second row. The result was the
+  // exact harm S1 exists to remove: one window with two unsuperseded identities,
+  // and `relay fleet` offering both as equally plausible.
+  //
+  // The invariant is enforced HERE, where two processes cannot both be wrong,
+  // rather than by care in the writer: a mutex or a re-read before insert is only
+  // a narrower window, not a guarantee.
+  //
+  // PARTIAL, on `superseded_at IS NULL`: superseded rows are history and a window
+  // legitimately accumulates many of them over its life. Only the CURRENT row is
+  // unique per anchor.
+  //
+  // Safe to add to v25 rather than a new v26 because v25 has never shipped — no
+  // released build creates agent_bindings at all, so no deployed database can hold
+  // the duplicate rows that would make this index fail to build on open.
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_bindings_current_anchor " +
+      "ON agent_bindings(host_id, window_pid, window_pid_start) WHERE superseded_at IS NULL",
+  );
   db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_agent_name ON agent_bindings(agent_name)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_conversation ON agent_bindings(conversation_id)");
 }
@@ -3023,7 +3047,87 @@ export function getCurrentBinding(db: CompatDatabase, anchor: BindingAnchor): Bi
  * The supersede and the insert commit in ONE transaction: a window must never be
  * observable with two current rows, nor with none.
  */
+/**
+ * Is this the loser of a concurrent bind, rather than a real failure?
+ *
+ * TWO shapes, both meaning "someone else won; re-read and decide again":
+ *   SQLITE_CONSTRAINT — the partial unique index refused our INSERT because a
+ *     concurrent process already created the current row for this anchor.
+ *   SQLITE_BUSY / BUSY_SNAPSHOT — CompatDatabase.transaction issues a DEFERRED
+ *     BEGIN (sqlite-compat.ts:198-204; the interface exposes no .immediate()),
+ *     so a read lock upgrading to a write lock can lose under WAL.
+ * Matched on the driver's code AND message because the wasm driver surfaces
+ * these as plain Errors without a `code` property.
+ */
+function isBindContentionError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  const text = `${typeof code === "string" ? code : ""} ${err instanceof Error ? err.message : String(err)}`;
+  return /SQLITE_CONSTRAINT|SQLITE_BUSY|UNIQUE constraint failed|database is locked/i.test(text);
+}
+
+/**
+ * CONCURRENCY (audit round 1, codex-5-5 — this was a real defect).
+ *
+ * The read that DECIDES insert-vs-refresh-vs-supersede must be inside the same
+ * transaction as the write it authorises. It previously sat outside, so two
+ * concurrent binds could each read "no current row" and each INSERT: SQLite
+ * serialises individual writes, not a read-then-write decision spread across
+ * autocommit statements.
+ *
+ * The transaction is NOT the guarantee — the partial unique index on
+ * (host_id, window_pid, window_pid_start) WHERE superseded_at IS NULL is. With a
+ * DEFERRED begin two processes can still both read an empty anchor; the index is
+ * what refuses the second INSERT, and this retry is what turns that refusal into
+ * the correct outcome (the loser re-reads and refreshes or supersedes) instead of
+ * a raw SQLITE_CONSTRAINT surfacing to a SessionStart hook.
+ *
+ * BOUNDED, because a hook must never spin: after MAX_BIND_ATTEMPTS the error is
+ * rethrown and `relay bind` reports BIND_FAILED loudly rather than hanging.
+ */
+const MAX_BIND_ATTEMPTS = 6;
+
+/**
+ * Busy-wait backoff. MEASURED: without it, eight processes released from a shared
+ * barrier burned all attempts in microseconds and five reported "database is
+ * locked" — the invariant held (one current row) but five windows would have gone
+ * UNRECORDED, which is the failure this slice exists to remove. Surviving the race
+ * is not the same as handling it.
+ *
+ * Deliberately SYNCHRONOUS: db.ts is a synchronous surface (better-sqlite3), and
+ * `relay bind` runs inside a 10s hook budget, so the total sleep is bounded well
+ * under it — attempts 1..5 wait ~2/6/14/30/62ms plus jitter, ~115ms worst case.
+ * Jitter is per-attempt so simultaneous losers do not re-collide in lockstep.
+ */
+function bindBackoffSleep(attempt: number): void {
+  const ms = Math.min(2 ** attempt, 64) + Math.floor(Math.random() * 8);
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    /* synchronous by design — see above */
+  }
+}
+
 export function upsertAgentBinding(
+  db: CompatDatabase,
+  w: BindingWrite,
+  opts: { supersedeReason?: string } = {},
+): BindingResult {
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= MAX_BIND_ATTEMPTS; attempt++) {
+    try {
+      return db.transaction(() => upsertAgentBindingOnce(db, w, opts))();
+    } catch (err) {
+      lastErr = err;
+      if (!isBindContentionError(err) || attempt === MAX_BIND_ATTEMPTS) throw err;
+      // Back off before retrying: the next read sees the winner's row, but only
+      // if we give the winner time to COMMIT rather than spinning into its lock.
+      bindBackoffSleep(attempt);
+    }
+  }
+  throw lastErr;
+}
+
+/** One attempt. MUST run inside a transaction — see upsertAgentBinding. */
+function upsertAgentBindingOnce(
   db: CompatDatabase,
   w: BindingWrite,
   opts: { supersedeReason?: string } = {},

@@ -122,6 +122,38 @@ describe("ADR-0036 S1 — the agent_bindings table", () => {
     expect(ix.some((i) => i.columns[0] === "conversation_id"), "index leading with conversation_id").toBe(true);
   });
 
+  /**
+   * ONE CURRENT ROW PER ANCHOR IS DATABASE-ENFORCED (audit round 1, codex-5-5).
+   *
+   * A plain index cannot refuse a second current row, and the writer's
+   * read-then-decide is not atomic across processes on its own. The invariant has
+   * to live where two concurrent processes cannot both be wrong, so it is a
+   * PARTIAL UNIQUE index — partial because superseded rows are history and a
+   * window legitimately accumulates many of them.
+   *
+   * Pinned here as well as in the concurrency test because this is the enforcement
+   * itself: if the index were dropped, the concurrency test would still pass most
+   * runs and fail rarely, which is the worst way to learn it is gone.
+   */
+  it("enforces ONE CURRENT binding per window anchor with a partial unique index", () => {
+    expect(tableExists("agent_bindings"), "agent_bindings table").toBe(true);
+    const anchor = ["host_id", "window_pid", "window_pid_start"];
+    const uniqueOnAnchor = indexesOf("agent_bindings").filter(
+      (i) => i.unique && JSON.stringify(i.columns) === JSON.stringify(anchor),
+    );
+    expect(uniqueOnAnchor.length, "a UNIQUE index over the window anchor").toBe(1);
+
+    const sql = (
+      getDb()
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get("idx_agent_bindings_current_anchor") as { sql?: string } | undefined
+    )?.sql;
+    expect(sql, "idx_agent_bindings_current_anchor must exist").toBeTruthy();
+    // PARTIAL, not total: a total unique index would forbid a window from ever
+    // rebinding, because its superseded history shares the same anchor.
+    expect(String(sql)).toMatch(/WHERE\s+superseded_at\s+IS\s+NULL/i);
+  });
+
   it("has NO unique-per-name constraint: two windows may record the same name in S1 (§8a D1)", () => {
     expect(tableExists("agent_bindings"), "agent_bindings table").toBe(true);
     const uniqueOnName = indexesOf("agent_bindings").filter(
