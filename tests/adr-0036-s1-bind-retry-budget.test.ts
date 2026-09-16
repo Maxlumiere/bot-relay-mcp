@@ -4,23 +4,35 @@
 // See LICENSE for full terms.
 
 /**
- * ADR-0036 S1 — the bind retry budget is a DEADLINE, not an attempt count.
+ * ADR-0036 S1 — the bind retry bound, asserted rather than assumed.
  *
- * FOUND BY AUDIT (codex-5-5, PR #276 round 2). The writer bounded its ATTEMPTS
- * (6) and its OWN sleeps (~115ms) and documented that as the worst case. But
- * `relay bind` opened its handle with `busy_timeout = 5000`, so each failed
- * attempt could sit inside SQLite's own busy wait for a further 5s before the
- * JavaScript catch block ran — a real ceiling near 25-30s against a MEASURED 10s
- * SessionStart hook timeout (~/.claude/settings.json). Two clocks, one budget,
- * and only one of them was counted.
+ * WHAT THIS FILE PINS: the published ceiling for one `upsertAgentBinding` call.
+ * That ceiling is BEST-EFFORT BUDGETING WITH A BOUNDED PER-STATEMENT ENVELOPE,
+ * not a strict whole-operation deadline — the deadline is checked BETWEEN
+ * attempts and `busy_timeout` is set per ATTEMPT, so a statement can consume its
+ * own bounded wait after the last check, and one attempt may hold several:
+ *     total <= BUDGET + (MAX_LOCKING_STATEMENTS * BUSY_CAP) = 3000 + 3*400 = 4200ms
+ * MAX_LOCKING_STATEMENTS = 3 is the longest write path (supersede UPDATE +
+ * INSERT + COMMIT); the SELECT does not block under WAL. Confirmed by audit.
  *
- * WHY THE EXISTING SUITE MISSED IT, which is the point of this file: the
- * 8-process concurrency test asserts the OUTCOME (exactly one current row) and
- * never looks at the CLOCK. It passed on the broken code and would pass again at
- * 30 seconds. A test that proves a bound must MEASURE THE BOUND.
+ * WHAT THIS FILE DOES NOT PROVE — stated because an earlier version of this
+ * header claimed otherwise and that claim was FALSE. There is no reachable
+ * ~25-30s in-loop stall, and nothing here was ever "seen failing first" against
+ * one. `busy_timeout` governs ACQUIRING a lock, not resolving a SNAPSHOT
+ * conflict, and `upsertAgentBindingOnce` reads unconditionally before every
+ * write — so a deferred transaction that has already read (even a read matching
+ * NOTHING) cannot upgrade and is refused immediately. Measured under WAL:
+ *     read-then-write -> SQLITE_BUSY in    0 ms
+ *     write-first     -> SQLITE_BUSY in 5371 ms
+ * The genuine 5s-per-call exposure was the OUT-OF-LOOP statements on the CLI
+ * handle, whose fixed `busy_timeout` was dropped 5000 -> 1000.
  *
- * SEEN FAILING FIRST: against the pre-fix writer, the held-lock case below takes
- * far longer than the budget (bounded only by 6 x 5s of SQLite busy waiting).
+ * SO: the elapsed bar below is NOT red-first evidence, and its own comment says
+ * so again at the assertion. Its job is to fail when a future change WIDENS the
+ * envelope — a bigger cap, another locking statement in the write path, a
+ * deadline check removed. The CLASSIFIER half is what is red-first proven: the
+ * pre-fix writer surfaces a raw "database is locked" where the fixed writer
+ * names a deadline.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
@@ -132,15 +144,16 @@ const EXPECTED_MAX_LOCKING_STATEMENTS = 3;
 const EXPECTED_WORST_CASE_MS = EXPECTED_BUDGET_MS + EXPECTED_MAX_LOCKING_STATEMENTS * EXPECTED_BUSY_CAP_MS;
 
 /**
- * Opens the contended handle the way `relay bind` SHIPPED WHEN THE DEFECT
- * EXISTED: busy_timeout = 5000.
+ * Opens the contended handle carrying `busy_timeout = 5000` — the value the CLI
+ * shipped before the correction — so the fixture hands the writer the LARGEST
+ * engine wait it could ever meet, rather than the repaired one.
  *
- * This is the whole point of the fixture. With a small busy_timeout SQLite
- * returns SQLITE_BUSY almost immediately, the old attempt-counted loop burned
- * its six tries in ~85ms, and the red run showed no delay at all — the harness
- * could not express the failure it was built to guard. The ~25-30s ceiling only
- * appears when each failed attempt can sit in SQLite's own 5s busy wait, so the
- * fixture must reproduce that value, not the repaired one.
+ * Note what this does NOT create: a long stall. Under WAL this writer reads
+ * before it writes, so the upgrade is refused as a snapshot conflict in ~0ms and
+ * `busy_timeout` is never consulted (see the header). The 5000 stays because it
+ * is the adversarial value: if the per-attempt override were ever removed, the
+ * handle's own large timeout would be free to apply and the elapsed bar below
+ * would catch it. A repaired value here would make that regression invisible.
  *
  * The fixed writer OVERRIDES this per attempt from its remaining deadline; that
  * override is exactly the behaviour under test.
