@@ -3114,6 +3114,13 @@ export function upsertAgentBinding(
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= MAX_BIND_ATTEMPTS; attempt++) {
     try {
+      // THE INDEX IS THE GUARANTEE — not this BEGIN. CompatDatabase exposes no
+      // .immediate(), so this transaction is DEFERRED and two processes CAN both
+      // read an empty anchor right here. What refuses the second current row is
+      // the partial unique index idx_agent_bindings_current_anchor; this
+      // transaction and the retry below only convert that refusal into the
+      // correct outcome (the loser re-reads and refreshes or supersedes).
+      // Do NOT drop the index believing this transaction covers the invariant.
       return db.transaction(() => upsertAgentBindingOnce(db, w, opts))();
     } catch (err) {
       lastErr = err;
