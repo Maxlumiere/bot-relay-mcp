@@ -193,11 +193,16 @@ export async function run(argv: string[]): Promise<number> {
   try {
     const Better = (await import("better-sqlite3")).default;
     db = new Better(dbPath, { fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
-    // MODEST, and deliberately not 5000 (audit round 2, codex-5-5). This value
-    // governs the statements OUTSIDE the writer's retry loop — the schema probe
-    // and `--end` — each of which is a single statement. A fixed 5s here was a
-    // second uncounted clock: six retries × 5s put the real ceiling near 25-30s
-    // against a MEASURED 10s SessionStart hook timeout.
+    // MODEST, and deliberately not 5000 (audit, codex-5-5). This value governs
+    // the statements OUTSIDE the writer's retry loop — the schema probe and
+    // `--end`. Those are precisely the ones that CAN sit in SQLite's own busy
+    // wait, because each runs in its own autocommit transaction and so reaches
+    // its write without a preceding read in the same transaction. A fixed 5s here
+    // was a second uncounted clock against a MEASURED 10s SessionStart timeout.
+    //
+    // NOT a "six retries x 5s" ceiling. That arithmetic was sound but MISLOCATED:
+    // upsertAgentBinding's in-loop attempts read first, so they fast-fail on a
+    // snapshot conflict rather than each burning a busy wait.
     //
     // upsertAgentBinding OVERRIDES this per attempt from its remaining deadline
     // budget, so this is only the floor for everything else on this handle.
