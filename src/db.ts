@@ -3060,9 +3060,32 @@ export function getCurrentBinding(db: CompatDatabase, anchor: BindingAnchor): Bi
  * these as plain Errors without a `code` property.
  */
 function isBindContentionError(err: unknown): boolean {
-  const code = (err as { code?: unknown })?.code;
-  const text = `${typeof code === "string" ? code : ""} ${err instanceof Error ? err.message : String(err)}`;
-  return /SQLITE_CONSTRAINT|SQLITE_BUSY|UNIQUE constraint failed|database is locked/i.test(text);
+  const code = String((err as { code?: unknown })?.code ?? "");
+  const msg = err instanceof Error ? err.message : String(err);
+
+  // Lock contention: always a retry candidate.
+  if (/SQLITE_BUSY/i.test(code) || /database (?:table )?is locked/i.test(msg)) return true;
+
+  // A UNIQUE violation is contention ONLY when it is OUR anchor index. Matching
+  // every SQLITE_CONSTRAINT (audit round 2, codex-5-5) meant an unrelated
+  // violation — a NOT NULL, a different unique index — was retried to exhaustion
+  // and then reported as contention, burning the budget and misnaming the cause.
+  //
+  // MEASURED, because SQLite names COLUMNS and not the index, so matching
+  // "idx_agent_bindings_current_anchor" would never fire:
+  //   code:    SQLITE_CONSTRAINT_UNIQUE
+  //   message: UNIQUE constraint failed: agent_bindings.host_id,
+  //            agent_bindings.window_pid, agent_bindings.window_pid_start
+  // `\bwindow_pid\b` does not match `window_pid_start` (`_` is a word char), so
+  // all three columns must genuinely be named.
+  if (/SQLITE_CONSTRAINT/i.test(code) || /UNIQUE constraint failed/i.test(msg)) {
+    return (
+      /agent_bindings\.host_id/i.test(msg) &&
+      /agent_bindings\.window_pid\b/i.test(msg) &&
+      /agent_bindings\.window_pid_start/i.test(msg)
+    );
+  }
+  return false;
 }
 
 /**
@@ -3081,25 +3104,53 @@ function isBindContentionError(err: unknown): boolean {
  * the correct outcome (the loser re-reads and refreshes or supersedes) instead of
  * a raw SQLITE_CONSTRAINT surfacing to a SessionStart hook.
  *
- * BOUNDED, because a hook must never spin: after MAX_BIND_ATTEMPTS the error is
- * rethrown and `relay bind` reports BIND_FAILED loudly rather than hanging.
+ * BOUNDED BY THE DEADLINE, because a hook must never spin: once the remaining
+ * budget falls below one viable attempt the error is rethrown and `relay bind`
+ * reports BIND_FAILED loudly, naming the elapsed time, rather than hanging.
  */
-const MAX_BIND_ATTEMPTS = 6;
+/**
+ * THE BIND RETRY BUDGET IS A DEADLINE, NOT AN ATTEMPT COUNT.
+ *
+ * The previous version bounded attempts (6) and its own sleeps (~115ms) and
+ * claimed that as the worst case. It was wrong by ~250x: `relay bind` opened its
+ * handle with `busy_timeout = 5000`, so EACH failed attempt could sit inside
+ * SQLite's own busy wait for a further 5s before the JavaScript catch block ever
+ * ran — a real ceiling near 25-30s against a MEASURED 10s SessionStart hook
+ * timeout (`~/.claude/settings.json`). Two clocks, one budget, and only one of
+ * them was being counted.
+ *
+ * So: ONE deadline, computed once at entry, and EVERY wait is drawn from it —
+ * SQLite's internal wait included, by setting `busy_timeout` per attempt from the
+ * REMAINING budget rather than a fixed value.
+ *
+ * 3000ms of the 10s ceiling: `check-relay.sh` also spends a bounded health curl,
+ * a register curl, several sqlite reads and a node subprocess for wake-coverage,
+ * so roughly a third of the budget for the bind leaves the rest intact.
+ *
+ * NOTE for the wasm driver: `busy_timeout` is a documented no-op there
+ * (sqlite-compat.ts:177-178 — single process, no locking), so the pragma may do
+ * nothing. The deadline check is therefore the authority, never the pragma.
+ */
+export const BIND_BUDGET_MS = 3000;
+/** Below this much remaining, do not start another attempt — it cannot finish. */
+const BIND_MIN_ATTEMPT_MS = 120;
+/** No single attempt may swallow the whole envelope waiting on a lock. */
+const BIND_BUSY_CAP_MS = 750;
 
 /**
- * Busy-wait backoff. MEASURED: without it, eight processes released from a shared
- * barrier burned all attempts in microseconds and five reported "database is
- * locked" — the invariant held (one current row) but five windows would have gone
- * UNRECORDED, which is the failure this slice exists to remove. Surviving the race
- * is not the same as handling it.
+ * Backoff between attempts, CAPPED BY WHAT IS LEFT. Without any backoff, eight
+ * processes released from a shared barrier burned every attempt in microseconds
+ * and five reported "database is locked": the invariant held (one current row)
+ * while five windows went UNRECORDED. Surviving a race is not handling it.
  *
- * Deliberately SYNCHRONOUS: db.ts is a synchronous surface (better-sqlite3), and
- * `relay bind` runs inside a 10s hook budget, so the total sleep is bounded well
- * under it — attempts 1..5 wait ~2/6/14/30/62ms plus jitter, ~115ms worst case.
+ * Deliberately SYNCHRONOUS — db.ts is a synchronous surface (better-sqlite3).
  * Jitter is per-attempt so simultaneous losers do not re-collide in lockstep.
  */
-function bindBackoffSleep(attempt: number): void {
-  const ms = Math.min(2 ** attempt, 64) + Math.floor(Math.random() * 8);
+function bindBackoffSleep(attempt: number, remainingMs: number): void {
+  const want = Math.min(2 ** attempt, 64) + Math.floor(Math.random() * 8);
+  // Never sleep past the deadline, and always leave room for one real attempt.
+  const ms = Math.max(0, Math.min(want, remainingMs - BIND_MIN_ATTEMPT_MS));
+  if (ms <= 0) return;
   const until = Date.now() + ms;
   while (Date.now() < until) {
     /* synchronous by design — see above */
@@ -3109,10 +3160,36 @@ function bindBackoffSleep(attempt: number): void {
 export function upsertAgentBinding(
   db: CompatDatabase,
   w: BindingWrite,
-  opts: { supersedeReason?: string } = {},
+  opts: { supersedeReason?: string; budgetMs?: number } = {},
 ): BindingResult {
+  const started = Date.now();
+  const deadline = started + Math.max(BIND_MIN_ATTEMPT_MS, opts.budgetMs ?? BIND_BUDGET_MS);
+  let attempts = 0;
   let lastErr: unknown = null;
-  for (let attempt = 1; attempt <= MAX_BIND_ATTEMPTS; attempt++) {
+
+  const exhausted = (): Error =>
+    new Error(
+      `bind deadline exceeded after ${Date.now() - started}ms over ${attempts} attempt(s) ` +
+        `(budget ${opts.budgetMs ?? BIND_BUDGET_MS}ms): the window binding could not be recorded ` +
+        `while another process held the database` +
+        (lastErr instanceof Error ? ` — last error: ${lastErr.message}` : ""),
+    );
+
+  for (;;) {
+    const remaining = deadline - Date.now();
+    // Loud and FAST. A window that cannot record its identity inside the budget
+    // must say so, never hang a session start waiting to find out.
+    if (remaining < BIND_MIN_ATTEMPT_MS) throw exhausted();
+
+    // Draw SQLite's OWN wait from the SAME envelope as the sleeps. This is the
+    // whole fix: a fixed busy_timeout is a second, uncounted clock.
+    try {
+      db.pragma(`busy_timeout = ${Math.max(1, Math.min(remaining - BIND_MIN_ATTEMPT_MS, BIND_BUSY_CAP_MS))}`);
+    } catch {
+      /* wasm driver: busy_timeout is a no-op — the deadline check still governs */
+    }
+
+    attempts++;
     try {
       // THE INDEX IS THE GUARANTEE — not this BEGIN. CompatDatabase exposes no
       // .immediate(), so this transaction is DEFERRED and two processes CAN both
@@ -3121,16 +3198,32 @@ export function upsertAgentBinding(
       // transaction and the retry below only convert that refusal into the
       // correct outcome (the loser re-reads and refreshes or supersedes).
       // Do NOT drop the index believing this transaction covers the invariant.
+      //
+      // AND A SECOND FACT ABOUT THIS DEFERRED BEGIN, MEASURED, because the next
+      // reader will otherwise rediscover it the slow way: `busy_timeout` governs
+      // ACQUIRING a lock, not resolving a SNAPSHOT conflict. A deferred
+      // transaction that has ALREADY READ cannot upgrade to a write while another
+      // connection holds the write lock — SQLite returns BUSY immediately and
+      // never honours the timeout. Probed on this schema under WAL:
+      //   read-then-write -> SQLITE_BUSY in 0 ms
+      //   write-first     -> SQLITE_BUSY in 5371 ms
+      // upsertAgentBindingOnce reads first unconditionally, so these in-loop
+      // attempts fast-fail rather than each burning a busy wait. That is WHY the
+      // retry budget must be a deadline over the WHOLE operation and not a per-
+      // attempt estimate: the per-attempt cost is not a fixed quantity, it
+      // depends on whether the attempt has read before it writes.
+
       return db.transaction(() => upsertAgentBindingOnce(db, w, opts))();
     } catch (err) {
       lastErr = err;
-      if (!isBindContentionError(err) || attempt === MAX_BIND_ATTEMPTS) throw err;
-      // Back off before retrying: the next read sees the winner's row, but only
-      // if we give the winner time to COMMIT rather than spinning into its lock.
-      bindBackoffSleep(attempt);
+      // Anything that is not OUR anchor contention is a real failure: throw on
+      // the FIRST occurrence rather than retrying it to exhaustion.
+      if (!isBindContentionError(err)) throw err;
+      const left = deadline - Date.now();
+      if (left < BIND_MIN_ATTEMPT_MS) throw exhausted();
+      bindBackoffSleep(attempts, left);
     }
   }
-  throw lastErr;
 }
 
 /** One attempt. MUST run inside a transaction — see upsertAgentBinding. */

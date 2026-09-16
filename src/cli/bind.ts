@@ -193,7 +193,15 @@ export async function run(argv: string[]): Promise<number> {
   try {
     const Better = (await import("better-sqlite3")).default;
     db = new Better(dbPath, { fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
-    db.pragma("busy_timeout = 5000");
+    // MODEST, and deliberately not 5000 (audit round 2, codex-5-5). This value
+    // governs the statements OUTSIDE the writer's retry loop — the schema probe
+    // and `--end` — each of which is a single statement. A fixed 5s here was a
+    // second uncounted clock: six retries × 5s put the real ceiling near 25-30s
+    // against a MEASURED 10s SessionStart hook timeout.
+    //
+    // upsertAgentBinding OVERRIDES this per attempt from its remaining deadline
+    // budget, so this is only the floor for everything else on this handle.
+    db.pragma("busy_timeout = 1000");
   } catch (err) {
     return bindFailed(`could not open ${dbPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
