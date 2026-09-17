@@ -4,13 +4,18 @@
 // See LICENSE for full terms.
 
 /**
- * ADR-0036 S1 — pure resolvers for `relay bind`.
+ * ADR-0036 — pure resolvers for window-bound identity.
  *
- * Kept OUT of the CLI on purpose. Two of the decisions below cannot be reached
+ * S1 (`relay bind`): resolve the window anchor, the cwd, the bind reason and the
+ * agent name. S3-lite (continuity rebind, rows 1 and 4): decide whether a window
+ * presenting a known conversation may take that conversation's identity.
+ *
+ * Kept OUT of the CLI on purpose. Several decisions here cannot be reached
  * through a spawned verb, so putting them in the IO layer would make them
  * untestable: a test process has no `claude` ancestor (detectAgentProcess()
- * returns null there), and the "detected anchor disagrees with CLAUDE_PID"
- * refusal never fires when detection finds nothing. As pure functions every
+ * returns null there), the "detected anchor disagrees with CLAUDE_PID" refusal
+ * never fires when detection finds nothing, and a continuity claim needs a
+ * liveness verdict that cannot be produced on demand. As pure functions every
  * branch is exercised directly — including the refusals, which victra required
  * be pinned as hard as the happy path.
  *
@@ -20,6 +25,7 @@
  * it an anchor rather than a number the OS will hand to someone else.
  */
 import { processStartedAt, type AgentProcess } from "./liveness.js";
+import type { AnchorVerdict } from "./liveness.js";
 
 /** A window anchor: the pid AND the start time that makes it reusable-proof. */
 export interface WindowAnchor {
@@ -121,6 +127,125 @@ export function boundViaForSource(source: string | null | undefined, isNamed: bo
   if (source === "clear") return "clear-carry";
   if (source === "fork") return "fork";
   return isNamed ? "launch-intent" : "transient";
+}
+
+/**
+ * ADR-0036 S3-lite (rows 1 and 4) — may this window take the conversation's
+ * identity?
+ *
+ * ROW 1, verbatim: "Hook fires (resume, C). C is bound to X; X's anchor is dead.
+ * Rebind X to this window under CAS on binding_version." ROW 4: "Same as row 1."
+ *
+ * §3 tier 1 (CONTINUITY) is the only automatic claim this resolver grants: the
+ * relay's OWN record says conversation C held name X, and a window now presents
+ * C. That is the strongest claim available on one machine, because the relay
+ * wrote it — unlike a title, a rename, or an agent asking, all of which §3 tier 3
+ * refuses outright.
+ *
+ * THE BRANCH TABLE, exhaustive:
+ *   prior anchor DEAD            → claim X, CAS pinned to the version we READ
+ *   prior anchor ALIVE           → REFUSE (another window holds X right now)
+ *   prior anchor UNVERIFIABLE    → REFUSE (see below — this is the load-bearing one)
+ *   prior binding has NO name    → REFUSE (an unnamed window is not an identity)
+ *   prior anchor IS this window  → REFRESH, never a takeover against yourself
+ *
+ * WHY `unverifiable` REFUSES, and why it is a separate branch rather than a
+ * footnote: `anchorLivenessVerdict` COLLAPSES "observed alive (start time
+ * matched)" with "present but unverifiable (no or unreadable start anchor, so
+ * PID reuse cannot be excluded)" into a single `alive`. So `alive` means NOT
+ * OBSERVED DEAD. Gating the claim on `dead` therefore refuses the live case AND
+ * the unverifiable one, which is the conservative direction: failing toward NOT
+ * acting is the entire safety argument for an automatic takeover. Treating
+ * `unverifiable` as "probably gone" is the one mistake that silently cuts a live
+ * agent's token.
+ *
+ * IT DECIDES, IT DOES NOT ACT. The release-then-claim write lives in db.ts,
+ * where the sanctioned-mutation guard requires every `agents` / `agent_bindings`
+ * mutation to live. This function reads nothing and writes nothing.
+ */
+export interface ContinuityPriorBinding {
+  binding_id: string;
+  binding_version: number;
+  agent_name: string | null;
+  conversation_id: string;
+  host_id: string;
+  window_pid: number;
+  window_pid_start: string;
+}
+
+export interface ResolveContinuityClaimInput {
+  /** The CURRENT binding the relay holds for the conversation being presented. */
+  priorBinding: ContinuityPriorBinding;
+  /** `anchorLivenessVerdict` for that prior binding's anchor. */
+  priorAnchorVerdict: AnchorVerdict;
+  /** The window asking — this session's own resolved anchor. */
+  thisAnchor: { hostId: string; pid: number; startedAt: string };
+}
+
+export type ContinuityClaim =
+  | {
+      ok: true;
+      action: "claim";
+      agentName: string;
+      /** CAS value: the version we READ, so a concurrent rebind loses. */
+      expectedBindingVersion: number;
+      boundVia: "continuity";
+    }
+  | { ok: true; action: "refresh"; agentName: string | null }
+  | { ok: false; reason: string };
+
+export function resolveContinuityClaim(input: ResolveContinuityClaimInput): ContinuityClaim {
+  const { priorBinding: prior, priorAnchorVerdict, thisAnchor } = input;
+
+  // Same window, same conversation: this is the window that already holds it.
+  // A release-then-claim here would rotate the session of a live, correct window
+  // for no reason — so it is a refresh, whatever the verdict says.
+  if (
+    prior.host_id === thisAnchor.hostId &&
+    prior.window_pid === thisAnchor.pid &&
+    prior.window_pid_start === thisAnchor.startedAt
+  ) {
+    return { ok: true, action: "refresh", agentName: prior.agent_name };
+  }
+
+  if (!prior.agent_name) {
+    return {
+      ok: false,
+      reason:
+        `conversation ${prior.conversation_id} is bound to an UNNAMED window, which is not an identity to ` +
+        `inherit — this window binds as itself instead`,
+    };
+  }
+
+  if (priorAnchorVerdict === "alive") {
+    return {
+      ok: false,
+      reason:
+        `"${prior.agent_name}" is held by a window that is ALIVE (pid ${prior.window_pid} on this host), so this ` +
+        `window will not take it. Identity moves only when the holder is provably gone. If that window is in ` +
+        `fact dead, clear it with \`relay release-binding ${prior.agent_name}\` and resume again.`,
+    };
+  }
+
+  if (priorAnchorVerdict === "unverifiable") {
+    return {
+      ok: false,
+      reason:
+        `"${prior.agent_name}" holds conversation ${prior.conversation_id}, but its anchor CANNOT BE VERIFIED on ` +
+        `this host (a different machine, or no readable start time — so pid reuse cannot be excluded). ` +
+        `Unverifiable is NOT dead, and taking a name whose holder cannot be observed is how a live agent loses ` +
+        `its token. Confirm the old window is gone, then ` +
+        `\`relay release-binding ${prior.agent_name} --override\` and resume again.`,
+    };
+  }
+
+  return {
+    ok: true,
+    action: "claim",
+    agentName: prior.agent_name,
+    expectedBindingVersion: prior.binding_version,
+    boundVia: "continuity",
+  };
 }
 
 /** Agent names the relay accepts — same allowlist the hooks enforce. */

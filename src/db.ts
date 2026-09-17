@@ -3384,6 +3384,40 @@ export interface BindingListRow {
   end_reason: string | null;
 }
 
+/**
+ * ADR-0036 S3-lite — the CURRENT binding for a conversation, or undefined.
+ *
+ * This is the question rows 1 and 4 open with: a window presents conversation C
+ * on `/resume`; does the relay's own record say C belongs to someone? §3 tier 1
+ * calls that CONTINUITY, and it is the strongest claim available on one machine
+ * because the relay wrote it rather than inferring it from a name or a title.
+ *
+ * Returns the FULL row, not just the name: the caller must gate on
+ * `anchorLivenessVerdict`, which needs `host_id` + the window anchor. Handing
+ * back only `agent_name` would force the gate to re-query and invite a second,
+ * subtly different deadness test — exactly the divergence ADR-0012 forbids.
+ *
+ * SUPERSEDED ROWS ARE EXCLUDED. A conversation a window used to hold is history,
+ * and history is not a claim; inheriting from it would let an identity be taken
+ * from a record that was already replaced.
+ *
+ * READ-ONLY. The release-then-claim write is a separate, sanctioned writer.
+ */
+export function getCurrentBindingByConversation(
+  db: CompatDatabase,
+  conversationId: string,
+): BindingListRow | undefined {
+  if (!hasAgentBindingsTable(db)) return undefined;
+  return db
+    .prepare(
+      "SELECT binding_id, binding_version, agent_name, agent_class, conversation_id, conversation_title, " +
+        "cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at, end_reason " +
+        "FROM agent_bindings WHERE conversation_id = ? AND superseded_at IS NULL " +
+        "ORDER BY bound_at DESC, binding_id LIMIT 1",
+    )
+    .get(conversationId) as BindingListRow | undefined;
+}
+
 export function listAgentBindings(db: CompatDatabase): BindingListRow[] {
   if (!hasAgentBindingsTable(db)) return [];
   return db
