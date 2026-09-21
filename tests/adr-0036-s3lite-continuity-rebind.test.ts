@@ -380,6 +380,58 @@ describe("ADR-0036 S3-lite — rebindAgentToWindow: release-then-claim under CAS
     expect(getAgentAuthData("s3-x")!.session_id).toBe(before.session_id);
   });
 
+  /**
+   * TORN STATE IS THE DEFECT THIS WRITER EXISTS TO AVOID (ruled: pin it).
+   *
+   * A release-then-claim split across two CONNECTIONS cannot share a transaction,
+   * so a failure between the halves leaves the agents row moved and the binding
+   * row not — the identity side getting exactly the torn state the partial unique
+   * index prevents on the binding side. One handle, one transaction, or neither.
+   *
+   * Driven through the FAILING CAS because that is the reachable rollback path:
+   * the agents claim succeeds, the binding supersede then loses, and the whole
+   * transaction must roll back — leaving the agents row EXACTLY as it was.
+   */
+  it("TORN STATE IS IMPOSSIBLE: a binding-CAS loss rolls back the agents claim too", async () => {
+    await seedPriorBinding();
+    const { registerAgent, getAgentAuthData, rebindAgentToWindow, listAgentBindings } = await import("../src/db.js");
+    registerAgent("s3-x", "builder", []);
+    const before = getAgentAuthData("s3-x")!;
+
+    const db = await openDb();
+    try {
+      const r = rebindAgentToWindow(db, {
+        agentName: "s3-x",
+        conversationId: CONV,
+        newAnchor: NEW_ANCHOR,
+        cwd: "/tmp/s3-project",
+        expected: {
+          bindingId: "unused-in-assertion",
+          // agents-side CAS values are CORRECT, so step 1 succeeds…
+          sessionId: before.session_id,
+          agentPid: before.agent_pid ?? null,
+          agentPidStart: before.agent_pid_start ?? null,
+          // …while the binding version is stale, so step 2 must lose.
+          bindingVersion: 99,
+        },
+      });
+      expect(r.ok, "the binding CAS must lose").toBe(false);
+
+      const current = listAgentBindings(db).filter((b) => b.conversation_id === CONV);
+      expect(current[0].window_pid, "binding must not have moved").toBe(DEAD_ANCHOR.windowPid);
+    } finally {
+      (db as unknown as { close(): void }).close();
+    }
+
+    // THE ASSERTION THAT MATTERS: the agents row is untouched. Without one
+    // transaction, step 1 would have committed and this identity would now point
+    // at a window that holds no binding.
+    const after = getAgentAuthData("s3-x")!;
+    expect(after.session_id, "a rolled-back rebind must not rotate the session").toBe(before.session_id);
+    expect(after.agent_pid, "a rolled-back rebind must not move the anchor").toBe(before.agent_pid ?? null);
+    expect(after.agent_pid_start).toBe(before.agent_pid_start ?? null);
+  }, 30_000);
+
   it("ANNOUNCES in ONE line: the hook collapses bind stdout and prints only the first", async () => {
     // check-relay.sh:919-921 does `tr '\r\n' '  '` and prints only if the result
     // starts with "[RELAY]". A release AND a claim therefore share ONE line —

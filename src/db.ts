@@ -3429,6 +3429,178 @@ export function listAgentBindings(db: CompatDatabase): BindingListRow[] {
     .all() as BindingListRow[];
 }
 
+/**
+ * ADR-0036 S3-lite (rows 1 and 4) — RELEASE-THEN-CLAIM: move an existing
+ * identity onto the window that is presenting its conversation.
+ *
+ * A REBIND IS NOT A REGISTRATION. That is the whole safety argument, and it is
+ * why this does not call `registerAgent`. A rebind MOVES an identity the relay
+ * already issued: it rotates `session_id` and stamps the new window anchor, and
+ * it touches NO `token_hash`, NO `auth_state`, NO capabilities and NO recovery
+ * ticket. `registerAgent` does all of those, so reusing it would drag ~200 lines
+ * of auth machinery — and, via `getDb()`, `applySchemaSetup` — onto a path that
+ * fires on every SessionStart. RULING 1 forbids exactly that: bind opens a raw
+ * handle with `busy_timeout` only, because a migration must never ride a path
+ * that runs dozens of times a day under a 10s hook timeout.
+ *
+ * ONE HANDLE, ONE TRANSACTION — and this is the stronger half of the argument.
+ * `getDb()` and the CLI's raw handle are two CONNECTIONS to the same file, and
+ * two connections cannot share a transaction. A release-then-claim split across
+ * them can leave the `agents` row moved and the `agent_bindings` row not: the
+ * identity side would get exactly the torn state the partial unique index exists
+ * to prevent on the binding side. So this takes the CALLER'S handle and does
+ * both writes inside one `db.transaction`.
+ *
+ * THE CAS IS THE FULL OBSERVED BINDING, NEVER THE NAME. It pins `binding_version`
+ * (the row we read) AND the agents-side triple `session_id` + `agent_pid` +
+ * `agent_pid_start`, all `IS`-compared so NULLs match null-safely — the same
+ * expected-state-in-WHERE shape `releaseAgentBinding` established. A concurrent
+ * rebind that moved either side loses, and a loser REFUSES: it never retries.
+ * "Re-read — do NOT retry force" is ForcePreconditionError's own instruction.
+ *
+ * SESSION-SCOPED STATE IS CLEARED WITH THE ROTATION. `signal_received_at` and
+ * `signal_kind` are NULLed in the same statement that rotates the session, for
+ * the reason registerAgent does it: a signal stamp from a PRIOR session would
+ * otherwise outlive it and drive deriveDashboardState to read a freshly claimed
+ * identity as `closed`.
+ *
+ * The caller decides WHETHER to rebind (`resolveContinuityClaim`, gated on
+ * `anchorLivenessVerdict === "dead"`). This function only performs it.
+ */
+export interface RebindAgentToWindowInput {
+  agentName: string;
+  conversationId: string;
+  newAnchor: BindingAnchor;
+  cwd: string | null;
+  conversationTitle?: string | null;
+  agentClass?: string | null;
+  expected: {
+    bindingId: string;
+    bindingVersion: number;
+    sessionId: string | null;
+    agentPid: number | null;
+    agentPidStart: string | null;
+  };
+}
+
+export type RebindResult =
+  | { ok: true; bindingId: string; bindingVersion: number; sessionId: string; announce: string }
+  | { ok: false; reason: string };
+
+export function rebindAgentToWindow(db: CompatDatabase, input: RebindAgentToWindowInput): RebindResult {
+  const { agentName, conversationId, newAnchor, cwd, expected } = input;
+  const ts = now();
+  const newSessionId = uuidv4();
+  const newBindingId = uuidv4();
+  const nextVersion = expected.bindingVersion + 1;
+
+  let outcome: RebindResult = {
+    ok: false,
+    reason: `rebind of "${agentName}" did not run`,
+  };
+
+  const tx = db.transaction(() => {
+    // 1. CLAIM the agents row, CASed on the anchor+session we OBSERVED. One
+    //    statement: release and claim together, so there is no window in which
+    //    the identity belongs to nobody.
+    const claimed = db
+      .prepare(
+        "UPDATE agents SET session_id = ?, session_started_at = ?, agent_pid = ?, agent_pid_start = ?, " +
+          "host_id = ?, agent_status = 'idle', last_seen = ?, " +
+          "signal_received_at = NULL, signal_kind = NULL " +
+          "WHERE name = ? AND session_id IS ? AND agent_pid IS ? AND agent_pid_start IS ?",
+      )
+      .run(
+        newSessionId,
+        ts,
+        newAnchor.windowPid,
+        newAnchor.windowPidStart,
+        newAnchor.hostId,
+        ts,
+        agentName,
+        expected.sessionId,
+        expected.agentPid,
+        expected.agentPidStart,
+      );
+
+    if (claimed.changes !== 1) {
+      outcome = {
+        ok: false,
+        reason:
+          `rebind of "${agentName}" LOST the compare-and-swap on the agents row: the session or anchor moved ` +
+          `between the read and this write (another window claimed it, or it went live). Re-read and decide ` +
+          `again — this is never retried automatically.`,
+      };
+      throw new Error("rebind-cas-lost"); // roll the transaction back
+    }
+
+    // 2. SUPERSEDE the prior binding, CASed on the version we READ.
+    const superseded = db
+      .prepare(
+        "UPDATE agent_bindings SET superseded_at = ?, superseded_by = ?, supersede_reason = 'continuity' " +
+          "WHERE conversation_id = ? AND superseded_at IS NULL AND binding_version = ?",
+      )
+      .run(ts, newBindingId, conversationId, expected.bindingVersion);
+
+    if (superseded.changes !== 1) {
+      outcome = {
+        ok: false,
+        reason:
+          `rebind of "${agentName}" LOST the compare-and-swap on binding_version ` +
+          `(expected ${expected.bindingVersion}): a concurrent rebind moved the binding first. Re-read and ` +
+          `decide again — this is never retried automatically.`,
+      };
+      throw new Error("rebind-cas-lost");
+    }
+
+    // 3. INSERT the new current binding for THIS window.
+    db.prepare(
+      "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, agent_class, conversation_id, " +
+        "conversation_title, cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'continuity', ?, ?)",
+    ).run(
+      newBindingId,
+      nextVersion,
+      agentName,
+      input.agentClass ?? null,
+      conversationId,
+      input.conversationTitle ?? null,
+      cwd,
+      newAnchor.hostId,
+      newAnchor.windowPid,
+      newAnchor.windowPidStart,
+      ts,
+      ts,
+    );
+
+    outcome = {
+      ok: true,
+      bindingId: newBindingId,
+      bindingVersion: nextVersion,
+      sessionId: newSessionId,
+      // ONE LINE: check-relay.sh collapses bind stdout with `tr '\r\n' '  '` and
+      // prints only the first, so the release and the claim share a single line.
+      // `relay fleet` is where the pair is separable (bound_via + binding_version).
+      announce:
+        `[RELAY] reclaimed ${agentName} for this window from a dead window ` +
+        `(released pid ${expected.agentPid ?? "none"}, took over on conversation ${conversationId}, ` +
+        `binding v${nextVersion})`,
+    };
+  });
+
+  try {
+    tx();
+  } catch (err) {
+    if (err instanceof Error && err.message === "rebind-cas-lost") return outcome;
+    throw err;
+  }
+
+  // Any anchor/session change invalidates BOTH cached probe verdicts → re-probe.
+  _negativeProbeCache.delete(agentName);
+  _positiveProbeCache.delete(agentName);
+  return outcome;
+}
+
 export function setAgentLivenessAnchor(
   name: string,
   pid: number,
