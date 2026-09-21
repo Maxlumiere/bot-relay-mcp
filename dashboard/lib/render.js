@@ -96,8 +96,31 @@ export function renderBoard({ latest, lastRejection, nowMs }) {
   // An empty-state all-clear ("... right now") is a claim about the present. It is
   // only true when a FRESH, VALID snapshot carries an EMPTY list. Items that do
   // exist are always shown (the banner already says how old they are).
+  // LIVE / DORMANT grouping. Keyed on the VERDICT-DERIVED status the snapshot
+  // already carries — NOT on last_seen age. src/types.ts records that v2.19.0
+  // removed the age rule because it LIED ("last_seen is pure telemetry ... a live
+  // agent NEVER reads offline"), so grouping by age would reintroduce a
+  // known-false signal on the surface that is trusted most.
+  //
+  // It also keeps the push honest: ADR-0036 §4 allows "name, derived status and a
+  // needs-resume flag" outbound, because folder paths and titles are internal
+  // content. Grouping on the EXISTING status adds no field and sends no
+  // per-agent timestamp off the machine.
+  //
+  // Nothing is hidden or dropped: every agent still renders, and DORMANT shows
+  // its count, so the board still mirrors the relay exactly.
+  const liveAgents = agents.filter((a) => (a.status || a.agent_status) === "online");
+  const dormantAgents = agents.filter((a) => (a.status || a.agent_status) !== "online");
+
+  const groupedAgentsHtml = [
+    liveAgents.length ? `<h3 class="lane-head">LIVE <span class="lane-count">${liveAgents.length}</span></h3>
+    <div class="grid">${liveAgents.map(agentCardHtml).join("\n")}</div>` : "",
+    dormantAgents.length ? `<h3 class="lane-head lane-dormant">DORMANT <span class="lane-count">${dormantAgents.length}</span></h3>
+    <div class="grid grid-dormant">${dormantAgents.map(agentCardHtml).join("\n")}</div>` : "",
+  ].filter(Boolean).join("\n");
+
   const agentsHtml = agents.length
-    ? agents.map(agentCardHtml).join("\n")
+    ? groupedAgentsHtml
     : !snap
       ? `<div class="empty">No snapshot yet.</div>`
       : unknownReason(banner, snap, "agents", "agent")
@@ -155,6 +178,19 @@ export function renderBoard({ latest, lastRejection, nowMs }) {
   .note { background:#161b22; border:1px dashed #30363d; border-radius:8px; padding:10px 14px; margin-top:18px;
           color:#c9d1d9; font-size:12px; }
   .empty { color:#8b949e; font-style:italic; padding:8px 0; }
+  /* LIVE / DORMANT lane headings. Deliberately quieter than h2 (the lane title)
+     and louder than .empty: these are subdivisions of one lane, not new lanes.
+     DORMANT is DIMMED rather than hidden — the spec is "clearly separated, count
+     visible, nothing dropped", so it must read as present-but-past, never absent. */
+  .lane-head { font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+               color:#8b949e; margin:14px 0 8px; font-weight:600; }
+  .lane-count { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:999px;
+                background:#20304d; border:1px solid #3a5a9a; color:#bcd4ff; font-size:11px; }
+  .lane-dormant { color:#6e7681; }
+  .lane-dormant .lane-count { background:#2a2118; border-color:#5a4632; color:#e0c08a; }
+  /* Dormant cards recede: same information, lower visual weight, so 21 stale rows
+     cannot read as current at a glance. Opacity only — no display:none anywhere. */
+  .grid-dormant .card { opacity:.62; }
   footer { margin-top:22px; color:#6e7681; font-size:11px; border-top:1px solid #21262d; padding-top:10px; }
 </style></head>
 <body>
