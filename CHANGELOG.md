@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — `relay fleet` told you to delete a window you needed to restore (ADR-0036 S1 completion)
+
+A binding whose window is gone was reported as a "DEAD anchor" with the remedy `relay release-binding <name>`. After a reboot every window is gone, so that remedy pointed at deleting exactly the record a restore needs (ADR-0036 row 13).
+
+- Each row now has a derived `status`: `live`, `needs-resume` or `unverifiable`. It is computed at read time from the anchor verdict and never stored. `--json` keeps `liveness` (the raw verdict) and adds `status`. The table's first column is now STATUS.
+- When any window needs resuming, the listing says how to restore it: open a terminal in its CWD and run `claude --resume <CONVERSATION>`. `relay release-binding` is named only for a window you do not want back.
+- The listing does not print a ready-to-paste command. A pasteable line needs every field validated and quoted first (ADR-0040).
+- Tests: `tests/adr-0036-s1c-needs-resume.test.ts`. 4 of its 5 cases were red on the old listing; the fifth is a control, where a live-only fleet prints no resume advice.
+
 ### Fixed — the window record followed `/clear` only on machines installed from scratch (ADR-0036 S1 completion)
 
 S1 records which conversation a window holds, but the SessionStart hook was installed with `startup|resume`. So `/clear`, which starts a new conversation in the same window, never reached it. The record kept the old conversation id, and a restart line built from it would resume the wrong conversation.

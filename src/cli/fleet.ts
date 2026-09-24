@@ -39,6 +39,18 @@ interface Args {
   help: boolean;
 }
 
+
+/**
+ * Status is DERIVED from the anchor verdict at read time, never stored (§2.2).
+ * A dead anchor means the window is gone and the conversation is recorded, which
+ * is row 13's needs-resume. It is not garbage.
+ */
+function statusFor(liveness: string): "live" | "needs-resume" | "unverifiable" {
+  if (liveness === "alive") return "live";
+  if (liveness === "dead") return "needs-resume";
+  return "unverifiable";
+}
+
 function parseArgs(argv: string[]): Args {
   const args: Args = { json: false, dbPath: null, help: false };
   for (let i = 0; i < argv.length; i++) {
@@ -135,15 +147,15 @@ export async function run(argv: string[]): Promise<number> {
     }
 
     const ownHost = getOwnHostId();
-    const rows = listAgentBindings(db).map((r) => ({
-      ...r,
+    const rows = listAgentBindings(db).map((r) => {
       // THE MAPPING. window_pid/window_pid_start ARE this window's anchor; the
       // verdict helper names the same two facts agent_pid/agent_pid_start.
-      liveness: anchorLivenessVerdict(
+      const liveness = anchorLivenessVerdict(
         { host_id: r.host_id, agent_pid: r.window_pid, agent_pid_start: r.window_pid_start },
         ownHost,
-      ),
-    }));
+      );
+      return { ...r, liveness, status: statusFor(liveness) };
+    });
 
     if (args.json) {
       process.stdout.write(JSON.stringify(rows, null, 2) + "\n");
@@ -157,9 +169,9 @@ export async function run(argv: string[]): Promise<number> {
       return 0;
     }
 
-    const head = ["LIVENESS", "AGENT", "CONVERSATION", "WINDOW", "VIA", "CWD"];
+    const head = ["STATUS", "AGENT", "CONVERSATION", "WINDOW", "VIA", "CWD"];
     const body = rows.map((r) => [
-      r.liveness,
+      r.status,
       r.agent_name ?? "(unnamed)",
       // NEVER truncated: a partial conversation id cannot be resumed, which is
       // the one thing a reader most often wants this list for.
@@ -181,11 +193,17 @@ export async function run(argv: string[]): Promise<number> {
         `[RELAY] ${r.agent_name ?? "(unnamed)"} on ${r.conversation_id} recorded a session end: "${r.end_reason}"\n`,
       );
     }
-    const stale = rows.filter((r) => r.liveness === "dead").length;
-    if (stale > 0) {
+    // Row 13: a dead anchor is a window to RESTORE, not a record to delete. After a
+    // reboot every binding is dead, and the old remedy (release-binding) pointed at
+    // deleting exactly what a restore needs. The line names the columns rather than
+    // interpolating a folder: a pasteable command needs every field validated and
+    // quoted first (ADR-0040), which is not this listing's job.
+    const needsResume = rows.filter((r) => r.status === "needs-resume").length;
+    if (needsResume > 0) {
       process.stdout.write(
-        `[RELAY] ${stale} binding(s) have a DEAD anchor: that window is gone, so no wake reaches it. ` +
-          `Clear one with \`relay release-binding <name>\`.\n`,
+        `[RELAY] ${needsResume} window(s) need resuming: the window is gone but its conversation is recorded. ` +
+          `To restore one, open a terminal in its CWD and run \`claude --resume <CONVERSATION>\`. ` +
+          `Use \`relay release-binding <name>\` only for a window you do not want back.\n`,
       );
     }
     return 0;
