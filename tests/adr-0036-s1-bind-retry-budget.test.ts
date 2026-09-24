@@ -204,6 +204,25 @@ afterEach(async () => {
   fs.rmSync(LOCKER, { force: true });
 });
 
+// DRIFT GUARD (victra-approved, lands with S3-lite): the constants above are a
+// deliberate LOCAL copy, so a bar fails for the reason its name claims. The cost
+// of a copy is drift, and "Keep in step with src/db.ts" is a memory obligation.
+// This converts it into a mechanical one: if db.ts changes the ceiling, this
+// fails, and whoever changed it must decide whether the timing bars still hold.
+// Skipped only if the export is absent, so it never fails for a missing import.
+const dbConstants = (await import("../src/db.js")) as Record<string, unknown>;
+describe("ADR-0036 S1 — the local budget constants match what db.ts ships", () => {
+  it.skipIf(dbConstants.BIND_WORST_CASE_MS === undefined)(
+    "EXPECTED_WORST_CASE_MS, the budget and the statement count equal the exported BIND_* values",
+    () => {
+      expect(dbConstants.BIND_WORST_CASE_MS).toBe(EXPECTED_WORST_CASE_MS);
+      expect(dbConstants.BIND_BUDGET_MS).toBe(EXPECTED_BUDGET_MS);
+      // BIND_BUSY_CAP_MS is module-private; it is covered through BIND_WORST_CASE_MS.
+      expect(dbConstants.BIND_MAX_LOCKING_STATEMENTS).toBe(EXPECTED_MAX_LOCKING_STATEMENTS);
+    },
+  );
+});
+
 describe("ADR-0036 S1 — a contended bind fails inside its budget, not the hook's", () => {
   it("a REAL held write lock makes bind fail in ~budget, NOT ~30s (the round-2 defect)", async () => {
     const { upsertAgentBinding } = await import("../src/db.js");
