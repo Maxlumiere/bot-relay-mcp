@@ -389,12 +389,15 @@ describe("ADR-0036 S1 — relay bind RECORDS the window (happy paths)", () => {
     expect(b.end_reason).toBeNull();
   });
 
-  it("startup, UNNAMED window → a row with agent_name NULL and bound_via transient (default stops existing)", async () => {
+  // S3-lite (victra ruling B, provisional pending architect) pulls row 11 forward:
+  // an unnamed window's binding now carries a transient LABEL instead of NULL. The
+  // label lives only in agent_bindings: no agents row, no token, no inbox.
+  it("startup, UNNAMED window → a row with a transient tmp- label and bound_via transient (default stops existing)", async () => {
     const r = runBind([], sessionStart("startup"), { RELAY_AGENT_NAME: undefined });
     expect(r.status, r.stdout + r.stderr).toBe(0);
     const rows = await bindings();
     expect(rows).toHaveLength(1);
-    expect(rows[0].agent_name).toBeNull();
+    expect(String(rows[0].agent_name)).toMatch(/^tmp-[a-z0-9-]+-[0-9a-f]{4}$/);
     expect(rows[0].bound_via).toBe("transient");
   });
 

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Added — `/resume` gives a window its identity back with zero steps (ADR-0036 S3-lite)
+
+**Auth-adjacent.** This slice rewrites an agent's `session_id` and liveness anchor when it moves the identity to a new window. S1 deliberately did neither. The gate is as strong as the vault token, not an OS fact: a provably dead window anchor rules out a second live **window** holding the name. It does not rule out a CLI, HTTP client or other process that holds the name's token, and `report_liveness` can still rewrite the anchor. Gating that is the first item of S2.
+
+- **Row 1 and row 4: restart or crash, then `ai`, then `/resume C`.** Suppose the relay's own record says C belongs to X and X's window is provably dead. The window becomes X: its session is rotated and its anchor stamped in one transaction, compare-and-swapped against what was read, and announced on one line.
+  - The decision uses the anchor-only liveness check. A live or unverifiable holder is never taken, and neither is a lost race; the window is recorded as itself and the line says why, with the route.
+  - A named window never inherits, because its launch intent wins. Only `resume` looks.
+- **The claimed identity carries (row 8).** A window's identity is its binding, not its environment, so a later `/clear` binds the new conversation to X instead of dropping it.
+- **The rebind could never have worked as `ai` actually runs.** `ai` binds the window at startup before `/resume`, and the writer did not supersede that row, so its insert hit the one-current-row-per-window index. Fixed in the same transaction, with a test that starts from an already-bound window.
+- **Row 11, brought forward from S4 (provisional, pending the design review).** A window with no name from env, spawn manifest or config no longer registers the shared `default` agent. It gets a transient label `tmp-<folder>-<4hex>` that exists only in the fleet record: no agent row, no token, no inbox. The label is never inherited, and it stays the same through the window's own `/clear` and `/compact`. The hook says plainly that the window has no relay identity, instead of showing `default`'s mailbox. An explicit `RELAY_AGENT_NAME=default` keeps the old behaviour.
+- **The hook takes its identity from the bind result (provisional, pending the design review).** After a claim, the hook shows X's mail and tasks, never those of the name it started with.
+- **`relay bind` and `relay fleet` check the recorded schema version**, not whether a table exists. The supported range is v25 to `MAX_SUPPORTED_SCHEMA`. A test fails if a migration raises the schema version past that bound without a decision. Each of the three refusals names its own fix:
+  - no `schema_info`: check the DB path;
+  - below the range: "schema not migrated", let the new build open it;
+  - above the range: upgrade relay.
+  The hook reports all three in its verdict.
+- A drift guard ties the retry-budget test's local constants to the exported `BIND_*` values.
+- Known adjacent value, left unchanged in this slice: `db.ts` still sets `busy_timeout = 5000` on the daemon and CLI handle. It is the same 5000 that caused the original 25–30s confusion. The bind path does not use it.
+- Tests:
+  - `tests/adr-0036-s3lite-continuity-rebind.test.ts` (15)
+  - `tests/adr-0036-s3lite-bind-continuity.test.ts` (13)
+  - `tests/adr-0036-s3lite-hook-identity.test.ts` (4)
+  - `tests/adr-0036-s3lite-schema-probe.test.ts` (17)
+  - two new cases in `tests/adr-0036-s1-hook-bind-announce.test.ts`, and the drift guard in `tests/adr-0036-s1-bind-retry-budget.test.ts`
+  Each red was checked for the right reason before it was banked, and each guard was mutated to prove it can fail.
+
 ### Added — a window now RECORDS which identity it holds, and says so (`relay bind` + `relay fleet`, ADR-0036 S1)
 
 A terminal could become agent X without anything observable happening: no record of which window held which name, on which conversation, and no way to ask. When that binding went stale the only symptom was mail that never arrived. S1 **records and lists**; it changes no auth and performs **no** automatic rebind (that is S3-lite).

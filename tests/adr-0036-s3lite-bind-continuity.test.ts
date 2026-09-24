@@ -248,7 +248,7 @@ describe("S3-lite — relay bind claims a dead holder's identity on /resume (row
     expect(r.stdout).toMatch(new RegExp(`did not take ${PRIOR}`));
     expect(r.stdout).toMatch(/ALIVE/);
     expect(await agentRow(), "X is untouched").toEqual(before);
-    expect((await thisWindowBinding())?.agent_name ?? null).toBeNull();
+    expect(String((await thisWindowBinding())?.agent_name), "recorded as itself: a transient label, not X").toMatch(/^tmp-/);
   }, 30_000);
 
   it("REFUSE: the holder is UNVERIFIABLE (another host) — unverifiable is not dead", async () => {
@@ -306,5 +306,52 @@ describe("S3-lite — the claimed identity CARRIES in the same window (row 8)", 
     expect(runBind([], sessionStart("resume", C), UNNAMED).status).toBe(0);
     expect(runBind([], sessionStart("compact", C), UNNAMED).status).toBe(0);
     expect((await thisWindowBinding())?.agent_name).toBe(PRIOR);
+  }, 30_000);
+});
+
+const TRANSIENT = /^tmp-[a-z0-9-]+-[0-9a-f]{4}$/;
+
+describe("S3-lite row 11 — an unnamed window gets a TRANSIENT label, in agent_bindings only (victra ruling B)", () => {
+  it("startup without a name → binding labelled tmp-<cwd>-<4hex>, announced, and NO agents row", async () => {
+    const r = runBind([], sessionStart("startup", N), UNNAMED);
+    expect(r.status, r.stderr).toBe(0);
+    const b = await thisWindowBinding();
+    expect(String(b?.agent_name)).toMatch(TRANSIENT);
+    expect(String(b?.agent_name), "derived from the folder name").toContain("stdin-cwd");
+    expect(b?.bound_via).toBe("transient");
+    expect(r.stdout).toContain(String(b?.agent_name));
+    const agentsRow = await raw((db) => db.prepare("SELECT 1 FROM agents WHERE name = ?").get(String(b?.agent_name)));
+    expect(agentsRow, "a transient label is never an identity: no agents row, no token").toBeUndefined();
+  }, 30_000);
+
+  it("a NAMED window is never relabelled", async () => {
+    runBind([], sessionStart("startup", N), { RELAY_AGENT_NAME: "named-z" });
+    expect((await thisWindowBinding())?.agent_name).toBe("named-z");
+  }, 30_000);
+
+  it("a conversation held by a dead TRANSIENT window is not an identity to inherit, and says nothing about it", async () => {
+    const { getOwnHostId } = await import("../src/liveness.js");
+    await raw((db) => {
+      db.prepare(
+        "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, agent_class, conversation_id, conversation_title, " +
+          "cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at) " +
+          "VALUES ('t-1', 1, 'tmp-old-ab12', NULL, ?, NULL, '/tmp/old', ?, ?, 'Mon Sep 15 10:00:00 2026', 'transient', ?, ?)",
+      ).run(C, getOwnHostId(), DEAD_PID, new Date().toISOString(), new Date().toISOString());
+    });
+
+    const r = runBind([], sessionStart("resume", C), UNNAMED);
+
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).not.toMatch(/reclaimed|did not take/);
+    const b = await thisWindowBinding();
+    expect(String(b?.agent_name)).toMatch(TRANSIENT);
+    expect(b?.agent_name, "this window gets its own label, not the dead window's").not.toBe("tmp-old-ab12");
+  }, 30_000);
+
+  it("the transient label CARRIES through /clear in the same window (row 8)", async () => {
+    runBind([], sessionStart("startup", N), UNNAMED);
+    const first = String((await thisWindowBinding())?.agent_name);
+    runBind([], sessionStart("clear", C2), UNNAMED);
+    expect((await thisWindowBinding())?.agent_name).toBe(first);
   }, 30_000);
 });

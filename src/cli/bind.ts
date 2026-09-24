@@ -255,7 +255,11 @@ export async function run(argv: string[]): Promise<number> {
     let continuityName: string | null = null;
     if (agentName === null && source === "resume") {
       const prior = getCurrentBindingByConversation(db, conversationId);
-      if (prior) {
+      // An unnamed or TRANSIENT holder is not an identity: nothing to take, and
+      // nothing to say (an `ai` window resuming its own earlier conversation is
+      // the common case, and a "did not take" line there would be noise).
+      const { isTransientName } = await import("../binding.js");
+      if (prior && prior.agent_name && !isTransientName(prior.agent_name)) {
         continuityName = prior.agent_name;
         const { anchorLivenessVerdict } = await import("../liveness.js");
         const { resolveContinuityClaim } = await import("../binding.js");
@@ -315,12 +319,22 @@ export async function run(argv: string[]): Promise<number> {
     // conversation, same window) would otherwise bind the new conversation as
     // nobody and drop X. `/compact` keeps the same conversation, so it lands on the
     // refresh path by construction; carrying the name costs it nothing.
+    //
+    // ROW 11 (victra ruling B): a window that is still nobody gets a TRANSIENT
+    // label, in agent_bindings only. The label is stable for the window: any
+    // re-fire in the same window (resume, clear, compact) keeps it.
+    const { isTransientName, transientNameFor } = await import("../binding.js");
+    const currentName = agentName === null ? (getCurrentBinding(db, anchor)?.agent_name ?? null) : null;
     const effectiveName =
-      agentName ?? (source === "clear" ? (getCurrentBinding(db, anchor)?.agent_name ?? null) : null);
+      agentName ??
+      (source === "clear" && currentName ? currentName : null) ??
+      (isTransientName(currentName) ? currentName : null) ??
+      transientNameFor(cwd);
 
     // `compact` keeps the same conversation id, so it lands on the refresh path
     // by construction — no special case, and no second current row (§8a D2).
-    const boundVia = boundViaForSource(source, effectiveName !== null);
+    // A transient label is not a launch intent: it binds as `transient`.
+    const boundVia = boundViaForSource(source, agentName !== null || (effectiveName !== null && !isTransientName(effectiveName)));
     const result = upsertAgentBinding(
       db,
       {

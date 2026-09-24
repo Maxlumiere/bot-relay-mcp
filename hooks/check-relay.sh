@@ -213,6 +213,17 @@ if [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; then
   fi
 fi
 
+# ADR-0036 S3-lite (ruling B, provisional): a window
+# that is still NOBODY after env + spawn manifest + config is UNNAMED. It no
+# longer registers the shared "default" row, which unnamed `ai` windows piled into
+# (measured live 24 Sep). Bind gives it a transient LABEL in agent_bindings only,
+# and the hook says it has no relay identity. An EXPLICIT RELAY_AGENT_NAME=default
+# is a deliberate choice and keeps the old path.
+RELAY_UNNAMED=0
+if [ -z "${RELAY_AGENT_NAME:-}" ] && [ "$AGENT_NAME" = "default" ]; then
+  RELAY_UNNAMED=1
+fi
+
 # v2.6.1 — vault-first bootstrap. If RELAY_AGENT_TOKEN is unset in env BUT a
 # vault file exists for this agent name, hydrate the env from disk before any
 # auth-sensitive call below. Closes the spawn-without-pre-mint failure mode
@@ -719,6 +730,12 @@ SQL
   fi
 fi
 
+# Ruling B: nobody registers as nobody. (A continuity claim in the bind below
+# moves an EXISTING identity to this window; that needs no register either.)
+if [ "$RELAY_UNNAMED" -eq 1 ]; then
+  SKIP_REGISTER=1
+fi
+
 # v2.16.3 — relay_machine_guid + relay_pid_chain (Tether v0.3 PID-handshake)
 # moved to _vault-helpers.sh (sourced above) so the Codex SessionStart hook
 # shares ONE copy and reports the SAME handshake → Tether can PID-bind Codex
@@ -926,6 +943,14 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
     case "$RELAY_BIND_LINE" in
       "[RELAY]"*) printf '%s\n' "$RELAY_BIND_LINE" ;;
     esac
+    # Ruling A: the bind RESULT is who this window is. A continuity claim made it
+    # X, so everything below (mail, tasks) is X's, never the env name's.
+    RELAY_CLAIMED=$(printf '%s' "$RELAY_BIND_LINE" | sed -n 's/^\[RELAY\] reclaimed \([A-Za-z0-9_.-]\{1,64\}\) for this window .*/\1/p')
+    if [ -n "$RELAY_CLAIMED" ]; then
+      AGENT_NAME="$RELAY_CLAIMED"
+      RELAY_UNNAMED=0
+    fi
+    RELAY_TRANSIENT_LABEL=$(printf '%s' "$RELAY_BIND_LINE" | sed -n 's/^\[RELAY\] bound \(tmp-[a-z0-9-]\{1,59\}\) to conversation .*/\1/p')
   else
     # Loud, never silent — the operator sees WHY this window was not recorded.
     [ -n "$RELAY_BIND_ERR" ] && printf '%s\n' "$RELAY_BIND_ERR" >&2
@@ -949,6 +974,10 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
 fi
 # --- end ADR-0036 S1 bind ------------------------------------------------------
 
+if [ "$RELAY_UNNAMED" -eq 1 ]; then
+  # Say it plainly rather than show the shared "default" mailbox as if it were ours.
+  echo "[RELAY] this window has no relay identity${RELAY_TRANSIENT_LABEL:+ (labelled $RELAY_TRANSIENT_LABEL in the fleet list only)}: no inbox, no tasks. Launch it with RELAY_AGENT_NAME=<name>, or /resume a conversation that belongs to a named agent."
+else
 # --- Deliver pending messages (parameter-bound) ---
 # #53 — the CANONICAL per-session pending predicate (SSOT: src/db.ts
 # pendingForSessionClause), replicated here because a shell hook can't call the
@@ -1000,6 +1029,8 @@ if [ -n "$TASKS" ]; then
   echo ""
   echo "[bot-relay] $AGENT_NAME has active tasks (delivered to context)." >&2
 fi
+
+fi # end RELAY_UNNAMED mail/task delivery gate
 
 # --- ADR-0026 item 1: wake-coverage briefing line (READ the durable sink) ---
 # Reached only on the SUCCESS path (valid identity + DB present; the invalid-name / out-of-

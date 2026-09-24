@@ -26,6 +26,8 @@
  */
 import { processStartedAt, type AgentProcess } from "./liveness.js";
 import type { AnchorVerdict } from "./liveness.js";
+import { randomBytes } from "crypto";
+import { AGENT_NAME_PATTERN } from "./types.js";
 
 /** A window anchor: the pid AND the start time that makes it reusable-proof. */
 export interface WindowAnchor {
@@ -208,7 +210,7 @@ export function resolveContinuityClaim(input: ResolveContinuityClaimInput): Cont
     return { ok: true, action: "refresh", agentName: prior.agent_name };
   }
 
-  if (!prior.agent_name) {
+  if (!prior.agent_name || isTransientName(prior.agent_name)) {
     return {
       ok: false,
       reason:
@@ -261,4 +263,32 @@ export function resolveAgentName(envName: string | null | undefined): string | n
   const trimmed = envName.trim();
   if (!trimmed || trimmed === "default") return null;
   return AGENT_NAME_RE.test(trimmed) ? trimmed : null;
+}
+
+/**
+ * ADR-0036 row 11, pulled forward from S4 into S3-lite (victra ruling B,
+ * provisional pending architect). A window that is nobody gets a unique
+ * TRANSIENT LABEL instead of the shared `default` path. The label lives ONLY in
+ * agent_bindings: never an agents row, never a token, never an inbox. So it is
+ * not an identity, adds no auth surface, and needs no reaper.
+ *
+ * `tmp-<folder>-<4hex>`: the folder name so a human can tell windows apart in
+ * `relay fleet`, and 4 random hex digits so two windows in the same folder
+ * differ. The folder part is reduced to [a-z0-9-] so the label also passes the
+ * ADR-0040 restart-line validator.
+ */
+export const TRANSIENT_PREFIX = "tmp-";
+
+export function isTransientName(name: string | null | undefined): boolean {
+  return typeof name === "string" && name.startsWith(TRANSIENT_PREFIX);
+}
+
+export function transientNameFor(cwd: string | null, randomHex4: () => string = () => randomBytes(2).toString("hex")): string {
+  const base = (cwd ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "";
+  const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "window";
+  const name = `${TRANSIENT_PREFIX}${slug}-${randomHex4()}`;
+  // AGENT_NAME_PATTERN from types.ts, deliberately NOT a copy (binding.ts already
+  // carries one duplicate of it; flagged, not refactored here).
+  if (!AGENT_NAME_PATTERN.test(name)) throw new Error(`transient label ${JSON.stringify(name)} is not a valid name`);
+  return name;
 }
