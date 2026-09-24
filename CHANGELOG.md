@@ -10,6 +10,10 @@ Measured live: `get_messages(status="pending", ack=true)` replied `acked: true, 
 - **The ack receipt reports the effect.** `resolved_count` is the number of rows the resolve changed, not the number returned. `acked` is true only when the resolve ran; otherwise the reply carries `ack_not_applied` with the reason. It used to be built from the request.
 - **An agent with no session is told so.** The reply carries `warning: { code: "session_unbound", message }`: mail was delivered and receipts recorded, but there is no per-session read mark, so unresolved mail is returned again until the agent re-registers or resolves it. With no session, neither the per-session read mark nor the legacy `status` column is written.
 - The `get_messages` tool description documents `acked`, `resolved_count` and `warning`.
+- **The same rule was checked across every handler that changes state.** A read-only walk of all 28 found two more receipts built from the request:
+  - `register_agent` returned an `agent` object put together in memory rather than read back. A first register showed `host_id`, `cli_profile`, `host_shell_pids` and `server_version` as null even though they were stored. A re-register showed the old `server_version` and `cli_profile`. The object is now read back from the database after the write.
+  - `spawn_agent` reported `has_initial_message: true` even when queuing the message failed and the error was swallowed. It now says whether the message was queued, and on failure adds `initial_message_error` with the next step.
+  Test: `tests/adr-0041-r1-receipt-walk.test.ts`. 4 of its 5 cases were red on the old code and turn red again when the fix is reverted; the fifth is the passing control.
 - Tests: `tests/adr-0041-null-session-receipts.test.ts`, 9 cases. The NULL session is produced by a real force mint. The cases cover:
   - the harm case (an ack must not claim what the database did not do) and its twin (with a session, the real count);
   - resolve and delivery with no session;

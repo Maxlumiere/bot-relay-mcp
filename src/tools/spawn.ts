@@ -121,12 +121,21 @@ export async function handleSpawnAgent(input: SpawnAgentInput) {
 
   // If an initial message was provided, queue it AFTER pre-register so the
   // child's first-session mail-delivery hook finds both the row and the mail.
+  // ADR-0041 R1: the receipt says whether the message was QUEUED, not whether
+  // one was asked for. A swallowed failure used to still report
+  // has_initial_message: true with no row behind it.
+  let initialMessageQueued = false;
+  let initialMessageError: string | undefined;
   if (input.initial_message) {
     try {
       sendMessage("system", input.name, input.initial_message, "normal");
+      initialMessageQueued = true;
     } catch (err) {
       // Non-fatal — we can still spawn even if message queueing fails
       log.warn("[spawn] Failed to queue initial message:", err);
+      initialMessageError =
+        `initial_message was not queued (${err instanceof Error ? err.message : String(err)}); ` +
+        `send it with send_message once the agent is up.`;
     }
   }
 
@@ -281,7 +290,8 @@ export async function handleSpawnAgent(input: SpawnAgentInput) {
               ? "Parent-issued agent_token has been written to the per-instance file vault (v2.6.1). The spawned terminal's SessionStart hook resolves identity from disk on first turn — no operator paste required. Shown once; the server stores only a bcrypt hash."
               : null,
             note: `Spawning agent "${input.name}" (role: ${input.role}) via ${result.driverName} on ${result.platform}. Pre-registered parent-side with token passthrough.`,
-            has_initial_message: !!input.initial_message,
+            has_initial_message: initialMessageQueued,
+            ...(initialMessageError ? { initial_message_error: initialMessageError } : {}),
             brief_file_path: validatedBriefPath ?? null,
           },
           null,

@@ -3932,7 +3932,6 @@ export function registerAgent(
 
   const existing = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord | undefined;
 
-  let agentWithStatus: AgentWithStatus;
   let plaintext_token: string | null = null;
   // ADR-0005: one-time registration-recovery handle — set ONLY on first register.
   let registration_recovery: string | null = null;
@@ -4110,21 +4109,6 @@ export function registerAgent(
       markEstablished(name);
     }
 
-    agentWithStatus = toAgentWithStatus({
-      ...existing,
-      role,
-      last_seen: timestamp,
-      token_hash: newHash,
-      session_id,
-      description: newDescription,
-      terminal_title_ref: newTitleRef,
-      host_shell_pids: newHostShellPids,
-      host_id: newHostId,
-      agent_status: newAgentStatus,
-      auth_state: newAuthState,
-      recovery_token_hash: newRecoveryHash,
-      revoked_at: newRevokedAt,
-    });
   } else {
     // First registration — always generate a token.
     plaintext_token = generateToken();
@@ -4166,26 +4150,6 @@ export function registerAgent(
       if (cap) insertCap.run(name, cap);
     }
 
-    agentWithStatus = toAgentWithStatus({
-      id,
-      name,
-      role,
-      capabilities: capsJson,
-      last_seen: timestamp,
-      created_at: timestamp,
-      token_hash,
-      session_id,
-      description,
-      agent_status: "idle", // v2.1.3 (I6)
-      managed,
-      terminal_title_ref: titleRef,
-      // ADR-0002 (codex #114 blocker): the INSERT above persists the declared
-      // class, but this in-memory row is projected straight to the FIRST
-      // register_agent response — omitting it made toAgentWithStatus read
-      // row.class===undefined → normalizeAgentClass → 'unclassified'. Mirror the
-      // persisted value so the initial response matches the row + next read.
-      class: options.class ?? null,
-    });
   }
 
   // v2.23.x #140 — registration CREATES (first INSERT) or REPLACES (re-register
@@ -4200,6 +4164,18 @@ export function registerAgent(
   // paths throw above → no identity change → nothing stale to clear.)
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
+
+  // ADR-0041 R1: the returned agent is READ BACK from what was written, never
+  // projected in memory. The projections this replaces had drifted from the SQL:
+  // a first register omitted server_version / cli_profile / host_id /
+  // host_shell_pids that the INSERT writes, and a re-register echoed the OLD
+  // server_version and cli_profile while the UPDATE wrote new ones. One read
+  // cannot drift from the write it follows.
+  const writtenRow = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord | undefined;
+  if (!writtenRow) {
+    throw new Error(`registerAgent: no row for "${name}" after a successful write (concurrent unregister?)`);
+  }
+  const agentWithStatus = toAgentWithStatus(writtenRow);
 
   // v2.0 beta.1 (Codex HIGH 4): auto-assign queued tasks at the DB layer so
   // every caller of registerAgent (tool handler, future hooks, direct scripts)
