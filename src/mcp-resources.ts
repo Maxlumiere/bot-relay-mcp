@@ -25,7 +25,7 @@
  *   Subscribable; emits notifications/resources/updated on every
  *   inbox write (send_message / broadcast / get_messages drain).
  */
-import { getDb, getAgents } from "./db.js";
+import { getDb, getAgents, pendingForSessionClause, pendingGlobalClause } from "./db.js";
 import { decryptContent } from "./encryption.js";
 import { truncatedPreview } from "./preview.js";
 import { agentNameFromInboxUri, inboxUriFor } from "./mcp-subscriptions.js";
@@ -138,7 +138,8 @@ export function readResource(uri: string): {
  *
  * Field shape:
  *   - agent_name              — exact name the URI was scoped to
- *   - pending_count           — messages still status='pending' (un-drained)
+ *   - pending_count           — mail this agent's current session has not drained and
+ *                               nobody resolved (the canonical get_messages predicate, F3)
  *   - total_count             — every message ever sent to this agent
  *   - last_message_at         — ISO timestamp of the most-recent message;
  *                               null if the inbox is empty
@@ -175,9 +176,17 @@ function buildInboxSnapshot(agentName: string): {
   const total = (db
     .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ?")
     .get(agentName) as { c: number }).c;
+  // F3: the per-session canonical predicate, the same one get_messages(pending)
+  // and peek_inbox_version use, so the wake signal and the drain cannot disagree.
+  // It used to count the legacy `status` column, which the stale PostToolUse hook
+  // flips with no drain: Tether saw an empty inbox while mail waited.
+  const session = (db.prepare("SELECT session_id FROM agents WHERE name = ?").get(agentName) as
+    | { session_id: string | null }
+    | undefined)?.session_id ?? "";
+  const pc = pendingForSessionClause(session);
   const pending = (db
-    .prepare("SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND status = 'pending' AND resolved_at IS NULL")
-    .get(agentName) as { c: number }).c;
+    .prepare(`SELECT COUNT(*) AS c FROM messages WHERE to_agent = ? AND ${pc.sql}`)
+    .get(agentName, ...pc.params) as { c: number }).c;
   const last = db
     .prepare(
       "SELECT from_agent, priority, content, created_at FROM messages " +
@@ -233,11 +242,11 @@ function buildCurrentState(): {
 } {
   const db = getDb();
   const agents = getAgents();
+  // F3: canonical session-agnostic predicate, not the legacy status column.
+  const pg = pendingGlobalClause();
   const pending = db
-    .prepare(
-      "SELECT to_agent, COUNT(*) AS c FROM messages WHERE status = 'pending' AND resolved_at IS NULL GROUP BY to_agent",
-    )
-    .all() as { to_agent: string; c: number }[];
+    .prepare(`SELECT to_agent, COUNT(*) AS c FROM messages WHERE ${pg.sql} GROUP BY to_agent`)
+    .all(...pg.params) as { to_agent: string; c: number }[];
   const pendingByAgent = new Map(pending.map((r) => [r.to_agent, r.c]));
   const activeTasks = (db
     .prepare("SELECT COUNT(*) AS c FROM tasks WHERE status IN ('queued','accepted','in_progress')")

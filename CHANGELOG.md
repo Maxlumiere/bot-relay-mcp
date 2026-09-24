@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — the board showed agents as quiet while their mail was still waiting (F3)
+
+The PostToolUse hook's fallback flips a message's legacy `status` column to `read` on every run, with no drain and no resolve. Every "is mail waiting" count that read `status = 'pending'` therefore dropped that mail, and the board reported the agent as quiet while the mail waited: a false quiet.
+
+All of them now use the canonical predicate, the same one the drain uses:
+- the dashboard snapshot's `pending_count`, which drives the inbox badge and sort; it now equals `unread_count`;
+- the dashboard's `pending` agent state;
+- `relay://current-state`;
+- `relay://inbox/<agent>` (Tether's inbox subscription), which uses the recipient's own session so the wake signal matches what `get_messages` returns.
+
+The field names are unchanged. The wake-coverage detector and the pending-on-a-human lane were checked and already used the canonical predicate. No other decision in `src/` reads `status`.
+
+Test: `tests/f3-board-signals-canonical.test.ts`. It applies exactly the hook's `status` flip and nothing else, then checks every surface. 4 were red on the old code and turn red again with the fix reverted. The innocent twins confirm that a real drain and a resolve still clear every count.
+
 ### Fixed — a closing window could end the session of a different, live window with the same agent name (ADR-0042 R1)
 
 Measured on 24 Sep: when an agent's old window closed, its relay connector ended the agent's session even though a new window had already taken over the row and was still running. Both connectors had captured the same session id, so the session compare-and-swap matched and protected nothing. The live window was left with no session.

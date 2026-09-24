@@ -4734,10 +4734,11 @@ export function getDashboardAgentSnapshots(
          a.last_alive,
          (SELECT COUNT(*) FROM messages m
            WHERE m.to_agent = a.name
-             AND m.status = 'pending'
-             -- status alone is NOT a proxy for unresolved: resolve_messages
-             -- stamps resolved_at and deliberately leaves status alone, so
-             -- resolved mail stayed counted here. See getInboxSummary.
+             -- F3: the canonical session-agnostic predicate (pendingGlobalClause:
+             -- never drained by any session AND unresolved), NOT the legacy
+             -- status column, which the stale PostToolUse hook flips with no
+             -- drain. See getInboxSummary.
+             AND m.read_by_session IS NULL
              AND m.resolved_at IS NULL
              AND m.created_at < ?) AS pending_count_old
        FROM agents a`,
@@ -5173,8 +5174,11 @@ export function buildAgentTopology(): {
  * agents[] without a second round-trip per row.
  *
  * Semantics:
- *   - pending_count — messages still in status='pending' (not yet drained
- *     by a get_messages call that flipped them to 'read').
+ *   - pending_count — F3 (relay review, 24 Sep): now the SAME canonical predicate
+ *     as unread_count. It used to count `status = 'pending'`, a legacy column
+ *     the stale PostToolUse hook flipped to 'read' on every run with no drain, so
+ *     the board showed an agent as quiet while its mail still waited (a false
+ *     quiet). The field is kept, under the same name, for existing readers.
  *   - unread_count  — the CANONICAL session-agnostic unread (#56):
  *     read_by_session IS NULL AND resolved_at IS NULL (= pendingGlobalClause,
  *     "not read by any session and not resolved"). Was `seq IS NULL` (mirroring
@@ -5200,12 +5204,13 @@ export function getInboxSummary(): Array<{
       // NOT miscounted as unread — SQL NULL IS NULL evaluates true, which
       // would inflate unread_count by 1 per mail-less agent.
       `SELECT a.name AS agent_name,
-              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.status = 'pending' AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS pending_count,
+              -- F3: canonical, NOT the legacy status column (see the doc comment).
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.read_by_session IS NULL AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS pending_count,
               -- #56: canonical session-agnostic unread = pendingGlobalClause
               -- (read_by_session IS NULL AND resolved_at IS NULL), not seq IS NULL.
               -- seq is stamped by any observation (incl. a non-consuming browse),
               -- so it silently disagreed with the other SSOT surfaces; read_by_session
-              -- moves with the drain, so this now agrees with pending_count above.
+              -- moves with the drain, so this and pending_count above agree by construction.
               COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.read_by_session IS NULL AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS unread_count,
               MAX(m.created_at) AS last_message_at
          FROM agents a
