@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Added — `relay fleet --lines`: a checked restart line for every window that needs resuming (ADR-0036 S1 completion, ADR-0040)
+
+Restoring the fleet after a reboot no longer needs anyone to remember which window held which conversation. `relay fleet --lines` prints one line per window that needs resuming. It is built from the recorded binding, never from a request:
+
+```
+# builder  needs-resume  1b2c3d4e-…  context 222k/1M (22%, ok), 0 compactions
+cd '/home/you/My Projects/app' && RELAY_AGENT_NAME='builder' claude --resume 1b2c3d4e-…
+```
+
+- **Every field is validated, then quoted** by the ADR-0040 validator. A row that fails gets a `#` comment naming each reason and no line. Everything that is not a command is a comment, so pasting the whole output runs only checked lines. Folders must be under your home directory.
+- **A live window gets no line**, only `already open, do not paste`: a second window would claim the same identity. An unverifiable one (another host, or an unreadable anchor) gets no line either.
+- **A sub-agent's transcript gets no line.** The comment names the parent conversation to resume instead.
+- **The context meter shows on each row's comment.** It reads context, window, level and compaction count from the transcript, found by file name under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR`). If no transcript is found, the comment says so.
+- **No `--model`.** A Claude transcript records `claude-opus-5-5` without its `[1m]` window (measured). A `--model` taken from it could reopen a 900k-token conversation in a 200k window.
+- The line reproduces the persona launchers' launch intent (`RELAY_AGENT_NAME=<name> claude …`); an unnamed window's line has no name.
+- `--lines` and `--json` are mutually exclusive. `--help` now describes status as `live` / `needs-resume` / `unverifiable`; it no longer calls a dead binding "stale".
+- Tests: `tests/adr-0036-s1c-fleet-lines.test.ts`.
+  - Each emitted line is run through `/bin/sh` against a fake `claude` that records its directory, arguments and `RELAY_AGENT_NAME`. That includes a real folder named `a'b; touch PWNED $(touch PWNED2)`, which the line reaches without running anything else.
+  - 9 of 10 cases were red before the option existed.
+  - Three mutations are each caught: an unquoted folder, a line for a live window, and an ignored sub-agent.
+
 ### Fixed — `relay fleet` told you to delete a window you needed to restore (ADR-0036 S1 completion)
 
 A binding whose window is gone was reported as a "DEAD anchor" with the remedy `relay release-binding <name>`. After a reboot every window is gone, so that remedy pointed at deleting exactly the record a restore needs (ADR-0036 row 13).
@@ -42,9 +63,10 @@ Two notes for anyone reading the hook diff:
 
 - The payload read is bounded by **time**, not size. A size bound (`head -c`) blocks until the writer closes, and `spawn(cmd, {})` with no `stdio` option hands the child a pipe nobody ever closes — which hung SessionStart against its 10s timeout and was caught by CANARY 6. Where no bounded read is available the payload is **skipped**: one unrecorded window costs less than a hung session start.
 - `docs/hook-payload-format.md` listed `hook_event_name` as "One of: …", an exhaustive set that omitted `SessionEnd` — an affirmative claim it did not exist. Now non-exhaustive, with a SessionEnd section and a SessionStart `source` table (`startup`/`resume`/`fork`/`clear`/`compact`), including that `clear` and `fork` change the conversation id while `compact` does not, that SessionEnd's `clear` carries the **old** id, that `/compact` fires no SessionEnd at all, and that a reboot's SIGTERM arrives as `other` — indistinguishable from a terminal close.
-### Added — ADR-0040 building blocks: a context meter and a restart-line field validator (not wired to any surface yet)
 
-Two pure modules for the self-serve fleet restart list (ADR-0040). Nothing calls them yet: the `relay fleet --lines` generator that uses them builds on ADR-0036 S1 (#276) and lands after it.
+### Added — ADR-0040 building blocks: a context meter and a restart-line field validator
+
+Two pure modules for the self-serve fleet restart list (ADR-0040). `relay fleet --lines` (below) is their first caller.
 
 - **`src/fleet-meter.ts`**: `meterFromTranscript(text)` / `readTranscriptMeter(path)` reads one Claude Code transcript or Codex rollout. It returns the newest model, the context size, the window, the fraction used, a level (`ok`, `amber` at 40%, `red` at 70%, or `unknown`), the compaction count, and whether the conversation can be resumed.
   - **Allowlist, not denylist.** Only the model, usage numbers, compaction markers and session/parent ids are read. The result has no field that can carry transcript content, and a model string that is not model-shaped is dropped.

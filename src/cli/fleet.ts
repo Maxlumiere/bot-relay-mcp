@@ -32,9 +32,14 @@
  * `$(relay fleet --json)` captures EMPTY instead of a plausible wrong value.
  */
 import fs from "fs";
+import os from "os";
+import path from "path";
+import { readTranscriptMeter, type MeterResult } from "../fleet-meter.js";
+import { validateLineFields, shellQuote } from "../fleet-line-fields.js";
 
 interface Args {
   json: boolean;
+  lines: boolean;
   dbPath: string | null;
   help: boolean;
 }
@@ -52,10 +57,11 @@ function statusFor(liveness: string): "live" | "needs-resume" | "unverifiable" {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { json: false, dbPath: null, help: false };
+  const args: Args = { json: false, lines: false, dbPath: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") args.json = true;
+    else if (a === "--lines") args.lines = true;
     else if (a === "--help" || a === "-h") args.help = true;
     else if (a === "--db-path") {
       const v = argv[++i];
@@ -63,20 +69,26 @@ function parseArgs(argv: string[]): Args {
       args.dbPath = v;
     } else throw new Error(`unknown option: ${a}`);
   }
+  if (args.json && args.lines) throw new Error("--json and --lines are mutually exclusive");
   return args;
 }
 
 function usage(requested = false): void {
   const text =
-    "Usage: relay fleet [--json] [--db-path P]\n\n" +
+    "Usage: relay fleet [--json | --lines] [--db-path P]\n\n" +
     "Lists every window binding the relay has recorded: which window holds which\n" +
     "identity, on which conversation, and whether that window is still alive.\n\n" +
-    "Liveness is DERIVED from the recorded anchor each time you run this — it is\n" +
+    "Status is DERIVED from the recorded anchor each time you run this — it is\n" +
     "never stored, so it cannot drift from the live process:\n" +
-    "  alive         the window's process is running on this host\n" +
-    "  dead          the anchor is gone or was reused — the binding is STALE\n" +
+    "  live          the window's process is running on this host\n" +
+    "  needs-resume  the window is gone; its conversation is recorded and can be resumed\n" +
     "  unverifiable  a different host, or no probe-able anchor (never a guess)\n\n" +
     "  --json       Emit the rows as JSON instead of a table.\n" +
+    "  --lines      One checked restart line per window that needs resuming, with its\n" +
+    "               context meter. Every field is validated and quoted; a row that\n" +
+    "               fails gets a comment saying why and no line. Live windows get\n" +
+    "               no line. Lines carry no --model (the transcript does not record\n" +
+    "               the context window).\n" +
     "  --db-path P  Read the DB at P (default: $RELAY_DB_PATH or the active\n" +
     "               instance's DB).\n\n" +
     "Exit: 0 = listed (an empty fleet is not an error) · 1 = could not read ·\n" +
@@ -93,6 +105,110 @@ function fleetFailed(reason: string): number {
 
 function pad(s: string, n: number): string {
   return s.length >= n ? s : s + " ".repeat(n - s.length);
+}
+
+/** Comment text: one line, no control characters (a pasted comment must stay a comment). */
+function commentSafe(s: string): string {
+  return s.replace(/[\u0000-\u001f\u007f]+/g, " ");
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * The transcript for `conversationId`, found by FILE NAME under the Claude projects
+ * dir rather than by re-deriving the project-dir slug from the cwd. The id is
+ * checked as a UUID before it goes near a path.
+ */
+function findTranscript(conversationId: string): string | null {
+  if (!UUID.test(conversationId)) return null;
+  const projects = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "projects");
+  let dirs: string[];
+  try {
+    dirs = fs.readdirSync(projects);
+  } catch {
+    return null;
+  }
+  for (const d of dirs) {
+    const f = path.join(projects, d, `${conversationId}.jsonl`);
+    if (fs.existsSync(f)) return f;
+  }
+  return null;
+}
+
+function tokens(n: number): string {
+  if (n >= 1_000_000 && n % 1_000_000 === 0) return `${n / 1_000_000}M`;
+  return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
+}
+
+function meterText(m: MeterResult | null): string {
+  if (!m) return "context unknown (no transcript found)";
+  if (m.contextTokens === null) return "context unknown (no usage in the transcript)";
+  const comp = `${m.compactions} compaction${m.compactions === 1 ? "" : "s"}`;
+  if (m.window === null || m.fraction === null) return `context ${tokens(m.contextTokens)}, window unknown, ${comp}`;
+  return `context ${tokens(m.contextTokens)}/${tokens(m.window)} (${Math.round(m.fraction * 100)}%, ${m.level}), ${comp}`;
+}
+
+type FleetRow = {
+  agent_name: string | null;
+  conversation_id: string;
+  cwd: string | null;
+  status: "live" | "needs-resume" | "unverifiable";
+};
+
+/**
+ * ADR-0040 restart lines. Built from the RECORD, never from a request, and every
+ * field goes through validateLineFields + shellQuote. A row that fails gets a
+ * comment naming why, and NO line. Everything that is not a command is a `#`
+ * comment, so pasting the whole output runs only the checked lines.
+ *
+ * The line reproduces the persona launchers' launch intent (`RELAY_AGENT_NAME=<name>
+ * claude …`, MEASURED in ~/.zshrc) and resumes the recorded conversation. NO
+ * --model: a Claude transcript records `claude-opus-5-5` without its `[1m]` window
+ * (MEASURED), so a --model taken from it could reopen a 900k conversation in a
+ * 200k window.
+ */
+function renderLines(rows: FleetRow[], dbPath: string): string {
+  if (rows.length === 0) return `# No window bindings recorded yet in ${commentSafe(dbPath)}\n`;
+  const out: string[] = [];
+  for (const r of rows) {
+    const who = commentSafe(r.agent_name ?? "(unnamed)");
+    const conv = commentSafe(r.conversation_id);
+    const file = findTranscript(r.conversation_id);
+    let meter: MeterResult | null = null;
+    if (file) {
+      try {
+        meter = readTranscriptMeter(file);
+      } catch {
+        meter = null;
+      }
+    }
+    out.push(`# ${who}  ${r.status}  ${conv}  ${meterText(meter)}`);
+    if (r.status === "live") {
+      out.push(`# ${who}: already open, do not paste (a second window would claim the same identity)`);
+      continue;
+    }
+    if (r.status === "unverifiable") {
+      out.push(`# ${who}: no line: liveness unverifiable (another host, or an unreadable anchor), so it may still be open`);
+      continue;
+    }
+    const v = validateLineFields(
+      {
+        conversationId: r.conversation_id,
+        name: r.agent_name,
+        folder: r.cwd ?? "",
+        parentThreadId: meter && meter.subagent ? (meter.resumeTarget ?? "(parent unknown)") : null,
+      },
+      { allowedRoots: [os.homedir()], knownModels: [] },
+    );
+    if (!v.ok) {
+      out.push(`# ${who}: no line: ${commentSafe(v.reasons.join("; "))}`);
+      continue;
+    }
+    const f = v.fields;
+    const intent = f.name ? `RELAY_AGENT_NAME=${shellQuote(f.name)} ` : "";
+    out.push(`cd ${shellQuote(f.folder)} && ${intent}claude --resume ${f.conversationId}`);
+  }
+  return out.join("\n") + "\n";
 }
 
 export async function run(argv: string[]): Promise<number> {
@@ -159,6 +275,11 @@ export async function run(argv: string[]): Promise<number> {
 
     if (args.json) {
       process.stdout.write(JSON.stringify(rows, null, 2) + "\n");
+      return 0;
+    }
+
+    if (args.lines) {
+      process.stdout.write(renderLines(rows, dbPath));
       return 0;
     }
 
