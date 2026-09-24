@@ -469,3 +469,69 @@ describe("ADR-0036 S3-lite — rebindAgentToWindow: release-then-claim under CAS
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. ROW 1'S REAL SEQUENCE — this window is ALREADY bound (its own startup)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `ai` fires SessionStart(startup) with a fresh conversation id BEFORE the user types
+// `/resume C`, so by the time the continuity claim runs, THIS anchor already holds a
+// current (unnamed) binding. Every fixture above used a fresh anchor, so none of them
+// could see what happens here. The partial unique index allows ONE current row per
+// anchor: the claim must supersede this window's own row, in the same transaction.
+
+describe("ADR-0036 S3-lite — rebind when THIS window already holds a binding (row 1 as it really happens)", () => {
+  it("supersedes this window's own startup binding and leaves exactly one current row for the anchor", async () => {
+    await seedPriorBinding();
+    const { registerAgent, getAgentAuthData, rebindAgentToWindow, upsertAgentBinding, getCurrentBinding } =
+      await import("../src/db.js");
+    registerAgent("s3-x", "builder", []);
+    const before = getAgentAuthData("s3-x")!;
+
+    const db = await openDb();
+    try {
+      // The window's own startup bind: unnamed, fresh conversation.
+      upsertAgentBinding(db, {
+        ...NEW_ANCHOR,
+        agentName: null,
+        agentClass: null,
+        conversationId: "eeeeeeee-1111-2222-3333-444444444444",
+        conversationTitle: null,
+        cwd: "/tmp/s3-project",
+        boundVia: "transient",
+      });
+      const startupRow = getCurrentBinding(db, NEW_ANCHOR)!;
+
+      const r = rebindAgentToWindow(db, {
+        agentName: "s3-x",
+        conversationId: CONV,
+        newAnchor: NEW_ANCHOR,
+        cwd: "/tmp/s3-project",
+        expected: {
+          bindingId: "unused-in-assertion",
+          bindingVersion: 1,
+          sessionId: before.session_id,
+          agentPid: before.agent_pid ?? null,
+          agentPidStart: before.agent_pid_start ?? null,
+        },
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+
+      const current = (db as unknown as { prepare(s: string): { all(...a: unknown[]): unknown[] } })
+        .prepare(
+          "SELECT binding_id, agent_name, conversation_id FROM agent_bindings " +
+            "WHERE host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL",
+        )
+        .all(NEW_ANCHOR.hostId, NEW_ANCHOR.windowPid, NEW_ANCHOR.windowPidStart) as Array<Record<string, unknown>>;
+      expect(current, "exactly one current row for this window").toHaveLength(1);
+      expect(current[0].agent_name).toBe("s3-x");
+      expect(current[0].conversation_id).toBe(CONV);
+      const old = (db as unknown as { prepare(s: string): { get(...a: unknown[]): unknown } })
+        .prepare("SELECT superseded_at, supersede_reason FROM agent_bindings WHERE binding_id = ?")
+        .get(startupRow.binding_id) as { superseded_at: string | null; supersede_reason: string | null };
+      expect(old.superseded_at, "this window's startup row is history now").not.toBeNull();
+    } finally {
+      (db as unknown as { close(): void }).close();
+    }
+  });
+});

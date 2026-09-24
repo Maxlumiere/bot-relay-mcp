@@ -3645,6 +3645,18 @@ export function rebindAgentToWindow(db: CompatDatabase, input: RebindAgentToWind
       throw new Error("rebind-cas-lost");
     }
 
+    // 2b. SUPERSEDE THIS WINDOW'S OWN current binding, if it has one. Row 1 as it
+    //     really happens: `ai` fires SessionStart(startup) with a fresh conversation
+    //     BEFORE `/resume C`, so this anchor already holds a current (unnamed) row,
+    //     and the partial unique index allows one current row per anchor. Without
+    //     this the INSERT below failed with UNIQUE constraint (MEASURED), so row 1
+    //     could never succeed. No CAS: it is this window's own row, and 0 or 1
+    //     changed rows are both correct.
+    db.prepare(
+      "UPDATE agent_bindings SET superseded_at = ?, superseded_by = ?, supersede_reason = 'continuity' " +
+        "WHERE host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL",
+    ).run(ts, newBindingId, newAnchor.hostId, newAnchor.windowPid, newAnchor.windowPidStart);
+
     // 3. INSERT the new current binding for THIS window.
     db.prepare(
       "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, agent_class, conversation_id, " +
