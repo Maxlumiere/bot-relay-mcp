@@ -4,6 +4,7 @@
 // See LICENSE for full terms.
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import { ownDeadWindow, OWN_DEAD_ANCHOR } from "./_helpers/own-dead-window.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -180,6 +181,7 @@ describe("v2.1.3 I5 — NAME_COLLISION_ACTIVE on live session + wrong token", ()
     // Seed + simulate SIGINT.
     const r = registerAgent("collider-4", "r", []);
     const sid = r.agent.session_id!;
+    ownDeadWindow("collider-4");
     performAutoUnregister("collider-4", sid, "SIGTERM");
 
     // Row is preserved; session_id is NULL. (v2.15.2: the signal path stores a

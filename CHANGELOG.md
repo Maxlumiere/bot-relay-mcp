@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed — a closing window could end the session of a different, live window with the same agent name (ADR-0042 R1)
+
+Measured on 24 Sep: when an agent's old window closed, its relay connector ended the agent's session even though a new window had already taken over the row and was still running. Both connectors had captured the same session id, so the session compare-and-swap matched and protected nothing. The live window was left with no session.
+
+A connector now ends a session only when:
+- the agent's row is anchored to that connector's own window (same host, process id and start time); and
+- that window is positively dead.
+
+If the anchor belongs to another window, is alive, or can't be verified, nothing is written. Leaving the session set is harmless there, because liveness is derived when the row is read, and a dead window already shows as dead. The probe-cache eviction still happens on every path, including the no-write ones.
+
+Test: `tests/adr-0042-r1-anchor-cas-ending.test.ts`. The measured case (a foreign connector, with the live window holding the row) was red on the old code. The existing signal-teardown tests now set up the one allowed case, a row anchored to the connector's own dead window, and their assertions are unchanged.
+
 ### Fixed — `get_messages(ack=true)` reported an ack the database never made, when the agent had no session (ADR-0041)
 
 Measured live: `get_messages(status="pending", ack=true)` replied `acked: true, resolved_count: 1`, yet the message kept `resolved_at`, `read_at` and `read_by_session` NULL and came back on the next drain. `last_drain_at` stayed frozen too. It happened to any agent whose `session_id` is NULL.

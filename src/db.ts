@@ -11,7 +11,7 @@ import os from "os";
 // "type":"module", so a bare `require(...)` is undefined at runtime — importing
 // createRequire from "module" is the supported way to do a sync require in ESM.
 import { createRequire } from "module";
-import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised } from "./liveness.js";
+import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised, anchorLivenessVerdict } from "./liveness.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -3634,26 +3634,60 @@ export function endAgentSessionOnSignal(
   name: string,
   expectedSessionId: string,
   signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null = null,
+  // ADR-0042 R1: the ending connector's OWN parent anchor (the window it lives in).
+  // Absent → the connector cannot prove the row is its window's → write nothing.
+  ownAnchor: { pid: number; startedAt: string } | null = null,
 ): { changed: boolean } {
   const db = getDb();
   const nowMs = Date.now();
-  const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'idle', busy_expires_at = NULL, " +
-    "signal_received_at = ?, signal_kind = ?, " +
-    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
-    "WHERE name = ? AND session_id = ?"
-  ).run(nowMs, signalKind, name, expectedSessionId);
-  // v2.23.x #140 — the FIFTH site, and the one four reviewers missed because it
-  // was BRACED (looked correct). Same defect as the four unbraced ones: on a CAS
-  // loser (r.changes===0 — a concurrent rebind already moved the session/anchor)
-  // the guarded `if` left a stale NEGATIVE entry intact, so the fresh live row
-  // read `dead`, or its argv-scan alive signal was SUPPRESSED (computeLiveness-
-  // Verdict returns at the negative-cache hit before reaching the argv probe),
-  // until the ~5s TTL. UNCONDITIONAL dual eviction — a CAS loser must not retain
-  // a verdict about a binding it failed to mutate (≤ one extra probe).
-  _negativeProbeCache.delete(name);
-  _positiveProbeCache.delete(name);
-  return { changed: r.changes === 1 };
+  // ADR-0042 R1 — only the window that HOLDS the row may end its session. The
+  // session CAS below protected nothing (MEASURED 24 Sep): an old window's
+  // connector and the new window's connector had captured the SAME session id, so
+  // the old one's signal ended the live window's session. The row must be anchored
+  // to MY parent (same host, pid and start), AND that anchor must be POSITIVELY
+  // DEAD (anchorLivenessVerdict: foreign host, alive, or unverifiable all refuse).
+  // Writing nothing is safe: read-time derivation already shows a dead anchor dead.
+  try {
+    if (!ownAnchor) return { changed: false };
+    const hostId = getOwnHostId();
+    const row = db
+      .prepare("SELECT host_id, agent_pid, agent_pid_start FROM agents WHERE name = ? AND session_id = ?")
+      .get(name, expectedSessionId) as
+      | { host_id: string | null; agent_pid: number | null; agent_pid_start: string | null }
+      | undefined;
+    if (!row) return { changed: false };
+    if (
+      !hostId ||
+      row.host_id !== hostId ||
+      row.agent_pid !== ownAnchor.pid ||
+      row.agent_pid_start !== ownAnchor.startedAt
+    ) {
+      return { changed: false };
+    }
+    if (anchorLivenessVerdict(row, hostId) !== "dead") return { changed: false };
+    const r = db.prepare(
+      "UPDATE agents SET session_id = NULL, agent_status = 'idle', busy_expires_at = NULL, " +
+      "signal_received_at = ?, signal_kind = ?, " +
+      "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
+      // CAS on the ANCHOR we just verified as well as the session, so a rebind
+      // between the check and this write makes it a no-op.
+      "WHERE name = ? AND session_id = ? AND host_id = ? AND agent_pid = ? AND agent_pid_start = ?"
+    ).run(nowMs, signalKind, name, expectedSessionId, hostId, ownAnchor.pid, ownAnchor.startedAt);
+    return { changed: r.changes === 1 };
+  } finally {
+    // v2.23.x #140 — the FIFTH site, and the one four reviewers missed because it
+    // was BRACED (looked correct). Same defect as the four unbraced ones: on a CAS
+    // loser (r.changes===0 — a concurrent rebind already moved the session/anchor)
+    // the guarded `if` left a stale NEGATIVE entry intact, so the fresh live row
+    // read `dead`, or its argv-scan alive signal was SUPPRESSED (computeLiveness-
+    // Verdict returns at the negative-cache hit before reaching the argv probe),
+    // until the ~5s TTL. UNCONDITIONAL dual eviction — a CAS loser must not retain
+    // a verdict about a binding it failed to mutate (≤ one extra probe). ADR-0042
+    // R1 added early no-write returns, so the eviction lives in `finally`: EVERY
+    // path, written or not, evicts.
+    _negativeProbeCache.delete(name);
+    _positiveProbeCache.delete(name);
+  }
 }
 
 /**

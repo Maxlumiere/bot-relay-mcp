@@ -27,8 +27,13 @@
  *     hang fails loudly as a timeout instead of asserting against a
  *     null exitCode from a process that simply hadn't exited yet
  *     (the exact CI flake this replaced: `expected null to be 130`).
- *  6. Read the DB and assert `signal_received_at` (epoch ms) +
- *     `signal_kind` (string) are populated correctly.
+ *  6. Read the DB. ADR-0042 R1 (24 Sep): a connector may end the session only
+ *     when the row is anchored to ITS OWN window and that window is positively
+ *     dead. Here the connector's parent is the live test runner (or undetectable,
+ *     in CI), so a real signal must write NOTHING: no stamp, and the session is
+ *     untouched. This is the measured failure at the OS level: a live window's
+ *     session ended by a signal to a connector that did not hold it. The positive
+ *     (own dead window) path is pinned by tests/adr-0042-r1-anchor-cas-ending.
  *
  * Skipped on win32 — POSIX signals only.
  */
@@ -224,6 +229,7 @@ function readAgentSignalCols(name: string): {
   signal_received_at: number | null;
   signal_kind: string | null;
   agent_status: string | null;
+  session_id: string | null;
 } {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const Better = require("better-sqlite3");
@@ -231,7 +237,7 @@ function readAgentSignalCols(name: string): {
   try {
     const row = db
       .prepare(
-        "SELECT signal_received_at, signal_kind, agent_status FROM agents WHERE name = ?",
+        "SELECT signal_received_at, signal_kind, agent_status, session_id FROM agents WHERE name = ?",
       )
       .get(name) as {
       signal_received_at: number | null;
@@ -248,13 +254,12 @@ function readAgentSignalCols(name: string): {
 }
 
 describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
-  it("(SH1) real SIGHUP fires installAutoUnregister and stamps signal_received_at + signal_kind='SIGHUP'", async () => {
+  it("(SH1) real SIGHUP reaches the shipped handler (exit 129) and, with a LIVE parent, ends NOTHING (ADR-0042 R1)", async () => {
     const NAME = "v2-8-sighup-target";
     const SID = "session-sighup-1";
     await seedAgent(NAME, SID);
     daemon = await startDaemonWithStdioTransport(NAME);
     expect(daemon.pid).toBeTypeOf("number");
-    const beforeMs = Date.now();
     daemon.kill("SIGHUP");
     const exit = await waitForExit(daemon);
     expect(
@@ -266,30 +271,12 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
       "SIGHUP should exit with code 129 (128 + signal number 1)",
     ).toBe(129);
     const row = readAgentSignalCols(NAME);
-    expect(
-      row.signal_kind,
-      "signal_kind must be 'SIGHUP' after SIGHUP delivery",
-    ).toBe("SIGHUP");
-    expect(
-      row.signal_received_at,
-      "signal_received_at must be populated",
-    ).not.toBeNull();
-    expect(
-      row.signal_received_at,
-      "signal_received_at must be a recent epoch ms",
-    ).toBeGreaterThanOrEqual(beforeMs);
-    expect(row.signal_received_at).toBeLessThanOrEqual(Date.now() + 1000);
-    expect(
-      row.agent_status,
-      "v2.15.2: signal stamps forensics but stores a NEUTRAL 'idle' (no sticky " +
-        "terminal status — a stored 'closed'/'offline' would phantom a " +
-        "surviving/relaunched agent). getAgents derives 'unknown' with the " +
-        "anchor cleared; the dashboard derives 'closed' from the stamp + " +
-        "non-alive liveness.",
-    ).toBe("idle");
+    expect(row.session_id, "a signal to a connector whose window is alive must not end the session").toBe(SID);
+    expect(row.signal_kind, "nothing written: no forensic stamp either").toBeNull();
+    expect(row.signal_received_at).toBeNull();
   }, 15_000);
 
-  it("(SH2) SIGINT stamps signal_kind='SIGINT' (regression — pre-v2.8 path still works)", async () => {
+  it("(SH2) real SIGINT reaches the handler (exit 130) and, with a LIVE parent, ends NOTHING (ADR-0042 R1)", async () => {
     const NAME = "v2-8-sigint-target";
     const SID = "session-sigint-1";
     await seedAgent(NAME, SID);
@@ -302,12 +289,11 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
     ).toBeNull();
     expect(exit.code).toBe(130);
     const row = readAgentSignalCols(NAME);
-    expect(row.signal_kind).toBe("SIGINT");
-    expect(row.signal_received_at).not.toBeNull();
-    expect(row.agent_status).toBe("idle"); // v2.15.2 — stored neutral, not sticky 'closed'
+    expect(row.session_id).toBe(SID);
+    expect(row.signal_kind).toBeNull();
   }, 15_000);
 
-  it("(SH3) SIGTERM stamps signal_kind='SIGTERM' (regression)", async () => {
+  it("(SH3) real SIGTERM reaches the handler (exit 143) and, with a LIVE parent, ends NOTHING (ADR-0042 R1)", async () => {
     const NAME = "v2-8-sigterm-target";
     const SID = "session-sigterm-1";
     await seedAgent(NAME, SID);
@@ -320,8 +306,7 @@ describe.skipIf(SKIP_PLATFORM)("v2.8 — SIGHUP handler integration", () => {
     ).toBeNull();
     expect(exit.code).toBe(143);
     const row = readAgentSignalCols(NAME);
-    expect(row.signal_kind).toBe("SIGTERM");
-    expect(row.signal_received_at).not.toBeNull();
-    expect(row.agent_status).toBe("idle"); // v2.15.2 — stored neutral, not sticky 'closed'
+    expect(row.session_id).toBe(SID);
+    expect(row.signal_kind).toBeNull();
   }, 15_000);
 });
