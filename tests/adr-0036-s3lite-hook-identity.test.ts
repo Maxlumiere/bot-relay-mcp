@@ -7,17 +7,19 @@
  * ADR-0036 S3-lite — the SessionStart hook takes its identity from the BIND
  * RESULT (victra rulings A and B, provisional pending architect).
  *
- * A: the hook used to register as the env name ("default" for an `ai` window)
- *    BEFORE bind, and show mail for that name AFTER. So a window that bind had just
- *    made X read "[RELAY] reclaimed X" followed by a mailbox header for "default":
- *    a false statement about who the window is. Now a claim makes the hook continue
- *    as X.
+ * A (architect ruling: RESOLVE FIRST, ACT ONCE): bind runs FIRST and its result
+ *    is the only name every later step uses. The hook used to register as the env
+ *    name ("default" for an `ai` window) BEFORE bind: two name sources in one run,
+ *    and a register before the takeover was adjudicated. Now a claim makes the hook
+ *    X with NO register (the rebind was the identity write); a named launch intent
+ *    registers; a transient registers nothing; if bind cannot run, only a REAL env
+ *    name is used, loudly.
  * B: a window that is nobody (no env name, no spawn manifest, no config default)
  *    no longer registers the shared "default" row (measured live today, pid 94194,
  *    with unnamed `ai` windows piling into it). It gets a transient LABEL in
  *    agent_bindings only, and the hook says plainly that it has no relay identity.
- *    An EXPLICIT RELAY_AGENT_NAME=default is a deliberate choice and still
- *    registers.
+ *    That includes an explicit RELAY_AGENT_NAME=default (architect: never register
+ *    default).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
@@ -131,7 +133,7 @@ describe("S3-lite ruling B — a window that is nobody does not register as 'def
       expect(d.calls.filter((c) => c.startsWith("register_agent")), r.stdout + r.stderr).toEqual([]);
       expect(r.stdout).not.toMatch(/Pending messages for default/);
       expect(r.stdout).toMatch(/no relay identity/i);
-      expect(r.stdout).toMatch(/tmp-proj-[0-9a-f]{4}/);
+      expect(r.stdout).toMatch(/tmp:proj:[0-9a-f]{4}/);
     });
   }, 30_000);
 
@@ -142,10 +144,11 @@ describe("S3-lite ruling B — a window that is nobody does not register as 'def
     });
   }, 30_000);
 
-  it("CONTROL: an EXPLICIT RELAY_AGENT_NAME=default is a deliberate choice and still registers", async () => {
+  it("an EXPLICIT RELAY_AGENT_NAME=default is nobody too: architect ruled 'never register default'", async () => {
     await withStub(async (d) => {
-      await runHook(d.port, "startup", { RELAY_AGENT_NAME: "default" });
-      expect(d.calls).toContain("register_agent:default");
+      const r = await runHook(d.port, "startup", { RELAY_AGENT_NAME: "default" });
+      expect(d.calls.filter((c) => c.startsWith("register_agent")), r.stdout + r.stderr).toEqual([]);
+      expect(r.stdout).toMatch(/no relay identity/i);
     });
   }, 30_000);
 });
@@ -184,6 +187,36 @@ describe("S3-lite ruling A — after a claim, the hook IS the claimed identity",
       expect(r.stdout).toContain("welcome back, hook-x");
       expect(r.stdout).not.toMatch(/for default/);
       expect(d.calls.filter((c) => c.startsWith("register_agent"))).toEqual([]);
+    });
+  }, 30_000);
+});
+
+describe("S3-lite ruling A — when bind cannot run, only a REAL launch-intent name is used, loudly", () => {
+  async function breakBind(): Promise<void> {
+    // A below-range schema: bind refuses (schema not migrated) before recording.
+    const { closeDb, getDb } = await import("../src/db.js");
+    closeDb();
+    process.env.RELAY_DB_PATH = DB;
+    getDb().prepare("UPDATE schema_info SET version = 24 WHERE id = 1").run();
+    closeDb();
+  }
+
+  it("named window + bind refused → registers its launch intent, says so on stdout, verdict DEGRADED naming bind", async () => {
+    await breakBind();
+    await withStub(async (d) => {
+      const r = await runHook(d.port, "startup", { RELAY_AGENT_NAME: "hook-fallback" });
+      expect(d.calls).toContain("register_agent:hook-fallback");
+      expect(r.stdout).toMatch(/launch intent ALONE/);
+      expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*bind[^"]*"/);
+    });
+  }, 30_000);
+
+  it("UNNAMED window + bind refused → registers NOTHING (never falls back to 'default')", async () => {
+    await breakBind();
+    await withStub(async (d) => {
+      const r = await runHook(d.port, "startup", { RELAY_AGENT_NAME: undefined });
+      expect(d.calls.filter((c) => c.startsWith("register_agent")), r.stdout + r.stderr).toEqual([]);
+      expect(r.stdout).not.toMatch(/Pending messages for default/);
     });
   }, 30_000);
 });

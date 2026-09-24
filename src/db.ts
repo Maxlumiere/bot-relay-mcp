@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
+import { isTransientName } from "./binding.js";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
@@ -5722,6 +5723,9 @@ export function sendMessage(
   disposition: string = "log",
   deadline: string | null = null
 ): MessageRecord {
+  // ADR-0036 S3-lite (B2): refused BEFORE the system bypass and before the
+  // non-agent (human) lane, so no transport can park mail at a window label.
+  if (isTransientName(to)) throw new TransientRecipientError(to);
   const db = getDb();
 
   // v2.1.3 (I9 bonus): verify the sender row exists BEFORE inserting. Pre-
@@ -6868,6 +6872,7 @@ export function postTask(
   priority: string,
   schemaId?: string
 ): TaskRecord {
+  if (isTransientName(to)) throw new TransientRecipientError(to); // ADR-0036 S3-lite (B2)
   const db = getDb();
   touchAgent(from);
 
@@ -7007,6 +7012,17 @@ export class ForcePreconditionError extends Error {
  * Classified as `SENDER_NOT_REGISTERED` by handleSendMessage; caller should
  * re-register the sender name and retry.
  */
+/** ADR-0036 S3-lite (B2): mail or a task addressed to a transient window label. */
+export class TransientRecipientError extends Error {
+  constructor(to: string) {
+    super(
+      `"${to}" is a transient window label, not an agent: it has no inbox, and nothing sent to it would ever be ` +
+        `read. Find the window's agent with \`relay fleet\`, or give the window a name (RELAY_AGENT_NAME) and send to that.`,
+    );
+    this.name = "TransientRecipientError";
+  }
+}
+
 export class SenderNotRegisteredError extends Error {
   constructor(name: string) {
     super(

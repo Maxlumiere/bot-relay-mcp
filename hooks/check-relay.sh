@@ -217,10 +217,10 @@ fi
 # that is still NOBODY after env + spawn manifest + config is UNNAMED. It no
 # longer registers the shared "default" row, which unnamed `ai` windows piled into
 # (measured live 24 Sep). Bind gives it a transient LABEL in agent_bindings only,
-# and the hook says it has no relay identity. An EXPLICIT RELAY_AGENT_NAME=default
-# is a deliberate choice and keeps the old path.
+# and the hook says it has no relay identity. That includes an explicit
+# RELAY_AGENT_NAME=default: "default" is never registered (ruling A).
 RELAY_UNNAMED=0
-if [ -z "${RELAY_AGENT_NAME:-}" ] && [ "$AGENT_NAME" = "default" ]; then
+if [ "$AGENT_NAME" = "default" ]; then
   RELAY_UNNAMED=1
 fi
 
@@ -263,6 +263,86 @@ if [ -z "$RESOLVED_DB_PATH" ] || { [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ 
   exit 0
 fi
 DB_PATH="$RESOLVED_DB_PATH"
+
+# --- ADR-0036 S3-lite: RESOLVE FIRST, ACT ONCE (ruling A) ----------------------
+# Bind runs HERE, before anything acts on a name, and its result is the ONLY name
+# every later step uses: register, mail and task notice, announcement, verdict.
+# Two name sources in one hook run is the split-writer class, and registering
+# before adjudicating is the takeover door.
+#   claimed X (continuity) → the window IS X. The rebind was the identity write:
+#                            no register (act once).
+#   a named launch intent  → that name; register as today.
+#   a transient label      → nobody. No register, no mailbox, said plainly.
+#   bind could not run     → the env name ONLY if it is a real name, with a loud
+#                            degraded notice. Never "default".
+# The announcement and any refusal are PRINTED later, where they always were
+# ("who am I" just before "what is waiting").
+RELAY_BIND_RAN=0
+RELAY_BIND_RC=1
+RELAY_BIND_OUT=""
+RELAY_BIND_ERR=""
+RELAY_BIND_ACTION=""
+RELAY_BIND_NAME=""
+RELAY_BIND_ANNOUNCE=""
+RELAY_BIND_CLAIMED=0
+RELAY_BIND_FALLBACK=0
+RELAY_TRANSIENT_LABEL=""
+if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
+  RELAY_BIND_RAN=1
+  RELAY_BIND_BIN="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+  RELAY_BIND_ERRFILE="$(mktemp 2>/dev/null || printf '')"
+  if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1; then
+    # Bind reads the launch intent from RELAY_AGENT_NAME: hand it the name this
+    # hook resolved (env, spawn manifest or config), or none at all.
+    if [ "$RELAY_UNNAMED" -eq 1 ]; then
+      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | env -u RELAY_AGENT_NAME node "$RELAY_BIND_BIN" bind --json 2>"${RELAY_BIND_ERRFILE:-/dev/null}")
+    else
+      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | RELAY_AGENT_NAME="$AGENT_NAME" node "$RELAY_BIND_BIN" bind --json 2>"${RELAY_BIND_ERRFILE:-/dev/null}")
+    fi
+    RELAY_BIND_RC=$?
+    [ -n "$RELAY_BIND_ERRFILE" ] && RELAY_BIND_ERR=$(cat "$RELAY_BIND_ERRFILE" 2>/dev/null || printf '')
+  else
+    RELAY_BIND_RC=127
+    RELAY_BIND_ERR="BIND_FAILED: no runnable relay CLI beside this hook (looked for $RELAY_BIND_BIN)"
+  fi
+  [ -n "$RELAY_BIND_ERRFILE" ] && rm -f "$RELAY_BIND_ERRFILE" 2>/dev/null
+  if [ "$RELAY_BIND_RC" -eq 0 ] && command -v perl >/dev/null 2>&1; then
+    # A real JSON parse (perl core JSON::PP), top-level keys only. Unit Separator
+    # between fields; the announce is collapsed to one line.
+    RELAY_BIND_PARSED=$(printf '%s' "$RELAY_BIND_OUT" | perl -MJSON::PP -e '
+      my $d = eval { JSON::PP->new->decode(do { local $/; <STDIN> }) };
+      exit 0 unless ref($d) eq "HASH";
+      my @f = map { my $v = $d->{$_}; defined $v && !ref $v ? $v : "" } qw(action agent_name announce);
+      $f[2] =~ s/[\r\n]+/ /g;
+      print join("\x1f", @f);
+    ' 2>/dev/null || printf '')
+    RELAY_BIND_ACTION="${RELAY_BIND_PARSED%%$'\x1f'*}"
+    _rest="${RELAY_BIND_PARSED#*$'\x1f'}"
+    RELAY_BIND_NAME="${_rest%%$'\x1f'*}"
+    RELAY_BIND_ANNOUNCE="${_rest#*$'\x1f'}"
+  fi
+  case "$RELAY_BIND_NAME" in
+    tmp:*)
+      # A transient LABEL: this window is nobody.
+      RELAY_TRANSIENT_LABEL="$RELAY_BIND_NAME"
+      RELAY_UNNAMED=1
+      ;;
+    "")
+      # Bind did not resolve a name. Fall back to the launch intent only if it is
+      # a real name; an unnamed window stays nobody.
+      if [ "$RELAY_BIND_RC" -ne 0 ] && [ "$RELAY_UNNAMED" -eq 0 ]; then
+        RELAY_BIND_FALLBACK=1
+      fi
+      ;;
+    *)
+      if [[ "$RELAY_BIND_NAME" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+        AGENT_NAME="$RELAY_BIND_NAME"
+        RELAY_UNNAMED=0
+        [ "$RELAY_BIND_ACTION" = "claimed" ] && RELAY_BIND_CLAIMED=1
+      fi
+      ;;
+  esac
+fi
 
 # --- SELF-DIAGNOSING MUTE DETECTION -----------------------------------------
 # Standing rule: a failure that presents as normal operation must be converted
@@ -730,9 +810,10 @@ SQL
   fi
 fi
 
-# Ruling B: nobody registers as nobody. (A continuity claim in the bind below
-# moves an EXISTING identity to this window; that needs no register either.)
-if [ "$RELAY_UNNAMED" -eq 1 ]; then
+# Ruling B: nobody registers as nobody. Ruling A: a continuity claim already
+# moved the identity to this window (rotated session, stamped anchor); a register
+# on top would be a second act on the same identity.
+if [ "$RELAY_UNNAMED" -eq 1 ] || [ "$RELAY_BIND_CLAIMED" -eq 1 ]; then
   SKIP_REGISTER=1
 fi
 
@@ -913,44 +994,14 @@ fi
 #                         check the path).
 # STREAM DISCIPLINE: the announcement is stdout (it is context); every refusal is
 # stderr. The one-VERDICT-line contract on stdout is unchanged.
-if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
-  RELAY_BIND_BIN="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
-  RELAY_BIND_OUT=""
-  RELAY_BIND_ERR=""
-  RELAY_BIND_RC=1
-  RELAY_BIND_ERRFILE="$(mktemp 2>/dev/null || printf '')"
-  if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1; then
-    if [ -n "$RELAY_BIND_ERRFILE" ]; then
-      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | node "$RELAY_BIND_BIN" bind 2>"$RELAY_BIND_ERRFILE")
-      RELAY_BIND_RC=$?
-      RELAY_BIND_ERR=$(cat "$RELAY_BIND_ERRFILE" 2>/dev/null || printf '')
-      rm -f "$RELAY_BIND_ERRFILE" 2>/dev/null
-    else
-      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | node "$RELAY_BIND_BIN" bind 2>/dev/null)
-      RELAY_BIND_RC=$?
-    fi
-  else
-    RELAY_BIND_RC=127
-    RELAY_BIND_ERR="BIND_FAILED: no runnable relay CLI beside this hook (looked for $RELAY_BIND_BIN)"
-  fi
-
+if [ "$RELAY_BIND_RAN" -eq 1 ]; then
   if [ "$RELAY_BIND_RC" -eq 0 ]; then
-    # One line, already shaped as "[RELAY] bound <who> to conversation <id> (...)".
-    # Collapse any stray CR/LF so a crafted conversation title can never inject an
-    # extra stdout line into the verdict-only contract (same guard the wake-coverage
-    # line applies at this boundary).
-    RELAY_BIND_LINE=$(printf '%s' "$RELAY_BIND_OUT" | tr '\r\n' '  ')
+    # One line. Collapse any stray CR/LF so a crafted conversation title can never
+    # inject an extra stdout line into the verdict-only contract.
+    RELAY_BIND_LINE=$(printf '%s' "$RELAY_BIND_ANNOUNCE" | tr '\r\n' '  ')
     case "$RELAY_BIND_LINE" in
       "[RELAY]"*) printf '%s\n' "$RELAY_BIND_LINE" ;;
     esac
-    # Ruling A: the bind RESULT is who this window is. A continuity claim made it
-    # X, so everything below (mail, tasks) is X's, never the env name's.
-    RELAY_CLAIMED=$(printf '%s' "$RELAY_BIND_LINE" | sed -n 's/^\[RELAY\] reclaimed \([A-Za-z0-9_.-]\{1,64\}\) for this window .*/\1/p')
-    if [ -n "$RELAY_CLAIMED" ]; then
-      AGENT_NAME="$RELAY_CLAIMED"
-      RELAY_UNNAMED=0
-    fi
-    RELAY_TRANSIENT_LABEL=$(printf '%s' "$RELAY_BIND_LINE" | sed -n 's/^\[RELAY\] bound \(tmp-[a-z0-9-]\{1,59\}\) to conversation .*/\1/p')
   else
     # Loud, never silent — the operator sees WHY this window was not recorded.
     [ -n "$RELAY_BIND_ERR" ] && printf '%s\n' "$RELAY_BIND_ERR" >&2
@@ -963,6 +1014,12 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
       *"no schema_info table"*)
         RELAY_BIND_SCHEMA_REASON="bind failed: not an initialized relay DB, check RELAY_DB_PATH — this window is NOT recorded" ;;
     esac
+    if [ -z "$RELAY_BIND_SCHEMA_REASON" ] && [ "$RELAY_BIND_FALLBACK" -eq 1 ]; then
+      RELAY_BIND_SCHEMA_REASON="bind failed: identity taken from the launch intent \"$AGENT_NAME\" without a window record"
+    fi
+    if [ "$RELAY_BIND_FALLBACK" -eq 1 ]; then
+      echo "[RELAY] bind could not run, so this window is \"$AGENT_NAME\" on its launch intent ALONE: it is not recorded, and a /resume will not restore it."
+    fi
     if [ -n "$RELAY_BIND_SCHEMA_REASON" ] && command -v relay_verdict_set >/dev/null 2>&1; then
       case "$RELAY_VERDICT" in
         HEALTHY|DEGRADED)

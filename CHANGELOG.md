@@ -11,8 +11,16 @@
   - A named window never inherits, because its launch intent wins. Only `resume` looks.
 - **The claimed identity carries (row 8).** A window's identity is its binding, not its environment, so a later `/clear` binds the new conversation to X instead of dropping it.
 - **The rebind could never have worked as `ai` actually runs.** `ai` binds the window at startup before `/resume`, and the writer did not supersede that row, so its insert hit the one-current-row-per-window index. Fixed in the same transaction, with a test that starts from an already-bound window.
-- **Row 11, brought forward from S4 (provisional, pending the design review).** A window with no name from env, spawn manifest or config no longer registers the shared `default` agent. It gets a transient label `tmp-<folder>-<4hex>` that exists only in the fleet record: no agent row, no token, no inbox. The label is never inherited, and it stays the same through the window's own `/clear` and `/compact`. The hook says plainly that the window has no relay identity, instead of showing `default`'s mailbox. An explicit `RELAY_AGENT_NAME=default` keeps the old behaviour.
-- **The hook takes its identity from the bind result (provisional, pending the design review).** After a claim, the hook shows X's mail and tasks, never those of the name it started with.
+- **Row 11, brought forward from S4.** A window with no name from env, spawn manifest or config (an explicit `RELAY_AGENT_NAME=default` included) no longer registers the shared `default` agent. It gets a transient label `tmp:<folder>:<4hex>` that exists only in the fleet record: no agent row, no token, no inbox.
+  - The colons put the label outside the agent-name grammar by design. Seven real agents already hold `tmp-` names, and one of those is now correctly restored by `/resume`.
+  - The label is never inherited.
+  - It stays the same through the window's own `/clear`, `/resume` and `/compact`; a fork starts a new one.
+  - A message or task addressed to a label is refused with `RECIPIENT_IS_TRANSIENT`, rather than parked in the lane for non-agent recipients, where nobody would read it.
+  - The hook says plainly that the window has no relay identity.
+- **The hook binds first, and every step after uses that one result.** Previously the hook registered a name before bind decided who the window was.
+  - After a claim, the hook is X and does not register again: the claim already moved the identity.
+  - A named launch intent registers as before. A transient label registers nothing.
+  - If bind cannot run, the hook uses the environment name only if it is a real name, says so loudly, and marks the verdict DEGRADED.
 - **`relay bind` and `relay fleet` check the recorded schema version**, not whether a table exists. The supported range is v25 to `MAX_SUPPORTED_SCHEMA`. A test fails if a migration raises the schema version past that bound without a decision. Each of the three refusals names its own fix:
   - no `schema_info`: check the DB path;
   - below the range: "schema not migrated", let the new build open it;
@@ -22,8 +30,9 @@
 - Known adjacent value, left unchanged in this slice: `db.ts` still sets `busy_timeout = 5000` on the daemon and CLI handle. It is the same 5000 that caused the original 25–30s confusion. The bind path does not use it.
 - Tests:
   - `tests/adr-0036-s3lite-continuity-rebind.test.ts` (15)
-  - `tests/adr-0036-s3lite-bind-continuity.test.ts` (13)
-  - `tests/adr-0036-s3lite-hook-identity.test.ts` (4)
+  - `tests/adr-0036-s3lite-bind-continuity.test.ts` (16, including the one-window matrix: startup, resume, clear, resume, fork, compact)
+  - `tests/adr-0036-s3lite-hook-identity.test.ts` (6)
+  - `tests/adr-0036-s3lite-transient-recipient.test.ts` (4)
   - `tests/adr-0036-s3lite-schema-probe.test.ts` (17)
   - two new cases in `tests/adr-0036-s1-hook-bind-announce.test.ts`, and the drift guard in `tests/adr-0036-s1-bind-retry-budget.test.ts`
   Each red was checked for the right reason before it was banked, and each guard was mutated to prove it can fail.

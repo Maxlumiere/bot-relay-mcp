@@ -40,6 +40,11 @@ export const ERROR_CODES = {
    * deleted by relay recover / unregister_agent between dispatcher auth and
    * handler write). Caller should re-register before retrying. */
   SENDER_NOT_REGISTERED: "SENDER_NOT_REGISTERED",
+  /** ADR-0036 S3-lite (row 11, B2) — the recipient is a TRANSIENT window label
+   * (`tmp:<folder>:<4hex>`), which lives only in agent_bindings and has no inbox.
+   * Refused rather than parked in the non-agent (human) lane, where nobody would
+   * ever read it. */
+  RECIPIENT_IS_TRANSIENT: "RECIPIENT_IS_TRANSIENT",
   /** v2.1.4 (I11) — expand_capabilities called with a new_capabilities list
    * that would REMOVE one of the agent's existing caps. This tool is additive-
    * only; operators must unregister + re-register for reductions. */

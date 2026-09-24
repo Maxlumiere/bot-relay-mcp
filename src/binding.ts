@@ -272,12 +272,18 @@ export function resolveAgentName(envName: string | null | undefined): string | n
  * agent_bindings: never an agents row, never a token, never an inbox. So it is
  * not an identity, adds no auth surface, and needs no reaper.
  *
- * `tmp-<folder>-<4hex>`: the folder name so a human can tell windows apart in
+ * `tmp:<folder>:<4hex>`: the folder name so a human can tell windows apart in
  * `relay fleet`, and 4 random hex digits so two windows in the same folder
- * differ. The folder part is reduced to [a-z0-9-] so the label also passes the
- * ADR-0040 restart-line validator.
+ * differ.
+ *
+ * OUTSIDE AGENT_NAME_PATTERN BY CONSTRUCTION (architect ruling B1): the colons
+ * are not in [A-Za-z0-9_.-], so a transient label can never collide with, be
+ * registered as, or be addressed as a real agent. The first form, `tmp-…`, was
+ * inside the pattern, and 7 real agents already hold `tmp-` names (MEASURED on the
+ * live DB, 24 Sep). The folder part is reduced to [a-z0-9-]; it is still data, so
+ * any pasted line quotes it.
  */
-export const TRANSIENT_PREFIX = "tmp-";
+export const TRANSIENT_PREFIX = "tmp:";
 
 export function isTransientName(name: string | null | undefined): boolean {
   return typeof name === "string" && name.startsWith(TRANSIENT_PREFIX);
@@ -286,9 +292,12 @@ export function isTransientName(name: string | null | undefined): boolean {
 export function transientNameFor(cwd: string | null, randomHex4: () => string = () => randomBytes(2).toString("hex")): string {
   const base = (cwd ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "";
   const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "window";
-  const name = `${TRANSIENT_PREFIX}${slug}-${randomHex4()}`;
+  const hex = randomHex4();
+  if (!/^[0-9a-f]{4}$/.test(hex)) throw new Error(`transient label suffix ${JSON.stringify(hex)} is not 4 hex digits`);
+  const name = `${TRANSIENT_PREFIX}${slug}:${hex}`;
   // AGENT_NAME_PATTERN from types.ts, deliberately NOT a copy (binding.ts already
-  // carries one duplicate of it; flagged, not refactored here).
-  if (!AGENT_NAME_PATTERN.test(name)) throw new Error(`transient label ${JSON.stringify(name)} is not a valid name`);
+  // carries one duplicate of it; flagged, not refactored here). The label must
+  // FAIL it: that is what keeps a label out of every name-keyed path.
+  if (AGENT_NAME_PATTERN.test(name)) throw new Error(`transient label ${JSON.stringify(name)} would be a valid agent name`);
   return name;
 }

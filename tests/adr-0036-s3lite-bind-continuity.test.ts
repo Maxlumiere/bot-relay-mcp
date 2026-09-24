@@ -248,7 +248,7 @@ describe("S3-lite — relay bind claims a dead holder's identity on /resume (row
     expect(r.stdout).toMatch(new RegExp(`did not take ${PRIOR}`));
     expect(r.stdout).toMatch(/ALIVE/);
     expect(await agentRow(), "X is untouched").toEqual(before);
-    expect(String((await thisWindowBinding())?.agent_name), "recorded as itself: a transient label, not X").toMatch(/^tmp-/);
+    expect(String((await thisWindowBinding())?.agent_name), "recorded as itself: a transient label, not X").toMatch(/^tmp:/);
   }, 30_000);
 
   it("REFUSE: the holder is UNVERIFIABLE (another host) — unverifiable is not dead", async () => {
@@ -309,10 +309,10 @@ describe("S3-lite — the claimed identity CARRIES in the same window (row 8)", 
   }, 30_000);
 });
 
-const TRANSIENT = /^tmp-[a-z0-9-]+-[0-9a-f]{4}$/;
+const TRANSIENT = /^tmp:[a-z0-9-]+:[0-9a-f]{4}$/;
 
 describe("S3-lite row 11 — an unnamed window gets a TRANSIENT label, in agent_bindings only (victra ruling B)", () => {
-  it("startup without a name → binding labelled tmp-<cwd>-<4hex>, announced, and NO agents row", async () => {
+  it("startup without a name → binding labelled tmp:<cwd>:<4hex>, announced, and NO agents row", async () => {
     const r = runBind([], sessionStart("startup", N), UNNAMED);
     expect(r.status, r.stderr).toBe(0);
     const b = await thisWindowBinding();
@@ -335,7 +335,7 @@ describe("S3-lite row 11 — an unnamed window gets a TRANSIENT label, in agent_
       db.prepare(
         "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, agent_class, conversation_id, conversation_title, " +
           "cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at) " +
-          "VALUES ('t-1', 1, 'tmp-old-ab12', NULL, ?, NULL, '/tmp/old', ?, ?, 'Mon Sep 15 10:00:00 2026', 'transient', ?, ?)",
+          "VALUES ('t-1', 1, 'tmp:old:ab12', NULL, ?, NULL, '/tmp/old', ?, ?, 'Mon Sep 15 10:00:00 2026', 'transient', ?, ?)",
       ).run(C, getOwnHostId(), DEAD_PID, new Date().toISOString(), new Date().toISOString());
     });
 
@@ -345,7 +345,7 @@ describe("S3-lite row 11 — an unnamed window gets a TRANSIENT label, in agent_
     expect(r.stdout).not.toMatch(/reclaimed|did not take/);
     const b = await thisWindowBinding();
     expect(String(b?.agent_name)).toMatch(TRANSIENT);
-    expect(b?.agent_name, "this window gets its own label, not the dead window's").not.toBe("tmp-old-ab12");
+    expect(b?.agent_name, "this window gets its own label, not the dead window's").not.toBe("tmp:old:ab12");
   }, 30_000);
 
   it("the transient label CARRIES through /clear in the same window (row 8)", async () => {
@@ -354,4 +354,74 @@ describe("S3-lite row 11 — an unnamed window gets a TRANSIENT label, in agent_
     runBind([], sessionStart("clear", C2), UNNAMED);
     expect((await thisWindowBinding())?.agent_name).toBe(first);
   }, 30_000);
+});
+
+describe("S3-lite B1 — a transient label is OUTSIDE the agent-name grammar, so real tmp- agents are not mistaken for one", () => {
+  it("the label fails AGENT_NAME_PATTERN (cannot be registered or addressed as an agent)", async () => {
+    const { transientNameFor } = await import("../src/binding.js");
+    const { AGENT_NAME_PATTERN } = await import("../src/types.js");
+    for (const cwd of ["/Users/x/My Project", "/", "", "/tmp/a'b; rm -rf ~", "/x/ÜNÏCÖDË"]) {
+      const label = transientNameFor(cwd);
+      expect(label).toMatch(TRANSIENT);
+      expect(AGENT_NAME_PATTERN.test(label), label).toBe(false);
+    }
+  });
+
+  it("a REAL agent whose name starts with tmp- (7 exist live) is an identity: its dead window's conversation IS inherited", async () => {
+    const { getOwnHostId } = await import("../src/liveness.js");
+    process.env.RELAY_DB_PATH = TEST_DB_PATH;
+    const { registerAgent, closeDb, upsertAgentBinding } = await import("../src/db.js");
+    registerAgent("tmp-apollo-audit", "builder", []);
+    closeDb();
+    await raw((db) => {
+      db.prepare("UPDATE agents SET agent_pid = ?, agent_pid_start = ?, host_id = ? WHERE name = ?").run(
+        DEAD_PID, "Mon Sep 15 10:00:00 2026", getOwnHostId(), "tmp-apollo-audit");
+      upsertAgentBinding(db as never, {
+        hostId: getOwnHostId()!, windowPid: DEAD_PID, windowPidStart: "Mon Sep 15 10:00:00 2026",
+        agentName: "tmp-apollo-audit", agentClass: null, conversationId: C, conversationTitle: null,
+        cwd: "/tmp/prior", boundVia: "launch-intent",
+      });
+    });
+    const r = runBind([], sessionStart("resume", C), UNNAMED);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toMatch(/reclaimed tmp-apollo-audit/);
+  }, 30_000);
+});
+
+describe("S3-lite test matrix — ONE window, every re-fire (architect: reused anchors)", () => {
+  async function currentRowsForThisWindow(): Promise<number> {
+    const { detectAgentProcess, processStartedAt, getOwnHostId } = await import("../src/liveness.js");
+    const pid = detectAgentProcess()?.pid ?? process.pid;
+    const start = detectAgentProcess()?.startedAt ?? processStartedAt(pid);
+    return raw(
+      (db) =>
+        (db
+          .prepare(
+            "SELECT COUNT(*) AS c FROM agent_bindings WHERE host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL",
+          )
+          .get(getOwnHostId(), pid, start) as { c: number }).c,
+    );
+  }
+
+  it("startup → resume(claim X) → clear → resume own earlier conversation → fork → compact: one current row at every step, X kept until the fork", async () => {
+    const { getOwnHostId } = await import("../src/liveness.js");
+    await seedHolder({ hostId: getOwnHostId()!, pid: DEAD_PID, startedAt: "Mon Sep 15 10:00:00 2026" });
+    const F = "f0f0f0f0-1111-2222-3333-444444444444";
+    const steps: Array<[string, string, (name: string) => void]> = [
+      ["startup", N, (n) => expect(n).toMatch(TRANSIENT)],
+      ["resume", C, (n) => expect(n).toBe(PRIOR)],
+      ["clear", C2, (n) => expect(n).toBe(PRIOR)],
+      ["resume", C, (n) => expect(n, "resuming the window's own earlier conversation keeps X").toBe(PRIOR)],
+      ["fork", F, (n) => expect(n, "a fork never shares X (row 9)").toMatch(TRANSIENT)],
+      ["compact", F, (n) => expect(n).toMatch(TRANSIENT)],
+    ];
+    for (const [source, conv, check] of steps) {
+      const r = runBind([], sessionStart(source, conv), UNNAMED);
+      expect(r.status, `${source} ${conv}: ${r.stderr}`).toBe(0);
+      expect(await currentRowsForThisWindow(), `${source}: exactly one current row for this window`).toBe(1);
+      const b = await thisWindowBinding();
+      expect(b?.conversation_id, source).toBe(conv);
+      check(String(b?.agent_name));
+    }
+  }, 60_000);
 });

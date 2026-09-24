@@ -17,6 +17,7 @@ import {
   ResultSchemaViolationError,
   SchemaDocumentInvalidError,
   SchemaAlreadyExistsError,
+  TransientRecipientError,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import type { PostTaskInput, PostTaskAutoInput, UpdateTaskInput, GetTasksInput, GetTaskInput, WebhookEvent, RegisterTaskSchemaInput, TaskSchemaGetInput } from "../types.js";
@@ -69,7 +70,28 @@ function runHealthMonitor(triggeredBy: string): void {
 }
 
 export function handlePostTask(input: PostTaskInput) {
-  const task = postTask(input.from, input.to, input.title, input.description, input.priority, input.schema_id);
+  let task: ReturnType<typeof postTask>;
+  try {
+    task = postTask(input.from, input.to, input.title, input.description, input.priority, input.schema_id);
+  } catch (err) {
+    // ADR-0036 S3-lite (B2): a task for a transient window label has no assignee.
+    if (err instanceof TransientRecipientError) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              { success: false, error: err.message, error_code: ERROR_CODES.RECIPIENT_IS_TRANSIENT },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    throw err;
+  }
   fireWebhooks("task.posted", input.from, input.to, {
     task_id: task.id,
     task: {

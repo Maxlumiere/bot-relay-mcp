@@ -14,6 +14,7 @@ import {
   postToCapability,
   runHealthMonitorTick,
   SenderNotRegisteredError,
+  TransientRecipientError,
   getAgentSessionStart,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
@@ -105,6 +106,21 @@ export function handleSendMessage(input: SendMessageInput) {
       ],
     };
   } catch (err: any) {
+    if (err instanceof TransientRecipientError) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              { success: false, error: err.message, error_code: ERROR_CODES.RECIPIENT_IS_TRANSIENT },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
     // v2.1.3 (I9 bonus): surface SENDER_NOT_REGISTERED so callers can
     // re-register + retry instead of silently succeeding with a frozen
     // last_seen on a ghost row.

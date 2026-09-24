@@ -293,6 +293,9 @@ export async function run(argv: string[]): Promise<number> {
                     ok: true,
                     action: "claimed",
                     agent_name: claim.agentName,
+                    // The exact one-line announcement, so a JSON caller (the hook)
+                    // prints what a human would have read.
+                    announce: rebind.announce,
                     conversation_id: conversationId,
                     bound_via: "continuity",
                     binding_id: rebind.bindingId,
@@ -325,10 +328,13 @@ export async function run(argv: string[]): Promise<number> {
     // re-fire in the same window (resume, clear, compact) keeps it.
     const { isTransientName, transientNameFor } = await import("../binding.js");
     const currentName = agentName === null ? (getCurrentBinding(db, anchor)?.agent_name ?? null) : null;
+    // A FORK is a new conversation that never shares the parent's identity (row 9),
+    // so it starts transient. Every other re-fire in the same window (clear,
+    // resume back to its own earlier conversation, compact) keeps what the window
+    // already is, named or transient.
     const effectiveName =
       agentName ??
-      (source === "clear" && currentName ? currentName : null) ??
-      (isTransientName(currentName) ? currentName : null) ??
+      (source !== "fork" && currentName ? currentName : null) ??
       transientNameFor(cwd);
 
     // `compact` keeps the same conversation id, so it lands on the refresh path
@@ -365,6 +371,7 @@ export async function run(argv: string[]): Promise<number> {
             ok: true,
             action: result.action,
             agent_name: effectiveName,
+            announce: line,
             ...(continuityRefusal ? { continuity_refused: continuityRefusal } : {}),
             conversation_id: conversationId,
             bound_via: boundVia,
