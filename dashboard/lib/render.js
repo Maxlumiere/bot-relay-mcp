@@ -60,6 +60,29 @@ function pendingItemHtml(p, nowMs) {
 }
 
 /**
+ * Why an EMPTY lane cannot be shown as "nothing right now", or null when it can.
+ * Null only for a fresh (banner "ok") snapshot whose list really is an array.
+ * @param {{level: string, ageMs?: number}} banner
+ * @param {object|null} snap
+ * @param {string} field  snapshot key holding the lane's list
+ * @param {string} noun   what the lane lists, for the sentence
+ * @returns {string|null}
+ */
+function unknownReason(banner, snap, field, noun) {
+  if (!snap) return `Unknown — no snapshot from the relay yet, so the board cannot tell whether any ${noun} items exist.`;
+  if (banner.level === "rejected") {
+    return `Unknown — the latest push was rejected, so the board is frozen at an older snapshot that listed no ${noun} items.`;
+  }
+  if (banner.level === "stale") {
+    const age = banner.ageMs != null ? ` ${fmtAge(banner.ageMs)}` : "";
+    return `Unknown — the last snapshot is${age} old; it listed no ${noun} items, but newer ones would not show here.`;
+  }
+  if (!Array.isArray(snap[field])) return `Unknown — the latest snapshot has no ${noun} list.`;
+  if (banner.level !== "ok") return `Unknown — the board cannot confirm the snapshot is current.`;
+  return null;
+}
+
+/**
  * @param {{latest: {snapshot: object, received_at: string}|null, lastRejection: object|null, nowMs: number}} args
  * @returns {string} full HTML document
  */
@@ -70,15 +93,22 @@ export function renderBoard({ latest, lastRejection, nowMs }) {
   const agents = snap && Array.isArray(snap.agents) ? snap.agents : [];
   const pending = snap && Array.isArray(snap.pending_on_human) ? snap.pending_on_human : [];
 
+  // An empty-state all-clear ("... right now") is a claim about the present. It is
+  // only true when a FRESH, VALID snapshot carries an EMPTY list. Items that do
+  // exist are always shown (the banner already says how old they are).
   const agentsHtml = agents.length
     ? agents.map(agentCardHtml).join("\n")
-    : snap
-      ? `<div class="empty">No agents registered right now.</div>`
-      : `<div class="empty">No snapshot yet.</div>`;
+    : !snap
+      ? `<div class="empty">No snapshot yet.</div>`
+      : unknownReason(banner, snap, "agents", "agent")
+        ? `<div class="empty">${escapeHtml(unknownReason(banner, snap, "agents", "agent"))}</div>`
+        : `<div class="empty">No agents registered right now.</div>`;
 
   const pendingHtml = pending.length
     ? `<ul class="pending-list">${pending.map((p) => pendingItemHtml(p, nowMs)).join("\n")}</ul>`
-    : `<div class="empty">Nothing is blocked on a human right now.</div>`;
+    : unknownReason(banner, snap, "pending_on_human", "pending")
+      ? `<div class="empty">${escapeHtml(unknownReason(banner, snap, "pending_on_human", "pending"))}</div>`
+      : `<div class="empty">Nothing is blocked on a human right now.</div>`;
 
   const note = snap && snap.note ? `<section class="note">${escapeHtml(snap.note)}</section>` : "";
 

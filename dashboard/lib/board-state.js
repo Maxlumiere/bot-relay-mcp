@@ -40,7 +40,27 @@ export function computeBanner({ latest, lastRejection, nowMs, staleMs = STALE_MS
         "confirm the relay has dashboard_push_url + dashboard_push_secret set and is running.",
     };
   }
+  // FAIL CLOSED on an unparseable receipt time. Date.parse returns NaN, and
+  // `Math.max(0, nowMs - NaN)` is NaN — NOT 0 — so `ageMs > staleMs` was
+  // `NaN > 90000` = false, the stale branch was skipped, and a garbage timestamp
+  // fell through to `ok`. Invalid input produced a FRESHER verdict than a
+  // genuinely old snapshot, which is the precise inversion this banner exists to
+  // prevent: an unparseable receipt time cannot prove a snapshot fresh.
+  // Treated as "waiting" because that is literally true — no snapshot with a
+  // usable arrival time has been proven to exist — and its wording ("not wired",
+  // not "nothing happening") already reads correctly for this case.
   const receivedMs = Date.parse(latest.received_at);
+  if (!Number.isFinite(receivedMs)) {
+    return {
+      level: "waiting",
+      title: "Waiting for a snapshot with a usable arrival time",
+      detail:
+        `A push was recorded but its received_at (${JSON.stringify(latest.received_at)}) could not be ` +
+        "parsed as a date, so its age is unknown and it CANNOT be treated as fresh. This means " +
+        "'not wired / bad receiver clock', not 'nothing happening' — check the receiver that stamps " +
+        "received_at on the push.",
+    };
+  }
   const ageMs = Math.max(0, nowMs - receivedMs);
   const rejectedAtMs = lastRejection && lastRejection.at ? Date.parse(lastRejection.at) : NaN;
 

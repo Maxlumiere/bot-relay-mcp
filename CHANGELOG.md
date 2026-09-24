@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — the fleet board claimed "Nothing is blocked on a human" when it could not know
+
+Measured on the live board: with no snapshot received yet, the banner said "Waiting for the first snapshot" while the **Pending on a human** lane said "Nothing is blocked on a human right now". That is silence shown as health, on the lane most likely to be trusted. The agents lane had the same pattern: "No agents registered right now" from an out-of-date snapshot.
+
+- An empty lane now shows its all-clear only when the snapshot is **fresh** (banner "ok") and the list is really present.
+- In every other case the lane says **Unknown** and why: no snapshot yet, the latest push was rejected (the board is frozen), the last snapshot is stale (with its age), or the snapshot has no such list.
+- Items that do exist still show from a stale snapshot; the banner already gives its age.
+- An **unparseable `received_at` can no longer prove a snapshot fresh.** `Date.parse` returns `NaN`, `Math.max(0, now - NaN)` is `NaN` (not `0`), and every comparison with `NaN` is false — so `ageMs > staleMs` was skipped and a garbage timestamp fell through to "ok", rendering the all-clear and an age of "NaNd". `computeBanner` now fails closed to **waiting** on any non-finite receipt time, which also stops `NaN` escaping into the banner and footer age. Found in audit (round 1), not by the original tests: the same false all-clear this entry exists to kill, reached through the timestamp instead of the empty list.
+- New `dashboard/test/board-state-invalid-received-at.test.mjs`: 9 non-finite `received_at` shapes (unparseable string, whitespace, out-of-range ISO, number, boolean, object, array, `null`, `NaN`) pinned at **both** layers — `computeBanner` and the rendered HTML — plus a missing-field case and two innocent twins (a fresh timestamp still reads "ok", an old one still reads "stale") so the fix cannot degenerate into "always return waiting". Seen failing first with the fix stashed.
+- New `dashboard/test/render-empty-states.test.mjs`: 8 cases that must not show an all-clear, all seen failing on the old renderer, plus 4 cases the old renderer already got right, which still pass.
+
 ### Fixed — the board's post-deploy verifier could "pass" without running a single check
 
 `dashboard/verify-deploy.mjs` decided whether it was being run directly by comparing `import.meta.url` with `` `file://${process.argv[1]}` ``. The module URL is symlink-resolved and percent-encoded; `argv[1]` is neither. So from a checkout path containing a space, through a symlinked file, or under a symlinked directory (on macOS `/tmp` and `/var/folders` are themselves symlinks), the script skipped `main()` and exited 0 with no output: a green verifier that had verified nothing.
