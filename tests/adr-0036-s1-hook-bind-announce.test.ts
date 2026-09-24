@@ -311,4 +311,54 @@ describe("ADR-0036 S1 — the SessionStart hook records the binding and announce
     );
     expect((r.stdout.match(/VERDICT=/g) ?? []).length, "exactly one verdict").toBe(1);
   }, 25_000);
+
+  // S3-lite (architect ruling 1 + victra's three-state ruling): the probe reads the
+  // RECORDED version, so agent_bindings stays PRESENT in both cases below — a
+  // table-exists probe passes them. Each state is as systemic as "schema not
+  // migrated" (no window anywhere on this hook is recorded), so each must reach the
+  // VERDICT, and the reason must name ITS remedy, not another state's.
+  async function reachesSchemaBranch(): Promise<void> {
+    const { resolveWindowAnchor } = await import("../src/binding.js");
+    const { getOwnHostId } = await import("../src/liveness.js");
+    const a = resolveWindowAnchor({ claudePid: ANCHOR_PID, detected: DETECTED });
+    expect(a.ok, `this fixture cannot reach the schema branch (${a.ok ? "" : a.reason})`).toBe(true);
+    expect(getOwnHostId(), "this fixture needs a resolvable own-host id").toBeTruthy();
+  }
+
+  it("DB schema ABOVE the supported max is SYSTEMIC → verdict names an upgrade, not a migration", async () => {
+    const port = await getFreePort();
+    await reachesSchemaBranch();
+    const { CURRENT_SCHEMA_VERSION } = await import("../src/db.js");
+    const Better = (await import("better-sqlite3")).default;
+    const db = new Better(TEST_DB_PATH);
+    db.prepare("UPDATE schema_info SET version = ? WHERE id = 1").run(CURRENT_SCHEMA_VERSION + 1);
+    db.close();
+
+    const r = runHook({ port, input: sessionStart("startup") });
+
+    expect(await bindings()).toEqual([]);
+    expect(r.stderr).toMatch(/newer than this relay build supports/i);
+    expect(verdictOf(r.stdout), r.stdout + r.stderr).toBe("DEGRADED");
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*bind[^"]*newer than this relay build[^"]*"/i);
+    expect(r.stdout, "must not send the operator to a migration").not.toMatch(/schema not migrated/i);
+    expect((r.stdout.match(/VERDICT=/g) ?? []).length, "exactly one verdict").toBe(1);
+  }, 25_000);
+
+  it("NO schema_info table is SYSTEMIC → verdict names the DB path check", async () => {
+    const port = await getFreePort();
+    await reachesSchemaBranch();
+    const Better = (await import("better-sqlite3")).default;
+    const db = new Better(TEST_DB_PATH);
+    db.exec("DROP TABLE schema_info");
+    db.close();
+
+    const r = runHook({ port, input: sessionStart("startup") });
+
+    expect(await bindings()).toEqual([]);
+    expect(r.stderr).toMatch(/no schema_info table/i);
+    expect(verdictOf(r.stdout), r.stdout + r.stderr).toBe("DEGRADED");
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*bind[^"]*not an initialized relay DB[^"]*"/i);
+    expect(r.stdout).not.toMatch(/schema not migrated/i);
+    expect((r.stdout.match(/VERDICT=/g) ?? []).length, "exactly one verdict").toBe(1);
+  }, 25_000);
 });

@@ -14,10 +14,12 @@
  * start after a reboot must not be able to cause a missed bind.
  *
  * RULING 1 (victra, 2026-09-16): open a RAW handle with busy_timeout only — NO
- * applySchemaSetup — and PROBE for agent_bindings first. A schema migration and
- * a record purge must never ride a path that fires dozens of times a day under a
- * 10s hook timeout, beside old code mid-rollout. Absent table → BIND_FAILED
- * "schema not migrated", loud, never a silent skip.
+ * applySchemaSetup — and PROBE the schema first. A schema migration and a record
+ * purge must never ride a path that fires dozens of times a day under a 10s hook
+ * timeout, beside old code mid-rollout. S3-lite (architect ruling 1): the probe
+ * reads the RECORDED schema version against MIN_BIND_SCHEMA_VERSION..
+ * MAX_SUPPORTED_SCHEMA (probeBindSchema), not table existence, and refuses
+ * loudly in one of three states that each name their remedy — never a silent skip.
  *
  * REFUSE RATHER THAN GUESS (§8a amendment d): missing/malformed stdin, no
  * conversation id, or an anchor that cannot be resolved all write NOTHING and
@@ -212,14 +214,12 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const { hasAgentBindingsTable, upsertAgentBinding, endAgentBinding } = await import("../db.js");
+    const { probeBindSchema, upsertAgentBinding, endAgentBinding } = await import("../db.js");
 
-    if (!hasAgentBindingsTable(db)) {
-      return bindFailed(
-        `schema not migrated: ${dbPath} has no agent_bindings table (schema v25). ` +
-          `The daemon or connector on the new build must open this DB once first; bind never migrates.`,
-      );
-    }
+    // The RECORDED version, not table existence (architect ruling 1): a
+    // table-exists probe passes after a future column change, then breaks on write.
+    const schema = probeBindSchema(db, dbPath);
+    if (!schema.ok) return bindFailed(schema.message);
 
     if (args.end) {
       if (!endReason) {

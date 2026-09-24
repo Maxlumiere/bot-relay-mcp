@@ -613,6 +613,23 @@ function initSchema(db: CompatDatabase): void {
 export const CURRENT_SCHEMA_VERSION = 25;
 
 /**
+ * ADR-0036 S3-lite — the schema range `relay bind` / `relay fleet` accept on a
+ * RAW handle (they never run applySchemaSetup, so they cannot rely on having
+ * migrated the DB themselves). Victra ruling, option (c): an explicit range,
+ * MIN <= recorded version <= MAX.
+ *
+ *   MIN is v25, where agent_bindings arrived.
+ *   MAX is a CONSCIOUS DECISION, not an alias for CURRENT_SCHEMA_VERSION. When a
+ *   migration bumps CURRENT, tests/adr-0036-s3lite-schema-probe.test.ts fails
+ *   until someone decides bind/fleet are correct against the new schema and
+ *   raises MAX here. `>= MIN` alone would be architect's table-exists defect
+ *   relocated from tables to numbers; `=== 25` would refuse every bind the day
+ *   an unrelated migration ships.
+ */
+export const MIN_BIND_SCHEMA_VERSION = 25;
+export const MAX_SUPPORTED_SCHEMA = 25;
+
+/**
  * Read the live DB's recorded schema version. Throws if the table is
  * missing (shouldn't happen post-initSchema; fail-loud over silent-zero).
  */
@@ -3022,6 +3039,81 @@ export function hasAgentBindingsTable(db: CompatDatabase): boolean {
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_bindings'")
     .get();
   return !!row;
+}
+
+export type BindSchemaProbe =
+  | { ok: true; version: number }
+  | {
+      ok: false;
+      state: "no_schema_info" | "below_range" | "above_range";
+      version: number | null;
+      message: string;
+    };
+
+/**
+ * ADR-0036 S3-lite (architect ruling 1) — the DB-open probe for `relay bind` and
+ * `relay fleet`. It reads the RECORDED schema version on the caller's raw handle;
+ * it does not ask whether agent_bindings exists. A table-exists probe passes after
+ * a future column change and then breaks on write.
+ *
+ * Handle-taking and read-only: getSchemaVersion() goes through getDb(), which runs
+ * applySchemaSetup, and the bind path must never migrate.
+ *
+ * THREE REFUSAL STATES, each naming its own remedy (victra ruling). They have
+ * different causes and different fixes, and a refusal that sends the operator to
+ * the wrong fix wastes their time while looking like it did its job:
+ *   no_schema_info — not an initialized relay DB (wrong path, or never opened).
+ *     A missing version row is the same state: same cause, same fix.
+ *   below_range    — an older DB the new build has not migrated yet.
+ *   above_range    — a newer DB than this relay build understands.
+ * `schema not migrated` is the below-range phrase; S1 tests pin it.
+ *
+ * NOT a replacement for hasAgentBindingsTable inside readers (getCurrentBinding,
+ * listAgentBindings). Those degrade defensively (undefined / []), and making them
+ * refuse would make their callers throw.
+ */
+export function probeBindSchema(db: CompatDatabase, dbPath: string): BindSchemaProbe {
+  const range = `v${MIN_BIND_SCHEMA_VERSION}..v${MAX_SUPPORTED_SCHEMA}`;
+  let version: unknown;
+  try {
+    const row = db.prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: unknown } | undefined;
+    version = row?.version;
+  } catch {
+    // MEASURED: with no schema_info table the SELECT throws (SQLITE_ERROR: no such table).
+    version = undefined;
+  }
+  if (typeof version !== "number" || !Number.isInteger(version)) {
+    return {
+      ok: false,
+      state: "no_schema_info",
+      version: null,
+      message:
+        `${dbPath} has no schema_info table or version row, so it is not an initialized relay DB. ` +
+        `Check this is the DB relay should use (RELAY_DB_PATH / --db-path; \`relay doctor\` shows the resolved path). ` +
+        `bind never initializes a DB.`,
+    };
+  }
+  if (version < MIN_BIND_SCHEMA_VERSION) {
+    return {
+      ok: false,
+      state: "below_range",
+      version,
+      message:
+        `schema not migrated: ${dbPath} records schema v${version}; bind and fleet need ${range}. ` +
+        `The daemon or connector on the new build must open this DB once first; bind never migrates.`,
+    };
+  }
+  if (version > MAX_SUPPORTED_SCHEMA) {
+    return {
+      ok: false,
+      state: "above_range",
+      version,
+      message:
+        `${dbPath} records schema v${version}, newer than this relay build supports (${range}). ` +
+        `Upgrade or reinstall relay so the hook runs the build that migrated this DB. Never downgrade the DB.`,
+    };
+  }
+  return { ok: true, version };
 }
 
 /** This window's CURRENT (not superseded) binding, or undefined. */

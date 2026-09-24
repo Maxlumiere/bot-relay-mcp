@@ -884,10 +884,16 @@ fi
 #   refused (malformed, → LOUD on stderr, verdict UNTOUCHED. This session is
 #   no session_id, bad    otherwise fine; degrading it would mask a real
 #   anchor)               problem behind a payload quirk.
-#   schema not migrated → SYSTEMIC (RULING 1): mid-rollout, NO window anywhere is
+#   schema refusal      → SYSTEMIC (RULING 1): NO window anywhere on this hook is
 #                         being recorded, so it goes into the VERDICT. Only
 #                         replaces HEALTHY/DEGRADED-for-a-softer-reason; it never
 #                         masks a louder verdict such as MUTE or UNWAKEABLE.
+#                         S3-lite: bind probes the RECORDED version, so there are
+#                         three states, each with its own remedy in the reason —
+#                         "schema not migrated" (below range: let the new build
+#                         migrate), "newer than this relay build" (above range:
+#                         upgrade relay), "no schema_info table" (not a relay DB:
+#                         check the path).
 # STREAM DISCIPLINE: the announcement is stdout (it is context); every refusal is
 # stderr. The one-VERDICT-line contract on stdout is unchanged.
 if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
@@ -923,17 +929,22 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
   else
     # Loud, never silent — the operator sees WHY this window was not recorded.
     [ -n "$RELAY_BIND_ERR" ] && printf '%s\n' "$RELAY_BIND_ERR" >&2
+    RELAY_BIND_SCHEMA_REASON=""
     case "$RELAY_BIND_ERR" in
       *"schema not migrated"*)
-        if command -v relay_verdict_set >/dev/null 2>&1; then
-          case "$RELAY_VERDICT" in
-            HEALTHY|DEGRADED)
-              relay_verdict_set "DEGRADED" "bind failed: agent_bindings missing (schema not migrated) — this window is NOT recorded" " agent=\"$AGENT_NAME\""
-              ;;
-          esac
-        fi
-        ;;
+        RELAY_BIND_SCHEMA_REASON="bind failed: schema not migrated, the new build must open this DB once — this window is NOT recorded" ;;
+      *"newer than this relay build supports"*)
+        RELAY_BIND_SCHEMA_REASON="bind failed: DB schema newer than this relay build supports, upgrade relay — this window is NOT recorded" ;;
+      *"no schema_info table"*)
+        RELAY_BIND_SCHEMA_REASON="bind failed: not an initialized relay DB, check RELAY_DB_PATH — this window is NOT recorded" ;;
     esac
+    if [ -n "$RELAY_BIND_SCHEMA_REASON" ] && command -v relay_verdict_set >/dev/null 2>&1; then
+      case "$RELAY_VERDICT" in
+        HEALTHY|DEGRADED)
+          relay_verdict_set "DEGRADED" "$RELAY_BIND_SCHEMA_REASON" " agent=\"$AGENT_NAME\""
+          ;;
+      esac
+    fi
   fi
 fi
 # --- end ADR-0036 S1 bind ------------------------------------------------------
