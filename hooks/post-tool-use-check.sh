@@ -2,9 +2,13 @@
 # bot-relay-mcp: PostToolUse hook — mid-task mail NOTICE (v1.8; peek-only since ADR-0037)
 #
 # Fires after every Claude Code tool call. If this agent (RELAY_AGENT_NAME)
-# has unread mail in the relay, inject a short NOTICE as additionalContext: the
-# unread count, the senders, and a bounded quoted first line of the newest
-# message. Never message bodies, and never a read-mark.
+# has unread mail in the relay, inject a short NOTICE as additionalContext:
+# METADATA ONLY (the unread count, the highest priority, the sender names checked
+# against [a-z0-9-], and the newest message's age). Never any message content,
+# not even a first line, and never a read-mark. additionalContext is a
+# HIGHER-TRUST channel than a get_messages tool result, so quoting a sender's
+# words here would launder attacker-chosen text into it, and an excerpt stands in
+# for actually reading the mail (design review, 24 Sep).
 #
 # ADR-0037 — ONLY THE MODEL MOVES MAIL TO READ. This hook used to DRAIN the
 # mailbox (HTTP get_messages, or a sqlite UPDATE status='read') and inject the
@@ -294,18 +298,17 @@ else:
 if not recs:
     sys.exit(0)
 
-def clean(s, cap):
-    s = re.sub(r"[\x00-\x1f\x7f]+", " ", s).strip()
-    return s if len(s) <= cap else s[: cap - 1] + "…"
-
 n = len(recs)
 count = ("%d+" % n) if n >= lim else ("%d" % n)
 fpr = hashlib.sha256("\n".join(sorted(r[0] for r in recs)).encode("utf-8", "replace")).hexdigest()[:32]
 top = "high" if any(r[2] == "high" for r in recs) else "normal"
 newest_first = sorted(recs, key=lambda r: r[3], reverse=True)
+# Sender names are the ONLY sender-chosen field in the notice, so they are held to
+# [a-z0-9-]; anything else shows as "unknown". No content field is read at all.
+SENDER = re.compile(r"[a-z0-9-]{1,64}")
 order, highs = [], {}
 for r in newest_first:
-    who = clean(r[1], 64) or "?"
+    who = r[1] if SENDER.fullmatch(r[1] or "") else "unknown"
     if who not in highs:
         order.append(who)
         highs[who] = 0
@@ -314,14 +317,21 @@ for r in newest_first:
 shown = [("%s (%d high)" % (w, highs[w])) if highs[w] else w for w in order[:5]]
 if len(order) > 5:
     shown.append("+%d more" % (len(order) - 5))
-content = newest_first[0][4]
-if src == "sqlite" and (content.startswith("enc:") or content.startswith("enc1:")):
-    first = "(encrypted at rest, not shown)"
-else:
-    first = next((l for l in content.splitlines() if l.strip()), "")
-    first = json.dumps(clean(first, 100), ensure_ascii=False)
-notice = ("relay: %s unread for %s, from %s. newest first line (≤100 chars): %s. "
-          "Unread until get_messages is called.") % (count, an, ", ".join(shown), first)
+
+def age(iso):
+    import datetime
+    try:
+        t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        secs = max(0, int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()))
+    except Exception:
+        return "at an unknown time"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return "%d%s ago" % (secs // size, unit)
+    return "%ds ago" % secs
+
+notice = ("relay: %s unread for %s (highest priority: %s), from %s. newest arrived %s. "
+          "Unread until get_messages is called.") % (count, an, top, ", ".join(shown), age(newest_first[0][3]))
 sys.stdout.buffer.write(("%s\x1f%s\x1f%s" % (fpr, top, notice)).encode("utf-8", "replace"))
 '
 

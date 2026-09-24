@@ -394,7 +394,9 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       const parsed = JSON.parse(r.stdout);
       expect(parsed.continue).toBe(true);
       expect(parsed.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
-      expect(parsed.hookSpecificOutput?.additionalContext).toContain("Hello from P3");
+      // Metadata only (design review, 24 Sep): the sender is named, the content never is.
+      expect(parsed.hookSpecificOutput?.additionalContext).toContain("orchestrator");
+      expect(parsed.hookSpecificOutput?.additionalContext).not.toContain("Hello from P3");
       // ADR-0037 — READ MUST MEAN RECEIVED: the notice consumed nothing.
       const db = new Database(dbPath, { readonly: true });
       const row = db
