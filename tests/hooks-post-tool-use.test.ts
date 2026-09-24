@@ -163,7 +163,9 @@ describe("PostToolUse hook — HTTP path (preferred)", () => {
     expect(parsed.hookSpecificOutput.hookEventName).toBe("PostToolUse");
     expect(parsed.hookSpecificOutput.additionalContext).toMatch(/^relay: 1 unread for hook-recv-1/);
     expect(parsed.hookSpecificOutput.additionalContext).toContain("hook-sender-1");
-    expect(parsed.hookSpecificOutput.additionalContext).toContain("first message");
+    // Metadata only (design review, 24 Sep): the sender is named, the content never is.
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("hook-sender-1");
+    expect(parsed.hookSpecificOutput.additionalContext).not.toContain("first message");
   });
 
   it("(2) empty mailbox → truly empty stdout, exit 0", async () => {
@@ -193,7 +195,8 @@ describe("PostToolUse hook — HTTP path (preferred)", () => {
     };
     const r1 = await runHook(env);
     expect(r1.stdout).not.toBe("");
-    expect(r1.stdout).toContain("only once please");
+    expect(r1.stdout).toContain("hook-sender-2");
+    expect(r1.stdout).not.toContain("only once please");
 
     const r2 = await runHook(env);
     expect(r2.code).toBe(0);
@@ -236,7 +239,8 @@ describe("PostToolUse hook — graceful degradation", () => {
     expect(r.code).toBe(0);
     expect(r.stdout).not.toBe("");
     const parsed = JSON.parse(r.stdout);
-    expect(parsed.hookSpecificOutput.additionalContext).toContain("via sqlite path");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("hook-sender-3");
+    expect(parsed.hookSpecificOutput.additionalContext).not.toContain("via sqlite path");
   });
 
   it("(7) missing RELAY_AGENT_NAME → silent exit 0, empty stdout", async () => {
@@ -287,7 +291,7 @@ describe("PostToolUse hook — behavioral invariants", () => {
       RELAY_DB_PATH: TEST_DB_PATH,
     });
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("peek");
+    expect(r.stdout).toContain("hook-sender-4");
 
     // Snapshot after
     const after = await mcpCall({
