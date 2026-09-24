@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixed — `get_messages(ack=true)` reported an ack the database never made, when the agent had no session (ADR-0041)
+
+Measured live: `get_messages(status="pending", ack=true)` replied `acked: true, resolved_count: 1`, yet the message kept `resolved_at`, `read_at` and `read_by_session` NULL and came back on the next drain. `last_drain_at` stayed frozen too. It happened to any agent whose `session_id` is NULL.
+
+- **The drain no longer needs a session for agent-level receipts.** The mark block used to be gated as a whole on the session. Now only `read_by_session`, the per-session read mark, needs one. `resolved_at`, `read_at` and `last_drain_at` belong to the agent, and are stamped whenever the drain returns mail, with or without a session. So an ack with no session now resolves, and the mail does not come back.
+- **The ack receipt reports the effect.** `resolved_count` is the number of rows the resolve changed, not the number returned. `acked` is true only when the resolve ran; otherwise the reply carries `ack_not_applied` with the reason. It used to be built from the request.
+- **An agent with no session is told so.** The reply carries `warning: { code: "session_unbound", message }`: mail was delivered and receipts recorded, but there is no per-session read mark, so unresolved mail is returned again until the agent re-registers or resolves it. With no session, neither the per-session read mark nor the legacy `status` column is written.
+- The `get_messages` tool description documents `acked`, `resolved_count` and `warning`.
+- Tests: `tests/adr-0041-null-session-receipts.test.ts`, 9 cases. The NULL session is produced by a real force mint. The cases cover:
+  - the harm case (an ack must not claim what the database did not do) and its twin (with a session, the real count);
+  - resolve and delivery with no session;
+  - that a peek stamps nothing;
+  - the warning and its twin;
+  - the ADR-0037 innocent twin (the model's drain marks delivery) for an agent with no session.
+  5 were red on the old code and turned red again with the fix reverted. Two mutations are each caught: re-gating the stamps on the session, and building the receipt from the request.
+
 ### Added — a window now RECORDS which identity it holds, and says so (`relay bind` + `relay fleet`, ADR-0036 S1)
 
 A terminal could become agent X without anything observable happening: no record of which window held which name, on which conversation, and no way to ask. When that binding went stale the only symptom was mail that never arrived. S1 **records and lists**; it changes no auth and performs **no** automatic rebind (that is S3-lite).

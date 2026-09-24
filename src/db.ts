@@ -5768,6 +5768,21 @@ export function countMatchingMessages(
   return (db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE ${where}`).get(...params) as { c: number }).c;
 }
 
+/**
+ * ADR-0041 — what a drain actually DID, so a receipt can report the effect and
+ * never the request.
+ */
+export interface DrainEffect {
+  /** False when agents.session_id is NULL: the honest "unbound" state (ADR-0041 R3). */
+  sessionBound: boolean;
+  /** Rows whose per-session read mark (read_by_session) changed. Always 0 when unbound. */
+  marked: number;
+  /** True when the resolve UPDATE ran (ack on a pending drain with rows). Every returned row is then resolved. */
+  resolveRan: boolean;
+  /** Rows whose resolved_at this call set (not rows returned). */
+  resolved: number;
+}
+
 export function getMessages(
   agentName: string,
   status: string,
@@ -5783,6 +5798,19 @@ export function getMessages(
   // resolved reads (those never mark, so they never resolve).
   ack = false,
 ): MessageRecord[] {
+  return getMessagesWithEffect(agentName, status, limit, peek, sinceIso, lane, ack).rows;
+}
+
+/** getMessages plus the DrainEffect: the one the get_messages receipt is built from (ADR-0041 R1). */
+export function getMessagesWithEffect(
+  agentName: string,
+  status: string,
+  limit: number,
+  peek = false,
+  sinceIso: string | null = null,
+  lane: "all" | "direct" | "capability" = "all",
+  ack = false,
+): { rows: MessageRecord[]; effect: DrainEffect } {
   const db = getDb();
   // No touchAgent here — observation is not liveness (v1.3 presence fix)
 
@@ -5816,7 +5844,16 @@ export function getMessages(
   // single-shot workers (v2.0 final #6).
   let drainedRows = 0;
   let outboxId = 0;
-  if (!peek && rows.length > 0 && currentSession && status !== "read") {
+  let resolveRan = false;
+  let resolvedRows = 0;
+  // ADR-0041 R2: this block used to be gated on `currentSession` as a WHOLE, so a
+  // NULL agents.session_id (force-mint and rotate clear it by design) silently
+  // skipped the resolve, read_at and last_drain_at too, and the handler still
+  // reported `acked`. Only read_by_session is per-session. resolved_at (RESOLVED)
+  // and read_at + last_drain_at (DELIVERED) are AGENT-level and are stamped
+  // whenever the model's drain returned rows. Delivery is never blocked by
+  // identity bookkeeping.
+  if (!peek && rows.length > 0 && status !== "read") {
     const ids = rows.map((r) => r.id);
     const placeholders = ids.map(() => "?").join(",");
     // v2.12.0 — resolve-on-ack. Only the PENDING drain path resolves: it is
@@ -5854,14 +5891,28 @@ export function getMessages(
     // sender must fall back to an explicit ack when the recipient is off that path.
     const readStampedAt = now();
     const tx = db.transaction(() => {
-      const r = db.prepare(
-        `UPDATE messages SET status = 'read', read_by_session = ?, read_at = COALESCE(read_at, ?) WHERE id IN (${placeholders})`
-      ).run(currentSession, readStampedAt, ...ids);
-      drainedRows = r.changes;
-      if (doResolve) {
+      if (currentSession) {
+        const r = db.prepare(
+          `UPDATE messages SET status = 'read', read_by_session = ?, read_at = COALESCE(read_at, ?) WHERE id IN (${placeholders})`
+        ).run(currentSession, readStampedAt, ...ids);
+        drainedRows = r.changes;
+      } else {
+        // Unbound (ADR-0041 R3): no per-session read to record, so read_by_session
+        // and the legacy `status` column are left alone and the mail re-pends on the
+        // next drain (the handler says so). The agent-level delivery marker is stamped.
         db.prepare(
+          `UPDATE messages SET read_at = COALESCE(read_at, ?) WHERE id IN (${placeholders})`
+        ).run(readStampedAt, ...ids);
+      }
+      if (doResolve) {
+        resolvedRows = db.prepare(
           `UPDATE messages SET resolved_at = ? WHERE id IN (${placeholders}) AND resolved_at IS NULL`
-        ).run(resolvedAt, ...ids);
+        ).run(resolvedAt, ...ids).changes;
+        resolveRan = true;
+      }
+      if (!currentSession) {
+        // DELIVERED is agent-level: a drain that returned rows is a drain, bound or not.
+        updateAgentMetadata(agentName, { last_drain_at: now() });
       }
       if (drainedRows > 0) {
         const ins = db.prepare(
@@ -5990,7 +6041,10 @@ export function getMessages(
   }
 
   // v1.7: decrypt content field on read (safe-no-op for plaintext rows)
-  return rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content }));
+  return {
+    rows: rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content })),
+    effect: { sessionBound: !!currentSession, marked: drainedRows, resolveRan, resolved: resolvedRows },
+  };
 }
 
 /**
