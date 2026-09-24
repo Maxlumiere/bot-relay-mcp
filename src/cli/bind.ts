@@ -214,7 +214,15 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const { probeBindSchema, upsertAgentBinding, endAgentBinding } = await import("../db.js");
+    const {
+      probeBindSchema,
+      upsertAgentBinding,
+      endAgentBinding,
+      getCurrentBinding,
+      getCurrentBindingByConversation,
+      getAgentIdentityAnchor,
+      rebindAgentToWindow,
+    } = await import("../db.js");
 
     // The RECORDED version, not table existence (architect ruling 1): a
     // table-exists probe passes after a future column change, then breaks on write.
@@ -236,14 +244,88 @@ export async function run(argv: string[]): Promise<number> {
       return 0;
     }
 
+    // --- ADR-0036 S3-lite: CONTINUITY (rows 1 and 4) ----------------------
+    // An UNNAMED window resuming C, where the relay's own record says C belongs to
+    // X and X's window anchor is provably DEAD, becomes X: rebind under CAS, one
+    // transaction, zero steps. Gated on anchorLivenessVerdict ONLY (never the
+    // argv-inclusive verdict); alive AND unverifiable refuse. A NAMED window never
+    // inherits: its launch intent wins, and row 3 (launcher X resuming Y's
+    // conversation) is S3, not S3-lite. Only `resume` asks.
+    let continuityRefusal: string | null = null;
+    let continuityName: string | null = null;
+    if (agentName === null && source === "resume") {
+      const prior = getCurrentBindingByConversation(db, conversationId);
+      if (prior) {
+        continuityName = prior.agent_name;
+        const { anchorLivenessVerdict } = await import("../liveness.js");
+        const { resolveContinuityClaim } = await import("../binding.js");
+        const claim = resolveContinuityClaim({
+          priorBinding: prior,
+          priorAnchorVerdict: anchorLivenessVerdict(
+            { host_id: prior.host_id, agent_pid: prior.window_pid, agent_pid_start: prior.window_pid_start },
+            hostId,
+          ),
+          thisAnchor: { hostId, pid: anchor.windowPid, startedAt: anchor.windowPidStart },
+        });
+        if (claim.ok && claim.action === "claim") {
+          const held = getAgentIdentityAnchor(db, claim.agentName);
+          const rebind = rebindAgentToWindow(db, {
+            agentName: claim.agentName,
+            conversationId,
+            newAnchor: anchor,
+            cwd,
+            expected: {
+              bindingId: prior.binding_id,
+              bindingVersion: claim.expectedBindingVersion,
+              sessionId: held?.session_id ?? null,
+              agentPid: held?.agent_pid ?? null,
+              agentPidStart: held?.agent_pid_start ?? null,
+            },
+          });
+          if (rebind.ok) {
+            process.stdout.write(
+              args.json
+                ? JSON.stringify({
+                    ok: true,
+                    action: "claimed",
+                    agent_name: claim.agentName,
+                    conversation_id: conversationId,
+                    bound_via: "continuity",
+                    binding_id: rebind.bindingId,
+                    binding_version: rebind.bindingVersion,
+                    window_pid: anchor.windowPid,
+                    host_id: hostId,
+                    cwd,
+                  }) + "\n"
+                : rebind.announce + "\n",
+            );
+            return 0;
+          }
+          // Lost the CAS (row 10: another window claimed it first). Never retried:
+          // this window is recorded as itself, and says why.
+          continuityRefusal = rebind.reason;
+        } else if (!claim.ok) {
+          continuityRefusal = claim.reason;
+        }
+      }
+    }
+
+    // IDENTITY CARRIES (row 8): an unnamed window's identity is its BINDING, not its
+    // env. After a continuity claim the env still has no name, so `/clear` (a new
+    // conversation, same window) would otherwise bind the new conversation as
+    // nobody and drop X. `/compact` keeps the same conversation, so it lands on the
+    // refresh path by construction; carrying the name costs it nothing.
+    const effectiveName =
+      agentName ?? (source === "clear" ? (getCurrentBinding(db, anchor)?.agent_name ?? null) : null);
+
     // `compact` keeps the same conversation id, so it lands on the refresh path
     // by construction — no special case, and no second current row (§8a D2).
-    const boundVia = boundViaForSource(source, agentName !== null);
+    const boundVia = boundViaForSource(source, effectiveName !== null);
     const result = upsertAgentBinding(
       db,
       {
         ...anchor,
-        agentName,
+        agentName: effectiveName,
         agentClass: null,
         conversationId,
         conversationTitle: null,
@@ -255,16 +337,21 @@ export async function run(argv: string[]): Promise<number> {
 
     // ANNOUNCE — a human and an agent both read this. Name the identity, the
     // conversation and the evidence, so a window can never become X silently.
-    const who = agentName ?? "an unnamed window";
+    const who = effectiveName ?? "an unnamed window";
     const line =
       `[RELAY] bound ${who} to conversation ${conversationId} ` +
-      `(${result.action}, via ${boundVia}, window pid ${anchor.windowPid} on this host)`;
+      `(${result.action}, via ${boundVia}, window pid ${anchor.windowPid} on this host)` +
+      // ONE line: the hook collapses bind stdout to its first line.
+      (continuityRefusal
+        ? ` — did not take ${continuityName ?? "the conversation's identity"}: ${continuityRefusal}`
+        : "");
     process.stdout.write(
       args.json
         ? JSON.stringify({
             ok: true,
             action: result.action,
-            agent_name: agentName,
+            agent_name: effectiveName,
+            ...(continuityRefusal ? { continuity_refused: continuityRefusal } : {}),
             conversation_id: conversationId,
             bound_via: boundVia,
             binding_id: result.bindingId,

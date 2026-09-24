@@ -3579,6 +3579,21 @@ export type RebindResult =
   | { ok: true; bindingId: string; bindingVersion: number; sessionId: string; announce: string }
   | { ok: false; reason: string };
 
+/**
+ * ADR-0036 S3-lite — the agents-row facts rebindAgentToWindow CASes on, read on
+ * the CALLER'S handle. `relay bind` must never call getDb() (it runs
+ * applySchemaSetup), so the getDb()-based readers are off limits on that path.
+ * Read-only.
+ */
+export function getAgentIdentityAnchor(
+  db: CompatDatabase,
+  name: string,
+): { session_id: string | null; agent_pid: number | null; agent_pid_start: string | null } | undefined {
+  return db
+    .prepare("SELECT session_id, agent_pid, agent_pid_start FROM agents WHERE name = ?")
+    .get(name) as { session_id: string | null; agent_pid: number | null; agent_pid_start: string | null } | undefined;
+}
+
 export function rebindAgentToWindow(db: CompatDatabase, input: RebindAgentToWindowInput): RebindResult {
   const { agentName, conversationId, newAnchor, cwd, expected } = input;
   const ts = now();
