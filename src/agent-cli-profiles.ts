@@ -38,6 +38,13 @@ export interface HookEvent {
   timeout?: number;
   /** Codex config.toml hooks carry a statusMessage. */
   statusMessage?: string;
+  /**
+   * Matchers this event shipped with BEFORE `matcher`. An installed relay entry
+   * whose matcher is EXACTLY one of these is widened to `matcher` on the next
+   * `relay init` (exact-literal, like migrateRawHookCommand: an operator's
+   * hand-edited matcher is never one of these, so it is never touched).
+   */
+  priorMatchers?: string[];
 }
 
 /** How `generate-hooks` renders + where a profile installs its hooks. */
@@ -134,7 +141,17 @@ const CLAUDE: AgentCliProfile = {
     target: "~/.claude/settings.json",
     format: "claude-settings-json",
     events: [
-      { event: "SessionStart", matcher: "startup|resume", script: "hooks/check-relay.sh", timeout: 10 },
+      // ADR-0036 F9/E4 (S1): widened from `startup|resume`. `/clear` mints a NEW
+      // conversation id in the same window (MEASURED), so without `clear` the
+      // binding keeps the pre-clear id and a restart line resumes the wrong
+      // conversation. E4 MEASURED this matcher fires on all five sources.
+      {
+        event: "SessionStart",
+        matcher: "startup|resume|clear|compact|fork",
+        priorMatchers: ["startup|resume"],
+        script: "hooks/check-relay.sh",
+        timeout: 10,
+      },
       { event: "PostToolUse", matcher: "*", script: "hooks/post-tool-use-check.sh", timeout: 5 },
       { event: "Stop", matcher: "*", script: "hooks/stop-check.sh", timeout: 5 },
     ],

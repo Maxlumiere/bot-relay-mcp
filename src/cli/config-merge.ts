@@ -459,6 +459,71 @@ export function canQuoteForHookCommand(p: string): boolean {
  * (a different root, a `%20` path from elsewhere) is LEFT ALONE — the tripwire
  * surfaces those loudly; migrating them would be guessing.
  */
+export interface WidenResult extends MergeResult {
+  /** Set when the relay entry was LEFT narrow (hand-edited matcher): say so, never silently. */
+  note?: string;
+}
+
+/**
+ * ADR-0036 S1 completion — widen the relay's own SessionStart entry to `matcher`.
+ *
+ * upsertSessionStartHook is deliberately a no-op when the relay hook is already
+ * installed, so a new default alone reaches no existing machine. This migration
+ * closes that, EXACT-LITERAL like migrateRawHookCommand, never a classifier:
+ *   - only groups that run exactly `command`;
+ *   - only when the group's matcher is exactly one of `priorMatchers` (a value we
+ *     shipped). Anything else is the operator's choice: left alone, and reported in
+ *     `note`, because a narrow matcher silently misses /clear.
+ *   - a group SHARED with a foreign hook is SPLIT: our hook moves to its own group
+ *     with the new matcher, and the foreign hook keeps its matcher. Widening the
+ *     shared group would change when someone else's hook fires.
+ */
+export function widenRelayHookMatcher(
+  root: Record<string, unknown> | null,
+  command: string,
+  priorMatchers: readonly string[],
+  matcher: string,
+): WidenResult {
+  const out: Record<string, unknown> = { ...(root ?? {}) };
+  const hooks: Record<string, unknown> = { ...((out.hooks as Record<string, unknown> | undefined) ?? {}) };
+  if (!Array.isArray(hooks.SessionStart)) return { root: out, changed: false };
+
+  let changed = false;
+  let leftNarrow: string | null = null;
+  const next: unknown[] = [];
+  const split: unknown[] = [];
+  for (const group of hooks.SessionStart as unknown[]) {
+    const g = group as { matcher?: unknown; hooks?: unknown[] };
+    const inner = Array.isArray(g?.hooks) ? g.hooks : null;
+    const ours = inner ? inner.filter((h) => (h as { command?: unknown })?.command === command) : [];
+    if (ours.length === 0 || g.matcher === matcher) {
+      next.push(group);
+      continue;
+    }
+    if (typeof g.matcher !== "string" || !priorMatchers.includes(g.matcher)) {
+      leftNarrow = typeof g.matcher === "string" ? g.matcher : JSON.stringify(g.matcher);
+      next.push(group);
+      continue;
+    }
+    changed = true;
+    if (ours.length === inner!.length) {
+      next.push({ ...(group as Record<string, unknown>), matcher });
+    } else {
+      next.push({ ...(group as Record<string, unknown>), hooks: inner!.filter((h) => !ours.includes(h)) });
+      split.push({ matcher, hooks: ours });
+    }
+  }
+
+  const note =
+    leftNarrow === null
+      ? undefined
+      : `the relay SessionStart hook's matcher is "${leftNarrow}", not a relay default, so it was left as is. ` +
+        `This window's binding will not follow /clear or /compact until it is "${matcher}".`;
+  if (!changed) return { root: out, changed: false, ...(note ? { note } : {}) };
+  out.hooks = { ...hooks, SessionStart: [...next, ...split] };
+  return { root: out, changed: true, ...(note ? { note } : {}) };
+}
+
 export function migrateRawHookCommand(
   root: Record<string, unknown> | null,
   rawCommand: string,

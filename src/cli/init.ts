@@ -51,7 +51,9 @@ import {
   quoteForHookCommand,
   canQuoteForHookCommand,
   migrateRawHookCommand,
+  widenRelayHookMatcher,
 } from "./config-merge.js";
+import { getAgentCliProfile } from "../agent-cli-profiles.js";
 import { installDaemon, type InstallDeps, type HealthProbe } from "./launchd.js";
 
 function defaultBotRelayDir(): string {
@@ -254,18 +256,27 @@ export function installMcpServer(distEntry: string, jsonPath: string = claudeJso
  * prior RAW (unquoted) literal of this exact root to the quoted form, so the
  * ambiguous shape drains out of the installed base instead of being carried
  * forever. Migration is exact-literal, never a classifier (see config-merge). */
-export function installHook(hookScript: string, settingsPath: string = claudeSettingsPath()): { changed: boolean } {
+export function installHook(
+  hookScript: string,
+  settingsPath: string = claudeSettingsPath(),
+): { changed: boolean; note?: string } {
+  // The matcher comes from the profile registry, the one source generate-hooks
+  // also reads. It used to be a second hardcoded copy here.
+  const ss = getAgentCliProfile("claude")?.hookInstall.events.find((e) => e.event === "SessionStart");
+  if (!ss) throw new Error("[init] the claude profile has no SessionStart hook");
   const existing = readJsonSafe(settingsPath);
   const canonical = quoteForHookCommand(hookScript);
   const migrated = migrateRawHookCommand(existing, hookScript, canonical);
-  const { root, changed } = upsertSessionStartHook(migrated.root, {
-    matcher: "startup|resume",
+  // ADR-0036 S1 completion: widen an existing install, exact-literal (see widenRelayHookMatcher).
+  const widened = widenRelayHookMatcher(migrated.root, canonical, ss.priorMatchers ?? [], ss.matcher);
+  const { root, changed } = upsertSessionStartHook(widened.root, {
+    matcher: ss.matcher,
     command: canonical,
-    timeout: 10,
+    timeout: ss.timeout ?? 10,
   });
-  const anyChange = migrated.changed || changed;
+  const anyChange = migrated.changed || widened.changed || changed;
   if (anyChange) atomicWriteJson(settingsPath, root, 0o600);
-  return { changed: anyChange };
+  return { changed: anyChange, ...(widened.note ? { note: widened.note } : {}) };
 }
 
 /**
@@ -675,6 +686,7 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     process.stdout.write(
       `✓ ~/.claude/settings.json: SessionStart hook ${r.changed ? "merged" : "already present (no change)"}\n`,
     );
+    if (r.note) process.stderr.write(`⚠ ~/.claude/settings.json: ${r.note}\n`);
   }
 
   // ---- 4. macOS launchd daemon (collision-safe) ----------------------------

@@ -108,6 +108,22 @@ if [ ! -t 0 ]; then
   # truncated payload is not valid JSON and would only produce a confusing refusal.
 fi
 
+# ADR-0036 S1 completion — the SessionStart SOURCE (startup|resume|clear|compact|
+# fork). A real JSON parse with perl's core JSON::PP (no new dependency; perl
+# already reads stdin above), top-level key only, then an allowlist. Anything
+# unparseable or odd is "", which changes nothing below.
+RELAY_HOOK_SOURCE=""
+if [ -n "$RELAY_HOOK_PAYLOAD" ] && command -v perl >/dev/null 2>&1; then
+  RELAY_HOOK_SOURCE=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | perl -MJSON::PP -e '
+    my $d = eval { JSON::PP->new->decode(do { local $/; <STDIN> }) };
+    print $d->{source} if ref($d) eq "HASH" && defined $d->{source} && !ref($d->{source});
+  ' 2>/dev/null || printf '')
+  case "$RELAY_HOOK_SOURCE" in
+    startup|resume|clear|compact|fork) ;;
+    *) RELAY_HOOK_SOURCE="" ;;
+  esac
+fi
+
 AGENT_NAME="${RELAY_AGENT_NAME:-default}"
 AGENT_ROLE="${RELAY_AGENT_ROLE:-user}"
 AGENT_CAPS="${RELAY_AGENT_CAPABILITIES:-}"
@@ -718,6 +734,17 @@ SQL
     # --- end dead-anchor diagnostic ----------------------------------------
   fi
 fi
+
+# ADR-0036 row 8, "identity carries": /clear and /compact re-fire SessionStart in
+# the SAME window, in the SAME process. Nothing a register would refresh (the PID
+# chain, host_id, the anchor) has changed, and a register ROTATES session_id,
+# which re-pends mail this session already read. The 120s LIVE gate above does
+# not cover it: an auto-compact after two idle minutes reads STALE and would
+# re-register. The bind below still records the new conversation id.
+# `resume` still registers: a resumed conversation may be in a NEW window.
+case "$RELAY_HOOK_SOURCE" in
+  clear|compact) SKIP_REGISTER=1 ;;
+esac
 
 # v2.16.3 — relay_machine_guid + relay_pid_chain (Tether v0.3 PID-handshake)
 # moved to _vault-helpers.sh (sourced above) so the Codex SessionStart hook

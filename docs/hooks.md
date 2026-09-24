@@ -32,7 +32,7 @@ Add to `~/.claude/settings.json` (global) or `.claude/settings.json` (per-projec
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|resume",
+        "matcher": "startup|resume|clear|compact|fork",
         "hooks": [
           {
             "type": "command",
@@ -47,6 +47,8 @@ Add to `~/.claude/settings.json` (global) or `.claude/settings.json` (per-projec
 ```
 
 Replace `/path/to/` with the actual path to your bot-relay-mcp installation.
+
+The matcher includes `clear`, `compact` and `fork` so the relay records which conversation the window holds: `/clear` and a fork start a new conversation in the same window, and a narrower matcher leaves the record pointing at the old one. On `clear` and `compact` the hook does not re-register, because it is the same window and the same process. `relay init` widens an existing `startup|resume` entry for you; a matcher you edited by hand is left alone, and `relay init` warns that it will miss `/clear`.
 
 ### 3. That's it
 

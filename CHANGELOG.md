@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — the window record followed `/clear` only on machines installed from scratch (ADR-0036 S1 completion)
+
+S1 records which conversation a window holds, but the SessionStart hook was installed with `startup|resume`. So `/clear`, which starts a new conversation in the same window, never reached it. The record kept the old conversation id, and a restart line built from it would resume the wrong conversation.
+
+- The Claude SessionStart matcher is now `startup|resume|clear|compact|fork`, the five sources measured to fire (ADR-0036 E4). `relay init` reads it from the CLI profile registry instead of its own hardcoded copy. Codex is unchanged: its sources were never measured.
+- **Existing installs are widened too.** `upsertSessionStartHook` deliberately leaves an installed relay hook alone, so a new default alone would never reach a machine that already has one. `relay init` now widens the relay's own entry only when its matcher is exactly the old default. This is exact-literal, like the raw-command migration.
+  - A group shared with another tool's hook is split, so that hook keeps its matcher.
+  - A matcher edited by hand is left alone, and `relay init` warns on stderr that the window will miss `/clear`.
+- **`/clear` and `/compact` do not re-register.** They re-fire SessionStart in the same window and process (ADR-0036 row 8, "identity carries"). A re-register rotates `session_id` and brings back mail this session already read. An auto-compact after two idle minutes would otherwise have done that, because the 120-second "live" gate reads the row as stale. The bind still records the new conversation. `resume` still registers, because a resumed conversation can be in a new window.
+- Tests: `tests/adr-0036-s1c-widened-matcher.test.ts`.
+  - 8 of its 13 cases were red on the old code. The 5 that passed there are controls; they include a recording stub daemon showing that `startup` and `resume` do call `register_agent`.
+  - Reverting the implementation turns the same 8 red.
+  - Two mutations are each caught: widening a shared group instead of splitting it, and dropping the hand-edit warning.
+
 ### Added — a window now RECORDS which identity it holds, and says so (`relay bind` + `relay fleet`, ADR-0036 S1)
 
 A terminal could become agent X without anything observable happening: no record of which window held which name, on which conversation, and no way to ask. When that binding went stale the only symptom was mail that never arrived. S1 **records and lists**; it changes no auth and performs **no** automatic rebind (that is S3-lite).
