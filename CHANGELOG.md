@@ -42,6 +42,24 @@ Two notes for anyone reading the hook diff:
 
 - The payload read is bounded by **time**, not size. A size bound (`head -c`) blocks until the writer closes, and `spawn(cmd, {})` with no `stdio` option hands the child a pipe nobody ever closes — which hung SessionStart against its 10s timeout and was caught by CANARY 6. Where no bounded read is available the payload is **skipped**: one unrecorded window costs less than a hung session start.
 - `docs/hook-payload-format.md` listed `hook_event_name` as "One of: …", an exhaustive set that omitted `SessionEnd` — an affirmative claim it did not exist. Now non-exhaustive, with a SessionEnd section and a SessionStart `source` table (`startup`/`resume`/`fork`/`clear`/`compact`), including that `clear` and `fork` change the conversation id while `compact` does not, that SessionEnd's `clear` carries the **old** id, that `/compact` fires no SessionEnd at all, and that a reboot's SIGTERM arrives as `other` — indistinguishable from a terminal close.
+### Added — ADR-0040 building blocks: a context meter and a restart-line field validator (not wired to any surface yet)
+
+Two pure modules for the self-serve fleet restart list (ADR-0040). Nothing calls them yet: the `relay fleet --lines` generator that uses them builds on ADR-0036 S1 (#276) and lands after it.
+
+- **`src/fleet-meter.ts`**: `meterFromTranscript(text)` / `readTranscriptMeter(path)` reads one Claude Code transcript or Codex rollout. It returns the newest model, the context size, the window, the fraction used, a level (`ok`, `amber` at 40%, `red` at 70%, or `unknown`), the compaction count, and whether the conversation can be resumed.
+  - **Allowlist, not denylist.** Only the model, usage numbers, compaction markers and session/parent ids are read. The result has no field that can carry transcript content, and a model string that is not model-shaped is dropped.
+  - **A Claude transcript does not record its window.** A 1M session records a bare `claude-opus-5-5` (measured). The window is used as declared by the caller unless the transcript contradicts it, or inferred from evidence (context or a compaction's `preTokens` above 200k proves 1M), or else reported `unknown`. It is never guessed, and `unknown` is not an all-clear. Codex records `model_context_window` itself.
+  - Codex context is `input_tokens` alone: `cached_input_tokens` is a subset of it, not an addend (measured).
+  - **Sub-agents are not resumable.** A Codex rollout with `source.subagent` or `parent_thread_id`, or a Claude sidechain transcript with an `agentId`, points at its parent.
+  - Unparseable lines are counted, so a torn file shows up rather than silently reading as a smaller context.
+- **`src/fleet-line-fields.ts`**: `validateLineFields(input, policy)` checks every field before it can go into a pasted shell line, and refuses with every reason on any failure:
+  - conversation id: a lowercase UUID;
+  - name and role: `[a-z0-9-]`;
+  - folder: absolute, no control characters, an existing directory whose realpath is under an allowlisted root (no roots allows nothing);
+  - model: must be on the caller's known list;
+  - a sub-agent conversation is refused, and the reason names its parent.
+  `shellQuote(value)` POSIX-quotes a value and refuses control characters instead of quoting them.
+- Tests: `tests/adr-0040-context-meter.test.ts` and `tests/adr-0040-line-fields.test.ts`. Fixture shapes were measured from real transcripts. The quoting is proven by running every hostile value through `/bin/sh` and `zsh` and getting it back byte-identical with no side effect. Nine targeted mutations each turn a named case red: prefix-only root check, no escaping, no sidechain filter, a guessed window, summed Codex cache, ignored `parent_thread_id`, unshaped model, quoted control characters, no realpath.
 
 ### Added — opt-in same-name instance addressing via auto-suffix (`register_agent` `on_name_collision`)
 
