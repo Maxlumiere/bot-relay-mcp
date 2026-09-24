@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — the board's post-deploy verifier could "pass" without running a single check
+
+`dashboard/verify-deploy.mjs` decided whether it was being run directly by comparing `import.meta.url` with `` `file://${process.argv[1]}` ``. The module URL is symlink-resolved and percent-encoded; `argv[1]` is neither. So from a checkout path containing a space, through a symlinked file, or under a symlinked directory (on macOS `/tmp` and `/var/folders` are themselves symlinks), the script skipped `main()` and exited 0 with no output: a green verifier that had verified nothing.
+
+- Entrypoint detection now compares `pathToFileURL(realpathSync(argv[1]))` with the module URL. A run that looks direct (same file name) but cannot be confirmed exits 2 with an explanation instead of silently succeeding.
+- The exit code comes from one rule (`exitCodeFor`): 0 only when checks actually ran and all of them passed.
+- New `dashboard/test/entrypoint.test.mjs` runs the real script as a subprocess from a path with a space, through a symlinked file and under a symlinked directory. Each shape was seen exiting 0 silently on the old code; a plain-path control passes on both.
+- CI now runs the dashboard tests (`node --test`), which it never did before.
+
 ### Added — opt-in same-name instance addressing via auto-suffix (`register_agent` `on_name_collision`)
 
 Several CLIs sharing ONE agent definition all register the same name and are hard-rejected with `NAME_COLLISION_ACTIVE`. New OPT-IN input `on_name_collision: "reject" | "suffix"` (default `"reject"` — today's behavior exactly, silence changes nothing). With `"suffix"`, an actively-held name registers instead as a relay-assigned instance `<name>-N` (lowest free N≥2), returned as `assigned_name` alongside an unmissable **not-restart-stable** warning (also stated in the tool description, so an LLM client reads it in the schema).
