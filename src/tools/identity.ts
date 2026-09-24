@@ -21,13 +21,14 @@ import {
   setAgentLivenessAnchor,
   NameCollisionActiveError,
   isNameActivelyHeld,
+  isHeldByLiveForeignAnchor,
   resolveAvailableInstanceName,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
 import { log } from "../logger.js";
 import { currentContext } from "../request-context.js";
-import { updateCapturedSessionId, stampDetectedAgentLiveness } from "../transport/stdio.js";
+import { updateCapturedSessionId, stampDetectedAgentLiveness, getDetectedAgentProcess } from "../transport/stdio.js";
 import { defaultTokenStore } from "../token-store.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { ERROR_CODES } from "../error-codes.js";
@@ -110,7 +111,22 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     // freshness + active status), NOT the `status` column. resolveAvailableInstanceName
     // uses the SAME predicate for reuse, so the suffix path can never disagree
     // with the collision path and hand a live instance's name to a new caller.
-    if (isNameActivelyHeld(requestedRow)) {
+    // ADR-0042 R2: "held" is EITHER the last_seen triple OR a LIVE stored anchor
+    // that is not the caller's. last_seen alone let a live but quiet window read
+    // stale, and another process with the token took its row (MEASURED 24 Sep).
+    // The caller's anchor: what it states, or, for a stdio connector registering
+    // its own name, the window it detected at startup.
+    const statedAnchor =
+      typeof input.agent_pid === "number"
+        ? { pid: input.agent_pid, startedAt: input.agent_pid_start ?? null, hostId: input.host_id ?? null }
+        : null;
+    const detected =
+      statedAnchor === null && currentContext().transport === "stdio" && process.env.RELAY_AGENT_NAME === input.name
+        ? getDetectedAgentProcess()
+        : null;
+    const callerAnchor = statedAnchor ?? (detected ? { pid: detected.pid, startedAt: detected.startedAt, hostId: null } : null);
+    const heldByLiveWindow = isHeldByLiveForeignAnchor(requestedRow, callerAnchor);
+    if (isNameActivelyHeld(requestedRow) || heldByLiveWindow) {
       if (input.on_name_collision === "suffix") {
         const suffixed = resolveAvailableInstanceName(input.name);
         if (suffixed === null) {
@@ -148,6 +164,10 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
                 {
                   success: false,
                   error:
+                    (heldByLiveWindow
+                      ? `Agent "${input.name}" is held by a LIVE window (pid ${requestedRow.agent_pid} on this host) ` +
+                        `and this caller is not that window, so nothing was changed. `
+                      : "") +
                     `Agent "${input.name}" is already registered and online on another session ` +
                     `(session_id=${requestedRow.session_id}, last_seen=${requestedRow.last_seen}). ` +
                     `Two terminals running under the same name will race on get_messages and silently drop mail. ` +

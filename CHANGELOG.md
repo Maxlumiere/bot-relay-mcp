@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixed — a second process with an agent's name could silently take over a live window's row (ADR-0042 R2)
+
+Measured on 24 Sep, two ways in:
+- **A re-register.** The collision check judged "is this name in use?" by `last_seen`, which reading mail does not update. So a live but quiet window looked stale, and another process holding the token re-registered over it.
+- **An anchor stamp.** A new window's connector stamped its liveness anchor over a still-open window's row. That left the row pointing at one window's process and another window's session.
+
+Now a register, `report_liveness` or a connector anchor stamp is refused when the row's stored anchor is alive and is not the caller's. The liveness check is the anchor-only one.
+- The refusal is `NAME_COLLISION_ACTIVE`, and it names the way forward: close the live window, `relay release-binding` once it is gone, or give the second process its own name.
+- A caller that states no anchor cannot prove it is the holder, so it is refused too.
+- A dead holder is a relaunch and proceeds. The declared takeover route (`force` with `expected_session_id`) stays open.
+- The connector's startup stamp used to swallow errors. It now logs the refusal and writes an audit entry.
+- The SessionStart hook checks the stored anchor before it tries to register. If a live window holds the name, the hook says so and sets a REGISTER_FAILED verdict, instead of attempting the register and failing with a generic collision.
+
+Tests: `tests/adr-0042-r2-no-silent-takeover.test.ts` and `tests/adr-0042-r2-hook-gate.test.ts`.
+- Both measured cases were red on the old code.
+- The twin cases still succeed: the holder's own re-stamp and re-register, a dead holder, and the declared force route.
+
 ### Added — `relay fleet --lines`: a checked restart line for every window that needs resuming (ADR-0036 S1 completion, ADR-0040)
 
 Restoring the fleet after a reboot no longer needs anyone to remember which window held which conversation. `relay fleet --lines` prints one line per window that needs resuming. It is built from the recorded binding, never from a request:

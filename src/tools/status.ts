@@ -44,11 +44,32 @@ const EXEMPT_FROM_REASSIGN = new Set(["working", "blocked", "waiting_user"]);
  * Auth: own agent token only (agent_name is the caller field).
  */
 export function handleReportLiveness(input: ReportLivenessInput) {
-  const updated = setAgentLivenessAnchor(
+  let updated: boolean;
+  try {
+    updated = setAgentLivenessAnchor(
     input.agent_name,
     input.agent_pid,
     input.agent_pid_start ?? null,
   );
+  } catch (err) {
+    // ADR-0042 R2: this process is not the live window that holds the row.
+    if (err instanceof Error && err.name === "LiveAnchorHeldError") {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              { success: false, error: err.message, error_code: ERROR_CODES.NAME_COLLISION_ACTIVE },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    throw err;
+  }
   if (!updated) {
     return {
       content: [

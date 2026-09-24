@@ -100,9 +100,26 @@ export function stampDetectedAgentLiveness(name: string | undefined): void {
     if (!name || !ownName || ownName !== name) return;
     if (!detectedAgentProcess) return;
     setAgentLivenessAnchor(name, detectedAgentProcess.pid, detectedAgentProcess.startedAt);
-  } catch {
+  } catch (err) {
     // Liveness is best-effort — never block startup/register on a stamp miss.
+    // ADR-0042 R2: but a REFUSAL is not a miss. This window tried to take a row a
+    // live window holds; say so loudly (stderr + audit) instead of swallowing it.
+    if (err instanceof Error && err.name === "LiveAnchorHeldError") {
+      log.warn(`[stdio] ${err.message}`);
+      try {
+        logAudit(name ?? "", "stdio.anchor_stamp_refused", "live foreign anchor", false, err.message, "stdio", {
+          pid: detectedAgentProcess?.pid ?? null,
+        });
+      } catch {
+        /* audit best-effort */
+      }
+    }
   }
+}
+
+/** The agent process this connector detected at startup (its window), or null. */
+export function getDetectedAgentProcess(): AgentProcess | null {
+  return detectedAgentProcess;
 }
 
 /** Test-only: override the detected agent process. */

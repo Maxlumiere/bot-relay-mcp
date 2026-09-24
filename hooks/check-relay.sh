@@ -612,6 +612,17 @@ UUID=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "hook-$$-$(date 
 # relaunch of an offline/stale row, so the Tether PID-handshake can refresh.
 # v2.1 Phase 4b.1 v2: also skip if we just completed a recovery above — the
 # register_agent over HTTP already wrote the row.
+# The row's STORED liveness anchor as "pid|start|host". One reader, used by the
+# dead-anchor diagnostic and by the ADR-0042 R2 gate below; the liveness JUDGEMENT
+# is relay_anchor_liveness (the conformance-pinned twin of anchorLivenessVerdict).
+relay_stored_anchor_row() {
+  sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
+.parameter set :name '$AGENT_NAME'
+SELECT COALESCE(agent_pid,''), COALESCE(agent_pid_start,''), COALESCE(host_id,'')
+FROM agents WHERE name = :name LIMIT 1;
+SQL
+}
+
 SKIP_REGISTER=0
 if [ "$RECOVERY_COMPLETED" -eq 1 ]; then
   SKIP_REGISTER=1
@@ -680,12 +691,7 @@ SQL
     # problem dominates the verdict line).
     if [ "$RELAY_VERDICT" != "MUTE" ]; then
       RELAY_OWN_GUID=$(relay_machine_guid 2>/dev/null || printf '')
-      RELAY_ANCHOR_ROW=$(sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-SELECT COALESCE(agent_pid,''), COALESCE(agent_pid_start,''), COALESCE(host_id,'')
-FROM agents WHERE name = :name LIMIT 1;
-SQL
-)
+      RELAY_ANCHOR_ROW=$(relay_stored_anchor_row)
       RELAY_A_PID="${RELAY_ANCHOR_ROW%%|*}"
       RELAY_A_REST="${RELAY_ANCHOR_ROW#*|}"
       RELAY_A_START="${RELAY_A_REST%%|*}"
@@ -745,6 +751,32 @@ fi
 case "$RELAY_HOOK_SOURCE" in
   clear|compact) SKIP_REGISTER=1 ;;
 esac
+
+# ADR-0042 R2 — NO SILENT TAKEOVER. The last_seen gate above reads a live but QUIET
+# window as STALE (observation does not bump last_seen), which is how a second
+# process carrying this name re-registered over a live window (MEASURED 24 Sep).
+# Before registering, ask the row's STORED ANCHOR: if it is ALIVE and is not this
+# window, this window is not the agent. Do not try; say so. The server refuses the
+# same register anyway (isHeldByLiveForeignAnchor), so this only makes the refusal
+# true and early instead of a generic collision.
+if [ "$SKIP_REGISTER" -eq 0 ] && [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
+  RELAY_HELD_ROW=$(relay_stored_anchor_row)
+  RELAY_HELD_PID="${RELAY_HELD_ROW%%|*}"
+  RELAY_HELD_REST="${RELAY_HELD_ROW#*|}"
+  RELAY_HELD_START="${RELAY_HELD_REST%%|*}"
+  RELAY_HELD_HOST="${RELAY_HELD_REST##*|}"
+  if [ -n "$RELAY_HELD_PID" ]; then
+    RELAY_HELD_VERDICT=$(relay_anchor_liveness "$RELAY_HELD_PID" "$RELAY_HELD_START" "$RELAY_HELD_HOST" "$(relay_machine_guid 2>/dev/null || printf '')")
+    RELAY_MY_PID=$(relay_agent_pid 2>/dev/null || printf '')
+    RELAY_MY_START=""
+    [ -n "$RELAY_MY_PID" ] && RELAY_MY_START=$(relay_pid_start "$RELAY_MY_PID" 2>/dev/null || printf '')
+    if [ "$RELAY_HELD_VERDICT" = "alive" ] && { [ "$RELAY_MY_PID" != "$RELAY_HELD_PID" ] || [ "$RELAY_MY_START" != "$RELAY_HELD_START" ]; }; then
+      SKIP_REGISTER=1
+      echo "[RELAY] \"$AGENT_NAME\" is held by a LIVE window (pid $RELAY_HELD_PID on this host), and this window is not it: NOT registered, nothing changed. Close that window first, or give this one its own RELAY_AGENT_NAME."
+      command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "REGISTER_FAILED" "held by a live window (pid $RELAY_HELD_PID): this window is not \"$AGENT_NAME\"" " agent=\"$AGENT_NAME\""
+    fi
+  fi
+fi
 
 # v2.16.3 — relay_machine_guid + relay_pid_chain (Tether v0.3 PID-handshake)
 # moved to _vault-helpers.sh (sourced above) so the Codex SessionStart hook

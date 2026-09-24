@@ -11,7 +11,7 @@ import os from "os";
 // "type":"module", so a bare `require(...)` is undefined at runtime — importing
 // createRequire from "module" is the supported way to do a sync require in ESM.
 import { createRequire } from "module";
-import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised } from "./liveness.js";
+import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised, anchorLivenessVerdict } from "./liveness.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -3395,6 +3395,47 @@ export function listAgentBindings(db: CompatDatabase): BindingListRow[] {
     .all() as BindingListRow[];
 }
 
+/** ADR-0042 R2: a write that would take over a row whose window is alive. */
+export class LiveAnchorHeldError extends Error {
+  constructor(name: string, heldByPid: number) {
+    super(
+      `"${name}" is held by a LIVE window (pid ${heldByPid} on this host), and this process is not that window. ` +
+        `Nothing was changed. Close that window first (its row then reads dead and can be taken), or, once it is ` +
+        `gone, run \`relay release-binding ${name}\`. To run a second agent at the same time, give it its own ` +
+        `RELAY_AGENT_NAME.`,
+    );
+    this.name = "LiveAnchorHeldError";
+  }
+}
+
+/**
+ * ADR-0042 R2 — is this row held by a LIVE window that is not the caller?
+ *
+ * True when the row's stored anchor (host_id + agent_pid + agent_pid_start) reads
+ * `alive` under anchorLivenessVerdict (anchor-only, same host) AND the caller's
+ * anchor is not that anchor. A caller that states no anchor cannot prove it is the
+ * holder, so it counts as foreign. `dead` and `unverifiable` return false: a dead
+ * holder is a relaunch, and unverifiable is not proof of life.
+ *
+ * This replaces trusting `last_seen` for the takeover decision: observation does
+ * not bump last_seen, so a live but quiet window read STALE, and that was the
+ * door (MEASURED 24 Sep).
+ */
+export function isHeldByLiveForeignAnchor(
+  row: Pick<AgentRecord, "host_id" | "agent_pid" | "agent_pid_start"> | null | undefined,
+  caller: { pid: number; startedAt: string | null; hostId?: string | null } | null,
+): boolean {
+  if (!row || typeof row.agent_pid !== "number" || row.agent_pid <= 0) return false;
+  const ownHost = getOwnHostId();
+  if (anchorLivenessVerdict(row, ownHost) !== "alive") return false;
+  const isSame =
+    caller !== null &&
+    caller.pid === row.agent_pid &&
+    (caller.startedAt ?? null) === (row.agent_pid_start ?? null) &&
+    (caller.hostId ?? ownHost) === row.host_id;
+  return !isSame;
+}
+
 export function setAgentLivenessAnchor(
   name: string,
   pid: number,
@@ -3403,6 +3444,17 @@ export function setAgentLivenessAnchor(
   if (!name || !Number.isInteger(pid) || pid <= 0) return false;
   const db = getDb();
   const ownHost = getOwnHostId();
+  // ADR-0042 R2: never overwrite a LIVE foreign anchor. A new window's connector
+  // stamping over a still-open window's anchor left architect's row with window
+  // N's anchor and window N-1's session (MEASURED). Refused loudly instead.
+  const held = db
+    .prepare("SELECT host_id, agent_pid, agent_pid_start FROM agents WHERE name = ?")
+    .get(name) as Pick<AgentRecord, "host_id" | "agent_pid" | "agent_pid_start"> | undefined;
+  if (isHeldByLiveForeignAnchor(held, { pid, startedAt, hostId: ownHost })) {
+    _negativeProbeCache.delete(name);
+    _positiveProbeCache.delete(name);
+    throw new LiveAnchorHeldError(name, held!.agent_pid as number);
+  }
   const r = db
     .prepare(
       "UPDATE agents SET agent_pid = ?, agent_pid_start = ?, host_id = COALESCE(host_id, ?) WHERE name = ?",
