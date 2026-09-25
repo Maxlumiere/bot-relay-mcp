@@ -12,7 +12,8 @@
  * The harm: an agent's identity is created / replaced / deleted OUTSIDE the
  * single sanctioned mutation site (src/db.ts), bypassing the invariants that
  * live only there. The predicate: any INSERT / REPLACE / UPDATE / DELETE of the
- * `agents` or `agent_capabilities` table in a src/ file other than db.ts.
+ * `agents`, `agent_capabilities` or `agent_bindings` (ADR-0036 S1) table in a src/
+ * file other than db.ts.
  *
  * The prior guard was a case-sensitive grep that classified TEXT; it covered no
  * INSERT/REPLACE and missed main.agents / aliases / comments / case. Each of
@@ -45,7 +46,7 @@ const LEGACY_GREP =
   /(UPDATE\s+agents|DELETE\s+FROM\s+agents|UPDATE\s+agent_capabilities|DELETE\s+FROM\s+agent_capabilities)/;
 
 describe("v2.24.0 — sanctioned-mutation guard (ADR-0015)", () => {
-  it("real src/ passes — every agents/agent_capabilities mutation already funnels through db.ts", () => {
+  it("real src/ passes — every agents/agent_capabilities/agent_bindings mutation already funnels through db.ts", () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const srcDir = path.resolve(here, "..", "src");
     // Walk src/ the way the CLI does, minus db.ts, and assert zero violations.
@@ -174,6 +175,33 @@ describe("v2.24.0 — sanctioned-mutation guard (ADR-0015)", () => {
       expect(() => mutatesAgentsTable(junk)).not.toThrow();
       expect(mutatesAgentsTable(junk)).toBe(false);
     }
+  });
+});
+
+// ADR-0036 S1 — agent_bindings records which window holds which name. A raw
+// write outside src/db.ts could forge or erase that record, so it is guarded like
+// agents / agent_capabilities: db.ts is its only writer (D3, accepted).
+describe("ADR-0036 S1 — agent_bindings is a guarded identity table", () => {
+  const BINDING_HARM: Array<[string, string]> = [
+    ["INSERT", "INSERT INTO agent_bindings (binding_id, conversation_id) VALUES (?, ?)"],
+    ["INSERT OR REPLACE", "INSERT OR REPLACE INTO agent_bindings (binding_id) VALUES (?)"],
+    ["UPDATE", "UPDATE agent_bindings SET superseded_at = ? WHERE binding_id = ?"],
+    ["DELETE", "DELETE FROM agent_bindings WHERE binding_id = ?"],
+    ["schema-qualified", "UPDATE main.agent_bindings SET end_reason = ? WHERE binding_id = ?"],
+  ];
+  for (const [label, sql] of BINDING_HARM) {
+    it(`HARM flagged: agent_bindings ${label} outside db.ts`, () => {
+      expect(flagged(sql), `guard must flag: ${sql}`).toBe(true);
+    });
+  }
+
+  it("INNOCENT: the same agent_bindings mutation inside src/db.ts is sanctioned", () => {
+    const src = inFile("UPDATE agent_bindings SET end_reason = ? WHERE binding_id = ?");
+    expect(findSanctionedMutationViolations(src, "src/db.ts")).toEqual([]);
+  });
+
+  it("INNOCENT: a SELECT of agent_bindings (relay fleet's read) is not a mutation", () => {
+    expect(flagged("SELECT * FROM agent_bindings WHERE agent_name = ?")).toBe(false);
   });
 });
 

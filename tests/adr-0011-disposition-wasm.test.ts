@@ -66,8 +66,8 @@ describe("ADR-0011 (wasm) — migration + read-receipt + overdue on sql.js", () 
     expect(getActiveDriver()).toBe("wasm");
   });
 
-  it("migrates to v24 and the NOT NULL DEFAULT backfills disposition='log'", () => {
-    expect(getSchemaVersion()).toBe(24);
+  it("migrates to the current schema (v25; v24 added disposition) and the NOT NULL DEFAULT backfills disposition='log'", () => {
+    expect(getSchemaVersion()).toBe(25);
     registerAgent("alice", "r", []);
     registerAgent("bob", "r", []);
     const m = sendMessage("alice", "bob", "fyi", "normal");

@@ -64,7 +64,10 @@ function runHook(env: Record<string, string> = {}): string {
   }
   try {
     return execFileSync("bash", [HOOK], {
-      env: { ...inherited, HOME: home, RELAY_AGENT_NAME: "probe", ...env },
+      // ADR-0036 S1: pin the daemon port to an unreachable one. Unpinned, the hook fell back
+      // to 127.0.0.1:3777 — the LIVE daemon on a developer machine — and could register
+      // "probe" there. These tests judge config diagnostics, never a live relay.
+      env: { ...inherited, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_HTTP_PORT: "1", ...env },
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -261,9 +264,12 @@ describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
     fs.symlinkSync("work", path.join(home, ".bot-relay", "active-instance"));
   }
 
-  it("HEALTHY when the config resolves and the instance is consistent", () => {
+  it("DEGRADED (never HEALTHY) when the config resolves but the daemon is unreachable (ADR-0036 S1, §8a D7 f)", () => {
+    // HEALTHY now also requires the daemon to answer. That positive case, with a real
+    // daemon, lives in tests/adr-0036-s1-hook-truthful-verdict.test.ts; here the port is
+    // pinned closed, so the truthful verdict for a resolving config is DEGRADED.
     linkInstance(); writeConfig(OK);
-    expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb() }))).toBe("HEALTHY");
+    expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb() }))).toBe("DEGRADED");
   });
 
   it("MUTE when the canonical entry points at a missing path", () => {

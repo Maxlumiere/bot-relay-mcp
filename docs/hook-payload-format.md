@@ -23,7 +23,7 @@ every event:
 | `session_id` | string | UUID of the Claude Code session that triggered the hook. |
 | `transcript_path` | string | Absolute path to the session's JSONL transcript file. |
 | `cwd` | string | The session's current working directory at the time of the event. |
-| `hook_event_name` | string | One of: `SessionStart`, `Stop`, `PostToolUse`, `PreToolUse`, `UserPromptSubmit`. |
+| `hook_event_name` | string | The event that fired — e.g. `SessionStart`, `SessionEnd`, `Stop`, `PostToolUse`, `PreToolUse`, `UserPromptSubmit`. Treat this list as non-exhaustive: Claude Code adds event types, and a script that switches on an exhaustive set silently no-ops on a new one. |
 
 Event-specific fields are documented per-event below.
 
@@ -43,9 +43,33 @@ with external services, context injection, stale-state audits.
   "session_id": "<session-id>",
   "transcript_path": "~/.claude/projects/<project>/<session-id>.jsonl",
   "cwd": "/path/to/workspace",
-  "hook_event_name": "SessionStart"
+  "hook_event_name": "SessionStart",
+  "source": "startup"
 }
 ```
+
+**The `source` field** says WHY the session started, and it is the field that
+distinguishes a brand-new window from a continuation. Observed values (MEASURED
+on Claude Code 2.1.272; treat as non-exhaustive):
+
+| `source` | Meaning | `session_id` |
+|----------|---------|--------------|
+| `startup` | A new window. | new |
+| `resume` | `--resume`, `-p --resume`, or in-session `/resume`. | unchanged (the resumed conversation) |
+| `fork` | `--fork-session`. | **new** |
+| `clear` | `/clear` — the window continues, the conversation does not. | **new** |
+| `compact` | Context was compacted mid-session. | unchanged |
+
+`clear` and `fork` are the ones that surprise: the terminal is the same but the
+conversation id changes, so anything keyed to the conversation must decide
+whether to carry across or start fresh. They differ in intent — `clear`
+continues the same window's work under a new id, while `fork` deliberately
+branches — so code that treats them identically will mis-attribute one of them.
+`compact` keeps the same id, so it is a refresh, not a new conversation.
+
+A SessionStart matcher of `startup|resume|clear|compact|fork` fires on all five;
+a `startup`-only matcher fires solely on startup, so the matcher itself is how
+you filter by source.
 
 **Stdout convention:** anything the SessionStart hook writes to stdout is
 injected into the session's context before the first user message. Keep it
@@ -54,6 +78,51 @@ writes a `[RELAY]` banner + pending-mail digest.
 
 **Reference implementation:** `hooks/check-relay.sh` (in this repo). Reads
 env vars AND falls back gracefully if the relay daemon isn't reachable.
+
+## SessionEnd
+
+Fires when a session ends. Use for: releasing a binding, flushing state,
+recording WHY the session ended.
+
+```json
+{
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/<project>/<session-id>.jsonl",
+  "cwd": "/path/to/workspace",
+  "hook_event_name": "SessionEnd",
+  "reason": "prompt_input_exit"
+}
+```
+
+The `reason` field carries the cause of the end. Observed values (MEASURED on
+Claude Code 2.1.272; treat as non-exhaustive):
+
+| `reason` | Cause |
+|----------|-------|
+| `prompt_input_exit` | `/exit` — the user explicitly closed the session. |
+| `clear` | `/clear`. Carries the **OLD** `session_id`, and fires immediately before `SessionStart` with `source: "clear"` and the NEW id. |
+| `other` | SIGTERM **and** terminal close (SIGHUP) — these are not distinguishable here. |
+
+Two consequences worth designing around:
+
+- **`/compact` fires no SessionEnd at all.** A cleanup keyed to SessionEnd will
+  simply not run across a compaction, so anything that must survive one cannot
+  depend on this event.
+- **"Explicitly closed" means `prompt_input_exit` only.** A machine rebooting
+  sends SIGTERM, which arrives as `other` — identical to the user closing the
+  window. Treating `other` as a deliberate exit will mistake a reboot for one.
+
+Record `reason` verbatim rather than mapping it to a local vocabulary — a reason
+you do not recognise today is still the truth about what happened, and rewriting
+it loses the only evidence of an end you did not expect.
+
+**Stdout convention:** treat SessionEnd's stdout as discarded, the same as
+`Stop`. Write to disk or stderr.
+
+> **Not the same as `Stop`.** `Stop` fires when the assistant finishes responding
+> and can fire many times in one session; `SessionEnd` fires once, when the
+> session itself is over. A script that wants "the session is finished" wants
+> this event, not `Stop`.
 
 ## Stop
 

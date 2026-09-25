@@ -390,6 +390,7 @@ function applySchemaSetup(db: CompatDatabase): void {
   migrateSchemaToV2_22(db);
   migrateSchemaToV2_23(db);
   migrateSchemaToV2_24(db);
+  migrateSchemaToV2_25(db);
   seedBuiltinTaskSchemas(db);
   finalizeSchemaVersion(db);
   purgeOldRecords(db);
@@ -609,7 +610,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 24;
+export const CURRENT_SCHEMA_VERSION = 25;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -707,6 +708,7 @@ export function applyMigration(from: number, to: number): void {
     [21, 22],
     [22, 23],
     [23, 24],
+    [24, 25],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -1847,6 +1849,76 @@ function migrateSchemaToV2_24(db: CompatDatabase): void {
 }
 
 /**
+ * ADR-0036 S1 (schema v25) — `agent_bindings`, the window-bound identity RECORD.
+ * S1 records and lists; no auth path reads this table yet.
+ *   - One current row per WINDOW ANCHOR (host_id, window_pid, window_pid_start) on
+ *     its current Claude Code conversation. Superseded rows are history, never
+ *     deleted.
+ *   - `conversation_id` is NOT NULL: a bind that cannot read the conversation id
+ *     writes nothing (BIND_FAILED), never a guessed or NULL id (§8a D3). Likewise
+ *     the anchor columns.
+ *   - `conversation_title` is display-only ("as named in Claude Code"), never identity.
+ *   - `end_reason` = Claude Code's verbatim SessionEnd reason (NULL if none observed).
+ *     `supersede_reason` = relay-authored (resume-switch, clear-carry, handoff).
+ *     Status derivation reads end_reason only (§8a D2).
+ *   - NO status column: live / exited / needs-resume is derived at read time from
+ *     anchorLivenessVerdict (§2.2), so a stored status can never drift from the anchor.
+ *   - NO unique-per-name constraint: per-name exclusivity is S3's claim-time rule,
+ *     never schema (§8a D1).
+ * Additive: a new table and its indexes; no existing row changes.
+ */
+function migrateSchemaToV2_25(db: CompatDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_bindings (
+      binding_id TEXT PRIMARY KEY,
+      binding_version INTEGER NOT NULL DEFAULT 1,
+      agent_name TEXT,
+      agent_class TEXT,
+      conversation_id TEXT NOT NULL,
+      conversation_title TEXT,
+      cwd TEXT,
+      host_id TEXT NOT NULL,
+      window_pid INTEGER NOT NULL,
+      window_pid_start TEXT NOT NULL,
+      bound_via TEXT NOT NULL,
+      bound_at TEXT NOT NULL,
+      last_verified_at TEXT,
+      superseded_at TEXT,
+      superseded_by TEXT,
+      end_reason TEXT,
+      supersede_reason TEXT
+    )
+  `);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_anchor ON agent_bindings(host_id, window_pid, window_pid_start)");
+  // ONE CURRENT ROW PER WINDOW ANCHOR, ENFORCED BY THE DATABASE (audit round 1,
+  // codex-5-5). upsertAgentBinding used to READ getCurrentBinding() outside the
+  // transaction and then decide insert-vs-supersede, so two concurrent binds could
+  // each observe "no current row" and each INSERT. SQLite serialises individual
+  // writes, NOT a read-then-write decision spread across autocommit statements —
+  // and the plain index above cannot refuse the second row. The result was the
+  // exact harm S1 exists to remove: one window with two unsuperseded identities,
+  // and `relay fleet` offering both as equally plausible.
+  //
+  // The invariant is enforced HERE, where two processes cannot both be wrong,
+  // rather than by care in the writer: a mutex or a re-read before insert is only
+  // a narrower window, not a guarantee.
+  //
+  // PARTIAL, on `superseded_at IS NULL`: superseded rows are history and a window
+  // legitimately accumulates many of them over its life. Only the CURRENT row is
+  // unique per anchor.
+  //
+  // Safe to add to v25 rather than a new v26 because v25 has never shipped — no
+  // released build creates agent_bindings at all, so no deployed database can hold
+  // the duplicate rows that would make this index fail to build on open.
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_bindings_current_anchor " +
+      "ON agent_bindings(host_id, window_pid, window_pid_start) WHERE superseded_at IS NULL",
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_agent_name ON agent_bindings(agent_name)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agent_bindings_conversation ON agent_bindings(conversation_id)");
+}
+
+/**
  * Does this CLI profile OWE a verdict at session start?
  *
  * Derived from the registry rather than listed here, so the recording side and
@@ -2897,6 +2969,432 @@ export function updateAgentMetadata(
  * so a freshly-relaunched agent isn't briefly dead-cached. No-op (false) if the
  * row doesn't exist yet. Sanctioned single-site agents mutation (lives in db.ts).
  */
+/**
+ * ADR-0036 S1 — the `agent_bindings` writer.
+ *
+ * TAKES A HANDLE, never `getDb()` (victra's RULING 1, 2026-09-16): `relay bind`
+ * and `relay fleet` open a RAW handle with busy_timeout only and never run
+ * `applySchemaSetup`, so a schema migration and a record purge can never ride a
+ * path that fires dozens of times a day under a 10s hook timeout, beside old
+ * code mid-rollout. The SQL lives HERE because `agent_bindings` is a guarded
+ * identity table and db.ts is its only sanctioned writer
+ * (scripts/sanctioned-mutation-guard.mjs) — a raw write elsewhere could forge or
+ * erase the record of which window holds which name.
+ */
+export interface BindingAnchor {
+  hostId: string;
+  windowPid: number;
+  windowPidStart: string;
+}
+
+export interface BindingWrite extends BindingAnchor {
+  agentName: string | null;
+  agentClass: string | null;
+  conversationId: string;
+  conversationTitle: string | null;
+  cwd: string | null;
+  boundVia: string;
+}
+
+export type BindingAction = "created" | "refreshed" | "superseded-and-created";
+
+export interface BindingResult {
+  action: BindingAction;
+  bindingId: string;
+  bindingVersion: number;
+  supersededBindingId: string | null;
+}
+
+interface BindingRow {
+  binding_id: string;
+  binding_version: number;
+  conversation_id: string;
+  agent_name: string | null;
+  last_verified_at: string | null;
+}
+
+/**
+ * Is the v25 table present? A bind against a pre-v25 DB must refuse LOUDLY
+ * (BIND_FAILED "schema not migrated"), never migrate and never skip silently.
+ */
+export function hasAgentBindingsTable(db: CompatDatabase): boolean {
+  const row = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_bindings'")
+    .get();
+  return !!row;
+}
+
+/** This window's CURRENT (not superseded) binding, or undefined. */
+export function getCurrentBinding(db: CompatDatabase, anchor: BindingAnchor): BindingRow | undefined {
+  return db
+    .prepare(
+      "SELECT binding_id, binding_version, conversation_id, agent_name, last_verified_at FROM agent_bindings " +
+        "WHERE host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL " +
+        "ORDER BY bound_at DESC LIMIT 1",
+    )
+    .get(anchor.hostId, anchor.windowPid, anchor.windowPidStart) as BindingRow | undefined;
+}
+
+/**
+ * Record this window on this conversation. One current row per WINDOW ANCHOR
+ * (§8a D1 — cardinality is per anchor, never per name; per-name exclusivity is
+ * S3's claim-time job and is never enforced by schema).
+ *
+ *   no current row                    → INSERT                      ("created")
+ *   current row, SAME conversation    → refresh last_verified_at    ("refreshed")
+ *   current row, DIFFERENT conversation → supersede + INSERT        ("superseded-and-created")
+ *
+ * The supersede and the insert commit in ONE transaction: a window must never be
+ * observable with two current rows, nor with none.
+ */
+/**
+ * Is this the loser of a concurrent bind, rather than a real failure?
+ *
+ * TWO shapes, both meaning "someone else won; re-read and decide again":
+ *   SQLITE_CONSTRAINT — the partial unique index refused our INSERT because a
+ *     concurrent process already created the current row for this anchor.
+ *   SQLITE_BUSY / BUSY_SNAPSHOT — CompatDatabase.transaction issues a DEFERRED
+ *     BEGIN (sqlite-compat.ts:198-204; the interface exposes no .immediate()),
+ *     so a read lock upgrading to a write lock can lose under WAL.
+ * Matched on the driver's code AND message because the wasm driver surfaces
+ * these as plain Errors without a `code` property.
+ */
+function isBindContentionError(err: unknown): boolean {
+  const code = String((err as { code?: unknown })?.code ?? "");
+  const msg = err instanceof Error ? err.message : String(err);
+
+  // Lock contention: always a retry candidate.
+  if (/SQLITE_BUSY/i.test(code) || /database (?:table )?is locked/i.test(msg)) return true;
+
+  // A UNIQUE violation is contention ONLY when it is OUR anchor index. Matching
+  // every SQLITE_CONSTRAINT (audit round 2, codex-5-5) meant an unrelated
+  // violation — a NOT NULL, a different unique index — was retried to exhaustion
+  // and then reported as contention, burning the budget and misnaming the cause.
+  //
+  // MEASURED, because SQLite names COLUMNS and not the index, so matching
+  // "idx_agent_bindings_current_anchor" would never fire:
+  //   code:    SQLITE_CONSTRAINT_UNIQUE
+  //   message: UNIQUE constraint failed: agent_bindings.host_id,
+  //            agent_bindings.window_pid, agent_bindings.window_pid_start
+  // `\bwindow_pid\b` does not match `window_pid_start` (`_` is a word char), so
+  // all three columns must genuinely be named.
+  if (/SQLITE_CONSTRAINT/i.test(code) || /UNIQUE constraint failed/i.test(msg)) {
+    return (
+      /agent_bindings\.host_id/i.test(msg) &&
+      /agent_bindings\.window_pid\b/i.test(msg) &&
+      /agent_bindings\.window_pid_start/i.test(msg)
+    );
+  }
+  return false;
+}
+
+/**
+ * CONCURRENCY (audit round 1, codex-5-5 — this was a real defect).
+ *
+ * The read that DECIDES insert-vs-refresh-vs-supersede must be inside the same
+ * transaction as the write it authorises. It previously sat outside, so two
+ * concurrent binds could each read "no current row" and each INSERT: SQLite
+ * serialises individual writes, not a read-then-write decision spread across
+ * autocommit statements.
+ *
+ * The transaction is NOT the guarantee — the partial unique index on
+ * (host_id, window_pid, window_pid_start) WHERE superseded_at IS NULL is. With a
+ * DEFERRED begin two processes can still both read an empty anchor; the index is
+ * what refuses the second INSERT, and this retry is what turns that refusal into
+ * the correct outcome (the loser re-reads and refreshes or supersedes) instead of
+ * a raw SQLITE_CONSTRAINT surfacing to a SessionStart hook.
+ *
+ * BOUNDED BY THE DEADLINE, because a hook must never spin: once the remaining
+ * budget falls below one viable attempt the error is rethrown and `relay bind`
+ * reports BIND_FAILED loudly, naming the elapsed time, rather than hanging.
+ */
+/**
+ * THE BIND RETRY BUDGET — what it actually guarantees, stated exactly.
+ *
+ * This is **best-effort budgeting with a bounded per-statement envelope**, NOT a
+ * strict whole-operation deadline. Saying otherwise would be a claim the
+ * mechanism does not give (audit, codex-5-5):
+ *   - the deadline is checked BETWEEN attempts, not inside one;
+ *   - `busy_timeout` is set once per ATTEMPT, not per statement;
+ *   - so a synchronous statement can consume its own bounded wait AFTER the last
+ *     deadline check, and one attempt may contain several such statements.
+ *
+ * WORST CASE, computed rather than estimated:
+ *     total <= BIND_BUDGET_MS + (MAX_LOCKING_STATEMENTS * BIND_BUSY_CAP_MS)
+ *            = 3000 + (3 * 400) = 4200ms
+ * MAX_LOCKING_STATEMENTS = 3 is read off the longest write path, the supersede
+ * branch: UPDATE (supersede) + INSERT (new row) + COMMIT. `getCurrentBinding`'s
+ * SELECT does not block under WAL. The created and refreshed branches run two.
+ * In practice the figure is lower, because the per-attempt cap is drawn from what
+ * REMAINS (`min(remaining - floor, cap)`) and so shrinks as the deadline nears.
+ * 4200ms sits inside the MEASURED 10s SessionStart hook timeout
+ * (`~/.claude/settings.json`), leaving room for the health curl, the register
+ * curl, the sqlite reads and the wake-coverage subprocess check-relay.sh spends.
+ *
+ * WHY A DEADLINE AT ALL, since the previous version's feared ceiling proved
+ * unreachable: the old code bounded its ATTEMPTS (6) and its OWN sleeps (~115ms)
+ * and documented that as the worst case, while `busy_timeout = 5000` ran a second
+ * uncounted clock inside the driver. Bounding the operation rather than one's own
+ * contribution to it is the correction, and it holds regardless of which path
+ * turns out to be reachable.
+ *
+ * NOTE for the wasm driver: `busy_timeout` is a documented no-op there
+ * (sqlite-compat.ts:177-178 — single process, no locking), so the pragma may do
+ * nothing at all. The deadline check is the authority, never the pragma.
+ *
+ * WHY NOT A STRICT WHOLE-OPERATION DEADLINE (ruled, so it is not revisited as an
+ * oversight): threading the deadline through the writer and firing a pragma before
+ * every statement buys a bound that is STILL approximate — a statement starting
+ * with 50ms left can overrun — costs a pragma on every write, and is a complete
+ * no-op on the wasm driver, where it would add machinery, keep the approximation,
+ * and lend a false impression of rigour.
+ * AN HONEST BOUND WITH STATED SLACK BEATS A STRICTER-SOUNDING ONE THAT IS STILL
+ * APPROXIMATE.
+ */
+export const BIND_BUDGET_MS = 3000;
+/** Below this much remaining, do not start another attempt — it cannot finish. */
+const BIND_MIN_ATTEMPT_MS = 120;
+/**
+ * Per-attempt cap on SQLite's own wait. Lowered 750 -> 400 to shrink the
+ * worst-case slack BY CONSTRUCTION rather than by analysis: the overshoot is
+ * MAX_LOCKING_STATEMENTS * this value, so 400 caps it at 1200ms.
+ */
+const BIND_BUSY_CAP_MS = 400;
+/** Longest write path: supersede UPDATE + INSERT + COMMIT. See the note above. */
+export const BIND_MAX_LOCKING_STATEMENTS = 3;
+/** The honest, publishable ceiling for one `upsertAgentBinding` call. */
+export const BIND_WORST_CASE_MS = BIND_BUDGET_MS + BIND_MAX_LOCKING_STATEMENTS * BIND_BUSY_CAP_MS;
+
+/**
+ * Backoff between attempts, CAPPED BY WHAT IS LEFT. Without any backoff, eight
+ * processes released from a shared barrier burned every attempt in microseconds
+ * and five reported "database is locked": the invariant held (one current row)
+ * while five windows went UNRECORDED. Surviving a race is not handling it.
+ *
+ * Deliberately SYNCHRONOUS — db.ts is a synchronous surface (better-sqlite3).
+ * Jitter is per-attempt so simultaneous losers do not re-collide in lockstep.
+ */
+function bindBackoffSleep(attempt: number, remainingMs: number): void {
+  const want = Math.min(2 ** attempt, 64) + Math.floor(Math.random() * 8);
+  // Never sleep past the deadline, and always leave room for one real attempt.
+  const ms = Math.max(0, Math.min(want, remainingMs - BIND_MIN_ATTEMPT_MS));
+  if (ms <= 0) return;
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    /* synchronous by design — see above */
+  }
+}
+
+export function upsertAgentBinding(
+  db: CompatDatabase,
+  w: BindingWrite,
+  opts: { supersedeReason?: string; budgetMs?: number } = {},
+): BindingResult {
+  const started = Date.now();
+  const deadline = started + Math.max(BIND_MIN_ATTEMPT_MS, opts.budgetMs ?? BIND_BUDGET_MS);
+  let attempts = 0;
+  let lastErr: unknown = null;
+
+  const exhausted = (): Error =>
+    new Error(
+      `bind deadline exceeded after ${Date.now() - started}ms over ${attempts} attempt(s) ` +
+        `(budget ${opts.budgetMs ?? BIND_BUDGET_MS}ms): the window binding could not be recorded ` +
+        `while another process held the database` +
+        (lastErr instanceof Error ? ` — last error: ${lastErr.message}` : ""),
+    );
+
+  for (;;) {
+    const remaining = deadline - Date.now();
+    // Loud and FAST. A window that cannot record its identity inside the budget
+    // must say so, never hang a session start waiting to find out.
+    if (remaining < BIND_MIN_ATTEMPT_MS) throw exhausted();
+
+    // Draw SQLite's OWN wait from the SAME envelope as the sleeps. This is the
+    // whole fix: a fixed busy_timeout is a second, uncounted clock.
+    try {
+      db.pragma(`busy_timeout = ${Math.max(1, Math.min(remaining - BIND_MIN_ATTEMPT_MS, BIND_BUSY_CAP_MS))}`);
+    } catch {
+      /* wasm driver: busy_timeout is a no-op — the deadline check still governs */
+    }
+
+    attempts++;
+    try {
+      // THE INDEX IS THE GUARANTEE — not this BEGIN. CompatDatabase exposes no
+      // .immediate(), so this transaction is DEFERRED and two processes CAN both
+      // read an empty anchor right here. What refuses the second current row is
+      // the partial unique index idx_agent_bindings_current_anchor; this
+      // transaction and the retry below only convert that refusal into the
+      // correct outcome (the loser re-reads and refreshes or supersedes).
+      // Do NOT drop the index believing this transaction covers the invariant.
+      //
+      // AND A SECOND FACT ABOUT THIS DEFERRED BEGIN, MEASURED, because the next
+      // reader will otherwise rediscover it the slow way: `busy_timeout` governs
+      // ACQUIRING a lock, not resolving a SNAPSHOT conflict. A deferred
+      // transaction that has ALREADY READ cannot upgrade to a write while another
+      // connection holds the write lock — SQLite returns BUSY immediately and
+      // never honours the timeout. Probed on this schema under WAL:
+      //   read-then-write -> SQLITE_BUSY in 0 ms
+      //   write-first     -> SQLITE_BUSY in 5371 ms
+      // upsertAgentBindingOnce reads first unconditionally, so these in-loop
+      // attempts fast-fail rather than each burning a busy wait. That is WHY the
+      // retry budget must be a deadline over the WHOLE operation and not a per-
+      // attempt estimate: the per-attempt cost is not a fixed quantity, it
+      // depends on whether the attempt has read before it writes.
+
+      return db.transaction(() => upsertAgentBindingOnce(db, w, opts))();
+    } catch (err) {
+      lastErr = err;
+      // Anything that is not OUR anchor contention is a real failure: throw on
+      // the FIRST occurrence rather than retrying it to exhaustion.
+      if (!isBindContentionError(err)) throw err;
+      const left = deadline - Date.now();
+      if (left < BIND_MIN_ATTEMPT_MS) throw exhausted();
+      bindBackoffSleep(attempts, left);
+    }
+  }
+}
+
+/** One attempt. MUST run inside a transaction — see upsertAgentBinding. */
+function upsertAgentBindingOnce(
+  db: CompatDatabase,
+  w: BindingWrite,
+  opts: { supersedeReason?: string } = {},
+): BindingResult {
+  const ts = now();
+  const current = getCurrentBinding(db, w);
+
+  if (!current) {
+    const bindingId = uuidv4();
+    db.prepare(
+      "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, agent_class, conversation_id, " +
+        "conversation_title, cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at) " +
+        "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      bindingId,
+      w.agentName,
+      w.agentClass,
+      w.conversationId,
+      w.conversationTitle,
+      w.cwd,
+      w.hostId,
+      w.windowPid,
+      w.windowPidStart,
+      w.boundVia,
+      ts,
+      ts,
+    );
+    return { action: "created", bindingId, bindingVersion: 1, supersededBindingId: null };
+  }
+
+  if (current.conversation_id === w.conversationId) {
+    db.prepare("UPDATE agent_bindings SET last_verified_at = ? WHERE binding_id = ?").run(ts, current.binding_id);
+    return {
+      action: "refreshed",
+      bindingId: current.binding_id,
+      bindingVersion: current.binding_version,
+      supersededBindingId: null,
+    };
+  }
+
+  const bindingId = uuidv4();
+  const nextVersion = current.binding_version + 1;
+  // `supersede_reason` is the RELAY's word (resume-switch / clear-carry / handoff).
+  // `end_reason` stays reserved for Claude Code's verbatim SessionEnd reason (§8a D2),
+  // so the two vocabularies can never be confused for one another.
+  const supersedeReason = opts.supersedeReason ?? "resume-switch";
+  const tx = db.transaction(() => {
+    db.prepare(
+      "UPDATE agent_bindings SET superseded_at = ?, superseded_by = ?, supersede_reason = ? WHERE binding_id = ?",
+    ).run(ts, bindingId, supersedeReason, current.binding_id);
+    db.prepare(
+      "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, agent_class, conversation_id, " +
+        "conversation_title, cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      bindingId,
+      nextVersion,
+      w.agentName,
+      w.agentClass,
+      w.conversationId,
+      w.conversationTitle,
+      w.cwd,
+      w.hostId,
+      w.windowPid,
+      w.windowPidStart,
+      w.boundVia,
+      ts,
+      ts,
+    );
+  });
+  tx();
+
+  return {
+    action: "superseded-and-created",
+    bindingId,
+    bindingVersion: nextVersion,
+    supersededBindingId: current.binding_id,
+  };
+}
+
+/**
+ * Record SessionEnd's reason VERBATIM on this window's current binding (§8a D2:
+ * stored as Claude Code said it, never translated). Adds no row. Returns false
+ * when the window has no current binding — the caller says so loudly rather than
+ * inventing one.
+ */
+export function endAgentBinding(db: CompatDatabase, anchor: BindingAnchor, endReason: string): boolean {
+  const current = getCurrentBinding(db, anchor);
+  if (!current) return false;
+  const r = db
+    .prepare("UPDATE agent_bindings SET end_reason = ?, last_verified_at = ? WHERE binding_id = ?")
+    .run(endReason, now(), current.binding_id);
+  return r.changes > 0;
+}
+
+/**
+ * Every CURRENT binding, newest first — the read side of ADR-0036 S1 ("S1
+ * records and LISTS"), and what makes `relay fleet` able to show that a window
+ * became X. READ-ONLY: it writes nothing, so it does not touch the sanctioned-
+ * writer invariant that keeps db.ts the only mutator of this guarded table.
+ *
+ * Deliberately NOT reusing BindingRow. That type is shaped for the supersede
+ * decision in upsertAgentBinding (5 columns, no display fields); widening it
+ * would drag presentation concerns into the write path, where an extra column
+ * is a chance to get cardinality wrong. A listing is a different question, so
+ * it gets its own row type.
+ *
+ * Superseded rows are excluded: they are history, and a fleet list that mixes
+ * the window's current identity with the ones it used to hold would be exactly
+ * the ambiguity the per-anchor cardinality rule exists to remove.
+ */
+export interface BindingListRow {
+  binding_id: string;
+  binding_version: number;
+  agent_name: string | null;
+  agent_class: string | null;
+  conversation_id: string;
+  conversation_title: string | null;
+  cwd: string | null;
+  host_id: string;
+  window_pid: number;
+  window_pid_start: string;
+  bound_via: string;
+  bound_at: string;
+  last_verified_at: string | null;
+  end_reason: string | null;
+}
+
+export function listAgentBindings(db: CompatDatabase): BindingListRow[] {
+  if (!hasAgentBindingsTable(db)) return [];
+  return db
+    .prepare(
+      "SELECT binding_id, binding_version, agent_name, agent_class, conversation_id, conversation_title, " +
+        "cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at, end_reason " +
+        "FROM agent_bindings WHERE superseded_at IS NULL ORDER BY bound_at DESC, binding_id",
+    )
+    .all() as BindingListRow[];
+}
+
 export function setAgentLivenessAnchor(
   name: string,
   pid: number,
