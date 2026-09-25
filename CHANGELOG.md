@@ -21,17 +21,19 @@ Measured live: `get_messages(status="pending", ack=true)` replied `acked: true, 
 - **The drain no longer needs a session for agent-level receipts.** The mark block used to be gated as a whole on the session. Now only `read_by_session`, the per-session read mark, needs one. `resolved_at`, `read_at` and `last_drain_at` belong to the agent, and are stamped whenever the drain returns mail, with or without a session. So an ack with no session now resolves, and the mail does not come back.
 - **The ack receipt reports the effect.** `resolved_count` is the number of rows the resolve changed, not the number returned. `acked` is true only when the resolve ran; otherwise the reply carries `ack_not_applied` with the reason. It used to be built from the request.
 - **An agent with no session is told so.** The reply carries `warning: { code: "session_unbound", message }`: mail was delivered and receipts recorded, but there is no per-session read mark, so unresolved mail is returned again until the agent re-registers or resolves it. With no session, neither the per-session read mark nor the legacy `status` column is written.
+- **Subscribers hear an ack with no session.** The durable outbox row and the inbox-changed event were gated on per-session read marks, which only a bound session writes. An ack that resolved the mail with no session therefore emptied the queue silently: Tether and `relay://inbox` subscribers saw nothing. Both now fire on any change to the mailbox, whether a read mark or a resolve. A bound drain with ack still emits exactly one.
 - The `get_messages` tool description documents `acked`, `resolved_count` and `warning`.
 - **The same rule was checked across every handler that changes state.** A read-only walk of all 28 found two more receipts built from the request:
   - `register_agent` returned an `agent` object put together in memory rather than read back. A first register showed `host_id`, `cli_profile`, `host_shell_pids` and `server_version` as null even though they were stored. A re-register showed the old `server_version` and `cli_profile`. The object is now read back from the database after the write.
   - `spawn_agent` reported `has_initial_message: true` even when queuing the message failed and the error was swallowed. It now says whether the message was queued, and on failure adds `initial_message_error` with the next step.
   Test: `tests/adr-0041-r1-receipt-walk.test.ts`. 4 of its 5 cases were red on the old code and turn red again when the fix is reverted; the fifth is the passing control.
-- Tests: `tests/adr-0041-null-session-receipts.test.ts`, 9 cases. The NULL session is produced by a real force mint. The cases cover:
+- Tests: `tests/adr-0041-null-session-receipts.test.ts`. The NULL session is produced by a real force mint. The cases include:
   - the harm case (an ack must not claim what the database did not do) and its twin (with a session, the real count);
   - resolve and delivery with no session;
   - that a peek stamps nothing;
   - the warning and its twin;
-  - the ADR-0037 innocent twin (the model's drain marks delivery) for an agent with no session.
+  - the ADR-0037 innocent twin (the model's drain marks delivery) for an agent with no session;
+  - an ack with no session writes one outbox row and emits one event, with a bound control (still exactly one) and a twin with no ack (no row, no event).
   5 were red on the old code and turned red again with the fix reverted. Two mutations are each caught: re-gating the stamps on the session, and building the receipt from the request.
 
 ### Added — a window now RECORDS which identity it holds, and says so (`relay bind` + `relay fleet`, ADR-0036 S1)

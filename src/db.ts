@@ -5865,6 +5865,7 @@ export function getMessagesWithEffect(
   // stays `peek=false` so consume-once semantics are preserved for
   // single-shot workers (v2.0 final #6).
   let drainedRows = 0;
+  let mailboxChanged = false;
   let outboxId = 0;
   let resolveRan = false;
   let resolvedRows = 0;
@@ -5936,7 +5937,13 @@ export function getMessagesWithEffect(
         // DELIVERED is agent-level: a drain that returned rows is a drain, bound or not.
         updateAgentMetadata(agentName, { last_drain_at: now() });
       }
-      if (drainedRows > 0) {
+      // THE MAILBOX CHANGED iff this tx moved mail out of a pending set: a
+      // per-session read-mark (bound) OR a resolve (bound or not). Round-2 audit:
+      // gating on drainedRows alone, which only a bound session produces, gave
+      // subscribers ZERO events for an unbound ack that really emptied the queue.
+      // One row per drain either way, so a bound drain+ack still emits exactly one.
+      mailboxChanged = drainedRows > 0 || resolvedRows > 0;
+      if (mailboxChanged) {
         const ins = db.prepare(
           "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
         ).run(agentName, "message_read", now(), process.pid);
@@ -5967,8 +5974,9 @@ export function getMessagesWithEffect(
   // v2.5.0 Tether Phase 1 — Part S — fire the inbox-changed event when
   // pending → read, so subscribers see the unread count drop in real time.
   // Skipped on peek (no mutation) and skipped when zero rows transitioned
-  // (e.g. status='all' / 'read' filters never mark anything new).
-  if (drainedRows > 0) {
+  // (e.g. status='all' / 'read' filters never mark anything new). Gated on the
+  // same mailboxChanged as the outbox row, so the bus and the durable tail agree.
+  if (mailboxChanged) {
     // Post-commit NOTIFICATION only (a side-channel wake, not durable evidence) — the
     // durable last_drain_at marker is written INSIDE the tx above, atomically with the
     // drain (#60 / codex #200), so it can never lag or be lost relative to the drain.

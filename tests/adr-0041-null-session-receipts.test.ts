@@ -44,6 +44,7 @@ delete process.env.RELAY_AGENT_CAPABILITIES;
 const { handleGetMessages } = await import("../src/tools/messaging.js");
 const { handleRegisterAgent } = await import("../src/tools/identity.js");
 const { closeDb, getDb, registerAgent, sendMessage, mintAgentToken } = await import("../src/db.js");
+const { onInboxChanged } = await import("../src/inbox-events.js");
 
 function parse(result: { content: { text: string }[] }) {
   return JSON.parse(result.content[0].text);
@@ -231,5 +232,64 @@ describe("ADR-0041 R1, Codex round 1 — the register receipt is read back AFTER
     expect(now.liveness, "precondition: the completed row has a live anchor").toBe("alive");
     expect(r.agent.host_id, "the receipt must not predate the anchor write").toBe(now.host_id);
     expect(r.agent.liveness).toBe(now.liveness);
+  });
+});
+
+/**
+ * Round-2 audit (#281, P2): an UNBOUND ack changes the mailbox (the resolve
+ * removes the mail from every pending set), but the durable outbox row and the
+ * inbox notification were gated on per-session drained rows, which only a bound
+ * session produces. Subscribers (Tether, relay://inbox) got zero events. Both are
+ * now gated on the actual mailbox change.
+ */
+describe("ADR-0041 round 2 — an unbound ack notifies subscribers like any other mailbox change", () => {
+  const events = (name: string) =>
+    (getDb().prepare("SELECT COUNT(*) AS c FROM inbox_events WHERE agent_name = ? AND reason = 'message_read'").get(name) as { c: number }).c;
+
+  function watch(name: string): { count: () => number; stop: () => void } {
+    let n = 0;
+    const stop = onInboxChanged((e) => {
+      if (e.agent_name === name && e.reason === "message_read") n++;
+    });
+    return { count: () => n, stop };
+  }
+
+  it("HARM: NULL session + ack=true resolves the mail AND writes one outbox row AND emits one event", () => {
+    registerAgent("ev-sender", "r", []);
+    nullSessionAgent("ev-unbound");
+    const id = sendMessage("ev-sender", "ev-unbound", "x", "normal").id;
+    const before = events("ev-unbound");
+    const w = watch("ev-unbound");
+    parse(handleGetMessages({ agent_name: "ev-unbound", status: "pending", limit: 20, ack: true } as never));
+    w.stop();
+    expect(row(id).resolved_at, "precondition: the resolve happened").not.toBeNull();
+    expect(events("ev-unbound") - before, "one durable outbox row").toBe(1);
+    expect(w.count(), "one in-process notification").toBe(1);
+  });
+
+  it("CONTROL: a BOUND drain+ack still writes exactly one row and one event (not two)", () => {
+    registerAgent("ev-sender2", "r", []);
+    registerAgent("ev-bound", "r", []);
+    expect(sessionOf("ev-bound")).not.toBeNull();
+    sendMessage("ev-sender2", "ev-bound", "y", "normal");
+    const before = events("ev-bound");
+    const w = watch("ev-bound");
+    parse(handleGetMessages({ agent_name: "ev-bound", status: "pending", limit: 20, ack: true } as never));
+    w.stop();
+    expect(events("ev-bound") - before).toBe(1);
+    expect(w.count()).toBe(1);
+  });
+
+  it("INNOCENT TWIN: NULL session WITHOUT ack changes nothing a subscriber tracks (the mail re-pends): no row, no event", () => {
+    registerAgent("ev-sender3", "r", []);
+    nullSessionAgent("ev-unbound3");
+    const id = sendMessage("ev-sender3", "ev-unbound3", "z", "normal").id;
+    const before = events("ev-unbound3");
+    const w = watch("ev-unbound3");
+    parse(handleGetMessages({ agent_name: "ev-unbound3", status: "pending", limit: 20 } as never));
+    w.stop();
+    expect(row(id).resolved_at).toBeNull();
+    expect(events("ev-unbound3") - before).toBe(0);
+    expect(w.count()).toBe(0);
   });
 });
