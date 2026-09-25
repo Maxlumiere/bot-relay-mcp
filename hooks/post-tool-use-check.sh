@@ -252,7 +252,9 @@ sys.stdout.write(("subagent" if sub else "main") + "\x1f" + sid)
 # SRC=http  → stdin is the StreamableHTTP get_messages response.
 # SRC=sqlite → stdin is rows "id<US>from<US>priority<US>created_at<US>content<RS>...".
 # Exit 1 = the read failed (caller falls back / stays CANNOT-JUDGE); exit 0 with
-# no output = empty mailbox. FPR fingerprints the unread set for the damper.
+# no output = empty mailbox; exit 3 = an HTTP page that does not hold every pending
+# message, so the newest arrival must come from the all-pending reader (the caller
+# re-runs with NEWEST_KNOWN=1). FPR fingerprints the unread set for the damper.
 # Piped rather than passed in an env var: a full get_messages response can exceed
 # Linux's 128KB per-string exec limit.
 NOTICE_PY='
@@ -268,7 +270,12 @@ raw = sys.stdin.buffer.read().decode("utf-8", "replace")
 
 # Every record is (id, sender, priority, created_at). NO content field is read on
 # either path: the notice is metadata only.
-RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+# Priority is rendered, so it is held to the literals the relay itself uses BEFORE it is
+# ranked or shown; anything else (a raw DB value, a stubbed response) is "unknown".
+KNOWN = ("critical", "high", "normal", "low")
+RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3, "unknown": 4}
+def prio(p):
+    return p if p in KNOWN else "unknown"
 recs, total, top_name, newest = [], None, None, None
 if src == "http":
     payload = None
@@ -290,7 +297,7 @@ if src == "http":
     for m in msgs:
         if isinstance(m, dict):
             recs.append((str(m.get("id", "")), str(m.get("from_agent", "")),
-                         str(m.get("priority", "normal")), str(m.get("created_at", ""))))
+                         prio(m.get("priority")), str(m.get("created_at", ""))))
     # get_messages orders by PRIORITY first, so the highest priority of ALL
     # pending mail is always inside the returned page.
     if isinstance(data.get("total_pending"), int):
@@ -300,10 +307,10 @@ elif src == "sqlite":
     try:
         d = json.loads(raw)
         total = int(d["total"])
-        top_name = d.get("top")
+        top_name = prio(d.get("top")) if d.get("top") is not None else None
         newest = d.get("newest")
         for r in d["rows"]:
-            recs.append((str(r["id"]), str(r["from_agent"]), str(r["priority"]), str(r["created_at"])))
+            recs.append((str(r["id"]), str(r["from_agent"]), prio(r["priority"]), str(r["created_at"])))
     except Exception:
         sys.exit(1)
 else:
@@ -318,11 +325,23 @@ if total is None:
 else:
     count = "%d" % total
 fpr = hashlib.sha256("\n".join(sorted(r[0] for r in recs)).encode("utf-8", "replace")).hexdigest()[:32]
-if top_name not in RANK:
-    top_name = min((r[2] for r in recs), key=lambda p: RANK.get(p, 2))
+if top_name is None:
+    top_name = min((r[2] for r in recs), key=lambda p: RANK[p])
 # The damper 120s remind applies to anything high or above.
-top = "high" if RANK.get(top_name, 2) <= 1 else "normal"
-if not newest:
+top = "high" if RANK[top_name] <= 1 else "normal"
+if src == "http":
+    # The newest arrival over ALL pending. The page is priority-first, so when it
+    # does not hold every pending message a brand-new normal one can sit outside
+    # it, behind older high ones. Only a complete page may answer; otherwise the
+    # all-pending reader does, and with no reader the age is stated as unknown.
+    complete = (n >= total) if total is not None else (n < lim)
+    if complete:
+        newest = max(r[3] for r in recs)
+    elif os.environ.get("NEWEST_KNOWN") != "1":
+        sys.exit(3)
+    else:
+        newest = os.environ.get("NEWEST") or None
+elif not newest:
     newest = max(r[3] for r in recs)
 newest_first = sorted(recs, key=lambda r: r[3], reverse=True)
 # Sender names are the ONLY sender-chosen field in the notice, so they are held to
@@ -342,6 +361,8 @@ if len(order) > 5:
 
 def age(iso):
     import datetime
+    if not isinstance(iso, str) or not iso:
+        return "at an unknown time"
     try:
         t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
         secs = max(0, int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()))
@@ -398,7 +419,30 @@ print(json.dumps({
     -H "X-Agent-Token: $AGENT_TOKEN" \
     --data "$payload" 2>/dev/null) || return 1
 
-  printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null
+  local out rc
+  out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null)
+  rc=$?
+  if [ $rc -eq 3 ]; then
+    # A partial page: the newest arrival comes from the all-pending reader.
+    out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" NEWEST_KNOWN=1 \
+      NEWEST="$(sqlite_newest)" python3 -c "$NOTICE_PY" 2>/dev/null)
+    rc=$?
+  fi
+  printf '%s' "$out"
+  return $rc
+}
+
+# The newest pending arrival over ALL pending mail, from the read-only reader
+# below; empty when the DB cannot be read (the notice then says "unknown").
+sqlite_newest() {
+  { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ]; } || return 0
+  AN="$AGENT_NAME" DBP="$DB_PATH" LIM=1 python3 -c "$SQLITE_PEEK_PY" 2>/dev/null |
+    python3 -c 'import json, sys
+try:
+    v = json.load(sys.stdin).get("newest")
+    sys.stdout.write(v if isinstance(v, str) else "")
+except Exception:
+    pass' 2>/dev/null
 }
 
 # --- Sqlite peek (fallback) ---
