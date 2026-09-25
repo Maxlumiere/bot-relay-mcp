@@ -389,8 +389,11 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1, // force sqlite path
     });
     expect(r.status).toBe(0);
-    if (r.stdout) {
-      // If stdout has content, it must be valid JSON with the contract shape.
+    // Codex round 2 (P2-d): mail IS seeded, so silence is a failure, not a degrade.
+    // The old `if (r.stdout)` let a hook that exited silently pass.
+    expect(r.stdout, "seeded mail must produce a notice on the sqlite path").not.toBe("");
+    {
+      // It must be valid JSON with the contract shape.
       const parsed = JSON.parse(r.stdout);
       expect(parsed.continue).toBe(true);
       expect(parsed.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
@@ -404,10 +407,6 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
         .get() as { n: number };
       db.close();
       expect(row.n).toBe(1);
-    } else {
-      // Sqlite fallback may degrade silently if python3 / sqlite3 unavailable
-      // in the test sandbox; clean degrade is acceptable per the hook's
-      // documented contract ("No mail OR any error → empty stdout, exit 0").
     }
   });
 
