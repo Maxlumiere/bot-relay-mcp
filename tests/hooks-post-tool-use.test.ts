@@ -4,21 +4,25 @@
 // See LICENSE for full terms.
 
 /**
- * Integration tests for hooks/post-tool-use-check.sh (v1.8).
+ * Integration tests for hooks/post-tool-use-check.sh (v1.8; peek-only since ADR-0037).
  *
  * Spins up a real HTTP relay on a random port, registers a real agent with a
  * token, sends messages, then invokes the hook script as a subprocess with
  * controlled env vars and inspects stdout / stderr / timing.
  *
  * Covers:
- *   1. HTTP happy path — pending mail → valid Claude Code hook JSON.
+ *   1. HTTP happy path — pending mail → valid Claude Code hook JSON (a notice).
  *   2. Empty mailbox → truly empty stdout, exit 0.
- *   3. Idempotency — re-running the hook on the same mailbox returns empty.
+ *   3. Not consumed — a repeat run leaves the mail pending; the damper
+ *      suppresses the duplicate notice. (Pre-ADR-0037 this was "idempotent
+ *      because the first run marked it read" — the message-loss bug.)
  *   4. Unreachable relay + unreachable DB → silent fail within budget.
  *   5. Missing token → falls back to sqlite direct, still surfaces mail.
  *   6. No re-register — hook does not change the agent's capabilities or role.
  *   7. Missing RELAY_AGENT_NAME → silent exit 0.
  *   8. Invalid token shape → treated as missing token, sqlite fallback runs.
+ * The ADR-0037 contract itself (harm tests, subagent skip, damper) lives in
+ * tests/adr-0037-post-tool-use-peek-only.test.ts.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "fs";
@@ -34,6 +38,8 @@ const HOOK_SCRIPT = path.resolve(__dirname, "..", "hooks", "post-tool-use-check.
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-hook-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
+// The hook writes damper state under $HOME/.bot-relay/hook-state — never the real HOME.
+const HOOK_HOME = path.join(TEST_DB_DIR, "home");
 process.env.RELAY_DB_PATH = TEST_DB_PATH;
 // v2.1.3 I8: scrub inherited RELAY_AGENT_* env vars so isolated tests
 // do not auth against a parent-shell spawn-agent.sh token.
@@ -45,7 +51,7 @@ delete process.env.RELAY_ALLOW_LEGACY;
 delete process.env.RELAY_HTTP_SECRET;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { closeDb } = await import("../src/db.js");
+const { closeDb, getDb } = await import("../src/db.js");
 
 let server: HttpServer;
 let port: number;
@@ -100,11 +106,11 @@ interface RunResult {
 function runHook(env: Record<string, string | undefined>): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-    // Build a clean env — start from process.env, then override with our keys.
+    // Build a clean env — start from a sandboxed HOME, then override with our keys.
     // Always unset keys we don't want inherited from the parent test process.
     const finalEnv: Record<string, string> = {
       PATH: process.env.PATH ?? "",
-      HOME: process.env.HOME ?? "",
+      HOME: HOOK_HOME,
     };
     for (const [k, v] of Object.entries(env)) {
       if (v !== undefined) finalEnv[k] = v;
@@ -116,12 +122,14 @@ function runHook(env: Record<string, string | undefined>): Promise<RunResult> {
     child.stderr.on("data", (d) => (stderr += d.toString()));
     child.on("exit", (code) => resolve({ code, stdout, stderr, durationMs: Date.now() - start }));
     child.on("error", reject);
+    // Claude Code writes its payload and closes stdin; an empty payload is a manual run.
+    child.stdin.end();
   });
 }
 
 beforeAll(async () => {
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
-  fs.mkdirSync(TEST_DB_DIR, { recursive: true });
+  fs.mkdirSync(HOOK_HOME, { recursive: true });
   server = startHttpServer(0, "127.0.0.1");
   await new Promise((r) => setTimeout(r, 100));
   const addr = server.address();
@@ -153,7 +161,7 @@ describe("PostToolUse hook — HTTP path (preferred)", () => {
     const parsed = JSON.parse(r.stdout);
     expect(parsed.continue).toBe(true);
     expect(parsed.hookSpecificOutput.hookEventName).toBe("PostToolUse");
-    expect(parsed.hookSpecificOutput.additionalContext).toContain("[RELAY]");
+    expect(parsed.hookSpecificOutput.additionalContext).toMatch(/^relay: 1 unread for hook-recv-1/);
     expect(parsed.hookSpecificOutput.additionalContext).toContain("hook-sender-1");
     expect(parsed.hookSpecificOutput.additionalContext).toContain("first message");
   });
@@ -171,7 +179,7 @@ describe("PostToolUse hook — HTTP path (preferred)", () => {
     expect(r.stdout).toBe("");
   });
 
-  it("(3) idempotent: second run after the first returns empty (messages marked read)", async () => {
+  it("(3) not consumed: a second run leaves the mail pending, and the damper suppresses the repeat notice", async () => {
     const senderTok = await registerWithToken("hook-sender-2", []);
     const recvTok = await registerWithToken("hook-recv-2", []);
     await sendMessage("hook-sender-2", "hook-recv-2", "only once please", senderTok);
@@ -190,6 +198,12 @@ describe("PostToolUse hook — HTTP path (preferred)", () => {
     const r2 = await runHook(env);
     expect(r2.code).toBe(0);
     expect(r2.stdout).toBe("");
+
+    const row = getDb()
+      .prepare("SELECT status, read_at FROM messages WHERE to_agent = ? AND content = ?")
+      .get("hook-recv-2", "only once please") as { status: string; read_at: string | null };
+    expect(row.status).toBe("pending");
+    expect(row.read_at).toBeNull();
   });
 });
 

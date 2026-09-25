@@ -1,8 +1,10 @@
-# PostToolUse Hook — Near-Real-Time Mail Delivery (v1.8)
+# PostToolUse Hook — Mid-Task Mail Notice (v1.8; peek-only since ADR-0037)
 
 The `SessionStart` hook (`docs/hooks.md`) gives you a one-shot mail check at terminal open. That is great for resuming a session, but it does nothing if messages arrive WHILE the agent is working — you have to wait for the next terminal open (or a human paste) before the agent sees them.
 
-The `PostToolUse` hook closes that gap. It fires after every tool call, checks the mailbox, and injects any pending messages as `additionalContext` — the running Claude Code session sees them immediately.
+The `PostToolUse` hook closes that gap. It fires after every tool call, **peeks** at the mailbox, and injects a short notice as `additionalContext`: how many messages are unread, who sent them, and a bounded quoted first line of the newest one. The agent then calls `get_messages` itself, and that call is what delivers the mail and marks it read.
+
+> **Why a notice and not the messages (ADR-0037).** Before this change the hook drained the mailbox and injected the bodies. A hook cannot prove delivery: `additionalContext` has no acknowledgement, it can be truncated or dropped, and `PostToolUse` also fires for a **subagent's** tool calls. Mail was marked read while the model never saw it, and the recipient's own drain came back empty. Only the model moves mail to read now; the hook, like the `Stop` hook, is read-only.
 
 ## When to install
 
@@ -11,7 +13,7 @@ Install `PostToolUse` in **every project you run a relay-registered agent from**
 | Hook | When it fires | What it delivers |
 |---|---|---|
 | `SessionStart` | Terminal open / resume | Mail + active tasks (snapshot) |
-| `PostToolUse` | After every tool call | Mail only (push-style) |
+| `PostToolUse` | After every tool call | A notice that mail is waiting (never consumes it) |
 
 ## Per-project install (NOT global)
 
@@ -61,11 +63,13 @@ The hook reads these:
 | Var | Purpose | Default |
 |---|---|---|
 | `RELAY_AGENT_NAME` | Which agent mailbox to check | (unset → hook silently exits) |
-| `RELAY_AGENT_TOKEN` | Auth token for HTTP path | (unset → HTTP path skipped, sqlite fallback used) |
+| `RELAY_AGENT_TOKEN` | Auth token for HTTP path | (unset → vault token, else HTTP path skipped and sqlite fallback used) |
 | `RELAY_HTTP_HOST` | Relay HTTP host | `127.0.0.1` |
 | `RELAY_HTTP_PORT` | Relay HTTP port | `3777` |
-| `RELAY_DB_PATH` | Sqlite DB path (sqlite fallback only) | `~/.bot-relay/relay.db` |
-| `RELAY_HOOK_MAX_MESSAGES` | Max messages per firing | `20` |
+| `RELAY_DB_PATH` | Sqlite DB path (sqlite fallback only) | per-instance DB, else `~/.bot-relay/relay.db` |
+| `RELAY_HOOK_MAX_MESSAGES` | Max messages looked at per firing (the count shows `N+` when capped) | `20` |
+| `RELAY_HOOK_NOTICE_REMIND_SECS` | How long an unchanged notice stays quiet (see "Damper") | `600` |
+| `RELAY_HOME` | Where the damper keeps its state (`$RELAY_HOME/hook-state/`) | `~/.bot-relay` |
 
 Typical setup via shell alias (the SessionStart hook already uses this pattern):
 
@@ -76,39 +80,51 @@ alias ai-agent='RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=<your-token> claude'
 ## What the hook does
 
 1. Validates all env-var inputs against an allowlist (no surprises in URLs or SQL).
-2. If `RELAY_AGENT_TOKEN` is set AND the HTTP daemon responds on `/health` within 1 second, uses `get_messages` via `/mcp`. This path goes through the full auth / rate-limit / audit pipeline. Messages are marked `read` server-side.
-3. Otherwise falls back to sqlite direct on `RELAY_DB_PATH`. Reads pending rows, formats them, then marks those specific message IDs `read` in a follow-up statement.
-4. Emits a single-line Claude Code hook JSON (`{"continue": true, "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}`) to stdout. The content looks like:
+2. Reads its stdin payload. If the payload carries `agent_id` or `agent_type`, the tool call belongs to a **subagent** and the hook stops there: no mail check, no output. A non-empty payload that is not valid JSON is treated the same way.
+3. If a token is available AND the HTTP daemon responds on `/health` within 1 second, calls `get_messages` with `peek: true` via `/mcp`. This is the same query the agent's own drain runs, minus the read-mark, so the notice goes away exactly when the agent's drain takes the mail.
+4. Otherwise falls back to a read-only `SELECT` on `RELAY_DB_PATH` (the same pending predicate the `Stop` hook uses). Content stored encrypted at rest is never quoted.
+5. Emits a single-line Claude Code hook JSON (`{"continue": true, "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}`) to stdout. The notice looks like:
    ```
-   [RELAY] New mail for builder (2 messages):
-     [high] from planner at 2026-04-15T07:43:23Z:
-       please review the v1.8 plan
-     [normal] from ops at 2026-04-15T07:44:01Z:
-       deploy green
+   relay: 2 unread for builder, from planner (1 high), ops. newest first line (≤100 chars): "deploy green". Unread until get_messages is called.
    ```
-5. If there is no mail, or any error happens, the hook exits silently with empty stdout — never pollutes the conversation.
+6. If there is no mail, or any error happens, the hook exits silently with empty stdout — never pollutes the conversation.
+
+## Damper
+
+A read-only notice would otherwise repeat after every tool call until the agent reads its mail. So the hook stays quiet while nothing has changed:
+
+- A notice is emitted when the set of unread messages **changes** (new mail arrives, or some is read), or when the **remind interval** has passed since the last notice.
+- The remind interval is `RELAY_HOOK_NOTICE_REMIND_SECS` (default `600`, maximum `3600`). While any unread message is **high priority** it is at most `120` seconds.
+- `0` disables damping: every tool call re-notifies. A non-numeric, negative or larger-than-3600 value falls back to the default; it never disables damping, and damping is never unbounded.
+- State is kept per **agent and Claude session** (`session_id` from the hook payload) in `$RELAY_HOME/hook-state/`. Two windows running as the same agent do not silence each other, and `/clear` (which starts a new session id) notifies again. A payload without `session_id` falls back to one key per agent.
+- Suppression never touches the mail. It stays pending, `SessionStart` and `Stop` still surface it, and the worst case is a late notice. If the state cannot be read or written, the hook notifies rather than staying silent.
 
 ## What the hook does NOT do
 
+- **It does NOT mark mail read, resolve it, or change it in any way.** Only the agent's own `get_messages` call does that.
+- **It does NOT inject message bodies.** Count, senders and one bounded first line only.
+- **It does NOT run for subagent tool calls.**
 - **It does NOT re-register the agent.** The `SessionStart` hook handles registration. If the agent is not registered when the hook fires, the hook silently exits.
-- **It does NOT check tasks.** Task surfacing stays in `SessionStart` for now (simpler, less context-pressure). Dedicate `PostToolUse` to live message delivery only.
-- **It does NOT read stdin.** The PostToolUse stdin payload (tool_name, tool_input, tool_response) is ignored — the mail check is tool-agnostic.
+- **It does NOT check tasks.** Task surfacing stays in `SessionStart` for now (simpler, less context-pressure).
 - **It does NOT retry.** A single budget, silent-fail, wait for the next tool call.
-- **It does NOT work for idle terminals.** If no tool is running, the hook will not fire — honest limitation. Use the SessionStart hook + human attention for long-idle windows.
+- **It does NOT work for idle terminals.** If no tool is running, the hook will not fire — honest limitation. Use the SessionStart and Stop hooks for idle windows.
 
 ## Timing budget
 
-The hook self-imposes a ~2 second budget (1s health probe + 2s `get_messages` call). On an unreachable relay + missing DB, the full-fail path completes in tens of milliseconds. Claude Code's `timeout` field is the hard ceiling; set it to 5 or higher in settings.json to leave headroom.
+The hook self-imposes a ~2 second budget (1s health probe + 2s `get_messages` call). On an unreachable relay + missing DB, the full-fail path completes in tens of milliseconds. Reading the stdin payload is instant when Claude Code closes the pipe, and bounded to one idle second when a caller does not. Claude Code's `timeout` field is the hard ceiling; set it to 5 or higher in settings.json to leave headroom.
 
 ## Troubleshooting
 
 **Hook silently fails on paths with spaces.** This is the most common install bug. Claude Code passes the `command` string to `/bin/sh`, which splits on whitespace. A path like `/path/to/My Projects/bot-relay-mcp/...` gets split at the space and the shell errors with `is a directory` — which you never see because hook stderr is not surfaced by default. **Fix:** single-quote the path inside the JSON string — see "Paths containing spaces" above. Verify with `sh -c "$COMMAND"` where `$COMMAND` is the exact string from your settings.json.
 
-**Hook fires but messages never appear.** Check that:
+**Hook fires but no notice appears.** Check that:
 - `RELAY_AGENT_NAME` matches the name the SessionStart hook registered under.
 - The relay daemon is running (`curl http://127.0.0.1:3777/health` returns `status:ok`).
 - If using HTTP, `RELAY_AGENT_TOKEN` is set and matches the agent.
-- If using sqlite, the DB path is correct and you have read+write access to it.
+- If using sqlite, the DB path is correct and readable.
+- The notice is not simply damped: the same unread set was already announced in this session less than `RELAY_HOOK_NOTICE_REMIND_SECS` ago. Set it to `0` to see every notice while debugging.
+
+**The same notice keeps coming back.** The mail is still unread. Call `get_messages` for the agent; the notice stops once the unread set is empty.
 
 **Hook output looks like stray JSON in my conversation.** That would mean the hook JSON is not being parsed as a Claude Code hook response. Check that the `type: "command"` and `command: "/path/..."` config in settings.json are correct and the script has `+x` permission.
 
@@ -121,3 +137,4 @@ The hook self-imposes a ~2 second budget (1s health probe + 2s `get_messages` ca
 - [`docs/hooks.md`](./hooks.md) — SessionStart hook (terminal-open mail check)
 - [`hooks/post-tool-use-check.sh`](../hooks/post-tool-use-check.sh) — script source
 - [`tests/hooks-post-tool-use.test.ts`](../tests/hooks-post-tool-use.test.ts) — integration tests
+- [`tests/adr-0037-post-tool-use-peek-only.test.ts`](../tests/adr-0037-post-tool-use-peek-only.test.ts) — the ADR-0037 contract (never consumes, subagent skip, damper)
