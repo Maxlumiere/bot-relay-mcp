@@ -5098,6 +5098,16 @@ function positiveConfirmationISO(name: string): string | null {
   return new Date(at).toISOString();
 }
 
+/**
+ * ADR-0041 R1 — one agent, projected from what is stored NOW. Callers that write
+ * more than once (register_agent writes the row, then the anchor) build their
+ * receipt from this AFTER the last write, so it cannot predate one.
+ */
+export function getAgentWithStatus(name: string): AgentWithStatus | undefined {
+  const row = getDb().prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord | undefined;
+  return row ? toAgentWithStatus(row) : undefined;
+}
+
 export function getAgents(role?: string): AgentWithStatus[] {
   const db = getDb();
   let rows: AgentRecord[];
@@ -5791,6 +5801,8 @@ export interface DrainEffect {
   resolveRan: boolean;
   /** Rows whose resolved_at this call set (not rows returned). */
   resolved: number;
+  /** Rows this call DELIVERED (a non-peek drain that returned them and stamped read_at / last_drain_at). 0 on a peek, a read-status browse, or an empty result. */
+  delivered: number;
 }
 
 export function getMessages(
@@ -6053,7 +6065,13 @@ export function getMessagesWithEffect(
   // v1.7: decrypt content field on read (safe-no-op for plaintext rows)
   return {
     rows: rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content })),
-    effect: { sessionBound: !!currentSession, marked: drainedRows, resolveRan, resolved: resolvedRows },
+    effect: {
+      sessionBound: !!currentSession,
+      marked: drainedRows,
+      resolveRan,
+      resolved: resolvedRows,
+      delivered: !peek && status !== "read" ? rows.length : 0,
+    },
   };
 }
 

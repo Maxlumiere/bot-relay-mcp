@@ -42,6 +42,7 @@ delete process.env.RELAY_AGENT_ROLE;
 delete process.env.RELAY_AGENT_CAPABILITIES;
 
 const { handleGetMessages } = await import("../src/tools/messaging.js");
+const { handleRegisterAgent } = await import("../src/tools/identity.js");
 const { closeDb, getDb, registerAgent, sendMessage, mintAgentToken } = await import("../src/db.js");
 
 function parse(result: { content: { text: string }[] }) {
@@ -177,5 +178,58 @@ describe("ADR-0041 R4 — the ADR-0037 innocent twin holds for a NULL-session ag
     parse(handleGetMessages({ agent_name: "victra-like", status: "pending", limit: 20 } as never));
     for (const id of ids) expect(row(id).read_at).not.toBeNull();
     expect(lastDrainAt("victra-like")).not.toBeNull();
+  });
+});
+
+describe("ADR-0041 R3, Codex round 1 — the session_unbound warning states only what THIS call did", () => {
+  it("a PEEK with a NULL session: the warning must not claim delivery or recorded receipts", () => {
+    registerAgent("sender", "r", []);
+    nullSessionAgent("nulls");
+    sendMessage("sender", "nulls", "x", "normal");
+    const r = parse(handleGetMessages({ agent_name: "nulls", status: "pending", limit: 20, peek: true } as never));
+    expect(r.warning?.code).toBe("session_unbound");
+    expect(r.warning?.message).not.toMatch(/was delivered|were recorded/i);
+    expect(r.warning?.message).toMatch(/peek|nothing was recorded/i);
+  });
+
+  it("a drain that returns ZERO rows with a NULL session: nothing to record, and the warning says so", () => {
+    nullSessionAgent("nulls");
+    const r = parse(handleGetMessages({ agent_name: "nulls", status: "pending", limit: 20 } as never));
+    expect(r.count).toBe(0);
+    expect(r.warning?.code).toBe("session_unbound");
+    expect(r.warning?.message).not.toMatch(/was delivered|were recorded/i);
+    expect(r.warning?.message).toMatch(/nothing (to record|was recorded)/i);
+  });
+
+  it("TWIN: a drain that DID return mail says what it recorded", () => {
+    registerAgent("sender", "r", []);
+    nullSessionAgent("nulls");
+    sendMessage("sender", "nulls", "x", "normal");
+    const r = parse(handleGetMessages({ agent_name: "nulls", status: "pending", limit: 20 } as never));
+    expect(r.warning?.message).toMatch(/read_at/);
+    expect(r.warning?.message).toMatch(/last_drain_at/);
+  });
+});
+
+// Lives in THIS file, not the receipt-walk file: that one mocks child_process, so
+// `ps` sees no process and no anchor can ever read alive (a vacuous precondition).
+describe("ADR-0041 R1, Codex round 1 — the register receipt is read back AFTER every write, the anchor included", () => {
+  it("first register with agent_pid = a LIVE local pid and no host_id: the receipt shows the anchor the handler just wrote", async () => {
+    const { getOwnHostId, processStartedAt } = await import("../src/liveness.js");
+    const { getAgents } = await import("../src/db.js");
+    const r = parse(
+      handleRegisterAgent({
+        name: "walk-anchor",
+        role: "builder",
+        capabilities: [],
+        agent_pid: process.pid,
+        agent_pid_start: processStartedAt(process.pid) ?? undefined,
+      } as never),
+    );
+    const now = getAgents().find((a) => a.name === "walk-anchor")!;
+    expect(now.host_id, "precondition: the handler's anchor write stamped the local host").toBe(getOwnHostId());
+    expect(now.liveness, "precondition: the completed row has a live anchor").toBe("alive");
+    expect(r.agent.host_id, "the receipt must not predate the anchor write").toBe(now.host_id);
+    expect(r.agent.liveness).toBe(now.liveness);
   });
 });

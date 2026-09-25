@@ -144,3 +144,4 @@ describe("ADR-0041 R1 walk — spawn_agent's has_initial_message reports the ins
     expect(r.initial_message_error).toBeUndefined();
   });
 });
+

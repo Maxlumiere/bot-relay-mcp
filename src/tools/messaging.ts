@@ -297,14 +297,23 @@ export function handleGetMessages(input: GetMessagesInput) {
   // ADR-0041 R3: a NULL session is the honest "unbound" state. The drain delivered
   // and stamped the agent-level axes, but there is no per-session read mark, so the
   // same mail comes back next time unless it is resolved. Say so, and name the remedy.
+  // Codex round 1: the warning states only what THIS call did. A peek records
+  // nothing, and a drain that returned no rows has nothing to record.
+  const whatHappened =
+    input.peek === true
+      ? "This was a peek, so nothing was recorded."
+      : effect.delivered === 0
+        ? "No mail was returned, so there was nothing to record."
+        : `${effect.delivered} message(s) were delivered: read_at and last_drain_at were stamped` +
+          (effect.resolved > 0 ? `, and ${effect.resolved} resolved` : "") +
+          `, but no per-session read mark was written, so unresolved mail is returned again on the next drain.`;
   const unboundWarning = effect.sessionBound
     ? undefined
     : {
         code: "session_unbound",
         message:
           `${input.agent_name} has no current session (agents.session_id is NULL, e.g. after a token ` +
-          `rotation or force-mint). Mail was delivered and read_at / last_drain_at / resolves were recorded, ` +
-          `but no per-session read mark, so unresolved mail is returned again on the next drain. ` +
+          `rotation or force-mint). ${whatHappened} ` +
           `Remedy: re-register this agent (restart its window so the SessionStart hook registers, or call ` +
           `register_agent), and resolve handled mail with ack=true or resolve_messages.`,
       };
