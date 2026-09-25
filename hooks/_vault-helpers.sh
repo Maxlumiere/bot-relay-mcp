@@ -29,6 +29,13 @@
 #   - botRelayRoot()              src/instance.ts:70   (RELAY_HOME wins, else $HOME/.bot-relay)
 #   - resolveActiveInstanceId()   src/instance.ts:118  (RELAY_INSTANCE_ID > active-instance link/file)
 #   - instanceDir()               src/instance.ts:149  ([A-Za-z0-9._-]+ allowlist)
+# Whole-string match. `echo "$X" | grep -Eq '^RE$'` is LINE-oriented: a
+# multi-line value passes if ANY line matches, and the rest rides along into
+# whatever the value is used for (Codex round 2 on #280: a newline in
+# RELAY_AGENT_NAME reached a sqlite heredoc as SQL). [[ =~ ]] anchors to the
+# whole string.
+relay_whole_match() { [[ "$1" =~ $2 ]]; }
+
 resolve_relay_db_path() {
   if [ -n "${RELAY_DB_PATH:-}" ]; then
     echo "$RELAY_DB_PATH"
@@ -50,7 +57,10 @@ resolve_relay_db_path() {
     id=$(head -n 1 "$root/active-instance" | tr -d '[:space:]')
   fi
   if [ -n "$id" ]; then
-    if ! echo "$id" | grep -qE '^[A-Za-z0-9._-]+$'; then
+    # Inlined whole-string match (not relay_whole_match): this function is also
+    # extracted and run standalone by tests/v2-4-5, so it must be self-contained.
+    local id_re='^[A-Za-z0-9._-]+$'
+    if ! [[ "$id" =~ $id_re ]]; then
       echo "[bot-relay hook] invalid instance_id \"$id\" — must match [A-Za-z0-9._-]+ (mirrors src/instance.ts:instanceDir)" >&2
       return 1
     fi
@@ -65,7 +75,7 @@ resolve_relay_db_path() {
 # stdout. Returns 0 on success; on bad name, stderr + return 1.
 resolve_relay_token_path() {
   local name="$1"
-  if ! echo "$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+  if ! relay_whole_match "$name" '^[A-Za-z0-9_.-]{1,64}$'; then
     echo "[bot-relay hook] invalid agent name \"$name\" for vault path (mirrors AGENT_NAME_RE in src/token-store.ts)" >&2
     return 1
   fi
@@ -91,7 +101,7 @@ read_relay_token_from_vault() {
   if [ -z "$token" ]; then
     return 1
   fi
-  if ! echo "$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
+  if ! relay_whole_match "$token" '^[A-Za-z0-9_=.-]{8,128}$'; then
     return 1
   fi
   echo "$token"
@@ -116,7 +126,7 @@ read_relay_token_from_vault() {
 # return 1.
 resolve_relay_spawn_manifest_path() {
   local name="$1"
-  if ! echo "$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+  if ! relay_whole_match "$name" '^[A-Za-z0-9_.-]{1,64}$'; then
     echo "[bot-relay hook] invalid agent name \"$name\" for manifest path" >&2
     return 1
   fi
@@ -135,11 +145,11 @@ resolve_relay_spawn_manifest_path() {
 write_relay_spawn_manifest() {
   local name="$1"
   local role="$2"
-  if ! echo "$name" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+  if ! relay_whole_match "$name" '^[A-Za-z0-9_.-]{1,64}$'; then
     echo "[bot-relay hook] refusing to write manifest with malformed name \"$name\"" >&2
     return 1
   fi
-  if ! echo "$role" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+  if ! relay_whole_match "$role" '^[A-Za-z0-9_.-]{1,64}$'; then
     echo "[bot-relay hook] refusing to write manifest with malformed role \"$role\"" >&2
     return 1
   fi
@@ -224,7 +234,7 @@ find_fresh_relay_spawn_manifest() {
   # Validate filename + read+parse content
   local fname mname mrole
   fname=$(basename "$candidates" .spawn-manifest)
-  if ! echo "$fname" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+  if ! relay_whole_match "$fname" '^[A-Za-z0-9_.-]{1,64}$'; then
     return 1
   fi
   mname=$(grep -E '^name=' "$candidates" | head -n 1 | sed -E 's/^name=//')
@@ -235,10 +245,10 @@ find_fresh_relay_spawn_manifest() {
   if [ "$mname" != "$fname" ]; then
     return 1
   fi
-  if ! echo "$mname" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+  if ! relay_whole_match "$mname" '^[A-Za-z0-9_.-]{1,64}$'; then
     return 1
   fi
-  if ! echo "$mrole" | grep -qE '^[A-Za-z0-9_.-]{1,64}$'; then
+  if ! relay_whole_match "$mrole" '^[A-Za-z0-9_.-]{1,64}$'; then
     return 1
   fi
   printf 'name=%s;role=%s\n' "$mname" "$mrole"
@@ -309,7 +319,7 @@ delete_relay_spawn_manifest() {
 write_relay_token_to_vault() {
   local name="$1"
   local token="$2"
-  if ! echo "$token" | grep -qE '^[A-Za-z0-9_=.-]{8,128}$'; then
+  if ! relay_whole_match "$token" '^[A-Za-z0-9_=.-]{8,128}$'; then
     echo "[bot-relay hook] refusing to write malformed token to vault for \"$name\"" >&2
     return 1
   fi

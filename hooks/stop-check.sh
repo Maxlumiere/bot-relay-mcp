@@ -206,7 +206,14 @@ fi
 
 # --- Input validation (security hardening — same allowlist as check-relay.sh) ---
 
-if ! echo "$AGENT_NAME" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$'; then
+# Whole-string match. `echo "$X" | grep -Eq '^RE$'` is LINE-oriented: a
+# multi-line value passes if ANY line matches, and the rest rides along into
+# whatever the value is used for (Codex round 2 on #280: a newline in
+# RELAY_AGENT_NAME reached a sqlite heredoc as SQL). [[ =~ ]] anchors to the
+# whole string.
+relay_whole_match() { [[ "$1" =~ $2 ]]; }
+
+if ! relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$'; then
   exit 0
 fi
 
@@ -220,26 +227,26 @@ if [ -z "$AGENT_TOKEN" ]; then
   fi
 fi
 
-if ! echo "$HTTP_HOST" | grep -Eq '^[A-Za-z0-9_.:-]{1,253}$'; then
+if ! relay_whole_match "$HTTP_HOST" '^[A-Za-z0-9_.:-]{1,253}$'; then
   exit 0
 fi
 
-if ! echo "$HTTP_PORT" | grep -Eq '^[0-9]{1,5}$' || [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+if ! relay_whole_match "$HTTP_PORT" '^[0-9]{1,5}$' || [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
   exit 0
 fi
 
-if ! echo "$MAX_MESSAGES" | grep -Eq '^[0-9]{1,3}$' || [ "$MAX_MESSAGES" -lt 1 ] || [ "$MAX_MESSAGES" -gt 100 ]; then
+if ! relay_whole_match "$MAX_MESSAGES" '^[0-9]{1,3}$' || [ "$MAX_MESSAGES" -lt 1 ] || [ "$MAX_MESSAGES" -gt 100 ]; then
   MAX_MESSAGES=20
 fi
 
-if ! echo "$DAMPER_SECS" | grep -Eq '^[0-9]{1,4}$' || [ "$DAMPER_SECS" -gt 3600 ]; then
+if ! relay_whole_match "$DAMPER_SECS" '^[0-9]{1,4}$' || [ "$DAMPER_SECS" -gt 3600 ]; then
   DAMPER_SECS=120
 fi
 
 # Token shape: base64url-ish, 8-128 chars, strictly alnum/_/=/./- (no whitespace,
 # no control chars — blocks header-injection via newlines in env var).
 if [ -n "$AGENT_TOKEN" ]; then
-  if ! echo "$AGENT_TOKEN" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}$'; then
+  if ! relay_whole_match "$AGENT_TOKEN" '^[A-Za-z0-9_=.-]{8,128}$'; then
     AGENT_TOKEN=""
   fi
 fi

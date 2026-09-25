@@ -123,7 +123,14 @@ fi
 
 # --- Input validation (security hardening — same allowlist as check-relay.sh) ---
 
-if ! echo "$AGENT_NAME" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$'; then
+# Whole-string match. `echo "$X" | grep -Eq '^RE$'` is LINE-oriented: a
+# multi-line value passes if ANY line matches, and the rest rides along into
+# whatever the value is used for (Codex round 2 on #280: a newline in
+# RELAY_AGENT_NAME reached a sqlite heredoc as SQL). [[ =~ ]] anchors to the
+# whole string.
+relay_whole_match() { [[ "$1" =~ $2 ]]; }
+
+if ! relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$'; then
   exit 0
 fi
 
@@ -137,21 +144,21 @@ if [ -z "$AGENT_TOKEN" ]; then
   fi
 fi
 
-if ! echo "$HTTP_HOST" | grep -Eq '^[A-Za-z0-9_.:-]{1,253}$'; then
+if ! relay_whole_match "$HTTP_HOST" '^[A-Za-z0-9_.:-]{1,253}$'; then
   exit 0
 fi
 
-if ! echo "$HTTP_PORT" | grep -Eq '^[0-9]{1,5}$' || [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+if ! relay_whole_match "$HTTP_PORT" '^[0-9]{1,5}$' || [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
   exit 0
 fi
 
-if ! echo "$MAX_MESSAGES" | grep -Eq '^[0-9]{1,3}$' || [ "$MAX_MESSAGES" -lt 1 ] || [ "$MAX_MESSAGES" -gt 100 ]; then
+if ! relay_whole_match "$MAX_MESSAGES" '^[0-9]{1,3}$' || [ "$MAX_MESSAGES" -lt 1 ] || [ "$MAX_MESSAGES" -gt 100 ]; then
   MAX_MESSAGES=20
 fi
 
 # Only a plain decimal 0..3600 is honoured; anything else is the default, never
 # "disabled". 10# strips leading zeros so shell arithmetic cannot read octal.
-if ! echo "$REMIND_SECS" | grep -Eq '^[0-9]{1,4}$' || [ "$REMIND_SECS" -gt 3600 ]; then
+if ! relay_whole_match "$REMIND_SECS" '^[0-9]{1,4}$' || [ "$REMIND_SECS" -gt 3600 ]; then
   REMIND_SECS=600
 fi
 REMIND_SECS=$((10#$REMIND_SECS))
@@ -159,7 +166,7 @@ REMIND_SECS=$((10#$REMIND_SECS))
 # Token shape: base64url-ish, 8-128 chars, strictly alnum/_/=/./- (no whitespace,
 # no control chars — blocks header-injection via newlines in env var).
 if [ -n "$AGENT_TOKEN" ]; then
-  if ! echo "$AGENT_TOKEN" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}$'; then
+  if ! relay_whole_match "$AGENT_TOKEN" '^[A-Za-z0-9_=.-]{8,128}$'; then
     AGENT_TOKEN=""
   fi
 fi
@@ -259,7 +266,10 @@ except ValueError:
     lim = 20
 raw = sys.stdin.buffer.read().decode("utf-8", "replace")
 
-recs = []
+# Every record is (id, sender, priority, created_at). NO content field is read on
+# either path: the notice is metadata only.
+RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+recs, total, top_name, newest = [], None, None, None
 if src == "http":
     payload = None
     for line in raw.strip().splitlines():
@@ -278,20 +288,24 @@ if src == "http":
     if not isinstance(msgs, list):
         sys.exit(1)
     for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        c = m.get("content")
-        recs.append((str(m.get("id", "")), str(m.get("from_agent", "?")),
-                     str(m.get("priority", "normal")), str(m.get("created_at", "")),
-                     c if isinstance(c, str) else ""))
+        if isinstance(m, dict):
+            recs.append((str(m.get("id", "")), str(m.get("from_agent", "")),
+                         str(m.get("priority", "normal")), str(m.get("created_at", ""))))
+    # get_messages orders by PRIORITY first, so the highest priority of ALL
+    # pending mail is always inside the returned page.
+    if isinstance(data.get("total_pending"), int):
+        total = data["total_pending"]
 elif src == "sqlite":
-    for rec in raw.split("\x1e"):
-        rec = rec.strip("\n\r")
-        if not rec:
-            continue
-        parts = rec.split("\x1f", 4)
-        if len(parts) == 5:
-            recs.append(tuple(parts))
+    # JSON from the read-only sqlite reader: no delimiter a sender can forge.
+    try:
+        d = json.loads(raw)
+        total = int(d["total"])
+        top_name = d.get("top")
+        newest = d.get("newest")
+        for r in d["rows"]:
+            recs.append((str(r["id"]), str(r["from_agent"]), str(r["priority"]), str(r["created_at"])))
+    except Exception:
+        sys.exit(1)
 else:
     sys.exit(1)
 
@@ -299,12 +313,20 @@ if not recs:
     sys.exit(0)
 
 n = len(recs)
-count = ("%d+" % n) if n >= lim else ("%d" % n)
+if total is None:
+    count = ("%d+" % n) if n >= lim else ("%d" % n)
+else:
+    count = "%d" % total
 fpr = hashlib.sha256("\n".join(sorted(r[0] for r in recs)).encode("utf-8", "replace")).hexdigest()[:32]
-top = "high" if any(r[2] == "high" for r in recs) else "normal"
+if top_name not in RANK:
+    top_name = min((r[2] for r in recs), key=lambda p: RANK.get(p, 2))
+# The damper 120s remind applies to anything high or above.
+top = "high" if RANK.get(top_name, 2) <= 1 else "normal"
+if not newest:
+    newest = max(r[3] for r in recs)
 newest_first = sorted(recs, key=lambda r: r[3], reverse=True)
 # Sender names are the ONLY sender-chosen field in the notice, so they are held to
-# [a-z0-9-]; anything else shows as "unknown". No content field is read at all.
+# [a-z0-9-]; anything else shows as "unknown".
 SENDER = re.compile(r"[a-z0-9-]{1,64}")
 order, highs = [], {}
 for r in newest_first:
@@ -312,7 +334,7 @@ for r in newest_first:
     if who not in highs:
         order.append(who)
         highs[who] = 0
-    if r[2] == "high":
+    if RANK.get(r[2], 2) <= 1:
         highs[who] += 1
 shown = [("%s (%d high)" % (w, highs[w])) if highs[w] else w for w in order[:5]]
 if len(order) > 5:
@@ -331,7 +353,7 @@ def age(iso):
     return "%ds ago" % secs
 
 notice = ("relay: %s unread for %s (highest priority: %s), from %s. newest arrived %s. "
-          "Unread until get_messages is called.") % (count, an, top, ", ".join(shown), age(newest_first[0][3]))
+          "Unread until get_messages is called.") % (count, an, top_name, ", ".join(shown), age(newest))
 sys.stdout.buffer.write(("%s\x1f%s\x1f%s" % (fpr, top, notice)).encode("utf-8", "replace"))
 '
 
@@ -385,38 +407,57 @@ print(json.dumps({
 # (never read, OR read by a DIFFERENT session). On a legacy DB without those
 # columns the query errors and the bare-status form runs instead.
 
+# Read-only, parameter-bound, content-free, delimiter-free. The DB is opened with
+# mode=ro (a write is impossible, not merely avoided) and the agent name is BOUND,
+# never interpolated into command text. COUNT, top priority and newest arrival are
+# computed over ALL pending mail; the page is ordered priority-first like
+# get_messages. Exit 1 = could not read (never rendered as "no mail").
+SQLITE_PEEK_PY='
+import json, os, sqlite3, sys, urllib.parse
+an = os.environ["AN"]
+lim = int(os.environ.get("LIM", "20"))
+try:
+    con = sqlite3.connect("file:" + urllib.parse.quote(os.environ["DBP"]) + "?mode=ro", uri=True, timeout=1)
+except Exception:
+    sys.exit(1)
+RANK = "CASE priority WHEN \x27critical\x27 THEN 0 WHEN \x27high\x27 THEN 1 WHEN \x27normal\x27 THEN 2 WHEN \x27low\x27 THEN 3 ELSE 2 END"
+NAMES = {0: "critical", 1: "high", 2: "normal", 3: "low"}
+# #56 canonical per-session pending predicate (the same replica stop-check.sh uses;
+# F1 replaces every hook copy with one CLI entrypoint). Legacy DBs without those
+# columns fall back to the bare status form.
+CANON = ("to_agent = ? AND resolved_at IS NULL AND (read_by_session IS NULL OR "
+         "read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = ?), \x27\x27))", 2)
+LEGACY = ("to_agent = ? AND status = \x27pending\x27", 1)
+def run(where, k):
+    p = [an] * k
+    total, toprank, newest = con.execute(
+        "SELECT COUNT(*), MIN(" + RANK + "), MAX(created_at) FROM messages WHERE " + where, p).fetchone()
+    rows = con.execute(
+        "SELECT id, from_agent, priority, created_at FROM messages WHERE " + where +
+        " ORDER BY " + RANK + ", created_at DESC LIMIT ?", p + [lim]).fetchall()
+    return total, toprank, newest, rows
+try:
+    try:
+        total, toprank, newest, rows = run(*CANON)
+    except sqlite3.OperationalError:
+        total, toprank, newest, rows = run(*LEGACY)
+except Exception:
+    sys.exit(1)
+if not total:
+    sys.exit(0)
+print(json.dumps({"total": total, "top": NAMES.get(toprank, "normal"), "newest": newest,
+                  "rows": [{"id": r[0], "from_agent": r[1], "priority": r[2], "created_at": r[3]} for r in rows]}))
+'
+
 sqlite_peek() {
   [ -z "$DB_PATH" ] && return 1
   [ -f "$DB_PATH" ] || return 1
-  command -v sqlite3 >/dev/null 2>&1 || return 1
-
-  local rows
-  rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-.parameter set :lim $MAX_MESSAGES
-SELECT id, from_agent, priority, created_at, substr(content, 1, 2048)
-FROM messages WHERE to_agent = :name
-  AND resolved_at IS NULL
-  AND (read_by_session IS NULL
-       OR read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = :name), ''))
-ORDER BY created_at DESC LIMIT :lim;
-SQL
-)
-  if [ $? -ne 0 ]; then
-    rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-.parameter set :lim $MAX_MESSAGES
-SELECT id, from_agent, priority, created_at, substr(content, 1, 2048)
-FROM messages WHERE to_agent = :name AND status = 'pending'
-ORDER BY created_at DESC LIMIT :lim;
-SQL
-) || return 1
+  local json
+  json=$(AN="$AGENT_NAME" DBP="$DB_PATH" LIM="$MAX_MESSAGES" python3 -c "$SQLITE_PEEK_PY" 2>/dev/null) || return 1
+  if [ -z "$json" ]; then
+    return 0  # verified empty
   fi
-  if [ -z "$rows" ]; then
-    return 0  # empty — nothing to surface
-  fi
-
-  printf '%s' "$rows" | SRC=sqlite AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null
+  printf '%s' "$json" | SRC=sqlite AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null
 }
 
 # --- v2.15.0: presence self-heal (narrow, metadata-only) ---
@@ -439,17 +480,23 @@ liveness_self_heal() {
   cur_start=$(relay_pid_start "$cur_pid" 2>/dev/null || printf '')
   # Read the stored anchor. Requires the sqlite fast-path; if unavailable we
   # can't compute the gate → skip (SessionStart still carries the anchor).
-  { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; } || return 0
-  stored_pid=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-SELECT IFNULL(agent_pid,'') FROM agents WHERE name = :name LIMIT 1;
-SQL
-)
-  stored_start=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-SELECT IFNULL(agent_pid_start,'') FROM agents WHERE name = :name LIMIT 1;
-SQL
-)
+  { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ]; } || return 0
+  # Read-only and parameter-bound (Codex round 2): the name is BOUND, never
+  # interpolated into sqlite command text. One read for both fields.
+  local stored
+  stored=$(AN="$AGENT_NAME" DBP="$DB_PATH" python3 -c '
+import os, sqlite3, sys, urllib.parse
+try:
+    con = sqlite3.connect("file:" + urllib.parse.quote(os.environ["DBP"]) + "?mode=ro", uri=True, timeout=1)
+    r = con.execute("SELECT IFNULL(agent_pid, \x27\x27), IFNULL(agent_pid_start, \x27\x27) FROM agents WHERE name = ? LIMIT 1", (os.environ["AN"],)).fetchone()
+except Exception:
+    sys.exit(1)
+if r:
+    sys.stdout.write("%s\x1f%s" % (r[0], r[1]))
+' 2>/dev/null) || return 0
+  stored_pid="${stored%%$'\x1f'*}"
+  stored_start="${stored#*$'\x1f'}"
+  [ "$stored_pid" = "$stored" ] && stored_start=""
   # Gate: restamp on a real mismatch — pid changed, OR we have a READABLE
   # current start that differs from / fills the stored one. Do NOT downgrade a
   # present stored start to empty when the current start is transiently
@@ -525,7 +572,7 @@ if [ ! -t 0 ]; then
   HOOK_MODE="${_parsed%%$'\x1f'*}"
   HOOK_SESSION="${_parsed#*$'\x1f'}"
 fi
-if ! echo "$HOOK_SESSION" | grep -Eq '^[A-Za-z0-9_-]{1,128}$'; then
+if ! relay_whole_match "$HOOK_SESSION" '^[A-Za-z0-9_-]{1,128}$'; then
   HOOK_SESSION=""
 fi
 
