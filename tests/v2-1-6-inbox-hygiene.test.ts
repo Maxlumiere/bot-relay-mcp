@@ -162,9 +162,14 @@ describe("v2.1.6 — get_messages `since` filter", () => {
     expect(data.messages[0].content).toBe("post");
   });
 
-  it("(1e) Zod schema applies the '24h' default at the MCP boundary", () => {
+  // ADR-0045 R2: the default is no longer a schema constant; it depends on status
+  // (pending → 'all', history → '24h') and the handler applies it (defaultSinceFor).
+  it("(1e) the since default is status-dependent: the schema leaves it unset, the handler applies it", async () => {
     const parsed = GetMessagesSchema.parse({ agent_name: "x" });
-    expect(parsed.since).toBe("24h");
+    expect(parsed.since).toBeUndefined();
+    const { defaultSinceFor } = await import("../src/types.js");
+    expect(defaultSinceFor("pending")).toBe("all");
+    for (const s of ["all", "history", "read", "resolved"]) expect(defaultSinceFor(s)).toBe("24h");
   });
 
   it("(1f) malformed since returns a VALIDATION error, not a throw", () => {
@@ -256,7 +261,7 @@ describe("v2.1.6 — get_messages_summary tool", () => {
 
   it("(2d) Zod schema is additive — same since field contract as get_messages", () => {
     const parsed = GetMessagesSummarySchema.parse({ agent_name: "x" });
-    expect(parsed.since).toBe("24h");
+    expect(parsed.since, "status-dependent default, applied by the handler (ADR-0045)").toBeUndefined();
     expect(parsed.status).toBe("pending");
     expect(parsed.limit).toBe(20);
   });

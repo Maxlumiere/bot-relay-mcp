@@ -90,7 +90,7 @@ describe("v2.2.2 regression-from-released-bugs", () => {
   });
 
   // ─── v2.2.1 B4 ──────────────────────────────────────────────────────
-  it("(3) since-filter trap — get_messages returns hint when a narrow window hides ALREADY-SEEN pending mail (#198: never-observed mail is delivered, not hidden, so this uses observed mail)", () => {
+  it("(3) since-filter trap — a narrow window that hides ALREADY-SEEN pending mail says so (hidden_by_since, ADR-0045; was the hint)", () => {
     registerAgent("r3-from", "r", []);
     registerAgent("r3-to", "r", []);
     const db = getDb();
@@ -115,8 +115,9 @@ describe("v2.2.2 regression-from-released-bugs", () => {
     } as any);
     const parsed = JSON.parse(res.content[0].text);
     expect(parsed.count).toBe(0); // observed-old mail is window-trimmed for session B
-    expect(parsed.hint).toBeTruthy(); // ...and the hint fires to say so
-    expect(parsed.hint).toMatch(/since/i);
+    expect(parsed.hidden_by_since).toBe(1); // ...and the response says how much it hid
+    expect(parsed.total_pending).toBe(1); // the canonical, unwindowed queue
+    expect(parsed).not.toHaveProperty("hint");
   });
 
   // ─── v2.2.1 B2 ──────────────────────────────────────────────────────

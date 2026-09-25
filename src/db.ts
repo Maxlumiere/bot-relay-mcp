@@ -5768,6 +5768,31 @@ export function countMatchingMessages(
   return (db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE ${where}`).get(...params) as { c: number }).c;
 }
 
+/**
+ * ADR-0045 R3/R5 — what a read's window did to the pending set. Every read that
+ * passes `since` to a message query reports through this, so a window can never
+ * hide pending mail silently (the drift guard in
+ * tests/adr-0045-hidden-by-since-guard.test.ts enforces that it is called).
+ *   windowed      — rows the query matches WITH its window (drives has_more/total).
+ *   total_pending — for status='pending', the CANONICAL count: the #53 predicate
+ *                   with NO window (R1). Absent for history reads.
+ *   hidden_by_since — pending rows the window hid (canonical − windowed), only
+ *                   when > 0.
+ * Counted BEFORE a drain marks anything, like the completeness signal it extends.
+ */
+export function pendingWindowReport(
+  agentName: string,
+  status: string,
+  sinceIso: string | null,
+  lane: "all" | "direct" | "capability" = "all",
+): { windowed: number; total_pending?: number; hidden_by_since?: number } {
+  const windowed = countMatchingMessages(agentName, status, sinceIso, lane);
+  if (status !== "pending") return { windowed };
+  const canonical = sinceIso === null ? windowed : countMatchingMessages(agentName, "pending", null, lane);
+  const hidden = canonical - windowed;
+  return { windowed, total_pending: canonical, ...(hidden > 0 ? { hidden_by_since: hidden } : {}) };
+}
+
 export function getMessages(
   agentName: string,
   status: string,
