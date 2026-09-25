@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-import { setAgentStatus, getHealthSnapshot, getAgents, getAgentAuthData, setAgentLivenessAnchor, findAgentRowByToken, markAgentAuthenticated } from "../db.js";
+import { setAgentStatus, getHealthSnapshot, getAgents, getDb, getLocalEdgeId, getAgentAuthData, setAgentLivenessAnchor, findAgentRowByToken, markAgentAuthenticated } from "../db.js";
 import type { SetStatusInput, HealthCheckInput, ReportLivenessInput, WhoamiResult } from "../types.js";
 import { resolveActiveInstanceId, resolveInstanceDbPath } from "../instance.js";
 import { VERSION } from "../version.js";
@@ -251,6 +251,11 @@ export function handleHealthCheck(input: HealthCheckInput) {
             ...snapshot,
             version: VERSION,
             protocol_version: PROTOCOL_VERSION,
+            // ADR-0043: which store am I talking to? The edge identity is per
+            // DATABASE, so two clients reporting different edge_ids are on two
+            // stores (the stdio legacy-DB split). Validated on read: a malformed
+            // edge throws rather than being reported.
+            edge_id: getLocalEdgeId(getDb()),
             transport: process.env.RELAY_TRANSPORT || "stdio",
             uptime_seconds,
             legacy_grace_active: process.env.RELAY_ALLOW_LEGACY === "1",
@@ -312,6 +317,7 @@ export function handleWhoami() {
     instance_id: resolveActiveInstanceId(),
     db_path: resolveInstanceDbPath(),
     host_id: row.host_id ?? null,
+    edge_id: getLocalEdgeId(getDb()),
   };
   return {
     content: [{ type: "text" as const, text: JSON.stringify({ success: true, ...identity }, null, 2) }],

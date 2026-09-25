@@ -603,6 +603,8 @@ export interface WhoamiResult {
   instance_id: string | null;
   db_path: string;
   host_id: string | null;
+  /** ADR-0043: which relay this is to the federation (relay_edge.edge_id) — an identifier, never a credential. */
+  edge_id: string;
 }
 
 export const HealthCheckSchema = z.object({

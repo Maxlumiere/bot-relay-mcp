@@ -205,6 +205,27 @@ describe("ADR-0036 S1 — agent_bindings is a guarded identity table", () => {
   });
 });
 
+// ADR-0043 — relay_edge is this relay's identity to the federation, created once
+// in db.ts and immutable. The triggers refuse a raw write at runtime; this guard
+// refuses one at review time, before it ships.
+describe("ADR-0043 — relay_edge is a guarded identity table", () => {
+  const EDGE_HARM: Array<[string, string]> = [
+    ["INSERT", "INSERT INTO relay_edge (id, edge_id, created_at) VALUES (1, ?, ?)"],
+    ["INSERT OR REPLACE", "INSERT OR REPLACE INTO relay_edge (id, edge_id, created_at) VALUES (1, ?, ?)"],
+    ["UPDATE", "UPDATE relay_edge SET edge_id = ? WHERE id = 1"],
+    ["DELETE", "DELETE FROM relay_edge"],
+  ];
+  for (const [label, sql] of EDGE_HARM) {
+    it(`HARM flagged: relay_edge ${label} outside db.ts`, () => {
+      expect(flagged(sql), `guard must flag: ${sql}`).toBe(true);
+    });
+  }
+
+  it("INNOCENT: a SELECT of relay_edge (whoami / health_check read) is not a mutation", () => {
+    expect(flagged("SELECT edge_id FROM relay_edge WHERE id = 1")).toBe(false);
+  });
+});
+
 // A source that db.exec's `sql` — the multi-statement path (prepare() is single-
 // statement; exec() is where codex's bypasses actually executed).
 const inExec = (sql: string) => `export function raw(db: any){ db.exec(${JSON.stringify(sql)}); }`;

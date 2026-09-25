@@ -114,12 +114,14 @@ describe("ADR-0036 S1 — the agent_bindings table", () => {
     }
   });
 
-  it("indexes the window anchor, agent_name and conversation_id", () => {
+  // Every key leads with edge_id (ADR-0043 rule 3): an anchor, a name or a
+  // conversation is only a key together with the edge that recorded it.
+  it("indexes the window anchor, agent_name and conversation_id — each behind edge_id", () => {
     const ix = indexesOf("agent_bindings");
-    const anchor = ["host_id", "window_pid", "window_pid_start"];
+    const anchor = ["edge_id", "host_id", "window_pid", "window_pid_start"];
     expect(ix.some((i) => JSON.stringify(i.columns) === JSON.stringify(anchor)), "index on the window anchor").toBe(true);
-    expect(ix.some((i) => i.columns[0] === "agent_name"), "index leading with agent_name").toBe(true);
-    expect(ix.some((i) => i.columns[0] === "conversation_id"), "index leading with conversation_id").toBe(true);
+    expect(ix.some((i) => JSON.stringify(i.columns) === '["edge_id","agent_name"]'), "index on (edge_id, agent_name)").toBe(true);
+    expect(ix.some((i) => JSON.stringify(i.columns) === '["edge_id","conversation_id"]'), "index on (edge_id, conversation_id)").toBe(true);
   });
 
   /**
@@ -137,7 +139,7 @@ describe("ADR-0036 S1 — the agent_bindings table", () => {
    */
   it("enforces ONE CURRENT binding per window anchor with a partial unique index", () => {
     expect(tableExists("agent_bindings"), "agent_bindings table").toBe(true);
-    const anchor = ["host_id", "window_pid", "window_pid_start"];
+    const anchor = ["edge_id", "host_id", "window_pid", "window_pid_start"];
     const uniqueOnAnchor = indexesOf("agent_bindings").filter(
       (i) => i.unique && JSON.stringify(i.columns) === JSON.stringify(anchor),
     );
@@ -156,8 +158,9 @@ describe("ADR-0036 S1 — the agent_bindings table", () => {
 
   it("has NO unique-per-name constraint: two windows may record the same name in S1 (§8a D1)", () => {
     expect(tableExists("agent_bindings"), "agent_bindings table").toBe(true);
+    // Any unique key made of the name alone or the name behind its edge.
     const uniqueOnName = indexesOf("agent_bindings").filter(
-      (i) => i.unique && i.columns.length === 1 && i.columns[0] === "agent_name",
+      (i) => i.unique && i.columns.includes("agent_name") && i.columns.every((c) => c === "agent_name" || c === "edge_id"),
     );
     expect(uniqueOnName, "per-name exclusivity is S3's claim-time rule, never schema").toEqual([]);
   });
