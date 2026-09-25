@@ -512,3 +512,39 @@ describe("ADR-0037 notice, architect ruling — METADATA ONLY: sender-chosen wor
     expect(ctx).toContain("from unknown");
   });
 });
+
+describe("ADR-0044 (a) — the hook's peek changes NO delivery or resolution state; the seq stamp is a KNOWN RESIDUAL", () => {
+  it("HTTP peek: read_by_session, read_at, resolved_at, status, last_drain_at and the unread count are unchanged", async () => {
+    const s = await register("a44-sender");
+    const t = await register("a44-recv");
+    await send("a44-sender", "a44-recv", "a44 body", s);
+    const row = () =>
+      getDb()
+        .prepare("SELECT status, read_by_session, read_at, resolved_at, seq, epoch FROM messages WHERE to_agent = ? AND content = ?")
+        .get("a44-recv", "a44 body") as Record<string, unknown>;
+    const unread = async () => (await tool("peek_inbox_version", { agent_name: "a44-recv", agent_token: t })).total_unread_count;
+
+    const before = row();
+    const unreadBefore = await unread();
+    const drainBefore = lastDrainAt("a44-recv");
+    expect(before.seq, "precondition: never observed yet").toBeNull();
+
+    const ctx = contextOf(await runHook(httpEnv("a44-recv", t)));
+    expect(ctx, "precondition: the hook really peeked this mail").toMatch(/^relay: 1 unread for a44-recv/);
+
+    const after = row();
+    for (const k of ["status", "read_by_session", "read_at", "resolved_at"]) {
+      expect(after[k], `${k} must not change on a hook peek`).toEqual(before[k]);
+    }
+    expect(lastDrainAt("a44-recv"), "last_drain_at must not change").toEqual(drainBefore);
+    expect(await unread(), "the unread count the wake runs on must not change").toBe(unreadBefore);
+
+    // KNOWN RESIDUAL (ADR-0044): get_messages(peek) stamps the OBSERVED axis
+    // (seq/epoch) even though the metadata-only notice observed no message. It is
+    // measured inert (no decision keys on seq, drift guard below). F1 (relay pending
+    // --json, pure SELECT) removes it: when F1 lands this assertion FAILS and must be
+    // flipped to "seq stays NULL". No silent drift.
+    expect(after.seq, "KNOWN RESIDUAL until F1: the peek stamps seq").not.toBeNull();
+    expect(after.epoch).not.toBeNull();
+  });
+});

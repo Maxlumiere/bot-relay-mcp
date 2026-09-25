@@ -16,12 +16,14 @@
  * differs from the cached one.
  *
  * The wake signal is `total_unread_count`, NOT `last_seq` (v2.3.0
- * Codex HIGH #2 contract at src/db.ts:3014-3021). `seq` is assigned
- * on FIRST OBSERVATION — i.e., the recipient's get_messages drain
- * path at src/db.ts:3181-3199 runs UPDATE messages SET seq = ...
- * WHERE seq IS NULL — so `last_seq` doesn't advance on delivery
- * and won't reflect pre-first-observation new mail. Watching
- * `last_seq` alone will miss every fresh arrival.
+ * Codex HIGH #2 contract). `seq` is assigned on FIRST OBSERVATION by
+ * ANY get_messages call, a non-consuming peek included (UPDATE messages
+ * SET seq = ... WHERE seq IS NULL in getMessages). So `last_seq`
+ * doesn't advance on delivery, won't reflect pre-first-observation new
+ * mail, and DOES advance on a peek that marked nothing read: it is the
+ * OBSERVED axis, not the delivered or read one. Watching `last_seq`
+ * alone will miss every fresh arrival. No decision may key on `seq`
+ * (ADR-0044, enforced by tests/adr-0044-no-decision-keys-on-seq).
  *
  * Auth model: same as `get_messages`. The dispatcher's enforceAuth
  * step handles token verification before we're called; this handler
