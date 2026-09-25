@@ -18,7 +18,7 @@ import {
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
 import { ERROR_CODES } from "../error-codes.js";
-import { parseSince } from "./standup.js";
+import { resolveSinceBoundWith } from "../since.js";
 import { sampleGetMessagesConsistency } from "../transport/consistency-probe.js";
 import { truncatedPreview } from "../preview.js";
 import type {
@@ -147,17 +147,10 @@ function resolveSinceBound(
   since: string | null | undefined,
   agentName: string
 ): string | null {
-  if (since === null || since === undefined) return null;
-  if (since === "all") return null;
-  if (since === "session_start") {
-    const started = getAgentSessionStart(agentName);
-    // Unknown agent OR legacy row (never re-registered post-v2.1.6) → no
-    // session anchor exists, so treat as an unfiltered read instead of
-    // inventing a bound. Callers wanting a time floor can pass a duration.
-    return started ?? null;
-  }
-  const ms = parseSince(since);
-  return new Date(ms).toISOString();
+  // Unknown agent OR legacy row (never re-registered post-v2.1.6) → no session
+  // anchor exists, so "session_start" is an unfiltered read instead of an
+  // invented bound. Shared with `relay pending` (src/since.ts).
+  return resolveSinceBoundWith(since, () => getAgentSessionStart(agentName));
 }
 
 export function handleGetMessages(input: GetMessagesInput) {

@@ -14,6 +14,8 @@
 
 import type { GetStandupInput } from "../types.js";
 import { ERROR_CODES } from "../error-codes.js";
+import { parseSince } from "../since.js";
+export { parseSince };
 import {
   getAgents,
   getMessagesInWindow,
@@ -63,35 +65,6 @@ interface StandupResult {
     assigned_by_agent: Record<string, number>;
   };
   observations: string[];
-}
-
-/**
- * Parse `since` as either a duration shorthand or an ISO timestamp. Returns
- * milliseconds-since-epoch of the window start. Throws on invalid input.
- */
-export function parseSince(since: string, nowMs: number = Date.now()): number {
-  const durMatch = /^(\d+)(m|h|d)$/.exec(since.trim());
-  if (durMatch) {
-    const n = parseInt(durMatch[1], 10);
-    const unit = durMatch[2];
-    const multipliers: Record<string, number> = {
-      m: 60 * 1000,
-      h: 60 * 60 * 1000,
-      d: 24 * 60 * 60 * 1000,
-    };
-    if (n <= 0 || !Number.isFinite(n)) {
-      throw new Error(`since duration must be positive: "${since}"`);
-    }
-    return nowMs - n * multipliers[unit];
-  }
-  // Fallback: ISO timestamp parse.
-  const t = Date.parse(since);
-  if (Number.isNaN(t)) {
-    throw new Error(
-      `since must be a duration ('15m' | '1h' | '3h' | '1d') or ISO8601 timestamp; got "${since}"`
-    );
-  }
-  return t;
 }
 
 function topN<T>(

@@ -22,7 +22,7 @@ import type {
   WebhookRecord,
   WebhookDeliveryRecord,
 } from "./types.js";
-import { VALID_TRANSITIONS, ACTION_TO_STATUS } from "./types.js";
+import { VALID_TRANSITIONS, ACTION_TO_STATUS, AGENT_NAME_PATTERN } from "./types.js";
 import { generateToken, hashToken, verifyToken } from "./auth.js";
 import { registerPersistedSecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
@@ -5768,6 +5768,98 @@ export function countMatchingMessages(
   return (db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE ${where}`).get(...params) as { c: number }).c;
 }
 
+/** The drain's ORDER (priority first, newest first) — shared with pendingMetadata so the two list in one order. */
+const DRAIN_PRIORITY_ORDER_SQL =
+  "ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC";
+
+const PRIORITIES: ReadonlySet<string> = new Set(["critical", "high", "normal", "low"]);
+
+export interface PendingMessageMeta {
+  id: string;
+  /** The sender, or null when the stored value fails the agent-name pattern (never echoed raw). */
+  from: string | null;
+  priority: string | null;
+  age_seconds: number;
+}
+
+export interface PendingMeta {
+  /** False: this DB has no row for the agent (wrong instance, or never registered). */
+  registered: boolean;
+  /** False when agents.session_id is NULL: the pending set is then every unresolved message. */
+  session_bound: boolean;
+  count: number;
+  top_priority: string | null;
+  messages: PendingMessageMeta[];
+}
+
+/**
+ * F1 (ADR-0044) — what get_messages(pending) WOULD return for this agent, as
+ * METADATA ONLY, from a handle the caller opened (read-only for `relay pending`).
+ *
+ * SSOT BY CONSTRUCTION, not by care: the session is resolved exactly as
+ * getMessages resolves it (agents.session_id), the WHERE comes from the SAME
+ * buildMessageWhere("pending", ...) and the order from the SAME
+ * DRAIN_PRIORITY_ORDER_SQL. Nothing here restates the predicate.
+ *
+ * PURE SELECT: no seq stamp, no read-mark, no inbox_events, no last_drain_at.
+ * The CLI additionally opens its handle read-only, so a write would fail at the
+ * driver. NO CONTENT: only id, sender, priority and created_at are selected.
+ * No LIMIT: `count` is the whole pending set, never a capped page.
+ */
+export function pendingMetadata(db: CompatDatabase, agentName: string, sinceIso: string | null): PendingMeta {
+  const agentRow = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(agentName) as
+    | { session_id: string | null }
+    | undefined;
+  const currentSession = agentRow?.session_id ?? null;
+  const { where, params } = buildMessageWhere(agentName, "pending", sinceIso, "all", currentSession);
+  const rows = db
+    .prepare(`SELECT id, from_agent, priority, created_at FROM messages WHERE ${where} ${DRAIN_PRIORITY_ORDER_SQL}`)
+    .all(...params) as Array<{ id: string; from_agent: unknown; priority: unknown; created_at: string }>;
+  const nowMs = Date.now();
+  const messages = rows.map((r) => ({
+    id: r.id,
+    from: typeof r.from_agent === "string" && AGENT_NAME_PATTERN.test(r.from_agent) ? r.from_agent : null,
+    priority: typeof r.priority === "string" && PRIORITIES.has(r.priority) ? r.priority : null,
+    age_seconds: Math.max(0, Math.floor((nowMs - Date.parse(r.created_at)) / 1000) || 0),
+  }));
+  return {
+    registered: !!agentRow,
+    session_bound: !!currentSession,
+    count: messages.length,
+    top_priority: messages[0]?.priority ?? null,
+    messages,
+  };
+}
+
+/**
+ * What stops this DB from answering `relay pending`, or null. A file that is not a
+ * relay DB, or one too old for the pending predicate, must be refused by name,
+ * never read as "no mail".
+ */
+export function pendingSchemaGap(db: CompatDatabase): string | null {
+  const need: Array<[string, string[]]> = [
+    ["messages", ["id", "to_agent", "from_agent", "priority", "created_at", "read_by_session", "resolved_at"]],
+    ["agents", ["name", "session_id", "session_started_at"]],
+  ];
+  for (const [table, cols] of need) {
+    const have = new Set(
+      (db.prepare("SELECT name FROM pragma_table_info(?)").all(table) as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (have.size === 0) return `has no ${table} table (not a relay DB, or a different store)`;
+    const missing = cols.filter((c) => !have.has(c));
+    if (missing.length) return `${table} lacks ${missing.join(", ")} (schema too old for the pending predicate)`;
+  }
+  return null;
+}
+
+/** Handle-taking twin of getAgentSessionStart, for the read-only CLI. */
+export function agentSessionStartOn(db: CompatDatabase, agentName: string): string | null {
+  const row = db.prepare("SELECT session_started_at FROM agents WHERE name = ?").get(agentName) as
+    | { session_started_at: string | null }
+    | undefined;
+  return row?.session_started_at ?? null;
+}
+
 export function getMessages(
   agentName: string,
   status: string,
@@ -5791,7 +5883,7 @@ export function getMessages(
   const agentRow = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(agentName) as { session_id: string | null } | undefined;
   const currentSession = agentRow?.session_id ?? null;
 
-  const priorityOrder = `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
+  const priorityOrder = DRAIN_PRIORITY_ORDER_SQL + " LIMIT ?";
   // v2.7.0 external-review-flagged P1 fix — `since` filter MUST run in SQL BEFORE
   // the mark-as-read mutation below, otherwise messages older than the bound get
   // marked read silently and never resurface to this session.

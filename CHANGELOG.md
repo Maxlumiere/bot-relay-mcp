@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added — `relay pending AGENT`: what is pending, as metadata only, from one read-only surface
+
+The hooks each carried a hand-copied copy of the pending predicate, and the only other way to ask was a `get_messages` peek, which stamps the observation cursor (`seq`) although a count observes no message. `relay pending` is the one read surface for "does this agent have mail?".
+
+- **Exactly the drain's set.** The answer is built from the same `buildMessageWhere("pending", …)` the drain uses, with the session resolved the same way and the window defaulting to `get_messages`' own default (`24h`, now one exported constant). Nothing restates the predicate. Tests pin the ids, **in order**, against `get_messages(pending, peek)` for: undelivered mail, mail read by this session, mail re-pended from a prior session, resolved mail, aged mail inside and outside the window, `--since all`, a NULL session and a re-registered session.
+- **Read-only by construction.** The DB is opened `readonly`, so even an accidental write fails at the driver. A run changes no `seq`, read-mark, `inbox_events` or `last_drain_at`. A control run proves the same check does see a `get_messages` peek's stamp. DB-direct: works with the daemon down.
+- **Metadata only:** count, top priority, and per message the id, sender, priority and age. **Never the content.** A sender that fails the agent-name pattern is reported as `null`, never echoed.
+- **Silence is never success.** Exit 0 with `count: 0` is a verified empty. If there's no DB, the file isn't a relay DB, it's corrupt, or the agent isn't registered in it (the wrong instance's DB), the command exits 1 with `PENDING_FAILED` on stderr and **nothing on stdout**. The unresolved name `default` is refused (exit 2).
+- `since` resolution moved to `src/since.ts`, shared by the message tools and this command, so the two windows cannot drift.
+
 ### Added — a window now RECORDS which identity it holds, and says so (`relay bind` + `relay fleet`, ADR-0036 S1)
 
 A terminal could become agent X without anything observable happening: no record of which window held which name, on which conversation, and no way to ask. When that binding went stale the only symptom was mail that never arrived. S1 **records and lists**; it changes no auth and performs **no** automatic rebind (that is S3-lite).
