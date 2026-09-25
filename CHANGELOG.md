@@ -6,15 +6,17 @@
 
 The PostToolUse hook's fallback flips a message's legacy `status` column to `read` on every run, with no drain and no resolve. Every "is mail waiting" count that read `status = 'pending'` therefore dropped that mail, and the board reported the agent as quiet while the mail waited: a false quiet.
 
-All of them now use the canonical predicate, the same one the drain uses:
-- the dashboard snapshot's `pending_count`, which drives the inbox badge and sort; it now equals `unread_count`;
+Each of them now counts, per agent, what **that agent's** drain would return: the drain's own predicate, keyed on the agent's current session:
+- the dashboard snapshot's `pending_count`, which drives the inbox badge and sort, and its `unread_count` (now equal);
 - the dashboard's `pending` agent state;
-- `relay://current-state`;
-- `relay://inbox/<agent>` (Tether's inbox subscription), which uses the recipient's own session so the wake signal matches what `get_messages` returns.
+- `relay://current-state`, both per agent and in its total;
+- `relay://inbox/<agent>` (Tether's inbox subscription), so the wake signal matches what `get_messages` returns.
+
+The session matters. The "never drained by any session" form reads 0 after an agent re-registers, even though the drain returns mail the previous session read but nobody resolved. That is the same false quiet by another route. `unread_count` used that form, so it moved too.
 
 The field names are unchanged. The wake-coverage detector and the pending-on-a-human lane were checked and already used the canonical predicate. No other decision in `src/` reads `status`.
 
-Test: `tests/f3-board-signals-canonical.test.ts`. It applies exactly the hook's `status` flip and nothing else, then checks every surface. 4 were red on the old code and turn red again with the fix reverted. The innocent twins confirm that a real drain and a resolve still clear every count.
+Test: `tests/f3-board-signals-canonical.test.ts`. It applies exactly the hook's `status` flip and nothing else, then checks every surface. 4 were red on the old code and turn red again with the fix reverted. A second fixture re-registers the agent after a drain, and a third clears the session. On those, every surface must equal what the drain returns: 4 were red on the any-session form, and each surface, reverted alone, turns red again. The innocent twins confirm that a real drain by the current session and a resolve still clear every count.
 
 ### Fixed — a closing window could end the session of a different, live window with the same agent name (ADR-0042 R1)
 

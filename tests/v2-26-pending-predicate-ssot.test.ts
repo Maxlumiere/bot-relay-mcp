@@ -35,8 +35,10 @@
  *   - hooks/stop-check.sh (#124 Stop-hook) — its PRIMARY pending query now uses
  *     the per-session predicate; only the bare-status LEGACY fallback (for
  *     pre-v2.0/v2.12 DBs with no read_by_session/resolved_at column) keeps `status`.
- *   - getInboxSummary.unread_count — now `read_by_session IS NULL AND resolved_at
- *     IS NULL` (pendingGlobalClause), not `seq IS NULL`.
+ *   - getInboxSummary.unread_count — not `seq IS NULL`. Since F3 round 2 it is the
+ *     per-agent PENDING_FOR_AGENT_ROW_SQL (pendingForSessionClause keyed on the
+ *     agent's own session), not the any-session pendingGlobalClause, which a
+ *     re-registration zeroes (behaviour pinned in tests/f3-board-signals-canonical).
  * The tripwire at the end now asserts these are canonical — it would red if
  * either regressed to the old binary-status/seq predicate.
  *
@@ -241,9 +243,9 @@ describe("#53 pending predicate SSOT — every surface derives from one definiti
     expect(stop).toMatch(
       /read_by_session != COALESCE\(\(SELECT session_id FROM agents WHERE name = :name\), ''\)/,
     );
-    // getInboxSummary.unread_count now keys on read_by_session + resolved_at, not seq.
+    // getInboxSummary.unread_count keys on the per-agent SSOT predicate, not seq.
     const db = fs.readFileSync(path.join(PROJECT_ROOT, "src/db.ts"), "utf8");
-    expect(db).toMatch(/m\.read_by_session IS NULL AND m\.resolved_at IS NULL THEN 1 ELSE 0 END\), 0\) AS unread_count/);
+    expect(db).toMatch(/\$\{PENDING_FOR_AGENT_ROW_SQL\} THEN 1 ELSE 0 END\), 0\) AS unread_count/);
     expect(db).not.toMatch(/m\.seq IS NULL\s+THEN 1 ELSE 0 END\), 0\) AS unread_count/);
   });
 });

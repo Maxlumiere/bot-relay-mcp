@@ -138,3 +138,64 @@ describe("F3 — innocent twins: a real model drain, and a resolve, DO take the 
     expect(currentState()).toBe(0);
   });
 });
+
+/**
+ * Round-2 audit — the per-agent surfaces must count what THIS agent's drain would
+ * return: pendingForSessionClause keyed on that agent's own agents.session_id. The
+ * "never drained by ANY session" form reads 0 after a re-registration (drained by
+ * session S1, the agent now on S2), while the drain re-pends the mail: a false
+ * quiet in exactly the case F3 exists to fix.
+ */
+describe("F3 round 2 — after a re-registration, every per-agent surface counts what the drain returns", () => {
+  function reRegistered(): string {
+    const id = seed();
+    db.getMessages("f3-rec", "pending", 20); // drained by the first session
+    const before = db.getDb().prepare("SELECT session_id FROM agents WHERE name = 'f3-rec'").get() as { session_id: string };
+    db.getDb().prepare("UPDATE agents SET session_id = ? WHERE name = 'f3-rec'").run("second-session-after-reregister");
+    const m = db.getDb().prepare("SELECT read_by_session, resolved_at FROM messages WHERE id = ?").get(id) as Record<string, unknown>;
+    expect(m, "precondition: drained by the FIRST session, unresolved").toEqual({ read_by_session: before.session_id, resolved_at: null });
+    return id;
+  }
+  /** What the drain would return right now (peek: no mark). */
+  const drainWould = () => db.getMessages("f3-rec", "pending", 100, true).length;
+
+  it("PRECONDITION: the drain re-pends it to the new session", () => {
+    reRegistered();
+    expect(drainWould()).toBe(1);
+  });
+  it("getInboxSummary() pending_count and unread_count", () => {
+    reRegistered();
+    expect(inboxSummary().pending_count).toBe(drainWould());
+    expect(inboxSummary().unread_count).toBe(drainWould());
+  });
+  it("getDashboardAgentSnapshots() pendingCount", () => {
+    reRegistered();
+    expect(dashPending()).toBe(1);
+  });
+  it("relay://current-state per-agent pending_count", () => {
+    reRegistered();
+    expect(currentState()).toBe(drainWould());
+  });
+  it("relay://inbox/<agent> (already per-session; pinned)", () => {
+    reRegistered();
+    expect(inboxResource()).toBe(drainWould());
+  });
+  it("INNOCENT TWIN: drained by the CURRENT session → 0 on every surface", () => {
+    reRegistered();
+    db.getMessages("f3-rec", "pending", 20);
+    expect(drainWould()).toBe(0);
+    expect(inboxSummary().pending_count).toBe(0);
+    expect(inboxSummary().unread_count).toBe(0);
+    expect(dashPending()).toBe(0);
+    expect(currentState()).toBe(0);
+    expect(inboxResource()).toBe(0);
+  });
+  it("a NULL session: every unresolved message counts, matching the drain", () => {
+    seed();
+    db.getMessages("f3-rec", "pending", 20);
+    db.getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = 'f3-rec'").run();
+    expect(inboxSummary().pending_count).toBe(drainWould());
+    expect(currentState()).toBe(drainWould());
+    expect(dashPending()).toBe(drainWould());
+  });
+});

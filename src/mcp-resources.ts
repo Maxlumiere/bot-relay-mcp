@@ -25,7 +25,7 @@
  *   Subscribable; emits notifications/resources/updated on every
  *   inbox write (send_message / broadcast / get_messages drain).
  */
-import { getDb, getAgents, pendingForSessionClause, pendingGlobalClause } from "./db.js";
+import { getDb, getAgents, pendingForSessionClause, PENDING_FOR_AGENT_ROW_SQL } from "./db.js";
 import { decryptContent } from "./encryption.js";
 import { truncatedPreview } from "./preview.js";
 import { agentNameFromInboxUri, inboxUriFor } from "./mcp-subscriptions.js";
@@ -242,11 +242,16 @@ function buildCurrentState(): {
 } {
   const db = getDb();
   const agents = getAgents();
-  // F3: canonical session-agnostic predicate, not the legacy status column.
-  const pg = pendingGlobalClause();
+  // F3: each recipient's own drain set (keyed on ITS agents.session_id), not the
+  // legacy status column and not the any-session form, which a re-registration
+  // zeroes. LEFT JOIN keeps mail to a name with no agents row in the total; with
+  // no row there is no session, so, as in getMessages, every unresolved message counts.
   const pending = db
-    .prepare(`SELECT to_agent, COUNT(*) AS c FROM messages WHERE ${pg.sql} GROUP BY to_agent`)
-    .all(...pg.params) as { to_agent: string; c: number }[];
+    .prepare(
+      `SELECT m.to_agent AS to_agent, COUNT(*) AS c FROM messages m LEFT JOIN agents a ON a.name = m.to_agent ` +
+        `WHERE ${PENDING_FOR_AGENT_ROW_SQL} GROUP BY m.to_agent`,
+    )
+    .all() as { to_agent: string; c: number }[];
   const pendingByAgent = new Map(pending.map((r) => [r.to_agent, r.c]));
   const activeTasks = (db
     .prepare("SELECT COUNT(*) AS c FROM tasks WHERE status IN ('queued','accepted','in_progress')")

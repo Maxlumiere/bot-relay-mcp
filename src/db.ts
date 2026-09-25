@@ -4734,12 +4734,10 @@ export function getDashboardAgentSnapshots(
          a.last_alive,
          (SELECT COUNT(*) FROM messages m
            WHERE m.to_agent = a.name
-             -- F3: the canonical session-agnostic predicate (pendingGlobalClause:
-             -- never drained by any session AND unresolved), NOT the legacy
-             -- status column, which the stale PostToolUse hook flips with no
-             -- drain. See getInboxSummary.
-             AND m.read_by_session IS NULL
-             AND m.resolved_at IS NULL
+             -- F3: THIS agent's drain set (PENDING_FOR_AGENT_ROW_SQL, keyed on
+             -- a.session_id), NOT the legacy status column, which the stale
+             -- PostToolUse hook flips with no drain. See getInboxSummary.
+             AND ${PENDING_FOR_AGENT_ROW_SQL}
              AND m.created_at < ?) AS pending_count_old
        FROM agents a`,
     )
@@ -5174,14 +5172,16 @@ export function buildAgentTopology(): {
  * agents[] without a second round-trip per row.
  *
  * Semantics:
- *   - pending_count — F3 (relay review, 24 Sep): now the SAME canonical predicate
- *     as unread_count. It used to count `status = 'pending'`, a legacy column
- *     the stale PostToolUse hook flipped to 'read' on every run with no drain, so
- *     the board showed an agent as quiet while its mail still waited (a false
- *     quiet). The field is kept, under the same name, for existing readers.
- *   - unread_count  — the CANONICAL session-agnostic unread (#56):
- *     read_by_session IS NULL AND resolved_at IS NULL (= pendingGlobalClause,
- *     "not read by any session and not resolved"). Was `seq IS NULL` (mirroring
+ *   - pending_count — F3 (relay review, 24 Sep): what THIS agent's drain would
+ *     return (PENDING_FOR_AGENT_ROW_SQL = pendingForSessionClause keyed on the
+ *     agent's own agents.session_id). It used to count `status = 'pending'`, a
+ *     legacy column the stale PostToolUse hook flipped to 'read' on every run with
+ *     no drain, so the board showed an agent as quiet while its mail still waited
+ *     (a false quiet). The field is kept, under the same name, for existing readers.
+ *   - unread_count  — the same per-agent predicate as pending_count (F3 round 2).
+ *     It was the session-agnostic pendingGlobalClause ("not read by any session
+ *     and not resolved"), which reads 0 after a re-registration while the drain
+ *     re-pends the mail. Before that it was `seq IS NULL` (mirroring
  *     peek's v2.3 signal), but seq is stamped by ANY observation — including a
  *     NON-consuming browse (get_messages peek=true / status='all') that never
  *     drains — so the seq count silently DISAGREED with the drain and the other
@@ -5205,13 +5205,12 @@ export function getInboxSummary(): Array<{
       // would inflate unread_count by 1 per mail-less agent.
       `SELECT a.name AS agent_name,
               -- F3: canonical, NOT the legacy status column (see the doc comment).
-              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.read_by_session IS NULL AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS pending_count,
-              -- #56: canonical session-agnostic unread = pendingGlobalClause
-              -- (read_by_session IS NULL AND resolved_at IS NULL), not seq IS NULL.
-              -- seq is stamped by any observation (incl. a non-consuming browse),
-              -- so it silently disagreed with the other SSOT surfaces; read_by_session
-              -- moves with the drain, so this and pending_count above agree by construction.
-              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.read_by_session IS NULL AND m.resolved_at IS NULL THEN 1 ELSE 0 END), 0) AS unread_count,
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND ${PENDING_FOR_AGENT_ROW_SQL} THEN 1 ELSE 0 END), 0) AS pending_count,
+              -- #56 + F3 round 2: per agent, what that agent's drain would return
+              -- (not seq IS NULL, which any observation stamps; not the
+              -- any-session form, which a re-registration zeroes). Same
+              -- predicate as pending_count, so the two agree by construction.
+              COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND ${PENDING_FOR_AGENT_ROW_SQL} THEN 1 ELSE 0 END), 0) AS unread_count,
               MAX(m.created_at) AS last_message_at
          FROM agents a
          LEFT JOIN messages m ON m.to_agent = a.name
@@ -5612,10 +5611,27 @@ export const NEVER_DRAINED_SQL = "read_by_session IS NULL";
  *  some-other-session)", matching get_messages' historical `?? ""` behaviour. */
 export function pendingForSessionClause(session: string): { sql: string; params: string[] } {
   return {
-    sql: `${PENDING_NOT_RESOLVED_SQL} AND (${NEVER_DRAINED_SQL} OR read_by_session != ?)`,
+    sql: pendingForSessionSql("?"),
     params: [session],
   };
 }
+
+/** The ONE per-session pending shape; the session is a bound `?` or a correlated column. */
+function pendingForSessionSql(sessionOperand: string): string {
+  return `${PENDING_NOT_RESOLVED_SQL} AND (${NEVER_DRAINED_SQL} OR read_by_session != ${sessionOperand})`;
+}
+
+/**
+ * pendingForSessionClause in CORRELATED form, for one query over MANY agents: each
+ * message is judged against ITS recipient's own current session, read from the
+ * agents row aliased `a` (a NULL session reads as "", exactly as getMessages
+ * passes it). Every per-agent count (the board summary, the dashboard snapshot,
+ * relay://current-state) uses this, so each counts what that agent's drain would
+ * return. The session-agnostic pendingGlobalClause ("never drained by ANY
+ * session") is NOT a per-agent count: after a re-registration it reads 0 while the
+ * drain re-pends the mail (round-2 audit, F3).
+ */
+export const PENDING_FOR_AGENT_ROW_SQL = pendingForSessionSql("COALESCE(a.session_id, '')");
 
 /** Canonical session-agnostic backlog predicate (SSOT): unresolved AND not read
  *  by ANY session. Used where there is no single caller session (health_check). */
