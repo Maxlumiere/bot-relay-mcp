@@ -234,12 +234,55 @@ describe("ADR-0043 — agent_bindings.edge_id is the LOCAL edge, stamped only fr
 });
 
 describe("ADR-0043 — every key on agent_bindings starts with edge_id", () => {
-  it("every index on agent_bindings (unique included) leads with edge_id", async () => {
-    const idx = await raw((db) =>
-      db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'agent_bindings' AND sql IS NOT NULL").all() as Array<{ name: string; sql: string }>,
+  // EVERY index, including the implicit ones SQLite makes for a PRIMARY KEY or
+  // UNIQUE constraint (sqlite_autoindex_*, whose sqlite_master.sql is NULL). A
+  // filter on `sql IS NOT NULL` hid exactly the binding_id primary key.
+  const allIndexes = () =>
+    raw((db) =>
+      (db.prepare("SELECT name, origin FROM pragma_index_list('agent_bindings')").all() as Array<{ name: string; origin: string }>).map(
+        (i) => ({
+          ...i,
+          columns: (db.prepare("SELECT name FROM pragma_index_info(?) ORDER BY seqno").all(i.name) as Array<{ name: string }>).map((c) => c.name),
+        }),
+      ),
     );
+
+  it("every index on agent_bindings, implicit and autoindex included, leads with edge_id", async () => {
+    const idx = await allIndexes();
     expect(idx.length, "precondition: the table has indexes").toBeGreaterThan(0);
-    for (const i of idx) expect(i.sql, i.name).toMatch(/ON agent_bindings\s*\(\s*edge_id\b/i);
+    expect(idx.some((i) => i.origin === "pk"), "precondition: the primary key's own index is in the list").toBe(true);
+    for (const i of idx) expect(i.columns[0], `${i.name} (${i.origin}) columns ${i.columns.join(",")}`).toBe("edge_id");
+  });
+
+  it("the PRIMARY KEY is (edge_id, binding_id)", async () => {
+    const pk = await raw((db) =>
+      (db.prepare("SELECT name FROM pragma_table_info('agent_bindings') WHERE pk > 0 ORDER BY pk").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    expect(pk).toEqual(["edge_id", "binding_id"]);
+  });
+
+  it("HARM (hub shape): the SAME binding_id on two edges does not collide, and a local end/refresh never touches the foreign row", async () => {
+    const local = (await edgeRow())!.edge_id;
+    await raw(async (db) => {
+      await bindRow(db, anchor(4005), "shared-id", "caaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+      const mine = db.prepare("SELECT binding_id FROM agent_bindings WHERE edge_id = ?").get(local) as { binding_id: string };
+      db.exec("DROP TRIGGER IF EXISTS agent_bindings_local_edge_insert");
+      db.prepare(
+        "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, conversation_id, host_id, window_pid, " +
+          "window_pid_start, bound_via, bound_at, edge_id) VALUES (?, 1, 'shared-id', 'cf', 'h-1', 4005, ?, 'launch-intent', 't', ?)",
+      ).run(mine.binding_id, "Mon Sep 15 10:00:00 2026", FOREIGN);
+      const { endAgentBinding } = await import("../src/db.js");
+      expect(endAgentBinding(db as never, anchor(4005), "logout")).toBe(true);
+      // Same conversation again → the refresh path's UPDATE ... WHERE binding_id.
+      await bindRow(db, anchor(4005), "shared-id", "caaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    });
+    const foreign = await raw((db) =>
+      db.prepare("SELECT end_reason, last_verified_at FROM agent_bindings WHERE edge_id = ?").get(FOREIGN) as {
+        end_reason: string | null;
+        last_verified_at: string | null;
+      },
+    );
+    expect(foreign, "the foreign row with the same binding_id is untouched").toEqual({ end_reason: null, last_verified_at: null });
   });
 
   it("two bindings with the SAME name and the SAME anchor on DIFFERENT edges do not collide (the hub-mode shape)", async () => {
@@ -289,8 +332,39 @@ describe("ADR-0043 — a pre-F7 v25 database is brought forward in v25 (no v26 b
     expect(r.edge_id).toBe(local);
     const v = await raw((db) => (db.prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number }).version);
     expect(v, "no v26 bump").toBe(25);
-    const idx = await raw((db) => db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'agent_bindings' AND sql IS NOT NULL").all() as Array<{ sql: string }>);
-    for (const i of idx) expect(i.sql).toMatch(/\(\s*edge_id\b/i);
+    const idx = await raw((db) =>
+      (db.prepare("SELECT name FROM pragma_index_list('agent_bindings')").all() as Array<{ name: string }>).map(
+        (i) => (db.prepare("SELECT name FROM pragma_index_info(?) ORDER BY seqno").get(i.name) as { name: string }).name,
+      ),
+    );
+    expect(idx.length).toBeGreaterThan(0);
+    for (const first of idx) expect(first).toBe("edge_id");
+    const pk = await raw((db) =>
+      (db.prepare("SELECT name FROM pragma_table_info('agent_bindings') WHERE pk > 0 ORDER BY pk").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    expect(pk).toEqual(["edge_id", "binding_id"]);
+  });
+
+  it("a v25 table WITH edge_id but a binding_id-only primary key is rebuilt to (edge_id, binding_id), rows kept", async () => {
+    const local = (await edgeRow())!.edge_id;
+    await raw((db) => {
+      db.exec("DROP TABLE agent_bindings");
+      db.exec(`CREATE TABLE agent_bindings (binding_id TEXT PRIMARY KEY, edge_id TEXT NOT NULL, binding_version INTEGER NOT NULL DEFAULT 1,
+        agent_name TEXT, agent_class TEXT, conversation_id TEXT NOT NULL, conversation_title TEXT, cwd TEXT,
+        host_id TEXT NOT NULL, window_pid INTEGER NOT NULL, window_pid_start TEXT NOT NULL, bound_via TEXT NOT NULL,
+        bound_at TEXT NOT NULL, last_verified_at TEXT, superseded_at TEXT, superseded_by TEXT, end_reason TEXT, supersede_reason TEXT)`);
+      db.prepare(
+        "INSERT INTO agent_bindings (binding_id, edge_id, conversation_id, host_id, window_pid, window_pid_start, bound_via, bound_at) " +
+          "VALUES ('mid', ?, 'c', 'h', 1, 's', 'v', 't')",
+      ).run(local);
+    });
+    await freshSchema();
+    const pk = await raw((db) =>
+      (db.prepare("SELECT name FROM pragma_table_info('agent_bindings') WHERE pk > 0 ORDER BY pk").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    expect(pk).toEqual(["edge_id", "binding_id"]);
+    const row = await raw((db) => db.prepare("SELECT edge_id FROM agent_bindings WHERE binding_id = 'mid'").get() as { edge_id: string } | undefined);
+    expect(row?.edge_id).toBe(local);
   });
 });
 

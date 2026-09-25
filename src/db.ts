@@ -1879,12 +1879,15 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
     .get();
   if (!hasTable) {
     db.exec("CREATE TABLE IF NOT EXISTS agent_bindings " + AGENT_BINDINGS_COLUMNS);
-  } else if (!tableHasColumn(db, "agent_bindings", "edge_id")) {
-    // A PRE-EDGE v25 table (#276 as merged). v25 never shipped, so only a dev or
-    // test database can hold this shape. REBUILT rather than ALTERed so a migrated
-    // table is byte-for-byte the fresh shape: ADD COLUMN ... NOT NULL needs a
-    // DEFAULT, and a default edge is exactly the value that must never exist.
-    // Every existing row belongs to THIS database, so it takes the local edge.
+  } else if (!agentBindingsKeyIsEdgeScoped(db)) {
+    // A NON-CANONICAL v25 table: no edge_id at all (#276 as merged), or edge_id
+    // with a binding_id-only primary key (this PR's first round). v25 never
+    // shipped, so only a dev or test database can hold either shape. REBUILT
+    // rather than ALTERed, because SQLite cannot change a primary key in place and
+    // ADD COLUMN ... NOT NULL needs a DEFAULT, and a default edge is exactly the
+    // value that must never exist; the rebuilt table is the fresh shape. Every
+    // existing row belongs to THIS database (the foreign-edge trigger refused any
+    // other), so it takes the local edge.
     const edge = getLocalEdgeId(db);
     db.transaction(() => {
       db.exec("DROP TABLE IF EXISTS agent_bindings_edge_rebuild");
@@ -1964,17 +1967,30 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
  * resolve statically (the ADR-0003 auth-gen guard).
  */
 const AGENT_BINDINGS_COLUMNS =
-  "(binding_id TEXT PRIMARY KEY, edge_id TEXT NOT NULL, binding_version INTEGER NOT NULL DEFAULT 1, " +
+  "(binding_id TEXT NOT NULL, edge_id TEXT NOT NULL, binding_version INTEGER NOT NULL DEFAULT 1, " +
   "agent_name TEXT, agent_class TEXT, conversation_id TEXT NOT NULL, conversation_title TEXT, cwd TEXT, " +
   "host_id TEXT NOT NULL, window_pid INTEGER NOT NULL, window_pid_start TEXT NOT NULL, bound_via TEXT NOT NULL, " +
   "bound_at TEXT NOT NULL, last_verified_at TEXT, superseded_at TEXT, superseded_by TEXT, end_reason TEXT, " +
-  "supersede_reason TEXT)";
+  "supersede_reason TEXT, PRIMARY KEY (edge_id, binding_id))";
 
 /** The pre-edge v25 columns, copied verbatim by the rebuild. */
 const AGENT_BINDINGS_PRE_EDGE_COLUMNS =
   "binding_id, binding_version, agent_name, agent_class, conversation_id, conversation_title, cwd, host_id, " +
   "window_pid, window_pid_start, bound_via, bound_at, last_verified_at, superseded_at, superseded_by, " +
   "end_reason, supersede_reason";
+
+/**
+ * Is agent_bindings in the canonical ADR-0043 shape: an edge_id column AND a
+ * primary key of exactly (edge_id, binding_id)? The primary key is a key like any
+ * other (rule 3): a binding_id-only key would make the same binding_id on two
+ * edges collide in hub mode.
+ */
+function agentBindingsKeyIsEdgeScoped(db: CompatDatabase): boolean {
+  const pk = (
+    db.prepare("SELECT name FROM pragma_table_info('agent_bindings') WHERE pk > 0 ORDER BY pk").all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  return pk.length === 2 && pk[0] === "edge_id" && pk[1] === "binding_id";
+}
 
 function tableHasColumn(db: CompatDatabase, table: string, column: string): boolean {
   return !!db.prepare("SELECT 1 FROM pragma_table_info(?) WHERE name = ?").get(table, column);
@@ -3180,6 +3196,7 @@ export function hasAgentBindingsTable(db: CompatDatabase): boolean {
 export function bindingSchemaGap(db: CompatDatabase): string | null {
   if (!hasAgentBindingsTable(db)) return "has no agent_bindings table (schema v25)";
   if (!tableHasColumn(db, "agent_bindings", "edge_id")) return "has a pre-edge agent_bindings table (no edge_id, ADR-0043)";
+  if (!agentBindingsKeyIsEdgeScoped(db)) return "has an agent_bindings key not scoped by edge_id (ADR-0043)";
   const edge = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'relay_edge'").get();
   if (!edge) return "has no relay_edge table (ADR-0043 edge identity)";
   return null;
@@ -3459,7 +3476,11 @@ function upsertAgentBindingOnce(
   }
 
   if (current.conversation_id === w.conversationId) {
-    db.prepare("UPDATE agent_bindings SET last_verified_at = ? WHERE binding_id = ?").run(ts, current.binding_id);
+    db.prepare("UPDATE agent_bindings SET last_verified_at = ? WHERE edge_id = ? AND binding_id = ?").run(
+      ts,
+      edgeId,
+      current.binding_id,
+    );
     return {
       action: "refreshed",
       bindingId: current.binding_id,
@@ -3476,8 +3497,9 @@ function upsertAgentBindingOnce(
   const supersedeReason = opts.supersedeReason ?? "resume-switch";
   const tx = db.transaction(() => {
     db.prepare(
-      "UPDATE agent_bindings SET superseded_at = ?, superseded_by = ?, supersede_reason = ? WHERE binding_id = ?",
-    ).run(ts, bindingId, supersedeReason, current.binding_id);
+      "UPDATE agent_bindings SET superseded_at = ?, superseded_by = ?, supersede_reason = ? " +
+        "WHERE edge_id = ? AND binding_id = ?",
+    ).run(ts, bindingId, supersedeReason, edgeId, current.binding_id);
     db.prepare(
       "INSERT INTO agent_bindings (binding_id, edge_id, binding_version, agent_name, agent_class, conversation_id, " +
         "conversation_title, cwd, host_id, window_pid, window_pid_start, bound_via, bound_at, last_verified_at) " +
@@ -3519,8 +3541,8 @@ export function endAgentBinding(db: CompatDatabase, anchor: BindingAnchor, endRe
   const current = getCurrentBinding(db, anchor);
   if (!current) return false;
   const r = db
-    .prepare("UPDATE agent_bindings SET end_reason = ?, last_verified_at = ? WHERE binding_id = ?")
-    .run(endReason, now(), current.binding_id);
+    .prepare("UPDATE agent_bindings SET end_reason = ?, last_verified_at = ? WHERE edge_id = ? AND binding_id = ?")
+    .run(endReason, now(), getLocalEdgeId(db), current.binding_id);
   return r.changes > 0;
 }
 
