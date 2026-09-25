@@ -495,6 +495,30 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
     // (else: clean degrade — same caveat as P3)
   });
 
+  it("(S2b) Codex round 2 on #280: a MULTI-LINE agent name is rejected whole; no injected SQL reaches the DB", () => {
+    // The old `echo "$AGENT_NAME" | grep -Eq '^…$'` passed a multi-line value if ANY
+    // line matched, and the name was interpolated into a sqlite heredoc, so lines
+    // 2+ ran as SQL. MEASURED red on the old stop-check.sh.
+    const { root, dbPath } = freshTestRoot();
+    initMinimalDb(dbPath);
+    insertAgent(dbPath, "stop-inj-agent");
+    insertMessage(dbPath, "orchestrator", "stop-inj-agent", "must stay pending");
+    const r = runHook({
+      hook: HOOK_STOP,
+      agentName: "stop-inj-agent\nUPDATE messages SET status = 'read';\nSELECT 'x",
+      home: root,
+      dbPath,
+      httpPort: 1,
+    });
+    expect(r.status).toBe(0);
+    const db = new Database(dbPath, { readonly: true });
+    const row = db
+      .prepare("SELECT COUNT(*) AS n FROM messages WHERE to_agent = 'stop-inj-agent' AND status = 'pending'")
+      .get() as { n: number };
+    db.close();
+    expect(row.n, "the injected UPDATE must never run").toBe(1);
+  });
+
   it("(S3) daemon-down → exit 0, empty stdout, no JSON-RPC garbage", () => {
     const { root } = freshTestRoot();
     const r = runHook({
