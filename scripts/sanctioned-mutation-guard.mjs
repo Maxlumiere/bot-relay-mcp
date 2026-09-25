@@ -224,7 +224,9 @@ import path from "path";
 
 // The tables whose mutation IS an agent-identity change. agent_bindings (ADR-0036
 // S1) records which window holds which name; a raw write could forge or erase it.
-const GUARDED_TABLES = new Set(["agents", "agent_capabilities", "agent_bindings"]);
+// relay_edge (ADR-0043) is this relay's identity to the federation; it is created
+// once in db.ts and is immutable.
+const GUARDED_TABLES = new Set(["agents", "agent_capabilities", "agent_bindings", "relay_edge"]);
 
 // GUARD ON THE GUARD — the quoted-identifier equivalence proof in this header
 // rests on a PREMISE: every guarded name is a bare identifier that needs NO
@@ -649,7 +651,7 @@ function main() {
   }
   if (all.length > 0) {
     process.stderr.write(
-      "Raw agents / agent_capabilities / agent_bindings mutations found OUTSIDE src/db.ts (agent identity created/replaced/deleted off the sanctioned path):\n",
+      "Raw agents / agent_capabilities / agent_bindings / relay_edge mutations found OUTSIDE src/db.ts (agent identity created/replaced/deleted off the sanctioned path):\n",
     );
     for (const v of all) process.stderr.write(`  ${v.file}:${v.line}  ${v.sql}\n`);
     process.stderr.write(
@@ -659,7 +661,7 @@ function main() {
     );
     process.exit(1);
   }
-  process.stdout.write("No raw agents/agent_capabilities/agent_bindings mutations outside src/db.ts — invariant surface consolidated\n");
+  process.stdout.write("No raw agents/agent_capabilities/agent_bindings/relay_edge mutations outside src/db.ts — invariant surface consolidated\n");
   process.exit(0);
 }
 
