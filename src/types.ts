@@ -278,22 +278,29 @@ export type GetOutstandingInput = z.infer<typeof GetOutstandingSchema>;
  * v2.1.6: optional `since` filter. Same grammar as `/standup`'s since arg —
  * duration shorthand ("15m" | "1h" | "24h" | "3d"), an ISO8601 timestamp, the
  * literal "session_start" sentinel (messages since the agent's current
- * session registered), OR "all" / null to preserve pre-v2.1.6 unlimited
- * behavior. Default is "24h" — keeps reused agent names from inheriting the
- * full inbox backlog while leaving an escape hatch for cross-session handoff.
+ * session registered), OR "all" / null for no bound.
+ *
+ * ADR-0045 R2: NO schema default. The default depends on `status` and is applied
+ * by the handler (defaultSinceFor): the pending ACTION QUEUE is never windowed by
+ * default ('all'), because a window there silently dropped unfinished work;
+ * history reads keep '24h', which trims a reused name's old backlog.
  */
 const GetMessagesSinceField = z
   .union([z.string().min(1), z.null()])
   .optional()
-  .default("24h")
   .describe(
-    "v2.1.6: time-window filter over ALREADY-OBSERVED history. Accepts duration " +
-      "('15m'|'1h'|'24h'|'3d'), ISO8601 timestamp, 'session_start' sentinel, or " +
-      "'all'/null to disable. Default '24h' trims stale backlog when an agent name " +
-      "is reused. #198: this bound applies ONLY to mail this recipient has already " +
-      "seen — a PENDING drain ALWAYS returns never-observed (undelivered) mail " +
-      "regardless of `since`, so undelivered mail can never age out of reach."
+    "Time-window filter. Accepts duration ('15m'|'1h'|'24h'|'3d'), ISO8601 timestamp, " +
+      "'session_start' sentinel, or 'all'/null for no bound. DEFAULT DEPENDS ON STATUS: " +
+      "status='pending' defaults to 'all' (the action queue is never windowed unless you ask); " +
+      "history reads (all/history/read/resolved) default to '24h'. On a pending read the bound " +
+      "applies only to mail this recipient has already seen: never-drained mail is always returned. " +
+      "When a window hides pending mail, the response says so in `hidden_by_since`."
   );
+
+/** ADR-0045 R2 — the `since` a read gets when the caller gives none. */
+export function defaultSinceFor(status: string): string {
+  return status === "pending" ? "all" : "24h";
+}
 
 /**
  * v2.3.0 Part C.3 — peek_inbox_version. Cheap non-mutating observation
