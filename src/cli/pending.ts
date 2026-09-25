@@ -10,9 +10,10 @@
  * drain.
  *
  * SSOT: the answer comes from db.pendingMetadata, which builds its WHERE with the
- * drain's own buildMessageWhere("pending", ...), resolves the session the way
- * getMessages does, and defaults the window to get_messages' own default. Its ids
- * equal get_messages(pending, peek) ids, pinned by tests/f1-relay-pending.test.ts.
+ * drain's own buildMessageWhere("pending", ...) and resolves the session the way
+ * getMessages does. It takes NO window (ADR-0045 R1/R4): it IS the canonical
+ * pending set, so there is no `--since` to pass. Its ids equal
+ * get_messages(pending, peek, since='all') ids, pinned by tests/f1-relay-pending.test.ts.
  *
  * READ-ONLY BY CONSTRUCTION: the handle is opened `readonly: true`, so even an
  * accidental write fails at the driver. Unlike a get_messages peek it stamps no
@@ -29,22 +30,23 @@ import fs from "fs";
 interface Args {
   name: string | null;
   json: boolean;
-  since: string | null;
   dbPath: string | null;
   help: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { name: null, json: false, since: null, dbPath: null, help: false };
+  const args: Args = { name: null, json: false, dbPath: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") args.json = true;
     else if (a === "--help" || a === "-h") args.help = true;
-    else if (a === "--since" || a === "--db-path") {
+    else if (a === "--since") {
+      // Refused, not ignored: a caller passing a window expects one to apply.
+      throw new Error("--since is not accepted: this is the canonical pending set, which has no window (ADR-0045)");
+    } else if (a === "--db-path") {
       const v = argv[++i];
-      if (!v) throw new Error(`${a} requires a value`);
-      if (a === "--since") args.since = v;
-      else args.dbPath = v;
+      if (!v) throw new Error("--db-path requires a path");
+      args.dbPath = v;
     } else if (a.startsWith("-")) throw new Error(`unknown option: ${a}`);
     else if (args.name === null) args.name = a;
     else throw new Error(`unexpected argument: ${a}`);
@@ -54,13 +56,12 @@ function parseArgs(argv: string[]): Args {
 
 function usage(requested = false): void {
   const text =
-    "Usage: relay pending AGENT [--json] [--since S] [--db-path P]\n\n" +
-    "What is pending for AGENT, exactly as get_messages(status=pending) would return\n" +
-    "it, as METADATA ONLY: count, top priority, and per message the id, sender,\n" +
-    "priority and age. Never the content. Reads the DB read-only and marks nothing.\n\n" +
+    "Usage: relay pending AGENT [--json] [--db-path P]\n\n" +
+    "What is pending for AGENT: the canonical pending set, exactly what\n" +
+    "get_messages(status=pending, since='all') would return, as METADATA ONLY:\n" +
+    "count, top priority, and per message the id, sender, priority and age. Never\n" +
+    "the content. No time window. Reads the DB read-only and marks nothing.\n\n" +
     "  --json       Emit JSON.\n" +
-    "  --since S    The drain's window: a duration (24h), an ISO time, session_start\n" +
-    "               or all. Default: get_messages' own default (24h).\n" +
     "  --db-path P  Read the DB at P (default: $RELAY_DB_PATH or the active\n" +
     "               instance's DB).\n\n" +
     "Exit: 0 = answered (count 0 is a VERIFIED empty) · 1 = could not answer ·\n" +
@@ -89,7 +90,7 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   // --- the name: a RESOLVED identity, never `default` (ADR-0044 point 5) -------
-  const { AGENT_NAME_PATTERN, GET_MESSAGES_DEFAULT_SINCE } = await import("../types.js");
+  const { AGENT_NAME_PATTERN } = await import("../types.js");
   const name = args.name;
   if (!name) {
     process.stderr.write("relay pending: AGENT is required\n\n");
@@ -128,22 +129,11 @@ export async function run(argv: string[]): Promise<number> {
     db = new Better(dbPath, { readonly: true, fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
     db.pragma("busy_timeout = 1000");
 
-    const { pendingSchemaGap, pendingMetadata, agentSessionStartOn } = await import("../db.js");
+    const { pendingSchemaGap, pendingMetadata } = await import("../db.js");
     const gap = pendingSchemaGap(db);
     if (gap) return pendingFailed(`${dbPath} ${gap}`);
 
-    const { resolveSinceBoundWith } = await import("../since.js");
-    const since = args.since ?? GET_MESSAGES_DEFAULT_SINCE;
-    let sinceIso: string | null;
-    try {
-      const handle = db;
-      sinceIso = resolveSinceBoundWith(since, () => agentSessionStartOn(handle, name));
-    } catch (err) {
-      process.stderr.write(`relay pending: ${err instanceof Error ? err.message : String(err)}\n`);
-      return 2;
-    }
-
-    const meta = pendingMetadata(db, name, sinceIso);
+    const meta = pendingMetadata(db, name);
     if (!meta.registered) {
       return pendingFailed(
         `agent ${JSON.stringify(name)} is not registered in ${dbPath} — the wrong instance's DB, or an agent that ` +
@@ -157,8 +147,6 @@ export async function run(argv: string[]): Promise<number> {
           ok: true,
           agent: name,
           db_path: dbPath,
-          since,
-          since_bound: sinceIso,
           session_bound: meta.session_bound,
           count: meta.count,
           top_priority: meta.top_priority,

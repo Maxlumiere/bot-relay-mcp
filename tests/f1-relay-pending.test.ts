@@ -11,9 +11,10 @@
  *   1. READ-ONLY BY CONSTRUCTION: the handle is opened read-only, so a write is
  *      impossible, not merely avoided. No seq, no read-mark, no inbox_events, no
  *      last_drain_at. Works with the daemon down (DB-direct).
- *   2. The predicate is the TS source of truth, never retyped. SSOT: its ids equal
- *      get_messages(pending, peek) ids, in order, on the same fixtures, including
- *      a NULL session and a re-registered (reused-anchor) session.
+ *   2. The predicate is the TS source of truth, never retyped, with NO window
+ *      (ADR-0045 R1/R4: it IS the canonical pending set). SSOT: its ids equal
+ *      get_messages(pending, peek, since='all') ids, in order, on the same
+ *      fixtures, including a NULL session and a re-registered (reused-anchor) session.
  *   3. METADATA ONLY: count, top priority, and per message the id, a
  *      pattern-checked sender, the age and the priority. No content.
  *   4. SILENCE IS NEVER SUCCESS: `count: 0` with exit 0 means verified empty; any
@@ -57,14 +58,14 @@ function pending(args: string[], dbPath = DB): Run {
   });
   return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
-function cliIds(name: string, extra: string[] = []): string[] {
-  const r = pending([name, "--json", ...extra]);
+function cliIds(name: string): string[] {
+  const r = pending([name, "--json"]);
   expect(r.status, r.stderr).toBe(0);
   return JSON.parse(r.stdout).messages.map((m: { id: string }) => m.id);
 }
-/** get_messages(pending, peek) exactly as the dispatcher sees it: through its schema, defaults included. */
-function toolIds(name: string, since?: string): string[] {
-  const input = GetMessagesSchema.parse({ agent_name: name, status: "pending", peek: true, limit: 100, ...(since ? { since } : {}) });
+/** get_messages(pending, peek, since='all'), the canonical set, exactly as the dispatcher parses it. */
+function toolIds(name: string): string[] {
+  const input = GetMessagesSchema.parse({ agent_name: name, status: "pending", peek: true, limit: 100, since: "all" });
   const r = JSON.parse(handleGetMessages(input as never).content[0].text);
   return r.messages.map((m: { id: string }) => m.id);
 }
@@ -130,20 +131,23 @@ afterEach(() => {
 });
 
 describe("F1 — SSOT: `relay pending` ids equal get_messages(pending, peek) ids, in order", () => {
-  it("the reference fixture, with get_messages' own default window", () => {
+  it("the reference fixture: the canonical set, including mail a prior session read days ago", () => {
     const ids = seed();
     const cli = cliIds(R);
     expect(cli).toEqual(toolIds(R));
     // Non-vacuous: the fixture actually splits in and out.
-    expect(new Set(cli)).toEqual(new Set([ids.high, ids.undelivered, ids.readByPrior, ids.oldUndelivered]));
+    expect(new Set(cli)).toEqual(
+      new Set([ids.high, ids.undelivered, ids.readByPrior, ids.oldUndelivered, ids.oldReadByPrior]),
+    );
     expect(cli[0], "priority first, as the drain orders").toBe(ids.high);
   });
 
-  it("with --since all (the window lifted on both sides)", () => {
-    const ids = seed();
-    const cli = cliIds(R, ["--since", "all"]);
-    expect(cli).toEqual(toolIds(R, "all"));
-    expect(cli).toContain(ids.oldReadByPrior);
+  it("--since is REFUSED, not ignored: the canonical set has no window (ADR-0045 R4)", () => {
+    seed();
+    const r = pending([R, "--json", "--since", "24h"]);
+    expect(r.status).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/--since is not accepted/);
   });
 
   it("a NULL session (force-mint / rotate clear it): the not-resolved set", () => {
@@ -181,7 +185,7 @@ describe("F1 — read-only by construction", () => {
     seed();
     const before = snapshot();
     cliIds(R);
-    cliIds(R, ["--since", "all"]);
+    cliIds(R);
     expect(snapshot()).toBe(before);
   });
 
@@ -197,7 +201,7 @@ describe("F1 — read-only by construction", () => {
     const Better = (await import("better-sqlite3")).default;
     const ro = new Better(DB, { readonly: true });
     try {
-      const m = db.pendingMetadata(ro as never, R, null);
+      const m = db.pendingMetadata(ro as never, R);
       expect(m.count).toBeGreaterThan(0);
     } finally {
       ro.close();
@@ -208,7 +212,7 @@ describe("F1 — read-only by construction", () => {
 describe("F1 — metadata only", () => {
   it("never emits content; each message is exactly {id, from, priority, age_seconds}", () => {
     seed();
-    const r = pending([R, "--json", "--since", "all"]);
+    const r = pending([R, "--json"]);
     expect(r.status, r.stderr).toBe(0);
     expect(r.stdout).not.toContain(SECRET);
     const j = JSON.parse(r.stdout);

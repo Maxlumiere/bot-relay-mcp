@@ -282,13 +282,10 @@ export type GetOutstandingInput = z.infer<typeof GetOutstandingSchema>;
  * behavior. Default is "24h" — keeps reused agent names from inheriting the
  * full inbox backlog while leaving an escape hatch for cross-session handoff.
  */
-/** get_messages' default window. Exported so `relay pending` (F1) defaults to the SAME window. */
-export const GET_MESSAGES_DEFAULT_SINCE = "24h";
-
 const GetMessagesSinceField = z
   .union([z.string().min(1), z.null()])
   .optional()
-  .default(GET_MESSAGES_DEFAULT_SINCE)
+  .default("24h")
   .describe(
     "v2.1.6: time-window filter over ALREADY-OBSERVED history. Accepts duration " +
       "('15m'|'1h'|'24h'|'3d'), ISO8601 timestamp, 'session_start' sentinel, or " +

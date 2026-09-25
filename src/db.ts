@@ -5793,8 +5793,9 @@ export interface PendingMeta {
 }
 
 /**
- * F1 (ADR-0044) — what get_messages(pending) WOULD return for this agent, as
- * METADATA ONLY, from a handle the caller opened (read-only for `relay pending`).
+ * F1 (ADR-0044) — the CANONICAL pending set for this agent (ADR-0045 R1: the #53
+ * predicate with NO window), as METADATA ONLY, from a handle the caller opened
+ * (read-only for `relay pending`). Equal to get_messages(pending, since='all').
  *
  * SSOT BY CONSTRUCTION, not by care: the session is resolved exactly as
  * getMessages resolves it (agents.session_id), the WHERE comes from the SAME
@@ -5806,12 +5807,13 @@ export interface PendingMeta {
  * driver. NO CONTENT: only id, sender, priority and created_at are selected.
  * No LIMIT: `count` is the whole pending set, never a capped page.
  */
-export function pendingMetadata(db: CompatDatabase, agentName: string, sinceIso: string | null): PendingMeta {
+export function pendingMetadata(db: CompatDatabase, agentName: string): PendingMeta {
   const agentRow = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(agentName) as
     | { session_id: string | null }
     | undefined;
   const currentSession = agentRow?.session_id ?? null;
-  const { where, params } = buildMessageWhere(agentName, "pending", sinceIso, "all", currentSession);
+  // NO window (ADR-0045 R1/R4): this IS the canonical pending set.
+  const { where, params } = buildMessageWhere(agentName, "pending", null, "all", currentSession);
   const rows = db
     .prepare(`SELECT id, from_agent, priority, created_at FROM messages WHERE ${where} ${DRAIN_PRIORITY_ORDER_SQL}`)
     .all(...params) as Array<{ id: string; from_agent: unknown; priority: unknown; created_at: string }>;
@@ -5850,14 +5852,6 @@ export function pendingSchemaGap(db: CompatDatabase): string | null {
     if (missing.length) return `${table} lacks ${missing.join(", ")} (schema too old for the pending predicate)`;
   }
   return null;
-}
-
-/** Handle-taking twin of getAgentSessionStart, for the read-only CLI. */
-export function agentSessionStartOn(db: CompatDatabase, agentName: string): string | null {
-  const row = db.prepare("SELECT session_started_at FROM agents WHERE name = ?").get(agentName) as
-    | { session_started_at: string | null }
-    | undefined;
-  return row?.session_started_at ?? null;
 }
 
 export function getMessages(

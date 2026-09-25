@@ -29,8 +29,9 @@
  *                             run (§2.2), never stored, so it cannot drift.
  *   relay pending AGENT       What is pending for AGENT, as metadata only (count,
  *                             top priority, id/sender/priority/age). Read-only;
- *                             exactly get_messages' pending set (F1). Exit 1 when
- *                             it cannot answer — never a silent "no mail".
+ *                             the canonical pending set, no window (F1,
+ *                             ADR-0045). Exit 1 when it cannot answer — never a
+ *                             silent "no mail".
  *   relay mint-token NAME     Mint an agent token directly via filesystem access
  *                             (v2.6.0). For external CLI agents whose safety
  *                             monitors block register_agent → use-token in one
@@ -120,7 +121,7 @@ function printHelp(requested) {
       "  recover NAME     Clear an agent's registration so it can re-bootstrap.\n" +
       "  bind             Record THIS window's identity binding from the hook payload on stdin (ADR-0036 S1).\n" +
       "  fleet            List every recorded window binding, with liveness derived from the anchor.\n" +
-      "  pending AGENT    What is pending for AGENT (metadata only, read-only; exactly get_messages' pending set).\n" +
+      "  pending AGENT    What is pending for AGENT (metadata only, read-only, no window: the canonical pending set).\n" +
       "  release-binding NAME  Clear a STALE binding (refuses on a live anchor) so the next launch re-binds; preserves identity.\n" +
       "  mint-token NAME  Mint an agent token via filesystem (external-CLI setup).\n" +
       "  purge-history NAME  Delete every message + task where the agent is sender or recipient.\n" +
