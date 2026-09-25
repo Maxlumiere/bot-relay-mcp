@@ -9,7 +9,7 @@ Seven scripts under `scripts/` decided whether they were being run directly by c
 - New `scripts/lib/entrypoint.mjs`: `isDirectRun(import.meta.url)` resolves `argv[1]` through `realpath`, so a symlinked path and a path containing a space both run. A run that looks direct (same file name) but cannot be confirmed prints why and exits 2 instead of passing silently. All seven scripts use it.
 - `scripts/pre-publish-check.sh` resolves its project root with `pwd -P`, so the gate invokes every guard by its physical path even when it is started through a symlink.
 - Tests:
-  - `tests/release-guards-symlink-entrypoint.test.ts` runs each script through a symlinked directory and requires the same exit code and output as the real path. It also checks that every guard path `--list-steps` reports is physical. All 8 cases were seen failing on the old code.
+  - `tests/release-guards-symlink-entrypoint.test.ts` runs each script through a symlinked directory and requires an equivalent exit status, plus output that is loud rather than silent — not byte-identical output — matching the real path. It also checks that every guard path `--list-steps` reports is physical. All 8 cases were seen failing on the old code.
   - `tests/scripts-lib-entrypoint.test.ts` covers the helper itself: a path with a space, a symlinked directory, an import from another script, and a same-named file elsewhere.
 
 ### Fixed — the PostToolUse hook marked mail read that the agent never saw (ADR-0037)
