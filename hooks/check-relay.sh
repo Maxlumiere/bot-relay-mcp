@@ -237,9 +237,17 @@ if ! [[ "$AGENT_ROLE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
   exit 0
 fi
 # Capabilities: comma-separated tokens of the same character set.
-# grep used instead of bash =~ for portability with macOS bash 3.2.
+# Whole-string match via relay_whole_match (bash =~, which macOS bash 3.2 supports:
+# MEASURED 25 Sep). The old `echo | grep` passed a multi-line value if any line matched.
+# Whole-string match. `echo "$X" | grep -Eq '^RE$'` is LINE-oriented: a
+# multi-line value passes if ANY line matches, and the rest rides along into
+# whatever the value is used for (Codex round 2 on #280: a newline in
+# RELAY_AGENT_NAME reached a sqlite heredoc as SQL). [[ =~ ]] anchors to the
+# whole string.
+relay_whole_match() { [[ "$1" =~ $2 ]]; }
+
 if [ -n "$AGENT_CAPS" ]; then
-  if [ ${#AGENT_CAPS} -gt 256 ] || ! echo "$AGENT_CAPS" | grep -Eq '^[A-Za-z0-9_.,-]+$'; then
+  if [ ${#AGENT_CAPS} -gt 256 ] || ! relay_whole_match "$AGENT_CAPS" '^[A-Za-z0-9_.,-]+$'; then
     echo "[bot-relay] RELAY_AGENT_CAPABILITIES has invalid characters or length. Allowed: [A-Za-z0-9_.,-], 1-256 chars." >&2
     exit 0
   fi

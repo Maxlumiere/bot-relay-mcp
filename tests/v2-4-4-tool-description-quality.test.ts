@@ -213,7 +213,7 @@ describe("v2.4.4 — tool description quality", () => {
       join_channel: "46b2b3247d5a1115e1f72635bdfae99b63e88b344bbf3482fce93410321de45f",
       leave_channel: "654ef16a3e05b55712b155643cc92b8536b9795fa68037f203f1fb5cb7b3f9d0",
       list_webhooks: "8c0a676339308cdf9591e789636ec49ab681eed8ff662815c2bf2a9de5f87449",
-      peek_inbox_version: "5d76f1442911e752555ed122a5ccd2254c4a47df1ddcd83307dcddcf906752a1",
+      peek_inbox_version: "416eb2b0a87d599ecb68973f30909c924dc6d675401ccd0b36fca558ddc2d52c",
       post_task: "76309d5c555329f7df772e65230ec243c544b82a0c519f1b5cdb0351edd69e24",
       post_task_auto: "f227175138d36cc2117dc77bbadafc2d151a33d0533996a2beb572192091a535",
       post_to_capability: "add2c4bcf0d20624269cde691d2c84fafb5e493caaa446192e86fde41d421247",

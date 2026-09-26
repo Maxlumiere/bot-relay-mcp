@@ -2,9 +2,13 @@
 # bot-relay-mcp: PostToolUse hook — mid-task mail NOTICE (v1.8; peek-only since ADR-0037)
 #
 # Fires after every Claude Code tool call. If this agent (RELAY_AGENT_NAME)
-# has unread mail in the relay, inject a short NOTICE as additionalContext: the
-# unread count, the senders, and a bounded quoted first line of the newest
-# message. Never message bodies, and never a read-mark.
+# has unread mail in the relay, inject a short NOTICE as additionalContext:
+# METADATA ONLY (the unread count, the highest priority, the sender names checked
+# against [a-z0-9-], and the newest message's age). Never any message content,
+# not even a first line, and never a read-mark. additionalContext is a
+# HIGHER-TRUST channel than a get_messages tool result, so quoting a sender's
+# words here would launder attacker-chosen text into it, and an excerpt stands in
+# for actually reading the mail (design review, 24 Sep).
 #
 # ADR-0037 — ONLY THE MODEL MOVES MAIL TO READ. This hook used to DRAIN the
 # mailbox (HTTP get_messages, or a sqlite UPDATE status='read') and inject the
@@ -119,7 +123,14 @@ fi
 
 # --- Input validation (security hardening — same allowlist as check-relay.sh) ---
 
-if ! echo "$AGENT_NAME" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$'; then
+# Whole-string match. `echo "$X" | grep -Eq '^RE$'` is LINE-oriented: a
+# multi-line value passes if ANY line matches, and the rest rides along into
+# whatever the value is used for (Codex round 2 on #280: a newline in
+# RELAY_AGENT_NAME reached a sqlite heredoc as SQL). [[ =~ ]] anchors to the
+# whole string.
+relay_whole_match() { [[ "$1" =~ $2 ]]; }
+
+if ! relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$'; then
   exit 0
 fi
 
@@ -133,21 +144,21 @@ if [ -z "$AGENT_TOKEN" ]; then
   fi
 fi
 
-if ! echo "$HTTP_HOST" | grep -Eq '^[A-Za-z0-9_.:-]{1,253}$'; then
+if ! relay_whole_match "$HTTP_HOST" '^[A-Za-z0-9_.:-]{1,253}$'; then
   exit 0
 fi
 
-if ! echo "$HTTP_PORT" | grep -Eq '^[0-9]{1,5}$' || [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+if ! relay_whole_match "$HTTP_PORT" '^[0-9]{1,5}$' || [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
   exit 0
 fi
 
-if ! echo "$MAX_MESSAGES" | grep -Eq '^[0-9]{1,3}$' || [ "$MAX_MESSAGES" -lt 1 ] || [ "$MAX_MESSAGES" -gt 100 ]; then
+if ! relay_whole_match "$MAX_MESSAGES" '^[0-9]{1,3}$' || [ "$MAX_MESSAGES" -lt 1 ] || [ "$MAX_MESSAGES" -gt 100 ]; then
   MAX_MESSAGES=20
 fi
 
 # Only a plain decimal 0..3600 is honoured; anything else is the default, never
 # "disabled". 10# strips leading zeros so shell arithmetic cannot read octal.
-if ! echo "$REMIND_SECS" | grep -Eq '^[0-9]{1,4}$' || [ "$REMIND_SECS" -gt 3600 ]; then
+if ! relay_whole_match "$REMIND_SECS" '^[0-9]{1,4}$' || [ "$REMIND_SECS" -gt 3600 ]; then
   REMIND_SECS=600
 fi
 REMIND_SECS=$((10#$REMIND_SECS))
@@ -155,7 +166,7 @@ REMIND_SECS=$((10#$REMIND_SECS))
 # Token shape: base64url-ish, 8-128 chars, strictly alnum/_/=/./- (no whitespace,
 # no control chars — blocks header-injection via newlines in env var).
 if [ -n "$AGENT_TOKEN" ]; then
-  if ! echo "$AGENT_TOKEN" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}$'; then
+  if ! relay_whole_match "$AGENT_TOKEN" '^[A-Za-z0-9_=.-]{8,128}$'; then
     AGENT_TOKEN=""
   fi
 fi
@@ -241,7 +252,9 @@ sys.stdout.write(("subagent" if sub else "main") + "\x1f" + sid)
 # SRC=http  → stdin is the StreamableHTTP get_messages response.
 # SRC=sqlite → stdin is rows "id<US>from<US>priority<US>created_at<US>content<RS>...".
 # Exit 1 = the read failed (caller falls back / stays CANNOT-JUDGE); exit 0 with
-# no output = empty mailbox. FPR fingerprints the unread set for the damper.
+# no output = empty mailbox; exit 3 = an HTTP page that does not hold every pending
+# message, so the top priority and newest arrival must come from the full-set reader
+# (the caller re-runs with AGG_KNOWN=1). FPR fingerprints the unread set for the damper.
 # Piped rather than passed in an env var: a full get_messages response can exceed
 # Linux's 128KB per-string exec limit.
 NOTICE_PY='
@@ -255,7 +268,15 @@ except ValueError:
     lim = 20
 raw = sys.stdin.buffer.read().decode("utf-8", "replace")
 
-recs = []
+# Every record is (id, sender, priority, created_at). NO content field is read on
+# either path: the notice is metadata only.
+# Priority is rendered, so it is held to the literals the relay itself uses BEFORE it is
+# ranked or shown; anything else (a raw DB value, a stubbed response) is "unknown".
+KNOWN = ("critical", "high", "normal", "low")
+RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3, "unknown": 4}
+def prio(p):
+    return p if p in KNOWN else "unknown"
+recs, total, top_name, newest, fpr, windowed = [], None, None, None, None, False
 if src == "http":
     payload = None
     for line in raw.strip().splitlines():
@@ -274,54 +295,104 @@ if src == "http":
     if not isinstance(msgs, list):
         sys.exit(1)
     for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        c = m.get("content")
-        recs.append((str(m.get("id", "")), str(m.get("from_agent", "?")),
-                     str(m.get("priority", "normal")), str(m.get("created_at", "")),
-                     c if isinstance(c, str) else ""))
+        if isinstance(m, dict):
+            recs.append((str(m.get("id", "")), str(m.get("from_agent", "")),
+                         prio(m.get("priority")), str(m.get("created_at", ""))))
+    # get_messages orders by PRIORITY first, so the highest priority of ALL
+    # pending mail is always inside the returned page.
+    if isinstance(data.get("total_pending"), int):
+        total = data["total_pending"]
+    # A page drawn through ANY window is never the full set, whatever its size.
+    windowed = data.get("since_bound") is not None
 elif src == "sqlite":
-    for rec in raw.split("\x1e"):
-        rec = rec.strip("\n\r")
-        if not rec:
-            continue
-        parts = rec.split("\x1f", 4)
-        if len(parts) == 5:
-            recs.append(tuple(parts))
+    # JSON from the read-only sqlite reader: no delimiter a sender can forge.
+    try:
+        d = json.loads(raw)
+        total = int(d["total"])
+        top_name = prio(d.get("top")) if d.get("top") is not None else None
+        newest = d.get("newest")
+        fpr = d.get("fpr") if isinstance(d.get("fpr"), str) else None
+        for r in d["rows"]:
+            recs.append((str(r["id"]), str(r["from_agent"]), prio(r["priority"]), str(r["created_at"])))
+    except Exception:
+        sys.exit(1)
 else:
     sys.exit(1)
 
 if not recs:
     sys.exit(0)
 
-def clean(s, cap):
-    s = re.sub(r"[\x00-\x1f\x7f]+", " ", s).strip()
-    return s if len(s) <= cap else s[: cap - 1] + "…"
-
 n = len(recs)
-count = ("%d+" % n) if n >= lim else ("%d" % n)
-fpr = hashlib.sha256("\n".join(sorted(r[0] for r in recs)).encode("utf-8", "replace")).hexdigest()[:32]
-top = "high" if any(r[2] == "high" for r in recs) else "normal"
+if total is None:
+    count = ("%d+" % n) if n >= lim else ("%d" % n)
+else:
+    count = "%d" % total
+def fingerprint(ids):
+    return hashlib.sha256("\n".join(sorted(ids)).encode("utf-8", "replace")).hexdigest()[:32]
+# AGGREGATES COME FROM THE FULL SET, NEVER A PAGE (truncated is not complete).
+# The top priority and the newest arrival describe ALL pending mail. The sqlite
+# reader computes them over the full canonical set. An HTTP page that holds every
+# pending message IS the full set; a partial one proves nothing about what it
+# left out, whatever its ordering, so the full-set reader answers (exit 3, the
+# caller re-runs with AGG_KNOWN=1), and with no reader both read as unknown.
+if src == "http":
+    complete = (not windowed) and ((n >= total) if total is not None else (n < lim))
+    if complete:
+        top_name = min((r[2] for r in recs), key=lambda p: RANK[p])
+        newest = max(r[3] for r in recs)
+        fpr = fingerprint(r[0] for r in recs)
+    elif os.environ.get("AGG_KNOWN") != "1":
+        sys.exit(3)
+    else:
+        top_name = prio(os.environ.get("AGG_TOP") or "unknown")
+        newest = os.environ.get("AGG_NEWEST") or None
+        fpr = os.environ.get("AGG_FPR") or None
+        if fpr is None:
+            # No full-set reader: the page ids plus the full COUNT, so an arrival or a
+            # departure beyond the page still changes the fingerprint.
+            fpr = fingerprint([r[0] for r in recs] + ["total=%s" % total])
+elif top_name is None:
+    top_name = "unknown"
+# THE DAMPER FINGERPRINT COVERS THE FULL PENDING SET, never only a page: a new
+# arrival that sorts outside the page must change it, or the notice stays damped.
+if fpr is None:
+    fpr = fingerprint(r[0] for r in recs)
+# The damper 120s remind applies to anything high or above, and to an UNKNOWN top:
+# a set whose top cannot be established is reminded as if it were high, never damped
+# on the assumption that it is not.
+top = "high" if (RANK[top_name] <= 1 or top_name == "unknown") else "normal"
 newest_first = sorted(recs, key=lambda r: r[3], reverse=True)
+# Sender names are the ONLY sender-chosen field in the notice, so they are held to
+# [a-z0-9-]; anything else shows as "unknown".
+SENDER = re.compile(r"[a-z0-9-]{1,64}")
 order, highs = [], {}
 for r in newest_first:
-    who = clean(r[1], 64) or "?"
+    who = r[1] if SENDER.fullmatch(r[1] or "") else "unknown"
     if who not in highs:
         order.append(who)
         highs[who] = 0
-    if r[2] == "high":
+    if RANK.get(r[2], 2) <= 1:
         highs[who] += 1
 shown = [("%s (%d high)" % (w, highs[w])) if highs[w] else w for w in order[:5]]
 if len(order) > 5:
     shown.append("+%d more" % (len(order) - 5))
-content = newest_first[0][4]
-if src == "sqlite" and (content.startswith("enc:") or content.startswith("enc1:")):
-    first = "(encrypted at rest, not shown)"
-else:
-    first = next((l for l in content.splitlines() if l.strip()), "")
-    first = json.dumps(clean(first, 100), ensure_ascii=False)
-notice = ("relay: %s unread for %s, from %s. newest first line (≤100 chars): %s. "
-          "Unread until get_messages is called.") % (count, an, ", ".join(shown), first)
+
+def age(iso):
+    import datetime
+    if not isinstance(iso, str) or not iso:
+        return "at an unknown time"
+    try:
+        t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        secs = max(0, int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()))
+    except Exception:
+        return "at an unknown time"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return "%d%s ago" % (secs // size, unit)
+    return "%ds ago" % secs
+
+notice = ("relay: %s unread for %s (highest priority: %s), from %s. newest arrived %s. "
+          "Unread until get_messages is called.") % (count, an, top_name, ", ".join(shown), age(newest))
 sys.stdout.buffer.write(("%s\x1f%s\x1f%s" % (fpr, top, notice)).encode("utf-8", "replace"))
 '
 
@@ -352,6 +423,10 @@ print(json.dumps({
       "status": "pending",
       "limit": int(os.environ["LIM"]),
       "peek": True,
+      # The canonical pending set has NO window. Explicit, never the server default:
+      # a windowed page silently drops mail a prior session read, and would then be
+      # mistaken for the whole set.
+      "since": "all",
       "agent_token": os.environ["AT"],
     },
   },
@@ -366,7 +441,44 @@ print(json.dumps({
     -H "X-Agent-Token: $AGENT_TOKEN" \
     --data "$payload" 2>/dev/null) || return 1
 
-  printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null
+  local out rc
+  out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null)
+  rc=$?
+  if [ $rc -eq 3 ]; then
+    # A partial page: the top priority and newest arrival come from the full-set reader.
+    local agg agg_top agg_newest agg_fpr rest
+    agg=$(sqlite_aggregates)
+    agg_top="" agg_newest="" agg_fpr=""
+    if [ -n "$agg" ]; then
+      agg_top="${agg%%$'\x1f'*}"
+      rest="${agg#*$'\x1f'}"
+      agg_newest="${rest%%$'\x1f'*}"
+      agg_fpr="${rest#*$'\x1f'}"
+    fi
+    out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" AGG_KNOWN=1 \
+      AGG_TOP="$agg_top" AGG_NEWEST="$agg_newest" AGG_FPR="$agg_fpr" python3 -c "$NOTICE_PY" 2>/dev/null)
+    rc=$?
+  fi
+  printf '%s' "$out"
+  return $rc
+}
+
+# The full-set aggregates, "TOP<US>NEWEST<US>FPR", from the read-only reader below
+# (MIN of the shared rank, MAX(created_at), and the fingerprint of every pending id,
+# over the canonical set); empty when the DB cannot be read, and the notice then
+# says "unknown".
+sqlite_aggregates() {
+  { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ]; } || return 0
+  AN="$AGENT_NAME" DBP="$DB_PATH" LIM=1 python3 -c "$SQLITE_PEEK_PY" 2>/dev/null |
+    python3 -c 'import json, sys
+try:
+    d = json.load(sys.stdin)
+    t = d.get("top")
+    v = d.get("newest")
+    f = d.get("fpr")
+    sys.stdout.write((t if isinstance(t, str) else "") + "\x1f" + (v if isinstance(v, str) else "") + "\x1f" + (f if isinstance(f, str) else ""))
+except Exception:
+    pass' 2>/dev/null
 }
 
 # --- Sqlite peek (fallback) ---
@@ -375,38 +487,60 @@ print(json.dumps({
 # (never read, OR read by a DIFFERENT session). On a legacy DB without those
 # columns the query errors and the bare-status form runs instead.
 
+# Read-only, parameter-bound, content-free, delimiter-free. The DB is opened with
+# mode=ro (a write is impossible, not merely avoided) and the agent name is BOUND,
+# never interpolated into command text. COUNT, top priority and newest arrival are
+# computed over ALL pending mail; the page is ordered priority-first like
+# get_messages. Exit 1 = could not read (never rendered as "no mail").
+SQLITE_PEEK_PY='
+import hashlib, json, os, sqlite3, sys, urllib.parse
+an = os.environ["AN"]
+lim = int(os.environ.get("LIM", "20"))
+try:
+    con = sqlite3.connect("file:" + urllib.parse.quote(os.environ["DBP"]) + "?mode=ro", uri=True, timeout=1)
+except Exception:
+    sys.exit(1)
+RANK = "CASE priority WHEN \x27critical\x27 THEN 0 WHEN \x27high\x27 THEN 1 WHEN \x27normal\x27 THEN 2 WHEN \x27low\x27 THEN 3 ELSE 4 END"
+NAMES = {0: "critical", 1: "high", 2: "normal", 3: "low", 4: "unknown"}
+# #56 canonical per-session pending predicate (the same replica stop-check.sh uses;
+# F1 replaces every hook copy with one CLI entrypoint). Legacy DBs without those
+# columns fall back to the bare status form.
+CANON = ("to_agent = ? AND resolved_at IS NULL AND (read_by_session IS NULL OR "
+         "read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = ?), \x27\x27))", 2)
+LEGACY = ("to_agent = ? AND status = \x27pending\x27", 1)
+def run(where, k):
+    p = [an] * k
+    total, toprank, newest = con.execute(
+        "SELECT COUNT(*), MIN(" + RANK + "), MAX(created_at) FROM messages WHERE " + where, p).fetchone()
+    rows = con.execute(
+        "SELECT id, from_agent, priority, created_at FROM messages WHERE " + where +
+        " ORDER BY " + RANK + ", created_at DESC LIMIT ?", p + [lim]).fetchall()
+    # The damper fingerprint covers the FULL pending id set, not the page.
+    ids = sorted(r[0] for r in con.execute("SELECT id FROM messages WHERE " + where, p).fetchall())
+    fpr = hashlib.sha256("\n".join(ids).encode("utf-8", "replace")).hexdigest()[:32]
+    return total, toprank, newest, rows, fpr
+try:
+    try:
+        total, toprank, newest, rows, fpr = run(*CANON)
+    except sqlite3.OperationalError:
+        total, toprank, newest, rows, fpr = run(*LEGACY)
+except Exception:
+    sys.exit(1)
+if not total:
+    sys.exit(0)
+print(json.dumps({"total": total, "top": NAMES.get(toprank, "unknown"), "newest": newest, "fpr": fpr,
+                  "rows": [{"id": r[0], "from_agent": r[1], "priority": r[2], "created_at": r[3]} for r in rows]}))
+'
+
 sqlite_peek() {
   [ -z "$DB_PATH" ] && return 1
   [ -f "$DB_PATH" ] || return 1
-  command -v sqlite3 >/dev/null 2>&1 || return 1
-
-  local rows
-  rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-.parameter set :lim $MAX_MESSAGES
-SELECT id, from_agent, priority, created_at, substr(content, 1, 2048)
-FROM messages WHERE to_agent = :name
-  AND resolved_at IS NULL
-  AND (read_by_session IS NULL
-       OR read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = :name), ''))
-ORDER BY created_at DESC LIMIT :lim;
-SQL
-)
-  if [ $? -ne 0 ]; then
-    rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-.parameter set :lim $MAX_MESSAGES
-SELECT id, from_agent, priority, created_at, substr(content, 1, 2048)
-FROM messages WHERE to_agent = :name AND status = 'pending'
-ORDER BY created_at DESC LIMIT :lim;
-SQL
-) || return 1
+  local json
+  json=$(AN="$AGENT_NAME" DBP="$DB_PATH" LIM="$MAX_MESSAGES" python3 -c "$SQLITE_PEEK_PY" 2>/dev/null) || return 1
+  if [ -z "$json" ]; then
+    return 0  # verified empty
   fi
-  if [ -z "$rows" ]; then
-    return 0  # empty — nothing to surface
-  fi
-
-  printf '%s' "$rows" | SRC=sqlite AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null
+  printf '%s' "$json" | SRC=sqlite AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null
 }
 
 # --- v2.15.0: presence self-heal (narrow, metadata-only) ---
@@ -429,17 +563,23 @@ liveness_self_heal() {
   cur_start=$(relay_pid_start "$cur_pid" 2>/dev/null || printf '')
   # Read the stored anchor. Requires the sqlite fast-path; if unavailable we
   # can't compute the gate → skip (SessionStart still carries the anchor).
-  { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; } || return 0
-  stored_pid=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-SELECT IFNULL(agent_pid,'') FROM agents WHERE name = :name LIMIT 1;
-SQL
-)
-  stored_start=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-SELECT IFNULL(agent_pid_start,'') FROM agents WHERE name = :name LIMIT 1;
-SQL
-)
+  { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ]; } || return 0
+  # Read-only and parameter-bound (Codex round 2): the name is BOUND, never
+  # interpolated into sqlite command text. One read for both fields.
+  local stored
+  stored=$(AN="$AGENT_NAME" DBP="$DB_PATH" python3 -c '
+import os, sqlite3, sys, urllib.parse
+try:
+    con = sqlite3.connect("file:" + urllib.parse.quote(os.environ["DBP"]) + "?mode=ro", uri=True, timeout=1)
+    r = con.execute("SELECT IFNULL(agent_pid, \x27\x27), IFNULL(agent_pid_start, \x27\x27) FROM agents WHERE name = ? LIMIT 1", (os.environ["AN"],)).fetchone()
+except Exception:
+    sys.exit(1)
+if r:
+    sys.stdout.write("%s\x1f%s" % (r[0], r[1]))
+' 2>/dev/null) || return 0
+  stored_pid="${stored%%$'\x1f'*}"
+  stored_start="${stored#*$'\x1f'}"
+  [ "$stored_pid" = "$stored" ] && stored_start=""
   # Gate: restamp on a real mismatch — pid changed, OR we have a READABLE
   # current start that differs from / fills the stored one. Do NOT downgrade a
   # present stored start to empty when the current start is transiently
@@ -515,7 +655,7 @@ if [ ! -t 0 ]; then
   HOOK_MODE="${_parsed%%$'\x1f'*}"
   HOOK_SESSION="${_parsed#*$'\x1f'}"
 fi
-if ! echo "$HOOK_SESSION" | grep -Eq '^[A-Za-z0-9_-]{1,128}$'; then
+if ! relay_whole_match "$HOOK_SESSION" '^[A-Za-z0-9_-]{1,128}$'; then
   HOOK_SESSION=""
 fi
 
