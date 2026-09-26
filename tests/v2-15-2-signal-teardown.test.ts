@@ -26,6 +26,7 @@
  *       the stamp is session-scoped and can't outlive its session.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { ownDeadWindow, OWN_DEAD_ANCHOR } from "./_helpers/own-dead-window.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -96,7 +97,8 @@ describe("v2.15.2 — signal teardown does not phantom a surviving/relaunched ag
     setAgentLivenessAnchor("a-agent", LIVE_PID, REAL_START);
 
     // Signal teardown: stored 'idle' (neutral), NOT a sticky 'offline'/'closed'.
-    const r = endAgentSessionOnSignal("a-agent", sid, "SIGHUP");
+    ownDeadWindow("a-agent");
+    const r = endAgentSessionOnSignal("a-agent", sid, "SIGHUP", OWN_DEAD_ANCHOR);
     expect(r.changed).toBe(true);
     expect(rawRow("a-agent").agent_status).toBe("idle");
     expect(rawRow("a-agent").agent_status).not.toBe("offline"); // the R1 phantom class
@@ -116,7 +118,8 @@ describe("v2.15.2 — signal teardown does not phantom a surviving/relaunched ag
     registerAgent("b-agent", "builder", [], { host_id: OWN_HOST });
     const sid = getAgentSessionId("b-agent")!;
     setAgentLivenessAnchor("b-agent", LIVE_PID, REAL_START);
-    endAgentSessionOnSignal("b-agent", sid, "SIGTERM");
+    ownDeadWindow("b-agent");
+    endAgentSessionOnSignal("b-agent", sid, "SIGTERM", OWN_DEAD_ANCHOR);
 
     const raw = rawRow("b-agent");
     expect(raw.agent_status).toBe("idle"); // stored neutral
@@ -154,7 +157,8 @@ describe("v2.15.2 — signal teardown does not phantom a surviving/relaunched ag
   it("(e) LOAD-BEARING — signal teardown → re-register with NO anchor → dashboard NOT 'closed' (stamp cleared)", () => {
     registerAgent("e-agent", "builder", [], { host_id: OWN_HOST });
     const sid = getAgentSessionId("e-agent")!;
-    endAgentSessionOnSignal("e-agent", sid, "SIGHUP");
+    ownDeadWindow("e-agent");
+    endAgentSessionOnSignal("e-agent", sid, "SIGHUP", OWN_DEAD_ANCHOR);
 
     // The stamp is set, anchor cleared → liveness 'unknown'. WITHOUT 1c the
     // dashboard would read 'closed' from this stamp. Prove the pre-condition:
@@ -203,17 +207,18 @@ describe("v2.15.2 — signal teardown does not phantom a surviving/relaunched ag
     const sid = getAgentSessionId("g-agent")!;
 
     // CAS mismatch (wrong session) → no-op, row untouched.
-    const wrong = endAgentSessionOnSignal("g-agent", "not-the-session", "SIGINT");
+    ownDeadWindow("g-agent");
+    const wrong = endAgentSessionOnSignal("g-agent", "not-the-session", "SIGINT", OWN_DEAD_ANCHOR);
     expect(wrong.changed).toBe(false);
     expect(rawRow("g-agent").session_id).toBe(sid); // still live
 
     // Correct CAS → ends the session (idle + anchor cleared + stamp).
-    const ok = endAgentSessionOnSignal("g-agent", sid, "SIGINT");
+    const ok = endAgentSessionOnSignal("g-agent", sid, "SIGINT", OWN_DEAD_ANCHOR);
     expect(ok.changed).toBe(true);
     expect(rawRow("g-agent").session_id).toBeNull();
 
     // Idempotent: a second call with the now-consumed session → no-op.
-    const again = endAgentSessionOnSignal("g-agent", sid, "SIGINT");
+    const again = endAgentSessionOnSignal("g-agent", sid, "SIGINT", OWN_DEAD_ANCHOR);
     expect(again.changed).toBe(false);
   });
 });

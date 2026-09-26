@@ -154,7 +154,12 @@ export function performAutoUnregister(
     // 'offline' this fix removes on the exact path being fixed. If the helper
     // throws, the outer catch logs + audits and writes NO terminal status;
     // liveness derivation governs the row from there.
-    const { changed } = endAgentSessionOnSignal(name, capturedSid, signalKind);
+    // ADR-0042 R1: pass THIS connector's parent anchor. The writer ends the session
+    // only if the row is anchored to it and that anchor is positively dead.
+    const ownAnchor = detectedAgentProcess?.startedAt
+      ? { pid: detectedAgentProcess.pid, startedAt: detectedAgentProcess.startedAt }
+      : null;
+    const { changed } = endAgentSessionOnSignal(name, capturedSid, signalKind, ownAnchor);
     if (changed) {
       log.info(`[stdio] ended session for agent "${name}" (session=${capturedSid}) on ${signal} — liveness now governs presence`);
       // v2.8 wire-emit-sites — signal-triggered state change was previously
@@ -194,7 +199,8 @@ export function performAutoUnregister(
       }
     } else {
       log.debug(
-        `[stdio] session-end skipped for "${name}" — session_id mismatch (${capturedSid}) or session already ended`,
+        `[stdio] session-end skipped for "${name}" — not this window's row, its anchor is not positively dead, ` +
+          `or the session already moved (${capturedSid}). ADR-0042 R1: writing nothing is the safe outcome.`,
       );
     }
   } catch (err) {

@@ -4,6 +4,7 @@
 // See LICENSE for full terms.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { ownDeadWindow, OWN_DEAD_ANCHOR } from "./_helpers/own-dead-window.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -79,6 +80,7 @@ describe("v2.0.2 — SIGINT auto-offline honours capturedSessionId contract", ()
     const tokenHashBefore = getAgentAuthData("solo-stdio")?.token_hash;
     expect(tokenHashBefore).toBeTruthy();
 
+    ownDeadWindow("solo-stdio");
     performAutoUnregister("solo-stdio", sid, "SIGINT");
 
     // v2.1.3: row is preserved (not deleted). session_id is cleared. Token

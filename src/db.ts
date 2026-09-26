@@ -11,7 +11,7 @@ import os from "os";
 // "type":"module", so a bare `require(...)` is undefined at runtime — importing
 // createRequire from "module" is the supported way to do a sync require in ESM.
 import { createRequire } from "module";
-import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised } from "./liveness.js";
+import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised, anchorLivenessVerdict } from "./liveness.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -3634,26 +3634,60 @@ export function endAgentSessionOnSignal(
   name: string,
   expectedSessionId: string,
   signalKind: "SIGHUP" | "SIGINT" | "SIGTERM" | null = null,
+  // ADR-0042 R1: the ending connector's OWN parent anchor (the window it lives in).
+  // Absent → the connector cannot prove the row is its window's → write nothing.
+  ownAnchor: { pid: number; startedAt: string } | null = null,
 ): { changed: boolean } {
   const db = getDb();
   const nowMs = Date.now();
-  const r = db.prepare(
-    "UPDATE agents SET session_id = NULL, agent_status = 'idle', busy_expires_at = NULL, " +
-    "signal_received_at = ?, signal_kind = ?, " +
-    "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
-    "WHERE name = ? AND session_id = ?"
-  ).run(nowMs, signalKind, name, expectedSessionId);
-  // v2.23.x #140 — the FIFTH site, and the one four reviewers missed because it
-  // was BRACED (looked correct). Same defect as the four unbraced ones: on a CAS
-  // loser (r.changes===0 — a concurrent rebind already moved the session/anchor)
-  // the guarded `if` left a stale NEGATIVE entry intact, so the fresh live row
-  // read `dead`, or its argv-scan alive signal was SUPPRESSED (computeLiveness-
-  // Verdict returns at the negative-cache hit before reaching the argv probe),
-  // until the ~5s TTL. UNCONDITIONAL dual eviction — a CAS loser must not retain
-  // a verdict about a binding it failed to mutate (≤ one extra probe).
-  _negativeProbeCache.delete(name);
-  _positiveProbeCache.delete(name);
-  return { changed: r.changes === 1 };
+  // ADR-0042 R1 — only the window that HOLDS the row may end its session. The
+  // session CAS below protected nothing (MEASURED 24 Sep): an old window's
+  // connector and the new window's connector had captured the SAME session id, so
+  // the old one's signal ended the live window's session. The row must be anchored
+  // to MY parent (same host, pid and start), AND that anchor must be POSITIVELY
+  // DEAD (anchorLivenessVerdict: foreign host, alive, or unverifiable all refuse).
+  // Writing nothing is safe: read-time derivation already shows a dead anchor dead.
+  try {
+    if (!ownAnchor) return { changed: false };
+    const hostId = getOwnHostId();
+    const row = db
+      .prepare("SELECT host_id, agent_pid, agent_pid_start FROM agents WHERE name = ? AND session_id = ?")
+      .get(name, expectedSessionId) as
+      | { host_id: string | null; agent_pid: number | null; agent_pid_start: string | null }
+      | undefined;
+    if (!row) return { changed: false };
+    if (
+      !hostId ||
+      row.host_id !== hostId ||
+      row.agent_pid !== ownAnchor.pid ||
+      row.agent_pid_start !== ownAnchor.startedAt
+    ) {
+      return { changed: false };
+    }
+    if (anchorLivenessVerdict(row, hostId) !== "dead") return { changed: false };
+    const r = db.prepare(
+      "UPDATE agents SET session_id = NULL, agent_status = 'idle', busy_expires_at = NULL, " +
+      "signal_received_at = ?, signal_kind = ?, " +
+      "last_alive = NULL, agent_pid = NULL, agent_pid_start = NULL " +
+      // CAS on the ANCHOR we just verified as well as the session, so a rebind
+      // between the check and this write makes it a no-op.
+      "WHERE name = ? AND session_id = ? AND host_id = ? AND agent_pid = ? AND agent_pid_start = ?"
+    ).run(nowMs, signalKind, name, expectedSessionId, hostId, ownAnchor.pid, ownAnchor.startedAt);
+    return { changed: r.changes === 1 };
+  } finally {
+    // v2.23.x #140 — the FIFTH site, and the one four reviewers missed because it
+    // was BRACED (looked correct). Same defect as the four unbraced ones: on a CAS
+    // loser (r.changes===0 — a concurrent rebind already moved the session/anchor)
+    // the guarded `if` left a stale NEGATIVE entry intact, so the fresh live row
+    // read `dead`, or its argv-scan alive signal was SUPPRESSED (computeLiveness-
+    // Verdict returns at the negative-cache hit before reaching the argv probe),
+    // until the ~5s TTL. UNCONDITIONAL dual eviction — a CAS loser must not retain
+    // a verdict about a binding it failed to mutate (≤ one extra probe). ADR-0042
+    // R1 added early no-write returns, so the eviction lives in `finally`: EVERY
+    // path, written or not, evicts.
+    _negativeProbeCache.delete(name);
+    _positiveProbeCache.delete(name);
+  }
 }
 
 /**
@@ -3932,7 +3966,6 @@ export function registerAgent(
 
   const existing = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord | undefined;
 
-  let agentWithStatus: AgentWithStatus;
   let plaintext_token: string | null = null;
   // ADR-0005: one-time registration-recovery handle — set ONLY on first register.
   let registration_recovery: string | null = null;
@@ -4110,21 +4143,6 @@ export function registerAgent(
       markEstablished(name);
     }
 
-    agentWithStatus = toAgentWithStatus({
-      ...existing,
-      role,
-      last_seen: timestamp,
-      token_hash: newHash,
-      session_id,
-      description: newDescription,
-      terminal_title_ref: newTitleRef,
-      host_shell_pids: newHostShellPids,
-      host_id: newHostId,
-      agent_status: newAgentStatus,
-      auth_state: newAuthState,
-      recovery_token_hash: newRecoveryHash,
-      revoked_at: newRevokedAt,
-    });
   } else {
     // First registration — always generate a token.
     plaintext_token = generateToken();
@@ -4166,26 +4184,6 @@ export function registerAgent(
       if (cap) insertCap.run(name, cap);
     }
 
-    agentWithStatus = toAgentWithStatus({
-      id,
-      name,
-      role,
-      capabilities: capsJson,
-      last_seen: timestamp,
-      created_at: timestamp,
-      token_hash,
-      session_id,
-      description,
-      agent_status: "idle", // v2.1.3 (I6)
-      managed,
-      terminal_title_ref: titleRef,
-      // ADR-0002 (codex #114 blocker): the INSERT above persists the declared
-      // class, but this in-memory row is projected straight to the FIRST
-      // register_agent response — omitting it made toAgentWithStatus read
-      // row.class===undefined → normalizeAgentClass → 'unclassified'. Mirror the
-      // persisted value so the initial response matches the row + next read.
-      class: options.class ?? null,
-    });
   }
 
   // v2.23.x #140 — registration CREATES (first INSERT) or REPLACES (re-register
@@ -4200,6 +4198,18 @@ export function registerAgent(
   // paths throw above → no identity change → nothing stale to clear.)
   _negativeProbeCache.delete(name);
   _positiveProbeCache.delete(name);
+
+  // ADR-0041 R1: the returned agent is READ BACK from what was written, never
+  // projected in memory. The projections this replaces had drifted from the SQL:
+  // a first register omitted server_version / cli_profile / host_id /
+  // host_shell_pids that the INSERT writes, and a re-register echoed the OLD
+  // server_version and cli_profile while the UPDATE wrote new ones. One read
+  // cannot drift from the write it follows.
+  const writtenRow = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord | undefined;
+  if (!writtenRow) {
+    throw new Error(`registerAgent: no row for "${name}" after a successful write (concurrent unregister?)`);
+  }
+  const agentWithStatus = toAgentWithStatus(writtenRow);
 
   // v2.0 beta.1 (Codex HIGH 4): auto-assign queued tasks at the DB layer so
   // every caller of registerAgent (tool handler, future hooks, direct scripts)
@@ -5088,6 +5098,16 @@ function positiveConfirmationISO(name: string): string | null {
   return new Date(at).toISOString();
 }
 
+/**
+ * ADR-0041 R1 — one agent, projected from what is stored NOW. Callers that write
+ * more than once (register_agent writes the row, then the anchor) build their
+ * receipt from this AFTER the last write, so it cannot predate one.
+ */
+export function getAgentWithStatus(name: string): AgentWithStatus | undefined {
+  const row = getDb().prepare("SELECT * FROM agents WHERE name = ?").get(name) as AgentRecord | undefined;
+  return row ? toAgentWithStatus(row) : undefined;
+}
+
 export function getAgents(role?: string): AgentWithStatus[] {
   const db = getDb();
   let rows: AgentRecord[];
@@ -5768,6 +5788,23 @@ export function countMatchingMessages(
   return (db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE ${where}`).get(...params) as { c: number }).c;
 }
 
+/**
+ * ADR-0041 — what a drain actually DID, so a receipt can report the effect and
+ * never the request.
+ */
+export interface DrainEffect {
+  /** False when agents.session_id is NULL: the honest "unbound" state (ADR-0041 R3). */
+  sessionBound: boolean;
+  /** Rows whose per-session read mark (read_by_session) changed. Always 0 when unbound. */
+  marked: number;
+  /** True when the resolve UPDATE ran (ack on a pending drain with rows). Every returned row is then resolved. */
+  resolveRan: boolean;
+  /** Rows whose resolved_at this call set (not rows returned). */
+  resolved: number;
+  /** Rows this call DELIVERED (a non-peek drain that returned them and stamped read_at / last_drain_at). 0 on a peek, a read-status browse, or an empty result. */
+  delivered: number;
+}
+
 export function getMessages(
   agentName: string,
   status: string,
@@ -5783,6 +5820,19 @@ export function getMessages(
   // resolved reads (those never mark, so they never resolve).
   ack = false,
 ): MessageRecord[] {
+  return getMessagesWithEffect(agentName, status, limit, peek, sinceIso, lane, ack).rows;
+}
+
+/** getMessages plus the DrainEffect: the one the get_messages receipt is built from (ADR-0041 R1). */
+export function getMessagesWithEffect(
+  agentName: string,
+  status: string,
+  limit: number,
+  peek = false,
+  sinceIso: string | null = null,
+  lane: "all" | "direct" | "capability" = "all",
+  ack = false,
+): { rows: MessageRecord[]; effect: DrainEffect } {
   const db = getDb();
   // No touchAgent here — observation is not liveness (v1.3 presence fix)
 
@@ -5815,8 +5865,18 @@ export function getMessages(
   // stays `peek=false` so consume-once semantics are preserved for
   // single-shot workers (v2.0 final #6).
   let drainedRows = 0;
+  let mailboxChanged = false;
   let outboxId = 0;
-  if (!peek && rows.length > 0 && currentSession && status !== "read") {
+  let resolveRan = false;
+  let resolvedRows = 0;
+  // ADR-0041 R2: this block used to be gated on `currentSession` as a WHOLE, so a
+  // NULL agents.session_id (force-mint and rotate clear it by design) silently
+  // skipped the resolve, read_at and last_drain_at too, and the handler still
+  // reported `acked`. Only read_by_session is per-session. resolved_at (RESOLVED)
+  // and read_at + last_drain_at (DELIVERED) are AGENT-level and are stamped
+  // whenever the model's drain returned rows. Delivery is never blocked by
+  // identity bookkeeping.
+  if (!peek && rows.length > 0 && status !== "read") {
     const ids = rows.map((r) => r.id);
     const placeholders = ids.map(() => "?").join(",");
     // v2.12.0 — resolve-on-ack. Only the PENDING drain path resolves: it is
@@ -5854,16 +5914,36 @@ export function getMessages(
     // sender must fall back to an explicit ack when the recipient is off that path.
     const readStampedAt = now();
     const tx = db.transaction(() => {
-      const r = db.prepare(
-        `UPDATE messages SET status = 'read', read_by_session = ?, read_at = COALESCE(read_at, ?) WHERE id IN (${placeholders})`
-      ).run(currentSession, readStampedAt, ...ids);
-      drainedRows = r.changes;
-      if (doResolve) {
+      if (currentSession) {
+        const r = db.prepare(
+          `UPDATE messages SET status = 'read', read_by_session = ?, read_at = COALESCE(read_at, ?) WHERE id IN (${placeholders})`
+        ).run(currentSession, readStampedAt, ...ids);
+        drainedRows = r.changes;
+      } else {
+        // Unbound (ADR-0041 R3): no per-session read to record, so read_by_session
+        // and the legacy `status` column are left alone and the mail re-pends on the
+        // next drain (the handler says so). The agent-level delivery marker is stamped.
         db.prepare(
-          `UPDATE messages SET resolved_at = ? WHERE id IN (${placeholders}) AND resolved_at IS NULL`
-        ).run(resolvedAt, ...ids);
+          `UPDATE messages SET read_at = COALESCE(read_at, ?) WHERE id IN (${placeholders})`
+        ).run(readStampedAt, ...ids);
       }
-      if (drainedRows > 0) {
+      if (doResolve) {
+        resolvedRows = db.prepare(
+          `UPDATE messages SET resolved_at = ? WHERE id IN (${placeholders}) AND resolved_at IS NULL`
+        ).run(resolvedAt, ...ids).changes;
+        resolveRan = true;
+      }
+      if (!currentSession) {
+        // DELIVERED is agent-level: a drain that returned rows is a drain, bound or not.
+        updateAgentMetadata(agentName, { last_drain_at: now() });
+      }
+      // THE MAILBOX CHANGED iff this tx moved mail out of a pending set: a
+      // per-session read-mark (bound) OR a resolve (bound or not). Round-2 audit:
+      // gating on drainedRows alone, which only a bound session produces, gave
+      // subscribers ZERO events for an unbound ack that really emptied the queue.
+      // One row per drain either way, so a bound drain+ack still emits exactly one.
+      mailboxChanged = drainedRows > 0 || resolvedRows > 0;
+      if (mailboxChanged) {
         const ins = db.prepare(
           "INSERT INTO inbox_events (agent_name, reason, created_at, source_pid) VALUES (?, ?, ?, ?)"
         ).run(agentName, "message_read", now(), process.pid);
@@ -5894,8 +5974,9 @@ export function getMessages(
   // v2.5.0 Tether Phase 1 — Part S — fire the inbox-changed event when
   // pending → read, so subscribers see the unread count drop in real time.
   // Skipped on peek (no mutation) and skipped when zero rows transitioned
-  // (e.g. status='all' / 'read' filters never mark anything new).
-  if (drainedRows > 0) {
+  // (e.g. status='all' / 'read' filters never mark anything new). Gated on the
+  // same mailboxChanged as the outbox row, so the bus and the durable tail agree.
+  if (mailboxChanged) {
     // Post-commit NOTIFICATION only (a side-channel wake, not durable evidence) — the
     // durable last_drain_at marker is written INSIDE the tx above, atomically with the
     // drain (#60 / codex #200), so it can never lag or be lost relative to the drain.
@@ -5990,7 +6071,16 @@ export function getMessages(
   }
 
   // v1.7: decrypt content field on read (safe-no-op for plaintext rows)
-  return rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content }));
+  return {
+    rows: rows.map((r) => ({ ...r, content: decryptContent(r.content) ?? r.content })),
+    effect: {
+      sessionBound: !!currentSession,
+      marked: drainedRows,
+      resolveRan,
+      resolved: resolvedRows,
+      delivered: !peek && status !== "read" ? rows.length : 0,
+    },
+  };
 }
 
 /**

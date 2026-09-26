@@ -21,6 +21,7 @@ import {
   setAgentLivenessAnchor,
   NameCollisionActiveError,
   isNameActivelyHeld,
+  getAgentWithStatus,
   resolveAvailableInstanceName,
 } from "../db.js";
 import { fireWebhooks } from "../webhooks.js";
@@ -319,6 +320,12 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     }
   }
 
+  // ADR-0041 R1 (Codex round 1): the receipt is read back AFTER every write,
+  // including the anchor writes just above. registerAgent's own read-back predates
+  // them, so a first register with a live agent_pid used to report liveness
+  // "unknown" and host_id null for a row that is alive on this host.
+  const receiptAgent = getAgentWithStatus(agent.name) ?? agent;
+
   // v2.8 wire-emit-sites — register_agent didn't broadcast pre-v2.8, so
   // a fresh registration left the dashboard in the dark until the decay
   // broadcaster's next tick (up to 30s). Fire an immediate
@@ -388,7 +395,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
             // first successful auth.
             ...(registration_recovery ? { registration_recovery } : {}),
             success: true,
-            agent,
+            agent: receiptAgent,
             // v2.26 auto-suffix: when on_name_collision="suffix" assigned a
             // relay instance name, surface it UNMISSABLY + warn that it is not
             // restart-stable (an order/occupancy-dependent handle that LOOKS

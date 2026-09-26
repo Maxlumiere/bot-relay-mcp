@@ -4,6 +4,7 @@
 // See LICENSE for full terms.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { ownDeadWindow, OWN_DEAD_ANCHOR } from "./_helpers/own-dead-window.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -109,6 +110,7 @@ describe("v2.1.3 round-trip — re-register after markAgentOffline resumes clean
 
     // Terminal closes → v2.15.2 signal path stores a NEUTRAL 'idle' (no sticky
     // terminal status) + clears the anchor + releases the session.
+    ownDeadWindow("respawn");
     performAutoUnregister("respawn", sidA, "SIGTERM");
 
     const offlineRow = getAgentAuthData("respawn");
@@ -137,6 +139,7 @@ describe("v2.1.3 audit-log forensic trail", () => {
     const r = registerAgent("forensic-target", "r", []);
     const sid = r.agent.session_id!;
 
+    ownDeadWindow("forensic-target");
     performAutoUnregister("forensic-target", sid, "SIGINT");
 
     const entries = getAuditLog("forensic-target", "stdio.session_ended_on_signal", 10);

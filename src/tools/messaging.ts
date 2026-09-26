@@ -5,7 +5,7 @@
 
 import {
   sendMessage,
-  getMessages,
+  getMessagesWithEffect,
   countMatchingMessages,
   getMessagesSummary,
   getOutstanding,
@@ -223,7 +223,7 @@ export function handleGetMessages(input: GetMessagesInput) {
     sinceIso,
     input.lane ?? "all",
   );
-  const raw = getMessages(
+  const { rows: raw, effect } = getMessagesWithEffect(
     input.agent_name,
     input.status,
     input.limit,
@@ -285,10 +285,38 @@ export function handleGetMessages(input: GetMessagesInput) {
     }
   }
 
-  // v2.12.0 — surface an `acked` confirmation ONLY when ack actually took
-  // effect (true + the drain path). Omitted otherwise so an ack=false call is
-  // byte-identical to pre-v2.12.0 output (back-compat contract).
-  const ackEffective = (input.ack ?? false) === true && input.status === "pending";
+  // v2.12.0 — the ack receipt is present only for an ack on the pending drain, so
+  // an ack=false call is byte-identical to pre-v2.12.0 output (back-compat).
+  // ADR-0041 R1: its VALUES report the EFFECT, never the request. It used to say
+  // `acked: true, resolved_count: messages.length` while a NULL session had
+  // skipped the resolve entirely. Now `acked` is true only when the resolve UPDATE
+  // ran (every returned row is then resolved), or there was nothing to ack.
+  // `resolved_count` is the rows that UPDATE changed.
+  const ackRequested = (input.ack ?? false) === true && input.status === "pending";
+  const acked = messages.length === 0 || effect.resolveRan;
+  // ADR-0041 R3: a NULL session is the honest "unbound" state. The drain delivered
+  // and stamped the agent-level axes, but there is no per-session read mark, so the
+  // same mail comes back next time unless it is resolved. Say so, and name the remedy.
+  // Codex round 1: the warning states only what THIS call did. A peek records
+  // nothing, and a drain that returned no rows has nothing to record.
+  const whatHappened =
+    input.peek === true
+      ? "This was a peek, so nothing was recorded."
+      : effect.delivered === 0
+        ? "No mail was returned, so there was nothing to record."
+        : `${effect.delivered} message(s) were delivered: read_at and last_drain_at were stamped` +
+          (effect.resolved > 0 ? `, and ${effect.resolved} resolved` : "") +
+          `, but no per-session read mark was written, so unresolved mail is returned again on the next drain.`;
+  const unboundWarning = effect.sessionBound
+    ? undefined
+    : {
+        code: "session_unbound",
+        message:
+          `${input.agent_name} has no current session (agents.session_id is NULL, e.g. after a token ` +
+          `rotation or force-mint). ${whatHappened} ` +
+          `Remedy: re-register this agent (restart its window so the SessionStart hook registers, or call ` +
+          `register_agent), and resolve handled mail with ack=true or resolve_messages.`,
+      };
 
   return {
     content: [
@@ -315,7 +343,16 @@ export function handleGetMessages(input: GetMessagesInput) {
             since: input.since ?? null,
             since_bound: sinceIso,
             ...(hint ? { hint } : {}),
-            ...(ackEffective ? { acked: true, resolved_count: messages.length } : {}),
+            ...(ackRequested
+              ? {
+                  acked,
+                  resolved_count: effect.resolved,
+                  ...(acked
+                    ? {}
+                    : { ack_not_applied: "the resolve did not run for the returned rows; nothing was acked" }),
+                }
+              : {}),
+            ...(unboundWarning ? { warning: unboundWarning } : {}),
           },
           null,
           2

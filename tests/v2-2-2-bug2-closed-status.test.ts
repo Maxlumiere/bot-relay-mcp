@@ -20,6 +20,7 @@
  *         `.badge-closed` style.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { ownDeadWindow, OWN_DEAD_ANCHOR } from "./_helpers/own-dead-window.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -97,6 +98,7 @@ describe("v2.2.2 BUG2 — closed agent_status", () => {
     const row = getDb()
       .prepare("SELECT session_id FROM agents WHERE name = ?")
       .get("sigint-target") as { session_id: string };
+    ownDeadWindow("sigint-target");
     performAutoUnregister("sigint-target", row.session_id, "SIGINT");
     const after = getDb()
       .prepare("SELECT agent_status, agent_pid, signal_kind FROM agents WHERE name = ?")
