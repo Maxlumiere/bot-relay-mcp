@@ -5878,7 +5878,6 @@ export function pendingWindowReport(
 export const MESSAGE_PRIORITY_RANK_SQL =
   "CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END";
 
-
 export function getMessages(
   agentName: string,
   status: string,
