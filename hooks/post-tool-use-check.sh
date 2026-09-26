@@ -276,7 +276,7 @@ KNOWN = ("critical", "high", "normal", "low")
 RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3, "unknown": 4}
 def prio(p):
     return p if p in KNOWN else "unknown"
-recs, total, top_name, newest = [], None, None, None
+recs, total, top_name, newest, fpr, windowed = [], None, None, None, None, False
 if src == "http":
     payload = None
     for line in raw.strip().splitlines():
@@ -302,6 +302,8 @@ if src == "http":
     # pending mail is always inside the returned page.
     if isinstance(data.get("total_pending"), int):
         total = data["total_pending"]
+    # A page drawn through ANY window is never the full set, whatever its size.
+    windowed = data.get("since_bound") is not None
 elif src == "sqlite":
     # JSON from the read-only sqlite reader: no delimiter a sender can forge.
     try:
@@ -309,6 +311,7 @@ elif src == "sqlite":
         total = int(d["total"])
         top_name = prio(d.get("top")) if d.get("top") is not None else None
         newest = d.get("newest")
+        fpr = d.get("fpr") if isinstance(d.get("fpr"), str) else None
         for r in d["rows"]:
             recs.append((str(r["id"]), str(r["from_agent"]), prio(r["priority"]), str(r["created_at"])))
     except Exception:
@@ -324,7 +327,8 @@ if total is None:
     count = ("%d+" % n) if n >= lim else ("%d" % n)
 else:
     count = "%d" % total
-fpr = hashlib.sha256("\n".join(sorted(r[0] for r in recs)).encode("utf-8", "replace")).hexdigest()[:32]
+def fingerprint(ids):
+    return hashlib.sha256("\n".join(sorted(ids)).encode("utf-8", "replace")).hexdigest()[:32]
 # AGGREGATES COME FROM THE FULL SET, NEVER A PAGE (truncated is not complete).
 # The top priority and the newest arrival describe ALL pending mail. The sqlite
 # reader computes them over the full canonical set. An HTTP page that holds every
@@ -332,17 +336,27 @@ fpr = hashlib.sha256("\n".join(sorted(r[0] for r in recs)).encode("utf-8", "repl
 # left out, whatever its ordering, so the full-set reader answers (exit 3, the
 # caller re-runs with AGG_KNOWN=1), and with no reader both read as unknown.
 if src == "http":
-    complete = (n >= total) if total is not None else (n < lim)
+    complete = (not windowed) and ((n >= total) if total is not None else (n < lim))
     if complete:
         top_name = min((r[2] for r in recs), key=lambda p: RANK[p])
         newest = max(r[3] for r in recs)
+        fpr = fingerprint(r[0] for r in recs)
     elif os.environ.get("AGG_KNOWN") != "1":
         sys.exit(3)
     else:
         top_name = prio(os.environ.get("AGG_TOP") or "unknown")
         newest = os.environ.get("AGG_NEWEST") or None
+        fpr = os.environ.get("AGG_FPR") or None
+        if fpr is None:
+            # No full-set reader: the page ids plus the full COUNT, so an arrival or a
+            # departure beyond the page still changes the fingerprint.
+            fpr = fingerprint([r[0] for r in recs] + ["total=%s" % total])
 elif top_name is None:
     top_name = "unknown"
+# THE DAMPER FINGERPRINT COVERS THE FULL PENDING SET, never only a page: a new
+# arrival that sorts outside the page must change it, or the notice stays damped.
+if fpr is None:
+    fpr = fingerprint(r[0] for r in recs)
 # The damper 120s remind applies to anything high or above, and to an UNKNOWN top:
 # a set whose top cannot be established is reminded as if it were high, never damped
 # on the assumption that it is not.
@@ -409,6 +423,10 @@ print(json.dumps({
       "status": "pending",
       "limit": int(os.environ["LIM"]),
       "peek": True,
+      # The canonical pending set has NO window. Explicit, never the server default:
+      # a windowed page silently drops mail a prior session read, and would then be
+      # mistaken for the whole set.
+      "since": "all",
       "agent_token": os.environ["AT"],
     },
   },
@@ -428,22 +446,27 @@ print(json.dumps({
   rc=$?
   if [ $rc -eq 3 ]; then
     # A partial page: the top priority and newest arrival come from the full-set reader.
-    local agg agg_top agg_newest
+    local agg agg_top agg_newest agg_fpr rest
     agg=$(sqlite_aggregates)
-    agg_top="${agg%%$'\x1f'*}"
-    agg_newest=""
-    case "$agg" in *$'\x1f'*) agg_newest="${agg#*$'\x1f'}" ;; esac
+    agg_top="" agg_newest="" agg_fpr=""
+    if [ -n "$agg" ]; then
+      agg_top="${agg%%$'\x1f'*}"
+      rest="${agg#*$'\x1f'}"
+      agg_newest="${rest%%$'\x1f'*}"
+      agg_fpr="${rest#*$'\x1f'}"
+    fi
     out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" AGG_KNOWN=1 \
-      AGG_TOP="$agg_top" AGG_NEWEST="$agg_newest" python3 -c "$NOTICE_PY" 2>/dev/null)
+      AGG_TOP="$agg_top" AGG_NEWEST="$agg_newest" AGG_FPR="$agg_fpr" python3 -c "$NOTICE_PY" 2>/dev/null)
     rc=$?
   fi
   printf '%s' "$out"
   return $rc
 }
 
-# The full-set aggregates, "TOP<US>NEWEST", from the read-only reader below (COUNT,
-# MIN of the shared rank, MAX(created_at) over the canonical set); empty when the
-# DB cannot be read, and the notice then says "unknown".
+# The full-set aggregates, "TOP<US>NEWEST<US>FPR", from the read-only reader below
+# (MIN of the shared rank, MAX(created_at), and the fingerprint of every pending id,
+# over the canonical set); empty when the DB cannot be read, and the notice then
+# says "unknown".
 sqlite_aggregates() {
   { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ]; } || return 0
   AN="$AGENT_NAME" DBP="$DB_PATH" LIM=1 python3 -c "$SQLITE_PEEK_PY" 2>/dev/null |
@@ -452,7 +475,8 @@ try:
     d = json.load(sys.stdin)
     t = d.get("top")
     v = d.get("newest")
-    sys.stdout.write((t if isinstance(t, str) else "") + "\x1f" + (v if isinstance(v, str) else ""))
+    f = d.get("fpr")
+    sys.stdout.write((t if isinstance(t, str) else "") + "\x1f" + (v if isinstance(v, str) else "") + "\x1f" + (f if isinstance(f, str) else ""))
 except Exception:
     pass' 2>/dev/null
 }
@@ -469,7 +493,7 @@ except Exception:
 # computed over ALL pending mail; the page is ordered priority-first like
 # get_messages. Exit 1 = could not read (never rendered as "no mail").
 SQLITE_PEEK_PY='
-import json, os, sqlite3, sys, urllib.parse
+import hashlib, json, os, sqlite3, sys, urllib.parse
 an = os.environ["AN"]
 lim = int(os.environ.get("LIM", "20"))
 try:
@@ -491,17 +515,20 @@ def run(where, k):
     rows = con.execute(
         "SELECT id, from_agent, priority, created_at FROM messages WHERE " + where +
         " ORDER BY " + RANK + ", created_at DESC LIMIT ?", p + [lim]).fetchall()
-    return total, toprank, newest, rows
+    # The damper fingerprint covers the FULL pending id set, not the page.
+    ids = sorted(r[0] for r in con.execute("SELECT id FROM messages WHERE " + where, p).fetchall())
+    fpr = hashlib.sha256("\n".join(ids).encode("utf-8", "replace")).hexdigest()[:32]
+    return total, toprank, newest, rows, fpr
 try:
     try:
-        total, toprank, newest, rows = run(*CANON)
+        total, toprank, newest, rows, fpr = run(*CANON)
     except sqlite3.OperationalError:
-        total, toprank, newest, rows = run(*LEGACY)
+        total, toprank, newest, rows, fpr = run(*LEGACY)
 except Exception:
     sys.exit(1)
 if not total:
     sys.exit(0)
-print(json.dumps({"total": total, "top": NAMES.get(toprank, "unknown"), "newest": newest,
+print(json.dumps({"total": total, "top": NAMES.get(toprank, "unknown"), "newest": newest, "fpr": fpr,
                   "rows": [{"id": r[0], "from_agent": r[1], "priority": r[2], "created_at": r[3]} for r in rows]}))
 '
 

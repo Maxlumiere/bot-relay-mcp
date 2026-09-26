@@ -55,7 +55,7 @@ delete process.env.RELAY_ALLOW_LEGACY;
 delete process.env.RELAY_HTTP_SECRET;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { closeDb, getDb, sendMessage: dbSend } = await import("../src/db.js");
+const { closeDb, getDb, sendMessage: dbSend, registerAgent: dbRegister } = await import("../src/db.js");
 
 let server: HttpServer;
 let port: number;
@@ -678,5 +678,56 @@ describe("#280 Codex round 3 — priority is an allowlisted literal; newest is o
     await send("a37-n-sender3", "a37-n-recv3", "only one", s);
     const ctx = contextOf(await runHook({ ...httpEnv("a37-n-recv3", t), RELAY_DB_PATH: path.join(TEST_DB_DIR, "absent.db") }));
     expect(ctx).toMatch(/newest arrived \d+s ago/);
+  });
+});
+
+describe("#280 final round — the HTTP peek is unwindowed, and the damper fingerprints the FULL pending set", () => {
+  // Registration and seeding go through the DB layer: late in this file the relay's
+  // per-agent HTTP rate limit refuses register_agent / send_message. Only the READ
+  // under test goes over HTTP.
+  const reg = (name: string) => dbRegister(name, "r", []).plaintext_token;
+  it("P1: HTTP peek passes since='all': an unresolved high a PRIOR session read 2 days ago is counted, and is the top", async () => {
+    reg("a37-f1-sender");
+    const t = reg("a37-f1-recv");
+    dbSend("a37-f1-sender", "a37-f1-recv", "old high, read by a prior session", "high");
+    dbSend("a37-f1-sender", "a37-f1-recv", "fresh normal", "normal");
+    getDb()
+      .prepare("UPDATE messages SET created_at = ?, read_by_session = 'prior-session', status = 'read' WHERE to_agent = ? AND priority = 'high'")
+      .run(new Date(Date.now() - 2 * 86_400_000).toISOString(), "a37-f1-recv");
+    const ctx = contextOf(await runHook(httpEnv("a37-f1-recv", t)));
+    expect(ctx).toMatch(/^relay: 2 unread for a37-f1-recv/);
+    expect(ctx).toMatch(/highest priority: high/);
+  });
+
+  async function newArrivalBeyondThePage(env: Record<string, string | undefined>, recv: string, sender: string) {
+    for (let i = 0; i < 20; i++) dbSend(sender, recv, `normal ${i}`, "normal");
+    const first = await runHook({ ...env, RELAY_HOOK_NOTICE_REMIND_SECS: undefined });
+    expect(contextOf(first), "precondition: the first notice").toMatch(/^relay: 20 unread/);
+    // A new LOW message ranks after 20 normals, so it lies OUTSIDE a 20-row page.
+    dbSend(sender, recv, "a new low one", "low");
+    return runHook({ ...env, RELAY_HOOK_NOTICE_REMIND_SECS: undefined });
+  }
+
+  it("P2 sqlite: a new arrival outside the page changes the fingerprint, so the damper lets the notice through", async () => {
+    reg("a37-f2-sender");
+    reg("a37-f2-recv");
+    const second = await newArrivalBeyondThePage({ RELAY_AGENT_NAME: "a37-f2-recv", RELAY_DB_PATH: TEST_DB_PATH }, "a37-f2-recv", "a37-f2-sender");
+    expect(contextOf(second)).toMatch(/^relay: 21 unread/);
+  });
+
+  it("P2 HTTP: the same, on the HTTP path", async () => {
+    reg("a37-f3-sender");
+    const t = reg("a37-f3-recv");
+    const second = await newArrivalBeyondThePage(httpEnv("a37-f3-recv", t), "a37-f3-recv", "a37-f3-sender");
+    expect(contextOf(second)).toMatch(/^relay: 21 unread/);
+  });
+
+  it("INNOCENT TWIN: the SAME full set twice is still damped (the fingerprint is stable)", async () => {
+    reg("a37-f4-sender");
+    reg("a37-f4-recv");
+    for (let i = 0; i < 3; i++) dbSend("a37-f4-sender", "a37-f4-recv", `n ${i}`, "normal");
+    const env = { RELAY_AGENT_NAME: "a37-f4-recv", RELAY_DB_PATH: TEST_DB_PATH, RELAY_HOOK_NOTICE_REMIND_SECS: undefined };
+    expect(contextOf(await runHook(env))).toMatch(/^relay: 3 unread/);
+    expect((await runHook(env)).stdout).toBe("");
   });
 });
