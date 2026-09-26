@@ -4,6 +4,20 @@
 // See LICENSE for full terms.
 
 /**
+ * TRIPWIRE, NOT THE GUARD (ADR-0046). The real enforcement is behavioural:
+ * tests/adr-0046-seq-metamorphic.test.ts scrambles seq/epoch (all NULL, random,
+ * reversed) and requires every decision surface to be identical. This file is a
+ * cheap early warning for ACCIDENTAL drift by an honest builder, and is audited only
+ * for false alarms.
+ *
+ * KNOWN LIMITS, by design (deliberate evasion, not drift; the metamorphic test
+ * makes them irrelevant, so they are NOT chased here):
+ *   - seq reached through a view, a CTE alias or a column renamed in a subquery;
+ *   - `seq IS NOT DISTINCT FROM ?`, arithmetic on seq (`seq + 0 > ?`), CAST;
+ *   - a predicate borrowed from another UNION / compound-select branch;
+ *   - SQL assembled across variables or function calls (literal parts only);
+ *   - a decision made in TypeScript on a `seq` value a query returned.
+ *
  * ADR-0044 (b) — NO DECISION MAY KEY ON `seq`.
  *
  * `messages.seq` is the OBSERVED axis. It is stamped by ANY view, including a

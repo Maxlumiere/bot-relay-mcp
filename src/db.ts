@@ -5768,6 +5768,17 @@ export function countMatchingMessages(
   return (db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE ${where}`).get(...params) as { c: number }).c;
 }
 
+/**
+ * ADR-0046 — the ONE message-priority ordering, shared by the drain, the summary
+ * and (textually, until F1 makes them one path) the PostToolUse hook's reader.
+ * The explicit ELSE ranks an out-of-domain value LAST: without it the CASE yields
+ * NULL, and SQLite sorts NULL FIRST in ascending order, so garbage outranked a
+ * real `high`. The write-side domain (v25 triggers) makes the ELSE unreachable;
+ * it stays as defence in depth.
+ */
+export const MESSAGE_PRIORITY_RANK_SQL =
+  "CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END";
+
 export function getMessages(
   agentName: string,
   status: string,
@@ -5791,7 +5802,7 @@ export function getMessages(
   const agentRow = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(agentName) as { session_id: string | null } | undefined;
   const currentSession = agentRow?.session_id ?? null;
 
-  const priorityOrder = `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
+  const priorityOrder = "ORDER BY " + MESSAGE_PRIORITY_RANK_SQL + ", created_at DESC LIMIT ?";
   // v2.7.0 external-review-flagged P1 fix — `since` filter MUST run in SQL BEFORE
   // the mark-as-read mutation below, otherwise messages older than the bound get
   // marked read silently and never resurface to this session.
@@ -6118,8 +6129,7 @@ export function getMessagesSummary(
     .get(agentName) as { session_id: string | null } | undefined;
   const currentSession = agentRow?.session_id ?? null;
 
-  const priorityOrder =
-    `ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END, created_at DESC LIMIT ?`;
+  const priorityOrder = "ORDER BY " + MESSAGE_PRIORITY_RANK_SQL + ", created_at DESC LIMIT ?";
 
   // #completeness-signal — the cheap preview now derives its WHERE from the SAME buildMessageWhere
   // SSOT as the mutating get_messages drain, instead of a hand-duplicated status branch, so the two

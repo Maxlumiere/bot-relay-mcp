@@ -253,8 +253,8 @@ sys.stdout.write(("subagent" if sub else "main") + "\x1f" + sid)
 # SRC=sqlite → stdin is rows "id<US>from<US>priority<US>created_at<US>content<RS>...".
 # Exit 1 = the read failed (caller falls back / stays CANNOT-JUDGE); exit 0 with
 # no output = empty mailbox; exit 3 = an HTTP page that does not hold every pending
-# message, so the newest arrival must come from the all-pending reader (the caller
-# re-runs with NEWEST_KNOWN=1). FPR fingerprints the unread set for the damper.
+# message, so the top priority and newest arrival must come from the full-set reader
+# (the caller re-runs with AGG_KNOWN=1). FPR fingerprints the unread set for the damper.
 # Piped rather than passed in an env var: a full get_messages response can exceed
 # Linux's 128KB per-string exec limit.
 NOTICE_PY='
@@ -325,24 +325,28 @@ if total is None:
 else:
     count = "%d" % total
 fpr = hashlib.sha256("\n".join(sorted(r[0] for r in recs)).encode("utf-8", "replace")).hexdigest()[:32]
-if top_name is None:
-    top_name = min((r[2] for r in recs), key=lambda p: RANK[p])
-# The damper 120s remind applies to anything high or above.
-top = "high" if RANK[top_name] <= 1 else "normal"
+# AGGREGATES COME FROM THE FULL SET, NEVER A PAGE (truncated is not complete).
+# The top priority and the newest arrival describe ALL pending mail. The sqlite
+# reader computes them over the full canonical set. An HTTP page that holds every
+# pending message IS the full set; a partial one proves nothing about what it
+# left out, whatever its ordering, so the full-set reader answers (exit 3, the
+# caller re-runs with AGG_KNOWN=1), and with no reader both read as unknown.
 if src == "http":
-    # The newest arrival over ALL pending. The page is priority-first, so when it
-    # does not hold every pending message a brand-new normal one can sit outside
-    # it, behind older high ones. Only a complete page may answer; otherwise the
-    # all-pending reader does, and with no reader the age is stated as unknown.
     complete = (n >= total) if total is not None else (n < lim)
     if complete:
+        top_name = min((r[2] for r in recs), key=lambda p: RANK[p])
         newest = max(r[3] for r in recs)
-    elif os.environ.get("NEWEST_KNOWN") != "1":
+    elif os.environ.get("AGG_KNOWN") != "1":
         sys.exit(3)
     else:
-        newest = os.environ.get("NEWEST") or None
-elif not newest:
-    newest = max(r[3] for r in recs)
+        top_name = prio(os.environ.get("AGG_TOP") or "unknown")
+        newest = os.environ.get("AGG_NEWEST") or None
+elif top_name is None:
+    top_name = "unknown"
+# The damper 120s remind applies to anything high or above, and to an UNKNOWN top:
+# a set whose top cannot be established is reminded as if it were high, never damped
+# on the assumption that it is not.
+top = "high" if (RANK[top_name] <= 1 or top_name == "unknown") else "normal"
 newest_first = sorted(recs, key=lambda r: r[3], reverse=True)
 # Sender names are the ONLY sender-chosen field in the notice, so they are held to
 # [a-z0-9-]; anything else shows as "unknown".
@@ -423,24 +427,32 @@ print(json.dumps({
   out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null)
   rc=$?
   if [ $rc -eq 3 ]; then
-    # A partial page: the newest arrival comes from the all-pending reader.
-    out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" NEWEST_KNOWN=1 \
-      NEWEST="$(sqlite_newest)" python3 -c "$NOTICE_PY" 2>/dev/null)
+    # A partial page: the top priority and newest arrival come from the full-set reader.
+    local agg agg_top agg_newest
+    agg=$(sqlite_aggregates)
+    agg_top="${agg%%$'\x1f'*}"
+    agg_newest=""
+    case "$agg" in *$'\x1f'*) agg_newest="${agg#*$'\x1f'}" ;; esac
+    out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" AGG_KNOWN=1 \
+      AGG_TOP="$agg_top" AGG_NEWEST="$agg_newest" python3 -c "$NOTICE_PY" 2>/dev/null)
     rc=$?
   fi
   printf '%s' "$out"
   return $rc
 }
 
-# The newest pending arrival over ALL pending mail, from the read-only reader
-# below; empty when the DB cannot be read (the notice then says "unknown").
-sqlite_newest() {
+# The full-set aggregates, "TOP<US>NEWEST", from the read-only reader below (COUNT,
+# MIN of the shared rank, MAX(created_at) over the canonical set); empty when the
+# DB cannot be read, and the notice then says "unknown".
+sqlite_aggregates() {
   { [ -n "$DB_PATH" ] && [ -f "$DB_PATH" ]; } || return 0
   AN="$AGENT_NAME" DBP="$DB_PATH" LIM=1 python3 -c "$SQLITE_PEEK_PY" 2>/dev/null |
     python3 -c 'import json, sys
 try:
-    v = json.load(sys.stdin).get("newest")
-    sys.stdout.write(v if isinstance(v, str) else "")
+    d = json.load(sys.stdin)
+    t = d.get("top")
+    v = d.get("newest")
+    sys.stdout.write((t if isinstance(t, str) else "") + "\x1f" + (v if isinstance(v, str) else ""))
 except Exception:
     pass' 2>/dev/null
 }
@@ -464,8 +476,8 @@ try:
     con = sqlite3.connect("file:" + urllib.parse.quote(os.environ["DBP"]) + "?mode=ro", uri=True, timeout=1)
 except Exception:
     sys.exit(1)
-RANK = "CASE priority WHEN \x27critical\x27 THEN 0 WHEN \x27high\x27 THEN 1 WHEN \x27normal\x27 THEN 2 WHEN \x27low\x27 THEN 3 ELSE 2 END"
-NAMES = {0: "critical", 1: "high", 2: "normal", 3: "low"}
+RANK = "CASE priority WHEN \x27critical\x27 THEN 0 WHEN \x27high\x27 THEN 1 WHEN \x27normal\x27 THEN 2 WHEN \x27low\x27 THEN 3 ELSE 4 END"
+NAMES = {0: "critical", 1: "high", 2: "normal", 3: "low", 4: "unknown"}
 # #56 canonical per-session pending predicate (the same replica stop-check.sh uses;
 # F1 replaces every hook copy with one CLI entrypoint). Legacy DBs without those
 # columns fall back to the bare status form.
@@ -489,7 +501,7 @@ except Exception:
     sys.exit(1)
 if not total:
     sys.exit(0)
-print(json.dumps({"total": total, "top": NAMES.get(toprank, "normal"), "newest": newest,
+print(json.dumps({"total": total, "top": NAMES.get(toprank, "unknown"), "newest": newest,
                   "rows": [{"id": r[0], "from_agent": r[1], "priority": r[2], "created_at": r[3]} for r in rows]}))
 '
 
