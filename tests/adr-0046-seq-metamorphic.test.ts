@@ -77,69 +77,89 @@ function seed(): void {
 
 const strip = (rows: Array<Record<string, unknown>>) => rows.map((r) => r.id);
 
-/** Every decision surface, as a comparable value. */
-function surfaces() {
+/**
+ * Every decision surface, each measured on its OWN freshly-restored fixture. A
+ * get_messages peek STAMPS seq on the rows it returns, so measuring the surfaces in
+ * sequence let an earlier one change the seq the later ones saw (round-4 audit: a
+ * hook keyed on `seq IS NOT NULL` escaped because the peek ran first). `restore`
+ * re-applies the SAME seq/epoch assignment before every surface.
+ */
+function surfaces(restore: () => void) {
   const d = db.getDb();
-  const session = (d.prepare("SELECT session_id FROM agents WHERE name = ?").get(R) as { session_id: string | null }).session_id;
-  const pc = db.pendingForSessionClause(session ?? "");
-  const canonical = (d.prepare(`SELECT id FROM messages WHERE to_agent = ? AND ${pc.sql} ORDER BY id`).all(R, ...pc.params) as Array<{
-    id: string;
-  }>).map((r) => r.id);
-  const peek = db.peekMailboxVersion(R);
-  const gm = JSON.parse(
-    handleGetMessages(GetMessagesSchema.parse({ agent_name: R, status: "pending", peek: true, limit: 100, since: "all" }) as never).content[0].text,
-  );
-  const gmDefault = JSON.parse(
-    handleGetMessages(GetMessagesSchema.parse({ agent_name: R, status: "pending", peek: true, limit: 2 }) as never).content[0].text,
-  );
-  const sum = JSON.parse(
-    handleGetMessagesSummary(GetMessagesSummarySchema.parse({ agent_name: R, status: "pending", limit: 100, since: "all" }) as never).content[0]
-      .text,
-  );
-  const inbox = db.getInboxSummary().find((r) => r.agent_name === R)!;
-  const health = db.getHealthSnapshot() as unknown as Record<string, unknown>;
-  const hook = cp.spawnSync("bash", [HOOK], {
-    input: JSON.stringify({ session_id: "44444444-4444-4444-4444-444444444444", hook_event_name: "PostToolUse" }),
-    encoding: "utf-8",
-    timeout: 15_000,
-    env: { PATH: process.env.PATH ?? "", HOME, RELAY_AGENT_NAME: R, RELAY_DB_PATH: DB_PATH, RELAY_HOOK_NOTICE_REMIND_SECS: "0" },
-  });
-  const notice = hook.stdout ? JSON.parse(hook.stdout).hookSpecificOutput.additionalContext : "";
-  return {
-    canonical,
-    unread: peek.total_unread_count,
-    total: peek.total_messages_count,
-    getMessages: { ids: strip(gm.messages), count: gm.count, total_pending: gm.total_pending, has_more: gm.has_more },
-    getMessagesPage: { ids: strip(gmDefault.messages), has_more: gmDefault.has_more, total_pending: gmDefault.total_pending },
-    summary: { ids: strip(sum.summaries), total: sum.total },
-    inbox: { pending: inbox.pending_count, unread: inbox.unread_count },
-    health: health.message_count_pending ?? health.messages_pending ?? null,
-    notice,
+  const measure = <T,>(f: () => T): T => {
+    restore();
+    return f();
   };
+  const canonical = measure(() => {
+    const session = (d.prepare("SELECT session_id FROM agents WHERE name = ?").get(R) as { session_id: string | null }).session_id;
+    const pc = db.pendingForSessionClause(session ?? "");
+    return (d.prepare(`SELECT id FROM messages WHERE to_agent = ? AND ${pc.sql} ORDER BY id`).all(R, ...pc.params) as Array<{ id: string }>).map(
+      (r) => r.id,
+    );
+  });
+  const peek = measure(() => {
+    const p = db.peekMailboxVersion(R);
+    return { unread: p.total_unread_count, total: p.total_messages_count };
+  });
+  const getMessages = measure(() => {
+    const gm = JSON.parse(
+      handleGetMessages(GetMessagesSchema.parse({ agent_name: R, status: "pending", peek: true, limit: 100, since: "all" }) as never).content[0].text,
+    );
+    return { ids: strip(gm.messages), count: gm.count, total_pending: gm.total_pending, has_more: gm.has_more };
+  });
+  const getMessagesPage = measure(() => {
+    const gm = JSON.parse(handleGetMessages(GetMessagesSchema.parse({ agent_name: R, status: "pending", peek: true, limit: 2 }) as never).content[0].text);
+    return { ids: strip(gm.messages), has_more: gm.has_more, total_pending: gm.total_pending };
+  });
+  const summary = measure(() => {
+    const sum = JSON.parse(
+      handleGetMessagesSummary(GetMessagesSummarySchema.parse({ agent_name: R, status: "pending", limit: 100, since: "all" }) as never).content[0].text,
+    );
+    return { ids: strip(sum.summaries), total: sum.total };
+  });
+  const inbox = measure(() => {
+    const row = db.getInboxSummary().find((r) => r.agent_name === R)!;
+    return { pending: row.pending_count, unread: row.unread_count };
+  });
+  const health = measure(() => (db.getHealthSnapshot() as unknown as Record<string, unknown>).message_count_pending ?? null);
+  const notice = measure(() => {
+    const hook = cp.spawnSync("bash", [HOOK], {
+      input: JSON.stringify({ session_id: "44444444-4444-4444-4444-444444444444", hook_event_name: "PostToolUse" }),
+      encoding: "utf-8",
+      timeout: 15_000,
+      env: { PATH: process.env.PATH ?? "", HOME, RELAY_AGENT_NAME: R, RELAY_DB_PATH: DB_PATH, RELAY_HOOK_NOTICE_REMIND_SECS: "0" },
+    });
+    return hook.stdout ? JSON.parse(hook.stdout).hookSpecificOutput.additionalContext : "";
+  });
+  return { canonical, peek, getMessages, getMessagesPage, summary, inbox, health, notice };
 }
 
 type Scramble = "null" | "random" | "reversed";
-function scramble(kind: Scramble): void {
+/** A FIXED seq/epoch assignment for a scramble kind, re-applied before every surface. */
+function assignment(kind: Scramble): () => void {
   const d = db.getDb();
   const ids = (d.prepare("SELECT id FROM messages ORDER BY created_at").all() as Array<{ id: string }>).map((r) => r.id);
+  const vals = ids.map((id, i): [number | null, string | null, string] =>
+    kind === "null"
+      ? [null, null, id]
+      : kind === "random"
+        ? [Math.floor(Math.random() * 1_000_000), `ep-${Math.random()}`, id]
+        : [ids.length - i, `ep-rev-${ids.length - i}`, id],
+  );
   const upd = d.prepare("UPDATE messages SET seq = ?, epoch = ? WHERE id = ?");
-  ids.forEach((id, i) => {
-    if (kind === "null") upd.run(null, null, id);
-    else if (kind === "random") upd.run(Math.floor(Math.random() * 1_000_000), `ep-${Math.random()}`, id);
-    else upd.run(ids.length - i, `ep-rev-${ids.length - i}`, id);
-  });
+  return () => {
+    for (const v of vals) upd.run(...v);
+  };
 }
 
 describe("ADR-0046 — no decision keys on seq: scrambling seq/epoch changes NO decision surface", () => {
   it.each(["null", "random", "reversed"] as const)("scramble = %s: every surface is identical", (kind) => {
     seed();
-    scramble("null");
-    const baseline = surfaces();
+    const baseline = surfaces(assignment("null"));
     // Non-vacuous: the fixture splits in and out, the notice exists, and a page truncates.
     expect(baseline.canonical.length).toBe(4);
     expect(baseline.notice).toMatch(/^relay: 4 unread for a46-seq/);
     expect(baseline.getMessagesPage.has_more).toBe(true);
-    scramble(kind);
-    expect(surfaces()).toEqual(baseline);
+    expect(surfaces(assignment(kind))).toEqual(baseline);
   });
 });

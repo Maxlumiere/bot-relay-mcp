@@ -45,6 +45,8 @@ let port = 0;
 /** What the stub returns for get_messages: a partial page of 20 normal messages. */
 let page: Array<{ id: string; from_agent: string; priority: string; created_at: string }> = [];
 let totalPending = 0;
+/** since_bound the stub reports: null = an unwindowed page. */
+let sinceBound: string | null = null;
 
 beforeAll(async () => {
   fs.rmSync(DIR, { recursive: true, force: true });
@@ -57,7 +59,7 @@ beforeAll(async () => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      const text = JSON.stringify({ messages: page, count: page.length, has_more: true, total_pending: totalPending });
+      const text = JSON.stringify({ messages: page, count: page.length, has_more: page.length < totalPending, total_pending: totalPending, since_bound: sinceBound });
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text }] } }));
     });
@@ -188,5 +190,26 @@ describe("ADR-0046 (i), reader half — ONE message-priority ordering with an ex
     const m = /^RANK = "(CASE priority[^"]*END)"$/m.exec(hook);
     expect(m, "the hook declares its RANK").not.toBeNull();
     expect(m![1].replace(/\\x27/g, "'")).toBe(MESSAGE_PRIORITY_RANK_SQL);
+  });
+});
+
+describe("#280 final round — a WINDOWED page is never taken for the full set", () => {
+  it("HARM: a page that looks complete but came through a window defers to the full-set reader", async () => {
+    db.registerAgent("a46-sender", "s", []);
+    db.registerAgent(AGENT, "r", []);
+    // The DB: a fresh normal, plus an unresolved HIGH a prior session read 2 days ago.
+    const fresh = db.sendMessage("a46-sender", AGENT, "fresh", "normal").id;
+    const old = db.sendMessage("a46-sender", AGENT, "old high", "high").id;
+    db.getDb()
+      .prepare("UPDATE messages SET created_at = ?, read_by_session = 'prior', status = 'read' WHERE id = ?")
+      .run(new Date(Date.now() - 2 * 86_400_000).toISOString(), old);
+    // The stub: a windowed server's answer: 1 of 1, looking complete, since_bound set.
+    const row = db.getDb().prepare("SELECT created_at FROM messages WHERE id = ?").get(fresh) as { created_at: string };
+    page = [{ id: fresh, from_agent: "a46-sender", priority: "normal", created_at: row.created_at }];
+    totalPending = 1;
+    sinceBound = new Date(Date.now() - 86_400_000).toISOString();
+    const c = ctx((await runHook("0")).stdout);
+    sinceBound = null;
+    expect(c).toMatch(/highest priority: high/);
   });
 });
