@@ -263,9 +263,11 @@ describe("v2.2.1 B3 — daemon non-TTY fallback", () => {
 // ============================================================================
 
 describe("v2.2.1 B4 — get_messages since UX hint", () => {
-  it("(B4.1) status=pending + count=0 + since<24h → hint present", () => {
+  // ADR-0045 R3 replaced the narrow-window hint with `hidden_by_since`, a count that
+  // appears exactly when the window hid pending mail. An EMPTY mailbox hides nothing,
+  // so it now says nothing: no hint to widen a window that is hiding no mail.
+  it("(B4.1) status=pending + count=0 + since<24h on an EMPTY mailbox → no hint, no hidden_by_since", () => {
     registerAgent("hinter", "r", []);
-    // No messages seeded; mailbox empty.
     const r = handleGetMessages({
       agent_name: "hinter",
       status: "pending",
@@ -274,8 +276,9 @@ describe("v2.2.1 B4 — get_messages since UX hint", () => {
     } as any);
     const body = parseResult(r);
     expect(body.count).toBe(0);
-    expect(body.hint).toBeTruthy();
-    expect(body.hint).toMatch(/since='all'|since='24h'/);
+    expect(body).not.toHaveProperty("hint");
+    expect(body).not.toHaveProperty("hidden_by_since");
+    expect(body.total_pending).toBe(0);
   });
 
   it("(B4.2) status=pending + count>0 → NO hint (operator has results)", () => {

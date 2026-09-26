@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed — the pending queue is never windowed by default, and a window that hides pending mail says so
+
+**Release note:** after upgrading, `get_messages(status='pending')` returns mail it previously left out: messages you received and a previous session read, but that were never acked (resolved). Existing callers may therefore see up to 7 days of such mail resurface **once** (older mail has already been purged). **One ack clears it permanently**: drain with `ack: true`, or `resolve_messages` the ids.
+
+Unresolved mail read by a previous session stays pending, because it is unfinished work. But `get_messages` applied a default `since` of `24h`, so once such mail was more than a day old it silently left the queue. It wasn't returned, it wasn't counted in `total_pending`, and there was no hint, because the hint only fired when zero messages came back. Unfinished work disappeared without a trace.
+
+- **The default `since` now depends on `status`.** `pending` defaults to `'all'`, so the action queue is never windowed unless you ask. History reads (`all`, `history`, `read`, `resolved`) keep `'24h'`. `get_messages_summary` uses the same defaults, so the preview agrees with the drain. An explicit `since`, including `null`, is honoured as before. The response's `since` field now states the window actually applied.
+- **`total_pending` is always the full, unwindowed queue**, even when you pass a `since`. `has_more` keeps its meaning: the `limit` truncated what your window matched. A pending `get_messages_summary` carries the same canonical `total_pending` alongside its `total`, which still counts what the window matched.
+- **`hidden_by_since: N`** appears on a pending read, and on a pending summary, whenever your `since` hid N pending messages. It replaces the old narrow-window `hint`, which only fired when nothing at all was returned.
+- **Drift guard:** `tests/adr-0045-hidden-by-since-guard.test.ts`. Any function in `src/` that passes a `since` to a message read must also report through `pendingWindowReport`, so a new read path cannot window the queue silently.
+- Tests: `tests/adr-0045-pending-unwindowed.test.ts` uses a message a previous session read 3 days ago plus a fresh one. It covers the default on both tools, the history twin, an explicit window, `total_pending` and `hidden_by_since`, the replaced hint, and `has_more`.
+
 ### Added — a window now RECORDS which identity it holds, and says so (`relay bind` + `relay fleet`, ADR-0036 S1)
 
 A terminal could become agent X without anything observable happening: no record of which window held which name, on which conversation, and no way to ask. When that binding went stale the only symptom was mail that never arrived. S1 **records and lists**; it changes no auth and performs **no** automatic rebind (that is S3-lite).

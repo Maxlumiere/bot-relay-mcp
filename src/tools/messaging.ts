@@ -7,6 +7,7 @@ import {
   sendMessage,
   getMessages,
   countMatchingMessages,
+  pendingWindowReport,
   getMessagesSummary,
   getOutstanding,
   resolveMessages,
@@ -21,6 +22,7 @@ import { ERROR_CODES } from "../error-codes.js";
 import { parseSince } from "./standup.js";
 import { sampleGetMessagesConsistency } from "../transport/consistency-probe.js";
 import { truncatedPreview } from "../preview.js";
+import { defaultSinceFor } from "../types.js";
 import type {
   SendMessageInput,
   GetMessagesInput,
@@ -193,9 +195,12 @@ export function handleGetMessages(input: GetMessagesInput) {
   // message older than the bound got consumed silently and never
   // resurfaced. See docs/v2.7.0-get-messages-filter-after-mark.md for
   // the full investigation + regression test.
+  // ADR-0045 R2: an absent `since` takes the STATUS-dependent default (pending →
+  // 'all', history → '24h'); an explicit value, including null, is honoured.
+  const since = input.since === undefined ? defaultSinceFor(input.status) : input.since;
   let sinceIso: string | null;
   try {
-    sinceIso = resolveSinceBound(input.since, input.agent_name);
+    sinceIso = resolveSinceBound(since, input.agent_name);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return {
@@ -212,17 +217,13 @@ export function handleGetMessages(input: GetMessagesInput) {
       isError: true,
     };
   }
-  // #inbox-subset (seq 961) — the completeness signal. Count ALL messages matching
-  // this exact query (same SSOT predicate as the drain) BEFORE getMessages marks the returned
-  // pending rows read — counting after would undercount the queue. `has_more` then makes a
-  // capped drain structurally unable to claim it returned everything: the wake signal and the
-  // drain can no longer count different sets without the caller being told.
-  const totalMatching = countMatchingMessages(
-    input.agent_name,
-    input.status,
-    sinceIso,
-    input.lane ?? "all",
-  );
+  // #inbox-subset (seq 961) — the completeness signal, counted BEFORE getMessages marks
+  // the returned pending rows read (counting after would undercount the queue). ADR-0045
+  // R3: total_pending is the CANONICAL unwindowed count, and hidden_by_since says how
+  // much of it this call's window hid; has_more still means "the LIMIT truncated the
+  // windowed result".
+  const report = pendingWindowReport(input.agent_name, input.status, sinceIso, input.lane ?? "all");
+  const totalMatching = report.windowed;
   const raw = getMessages(
     input.agent_name,
     input.status,
@@ -259,31 +260,9 @@ export function handleGetMessages(input: GetMessagesInput) {
     /* probe guarantees no-throw but defensive */
   }
 
-  // v2.2.1 B4 / #198: if the caller asked for `pending` + got zero results + the
-  // `since` window is narrow (parsed + < 24h), emit a `hint` nudging them to
-  // widen. Post-#198 a pending drain ALWAYS returns never-observed (undelivered)
-  // mail regardless of `since`, so a zero result means there is none of THAT
-  // either — the only thing a narrow window can still hide is older ALREADY-SEEN
-  // pending mail (re-pending from another session, aged past the window). The
-  // hint makes that bounded-HISTORY semantic visible instead of silently hiding it.
-  //
-  // Fires ONLY when all three conditions hold:
-  //   - status === "pending"
-  //   - returned count === 0
-  //   - sinceIso != null (a bound was applied) AND bound is < 24h ago
-  // When since="all" or since=null the bound is absent → no hint.
-  let hint: string | undefined;
-  if (input.status === "pending" && messages.length === 0 && sinceIso) {
-    const boundAgeMs = Date.now() - new Date(sinceIso).getTime();
-    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
-    if (boundAgeMs >= 0 && boundAgeMs < twentyFourHoursMs) {
-      hint =
-        "Narrow `since` window may hide older ALREADY-SEEN pending mail " +
-        "(re-pending from another session); never-observed mail is always " +
-        "returned regardless of `since`. Try since='24h' or since='all' to also " +
-        "surface older already-observed pending work.";
-    }
-  }
+  // ADR-0045 R3: the v2.2.1 narrow-window `hint` is replaced by `hidden_by_since`, a
+  // count that is present exactly when the window hid pending mail, whatever the
+  // window and whatever this call returned.
 
   // v2.12.0 — surface an `acked` confirmation ONLY when ack actually took
   // effect (true + the drain path). Omitted otherwise so an ack=false call is
@@ -308,13 +287,16 @@ export function handleGetMessages(input: GetMessagesInput) {
             // scope): pending keeps `total_pending` (unchanged), history reads gain `total`. Both are
             // additive; a caller reading `count` on ANY status can no longer believe it holds everything.
             ...(input.status === "pending"
-              ? { has_more: hasMore, total_pending: totalMatching }
+              ? {
+                  has_more: hasMore,
+                  total_pending: report.total_pending,
+                  ...(report.hidden_by_since ? { hidden_by_since: report.hidden_by_since } : {}),
+                }
               : { has_more: hasMore, total: totalMatching }),
             agent: input.agent_name,
             filter: input.status,
-            since: input.since ?? null,
+            since,
             since_bound: sinceIso,
-            ...(hint ? { hint } : {}),
             ...(ackEffective ? { acked: true, resolved_count: messages.length } : {}),
           },
           null,
@@ -391,9 +373,12 @@ export function handleResolveMessages(input: ResolveMessagesInput) {
 const SUMMARY_PREVIEW_MAX = 100;
 
 export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
+  // ADR-0045 R2: the same status-dependent default as get_messages, so the preview
+  // and the drain it previews agree.
+  const since = input.since === undefined ? defaultSinceFor(input.status) : input.since;
   let sinceIso: string | null;
   try {
-    sinceIso = resolveSinceBound(input.since, input.agent_name);
+    sinceIso = resolveSinceBound(since, input.agent_name);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return {
@@ -412,7 +397,9 @@ export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
   }
   // #completeness-signal — the cheap preview is LIMIT-capped like the drain; report has_more/total
   // from the SAME buildMessageWhere-derived count so a busy inbox's summary cannot look complete.
-  const totalMatching = countMatchingMessages(input.agent_name, input.status, sinceIso, "all");
+  // ADR-0045 R5: a windowed pending read reports what its window hid.
+  const report = pendingWindowReport(input.agent_name, input.status, sinceIso, "all");
+  const totalMatching = report.windowed;
   const rows = getMessagesSummary(input.agent_name, input.status, input.limit, sinceIso);
   const summaries = rows.map((r) => {
     // #inbox-preview-fragment — the truncation marker is embedded IN content_preview so a reader of
@@ -437,10 +424,14 @@ export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
             summaries,
             count: summaries.length,
             has_more: totalMatching > summaries.length,
+            // `total` is the WINDOWED match count (the has_more signal); for a pending
+            // preview, total_pending is the CANONICAL queue, as on get_messages (R3).
             total: totalMatching,
+            ...(report.total_pending !== undefined ? { total_pending: report.total_pending } : {}),
+            ...(report.hidden_by_since ? { hidden_by_since: report.hidden_by_since } : {}),
             agent: input.agent_name,
             filter: input.status,
-            since: input.since ?? null,
+            since,
             since_bound: sinceIso,
           },
           null,
