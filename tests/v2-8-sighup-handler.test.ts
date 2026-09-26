@@ -243,6 +243,7 @@ function readAgentSignalCols(name: string): {
       signal_received_at: number | null;
       signal_kind: string | null;
       agent_status: string | null;
+      session_id: string | null;
     } | undefined;
     if (!row) {
       throw new Error(`agent "${name}" not found in DB`);
