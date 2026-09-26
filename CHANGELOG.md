@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed — a message's priority is a closed set, enforced when it is written
+
+`messages.priority` had no constraint. Every tool validated it, but a direct writer could store any text, including an instruction-shaped string, and every reader that ranks or displays the priority would have passed it on. Triggers now refuse any `INSERT` or `UPDATE` whose priority is not `critical`, `high`, `normal` or `low`. They need no table rebuild and ship in the unreleased schema v25. Existing rows are left untouched. Tests: `tests/adr-0046-message-priority-domain.test.ts`.
+
 ### Added — edge identity: each relay database has one random, immutable `edge_id`, and every window-binding key starts with it
 
 Every `agent_bindings` key was a bare name or anchor. Once federation lets one table hold rows from several relays, two relays' agents with the same name would be one row. This fixes the key while the table is still empty, so federation needs no migration later.
