@@ -88,10 +88,12 @@ describe("ADR-0046 — the R5 contract, on the actual tool response", () => {
     expect(r.total_pending).toBe(canonicalPending());
   });
 
-  it("get_messages_summary(pending, since='1h'): hidden_by_since == 2", async () => {
+  it("get_messages_summary(pending, since='1h'): hidden_by_since == 2, total_pending == canonical (beside the windowed total)", async () => {
     const r = await tool("get_messages_summary", { agent_name: R, status: "pending", since: "1h", agent_token: token });
     expect(r.count).toBe(1);
     expect(r.hidden_by_since).toBe(2);
+    expect(r.total, "total stays the WINDOWED match count (the has_more signal)").toBe(1);
+    expect(r.total_pending, "the canonical, unwindowed count").toBe(canonicalPending());
   });
 
   it("no window given (pending defaults to 'all'): nothing hidden, so no hidden_by_since; total_pending == canonical", async () => {
