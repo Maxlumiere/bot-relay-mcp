@@ -75,8 +75,26 @@ function plantForeign(h: import("better-sqlite3").Database): void {
 const foreignRows = (h: import("better-sqlite3").Database) =>
   h.prepare("SELECT * FROM agent_bindings WHERE edge_id = ? ORDER BY binding_id").all(FOREIGN);
 
+/**
+ * Round-4 audit: foreign rows with their OWN ids never collide with the local
+ * random binding_ids, so an UPDATE keyed on binding_id alone touched nothing foreign
+ * and passed. Before EVERY update path, give every local binding_id a FOREIGN TWIN
+ * with the same binding_id (the (edge_id, binding_id) key allows it). An update that
+ * is not edge-scoped then writes the twin, and the "foreign rows untouched" check
+ * catches it.
+ */
+function plantTwins(h: import("better-sqlite3").Database): void {
+  h.exec("DROP TRIGGER IF EXISTS agent_bindings_local_edge_insert");
+  h.prepare(
+    "INSERT OR IGNORE INTO agent_bindings (binding_id, edge_id, binding_version, agent_name, conversation_id, host_id, " +
+      "window_pid, window_pid_start, bound_via, bound_at, last_verified_at, superseded_at, end_reason) " +
+      "SELECT binding_id, ?, 99, agent_name, 'c-foreign-twin', host_id, window_pid, window_pid_start, 'launch-intent', " +
+      "'2000-01-01T00:00:00Z', NULL, '2000-01-02T00:00:00Z', NULL FROM agent_bindings WHERE edge_id != ?",
+  ).run(FOREIGN, FOREIGN);
+}
+
 /** The script, through every accessor. Binding ids and timestamps are random/now, so results are normalised. */
-function script(h: import("better-sqlite3").Database) {
+function script(h: import("better-sqlite3").Database, beforeUpdate: () => void = () => {}) {
   const out: unknown[] = [];
   const norm = (r: { action: string; bindingVersion: number; supersededBindingId: string | null }) => ({
     action: r.action,
@@ -99,10 +117,15 @@ function script(h: import("better-sqlite3").Database) {
   out.push(["claim A", norm(write(h, A, "arch", "c1"))]);
   out.push(["claim B", norm(write(h, B, "build", "c2"))]);
   out.push(["current A", cur(A)], ["current B", cur(B)], ["list", list()]);
-  out.push(["resume-switch A", norm(write(h, A, "arch", "c3"))]);
-  out.push(["end A", db.endAgentBinding(h as never, A, "logout")]);
-  out.push(["refresh A", norm(write(h, A, "arch", "c3"))]);
-  out.push(["clear-carry B", norm(write(h, B, "build", "c4", "clear-carry"))]);
+  beforeUpdate();
+  out.push(["resume-switch A", norm(write(h, A, "arch", "c3"))]); // supersede UPDATE
+  beforeUpdate();
+  out.push(["end A", db.endAgentBinding(h as never, A, "logout")]); // end UPDATE
+  beforeUpdate();
+  out.push(["refresh A", norm(write(h, A, "arch", "c3"))]); // refresh UPDATE
+  beforeUpdate();
+  out.push(["clear-carry B", norm(write(h, B, "build", "c4", "clear-carry"))]); // supersede UPDATE, clear-carry
+  beforeUpdate();
   out.push(["current A", cur(A)], ["current B", cur(B)], ["list", list()]);
   return out;
 }
@@ -131,6 +154,34 @@ describe("ADR-0046 — edge scope, metamorphic: foreign rows that collide on nam
 
     expect(withForeign).toEqual(baseline);
     expect(after, "no local write touched a foreign row").toBe(before);
+  });
+
+  it("every UPDATE path (supersede, end, refresh, clear-carry) runs against a FOREIGN TWIN sharing its local binding_id, and never touches it", () => {
+    const basePath = freshDb(path.join(ROOT, "base2"));
+    const base = new Better(basePath);
+    const baseline = script(base);
+    base.close();
+
+    const metaPath = freshDb(path.join(ROOT, "twins"));
+    const meta = new Better(metaPath);
+    // Each twin, as planted; a twin planted before an update must still equal this after it.
+    const planted = new Map<string, string>();
+    const plant = () => {
+      plantTwins(meta);
+      for (const row of foreignRows(meta) as Array<{ binding_id: string }>) {
+        if (!planted.has(row.binding_id)) planted.set(row.binding_id, JSON.stringify(row));
+      }
+    };
+    const withTwins = script(meta, plant);
+    const shared = (meta
+      .prepare("SELECT COUNT(*) AS c FROM agent_bindings f JOIN agent_bindings l ON l.binding_id = f.binding_id WHERE f.edge_id = ? AND l.edge_id != ?")
+      .get(FOREIGN, FOREIGN) as { c: number }).c;
+    const now = new Map((foreignRows(meta) as Array<{ binding_id: string }>).map((r) => [r.binding_id, JSON.stringify(r)]));
+    meta.close();
+
+    expect(shared, "precondition: foreign twins really share local binding_ids").toBeGreaterThanOrEqual(4);
+    expect(withTwins).toEqual(baseline);
+    for (const [id, row] of planted) expect(now.get(id), `foreign twin ${id} was modified`).toBe(row);
   });
 
   it("NON-VACUOUS: the baseline really exercises claim, supersede, end, refresh and clear-carry", () => {
