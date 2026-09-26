@@ -213,3 +213,40 @@ describe("#280 final round — a WINDOWED page is never taken for the full set",
     expect(c).toMatch(/highest priority: high/);
   });
 });
+
+describe("#280 sharpening — the count is total_pending, never the page length; the fingerprint is (total, newest, top)", () => {
+  it("HARM: a response WITHOUT total_pending is not trusted for the count: the full-set reader answers (21), never '20+'", async () => {
+    seed();
+    const saved = totalPending;
+    // @ts-expect-error — simulate a server that omits total_pending
+    totalPending = undefined;
+    const c = ctx((await runHook("0")).stdout);
+    totalPending = saved;
+    expect(c).toMatch(/^relay: 21 unread for a46-recv/);
+    expect(c).not.toMatch(/20\+/);
+  });
+
+  it("the fingerprint changes when the full set changes by a resolve + an arrival at the SAME count (sqlite path)", async () => {
+    db.registerAgent("a46-sender", "s", []);
+    db.registerAgent(AGENT, "r", []);
+    const ids = [0, 1, 2].map((i) => db.sendMessage("a46-sender", AGENT, `m${i}`, "normal").id);
+    db.getDb().prepare("UPDATE messages SET created_at = ?").run(new Date(Date.now() - 600_000).toISOString());
+    const env = { dbPath: DB_PATH };
+    void env;
+    const first = await spawnHook({ PATH: process.env.PATH ?? "", HOME, RELAY_AGENT_NAME: AGENT, RELAY_DB_PATH: DB_PATH });
+    expect(ctx(first.stdout)).toMatch(/^relay: 3 unread/);
+    db.resolveMessages(AGENT, [ids[0]]);
+    db.sendMessage("a46-sender", AGENT, "arrived", "normal");
+    const second = await spawnHook({ PATH: process.env.PATH ?? "", HOME, RELAY_AGENT_NAME: AGENT, RELAY_DB_PATH: DB_PATH });
+    expect(ctx(second.stdout), "same count (3), new newest → re-notify").toMatch(/^relay: 3 unread/);
+  });
+
+  it("INNOCENT TWIN: an unchanged full set stays damped", async () => {
+    db.registerAgent("a46-sender", "s", []);
+    db.registerAgent(AGENT, "r", []);
+    db.sendMessage("a46-sender", AGENT, "only", "normal");
+    const env = { PATH: process.env.PATH ?? "", HOME, RELAY_AGENT_NAME: AGENT, RELAY_DB_PATH: DB_PATH };
+    expect(ctx((await spawnHook(env)).stdout)).toMatch(/^relay: 1 unread/);
+    expect((await spawnHook(env)).stdout).toBe("");
+  });
+});
