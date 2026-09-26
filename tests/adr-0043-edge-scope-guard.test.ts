@@ -4,7 +4,22 @@
 // See LICENSE for full terms.
 
 /**
- * ADR-0043 rule 3 — DRIFT GUARD: every agent_bindings key starts with edge_id,
+ * TRIPWIRE, NOT THE GUARD (ADR-0046). The real enforcement of edge scope is
+ * behavioural: tests/adr-0046-edge-scope-metamorphic.test.ts plants foreign rows
+ * that collide on name and anchor and requires every accessor's local results to be
+ * identical. This file is a cheap early warning for ACCIDENTAL drift by an honest
+ * builder, and is audited only for false alarms.
+ *
+ * KNOWN LIMITS, by design (deliberate evasion, not drift; the metamorphic test
+ * makes them irrelevant, so they are NOT chased here):
+ *   - tautologies: `edge_id = edge_id`, `edge_id IS edge_id`;
+ *   - `edge_id IS NOT DISTINCT FROM ?` and other non-`=` spellings;
+ *   - a predicate borrowed from another UNION / compound-select branch;
+ *   - SQL assembled across variables or function calls (seen only through its
+ *     literal parts), views, and dynamically built identifiers;
+ *   - an edge_id comparison against the WRONG value (it checks shape, not value).
+ *
+ * ADR-0043 rule 3 — DRIFT TRIPWIRE: every agent_bindings key starts with edge_id,
  * and every query that looks a binding up by NAME, ANCHOR, CONVERSATION or
  * BINDING ID also RESTRICTS it to one edge: `edge_id = ?` as a top-level AND
  * conjunct of every OR branch of the condition at that table's level. An edge
@@ -52,6 +67,8 @@ function norm(sql: string): string {
   return sql
     .replace(/--[^\n]*/g, " ")
     .replace(/\/\*[\s\S]*?\*\//g, " ")
+    // An accidental quoted identifier names the same thing: "edge_id", `edge_id`, [edge_id].
+    .replace(/"([A-Za-z_][A-Za-z0-9_]*)"|`([A-Za-z_][A-Za-z0-9_]*)`|\[([A-Za-z_][A-Za-z0-9_]*)\]/g, (_m, a, b, c) => a ?? b ?? c)
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
@@ -260,6 +277,7 @@ describe("ADR-0043 rule 3 — agent_bindings keys and lookups are edge-scoped", 
     ["a binding_id update without the edge (binding_id is no longer a key alone)", 'db.prepare("UPDATE agent_bindings SET end_reason = ? WHERE binding_id = ?")'],
     ["agent_bindings nested in another table's query", 'db.prepare("SELECT * FROM agents WHERE name IN (SELECT agent_name FROM agent_bindings WHERE host_id = ?)")'],
     ["edge compared on the OTHER table of a join", 'db.prepare("SELECT * FROM agents a JOIN agent_bindings b ON b.agent_name = a.name WHERE a.edge_id = ?")'],
+    ["a quoted table name, no edge", `db.prepare('SELECT * FROM "agent_bindings" WHERE agent_name = ?')`],
   ])("FLAGS a form absent from the repo: %s", (_label, code) => {
     expect(violations("x.ts", `const x = 1; ${code};`)).toHaveLength(1);
   });
@@ -276,6 +294,7 @@ describe("ADR-0043 rule 3 — agent_bindings keys and lookups are edge-scoped", 
     ["a join scoped on the binding alias", 'db.prepare("SELECT * FROM agents a JOIN agent_bindings b ON b.agent_name = a.name AND b.edge_id = ?")'],
     ["an edge-scoped binding_id update", 'db.prepare("UPDATE agent_bindings SET end_reason = ? WHERE edge_id = ? AND binding_id = ?")'],
     ["nested and scoped", 'db.prepare("SELECT * FROM agents WHERE name IN (SELECT agent_name FROM agent_bindings WHERE edge_id = ? AND host_id = ?)")'],
+    ["a quoted edge column, scoped", `db.prepare('SELECT * FROM agent_bindings WHERE "edge_id" = ? AND agent_name = ?')`],
   ])("does NOT flag: %s", (label, code) => {
     expect(violations("x.ts", `const x = 1; ${code};`), label).toEqual([]);
   });
