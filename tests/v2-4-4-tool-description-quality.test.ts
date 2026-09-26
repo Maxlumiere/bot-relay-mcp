@@ -203,7 +203,7 @@ describe("v2.4.4 — tool description quality", () => {
       discover_agents: "1cc22950fa7478fee94c7549a0b8c46d76c59165b0f128aa07b0461b4c8d18a4",
       expand_capabilities: "f68e3c05bc1779d8bef11669895c21e14a2f1844c3e01ae1f57e39f48ebb8d09",
       get_channel_messages: "06592f4a9f58da0d111640ff64829ae49f3e388c00c9ffa9c9c7230b81f1c522",
-      get_messages: "4deac94b970b23bbe588d46a114106a7d7c473d220bd15479cb077b83ecb38fd",
+      get_messages: "80e10a2c96bb95d2e3f724cb6c6e22b0aabbb66a23bfe03baa7d5da0f417f74e",
       get_messages_summary: "d0d49432edb393e790e95985e6fc0e46d07ac7a174b2d4b17312af882bc4f599",
       get_outstanding: "c8afb6aef443fd40b79a4d077b410023ff61f435192d8c3da3862e32b49a0dd5", // #inbox-read-at: state enum unread->undrained / read-unresolved->drained-unresolved (delivery-path, not read/seen)
       get_standup: "50fc69fcf51b6d21632b5e9be632f570c7cee8b1cbc18999a82d0a34dc2b1519",

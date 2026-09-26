@@ -38,6 +38,8 @@
  *     returns a WHERE clause, never a result to a caller.
  *   - sampleGetMessagesConsistency: a comparator that mirrors the drain's window
  *     to detect dropped rows; it logs and returns nothing to a caller.
+ *   - getMessages (db.ts): a thin wrapper over getMessagesWithEffect (ADR-0041), itself
+ *     a windowed read primitive listed above; ITS callers are what the tripwire checks.
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";
@@ -51,11 +53,13 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 /** Windowed reads, and the index of their `since` argument. */
 const WINDOWED_READS: Record<string, number> = {
   getMessages: 4,
+  // ADR-0041 (#281): the get_messages handler reads through this receipt-returning twin.
+  getMessagesWithEffect: 4,
   getMessagesSummary: 3,
   countMatchingMessages: 2,
   pendingSinceClause: 0,
 };
-const EXEMPT = new Set(["pendingWindowReport", "buildMessageWhere", "sampleGetMessagesConsistency"]);
+const EXEMPT = new Set(["pendingWindowReport", "buildMessageWhere", "sampleGetMessagesConsistency", "getMessages"]);
 
 function calleeName(call: any): string | null {
   const e = call.expression;
