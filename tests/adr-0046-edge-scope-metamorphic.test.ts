@@ -23,6 +23,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { fileURLToPath } from "url";
 
 const ROOT = path.join(os.tmpdir(), `bot-relay-adr0046-edge-${process.pid}`);
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -191,5 +192,30 @@ describe("ADR-0046 — edge scope, metamorphic: foreign rows that collide on nam
     h.close();
     for (const want of ["created", "superseded-and-created", "refreshed"]) expect(r).toContain(want);
     expect(r).toContain('"end A",true');
+  });
+});
+
+/**
+ * Two-sided coverage pin: the metamorphic script above must exercise EVERY local
+ * write statement on agent_bindings. These are the ones src/db.ts holds today (bind =
+ * the create INSERT; resume-switch and clear-carry = the supersede UPDATE + INSERT;
+ * refresh; end). There is NO release write on agent_bindings on this branch
+ * (releaseAgentBinding writes only `agents`); when one is added (S3-lite), this pin
+ * fails until the script covers it.
+ */
+describe("ADR-0046 — every agent_bindings write path is in the metamorphic script", () => {
+  it("the write statements in src/db.ts are exactly the ones the script exercises", () => {
+    // fileURLToPath, not URL.pathname: the repo path contains a space ("Claude AI").
+    const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "db.ts"), "utf-8");
+    const writes = [...src.matchAll(/"(INSERT INTO agent_bindings \(|UPDATE agent_bindings SET [a-z_]+)/g)].map((m) => m[1]).sort();
+    expect(writes).toEqual(
+      [
+        "INSERT INTO agent_bindings (", // create (bind)
+        "INSERT INTO agent_bindings (", // supersede's new row (resume-switch, clear-carry)
+        "UPDATE agent_bindings SET end_reason", // end
+        "UPDATE agent_bindings SET last_verified_at", // refresh
+        "UPDATE agent_bindings SET superseded_at", // supersede (resume-switch, clear-carry)
+      ].sort(),
+    );
   });
 });
