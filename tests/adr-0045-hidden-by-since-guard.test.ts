@@ -4,7 +4,22 @@
 // See LICENSE for full terms.
 
 /**
- * ADR-0045 R5 — DRIFT GUARD: a read that windows the pending set must say what
+ * TRIPWIRE, NOT THE GUARD (ADR-0046). The real enforcement is the CONTRACT test on
+ * the actual tool response, through the MCP transport:
+ * tests/adr-0046-hidden-by-since-contract.test.ts (hidden_by_since == N,
+ * total_pending == the canonical count). This file only warns early when an honest
+ * builder adds a windowed read path without the report, and is audited only for
+ * false alarms. It checks that the report is CALLED, not that its result reaches
+ * the response: removing the response field passes here (MEASURED in the round-3
+ * audit), and that is exactly what the contract test catches.
+ *
+ * KNOWN LIMITS, by design (evasion, not drift; the contract test covers the tools):
+ *   - a read function reached through an alias, a re-export, or a wrapper;
+ *   - a report whose result is computed and then dropped;
+ *   - a since value that is a variable holding null (only the literal null is exempt);
+ *   - new windowed read primitives not in WINDOWED_READS.
+ *
+ * ADR-0045 R5 — DRIFT TRIPWIRE: a read that windows the pending set must say what
  * its window hid.
  *
  * Every function in src/ that passes a `since` bound to a message read
