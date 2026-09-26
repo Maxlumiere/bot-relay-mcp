@@ -424,7 +424,10 @@ export function handleGetMessagesSummary(input: GetMessagesSummaryInput) {
             summaries,
             count: summaries.length,
             has_more: totalMatching > summaries.length,
+            // `total` is the WINDOWED match count (the has_more signal); for a pending
+            // preview, total_pending is the CANONICAL queue, as on get_messages (R3).
             total: totalMatching,
+            ...(report.total_pending !== undefined ? { total_pending: report.total_pending } : {}),
             ...(report.hidden_by_since ? { hidden_by_since: report.hidden_by_since } : {}),
             agent: input.agent_name,
             filter: input.status,

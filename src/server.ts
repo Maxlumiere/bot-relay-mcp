@@ -416,7 +416,7 @@ export function createServer(): Server {
           "Cheap, non-mutating mailbox preview (v2.1.6).\n\n" +
           "When to use: orchestrators scanning many inboxes per cycle, dashboards rendering a per-agent backlog count, or any flow where you want to see what is there without consuming it. After picking interesting IDs, expand them with `get_messages` (which CAN mutate) or read them by ID.\n\n" +
           "Behavior: same `status` + `since` filter surface as `get_messages`, with the same status-dependent `since` default (pending → `'all'`, history → `'24h'`). Returns headers + a 100-char `content_preview` (decrypted on the fly when `RELAY_ENCRYPTION_KEY` is set). Never marks messages read. Auth: agent token (own mailbox only).\n\n" +
-          "Returns: `{ summaries: { id, from_agent, priority, status, created_at, content_preview, content_truncated }[], count, has_more, total, hidden_by_since?, agent, filter, since, since_bound }`. `hidden_by_since` appears when a pending preview's window hid pending mail. `content_truncated=true` when the original content exceeded the 100-char preview cap.\n\n" +
+          "Returns: `{ summaries: { id, from_agent, priority, status, created_at, content_preview, content_truncated }[], count, has_more, total, total_pending?, hidden_by_since?, agent, filter, since, since_bound }`. `total` is what your window matched; for a pending preview `total_pending` is the full, unwindowed queue, and `hidden_by_since` appears when your window hid pending mail. `content_truncated=true` when the original content exceeded the 100-char preview cap.\n\n" +
           "Errors: `AUTH_FAILED`, `VALIDATION`, `RATE_LIMITED`.",
         inputSchema: zodToJsonSchema(GetMessagesSummarySchema),
       },
