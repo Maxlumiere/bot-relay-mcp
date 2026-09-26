@@ -4700,6 +4700,14 @@ export function markRecipientDispatched(
  * `agent_state_machine.ts:207-212` explicitly says callers must do
  * this pre-filter BEFORE passing `pendingCount` to `deriveDashboardState`.
  *
+ * TWO COUNTS, deliberately (ADR-0046, #283 round 3):
+ *   - `pending_count`: the CANONICAL count: what this agent's drain returns,
+ *     with NO age filter (ADR-0045 R1). This is the number any display calls
+ *     "pending".
+ *   - `inputs.pendingCount`: the AGE-FILTERED state input above. It is not a
+ *     count of pending mail; it only answers "is anything older than the window?"
+ *     for deriveDashboardState, and must never be shown as "pending".
+ *
  * Single SQL round-trip: agents JOIN messages (filtered by age). For
  * typical N < 20 registered agents this is fast.
  */
@@ -4708,6 +4716,8 @@ export function getDashboardAgentSnapshots(
   nowMs: number = Date.now(),
 ): Array<{
   name: string;
+  /** Canonical pending count (no age filter): equals the drain. */
+  pending_count: number;
   inputs: {
     lastSeen: string | null;
     signalReceivedAt: number | null;
@@ -4738,7 +4748,11 @@ export function getDashboardAgentSnapshots(
              -- a.session_id), NOT the legacy status column, which the stale
              -- PostToolUse hook flips with no drain. See getInboxSummary.
              AND ${PENDING_FOR_AGENT_ROW_SQL}
-             AND m.created_at < ?) AS pending_count_old
+             AND m.created_at < ?) AS pending_count_old,
+         (SELECT COUNT(*) FROM messages m
+           WHERE m.to_agent = a.name
+             -- The canonical count: the same per-agent predicate, NO age filter.
+             AND ${PENDING_FOR_AGENT_ROW_SQL}) AS pending_count
        FROM agents a`,
     )
     .all(cutoffIso) as Array<{
@@ -4752,12 +4766,14 @@ export function getDashboardAgentSnapshots(
     agent_pid_start: string | null;
     last_alive: string | null;
     pending_count_old: number | bigint;
+    pending_count: number | bigint;
   }>;
   // v2.15.0 — compute the liveness verdict PURELY (in-memory probe + caches,
   // zero DB writes) and feed it to the dashboard state machine, same as
   // getAgents(). No read-path mutation.
   return rows.map((r) => ({
     name: r.name,
+    pending_count: Number(r.pending_count),
     inputs: {
       lastSeen: r.last_seen,
       signalReceivedAt: r.signal_received_at,

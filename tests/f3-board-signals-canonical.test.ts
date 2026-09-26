@@ -199,3 +199,44 @@ describe("F3 round 2 — after a re-registration, every per-agent surface counts
     expect(dashPending()).toBe(drainWould());
   });
 });
+
+/**
+ * Round-3 audit (#283) + ADR-0046: a never-drained message younger than the
+ * dashboard's pendingWindowMs showed 0 while the drain returned it. The fixtures
+ * above all backdate their mail, so they missed it. TWO counts, kept apart:
+ *   - the DISPLAY count (the board's getInboxSummary pending_count, and the
+ *     snapshot's canonical pending_count) is canonical: it equals the drain,
+ *     whatever the message's age;
+ *   - the snapshot's inputs.pendingCount is the AGE-FILTERED state input to
+ *     deriveDashboardState ("pending = older than the window", by design), never
+ *     displayed as "pending".
+ */
+describe("F3 round 3 — the displayed pending count does not depend on message age", () => {
+  function fresh30s(): number {
+    db.registerAgent("f3-sender", "r", []);
+    db.registerAgent("f3-rec", "r", []);
+    const id = db.sendMessage("f3-sender", "f3-rec", "arrived 30 seconds ago", "normal").id;
+    db.getDb().prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(new Date(Date.now() - 30_000).toISOString(), id);
+    const drainWould = db.getMessages("f3-rec", "pending", 100, true).length;
+    expect(drainWould, "precondition: the drain returns it").toBe(1);
+    return drainWould;
+  }
+  const snapshot = () => db.getDashboardAgentSnapshots(60_000).find((r) => r.name === "f3-rec")!;
+
+  it("HARM: a 30-second-old never-drained message counts 1 on the display counts, and 1 in the drain", () => {
+    const drainWould = fresh30s();
+    expect(snapshot().pending_count, "the snapshot's canonical count").toBe(drainWould);
+    expect(inboxSummary().pending_count, "the board's displayed count").toBe(drainWould);
+  });
+
+  it("INNOCENT TWIN: the STATE input stays age-filtered by design (30s < the 60s window → 0)", () => {
+    fresh30s();
+    expect(snapshot().inputs.pendingCount).toBe(0);
+  });
+
+  it("aged mail: the canonical count and the state input agree", () => {
+    staleHookFlip(seed());
+    expect(snapshot().pending_count).toBe(1);
+    expect(snapshot().inputs.pendingCount).toBe(1);
+  });
+});
