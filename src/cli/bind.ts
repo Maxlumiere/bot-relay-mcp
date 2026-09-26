@@ -212,11 +212,12 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const { hasAgentBindingsTable, upsertAgentBinding, endAgentBinding } = await import("../db.js");
+    const { bindingSchemaGap, upsertAgentBinding, endAgentBinding } = await import("../db.js");
 
-    if (!hasAgentBindingsTable(db)) {
+    const gap = bindingSchemaGap(db);
+    if (gap) {
       return bindFailed(
-        `schema not migrated: ${dbPath} has no agent_bindings table (schema v25). ` +
+        `schema not migrated: ${dbPath} ${gap}. ` +
           `The daemon or connector on the new build must open this DB once first; bind never migrates.`,
       );
     }

@@ -928,7 +928,7 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
         if command -v relay_verdict_set >/dev/null 2>&1; then
           case "$RELAY_VERDICT" in
             HEALTHY|DEGRADED)
-              relay_verdict_set "DEGRADED" "bind failed: agent_bindings missing (schema not migrated) — this window is NOT recorded" " agent=\"$AGENT_NAME\""
+              relay_verdict_set "DEGRADED" "bind failed: schema not migrated (binding tables missing or pre-edge-identity) — this window is NOT recorded" " agent=\"$AGENT_NAME\""
               ;;
           esac
         fi

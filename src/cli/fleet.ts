@@ -121,15 +121,16 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const { hasAgentBindingsTable, listAgentBindings } = await import("../db.js");
+    const { bindingSchemaGap, listAgentBindings } = await import("../db.js");
     const { anchorLivenessVerdict, getOwnHostId } = await import("../liveness.js");
 
     // "0 windows" and "this DB cannot answer" are DIFFERENT FACTS. Reporting the
     // second as the first is the silence-as-health failure this arc exists to end,
     // so an unmigrated DB refuses loudly and exits non-zero.
-    if (!hasAgentBindingsTable(db)) {
+    const gap = bindingSchemaGap(db);
+    if (gap) {
       return fleetFailed(
-        `schema not migrated: ${dbPath} has no agent_bindings table (schema v25). ` +
+        `schema not migrated: ${dbPath} ${gap}. ` +
           `The daemon or connector on the new build must open this DB once first.`,
       );
     }

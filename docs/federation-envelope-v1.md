@@ -27,8 +27,8 @@ Every cross-edge event carries exactly this set of fields. JSON encoding is the 
 | Field              | Type            | Required | Purpose                                                                                                |
 | ------------------ | --------------- | -------- | ------------------------------------------------------------------------------------------------------ |
 | `event_id`         | UUIDv7 string   | yes      | Globally unique + time-sortable. Replay protection on the receiver. MUST be v7 (time-prefix matters).  |
-| `origin_edge`      | edge identity   | yes      | Sending edge. String (opaque to this layer; defined by the edge identity spec in v2.3).                |
-| `target_edge`      | edge identity   | yes      | Recipient edge. Literal string `"hub"` when the envelope is routed through a hub without E2E metadata. |
+| `origin_edge`      | edge identity   | yes      | Sending edge: its `relay_edge.edge_id`, a canonical lowercase random UUID v4 (defined in §7, "Edge identity spec"). |
+| `target_edge`      | edge identity   | yes      | Recipient edge's `relay_edge.edge_id`. Literal string `"hub"` when the envelope is routed through a hub without E2E metadata. |
 | `sender_agent`     | agent name      | yes      | Scoped to `origin_edge`. Same namespace as local `agents.name`.                                        |
 | `recipient_agent`  | agent name      | yes      | Scoped to `target_edge`. Receiver resolves to a local row.                                             |
 | `event_type`       | enum            | yes      | See §3. Additive only; new types MUST NOT shadow old types.                                            |
@@ -120,7 +120,7 @@ The hub treats the envelope as opaque payload + metadata. It:
 
 - **Envelope-level rotation.** If an edge's ed25519 key is compromised, v1 requires whole-edge rekey (new identity). A rotation grace (dual-key accept window) is a v3 item.
 - **Causal ordering guarantees.** `causal_refs` is a hint; receivers MAY process out-of-order. CRDT-style guarantees are explicitly deferred (CRDT was rejected during federation design).
-- **Edge identity spec.** The string form of `origin_edge` / `target_edge` is defined in v2.3 federation kickoff. For v1, treat as opaque strings.
+- **Edge identity spec.** Defined (ADR-0043): `origin_edge` / `target_edge` = the relay's `relay_edge.edge_id`. That is one row per database, a canonical lowercase random UUID v4 created once at schema setup. It is never derived from the instance id (an operator label, not globally unique), the host id, the hostname or a path, and it is immutable. A hub is a relay too, so hub-originated envelopes carry the hub's own `relay_edge.edge_id` with no special case. The ID is an identifier, not a credential: it is bound to the edge's ed25519 key at hub registration (v2.3) and is deliberately NOT a hash of that key, so a key rotation leaves the identity unchanged. Still open for v2.3: `relay restore` must offer replace (keep the ID) or fork (mint a new one), and the hub must refuse a second concurrent connection claiming an `edge_id` already connected.
 - **Per-event-type schemas beyond §3.** Future event types extend §3 without bumping `protocol_version`. A breaking change to an EXISTING type's body shape DOES bump the version.
 - **Multiple signatures.** Exactly one `signature`, from `origin_edge`. Multi-sig envelopes (hub + origin double-attest) are a v3 item.
 - **Compression.** Envelope-level compression is not specified. If needed, bolt on in transport-layer only (gzip on HTTP, etc.).
