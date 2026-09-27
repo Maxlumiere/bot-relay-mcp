@@ -1969,6 +1969,8 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
 
 const MESSAGE_PRIORITY_REFUSED =
   "'messages.priority must be one of critical, high, normal, low (ADR-0046: the domain is enforced at write)'";
+const CHANNEL_MESSAGE_PRIORITY_REFUSED =
+  "'channel_messages.priority must be one of critical, high, normal, low (ADR-0046: the domain is enforced at write)'";
 
 function ensureMessagePriorityDomain(db: CompatDatabase): void {
   db.exec(
@@ -1980,6 +1982,19 @@ function ensureMessagePriorityDomain(db: CompatDatabase): void {
     "CREATE TRIGGER IF NOT EXISTS messages_priority_domain_update BEFORE UPDATE OF priority ON messages " +
       "WHEN NEW.priority NOT IN ('critical', 'high', 'normal', 'low') " +
       "BEGIN SELECT RAISE(ABORT, " + MESSAGE_PRIORITY_REFUSED + "); END",
+  );
+  // The same closed domain on channel_messages: getChannelMessages ranks its priority
+  // with the same ordering. Same 4 values as messages; the post_to_channel API enum
+  // (normal/high) stays the narrower gate.
+  db.exec(
+    "CREATE TRIGGER IF NOT EXISTS channel_messages_priority_domain_insert BEFORE INSERT ON channel_messages " +
+      "WHEN NEW.priority NOT IN ('critical', 'high', 'normal', 'low') " +
+      "BEGIN SELECT RAISE(ABORT, " + CHANNEL_MESSAGE_PRIORITY_REFUSED + "); END",
+  );
+  db.exec(
+    "CREATE TRIGGER IF NOT EXISTS channel_messages_priority_domain_update BEFORE UPDATE OF priority ON channel_messages " +
+      "WHEN NEW.priority NOT IN ('critical', 'high', 'normal', 'low') " +
+      "BEGIN SELECT RAISE(ABORT, " + CHANNEL_MESSAGE_PRIORITY_REFUSED + "); END",
   );
 }
 
