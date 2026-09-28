@@ -154,6 +154,70 @@ describe("ADR-0048 — the daemon re-checks containment AFTER create (TOCTOU)", 
       else process.env.RELAY_DB_PATH = saved.RELAY_DB_PATH;
     }
   });
+
+  // Codex #287 R2 (partial probe): the REFUSAL itself must not write through the
+  // escaped path. The WASM handle used to flush its image on close(), creating the
+  // DB outside the roots at the moment of refusal; the DB file was also chmod'ed
+  // (through the swapped path) before the re-check.
+  for (const driver of ["wasm", "native"] as const) {
+    it(`${driver}: the refusal writes NOTHING outside the roots (no flush, no chmod of the escaped DB)`, async () => {
+      const saved = { HOME: process.env.HOME, RELAY_DB_PATH: process.env.RELAY_DB_PATH, D: process.env.RELAY_SQLITE_DRIVER };
+      process.env.HOME = HOME;
+      process.env.RELAY_SQLITE_DRIVER = driver;
+      const dir = path.join(HOME, `racy-${driver}`);
+      const lazyDir = path.join(HOME, `racy-${driver}-lazy`);
+      const dbPath = path.join(dir, "relay.db");
+      process.env.RELAY_DB_PATH = dbPath;
+      const db = await import("../src/db.js");
+      db.closeDb();
+      const realMkdir = fs.mkdirSync.bind(fs);
+      vi.spyOn(fs, "mkdirSync").mockImplementation(((p: fs.PathLike, o?: unknown) => {
+        if (String(p) === dir || String(p) === lazyDir) {
+          fs.symlinkSync(String(p) === dir ? OUTSIDE : path.join(OUTSIDE, "lazy"), String(p));
+          return undefined;
+        }
+        return realMkdir(p, o as never);
+      }) as never);
+      const realChmod = fs.chmodSync.bind(fs);
+      const chmodded: string[] = [];
+      vi.spyOn(fs, "chmodSync").mockImplementation(((p: fs.PathLike, m: fs.Mode) => {
+        chmodded.push(String(p));
+        return realChmod(p, m);
+      }) as never);
+      try {
+        await expect(db.initializeDb()).rejects.toThrow(/REFUSING the relay DB after opening it/);
+        const outsideDb = path.join(OUTSIDE, "relay.db");
+        if (driver === "wasm") {
+          // WASM opens a missing DB in memory: a refusal must leave NO file.
+          expect(fs.existsSync(outsideDb), "the refused WASM handle flushed its image outside the roots").toBe(false);
+        } else {
+          // The native open itself creates the file (the race the re-check
+          // detects); the refusal must add no bytes to it.
+          expect(fs.existsSync(outsideDb) ? fs.statSync(outsideDb).size : 0, "the refused native handle wrote to the escaped DB").toBe(0);
+        }
+        expect(chmodded, "the escaped DB file was chmod'ed before the re-check").not.toContain(dbPath);
+        if (driver === "native") {
+          // The synchronous lazy path (getDb before initializeDb) refuses the same
+          // way, on its own fresh racy directory (the first one is already a
+          // symlink, which the resolver itself now refuses before any open).
+          fs.mkdirSync(path.join(OUTSIDE, "lazy"));
+          const lazyDb = path.join(lazyDir, "relay.db");
+          process.env.RELAY_DB_PATH = lazyDb;
+          chmodded.length = 0;
+          db.closeDb();
+          expect(() => db.getDb()).toThrow(/REFUSING the relay DB after opening it/);
+          expect(chmodded, "getDb chmod'ed the escaped DB file before the re-check").not.toContain(lazyDb);
+        }
+      } finally {
+        db.closeDb();
+        process.env.HOME = saved.HOME;
+        if (saved.RELAY_DB_PATH === undefined) delete process.env.RELAY_DB_PATH;
+        else process.env.RELAY_DB_PATH = saved.RELAY_DB_PATH;
+        if (saved.D === undefined) delete process.env.RELAY_SQLITE_DRIVER;
+        else process.env.RELAY_SQLITE_DRIVER = saved.D;
+      }
+    });
+  }
 });
 
 describe("ADR-0048 — tripwires (literal spellings only; the guards are the contract tests)", () => {

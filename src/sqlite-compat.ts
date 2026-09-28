@@ -238,6 +238,15 @@ class WasmDatabase implements CompatDatabase {
   }
 
   /**
+   * Release the handle WITHOUT flushing the in-memory image. For a refused DB
+   * (ADR-0048: the path escaped the approved roots after it was opened): a
+   * close() would export() and write the image THROUGH the escaped path.
+   */
+  discard(): void {
+    this.db.close();
+  }
+
+  /**
    * #171: atomic in-memory serialization — the whole DB image as bytes, produced
    * synchronously from memory with no filesystem touch. Tear-proof by
    * construction (unlike copying the write-back file, whose flush is a bare
@@ -444,6 +453,21 @@ export function configuredDriver(): SqliteDriver {
 /**
  * Close and clear the initialized DB (for test cleanup).
  */
+/**
+ * ADR-0048: drop the initialized handle WITHOUT any write, for a DB refused after
+ * opening. WASM: discard() skips the flush. Native: nothing has been written yet
+ * (no pragma, no schema: those run after the re-check), so close() writes nothing.
+ */
+export function discardInitializedDb(): void {
+  const db = _initializedDb;
+  _initializedDb = null;
+  _driverUsed = null;
+  _initPromise = null;
+  if (!db) return;
+  if (db instanceof WasmDatabase) db.discard();
+  else db.close();
+}
+
 export function closeInitializedDb(): void {
   if (_initializedDb) {
     _initializedDb.close();

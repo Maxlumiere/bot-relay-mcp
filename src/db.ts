@@ -36,6 +36,7 @@ import {
   initializeDb as initDriver,
   getInitializedDb,
   closeInitializedDb,
+  discardInitializedDb,
 } from "./sqlite-compat.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
@@ -298,15 +299,18 @@ export async function initializeDb(): Promise<void> {
   // file so there is no window where the DB lives under a 0755 parent.
   ensureSecureDir(path.dirname(dbPath), 0o700);
   _db = await initDriver(dbPath);
-  // And narrow the DB file itself to 0600 right after create.
-  ensureSecureFile(dbPath, 0o600);
+  // Re-check BEFORE anything else touches the file: on a refusal the handle is
+  // DISCARDED (a WASM close() would flush its image through the escaped path),
+  // and the chmod below never follows an escaped path.
   try {
     assertStillContained(dbPath);
   } catch (err) {
-    closeInitializedDb();
+    discardInitializedDb();
     _db = null;
     throw err;
   }
+  // And narrow the DB file itself to 0600 right after create.
+  ensureSecureFile(dbPath, 0o600);
 
   // #171 — single-sourced schema setup (pragmas + full migration chain + seed +
   // finalize + purge). Shared with getDb()'s native fallback so the two paths
@@ -334,18 +338,18 @@ export function getDb(): CompatDatabase {
   const req = createRequire(import.meta.url);
   const Database = req("better-sqlite3");
   _db = new Database(dbPath) as unknown as CompatDatabase;
-  ensureSecureFile(dbPath, 0o600);
   try {
     assertStillContained(dbPath);
   } catch (err) {
     try {
-      _db.close();
+      _db.close(); // native only here, before any pragma or schema: no write
     } catch {
       /* closing a refused handle is best-effort */
     }
     _db = null;
     throw err;
   }
+  ensureSecureFile(dbPath, 0o600);
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.
   applySchemaSetup(_db);
