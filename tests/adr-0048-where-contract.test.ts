@@ -249,12 +249,12 @@ describe("ADR-0048 — tripwires (literal spellings only; the guards are the con
     expect(hits.map(rel)).toEqual(["src/approved-roots.ts"]);
   });
 
-  it("the instance layout literals live in instance.ts (+ the one pinned writer, src/cli/init.ts, which PR B migrates)", () => {
+  it("the instance layout literals live in instance.ts ONLY (PR B migrated src/cli/init.ts, the last exception)", () => {
     const hits = srcFiles(path.join(REPO_ROOT, "src"))
       .filter((f) => /["']active-instance["']|["']instances["']/.test(fs.readFileSync(f, "utf-8")))
       .map(rel)
       .sort();
-    expect(hits).toEqual(["src/cli/init.ts", "src/instance.ts"]);
+    expect(hits).toEqual(["src/instance.ts"]);
   });
 });
 

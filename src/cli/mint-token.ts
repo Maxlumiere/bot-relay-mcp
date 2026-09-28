@@ -184,17 +184,16 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   // Apply --db-path BEFORE initializeDb reads RELAY_DB_PATH. When omitted,
-  // the daemon's own resolver (resolveInstanceDbPath) picks the active
-  // per-instance DB OR falls back to ~/.bot-relay/relay.db in single-
-  // instance mode — exact same path the live daemon uses.
+  // the daemon's own resolver (ADR-0048 resolveInstance) picks the DB, exactly
+  // as the live daemon does; a resolver fault ends the verb (no fallback).
   if (args.dbPath) {
     process.env.RELAY_DB_PATH = args.dbPath;
-  } else if (!process.env.RELAY_DB_PATH) {
-    try {
-      const { resolveInstanceDbPath } = await import("../instance.js");
-      process.env.RELAY_DB_PATH = resolveInstanceDbPath();
-    } catch {
-      /* fall back to db.ts's default */
+  } else {
+    const { pinResolvedDbPath } = await import("./_instance-db.js");
+    const resolveFault = await pinResolvedDbPath();
+    if (resolveFault) {
+      process.stderr.write(`relay mint-token: instance resolution failed: ${resolveFault}\n`);
+      return 2;
     }
   }
 

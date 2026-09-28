@@ -99,13 +99,11 @@ export async function run(argv: string[]): Promise<number> {
 
   // --- resolve the DB (no daemon, same as bind: §2.2 DB-direct) -------------
   if (args.dbPath) process.env.RELAY_DB_PATH = args.dbPath;
-  if (!process.env.RELAY_DB_PATH) {
-    try {
-      const { resolveInstanceDbPath } = await import("../instance.js");
-      process.env.RELAY_DB_PATH = resolveInstanceDbPath();
-    } catch (err) {
-      return fleetFailed(`could not resolve the relay DB path: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  {
+    // ADR-0048: the ONE strict resolver (RELAY_DB_PATH included: containment).
+    const { pinResolvedDbPath } = await import("./_instance-db.js");
+    const resolveFault = await pinResolvedDbPath();
+    if (resolveFault) return fleetFailed(`instance resolution failed: ${resolveFault}`);
   }
   const dbPath = process.env.RELAY_DB_PATH as string;
   if (!fs.existsSync(dbPath)) {

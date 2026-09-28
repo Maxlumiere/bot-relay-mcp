@@ -31,7 +31,8 @@
  * ACTIVE per-instance DB (~/.bot-relay/instances/<id>/relay.db), the SAME path
  * the daemon writes — NOT the legacy ~/.bot-relay/relay.db. Reading the wrong
  * path watches a dead DB and never sees mail (the stdio-legacy-DB-split bug).
- * We set RELAY_DB_PATH from resolveInstanceDbPath() exactly as the daemon does.
+ * We set RELAY_DB_PATH from the ONE strict resolver exactly as the daemon does
+ * (ADR-0048); a resolver fault is a DEGRADED exit, never a guessed DB.
  */
 import fs from "fs";
 import path from "path";
@@ -250,11 +251,19 @@ export async function run(argv: string[]): Promise<number> {
   // does — never the legacy ~/.bot-relay/relay.db. The marker the daemon writes
   // (~/.bot-relay/marker/<agent>.touch) and this DB then describe the same live
   // instance.
-  try {
-    const { resolveInstanceDbPath } = await import("../instance.js");
-    if (!process.env.RELAY_DB_PATH) process.env.RELAY_DB_PATH = resolveInstanceDbPath();
-  } catch {
-    /* fall back to db.ts default resolution */
+  // ADR-0048: the ONE strict resolver. On a fault there is NO wake at all, so it
+  // is said in the DEGRADED vocabulary every watcher already greps for, and the
+  // process exits non-zero instead of watching a guessed (dead) DB.
+  {
+    const { pinResolvedDbPath } = await import("./_instance-db.js");
+    const resolveFault = await pinResolvedDbPath();
+    if (resolveFault) {
+      process.stderr.write(
+        `[sentinel] DEGRADED — no wake for ${agent}: instance resolution failed: ${resolveFault}\n` +
+          `[sentinel]   Nothing is being watched. Fix the cause (\`relay doctor\` shows it), then restart the watch.\n`,
+      );
+      return 1;
+    }
   }
 
   const { initializeDb, peekMailboxVersion, closeDb } = await import("../db.js");

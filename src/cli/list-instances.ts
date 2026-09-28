@@ -45,12 +45,21 @@ export async function run(argv: string[]): Promise<number> {
     }
   }
   const instances = listInstances();
-  const active = resolveActiveInstanceId();
+  // ADR-0048: the resolver may report a fault (e.g. instances but none selected).
+  // This verb is how that is FIXED, so it still lists, and names the fault.
+  let active: string | null = null;
+  let resolutionError: string | null = null;
+  try {
+    active = resolveActiveInstanceId();
+  } catch (err) {
+    resolutionError = err instanceof Error ? err.message : String(err);
+  }
   if (asJson) {
     process.stdout.write(
       JSON.stringify(
         {
           active_instance_id: active,
+          ...(resolutionError ? { resolution_error: resolutionError } : {}),
           instances: instances.map((m) => ({
             ...m,
             active: m.instance_id === active,
@@ -88,6 +97,12 @@ export async function run(argv: string[]): Promise<number> {
       pad(m.label ?? "", colLabel) +
       pad(m.daemon_version_first_seen, colVersion) +
       m.created_at + "\n",
+    );
+  }
+  if (resolutionError) {
+    process.stdout.write(
+      `\nNo instance is resolved: ${resolutionError}\n` +
+        "Fix: relay use-instance <INSTANCE_ID> (or set RELAY_INSTANCE_ID).\n",
     );
   }
   return 0;
