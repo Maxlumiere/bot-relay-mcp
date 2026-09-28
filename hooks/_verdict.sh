@@ -61,6 +61,27 @@
 #   . "$HOOKS_DIR/_verdict.sh"          # or ../_verdict.sh from a subdirectory
 # then upgrade with relay_verdict_set on positive evidence.
 
+# VERDICT WORDS (closed set):
+#   HEALTHY — every check this hook runs concluded well, including (SessionStart)
+#     the mail read. Only ever reached on positive evidence.
+#   DEGRADED — a CONCLUDED fault that leaves the session usable but not whole.
+#     A LOCAL mail read that failed is DEGRADED, reason "relay unreadable: <why>",
+#     in every hook, and it is never retried over HTTP.
+#   CANNOT-JUDGE — NO judgement was made: the default, a subagent tool call,
+#     unparseable hook stdin, no mode resolvable (no local instance and no remote
+#     relay), a remote read that failed, or health not yet verified at exit.
+#   MUTE — the session will have no working relay tools (the configured relay
+#     path does not exist, or the resolved DB is the wrong, empty one).
+#   UNWAKEABLE — the agent's binding reads live, but its process is dead: mail
+#     cannot wake it until the binding is released.
+#   TAKEOVER_LIVENESS_UNVERIFIABLE — a live-reading binding has no verifiable
+#     same-host anchor, so a takeover cannot be proven safe.
+#   AUTH_FAILED — the token is stale or revoked, or recovery with it failed.
+#   REGISTER_FAILED — register_agent returned an error (for example the name is
+#     held by another live agent).
+# A hook uses no other word; tests/f1-286-codex-r1.test.ts checks every
+# relay_verdict_set call in hooks/ against this list.
+
 RELAY_VERDICT="CANNOT-JUDGE"
 RELAY_VERDICT_REASON="hook did not reach a conclusion"
 RELAY_VERDICT_DETAIL=""

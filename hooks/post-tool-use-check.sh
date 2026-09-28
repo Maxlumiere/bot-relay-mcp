@@ -275,10 +275,17 @@ if src == "http":
             break
     if payload is None:
         payload = raw.strip()
+    # A TOOL ERROR IS A FAILED READ, never an empty mailbox (isError, or error_code).
     try:
         rpc = json.loads(payload)
+        if rpc["result"].get("isError"):
+            sys.exit(1)
         data = json.loads(rpc["result"]["content"][0]["text"])
+        if not isinstance(data, dict) or "error_code" in data:
+            sys.exit(1)
         msgs = data["messages"]
+    except SystemExit:
+        raise
     except Exception:
         sys.exit(1)
     if not isinstance(msgs, list):
@@ -601,18 +608,29 @@ case "$HOOK_MODE" in
 esac
 
 # --- The mail read: F1 decides the mode; a failure never changes the path ------
+# The unresolved fallback name is never an identity (ADR-0044 point 5): no mail
+# is read for it, and no judgement is made.
+case "$AGENT_NAME" in
+  [Dd][Ee][Ff][Aa][Uu][Ll][Tt])
+    command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "agent name unresolved (default): mail not read" " agent=\"${AGENT_NAME}\""
+    exit 0
+    ;;
+esac
+
 F1_OUT="" F1_ERR="" F1_RC=127
 if [ -f "$RELAY_CLI" ] && command -v node >/dev/null 2>&1; then
   _f1_errf="$(mktemp 2>/dev/null || printf '')"
   if [ -n "$_f1_errf" ]; then
-    F1_OUT=$(node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>"$_f1_errf")
+    F1_OUT=$(relay_run_with_deadline "$(relay_pending_deadline)" node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>"$_f1_errf")
     F1_RC=$?
-    F1_ERR=$(head -n 1 "$_f1_errf" 2>/dev/null)
+    F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null || head -n 1 "$_f1_errf" 2>/dev/null)
     rm -f "$_f1_errf" 2>/dev/null
   else
-    F1_OUT=$(node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>/dev/null)
+    F1_OUT=$(relay_run_with_deadline "$(relay_pending_deadline)" node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>/dev/null)
     F1_RC=$?
   fi
+  # A stall ends at the deadline (124), LOUD: never an endless hook.
+  [ "$F1_RC" -eq 124 ] && F1_ERR="relay pending timed out after $(relay_pending_deadline)s"
 else
   F1_ERR="no runnable relay CLI beside this hook ($RELAY_CLI)"
 fi
@@ -669,7 +687,9 @@ if command -v relay_verdict_set >/dev/null 2>&1; then
     # The reason is F1's first stderr line, held to a safe character set so it can
     # never break the one-line verdict format.
     _f1_why=$(printf '%s' "$F1_ERR" | tr -cd 'A-Za-z0-9 _./:()=,-' | cut -c1-200)
-    relay_verdict_set "CANNOT-JUDGE" "relay unreadable: the local relay DB could not be read (no HTTP fallback)" " agent=\"${AGENT_NAME}\" detail=\"${_f1_why}\""
+    # DEGRADED = a concluded fault (the verdict contract in _verdict.sh): the
+    # local read failed, and nothing was asked of any other relay.
+    relay_verdict_set "DEGRADED" "relay unreadable: ${_f1_why:-the local relay mailbox could not be read}" " agent=\"${AGENT_NAME}\" http_fallback=\"none\""
   elif [ "$MODE" = remote ]; then
     relay_verdict_set "CANNOT-JUDGE" "remote relay read failed (unreachable, unauthorized or no token)" " agent=\"${AGENT_NAME}\""
   else

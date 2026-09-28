@@ -54,7 +54,7 @@ Every time you open a Claude Code terminal (or resume a session), the hook check
 
 ## What the hook checks
 
-- **Pending messages** — exactly what `get_messages(status="pending")` would return, in the same order (priority first, then newest). The hook reads them through `relay pending AGENT --with-content 10`, so it holds no query of its own. It shows up to 10 bodies and says how many are pending in all. Bodies stored encrypted are shown decrypted when this environment has the key, and as a placeholder otherwise, never as ciphertext. The read marks nothing: the mail stays pending until the agent calls `get_messages`. If the mail cannot be read, the hook says `relay unreadable` rather than showing nothing. Message bodies and task titles are FRAMED: every line after the first starts with `    | `, and control characters and ANSI escapes are removed, so no sender text can start a line and pose as a `[RELAY]` line from the hook. The framing does not make the content trusted: it is still what the sender wrote.
+- **Pending messages** — exactly what `get_messages(status="pending")` would return, in the same order (priority first, then newest). The hook reads them through `relay pending AGENT --with-content 10`, so it holds no query of its own. It shows up to 10 bodies and says how many are pending in all. Bodies stored encrypted are shown decrypted when this environment has the key, and as a placeholder otherwise, never as ciphertext. The read marks nothing: the mail stays pending until the agent calls `get_messages`. The hook's verdict is HEALTHY only once this mail read has completed. `relay pending` also decides WHERE the mail is, as the `PostToolUse` and `Stop` hooks do: with no local instance and `RELAY_HTTP_HOST` set, the mail comes from the remote relay and the header says `via remote relay`. If a local read fails (a missing, corrupt or too-old DB, the wrong instance, or a read still running after `RELAY_PENDING_TIMEOUT_SECS`, default 10), the hook says `relay unreadable` rather than showing nothing, the verdict is `DEGRADED`, and nothing is asked over HTTP. An answer whose count contradicts its messages is refused the same way. Active tasks that cannot be rendered are reported too, never dropped. With no agent name set (the unresolved fallback `default`), no mail is read and the verdict is `CANNOT-JUDGE`. Message bodies and task titles are FRAMED: every line after the first starts with `    | `. Every line terminator counts as a newline (CR, LF, VT, FF, NEL, U+2028, U+2029 and the like), and other control characters and ANSI escapes are removed, so no sender text can start a line and pose as a `[RELAY]` line from the hook. The framing does not make the content trusted: it is still what the sender wrote.
 - **Active tasks** — tasks assigned to you with status "posted" or "accepted", sorted by priority
 
 ## Example output
@@ -86,6 +86,12 @@ export RELAY_DB_PATH="/custom/path/relay.db"
 ```
 
 Default: `~/.bot-relay/relay.db`
+
+## Verdict words
+
+Every relay hook ends with exactly one `[RELAY] VERDICT=<WORD> reason="..."` line. The words are one closed set, defined with their meaning in [`hooks/_verdict.sh`](../hooks/_verdict.sh) and shared by every hook. In short: `HEALTHY` means every check concluded well. `DEGRADED` means a concluded fault; a local mail read that failed is always `DEGRADED`, with the reason `relay unreadable: <why>`. `CANNOT-JUDGE` means no judgement was made. The rest (`MUTE`, `UNWAKEABLE`, `TAKEOVER_LIVENESS_UNVERIFIABLE`, `AUTH_FAILED`, `REGISTER_FAILED`) name specific faults.
+
+**Known limit:** the mail read resolves its DB through `relay pending`, but this hook's liveness and task reads still resolve the DB in shell until a single shared resolver lands.
 
 ## Stale token? Run `relay recover`
 

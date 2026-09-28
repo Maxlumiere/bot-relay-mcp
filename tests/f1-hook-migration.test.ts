@@ -14,7 +14,9 @@
  *     get_messages peek, LABELED "via remote relay" in what the agent sees. It
  *     still stamps `seq` (the ADR-0044 residual, a known limit for remote-only
  *     setups until a remote F1 equivalent exists).
- *   - Neither: no read, no request, CANNOT-JUDGE.
+ *   - Neither: no read, no request, CANNOT-JUDGE (no judgement was made).
+ * A LOCAL read that failed is a concluded fault: DEGRADED, "relay unreadable: <why>"
+ * (the verdict contract shared by all three hooks, documented in hooks/_verdict.sh).
  *
  * HARM TEST: in local mode the hook makes ZERO HTTP requests, whether the DB is
  * readable or not. The fixture points RELAY_HTTP_HOST/PORT at a COUNTING STUB that
@@ -69,6 +71,11 @@ let stubPort: number;
 const stubRequests: StubRequest[] = [];
 
 const STUB_SENDER = "stub-sender";
+/** What the stub answers a tool call with: a plausible page, or a tool error in either shape. */
+// is-error / error-json: Codex's measured shapes. The *-page modes ISOLATE each check:
+// a body that is otherwise a valid EMPTY page, so only that one check stands between
+// a tool error and a "verified empty" mailbox.
+let stubMode: "ok" | "is-error" | "error-json" | "is-error-page" | "error-code-page" = "ok";
 
 /** A counting stand-in for a daemon: answers /health and any /mcp call with ONE plausible pending message. */
 function startStub(): Promise<void> {
@@ -80,6 +87,21 @@ function startStub(): Promise<void> {
       if (req.url === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      if (stubMode !== "ok") {
+        const emptyPage = { messages: [], count: 0, total_pending: 0, since_bound: null };
+        const body =
+          stubMode === "is-error-page"
+            ? emptyPage
+            : stubMode === "error-code-page"
+              ? { ...emptyPage, error_code: "AUTH_FAILED" }
+              : { error_code: "AUTH_FAILED", error: "stub: token rejected" };
+        const text = JSON.stringify(body);
+        const flagged = stubMode === "is-error" || stubMode === "is-error-page";
+        const result = flagged ? { isError: true, content: [{ type: "text", text }] } : { content: [{ type: "text", text }] };
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
         return;
       }
       const inner = {
@@ -240,7 +262,7 @@ describe("F1 hook migration — PostToolUse, LOCAL mode: F1 only, ZERO HTTP requ
       const ctx = ptuContext(r);
       expect(ctx).toMatch(/relay unreadable/);
       expect(ctx).not.toContain(STUB_SENDER);
-      expect(r.stderr).toMatch(/VERDICT=CANNOT-JUDGE reason="relay unreadable/);
+      expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
     });
   }
 
@@ -251,7 +273,7 @@ describe("F1 hook migration — PostToolUse, LOCAL mode: F1 only, ZERO HTTP requ
     const r = await runHook(PTU_HOOK, localEnv("f1h-recv-3", t, freshHome("p3"), path.join(TEST_DIR, "absent.db")), PTU_STDIN);
     expect(takeStubRequests(), "a missing configured DB must NEVER switch to HTTP").toEqual([]);
     expect(ptuContext(r)).toMatch(/relay unreadable/);
-    expect(r.stderr).toMatch(/VERDICT=CANNOT-JUDGE reason="relay unreadable/);
+    expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 
   it("NON-VACUOUS: with a MISMATCHED anchor the stub IS reached, and only by the self-heal write; no request names get_messages", async () => {
@@ -346,7 +368,7 @@ describe("F1 hook migration — Stop hook: the same mode rule", () => {
     expect(takeStubRequests(), "an unreadable local DB must NEVER switch to HTTP").toEqual([]);
     expect(r.stdout).toBe("");
     expect(r.stderr).toMatch(/relay unreadable/);
-    expect(r.stderr).toMatch(/VERDICT=CANNOT-JUDGE reason="relay unreadable/);
+    expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 
   it("REMOTE twin: the wake is labeled 'via remote relay'", async () => {
@@ -370,4 +392,49 @@ describe("F1 hook migration — Stop hook: the same mode rule", () => {
     expect(out.reason).toMatch(/via remote relay/);
     expect(out.reason).toContain("f1h-sender-9");
   });
+});
+
+describe("#286 Codex R1 #4 — a remote TOOL ERROR is never a successful empty read", () => {
+  for (const mode of ["is-error", "error-json", "is-error-page", "error-code-page"] as const) {
+    for (const [label, hook, stdin] of [["Stop", STOP_HOOK, STOP_STDIN], ["PostToolUse", PTU_HOOK, PTU_STDIN]] as const) {
+      it(`${label}: an MCP result [${mode}] is a FAILED read (no HEALTHY), not an empty mailbox`, async () => {
+        stubMode = mode;
+        try {
+          takeStubRequests();
+          const r = await runHook(
+            hook,
+            {
+              HOME: freshHome(`r4-${label}-${mode}`),
+              RELAY_AGENT_NAME: "f1h-r4",
+              RELAY_AGENT_TOKEN: "stubtoken-aaaaaaaaaaaa",
+              RELAY_HTTP_HOST: "127.0.0.1",
+              RELAY_HTTP_PORT: String(stubPort),
+              RELAY_HOOK_NOTICE_REMIND_SECS: "0",
+              RELAY_STOP_WAKE_DAMPER_SECS: "0",
+            },
+            stdin,
+          );
+          const reqs = takeStubRequests();
+          expect(reqs.some((q) => q.body.includes("get_messages")), "precondition: the remote path really asked").toBe(true);
+          expect(r.stdout).toBe("");
+          expect(r.stderr).not.toMatch(/VERDICT=HEALTHY/);
+          expect(r.stderr).toMatch(/VERDICT=CANNOT-JUDGE reason="remote relay read failed/);
+        } finally {
+          stubMode = "ok";
+        }
+      });
+    }
+  }
+});
+
+describe("the unresolved name `default` is never an identity: no mail read, no judgement (ADR-0044 point 5)", () => {
+  for (const [label, hook, stdin] of [["PostToolUse", PTU_HOOK, PTU_STDIN], ["Stop", STOP_HOOK, STOP_STDIN]] as const) {
+    it(`${label}: RELAY_AGENT_NAME=default → no notice, no request, CANNOT-JUDGE (never "relay unreadable")`, async () => {
+      takeStubRequests();
+      const r = await runHook(hook, { ...localEnv("default", "stubtoken-aaaaaaaaaaaa", freshHome(`dflt-${label}`)) }, stdin);
+      expect(r.stdout).toBe("");
+      expect(takeStubRequests()).toEqual([]);
+      expect(r.stderr).toMatch(/VERDICT=CANNOT-JUDGE reason="agent name unresolved \(default\)/);
+    });
+  }
 });

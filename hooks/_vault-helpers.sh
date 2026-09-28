@@ -515,3 +515,29 @@ relay_pid_chain() {
   esac
   printf '[%s]' "$chain"
 }
+
+# Run a command under a wall-clock DEADLINE (seconds). A stalled `relay pending`
+# must end LOUD, not hang the hook until the harness kills it. perl's alarm()
+# survives exec, so the command itself receives SIGALRM at the deadline; that
+# status (142) is reported as 124, the GNU `timeout` convention. Without perl the
+# command runs unbounded (the harness's own hook timeout still applies).
+relay_run_with_deadline() {
+  local secs="$1"
+  shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$secs" "$@"
+    local rc=$?
+    [ "$rc" -eq 142 ] && return 124
+    return "$rc"
+  fi
+  "$@"
+}
+
+# The deadline for `relay pending`, in seconds: RELAY_PENDING_TIMEOUT_SECS
+# (a whole number 1-120), else 10.
+relay_pending_deadline() {
+  local v="${RELAY_PENDING_TIMEOUT_SECS:-10}"
+  case "$v" in ''|*[!0-9]*) v=10 ;; esac
+  if [ "${#v}" -gt 3 ] || [ "$((10#$v))" -lt 1 ] || [ "$((10#$v))" -gt 120 ]; then v=10; fi
+  printf '%s' "$((10#$v))"
+}

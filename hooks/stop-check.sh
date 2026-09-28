@@ -330,17 +330,30 @@ for line in raw.splitlines():
         break
 if payload is None:
     payload = raw
+# A TOOL ERROR IS A FAILED READ, never an empty mailbox: an MCP result flagged
+# isError, a payload carrying error_code, or one without a messages list and an
+# integer total_pending is rejected (exit 1), so it can never read as HEALTHY.
 try:
     rpc = json.loads(payload)
-    inner = rpc["result"]["content"][0]["text"]
-    data = json.loads(inner)
+    result = rpc["result"]
+    if not isinstance(result, dict) or result.get("isError"):
+        sys.exit(1)
+    data = json.loads(result["content"][0]["text"])
+except SystemExit:
+    raise
 except Exception:
     sys.exit(1)
-msgs = data.get("messages", [])
-if not msgs:
-    sys.exit(0)  # empty — success but nothing to wake for
+if not isinstance(data, dict) or "error_code" in data or data.get("success") is False:
+    sys.exit(1)
+msgs = data.get("messages")
 total = data.get("total_pending")
-count = total if type(total) is int else len(msgs)
+if not isinstance(msgs, list) or type(total) is not int or total < len(msgs):
+    sys.exit(1)
+if total == 0:
+    sys.exit(0)  # a VERIFIED empty mailbox: nothing to wake for
+if not msgs:
+    sys.exit(1)  # pending mail the page does not show: not a trustworthy answer
+count = total
 top = "high" if any(m.get("priority") in ("critical", "high") for m in msgs) else "normal"
 latest = max(msgs, key=lambda m: str(m.get("created_at", ""))).get("from_agent")
 latest = latest if isinstance(latest, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", latest) else "unknown"
@@ -351,18 +364,29 @@ PYEOF
 
 # --- Main: read (F1 decides the mode), damper, then block-to-wake ------------
 
+# The unresolved fallback name is never an identity (ADR-0044 point 5): no mail
+# is read for it, and no judgement is made.
+case "$AGENT_NAME" in
+  [Dd][Ee][Ff][Aa][Uu][Ll][Tt])
+    command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "agent name unresolved (default): mail not read" " agent=\"${AGENT_NAME}\""
+    exit 0
+    ;;
+esac
+
 F1_OUT="" F1_ERR="" F1_RC=127
 if [ -f "$RELAY_CLI" ] && command -v node >/dev/null 2>&1; then
   _f1_errf="$(mktemp 2>/dev/null || printf '')"
   if [ -n "$_f1_errf" ]; then
-    F1_OUT=$(node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>"$_f1_errf")
+    F1_OUT=$(relay_run_with_deadline "$(relay_pending_deadline)" node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>"$_f1_errf")
     F1_RC=$?
-    F1_ERR=$(head -n 1 "$_f1_errf" 2>/dev/null)
+    F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null || head -n 1 "$_f1_errf" 2>/dev/null)
     rm -f "$_f1_errf" 2>/dev/null
   else
-    F1_OUT=$(node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>/dev/null)
+    F1_OUT=$(relay_run_with_deadline "$(relay_pending_deadline)" node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>/dev/null)
     F1_RC=$?
   fi
+  # A stall ends at the deadline (124), LOUD: never an endless hook.
+  [ "$F1_RC" -eq 124 ] && F1_ERR="relay pending timed out after $(relay_pending_deadline)s"
 else
   F1_ERR="no runnable relay CLI beside this hook ($RELAY_CLI)"
 fi
@@ -406,7 +430,9 @@ if command -v relay_verdict_set >/dev/null 2>&1; then
     relay_verdict_set "HEALTHY" "mailbox read succeeded" " agent=\"${AGENT_NAME:-?}\""
   elif [ "$MODE" = unreadable ]; then
     _f1_why=$(printf '%s' "$F1_ERR" | tr -cd 'A-Za-z0-9 _./:()=,-' | cut -c1-200)
-    relay_verdict_set "CANNOT-JUDGE" "relay unreadable: the local relay DB could not be read (no HTTP fallback)" " agent=\"${AGENT_NAME}\" detail=\"${_f1_why}\""
+    # DEGRADED = a concluded fault (the verdict contract in _verdict.sh): the
+    # local read failed, and nothing was asked of any other relay.
+    relay_verdict_set "DEGRADED" "relay unreadable: ${_f1_why:-the local relay mailbox could not be read}" " agent=\"${AGENT_NAME}\" http_fallback=\"none\""
   elif [ "$MODE" = remote ]; then
     relay_verdict_set "CANNOT-JUDGE" "remote relay read failed (unreachable, unauthorized or no token)" " agent=\"${AGENT_NAME}\""
   else

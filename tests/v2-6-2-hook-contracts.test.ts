@@ -262,21 +262,23 @@ afterEach(() => {
 
 // --- check-relay.sh (SessionStart) ---
 describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
-  it("(C1) empty stdin + no DB present → exit 0, silent stdout (defensive)", () => {
+  it("(C1) empty stdin + a CONFIGURED DB that is missing → exit 0, and the only output is the LOUD mail-read line", () => {
+    // F1 mode rule (28 Sep): the missing-DB exit no longer skips the mail decision;
+    // a configured local DB that is missing is a concluded local failure: DEGRADED.
     const { root } = freshTestRoot();
-    // No DB created; hook should exit 0 silently.
+    // No DB created: RELAY_DB_PATH names a file that does not exist.
     const r = runHook({
       hook: HOOK_CHECK_RELAY,
       agentName: "build-agent",
       home: root,
-      // Use a path that doesn't exist so the "no DB" branch fires cleanly.
       dbPath: path.join(root, "missing.db"),
-      // Avoid hitting the live operator daemon at port 3777 by pointing
-      // elsewhere; the hook degrades silently when daemon is unreachable.
+      // Never the live operator daemon at 3777: a closed port.
       httpPort: 1, // privileged port, ECONNREFUSED instantly
     });
     expect(r.status).toBe(0);
-    expect(stripVerdict(r.stdout)).toBe("");
+    expect(stripVerdict(r.stdout)).toMatch(/^\[RELAY\] relay unreadable: pending mail for build-agent could not be read/);
+    expect(stripVerdict(r.stdout).split("\n")).toHaveLength(1);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 
   it("(C2-seam #53) NULL session_id + a prior-session-read UNRESOLVED message → hook DELIVERS it, mirroring get_messages re-pend", () => {
