@@ -19,3 +19,32 @@ export async function pinResolvedDbPath(): Promise<string | null> {
   process.env.RELAY_DB_PATH = r.dbPath;
   return null;
 }
+
+/**
+ * ADR-0048 PR B — open a RAW better-sqlite3 handle on the resolved DB (the verbs
+ * that must not run the schema setup: bind, fleet) and apply the SAME post-open
+ * re-check db.ts applies to its own handle (db.ts assertStillContained: the
+ * containment + shared-root ownership rule). A file created or swapped between
+ * resolution and open (for example by another user under /tmp) is refused
+ * before the handle is used; nothing has been written through it yet (no pragma
+ * or statement runs before the check), and it is closed.
+ */
+export async function openRawRelayDb(
+  dbPath: string,
+  opts: { readonly: boolean },
+): Promise<import("../sqlite-compat.js").CompatDatabase> {
+  const Better = (await import("better-sqlite3")).default;
+  const db = new Better(dbPath, { readonly: opts.readonly, fileMustExist: true });
+  try {
+    const { assertStillContained } = await import("../db.js");
+    assertStillContained(dbPath);
+  } catch (err) {
+    try {
+      db.close();
+    } catch {
+      /* closing a refused handle is best-effort */
+    }
+    throw err;
+  }
+  return db as unknown as import("../sqlite-compat.js").CompatDatabase;
+}

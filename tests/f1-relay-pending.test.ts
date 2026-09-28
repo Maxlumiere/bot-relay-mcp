@@ -472,10 +472,17 @@ describe("F1 — the active-instance marker is read once; a later failure cannot
     for (const k of keys) delete process.env[k];
     process.env.RELAY_HOME = RH;
     const real = fs.readlinkSync;
+    // Count reads of the MARKER only. The containment walk also readlinks the
+    // symlinks on the DB's path (on macOS the temp dir sits under /var →
+    // /private/var); those are not marker reads, and failing them would test the
+    // walk, not the single marker read.
+    const marker = path.join(RH, "active-instance");
     let calls = 0;
     const spy = vi.spyOn(fs, "readlinkSync").mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
-      calls++;
-      if (calls >= 2) throw Object.assign(new Error("EIO: injected on the second marker read"), { code: "EIO" });
+      if (String(p) === marker) {
+        calls++;
+        if (calls >= 2) throw Object.assign(new Error("EIO: injected on the second marker read"), { code: "EIO" });
+      }
       return (real as (...a: unknown[]) => unknown)(p, ...rest);
     }) as typeof fs.readlinkSync);
     try {

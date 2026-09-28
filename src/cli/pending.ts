@@ -44,8 +44,9 @@ export type PendingSource =
 
 /** The CLI's handle: READ-ONLY at the driver, so a write through it throws (SQLITE_READONLY). */
 export async function openPendingDb(dbPath: string): Promise<import("../sqlite-compat.js").CompatDatabase> {
-  const Better = (await import("better-sqlite3")).default;
-  const db = new Better(dbPath, { readonly: true, fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
+  // ADR-0048: the raw handle gets db.ts's post-open re-check (one function).
+  const { openRawRelayDb } = await import("./_instance-db.js");
+  const db = await openRawRelayDb(dbPath, { readonly: true });
   db.pragma("busy_timeout = 1000");
   return db;
 }

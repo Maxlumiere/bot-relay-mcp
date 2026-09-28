@@ -189,8 +189,10 @@ export async function run(argv: string[]): Promise<number> {
   const anchor = { hostId, windowPid: anchorRes.anchor.pid, windowPidStart: anchorRes.anchor.startedAt };
   let db: import("../sqlite-compat.js").CompatDatabase;
   try {
-    const Better = (await import("better-sqlite3")).default;
-    db = new Better(dbPath, { fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
+    // ADR-0048: the raw handle gets db.ts's post-open re-check (one function)
+    // BEFORE anything runs on it (it is writable).
+    const { openRawRelayDb } = await import("./_instance-db.js");
+    db = await openRawRelayDb(dbPath, { readonly: false });
     // MODEST, and deliberately not 5000 (audit, codex-5-5). This value governs
     // the statements OUTSIDE the writer's retry loop — the schema probe and
     // `--end`. Those are precisely the ones that CAN sit in SQLite's own busy

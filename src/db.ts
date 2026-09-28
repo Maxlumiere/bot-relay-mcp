@@ -66,7 +66,7 @@ export function getDbPath(): string {
  * resolved, but a parent could be swapped for a symlink before the directory is
  * made or the file opened. Resolve it again once it exists; refuse if it escaped.
  */
-function assertStillContained(dbPath: string): void {
+export function assertStillContained(dbPath: string): void {
   const c = checkContainment(dbPath);
   if (!c.ok) {
     throw new Error(`REFUSING the relay DB after opening it: ${c.reason}`);

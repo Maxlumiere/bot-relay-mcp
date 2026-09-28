@@ -28,11 +28,14 @@
  * resolved; any other error is a failure.
  *
  * SHARED roots (/tmp, /private/tmp) are world-writable, so another local user can
- * pre-plant a component there. Below a shared root (ssh StrictModes style) the
- * root must carry the sticky bit, and every EXISTING component, the file
- * included, must be owned by the current uid or root and not group- or
- * other-writable; otherwise the path is refused. The per-user roots (the home
- * directory, /var/folders) are unaffected. Threat model: accidental faults,
+ * pre-plant a component there. When the walk TOUCHES a shared root at any point
+ * (ssh StrictModes style), EVERY component it traversed, before and after the
+ * shared root, each symlink itself and every component on a link's target side,
+ * the file included, must be owned by the current uid or root and (except a
+ * symlink, whose mode bits mean nothing) not group- or other-writable, and the
+ * shared root itself must carry the sticky bit; otherwise the path is refused. A
+ * walk that never touches a shared root (the home directory, /var/folders) is
+ * unaffected. Threat model: accidental faults,
  * misconfiguration and CROSS-USER interference are in scope; a same-user
  * adversary racing the daemon is not.
  */
@@ -61,41 +64,36 @@ function sharedRootsReal(): string[] {
   return [...out];
 }
 
+/** One component the walk passed through: where it sits (canonical parent) and its lstat. */
+interface Traversed {
+  path: string;
+  st: fs.Stats;
+}
+
 /**
- * Why `realPath` (a real path under an approved root) fails the shared-root
- * ownership rule, or null when it passes or is not below a shared root. Every
- * stat fault is a failure, never assumed safe.
+ * Why the walk fails the shared-root ownership rule, or null when it passes or
+ * never touched a shared root. Judged on the lstat the walk itself took of each
+ * component (one observation per component).
  */
-function sharedRootFault(realPath: string): string | null {
+function sharedRootFault(traversed: Traversed[]): string | null {
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   if (uid === null) return null; // no POSIX ownership model (Windows)
-  const root = sharedRootsReal().find((r) => realPath.startsWith(r + path.sep));
-  if (!root) return null;
-  const inspect = (p: string): fs.Stats | "absent" | string => {
-    try {
-      return fs.lstatSync(p);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      return code === "ENOENT" ? "absent" : `cannot inspect ${p} (${code ?? String(err)})`;
+  const shared = sharedRootsReal();
+  const isRoot = (p: string) => shared.includes(p);
+  const touched = traversed.some((t) => isRoot(t.path) || shared.some((r) => t.path.startsWith(r + path.sep)));
+  if (!touched) return null;
+  for (const { path: p, st } of traversed) {
+    if (isRoot(p)) {
+      if (!(st.mode & 0o1000)) {
+        return `${p} is a shared directory without the sticky bit: another user could replace your files there. Use a path under your home directory.`;
+      }
+      continue;
     }
-  };
-  const rootSt = inspect(root);
-  if (typeof rootSt === "string") return rootSt === "absent" ? `the shared directory ${root} is missing` : rootSt;
-  if (!(rootSt.mode & 0o1000)) {
-    return `${root} is a shared directory without the sticky bit: another user could replace your files there. Use a path under your home directory.`;
-  }
-  let cur = root;
-  for (const part of realPath.slice(root.length + 1).split(path.sep)) {
-    cur = path.join(cur, part);
-    const st = inspect(cur);
-    if (st === "absent") break; // the rest does not exist yet: created by you
-    if (typeof st === "string") return st;
-    if (st.isSymbolicLink()) return `${cur} changed into a symlink while it was being checked`;
     if (st.uid !== uid && st.uid !== 0) {
-      return `${cur} is owned by uid ${st.uid}, not you (uid ${uid}): under the shared ${root}, another user could control it. Use a path under your home directory.`;
+      return `${p} is owned by uid ${st.uid}, not you (uid ${uid}): on a path through a shared directory, another user could control it. Use a path under your home directory.`;
     }
-    if (st.mode & 0o022) {
-      return `${cur} is group- or other-writable (mode 0${(st.mode & 0o777).toString(8)}): under the shared ${root}, another user could replace it. Remove that write permission, or use a path under your home directory.`;
+    if (!st.isSymbolicLink() && st.mode & 0o022) {
+      return `${p} is group- or other-writable (mode 0${(st.mode & 0o777).toString(8)}): on a path through a shared directory, another user could replace it. Remove that write permission, or use a path under your home directory.`;
     }
   }
   return null;
@@ -126,7 +124,7 @@ export type Containment =
 /** At most this many symlink hops in one walk (the kernel's own MAXSYMLINKS order). */
 const MAX_SYMLINK_HOPS = 40;
 
-type Placed = { ok: true; realPath: string; exists: boolean } | { ok: false; reason: string };
+type Placed = { ok: true; realPath: string; exists: boolean; traversed: Traversed[] } | { ok: false; reason: string };
 
 /** Where the kernel would put `absPath`: the walk described at the top of this file. */
 function placeReal(absPath: string): Placed {
@@ -134,6 +132,7 @@ function placeReal(absPath: string): Placed {
   const parts = (p: string) => p.split(path.sep).filter((c) => c !== "");
   let cur = path.parse(absPath).root;
   const queue = parts(absPath.slice(cur.length));
+  const traversed: Traversed[] = [];
   let hops = 0;
   while (queue.length) {
     const c = queue.shift() as string;
@@ -143,12 +142,8 @@ function placeReal(absPath: string): Placed {
       continue;
     }
     const next = path.join(cur, c);
-    try {
-      cur = fs.realpathSync.native(next);
-      continue;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return { ok: false, reason: `cannot resolve ${next} (${why(err)})` };
-    }
+    // Every component is lstat'ed HERE, so a symlink is seen as itself (the
+    // ownership rule judges the link, not only where it leads).
     let st: fs.Stats;
     try {
       st = fs.lstatSync(next);
@@ -157,21 +152,33 @@ function placeReal(absPath: string): Placed {
       // A POSITIVE absence: the missing tail lands under the real prefix.
       const rest = [c, ...queue].filter((x) => x !== ".");
       if (rest.includes("..")) return { ok: false, reason: `cannot place ${absPath}: a ".." follows the missing component ${next}` };
-      return { ok: true, realPath: path.join(cur, ...rest), exists: false };
+      return { ok: true, realPath: path.join(cur, ...rest), exists: false, traversed };
     }
-    if (!st.isSymbolicLink()) return { ok: false, reason: `cannot resolve ${next} (ENOENT on an existing non-symlink)` };
-    if (++hops > MAX_SYMLINK_HOPS) return { ok: false, reason: `cannot resolve ${absPath} (ELOOP: more than ${MAX_SYMLINK_HOPS} symlinks)` };
-    let target: string;
+    if (st.isSymbolicLink()) {
+      traversed.push({ path: next, st });
+      if (++hops > MAX_SYMLINK_HOPS) return { ok: false, reason: `cannot resolve ${absPath} (ELOOP: more than ${MAX_SYMLINK_HOPS} symlinks)` };
+      let target: string;
+      try {
+        target = fs.readlinkSync(next);
+      } catch (err) {
+        return { ok: false, reason: `cannot read the symlink ${next} (${why(err)})` };
+      }
+      // A symlink (dangling or not) is followed in kernel order: its target is
+      // spliced into the walk, never collapsed lexically.
+      if (path.isAbsolute(target)) cur = path.parse(target).root;
+      queue.unshift(...parts(target));
+      continue;
+    }
+    // A real component. cur is symlink-free, so the kernel's realpath only
+    // canonicalises its spelling (the on-disk CASE on a case-insensitive volume).
     try {
-      target = fs.readlinkSync(next);
+      cur = fs.realpathSync.native(next);
     } catch (err) {
-      return { ok: false, reason: `cannot read the symlink ${next} (${why(err)})` };
+      return { ok: false, reason: `cannot resolve ${next} (${why(err)})` };
     }
-    // A dangling symlink is NOT an absence: follow its target, in kernel order.
-    if (path.isAbsolute(target)) cur = path.parse(target).root;
-    queue.unshift(...parts(target));
+    traversed.push({ path: cur, st });
   }
-  return { ok: true, realPath: cur, exists: true };
+  return { ok: true, realPath: cur, exists: true, traversed };
 }
 
 /**
@@ -190,7 +197,7 @@ export function checkContainment(p: string): Containment {
         `Use a path under your home directory or a temp directory.`,
     };
   }
-  const shared = sharedRootFault(realPath);
+  const shared = sharedRootFault(placed.traversed);
   if (shared) return { ok: false, reason: shared };
   return { ok: true, absPath, realPath, exists };
 }

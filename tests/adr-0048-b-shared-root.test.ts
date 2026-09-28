@@ -121,3 +121,55 @@ describe.skipIf(UID < 0)("ADR-0048 PR B — below a SHARED root, every existing 
     expect(checkContainment(path.join(d, "relay.db")).ok).toBe(true);
   });
 });
+
+describe.skipIf(UID < 0)("Codex #288 R1 P1-1 — the rule covers EVERY traversed component (symlinks and their targets), not just the final path", () => {
+  it("a FOREIGN-owned symlink in /tmp pointing at a safe target → refused (the link itself is a traversed component)", () => {
+    const safe = path.join(SHARED_DIR, "safe1");
+    fs.mkdirSync(safe);
+    const link = path.join(SHARED_DIR, "foreign-link");
+    fs.symlinkSync(safe, link);
+    patchLstat(link, { uid: UID + 1 });
+    refused(path.join(link, "relay.db"), /owned by uid/);
+  });
+  it("a /tmp link into ANOTHER user's per-user directory → refused (the target side is checked once the walk touched a shared root)", () => {
+    const theirs = path.join(PER_USER, "their-dir");
+    fs.mkdirSync(theirs);
+    const link = path.join(SHARED_DIR, "to-theirs");
+    fs.symlinkSync(theirs, link);
+    patchLstat(theirs, { uid: UID + 1 });
+    refused(path.join(link, "relay.db"), /owned by uid/);
+  });
+  it("a FOREIGN-owned /tmp parent holding a symlink to a safe /tmp target → refused (the parent is traversed)", () => {
+    const safe = path.join(SHARED_DIR, "safe2");
+    fs.mkdirSync(safe);
+    const parent = path.join(SHARED_DIR, "foreign-parent");
+    fs.mkdirSync(parent);
+    fs.symlinkSync(safe, path.join(parent, "link"));
+    patchLstat(parent, { uid: UID + 1 });
+    refused(path.join(parent, "link", "relay.db"), /owned by uid/);
+  });
+  it("TWIN: your own /tmp link to your own /tmp target → accepted", () => {
+    const safe = path.join(SHARED_DIR, "safe3");
+    fs.mkdirSync(safe);
+    const link = path.join(SHARED_DIR, "own-link");
+    fs.symlinkSync(safe, link);
+    expect(checkContainment(path.join(link, "relay.db")).ok).toBe(true);
+  });
+  it("TWIN: a symlink's OWN mode bits are ignored (Linux links are always 0777); its owner is not", () => {
+    const safe = path.join(SHARED_DIR, "safe4");
+    fs.mkdirSync(safe);
+    const link = path.join(SHARED_DIR, "lax-link");
+    fs.symlinkSync(safe, link);
+    const st = fs.lstatSync(link);
+    patchLstat(link, { mode: (st.mode & ~0o777) | 0o777 });
+    expect(checkContainment(path.join(link, "relay.db")).ok).toBe(true);
+  });
+  it("TWIN: a walk that never touches a shared root is unaffected (a group-writable dir under a per-user root, reached by a link there)", () => {
+    const d = path.join(PER_USER, "gw-target");
+    fs.mkdirSync(d);
+    fs.chmodSync(d, 0o775);
+    const link = path.join(PER_USER, "link-to-gw");
+    fs.symlinkSync(d, link);
+    expect(checkContainment(path.join(link, "relay.db")).ok).toBe(true);
+  });
+});

@@ -134,8 +134,9 @@ export async function run(argv: string[]): Promise<number> {
 
   if (resolvedDbPath && fs.existsSync(resolvedDbPath)) {
     try {
-      const Better = (await import("better-sqlite3")).default;
-      const probe = new Better(resolvedDbPath, { readonly: true, fileMustExist: true });
+      // ADR-0048: every raw handle gets db.ts's post-open re-check (one function).
+      const { openRawRelayDb } = await import("./_instance-db.js");
+      const probe = await openRawRelayDb(resolvedDbPath, { readonly: true });
       try {
         const tables = probe
           .prepare(

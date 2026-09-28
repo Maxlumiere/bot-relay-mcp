@@ -254,21 +254,33 @@ export async function run(argv: string[]): Promise<number> {
   // ADR-0048: the ONE strict resolver. On a fault there is NO wake at all, so it
   // is said in the DEGRADED vocabulary every watcher already greps for, and the
   // process exits non-zero instead of watching a guessed (dead) DB.
+  // EVERY startup failure path says it in that vocabulary (the resolution, the
+  // DB open and its containment re-check): a bare rejection would reach the
+  // generic CLI handler and exit non-zero with NO line the watchers grep for.
+  const degraded = (why: string): number => {
+    process.stderr.write(
+      `[sentinel] DEGRADED — no wake for ${agent}: ${why}\n` +
+        `[sentinel]   Nothing is being watched. Fix the cause (\`relay doctor\` shows it), then restart the watch.\n`,
+    );
+    return 1;
+  };
   {
     const { pinResolvedDbPath } = await import("./_instance-db.js");
     const resolveFault = await pinResolvedDbPath();
-    if (resolveFault) {
-      process.stderr.write(
-        `[sentinel] DEGRADED — no wake for ${agent}: instance resolution failed: ${resolveFault}\n` +
-          `[sentinel]   Nothing is being watched. Fix the cause (\`relay doctor\` shows it), then restart the watch.\n`,
-      );
-      return 1;
-    }
+    if (resolveFault) return degraded(`instance resolution failed: ${resolveFault}`);
   }
 
-  const { initializeDb, peekMailboxVersion, closeDb } = await import("../db.js");
-  await initializeDb();
-  const { markersEnabled, markerPath } = await import("../filesystem-marker.js");
+  let db: typeof import("../db.js");
+  let markers: typeof import("../filesystem-marker.js");
+  try {
+    db = await import("../db.js");
+    await db.initializeDb();
+    markers = await import("../filesystem-marker.js");
+  } catch (err) {
+    return degraded(`the relay DB could not be opened: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const { peekMailboxVersion, closeDb } = db;
+  const { markersEnabled, markerPath } = markers;
 
   let prevUnread: number | null = null;
   let prevEpoch: string | null = null;

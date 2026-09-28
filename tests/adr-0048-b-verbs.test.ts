@@ -107,7 +107,7 @@ for (const state of ["ambiguous", "empty", "eacces"] as State[]) {
   });
 }
 
-describe("ADR-0048 PR B — `relay list-instances` still LISTS in the ambiguous state (it is how you fix it)", () => {
+describe("ADR-0048 PR B — `relay list-instances` still LISTS in the ambiguous state (it is how you fix it), and EXITS NON-ZERO on the fault", () => {
   beforeEach(() => {
     setState("ambiguous");
     fs.writeFileSync(
@@ -115,19 +115,58 @@ describe("ADR-0048 PR B — `relay list-instances` still LISTS in the ambiguous 
       JSON.stringify({ instance_id: "work", created_at: "2026-09-28T00:00:00Z", hostname: "h", daemon_version_first_seen: "x", label: null }),
     );
   });
-  it("text: exit 0, the instance listed, the fault named, the fix named", () => {
+  it("text: exit 1 (a fault is never a success), the instance listed, the fault named, the fix named", () => {
     const r = relay(["list-instances"], "");
-    expect(r.status, r.out).toBe(0);
+    expect(r.status, r.out).toBe(1);
     expect(r.out).toContain("work");
     expect(r.out).toMatch(/ambiguous/);
     expect(r.out).toMatch(/relay use-instance/);
   });
-  it("--json: exit 0, active_instance_id null, the resolution error carried", () => {
+  it("--json: exit 1, active_instance_id null, the resolution error carried", () => {
     const r = relay(["list-instances", "--json"], "");
-    expect(r.status, r.out).toBe(0);
+    expect(r.status, r.out).toBe(1);
     const j = JSON.parse(r.out.slice(0, r.out.lastIndexOf("}") + 1));
     expect(j.active_instance_id).toBeNull();
     expect(j.resolution_error).toMatch(/ambiguous/);
     expect(j.instances.map((m: { instance_id: string }) => m.instance_id)).toEqual(["work"]);
+  });
+});
+
+describe("ADR-0048 PR B (Codex #288 R1 P2-3) — no instances, but a resolution FAULT: never \"legacy mode is active\"", () => {
+  beforeEach(() => {
+    fs.rmSync(HOME, { recursive: true, force: true });
+    fs.mkdirSync(HOME, { recursive: true });
+  });
+  it("text: RELAY_INSTANCE_ID=\"..\" → exit 1, the fault named, no legacy-mode claim", () => {
+    const r = spawnSync("node", [RELAY_BIN, "list-instances"], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME, RELAY_INSTANCE_ID: ".." } });
+    const out = `${r.stdout}\n${r.stderr}`;
+    expect(r.status, out).toBe(1);
+    expect(out).toMatch(/path step, not a name/);
+    expect(out).not.toMatch(/legacy mode is active/);
+  });
+  it("--json: exit 1, resolution_error carried, the (empty) list still printed", () => {
+    const r = spawnSync("node", [RELAY_BIN, "list-instances", "--json"], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME, RELAY_INSTANCE_ID: ".." } });
+    expect(r.status, r.stderr).toBe(1);
+    const j = JSON.parse(r.stdout);
+    expect(j.resolution_error).toMatch(/path step/);
+    expect(j.instances).toEqual([]);
+  });
+  it("TWIN: no instances and NO fault → exit 0, the legacy-mode line", () => {
+    const r = spawnSync("node", [RELAY_BIN, "list-instances"], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME } });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toMatch(/legacy mode is active/);
+  });
+});
+
+describe("ADR-0048 PR B (Codex #288 R1 P2-4) — `relay watch`: EVERY failure path says DEGRADED, not only the first resolution", () => {
+  it("resolution passes, then the DB open fails (RELAY_DB_PATH names a directory) → DEGRADED + exit 1, no stack trace", () => {
+    fs.rmSync(HOME, { recursive: true, force: true });
+    const dir = path.join(HOME, "not-a-db");
+    fs.mkdirSync(dir, { recursive: true });
+    const r = spawnSync("node", [RELAY_BIN, "watch", "a", "--once"], { encoding: "utf-8", timeout: 30_000, env: { PATH: process.env.PATH ?? "", HOME, RELAY_DB_PATH: dir } });
+    const out = `${r.stdout}\n${r.stderr}`;
+    expect(r.status, out).toBe(1);
+    expect(out).toMatch(/\[sentinel\] DEGRADED — no wake for a: /);
+    expect(out, "never a stack trace").not.toMatch(/\n\s+at [^\n]+:\d+:\d+/);
   });
 });

@@ -112,8 +112,9 @@ export async function run(argv: string[]): Promise<number> {
 
   let db: import("../sqlite-compat.js").CompatDatabase;
   try {
-    const Better = (await import("better-sqlite3")).default;
-    db = new Better(dbPath, { readonly: true, fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
+    // ADR-0048: the raw handle gets db.ts's post-open re-check (one function).
+    const { openRawRelayDb } = await import("./_instance-db.js");
+    db = await openRawRelayDb(dbPath, { readonly: true });
   } catch (err) {
     return fleetFailed(`could not open ${dbPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
