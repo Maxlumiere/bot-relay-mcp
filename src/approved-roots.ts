@@ -26,14 +26,79 @@
  *      themselves symlinks).
  * `exists` is a POSITIVE fact from the same walk: true only when every component
  * resolved; any other error is a failure.
+ *
+ * SHARED roots (/tmp, /private/tmp) are world-writable, so another local user can
+ * pre-plant a component there. Below a shared root (ssh StrictModes style) the
+ * root must carry the sticky bit, and every EXISTING component, the file
+ * included, must be owned by the current uid or root and not group- or
+ * other-writable; otherwise the path is refused. The per-user roots (the home
+ * directory, /var/folders) are unaffected. Threat model: accidental faults,
+ * misconfiguration and CROSS-USER interference are in scope; a same-user
+ * adversary racing the daemon is not.
  */
 import fs from "fs";
 import os from "os";
 import path from "path";
 
+/** The world-writable approved roots, before realpath (subject to the ownership rule). */
+const SHARED_ROOT_BASES = ["/tmp", "/private/tmp"];
+
 /** The approved roots, before realpath. The ONLY place this list is written. */
 function approvedRootBases(): string[] {
-  return [os.homedir(), "/tmp", "/private/tmp", "/var/folders"];
+  return [os.homedir(), ...SHARED_ROOT_BASES, "/var/folders"];
+}
+
+/** The shared roots as REAL paths (on macOS /tmp is /private/tmp). */
+function sharedRootsReal(): string[] {
+  const out = new Set<string>();
+  for (const base of SHARED_ROOT_BASES) {
+    try {
+      out.add(fs.realpathSync.native(base));
+    } catch {
+      /* absent on this machine */
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Why `realPath` (a real path under an approved root) fails the shared-root
+ * ownership rule, or null when it passes or is not below a shared root. Every
+ * stat fault is a failure, never assumed safe.
+ */
+function sharedRootFault(realPath: string): string | null {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid === null) return null; // no POSIX ownership model (Windows)
+  const root = sharedRootsReal().find((r) => realPath.startsWith(r + path.sep));
+  if (!root) return null;
+  const inspect = (p: string): fs.Stats | "absent" | string => {
+    try {
+      return fs.lstatSync(p);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      return code === "ENOENT" ? "absent" : `cannot inspect ${p} (${code ?? String(err)})`;
+    }
+  };
+  const rootSt = inspect(root);
+  if (typeof rootSt === "string") return rootSt === "absent" ? `the shared directory ${root} is missing` : rootSt;
+  if (!(rootSt.mode & 0o1000)) {
+    return `${root} is a shared directory without the sticky bit: another user could replace your files there. Use a path under your home directory.`;
+  }
+  let cur = root;
+  for (const part of realPath.slice(root.length + 1).split(path.sep)) {
+    cur = path.join(cur, part);
+    const st = inspect(cur);
+    if (st === "absent") break; // the rest does not exist yet: created by you
+    if (typeof st === "string") return st;
+    if (st.isSymbolicLink()) return `${cur} changed into a symlink while it was being checked`;
+    if (st.uid !== uid && st.uid !== 0) {
+      return `${cur} is owned by uid ${st.uid}, not you (uid ${uid}): under the shared ${root}, another user could control it. Use a path under your home directory.`;
+    }
+    if (st.mode & 0o022) {
+      return `${cur} is group- or other-writable (mode 0${(st.mode & 0o777).toString(8)}): under the shared ${root}, another user could replace it. Remove that write permission, or use a path under your home directory.`;
+    }
+  }
+  return null;
 }
 
 /** The approved roots as REAL paths (a root that does not exist is skipped). */
@@ -125,5 +190,7 @@ export function checkContainment(p: string): Containment {
         `Use a path under your home directory or a temp directory.`,
     };
   }
+  const shared = sharedRootFault(realPath);
+  if (shared) return { ok: false, reason: shared };
   return { ok: true, absPath, realPath, exists };
 }
