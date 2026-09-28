@@ -39,7 +39,8 @@ import {
 } from "./sqlite-compat.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
-import { resolveInstanceDbPath } from "./instance.js";
+import { resolveInstance } from "./instance.js";
+import { checkContainment } from "./approved-roots.js";
 import { emitInboxChanged } from "./inbox-events.js";
 import { VERSION } from "./version.js";
 import { getAgentCliProfile } from "./agent-cli-profiles.js";
@@ -48,43 +49,27 @@ import { validateSchemaDocument, validateResult, type SchemaCheck } from "./task
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".bot-relay");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "relay.db");
 
-// Path traversal protection (v1.6.1): RELAY_DB_PATH must resolve under an
-// approved root. Mirrors the check-relay.sh hook logic.
-const APPROVED_ROOTS = [
-  os.homedir(),
-  "/tmp",
-  "/private/tmp", // macOS real path for /tmp
-  "/var/folders", // macOS test tmpdirs
-];
-
-/** Exported so `relay pending` applies the SAME containment rule (no copy). */
-export function isPathUnderApprovedRoot(resolved: string): boolean {
-  return APPROVED_ROOTS.some((root) => {
-    const rootResolved = path.resolve(root);
-    return resolved === rootResolved || resolved.startsWith(rootResolved + path.sep);
-  });
+/**
+ * The DB path this process opens. ADR-0048: through the ONE strict resolver
+ * (src/instance.ts resolveInstance): containment on REAL paths is inside it, and
+ * any fault THROWS instead of landing on the flat DB.
+ */
+export function getDbPath(): string {
+  const r = resolveInstance();
+  if (r.kind === "error") throw new Error(r.reason);
+  return r.dbPath;
 }
 
-export function getDbPath(): string {
-  // v2.4.0 Part E — per-instance isolation. RELAY_DB_PATH still wins
-  // (explicit operator override); otherwise fall back to the per-
-  // instance path if multi-instance mode is active, then the legacy
-  // flat layout. Single-instance operators with existing setups see
-  // identical behavior to v2.3.x.
-  let raw: string;
-  if (process.env.RELAY_DB_PATH) {
-    raw = process.env.RELAY_DB_PATH;
-  } else {
-    raw = resolveInstanceDbPath();
+/**
+ * ADR-0048 re-check AFTER create (TOCTOU): the path was contained when it was
+ * resolved, but a parent could be swapped for a symlink before the directory is
+ * made or the file opened. Resolve it again once it exists; refuse if it escaped.
+ */
+function assertStillContained(dbPath: string): void {
+  const c = checkContainment(dbPath);
+  if (!c.ok) {
+    throw new Error(`REFUSING the relay DB after opening it: ${c.reason}`);
   }
-  const resolved = path.resolve(raw);
-  if (!isPathUnderApprovedRoot(resolved)) {
-    throw new Error(
-      `RELAY_DB_PATH resolves to '${resolved}', which is outside approved roots (${APPROVED_ROOTS.join(", ")}). ` +
-      `Set a path under your home directory or a temp directory.`
-    );
-  }
-  return resolved;
 }
 
 function now(): string {
@@ -315,6 +300,13 @@ export async function initializeDb(): Promise<void> {
   _db = await initDriver(dbPath);
   // And narrow the DB file itself to 0600 right after create.
   ensureSecureFile(dbPath, 0o600);
+  try {
+    assertStillContained(dbPath);
+  } catch (err) {
+    closeInitializedDb();
+    _db = null;
+    throw err;
+  }
 
   // #171 — single-sourced schema setup (pragmas + full migration chain + seed +
   // finalize + purge). Shared with getDb()'s native fallback so the two paths
@@ -343,6 +335,17 @@ export function getDb(): CompatDatabase {
   const Database = req("better-sqlite3");
   _db = new Database(dbPath) as unknown as CompatDatabase;
   ensureSecureFile(dbPath, 0o600);
+  try {
+    assertStillContained(dbPath);
+  } catch (err) {
+    try {
+      _db.close();
+    } catch {
+      /* closing a refused handle is best-effort */
+    }
+    _db = null;
+    throw err;
+  }
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.
   applySchemaSetup(_db);

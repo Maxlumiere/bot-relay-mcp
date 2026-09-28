@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed — instance resolution is one strict function: a fault never selects a different DB
+
+Every process picked its relay DB through helpers that swallowed file-system errors. An unreadable `~/.bot-relay/active-instance`, an I/O or permission error on `instances/`, or a marker that could not be read therefore landed the process on the flat `~/.bot-relay/relay.db`. Nothing said so: the relay looked healthy and read an empty mailbox. Now one resolver, `resolveInstance()`, serves the daemon and the CLI:
+
+- **The flat DB only on a positive absence** (no marker, and no instance directory). Any other fault is an error.
+- **The daemon refuses to start on an error.** **If you upgrade and the relay will not start:** run `relay doctor`. Its first line, "instance resolution", names the cause (for example a permission error on `~/.bot-relay/instances`, or instances present but none selected: `relay use-instance <id>`).
+- **The marker is read once.**
+- **Containment uses real paths:** a DB path whose parent is a symlink out of your home and temp directories is refused. Before, only the literal path was checked. The daemon checks again after it creates the DB. This one rule replaces three copies (the DB, backup destinations, config validation).
+- **`relay where`** prints what this environment resolves to. `relay pending --json` includes the same `resolution`.
+- **Deploy gate:** `relay where --expect-db PATH`, and `scripts/adr0048-deploy-gate.sh` for a running daemon.
+
+Tests:
+- `tests/adr-0048-resolve-instance.test.ts`: the state table, with fault injection per row; two-sided (every fault is an error, and every positive absence is still flat).
+- `tests/adr-0048-where-contract.test.ts`: `where` equals `pending`; the gate against a real daemon; the re-check after create; `relay doctor`.
+
 ### Fixed — session start showed encrypted mail as ciphertext; it now delivers pending mail through `relay pending`, decrypted, in drain order, with an honest count
 
 The SessionStart hook printed the raw stored body, so a relay with an encryption keyring showed `enc:…` ciphertext to the agent at session start. It also used its own copy of the pending predicate, ordered newest-first instead of the drain's order, and cut the list at 10 without saying so. Now:

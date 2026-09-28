@@ -464,10 +464,30 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   const results: CheckResult[] = [];
-  results.push(await checkConfig());
-  results.push(...(await checkDb()));
-  results.push(...checkPerms());
-  results.push(await checkDiskSpace());
+  // ADR-0048: the ONE strict resolver, reported first. On a fault, print it and
+  // skip the checks that need a DB path (they would only guess or crash); the
+  // daemon refuses to start on this same result.
+  const { resolveInstance } = await import("../instance.js");
+  const resolution = resolveInstance();
+  if (resolution.kind === "error") {
+    results.push({ name: "instance resolution", status: "FAIL", detail: resolution.reason });
+  } else {
+    const who =
+      resolution.kind === "instance"
+        ? `instance ${resolution.id} (${resolution.basis})`
+        : resolution.kind === "flat"
+          ? "flat"
+          : `explicit DB (${resolution.basis})`;
+    results.push({
+      name: "instance resolution",
+      status: resolution.kind === "flat" && resolution.warning ? "WARN" : "PASS",
+      detail: `${who} ${resolution.dbPath}${resolution.kind === "flat" && resolution.warning ? ` — ${resolution.warning}` : ""}`,
+    });
+    results.push(await checkConfig());
+    results.push(...(await checkDb()));
+    results.push(...checkPerms());
+    results.push(await checkDiskSpace());
+  }
   results.push(await checkDaemon());
   results.push(checkHooks());
   results.push(checkMcpServerPath());

@@ -8,6 +8,7 @@ import path from "path";
 import os from "os";
 import { validateKeyringStrict } from "./encryption.js";
 import { resolveInstanceConfigPath } from "./instance.js";
+import { checkContainment } from "./approved-roots.js";
 
 export interface RelayConfig {
   transport: "stdio" | "http" | "both";
@@ -364,18 +365,11 @@ export function validateConfigAndEnv(config: RelayConfig): void {
 
   // v2.0.1 (Codex MEDIUM 4): validate RELAY_DB_PATH up front so misconfig
   // fails at startup, not on first tool call.
+  // ADR-0048: the ONE containment rule, on REAL paths (src/approved-roots.ts).
   if (process.env.RELAY_DB_PATH) {
     const rawPath = process.env.RELAY_DB_PATH;
-    try {
-      const resolved = path.resolve(rawPath);
-      const approvedRoots = [os.homedir(), "/tmp", "/private/tmp", "/var/folders"].map((r) => path.resolve(r));
-      const underApproved = approvedRoots.some((root) => resolved === root || resolved.startsWith(root + path.sep));
-      if (!underApproved) {
-        errors.push(`RELAY_DB_PATH '${rawPath}' resolves to '${resolved}', which is outside approved roots (${approvedRoots.join(", ")})`);
-      }
-    } catch (err) {
-      errors.push(`RELAY_DB_PATH '${rawPath}' could not be resolved: ${String(err)}`);
-    }
+    const c = checkContainment(rawPath);
+    if (!c.ok) errors.push(`RELAY_DB_PATH '${rawPath}': ${c.reason}`);
   }
 
   // Rate limits

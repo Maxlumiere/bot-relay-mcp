@@ -142,6 +142,17 @@ A message sent to `alice` on instance `work` does NOT appear on instance `person
 - `RELAY_DB_PATH` still wins as an explicit override (e.g. for test harnesses). When set, the per-instance resolver is skipped.
 - Existing hook scripts + MCP server entries keep working. Point them at the per-instance paths only if you intentionally want to drive a specific instance.
 
+## ADR-0048 — ONE strict resolver: a fault never selects a different DB
+
+Every consumer (the daemon, `getDbPath`, `relay pending`, `relay doctor`, `relay where`, and every verb that resolves a DB path) goes through one function, `resolveInstance()` in `src/instance.ts`. Its priority is unchanged: `--db-path` / `RELAY_DB_PATH`, then `RELAY_INSTANCE_ID`, then the `active-instance` marker, then the flat `~/.bot-relay/relay.db`. What changed is **when the flat DB may be chosen**:
+
+- **Only on a positive absence:** the marker does not exist, and `instances/` does not exist, is empty, or holds no instance directories.
+- **Any other fault is an error, never the flat DB:** an unreadable or malformed marker, an I/O or permission error, a symlink loop, instances with none selected, or a path outside the approved roots. The daemon **refuses to start** on it, and `relay doctor` and `relay where` print the reason. Before, such a fault silently put the process on the flat DB: a relay that looked healthy and read an empty mailbox. `RELAY_ALLOW_LEGACY_FALLBACK=1` still opts into the flat DB when instances exist but none is selected, with a warning.
+- **The marker is read once.** The DB path comes from that one read.
+- **Containment uses real paths:** the DB path, after resolving symlinks, must sit under your home directory or a temp directory, so a symlinked parent cannot point it elsewhere. The daemon checks again after creating the DB.
+- **`relay where [--json]`** prints what this environment resolves to. `relay pending --json` embeds the same result. `relay where --expect-db PATH` exits non-zero unless the resolution names that DB.
+- **Before restarting a daemon onto a new build,** run `scripts/adr0048-deploy-gate.sh` (or `--pid PID`). It runs the new build's resolver under the running daemon's own environment, and passes only if it names the DB that daemon has open.
+
 ## v2.4.5 — every transport + hook resolves the same DB
 
 v2.4.0 shipped per-instance isolation, but only the HTTP daemon's startup path went through `resolveInstanceDbPath()`. The bash hooks (`hooks/check-relay.sh`, `hooks/post-tool-use-check.sh`, `hooks/stop-check.sh`) and the `relay doctor` CLI hardcoded `~/.bot-relay/relay.db`. Result: an operator with an active per-instance setup got silent split-brain — the daemon wrote to the per-instance DB while the SessionStart hook delivered mail from legacy. Codex caught this during the v2.4.4 R2 audit (its stdio session couldn't authenticate because its hook was reading legacy while its agent row lived per-instance).

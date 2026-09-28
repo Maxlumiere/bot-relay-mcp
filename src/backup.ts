@@ -36,6 +36,7 @@ import { spawnSync } from "child_process";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
+import { checkContainment } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
@@ -66,28 +67,15 @@ export const SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 /** Bump on any breaking change to the tar layout (files, manifest structure). */
 export const ARCHIVE_FORMAT_VERSION = 1;
 
-const APPROVED_ROOTS = [
-  os.homedir(),
-  "/tmp",
-  "/private/tmp",
-  "/var/folders",
-];
-
-function isPathUnderApprovedRoot(resolved: string): boolean {
-  return APPROVED_ROOTS.some((root) => {
-    const rootResolved = path.resolve(root);
-    return resolved === rootResolved || resolved.startsWith(rootResolved + path.sep);
-  });
-}
-
+/**
+ * A backup DESTINATION must sit under the approved roots, on REAL paths (the ONE
+ * containment rule, src/approved-roots.ts; ADR-0048). The destination is not an
+ * instance DB, so it is checked directly, not through resolveInstance.
+ */
 function assertSafePath(p: string, label: string): string {
-  const resolved = path.resolve(p);
-  if (!isPathUnderApprovedRoot(resolved)) {
-    throw new Error(
-      `${label} resolves to '${resolved}', which is outside approved roots (${APPROVED_ROOTS.join(", ")}).`
-    );
-  }
-  return resolved;
+  const c = checkContainment(p);
+  if (!c.ok) throw new Error(`${label}: ${c.reason}`);
+  return c.absPath;
 }
 
 function getConfigPath(): string {

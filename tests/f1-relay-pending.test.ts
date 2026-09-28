@@ -514,7 +514,7 @@ describe("F1 — containment: the connector's approved-roots rule applies to eve
         encoding: "utf-8",
         env: { PATH: process.env.PATH ?? "", HOME: HOME_DIR, RELAY_DB_PATH: outside },
       });
-      expect(conn.stdout, "the connector's getDbPath refuses the path").toMatch(/^THREW: .*outside approved roots/);
+      expect(conn.stdout, "the connector's getDbPath refuses the path").toMatch(/^THREW: .*outside the approved roots/);
       for (const via of ["--db-path", "RELAY_DB_PATH"] as const) {
         const r =
           via === "--db-path"

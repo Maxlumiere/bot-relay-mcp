@@ -122,6 +122,10 @@ $ relay restore ~/.bot-relay/backups/relay-backup-*.tar.gz
 Restore complete. schema_version=1, previous DB saved to: ~/.bot-relay/backups/pre-restore-<iso>.tar.gz
 ```
 
+## `relay where [--json] [--db-path P] [--expect-db PATH]`
+
+Which relay DB this environment resolves to, as the relay's one strict resolver sees it (see [multi-instance.md](./multi-instance.md), "ADR-0048"). Read-only. `--json` prints the result (`kind`: `explicit-db`, `instance`, `flat` or `error`, with `db_path`, `exists`, and the reason on an error) plus the vault directory. `--expect-db PATH` exits 1 unless the result names that DB (compared by real path); it is the deploy gate for a daemon restart. Exit: 0 resolved (and matched), 1 a resolver fault or no match, 2 usage.
+
 ## `relay help`
 
 Prints the subcommand list. `relay <sub> --help` prints per-subcommand help.

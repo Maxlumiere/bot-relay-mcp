@@ -75,6 +75,7 @@ const SUBCOMMANDS = {
   bind: "../dist/cli/bind.js",
   fleet: "../dist/cli/fleet.js",
   pending: "../dist/cli/pending.js",
+  where: "../dist/cli/where.js",
   "release-binding": "../dist/cli/release-binding.js",
   "mint-token": "../dist/cli/mint-token.js",
   "purge-history": "../dist/cli/purge-history.js",
@@ -122,6 +123,7 @@ function printHelp(requested) {
       "  bind             Record THIS window's identity binding from the hook payload on stdin (ADR-0036 S1).\n" +
       "  fleet            List every recorded window binding, with liveness derived from the anchor.\n" +
       "  pending AGENT    What is pending for AGENT (metadata only, read-only, no window: the canonical pending set).\n" +
+      "  where            Which relay DB this environment resolves to (read-only; --expect-db is the deploy gate).\n" +
       "  release-binding NAME  Clear a STALE binding (refuses on a live anchor) so the next launch re-binds; preserves identity.\n" +
       "  mint-token NAME  Mint an agent token via filesystem (external-CLI setup).\n" +
       "  purge-history NAME  Delete every message + task where the agent is sender or recipient.\n" +
