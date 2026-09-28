@@ -52,6 +52,13 @@ afterEach(() => {
   }
 });
 
+// `relay bind` resolves its window anchor BEFORE the DB. Pin the anchor so every
+// environment reaches the resolver: the agent process this test runs under, when
+// there is one (CLAUDE_PID must AGREE with the ancestry walk), else this test's
+// own live pid. Unpinned, the row passed only where an agent was an ancestor.
+const { detectAgentProcess } = await import("../src/liveness.js");
+const ANCHOR_PID = String(detectAgentProcess()?.pid ?? process.pid);
+
 const PAYLOAD = JSON.stringify({ session_id: "11111111-2222-3333-4444-555555555555", hook_event_name: "SessionStart", cwd: "/tmp", source: "startup" });
 
 /** Every verb that resolves a relay DB. [label, argv, stdin]. */
@@ -79,7 +86,7 @@ function relay(argv: string[], stdin: string) {
     encoding: "utf-8",
     timeout: 30_000,
     input: stdin,
-    env: { PATH: process.env.PATH ?? "", HOME, RELAY_HTTP_PORT: "1", RELAY_AGENT_NAME: "a" },
+    env: { PATH: process.env.PATH ?? "", HOME, RELAY_HTTP_PORT: "1", RELAY_AGENT_NAME: "a", CLAUDE_PID: ANCHOR_PID },
   });
   return { status: r.status ?? -1, out: `${r.stdout ?? ""}\n${r.stderr ?? ""}` };
 }
@@ -91,6 +98,7 @@ for (const state of ["ambiguous", "empty", "eacces"] as State[]) {
       it(`relay ${label}`, () => {
         const r = relay(argv, stdin);
         expect(r.status, r.out).not.toBe(0);
+        expect(r.out, "precondition: the verb got past its window anchor to the resolver").not.toMatch(/window anchor/);
         expect(r.out, "the message names the resolver's cause").toMatch(REASON[state]);
         expect(r.out, "never a stack trace").not.toMatch(/\n\s+at [^\n]+:\d+:\d+/);
         if (label === "watch") expect(r.out, "watch is the wake path: it says DEGRADED").toMatch(/DEGRADED/);
