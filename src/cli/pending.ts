@@ -69,15 +69,20 @@ export async function openPendingDb(dbPath: string): Promise<import("../sqlite-c
 }
 
 /**
- * WHERE the answer comes from — decided here, from the connector's own resolver
- * (src/instance.ts), so no hook re-implements it (the F1 mode rule).
+ * WHERE the answer comes from — decided here, so no hook re-implements it (the F1
+ * mode rule). It uses the connector's own instance LAYOUT and marker reader
+ * (src/instance.ts: botRelayRoot, resolveActiveInstanceId, instanceDir) but NOT
+ * its fallbacks: resolveInstanceDbPath and describeInstanceResolution swallow fs
+ * errors and fall back to the flat DB, which the connector relies on and this
+ * command must not. Existence is decided by its own probes (verifiedExists).
  *
  * EXPLICIT configuration outranks AMBIENT signals:
  *   1. explicit local: --db-path, RELAY_DB_PATH, RELAY_INSTANCE_ID → that DB. A
  *      missing file is a READ failure (exit 1), never "no local instance".
  *   2. explicit remote: RELAY_HTTP_HOST set → "no-local" (exit 3). A caller with a
  *      remote relay configured is not redirected to a stray local file.
- *   3. ambient local: the active-instance marker, or the legacy flat DB file.
+ *   3. ambient local: the active-instance marker (read ONCE; the path is
+ *      instanceDir(id)/relay.db), or the legacy flat DB file.
  *      The AMBIGUOUS state (instances exist, none resolved) is refused loudly,
  *      exactly as the connector's assertInstanceResolution refuses it: a quiet
  *      read of the flat DB there is the nine-day silent-loss shape.
@@ -87,11 +92,14 @@ export async function openPendingDb(dbPath: string): Promise<import("../sqlite-c
  * absence that falls through to the flat DB or to exit 3.
  */
 export async function resolvePendingSource(dbPathFlag: string | null): Promise<PendingSource> {
-  const { resolveInstanceDbPath, resolveActiveInstanceId, botRelayRoot } = await import("../instance.js");
+  const { resolveActiveInstanceId, instanceDir, botRelayRoot } = await import("../instance.js");
+  // The DB path of a KNOWN id, from the layout alone (no filesystem read, so no
+  // fallback). instanceDir throws on an id outside [A-Za-z0-9._-]: that is exit 1.
+  const instanceDbPath = (id: string): string => path.join(instanceDir(id) as string, "relay.db");
   if (dbPathFlag) return { kind: "local", dbPath: dbPathFlag, basis: "--db-path" };
   if (process.env.RELAY_DB_PATH) return { kind: "local", dbPath: process.env.RELAY_DB_PATH, basis: "RELAY_DB_PATH" };
   if (process.env.RELAY_INSTANCE_ID) {
-    return { kind: "local", dbPath: resolveInstanceDbPath(), basis: "RELAY_INSTANCE_ID" };
+    return { kind: "local", dbPath: instanceDbPath(process.env.RELAY_INSTANCE_ID), basis: "RELAY_INSTANCE_ID" };
   }
   if (process.env.RELAY_HTTP_HOST) {
     return {
@@ -124,10 +132,14 @@ export async function resolvePendingSource(dbPathFlag: string | null): Promise<P
     };
   }
   if (marker) {
-    if (!resolveActiveInstanceId()) {
+    // Read the marker ONCE and keep the id. A second read through
+    // resolveInstanceDbPath could fail, be swallowed, and fall back to the flat
+    // DB under this label (Codex #285 round 2).
+    const id = resolveActiveInstanceId();
+    if (!id) {
       return { kind: "unreadable", reason: `the active-instance marker under ${root} exists but could not be read` };
     }
-    return { kind: "local", dbPath: resolveInstanceDbPath(), basis: "active-instance" };
+    return { kind: "local", dbPath: instanceDbPath(id), basis: "active-instance" };
   }
   if (instanceDirs) {
     return {

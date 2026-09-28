@@ -21,7 +21,7 @@
  *      failure to read exits non-zero, loudly, with empty stdout.
  *   5. The name is the resolved identity, never `default`.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -450,6 +450,45 @@ describe("F1 — read-only: no logical write, and the main DB file is byte-ident
       expect(() => h.prepare("UPDATE messages SET seq = 1").run()).toThrow(/readonly/i);
     } finally {
       h.close();
+    }
+  });
+});
+
+// Codex #285 round 2, P1 (DETAIL). The marker must be read ONCE: a second read
+// through a shared helper (resolveInstanceDbPath) could fail, be swallowed, and
+// fall back to the FLAT DB while still labeled "active-instance". Injected
+// in-process, as Codex measured it: the first readlink succeeds, any later one
+// throws EIO.
+describe("F1 — the active-instance marker is read once; a later failure cannot select the flat DB", () => {
+  it("REGRESSION: first marker read ok, a second would fail → the INSTANCE DB, never the flat one", async () => {
+    const RH = path.join(ROOT, "rh-once");
+    fs.mkdirSync(path.join(RH, "instances", "inst-a"), { recursive: true });
+    fs.writeFileSync(path.join(RH, "instances", "inst-a", "relay.db"), "");
+    fs.writeFileSync(path.join(RH, "relay.db"), ""); // the flat DB a fallback would pick
+    fs.symlinkSync("inst-a", path.join(RH, "active-instance"));
+
+    const keys = ["RELAY_DB_PATH", "RELAY_INSTANCE_ID", "RELAY_HTTP_HOST", "RELAY_HOME"] as const;
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    for (const k of keys) delete process.env[k];
+    process.env.RELAY_HOME = RH;
+    const real = fs.readlinkSync;
+    let calls = 0;
+    const spy = vi.spyOn(fs, "readlinkSync").mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      calls++;
+      if (calls >= 2) throw Object.assign(new Error("EIO: injected on the second marker read"), { code: "EIO" });
+      return (real as (...a: unknown[]) => unknown)(p, ...rest);
+    }) as typeof fs.readlinkSync);
+    try {
+      const { resolvePendingSource } = await import("../src/cli/pending.js");
+      const src = await resolvePendingSource(null);
+      expect(calls, "precondition: the marker was read through the spied readlink").toBeGreaterThanOrEqual(1);
+      expect(src).toEqual({ kind: "local", dbPath: path.join(RH, "instances", "inst-a", "relay.db"), basis: "active-instance" });
+    } finally {
+      spy.mockRestore();
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
     }
   });
 });
