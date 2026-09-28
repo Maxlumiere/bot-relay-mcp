@@ -193,6 +193,10 @@ HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_vault-helpers.sh
 . "$HOOKS_DIR/_vault-helpers.sh"
+# This hook's INSTALLED timeout in seconds. The source of truth is
+# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
+# equal, so a budget change there cannot silently outrun the read deadline here.
+RELAY_HOOK_BUDGET_SECS=5
 RELAY_CLI="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
 MAX_MESSAGES="${RELAY_HOOK_MAX_MESSAGES:-20}"
 DAMPER_SECS="${RELAY_STOP_WAKE_DAMPER_SECS:-120}"
@@ -368,27 +372,40 @@ PYEOF
 # is read for it, and no judgement is made.
 case "$AGENT_NAME" in
   [Dd][Ee][Ff][Aa][Uu][Ll][Tt])
-    command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "agent name unresolved (default): mail not read" " agent=\"${AGENT_NAME}\""
+    command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "agent name unresolved (default): mail not read" " agent=\"${AGENT_NAME}\" remedy=\"relay init --agent <name>, or set RELAY_AGENT_NAME\""
     exit 0
     ;;
 esac
 
 F1_OUT="" F1_ERR="" F1_RC=127
-if [ -f "$RELAY_CLI" ] && command -v node >/dev/null 2>&1; then
-  _f1_errf="$(mktemp 2>/dev/null || printf '')"
-  if [ -n "$_f1_errf" ]; then
-    F1_OUT=$(relay_run_with_deadline "$(relay_pending_deadline)" node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>"$_f1_errf")
-    F1_RC=$?
-    F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null || head -n 1 "$_f1_errf" 2>/dev/null)
-    rm -f "$_f1_errf" 2>/dev/null
-  else
-    F1_OUT=$(relay_run_with_deadline "$(relay_pending_deadline)" node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>/dev/null)
-    F1_RC=$?
-  fi
-  # A stall ends at the deadline (124), LOUD: never an endless hook.
-  [ "$F1_RC" -eq 124 ] && F1_ERR="relay pending timed out after $(relay_pending_deadline)s"
+_f1_outf=""
+_f1_errf=""
+# The TRUE cause when the read cannot even start: never phrased as an unreadable DB.
+if ! command -v node >/dev/null 2>&1; then
+  F1_ERR="node not found (the relay CLI runs on node)"
+elif [ ! -f "$RELAY_CLI" ]; then
+  F1_ERR="no relay CLI beside this hook ($RELAY_CLI)"
 else
-  F1_ERR="no runnable relay CLI beside this hook ($RELAY_CLI)"
+  _f1_outf="$(mktemp 2>/dev/null || printf '')"
+  _f1_errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -z "$_f1_outf" ] || [ -z "$_f1_errf" ]; then
+    F1_ERR="could not create a private temp file for the read"
+  else
+    # The read's files are removed on EVERY exit, then the verdict is emitted.
+    trap 'rm -f "$_f1_outf" "$_f1_errf" "$_f1_outf.timedout" 2>/dev/null; relay_emit_verdict' EXIT
+    # node runs DIRECTLY into files under a watchdog, inside this hook's installed
+    # budget (relay_run_pending / relay_pending_deadline in _vault-helpers.sh).
+    _f1_deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
+    relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json
+    F1_RC=$?
+    F1_OUT=$(cat "$_f1_outf" 2>/dev/null)
+    F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null)
+    if [ "$F1_RC" -eq 124 ]; then
+      F1_ERR="timed out after ${_f1_deadline}s"
+    elif [ "$F1_RC" -ne 0 ] && [ "$F1_RC" -ne 3 ] && [ -z "$F1_ERR" ]; then
+      F1_ERR="node crashed (exit $F1_RC): relay pending gave no reason"
+    fi
+  fi
 fi
 
 SUMMARY=""

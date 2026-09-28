@@ -367,9 +367,11 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     // separately by tests/v2-6-1-token-store.test.ts:test 12 / 12b.
   });
 
-  it("(C5) DB outside $HOME and not /tmp → exit 0 with stderr warning (path-traversal guard)", () => {
-    // The hook rejects DB paths outside $HOME / /tmp / /private/tmp /
-    // /var/folders. Assert the rejection emits the documented stderr line.
+  it("(C5) DB outside $HOME and not /tmp → exit 0; the guard never exits mute, and stdout holds only the LOUD mail-read line", () => {
+    // The hook's OWN sqlite reads refuse DB paths outside $HOME / /tmp /
+    // /private/tmp / /var/folders. Since the F1 mode rule (D2) that no longer ends
+    // the hook: relay pending still decides the mail, and a configured DB it
+    // cannot read is a LOUD local failure. Still no partial-state context.
     const { root } = freshTestRoot();
     const outsideDb = path.join(root, "..", "..", "etc", "fake.db");
     const r = runHook({
@@ -379,9 +381,11 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
       dbPath: outsideDb,
       httpPort: 1,
     });
-    // Either status 0 with stderr warning, OR clean exit. Whatever shape,
-    // stdout MUST be empty (never partial-state context).
-    expect(stripVerdict(r.stdout)).toBe("");
+    expect(r.status).toBe(0);
+    const out = stripVerdict(r.stdout);
+    expect(out.split("\n"), out).toHaveLength(1);
+    expect(out).toMatch(/^\[RELAY\] relay unreadable: pending mail for build-agent could not be read/);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 });
 

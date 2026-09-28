@@ -75,7 +75,7 @@ const STUB_SENDER = "stub-sender";
 // is-error / error-json: Codex's measured shapes. The *-page modes ISOLATE each check:
 // a body that is otherwise a valid EMPTY page, so only that one check stands between
 // a tool error and a "verified empty" mailbox.
-let stubMode: "ok" | "is-error" | "error-json" | "is-error-page" | "error-code-page" = "ok";
+let stubMode: "ok" | "is-error" | "error-json" | "is-error-page" | "error-code-page" | "bool-total" | "pos-total-empty" | "neg-total" = "ok";
 
 /** A counting stand-in for a daemon: answers /health and any /mcp call with ONE plausible pending message. */
 function startStub(): Promise<void> {
@@ -92,13 +92,20 @@ function startStub(): Promise<void> {
       if (stubMode !== "ok") {
         const emptyPage = { messages: [], count: 0, total_pending: 0, since_bound: null };
         const body =
-          stubMode === "is-error-page"
+          stubMode === "bool-total"
+            ? { messages: [], total_pending: false }
+            : stubMode === "pos-total-empty"
+              ? { messages: [], total_pending: 5 }
+              : stubMode === "neg-total"
+                ? { messages: [], total_pending: -1 }
+                : stubMode === "is-error-page"
             ? emptyPage
             : stubMode === "error-code-page"
               ? { ...emptyPage, error_code: "AUTH_FAILED" }
               : { error_code: "AUTH_FAILED", error: "stub: token rejected" };
         const text = JSON.stringify(body);
         const flagged = stubMode === "is-error" || stubMode === "is-error-page";
+        // (The bounds modes are NOT tool errors: a well-formed result whose page cannot be true.)
         const result = flagged ? { isError: true, content: [{ type: "text", text }] } : { content: [{ type: "text", text }] };
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
@@ -395,7 +402,9 @@ describe("F1 hook migration — Stop hook: the same mode rule", () => {
 });
 
 describe("#286 Codex R1 #4 — a remote TOOL ERROR is never a successful empty read", () => {
-  for (const mode of ["is-error", "error-json", "is-error-page", "error-code-page"] as const) {
+  // bool-total / pos-total-empty / neg-total: Codex #286 R2. A boolean is not an integer
+  // (Python counts it as one), and an empty page cannot hold a positive or negative total.
+  for (const mode of ["is-error", "error-json", "is-error-page", "error-code-page", "bool-total", "pos-total-empty", "neg-total"] as const) {
     for (const [label, hook, stdin] of [["Stop", STOP_HOOK, STOP_STDIN], ["PostToolUse", PTU_HOOK, PTU_STDIN]] as const) {
       it(`${label}: an MCP result [${mode}] is a FAILED read (no HEALTHY), not an empty mailbox`, async () => {
         stubMode = mode;

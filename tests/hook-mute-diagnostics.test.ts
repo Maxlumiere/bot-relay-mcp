@@ -323,7 +323,8 @@ describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
     try {
       const out = runHook({ RELAY_DB_PATH: instanceDb(), PATH: `${binDir}:${process.env.PATH ?? ""}` });
       expect(verdictOf(out)).toBe("DEGRADED");
-      expect(out).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
+      // The reason names the TRUE cause (node crashed), never an unreadable DB.
+      expect(out).toMatch(/VERDICT=DEGRADED reason="relay unreadable: node crashed/);
     } finally { fs.rmSync(binDir, { recursive: true, force: true }); }
   });
 
@@ -333,7 +334,8 @@ describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
     linkInstance(); writeConfig(DEAD);
     const out = runHook({ RELAY_DB_PATH: instanceDb(), PATH: "/usr/bin:/bin" });
     expect(verdictOf(out)).toBe("DEGRADED");
-    expect(out).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
+    // The reason names the TRUE cause (node not found), never an unreadable DB.
+    expect(out).toMatch(/VERDICT=DEGRADED reason="relay unreadable: node not found/);
   });
 
   it("emits EXACTLY ONE verdict — never two, never zero", () => {

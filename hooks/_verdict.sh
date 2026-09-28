@@ -81,10 +81,57 @@
 #     held by another live agent).
 # A hook uses no other word; tests/f1-286-codex-r1.test.ts checks every
 # relay_verdict_set call in hooks/ against this list.
+#
+# The words are a TOTAL ORDER, most severe first: MUTE > AUTH_FAILED > UNWAKEABLE > TAKEOVER_LIVENESS_UNVERIFIABLE > REGISTER_FAILED > DEGRADED > CANNOT-JUDGE > HEALTHY
+# relay_verdict_raise applies it: the most severe verdict wins, and a less severe
+# one changes nothing. At the SAME level BOTH reasons are kept, joined with "; ":
+# a mail-path reason goes FIRST (the fault the agent must act on stays visible),
+# any other joins after the existing one. The placeholder reason ("hook did not
+# reach a conclusion") is not a fault and is simply replaced.
 
 RELAY_VERDICT="CANNOT-JUDGE"
 RELAY_VERDICT_REASON="hook did not reach a conclusion"
 RELAY_VERDICT_DETAIL=""
+
+# Position in the total order: 1 = most severe. An unknown word ranks 0 (above
+# everything) so it is never silently downgraded.
+relay_verdict_rank() {
+  case "$1" in
+    MUTE) echo 1 ;;
+    AUTH_FAILED) echo 2 ;;
+    UNWAKEABLE) echo 3 ;;
+    TAKEOVER_LIVENESS_UNVERIFIABLE) echo 4 ;;
+    REGISTER_FAILED) echo 5 ;;
+    DEGRADED) echo 6 ;;
+    CANNOT-JUDGE) echo 7 ;;
+    HEALTHY) echo 8 ;;
+    *) echo 0 ;;
+  esac
+}
+
+# relay_verdict_raise WORD REASON [DETAIL] [mail]
+# The total order (see VERDICT WORDS above). Pass "mail" as the 4th argument for
+# a mail-path reason, so a same-level join puts it first.
+relay_verdict_raise() {
+  local cur new
+  cur=$(relay_verdict_rank "$RELAY_VERDICT")
+  new=$(relay_verdict_rank "$1")
+  if [ "$new" -lt "$cur" ]; then
+    relay_verdict_set "$1" "$2" "${3:-}"
+    return 0
+  fi
+  [ "$new" -gt "$cur" ] && return 0
+  if [ -z "$RELAY_VERDICT_REASON" ] || [ "$RELAY_VERDICT_REASON" = "hook did not reach a conclusion" ]; then
+    relay_verdict_set "$1" "$2" "${3:-}"
+    return 0
+  fi
+  case "$RELAY_VERDICT_REASON" in *"$2"*) return 0 ;; esac
+  if [ "${4:-}" = "mail" ]; then
+    relay_verdict_set "$1" "$2; $RELAY_VERDICT_REASON" "$RELAY_VERDICT_DETAIL"
+  else
+    relay_verdict_set "$1" "$RELAY_VERDICT_REASON; $2" "$RELAY_VERDICT_DETAIL"
+  fi
+}
 
 # relay_verdict_set VERDICT REASON [DETAIL]
 # Upgrade the verdict. Kept as a function so no caller hand-rolls the shape, and

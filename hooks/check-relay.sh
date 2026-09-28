@@ -27,7 +27,9 @@
 # Security notes (v1.6):
 # - All env-var inputs are validated against an allowlist regex BEFORE use.
 # - Names/roles/caps that contain anything outside [A-Za-z0-9_.-] are rejected.
-# - DB_PATH is resolved and must live under $HOME (no /etc/passwd shenanigans).
+# - DB_PATH is resolved and must live under $HOME or a temp root for this hook's OWN
+#   sqlite reads; a path outside them skips those reads (DEGRADED in local mode),
+#   it never ends the hook (the mail read is decided by relay pending).
 # - SQL is parameterised via sqlite3's `.parameter set` rather than string-interpolated.
 
 # VERDICT BY CONSTRUCTION — must be the FIRST executable code in this file.
@@ -62,7 +64,10 @@ RELAY_VERDICT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # CANNOT-JUDGE at exit. Defined here, after the helper, so a helper that failed
 # to load still leaves the fallback trap in place.
 RELAY_MAIL_READ_DONE=0
+RELAY_TMP_FILES=""
 relay_finalize_verdict() {
+  # shellcheck disable=SC2086 # a space-separated list of mktemp paths
+  [ -n "$RELAY_TMP_FILES" ] && rm -f $RELAY_TMP_FILES 2>/dev/null
   if [ "$RELAY_VERDICT" = "HEALTHY" ] && [ "${RELAY_MAIL_READ_DONE:-0}" != "1" ]; then
     RELAY_VERDICT="CANNOT-JUDGE"
     RELAY_VERDICT_REASON="health unverified: the session-start mail read did not complete"
@@ -162,6 +167,10 @@ fi
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_vault-helpers.sh
 . "$HOOKS_DIR/_vault-helpers.sh"
+# This hook's INSTALLED timeout in seconds. The source of truth is
+# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
+# equal. The mail read's deadline is what is LEFT of it after registration.
+RELAY_HOOK_BUDGET_SECS=10
 # v2.7.2 — manifest-fallback (see comment above the AGENT_NAME default). Only
 # kicks in when env-derived name is empty or literal "default" — operators who
 # explicitly want the "default" agent (rare, but legitimate) can opt out by
@@ -269,13 +278,34 @@ if [ -n "$AGENT_CAPS" ]; then
   fi
 fi
 
-# DB path must live under HOME (or under /tmp for tests). Resolve symlinks first.
-RESOLVED_DB_PATH=$(cd "$(dirname "$DB_PATH")" 2>/dev/null && pwd)/$(basename "$DB_PATH")
-if [ -z "$RESOLVED_DB_PATH" ] || { [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ "$RESOLVED_DB_PATH" != /tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /private/tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /var/folders/* ]]; }; then
-  echo "[bot-relay] RELAY_DB_PATH must live under \$HOME or /tmp. Got: '$RESOLVED_DB_PATH'" >&2
-  exit 0
+# The DB path THIS HOOK's own reads use (liveness, anchor, tasks, topology). The
+# mail read does not use it: relay pending resolves its own. Three states, never
+# a made-up path and never a mute exit:
+#   usable     — its directory resolves, under $HOME or a temp root;
+#   unresolved — its directory does not resolve (absent, or not enterable): no DB
+#                file can be read there by this hook; relay pending decides;
+#   rejected   — it resolves OUTSIDE $HOME and the temp roots (the containment
+#                guard): this hook's own reads are skipped, and in LOCAL mode
+#                that is DEGRADED with the reason.
+# (A failed `cd` used to become '/relay.db' and exit mute: Codex #286 R2 D2.)
+RELAY_LOCAL_DB_STATE="usable"
+RELAY_LOCAL_DB_WHY=""
+_relay_db_dir=""
+if [ -n "$DB_PATH" ]; then
+  _relay_db_dir=$(cd "$(dirname "$DB_PATH")" 2>/dev/null && pwd) || _relay_db_dir=""
 fi
-DB_PATH="$RESOLVED_DB_PATH"
+if [ -z "$DB_PATH" ] || [ -z "$_relay_db_dir" ]; then
+  RELAY_LOCAL_DB_STATE="unresolved"
+else
+  RESOLVED_DB_PATH="$_relay_db_dir/$(basename "$DB_PATH")"
+  if [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ "$RESOLVED_DB_PATH" != /tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /private/tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /var/folders/* ]]; then
+    RELAY_LOCAL_DB_STATE="rejected"
+    RELAY_LOCAL_DB_WHY="it resolves outside HOME and the temp roots"
+    echo "[bot-relay] RELAY_DB_PATH must live under \$HOME or /tmp. Got: '$RESOLVED_DB_PATH'. This hook's own DB reads are skipped; the mail read is still decided by relay pending." >&2
+  else
+    DB_PATH="$RESOLVED_DB_PATH"
+  fi
+fi
 
 # --- SELF-DIAGNOSING MUTE DETECTION -----------------------------------------
 # Standing rule: a failure that presents as normal operation must be converted
@@ -490,7 +520,9 @@ fi
 #   - bodies go through the TS decrypting accessor, so a keyring user sees
 #     plaintext, and an undecryptable body shows a placeholder, never `enc:`;
 #   - the read marks nothing (read-only handle, no seq), and is bounded by a
-#     deadline (RELAY_PENDING_TIMEOUT_SECS, default 10): a stall is reported;
+#     deadline inside this hook's installed budget (RELAY_HOOK_BUDGET_SECS, minus
+#     what registration already used; RELAY_PENDING_TIMEOUT_SECS may only shorten
+#     it): a stall is reported;
 #   - the header says how many of the canonical total are shown, and an answer
 #     whose count contradicts its messages is refused, never shown as no mail.
 # KNOWN LIMIT: the liveness and task reads in this hook still resolve the DB in
@@ -565,13 +597,17 @@ process.stdin.on("end", () => {
 '
 RELAY_PENDING_SHOW=10
 
-# A concluded fault on the mail path: DEGRADED, "<reason>". It replaces only
-# HEALTHY or CANNOT-JUDGE, so it never masks a louder verdict (MUTE, UNWAKEABLE…).
+# Verdicts on the mail path go through the TOTAL ORDER (relay_verdict_raise in
+# _verdict.sh): the most severe wins, and at the same level both reasons are
+# kept, the mail-path one first. Without the helper (it failed to load), nothing
+# is changed: the fallback verdict stands.
+relay_mail_verdict() { # WORD REASON [mail|other]
+  command -v relay_verdict_raise >/dev/null 2>&1 || return 0
+  relay_verdict_raise "$1" "$2" " agent=\"$AGENT_NAME\"" "${3:-mail}"
+}
+# A concluded fault on the mail path: DEGRADED, "<reason>".
 relay_degrade() {
-  command -v relay_verdict_set >/dev/null 2>&1 || return 0
-  case "$RELAY_VERDICT" in
-    HEALTHY|CANNOT-JUDGE) relay_verdict_set "DEGRADED" "$1" " agent=\"$AGENT_NAME\"" ;;
-  esac
+  relay_mail_verdict "DEGRADED" "$1" mail
 }
 
 relay_mail_unreadable() {
@@ -585,9 +621,8 @@ relay_mail_unreadable() {
 relay_remote_failed() {
   echo "[RELAY] remote relay read failed: pending mail for $AGENT_NAME could not be read at session start. Mail may be waiting: call get_messages."
   echo "[bot-relay] remote mail read failed for $AGENT_NAME: $1" >&2
-  if command -v relay_verdict_set >/dev/null 2>&1 && [ "$RELAY_VERDICT" = "HEALTHY" ]; then
-    relay_verdict_set "CANNOT-JUDGE" "remote relay read failed: $1" " agent=\"$AGENT_NAME\""
-  fi
+  RELAY_MAIL_MODE="remote-failed"
+  relay_mail_verdict "CANNOT-JUDGE" "remote relay read failed: $1" mail
 }
 
 # REMOTE mode only (relay pending said: no local instance; RELAY_HTTP_HOST set).
@@ -609,41 +644,59 @@ relay_deliver_remote_mail() {
   block=$(printf '%s' "$resp" | SRC=http AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null) \
     || { relay_remote_failed "the remote relay answered with an error or an untrusted page"; return 0; }
   RELAY_MAIL_READ_DONE=1
+  RELAY_MAIL_MODE="remote"
   if [ -n "$block" ]; then
     printf '%s\n\n' "$block"
     echo "[bot-relay] $AGENT_NAME has pending messages (delivered to context, via remote relay)." >&2
   fi
 }
 
+RELAY_MAIL_MODE="" # local | unreadable | remote | remote-failed | none | unresolved-name
+
 relay_deliver_pending_mail() {
-  local bin out="" rc=127 why="no runnable relay CLI beside this hook" errf block=""
+  local bin outf errf deadline out="" rc=127 why="" block=""
   # The unresolved fallback name is never an identity (ADR-0044 point 5): relay
   # pending refuses it, and no mail is read for it. That is no judgement, not a
   # fault of the relay.
   case "$AGENT_NAME" in
     [Dd][Ee][Ff][Aa][Uu][Ll][Tt])
-      echo "[bot-relay] mail not read at session start: this window's agent name is unresolved (\"default\"). Set RELAY_AGENT_NAME." >&2
-      if command -v relay_verdict_set >/dev/null 2>&1 && [ "$RELAY_VERDICT" = "HEALTHY" ]; then
-        relay_verdict_set "CANNOT-JUDGE" "agent name unresolved (default): mail not read" " agent=\"$AGENT_NAME\""
-      fi
+      echo "[bot-relay] mail not read at session start: this window's agent name is unresolved (\"default\"). Run: relay init --agent <name> (or set RELAY_AGENT_NAME)." >&2
+      RELAY_MAIL_MODE="unresolved-name"
+      relay_mail_verdict "CANNOT-JUDGE" "agent name unresolved (default): mail not read; run relay init --agent <name>, or set RELAY_AGENT_NAME" mail
       return 0
       ;;
   esac
   bin="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
-  if [ -f "$bin" ] && command -v node >/dev/null 2>&1; then
+  # The TRUE cause when the read cannot even start: never phrased as an unreadable DB.
+  if ! command -v node >/dev/null 2>&1; then
+    why="node not found (the relay CLI runs on node)"
+  elif [ ! -f "$bin" ]; then
+    why="no relay CLI beside this hook ($bin)"
+  else
+    outf="$(mktemp 2>/dev/null || printf '')"
     errf="$(mktemp 2>/dev/null || printf '')"
-    out=$(relay_run_with_deadline "$(relay_pending_deadline)" node "$bin" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW" 2>"${errf:-/dev/null}")
-    rc=$?
-    if [ -n "$errf" ]; then
-      why=$(grep -m 1 'PENDING_' "$errf" 2>/dev/null || head -n 1 "$errf" 2>/dev/null)
-      rm -f "$errf" 2>/dev/null
+    if [ -z "$outf" ] || [ -z "$errf" ]; then
+      why="could not create a private temp file for the read"
+    else
+      RELAY_TMP_FILES="$RELAY_TMP_FILES $outf $errf $outf.timedout"
+      # node runs DIRECTLY into files under a watchdog, inside what is LEFT of this
+      # hook's installed budget (relay_run_pending / relay_pending_deadline).
+      deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
+      relay_run_pending "$deadline" "$outf" "$errf" node "$bin" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW"
+      rc=$?
+      out=$(cat "$outf" 2>/dev/null)
+      why=$(grep -m 1 'PENDING_' "$errf" 2>/dev/null)
+      if [ "$rc" -eq 124 ]; then
+        why="timed out after ${deadline}s"
+      elif [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && [ -z "$why" ]; then
+        why="node crashed (exit $rc): relay pending gave no reason"
+      fi
     fi
-    [ "$rc" -eq 124 ] && why="relay pending timed out after $(relay_pending_deadline)s"
   fi
   case "$rc" in
     0)
       block=$(printf '%s' "$out" | SRC=f1 AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null) \
-        || { relay_mail_unreadable "relay pending returned an answer this hook cannot trust"; return 0; }
+        || { RELAY_MAIL_MODE="unreadable"; relay_mail_unreadable "relay pending returned an answer this hook cannot trust"; return 0; }
       ;;
     3)
       if [ -n "${RELAY_HTTP_HOST:-}" ]; then
@@ -651,29 +704,40 @@ relay_deliver_pending_mail() {
         return 0
       fi
       # Nothing to read, and no judgement made about the mail.
-      if command -v relay_verdict_set >/dev/null 2>&1 && [ "$RELAY_VERDICT" = "HEALTHY" ]; then
-        relay_verdict_set "CANNOT-JUDGE" "no local relay instance and no remote relay configured" " agent=\"$AGENT_NAME\""
-      fi
+      RELAY_MAIL_MODE="none"
+      relay_mail_verdict "CANNOT-JUDGE" "no local relay instance and no remote relay configured" mail
       return 0
       ;;
     *)
+      RELAY_MAIL_MODE="unreadable"
       relay_mail_unreadable "${why:-relay pending failed (exit $rc)}"
       return 0
       ;;
   esac
   RELAY_MAIL_READ_DONE=1
+  RELAY_MAIL_MODE="local"
   if [ -n "$block" ]; then
     printf '%s\n\n' "$block"
     echo "[bot-relay] $AGENT_NAME has pending messages (delivered to context)." >&2
   fi
 }
 
-# No local DB file where this hook resolved one: the rest of this hook (liveness,
-# register, bind, tasks) needs it, but the MAIL DECISION does not. relay pending
-# decides: a configured DB that is missing is a loud local failure, and no local
-# instance at all is the labeled remote path when one is configured.
-if [ ! -f "$DB_PATH" ]; then
+# No usable local DB file for THIS hook's own reads: the rest of this hook
+# (liveness, register, bind, tasks) needs one, but the MAIL DECISION does not.
+# The order (the F1 mode rule, D2): the name is resolved; relay pending decides
+# the source (a configured DB that is missing is a loud local failure; no local
+# instance at all is the labeled remote path when one is configured); and only in
+# LOCAL mode does a path this hook REJECTED count, as DEGRADED with its reason,
+# because its liveness and task reads were skipped. Never a mute exit.
+if [ "$RELAY_LOCAL_DB_STATE" != "usable" ] || [ ! -f "$DB_PATH" ]; then
   relay_deliver_pending_mail
+  if [ "$RELAY_LOCAL_DB_STATE" = "rejected" ]; then
+    case "$RELAY_MAIL_MODE" in
+      local|unreadable)
+        relay_mail_verdict "DEGRADED" "local DB path rejected ($RELAY_LOCAL_DB_WHY): liveness and task reads skipped" other
+        ;;
+    esac
+  fi
   exit 0
 fi
 
@@ -1192,7 +1256,7 @@ if [ "$RELAY_TASKS_FAILED" = "1" ]; then
   # LOUD: tasks exist that the agent is not being shown.
   echo "[RELAY] active tasks for $AGENT_NAME could not be rendered safely. Call get_tasks to see them."
   echo "[bot-relay] task rendering failed for $AGENT_NAME — active tasks NOT delivered to context." >&2
-  relay_degrade "tasks could not be rendered at session start"
+  relay_mail_verdict "DEGRADED" "tasks could not be rendered at session start" other
   TASKS=""
 fi
 

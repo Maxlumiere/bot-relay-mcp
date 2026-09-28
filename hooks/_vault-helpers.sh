@@ -516,28 +516,64 @@ relay_pid_chain() {
   printf '[%s]' "$chain"
 }
 
-# Run a command under a wall-clock DEADLINE (seconds). A stalled `relay pending`
-# must end LOUD, not hang the hook until the harness kills it. perl's alarm()
-# survives exec, so the command itself receives SIGALRM at the deadline; that
-# status (142) is reported as 124, the GNU `timeout` convention. Without perl the
-# command runs unbounded (the harness's own hook timeout still applies).
-relay_run_with_deadline() {
-  local secs="$1"
-  shift
-  if command -v perl >/dev/null 2>&1; then
-    perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$secs" "$@"
-    local rc=$?
-    [ "$rc" -eq 142 ] && return 124
-    return "$rc"
+# relay_run_pending DEADLINE OUTFILE ERRFILE CMD...
+# Runs CMD DIRECTLY (its own pid: no wrapper, no fork) with stdout and stderr in
+# FILES, never a pipe: a command substitution waits for EVERY process that
+# inherited its pipe, so a leftover child could hold it open long past any
+# deadline. A bash watchdog sleeps to the deadline and kills THAT pid. Returns
+# CMD's exit status, or 124 when the watchdog fired (the GNU `timeout`
+# convention). No perl, no coreutils `timeout`: bash, sleep and kill only, on
+# macOS and Linux alike. (An in-process timer cannot do this: better-sqlite3 is
+# synchronous, so a JS timer cannot pre-empt a blocked native call.)
+relay_run_pending() {
+  local secs="$1" outf="$2" errf="$3"
+  shift 3
+  local mark="$outf.timedout"
+  rm -f "$mark" 2>/dev/null
+  "$@" >"$outf" 2>"$errf" </dev/null &
+  local pid=$!
+  (
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$secs" &
+    s=$!
+    wait "$s"
+    : >"$mark"
+    kill -TERM "$pid" 2>/dev/null
+    sleep 1
+    kill -KILL "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  local wd=$!
+  wait "$pid" 2>/dev/null
+  local rc=$?
+  if [ -e "$mark" ]; then
+    # The watchdog fired and the target is gone: end the watchdog now rather than
+    # wait out its KILL grace second (its stray `sleep` writes nowhere).
+    kill -KILL "$wd" 2>/dev/null
+    wait "$wd" 2>/dev/null
+    rm -f "$mark" 2>/dev/null
+    return 124
   fi
-  "$@"
+  kill -TERM "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  return "$rc"
 }
 
-# The deadline for `relay pending`, in seconds: RELAY_PENDING_TIMEOUT_SECS
-# (a whole number 1-120), else 10.
+# relay_pending_deadline BUDGET
+# Whole seconds `relay pending` may run in this hook. BUDGET is the hook's
+# INSTALLED timeout (src/agent-cli-profiles.ts is the source of truth; each hook
+# declares it as RELAY_HOOK_BUDGET_SECS, and a test holds the two equal). The
+# deadline is what is LEFT of it (minus what this hook already spent, $SECONDS)
+# minus a 2s margin to report the failure, so the harness never kills the hook
+# before it can say why. RELAY_PENDING_TIMEOUT_SECS may only shorten it. At least 1.
 relay_pending_deadline() {
-  local v="${RELAY_PENDING_TIMEOUT_SECS:-10}"
-  case "$v" in ''|*[!0-9]*) v=10 ;; esac
-  if [ "${#v}" -gt 3 ] || [ "$((10#$v))" -lt 1 ] || [ "$((10#$v))" -gt 120 ]; then v=10; fi
-  printf '%s' "$((10#$v))"
+  local budget="$1" margin=2 left v
+  case "$budget" in ''|*[!0-9]*) budget=5 ;; esac
+  left=$(( budget - ${SECONDS:-0} - margin ))
+  [ "$left" -lt 1 ] && left=1
+  v="${RELAY_PENDING_TIMEOUT_SECS:-}"
+  case "$v" in ''|*[!0-9]*) v="" ;; esac
+  if [ -n "$v" ] && [ "${#v}" -le 3 ] && [ "$((10#$v))" -ge 1 ] && [ "$((10#$v))" -lt "$left" ]; then
+    left=$((10#$v))
+  fi
+  printf '%s' "$left"
 }

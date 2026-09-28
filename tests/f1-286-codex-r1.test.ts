@@ -32,6 +32,8 @@ const ROOT = path.join(os.tmpdir(), `bot-relay-286-r1-${process.pid}`);
 const SHIM_DIR = path.join(ROOT, "shim");
 const REAL_NODE = execFileSync("sh", ["-c", "command -v node"], { encoding: "utf-8" }).trim();
 const OK_ENTRY = { "bot-relay": { type: "stdio", command: "node", args: [DIST_INDEX] } };
+const PTU_HOOK = path.join(REPO_ROOT, "hooks", "post-tool-use-check.sh");
+const STOP_HOOK = path.join(REPO_ROOT, "hooks", "stop-check.sh");
 
 delete process.env.RELAY_AGENT_TOKEN;
 delete process.env.RELAY_AGENT_NAME;
@@ -52,6 +54,8 @@ for a in "$@"; do
   case "$a" in *"const dec = (h)"*) is_task=1 ;; esac
 done
 if [ "$is_pending" = 1 ] && [ "$SHIM_MODE" = stall ]; then echo $$ > "$SHIM_MARKER"; exec sleep 20; fi
+# A WRAPPER WITH A CHILD: the child inherits stdout and outlives a killed parent.
+if [ "$is_pending" = 1 ] && [ "$SHIM_MODE" = stall-child ]; then sleep 20 & echo $! > "$SHIM_MARKER"; wait; exit 0; fi
 if [ "$is_pending" = 1 ] && [ "$SHIM_MODE" = contradict ]; then
   printf '%s\\n' '{"ok":true,"agent":"r","db_path":"x","session_bound":true,"count":0,"top_priority":null,"messages":[{"id":"m1","from":"s","priority":"normal","age_seconds":1,"created_at":"t","content":"MAIL-HIDDEN-BY-A-COUNT"}]}'
   exit 0
@@ -61,6 +65,9 @@ exec "${REAL_NODE}" "$@"
 `,
     { mode: 0o755 },
   );
+  // NO PERL: every test in this file runs with a perl that cannot run, so no hook
+  // may depend on it (the F1 mode rule's deadline, architect D1).
+  fs.writeFileSync(path.join(SHIM_DIR, "perl"), "#!/bin/sh\nexit 127\n", { mode: 0o755 });
 }
 
 /** A relay DB with the agent registered (and optionally one task), built by the real code. */
@@ -385,5 +392,188 @@ describe("#286 R1 #7 (ruling) — the verdict words are ONE closed set, document
     walk(path.join(REPO_ROOT, "hooks"));
     expect(used.size).toBeGreaterThan(3);
     for (const w of used) expect(documented.has(w), `${w} is used but not documented`).toBe(true);
+  });
+});
+
+/**
+ * #286 Codex round 2 (DETAIL) + the architect's sharpenings: the verdict words are
+ * a TOTAL ORDER (hooks/_verdict.sh). The most severe verdict wins; at the same
+ * level BOTH reasons are kept, joined with "; ", a MAIL-PATH reason first.
+ */
+describe("#286 R2 — one total order of verdicts on the SessionStart mail path", () => {
+  function sessionStart(home: string, env: Record<string, string>) {
+    return spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, { RELAY_HTTP_PORT: "1", ...env }) });
+  }
+
+  it("(C) an earlier DEGRADED (daemon unreachable) + a failed local read → BOTH reasons, joined, the mail-read one first", () => {
+    const home = path.join(ROOT, "home-r2c");
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ mcpServers: OK_ENTRY }));
+    const corrupt = path.join(home, "corrupt.db");
+    fs.writeFileSync(corrupt, "not a sqlite database\n".repeat(100));
+    const r = sessionStart(home, { RELAY_AGENT_NAME: "r2c", RELAY_DB_PATH: corrupt });
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*; daemon unreachable[^"]*"/);
+  });
+
+  it("(A) the unresolved name from a CANNOT-JUDGE start → CANNOT-JUDGE 'agent name unresolved', never the generic reason", () => {
+    const home = path.join(ROOT, "home-r2a");
+    fs.mkdirSync(home, { recursive: true });
+    const dbPath = path.join(home, "relay.db");
+    seedDb(dbPath, "r2a");
+    // No .claude.json: the config diagnostic cannot judge.
+    const r = sessionStart(home, { RELAY_DB_PATH: dbPath }); // no RELAY_AGENT_NAME: "default"
+    expect(r.stdout).toMatch(/VERDICT=CANNOT-JUDGE reason="agent name unresolved \(default\)/);
+    // The remedy names `relay init --agent <name>` FIRST, then RELAY_AGENT_NAME.
+    expect(r.stderr).toMatch(/relay init --agent <name>[^\n]*RELAY_AGENT_NAME/);
+  });
+
+  it("(B) the unresolved name from a MORE severe verdict (DEGRADED: daemon unreachable) → that verdict holds (the total order)", () => {
+    const home = path.join(ROOT, "home-r2b");
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ mcpServers: OK_ENTRY }));
+    const dbPath = path.join(home, "relay.db");
+    seedDb(dbPath, "r2b");
+    const r = sessionStart(home, { RELAY_DB_PATH: dbPath });
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="daemon unreachable/);
+    expect(r.stdout).not.toMatch(/Pending messages for default/);
+  });
+
+  it("the total order is DOCUMENTED once, as the closed set's order, in hooks/_verdict.sh", () => {
+    const helper = fs.readFileSync(path.join(REPO_ROOT, "hooks", "_verdict.sh"), "utf-8");
+    expect(helper).toMatch(/TOTAL ORDER, most severe first: MUTE > AUTH_FAILED > UNWAKEABLE > TAKEOVER_LIVENESS_UNVERIFIABLE > REGISTER_FAILED > DEGRADED > CANNOT-JUDGE > HEALTHY/);
+  });
+});
+
+// --- architect D1: ONE deadline mechanism (no perl), inside the INSTALLED budget -------
+describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files not a pipe, within the installed budget", () => {
+  it("NO PERL: a normal local mail read still works (this whole file runs with a perl that cannot run)", () => {
+    const home = path.join(ROOT, "home-d1a");
+    fs.mkdirSync(home, { recursive: true });
+    const dbPath = path.join(home, "relay.db");
+    seedDb(dbPath, "d1a");
+    const send = spawnSync(REAL_NODE, ["--input-type=module", "-e", `
+      process.env.RELAY_DB_PATH = ${JSON.stringify(dbPath)};
+      const db = await import(${JSON.stringify(path.join(REPO_ROOT, "dist", "db.js"))});
+      db.sendMessage("s", "d1a", "hello without perl", "normal"); db.closeDb();`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME: ROOT, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json") } });
+    expect(send.status, send.stderr).toBe(0);
+    const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, { RELAY_AGENT_NAME: "d1a", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1" }) });
+    expect(r.stdout, r.stderr).toContain("[RELAY] Pending messages for d1a (showing 1 of 1):");
+    expect(r.stdout).toContain("hello without perl");
+  });
+
+  it("A WRAPPER WITH A CHILD that keeps stdout open still ends at the deadline (no command substitution waits on it)", () => {
+    const home = path.join(ROOT, "home-d1b");
+    fs.mkdirSync(home, { recursive: true });
+    const dbPath = path.join(home, "relay.db");
+    seedDb(dbPath, "d1b");
+    const marker = path.join(ROOT, "stall-d1b.pid");
+    const t0 = Date.now();
+    const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 40_000, input: "", env: baseEnv(home, {
+      RELAY_AGENT_NAME: "d1b", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
+      SHIM_MODE: "stall-child", SHIM_MARKER: marker, RELAY_PENDING_TIMEOUT_SECS: "2",
+    }) });
+    const took = Date.now() - t0;
+    try { process.kill(Number(fs.readFileSync(marker, "utf-8").trim()), "SIGKILL"); } catch { /* gone */ }
+    expect(took, "the deadline, not the 20s child, ends the read").toBeLessThan(9_000);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*timed out/);
+  }, 45_000);
+
+  for (const [label, hook, stdin] of [
+    ["PostToolUse", PTU_HOOK, JSON.stringify({ session_id: "d1-ptu", hook_event_name: "PostToolUse", tool_name: "Read" })],
+    ["Stop", STOP_HOOK, JSON.stringify({ session_id: "d1-stop", stop_hook_active: false })],
+  ] as const) {
+    it(`${label}: a stalled read ends INSIDE the installed 5s budget, LOUD (DEGRADED timed out), with NO override`, () => {
+      const home = path.join(ROOT, `home-d1-${label}`);
+      fs.mkdirSync(home, { recursive: true });
+      const dbPath = path.join(home, "relay.db");
+      seedDb(dbPath, `d1${label.toLowerCase()}`);
+      const t0 = Date.now();
+      const r = spawnSync("bash", [hook], { encoding: "utf-8", timeout: 40_000, input: stdin, env: baseEnv(home, {
+        RELAY_AGENT_NAME: `d1${label.toLowerCase()}`, RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
+        SHIM_MODE: "stall", SHIM_MARKER: path.join(ROOT, `stall-d1-${label}.pid`),
+        RELAY_HOOK_NOTICE_REMIND_SECS: "0", RELAY_STOP_WAKE_DAMPER_SECS: "0",
+      }) });
+      const took = Date.now() - t0;
+      expect(took, `${label} must finish inside its 5s installed budget`).toBeLessThan(5_000);
+      expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*timed out/);
+    }, 45_000);
+  }
+
+  it("BUDGET INVARIANT: each hook's budget constant IS the installed timeout in src/agent-cli-profiles.ts, and deadline + margin stays under it", () => {
+    const profile = fs.readFileSync(path.join(REPO_ROOT, "src", "agent-cli-profiles.ts"), "utf-8");
+    const installed = new Map<string, number>();
+    for (const m of profile.matchAll(/script: "hooks\/([a-z-]+\.sh)", timeout: (\d+)/g)) installed.set(m[1], Number(m[2]));
+    expect(installed.size, "the Claude profile lists the three hooks with a timeout").toBe(3);
+    for (const [script, budget] of installed) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, "hooks", script), "utf-8");
+      const m = src.match(/^RELAY_HOOK_BUDGET_SECS=(\d+)$/m);
+      expect(m, `${script} declares RELAY_HOOK_BUDGET_SECS`).not.toBeNull();
+      expect(Number(m![1]), `${script}'s budget constant equals the installed timeout`).toBe(budget);
+      for (const override of ["", "100"]) {
+        const d = spawnSync("bash", ["-c", `. "${path.join(REPO_ROOT, "hooks", "_vault-helpers.sh")}"; relay_pending_deadline ${budget}`], {
+          encoding: "utf-8", env: { PATH: process.env.PATH ?? "", RELAY_PENDING_TIMEOUT_SECS: override },
+        });
+        const secs = Number(d.stdout.trim());
+        expect(secs, `${script}: deadline with override "${override}"`).toBeGreaterThanOrEqual(1);
+        expect(secs + 1, `${script}: deadline + at least 1s margin < the installed ${budget}s`).toBeLessThan(budget);
+      }
+    }
+  });
+});
+
+// --- architect D2: relay pending decides the source; the bash guard only gates local reads ---
+describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guard that never exits mute", () => {
+  it("REMOTE-ONLY FRESH INSTALL: no $HOME/.bot-relay at all (no RELAY_HOME) → the labeled remote path", async () => {
+    const d = await startDaemon("d2a");
+    try {
+      const tok = (await tool(d.port, "register_agent", { name: "d2a", role: "r", capabilities: [] })).agent_token as string;
+      const sTok = (await tool(d.port, "register_agent", { name: "d2a-sender", role: "r", capabilities: [] })).agent_token as string;
+      await tool(d.port, "send_message", { from: "d2a-sender", to: "d2a", content: "fresh install mail", agent_token: sTok });
+      const home = path.join(ROOT, "home-d2a-fresh");
+      fs.mkdirSync(home, { recursive: true });
+      expect(fs.existsSync(path.join(home, ".bot-relay")), "precondition: a truly fresh install").toBe(false);
+      const env = baseEnv(home, { RELAY_AGENT_NAME: "d2a", RELAY_AGENT_TOKEN: tok, RELAY_HTTP_PORT: String(d.port) });
+      delete (env as Record<string, string | undefined>).RELAY_HOME;
+      const r = await runHookAsync(env);
+      expect(r.stdout, r.stdout + r.stderr).toContain("[RELAY] Pending messages for d2a via remote relay (showing 1 of 1):");
+      expect(r.stdout).toContain("fresh install mail");
+      expect(r.stderr).not.toMatch(/must live under/);
+    } finally {
+      d.kill();
+    }
+  }, 40_000);
+
+  it("a configured DB whose PARENT DIRECTORY is absent → relay pending exit 1 → DEGRADED, never a mute '/relay.db' exit", () => {
+    const home = path.join(ROOT, "home-d2b");
+    fs.mkdirSync(home, { recursive: true });
+    const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, {
+      RELAY_AGENT_NAME: "d2b", RELAY_DB_PATH: path.join(home, "no-such-dir", "relay.db"), RELAY_HTTP_PORT: "1",
+    }) });
+    expect(r.stderr).not.toMatch(/Got: '\/relay\.db'/);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
+  });
+
+  it("a DB the containment guard REJECTS (outside HOME and the temp roots): mail still decided by relay pending, the local reads skipped, DEGRADED with the reason", () => {
+    // A path outside this test's HOME and outside every temp root: under the repo's
+    // own (gitignored) node_modules/.cache.
+    const dir = path.join(REPO_ROOT, "node_modules", ".cache", `f1-286-d2c-${process.pid}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const dbPath = path.join(dir, "relay.db");
+    try {
+      // db.ts itself refuses to OPEN a path outside its approved roots, so the DB is
+      // built in a temp dir, closed (WAL folded in), and its file copied out.
+      const staged = path.join(ROOT, "staged-d2c.db");
+      seedDb(staged, "d2c");
+      fs.copyFileSync(staged, dbPath);
+      const home = path.join(ROOT, "home-d2c");
+      fs.mkdirSync(home, { recursive: true });
+      const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, {
+        RELAY_AGENT_NAME: "d2c", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
+      }) });
+      expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*local DB path rejected/);
+      expect(r.stdout).not.toMatch(/Active tasks for d2c/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
