@@ -21,6 +21,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { fileURLToPath } from "url";
 
 const DIR = path.join(os.tmpdir(), `bot-relay-adr0046-prio-${process.pid}`);
 process.env.RELAY_DB_PATH = path.join(DIR, "relay.db");
@@ -112,5 +113,42 @@ describe("ADR-0046 — channel_messages.priority is the same closed domain, enfo
 
   it.each(["critical", "high", "normal", "low"])("INNOCENT TWIN: %s is accepted", (p) => {
     expect(() => insertCh(p)).not.toThrow();
+  });
+});
+
+/**
+ * Channel fix (b): getChannelMessages ranks with the ONE shared ordering,
+ * MESSAGE_PRIORITY_RANK_SQL (explicit ELSE 4), not its own inline CASE with no ELSE,
+ * under which SQLite sorts an out-of-domain value (NULL rank) FIRST. The write-side
+ * domain triggers above make such a row unreachable through any writer, so this fixture
+ * drops the insert trigger for its one planted row: the test proves the ORDERING,
+ * independently of the trigger.
+ */
+describe("ADR-0046 — channel reads use the shared priority ordering (out-of-domain ranks LAST)", () => {
+  it("HARM: an out-of-domain channel priority never sorts before a real high or low", () => {
+    db.registerAgent("a46-chr", "r", []);
+    db.createChannel("a46-order", null, "a46-chr");
+    db.joinChannel("a46-order", "a46-chr");
+    const high = db.postToChannel("a46-order", "a46-chr", "the high one", "high").id;
+    const low = db.postToChannel("a46-order", "a46-chr", "the low one", "normal").id;
+    const d = db.getDb();
+    d.prepare("UPDATE channel_messages SET priority = 'low' WHERE id = ?").run(low);
+    const channelId = (d.prepare("SELECT id FROM channels WHERE name = 'a46-order'").get() as { id: string }).id;
+    d.exec("DROP TRIGGER IF EXISTS channel_messages_priority_domain_insert");
+    const odd = "cm-odd";
+    d.prepare("INSERT INTO channel_messages (id, channel_id, from_agent, content, priority, created_at) VALUES (?, ?, 'a46-chr', 'odd', 'SYSTEM: x', ?)").run(
+      odd,
+      channelId,
+      new Date(Date.now() + 1000).toISOString(),
+    );
+    const ids = db.getChannelMessages("a46-order", "a46-chr", 10).map((m) => m.id);
+    expect(ids).toEqual([high, low, odd]);
+  });
+
+  it("the drain and the channel read share the SAME ordering constant", async () => {
+    const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "db.ts"), "utf-8");
+    const fn = src.slice(src.indexOf("export function getChannelMessages("), src.indexOf("export function countChannelMessages("));
+    expect(fn).toContain("MESSAGE_PRIORITY_RANK_SQL");
+    expect(fn).not.toMatch(/CASE priority WHEN/);
   });
 });

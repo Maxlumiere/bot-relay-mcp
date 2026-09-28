@@ -8088,8 +8088,10 @@ export function getChannelMessages(
   const db = getDb();
   const { channelId, floor } = resolveChannelReadScope(channelName, agentName, since);
   const rows = db.prepare(
+    // ADR-0046: the ONE shared priority ordering (explicit ELSE ranks an out-of-domain
+    // value LAST); its own inline CASE had no ELSE, so SQLite sorted such a value FIRST.
     `SELECT * FROM channel_messages WHERE ${CHANNEL_MSG_WHERE}
-     ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+     ORDER BY ${MESSAGE_PRIORITY_RANK_SQL},
               created_at DESC LIMIT ?`
   ).all(channelId, floor, limit) as ChannelMessageRecord[];
   return rows.map((r) => ({ ...r, content: decryptContent(r.content) || r.content }));
