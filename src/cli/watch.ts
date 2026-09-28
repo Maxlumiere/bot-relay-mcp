@@ -145,6 +145,100 @@ export function makeFallbackTick(deps: {
   };
 }
 
+type MailboxSnap = { total_unread_count: number; epoch: string; last_seq: number };
+
+/** While reads keep failing, the DEGRADED line is repeated every this many failures. */
+export const READ_FAILURE_REPEAT_EVERY = 20;
+
+/**
+ * The mailbox check, extracted so tests drive the REAL closure. It owns the
+ * baseline (prevUnread/epoch) and the READ-FAILURE reporting: a read that throws
+ * is never swallowed. The first failure of a streak prints a DEGRADED line (the
+ * vocabulary every watch Monitor greps for), the streak repeats it every
+ * READ_FAILURE_REPEAT_EVERY failures, and the first success afterwards says the
+ * reads recovered. check() returns false when the read failed (--once exits 1).
+ */
+export function makeMailboxCheck(deps: {
+  agent: string;
+  read: () => MailboxSnap;
+  wake: (snap: MailboxSnap, previousUnread: number) => void;
+  write: (line: string) => void;
+}): { check: () => boolean; prevUnread: () => number | null } {
+  let prevUnread: number | null = null;
+  let prevEpoch: string | null = null;
+  let failures = 0;
+  const check = (): boolean => {
+    let snap: MailboxSnap;
+    try {
+      snap = deps.read();
+    } catch (err) {
+      failures++;
+      if (failures === 1 || failures % READ_FAILURE_REPEAT_EVERY === 0) {
+        deps.write(
+          `[sentinel] DEGRADED — no wake for ${deps.agent}: the mailbox read failed` +
+            (failures > 1 ? ` (${failures} consecutive failures)` : "") +
+            `: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+      return false;
+    }
+    if (failures > 0) {
+      deps.write(`[sentinel] recovered — mailbox reads for ${deps.agent} succeed again after ${failures} failure(s)\n`);
+      failures = 0;
+    }
+    // Epoch change (DB backup/restore) → the cached baseline is incomparable;
+    // reset it so we don't miss or double-fire (v2.3.0 epoch semantics).
+    if (prevEpoch !== null && snap.epoch !== prevEpoch) prevUnread = null;
+    prevEpoch = snap.epoch;
+
+    const unread = snap.total_unread_count;
+    if (prevUnread === null) {
+      // First observation: set the baseline. If there is ALREADY pending mail
+      // (the "register → start your watch" flow), surface it once.
+      if (unread > 0) deps.wake(snap, 0);
+    } else if (unread > prevUnread) {
+      deps.wake(snap, prevUnread);
+    }
+    prevUnread = unread;
+    return true;
+  };
+  return { check, prevUnread: () => prevUnread };
+}
+
+/**
+ * Watch the marker DIRECTORY, extracted so tests drive it. fs.watch reports
+ * later failures (EIO, the directory removed) as an asynchronous 'error' event;
+ * without a listener that is an UNCAUGHT exception with no DEGRADED line. Here
+ * it is a DEGRADED line, the watcher is closed, and onFallback() moves the
+ * watch to polling. Returns null when fs.watch is unsupported (interval-only).
+ */
+export function watchMarkerDir(deps: {
+  agent: string;
+  dir: string;
+  onEvent: () => void;
+  onFallback: () => void;
+  write: (line: string) => void;
+}): fs.FSWatcher | null {
+  let watcher: fs.FSWatcher;
+  try {
+    watcher = fs.watch(deps.dir, () => deps.onEvent());
+  } catch {
+    return null; // fs.watch unsupported here → the interval covers it
+  }
+  watcher.on("error", (err: NodeJS.ErrnoException) => {
+    deps.write(
+      `[sentinel] DEGRADED — the marker watcher for ${deps.agent} failed (${err.code ?? err.message}): falling back to polling\n`,
+    );
+    try {
+      watcher.close();
+    } catch {
+      /* already closed */
+    }
+    deps.onFallback();
+  });
+  return watcher;
+}
+
 /** Emit the wake signal: a single stdout line a harness Monitor can consume. */
 function emitWake(
   agent: string,
@@ -282,40 +376,26 @@ export async function run(argv: string[]): Promise<number> {
   const { peekMailboxVersion, closeDb } = db;
   const { markersEnabled, markerPath } = markers;
 
-  let prevUnread: number | null = null;
-  let prevEpoch: string | null = null;
-
+  // A read failure is never swallowed: DEGRADED on the first failure of a
+  // streak, repeated while it lasts, and a recovery line (makeMailboxCheck).
+  const mailbox = makeMailboxCheck({
+    agent,
+    read: () => peekMailboxVersion(agent),
+    wake: (snap, previous) => emitWake(agent, snap, previous, args.json),
+    write: (line) => process.stderr.write(line),
+  });
   const check = (): void => {
-    let snap: { total_unread_count: number; epoch: string; last_seq: number };
-    try {
-      snap = peekMailboxVersion(agent);
-    } catch {
-      return; // transient read error — a later signal/tick retries (never fatal)
-    }
-    // Epoch change (DB backup/restore) → the cached baseline is incomparable;
-    // reset it so we don't miss or double-fire (v2.3.0 epoch semantics).
-    if (prevEpoch !== null && snap.epoch !== prevEpoch) prevUnread = null;
-    prevEpoch = snap.epoch;
-
-    const unread = snap.total_unread_count;
-    if (prevUnread === null) {
-      // First observation: set the baseline. If there is ALREADY pending mail
-      // (the "register → start your watch" flow), surface it once.
-      if (unread > 0) emitWake(agent, snap, 0, args.json);
-    } else if (unread > prevUnread) {
-      emitWake(agent, snap, prevUnread, args.json);
-    }
-    prevUnread = unread;
+    mailbox.check();
   };
 
   if (args.once) {
-    check();
+    const ok = mailbox.check();
     try {
       closeDb();
     } catch {
       /* ignore */
     }
-    return 0;
+    return ok ? 0 : 1;
   }
 
   // --- Continuous watch. Bounded, no busy-spin. Runs until SIGINT/SIGTERM. ---
@@ -401,22 +481,31 @@ export async function run(argv: string[]): Promise<number> {
       } catch {
         /* best-effort */
       }
-      try {
-        watcher = fs.watch(dir, (_event, filename) => {
-          // record() returns true ONLY for a positively identified marker for
-          // THIS agent — that is the sole positive evidence the wake path works
-          // end to end. Anything else (no filename, another agent's marker) is
-          // indistinguishable from an unrelated directory change, so it stays
-          // UNPROVEN. We still check() either way: checking is free and correct,
-          // and it is claiming PROOF from an unidentified event that would let
-          // one anonymous callback suppress the degraded announcement forever.
-          // No evidence is recorded. A marker callback's only job is to make
-          // the delivery observed; whether it fired is not evidence about any
-          // OTHER delivery. See fallbackObservedMissedDelivery().
-          check();
+      {
+        // Callback semantics below; a later async 'error' is a DEGRADED line and
+        // a fall back to polling (watchMarkerDir), never an uncaught exception.
+        watcher = watchMarkerDir({
+          agent,
+          dir,
+          write: (line) => process.stderr.write(line),
+          onFallback: () => {
+            watcher = null;
+            tightenToPolling();
+          },
+          onEvent: () => {
+            // record() returns true ONLY for a positively identified marker for
+            // THIS agent — that is the sole positive evidence the wake path works
+            // end to end. Anything else (no filename, another agent's marker) is
+            // indistinguishable from an unrelated directory change, so it stays
+            // UNPROVEN. We still check() either way: checking is free and correct,
+            // and it is claiming PROOF from an unidentified event that would let
+            // one anonymous callback suppress the degraded announcement forever.
+            // No evidence is recorded. A marker callback's only job is to make
+            // the delivery observed; whether it fired is not evidence about any
+            // OTHER delivery. See fallbackObservedMissedDelivery().
+            check();
+          },
         });
-      } catch {
-        /* fs.watch unsupported here → interval-only below still covers it */
       }
     }
     const FALLBACK_MS = 30_000; // marker-miss safety net
@@ -425,7 +514,7 @@ export async function run(argv: string[]): Promise<number> {
     // we are degraded, then stop pretending the 30s net is a wake path.
     timer = setInterval(
       makeFallbackTick({
-        readPrevUnread: () => prevUnread,
+        readPrevUnread: () => mailbox.prevUnread(),
         check,
         onMissedDelivery: () => {
           announceDegraded("new mail was detected by the fallback poll, not by a marker event");

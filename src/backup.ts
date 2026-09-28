@@ -36,7 +36,7 @@ import { spawnSync } from "child_process";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
-import { checkContainment } from "./approved-roots.js";
+import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
@@ -76,6 +76,18 @@ function assertSafePath(p: string, label: string): string {
   const c = checkContainment(p);
   if (!c.ok) throw new Error(`${label}: ${c.reason}`);
   return c.absPath;
+}
+
+/**
+ * ADR-0048: the staging directory (under $TMPDIR, which may be anywhere) must be
+ * PRIVATE before anything is staged in it: every traversed component owned by
+ * you or root, and not writable by others unless it is a sticky directory (such
+ * as /tmp). Otherwise another local user could swap the staged DB between
+ * extraction and the copy into the live destination.
+ */
+function assertPrivateStaging(dir: string): void {
+  const c = checkPrivatePath(dir);
+  if (!c.ok) throw new Error(`the staging directory ${dir} is not private: ${c.reason}`);
 }
 
 function getConfigPath(): string {
@@ -149,6 +161,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   // (keyed off a random suffix so parallel exports can't collide).
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-export-"));
   try {
+    assertPrivateStaging(stagingDir);
     const snapshotDbPath = path.join(stagingDir, "relay.db");
 
     // #171: driver-aware consistent snapshot. native → VACUUM INTO (online-safe
@@ -301,6 +314,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
   // --- Step 3: extract the archive to a staging dir ---
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-import-"));
   try {
+    assertPrivateStaging(stagingDir);
     runTar(["-xzf", resolvedArchive, "-C", stagingDir], stagingDir);
 
     const manifestPath = path.join(stagingDir, "manifest.json");

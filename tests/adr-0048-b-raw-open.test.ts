@@ -112,13 +112,31 @@ describe.skipIf(UID < 0)("ADR-0048 PR B — openRawRelayDb: the raw handle gets 
   });
 });
 
-describe("ADR-0048 PR B — TRIPWIRE: no CLI verb opens the relay DB with a raw driver handle except through openRawRelayDb", () => {
-  it("better-sqlite3 is imported in src/cli/ ONLY by _instance-db.ts", () => {
-    const dir = path.join(REPO_ROOT, "src", "cli");
-    const hits = fs
-      .readdirSync(dir)
-      .filter((f) => f.endsWith(".ts"))
-      .filter((f) => /import\(\s*["']better-sqlite3["']\s*\)|from\s+["']better-sqlite3["']|require\(\s*["']better-sqlite3["']\s*\)/.test(fs.readFileSync(path.join(dir, f), "utf-8")));
-    expect(hits).toEqual(["_instance-db.ts"]);
+describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle except the three that re-check it after opening", () => {
+  /**
+   * src/-wide (Codex #288 R2 #2): a driver import (better-sqlite3 or sql.js, any
+   * spelling: import(), from, require(), createRequire's req()) appears ONLY in
+   *   - src/sqlite-compat.ts  (the driver layer; openReadOnly re-checks privately),
+   *   - src/db.ts             (initializeDb/getDb re-check assertStillContained),
+   *   - src/cli/_instance-db.ts (openRawRelayDb, the verbs' raw handle).
+   * Type declarations (.d.ts) are not code.
+   */
+  it("the SQLite driver is referenced in src/ ONLY by the three checked modules", () => {
+    const hits: string[] = [];
+    const walk = (dir: string) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (e.name.endsWith(".ts") && !e.name.endsWith(".d.ts")) {
+          // Code forms only (a comment may NAME the package): import("x"), from "x",
+          // require("x"), createRequire's req("x"), and a bare import "x".
+          if (/(?:\bimport\s*\(|\bfrom|\brequire\s*\(|\breq\s*\(|\bimport)\s*["'`](better-sqlite3|sql\.js)["'`]/.test(fs.readFileSync(full, "utf-8"))) {
+            hits.push(path.relative(REPO_ROOT, full));
+          }
+        }
+      }
+    };
+    walk(path.join(REPO_ROOT, "src"));
+    expect(hits.sort()).toEqual(["src/cli/_instance-db.ts", "src/db.ts", "src/sqlite-compat.ts"]);
   });
 });

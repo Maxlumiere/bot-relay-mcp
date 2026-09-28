@@ -71,9 +71,30 @@ interface Traversed {
 }
 
 /**
+ * ssh-StrictModes verdict on ONE traversed component, or null when it passes: it
+ * must be owned by the current uid or root; a symlink's own mode bits mean
+ * nothing; a STICKY directory may be world-writable (that is what the sticky bit
+ * is for) when `stickyWritableOk`, since its owner already passed; anything else
+ * must not be group- or other-writable.
+ */
+function strictComponentFault(t: Traversed, uid: number, stickyWritableOk: boolean, context: string): string | null {
+  if (t.st.uid !== uid && t.st.uid !== 0) {
+    return `${t.path} is owned by uid ${t.st.uid}, not you (uid ${uid}): ${context}, another user could control it.`;
+  }
+  if (t.st.isSymbolicLink()) return null;
+  if (stickyWritableOk && t.st.isDirectory() && t.st.mode & 0o1000) return null;
+  if (t.st.mode & 0o022) {
+    return `${t.path} is group- or other-writable (mode 0${(t.st.mode & 0o777).toString(8)}): ${context}, another user could replace it.`;
+  }
+  return null;
+}
+
+/**
  * Why the walk fails the shared-root ownership rule, or null when it passes or
  * never touched a shared root. Judged on the lstat the walk itself took of each
- * component (one observation per component).
+ * component (one observation per component). The shared root must be sticky AND
+ * owned by root or you (a foreign owner could rename or remove your entries
+ * despite the sticky bit) before its world-writable mode is exempted.
  */
 function sharedRootFault(traversed: Traversed[]): string | null {
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
@@ -82,21 +103,41 @@ function sharedRootFault(traversed: Traversed[]): string | null {
   const isRoot = (p: string) => shared.includes(p);
   const touched = traversed.some((t) => isRoot(t.path) || shared.some((r) => t.path.startsWith(r + path.sep)));
   if (!touched) return null;
-  for (const { path: p, st } of traversed) {
-    if (isRoot(p)) {
-      if (!(st.mode & 0o1000)) {
-        return `${p} is a shared directory without the sticky bit: another user could replace your files there. Use a path under your home directory.`;
+  const context = "on a path through a shared directory";
+  const fix = " Use a path under your home directory.";
+  for (const t of traversed) {
+    if (isRoot(t.path)) {
+      if (!(t.st.mode & 0o1000)) {
+        return `${t.path} is a shared directory without the sticky bit: another user could replace your files there.${fix}`;
       }
+      const owner = strictComponentFault(t, uid, true, context);
+      if (owner) return owner + fix;
       continue;
     }
-    if (st.uid !== uid && st.uid !== 0) {
-      return `${p} is owned by uid ${st.uid}, not you (uid ${uid}): on a path through a shared directory, another user could control it. Use a path under your home directory.`;
-    }
-    if (!st.isSymbolicLink() && st.mode & 0o022) {
-      return `${p} is group- or other-writable (mode 0${(st.mode & 0o777).toString(8)}): on a path through a shared directory, another user could replace it. Remove that write permission, or use a path under your home directory.`;
-    }
+    const fault = strictComponentFault(t, uid, false, context);
+    if (fault) return fault + fix;
   }
   return null;
+}
+
+/**
+ * A PRIVATE path (backup/restore staging under $TMPDIR, which may be anywhere):
+ * NOT an approved-roots question, only ownership. Every component the walk
+ * traverses (symlinks and their targets included) passes the StrictModes rule,
+ * with any sticky directory (such as /tmp) allowed to be world-writable once its
+ * owner passed. Otherwise another local user could swap what is staged there.
+ */
+export function checkPrivatePath(p: string): { ok: true; realPath: string; exists: boolean } | { ok: false; reason: string } {
+  const placed = placeReal(path.resolve(p));
+  if (!placed.ok) return placed;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid !== null) {
+    for (const t of placed.traversed) {
+      const fault = strictComponentFault(t, uid, true, "in a private (staging) path");
+      if (fault) return { ok: false, reason: `${fault} Set TMPDIR to a directory only you can write.` };
+    }
+  }
+  return { ok: true, realPath: placed.realPath, exists: placed.exists };
 }
 
 /** The approved roots as REAL paths (a root that does not exist is skipped). */
