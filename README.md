@@ -567,7 +567,7 @@ Add a `SessionStart` hook so every terminal automatically checks the relay for p
 
 The `SessionStart` hook only fires when a terminal opens. If an agent is actively working and mail arrives mid-session, it does not see the message until next startup (or a human pastes it in).
 
-v1.8 adds a `PostToolUse` hook — `hooks/post-tool-use-check.sh` — that fires after every tool call, peeks at the mailbox, and injects a short notice as `additionalContext` (unread count, senders, a bounded first line of the newest message) so the running session knows to call `get_messages`. The hook never marks mail read and does not run for subagent tool calls: a hook cannot prove the model saw what it injected, so only the agent's own `get_messages` call consumes mail (ADR-0037).
+v1.8 adds a `PostToolUse` hook — `hooks/post-tool-use-check.sh` — that fires after every tool call, peeks at the mailbox, and injects a short notice as `additionalContext` (unread count, highest priority, sender names and the newest message's age; never any message content) so the running session knows to call `get_messages`. The hook never marks mail read and does not run for subagent tool calls: a hook cannot prove the model saw what it injected, so only the agent's own `get_messages` call consumes mail (ADR-0037).
 
 Install per-project (NOT global), in `<project>/.claude/settings.json`:
 

@@ -2,7 +2,7 @@
 
 The `SessionStart` hook (`docs/hooks.md`) gives you a one-shot mail check at terminal open. That is great for resuming a session, but it does nothing if messages arrive WHILE the agent is working — you have to wait for the next terminal open (or a human paste) before the agent sees them.
 
-The `PostToolUse` hook closes that gap. It fires after every tool call, **peeks** at the mailbox, and injects a short notice as `additionalContext`: how many messages are unread, who sent them, and a bounded quoted first line of the newest one. The agent then calls `get_messages` itself, and that call is what delivers the mail and marks it read.
+The `PostToolUse` hook closes that gap. It fires after every tool call, **peeks** at the mailbox, and injects a short notice as `additionalContext`: how many messages are unread, the highest priority, who sent them, and how long ago the newest arrived. It never quotes any message content: `additionalContext` is trusted more than a tool result, so sender-chosen words do not belong in it. The agent then calls `get_messages` itself, and that call is what delivers the mail and marks it read.
 
 > **Why a notice and not the messages (ADR-0037).** Before this change the hook drained the mailbox and injected the bodies. A hook cannot prove delivery: `additionalContext` has no acknowledgement, it can be truncated or dropped, and `PostToolUse` also fires for a **subagent's** tool calls. Mail was marked read while the model never saw it, and the recipient's own drain came back empty. Only the model moves mail to read now; the hook, like the `Stop` hook, is read-only.
 
@@ -85,7 +85,7 @@ alias ai-agent='RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=<your-token> claude'
 4. Otherwise falls back to a read-only `SELECT` on `RELAY_DB_PATH` (the same pending predicate the `Stop` hook uses). Content stored encrypted at rest is never quoted.
 5. Emits a single-line Claude Code hook JSON (`{"continue": true, "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}`) to stdout. The notice looks like:
    ```
-   relay: 2 unread for builder, from planner (1 high), ops. newest first line (≤100 chars): "deploy green". Unread until get_messages is called.
+   relay: 2 unread for builder (highest priority: high), from planner (1 high), ops. newest arrived 3m ago. Unread until get_messages is called.
    ```
 6. If there is no mail, or any error happens, the hook exits silently with empty stdout — never pollutes the conversation.
 
@@ -102,7 +102,7 @@ A read-only notice would otherwise repeat after every tool call until the agent 
 ## What the hook does NOT do
 
 - **It does NOT mark mail read, resolve it, or change it in any way.** Only the agent's own `get_messages` call does that.
-- **It does NOT inject message bodies.** Count, senders and one bounded first line only.
+- **It does NOT inject any message content**, not even a first line. Count, highest priority, sender names (anything outside `[a-z0-9-]` shows as `unknown`) and the newest message's age only.
 - **It does NOT run for subagent tool calls.**
 - **It does NOT re-register the agent.** The `SessionStart` hook handles registration. If the agent is not registered when the hook fires, the hook silently exits.
 - **It does NOT check tasks.** Task surfacing stays in `SessionStart` for now (simpler, less context-pressure).

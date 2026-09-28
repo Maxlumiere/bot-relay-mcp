@@ -92,15 +92,22 @@ HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 # Any rejection → silent no-op (exit 0, empty stdout). A SessionStart hook must
 # never abort the session.
 [ -z "$AGENT_NAME" ] && exit 0
-echo "$AGENT_NAME" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$' || exit 0
-echo "$AGENT_ROLE" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$' || AGENT_ROLE="user"
+# Whole-string match. `echo "$X" | grep -Eq '^RE$'` is LINE-oriented: a
+# multi-line value passes if ANY line matches, and the rest rides along into
+# whatever the value is used for (Codex round 2 on #280: a newline in
+# RELAY_AGENT_NAME reached a sqlite heredoc as SQL). [[ =~ ]] anchors to the
+# whole string.
+relay_whole_match() { [[ "$1" =~ $2 ]]; }
+
+relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$' || exit 0
+relay_whole_match "$AGENT_ROLE" '^[A-Za-z0-9_.-]{1,64}$' || AGENT_ROLE="user"
 if [ -n "$AGENT_CAPS" ]; then
-  if [ ${#AGENT_CAPS} -gt 256 ] || ! echo "$AGENT_CAPS" | grep -Eq '^[A-Za-z0-9_.,-]+$'; then
+  if [ ${#AGENT_CAPS} -gt 256 ] || ! relay_whole_match "$AGENT_CAPS" '^[A-Za-z0-9_.,-]+$'; then
     AGENT_CAPS=""
   fi
 fi
-echo "$HTTP_HOST" | grep -Eq '^[A-Za-z0-9_.:-]{1,253}$' || exit 0
-echo "$HTTP_PORT" | grep -Eq '^[0-9]{1,5}$' || exit 0
+relay_whole_match "$HTTP_HOST" '^[A-Za-z0-9_.:-]{1,253}$' || exit 0
+relay_whole_match "$HTTP_PORT" '^[0-9]{1,5}$' || exit 0
 
 # --- Vault helpers (shared with the Claude hooks; one identity model) -------
 HOOKS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -208,7 +215,7 @@ REG_HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, t
 # session_id (filtered by AGENT_NAME) also means a marker for a DIFFERENT agent
 # can never make us skip (no cross-agent leakage).
 SKIP_REGISTER_HANDOFF=0
-if echo "${RELAY_LAUNCH_SESSION:-}" | grep -Eq '^[0-9a-fA-F-]{8,64}$'; then
+if relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
   DISCOVER_BODY=$(curl -fsS --connect-timeout 1 --max-time 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_agents","arguments":{}}}' 2>/dev/null) || DISCOVER_BODY=""

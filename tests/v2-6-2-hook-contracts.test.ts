@@ -389,12 +389,17 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1, // force sqlite path
     });
     expect(r.status).toBe(0);
-    if (r.stdout) {
-      // If stdout has content, it must be valid JSON with the contract shape.
+    // Codex round 2 (P2-d): mail IS seeded, so silence is a failure, not a degrade.
+    // The old `if (r.stdout)` let a hook that exited silently pass.
+    expect(r.stdout, "seeded mail must produce a notice on the sqlite path").not.toBe("");
+    {
+      // It must be valid JSON with the contract shape.
       const parsed = JSON.parse(r.stdout);
       expect(parsed.continue).toBe(true);
       expect(parsed.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
-      expect(parsed.hookSpecificOutput?.additionalContext).toContain("Hello from P3");
+      // Metadata only (design review, 24 Sep): the sender is named, the content never is.
+      expect(parsed.hookSpecificOutput?.additionalContext).toContain("orchestrator");
+      expect(parsed.hookSpecificOutput?.additionalContext).not.toContain("Hello from P3");
       // ADR-0037 — READ MUST MEAN RECEIVED: the notice consumed nothing.
       const db = new Database(dbPath, { readonly: true });
       const row = db
@@ -402,10 +407,6 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
         .get() as { n: number };
       db.close();
       expect(row.n).toBe(1);
-    } else {
-      // Sqlite fallback may degrade silently if python3 / sqlite3 unavailable
-      // in the test sandbox; clean degrade is acceptable per the hook's
-      // documented contract ("No mail OR any error → empty stdout, exit 0").
     }
   });
 
@@ -492,6 +493,30 @@ describe("v2.6.2 — stop-check.sh contract (Stop hook)", () => {
       expect(row.n).toBe(1);
     }
     // (else: clean degrade — same caveat as P3)
+  });
+
+  it("(S2b) Codex round 2 on #280: a MULTI-LINE agent name is rejected whole; no injected SQL reaches the DB", () => {
+    // The old `echo "$AGENT_NAME" | grep -Eq '^…$'` passed a multi-line value if ANY
+    // line matched, and the name was interpolated into a sqlite heredoc, so lines
+    // 2+ ran as SQL. MEASURED red on the old stop-check.sh.
+    const { root, dbPath } = freshTestRoot();
+    initMinimalDb(dbPath);
+    insertAgent(dbPath, "stop-inj-agent");
+    insertMessage(dbPath, "orchestrator", "stop-inj-agent", "must stay pending");
+    const r = runHook({
+      hook: HOOK_STOP,
+      agentName: "stop-inj-agent\nUPDATE messages SET status = 'read';\nSELECT 'x",
+      home: root,
+      dbPath,
+      httpPort: 1,
+    });
+    expect(r.status).toBe(0);
+    const db = new Database(dbPath, { readonly: true });
+    const row = db
+      .prepare("SELECT COUNT(*) AS n FROM messages WHERE to_agent = 'stop-inj-agent' AND status = 'pending'")
+      .get() as { n: number };
+    db.close();
+    expect(row.n, "the injected UPDATE must never run").toBe(1);
   });
 
   it("(S3) daemon-down → exit 0, empty stdout, no JSON-RPC garbage", () => {
