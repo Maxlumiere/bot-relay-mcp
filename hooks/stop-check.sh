@@ -25,7 +25,7 @@
 #      (mail still pending after the hook fires) and the structure (no UPDATE
 #      in the source). THE READ PATH IS CHOSEN BY CONFIGURATION, NEVER BY
 #      FAILURE (the F1 mode rule, 28 Sep), and `relay pending`
-#      (F1, ADR-0044) decides it with the connector's own resolver:
+#      (F1, ADR-0044) decides it, on positive evidence only:
 #        - LOCAL: `relay pending AGENT --json`, the full canonical set, read-only.
 #          If it cannot read, the hook is LOUD (stderr + verdict "relay
 #          unreadable") and makes NO HTTP request.
@@ -188,8 +188,8 @@ AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 # v2.6.1 — vault helpers (token vault) sourced from a single file. The DB path
-# is NOT resolved here: `relay pending` resolves it with the connector's own
-# resolver.
+# is NOT resolved here: `relay pending` resolves it (the connector's instance
+# layout, positive evidence only).
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_vault-helpers.sh
 . "$HOOKS_DIR/_vault-helpers.sh"

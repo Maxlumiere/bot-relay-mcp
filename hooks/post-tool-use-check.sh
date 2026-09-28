@@ -21,8 +21,8 @@
 # contract as stop-check.sh (#124).
 #
 # The read path is chosen by CONFIGURATION, never by failure (the F1 mode rule,
-# 28 Sep). `relay pending AGENT --json` (F1, ADR-0044) decides
-# from the connector's own instance resolver; this file re-implements none of it
+# 28 Sep). `relay pending AGENT --json` (F1, ADR-0044) decides, on positive
+# evidence only, from the connector's instance layout; this file re-implements none of it
 # and holds no predicate SQL (ADR-0039):
 #   1. LOCAL (F1 answered): the canonical pending set, metadata only, read-only.
 #      A pure SELECT, so it stamps no seq either.
@@ -104,8 +104,8 @@ AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 # v2.6.1 — vault helpers (token vault, agent pid) sourced from a single file.
-# The DB path is NOT resolved here: `relay pending` resolves it with the
-# connector's own resolver, and reports the path it read.
+# The DB path is NOT resolved here: `relay pending` resolves it (the connector's
+# instance layout, positive evidence only) and reports the path it read.
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_vault-helpers.sh
 . "$HOOKS_DIR/_vault-helpers.sh"
