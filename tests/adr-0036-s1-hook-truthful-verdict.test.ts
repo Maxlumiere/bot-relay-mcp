@@ -185,6 +185,10 @@ beforeEach(async () => {
   if (fs.existsSync(TEST_ROOT)) fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true, mode: 0o700 });
   fs.cpSync(REAL_HOOKS, HOOK_COPY_DIR, { recursive: true });
+  // A real install has bin/ beside hooks/: the hooks run `bin/relay` (bind, and
+  // `relay pending` for the mail delivery). A symlink keeps the copy byte-identical
+  // while bin/relay still resolves dist/ through its real path.
+  fs.symlinkSync(path.join(REPO_ROOT, "bin"), path.join(TEST_ROOT, "bot-relay-mcp", "bin"));
   const { closeDb } = await import("../src/db.js");
   closeDb();
   // A sibling file sharing this worker may have moved RELAY_DB_PATH; re-assert ours.

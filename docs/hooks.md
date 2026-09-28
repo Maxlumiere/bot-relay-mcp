@@ -54,7 +54,7 @@ Every time you open a Claude Code terminal (or resume a session), the hook check
 
 ## What the hook checks
 
-- **Pending messages** — messages sent to your agent that haven't been read yet
+- **Pending messages** — exactly what `get_messages(status="pending")` would return, in the same order (priority first, then newest). The hook reads them through `relay pending AGENT --with-content 10`, so it holds no query of its own. It shows up to 10 bodies and says how many are pending in all. Bodies stored encrypted are shown decrypted when this environment has the key, and as a placeholder otherwise, never as ciphertext. The read marks nothing: the mail stays pending until the agent calls `get_messages`. If the mail cannot be read, the hook says `relay unreadable` rather than showing nothing.
 - **Active tasks** — tasks assigned to you with status "posted" or "accepted", sorted by priority
 
 ## Example output
@@ -62,7 +62,7 @@ Every time you open a Claude Code terminal (or resume a session), the hook check
 When you open a terminal and have pending items:
 
 ```
-[RELAY] Pending messages for orchestrator:
+[RELAY] Pending messages for orchestrator (showing 1 of 1):
   From: ops | Server health check complete, all green. (2026-04-13T15:30:00Z)
 
 [RELAY] Active tasks for orchestrator:
@@ -74,7 +74,7 @@ Claude sees this automatically and can act on it without you asking.
 
 ## Requirements
 
-- `sqlite3` command-line tool (pre-installed on macOS and most Linux)
+- `sqlite3` command-line tool (pre-installed on macOS and most Linux), and `node` (the hook runs the `relay` CLI beside it)
 - The `RELAY_AGENT_NAME` environment variable set before launching Claude Code
 
 ## Custom database path
@@ -91,7 +91,7 @@ Default: `~/.bot-relay/relay.db`
 
 The hook probes `health_check` with the presented `RELAY_AGENT_TOKEN` first. If the daemon reports an auth error — because the terminal restarted, a new token was issued in another session, or the row was somehow desynced — the hook surfaces a clear stderr message telling the operator what to do (set `RELAY_RECOVERY_TOKEN` if an admin issued one, or fall through to `relay recover`).
 
-The hook NEVER writes the agent row directly via `sqlite3` (Phase 7p HIGH #3 — that path created impossible `auth_state='active' + token_hash IS NULL` rows). Instead, it calls the daemon's `register_agent` over HTTP, so the server enforces every auth-state invariant. If the daemon is unreachable, the hook skips the register silently; mail/task delivery still runs via read-only sqlite3.
+The hook NEVER writes the agent row directly via `sqlite3` (Phase 7p HIGH #3 — that path created impossible `auth_state='active' + token_hash IS NULL` rows). Instead, it calls the daemon's `register_agent` over HTTP, so the server enforces every auth-state invariant. If the daemon is unreachable, the hook skips the register silently; mail delivery still runs read-only through `relay pending`, and task delivery through read-only sqlite3.
 
 Run `relay recover <agent-name>` (filesystem-gated, see [`README.md`](../README.md#lost-token-recovery-v21)) to clear a registration and let the next session re-bootstrap via the hook.
 

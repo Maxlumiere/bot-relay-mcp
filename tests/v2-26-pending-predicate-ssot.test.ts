@@ -28,8 +28,8 @@
  * guard passing for a coincidental reason.
  *
  * COVERED surfaces (routed through the SSOT): peek_inbox_version.total_unread_count,
- * get_messages(pending), getHealthSnapshot.message_count_pending, hooks/check-relay.sh,
- * src/transport/consistency-probe.ts.
+ * get_messages(pending), getHealthSnapshot.message_count_pending, hooks/check-relay.sh
+ * (through `relay pending` since F1), src/transport/consistency-probe.ts.
  *
  * FORMERLY-RESIDUAL surfaces, now UNIFIED (#56 finished the SSOT):
  *   - hooks/stop-check.sh (#124 Stop-hook) — since F1 it holds NO predicate SQL
@@ -205,17 +205,16 @@ describe("#53 pending predicate SSOT — every surface derives from one definiti
     expect(canonicalPendingCount("rp-to", s2)).toBe(1);
   });
 
-  it("check-relay.sh delivers on the canonical per-session predicate, not the binary status column", () => {
+  it("check-relay.sh delivers through F1 (the drain's own predicate), with no predicate of its own", () => {
+    // Since F1 the hook selects no message rows: `relay pending --with-content`
+    // builds the WHERE with the drain's buildMessageWhere. The behaviour guards are
+    // tests/f1-sessionstart-delivery.test.ts (drain order, decrypt, K of N) and the
+    // v2-6-2 NULL-session re-pend seam test, which EXECUTES the hook. This is a
+    // TRIPWIRE with a pinned limit (ADR-0046): literal spellings only.
     const hook = fs.readFileSync(path.join(PROJECT_ROOT, "hooks/check-relay.sh"), "utf8");
-    // The delivery query must use the canonical predicate, with COALESCE(…, '')
-    // so a NULL/missing session mirrors get_messages' `currentSession ?? ""`
-    // (re-pends a prior session's unresolved mail) rather than hiding it.
-    expect(hook).toContain("resolved_at IS NULL");
-    expect(hook).toMatch(
-      /read_by_session IS NULL\s+OR\s+read_by_session != COALESCE\(\(SELECT session_id FROM agents WHERE name = :name\), ''\)/,
-    );
-    // …and must NOT deliver on the pre-#53 binary `status='pending'` filter.
-    expect(hook).not.toMatch(/FROM messages WHERE to_agent = :name AND status\s*=\s*'pending'/);
+    expect(hook).toMatch(/pending "\$AGENT_NAME" --json --with-content/);
+    expect(hook).not.toMatch(/FROM messages/);
+    expect(hook).not.toMatch(/read_by_session/);
   });
 
   it("#56 BITE: getInboxSummary.unread_count no longer zeroes on a non-consuming browse (agrees with the drain, not seq)", () => {

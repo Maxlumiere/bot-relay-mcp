@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed — session start showed encrypted mail as ciphertext; it now delivers pending mail through `relay pending`, decrypted, in drain order, with an honest count
+
+The SessionStart hook printed the raw stored body, so a relay with an encryption keyring showed `enc:…` ciphertext to the agent at session start. It also used its own copy of the pending predicate, ordered newest-first instead of the drain's order, and cut the list at 10 without saying so. Now:
+
+- **One read, the drain's own predicate and order** (priority first, then newest). The hook runs `relay pending AGENT --json --with-content 10` and selects no message rows itself.
+- **Bodies are decrypted** by the same accessor the drain uses. A body this environment cannot decrypt shows a placeholder, never ciphertext.
+- **Honest truncation:** `[RELAY] Pending messages for X (showing 10 of 23):`. The total is the full pending count.
+- **Still a pure read** (no read-mark, no `seq`), and only this agent's mail.
+- **If the mail cannot be read, the hook says so** (`relay unreadable`, and the verdict degrades) instead of showing nothing.
+- **`relay pending --with-content N`** (1-100) is opt-in and off by default. The default output, and `pendingMetadata` called without options, carry no content key at all, so the board and every other metadata reader stay metadata-only by construction.
+
+Tests: `tests/f1-sessionstart-delivery.test.ts`. An undecrypting mutation, and a mutation that makes content default-on at either layer, each turn it red.
+
 ### Changed — the PostToolUse and Stop hooks read through `relay pending`; the read path is chosen by configuration, never by failure
 
 Both hooks carried their own copy of the pending predicate as a sqlite fallback. They also preferred a `get_messages` peek over HTTP, which stamps the `seq` observation cursor. A failed read on one path fell through to the other path, or went silent. Now `relay pending` decides:

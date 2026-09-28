@@ -157,11 +157,13 @@ interface Args {
   name: string | null;
   json: boolean;
   dbPath: string | null;
+  /** OPT-IN body window (SessionStart delivery): 0 = metadata only, the default. */
+  withContent: number;
   help: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { name: null, json: false, dbPath: null, help: false };
+  const args: Args = { name: null, json: false, dbPath: null, withContent: 0, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") args.json = true;
@@ -173,6 +175,12 @@ function parseArgs(argv: string[]): Args {
       const v = argv[++i];
       if (!v) throw new Error("--db-path requires a path");
       args.dbPath = v;
+    } else if (a === "--with-content") {
+      const v = argv[++i];
+      if (!v || !/^[0-9]{1,3}$/.test(v) || Number(v) < 1 || Number(v) > 100) {
+        throw new Error("--with-content requires a whole number from 1 to 100");
+      }
+      args.withContent = Number(v);
     } else if (a.startsWith("-")) throw new Error(`unknown option: ${a}`);
     else if (args.name === null) args.name = a;
     else throw new Error(`unexpected argument: ${a}`);
@@ -188,7 +196,10 @@ function usage(requested = false): void {
     "count, top priority, and per message the id, sender, priority and age. Never\n" +
     "the content. No time window. Reads the DB read-only and marks nothing.\n\n" +
     "  --json       Emit JSON.\n" +
-    "  --db-path P  Read the DB at P.\n\n" +
+    "  --db-path P  Read the DB at P.\n" +
+    "  --with-content N  OPT-IN: add the DECRYPTED body to the first N messages\n" +
+    "               (drain order, 1-100), read in the same statement as the ids.\n" +
+    "               For SessionStart delivery. Off by default: no content key.\n\n" +
     "Source: --db-path, RELAY_DB_PATH or RELAY_INSTANCE_ID (explicit) win; then a\n" +
     "configured remote (RELAY_HTTP_HOST) means no local answer; then the active\n" +
     "instance or the legacy DB file.\n\n" +
@@ -267,7 +278,7 @@ export async function run(argv: string[]): Promise<number> {
       );
     }
 
-    const meta = pendingMetadata(db, name);
+    const meta = pendingMetadata(db, name, { contentFor: args.withContent });
     if (!meta.registered) {
       return pendingFailed(
         `agent ${JSON.stringify(name)} is not registered in ${dbPath} — the wrong instance's DB, or an agent that ` +

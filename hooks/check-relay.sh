@@ -946,38 +946,59 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
 fi
 # --- end ADR-0036 S1 bind ------------------------------------------------------
 
-# --- Deliver pending messages (parameter-bound) ---
-# #53 — the CANONICAL per-session pending predicate (SSOT: src/db.ts
-# pendingForSessionClause), replicated here because a shell hook can't call the
-# TS helper. Pre-#53 this read the binary `status='pending'` column, which flips
-# to 'read' GLOBALLY on the first MCP drain by ANY session — so a fresh session
-# was told "no mail" for messages a prior session drained but never resolved,
-# even though its own get_messages(pending) would re-surface them (v2.0 #6). The
-# correlated subselect binds THIS agent's current session so the preview matches
-# exactly what get_messages(pending) returns: unresolved AND (never read, OR read
-# by a DIFFERENT session). COALESCE(session_id, '') mirrors get_messages'
-# `currentSession ?? ""` EXACTLY — with a NULL/missing session it becomes
-# `read_by_session != ''`, so a row read by a PRIOR session still re-pends (the
-# v2.0 #6 handover), identical to the drain. Without the COALESCE, `!= NULL`
-# is SQL NULL and would silently hide that row in the pre-register state — a
-# wake-vs-drain divergence, the exact class this predicate exists to kill.
-# Executed-hook coverage in tests/v2-26-pending-predicate-ssot.test.ts.
-MESSAGES=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-SELECT '  From: ' || from_agent || ' | ' || content || ' (' || created_at || ')'
-FROM messages
-WHERE to_agent = :name
-  AND resolved_at IS NULL
-  AND (read_by_session IS NULL
-       OR read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = :name), ''))
-ORDER BY created_at DESC LIMIT 10;
-SQL
-)
+# --- Deliver pending messages (F1: this hook selects no message rows) ---
+# The ids, their ORDER (the drain's: priority first, then newest) and the bodies
+# come from ONE read by `relay pending --with-content` (ADR-0044 point 6):
+#   - the predicate is the drain's own (buildMessageWhere), never a copy here;
+#   - bodies go through the TS decrypting accessor, so a keyring user sees
+#     plaintext, and an undecryptable body shows a placeholder, never `enc:`;
+#   - the read marks nothing (read-only handle, no seq);
+#   - the header says how many of the canonical total are shown, so a truncated
+#     list never reads as the whole queue.
+# --db-path pins the read to the DB this hook already resolved and registered
+# against. If it cannot answer, that is SAID (stdout + verdict), never shown as
+# "no mail".
+RELAY_PENDING_BIN="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+RELAY_PENDING_SHOW=10
+RELAY_PENDING_OUT=""
+RELAY_PENDING_RC=127
+if [ -f "$RELAY_PENDING_BIN" ] && command -v node >/dev/null 2>&1; then
+  RELAY_PENDING_OUT=$(node "$RELAY_PENDING_BIN" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW" --db-path "$DB_PATH" 2>/dev/null)
+  RELAY_PENDING_RC=$?
+fi
+RELAY_PENDING_BLOCK=""
+if [ "$RELAY_PENDING_RC" -eq 0 ]; then
+  # Rendered from the JSON on stdin (never an env var: ten bodies can exceed an
+  # exec string limit). Exit 1 = output this hook cannot trust.
+  RELAY_PENDING_BLOCK=$(printf '%s' "$RELAY_PENDING_OUT" | AN="$AGENT_NAME" node -e '
+    let raw = "";
+    process.stdin.on("data", (c) => (raw += c));
+    process.stdin.on("end", () => {
+      let d;
+      try { d = JSON.parse(raw); } catch { process.exit(1); }
+      if (!d || d.ok !== true || !Array.isArray(d.messages) || !Number.isInteger(d.count)) process.exit(1);
+      if (d.count === 0) return;
+      const shown = d.messages.filter((m) => Object.prototype.hasOwnProperty.call(m, "content"));
+      const out = ["[RELAY] Pending messages for " + process.env.AN + " (showing " + shown.length + " of " + d.count + "):"];
+      for (const m of shown) {
+        const body = typeof m.content === "string"
+          ? m.content
+          : "[" + (m.content_error || "body unavailable") + "; call get_messages to read it]";
+        out.push("  From: " + (m.from || "unknown") + " | " + body + " (" + (m.created_at || "?") + ")");
+      }
+      process.stdout.write(out.join("\n"));
+    });' 2>/dev/null) || RELAY_PENDING_RC=1
+fi
 
-if [ -n "$MESSAGES" ]; then
-  echo "[RELAY] Pending messages for $AGENT_NAME:"
-  echo "$MESSAGES"
-  echo ""
+if [ "$RELAY_PENDING_RC" -ne 0 ]; then
+  # LOUD: mail may be waiting. Same wording family as the other hooks.
+  echo "[RELAY] relay unreadable: pending mail for $AGENT_NAME could not be read at session start. Mail may be waiting: call get_messages. (relay pending $AGENT_NAME shows the reason.)"
+  echo "[bot-relay] relay pending failed for $AGENT_NAME (exit $RELAY_PENDING_RC) — pending mail NOT delivered to context." >&2
+  if command -v relay_verdict_set >/dev/null 2>&1 && [ "$RELAY_VERDICT" = "HEALTHY" ]; then
+    relay_verdict_set "DEGRADED" "relay unreadable: pending mail could not be read at session start" " agent=\"$AGENT_NAME\""
+  fi
+elif [ -n "$RELAY_PENDING_BLOCK" ]; then
+  printf '%s\n\n' "$RELAY_PENDING_BLOCK"
   echo "[bot-relay] $AGENT_NAME has pending messages (delivered to context)." >&2
 fi
 
