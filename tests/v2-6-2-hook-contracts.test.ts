@@ -78,6 +78,36 @@ function discoverHooks(): string[] {
 
 const ALL_HOOKS = discoverHooks();
 
+// The REAL shared helper, as it was when this file loaded. Other test files copy
+// hooks/ while they run (in parallel), so a test here that edits the real file
+// in place leaks a corrupt helper into THEIR copies: the adr-0036
+// truthful-verdict flake (a CANNOT-JUDGE from a copied, corrupted _verdict.sh).
+const REAL_HELPER = path.join(REPO_ROOT, "hooks", "_verdict.sh");
+const REAL_HELPER_BYTES = fs.readFileSync(REAL_HELPER);
+/**
+ * A private, byte-identical copy of hooks/ (with bin/ symlinked beside it, as a
+ * real install has it), so a test can corrupt or delete ITS helper without the
+ * real file ever changing. Returns the copy's helper path and each discovered
+ * hook's path inside the copy.
+ */
+function hookCopy(root: string): { helper: string; hooks: string[] } {
+  const base = path.join(root, "copy", "bot-relay-mcp");
+  const dir = path.join(base, "hooks");
+  fs.cpSync(path.join(REPO_ROOT, "hooks"), dir, { recursive: true });
+  fs.symlinkSync(path.join(REPO_ROOT, "bin"), path.join(base, "bin"));
+  return {
+    helper: path.join(dir, "_verdict.sh"),
+    hooks: ALL_HOOKS.map((h) => path.join(dir, path.relative(path.join(REPO_ROOT, "hooks"), h))),
+  };
+}
+function realHelperIntact(): boolean {
+  try {
+    return fs.readFileSync(REAL_HELPER).equals(REAL_HELPER_BYTES);
+  } catch {
+    return false;
+  }
+}
+
 const TEST_ROOT = path.join(os.tmpdir(), "v2-6-2-hook-contracts-" + process.pid);
 
 function freshTestRoot(): { root: string; dbPath: string; vaultDir: string } {
@@ -564,38 +594,34 @@ describe("v2.6.2 — cross-hook invariants", () => {
     // exit 0, and emit ZERO verdicts — the exact silence the mechanism exists
     // to end, reintroduced at the loader boundary. Each hook now installs a
     // minimal fallback trap BEFORE sourcing; a healthy load upgrades it.
-    const helper = path.join(REPO_ROOT, "hooks", "_verdict.sh");
-    const original = fs.readFileSync(helper, "utf8");
-    try {
-      fs.writeFileSync(helper, "this is not valid bash (((\n");
-      const { root } = freshTestRoot();
-      for (const hook of ALL_HOOKS) {
-        const r = runHook({ hook, root, agentName: "probe" });
-        const combined = `${r.stdout}\n${r.stderr}`;
-        const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
-        expect(count, `${path.basename(hook)} emitted ${count} verdicts with a CORRUPT helper`).toBe(1);
-      }
-    } finally {
-      fs.writeFileSync(helper, original);
+    const { root } = freshTestRoot();
+    const copy = hookCopy(root);
+    fs.writeFileSync(copy.helper, "this is not valid bash (((\n");
+    for (const hook of copy.hooks) {
+      const r = runHook({ hook, root, agentName: "probe" });
+      const combined = `${r.stdout}\n${r.stderr}`;
+      const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+      expect(count, `${path.basename(hook)} emitted ${count} verdicts with a CORRUPT helper`).toBe(1);
+      // Non-vacuous: the hook really ran on the COPY's broken helper (its fallback verdict).
+      expect(combined, path.basename(hook)).toContain("verdict helper did not load");
+      expect(realHelperIntact(), "the REAL hooks/_verdict.sh must never be touched: parallel files copy hooks/").toBe(true);
     }
   });
 
   it("EVERY hook still emits a verdict when the SHARED HELPER IS ABSENT", () => {
     // The other half: post/stop/codex guard the source with `if [ -f ]`, which
     // silently accepts a missing helper. Absence must still produce a verdict.
-    const helper = path.join(REPO_ROOT, "hooks", "_verdict.sh");
-    const original = fs.readFileSync(helper, "utf8");
-    try {
-      fs.rmSync(helper);
-      const { root } = freshTestRoot();
-      for (const hook of ALL_HOOKS) {
-        const r = runHook({ hook, root, agentName: "probe" });
-        const combined = `${r.stdout}\n${r.stderr}`;
-        const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
-        expect(count, `${path.basename(hook)} emitted ${count} verdicts with NO helper`).toBe(1);
-      }
-    } finally {
-      fs.writeFileSync(helper, original);
+    const { root } = freshTestRoot();
+    const copy = hookCopy(root);
+    fs.rmSync(copy.helper);
+    for (const hook of copy.hooks) {
+      const r = runHook({ hook, root, agentName: "probe" });
+      const combined = `${r.stdout}\n${r.stderr}`;
+      const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+      expect(count, `${path.basename(hook)} emitted ${count} verdicts with NO helper`).toBe(1);
+      // Non-vacuous: the hook really ran on the COPY's broken helper (its fallback verdict).
+      expect(combined, path.basename(hook)).toContain("verdict helper did not load");
+      expect(realHelperIntact(), "the REAL hooks/_verdict.sh must never be touched: parallel files copy hooks/").toBe(true);
     }
   });
 
