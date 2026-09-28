@@ -180,6 +180,21 @@ describe("ADR-0048 — the daemon re-checks containment AFTER create (TOCTOU)", 
       }) as never);
       const realChmod = fs.chmodSync.bind(fs);
       const chmodded: string[] = [];
+      // Codex R2 #1: record EVERY chmod (the parent directory too), and measure
+      // the outside targets' modes directly.
+      fs.mkdirSync(path.join(OUTSIDE, "lazy"));
+      fs.chmodSync(OUTSIDE, 0o755);
+      fs.chmodSync(path.join(OUTSIDE, "lazy"), 0o755);
+      const outsideReal = fs.realpathSync(OUTSIDE);
+      const escaped = (list: string[]) =>
+        list.filter((p) => {
+          try {
+            const r = fs.realpathSync(p);
+            return r === outsideReal || r.startsWith(outsideReal + path.sep);
+          } catch {
+            return false;
+          }
+        });
       vi.spyOn(fs, "chmodSync").mockImplementation(((p: fs.PathLike, m: fs.Mode) => {
         chmodded.push(String(p));
         return realChmod(p, m);
@@ -195,18 +210,19 @@ describe("ADR-0048 — the daemon re-checks containment AFTER create (TOCTOU)", 
           // detects); the refusal must add no bytes to it.
           expect(fs.existsSync(outsideDb) ? fs.statSync(outsideDb).size : 0, "the refused native handle wrote to the escaped DB").toBe(0);
         }
-        expect(chmodded, "the escaped DB file was chmod'ed before the re-check").not.toContain(dbPath);
+        expect(escaped(chmodded), "a chmod followed the escaped path (DB file or its parent)").toEqual([]);
+        expect(fs.statSync(OUTSIDE).mode & 0o777, "the outside directory's mode changed").toBe(0o755);
         if (driver === "native") {
           // The synchronous lazy path (getDb before initializeDb) refuses the same
           // way, on its own fresh racy directory (the first one is already a
           // symlink, which the resolver itself now refuses before any open).
-          fs.mkdirSync(path.join(OUTSIDE, "lazy"));
           const lazyDb = path.join(lazyDir, "relay.db");
           process.env.RELAY_DB_PATH = lazyDb;
           chmodded.length = 0;
           db.closeDb();
           expect(() => db.getDb()).toThrow(/REFUSING the relay DB after opening it/);
-          expect(chmodded, "getDb chmod'ed the escaped DB file before the re-check").not.toContain(lazyDb);
+          expect(escaped(chmodded), "getDb: a chmod followed the escaped path").toEqual([]);
+          expect(fs.statSync(path.join(OUTSIDE, "lazy")).mode & 0o777, "getDb changed the outside directory's mode").toBe(0o755);
         }
       } finally {
         db.closeDb();
@@ -268,6 +284,57 @@ describe("ADR-0048 Q2 — `relay doctor` PRINTS the resolver error (never a cras
     } finally {
       fs.chmodSync(marker, 0o600);
     }
+  });
+  /** Run the doctor IN-PROCESS (fault injection needs the same fs module), capturing stdout. */
+  async function doctorInProcess(env: Record<string, string>): Promise<{ code: number; out: string }> {
+    const keys = ["HOME", "RELAY_HTTP_PORT", "RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_INSTANCE_ID", "RELAY_WAKE_COVERAGE_STATUS_PATH", ...Object.keys(env)];
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    for (const k of ["RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_INSTANCE_ID"]) delete process.env[k];
+    Object.assign(process.env, { HOME, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json") }, env);
+    let out = "";
+    const w = vi.spyOn(process.stdout, "write").mockImplementation(((c: string | Uint8Array) => {
+      out += String(c);
+      return true;
+    }) as never);
+    try {
+      const doctor = await import("../src/cli/doctor.js");
+      const code = await doctor.run([]);
+      return { code, out };
+    } finally {
+      w.mockRestore();
+      (await import("../src/db.js")).closeDb();
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+  it("Codex #287 R2 #6: ONE resolution per run — the active-instance marker is read exactly once (config + DB init reuse it)", async () => {
+    seedDb(path.join(RH, "instances", "a", "relay.db"));
+    fs.symlinkSync("a", path.join(RH, "active-instance"));
+    const marker = path.join(RH, "active-instance");
+    const realReadlink = fs.readlinkSync.bind(fs);
+    let reads = 0;
+    vi.spyOn(fs, "readlinkSync").mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p) === marker) reads++;
+      return (realReadlink as (...a: unknown[]) => unknown)(p, ...rest);
+    }) as never);
+    const r = await doctorInProcess({});
+    expect(r.out).toMatch(/PASS instance resolution: instance a/);
+    expect(reads, "the marker was re-read after the report's resolution").toBe(1);
+  });
+  it("Codex #287 R2 #6: an EIO in the perms stat is a REPORT ROW, never a rejected doctor.run()", async () => {
+    const db = path.join(RH, "relay.db");
+    seedDb(db);
+    const realStat = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p) === RH || String(p) === db) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+      return (realStat as (...a: unknown[]) => unknown)(p, ...rest);
+    }) as never);
+    const r = await doctorInProcess({});
+    expect(r.out).toMatch(/=== relay doctor ===/);
+    expect(r.out).toMatch(/FAIL (dir|db) perms .*EIO/);
+    expect(r.code).toBe(1);
   });
   it("TWIN: a resolvable home → PASS 'instance resolution' naming the DB", () => {
     seedDb(path.join(RH, "relay.db"));

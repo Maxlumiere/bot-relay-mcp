@@ -73,6 +73,21 @@ function assertStillContained(dbPath: string): void {
   }
 }
 
+/**
+ * Create the DB's directory BEFORE the open, at 0700, WITHOUT chmod'ing one that
+ * already exists: a chmod follows symlinks, and before the containment re-check
+ * the directory may have been swapped for a link out of the approved roots. The
+ * existing directory is narrowed (ensureSecureDir) only AFTER the re-check.
+ * Errors are left to the open, which reports them.
+ */
+function createDbDir(dir: string): void {
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch {
+    /* the driver's open reports it */
+  }
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -295,9 +310,11 @@ export async function initializeDb(): Promise<void> {
   if (_db) return;
 
   const dbPath = getDbPath();
-  // v2.1 Phase 4c.4: tighten directory perms BEFORE the driver opens the
-  // file so there is no window where the DB lives under a 0755 parent.
-  ensureSecureDir(path.dirname(dbPath), 0o700);
+  // v2.1 Phase 4c.4: a NEW directory is created 0700 before the open, so there is
+  // no window where a fresh DB lives under a 0755 parent. An existing directory is
+  // narrowed only after the re-check below (ADR-0048: never chmod through an
+  // unverified path).
+  createDbDir(path.dirname(dbPath));
   _db = await initDriver(dbPath);
   // Re-check BEFORE anything else touches the file: on a refusal the handle is
   // DISCARDED (a WASM close() would flush its image through the escaped path),
@@ -309,7 +326,8 @@ export async function initializeDb(): Promise<void> {
     _db = null;
     throw err;
   }
-  // And narrow the DB file itself to 0600 right after create.
+  // Verified: narrow the directory and the DB file itself.
+  ensureSecureDir(path.dirname(dbPath), 0o700);
   ensureSecureFile(dbPath, 0o600);
 
   // #171 — single-sourced schema setup (pragmas + full migration chain + seed +
@@ -323,8 +341,9 @@ export function getDb(): CompatDatabase {
 
   const dbPath = getDbPath();
   const dir = path.dirname(dbPath);
-  // v2.1 Phase 4c.4: same dir + file perm narrowing as the eager init path.
-  ensureSecureDir(dir, 0o700);
+  // v2.1 Phase 4c.4: same dir + file perm narrowing as the eager init path
+  // (the existing directory is narrowed only after the re-check).
+  createDbDir(dir);
 
   // Native lazy-init fallback for callers that reach getDb() before
   // initializeDb() (the server and every CLI subcommand `await initializeDb()`
@@ -349,6 +368,7 @@ export function getDb(): CompatDatabase {
     _db = null;
     throw err;
   }
+  ensureSecureDir(dir, 0o700);
   ensureSecureFile(dbPath, 0o600);
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.

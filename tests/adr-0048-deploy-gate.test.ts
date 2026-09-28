@@ -26,7 +26,7 @@ import path from "path";
 import net from "net";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
-import { runGate, defaultGateDeps, formatGate, parseLaunchctlPrint, type GateDeps } from "../src/deploy-gate.js";
+import { runGate, defaultGateDeps, formatGate, parseLaunchctlPrint, parseLsofF, type GateDeps, type OpenFile } from "../src/deploy-gate.js";
 import { RESOLVER_ENV_KEYS } from "../src/instance.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -67,30 +67,55 @@ function lcText(o: { env: Env; inherited?: Env; dflt?: Env; pid?: number | null;
   ].join("\n");
 }
 
-/** Fake deps around the REAL new resolver (runWhere) and real realpath. */
+/** The OpenFile lsof would report for a real path: its (dev, ino) and its name. */
+function openFile(p: string): OpenFile {
+  try {
+    const st = fs.statSync(p, { bigint: true });
+    return { dev: st.dev, ino: st.ino, name: p };
+  } catch {
+    return { dev: null, ino: null, name: p };
+  }
+}
+/** Call n of a sequence (the last value repeats): successive observations. */
+const nth = <T,>(seq: T[]) => {
+  let n = 0;
+  return () => seq[Math.min(n++, seq.length - 1)];
+};
+
+/** Fake deps around the REAL new resolver (runWhere), real realpath and real stat. */
 function deps(o: {
   env: Env;
   plistEnv?: Env | string;
   inherited?: Env;
   lcRaw?: string;
+  lcSeq?: string[];
   lcFail?: boolean;
   listeners?: number[];
+  listenerSeq?: number[][];
   open?: string[];
+  openSeq?: string[][];
+  openRaw?: OpenFile[];
+  startSeq?: Array<string | null>;
   platform?: NodeJS.Platform;
   procEnviron?: string;
   dsHome?: string;
 }): GateDeps & { passedEnv: Env[] } {
   const real = defaultGateDeps();
   const passedEnv: Env[] = [];
+  const lc = nth(o.lcSeq ?? [o.lcRaw ?? lcText({ env: o.env, inherited: o.inherited })]);
+  const listeners = nth(o.listenerSeq ?? [o.listeners ?? [PID]]);
+  const open = nth(o.openSeq ?? [o.open ?? []]);
+  const start = nth(o.startSeq ?? ["Mon Sep 28 10:00:00 2026"]);
   return {
     ...real,
     passedEnv,
     platform: o.platform ?? "darwin",
     uid: 501,
-    launchctlPrint: () => (o.lcFail ? { ok: false, error: "Could not find service" } : { ok: true, text: o.lcRaw ?? lcText({ env: o.env, inherited: o.inherited }) }),
+    launchctlPrint: () => (o.lcFail ? { ok: false, error: "Could not find service" } : { ok: true, text: lc() }),
     plutilEnv: () => ({ ok: true, json: typeof o.plistEnv === "string" ? o.plistEnv : JSON.stringify(o.plistEnv ?? o.env) }),
-    listenerPids: () => ({ ok: true, pids: o.listeners ?? [PID] }),
-    openFiles: () => ({ ok: true, paths: o.open ?? [] }),
+    listenerPids: () => ({ ok: true, pids: listeners() }),
+    openFiles: () => ({ ok: true, files: o.openRaw ?? open().map(openFile) }),
+    processStart: () => start(),
     procEnviron: () => (o.procEnviron === undefined ? { ok: false, error: "no /proc" } : { ok: true, raw: Buffer.from(o.procEnviron) }),
     dsHome: () => o.dsHome ?? H,
     runWhere: (env: Env) => {
@@ -262,6 +287,82 @@ describe("deploy gate — Linux: /proc/<pid>/environ (NUL-delimited); no modelle
   });
 });
 
+describe("Codex #287 R2 — #3: a forged closing brace cannot hide an entry (structure, not just lines)", () => {
+  it("an INHERITED value `prefix\\n\\t}` closes the section early; the real entries after it are at a wrong depth → CANNOT-VERIFY", () => {
+    const g = gate(deps({ env: { HOME: H, RELAY_INSTANCE_ID: "a" }, inherited: { A_FORGE: "prefix\n\t}", RELAY_DB_PATH: "/tmp/b.db" }, open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toMatch(/unexpected depth/);
+    expect(g.all).not.toContain("/tmp/b.db");
+  });
+  it("the forge also OPENS a fake block to hold the real entries: the resolver key outside the environment sections is found anyway", () => {
+    const g = gate(deps({ env: { HOME: H, RELAY_INSTANCE_ID: "a" }, inherited: { A_FORGE: "prefix\n\t}\n\tfake = {", RELAY_DB_PATH: "/tmp/b.db" }, open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toMatch(/outside the environment sections/);
+    expect(g.all).not.toContain("/tmp/b.db");
+  });
+  it("a stray `}` at the top level → CANNOT-VERIFY", () => {
+    const text = lcText({ env: { HOME: H } }).replace("\tdomain = gui/501", "\t}\n\tdomain = gui/501");
+    const g = gate(deps({ env: { HOME: H }, lcRaw: text, open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toMatch(/closes a block at the wrong depth/);
+  });
+});
+
+describe("Codex #287 R2 — #4: open-DB membership is by (device, inode), never by lsof's escaped names", () => {
+  it("the daemon holds `x\\ny` (a real newline, which lsof prints as `x\\\\ny`); the new resolver names the file literally called `x\\\\ny` → FAIL, not a name match", () => {
+    const withNewline = path.join(ROOT, "x\ny.db");
+    const literal = path.join(ROOT, "x\\ny.db");
+    fs.writeFileSync(withNewline, "");
+    fs.writeFileSync(literal, "");
+    const held = openFile(withNewline);
+    // What lsof -F Din prints for the held file: its identity, and the ESCAPED name.
+    const lsofOut = `p${PID}\nf3\nD0x${held.dev!.toString(16)}\ni${held.ino}\nn${literal}\n`;
+    const g = gate(deps({ env: { HOME: H, RELAY_DB_PATH: literal }, openRaw: parseLsofF(lsofOut) }));
+    expect(g.outcome, g.all).toBe("FAIL");
+  });
+  it("parseLsofF reads D (hex), i (decimal, beyond 2^53) and n per `f` record", () => {
+    const files = parseLsofF("p1\nfcwd\nD0x100000d\ni1152921500312607377\nn/x y\nf4\nn/sock\n");
+    expect(files).toEqual([
+      { dev: 0x100000dn, ino: 1152921500312607377n, name: "/x y" },
+      { dev: null, ino: null, name: "/sock" },
+    ]);
+  });
+});
+
+describe("Codex #287 R2 — D-B: the snapshot is ONE process incarnation, re-validated before PASS", () => {
+  const env = { HOME: H, RELAY_INSTANCE_ID: "a" };
+  it("the job's pid changes between the first observation and the re-validation → CANNOT-VERIFY", () => {
+    const g = gate(deps({ env, lcSeq: [lcText({ env }), lcText({ env, pid: PID + 1 })], open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toMatch(/changed during the gate/);
+  });
+  it("same pid, different START TIME (a reused pid) → CANNOT-VERIFY", () => {
+    const g = gate(deps({ env, startSeq: ["Mon Sep 28 10:00:00 2026", "Mon Sep 28 10:05:00 2026"], open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toMatch(/start time/);
+  });
+  it("the listener moves to another pid before PASS → CANNOT-VERIFY", () => {
+    const g = gate(deps({ env, listenerSeq: [[PID], [PID + 7]], open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toMatch(/listener/);
+  });
+  it("the pid no longer holds the DB at the re-validation → CANNOT-VERIFY", () => {
+    const g = gate(deps({ env, openSeq: [[dbA()], ["/dev/null"]] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toMatch(/no longer holds/);
+  });
+  it("the job's resolver env changes before PASS → CANNOT-VERIFY", () => {
+    const env2 = { HOME: H, RELAY_INSTANCE_ID: "b" };
+    const g = gate(deps({ env, lcSeq: [lcText({ env }), lcText({ env: env2 })], open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toMatch(/resolver environment changed/);
+  });
+  it("an unreadable start time → CANNOT-VERIFY (a pid alone is not an incarnation)", () => {
+    const g = gate(deps({ env, startSeq: [null], open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+  });
+});
+
 describe("parseLaunchctlPrint — the strict parser, directly", () => {
   it("hyphenated keys are ordinary entries (the ps -E leak cannot recur: entries are lines)", () => {
     const p = parseLaunchctlPrint(lcText({ env: { "API-KEY": SECRET, HOME: H } }));
@@ -270,19 +371,104 @@ describe("parseLaunchctlPrint — the strict parser, directly", () => {
   });
 });
 
-describe("RESOLVER_ENV_KEYS — the exported set covers every env read of the resolver", () => {
-  it("static: every process.env read in src/instance.ts + src/approved-roots.ts is in the set (or a declared non-resolver key); os.homedir ⇒ HOME", () => {
+/**
+ * Codex #287 R2 #7: the env-read audit is SYNTAX-AWARE (the repo's pinned parser,
+ * scripts/lib/guard-parse.mjs, which fails loud on any parse diagnostic). Every
+ * access form it can read yields its key; EVERY other use of process.env is
+ * reported as unsupported, so a new form fails the test instead of escaping it.
+ */
+const { parseGuardSource, ts } = (await import("../scripts/lib/guard-parse.mjs")) as {
+  parseGuardSource: (f: string, s: string) => import("typescript-legacy").SourceFile;
+  ts: typeof import("typescript-legacy");
+};
+function envReads(fileName: string, source: string): { keys: Set<string>; unsupported: string[] } {
+  const sf = parseGuardSource(fileName, source);
+  const keys = new Set<string>();
+  const unsupported: string[] = [];
+  const at = (n: import("typescript-legacy").Node) => `${fileName}:${sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1} ${n.getText(sf)}`;
+  const isProcess = (e: import("typescript-legacy").Expression) => ts.isIdentifier(e) && e.text === "process";
+  /** Walk up through parentheses, `!`, `as`, `<T>` and `satisfies`: they do not change what is read. */
+  const outer = (n: import("typescript-legacy").Node) => {
+    let cur = n;
+    while (
+      cur.parent &&
+      (ts.isParenthesizedExpression(cur.parent) || ts.isNonNullExpression(cur.parent) || ts.isAsExpression(cur.parent) ||
+        ts.isTypeAssertionExpression(cur.parent) || ts.isSatisfiesExpression(cur.parent))
+    ) {
+      cur = cur.parent;
+    }
+    return cur;
+  };
+  const visit = (n: import("typescript-legacy").Node): void => {
+    // import { env } from "process" / import process from "node:process": an alias the walk cannot follow.
+    if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier) && /^(node:)?process$/.test(n.moduleSpecifier.text)) unsupported.push(at(n));
+    // os.homedir() / os.userInfo() read HOME; so does a named import of either.
+    if (ts.isPropertyAccessExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "os" && /^(homedir|userInfo)$/.test(n.name.text)) keys.add("HOME");
+    if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier) && /^(node:)?os$/.test(n.moduleSpecifier.text)) {
+      const named = n.importClause?.namedBindings;
+      if (named && ts.isNamedImports(named) && named.elements.some((e) => /^(homedir|userInfo)$/.test((e.propertyName ?? e.name).text))) keys.add("HOME");
+    }
+    // process["env"] or process[x]: not the audited spelling.
+    if (ts.isElementAccessExpression(n) && isProcess(n.expression)) unsupported.push(at(n));
+    // X.process.env (globalThis.process.env, …): an env read through another object.
+    if (ts.isPropertyAccessExpression(n) && n.name.text === "env" && !isProcess(n.expression) && ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === "process") {
+      unsupported.push(at(n));
+    }
+    if (ts.isPropertyAccessExpression(n) && n.name.text === "env" && isProcess(n.expression)) {
+      const e = outer(n);
+      const p = e.parent;
+      if (p && ts.isPropertyAccessExpression(p) && p.expression === e) keys.add(p.name.text);
+      else if (p && ts.isElementAccessExpression(p) && p.expression === e && ts.isStringLiteralLike(p.argumentExpression)) keys.add(p.argumentExpression.text);
+      else if (p && ts.isVariableDeclaration(p) && p.initializer === e && ts.isObjectBindingPattern(p.name)) {
+        for (const el of p.name.elements) {
+          const name = el.propertyName ?? el.name;
+          if (el.dotDotDotToken || !(ts.isIdentifier(name) || ts.isStringLiteral(name))) unsupported.push(at(el));
+          else keys.add(name.text);
+        }
+      } else unsupported.push(at(p ?? n));
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return { keys, unsupported };
+}
+
+describe("RESOLVER_ENV_KEYS — the exported set covers every env read of the resolver (syntax-aware)", () => {
+  it("every env read in src/instance.ts + src/approved-roots.ts is in the set (or a declared non-resolver key); no unsupported access form", () => {
     const NOT_RESOLVER: Record<string, string> = { RELAY_CONFIG_PATH: "moves the config file, not the DB" };
     const found = new Set<string>();
+    const unsupported: string[] = [];
     for (const f of ["src/instance.ts", "src/approved-roots.ts"]) {
-      const src = fs.readFileSync(path.join(REPO_ROOT, f), "utf-8");
-      for (const m of src.matchAll(/process\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])/g)) found.add(m[1] ?? m[2]);
-      expect(src, `${f}: a computed process.env[...] read cannot be audited`).not.toMatch(/process\.env\[\s*[^"'`\s]/);
-      if (/os\.homedir\(|os\.userInfo\(/.test(src)) found.add("HOME");
+      const r = envReads(f, fs.readFileSync(path.join(REPO_ROOT, f), "utf-8"));
+      r.keys.forEach((k) => found.add(k));
+      unsupported.push(...r.unsupported);
     }
+    expect(unsupported, "an env access form the audit cannot read").toEqual([]);
     const keys = new Set<string>(RESOLVER_ENV_KEYS);
     for (const k of found) if (!NOT_RESOLVER[k]) expect(keys.has(k), `${k} is read by the resolver modules but not exported`).toBe(true);
     for (const k of keys) expect(found.has(k), `${k} is exported but never read (stale)`).toBe(true);
+  });
+  it("the audit reads or REJECTS every access form (Codex's escapes included)", () => {
+    const r = (src: string) => envReads("fixture.ts", src);
+    expect([...r("const { RELAY_NEW_DB } = process.env;").keys]).toEqual(["RELAY_NEW_DB"]);
+    expect([...r("const { A: a, 'B': b } = process.env;").keys].sort()).toEqual(["A", "B"]);
+    expect([...r('const x = process.env["Y"];').keys]).toEqual(["Y"]);
+    expect([...r("const x = (process.env as Record<string, string>).Z;").keys]).toEqual(["Z"]);
+    expect([...r("const h = os.homedir();").keys]).toEqual(["HOME"]);
+    expect([...r('import { homedir } from "node:os";').keys]).toEqual(["HOME"]);
+    for (const bad of [
+      "declare const key: string; const x = process.env [key];",
+      "const e = process.env;",
+      "const { ...rest } = process.env;",
+      "declare const k: string; const { [k]: v } = process.env;",
+      "const x = globalThis.process.env.X;",
+      'const x = process["env"].X;',
+      'import { env } from "node:process";',
+      "f(process.env);",
+      '"X" in process.env;',
+    ]) {
+      expect(r(bad).unsupported.length, `not rejected: ${bad}`).toBeGreaterThan(0);
+    }
   });
   it("`relay where --env-keys --json` prints exactly the set", () => {
     const r = spawnSync("node", [path.join(REPO_ROOT, "bin", "relay"), "where", "--env-keys", "--json"], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME: H } });

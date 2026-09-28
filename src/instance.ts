@@ -513,8 +513,24 @@ export function assertInstanceResolution(
 export function resolveInstanceConfigPath(): string {
   if (process.env.RELAY_CONFIG_PATH) return process.env.RELAY_CONFIG_PATH;
   // STRICT since ADR-0048: the same resolution as the DB; a fault throws.
-  const { dir } = instancePart();
-  return path.join(dir ?? botRelayRoot(), "config.json");
+  return configPathFor(resolveInstance({ ignoreDbPathEnv: true }));
+}
+
+/**
+ * The config path for a resolution of the INSTANCE PART (RELAY_DB_PATH ignored:
+ * an explicit DB does not move the config). For a caller that already holds that
+ * resolution and must not resolve again (relay doctor reports ONE resolution and
+ * inspects exactly what it reported). RELAY_CONFIG_PATH wins; a fault throws,
+ * except the ambiguous state under an explicit RELAY_DB_PATH (tolerated, as in
+ * instancePart).
+ */
+export function configPathFor(r: ResolvedInstance): string {
+  if (process.env.RELAY_CONFIG_PATH) return process.env.RELAY_CONFIG_PATH;
+  if (r.kind === "error") {
+    if (r.ambiguous && process.env.RELAY_DB_PATH) return path.join(botRelayRoot(), "config.json");
+    throw new Error(r.reason);
+  }
+  return path.join(r.kind === "instance" ? path.dirname(r.dbPath) : botRelayRoot(), "config.json");
 }
 
 /**
