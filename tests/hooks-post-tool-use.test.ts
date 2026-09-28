@@ -10,17 +10,20 @@
  * token, sends messages, then invokes the hook script as a subprocess with
  * controlled env vars and inspects stdout / stderr / timing.
  *
- * Covers:
- *   1. HTTP happy path — pending mail → valid Claude Code hook JSON (a notice).
+ * Covers (the fixture configures RELAY_DB_PATH, so the hook runs in LOCAL mode
+ * and reads through `relay pending`; the local/remote mode rule itself lives in
+ * tests/f1-hook-migration.test.ts):
+ *   1. Happy path — pending mail → valid Claude Code hook JSON (a notice).
  *   2. Empty mailbox → truly empty stdout, exit 0.
  *   3. Not consumed — a repeat run leaves the mail pending; the damper
  *      suppresses the duplicate notice. (Pre-ADR-0037 this was "idempotent
  *      because the first run marked it read" — the message-loss bug.)
- *   4. Unreachable relay + unreachable DB → silent fail within budget.
- *   5. Missing token → falls back to sqlite direct, still surfaces mail.
+ *   4. Unreachable relay + a configured DB that does not exist → a LOUD notice
+ *      within budget (F1: a failed local read is never silent).
+ *   5. Missing token → the local read needs none, still surfaces mail.
  *   6. No re-register — hook does not change the agent's capabilities or role.
  *   7. Missing RELAY_AGENT_NAME → silent exit 0.
- *   8. Invalid token shape → treated as missing token, sqlite fallback runs.
+ *   8. Invalid token shape → treated as missing token; the local read still runs.
  * The ADR-0037 contract itself (harm tests, subagent skip, damper) lives in
  * tests/adr-0037-post-tool-use-peek-only.test.ts.
  */
@@ -211,7 +214,7 @@ describe("PostToolUse hook — HTTP path (preferred)", () => {
 });
 
 describe("PostToolUse hook — graceful degradation", () => {
-  it("(4) unreachable relay AND unreachable DB → silent exit within ~3s, empty stdout", async () => {
+  it("(4) unreachable relay AND a configured DB that does not exist → exit 0 with a LOUD notice, promptly", async () => {
     const r = await runHook({
       RELAY_AGENT_NAME: "hook-gone",
       RELAY_AGENT_TOKEN: "AAAAAAAAAAAAAAAAAAAAAAAA",
@@ -220,13 +223,14 @@ describe("PostToolUse hook — graceful degradation", () => {
       RELAY_DB_PATH: "/tmp/bot-relay-hook-test-does-not-exist-" + process.pid + "/relay.db",
     });
     expect(r.code).toBe(0);
-    expect(r.stdout).toBe("");
-    // Budget is ~2s total (1s health probe + 2s get_messages); the internal
-    // deadline is what bounds the hook — this ceiling only catches a true hang.
+    // F1 mode rule (28 Sep): a configured local DB that cannot be read is LOUD,
+    // never silence, and never a reason to try HTTP.
+    expect(JSON.parse(r.stdout).hookSpecificOutput.additionalContext).toMatch(/^relay unreadable/);
+    // The internal deadline is what bounds the hook; this ceiling only catches a true hang.
     expect(r.durationMs).toBeLessThan(7000); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten
   });
 
-  it("(5) missing token → falls back to sqlite direct, still surfaces mail", async () => {
+  it("(5) missing token → the local read needs none, still surfaces mail", async () => {
     const senderTok = await registerWithToken("hook-sender-3", []);
     await registerWithToken("hook-recv-3", []);
     await sendMessage("hook-sender-3", "hook-recv-3", "via sqlite path", senderTok);

@@ -28,13 +28,14 @@
  * guard passing for a coincidental reason.
  *
  * COVERED surfaces (routed through the SSOT): peek_inbox_version.total_unread_count,
- * get_messages(pending), getHealthSnapshot.message_count_pending, hooks/check-relay.sh,
- * src/transport/consistency-probe.ts.
+ * get_messages(pending), getHealthSnapshot.message_count_pending, hooks/check-relay.sh
+ * (through `relay pending` since F1), src/transport/consistency-probe.ts.
  *
  * FORMERLY-RESIDUAL surfaces, now UNIFIED (#56 finished the SSOT):
- *   - hooks/stop-check.sh (#124 Stop-hook) — its PRIMARY pending query now uses
- *     the per-session predicate; only the bare-status LEGACY fallback (for
- *     pre-v2.0/v2.12 DBs with no read_by_session/resolved_at column) keeps `status`.
+ *   - hooks/stop-check.sh (#124 Stop-hook) — since F1 it holds NO predicate SQL
+ *     at all: it reads `relay pending --json`, which builds its WHERE from the
+ *     drain's own buildMessageWhere (ids pinned equal in tests/f1-relay-pending).
+ *     The bare-status legacy fallback is gone: F1 refuses a pre-v2.12 DB loudly.
  *   - getInboxSummary.unread_count — not `seq IS NULL`. Since F3 round 2 it is the
  *     per-agent PENDING_FOR_AGENT_ROW_SQL (pendingForSessionClause keyed on the
  *     agent's own session), not the any-session pendingGlobalClause, which a
@@ -204,17 +205,16 @@ describe("#53 pending predicate SSOT — every surface derives from one definiti
     expect(canonicalPendingCount("rp-to", s2)).toBe(1);
   });
 
-  it("check-relay.sh delivers on the canonical per-session predicate, not the binary status column", () => {
+  it("check-relay.sh delivers through F1 (the drain's own predicate), with no predicate of its own", () => {
+    // Since F1 the hook selects no message rows: `relay pending --with-content`
+    // builds the WHERE with the drain's buildMessageWhere. The behaviour guards are
+    // tests/f1-sessionstart-delivery.test.ts (drain order, decrypt, K of N) and the
+    // v2-6-2 NULL-session re-pend seam test, which EXECUTES the hook. This is a
+    // TRIPWIRE with a pinned limit (ADR-0046): literal spellings only.
     const hook = fs.readFileSync(path.join(PROJECT_ROOT, "hooks/check-relay.sh"), "utf8");
-    // The delivery query must use the canonical predicate, with COALESCE(…, '')
-    // so a NULL/missing session mirrors get_messages' `currentSession ?? ""`
-    // (re-pends a prior session's unresolved mail) rather than hiding it.
-    expect(hook).toContain("resolved_at IS NULL");
-    expect(hook).toMatch(
-      /read_by_session IS NULL\s+OR\s+read_by_session != COALESCE\(\(SELECT session_id FROM agents WHERE name = :name\), ''\)/,
-    );
-    // …and must NOT deliver on the pre-#53 binary `status='pending'` filter.
-    expect(hook).not.toMatch(/FROM messages WHERE to_agent = :name AND status\s*=\s*'pending'/);
+    expect(hook).toMatch(/pending "\$AGENT_NAME" --json --with-content/);
+    expect(hook).not.toMatch(/FROM messages/);
+    expect(hook).not.toMatch(/read_by_session/);
   });
 
   it("#56 BITE: getInboxSummary.unread_count no longer zeroes on a non-consuming browse (agrees with the drain, not seq)", () => {
@@ -237,12 +237,13 @@ describe("#53 pending predicate SSOT — every surface derives from one definiti
   });
 
   it("FORMERLY-RESIDUAL surfaces are now CANONICAL (#56 finished the SSOT)", () => {
-    // stop-check.sh's PRIMARY pending query now uses the per-session predicate;
-    // any bare `status='pending'` that remains is ONLY the legacy-DB fallback.
+    // stop-check.sh reads through F1 and holds no predicate of its own. TRIPWIRE
+    // with a pinned limit (ADR-0046): it sees these literal spellings only; the
+    // behaviour guard is tests/f1-hook-migration.test.ts.
     const stop = fs.readFileSync(path.join(PROJECT_ROOT, "hooks/stop-check.sh"), "utf8");
-    expect(stop).toMatch(
-      /read_by_session != COALESCE\(\(SELECT session_id FROM agents WHERE name = :name\), ''\)/,
-    );
+    expect(stop).toMatch(/pending "\$AGENT_NAME" --json/);
+    expect(stop).not.toMatch(/read_by_session/);
+    expect(stop).not.toMatch(/status = 'pending'/);
     // getInboxSummary.unread_count keys on the per-agent SSOT predicate, not seq.
     const db = fs.readFileSync(path.join(PROJECT_ROOT, "src/db.ts"), "utf8");
     expect(db).toMatch(/\$\{PENDING_FOR_AGENT_ROW_SQL\} THEN 1 ELSE 0 END\), 0\) AS unread_count/);

@@ -78,6 +78,36 @@ function discoverHooks(): string[] {
 
 const ALL_HOOKS = discoverHooks();
 
+// The REAL shared helper, as it was when this file loaded. Other test files copy
+// hooks/ while they run (in parallel), so a test here that edits the real file
+// in place leaks a corrupt helper into THEIR copies: the adr-0036
+// truthful-verdict flake (a CANNOT-JUDGE from a copied, corrupted _verdict.sh).
+const REAL_HELPER = path.join(REPO_ROOT, "hooks", "_verdict.sh");
+const REAL_HELPER_BYTES = fs.readFileSync(REAL_HELPER);
+/**
+ * A private, byte-identical copy of hooks/ (with bin/ symlinked beside it, as a
+ * real install has it), so a test can corrupt or delete ITS helper without the
+ * real file ever changing. Returns the copy's helper path and each discovered
+ * hook's path inside the copy.
+ */
+function hookCopy(root: string): { helper: string; hooks: string[] } {
+  const base = path.join(root, "copy", "bot-relay-mcp");
+  const dir = path.join(base, "hooks");
+  fs.cpSync(path.join(REPO_ROOT, "hooks"), dir, { recursive: true });
+  fs.symlinkSync(path.join(REPO_ROOT, "bin"), path.join(base, "bin"));
+  return {
+    helper: path.join(dir, "_verdict.sh"),
+    hooks: ALL_HOOKS.map((h) => path.join(dir, path.relative(path.join(REPO_ROOT, "hooks"), h))),
+  };
+}
+function realHelperIntact(): boolean {
+  try {
+    return fs.readFileSync(REAL_HELPER).equals(REAL_HELPER_BYTES);
+  } catch {
+    return false;
+  }
+}
+
 const TEST_ROOT = path.join(os.tmpdir(), "v2-6-2-hook-contracts-" + process.pid);
 
 function freshTestRoot(): { root: string; dbPath: string; vaultDir: string } {
@@ -104,6 +134,9 @@ function initMinimalDb(dbPath: string): void {
       capabilities TEXT,
       last_seen TEXT,
       session_id TEXT,
+      -- F1: the PostToolUse and Stop hooks read through \`relay pending\`, which
+      -- refuses (loudly) a DB lacking any column the pending predicate uses.
+      session_started_at TEXT,
       auth_state TEXT DEFAULT 'active',
       token_hash TEXT
     );
@@ -229,21 +262,23 @@ afterEach(() => {
 
 // --- check-relay.sh (SessionStart) ---
 describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
-  it("(C1) empty stdin + no DB present → exit 0, silent stdout (defensive)", () => {
+  it("(C1) empty stdin + a CONFIGURED DB that is missing → exit 0, and the only output is the LOUD mail-read line", () => {
+    // F1 mode rule (28 Sep): the missing-DB exit no longer skips the mail decision;
+    // a configured local DB that is missing is a concluded local failure: DEGRADED.
     const { root } = freshTestRoot();
-    // No DB created; hook should exit 0 silently.
+    // No DB created: RELAY_DB_PATH names a file that does not exist.
     const r = runHook({
       hook: HOOK_CHECK_RELAY,
       agentName: "build-agent",
       home: root,
-      // Use a path that doesn't exist so the "no DB" branch fires cleanly.
       dbPath: path.join(root, "missing.db"),
-      // Avoid hitting the live operator daemon at port 3777 by pointing
-      // elsewhere; the hook degrades silently when daemon is unreachable.
+      // Never the live operator daemon at 3777: a closed port.
       httpPort: 1, // privileged port, ECONNREFUSED instantly
     });
     expect(r.status).toBe(0);
-    expect(stripVerdict(r.stdout)).toBe("");
+    expect(stripVerdict(r.stdout)).toMatch(/^\[RELAY\] relay unreadable: pending mail for build-agent could not be read/);
+    expect(stripVerdict(r.stdout).split("\n")).toHaveLength(1);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 
   it("(C2-seam #53) NULL session_id + a prior-session-read UNRESOLVED message → hook DELIVERS it, mirroring get_messages re-pend", () => {
@@ -332,9 +367,11 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     // separately by tests/v2-6-1-token-store.test.ts:test 12 / 12b.
   });
 
-  it("(C5) DB outside $HOME and not /tmp → exit 0 with stderr warning (path-traversal guard)", () => {
-    // The hook rejects DB paths outside $HOME / /tmp / /private/tmp /
-    // /var/folders. Assert the rejection emits the documented stderr line.
+  it("(C5) DB outside $HOME and not /tmp → exit 0; the guard never exits mute, and stdout holds only the LOUD mail-read line", () => {
+    // The hook's OWN sqlite reads refuse DB paths outside $HOME / /tmp /
+    // /private/tmp / /var/folders. Since the F1 mode rule (D2) that no longer ends
+    // the hook: relay pending still decides the mail, and a configured DB it
+    // cannot read is a LOUD local failure. Still no partial-state context.
     const { root } = freshTestRoot();
     const outsideDb = path.join(root, "..", "..", "etc", "fake.db");
     const r = runHook({
@@ -344,9 +381,11 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
       dbPath: outsideDb,
       httpPort: 1,
     });
-    // Either status 0 with stderr warning, OR clean exit. Whatever shape,
-    // stdout MUST be empty (never partial-state context).
-    expect(stripVerdict(r.stdout)).toBe("");
+    expect(r.status).toBe(0);
+    const out = stripVerdict(r.stdout);
+    expect(out.split("\n"), out).toHaveLength(1);
+    expect(out).toMatch(/^\[RELAY\] relay unreadable: pending mail for build-agent could not be read/);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 });
 
@@ -410,7 +449,9 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
     }
   });
 
-  it("(P4) daemon-down (port 1 ECONNREFUSED) + no DB → exit 0, empty stdout, no JSON-RPC garbage", () => {
+  it("(P4) daemon-down (port 1 ECONNREFUSED) + a CONFIGURED DB that is missing → exit 0, one well-formed LOUD notice, no JSON-RPC garbage", () => {
+    // F1 mode rule (28 Sep): an explicitly configured local DB that cannot be read
+    // is LOUD ("relay unreadable"), never silence and never an HTTP fallback.
     const { root } = freshTestRoot();
     const r = runHook({
       hook: HOOK_POST_TOOL,
@@ -421,7 +462,12 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1, // ECONNREFUSED
     });
     expect(r.status).toBe(0);
-    expect(stripVerdict(r.stdout)).toBe("");
+    const out = stripVerdict(r.stdout);
+    expect(out.split("\n").length, "a single line").toBe(1);
+    const parsed = JSON.parse(out);
+    expect(parsed.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
+    expect(parsed.hookSpecificOutput?.additionalContext).toMatch(/^relay unreadable/);
+    expect(out).not.toMatch(/jsonrpc/);
   });
 
   it("(P5) malformed RELAY_AGENT_TOKEN (contains space) → token discarded, no auth header sent, exit 0", () => {
@@ -554,38 +600,34 @@ describe("v2.6.2 — cross-hook invariants", () => {
     // exit 0, and emit ZERO verdicts — the exact silence the mechanism exists
     // to end, reintroduced at the loader boundary. Each hook now installs a
     // minimal fallback trap BEFORE sourcing; a healthy load upgrades it.
-    const helper = path.join(REPO_ROOT, "hooks", "_verdict.sh");
-    const original = fs.readFileSync(helper, "utf8");
-    try {
-      fs.writeFileSync(helper, "this is not valid bash (((\n");
-      const { root } = freshTestRoot();
-      for (const hook of ALL_HOOKS) {
-        const r = runHook({ hook, root, agentName: "probe" });
-        const combined = `${r.stdout}\n${r.stderr}`;
-        const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
-        expect(count, `${path.basename(hook)} emitted ${count} verdicts with a CORRUPT helper`).toBe(1);
-      }
-    } finally {
-      fs.writeFileSync(helper, original);
+    const { root } = freshTestRoot();
+    const copy = hookCopy(root);
+    fs.writeFileSync(copy.helper, "this is not valid bash (((\n");
+    for (const hook of copy.hooks) {
+      const r = runHook({ hook, root, agentName: "probe" });
+      const combined = `${r.stdout}\n${r.stderr}`;
+      const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+      expect(count, `${path.basename(hook)} emitted ${count} verdicts with a CORRUPT helper`).toBe(1);
+      // Non-vacuous: the hook really ran on the COPY's broken helper (its fallback verdict).
+      expect(combined, path.basename(hook)).toContain("verdict helper did not load");
+      expect(realHelperIntact(), "the REAL hooks/_verdict.sh must never be touched: parallel files copy hooks/").toBe(true);
     }
   });
 
   it("EVERY hook still emits a verdict when the SHARED HELPER IS ABSENT", () => {
     // The other half: post/stop/codex guard the source with `if [ -f ]`, which
     // silently accepts a missing helper. Absence must still produce a verdict.
-    const helper = path.join(REPO_ROOT, "hooks", "_verdict.sh");
-    const original = fs.readFileSync(helper, "utf8");
-    try {
-      fs.rmSync(helper);
-      const { root } = freshTestRoot();
-      for (const hook of ALL_HOOKS) {
-        const r = runHook({ hook, root, agentName: "probe" });
-        const combined = `${r.stdout}\n${r.stderr}`;
-        const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
-        expect(count, `${path.basename(hook)} emitted ${count} verdicts with NO helper`).toBe(1);
-      }
-    } finally {
-      fs.writeFileSync(helper, original);
+    const { root } = freshTestRoot();
+    const copy = hookCopy(root);
+    fs.rmSync(copy.helper);
+    for (const hook of copy.hooks) {
+      const r = runHook({ hook, root, agentName: "probe" });
+      const combined = `${r.stdout}\n${r.stderr}`;
+      const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
+      expect(count, `${path.basename(hook)} emitted ${count} verdicts with NO helper`).toBe(1);
+      // Non-vacuous: the hook really ran on the COPY's broken helper (its fallback verdict).
+      expect(combined, path.basename(hook)).toContain("verdict helper did not load");
+      expect(realHelperIntact(), "the REAL hooks/_verdict.sh must never be touched: parallel files copy hooks/").toBe(true);
     }
   });
 

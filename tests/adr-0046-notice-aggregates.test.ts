@@ -9,14 +9,20 @@
  * a page limited to N rows. Truncated is not complete. The damper's 120-second
  * high-priority reminder keys on that full-set top priority.
  *
- * A STUB relay answers the hook's HTTP peek with a PARTIAL page (20 normal
- * messages, total_pending 21) while the real DB also holds one HIGH message. A
- * correct priority-first server would have put the high one on the page, so only a
- * stub can separate "an aggregate over the full set" from "read off whatever page
- * came back": the property must hold whatever the page ordering.
+ * A STUB relay answers an HTTP peek with a PARTIAL page (20 normal messages,
+ * total_pending 21) while the real DB also holds one HIGH message. A correct
+ * priority-first server would have put the high one on the page, so only a stub can
+ * separate "an aggregate over the full set" from "read off whatever page came back".
+ *
+ * Since the F1 hook migration the READ PATH IS CHOSEN BY CONFIGURATION:
+ *   - LOCAL mode (RELAY_DB_PATH configured): the hook reads `relay pending`, the
+ *     FULL set, and never consults the stub at all, so every aggregate is exact.
+ *   - REMOTE mode (no local instance, RELAY_HTTP_HOST configured): the stub's page
+ *     is all there is, so a partial or windowed page claims NEITHER a top priority
+ *     NOR an age ("unknown"), and a response without total_pending is not trusted.
  *
  * Plus rule (i)'s reader half: ONE shared message-priority ordering with an
- * explicit ELSE, identical in the TS drain and the hook's sqlite reader.
+ * explicit ELSE. The TS drain is the only place it exists: the hook holds none.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import fs from "fs";
@@ -111,7 +117,8 @@ function spawnHook(env: Record<string, string>): Promise<{ stdout: string }> {
   });
 }
 
-function runHook(remindSecs?: string, dbPath: string = DB_PATH): Promise<{ stdout: string }> {
+/** LOCAL mode by default (RELAY_DB_PATH configured); `remote` drops it, so the stub is the relay. */
+function runHook(remindSecs?: string, mode: "local" | "remote" = "local"): Promise<{ stdout: string }> {
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     HOME,
@@ -119,8 +126,8 @@ function runHook(remindSecs?: string, dbPath: string = DB_PATH): Promise<{ stdou
     RELAY_AGENT_TOKEN: "stubtoken-aaaaaaaaaaaa",
     RELAY_HTTP_HOST: "127.0.0.1",
     RELAY_HTTP_PORT: String(port),
-    RELAY_DB_PATH: dbPath,
   };
+  if (mode === "local") env.RELAY_DB_PATH = DB_PATH;
   if (remindSecs !== undefined) env.RELAY_HOOK_NOTICE_REMIND_SECS = remindSecs;
   return spawnHook(env);
 }
@@ -133,13 +140,20 @@ function backdateDamper(seconds: number): void {
 }
 
 describe("ADR-0046 (ii) — the notice's aggregates come from the FULL set, never a page", () => {
-  it("PRECONDITION: the hook really reads the stub (HTTP path), not the sqlite fallback", async () => {
+  it("LOCAL mode never consults the stub: only the stub could claim 99, and the notice says the real 21", async () => {
     seed();
-    // Only the stub can claim 99: the real DB holds 21.
     totalPending = 99;
     const c = ctx((await runHook("0")).stdout);
     totalPending = 21;
-    expect(c).toMatch(/^relay: 99 unread for a46-recv/);
+    expect(c).toMatch(/^relay: 21 unread for a46-recv/);
+  });
+
+  it("PRECONDITION (remote): with no local instance the hook really reads the stub", async () => {
+    seed();
+    totalPending = 99;
+    const c = ctx((await runHook("0", "remote")).stdout);
+    totalPending = 21;
+    expect(c).toMatch(/^relay \(via remote relay\): 99 unread for a46-recv/);
   });
 
   it("HARM: a partial page of normals cannot hide the full-set top priority (high)", async () => {
@@ -161,11 +175,11 @@ describe("ADR-0046 (ii) — the notice's aggregates come from the FULL set, neve
     expect(ctx((await runHook()).stdout), "a HIGH set re-notifies after 120s").not.toBe("");
   });
 
-  it("INNOCENT TWIN: with no readable DB, a partial page claims neither a top priority nor an age", async () => {
+  it("REMOTE: a partial page claims neither a top priority nor an age (never the page's 'normal')", async () => {
     seed();
-    const r = await runHook("0", path.join(DIR, "absent.db"));
+    const r = await runHook("0", "remote");
     const c = ctx(r.stdout ?? "");
-    expect(c).toMatch(/^relay: 21 unread for a46-recv/);
+    expect(c).toMatch(/^relay \(via remote relay\): 21 unread for a46-recv/);
     expect(c).toMatch(/highest priority: unknown/);
     expect(c).toMatch(/newest arrived at an unknown time/);
   });
@@ -187,17 +201,20 @@ describe("ADR-0046 (i), reader half — ONE message-priority ordering with an ex
     expect(ids).toEqual([high, low, odd]);
   });
 
-  it("the hook's sqlite reader uses the SAME ordering text as the TS drain (until F1 makes them one path)", async () => {
-    const { MESSAGE_PRIORITY_RANK_SQL } = await import("../src/db.js");
+  // TRIPWIRE, not the guard (ADR-0046): the guards are the behaviour tests above and
+  // tests/f1-hook-migration.test.ts. Pinned limit: it sees only these literal
+  // spellings, so a renamed copy would pass it. What it catches is a hand-copied
+  // ordering or predicate creeping back into the hook F1 replaced.
+  it("F1 made them one path: the hook holds no priority ordering and no predicate SQL of its own", () => {
     const hook = fs.readFileSync(HOOK, "utf-8");
-    const m = /^RANK = "(CASE priority[^"]*END)"$/m.exec(hook);
-    expect(m, "the hook declares its RANK").not.toBeNull();
-    expect(m![1].replace(/\\x27/g, "'")).toBe(MESSAGE_PRIORITY_RANK_SQL);
+    expect(hook).not.toMatch(/CASE priority/);
+    expect(hook).not.toMatch(/read_by_session/);
+    expect(hook).toMatch(/pending "\$AGENT_NAME" --json/);
   });
 });
 
 describe("#280 final round — a WINDOWED page is never taken for the full set", () => {
-  it("HARM: a page that looks complete but came through a window defers to the full-set reader", async () => {
+  it("REMOTE HARM: a page that looks complete but came through a window is never taken for the full set", async () => {
     db.registerAgent("a46-sender", "s", []);
     db.registerAgent(AGENT, "r", []);
     // The DB: a fresh normal, plus an unresolved HIGH a prior session read 2 days ago.
@@ -211,25 +228,38 @@ describe("#280 final round — a WINDOWED page is never taken for the full set",
     page = [{ id: fresh, from_agent: "a46-sender", priority: "normal", created_at: row.created_at }];
     totalPending = 1;
     sinceBound = new Date(Date.now() - 86_400_000).toISOString();
-    const c = ctx((await runHook("0")).stdout);
+    const c = ctx((await runHook("0", "remote")).stdout);
     sinceBound = null;
-    expect(c).toMatch(/highest priority: high/);
+    expect(c, "precondition: the remote page was read").toMatch(/via remote relay/);
+    // The window could hide the high one, so the page's "normal" is never claimed.
+    expect(c).toMatch(/highest priority: unknown/);
+    expect(c).toMatch(/newest arrived at an unknown time/);
+  });
+
+  it("LOCAL twin: the same DB read locally names the full-set top (high)", async () => {
+    db.registerAgent("a46-sender", "s", []);
+    db.registerAgent(AGENT, "r", []);
+    db.sendMessage("a46-sender", AGENT, "fresh", "normal");
+    const old = db.sendMessage("a46-sender", AGENT, "old high", "high").id;
+    db.getDb()
+      .prepare("UPDATE messages SET created_at = ?, read_by_session = 'prior', status = 'read' WHERE id = ?")
+      .run(new Date(Date.now() - 2 * 86_400_000).toISOString(), old);
+    expect(ctx((await runHook("0")).stdout)).toMatch(/highest priority: high/);
   });
 });
 
 describe("#280 sharpening — the count is total_pending, never the page length; the fingerprint is (total, newest, top)", () => {
-  it("HARM: a response WITHOUT total_pending is not trusted for the count: the full-set reader answers (21), never '20+'", async () => {
+  it("REMOTE HARM: a response WITHOUT total_pending is not trusted: no notice claims the page length", async () => {
     seed();
     const saved = totalPending;
     // @ts-expect-error — simulate a server that omits total_pending
     totalPending = undefined;
-    const c = ctx((await runHook("0")).stdout);
+    const r = await runHook("0", "remote");
     totalPending = saved;
-    expect(c).toMatch(/^relay: 21 unread for a46-recv/);
-    expect(c).not.toMatch(/20\+/);
+    expect(r.stdout, "an untrusted count is never rendered (20 of 21 would be a lie)").toBe("");
   });
 
-  it("the fingerprint changes when the full set changes by a resolve + an arrival at the SAME count (sqlite path)", async () => {
+  it("the fingerprint changes when the full set changes by a resolve + an arrival at the SAME count (local path)", async () => {
     db.registerAgent("a46-sender", "s", []);
     db.registerAgent(AGENT, "r", []);
     const ids = [0, 1, 2].map((i) => db.sendMessage("a46-sender", AGENT, `m${i}`, "normal").id);

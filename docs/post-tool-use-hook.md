@@ -63,11 +63,11 @@ The hook reads these:
 | Var | Purpose | Default |
 |---|---|---|
 | `RELAY_AGENT_NAME` | Which agent mailbox to check | (unset → hook silently exits) |
-| `RELAY_AGENT_TOKEN` | Auth token for HTTP path | (unset → vault token, else HTTP path skipped and sqlite fallback used) |
-| `RELAY_HTTP_HOST` | Relay HTTP host | `127.0.0.1` |
+| `RELAY_AGENT_TOKEN` | Auth token for the remote read and the liveness self-heal (the local read needs none) | (unset → vault token) |
+| `RELAY_DB_PATH` / `RELAY_INSTANCE_ID` | An explicit local relay DB: forces local mode | per-instance DB, else `~/.bot-relay/relay.db` |
+| `RELAY_HTTP_HOST` | A remote relay: selects remote mode when no local instance is configured explicitly | `127.0.0.1` (used only by the self-heal when unset) |
 | `RELAY_HTTP_PORT` | Relay HTTP port | `3777` |
-| `RELAY_DB_PATH` | Sqlite DB path (sqlite fallback only) | per-instance DB, else `~/.bot-relay/relay.db` |
-| `RELAY_HOOK_MAX_MESSAGES` | Max messages looked at per firing (the count shows `N+` when capped) | `20` |
+| `RELAY_HOOK_MAX_MESSAGES` | Page size of the remote read | `20` |
 | `RELAY_HOOK_NOTICE_REMIND_SECS` | How long an unchanged notice stays quiet (see "Damper") | `600` |
 | `RELAY_HOME` | Where the damper keeps its state (`$RELAY_HOME/hook-state/`) | `~/.bot-relay` |
 
@@ -81,13 +81,16 @@ alias ai-agent='RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=<your-token> claude'
 
 1. Validates all env-var inputs against an allowlist (no surprises in URLs or SQL).
 2. Reads its stdin payload. If the payload carries `agent_id` or `agent_type`, the tool call belongs to a **subagent** and the hook stops there: no mail check, no output. A non-empty payload that is not valid JSON is treated the same way.
-3. If a token is available AND the HTTP daemon responds on `/health` within 1 second, calls `get_messages` with `peek: true` via `/mcp`. This is the same query the agent's own drain runs, minus the read-mark, so the notice goes away exactly when the agent's drain takes the mail.
-4. Otherwise falls back to a read-only `SELECT` on `RELAY_DB_PATH` (the same pending predicate the `Stop` hook uses). Content stored encrypted at rest is never quoted.
-5. Emits a single-line Claude Code hook JSON (`{"continue": true, "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}`) to stdout. The notice looks like:
+3. Reads the mailbox. **The path is chosen by configuration, never by failure.** `relay pending AGENT --json` decides, using the MCP server's instance layout and marker reader, on positive evidence only (a place it cannot read is an error, never an absence). Explicit local configuration (`RELAY_DB_PATH`, `RELAY_INSTANCE_ID`) comes first, then an explicit remote (`RELAY_HTTP_HOST`), then what is on disk (the active-instance marker, the legacy `~/.bot-relay/relay.db`):
+   - **Local** (the usual case): the answer is `relay pending`'s own. That is the canonical pending set, exactly what `get_messages(status="pending")` would return, as metadata only, read from the DB read-only. It works with the daemon down, and it stamps nothing (not even the `seq` observation cursor).
+   - **Local, but unreadable** (a missing, corrupt or too-old DB, or the wrong instance): the notice says `relay unreadable: …`, and the verdict is `DEGRADED` with the reason. A read still running at its deadline (inside the hook's installed 5 s budget; `RELAY_PENDING_TIMEOUT_SECS` may only shorten it) counts as unreadable. The hook **never** falls back to HTTP: a failed local read is a problem to see, not a reason to ask a different relay.
+   - **Remote** (no local instance, `RELAY_HTTP_HOST` set): `get_messages` with `peek: true` over HTTP, and the notice starts `relay (via remote relay):`. **Known limit:** this peek stamps the message's `seq` observation cursor, although the notice observes no message. No decision keys on `seq`. A remote equivalent of `relay pending` is planned.
+   - **Neither:** nothing is read, and the verdict is `CANNOT-JUDGE` (no judgement made). A remote read that fails, or that returns a tool error (`isError`, `error_code`), is never taken for an empty mailbox: it is `CANNOT-JUDGE` too.
+4. Emits a single-line Claude Code hook JSON (`{"continue": true, "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}`) to stdout. The notice looks like:
    ```
    relay: 2 unread for builder (highest priority: high), from planner (1 high), ops. newest arrived 3m ago. Unread until get_messages is called.
    ```
-6. If there is no mail, or any error happens, the hook exits silently with empty stdout — never pollutes the conversation.
+5. If there is no mail, or nothing to read, the hook exits with empty stdout. An unreadable local relay is the one error it announces (step 3).
 
 ## Damper
 
@@ -104,14 +107,14 @@ A read-only notice would otherwise repeat after every tool call until the agent 
 - **It does NOT mark mail read, resolve it, or change it in any way.** Only the agent's own `get_messages` call does that.
 - **It does NOT inject any message content**, not even a first line. Count, highest priority, sender names (anything outside `[a-z0-9-]` shows as `unknown`) and the newest message's age only.
 - **It does NOT run for subagent tool calls.**
-- **It does NOT re-register the agent.** The `SessionStart` hook handles registration. If the agent is not registered when the hook fires, the hook silently exits.
+- **It does NOT re-register the agent.** The `SessionStart` hook handles registration. If the agent is not registered in the local relay (often the wrong instance), `relay pending` refuses to answer and the notice says `relay unreadable`.
 - **It does NOT check tasks.** Task surfacing stays in `SessionStart` for now (simpler, less context-pressure).
-- **It does NOT retry.** A single budget, silent-fail, wait for the next tool call.
+- **It does NOT retry.** One read per firing; the next tool call reads again.
 - **It does NOT work for idle terminals.** If no tool is running, the hook will not fire — honest limitation. Use the SessionStart and Stop hooks for idle windows.
 
 ## Timing budget
 
-The hook self-imposes a ~2 second budget (1s health probe + 2s `get_messages` call). On an unreachable relay + missing DB, the full-fail path completes in tens of milliseconds. Reading the stdin payload is instant when Claude Code closes the pipe, and bounded to one idle second when a caller does not. Claude Code's `timeout` field is the hard ceiling; set it to 5 or higher in settings.json to leave headroom.
+Local mode costs one `relay pending` run, a Node process start: about 280ms at p95 on the machine we measured, against about 220ms for the HTTP peek it replaces. Remote mode self-imposes a ~3 second budget (1s health probe + 2s `get_messages` call). Reading the stdin payload is instant when Claude Code closes the pipe, and bounded to one idle second when a caller does not. Claude Code's `timeout` field is the hard ceiling; set it to 5 or higher in settings.json to leave headroom.
 
 ## Troubleshooting
 
@@ -119,18 +122,19 @@ The hook self-imposes a ~2 second budget (1s health probe + 2s `get_messages` ca
 
 **Hook fires but no notice appears.** Check that:
 - `RELAY_AGENT_NAME` matches the name the SessionStart hook registered under.
-- The relay daemon is running (`curl http://127.0.0.1:3777/health` returns `status:ok`).
-- If using HTTP, `RELAY_AGENT_TOKEN` is set and matches the agent.
-- If using sqlite, the DB path is correct and readable.
+- `relay pending <agent>` answers in the same environment. It names the DB it read, or says why it could not.
+- If remote, `RELAY_AGENT_TOKEN` is set and matches the agent, and the relay answers `/health`.
 - The notice is not simply damped: the same unread set was already announced in this session less than `RELAY_HOOK_NOTICE_REMIND_SECS` ago. Set it to `0` to see every notice while debugging.
 
 **The same notice keeps coming back.** The mail is still unread. Call `get_messages` for the agent; the notice stops once the unread set is empty.
 
 **Hook output looks like stray JSON in my conversation.** That would mean the hook JSON is not being parsed as a Claude Code hook response. Check that the `type: "command"` and `command: "/path/..."` config in settings.json are correct and the script has `+x` permission.
 
-**Hook feels slow.** The `/health` probe is capped at 1s. If that times out frequently, your relay daemon is overloaded or binding to a different interface. Reduce the polling surface by shortening `RELAY_HOOK_MAX_MESSAGES`.
+**The notice says `relay unreadable`.** Run `relay pending <agent>` yourself; its error names the DB and the reason. A DB from before v2.12 is refused with a one-line remedy: start the current relay once against it, which migrates the schema in place.
 
-**Hook triggered a rate limit.** The HTTP path counts against the relay's rate-limit buckets. `get_messages` is not in the rate-limited set (`messages`, `tasks`, `spawns`) by default, so this should not happen — file a bug if it does.
+**Hook feels slow.** Locally, each firing starts one Node process. Remotely, the `/health` probe is capped at 1s; if it times out often, the relay is overloaded or bound to a different interface.
+
+**Hook triggered a rate limit.** The remote path counts against the relay's rate-limit buckets. `get_messages` is not in the rate-limited set (`messages`, `tasks`, `spawns`) by default, so this should not happen — file a bug if it does.
 
 ## Related
 

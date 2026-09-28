@@ -83,6 +83,22 @@ function writeConfig(obj: unknown): void {
 
 const instanceDb = (): string => path.join(home, ".bot-relay", "instances", "work", "relay.db");
 
+/**
+ * Make the instance DB a REAL relay DB with "probe" registered. The session-start
+ * mail read (relay pending) runs on every hook run; on the default empty
+ * placeholder file it is a concluded read failure (DEGRADED, "relay unreadable"),
+ * which would mask the CONFIG verdict a test is judging. Tests of the config axis
+ * alone use this, so their mail read succeeds and only the config decides.
+ */
+function realInstanceDb(): void {
+  const dist = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "db.js");
+  execFileSync(process.execPath, ["--input-type=module", "-e", `
+    process.env.RELAY_DB_PATH = ${JSON.stringify(instanceDb())};
+    const db = await import(${JSON.stringify(dist)});
+    db.registerAgent("probe", "r", []);
+    db.closeDb();`], { env: { PATH: process.env.PATH ?? "", HOME: home, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, stdio: "ignore" });
+}
+
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-hook-diag-"));
   fs.mkdirSync(path.join(home, ".bot-relay", "instances", "work"), { recursive: true });
@@ -283,7 +299,7 @@ describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
   });
 
   it("CANNOT-JUDGE when there is no config to judge", () => {
-    linkInstance();
+    linkInstance(); realInstanceDb();
     expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb() }))).toBe("CANNOT-JUDGE");
   });
 
@@ -291,27 +307,35 @@ describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
     // "Could not parse" and "parsed fine, nothing wrong" previously produced
     // identical observables (empty stdout, exit 0), so this reached HEALTHY.
     // That conflation is the entire bug class this redesign removes.
-    linkInstance();
+    linkInstance(); realInstanceDb();
     fs.writeFileSync(path.join(home, ".claude.json"), "{ not json");
     expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb() }))).toBe("CANNOT-JUDGE");
   });
 
-  it("CANNOT-JUDGE when the detector crashes", () => {
+  // A node that cannot run also cannot run `relay pending`: the session-start mail
+  // read FAILED, a concluded fault, so the verdict is DEGRADED "relay unreadable"
+  // (the verdict contract in hooks/_verdict.sh), never HEALTHY.
+  it("DEGRADED (relay unreadable), never HEALTHY, when the detector crashes", () => {
     linkInstance(); writeConfig(DEAD);
     const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-vbin1-"));
     fs.writeFileSync(path.join(binDir, "node"), "#!/bin/sh\nexit 1\n");
     fs.chmodSync(path.join(binDir, "node"), 0o755);
     try {
       const out = runHook({ RELAY_DB_PATH: instanceDb(), PATH: `${binDir}:${process.env.PATH ?? ""}` });
-      expect(verdictOf(out)).toBe("CANNOT-JUDGE");
+      expect(verdictOf(out)).toBe("DEGRADED");
+      // The reason names the TRUE cause (node crashed), never an unreadable DB.
+      expect(out).toMatch(/VERDICT=DEGRADED reason="relay unreadable: node crashed/);
     } finally { fs.rmSync(binDir, { recursive: true, force: true }); }
   });
 
-  it("CANNOT-JUDGE when node is absent entirely (codex round 3, by construction)", () => {
+  it("DEGRADED (relay unreadable), never HEALTHY, when node is absent entirely (codex round 3, by construction)", () => {
     // Previously `command -v node` skipped the whole check and emitted NOTHING.
     // Nothing special-cases this now — it simply never earns a HEALTHY upgrade.
     linkInstance(); writeConfig(DEAD);
-    expect(verdictOf(runHook({ RELAY_DB_PATH: instanceDb(), PATH: "/usr/bin:/bin" }))).toBe("CANNOT-JUDGE");
+    const out = runHook({ RELAY_DB_PATH: instanceDb(), PATH: "/usr/bin:/bin" });
+    expect(verdictOf(out)).toBe("DEGRADED");
+    // The reason names the TRUE cause (node not found), never an unreadable DB.
+    expect(out).toMatch(/VERDICT=DEGRADED reason="relay unreadable: node not found/);
   });
 
   it("emits EXACTLY ONE verdict — never two, never zero", () => {

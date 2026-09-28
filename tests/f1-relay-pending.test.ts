@@ -492,3 +492,44 @@ describe("F1 — the active-instance marker is read once; a later failure cannot
     }
   });
 });
+
+// Architect 0c1911a5 (P-b): relay pending is NEVER less conservative than the
+// connector. The #285 state table's contract: a DB path outside the approved roots
+// makes the connector's getDbPath THROW, so relay pending must refuse it too (exit
+// 1), on EVERY source, including --db-path, with the SAME function (no copy).
+describe("F1 — containment: the connector's approved-roots rule applies to every source", () => {
+  it("STATE-TABLE ROW: a path outside the approved roots → the connector's getDbPath throws AND relay pending exits 1", async () => {
+    // Outside this test's HOME and every temp root: the repo's own gitignored cache.
+    const dir = path.join(REPO_ROOT, "node_modules", ".cache", `f1-contain-${process.pid}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const outside = path.join(dir, "relay.db");
+    try {
+      seed();
+      db.getDb().exec(`VACUUM INTO '${outside.replace(/'/g, "''")}'`);
+      // The connector, judged under the SAME HOME the CLI runs with (its approved
+      // roots include the home directory, read when db.ts loads).
+      const conn = spawnSync("node", ["--input-type=module", "-e", `
+        const db = await import(${JSON.stringify(path.join(REPO_ROOT, "dist", "db.js"))});
+        try { db.getDbPath(); process.stdout.write("ACCEPTED"); } catch (e) { process.stdout.write("THREW: " + e.message); }`], {
+        encoding: "utf-8",
+        env: { PATH: process.env.PATH ?? "", HOME: HOME_DIR, RELAY_DB_PATH: outside },
+      });
+      expect(conn.stdout, "the connector's getDbPath refuses the path").toMatch(/^THREW: .*outside approved roots/);
+      for (const via of ["--db-path", "RELAY_DB_PATH"] as const) {
+        const r =
+          via === "--db-path"
+            ? pending([R, "--json"], outside)
+            : spawnSync("node", [RELAY_BIN, "pending", R, "--json"], {
+                encoding: "utf-8",
+                timeout: 20_000,
+                env: { PATH: process.env.PATH ?? "", HOME: HOME_DIR, RELAY_HOME: HOME_DIR, RELAY_DB_PATH: outside },
+              });
+        expect(r.status, `${via}: ${r.stdout}${r.stderr}`).toBe(1);
+        expect(r.stdout, via).toBe("");
+        expect(r.stderr, via).toMatch(/PENDING_FAILED:[^\n]*outside the approved roots/);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -57,7 +57,8 @@ const APPROVED_ROOTS = [
   "/var/folders", // macOS test tmpdirs
 ];
 
-function isPathUnderApprovedRoot(resolved: string): boolean {
+/** Exported so `relay pending` applies the SAME containment rule (no copy). */
+export function isPathUnderApprovedRoot(resolved: string): boolean {
   return APPROVED_ROOTS.some((root) => {
     const rootResolved = path.resolve(root);
     return resolved === rootResolved || resolved.startsWith(rootResolved + path.sep);
@@ -6132,6 +6133,15 @@ export interface PendingMessageMeta {
   from: string | null;
   priority: string | null;
   age_seconds: number;
+  /**
+   * OPT-IN only (`contentFor`), and only on the first N in drain order: the body,
+   * DECRYPTED. null when this environment cannot decrypt it (never the ciphertext).
+   */
+  content?: string | null;
+  /** With `content`: the stored arrival time (the SessionStart delivery line shows it). */
+  created_at?: string;
+  /** Why `content` is null: a fixed reason, never the stored value. */
+  content_error?: string;
 }
 
 export interface PendingMeta {
@@ -6156,26 +6166,53 @@ export interface PendingMeta {
  *
  * PURE SELECT: no seq stamp, no read-mark, no inbox_events, no last_drain_at.
  * The CLI additionally opens its handle read-only, so a write would fail at the
- * driver. NO CONTENT: only id, sender, priority and created_at are selected.
+ * driver. NO CONTENT by default: only id, sender, priority and created_at are selected.
  * No LIMIT: `count` is the whole pending set, never a capped page.
+ * `contentFor: N` (OPT-IN, SessionStart delivery only) adds the decrypted body to
+ * the first N messages in drain order, from the same statement.
  */
-export function pendingMetadata(db: CompatDatabase, agentName: string): PendingMeta {
+export function pendingMetadata(
+  db: CompatDatabase,
+  agentName: string,
+  opts: { contentFor?: number } = {},
+): PendingMeta {
   const agentRow = db.prepare("SELECT session_id FROM agents WHERE name = ?").get(agentName) as
     | { session_id: string | null }
     | undefined;
   const currentSession = agentRow?.session_id ?? null;
   // NO window (ADR-0045 R1/R4): this IS the canonical pending set.
   const { where, params } = buildMessageWhere(agentName, "pending", null, "all", currentSession);
+  // Content is OPT-IN (SessionStart delivery, invariant I3) and read in the SAME
+  // statement as the ids, so the ids and the bodies come from one snapshot. The
+  // default selects no content column at all. The WHERE is the recipient's own
+  // pending set, so a body is only ever this recipient's (I6).
+  const contentFor = Math.max(0, Math.floor(opts.contentFor ?? 0));
+  const cols = contentFor > 0 ? "id, from_agent, priority, created_at, content" : "id, from_agent, priority, created_at";
   const rows = db
-    .prepare(`SELECT id, from_agent, priority, created_at FROM messages WHERE ${where} ${DRAIN_PRIORITY_ORDER_SQL}`)
-    .all(...params) as Array<{ id: string; from_agent: unknown; priority: unknown; created_at: string }>;
+    .prepare(`SELECT ${cols} FROM messages WHERE ${where} ${DRAIN_PRIORITY_ORDER_SQL}`)
+    .all(...params) as Array<{ id: string; from_agent: unknown; priority: unknown; created_at: string; content?: unknown }>;
   const nowMs = Date.now();
-  const messages = rows.map((r) => ({
-    id: r.id,
-    from: typeof r.from_agent === "string" && AGENT_NAME_PATTERN.test(r.from_agent) ? r.from_agent : null,
-    priority: typeof r.priority === "string" && PRIORITIES.has(r.priority) ? r.priority : null,
-    age_seconds: Math.max(0, Math.floor((nowMs - Date.parse(r.created_at)) / 1000) || 0),
-  }));
+  const messages: PendingMessageMeta[] = rows.map((r, i) => {
+    const m: PendingMessageMeta = {
+      id: r.id,
+      from: typeof r.from_agent === "string" && AGENT_NAME_PATTERN.test(r.from_agent) ? r.from_agent : null,
+      priority: typeof r.priority === "string" && PRIORITIES.has(r.priority) ? r.priority : null,
+      age_seconds: Math.max(0, Math.floor((nowMs - Date.parse(r.created_at)) / 1000) || 0),
+    };
+    if (i < contentFor) {
+      m.created_at = r.created_at;
+      // ONLY through the decrypting accessor (I2): plaintext, or null with a fixed
+      // reason. The stored value is never passed through, so ciphertext cannot leak.
+      try {
+        m.content = typeof r.content === "string" ? decryptContent(r.content) : null;
+        if (m.content === null) m.content_error = "no content stored";
+      } catch {
+        m.content = null;
+        m.content_error = "encrypted, and this environment has no key that decrypts it";
+      }
+    }
+    return m;
+  });
   return {
     registered: !!agentRow,
     session_bound: !!currentSession,

@@ -515,3 +515,67 @@ relay_pid_chain() {
   esac
   printf '[%s]' "$chain"
 }
+
+# relay_run_pending DEADLINE OUTFILE ERRFILE CMD...
+# Runs CMD DIRECTLY (its own pid: no wrapper, no fork) with stdout and stderr in
+# FILES, never a pipe: a command substitution waits for EVERY process that
+# inherited its pipe, so a leftover child could hold it open long past any
+# deadline. A bash watchdog sleeps to the deadline and kills THAT pid. Returns
+# CMD's exit status, or 124 when the watchdog fired (the GNU `timeout`
+# convention). No perl, no coreutils `timeout`: bash, sleep and kill only, on
+# macOS and Linux alike. (An in-process timer cannot do this: better-sqlite3 is
+# synchronous, so a JS timer cannot pre-empt a blocked native call.)
+relay_run_pending() {
+  local secs="$1" outf="$2" errf="$3"
+  shift 3
+  local mark="$outf.timedout"
+  rm -f "$mark" 2>/dev/null
+  "$@" >"$outf" 2>"$errf" </dev/null &
+  local pid=$!
+  (
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$secs" &
+    s=$!
+    wait "$s"
+    : >"$mark"
+    kill -TERM "$pid" 2>/dev/null
+    sleep 1
+    kill -KILL "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  local wd=$!
+  wait "$pid" 2>/dev/null
+  local rc=$?
+  if [ -e "$mark" ]; then
+    # The watchdog fired and the target is gone: end the watchdog now rather than
+    # wait out its KILL grace second (its stray `sleep` writes nowhere).
+    kill -KILL "$wd" 2>/dev/null
+    wait "$wd" 2>/dev/null
+    rm -f "$mark" 2>/dev/null
+    return 124
+  fi
+  kill -TERM "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  return "$rc"
+}
+
+# relay_pending_deadline BUDGET
+# Whole seconds `relay pending` may run in this hook. BUDGET is the hook's
+# INSTALLED timeout (src/agent-cli-profiles.ts is the source of truth; each hook
+# declares it as RELAY_HOOK_BUDGET_SECS, and a test holds the two equal). The
+# deadline is what is LEFT of it (minus what this hook already spent, $SECONDS)
+# minus a 3s margin to report the failure (SECONDS truncates, so up to 1s spent
+# is unseen, and the watchdog's 1s KILL grace comes on top), so the harness never
+# kills the hook before it can say why. RELAY_PENDING_TIMEOUT_SECS may only
+# shorten it. NO FLOOR: below 1 means there is no time left, and the caller must
+# SKIP the read and say so, never squeeze in a 1s read the harness would kill.
+relay_pending_deadline() {
+  local budget="$1" margin=3 left v
+  case "$budget" in ''|*[!0-9]*) budget=5 ;; esac
+  left=$(( budget - ${SECONDS:-0} - margin ))
+  v="${RELAY_PENDING_TIMEOUT_SECS:-}"
+  case "$v" in ''|*[!0-9]*) v="" ;; esac
+  if [ -n "$v" ] && [ "${#v}" -le 3 ] && [ "$((10#$v))" -ge 1 ] && [ "$((10#$v))" -lt "$left" ]; then
+    left=$((10#$v))
+  fi
+  printf '%s' "$left"
+}

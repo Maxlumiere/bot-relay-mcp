@@ -27,7 +27,9 @@
 # Security notes (v1.6):
 # - All env-var inputs are validated against an allowlist regex BEFORE use.
 # - Names/roles/caps that contain anything outside [A-Za-z0-9_.-] are rejected.
-# - DB_PATH is resolved and must live under $HOME (no /etc/passwd shenanigans).
+# - DB_PATH is resolved and must live under $HOME or a temp root for this hook's OWN
+#   sqlite reads; a path outside them skips those reads (DEGRADED in local mode),
+#   it never ends the hook (the mail read is decided by relay pending).
 # - SQL is parameterised via sqlite3's `.parameter set` rather than string-interpolated.
 
 # VERDICT BY CONSTRUCTION — must be the FIRST executable code in this file.
@@ -55,6 +57,25 @@ trap relay_emit_verdict EXIT
 RELAY_VERDICT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_verdict.sh
 . "$RELAY_VERDICT_DIR/_verdict.sh"
+# HEALTHY ONLY AFTER THE MAIL READ COMPLETED. This hook's HEALTHY is set early
+# (the config diagnostic), so any exit before the session-start mail read
+# finished (an early `exit`, a kill during a stalled read) would otherwise print
+# a health that was never verified. The gate turns an unearned HEALTHY into
+# CANNOT-JUDGE at exit. Defined here, after the helper, so a helper that failed
+# to load still leaves the fallback trap in place.
+RELAY_MAIL_READ_DONE=0
+RELAY_TMP_FILES=""
+relay_finalize_verdict() {
+  # shellcheck disable=SC2086 # a space-separated list of mktemp paths
+  [ -n "$RELAY_TMP_FILES" ] && rm -f $RELAY_TMP_FILES 2>/dev/null
+  if [ "$RELAY_VERDICT" = "HEALTHY" ] && [ "${RELAY_MAIL_READ_DONE:-0}" != "1" ]; then
+    RELAY_VERDICT="CANNOT-JUDGE"
+    RELAY_VERDICT_REASON="health unverified: the session-start mail read did not complete"
+    RELAY_VERDICT_DETAIL=""
+  fi
+  relay_emit_verdict
+}
+trap relay_finalize_verdict EXIT
 
 # v2.0 final (#19): self-check for path truncation. When .claude/settings.json
 # references this script with an unquoted path containing spaces, only the
@@ -146,6 +167,10 @@ fi
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_vault-helpers.sh
 . "$HOOKS_DIR/_vault-helpers.sh"
+# This hook's INSTALLED timeout in seconds. The source of truth is
+# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
+# equal. The mail read's deadline is what is LEFT of it after registration.
+RELAY_HOOK_BUDGET_SECS=10
 # v2.7.2 — manifest-fallback (see comment above the AGENT_NAME default). Only
 # kicks in when env-derived name is empty or literal "default" — operators who
 # explicitly want the "default" agent (rare, but legitimate) can opt out by
@@ -253,13 +278,34 @@ if [ -n "$AGENT_CAPS" ]; then
   fi
 fi
 
-# DB path must live under HOME (or under /tmp for tests). Resolve symlinks first.
-RESOLVED_DB_PATH=$(cd "$(dirname "$DB_PATH")" 2>/dev/null && pwd)/$(basename "$DB_PATH")
-if [ -z "$RESOLVED_DB_PATH" ] || { [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ "$RESOLVED_DB_PATH" != /tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /private/tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /var/folders/* ]]; }; then
-  echo "[bot-relay] RELAY_DB_PATH must live under \$HOME or /tmp. Got: '$RESOLVED_DB_PATH'" >&2
-  exit 0
+# The DB path THIS HOOK's own reads use (liveness, anchor, tasks, topology). The
+# mail read does not use it: relay pending resolves its own. Three states, never
+# a made-up path and never a mute exit:
+#   usable     — its directory resolves, under $HOME or a temp root;
+#   unresolved — its directory does not resolve (absent, or not enterable): no DB
+#                file can be read there by this hook; relay pending decides;
+#   rejected   — it resolves OUTSIDE $HOME and the temp roots (the containment
+#                guard): this hook's own reads are skipped, and in LOCAL mode
+#                that is DEGRADED with the reason.
+# (A failed `cd` used to become '/relay.db' and exit mute: Codex #286 R2 D2.)
+RELAY_LOCAL_DB_STATE="usable"
+RELAY_LOCAL_DB_WHY=""
+_relay_db_dir=""
+if [ -n "$DB_PATH" ]; then
+  _relay_db_dir=$(cd "$(dirname "$DB_PATH")" 2>/dev/null && pwd) || _relay_db_dir=""
 fi
-DB_PATH="$RESOLVED_DB_PATH"
+if [ -z "$DB_PATH" ] || [ -z "$_relay_db_dir" ]; then
+  RELAY_LOCAL_DB_STATE="unresolved"
+else
+  RESOLVED_DB_PATH="$_relay_db_dir/$(basename "$DB_PATH")"
+  if [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ "$RESOLVED_DB_PATH" != /tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /private/tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /var/folders/* ]]; then
+    RELAY_LOCAL_DB_STATE="rejected"
+    RELAY_LOCAL_DB_WHY="it resolves outside HOME and the temp roots"
+    echo "[bot-relay] RELAY_DB_PATH must live under \$HOME or /tmp. Got: '$RESOLVED_DB_PATH'. This hook's own DB reads are skipped; the mail read is still decided by relay pending." >&2
+  else
+    DB_PATH="$RESOLVED_DB_PATH"
+  fi
+fi
 
 # --- SELF-DIAGNOSING MUTE DETECTION -----------------------------------------
 # Standing rule: a failure that presents as normal operation must be converted
@@ -463,8 +509,243 @@ if command -v node >/dev/null 2>&1 && [ -r "${HOME}/.claude.json" ]; then
   fi
 fi
 
-# If there's no DB yet, nothing to do
-if [ ! -f "$DB_PATH" ]; then
+# --- Session-start mail delivery (F1: this hook selects no message rows) ------
+# The ids, their ORDER (the drain's: priority first, then newest) and the bodies
+# come from ONE read by `relay pending --with-content` (ADR-0044 point 6), and
+# `relay pending` alone decides where the mail lives (the F1 mode rule, the same
+# as the PostToolUse and Stop hooks): exit 0 = local, exit 3 = no local instance
+# (the labeled remote path when RELAY_HTTP_HOST names one), anything else = a
+# LOCAL read that failed, which is DEGRADED ("relay unreadable") and is NEVER
+# retried over HTTP.
+#   - bodies go through the TS decrypting accessor, so a keyring user sees
+#     plaintext, and an undecryptable body shows a placeholder, never `enc:`;
+#   - the read marks nothing (read-only handle, no seq), and is bounded by a
+#     deadline inside this hook's installed budget (RELAY_HOOK_BUDGET_SECS, minus
+#     what registration already used; RELAY_PENDING_TIMEOUT_SECS may only shorten
+#     it): a stall is reported;
+#   - the header says how many of the canonical total are shown, and an answer
+#     whose count contradicts its messages is refused, never shown as no mail.
+# KNOWN LIMIT: the liveness and task reads in this hook still resolve the DB in
+# bash (resolve_relay_db_path) until ADR-0048's single resolver lands.
+#
+# FRAMING (shared by the mail and task renderers). This stdout is the agent's
+# context AND carries this hook's own "[RELAY] VERDICT=" line, so no sender-chosen
+# text may start a line: every line of a body after the first gets a fixed
+# continuation prefix. Every line terminator a reader might honour (CR, LF, VT,
+# FF, FS/GS/RS, NEL, U+2028, U+2029) counts as a newline; other C0/C1 controls
+# and ANSI escapes are stripped; a tab becomes a space. Single-line fields are
+# folded onto one line. Framing does not make the content trusted.
+RELAY_FRAME_JS='
+const relayClean = (v) => String(v == null ? "" : v)
+  .replace(/\r\n|[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]/g, "\n")
+  .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "")
+  .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+  .replace(/\x1b[@-_]/g, "")
+  .replace(/\u009b[0-?]*[ -\/]*[@-~]/g, "")
+  .replace(/\t/g, " ")
+  .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
+const relayOneLine = (v) => relayClean(v).replace(/\n/g, " ");
+const RELAY_CONT = "    | ";
+const relayFramed = (v) => relayClean(v).split("\n").join("\n" + RELAY_CONT);
+'
+# One renderer for both answers. SRC=f1: `relay pending --json --with-content`.
+# SRC=http: a get_messages peek from a remote relay. Exit 1 = an answer this hook
+# cannot trust (a tool error, a missing field, a count that contradicts the list).
+RELAY_MAIL_RENDER_JS='
+let raw = "";
+process.stdin.on("data", (c) => (raw += c));
+process.stdin.on("end", () => {
+  let count;
+  let shown;
+  try {
+    if (process.env.SRC === "http") {
+      let payload = null;
+      for (const line of raw.split("\n")) {
+        const t = line.trim();
+        if (t.startsWith("data:")) { payload = t.slice(5).trim(); break; }
+      }
+      const rpc = JSON.parse(payload === null ? raw.trim() : payload);
+      const result = rpc && rpc.result;
+      if (!result || result.isError) process.exit(1);
+      const d = JSON.parse(result.content[0].text);
+      if (!d || typeof d !== "object" || "error_code" in d || !Array.isArray(d.messages)) process.exit(1);
+      if (!Number.isInteger(d.total_pending) || d.total_pending < d.messages.length) process.exit(1);
+      if (d.total_pending > 0 && d.messages.length === 0) process.exit(1);
+      count = d.total_pending;
+      shown = d.messages.map((m) => ({ from: m.from_agent, content: m.content, created_at: m.created_at }));
+    } else {
+      const d = JSON.parse(raw);
+      if (!d || d.ok !== true || !Array.isArray(d.messages) || !Number.isInteger(d.count)) process.exit(1);
+      if (d.messages.length !== d.count) process.exit(1);
+      count = d.count;
+      shown = d.messages.filter((m) => Object.prototype.hasOwnProperty.call(m, "content"));
+    }
+  } catch {
+    process.exit(1);
+  }
+  if (count === 0) return;
+  const via = process.env.SRC === "http" ? " via remote relay" : "";
+  const out = ["[RELAY] Pending messages for " + process.env.AN + via + " (showing " + shown.length + " of " + count + "):"];
+  for (const m of shown) {
+    const body = typeof m.content === "string"
+      ? relayFramed(m.content)
+      : "[" + relayOneLine(m.content_error || "body unavailable") + "; call get_messages to read it]";
+    out.push("  From: " + relayOneLine(m.from || "unknown") + " | " + body + " (" + relayOneLine(m.created_at || "?") + ")");
+  }
+  process.stdout.write(out.join("\n"));
+});
+'
+RELAY_PENDING_SHOW=10
+
+# Verdicts on the mail path go through the TOTAL ORDER (relay_verdict_raise in
+# _verdict.sh): the most severe wins, and at the same level both reasons are
+# kept, the mail-path one first. Without the helper (it failed to load), nothing
+# is changed: the fallback verdict stands.
+relay_mail_verdict() { # WORD REASON [mail|other]
+  command -v relay_verdict_raise >/dev/null 2>&1 || return 0
+  relay_verdict_raise "$1" "$2" " agent=\"$AGENT_NAME\"" "${3:-mail}"
+}
+# A concluded fault on the mail path: DEGRADED, "<reason>".
+relay_degrade() {
+  relay_mail_verdict "DEGRADED" "$1" mail
+}
+
+relay_mail_unreadable() {
+  local why
+  why=$(printf '%s' "$1" | tr -cd 'A-Za-z0-9 _./:()=,-' | cut -c1-200)
+  echo "[RELAY] relay unreadable: pending mail for $AGENT_NAME could not be read at session start. Mail may be waiting: call get_messages. (relay pending $AGENT_NAME shows the reason.)"
+  echo "[bot-relay] local mail read failed for $AGENT_NAME: $why. Pending mail NOT delivered to context; no HTTP fallback." >&2
+  relay_degrade "relay unreadable: ${why:-the local relay mailbox could not be read}"
+}
+
+relay_remote_failed() {
+  echo "[RELAY] remote relay read failed: pending mail for $AGENT_NAME could not be read at session start. Mail may be waiting: call get_messages."
+  echo "[bot-relay] remote mail read failed for $AGENT_NAME: $1" >&2
+  RELAY_MAIL_MODE="remote-failed"
+  relay_mail_verdict "CANNOT-JUDGE" "remote relay read failed: $1" mail
+}
+
+# REMOTE mode only (relay pending said: no local instance; RELAY_HTTP_HOST set).
+relay_deliver_remote_mail() {
+  local host="$RELAY_HTTP_HOST" port="${RELAY_HTTP_PORT:-3777}" tok="${RELAY_AGENT_TOKEN:-}" payload resp block
+  if ! relay_whole_match "$host" '^[A-Za-z0-9_.:-]{1,253}$' || ! relay_whole_match "$port" '^[0-9]{1,5}$' \
+     || ! relay_whole_match "$tok" '^[A-Za-z0-9_=.-]{8,128}$' || ! command -v curl >/dev/null 2>&1; then
+    relay_remote_failed "no usable remote relay settings, token or curl"
+    return 0
+  fi
+  payload=$(AN="$AGENT_NAME" AT="$tok" LIM="$RELAY_PENDING_SHOW" node -e '
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "get_messages",
+      arguments: { agent_name: process.env.AN, status: "pending", limit: Number(process.env.LIM), peek: true, since: "all", agent_token: process.env.AT },
+    } }));' 2>/dev/null) || { relay_remote_failed "could not build the request"; return 0; }
+  resp=$(curl -fsS --max-time 4 -X POST "http://${host}:${port}/mcp" \
+    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -H "X-Agent-Token: $tok" --data "$payload" 2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }
+  block=$(printf '%s' "$resp" | SRC=http AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null) \
+    || { relay_remote_failed "the remote relay answered with an error or an untrusted page"; return 0; }
+  RELAY_MAIL_READ_DONE=1
+  RELAY_MAIL_MODE="remote"
+  if [ -n "$block" ]; then
+    printf '%s\n\n' "$block"
+    echo "[bot-relay] $AGENT_NAME has pending messages (delivered to context, via remote relay)." >&2
+  fi
+}
+
+RELAY_MAIL_MODE="" # local | unreadable | remote | remote-failed | none | unresolved-name
+
+relay_deliver_pending_mail() {
+  local bin outf errf deadline out="" rc=127 why="" block=""
+  # The unresolved fallback name is never an identity (ADR-0044 point 5): relay
+  # pending refuses it, and no mail is read for it. That is no judgement, not a
+  # fault of the relay.
+  case "$AGENT_NAME" in
+    [Dd][Ee][Ff][Aa][Uu][Ll][Tt])
+      echo "[bot-relay] mail not read at session start: this window's agent name is unresolved (\"default\"). Run: relay init --agent <name> (or set RELAY_AGENT_NAME)." >&2
+      RELAY_MAIL_MODE="unresolved-name"
+      relay_mail_verdict "CANNOT-JUDGE" "agent name unresolved (default): mail not read; run relay init --agent <name>, or set RELAY_AGENT_NAME" mail
+      return 0
+      ;;
+  esac
+  bin="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+  # The TRUE cause when the read cannot even start: never phrased as an unreadable DB.
+  if ! command -v node >/dev/null 2>&1; then
+    why="node not found (the relay CLI runs on node)"
+  elif [ ! -f "$bin" ]; then
+    why="no relay CLI beside this hook ($bin)"
+  else
+    outf="$(mktemp 2>/dev/null || printf '')"
+    errf="$(mktemp 2>/dev/null || printf '')"
+    if [ -z "$outf" ] || [ -z "$errf" ]; then
+      why="could not create a private temp file for the read"
+    else
+      RELAY_TMP_FILES="$RELAY_TMP_FILES $outf $errf $outf.timedout"
+      # node runs DIRECTLY into files under a watchdog, inside what is LEFT of this
+      # hook's installed budget (relay_run_pending / relay_pending_deadline).
+      deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
+      if [ "$deadline" -lt 1 ]; then
+        # No time left for the read: SKIP it and say so (never a floored 1s read).
+        rc=125
+        why="no time budget left (${SECONDS}s spent before the mail read)"
+      else
+        relay_run_pending "$deadline" "$outf" "$errf" node "$bin" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW"
+        rc=$?
+        out=$(cat "$outf" 2>/dev/null)
+        why=$(grep -m 1 'PENDING_' "$errf" 2>/dev/null)
+      fi
+      if [ "$rc" -eq 125 ]; then
+        :
+      elif [ "$rc" -eq 124 ]; then
+        why="timed out after ${deadline}s"
+      elif [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && [ -z "$why" ]; then
+        why="node crashed (exit $rc): relay pending gave no reason"
+      fi
+    fi
+  fi
+  case "$rc" in
+    0)
+      block=$(printf '%s' "$out" | SRC=f1 AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null) \
+        || { RELAY_MAIL_MODE="unreadable"; relay_mail_unreadable "relay pending returned an answer this hook cannot trust"; return 0; }
+      ;;
+    3)
+      if [ -n "${RELAY_HTTP_HOST:-}" ]; then
+        relay_deliver_remote_mail
+        return 0
+      fi
+      # Nothing to read, and no judgement made about the mail.
+      RELAY_MAIL_MODE="none"
+      relay_mail_verdict "CANNOT-JUDGE" "no local relay instance and no remote relay configured" mail
+      return 0
+      ;;
+    *)
+      RELAY_MAIL_MODE="unreadable"
+      relay_mail_unreadable "${why:-relay pending failed (exit $rc)}"
+      return 0
+      ;;
+  esac
+  RELAY_MAIL_READ_DONE=1
+  RELAY_MAIL_MODE="local"
+  if [ -n "$block" ]; then
+    printf '%s\n\n' "$block"
+    echo "[bot-relay] $AGENT_NAME has pending messages (delivered to context)." >&2
+  fi
+}
+
+# No usable local DB file for THIS hook's own reads: the rest of this hook
+# (liveness, register, bind, tasks) needs one, but the MAIL DECISION does not.
+# The order (the F1 mode rule, D2): the name is resolved; relay pending decides
+# the source (a configured DB that is missing is a loud local failure; no local
+# instance at all is the labeled remote path when one is configured); and only in
+# LOCAL mode does a path this hook REJECTED count, as DEGRADED with its reason,
+# because its liveness and task reads were skipped. Never a mute exit.
+if [ "$RELAY_LOCAL_DB_STATE" != "usable" ] || [ ! -f "$DB_PATH" ]; then
+  relay_deliver_pending_mail
+  if [ "$RELAY_LOCAL_DB_STATE" = "rejected" ]; then
+    case "$RELAY_MAIL_MODE" in
+      local|unreadable)
+        relay_mail_verdict "DEGRADED" "local DB path rejected ($RELAY_LOCAL_DB_WHY): liveness and task reads skipped" other
+        ;;
+    esac
+  fi
   exit 0
 fi
 
@@ -946,50 +1227,46 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
 fi
 # --- end ADR-0036 S1 bind ------------------------------------------------------
 
-# --- Deliver pending messages (parameter-bound) ---
-# #53 — the CANONICAL per-session pending predicate (SSOT: src/db.ts
-# pendingForSessionClause), replicated here because a shell hook can't call the
-# TS helper. Pre-#53 this read the binary `status='pending'` column, which flips
-# to 'read' GLOBALLY on the first MCP drain by ANY session — so a fresh session
-# was told "no mail" for messages a prior session drained but never resolved,
-# even though its own get_messages(pending) would re-surface them (v2.0 #6). The
-# correlated subselect binds THIS agent's current session so the preview matches
-# exactly what get_messages(pending) returns: unresolved AND (never read, OR read
-# by a DIFFERENT session). COALESCE(session_id, '') mirrors get_messages'
-# `currentSession ?? ""` EXACTLY — with a NULL/missing session it becomes
-# `read_by_session != ''`, so a row read by a PRIOR session still re-pends (the
-# v2.0 #6 handover), identical to the drain. Without the COALESCE, `!= NULL`
-# is SQL NULL and would silently hide that row in the pre-register state — a
-# wake-vs-drain divergence, the exact class this predicate exists to kill.
-# Executed-hook coverage in tests/v2-26-pending-predicate-ssot.test.ts.
-MESSAGES=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-SELECT '  From: ' || from_agent || ' | ' || content || ' (' || created_at || ')'
-FROM messages
-WHERE to_agent = :name
-  AND resolved_at IS NULL
-  AND (read_by_session IS NULL
-       OR read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = :name), ''))
-ORDER BY created_at DESC LIMIT 10;
-SQL
-)
-
-if [ -n "$MESSAGES" ]; then
-  echo "[RELAY] Pending messages for $AGENT_NAME:"
-  echo "$MESSAGES"
-  echo ""
-  echo "[bot-relay] $AGENT_NAME has pending messages (delivered to context)." >&2
-fi
+# --- Deliver pending messages (defined above: relay_deliver_pending_mail) ---
+relay_deliver_pending_mail
 
 # --- Deliver active tasks (parameter-bound) ---
-TASKS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+# Every field leaves sqlite3 HEX-encoded, so no byte of a title can forge a row or
+# a line boundary on the way out; node decodes and FRAMES it (RELAY_FRAME_JS).
+TASKS=""
+RELAY_TASKS_FAILED=0
+TASKS_HEX=$(sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
-SELECT '  [' || priority || '] ' || title || ' (from: ' || from_agent || ', id: ' || id || ')'
+SELECT hex(priority), hex(title), hex(from_agent), hex(id)
 FROM tasks WHERE to_agent = :name AND status IN ('posted', 'accepted')
 ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END
 LIMIT 10;
 SQL
 )
+if [ -n "$TASKS_HEX" ] && command -v node >/dev/null 2>&1; then
+  TASKS=$(printf '%s' "$TASKS_HEX" | node -e "$RELAY_FRAME_JS"'
+    let raw = "";
+    process.stdin.on("data", (c) => (raw += c));
+    process.stdin.on("end", () => {
+      const dec = (h) => Buffer.from(/^[0-9A-Fa-f]*$/.test(h || "") ? h : "", "hex").toString("utf8");
+      const out = [];
+      for (const row of raw.split("\n")) {
+        if (!row) continue;
+        const [p, t, f, i] = row.split("|").map(dec);
+        out.push("  [" + relayOneLine(p) + "] " + relayFramed(t) + " (from: " + relayOneLine(f) + ", id: " + relayOneLine(i) + ")");
+      }
+      process.stdout.write(out.join("\n"));
+    });' 2>/dev/null) || RELAY_TASKS_FAILED=1
+elif [ -n "$TASKS_HEX" ]; then
+  RELAY_TASKS_FAILED=1
+fi
+if [ "$RELAY_TASKS_FAILED" = "1" ]; then
+  # LOUD: tasks exist that the agent is not being shown.
+  echo "[RELAY] active tasks for $AGENT_NAME could not be rendered safely. Call get_tasks to see them."
+  echo "[bot-relay] task rendering failed for $AGENT_NAME — active tasks NOT delivered to context." >&2
+  relay_mail_verdict "DEGRADED" "tasks could not be rendered at session start" other
+  TASKS=""
+fi
 
 if [ -n "$TASKS" ]; then
   echo "[RELAY] Active tasks for $AGENT_NAME:"
