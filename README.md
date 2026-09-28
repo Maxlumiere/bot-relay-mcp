@@ -598,7 +598,7 @@ Install per-project (NOT global), in `<project>/.claude/settings.json`:
 >
 > The outer double-quotes are JSON; the inner single-quotes are shell. Paths with no spaces do not need this treatment.
 
-The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is running (full auth + audit), falling back to direct sqlite on `RELAY_DB_PATH` otherwise. It does NOT re-register (SessionStart handles that), does NOT check tasks (simpler focus, less context pressure), silent-exits when there is no mail, and stays quiet while the unread set is unchanged (`RELAY_HOOK_NOTICE_REMIND_SECS`, default 600s, at most 120s when anything unread is high priority). Full docs + troubleshooting in [`docs/post-tool-use-hook.md`](./docs/post-tool-use-hook.md).
+The hook reads through `relay pending` (read-only, the canonical pending set, works with the daemon down). The read path is chosen by configuration, never by failure: with a local relay it reads only locally and says `relay unreadable` if it cannot. It peeks over HTTP ("via remote relay") only when no local instance exists and `RELAY_HTTP_HOST` names a remote relay. It does NOT re-register (SessionStart handles that), does NOT check tasks (simpler focus, less context pressure), silent-exits when there is no mail, and stays quiet while the unread set is unchanged (`RELAY_HOOK_NOTICE_REMIND_SECS`, default 600s, at most 120s when anything unread is high priority). Full docs + troubleshooting in [`docs/post-tool-use-hook.md`](./docs/post-tool-use-hook.md).
 
 **Honest limitation:** idle terminals get no delivery. The hook only fires when the agent is actively running tool calls. For long-idle windows, still rely on SessionStart + human attention.
 
@@ -625,7 +625,7 @@ The hook prefers the HTTP path when `RELAY_AGENT_TOKEN` is set and the daemon is
 }
 ```
 
-Same single-quote-the-path-if-it-contains-spaces rule, same env vars, same HTTP/sqlite fallback (both non-mutating: `peek:true` over HTTP, a bare SELECT over sqlite — no mutating SQL exists in the script), same silent-fail contract as `PostToolUse`. Two loop guards bound the blocking: `stop_hook_active` in the hook payload (one wake per natural stop) and a time damper (`RELAY_STOP_WAKE_DAMPER_SECS`, default 120s) that applies only when the payload lacks a parseable `stop_hook_active`. All guards leave mail pending when they suppress — a delayed wake, never a lost one. Full docs + troubleshooting in [`docs/stop-hook.md`](./docs/stop-hook.md).
+Same single-quote-the-path-if-it-contains-spaces rule, same env vars, and the same read rule as `PostToolUse` (`relay pending` locally, a `peek:true` read over HTTP only for a remote relay; both non-mutating, and no mutating SQL exists in the script). An unreadable local relay is reported on stderr, never turned into a block. Two loop guards bound the blocking: `stop_hook_active` in the hook payload (one wake per natural stop) and a time damper (`RELAY_STOP_WAKE_DAMPER_SECS`, default 120s) that applies only when the payload lacks a parseable `stop_hook_active`. All guards leave mail pending when they suppress — a delayed wake, never a lost one. Full docs + troubleshooting in [`docs/stop-hook.md`](./docs/stop-hook.md).
 
 **Honest limitation:** `Stop` does NOT wake truly idle terminals. If no turn is in progress, neither hook fires. For long-idle windows, use the Layer 2 Managed Agent reference (`examples/managed-agent-reference/`).
 

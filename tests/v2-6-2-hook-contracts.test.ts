@@ -104,6 +104,9 @@ function initMinimalDb(dbPath: string): void {
       capabilities TEXT,
       last_seen TEXT,
       session_id TEXT,
+      -- F1: the PostToolUse and Stop hooks read through \`relay pending\`, which
+      -- refuses (loudly) a DB lacking any column the pending predicate uses.
+      session_started_at TEXT,
       auth_state TEXT DEFAULT 'active',
       token_hash TEXT
     );
@@ -410,7 +413,9 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
     }
   });
 
-  it("(P4) daemon-down (port 1 ECONNREFUSED) + no DB → exit 0, empty stdout, no JSON-RPC garbage", () => {
+  it("(P4) daemon-down (port 1 ECONNREFUSED) + a CONFIGURED DB that is missing → exit 0, one well-formed LOUD notice, no JSON-RPC garbage", () => {
+    // F1 mode rule (28 Sep): an explicitly configured local DB that cannot be read
+    // is LOUD ("relay unreadable"), never silence and never an HTTP fallback.
     const { root } = freshTestRoot();
     const r = runHook({
       hook: HOOK_POST_TOOL,
@@ -421,7 +426,12 @@ describe("v2.6.2 — post-tool-use-check.sh contract (PostToolUse hook)", () => 
       httpPort: 1, // ECONNREFUSED
     });
     expect(r.status).toBe(0);
-    expect(stripVerdict(r.stdout)).toBe("");
+    const out = stripVerdict(r.stdout);
+    expect(out.split("\n").length, "a single line").toBe(1);
+    const parsed = JSON.parse(out);
+    expect(parsed.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
+    expect(parsed.hookSpecificOutput?.additionalContext).toMatch(/^relay unreadable/);
+    expect(out).not.toMatch(/jsonrpc/);
   });
 
   it("(P5) malformed RELAY_AGENT_TOKEN (contains space) → token discarded, no auth header sent, exit 0", () => {

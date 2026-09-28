@@ -19,12 +19,20 @@
 #     agent to continue immediately with the reason in front of it.
 #
 # So this hook:
-#   1. PEEKS at pending mail (get_messages peek:true over HTTP, or a plain
-#      SELECT over sqlite). It performs ZERO writes — there is no UPDATE
+#   1. PEEKS at pending mail. It performs ZERO writes — there is no UPDATE
 #      statement in this file, so it cannot consume mail it failed to deliver,
 #      by construction. tests/hooks-stop.test.ts asserts both the behavior
 #      (mail still pending after the hook fires) and the structure (no UPDATE
-#      in the source).
+#      in the source). THE READ PATH IS CHOSEN BY CONFIGURATION, NEVER BY
+#      FAILURE (the F1 mode rule, 28 Sep), and `relay pending`
+#      (F1, ADR-0044) decides it with the connector's own resolver:
+#        - LOCAL: `relay pending AGENT --json`, the full canonical set, read-only.
+#          If it cannot read, the hook is LOUD (stderr + verdict "relay
+#          unreadable") and makes NO HTTP request.
+#        - REMOTE (no local instance, RELAY_HTTP_HOST configured): the
+#          get_messages peek over HTTP, labeled "via remote relay". KNOWN LIMIT:
+#          it stamps seq (the ADR-0044 residual).
+#        - Neither: nothing to read, CANNOT-JUDGE.
 #   2. If mail is pending, emits decision:"block" with a compact wake in
 #      `reason`: the agent is told to call get_messages itself. Content
 #      delivery rides that authenticated tool call — the one place mark-as-read
@@ -66,8 +74,8 @@
 #   - Never re-register. SessionStart handles that.
 #   - Validate every env-var input against an allowlist BEFORE use.
 #   - Never write partial JSON, error text, or stack traces to stdout.
-#   - 2s total budget (1s health probe + 2s peek). Claude Code enforces
-#     hook timeout from settings.json on top of this.
+#   - Budget: one `relay pending` run (local), or 1s health probe + 2s peek
+#     (remote). Claude Code enforces the hook timeout from settings.json on top.
 #
 # Honest limitation:
 #   - Does NOT wake a truly idle terminal. If no turn is in progress, the hook
@@ -179,22 +187,13 @@ AGENT_NAME="${RELAY_AGENT_NAME:-}"
 AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
-# v2.6.1 — vault helpers + DB-path resolution sourced from a single file.
-# Mirrors src/instance.ts:resolveInstanceDbPath + src/token-store.ts:
-# resolveAgentVaultDir + FileTokenStore.{pathFor,read,write}. Drift surfaces
-# directly as a test failure in tests/v2-6-1-token-store.test.ts (which
-# sources this same file) — no inline-copy hide-out.
+# v2.6.1 — vault helpers (token vault) sourced from a single file. The DB path
+# is NOT resolved here: `relay pending` resolves it with the connector's own
+# resolver.
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_vault-helpers.sh
 . "$HOOKS_DIR/_vault-helpers.sh"
-DB_PATH=$(resolve_relay_db_path) || {
-  # Malformed active-instance content — refuse to fall back silently. A
-  # broken setup should be loud, not hidden under legacy. The hook's
-  # other side effects (HTTP health probe, peek) are gated behind DB_PATH
-  # being readable below; null DB_PATH falls cleanly to the existing
-  # "no DB → exit 0" path.
-  DB_PATH=""
-}
+RELAY_CLI="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
 MAX_MESSAGES="${RELAY_HOOK_MAX_MESSAGES:-20}"
 DAMPER_SECS="${RELAY_STOP_WAKE_DAMPER_SECS:-120}"
 
@@ -218,8 +217,8 @@ if ! relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$'; then
 fi
 
 # v2.6.1 — vault hydration. If the env-supplied RELAY_AGENT_TOKEN is empty
-# but a valid token sits in the vault for this agent, use it for HTTP-path
-# authentication. Sqlite-direct fallback path below does not need a token.
+# but a valid token sits in the vault for this agent, use it for the remote
+# read. The local read needs no token.
 if [ -z "$AGENT_TOKEN" ]; then
   if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
     AGENT_TOKEN="$VAULT_TOKEN"
@@ -251,26 +250,35 @@ if [ -n "$AGENT_TOKEN" ]; then
   fi
 fi
 
-# DB path must live under $HOME or a test-tmp location — same policy as check-relay.sh.
-RESOLVED_DB_PATH=$(cd "$(dirname "$DB_PATH")" 2>/dev/null && pwd)/$(basename "$DB_PATH")
-if [ -z "$RESOLVED_DB_PATH" ] || { [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ "$RESOLVED_DB_PATH" != /tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /private/tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /var/folders/* ]]; }; then
-  # DB path unusable — still try HTTP if available, but skip sqlite fallback.
-  DB_PATH=""
-else
-  DB_PATH="$RESOLVED_DB_PATH"
-fi
+# --- Read helpers — both emit "COUNT<US>LATEST_FROM<US>TOP_PRIORITY" ----------
+# <US> = 0x1f. Neither mutates message state. COUNT is the FULL pending count,
+# never a page length. LATEST_FROM is the newest message's sender, held to the
+# agent-name pattern ("unknown" otherwise): it is the one sender-chosen field in
+# the wake. TOP is "high" when anything pending is high or critical.
 
-# --- Peek helpers — both emit "COUNT<US>LATEST_FROM<US>TOP_PRIORITY" ----------
-# <US> = 0x1f. Neither path mutates message state: HTTP passes peek:true (the
-# v2.2.2 non-mutating read), sqlite runs a bare SELECT. The sqlite connection
-# is deliberately NOT opened with -readonly: readonly open of a WAL database
-# is version-dependent (it fails with SQLITE_CANTOPEN on a cleanly-closed WAL
-# DB under some sqlite3 builds because the readonly connection cannot create
-# the -shm), and the relay DB is WAL by default — so -readonly silently
-# degraded the whole fallback to no-wake on affected machines. The read-only
-# guarantee is structural instead: no mutating SQL exists in this file, and
-# tests/hooks-stop.test.ts asserts that against the source.
+# LOCAL: `relay pending --json` output on stdin (the full canonical set).
+F1_SUMMARY_PY='
+import json, re, sys
+try:
+    d = json.load(sys.stdin)
+    msgs = d["messages"]
+    n = d["count"]
+    if d.get("ok") is not True or type(n) is not int or not isinstance(msgs, list) or len(msgs) != n:
+        sys.exit(1)
+    if n == 0:
+        sys.exit(0)
+    newest = min(msgs, key=lambda m: m["age_seconds"])
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(1)
+who = newest.get("from")
+who = who if isinstance(who, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", who) else "unknown"
+top = "high" if d.get("top_priority") in ("critical", "high") else "normal"
+sys.stdout.write("%d\x1f%s\x1f%s" % (n, who, top))
+'
 
+# REMOTE mode only: never called when a local instance exists.
 http_peek() {
   [ -z "$AGENT_TOKEN" ] && return 1
   command -v curl >/dev/null 2>&1 || return 1
@@ -294,6 +302,7 @@ print(json.dumps({
       "status": "pending",
       "limit": int(os.environ["LIM"]),
       "peek": True,
+      "since": "all",
       "agent_token": os.environ["AT"],
     },
   },
@@ -309,7 +318,7 @@ print(json.dumps({
     --data "$payload" 2>/dev/null) || return 1
 
   RESP="$response" python3 <<'PYEOF' 2>/dev/null
-import json, os, sys
+import json, os, re, sys
 
 raw = os.environ.get("RESP", "").strip()
 # StreamableHTTP wraps the JSON-RPC response in SSE: "event: message\ndata: {..}".
@@ -330,97 +339,85 @@ except Exception:
 msgs = data.get("messages", [])
 if not msgs:
     sys.exit(0)  # empty — success but nothing to wake for
-top = "high" if any(m.get("priority") == "high" for m in msgs) else "normal"
-latest = msgs[0].get("from_agent", "?")
-sys.stdout.write(f"{len(msgs)}\x1f{latest}\x1f{top}")
+total = data.get("total_pending")
+count = total if type(total) is int else len(msgs)
+top = "high" if any(m.get("priority") in ("critical", "high") for m in msgs) else "normal"
+latest = max(msgs, key=lambda m: str(m.get("created_at", ""))).get("from_agent")
+latest = latest if isinstance(latest, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", latest) else "unknown"
+sys.stdout.write(f"{count}\x1f{latest}\x1f{top}")
 PYEOF
   return $?
 }
 
-sqlite_peek() {
-  [ -z "$DB_PATH" ] && return 1
-  [ -f "$DB_PATH" ] || return 1
-  command -v sqlite3 >/dev/null 2>&1 || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
+# --- Main: read (F1 decides the mode), damper, then block-to-wake ------------
 
-  # #56 — canonical per-session pending predicate (SSOT: src/db.ts
-  # pendingForSessionClause), replicated in SQL because a shell hook can't call
-  # the TS helper. This is exactly what get_messages(pending) returns for this
-  # agent's CURRENT session: unresolved AND (never read, OR read by a DIFFERENT
-  # session). COALESCE(session_id,'') mirrors get_messages' `currentSession ?? ""`
-  # (a NULL/missing session re-pends a prior session's unresolved mail). Pre-#56
-  # this keyed on the binary `status` column, which flips to 'read' GLOBALLY on
-  # the first MCP drain by ANY session — so a fresh Stop-hook wake under-reported
-  # re-pendable mail (codex #124's resolved_at guard is now subsumed here).
-  # read_by_session + resolved_at exist since v2.0 / v2.12; on an older legacy DB
-  # the query errors and we retry with the bare-status fallback below (the only
-  # signal such a DB has).
-  local rows
-  rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-.parameter set :lim $MAX_MESSAGES
-SELECT from_agent, priority
-FROM messages WHERE to_agent = :name
-  AND resolved_at IS NULL
-  AND (read_by_session IS NULL
-       OR read_by_session != COALESCE((SELECT session_id FROM agents WHERE name = :name), ''))
-ORDER BY created_at DESC LIMIT :lim;
-SQL
-)
-  if [ $? -ne 0 ]; then
-    rows=$(sqlite3 -separator $'\x1f' -newline $'\x1e' "$DB_PATH" <<SQL 2>/dev/null
-.parameter set :name '$AGENT_NAME'
-.parameter set :lim $MAX_MESSAGES
-SELECT from_agent, priority
-FROM messages WHERE to_agent = :name AND status = 'pending'
-ORDER BY created_at DESC LIMIT :lim;
-SQL
-) || return 1
+F1_OUT="" F1_ERR="" F1_RC=127
+if [ -f "$RELAY_CLI" ] && command -v node >/dev/null 2>&1; then
+  _f1_errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -n "$_f1_errf" ]; then
+    F1_OUT=$(node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>"$_f1_errf")
+    F1_RC=$?
+    F1_ERR=$(head -n 1 "$_f1_errf" 2>/dev/null)
+    rm -f "$_f1_errf" 2>/dev/null
+  else
+    F1_OUT=$(node "$RELAY_CLI" pending "$AGENT_NAME" --json 2>/dev/null)
+    F1_RC=$?
   fi
-  if [ -z "$rows" ]; then
-    return 0  # empty — nothing to wake for
-  fi
-
-  ROWS="$rows" python3 <<'PYEOF' 2>/dev/null
-import os, sys
-raw = os.environ.get("ROWS", "")
-records = []
-for rec in raw.split("\x1e"):
-    rec = rec.strip("\n\r")
-    if not rec:
-        continue
-    parts = rec.split("\x1f", 1)
-    if len(parts) != 2:
-        continue
-    records.append(parts)
-if not records:
-    sys.exit(0)
-top = "high" if any(p == "high" for (_, p) in records) else "normal"
-sys.stdout.write(f"{len(records)}\x1f{records[0][0]}\x1f{top}")
-PYEOF
-  return $?
-}
-
-# --- Main: peek (HTTP then sqlite), damper, then block-to-wake ---------------
-
-SUMMARY=$(http_peek)
-RC=$?
-READ_OK=0
-[ $RC -eq 0 ] && READ_OK=1
-if [ $RC -ne 0 ] || [ -z "$SUMMARY" ]; then
-  SUMMARY=$(sqlite_peek)
-  # sqlite_peek returning 0 with empty SUMMARY = empty mailbox, which is fine.
-  [ $? -eq 0 ] && READ_OK=1
+else
+  F1_ERR="no runnable relay CLI beside this hook ($RELAY_CLI)"
 fi
 
-# THE ONLY UPGRADE. Positive evidence is a mailbox read that SUCCEEDED — via
-# HTTP or via the sqlite fallback (both PEEKS now: this hook never consumes
-# mail it cannot prove it delivered). An empty SUMMARY alone is NOT evidence:
-# it is ambiguous between "no mail" and "could not read", and treating
-# ambiguity as health is the exact conflation this whole mechanism removes.
-# If both paths failed, CANNOT-JUDGE stands.
-if [ "$READ_OK" -eq 1 ] && command -v relay_verdict_set >/dev/null 2>&1; then
-  relay_verdict_set "HEALTHY" "mailbox read succeeded" " agent=\"${AGENT_NAME:-?}\""
+SUMMARY=""
+READ_OK=0
+case "$F1_RC" in
+  0)
+    MODE=local
+    if command -v python3 >/dev/null 2>&1 && SUMMARY=$(printf '%s' "$F1_OUT" | python3 -c "$F1_SUMMARY_PY" 2>/dev/null); then
+      READ_OK=1
+    else
+      MODE=unreadable
+      SUMMARY=""
+      F1_ERR="relay pending returned output this hook could not parse"
+    fi
+    ;;
+  3)
+    if [ -n "${RELAY_HTTP_HOST:-}" ]; then
+      MODE=remote
+      SUMMARY=$(http_peek)
+      [ $? -eq 0 ] && READ_OK=1
+    else
+      MODE=none
+    fi
+    ;;
+  *)
+    MODE=unreadable
+    ;;
+esac
+
+# THE ONLY UPGRADE. Positive evidence is a mailbox read that SUCCEEDED (this hook
+# never consumes mail it cannot prove it delivered). An empty SUMMARY alone is
+# NOT evidence: it is ambiguous between "no mail" and "could not read", and
+# treating ambiguity as health is the exact conflation this whole mechanism
+# removes.
+if command -v relay_verdict_set >/dev/null 2>&1; then
+  if [ "$READ_OK" -eq 1 ] && [ "$MODE" = remote ]; then
+    relay_verdict_set "HEALTHY" "mailbox read succeeded" " agent=\"${AGENT_NAME:-?}\" via=\"remote relay\""
+  elif [ "$READ_OK" -eq 1 ]; then
+    relay_verdict_set "HEALTHY" "mailbox read succeeded" " agent=\"${AGENT_NAME:-?}\""
+  elif [ "$MODE" = unreadable ]; then
+    _f1_why=$(printf '%s' "$F1_ERR" | tr -cd 'A-Za-z0-9 _./:()=,-' | cut -c1-200)
+    relay_verdict_set "CANNOT-JUDGE" "relay unreadable: the local relay DB could not be read (no HTTP fallback)" " agent=\"${AGENT_NAME}\" detail=\"${_f1_why}\""
+  elif [ "$MODE" = remote ]; then
+    relay_verdict_set "CANNOT-JUDGE" "remote relay read failed (unreachable, unauthorized or no token)" " agent=\"${AGENT_NAME}\""
+  else
+    relay_verdict_set "CANNOT-JUDGE" "no local relay instance and no remote relay configured" " agent=\"${AGENT_NAME}\""
+  fi
+fi
+
+# LOUD, not silent, and no block: a wake the agent cannot act on would only steal
+# the turn boundary. The operator sees it on stderr; PostToolUse tells the agent.
+if [ "$MODE" = unreadable ]; then
+  echo "[RELAY] relay unreadable: could not read the local relay DB for ${AGENT_NAME}; mail may be waiting (run: relay pending ${AGENT_NAME})" >&2
 fi
 
 if [ -z "$SUMMARY" ]; then
@@ -461,14 +458,15 @@ fi
 # fetch its own mail — the hook deliberately does NOT carry bodies, so the
 # mark-as-read stays inside the agent's authenticated get_messages call.
 command -v python3 >/dev/null 2>&1 || exit 0
-SUMMARY="$SUMMARY" AN="$AGENT_NAME" python3 -c '
+SUMMARY="$SUMMARY" AN="$AGENT_NAME" VIA="$MODE" python3 -c '
 import json, os, sys
 count, latest_from, top = os.environ["SUMMARY"].split("\x1f", 2)
 an = os.environ["AN"]
 plural = "s" if count != "1" else ""
 prio = " (high priority)" if top == "high" else ""
+via = " via remote relay" if os.environ.get("VIA") == "remote" else ""
 reason = (
-    f"[RELAY] {count} pending message{plural} for {an}{prio}, latest from {latest_from}. "
+    f"[RELAY] {count} pending message{plural} for {an}{prio}{via}, latest from {latest_from}. "
     f"Before stopping, call get_messages(agent_name=\"{an}\", status=\"pending\"), "
     f"act on every message, then continue. The mail is still unread in the relay; "
     f"this wake did not consume it."

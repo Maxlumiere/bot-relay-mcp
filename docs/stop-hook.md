@@ -66,11 +66,11 @@ The hook reads the same env vars as `PostToolUse`:
 | Var | Purpose | Default |
 |---|---|---|
 | `RELAY_AGENT_NAME` | Which agent mailbox to check | (unset → hook silently exits) |
-| `RELAY_AGENT_TOKEN` | Auth token for HTTP path | (unset → HTTP path skipped, sqlite fallback used) |
-| `RELAY_HTTP_HOST` | Relay HTTP host | `127.0.0.1` |
+| `RELAY_AGENT_TOKEN` | Auth token for the remote read (the local read needs none) | (unset → vault token) |
+| `RELAY_DB_PATH` / `RELAY_INSTANCE_ID` | An explicit local relay DB: forces local mode | per-instance DB, else `~/.bot-relay/relay.db` |
+| `RELAY_HTTP_HOST` | A remote relay: selects remote mode when no local instance is configured explicitly | (unset) |
 | `RELAY_HTTP_PORT` | Relay HTTP port | `3777` |
-| `RELAY_DB_PATH` | Sqlite DB path (sqlite fallback only) | `~/.bot-relay/relay.db` |
-| `RELAY_HOOK_MAX_MESSAGES` | Max messages considered per peek | `20` |
+| `RELAY_HOOK_MAX_MESSAGES` | Page size of the remote read | `20` |
 | `RELAY_STOP_WAKE_DAMPER_SECS` | Minimum seconds between blocks per agent (0 disables) | `120` |
 
 Typical setup via shell alias (matches the `SessionStart` + `PostToolUse` pattern):
@@ -83,26 +83,25 @@ alias ai-agent='RELAY_AGENT_NAME=my-agent RELAY_AGENT_TOKEN=<your-token> claude'
 
 1. Reads the **complete** hook payload from stdin (bounded at 256KB — not first-line-only, so a pretty-printed payload cannot defeat the guard). If `stop_hook_active` is true (this stop is already a hook-forced continuation), exits silently — one wake per natural stop. A non-empty payload that does not parse as JSON also suppresses (fail-safe: we cannot rule out active, and the mail stays pending either way).
 2. Validates all env-var inputs against an allowlist (no surprises in URLs or SQL).
-3. If `RELAY_AGENT_TOKEN` is set AND the HTTP daemon responds on `/health` within 1 second, calls `get_messages` with **`peek: true`** via `/mcp` — the v2.2.2 non-mutating read. This path goes through the full auth / rate-limit / audit pipeline and marks nothing.
-4. Otherwise falls back to sqlite on `RELAY_DB_PATH` with a bare `SELECT` that mirrors the authoritative pending query (`status='pending' AND resolved_at IS NULL`, with a filterless retry for pre-v2.12 legacy DBs). The connection is deliberately **not** opened `-readonly`: readonly open of a WAL database is sqlite-version-dependent and fails on some builds, which would silently kill the whole fallback — the read-only guarantee is structural instead (no mutating SQL exists in the file; enforced by test).
-5. If mail is pending and the damper window has elapsed, emits a single-line Claude Code hook JSON to stdout:
+3. Reads the mailbox with the same rule as `PostToolUse`: **the path is chosen by configuration, never by failure** (see [`post-tool-use-hook.md`](./post-tool-use-hook.md), "What the hook does"). Locally it is `relay pending AGENT --json`: the full canonical pending set, read-only. The count in the wake is the whole set, never a page. An unreadable local relay is reported on stderr and in the verdict (`relay unreadable`), with no block and no HTTP request. Remotely (no local instance, `RELAY_HTTP_HOST` set) it is the `get_messages` `peek: true` read over HTTP, and the wake says `via remote relay`. That peek stamps the `seq` observation cursor, a known limit for remote-only setups.
+4. If mail is pending and the damper window has elapsed, emits a single-line Claude Code hook JSON to stdout:
    ```json
    {"decision": "block", "reason": "[RELAY] 2 pending messages for builder (high priority), latest from planner. Before stopping, call get_messages(agent_name=\"builder\", status=\"pending\"), act on every message, then continue. The mail is still unread in the relay; this wake did not consume it."}
    ```
    The reason deliberately carries a compact summary, not the message bodies — the agent fetches content through its own authenticated `get_messages` call, which is where mark-as-read lives.
-6. If there is no mail, a guard suppresses, or any error happens, the hook exits silently with empty stdout — never pollutes the conversation, never consumes anything.
+5. If there is no mail, a guard suppresses, or the read fails, the hook exits with empty stdout — never pollutes the conversation, never consumes anything.
 
 ## What the hook does NOT do
 
 - **It does NOT mark mail read — ever.** There is no write path in the script (no `UPDATE` statement exists; `tests/hooks-stop.test.ts` enforces this structurally and behaviorally). A hook cannot prove from the inside that its output reached the model, so it must not consume what it cannot prove it delivered.
 - **It does NOT wake truly idle terminals.** If no turn is in progress, the hook does not fire. Mail that arrives while the agent is sitting idle will not be delivered until either a user types something, the agent's next turn ends, or a `SessionStart` fires on terminal open. Idle wake is Tether's job; parked agents are Sentinel's.
-- **It does NOT re-register the agent.** `SessionStart` handles registration. If the agent is not registered when the hook fires, the hook silently exits.
+- **It does NOT re-register the agent.** `SessionStart` handles registration. If the agent is not registered in the local relay (often the wrong instance), `relay pending` refuses to answer and the hook reports `relay unreadable` on stderr.
 - **It does NOT check tasks.** Task surfacing stays in `SessionStart` for now (simpler, less context-pressure). `Stop` is dedicated to the wake only.
-- **It does NOT retry.** A single budget, silent-fail, wait for the next turn.
+- **It does NOT retry.** One read per firing; the next turn reads again.
 
 ## Timing budget
 
-The hook self-imposes a ~2 second budget (1s health probe + 2s `get_messages` call). On an unreachable relay + missing DB, the full-fail path completes in tens of milliseconds. Claude Code's `timeout` field is the hard ceiling; set it to 5 or higher in settings.json to leave headroom.
+Local mode costs one `relay pending` run (a Node process start, a few hundred milliseconds). Remote mode self-imposes a ~3 second budget (1s health probe + 2s `get_messages` call). Claude Code's `timeout` field is the hard ceiling; set it to 5 or higher in settings.json to leave headroom.
 
 ## Troubleshooting
 
@@ -110,9 +109,8 @@ The hook self-imposes a ~2 second budget (1s health probe + 2s `get_messages` ca
 
 **Hook fires but messages never appear.** Check that:
 - `RELAY_AGENT_NAME` matches the name the SessionStart hook registered under.
-- The relay daemon is running (`curl http://127.0.0.1:3777/health` returns `status:ok`).
-- If using HTTP, `RELAY_AGENT_TOKEN` is set and matches the agent.
-- If using sqlite, the DB path is correct and you have read+write access to it.
+- `relay pending <agent>` answers in the same environment. It names the DB it read, or says why it could not.
+- If remote, `RELAY_AGENT_TOKEN` is set and matches the agent, and the relay answers `/health`.
 
 **Mail appears once in the wake summary and again when the agent fetches it.** Expected: the Stop wake carries a summary, and the agent's own `get_messages` call in the forced continuation carries the bodies (and marks them read). The `PostToolUse` hook may also render the same batch onto that tool result — a harmless double-render inside one continuation, not a duplicate delivery.
 

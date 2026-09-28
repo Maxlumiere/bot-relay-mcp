@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed — the PostToolUse and Stop hooks read through `relay pending`; the read path is chosen by configuration, never by failure
+
+Both hooks carried their own copy of the pending predicate as a sqlite fallback. They also preferred a `get_messages` peek over HTTP, which stamps the `seq` observation cursor. A failed read on one path fell through to the other path, or went silent. Now `relay pending` decides:
+
+- **With a local relay, the hooks read locally only.** Neither hook holds predicate SQL any more. The count, top priority and newest arrival come from the full pending set, and no `seq` is stamped. The Stop wake's count was a 20-row page before; it is now the whole set.
+- **A local relay that cannot be read is loud.** PostToolUse tells the agent `relay unreadable: …` (damped, reminded every 120 s), and Stop reports it on stderr. Both verdict lines say `relay unreadable` and give the reason. **Neither hook ever falls back to HTTP.** A missing configured DB, a corrupt or pre-v2.12 DB, or an agent the DB does not know (often the wrong instance) was silent before, and is now announced.
+- **Remote only** (no local instance, and `RELAY_HTTP_HOST` names a relay): the HTTP peek, labeled `via remote relay`. Known limit: that peek still stamps `seq`. No decision keys on `seq`.
+- **The PostToolUse liveness self-heal** now runs only after a successful local read, and only when the stored anchor positively differs from this process. An unknown anchor sends nothing.
+- **Cost:** one Node process start per firing. On one machine over 40 runs, p95 was 277 ms, against 222 ms for the HTTP peek it replaces.
+
+Tests: `tests/f1-hook-migration.test.ts`. In local mode the hooks make zero HTTP requests, whether the DB is readable or unreadable and whatever the anchor. A counting stub that would answer is in place, and a mismatched-anchor case proves the stub is reachable. The remote twin is labeled, and neither mode sends nothing. A failure-triggered HTTP fallback turns them red.
+
 ### Added — `relay pending AGENT`: what is pending, as metadata only, from one read-only surface
 
 The hooks each carried a hand-copied copy of the pending predicate, and the only other way to ask was a `get_messages` peek, which stamps the observation cursor (`seq`) although a count observes no message. `relay pending` is the one read surface for "does this agent have mail?".
