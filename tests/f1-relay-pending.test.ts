@@ -273,3 +273,109 @@ describe("F1 — silence is never success", () => {
     loud(pending(["bad name;rm", "--json"]), 2);
   });
 });
+
+/**
+ * WHERE the answer comes from is decided HERE, in TS, from the same resolver the
+ * connector uses (architect ruling 0bab3b46): the hooks never re-implement it.
+ * Precedence: EXPLICIT local (--db-path, RELAY_DB_PATH, RELAY_INSTANCE_ID) >
+ * EXPLICIT remote (RELAY_HTTP_HOST) > AMBIENT local (the active-instance marker,
+ * the legacy flat DB file) > none. "No local instance" is its own exit code (3),
+ * so a caller can tell it from "a local instance I could not read" (1), which must
+ * never be treated as a reason to go remote.
+ */
+describe("F1 — the source: explicit config outranks ambient signals; no local instance is exit 3", () => {
+  const RHOME = path.join(ROOT, "relay-home");
+  /** `relay pending` with NO --db-path, under a controlled environment. */
+  function bare(name: string, env: Record<string, string>): Run {
+    const r = spawnSync("node", [RELAY_BIN, "pending", name, "--json"], {
+      encoding: "utf-8",
+      timeout: 20_000,
+      env: { PATH: process.env.PATH ?? "", HOME: HOME_DIR, RELAY_HOME: RHOME, ...env },
+    });
+    return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  }
+  /** A consistent copy of the fixture DB at `dest` (VACUUM INTO folds in the WAL). */
+  function copyDbTo(dest: string): void {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    db.getDb().exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+  }
+  function noLocal(r: Run): void {
+    expect(r.status, r.stderr).toBe(3);
+    expect(r.stdout, "stdout stays EMPTY on exit 3 too").toBe("");
+    expect(r.stderr).toMatch(/PENDING_NO_LOCAL/);
+  }
+  function answered(r: Run): void {
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).ok).toBe(true);
+  }
+  beforeEach(() => {
+    fs.mkdirSync(RHOME, { recursive: true });
+    seed();
+  });
+
+  it("nothing configured and nothing on disk → exit 3 (no local instance), never exit 0", () => {
+    noLocal(bare(R, {}));
+  });
+
+  it("a remote relay configured and nothing local → exit 3", () => {
+    noLocal(bare(R, { RELAY_HTTP_HOST: "relay.example.com" }));
+  });
+
+  it("AMBIENT legacy DB file, no remote configured → answered from the local file", () => {
+    copyDbTo(path.join(RHOME, "relay.db"));
+    answered(bare(R, {}));
+  });
+
+  it("AMBIENT legacy DB file + an EXPLICIT remote → exit 3: the explicit remote outranks the ambient file", () => {
+    copyDbTo(path.join(RHOME, "relay.db"));
+    noLocal(bare(R, { RELAY_HTTP_HOST: "relay.example.com" }));
+  });
+
+  it("AMBIENT active-instance marker → answered from that instance's DB", () => {
+    copyDbTo(path.join(RHOME, "instances", "inst-a", "relay.db"));
+    fs.symlinkSync("inst-a", path.join(RHOME, "active-instance"));
+    answered(bare(R, {}));
+  });
+
+  it("EXPLICIT RELAY_INSTANCE_ID outranks an explicit remote", () => {
+    copyDbTo(path.join(RHOME, "instances", "inst-b", "relay.db"));
+    answered(bare(R, { RELAY_INSTANCE_ID: "inst-b", RELAY_HTTP_HOST: "relay.example.com" }));
+  });
+
+  it("EXPLICIT RELAY_DB_PATH that is MISSING → exit 1 (loud), NEVER exit 3, even with a remote configured", () => {
+    const r = bare(R, { RELAY_DB_PATH: path.join(ROOT, "gone.db"), RELAY_HTTP_HOST: "relay.example.com" });
+    expect(r.status, r.stderr).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/PENDING_FAILED/);
+  });
+
+  it("an explicit RELAY_INSTANCE_ID whose DB is missing → exit 1, never exit 3", () => {
+    const r = bare(R, { RELAY_INSTANCE_ID: "no-such-inst" });
+    expect(r.status, r.stderr).toBe(1);
+    expect(r.stderr).toMatch(/PENDING_FAILED/);
+  });
+
+  it("AMBIGUOUS (instances exist, no marker, no id) → exit 1 (loud): never a quiet read of the flat DB, never exit 3", () => {
+    copyDbTo(path.join(RHOME, "instances", "inst-c", "relay.db"));
+    copyDbTo(path.join(RHOME, "relay.db"));
+    const r = bare(R, {});
+    expect(r.status, r.stderr).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/PENDING_FAILED/);
+  });
+
+  it("a pre-v2.12 legacy DB is refused with a ONE-LINE remedy", async () => {
+    const Better = (await import("better-sqlite3")).default;
+    const p = path.join(ROOT, "old.db");
+    const f = new Better(p);
+    f.exec("CREATE TABLE messages (id TEXT, to_agent TEXT, from_agent TEXT, priority TEXT, created_at TEXT, status TEXT);");
+    f.exec("CREATE TABLE agents (name TEXT, session_id TEXT, session_started_at TEXT);");
+    f.close();
+    const r = pending([R, "--json"], p);
+    expect(r.status).toBe(1);
+    const lines = r.stderr.trim().split("\n");
+    expect(lines.length, r.stderr).toBe(1);
+    expect(lines[0]).toMatch(/schema too old/);
+    expect(lines[0]).toMatch(/[Rr]emedy:/);
+  });
+});

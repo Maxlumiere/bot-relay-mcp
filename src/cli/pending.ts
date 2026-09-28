@@ -23,9 +23,61 @@
  * that prevents a verified answer (no DB, not a relay DB, corrupt, locked, an
  * agent this DB has never registered) exits 1 with PENDING_FAILED on stderr and
  * NOTHING on stdout, so `$(relay pending X --json)` can never capture a plausible
- * "no mail".
+ * "no mail". "There is no local instance here" is exit 3 (see resolvePendingSource),
+ * so a hook can tell it from a local read that failed, which must stay loud and
+ * must never be taken as a reason to go remote (the F1 mode rule).
  */
 import fs from "fs";
+
+/** Exit code for "no local relay instance is configured or present here" (never "could not read"). */
+export const EXIT_NO_LOCAL = 3;
+
+export type PendingSource =
+  | { kind: "local"; dbPath: string; basis: string }
+  | { kind: "no-local"; reason: string }
+  | { kind: "ambiguous"; reason: string };
+
+/**
+ * WHERE the answer comes from — decided here, from the connector's own resolver
+ * (src/instance.ts), so no hook re-implements it (the F1 mode rule).
+ *
+ * EXPLICIT configuration outranks AMBIENT signals:
+ *   1. explicit local: --db-path, RELAY_DB_PATH, RELAY_INSTANCE_ID → that DB. A
+ *      missing file is a READ failure (exit 1), never "no local instance".
+ *   2. explicit remote: RELAY_HTTP_HOST set → "no-local" (exit 3). A caller with a
+ *      remote relay configured is not redirected to a stray local file.
+ *   3. ambient local: the active-instance marker, or the legacy flat DB file.
+ *      The AMBIGUOUS state (instances exist, none resolved) is refused loudly,
+ *      exactly as the connector's assertInstanceResolution refuses it: a quiet
+ *      read of the flat DB there is the nine-day silent-loss shape.
+ *   4. nothing → "no-local" (exit 3).
+ */
+export async function resolvePendingSource(dbPathFlag: string | null): Promise<PendingSource> {
+  const { resolveInstanceDbPath, resolveActiveInstanceId, describeInstanceResolution } = await import("../instance.js");
+  if (dbPathFlag) return { kind: "local", dbPath: dbPathFlag, basis: "--db-path" };
+  if (process.env.RELAY_DB_PATH) return { kind: "local", dbPath: process.env.RELAY_DB_PATH, basis: "RELAY_DB_PATH" };
+  if (process.env.RELAY_INSTANCE_ID) {
+    return { kind: "local", dbPath: resolveInstanceDbPath(), basis: "RELAY_INSTANCE_ID" };
+  }
+  if (process.env.RELAY_HTTP_HOST) {
+    return {
+      kind: "no-local",
+      reason: "a remote relay is configured (RELAY_HTTP_HOST) and no local instance is configured explicitly",
+    };
+  }
+  const res = describeInstanceResolution();
+  if (res.legacyFallback) {
+    return {
+      kind: "ambiguous",
+      reason:
+        `instance resolution is ambiguous: this machine has relay instances, but none is selected ` +
+        `(set RELAY_INSTANCE_ID, or run \`relay use-instance <id>\`). Refusing to read the flat DB ${res.dbPath}.`,
+    };
+  }
+  if (resolveActiveInstanceId()) return { kind: "local", dbPath: res.dbPath, basis: "active-instance" };
+  if (fs.existsSync(res.dbPath)) return { kind: "local", dbPath: res.dbPath, basis: "legacy DB file" };
+  return { kind: "no-local", reason: `no local relay instance here (nothing at ${res.dbPath}, no active instance)` };
+}
 
 interface Args {
   name: string | null;
@@ -62,10 +114,13 @@ function usage(requested = false): void {
     "count, top priority, and per message the id, sender, priority and age. Never\n" +
     "the content. No time window. Reads the DB read-only and marks nothing.\n\n" +
     "  --json       Emit JSON.\n" +
-    "  --db-path P  Read the DB at P (default: $RELAY_DB_PATH or the active\n" +
-    "               instance's DB).\n\n" +
+    "  --db-path P  Read the DB at P.\n\n" +
+    "Source: --db-path, RELAY_DB_PATH or RELAY_INSTANCE_ID (explicit) win; then a\n" +
+    "configured remote (RELAY_HTTP_HOST) means no local answer; then the active\n" +
+    "instance or the legacy DB file.\n\n" +
     "Exit: 0 = answered (count 0 is a VERIFIED empty) · 1 = could not answer ·\n" +
-    "      2 = usage error (including the unresolved name `default`).\n";
+    "      2 = usage error (including the unresolved name `default`) ·\n" +
+    "      3 = no local relay instance here (nothing was read; stdout empty).\n";
   if (requested) process.stdout.write(text);
   else process.stderr.write(text);
 }
@@ -109,18 +164,21 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
 
-  // --- resolve the DB (no daemon, same as bind / fleet) ----------------------
-  let dbPath = args.dbPath ?? process.env.RELAY_DB_PATH ?? null;
-  if (!dbPath) {
-    try {
-      const { resolveInstanceDbPath } = await import("../instance.js");
-      dbPath = resolveInstanceDbPath();
-    } catch (err) {
-      return pendingFailed(`could not resolve the relay DB path: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  // --- resolve the SOURCE (no daemon, same as bind / fleet) --------------------
+  let source: PendingSource;
+  try {
+    source = await resolvePendingSource(args.dbPath);
+  } catch (err) {
+    return pendingFailed(`could not resolve the relay DB path: ${err instanceof Error ? err.message : String(err)}`);
   }
+  if (source.kind === "no-local") {
+    process.stderr.write(`PENDING_NO_LOCAL: ${source.reason}\n`);
+    return EXIT_NO_LOCAL;
+  }
+  if (source.kind === "ambiguous") return pendingFailed(source.reason);
+  const dbPath = source.dbPath;
   if (!fs.existsSync(dbPath)) {
-    return pendingFailed(`no relay DB at ${dbPath} — cannot answer (this is NOT "no mail")`);
+    return pendingFailed(`no relay DB at ${dbPath} (${source.basis}) — cannot answer (this is NOT "no mail")`);
   }
 
   let db: import("../sqlite-compat.js").CompatDatabase | null = null;
@@ -131,7 +189,11 @@ export async function run(argv: string[]): Promise<number> {
 
     const { pendingSchemaGap, pendingMetadata } = await import("../db.js");
     const gap = pendingSchemaGap(db);
-    if (gap) return pendingFailed(`${dbPath} ${gap}`);
+    if (gap) {
+      return pendingFailed(
+        `${dbPath} ${gap}. Remedy: start the current relay once against this DB (the daemon migrates the schema in place), then retry.`,
+      );
+    }
 
     const meta = pendingMetadata(db, name);
     if (!meta.registered) {
