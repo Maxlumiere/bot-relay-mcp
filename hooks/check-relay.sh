@@ -958,6 +958,25 @@ fi
 # --db-path pins the read to the DB this hook already resolved and registered
 # against. If it cannot answer, that is SAID (stdout + verdict), never shown as
 # "no mail".
+# FRAMING (shared by the mail and task renderers below). This stdout is the agent's
+# context AND carries this hook's own "[RELAY] VERDICT=" line, so no sender-chosen
+# text may start a line: every line of a body after the first gets a fixed
+# continuation prefix, and C0/C1 control characters and ANSI escapes are stripped
+# (a lone CR counts as a newline; a tab becomes a space). Single-line fields are
+# folded onto one line. Framing does not make the content trusted.
+RELAY_FRAME_JS='
+const relayClean = (v) => String(v == null ? "" : v)
+  .replace(/\r\n?/g, "\n")
+  .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "")
+  .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+  .replace(/\x1b[@-_]/g, "")
+  .replace(/\u009b[0-?]*[ -\/]*[@-~]/g, "")
+  .replace(/\t/g, " ")
+  .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
+const relayOneLine = (v) => relayClean(v).replace(/\n/g, " ");
+const RELAY_CONT = "    | ";
+const relayFramed = (v) => relayClean(v).split("\n").join("\n" + RELAY_CONT);
+'
 RELAY_PENDING_BIN="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
 RELAY_PENDING_SHOW=10
 RELAY_PENDING_OUT=""
@@ -970,7 +989,7 @@ RELAY_PENDING_BLOCK=""
 if [ "$RELAY_PENDING_RC" -eq 0 ]; then
   # Rendered from the JSON on stdin (never an env var: ten bodies can exceed an
   # exec string limit). Exit 1 = output this hook cannot trust.
-  RELAY_PENDING_BLOCK=$(printf '%s' "$RELAY_PENDING_OUT" | AN="$AGENT_NAME" node -e '
+  RELAY_PENDING_BLOCK=$(printf '%s' "$RELAY_PENDING_OUT" | AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS"'
     let raw = "";
     process.stdin.on("data", (c) => (raw += c));
     process.stdin.on("end", () => {
@@ -982,9 +1001,9 @@ if [ "$RELAY_PENDING_RC" -eq 0 ]; then
       const out = ["[RELAY] Pending messages for " + process.env.AN + " (showing " + shown.length + " of " + d.count + "):"];
       for (const m of shown) {
         const body = typeof m.content === "string"
-          ? m.content
-          : "[" + (m.content_error || "body unavailable") + "; call get_messages to read it]";
-        out.push("  From: " + (m.from || "unknown") + " | " + body + " (" + (m.created_at || "?") + ")");
+          ? relayFramed(m.content)
+          : "[" + relayOneLine(m.content_error || "body unavailable") + "; call get_messages to read it]";
+        out.push("  From: " + relayOneLine(m.from || "unknown") + " | " + body + " (" + relayOneLine(m.created_at || "?") + ")");
       }
       process.stdout.write(out.join("\n"));
     });' 2>/dev/null) || RELAY_PENDING_RC=1
@@ -1003,14 +1022,34 @@ elif [ -n "$RELAY_PENDING_BLOCK" ]; then
 fi
 
 # --- Deliver active tasks (parameter-bound) ---
-TASKS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+# Every field leaves sqlite3 HEX-encoded, so no byte of a title can forge a row or
+# a line boundary on the way out; node decodes and FRAMES it (RELAY_FRAME_JS).
+TASKS=""
+TASKS_HEX=$(sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
-SELECT '  [' || priority || '] ' || title || ' (from: ' || from_agent || ', id: ' || id || ')'
+SELECT hex(priority), hex(title), hex(from_agent), hex(id)
 FROM tasks WHERE to_agent = :name AND status IN ('posted', 'accepted')
 ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END
 LIMIT 10;
 SQL
 )
+if [ -n "$TASKS_HEX" ] && command -v node >/dev/null 2>&1; then
+  TASKS=$(printf '%s' "$TASKS_HEX" | node -e "$RELAY_FRAME_JS"'
+    let raw = "";
+    process.stdin.on("data", (c) => (raw += c));
+    process.stdin.on("end", () => {
+      const dec = (h) => Buffer.from(/^[0-9A-Fa-f]*$/.test(h || "") ? h : "", "hex").toString("utf8");
+      const out = [];
+      for (const row of raw.split("\n")) {
+        if (!row) continue;
+        const [p, t, f, i] = row.split("|").map(dec);
+        out.push("  [" + relayOneLine(p) + "] " + relayFramed(t) + " (from: " + relayOneLine(f) + ", id: " + relayOneLine(i) + ")");
+      }
+      process.stdout.write(out.join("\n"));
+    });' 2>/dev/null) || TASKS=""
+elif [ -n "$TASKS_HEX" ]; then
+  echo "[bot-relay] $AGENT_NAME has active tasks, but node is unavailable to render them safely." >&2
+fi
 
 if [ -n "$TASKS" ]; then
   echo "[RELAY] Active tasks for $AGENT_NAME:"

@@ -54,7 +54,7 @@ Every time you open a Claude Code terminal (or resume a session), the hook check
 
 ## What the hook checks
 
-- **Pending messages** — exactly what `get_messages(status="pending")` would return, in the same order (priority first, then newest). The hook reads them through `relay pending AGENT --with-content 10`, so it holds no query of its own. It shows up to 10 bodies and says how many are pending in all. Bodies stored encrypted are shown decrypted when this environment has the key, and as a placeholder otherwise, never as ciphertext. The read marks nothing: the mail stays pending until the agent calls `get_messages`. If the mail cannot be read, the hook says `relay unreadable` rather than showing nothing.
+- **Pending messages** — exactly what `get_messages(status="pending")` would return, in the same order (priority first, then newest). The hook reads them through `relay pending AGENT --with-content 10`, so it holds no query of its own. It shows up to 10 bodies and says how many are pending in all. Bodies stored encrypted are shown decrypted when this environment has the key, and as a placeholder otherwise, never as ciphertext. The read marks nothing: the mail stays pending until the agent calls `get_messages`. If the mail cannot be read, the hook says `relay unreadable` rather than showing nothing. Message bodies and task titles are FRAMED: every line after the first starts with `    | `, and control characters and ANSI escapes are removed, so no sender text can start a line and pose as a `[RELAY]` line from the hook. The framing does not make the content trusted: it is still what the sender wrote.
 - **Active tasks** — tasks assigned to you with status "posted" or "accepted", sorted by priority
 
 ## Example output

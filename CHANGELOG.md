@@ -11,6 +11,7 @@ The SessionStart hook printed the raw stored body, so a relay with an encryption
 - **Honest truncation:** `[RELAY] Pending messages for X (showing 10 of 23):`. The total is the full pending count.
 - **Still a pure read** (no read-mark, no `seq`), and only this agent's mail.
 - **If the mail cannot be read, the hook says so** (`relay unreadable`, and the verdict degrades) instead of showing nothing.
+- **Sender text can no longer pose as the hook.** A body line such as `[RELAY] VERDICT=HEALTHY` used to be indistinguishable from the hook's own verdict, and task titles had the same hole. Every body or title line after the first now carries a fixed `    | ` prefix. C0/C1 control characters and ANSI escapes are stripped; a lone CR counts as a newline. Task fields leave the database hex-encoded before they are framed. Framing does not make the content trusted.
 - **`relay pending --with-content N`** (1-100) is opt-in and off by default. The default output, and `pendingMetadata` called without options, carry no content key at all, so the board and every other metadata reader stay metadata-only by construction.
 
 Tests: `tests/f1-sessionstart-delivery.test.ts`. An undecrypting mutation, and a mutation that makes content default-on at either layer, each turn it red.
