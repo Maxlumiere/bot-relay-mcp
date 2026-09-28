@@ -682,11 +682,19 @@ relay_deliver_pending_mail() {
       # node runs DIRECTLY into files under a watchdog, inside what is LEFT of this
       # hook's installed budget (relay_run_pending / relay_pending_deadline).
       deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
-      relay_run_pending "$deadline" "$outf" "$errf" node "$bin" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW"
-      rc=$?
-      out=$(cat "$outf" 2>/dev/null)
-      why=$(grep -m 1 'PENDING_' "$errf" 2>/dev/null)
-      if [ "$rc" -eq 124 ]; then
+      if [ "$deadline" -lt 1 ]; then
+        # No time left for the read: SKIP it and say so (never a floored 1s read).
+        rc=125
+        why="no time budget left (${SECONDS}s spent before the mail read)"
+      else
+        relay_run_pending "$deadline" "$outf" "$errf" node "$bin" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW"
+        rc=$?
+        out=$(cat "$outf" 2>/dev/null)
+        why=$(grep -m 1 'PENDING_' "$errf" 2>/dev/null)
+      fi
+      if [ "$rc" -eq 125 ]; then
+        :
+      elif [ "$rc" -eq 124 ]; then
         why="timed out after ${deadline}s"
       elif [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && [ -z "$why" ]; then
         why="node crashed (exit $rc): relay pending gave no reason"

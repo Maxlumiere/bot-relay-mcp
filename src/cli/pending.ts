@@ -262,6 +262,19 @@ export async function run(argv: string[]): Promise<number> {
   }
   if (source.kind === "ambiguous" || source.kind === "unreadable") return pendingFailed(source.reason);
   const dbPath = source.dbPath;
+  // NEVER less conservative than the connector: the SAME approved-roots rule its
+  // getDbPath applies, on EVERY source (--db-path included). Outside them is a
+  // refusal (exit 1), never an answer.
+  {
+    const { isPathUnderApprovedRoot } = await import("../db.js");
+    const resolved = path.resolve(dbPath);
+    if (!isPathUnderApprovedRoot(resolved)) {
+      return pendingFailed(
+        `${resolved} (${source.basis}) is outside the approved roots (the home directory and the temp roots), ` +
+          `which the relay itself refuses. Cannot answer.`,
+      );
+    }
+  }
   if (!fs.existsSync(dbPath)) {
     return pendingFailed(`no relay DB at ${dbPath} (${source.basis}) — cannot answer (this is NOT "no mail")`);
   }

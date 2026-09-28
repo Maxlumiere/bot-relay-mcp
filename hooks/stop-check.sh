@@ -396,11 +396,19 @@ else
     # node runs DIRECTLY into files under a watchdog, inside this hook's installed
     # budget (relay_run_pending / relay_pending_deadline in _vault-helpers.sh).
     _f1_deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
-    relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json
-    F1_RC=$?
-    F1_OUT=$(cat "$_f1_outf" 2>/dev/null)
-    F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null)
-    if [ "$F1_RC" -eq 124 ]; then
+    if [ "$_f1_deadline" -lt 1 ]; then
+      # No time left for the read: SKIP it and say so (never a floored 1s read).
+      F1_RC=125
+      F1_ERR="no time budget left (${SECONDS}s spent before the mail read)"
+    else
+      relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json
+      F1_RC=$?
+      F1_OUT=$(cat "$_f1_outf" 2>/dev/null)
+      F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null)
+    fi
+    if [ "$F1_RC" -eq 125 ]; then
+      :
+    elif [ "$F1_RC" -eq 124 ]; then
       F1_ERR="timed out after ${_f1_deadline}s"
     elif [ "$F1_RC" -ne 0 ] && [ "$F1_RC" -ne 3 ] && [ -z "$F1_ERR" ]; then
       F1_ERR="node crashed (exit $F1_RC): relay pending gave no reason"

@@ -57,7 +57,8 @@ const APPROVED_ROOTS = [
   "/var/folders", // macOS test tmpdirs
 ];
 
-function isPathUnderApprovedRoot(resolved: string): boolean {
+/** Exported so `relay pending` applies the SAME containment rule (no copy). */
+export function isPathUnderApprovedRoot(resolved: string): boolean {
   return APPROVED_ROOTS.some((root) => {
     const rootResolved = path.resolve(root);
     return resolved === rootResolved || resolved.startsWith(rootResolved + path.sep);

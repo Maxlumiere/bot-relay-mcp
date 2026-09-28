@@ -563,13 +563,15 @@ relay_run_pending() {
 # INSTALLED timeout (src/agent-cli-profiles.ts is the source of truth; each hook
 # declares it as RELAY_HOOK_BUDGET_SECS, and a test holds the two equal). The
 # deadline is what is LEFT of it (minus what this hook already spent, $SECONDS)
-# minus a 2s margin to report the failure, so the harness never kills the hook
-# before it can say why. RELAY_PENDING_TIMEOUT_SECS may only shorten it. At least 1.
+# minus a 3s margin to report the failure (SECONDS truncates, so up to 1s spent
+# is unseen, and the watchdog's 1s KILL grace comes on top), so the harness never
+# kills the hook before it can say why. RELAY_PENDING_TIMEOUT_SECS may only
+# shorten it. NO FLOOR: below 1 means there is no time left, and the caller must
+# SKIP the read and say so, never squeeze in a 1s read the harness would kill.
 relay_pending_deadline() {
-  local budget="$1" margin=2 left v
+  local budget="$1" margin=3 left v
   case "$budget" in ''|*[!0-9]*) budget=5 ;; esac
   left=$(( budget - ${SECONDS:-0} - margin ))
-  [ "$left" -lt 1 ] && left=1
   v="${RELAY_PENDING_TIMEOUT_SECS:-}"
   case "$v" in ''|*[!0-9]*) v="" ;; esac
   if [ -n "$v" ] && [ "${#v}" -le 3 ] && [ "$((10#$v))" -ge 1 ] && [ "$((10#$v))" -lt "$left" ]; then

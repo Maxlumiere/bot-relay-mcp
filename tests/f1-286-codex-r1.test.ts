@@ -515,7 +515,9 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
         });
         const secs = Number(d.stdout.trim());
         expect(secs, `${script}: deadline with override "${override}"`).toBeGreaterThanOrEqual(1);
-        expect(secs + 1, `${script}: deadline + at least 1s margin < the installed ${budget}s`).toBeLessThan(budget);
+        // A 3s report margin: SECONDS truncates (up to +1s unseen), and the watchdog's
+        // 1s KILL grace comes on top of the deadline (architect 0c1911a5).
+        expect(secs + 3, `${script}: deadline + the 3s margin fits the installed ${budget}s`).toBeLessThanOrEqual(budget);
       }
     }
   });
@@ -576,4 +578,51 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+// Architect 0c1911a5 (P-a): when the budget is spent, SKIP the read (never floor
+// the deadline to 1s): DEGRADED "relay unreadable: no time budget left (Ns spent
+// before the mail read)".
+describe("#286 P-a — no time budget left: the read is skipped, LOUD, never floored", () => {
+  it("relay_pending_deadline does NOT floor: with the budget spent it reports < 1", () => {
+    const d = spawnSync("bash", ["-c", `. "${path.join(REPO_ROOT, "hooks", "_vault-helpers.sh")}"; SECONDS=8; relay_pending_deadline 10`], { encoding: "utf-8" });
+    expect(Number(d.stdout.trim()), d.stdout).toBeLessThan(1);
+  });
+
+  it("SessionStart: a slow registration spends the budget → the mail read is SKIPPED, DEGRADED 'no time budget left'", () => {
+    const home = path.join(ROOT, "home-pa1");
+    fs.mkdirSync(home, { recursive: true });
+    const dbPath = path.join(home, "relay.db");
+    seedDb(dbPath, "pa1");
+    // A curl that is slow ONCE (the registration), then fails fast.
+    const slow = path.join(ROOT, "slowcurl");
+    fs.mkdirSync(slow, { recursive: true });
+    const once = path.join(ROOT, "slowcurl.once");
+    fs.writeFileSync(path.join(slow, "curl"), `#!/bin/sh\nif [ ! -e "${once}" ]; then : > "${once}"; sleep 8; fi\nexit 7\n`, { mode: 0o755 });
+    const env = baseEnv(home, { RELAY_AGENT_NAME: "pa1", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1" });
+    env.PATH = `${slow}:${env.PATH}`;
+    const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 40_000, input: "", env });
+    expect(r.stdout, r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: no time budget left \(\d+s spent before the mail read\)/);
+  }, 45_000);
+
+  it("PostToolUse: a slow hook stdin spends the 5s budget → SKIPPED, DEGRADED 'no time budget left'", async () => {
+    const home = path.join(ROOT, "home-pa2");
+    fs.mkdirSync(home, { recursive: true });
+    const dbPath = path.join(home, "relay.db");
+    seedDb(dbPath, "pa2");
+    const child = spawn("bash", [PTU_HOOK], { env: baseEnv(home, { RELAY_AGENT_NAME: "pa2", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_HOOK_NOTICE_REMIND_SECS: "0" }) });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    const done = new Promise((r) => child.on("close", r));
+    // A payload that dribbles in for ~2.6s: the stdin reader keeps reading (its idle
+    // limit is 1s), so the time is really spent before the mail read.
+    const parts = ['{"session_id": "pa2", ', '"hook_event_name": ', '"PostToolUse", ', '"tool_name": ', '"Read", ', '"x": 1}'];
+    for (const p of parts) {
+      child.stdin.write(p);
+      await new Promise((r) => setTimeout(r, 520));
+    }
+    child.stdin.end();
+    await done;
+    expect(stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: no time budget left \(\d+s spent before the mail read\)/);
+  }, 30_000);
 });
