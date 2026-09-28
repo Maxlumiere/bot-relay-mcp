@@ -8,7 +8,8 @@
  *   - `relay where --json` and `relay pending --json` report the SAME resolution
  *     (one serializer) on every row where pending answers; where pending refuses,
  *     its exit code is its documented POLICY applied to where's FACTS.
- *   - `--expect-db` is the deploy gate: 0 only for the same DB.
+ *   - `--expect-db`: 0 only for the same DB (the full gate is `relay deploy-gate`,
+ *     tests/adr-0048-deploy-gate.test.ts).
  *   - the daemon RE-CHECKS containment AFTER create (TOCTOU): a parent swapped for
  *     an outside symlink between resolution and open is refused.
  *   - TRIPWIRES (ADR-0046: literal spellings only, a pinned limit): the approved
@@ -102,7 +103,7 @@ describe("ADR-0048 — `relay where` == the resolution `relay pending` embeds (o
   }
 });
 
-describe("ADR-0048 — `relay where --expect-db` is the deploy gate", () => {
+describe("ADR-0048 — `relay where --expect-db`: the same DB, by real path", () => {
   it("the same DB (by real path, through a symlinked alias) → exit 0, WHERE_MATCH", () => {
     const p = path.join(HOME, "real", "relay.db");
     seedDb(p);
@@ -177,57 +178,6 @@ describe("ADR-0048 — tripwires (literal spellings only; the guards are the con
   });
 });
 
-describe("ADR-0048 — the one-step DEPLOY GATE against a real running daemon", () => {
-  it("PASS while the daemon's own environment resolves to the DB it holds; FAIL once it would resolve elsewhere", async () => {
-    const { spawn } = await import("child_process");
-    const { getFreePort } = await import("./_helpers/port.js");
-    const port = await getFreePort();
-    fs.mkdirSync(path.join(RH, "instances", "a"), { recursive: true });
-    fs.mkdirSync(path.join(RH, "instances", "b"), { recursive: true });
-    fs.symlinkSync("a", path.join(RH, "active-instance"));
-    const daemon = spawn(process.execPath, [path.join(REPO_ROOT, "dist", "index.js")], {
-      env: {
-        PATH: process.env.PATH ?? "",
-        HOME,
-        RELAY_TRANSPORT: "http",
-        RELAY_HTTP_PORT: String(port),
-        RELAY_HTTP_HOST: "127.0.0.1",
-        RELAY_CONFIG_PATH: path.join(ROOT, "gate-config.json"),
-        RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),
-      },
-      stdio: ["ignore", "ignore", "ignore"],
-    });
-    const gate = path.join(REPO_ROOT, "scripts", "adr0048-deploy-gate.sh");
-    try {
-      const t0 = Date.now();
-      let up = false;
-      while (!up && Date.now() - t0 < 10_000) {
-        try {
-          up = (await fetch(`http://127.0.0.1:${port}/health`)).ok;
-        } catch {
-          await new Promise((r) => setTimeout(r, 100));
-        }
-      }
-      expect(up, "precondition: the daemon is up").toBe(true);
-      const pass = spawnSync("bash", [gate, "--pid", String(daemon.pid)], { encoding: "utf-8", timeout: 30_000 });
-      expect(pass.status, pass.stdout + pass.stderr).toBe(0);
-      expect(pass.stdout).toContain(path.join("instances", "a", "relay.db"));
-      expect(pass.stdout).toMatch(/DEPLOY GATE: PASS/);
-
-      // Someone re-points the marker before the restart: the restart would MOVE
-      // the daemon to instance b. The gate must catch it.
-      fs.unlinkSync(path.join(RH, "active-instance")); // a dangling symlink: unlink, not rm
-      fs.symlinkSync("b", path.join(RH, "active-instance"));
-      const failRun = spawnSync("bash", [gate, "--pid", String(daemon.pid)], { encoding: "utf-8", timeout: 30_000 });
-      expect(failRun.status, failRun.stdout + failRun.stderr).toBe(1);
-      expect(failRun.stderr).toMatch(/DEPLOY GATE: FAIL/);
-      expect(failRun.stdout + failRun.stderr).toMatch(/WHERE_MISMATCH/);
-    } finally {
-      daemon.kill("SIGKILL");
-    }
-  }, 60_000);
-});
-
 describe("ADR-0048 Q2 — `relay doctor` PRINTS the resolver error (never a crash, never a guess)", () => {
   it("an ambiguous home → FAIL 'instance resolution' with the reason, exit 1, no stack trace", () => {
     fs.mkdirSync(path.join(RH, "instances", "x"), { recursive: true });
@@ -235,6 +185,25 @@ describe("ADR-0048 Q2 — `relay doctor` PRINTS the resolver error (never a cras
     expect(r.status).toBe(1);
     expect(r.stdout).toMatch(/FAIL instance resolution: .*ambiguous/);
     expect(r.stdout + r.stderr).not.toMatch(/\n\s+at /);
+  });
+  const IS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
+  it.skipIf(IS_ROOT)("Codex #287 P2-8: explicit DB + an UNREADABLE marker (mode 000) → the doctor REPORTS it (config FAIL), never crashes", () => {
+    const db = path.join(HOME, "explicit", "relay.db");
+    seedDb(db);
+    fs.mkdirSync(RH, { recursive: true });
+    const marker = path.join(RH, "active-instance");
+    fs.writeFileSync(marker, "work");
+    fs.chmodSync(marker, 0o000);
+    try {
+      const r = relay(["doctor"], { RELAY_HTTP_PORT: "1", RELAY_DB_PATH: db });
+      expect(r.stdout, r.stderr).toMatch(/=== relay doctor ===/);
+      expect(r.stdout).toMatch(/PASS instance resolution: explicit DB/);
+      expect(r.stdout).toMatch(/FAIL config\.json: .*EACCES/);
+      expect(r.status).toBe(1);
+      expect(r.stdout + r.stderr).not.toMatch(/\n\s+at /);
+    } finally {
+      fs.chmodSync(marker, 0o600);
+    }
   });
   it("TWIN: a resolvable home → PASS 'instance resolution' naming the DB", () => {
     seedDb(path.join(RH, "relay.db"));

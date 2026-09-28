@@ -113,6 +113,32 @@ export function isMultiInstanceMode(): boolean {
 const INSTANCE_ID_RE = /^[A-Za-z0-9._-]+$/;
 
 /**
+ * EVERY environment variable resolveInstance() reads, directly or through the
+ * approved roots (os.homedir() is HOME). The deploy gate (src/deploy-gate.ts)
+ * hands the NEW resolver exactly these keys from the running daemon's
+ * environment and prints no other. A contract test holds this list equal to the
+ * env reads in src/instance.ts + src/approved-roots.ts, so a new read cannot be
+ * missed by the gate. (RELAY_CONFIG_PATH moves the config file, not the DB.)
+ */
+export const RESOLVER_ENV_KEYS = ["HOME", "RELAY_HOME", "RELAY_DB_PATH", "RELAY_INSTANCE_ID", "RELAY_ALLOW_LEGACY_FALLBACK"] as const;
+
+/**
+ * Why `id` is not a usable instance id, or null when it is. The charset alone
+ * admits "." and "..", which path.join collapses onto instances/ itself or onto
+ * the relay home (whose relay.db is the FLAT DB, then mislabeled an instance), so
+ * they are refused by name, and the joined directory must be a DIRECT child of
+ * instances/.
+ */
+function instanceIdFault(id: string): string | null {
+  if (!INSTANCE_ID_RE.test(id)) return `it must match ${INSTANCE_ID_RE}`;
+  if (id === "." || id === "..") return `"${id}" is a path step, not a name`;
+  if (path.dirname(path.resolve(instancesRoot(), id)) !== path.resolve(instancesRoot())) {
+    return "it does not name a direct child of the instances directory";
+  }
+  return null;
+}
+
+/**
  * ADR-0048 — the ONE instance resolver. Every caller uses it; it reports FACTS and
  * callers own POLICY. A CLOSED result:
  *   - explicit-db : --db-path (opts.dbPath) or RELAY_DB_PATH;
@@ -149,7 +175,8 @@ export function resolveInstance(opts: { dbPath?: string; ignoreDbPathEnv?: boole
   }
   const envId = process.env.RELAY_INSTANCE_ID;
   if (envId) {
-    if (!INSTANCE_ID_RE.test(envId)) return failed(`RELAY_INSTANCE_ID "${envId}" is invalid: it must match ${INSTANCE_ID_RE}`);
+    const idFault = instanceIdFault(envId);
+    if (idFault) return failed(`RELAY_INSTANCE_ID "${envId}" is invalid: ${idFault}`);
     return placed(path.join(instancesRoot(), envId, "relay.db"), (p, e) => ({
       kind: "instance", id: envId, dbPath: p, exists: e, basis: "RELAY_INSTANCE_ID",
     }));
@@ -185,7 +212,8 @@ export function resolveInstance(opts: { dbPath?: string; ignoreDbPathEnv?: boole
       return failed(`cannot read ${marker} (${code(err)})`);
     }
     if (!id) return failed(`${marker} is empty`);
-    if (!INSTANCE_ID_RE.test(id)) return failed(`${marker} names an invalid instance id "${id}"`);
+    const idFault = instanceIdFault(id);
+    if (idFault) return failed(`${marker} names an invalid instance id "${id}": ${idFault}`);
     return placed(path.join(instancesRoot(), id, "relay.db"), (p, e) => ({
       kind: "instance", id, dbPath: p, exists: e, basis: "active-instance",
     }));
@@ -199,7 +227,12 @@ export function resolveInstance(opts: { dbPath?: string; ignoreDbPathEnv?: boole
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") return failed(`cannot inspect ${instDir} (${code(err)})`);
   }
-  if (instStat && (instStat.isDirectory() || instStat.isSymbolicLink())) {
+  // instances/ present but NOT a directory (or a symlink to one) is corruption,
+  // not a positive absence: it never yields flat.
+  if (instStat && !instStat.isDirectory() && !instStat.isSymbolicLink()) {
+    return failed(`${instDir} exists but is not a directory`);
+  }
+  if (instStat) {
     let dirs: string[];
     try {
       dirs = fs.readdirSync(instDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
@@ -274,11 +307,8 @@ export function resolveActiveInstanceId(): string | null {
 export function instanceDir(instanceId: string | null): string | null {
   if (!instanceId) return null;
   // instance_id is operator-supplied; sanitize to prevent traversal.
-  if (!/^[A-Za-z0-9._-]+$/.test(instanceId)) {
-    throw new Error(
-      `invalid instance_id "${instanceId}" — must match /^[A-Za-z0-9._-]+$/`,
-    );
-  }
+  const idFault = instanceIdFault(instanceId);
+  if (idFault) throw new Error(`invalid instance_id "${instanceId}": ${idFault}`);
   return path.join(instancesRoot(), instanceId);
 }
 

@@ -151,7 +151,7 @@ Every consumer (the daemon, `getDbPath`, `relay pending`, `relay doctor`, `relay
 - **The marker is read once.** The DB path comes from that one read.
 - **Containment uses real paths:** the DB path, after resolving symlinks, must sit under your home directory or a temp directory, so a symlinked parent cannot point it elsewhere. The daemon checks again after creating the DB.
 - **`relay where [--json]`** prints what this environment resolves to. `relay pending --json` embeds the same result. `relay where --expect-db PATH` exits non-zero unless the resolution names that DB.
-- **Before restarting a daemon onto a new build,** run `scripts/adr0048-deploy-gate.sh` (or `--pid PID`). It runs the new build's resolver under the running daemon's own environment, and passes only if it names the DB that daemon has open.
+- **Before restarting a daemon onto a new build,** run `relay deploy-gate` from the new build. It runs the new build's resolver under the environment the restarted daemon will get (on macOS, the loaded launchd job's, checked against the plist file), and passes only if it names the DB the running daemon has open. See [cli.md](./cli.md).
 
 ## v2.4.5 — every transport + hook resolves the same DB
 

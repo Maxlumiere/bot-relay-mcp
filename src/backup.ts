@@ -82,8 +82,13 @@ function getConfigPath(): string {
   return process.env.RELAY_CONFIG_PATH || path.join(os.homedir(), ".bot-relay", "config.json");
 }
 
+/**
+ * The DEFAULT backups directory, <db-dir>/backups, under the same containment
+ * rule as an explicit destination: a symlinked backups dir pointing outside the
+ * approved roots is refused before anything is created, chmod'ed or written.
+ */
 function getBackupsDir(): string {
-  return path.join(path.dirname(getDbPath()), "backups");
+  return assertSafePath(path.join(path.dirname(getDbPath()), "backups"), "backups directory");
 }
 
 function isoTimestamp(): string {

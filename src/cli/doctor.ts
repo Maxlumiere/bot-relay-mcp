@@ -12,7 +12,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { resolveInstanceDbPath, resolveInstanceConfigPath } from "../instance.js";
+import { resolveInstance, resolveInstanceConfigPath } from "../instance.js";
 import { withDeadline } from "../http-deadline.js";
 
 type Status = "PASS" | "WARN" | "FAIL";
@@ -27,16 +27,15 @@ interface CheckResult {
 // Pre-v2.4.5 this hardcoded the legacy ~/.bot-relay/relay.db, which on a
 // per-instance setup printed correct PASS/WARN against the wrong file —
 // hiding the very split-brain doctor exists to surface.
-function getDbPath(): string {
-  return resolveInstanceDbPath();
-}
+// ADR-0048: the paths are resolved ONCE in run() and handed to every check; no
+// check re-resolves (a second resolution could disagree with, or throw after,
+// the first one the report is built on).
 
-function getConfigPath(): string {
-  return resolveInstanceConfigPath();
-}
-
-async function checkConfig(): Promise<CheckResult> {
-  const p = getConfigPath();
+async function checkConfig(configPath: { path: string } | { fault: string }): Promise<CheckResult> {
+  if ("fault" in configPath) {
+    return { name: "config.json", status: "FAIL", detail: `cannot resolve the config path: ${configPath.fault}` };
+  }
+  const p = configPath.path;
   if (!fs.existsSync(p)) {
     return { name: "config.json", status: "WARN", detail: `not present at ${p} (defaults will be used)` };
   }
@@ -133,8 +132,7 @@ export function checkMcpServerPath(claudeJsonPath: string = resolveClaudeJsonPat
   return { name, status: "PASS", detail: `spawn path OK (${scriptPath})` };
 }
 
-async function checkDb(): Promise<CheckResult[]> {
-  const p = getDbPath();
+async function checkDb(p: string): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   if (!fs.existsSync(p)) {
     results.push({ name: "relay.db", status: "WARN", detail: `not present at ${p} (will be created on first run)` });
@@ -163,11 +161,10 @@ async function checkDb(): Promise<CheckResult[]> {
   return results;
 }
 
-function checkPerms(): CheckResult[] {
+function checkPerms(p: string): CheckResult[] {
   if (process.platform === "win32") {
     return [{ name: "file perms", status: "WARN", detail: "Windows NTFS — POSIX mode bits not applicable" }];
   }
-  const p = getDbPath();
   const dir = path.dirname(p);
   const results: CheckResult[] = [];
   if (fs.existsSync(dir)) {
@@ -189,9 +186,8 @@ function checkPerms(): CheckResult[] {
   return results;
 }
 
-async function checkDiskSpace(): Promise<CheckResult> {
+async function checkDiskSpace(p: string): Promise<CheckResult> {
   try {
-    const p = getDbPath();
     const dir = fs.existsSync(path.dirname(p)) ? path.dirname(p) : os.tmpdir();
     // fs.statfsSync exists on Node 18.15+. Best-effort.
     const anyFs = fs as any;
@@ -467,7 +463,6 @@ export async function run(argv: string[]): Promise<number> {
   // ADR-0048: the ONE strict resolver, reported first. On a fault, print it and
   // skip the checks that need a DB path (they would only guess or crash); the
   // daemon refuses to start on this same result.
-  const { resolveInstance } = await import("../instance.js");
   const resolution = resolveInstance();
   if (resolution.kind === "error") {
     results.push({ name: "instance resolution", status: "FAIL", detail: resolution.reason });
@@ -483,10 +478,18 @@ export async function run(argv: string[]): Promise<number> {
       status: resolution.kind === "flat" && resolution.warning ? "WARN" : "PASS",
       detail: `${who} ${resolution.dbPath}${resolution.kind === "flat" && resolution.warning ? ` — ${resolution.warning}` : ""}`,
     });
-    results.push(await checkConfig());
-    results.push(...(await checkDb()));
-    results.push(...checkPerms());
-    results.push(await checkDiskSpace());
+    // The config path comes from the instance part alone (RELAY_DB_PATH does not
+    // move it), which can fault on its own: reported as a FAIL, never thrown.
+    let configPath: { path: string } | { fault: string };
+    try {
+      configPath = { path: resolveInstanceConfigPath() };
+    } catch (err) {
+      configPath = { fault: err instanceof Error ? err.message : String(err) };
+    }
+    results.push(await checkConfig(configPath));
+    results.push(...(await checkDb(resolution.dbPath)));
+    results.push(...checkPerms(resolution.dbPath));
+    results.push(await checkDiskSpace(resolution.dbPath));
   }
   results.push(await checkDaemon());
   results.push(checkHooks());

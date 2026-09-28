@@ -11,11 +11,13 @@ Every process picked its relay DB through helpers that swallowed file-system err
 - **The marker is read once.**
 - **Containment uses real paths:** a DB path whose parent is a symlink out of your home and temp directories is refused. Before, only the literal path was checked. The daemon checks again after it creates the DB. This one rule replaces three copies (the DB, backup destinations, config validation).
 - **`relay where`** prints what this environment resolves to. `relay pending --json` includes the same `resolution`.
-- **Deploy gate:** `relay where --expect-db PATH`, and `scripts/adr0048-deploy-gate.sh` for a running daemon.
+- **Deploy gate:** `relay deploy-gate`, run from the new build before a daemon restart. It passes only when the new resolver, given the environment the restarted daemon will get, names the DB the running daemon holds open. On macOS that environment comes from the loaded launchd job and must match the plist file. Only the resolver's variables are printed (`relay where --env-keys`). Exit 0 PASS, 1 FAIL, 3 CANNOT-VERIFY.
+- **Refused, not guessed:** an instance id `.` or `..`, an `instances` path that is a file, a DB path through a dangling symlink that points outside the approved roots, and a default backups directory that is a symlink out of them. Path containment compares the real, on-disk spelling, so a differently-cased path on a case-insensitive disk is accepted.
 
 Tests:
 - `tests/adr-0048-resolve-instance.test.ts`: the state table, with fault injection per row; two-sided (every fault is an error, and every positive absence is still flat).
-- `tests/adr-0048-where-contract.test.ts`: `where` equals `pending`; the gate against a real daemon; the re-check after create; `relay doctor`.
+- `tests/adr-0048-where-contract.test.ts`: `where` equals `pending`; the re-check after create; `relay doctor`.
+- `tests/adr-0048-deploy-gate.test.ts`: the gate's outcomes with injected system reads (forged and malformed launchd output, plist drift, a wrong listener, Linux), and one run against a real daemon.
 
 ### Fixed — session start showed encrypted mail as ciphertext; it now delivers pending mail through `relay pending`, decrypted, in drain order, with an honest count
 

@@ -64,7 +64,18 @@ const touch = (p: string) => {
 };
 const errno = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
 /** Make fs.<fn> throw `code` for any path matching `match` (the n-th call onward). */
-function fault(fn: "lstatSync" | "readlinkSync" | "readFileSync" | "readdirSync" | "realpathSync" | "statSync", match: (p: string) => boolean, code: string, fromCall = 1) {
+function fault(fn: "lstatSync" | "readlinkSync" | "readFileSync" | "readdirSync" | "realpathSync.native" | "statSync", match: (p: string) => boolean, code: string, fromCall = 1) {
+  if (fn === "realpathSync.native") {
+    const realNative = fs.realpathSync.native.bind(fs.realpathSync);
+    let m = 0;
+    return vi.spyOn(fs.realpathSync, "native").mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (match(String(p))) {
+        m++;
+        if (m >= fromCall) throw errno(code);
+      }
+      return (realNative as (...a: unknown[]) => string)(p, ...rest);
+    }) as never);
+  }
   const real = (fs as unknown as Record<string, (...a: unknown[]) => unknown>)[fn].bind(fs);
   let n = 0;
   return vi.spyOn(fs, fn as never).mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
@@ -211,7 +222,7 @@ describe("ADR-0048 — every FAULT is `error`, never flat", () => {
       const p = path.join(HOME, "x", "relay.db");
       touch(p);
       process.env.RELAY_DB_PATH = p;
-      fault("realpathSync", (q) => q === p || q === path.dirname(p), code);
+      fault("realpathSync.native", (q) => q === p || q === path.dirname(p), code);
       isError(inst.resolveInstance());
     });
   }
@@ -299,5 +310,80 @@ describe("ADR-0048 — consumers are strict: no fault reaches the flat DB throug
     expect(inst.resolveInstanceConfigPath()).toBe(path.join(RH, "instances", "a", "config.json"));
     fault("readlinkSync", (p) => p.endsWith("active-instance"), "EIO");
     expect(() => inst.resolveInstanceConfigPath()).toThrow(/EIO/);
+  });
+});
+
+// --- Codex #287 round 1 -------------------------------------------------------------
+describe("Codex #287 R1 — P1-1/P1-2: no corruption or id trick reaches the flat DB", () => {
+  it("P1-1: no marker and `instances` is a regular FILE → error (corruption is not a positive absence)", () => {
+    fs.mkdirSync(RH, { recursive: true });
+    fs.writeFileSync(path.join(RH, "instances"), "not a directory");
+    touch(flatDb());
+    const r = inst.resolveInstance();
+    expect(r).toMatchObject({ kind: "error" });
+    // Pinned: the explicit guard says what is wrong (not a downstream ENOTDIR).
+    if (r.kind === "error") expect(r.reason).toMatch(/exists but is not a directory/);
+  });
+  for (const id of ["..", "."]) {
+    it(`P1-2: RELAY_INSTANCE_ID="${id}" → error (never the relay home's own relay.db labeled "instance")`, () => {
+      process.env.RELAY_INSTANCE_ID = id;
+      const r = inst.resolveInstance();
+      expect(r).toMatchObject({ kind: "error" });
+      if (r.kind === "error") expect(r.reason).toMatch(/is a path step, not a name/);
+    });
+    it(`P1-2: a marker naming "${id}" → error`, () => {
+      fs.mkdirSync(RH, { recursive: true });
+      fs.writeFileSync(path.join(RH, "active-instance"), id);
+      const r = inst.resolveInstance();
+      expect(r).toMatchObject({ kind: "error" });
+      if (r.kind === "error") expect(r.reason).toMatch(/is a path step, not a name/);
+    });
+    it(`P1-2: instanceDir("${id}") throws (the layout helper refuses it too)`, () => {
+      expect(() => inst.instanceDir(id)).toThrow();
+    });
+  }
+});
+
+describe("Codex #287 R1 — P1-3: a component that EXISTS as a symlink is never 'absent'", () => {
+  it("a DANGLING DB symlink pointing OUTSIDE the roots → error (its target is contained, not its name)", () => {
+    fs.symlinkSync(path.join(OUTSIDE, "new.db"), path.join(HOME, "db.sqlite"));
+    process.env.RELAY_DB_PATH = path.join(HOME, "db.sqlite");
+    expect(inst.resolveInstance()).toMatchObject({ kind: "error" });
+  });
+  it("a DANGLING ANCESTOR symlink pointing outside → error", () => {
+    fs.symlinkSync(path.join(OUTSIDE, "missing-dir"), path.join(HOME, "link"));
+    process.env.RELAY_DB_PATH = path.join(HOME, "link", "relay.db");
+    expect(inst.resolveInstance()).toMatchObject({ kind: "error" });
+  });
+  it("TWIN: a dangling symlink whose target stays INSIDE → accepted, not exists", () => {
+    fs.symlinkSync(path.join(HOME, "inside", "new.db"), path.join(HOME, "db2.sqlite"));
+    process.env.RELAY_DB_PATH = path.join(HOME, "db2.sqlite");
+    expect(inst.resolveInstance()).toMatchObject({ kind: "explicit-db", exists: false });
+  });
+  it("WASM driver: the daemon refuses the dangling outside symlink, and NOTHING is created outside", async () => {
+    const saved = { HOME: process.env.HOME, D: process.env.RELAY_SQLITE_DRIVER };
+    fs.symlinkSync(path.join(OUTSIDE, "wasm.db"), path.join(HOME, "wasm.sqlite"));
+    process.env.RELAY_DB_PATH = path.join(HOME, "wasm.sqlite");
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const db = await import("../src/db.js");
+    db.closeDb();
+    try {
+      await expect(db.initializeDb()).rejects.toThrow(/outside the approved roots/);
+      expect(fs.existsSync(path.join(OUTSIDE, "wasm.db")), "no DB was created outside the roots").toBe(false);
+    } finally {
+      db.closeDb();
+      if (saved.D === undefined) delete process.env.RELAY_SQLITE_DRIVER;
+      else process.env.RELAY_SQLITE_DRIVER = saved.D;
+    }
+  });
+});
+
+describe("Codex #287 R1 — P2-9: the containment compare uses canonical REAL paths", () => {
+  const caseInsensitive = fs.existsSync(ROOT.toUpperCase());
+  it.skipIf(!caseInsensitive)("a case variant of a real path under the roots is ACCEPTED on a case-insensitive volume (macOS APFS)", () => {
+    const p = path.join(HOME, "casey", "relay.db");
+    touch(p);
+    process.env.RELAY_DB_PATH = p.toUpperCase();
+    expect(inst.resolveInstance()).toMatchObject({ kind: "explicit-db", exists: true });
   });
 });
