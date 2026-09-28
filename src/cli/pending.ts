@@ -16,8 +16,11 @@
  * get_messages(pending, peek, since='all') ids, pinned by tests/f1-relay-pending.test.ts.
  *
  * READ-ONLY BY CONSTRUCTION: the handle is opened `readonly: true`, so even an
- * accidental write fails at the driver. Unlike a get_messages peek it stamps no
- * `seq`, because it observes no message. DB-direct: works with the daemon down.
+ * accidental write fails at the driver: NO LOGICAL WRITES (no row, seq, read-mark,
+ * inbox_events or last_drain_at change; the main DB file is byte-identical after
+ * a run). It is not zero filesystem activity: SQLite may create the WAL sidecar
+ * files (-wal, -shm), as any reader of a WAL database does. Unlike a
+ * get_messages peek it stamps no `seq`, because it observes no message. DB-direct: works with the daemon down.
  *
  * SILENCE IS NEVER SUCCESS: exit 0 with `count: 0` means VERIFIED empty. Anything
  * that prevents a verified answer (no DB, not a relay DB, corrupt, locked, an
@@ -28,6 +31,7 @@
  * must never be taken as a reason to go remote (the F1 mode rule).
  */
 import fs from "fs";
+import path from "path";
 
 /** Exit code for "no local relay instance is configured or present here" (never "could not read"). */
 export const EXIT_NO_LOCAL = 3;
@@ -35,7 +39,34 @@ export const EXIT_NO_LOCAL = 3;
 export type PendingSource =
   | { kind: "local"; dbPath: string; basis: string }
   | { kind: "no-local"; reason: string }
-  | { kind: "ambiguous"; reason: string };
+  | { kind: "ambiguous"; reason: string }
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * POSITIVE absence only: true = present, false = VERIFIED absent (ENOENT). Any
+ * other error (EACCES, EIO, ...) throws: a place that cannot be read is not an
+ * empty one. The shared instance helpers swallow such errors by design (the
+ * connector relies on that), so the source decision below never trusts their
+ * fallbacks for existence; it probes for itself.
+ */
+function verifiedExists(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return false;
+    throw new Error(`cannot inspect ${p} (${code ?? (err instanceof Error ? err.message : String(err))})`);
+  }
+}
+
+/** The CLI's handle: READ-ONLY at the driver, so a write through it throws (SQLITE_READONLY). */
+export async function openPendingDb(dbPath: string): Promise<import("../sqlite-compat.js").CompatDatabase> {
+  const Better = (await import("better-sqlite3")).default;
+  const db = new Better(dbPath, { readonly: true, fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
+  db.pragma("busy_timeout = 1000");
+  return db;
+}
 
 /**
  * WHERE the answer comes from — decided here, from the connector's own resolver
@@ -51,9 +82,12 @@ export type PendingSource =
  *      exactly as the connector's assertInstanceResolution refuses it: a quiet
  *      read of the flat DB there is the nine-day silent-loss shape.
  *   4. nothing → "no-local" (exit 3).
+ * Steps 3-4 decide on POSITIVE evidence only (verifiedExists): an fs error on
+ * the relay root, the marker or instances/ is "unreadable" (exit 1), never an
+ * absence that falls through to the flat DB or to exit 3.
  */
 export async function resolvePendingSource(dbPathFlag: string | null): Promise<PendingSource> {
-  const { resolveInstanceDbPath, resolveActiveInstanceId, describeInstanceResolution } = await import("../instance.js");
+  const { resolveInstanceDbPath, resolveActiveInstanceId, botRelayRoot } = await import("../instance.js");
   if (dbPathFlag) return { kind: "local", dbPath: dbPathFlag, basis: "--db-path" };
   if (process.env.RELAY_DB_PATH) return { kind: "local", dbPath: process.env.RELAY_DB_PATH, basis: "RELAY_DB_PATH" };
   if (process.env.RELAY_INSTANCE_ID) {
@@ -65,18 +99,46 @@ export async function resolvePendingSource(dbPathFlag: string | null): Promise<P
       reason: "a remote relay is configured (RELAY_HTTP_HOST) and no local instance is configured explicitly",
     };
   }
-  const res = describeInstanceResolution();
-  if (res.legacyFallback) {
+  const root = botRelayRoot();
+  const flatDb = path.join(root, "relay.db");
+  let marker = false;
+  let instanceDirs = false;
+  let legacy = false;
+  try {
+    if (!verifiedExists(root)) {
+      return { kind: "no-local", reason: `no local relay instance here (no relay home at ${root})` };
+    }
+    marker = verifiedExists(path.join(root, "active-instance"));
+    const instances = path.join(root, "instances");
+    // The listing matters only when no marker names the instance.
+    if (!marker && verifiedExists(instances)) {
+      instanceDirs = fs.readdirSync(instances, { withFileTypes: true }).some((e) => e.isDirectory());
+    }
+    legacy = verifiedExists(flatDb);
+  } catch (err) {
+    return {
+      kind: "unreadable",
+      reason:
+        `cannot tell whether a local relay instance exists: ${err instanceof Error ? err.message : String(err)}. ` +
+        `A place that cannot be read is not an empty one.`,
+    };
+  }
+  if (marker) {
+    if (!resolveActiveInstanceId()) {
+      return { kind: "unreadable", reason: `the active-instance marker under ${root} exists but could not be read` };
+    }
+    return { kind: "local", dbPath: resolveInstanceDbPath(), basis: "active-instance" };
+  }
+  if (instanceDirs) {
     return {
       kind: "ambiguous",
       reason:
         `instance resolution is ambiguous: this machine has relay instances, but none is selected ` +
-        `(set RELAY_INSTANCE_ID, or run \`relay use-instance <id>\`). Refusing to read the flat DB ${res.dbPath}.`,
+        `(set RELAY_INSTANCE_ID, or run \`relay use-instance <id>\`). Refusing to read the flat DB ${flatDb}.`,
     };
   }
-  if (resolveActiveInstanceId()) return { kind: "local", dbPath: res.dbPath, basis: "active-instance" };
-  if (fs.existsSync(res.dbPath)) return { kind: "local", dbPath: res.dbPath, basis: "legacy DB file" };
-  return { kind: "no-local", reason: `no local relay instance here (nothing at ${res.dbPath}, no active instance)` };
+  if (legacy) return { kind: "local", dbPath: flatDb, basis: "legacy DB file" };
+  return { kind: "no-local", reason: `no local relay instance here (nothing at ${flatDb}, no active instance)` };
 }
 
 interface Args {
@@ -175,7 +237,7 @@ export async function run(argv: string[]): Promise<number> {
     process.stderr.write(`PENDING_NO_LOCAL: ${source.reason}\n`);
     return EXIT_NO_LOCAL;
   }
-  if (source.kind === "ambiguous") return pendingFailed(source.reason);
+  if (source.kind === "ambiguous" || source.kind === "unreadable") return pendingFailed(source.reason);
   const dbPath = source.dbPath;
   if (!fs.existsSync(dbPath)) {
     return pendingFailed(`no relay DB at ${dbPath} (${source.basis}) — cannot answer (this is NOT "no mail")`);
@@ -183,9 +245,7 @@ export async function run(argv: string[]): Promise<number> {
 
   let db: import("../sqlite-compat.js").CompatDatabase | null = null;
   try {
-    const Better = (await import("better-sqlite3")).default;
-    db = new Better(dbPath, { readonly: true, fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
-    db.pragma("busy_timeout = 1000");
+    db = await openPendingDb(dbPath);
 
     const { pendingSchemaGap, pendingMetadata } = await import("../db.js");
     const gap = pendingSchemaGap(db);

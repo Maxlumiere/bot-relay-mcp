@@ -67,7 +67,7 @@ export function shellSingleQuoteEscape(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-function botRelayRoot(): string {
+export function botRelayRoot(): string {
   // RELAY_HOME env var is a test-friendly override that lets a suite
   // point the whole per-instance namespace at a tmp dir without
   // touching the operator's real $HOME. Production operators leave

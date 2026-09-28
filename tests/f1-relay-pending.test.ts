@@ -26,6 +26,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -377,5 +378,78 @@ describe("F1 — the source: explicit config outranks ambient signals; no local 
     expect(lines.length, r.stderr).toBe(1);
     expect(lines[0]).toMatch(/schema too old/);
     expect(lines[0]).toMatch(/[Rr]emedy:/);
+  });
+
+  // Codex #285 round 1, P1. The instance helpers swallow fs errors, so an
+  // UNREADABLE place looked like an EMPTY one: a quiet fallback to the flat DB
+  // (a "verified" count 0), or "no local instance" (exit 3). Only a POSITIVELY
+  // verified absence (ENOENT) may fall through; any other error is exit 1.
+  function withMode<T>(p: string, mode: number, fn: () => T): T {
+    fs.chmodSync(p, mode);
+    try {
+      return fn();
+    } finally {
+      fs.chmodSync(p, 0o755);
+    }
+  }
+
+  it("P1: instances/ UNREADABLE (EACCES), no marker, a readable legacy DB holding the agent → exit 1, NEVER a verified 0", () => {
+    copyDbTo(path.join(RHOME, "instances", "inst-x", "relay.db"));
+    copyDbTo(path.join(RHOME, "relay.db"));
+    const r = withMode(path.join(RHOME, "instances"), 0o000, () => bare(R, {}));
+    expect(r.status, r.stdout + r.stderr).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/PENDING_FAILED/);
+  });
+
+  it("P1: the relay root UNREADABLE (EACCES) → exit 1, NEVER exit 3 (no local instance)", () => {
+    copyDbTo(path.join(RHOME, "relay.db"));
+    const r = withMode(RHOME, 0o000, () => bare(R, {}));
+    expect(r.status, r.stdout + r.stderr).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/PENDING_FAILED/);
+  });
+
+  it("P1 TWIN: a relay root that does not exist at all (ENOENT) is still exit 3", () => {
+    fs.rmSync(RHOME, { recursive: true, force: true });
+    noLocal(bare(R, {}));
+  });
+
+  it("P1 TWIN: an unreadable instances/ WITH an active marker still answers from the marked instance", () => {
+    copyDbTo(path.join(RHOME, "instances", "inst-y", "relay.db"));
+    fs.symlinkSync("inst-y", path.join(RHOME, "active-instance"));
+    // The marker names the instance: the directory listing is not needed.
+    const r = withMode(path.join(RHOME, "instances"), 0o311, () => bare(R, {}));
+    answered(r);
+  });
+});
+
+// Codex #285 round 1, P2. readonly:true means NO LOGICAL WRITE, and a write
+// through the handle fails at the driver. It does not mean zero filesystem
+// activity: SQLite may create the WAL sidecars (-wal, -shm) for any reader. The
+// claim is narrowed to what holds, and pinned at the byte level.
+describe("F1 — read-only: no logical write, and the main DB file is byte-identical", () => {
+  const sha = (p: string) => createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+
+  it("a run leaves the MAIN DB file byte-identical (cleanly closed WAL DB: the case that creates sidecars)", () => {
+    seed();
+    db.closeDb(); // checkpoint + close: the cleanly-closed WAL state
+    const before = sha(DB);
+    const r = pending([R, "--json"]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).count).toBeGreaterThan(0);
+    expect(sha(DB)).toBe(before);
+    db.getDb();
+  });
+
+  it("the CLI's own handle refuses a planted write at the driver (removing `readonly` turns this red)", async () => {
+    seed();
+    const { openPendingDb } = await import("../src/cli/pending.js");
+    const h = await openPendingDb(DB);
+    try {
+      expect(() => h.prepare("UPDATE messages SET seq = 1").run()).toThrow(/readonly/i);
+    } finally {
+      h.close();
+    }
   });
 });
