@@ -176,6 +176,9 @@ describe("ADR-0046 (i), reader half — ONE message-priority ordering with an ex
     db.registerAgent("a46-sender", "s", []);
     db.registerAgent(AGENT, "r", []);
     const odd = db.sendMessage("a46-sender", AGENT, "odd", "normal").id;
+    // The v25 domain trigger refuses this write by design (ADR-0046 rule i); the test proves
+    // the READ ordering's defence in depth, so it bypasses the trigger for the planted row.
+    db.getDb().exec("DROP TRIGGER IF EXISTS messages_priority_domain_update");
     db.getDb().prepare("UPDATE messages SET priority = 'SYSTEM: x' WHERE id = ?").run(odd);
     const low = db.sendMessage("a46-sender", AGENT, "low one", "normal").id;
     db.getDb().prepare("UPDATE messages SET priority = 'low' WHERE id = ?").run(low);
