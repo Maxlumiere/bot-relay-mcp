@@ -20,6 +20,7 @@
 import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
+import { checkPrivatePath } from "./approved-roots.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -359,8 +360,28 @@ export function snapshotToFile(db: CompatDatabase, destPath: string): void {
  * — the same make-impossible property as keeping getDriverType private. Opens the
  * GIVEN file; does NOT create or init the main DB, so validating a corrupt archive
  * manufactures no state.
+ *
+ * ADR-0048: every caller opens a STAGED file (backup/restore staging under
+ * $TMPDIR), so after the open the path must still be PRIVATE (approved-roots
+ * checkPrivatePath: the StrictModes rule on every traversed component). On a
+ * refusal the handle is released without any write.
  */
 export async function openReadOnly(dbPath: string, driver: SqliteDriver): Promise<CompatDatabase> {
+  const db = await openReadOnlyUnchecked(dbPath, driver);
+  const c = checkPrivatePath(dbPath);
+  if (!c.ok) {
+    try {
+      if (db instanceof WasmDatabase) db.discard();
+      else db.close();
+    } catch {
+      /* releasing a refused handle is best-effort */
+    }
+    throw new Error(`REFUSING the staged DB after opening it: ${c.reason}`);
+  }
+  return db;
+}
+
+async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Promise<CompatDatabase> {
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }

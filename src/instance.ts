@@ -301,6 +301,20 @@ export function resolveActiveInstanceId(): string | null {
 }
 
 /**
+ * The names of the instance DIRECTORIES under instances/ (empty when it does not
+ * exist). Throws on any other error. For init's warning; selection goes through
+ * resolveInstance.
+ */
+export function instanceDirNames(): string[] {
+  try {
+    return fs.readdirSync(instancesRoot(), { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+}
+
+/**
  * Compute the per-instance directory. Returns null in single-instance
  * mode so callers can short-circuit to the legacy flat layout.
  */

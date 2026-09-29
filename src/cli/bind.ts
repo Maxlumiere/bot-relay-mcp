@@ -175,13 +175,11 @@ export async function run(argv: string[]): Promise<number> {
 
   // --- the DB: raw handle, busy_timeout only, NO applySchemaSetup ----------
   if (args.dbPath) process.env.RELAY_DB_PATH = args.dbPath;
-  if (!process.env.RELAY_DB_PATH) {
-    try {
-      const { resolveInstanceDbPath } = await import("../instance.js");
-      process.env.RELAY_DB_PATH = resolveInstanceDbPath();
-    } catch (err) {
-      return bindFailed(`could not resolve the relay DB path: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  {
+    // ADR-0048: the ONE strict resolver (RELAY_DB_PATH included: containment).
+    const { pinResolvedDbPath } = await import("./_instance-db.js");
+    const resolveFault = await pinResolvedDbPath();
+    if (resolveFault) return bindFailed(`instance resolution failed: ${resolveFault}`);
   }
   const dbPath = process.env.RELAY_DB_PATH as string;
   if (!fs.existsSync(dbPath)) {
@@ -191,8 +189,10 @@ export async function run(argv: string[]): Promise<number> {
   const anchor = { hostId, windowPid: anchorRes.anchor.pid, windowPidStart: anchorRes.anchor.startedAt };
   let db: import("../sqlite-compat.js").CompatDatabase;
   try {
-    const Better = (await import("better-sqlite3")).default;
-    db = new Better(dbPath, { fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
+    // ADR-0048: the raw handle gets db.ts's post-open re-check (one function)
+    // BEFORE anything runs on it (it is writable).
+    const { openRawRelayDb } = await import("./_instance-db.js");
+    db = await openRawRelayDb(dbPath, { readonly: false });
     // MODEST, and deliberately not 5000 (audit, codex-5-5). This value governs
     // the statements OUTSIDE the writer's retry loop — the schema probe and
     // `--end`. Those are precisely the ones that CAN sit in SQLite's own busy

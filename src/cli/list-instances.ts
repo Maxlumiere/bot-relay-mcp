@@ -45,12 +45,22 @@ export async function run(argv: string[]): Promise<number> {
     }
   }
   const instances = listInstances();
-  const active = resolveActiveInstanceId();
+  // ADR-0048: the resolver may report a fault (e.g. instances but none selected).
+  // This verb is how that is FIXED, so it still lists and names the fault, but a
+  // fault is never a success: the exit is non-zero (1) whenever one was caught.
+  let active: string | null = null;
+  let resolutionError: string | null = null;
+  try {
+    active = resolveActiveInstanceId();
+  } catch (err) {
+    resolutionError = err instanceof Error ? err.message : String(err);
+  }
   if (asJson) {
     process.stdout.write(
       JSON.stringify(
         {
           active_instance_id: active,
+          ...(resolutionError ? { resolution_error: resolutionError } : {}),
           instances: instances.map((m) => ({
             ...m,
             active: m.instance_id === active,
@@ -60,9 +70,18 @@ export async function run(argv: string[]): Promise<number> {
         2,
       ) + "\n",
     );
-    return 0;
+    return resolutionError ? 1 : 0;
   }
   if (instances.length === 0) {
+    if (resolutionError) {
+      // No instance directories, yet the resolution FAILED (for example an invalid
+      // RELAY_INSTANCE_ID): the legacy flat DB is NOT what is active.
+      process.stdout.write(
+        `No instances registered, and instance resolution FAILED: ${resolutionError}\n` +
+          "Fix the cause (unset or correct RELAY_INSTANCE_ID, or check ~/.bot-relay), then run `relay doctor`.\n",
+      );
+      return 1;
+    }
     process.stdout.write(
       "No instances registered. Single-instance legacy mode is active.\n" +
       "Run `relay init --instance-id=<uuid>` to create a per-instance setup.\n",
@@ -89,6 +108,13 @@ export async function run(argv: string[]): Promise<number> {
       pad(m.daemon_version_first_seen, colVersion) +
       m.created_at + "\n",
     );
+  }
+  if (resolutionError) {
+    process.stdout.write(
+      `\nNo instance is resolved: ${resolutionError}\n` +
+        "Fix: relay use-instance <INSTANCE_ID> (or set RELAY_INSTANCE_ID).\n",
+    );
+    return 1;
   }
   return 0;
 }
