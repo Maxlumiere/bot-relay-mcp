@@ -136,15 +136,9 @@ if ! relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$'; then
   exit 0
 fi
 
-# v2.6.1 — vault hydration. If the env-supplied RELAY_AGENT_TOKEN is empty
-# but a valid token sits in the vault for this agent, use it for the remote
-# read and the liveness self-heal. The local read needs no token.
-if [ -z "$AGENT_TOKEN" ]; then
-  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
-    AGENT_TOKEN="$VAULT_TOKEN"
-    export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
-  fi
-fi
+# v2.6.1 — vault hydration: relay_hydrate_token (below) runs AFTER the mail read,
+# because the vault sits beside the resolved DB (ADR-0048) and only the remote
+# read and the liveness self-heal need a token. The local read needs none.
 
 if ! relay_whole_match "$HTTP_HOST" '^[A-Za-z0-9_.:-]{1,253}$'; then
   exit 0
@@ -576,6 +570,21 @@ notice_is_damped() {
   [ $((now - last)) -lt "$window" ]
 }
 
+# If the env-supplied RELAY_AGENT_TOKEN is empty but a valid token sits in the
+# vault for this agent, use it. The vault is beside the RESOLVED DB: the caller
+# has loaded the resolution first (relay_res_set_db from the mail read, or
+# relay_where_load for the remote path). Best-effort: no token just means the
+# token-needing step is skipped, as before.
+relay_hydrate_token() {
+  [ -n "$AGENT_TOKEN" ] && return 0
+  local t
+  if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+    AGENT_TOKEN="$t"
+    export RELAY_AGENT_TOKEN="$t"
+  fi
+  return 0
+}
+
 # Records "notified" by writing the fingerprint atomically; the file's mtime is
 # the notice time. Best-effort: a failure here only means the next call notifies.
 record_notice() {
@@ -681,6 +690,11 @@ case "$F1_RC" in
   3)
     if [ -n "${RELAY_HTTP_HOST:-}" ]; then
       MODE=remote
+      # The vault location is the resolver's answer: one `relay where`, remote only.
+      if [ -z "$AGENT_TOKEN" ]; then
+        relay_where_load "$RELAY_CLI" || true
+        relay_hydrate_token
+      fi
       SUMMARY=$(http_peek)
       [ $? -eq 0 ] && READ_OK=1
     else
@@ -692,14 +706,21 @@ case "$F1_RC" in
     ;;
 esac
 
-# Only a SUCCESSFUL local read tells us which DB holds this agent's anchor.
+# Only a SUCCESSFUL local read tells us which DB holds this agent's anchor. Its
+# path is the resolution `relay pending --json` embeds (ADR-0048: the SAME object
+# `relay where` prints), so the vault beside it needs no second node start.
 if [ "$MODE" = local ] && [ "$READ_OK" -eq 1 ]; then
   F1_DB=$(printf '%s' "$F1_OUT" | python3 -c 'import json, sys
 try:
-    p = json.load(sys.stdin).get("db_path")
+    r = json.load(sys.stdin).get("resolution") or {}
+    p = r.get("db_path") if r.get("kind") != "error" else None
 except Exception:
     p = None
-sys.stdout.write(p if isinstance(p, str) else "")' 2>/dev/null)
+sys.stdout.write(p if isinstance(p, str) and "\n" not in p else "")' 2>/dev/null)
+  if [ -n "$F1_DB" ]; then
+    relay_res_set_db "$F1_DB"
+    relay_hydrate_token
+  fi
   liveness_self_heal "$F1_DB"
 fi
 

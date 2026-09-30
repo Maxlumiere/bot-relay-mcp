@@ -11,8 +11,9 @@
 #   RELAY_AGENT_ROLE         — agent role (default: "user")
 #   RELAY_AGENT_CAPABILITIES — comma-separated (default: empty)
 #   RELAY_DB_PATH            — DB path (default: per-instance resolution, see below)
-#   RELAY_INSTANCE_ID        — (v2.4.5) explicit per-instance override; mirrors
-#                              src/instance.ts:resolveInstanceDbPath().
+#   RELAY_INSTANCE_ID        — (v2.4.5) explicit per-instance override. Every DB
+#                              path is the ONE resolver's answer (ADR-0048,
+#                              src/instance.ts resolveInstance, via relay where).
 #   RELAY_AGENT_TOKEN        — (v1.7+) token for authenticated tool calls
 #   RELAY_RECOVERY_TOKEN     — (v2.1 Phase 4b.1 v2) admin-issued one-time
 #                              recovery secret. If the daemon reports the
@@ -27,9 +28,9 @@
 # Security notes (v1.6):
 # - All env-var inputs are validated against an allowlist regex BEFORE use.
 # - Names/roles/caps that contain anything outside [A-Za-z0-9_.-] are rejected.
-# - DB_PATH is resolved and must live under $HOME or a temp root for this hook's OWN
-#   sqlite reads; a path outside them skips those reads (DEGRADED in local mode),
-#   it never ends the hook (the mail read is decided by relay pending).
+# - DB_PATH is the resolver's answer (`relay where`, which owns containment); a
+#   resolver error skips this hook's OWN sqlite reads (DEGRADED in local mode), it
+#   never ends the hook (the mail read is decided by relay pending).
 # - SQL is parameterised via sqlite3's `.parameter set` rather than string-interpolated.
 
 # VERDICT BY CONSTRUCTION — must be the FIRST executable code in this file.
@@ -159,11 +160,8 @@ RELAY_TERMINAL_TITLE_RE='^[A-Za-z0-9_. -]{1,100}$'
 if [ -n "$RELAY_TERMINAL_TITLE_VALUE" ] && ! [[ "$RELAY_TERMINAL_TITLE_VALUE" =~ $RELAY_TERMINAL_TITLE_RE ]]; then
   RELAY_TERMINAL_TITLE_VALUE=""
 fi
-# v2.6.1 — vault helpers + DB-path resolution sourced from a single file.
-# Mirrors src/instance.ts:resolveInstanceDbPath + src/token-store.ts:
-# resolveAgentVaultDir + FileTokenStore.{pathFor,read,write}. Drift surfaces
-# directly as a test failure in tests/v2-6-1-token-store.test.ts (which
-# sources this same file) — no inline-copy hide-out.
+# v2.6.1 — vault helpers sourced from a single file. The DB path (and so the vault
+# beside it) is the ONE resolver's answer (ADR-0048), never a bash derivation.
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./_vault-helpers.sh
 . "$HOOKS_DIR/_vault-helpers.sh"
@@ -171,6 +169,10 @@ HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
 # equal. The mail read's deadline is what is LEFT of it after registration.
 RELAY_HOOK_BUDGET_SECS=10
+# ADR-0048: ask the ONE resolver ONCE, before anything needs a path (the spawn
+# manifest and the vault live beside the DB, and the mail read follows). Its
+# answer is held in exported RELAY_RES_* variables for every helper below.
+relay_where_load "$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay" || true
 # v2.7.2 — manifest-fallback (see comment above the AGENT_NAME default). Only
 # kicks in when env-derived name is empty or literal "default" — operators who
 # explicitly want the "default" agent (rare, but legitimate) can opt out by
@@ -206,14 +208,12 @@ if [ -z "${RELAY_DISABLE_MANIFEST_FALLBACK:-}" ] && { [ "$AGENT_NAME" = "default
     fi
   fi
 fi
-DB_PATH=$(resolve_relay_db_path) || {
-  # Malformed active-instance content — refuse to fall back silently. A
-  # broken setup should be loud, not hidden under legacy. The hook's
-  # other side effects (HTTP register/health, mail delivery) are gated
-  # behind DB_PATH being readable below; null DB_PATH falls cleanly to
-  # the existing "no DB → exit 0" path.
-  DB_PATH=""
-}
+# The resolver's DB path, or none on a resolver error: never a fallback. The
+# hook's own reads (liveness, register, bind, tasks) are gated on it below.
+DB_PATH=""
+if [ "${RELAY_RES_KIND:-error}" != error ]; then
+  DB_PATH="$RELAY_RES_DB_PATH"
+fi
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 
@@ -279,32 +279,22 @@ if [ -n "$AGENT_CAPS" ]; then
 fi
 
 # The DB path THIS HOOK's own reads use (liveness, anchor, tasks, topology). The
-# mail read does not use it: relay pending resolves its own. Three states, never
-# a made-up path and never a mute exit:
-#   usable     — its directory resolves, under $HOME or a temp root;
-#   unresolved — its directory does not resolve (absent, or not enterable): no DB
-#                file can be read there by this hook; relay pending decides;
-#   rejected   — it resolves OUTSIDE $HOME and the temp roots (the containment
-#                guard): this hook's own reads are skipped, and in LOCAL mode
-#                that is DEGRADED with the reason.
-# (A failed `cd` used to become '/relay.db' and exit mute: Codex #286 R2 D2.)
+# mail read does not use it: relay pending resolves its own, through the same
+# resolver. Containment is the resolver's (ADR-0048): there is no bash guard.
+#   usable     — the resolver named a DB path;
+#   unresolved — the resolver reported an error (or could not be asked): this
+#                hook's own reads are skipped, and in LOCAL mode that is DEGRADED
+#                with the resolver's reason. Never a made-up path, never mute.
 RELAY_LOCAL_DB_STATE="usable"
 RELAY_LOCAL_DB_WHY=""
-_relay_db_dir=""
-if [ -n "$DB_PATH" ]; then
-  _relay_db_dir=$(cd "$(dirname "$DB_PATH")" 2>/dev/null && pwd) || _relay_db_dir=""
-fi
-if [ -z "$DB_PATH" ] || [ -z "$_relay_db_dir" ]; then
+if [ -z "$DB_PATH" ]; then
   RELAY_LOCAL_DB_STATE="unresolved"
-else
-  RESOLVED_DB_PATH="$_relay_db_dir/$(basename "$DB_PATH")"
-  if [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ "$RESOLVED_DB_PATH" != /tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /private/tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /var/folders/* ]]; then
-    RELAY_LOCAL_DB_STATE="rejected"
-    RELAY_LOCAL_DB_WHY="it resolves outside HOME and the temp roots"
-    echo "[bot-relay] RELAY_DB_PATH must live under \$HOME or /tmp. Got: '$RESOLVED_DB_PATH'. This hook's own DB reads are skipped; the mail read is still decided by relay pending." >&2
-  else
-    DB_PATH="$RESOLVED_DB_PATH"
-  fi
+  # Held to a safe character set: the reason lands inside the one-line verdict.
+  RELAY_LOCAL_DB_WHY="instance resolution failed: $(printf '%s' "${RELAY_RES_REASON:-unknown}" | tr -cd 'A-Za-z0-9 _./:()=,-' | cut -c1-200)"
+  # LOUD, to the agent (stdout is its context) and the operator: the resolver's
+  # own reason names the fix (for example `relay use-instance <id>`). One line:
+  # the resolver's --fields answer carries no line break.
+  echo "[RELAY] instance resolution FAILED: ${RELAY_RES_REASON:-unknown}" | tee /dev/stderr
 fi
 
 # --- SELF-DIAGNOSING MUTE DETECTION -----------------------------------------
@@ -324,35 +314,22 @@ fi
 # Written to STDOUT deliberately: SessionStart hook stdout is injected into the
 # session as context, so the agent itself reads the warning and can refuse to
 # proceed as connected. A copy goes to stderr for the operator's terminal.
-# RELAY_HOME mirrors botRelayRoot() in src/instance.ts — the hook and the server
-# must agree on where the namespace lives or their diagnostics will contradict
-# each other (codex HIGH: hardcoding $HOME/.bot-relay diverged from the server).
-RELAY_ROOT="${RELAY_HOME:-${HOME}/.bot-relay}"
-RELAY_LEGACY_DB="${RELAY_ROOT}/relay.db"
-RELAY_INSTANCES_DIR="${RELAY_ROOT}/instances"
-
-RELAY_INSTANCE_DIR_COUNT=0
-if [ -d "$RELAY_INSTANCES_DIR" ]; then
-  RELAY_INSTANCE_DIR_COUNT=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-fi
-
-# HARM 2 — the contradiction: instances exist, yet we resolved the flat legacy DB.
 #
-# An explicit RELAY_DB_PATH is a DELIBERATE OPERATOR CHOICE and must never be
-# reported as a fault — assertInstanceResolution() already treats it that way,
-# and the two halves contradicting each other is worse than either being wrong
-# alone. Without this guard the hook tells a legitimate legacy-DB session that
-# it has lost its mail (codex HIGH).
-if [ -z "${RELAY_DB_PATH:-}" ] && [ "${RELAY_INSTANCE_DIR_COUNT:-0}" -gt 0 ] && [ "$DB_PATH" = "$RELAY_LEGACY_DB" ]; then
+# HARM 2 — the contradiction: instances exist, yet the flat legacy DB is in use.
+# Since ADR-0048 the resolver only chooses the flat DB then under the explicit
+# RELAY_ALLOW_LEGACY_FALLBACK=1 opt-in, and says so in its warning (which names
+# the instances); without the opt-in that state is a resolver error, reported
+# above as DEGRADED. An explicit RELAY_DB_PATH is a deliberate operator choice and
+# is never flagged (the resolver answers explicit-db then, with no warning).
+if [ "${RELAY_RES_KIND:-}" = flat ] && [ -n "${RELAY_RES_WARNING:-}" ]; then
   # Set OUTSIDE the `{ ... } | tee` below: a pipeline runs in a SUBSHELL, so an
   # assignment made inside it is discarded when that subshell exits.
   relay_verdict_set "MUTE" "resolved the legacy DB while instances exist — inbox will read empty" " db=\"$DB_PATH\""
-  RELAY_AVAILABLE_IDS=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
   {
     echo "[RELAY] *** WRONG INSTANCE — DO NOT PROCEED AS CONNECTED ***"
     echo "[RELAY] Relay tools may work, but this session resolved the LEGACY database:"
     echo "[RELAY]     using     : $DB_PATH"
-    echo "[RELAY]     instances : ${RELAY_AVAILABLE_IDS:-(unreadable)}"
+    echo "[RELAY]     resolver  : $RELAY_RES_WARNING"
     echo "[RELAY] Your real mailbox lives under an instance directory, so your inbox will"
     echo "[RELAY] read EMPTY no matter how much mail is sent to you. This is silent message"
     echo "[RELAY] loss, not a quiet inbox."
@@ -525,8 +502,8 @@ fi
 #     it): a stall is reported;
 #   - the header says how many of the canonical total are shown, and an answer
 #     whose count contradicts its messages is refused, never shown as no mail.
-# KNOWN LIMIT: the liveness and task reads in this hook still resolve the DB in
-# bash (resolve_relay_db_path) until ADR-0048's single resolver lands.
+# This hook's own reads (liveness, anchor, tasks) use the SAME resolver's answer
+# (relay where, loaded at the top): one resolution for everything.
 #
 # FRAMING (shared by the mail and task renderers). This stdout is the agent's
 # context AND carries this hook's own "[RELAY] VERDICT=" line, so no sender-chosen
@@ -735,14 +712,14 @@ relay_deliver_pending_mail() {
 # The order (the F1 mode rule, D2): the name is resolved; relay pending decides
 # the source (a configured DB that is missing is a loud local failure; no local
 # instance at all is the labeled remote path when one is configured); and only in
-# LOCAL mode does a path this hook REJECTED count, as DEGRADED with its reason,
+# LOCAL mode does a resolver error count here, as DEGRADED with its reason,
 # because its liveness and task reads were skipped. Never a mute exit.
 if [ "$RELAY_LOCAL_DB_STATE" != "usable" ] || [ ! -f "$DB_PATH" ]; then
   relay_deliver_pending_mail
-  if [ "$RELAY_LOCAL_DB_STATE" = "rejected" ]; then
+  if [ "$RELAY_LOCAL_DB_STATE" = "unresolved" ]; then
     case "$RELAY_MAIL_MODE" in
       local|unreadable)
-        relay_mail_verdict "DEGRADED" "local DB path rejected ($RELAY_LOCAL_DB_WHY): liveness and task reads skipped" other
+        relay_mail_verdict "DEGRADED" "$RELAY_LOCAL_DB_WHY: liveness and task reads skipped" other
         ;;
     esac
   fi

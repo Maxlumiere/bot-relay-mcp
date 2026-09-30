@@ -120,6 +120,9 @@ function runHook(): { stdout: string; stderr: string; status: number } {
 beforeEach(async () => {
   resetRoot();
   fs.cpSync(REAL_HOOKS, HOOK_COPY_DIR, { recursive: true }); // isolated, byte-identical hooks
+  // ADR-0048: the hooks ask the ONE resolver (the relay CLI beside them, as in
+  // every install): link the real bin/ next to the copied hooks/.
+  fs.symlinkSync(path.join(REAL_HOOKS, "..", "bin"), path.join(HOOK_COPY_DIR, "..", "bin"));
   writeHealthyClaudeJson();
   const { closeDb } = await import("../src/db.js");
   closeDb();

@@ -87,23 +87,24 @@ interface ResolverResult {
 }
 
 /**
- * Invoke a hook's resolve_relay_db_path() under a controlled environment.
- * Sets RELAY_HOME explicitly when provided so the bash mirror's RELAY_HOME
- * branch is exercised — matches the way the hooks ship to operators (one
- * function, three call sites).
+ * Invoke a hook's resolve_relay_db_path() under a controlled environment. Since
+ * ADR-0048 it is a SHIM over the ONE resolver (`relay where --fields`, loaded by
+ * relay_where_load in the same helper file), so the whole shipped helper is
+ * SOURCED, not the function body alone: these rows now hold the hooks to the TS
+ * resolver itself instead of to a bash mirror of it.
  */
 function runHookResolver(
   hookPath: string,
   env: Record<string, string | undefined>,
 ): ResolverResult {
-  const fnSrc = extractResolver(hookPath);
+  void hookPath;
   const exports = Object.entries(env)
     .map(([k, v]) => (v === undefined ? `unset ${k};` : `export ${k}=${JSON.stringify(v)};`))
     .join(" ");
-  const cmd = `${exports} ${fnSrc}\n resolve_relay_db_path`;
+  const cmd = `${exports} . ${JSON.stringify(VAULT_HELPERS_PATH)}\n resolve_relay_db_path`;
   const r = spawnSync("bash", ["-c", cmd], {
     encoding: "utf8",
-    timeout: 5_000,
+    timeout: 20_000,
     env: { PATH: process.env.PATH ?? "" },
   });
   return { stdout: r.stdout.trim(), stderr: r.stderr ?? "", status: r.status };
@@ -192,13 +193,14 @@ describe("v2.4.5 — bash hook resolvers mirror src/instance.ts (parameterized o
 
       it(`(Q5) ${label}: rejects malformed active-instance content with stderr + exit 1`, () => {
         // R1 MED 2: pre-R1 bash hooks silently fell back to legacy on
-        // malformed instance_id. The TS resolver throws (instance.ts:152).
-        // Bash mirror now emits stderr + returns 1 so attacker-controlled
-        // active-instance content can't mask the operator's setup.
+        // malformed instance_id. Since ADR-0048 the hooks ask the TS resolver
+        // itself, which reports the error kind: the shim names it on stderr and
+        // returns 1, so attacker-controlled active-instance content can't mask
+        // the operator's setup.
         fs.writeFileSync(path.join(root, "active-instance"), "../escape\n");
         const r = runHookResolver(hookPath, { HOME });
         expect(r.status).not.toBe(0);
-        expect(r.stderr).toMatch(/invalid instance_id/i);
+        expect(r.stderr).toMatch(/instance resolution failed: .*invalid instance id/i);
       });
 
       it(`(Q5b) ${label}: RELAY_HOME override redirects the bot-relay root (TS test seam parity)`, () => {

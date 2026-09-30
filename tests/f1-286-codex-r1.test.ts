@@ -555,7 +555,7 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
     expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 
-  it("a DB the containment guard REJECTS (outside HOME and the temp roots): mail still decided by relay pending, the local reads skipped, DEGRADED with the reason", () => {
+  it("a DB the RESOLVER refuses (outside HOME and the temp roots; ADR-0048 retired the bash guard): mail still decided by relay pending, the local reads skipped, DEGRADED with the reason", () => {
     // A path outside this test's HOME and outside every temp root: under the repo's
     // own (gitignored) node_modules/.cache.
     const dir = path.join(REPO_ROOT, "node_modules", ".cache", `f1-286-d2c-${process.pid}`);
@@ -572,7 +572,11 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
       const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, {
         RELAY_AGENT_NAME: "d2c", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
       }) });
-      expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*local DB path rejected/);
+      // The verdict carries the resolver's refusal (each reason is capped at 200
+      // characters, so the long path may cut its tail); the full sentence is on
+      // the loud stdout line.
+      expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*instance resolution failed: [^"]*liveness and task reads skipped/);
+      expect(r.stdout).toMatch(/\[RELAY\] instance resolution FAILED: .*outside the approved roots/);
       expect(r.stdout).not.toMatch(/Active tasks for d2c/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

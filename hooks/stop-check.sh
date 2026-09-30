@@ -220,15 +220,9 @@ if ! relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$'; then
   exit 0
 fi
 
-# v2.6.1 — vault hydration. If the env-supplied RELAY_AGENT_TOKEN is empty
-# but a valid token sits in the vault for this agent, use it for the remote
-# read. The local read needs no token.
-if [ -z "$AGENT_TOKEN" ]; then
-  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
-    AGENT_TOKEN="$VAULT_TOKEN"
-    export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
-  fi
-fi
+# v2.6.1 — vault hydration: relay_hydrate_token (below) runs only on the remote
+# path, AFTER the mail read decided it: the vault sits beside the resolved DB
+# (ADR-0048), and the local read needs no token.
 
 if ! relay_whole_match "$HTTP_HOST" '^[A-Za-z0-9_.:-]{1,253}$'; then
   exit 0
@@ -283,6 +277,21 @@ sys.stdout.write("%d\x1f%s\x1f%s" % (n, who, top))
 '
 
 # REMOTE mode only: never called when a local instance exists.
+# If the env-supplied RELAY_AGENT_TOKEN is empty but a valid token sits in the
+# vault for this agent, use it. The vault is beside the RESOLVED DB: the resolver
+# is asked once (relay_where_load) before the vault is read. Best-effort: no
+# token means the remote read reports it cannot authenticate, as before.
+relay_hydrate_token() {
+  [ -n "$AGENT_TOKEN" ] && return 0
+  relay_where_load "$RELAY_CLI" || true
+  local t
+  if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+    AGENT_TOKEN="$t"
+    export RELAY_AGENT_TOKEN="$t"
+  fi
+  return 0
+}
+
 http_peek() {
   [ -z "$AGENT_TOKEN" ] && return 1
   command -v curl >/dev/null 2>&1 || return 1
@@ -432,6 +441,7 @@ case "$F1_RC" in
   3)
     if [ -n "${RELAY_HTTP_HOST:-}" ]; then
       MODE=remote
+      relay_hydrate_token
       SUMMARY=$(http_peek)
       [ $? -eq 0 ] && READ_OK=1
     else
