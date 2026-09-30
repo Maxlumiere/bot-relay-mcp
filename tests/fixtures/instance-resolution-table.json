@@ -1,0 +1,111 @@
+{
+  "about": "ADR-0048 PR D: ONE state table for the instance resolver, run by the relay (tests/adr-0048-d-fixture.test.ts, through resolveInstance) and by Tether (extensions/vscode/src/adr-0048-fixture.test.ts, through vault-path). Both must agree on every row. Placeholders: ${HOME} is the row's temporary home; ${OUTSIDE} is a directory outside every approved root. Every row MUST declare its platform stance (posix | all) and its containment stance (strict | n/a); a test fails on a row without them.",
+  "win32": "UNSUPPORTED in CI: no Windows runner exercises these rows. On win32 the resolver labels every path result containment \"roots-only\" (the approved roots and the real-path walk apply; the POSIX ownership rules cannot), and symlink rows would need privileges CI does not have.",
+  "rows": [
+    {
+      "name": "a fresh home (no relay home at all) is a positive absence: the flat DB",
+      "platform": "all", "containment": "strict",
+      "layout": [],
+      "env": {},
+      "expect": { "kind": "flat", "db": "${HOME}/.bot-relay/relay.db", "exists": false }
+    },
+    {
+      "name": "an empty relay home: the flat DB",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay" }],
+      "env": {},
+      "expect": { "kind": "flat", "db": "${HOME}/.bot-relay/relay.db", "exists": false }
+    },
+    {
+      "name": "the active-instance marker as a SYMLINK",
+      "platform": "posix", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "symlink": ".bot-relay/active-instance", "to": "a" }],
+      "env": {},
+      "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/a/relay.db", "exists": false }
+    },
+    {
+      "name": "the active-instance marker as a FILE (the Windows form)",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "file": ".bot-relay/active-instance", "content": "a\n" }],
+      "env": {},
+      "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/a/relay.db", "exists": false }
+    },
+    {
+      "name": "RELAY_INSTANCE_ID",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay" }],
+      "env": { "RELAY_INSTANCE_ID": "b" },
+      "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/b/relay.db", "exists": false }
+    },
+    {
+      "name": "an explicit RELAY_DB_PATH under the home",
+      "platform": "all", "containment": "strict",
+      "layout": [],
+      "env": { "RELAY_DB_PATH": "${HOME}/x/relay.db" },
+      "expect": { "kind": "explicit-db", "db": "${HOME}/x/relay.db", "exists": false }
+    },
+    {
+      "name": "RELAY_HOME moves the relay home",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": "alt" }],
+      "env": { "RELAY_HOME": "${HOME}/alt" },
+      "expect": { "kind": "flat", "db": "${HOME}/alt/relay.db", "exists": false }
+    },
+    {
+      "name": "the legacy opt-in over instances with none selected: the flat DB, with a warning",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }],
+      "env": { "RELAY_ALLOW_LEGACY_FALLBACK": "1" },
+      "expect": { "kind": "flat", "db": "${HOME}/.bot-relay/relay.db", "exists": false }
+    },
+    {
+      "name": "an EMPTY marker is an error, never the flat DB",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "file": ".bot-relay/active-instance", "content": "" }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "is empty" }
+    },
+    {
+      "name": "a marker naming \"..\" is an error (it would collapse onto the flat DB)",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay/instances" }, { "file": ".bot-relay/active-instance", "content": ".." }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "path step" }
+    },
+    {
+      "name": "RELAY_INSTANCE_ID=\".\" is an error",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay" }],
+      "env": { "RELAY_INSTANCE_ID": "." },
+      "expect": { "kind": "error", "reason": "path step" }
+    },
+    {
+      "name": "`instances` as a regular FILE is an error (corruption, not an absence)",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay" }, { "file": ".bot-relay/instances", "content": "x" }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "not a directory" }
+    },
+    {
+      "name": "instances with none selected is AMBIGUOUS: an error, never the flat DB",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "mkdir": ".bot-relay/instances/b" }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "ambiguous" }
+    },
+    {
+      "name": "an explicit RELAY_DB_PATH OUTSIDE the approved roots is an error",
+      "platform": "posix", "containment": "n/a",
+      "layout": [],
+      "env": { "RELAY_DB_PATH": "${OUTSIDE}/relay.db" },
+      "expect": { "kind": "error", "reason": "outside the approved roots" }
+    },
+    {
+      "name": "a DANGLING symlink under the home that points OUTSIDE is an error (the target is judged)",
+      "platform": "posix", "containment": "n/a",
+      "layout": [{ "symlink": "link.db", "to": "${OUTSIDE}/missing.db" }],
+      "env": { "RELAY_DB_PATH": "${HOME}/link.db" },
+      "expect": { "kind": "error", "reason": "outside the approved roots" }
+    }
+  ]
+}

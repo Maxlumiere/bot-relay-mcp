@@ -47,8 +47,19 @@ import path from "path";
 const SHARED_ROOT_BASES = ["/tmp", "/private/tmp"];
 
 /** The approved roots, before realpath. The ONLY place this list is written. */
-function approvedRootBases(): string[] {
-  return [os.homedir(), ...SHARED_ROOT_BASES, "/var/folders"];
+function approvedRootBases(home: string = os.homedir()): string[] {
+  return [home, ...SHARED_ROOT_BASES, "/var/folders"];
+}
+
+/**
+ * Which containment this platform can enforce. "strict": the approved roots, the
+ * real-path walk AND the POSIX ownership rules (the shared-root rule, private
+ * staging). "roots-only": there is no uid to check (Windows): the roots and the
+ * real-path walk still apply, the ownership rules cannot, and results say so.
+ */
+export type ContainmentModel = "strict" | "roots-only";
+export function containmentModel(): ContainmentModel {
+  return typeof process.getuid === "function" ? "strict" : "roots-only";
 }
 
 /** The shared roots as REAL paths (on macOS /tmp is /private/tmp). */
@@ -127,7 +138,7 @@ function sharedRootFault(traversed: Traversed[]): string | null {
  * with any sticky directory (such as /tmp) allowed to be world-writable once its
  * owner passed. Otherwise another local user could swap what is staged there.
  */
-export function checkPrivatePath(p: string): { ok: true; realPath: string; exists: boolean } | { ok: false; reason: string } {
+export function checkPrivatePath(p: string): { ok: true; realPath: string; exists: boolean; containment: ContainmentModel } | { ok: false; reason: string } {
   const placed = placeReal(path.resolve(p));
   if (!placed.ok) return placed;
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
@@ -137,13 +148,13 @@ export function checkPrivatePath(p: string): { ok: true; realPath: string; exist
       if (fault) return { ok: false, reason: `${fault} Set TMPDIR to a directory only you can write.` };
     }
   }
-  return { ok: true, realPath: placed.realPath, exists: placed.exists };
+  return { ok: true, realPath: placed.realPath, exists: placed.exists, containment: containmentModel() };
 }
 
 /** The approved roots as REAL paths (a root that does not exist is skipped). */
-export function approvedRootsReal(): string[] {
+export function approvedRootsReal(home?: string): string[] {
   const out = new Set<string>();
-  for (const base of approvedRootBases()) {
+  for (const base of approvedRootBases(home)) {
     try {
       out.add(fs.realpathSync.native(path.resolve(base)));
     } catch {
@@ -154,12 +165,12 @@ export function approvedRootsReal(): string[] {
 }
 
 /** True when `realPath` (already a realpath) is an approved root or inside one. */
-export function isUnderApprovedRoot(realPath: string): boolean {
-  return approvedRootsReal().some((root) => realPath === root || realPath.startsWith(root + path.sep));
+export function isUnderApprovedRoot(realPath: string, home?: string): boolean {
+  return approvedRootsReal(home).some((root) => realPath === root || realPath.startsWith(root + path.sep));
 }
 
 export type Containment =
-  | { ok: true; absPath: string; realPath: string; exists: boolean }
+  | { ok: true; absPath: string; realPath: string; exists: boolean; containment: ContainmentModel }
   | { ok: false; reason: string };
 
 /** At most this many symlink hops in one walk (the kernel's own MAXSYMLINKS order). */
@@ -225,20 +236,20 @@ function placeReal(absPath: string): Placed {
 /**
  * Containment of `p` on real paths, plus whether it exists. Never throws.
  */
-export function checkContainment(p: string): Containment {
+export function checkContainment(p: string, opts: { home?: string } = {}): Containment {
   const absPath = path.resolve(p);
   const placed = placeReal(absPath);
   if (!placed.ok) return placed;
   const { realPath, exists } = placed;
-  if (!isUnderApprovedRoot(realPath)) {
+  if (!isUnderApprovedRoot(realPath, opts.home)) {
     return {
       ok: false,
       reason:
-        `${absPath} resolves to ${realPath}, which is outside the approved roots (${approvedRootsReal().join(", ")}). ` +
+        `${absPath} resolves to ${realPath}, which is outside the approved roots (${approvedRootsReal(opts.home).join(", ")}). ` +
         `Use a path under your home directory or a temp directory.`,
     };
   }
   const shared = sharedRootFault(placed.traversed);
   if (shared) return { ok: false, reason: shared };
-  return { ok: true, absPath, realPath, exists };
+  return { ok: true, absPath, realPath, exists, containment: containmentModel() };
 }

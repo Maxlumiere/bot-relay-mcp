@@ -36,9 +36,21 @@ afterEach(() => {
 
 describe("resolveVaultTokenPath — mirrors resolveInstanceDbPath", () => {
   it("RELAY_DB_PATH explicit → vault sits next to that DB", () => {
-    const env: EnvRecord = { RELAY_DB_PATH: "/custom/place/relay.db" };
+    const env: EnvRecord = { RELAY_DB_PATH: path.join(home, "custom", "place", "relay.db") };
     const r = resolveVaultTokenPath("a1", env, home);
-    expect(r).toEqual({ tokenPath: "/custom/place/agents/a1.token" });
+    expect(r).toEqual({ tokenPath: path.join(home, "custom", "place", "agents", "a1.token") });
+  });
+
+  it("ADR-0048 PR D: the injected homeDir IS the home (no HOME / RELAY_HOME in the env): the vault is under it", () => {
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances", "hi"), { recursive: true });
+    fs.symlinkSync("hi", path.join(home, ".bot-relay", "active-instance"));
+    const r = resolveVaultTokenPath("a1", {}, home);
+    expect(r).toEqual({ tokenPath: path.join(home, ".bot-relay", "instances", "hi", "agents", "a1.token") });
+  });
+
+  it("ADR-0048 PR D: an explicit RELAY_DB_PATH OUTSIDE the approved roots → a MISS (the relay refuses it; Tether never reads a vault beside it)", () => {
+    const r = resolveVaultTokenPath("a1", { RELAY_DB_PATH: "/custom/place/relay.db" }, home);
+    expect(r).toMatchObject({ miss: expect.stringMatching(/outside the approved roots/) });
   });
 
   it("no instance configured (no env, no active-instance) → flat vault", () => {

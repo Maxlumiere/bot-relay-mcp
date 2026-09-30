@@ -41,6 +41,7 @@ import { pushKanbanSnapshotOnce } from "../dashboard-push.js";
 import { requestContext } from "../request-context.js";
 import { ipInAnyCidr } from "../cidr.js";
 import { VERSION } from "../version.js";
+import { RESOLVER_REVISION } from "../resolve-instance.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import type { Server } from "http";
 
@@ -543,6 +544,8 @@ export function startHttpServer(port: number, host: string): Server {
       status: "ok",
       version: VERSION,
       protocol_version: PROTOCOL_VERSION,
+      // ADR-0048 PR D: Tether bundles this resolver and compares this value to its own.
+      resolver_revision: RESOLVER_REVISION,
       transport: "http",
       auth_required: !!config.http_secret,
       // v2.15.2 — MONOTONIC process uptime (process.uptime(), NOT Date.now

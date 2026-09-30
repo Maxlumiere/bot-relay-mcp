@@ -87,7 +87,7 @@ export async function run(argv: string[]): Promise<number> {
     usage(true);
     return 0;
   }
-  const { resolveInstance, serializeResolution, RESOLVER_ENV_KEYS } = await import("../instance.js");
+  const { resolveInstance, serializeResolution, RESOLVER_ENV_KEYS, RESOLVER_REVISION } = await import("../instance.js");
   if (args.envKeys) {
     process.stdout.write(args.json ? JSON.stringify(RESOLVER_ENV_KEYS) + "\n" : RESOLVER_ENV_KEYS.join("\n") + "\n");
     return 0;
@@ -96,7 +96,7 @@ export async function run(argv: string[]): Promise<number> {
   const vaultDir = r.kind === "error" ? null : path.join(path.dirname(r.dbPath), "agents");
 
   if (args.json) {
-    process.stdout.write(JSON.stringify({ resolution: serializeResolution(r), vault_dir: vaultDir }) + "\n");
+    process.stdout.write(JSON.stringify({ resolution: serializeResolution(r), vault_dir: vaultDir, resolver_revision: RESOLVER_REVISION }) + "\n");
   } else if (r.kind === "error") {
     process.stdout.write(`[RELAY] instance resolution FAILED: ${r.reason}\n`);
   } else {

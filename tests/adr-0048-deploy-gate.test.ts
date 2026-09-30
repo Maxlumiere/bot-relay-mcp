@@ -399,6 +399,32 @@ function envReads(fileName: string, source: string): { keys: Set<string>; unsupp
     }
     return cur;
   };
+  /**
+   * process.env used as a VALUE (not a read) is allowed only where it is still
+   * audited: compared (===, !==), selected INTO a binding named `env` (`const env
+   * = opts.env ?? process.env`, a parameter default), or passed to a resolver
+   * helper whose parameter IS that audited `env`. Any other value use would be an
+   * alias the audit cannot follow.
+   */
+  const ENV_TAKING_HELPERS = new Set(["relayRootFor", "instancesRootFor", "homeFor", "resolveInstance"]);
+  const processEnvAsAuditedValue = (e: import("typescript-legacy").Node): boolean => {
+    const p = e.parent;
+    if (!p) return false;
+    if (ts.isBinaryExpression(p)) {
+      const op = p.operatorToken.kind;
+      if (op === ts.SyntaxKind.EqualsEqualsEqualsToken || op === ts.SyntaxKind.ExclamationEqualsEqualsToken) return true;
+      if (op === ts.SyntaxKind.QuestionQuestionToken || op === ts.SyntaxKind.BarBarToken) {
+        const d = p.parent;
+        return Boolean(d && ts.isVariableDeclaration(d) && d.initializer === p && ts.isIdentifier(d.name) && d.name.text === "env");
+      }
+      return false;
+    }
+    if (ts.isParameter(p) && p.initializer === e && ts.isIdentifier(p.name) && p.name.text === "env") return true;
+    if (ts.isCallExpression(p) && p.arguments.includes(e as import("typescript-legacy").Expression) && ts.isIdentifier(p.expression)) {
+      return ENV_TAKING_HELPERS.has(p.expression.text);
+    }
+    return false;
+  };
   const visit = (n: import("typescript-legacy").Node): void => {
     // import { env } from "process" / import process from "node:process": an alias the walk cannot follow.
     if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier) && /^(node:)?process$/.test(n.moduleSpecifier.text)) unsupported.push(at(n));
@@ -414,7 +440,12 @@ function envReads(fileName: string, source: string): { keys: Set<string>; unsupp
     if (ts.isPropertyAccessExpression(n) && n.name.text === "env" && !isProcess(n.expression) && ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === "process") {
       unsupported.push(at(n));
     }
-    if (ts.isPropertyAccessExpression(n) && n.name.text === "env" && isProcess(n.expression)) {
+    // An env OBJECT is process.env, or (ADR-0048 PR D) the resolver's own `env`
+    // PARAMETER (resolveInstance({ env })). Reads through either are audited the
+    // same way; `env` may also be PASSED to a helper (whose own reads are audited
+    // in these same files), but a computed `env[k]` is never readable.
+    const isEnvParam = ts.isIdentifier(n) && n.text === "env" && !(n.parent && ts.isPropertyAccessExpression(n.parent) && n.parent.name === n);
+    if ((ts.isPropertyAccessExpression(n) && n.name.text === "env" && isProcess(n.expression)) || isEnvParam) {
       const e = outer(n);
       const p = e.parent;
       if (p && ts.isPropertyAccessExpression(p) && p.expression === e) keys.add(p.name.text);
@@ -425,7 +456,8 @@ function envReads(fileName: string, source: string): { keys: Set<string>; unsupp
           if (el.dotDotDotToken || !(ts.isIdentifier(name) || ts.isStringLiteral(name))) unsupported.push(at(el));
           else keys.add(name.text);
         }
-      } else unsupported.push(at(p ?? n));
+      } else if (p && ts.isElementAccessExpression(p) && p.expression === e) unsupported.push(at(p));
+      else if (!isEnvParam && !processEnvAsAuditedValue(e)) unsupported.push(at(p ?? n));
     }
     ts.forEachChild(n, visit);
   };
@@ -434,11 +466,11 @@ function envReads(fileName: string, source: string): { keys: Set<string>; unsupp
 }
 
 describe("RESOLVER_ENV_KEYS — the exported set covers every env read of the resolver (syntax-aware)", () => {
-  it("every env read in src/instance.ts + src/approved-roots.ts is in the set (or a declared non-resolver key); no unsupported access form", () => {
+  it("every env read in the resolver modules (src/resolve-instance.ts, src/approved-roots.ts, src/instance.ts) is in the set (or a declared non-resolver key); no unsupported access form", () => {
     const NOT_RESOLVER: Record<string, string> = { RELAY_CONFIG_PATH: "moves the config file, not the DB" };
     const found = new Set<string>();
     const unsupported: string[] = [];
-    for (const f of ["src/instance.ts", "src/approved-roots.ts"]) {
+    for (const f of ["src/resolve-instance.ts", "src/approved-roots.ts", "src/instance.ts"]) {
       const r = envReads(f, fs.readFileSync(path.join(REPO_ROOT, f), "utf-8"));
       r.keys.forEach((k) => found.add(k));
       unsupported.push(...r.unsupported);
@@ -455,6 +487,9 @@ describe("RESOLVER_ENV_KEYS — the exported set covers every env read of the re
     expect([...r('const x = process.env["Y"];').keys]).toEqual(["Y"]);
     expect([...r("const x = (process.env as Record<string, string>).Z;").keys]).toEqual(["Z"]);
     expect([...r("const h = os.homedir();").keys]).toEqual(["HOME"]);
+    expect([...r("function f(env: Record<string, string>) { return env.RELAY_X; }").keys]).toEqual(["RELAY_X"]);
+    expect(r("function f(env: Record<string, string>) { return g(env); }").unsupported, "passing the env param is fine").toEqual([]);
+    expect(r("declare const o: { env?: Record<string, string> }; const env = o.env ?? process.env; void (env === process.env); relayRootFor(process.env);").unsupported, "the audited value uses").toEqual([]);
     expect([...r('import { homedir } from "node:os";').keys]).toEqual(["HOME"]);
     for (const bad of [
       "declare const key: string; const x = process.env [key];",
@@ -466,6 +501,9 @@ describe("RESOLVER_ENV_KEYS — the exported set covers every env read of the re
       'import { env } from "node:process";',
       "f(process.env);",
       '"X" in process.env;',
+      "declare const k: string; function f(env: Record<string, string>) { return env[k]; }",
+      "const other = process.env ?? {};",
+      "someOtherHelper(process.env);",
     ]) {
       expect(r(bad).unsupported.length, `not rejected: ${bad}`).toBeGreaterThan(0);
     }

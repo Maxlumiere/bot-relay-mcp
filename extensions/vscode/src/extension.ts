@@ -63,6 +63,7 @@ import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { ConnectionLifecycle } from "./connection-lifecycle.js";
 import { HealthPoll } from "./health-poll.js";
+import { ResolverSkewReporter } from "./resolver-skew.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { decideNoDeliveryWarn, NO_WAKE_WARN_COOLDOWN_MS } from "./no-delivery-warn.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
@@ -390,6 +391,12 @@ const HEALTH_POLL_INTERVAL_MS = 15_000;
 const HEALTH_POLL_TIMEOUT_MS = 5_000;
 const HEALTH_POLL_FAIL_THRESHOLD = 2; // N consecutive fails → reconnect
 let healthPollTimer: ReturnType<typeof setInterval> | undefined;
+// ADR-0048 PR D: the same /health body carries the relay's resolver revision;
+// a mismatch with the resolver this bundle carries is logged and warned (once).
+const resolverSkew = new ResolverSkewReporter({
+  log: (line) => log(line),
+  warn: (message) => void vscode.window.showWarningMessage(`Tether: ${message}`),
+});
 const healthPoll = new HealthPoll({
   threshold: HEALTH_POLL_FAIL_THRESHOLD,
   fetchHealth: async () => {
@@ -401,7 +408,9 @@ const healthPoll = new HealthPoll({
       const res = await fetch(new URL("/health", base), { signal: controller.signal });
       // Read the body only on a 2xx — HealthPoll requires status==="ok", so a
       // non-2xx (bodyText=null) is already unhealthy without spending a read.
-      return { ok: res.ok, bodyText: res.ok ? await res.text() : null };
+      const bodyText = res.ok ? await res.text() : null;
+      if (bodyText !== null) resolverSkew.observe(bodyText);
+      return { ok: res.ok, bodyText };
     } finally {
       clearTimeout(timer);
     }
