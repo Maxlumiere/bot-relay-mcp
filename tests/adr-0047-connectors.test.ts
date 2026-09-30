@@ -48,8 +48,8 @@ const DAY = 24 * 60 * 60 * 1000;
 function plant(r: { pid: number; pid_start: string; started_at?: string; host_id?: string | null; edge_id?: string }): void {
   db.getDb()
     .prepare(
-      "INSERT INTO connectors (edge_id, pid, pid_start, parent_pid, parent_start, build_id, deps_id, node, commit_sha, dirty, built_at, resolver_revision, install_dir, host_id, started_at) " +
-        "VALUES (?, ?, ?, NULL, NULL, 'x', NULL, NULL, NULL, NULL, NULL, NULL, '/i', ?, ?)",
+      "INSERT INTO connectors (edge_id, pid, pid_start, parent_pid, parent_start, build_id, deps_id, deps_state, node, commit_sha, dirty, built_at, resolver_revision, install_dir, host_id, started_at) " +
+        "VALUES (?, ?, ?, NULL, NULL, 'x', NULL, NULL, NULL, NULL, NULL, NULL, NULL, '/i', ?, ?)",
     )
     .run(r.edge_id ?? edge(), r.pid, r.pid_start, r.host_id === undefined ? getOwnHostId() : r.host_id, r.started_at ?? new Date().toISOString());
 }
@@ -89,6 +89,7 @@ describe("ADR-0047 PR 2 — the writer: a connector writes ONLY its own row", ()
     expect(r.parent_start).toBe("Mon Sep 28 11:17:16 2026");
     expect(r.build_id).toBe(LOADED_BUILD.build_id);
     expect(r.deps_id).toBe(LOADED_BUILD.deps_id);
+    expect(r.deps_state).toBe(LOADED_BUILD.deps_state);
     expect(r.node).toBe(process.version);
   });
   it("the writer takes NO pid (it cannot be aimed at another process's row)", () => {

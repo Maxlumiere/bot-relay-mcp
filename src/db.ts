@@ -2048,7 +2048,7 @@ function migrateSchemaToV2_26(db: CompatDatabase): void {
 /** ADR-0047 — the ONE definition of the connectors columns (a literal: statically resolvable SQL). */
 const CONNECTORS_COLUMNS =
   "(edge_id TEXT NOT NULL, pid INTEGER NOT NULL, pid_start TEXT NOT NULL, parent_pid INTEGER, parent_start TEXT, " +
-  "build_id TEXT NOT NULL, deps_id TEXT, node TEXT, commit_sha TEXT, dirty INTEGER, built_at TEXT, resolver_revision TEXT, " +
+  "build_id TEXT NOT NULL, deps_id TEXT, deps_state TEXT, node TEXT, commit_sha TEXT, dirty INTEGER, built_at TEXT, resolver_revision TEXT, " +
   "install_dir TEXT NOT NULL, host_id TEXT, started_at TEXT NOT NULL, PRIMARY KEY (edge_id, pid, pid_start))";
 
 /** The install this module was loaded from (dist/.. or src/..), as a realpath. */
@@ -2069,6 +2069,7 @@ export interface ConnectorRow {
   parent_start: string | null;
   build_id: string;
   deps_id: string | null;
+  deps_state: string | null;
   node: string | null;
   commit_sha: string | null;
   dirty: number | null;
@@ -2095,8 +2096,8 @@ export function recordOwnConnector(input: { parent: { pid: number; startedAt: st
   const db = getDb();
   const parent = input.parent && input.parent.startedAt ? input.parent : null;
   db.prepare(
-    "INSERT OR REPLACE INTO connectors (edge_id, pid, pid_start, parent_pid, parent_start, build_id, deps_id, node, commit_sha, " +
-      "dirty, built_at, resolver_revision, install_dir, host_id, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO connectors (edge_id, pid, pid_start, parent_pid, parent_start, build_id, deps_id, deps_state, node, " +
+      "commit_sha, dirty, built_at, resolver_revision, install_dir, host_id, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     getLocalEdgeId(db),
     process.pid,
@@ -2105,6 +2106,7 @@ export function recordOwnConnector(input: { parent: { pid: number; startedAt: st
     parent ? parent.startedAt : null,
     input.build.build_id,
     input.build.deps_id,
+    input.build.deps_state,
     input.build.node,
     input.build.commit,
     input.build.dirty === null ? null : input.build.dirty ? 1 : 0,
