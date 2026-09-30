@@ -12,81 +12,49 @@
 // auto-syncs across a rotation with ZERO manual steps.
 //
 // D2 (the load-bearing constraint): the vault path MUST be resolved EXACTLY the
-// way the relay resolves it (src/instance.ts `resolveInstanceDbPath` +
-// src/token-store.ts `resolveAgentVaultDir`), honoring `RELAY_DB_PATH`,
-// `RELAY_HOME`, `RELAY_INSTANCE_ID`, and the `~/.bot-relay/active-instance`
-// pointer (symlink OR file — a GUI-launched VSCode often lacks the env but CAN
-// read that file), then `dirname(dbPath)/agents/<name>.token`. A NAIVE flat
-// `~/.bot-relay/agents` hardcode would reopen the v2.4.5 split-brain and read
-// the WRONG token. So:
-//   - a genuinely single-instance setup (no env + no active-instance file) →
-//     the flat DB, which is correct there;
-//   - but an active-instance that is PRESENT-BUT-MALFORMED → FAIL CLOSED (miss
-//     + a visible log), never a silent fall-through to the flat vault.
+// way the relay resolves it, then `dirname(dbPath)/agents/<name>.token`. Since
+// ADR-0048 PR D that is not a mirror any more: Tether BUNDLES the relay's ONE
+// resolver (src/resolve-instance.ts, a pure module) and calls it. So every rule
+// the relay applies applies here, by construction: the flat DB only on a
+// positive absence of any instance, a present-but-malformed or ambiguous
+// selection is a MISS (never a silent fall-through to the flat vault), ids "."
+// and ".." are refused, and containment (approved roots, real paths, the
+// shared-root ownership rule; labeled "roots-only" on Windows) is the relay's
+// own. A shared fixture (tests/fixtures/instance-resolution-table.json) runs the
+// same rows through the relay and through this module.
 //
 // The token is shape-validated and NEVER logged.
 //
 // VSCode-free: `env` + `homeDir` are injected so the unit tests drive the REAL
-// resolver (extension.ts wires `process.env` + `os.homedir()`).
+// resolver (extension.ts wires `process.env` + `os.homedir()`); the resolver
+// takes the env as a PARAMETER and never reads or mutates process.env for it.
 import fs from "node:fs";
 import path from "node:path";
+import { resolveInstance, INSTANCE_ID_RE as RESOLVER_INSTANCE_ID_RE, RESOLVER_REVISION } from "../../../src/resolve-instance.js";
+
+/** The resolver revision this bundle carries (compared with the relay's /health). */
+export const BUNDLED_RESOLVER_REVISION = RESOLVER_REVISION;
 
 /** Mirrors src/token-store.ts TOKEN_SHAPE_RE. */
 export const TOKEN_SHAPE_RE = /^[A-Za-z0-9_=.-]{8,128}$/;
 /** Mirrors config.ts AGENT_NAME_RE / hooks/_vault-helpers.sh. */
 export const AGENT_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
-/** Mirrors src/instance.ts instanceDir() id sanitizer. */
-export const INSTANCE_ID_RE = /^[A-Za-z0-9._-]+$/;
+/** The relay's own instance-id rule (re-exported; not a copy). */
+export const INSTANCE_ID_RE = RESOLVER_INSTANCE_ID_RE;
 
 export type EnvRecord = Record<string, string | undefined>;
 
-function botRelayRoot(env: EnvRecord, homeDir: string): string {
-  if (env.RELAY_HOME) return env.RELAY_HOME;
-  return path.join(homeDir, ".bot-relay");
-}
-
-type InstanceResult = { id: string } | { id: null } | { malformed: string };
-
-/**
- * Mirror of src/instance.ts resolveActiveInstanceId, but with the D2
- * fail-closed distinction: a PRESENT-but-malformed active-instance is a
- * `malformed` (→ miss), NOT a silent null (→ flat).
- */
-function resolveActiveInstanceId(env: EnvRecord, homeDir: string): InstanceResult {
-  const envId = env.RELAY_INSTANCE_ID;
-  if (envId && envId.length > 0) {
-    if (!INSTANCE_ID_RE.test(envId)) return { malformed: `RELAY_INSTANCE_ID "${envId}" is invalid` };
-    return { id: envId };
-  }
-  const activeLink = path.join(botRelayRoot(env, homeDir), "active-instance");
-  let st: fs.Stats;
-  try {
-    st = fs.lstatSync(activeLink); // no-follow so a symlink to a bare id still "exists"
-  } catch {
-    return { id: null }; // no pointer at all → legitimately single-instance (flat)
-  }
-  let raw: string | null = null;
-  try {
-    if (st.isSymbolicLink()) raw = path.basename(fs.readlinkSync(activeLink));
-    else if (st.isFile()) raw = fs.readFileSync(activeLink, "utf-8").trim();
-    else return { malformed: "active-instance is neither a file nor a symlink" };
-  } catch {
-    return { malformed: "active-instance pointer is unreadable" };
-  }
-  if (!raw || raw.length === 0) return { malformed: "active-instance pointer is empty" };
-  if (!INSTANCE_ID_RE.test(raw)) return { malformed: `active-instance id "${raw}" is invalid` };
-  return { id: raw };
-}
-
 export type DbPathResult = { dbPath: string } | { miss: string };
 
-/** Mirror of src/instance.ts resolveInstanceDbPath (fail-closed on malformed). */
+/**
+ * The relay DB for `env`, from the relay's ONE resolver. The injected `homeDir`
+ * is authoritative for the home directory (HOME / USERPROFILE), exactly as the
+ * callers pass it; the resolver's error kind is a MISS with its reason.
+ */
 export function resolveRelayDbPath(env: EnvRecord, homeDir: string): DbPathResult {
-  if (env.RELAY_DB_PATH) return { dbPath: env.RELAY_DB_PATH };
-  const active = resolveActiveInstanceId(env, homeDir);
-  if ("malformed" in active) return { miss: active.malformed };
-  if (active.id === null) return { dbPath: path.join(botRelayRoot(env, homeDir), "relay.db") };
-  return { dbPath: path.join(botRelayRoot(env, homeDir), "instances", active.id, "relay.db") };
+  const r = resolveInstance({ env: { ...env, HOME: homeDir, USERPROFILE: homeDir } });
+  if (r.kind === "error") return { miss: r.reason };
+  return { dbPath: r.dbPath };
 }
 
 export type VaultPathResult = { tokenPath: string } | { miss: string };

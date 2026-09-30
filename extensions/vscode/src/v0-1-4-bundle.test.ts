@@ -158,6 +158,8 @@ describe("v0.1.4 — bundle correctness", () => {
     // undelivered-mail surface), imported by extension.ts's hintNoWake. ADR-0026/M3
     // added wake-decline-log.ts (the wake-decision observability sink), imported by
     // extension.ts's activate() (activation record + the per-WakeGate recordDecision sink).
+    // ADR-0048 PR D added resolver-skew.ts (compares the relay's /health resolver
+    // revision with the bundled one), imported by extension.ts's health poll.
     expect(srcInputs.sort()).toEqual([
       "src/agent-manager.ts",
       "src/catch-up-wake.ts",
@@ -172,6 +174,7 @@ describe("v0.1.4 — bundle correctness", () => {
       "src/no-delivery-warn.ts",
       "src/pid-binding.ts",
       "src/reconnect-supervisor.ts",
+      "src/resolver-skew.ts",
       "src/restart-policy.ts",
       "src/switch-agent.ts",
       "src/terminal-targeting.ts",

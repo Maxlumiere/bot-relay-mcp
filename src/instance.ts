@@ -38,7 +38,24 @@ import path from "path";
 import os from "os";
 import { randomUUID } from "crypto";
 import { log } from "./logger.js";
-import { checkContainment } from "./approved-roots.js";
+import {
+  resolveInstance,
+  relayRootFor,
+  instancesRootFor,
+  instanceIdFault as idFaultUnder,
+  ACTIVE_INSTANCE_MARKER,
+  type ResolvedInstance,
+} from "./resolve-instance.js";
+
+// ADR-0048 PR D: the resolver lives in src/resolve-instance.ts (a PURE module
+// Tether bundles). Re-exported here so every existing caller is unchanged.
+export {
+  resolveInstance,
+  serializeResolution,
+  RESOLVER_ENV_KEYS,
+  RESOLVER_REVISION,
+  type ResolvedInstance,
+} from "./resolve-instance.js";
 
 export interface InstanceMetadata {
   instance_id: string;
@@ -72,13 +89,12 @@ export function botRelayRoot(): string {
   // RELAY_HOME env var is a test-friendly override that lets a suite
   // point the whole per-instance namespace at a tmp dir without
   // touching the operator's real $HOME. Production operators leave
-  // it unset and get ~/.bot-relay/.
-  if (process.env.RELAY_HOME) return process.env.RELAY_HOME;
-  return path.join(os.homedir(), ".bot-relay");
+  // it unset and get ~/.bot-relay/. (One definition: src/resolve-instance.ts.)
+  return relayRootFor(process.env);
 }
 
 function instancesRoot(): string {
-  return path.join(botRelayRoot(), "instances");
+  return instancesRootFor(process.env);
 }
 
 /**
@@ -93,7 +109,7 @@ function instancesRoot(): string {
 export function isMultiInstanceMode(): boolean {
   if (process.env.RELAY_INSTANCE_ID) return true;
   try {
-    const activeLink = path.join(botRelayRoot(), "active-instance");
+    const activeLink = path.join(botRelayRoot(), ACTIVE_INSTANCE_MARKER);
     // lstatSync doesn't follow symlinks — handles dangling-link case
     // where the symlink target is a bare instance_id (not a real path).
     try {
@@ -110,163 +126,9 @@ export function isMultiInstanceMode(): boolean {
   return false;
 }
 
-const INSTANCE_ID_RE = /^[A-Za-z0-9._-]+$/;
-
-/**
- * EVERY environment variable resolveInstance() reads, directly or through the
- * approved roots (os.homedir() is HOME). The deploy gate (src/deploy-gate.ts)
- * hands the NEW resolver exactly these keys from the running daemon's
- * environment and prints no other. A contract test holds this list equal to the
- * env reads in src/instance.ts + src/approved-roots.ts, so a new read cannot be
- * missed by the gate. (RELAY_CONFIG_PATH moves the config file, not the DB.)
- */
-export const RESOLVER_ENV_KEYS = ["HOME", "RELAY_HOME", "RELAY_DB_PATH", "RELAY_INSTANCE_ID", "RELAY_ALLOW_LEGACY_FALLBACK"] as const;
-
-/**
- * Why `id` is not a usable instance id, or null when it is. The charset alone
- * admits "." and "..", which path.join collapses onto instances/ itself or onto
- * the relay home (whose relay.db is the FLAT DB, then mislabeled an instance), so
- * they are refused by name, and the joined directory must be a DIRECT child of
- * instances/.
- */
+/** Why `id` is not a usable instance id (the resolver's own rule, src/resolve-instance.ts). */
 function instanceIdFault(id: string): string | null {
-  if (!INSTANCE_ID_RE.test(id)) return `it must match ${INSTANCE_ID_RE}`;
-  if (id === "." || id === "..") return `"${id}" is a path step, not a name`;
-  if (path.dirname(path.resolve(instancesRoot(), id)) !== path.resolve(instancesRoot())) {
-    return "it does not name a direct child of the instances directory";
-  }
-  return null;
-}
-
-/**
- * ADR-0048 — the ONE instance resolver. Every caller uses it; it reports FACTS and
- * callers own POLICY. A CLOSED result:
- *   - explicit-db : --db-path (opts.dbPath) or RELAY_DB_PATH;
- *   - instance    : RELAY_INSTANCE_ID, or the active-instance marker (read ONCE);
- *   - flat        : the legacy <root>/relay.db, ONLY on a POSITIVE absence of any
- *                   instance: the marker is ENOENT AND instances/ is ENOENT, empty,
- *                   or holds no directories (or RELAY_ALLOW_LEGACY_FALLBACK=1 over
- *                   the ambiguous state, which then carries a `warning`);
- *   - error       : ANY other fault (EIO, EACCES, ELOOP, ENOTDIR, an unreadable,
- *                   empty or malformed marker, the ambiguous state, containment).
- * A fault NEVER yields flat: "the path chosen by failure" is the silent-wrong-DB
- * class (nine days of invisible message loss). Every path-bearing kind carries
- * `exists`, a POSITIVE fact from the containment walk (src/approved-roots.ts).
- */
-export type ResolvedInstance =
-  | { kind: "explicit-db"; dbPath: string; exists: boolean; basis: "RELAY_DB_PATH" | "--db-path" }
-  | { kind: "instance"; id: string; dbPath: string; exists: boolean; basis: "RELAY_INSTANCE_ID" | "active-instance" }
-  | { kind: "flat"; dbPath: string; exists: boolean; warning?: string }
-  | { kind: "error"; reason: string; ambiguous?: boolean };
-
-export function resolveInstance(opts: { dbPath?: string; ignoreDbPathEnv?: boolean } = {}): ResolvedInstance {
-  const failed = (reason: string): ResolvedInstance => ({ kind: "error", reason });
-  const code = (err: unknown) => (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
-  const placed = (dbPath: string, make: (abs: string, exists: boolean) => ResolvedInstance): ResolvedInstance => {
-    const c = checkContainment(dbPath);
-    return c.ok ? make(c.absPath, c.exists) : failed(c.reason);
-  };
-
-  if (opts.dbPath) {
-    return placed(opts.dbPath, (p, e) => ({ kind: "explicit-db", dbPath: p, exists: e, basis: "--db-path" }));
-  }
-  if (!opts.ignoreDbPathEnv && process.env.RELAY_DB_PATH) {
-    return placed(process.env.RELAY_DB_PATH, (p, e) => ({ kind: "explicit-db", dbPath: p, exists: e, basis: "RELAY_DB_PATH" }));
-  }
-  const envId = process.env.RELAY_INSTANCE_ID;
-  if (envId) {
-    const idFault = instanceIdFault(envId);
-    if (idFault) return failed(`RELAY_INSTANCE_ID "${envId}" is invalid: ${idFault}`);
-    return placed(path.join(instancesRoot(), envId, "relay.db"), (p, e) => ({
-      kind: "instance", id: envId, dbPath: p, exists: e, basis: "RELAY_INSTANCE_ID",
-    }));
-  }
-
-  const root = botRelayRoot();
-  const flat = (warning?: string): ResolvedInstance =>
-    placed(path.join(root, "relay.db"), (p, e) => (warning ? { kind: "flat", dbPath: p, exists: e, warning } : { kind: "flat", dbPath: p, exists: e }));
-
-  // The relay home: absent (ENOENT) is a positive absence of everything.
-  try {
-    fs.lstatSync(root);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return flat();
-    return failed(`cannot inspect the relay home ${root} (${code(err)})`);
-  }
-
-  // The marker, read ONCE.
-  const marker = path.join(root, "active-instance");
-  let markerStat: fs.Stats | null = null;
-  try {
-    markerStat = fs.lstatSync(marker);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return failed(`cannot inspect ${marker} (${code(err)})`);
-  }
-  if (markerStat) {
-    let id: string;
-    try {
-      if (markerStat.isSymbolicLink()) id = path.basename(fs.readlinkSync(marker));
-      else if (markerStat.isFile()) id = fs.readFileSync(marker, "utf-8").trim();
-      else return failed(`${marker} is neither a file nor a symlink`);
-    } catch (err) {
-      return failed(`cannot read ${marker} (${code(err)})`);
-    }
-    if (!id) return failed(`${marker} is empty`);
-    const idFault = instanceIdFault(id);
-    if (idFault) return failed(`${marker} names an invalid instance id "${id}": ${idFault}`);
-    return placed(path.join(instancesRoot(), id, "relay.db"), (p, e) => ({
-      kind: "instance", id, dbPath: p, exists: e, basis: "active-instance",
-    }));
-  }
-
-  // No marker: flat only if no instance directory exists.
-  const instDir = instancesRoot();
-  let instStat: fs.Stats | null = null;
-  try {
-    instStat = fs.lstatSync(instDir);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return failed(`cannot inspect ${instDir} (${code(err)})`);
-  }
-  // instances/ present but NOT a directory (or a symlink to one) is corruption,
-  // not a positive absence: it never yields flat.
-  if (instStat && !instStat.isDirectory() && !instStat.isSymbolicLink()) {
-    return failed(`${instDir} exists but is not a directory`);
-  }
-  if (instStat) {
-    let dirs: string[];
-    try {
-      dirs = fs.readdirSync(instDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
-    } catch (err) {
-      return failed(`cannot list ${instDir} (${code(err)})`);
-    }
-    if (dirs.length) {
-      if (process.env.RELAY_ALLOW_LEGACY_FALLBACK === "1") {
-        return flat(`instances exist (${dirs.join(", ")}) but none is selected; using the flat DB because RELAY_ALLOW_LEGACY_FALLBACK=1`);
-      }
-      return {
-        kind: "error",
-        ambiguous: true,
-        reason:
-          `instance resolution is ambiguous: ${instDir} holds instances (${dirs.join(", ")}) but none is selected ` +
-          `(set RELAY_INSTANCE_ID, or run \`relay use-instance <id>\`)`,
-      };
-    }
-  }
-  return flat();
-}
-
-/** The resolution as JSON (snake_case), ONE serializer for `relay where` and `relay pending`. */
-export function serializeResolution(r: ResolvedInstance): Record<string, unknown> {
-  switch (r.kind) {
-    case "error":
-      return r.ambiguous ? { kind: r.kind, reason: r.reason, ambiguous: true } : { kind: r.kind, reason: r.reason };
-    case "flat":
-      return r.warning ? { kind: r.kind, db_path: r.dbPath, exists: r.exists, warning: r.warning } : { kind: r.kind, db_path: r.dbPath, exists: r.exists };
-    case "instance":
-      return { kind: r.kind, id: r.id, db_path: r.dbPath, exists: r.exists, basis: r.basis };
-    case "explicit-db":
-      return { kind: r.kind, db_path: r.dbPath, exists: r.exists, basis: r.basis };
-  }
+  return idFaultUnder(id, instancesRoot());
 }
 
 /** The DB path, or a thrown Error naming the fault. Never the flat DB by accident. */
@@ -673,7 +535,7 @@ export function setActiveInstance(instanceId: string): void {
       `instance "${instanceId}" not found. Run \`relay init --instance-id=${instanceId}\` first.`,
     );
   }
-  const linkPath = path.join(botRelayRoot(), "active-instance");
+  const linkPath = path.join(botRelayRoot(), ACTIVE_INSTANCE_MARKER);
   try {
     if (fs.existsSync(linkPath) || fs.lstatSync(linkPath)) fs.unlinkSync(linkPath);
   } catch { /* lstatSync throws on ENOENT — ignore */ }

@@ -83,6 +83,14 @@ describe("HTTP transport", () => {
     expect(body.transport).toBe("http");
   });
 
+  it("health check reports the resolver's revision (ADR-0048 PR D: Tether compares it to the one it bundles)", async () => {
+    const { RESOLVER_REVISION } = await import("../src/resolve-instance.js");
+    const res = await fetch(`${baseUrl}/health`);
+    const body = await res.json();
+    expect(body.resolver_revision).toBe(RESOLVER_REVISION);
+    expect(body.resolver_revision).toMatch(/^[0-9a-f]{12}$/);
+  });
+
   it("health check exposes a monotonic uptime_seconds (v2.15.2)", async () => {
     // v2.15.2 — a follow-on Tether health-poll uses this as a silent-death
     // detector (a strict decrease across polls = daemon restarted). It must be

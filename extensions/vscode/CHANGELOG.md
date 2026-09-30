@@ -4,6 +4,14 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
+## Unreleased — the token vault is found by the relay's own resolver
+
+Tether used to find the per-instance token vault with its own copy of the relay's instance resolver. The relay's resolver became strict, and the copy did not: with a damaged or ambiguous instance selection, an instance id of `.` or `..`, or a path outside your home and temp directories, the copy could still read a vault the relay itself refuses. Tether now carries the relay's resolver itself, so it can no longer drift.
+
+- **The same answer as the relay, every time.** Where the relay refuses to pick a DB, Tether does not read a token vault either, and its log says why. A shared table of cases runs through both, and their answers must match.
+- **A different resolver revision is visible.** Tether compares the resolver it carries with the one the relay reports and shows a warning when they differ, so an old Tether talking to a newer relay (or the reverse) is noticed rather than silently reading another vault. It asks at every connect, on its own: `/health` needs no token, so the check runs even when the relay refuses Tether's connection (a rejected token is often what such a mismatch looks like). A check still in flight when Tether reconnects or shuts down is cancelled, so a late answer never overwrites the newer connection's result or writes to a closed output panel.
+- **Windows:** the file-ownership checks cannot apply there; the resolver says so (`roots-only`) instead of passing silently. A symlink or junction whose target is an absolute Windows path (another drive, or a `\\server\share` path) is now followed from that path's root; before, the drive or the server and share names were walked into as if they were folders. The long (`\\?\C:\`, `\\?\UNC\server\share\`) and device (`\\.\C:\`) spellings are read as the ordinary path they name; any other such form is refused, never guessed.
+
 ## [0.7.0] — 2026-07-24 — Claude wakes actually submit: no more prompts piling up waiting for a human Enter
 
 The Claude wake was typing `inbox` into the agent's terminal but **never actually submitting it**. Claude Code's input treats a newline that arrives inside the typed chunk as literal text — not as pressing Enter — so the wake sat in the box until you pressed Enter yourself, and each new message stacked another dead `inbox` on top (observed 14 deep). Codex was immune because its wake already sent a separate Enter after a short settle delay; Claude now does the same.

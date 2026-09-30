@@ -95,57 +95,57 @@ describe("ADR-0048 — the state table: positive rows", () => {
     const p = path.join(HOME, "x", "relay.db");
     touch(p);
     process.env.RELAY_DB_PATH = p;
-    expect(inst.resolveInstance()).toEqual({ kind: "explicit-db", dbPath: p, exists: true, basis: "RELAY_DB_PATH" });
+    expect(inst.resolveInstance()).toEqual({ kind: "explicit-db", dbPath: p, exists: true, basis: "RELAY_DB_PATH", containment: "strict" });
   });
 
   it("RELAY_DB_PATH, file absent (parent present) → explicit-db, NOT exists", () => {
     fs.mkdirSync(path.join(HOME, "x"));
     const p = path.join(HOME, "x", "relay.db");
     process.env.RELAY_DB_PATH = p;
-    expect(inst.resolveInstance()).toEqual({ kind: "explicit-db", dbPath: p, exists: false, basis: "RELAY_DB_PATH" });
+    expect(inst.resolveInstance()).toEqual({ kind: "explicit-db", dbPath: p, exists: false, basis: "RELAY_DB_PATH", containment: "strict" });
   });
 
   it("RELAY_DB_PATH with an ABSENT parent → explicit-db, NOT exists (the walk climbs on ENOENT)", () => {
     const p = path.join(HOME, "no", "such", "dir", "relay.db");
     process.env.RELAY_DB_PATH = p;
-    expect(inst.resolveInstance()).toEqual({ kind: "explicit-db", dbPath: p, exists: false, basis: "RELAY_DB_PATH" });
+    expect(inst.resolveInstance()).toEqual({ kind: "explicit-db", dbPath: p, exists: false, basis: "RELAY_DB_PATH", containment: "strict" });
   });
 
   it("an explicit --db-path input outranks everything", () => {
     const p = path.join(HOME, "flag.db");
     touch(p);
     process.env.RELAY_DB_PATH = path.join(HOME, "env.db");
-    expect(inst.resolveInstance({ dbPath: p })).toEqual({ kind: "explicit-db", dbPath: p, exists: true, basis: "--db-path" });
+    expect(inst.resolveInstance({ dbPath: p })).toEqual({ kind: "explicit-db", dbPath: p, exists: true, basis: "--db-path", containment: "strict" });
   });
 
   it("RELAY_INSTANCE_ID valid → instance (env), exists as found", () => {
     touch(instDb("work"));
     process.env.RELAY_INSTANCE_ID = "work";
-    expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "work", dbPath: instDb("work"), exists: true, basis: "RELAY_INSTANCE_ID" });
+    expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "work", dbPath: instDb("work"), exists: true, basis: "RELAY_INSTANCE_ID", containment: "strict" });
     process.env.RELAY_INSTANCE_ID = "other";
-    expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "other", dbPath: instDb("other"), exists: false, basis: "RELAY_INSTANCE_ID" });
+    expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "other", dbPath: instDb("other"), exists: false, basis: "RELAY_INSTANCE_ID", containment: "strict" });
   });
 
   it("marker symlink → instance (active-instance)", () => {
     touch(instDb("a"));
     fs.symlinkSync("a", path.join(RH, "active-instance"));
-    expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "a", dbPath: instDb("a"), exists: true, basis: "active-instance" });
+    expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "a", dbPath: instDb("a"), exists: true, basis: "active-instance", containment: "strict" });
   });
 
   it("marker FILE with an id → instance", () => {
     fs.mkdirSync(RH, { recursive: true });
     fs.writeFileSync(path.join(RH, "active-instance"), "b\n");
-    expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "b", dbPath: instDb("b"), exists: false, basis: "active-instance" });
+    expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "b", dbPath: instDb("b"), exists: false, basis: "active-instance", containment: "strict" });
   });
 });
 
 describe("ADR-0048 — flat ONLY on a POSITIVE absence (the legacy install still works)", () => {
   it("no relay home at all → flat, NOT exists", () => {
-    expect(inst.resolveInstance()).toEqual({ kind: "flat", dbPath: flatDb(), exists: false });
+    expect(inst.resolveInstance()).toEqual({ kind: "flat", dbPath: flatDb(), exists: false, containment: "strict" });
   });
   it("relay home, no marker, no instances/, flat DB present → flat, exists", () => {
     touch(flatDb());
-    expect(inst.resolveInstance()).toEqual({ kind: "flat", dbPath: flatDb(), exists: true });
+    expect(inst.resolveInstance()).toEqual({ kind: "flat", dbPath: flatDb(), exists: true, containment: "strict" });
   });
   it("instances/ EMPTY → flat", () => {
     fs.mkdirSync(path.join(RH, "instances"), { recursive: true });

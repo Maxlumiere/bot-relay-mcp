@@ -1,0 +1,171 @@
+{
+  "about": "ADR-0048 PR D: ONE state table for the instance resolver, run by the relay (tests/adr-0048-d-fixture.test.ts, through resolveInstance) and by Tether (extensions/vscode/src/adr-0048-fixture.test.ts, through vault-path). Both must agree on every row. Placeholders: ${HOME} is the row's temporary home; ${OUTSIDE} is a directory outside every approved root. Every row MUST declare its platform stance (posix | all) and its containment stance (strict | n/a); a test fails on a row without them.",
+  "win32": "The rows above need a real file system and symlinks, which no Windows CI runner provides with the privileges they need, so they do not run on win32; there the resolver labels every path result containment \"roots-only\" (the approved roots and the real-path walk apply; the POSIX ownership rules cannot). The Windows-specific part of the walk, where a symlink or junction with an ABSOLUTE target (a drive, a UNC share, a root-relative path) restarts it, runs SIMULATED on every platform: the placement_sim rows below, through path.win32 and an in-memory file system.",
+  "placement_sim": {
+    "about": "The real-path walk (placeReal in src/approved-roots.ts) on a SIMULATED file system, run by both sides on every platform. flavour picks path.win32 or path.posix; fs maps each existing path to \"dir\", \"file\" or { \"link\": target }; anything else is absent (ENOENT). expect is where the kernel would put `input`.",
+    "rows": [
+      {
+        "name": "win32: a junction to an absolute DRIVE path restarts the walk at C:\\ (the drive is never a component)",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "C:\\Users\\alice\\relay-data" }, "C:\\Users\\alice\\relay-data": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "C:\\Users\\alice\\relay-data\\relay.db", "exists": false }
+      },
+      {
+        "name": "win32: a link to ANOTHER drive lands on that drive",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "D:\\relay" }, "D:\\relay": "dir", "D:\\relay\\relay.db": "file" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "D:\\relay\\relay.db", "exists": true }
+      },
+      {
+        "name": "win32: a link to a UNC share restarts at \\\\server\\share\\ (the server and share are never components)",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "\\\\fileserver\\share\\relay" }, "\\\\fileserver\\share\\relay": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "\\\\fileserver\\share\\relay\\relay.db", "exists": false }
+      },
+      {
+        "name": "win32: a ROOT-RELATIVE target (\\data) keeps the drive the walk is on",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "\\data\\relay" }, "C:\\data": "dir", "C:\\data\\relay": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "C:\\data\\relay\\relay.db", "exists": false }
+      },
+      {
+        "name": "win32: a RELATIVE target is spliced in the link's own directory (control)",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "relay-data" }, "C:\\Users\\alice\\relay-data": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "C:\\Users\\alice\\relay-data\\relay.db", "exists": false }
+      },
+      {
+        "name": "win32: a target written with FORWARD slashes (D:/relay/data) is walked one component at a time (the link on the way is followed)",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "D:/relay/data" }, "D:\\relay": { "link": "E:\\store" }, "E:\\store": "dir", "E:\\store\\data": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "E:\\store\\data\\relay.db", "exists": false }
+      },
+      {"name": "win32: an EXTENDED-LENGTH UNC target (\\\\?\\UNC\\server\\share\\...) is the same share: the walk restarts at \\\\server\\share\\ (never probes \\\\?\\UNC\\server)", "flavour": "win32", "fs": {"\\\\server\\share\\alice": "dir", "\\\\server\\share\\alice\\.bot-relay": {"link": "\\\\?\\UNC\\server\\share\\alice\\data"}, "\\\\server\\share\\alice\\data": "dir", "\\\\server\\share\\alice\\data\\relay.db": "file"}, "input": "\\\\server\\share\\alice\\.bot-relay\\relay.db", "expect": {"realPath": "\\\\server\\share\\alice\\data\\relay.db", "exists": true}},
+      {"name": "win32: an EXTENDED-LENGTH drive target (\\\\?\\C:\\...) is that drive", "flavour": "win32", "fs": {"C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": {"link": "\\\\?\\C:\\Users\\alice\\data"}, "C:\\Users\\alice\\data": "dir"}, "input": "C:\\Users\\alice\\.bot-relay\\relay.db", "expect": {"realPath": "C:\\Users\\alice\\data\\relay.db", "exists": false}},
+      {"name": "win32: a DEVICE-namespace drive target (\\\\.\\C:\\...) is that drive", "flavour": "win32", "fs": {"C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": {"link": "\\\\.\\C:\\data"}, "C:\\data": "dir"}, "input": "C:\\Users\\alice\\.bot-relay\\relay.db", "expect": {"realPath": "C:\\data\\relay.db", "exists": false}},
+      {"name": "win32: an extended-length INPUT path (\\\\?\\C:\\...) is walked as its canonical form", "flavour": "win32", "fs": {"C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": "dir"}, "input": "\\\\?\\C:\\Users\\alice\\.bot-relay\\relay.db", "expect": {"realPath": "C:\\Users\\alice\\.bot-relay\\relay.db", "exists": false}},
+      {"name": "win32: a VOLUME-GUID target (\\\\?\\Volume{...}\\) cannot be placed safely: an explicit error, never a silent miss", "flavour": "win32", "fs": {"C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": {"link": "\\\\?\\Volume{26a21bda-a627-11d7-9931-806e6f6e6963}\\relay"}}, "input": "C:\\Users\\alice\\.bot-relay\\relay.db", "expect": {"error": "unsupported Windows namespace path"}},
+      {"name": "win32: a raw DEVICE target (\\\\.\\PhysicalDrive0) is an explicit error", "flavour": "win32", "fs": {"C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": {"link": "\\\\.\\PhysicalDrive0"}}, "input": "C:\\Users\\alice\\.bot-relay\\relay.db", "expect": {"error": "unsupported Windows namespace path"}},
+      {
+        "name": "posix: an absolute target restarts at / (control: the same walk, the other flavour)",
+        "flavour": "posix",
+        "fs": { "/home": "dir", "/home/alice": "dir", "/home/alice/.bot-relay": { "link": "/srv/relay" }, "/srv": "dir", "/srv/relay": "dir" },
+        "input": "/home/alice/.bot-relay/relay.db",
+        "expect": { "realPath": "/srv/relay/relay.db", "exists": false }
+      }
+    ]
+  },
+  "rows": [
+    {
+      "name": "a fresh home (no relay home at all) is a positive absence: the flat DB",
+      "platform": "all", "containment": "strict",
+      "layout": [],
+      "env": {},
+      "expect": { "kind": "flat", "db": "${HOME}/.bot-relay/relay.db", "exists": false }
+    },
+    {
+      "name": "an empty relay home: the flat DB",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay" }],
+      "env": {},
+      "expect": { "kind": "flat", "db": "${HOME}/.bot-relay/relay.db", "exists": false }
+    },
+    {
+      "name": "the active-instance marker as a SYMLINK",
+      "platform": "posix", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "symlink": ".bot-relay/active-instance", "to": "a" }],
+      "env": {},
+      "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/a/relay.db", "exists": false }
+    },
+    {
+      "name": "the active-instance marker as a FILE (the Windows form)",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "file": ".bot-relay/active-instance", "content": "a\n" }],
+      "env": {},
+      "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/a/relay.db", "exists": false }
+    },
+    {
+      "name": "RELAY_INSTANCE_ID",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay" }],
+      "env": { "RELAY_INSTANCE_ID": "b" },
+      "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/b/relay.db", "exists": false }
+    },
+    {
+      "name": "an explicit RELAY_DB_PATH under the home",
+      "platform": "all", "containment": "strict",
+      "layout": [],
+      "env": { "RELAY_DB_PATH": "${HOME}/x/relay.db" },
+      "expect": { "kind": "explicit-db", "db": "${HOME}/x/relay.db", "exists": false }
+    },
+    {
+      "name": "RELAY_HOME moves the relay home",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": "alt" }],
+      "env": { "RELAY_HOME": "${HOME}/alt" },
+      "expect": { "kind": "flat", "db": "${HOME}/alt/relay.db", "exists": false }
+    },
+    {
+      "name": "the legacy opt-in over instances with none selected: the flat DB, with a warning",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }],
+      "env": { "RELAY_ALLOW_LEGACY_FALLBACK": "1" },
+      "expect": { "kind": "flat", "db": "${HOME}/.bot-relay/relay.db", "exists": false }
+    },
+    {
+      "name": "an EMPTY marker is an error, never the flat DB",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "file": ".bot-relay/active-instance", "content": "" }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "is empty" }
+    },
+    {
+      "name": "a marker naming \"..\" is an error (it would collapse onto the flat DB)",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay/instances" }, { "file": ".bot-relay/active-instance", "content": ".." }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "path step" }
+    },
+    {
+      "name": "RELAY_INSTANCE_ID=\".\" is an error",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay" }],
+      "env": { "RELAY_INSTANCE_ID": "." },
+      "expect": { "kind": "error", "reason": "path step" }
+    },
+    {
+      "name": "`instances` as a regular FILE is an error (corruption, not an absence)",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay" }, { "file": ".bot-relay/instances", "content": "x" }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "not a directory" }
+    },
+    {
+      "name": "instances with none selected is AMBIGUOUS: an error, never the flat DB",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "mkdir": ".bot-relay/instances/b" }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "ambiguous" }
+    },
+    {
+      "name": "an explicit RELAY_DB_PATH OUTSIDE the approved roots is an error",
+      "platform": "posix", "containment": "n/a",
+      "layout": [],
+      "env": { "RELAY_DB_PATH": "${OUTSIDE}/relay.db" },
+      "expect": { "kind": "error", "reason": "outside the approved roots" }
+    },
+    {
+      "name": "a DANGLING symlink under the home that points OUTSIDE is an error (the target is judged)",
+      "platform": "posix", "containment": "n/a",
+      "layout": [{ "symlink": "link.db", "to": "${OUTSIDE}/missing.db" }],
+      "env": { "RELAY_DB_PATH": "${HOME}/link.db" },
+      "expect": { "kind": "error", "reason": "outside the approved roots" }
+    }
+  ]
+}

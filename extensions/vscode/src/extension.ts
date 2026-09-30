@@ -63,6 +63,7 @@ import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { ConnectionLifecycle } from "./connection-lifecycle.js";
 import { HealthPoll } from "./health-poll.js";
+import { ResolverSkewReporter, probeResolverRevision } from "./resolver-skew.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { decideNoDeliveryWarn, NO_WAKE_WARN_COOLDOWN_MS } from "./no-delivery-warn.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
@@ -390,6 +391,23 @@ const HEALTH_POLL_INTERVAL_MS = 15_000;
 const HEALTH_POLL_TIMEOUT_MS = 5_000;
 const HEALTH_POLL_FAIL_THRESHOLD = 2; // N consecutive fails → reconnect
 let healthPollTimer: ReturnType<typeof setInterval> | undefined;
+// ADR-0048 PR D: the same /health body carries the relay's resolver revision;
+// a mismatch with the resolver this bundle carries is logged and warned (once).
+const resolverSkew = new ResolverSkewReporter({
+  log: (line) => log(line),
+  warn: (message) => void vscode.window.showWarningMessage(`Tether: ${message}`),
+});
+// The /health resolver probe of the CURRENT connection (connect() below). A new
+// connect() and every teardown (disconnect(), so deactivate() too) cancel it and
+// advance the generation, so a late answer can neither report into a closed
+// output channel nor overwrite the verdict of a newer connection.
+let skewProbeGeneration = 0;
+let skewProbeAbort: AbortController | undefined;
+function cancelSkewProbe(): void {
+  skewProbeGeneration++;
+  skewProbeAbort?.abort();
+  skewProbeAbort = undefined;
+}
 const healthPoll = new HealthPoll({
   threshold: HEALTH_POLL_FAIL_THRESHOLD,
   fetchHealth: async () => {
@@ -401,7 +419,9 @@ const healthPoll = new HealthPoll({
       const res = await fetch(new URL("/health", base), { signal: controller.signal });
       // Read the body only on a 2xx — HealthPoll requires status==="ok", so a
       // non-2xx (bodyText=null) is already unhealthy without spending a read.
-      return { ok: res.ok, bodyText: res.ok ? await res.text() : null };
+      const bodyText = res.ok ? await res.text() : null;
+      if (bodyText !== null) resolverSkew.observe(bodyText);
+      return { ok: res.ok, bodyText };
     } finally {
       clearTimeout(timer);
     }
@@ -876,7 +896,7 @@ function ensureSummaryTimer(level: TetherConfig["notificationLevel"]): void {
   }, 5 * 60 * 1000);
 }
 
-async function connect(config: TetherConfig): Promise<void> {
+export async function connect(config: TetherConfig): Promise<void> {
   const agentList = resolveAgentList(config);
   if (agentList.length === 0) {
     log("idle: no agents configured (set bot-relay.tether.agentName / RELAY_AGENT_NAME, or bot-relay.tether.agents)");
@@ -903,6 +923,19 @@ async function connect(config: TetherConfig): Promise<void> {
 
   log(`connecting to ${config.endpoint}/mcp; watching ${agentList.length} agent(s): ${agentList.map((a) => `${a.name}(${a.llm})`).join(", ")}`);
   relayEndpoint = config.endpoint; // for the /api/snapshot PID-binding fallback
+  // ADR-0048 PR D: compare resolver revisions from /health (no token needed) on
+  // its own, NOT awaited and NOT gated on the MCP connect below: a relay that
+  // refuses the connection (a 401) still has a skew named, often its cause.
+  // disconnect() above already cancelled the previous connection's probe.
+  const probeGeneration = skewProbeGeneration;
+  skewProbeAbort = new AbortController();
+  void probeResolverRevision({
+    endpoint: config.endpoint,
+    reporter: resolverSkew,
+    timeoutMs: HEALTH_POLL_TIMEOUT_MS,
+    signal: skewProbeAbort.signal,
+    isCurrent: () => probeGeneration === skewProbeGeneration,
+  });
   const url = new URL("/mcp", config.endpoint);
   // The SDK's StreamableHTTPClientTransport accepts request init for
   // header injection; the relay's HTTP transport reads X-Agent-Token
@@ -1102,6 +1135,7 @@ async function rerouteSuppressedWakes(): Promise<void> {
 }
 
 async function disconnect(): Promise<void> {
+  cancelSkewProbe();
   if (mcpClient) {
     try {
       await mcpClient.close();

@@ -39,16 +39,27 @@
  * misconfiguration and CROSS-USER interference are in scope; a same-user
  * adversary racing the daemon is not.
  */
-import fs from "fs";
-import os from "os";
-import path from "path";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 /** The world-writable approved roots, before realpath (subject to the ownership rule). */
 const SHARED_ROOT_BASES = ["/tmp", "/private/tmp"];
 
 /** The approved roots, before realpath. The ONLY place this list is written. */
-function approvedRootBases(): string[] {
-  return [os.homedir(), ...SHARED_ROOT_BASES, "/var/folders"];
+function approvedRootBases(home: string = os.homedir()): string[] {
+  return [home, ...SHARED_ROOT_BASES, "/var/folders"];
+}
+
+/**
+ * Which containment this platform can enforce. "strict": the approved roots, the
+ * real-path walk AND the POSIX ownership rules (the shared-root rule, private
+ * staging). "roots-only": there is no uid to check (Windows): the roots and the
+ * real-path walk still apply, the ownership rules cannot, and results say so.
+ */
+export type ContainmentModel = "strict" | "roots-only";
+export function containmentModel(): ContainmentModel {
+  return typeof process.getuid === "function" ? "strict" : "roots-only";
 }
 
 /** The shared roots as REAL paths (on macOS /tmp is /private/tmp). */
@@ -65,7 +76,7 @@ function sharedRootsReal(): string[] {
 }
 
 /** One component the walk passed through: where it sits (canonical parent) and its lstat. */
-interface Traversed {
+export interface Traversed {
   path: string;
   st: fs.Stats;
 }
@@ -127,7 +138,7 @@ function sharedRootFault(traversed: Traversed[]): string | null {
  * with any sticky directory (such as /tmp) allowed to be world-writable once its
  * owner passed. Otherwise another local user could swap what is staged there.
  */
-export function checkPrivatePath(p: string): { ok: true; realPath: string; exists: boolean } | { ok: false; reason: string } {
+export function checkPrivatePath(p: string): { ok: true; realPath: string; exists: boolean; containment: ContainmentModel } | { ok: false; reason: string } {
   const placed = placeReal(path.resolve(p));
   if (!placed.ok) return placed;
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
@@ -137,13 +148,13 @@ export function checkPrivatePath(p: string): { ok: true; realPath: string; exist
       if (fault) return { ok: false, reason: `${fault} Set TMPDIR to a directory only you can write.` };
     }
   }
-  return { ok: true, realPath: placed.realPath, exists: placed.exists };
+  return { ok: true, realPath: placed.realPath, exists: placed.exists, containment: containmentModel() };
 }
 
 /** The approved roots as REAL paths (a root that does not exist is skipped). */
-export function approvedRootsReal(): string[] {
+export function approvedRootsReal(home?: string): string[] {
   const out = new Set<string>();
-  for (const base of approvedRootBases()) {
+  for (const base of approvedRootBases(home)) {
     try {
       out.add(fs.realpathSync.native(path.resolve(base)));
     } catch {
@@ -154,24 +165,69 @@ export function approvedRootsReal(): string[] {
 }
 
 /** True when `realPath` (already a realpath) is an approved root or inside one. */
-export function isUnderApprovedRoot(realPath: string): boolean {
-  return approvedRootsReal().some((root) => realPath === root || realPath.startsWith(root + path.sep));
+export function isUnderApprovedRoot(realPath: string, home?: string): boolean {
+  return approvedRootsReal(home).some((root) => realPath === root || realPath.startsWith(root + path.sep));
 }
 
 export type Containment =
-  | { ok: true; absPath: string; realPath: string; exists: boolean }
+  | { ok: true; absPath: string; realPath: string; exists: boolean; containment: ContainmentModel }
   | { ok: false; reason: string };
 
 /** At most this many symlink hops in one walk (the kernel's own MAXSYMLINKS order). */
 const MAX_SYMLINK_HOPS = 40;
 
-type Placed = { ok: true; realPath: string; exists: boolean; traversed: Traversed[] } | { ok: false; reason: string };
+export type Placed = { ok: true; realPath: string; exists: boolean; traversed: Traversed[] } | { ok: false; reason: string };
+
+/**
+ * The path flavour and the three file-system reads the walk makes. Node's own by
+ * default; injectable so the Windows rows (drive, UNC and root-relative symlink
+ * targets) run SIMULATED, with path.win32 and an in-memory file system, on every
+ * platform (tests/fixtures/instance-resolution-table.json, placement_sim).
+ */
+export interface WalkSystem {
+  path: typeof path.posix;
+  lstat: (p: string) => fs.Stats;
+  readlink: (p: string) => string;
+  realpath: (p: string) => string;
+}
+const NODE_WALK: WalkSystem = {
+  path,
+  lstat: (p) => fs.lstatSync(p),
+  readlink: (p) => fs.readlinkSync(p),
+  realpath: (p) => fs.realpathSync.native(p),
+};
+
+/**
+ * A win32 NAMESPACE path in its ordinary spelling, so the walk sees the same
+ * root as the rest of the system: \\?\UNC\server\share\x is \\server\share\x, and
+ * \\?\C:\x and \\.\C:\x are C:\x. Any other namespace form (a volume GUID,
+ * GLOBALROOT, a raw device) cannot be placed safely: an explicit error, never a
+ * silent miss. Anything else is returned unchanged.
+ */
+export function canonicalWin32(p: string): { ok: true; path: string } | { ok: false; reason: string } {
+  const ns = /^[\\/]{2}[?.][\\/](.*)$/s.exec(p);
+  if (!ns) return { ok: true, path: p };
+  const rest = ns[1];
+  const unc = /^UNC[\\/]+([^\\/]+)[\\/]+([^\\/]+)(?:[\\/]+(.*))?$/is.exec(rest);
+  if (unc) return { ok: true, path: `\\\\${unc[1]}\\${unc[2]}\\${unc[3] ?? ""}` };
+  const drive = /^([A-Za-z]:)(?:[\\/]+(.*))?$/s.exec(rest);
+  if (drive) return { ok: true, path: `${drive[1]}\\${drive[2] ?? ""}` };
+  return { ok: false, reason: `unsupported Windows namespace path: ${p} (only \\\\?\\UNC\\server\\share\\, \\\\?\\X:\\ and \\\\.\\X:\\ can be placed)` };
+}
 
 /** Where the kernel would put `absPath`: the walk described at the top of this file. */
-function placeReal(absPath: string): Placed {
+export function placeReal(absPath: string, sys: WalkSystem = NODE_WALK): Placed {
+  const P = sys.path;
+  const win = P.sep === "\\";
+  if (win) {
+    const c = canonicalWin32(absPath);
+    if (!c.ok) return c;
+    absPath = c.path;
+  }
   const why = (err: unknown) => (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
-  const parts = (p: string) => p.split(path.sep).filter((c) => c !== "");
-  let cur = path.parse(absPath).root;
+  // win32 accepts both separators in a path (and in a link target).
+  const parts = (p: string) => p.split(P.sep === "\\" ? /[\\/]+/ : P.sep).filter((c) => c !== "");
+  let cur = P.parse(absPath).root;
   const queue = parts(absPath.slice(cur.length));
   const traversed: Traversed[] = [];
   let hops = 0;
@@ -179,41 +235,55 @@ function placeReal(absPath: string): Placed {
     const c = queue.shift() as string;
     if (c === ".") continue;
     if (c === "..") {
-      cur = path.dirname(cur); // cur is already real, so its parent is the kernel's `..`
+      cur = P.dirname(cur); // cur is already real, so its parent is the kernel's `..`
       continue;
     }
-    const next = path.join(cur, c);
+    const next = P.join(cur, c);
     // Every component is lstat'ed HERE, so a symlink is seen as itself (the
     // ownership rule judges the link, not only where it leads).
     let st: fs.Stats;
     try {
-      st = fs.lstatSync(next);
+      st = sys.lstat(next);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") return { ok: false, reason: `cannot inspect ${next} (${why(err)})` };
       // A POSITIVE absence: the missing tail lands under the real prefix.
       const rest = [c, ...queue].filter((x) => x !== ".");
       if (rest.includes("..")) return { ok: false, reason: `cannot place ${absPath}: a ".." follows the missing component ${next}` };
-      return { ok: true, realPath: path.join(cur, ...rest), exists: false, traversed };
+      return { ok: true, realPath: P.join(cur, ...rest), exists: false, traversed };
     }
     if (st.isSymbolicLink()) {
       traversed.push({ path: next, st });
       if (++hops > MAX_SYMLINK_HOPS) return { ok: false, reason: `cannot resolve ${absPath} (ELOOP: more than ${MAX_SYMLINK_HOPS} symlinks)` };
       let target: string;
       try {
-        target = fs.readlinkSync(next);
+        target = sys.readlink(next);
       } catch (err) {
         return { ok: false, reason: `cannot read the symlink ${next} (${why(err)})` };
       }
       // A symlink (dangling or not) is followed in kernel order: its target is
-      // spliced into the walk, never collapsed lexically.
-      if (path.isAbsolute(target)) cur = path.parse(target).root;
-      queue.unshift(...parts(target));
+      // spliced into the walk, never collapsed lexically. An ABSOLUTE target
+      // restarts the walk at its root, and only the components AFTER that root
+      // are queued: on win32 the root is a drive (C:\) or a UNC prefix
+      // (\\server\share\), never a component to walk into. A root-relative
+      // target on win32 (\data) keeps the drive the walk is on.
+      if (win) {
+        const c = canonicalWin32(target);
+        if (!c.ok) return c;
+        target = c.path;
+      }
+      if (P.isAbsolute(target)) {
+        const root = P.parse(target).root;
+        cur = win && /^[\\/]$/.test(root) ? P.parse(cur).root : root;
+        queue.unshift(...parts(target.slice(root.length)));
+      } else {
+        queue.unshift(...parts(target));
+      }
       continue;
     }
     // A real component. cur is symlink-free, so the kernel's realpath only
     // canonicalises its spelling (the on-disk CASE on a case-insensitive volume).
     try {
-      cur = fs.realpathSync.native(next);
+      cur = sys.realpath(next);
     } catch (err) {
       return { ok: false, reason: `cannot resolve ${next} (${why(err)})` };
     }
@@ -225,20 +295,20 @@ function placeReal(absPath: string): Placed {
 /**
  * Containment of `p` on real paths, plus whether it exists. Never throws.
  */
-export function checkContainment(p: string): Containment {
+export function checkContainment(p: string, opts: { home?: string } = {}): Containment {
   const absPath = path.resolve(p);
   const placed = placeReal(absPath);
   if (!placed.ok) return placed;
   const { realPath, exists } = placed;
-  if (!isUnderApprovedRoot(realPath)) {
+  if (!isUnderApprovedRoot(realPath, opts.home)) {
     return {
       ok: false,
       reason:
-        `${absPath} resolves to ${realPath}, which is outside the approved roots (${approvedRootsReal().join(", ")}). ` +
+        `${absPath} resolves to ${realPath}, which is outside the approved roots (${approvedRootsReal(opts.home).join(", ")}). ` +
         `Use a path under your home directory or a temp directory.`,
     };
   }
   const shared = sharedRootFault(placed.traversed);
   if (shared) return { ok: false, reason: shared };
-  return { ok: true, absPath, realPath, exists };
+  return { ok: true, absPath, realPath, exists, containment: containmentModel() };
 }
