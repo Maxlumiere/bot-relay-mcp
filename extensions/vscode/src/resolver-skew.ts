@@ -36,7 +36,11 @@ export function compareResolverRevision(bodyText: string | null, bundled: string
   return rev === bundled ? { status: "match", revision: rev } : { status: "mismatch", relay: rev, bundled };
 }
 
-/** Reports a verdict only when it CHANGES (the health poll runs every few seconds). */
+/**
+ * Reports a verdict only when it CHANGES (the health poll runs every few seconds).
+ * observe() never throws: a sink that does (VS Code's output channel after it was
+ * disposed: "Channel has been closed") has nowhere left to report to.
+ */
 export class ResolverSkewReporter {
   private last = "";
   constructor(private readonly sinks: { log: (line: string) => void; warn: (message: string) => void }) {}
@@ -46,6 +50,14 @@ export class ResolverSkewReporter {
     const key = v.status === "mismatch" ? `mismatch:${v.relay}` : v.status === "match" ? "match" : `unknown:${v.why}`;
     if (key === this.last) return;
     this.last = key;
+    try {
+      this.report(v);
+    } catch {
+      /* the sink is gone: nothing to report into */
+    }
+  }
+
+  private report(v: SkewVerdict): void {
     if (v.status === "match") {
       this.sinks.log(`resolver: revision ${v.revision} matches the relay`);
     } else if (v.status === "mismatch") {
@@ -73,10 +85,17 @@ export async function probeResolverRevision(opts: {
   reporter: ResolverSkewReporter;
   timeoutMs: number;
   fetchImpl?: typeof fetch;
+  /** Aborted on teardown or a new connection: the probe then reports nothing. */
+  signal?: AbortSignal;
+  /** False once this probe's connection was superseded: its answer is discarded. */
+  isCurrent?: () => boolean;
 }): Promise<void> {
+  if (opts.signal?.aborted) return;
   const doFetch = opts.fetchImpl ?? fetch;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+  const cancel = () => controller.abort();
+  opts.signal?.addEventListener("abort", cancel, { once: true });
+  const timer = setTimeout(cancel, opts.timeoutMs);
   let bodyText: string | null = null;
   try {
     const res = await doFetch(new URL("/health", opts.endpoint), { signal: controller.signal });
@@ -85,6 +104,10 @@ export async function probeResolverRevision(opts: {
     bodyText = null;
   } finally {
     clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", cancel);
   }
+  // A cancelled or superseded probe reports nothing: its connection is gone, and
+  // a late answer must not overwrite the current connection's verdict.
+  if (opts.signal?.aborted || (opts.isCurrent && !opts.isCurrent())) return;
   opts.reporter.observe(bodyText);
 }

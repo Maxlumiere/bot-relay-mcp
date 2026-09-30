@@ -31,7 +31,7 @@ export interface PlacementRow {
   flavour: "win32" | "posix";
   fs: Record<string, "dir" | "file" | { link: string }>;
   input: string;
-  expect: { realPath: string; exists: boolean };
+  expect: { realPath: string; exists: boolean } | { error: string };
 }
 export interface ResolutionTable {
   about: string;

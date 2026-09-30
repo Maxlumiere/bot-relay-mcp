@@ -14,10 +14,18 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 const warnings: string[] = [];
+// Codex #292 R2 #2: after teardown, the output channel is closed and writing to
+// it throws. The mocked warning sink does the same once `sinkClosed` is set.
+let sinkClosed = false;
+let lateReports = 0;
 
 vi.mock("vscode", () => ({
   window: {
     showWarningMessage: (m: string) => {
+      if (sinkClosed) {
+        lateReports++;
+        throw new Error("Channel has been closed");
+      }
       warnings.push(m);
       return Promise.resolve(undefined);
     },
@@ -29,7 +37,7 @@ vi.mock("vscode", () => ({
   ThemeColor: class {},
 }));
 
-const { connect } = await import("./extension.js");
+const { connect, deactivate } = await import("./extension.js");
 const { probeResolverRevision, ResolverSkewReporter } = await import("./resolver-skew.js");
 const { BUNDLED_RESOLVER_REVISION } = await import("./vault-path.js");
 
@@ -57,6 +65,8 @@ beforeAll(async () => {
 });
 afterAll(() => new Promise<void>((r) => server.close(() => r())));
 beforeEach(() => {
+  sinkClosed = false;
+  lateReports = 0;
   warnings.length = 0;
   hits.length = 0;
   healthStatus = 200;
@@ -118,5 +128,121 @@ describe("probeResolverRevision — one /health read, never throws", () => {
     const { out, reporter } = sinks();
     await expect(probeResolverRevision({ endpoint: "http://127.0.0.1:1", reporter, timeoutMs: 2000 })).resolves.toBeUndefined();
     expect(out.logs.join("\n")).toMatch(/cannot compare revisions/);
+  });
+});
+
+/** A relay whose /health answers `revision` after `delayMs`; /mcp is refused (401). */
+async function relayServer(revision: string, delayMs: number): Promise<{ endpoint: string; close: () => Promise<void> }> {
+  const srv = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", resolver_revision: revision }));
+      }, delayMs);
+      return;
+    }
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "AUTH_FAILED" }, id: null }));
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+  return {
+    endpoint: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+    close: () => new Promise<void>((r) => { srv.closeAllConnections(); srv.close(() => r()); }),
+  };
+}
+const cfg = (endpoint: string) => ({ endpoint, agentName: "probe-agent", agentToken: "stale-token-0000000000", autoInjectInbox: false, notificationLevel: "none" as const });
+
+describe("Codex #292 R2 #2 — a probe answering after teardown reports nothing and cannot throw", () => {
+  it("the SHIPPED path: connect(), then deactivate() before /health answers ⇒ no report into the closed sink, no unhandled rejection", async () => {
+    const slow = await relayServer(OTHER, 300);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await connect(cfg(slow.endpoint)).catch(() => {});
+      await deactivate();
+      sinkClosed = true; // VS Code has disposed the channel
+      await new Promise((r) => setTimeout(r, 600));
+      expect(unhandled, String(unhandled[0])).toEqual([]);
+      expect(lateReports, "the torn-down probe tried to report").toBe(0);
+      expect(warnings).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await slow.close();
+    }
+  });
+  it("a cancelled probe never reports", async () => {
+    const slow = await relayServer(OTHER, 300);
+    const out: string[] = [];
+    const reporter = new ResolverSkewReporter({ log: (l) => out.push(l), warn: (m) => out.push(m) });
+    const ctl = new AbortController();
+    const p = probeResolverRevision({ endpoint: slow.endpoint, reporter, timeoutMs: 2000, signal: ctl.signal });
+    setTimeout(() => ctl.abort(), 50);
+    await p;
+    expect(out).toEqual([]);
+    await slow.close();
+  });
+  it("an abort CANCELS the in-flight request: the relay sees the connection closed before it answers", async () => {
+    let closedEarly = false;
+    const srv = http.createServer((req, res) => {
+      res.on("close", () => { if (!res.writableEnded) closedEarly = true; });
+      setTimeout(() => { if (!res.destroyed) res.end("{}"); }, 400);
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const ep = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    const reporter = new ResolverSkewReporter({ log: () => {}, warn: () => {} });
+    const ctl = new AbortController();
+    const p = probeResolverRevision({ endpoint: ep, reporter, timeoutMs: 5000, signal: ctl.signal });
+    setTimeout(() => ctl.abort(), 50);
+    await p;
+    await until(() => closedEarly, 1000);
+    expect(closedEarly).toBe(true);
+    await new Promise<void>((r) => { srv.closeAllConnections(); srv.close(() => r()); });
+  });
+  it("a SUPERSEDED probe (isCurrent false) never reports, even with no abort", async () => {
+    const out: string[] = [];
+    const reporter = new ResolverSkewReporter({ log: (l) => out.push(l), warn: (m) => out.push(m) });
+    await probeResolverRevision({ endpoint, reporter, timeoutMs: 2000, isCurrent: () => false });
+    expect(out).toEqual([]);
+  });
+  it("a reporting sink that THROWS is contained: observe() and the probe never throw", async () => {
+    const reporter = new ResolverSkewReporter({
+      log: () => { throw new Error("Channel has been closed"); },
+      warn: () => { throw new Error("Channel has been closed"); },
+    });
+    expect(() => reporter.observe(JSON.stringify({ resolver_revision: OTHER }))).not.toThrow();
+    const r2 = new ResolverSkewReporter({ log: () => { throw new Error("closed"); }, warn: () => { throw new Error("closed"); } });
+    await expect(probeResolverRevision({ endpoint, reporter: r2, timeoutMs: 2000 })).resolves.toBeUndefined();
+  });
+});
+
+describe("Codex #292 R2 #3 — a superseded connection's late /health answer is discarded", () => {
+  it("connect A (slow, MISMATCH), then B (fast, MATCH) ⇒ B's verdict stands: no warning from A", async () => {
+    const a = await relayServer(OTHER, 400);
+    const b = await relayServer(BUNDLED_RESOLVER_REVISION, 0);
+    try {
+      await connect(cfg(a.endpoint)).catch(() => {});
+      await connect(cfg(b.endpoint)).catch(() => {});
+      await new Promise((r) => setTimeout(r, 800));
+      expect(warnings).toEqual([]);
+    } finally {
+      await a.close();
+      await b.close();
+    }
+  });
+  it("TWIN: A alone (slow, MISMATCH) ⇒ warned (the guard discards only a SUPERSEDED answer)", async () => {
+    // Start from a MATCH (the reporter reports only a change of verdict).
+    const same = await relayServer(BUNDLED_RESOLVER_REVISION, 0);
+    await connect(cfg(same.endpoint)).catch(() => {});
+    await new Promise((r) => setTimeout(r, 200));
+    await same.close();
+    const a = await relayServer(OTHER, 400);
+    try {
+      await connect(cfg(a.endpoint)).catch(() => {});
+      await until(() => warnings.length > 0, 3000);
+      expect(warnings.length).toBe(1);
+    } finally {
+      await a.close();
+    }
   });
 });

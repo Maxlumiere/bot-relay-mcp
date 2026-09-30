@@ -197,9 +197,33 @@ const NODE_WALK: WalkSystem = {
   realpath: (p) => fs.realpathSync.native(p),
 };
 
+/**
+ * A win32 NAMESPACE path in its ordinary spelling, so the walk sees the same
+ * root as the rest of the system: \\?\UNC\server\share\x is \\server\share\x, and
+ * \\?\C:\x and \\.\C:\x are C:\x. Any other namespace form (a volume GUID,
+ * GLOBALROOT, a raw device) cannot be placed safely: an explicit error, never a
+ * silent miss. Anything else is returned unchanged.
+ */
+export function canonicalWin32(p: string): { ok: true; path: string } | { ok: false; reason: string } {
+  const ns = /^[\\/]{2}[?.][\\/](.*)$/s.exec(p);
+  if (!ns) return { ok: true, path: p };
+  const rest = ns[1];
+  const unc = /^UNC[\\/]+([^\\/]+)[\\/]+([^\\/]+)(?:[\\/]+(.*))?$/is.exec(rest);
+  if (unc) return { ok: true, path: `\\\\${unc[1]}\\${unc[2]}\\${unc[3] ?? ""}` };
+  const drive = /^([A-Za-z]:)(?:[\\/]+(.*))?$/s.exec(rest);
+  if (drive) return { ok: true, path: `${drive[1]}\\${drive[2] ?? ""}` };
+  return { ok: false, reason: `unsupported Windows namespace path: ${p} (only \\\\?\\UNC\\server\\share\\, \\\\?\\X:\\ and \\\\.\\X:\\ can be placed)` };
+}
+
 /** Where the kernel would put `absPath`: the walk described at the top of this file. */
 export function placeReal(absPath: string, sys: WalkSystem = NODE_WALK): Placed {
   const P = sys.path;
+  const win = P.sep === "\\";
+  if (win) {
+    const c = canonicalWin32(absPath);
+    if (!c.ok) return c;
+    absPath = c.path;
+  }
   const why = (err: unknown) => (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
   // win32 accepts both separators in a path (and in a link target).
   const parts = (p: string) => p.split(P.sep === "\\" ? /[\\/]+/ : P.sep).filter((c) => c !== "");
@@ -242,9 +266,14 @@ export function placeReal(absPath: string, sys: WalkSystem = NODE_WALK): Placed 
       // are queued: on win32 the root is a drive (C:\) or a UNC prefix
       // (\\server\share\), never a component to walk into. A root-relative
       // target on win32 (\data) keeps the drive the walk is on.
+      if (win) {
+        const c = canonicalWin32(target);
+        if (!c.ok) return c;
+        target = c.path;
+      }
       if (P.isAbsolute(target)) {
         const root = P.parse(target).root;
-        cur = P.sep === "\\" && /^[\\/]$/.test(root) ? P.parse(cur).root : root;
+        cur = win && /^[\\/]$/.test(root) ? P.parse(cur).root : root;
         queue.unshift(...parts(target.slice(root.length)));
       } else {
         queue.unshift(...parts(target));

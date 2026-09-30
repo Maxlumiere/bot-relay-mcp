@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "15dd790befcd";
+export const RESOLVER_REVISION = "81aa4d2f37b1";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";

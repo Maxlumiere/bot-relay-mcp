@@ -72,7 +72,13 @@ describe("ADR-0048 PR D — placement_sim: the real-path walk on a simulated fil
   });
   for (const row of table.placement_sim.rows) {
     it(row.name, () => {
-      expect(placeReal(row.input, simulatedWalk(row))).toMatchObject({ ok: true, realPath: row.expect.realPath, exists: row.expect.exists });
+      const placed = placeReal(row.input, simulatedWalk(row));
+      if ("error" in row.expect) {
+        expect(placed.ok, JSON.stringify(placed)).toBe(false);
+        expect(placed.ok ? "" : placed.reason).toContain(row.expect.error);
+      } else {
+        expect(placed).toMatchObject({ ok: true, realPath: row.expect.realPath, exists: row.expect.exists });
+      }
     });
   }
 });

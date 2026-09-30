@@ -397,6 +397,17 @@ const resolverSkew = new ResolverSkewReporter({
   log: (line) => log(line),
   warn: (message) => void vscode.window.showWarningMessage(`Tether: ${message}`),
 });
+// The /health resolver probe of the CURRENT connection (connect() below). A new
+// connect() and every teardown (disconnect(), so deactivate() too) cancel it and
+// advance the generation, so a late answer can neither report into a closed
+// output channel nor overwrite the verdict of a newer connection.
+let skewProbeGeneration = 0;
+let skewProbeAbort: AbortController | undefined;
+function cancelSkewProbe(): void {
+  skewProbeGeneration++;
+  skewProbeAbort?.abort();
+  skewProbeAbort = undefined;
+}
 const healthPoll = new HealthPoll({
   threshold: HEALTH_POLL_FAIL_THRESHOLD,
   fetchHealth: async () => {
@@ -915,7 +926,16 @@ export async function connect(config: TetherConfig): Promise<void> {
   // ADR-0048 PR D: compare resolver revisions from /health (no token needed) on
   // its own, NOT awaited and NOT gated on the MCP connect below: a relay that
   // refuses the connection (a 401) still has a skew named, often its cause.
-  void probeResolverRevision({ endpoint: config.endpoint, reporter: resolverSkew, timeoutMs: HEALTH_POLL_TIMEOUT_MS });
+  // disconnect() above already cancelled the previous connection's probe.
+  const probeGeneration = skewProbeGeneration;
+  skewProbeAbort = new AbortController();
+  void probeResolverRevision({
+    endpoint: config.endpoint,
+    reporter: resolverSkew,
+    timeoutMs: HEALTH_POLL_TIMEOUT_MS,
+    signal: skewProbeAbort.signal,
+    isCurrent: () => probeGeneration === skewProbeGeneration,
+  });
   const url = new URL("/mcp", config.endpoint);
   // The SDK's StreamableHTTPClientTransport accepts request init for
   // header injection; the relay's HTTP transport reads X-Agent-Token
@@ -1115,6 +1135,7 @@ async function rerouteSuppressedWakes(): Promise<void> {
 }
 
 async function disconnect(): Promise<void> {
+  cancelSkewProbe();
   if (mcpClient) {
     try {
       await mcpClient.close();
