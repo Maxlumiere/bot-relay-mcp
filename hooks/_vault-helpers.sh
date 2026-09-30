@@ -8,8 +8,12 @@
 # real test failure (not a silent inline-copy hide-out — the test path
 # must match the shipped path).
 #
+# The relay DB path is NOT derived here (ADR-0048): it is the ONE resolver's
+# answer (src/instance.ts resolveInstance), asked through `relay where --fields`
+# (relay_where_load) or taken from what `relay pending --json` reported
+# (relay_res_set_db). resolve_relay_db_path is a shim over that answer.
+#
 # Mirrors:
-#   - src/instance.ts:resolveInstanceDbPath          → resolve_relay_db_path
 #   - src/token-store.ts:resolveAgentVaultDir +
 #     FileTokenStore.{pathFor,read,write}            → resolve_relay_token_path
 #                                                       read_relay_token_from_vault
@@ -22,13 +26,6 @@
 # callers source it from many contexts (hooks running under Claude Code's
 # event loop, the migration script, vitest test bash). Functions only.
 
-# resolve_relay_db_path — echo absolute DB path on stdout. Returns 0; on
-# malformed instance_id, echoes nothing + returns 1 + stderr message.
-#
-# Mirrors:
-#   - botRelayRoot()              src/instance.ts:70   (RELAY_HOME wins, else $HOME/.bot-relay)
-#   - resolveActiveInstanceId()   src/instance.ts:118  (RELAY_INSTANCE_ID > active-instance link/file)
-#   - instanceDir()               src/instance.ts:149  ([A-Za-z0-9._-]+ allowlist)
 # Whole-string match. `echo "$X" | grep -Eq '^RE$'` is LINE-oriented: a
 # multi-line value passes if ANY line matches, and the rest rides along into
 # whatever the value is used for (Codex round 2 on #280: a newline in
@@ -36,38 +33,155 @@
 # whole string.
 relay_whole_match() { [[ "$1" =~ $2 ]]; }
 
+# relay_helpers_cli — the relay CLI beside these hooks (hooks/../bin/relay). A
+# function, not a top-level assignment: this file runs no top-level commands.
+# Inside a function, BASH_SOURCE[0] is the file that defines it (this one).
+relay_helpers_cli() {
+  printf '%s/bin/relay' "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+}
+
+# relay_where_load [CLI] — ask the ONE resolver, ONCE, through `relay where
+# --fields`, and hold its answer in exported RELAY_RES_* variables (so every
+# later $(...) subshell reuses it instead of starting node again):
+#   RELAY_RES_KIND     explicit-db | instance | flat | error
+#   RELAY_RES_DB_PATH  the DB path (empty on error)
+#   RELAY_RES_EXISTS   true | false (empty on error)
+#   RELAY_RES_REASON   why, on error
+#   RELAY_RES_WARNING  the flat-fallback warning (RELAY_ALLOW_LEGACY_FALLBACK=1)
+# Returns 0 when the resolver answered (the answer may be the error kind); 1
+# when it could not be asked (no node, no CLI, no time left, a timeout, no
+# answer), which is also recorded as the error kind with the reason. A path is
+# exposed ONLY from a SUCCESSFUL, COMPLETE answer: exit 0, all six lines, a known
+# kind, a DB path, `exists` true or false (an error answer must exit 1 with its
+# reason), and a path carrying a control character (C0 or DEL) is refused;
+# anything else (a failed or truncated run) is the error kind. The read is
+# bounded by an explicit cap in seconds (the 2nd argument, from the caller's
+# relay_budget_for), or else by relay_budget_for here (the pre-mail budget).
+relay_where_load() {
+  local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" nlines=0
+  export RELAY_RES_LOADED=1 RELAY_RES_KIND=error RELAY_RES_DB_PATH="" RELAY_RES_EXISTS="" RELAY_RES_REASON="" RELAY_RES_WARNING=""
+  if ! command -v node >/dev/null 2>&1; then
+    export RELAY_RES_REASON="node not found (the relay CLI runs on node)"
+    return 1
+  fi
+  if [ ! -f "$cli" ]; then
+    export RELAY_RES_REASON="no relay CLI beside this hook ($cli)"
+    return 1
+  fi
+  # An explicit cap (PostToolUse/Stop take theirs from relay_budget_for) is used
+  # as given; without one (SessionStart, BEFORE its mail read) the pre-mail budget
+  # applies, so the mail read keeps its reserve.
+  case "$cap" in
+    ''|*[!0-9]*)
+      if ! relay_budget_for "the resolver" 5; then
+        export RELAY_RES_REASON="no time budget left to ask the resolver"
+        return 1
+      fi
+      secs="$RELAY_STEP_SECS"
+      ;;
+    *) secs="$cap" ;;
+  esac
+  if [ "$secs" -lt 1 ]; then
+    export RELAY_RES_REASON="no time budget left to ask the resolver"
+    return 1
+  fi
+  outf="$(mktemp 2>/dev/null || printf '')"
+  errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -z "$outf" ] || [ -z "$errf" ]; then
+    rm -f "$outf" "$errf" 2>/dev/null
+    export RELAY_RES_REASON="could not create a private temp file to ask the resolver"
+    return 1
+  fi
+  relay_run_pending "$secs" "$outf" "$errf" node "$cli" where --fields
+  rc=$?
+  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; } < "$outf"
+  nlines=$(wc -l < "$outf" 2>/dev/null | tr -d ' ')
+  rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
+  if [ "$rc" -eq 124 ]; then
+    export RELAY_RES_REASON="relay where timed out after ${secs}s"
+    return 1
+  fi
+  if [ "${nlines:-0}" != 6 ]; then
+    export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 6 lines)"
+    return 1
+  fi
+  case "$k" in
+    explicit-db|instance|flat)
+      if [ "$rc" -ne 0 ] || [ -z "$d" ] || { [ "$e" != true ] && [ "$e" != false ]; }; then
+        export RELAY_RES_REASON="relay where gave an invalid path answer (exit $rc)"
+        return 1
+      fi
+      # A control character in the path (C0 or DEL) is never a path to hand on.
+      if relay_whole_match "$d" '[[:cntrl:]]'; then
+        export RELAY_RES_REASON="relay where gave a path with a control character: refused"
+        return 1
+      fi
+      export RELAY_RES_KIND="$k" RELAY_RES_DB_PATH="$d" RELAY_RES_EXISTS="$e" RELAY_RES_WARNING="$warn"
+      return 0
+      ;;
+    error)
+      if [ "$rc" -ne 1 ]; then
+        export RELAY_RES_REASON="relay where reported an error but exited $rc"
+        return 1
+      fi
+      export RELAY_RES_REASON="${why:-the resolver reported an error without a reason}"
+      return 0
+      ;;
+  esac
+  export RELAY_RES_REASON="relay where gave no valid answer (exit $rc)"
+  return 1
+}
+
+# relay_res_set_db PATH — the resolver's DB path as `relay pending --json`
+# reported it (its embedded resolution): no second node start for the same fact.
+relay_res_set_db() {
+  export RELAY_RES_LOADED=1 RELAY_RES_KIND=reported RELAY_RES_DB_PATH="$1" RELAY_RES_EXISTS=true RELAY_RES_REASON="" RELAY_RES_WARNING=""
+}
+
+# relay_pending_resolution_db JSON — the DB path of the resolution a `relay
+# pending --json` answer EMBEDS, echoed with return 0, ONLY when that resolution
+# is valid: kind explicit-db | instance | flat, db_path a non-empty string,
+# exists a boolean, and NO control character (C0, NUL included, or DEL) in any
+# of its strings: bash command substitution silently drops a NUL, so a path that
+# carried one would name a different file. A missing or malformed resolution, the error kind or
+# an unknown kind → return 1: an exit-0 answer without a valid resolution is not
+# a trustworthy read (the caller reports DEGRADED and reads nothing through it).
+# PostToolUse and Stop only (python3, which those hooks already require).
+relay_pending_resolution_db() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin).get("resolution")
+except Exception:
+    sys.exit(1)
+if not isinstance(r, dict) or r.get("kind") not in ("explicit-db", "instance", "flat"):
+    sys.exit(1)
+def controls(v):
+    if isinstance(v, str):
+        return any(ord(c) < 32 or ord(c) == 127 for c in v)
+    if isinstance(v, dict):
+        return any(controls(k) or controls(x) for k, x in v.items())
+    if isinstance(v, list):
+        return any(controls(x) for x in v)
+    return False
+p, e = r.get("db_path"), r.get("exists")
+if not isinstance(p, str) or not p or not isinstance(e, bool) or controls(r):
+    sys.exit(1)
+sys.stdout.write(p)' 2>/dev/null
+}
+
+# resolve_relay_db_path — echo the resolver's DB path on stdout and return 0; on
+# a resolver error (or when the resolver could not be asked), echo nothing, name
+# the reason on stderr, return 1. Never a bash re-derivation: it asks
+# relay_where_load when nothing has been loaded yet.
 resolve_relay_db_path() {
-  if [ -n "${RELAY_DB_PATH:-}" ]; then
-    echo "$RELAY_DB_PATH"
-    return 0
+  [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
+  if [ "${RELAY_RES_KIND:-error}" = error ] || [ -z "${RELAY_RES_DB_PATH:-}" ]; then
+    echo "[bot-relay hook] instance resolution failed: ${RELAY_RES_REASON:-unknown}" >&2
+    return 1
   fi
-  local root="${RELAY_HOME:-$HOME/.bot-relay}"
-  local id=""
-  if [ -n "${RELAY_INSTANCE_ID:-}" ]; then
-    id="$RELAY_INSTANCE_ID"
-  elif [ -L "$root/active-instance" ]; then
-    # readlink target may be a bare instance_id or an absolute/relative
-    # path; basename normalizes both shapes (mirrors path.basename in
-    # src/instance.ts:135).
-    id=$(basename "$(readlink "$root/active-instance")")
-  elif [ -f "$root/active-instance" ]; then
-    # File-fallback for platforms where symlink creation is restricted
-    # (Windows non-admin); src/instance.ts:setActiveInstance writes a
-    # regular file in that case.
-    id=$(head -n 1 "$root/active-instance" | tr -d '[:space:]')
-  fi
-  if [ -n "$id" ]; then
-    # Inlined whole-string match (not relay_whole_match): this function is also
-    # extracted and run standalone by tests/v2-4-5, so it must be self-contained.
-    local id_re='^[A-Za-z0-9._-]+$'
-    if ! [[ "$id" =~ $id_re ]]; then
-      echo "[bot-relay hook] invalid instance_id \"$id\" — must match [A-Za-z0-9._-]+ (mirrors src/instance.ts:instanceDir)" >&2
-      return 1
-    fi
-    echo "$root/instances/$id/relay.db"
-    return 0
-  fi
-  echo "$root/relay.db"
+  echo "$RELAY_RES_DB_PATH"
   return 0
 }
 
@@ -528,9 +642,18 @@ relay_pid_chain() {
 relay_run_pending() {
   local secs="$1" outf="$2" errf="$3"
   shift 3
+  relay_run_bounded "$secs" /dev/null "$outf" "$errf" "$@"
+}
+
+# relay_run_bounded SECS INFILE OUTF ERRF CMD... — relay_run_pending's watchdog
+# with a chosen stdin (the bind reads the hook payload on stdin): CMD runs
+# directly into files, is killed at SECS, and 124 means it timed out.
+relay_run_bounded() {
+  local secs="$1" inf="$2" outf="$3" errf="$4"
+  shift 4
   local mark="$outf.timedout"
   rm -f "$mark" 2>/dev/null
-  "$@" >"$outf" 2>"$errf" </dev/null &
+  "$@" >"$outf" 2>"$errf" <"$inf" &
   local pid=$!
   (
     trap 'kill "$s" 2>/dev/null; exit 0' TERM
@@ -558,16 +681,88 @@ relay_run_pending() {
   return "$rc"
 }
 
-# relay_pending_deadline BUDGET
-# Whole seconds `relay pending` may run in this hook. BUDGET is the hook's
-# INSTALLED timeout (src/agent-cli-profiles.ts is the source of truth; each hook
-# declares it as RELAY_HOOK_BUDGET_SECS, and a test holds the two equal). The
-# deadline is what is LEFT of it (minus what this hook already spent, $SECONDS)
-# minus a 3s margin to report the failure (SECONDS truncates, so up to 1s spent
-# is unseen, and the watchdog's 1s KILL grace comes on top), so the harness never
-# kills the hook before it can say why. RELAY_PENDING_TIMEOUT_SECS may only
-# shorten it. NO FLOOR: below 1 means there is no time left, and the caller must
-# SKIP the read and say so, never squeeze in a 1s read the harness would kill.
+# relay_run_capture SECS INFILE CMD... — CMD under relay_run_bounded's watchdog
+# (killed at SECS, 124 = timed out), stdin from INFILE (/dev/stdin: this
+# function's own, e.g. a heredoc), its stdout printed. For a blocking call whose
+# answer the caller captures (a sqlite3 read): files, never a pipe, as above.
+relay_run_capture() {
+  local secs="$1" inf="$2" outf errf rc
+  shift 2
+  outf="$(mktemp 2>/dev/null || printf '')"
+  errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -z "$outf" ] || [ -z "$errf" ]; then
+    rm -f "$outf" "$errf" 2>/dev/null
+    return 125
+  fi
+  relay_run_bounded "$secs" "$inf" "$outf" "$errf" "$@"
+  rc=$?
+  cat "$outf" 2>/dev/null
+  rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
+  return "$rc"
+}
+
+# THE TIME BUDGET. Every blocking call in a hook (curl, the relay CLI, sqlite3,
+# the hook's own stdin read) takes its timeout from relay_budget_for below, never
+# a fixed number: a test fails on any literal timeout spelling in hooks/*.sh.
+#
+# Each hook declares its INSTALLED timeout as RELAY_HOOK_BUDGET_SECS (the source
+# of truth is src/agent-cli-profiles.ts; a test holds the two equal). What is left
+# of it is the budget minus what the hook already spent ($SECONDS) minus a 3s
+# margin to report a failure (SECONDS truncates, so up to 1s spent is unseen, and
+# the watchdog's 1s KILL grace comes on top), so the harness never kills the hook
+# before it can say why.
+
+# relay_margin_secs — whole seconds left for any step: the installed budget minus
+# what was spent minus the report margin. Never negative.
+relay_margin_secs() {
+  local budget="${RELAY_HOOK_BUDGET_SECS:-10}" left
+  case "$budget" in ''|*[!0-9]*) budget=10 ;; esac
+  left=$(( budget - ${SECONDS:-0} - 3 ))
+  [ "$left" -lt 0 ] && left=0
+  printf '%s' "$left"
+}
+
+# relay_premail_secs — whole seconds a step BEFORE SessionStart's mail read may
+# still use: relay_margin_secs minus a RESERVE for the mail read itself (2s), so
+# the pre-mail steps together can never eat the mail read's time. Never negative.
+relay_premail_secs() {
+  local left
+  left=$(( $(relay_margin_secs) - 2 ))
+  [ "$left" -lt 0 ] && left=0
+  printf '%s' "$left"
+}
+
+# relay_budget_for STEP OWN [premail|margin] — may STEP still run, and for how
+# long? Sets RELAY_STEP_SECS to the smaller of the step's own cap OWN and what is
+# left: relay_premail_secs (premail, the default: a SessionStart step before its
+# mail read) or relay_margin_secs (margin: the mail read's own remote call, any
+# step after it, and every step of PostToolUse and Stop, whose 5s budget has no
+# room for a reserve). With under a second left the step is SKIPPED (a `curl -m 0`
+# would be no timeout at all), LOUDLY: a stderr line, RELAY_BUDGET_SKIPPED names
+# the first skipped step, and the hook's relay_budget_skipped (when it defines
+# one) raises DEGRADED "no time budget left for STEP". Returns 1 then.
+relay_budget_for() {
+  local step="$1" own="$2" left
+  case "$own" in ''|*[!0-9]*) own=0 ;; esac
+  if [ "${3:-premail}" = margin ]; then left=$(relay_margin_secs); else left=$(relay_premail_secs); fi
+  if [ "$own" -lt "$left" ]; then RELAY_STEP_SECS="$own"; else RELAY_STEP_SECS="$left"; fi
+  if [ "$RELAY_STEP_SECS" -lt 1 ]; then
+    RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-$step}"
+    echo "[bot-relay] no time budget left for $step (${SECONDS}s of ${RELAY_HOOK_BUDGET_SECS:-10}s spent): skipped." >&2
+    if declare -F relay_budget_skipped >/dev/null 2>&1; then
+      relay_budget_skipped "$step"
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# relay_pending_deadline BUDGET — whole seconds `relay pending` (the mail read)
+# may run: what is left of BUDGET (the hook's RELAY_HOOK_BUDGET_SECS) after $SECONDS
+# spent and the 3s margin, as relay_margin_secs. RELAY_PENDING_TIMEOUT_SECS may
+# only shorten it. NO FLOOR: below 1 means there is no time left, and the caller
+# must SKIP the read and say so (its own loud path: "relay unreadable: no time
+# budget left"), never squeeze in a 1s read the harness would kill.
 relay_pending_deadline() {
   local budget="$1" margin=3 left v
   case "$budget" in ''|*[!0-9]*) budget=5 ;; esac

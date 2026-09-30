@@ -11,8 +11,9 @@
 #   RELAY_AGENT_ROLE         — agent role (default: "user")
 #   RELAY_AGENT_CAPABILITIES — comma-separated (default: empty)
 #   RELAY_DB_PATH            — DB path (default: per-instance resolution, see below)
-#   RELAY_INSTANCE_ID        — (v2.4.5) explicit per-instance override; mirrors
-#                              src/instance.ts:resolveInstanceDbPath().
+#   RELAY_INSTANCE_ID        — (v2.4.5) explicit per-instance override. Every DB
+#                              path is the ONE resolver's answer (ADR-0048,
+#                              src/instance.ts resolveInstance, via relay where).
 #   RELAY_AGENT_TOKEN        — (v1.7+) token for authenticated tool calls
 #   RELAY_RECOVERY_TOKEN     — (v2.1 Phase 4b.1 v2) admin-issued one-time
 #                              recovery secret. If the daemon reports the
@@ -27,9 +28,9 @@
 # Security notes (v1.6):
 # - All env-var inputs are validated against an allowlist regex BEFORE use.
 # - Names/roles/caps that contain anything outside [A-Za-z0-9_.-] are rejected.
-# - DB_PATH is resolved and must live under $HOME or a temp root for this hook's OWN
-#   sqlite reads; a path outside them skips those reads (DEGRADED in local mode),
-#   it never ends the hook (the mail read is decided by relay pending).
+# - DB_PATH is the resolver's answer (`relay where`, which owns containment); a
+#   resolver error skips this hook's OWN sqlite reads (DEGRADED in local mode), it
+#   never ends the hook (the mail read is decided by relay pending).
 # - SQL is parameterised via sqlite3's `.parameter set` rather than string-interpolated.
 
 # VERDICT BY CONSTRUCTION — must be the FIRST executable code in this file.
@@ -106,22 +107,40 @@ fi
 # TIME, not bytes. macOS has no `timeout`/`gtimeout` (verified: bash 3.2,
 # /usr/bin/perl present), and perl's alarm interrupts a blocking slurp — measured
 # at 2s against a FIFO with a live writer that never closes.
+# v2.6.1 — vault helpers sourced from a single file (functions only: sourcing
+# reads nothing, so stdin is still untouched). The DB path (and so the vault
+# beside it) is the ONE resolver's answer (ADR-0048), never a bash derivation.
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./_vault-helpers.sh
+. "$HOOKS_DIR/_vault-helpers.sh"
+# This hook's INSTALLED timeout in seconds. The source of truth is
+# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
+# equal. Every blocking call below takes its timeout from what is LEFT of it
+# (relay_budget_for in _vault-helpers.sh).
+RELAY_HOOK_BUDGET_SECS=10
+# A step skipped for want of time is a concluded fault: DEGRADED, "no time budget
+# left for STEP" (relay_budget_for calls this by name).
+relay_budget_skipped() {
+  command -v relay_verdict_raise >/dev/null 2>&1 || return 0
+  relay_verdict_raise "DEGRADED" "no time budget left for $1 (${SECONDS}s spent)" " agent=\"${AGENT_NAME:-}\"" other
+}
+
 RELAY_HOOK_PAYLOAD=""
-if [ ! -t 0 ]; then
+if [ ! -t 0 ] && relay_budget_for "the hook payload read" 2; then
   if command -v perl >/dev/null 2>&1; then
-    RELAY_HOOK_PAYLOAD=$(perl -e '
+    RELAY_HOOK_PAYLOAD=$(RELAY_STEP_SECS="$RELAY_STEP_SECS" perl -e '
       eval {
         local $SIG{ALRM} = sub { die "relay-stdin-timeout\n" };
-        alarm 2;
+        alarm $ENV{RELAY_STEP_SECS};
         my $d = do { local $/; <STDIN> };
         alarm 0;
         print substr($d, 0, 1048576) if defined $d;
       };
     ' 2>/dev/null || printf '')
   elif command -v timeout >/dev/null 2>&1; then
-    RELAY_HOOK_PAYLOAD=$(timeout 2 head -c 1048576 2>/dev/null || printf '')
+    RELAY_HOOK_PAYLOAD=$(timeout "$RELAY_STEP_SECS" head -c 1048576 2>/dev/null || printf '')
   elif command -v gtimeout >/dev/null 2>&1; then
-    RELAY_HOOK_PAYLOAD=$(gtimeout 2 head -c 1048576 2>/dev/null || printf '')
+    RELAY_HOOK_PAYLOAD=$(gtimeout "$RELAY_STEP_SECS" head -c 1048576 2>/dev/null || printf '')
   fi
   # NO unbounded fallback. With no way to bound the read, SKIP the payload: the
   # cost of no bind is one unrecorded window, and the cost of a hang is the whole
@@ -159,18 +178,10 @@ RELAY_TERMINAL_TITLE_RE='^[A-Za-z0-9_. -]{1,100}$'
 if [ -n "$RELAY_TERMINAL_TITLE_VALUE" ] && ! [[ "$RELAY_TERMINAL_TITLE_VALUE" =~ $RELAY_TERMINAL_TITLE_RE ]]; then
   RELAY_TERMINAL_TITLE_VALUE=""
 fi
-# v2.6.1 — vault helpers + DB-path resolution sourced from a single file.
-# Mirrors src/instance.ts:resolveInstanceDbPath + src/token-store.ts:
-# resolveAgentVaultDir + FileTokenStore.{pathFor,read,write}. Drift surfaces
-# directly as a test failure in tests/v2-6-1-token-store.test.ts (which
-# sources this same file) — no inline-copy hide-out.
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=./_vault-helpers.sh
-. "$HOOKS_DIR/_vault-helpers.sh"
-# This hook's INSTALLED timeout in seconds. The source of truth is
-# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
-# equal. The mail read's deadline is what is LEFT of it after registration.
-RELAY_HOOK_BUDGET_SECS=10
+# ADR-0048: ask the ONE resolver ONCE, before anything needs a path (the spawn
+# manifest and the vault live beside the DB, and the mail read follows). Its
+# answer is held in exported RELAY_RES_* variables for every helper below.
+relay_where_load "$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay" || true
 # v2.7.2 — manifest-fallback (see comment above the AGENT_NAME default). Only
 # kicks in when env-derived name is empty or literal "default" — operators who
 # explicitly want the "default" agent (rare, but legitimate) can opt out by
@@ -206,14 +217,12 @@ if [ -z "${RELAY_DISABLE_MANIFEST_FALLBACK:-}" ] && { [ "$AGENT_NAME" = "default
     fi
   fi
 fi
-DB_PATH=$(resolve_relay_db_path) || {
-  # Malformed active-instance content — refuse to fall back silently. A
-  # broken setup should be loud, not hidden under legacy. The hook's
-  # other side effects (HTTP register/health, mail delivery) are gated
-  # behind DB_PATH being readable below; null DB_PATH falls cleanly to
-  # the existing "no DB → exit 0" path.
-  DB_PATH=""
-}
+# The resolver's DB path, or none on a resolver error: never a fallback. The
+# hook's own reads (liveness, register, bind, tasks) are gated on it below.
+DB_PATH=""
+if [ "${RELAY_RES_KIND:-error}" != error ]; then
+  DB_PATH="$RELAY_RES_DB_PATH"
+fi
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 
@@ -279,32 +288,22 @@ if [ -n "$AGENT_CAPS" ]; then
 fi
 
 # The DB path THIS HOOK's own reads use (liveness, anchor, tasks, topology). The
-# mail read does not use it: relay pending resolves its own. Three states, never
-# a made-up path and never a mute exit:
-#   usable     — its directory resolves, under $HOME or a temp root;
-#   unresolved — its directory does not resolve (absent, or not enterable): no DB
-#                file can be read there by this hook; relay pending decides;
-#   rejected   — it resolves OUTSIDE $HOME and the temp roots (the containment
-#                guard): this hook's own reads are skipped, and in LOCAL mode
-#                that is DEGRADED with the reason.
-# (A failed `cd` used to become '/relay.db' and exit mute: Codex #286 R2 D2.)
+# mail read does not use it: relay pending resolves its own, through the same
+# resolver. Containment is the resolver's (ADR-0048): there is no bash guard.
+#   usable     — the resolver named a DB path;
+#   unresolved — the resolver reported an error (or could not be asked): this
+#                hook's own reads are skipped, and in LOCAL mode that is DEGRADED
+#                with the resolver's reason. Never a made-up path, never mute.
 RELAY_LOCAL_DB_STATE="usable"
 RELAY_LOCAL_DB_WHY=""
-_relay_db_dir=""
-if [ -n "$DB_PATH" ]; then
-  _relay_db_dir=$(cd "$(dirname "$DB_PATH")" 2>/dev/null && pwd) || _relay_db_dir=""
-fi
-if [ -z "$DB_PATH" ] || [ -z "$_relay_db_dir" ]; then
+if [ -z "$DB_PATH" ]; then
   RELAY_LOCAL_DB_STATE="unresolved"
-else
-  RESOLVED_DB_PATH="$_relay_db_dir/$(basename "$DB_PATH")"
-  if [[ "$RESOLVED_DB_PATH" != "$HOME"/* ]] && [[ "$RESOLVED_DB_PATH" != /tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /private/tmp/* ]] && [[ "$RESOLVED_DB_PATH" != /var/folders/* ]]; then
-    RELAY_LOCAL_DB_STATE="rejected"
-    RELAY_LOCAL_DB_WHY="it resolves outside HOME and the temp roots"
-    echo "[bot-relay] RELAY_DB_PATH must live under \$HOME or /tmp. Got: '$RESOLVED_DB_PATH'. This hook's own DB reads are skipped; the mail read is still decided by relay pending." >&2
-  else
-    DB_PATH="$RESOLVED_DB_PATH"
-  fi
+  # Held to a safe character set: the reason lands inside the one-line verdict.
+  RELAY_LOCAL_DB_WHY="instance resolution failed: $(printf '%s' "${RELAY_RES_REASON:-unknown}" | tr -cd 'A-Za-z0-9 _./:()=,-' | cut -c1-200)"
+  # LOUD, to the agent (stdout is its context) and the operator: the resolver's
+  # own reason names the fix (for example `relay use-instance <id>`). One line:
+  # the resolver's --fields answer carries no line break.
+  echo "[RELAY] instance resolution FAILED: ${RELAY_RES_REASON:-unknown}" | tee /dev/stderr
 fi
 
 # --- SELF-DIAGNOSING MUTE DETECTION -----------------------------------------
@@ -324,35 +323,22 @@ fi
 # Written to STDOUT deliberately: SessionStart hook stdout is injected into the
 # session as context, so the agent itself reads the warning and can refuse to
 # proceed as connected. A copy goes to stderr for the operator's terminal.
-# RELAY_HOME mirrors botRelayRoot() in src/instance.ts — the hook and the server
-# must agree on where the namespace lives or their diagnostics will contradict
-# each other (codex HIGH: hardcoding $HOME/.bot-relay diverged from the server).
-RELAY_ROOT="${RELAY_HOME:-${HOME}/.bot-relay}"
-RELAY_LEGACY_DB="${RELAY_ROOT}/relay.db"
-RELAY_INSTANCES_DIR="${RELAY_ROOT}/instances"
-
-RELAY_INSTANCE_DIR_COUNT=0
-if [ -d "$RELAY_INSTANCES_DIR" ]; then
-  RELAY_INSTANCE_DIR_COUNT=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-fi
-
-# HARM 2 — the contradiction: instances exist, yet we resolved the flat legacy DB.
 #
-# An explicit RELAY_DB_PATH is a DELIBERATE OPERATOR CHOICE and must never be
-# reported as a fault — assertInstanceResolution() already treats it that way,
-# and the two halves contradicting each other is worse than either being wrong
-# alone. Without this guard the hook tells a legitimate legacy-DB session that
-# it has lost its mail (codex HIGH).
-if [ -z "${RELAY_DB_PATH:-}" ] && [ "${RELAY_INSTANCE_DIR_COUNT:-0}" -gt 0 ] && [ "$DB_PATH" = "$RELAY_LEGACY_DB" ]; then
+# HARM 2 — the contradiction: instances exist, yet the flat legacy DB is in use.
+# Since ADR-0048 the resolver only chooses the flat DB then under the explicit
+# RELAY_ALLOW_LEGACY_FALLBACK=1 opt-in, and says so in its warning (which names
+# the instances); without the opt-in that state is a resolver error, reported
+# above as DEGRADED. An explicit RELAY_DB_PATH is a deliberate operator choice and
+# is never flagged (the resolver answers explicit-db then, with no warning).
+if [ "${RELAY_RES_KIND:-}" = flat ] && [ -n "${RELAY_RES_WARNING:-}" ]; then
   # Set OUTSIDE the `{ ... } | tee` below: a pipeline runs in a SUBSHELL, so an
   # assignment made inside it is discarded when that subshell exits.
   relay_verdict_set "MUTE" "resolved the legacy DB while instances exist — inbox will read empty" " db=\"$DB_PATH\""
-  RELAY_AVAILABLE_IDS=$(find "$RELAY_INSTANCES_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
   {
     echo "[RELAY] *** WRONG INSTANCE — DO NOT PROCEED AS CONNECTED ***"
     echo "[RELAY] Relay tools may work, but this session resolved the LEGACY database:"
     echo "[RELAY]     using     : $DB_PATH"
-    echo "[RELAY]     instances : ${RELAY_AVAILABLE_IDS:-(unreadable)}"
+    echo "[RELAY]     resolver  : $RELAY_RES_WARNING"
     echo "[RELAY] Your real mailbox lives under an instance directory, so your inbox will"
     echo "[RELAY] read EMPTY no matter how much mail is sent to you. This is silent message"
     echo "[RELAY] loss, not a quiet inbox."
@@ -525,8 +511,8 @@ fi
 #     it): a stall is reported;
 #   - the header says how many of the canonical total are shown, and an answer
 #     whose count contradicts its messages is refused, never shown as no mail.
-# KNOWN LIMIT: the liveness and task reads in this hook still resolve the DB in
-# bash (resolve_relay_db_path) until ADR-0048's single resolver lands.
+# This hook's own reads (liveness, anchor, tasks) use the SAME resolver's answer
+# (relay where, loaded at the top): one resolution for everything.
 #
 # FRAMING (shared by the mail and task renderers). This stdout is the agent's
 # context AND carries this hook's own "[RELAY] VERDICT=" line, so no sender-chosen
@@ -638,7 +624,12 @@ relay_deliver_remote_mail() {
       name: "get_messages",
       arguments: { agent_name: process.env.AN, status: "pending", limit: Number(process.env.LIM), peek: true, since: "all", agent_token: process.env.AT },
     } }));' 2>/dev/null) || { relay_remote_failed "could not build the request"; return 0; }
-  resp=$(curl -fsS --max-time 4 -X POST "http://${host}:${port}/mcp" \
+  # The remote read IS the mail read: it draws on what is left (margin, no reserve).
+  if ! relay_budget_for "the remote mail read" 4 margin; then
+    relay_remote_failed "no time budget left for the remote mail read"
+    return 0
+  fi
+  resp=$(curl -fsS -m "$RELAY_STEP_SECS" -X POST "http://${host}:${port}/mcp" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
     -H "X-Agent-Token: $tok" --data "$payload" 2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }
   block=$(printf '%s' "$resp" | SRC=http AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null) \
@@ -681,12 +672,14 @@ relay_deliver_pending_mail() {
       RELAY_TMP_FILES="$RELAY_TMP_FILES $outf $errf $outf.timedout"
       # node runs DIRECTLY into files under a watchdog, inside what is LEFT of this
       # hook's installed budget (relay_run_pending / relay_pending_deadline).
-      deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
-      if [ "$deadline" -lt 1 ]; then
+      if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
+        deadline="$RELAY_STEP_SECS"
+      else
         # No time left for the read: SKIP it and say so (never a floored 1s read).
         rc=125
         why="no time budget left (${SECONDS}s spent before the mail read)"
-      else
+      fi
+      if [ "$rc" -ne 125 ]; then
         relay_run_pending "$deadline" "$outf" "$errf" node "$bin" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW"
         rc=$?
         out=$(cat "$outf" 2>/dev/null)
@@ -735,14 +728,14 @@ relay_deliver_pending_mail() {
 # The order (the F1 mode rule, D2): the name is resolved; relay pending decides
 # the source (a configured DB that is missing is a loud local failure; no local
 # instance at all is the labeled remote path when one is configured); and only in
-# LOCAL mode does a path this hook REJECTED count, as DEGRADED with its reason,
+# LOCAL mode does a resolver error count here, as DEGRADED with its reason,
 # because its liveness and task reads were skipped. Never a mute exit.
 if [ "$RELAY_LOCAL_DB_STATE" != "usable" ] || [ ! -f "$DB_PATH" ]; then
   relay_deliver_pending_mail
-  if [ "$RELAY_LOCAL_DB_STATE" = "rejected" ]; then
+  if [ "$RELAY_LOCAL_DB_STATE" = "unresolved" ]; then
     case "$RELAY_MAIL_MODE" in
       local|unreadable)
-        relay_mail_verdict "DEGRADED" "local DB path rejected ($RELAY_LOCAL_DB_WHY): liveness and task reads skipped" other
+        relay_mail_verdict "DEGRADED" "$RELAY_LOCAL_DB_WHY: liveness and task reads skipped" other
         ;;
     esac
   fi
@@ -766,8 +759,8 @@ RECOVERY_COMPLETED=0
 # proves it either way ("" = not known yet, 1 = answered, 0 = unreachable). The verdict
 # block after register reads it, so a daemon that never came up cannot print HEALTHY.
 DAEMON_REACHABLE=""
-if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
-  HEALTH_BODY=$(curl -s -m 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the token health check" 2; then
+  HEALTH_BODY=$(curl -s -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -H "X-Agent-Token: ${RELAY_AGENT_TOKEN}" \
@@ -795,7 +788,7 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
   # v2.1 Phase 4b.1 v2 recovery path: if operator set $RELAY_RECOVERY_TOKEN AND
   # the daemon reported recovery_pending, try to re-register with the recovery
   # token. On success, emit guidance for the operator to replace their token.
-  if [ "$AUTH_STATE" = "recovery_pending" ] && [ -n "${RELAY_RECOVERY_TOKEN:-}" ]; then
+  if [ "$AUTH_STATE" = "recovery_pending" ] && [ -n "${RELAY_RECOVERY_TOKEN:-}" ] && relay_budget_for "the recovery registration" 4; then
     # Build capabilities JSON for the recovery register_agent call. Re-uses
     # the allowlist logic below (hoisted here so recovery path can call it).
     CAPS_JSON="[]"
@@ -811,7 +804,7 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
         printf "]";
       }')
     fi
-    RECOVERY_BODY=$(curl -s -m 4 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    RECOVERY_BODY=$(curl -s -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
       -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" 2>/dev/null)
@@ -913,7 +906,9 @@ elif [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
   # host_shell_pids + host_id + agent_pid. Paired with the spawn-side offline
   # pre-register (src/tools/spawn.ts), which keeps that register from tripping
   # the collision guard. Populated-live rows still skip as before.
-  LIVENESS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+  # Every sqlite3 read runs under the watchdog, at what is left of the budget.
+  LIVENESS=""
+  relay_budget_for "the liveness read" 1 && LIVENESS=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT CASE
   WHEN session_id IS NOT NULL AND session_id != ''
@@ -951,9 +946,11 @@ SQL
     #                 leave the verdict untouched. This is the no-false-fire crux.
     # NEVER auto-forces. Suppressed when already MUTE (a bigger, more-actionable
     # problem dominates the verdict line).
-    if [ "$RELAY_VERDICT" != "MUTE" ]; then
+    # With no time left for the anchor read there is no diagnosis to make (the skip
+    # is DEGRADED on its own): never a verdict from an anchor that was not read.
+    if [ "$RELAY_VERDICT" != "MUTE" ] && relay_budget_for "the anchor read" 1; then
       RELAY_OWN_GUID=$(relay_machine_guid 2>/dev/null || printf '')
-      RELAY_ANCHOR_ROW=$(sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
+      RELAY_ANCHOR_ROW=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT COALESCE(agent_pid,''), COALESCE(agent_pid_start,''), COALESCE(host_id,'')
 FROM agents WHERE name = :name LIMIT 1;
@@ -1032,7 +1029,9 @@ fi
 # register silently — we do NOT touch the DB directly. The mail/task
 # delivery path below is read-only and stays via sqlite3 (the fast path is
 # the point). Bootstrap without a daemon is deliberately not supported.
-if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
+REGISTER_RAN=0
+if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget_for "registration" 4; then
+  REGISTER_RAN=1
   # Carry the caller's token if they have one — active re-register requires
   # it; first-time bootstrap on a fresh row doesn't. Either way the request
   # reaches the server so the server decides which branch to take.
@@ -1051,7 +1050,7 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
-  REG_BODY=$(curl -s -m 4 -w "\nHTTP_STATUS:%{http_code}\n" \
+  REG_BODY=$(curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
@@ -1125,7 +1124,7 @@ fi
 # it did not, or when register itself failed. A HEALTHY printed after a reboot where the
 # daemon never came up is the false-comfort class this exists to remove.
 REGISTER_ATTEMPTED=0
-if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
+if [ "$REGISTER_RAN" -eq 1 ]; then
   REGISTER_ATTEMPTED=1
   # The register curl appends "HTTP_STATUS:<code>"; 000 = connection refused or timed out.
   if printf '%s\n' "${REG_BODY:-}" | grep -q '^HTTP_STATUS:000$'; then
@@ -1134,10 +1133,10 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     DAEMON_REACHABLE=1
   fi
 fi
-if [ -z "$DAEMON_REACHABLE" ] && command -v curl >/dev/null 2>&1; then
+if [ -z "$DAEMON_REACHABLE" ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the daemon probe" 1; then
   # Register was skipped (a LIVE row or a completed recovery), so nothing above proved
   # the daemon is up. One bounded probe settles it.
-  if curl -fsS --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+  if curl -fsS --max-time "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
     DAEMON_REACHABLE=1
   else
     DAEMON_REACHABLE=0
@@ -1185,16 +1184,27 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
   RELAY_BIND_ERR=""
   RELAY_BIND_RC=1
   RELAY_BIND_ERRFILE="$(mktemp 2>/dev/null || printf '')"
-  if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1; then
-    if [ -n "$RELAY_BIND_ERRFILE" ]; then
-      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | node "$RELAY_BIND_BIN" bind 2>"$RELAY_BIND_ERRFILE")
+  RELAY_BIND_INFILE="$(mktemp 2>/dev/null || printf '')"
+  RELAY_BIND_OUTFILE="$(mktemp 2>/dev/null || printf '')"
+  if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1 && [ -n "$RELAY_BIND_ERRFILE" ] && [ -n "$RELAY_BIND_INFILE" ] && [ -n "$RELAY_BIND_OUTFILE" ]; then
+    if relay_budget_for "the window bind" 3; then
+      # Bounded like every pre-mail step: the payload goes in through a private
+      # file, and the run is killed at its share of the budget (124 = timed out).
+      printf '%s' "$RELAY_HOOK_PAYLOAD" > "$RELAY_BIND_INFILE"
+      relay_run_bounded "$RELAY_STEP_SECS" "$RELAY_BIND_INFILE" "$RELAY_BIND_OUTFILE" "$RELAY_BIND_ERRFILE" node "$RELAY_BIND_BIN" bind
       RELAY_BIND_RC=$?
+      RELAY_BIND_OUT=$(cat "$RELAY_BIND_OUTFILE" 2>/dev/null || printf '')
       RELAY_BIND_ERR=$(cat "$RELAY_BIND_ERRFILE" 2>/dev/null || printf '')
-      rm -f "$RELAY_BIND_ERRFILE" 2>/dev/null
+      [ "$RELAY_BIND_RC" -eq 124 ] && RELAY_BIND_ERR="BIND_FAILED: timed out after ${RELAY_STEP_SECS}s"
     else
-      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | node "$RELAY_BIND_BIN" bind 2>/dev/null)
-      RELAY_BIND_RC=$?
+      RELAY_BIND_RC=125
+      RELAY_BIND_ERR="BIND_FAILED: no time budget left for the window bind"
     fi
+    rm -f "$RELAY_BIND_ERRFILE" "$RELAY_BIND_INFILE" "$RELAY_BIND_OUTFILE" "$RELAY_BIND_OUTFILE.timedout" 2>/dev/null
+  elif [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1; then
+    rm -f "$RELAY_BIND_ERRFILE" "$RELAY_BIND_INFILE" "$RELAY_BIND_OUTFILE" 2>/dev/null
+    RELAY_BIND_RC=1
+    RELAY_BIND_ERR="BIND_FAILED: could not create a private temp file for the bind"
   else
     RELAY_BIND_RC=127
     RELAY_BIND_ERR="BIND_FAILED: no runnable relay CLI beside this hook (looked for $RELAY_BIND_BIN)"
@@ -1235,7 +1245,12 @@ relay_deliver_pending_mail
 # a line boundary on the way out; node decodes and FRAMES it (RELAY_FRAME_JS).
 TASKS=""
 RELAY_TASKS_FAILED=0
-TASKS_HEX=$(sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
+TASKS_HEX=""
+# After the mail read: what is left minus the margin (no reserve to keep). A task
+# read that was skipped or timed out is TOLD: tasks may exist that are not shown.
+RELAY_TASKS_RC=0
+if relay_budget_for "the task read" 2 margin; then
+  TASKS_HEX=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT hex(priority), hex(title), hex(from_agent), hex(id)
 FROM tasks WHERE to_agent = :name AND status IN ('posted', 'accepted')
@@ -1243,6 +1258,15 @@ ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' T
 LIMIT 10;
 SQL
 )
+  RELAY_TASKS_RC=$?
+else
+  RELAY_TASKS_RC=125
+fi
+if [ "$RELAY_TASKS_RC" -eq 124 ] || [ "$RELAY_TASKS_RC" -eq 125 ]; then
+  echo "[RELAY] active tasks for $AGENT_NAME were not read in this hook's time budget. Call get_tasks to see them."
+  [ "$RELAY_TASKS_RC" -eq 124 ] && relay_mail_verdict "DEGRADED" "the task read timed out after ${RELAY_STEP_SECS}s" other
+  TASKS_HEX=""
+fi
 if [ -n "$TASKS_HEX" ] && command -v node >/dev/null 2>&1; then
   TASKS=$(printf '%s' "$TASKS_HEX" | node -e "$RELAY_FRAME_JS"'
     let raw = "";
@@ -1322,8 +1346,8 @@ fi
 # `discover_agents view='topology'`. Visible classes mirror
 # TOPOLOGY_VISIBLE_CLASSES in src/agent-class.ts (SSOT); transient + unclassified
 # are excluded by omission from the IN-list.
-if [ "${RELAY_ONBOARD_TOPOLOGY:-0}" = "1" ]; then
-  TOPOLOGY=$(sqlite3 "$DB_PATH" <<'SQL' 2>/dev/null
+if [ "${RELAY_ONBOARD_TOPOLOGY:-0}" = "1" ] && relay_budget_for "the team map read" 1 margin; then
+  TOPOLOGY=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<'SQL' 2>/dev/null
 SELECT '  ' || class || ': ' || GROUP_CONCAT(name, ', ')
 FROM agents
 WHERE class IN ('orchestrator','builder','advisory','auditor')

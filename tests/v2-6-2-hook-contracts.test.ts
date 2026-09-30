@@ -367,13 +367,17 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     // separately by tests/v2-6-1-token-store.test.ts:test 12 / 12b.
   });
 
-  it("(C5) DB outside $HOME and not /tmp → exit 0; the guard never exits mute, and stdout holds only the LOUD mail-read line", () => {
-    // The hook's OWN sqlite reads refuse DB paths outside $HOME / /tmp /
-    // /private/tmp / /var/folders. Since the F1 mode rule (D2) that no longer ends
-    // the hook: relay pending still decides the mail, and a configured DB it
-    // cannot read is a LOUD local failure. Still no partial-state context.
-    const { root } = freshTestRoot();
-    const outsideDb = path.join(root, "..", "..", "etc", "fake.db");
+  it("(C5) DB outside $HOME and not /tmp → exit 0; the guard never exits mute, and stdout holds the resolver's reason + the LOUD mail-read line only", () => {
+    // Since ADR-0048 the ONE resolver refuses DB paths outside $HOME and the temp
+    // roots (the hook's own bash guard is gone). That never ends the hook: relay
+    // pending still decides the mail, and a configured DB it cannot read is a LOUD
+    // local failure. The agent's context gets the resolver's reason and the mail
+    // line, and no partial state.
+    // An ABSOLUTE outside path: `tmpdir/../../etc` was /etc on Linux but landed
+    // inside /var/folders (an approved root) on macOS, so the row did not test the
+    // same thing on both.
+    freshTestRoot();
+    const outsideDb = "/etc/fake.db";
     const r = runHook({
       hook: HOOK_CHECK_RELAY,
       agentName: "build-agent",
@@ -383,8 +387,10 @@ describe("v2.6.2 — check-relay.sh contract (SessionStart hook)", () => {
     });
     expect(r.status).toBe(0);
     const out = stripVerdict(r.stdout);
-    expect(out.split("\n"), out).toHaveLength(1);
-    expect(out).toMatch(/^\[RELAY\] relay unreadable: pending mail for build-agent could not be read/);
+    const lines = out.split("\n");
+    expect(lines, out).toHaveLength(2);
+    expect(lines[0]).toMatch(/^\[RELAY\] instance resolution FAILED: .*outside the approved roots/);
+    expect(lines[1]).toMatch(/^\[RELAY\] relay unreadable: pending mail for build-agent could not be read/);
     expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 });

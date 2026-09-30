@@ -136,15 +136,9 @@ if ! relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$'; then
   exit 0
 fi
 
-# v2.6.1 — vault hydration. If the env-supplied RELAY_AGENT_TOKEN is empty
-# but a valid token sits in the vault for this agent, use it for the remote
-# read and the liveness self-heal. The local read needs no token.
-if [ -z "$AGENT_TOKEN" ]; then
-  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
-    AGENT_TOKEN="$VAULT_TOKEN"
-    export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
-  fi
-fi
+# v2.6.1 — vault hydration: relay_hydrate_token (below) runs AFTER the mail read,
+# because the vault sits beside the resolved DB (ADR-0048) and only the remote
+# read and the liveness self-heal need a token. The local read needs none.
 
 if ! relay_whole_match "$HTTP_HOST" '^[A-Za-z0-9_.:-]{1,253}$'; then
   exit 0
@@ -200,21 +194,30 @@ sys.stdout.write(json.dumps(out))
 }
 
 # --- Stdin parser: prints "MODE<US>SESSION_ID" -----------------------------------
-# MODE is main | subagent | absent | invalid. Python reads fd 0 in chunks with a
-# 1s idle deadline: Claude Code writes the payload and closes the pipe, so this
-# is instant in practice, and a caller that never closes stdin costs one second
-# rather than a hang. Top-level keys only, from a real JSON parse: an "agent_id"
-# string inside tool_response must not count.
+# MODE is main | subagent | absent | invalid | slow. Python reads fd 0 in chunks
+# until EOF or a TOTAL deadline of RELAY_STEP_SECS (relay_budget_for): Claude Code
+# writes the payload and closes the pipe, so this is instant in practice, and a
+# caller that never closes stdin, or dribbles into it forever, costs the step's
+# budget rather than a hang. At the deadline what arrived is parsed; if it is not
+# a whole payload the mode is slow. Top-level keys only, from a real JSON parse:
+# an "agent_id" string inside tool_response must not count.
 STDIN_PY='
-import json, os, re, select, sys
+import json, os, re, select, sys, time
 buf = bytearray()
 cap = 16 * 1024 * 1024
+deadline = time.monotonic() + float(os.environ["RELAY_STEP_SECS"])
+cut = False
 while True:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        cut = True
+        break
     try:
-        ready, _, _ = select.select([0], [], [], 1.0)
+        ready, _, _ = select.select([0], [], [], left)
     except Exception:
         break
     if not ready:
+        cut = True
         break
     chunk = os.read(0, 65536)
     if not chunk:
@@ -229,7 +232,7 @@ if not bytes(buf).strip():
 try:
     d = json.loads(bytes(buf).decode("utf-8", "replace"))
 except Exception:
-    sys.stdout.write("invalid\x1f")
+    sys.stdout.write("slow\x1f" if cut else "invalid\x1f")
     sys.exit(0)
 if not isinstance(d, dict):
     sys.stdout.write("invalid\x1f")
@@ -426,8 +429,12 @@ http_peek() {
   [ -z "$AGENT_TOKEN" ] && return 1
   command -v curl >/dev/null 2>&1 || return 1
 
-  # Probe /health with a tight budget. If no response in 1s, assume no daemon.
-  if ! curl -fsS --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+  # Probe /health first, then the read: each takes its timeout from what is LEFT
+  # of this hook's budget (relay_budget_for); with no time left it is skipped
+  # (exit 125: this runs in a $(...) subshell, so the caller records the skip;
+  # DEGRADED "no time budget left for the remote read", in the verdict below).
+  relay_budget_for "the remote health probe" 1 margin || return 125
+  if ! curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
     return 1
   fi
 
@@ -458,7 +465,8 @@ print(json.dumps({
 ' 2>/dev/null) || return 1
 
   local response
-  response=$(curl -fsS --max-time 2 \
+  relay_budget_for "the remote mail read" 2 margin || return 125
+  response=$(curl -fsS -m "$RELAY_STEP_SECS" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
@@ -507,11 +515,14 @@ liveness_self_heal() {
   { [ -n "$db" ] && [ -f "$db" ]; } || return 0
   # Read-only and parameter-bound (Codex round 2): the name is BOUND, never
   # interpolated into sqlite command text. One read for both fields.
+  # Every blocking step here takes what is LEFT of the budget (relay_budget_for),
+  # the read under the watchdog; a skipped step is a skipped self-heal.
   local stored
-  stored=$(AN="$AGENT_NAME" DBP="$db" python3 -c '
+  relay_budget_for "the liveness read" 1 margin || return 0
+  stored=$(relay_run_capture "$RELAY_STEP_SECS" /dev/null env AN="$AGENT_NAME" DBP="$db" RELAY_STEP_SECS="$RELAY_STEP_SECS" python3 -c '
 import os, sqlite3, sys, urllib.parse
 try:
-    con = sqlite3.connect("file:" + urllib.parse.quote(os.environ["DBP"]) + "?mode=ro", uri=True, timeout=1)
+    con = sqlite3.connect("file:" + urllib.parse.quote(os.environ["DBP"]) + "?mode=ro", uri=True, timeout=float(os.environ["RELAY_STEP_SECS"]))
     r = con.execute("SELECT IFNULL(agent_pid, \x27\x27), IFNULL(agent_pid_start, \x27\x27) FROM agents WHERE name = ? LIMIT 1", (os.environ["AN"],)).fetchone()
 except Exception:
     sys.exit(1)
@@ -533,8 +544,9 @@ sys.stdout.write("%s\x1f%s" % (r[0], r[1]))
     need=1
   fi
   [ "$need" -eq 0 ] && return 0
-  # Only over a reachable daemon (tight budget).
-  curl -fsS --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1 || return 0
+  # Only over a reachable daemon.
+  relay_budget_for "the liveness health probe" 1 margin || return 0
+  curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1 || return 0
   local payload
   payload=$(AN="$AGENT_NAME" AT="$AGENT_TOKEN" PID="$cur_pid" ST="$cur_start" python3 -c '
 import json, os
@@ -544,7 +556,8 @@ if st:
     args["agent_pid_start"] = st
 print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"report_liveness","arguments":args}}))
 ' 2>/dev/null) || return 0
-  curl -fsS --max-time 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  relay_budget_for "the liveness restamp" 2 margin || return 0
+  curl -fsS -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -H "X-Agent-Token: $AGENT_TOKEN" \
@@ -576,6 +589,21 @@ notice_is_damped() {
   [ $((now - last)) -lt "$window" ]
 }
 
+# If the env-supplied RELAY_AGENT_TOKEN is empty but a valid token sits in the
+# vault for this agent, use it. The vault is beside the RESOLVED DB: the caller
+# has loaded the resolution first (relay_res_set_db from the mail read, or
+# relay_where_load for the remote path). Best-effort: no token just means the
+# token-needing step is skipped, as before.
+relay_hydrate_token() {
+  [ -n "$AGENT_TOKEN" ] && return 0
+  local t
+  if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+    AGENT_TOKEN="$t"
+    export RELAY_AGENT_TOKEN="$t"
+  fi
+  return 0
+}
+
 # Records "notified" by writing the fingerprint atomically; the file's mtime is
 # the notice time. Best-effort: a failure here only means the next call notifies.
 record_notice() {
@@ -593,7 +621,9 @@ record_notice() {
 HOOK_MODE="absent"
 HOOK_SESSION=""
 if [ ! -t 0 ]; then
-  _parsed=$(python3 -c "$STDIN_PY" 2>/dev/null)
+  _parsed=""
+  relay_budget_for "the hook payload read" 2 margin \
+    && _parsed=$(RELAY_STEP_SECS="$RELAY_STEP_SECS" python3 -c "$STDIN_PY" 2>/dev/null)
   HOOK_MODE="${_parsed%%$'\x1f'*}"
   HOOK_SESSION="${_parsed#*$'\x1f'}"
 fi
@@ -607,6 +637,10 @@ case "$HOOK_MODE" in
   main|absent) ;;
   subagent)
     command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "subagent tool call: mail check skipped (ADR-0037)" " agent=\"${AGENT_NAME}\""
+    exit 0
+    ;;
+  slow)
+    command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "hook stdin not complete within its time budget: mail check skipped (ADR-0037)" " agent=\"${AGENT_NAME}\""
     exit 0
     ;;
   *)
@@ -643,16 +677,16 @@ else
     trap 'rm -f "$_f1_outf" "$_f1_errf" "$_f1_outf.timedout" 2>/dev/null; relay_emit_verdict' EXIT
     # node runs DIRECTLY into files under a watchdog, inside this hook's installed
     # budget (relay_run_pending / relay_pending_deadline in _vault-helpers.sh).
-    _f1_deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
-    if [ "$_f1_deadline" -lt 1 ]; then
-      # No time left for the read: SKIP it and say so (never a floored 1s read).
-      F1_RC=125
-      F1_ERR="no time budget left (${SECONDS}s spent before the mail read)"
-    else
+    if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
+      _f1_deadline="$RELAY_STEP_SECS"
       relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json
       F1_RC=$?
       F1_OUT=$(cat "$_f1_outf" 2>/dev/null)
       F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null)
+    else
+      # No time left for the read: SKIP it and say so (never a floored 1s read).
+      F1_RC=125
+      F1_ERR="no time budget left (${SECONDS}s spent before the mail read)"
     fi
     if [ "$F1_RC" -eq 125 ]; then
       :
@@ -670,19 +704,34 @@ case "$F1_RC" in
   0)
     MODE=local
     SUMMARY=$(printf '%s' "$F1_OUT" | SRC=f1 AN="$AGENT_NAME" python3 -c "$NOTICE_PY" 2>/dev/null)
-    if [ $? -eq 0 ]; then
-      READ_OK=1
-    else
+    if [ $? -ne 0 ]; then
       MODE=unreadable
       SUMMARY=""
       F1_ERR="relay pending returned output this hook could not parse"
+    elif ! F1_DB=$(relay_pending_resolution_db "$F1_OUT"); then
+      # ADR-0048: the answer must name the DB it came from (its embedded
+      # resolution); without a valid one it is not a read this hook can trust.
+      MODE=unreadable
+      SUMMARY=""
+      F1_DB=""
+      F1_ERR="relay pending returned no valid resolution"
+    else
+      READ_OK=1
     fi
     ;;
   3)
     if [ -n "${RELAY_HTTP_HOST:-}" ]; then
       MODE=remote
+      # The vault location is the resolver's answer: one `relay where`, remote only.
+      if [ -z "$AGENT_TOKEN" ]; then
+        relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
+        relay_hydrate_token
+      fi
       SUMMARY=$(http_peek)
-      [ $? -eq 0 ] && READ_OK=1
+      case $? in
+        0) READ_OK=1 ;;
+        125) RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-the remote read}" ;;
+      esac
     else
       MODE=none
     fi
@@ -692,14 +741,15 @@ case "$F1_RC" in
     ;;
 esac
 
-# Only a SUCCESSFUL local read tells us which DB holds this agent's anchor.
+# Only a SUCCESSFUL local read tells us which DB holds this agent's anchor. Its
+# path is the VALIDATED resolution `relay pending --json` embeds (F1_DB, above;
+# ADR-0048: the SAME object `relay where` prints), so the vault beside it needs
+# no second node start.
 if [ "$MODE" = local ] && [ "$READ_OK" -eq 1 ]; then
-  F1_DB=$(printf '%s' "$F1_OUT" | python3 -c 'import json, sys
-try:
-    p = json.load(sys.stdin).get("db_path")
-except Exception:
-    p = None
-sys.stdout.write(p if isinstance(p, str) else "")' 2>/dev/null)
+  if [ -n "$F1_DB" ]; then
+    relay_res_set_db "$F1_DB"
+    relay_hydrate_token
+  fi
   liveness_self_heal "$F1_DB"
 fi
 
@@ -719,6 +769,9 @@ if command -v relay_verdict_set >/dev/null 2>&1; then
     # DEGRADED = a concluded fault (the verdict contract in _verdict.sh): the
     # local read failed, and nothing was asked of any other relay.
     relay_verdict_set "DEGRADED" "relay unreadable: ${_f1_why:-the local relay mailbox could not be read}" " agent=\"${AGENT_NAME}\" http_fallback=\"none\""
+  elif [ "$MODE" = remote ] && [ -n "${RELAY_BUDGET_SKIPPED:-}" ]; then
+    # A step of the remote read was SKIPPED for want of time: a concluded fault.
+    relay_verdict_set "DEGRADED" "no time budget left for ${RELAY_BUDGET_SKIPPED}" " agent=\"${AGENT_NAME}\""
   elif [ "$MODE" = remote ]; then
     relay_verdict_set "CANNOT-JUDGE" "remote relay read failed (unreachable, unauthorized or no token)" " agent=\"${AGENT_NAME}\""
   else
