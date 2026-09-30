@@ -30,9 +30,9 @@
  * the approved roots and the real-path walk still apply; the label says so
  * instead of passing silently).
  */
-import fs from "fs";
-import os from "os";
-import path from "path";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { checkContainment, type ContainmentModel } from "./approved-roots.js";
 
 /**
@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "bf4f5f3a98e1";
+export const RESOLVER_REVISION = "3cb651cae813";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";

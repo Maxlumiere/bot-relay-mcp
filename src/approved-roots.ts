@@ -39,9 +39,9 @@
  * misconfiguration and CROSS-USER interference are in scope; a same-user
  * adversary racing the daemon is not.
  */
-import fs from "fs";
-import os from "os";
-import path from "path";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 /** The world-writable approved roots, before realpath (subject to the ownership rule). */
 const SHARED_ROOT_BASES = ["/tmp", "/private/tmp"];
