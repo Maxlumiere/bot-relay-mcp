@@ -2,13 +2,17 @@
 
 ## Unreleased
 
+### Fixed — `zod-to-json-schema` is a declared dependency
+
+The relay imports `zod-to-json-schema` directly, but it was only installed as a dependency of the MCP SDK. It is now declared, so the relay's own copy is the one that is installed and resolved.
+
 ### Added — every relay process reports the build it loaded, not the one on disk
 
 A merge and an install change the files on disk, but a process that is already running keeps the code it loaded, so "deployed" was a claim about disk. Every build now carries a stamp, and every process reports the stamp it loaded:
 
 - **`build`** in `/health`, `health_check`, `whoami` and `relay where --json`:
   - `build_id`: a hash of `package.json` and the build's `dist/` files;
-  - `deps_id`: a hash of the installed production dependencies (each one's own name and version, plus native addons);
+  - `deps_id`: a hash of the installed dependencies (npm's own record of the installed tree, plus every native addon), taken when the process starts; `deps_state` is `known`, or `unknown` for an install npm did not make (only npm installs are supported);
   - for humans: the `commit`, whether that tree was `dirty`, `built_at` and the `node` version.
   On a stdio connector, `health_check` and `whoami` report the connector's own build, so a connector still running old code shows it.
 - **Fixed at load.** The value is taken once when the process starts and is never read from disk again.

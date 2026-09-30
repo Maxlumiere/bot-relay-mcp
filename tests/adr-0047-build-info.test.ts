@@ -8,9 +8,9 @@
  * disk. The identity covers exactly what a long-lived process loads at start:
  *   CODE ID  package.json + dist/** (stamped by the build step; the stamp enters
  *            as one constant entry and must be byte-identical to its template);
- *   DEPS ID  the installed production dependencies (name@version from each
- *            installed package's own package.json, plus every native addon),
- *            computed by the process once at load.
+ *   DEPS ID  npm's installed-tree record (node_modules/.package-lock.json) plus
+ *            every native addon under node_modules, snapshotted by the process
+ *            when it starts (the entry's FIRST import).
  * hooks/*.sh and bin/relay run fresh per call: OUT.
  *
  * checkInstall() recomputes an install from its CONTENT, observed twice.
@@ -31,14 +31,16 @@ const DIST = path.join(REPO_ROOT, "dist");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adr0047-pr1-")));
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
-const { computeCodeId, computeDepsId, checkInstall, parseStamp, renderStamp } = await import("../dist/build-id.js");
+const { computeCodeId, checkInstall, parseStamp, renderStamp } = await import("../dist/build-id.js");
+const { computeDepsId } = await import("../dist/deps-snapshot.js");
 const { BUILD_INFO: DIST_STAMP } = await import("../dist/build-info.js");
 const STAMP_TEXT = fs.readFileSync(path.join(DIST, "build-info.js"), "utf-8");
 
 /**
  * A scratch INSTALL: a copy of dist/, package.json, hooks/ and bin/. Its
- * node_modules holds one SYMLINK per top-level package of the repo's, except the
- * packages in `realCopies`, which are copied so a test can change them.
+ * node_modules holds a real copy of npm's installed-tree record and one SYMLINK per
+ * top-level package of the repo's, except the packages in `realCopies`, which are
+ * copied so a test can change them.
  */
 function scratchInstall(tag: string, opts: { realCopies?: string[] } = {}): string {
   const dir = path.join(ROOT, tag);
@@ -48,6 +50,7 @@ function scratchInstall(tag: string, opts: { realCopies?: string[] } = {}): stri
   fs.copyFileSync(path.join(REPO_ROOT, "package.json"), path.join(dir, "package.json"));
   const nm = path.join(REPO_ROOT, "node_modules");
   const real = new Set(opts.realCopies ?? []);
+  fs.copyFileSync(path.join(nm, ".package-lock.json"), path.join(dir, "node_modules", ".package-lock.json"));
   for (const top of fs.readdirSync(nm)) {
     if (top.startsWith(".")) continue;
     const entries = top.startsWith("@") ? fs.readdirSync(path.join(nm, top)).map((s) => `${top}/${s}`) : [top];
@@ -89,12 +92,14 @@ async function connectorFrom(install: string, tag: string) {
   };
 }
 
-const bumpVersion = (install: string, pkg: string) => {
-  const f = path.join(install, "node_modules", pkg, "package.json");
+/** What an `npm install`/`update` does to the installed-tree record (a new byte content). */
+const touchRecord = (install: string) => {
+  const f = path.join(install, "node_modules", ".package-lock.json");
   const j = JSON.parse(fs.readFileSync(f, "utf-8"));
-  j.version = `${j.version}-bumped`;
-  fs.writeFileSync(f, JSON.stringify(j));
+  j.name = `${j.name}-reinstalled`;
+  fs.writeFileSync(f, JSON.stringify(j, null, 2));
 };
+const depsIdOf = (install: string) => (computeDepsId(install) as { state: string; id: string }).id;
 
 describe("ADR-0047 PR 1 — the build stamp: the CODE ID, written by the build step", () => {
   it("dist/build-info.js is byte-identical to its template, and its build_id EQUALS the recomputed code id", () => {
@@ -115,15 +120,16 @@ describe("ADR-0047 PR 1 — the build stamp: the CODE ID, written by the build s
 
 describe("ADR-0047 PR 1 — the spec's mutation: the disk changes after the connector started; it still reports what it LOADED", () => {
   it("a running stdio connector keeps its loaded build_id AND deps_id; a NEW connector from the same install reads the new ones", async () => {
-    const install = scratchInstall("ondisk", { realCopies: ["uuid"] });
+    const install = scratchInstall("ondisk");
     const a = await connectorFrom(install, "a");
     try {
       const before = (await a.health()).build;
       expect(before.build_id).toBe(DIST_STAMP.build_id);
-      expect(before.deps_id).toBe((computeDepsId(install) as { id: string }).id);
+      expect(before.deps_id).toBe(depsIdOf(install));
+      expect(before.deps_state).toBe("known");
       expect(before.node).toBe(process.version);
       overwriteStampOnDisk(install, "f".repeat(64));
-      bumpVersion(install, "uuid");
+      touchRecord(install);
       const after = (await a.health()).build;
       expect(after.build_id, "the running connector re-read the stamp").toBe(DIST_STAMP.build_id);
       expect(after.deps_id, "the running connector re-read its dependencies").toBe(before.deps_id);
@@ -139,6 +145,22 @@ describe("ADR-0047 PR 1 — the spec's mutation: the disk changes after the conn
       await a.close();
     }
   }, 90_000);
+});
+
+describe("ADR-0047 PR 1 — the deps snapshot is EAGER: taken at start, not on first access", () => {
+  it("node_modules changes AFTER start, THEN the FIRST health_check: it reports the PRE-change deps id", async () => {
+    const install = scratchInstall("eager");
+    const pre = depsIdOf(install);
+    const a = await connectorFrom(install, "eager");
+    try {
+      touchRecord(install);
+      expect(depsIdOf(install)).not.toBe(pre);
+      const first = (await a.health()).build;
+      expect(first.deps_id, "a lazy digest would report the post-change id as loaded (a false CURRENT)").toBe(pre);
+    } finally {
+      await a.close();
+    }
+  }, 60_000);
 });
 
 describe("ADR-0047 PR 1 — P1-a: the boundary. IN: dist/** and package.json. OUT: hooks and bin/relay (they run fresh per call)", () => {
@@ -165,47 +187,80 @@ describe("ADR-0047 PR 1 — P1-a: the boundary. IN: dist/** and package.json. OU
   });
 });
 
-describe("ADR-0047 PR 1 — P1-b: the DEPS ID reads the INSTALLED packages, never a lockfile", () => {
-  const deps = (install: string) => computeDepsId(install) as { ok: boolean; id?: string; reason?: string };
-  it("a production dependency's installed VERSION changes the deps id (a connector loaded before it is STALE)", () => {
-    const install = scratchInstall("dep-version", { realCopies: ["uuid"] });
-    const before = deps(install).id;
-    bumpVersion(install, "uuid");
-    expect(deps(install).id).not.toBe(before);
+describe("ADR-0047 PR 1 — the DEPS ID: npm's installed-tree record + EVERY native addon under node_modules", () => {
+  const deps = (install: string) => computeDepsId(install) as { state: string; id?: string; reason?: string };
+  it("an install, update or removal (npm rewrites .package-lock.json) changes the deps id", () => {
+    const install = scratchInstall("dep-record");
+    const before = depsIdOf(install);
+    touchRecord(install);
+    expect(depsIdOf(install)).not.toBe(before);
   });
-  it("a NATIVE ADDON rebuilt with no version bump changes the deps id", () => {
+  it("a NATIVE ADDON rebuilt with no record change (npm rebuild) changes the deps id", () => {
     const install = scratchInstall("dep-native", { realCopies: ["better-sqlite3"] });
-    const before = deps(install).id;
-    const addon = spawnSync("find", [path.join(install, "node_modules", "better-sqlite3"), "-name", "*.node", "-not", "-path", "*/node_modules/better-sqlite3/node_modules/*"], { encoding: "utf-8" }).stdout.trim().split("\n")[0];
+    const before = depsIdOf(install);
+    const addon = spawnSync("find", [path.join(install, "node_modules", "better-sqlite3"), "-name", "*.node"], { encoding: "utf-8" }).stdout.trim().split("\n")[0];
     expect(addon, "better-sqlite3 ships a native addon").toMatch(/\.node$/);
     fs.appendFileSync(addon, Buffer.from([0]));
-    expect(deps(install).id).not.toBe(before);
+    expect(depsIdOf(install)).not.toBe(before);
   });
-  it("a declared dependency MISSING now → INCONSISTENT, never a pass", () => {
-    const install = scratchInstall("dep-missing");
-    fs.unlinkSync(path.join(install, "node_modules", "zod"));
+  it("EVERY addon counts, not only those a closure reaches: one added to any package (a peer, a dev package) changes it", () => {
+    const install = scratchInstall("dep-any-addon", { realCopies: ["uuid"] });
+    const before = depsIdOf(install);
+    fs.writeFileSync(path.join(install, "node_modules", "uuid", "extra.node"), "x");
+    expect(depsIdOf(install)).not.toBe(before);
+  });
+  it("a SYMLINKED addon is followed: its target's bytes count", () => {
+    const install = scratchInstall("dep-sym-addon", { realCopies: ["uuid"] });
+    const target = path.join(ROOT, "addon-target.bin");
+    fs.writeFileSync(target, "one");
+    fs.symlinkSync(target, path.join(install, "node_modules", "uuid", "linked.node"));
+    const before = depsIdOf(install);
+    fs.writeFileSync(target, "two");
+    expect(depsIdOf(install)).not.toBe(before);
+  });
+  it("a symlink CYCLE under node_modules → INCONSISTENT (never a silent pass)", () => {
+    const install = scratchInstall("dep-cycle", { realCopies: ["uuid"] });
+    fs.symlinkSync(path.join(install, "node_modules"), path.join(install, "node_modules", "uuid", "loop"));
+    expect(deps(install).state).toBe("error");
     const c = checkInstall(install);
     expect(c.consistent).toBe(false);
-    expect(c.reason).toMatch(/dependency zod .* is not installed/);
+    expect(c.reason).toMatch(/cycle/);
   });
-  it("a dependency package.json UNREADABLE now → INCONSISTENT", () => {
-    const install = scratchInstall("dep-unreadable", { realCopies: ["uuid"] });
-    fs.writeFileSync(path.join(install, "node_modules", "uuid", "package.json"), "{not json");
+  it("a DANGLING symlink under node_modules → INCONSISTENT", () => {
+    const install = scratchInstall("dep-dangling", { realCopies: ["uuid"] });
+    fs.symlinkSync(path.join(ROOT, "nowhere"), path.join(install, "node_modules", "uuid", "gone"));
     expect(checkInstall(install).consistent).toBe(false);
   });
-  it("a lockfile is not read: changing or deleting one changes nothing", () => {
-    const install = scratchInstall("no-lock");
-    const before = deps(install).id;
-    fs.writeFileSync(path.join(install, "package-lock.json"), "{}");
-    expect(deps(install).id).toBe(before);
-    fs.rmSync(path.join(install, "package-lock.json"));
-    expect(deps(install).id).toBe(before);
+  it("NO .package-lock.json (yarn, pnpm, a copied tree) → UNKNOWN, never a known id", () => {
+    const install = scratchInstall("dep-unknown");
+    fs.rmSync(path.join(install, "node_modules", ".package-lock.json"));
+    expect(deps(install).state).toBe("unknown");
+    const c = checkInstall(install);
+    expect(c).toMatchObject({ deps: null, deps_state: "unknown" });
+    expect(c.reason).toMatch(/only npm installs are supported/);
   });
-  it("a DEV-only package is outside the production closure (removing it changes nothing)", () => {
-    const install = scratchInstall("dev-only");
-    const before = deps(install).id;
-    fs.unlinkSync(path.join(install, "node_modules", "vitest"));
-    expect(deps(install).id).toBe(before);
+  it("#8: a record that is JSON null (or not an object) → INCONSISTENT, and a connector still STARTS (deps_state error)", async () => {
+    const install = scratchInstall("dep-null");
+    fs.writeFileSync(path.join(install, "node_modules", ".package-lock.json"), "null");
+    expect(deps(install).state).toBe("error");
+    expect(checkInstall(install).consistent).toBe(false);
+    fs.writeFileSync(path.join(install, "node_modules", ".package-lock.json"), "[1]");
+    expect(deps(install).state).toBe("error");
+    fs.writeFileSync(path.join(install, "node_modules", ".package-lock.json"), "null");
+    const a = await connectorFrom(install, "null-record");
+    try {
+      expect((await a.health()).build).toMatchObject({ deps_id: null, deps_state: "error" });
+    } finally {
+      await a.close();
+    }
+  }, 60_000);
+  it("the project lockfile (package-lock.json) is not read: changing or deleting it changes nothing", () => {
+    const install = scratchInstall("no-lock");
+    const before = depsIdOf(install);
+    fs.writeFileSync(path.join(install, "package-lock.json"), "{}");
+    expect(depsIdOf(install)).toBe(before);
+    fs.rmSync(path.join(install, "package-lock.json"));
+    expect(depsIdOf(install)).toBe(before);
   });
 });
 
@@ -299,6 +354,15 @@ describe("ADR-0047 PR 1 — TRIPWIRES: the loaded value is never re-read or reco
   it("src/build-info.ts imports NOTHING (a literal: no fs, no git, no package.json)", () => {
     expect(src("build-info.ts")).not.toMatch(/^\s*import\s/m);
   });
+  it("dist/index.js imports the deps snapshot FIRST (ESM evaluates in source order: nothing is loaded before it)", () => {
+    const imports = fs.readFileSync(path.join(DIST, "index.js"), "utf-8").split("\n").filter((l) => /^\s*import[\s{"']/.test(l));
+    expect(imports[0], imports.slice(0, 3).join("\n")).toMatch(/^import\s+["']\.\/deps-snapshot\.js["'];?$/);
+  });
+  it("dist/deps-snapshot.js imports only node: builtins", () => {
+    const specs = [...fs.readFileSync(path.join(DIST, "deps-snapshot.js"), "utf-8").matchAll(/^\s*import[^'"]*["']([^'"]+)["']/gm)].map((m) => m[1]);
+    expect(specs.length).toBeGreaterThan(0);
+    expect(specs.filter((x) => !x.startsWith("node:"))).toEqual([]);
+  });
   it("src/loaded-build.ts never recomputes the CODE id (only the stamp names it)", () => {
     expect(src("loaded-build.ts")).not.toMatch(/computeCodeId|checkInstall/);
   });
@@ -321,7 +385,7 @@ describe("ADR-0047 PR 1 — where it shows: /health, health_check, whoami, relay
     fs.mkdirSync(home, { recursive: true });
     const r = spawnSync(process.execPath, [path.join(REPO_ROOT, "bin", "relay"), "where", "--json"], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME: home } });
     const b = JSON.parse(r.stdout).build;
-    expect(b).toMatchObject({ ...DIST_STAMP, node: process.version });
-    expect(b.deps_id).toBe((computeDepsId(REPO_ROOT) as { id: string }).id);
+    expect(b).toMatchObject({ ...DIST_STAMP, node: process.version, deps_state: "known" });
+    expect(b.deps_id).toBe(depsIdOf(REPO_ROOT));
   });
 });

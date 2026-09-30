@@ -4,6 +4,10 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
+// ADR-0047: FIRST, before anything else is loaded (ESM evaluates static imports in
+// source order): the snapshot of the installed dependencies this process runs on.
+// It imports only node: builtins; a test fails if any import precedes it.
+import "./deps-snapshot.js";
 import { loadConfig, validateConfigAndEnv, InvalidConfigError, readConfigFileKeys } from "./config.js";
 import { startStdioServer } from "./transport/stdio.js";
 import { startHttpServer } from "./transport/http.js";
