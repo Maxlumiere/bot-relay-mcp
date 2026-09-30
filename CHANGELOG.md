@@ -18,6 +18,7 @@ A merge and an install change the files on disk, but a process that is already r
 - **Fixed at load.** The value is taken once when the process starts and is never read from disk again.
 - **Only what a running process keeps.** `hooks/*.sh` and `bin/relay` run fresh on every call, so they are not part of it: changing them needs no restart. See "Build identity" in `docs/deployment.md`.
 - **An identical rebuild is not a new build:** the same output gives the same `build_id`. A build made with plain `tsc` (without the stamping step) reports `unbuilt`, which never matches any build.
+- **Each connector records itself.** Every stdio connector an agent window starts writes one row about itself when it starts (schema v26, table `connectors`): its process, the window it belongs to, the install it was loaded from and the build it loaded. It writes only its own row. A row whose process has ended is never treated as live, and the daemon removes such rows after 7 days. This is what the coming deploy check reads.
 
 ### Fixed — a live process no longer reads dead when two relay processes run in different time zones
 

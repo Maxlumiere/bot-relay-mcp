@@ -6,8 +6,9 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Readable, Writable } from "node:stream";
 import { createServer } from "../server.js";
-import { endAgentSessionOnSignal, getAgentSessionId, logAudit, setAgentLivenessAnchor } from "../db.js";
+import { endAgentSessionOnSignal, getAgentSessionId, logAudit, recordOwnConnector, setAgentLivenessAnchor } from "../db.js";
 import { detectAgentProcess, type AgentProcess } from "../liveness.js";
+import { LOADED_BUILD } from "../loaded-build.js";
 import { log } from "../logger.js";
 import { broadcastDashboardEvent } from "./websocket.js";
 
@@ -293,9 +294,19 @@ export async function startStdioServer(
   // at startup, no loop) and stamp it as the liveness anchor if our row already
   // exists (hook-first registration). The on-register re-stamp in
   // src/tools/identity.ts covers the MCP-first / re-register orderings.
+  // ADR-0047: EVERY stdio connector (named or not) detects its window and stamps
+  // its own `connectors` row (its pid and start token, that window, the install it
+  // loaded from, the build it LOADED), so the board can compare what it runs with
+  // what is installed. Best-effort: a failed stamp leaves the window UNKNOWN, the
+  // safe direction, and never blocks startup.
+  detectedAgentProcess = detectAgentProcess();
+  try {
+    recordOwnConnector({ parent: detectedAgentProcess, build: LOADED_BUILD });
+  } catch (err) {
+    log.debug(`[stdio] connector stamp skipped: ${err instanceof Error ? err.message : String(err)}`);
+  }
   const name = process.env.RELAY_AGENT_NAME;
   if (name && name !== "default") {
-    detectedAgentProcess = detectAgentProcess();
     stampDetectedAgentLiveness(name);
   }
   installAutoUnregister();
