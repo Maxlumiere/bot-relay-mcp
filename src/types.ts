@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
+import type { BuildInfo } from "./build-info.js";
 import { z } from "zod";
 import { isSafeCssColorValue } from "./css-color.js";
 import { getAgentCliProfile } from "./agent-cli-profiles.js";
@@ -612,6 +613,8 @@ export interface WhoamiResult {
   host_id: string | null;
   /** ADR-0043: which relay this is to the federation (relay_edge.edge_id) — an identifier, never a credential. */
   edge_id: string;
+  /** ADR-0047: the build the answering process loaded (a content hash and, for humans, commit and time), never a credential. */
+  build: BuildInfo;
 }
 
 export const HealthCheckSchema = z.object({

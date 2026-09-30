@@ -42,6 +42,7 @@ import { requestContext } from "../request-context.js";
 import { ipInAnyCidr } from "../cidr.js";
 import { VERSION } from "../version.js";
 import { RESOLVER_REVISION } from "../resolve-instance.js";
+import { BUILD_INFO } from "../build-info.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import type { Server } from "http";
 
@@ -546,6 +547,8 @@ export function startHttpServer(port: number, host: string): Server {
       protocol_version: PROTOCOL_VERSION,
       // ADR-0048 PR D: Tether bundles this resolver and compares this value to its own.
       resolver_revision: RESOLVER_REVISION,
+      // ADR-0047: the build the daemon LOADED (fixed at load, never re-read from disk).
+      build: BUILD_INFO,
       transport: "http",
       auth_required: !!config.http_secret,
       // v2.15.2 — MONOTONIC process uptime (process.uptime(), NOT Date.now

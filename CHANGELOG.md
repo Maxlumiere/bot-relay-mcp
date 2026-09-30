@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added — every relay process reports the build it loaded, not the one on disk
+
+A merge and an install change the files on disk, but a process that is already running keeps the code it loaded, so "deployed" was a claim about disk. Every build now carries a stamp, and every process reports the stamp it loaded:
+
+- **`build`** in `/health`, `health_check`, `whoami` and `relay where --json`: a `build_id` (a content hash of the build's `dist/` files and the dependency lock it was built against), and for humans the `commit`, whether that tree was `dirty`, and `built_at`. On a stdio connector, `health_check` and `whoami` report the connector's own build, so a connector still running old code shows it.
+- **Fixed at load.** The value is imported once when the process starts and is never read from disk again.
+- **An identical rebuild is not a new build:** the same output gives the same `build_id`. A build made with plain `tsc` (without the stamping step) reports `unbuilt`, which never matches any build.
+
 ### Fixed — a live process no longer reads dead when two relay processes run in different time zones
 
 The relay tells a live agent window from a dead one (and from a new process that reused its PID) by the process start time that `ps` prints. That time was printed in the reading process's own time zone, so the same live process read differently under two `TZ` values. A connector and the daemon with different `TZ` settings would read a live window as dead. The start time now has one spelling everywhere: `TZ=UTC LC_ALL=C ps -o lstart= -p PID` followed by ` UTC` (for example `Thu Oct  1 07:37:33 2026 UTC`). It is read by one function in the relay (`processStartedAt`) and one in the hooks (`relay_pid_start`), which give byte-identical results. The ` UTC` ending records which clock printed the time: a start time is compared only with a reading in its own form. Without it, on a machine whose clock is behind UTC, a process reusing an old process id exactly that many hours later could have matched the old process's time.

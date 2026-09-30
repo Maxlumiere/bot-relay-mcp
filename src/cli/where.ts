@@ -32,6 +32,7 @@
  */
 import fs from "fs";
 import path from "path";
+import { BUILD_INFO } from "../build-info.js";
 
 interface Args {
   json: boolean;
@@ -118,7 +119,7 @@ export async function run(argv: string[]): Promise<number> {
         : [r.kind, r.dbPath, String(r.exists), "", r.kind === "flat" ? oneLine(r.warning) : "", vaultDir ?? ""];
     process.stdout.write(lines.join("\n") + "\n");
   } else if (args.json) {
-    process.stdout.write(JSON.stringify({ resolution: serializeResolution(r), vault_dir: vaultDir, resolver_revision: RESOLVER_REVISION }) + "\n");
+    process.stdout.write(JSON.stringify({ resolution: serializeResolution(r), vault_dir: vaultDir, resolver_revision: RESOLVER_REVISION, build: BUILD_INFO }) + "\n");
   } else if (r.kind === "error") {
     process.stdout.write(`[RELAY] instance resolution FAILED: ${r.reason}\n`);
   } else {

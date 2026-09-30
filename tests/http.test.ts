@@ -91,6 +91,13 @@ describe("HTTP transport", () => {
     expect(body.resolver_revision).toMatch(/^[0-9a-f]{12}$/);
   });
 
+  it("health check reports the build it LOADED (ADR-0047 PR 1: the static stamp, never re-read)", async () => {
+    const { BUILD_INFO } = await import("../src/build-info.js");
+    const res = await fetch(`${baseUrl}/health`);
+    const body = await res.json();
+    expect(body.build).toEqual(BUILD_INFO);
+  });
+
   it("health check exposes a monotonic uptime_seconds (v2.15.2)", async () => {
     // v2.15.2 — a follow-on Tether health-poll uses this as a silent-death
     // detector (a strict decrease across polls = daemon restarted). It must be

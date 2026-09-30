@@ -32,7 +32,7 @@
   ],
   "scripts": {
     "prebuild": "node scripts/prebuild-guard.mjs",
-    "build": "tsc && chmod +x dist/index.js",
+    "build": "tsc && chmod +x dist/index.js && node scripts/write-build-info.mjs",
     "start": "node dist/index.js",
     "test": "vitest run",
     "dev": "tsc --watch",
