@@ -119,7 +119,10 @@ describe("codex HIGH 1 — explicit RELAY_DB_PATH is an operator choice, not a f
   it("still shouts WRONG INSTANCE when the legacy DB is reached WITHOUT an explicit override", () => {
     // Positive control for the same guard: removing the override must restore
     // the warning, or the test above could pass simply because it never fires.
-    const out = runHook();
+    // Since ADR-0048 the legacy DB is reached while instances exist ONLY under
+    // the explicit RELAY_ALLOW_LEGACY_FALLBACK=1 opt-in (without it the state is a
+    // resolver error, DEGRADED: tests/adr-0048-c-hooks.test.ts).
+    const out = runHook({ RELAY_ALLOW_LEGACY_FALLBACK: "1" });
     expect(out).toContain("WRONG INSTANCE");
   });
 });
@@ -294,8 +297,10 @@ describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
   });
 
   it("MUTE when we resolved the legacy DB while instances exist", () => {
-    writeConfig(OK); // no active-instance link, no RELAY_DB_PATH
-    expect(verdictOf(runHook())).toBe("MUTE");
+    // No active-instance link, no RELAY_DB_PATH; the legacy opt-in (ADR-0048: the
+    // only way the resolver picks the legacy DB while instances exist).
+    writeConfig(OK);
+    expect(verdictOf(runHook({ RELAY_ALLOW_LEGACY_FALLBACK: "1" }))).toBe("MUTE");
   });
 
   it("CANNOT-JUDGE when there is no config to judge", () => {
@@ -389,13 +394,13 @@ describe("#226 — the harness isolates ambient RELAY_*, so a polluted env canno
   });
 
   it("still shouts WRONG INSTANCE despite an ambient RELAY_DB_PATH leak (no explicit override)", () => {
-    const out = runHook();
+    const out = runHook({ RELAY_ALLOW_LEGACY_FALLBACK: "1" });
     expect(out).toContain("WRONG INSTANCE");
   });
 
   it("still resolves MUTE despite an ambient RELAY_DB_PATH leak (legacy DB while instances exist)", () => {
     writeConfig({ mcpServers: { "bot-relay": { type: "http", url: "http://127.0.0.1:3777/mcp" } } });
-    const m = runHook().match(/VERDICT=([A-Z-]+)/);
+    const m = runHook({ RELAY_ALLOW_LEGACY_FALLBACK: "1" }).match(/VERDICT=([A-Z-]+)/);
     expect(m && m[1]).toBe("MUTE");
   });
 });

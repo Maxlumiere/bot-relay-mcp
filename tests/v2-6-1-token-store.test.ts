@@ -154,7 +154,7 @@ describe("v2.6.1 — bash hook mirror round-trip (sources shipped helper)", () =
     // FileTokenStore writes to.
     const script = `
 set -u
-RELAY_HOME='${TEST_ROOT}'
+export RELAY_HOME='${TEST_ROOT}'
 unset RELAY_DB_PATH RELAY_INSTANCE_ID
 . '${HELPER}'
 read_relay_token_from_vault '${name}'
@@ -172,7 +172,7 @@ read_relay_token_from_vault '${name}'
     // back. Closes the dispatch contract — drift in EITHER direction surfaces.
     const script = `
 set -u
-RELAY_HOME='${TEST_ROOT}'
+export RELAY_HOME='${TEST_ROOT}'
 unset RELAY_DB_PATH RELAY_INSTANCE_ID
 . '${HELPER}'
 write_relay_token_to_vault '${name}' '${token}'

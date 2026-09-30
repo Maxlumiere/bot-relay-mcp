@@ -555,7 +555,7 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
     expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 
-  it("a DB the containment guard REJECTS (outside HOME and the temp roots): mail still decided by relay pending, the local reads skipped, DEGRADED with the reason", () => {
+  it("a DB the RESOLVER refuses (outside HOME and the temp roots; ADR-0048 retired the bash guard): mail still decided by relay pending, the local reads skipped, DEGRADED with the reason", () => {
     // A path outside this test's HOME and outside every temp root: under the repo's
     // own (gitignored) node_modules/.cache.
     const dir = path.join(REPO_ROOT, "node_modules", ".cache", `f1-286-d2c-${process.pid}`);
@@ -572,7 +572,11 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
       const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, {
         RELAY_AGENT_NAME: "d2c", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
       }) });
-      expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*local DB path rejected/);
+      // The verdict carries the resolver's refusal (each reason is capped at 200
+      // characters, so the long path may cut its tail); the full sentence is on
+      // the loud stdout line.
+      expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*instance resolution failed: [^"]*liveness and task reads skipped/);
+      expect(r.stdout).toMatch(/\[RELAY\] instance resolution FAILED: .*outside the approved roots/);
       expect(r.stdout).not.toMatch(/Active tasks for d2c/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -605,17 +609,23 @@ describe("#286 P-a — no time budget left: the read is skipped, LOUD, never flo
     expect(r.stdout, r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: no time budget left \(\d+s spent before the mail read\)/);
   }, 45_000);
 
-  it("PostToolUse: a slow hook stdin spends the 5s budget → SKIPPED, DEGRADED 'no time budget left'", async () => {
+  // Codex #291 R2: the stdin read is itself on the budget now (relay_budget_for),
+  // so a slow stdin can no longer spend the mail read's time: it is CUT at its
+  // share and said so, and the hook ends inside its 5s. (The no-floor skip is held
+  // by the relay_pending_deadline row above and the SessionStart row.)
+  it("PostToolUse: a slow hook stdin is CUT at its budget share → CANNOT-JUDGE 'not complete within its time budget', inside 5s, the mail read never started", async () => {
     const home = path.join(ROOT, "home-pa2");
     fs.mkdirSync(home, { recursive: true });
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "pa2");
+    const t0 = Date.now();
     const child = spawn("bash", [PTU_HOOK], { env: baseEnv(home, { RELAY_AGENT_NAME: "pa2", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_HOOK_NOTICE_REMIND_SECS: "0" }) });
     let stderr = "";
     child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.stdin.on("error", () => {}); // the hook may have ended (EPIPE): expected
     const done = new Promise((r) => child.on("close", r));
-    // A payload that dribbles in for ~2.6s: the stdin reader keeps reading (its idle
-    // limit is 1s), so the time is really spent before the mail read.
+    // A payload that dribbles in for ~2.6s: past the stdin read's share (at most
+    // 2s of the 5s budget), so it is cut before it completes.
     const parts = ['{"session_id": "pa2", ', '"hook_event_name": ', '"PostToolUse", ', '"tool_name": ', '"Read", ', '"x": 1}'];
     for (const p of parts) {
       child.stdin.write(p);
@@ -623,6 +633,7 @@ describe("#286 P-a — no time budget left: the read is skipped, LOUD, never flo
     }
     child.stdin.end();
     await done;
-    expect(stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: no time budget left \(\d+s spent before the mail read\)/);
+    expect((Date.now() - t0) / 1000, stderr).toBeLessThan(5);
+    expect(stderr).toMatch(/VERDICT=CANNOT-JUDGE reason="hook stdin not complete within its time budget: mail check skipped/);
   }, 30_000);
 });
