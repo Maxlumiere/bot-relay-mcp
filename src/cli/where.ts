@@ -20,7 +20,8 @@
  * kind, db_path, exists, reason, warning, vault_dir (empty lines where a field
  * does not apply), read with plain `read -r`. It is fail-closed: a resolved PATH
  * containing a line break cannot be split across lines, so it is refused as the
- * error kind; a line break in a reason or warning becomes a space.
+ * error kind, and so is one with any other control character (C0 or DEL); a
+ * control character in a reason or warning becomes a space.
  *
  * --env-keys prints the environment variables the resolver reads (one per line;
  * a JSON array with --json) and exits 0: the ONLY keys the deploy gate passes on
@@ -104,11 +105,13 @@ export async function run(argv: string[]): Promise<number> {
   let r = resolveInstance(args.dbPath ? { dbPath: args.dbPath } : {});
   if (args.fields && r.kind !== "error" && /[\r\n]/.test(r.dbPath)) {
     r = { kind: "error", reason: "the resolved DB path contains a line break, which a line-per-field answer cannot carry: refused" };
+  } else if (args.fields && r.kind !== "error" && /[\x00-\x1f\x7f]/.test(r.dbPath)) {
+    r = { kind: "error", reason: "the resolved DB path contains a control character, which a shell must never be handed as a path: refused" };
   }
   const vaultDir = r.kind === "error" ? null : path.join(path.dirname(r.dbPath), "agents");
 
   if (args.fields) {
-    const oneLine = (v: string | undefined) => (v ?? "").replace(/[\r\n]+/g, " ");
+    const oneLine = (v: string | undefined) => (v ?? "").replace(/[\x00-\x1f\x7f]+/g, " ");
     const lines =
       r.kind === "error"
         ? ["error", "", "", oneLine(r.reason), "", ""]

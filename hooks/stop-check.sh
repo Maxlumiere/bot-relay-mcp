@@ -117,31 +117,54 @@ if [[ "$0" != *"/bot-relay-mcp/hooks/"* ]]; then
   echo "[bot-relay hook WARNING] \$0 does not contain '/bot-relay-mcp/hooks/' — the install path may be truncated. Quote the command string in .claude/settings.json if the path contains spaces. \$0='$0'" >&2
 fi
 
+# v2.6.1 — vault helpers (token vault) sourced from a single file (functions
+# only: sourcing reads nothing, so stdin is still untouched). The DB path is NOT
+# resolved here: `relay pending` resolves it (the connector's instance layout,
+# positive evidence only).
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./_vault-helpers.sh
+. "$HOOKS_DIR/_vault-helpers.sh"
+# This hook's INSTALLED timeout in seconds. The source of truth is
+# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
+# equal. Every blocking call below, the stdin read first, takes its timeout from
+# what is LEFT of it (relay_budget_for in _vault-helpers.sh).
+RELAY_HOOK_BUDGET_SECS=5
+
 # --- Hook input (stdin) — the ONE-WAKE-PER-NATURAL-STOP guard -----------------
 # Claude Code writes the hook payload to stdin and closes it. The COMPLETE
 # payload is read (bounded at 256KB), not just the first line — a pretty-printed
 # payload with `stop_hook_active` on a later line must not parse as inactive
 # (codex #124: first-line-only reading let a multi-line active:true payload
-# defeat the guard and re-block every forced continuation). The per-line 1s
-# timeout only guards a manual TTY invocation from hanging; on a closed pipe
-# every read returns instantly. Concatenating lines is JSON-safe: newlines are
-# inter-token whitespace and cannot occur inside JSON strings.
+# defeat the guard and re-block every forced continuation). The WHOLE read is
+# bounded by the step's budget (relay_budget_for): on a closed pipe every read
+# returns instantly, and a writer that never closes, or dribbles lines forever,
+# costs that budget rather than a hang. Concatenating lines is JSON-safe:
+# newlines are inter-token whitespace and cannot occur inside JSON strings.
 HOOK_INPUT=""
 _line=""
 _capped=0
-while IFS= read -r -t 1 _line 2>/dev/null; do
-  HOOK_INPUT="${HOOK_INPUT}${_line}"
-  if [ ${#HOOK_INPUT} -ge 262144 ]; then
-    _capped=1
-    break
-  fi
-done
-# On EOF-exit, `read` returns non-zero with the unterminated final line still
-# in _line — append it. On cap-break it was ALREADY appended inside the loop;
-# appending again would retain up to 2x the cap for a single giant line
-# (codex #124 round 2). Then truncate, so the cap holds even for the
+_ended=0
+if relay_budget_for "the hook payload read" 2 margin; then
+  _stdin_end=$(( SECONDS + RELAY_STEP_SECS ))
+  while [ "$SECONDS" -lt "$_stdin_end" ]; do
+    if IFS= read -r -t "$(( _stdin_end - SECONDS ))" _line 2>/dev/null; then
+      HOOK_INPUT="${HOOK_INPUT}${_line}"
+      if [ ${#HOOK_INPUT} -ge 262144 ]; then
+        _capped=1
+        break
+      fi
+    else
+      _ended=1
+      break
+    fi
+  done
+fi
+# When `read` fails (EOF or its timeout), the unterminated final line is still
+# in _line — append it. On cap-break (or the deadline) it was ALREADY appended
+# inside the loop; appending again would retain up to 2x the cap for a single
+# giant line (codex #124 round 2). Then truncate, so the cap holds even for the
 # EOF-remnant case and the 256KB claim is actually true.
-if [ "$_capped" -eq 0 ]; then
+if [ "$_ended" -eq 1 ]; then
   HOOK_INPUT="${HOOK_INPUT}${_line}"
 fi
 HOOK_INPUT="${HOOK_INPUT:0:262144}"
@@ -187,16 +210,6 @@ AGENT_NAME="${RELAY_AGENT_NAME:-}"
 AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}"
 HTTP_PORT="${RELAY_HTTP_PORT:-3777}"
 HTTP_HOST="${RELAY_HTTP_HOST:-127.0.0.1}"
-# v2.6.1 — vault helpers (token vault) sourced from a single file. The DB path
-# is NOT resolved here: `relay pending` resolves it (the connector's instance
-# layout, positive evidence only).
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=./_vault-helpers.sh
-. "$HOOKS_DIR/_vault-helpers.sh"
-# This hook's INSTALLED timeout in seconds. The source of truth is
-# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
-# equal, so a budget change there cannot silently outrun the read deadline here.
-RELAY_HOOK_BUDGET_SECS=5
 RELAY_CLI="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
 MAX_MESSAGES="${RELAY_HOOK_MAX_MESSAGES:-20}"
 DAMPER_SECS="${RELAY_STOP_WAKE_DAMPER_SECS:-120}"
@@ -283,7 +296,7 @@ sys.stdout.write("%d\x1f%s\x1f%s" % (n, who, top))
 # token means the remote read reports it cannot authenticate, as before.
 relay_hydrate_token() {
   [ -n "$AGENT_TOKEN" ] && return 0
-  relay_where_load "$RELAY_CLI" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" || true
+  relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
   local t
   if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
     AGENT_TOKEN="$t"
@@ -297,8 +310,12 @@ http_peek() {
   command -v curl >/dev/null 2>&1 || return 1
   command -v python3 >/dev/null 2>&1 || return 1
 
-  # Probe /health with a tight budget. If no response in 1s, assume no daemon.
-  if ! curl -fsS --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+  # Probe /health first, then the read: each takes its timeout from what is LEFT
+  # of this hook's budget (relay_budget_for); with no time left it is skipped
+  # (exit 125: this runs in a $(...) subshell, so the caller records the skip;
+  # DEGRADED "no time budget left for the remote read", in the verdict below).
+  relay_budget_for "the remote health probe" 1 margin || return 125
+  if ! curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
     return 1
   fi
 
@@ -323,7 +340,8 @@ print(json.dumps({
 ' 2>/dev/null) || return 1
 
   local response
-  response=$(curl -fsS --max-time 2 \
+  relay_budget_for "the remote mail read" 2 margin || return 125
+  response=$(curl -fsS -m "$RELAY_STEP_SECS" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
@@ -404,16 +422,16 @@ else
     trap 'rm -f "$_f1_outf" "$_f1_errf" "$_f1_outf.timedout" 2>/dev/null; relay_emit_verdict' EXIT
     # node runs DIRECTLY into files under a watchdog, inside this hook's installed
     # budget (relay_run_pending / relay_pending_deadline in _vault-helpers.sh).
-    _f1_deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
-    if [ "$_f1_deadline" -lt 1 ]; then
-      # No time left for the read: SKIP it and say so (never a floored 1s read).
-      F1_RC=125
-      F1_ERR="no time budget left (${SECONDS}s spent before the mail read)"
-    else
+    if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
+      _f1_deadline="$RELAY_STEP_SECS"
       relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json
       F1_RC=$?
       F1_OUT=$(cat "$_f1_outf" 2>/dev/null)
       F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null)
+    else
+      # No time left for the read: SKIP it and say so (never a floored 1s read).
+      F1_RC=125
+      F1_ERR="no time budget left (${SECONDS}s spent before the mail read)"
     fi
     if [ "$F1_RC" -eq 125 ]; then
       :
@@ -449,7 +467,10 @@ case "$F1_RC" in
       MODE=remote
       relay_hydrate_token
       SUMMARY=$(http_peek)
-      [ $? -eq 0 ] && READ_OK=1
+      case $? in
+        0) READ_OK=1 ;;
+        125) RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-the remote read}" ;;
+      esac
     else
       MODE=none
     fi
@@ -474,6 +495,9 @@ if command -v relay_verdict_set >/dev/null 2>&1; then
     # DEGRADED = a concluded fault (the verdict contract in _verdict.sh): the
     # local read failed, and nothing was asked of any other relay.
     relay_verdict_set "DEGRADED" "relay unreadable: ${_f1_why:-the local relay mailbox could not be read}" " agent=\"${AGENT_NAME}\" http_fallback=\"none\""
+  elif [ "$MODE" = remote ] && [ -n "${RELAY_BUDGET_SKIPPED:-}" ]; then
+    # A step of the remote read was SKIPPED for want of time: a concluded fault.
+    relay_verdict_set "DEGRADED" "no time budget left for ${RELAY_BUDGET_SKIPPED}" " agent=\"${AGENT_NAME}\""
   elif [ "$MODE" = remote ]; then
     relay_verdict_set "CANNOT-JUDGE" "remote relay read failed (unreachable, unauthorized or no token)" " agent=\"${AGENT_NAME}\""
   else

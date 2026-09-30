@@ -53,9 +53,10 @@ relay_helpers_cli() {
 # answer), which is also recorded as the error kind with the reason. A path is
 # exposed ONLY from a SUCCESSFUL, COMPLETE answer: exit 0, all six lines, a known
 # kind, a DB path, `exists` true or false (an error answer must exit 1 with its
-# reason); anything else (a failed or truncated run) is the error kind. The read
-# is bounded by what is left of the hook's budget before the mail read
-# (relay_premail_secs), or by an explicit cap in seconds as the 2nd argument.
+# reason), and a path carrying a control character (C0 or DEL) is refused;
+# anything else (a failed or truncated run) is the error kind. The read is
+# bounded by an explicit cap in seconds (the 2nd argument, from the caller's
+# relay_budget_for), or else by relay_budget_for here (the pre-mail budget).
 relay_where_load() {
   local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" nlines=0
   export RELAY_RES_LOADED=1 RELAY_RES_KIND=error RELAY_RES_DB_PATH="" RELAY_RES_EXISTS="" RELAY_RES_REASON="" RELAY_RES_WARNING=""
@@ -67,10 +68,19 @@ relay_where_load() {
     export RELAY_RES_REASON="no relay CLI beside this hook ($cli)"
     return 1
   fi
-  # An explicit cap (PostToolUse/Stop, AFTER their mail read) replaces the
-  # pre-mail budget; SessionStart asks BEFORE its mail read, so the default
-  # reserves the mail read's time.
-  case "$cap" in ''|*[!0-9]*) secs=$(relay_premail_secs) ;; *) secs="$cap" ;; esac
+  # An explicit cap (PostToolUse/Stop take theirs from relay_budget_for) is used
+  # as given; without one (SessionStart, BEFORE its mail read) the pre-mail budget
+  # applies, so the mail read keeps its reserve.
+  case "$cap" in
+    ''|*[!0-9]*)
+      if ! relay_budget_for "the resolver" 5; then
+        export RELAY_RES_REASON="no time budget left to ask the resolver"
+        return 1
+      fi
+      secs="$RELAY_STEP_SECS"
+      ;;
+    *) secs="$cap" ;;
+  esac
   if [ "$secs" -lt 1 ]; then
     export RELAY_RES_REASON="no time budget left to ask the resolver"
     return 1
@@ -101,6 +111,11 @@ relay_where_load() {
         export RELAY_RES_REASON="relay where gave an invalid path answer (exit $rc)"
         return 1
       fi
+      # A control character in the path (C0 or DEL) is never a path to hand on.
+      if relay_whole_match "$d" '[[:cntrl:]]'; then
+        export RELAY_RES_REASON="relay where gave a path with a control character: refused"
+        return 1
+      fi
       export RELAY_RES_KIND="$k" RELAY_RES_DB_PATH="$d" RELAY_RES_EXISTS="$e" RELAY_RES_WARNING="$warn"
       return 0
       ;;
@@ -125,8 +140,10 @@ relay_res_set_db() {
 
 # relay_pending_resolution_db JSON — the DB path of the resolution a `relay
 # pending --json` answer EMBEDS, echoed with return 0, ONLY when that resolution
-# is valid: kind explicit-db | instance | flat, db_path a non-empty one-line
-# string, exists a boolean. A missing or malformed resolution, the error kind or
+# is valid: kind explicit-db | instance | flat, db_path a non-empty string,
+# exists a boolean, and NO control character (C0, NUL included, or DEL) in any
+# of its strings: bash command substitution silently drops a NUL, so a path that
+# carried one would name a different file. A missing or malformed resolution, the error kind or
 # an unknown kind → return 1: an exit-0 answer without a valid resolution is not
 # a trustworthy read (the caller reports DEGRADED and reads nothing through it).
 # PostToolUse and Stop only (python3, which those hooks already require).
@@ -140,8 +157,16 @@ except Exception:
     sys.exit(1)
 if not isinstance(r, dict) or r.get("kind") not in ("explicit-db", "instance", "flat"):
     sys.exit(1)
+def controls(v):
+    if isinstance(v, str):
+        return any(ord(c) < 32 or ord(c) == 127 for c in v)
+    if isinstance(v, dict):
+        return any(controls(k) or controls(x) for k, x in v.items())
+    if isinstance(v, list):
+        return any(controls(x) for x in v)
+    return False
 p, e = r.get("db_path"), r.get("exists")
-if not isinstance(p, str) or not p or "\n" in p or "\r" in p or not isinstance(e, bool):
+if not isinstance(p, str) or not p or not isinstance(e, bool) or controls(r):
     sys.exit(1)
 sys.stdout.write(p)' 2>/dev/null
 }
@@ -656,38 +681,88 @@ relay_run_bounded() {
   return "$rc"
 }
 
-# relay_pending_deadline BUDGET
-# Whole seconds `relay pending` may run in this hook. BUDGET is the hook's
-# INSTALLED timeout (src/agent-cli-profiles.ts is the source of truth; each hook
-# declares it as RELAY_HOOK_BUDGET_SECS, and a test holds the two equal). The
-# deadline is what is LEFT of it (minus what this hook already spent, $SECONDS)
-# minus a 3s margin to report the failure (SECONDS truncates, so up to 1s spent
-# is unseen, and the watchdog's 1s KILL grace comes on top), so the harness never
-# kills the hook before it can say why. RELAY_PENDING_TIMEOUT_SECS may only
-# shorten it. NO FLOOR: below 1 means there is no time left, and the caller must
-# SKIP the read and say so, never squeeze in a 1s read the harness would kill.
-# relay_premail_secs — whole seconds the steps BEFORE the mail read (the resolver,
-# the health check, registration, the bind) may still use: the hook's installed
-# budget (RELAY_HOOK_BUDGET_SECS) minus what it already spent ($SECONDS), minus
-# the report margin (3s, as relay_pending_deadline) and a RESERVE for the mail
-# read itself (2s). Never negative. Every pre-mail step is capped by it, so those
-# steps together can never eat the mail read's time or push the hook past its
-# installed timeout.
-relay_premail_secs() {
-  local budget="${RELAY_HOOK_BUDGET_SECS:-10}" reserve=2 left
+# relay_run_capture SECS INFILE CMD... — CMD under relay_run_bounded's watchdog
+# (killed at SECS, 124 = timed out), stdin from INFILE (/dev/stdin: this
+# function's own, e.g. a heredoc), its stdout printed. For a blocking call whose
+# answer the caller captures (a sqlite3 read): files, never a pipe, as above.
+relay_run_capture() {
+  local secs="$1" inf="$2" outf errf rc
+  shift 2
+  outf="$(mktemp 2>/dev/null || printf '')"
+  errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -z "$outf" ] || [ -z "$errf" ]; then
+    rm -f "$outf" "$errf" 2>/dev/null
+    return 125
+  fi
+  relay_run_bounded "$secs" "$inf" "$outf" "$errf" "$@"
+  rc=$?
+  cat "$outf" 2>/dev/null
+  rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
+  return "$rc"
+}
+
+# THE TIME BUDGET. Every blocking call in a hook (curl, the relay CLI, sqlite3,
+# the hook's own stdin read) takes its timeout from relay_budget_for below, never
+# a fixed number: a test fails on any literal timeout spelling in hooks/*.sh.
+#
+# Each hook declares its INSTALLED timeout as RELAY_HOOK_BUDGET_SECS (the source
+# of truth is src/agent-cli-profiles.ts; a test holds the two equal). What is left
+# of it is the budget minus what the hook already spent ($SECONDS) minus a 3s
+# margin to report a failure (SECONDS truncates, so up to 1s spent is unseen, and
+# the watchdog's 1s KILL grace comes on top), so the harness never kills the hook
+# before it can say why.
+
+# relay_margin_secs — whole seconds left for any step: the installed budget minus
+# what was spent minus the report margin. Never negative.
+relay_margin_secs() {
+  local budget="${RELAY_HOOK_BUDGET_SECS:-10}" left
   case "$budget" in ''|*[!0-9]*) budget=10 ;; esac
-  left=$(( budget - ${SECONDS:-0} - 3 - reserve ))
+  left=$(( budget - ${SECONDS:-0} - 3 ))
   [ "$left" -lt 0 ] && left=0
   printf '%s' "$left"
 }
 
-# relay_cap SECS — the smaller of a step's own cap and the pre-mail budget.
-relay_cap() {
-  local own="$1" left
-  left=$(relay_premail_secs)
-  if [ "$own" -lt "$left" ]; then printf '%s' "$own"; else printf '%s' "$left"; fi
+# relay_premail_secs — whole seconds a step BEFORE SessionStart's mail read may
+# still use: relay_margin_secs minus a RESERVE for the mail read itself (2s), so
+# the pre-mail steps together can never eat the mail read's time. Never negative.
+relay_premail_secs() {
+  local left
+  left=$(( $(relay_margin_secs) - 2 ))
+  [ "$left" -lt 0 ] && left=0
+  printf '%s' "$left"
 }
 
+# relay_budget_for STEP OWN [premail|margin] — may STEP still run, and for how
+# long? Sets RELAY_STEP_SECS to the smaller of the step's own cap OWN and what is
+# left: relay_premail_secs (premail, the default: a SessionStart step before its
+# mail read) or relay_margin_secs (margin: the mail read's own remote call, any
+# step after it, and every step of PostToolUse and Stop, whose 5s budget has no
+# room for a reserve). With under a second left the step is SKIPPED (a `curl -m 0`
+# would be no timeout at all), LOUDLY: a stderr line, RELAY_BUDGET_SKIPPED names
+# the first skipped step, and the hook's relay_budget_skipped (when it defines
+# one) raises DEGRADED "no time budget left for STEP". Returns 1 then.
+relay_budget_for() {
+  local step="$1" own="$2" left
+  case "$own" in ''|*[!0-9]*) own=0 ;; esac
+  if [ "${3:-premail}" = margin ]; then left=$(relay_margin_secs); else left=$(relay_premail_secs); fi
+  if [ "$own" -lt "$left" ]; then RELAY_STEP_SECS="$own"; else RELAY_STEP_SECS="$left"; fi
+  if [ "$RELAY_STEP_SECS" -lt 1 ]; then
+    RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-$step}"
+    echo "[bot-relay] no time budget left for $step (${SECONDS}s of ${RELAY_HOOK_BUDGET_SECS:-10}s spent): skipped." >&2
+    if declare -F relay_budget_skipped >/dev/null 2>&1; then
+      relay_budget_skipped "$step"
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# relay_pending_deadline BUDGET — whole seconds `relay pending` (the mail read)
+# may run: what is left of BUDGET (the hook's RELAY_HOOK_BUDGET_SECS) after $SECONDS
+# spent and the 3s margin, as relay_margin_secs. RELAY_PENDING_TIMEOUT_SECS may
+# only shorten it. NO FLOOR: below 1 means there is no time left, and the caller
+# must SKIP the read and say so (its own loud path: "relay unreadable: no time
+# budget left"), never squeeze in a 1s read the harness would kill.
 relay_pending_deadline() {
   local budget="$1" margin=3 left v
   case "$budget" in ''|*[!0-9]*) budget=5 ;; esac

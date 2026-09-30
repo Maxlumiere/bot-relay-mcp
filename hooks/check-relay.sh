@@ -107,22 +107,40 @@ fi
 # TIME, not bytes. macOS has no `timeout`/`gtimeout` (verified: bash 3.2,
 # /usr/bin/perl present), and perl's alarm interrupts a blocking slurp — measured
 # at 2s against a FIFO with a live writer that never closes.
+# v2.6.1 — vault helpers sourced from a single file (functions only: sourcing
+# reads nothing, so stdin is still untouched). The DB path (and so the vault
+# beside it) is the ONE resolver's answer (ADR-0048), never a bash derivation.
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./_vault-helpers.sh
+. "$HOOKS_DIR/_vault-helpers.sh"
+# This hook's INSTALLED timeout in seconds. The source of truth is
+# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
+# equal. Every blocking call below takes its timeout from what is LEFT of it
+# (relay_budget_for in _vault-helpers.sh).
+RELAY_HOOK_BUDGET_SECS=10
+# A step skipped for want of time is a concluded fault: DEGRADED, "no time budget
+# left for STEP" (relay_budget_for calls this by name).
+relay_budget_skipped() {
+  command -v relay_verdict_raise >/dev/null 2>&1 || return 0
+  relay_verdict_raise "DEGRADED" "no time budget left for $1 (${SECONDS}s spent)" " agent=\"${AGENT_NAME:-}\"" other
+}
+
 RELAY_HOOK_PAYLOAD=""
-if [ ! -t 0 ]; then
+if [ ! -t 0 ] && relay_budget_for "the hook payload read" 2; then
   if command -v perl >/dev/null 2>&1; then
-    RELAY_HOOK_PAYLOAD=$(perl -e '
+    RELAY_HOOK_PAYLOAD=$(RELAY_STEP_SECS="$RELAY_STEP_SECS" perl -e '
       eval {
         local $SIG{ALRM} = sub { die "relay-stdin-timeout\n" };
-        alarm 2;
+        alarm $ENV{RELAY_STEP_SECS};
         my $d = do { local $/; <STDIN> };
         alarm 0;
         print substr($d, 0, 1048576) if defined $d;
       };
     ' 2>/dev/null || printf '')
   elif command -v timeout >/dev/null 2>&1; then
-    RELAY_HOOK_PAYLOAD=$(timeout 2 head -c 1048576 2>/dev/null || printf '')
+    RELAY_HOOK_PAYLOAD=$(timeout "$RELAY_STEP_SECS" head -c 1048576 2>/dev/null || printf '')
   elif command -v gtimeout >/dev/null 2>&1; then
-    RELAY_HOOK_PAYLOAD=$(gtimeout 2 head -c 1048576 2>/dev/null || printf '')
+    RELAY_HOOK_PAYLOAD=$(gtimeout "$RELAY_STEP_SECS" head -c 1048576 2>/dev/null || printf '')
   fi
   # NO unbounded fallback. With no way to bound the read, SKIP the payload: the
   # cost of no bind is one unrecorded window, and the cost of a hang is the whole
@@ -160,15 +178,6 @@ RELAY_TERMINAL_TITLE_RE='^[A-Za-z0-9_. -]{1,100}$'
 if [ -n "$RELAY_TERMINAL_TITLE_VALUE" ] && ! [[ "$RELAY_TERMINAL_TITLE_VALUE" =~ $RELAY_TERMINAL_TITLE_RE ]]; then
   RELAY_TERMINAL_TITLE_VALUE=""
 fi
-# v2.6.1 — vault helpers sourced from a single file. The DB path (and so the vault
-# beside it) is the ONE resolver's answer (ADR-0048), never a bash derivation.
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=./_vault-helpers.sh
-. "$HOOKS_DIR/_vault-helpers.sh"
-# This hook's INSTALLED timeout in seconds. The source of truth is
-# src/agent-cli-profiles.ts (the Claude profile's hook list); a test holds the two
-# equal. The mail read's deadline is what is LEFT of it after registration.
-RELAY_HOOK_BUDGET_SECS=10
 # ADR-0048: ask the ONE resolver ONCE, before anything needs a path (the spawn
 # manifest and the vault live beside the DB, and the mail read follows). Its
 # answer is held in exported RELAY_RES_* variables for every helper below.
@@ -595,22 +604,6 @@ relay_mail_unreadable() {
   relay_degrade "relay unreadable: ${why:-the local relay mailbox could not be read}"
 }
 
-# relay_budget_for STEP OWN_CAP — may a PRE-MAIL step (the resolver, the health
-# check, registration, the bind) still run? It sets RELAY_STEP_SECS to the
-# smaller of the step's own cap and what is left before the mail read's reserve
-# (relay_premail_secs), so the pre-mail steps can never push the hook past its
-# installed budget. With under a second left the step is SKIPPED (a `curl -m 0`
-# would be no timeout at all): LOUD, DEGRADED "no time budget left for STEP".
-relay_budget_for() {
-  RELAY_STEP_SECS=$(relay_cap "$2")
-  if [ "$RELAY_STEP_SECS" -lt 1 ]; then
-    echo "[bot-relay] no time budget left for $1 (${SECONDS}s of ${RELAY_HOOK_BUDGET_SECS}s spent): skipped; the mail read keeps its reserve." >&2
-    relay_mail_verdict "DEGRADED" "no time budget left for $1 (${SECONDS}s spent)" other
-    return 1
-  fi
-  return 0
-}
-
 relay_remote_failed() {
   echo "[RELAY] remote relay read failed: pending mail for $AGENT_NAME could not be read at session start. Mail may be waiting: call get_messages."
   echo "[bot-relay] remote mail read failed for $AGENT_NAME: $1" >&2
@@ -631,7 +624,12 @@ relay_deliver_remote_mail() {
       name: "get_messages",
       arguments: { agent_name: process.env.AN, status: "pending", limit: Number(process.env.LIM), peek: true, since: "all", agent_token: process.env.AT },
     } }));' 2>/dev/null) || { relay_remote_failed "could not build the request"; return 0; }
-  resp=$(curl -fsS --max-time 4 -X POST "http://${host}:${port}/mcp" \
+  # The remote read IS the mail read: it draws on what is left (margin, no reserve).
+  if ! relay_budget_for "the remote mail read" 4 margin; then
+    relay_remote_failed "no time budget left for the remote mail read"
+    return 0
+  fi
+  resp=$(curl -fsS -m "$RELAY_STEP_SECS" -X POST "http://${host}:${port}/mcp" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
     -H "X-Agent-Token: $tok" --data "$payload" 2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }
   block=$(printf '%s' "$resp" | SRC=http AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null) \
@@ -674,12 +672,14 @@ relay_deliver_pending_mail() {
       RELAY_TMP_FILES="$RELAY_TMP_FILES $outf $errf $outf.timedout"
       # node runs DIRECTLY into files under a watchdog, inside what is LEFT of this
       # hook's installed budget (relay_run_pending / relay_pending_deadline).
-      deadline=$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")
-      if [ "$deadline" -lt 1 ]; then
+      if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
+        deadline="$RELAY_STEP_SECS"
+      else
         # No time left for the read: SKIP it and say so (never a floored 1s read).
         rc=125
         why="no time budget left (${SECONDS}s spent before the mail read)"
-      else
+      fi
+      if [ "$rc" -ne 125 ]; then
         relay_run_pending "$deadline" "$outf" "$errf" node "$bin" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW"
         rc=$?
         out=$(cat "$outf" 2>/dev/null)
@@ -906,7 +906,9 @@ elif [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
   # host_shell_pids + host_id + agent_pid. Paired with the spawn-side offline
   # pre-register (src/tools/spawn.ts), which keeps that register from tripping
   # the collision guard. Populated-live rows still skip as before.
-  LIVENESS=$(sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+  # Every sqlite3 read runs under the watchdog, at what is left of the budget.
+  LIVENESS=""
+  relay_budget_for "the liveness read" 1 && LIVENESS=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT CASE
   WHEN session_id IS NOT NULL AND session_id != ''
@@ -944,9 +946,11 @@ SQL
     #                 leave the verdict untouched. This is the no-false-fire crux.
     # NEVER auto-forces. Suppressed when already MUTE (a bigger, more-actionable
     # problem dominates the verdict line).
-    if [ "$RELAY_VERDICT" != "MUTE" ]; then
+    # With no time left for the anchor read there is no diagnosis to make (the skip
+    # is DEGRADED on its own): never a verdict from an anchor that was not read.
+    if [ "$RELAY_VERDICT" != "MUTE" ] && relay_budget_for "the anchor read" 1; then
       RELAY_OWN_GUID=$(relay_machine_guid 2>/dev/null || printf '')
-      RELAY_ANCHOR_ROW=$(sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
+      RELAY_ANCHOR_ROW=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT COALESCE(agent_pid,''), COALESCE(agent_pid_start,''), COALESCE(host_id,'')
 FROM agents WHERE name = :name LIMIT 1;
@@ -1241,7 +1245,12 @@ relay_deliver_pending_mail
 # a line boundary on the way out; node decodes and FRAMES it (RELAY_FRAME_JS).
 TASKS=""
 RELAY_TASKS_FAILED=0
-TASKS_HEX=$(sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
+TASKS_HEX=""
+# After the mail read: what is left minus the margin (no reserve to keep). A task
+# read that was skipped or timed out is TOLD: tasks may exist that are not shown.
+RELAY_TASKS_RC=0
+if relay_budget_for "the task read" 2 margin; then
+  TASKS_HEX=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT hex(priority), hex(title), hex(from_agent), hex(id)
 FROM tasks WHERE to_agent = :name AND status IN ('posted', 'accepted')
@@ -1249,6 +1258,15 @@ ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' T
 LIMIT 10;
 SQL
 )
+  RELAY_TASKS_RC=$?
+else
+  RELAY_TASKS_RC=125
+fi
+if [ "$RELAY_TASKS_RC" -eq 124 ] || [ "$RELAY_TASKS_RC" -eq 125 ]; then
+  echo "[RELAY] active tasks for $AGENT_NAME were not read in this hook's time budget. Call get_tasks to see them."
+  [ "$RELAY_TASKS_RC" -eq 124 ] && relay_mail_verdict "DEGRADED" "the task read timed out after ${RELAY_STEP_SECS}s" other
+  TASKS_HEX=""
+fi
 if [ -n "$TASKS_HEX" ] && command -v node >/dev/null 2>&1; then
   TASKS=$(printf '%s' "$TASKS_HEX" | node -e "$RELAY_FRAME_JS"'
     let raw = "";
@@ -1328,8 +1346,8 @@ fi
 # `discover_agents view='topology'`. Visible classes mirror
 # TOPOLOGY_VISIBLE_CLASSES in src/agent-class.ts (SSOT); transient + unclassified
 # are excluded by omission from the IN-list.
-if [ "${RELAY_ONBOARD_TOPOLOGY:-0}" = "1" ]; then
-  TOPOLOGY=$(sqlite3 "$DB_PATH" <<'SQL' 2>/dev/null
+if [ "${RELAY_ONBOARD_TOPOLOGY:-0}" = "1" ] && relay_budget_for "the team map read" 1 margin; then
+  TOPOLOGY=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<'SQL' 2>/dev/null
 SELECT '  ' || class || ': ' || GROUP_CONCAT(name, ', ')
 FROM agents
 WHERE class IN ('orchestrator','builder','advisory','auditor')
