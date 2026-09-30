@@ -35,10 +35,10 @@ const { processStartedAt, getOwnHostId } = await import("../src/liveness.js");
 const { LOADED_BUILD } = await import("../src/loaded-build.js");
 const { BUILD_INFO: DIST_STAMP } = await import("../dist/build-info.js");
 
-beforeEach(() => {
+beforeEach(async () => {
   db.closeDb();
   fs.rmSync(DB_FILE, { force: true });
-  db.initializeDb();
+  await db.initializeDb();
 });
 
 const edge = () => db.getLocalEdgeId(db.getDb());
@@ -66,10 +66,10 @@ describe("ADR-0047 PR 2 — schema v26: the connectors table", () => {
     const pk = db.getDb().prepare("SELECT name FROM pragma_table_info('connectors') WHERE pk > 0 ORDER BY pk").all() as Array<{ name: string }>;
     expect(pk.map((c) => c.name)).toEqual(["edge_id", "pid", "pid_start"]);
   });
-  it("the migration is idempotent (a second open changes nothing)", () => {
+  it("the migration is idempotent (a second open changes nothing)", async () => {
     db.recordOwnConnector({ parent: null, build: LOADED_BUILD });
     db.closeDb();
-    db.initializeDb();
+    await db.initializeDb();
     expect(db.getSchemaVersion()).toBe(26);
     expect(rows()).toHaveLength(1);
   });
