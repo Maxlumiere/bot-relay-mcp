@@ -55,3 +55,15 @@ v2.2.1 introduced the guard as an immediate exit on non-TTY stdin. That over-cor
 The 1500ms window was itself wrong, and in a way nobody had reported because nobody had tried: **it exited before any container could start.** Measured against the published binary, a client connecting at 3000ms got exit 3 at ~1675ms — it never saw the server. That is the ordinary case for container runtimes, systemd units, process supervisors and MCP proxies, where stdin is a pipe and the client connects on its own schedule.
 
 The current guard replaces the undecidable question *"has enough time passed?"* with a decidable one: *"is anyone there?"* — readable means yes, EOF means no. The original mistake it was built to catch (running the stdio server where a daemon was meant) is still caught: stdin closed with no client is still exit 3.
+
+## Build identity: what a running process reports
+
+A merge or an install changes the files on disk, but a process that is already running keeps the code it loaded when it started. So every relay process reports the build it LOADED, as `build` in `/health`, `health_check`, `whoami` and `relay where --json`:
+
+- `build_id` is the **code id**: a hash of `package.json` and every file under `dist/`, written into `dist/build-info.js` by `npm run build`. An identical rebuild gives the same id. A build made with plain `tsc` (without that last step) reports `unbuilt`, which matches nothing.
+- `deps_id` is the **dependency id**: a hash of the name and version of every installed production dependency, read from each package's own `package.json` (never a lockfile), plus every native addon (`*.node`), which `npm rebuild` can change with no version bump. The process computes it once, when it starts.
+- `commit`, `dirty`, `built_at` and `node` are for people reading it.
+
+**The boundary: what a restart is needed for.** The identity covers exactly what a long-lived process (the daemon, or the stdio connector each agent window starts) loads when it starts and keeps for its whole life: `dist/`, `package.json` and the production dependencies. It does NOT cover `hooks/*.sh` or `bin/relay`: they run fresh on every call, so a change to them takes effect on the next call, and no window needs a restart for it.
+
+An install whose stamp does not match its own content (a plain `tsc` rebuild, a hand edit), or whose declared dependencies are missing or unreadable, is reported as inconsistent: rebuild with `npm run build`.

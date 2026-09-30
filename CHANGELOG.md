@@ -6,8 +6,13 @@
 
 A merge and an install change the files on disk, but a process that is already running keeps the code it loaded, so "deployed" was a claim about disk. Every build now carries a stamp, and every process reports the stamp it loaded:
 
-- **`build`** in `/health`, `health_check`, `whoami` and `relay where --json`: a `build_id` (a content hash of the build's `dist/` files and the dependency lock it was built against), and for humans the `commit`, whether that tree was `dirty`, and `built_at`. On a stdio connector, `health_check` and `whoami` report the connector's own build, so a connector still running old code shows it.
-- **Fixed at load.** The value is imported once when the process starts and is never read from disk again.
+- **`build`** in `/health`, `health_check`, `whoami` and `relay where --json`:
+  - `build_id`: a hash of `package.json` and the build's `dist/` files;
+  - `deps_id`: a hash of the installed production dependencies (each one's own name and version, plus native addons);
+  - for humans: the `commit`, whether that tree was `dirty`, `built_at` and the `node` version.
+  On a stdio connector, `health_check` and `whoami` report the connector's own build, so a connector still running old code shows it.
+- **Fixed at load.** The value is taken once when the process starts and is never read from disk again.
+- **Only what a running process keeps.** `hooks/*.sh` and `bin/relay` run fresh on every call, so they are not part of it: changing them needs no restart. See "Build identity" in `docs/deployment.md`.
 - **An identical rebuild is not a new build:** the same output gives the same `build_id`. A build made with plain `tsc` (without the stamping step) reports `unbuilt`, which never matches any build.
 
 ### Fixed — a live process no longer reads dead when two relay processes run in different time zones

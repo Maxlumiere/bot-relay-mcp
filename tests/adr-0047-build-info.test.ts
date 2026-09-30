@@ -4,17 +4,16 @@
 // See LICENSE for full terms.
 
 /**
- * ADR-0047 PR 1: a process reports the build it LOADED, never the one on disk.
+ * ADR-0047 PR 1: a process reports the build it LOADED AT START, never the one on
+ * disk. The identity covers exactly what a long-lived process loads at start:
+ *   CODE ID  package.json + dist/** (stamped by the build step; the stamp enters
+ *            as one constant entry and must be byte-identical to its template);
+ *   DEPS ID  the installed production dependencies (name@version from each
+ *            installed package's own package.json, plus every native addon),
+ *            computed by the process once at load.
+ * hooks/*.sh and bin/relay run fresh per call: OUT.
  *
- * - `npm run build` stamps dist/build-info.js with a CONTENT HASH of dist/ (every
- *   file but the stamp; the dependency lock's digest is itself a dist file,
- *   dist/.build-lock), plus commit, dirty and built_at for humans.
- * - Every reporter (/health, health_check, whoami, `relay where --json`) imports
- *   that stamp statically: fixed at load, never re-read.
- * - checkInstall() recomputes "installed" from an install's CONTENT: a stamp that
- *   does not match it (a tsc-only rebuild, a hand edit, a lock changed without a
- *   rebuild) is INCONSISTENT.
- *
+ * checkInstall() recomputes an install from its CONTENT, observed twice.
  * Runs against the worktree's built dist/ (CI builds first). Scratch installs are
  * copies under the temp dir; the dev tree is never built or touched.
  */
@@ -22,7 +21,6 @@ import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import crypto from "crypto";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -33,46 +31,51 @@ const DIST = path.join(REPO_ROOT, "dist");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adr0047-pr1-")));
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
-const { computeBuildId, checkInstall, lockDigest } = await import("../dist/build-id.js");
+const { computeCodeId, computeDepsId, checkInstall, parseStamp, renderStamp } = await import("../dist/build-id.js");
 const { BUILD_INFO: DIST_STAMP } = await import("../dist/build-info.js");
-const sha256 = (b: Buffer | string) => crypto.createHash("sha256").update(b).digest("hex");
+const STAMP_TEXT = fs.readFileSync(path.join(DIST, "build-info.js"), "utf-8");
 
-/** A scratch INSTALL: a copy of dist/, package.json and the lock, with node_modules linked. */
-function scratchInstall(tag: string, opts: { lock?: boolean } = {}): string {
+/**
+ * A scratch INSTALL: a copy of dist/, package.json, hooks/ and bin/. Its
+ * node_modules holds one SYMLINK per top-level package of the repo's, except the
+ * packages in `realCopies`, which are copied so a test can change them.
+ */
+function scratchInstall(tag: string, opts: { realCopies?: string[] } = {}): string {
   const dir = path.join(ROOT, tag);
   fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
-  fs.cpSync(DIST, path.join(dir, "dist"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "node_modules"), { recursive: true });
+  for (const p of ["dist", "hooks", "bin"]) fs.cpSync(path.join(REPO_ROOT, p), path.join(dir, p), { recursive: true, verbatimSymlinks: true });
   fs.copyFileSync(path.join(REPO_ROOT, "package.json"), path.join(dir, "package.json"));
-  if (opts.lock !== false) fs.copyFileSync(path.join(REPO_ROOT, "package-lock.json"), path.join(dir, "package-lock.json"));
-  fs.symlinkSync(path.join(REPO_ROOT, "node_modules"), path.join(dir, "node_modules"));
+  const nm = path.join(REPO_ROOT, "node_modules");
+  const real = new Set(opts.realCopies ?? []);
+  for (const top of fs.readdirSync(nm)) {
+    if (top.startsWith(".")) continue;
+    const entries = top.startsWith("@") ? fs.readdirSync(path.join(nm, top)).map((s) => `${top}/${s}`) : [top];
+    for (const name of entries) {
+      fs.mkdirSync(path.dirname(path.join(dir, "node_modules", name)), { recursive: true });
+      if (real.has(name)) fs.cpSync(path.join(nm, name), path.join(dir, "node_modules", name), { recursive: true, verbatimSymlinks: true });
+      else fs.symlinkSync(path.join(nm, name), path.join(dir, "node_modules", name));
+    }
+  }
   return dir;
 }
 
-/** Rewrite a stamp's build_id on DISK (what a later build would do to the file). */
+/** Rewrite a stamp's build_id on DISK, keeping the exact template (what a later build would write). */
 function overwriteStampOnDisk(install: string, buildId: string): void {
   const f = path.join(install, "dist", "build-info.js");
-  const src = fs.readFileSync(f, "utf-8");
-  const next = src.replace(/"build_id":\s*"[^"]*"/, `"build_id":"${buildId}"`);
-  expect(next, "the stamp file carries a build_id to rewrite").not.toBe(src);
-  fs.writeFileSync(f, next);
+  const parsed = parseStamp(fs.readFileSync(f, "utf-8"));
+  expect(parsed.ok).toBe(true);
+  fs.writeFileSync(f, renderStamp({ ...parsed.info, build_id: buildId }));
 }
 
 /** A stdio connector started from `install`, with an isolated DB/config/HOME. */
-async function connectorFrom(install: string, tag: string): Promise<{ health: () => Promise<Record<string, any>>; close: () => Promise<void> }> {
+async function connectorFrom(install: string, tag: string) {
   const tmp = path.join(ROOT, `conn-${tag}`);
   fs.mkdirSync(tmp, { recursive: true });
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(install, "dist", "index.js")],
-    env: {
-      PATH: process.env.PATH ?? "",
-      HOME: tmp,
-      RELAY_DB_PATH: path.join(tmp, "relay.db"),
-      RELAY_CONFIG_PATH: path.join(tmp, "no-config.json"),
-      RELAY_TRANSPORT: "stdio",
-      RELAY_SKIP_TTY_CHECK: "1",
-    },
+    env: { PATH: process.env.PATH ?? "", HOME: tmp, RELAY_DB_PATH: path.join(tmp, "relay.db"), RELAY_CONFIG_PATH: path.join(tmp, "none.json"), RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1" },
     stderr: "pipe",
   });
   const client = new Client({ name: "adr0047-test", version: "0" }, { capabilities: {} });
@@ -80,133 +83,214 @@ async function connectorFrom(install: string, tag: string): Promise<{ health: ()
   return {
     health: async () => {
       const r = (await client.callTool({ name: "health_check", arguments: {} })) as { content: Array<{ text: string }> };
-      return JSON.parse(r.content[0].text);
+      return JSON.parse(r.content[0].text) as { build: Record<string, unknown> };
     },
     close: () => client.close(),
   };
 }
 
-describe("ADR-0047 PR 1 — the build stamp: a content hash of dist/, written by the build step", () => {
-  it("dist/build-info.js carries a 64-hex build_id EQUAL to the recomputed content hash of dist/", () => {
+const bumpVersion = (install: string, pkg: string) => {
+  const f = path.join(install, "node_modules", pkg, "package.json");
+  const j = JSON.parse(fs.readFileSync(f, "utf-8"));
+  j.version = `${j.version}-bumped`;
+  fs.writeFileSync(f, JSON.stringify(j));
+};
+
+describe("ADR-0047 PR 1 — the build stamp: the CODE ID, written by the build step", () => {
+  it("dist/build-info.js is byte-identical to its template, and its build_id EQUALS the recomputed code id", () => {
+    const p = parseStamp(STAMP_TEXT);
+    expect(p.ok).toBe(true);
     expect(DIST_STAMP.build_id).toMatch(/^[0-9a-f]{64}$/);
-    const re = computeBuildId(DIST);
-    expect(re).toEqual({ ok: true, build_id: DIST_STAMP.build_id });
+    expect(computeCodeId(REPO_ROOT)).toEqual({ ok: true, id: DIST_STAMP.build_id });
   });
   it("commit / dirty / built_at are for humans: a 40-hex commit (or null), a boolean (or null), an ISO time", () => {
     expect(DIST_STAMP.commit === null || /^[0-9a-f]{40}$/.test(DIST_STAMP.commit)).toBe(true);
     expect(DIST_STAMP.dirty === null || typeof DIST_STAMP.dirty === "boolean").toBe(true);
     expect(Number.isNaN(Date.parse(DIST_STAMP.built_at))).toBe(false);
   });
-  it("dist/.build-lock is the sha256 of the lock the build used (so the lock is INSIDE the content hash)", () => {
-    expect(fs.readFileSync(path.join(DIST, ".build-lock"), "utf-8").trim()).toBe(sha256(fs.readFileSync(path.join(REPO_ROOT, "package-lock.json"))));
-    expect(lockDigest(REPO_ROOT)).toBe(sha256(fs.readFileSync(path.join(REPO_ROOT, "package-lock.json"))));
-  });
   it("TWIN: the freshly built worktree is CONSISTENT", () => {
     expect(checkInstall(REPO_ROOT)).toMatchObject({ consistent: true, stamped: DIST_STAMP.build_id, content: DIST_STAMP.build_id });
   });
 });
 
-describe("ADR-0047 PR 1 — the spec's mutation: the ON-DISK stamp changes after the connector started; it still reports what it LOADED", () => {
-  it("a running stdio connector keeps its loaded build_id; a NEW connector from the same install reads the new one", async () => {
-    const install = scratchInstall("ondisk");
-    const loaded = computeBuildId(path.join(install, "dist"));
+describe("ADR-0047 PR 1 — the spec's mutation: the disk changes after the connector started; it still reports what it LOADED", () => {
+  it("a running stdio connector keeps its loaded build_id AND deps_id; a NEW connector from the same install reads the new ones", async () => {
+    const install = scratchInstall("ondisk", { realCopies: ["uuid"] });
     const a = await connectorFrom(install, "a");
     try {
-      expect((await a.health()).build.build_id).toBe(DIST_STAMP.build_id);
+      const before = (await a.health()).build;
+      expect(before.build_id).toBe(DIST_STAMP.build_id);
+      expect(before.deps_id).toBe((computeDepsId(install) as { id: string }).id);
+      expect(before.node).toBe(process.version);
       overwriteStampOnDisk(install, "f".repeat(64));
-      expect((await a.health()).build.build_id, "the running connector re-read the disk").toBe(DIST_STAMP.build_id);
+      bumpVersion(install, "uuid");
+      const after = (await a.health()).build;
+      expect(after.build_id, "the running connector re-read the stamp").toBe(DIST_STAMP.build_id);
+      expect(after.deps_id, "the running connector re-read its dependencies").toBe(before.deps_id);
       const b = await connectorFrom(install, "b");
       try {
-        expect((await b.health()).build.build_id, "a new process loads what is on disk now").toBe("f".repeat(64));
+        const fresh = (await b.health()).build;
+        expect(fresh.build_id, "a new process loads what is on disk now").toBe("f".repeat(64));
+        expect(fresh.deps_id).not.toBe(before.deps_id);
       } finally {
         await b.close();
       }
     } finally {
       await a.close();
     }
-    expect(loaded.ok).toBe(true);
-  }, 60_000);
+  }, 90_000);
 });
 
-describe("ADR-0047 PR 1 — checkInstall: the stamp against the install's CONTENT (never the stamp against itself)", () => {
-  it("MUTATION: a tsc-only rebuild after the stamp is INCONSISTENT (the placeholder is never a build)", () => {
+describe("ADR-0047 PR 1 — P1-a: the boundary. IN: dist/** and package.json. OUT: hooks and bin/relay (they run fresh per call)", () => {
+  const code = (install: string) => (computeCodeId(install) as { id: string }).id;
+  it("a HOOK-only change and a bin/relay-only change leave the code id alone: still CONSISTENT (connectors stay CURRENT)", () => {
+    const install = scratchInstall("hook-only");
+    const before = code(install);
+    fs.appendFileSync(path.join(install, "hooks", "check-relay.sh"), "\n# changed\n");
+    fs.appendFileSync(path.join(install, "bin", "relay"), "\n// changed\n");
+    expect(code(install)).toBe(before);
+    expect(checkInstall(install).consistent).toBe(true);
+  });
+  it("a dist/ change moves the code id (a connector that loaded the old one is STALE); the stamp no longer matches", () => {
+    const install = scratchInstall("dist-change");
+    fs.appendFileSync(path.join(install, "dist", "server.js"), "\n");
+    expect(code(install)).not.toBe(DIST_STAMP.build_id);
+    expect(checkInstall(install)).toMatchObject({ consistent: false, stamped: DIST_STAMP.build_id });
+  });
+  it("a package.json change moves the code id too", () => {
+    const install = scratchInstall("pkg-change");
+    fs.appendFileSync(path.join(install, "package.json"), "\n");
+    expect(code(install)).not.toBe(DIST_STAMP.build_id);
+    expect(checkInstall(install).consistent).toBe(false);
+  });
+});
+
+describe("ADR-0047 PR 1 — P1-b: the DEPS ID reads the INSTALLED packages, never a lockfile", () => {
+  const deps = (install: string) => computeDepsId(install) as { ok: boolean; id?: string; reason?: string };
+  it("a production dependency's installed VERSION changes the deps id (a connector loaded before it is STALE)", () => {
+    const install = scratchInstall("dep-version", { realCopies: ["uuid"] });
+    const before = deps(install).id;
+    bumpVersion(install, "uuid");
+    expect(deps(install).id).not.toBe(before);
+  });
+  it("a NATIVE ADDON rebuilt with no version bump changes the deps id", () => {
+    const install = scratchInstall("dep-native", { realCopies: ["better-sqlite3"] });
+    const before = deps(install).id;
+    const addon = spawnSync("find", [path.join(install, "node_modules", "better-sqlite3"), "-name", "*.node", "-not", "-path", "*/node_modules/better-sqlite3/node_modules/*"], { encoding: "utf-8" }).stdout.trim().split("\n")[0];
+    expect(addon, "better-sqlite3 ships a native addon").toMatch(/\.node$/);
+    fs.appendFileSync(addon, Buffer.from([0]));
+    expect(deps(install).id).not.toBe(before);
+  });
+  it("a declared dependency MISSING now → INCONSISTENT, never a pass", () => {
+    const install = scratchInstall("dep-missing");
+    fs.unlinkSync(path.join(install, "node_modules", "zod"));
+    const c = checkInstall(install);
+    expect(c.consistent).toBe(false);
+    expect(c.reason).toMatch(/dependency zod .* is not installed/);
+  });
+  it("a dependency package.json UNREADABLE now → INCONSISTENT", () => {
+    const install = scratchInstall("dep-unreadable", { realCopies: ["uuid"] });
+    fs.writeFileSync(path.join(install, "node_modules", "uuid", "package.json"), "{not json");
+    expect(checkInstall(install).consistent).toBe(false);
+  });
+  it("a lockfile is not read: changing or deleting one changes nothing", () => {
+    const install = scratchInstall("no-lock");
+    const before = deps(install).id;
+    fs.writeFileSync(path.join(install, "package-lock.json"), "{}");
+    expect(deps(install).id).toBe(before);
+    fs.rmSync(path.join(install, "package-lock.json"));
+    expect(deps(install).id).toBe(before);
+  });
+  it("a DEV-only package is outside the production closure (removing it changes nothing)", () => {
+    const install = scratchInstall("dev-only");
+    const before = deps(install).id;
+    fs.unlinkSync(path.join(install, "node_modules", "vitest"));
+    expect(deps(install).id).toBe(before);
+  });
+});
+
+describe("ADR-0047 PR 1 — P2-c: the stamp must be BYTE-IDENTICAL to its template", () => {
+  let n = 0;
+  const refused = (text: string) => {
+    const install = scratchInstall(`stamp-${n++}`);
+    fs.writeFileSync(path.join(install, "dist", "build-info.js"), text);
+    const c = checkInstall(install);
+    expect(c.consistent, text).toBe(false);
+    expect(c.reason).toMatch(/stamp is refused/);
+  };
+  it("Codex's case: a comment naming the matching id, then an export of 'unbuilt' → refused", () => {
+    refused(`// previous build_id: "${DIST_STAMP.build_id}"\nexport const BUILD_INFO = Object.freeze({"build_id":"unbuilt","commit":null,"dirty":null,"built_at":null});\n`);
+  });
+  it("a TRUNCATED stamp → refused", () => refused(STAMP_TEXT.slice(0, 80)));
+  it("extra executable code before the stamp → refused", () => refused(`globalThis.x = 1;\n${STAMP_TEXT}`));
+  it("extra executable code after the stamp → refused", () => refused(`${STAMP_TEXT}globalThis.x = 1;\n`));
+  it("the same values spelled differently (a space in the JSON) → refused: byte-identical, not equivalent", () => {
+    refused(STAMP_TEXT.replace('{"build_id":', '{"build_id": '));
+  });
+  it("the fields reordered → refused", () => {
+    const i = (parseStamp(STAMP_TEXT) as { info: Record<string, unknown> }).info;
+    refused(`export const BUILD_INFO = Object.freeze(${JSON.stringify({ commit: i.commit, build_id: i.build_id, dirty: i.dirty, built_at: i.built_at })});\n`);
+  });
+  it("the tsc-only rebuild MUTATION: tsc re-emits the placeholder over the stamp → refused, INCONSISTENT, never current", () => {
     const install = scratchInstall("tsc-only");
     const r = spawnSync(process.execPath, [path.join(REPO_ROOT, "node_modules", "typescript", "bin", "tsc"), "-p", REPO_ROOT, "--outDir", path.join(install, "dist")], { encoding: "utf-8" });
     expect(r.status, r.stdout + r.stderr).toBe(0);
     const c = checkInstall(install);
     expect(c.consistent, JSON.stringify(c)).toBe(false);
-    expect(c.stamped).toBe("unbuilt");
     expect(c.reason).toMatch(/rebuild with npm run build/);
   }, 120_000);
-  it("dist content edited after the stamp (one byte) → INCONSISTENT, naming both hashes", () => {
-    const install = scratchInstall("edited");
-    fs.appendFileSync(path.join(install, "dist", "server.js"), "\n");
-    const c = checkInstall(install);
-    expect(c.consistent).toBe(false);
-    expect(c.stamped).toBe(DIST_STAMP.build_id);
-    expect(c.content).not.toBe(DIST_STAMP.build_id);
-  });
-  it("the dependency lock changed without a rebuild → INCONSISTENT, naming the lock", () => {
-    const install = scratchInstall("lock-drift");
-    fs.appendFileSync(path.join(install, "package-lock.json"), "\n");
-    const c = checkInstall(install);
-    expect(c.consistent).toBe(false);
-    expect(c.reason).toMatch(/package-lock\.json/);
-  });
-  it("TWIN: the lock changed, then the build step re-stamped → CONSISTENT again (the NEW lock is recorded)", () => {
-    const install = scratchInstall("lock-rebuilt");
-    fs.appendFileSync(path.join(install, "package-lock.json"), "\n");
-    expect(checkInstall(install).consistent).toBe(false);
-    const r = spawnSync(process.execPath, [path.join(REPO_ROOT, "scripts", "write-build-info.mjs"), install], { encoding: "utf-8" });
-    expect(r.status, r.stderr).toBe(0);
-    expect(fs.readFileSync(path.join(install, "dist", ".build-lock"), "utf-8").trim()).toBe(sha256(fs.readFileSync(path.join(install, "package-lock.json"))));
-    expect(checkInstall(install)).toMatchObject({ consistent: true });
-  });
-  it("an install that ships NO lock (the npm-registry shape) is checked on content alone: CONSISTENT", () => {
-    expect(checkInstall(scratchInstall("no-lock", { lock: false }))).toMatchObject({ consistent: true });
-  });
   it("an identical-output rebuild is NOT a deploy: re-stamping unchanged content gives the SAME build_id", () => {
     const install = scratchInstall("restamp");
     const r = spawnSync(process.execPath, [path.join(REPO_ROOT, "scripts", "write-build-info.mjs"), install], { encoding: "utf-8" });
     expect(r.status, r.stderr).toBe(0);
-    const c = checkInstall(install);
-    expect(c).toMatchObject({ consistent: true, stamped: DIST_STAMP.build_id });
+    expect(checkInstall(install)).toMatchObject({ consistent: true, stamped: DIST_STAMP.build_id });
   });
-  it("an install with no stamp at all is INCONSISTENT (never assumed current)", () => {
+  it("no stamp at all → INCONSISTENT", () => {
     const install = scratchInstall("no-stamp");
     fs.rmSync(path.join(install, "dist", "build-info.js"));
     expect(checkInstall(install).consistent).toBe(false);
   });
 });
 
-describe("ADR-0047 PR 1 — computeBuildId: what is and is not in the hash", () => {
+describe("ADR-0047 PR 1 — P2-d: observed twice, the same answer required", () => {
+  it("an install that changes BETWEEN the two observations (a compile racing the check) is inconsistent", () => {
+    const install = scratchInstall("race");
+    let calls = 0;
+    const c = checkInstall(install, {
+      afterFirstObservation: () => {
+        calls++;
+        fs.appendFileSync(path.join(install, "dist", "server.js"), "\n");
+      },
+    });
+    expect(calls).toBe(1);
+    expect(c.consistent).toBe(false);
+    expect(c.reason).toMatch(/changed while it was being checked/);
+  });
+});
+
+describe("ADR-0047 PR 1 — the code id: what is and is not in the hash", () => {
   function tree(tag: string, files: Record<string, string>): string {
-    const d = path.join(ROOT, "tree-" + tag, "dist");
-    fs.rmSync(path.dirname(d), { recursive: true, force: true });
+    const d = path.join(ROOT, "tree-" + tag);
+    fs.rmSync(d, { recursive: true, force: true });
     for (const [rel, body] of Object.entries(files)) {
       fs.mkdirSync(path.dirname(path.join(d, rel)), { recursive: true });
       fs.writeFileSync(path.join(d, rel), body);
     }
     return d;
   }
-  const base = { "a.js": "A", "sub/b.js": "B", ".build-lock": "L" };
-  const id = (files: Record<string, string>, tag: string) => computeBuildId(tree(tag, files));
-  it("deterministic: the same files give the same id", () => {
-    expect(id(base, "d1")).toEqual(id(base, "d2"));
-  });
+  const base = { "package.json": "{}", "dist/a.js": "A", "dist/sub/b.js": "B" };
+  const id = (files: Record<string, string>, tag: string) => computeCodeId(tree(tag, files));
+  it("deterministic: the same files give the same id", () => expect(id(base, "d1")).toEqual(id(base, "d2")));
   it("a file's PATH is in the hash (a rename changes it)", () => {
-    expect(id({ ...base }, "p1")).not.toEqual(id({ "a2.js": "A", "sub/b.js": "B", ".build-lock": "L" }, "p2"));
+    expect(id(base, "p1")).not.toEqual(id({ "package.json": "{}", "dist/a2.js": "A", "dist/sub/b.js": "B" }, "p2"));
   });
-  it("the lock digest (.build-lock) is in the hash", () => {
-    expect(id(base, "l1")).not.toEqual(id({ ...base, ".build-lock": "M" }, "l2"));
+  it("the stamp's content is NOT (it enters as one constant: the id cannot hash itself)", () => {
+    expect(id(base, "s1")).toEqual(id({ ...base, "dist/build-info.js": "anything" }, "s2"));
   });
-  it("the stamp files (build-info.*) are NOT in the hash (a stamp cannot hash itself)", () => {
-    expect(id(base, "s1")).toEqual(id({ ...base, "build-info.js": "x", "build-info.d.ts": "y", "build-info.js.map": "z" }, "s2"));
-  });
-  it("a symlink inside dist/ is refused (content it does not own), never followed", () => {
+  it("a symlink inside dist/ is refused, never followed", () => {
     const d = tree("sym", base);
-    fs.symlinkSync("/etc/hosts", path.join(d, "link.js"));
-    expect(computeBuildId(d)).toMatchObject({ ok: false });
+    fs.symlinkSync("/etc/hosts", path.join(d, "dist", "link.js"));
+    expect(computeCodeId(d)).toMatchObject({ ok: false });
   });
 });
 
@@ -215,19 +299,29 @@ describe("ADR-0047 PR 1 — TRIPWIRES: the loaded value is never re-read or reco
   it("src/build-info.ts imports NOTHING (a literal: no fs, no git, no package.json)", () => {
     expect(src("build-info.ts")).not.toMatch(/^\s*import\s/m);
   });
-  for (const f of ["tools/status.ts", "transport/http.ts", "cli/where.ts"]) {
-    it(`${f} reports BUILD_INFO from the static import and never imports the recompute (build-id)`, () => {
-      expect(src(f)).toMatch(/import\s*\{[^}]*\bBUILD_INFO\b[^}]*\}\s*from\s*"\.\.\/build-info\.js"/);
+  it("src/loaded-build.ts never recomputes the CODE id (only the stamp names it)", () => {
+    expect(src("loaded-build.ts")).not.toMatch(/computeCodeId|checkInstall/);
+  });
+  for (const f of ["tools/status.ts", "transport/http.ts"]) {
+    it(`${f} reports LOADED_BUILD from the static import and never imports build-id`, () => {
+      expect(src(f)).toMatch(/import\s*\{[^}]*\bLOADED_BUILD\b[^}]*\}\s*from\s*"\.\.\/loaded-build\.js"/);
       expect(src(f)).not.toMatch(/build-id\.js/);
     });
   }
+  it("cli/where.ts takes LOADED_BUILD only for --json (a one-shot process: still its load), never build-id; --fields, on every hook's path, does not pay for it", () => {
+    expect(src("cli/where.ts")).toMatch(/const\s*\{\s*LOADED_BUILD\s*\}\s*=\s*await import\("\.\.\/loaded-build\.js"\)/);
+    expect(src("cli/where.ts")).not.toMatch(/^import[^\n]*loaded-build/m);
+    expect(src("cli/where.ts")).not.toMatch(/build-id\.js/);
+  });
 });
 
 describe("ADR-0047 PR 1 — where it shows: /health, health_check, whoami, relay where --json", () => {
-  it("`relay where --json` carries build (the CLI's own loaded stamp)", () => {
+  it("`relay where --json` carries build: the CLI's own loaded stamp, deps id and node", () => {
     const home = path.join(ROOT, "where-home");
     fs.mkdirSync(home, { recursive: true });
     const r = spawnSync(process.execPath, [path.join(REPO_ROOT, "bin", "relay"), "where", "--json"], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME: home } });
-    expect(JSON.parse(r.stdout).build).toEqual(DIST_STAMP);
+    const b = JSON.parse(r.stdout).build;
+    expect(b).toMatchObject({ ...DIST_STAMP, node: process.version });
+    expect(b.deps_id).toBe((computeDepsId(REPO_ROOT) as { id: string }).id);
   });
 });

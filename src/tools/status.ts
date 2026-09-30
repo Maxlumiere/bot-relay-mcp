@@ -7,7 +7,7 @@ import { setAgentStatus, getHealthSnapshot, getAgents, getDb, getLocalEdgeId, ge
 import type { SetStatusInput, HealthCheckInput, ReportLivenessInput, WhoamiResult } from "../types.js";
 import { resolveActiveInstanceId, resolveInstanceDbPath } from "../instance.js";
 import { VERSION } from "../version.js";
-import { BUILD_INFO } from "../build-info.js";
+import { LOADED_BUILD } from "../loaded-build.js";
 import { resolveSurfaceSummary } from "../surface-shape.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { ERROR_CODES } from "../error-codes.js";
@@ -254,7 +254,7 @@ export function handleHealthCheck(input: HealthCheckInput) {
             protocol_version: PROTOCOL_VERSION,
             // ADR-0047: the build THIS process loaded (on stdio, the connector's own),
             // fixed at load: never what is on disk now.
-            build: BUILD_INFO,
+            build: LOADED_BUILD,
             // ADR-0043: which store am I talking to? The edge identity is per
             // DATABASE, so two clients reporting different edge_ids are on two
             // stores (the stdio legacy-DB split). Validated on read: a malformed
@@ -322,7 +322,7 @@ export function handleWhoami() {
     db_path: resolveInstanceDbPath(),
     host_id: row.host_id ?? null,
     edge_id: getLocalEdgeId(getDb()),
-    build: BUILD_INFO,
+    build: LOADED_BUILD,
   };
   return {
     content: [{ type: "text" as const, text: JSON.stringify({ success: true, ...identity }, null, 2) }],
