@@ -50,10 +50,14 @@ relay_helpers_cli() {
 #   RELAY_RES_WARNING  the flat-fallback warning (RELAY_ALLOW_LEGACY_FALLBACK=1)
 # Returns 0 when the resolver answered (the answer may be the error kind); 1
 # when it could not be asked (no node, no CLI, no time left, a timeout, no
-# answer), which is also recorded as the error kind with the reason. The read is
-# bounded by what is left of the hook's budget (relay_pending_deadline).
+# answer), which is also recorded as the error kind with the reason. A path is
+# exposed ONLY from a SUCCESSFUL, COMPLETE answer: exit 0, all six lines, a known
+# kind, a DB path, `exists` true or false (an error answer must exit 1 with its
+# reason); anything else (a failed or truncated run) is the error kind. The read
+# is bounded by what is left of the hook's budget before the mail read
+# (relay_premail_secs), or by an explicit cap in seconds as the 2nd argument.
 relay_where_load() {
-  local cli="${1:-$(relay_helpers_cli)}" secs outf errf rc k="" d="" e="" why="" warn=""
+  local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" nlines=0
   export RELAY_RES_LOADED=1 RELAY_RES_KIND=error RELAY_RES_DB_PATH="" RELAY_RES_EXISTS="" RELAY_RES_REASON="" RELAY_RES_WARNING=""
   if ! command -v node >/dev/null 2>&1; then
     export RELAY_RES_REASON="node not found (the relay CLI runs on node)"
@@ -63,7 +67,10 @@ relay_where_load() {
     export RELAY_RES_REASON="no relay CLI beside this hook ($cli)"
     return 1
   fi
-  secs=$(relay_pending_deadline "${RELAY_HOOK_BUDGET_SECS:-10}")
+  # An explicit cap (PostToolUse/Stop, AFTER their mail read) replaces the
+  # pre-mail budget; SessionStart asks BEFORE its mail read, so the default
+  # reserves the mail read's time.
+  case "$cap" in ''|*[!0-9]*) secs=$(relay_premail_secs) ;; *) secs="$cap" ;; esac
   if [ "$secs" -lt 1 ]; then
     export RELAY_RES_REASON="no time budget left to ask the resolver"
     return 1
@@ -78,26 +85,35 @@ relay_where_load() {
   relay_run_pending "$secs" "$outf" "$errf" node "$cli" where --fields
   rc=$?
   { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; } < "$outf"
+  nlines=$(wc -l < "$outf" 2>/dev/null | tr -d ' ')
   rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
   if [ "$rc" -eq 124 ]; then
     export RELAY_RES_REASON="relay where timed out after ${secs}s"
     return 1
   fi
+  if [ "${nlines:-0}" != 6 ]; then
+    export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 6 lines)"
+    return 1
+  fi
   case "$k" in
     explicit-db|instance|flat)
-      if [ -z "$d" ]; then
-        export RELAY_RES_REASON="relay where named no DB path (exit $rc)"
+      if [ "$rc" -ne 0 ] || [ -z "$d" ] || { [ "$e" != true ] && [ "$e" != false ]; }; then
+        export RELAY_RES_REASON="relay where gave an invalid path answer (exit $rc)"
         return 1
       fi
       export RELAY_RES_KIND="$k" RELAY_RES_DB_PATH="$d" RELAY_RES_EXISTS="$e" RELAY_RES_WARNING="$warn"
       return 0
       ;;
     error)
+      if [ "$rc" -ne 1 ]; then
+        export RELAY_RES_REASON="relay where reported an error but exited $rc"
+        return 1
+      fi
       export RELAY_RES_REASON="${why:-the resolver reported an error without a reason}"
       return 0
       ;;
   esac
-  export RELAY_RES_REASON="relay where gave no answer (exit $rc)"
+  export RELAY_RES_REASON="relay where gave no valid answer (exit $rc)"
   return 1
 }
 
@@ -105,6 +121,29 @@ relay_where_load() {
 # reported it (its embedded resolution): no second node start for the same fact.
 relay_res_set_db() {
   export RELAY_RES_LOADED=1 RELAY_RES_KIND=reported RELAY_RES_DB_PATH="$1" RELAY_RES_EXISTS=true RELAY_RES_REASON="" RELAY_RES_WARNING=""
+}
+
+# relay_pending_resolution_db JSON — the DB path of the resolution a `relay
+# pending --json` answer EMBEDS, echoed with return 0, ONLY when that resolution
+# is valid: kind explicit-db | instance | flat, db_path a non-empty one-line
+# string, exists a boolean. A missing or malformed resolution, the error kind or
+# an unknown kind → return 1: an exit-0 answer without a valid resolution is not
+# a trustworthy read (the caller reports DEGRADED and reads nothing through it).
+# PostToolUse and Stop only (python3, which those hooks already require).
+relay_pending_resolution_db() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin).get("resolution")
+except Exception:
+    sys.exit(1)
+if not isinstance(r, dict) or r.get("kind") not in ("explicit-db", "instance", "flat"):
+    sys.exit(1)
+p, e = r.get("db_path"), r.get("exists")
+if not isinstance(p, str) or not p or "\n" in p or "\r" in p or not isinstance(e, bool):
+    sys.exit(1)
+sys.stdout.write(p)' 2>/dev/null
 }
 
 # resolve_relay_db_path — echo the resolver's DB path on stdout and return 0; on
@@ -578,9 +617,18 @@ relay_pid_chain() {
 relay_run_pending() {
   local secs="$1" outf="$2" errf="$3"
   shift 3
+  relay_run_bounded "$secs" /dev/null "$outf" "$errf" "$@"
+}
+
+# relay_run_bounded SECS INFILE OUTF ERRF CMD... — relay_run_pending's watchdog
+# with a chosen stdin (the bind reads the hook payload on stdin): CMD runs
+# directly into files, is killed at SECS, and 124 means it timed out.
+relay_run_bounded() {
+  local secs="$1" inf="$2" outf="$3" errf="$4"
+  shift 4
   local mark="$outf.timedout"
   rm -f "$mark" 2>/dev/null
-  "$@" >"$outf" 2>"$errf" </dev/null &
+  "$@" >"$outf" 2>"$errf" <"$inf" &
   local pid=$!
   (
     trap 'kill "$s" 2>/dev/null; exit 0' TERM
@@ -618,6 +666,28 @@ relay_run_pending() {
 # kills the hook before it can say why. RELAY_PENDING_TIMEOUT_SECS may only
 # shorten it. NO FLOOR: below 1 means there is no time left, and the caller must
 # SKIP the read and say so, never squeeze in a 1s read the harness would kill.
+# relay_premail_secs — whole seconds the steps BEFORE the mail read (the resolver,
+# the health check, registration, the bind) may still use: the hook's installed
+# budget (RELAY_HOOK_BUDGET_SECS) minus what it already spent ($SECONDS), minus
+# the report margin (3s, as relay_pending_deadline) and a RESERVE for the mail
+# read itself (2s). Never negative. Every pre-mail step is capped by it, so those
+# steps together can never eat the mail read's time or push the hook past its
+# installed timeout.
+relay_premail_secs() {
+  local budget="${RELAY_HOOK_BUDGET_SECS:-10}" reserve=2 left
+  case "$budget" in ''|*[!0-9]*) budget=10 ;; esac
+  left=$(( budget - ${SECONDS:-0} - 3 - reserve ))
+  [ "$left" -lt 0 ] && left=0
+  printf '%s' "$left"
+}
+
+# relay_cap SECS — the smaller of a step's own cap and the pre-mail budget.
+relay_cap() {
+  local own="$1" left
+  left=$(relay_premail_secs)
+  if [ "$own" -lt "$left" ]; then printf '%s' "$own"; else printf '%s' "$left"; fi
+}
+
 relay_pending_deadline() {
   local budget="$1" margin=3 left v
   case "$budget" in ''|*[!0-9]*) budget=5 ;; esac

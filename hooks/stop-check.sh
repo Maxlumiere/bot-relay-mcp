@@ -283,7 +283,7 @@ sys.stdout.write("%d\x1f%s\x1f%s" % (n, who, top))
 # token means the remote read reports it cannot authenticate, as before.
 relay_hydrate_token() {
   [ -n "$AGENT_TOKEN" ] && return 0
-  relay_where_load "$RELAY_CLI" || true
+  relay_where_load "$RELAY_CLI" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" || true
   local t
   if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
     AGENT_TOKEN="$t"
@@ -430,12 +430,18 @@ READ_OK=0
 case "$F1_RC" in
   0)
     MODE=local
-    if command -v python3 >/dev/null 2>&1 && SUMMARY=$(printf '%s' "$F1_OUT" | python3 -c "$F1_SUMMARY_PY" 2>/dev/null); then
-      READ_OK=1
-    else
+    if ! command -v python3 >/dev/null 2>&1 || ! SUMMARY=$(printf '%s' "$F1_OUT" | python3 -c "$F1_SUMMARY_PY" 2>/dev/null); then
       MODE=unreadable
       SUMMARY=""
       F1_ERR="relay pending returned output this hook could not parse"
+    elif ! relay_pending_resolution_db "$F1_OUT" >/dev/null; then
+      # ADR-0048: the answer must name the DB it came from (its embedded
+      # resolution); without a valid one it is not a read this hook can trust.
+      MODE=unreadable
+      SUMMARY=""
+      F1_ERR="relay pending returned no valid resolution"
+    else
+      READ_OK=1
     fi
     ;;
   3)

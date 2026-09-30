@@ -262,3 +262,163 @@ describe("ADR-0048 PR C — `relay where --fields`: the resolver's answer for ba
     expect(r.stdout.split("\n").length, "exactly 6 lines + the final newline").toBe(7);
   });
 });
+
+describe("Codex #291 R1 #3 — relay_where_load exposes a path ONLY from a successful, COMPLETE answer", () => {
+  /** A fake relay CLI (a node script) that prints `out` and exits `rc`. */
+  function fakeCli(name: string, out: string, rc: number): string {
+    const f = path.join(ROOT, `fake-${name}.js`);
+    fs.writeFileSync(f, `process.stdout.write(${JSON.stringify(out)}); process.exit(${rc});\n`);
+    return f;
+  }
+  const load = (cli: string) =>
+    spawnSync("bash", ["-c", `. "${path.join(HOOKS, "_vault-helpers.sh")}"; relay_where_load "$1"; echo "rc=$? kind=$RELAY_RES_KIND db=$RELAY_RES_DB_PATH"; resolve_relay_db_path; echo "shim=$?"`, "bash", cli], {
+      encoding: "utf-8",
+      env: { PATH: process.env.PATH ?? "", HOME },
+    });
+  const cases: Array<[string, string, number]> = [
+    ["partial output from a FAILED command (Codex's case)", "flat\n/tmp/partial.db\n", 1],
+    ["a complete-looking path answer with a non-zero exit", "flat\n/tmp/p.db\ntrue\n\n\n/tmp/agents\n", 1],
+    ["exit 0 but a field missing (no vault line)", "flat\n/tmp/p.db\ntrue\n\n\n", 0],
+    ["exit 0 but `exists` is not true/false", "flat\n/tmp/p.db\nmaybe\n\n\n/tmp/agents\n", 0],
+    ["exit 0 but an unknown kind", "bogus\n/tmp/p.db\ntrue\n\n\n/tmp/agents\n", 0],
+    ["an error answer that exits 0", "error\n\n\nboom\n\n\n", 0],
+  ];
+  for (const [label, out, rc] of cases) {
+    it(`refused: ${label}`, () => {
+      const r = load(fakeCli(label.replace(/\W+/g, "-"), out, rc));
+      expect(r.stdout, r.stderr).toMatch(/kind=error db=$/m);
+      expect(r.stdout).toMatch(/shim=1/);
+      expect(r.stdout).not.toMatch(/\/tmp\/p(artial)?\.db\n/);
+      // Never the answer's own claims: the reason names what was wrong with the run.
+      expect(r.stderr).not.toMatch(/instance resolution failed: boom/);
+    });
+  }
+  it("TWIN: a complete path answer with exit 0 is accepted", () => {
+    const r = load(fakeCli("ok", "flat\n/tmp/ok.db\nfalse\n\n\n/tmp/agents\n", 0));
+    expect(r.stdout).toMatch(/kind=flat db=\/tmp\/ok\.db/);
+    expect(r.stdout).toMatch(/^\/tmp\/ok\.db$/m);
+    expect(r.stdout).toMatch(/shim=0/);
+  });
+  it("TWIN: a complete error answer (exit 1) is the resolver's error, with its reason", () => {
+    const r = load(fakeCli("err", "error\n\n\nthe reason\n\n\n", 1));
+    expect(r.stdout).toMatch(/kind=error/);
+    expect(r.stderr).toMatch(/instance resolution failed: the reason/);
+  });
+});
+
+describe("Codex #291 R1 #2 — PostToolUse / Stop trust a pending answer only with a VALID embedded resolution", () => {
+  const SQLITE_LOG = path.join(ROOT, "sqlite.log");
+  /** A copy of the hooks whose bin/relay prints `envelope` (exit 0); sqlite3 logs every DB it is handed. */
+  function hookTree(tag: string, envelope: unknown): string {
+    const base = path.join(ROOT, `tree-${tag}`, "bot-relay-mcp");
+    fs.rmSync(path.dirname(base), { recursive: true, force: true });
+    fs.cpSync(HOOKS, path.join(base, "hooks"), { recursive: true });
+    fs.mkdirSync(path.join(base, "bin"), { recursive: true });
+    fs.writeFileSync(path.join(base, "bin", "relay"), `process.stdout.write(${JSON.stringify(JSON.stringify(envelope) + "\n")}); process.exit(0);\n`);
+    fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
+    return path.join(base, "hooks");
+  }
+  const envelope = (resolution: unknown) => ({ ok: true, agent: AGENT, db_path: "/x/relay.db", resolution, session_bound: false, count: 0, top_priority: null, messages: [] });
+  const run = (hooksDir: string, hook: string) => {
+    fs.rmSync(SQLITE_LOG, { force: true });
+    const r = spawnSync("bash", [path.join(hooksDir, hook)], {
+      encoding: "utf-8",
+      timeout: 30_000,
+      input: JSON.stringify({ session_id: "s1" }),
+      env: { PATH: `${STUBS}:${process.env.PATH ?? ""}`, HOME, RELAY_AGENT_NAME: AGENT, RELAY_AGENT_TOKEN: "tok_" + "y".repeat(20), RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json") },
+    });
+    const out = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
+    return { out, verdict: (/VERDICT=([A-Z-]+)/.exec(out) ?? [])[1], sqlite: fs.existsSync(SQLITE_LOG) ? fs.readFileSync(SQLITE_LOG, "utf-8") : "" };
+  };
+  const bad: Array<[string, unknown]> = [
+    ["a MISSING resolution", undefined],
+    ["the ERROR kind", { kind: "error", reason: "x" }],
+    ["an unknown kind with a wrong path", { kind: "bogus", db_path: "/wrong/database", exists: true }],
+    ["`exists` not a boolean", { kind: "instance", id: "a", db_path: "/wrong/database", exists: "yes", basis: "active-instance" }],
+  ];
+  for (const hook of ["post-tool-use-check.sh", "stop-check.sh"]) {
+    for (const [label, res] of bad) {
+      it(`${hook}: ${label} → DEGRADED, never HEALTHY, and the path is never read`, () => {
+        const r = run(hookTree(`${hook}-${label.replace(/\W+/g, "-")}`, envelope(res)), hook);
+        expect(r.verdict, r.out).toBe("DEGRADED");
+        expect(r.sqlite, "the invalid path was never handed to a reader").not.toContain("/wrong/database");
+      });
+    }
+    it(`${hook}: TWIN — a valid resolution → HEALTHY`, () => {
+      const r = run(hookTree(`${hook}-ok`, envelope({ kind: "instance", id: "a", db_path: path.join(RH, "instances", "a", "relay.db"), exists: true, basis: "active-instance" })), hook);
+      expect(r.verdict, r.out).toBe("HEALTHY");
+    });
+  }
+});
+
+describe("Codex #291 R1 #1 — SessionStart: the pre-mail steps can never eat the mail read's time or pass the installed budget", () => {
+  const SLOW = path.join(ROOT, "slow-stubs");
+  const SLOW_NODE_LOG = path.join(ROOT, "slow-node.log");
+  const CURL_CAPS = path.join(ROOT, "curl-caps.log");
+  /** node: `relay where` takes WHERE_SECS; curl: honours -m/--max-time, each call takes its own time. */
+  function slowStubs(whereSecs: number): void {
+    fs.rmSync(SLOW, { recursive: true, force: true });
+    fs.mkdirSync(SLOW, { recursive: true });
+    fs.writeFileSync(
+      path.join(SLOW, "node"),
+      `#!/bin/sh\ncase "$1" in */bin/relay) printf '%s\\n' "$2" >> "${SLOW_NODE_LOG}"; [ "$2" = where ] && sleep ${whereSecs} ;; esac\nexec "${process.execPath}" "$@"\n`,
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(
+      path.join(SLOW, "curl"),
+      [
+        "#!/bin/sh",
+        'm=""; prev=""; for a in "$@"; do case "$prev" in -m|--max-time) m="$a" ;; esac; prev="$a"; done',
+        'd=1; case "$*" in *health_check*) d=2 ;; *register_agent*) d=4 ;; esac',
+        `k=other; case "$*" in *health_check*) k=health ;; *register_agent*) k=register ;; esac; printf '%s %s\\n' "$k" "$m" >> "${CURL_CAPS}"`,
+        '[ -n "$m" ] && [ "$m" -lt "$d" ] && d="$m"',
+        'sleep "$d"; exit 28',
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+  }
+  function timedRun(whereSecs: number) {
+    slowStubs(whereSecs);
+    fs.rmSync(SLOW_NODE_LOG, { force: true });
+    fs.rmSync(CURL_CAPS, { force: true });
+    seedDb(path.join(RH, "instances", "work", "relay.db"), false);
+    fs.symlinkSync("work", path.join(RH, "active-instance"));
+    const t0 = Date.now();
+    const r = spawnSync("bash", [path.join(HOOKS, "check-relay.sh")], {
+      encoding: "utf-8",
+      timeout: 30_000,
+      input: "",
+      env: {
+        PATH: `${SLOW}:${process.env.PATH ?? ""}`,
+        HOME,
+        RELAY_AGENT_NAME: AGENT,
+        RELAY_AGENT_TOKEN: "tok_" + "z".repeat(20),
+        RELAY_HTTP_PORT: "1",
+        RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),
+      },
+    });
+    const secs = (Date.now() - t0) / 1000;
+    const out = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
+    const verbs = fs.existsSync(SLOW_NODE_LOG) ? fs.readFileSync(SLOW_NODE_LOG, "utf-8").split("\n").filter(Boolean) : [];
+    const caps = fs.existsSync(CURL_CAPS) ? fs.readFileSync(CURL_CAPS, "utf-8").split("\n").filter(Boolean).map((l) => l.split(" ")) : [];
+    return { secs, out, verbs, caps, verdict: (/\[RELAY\] VERDICT=[^\n]*/.exec(out) ?? [""])[0] };
+  }
+  it("a slow resolver (3s) + a 2s health check + a 4s registration: done inside the 10s budget, the mail read still ran, the skip is DEGRADED", () => {
+    const r = timedRun(3);
+    expect(r.secs, r.out).toBeLessThan(9.5);
+    expect(r.verbs, "the mail read ran").toContain("pending");
+    expect(r.verdict, r.out).toMatch(/VERDICT=DEGRADED[^\n]*no time budget left for/);
+    // Each step's own cap never exceeds what is left before the mail read's
+    // reserve: after a 3s resolver, 10 - 3 - 3 (margin) - 2 (reserve) = 2s.
+    const health = r.caps.find(([k]) => k === "health");
+    expect(health, JSON.stringify(r.caps)).toBeDefined();
+    expect(Number(health![1]), "the health check's cap is within the budget left").toBeLessThanOrEqual(2);
+  }, 40_000);
+  it("a resolver that would take 6s is stopped at its share: inside the budget, the mail read still ran, DEGRADED", () => {
+    const r = timedRun(6);
+    expect(r.secs, r.out).toBeLessThan(9.5);
+    expect(r.verbs, "the mail read ran").toContain("pending");
+    expect(r.verdict, r.out).toMatch(/VERDICT=DEGRADED/);
+  }, 40_000);
+});

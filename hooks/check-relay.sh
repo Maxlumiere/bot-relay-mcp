@@ -595,6 +595,22 @@ relay_mail_unreadable() {
   relay_degrade "relay unreadable: ${why:-the local relay mailbox could not be read}"
 }
 
+# relay_budget_for STEP OWN_CAP — may a PRE-MAIL step (the resolver, the health
+# check, registration, the bind) still run? It sets RELAY_STEP_SECS to the
+# smaller of the step's own cap and what is left before the mail read's reserve
+# (relay_premail_secs), so the pre-mail steps can never push the hook past its
+# installed budget. With under a second left the step is SKIPPED (a `curl -m 0`
+# would be no timeout at all): LOUD, DEGRADED "no time budget left for STEP".
+relay_budget_for() {
+  RELAY_STEP_SECS=$(relay_cap "$2")
+  if [ "$RELAY_STEP_SECS" -lt 1 ]; then
+    echo "[bot-relay] no time budget left for $1 (${SECONDS}s of ${RELAY_HOOK_BUDGET_SECS}s spent): skipped; the mail read keeps its reserve." >&2
+    relay_mail_verdict "DEGRADED" "no time budget left for $1 (${SECONDS}s spent)" other
+    return 1
+  fi
+  return 0
+}
+
 relay_remote_failed() {
   echo "[RELAY] remote relay read failed: pending mail for $AGENT_NAME could not be read at session start. Mail may be waiting: call get_messages."
   echo "[bot-relay] remote mail read failed for $AGENT_NAME: $1" >&2
@@ -743,8 +759,8 @@ RECOVERY_COMPLETED=0
 # proves it either way ("" = not known yet, 1 = answered, 0 = unreachable). The verdict
 # block after register reads it, so a daemon that never came up cannot print HEALTHY.
 DAEMON_REACHABLE=""
-if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
-  HEALTH_BODY=$(curl -s -m 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the token health check" 2; then
+  HEALTH_BODY=$(curl -s -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -H "X-Agent-Token: ${RELAY_AGENT_TOKEN}" \
@@ -772,7 +788,7 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
   # v2.1 Phase 4b.1 v2 recovery path: if operator set $RELAY_RECOVERY_TOKEN AND
   # the daemon reported recovery_pending, try to re-register with the recovery
   # token. On success, emit guidance for the operator to replace their token.
-  if [ "$AUTH_STATE" = "recovery_pending" ] && [ -n "${RELAY_RECOVERY_TOKEN:-}" ]; then
+  if [ "$AUTH_STATE" = "recovery_pending" ] && [ -n "${RELAY_RECOVERY_TOKEN:-}" ] && relay_budget_for "the recovery registration" 4; then
     # Build capabilities JSON for the recovery register_agent call. Re-uses
     # the allowlist logic below (hoisted here so recovery path can call it).
     CAPS_JSON="[]"
@@ -788,7 +804,7 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
         printf "]";
       }')
     fi
-    RECOVERY_BODY=$(curl -s -m 4 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    RECOVERY_BODY=$(curl -s -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
       -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" 2>/dev/null)
@@ -1009,7 +1025,9 @@ fi
 # register silently — we do NOT touch the DB directly. The mail/task
 # delivery path below is read-only and stays via sqlite3 (the fast path is
 # the point). Bootstrap without a daemon is deliberately not supported.
-if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
+REGISTER_RAN=0
+if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget_for "registration" 4; then
+  REGISTER_RAN=1
   # Carry the caller's token if they have one — active re-register requires
   # it; first-time bootstrap on a fresh row doesn't. Either way the request
   # reaches the server so the server decides which branch to take.
@@ -1028,7 +1046,7 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
   RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
-  REG_BODY=$(curl -s -m 4 -w "\nHTTP_STATUS:%{http_code}\n" \
+  REG_BODY=$(curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
@@ -1102,7 +1120,7 @@ fi
 # it did not, or when register itself failed. A HEALTHY printed after a reboot where the
 # daemon never came up is the false-comfort class this exists to remove.
 REGISTER_ATTEMPTED=0
-if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
+if [ "$REGISTER_RAN" -eq 1 ]; then
   REGISTER_ATTEMPTED=1
   # The register curl appends "HTTP_STATUS:<code>"; 000 = connection refused or timed out.
   if printf '%s\n' "${REG_BODY:-}" | grep -q '^HTTP_STATUS:000$'; then
@@ -1111,10 +1129,10 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     DAEMON_REACHABLE=1
   fi
 fi
-if [ -z "$DAEMON_REACHABLE" ] && command -v curl >/dev/null 2>&1; then
+if [ -z "$DAEMON_REACHABLE" ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the daemon probe" 1; then
   # Register was skipped (a LIVE row or a completed recovery), so nothing above proved
   # the daemon is up. One bounded probe settles it.
-  if curl -fsS --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+  if curl -fsS --max-time "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
     DAEMON_REACHABLE=1
   else
     DAEMON_REACHABLE=0
@@ -1162,16 +1180,27 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
   RELAY_BIND_ERR=""
   RELAY_BIND_RC=1
   RELAY_BIND_ERRFILE="$(mktemp 2>/dev/null || printf '')"
-  if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1; then
-    if [ -n "$RELAY_BIND_ERRFILE" ]; then
-      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | node "$RELAY_BIND_BIN" bind 2>"$RELAY_BIND_ERRFILE")
+  RELAY_BIND_INFILE="$(mktemp 2>/dev/null || printf '')"
+  RELAY_BIND_OUTFILE="$(mktemp 2>/dev/null || printf '')"
+  if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1 && [ -n "$RELAY_BIND_ERRFILE" ] && [ -n "$RELAY_BIND_INFILE" ] && [ -n "$RELAY_BIND_OUTFILE" ]; then
+    if relay_budget_for "the window bind" 3; then
+      # Bounded like every pre-mail step: the payload goes in through a private
+      # file, and the run is killed at its share of the budget (124 = timed out).
+      printf '%s' "$RELAY_HOOK_PAYLOAD" > "$RELAY_BIND_INFILE"
+      relay_run_bounded "$RELAY_STEP_SECS" "$RELAY_BIND_INFILE" "$RELAY_BIND_OUTFILE" "$RELAY_BIND_ERRFILE" node "$RELAY_BIND_BIN" bind
       RELAY_BIND_RC=$?
+      RELAY_BIND_OUT=$(cat "$RELAY_BIND_OUTFILE" 2>/dev/null || printf '')
       RELAY_BIND_ERR=$(cat "$RELAY_BIND_ERRFILE" 2>/dev/null || printf '')
-      rm -f "$RELAY_BIND_ERRFILE" 2>/dev/null
+      [ "$RELAY_BIND_RC" -eq 124 ] && RELAY_BIND_ERR="BIND_FAILED: timed out after ${RELAY_STEP_SECS}s"
     else
-      RELAY_BIND_OUT=$(printf '%s' "$RELAY_HOOK_PAYLOAD" | node "$RELAY_BIND_BIN" bind 2>/dev/null)
-      RELAY_BIND_RC=$?
+      RELAY_BIND_RC=125
+      RELAY_BIND_ERR="BIND_FAILED: no time budget left for the window bind"
     fi
+    rm -f "$RELAY_BIND_ERRFILE" "$RELAY_BIND_INFILE" "$RELAY_BIND_OUTFILE" "$RELAY_BIND_OUTFILE.timedout" 2>/dev/null
+  elif [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1; then
+    rm -f "$RELAY_BIND_ERRFILE" "$RELAY_BIND_INFILE" "$RELAY_BIND_OUTFILE" 2>/dev/null
+    RELAY_BIND_RC=1
+    RELAY_BIND_ERR="BIND_FAILED: could not create a private temp file for the bind"
   else
     RELAY_BIND_RC=127
     RELAY_BIND_ERR="BIND_FAILED: no runnable relay CLI beside this hook (looked for $RELAY_BIND_BIN)"

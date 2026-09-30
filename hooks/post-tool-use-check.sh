@@ -679,12 +679,19 @@ case "$F1_RC" in
   0)
     MODE=local
     SUMMARY=$(printf '%s' "$F1_OUT" | SRC=f1 AN="$AGENT_NAME" python3 -c "$NOTICE_PY" 2>/dev/null)
-    if [ $? -eq 0 ]; then
-      READ_OK=1
-    else
+    if [ $? -ne 0 ]; then
       MODE=unreadable
       SUMMARY=""
       F1_ERR="relay pending returned output this hook could not parse"
+    elif ! F1_DB=$(relay_pending_resolution_db "$F1_OUT"); then
+      # ADR-0048: the answer must name the DB it came from (its embedded
+      # resolution); without a valid one it is not a read this hook can trust.
+      MODE=unreadable
+      SUMMARY=""
+      F1_DB=""
+      F1_ERR="relay pending returned no valid resolution"
+    else
+      READ_OK=1
     fi
     ;;
   3)
@@ -692,7 +699,7 @@ case "$F1_RC" in
       MODE=remote
       # The vault location is the resolver's answer: one `relay where`, remote only.
       if [ -z "$AGENT_TOKEN" ]; then
-        relay_where_load "$RELAY_CLI" || true
+        relay_where_load "$RELAY_CLI" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" || true
         relay_hydrate_token
       fi
       SUMMARY=$(http_peek)
@@ -707,16 +714,10 @@ case "$F1_RC" in
 esac
 
 # Only a SUCCESSFUL local read tells us which DB holds this agent's anchor. Its
-# path is the resolution `relay pending --json` embeds (ADR-0048: the SAME object
-# `relay where` prints), so the vault beside it needs no second node start.
+# path is the VALIDATED resolution `relay pending --json` embeds (F1_DB, above;
+# ADR-0048: the SAME object `relay where` prints), so the vault beside it needs
+# no second node start.
 if [ "$MODE" = local ] && [ "$READ_OK" -eq 1 ]; then
-  F1_DB=$(printf '%s' "$F1_OUT" | python3 -c 'import json, sys
-try:
-    r = json.load(sys.stdin).get("resolution") or {}
-    p = r.get("db_path") if r.get("kind") != "error" else None
-except Exception:
-    p = None
-sys.stdout.write(p if isinstance(p, str) and "\n" not in p else "")' 2>/dev/null)
   if [ -n "$F1_DB" ]; then
     relay_res_set_db "$F1_DB"
     relay_hydrate_token
