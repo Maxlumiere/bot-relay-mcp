@@ -27,6 +27,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import { spawnSync } from "child_process";
+import { fileURLToPath } from "url";
 
 const TEST_ROOT = path.join(os.tmpdir(), "bot-relay-backup-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_ROOT, "relay.db");
@@ -297,5 +298,36 @@ describe("v2.1 Phase 2c — importRelayState", () => {
     // No leftover staging artifacts in the DB dir.
     const files = fs.readdirSync(TEST_ROOT);
     expect(files.some((f) => f.endsWith(".new"))).toBe(false);
+  });
+});
+
+describe("ADR-0048 (Codex #287 P2-7) — the DEFAULT <db-dir>/backups destination is contained too", () => {
+  // Outside HOME and every temp root: the repo's own gitignored cache.
+  const OUTSIDE = path.join(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."), "node_modules", ".cache", `backup-outside-${process.pid}`);
+  // HOME is an approved root and the repo may sit under the real one: pin HOME to
+  // the (temp-rooted) test dir so the repo cache is genuinely outside every root.
+  let savedHome: string | undefined;
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    process.env.HOME = TEST_ROOT;
+    fs.mkdirSync(OUTSIDE, { recursive: true });
+  });
+  afterEach(() => {
+    process.env.HOME = savedHome;
+    fs.rmSync(OUTSIDE, { recursive: true, force: true });
+  });
+
+  it("a backups dir symlinked OUTSIDE the roots → the export is refused and NOTHING is written there", async () => {
+    await seedDb();
+    fs.symlinkSync(OUTSIDE, path.join(TEST_ROOT, "backups"));
+    const { exportRelayState } = await import("../src/backup.js");
+    await expect(exportRelayState()).rejects.toThrow(/outside the approved roots/);
+    expect(fs.readdirSync(OUTSIDE), "no archive landed outside the roots").toEqual([]);
+  });
+  it("TWIN: a plain backups dir still works", async () => {
+    await seedDb();
+    const { exportRelayState } = await import("../src/backup.js");
+    const r = await exportRelayState();
+    expect(path.dirname(r.archive_path)).toBe(path.join(TEST_ROOT, "backups"));
   });
 });

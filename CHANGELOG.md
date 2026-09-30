@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Changed — instance resolution is one strict function: a fault never selects a different DB
+
+Every process picked its relay DB through helpers that swallowed file-system errors. An unreadable `~/.bot-relay/active-instance`, an I/O or permission error on `instances/`, or a marker that could not be read therefore landed the process on the flat `~/.bot-relay/relay.db`. Nothing said so: the relay looked healthy and read an empty mailbox. Now one resolver, `resolveInstance()`, serves the daemon and the CLI:
+
+- **The flat DB only on a positive absence** (no marker, and no instance directory). Any other fault is an error.
+- **The daemon refuses to start on an error.** **If you upgrade and the relay will not start:** run `relay doctor`. It reads the instance selection once and checks exactly the config and DB it reports; a file it cannot stat is a FAIL line, never a crash. Its first line, "instance resolution", names the cause (for example a permission error on `~/.bot-relay/instances`, or instances present but none selected: `relay use-instance <id>`).
+- **The marker is read once.**
+- **Containment uses real paths:** a DB path whose parent is a symlink out of your home and temp directories is refused. Before, only the literal path was checked. The daemon checks again after it creates the DB, and a DB refused at that point is dropped without writing anything (the WASM driver no longer saves its copy through the escaped path, and neither the file nor its directory is chmod'ed first). This one rule replaces three copies (the DB, backup destinations, config validation).
+- **`relay where`** prints what this environment resolves to. `relay pending --json` includes the same `resolution`.
+- **Deploy gate:** `relay deploy-gate`, run from the new build before a daemon restart. It passes only when the new resolver, given the environment the restarted daemon will get, names the DB the running daemon holds open (compared by device and inode). On macOS that environment comes from the loaded launchd job, parsed by structure, and must match the plist file. Everything is checked a second time just before a PASS; a daemon that restarted in between gives CANNOT-VERIFY. Only the resolver's variables are printed (`relay where --env-keys`). Exit 0 PASS, 1 FAIL, 3 CANNOT-VERIFY.
+- **Shared temp directories:** when a DB path goes through `/tmp` at any point, `/tmp` must have the sticky bit, and every existing part of the path must belong to you or root and must not be writable by group or others, or the path is refused. That includes each symlink on the way and everything a link leads to. `/tmp` itself must belong to root or you. This stops another local user from planting a file or link there. Paths that never go through `/tmp` are not affected.
+- **Backup and restore stage their files privately.** The staging directory under `$TMPDIR` must not be writable by other users anywhere along its path (a sticky directory such as `/tmp` is fine), or the backup or restore is refused before anything is staged. The staged DB is checked again after it is opened.
+- **Every command that opens the DB checks it again after opening,** including the ones that read it directly (`relay fleet`, `bind`, `pending`, `recover`, `release-binding`, `purge-history`, `purge-agents`). A file another user created after the path was checked is refused before it is read.
+- **`relay list-instances` exits 1 when the instance selection has a fault.** It still lists the instances and names the fault. With no instances and a fault, it no longer claims that legacy single-instance mode is active.
+- **`relay watch` prints a DEGRADED line for every failure,** not only a failed instance selection: a DB that cannot be opened, a mailbox read that fails later (`--once` then exits 1; a continuous watch repeats the line while reads keep failing and says when they recover), and a marker watcher that fails (the watch falls back to polling).
+- **Scope:** these checks cover accidental faults, misconfiguration and another local user interfering through a shared directory. A program running as you that races the daemon's startup is out of scope: the check after opening validates the path name, not the open file.
+- **Refused, not guessed:** an instance id `.` or `..`, an `instances` path that is a file, a DB path through a dangling symlink that points outside the approved roots, and a default backups directory that is a symlink out of them. Path containment compares the real, on-disk spelling, so a differently-cased path on a case-insensitive disk is accepted.
+
+Tests:
+- `tests/adr-0048-resolve-instance.test.ts`: the state table, with fault injection per row; two-sided (every fault is an error, and every positive absence is still flat).
+- `tests/adr-0048-where-contract.test.ts`: `where` equals `pending`; the re-check after create; `relay doctor`.
+- `tests/adr-0048-deploy-gate.test.ts`: the gate's outcomes with injected system reads (forged and malformed launchd output, plist drift, a wrong listener, Linux), and one run against a real daemon.
+
 ### Fixed — session start showed encrypted mail as ciphertext; it now delivers pending mail through `relay pending`, decrypted, in drain order, with an honest count
 
 The SessionStart hook printed the raw stored body, so a relay with an encryption keyring showed `enc:…` ciphertext to the agent at session start. It also used its own copy of the pending predicate, ordered newest-first instead of the drain's order, and cut the list at 10 without saying so. Now:

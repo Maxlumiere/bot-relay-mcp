@@ -36,6 +36,7 @@ import { spawnSync } from "child_process";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
+import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
@@ -66,36 +67,40 @@ export const SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 /** Bump on any breaking change to the tar layout (files, manifest structure). */
 export const ARCHIVE_FORMAT_VERSION = 1;
 
-const APPROVED_ROOTS = [
-  os.homedir(),
-  "/tmp",
-  "/private/tmp",
-  "/var/folders",
-];
-
-function isPathUnderApprovedRoot(resolved: string): boolean {
-  return APPROVED_ROOTS.some((root) => {
-    const rootResolved = path.resolve(root);
-    return resolved === rootResolved || resolved.startsWith(rootResolved + path.sep);
-  });
+/**
+ * A backup DESTINATION must sit under the approved roots, on REAL paths (the ONE
+ * containment rule, src/approved-roots.ts; ADR-0048). The destination is not an
+ * instance DB, so it is checked directly, not through resolveInstance.
+ */
+function assertSafePath(p: string, label: string): string {
+  const c = checkContainment(p);
+  if (!c.ok) throw new Error(`${label}: ${c.reason}`);
+  return c.absPath;
 }
 
-function assertSafePath(p: string, label: string): string {
-  const resolved = path.resolve(p);
-  if (!isPathUnderApprovedRoot(resolved)) {
-    throw new Error(
-      `${label} resolves to '${resolved}', which is outside approved roots (${APPROVED_ROOTS.join(", ")}).`
-    );
-  }
-  return resolved;
+/**
+ * ADR-0048: the staging directory (under $TMPDIR, which may be anywhere) must be
+ * PRIVATE before anything is staged in it: every traversed component owned by
+ * you or root, and not writable by others unless it is a sticky directory (such
+ * as /tmp). Otherwise another local user could swap the staged DB between
+ * extraction and the copy into the live destination.
+ */
+function assertPrivateStaging(dir: string): void {
+  const c = checkPrivatePath(dir);
+  if (!c.ok) throw new Error(`the staging directory ${dir} is not private: ${c.reason}`);
 }
 
 function getConfigPath(): string {
   return process.env.RELAY_CONFIG_PATH || path.join(os.homedir(), ".bot-relay", "config.json");
 }
 
+/**
+ * The DEFAULT backups directory, <db-dir>/backups, under the same containment
+ * rule as an explicit destination: a symlinked backups dir pointing outside the
+ * approved roots is refused before anything is created, chmod'ed or written.
+ */
 function getBackupsDir(): string {
-  return path.join(path.dirname(getDbPath()), "backups");
+  return assertSafePath(path.join(path.dirname(getDbPath()), "backups"), "backups directory");
 }
 
 function isoTimestamp(): string {
@@ -156,6 +161,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   // (keyed off a random suffix so parallel exports can't collide).
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-export-"));
   try {
+    assertPrivateStaging(stagingDir);
     const snapshotDbPath = path.join(stagingDir, "relay.db");
 
     // #171: driver-aware consistent snapshot. native → VACUUM INTO (online-safe
@@ -308,6 +314,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
   // --- Step 3: extract the archive to a staging dir ---
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-import-"));
   try {
+    assertPrivateStaging(stagingDir);
     runTar(["-xzf", resolvedArchive, "-C", stagingDir], stagingDir);
 
     const manifestPath = path.join(stagingDir, "manifest.json");

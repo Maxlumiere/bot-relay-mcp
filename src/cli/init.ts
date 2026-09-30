@@ -40,7 +40,7 @@ import { withDeadline } from "../http-deadline.js";
 import { execFileSync } from "child_process";
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
-import { createInstance, generateInstanceId, resolveActiveInstanceId } from "../instance.js";
+import { createInstance, generateInstanceId, resolveActiveInstanceId, instanceDir, instanceDirNames } from "../instance.js";
 import { getConfigPath } from "../config.js";
 import {
   readJsonSafe,
@@ -427,7 +427,7 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     // Explicit: CREATE / target a specific instance. This branch scaffolds the
     // instance dir below (createInstance) and owns its config path.
     effectiveInstanceId = args.instanceId ?? generateInstanceId();
-    perInstanceDir = path.join(defaultBotRelayDir(), "instances", effectiveInstanceId);
+    perInstanceDir = instanceDir(effectiveInstanceId) as string;
     configPath = path.join(perInstanceDir, "config.json");
   } else {
     // No explicit flag: reconcile the ACTIVE install exactly as the daemon sees
@@ -437,8 +437,19 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     // write-target check below; perInstanceDir stays null — the instance dir
     // already exists (getConfigPath only resolves to one that does), so we do NOT
     // re-scaffold it.
-    configPath = getConfigPath();
-    effectiveInstanceId = resolveActiveInstanceId();
+    // ADR-0048: the ONE strict resolver. A fault (for example instances but none
+    // selected) ends init with the reason: it never writes a config the daemon
+    // would not read.
+    try {
+      configPath = getConfigPath();
+      effectiveInstanceId = resolveActiveInstanceId();
+    } catch (err) {
+      process.stderr.write(
+        `relay init: instance resolution failed: ${err instanceof Error ? err.message : String(err)}\n` +
+          "  Select an instance first (relay use-instance <id>, or RELAY_INSTANCE_ID), or pass --instance-id.\n",
+      );
+      return 1;
+    }
   }
 
   const existingConfig = readJsonSafe(configPath);
@@ -510,7 +521,7 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
   // ---- 1. config.json (reconcile) ------------------------------------------
   ensureSecureDir(defaultBotRelayDir(), 0o700);
   if (effectiveInstanceId && perInstanceDir) {
-    ensureSecureDir(path.join(defaultBotRelayDir(), "instances"), 0o700);
+    ensureSecureDir(path.dirname(perInstanceDir), 0o700);
     ensureSecureDir(perInstanceDir, 0o700);
     createInstance(effectiveInstanceId, "relay-init");
   }
@@ -597,14 +608,13 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     !process.env.RELAY_CONFIG_PATH &&
     path.resolve(configPath) === path.resolve(defaultConfigPath())
   ) {
+    // Reachable only under an explicit RELAY_DB_PATH (the resolver tolerates the
+    // ambiguous state there); a warning, so an unreadable listing is just none.
     let instanceDirs: string[] = [];
     try {
-      instanceDirs = fs
-        .readdirSync(path.join(defaultBotRelayDir(), "instances"), { withFileTypes: true })
-        .filter((e) => e.isDirectory())
-        .map((e) => e.name);
+      instanceDirs = instanceDirNames();
     } catch {
-      /* no instances/ dir → none */
+      /* unreadable → no warning; the resolver reports faults elsewhere */
     }
     if (instanceDirs.length > 0) {
       process.stdout.write(

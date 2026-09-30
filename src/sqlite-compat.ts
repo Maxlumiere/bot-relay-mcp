@@ -20,6 +20,7 @@
 import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
+import { checkPrivatePath } from "./approved-roots.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -238,6 +239,15 @@ class WasmDatabase implements CompatDatabase {
   }
 
   /**
+   * Release the handle WITHOUT flushing the in-memory image. For a refused DB
+   * (ADR-0048: the path escaped the approved roots after it was opened): a
+   * close() would export() and write the image THROUGH the escaped path.
+   */
+  discard(): void {
+    this.db.close();
+  }
+
+  /**
    * #171: atomic in-memory serialization — the whole DB image as bytes, produced
    * synchronously from memory with no filesystem touch. Tear-proof by
    * construction (unlike copying the write-back file, whose flush is a bare
@@ -350,8 +360,28 @@ export function snapshotToFile(db: CompatDatabase, destPath: string): void {
  * — the same make-impossible property as keeping getDriverType private. Opens the
  * GIVEN file; does NOT create or init the main DB, so validating a corrupt archive
  * manufactures no state.
+ *
+ * ADR-0048: every caller opens a STAGED file (backup/restore staging under
+ * $TMPDIR), so after the open the path must still be PRIVATE (approved-roots
+ * checkPrivatePath: the StrictModes rule on every traversed component). On a
+ * refusal the handle is released without any write.
  */
 export async function openReadOnly(dbPath: string, driver: SqliteDriver): Promise<CompatDatabase> {
+  const db = await openReadOnlyUnchecked(dbPath, driver);
+  const c = checkPrivatePath(dbPath);
+  if (!c.ok) {
+    try {
+      if (db instanceof WasmDatabase) db.discard();
+      else db.close();
+    } catch {
+      /* releasing a refused handle is best-effort */
+    }
+    throw new Error(`REFUSING the staged DB after opening it: ${c.reason}`);
+  }
+  return db;
+}
+
+async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Promise<CompatDatabase> {
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
@@ -444,6 +474,21 @@ export function configuredDriver(): SqliteDriver {
 /**
  * Close and clear the initialized DB (for test cleanup).
  */
+/**
+ * ADR-0048: drop the initialized handle WITHOUT any write, for a DB refused after
+ * opening. WASM: discard() skips the flush. Native: nothing has been written yet
+ * (no pragma, no schema: those run after the re-check), so close() writes nothing.
+ */
+export function discardInitializedDb(): void {
+  const db = _initializedDb;
+  _initializedDb = null;
+  _driverUsed = null;
+  _initPromise = null;
+  if (!db) return;
+  if (db instanceof WasmDatabase) db.discard();
+  else db.close();
+}
+
 export function closeInitializedDb(): void {
   if (_initializedDb) {
     _initializedDb.close();

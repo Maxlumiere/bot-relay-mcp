@@ -134,11 +134,12 @@ export async function run(argv: string[]): Promise<number> {
   if (isValidTokenShape(envToken)) {
     token = envToken;
   } else {
-    try {
-      const { resolveInstanceDbPath } = await import("../instance.js");
-      if (!process.env.RELAY_DB_PATH) process.env.RELAY_DB_PATH = resolveInstanceDbPath();
-    } catch {
-      /* fall back to db default */
+    // ADR-0048: the ONE strict resolver; a fault is said and ends the verb.
+    const { pinResolvedDbPath } = await import("./_instance-db.js");
+    const resolveFault = await pinResolvedDbPath();
+    if (resolveFault) {
+      process.stderr.write(`relay send: instance resolution failed: ${resolveFault}\n`);
+      return 2;
     }
     let dbOpen = false;
     try {

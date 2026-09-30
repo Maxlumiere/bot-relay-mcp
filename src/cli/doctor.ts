@@ -12,7 +12,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { resolveInstanceDbPath, resolveInstanceConfigPath } from "../instance.js";
+import { resolveInstance, configPathFor } from "../instance.js";
 import { withDeadline } from "../http-deadline.js";
 
 type Status = "PASS" | "WARN" | "FAIL";
@@ -27,16 +27,15 @@ interface CheckResult {
 // Pre-v2.4.5 this hardcoded the legacy ~/.bot-relay/relay.db, which on a
 // per-instance setup printed correct PASS/WARN against the wrong file —
 // hiding the very split-brain doctor exists to surface.
-function getDbPath(): string {
-  return resolveInstanceDbPath();
-}
+// ADR-0048: the paths are resolved ONCE in run() and handed to every check; no
+// check re-resolves (a second resolution could disagree with, or throw after,
+// the first one the report is built on).
 
-function getConfigPath(): string {
-  return resolveInstanceConfigPath();
-}
-
-async function checkConfig(): Promise<CheckResult> {
-  const p = getConfigPath();
+async function checkConfig(configPath: { path: string } | { fault: string }): Promise<CheckResult> {
+  if ("fault" in configPath) {
+    return { name: "config.json", status: "FAIL", detail: `cannot resolve the config path: ${configPath.fault}` };
+  }
+  const p = configPath.path;
   if (!fs.existsSync(p)) {
     return { name: "config.json", status: "WARN", detail: `not present at ${p} (defaults will be used)` };
   }
@@ -133,8 +132,7 @@ export function checkMcpServerPath(claudeJsonPath: string = resolveClaudeJsonPat
   return { name, status: "PASS", detail: `spawn path OK (${scriptPath})` };
 }
 
-async function checkDb(): Promise<CheckResult[]> {
-  const p = getDbPath();
+async function checkDb(p: string): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   if (!fs.existsSync(p)) {
     results.push({ name: "relay.db", status: "WARN", detail: `not present at ${p} (will be created on first run)` });
@@ -163,24 +161,35 @@ async function checkDb(): Promise<CheckResult[]> {
   return results;
 }
 
-function checkPerms(): CheckResult[] {
+function checkPerms(p: string): CheckResult[] {
   if (process.platform === "win32") {
     return [{ name: "file perms", status: "WARN", detail: "Windows NTFS — POSIX mode bits not applicable" }];
   }
-  const p = getDbPath();
   const dir = path.dirname(p);
   const results: CheckResult[] = [];
+  // A stat fault (EIO, EACCES…) is a FAIL row: the report is always printed.
+  const modeOf = (target: string): number | { fault: string } => {
+    try {
+      return fs.statSync(target).mode & 0o777;
+    } catch (err) {
+      return { fault: (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err)) };
+    }
+  };
   if (fs.existsSync(dir)) {
-    const mode = fs.statSync(dir).mode & 0o777;
-    if (mode === 0o700) {
+    const mode = modeOf(dir);
+    if (typeof mode !== "number") {
+      results.push({ name: `dir perms (${dir})`, status: "FAIL", detail: `cannot stat: ${mode.fault}` });
+    } else if (mode === 0o700) {
       results.push({ name: `dir perms (${dir})`, status: "PASS", detail: "0700" });
     } else {
       results.push({ name: `dir perms (${dir})`, status: "WARN", detail: `0${mode.toString(8)} (recommended 0700; run: chmod 700 "${dir}")` });
     }
   }
   if (fs.existsSync(p)) {
-    const mode = fs.statSync(p).mode & 0o777;
-    if (mode === 0o600) {
+    const mode = modeOf(p);
+    if (typeof mode !== "number") {
+      results.push({ name: `db perms (${p})`, status: "FAIL", detail: `cannot stat: ${mode.fault}` });
+    } else if (mode === 0o600) {
       results.push({ name: `db perms (${p})`, status: "PASS", detail: "0600" });
     } else {
       results.push({ name: `db perms (${p})`, status: "WARN", detail: `0${mode.toString(8)} (recommended 0600; run: chmod 600 "${p}")` });
@@ -189,9 +198,8 @@ function checkPerms(): CheckResult[] {
   return results;
 }
 
-async function checkDiskSpace(): Promise<CheckResult> {
+async function checkDiskSpace(p: string): Promise<CheckResult> {
   try {
-    const p = getDbPath();
     const dir = fs.existsSync(path.dirname(p)) ? path.dirname(p) : os.tmpdir();
     // fs.statfsSync exists on Node 18.15+. Best-effort.
     const anyFs = fs as any;
@@ -464,10 +472,52 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   const results: CheckResult[] = [];
-  results.push(await checkConfig());
-  results.push(...(await checkDb()));
-  results.push(...checkPerms());
-  results.push(await checkDiskSpace());
+  // ADR-0048: the ONE strict resolver, reported first. On a fault, print it and
+  // skip the checks that need a DB path (they would only guess or crash); the
+  // daemon refuses to start on this same result.
+  const resolution = resolveInstance();
+  if (resolution.kind === "error") {
+    results.push({ name: "instance resolution", status: "FAIL", detail: resolution.reason });
+  } else {
+    const who =
+      resolution.kind === "instance"
+        ? `instance ${resolution.id} (${resolution.basis})`
+        : resolution.kind === "flat"
+          ? "flat"
+          : `explicit DB (${resolution.basis})`;
+    results.push({
+      name: "instance resolution",
+      status: resolution.kind === "flat" && resolution.warning ? "WARN" : "PASS",
+      detail: `${who} ${resolution.dbPath}${resolution.kind === "flat" && resolution.warning ? ` — ${resolution.warning}` : ""}`,
+    });
+    // The config path comes from the instance part alone (RELAY_DB_PATH does not
+    // move it). It is the SAME resolution unless an explicit DB skipped the
+    // marker, which is then read here, once. A fault is a FAIL row, never thrown.
+    const instancePart = resolution.kind === "explicit-db" ? resolveInstance({ ignoreDbPathEnv: true }) : resolution;
+    let configPath: { path: string } | { fault: string };
+    try {
+      configPath = { path: configPathFor(instancePart) };
+    } catch (err) {
+      configPath = { fault: err instanceof Error ? err.message : String(err) };
+    }
+    // Every downstream step inspects exactly what was reported: the config
+    // loader and the DB layer would otherwise resolve AGAIN (a marker changed in
+    // between would make the report name A while inspecting or initializing B).
+    const pinned = { db: process.env.RELAY_DB_PATH, config: process.env.RELAY_CONFIG_PATH };
+    process.env.RELAY_DB_PATH = resolution.dbPath;
+    if ("path" in configPath) process.env.RELAY_CONFIG_PATH = configPath.path;
+    try {
+      results.push(await checkConfig(configPath));
+      results.push(...(await checkDb(resolution.dbPath)));
+      results.push(...checkPerms(resolution.dbPath));
+      results.push(await checkDiskSpace(resolution.dbPath));
+    } finally {
+      if (pinned.db === undefined) delete process.env.RELAY_DB_PATH;
+      else process.env.RELAY_DB_PATH = pinned.db;
+      if (pinned.config === undefined) delete process.env.RELAY_CONFIG_PATH;
+      else process.env.RELAY_CONFIG_PATH = pinned.config;
+    }
+  }
   results.push(await checkDaemon());
   results.push(checkHooks());
   results.push(checkMcpServerPath());

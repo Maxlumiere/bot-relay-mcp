@@ -42,115 +42,60 @@ export type PendingSource =
   | { kind: "ambiguous"; reason: string }
   | { kind: "unreadable"; reason: string };
 
-/**
- * POSITIVE absence only: true = present, false = VERIFIED absent (ENOENT). Any
- * other error (EACCES, EIO, ...) throws: a place that cannot be read is not an
- * empty one. The shared instance helpers swallow such errors by design (the
- * connector relies on that), so the source decision below never trusts their
- * fallbacks for existence; it probes for itself.
- */
-function verifiedExists(p: string): boolean {
-  try {
-    fs.lstatSync(p);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return false;
-    throw new Error(`cannot inspect ${p} (${code ?? (err instanceof Error ? err.message : String(err))})`);
-  }
-}
-
 /** The CLI's handle: READ-ONLY at the driver, so a write through it throws (SQLITE_READONLY). */
 export async function openPendingDb(dbPath: string): Promise<import("../sqlite-compat.js").CompatDatabase> {
-  const Better = (await import("better-sqlite3")).default;
-  const db = new Better(dbPath, { readonly: true, fileMustExist: true }) as unknown as import("../sqlite-compat.js").CompatDatabase;
+  // ADR-0048: the raw handle gets db.ts's post-open re-check (one function).
+  const { openRawRelayDb } = await import("./_instance-db.js");
+  const db = await openRawRelayDb(dbPath, { readonly: true });
   db.pragma("busy_timeout = 1000");
   return db;
 }
 
 /**
- * WHERE the answer comes from — decided here, so no hook re-implements it (the F1
- * mode rule). It uses the connector's own instance LAYOUT and marker reader
- * (src/instance.ts: botRelayRoot, resolveActiveInstanceId, instanceDir) but NOT
- * its fallbacks: resolveInstanceDbPath and describeInstanceResolution swallow fs
- * errors and fall back to the flat DB, which the connector relies on and this
- * command must not. Existence is decided by its own probes (verifiedExists).
- *
- * EXPLICIT configuration outranks AMBIENT signals:
- *   1. explicit local: --db-path, RELAY_DB_PATH, RELAY_INSTANCE_ID → that DB. A
- *      missing file is a READ failure (exit 1), never "no local instance".
- *   2. explicit remote: RELAY_HTTP_HOST set → "no-local" (exit 3). A caller with a
- *      remote relay configured is not redirected to a stray local file.
- *   3. ambient local: the active-instance marker (read ONCE; the path is
- *      instanceDir(id)/relay.db), or the legacy flat DB file.
- *      The AMBIGUOUS state (instances exist, none resolved) is refused loudly,
- *      exactly as the connector's assertInstanceResolution refuses it: a quiet
- *      read of the flat DB there is the nine-day silent-loss shape.
- *   4. nothing → "no-local" (exit 3).
- * Steps 3-4 decide on POSITIVE evidence only (verifiedExists): an fs error on
- * the relay root, the marker or instances/ is "unreadable" (exit 1), never an
- * absence that falls through to the flat DB or to exit 3.
+ * WHERE the answer comes from. ADR-0048: through the ONE strict resolver
+ * (src/instance.ts resolveInstance), which reads the marker ONCE, applies the
+ * approved-roots containment on REAL paths, and never turns a fault into the flat
+ * DB. This command keeps only its own POLICY on top of that fact:
+ *   1. explicit local (--db-path, RELAY_DB_PATH, RELAY_INSTANCE_ID) → that DB; a
+ *      missing file is a READ failure (exit 1), never "no local instance";
+ *   2. explicit remote (RELAY_HTTP_HOST) with no explicit local → "no-local"
+ *      (exit 3): a caller with a remote relay is not redirected to a stray file;
+ *   3. otherwise the resolver's answer: `error` (the ambiguous state included) is
+ *      exit 1; `flat` whose file does not exist is "no local relay here" (exit 3);
+ *      anything else is read.
  */
+export async function decidePendingSource(
+  dbPathFlag: string | null,
+): Promise<{ source: PendingSource; resolution: import("../instance.js").ResolvedInstance | null }> {
+  const { resolveInstance } = await import("../instance.js");
+  const explicitLocal = Boolean(dbPathFlag || process.env.RELAY_DB_PATH || process.env.RELAY_INSTANCE_ID);
+  if (!explicitLocal && process.env.RELAY_HTTP_HOST) {
+    return {
+      source: {
+        kind: "no-local",
+        reason: "a remote relay is configured (RELAY_HTTP_HOST) and no local instance is configured explicitly",
+      },
+      resolution: null,
+    };
+  }
+  const r = resolveInstance(dbPathFlag ? { dbPath: dbPathFlag } : {});
+  switch (r.kind) {
+    case "error":
+      return { source: r.ambiguous ? { kind: "ambiguous", reason: r.reason } : { kind: "unreadable", reason: r.reason }, resolution: r };
+    case "flat":
+      return r.exists
+        ? { source: { kind: "local", dbPath: r.dbPath, basis: "legacy DB file" }, resolution: r }
+        : { source: { kind: "no-local", reason: `no local relay instance here (nothing at ${r.dbPath}, no active instance)` }, resolution: r };
+    case "instance":
+      return { source: { kind: "local", dbPath: r.dbPath, basis: r.basis }, resolution: r };
+    case "explicit-db":
+      return { source: { kind: "local", dbPath: r.dbPath, basis: r.basis }, resolution: r };
+  }
+}
+
+/** The source alone (see decidePendingSource). */
 export async function resolvePendingSource(dbPathFlag: string | null): Promise<PendingSource> {
-  const { resolveActiveInstanceId, instanceDir, botRelayRoot } = await import("../instance.js");
-  // The DB path of a KNOWN id, from the layout alone (no filesystem read, so no
-  // fallback). instanceDir throws on an id outside [A-Za-z0-9._-]: that is exit 1.
-  const instanceDbPath = (id: string): string => path.join(instanceDir(id) as string, "relay.db");
-  if (dbPathFlag) return { kind: "local", dbPath: dbPathFlag, basis: "--db-path" };
-  if (process.env.RELAY_DB_PATH) return { kind: "local", dbPath: process.env.RELAY_DB_PATH, basis: "RELAY_DB_PATH" };
-  if (process.env.RELAY_INSTANCE_ID) {
-    return { kind: "local", dbPath: instanceDbPath(process.env.RELAY_INSTANCE_ID), basis: "RELAY_INSTANCE_ID" };
-  }
-  if (process.env.RELAY_HTTP_HOST) {
-    return {
-      kind: "no-local",
-      reason: "a remote relay is configured (RELAY_HTTP_HOST) and no local instance is configured explicitly",
-    };
-  }
-  const root = botRelayRoot();
-  const flatDb = path.join(root, "relay.db");
-  let marker = false;
-  let instanceDirs = false;
-  let legacy = false;
-  try {
-    if (!verifiedExists(root)) {
-      return { kind: "no-local", reason: `no local relay instance here (no relay home at ${root})` };
-    }
-    marker = verifiedExists(path.join(root, "active-instance"));
-    const instances = path.join(root, "instances");
-    // The listing matters only when no marker names the instance.
-    if (!marker && verifiedExists(instances)) {
-      instanceDirs = fs.readdirSync(instances, { withFileTypes: true }).some((e) => e.isDirectory());
-    }
-    legacy = verifiedExists(flatDb);
-  } catch (err) {
-    return {
-      kind: "unreadable",
-      reason:
-        `cannot tell whether a local relay instance exists: ${err instanceof Error ? err.message : String(err)}. ` +
-        `A place that cannot be read is not an empty one.`,
-    };
-  }
-  if (marker) {
-    // Read the marker ONCE and keep the id. A second read through
-    // resolveInstanceDbPath could fail, be swallowed, and fall back to the flat
-    // DB under this label (Codex #285 round 2).
-    const id = resolveActiveInstanceId();
-    if (!id) {
-      return { kind: "unreadable", reason: `the active-instance marker under ${root} exists but could not be read` };
-    }
-    return { kind: "local", dbPath: instanceDbPath(id), basis: "active-instance" };
-  }
-  if (instanceDirs) {
-    return {
-      kind: "ambiguous",
-      reason:
-        `instance resolution is ambiguous: this machine has relay instances, but none is selected ` +
-        `(set RELAY_INSTANCE_ID, or run \`relay use-instance <id>\`). Refusing to read the flat DB ${flatDb}.`,
-    };
-  }
-  if (legacy) return { kind: "local", dbPath: flatDb, basis: "legacy DB file" };
-  return { kind: "no-local", reason: `no local relay instance here (nothing at ${flatDb}, no active instance)` };
+  return (await decidePendingSource(dbPathFlag)).source;
 }
 
 interface Args {
@@ -251,8 +196,9 @@ export async function run(argv: string[]): Promise<number> {
 
   // --- resolve the SOURCE (no daemon, same as bind / fleet) --------------------
   let source: PendingSource;
+  let resolution: import("../instance.js").ResolvedInstance | null = null;
   try {
-    source = await resolvePendingSource(args.dbPath);
+    ({ source, resolution } = await decidePendingSource(args.dbPath));
   } catch (err) {
     return pendingFailed(`could not resolve the relay DB path: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -262,19 +208,6 @@ export async function run(argv: string[]): Promise<number> {
   }
   if (source.kind === "ambiguous" || source.kind === "unreadable") return pendingFailed(source.reason);
   const dbPath = source.dbPath;
-  // NEVER less conservative than the connector: the SAME approved-roots rule its
-  // getDbPath applies, on EVERY source (--db-path included). Outside them is a
-  // refusal (exit 1), never an answer.
-  {
-    const { isPathUnderApprovedRoot } = await import("../db.js");
-    const resolved = path.resolve(dbPath);
-    if (!isPathUnderApprovedRoot(resolved)) {
-      return pendingFailed(
-        `${resolved} (${source.basis}) is outside the approved roots (the home directory and the temp roots), ` +
-          `which the relay itself refuses. Cannot answer.`,
-      );
-    }
-  }
   if (!fs.existsSync(dbPath)) {
     return pendingFailed(`no relay DB at ${dbPath} (${source.basis}) — cannot answer (this is NOT "no mail")`);
   }
@@ -284,6 +217,7 @@ export async function run(argv: string[]): Promise<number> {
     db = await openPendingDb(dbPath);
 
     const { pendingSchemaGap, pendingMetadata } = await import("../db.js");
+    const { serializeResolution } = await import("../instance.js");
     const gap = pendingSchemaGap(db);
     if (gap) {
       return pendingFailed(
@@ -305,6 +239,9 @@ export async function run(argv: string[]): Promise<number> {
           ok: true,
           agent: name,
           db_path: dbPath,
+          // ADR-0048: the SAME resolution object `relay where --json` prints, from
+          // the SAME serializer (a contract test holds the two equal).
+          resolution: resolution ? serializeResolution(resolution) : null,
           session_bound: meta.session_bound,
           count: meta.count,
           top_priority: meta.top_priority,

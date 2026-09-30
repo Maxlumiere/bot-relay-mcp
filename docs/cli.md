@@ -122,6 +122,20 @@ $ relay restore ~/.bot-relay/backups/relay-backup-*.tar.gz
 Restore complete. schema_version=1, previous DB saved to: ~/.bot-relay/backups/pre-restore-<iso>.tar.gz
 ```
 
+## `relay where [--json] [--db-path P] [--expect-db PATH]`
+
+Which relay DB this environment resolves to, as the relay's one strict resolver sees it (see [multi-instance.md](./multi-instance.md), "ADR-0048"). Read-only. `--json` prints the result (`kind`: `explicit-db`, `instance`, `flat` or `error`, with `db_path`, `exists`, and the reason on an error) plus the vault directory. `--expect-db PATH` exits 1 unless the result names that DB (compared by real path). `--env-keys` lists the environment variables the resolver reads (a JSON array with `--json`). Exit: 0 resolved (and matched), 1 a resolver fault or no match, 2 usage.
+
+## `relay deploy-gate [--label L] [--port N]`
+
+Run it with the NEW build before restarting the daemon onto it. It passes only when the new resolver, given the environment the restarted daemon will get, names the DB the running daemon holds open. Read-only.
+
+- **macOS:** the environment comes from `launchctl print` of the loaded job (default label `com.lumiereventures.bot-relay`). It is parsed strictly, by structure: a resolver variable anywhere but the job's own environment section makes the result CANNOT-VERIFY. The plist file must still hold the same resolver variables; if not, it fails with "plist changed since load: bootout/bootstrap first". The job's pid must be the process listening on the port (default 3777). The new resolver's DB must be one of the files that pid has open. The comparison is by device and inode, so any DB name works and unusual file names cannot cause a false match. If `HOME` is not in the job's environment, the gate uses your account's home directory and says so. Just before a PASS, everything is checked again: the job, its pid and start time, the environment, the listener and the open DB. If the daemon restarted or changed in between, the result is CANNOT-VERIFY; run the gate again.
+- **Linux:** the environment of the process listening on the port (`/proc/PID/environ`). No service manager is modelled, so a match is CANNOT-VERIFY; a mismatch fails.
+- **Printed:** only the resolver's variables (`relay where --env-keys`), never the rest of the daemon's environment.
+
+Exit: 0 PASS, 1 FAIL, 3 CANNOT-VERIFY (for example: not a loaded launchd job, an environment it cannot parse unambiguously, a resolver variable set with `launchctl setenv`, or the WASM driver, which holds no DB file open), 2 usage.
+
 ## `relay help`
 
 Prints the subcommand list. `relay <sub> --help` prints per-subcommand help.
