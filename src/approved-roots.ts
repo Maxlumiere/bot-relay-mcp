@@ -76,7 +76,7 @@ function sharedRootsReal(): string[] {
 }
 
 /** One component the walk passed through: where it sits (canonical parent) and its lstat. */
-interface Traversed {
+export interface Traversed {
   path: string;
   st: fs.Stats;
 }
@@ -176,13 +176,34 @@ export type Containment =
 /** At most this many symlink hops in one walk (the kernel's own MAXSYMLINKS order). */
 const MAX_SYMLINK_HOPS = 40;
 
-type Placed = { ok: true; realPath: string; exists: boolean; traversed: Traversed[] } | { ok: false; reason: string };
+export type Placed = { ok: true; realPath: string; exists: boolean; traversed: Traversed[] } | { ok: false; reason: string };
+
+/**
+ * The path flavour and the three file-system reads the walk makes. Node's own by
+ * default; injectable so the Windows rows (drive, UNC and root-relative symlink
+ * targets) run SIMULATED, with path.win32 and an in-memory file system, on every
+ * platform (tests/fixtures/instance-resolution-table.json, placement_sim).
+ */
+export interface WalkSystem {
+  path: typeof path.posix;
+  lstat: (p: string) => fs.Stats;
+  readlink: (p: string) => string;
+  realpath: (p: string) => string;
+}
+const NODE_WALK: WalkSystem = {
+  path,
+  lstat: (p) => fs.lstatSync(p),
+  readlink: (p) => fs.readlinkSync(p),
+  realpath: (p) => fs.realpathSync.native(p),
+};
 
 /** Where the kernel would put `absPath`: the walk described at the top of this file. */
-function placeReal(absPath: string): Placed {
+export function placeReal(absPath: string, sys: WalkSystem = NODE_WALK): Placed {
+  const P = sys.path;
   const why = (err: unknown) => (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
-  const parts = (p: string) => p.split(path.sep).filter((c) => c !== "");
-  let cur = path.parse(absPath).root;
+  // win32 accepts both separators in a path (and in a link target).
+  const parts = (p: string) => p.split(P.sep === "\\" ? /[\\/]+/ : P.sep).filter((c) => c !== "");
+  let cur = P.parse(absPath).root;
   const queue = parts(absPath.slice(cur.length));
   const traversed: Traversed[] = [];
   let hops = 0;
@@ -190,41 +211,50 @@ function placeReal(absPath: string): Placed {
     const c = queue.shift() as string;
     if (c === ".") continue;
     if (c === "..") {
-      cur = path.dirname(cur); // cur is already real, so its parent is the kernel's `..`
+      cur = P.dirname(cur); // cur is already real, so its parent is the kernel's `..`
       continue;
     }
-    const next = path.join(cur, c);
+    const next = P.join(cur, c);
     // Every component is lstat'ed HERE, so a symlink is seen as itself (the
     // ownership rule judges the link, not only where it leads).
     let st: fs.Stats;
     try {
-      st = fs.lstatSync(next);
+      st = sys.lstat(next);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") return { ok: false, reason: `cannot inspect ${next} (${why(err)})` };
       // A POSITIVE absence: the missing tail lands under the real prefix.
       const rest = [c, ...queue].filter((x) => x !== ".");
       if (rest.includes("..")) return { ok: false, reason: `cannot place ${absPath}: a ".." follows the missing component ${next}` };
-      return { ok: true, realPath: path.join(cur, ...rest), exists: false, traversed };
+      return { ok: true, realPath: P.join(cur, ...rest), exists: false, traversed };
     }
     if (st.isSymbolicLink()) {
       traversed.push({ path: next, st });
       if (++hops > MAX_SYMLINK_HOPS) return { ok: false, reason: `cannot resolve ${absPath} (ELOOP: more than ${MAX_SYMLINK_HOPS} symlinks)` };
       let target: string;
       try {
-        target = fs.readlinkSync(next);
+        target = sys.readlink(next);
       } catch (err) {
         return { ok: false, reason: `cannot read the symlink ${next} (${why(err)})` };
       }
       // A symlink (dangling or not) is followed in kernel order: its target is
-      // spliced into the walk, never collapsed lexically.
-      if (path.isAbsolute(target)) cur = path.parse(target).root;
-      queue.unshift(...parts(target));
+      // spliced into the walk, never collapsed lexically. An ABSOLUTE target
+      // restarts the walk at its root, and only the components AFTER that root
+      // are queued: on win32 the root is a drive (C:\) or a UNC prefix
+      // (\\server\share\), never a component to walk into. A root-relative
+      // target on win32 (\data) keeps the drive the walk is on.
+      if (P.isAbsolute(target)) {
+        const root = P.parse(target).root;
+        cur = P.sep === "\\" && /^[\\/]$/.test(root) ? P.parse(cur).root : root;
+        queue.unshift(...parts(target.slice(root.length)));
+      } else {
+        queue.unshift(...parts(target));
+      }
       continue;
     }
     // A real component. cur is symlink-free, so the kernel's realpath only
     // canonicalises its spelling (the on-disk CASE on a case-insensitive volume).
     try {
-      cur = fs.realpathSync.native(next);
+      cur = sys.realpath(next);
     } catch (err) {
       return { ok: false, reason: `cannot resolve ${next} (${why(err)})` };
     }

@@ -63,7 +63,7 @@ import { RestartPolicy } from "./restart-policy.js";
 import { ReconnectSupervisor } from "./reconnect-supervisor.js";
 import { ConnectionLifecycle } from "./connection-lifecycle.js";
 import { HealthPoll } from "./health-poll.js";
-import { ResolverSkewReporter } from "./resolver-skew.js";
+import { ResolverSkewReporter, probeResolverRevision } from "./resolver-skew.js";
 import { resolveAndWake, resolveAgentBinding, type AgentPidBinding } from "./pid-binding.js";
 import { decideNoDeliveryWarn, NO_WAKE_WARN_COOLDOWN_MS } from "./no-delivery-warn.js";
 import { machineGuid, type HostPlatform } from "./host-identity.js";
@@ -885,7 +885,7 @@ function ensureSummaryTimer(level: TetherConfig["notificationLevel"]): void {
   }, 5 * 60 * 1000);
 }
 
-async function connect(config: TetherConfig): Promise<void> {
+export async function connect(config: TetherConfig): Promise<void> {
   const agentList = resolveAgentList(config);
   if (agentList.length === 0) {
     log("idle: no agents configured (set bot-relay.tether.agentName / RELAY_AGENT_NAME, or bot-relay.tether.agents)");
@@ -912,6 +912,10 @@ async function connect(config: TetherConfig): Promise<void> {
 
   log(`connecting to ${config.endpoint}/mcp; watching ${agentList.length} agent(s): ${agentList.map((a) => `${a.name}(${a.llm})`).join(", ")}`);
   relayEndpoint = config.endpoint; // for the /api/snapshot PID-binding fallback
+  // ADR-0048 PR D: compare resolver revisions from /health (no token needed) on
+  // its own, NOT awaited and NOT gated on the MCP connect below: a relay that
+  // refuses the connection (a 401) still has a skew named, often its cause.
+  void probeResolverRevision({ endpoint: config.endpoint, reporter: resolverSkew, timeoutMs: HEALTH_POLL_TIMEOUT_MS });
   const url = new URL("/mcp", config.endpoint);
   // The SDK's StreamableHTTPClientTransport accepts request init for
   // header injection; the relay's HTTP transport reads X-Agent-Token

@@ -12,6 +12,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { checkContainment, type WalkSystem } from "../../src/approved-roots.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..", "..");
@@ -25,9 +26,17 @@ export interface ResolutionRow {
   env: Record<string, string>;
   expect: { kind: "flat" | "instance" | "explicit-db"; db: string; exists: boolean } | { kind: "error"; reason: string };
 }
+export interface PlacementRow {
+  name: string;
+  flavour: "win32" | "posix";
+  fs: Record<string, "dir" | "file" | { link: string }>;
+  input: string;
+  expect: { realPath: string; exists: boolean };
+}
 export interface ResolutionTable {
   about: string;
   win32: string;
+  placement_sim: { about: string; rows: PlacementRow[] };
   rows: ResolutionRow[];
 }
 
@@ -35,11 +44,51 @@ export function loadResolutionTable(): ResolutionTable {
   return JSON.parse(fs.readFileSync(path.join(HERE, "instance-resolution-table.json"), "utf-8")) as ResolutionTable;
 }
 
-/** A directory OUTSIDE every approved root (the repo's gitignored cache; never under /tmp or the row's home). */
-export function outsideDir(tag: string): string {
-  const d = path.join(REPO_ROOT, "node_modules", ".cache", `resolution-table-${tag}-${process.pid}`);
-  fs.mkdirSync(d, { recursive: true });
-  return d;
+/**
+ * A directory OUTSIDE every approved root, VERIFIED so: the containment check
+ * itself must refuse a DB under it as "outside the approved roots". (A directory
+ * inside the checkout is not enough: a checkout under /tmp puts it INSIDE the
+ * roots.) It is never created; the rows only point into it (a DB path, a dangling
+ * link's target). `candidates` is for the test of this choice.
+ */
+export function outsideDir(tag: string, candidates?: string[]): string {
+  const tried = candidates ?? [
+    path.join(path.parse(REPO_ROOT).root, `relay-fixture-outside-${tag}-${process.pid}`),
+    path.join(path.parse(REPO_ROOT).root, "var", "empty", `relay-fixture-outside-${tag}-${process.pid}`),
+  ];
+  for (const d of tried) {
+    if (fs.existsSync(d)) continue;
+    const c = checkContainment(path.join(d, "relay.db"));
+    if (!c.ok && c.reason.includes("outside the approved roots")) return d;
+  }
+  throw new Error(`no directory verified outside the approved roots (tried: ${tried.join(", ")})`);
+}
+
+/** The in-memory file system a placement_sim row describes, as the walk's WalkSystem. */
+export function simulatedWalk(row: PlacementRow): WalkSystem {
+  const P = row.flavour === "win32" ? path.win32 : path.posix;
+  const absent = (p: string) => Object.assign(new Error(`ENOENT: ${p}`), { code: "ENOENT" });
+  const entry = (p: string) => {
+    const e = row.fs[p];
+    if (e === undefined) throw absent(p);
+    return e;
+  };
+  return {
+    path: P,
+    lstat: (p) => {
+      const e = entry(p);
+      return { isSymbolicLink: () => typeof e === "object", uid: 0, mode: 0o40755 } as unknown as fs.Stats;
+    },
+    readlink: (p) => {
+      const e = entry(p);
+      if (typeof e !== "object") throw Object.assign(new Error(`EINVAL: ${p}`), { code: "EINVAL" });
+      return e.link;
+    },
+    realpath: (p) => {
+      entry(p);
+      return p;
+    },
+  };
 }
 
 /** Does this row run on the current platform? (Windows rows are explicitly unsupported: see the table's `win32`.) */

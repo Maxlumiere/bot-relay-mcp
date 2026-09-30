@@ -15,9 +15,10 @@ import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { loadResolutionTable, applyRow, expectedDb, rowApplies, outsideDir } from "./fixtures/instance-resolution-table.js";
+import { loadResolutionTable, applyRow, expectedDb, rowApplies, outsideDir, simulatedWalk } from "./fixtures/instance-resolution-table.js";
 
 const { resolveInstance } = await import("../src/resolve-instance.js");
+const { placeReal, checkContainment } = await import("../src/approved-roots.js");
 const table = loadResolutionTable();
 const BASE = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adr0048d-fx-")));
 const OUTSIDE = outsideDir("relay");
@@ -58,5 +59,39 @@ describe("ADR-0048 PR D — the RELAY resolves every row as the table says", () 
         });
       }
     });
+  });
+});
+
+// Codex #292 R1 #2 — the Windows part of the walk runs SIMULATED here, on every
+// platform (path.win32 + an in-memory file system): an absolute symlink/junction
+// target restarts the walk at ITS root, and a drive or UNC prefix is never
+// queued as a component.
+describe("ADR-0048 PR D — placement_sim: the real-path walk on a simulated file system (win32 drive, UNC, root-relative; a POSIX control)", () => {
+  it("the table carries win32 rows (no platform is only skipped)", () => {
+    expect(table.placement_sim.rows.filter((r) => r.flavour === "win32").length).toBeGreaterThanOrEqual(4);
+  });
+  for (const row of table.placement_sim.rows) {
+    it(row.name, () => {
+      expect(placeReal(row.input, simulatedWalk(row))).toMatchObject({ ok: true, realPath: row.expect.realPath, exists: row.expect.exists });
+    });
+  }
+});
+
+// Codex #292 R1 #3 — ${OUTSIDE} must really be outside: a directory inside the
+// checkout is INSIDE the roots when the checkout is under /tmp.
+describe("ADR-0048 PR D — outsideDir is VERIFIED outside the approved roots", () => {
+  it("the OUTSIDE the rows use is refused by the containment check as outside the approved roots", () => {
+    const c = checkContainment(path.join(OUTSIDE, "relay.db"));
+    expect(c.ok).toBe(false);
+    expect(c.ok ? "" : c.reason).toContain("outside the approved roots");
+  });
+  it("a candidate INSIDE the roots (a checkout under the temp directory) is skipped for one verified outside", () => {
+    const inside = path.join(fs.realpathSync(os.tmpdir()), `relay-fx-inside-${process.pid}`, "node_modules", ".cache");
+    const out = path.join(path.parse(inside).root, `relay-fx-outside-${process.pid}`);
+    expect(outsideDir("t", [inside, out])).toBe(out);
+  });
+  it("no verified candidate → it throws, never hands back an inside directory", () => {
+    const inside = path.join(fs.realpathSync(os.tmpdir()), `relay-fx-inside-${process.pid}`);
+    expect(() => outsideDir("t", [inside])).toThrow(/no directory verified outside the approved roots/);
   });
 });

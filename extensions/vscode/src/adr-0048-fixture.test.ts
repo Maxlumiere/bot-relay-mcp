@@ -12,8 +12,9 @@ import { describe, it, expect, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadResolutionTable, applyRow, expectedDb, rowApplies, outsideDir } from "../../../tests/fixtures/instance-resolution-table.js";
+import { loadResolutionTable, applyRow, expectedDb, rowApplies, outsideDir, simulatedWalk } from "../../../tests/fixtures/instance-resolution-table.js";
 import { resolveRelayDbPath, resolveVaultTokenPath } from "./vault-path.js";
+import { placeReal } from "../../../src/approved-roots.js";
 
 const table = loadResolutionTable();
 const BASE = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tether-fx-")));
@@ -41,4 +42,14 @@ describe("ADR-0048 PR D — Tether resolves every row exactly as the relay does"
       }
     });
   });
+});
+
+// Codex #292 R1 #2 — the win32 walk rows, simulated (path.win32 + an in-memory
+// file system), through the walk this bundle carries.
+describe("ADR-0048 PR D — placement_sim: Tether's bundled walk agrees on every simulated row", () => {
+  for (const row of table.placement_sim.rows) {
+    it(row.name, () => {
+      expect(placeReal(row.input, simulatedWalk(row))).toMatchObject({ ok: true, realPath: row.expect.realPath, exists: row.expect.exists });
+    });
+  }
 });

@@ -59,3 +59,32 @@ export class ResolverSkewReporter {
     }
   }
 }
+
+/**
+ * Ask the relay's /health for its resolver revision ONCE, on its own, at every
+ * connect. /health needs no token, so a relay that REFUSES Tether's MCP
+ * connection (a 401: often the very symptom of a skew, a vault Tether reads that
+ * the relay no longer writes) still has its revision compared; the health poll
+ * only starts after a successful connect. Never throws: an unreachable relay or
+ * a non-2xx answer is "cannot compare" (logged by the reporter).
+ */
+export async function probeResolverRevision(opts: {
+  endpoint: string;
+  reporter: ResolverSkewReporter;
+  timeoutMs: number;
+  fetchImpl?: typeof fetch;
+}): Promise<void> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+  let bodyText: string | null = null;
+  try {
+    const res = await doFetch(new URL("/health", opts.endpoint), { signal: controller.signal });
+    bodyText = res.ok ? await res.text() : null;
+  } catch {
+    bodyText = null;
+  } finally {
+    clearTimeout(timer);
+  }
+  opts.reporter.observe(bodyText);
+}

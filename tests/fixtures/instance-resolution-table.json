@@ -1,6 +1,60 @@
 {
   "about": "ADR-0048 PR D: ONE state table for the instance resolver, run by the relay (tests/adr-0048-d-fixture.test.ts, through resolveInstance) and by Tether (extensions/vscode/src/adr-0048-fixture.test.ts, through vault-path). Both must agree on every row. Placeholders: ${HOME} is the row's temporary home; ${OUTSIDE} is a directory outside every approved root. Every row MUST declare its platform stance (posix | all) and its containment stance (strict | n/a); a test fails on a row without them.",
-  "win32": "UNSUPPORTED in CI: no Windows runner exercises these rows. On win32 the resolver labels every path result containment \"roots-only\" (the approved roots and the real-path walk apply; the POSIX ownership rules cannot), and symlink rows would need privileges CI does not have.",
+  "win32": "The rows above need a real file system and symlinks, which no Windows CI runner provides with the privileges they need, so they do not run on win32; there the resolver labels every path result containment \"roots-only\" (the approved roots and the real-path walk apply; the POSIX ownership rules cannot). The Windows-specific part of the walk, where a symlink or junction with an ABSOLUTE target (a drive, a UNC share, a root-relative path) restarts it, runs SIMULATED on every platform: the placement_sim rows below, through path.win32 and an in-memory file system.",
+  "placement_sim": {
+    "about": "The real-path walk (placeReal in src/approved-roots.ts) on a SIMULATED file system, run by both sides on every platform. flavour picks path.win32 or path.posix; fs maps each existing path to \"dir\", \"file\" or { \"link\": target }; anything else is absent (ENOENT). expect is where the kernel would put `input`.",
+    "rows": [
+      {
+        "name": "win32: a junction to an absolute DRIVE path restarts the walk at C:\\ (the drive is never a component)",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "C:\\Users\\alice\\relay-data" }, "C:\\Users\\alice\\relay-data": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "C:\\Users\\alice\\relay-data\\relay.db", "exists": false }
+      },
+      {
+        "name": "win32: a link to ANOTHER drive lands on that drive",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "D:\\relay" }, "D:\\relay": "dir", "D:\\relay\\relay.db": "file" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "D:\\relay\\relay.db", "exists": true }
+      },
+      {
+        "name": "win32: a link to a UNC share restarts at \\\\server\\share\\ (the server and share are never components)",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "\\\\fileserver\\share\\relay" }, "\\\\fileserver\\share\\relay": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "\\\\fileserver\\share\\relay\\relay.db", "exists": false }
+      },
+      {
+        "name": "win32: a ROOT-RELATIVE target (\\data) keeps the drive the walk is on",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "\\data\\relay" }, "C:\\data": "dir", "C:\\data\\relay": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "C:\\data\\relay\\relay.db", "exists": false }
+      },
+      {
+        "name": "win32: a RELATIVE target is spliced in the link's own directory (control)",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "relay-data" }, "C:\\Users\\alice\\relay-data": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "C:\\Users\\alice\\relay-data\\relay.db", "exists": false }
+      },
+      {
+        "name": "win32: a target written with FORWARD slashes (D:/relay/data) is walked one component at a time (the link on the way is followed)",
+        "flavour": "win32",
+        "fs": { "C:\\Users": "dir", "C:\\Users\\alice": "dir", "C:\\Users\\alice\\.bot-relay": { "link": "D:/relay/data" }, "D:\\relay": { "link": "E:\\store" }, "E:\\store": "dir", "E:\\store\\data": "dir" },
+        "input": "C:\\Users\\alice\\.bot-relay\\relay.db",
+        "expect": { "realPath": "E:\\store\\data\\relay.db", "exists": false }
+      },
+      {
+        "name": "posix: an absolute target restarts at / (control: the same walk, the other flavour)",
+        "flavour": "posix",
+        "fs": { "/home": "dir", "/home/alice": "dir", "/home/alice/.bot-relay": { "link": "/srv/relay" }, "/srv": "dir", "/srv/relay": "dir" },
+        "input": "/home/alice/.bot-relay/relay.db",
+        "expect": { "realPath": "/srv/relay/relay.db", "exists": false }
+      }
+    ]
+  },
   "rows": [
     {
       "name": "a fresh home (no relay home at all) is a positive absence: the flat DB",
