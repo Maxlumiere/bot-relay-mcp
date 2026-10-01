@@ -55,3 +55,21 @@ v2.2.1 introduced the guard as an immediate exit on non-TTY stdin. That over-cor
 The 1500ms window was itself wrong, and in a way nobody had reported because nobody had tried: **it exited before any container could start.** Measured against the published binary, a client connecting at 3000ms got exit 3 at ~1675ms — it never saw the server. That is the ordinary case for container runtimes, systemd units, process supervisors and MCP proxies, where stdin is a pipe and the client connects on its own schedule.
 
 The current guard replaces the undecidable question *"has enough time passed?"* with a decidable one: *"is anyone there?"* — readable means yes, EOF means no. The original mistake it was built to catch (running the stdio server where a daemon was meant) is still caught: stdin closed with no client is still exit 3.
+
+## Build identity: what a running process reports
+
+A merge or an install changes the files on disk, but a process that is already running keeps the code it loaded when it started. So every relay process reports the build it LOADED, as `build` in `/health`, `health_check`, `whoami` and `relay where --json`:
+
+- `build_id` is the **code id**: a hash of `package.json` and every file under `dist/`, written into `dist/build-info.js` by `npm run build`. An identical rebuild gives the same id. A build made with plain `tsc` (without that last step) reports `unbuilt`, which matches nothing.
+- `deps_id` is the **dependency id**: a hash of npm's own record of the installed tree (`node_modules/.package-lock.json`, which npm rewrites on every install, update or removal) and of every native addon (`*.node`) under `node_modules`, which `npm rebuild` can change without touching that record. The process takes it once, as the very first thing it does when it starts. `deps_state` says whether it is `known`, `unknown` or an `error`.
+- `commit`, `dirty`, `built_at` and `node` are for people reading it.
+
+**The boundary: what a restart is needed for.** The identity covers exactly what a long-lived process (the daemon, or the stdio connector each agent window starts) loads when it starts and keeps for its whole life: `dist/`, `package.json` and the production dependencies. It does NOT cover `hooks/*.sh` or `bin/relay`: they run fresh on every call, so a change to them takes effect on the next call, and no window needs a restart for it.
+
+An install whose stamp does not match its own content (a plain `tsc` rebuild, a hand edit) is reported as inconsistent: rebuild with `npm run build`. So is one whose `node_modules` cannot be read completely (a symlink cycle, a dangling link, a record that is not a JSON object).
+
+**Supported installers: npm.** The dependency id reads npm's own record. An install made by another tool (yarn, pnpm) or copied by hand has no `node_modules/.package-lock.json`, so its dependencies are `unknown`: never shown as current, and the deploy check fails it.
+
+**Known limits, both in the safe direction:**
+- A native addon that a process loads later, not at start (the SQLite driver loads on first use), and that changed on disk after the process started, reads as stale although the process may have loaded the new one. A restart resolves it.
+- If a different npm version rewrites the record of an identical tree in a different format, the processes started before read as stale. A restart resolves it.

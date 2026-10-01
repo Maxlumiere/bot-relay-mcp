@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixed — `zod-to-json-schema` is a declared dependency
+
+The relay imports `zod-to-json-schema` directly, but it was only installed as a dependency of the MCP SDK. It is now declared, so the relay's own copy is the one that is installed and resolved.
+
+### Added — every relay process reports the build it loaded, not the one on disk
+
+A merge and an install change the files on disk, but a process that is already running keeps the code it loaded, so "deployed" was a claim about disk. Every build now carries a stamp, and every process reports the stamp it loaded:
+
+- **`build`** in `/health`, `health_check`, `whoami` and `relay where --json`:
+  - `build_id`: a hash of `package.json` and the build's `dist/` files;
+  - `deps_id`: a hash of the installed dependencies (npm's own record of the installed tree, plus every native addon), taken when the process starts; `deps_state` is `known`, or `unknown` for an install npm did not make (only npm installs are supported);
+  - for humans: the `commit`, whether that tree was `dirty`, `built_at` and the `node` version.
+  On a stdio connector, `health_check` and `whoami` report the connector's own build, so a connector still running old code shows it.
+- **Fixed at load.** The value is taken once when the process starts and is never read from disk again.
+- **Only what a running process keeps.** `hooks/*.sh` and `bin/relay` run fresh on every call, so they are not part of it: changing them needs no restart. See "Build identity" in `docs/deployment.md`.
+- **An identical rebuild is not a new build:** the same output gives the same `build_id`. A build made with plain `tsc` (without the stamping step) reports `unbuilt`, which never matches any build.
+- **Each connector records itself.** Every stdio connector an agent window starts writes one row about itself when it starts (schema v26, table `connectors`): its process, the window it belongs to, the install it was loaded from and the build it loaded. It writes only its own row. A row whose process has ended is never treated as live, and the daemon removes such rows after 7 days. This is what the coming deploy check reads. A row counts as this machine's only when its host id equals this machine's id; when this machine's id cannot be read, no row is treated as live and none is removed. Its start times are stored only in the UTC form (ending ` UTC`); the table refuses any other. A connector that cannot write its row says so on stderr at the default log level ("connector not registered: <reason>; this window will read UNKNOWN on the board") and keeps serving. Start times have whole-second resolution, so a process id reused within the same second as the previous connector's start is read as that connector (a documented limit).
+
 ### Fixed — a live process no longer reads dead when two relay processes run in different time zones
 
 The relay tells a live agent window from a dead one (and from a new process that reused its PID) by the process start time that `ps` prints. That time was printed in the reading process's own time zone, so the same live process read differently under two `TZ` values. A connector and the daemon with different `TZ` settings would read a live window as dead. The start time now has one spelling everywhere: `TZ=UTC LC_ALL=C ps -o lstart= -p PID` followed by ` UTC` (for example `Thu Oct  1 07:37:33 2026 UTC`). It is read by one function in the relay (`processStartedAt`) and one in the hooks (`relay_pid_start`), which give byte-identical results. The ` UTC` ending records which clock printed the time: a start time is compared only with a reading in its own form. Without it, on a machine whose clock is behind UTC, a process reusing an old process id exactly that many hours later could have matched the old process's time.

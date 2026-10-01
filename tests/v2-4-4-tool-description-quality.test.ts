@@ -209,7 +209,7 @@ describe("v2.4.4 — tool description quality", () => {
       get_standup: "50fc69fcf51b6d21632b5e9be632f570c7cee8b1cbc18999a82d0a34dc2b1519",
       get_task: "de353b956b82f757829007fd6b9d7b7c7b89500dbf6b60681cf7080b574fce9b",
       get_tasks: "1e1416a86554d1e17346d3cc661453a4536768dfad4ef492ce60beb9aa597e7e",
-      health_check: "afa739887b607ad5aabb79acb580dde646622fd0e1fed4052ca74f11ddafa3e4", // #tools-list-visibility: breadcrumb pointing at the `surface` field (profile + hidden tools) — the pointer lives in tools/list even though the data cannot
+      health_check: "562ce788c99cce3e518a65e92a65c450dd4b81f3f024a2c5c117b00925cc8d30", // #tools-list-visibility: breadcrumb pointing at the `surface` field (profile + hidden tools) — the pointer lives in tools/list even though the data cannot
       join_channel: "46b2b3247d5a1115e1f72635bdfae99b63e88b344bbf3482fce93410321de45f",
       leave_channel: "654ef16a3e05b55712b155643cc92b8536b9795fa68037f203f1fb5cb7b3f9d0",
       list_webhooks: "8c0a676339308cdf9591e789636ec49ab681eed8ff662815c2bf2a9de5f87449",
@@ -233,7 +233,7 @@ describe("v2.4.4 — tool description quality", () => {
       task_schema_get: "4ec18861f288b8e7122e43834d86715da037eecd623bd98eec4ce368460b699f",
       unregister_agent: "dcd94807ba629527459cb0df2b5d73427d0b09bea7f756a47700e000685736ee",
       update_task: "05aacb80e85bf615a033a7611bb58d673dbb7bd86e5e33f846243f323cd02931",
-      whoami: "ea95167d6d8c3f910c70faf842fafae2f9b8d4bdd5ebe0b1a93a67ae22c3a828",
+      whoami: "586985150ecf63e7e63ad761dec914e7c63cff46ff1e2d61466577f4b4f89c5c",
     };
 
     const actualHashes: Record<string, string> = {};

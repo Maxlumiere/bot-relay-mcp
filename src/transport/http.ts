@@ -18,7 +18,7 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
 import { verifyToken } from "../auth.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
 import { fireWebhooks } from "../webhooks.js";
@@ -42,6 +42,7 @@ import { requestContext } from "../request-context.js";
 import { ipInAnyCidr } from "../cidr.js";
 import { VERSION } from "../version.js";
 import { RESOLVER_REVISION } from "../resolve-instance.js";
+import { LOADED_BUILD } from "../loaded-build.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import type { Server } from "http";
 
@@ -546,6 +547,8 @@ export function startHttpServer(port: number, host: string): Server {
       protocol_version: PROTOCOL_VERSION,
       // ADR-0048 PR D: Tether bundles this resolver and compares this value to its own.
       resolver_revision: RESOLVER_REVISION,
+      // ADR-0047: the build the daemon LOADED (fixed at load, never re-read from disk).
+      build: LOADED_BUILD,
       transport: "http",
       auth_required: !!config.http_secret,
       // v2.15.2 — MONOTONIC process uptime (process.uptime(), NOT Date.now
@@ -1594,6 +1597,21 @@ export function startHttpServer(port: number, host: string): Server {
   // Unref so the timer never blocks process shutdown.
   const reaper = setInterval(reapIdleSessions, HTTP_REAPER_INTERVAL_MS);
   if (typeof reaper.unref === "function") reaper.unref();
+
+  // ADR-0047 (D5) — the ONE purger of `connectors` rows: the daemon, at startup and
+  // hourly, deleting only rows POSITIVELY dead for over 7 days. Never on a stdio
+  // connector (a test pins that). Best-effort: correctness is read-time.
+  const purgeConnectors = () => {
+    try {
+      const { purged } = purgeDeadConnectors();
+      if (purged > 0) log.info(`[connectors] purged ${purged} dead connector row(s)`);
+    } catch (err) {
+      log.warn(`[connectors] purge failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  purgeConnectors();
+  const connectorPurge = setInterval(purgeConnectors, 60 * 60 * 1000);
+  if (typeof connectorPurge.unref === "function") connectorPurge.unref();
 
   // #60 — S2 wake-coverage detector (ADR-0023). HTTP DAEMON ONLY (this is the
   // long-lived shared process; a per-terminal stdio server must NOT run a

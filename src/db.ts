@@ -17,6 +17,7 @@ import {
   agentProcessAdvertised,
   anchorLivenessVerdict,
   isPidAlive,
+  processStartedAt,
   observeStartTokenForm,
   isUtcStartToken,
   START_TOKEN_UTC_SUFFIX,
@@ -24,6 +25,9 @@ import {
   type LegacyStartProbe,
   type KillProbe,
 } from "./liveness.js";
+import { fileURLToPath } from "url";
+import type { LoadedBuild } from "./loaded-build.js";
+import { RESOLVER_REVISION } from "./resolve-instance.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -431,6 +435,7 @@ function applySchemaSetup(db: CompatDatabase): void {
   migrateSchemaToV2_23(db);
   migrateSchemaToV2_24(db);
   migrateSchemaToV2_25(db);
+  migrateSchemaToV2_26(db);
   seedBuiltinTaskSchemas(db);
   finalizeSchemaVersion(db);
   purgeOldRecords(db);
@@ -650,7 +655,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 25;
+export const CURRENT_SCHEMA_VERSION = 26;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -749,6 +754,7 @@ export function applyMigration(from: number, to: number): void {
     [22, 23],
     [23, 24],
     [24, 25],
+    [25, 26],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -2005,6 +2011,181 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
       "BEGIN SELECT RAISE(ABORT, 'agent_bindings: foreign edge_id refused (no federation ingress before v2.3; " +
       "rows are stamped from relay_edge only)'); END",
   );
+}
+
+/**
+ * ADR-0047 (schema v26) — `connectors`: one row per relay CONNECTOR PROCESS (a
+ * stdio server an agent window started), so the board can compare what each one
+ * RUNS with what is installed.
+ *   - ONE WRITER PER ROW, by construction: a connector writes only the row keyed by
+ *     its own (pid, start token), once at startup (recordOwnConnector takes no pid).
+ *     The daemon's purge deletes only POSITIVELY dead rows (ADR-0042 R3).
+ *   - `parent_pid/parent_start` = the WINDOW anchor the connector detected (the same
+ *     detection `relay bind` uses), NULL when detection found none.
+ *   - `install_dir` = the realpath of the install the connector loaded from; the build
+ *     columns are the stamp it LOADED (build-info.ts), never re-read.
+ *   - NO status column: liveness is derived at read time from the pid AND its start
+ *     token (liveConnectors), so a stored status can never outlive the process.
+ *   - ADR-0043: every key starts with edge_id, and a foreign edge is refused.
+ *   - Start tokens are the UTC form ONLY (a CHECK): no legacy acceptance here.
+ */
+function migrateSchemaToV2_26(db: CompatDatabase): void {
+  ensureRelayEdge(db);
+  db.exec("CREATE TABLE IF NOT EXISTS connectors " + CONNECTORS_COLUMNS);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_connectors_parent ON connectors(edge_id, host_id, parent_pid, parent_start)");
+  db.exec(
+    "CREATE TRIGGER IF NOT EXISTS connectors_local_edge_insert BEFORE INSERT ON connectors " +
+      "WHEN NEW.edge_id IS NOT (SELECT edge_id FROM relay_edge WHERE id = 1) " +
+      "BEGIN SELECT RAISE(ABORT, 'connectors: foreign edge_id refused (no federation ingress before v2.3; " +
+      "rows are stamped from relay_edge only)'); END",
+  );
+  db.exec(
+    "CREATE TRIGGER IF NOT EXISTS connectors_local_edge_update BEFORE UPDATE OF edge_id ON connectors " +
+      "WHEN NEW.edge_id IS NOT (SELECT edge_id FROM relay_edge WHERE id = 1) " +
+      "BEGIN SELECT RAISE(ABORT, 'connectors: foreign edge_id refused (no federation ingress before v2.3; " +
+      "rows are stamped from relay_edge only)'); END",
+  );
+}
+
+/** ADR-0047 — the ONE definition of the connectors columns (a literal: statically resolvable SQL). */
+const CONNECTORS_COLUMNS =
+  "(edge_id TEXT NOT NULL, pid INTEGER NOT NULL, pid_start TEXT NOT NULL, parent_pid INTEGER, parent_start TEXT, " +
+  "build_id TEXT NOT NULL, deps_id TEXT, deps_state TEXT, node TEXT, commit_sha TEXT, dirty INTEGER, built_at TEXT, resolver_revision TEXT, " +
+  "install_dir TEXT NOT NULL, host_id TEXT, started_at TEXT NOT NULL, " +
+  // Born UTC-only (architect ae078834, condition 2): every start token here carries
+  // the provenance suffix (START_TOKEN_UTC_SUFFIX, pinned to this literal by test).
+  // A legacy (unsuffixed) token can never enter, so no reader here needs legacy acceptance.
+  "CHECK (substr(pid_start, -4) = ' UTC'), CHECK (parent_start IS NULL OR substr(parent_start, -4) = ' UTC'), " +
+  "PRIMARY KEY (edge_id, pid, pid_start))";
+
+/** The install this module was loaded from (dist/.. or src/..), as a realpath. */
+function ownInstallDir(): string {
+  const dir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return dir;
+  }
+}
+
+export interface ConnectorRow {
+  edge_id: string;
+  pid: number;
+  pid_start: string;
+  parent_pid: number | null;
+  parent_start: string | null;
+  build_id: string;
+  deps_id: string | null;
+  deps_state: string | null;
+  node: string | null;
+  commit_sha: string | null;
+  dirty: number | null;
+  built_at: string | null;
+  resolver_revision: string | null;
+  install_dir: string;
+  host_id: string | null;
+  started_at: string;
+}
+
+/**
+ * ADR-0047 — stamp THIS connector's row: its own pid and start token, the window
+ * anchor it detected, the install it was loaded from and the build it LOADED (the
+ * caller's LOADED_BUILD: db.ts does not import loaded-build, which would put the
+ * dependency walk on every CLI path). It takes no pid, so it cannot write any
+ * other process's row. Returns false (and
+ * writes nothing) when its own start token cannot be read: a pid without one is
+ * not an identity. The caller treats a failure as best-effort: the window then
+ * reads UNKNOWN, the safe direction.
+ */
+export function recordOwnConnector(input: { parent: { pid: number; startedAt: string } | null; build: LoadedBuild }): boolean {
+  const start = processStartedAt(process.pid);
+  if (!start) return false;
+  const db = getDb();
+  const parent = input.parent && input.parent.startedAt ? input.parent : null;
+  db.prepare(
+    "INSERT OR REPLACE INTO connectors (edge_id, pid, pid_start, parent_pid, parent_start, build_id, deps_id, deps_state, node, " +
+      "commit_sha, dirty, built_at, resolver_revision, install_dir, host_id, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(
+    getLocalEdgeId(db),
+    process.pid,
+    start,
+    parent ? parent.pid : null,
+    parent ? parent.startedAt : null,
+    input.build.build_id,
+    input.build.deps_id,
+    input.build.deps_state,
+    input.build.node,
+    input.build.commit,
+    input.build.dirty === null ? null : input.build.dirty ? 1 : 0,
+    input.build.built_at,
+    RESOLVER_REVISION,
+    ownInstallDir(),
+    getOwnHostId(),
+    now(),
+  );
+  return true;
+}
+
+/**
+ * This host's rows on this edge (a row from another host cannot be probed here).
+ * Host identity is POSITIVE (Codex #295 R1 P2-3): a row is ours only when its
+ * host_id EQUALS our own (`=`, never `IS`, so a NULL host id never matches), and
+ * an unknown own host id selects NOTHING. A DB copied to another host whose id is
+ * also unreadable would otherwise probe local pids for rows of remote processes,
+ * and the purger would delete live rows.
+ */
+function ownHostConnectorRows(db: CompatDatabase): ConnectorRow[] {
+  const ownHost = getOwnHostId();
+  if (!ownHost) return [];
+  return db
+    .prepare("SELECT * FROM connectors WHERE edge_id = ? AND host_id = ?")
+    .all(getLocalEdgeId(db), ownHost) as ConnectorRow[];
+}
+
+/**
+ * ADR-0047 — the LIVE connector rows on this host: the pid is running AND its
+ * start token equals the recorded one (the deploy-gate identity pattern). A dead
+ * pid, a reused pid, or an unreadable start token is never live.
+ *
+ * KNOWN LIMIT (Codex #295 R1 P2-2, ruled a documented limit): the start token
+ * (`ps -o lstart=`) has whole-second resolution. A pid reused within the SAME
+ * second as its previous connector's start reads as that connector, and the new
+ * connector's INSERT OR REPLACE overwrites the old row. Not reproduced; the
+ * window is one second on one pid.
+ */
+export function liveConnectors(opts: { startOf?: (pid: number) => string | null } = {}): ConnectorRow[] {
+  const startOf = opts.startOf ?? ((pid: number) => processStartedAt(pid));
+  return ownHostConnectorRows(getDb()).filter((r) => {
+    const s = startOf(r.pid);
+    return s !== null && s === r.pid_start;
+  });
+}
+
+/**
+ * ADR-0047 (D5) — the ONE purger, called by the daemon only: deletes rows older
+ * than 7 days whose process is POSITIVELY dead (the pid is gone, or its start
+ * token differs). A live pid whose start token cannot be read is kept. Correctness
+ * never depends on this: liveness is derived at read time.
+ */
+export function purgeDeadConnectors(
+  opts: { startOf?: (pid: number) => string | null; isAlive?: (pid: number) => boolean } = {},
+): { purged: number } {
+  const startOf = opts.startOf ?? ((pid: number) => processStartedAt(pid));
+  const isAlive = opts.isAlive ?? ((pid: number) => isPidAlive(pid));
+  const db = getDb();
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const del = db.prepare("DELETE FROM connectors WHERE edge_id = ? AND pid = ? AND pid_start = ?");
+  let purged = 0;
+  for (const r of ownHostConnectorRows(db)) {
+    if (r.started_at >= cutoff) continue;
+    let dead = !isAlive(r.pid);
+    if (!dead) {
+      const s = startOf(r.pid);
+      dead = s !== null && s !== r.pid_start;
+    }
+    if (dead) purged += del.run(r.edge_id, r.pid, r.pid_start).changes;
+  }
+  return { purged };
 }
 
 const MESSAGE_PRIORITY_REFUSED =

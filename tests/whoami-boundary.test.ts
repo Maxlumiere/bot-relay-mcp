@@ -60,7 +60,7 @@ afterAll(() => {
 });
 
 // edge_id (ADR-0043): an identifier, never a credential — it proves nothing.
-const ALLOWED = ["agent_name", "role", "capabilities", "instance_id", "db_path", "host_id", "edge_id"].sort();
+const ALLOWED = ["agent_name", "role", "capabilities", "instance_id", "db_path", "host_id", "edge_id", "build"].sort();
 
 function callWhoamiAs(name: string): Record<string, unknown> {
   const res = requestContext.run({ transport: "stdio", callerName: name }, () => handleWhoami());
