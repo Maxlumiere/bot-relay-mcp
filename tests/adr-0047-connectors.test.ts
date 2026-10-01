@@ -31,7 +31,7 @@ process.env.RELAY_DB_PATH = DB_FILE;
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 const db = await import("../src/db.js");
-const { processStartedAt, getOwnHostId } = await import("../src/liveness.js");
+const { processStartedAt, getOwnHostId, _resetOwnHostIdForTests } = await import("../src/liveness.js");
 const { LOADED_BUILD } = await import("../src/loaded-build.js");
 const { BUILD_INFO: DIST_STAMP } = await import("../dist/build-info.js");
 
@@ -123,6 +123,24 @@ describe("ADR-0047 PR 2 — liveConnectors: liveness from the pid AND its start 
   it("a row from ANOTHER host is not live here (it cannot be probed from this host)", () => {
     plant({ pid: process.pid, pid_start: processStartedAt(process.pid) as string, host_id: "another-host" });
     expect(db.liveConnectors()).toEqual([]);
+  });
+  it("host identity is POSITIVE: a row with NO host id is never this host's (never live, never probed)", () => {
+    plant({ pid: process.pid, pid_start: processStartedAt(process.pid) as string, host_id: null });
+    expect(db.liveConnectors()).toEqual([]);
+  });
+  it("an UNKNOWN own host id probes nothing: no row is live, and the purger deletes nothing (Codex #295 R1 P2-3)", () => {
+    const old = new Date(Date.now() - 8 * DAY).toISOString();
+    const d = deadPid();
+    plant({ pid: d.pid, pid_start: d.start, started_at: old, host_id: null }); // old + dead, origin unknown
+    plant({ pid: process.pid, pid_start: processStartedAt(process.pid) as string, host_id: null });
+    _resetOwnHostIdForTests(null);
+    try {
+      expect(db.liveConnectors()).toEqual([]);
+      expect(db.purgeDeadConnectors().purged).toBe(0);
+    } finally {
+      _resetOwnHostIdForTests();
+    }
+    expect(rows()).toHaveLength(2);
   });
   it("an unreadable start token is NOT live (never assumed)", () => {
     db.recordOwnConnector({ parent: null, build: LOADED_BUILD });

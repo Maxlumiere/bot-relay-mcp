@@ -754,6 +754,7 @@ export function applyMigration(from: number, to: number): void {
     [22, 23],
     [23, 24],
     [24, 25],
+    [25, 26],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -2119,17 +2120,32 @@ export function recordOwnConnector(input: { parent: { pid: number; startedAt: st
   return true;
 }
 
-/** This host's rows on this edge (a row from another host cannot be probed here). */
+/**
+ * This host's rows on this edge (a row from another host cannot be probed here).
+ * Host identity is POSITIVE (Codex #295 R1 P2-3): a row is ours only when its
+ * host_id EQUALS our own (`=`, never `IS`, so a NULL host id never matches), and
+ * an unknown own host id selects NOTHING. A DB copied to another host whose id is
+ * also unreadable would otherwise probe local pids for rows of remote processes,
+ * and the purger would delete live rows.
+ */
 function ownHostConnectorRows(db: CompatDatabase): ConnectorRow[] {
+  const ownHost = getOwnHostId();
+  if (!ownHost) return [];
   return db
-    .prepare("SELECT * FROM connectors WHERE edge_id = ? AND host_id IS ?")
-    .all(getLocalEdgeId(db), getOwnHostId()) as ConnectorRow[];
+    .prepare("SELECT * FROM connectors WHERE edge_id = ? AND host_id = ?")
+    .all(getLocalEdgeId(db), ownHost) as ConnectorRow[];
 }
 
 /**
  * ADR-0047 — the LIVE connector rows on this host: the pid is running AND its
  * start token equals the recorded one (the deploy-gate identity pattern). A dead
  * pid, a reused pid, or an unreadable start token is never live.
+ *
+ * KNOWN LIMIT (Codex #295 R1 P2-2, ruled a documented limit): the start token
+ * (`ps -o lstart=`) has whole-second resolution. A pid reused within the SAME
+ * second as its previous connector's start reads as that connector, and the new
+ * connector's INSERT OR REPLACE overwrites the old row. Not reproduced; the
+ * window is one second on one pid.
  */
 export function liveConnectors(opts: { startOf?: (pid: number) => string | null } = {}): ConnectorRow[] {
   const startOf = opts.startOf ?? ((pid: number) => processStartedAt(pid));
