@@ -199,6 +199,33 @@ describe("ADR-0047 PR 2 — purgeDeadConnectors: POSITIVELY dead and older than 
   });
 });
 
+describe("ADR-0047 PR 2 — a connector that cannot register says so, LOUDLY (Codex #295 R2)", () => {
+  it("a failed INSERT (an unsuffixed window anchor refused by the CHECK) → a WARN naming the reason; nothing written", async () => {
+    const { stampOwnConnector } = await import("../src/transport/stdio.js");
+    const warns: string[] = [];
+    const ok = stampOwnConnector({ pid: 4242, startedAt: "Mon Sep 28 11:17:16 2026" }, LOADED_BUILD, undefined, (m) => warns.push(m));
+    expect(ok).toBe(false);
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toMatch(/^\[stdio\] connector not registered: .*CHECK constraint failed.*; this window will read UNKNOWN on the board$/);
+    expect(rows()).toEqual([]);
+  });
+  it("an unreadable OWN start token (the writer returns false) → a WARN naming the reason", async () => {
+    const { stampOwnConnector } = await import("../src/transport/stdio.js");
+    const warns: string[] = [];
+    expect(stampOwnConnector(null, LOADED_BUILD, () => false, (m) => warns.push(m))).toBe(false);
+    expect(warns).toEqual([
+      "[stdio] connector not registered: this process's own start time could not be read; this window will read UNKNOWN on the board",
+    ]);
+  });
+  it("a registered connector warns nothing", async () => {
+    const { stampOwnConnector } = await import("../src/transport/stdio.js");
+    const warns: string[] = [];
+    expect(stampOwnConnector(null, LOADED_BUILD, undefined, (m) => warns.push(m))).toBe(true);
+    expect(warns).toEqual([]);
+    expect(rows()).toHaveLength(1);
+  });
+});
+
 describe("ADR-0047 PR 2 — db.ts takes the build from its caller", () => {
   it("db.ts imports loaded-build for its TYPE only (a value import would put the dependency walk on every CLI path)", () => {
     const src = fs.readFileSync(path.join(REPO_ROOT, "src", "db.ts"), "utf-8");
@@ -217,6 +244,8 @@ describe("ADR-0047 PR 2 — end to end: a REAL stdio connector stamps its row at
       env: { PATH: process.env.PATH ?? "", HOME: tmp, RELAY_DB_PATH: path.join(tmp, "relay.db"), RELAY_CONFIG_PATH: path.join(tmp, "none.json"), RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1", ...env },
       stderr: "pipe",
     });
+    let stderr = "";
+    transport.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
     const client = new Client({ name: "adr0047-pr2", version: "0" }, { capabilities: {} });
     await client.connect(transport);
     const pid = transport.pid as number;
@@ -224,7 +253,7 @@ describe("ADR-0047 PR 2 — end to end: a REAL stdio connector stamps its row at
       const r = spawnSync("sqlite3", ["-readonly", "-json", path.join(tmp, "relay.db"), "SELECT pid, pid_start, parent_pid, install_dir, build_id, deps_id FROM connectors"], { encoding: "utf-8" });
       return (r.stdout.trim() ? JSON.parse(r.stdout) : []) as Array<Record<string, unknown>>;
     };
-    return { pid, read, close: () => client.close() };
+    return { pid, read, client, stderr: () => stderr, dbPath: path.join(tmp, "relay.db"), close: () => client.close() };
   }
   it("its row: its own pid and start token, the install it loaded (realpath), the build it loaded; no agent name needed", async () => {
     const c = await connect(path.join(REPO_ROOT, "dist", "index.js"), "plain");
@@ -242,6 +271,24 @@ describe("ADR-0047 PR 2 — end to end: a REAL stdio connector stamps its row at
         const comm = spawnSync("ps", ["-o", "comm=", "-p", String(r[0].parent_pid)], { encoding: "utf-8" }).stdout.trim();
         expect(path.basename(comm)).toMatch(/^(claude|codex)/);
       }
+    } finally {
+      await c.close();
+    }
+  }, 60_000);
+  it("a REAL connector whose INSERT fails prints the reason on stderr (default log level) AND keeps serving MCP (Codex #295 R2)", async () => {
+    const entry = path.join(REPO_ROOT, "dist", "index.js");
+    const first = await connect(entry, "loud");
+    await first.close(); // the DB now exists with the full schema
+    const Better = (await import("better-sqlite3")).default;
+    const h = new Better(first.dbPath);
+    h.exec("CREATE TRIGGER planted_connector_failure BEFORE INSERT ON connectors BEGIN SELECT RAISE(ABORT, 'planted insert failure'); END");
+    h.close();
+    const c = await connect(entry, "loud");
+    try {
+      const tools = await c.client.listTools(); // still serving
+      expect(tools.tools.length).toBeGreaterThan(0);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(c.stderr()).toMatch(/connector not registered: planted insert failure; this window will read UNKNOWN on the board/);
     } finally {
       await c.close();
     }

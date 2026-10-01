@@ -281,6 +281,29 @@ function captureSessionId(): void {
  * engaged (TTY attached, or RELAY_SKIP_TTY_CHECK=1), callers pass nothing
  * and the SDK defaults to process.stdin / process.stdout — unchanged.
  */
+/**
+ * ADR-0047 — stamp this connector's own `connectors` row, and say so LOUDLY when it
+ * cannot (Codex #295 R2): a failed INSERT (e.g. the UTC-only CHECK refusing an
+ * unsuffixed window anchor) or an unreadable own start token leaves this window
+ * UNKNOWN on the board, and that must never be invisible at the default log level.
+ * Never throws: MCP keeps serving either way. Returns whether the row was written.
+ */
+export function stampOwnConnector(
+  parent: AgentProcess | null,
+  build: typeof LOADED_BUILD,
+  record: typeof recordOwnConnector = recordOwnConnector,
+  warn: (message: string) => void = (m) => log.warn(m),
+): boolean {
+  const notRegistered = (why: string) => warn(`[stdio] connector not registered: ${why}; this window will read UNKNOWN on the board`);
+  try {
+    if (record({ parent, build })) return true;
+    notRegistered("this process's own start time could not be read");
+  } catch (err) {
+    notRegistered(err instanceof Error ? err.message : String(err));
+  }
+  return false;
+}
+
 export async function startStdioServer(
   stdin?: Readable,
   stdout?: Writable,
@@ -298,13 +321,9 @@ export async function startStdioServer(
   // its own `connectors` row (its pid and start token, that window, the install it
   // loaded from, the build it LOADED), so the board can compare what it runs with
   // what is installed. Best-effort: a failed stamp leaves the window UNKNOWN, the
-  // safe direction, and never blocks startup.
+  // safe direction, and never blocks startup, but it is never silent.
   detectedAgentProcess = detectAgentProcess();
-  try {
-    recordOwnConnector({ parent: detectedAgentProcess, build: LOADED_BUILD });
-  } catch (err) {
-    log.debug(`[stdio] connector stamp skipped: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  stampOwnConnector(detectedAgentProcess, LOADED_BUILD);
   const name = process.env.RELAY_AGENT_NAME;
   if (name && name !== "default") {
     stampDetectedAgentLiveness(name);
