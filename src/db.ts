@@ -11,7 +11,19 @@ import os from "os";
 // "type":"module", so a bare `require(...)` is undefined at runtime — importing
 // createRequire from "module" is the supported way to do a sync require in ESM.
 import { createRequire } from "module";
-import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised, anchorLivenessVerdict } from "./liveness.js";
+import {
+  getOwnHostId,
+  isAgentProcessAlive,
+  agentProcessAdvertised,
+  anchorLivenessVerdict,
+  isPidAlive,
+  observeStartTokenForm,
+  isUtcStartToken,
+  START_TOKEN_UTC_SUFFIX,
+  type CommandRunner,
+  type LegacyStartProbe,
+  type KillProbe,
+} from "./liveness.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -3287,6 +3299,68 @@ export function getCurrentBinding(db: CompatDatabase, anchor: BindingAnchor): Bi
 }
 
 /**
+ * MIGRATION (the start-token TZ pin, src/liveness.ts startTokenEnv): a window
+ * bound before the pin carries its start token in the legacy (unsuffixed)
+ * local-time form, so the lookup by its UTC anchor misses it, and a re-bind
+ * (resume, clear, compact) would create a SECOND current row for the same window
+ * while an end would find none.
+ *
+ * THE ONLY GUARD during the transition (architect 1250296a): the partial unique
+ * index idx_agent_bindings_current_anchor cannot stop a window from holding a
+ * legacy row AND a UTC row, because the two spellings are different strings. It
+ * regains full force by construction once legacy acceptance is retired. Until
+ * then this function keeps one current row per window:
+ *   - legacy read OK, no UTC row current      → MOVE the legacy row onto the UTC anchor;
+ *   - legacy read OK, a UTC row already current → SUPERSEDE the legacy row by it
+ *     (the both-forms state converges, supersede_reason "start-token-migration");
+ *   - legacy read FAILED and a pre-UTC (unsuffixed) current row exists for this
+ *     window's pid → THROW: cannot judge whether it is this window's, so the bind
+ *     writes nothing rather than a UTC row beside it (Codex #296 R2 #1);
+ *   - legacy read FAILED, no such row        → nothing to do.
+ * Only an unsuffixed token can equal the legacy read, so a UTC row never moves
+ * (Codex #296 R1 #1). It runs INSIDE the caller's transaction (upsertAgentBinding,
+ * endAgentBinding), never alone, and swallows nothing (Codex #296 R1 #2). null =
+ * the caller made no legacy read (no migration).
+ */
+export function migrateLegacyBindingAnchor(db: CompatDatabase, anchor: BindingAnchor, legacy: LegacyStartProbe | null): "none" | "moved" | "collapsed" {
+  if (!legacy) return "none";
+  const edgeId = getLocalEdgeId(db);
+  if ("unreadable" in legacy) {
+    const pending = db
+      .prepare(
+        "SELECT binding_id FROM agent_bindings WHERE edge_id = ? AND host_id = ? AND window_pid = ? AND superseded_at IS NULL " +
+          "AND substr(window_pid_start, -length(?)) != ? LIMIT 1",
+      )
+      .get(edgeId, anchor.hostId, anchor.windowPid, START_TOKEN_UTC_SUFFIX, START_TOKEN_UTC_SUFFIX);
+    if (pending) {
+      throw new Error(
+        `this window's start time in the pre-UTC form could not be read, and a pre-UTC binding for pid ${anchor.windowPid} ` +
+          "is current: it may be this window's, so a new binding beside it would leave two current bindings. Nothing was recorded; retry.",
+      );
+    }
+    return "none";
+  }
+  if (legacy.start === anchor.windowPidStart) return "none";
+  const utc = getCurrentBinding(db, anchor);
+  if (utc) {
+    const r = db
+      .prepare(
+        "UPDATE agent_bindings SET superseded_at = ?, superseded_by = ?, supersede_reason = 'start-token-migration' " +
+          "WHERE edge_id = ? AND host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL",
+      )
+      .run(now(), utc.binding_id, edgeId, anchor.hostId, anchor.windowPid, legacy.start);
+    return r.changes > 0 ? "collapsed" : "none";
+  }
+  const r = db
+    .prepare(
+      "UPDATE agent_bindings SET window_pid_start = ? " +
+        "WHERE edge_id = ? AND host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL",
+    )
+    .run(anchor.windowPidStart, edgeId, anchor.hostId, anchor.windowPid, legacy.start);
+  return r.changes > 0 ? "moved" : "none";
+}
+
+/**
  * Record this window on this conversation. One current row per WINDOW ANCHOR
  * (§8a D1 — cardinality is per anchor, never per name; per-name exclusivity is
  * S3's claim-time job and is never enforced by schema).
@@ -3440,7 +3514,9 @@ function bindBackoffSleep(attempt: number, remainingMs: number): void {
 export function upsertAgentBinding(
   db: CompatDatabase,
   w: BindingWrite,
-  opts: { supersedeReason?: string; budgetMs?: number } = {},
+  // legacy: what the caller read for this window's start in the legacy form; the
+  // migration runs in the SAME transaction (migrateLegacyBindingAnchor).
+  opts: { supersedeReason?: string; budgetMs?: number; legacy?: LegacyStartProbe | null } = {},
 ): BindingResult {
   const started = Date.now();
   const deadline = started + Math.max(BIND_MIN_ATTEMPT_MS, opts.budgetMs ?? BIND_BUDGET_MS);
@@ -3493,7 +3569,10 @@ export function upsertAgentBinding(
       // attempt estimate: the per-attempt cost is not a fixed quantity, it
       // depends on whether the attempt has read before it writes.
 
-      return db.transaction(() => upsertAgentBindingOnce(db, w, opts))();
+      return db.transaction(() => {
+        migrateLegacyBindingAnchor(db, w, opts.legacy ?? null);
+        return upsertAgentBindingOnce(db, w, opts);
+      })();
     } catch (err) {
       lastErr = err;
       // Anything that is not OUR anchor contention is a real failure: throw on
@@ -3605,13 +3684,23 @@ function upsertAgentBindingOnce(
  * when the window has no current binding — the caller says so loudly rather than
  * inventing one.
  */
-export function endAgentBinding(db: CompatDatabase, anchor: BindingAnchor, endReason: string): boolean {
-  const current = getCurrentBinding(db, anchor);
-  if (!current) return false;
-  const r = db
-    .prepare("UPDATE agent_bindings SET end_reason = ?, last_verified_at = ? WHERE edge_id = ? AND binding_id = ?")
-    .run(endReason, now(), getLocalEdgeId(db), current.binding_id);
-  return r.changes > 0;
+export function endAgentBinding(
+  db: CompatDatabase,
+  anchor: BindingAnchor,
+  endReason: string,
+  legacy: LegacyStartProbe | null = null,
+): boolean {
+  // The legacy move and the end in ONE transaction: a lock error throws (the bind
+  // fails loudly), never an end that silently misses an unmoved legacy row.
+  return db.transaction(() => {
+    migrateLegacyBindingAnchor(db, anchor, legacy);
+    const current = getCurrentBinding(db, anchor);
+    if (!current) return false;
+    const r = db
+      .prepare("UPDATE agent_bindings SET end_reason = ?, last_verified_at = ? WHERE edge_id = ? AND binding_id = ?")
+      .run(endReason, now(), getLocalEdgeId(db), current.binding_id);
+    return r.changes > 0;
+  })();
 }
 
 /**
@@ -3661,6 +3750,58 @@ export function listAgentBindings(db: CompatDatabase): BindingListRow[] {
         "FROM agent_bindings WHERE edge_id = ? AND superseded_at IS NULL ORDER BY bound_at DESC, binding_id",
     )
     .all(getLocalEdgeId(db)) as BindingListRow[];
+}
+
+/**
+ * The MIGRATION METER for the start-token TZ pin (src/liveness.ts startTokenEnv):
+ * the LIVE anchors on this host still in the legacy (UNSUFFIXED) form, across
+ * agents.agent_pid_start and this edge's current agent_bindings. Readers accept
+ * that form only while this is above zero; at zero on every host, delete the
+ * legacy form (startTokenEnv "legacy" and relay_pid_start_legacy).
+ *
+ * Never a false zero (Codex #296 R1 #3): an unsuffixed anchor on a live pid whose
+ * start cannot be read is counted in `unreadable` (cannot judge), not dropped.
+ * Host identity is POSITIVE: a row is ours only when its host_id EQUALS our own;
+ * an unknown own host counts nothing and says so.
+ */
+export interface LegacyStartTokenCount {
+  ownHostKnown: boolean;
+  agents: number;
+  bindings: number;
+  total: number;
+  unreadable: number;
+  /**
+   * (host, window pid) pairs on this edge with MORE THAN ONE current binding: the
+   * both-forms state the unique index cannot stop during the transition
+   * (architect 1250296a). Counted on every host, with no probe, so it never hides.
+   */
+  duplicateWindows: Array<{ host_id: string; window_pid: number; rows: number }>;
+}
+export function countLegacyStartTokens(run?: CommandRunner, kill?: KillProbe): LegacyStartTokenCount {
+  const db = getDb();
+  const duplicateWindows = hasAgentBindingsTable(db)
+    ? (db
+        .prepare(
+          "SELECT host_id, window_pid, COUNT(*) AS rows FROM agent_bindings WHERE edge_id = ? AND superseded_at IS NULL " +
+            "GROUP BY host_id, window_pid HAVING COUNT(*) > 1 ORDER BY host_id, window_pid",
+        )
+        .all(getLocalEdgeId(db)) as Array<{ host_id: string; window_pid: number; rows: number }>)
+    : [];
+  const ownHost = getOwnHostId();
+  if (!ownHost) return { ownHostKnown: false, agents: 0, bindings: 0, total: 0, unreadable: 0, duplicateWindows };
+  let unreadable = 0;
+  const isLegacy = (pid: number | null, start: string | null): boolean => {
+    if (!(typeof pid === "number" && pid > 0) || !start || isUtcStartToken(start) || !isPidAlive(pid, kill)) return false;
+    const form = observeStartTokenForm(pid, start, run);
+    if (form === "unreadable") unreadable++;
+    return form === "legacy";
+  };
+  const agentRows = db
+    .prepare("SELECT agent_pid, agent_pid_start FROM agents WHERE host_id = ? AND agent_pid IS NOT NULL")
+    .all(ownHost) as Array<{ agent_pid: number | null; agent_pid_start: string | null }>;
+  const agents = agentRows.filter((r) => isLegacy(r.agent_pid, r.agent_pid_start)).length;
+  const bindings = listAgentBindings(db).filter((b) => b.host_id === ownHost && isLegacy(b.window_pid, b.window_pid_start)).length;
+  return { ownHostKnown: true, agents, bindings, total: agents + bindings, unreadable, duplicateWindows };
 }
 
 export function setAgentLivenessAnchor(

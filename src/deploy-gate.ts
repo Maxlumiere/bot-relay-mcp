@@ -52,6 +52,7 @@ import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { RESOLVER_ENV_KEYS } from "./instance.js";
+import { processStartedAt } from "./liveness.js";
 
 export type GateOutcome = "PASS" | "FAIL" | "CANNOT-VERIFY";
 export interface GateResult {
@@ -165,11 +166,8 @@ export function defaultGateDeps(): GateDeps {
         return { ok: false, error: (err as NodeJS.ErrnoException).code ?? String(err) };
       }
     },
-    processStart: (pid) => {
-      const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", timeout: CMD_TIMEOUT_MS, env: { ...process.env, LC_ALL: "C" } });
-      const out = (r.stdout ?? "").trim();
-      return r.status === 0 && out ? out : null;
-    },
+    // The ONE start-token producer (TZ=UTC LC_ALL=C), as every other site.
+    processStart: (pid) => processStartedAt(pid),
     dsHome: () => os.userInfo().homedir,
     runWhere: (env) => {
       const r = spawnSync(process.execPath, [RELAY_BIN, "where", "--json"], { encoding: "utf-8", timeout: CMD_TIMEOUT_MS, env });

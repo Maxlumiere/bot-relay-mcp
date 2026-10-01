@@ -970,7 +970,7 @@
             "type": "null"
           }
         ],
-        "description": "The process start-time token (LC_ALL=C `ps -o lstart=`), or null if unreadable — PID-liveness only in that case"
+        "description": "The process start-time token (TZ=UTC LC_ALL=C `ps -o lstart=`, plus the suffix ` UTC`), or null if unreadable — PID-liveness only in that case"
       },
       "agent_token": {
         "type": "string",

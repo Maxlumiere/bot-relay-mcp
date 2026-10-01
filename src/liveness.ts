@@ -64,23 +64,65 @@ export function parseWindowsMachineGuid(regStdout: string): string | null {
   return m ? m[1] : null;
 }
 
-/** Injectable command runner — returns stdout, or "" on any failure. */
-export type CommandRunner = (cmd: string, args: string[]) => string;
+/**
+ * The process START TOKEN, the PID-reuse guard, has ONE spelling:
+ * `TZ=UTC LC_ALL=C ps -o lstart= -p PID`, trimmed, plus the literal suffix
+ * START_TOKEN_UTC_SUFFIX (" UTC"). `lstart` is a wall-clock date,
+ * so BOTH variables are pinned: LC_ALL=C fixes the format (v2.14.1), TZ=UTC fixes
+ * the clock. Without the TZ pin, a writer and a reader with different TZ values
+ * (a user shell, launchd, a connector) read the same live process differently,
+ * and it reads DEAD. The token is compared as a string, never parsed as a date.
+ * The bash twin is relay_pid_start in hooks/_vault-helpers.sh; the conformance
+ * guard (tests/start-token-utc.test.ts) pins them byte-identical.
+ *
+ * The SUFFIX is the token's provenance (architect ruling on #296, Codex R1 #1).
+ * A bare lstart cannot say which zone printed it: on a UTC-4 host, a pid reused
+ * exactly 4 hours later has a local-time lstart equal to the first process's UTC
+ * one. So readers DISPATCH on the suffix: a suffixed token is compared ONLY with
+ * the UTC producer's suffixed output, an unsuffixed one ONLY with the legacy form.
+ * A cross-form match is impossible by construction.
+ *
+ * "legacy" = the form written before the TZ pin: unsuffixed, LC_ALL=C with the
+ * WRITER's TZ, which a default shell leaves unset (/etc/localtime). Readers
+ * recompute it with TZ REMOVED, never with their own inherited TZ, and accept it
+ * during the transition. KNOWN LIMIT: a writer that ran with an explicit TZ stored a form
+ * this cannot recompute; that anchor reads dead until it is restamped (the
+ * PostToolUse self-heal, or a window restart). Delete the legacy form once
+ * `relay doctor` counts zero live rows in it.
+ */
+export type StartTokenForm = "utc" | "legacy";
 
-const defaultRunner: CommandRunner = (cmd, args) => {
+/** The provenance suffix of a UTC start token. The bash twin (RELAY_START_TOKEN_UTC_SUFFIX) is pinned to it by test. */
+export const START_TOKEN_UTC_SUFFIX = " UTC";
+
+/** Does this stored token carry the UTC provenance suffix? */
+export function isUtcStartToken(token: string): boolean {
+  return token.endsWith(START_TOKEN_UTC_SUFFIX);
+}
+
+export function startTokenEnv(base: NodeJS.ProcessEnv, form: StartTokenForm = "utc"): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, LC_ALL: "C" };
+  if (form === "utc") env.TZ = "UTC";
+  else delete env.TZ;
+  return env;
+}
+
+/**
+ * Injectable command runner — returns stdout, or "" on any failure. `opts`
+ * selects the start-token form; a runner that ignores it reads one form only.
+ */
+export type CommandRunner = (cmd: string, args: string[], opts?: { startTokenForm?: StartTokenForm }) => string;
+
+const defaultRunner: CommandRunner = (cmd, args, opts) => {
   try {
-    // v2.14.1 — force LC_ALL=C so `ps -o lstart=` yields a DETERMINISTIC,
-    // locale-independent start-time. The agent_pid_start token is written by
-    // the SessionStart hook (user shell) and re-read here at probe time under
-    // launchd; without a pinned locale the two could format the same start
-    // time differently → a live agent's token wouldn't match → it would read
-    // DEAD. The other commands here (ioreg/cat/reg) are locale-insensitive, so
-    // pinning C is safe for all.
+    // Every command runs under the start-token environment, so `ps -o lstart=`
+    // (here and in the process table) is the ONE spelling above. The other
+    // commands here (ioreg/cat/reg) read neither the locale nor the clock.
     return execFileSync(cmd, args, {
       encoding: "utf8",
       timeout: 2000,
       stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, LC_ALL: "C" },
+      env: startTokenEnv(process.env, opts?.startTokenForm ?? "utc"),
     });
   } catch {
     return "";
@@ -313,10 +355,13 @@ export function parseProcessTable(psStdout: string): Map<number, ProcEntry> {
   return table;
 }
 
-function buildProcessTable(run: CommandRunner): Map<number, ProcEntry> {
+export function buildProcessTable(run: CommandRunner = defaultRunner): Map<number, ProcEntry> {
   // POSIX only here (macOS/Linux). Windows capture is a documented follow-on
   // (the daemon there falls back to age-based, same as cross-host).
-  const table = parseProcessTable(run("ps", ["-axo", "pid=,ppid=,lstart=,command="]));
+  const table = parseProcessTable(run("ps", ["-axo", "pid=,ppid=,lstart=,command="], { startTokenForm: "utc" }));
+  // The runner printed lstart in UTC: each entry's token is the UTC form, so it
+  // carries the suffix exactly as processStartedAt's does.
+  for (const entry of table.values()) entry.startedAt += START_TOKEN_UTC_SUFFIX;
   // Second pass: capture `comm` (the executable basename source) in its OWN ps
   // call — comm can contain spaces on macOS (full exec path), so it can't share
   // a line with the greedy `command` field. `pid=,comm=` puts comm last, so
@@ -380,17 +425,57 @@ export function detectAgentProcess(
   }
 }
 
-/** Read a live PID's start-time token (reuse guard). Null if unreadable. */
-export function processStartedAt(pid: number, run: CommandRunner = defaultRunner): string | null {
+/**
+ * Read a live PID's start token (reuse guard). Null if unreadable. The ONE TS
+ * producer: every writer, reader and the deploy gate read the token here.
+ */
+export function processStartedAt(
+  pid: number,
+  run: CommandRunner = defaultRunner,
+  form: StartTokenForm = "utc",
+): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  const out = run("ps", ["-o", "lstart=", "-p", String(pid)]).trim();
-  return out.length > 0 ? out : null;
+  const out = run("ps", ["-o", "lstart=", "-p", String(pid)], { startTokenForm: form }).trim();
+  if (out.length === 0) return null;
+  return form === "utc" ? out + START_TOKEN_UTC_SUFFIX : out;
+}
+
+/**
+ * What a binder read for a window's start in the LEGACY form: the token, or that
+ * the read failed. A failed read is "cannot judge", never "no legacy row"
+ * (migrateLegacyBindingAnchor refuses to bind beside a pre-UTC row on it).
+ */
+export type LegacyStartProbe = { start: string } | { unreadable: true };
+
+export function readLegacyStartProbe(pid: number, run: CommandRunner = defaultRunner): LegacyStartProbe {
+  const start = processStartedAt(pid, run, "legacy");
+  return start === null ? { unreadable: true } : { start };
+}
+
+export type StartTokenObservation = "utc" | "legacy" | "mismatch" | "unreadable";
+
+/**
+ * Does this stored token name this live pid, and in which form? DISPATCHED on the
+ * suffix (one `ps` either way): a suffixed token is compared only with the UTC
+ * producer, an unsuffixed one only with the legacy form. "unreadable" = the one
+ * read it needs failed.
+ */
+export function observeStartTokenForm(
+  pid: number,
+  stored: string,
+  run: CommandRunner = defaultRunner,
+): StartTokenObservation {
+  const form: StartTokenForm = isUtcStartToken(stored) ? "utc" : "legacy";
+  const current = processStartedAt(pid, run, form);
+  if (current === null) return "unreadable";
+  return current === stored ? form : "mismatch";
 }
 
 /**
  * Is the recorded agent process still the SAME live process? Alive iff the PID
- * is live AND (when both start-times are readable) they match — a reused PID
- * (new process, different start-time) reads dead.
+ * is live AND (when both start-times are readable) they match, in the UTC form or
+ * the legacy one (see startTokenEnv) — a reused PID (new process, different
+ * start-time) reads dead.
  *
  * EXPLICIT TRADEOFF (intentional): if the current start-time can't be read
  * (`ps` restricted/failed, or no token was recorded), we fall back to
@@ -410,9 +495,9 @@ export function isAgentProcessAlive(
 ): boolean {
   if (!isPidAlive(pid, kill)) return false;
   if (!expectedStartedAt) return true; // no recorded token → PID-liveness only
-  const current = processStartedAt(pid, run);
-  if (current === null) return true; // can't validate → trust PID-liveness
-  return current === expectedStartedAt;
+  // Either form matching is the same process (the legacy form during the
+  // transition); "unreadable" → can't validate → trust PID-liveness.
+  return observeStartTokenForm(pid, expectedStartedAt, run) !== "mismatch";
 }
 
 export type AnchorVerdict = "alive" | "dead" | "unverifiable";

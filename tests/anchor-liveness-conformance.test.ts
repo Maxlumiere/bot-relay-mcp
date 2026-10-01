@@ -52,7 +52,7 @@ const OTHER = "conformance-other-host-guid-B";
 
 const LIVE_PID = process.pid; // this vitest process — guaranteed alive
 const DEAD_PID = 2_147_483_646; // far above any real pid — guaranteed dead, no reuse
-const LIVE_START = processStartedAt(LIVE_PID); // the real lstart token (LC_ALL=C pinned)
+const LIVE_START = processStartedAt(LIVE_PID); // the real lstart token (TZ=UTC LC_ALL=C pinned)
 
 /**
  * Invoke the bash `relay_anchor_liveness` exactly as the hook does — source the

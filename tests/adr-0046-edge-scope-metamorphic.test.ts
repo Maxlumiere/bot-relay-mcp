@@ -37,6 +37,8 @@ const FOREIGN = "00000000-0000-4000-8000-00000000f0f0";
 const HOST = "h-meta";
 const START = "Mon Sep 15 10:00:00 2026";
 const A = { hostId: HOST, windowPid: 5001, windowPidStart: START };
+// The same window's start token in the UTC form (the start-token TZ pin): START is its legacy form.
+const A_UTC = { ...A, windowPidStart: "Mon Sep 15 02:00:00 2026 UTC" };
 const B = { hostId: HOST, windowPid: 5002, windowPidStart: START };
 
 function freshDb(dir: string): string {
@@ -128,6 +130,15 @@ function script(h: import("better-sqlite3").Database, beforeUpdate: () => void =
   out.push(["clear-carry B", norm(write(h, B, "build", "c4", "clear-carry"))]); // supersede UPDATE, clear-carry
   beforeUpdate();
   out.push(["current A", cur(A)], ["current B", cur(B)], ["list", list()]);
+  beforeUpdate();
+  out.push(["migrate A", db.migrateLegacyBindingAnchor(h as never, A_UTC, { start: START })]); // legacy start-token move UPDATE
+  out.push(["current A (legacy)", cur(A)], ["current A (utc)", cur(A_UTC)], ["list", list()]);
+  beforeUpdate();
+  // The both-forms state: a legacy-anchored row is current again beside the UTC one; the migration converges it.
+  out.push(["claim A legacy again", norm(write(h, A, "arch", "c5"))]);
+  beforeUpdate();
+  out.push(["collapse A", db.migrateLegacyBindingAnchor(h as never, A_UTC, { start: START })]); // legacy collapse UPDATE
+  out.push(["current A (legacy)", cur(A)], ["current A (utc)", cur(A_UTC)], ["list", list()]);
   return out;
 }
 
@@ -157,7 +168,7 @@ describe("ADR-0046 — edge scope, metamorphic: foreign rows that collide on nam
     expect(after, "no local write touched a foreign row").toBe(before);
   });
 
-  it("every UPDATE path (supersede, end, refresh, clear-carry) runs against a FOREIGN TWIN sharing its local binding_id, and never touches it", () => {
+  it("every UPDATE path (supersede, end, refresh, clear-carry, legacy move) runs against a FOREIGN TWIN sharing its local binding_id, and never touches it", () => {
     const basePath = freshDb(path.join(ROOT, "base2"));
     const base = new Better(basePath);
     const baseline = script(base);
@@ -185,13 +196,15 @@ describe("ADR-0046 — edge scope, metamorphic: foreign rows that collide on nam
     for (const [id, row] of planted) expect(now.get(id), `foreign twin ${id} was modified`).toBe(row);
   });
 
-  it("NON-VACUOUS: the baseline really exercises claim, supersede, end, refresh and clear-carry", () => {
+  it("NON-VACUOUS: the baseline really exercises claim, supersede, end, refresh, clear-carry and the legacy move", () => {
     const p = freshDb(path.join(ROOT, "nv"));
     const h = new Better(p);
     const r = JSON.stringify(script(h));
     h.close();
     for (const want of ["created", "superseded-and-created", "refreshed"]) expect(r).toContain(want);
     expect(r).toContain('"end A",true');
+    expect(r).toContain('"migrate A","moved"');
+    expect(r).toContain('"collapse A","collapsed"');
   });
 });
 
@@ -199,7 +212,7 @@ describe("ADR-0046 — edge scope, metamorphic: foreign rows that collide on nam
  * Two-sided coverage pin: the metamorphic script above must exercise EVERY local
  * write statement on agent_bindings. These are the ones src/db.ts holds today (bind =
  * the create INSERT; resume-switch and clear-carry = the supersede UPDATE + INSERT;
- * refresh; end). There is NO release write on agent_bindings on this branch
+ * refresh; end; the legacy start-token move and collapse). There is NO release write on agent_bindings on this branch
  * (releaseAgentBinding writes only `agents`); when one is added (S3-lite), this pin
  * fails until the script covers it.
  */
@@ -215,6 +228,8 @@ describe("ADR-0046 — every agent_bindings write path is in the metamorphic scr
         "UPDATE agent_bindings SET end_reason", // end
         "UPDATE agent_bindings SET last_verified_at", // refresh
         "UPDATE agent_bindings SET superseded_at", // supersede (resume-switch, clear-carry)
+        "UPDATE agent_bindings SET window_pid_start", // the legacy start-token move (migrateLegacyBindingAnchor)
+        "UPDATE agent_bindings SET superseded_at", // the legacy collapse (migrateLegacyBindingAnchor, both forms current)
       ].sort(),
     );
   });

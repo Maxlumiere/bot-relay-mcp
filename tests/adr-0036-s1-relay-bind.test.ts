@@ -439,6 +439,54 @@ describe("ADR-0036 S1 — relay bind RECORDS the window (happy paths)", () => {
     expect(superseded[0].supersede_reason).toBe("clear-carry");
   });
 
+  // The start-token TZ pin: a window bound BEFORE the pin stored its start token in
+  // the legacy form (local time, NO " UTC" suffix). The suffix tells the two forms
+  // apart on every host, a UTC one included, so these rows never skip.
+  const legacyForm = (pid: number): string => {
+    const env: NodeJS.ProcessEnv = { ...process.env, LC_ALL: "C" };
+    delete env.TZ;
+    return spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", env }).stdout.trim();
+  };
+  const utcForm = (pid: number): string =>
+    spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" } }).stdout.trim() + " UTC";
+  /** Bind this window, then rewrite its row as a pre-pin writer stored it. */
+  async function bindInLegacyForm(name: string): Promise<Record<string, unknown>> {
+    runBind([], sessionStart("startup"), { RELAY_AGENT_NAME: name });
+    const Better = (await import("better-sqlite3")).default;
+    const db = new Better(TEST_DB_PATH);
+    try {
+      db.prepare("UPDATE agent_bindings SET window_pid_start = ?").run(legacyForm(ANCHOR_PID));
+    } finally {
+      db.close();
+    }
+    const rows = await bindings();
+    expect(rows.map((b) => b.window_pid_start)).toEqual([legacyForm(ANCHOR_PID)]);
+    return rows[0];
+  }
+
+  it("a window bound in the legacy start-token form: compact lands on THAT row, moved onto the UTC anchor (no second current row)", async () => {
+    const before = await bindInLegacyForm("s1-bind-legacy");
+    const r = runBind([], sessionStart("compact"), { RELAY_AGENT_NAME: "s1-bind-legacy" });
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    const rows = await bindings();
+    expect(rows.filter((b) => b.superseded_at == null)).toHaveLength(1);
+    expect(rows[0].binding_id).toBe(before.binding_id);
+    expect(rows[0].window_pid_start).toBe(utcForm(ANCHOR_PID));
+  });
+
+  it("--end DIRECTLY on an untouched legacy-form row records the end on THAT row (Codex #296 R2 #2)", async () => {
+    const before = await bindInLegacyForm("s1-bind-legacy-end");
+    const end = runBind(["--end"], JSON.stringify({ session_id: CONV, hook_event_name: "SessionEnd", reason: "logout" }), {
+      RELAY_AGENT_NAME: "s1-bind-legacy-end",
+    });
+    expect(end.status, end.stdout + end.stderr).toBe(0);
+    const rows = await bindings();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].binding_id).toBe(before.binding_id);
+    expect(rows[0].end_reason).toBe("logout");
+    expect(rows[0].window_pid_start).toBe(utcForm(ANCHOR_PID));
+  });
+
   it("--end records SessionEnd's reason VERBATIM on the current row, and adds no row (D6)", async () => {
     runBind([], sessionStart("startup"), { RELAY_AGENT_NAME: "s1-bind-end" });
     const r = runBind(["--end"], JSON.stringify({ session_id: CONV, hook_event_name: "SessionEnd", reason: "prompt_input_exit" }), {
