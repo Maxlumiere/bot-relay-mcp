@@ -18,7 +18,7 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
 import { verifyToken } from "../auth.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
 import { fireWebhooks } from "../webhooks.js";
@@ -1597,6 +1597,21 @@ export function startHttpServer(port: number, host: string): Server {
   // Unref so the timer never blocks process shutdown.
   const reaper = setInterval(reapIdleSessions, HTTP_REAPER_INTERVAL_MS);
   if (typeof reaper.unref === "function") reaper.unref();
+
+  // ADR-0047 (D5) — the ONE purger of `connectors` rows: the daemon, at startup and
+  // hourly, deleting only rows POSITIVELY dead for over 7 days. Never on a stdio
+  // connector (a test pins that). Best-effort: correctness is read-time.
+  const purgeConnectors = () => {
+    try {
+      const { purged } = purgeDeadConnectors();
+      if (purged > 0) log.info(`[connectors] purged ${purged} dead connector row(s)`);
+    } catch (err) {
+      log.warn(`[connectors] purge failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  purgeConnectors();
+  const connectorPurge = setInterval(purgeConnectors, 60 * 60 * 1000);
+  if (typeof connectorPurge.unref === "function") connectorPurge.unref();
 
   // #60 — S2 wake-coverage detector (ADR-0023). HTTP DAEMON ONLY (this is the
   // long-lived shared process; a per-terminal stdio server must NOT run a

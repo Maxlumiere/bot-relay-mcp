@@ -86,10 +86,10 @@ function indexesOf(table: string): Array<{ name: string; unique: boolean; column
 }
 
 describe("ADR-0036 S1 — schema v25", () => {
-  it("the schema migrated to v25", () => {
+  it("the schema migrated to the current version (v25 added agent_bindings; v26 is ADR-0047's connectors)", () => {
     getDb();
-    expect(CURRENT_SCHEMA_VERSION).toBe(25);
-    expect(getSchemaVersion()).toBe(25);
+    expect(CURRENT_SCHEMA_VERSION).toBe(26);
+    expect(getSchemaVersion()).toBe(26);
   });
 });
 
@@ -175,10 +175,10 @@ describe("ADR-0036 S1 — migration is additive and idempotent", () => {
     expect(getSchemaVersion()).toBe(before.version);
     expect(columnsOf("agent_bindings")).toEqual(before.cols);
     expect(indexesOf("agent_bindings")).toEqual(before.ix);
-    expect(getSchemaVersion()).toBe(25);
+    expect(getSchemaVersion()).toBe(26);
   });
 
-  it("a v24-shaped DB gains agent_bindings on open, keeps its existing agents rows, and records v25", () => {
+  it("a v24-shaped DB gains agent_bindings on open, keeps its existing agents rows, and records the current version (v26)", () => {
     // Simulate a DB last written by v24 code: no agent_bindings, schema_info at 24.
     registerAgent("keeper", "builder", []);
     const db = getDb();
@@ -188,7 +188,7 @@ describe("ADR-0036 S1 — migration is additive and idempotent", () => {
 
     getDb();
     expect(tableExists("agent_bindings"), "agent_bindings recreated by the v25 migration").toBe(true);
-    expect(getSchemaVersion()).toBe(25);
+    expect(getSchemaVersion()).toBe(26);
     const kept = getDb().prepare("SELECT name, role FROM agents WHERE name = ?").get("keeper") as
       | { name: string; role: string }
       | undefined;

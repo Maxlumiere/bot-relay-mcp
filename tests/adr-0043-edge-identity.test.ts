@@ -331,7 +331,8 @@ describe("ADR-0043 — a pre-F7 v25 database is brought forward in v25 (no v26 b
     const r = await raw((db) => db.prepare("SELECT edge_id FROM agent_bindings WHERE binding_id = 'old'").get() as { edge_id: string });
     expect(r.edge_id).toBe(local);
     const v = await raw((db) => (db.prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number }).version);
-    expect(v, "no v26 bump").toBe(25);
+    // F7 itself needed no bump (it landed in the unreleased v25); the current v26 is ADR-0047's connectors.
+    expect(v, "no bump of F7's own: the current version").toBe(26);
     const idx = await raw((db) =>
       (db.prepare("SELECT name FROM pragma_index_list('agent_bindings')").all() as Array<{ name: string }>).map(
         (i) => (db.prepare("SELECT name FROM pragma_index_info(?) ORDER BY seqno").get(i.name) as { name: string }).name,

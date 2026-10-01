@@ -6,8 +6,9 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Readable, Writable } from "node:stream";
 import { createServer } from "../server.js";
-import { endAgentSessionOnSignal, getAgentSessionId, logAudit, setAgentLivenessAnchor } from "../db.js";
+import { endAgentSessionOnSignal, getAgentSessionId, logAudit, recordOwnConnector, setAgentLivenessAnchor } from "../db.js";
 import { detectAgentProcess, type AgentProcess } from "../liveness.js";
+import { LOADED_BUILD } from "../loaded-build.js";
 import { log } from "../logger.js";
 import { broadcastDashboardEvent } from "./websocket.js";
 
@@ -280,6 +281,29 @@ function captureSessionId(): void {
  * engaged (TTY attached, or RELAY_SKIP_TTY_CHECK=1), callers pass nothing
  * and the SDK defaults to process.stdin / process.stdout — unchanged.
  */
+/**
+ * ADR-0047 — stamp this connector's own `connectors` row, and say so LOUDLY when it
+ * cannot (Codex #295 R2): a failed INSERT (e.g. the UTC-only CHECK refusing an
+ * unsuffixed window anchor) or an unreadable own start token leaves this window
+ * UNKNOWN on the board, and that must never be invisible at the default log level.
+ * Never throws: MCP keeps serving either way. Returns whether the row was written.
+ */
+export function stampOwnConnector(
+  parent: AgentProcess | null,
+  build: typeof LOADED_BUILD,
+  record: typeof recordOwnConnector = recordOwnConnector,
+  warn: (message: string) => void = (m) => log.warn(m),
+): boolean {
+  const notRegistered = (why: string) => warn(`[stdio] connector not registered: ${why}; this window will read UNKNOWN on the board`);
+  try {
+    if (record({ parent, build })) return true;
+    notRegistered("this process's own start time could not be read");
+  } catch (err) {
+    notRegistered(err instanceof Error ? err.message : String(err));
+  }
+  return false;
+}
+
 export async function startStdioServer(
   stdin?: Readable,
   stdout?: Writable,
@@ -293,9 +317,15 @@ export async function startStdioServer(
   // at startup, no loop) and stamp it as the liveness anchor if our row already
   // exists (hook-first registration). The on-register re-stamp in
   // src/tools/identity.ts covers the MCP-first / re-register orderings.
+  // ADR-0047: EVERY stdio connector (named or not) detects its window and stamps
+  // its own `connectors` row (its pid and start token, that window, the install it
+  // loaded from, the build it LOADED), so the board can compare what it runs with
+  // what is installed. Best-effort: a failed stamp leaves the window UNKNOWN, the
+  // safe direction, and never blocks startup, but it is never silent.
+  detectedAgentProcess = detectAgentProcess();
+  stampOwnConnector(detectedAgentProcess, LOADED_BUILD);
   const name = process.env.RELAY_AGENT_NAME;
   if (name && name !== "default") {
-    detectedAgentProcess = detectAgentProcess();
     stampDetectedAgentLiveness(name);
   }
   installAutoUnregister();
