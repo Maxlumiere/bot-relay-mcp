@@ -11,7 +11,16 @@ import os from "os";
 // "type":"module", so a bare `require(...)` is undefined at runtime — importing
 // createRequire from "module" is the supported way to do a sync require in ESM.
 import { createRequire } from "module";
-import { getOwnHostId, isAgentProcessAlive, agentProcessAdvertised, anchorLivenessVerdict } from "./liveness.js";
+import {
+  getOwnHostId,
+  isAgentProcessAlive,
+  agentProcessAdvertised,
+  anchorLivenessVerdict,
+  isPidAlive,
+  observeStartTokenForm,
+  type CommandRunner,
+  type KillProbe,
+} from "./liveness.js";
 import type {
   AgentRecord,
   AgentWithStatus,
@@ -3287,6 +3296,34 @@ export function getCurrentBinding(db: CompatDatabase, anchor: BindingAnchor): Bi
 }
 
 /**
+ * MIGRATION (the start-token TZ pin, src/liveness.ts startTokenEnv): a window
+ * bound before the pin carries its start token in the legacy local-time form, so
+ * the lookup by its UTC anchor misses it, and a re-bind (resume, clear, compact)
+ * would create a SECOND current row for the same window while an end would find
+ * none. Move that row onto the UTC anchor first. When a current row already
+ * holds the UTC anchor, the partial unique index (idx_agent_bindings_current_anchor)
+ * refuses the move, as it refuses a second current row everywhere else. The caller
+ * passes the legacy token it read for this pid (null when unreadable or equal:
+ * nothing to move). Returns whether a row moved. That refusal, or lock contention,
+ * → false: the legacy row stays and still reads alive (readers accept the legacy form).
+ */
+export function migrateLegacyBindingAnchor(db: CompatDatabase, anchor: BindingAnchor, legacyStart: string | null): boolean {
+  if (!legacyStart || legacyStart === anchor.windowPidStart) return false;
+  try {
+    const r = db
+      .prepare(
+        "UPDATE agent_bindings SET window_pid_start = ? " +
+          "WHERE edge_id = ? AND host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL",
+      )
+      .run(anchor.windowPidStart, getLocalEdgeId(db), anchor.hostId, anchor.windowPid, legacyStart);
+    return r.changes > 0;
+  } catch (err) {
+    if (isBindContentionError(err)) return false;
+    throw err;
+  }
+}
+
+/**
  * Record this window on this conversation. One current row per WINDOW ANCHOR
  * (§8a D1 — cardinality is per anchor, never per name; per-name exclusivity is
  * S3's claim-time job and is never enforced by schema).
@@ -3661,6 +3698,32 @@ export function listAgentBindings(db: CompatDatabase): BindingListRow[] {
         "FROM agent_bindings WHERE edge_id = ? AND superseded_at IS NULL ORDER BY bound_at DESC, binding_id",
     )
     .all(getLocalEdgeId(db)) as BindingListRow[];
+}
+
+/**
+ * The MIGRATION METER for the start-token TZ pin (src/liveness.ts startTokenEnv):
+ * how many LIVE anchors on this host still carry the legacy local-time form,
+ * across agents.agent_pid_start and this edge's current agent_bindings. Readers
+ * accept that form only while this is above zero; at zero on every host, delete
+ * the legacy form (startTokenEnv "legacy" and relay_pid_start_legacy).
+ * Host identity is POSITIVE: a row is ours only when its host_id EQUALS our own;
+ * an unknown own host counts nothing and says so, never a false zero.
+ */
+export function countLegacyStartTokens(
+  run?: CommandRunner,
+  kill?: KillProbe,
+): { ownHostKnown: boolean; agents: number; bindings: number; total: number } {
+  const ownHost = getOwnHostId();
+  if (!ownHost) return { ownHostKnown: false, agents: 0, bindings: 0, total: 0 };
+  const db = getDb();
+  const isLegacy = (pid: number | null, start: string | null): boolean =>
+    typeof pid === "number" && pid > 0 && !!start && isPidAlive(pid, kill) && observeStartTokenForm(pid, start, run) === "legacy";
+  const agentRows = db
+    .prepare("SELECT agent_pid, agent_pid_start FROM agents WHERE host_id = ? AND agent_pid IS NOT NULL")
+    .all(ownHost) as Array<{ agent_pid: number | null; agent_pid_start: string | null }>;
+  const agents = agentRows.filter((r) => isLegacy(r.agent_pid, r.agent_pid_start)).length;
+  const bindings = listAgentBindings(db).filter((b) => b.host_id === ownHost && isLegacy(b.window_pid, b.window_pid_start)).length;
+  return { ownHostKnown: true, agents, bindings, total: agents + bindings };
 }
 
 export function setAgentLivenessAnchor(

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — a live process no longer reads dead when two relay processes run in different time zones
+
+The relay tells a live agent window from a dead one (and from a new process that reused its PID) by the process start time that `ps` prints. That time was printed in the reading process's own time zone, so the same live process read differently under two `TZ` values. A connector and the daemon with different `TZ` settings would read a live window as dead. The start time now has one spelling everywhere, `TZ=UTC LC_ALL=C ps -o lstart= -p PID`, read by one function in the relay (`processStartedAt`) and one in the hooks (`relay_pid_start`), which give byte-identical results.
+
+- **Upgrading keeps live windows live.** Start times recorded before this change are in the machine's local time. Until each window restarts, the relay and the hooks also accept that older form (recomputed with `TZ` removed, so from the system time zone, never the reader's own `TZ`). A restarted window records UTC from the start. In an open window, the hook that runs after each tool call rewrites the agent's anchor in UTC on its next run (it already restamps an anchor that differs; local mode). A window's binding moves onto its UTC start time the next time `relay bind` runs for it (resume, clear, compact or end), so a window never gets a second current binding. One exception: if your shell sets `TZ` explicitly, a start time recorded under it is not recognised. That window's agent reads dead until its next tool call rewrites the start time in UTC, and its next `relay bind` records a new binding beside the old one, which reads dead.
+- **`relay doctor` counts what is left:** "start tokens (legacy form)" names how many live anchors still use the older form (a WARN while any remain). When it reads 0 on every machine, the older form can be retired.
+- The deploy gate reads the start time through the same function.
+
+Tests: `tests/start-token-utc.test.ts`: the same live process read with `TZ` set to UTC, Asia/Singapore, America/New_York and unset gives one token from the relay, its process-table read and the hook helper; the older form is accepted in both the relay and the hook verdict; the doctor count; the binding move. `tests/adr-0036-s1-relay-bind.test.ts`: a window bound in the older form keeps one binding through `compact` and `--end`.
+
 ### Changed — instance resolution is one strict function: a fault never selects a different DB
 
 Every process picked its relay DB through helpers that swallowed file-system errors. An unreadable `~/.bot-relay/active-instance`, an I/O or permission error on `instances/`, or a marker that could not be read therefore landed the process on the flat `~/.bot-relay/relay.db`. Nothing said so: the relay looked healthy and read an empty mailbox. Now one resolver, `resolveInstance()`, serves the daemon and the CLI:

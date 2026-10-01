@@ -146,12 +146,13 @@ describe("v2.14.1 — hook agent_pid capture + spawn-window", () => {
     }
   }, 25_000);
 
-  it("(D) the hook-captured start-time equals the relay's probe (LC_ALL=C parity)", () => {
+  it("(D) the hook-captured start-time equals the relay's probe (TZ=UTC LC_ALL=C parity)", () => {
     // Both the hook (relay_pid_start) and the relay (processStartedAt) run
-    // `LC_ALL=C ps -o lstart=` for a PID → identical string → the stored token
-    // matches at probe time (a locale drift would false-read the agent dead).
+    // `TZ=UTC LC_ALL=C ps -o lstart=` for a PID → identical string → the stored
+    // token matches at probe time (a locale or TZ drift would false-read the agent
+    // dead; tests/start-token-utc pins this across reader TZ values).
     const pid = process.pid;
-    const hookForm = spawnSync("bash", ["-c", `LC_ALL=C ps -o lstart= -p ${pid} 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'`], { encoding: "utf-8" }).stdout.trim();
+    const hookForm = spawnSync("bash", ["-c", `TZ=UTC LC_ALL=C ps -o lstart= -p ${pid} 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'`], { encoding: "utf-8" }).stdout.trim();
     const relayForm = processStartedAt(pid);
     expect(hookForm.length).toBeGreaterThan(0);
     expect(relayForm).toBe(hookForm);

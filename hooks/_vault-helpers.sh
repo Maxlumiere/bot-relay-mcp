@@ -493,15 +493,26 @@ relay_agent_pid() {
   done
 }
 
-# Start-time token for a PID (the relay's PID-reuse guard). LC_ALL=C so the
-# format is DETERMINISTIC + byte-identical to the daemon's probe (src/liveness.ts
-# also pins LC_ALL=C) — a locale difference between this user shell and the
-# launchd daemon would otherwise make a live agent read dead. Trimmed. Empty on
-# any failure.
+# Start-time token for a PID (the relay's PID-reuse guard). ONE spelling,
+# byte-identical to the TS producer (src/liveness.ts processStartedAt, pinned by
+# tests/start-token-utc): TZ=UTC LC_ALL=C. lstart is a wall-clock date, so a
+# locale OR a TZ difference between this user shell and the launchd daemon would
+# make a live agent read dead. Compared as a string, never parsed. Trimmed. Empty
+# on any failure.
 relay_pid_start() {
   local pid="$1"
   [ -n "$pid" ] || return
-  LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+  TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# MIGRATION ONLY: the form written before the TZ pin (the writer TZ was unset, so
+# /etc/localtime). Recomputed with TZ REMOVED, never this shell inherited TZ.
+# Readers accept it until relay doctor counts zero live rows in that form; then
+# delete it with the TS twin (startTokenEnv "legacy").
+relay_pid_start_legacy() {
+  local pid="$1"
+  [ -n "$pid" ] || return
+  env -u TZ LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 # Is PID a live process on THIS host? The signal-0 probe, mirroring src/liveness.ts
@@ -553,7 +564,7 @@ relay_pid_alive() {
 #   - pid not alive                                  → dead
 #   - pid alive, no start anchor                     → alive (PID-liveness only)
 #   - pid alive, start unreadable                    → alive (can't validate → trust PID)
-#   - pid alive, start MATCHES                        → alive
+#   - pid alive, start MATCHES (UTC or legacy form)   → alive
 #   - pid alive, start MISMATCH (PID reuse)           → dead
 relay_anchor_liveness() {
   local agent_pid="$1" agent_pid_start="$2" row_host="$3" own_host="$4" cur
@@ -565,6 +576,10 @@ relay_anchor_liveness() {
   if ! relay_pid_alive "$agent_pid"; then printf 'dead'; return; fi
   if [ -z "$agent_pid_start" ]; then printf 'alive'; return; fi
   cur=$(relay_pid_start "$agent_pid")
+  if [ -z "$cur" ]; then printf 'alive'; return; fi
+  if [ "$cur" = "$agent_pid_start" ]; then printf 'alive'; return; fi
+  # MIGRATION: a token stored before the TZ pin (relay_pid_start_legacy).
+  cur=$(relay_pid_start_legacy "$agent_pid")
   if [ -z "$cur" ]; then printf 'alive'; return; fi
   if [ "$cur" = "$agent_pid_start" ]; then printf 'alive'; else printf 'dead'; fi
 }

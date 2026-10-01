@@ -565,7 +565,7 @@ export const SetStatusSchema = z.object({
 export const ReportLivenessSchema = z.object({
   agent_name: z.string().min(1).describe("Your agent name (must match your token)"),
   agent_pid: z.number().int().positive().describe("The agent CLI's own OS process id (from the hook's ancestry walk)"),
-  agent_pid_start: z.string().max(128).nullable().optional().describe("The process start-time token (LC_ALL=C `ps -o lstart=`), or null if unreadable — PID-liveness only in that case"),
+  agent_pid_start: z.string().max(128).nullable().optional().describe("The process start-time token (TZ=UTC LC_ALL=C `ps -o lstart=`), or null if unreadable — PID-liveness only in that case"),
   agent_token: AgentTokenField,
 });
 export type ReportLivenessInput = z.infer<typeof ReportLivenessSchema>;

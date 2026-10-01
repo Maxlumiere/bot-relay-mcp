@@ -153,7 +153,7 @@ export async function run(argv: string[]): Promise<number> {
   const endReason = typeof payload.reason === "string" ? payload.reason : null;
 
   // --- the window anchor ---------------------------------------------------
-  const { detectAgentProcess, getOwnHostId } = await import("../liveness.js");
+  const { detectAgentProcess, getOwnHostId, processStartedAt } = await import("../liveness.js");
   const { resolveWindowAnchor, resolveBindCwd, boundViaForSource, resolveAgentName } = await import("../binding.js");
 
   const rawClaudePid = Number.parseInt(process.env.CLAUDE_PID ?? "", 10);
@@ -212,7 +212,7 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const { bindingSchemaGap, upsertAgentBinding, endAgentBinding } = await import("../db.js");
+    const { bindingSchemaGap, upsertAgentBinding, endAgentBinding, migrateLegacyBindingAnchor } = await import("../db.js");
 
     const gap = bindingSchemaGap(db);
     if (gap) {
@@ -221,6 +221,10 @@ export async function run(argv: string[]): Promise<number> {
           `The daemon or connector on the new build must open this DB once first; bind never migrates.`,
       );
     }
+
+    // MIGRATION (the start-token TZ pin): a row this window wrote in the legacy
+    // form moves onto the UTC anchor first, so neither path below misses it.
+    migrateLegacyBindingAnchor(db, anchor, processStartedAt(anchor.windowPid, undefined, "legacy"));
 
     if (args.end) {
       if (!endReason) {

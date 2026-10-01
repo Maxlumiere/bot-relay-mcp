@@ -144,6 +144,7 @@ async function checkDb(p: string): Promise<CheckResult[]> {
     const v = getSchemaVersion();
     if (v === CURRENT_SCHEMA_VERSION) {
       results.push({ name: "schema_info", status: "PASS", detail: `version=${v} (matches CURRENT_SCHEMA_VERSION)` });
+      results.push(await checkLegacyStartTokens());
     } else {
       results.push({
         name: "schema_info",
@@ -159,6 +160,28 @@ async function checkDb(p: string): Promise<CheckResult[]> {
     });
   }
   return results;
+}
+
+/**
+ * The meter for the start-token TZ pin: live anchors still in the legacy
+ * local-time form. WARN, never FAIL: they still read alive (the legacy form is
+ * accepted); a restarted window or its next hook run rewrites them in UTC.
+ */
+async function checkLegacyStartTokens(): Promise<CheckResult> {
+  const name = "start tokens (legacy form)";
+  try {
+    const { countLegacyStartTokens } = await import("../db.js");
+    const c = countLegacyStartTokens();
+    if (!c.ownHostKnown) return { name, status: "WARN", detail: "cannot count: this host's id is unknown" };
+    if (c.total === 0) return { name, status: "PASS", detail: "0 live anchors in the pre-UTC form" };
+    return {
+      name,
+      status: "WARN",
+      detail: `${c.total} live anchor(s) still in the pre-UTC local-time form (agents ${c.agents}, bindings ${c.bindings}); accepted; rewritten in UTC as windows restart or their hooks restamp them`,
+    };
+  } catch (err) {
+    return { name, status: "WARN", detail: `cannot count: ${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 function checkPerms(p: string): CheckResult[] {
