@@ -31,7 +31,7 @@ process.env.RELAY_DB_PATH = DB_FILE;
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 const db = await import("../src/db.js");
-const { processStartedAt, getOwnHostId, _resetOwnHostIdForTests } = await import("../src/liveness.js");
+const { processStartedAt, getOwnHostId, _resetOwnHostIdForTests, START_TOKEN_UTC_SUFFIX } = await import("../src/liveness.js");
 const { LOADED_BUILD } = await import("../src/loaded-build.js");
 const { BUILD_INFO: DIST_STAMP } = await import("../dist/build-info.js");
 
@@ -53,11 +53,11 @@ function plant(r: { pid: number; pid_start: string; started_at?: string; host_id
     )
     .run(r.edge_id ?? edge(), r.pid, r.pid_start, r.host_id === undefined ? getOwnHostId() : r.host_id, r.started_at ?? new Date().toISOString());
 }
-/** A pid that WAS a process and is now gone, with its real start token. */
+/** A pid that WAS a process and is now gone, with its real start token (the UTC form, suffixed). */
 function deadPid(): { pid: number; start: string } {
-  const r = spawnSync("sh", ["-c", 'sleep 0.3 & p=$!; LC_ALL=C ps -o lstart= -p $p; echo "$p"; wait'], { encoding: "utf-8" });
+  const r = spawnSync("sh", ["-c", 'sleep 0.3 & p=$!; TZ=UTC LC_ALL=C ps -o lstart= -p $p; echo "$p"; wait'], { encoding: "utf-8" });
   const [start, pid] = r.stdout.trim().split("\n").map((s) => s.trim());
-  return { pid: Number(pid), start };
+  return { pid: Number(pid), start: start + START_TOKEN_UTC_SUFFIX };
 }
 
 describe("ADR-0047 PR 2 — schema v26: the connectors table", () => {
@@ -78,15 +78,43 @@ describe("ADR-0047 PR 2 — schema v26: the connectors table", () => {
   });
 });
 
+describe("ADR-0047 PR 2 — the connectors table is born UTC-only (architect ae078834, condition 2)", () => {
+  it("the table REFUSES a start token without the UTC suffix, for the connector and for its window anchor", () => {
+    expect(() => plant({ pid: 999_001, pid_start: "Thu Oct  1 15:37:33 2026" })).toThrow(/CHECK constraint failed/);
+    expect(() =>
+      db
+        .getDb()
+        .prepare(
+          "INSERT INTO connectors (edge_id, pid, pid_start, parent_pid, parent_start, build_id, install_dir, host_id, started_at) " +
+            "VALUES (?, 999002, 'Thu Oct  1 07:37:33 2026 UTC', 1, 'Thu Oct  1 15:37:33 2026', 'x', '/i', 'h', 'now')",
+        )
+        .run(edge()),
+    ).toThrow(/CHECK constraint failed/);
+    expect(() => plant({ pid: 999_003, pid_start: "Thu Oct  1 07:37:33 2026 utc" })).toThrow(/CHECK constraint failed/); // exact, case-sensitive
+    plant({ pid: 999_004, pid_start: "Thu Oct  1 07:37:33 2026 UTC" }); // the suffixed form is accepted
+    expect(rows().map((r) => r.pid)).toEqual([999_004]);
+  });
+  it("the CHECK literal is the ONE suffix constant (START_TOKEN_UTC_SUFFIX)", () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "src", "db.ts"), "utf-8");
+    const checks = [...src.matchAll(/substr\((pid_start|parent_start), -(\d+)\) = '([^']*)'/g)];
+    expect(checks.map((m) => m[1]).sort()).toEqual(["parent_start", "pid_start"]);
+    for (const m of checks) {
+      expect(m[3]).toBe(START_TOKEN_UTC_SUFFIX);
+      expect(Number(m[2])).toBe(START_TOKEN_UTC_SUFFIX.length);
+    }
+  });
+});
+
 describe("ADR-0047 PR 2 — the writer: a connector writes ONLY its own row", () => {
   it("the row is keyed by THIS process's pid and its own start token; the build is the one LOADED", () => {
-    db.recordOwnConnector({ parent: { pid: 4242, startedAt: "Mon Sep 28 11:17:16 2026" }, build: LOADED_BUILD });
+    db.recordOwnConnector({ parent: { pid: 4242, startedAt: "Mon Sep 28 03:17:16 2026 UTC" }, build: LOADED_BUILD });
     const [r] = rows();
     expect(r.pid).toBe(process.pid);
     expect(r.pid_start).toBe(processStartedAt(process.pid));
+    expect(String(r.pid_start).endsWith(START_TOKEN_UTC_SUFFIX)).toBe(true); // born UTC-only
     expect(r.edge_id).toBe(edge());
     expect(r.parent_pid).toBe(4242);
-    expect(r.parent_start).toBe("Mon Sep 28 11:17:16 2026");
+    expect(r.parent_start).toBe("Mon Sep 28 03:17:16 2026 UTC"); // the detector's suffixed window anchor
     expect(r.build_id).toBe(LOADED_BUILD.build_id);
     expect(r.deps_id).toBe(LOADED_BUILD.deps_id);
     expect(r.deps_state).toBe(LOADED_BUILD.deps_state);
@@ -116,7 +144,7 @@ describe("ADR-0047 PR 2 — liveConnectors: liveness from the pid AND its start 
     db.recordOwnConnector({ parent: null, build: LOADED_BUILD });
     const d = deadPid();
     plant({ pid: d.pid, pid_start: d.start });
-    plant({ pid: process.ppid, pid_start: "Thu Jan  1 00:00:00 1970" }); // a live pid, another incarnation
+    plant({ pid: process.ppid, pid_start: "Thu Jan  1 00:00:00 1970 UTC" }); // a live pid, another incarnation
     const live = db.liveConnectors();
     expect(live.map((r) => r.pid)).toEqual([process.pid]);
   });
@@ -162,7 +190,7 @@ describe("ADR-0047 PR 2 — purgeDeadConnectors: POSITIVELY dead and older than 
     expect(rows().map((x) => x.pid).sort()).toEqual([d2.pid, process.pid, process.ppid].sort());
   });
   it("a live pid whose start cannot be read is not 'positively dead' (kept)", () => {
-    plant({ pid: process.pid, pid_start: "whatever", started_at: new Date(Date.now() - 8 * DAY).toISOString() });
+    plant({ pid: process.pid, pid_start: "whatever UTC", started_at: new Date(Date.now() - 8 * DAY).toISOString() });
     expect(db.purgeDeadConnectors({ startOf: () => null }).purged).toBe(0);
   });
   it("ONE purger: only the daemon calls it (D5)", () => {

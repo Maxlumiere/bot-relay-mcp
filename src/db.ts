@@ -2027,6 +2027,7 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
  *   - NO status column: liveness is derived at read time from the pid AND its start
  *     token (liveConnectors), so a stored status can never outlive the process.
  *   - ADR-0043: every key starts with edge_id, and a foreign edge is refused.
+ *   - Start tokens are the UTC form ONLY (a CHECK): no legacy acceptance here.
  */
 function migrateSchemaToV2_26(db: CompatDatabase): void {
   ensureRelayEdge(db);
@@ -2050,7 +2051,12 @@ function migrateSchemaToV2_26(db: CompatDatabase): void {
 const CONNECTORS_COLUMNS =
   "(edge_id TEXT NOT NULL, pid INTEGER NOT NULL, pid_start TEXT NOT NULL, parent_pid INTEGER, parent_start TEXT, " +
   "build_id TEXT NOT NULL, deps_id TEXT, deps_state TEXT, node TEXT, commit_sha TEXT, dirty INTEGER, built_at TEXT, resolver_revision TEXT, " +
-  "install_dir TEXT NOT NULL, host_id TEXT, started_at TEXT NOT NULL, PRIMARY KEY (edge_id, pid, pid_start))";
+  "install_dir TEXT NOT NULL, host_id TEXT, started_at TEXT NOT NULL, " +
+  // Born UTC-only (architect ae078834, condition 2): every start token here carries
+  // the provenance suffix (START_TOKEN_UTC_SUFFIX, pinned to this literal by test).
+  // A legacy (unsuffixed) token can never enter, so no reader here needs legacy acceptance.
+  "CHECK (substr(pid_start, -4) = ' UTC'), CHECK (parent_start IS NULL OR substr(parent_start, -4) = ' UTC'), " +
+  "PRIMARY KEY (edge_id, pid, pid_start))";
 
 /** The install this module was loaded from (dist/.. or src/..), as a realpath. */
 function ownInstallDir(): string {
