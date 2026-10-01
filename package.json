@@ -88,6 +88,6 @@
   "overrides": {
     "hono": "^4.12.34",
     "fast-uri": "4.1.4",
-    "ip-address": "^10.4.0"
+    "ip-address": "^10.7.2"
   }
 }
