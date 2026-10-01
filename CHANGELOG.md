@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added — `relay fleet --connectors`: does every agent window run the installed build?
+
+After a relay install, each agent window keeps the relay code it loaded until it restarts, and nothing said which windows were still on the old code. `relay fleet --connectors` lists every relay connector process on this machine with a verdict: `CURRENT` (runs the installed build), `STALE` (restart that window), `UNKNOWN` (it cannot be shown to run the installed build: for example it started before this release), `INSTALL INCONSISTENT` (rebuild the install), or, for a live window with no connector at all, `NO CONNECTOR`. A connector that no window binding names is marked `UNBOUND`. The daemon gets the same check on its own install. `--json` gives the whole judgement. Read-only; see `docs/cli.md`. Known gap: a window that reaches the relay over HTTP reads `NO CONNECTOR` for now.
+
+Tests: `tests/adr-0047-fleet-verdicts.test.ts`: the comparison table; recognising a connector from the process table (a path with a space, a symlinked launch, an ambiguous path, node options, a relative script); every verdict and label; the daemon line; and that none of it reaches the off-machine dashboard push.
+
 ### Fixed — `zod-to-json-schema` is a declared dependency
 
 The relay imports `zod-to-json-schema` directly, but it was only installed as a dependency of the MCP SDK. It is now declared, so the relay's own copy is the one that is installed and resolved.
