@@ -131,7 +131,13 @@ function script(h: import("better-sqlite3").Database, beforeUpdate: () => void =
   beforeUpdate();
   out.push(["current A", cur(A)], ["current B", cur(B)], ["list", list()]);
   beforeUpdate();
-  out.push(["migrate A", db.migrateLegacyBindingAnchor(h as never, A_UTC, START)]); // legacy start-token move UPDATE
+  out.push(["migrate A", db.migrateLegacyBindingAnchor(h as never, A_UTC, { start: START })]); // legacy start-token move UPDATE
+  out.push(["current A (legacy)", cur(A)], ["current A (utc)", cur(A_UTC)], ["list", list()]);
+  beforeUpdate();
+  // The both-forms state: a legacy-anchored row is current again beside the UTC one; the migration converges it.
+  out.push(["claim A legacy again", norm(write(h, A, "arch", "c5"))]);
+  beforeUpdate();
+  out.push(["collapse A", db.migrateLegacyBindingAnchor(h as never, A_UTC, { start: START })]); // legacy collapse UPDATE
   out.push(["current A (legacy)", cur(A)], ["current A (utc)", cur(A_UTC)], ["list", list()]);
   return out;
 }
@@ -197,7 +203,8 @@ describe("ADR-0046 — edge scope, metamorphic: foreign rows that collide on nam
     h.close();
     for (const want of ["created", "superseded-and-created", "refreshed"]) expect(r).toContain(want);
     expect(r).toContain('"end A",true');
-    expect(r).toContain('"migrate A",true');
+    expect(r).toContain('"migrate A","moved"');
+    expect(r).toContain('"collapse A","collapsed"');
   });
 });
 
@@ -205,7 +212,7 @@ describe("ADR-0046 — edge scope, metamorphic: foreign rows that collide on nam
  * Two-sided coverage pin: the metamorphic script above must exercise EVERY local
  * write statement on agent_bindings. These are the ones src/db.ts holds today (bind =
  * the create INSERT; resume-switch and clear-carry = the supersede UPDATE + INSERT;
- * refresh; end; the legacy start-token move). There is NO release write on agent_bindings on this branch
+ * refresh; end; the legacy start-token move and collapse). There is NO release write on agent_bindings on this branch
  * (releaseAgentBinding writes only `agents`); when one is added (S3-lite), this pin
  * fails until the script covers it.
  */
@@ -222,6 +229,7 @@ describe("ADR-0046 — every agent_bindings write path is in the metamorphic scr
         "UPDATE agent_bindings SET last_verified_at", // refresh
         "UPDATE agent_bindings SET superseded_at", // supersede (resume-switch, clear-carry)
         "UPDATE agent_bindings SET window_pid_start", // the legacy start-token move (migrateLegacyBindingAnchor)
+        "UPDATE agent_bindings SET superseded_at", // the legacy collapse (migrateLegacyBindingAnchor, both forms current)
       ].sort(),
     );
   });

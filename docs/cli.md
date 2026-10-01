@@ -26,7 +26,7 @@ $ relay doctor
 Result: healthy
 ```
 
-Checks: config.json shape + validation; `schema_info.version` matches `CURRENT_SCHEMA_VERSION`; DB + parent dir perms; disk space >100MB; optional `/health` probe; SessionStart/PostToolUse/Stop hooks in `~/.claude/settings.json`.
+Checks: config.json shape + validation; `schema_info.version` matches `CURRENT_SCHEMA_VERSION`; start tokens (legacy form), see `docs/deployment.md`; DB + parent dir perms; disk space >100MB; optional `/health` probe; SessionStart/PostToolUse/Stop hooks in `~/.claude/settings.json`.
 
 ## `relay init`
 

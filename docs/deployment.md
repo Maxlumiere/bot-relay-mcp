@@ -18,6 +18,15 @@ RELAY_TRANSPORT=http RELAY_HTTP_PORT=3777 node dist/index.js
 
 See the `relay doctor --remote` runbook in `docs/multi-machine-deployment.md`.
 
+## Upgrading across the UTC start-token change
+
+The relay tells a live window from a dead one, and from a process that reused its id, by the process start time (`TZ=UTC LC_ALL=C ps -o lstart= -p PID` plus the suffix ` UTC`). Start times recorded before this change are in the machine's local time and have no suffix. The relay accepts both forms until every window has restarted, and compares each form only with a reading in that form.
+
+- **Deploy in one go:** update the tree, build, and restart the daemon back to back, then restart every agent window. The hooks run from disk, so they write the new form as soon as the tree is updated. Until it restarts, an old daemon or connector compares in local time and reads windows anchored in the new form as dead.
+- **During the transition, one guard keeps a window to one current binding: `relay bind`.** The database's unique index on a window's anchor (`idx_agent_bindings_current_anchor`) cannot stop a window from holding a pre-UTC row and a UTC row at once, because the two spellings are different strings. So `relay bind` moves a window's pre-UTC row onto its UTC start time, retires the pre-UTC row when both are current, and refuses to bind (with a reason, writing nothing) when it cannot read the window's pre-UTC start time while a pre-UTC row for that process id is current. Once the older form is retired, the index covers this state again.
+- **`relay doctor`, "start tokens (legacy form)":** counts the live anchors still in the older form and the ones it could not read, and lists any window with more than one current binding as an ANOMALY. It is PASS only when all three are zero. When it reads PASS on every machine, the older form can be retired.
+- **Known limit:** a start time recorded by a shell that set `TZ` explicitly is not recognised. That window reads dead until its next tool call rewrites the start time in UTC.
+
 ## stdio TTY guard
 
 When `transport=stdio`, `bot-relay-mcp` checks whether stdin is a TTY. Running `node dist/index.js` with non-TTY stdin in a background shell is almost always a mistake: the stdio transport exits the moment stdin closes, so the "daemon" dies silently as soon as the invoking shell finishes the command.

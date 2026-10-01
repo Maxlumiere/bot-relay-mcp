@@ -440,6 +440,18 @@ export function processStartedAt(
   return form === "utc" ? out + START_TOKEN_UTC_SUFFIX : out;
 }
 
+/**
+ * What a binder read for a window's start in the LEGACY form: the token, or that
+ * the read failed. A failed read is "cannot judge", never "no legacy row"
+ * (migrateLegacyBindingAnchor refuses to bind beside a pre-UTC row on it).
+ */
+export type LegacyStartProbe = { start: string } | { unreadable: true };
+
+export function readLegacyStartProbe(pid: number, run: CommandRunner = defaultRunner): LegacyStartProbe {
+  const start = processStartedAt(pid, run, "legacy");
+  return start === null ? { unreadable: true } : { start };
+}
+
 export type StartTokenObservation = "utc" | "legacy" | "mismatch" | "unreadable";
 
 /**

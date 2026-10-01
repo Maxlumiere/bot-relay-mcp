@@ -153,7 +153,7 @@ export async function run(argv: string[]): Promise<number> {
   const endReason = typeof payload.reason === "string" ? payload.reason : null;
 
   // --- the window anchor ---------------------------------------------------
-  const { detectAgentProcess, getOwnHostId, processStartedAt } = await import("../liveness.js");
+  const { detectAgentProcess, getOwnHostId, readLegacyStartProbe } = await import("../liveness.js");
   const { resolveWindowAnchor, resolveBindCwd, boundViaForSource, resolveAgentName } = await import("../binding.js");
 
   const rawClaudePid = Number.parseInt(process.env.CLAUDE_PID ?? "", 10);
@@ -224,13 +224,13 @@ export async function run(argv: string[]): Promise<number> {
 
     // MIGRATION (the start-token TZ pin): a row this window wrote in the legacy
     // form moves onto the UTC anchor INSIDE the end's / the upsert's transaction.
-    const legacyStart = processStartedAt(anchor.windowPid, undefined, "legacy");
+    const legacy = readLegacyStartProbe(anchor.windowPid);
 
     if (args.end) {
       if (!endReason) {
         return bindFailed("--end needs the SessionEnd payload's reason, and this payload carries none");
       }
-      const ok = endAgentBinding(db, anchor, endReason, legacyStart);
+      const ok = endAgentBinding(db, anchor, endReason, legacy);
       if (!ok) {
         return bindFailed(
           `this window (pid ${anchor.windowPid}) has no current binding to end — nothing was recorded`,
@@ -255,7 +255,7 @@ export async function run(argv: string[]): Promise<number> {
         cwd,
         boundVia,
       },
-      { supersedeReason: source === "clear" ? "clear-carry" : "resume-switch", legacyStart },
+      { supersedeReason: source === "clear" ? "clear-carry" : "resume-switch", legacy },
     );
 
     // ANNOUNCE — a human and an agent both read this. Name the identity, the

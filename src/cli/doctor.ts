@@ -170,8 +170,18 @@ async function checkDb(p: string): Promise<CheckResult[]> {
  */
 export function legacyStartTokenCheck(c: import("../db.js").LegacyStartTokenCount): CheckResult {
   const name = "start tokens (legacy form)";
-  if (!c.ownHostKnown) return { name, status: "WARN", detail: "cannot count: this host's id is unknown" };
   const parts: string[] = [];
+  // Reported first and on every host: the both-forms state must never hide.
+  if (c.duplicateWindows.length > 0) {
+    parts.push(
+      "ANOMALY, a window with more than one current binding: " +
+        c.duplicateWindows.map((d) => `${d.host_id} pid ${d.window_pid} (${d.rows} rows)`).join(", "),
+    );
+  }
+  if (!c.ownHostKnown) {
+    parts.push("cannot count: this host's id is unknown");
+    return { name, status: "WARN", detail: parts.join("; ") };
+  }
   if (c.total > 0) {
     parts.push(
       `${c.total} live anchor(s) still in the pre-UTC local-time form (agents ${c.agents}, bindings ${c.bindings}); ` +
@@ -179,7 +189,7 @@ export function legacyStartTokenCheck(c: import("../db.js").LegacyStartTokenCoun
     );
   }
   if (c.unreadable > 0) parts.push(`${c.unreadable} live pre-UTC anchor(s) whose start time could not be read: cannot judge`);
-  if (parts.length === 0) return { name, status: "PASS", detail: "0 live anchors in the pre-UTC form" };
+  if (parts.length === 0) return { name, status: "PASS", detail: "0 live anchors in the pre-UTC form, one current binding per window" };
   return { name, status: "WARN", detail: parts.join("; ") };
 }
 

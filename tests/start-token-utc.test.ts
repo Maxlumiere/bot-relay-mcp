@@ -47,6 +47,7 @@ const {
   observeStartTokenForm,
   startTokenEnv,
   START_TOKEN_UTC_SUFFIX,
+  readLegacyStartProbe,
   _resetOwnHostIdForTests,
 } = await import("../src/liveness.js");
 type CommandRunner = import("../src/liveness.js").CommandRunner;
@@ -209,6 +210,11 @@ describe("readers dispatch on the suffix; the legacy form is accepted only unsuf
     });
   }
 
+  it("the binder's legacy probe: a token when readable, and an EXPLICIT unreadable (never a silent no-probe) when not", () => {
+    expect(readLegacyStartProbe(4242, twoFormRunner(UTC_RAW, LEGACY_T))).toEqual({ start: LEGACY_T });
+    expect(readLegacyStartProbe(4242, twoFormRunner(UTC_RAW, null))).toEqual({ unreadable: true });
+  });
+
   it("ONE read per probe: a suffixed token reads only the UTC form, an unsuffixed one only the legacy form", () => {
     const calls: string[] = [];
     observeStartTokenForm(4242, UTC_T, twoFormRunner(UTC_RAW, LEGACY_T, calls));
@@ -287,7 +293,15 @@ describe("the legacy count is measurable, and never a false zero (gates deleting
     binding("b-superseded", LIVE, LEGACY_T, OWN, true); // not current
     binding("b-foreign", LIVE, LEGACY_T, "other-host"); // another host's window
     const c = countLegacyStartTokens(twoFormRunner(UTC_RAW, LEGACY_T));
-    expect(c).toEqual({ ownHostKnown: true, agents: 1, bindings: 1, total: 2, unreadable: 0 });
+    // b-legacy + b-utc on one window IS the both-forms state, so the anomaly is reported too.
+    expect(c).toEqual({
+      ownHostKnown: true,
+      agents: 1,
+      bindings: 1,
+      total: 2,
+      unreadable: 0,
+      duplicateWindows: [{ host_id: OWN, window_pid: LIVE, rows: 2 }],
+    });
     expect(legacyStartTokenCheck(c).status).toBe("WARN");
   });
 
@@ -295,7 +309,7 @@ describe("the legacy count is measurable, and never a false zero (gates deleting
     anchor("a-legacy", LIVE, LEGACY_T, OWN);
     anchor("a-utc", LIVE, UTC_T, OWN); // a migrated row is not part of the question
     const c = countLegacyStartTokens(twoFormRunner(null, null));
-    expect(c).toEqual({ ownHostKnown: true, agents: 0, bindings: 0, total: 0, unreadable: 1 });
+    expect(c).toEqual({ ownHostKnown: true, agents: 0, bindings: 0, total: 0, unreadable: 1, duplicateWindows: [] });
     const check = legacyStartTokenCheck(c);
     expect(check.status).toBe("WARN");
     expect(check.detail).toMatch(/could not be read: cannot judge/);
@@ -304,15 +318,26 @@ describe("the legacy count is measurable, and never a false zero (gates deleting
   it("PASS only on a certified zero", () => {
     anchor("a-utc", LIVE, UTC_T, OWN);
     const c = countLegacyStartTokens(twoFormRunner(UTC_RAW, LEGACY_T));
-    expect(c).toEqual({ ownHostKnown: true, agents: 0, bindings: 0, total: 0, unreadable: 0 });
+    expect(c).toEqual({ ownHostKnown: true, agents: 0, bindings: 0, total: 0, unreadable: 0, duplicateWindows: [] });
     expect(legacyStartTokenCheck(c).status).toBe("PASS");
+  });
+
+  it("architect 1250296a (b): a window with MORE THAN ONE current binding is reported as an anomaly, listed", () => {
+    binding("b-1", LIVE, LEGACY_T, OWN);
+    binding("b-2", LIVE, UTC_T, OWN); // the both-forms state: the unique index cannot stop it
+    binding("b-other", LIVE + 1, UTC_T, OWN);
+    const c = countLegacyStartTokens(twoFormRunner(UTC_RAW, LEGACY_T));
+    expect(c.duplicateWindows).toEqual([{ host_id: OWN, window_pid: LIVE, rows: 2 }]);
+    const check = legacyStartTokenCheck(c);
+    expect(check.status).toBe("WARN");
+    expect(check.detail).toContain(`more than one current binding: ${OWN} pid ${LIVE} (2 rows)`);
   });
 
   it("an unknown own host counts nothing and says so (never a false zero)", () => {
     _resetOwnHostIdForTests(null);
     anchor("a-legacy", LIVE, LEGACY_T, OWN);
     const c = countLegacyStartTokens(twoFormRunner(UTC_RAW, LEGACY_T));
-    expect(c).toEqual({ ownHostKnown: false, agents: 0, bindings: 0, total: 0, unreadable: 0 });
+    expect(c).toEqual({ ownHostKnown: false, agents: 0, bindings: 0, total: 0, unreadable: 0, duplicateWindows: [] });
     expect(legacyStartTokenCheck(c).status).toBe("WARN");
   });
 });
@@ -343,7 +368,7 @@ describe("migration: a window bound in the legacy form keeps ONE current binding
   it("a re-bind after the pin REFRESHES the legacy row (moved onto the UTC anchor in the same transaction), never a second current row", () => {
     const db = getDb();
     const legacyRow = upsertAgentBinding(db, write(LEGACY_T));
-    const r = upsertAgentBinding(db, write(UTC_T), { legacyStart: LEGACY_T });
+    const r = upsertAgentBinding(db, write(UTC_T), { legacy: { start: LEGACY_T } });
     expect(r.action).toBe("refreshed");
     expect(current()).toEqual([
       { binding_id: legacyRow.bindingId, agent_name: "w", window_pid_start: UTC_T, conversation_id: "conv-1", end_reason: null },
@@ -353,7 +378,7 @@ describe("migration: a window bound in the legacy form keeps ONE current binding
   it("an end after the pin is recorded on the legacy row", () => {
     const db = getDb();
     upsertAgentBinding(db, write(LEGACY_T));
-    expect(endAgentBinding(db, UTC_ANCHOR, "logout", LEGACY_T)).toBe(true);
+    expect(endAgentBinding(db, UTC_ANCHOR, "logout", { start: LEGACY_T })).toBe(true);
     expect(current().map((c) => [c.window_pid_start, c.end_reason])).toEqual([[UTC_T, "logout"]]);
   });
 
@@ -362,7 +387,7 @@ describe("migration: a window bound in the legacy form keeps ONE current binding
     // New York: A's UTC token; B's legacy lstart equals A's raw UTC lstart.
     upsertAgentBinding(db, write("Thu Oct  1 07:37:33 2026 UTC", "A"));
     const B = "Thu Oct  1 11:37:33 2026 UTC";
-    const r = upsertAgentBinding(db, write(B, "B"), { legacyStart: "Thu Oct  1 07:37:33 2026" });
+    const r = upsertAgentBinding(db, write(B, "B"), { legacy: { start: "Thu Oct  1 07:37:33 2026" } });
     expect(r.action).toBe("created");
     expect(current().filter((c) => c.window_pid_start === B).map((c) => c.agent_name)).toEqual(["B"]);
     expect(current().find((c) => c.agent_name === "A")?.window_pid_start).toBe("Thu Oct  1 07:37:33 2026 UTC");
@@ -394,7 +419,7 @@ describe("migration: a window bound in the legacy form keeps ONE current binding
   it("Codex R1 #2: a BUSY migration is RETRIED with its upsert, never swallowed into a second current row", () => {
     const real = getDb();
     const legacyRow = upsertAgentBinding(real, write(LEGACY_T));
-    const r = upsertAgentBinding(busyOnce(real) as never, write(UTC_T), { legacyStart: LEGACY_T });
+    const r = upsertAgentBinding(busyOnce(real) as never, write(UTC_T), { legacy: { start: LEGACY_T } });
     expect(r.action).toBe("refreshed");
     expect(current().map((c) => [c.binding_id, c.window_pid_start])).toEqual([[legacyRow.bindingId, UTC_T]]);
   });
@@ -402,7 +427,7 @@ describe("migration: a window bound in the legacy form keeps ONE current binding
   it("Codex R1 #2: contention past the budget FAILS the bind loudly and writes nothing", () => {
     const real = getDb();
     upsertAgentBinding(real, write(LEGACY_T));
-    expect(() => upsertAgentBinding(busyOnce(real, 1_000_000) as never, write(UTC_T), { legacyStart: LEGACY_T, budgetMs: 300 })).toThrow(
+    expect(() => upsertAgentBinding(busyOnce(real, 1_000_000) as never, write(UTC_T), { legacy: { start: LEGACY_T }, budgetMs: 300 })).toThrow(
       /bind deadline exceeded/,
     );
     expect(current().map((c) => c.window_pid_start)).toEqual([LEGACY_T]);
@@ -411,7 +436,7 @@ describe("migration: a window bound in the legacy form keeps ONE current binding
   it("Codex R1 #2: a BUSY migration on the end path throws (loud), and ends nothing", () => {
     const real = getDb();
     upsertAgentBinding(real, write(LEGACY_T));
-    expect(() => endAgentBinding(busyOnce(real) as never, UTC_ANCHOR, "logout", LEGACY_T)).toThrow(/locked/);
+    expect(() => endAgentBinding(busyOnce(real) as never, UTC_ANCHOR, "logout", { start: LEGACY_T })).toThrow(/locked/);
     expect(current().map((c) => [c.window_pid_start, c.end_reason])).toEqual([[LEGACY_T, null]]);
   });
 
@@ -421,15 +446,49 @@ describe("migration: a window bound in the legacy form keeps ONE current binding
     db.prepare("UPDATE agent_bindings SET window_pid_start = ? WHERE window_pid_start = ?").run(LEGACY_T, UTC_T);
     upsertAgentBinding(db, write(UTC_T, "w", "conv-2"));
     expect(current()).toHaveLength(2);
-    const r = upsertAgentBinding(db, write(UTC_T, "w", "conv-2"), { legacyStart: LEGACY_T, budgetMs: 300 });
+    const r = upsertAgentBinding(db, write(UTC_T, "w", "conv-2"), { legacy: { start: LEGACY_T }, budgetMs: 300 });
     expect(r.action).toBe("refreshed");
+  });
+
+  it("Codex R2 #1: an UNREADABLE legacy probe with a pre-UTC current binding for this window REFUSES the bind (loud, nothing written)", () => {
+    const db = getDb();
+    upsertAgentBinding(db, write(LEGACY_T));
+    expect(() => upsertAgentBinding(db, write(UTC_T), { legacy: { unreadable: true }, budgetMs: 300 })).toThrow(
+      /start time in the pre-UTC form could not be read/,
+    );
+    expect(current().map((c) => c.window_pid_start)).toEqual([LEGACY_T]);
+    expect(() => endAgentBinding(db, UTC_ANCHOR, "logout", { unreadable: true })).toThrow(/could not be read/);
+    expect(current().map((c) => [c.window_pid_start, c.end_reason])).toEqual([[LEGACY_T, null]]);
+  });
+
+  it("an unreadable legacy probe with NO pre-UTC current binding for this window binds normally", () => {
+    const db = getDb();
+    upsertAgentBinding(db, { ...write(LEGACY_T), windowPid: PID + 1 }); // another window's legacy row
+    upsertAgentBinding(db, write("Wed Sep 30 01:00:00 2026 UTC", "old", "conv-0")); // this pid, CURRENT, UTC form only
+    const r = upsertAgentBinding(db, write(UTC_T), { legacy: { unreadable: true } });
+    expect(r.action).toBe("created");
+  });
+
+  it("Codex R2 #1: both forms current for one window CONVERGE: the bind supersedes the legacy row by the UTC one", () => {
+    const db = getDb();
+    const utcRow = upsertAgentBinding(db, write(UTC_T));
+    db.prepare(
+      "INSERT INTO agent_bindings (binding_id, edge_id, agent_name, conversation_id, host_id, window_pid, window_pid_start, bound_via, bound_at) " +
+        "VALUES ('legacy-dup', ?, 'w', 'conv-1', ?, ?, ?, 'test', '2026-09-30T00:00:00Z')",
+    ).run(getLocalEdgeId(db), HOST, PID, LEGACY_T);
+    expect(current()).toHaveLength(2);
+    const r = upsertAgentBinding(db, write(UTC_T), { legacy: { start: LEGACY_T } });
+    expect(r.action).toBe("refreshed");
+    expect(current().map((c) => c.binding_id)).toEqual([utcRow.bindingId]);
+    const legacy = db.prepare("SELECT superseded_by, supersede_reason FROM agent_bindings WHERE binding_id = 'legacy-dup'").get();
+    expect(legacy).toEqual({ superseded_by: utcRow.bindingId, supersede_reason: "start-token-migration" });
   });
 
   it("never moves another window's row (pid and host are part of the match)", () => {
     const db = getDb();
     upsertAgentBinding(db, { ...write(LEGACY_T), windowPid: PID + 1 });
     upsertAgentBinding(db, { ...write(LEGACY_T), hostId: "other-host" });
-    const r = upsertAgentBinding(db, write(UTC_T), { legacyStart: LEGACY_T });
+    const r = upsertAgentBinding(db, write(UTC_T), { legacy: { start: LEGACY_T } });
     expect(r.action).toBe("created");
     expect(current().filter((c) => c.window_pid_start === LEGACY_T)).toHaveLength(2);
   });
