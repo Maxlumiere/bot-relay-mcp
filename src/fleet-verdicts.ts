@@ -325,14 +325,22 @@ export interface FleetSnapshot {
   nodeOnPath: string | null;
 }
 
+/**
+ * What a fleet entry IS: a classified relay connector, or a node process that could not be
+ * classified. This is the CONNECTOR-classification kind, not the agent coordination class
+ * (src/agent-class.ts): the two only share a word. Branch on these constants, never a literal.
+ */
+export const CONNECTOR_KIND = { connector: "connector", unclassified: "unclassified" } as const;
+export type ConnectorKind = (typeof CONNECTOR_KIND)[keyof typeof CONNECTOR_KIND];
+
 export interface ConnectorEntry {
   pid: number;
   start: string;
   /** The bound agent name, or null with `unbound: true`. */
   agent: string | null;
   unbound: boolean;
-  /** "unclassified" when the process could not be classified and has no row. */
-  kind: "connector" | "unclassified";
+  /** CONNECTOR_KIND.unclassified when the process could not be classified and has no row. */
+  kind: ConnectorKind;
   window_pid: number | null;
   install_dir: string | null;
   has_row: boolean;
@@ -449,7 +457,7 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
       start: r.pid_start,
       agent: b ? b.agent_name ?? "(unnamed)" : null,
       unbound: !b,
-      kind: "connector",
+      kind: CONNECTOR_KIND.connector,
       window_pid: r.parent_pid ?? (b ? b.window_pid : null),
       install_dir: r.install_dir,
       has_row: true,
@@ -472,7 +480,7 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
       start: p.start,
       agent: b ? b.agent_name ?? "(unnamed)" : null,
       unbound: !b,
-      kind: c.kind === "connector" ? "connector" : "unclassified",
+      kind: c.kind === "connector" ? CONNECTOR_KIND.connector : CONNECTOR_KIND.unclassified,
       window_pid: b ? b.window_pid : null,
       install_dir: c.kind === "connector" ? c.installDir : null,
       has_row: false,

@@ -217,7 +217,7 @@ export async function run(argv: string[]): Promise<number> {
 async function listConnectors(db: import("../sqlite-compat.js").CompatDatabase, dbPath: string, json: boolean): Promise<number> {
   const { hasConnectorsTable, liveConnectors, listAgentBindings } = await import("../db.js");
   const { anchorLivenessVerdict, getOwnHostId } = await import("../liveness.js");
-  const { observeFleet, judgeFleet } = await import("../fleet-verdicts.js");
+  const { observeFleet, judgeFleet, CONNECTOR_KIND } = await import("../fleet-verdicts.js");
   const { realSystemDeps } = await import("../fleet-system.js");
   if (!hasConnectorsTable(db)) {
     return fleetFailed(
@@ -253,7 +253,7 @@ async function listConnectors(db: import("../sqlite-compat.js").CompatDatabase, 
   const head = ["VERDICT", "AGENT", "PID", "WINDOW", "INSTALL", "WHY"];
   const body = j.connectors.map((e) => [
     e.verdict,
-    e.kind === "unclassified" ? "(unclassified)" : e.unbound ? "UNBOUND" : (e.agent as string),
+    e.kind === CONNECTOR_KIND.unclassified ? "(unclassified)" : e.unbound ? "UNBOUND" : (e.agent as string),
     String(e.pid),
     e.window_pid === null ? "-" : String(e.window_pid),
     e.install_dir ?? "-",
