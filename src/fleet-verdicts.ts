@@ -405,8 +405,8 @@ export interface DaemonView {
   port: number;
   /** Pids listening on the configured port; {error} when that cannot be read. */
   listenerPids: number[] | { error: string };
-  /** /health.build, or why it could not be read. */
-  health: { ok: true; build: LoadedFacts } | { ok: false; error: string };
+  /** /health.build, or why not; `unreachable` = the HTTP read itself failed (cannot verify), not a daemon without a stamp. */
+  health: { ok: true; build: LoadedFacts } | { ok: false; error: string; unreachable?: boolean };
 }
 
 export interface FleetSnapshot {
@@ -790,9 +790,69 @@ export async function observeFleet(sys: SystemDeps, db: DbReads, port: number): 
     daemon: {
       port,
       listenerPids: portListeners,
-      health: healthRead.ok ? healthBuild(healthRead.body) : { ok: false, error: healthRead.error },
+      health: healthRead.ok ? healthBuild(healthRead.body) : { ok: false, error: healthRead.error, unreachable: true },
     },
     installed: (dir) => sys.installed(dir),
     nodeOnPath: sys.nodeOnPath(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// PR 4 — the deploy check: the same engine, observed TWICE
+// ---------------------------------------------------------------------------
+
+export interface DeployCheckOutcome {
+  outcome: "PASS" | "FAIL" | "CANNOT-VERIFY";
+  /** 0 PASS · 1 FAIL · 3 CANNOT-VERIFY (the relay deploy-gate convention). */
+  exit: 0 | 1 | 3;
+  reason: string;
+  judgement: FleetJudgement;
+}
+
+/** Why this snapshot cannot support a verdict at all, or null. A daemon WITHOUT a stamp is a verdict (UNKNOWN → FAIL), not this. */
+export function cannotVerify(s: FleetSnapshot): string | null {
+  if (!Array.isArray(s.processes)) return `the process table cannot be read (${s.processes.error})`;
+  if (!Array.isArray(s.listeners)) return `the TCP listeners cannot be read (${s.listeners.error})`;
+  if (!Array.isArray(s.daemon.listenerPids)) return `the listener on port ${s.daemon.port} cannot be read (${s.daemon.listenerPids.error})`;
+  if (s.daemon.listenerPids.length > 0 && !s.daemon.health.ok && s.daemon.health.unreachable) {
+    return `the daemon's /health cannot be read (${s.daemon.health.error})`;
+  }
+  return null;
+}
+
+/** What two observations must agree on: every connector, window and the daemon, with its verdict. */
+export function fleetSignature(j: FleetJudgement): string {
+  return JSON.stringify({
+    c: j.connectors.map((e) => [e.pid, e.start, e.verdict]).sort(),
+    w: j.windows.map((w) => [w.window_pid, w.verdict, [...w.connectors].sort()]).sort(),
+    d: [j.daemon.pid, j.daemon.verdict],
+  });
+}
+
+/**
+ * `relay fleet --deploy-check`: PASS only when every relay connector on the host
+ * (bound or UNBOUND), every live bound window and the daemon read CURRENT, and a
+ * SECOND observation, taken just before the PASS, agrees (the relay deploy-gate
+ * pattern). A window restarting between the two is CANNOT-VERIFY, never a PASS on
+ * a half-read.
+ */
+export async function deployCheck(
+  observe: () => Promise<FleetSnapshot>,
+  opts: { judge?: (s: FleetSnapshot) => FleetJudgement; afterFirstObservation?: () => void | Promise<void> } = {},
+): Promise<DeployCheckOutcome> {
+  const judge = opts.judge ?? ((s: FleetSnapshot) => judgeFleet(s));
+  const s1 = await observe();
+  const j1 = judge(s1);
+  await opts.afterFirstObservation?.();
+  const s2 = await observe();
+  const j2 = judge(s2);
+  const blind = cannotVerify(s1) ?? cannotVerify(s2);
+  if (blind) return { outcome: "CANNOT-VERIFY", exit: 3, reason: blind, judgement: j2 };
+  if (fleetSignature(j1) !== fleetSignature(j2)) {
+    return { outcome: "CANNOT-VERIFY", exit: 3, reason: "the fleet changed while it was being checked: check again once the windows have settled", judgement: j2 };
+  }
+  if (j2.failing === 0) {
+    return { outcome: "PASS", exit: 0, reason: `${j2.connectors.length} connector(s) and the daemon run the installed build (observed twice)`, judgement: j2 };
+  }
+  return { outcome: "FAIL", exit: 1, reason: `${j2.failing} not CURRENT`, judgement: j2 };
 }

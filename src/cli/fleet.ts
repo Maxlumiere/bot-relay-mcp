@@ -36,16 +36,18 @@ import fs from "fs";
 interface Args {
   json: boolean;
   connectors: boolean;
+  deployCheck: boolean;
   dbPath: string | null;
   help: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { json: false, connectors: false, dbPath: null, help: false };
+  const args: Args = { json: false, connectors: false, deployCheck: false, dbPath: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") args.json = true;
     else if (a === "--connectors") args.connectors = true;
+    else if (a === "--deploy-check") args.deployCheck = true;
     else if (a === "--help" || a === "-h") args.help = true;
     else if (a === "--db-path") {
       const v = argv[++i];
@@ -58,7 +60,7 @@ function parseArgs(argv: string[]): Args {
 
 function usage(requested = false): void {
   const text =
-    "Usage: relay fleet [--connectors] [--json] [--db-path P]\n\n" +
+    "Usage: relay fleet [--connectors | --deploy-check] [--json] [--db-path P]\n\n" +
     "Lists every window binding the relay has recorded: which window holds which\n" +
     "identity, on which conversation, and whether that window is still alive.\n\n" +
     "Liveness is DERIVED from the recorded anchor each time you run this — it is\n" +
@@ -71,6 +73,10 @@ function usage(requested = false): void {
     "               needed), UNKNOWN, INSTALL INCONSISTENT (rebuild); a bound window\n" +
     "               with none reads NO CONNECTOR; plus the daemon's line. UNBOUND\n" +
     "               marks a connector no binding names.\n" +
+    "  --deploy-check  PASS only when every connector (bound or UNBOUND), every\n" +
+    "               live bound window and the daemon read CURRENT, observed twice.\n" +
+    "               Exit 0 PASS · 1 FAIL (each offender named) · 3 CANNOT-VERIFY\n" +
+    "               (the fleet changed between the two looks, or it cannot be read).\n" +
     "  --json       Emit the rows as JSON instead of a table.\n" +
     "  --db-path P  Read the DB at P (default: $RELAY_DB_PATH or the active\n" +
     "               instance's DB).\n\n" +
@@ -80,10 +86,14 @@ function usage(requested = false): void {
   else process.stderr.write(text);
 }
 
-/** One refusal vocabulary, mirroring BIND_FAILED. */
+/**
+ * One refusal vocabulary, mirroring BIND_FAILED. Under --deploy-check a board that
+ * cannot be read is CANNOT-VERIFY (3), never FAIL (1): the deploy-gate exit contract.
+ */
+let cannotReadExit = 1;
 function fleetFailed(reason: string): number {
   process.stderr.write(`FLEET_FAILED: ${reason}\n`);
-  return 1;
+  return cannotReadExit;
 }
 
 function pad(s: string, n: number): string {
@@ -103,6 +113,12 @@ export async function run(argv: string[]): Promise<number> {
     usage(true);
     return 0;
   }
+  if (args.connectors && args.deployCheck) {
+    process.stderr.write("relay fleet: --connectors and --deploy-check are different questions; pick one\n\n");
+    usage();
+    return 2;
+  }
+  cannotReadExit = args.deployCheck ? 3 : 1;
 
   // --- resolve the DB (no daemon, same as bind: §2.2 DB-direct) -------------
   if (args.dbPath) process.env.RELAY_DB_PATH = args.dbPath;
@@ -142,7 +158,7 @@ export async function run(argv: string[]): Promise<number> {
     }
 
     const ownHost = getOwnHostId();
-    if (args.connectors) return await listConnectors(db, dbPath, args.json);
+    if (args.connectors || args.deployCheck) return await listConnectors(db, dbPath, args.json, args.deployCheck);
     const rows = listAgentBindings(db).map((r) => ({
       ...r,
       // THE MAPPING. window_pid/window_pid_start ARE this window's anchor; the
@@ -214,10 +230,15 @@ export async function run(argv: string[]): Promise<number> {
  * readonly handle, at the instant of the process snapshot. Exit 0 when listed,
  * whatever the verdicts (the gate is `--deploy-check`); 1 when it cannot read.
  */
-async function listConnectors(db: import("../sqlite-compat.js").CompatDatabase, dbPath: string, json: boolean): Promise<number> {
+async function listConnectors(
+  db: import("../sqlite-compat.js").CompatDatabase,
+  dbPath: string,
+  json: boolean,
+  check = false,
+): Promise<number> {
   const { hasConnectorsTable, liveConnectors, listAgentBindings } = await import("../db.js");
   const { anchorLivenessVerdict, getOwnHostId } = await import("../liveness.js");
-  const { observeFleet, judgeFleet, CONNECTOR_KIND } = await import("../fleet-verdicts.js");
+  const { observeFleet, judgeFleet, deployCheck, CONNECTOR_KIND } = await import("../fleet-verdicts.js");
   const { realSystemDeps } = await import("../fleet-system.js");
   if (!hasConnectorsTable(db)) {
     return fleetFailed(
@@ -232,7 +253,7 @@ async function listConnectors(db: import("../sqlite-compat.js").CompatDatabase, 
     /* the env / default port: a wrong port reads the daemon UNKNOWN, never CURRENT */
   }
   const ownHost = getOwnHostId();
-  const snapshot = await observeFleet(
+  const observe = () => observeFleet(
     realSystemDeps,
     {
       liveRows: (startOf) => liveConnectors({ db, startOf }),
@@ -245,7 +266,8 @@ async function listConnectors(db: import("../sqlite-compat.js").CompatDatabase, 
     },
     port,
   );
-  const j = judgeFleet(snapshot);
+  if (check) return reportDeployCheck(await deployCheck(observe), json, CONNECTOR_KIND);
+  const j = judgeFleet(await observe());
   if (json) {
     process.stdout.write(JSON.stringify(j, null, 2) + "\n");
     return 0;
@@ -282,4 +304,30 @@ async function listConnectors(db: import("../sqlite-compat.js").CompatDatabase, 
       : `[RELAY] ${j.failing} not CURRENT: restart those windows (STALE/UNKNOWN), rebuild (INSTALL INCONSISTENT), or restart the daemon.\n`,
   );
   return 0;
+}
+
+/** PR 4 — print the deploy check's outcome. The verdict lines go to stdout; the exit code is the contract. */
+function reportDeployCheck(
+  o: import("../fleet-verdicts.js").DeployCheckOutcome,
+  json: boolean,
+  kinds: typeof import("../fleet-verdicts.js").CONNECTOR_KIND,
+): number {
+  if (json) {
+    process.stdout.write(JSON.stringify({ outcome: o.outcome, exit: o.exit, reason: o.reason, ...o.judgement }, null, 2) + "\n");
+    return o.exit;
+  }
+  process.stdout.write(`[RELAY] DEPLOY-CHECK ${o.outcome}: ${o.reason}\n`);
+  if (o.outcome !== "PASS") {
+    for (const e of o.judgement.connectors.filter((x) => x.verdict !== "CURRENT")) {
+      const who = e.kind === kinds.unclassified ? "unclassified node process" : e.unbound ? "UNBOUND" : `agent ${e.agent}`;
+      process.stdout.write(`  ${e.verdict}  pid ${e.pid} (${who})${e.install_dir ? ` from ${e.install_dir}` : ""}: ${e.reason}\n`);
+    }
+    for (const w of o.judgement.windows.filter((x) => x.connectors.length === 0 && x.verdict !== "CURRENT")) {
+      process.stdout.write(`  ${w.verdict}  window ${w.window_pid} (agent ${w.agent ?? "(unnamed)"}): ${w.reason}\n`);
+    }
+    if (o.judgement.daemon.verdict !== "CURRENT") {
+      process.stdout.write(`  ${o.judgement.daemon.verdict}  daemon${o.judgement.daemon.pid !== null ? ` pid ${o.judgement.daemon.pid}` : ""}: ${o.judgement.daemon.reason}\n`);
+    }
+  }
+  return o.exit;
 }
