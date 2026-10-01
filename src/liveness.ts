@@ -66,7 +66,8 @@ export function parseWindowsMachineGuid(regStdout: string): string | null {
 
 /**
  * The process START TOKEN, the PID-reuse guard, has ONE spelling:
- * `TZ=UTC LC_ALL=C ps -o lstart= -p PID`, trimmed. `lstart` is a wall-clock date,
+ * `TZ=UTC LC_ALL=C ps -o lstart= -p PID`, trimmed, plus the literal suffix
+ * START_TOKEN_UTC_SUFFIX (" UTC"). `lstart` is a wall-clock date,
  * so BOTH variables are pinned: LC_ALL=C fixes the format (v2.14.1), TZ=UTC fixes
  * the clock. Without the TZ pin, a writer and a reader with different TZ values
  * (a user shell, launchd, a connector) read the same live process differently,
@@ -74,15 +75,30 @@ export function parseWindowsMachineGuid(regStdout: string): string | null {
  * The bash twin is relay_pid_start in hooks/_vault-helpers.sh; the conformance
  * guard (tests/start-token-utc.test.ts) pins them byte-identical.
  *
- * "legacy" = the form written before the TZ pin: LC_ALL=C with the WRITER's TZ,
- * which a default shell leaves unset (/etc/localtime). Readers recompute it with
- * TZ REMOVED, never with their own inherited TZ, and accept it during the
- * transition. KNOWN LIMIT: a writer that ran with an explicit TZ stored a form
+ * The SUFFIX is the token's provenance (architect ruling on #296, Codex R1 #1).
+ * A bare lstart cannot say which zone printed it: on a UTC-4 host, a pid reused
+ * exactly 4 hours later has a local-time lstart equal to the first process's UTC
+ * one. So readers DISPATCH on the suffix: a suffixed token is compared ONLY with
+ * the UTC producer's suffixed output, an unsuffixed one ONLY with the legacy form.
+ * A cross-form match is impossible by construction.
+ *
+ * "legacy" = the form written before the TZ pin: unsuffixed, LC_ALL=C with the
+ * WRITER's TZ, which a default shell leaves unset (/etc/localtime). Readers
+ * recompute it with TZ REMOVED, never with their own inherited TZ, and accept it
+ * during the transition. KNOWN LIMIT: a writer that ran with an explicit TZ stored a form
  * this cannot recompute; that anchor reads dead until it is restamped (the
  * PostToolUse self-heal, or a window restart). Delete the legacy form once
  * `relay doctor` counts zero live rows in it.
  */
 export type StartTokenForm = "utc" | "legacy";
+
+/** The provenance suffix of a UTC start token. The bash twin (RELAY_START_TOKEN_UTC_SUFFIX) is pinned to it by test. */
+export const START_TOKEN_UTC_SUFFIX = " UTC";
+
+/** Does this stored token carry the UTC provenance suffix? */
+export function isUtcStartToken(token: string): boolean {
+  return token.endsWith(START_TOKEN_UTC_SUFFIX);
+}
 
 export function startTokenEnv(base: NodeJS.ProcessEnv, form: StartTokenForm = "utc"): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base, LC_ALL: "C" };
@@ -342,7 +358,10 @@ export function parseProcessTable(psStdout: string): Map<number, ProcEntry> {
 export function buildProcessTable(run: CommandRunner = defaultRunner): Map<number, ProcEntry> {
   // POSIX only here (macOS/Linux). Windows capture is a documented follow-on
   // (the daemon there falls back to age-based, same as cross-host).
-  const table = parseProcessTable(run("ps", ["-axo", "pid=,ppid=,lstart=,command="]));
+  const table = parseProcessTable(run("ps", ["-axo", "pid=,ppid=,lstart=,command="], { startTokenForm: "utc" }));
+  // The runner printed lstart in UTC: each entry's token is the UTC form, so it
+  // carries the suffix exactly as processStartedAt's does.
+  for (const entry of table.values()) entry.startedAt += START_TOKEN_UTC_SUFFIX;
   // Second pass: capture `comm` (the executable basename source) in its OWN ps
   // call — comm can contain spaces on macOS (full exec path), so it can't share
   // a line with the greedy `command` field. `pid=,comm=` puts comm last, so
@@ -417,27 +436,27 @@ export function processStartedAt(
 ): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const out = run("ps", ["-o", "lstart=", "-p", String(pid)], { startTokenForm: form }).trim();
-  return out.length > 0 ? out : null;
+  if (out.length === 0) return null;
+  return form === "utc" ? out + START_TOKEN_UTC_SUFFIX : out;
 }
 
 export type StartTokenObservation = "utc" | "legacy" | "mismatch" | "unreadable";
 
 /**
- * Which form, if any, a stored token takes for this live pid. The legacy form is
- * read only when the UTC one does not match, so a migrated row costs one `ps`.
- * Where /etc/localtime is UTC the two forms are equal and this says "utc".
+ * Does this stored token name this live pid, and in which form? DISPATCHED on the
+ * suffix (one `ps` either way): a suffixed token is compared only with the UTC
+ * producer, an unsuffixed one only with the legacy form. "unreadable" = the one
+ * read it needs failed.
  */
 export function observeStartTokenForm(
   pid: number,
   stored: string,
   run: CommandRunner = defaultRunner,
 ): StartTokenObservation {
-  const utc = processStartedAt(pid, run);
-  if (utc === null) return "unreadable";
-  if (utc === stored) return "utc";
-  const legacy = processStartedAt(pid, run, "legacy");
-  if (legacy === null) return "unreadable";
-  return legacy === stored ? "legacy" : "mismatch";
+  const form: StartTokenForm = isUtcStartToken(stored) ? "utc" : "legacy";
+  const current = processStartedAt(pid, run, form);
+  if (current === null) return "unreadable";
+  return current === stored ? form : "mismatch";
 }
 
 /**

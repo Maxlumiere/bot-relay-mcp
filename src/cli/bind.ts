@@ -212,7 +212,7 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const { bindingSchemaGap, upsertAgentBinding, endAgentBinding, migrateLegacyBindingAnchor } = await import("../db.js");
+    const { bindingSchemaGap, upsertAgentBinding, endAgentBinding } = await import("../db.js");
 
     const gap = bindingSchemaGap(db);
     if (gap) {
@@ -223,14 +223,14 @@ export async function run(argv: string[]): Promise<number> {
     }
 
     // MIGRATION (the start-token TZ pin): a row this window wrote in the legacy
-    // form moves onto the UTC anchor first, so neither path below misses it.
-    migrateLegacyBindingAnchor(db, anchor, processStartedAt(anchor.windowPid, undefined, "legacy"));
+    // form moves onto the UTC anchor INSIDE the end's / the upsert's transaction.
+    const legacyStart = processStartedAt(anchor.windowPid, undefined, "legacy");
 
     if (args.end) {
       if (!endReason) {
         return bindFailed("--end needs the SessionEnd payload's reason, and this payload carries none");
       }
-      const ok = endAgentBinding(db, anchor, endReason);
+      const ok = endAgentBinding(db, anchor, endReason, legacyStart);
       if (!ok) {
         return bindFailed(
           `this window (pid ${anchor.windowPid}) has no current binding to end — nothing was recorded`,
@@ -255,7 +255,7 @@ export async function run(argv: string[]): Promise<number> {
         cwd,
         boundVia,
       },
-      { supersedeReason: source === "clear" ? "clear-carry" : "resume-switch" },
+      { supersedeReason: source === "clear" ? "clear-carry" : "resume-switch", legacyStart },
     );
 
     // ANNOUNCE — a human and an agent both read this. Name the identity, the

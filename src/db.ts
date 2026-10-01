@@ -18,6 +18,7 @@ import {
   anchorLivenessVerdict,
   isPidAlive,
   observeStartTokenForm,
+  isUtcStartToken,
   type CommandRunner,
   type KillProbe,
 } from "./liveness.js";
@@ -3297,30 +3298,43 @@ export function getCurrentBinding(db: CompatDatabase, anchor: BindingAnchor): Bi
 
 /**
  * MIGRATION (the start-token TZ pin, src/liveness.ts startTokenEnv): a window
- * bound before the pin carries its start token in the legacy local-time form, so
- * the lookup by its UTC anchor misses it, and a re-bind (resume, clear, compact)
- * would create a SECOND current row for the same window while an end would find
- * none. Move that row onto the UTC anchor first. When a current row already
- * holds the UTC anchor, the partial unique index (idx_agent_bindings_current_anchor)
- * refuses the move, as it refuses a second current row everywhere else. The caller
- * passes the legacy token it read for this pid (null when unreadable or equal:
- * nothing to move). Returns whether a row moved. That refusal, or lock contention,
- * → false: the legacy row stays and still reads alive (readers accept the legacy form).
+ * bound before the pin carries its start token in the legacy (unsuffixed)
+ * local-time form, so the lookup by its UTC anchor misses it, and a re-bind
+ * (resume, clear, compact) would create a SECOND current row for the same window
+ * while an end would find none. This moves that row onto the UTC anchor. The
+ * caller passes the legacy token it read for this pid (null when unreadable:
+ * nothing to move). Only an unsuffixed token can equal it, so a row stored in
+ * the UTC form never moves (Codex #296 R1 #1).
+ *
+ * It runs INSIDE the caller's transaction (upsertAgentBinding, endAgentBinding),
+ * never alone (Codex #296 R1 #2): a lock error propagates, so the bind retries the
+ * move and its write together or fails loudly, and never writes a UTC row beside
+ * an unmoved legacy one. It moves nothing while a current row already holds the
+ * UTC anchor (that state is refreshed as is; moving would only collide with the
+ * partial unique index, which stays the guarantee). Returns whether a row moved.
  */
 export function migrateLegacyBindingAnchor(db: CompatDatabase, anchor: BindingAnchor, legacyStart: string | null): boolean {
   if (!legacyStart || legacyStart === anchor.windowPidStart) return false;
-  try {
-    const r = db
-      .prepare(
-        "UPDATE agent_bindings SET window_pid_start = ? " +
-          "WHERE edge_id = ? AND host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL",
-      )
-      .run(anchor.windowPidStart, getLocalEdgeId(db), anchor.hostId, anchor.windowPid, legacyStart);
-    return r.changes > 0;
-  } catch (err) {
-    if (isBindContentionError(err)) return false;
-    throw err;
-  }
+  const edgeId = getLocalEdgeId(db);
+  const r = db
+    .prepare(
+      "UPDATE agent_bindings SET window_pid_start = ? " +
+        "WHERE edge_id = ? AND host_id = ? AND window_pid = ? AND window_pid_start = ? AND superseded_at IS NULL " +
+        "AND NOT EXISTS (SELECT 1 FROM agent_bindings WHERE edge_id = ? AND host_id = ? AND window_pid = ? " +
+        "AND window_pid_start = ? AND superseded_at IS NULL)",
+    )
+    .run(
+      anchor.windowPidStart,
+      edgeId,
+      anchor.hostId,
+      anchor.windowPid,
+      legacyStart,
+      edgeId,
+      anchor.hostId,
+      anchor.windowPid,
+      anchor.windowPidStart,
+    );
+  return r.changes > 0;
 }
 
 /**
@@ -3477,7 +3491,9 @@ function bindBackoffSleep(attempt: number, remainingMs: number): void {
 export function upsertAgentBinding(
   db: CompatDatabase,
   w: BindingWrite,
-  opts: { supersedeReason?: string; budgetMs?: number } = {},
+  // legacyStart: this window's start token in the legacy form; its legacy-anchored
+  // row is moved onto w's anchor in the SAME transaction (migrateLegacyBindingAnchor).
+  opts: { supersedeReason?: string; budgetMs?: number; legacyStart?: string | null } = {},
 ): BindingResult {
   const started = Date.now();
   const deadline = started + Math.max(BIND_MIN_ATTEMPT_MS, opts.budgetMs ?? BIND_BUDGET_MS);
@@ -3530,7 +3546,10 @@ export function upsertAgentBinding(
       // attempt estimate: the per-attempt cost is not a fixed quantity, it
       // depends on whether the attempt has read before it writes.
 
-      return db.transaction(() => upsertAgentBindingOnce(db, w, opts))();
+      return db.transaction(() => {
+        migrateLegacyBindingAnchor(db, w, opts.legacyStart ?? null);
+        return upsertAgentBindingOnce(db, w, opts);
+      })();
     } catch (err) {
       lastErr = err;
       // Anything that is not OUR anchor contention is a real failure: throw on
@@ -3642,13 +3661,23 @@ function upsertAgentBindingOnce(
  * when the window has no current binding — the caller says so loudly rather than
  * inventing one.
  */
-export function endAgentBinding(db: CompatDatabase, anchor: BindingAnchor, endReason: string): boolean {
-  const current = getCurrentBinding(db, anchor);
-  if (!current) return false;
-  const r = db
-    .prepare("UPDATE agent_bindings SET end_reason = ?, last_verified_at = ? WHERE edge_id = ? AND binding_id = ?")
-    .run(endReason, now(), getLocalEdgeId(db), current.binding_id);
-  return r.changes > 0;
+export function endAgentBinding(
+  db: CompatDatabase,
+  anchor: BindingAnchor,
+  endReason: string,
+  legacyStart: string | null = null,
+): boolean {
+  // The legacy move and the end in ONE transaction: a lock error throws (the bind
+  // fails loudly), never an end that silently misses an unmoved legacy row.
+  return db.transaction(() => {
+    migrateLegacyBindingAnchor(db, anchor, legacyStart);
+    const current = getCurrentBinding(db, anchor);
+    if (!current) return false;
+    const r = db
+      .prepare("UPDATE agent_bindings SET end_reason = ?, last_verified_at = ? WHERE edge_id = ? AND binding_id = ?")
+      .run(endReason, now(), getLocalEdgeId(db), current.binding_id);
+    return r.changes > 0;
+  })();
 }
 
 /**
@@ -3702,28 +3731,40 @@ export function listAgentBindings(db: CompatDatabase): BindingListRow[] {
 
 /**
  * The MIGRATION METER for the start-token TZ pin (src/liveness.ts startTokenEnv):
- * how many LIVE anchors on this host still carry the legacy local-time form,
- * across agents.agent_pid_start and this edge's current agent_bindings. Readers
- * accept that form only while this is above zero; at zero on every host, delete
- * the legacy form (startTokenEnv "legacy" and relay_pid_start_legacy).
+ * the LIVE anchors on this host still in the legacy (UNSUFFIXED) form, across
+ * agents.agent_pid_start and this edge's current agent_bindings. Readers accept
+ * that form only while this is above zero; at zero on every host, delete the
+ * legacy form (startTokenEnv "legacy" and relay_pid_start_legacy).
+ *
+ * Never a false zero (Codex #296 R1 #3): an unsuffixed anchor on a live pid whose
+ * start cannot be read is counted in `unreadable` (cannot judge), not dropped.
  * Host identity is POSITIVE: a row is ours only when its host_id EQUALS our own;
- * an unknown own host counts nothing and says so, never a false zero.
+ * an unknown own host counts nothing and says so.
  */
-export function countLegacyStartTokens(
-  run?: CommandRunner,
-  kill?: KillProbe,
-): { ownHostKnown: boolean; agents: number; bindings: number; total: number } {
+export interface LegacyStartTokenCount {
+  ownHostKnown: boolean;
+  agents: number;
+  bindings: number;
+  total: number;
+  unreadable: number;
+}
+export function countLegacyStartTokens(run?: CommandRunner, kill?: KillProbe): LegacyStartTokenCount {
   const ownHost = getOwnHostId();
-  if (!ownHost) return { ownHostKnown: false, agents: 0, bindings: 0, total: 0 };
+  if (!ownHost) return { ownHostKnown: false, agents: 0, bindings: 0, total: 0, unreadable: 0 };
   const db = getDb();
-  const isLegacy = (pid: number | null, start: string | null): boolean =>
-    typeof pid === "number" && pid > 0 && !!start && isPidAlive(pid, kill) && observeStartTokenForm(pid, start, run) === "legacy";
+  let unreadable = 0;
+  const isLegacy = (pid: number | null, start: string | null): boolean => {
+    if (!(typeof pid === "number" && pid > 0) || !start || isUtcStartToken(start) || !isPidAlive(pid, kill)) return false;
+    const form = observeStartTokenForm(pid, start, run);
+    if (form === "unreadable") unreadable++;
+    return form === "legacy";
+  };
   const agentRows = db
     .prepare("SELECT agent_pid, agent_pid_start FROM agents WHERE host_id = ? AND agent_pid IS NOT NULL")
     .all(ownHost) as Array<{ agent_pid: number | null; agent_pid_start: string | null }>;
   const agents = agentRows.filter((r) => isLegacy(r.agent_pid, r.agent_pid_start)).length;
   const bindings = listAgentBindings(db).filter((b) => b.host_id === ownHost && isLegacy(b.window_pid, b.window_pid_start)).length;
-  return { ownHostKnown: true, agents, bindings, total: agents + bindings };
+  return { ownHostKnown: true, agents, bindings, total: agents + bindings, unreadable };
 }
 
 export function setAgentLivenessAnchor(

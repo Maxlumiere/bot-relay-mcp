@@ -493,20 +493,27 @@ relay_agent_pid() {
   done
 }
 
+# The provenance suffix of a UTC start token: the SAME literal as the TS
+# START_TOKEN_UTC_SUFFIX (src/liveness.ts), pinned equal by tests/start-token-utc.
+RELAY_START_TOKEN_UTC_SUFFIX=' UTC'
+
 # Start-time token for a PID (the relay's PID-reuse guard). ONE spelling,
 # byte-identical to the TS producer (src/liveness.ts processStartedAt, pinned by
-# tests/start-token-utc): TZ=UTC LC_ALL=C. lstart is a wall-clock date, so a
-# locale OR a TZ difference between this user shell and the launchd daemon would
-# make a live agent read dead. Compared as a string, never parsed. Trimmed. Empty
-# on any failure.
+# tests/start-token-utc): TZ=UTC LC_ALL=C, trimmed, plus the UTC suffix. lstart
+# is a wall-clock date, so a locale OR a TZ difference between this user shell
+# and the launchd daemon would make a live agent read dead; the suffix says which
+# zone printed it. Compared as a string, never parsed. Empty on any failure.
 relay_pid_start() {
-  local pid="$1"
+  local pid="$1" t
   [ -n "$pid" ] || return
-  TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+  t=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$t" ] || return
+  printf '%s%s' "$t" "$RELAY_START_TOKEN_UTC_SUFFIX"
 }
 
-# MIGRATION ONLY: the form written before the TZ pin (the writer TZ was unset, so
-# /etc/localtime). Recomputed with TZ REMOVED, never this shell inherited TZ.
+# MIGRATION ONLY: the form written before the TZ pin, UNSUFFIXED (the writer TZ
+# was unset, so /etc/localtime). Recomputed with TZ REMOVED, never this shell
+# inherited TZ.
 # Readers accept it until relay doctor counts zero live rows in that form; then
 # delete it with the TS twin (startTokenEnv "legacy").
 relay_pid_start_legacy() {
@@ -564,7 +571,8 @@ relay_pid_alive() {
 #   - pid not alive                                  → dead
 #   - pid alive, no start anchor                     → alive (PID-liveness only)
 #   - pid alive, start unreadable                    → alive (can't validate → trust PID)
-#   - pid alive, start MATCHES (UTC or legacy form)   → alive
+#   - pid alive, start MATCHES (dispatched on the suffix:
+#     suffixed → the UTC form only; unsuffixed → the legacy form only) → alive
 #   - pid alive, start MISMATCH (PID reuse)           → dead
 relay_anchor_liveness() {
   local agent_pid="$1" agent_pid_start="$2" row_host="$3" own_host="$4" cur
@@ -575,11 +583,11 @@ relay_anchor_liveness() {
   [ "$agent_pid" -gt 0 ] 2>/dev/null || { printf 'unverifiable'; return; }
   if ! relay_pid_alive "$agent_pid"; then printf 'dead'; return; fi
   if [ -z "$agent_pid_start" ]; then printf 'alive'; return; fi
-  cur=$(relay_pid_start "$agent_pid")
-  if [ -z "$cur" ]; then printf 'alive'; return; fi
-  if [ "$cur" = "$agent_pid_start" ]; then printf 'alive'; return; fi
-  # MIGRATION: a token stored before the TZ pin (relay_pid_start_legacy).
-  cur=$(relay_pid_start_legacy "$agent_pid")
+  case "$agent_pid_start" in
+    *"$RELAY_START_TOKEN_UTC_SUFFIX") cur=$(relay_pid_start "$agent_pid") ;;
+    # MIGRATION: an unsuffixed token, stored before the TZ pin.
+    *) cur=$(relay_pid_start_legacy "$agent_pid") ;;
+  esac
   if [ -z "$cur" ]; then printf 'alive'; return; fi
   if [ "$cur" = "$agent_pid_start" ]; then printf 'alive'; else printf 'dead'; fi
 }

@@ -449,8 +449,8 @@ describe("ADR-0036 S1 — relay bind RECORDS the window (happy paths)", () => {
     return spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", env }).stdout.trim();
   };
   const utcForm = (pid: number): string =>
-    spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" } }).stdout.trim();
-  it.skipIf(legacyForm(ANCHOR_PID) === utcForm(ANCHOR_PID))(
+    spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" } }).stdout.trim() + " UTC";
+  it.skipIf(legacyForm(ANCHOR_PID) + " UTC" === utcForm(ANCHOR_PID))(
     "a window bound in the legacy start-token form: compact, then --end, land on THAT row (no second current row)",
     async () => {
       runBind([], sessionStart("startup"), { RELAY_AGENT_NAME: "s1-bind-legacy" });

@@ -38,7 +38,7 @@ const HOST = "h-meta";
 const START = "Mon Sep 15 10:00:00 2026";
 const A = { hostId: HOST, windowPid: 5001, windowPidStart: START };
 // The same window's start token in the UTC form (the start-token TZ pin): START is its legacy form.
-const A_UTC = { ...A, windowPidStart: "Mon Sep 15 02:00:00 2026" };
+const A_UTC = { ...A, windowPidStart: "Mon Sep 15 02:00:00 2026 UTC" };
 const B = { hostId: HOST, windowPid: 5002, windowPidStart: START };
 
 function freshDb(dir: string): string {

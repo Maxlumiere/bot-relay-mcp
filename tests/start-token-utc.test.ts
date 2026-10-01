@@ -5,20 +5,26 @@
 
 /**
  * The process START TOKEN (the PID-reuse guard) has ONE spelling:
- * `TZ=UTC LC_ALL=C ps -o lstart= -p PID`, trimmed. `lstart` is a wall-clock
- * date, so a token read under one TZ never matches the same process read under
- * another: a connector and the daemon with different TZ values would read a live
- * process dead (Codex, #295 round 1, MEASURED 15:59:41 UTC vs 23:59:41 SGT).
+ * `TZ=UTC LC_ALL=C ps -o lstart= -p PID`, trimmed, plus the provenance suffix
+ * " UTC". `lstart` is a wall-clock date, so a token read under one TZ never
+ * matches the same process read under another: a connector and the daemon with
+ * different TZ values would read a live process dead (Codex, #295 round 1,
+ * MEASURED 15:59:41 UTC vs 23:59:41 SGT).
  *
  * GUARD (metamorphic): the same live pid, read with the reader's TZ set to UTC,
  * Asia/Singapore, America/New_York and unset, gives ONE byte-identical token from
  * every producer: TS processStartedAt, the TS process-table read (the detection
  * path), and the bash relay_pid_start. Un-pinning TZ in any producer turns it red.
  *
- * MIGRATION: tokens written before this change carry the writer's local time
- * (TZ unset, so /etc/localtime). Readers also accept that form, recomputed with
- * TZ REMOVED, never with the reader's inherited TZ, so no live anchor reads dead
- * after the deploy. `relay doctor` counts the live rows still in that form.
+ * PROVENANCE (architect ruling, Codex #296 R1 #1): a bare lstart cannot say which
+ * zone printed it, so readers DISPATCH on the suffix: suffixed → the UTC form
+ * only; unsuffixed → the legacy form only. A cross-form match is impossible.
+ *
+ * MIGRATION: tokens written before this change are unsuffixed and carry the
+ * writer's local time (TZ unset, so /etc/localtime). Readers accept that form,
+ * recomputed with TZ REMOVED, never with the reader's inherited TZ, so no live
+ * anchor reads dead after the deploy. `relay doctor` counts the live rows still
+ * in that form, and never certifies a zero it could not read.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import fs from "fs";
@@ -33,12 +39,21 @@ delete process.env.RELAY_AGENT_TOKEN;
 delete process.env.RELAY_AGENT_NAME;
 delete process.env.RELAY_AGENT_ROLE;
 
-const liveness = await import("../src/liveness.js");
-const { processStartedAt, buildProcessTable, isAgentProcessAlive, anchorLivenessVerdict, observeStartTokenForm, startTokenEnv, _resetOwnHostIdForTests } =
-  liveness;
+const {
+  processStartedAt,
+  buildProcessTable,
+  isAgentProcessAlive,
+  anchorLivenessVerdict,
+  observeStartTokenForm,
+  startTokenEnv,
+  START_TOKEN_UTC_SUFFIX,
+  _resetOwnHostIdForTests,
+} = await import("../src/liveness.js");
 type CommandRunner = import("../src/liveness.js").CommandRunner;
-const { closeDb, getDb, registerAgent, getLocalEdgeId, countLegacyStartTokens, migrateLegacyBindingAnchor, upsertAgentBinding, endAgentBinding } =
-  await import("../src/db.js");
+const { closeDb, getDb, registerAgent, getLocalEdgeId, countLegacyStartTokens, upsertAgentBinding, endAgentBinding } = await import(
+  "../src/db.js"
+);
+const { legacyStartTokenCheck } = await import("../src/cli/doctor.js");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HELPER = path.join(__dirname, "..", "hooks", "_vault-helpers.sh");
@@ -77,11 +92,15 @@ function bash(fnCall: string, args: string[], tz: string | null, prelude = ""): 
   return r.stdout;
 }
 
-/** The legacy token a pre-change writer stored (TZ unset → /etc/localtime), produced independently of the code under test. */
+function psLstart(pid: number, env: NodeJS.ProcessEnv): string {
+  return spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", env }).stdout.trim();
+}
+
+/** The legacy token a pre-change writer stored (TZ unset → /etc/localtime, no suffix), produced independently of the code under test. */
 function legacyReference(pid: number): string {
   const env = { ...process.env, LC_ALL: "C" };
   delete env.TZ;
-  return spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", env }).stdout.trim();
+  return psLstart(pid, env);
 }
 
 let child: ChildProcess;
@@ -110,14 +129,16 @@ describe("the start token: one spelling, independent of the reader's TZ", () => 
       const distinct = new Set(seen.values());
       expect(distinct.size, `pid ${pid}: ${JSON.stringify(Object.fromEntries(seen), null, 1)}`).toBe(1);
       const token = [...distinct][0];
-      // Positive: a real token, and it is the UTC form (not merely self-consistent).
-      expect(token).toMatch(/^[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d \d{4}$/);
-      const utc = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-        encoding: "utf-8",
-        env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
-      }).stdout.trim();
-      expect(token).toBe(utc);
+      // Positive: a real token, the UTC lstart plus the suffix (not merely self-consistent).
+      expect(token).toMatch(/^[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d \d{4} UTC$/);
+      expect(token).toBe(psLstart(pid, { ...process.env, TZ: "UTC", LC_ALL: "C" }) + " UTC");
     }
+  });
+
+  it("the suffix is ONE literal: the bash RELAY_START_TOKEN_UTC_SUFFIX equals the TS START_TOKEN_UTC_SUFFIX", () => {
+    expect(START_TOKEN_UTC_SUFFIX).toBe(" UTC");
+    const r = spawnSync("bash", ["-c", '. "$1"; printf "%s" "$RELAY_START_TOKEN_UTC_SUFFIX"', "bash", HELPER], { encoding: "utf-8" });
+    expect(r.stdout).toBe(START_TOKEN_UTC_SUFFIX);
   });
 
   it("startTokenEnv pins TZ=UTC and LC_ALL=C over any inherited value; the legacy form REMOVES TZ", () => {
@@ -129,7 +150,7 @@ describe("the start token: one spelling, independent of the reader's TZ", () => 
     expect(base.TZ).toBe("America/New_York"); // the caller's env is not mutated
   });
 
-  it("the legacy recompute ignores the reader's inherited TZ (TS and bash both equal the TZ-removed form)", () => {
+  it("the legacy recompute is UNSUFFIXED and ignores the reader's inherited TZ (TS and bash both equal the TZ-removed form)", () => {
     const pid = process.pid;
     const ref = legacyReference(pid);
     expect(ref.length).toBeGreaterThan(0);
@@ -141,54 +162,73 @@ describe("the start token: one spelling, independent of the reader's TZ", () => 
 });
 
 /**
- * A runner whose two forms DIFFER (as on any non-UTC host), so legacy acceptance
- * is exercised everywhere, including a CI host whose /etc/localtime is UTC.
+ * A runner whose two forms DIFFER (as on any non-UTC host), so the dispatch is
+ * exercised everywhere, including a CI host whose /etc/localtime is UTC. It
+ * returns RAW lstart; processStartedAt adds the suffix to the UTC form.
  */
-function twoFormRunner(utc: string | null, legacy: string | null): CommandRunner {
+function twoFormRunner(utc: string | null, legacy: string | null, calls?: string[]): CommandRunner {
   return (cmd, args, opts) => {
     if (cmd !== "ps" || !args.includes("lstart=")) return "";
-    const v = opts?.startTokenForm === "legacy" ? legacy : utc;
+    const form = opts?.startTokenForm ?? "utc";
+    calls?.push(form);
+    const v = form === "legacy" ? legacy : utc;
     return v === null ? "" : `${v}  \n`;
   };
 }
-const UTC_T = "Thu Oct  1 07:37:33 2026";
-const LEGACY_T = "Thu Oct  1 15:37:33 2026";
+const UTC_RAW = "Thu Oct  1 07:37:33 2026";
+const UTC_T = UTC_RAW + " UTC"; // a stored UTC token
+const LEGACY_T = "Thu Oct  1 15:37:33 2026"; // the same process, stored before the pin (SGT)
 const OTHER_T = "Mon Jan  1 00:00:00 2020";
 const alive = () => true;
 
-describe("migration: readers accept the legacy local-time form", () => {
-  const rows: Array<[string, string | null, string | null, boolean, string]> = [
-    // [label, stored, legacy read, expected alive, expected observation]
-    ["stored UTC form → alive", UTC_T, LEGACY_T, true, "utc"],
-    ["stored legacy form → alive (no binding reads dead after the deploy)", LEGACY_T, LEGACY_T, true, "legacy"],
-    ["stored neither form (PID reuse) → dead", OTHER_T, LEGACY_T, false, "mismatch"],
-    ["legacy form unreadable → alive (cannot validate → trust the PID, as before)", OTHER_T, null, true, "unreadable"],
+describe("readers dispatch on the suffix; the legacy form is accepted only unsuffixed", () => {
+  const rows: Array<[string, string, string | null, string | null, boolean, string]> = [
+    // [label, stored, utc read (raw), legacy read, expected alive, expected observation]
+    ["a suffixed token matching the UTC read → alive", UTC_T, UTC_RAW, LEGACY_T, true, "utc"],
+    ["an unsuffixed token matching the legacy read → alive (no binding reads dead after the deploy)", LEGACY_T, UTC_RAW, LEGACY_T, true, "legacy"],
+    ["a suffixed token matching neither → dead (PID reuse)", OTHER_T + " UTC", UTC_RAW, LEGACY_T, false, "mismatch"],
+    ["an unsuffixed token matching neither → dead (PID reuse)", OTHER_T, UTC_RAW, LEGACY_T, false, "mismatch"],
+    ["an unsuffixed token equal to the RAW UTC read → dead (never compared across forms)", UTC_RAW, UTC_RAW, LEGACY_T, false, "mismatch"],
+    ["a suffixed token, UTC read unreadable → alive (cannot validate → trust the PID, as before)", UTC_T, null, LEGACY_T, true, "unreadable"],
+    ["an unsuffixed token, legacy read unreadable → alive (cannot validate → trust the PID)", LEGACY_T, UTC_RAW, null, true, "unreadable"],
   ];
-  for (const [label, stored, legacyRead, expected, obs] of rows) {
+  for (const [label, stored, utcRead, legacyRead, expected, obs] of rows) {
     it(`TS: ${label}`, () => {
-      const run = twoFormRunner(UTC_T, legacyRead);
-      expect(observeStartTokenForm(4242, stored as string, run)).toBe(obs);
+      const run = twoFormRunner(utcRead, legacyRead);
+      expect(observeStartTokenForm(4242, stored, run)).toBe(obs);
       expect(isAgentProcessAlive(4242, stored, run, alive as never)).toBe(expected);
     });
     it(`bash relay_anchor_liveness agrees: ${label}`, () => {
       // Override only the two PRODUCERS (the verdict logic is the shipped one);
       // the pid is this live process so relay_pid_alive passes for real.
       const prelude =
-        `relay_pid_start() { printf '%s' '${UTC_T}'; }; ` +
+        `relay_pid_start() { [ -n '${utcRead ?? ""}' ] && printf '%s%s' '${utcRead ?? ""}' "$RELAY_START_TOKEN_UTC_SUFFIX"; }; ` +
         `relay_pid_start_legacy() { printf '%s' '${legacyRead ?? ""}'; }; `;
-      const verdict = bash("relay_anchor_liveness", [String(process.pid), stored as string, "H", "H"], null, prelude);
+      const verdict = bash("relay_anchor_liveness", [String(process.pid), stored, "H", "H"], null, prelude);
       expect(verdict).toBe(expected ? "alive" : "dead");
     });
   }
 
-  it("a UTC read that already matches never runs the legacy read", () => {
+  it("ONE read per probe: a suffixed token reads only the UTC form, an unsuffixed one only the legacy form", () => {
     const calls: string[] = [];
-    const run: CommandRunner = (cmd, args, opts) => {
-      calls.push(opts?.startTokenForm ?? "utc");
-      return UTC_T;
-    };
-    expect(isAgentProcessAlive(4242, UTC_T, run, alive as never)).toBe(true);
+    observeStartTokenForm(4242, UTC_T, twoFormRunner(UTC_RAW, LEGACY_T, calls));
     expect(calls).toEqual(["utc"]);
+    calls.length = 0;
+    observeStartTokenForm(4242, LEGACY_T, twoFormRunner(UTC_RAW, LEGACY_T, calls));
+    expect(calls).toEqual(["legacy"]);
+  });
+
+  // Codex #296 R1 #1, the injection as measured: a New York host (UTC-4). A started
+  // at 07:37:33 UTC and stored its token; B reuses the pid at 11:37:33 UTC, so B's
+  // LEGACY (local) lstart is 07:37:33, exactly A's UTC lstart.
+  const runB = twoFormRunner("Thu Oct  1 11:37:33 2026", "Thu Oct  1 07:37:33 2026");
+  const A_TOKEN = "Thu Oct  1 07:37:33 2026 UTC";
+  it("Codex R1 #1: a pid reused exactly the zone offset later reads DEAD for the first process's token (TS and bash)", () => {
+    expect(isAgentProcessAlive(4242, A_TOKEN, runB, alive as never)).toBe(false);
+    const prelude =
+      `relay_pid_start() { printf '%s%s' 'Thu Oct  1 11:37:33 2026' "$RELAY_START_TOKEN_UTC_SUFFIX"; }; ` +
+      `relay_pid_start_legacy() { printf '%s' 'Thu Oct  1 07:37:33 2026'; }; `;
+    expect(bash("relay_anchor_liveness", [String(process.pid), A_TOKEN, "H", "H"], null, prelude)).toBe("dead");
   });
 
   it("real ps: a live anchor stored in the legacy form reads alive in TS and bash (the conformance pair)", () => {
@@ -204,18 +244,19 @@ describe("migration: readers accept the legacy local-time form", () => {
   });
 });
 
-describe("the legacy count is measurable (gates deleting legacy acceptance)", () => {
+function cleanupDb() {
+  closeDb();
+  if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+}
+
+describe("the legacy count is measurable, and never a false zero (gates deleting legacy acceptance)", () => {
   const OWN = "own-host-guid";
-  function cleanup() {
-    closeDb();
-    if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
-  }
   beforeEach(() => {
-    cleanup();
+    cleanupDb();
     _resetOwnHostIdForTests(OWN);
   });
   afterEach(() => {
-    cleanup();
+    cleanupDb();
     _resetOwnHostIdForTests();
   });
 
@@ -230,10 +271,10 @@ describe("the legacy count is measurable (gates deleting legacy acceptance)", ()
         "VALUES (?, ?, ?, ?, ?, ?, ?, 'test', '2026-10-01T00:00:00Z', ?)",
     ).run(id, getLocalEdgeId(db), id, "conv-" + id, host, pid, start, superseded ? "2026-10-01T01:00:00Z" : null);
   }
+  const LIVE = process.pid;
+  const DEAD = 2_147_483_646;
 
-  it("counts only live, same-host, CURRENT anchors whose token matches the legacy form alone", () => {
-    const LIVE = process.pid;
-    const DEAD = 2_147_483_646;
+  it("counts only live, same-host, CURRENT, UNSUFFIXED anchors whose token matches the legacy form", () => {
     anchor("a-legacy", LIVE, LEGACY_T, OWN); // counted
     anchor("a-utc", LIVE, UTC_T, OWN); // migrated
     anchor("a-dead", DEAD, LEGACY_T, OWN); // not live
@@ -245,79 +286,151 @@ describe("the legacy count is measurable (gates deleting legacy acceptance)", ()
     binding("b-utc", LIVE, UTC_T, OWN);
     binding("b-superseded", LIVE, LEGACY_T, OWN, true); // not current
     binding("b-foreign", LIVE, LEGACY_T, "other-host"); // another host's window
-    const c = countLegacyStartTokens(twoFormRunner(UTC_T, LEGACY_T));
-    expect(c).toEqual({ ownHostKnown: true, agents: 1, bindings: 1, total: 2 });
+    const c = countLegacyStartTokens(twoFormRunner(UTC_RAW, LEGACY_T));
+    expect(c).toEqual({ ownHostKnown: true, agents: 1, bindings: 1, total: 2, unreadable: 0 });
+    expect(legacyStartTokenCheck(c).status).toBe("WARN");
+  });
+
+  it("Codex R1 #3: an unreadable ps is cannot-judge, never a certified zero (doctor WARNs, never PASS)", () => {
+    anchor("a-legacy", LIVE, LEGACY_T, OWN);
+    anchor("a-utc", LIVE, UTC_T, OWN); // a migrated row is not part of the question
+    const c = countLegacyStartTokens(twoFormRunner(null, null));
+    expect(c).toEqual({ ownHostKnown: true, agents: 0, bindings: 0, total: 0, unreadable: 1 });
+    const check = legacyStartTokenCheck(c);
+    expect(check.status).toBe("WARN");
+    expect(check.detail).toMatch(/could not be read: cannot judge/);
+  });
+
+  it("PASS only on a certified zero", () => {
+    anchor("a-utc", LIVE, UTC_T, OWN);
+    const c = countLegacyStartTokens(twoFormRunner(UTC_RAW, LEGACY_T));
+    expect(c).toEqual({ ownHostKnown: true, agents: 0, bindings: 0, total: 0, unreadable: 0 });
+    expect(legacyStartTokenCheck(c).status).toBe("PASS");
   });
 
   it("an unknown own host counts nothing and says so (never a false zero)", () => {
     _resetOwnHostIdForTests(null);
-    anchor("a-legacy", process.pid, LEGACY_T, OWN);
-    expect(countLegacyStartTokens(twoFormRunner(UTC_T, LEGACY_T))).toEqual({ ownHostKnown: false, agents: 0, bindings: 0, total: 0 });
+    anchor("a-legacy", LIVE, LEGACY_T, OWN);
+    const c = countLegacyStartTokens(twoFormRunner(UTC_RAW, LEGACY_T));
+    expect(c).toEqual({ ownHostKnown: false, agents: 0, bindings: 0, total: 0, unreadable: 0 });
+    expect(legacyStartTokenCheck(c).status).toBe("WARN");
   });
 });
 
 describe("migration: a window bound in the legacy form keeps ONE current binding", () => {
   const HOST = "own-host-guid";
   const PID = 4242;
-  function cleanup() {
-    closeDb();
-    if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
-  }
-  beforeEach(() => cleanup());
-  afterEach(() => cleanup());
+  beforeEach(() => cleanupDb());
+  afterEach(() => cleanupDb());
 
-  const write = (start: string, conversationId = "conv-1") => ({
+  const write = (start: string, agentName = "w", conversationId = "conv-1") => ({
     hostId: HOST,
     windowPid: PID,
     windowPidStart: start,
-    agentName: "w",
+    agentName,
     agentClass: null,
     conversationId,
     conversationTitle: null,
     cwd: null,
     boundVia: "test",
   });
+  const UTC_ANCHOR = { hostId: HOST, windowPid: PID, windowPidStart: UTC_T };
   const current = () =>
     getDb()
-      .prepare("SELECT binding_id, window_pid_start, conversation_id, end_reason FROM agent_bindings WHERE superseded_at IS NULL")
-      .all() as Array<{ binding_id: string; window_pid_start: string; conversation_id: string; end_reason: string | null }>;
+      .prepare("SELECT binding_id, agent_name, window_pid_start, conversation_id, end_reason FROM agent_bindings WHERE superseded_at IS NULL")
+      .all() as Array<{ binding_id: string; agent_name: string; window_pid_start: string; conversation_id: string; end_reason: string | null }>;
 
-  it("a re-bind after the pin REFRESHES the legacy row (moved onto the UTC anchor), never a second current row", () => {
+  it("a re-bind after the pin REFRESHES the legacy row (moved onto the UTC anchor in the same transaction), never a second current row", () => {
     const db = getDb();
     const legacyRow = upsertAgentBinding(db, write(LEGACY_T));
-    const anchor = { hostId: HOST, windowPid: PID, windowPidStart: UTC_T };
-    expect(migrateLegacyBindingAnchor(db, anchor, LEGACY_T)).toBe(true);
-    const r = upsertAgentBinding(db, write(UTC_T));
+    const r = upsertAgentBinding(db, write(UTC_T), { legacyStart: LEGACY_T });
     expect(r.action).toBe("refreshed");
-    expect(current()).toEqual([{ binding_id: legacyRow.bindingId, window_pid_start: UTC_T, conversation_id: "conv-1", end_reason: null }]);
+    expect(current()).toEqual([
+      { binding_id: legacyRow.bindingId, agent_name: "w", window_pid_start: UTC_T, conversation_id: "conv-1", end_reason: null },
+    ]);
   });
 
   it("an end after the pin is recorded on the legacy row", () => {
     const db = getDb();
     upsertAgentBinding(db, write(LEGACY_T));
-    const anchor = { hostId: HOST, windowPid: PID, windowPidStart: UTC_T };
-    migrateLegacyBindingAnchor(db, anchor, LEGACY_T);
-    expect(endAgentBinding(db, anchor, "logout")).toBe(true);
+    expect(endAgentBinding(db, UTC_ANCHOR, "logout", LEGACY_T)).toBe(true);
+    expect(current().map((c) => [c.window_pid_start, c.end_reason])).toEqual([[UTC_T, "logout"]]);
   });
 
-  it("moves nothing when a current row already holds the UTC anchor, or when the forms are equal or unread", () => {
+  it("Codex R1 #1: B reusing A's pid at the zone offset does NOT inherit A's binding (A's UTC row never moves)", () => {
+    const db = getDb();
+    // New York: A's UTC token; B's legacy lstart equals A's raw UTC lstart.
+    upsertAgentBinding(db, write("Thu Oct  1 07:37:33 2026 UTC", "A"));
+    const B = "Thu Oct  1 11:37:33 2026 UTC";
+    const r = upsertAgentBinding(db, write(B, "B"), { legacyStart: "Thu Oct  1 07:37:33 2026" });
+    expect(r.action).toBe("created");
+    expect(current().filter((c) => c.window_pid_start === B).map((c) => c.agent_name)).toEqual(["B"]);
+    expect(current().find((c) => c.agent_name === "A")?.window_pid_start).toBe("Thu Oct  1 07:37:33 2026 UTC");
+  });
+
+  /** The DB, with the FIRST run of the migration statement failing SQLITE_BUSY (another window holding the lock). */
+  function busyOnce(real: ReturnType<typeof getDb>, failures = 1) {
+    let left = failures;
+    return new Proxy(real, {
+      get(t, p) {
+        if (p === "prepare") {
+          return (sql: string) => {
+            const st = (t as unknown as { prepare(s: string): unknown }).prepare(sql);
+            if (!sql.startsWith("UPDATE agent_bindings SET window_pid_start")) return st;
+            return {
+              run: (...a: unknown[]) => {
+                if (left-- > 0) throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+                return (st as { run(...x: unknown[]): unknown }).run(...a);
+              },
+            };
+          };
+        }
+        const v = (t as unknown as Record<string | symbol, unknown>)[p];
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(t) : v;
+      },
+    });
+  }
+
+  it("Codex R1 #2: a BUSY migration is RETRIED with its upsert, never swallowed into a second current row", () => {
+    const real = getDb();
+    const legacyRow = upsertAgentBinding(real, write(LEGACY_T));
+    const r = upsertAgentBinding(busyOnce(real) as never, write(UTC_T), { legacyStart: LEGACY_T });
+    expect(r.action).toBe("refreshed");
+    expect(current().map((c) => [c.binding_id, c.window_pid_start])).toEqual([[legacyRow.bindingId, UTC_T]]);
+  });
+
+  it("Codex R1 #2: contention past the budget FAILS the bind loudly and writes nothing", () => {
+    const real = getDb();
+    upsertAgentBinding(real, write(LEGACY_T));
+    expect(() => upsertAgentBinding(busyOnce(real, 1_000_000) as never, write(UTC_T), { legacyStart: LEGACY_T, budgetMs: 300 })).toThrow(
+      /bind deadline exceeded/,
+    );
+    expect(current().map((c) => c.window_pid_start)).toEqual([LEGACY_T]);
+  });
+
+  it("Codex R1 #2: a BUSY migration on the end path throws (loud), and ends nothing", () => {
+    const real = getDb();
+    upsertAgentBinding(real, write(LEGACY_T));
+    expect(() => endAgentBinding(busyOnce(real) as never, UTC_ANCHOR, "logout", LEGACY_T)).toThrow(/locked/);
+    expect(current().map((c) => [c.window_pid_start, c.end_reason])).toEqual([[LEGACY_T, null]]);
+  });
+
+  it("both forms already current for one window: the bind refreshes the UTC row and does not fail on the index", () => {
     const db = getDb();
     upsertAgentBinding(db, write(UTC_T));
-    const anchor = { hostId: HOST, windowPid: PID, windowPidStart: UTC_T };
-    expect(migrateLegacyBindingAnchor(db, anchor, UTC_T)).toBe(false);
-    expect(migrateLegacyBindingAnchor(db, anchor, null)).toBe(false);
-    // A legacy current row for the same window while the UTC row is current: the unique index refuses
-    // the move, and that refusal is false, never a thrown constraint error.
     db.prepare("UPDATE agent_bindings SET window_pid_start = ? WHERE window_pid_start = ?").run(LEGACY_T, UTC_T);
-    upsertAgentBinding(db, write(UTC_T, "conv-2"));
+    upsertAgentBinding(db, write(UTC_T, "w", "conv-2"));
     expect(current()).toHaveLength(2);
-    expect(migrateLegacyBindingAnchor(db, anchor, LEGACY_T)).toBe(false);
+    const r = upsertAgentBinding(db, write(UTC_T, "w", "conv-2"), { legacyStart: LEGACY_T, budgetMs: 300 });
+    expect(r.action).toBe("refreshed");
   });
 
   it("never moves another window's row (pid and host are part of the match)", () => {
     const db = getDb();
     upsertAgentBinding(db, { ...write(LEGACY_T), windowPid: PID + 1 });
     upsertAgentBinding(db, { ...write(LEGACY_T), hostId: "other-host" });
-    expect(migrateLegacyBindingAnchor(db, { hostId: HOST, windowPid: PID, windowPidStart: UTC_T }, LEGACY_T)).toBe(false);
+    const r = upsertAgentBinding(db, write(UTC_T), { legacyStart: LEGACY_T });
+    expect(r.action).toBe("created");
+    expect(current().filter((c) => c.window_pid_start === LEGACY_T)).toHaveLength(2);
   });
 });

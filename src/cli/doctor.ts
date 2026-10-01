@@ -164,23 +164,31 @@ async function checkDb(p: string): Promise<CheckResult[]> {
 
 /**
  * The meter for the start-token TZ pin: live anchors still in the legacy
- * local-time form. WARN, never FAIL: they still read alive (the legacy form is
- * accepted); a restarted window or its next hook run rewrites them in UTC.
+ * (unsuffixed) local-time form. PASS only on a CERTIFIED zero; WARN, never FAIL,
+ * otherwise: legacy anchors still read alive (the form is accepted), and an
+ * anchor whose start cannot be read is cannot-judge, never counted as migrated.
  */
-async function checkLegacyStartTokens(): Promise<CheckResult> {
+export function legacyStartTokenCheck(c: import("../db.js").LegacyStartTokenCount): CheckResult {
   const name = "start tokens (legacy form)";
+  if (!c.ownHostKnown) return { name, status: "WARN", detail: "cannot count: this host's id is unknown" };
+  const parts: string[] = [];
+  if (c.total > 0) {
+    parts.push(
+      `${c.total} live anchor(s) still in the pre-UTC local-time form (agents ${c.agents}, bindings ${c.bindings}); ` +
+        "accepted; rewritten in UTC as windows restart or their hooks restamp them",
+    );
+  }
+  if (c.unreadable > 0) parts.push(`${c.unreadable} live pre-UTC anchor(s) whose start time could not be read: cannot judge`);
+  if (parts.length === 0) return { name, status: "PASS", detail: "0 live anchors in the pre-UTC form" };
+  return { name, status: "WARN", detail: parts.join("; ") };
+}
+
+async function checkLegacyStartTokens(): Promise<CheckResult> {
   try {
     const { countLegacyStartTokens } = await import("../db.js");
-    const c = countLegacyStartTokens();
-    if (!c.ownHostKnown) return { name, status: "WARN", detail: "cannot count: this host's id is unknown" };
-    if (c.total === 0) return { name, status: "PASS", detail: "0 live anchors in the pre-UTC form" };
-    return {
-      name,
-      status: "WARN",
-      detail: `${c.total} live anchor(s) still in the pre-UTC local-time form (agents ${c.agents}, bindings ${c.bindings}); accepted; rewritten in UTC as windows restart or their hooks restamp them`,
-    };
+    return legacyStartTokenCheck(countLegacyStartTokens());
   } catch (err) {
-    return { name, status: "WARN", detail: `cannot count: ${err instanceof Error ? err.message : String(err)}` };
+    return { name: "start tokens (legacy form)", status: "WARN", detail: `cannot count: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
