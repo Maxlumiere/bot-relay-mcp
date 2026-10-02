@@ -2126,6 +2126,11 @@ export function recordOwnConnector(input: { parent: { pid: number; startedAt: st
   return true;
 }
 
+/** ADR-0047: does this DB have the v26 connectors table? (A reader never migrates.) */
+export function hasConnectorsTable(db: CompatDatabase): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'connectors'").get();
+}
+
 /**
  * This host's rows on this edge (a row from another host cannot be probed here).
  * Host identity is POSITIVE (Codex #295 R1 P2-3): a row is ours only when its
@@ -2153,9 +2158,14 @@ function ownHostConnectorRows(db: CompatDatabase): ConnectorRow[] {
  * connector's INSERT OR REPLACE overwrites the old row. Not reproduced; the
  * window is one second on one pid.
  */
-export function liveConnectors(opts: { startOf?: (pid: number) => string | null } = {}): ConnectorRow[] {
+export function liveConnectors(
+  // db: a caller's own handle (e.g. `relay fleet`'s READONLY raw handle); default
+  // the app handle. startOf: e.g. one process-table snapshot, so a whole board is
+  // read at one instant.
+  opts: { startOf?: (pid: number) => string | null; db?: CompatDatabase } = {},
+): ConnectorRow[] {
   const startOf = opts.startOf ?? ((pid: number) => processStartedAt(pid));
-  return ownHostConnectorRows(getDb()).filter((r) => {
+  return ownHostConnectorRows(opts.db ?? getDb()).filter((r) => {
     const s = startOf(r.pid);
     return s !== null && s === r.pid_start;
   });

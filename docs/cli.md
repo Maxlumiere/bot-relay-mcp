@@ -136,6 +136,26 @@ Run it with the NEW build before restarting the daemon onto it. It passes only w
 
 Exit: 0 PASS, 1 FAIL, 3 CANNOT-VERIFY (for example: not a loaded launchd job, an environment it cannot parse unambiguously, a resolver variable set with `launchctl setenv`, or the WASM driver, which holds no DB file open), 2 usage.
 
+## `relay fleet [--connectors | --deploy-check] [--json] [--db-path P]`
+
+Lists every window binding the relay has recorded, with each window's liveness derived at read time. Read-only.
+
+**`--connectors`** (ADR-0047) lists every relay connector process on this host and says whether it runs the build that is installed. Each connector is judged on what it LOADED at start (its code and its dependencies) against the install it was loaded from, recomputed from that install's content:
+
+- `CURRENT`: it runs the installed build. The only verdict that passes.
+- `STALE`: its code or dependencies differ from the install. Restart that window.
+- `UNKNOWN`: it wrote no connector row (it predates the build stamp, or writes to another DB), it runs an unstamped build, its dependencies could not be identified (only npm installs are supported), or it is a node process that cannot be classified.
+- `INSTALL INCONSISTENT`: the install itself fails its check (`npm run build`).
+- `NO CONNECTOR`: a live bound window with no relay connector process under it at all (MCP-mute, OR HTTP-configured: see the known gap below). Shown only when every process under the window was classified.
+
+The set covers every connector PROCESS on the host plus every live connector row. A connector that no binding names is labelled `UNBOUND` and judged like any other. The daemon gets the same comparison, on its `/health` build against its own install ("not restarted after the install" when STALE). A connector running another node than the one on PATH, or loaded from another install than the daemon's, gets a warning, never a different verdict. `--json` emits the whole judgement (`connectors`, `windows`, `daemon`, `failing`). It exits 0 whenever it could read the board; the gate is `--deploy-check`.
+
+A connector is recognised from the process table: a node process whose script (the first argument that is not a node option) resolves, as a real path, to `<install>/dist/index.js`, where `<install>/package.json` is named `bot-relay-mcp`. On macOS, `ps` joins arguments with spaces, so the script is found by existence: exactly one space-joined prefix of the arguments must be an existing file, or the process is `UNKNOWN`. Any process holding a TCP listen socket (the daemon) is never a connector. No process environment is read.
+
+**`--deploy-check`** answers "is this deploy finished?" with the same engine. It is PASS (exit 0) only when every connector on the host (bound or `UNBOUND`), every live bound window and the daemon read `CURRENT`, and a second look, taken just before the PASS, agrees with the first. Otherwise it is FAIL (exit 1), with each offender named (verdict, pid, agent or `UNBOUND`, install, reason), or CANNOT-VERIFY (exit 3) when the two looks disagree (a window restarted in between: run it again) or the board cannot be read (no DB, the process table, the listeners, or the daemon's `/health`). A daemon that answers but predates the build stamp is a FAIL, not a CANNOT-VERIFY. A deploy is complete when `relay fleet --deploy-check` exits 0. `relay deploy-gate` is unchanged: it answers a different question, before the restart (will the new daemon open the same DB).
+
+**Known gap, VIA DAEMON:** an agent configured to reach the relay over HTTP runs no relay process of its own, so its window reads `NO CONNECTOR` and fails the deploy check. Recognising it (a throttled `last_http_auth_at` on the agent, shown as "via daemon" with its age) will be built when the first HTTP-configured agent appears, or when an external user is confirmed to run one.
+
 ## `relay help`
 
 Prints the subcommand list. `relay <sub> --help` prints per-subcommand help.
