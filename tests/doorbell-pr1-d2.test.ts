@@ -168,6 +168,14 @@ describe.skipIf(!HOST)("the job: compaction at the first DB open, and the size c
     expect(intentsInLog().map((r) => r.intent.intent_id)).toEqual([kept]);
     expect(m1).not.toBe(m2);
   });
+  it("#300 R2 #1 (MEASURED): the start's compaction failing after its rename STOPS the job (exit 1); no cycle runs on the old fd", async () => {
+    send();
+    const io = { ...L.realLogIo, fsyncSync: (fd: number) => { if (fs.fstatSync(fd).isDirectory()) throw new Error("EIO (injected, dir)"); fs.fsyncSync(fd); } };
+    const r = await job(["--interval-ms", "1000"], { logIo: io }); // a LOOP: it must not continue
+    expect([r.code, r.stderr]).toEqual([1, expect.stringMatching(/DOORBELL_FAILED: the compaction did not complete .*stopping/)]);
+    expect(intentsInLog()).toEqual([]);
+  });
+
   it("over the cap: no ring, LOG-FULL said ONCE across cycles, never a silent drop", async () => {
     send();
     const p = job(["--interval-ms", "1000"], { logCapBytes: 1 });

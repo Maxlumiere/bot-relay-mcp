@@ -66,7 +66,10 @@ export type LogRecord = IntentRecord | HeaderRecord;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
-const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+/** An ISO UTC timestamp, BOUNDED (#300 R2 #5): at most 9 fractional digits. */
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+/** At most this many ids in one intent (a burst is far smaller; a record stays bounded). */
+export const MAX_IDS_PER_INTENT = 10_000;
 
 const MAX_PATH = 4096;
 const MAX_TEXT = 500;
@@ -86,7 +89,7 @@ function buildFault(b: unknown): string | null {
   if (!nullOr(b.built_at, (x): x is string => typeof x === "string" && ISO_RE.test(x))) return "build.built_at is not an ISO timestamp";
   if (!nullOr(b.deps_id, (x): x is string => typeof x === "string" && HEX64.test(x))) return "build.deps_id is not a deps id";
   if (!["known", "unknown", "error"].includes(b.deps_state as string)) return "build.deps_state is not known, unknown or error";
-  if (typeof b.node !== "string" || !/^v\d+\.\d+\.\d+[-+.0-9A-Za-z]{0,24}$/.test(b.node)) return "build.node is not a node version";
+  if (typeof b.node !== "string" || !/^v\d{1,4}\.\d{1,4}\.\d{1,4}([-+][0-9A-Za-z.]{1,24})?$/.test(b.node)) return "build.node is not a bounded node version";
   return null;
 }
 function resolutionFault(r: unknown): string | null {
@@ -136,7 +139,9 @@ export function recordFault(r: unknown): string | null {
     const c = r.covers;
     if (!sameKeys(c, ["reading_session", "message_ids"])) return "covers has exactly reading_session, message_ids";
     if (typeof c.reading_session !== "string" || !DIGEST_RE.test(c.reading_session)) return "reading_session is not a 64-hex digest";
-    if (!Array.isArray(c.message_ids) || c.message_ids.length === 0 || !c.message_ids.every(nonEmpty)) return "message_ids must be a non-empty list of ids";
+    if (!Array.isArray(c.message_ids) || c.message_ids.length === 0 || c.message_ids.length > MAX_IDS_PER_INTENT || !c.message_ids.every(nonEmpty)) {
+      return `message_ids must be a non-empty list of at most ${MAX_IDS_PER_INTENT} bounded ids`;
+    }
     // #300 R1 #8: a SET in canonical form: unique and sorted, at the writer AND on replay.
     const ids = c.message_ids as string[];
     for (let k = 1; k < ids.length; k++) if (!(ids[k - 1] < ids[k])) return "message_ids must be unique and sorted (a canonical set)";
@@ -146,7 +151,7 @@ export function recordFault(r: unknown): string | null {
     if (!sameKeys(r, ["v", "type", "at", "pid", "build", "install_dir", "resolution"])) return "a header record has exactly v, type, at, pid, build, install_dir, resolution";
     if (r.v !== 1) return "unknown record version";
     if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
-    if (!Number.isInteger(r.pid) || (r.pid as number) <= 0) return "pid is not a positive integer";
+    if (!Number.isInteger(r.pid) || (r.pid as number) <= 0 || (r.pid as number) > 0x7fffffff) return "pid is not a positive 32-bit integer";
     const bf = buildFault(r.build);
     if (bf) return bf;
     if (!boundedText(r.install_dir, MAX_PATH)) return "install_dir is not a bounded path";
@@ -188,10 +193,34 @@ export interface LogHandle {
   fd: number;
   path: string;
   io: LogIo;
+  /** The VERIFIED state dir, held open (no-follow), and its identity (#300 R2 #2). */
+  dirFd: number;
+  dirDev: number;
+  dirIno: number;
+}
+
+/**
+ * The state dir must still be the directory openLog verified: a real directory (not a
+ * symlink) with the same (dev, ino). Node has no openat/renameat, so path operations are
+ * re-anchored by checking this immediately before each of them: it narrows the window to
+ * the instant between the check and the call, it cannot close it. A mismatch is a
+ * LogWriteError: the job stops, it never writes into a directory it did not verify.
+ */
+function verifyDir(h: LogHandle, what: string): void {
+  const dir = path.dirname(h.path);
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(dir);
+  } catch (err) {
+    throw new LogWriteError(`the doorbell state dir is gone ${what} (${err instanceof Error ? err.message : String(err)})`);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== h.dirDev || st.ino !== h.dirIno) {
+    throw new LogWriteError(`the doorbell state dir ${dir} was replaced ${what}: refusing to write into it`);
+  }
 }
 
 /** The state dir must be a REAL directory (not a symlink), private (0700). */
-function ensurePrivateDir(dir: string): void {
+function ensurePrivateDir(dir: string): fs.Stats {
   let st: fs.Stats | null = null;
   try {
     st = fs.lstatSync(dir);
@@ -202,6 +231,7 @@ function ensurePrivateDir(dir: string): void {
   if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${dir} is not a real directory (a symlink or another file type): refusing to use it as the doorbell state dir`);
   const mode = st.mode & 0o777;
   if (mode & 0o077) throw new Error(`${dir} is mode ${mode.toString(8)}: the doorbell state dir must be private (0700)`);
+  return st;
 }
 
 /**
@@ -215,7 +245,7 @@ function ensurePrivateDir(dir: string): void {
  * Returns the handle and the state rebuilt from the same read.
  */
 export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogHandle; state: LogState; recoveredBytes: number } {
-  ensurePrivateDir(stateDir);
+  const dirSt = ensurePrivateDir(stateDir);
   // A compaction that crashed before its rename left only its temp file: the log itself is
   // intact, so the temp is discarded (unlink removes a planted symlink itself, never its target).
   for (const name of fs.readdirSync(stateDir)) if (name.startsWith(COMPACT_PREFIX)) fs.unlinkSync(path.join(stateDir, name));
@@ -244,7 +274,13 @@ export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogH
       fs.ftruncateSync(fd, keep);
       state.tornTail = false;
     }
-    return { handle: { fd, path: logPath, io }, state, recoveredBytes };
+    const dirFd = fs.openSync(stateDir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | O_NOFOLLOW);
+    const held = fs.fstatSync(dirFd);
+    if (held.dev !== dirSt.dev || held.ino !== dirSt.ino) {
+      fs.closeSync(dirFd);
+      throw new Error(`${stateDir} changed between its check and its open: refusing it`);
+    }
+    return { handle: { fd, path: logPath, io, dirFd, dirDev: held.dev, dirIno: held.ino }, state, recoveredBytes };
   } catch (err) {
     fs.closeSync(fd);
     throw err;
@@ -253,6 +289,7 @@ export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogH
 
 export function closeLog(h: LogHandle): void {
   fs.closeSync(h.fd);
+  fs.closeSync(h.dirFd);
 }
 
 /** A log append that did not provably complete: the job must FAIL-STOP (#300 R1 #4). */
@@ -373,28 +410,42 @@ export function compactLog(
   const headers = current.records.filter((r) => r.type === "header").slice(-COMPACT_KEEP_HEADERS);
   const kept = current.records.filter((r) => (r.type === "header" ? headers.includes(r) : r.type === "intent" ? keepIntent(r) : true));
   const tmp = path.join(stateDir, `${COMPACT_PREFIX}${process.pid}`);
-  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+  // #300 R2 #1 + #2: from here on, anything that does not complete is a LogWriteError, and
+  // the job FAIL-STOPS (it never resumes on the old descriptor, whose inode may already be
+  // unlinked). Every path operation is re-anchored to the verified dir first.
+  let renamed = false;
   try {
-    const buf = Buffer.from(kept.map((r) => JSON.stringify(r) + "\n").join(""), "utf-8");
-    let off = 0;
-    while (off < buf.length) {
-      const n = h.io.writeSync(fd, buf, off, buf.length - off);
-      if (!(n > 0)) throw new LogWriteError(`a compaction write made no progress at byte ${off} of ${buf.length}`);
-      off += n;
+    verifyDir(h, "before the compaction's temp file was created");
+    const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+    let tmpIno: number;
+    try {
+      tmpIno = fs.fstatSync(fd).ino;
+      const buf = Buffer.from(kept.map((r) => JSON.stringify(r) + "\n").join(""), "utf-8");
+      let off = 0;
+      while (off < buf.length) {
+        const n = h.io.writeSync(fd, buf, off, buf.length - off);
+        if (!(n > 0)) throw new Error(`a compaction write made no progress at byte ${off} of ${buf.length}`);
+        off += n;
+      }
+      h.io.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
     }
-    h.io.fsyncSync(fd);
+    verifyDir(h, "before the compaction's rename");
+    fs.renameSync(tmp, h.path);
+    renamed = true;
+    const landed = fs.lstatSync(h.path);
+    if (landed.ino !== tmpIno || !landed.isFile()) throw new Error("the compacted log is not the file this compaction wrote");
+    h.io.fsyncSync(h.dirFd); // the HELD verified dir, never re-opened by path
   } catch (err) {
-    fs.closeSync(fd);
-    fs.unlinkSync(tmp);
-    throw err;
-  }
-  fs.closeSync(fd);
-  fs.renameSync(tmp, h.path);
-  const dirFd = fs.openSync(stateDir, fs.constants.O_RDONLY);
-  try {
-    fs.fsyncSync(dirFd);
-  } finally {
-    fs.closeSync(dirFd);
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* the temp may not exist yet; the next open discards any left over */
+      }
+    }
+    throw err instanceof LogWriteError ? err : new LogWriteError(`the compaction did not complete (${err instanceof Error ? err.message : String(err)})`);
   }
   closeLog(h);
   const reopened = openLog(stateDir, h.io);
@@ -414,7 +465,11 @@ export class LogTailer {
   private offset = 0;
   private partial = "";
   private readonly seen = new Set<string>();
-  constructor(private readonly logPath: string) {}
+  /** `afterDetect` is a test seam: it runs between the replacement check and the drain. */
+  constructor(
+    private readonly logPath: string,
+    private readonly opts: { afterDetect?: () => void } = {},
+  ) {}
 
   private openCurrent(): void {
     this.fd = fs.openSync(this.logPath, fs.constants.O_RDONLY | O_NOFOLLOW);
@@ -447,13 +502,16 @@ export class LogTailer {
   poll(): IntentRecord[] {
     const out: IntentRecord[] = [];
     if (this.fd === null) this.openCurrent();
-    this.drain(out);
+    // #300 R2 #3: DETECT a replacement first, THEN drain the old inode: anything written to
+    // it before the replacement was detected is read before it is closed.
     let pathIno: number | null = null;
     try {
       pathIno = fs.lstatSync(this.logPath).ino;
     } catch {
       pathIno = null;
     }
+    this.opts.afterDetect?.();
+    this.drain(out);
     if (pathIno !== null && pathIno !== this.ino) {
       fs.closeSync(this.fd as number);
       this.openCurrent();
