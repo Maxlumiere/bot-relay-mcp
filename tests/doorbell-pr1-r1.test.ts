@@ -26,6 +26,7 @@ const intent = (ids: string[]) => ({
   v: 1 as const,
   type: "intent" as const,
   at: "2026-10-02T05:00:00.000Z",
+  mono_ms: 0,
   intent: { intent_id: "00000000-0000-4000-8000-000000000001", agent_name: "alice", binding_id: "b", reason: "new_mail" as const },
   covers: { reading_session: RS, message_ids: ids },
 });
@@ -147,6 +148,11 @@ describe("#8: message_ids is a canonical set", () => {
       ownHostId: "H",
       pending: () => ({ registered: true, reading_session: RS, ids: ["m2", "m1", "m1"] }),
       rung: new Set(),
+      ringMono: new Map(),
+      nowMono: 0,
+      budgetExhausted: new Set(),
+      windowMs: C.DEFAULT_WINDOW_MS,
+      budgetPerHour: C.DEFAULT_BUDGET_PER_HOUR,
       newIntentId: () => "00000000-0000-4000-8000-000000000009",
       now: () => "2026-10-02T05:00:00.000Z",
     });
