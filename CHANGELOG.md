@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added — `relay fleet --deploy-check`: is this deploy finished?
+
+`relay fleet --deploy-check` exits 0 only when every relay connector on this machine (whether or not a window binding names it), every live bound window and the daemon run the installed build, checked twice in a row. It exits 1 naming every window or connector still on the old build (restart it), and 3 when the machine changed between the two checks or could not be read (run it again). A deploy is complete when it exits 0.
+
+Tests: `tests/adr-0047-deploy-check.test.ts`: every failing state, the two checks disagreeing, an unreadable board; and, on real processes, a connector launched through a symlinked install that passes, then fails once the install is rebuilt.
+
 ### Added — `relay fleet --connectors`: does every agent window run the installed build?
 
 After a relay install, each agent window keeps the relay code it loaded until it restarts, and nothing said which windows were still on the old code. `relay fleet --connectors` lists every relay connector process on this machine with a verdict: `CURRENT` (runs the installed build), `STALE` (restart that window), `UNKNOWN` (it cannot be shown to run the installed build: for example it started before this release), `INSTALL INCONSISTENT` (rebuild the install), or, for a live window with no connector at all, `NO CONNECTOR`. A connector that no window binding names is marked `UNBOUND`. The daemon gets the same check on its own install. `--json` gives the whole judgement. Read-only; see `docs/cli.md`. Known gap: a window that reaches the relay over HTTP reads `NO CONNECTOR` for now.
