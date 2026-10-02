@@ -71,6 +71,12 @@ describe("planCycle: the V4 trigger", () => {
     const p = plan({ rung: new Set([L.rungKey(RS1, "m1")]), reads: { alice: { registered: true, reading_session: RS1, ids: ["m1", "m3"] } } });
     expect(p.intents.map((r) => r.covers.message_ids)).toEqual([["m3"]]);
   });
+  it("message_ids is a SET: the same ids in any scan order give the same record (the drain order has no same-ms tie-break)", () => {
+    const a = plan({ reads: { alice: { registered: true, reading_session: RS1, ids: ["m2", "m1", "m3"] } } });
+    const b = plan({ reads: { alice: { registered: true, reading_session: RS1, ids: ["m3", "m2", "m1"] } } });
+    expect(a.intents[0].covers).toEqual(b.intents[0].covers);
+    expect(a.intents[0].covers.message_ids).toEqual(["m1", "m2", "m3"]);
+  });
   it("one intent per agent per cycle, even with two bindings for the same name", () => {
     const p = plan({ bindings: [bind("alice", HOST, "b1"), bind("alice", HOST, "b2")] });
     expect(p.intents).toHaveLength(1);

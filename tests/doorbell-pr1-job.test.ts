@@ -116,9 +116,10 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
     expect(intents()).toEqual([]);
   });
 
-  it("HARM (ADR-0046 metamorphic): scrambling seq and epoch changes no intent", () => {
+  it("HARM (ADR-0046 metamorphic): scrambling seq and epoch changes no intent (two mails in the SAME millisecond: the CI shape)", () => {
     send("db-alice");
     send("db-alice");
+    db.getDb().prepare("UPDATE messages SET created_at = ? WHERE to_agent = ?").run(new Date().toISOString(), "db-alice");
     expect(once().status).toBe(0);
     const first = intents().map((i) => i.covers);
     fs.rmSync(path.join(ROOT, "inst", "doorbell"), { recursive: true });
@@ -172,7 +173,9 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
       const files = spawnSync("lsof", ["-nP", "-p", String(pid)], { encoding: "utf-8" }).stdout.split("\n");
       const dbFds = files.filter((l) => l.endsWith(DB));
       expect(dbFds.length, files.join("\n")).toBeGreaterThan(0);
-      for (const l of dbFds) expect(l.split(/\s+/)[3], l).toMatch(/^\d+r$/); // FD column: read-only
+      // lsof's FD column is the fd, then the access MODE (r / w / u), then an optional
+      // lock flag ("20rr" on Linux = fd 20, mode r, read lock): the mode must be r.
+      for (const l of dbFds) expect(l.split(/\s+/)[3], l).toMatch(/^\d+r/);
       const e = realSystemDeps.processTable().get(pid);
       expect(e, "the job is in the process table").toBeTruthy();
       const view = { pid, ppid: e!.ppid, start: e!.startedAt, command: e!.command, comm: e!.comm, cwd: realSystemDeps.cwds([pid]).get(pid) ?? null, argv: realSystemDeps.exactArgv(pid) };
