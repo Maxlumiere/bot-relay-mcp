@@ -17,7 +17,7 @@
  *   - the connector classifier reads the job's real argv as NOT relay (the deploy check
  *     never fails on it), and dist/doorbell.js loads the deps snapshot FIRST.
  */
-import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -38,6 +38,18 @@ const db = await import("../src/db.js");
 const { getOwnHostId, processStartedAt } = await import("../src/liveness.js");
 const { realSystemDeps } = await import("../src/fleet-system.js");
 const { classifyProcess } = await import("../src/fleet-verdicts.js");
+const { runDoorbell } = await import("../src/doorbell-run.js");
+const L = await import("../src/doorbell-log.js");
+/** Run the job IN-PROCESS (for its test seams) and capture what it says on stderr. */
+async function inProcess(argv: string[], opts: import("../src/doorbell-run.js").DoorbellOptions = {}): Promise<{ code: number; stderr: string }> {
+  let stderr = "";
+  const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => ((stderr += String(chunk)), true));
+  try {
+    return { code: await runDoorbell(argv, opts), stderr };
+  } finally {
+    spy.mockRestore();
+  }
+}
 
 const HOST = getOwnHostId();
 const env = (over: Record<string, string> = {}) => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, ...over });
@@ -79,11 +91,13 @@ beforeEach(() => {
 describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => {
   it("one intent for new mail, content-free; the header carries LOADED_BUILD, the install and the resolution; the relay DB is byte-identical", () => {
     const m1 = send("db-alice");
-    db.closeDb();
+    // The test's own connection stays open: the WAL sidecars exist (ruling 8c83e4ce D-1).
     const before = fs.readFileSync(DB);
+    const walBefore = fs.readFileSync(`${DB}-wal`);
     const r = once();
     expect(r.status, r.stderr).toBe(0);
-    expect(fs.readFileSync(DB).equals(before)).toBe(true); // V1: no write to the relay DB
+    expect(fs.readFileSync(DB).equals(before)).toBe(true); // V1 restated: the main file is never written
+    expect(fs.readFileSync(`${DB}-wal`).equals(walBefore)).toBe(true); // ...and neither is -wal
     const recs = records();
     expect(recs[0]).toMatchObject({ type: "header", install_dir: fs.realpathSync(REPO_ROOT), resolution: { kind: "explicit-db" } });
     expect(recs[0].build?.build_id).toMatch(/^([0-9a-f]{64}|unbuilt)$/);
@@ -93,7 +107,6 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
 
   it("HARM (V4): a RESTART after a ring does not re-ring the same (reading session, id)", () => {
     send("db-alice");
-    db.closeDb();
     expect(once().status).toBe(0);
     expect(once().status).toBe(0);
     expect(intents()).toHaveLength(1);
@@ -141,6 +154,40 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
     expect(intents().map((i) => i.intent?.agent_name)).toEqual([]);
   });
 
+  it("D-1 (ruling 8c83e4ce): NO WAL sidecars → the DB is not opened, WAITING-FOR-WRITER (exit 0), and no sidecar is created", () => {
+    send("db-alice");
+    db.closeDb(); // the last connection: SQLite checkpoints and removes -wal and -shm
+    expect([fs.existsSync(`${DB}-wal`), fs.existsSync(`${DB}-shm`)]).toEqual([false, false]); // precondition
+    const r = once();
+    expect([r.status, r.stderr]).toEqual([0, expect.stringMatching(/WAITING-FOR-WRITER: the relay DB has no -wal and -shm yet/)]);
+    expect([fs.existsSync(`${DB}-wal`), fs.existsSync(`${DB}-shm`)]).toEqual([false, false]);
+    expect(intents()).toEqual([]);
+  });
+
+  it("D-1: a sidecar REPLACED while the DB was being opened → the handle is closed at once, waiting; no intent", async () => {
+    send("db-alice");
+    const r = await inProcess(["--once"], {
+      afterDbOpen: () => {
+        const shm = `${DB}-shm`;
+        fs.copyFileSync(shm, `${shm}.swap`);
+        fs.renameSync(`${shm}.swap`, shm); // same bytes, a NEW inode
+      },
+    });
+    expect([r.code, r.stderr]).toEqual([0, expect.stringMatching(/a WAL sidecar changed while the relay DB was being opened/)]);
+    expect(intents()).toEqual([]);
+  });
+
+  it("HARM (#4): an fsync failure after a complete write STOPS the job (exit 1, no retry); a restart adds NO duplicate", async () => {
+    send("db-alice");
+    let fsyncs = 0;
+    const io = { ...L.realLogIo, fsyncSync: (fd: number) => { if (++fsyncs === 2) throw new Error("EIO (injected)"); fs.fsyncSync(fd); } };
+    const r = await inProcess(["--interval-ms", "1000"], { logIo: io }); // a LOOP, which would otherwise retry
+    expect([r.code, r.stderr]).toEqual([1, expect.stringMatching(/DOORBELL_FAILED: the doorbell log write did not complete .*stopping/)]);
+    expect(intents()).toHaveLength(1); // the line was written; only its fsync failed
+    expect(once().status).toBe(0); // the restart rebuilds rung memory from the log
+    expect(intents()).toHaveLength(1);
+  });
+
   it("a resolver fault, or a missing DB, refuses the start (exit 1) and creates no state dir", () => {
     db.closeDb();
     const fault = once({ RELAY_DB_PATH: "", RELAY_INSTANCE_ID: "../escape" });
@@ -158,7 +205,6 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
   });
 
   it("a LIVE job: no network fd at all; the relay DB held read-only; the classifier reads it NOT relay; SIGTERM stops it cleanly", async () => {
-    db.closeDb();
     const child = spawn(process.execPath, [ENTRY, "--interval-ms", "1000"], { env: env(), stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
     child.stderr.on("data", (b) => (stderr += String(b)));
@@ -168,6 +214,10 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
         await new Promise((r) => setTimeout(r, 100));
       }
       const pid = child.pid as number;
+      for (let t0 = Date.now(); !spawnSync("lsof", ["-nP", "-p", String(pid)], { encoding: "utf-8" }).stdout.includes(DB); ) {
+        if (Date.now() - t0 > 10_000) throw new Error(`the job never opened the relay DB: ${stderr}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
       const net = spawnSync("lsof", ["-nP", "-a", "-p", String(pid), "-i"], { encoding: "utf-8" });
       expect(net.stdout.trim(), "the job holds a network socket").toBe("");
       const files = spawnSync("lsof", ["-nP", "-p", String(pid)], { encoding: "utf-8" }).stdout.split("\n");

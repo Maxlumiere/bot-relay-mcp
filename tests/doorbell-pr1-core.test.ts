@@ -19,6 +19,20 @@ const L = await import("../src/doorbell-log.js");
 type PendingRead = import("../src/doorbell-core.js").PendingRead;
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "doorbell-pr1-core-"));
+/** Open-check-close (the job holds the handle; a test opens it per step). */
+const prep = (dir: string) => {
+  const o = L.openLog(dir);
+  L.closeLog(o.handle);
+  return { logPath: o.handle.path, recoveredBytes: o.recoveredBytes };
+};
+const append = (logPath: string, rec: unknown) => {
+  const o = L.openLog(path.dirname(logPath));
+  try {
+    L.appendRecord(o.handle, rec as never);
+  } finally {
+    L.closeLog(o.handle);
+  }
+};
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 const HOST = "HOST-A";
@@ -107,36 +121,36 @@ describe("planCycle: candidates are THIS host's bindings, positively", () => {
 describe("the log: a CLOSED schema (C3), content-free", () => {
   const good = () => plan().intents[0];
   it("HARM (C3): a free-text reason is refused by the writer, and nothing is written", () => {
-    const { logPath } = L.prepareLog(path.join(ROOT, "c3-reason"));
+    const { logPath } = prep(path.join(ROOT, "c3-reason"));
     const bad = { ...good(), intent: { ...good().intent, reason: "alice has 3 urgent messages from bob" } };
-    expect(() => L.appendRecord(logPath, bad as never)).toThrow(/reason must be one of/);
+    expect(() => append(logPath, bad as never)).toThrow(/reason must be one of/);
     expect(fs.readFileSync(logPath, "utf-8")).toBe("");
   });
   it("HARM (C3): an EXTRA field (in the intent, in covers, or on the record) is refused", () => {
-    const { logPath } = L.prepareLog(path.join(ROOT, "c3-extra"));
+    const { logPath } = prep(path.join(ROOT, "c3-extra"));
     const g = good();
     for (const bad of [
       { ...g, intent: { ...g.intent, content: "hi" } },
       { ...g, covers: { ...g.covers, from: "bob" } },
       { ...g, subject: "x" },
     ]) {
-      expect(() => L.appendRecord(logPath, bad as never)).toThrow(/refusing to log/);
+      expect(() => append(logPath, bad as never)).toThrow(/refusing to log/);
     }
     expect(fs.readFileSync(logPath, "utf-8")).toBe("");
   });
   it("twin: a valid intent is written as ONE line and read back into rung memory", () => {
-    const { logPath } = L.prepareLog(path.join(ROOT, "ok"));
-    L.appendRecord(logPath, good());
+    const { logPath } = prep(path.join(ROOT, "ok"));
+    append(logPath, good());
     expect(fs.readFileSync(logPath, "utf-8").split("\n").filter(Boolean)).toHaveLength(1);
     expect([...L.readRungMemory(logPath).rung]).toEqual([L.rungKey(RS1, "m1")]);
   });
   it("the log is 0600 in a 0700 state dir; an existing world-readable log is REFUSED, never repaired", () => {
     const dir = path.join(ROOT, "modes");
-    const { logPath } = L.prepareLog(dir);
+    const { logPath } = prep(dir);
     expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
     expect(fs.statSync(logPath).mode & 0o777).toBe(0o600);
     fs.chmodSync(logPath, 0o644);
-    expect(() => L.prepareLog(dir)).toThrow(/must be private \(0600\)/);
+    expect(() => prep(dir)).toThrow(/must be private \(0600\)/);
   });
 });
 
@@ -145,25 +159,25 @@ describe("rung memory and WAL recovery", () => {
     JSON.stringify({ v: 1, type: "intent", at: "2026-10-02T04:00:00.000Z", intent: { intent_id: ids(), agent_name: "alice", binding_id: "b", reason: "new_mail" }, covers: { reading_session: rs, message_ids: idsList } });
   it("memory is keyed (reading session, id): the same id under two sessions is two keys", () => {
     const dir = path.join(ROOT, "mem");
-    const { logPath } = L.prepareLog(dir);
+    const { logPath } = prep(dir);
     fs.appendFileSync(logPath, line(RS1, ["m1"]) + "\n" + line(RS2, ["m1"]) + "\n");
     expect(L.readRungMemory(logPath).rung).toEqual(new Set([L.rungKey(RS1, "m1"), L.rungKey(RS2, "m1")]));
   });
   it("a TORN tail (unterminated last line, a crash mid-write) is truncated on prepare and never counted as rung", () => {
     const dir = path.join(ROOT, "torn");
-    const { logPath } = L.prepareLog(dir);
+    const { logPath } = prep(dir);
     fs.appendFileSync(logPath, line(RS1, ["m1"]) + "\n" + line(RS1, ["m2"]).slice(0, 40));
     expect(L.readRungMemory(logPath)).toMatchObject({ tornTail: true });
     expect(L.readRungMemory(logPath).rung).toEqual(new Set([L.rungKey(RS1, "m1")]));
-    const again = L.prepareLog(dir);
+    const again = prep(dir);
     expect(again.recoveredBytes).toBe(40);
-    L.appendRecord(logPath, plan({ reads: { alice: { registered: true, reading_session: RS1, ids: ["m3"] } } }).intents[0]);
+    append(logPath, plan({ reads: { alice: { registered: true, reading_session: RS1, ids: ["m3"] } } }).intents[0]);
     expect(L.readRungMemory(logPath)).toMatchObject({ tornTail: false }); // the next append started on a clean line
     expect(L.readRungMemory(logPath).rung).toEqual(new Set([L.rungKey(RS1, "m1"), L.rungKey(RS1, "m3")]));
   });
   it("HARM: an invalid COMPLETE line anywhere (even the last) is refused: no cycle on a memory it cannot trust", () => {
     const dir = path.join(ROOT, "corrupt");
-    const { logPath } = L.prepareLog(dir);
+    const { logPath } = prep(dir);
     fs.appendFileSync(logPath, line(RS1, ["m1"]) + "\n" + '{"v":1,"type":"intent"}\n');
     expect(() => L.readRungMemory(logPath)).toThrow(/line 2 is not a valid doorbell record/);
   });

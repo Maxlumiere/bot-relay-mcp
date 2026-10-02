@@ -14,9 +14,16 @@
  * and WRITE-AHEAD an intent per agent with new mail (src/doorbell-core.ts). There is no
  * driver yet, so nothing is rung: the intents only land in the log.
  *
- *   - V1: NO write handle to the relay DB. It is opened READ-ONLY at the driver
- *     (openPendingDb), so a write through it throws; the job writes only its own state
- *     dir, beside the resolved DB (plan v3 Q5).
+ *   - V1, as restated by ruling 8c83e4ce: NO LOGICAL WRITE to the relay DB, and the main
+ *     file and -wal are never written by the doorbell (-shm reader coordination is
+ *     inherent and permitted). It is opened READ-ONLY at the driver (openPendingDb), and
+ *     ONLY when both WAL sidecars already exist: with either absent, it does not open and
+ *     reports WAITING-FOR-WRITER (expected, not unhealthy; retried every cycle), so it
+ *     never creates a sidecar with its own umask. A sidecar whose identity changed while
+ *     the DB was being opened closes the handle at once (same state).
+ *   - Its own state (the log) is opened no-follow and identity-checked; a log write that
+ *     does not provably complete STOPS the job (exit 1): a restart rebuilds from the log,
+ *     so a record already on disk is never written twice.
  *   - ADR-0048: the DB comes from the ONE strict resolver. A fault, or a DB that does not
  *     exist, refuses the start (exit 1); it never picks another DB.
  *   - No listener: it opens no socket of any kind, and no tool or HTTP route accepts an
@@ -37,7 +44,7 @@ import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { getOwnHostId } from "./liveness.js";
 import { planCycle, type PendingRead } from "./doorbell-core.js";
-import { appendRecord, prepareLog, readRungMemory, rungKey, stateDirFor } from "./doorbell-log.js";
+import { appendRecord, closeLog, LogWriteError, openLog, rungKey, stateDirFor, type LogHandle, type LogIo, type LogState } from "./doorbell-log.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
 export const MIN_INTERVAL_MS = 1000;
@@ -89,7 +96,28 @@ function ownInstallDir(): string {
   }
 }
 
-export async function runDoorbell(argv: string[]): Promise<number> {
+/** The two WAL sidecars' identities, or null for one that is absent / not a regular file. */
+function sidecarIds(dbPath: string): { wal: string | null; shm: string | null } {
+  const id = (p: string): string | null => {
+    try {
+      const st = fs.lstatSync(p);
+      return st.isFile() ? `${st.dev}:${st.ino}` : null;
+    } catch {
+      return null;
+    }
+  };
+  return { wal: id(`${dbPath}-wal`), shm: id(`${dbPath}-shm`) };
+}
+
+/** Test seams: not reachable from the command line (dist/doorbell.js passes argv only). */
+export interface DoorbellOptions {
+  /** The log's file I/O (a short write, a failed fsync). */
+  logIo?: LogIo;
+  /** Runs after the DB's first read and BEFORE the post-open sidecar recheck. */
+  afterDbOpen?: () => void;
+}
+
+export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): Promise<number> {
   const args = parseArgs(argv);
   if (args === "help") {
     usage(process.stderr); // stderr: src/ keeps stdout for the MCP channel (tests/no-stdout-writes.test.ts)
@@ -104,26 +132,21 @@ export async function runDoorbell(argv: string[]): Promise<number> {
   const resolution = resolveInstance();
   if (resolution.kind === "error") return fail(`the relay DB cannot be resolved (${resolution.reason})`);
   if (!resolution.exists) return fail(`no relay DB at ${resolution.dbPath}: nothing to watch (a missing DB is never "no mail")`);
+  const dbPath = resolution.dbPath;
 
-  const { openPendingDb } = await import("./cli/pending.js");
-  const { pendingMetadata, pendingSchemaGap, listAgentBindings } = await import("./db.js");
-  let db: import("./sqlite-compat.js").CompatDatabase;
+  // The log first: it does not depend on the DB being openable yet.
+  let log: LogHandle;
+  let state: LogState;
   try {
-    db = await openPendingDb(resolution.dbPath);
+    const opened = openLog(stateDirFor(dbPath), opts.logIo);
+    log = opened.handle;
+    state = opened.state;
+    if (opened.recoveredBytes > 0) process.stderr.write(`doorbell: recovered a torn log tail (${opened.recoveredBytes} bytes, never acted on)\n`);
   } catch (err) {
-    return fail(`cannot open ${resolution.dbPath} read-only (${err instanceof Error ? err.message : String(err)})`);
+    return fail(err instanceof Error ? err.message : String(err));
   }
-
-  let logPath: string;
-  let rung: Set<string>;
   try {
-    const gap = pendingSchemaGap(db);
-    if (gap) throw new Error(`${resolution.dbPath} ${gap}`);
-    const prepared = prepareLog(stateDirFor(resolution.dbPath));
-    logPath = prepared.logPath;
-    if (prepared.recoveredBytes > 0) process.stderr.write(`doorbell: recovered a torn log tail (${prepared.recoveredBytes} bytes, never acted on)\n`);
-    rung = readRungMemory(logPath).rung;
-    appendRecord(logPath, {
+    appendRecord(log, {
       v: 1,
       type: "header",
       at: new Date().toISOString(),
@@ -133,9 +156,42 @@ export async function runDoorbell(argv: string[]): Promise<number> {
       resolution: serializeResolution(resolution),
     });
   } catch (err) {
-    db.close();
+    closeLog(log);
     return fail(err instanceof Error ? err.message : String(err));
   }
+
+  const { openPendingDb } = await import("./cli/pending.js");
+  const { pendingMetadata, pendingSchemaGap, listAgentBindings } = await import("./db.js");
+  let db: import("./sqlite-compat.js").CompatDatabase | null = null;
+
+  /** Open the DB only with both sidecars present and unchanged across the open; else why not. */
+  const tryOpenDb = async (): Promise<string | null> => {
+    const before = sidecarIds(dbPath);
+    if (!before.wal || !before.shm) {
+      const missing = [!before.wal && "-wal", !before.shm && "-shm"].filter(Boolean).join(" and ");
+      return `the relay DB has no ${missing} yet: waiting for a writer (the doorbell creates no sidecar)`;
+    }
+    const h = await openPendingDb(dbPath);
+    let gap: string | null;
+    try {
+      gap = pendingSchemaGap(h); // the first read: SQLite maps the sidecars here
+      opts.afterDbOpen?.();
+    } catch (err) {
+      h.close();
+      throw err;
+    }
+    const after = sidecarIds(dbPath);
+    if (after.wal !== before.wal || after.shm !== before.shm) {
+      h.close();
+      return "a WAL sidecar changed while the relay DB was being opened: closed at once, waiting for a writer";
+    }
+    if (gap) {
+      h.close();
+      throw new Error(`${dbPath} ${gap}`);
+    }
+    db = h;
+    return null;
+  };
 
   let stopping = false;
   let wake: (() => void) | null = null;
@@ -146,31 +202,46 @@ export async function runDoorbell(argv: string[]): Promise<number> {
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
 
-  const cycle = (): void => {
+  const cycle = (handle: import("./sqlite-compat.js").CompatDatabase): void => {
     const plan = planCycle({
-      bindings: listAgentBindings(db),
+      bindings: listAgentBindings(handle),
       ownHostId: getOwnHostId(),
       pending: (name): PendingRead => {
-        const m = pendingMetadata(db, name);
+        const m = pendingMetadata(handle, name);
         return { registered: m.registered, reading_session: m.reading_session, ids: m.messages.map((x) => x.id) };
       },
-      rung,
+      rung: state.rung,
       newIntentId: () => randomUUID(),
       now: () => new Date().toISOString(),
     });
     for (const rec of plan.intents) {
-      appendRecord(logPath, rec); // write-ahead: durable before it counts as rung
-      for (const id of rec.covers.message_ids) rung.add(rungKey(rec.covers.reading_session, id));
+      appendRecord(log, rec); // write-ahead: complete and durable before it counts as rung
+      for (const id of rec.covers.message_ids) state.rung.add(rungKey(rec.covers.reading_session, id));
     }
   };
 
   let code = 0;
+  let waitingSaid: string | null = null;
   try {
     while (!stopping) {
       try {
-        cycle();
+        if (!db) {
+          const waiting = await tryOpenDb();
+          if (waiting) {
+            if (waiting !== waitingSaid) process.stderr.write(`doorbell: WAITING-FOR-WRITER: ${waiting}\n`); // once per state change
+            waitingSaid = waiting;
+          } else waitingSaid = null;
+        }
+        if (db) cycle(db);
       } catch (err) {
-        process.stderr.write(`doorbell: cycle failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        const msg = err instanceof Error ? err.message : String(err);
+        if (err instanceof LogWriteError) {
+          // FAIL-STOP: the record may already be on disk; never retry it from memory.
+          process.stderr.write(`DOORBELL_FAILED: ${msg}; stopping (a restart rebuilds from the log)\n`);
+          code = 1;
+          break;
+        }
+        process.stderr.write(`doorbell: cycle failed: ${msg}\n`);
         if (args.once) {
           code = 1;
           break;
@@ -187,7 +258,10 @@ export async function runDoorbell(argv: string[]): Promise<number> {
       wake = null;
     }
   } finally {
-    db.close();
+    (db as import("./sqlite-compat.js").CompatDatabase | null)?.close();
+    closeLog(log);
+    process.removeListener("SIGTERM", stop);
+    process.removeListener("SIGINT", stop);
   }
   return code;
 }

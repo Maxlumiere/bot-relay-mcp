@@ -20,6 +20,7 @@
 import fs from "fs";
 import path from "path";
 import { AGENT_NAME_PATTERN } from "./types.js";
+import { ACTIVE_INSTANCE_MARKER } from "./resolve-instance.js";
 
 /** Why an intent exists. An ENUM (C3): later PRs add members; free text never. */
 export const INTENT_REASONS = ["new_mail"] as const;
@@ -46,10 +47,18 @@ export interface HeaderRecord {
   type: "header";
   at: string;
   pid: number;
-  /** ADR-0047: what THIS process loaded (LOADED_BUILD), and the install it came from. */
-  build: Record<string, unknown>;
+  /** ADR-0047: what THIS process loaded (LOADED_BUILD), exactly its seven keys. */
+  build: {
+    build_id: string;
+    commit: string | null;
+    dirty: boolean | null;
+    built_at: string | null;
+    deps_id: string | null;
+    deps_state: "known" | "unknown" | "error";
+    node: string;
+  };
   install_dir: string;
-  /** ADR-0048: the resolution it runs against (serializeResolution). */
+  /** ADR-0048: the resolution it runs against (serializeResolution of a non-error kind). */
   resolution: Record<string, unknown>;
 }
 
@@ -58,6 +67,53 @@ export type LogRecord = IntentRecord | HeaderRecord;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+
+const MAX_PATH = 4096;
+const MAX_TEXT = 500;
+/** A bounded, single-line string: no control character, at most `max` characters. */
+const boundedText = (v: unknown, max: number): v is string => typeof v === "string" && v.length > 0 && v.length <= max && !/[\u0000-\u001f\u007f]/.test(v);
+const nullOr = <T>(v: unknown, ok: (x: unknown) => x is T): boolean => v === null || ok(v);
+const HEX64 = /^[0-9a-f]{64}$/;
+
+/** #300 R1 #7: the header's nested objects are CLOSED too: exact keys, typed and bounded values. */
+function buildFault(b: unknown): string | null {
+  if (!sameKeys(b, ["build_id", "commit", "dirty", "built_at", "deps_id", "deps_state", "node"])) {
+    return "build has exactly build_id, commit, dirty, built_at, deps_id, deps_state, node";
+  }
+  if (typeof b.build_id !== "string" || !(HEX64.test(b.build_id) || b.build_id === "unbuilt")) return "build.build_id is not a code id";
+  if (!nullOr(b.commit, (x): x is string => typeof x === "string" && /^[0-9a-f]{7,64}$/.test(x))) return "build.commit is not a commit id";
+  if (!(b.dirty === null || typeof b.dirty === "boolean")) return "build.dirty is not a boolean";
+  if (!nullOr(b.built_at, (x): x is string => typeof x === "string" && ISO_RE.test(x))) return "build.built_at is not an ISO timestamp";
+  if (!nullOr(b.deps_id, (x): x is string => typeof x === "string" && HEX64.test(x))) return "build.deps_id is not a deps id";
+  if (!["known", "unknown", "error"].includes(b.deps_state as string)) return "build.deps_state is not known, unknown or error";
+  if (typeof b.node !== "string" || !/^v\d+\.\d+\.\d+[-+.0-9A-Za-z]{0,24}$/.test(b.node)) return "build.node is not a node version";
+  return null;
+}
+function resolutionFault(r: unknown): string | null {
+  const kind = (r as { kind?: unknown } | null)?.kind;
+  const base = ["kind", "db_path", "exists", "containment"];
+  const keys =
+    kind === "explicit-db" || kind === "instance"
+      ? [...base, "basis", ...(kind === "instance" ? ["id"] : [])]
+      : kind === "flat"
+        ? (r as Record<string, unknown>).warning === undefined
+          ? base
+          : [...base, "warning"]
+        : null;
+  if (!keys) return "resolution.kind is not explicit-db, instance or flat";
+  if (!sameKeys(r, keys)) return `resolution (${kind as string}) has exactly ${keys.join(", ")}`;
+  if (!boundedText(r.db_path, MAX_PATH)) return "resolution.db_path is not a bounded path";
+  if (typeof r.exists !== "boolean") return "resolution.exists is not a boolean";
+  if (!["strict", "roots-only"].includes(r.containment as string)) return "resolution.containment is not strict or roots-only";
+  if (kind === "explicit-db" && !["RELAY_DB_PATH", "--db-path"].includes(r.basis as string)) return "resolution.basis is not RELAY_DB_PATH or --db-path";
+  if (kind === "instance") {
+    // That basis IS the marker file's name: the resolver's constant, never re-spelled (ADR-0048 tripwire).
+    if (!["RELAY_INSTANCE_ID", ACTIVE_INSTANCE_MARKER].includes(r.basis as string)) return `resolution.basis is not RELAY_INSTANCE_ID or ${ACTIVE_INSTANCE_MARKER}`;
+    if (typeof r.id !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(r.id)) return "resolution.id is not an instance id";
+  }
+  if (r.warning !== undefined && !boundedText(r.warning, MAX_TEXT)) return "resolution.warning is not bounded text";
+  return null;
+}
 
 const sameKeys = (o: unknown, keys: readonly string[]): o is Record<string, unknown> =>
   !!o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).sort().join(",") === [...keys].sort().join(",");
@@ -81,6 +137,9 @@ export function recordFault(r: unknown): string | null {
     if (!sameKeys(c, ["reading_session", "message_ids"])) return "covers has exactly reading_session, message_ids";
     if (typeof c.reading_session !== "string" || !DIGEST_RE.test(c.reading_session)) return "reading_session is not a 64-hex digest";
     if (!Array.isArray(c.message_ids) || c.message_ids.length === 0 || !c.message_ids.every(nonEmpty)) return "message_ids must be a non-empty list of ids";
+    // #300 R1 #8: a SET in canonical form: unique and sorted, at the writer AND on replay.
+    const ids = c.message_ids as string[];
+    for (let k = 1; k < ids.length; k++) if (!(ids[k - 1] < ids[k])) return "message_ids must be unique and sorted (a canonical set)";
     return null;
   }
   if (t === "header") {
@@ -88,10 +147,10 @@ export function recordFault(r: unknown): string | null {
     if (r.v !== 1) return "unknown record version";
     if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
     if (!Number.isInteger(r.pid) || (r.pid as number) <= 0) return "pid is not a positive integer";
-    if (!r.build || typeof r.build !== "object" || typeof (r.build as { build_id?: unknown }).build_id !== "string") return "build carries no build_id";
-    if (!nonEmpty(r.install_dir)) return "install_dir is empty";
-    if (!r.resolution || typeof r.resolution !== "object") return "resolution is not an object";
-    return null;
+    const bf = buildFault(r.build);
+    if (bf) return bf;
+    if (!boundedText(r.install_dir, MAX_PATH)) return "install_dir is not a bounded path";
+    return resolutionFault(r.resolution);
   }
   return "unknown record type";
 }
@@ -106,64 +165,141 @@ export function stateDirFor(dbPath: string): string {
 export const LOG_FILENAME = "actuation.jsonl";
 
 /**
- * Open (create) the log: the state dir 0700, the file 0600. An existing file or dir that
- * anyone else can read is REFUSED, never silently repaired. WAL recovery: an
- * UNTERMINATED last line (a crash mid-write) was never fully logged, so nothing acted on
- * it; it is truncated, so the next append starts on a clean line. `recoveredBytes` says so.
+ * EVERY open of doorbell state is no-follow (#300 R1 #2; ruling 8c83e4ce): a symlink
+ * planted at the log path (say, to the relay DB) is refused by the kernel, never written
+ * through. Where the platform has no O_NOFOLLOW, the lstat + identity checks still refuse it.
  */
-export function prepareLog(stateDir: string): { logPath: string; recoveredBytes: number } {
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const dirMode = fs.statSync(stateDir).mode & 0o777;
-  if (dirMode & 0o077) throw new Error(`${stateDir} is mode ${dirMode.toString(8)}: the doorbell state dir must be private (0700)`);
-  const logPath = path.join(stateDir, LOG_FILENAME);
-  if (fs.existsSync(logPath)) {
-    const mode = fs.statSync(logPath).mode & 0o777;
-    if (mode & 0o077) throw new Error(`${logPath} is mode ${mode.toString(8)}: the doorbell log must be private (0600)`);
-  } else {
-    fs.closeSync(fs.openSync(logPath, "a", 0o600));
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+/** The file I/O an append uses (injectable, so a short write or a failed fsync can be tested). */
+export interface LogIo {
+  writeSync(fd: number, buf: Buffer, offset: number, length: number): number;
+  fsyncSync(fd: number): void;
+  fstatSync(fd: number): fs.Stats;
+}
+export const realLogIo: LogIo = {
+  writeSync: (fd, buf, offset, length) => fs.writeSync(fd, buf, offset, length),
+  fsyncSync: (fd) => fs.fsyncSync(fd),
+  fstatSync: (fd) => fs.fstatSync(fd),
+};
+
+/** The log, held open for the job's life: one identity-checked, no-follow descriptor. */
+export interface LogHandle {
+  fd: number;
+  path: string;
+  io: LogIo;
+}
+
+/** The state dir must be a REAL directory (not a symlink), private (0700). */
+function ensurePrivateDir(dir: string): void {
+  let st: fs.Stats | null = null;
+  try {
+    st = fs.lstatSync(dir);
+  } catch {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    st = fs.lstatSync(dir);
   }
-  const text = fs.readFileSync(logPath);
-  let recoveredBytes = 0;
-  if (text.length > 0 && text[text.length - 1] !== 0x0a) {
-    const keep = text.lastIndexOf(0x0a) + 1;
-    recoveredBytes = text.length - keep;
-    fs.truncateSync(logPath, keep);
-  }
-  return { logPath, recoveredBytes };
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${dir} is not a real directory (a symlink or another file type): refusing to use it as the doorbell state dir`);
+  const mode = st.mode & 0o777;
+  if (mode & 0o077) throw new Error(`${dir} is mode ${mode.toString(8)}: the doorbell state dir must be private (0700)`);
 }
 
 /**
- * WRITE-AHEAD append: validate, then write ONE line and fsync before returning, so
- * nothing can act on a record that is not durably on disk. An invalid record throws
- * and nothing is written.
+ * Open the log for the job's life. #300 R1 #2:
+ *   - the state dir and the log are lstat-checked: a symlink or a non-regular file is REFUSED;
+ *   - the log is opened O_NOFOLLOW, and its (dev, ino) must equal what lstat saw (no swap
+ *     between the check and the open); a new log is created O_EXCL, mode 0600;
+ *   - recovery VALIDATES first: every complete line must be a valid record (else refuse,
+ *     touching nothing), and only then is an UNTERMINATED tail truncated (a crash
+ *     mid-write; never fully logged, so never acted on).
+ * Returns the handle and the state rebuilt from the same read.
  */
-export function appendRecord(logPath: string, rec: LogRecord): void {
+export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogHandle; state: LogState; recoveredBytes: number } {
+  ensurePrivateDir(stateDir);
+  const logPath = path.join(stateDir, LOG_FILENAME);
+  let pre: fs.Stats | null = null;
+  try {
+    pre = fs.lstatSync(logPath);
+  } catch {
+    pre = null;
+  }
+  if (pre && (pre.isSymbolicLink() || !pre.isFile())) throw new Error(`${logPath} is not a regular file (a symlink or another file type): refusing to open it`);
+  const flags = fs.constants.O_RDWR | fs.constants.O_APPEND | O_NOFOLLOW | (pre ? 0 : fs.constants.O_CREAT | fs.constants.O_EXCL);
+  const fd = fs.openSync(logPath, flags, 0o600);
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${logPath} is not a regular file`);
+    if (pre && (st.dev !== pre.dev || st.ino !== pre.ino)) throw new Error(`${logPath} changed between its check and its open: refusing it`);
+    const mode = st.mode & 0o777;
+    if (mode & 0o077) throw new Error(`${logPath} is mode ${mode.toString(8)}: the doorbell log must be private (0600)`);
+    const bytes = fs.readFileSync(fd);
+    const state = parseLogText(bytes.toString("utf-8"), logPath); // throws before any truncation
+    let recoveredBytes = 0;
+    if (bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a) {
+      const keep = bytes.lastIndexOf(0x0a) + 1;
+      recoveredBytes = bytes.length - keep;
+      fs.ftruncateSync(fd, keep);
+      state.tornTail = false;
+    }
+    return { handle: { fd, path: logPath, io }, state, recoveredBytes };
+  } catch (err) {
+    fs.closeSync(fd);
+    throw err;
+  }
+}
+
+export function closeLog(h: LogHandle): void {
+  fs.closeSync(h.fd);
+}
+
+/** A log append that did not provably complete: the job must FAIL-STOP (#300 R1 #4). */
+export class LogWriteError extends Error {}
+
+/**
+ * WRITE-AHEAD append through the held descriptor: validate, write the WHOLE line (a short
+ * write is continued, no progress is an error), check the file grew by exactly that many
+ * bytes, fsync, and only then return (#300 R1 #3). The caller advances its memory only
+ * after this returns; any failure is a LogWriteError, and the job stops rather than retry
+ * a record that may already be on disk (#4: a restart rebuilds from the log).
+ */
+export function appendRecord(h: LogHandle, rec: LogRecord): void {
   const fault = recordFault(rec);
   if (fault) throw new Error(`refusing to log an invalid doorbell record: ${fault}`);
-  const fd = fs.openSync(logPath, "a", 0o600);
+  const buf = Buffer.from(JSON.stringify(rec) + "\n", "utf-8");
   try {
-    fs.writeSync(fd, JSON.stringify(rec) + "\n");
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+    const before = h.io.fstatSync(h.fd).size;
+    let off = 0;
+    while (off < buf.length) {
+      const n = h.io.writeSync(h.fd, buf, off, buf.length - off);
+      if (!(n > 0)) throw new Error(`a write made no progress at byte ${off} of ${buf.length}`);
+      off += n;
+    }
+    const after = h.io.fstatSync(h.fd).size;
+    if (after !== before + buf.length) throw new Error(`the log grew by ${after - before} bytes, not ${buf.length}`);
+    h.io.fsyncSync(h.fd);
+  } catch (err) {
+    throw new LogWriteError(`the doorbell log write did not complete (${err instanceof Error ? err.message : String(err)})`);
   }
 }
 
+/** Everything the job keeps between cycles, rebuilt from the log on start (never memory-only). */
+export interface LogState {
+  /** rungKey(reading session, id) for every id an intent covered. */
+  rung: Set<string>;
+  tornTail: boolean;
+}
+
 /**
- * Rebuild rung memory from the log. A torn tail (an UNTERMINATED last line: a crash, or
- * a writer mid-append seen by a reader) was never fully logged, so nothing acted on it:
- * it is skipped and reported. Any other invalid line, a complete one included, means the
- * log is not what this writer wrote: REFUSED (fail closed: no cycle runs on a memory it
- * cannot trust).
+ * Parse the log text. A torn tail (an UNTERMINATED last line) is skipped and reported. Any
+ * other invalid line, a complete one included, means the log is not what this writer
+ * wrote: REFUSED (fail closed: no cycle runs on a state it cannot trust).
  */
-export function readRungMemory(logPath: string): { rung: Set<string>; tornTail: boolean } {
-  const text = fs.readFileSync(logPath, "utf-8");
+function parseLogText(text: string, logPath: string): LogState {
   const terminated = text.endsWith("\n");
   const lines = text.split("\n");
   lines.pop(); // "" after a final newline, or the unterminated tail (checked below)
   const tail = terminated ? null : text.slice(text.lastIndexOf("\n") + 1);
-  const rung = new Set<string>();
-  let tornTail = false;
+  const state: LogState = { rung: new Set(), tornTail: false };
   lines.forEach((line, i) => {
     let rec: unknown;
     let fault: string | null;
@@ -173,12 +309,26 @@ export function readRungMemory(logPath: string): { rung: Set<string>; tornTail: 
     } catch {
       fault = "not JSON";
     }
-    if (fault) {
-      throw new Error(`${logPath} line ${i + 1} is not a valid doorbell record (${fault}): refusing to rebuild rung memory from it`);
-    }
+    if (fault) throw new Error(`${logPath} line ${i + 1} is not a valid doorbell record (${fault}): refusing to rebuild rung memory from it`);
     const r = rec as LogRecord;
-    if (r.type === "intent") for (const id of r.covers.message_ids) rung.add(rungKey(r.covers.reading_session, id));
+    if (r.type === "intent") for (const id of r.covers.message_ids) state.rung.add(rungKey(r.covers.reading_session, id));
   });
-  if (tail !== null && tail.length > 0) tornTail = true;
-  return { rung, tornTail };
+  if (tail !== null && tail.length > 0) state.tornTail = true;
+  return state;
+}
+
+/** A READER's view of the log (tests, tailers): opened read-only and no-follow, never written. */
+export function readLogState(logPath: string): LogState {
+  const fd = fs.openSync(logPath, fs.constants.O_RDONLY | O_NOFOLLOW);
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`${logPath} is not a regular file`);
+    return parseLogText(fs.readFileSync(fd, "utf-8"), logPath);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Rung memory only (PR 1's reader name), from the same parse. */
+export function readRungMemory(logPath: string): { rung: Set<string>; tornTail: boolean } {
+  return readLogState(logPath);
 }

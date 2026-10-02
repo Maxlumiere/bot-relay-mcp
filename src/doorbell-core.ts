@@ -95,7 +95,7 @@ export function planCycle(input: CycleInput): CyclePlan {
     const rs = read.reading_session;
     // A SET, in canonical order: the drain order has no same-millisecond tie-break, so the
     // scan order of equal-time ids is not stable, and the record must not depend on it.
-    const fresh = read.ids.filter((id) => !input.rung.has(rungKey(rs, id))).sort();
+    const fresh = [...new Set(read.ids.filter((id) => !input.rung.has(rungKey(rs, id))))].sort(); // a canonical SET (#300 R1 #8)
     if (fresh.length === 0) continue;
     const intent: Intent = { intent_id: input.newIntentId(), agent_name: b.agent_name, binding_id: b.binding_id, reason: "new_mail" };
     intents.push({ v: 1, type: "intent", at: input.now(), intent, covers: { reading_session: rs, message_ids: fresh } });

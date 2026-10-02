@@ -18,17 +18,41 @@ import { describe, it, expect } from "vitest";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import os from "os";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = path.join(REPO_ROOT, "src");
 const E = await import("../src/entrypoints.js");
-const { installPaths } = await import("../src/cli/init.js");
+const { installPaths, installMcpServer } = await import("../src/cli/init.js");
 const { buildLaunchdPlist } = await import("../src/cli/launchd.js");
 
 const rel = (p: string) => path.relative(REPO_ROOT, p).split(path.sep).join("/");
 function walk(dir: string): string[] {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) => (d.isDirectory() ? walk(path.join(dir, d.name)) : [path.join(dir, d.name)]));
 }
+
+/**
+ * #300 R1 #5: INSTALLERS are discovered from the source, not assumed. A file that builds a
+ * plist (`<key>ProgramArguments</key>`), runs `launchctl bootstrap`, or calls
+ * `upsertMcpServer(` writes or loads an install. Each must be one the collector below
+ * covers; a NEW installer fails this until the collector learns it.
+ */
+const INSTALLER_PATTERNS = [/<key>ProgramArguments<\/key>/, /["']bootstrap["']/, /\bupsertMcpServer\(/];
+const KNOWN_INSTALLERS: Record<string, string> = {
+  "src/cli/launchd.ts": "the daemon plist builder (collected: its ProgramArguments are parsed)",
+  "src/cli/init.ts": "the MCP config writer (collected: the config it writes is read back) and the daemon plist's bootstrap",
+  "src/cli/restart.ts": "re-bootstraps the daemon plist launchd.ts built (no script of its own)",
+};
+function discoverInstallers(files: Array<{ rel: string; text: string }>): string[] {
+  return files
+    .filter((f) => {
+      const text = f.text.replace(/export function upsertMcpServer\(/g, ""); // the helper's own definition is not a call site
+      return INSTALLER_PATTERNS.some((re) => re.test(text));
+    })
+    .map((f) => f.rel)
+    .sort();
+}
+const srcFiles = () => walk(SRC).filter((f) => f.endsWith(".ts")).map((f) => ({ rel: rel(f), text: fs.readFileSync(f, "utf-8") }));
 
 async function realFacts(): Promise<import("../src/entrypoints.js").EntrypointFacts> {
   const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf-8")) as { bin: Record<string, string> };
@@ -41,6 +65,11 @@ async function realFacts(): Promise<import("../src/entrypoints.js").EntrypointFa
   const bootstrapped = walk(SRC)
     .filter((f) => f.endsWith(".ts") && fs.readFileSync(f, "utf-8").startsWith("#!"))
     .map((f) => "dist/" + rel(f).replace(/^src\//, "").replace(/\.ts$/, ".js"));
+  // The MCP fact: the script in the config the installer ACTUALLY writes.
+  const json = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "i1-mcp-")), "claude.json");
+  installMcpServer(distEntry, json);
+  const written = JSON.parse(fs.readFileSync(json, "utf-8")) as { mcpServers: Record<string, { args?: string[] }> };
+  const mcpScripts = Object.values(written.mcpServers).flatMap((e) => e.args ?? []).filter((a) => a.startsWith(REPO_ROOT)).map(rel);
   const modules: Record<string, Record<string, unknown>> = {
     "./db.js": await import("../src/db.js"),
     "./fleet-verdicts.js": await import("../src/fleet-verdicts.js"),
@@ -48,7 +77,7 @@ async function realFacts(): Promise<import("../src/entrypoints.js").EntrypointFa
   return {
     binTargets,
     plistScripts,
-    mcpScripts: [rel(distEntry)],
+    mcpScripts,
     bootstrapped,
     hasExport: (m, name) => typeof modules[m]?.[name] === "function",
   };
@@ -69,6 +98,24 @@ describe("I1: the entrypoint registry, on the REAL sources", () => {
     expect(E.CURRENCY_MECHANISMS.heartbeat).toBeNull();
     const f = await realFacts();
     expect([...f.binTargets, ...f.plistScripts, ...f.mcpScripts]).not.toContain("dist/doorbell.js");
+  });
+});
+
+describe("#300 R1 #5: installers are DISCOVERED from the source", () => {
+  it("every installer in the source is one the collector covers (and none it lists is stale)", () => {
+    expect(discoverInstallers(srcFiles())).toEqual(Object.keys(KNOWN_INSTALLERS).sort());
+  });
+  it("HARM (MEASURED shape): a NEW plist installer, bootstrap or MCP writer is discovered, so it cannot escape I1", () => {
+    const fixtures = [
+      ...srcFiles(),
+      { rel: "src/cli/doorbell-install.ts", text: "const plist = `<key>ProgramArguments</key><array><string>${node}</string></array>`;" },
+      { rel: "src/cli/other-boot.ts", text: 'execFileSync("launchctl", ["bootstrap", domain, p]);' },
+      { rel: "src/cli/other-mcp.ts", text: 'upsertMcpServer(existing, "x", entry);' },
+    ];
+    expect(discoverInstallers(fixtures).filter((f) => !(f in KNOWN_INSTALLERS))).toEqual(["src/cli/doorbell-install.ts", "src/cli/other-boot.ts", "src/cli/other-mcp.ts"]);
+  });
+  it("the MCP fact is read from the config the installer WROTE (non-vacuous)", async () => {
+    expect((await realFacts()).mcpScripts).toEqual(["dist/index.js"]);
   });
 });
 
