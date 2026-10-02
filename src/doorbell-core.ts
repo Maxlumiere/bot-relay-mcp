@@ -70,8 +70,15 @@ export interface CycleInput {
   pending: (agentName: string) => PendingRead;
   /** Rung memory: rungKey(reading session, id). Not mutated. */
   rung: ReadonlySet<string>;
-  /** Per agent: the time (ms) of every past intent (the window and the budget). Not mutated. */
-  ringTimes: ReadonlyMap<string, readonly number[]>;
+  /**
+   * Per agent: every past ring as a MONOTONIC time (ms) on THIS lifetime's clock (ruling
+   * 622689ba): this lifetime's own rings at their offset; a previous lifetime's at the
+   * effective time effectiveRingMono() gives it. The window and the budget never read the
+   * wall clock. Not mutated.
+   */
+  ringMono: ReadonlyMap<string, readonly number[]>;
+  /** Now, on this lifetime's monotonic clock (ms since its header). */
+  nowMono: number;
   /** Agents whose budget state is currently "exhausted" (as last logged). Not mutated. */
   budgetExhausted: ReadonlySet<string>;
   windowMs: number;
@@ -100,7 +107,7 @@ export function planCycle(input: CycleInput): CyclePlan {
   const fault = tunablesFault(input);
   if (fault) throw new Error(fault);
   const at = input.now();
-  const nowMs = Date.parse(at);
+  const nowMono = input.nowMono;
   if (!input.ownHostId) {
     for (const b of input.bindings) skipped.push({ binding_id: b.binding_id, agent_name: b.agent_name, why: "this host's identity is unknown: no binding can be shown to be local" });
     return { intents, budget, skipped };
@@ -134,10 +141,10 @@ export function planCycle(input: CycleInput): CyclePlan {
     }
     const rs = read.reading_session;
     const name = b.agent_name;
-    const times = input.ringTimes.get(name) ?? [];
+    const times = input.ringMono.get(name) ?? [];
     // Q4: the budget STATE, evaluated every cycle so its change is logged when it happens
     // (A3.2), whether or not this agent has new mail right now.
-    const inHour = times.filter((t) => t > nowMs - BUDGET_WINDOW_MS).length;
+    const inHour = times.filter((t) => t > nowMono - BUDGET_WINDOW_MS).length;
     const exhaustedNow = inHour >= input.budgetPerHour;
     if (exhaustedNow !== input.budgetExhausted.has(name)) {
       budget.push({ v: 1, type: "budget", at, agent_name: name, state: exhaustedNow ? "exhausted" : "available", rings_in_hour: inHour, budget_per_hour: input.budgetPerHour });
@@ -154,12 +161,39 @@ export function planCycle(input: CycleInput): CyclePlan {
     }
     // Q3: within W of the last ring, hold; the held ids stay un-rung, so ONE intent covers them once W has passed.
     const last = times.length > 0 ? Math.max(...times) : null;
-    if (last !== null && nowMs - last < input.windowMs) {
+    if (last !== null && nowMono - last < input.windowMs) {
       skip(`coalescing: ${fresh.length} new id(s) held until ${input.windowMs / 1000}s after the last ring`);
       continue;
     }
     const intent: Intent = { intent_id: input.newIntentId(), agent_name: name, binding_id: b.binding_id, reason: "new_mail" };
-    intents.push({ v: 1, type: "intent", at, intent, covers: { reading_session: rs, message_ids: fresh } });
+    intents.push({ v: 1, type: "intent", at, mono_ms: Math.max(0, Math.round(nowMono)), intent, covers: { reading_session: rs, message_ids: fresh } });
   }
   return { intents, budget, skipped };
+}
+
+/**
+ * Ruling 622689ba (2): a PREVIOUS lifetime's rings on THIS lifetime's monotonic clock. A ring
+ * counts iff its wall age at this start is under the budget window, OR that age is
+ * IMPLAUSIBLE (negative, or the log's last header is AHEAD of now: a detectable backward
+ * jump), which fails SAFE: it counts as if it rang at this start. A plausible ring sits at
+ * minus its wall age. A forward jump entirely inside the restart gap is a documented KNOWN
+ * LIMIT (at most one extra budget window per restart).
+ */
+export function effectiveRingMono(
+  ringWalls: ReadonlyMap<string, readonly number[]>,
+  lastHeaderWall: number | null,
+  startWall: number,
+): Map<string, number[]> {
+  const backward = lastHeaderWall !== null && lastHeaderWall > startWall;
+  const out = new Map<string, number[]>();
+  for (const [agent, walls] of ringWalls) {
+    out.set(
+      agent,
+      walls.map((w) => {
+        const age = startWall - w;
+        return backward || age < 0 ? 0 : -age;
+      }),
+    );
+  }
+  return out;
 }

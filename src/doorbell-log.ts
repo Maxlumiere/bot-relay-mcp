@@ -36,7 +36,10 @@ export interface Intent {
 export interface IntentRecord {
   v: 1;
   type: "intent";
+  /** Wall time (for humans and across restarts). */
   at: string;
+  /** Monotonic ms since this job lifetime's header (ruling 622689ba: the in-lifetime clock). */
+  mono_ms: number;
   intent: Intent;
   /** What this intent rings for: the reading session (PR 0b digest) and the message ids. */
   covers: { reading_session: string; message_ids: string[] };
@@ -78,7 +81,17 @@ export interface BudgetRecord {
   budget_per_hour: number;
 }
 
-export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord;
+/** Ruling 622689ba (4): an in-lifetime WALL-CLOCK JUMP (|wall delta − mono delta| > 5 s), for audit. */
+export interface ClockRecord {
+  v: 1;
+  type: "clock";
+  at: string;
+  mono_ms: number;
+  wall_delta_ms: number;
+  mono_delta_ms: number;
+}
+
+export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord | ClockRecord;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -134,6 +147,10 @@ function resolutionFault(r: unknown): string | null {
   return null;
 }
 
+/** A bounded integer number of ms (about 317 years either way at most). */
+const MAX_MS = 10_000_000_000_000;
+const boundedMs = (v: unknown, min: number): boolean => Number.isInteger(v) && (v as number) >= min && (v as number) <= MAX_MS;
+
 const sameKeys = (o: unknown, keys: readonly string[]): o is Record<string, unknown> =>
   !!o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).sort().join(",") === [...keys].sort().join(",");
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 200 && !/[\u0000-\u001f\u007f]/.test(v);
@@ -143,9 +160,10 @@ export function recordFault(r: unknown): string | null {
   if (!r || typeof r !== "object") return "not an object";
   const t = (r as { type?: unknown }).type;
   if (t === "intent") {
-    if (!sameKeys(r, ["v", "type", "at", "intent", "covers"])) return "an intent record has exactly v, type, at, intent, covers";
+    if (!sameKeys(r, ["v", "type", "at", "mono_ms", "intent", "covers"])) return "an intent record has exactly v, type, at, mono_ms, intent, covers";
     if (r.v !== 1) return "unknown record version";
     if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
+    if (!boundedMs(r.mono_ms, 0)) return "mono_ms is not a bounded non-negative integer";
     const i = r.intent;
     if (!sameKeys(i, ["intent_id", "agent_name", "binding_id", "reason"])) return "an intent has exactly intent_id, agent_name, binding_id, reason";
     if (typeof i.intent_id !== "string" || !UUID_RE.test(i.intent_id)) return "intent_id is not a v4 UUID";
@@ -161,6 +179,13 @@ export function recordFault(r: unknown): string | null {
     // #300 R1 #8: a SET in canonical form: unique and sorted, at the writer AND on replay.
     const ids = c.message_ids as string[];
     for (let k = 1; k < ids.length; k++) if (!(ids[k - 1] < ids[k])) return "message_ids must be unique and sorted (a canonical set)";
+    return null;
+  }
+  if (t === "clock") {
+    if (!sameKeys(r, ["v", "type", "at", "mono_ms", "wall_delta_ms", "mono_delta_ms"])) return "a clock record has exactly v, type, at, mono_ms, wall_delta_ms, mono_delta_ms";
+    if (r.v !== 1) return "unknown record version";
+    if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
+    if (!boundedMs(r.mono_ms, 0) || !boundedMs(r.wall_delta_ms, -MAX_MS) || !boundedMs(r.mono_delta_ms, 0)) return "a clock record's ms fields are not bounded integers";
     return null;
   }
   if (t === "budget") {
@@ -355,8 +380,10 @@ export function appendRecord(h: LogHandle, rec: LogRecord): void {
 export interface LogState {
   /** rungKey(reading session, id) for every id an intent covered. */
   rung: Set<string>;
-  /** Per agent: the time (ms) of every intent, oldest first: the window (Q3) and the budget (Q4). */
-  ringTimes: Map<string, number[]>;
+  /** Per agent: the WALL time (ms) of every intent in the log, oldest first (previous lifetimes). */
+  ringWalls: Map<string, number[]>;
+  /** The wall time (ms) of the LAST header in the log (null if none): a backward-jump detector. */
+  lastHeaderWall: number | null;
   /** Agents whose LAST budget record says exhausted (A3.2: so a restart does not log it again). */
   budgetExhausted: Set<string>;
   tornTail: boolean;
@@ -374,7 +401,7 @@ function parseLogText(text: string, logPath: string): LogState {
   const lines = text.split("\n");
   lines.pop(); // "" after a final newline, or the unterminated tail (checked below)
   const tail = terminated ? null : text.slice(text.lastIndexOf("\n") + 1);
-  const state: LogState = { rung: new Set(), ringTimes: new Map(), budgetExhausted: new Set(), tornTail: false, records: [] };
+  const state: LogState = { rung: new Set(), ringWalls: new Map(), lastHeaderWall: null, budgetExhausted: new Set(), tornTail: false, records: [] };
   lines.forEach((line, i) => {
     let rec: unknown;
     let fault: string | null;
@@ -389,9 +416,11 @@ function parseLogText(text: string, logPath: string): LogState {
     state.records.push(r);
     if (r.type === "intent") {
       for (const id of r.covers.message_ids) state.rung.add(rungKey(r.covers.reading_session, id));
-      const times = state.ringTimes.get(r.intent.agent_name) ?? [];
-      times.push(Date.parse(r.at));
-      state.ringTimes.set(r.intent.agent_name, times);
+      const walls = state.ringWalls.get(r.intent.agent_name) ?? [];
+      walls.push(Date.parse(r.at));
+      state.ringWalls.set(r.intent.agent_name, walls);
+    } else if (r.type === "header") {
+      state.lastHeaderWall = Date.parse(r.at);
     } else if (r.type === "budget") {
       if (r.state === "exhausted") state.budgetExhausted.add(r.agent_name);
       else state.budgetExhausted.delete(r.agent_name);

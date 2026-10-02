@@ -43,7 +43,8 @@ import { fileURLToPath } from "url";
 import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { getOwnHostId } from "./liveness.js";
-import { BUDGET_WINDOW_MS, DEFAULT_BUDGET_PER_HOUR, DEFAULT_WINDOW_MS, MAX_WINDOW_MS, MIN_WINDOW_MS, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
+import { performance } from "perf_hooks";
+import { effectiveRingMono, DEFAULT_BUDGET_PER_HOUR, DEFAULT_WINDOW_MS, MAX_WINDOW_MS, MIN_WINDOW_MS, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, LogWriteError, openLog, rungKey, stateDirFor, type IntentRecord, type LogHandle, type LogIo, type LogState } from "./doorbell-log.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
@@ -136,7 +137,18 @@ export interface DoorbellOptions {
   afterDbOpen?: () => void;
   /** The log size cap (default LOG_CAP_BYTES). */
   logCapBytes?: number;
+  /** The clocks (ruling 622689ba): wall for records and across restarts, monotonic within a lifetime. */
+  clock?: { wallMs(): number; monoMs(): number };
+  /** Runs at the start of every cycle (a test drives mail arrival with it). */
+  beforeCycle?: (n: number) => void;
 }
+
+/** A wall step this large against the monotonic clock is a JUMP (ruling 622689ba (4)). */
+export const CLOCK_JUMP_MS = 5000;
+
+const realClock = { wallMs: () => Date.now(), monoMs: () => performance.now() };
+const iso = (ms: number): string => new Date(ms).toISOString();
+
 
 export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): Promise<number> {
   const args = parseArgs(argv);
@@ -166,11 +178,17 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));
   }
+  const clock = opts.clock ?? realClock;
+  const startWall = clock.wallMs();
+  const startMono = clock.monoMs();
+  // Ruling 622689ba (2): every ring in the log is a PREVIOUS lifetime's; place it on this
+  // lifetime's monotonic clock ONCE, here, before our header and before any compaction.
+  const ringMono = effectiveRingMono(state.ringWalls, state.lastHeaderWall, startWall);
   try {
     appendRecord(log, {
       v: 1,
       type: "header",
-      at: new Date().toISOString(),
+      at: iso(startWall),
       pid: process.pid,
       build: { ...LOADED_BUILD },
       install_dir: ownInstallDir(),
@@ -232,11 +250,15 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
         pendingNow.set(r.intent.agent_name, { rs: m.reading_session, ids: new Set(m.messages.map((x) => x.id)) });
       }
     })();
-    const nowMs = Date.now();
+    // Ruling 622689ba (3): each agent's LAST N intents (N = the budget) are kept REGARDLESS of
+    // wall age, as EVIDENCE (plausibility and audit): a wall jump can never erase them. They
+    // are not automatically counted: counting is effectiveRingMono's rule.
+    const lastN = new Set<string>();
+    const byAgent = new Map<string, IntentRecord[]>();
+    for (const r of state.records) if (r.type === "intent") byAgent.set(r.intent.agent_name, [...(byAgent.get(r.intent.agent_name) ?? []), r]);
+    for (const list of byAgent.values()) for (const r of list.slice(-args.budgetPerHour)) lastN.add(r.intent.intent_id);
     const keep = (rec: IntentRecord): boolean => {
-      // PR 2: an intent inside the budget window is a RING TIME the window and the budget
-      // still count; dropping it would let a restart undercount the budget.
-      if (Date.parse(rec.at) > nowMs - BUDGET_WINDOW_MS) return true;
+      if (lastN.has(rec.intent.intent_id)) return true;
       const p = pendingNow.get(rec.intent.agent_name);
       return !!p && p.rs === rec.covers.reading_session && rec.covers.message_ids.some((id) => p.ids.has(id));
     };
@@ -255,7 +277,23 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
 
+  let cycles = 0;
+  let lastWall = startWall;
+  let lastMono = 0;
   const cycle = (handle: import("./sqlite-compat.js").CompatDatabase): void => {
+    opts.beforeCycle?.(cycles++);
+    const nowWall = clock.wallMs();
+    const nowMono = clock.monoMs() - startMono;
+    // Ruling 622689ba (4): a wall step that disagrees with the monotonic one by > 5 s is a
+    // JUMP: recorded (closed `clock` record), never acted on (the arithmetic is monotonic).
+    const wallDelta = nowWall - lastWall;
+    const monoDelta = nowMono - lastMono;
+    if (Math.abs(wallDelta - monoDelta) > CLOCK_JUMP_MS) {
+      appendRecord(log, { v: 1, type: "clock", at: iso(nowWall), mono_ms: Math.round(nowMono), wall_delta_ms: Math.round(wallDelta), mono_delta_ms: Math.round(monoDelta) });
+      process.stderr.write(`doorbell: the wall clock jumped ${Math.round((wallDelta - monoDelta) / 1000)} s against the monotonic clock (recorded; timing is monotonic)\n`);
+    }
+    lastWall = nowWall;
+    lastMono = nowMono;
     const plan = planCycle({
       bindings: listAgentBindings(handle),
       ownHostId: getOwnHostId(),
@@ -264,12 +302,13 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
         return { registered: m.registered, reading_session: m.reading_session, ids: m.messages.map((x) => x.id) };
       },
       rung: state.rung,
-      ringTimes: state.ringTimes,
+      ringMono,
+      nowMono,
       budgetExhausted: state.budgetExhausted,
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,
       newIntentId: () => randomUUID(),
-      now: () => new Date().toISOString(),
+      now: () => iso(nowWall),
     });
     for (const rec of plan.budget) {
       appendRecord(log, rec); // A3.2: once per state change, durable before the state moves
@@ -283,9 +322,7 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
     for (const rec of plan.intents) {
       appendRecord(log, rec); // write-ahead: complete and durable before it counts as rung
       for (const id of rec.covers.message_ids) state.rung.add(rungKey(rec.covers.reading_session, id));
-      const times = state.ringTimes.get(rec.intent.agent_name) ?? [];
-      times.push(Date.parse(rec.at));
-      state.ringTimes.set(rec.intent.agent_name, times);
+      ringMono.set(rec.intent.agent_name, [...(ringMono.get(rec.intent.agent_name) ?? []), rec.mono_ms]);
     }
   };
 

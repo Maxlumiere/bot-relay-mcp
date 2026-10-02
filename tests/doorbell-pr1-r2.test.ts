@@ -29,6 +29,7 @@ const intent = (ids: string[]) => ({
   v: 1 as const,
   type: "intent" as const,
   at: "2026-10-02T05:00:00.000Z",
+  mono_ms: 0,
   intent: { intent_id: `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`, agent_name: "alice", binding_id: "b", reason: "new_mail" as const },
   covers: { reading_session: RS, message_ids: ids },
 });

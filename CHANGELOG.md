@@ -8,7 +8,8 @@ The doorbell job (not installed yet) now limits how often it would ring an agent
 
 - **Once per burst.** It rings at once. More mail for that agent within the next 60 seconds is held, then covered by one ring. `--window-s` sets the window, within bounds.
 - **A budget.** At most 6 rings per agent per hour; `--budget-per-hour` sets it, within bounds. Past it, that agent is not rung. The job says so on stderr and in its log once, and once more when rings are allowed again, never on every cycle.
-- **Survives a restart.** Both are rebuilt from the job's log, and the log compaction keeps the last hour's rings, so a restart does not reset either.
+- **Survives a restart.** Both are rebuilt from the job's log, and compaction keeps each agent's most recent rings, so a restart does not reset either.
+- **Not fooled by clock changes.** While running, the job measures the window and the budget on the computer's monotonic clock, not the wall clock. After a restart, an earlier ring counts if it happened within the last hour. It also counts if its time cannot be trusted, for example when the clock has gone backward; in that case the job errs toward ringing less. A wall-clock jump of more than 5 seconds is recorded in the log.
 
 Values outside the bounds are refused at start (exit 2).
 

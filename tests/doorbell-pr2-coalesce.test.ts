@@ -43,7 +43,7 @@ const uuid = () => `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`;
  */
 function harness(opts: { windowMs?: number; budgetPerHour?: number } = {}) {
   const rung = new Set<string>();
-  const ringTimes = new Map<string, number[]>();
+  const ringMono = new Map<string, number[]>(); // one lifetime: mono = ms since T0
   const exhausted = new Set<string>();
   const all: Array<IntentRecord | import("../src/doorbell-log.js").BudgetRecord> = [];
   const cycle = (atMs: number, ids: string[]) => {
@@ -53,7 +53,8 @@ function harness(opts: { windowMs?: number; budgetPerHour?: number } = {}) {
       ownHostId: HOST,
       pending: (name) => reads[name],
       rung,
-      ringTimes,
+      ringMono,
+      nowMono: atMs - T0,
       budgetExhausted: exhausted,
       windowMs: opts.windowMs ?? W,
       budgetPerHour: opts.budgetPerHour ?? 6,
@@ -67,7 +68,7 @@ function harness(opts: { windowMs?: number; budgetPerHour?: number } = {}) {
     }
     for (const r of p.intents) {
       for (const id of r.covers.message_ids) rung.add(L.rungKey(r.covers.reading_session, id));
-      ringTimes.set(r.intent.agent_name, [...(ringTimes.get(r.intent.agent_name) ?? []), Date.parse(r.at)]);
+      ringMono.set(r.intent.agent_name, [...(ringMono.get(r.intent.agent_name) ?? []), r.mono_ms]);
       all.push(r);
     }
     return p;
@@ -109,7 +110,8 @@ describe("Q3: one ring per burst (the coalescing window W)", () => {
       ownHostId: HOST,
       pending: (name) => ({ registered: true, reading_session: RS, ids: [`${name}-m`] }),
       rung,
-      ringTimes: new Map([["alice", [T0 - 1000]]]),
+      ringMono: new Map([["alice", [-1000]]]),
+      nowMono: 0,
       budgetExhausted: new Set(),
       windowMs: W,
       budgetPerHour: 6,
@@ -187,7 +189,7 @@ describe("restart: the window and the budget are rebuilt from the log", () => {
     for (const r of h.all) L.appendRecord(o.handle, r);
     L.closeLog(o.handle);
     const s = L.readLogState(o.handle.path);
-    expect(s.ringTimes.get("alice")).toEqual(h.intents().map((r) => Date.parse(r.at)));
+    expect(s.ringWalls.get("alice")).toEqual(h.intents().map((r) => Date.parse(r.at)));
     expect([...s.budgetExhausted]).toEqual(["alice"]);
   });
   it("HARM: a restart INSIDE W does not ring again for mail that arrived after the last ring", () => {
@@ -202,7 +204,9 @@ describe("restart: the window and the budget are rebuilt from the log", () => {
       ownHostId: HOST,
       pending: () => ({ registered: true, reading_session: RS, ids: ["m1", "m2"] }),
       rung: s.rung,
-      ringTimes: s.ringTimes,
+      // A RESTART: the log's rings are a previous lifetime's, placed by the ruling-622689ba rule.
+      ringMono: C.effectiveRingMono(s.ringWalls, s.lastHeaderWall, T0 + 5000),
+      nowMono: 0,
       budgetExhausted: s.budgetExhausted,
       windowMs: W,
       budgetPerHour: 6,

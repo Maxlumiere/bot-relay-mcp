@@ -52,7 +52,8 @@ function plan(over: Partial<Parameters<typeof C.planCycle>[0]> & { reads?: Recor
       return r;
     },
     rung: new Set(),
-    ringTimes: new Map(),
+    ringMono: new Map(),
+    nowMono: 0,
     budgetExhausted: new Set(),
     windowMs: C.DEFAULT_WINDOW_MS,
     budgetPerHour: C.DEFAULT_BUDGET_PER_HOUR,
@@ -160,7 +161,7 @@ describe("the log: a CLOSED schema (C3), content-free", () => {
 
 describe("rung memory and WAL recovery", () => {
   const line = (rs: string, idsList: string[]) =>
-    JSON.stringify({ v: 1, type: "intent", at: "2026-10-02T04:00:00.000Z", intent: { intent_id: ids(), agent_name: "alice", binding_id: "b", reason: "new_mail" }, covers: { reading_session: rs, message_ids: idsList } });
+    JSON.stringify({ v: 1, type: "intent", at: "2026-10-02T04:00:00.000Z", mono_ms: 0, intent: { intent_id: ids(), agent_name: "alice", binding_id: "b", reason: "new_mail" }, covers: { reading_session: rs, message_ids: idsList } });
   it("memory is keyed (reading session, id): the same id under two sessions is two keys", () => {
     const dir = path.join(ROOT, "mem");
     const { logPath } = prep(dir);

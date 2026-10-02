@@ -37,6 +37,7 @@ const intent = (ids: string[], agent = "alice") => ({
   v: 1 as const,
   type: "intent" as const,
   at: "2026-10-02T05:00:00.000Z",
+  mono_ms: 0,
   intent: { intent_id: `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`, agent_name: agent, binding_id: "b", reason: "new_mail" as const },
   covers: { reading_session: RS, message_ids: ids },
 });
@@ -160,18 +161,24 @@ beforeEach(() => {
 
 describe.skipIf(!HOST)("the job: compaction at the first DB open, and the size cap", () => {
   it("an intent whose ids all LEFT pending is dropped at the next start; a still-pending one is KEPT (so no re-ring)", async () => {
+    // Budget 1 = only each agent's LAST intent is kept as evidence regardless of age (ruling
+    // 622689ba (3)), so the pending rule decides for every older one.
+    const B = ["--once", "--budget-per-hour", "1"];
     const m1 = send();
-    expect((await job(["--once"])).code).toBe(0);
+    expect((await job(B)).code).toBe(0);
     drain(); // m1 leaves the reading session's pending set
-    ageLog(TWO_HOURS); // past the budget window, so only the pending rule decides
-    const m2 = send();
-    expect((await job(["--once"])).code).toBe(0); // compacts first (drops m1's intent), then rings m2
-    expect(intentsInLog().map((r) => r.covers.message_ids)).toEqual([[m2]]);
-    const kept = intentsInLog()[0].intent.intent_id;
     ageLog(TWO_HOURS);
-    expect((await job(["--once"])).code).toBe(0); // m2 still pending: KEPT by the pending rule, so no re-ring
-    // The SAME intent (by id): a dropped-then-re-rung one would carry a new id.
-    expect(intentsInLog().map((r) => r.intent.intent_id)).toEqual([kept]);
+    const m2 = send();
+    expect((await job(B)).code).toBe(0); // rings m2; m1 survives this compaction only as the LAST intent
+    ageLog(TWO_HOURS);
+    const m3 = send();
+    expect((await job(B)).code).toBe(0); // compacts: m1 is neither the last nor pending → DROPPED; then rings m3
+    expect(intentsInLog().map((r) => r.covers.message_ids)).toEqual([[m2], [m3]]);
+    const ids = intentsInLog().map((r) => r.intent.intent_id);
+    ageLog(TWO_HOURS);
+    expect((await job(B)).code).toBe(0); // m2 is not the last, but still PENDING → KEPT, so no re-ring
+    // The SAME intents (by id): a dropped-then-re-rung one would carry a new id.
+    expect(intentsInLog().map((r) => r.intent.intent_id)).toEqual(ids);
     expect(m1).not.toBe(m2);
   });
   it("#300 R2 #1 (MEASURED): the start's compaction failing after its rename STOPS the job (exit 1); no cycle runs on the old fd", async () => {
