@@ -153,17 +153,29 @@ describe("tunables: bounded, rejected loudly", () => {
       expect(C.tunablesFault(bad), JSON.stringify(bad)).toMatch(/must be/);
     }
   });
-  it("the job refuses out-of-bounds flags with a usage error (2)", () => {
-    const entry = path.join(REPO_ROOT, "dist", "doorbell.js");
-    for (const args of [["--window-s", "1"], ["--budget-per-hour", "0"], ["--window-s", "abc"]]) {
-      const r = spawnSync(process.execPath, [entry, ...args], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME: ROOT } });
-      expect([args.join(" "), r.status]).toEqual([args.join(" "), 2]);
+  const entry = path.join(REPO_ROOT, "dist", "doorbell.js");
+  const runJob = (args: string[]) =>
+    spawnSync(process.execPath, [entry, ...args], {
+      encoding: "utf-8",
+      env: { PATH: process.env.PATH ?? "", HOME: ROOT, RELAY_DB_PATH: path.join(ROOT, "no-such-dir", "relay.db") },
+    });
+  it("#301 R1: out-of-bounds or NON-INTEGER flags are refused with the SPECIFIC validation error (exit 2)", () => {
+    const rows: Array<[string[], RegExp]> = [
+      [["--window-s", "1"], /--window-s must be an integer number of seconds in 10\.\.600/],
+      [["--window-s", "10.5"], /--window-s must be an integer number of seconds/],
+      [["--window-s", "60.001"], /--window-s must be an integer number of seconds/],
+      [["--window-s", "abc"], /--window-s must be an integer number of seconds/],
+      [["--budget-per-hour", "0"], /the ring budget must be an integer in 1\.\.60 per hour/],
+      [["--budget-per-hour", "2.5"], /the ring budget must be an integer/],
+    ];
+    for (const [args, why] of rows) {
+      const r = runJob(["--once", ...args]);
+      expect([args.join(" "), r.status, r.stderr]).toEqual([args.join(" "), 2, expect.stringMatching(why)]);
     }
   });
-  it("twin: in-bounds flags are accepted (they parse; --help then exits 0)", () => {
-    const entry = path.join(REPO_ROOT, "dist", "doorbell.js");
-    const r = spawnSync(process.execPath, [entry, "--window-s", "60", "--budget-per-hour", "6", "--help"], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME: ROOT } });
-    expect([r.status, r.stderr]).toEqual([0, expect.stringMatching(/--window-s/)]);
+  it("twin: in-bounds integer flags PARSE (no early return): the run proceeds to the resolver and fails there, not on usage", () => {
+    const r = runJob(["--once", "--window-s", "60", "--budget-per-hour", "6"]);
+    expect([r.status, r.stderr]).toEqual([1, expect.stringMatching(/DOORBELL_FAILED: no relay DB/)]);
   });
 });
 

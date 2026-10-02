@@ -43,7 +43,7 @@ import { fileURLToPath } from "url";
 import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { getOwnHostId } from "./liveness.js";
-import { BUDGET_WINDOW_MS, DEFAULT_BUDGET_PER_HOUR, DEFAULT_WINDOW_MS, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
+import { BUDGET_WINDOW_MS, DEFAULT_BUDGET_PER_HOUR, DEFAULT_WINDOW_MS, MAX_WINDOW_MS, MIN_WINDOW_MS, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, LogWriteError, openLog, rungKey, stateDirFor, type IntentRecord, type LogHandle, type LogIo, type LogState } from "./doorbell-log.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
@@ -83,8 +83,11 @@ function parseArgs(argv: string[]): Args | { error: string } | "help" {
       }
       a.intervalMs = v;
     } else if (t === "--window-s") {
+      // An INTEGER number of seconds, checked BEFORE scaling (#301 R1: 10.5 and 60.001 must not pass).
       const v = Number(argv[++i]);
-      if (!Number.isFinite(v)) return { error: "--window-s needs a number" };
+      if (!Number.isInteger(v) || v < MIN_WINDOW_MS / 1000 || v > MAX_WINDOW_MS / 1000) {
+        return { error: `--window-s must be an integer number of seconds in ${MIN_WINDOW_MS / 1000}..${MAX_WINDOW_MS / 1000}` };
+      }
       a.windowMs = v * 1000;
     } else if (t === "--budget-per-hour") {
       const v = Number(argv[++i]);
