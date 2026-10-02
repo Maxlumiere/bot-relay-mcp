@@ -121,15 +121,16 @@ export interface ProcessView {
 type Reading = { index: number } | { none: string };
 
 /**
- * Every plausible reading of the node options (D3; #297 Codex R1 P1). A listed option
- * has node's own arity (src/node-options.ts); `--opt=value` is one argument whatever
- * the option; an option node's table does not know may take a value or not, so it is
- * read BOTH ways. Memoised on the argv index: linear in practice, quadratic at worst.
+ * Every plausible reading of the node options (D3). A listed option has node's own
+ * arity (src/node-options.ts); `--opt=value` is one argument whatever the option; an
+ * option node's table does not list may take a value or not, so it is read BOTH ways.
+ * Memoised on the argv index: linear in practice, quadratic at worst. Consulted only
+ * AFTER the positive-evidence gate (classifyProcess), so it can only choose between
+ * CONNECTOR and UNKNOWN, never hide a connector or flag an unrelated process.
  */
-function readNodeOptions(args: string[]): { readings: Reading[]; unknownOptions: string[]; spaceValue: boolean } {
+function readNodeOptions(args: string[]): { readings: Reading[]; unknownOptions: string[] } {
   const memo = new Map<number, Reading[]>();
   const unknownOptions: string[] = [];
-  let spaceValue = false;
   const at = (i: number): Reading[] => {
     const hit = memo.get(i);
     if (hit) return hit;
@@ -143,10 +144,8 @@ function readNodeOptions(args: string[]): { readings: Reading[]; unknownOptions:
       const name = eq > 0 ? a.slice(0, eq) : a;
       if (NODE_NO_SCRIPT.has(name)) r = [{ none: `node ${name}: no script` }];
       else if (eq > 0) r = at(i + 1);
-      else if (NODE_OPTIONS_WITH_VALUE.has(a)) {
-        spaceValue = true;
-        r = at(i + 2);
-      } else if (NODE_FLAGS.has(a) || a.startsWith("--no-")) r = at(i + 1);
+      else if (NODE_OPTIONS_WITH_VALUE.has(a)) r = at(i + 2);
+      else if (NODE_FLAGS.has(a) || a.startsWith("--no-")) r = at(i + 1);
       else {
         unknownOptions.push(a);
         r = [...at(i + 1), ...at(i + 2)];
@@ -160,13 +159,13 @@ function readNodeOptions(args: string[]): { readings: Reading[]; unknownOptions:
     const k = JSON.stringify(r);
     return seen.has(k) ? false : (seen.add(k), true);
   });
-  return { readings, unknownOptions: [...new Set(unknownOptions)], spaceValue };
+  return { readings, unknownOptions: [...new Set(unknownOptions)] };
 }
 
-/** A relay connector entrypoint: `<dir>/dist/index.js`. */
-const relayShaped = (real: string): boolean => path.basename(real) === "index.js" && path.basename(path.dirname(real)) === "dist";
+/** A relay connector entrypoint's shape: `<dir>/dist/index.js`. */
+const relayShaped = (p: string): boolean => path.basename(p) === "index.js" && path.basename(path.dirname(p)) === "dist";
 
-/** Is the script that starts at argv[index] a relay connector? (D3 + D9, P2: unidentifiable → UNKNOWN). */
+/** Is the script that starts at argv[index] a relay connector? (D3 + D9; unidentifiable → UNKNOWN). */
 function classifyScript(args: string[], index: number, exact: boolean, absolute: (c: string) => string | null, fsx: ClassifyFs): Classification {
   let script: string;
   if (exact) {
@@ -213,11 +212,20 @@ function classifyScript(args: string[], index: number, exact: boolean, absolute:
 }
 
 /**
- * The relay entrypoint named ANYWHERE in argv (any space-joined span, an `--opt=value`
- * value included), or null. The guard behind an uncertain "not relay": a connector's
- * script is always such a span, so when none exists the uncertainty cannot matter.
+ * THE POSITIVE-EVIDENCE GATE (#297 #4, architect ruling b2a9ef30): the relay entrypoint
+ * named ANYWHERE in argv, or null. Every space-joined token span (an `--opt=value`
+ * value included) is tried, with NO option grammar.
+ *   Pass 1, existing files: a span whose realpath is `<dir>/dist/index.js` with
+ *   `<dir>/package.json` naming bot-relay-mcp (a symlinked launch resolves through
+ *   realpath), or missing, nameless or unreadable (it cannot be ruled out; #297 Codex
+ *   R2 #3), is evidence. Any OTHER existing file covers its tokens: it is evidence
+ *   AGAINST those tokens being part of a relay path.
+ *   Pass 2, unresolved: a relay-shaped span that overlaps no covered token, when it is
+ *   ABSOLUTE and does not exist (moved or deleted: D9.1, never NO CONNECTOR) or
+ *   RELATIVE while the process's working directory is unreadable.
  */
-function relayEntrypointInArgv(args: string[], exact: boolean, absolute: (c: string) => string | null, fsx: ClassifyFs): string | null {
+function relayEvidence(args: string[], exact: boolean, cwdReadable: boolean, absolute: (c: string) => string | null, fsx: ClassifyFs): string | null {
+  const spans: Array<{ s: number; e: number; text: string }> = [];
   for (let s = 0; s < args.length; s++) {
     let head = args[s];
     if (head.startsWith("-")) {
@@ -225,14 +233,33 @@ function relayEntrypointInArgv(args: string[], exact: boolean, absolute: (c: str
       if (eq < 0) continue;
       head = head.slice(eq + 1);
     }
-    let candidate = head;
+    let text = head;
     for (let e = s; e < (exact ? s + 1 : args.length); e++) {
-      if (e > s) candidate += " " + args[e];
-      const abs = absolute(candidate);
-      if (!abs || !fsx.isFile(abs)) continue;
-      const real = fsx.realpath(abs);
-      if (real && relayShaped(real) && fsx.packageName(path.dirname(path.dirname(real))) === "bot-relay-mcp") return real;
+      if (e > s) text += " " + args[e];
+      spans.push({ s, e, text });
     }
+  }
+  const covered = new Set<number>();
+  for (const { s, e, text } of spans) {
+    const abs = absolute(text);
+    if (!abs || !fsx.isFile(abs)) continue;
+    const real = fsx.realpath(abs);
+    if (real && relayShaped(real)) {
+      const name = fsx.packageName(path.dirname(path.dirname(real)));
+      if (name === "bot-relay-mcp") return real;
+      if (name === null || typeof name === "object") return `${real} (its package.json is missing, nameless or unreadable)`;
+    }
+    if (!real && relayShaped(abs)) return `${abs} (it cannot be resolved)`;
+    for (let t = s; t <= e; t++) covered.add(t);
+  }
+  for (const { s, e, text } of spans) {
+    if (!relayShaped(text)) continue;
+    let overlaps = false;
+    for (let t = s; t <= e && !overlaps; t++) overlaps = covered.has(t);
+    if (overlaps) continue;
+    const abs = absolute(text);
+    if (!abs && !cwdReadable) return `${text} (relative, and the working directory is unreadable)`;
+    if (abs && path.isAbsolute(text) && !fsx.isFile(abs)) return `${abs} (it does not exist: moved or deleted)`;
   }
   return null;
 }
@@ -240,23 +267,22 @@ function relayEntrypointInArgv(args: string[], exact: boolean, absolute: (c: str
 /**
  * Is this process a relay stdio connector, and from which install?
  *
- *   - A TCP listener is never a connector (ruling fd6b7757 D9.2: a stdio connector
- *     never listens; this excludes the daemon without reading its environment).
- *   - Not node → not a relay process.
- *   - The script is the first NON-OPTION argument (D3), found with node's own option
- *     table (src/node-options.ts). With an exact argv (Linux) it is read directly.
- *     macOS `ps` joins argv with spaces, and paths contain spaces ("Claude AI"), so it
- *     is resolved by EXISTENCE: the space-joined token prefixes that are existing
- *     files. Exactly one → the script; none, or more than one → UNKNOWN, never NO
- *     CONNECTOR (D9.1).
- *   - A connector = the script's realpath is `<dir>/dist/index.js` and
- *     `<dir>/package.json` names "bot-relay-mcp"; installDir = `<dir>`. A missing or
- *     unreadable package.json → UNKNOWN.
- *   - UNCERTAINTY NEVER HIDES A CONNECTOR (#297 Codex R1 P1): every plausible reading
- *     of the options is classified. A connector only when every reading is the same
- *     connector; "not relay" only when every reading is, AND (when a reading was
- *     uncertain: an unknown option, or a space-form value that ps may have split)
- *     no span of argv names a relay entrypoint at all. Anything else → UNKNOWN.
+ *   1. A TCP listener is never a connector (ruling fd6b7757 D9.2: a stdio connector
+ *      never listens; this excludes the daemon without reading its environment).
+ *   2. Not node → not a relay process.
+ *   3. POSITIVE EVIDENCE FIRST (#297 #4, architect ruling b2a9ef30): with no relay
+ *      entrypoint named anywhere in argv (relayEvidence), the process is NOT relay,
+ *      full stop, and no option grammar is consulted: an unrelated node worker can
+ *      never block a deploy, whatever its flags.
+ *   4. Only with evidence does the grammar refine CONNECTOR vs UNKNOWN. The script is
+ *      the first NON-OPTION argument (D3), found with node's own option table; every
+ *      plausible reading is classified. With an exact argv (Linux) it is read directly;
+ *      macOS `ps` joins argv with spaces, and paths contain spaces ("Claude AI"), so it
+ *      is resolved by EXISTENCE: exactly one space-joined prefix that is an existing
+ *      file → the script; none or several → UNKNOWN (D9.1). A connector = the script's
+ *      realpath is `<dir>/dist/index.js` and `<dir>/package.json` names bot-relay-mcp;
+ *      installDir = `<dir>`. Every reading the same connector → CONNECTOR; anything
+ *      else → UNKNOWN, never not-relay (the evidence says it may be one).
  */
 export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, fsx: ClassifyFs = realClassifyFs): Classification {
   if (listeners.has(p.pid)) return { kind: "not-relay", why: "it holds a TCP listen socket (the daemon or another server)" };
@@ -282,30 +308,22 @@ export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, 
   const absolute = (candidate: string): string | null =>
     path.isAbsolute(candidate) ? candidate : p.cwd ? path.resolve(p.cwd, candidate) : null;
 
-  const { readings, unknownOptions, spaceValue } = readNodeOptions(args);
-  const results = readings.map((r): Classification => ("none" in r ? { kind: "not-relay", why: r.none } : classifyScript(args, r.index, exact, absolute, fsx)));
-  const uncertainty =
-    unknownOptions.length > 0
-      ? `the node option${unknownOptions.length > 1 ? "s" : ""} ${unknownOptions.join(", ")} ${unknownOptions.length > 1 ? "are" : "is"} not in node's option table (it may take a value)`
-      : !exact && spaceValue
-        ? "ps joins argv with spaces, so a space-form option value may hold a space"
-        : null;
+  const evidence = relayEvidence(args, exact, p.cwd !== null, absolute, fsx);
+  if (!evidence) return { kind: "not-relay", why: "its argv names no relay entrypoint" };
 
+  const { readings, unknownOptions } = readNodeOptions(args);
+  const results = readings.map((r): Classification => ("none" in r ? { kind: "not-relay", why: r.none } : classifyScript(args, r.index, exact, absolute, fsx)));
   const first = results[0];
-  if (results.length === 1 && first.kind === "unknown") return first;
   if (results.every((c) => c.kind === "connector" && first.kind === "connector" && c.installDir === first.installDir && c.script === first.script)) return first;
-  if (results.every((c) => c.kind === "not-relay")) {
-    if (uncertainty) {
-      const named = relayEntrypointInArgv(args, exact, absolute, fsx);
-      if (named) return { kind: "unknown", reason: `its argv names the relay entrypoint ${named}, but ${uncertainty}: which argument is the script is uncertain` };
-    }
-    return first;
+  if (results.length === 1) {
+    return first.kind === "unknown" ? first : { kind: "unknown", reason: `its argv names the relay entrypoint ${evidence}, but ${first.kind === "not-relay" ? first.why : "it is not the script"}` };
   }
   const inner = results.find((c) => c.kind === "unknown") as { reason: string } | undefined;
-  return {
-    kind: "unknown",
-    reason: `${uncertainty ?? "its node options"}: ${results.length} readings of its argv disagree${inner ? ` (${inner.reason})` : ""}`,
-  };
+  const options =
+    unknownOptions.length > 0
+      ? `the node option${unknownOptions.length > 1 ? "s" : ""} ${unknownOptions.join(", ")} ${unknownOptions.length > 1 ? "are" : "is"} not in node's option table (it may take a value)`
+      : "its node options";
+  return { kind: "unknown", reason: `its argv names the relay entrypoint ${evidence}, but ${options}: ${results.length} readings of its argv disagree${inner ? ` (${inner.reason})` : ""}` };
 }
 
 // ---------------------------------------------------------------------------

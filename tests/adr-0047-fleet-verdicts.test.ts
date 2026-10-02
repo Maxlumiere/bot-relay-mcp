@@ -162,10 +162,9 @@ describe("classifyProcess (D3 + D9)", () => {
       // Read as a flag: the script is /opt/other (another package). Read as taking a value: no script at all.
       expect(V.classifyProcess(proc({ command: "node --frobnicate /opt/other/dist/index.js" }), new Set(), optFs).kind).toBe("not-relay");
     });
-    it("twin: an unknown option whose readings DISAGREE (one cannot be confirmed) → UNKNOWN, naming the option", () => {
-      // As a flag the script is "4096", which does not exist: that reading cannot be confirmed.
-      const c = V.classifyProcess(proc({ command: "node --frobnicate 4096 /opt/other/dist/index.js", cwd: "/w" }), new Set(), optFs);
-      expect(c).toMatchObject({ kind: "unknown", reason: expect.stringMatching(/--frobnicate .*readings of its argv disagree/) });
+    it("#297 #4 (architect b2a9ef30): no relay entrypoint in argv → NOT relay, whatever the options (readings that disagree included)", () => {
+      // As a flag the script would be "4096" (absent): readings disagree, but nothing names the relay, so grammar is never consulted.
+      expect(V.classifyProcess(proc({ command: "node --frobnicate 4096 /opt/other/dist/index.js", cwd: "/w" }), new Set(), optFs).kind).toBe("not-relay");
     });
     it("twin: one reading finds a connector, another does not → UNKNOWN, never a guessed connector", () => {
       // As a flag the script is the relay entrypoint; taking a value, the script is /tmp/config.env.
@@ -182,6 +181,23 @@ describe("classifyProcess (D3 + D9)", () => {
       // The real value is "/tmp/a b.js"; skipping ONE token lands on "b.js", which exists relative to the cwd.
       const c = V.classifyProcess(proc({ command: `node --require /tmp/a b.js ${SPACED}/dist/index.js`, cwd: "/w" }), new Set(), optFs);
       expect(c.kind).toBe("unknown");
+    });
+    it("#297 Codex R2 #1: ps-joined argv: an --opt=VALUE holding a space cannot hide the connector (--require= and --import=) → UNKNOWN", () => {
+      for (const opt of ["--require", "--import"]) {
+        const c = V.classifyProcess(proc({ command: `node ${opt}=/tmp/a b.js ${SPACED}/dist/index.js`, cwd: "/w" }), new Set(), optFs);
+        expect([opt, c.kind]).toEqual([opt, "unknown"]);
+      }
+    });
+    it("#297 Codex R2 #2: -i / --interactive still RUN the script: `node -i <relay>` is a connector (ps-joined and exact)", () => {
+      for (const flag of ["-i", "--interactive"]) {
+        expect(V.classifyProcess(proc({ command: `node ${flag} ${SPACED}/dist/index.js` }), new Set(), optFs)).toMatchObject({ kind: "connector", installDir: SPACED });
+        expect(V.classifyProcess(proc({ command: "x", argv: ["node", flag, `${SPACED}/dist/index.js`] }), new Set(), optFs)).toMatchObject({ kind: "connector", installDir: SPACED });
+      }
+    });
+    it("#297 Codex R2 #3: under uncertainty, a relay-shaped entrypoint whose package.json is MISSING keeps it UNKNOWN", () => {
+      const noPkg = fakeFs(["/tmp/a b.js", "/w/b.js", `${SPACED}/dist/index.js`], {});
+      const c = V.classifyProcess(proc({ command: `node -r /tmp/a b.js ${SPACED}/dist/index.js`, cwd: "/w" }), new Set(), noPkg);
+      expect(c).toMatchObject({ kind: "unknown", reason: expect.stringMatching(/cannot be identified|package\.json/) });
     });
     it("node's OWN option table (`node --help` of the running node) is pinned: every option, with the same arity", () => {
       const help = spawnSync(process.execPath, ["--help"], { encoding: "utf-8" }).stdout;
@@ -202,6 +218,43 @@ describe("classifyProcess (D3 + D9)", () => {
       expect([...value].filter((o) => !V.NODE_OPTIONS_WITH_VALUE.has(o))).toEqual([]);
       expect([...flag].filter((o) => !V.NODE_FLAGS.has(o) && !V.NODE_NO_SCRIPT.has(o))).toEqual([]);
       expect([...flag].filter((o) => V.NODE_OPTIONS_WITH_VALUE.has(o))).toEqual([]);
+    });
+  });
+  describe("#297 #4 (architect b2a9ef30): POSITIVE EVIDENCE first; grammar only refines CONNECTOR vs UNKNOWN", () => {
+    const N8N = "/Users/m/LLMs/Claude AI/n8n-mcp";
+    const gateFs = fakeFs(
+      ["/app/worker.js", "/tmp/x.js", `${SPACED}/dist/index.js`, `${N8N}/dist/index.js`, "/opt/other/dist/index.js", "/Users/m/bot-relay-mcp/dist/index.js"],
+      { [SPACED]: "bot-relay-mcp", [N8N]: "n8n-mcp", "/opt/other": "something-else" },
+      { "/Users/m/bot-relay-mcp/dist/index.js": `${SPACED}/dist/index.js` },
+    );
+    it("the MEASURED worker: `node --trace-gc /app/worker.js job` → NOT relay (cwd readable or not, ps-joined or exact)", () => {
+      for (const cwd of ["/app", null]) {
+        expect(V.classifyProcess(proc({ command: "node --trace-gc /app/worker.js job", cwd }), new Set(), gateFs).kind).toBe("not-relay");
+        expect(V.classifyProcess(proc({ command: "x", argv: ["node", "--trace-gc", "/app/worker.js", "job"], cwd }), new Set(), gateFs).kind).toBe("not-relay");
+      }
+    });
+    it("the SAME flags in front of our dist path → CONNECTOR or UNKNOWN, never NOT relay", () => {
+      for (const argv of [["--trace-gc", `${SPACED}/dist/index.js`, "job"], ["--trace-gc", `${SPACED}/dist/index.js`], ["--trace-gc", "--stack-size", "999", `${SPACED}/dist/index.js`]]) {
+        expect(V.classifyProcess(proc({ command: `node ${argv.join(" ")}` }), new Set(), gateFs).kind).not.toBe("not-relay");
+        expect(V.classifyProcess(proc({ command: "x", argv: ["node", ...argv] }), new Set(), gateFs).kind).not.toBe("not-relay");
+      }
+    });
+    it("a span through the /Users/<me>/bot-relay-mcp SYMLINK is evidence: it resolves via realpath", () => {
+      const c = V.classifyProcess(proc({ command: "node --trace-gc /Users/m/bot-relay-mcp/dist/index.js" }), new Set(), gateFs);
+      expect(c.kind).not.toBe("not-relay");
+      expect((c as { reason: string }).reason).toContain(`${SPACED}/dist/index.js`); // the evidence IS the realpath, not "does not exist"
+      expect(V.classifyProcess(proc({ command: "node /Users/m/bot-relay-mcp/dist/index.js" }), new Set(), gateFs)).toMatchObject({ kind: "connector", installDir: SPACED });
+    });
+    it("over-detection twins: another package is never evidence (a preload before it; its spaced path with no cwd; an =value with no cwd)", () => {
+      expect(V.classifyProcess(proc({ command: "node --require /tmp/x.js /opt/other/dist/index.js" }), new Set(), gateFs).kind).toBe("not-relay");
+      expect(V.classifyProcess(proc({ command: `node ${N8N}/dist/index.js`, cwd: null }), new Set(), gateFs).kind).toBe("not-relay");
+      expect(V.classifyProcess(proc({ command: "node --max-old-space-size=4096 /opt/other/dist/index.js", cwd: null }), new Set(), gateFs).kind).toBe("not-relay");
+    });
+    it("a healthy fleet plus an unrelated worker with V8 flags: failing stays 0", () => {
+      const fsx = fakeFs([SCRIPT, "/app/worker.js"], { [INSTALL]: "bot-relay-mcp" });
+      const j = V.judgeFleet(snapshot({ processes: [win(10, 1), node(11, 10, SCRIPT, 2), proc({ pid: 40, ppid: 10, start: START(4), command: "node --trace-gc /app/worker.js job", cwd: "/app" }), node(99, 1, SCRIPT, 9)] }), fsx);
+      expect(j.connectors.map((e) => e.pid)).toEqual([11]);
+      expect(j.failing).toBe(0);
     });
   });
   describe("#297 Codex R1 P2: missing identification metadata is UNKNOWN, never a positive exclusion", () => {
@@ -362,6 +415,15 @@ describe("judgeFleet", () => {
     const fsx = fakeFs([SCRIPT, "/tmp/config.env"], { [INSTALL]: "bot-relay-mcp" });
     const j = V.judgeFleet(
       snapshot({ processes: [win(10, 1), proc({ pid: 11, ppid: 1, start: START(2), command: `node --env-file-if-exists /tmp/config.env ${SCRIPT}` }), node(99, 1, SCRIPT, 9)], rows: [], bindings: [] }),
+      fsx,
+    );
+    expect(j.connectors).toMatchObject([{ pid: 11, verdict: "UNKNOWN" }]);
+    expect(j.failing).toBe(1);
+  });
+  it("#297 Codex R2 #1 (MEASURED): a rowless UNBOUND connector behind --require=VALUE-with-a-space is on the board and fails", () => {
+    const fsx = fakeFs([SCRIPT, "/tmp/a b.js", "/work/b.js"], { [INSTALL]: "bot-relay-mcp" });
+    const j = V.judgeFleet(
+      snapshot({ processes: [win(10, 1), proc({ pid: 11, ppid: 1, start: START(2), command: `node --require=/tmp/a b.js ${SCRIPT}`, cwd: "/work" }), node(99, 1, SCRIPT, 9)], rows: [], bindings: [] }),
       fsx,
     );
     expect(j.connectors).toMatchObject([{ pid: 11, verdict: "UNKNOWN" }]);

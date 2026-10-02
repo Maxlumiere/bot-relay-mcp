@@ -74,7 +74,10 @@ export const NODE_FLAGS: ReadonlySet<string> = new Set([
   "--watch", "--watch-preserve-output", "--zero-fill-buffers", "-c", "-h", "-i", "-p", "-v",
 ]);
 
-/** Options after which node runs no script file at all (checked BEFORE the tables above). */
+/**
+ * Options after which node runs no script file at all (checked BEFORE the tables above).
+ * NOT -i / --interactive: `node -i <script>` still runs the script (#297 Codex R2 #2).
+ */
 export const NODE_NO_SCRIPT: ReadonlySet<string> = new Set([
-  "-e", "--eval", "-p", "--print", "-i", "--interactive", "-v", "--version", "-h", "--help", "-c", "--check", "--run",
+  "-e", "--eval", "-p", "--print", "-v", "--version", "-h", "--help", "-c", "--check", "--run",
 ]);
