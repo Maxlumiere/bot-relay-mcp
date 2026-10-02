@@ -53,13 +53,22 @@ async function inProcess(argv: string[], opts: import("../src/doorbell-run.js").
 
 const HOST = getOwnHostId();
 const env = (over: Record<string, string> = {}) => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, ...over });
-function once(over: Record<string, string> = {}) {
-  const r = spawnSync(process.execPath, [ENTRY, "--once"], { encoding: "utf-8", env: env(over), timeout: 30_000 });
+function once(over: Record<string, string> = {}, extra: string[] = []) {
+  const r = spawnSync(process.execPath, [ENTRY, "--once", ...extra], { encoding: "utf-8", env: env(over), timeout: 30_000 });
   return { status: r.status, stderr: r.stderr ?? "", stdout: r.stdout ?? "" };
 }
 type Rec = { type: string; covers?: { reading_session: string; message_ids: string[] }; intent?: { agent_name: string }; build?: { build_id: string }; install_dir?: string; resolution?: { kind: string } };
 const records = (): Rec[] => (fs.existsSync(LOG) ? fs.readFileSync(LOG, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
 const intents = () => records().filter((r) => r.type === "intent");
+/** Time passing, as the log records it: every intent moved `ms` into the past (still a valid record). */
+function ageLog(ms: number): void {
+  const lines = fs.readFileSync(LOG, "utf-8").split("\n").filter(Boolean).map((l) => {
+    const r = JSON.parse(l);
+    if (r.type === "intent") r.at = new Date(Date.parse(r.at) - ms).toISOString();
+    return JSON.stringify(r);
+  });
+  fs.writeFileSync(LOG, lines.join("\n") + "\n");
+}
 const send = (to: string) => db.sendMessage("db-sender", to, "content that must never reach the log", "normal").id;
 const setSession = (name: string, s: string | null) => void db.getDb().prepare("UPDATE agents SET session_id = ? WHERE name = ?").run(s, name);
 function bindHere(agent: string, conv: string): void {
@@ -117,13 +126,40 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
     expect(once().status).toBe(0);
     const first = intents()[0].covers?.reading_session;
     setSession("db-alice", "a-later-window-session");
+    ageLog(120_000); // past the coalescing window (PR 2), so only V4 decides
     expect(once().status).toBe(0);
-    // The start compacts first (D-2): the old session's key can never be needed again, so its
-    // intent is dropped; what remains is the NEW ring, for the same id under the new session.
-    const covers = intents().map((i) => i.covers);
-    expect(covers.map((c) => c?.message_ids)).toEqual([[m1]]);
-    expect(covers[0]?.reading_session).toMatch(/^[0-9a-f]{64}$/);
-    expect(covers[0]?.reading_session).not.toBe(first);
+    // The LAST intent is the new ring: the same id, under the new session. (Whether the old
+    // one survives the start's compaction depends on its age: PR 2 keeps the last hour.)
+    const last = intents().at(-1)?.covers;
+    expect(last?.message_ids).toEqual([m1]);
+    expect(last?.reading_session).toMatch(/^[0-9a-f]{64}$/);
+    expect(last?.reading_session).not.toBe(first);
+  });
+
+  it("PR 2 (Q3), real process: new mail after a RESTART inside the window is held (ring times come back from the log); past W it rings once", () => {
+    send("db-alice");
+    expect(once().status).toBe(0);
+    const m2 = send("db-alice");
+    expect(once().status).toBe(0); // a fresh process, < 60 s after the first ring
+    expect(intents()).toHaveLength(1);
+    ageLog(120_000);
+    expect(once().status).toBe(0);
+    expect(intents().map((i) => i.covers?.message_ids)).toEqual([expect.any(Array), [m2]]);
+  });
+
+  it("PR 2 x D-2: the start's compaction keeps the last hour's rings, so a restart never UNDERCOUNTS the budget", () => {
+    for (let i = 0; i < 6; i++) {
+      send("db-alice");
+      expect(once({}, ["--window-s", "10"]).status).toBe(0);
+      ageLog(11_000); // past the 10 s window, still well inside the hour
+    }
+    expect(intents()).toHaveLength(6);
+    db.getDb().prepare("UPDATE messages SET resolved_at = ? WHERE to_agent = 'db-alice'").run(new Date().toISOString()); // none pending now
+    send("db-alice");
+    const r = once({}, ["--window-s", "10"]); // compacts first: the six rings are NOT pending, but inside the hour
+    expect(r.status, r.stderr).toBe(0);
+    expect(intents()).toHaveLength(6); // the 7th is refused
+    expect(records().filter((x) => x.type === "budget").map((x) => (x as { state?: string }).state)).toEqual(["exhausted"]);
   });
 
   it("HARM (V4): a NULL-session agent with pending mail produces NO intent", () => {

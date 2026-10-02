@@ -147,6 +147,10 @@ describe("#8: message_ids is a canonical set", () => {
       ownHostId: "H",
       pending: () => ({ registered: true, reading_session: RS, ids: ["m2", "m1", "m1"] }),
       rung: new Set(),
+      ringTimes: new Map(),
+      budgetExhausted: new Set(),
+      windowMs: C.DEFAULT_WINDOW_MS,
+      budgetPerHour: C.DEFAULT_BUDGET_PER_HOUR,
       newIntentId: () => "00000000-0000-4000-8000-000000000009",
       now: () => "2026-10-02T05:00:00.000Z",
     });

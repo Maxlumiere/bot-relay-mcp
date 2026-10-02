@@ -43,7 +43,7 @@ import { fileURLToPath } from "url";
 import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { getOwnHostId } from "./liveness.js";
-import { planCycle, type PendingRead } from "./doorbell-core.js";
+import { BUDGET_WINDOW_MS, DEFAULT_BUDGET_PER_HOUR, DEFAULT_WINDOW_MS, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, LogWriteError, openLog, rungKey, stateDirFor, type IntentRecord, type LogHandle, type LogIo, type LogState } from "./doorbell-log.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
@@ -55,6 +55,8 @@ export const MAX_INTERVAL_MS = 600_000;
 interface Args {
   once: boolean;
   intervalMs: number;
+  windowMs: number;
+  budgetPerHour: number;
 }
 
 function usage(out: NodeJS.WriteStream): void {
@@ -62,12 +64,14 @@ function usage(out: NodeJS.WriteStream): void {
     "Usage: node dist/doorbell.js [--once] [--interval-ms N]\n" +
       "  The doorbell job: logs a content-free intent per agent with new pending mail.\n" +
       `  --once           run one cycle and exit\n` +
-      `  --interval-ms N  cycle period, ${MIN_INTERVAL_MS}..${MAX_INTERVAL_MS} (default ${DEFAULT_INTERVAL_MS})\n`,
+      `  --interval-ms N  cycle period, ${MIN_INTERVAL_MS}..${MAX_INTERVAL_MS} (default ${DEFAULT_INTERVAL_MS})\n` +
+      `  --window-s N     per-agent coalescing window, seconds (default ${DEFAULT_WINDOW_MS / 1000}; bounds enforced)\n` +
+      `  --budget-per-hour N  per-agent ring budget (default ${DEFAULT_BUDGET_PER_HOUR}; bounds enforced)\n`,
   );
 }
 
 function parseArgs(argv: string[]): Args | { error: string } | "help" {
-  const a: Args = { once: false, intervalMs: DEFAULT_INTERVAL_MS };
+  const a: Args = { once: false, intervalMs: DEFAULT_INTERVAL_MS, windowMs: DEFAULT_WINDOW_MS, budgetPerHour: DEFAULT_BUDGET_PER_HOUR };
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     if (t === "--help" || t === "-h") return "help";
@@ -78,8 +82,18 @@ function parseArgs(argv: string[]): Args | { error: string } | "help" {
         return { error: `--interval-ms must be an integer in ${MIN_INTERVAL_MS}..${MAX_INTERVAL_MS}` };
       }
       a.intervalMs = v;
+    } else if (t === "--window-s") {
+      const v = Number(argv[++i]);
+      if (!Number.isFinite(v)) return { error: "--window-s needs a number" };
+      a.windowMs = v * 1000;
+    } else if (t === "--budget-per-hour") {
+      const v = Number(argv[++i]);
+      if (!Number.isFinite(v)) return { error: "--budget-per-hour needs a number" };
+      a.budgetPerHour = v;
     } else return { error: `unknown argument ${JSON.stringify(t)}` };
   }
+  const fault = tunablesFault(a);
+  if (fault) return { error: fault };
   return a;
 }
 
@@ -215,7 +229,11 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
         pendingNow.set(r.intent.agent_name, { rs: m.reading_session, ids: new Set(m.messages.map((x) => x.id)) });
       }
     })();
+    const nowMs = Date.now();
     const keep = (rec: IntentRecord): boolean => {
+      // PR 2: an intent inside the budget window is a RING TIME the window and the budget
+      // still count; dropping it would let a restart undercount the budget.
+      if (Date.parse(rec.at) > nowMs - BUDGET_WINDOW_MS) return true;
       const p = pendingNow.get(rec.intent.agent_name);
       return !!p && p.rs === rec.covers.reading_session && rec.covers.message_ids.some((id) => p.ids.has(id));
     };
@@ -243,12 +261,28 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
         return { registered: m.registered, reading_session: m.reading_session, ids: m.messages.map((x) => x.id) };
       },
       rung: state.rung,
+      ringTimes: state.ringTimes,
+      budgetExhausted: state.budgetExhausted,
+      windowMs: args.windowMs,
+      budgetPerHour: args.budgetPerHour,
       newIntentId: () => randomUUID(),
       now: () => new Date().toISOString(),
     });
+    for (const rec of plan.budget) {
+      appendRecord(log, rec); // A3.2: once per state change, durable before the state moves
+      if (rec.state === "exhausted") state.budgetExhausted.add(rec.agent_name);
+      else state.budgetExhausted.delete(rec.agent_name);
+      // Q4: surface it loudly (the board and the status verb read it from the log later).
+      process.stderr.write(
+        `doorbell: ring budget ${rec.state} for ${rec.agent_name} (${rec.rings_in_hour} rings in the last hour, budget ${rec.budget_per_hour})\n`,
+      );
+    }
     for (const rec of plan.intents) {
       appendRecord(log, rec); // write-ahead: complete and durable before it counts as rung
       for (const id of rec.covers.message_ids) state.rung.add(rungKey(rec.covers.reading_session, id));
+      const times = state.ringTimes.get(rec.intent.agent_name) ?? [];
+      times.push(Date.parse(rec.at));
+      state.ringTimes.set(rec.intent.agent_name, times);
     }
   };
 

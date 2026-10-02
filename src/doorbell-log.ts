@@ -62,7 +62,23 @@ export interface HeaderRecord {
   resolution: Record<string, unknown>;
 }
 
-export type LogRecord = IntentRecord | HeaderRecord;
+/**
+ * PR 2 (ADR-0038 Q4 + A3.2): an agent's ring-budget STATE CHANGED. Written once per change
+ * (never once per refused cycle), and again when it changes back.
+ */
+export const BUDGET_STATES = ["exhausted", "available"] as const;
+export interface BudgetRecord {
+  v: 1;
+  type: "budget";
+  at: string;
+  agent_name: string;
+  state: (typeof BUDGET_STATES)[number];
+  /** Rings in the trailing hour when the state changed. */
+  rings_in_hour: number;
+  budget_per_hour: number;
+}
+
+export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -145,6 +161,19 @@ export function recordFault(r: unknown): string | null {
     // #300 R1 #8: a SET in canonical form: unique and sorted, at the writer AND on replay.
     const ids = c.message_ids as string[];
     for (let k = 1; k < ids.length; k++) if (!(ids[k - 1] < ids[k])) return "message_ids must be unique and sorted (a canonical set)";
+    return null;
+  }
+  if (t === "budget") {
+    if (!sameKeys(r, ["v", "type", "at", "agent_name", "state", "rings_in_hour", "budget_per_hour"])) {
+      return "a budget record has exactly v, type, at, agent_name, state, rings_in_hour, budget_per_hour";
+    }
+    if (r.v !== 1) return "unknown record version";
+    if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
+    if (typeof r.agent_name !== "string" || !AGENT_NAME_PATTERN.test(r.agent_name)) return "agent_name is not a valid agent name";
+    if (!(BUDGET_STATES as readonly unknown[]).includes(r.state)) return `state must be one of ${BUDGET_STATES.join(", ")}`;
+    // Bounded (#300 R2 #5): a budget is at most 60/hour (doorbell-core bounds), so these stay small.
+    if (!Number.isInteger(r.rings_in_hour) || (r.rings_in_hour as number) < 0 || (r.rings_in_hour as number) > 100_000) return "rings_in_hour is not a bounded non-negative integer";
+    if (!Number.isInteger(r.budget_per_hour) || (r.budget_per_hour as number) < 1 || (r.budget_per_hour as number) > 1000) return "budget_per_hour is not a bounded positive integer";
     return null;
   }
   if (t === "header") {
@@ -326,6 +355,10 @@ export function appendRecord(h: LogHandle, rec: LogRecord): void {
 export interface LogState {
   /** rungKey(reading session, id) for every id an intent covered. */
   rung: Set<string>;
+  /** Per agent: the time (ms) of every intent, oldest first: the window (Q3) and the budget (Q4). */
+  ringTimes: Map<string, number[]>;
+  /** Agents whose LAST budget record says exhausted (A3.2: so a restart does not log it again). */
+  budgetExhausted: Set<string>;
   tornTail: boolean;
   /** Every valid record, in order (compaction and readers use it). */
   records: LogRecord[];
@@ -341,7 +374,7 @@ function parseLogText(text: string, logPath: string): LogState {
   const lines = text.split("\n");
   lines.pop(); // "" after a final newline, or the unterminated tail (checked below)
   const tail = terminated ? null : text.slice(text.lastIndexOf("\n") + 1);
-  const state: LogState = { rung: new Set(), tornTail: false, records: [] };
+  const state: LogState = { rung: new Set(), ringTimes: new Map(), budgetExhausted: new Set(), tornTail: false, records: [] };
   lines.forEach((line, i) => {
     let rec: unknown;
     let fault: string | null;
@@ -354,7 +387,15 @@ function parseLogText(text: string, logPath: string): LogState {
     if (fault) throw new Error(`${logPath} line ${i + 1} is not a valid doorbell record (${fault}): refusing to rebuild rung memory from it`);
     const r = rec as LogRecord;
     state.records.push(r);
-    if (r.type === "intent") for (const id of r.covers.message_ids) state.rung.add(rungKey(r.covers.reading_session, id));
+    if (r.type === "intent") {
+      for (const id of r.covers.message_ids) state.rung.add(rungKey(r.covers.reading_session, id));
+      const times = state.ringTimes.get(r.intent.agent_name) ?? [];
+      times.push(Date.parse(r.at));
+      state.ringTimes.set(r.intent.agent_name, times);
+    } else if (r.type === "budget") {
+      if (r.state === "exhausted") state.budgetExhausted.add(r.agent_name);
+      else state.budgetExhausted.delete(r.agent_name);
+    }
   });
   if (tail !== null && tail.length > 0) state.tornTail = true;
   return state;
@@ -373,7 +414,8 @@ export function readLogState(logPath: string): LogState {
 
 /** Rung memory only (PR 1's reader name), from the same parse. */
 export function readRungMemory(logPath: string): { rung: Set<string>; tornTail: boolean } {
-  return readLogState(logPath);
+  const s = readLogState(logPath);
+  return { rung: s.rung, tornTail: s.tornTail };
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +450,12 @@ export function compactLog(
   }
   const current = parseLogText(all.subarray(0, got).toString("utf-8"), h.path);
   const headers = current.records.filter((r) => r.type === "header").slice(-COMPACT_KEEP_HEADERS);
-  const kept = current.records.filter((r) => (r.type === "header" ? headers.includes(r) : r.type === "intent" ? keepIntent(r) : true));
+  // The budget STATE is the last budget record per agent: earlier ones are history.
+  const lastBudget = new Map<string, LogRecord>();
+  for (const r of current.records) if (r.type === "budget") lastBudget.set(r.agent_name, r);
+  const kept = current.records.filter((r) =>
+    r.type === "header" ? headers.includes(r) : r.type === "intent" ? keepIntent(r) : r.type === "budget" ? lastBudget.get(r.agent_name) === r : true,
+  );
   const tmp = path.join(stateDir, `${COMPACT_PREFIX}${process.pid}`);
   // #300 R2 #1 + #2: from here on, anything that does not complete is a LogWriteError, and
   // the job FAIL-STOPS (it never resumes on the old descriptor, whose inode may already be

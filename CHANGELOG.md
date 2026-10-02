@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added — the doorbell rings once per burst, within a per-agent hourly budget
+
+The doorbell job (not installed yet) now limits how often it would ring an agent.
+
+- **Once per burst.** It rings at once. More mail for that agent within the next 60 seconds is held, then covered by one ring. `--window-s` sets the window, within bounds.
+- **A budget.** At most 6 rings per agent per hour; `--budget-per-hour` sets it, within bounds. Past it, that agent is not rung. The job says so on stderr and in its log once, and once more when rings are allowed again, never on every cycle.
+- **Survives a restart.** Both are rebuilt from the job's log, and the log compaction keeps the last hour's rings, so a restart does not reset either.
+
+Values outside the bounds are refused at start (exit 2).
+
+Tests: `tests/doorbell-pr2-coalesce.test.ts`, plus real-process rows in `tests/doorbell-pr1-job.test.ts`.
+
 ### Added — the doorbell job's core (not installed yet), and one registry of every relay entrypoint
 
 - **`dist/doorbell.js`**: a separate local job that watches the canonical pending set of each agent window on this machine. When an agent has new mail, it writes a content-free intent to its own log. The log is append-only, mode 0600, beside the relay DB in `doorbell/`. Nothing is rung yet: there is no driver, and nothing installs the job.

@@ -127,6 +127,10 @@ async function job(argv: string[], opts: import("../src/doorbell-run.js").Doorbe
   }
 }
 const intentsInLog = () => linesOf(LOGP).filter((r) => r.type === "intent");
+/** Time passing: every intent moved `ms` into the past (still valid). PR 2 keeps the last hour's. */
+const ageLog = (ms: number) =>
+  fs.writeFileSync(LOGP, linesOf(LOGP).map((r) => JSON.stringify(r.type === "intent" ? { ...r, at: new Date(Date.parse(r.at) - ms).toISOString() } : r)).join("\n") + "\n");
+const TWO_HOURS = 7_200_000;
 const send = () => db.sendMessage("d2-sender", "d2-alice", "x", "normal").id;
 const drain = () => {
   const input = GetMessagesSchema.parse({ agent_name: "d2-alice", status: "pending", peek: false, limit: 100, since: "all" });
@@ -159,11 +163,13 @@ describe.skipIf(!HOST)("the job: compaction at the first DB open, and the size c
     const m1 = send();
     expect((await job(["--once"])).code).toBe(0);
     drain(); // m1 leaves the reading session's pending set
+    ageLog(TWO_HOURS); // past the budget window, so only the pending rule decides
     const m2 = send();
     expect((await job(["--once"])).code).toBe(0); // compacts first (drops m1's intent), then rings m2
     expect(intentsInLog().map((r) => r.covers.message_ids)).toEqual([[m2]]);
     const kept = intentsInLog()[0].intent.intent_id;
-    expect((await job(["--once"])).code).toBe(0); // m2 still pending: KEPT, so no re-ring
+    ageLog(TWO_HOURS);
+    expect((await job(["--once"])).code).toBe(0); // m2 still pending: KEPT by the pending rule, so no re-ring
     // The SAME intent (by id): a dropped-then-re-rung one would carry a new id.
     expect(intentsInLog().map((r) => r.intent.intent_id)).toEqual([kept]);
     expect(m1).not.toBe(m2);

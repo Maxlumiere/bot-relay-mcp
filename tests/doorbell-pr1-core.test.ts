@@ -52,6 +52,10 @@ function plan(over: Partial<Parameters<typeof C.planCycle>[0]> & { reads?: Recor
       return r;
     },
     rung: new Set(),
+    ringTimes: new Map(),
+    budgetExhausted: new Set(),
+    windowMs: C.DEFAULT_WINDOW_MS,
+    budgetPerHour: C.DEFAULT_BUDGET_PER_HOUR,
     newIntentId: ids,
     now: () => "2026-10-02T04:00:00.000Z",
     ...over,
