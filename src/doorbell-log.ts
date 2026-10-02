@@ -216,6 +216,9 @@ function ensurePrivateDir(dir: string): void {
  */
 export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogHandle; state: LogState; recoveredBytes: number } {
   ensurePrivateDir(stateDir);
+  // A compaction that crashed before its rename left only its temp file: the log itself is
+  // intact, so the temp is discarded (unlink removes a planted symlink itself, never its target).
+  for (const name of fs.readdirSync(stateDir)) if (name.startsWith(COMPACT_PREFIX)) fs.unlinkSync(path.join(stateDir, name));
   const logPath = path.join(stateDir, LOG_FILENAME);
   let pre: fs.Stats | null = null;
   try {
@@ -287,6 +290,8 @@ export interface LogState {
   /** rungKey(reading session, id) for every id an intent covered. */
   rung: Set<string>;
   tornTail: boolean;
+  /** Every valid record, in order (compaction and readers use it). */
+  records: LogRecord[];
 }
 
 /**
@@ -299,7 +304,7 @@ function parseLogText(text: string, logPath: string): LogState {
   const lines = text.split("\n");
   lines.pop(); // "" after a final newline, or the unterminated tail (checked below)
   const tail = terminated ? null : text.slice(text.lastIndexOf("\n") + 1);
-  const state: LogState = { rung: new Set(), tornTail: false };
+  const state: LogState = { rung: new Set(), tornTail: false, records: [] };
   lines.forEach((line, i) => {
     let rec: unknown;
     let fault: string | null;
@@ -311,6 +316,7 @@ function parseLogText(text: string, logPath: string): LogState {
     }
     if (fault) throw new Error(`${logPath} line ${i + 1} is not a valid doorbell record (${fault}): refusing to rebuild rung memory from it`);
     const r = rec as LogRecord;
+    state.records.push(r);
     if (r.type === "intent") for (const id of r.covers.message_ids) state.rung.add(rungKey(r.covers.reading_session, id));
   });
   if (tail !== null && tail.length > 0) state.tornTail = true;
@@ -331,4 +337,133 @@ export function readLogState(logPath: string): LogState {
 /** Rung memory only (PR 1's reader name), from the same parse. */
 export function readRungMemory(logPath: string): { rung: Set<string>; tornTail: boolean } {
   return readLogState(logPath);
+}
+
+// ---------------------------------------------------------------------------
+// D-2 (ruling 8c83e4ce): compaction on start, and the reference tailer
+// ---------------------------------------------------------------------------
+
+const COMPACT_PREFIX = ".actuation.jsonl.compact-";
+/** Headers kept by a compaction: the most recent ones (provenance of recent runs). */
+export const COMPACT_KEEP_HEADERS = 5;
+
+/**
+ * Rewrite the log keeping only what still matters, CRASH-SAFE: the kept records go to a
+ * new no-follow, exclusive, 0600 temp file in the state dir, which is fsynced, renamed
+ * over the log (atomic), and the dir fsynced. A crash before the rename leaves the old log
+ * intact (the temp is discarded on the next open); after it, the new one. Kept records are
+ * written UNCHANGED (a tailer dedupes by intent_id, so nothing it already saw is new).
+ * Returns a fresh handle on the new file (the old one is closed).
+ */
+export function compactLog(
+  h: LogHandle,
+  keepIntent: (rec: IntentRecord) => boolean,
+): { handle: LogHandle; state: LogState; beforeBytes: number; afterBytes: number } {
+  const stateDir = path.dirname(h.path);
+  const beforeBytes = h.io.fstatSync(h.fd).size;
+  // Read through the HELD descriptor from byte 0 (its position is at the end after appends).
+  const all = Buffer.alloc(beforeBytes);
+  let got = 0;
+  while (got < beforeBytes) {
+    const n = fs.readSync(h.fd, all, got, beforeBytes - got, got);
+    if (n <= 0) break;
+    got += n;
+  }
+  const current = parseLogText(all.subarray(0, got).toString("utf-8"), h.path);
+  const headers = current.records.filter((r) => r.type === "header").slice(-COMPACT_KEEP_HEADERS);
+  const kept = current.records.filter((r) => (r.type === "header" ? headers.includes(r) : r.type === "intent" ? keepIntent(r) : true));
+  const tmp = path.join(stateDir, `${COMPACT_PREFIX}${process.pid}`);
+  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+  try {
+    const buf = Buffer.from(kept.map((r) => JSON.stringify(r) + "\n").join(""), "utf-8");
+    let off = 0;
+    while (off < buf.length) {
+      const n = h.io.writeSync(fd, buf, off, buf.length - off);
+      if (!(n > 0)) throw new LogWriteError(`a compaction write made no progress at byte ${off} of ${buf.length}`);
+      off += n;
+    }
+    h.io.fsyncSync(fd);
+  } catch (err) {
+    fs.closeSync(fd);
+    fs.unlinkSync(tmp);
+    throw err;
+  }
+  fs.closeSync(fd);
+  fs.renameSync(tmp, h.path);
+  const dirFd = fs.openSync(stateDir, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(dirFd);
+  } finally {
+    fs.closeSync(dirFd);
+  }
+  closeLog(h);
+  const reopened = openLog(stateDir, h.io);
+  return { handle: reopened.handle, state: reopened.state, beforeBytes, afterBytes: reopened.handle.io.fstatSync(reopened.handle.fd).size };
+}
+
+/**
+ * The reference TAILER (an out-of-process driver's reader; the log is the transport):
+ * follows the log BY PATH, like `tail -F`. Each poll first drains the file it has open to
+ * its end, then, if the path now names a different inode (a compaction), switches to it
+ * from the start. Intents are de-duplicated by intent_id, so a compaction (which rewrites
+ * kept records unchanged) loses nothing and repeats nothing. Read-only and no-follow.
+ */
+export class LogTailer {
+  private fd: number | null = null;
+  private ino = 0;
+  private offset = 0;
+  private partial = "";
+  private readonly seen = new Set<string>();
+  constructor(private readonly logPath: string) {}
+
+  private openCurrent(): void {
+    this.fd = fs.openSync(this.logPath, fs.constants.O_RDONLY | O_NOFOLLOW);
+    this.ino = fs.fstatSync(this.fd).ino;
+    this.offset = 0;
+    this.partial = "";
+  }
+
+  private drain(out: IntentRecord[]): void {
+    if (this.fd === null) return;
+    const size = fs.fstatSync(this.fd).size;
+    if (size <= this.offset) return;
+    const buf = Buffer.alloc(size - this.offset);
+    const n = fs.readSync(this.fd, buf, 0, buf.length, this.offset);
+    this.offset += n;
+    const text = this.partial + buf.subarray(0, n).toString("utf-8");
+    const lines = text.split("\n");
+    this.partial = lines.pop() ?? ""; // an unterminated line waits for the next poll
+    for (const line of lines) {
+      const rec = JSON.parse(line) as LogRecord;
+      if (recordFault(rec)) continue;
+      if (rec.type === "intent" && !this.seen.has(rec.intent.intent_id)) {
+        this.seen.add(rec.intent.intent_id);
+        out.push(rec);
+      }
+    }
+  }
+
+  /** The intents that are new since the last poll, in log order. */
+  poll(): IntentRecord[] {
+    const out: IntentRecord[] = [];
+    if (this.fd === null) this.openCurrent();
+    this.drain(out);
+    let pathIno: number | null = null;
+    try {
+      pathIno = fs.lstatSync(this.logPath).ino;
+    } catch {
+      pathIno = null;
+    }
+    if (pathIno !== null && pathIno !== this.ino) {
+      fs.closeSync(this.fd as number);
+      this.openCurrent();
+      this.drain(out);
+    }
+    return out;
+  }
+
+  close(): void {
+    if (this.fd !== null) fs.closeSync(this.fd);
+    this.fd = null;
+  }
 }

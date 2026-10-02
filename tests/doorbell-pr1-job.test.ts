@@ -115,11 +115,15 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
   it("HARM (V4 rescue twin): the same id re-pended to a NEW reading session (a re-registration) DOES ring", () => {
     const m1 = send("db-alice");
     expect(once().status).toBe(0);
+    const first = intents()[0].covers?.reading_session;
     setSession("db-alice", "a-later-window-session");
     expect(once().status).toBe(0);
+    // The start compacts first (D-2): the old session's key can never be needed again, so its
+    // intent is dropped; what remains is the NEW ring, for the same id under the new session.
     const covers = intents().map((i) => i.covers);
-    expect(covers.map((c) => c?.message_ids)).toEqual([[m1], [m1]]);
-    expect(covers[0]?.reading_session).not.toBe(covers[1]?.reading_session);
+    expect(covers.map((c) => c?.message_ids)).toEqual([[m1]]);
+    expect(covers[0]?.reading_session).toMatch(/^[0-9a-f]{64}$/);
+    expect(covers[0]?.reading_session).not.toBe(first);
   });
 
   it("HARM (V4): a NULL-session agent with pending mail produces NO intent", () => {
@@ -179,8 +183,20 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
 
   it("HARM (#4): an fsync failure after a complete write STOPS the job (exit 1, no retry); a restart adds NO duplicate", async () => {
     send("db-alice");
-    let fsyncs = 0;
-    const io = { ...L.realLogIo, fsyncSync: (fd: number) => { if (++fsyncs === 2) throw new Error("EIO (injected)"); fs.fsyncSync(fd); } };
+    // Fail the fsync of the first INTENT append (the header's and a compaction's fsyncs pass).
+    let lastWrite = "";
+    let failed = false;
+    const io = {
+      ...L.realLogIo,
+      writeSync: (fd: number, buf: Buffer, off: number, len: number) => ((lastWrite = buf.toString("utf-8")), fs.writeSync(fd, buf, off, len)),
+      fsyncSync: (fd: number) => {
+        if (!failed && lastWrite.includes('"type":"intent"')) {
+          failed = true;
+          throw new Error("EIO (injected)");
+        }
+        fs.fsyncSync(fd);
+      },
+    };
     const r = await inProcess(["--interval-ms", "1000"], { logIo: io }); // a LOOP, which would otherwise retry
     expect([r.code, r.stderr]).toEqual([1, expect.stringMatching(/DOORBELL_FAILED: the doorbell log write did not complete .*stopping/)]);
     expect(intents()).toHaveLength(1); // the line was written; only its fsync failed

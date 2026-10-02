@@ -8,6 +8,7 @@
   - It opens the relay DB **read-only** and finds it through the one resolver. A resolver fault, a missing DB or a corrupt log stops it with exit 1.
   - It never writes the relay DB or its `-wal`. It opens the DB only once a relay process has created both WAL side files, and reports `WAITING-FOR-WRITER` until then, so it never creates them itself.
   - Its own log is never written through a symlink. A log write that does not complete stops the job, so a restart never writes the same record twice.
+  - The log stays bounded. On start, it keeps only the records whose mail is still pending, plus the last few start records. It rewrites the file safely: temp file, then an atomic rename. A size cap is checked every cycle. Over it, the job stops writing intents and says `LOG-FULL` once, until a restart compacts the log.
   - It never rings an agent with no bound session, and never a window on another machine.
   - It remembers what it rang per (message, session), so a restart does not ring again, but a new session for the same mail does.
   - It opens no network socket.

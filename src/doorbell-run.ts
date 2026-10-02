@@ -44,9 +44,11 @@ import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { getOwnHostId } from "./liveness.js";
 import { planCycle, type PendingRead } from "./doorbell-core.js";
-import { appendRecord, closeLog, LogWriteError, openLog, rungKey, stateDirFor, type LogHandle, type LogIo, type LogState } from "./doorbell-log.js";
+import { appendRecord, closeLog, compactLog, LogWriteError, openLog, rungKey, stateDirFor, type IntentRecord, type LogHandle, type LogIo, type LogState } from "./doorbell-log.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
+/** D-2: the log's size cap, checked EVERY cycle. Over it: no ring, LOG-FULL, loud (a restart compacts). */
+export const LOG_CAP_BYTES = 16 * 1024 * 1024;
 export const MIN_INTERVAL_MS = 1000;
 export const MAX_INTERVAL_MS = 600_000;
 
@@ -115,6 +117,8 @@ export interface DoorbellOptions {
   logIo?: LogIo;
   /** Runs after the DB's first read and BEFORE the post-open sidecar recheck. */
   afterDbOpen?: () => void;
+  /** The log size cap (default LOG_CAP_BYTES). */
+  logCapBytes?: number;
 }
 
 export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): Promise<number> {
@@ -190,7 +194,35 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
       throw new Error(`${dbPath} ${gap}`);
     }
     db = h;
+    compactOnStart(h);
     return null;
+  };
+
+  /**
+   * D-2 (ruling 8c83e4ce): COMPACT once, at the first successful DB open (the keep rule
+   * needs the pending set). An intent is kept while ANY of its (reading session, id) is
+   * STILL in that agent's pending set, read for every agent in ONE snapshot: a message
+   * that left pending for a session never re-enters it, and a re-pend to a new session
+   * is a new key (V4), so a dropped key can never be needed again. The last few headers
+   * are kept. (Open escalations join the keep rule when they exist, PR 3.)
+   */
+  const compactOnStart = (handle: import("./sqlite-compat.js").CompatDatabase): void => {
+    const pendingNow = new Map<string, { rs: string | null; ids: Set<string> }>();
+    handle.transaction(() => {
+      for (const r of state.records) {
+        if (r.type !== "intent" || pendingNow.has(r.intent.agent_name)) continue;
+        const m = pendingMetadata(handle, r.intent.agent_name);
+        pendingNow.set(r.intent.agent_name, { rs: m.reading_session, ids: new Set(m.messages.map((x) => x.id)) });
+      }
+    })();
+    const keep = (rec: IntentRecord): boolean => {
+      const p = pendingNow.get(rec.intent.agent_name);
+      return !!p && p.rs === rec.covers.reading_session && rec.covers.message_ids.some((id) => p.ids.has(id));
+    };
+    const c = compactLog(log, keep);
+    log = c.handle;
+    state = c.state;
+    if (c.afterBytes < c.beforeBytes) process.stderr.write(`doorbell: compacted the log, ${c.beforeBytes} → ${c.afterBytes} bytes\n`);
   };
 
   let stopping = false;
@@ -222,6 +254,8 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
 
   let code = 0;
   let waitingSaid: string | null = null;
+  let logFullSaid = false;
+  const cap = opts.logCapBytes ?? LOG_CAP_BYTES;
   try {
     while (!stopping) {
       try {
@@ -232,7 +266,18 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
             waitingSaid = waiting;
           } else waitingSaid = null;
         }
-        if (db) cycle(db);
+        if (db) {
+          // D-2: the cap, EVERY cycle. Over it, no ring at all: never grow, never drop silently.
+          const size = fs.fstatSync(log.fd).size;
+          if (size >= cap) {
+            if (!logFullSaid) process.stderr.write(`doorbell: LOG-FULL: the log is ${size} bytes (cap ${cap}): not ringing until a restart compacts it\n`);
+            logFullSaid = true;
+          } else {
+            if (logFullSaid) process.stderr.write("doorbell: the log is under its cap again: ringing resumes\n");
+            logFullSaid = false;
+            cycle(db);
+          }
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (err instanceof LogWriteError) {
