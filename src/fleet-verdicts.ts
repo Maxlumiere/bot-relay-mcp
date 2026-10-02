@@ -823,6 +823,17 @@ export function cannotVerify(s: FleetSnapshot): string | null {
   return null;
 }
 
+/**
+ * Why a judgement's daemon IDENTITY is unread, or null (#298 Codex R2): a daemon that
+ * listens (it has a pid) but whose start token is absent or empty cannot be compared
+ * across the two looks, so it can support no verdict at all: CANNOT-VERIFY, never a
+ * FAIL or a PASS on an anonymous daemon.
+ */
+export function daemonIdentityUnread(j: FleetJudgement): string | null {
+  if (j.daemon.pid === null || j.daemon.start) return null;
+  return `the daemon listening as pid ${j.daemon.pid} has no readable identity (its process start token is ${j.daemon.start === null ? "absent from the process table" : "empty"})`;
+}
+
 /** What two observations must agree on: every connector and the daemon by (pid, start), every window, each with its verdict. */
 export function fleetSignature(j: FleetJudgement): string {
   return JSON.stringify({
@@ -850,7 +861,7 @@ export async function deployCheck(
   await opts.afterFirstObservation?.();
   const s2 = await observe();
   const j2 = judge(s2);
-  const blind = cannotVerify(s1) ?? cannotVerify(s2);
+  const blind = cannotVerify(s1) ?? cannotVerify(s2) ?? daemonIdentityUnread(j1) ?? daemonIdentityUnread(j2);
   if (blind) return { outcome: "CANNOT-VERIFY", exit: 3, reason: blind, judgement: j2 };
   if (fleetSignature(j1) !== fleetSignature(j2)) {
     return { outcome: "CANNOT-VERIFY", exit: 3, reason: "the fleet changed while it was being checked: check again once the windows have settled", judgement: j2 };

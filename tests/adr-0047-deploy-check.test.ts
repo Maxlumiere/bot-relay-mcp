@@ -123,6 +123,19 @@ describe("the exit contract", () => {
     expect(o.judgement.daemon).toMatchObject({ pid: 99, start: START(9) });
     expect([o.outcome, o.exit]).toEqual(["PASS", 0]);
   });
+  it("#298 Codex R2 (MEASURED): the listening daemon is ABSENT from an otherwise readable process table → CANNOT-VERIFY (3), never FAIL", async () => {
+    const noDaemonRow = snap({ processes: [p(10, 1, "claude", "claude", 1), p(11, 10, `node ${SCRIPT}`, "node", 2)] });
+    expect(judge(noDaemonRow).daemon).toMatchObject({ pid: 99, start: null }); // precondition: its identity was not obtained
+    const o = await check(noDaemonRow);
+    expect([o.outcome, o.exit]).toEqual(["CANNOT-VERIFY", 3]);
+    expect(o.reason).toMatch(/daemon .*pid 99.*identity/);
+  });
+  it("#298 Codex R2 (MEASURED): an EMPTY daemon start token in both looks → CANNOT-VERIFY (3), never PASS", async () => {
+    const empty = snap({ processes: [p(10, 1, "claude", "claude", 1), p(11, 10, `node ${SCRIPT}`, "node", 2), { ...p(99, 1, `node ${SCRIPT}`, "node", 9), start: "" }] });
+    expect(judge(empty).daemon).toMatchObject({ pid: 99, start: "", verdict: "CURRENT" }); // precondition: otherwise it would PASS
+    const o = await check(empty);
+    expect([o.outcome, o.exit]).toEqual(["CANNOT-VERIFY", 3]);
+  });
   it("the second observation is taken AFTER the first (afterFirstObservation runs between them)", async () => {
     const order: string[] = [];
     await V.deployCheck(async () => (order.push("observe"), snap()), { judge, afterFirstObservation: () => void order.push("between") });
