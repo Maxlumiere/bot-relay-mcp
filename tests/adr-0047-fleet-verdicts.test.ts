@@ -133,6 +133,83 @@ describe("classifyProcess (D3 + D9)", () => {
     expect(V.classifyProcess(proc({ command: `node ${SPACED}/dist/index.js` }), new Set(), fakeFs([`${SPACED}/dist/index.js`], { [SPACED]: "n8n-mcp" })).kind).toBe("not-relay");
     expect(V.classifyProcess(proc({ command: `node ${SPACED}/dist/index.js` }), new Set(), fakeFs([`${SPACED}/dist/index.js`], { [SPACED]: { error: "EACCES" } })).kind).toBe("unknown");
   });
+  describe("#297 Codex R1 P1: a node option can never hide a connector", () => {
+    const optFs = fakeFs(["/tmp/config.env", "/tmp/a b.js", "/w/b.js", `${SPACED}/dist/index.js`, "/opt/other/dist/index.js"], {
+      [SPACED]: "bot-relay-mcp",
+      "/opt/other": "something-else",
+    });
+    it("the MEASURED shape: --env-file-if-exists VALUE is never taken for the script (ps-joined AND exact argv)", () => {
+      const cmd = `node --env-file-if-exists /tmp/config.env ${SPACED}/dist/index.js`;
+      expect(V.classifyProcess(proc({ command: cmd }), new Set(), optFs).kind).not.toBe("not-relay");
+      expect(V.classifyProcess(proc({ command: "x", argv: ["node", "--env-file-if-exists", "/tmp/config.env", `${SPACED}/dist/index.js`] }), new Set(), optFs)).toMatchObject({
+        kind: "connector",
+        installDir: SPACED,
+      });
+    });
+    it("EVERY value-taking option of node's own table, in the space form, skips its value (exact argv)", () => {
+      expect(V.NODE_OPTIONS_WITH_VALUE.size).toBeGreaterThan(60); // non-vacuous: the table, not a sample
+      for (const opt of V.NODE_OPTIONS_WITH_VALUE) {
+        if (V.NODE_NO_SCRIPT.has(opt)) continue; // --eval / --run: node runs no script file at all
+        const c = V.classifyProcess(proc({ command: "x", argv: ["node", opt, "/tmp/config.env", `${SPACED}/dist/index.js`] }), new Set(), optFs);
+        expect([opt, c.kind]).toEqual([opt, "connector"]);
+      }
+    });
+    it("an option node's table does not know, in the space form, before a relay entrypoint → UNKNOWN, never not-relay", () => {
+      const c = V.classifyProcess(proc({ command: `node --frobnicate /tmp/config.env ${SPACED}/dist/index.js` }), new Set(), optFs);
+      expect(c).toMatchObject({ kind: "unknown", reason: expect.stringMatching(/--frobnicate/) });
+    });
+    it("twin: an unknown option whose EVERY reading is not relay, and no relay entrypoint in argv → not relay", () => {
+      // Read as a flag: the script is /opt/other (another package). Read as taking a value: no script at all.
+      expect(V.classifyProcess(proc({ command: "node --frobnicate /opt/other/dist/index.js" }), new Set(), optFs).kind).toBe("not-relay");
+    });
+    it("twin: an unknown option whose readings DISAGREE (one cannot be confirmed) → UNKNOWN, naming the option", () => {
+      // As a flag the script is "4096", which does not exist: that reading cannot be confirmed.
+      const c = V.classifyProcess(proc({ command: "node --frobnicate 4096 /opt/other/dist/index.js", cwd: "/w" }), new Set(), optFs);
+      expect(c).toMatchObject({ kind: "unknown", reason: expect.stringMatching(/--frobnicate .*readings of its argv disagree/) });
+    });
+    it("twin: one reading finds a connector, another does not → UNKNOWN, never a guessed connector", () => {
+      // As a flag the script is the relay entrypoint; taking a value, the script is /tmp/config.env.
+      const c = V.classifyProcess(proc({ command: `node --frobnicate ${SPACED}/dist/index.js /tmp/config.env` }), new Set(), optFs);
+      expect(c.kind).toBe("unknown");
+    });
+    it("twin: an unknown option in the --opt=value form is ONE argument: certain, the connector is found", () => {
+      expect(V.classifyProcess(proc({ command: `node --frobnicate=/tmp/config.env ${SPACED}/dist/index.js` }), new Set(), optFs)).toMatchObject({
+        kind: "connector",
+        installDir: SPACED,
+      });
+    });
+    it("ps-joined argv: a space-form value that itself contains a space cannot hide the connector → UNKNOWN", () => {
+      // The real value is "/tmp/a b.js"; skipping ONE token lands on "b.js", which exists relative to the cwd.
+      const c = V.classifyProcess(proc({ command: `node --require /tmp/a b.js ${SPACED}/dist/index.js`, cwd: "/w" }), new Set(), optFs);
+      expect(c.kind).toBe("unknown");
+    });
+    it("node's OWN option table (`node --help` of the running node) is pinned: every option, with the same arity", () => {
+      const help = spawnSync(process.execPath, ["--help"], { encoding: "utf-8" }).stdout;
+      const value = new Set<string>();
+      const flag = new Set<string>();
+      for (const line of help.split("\n")) {
+        const m = /^ {2}(-[^ ].*?)(?: {2,}| [A-Z(]|$)/.exec(line);
+        if (!m) continue;
+        const aliases = m[1].split(/, /).map((s) => s.trim());
+        const lm = /^(-{1,2}[A-Za-z0-9][A-Za-z0-9.-]*)(.*)$/.exec(aliases[aliases.length - 1]);
+        if (!lm) continue; // "-" (stdin) and "--"
+        for (const a of aliases) {
+          const am = /^(-{1,2}[A-Za-z0-9][A-Za-z0-9.-]*)/.exec(a);
+          if (am) (lm[2].startsWith("=") ? value : flag).add(am[1]);
+        }
+      }
+      expect(value.size + flag.size).toBeGreaterThan(150); // non-vacuous: the parse read the real table
+      expect([...value].filter((o) => !V.NODE_OPTIONS_WITH_VALUE.has(o))).toEqual([]);
+      expect([...flag].filter((o) => !V.NODE_FLAGS.has(o) && !V.NODE_NO_SCRIPT.has(o))).toEqual([]);
+      expect([...flag].filter((o) => V.NODE_OPTIONS_WITH_VALUE.has(o))).toEqual([]);
+    });
+  });
+  describe("#297 Codex R1 P2: missing identification metadata is UNKNOWN, never a positive exclusion", () => {
+    it("a relay-shaped dist/index.js whose package.json is MISSING → UNKNOWN", () => {
+      const c = V.classifyProcess(proc({ command: `node ${SPACED}/dist/index.js` }), new Set(), fakeFs([`${SPACED}/dist/index.js`], {}));
+      expect(c).toMatchObject({ kind: "unknown", reason: expect.stringMatching(/package\.json/) });
+    });
+  });
   it("an EXACT argv (Linux /proc) is read directly: no ambiguity", () => {
     const fsx = fakeFs(["/Users/m/LLMs/Claude", `${SPACED}/dist/index.js`], { [SPACED]: "bot-relay-mcp" });
     const c = V.classifyProcess(proc({ command: "ignored", argv: ["node", `${SPACED}/dist/index.js`] }), new Set(), fsx);
@@ -280,6 +357,47 @@ describe("judgeFleet", () => {
     expect(j.connectors.map((e) => [e.pid, e.verdict])).toEqual([[13, "STALE"], [11, "CURRENT"]]);
     expect(j.windows).toMatchObject([{ window_pid: 10, verdict: "STALE", connectors: [11, 13] }]);
     expect(j.failing).toBe(1); // the STALE connector, once
+  });
+  it("#297 Codex R1 P1 (MEASURED): a rowless connector behind --env-file-if-exists is on the board and fails", () => {
+    const fsx = fakeFs([SCRIPT, "/tmp/config.env"], { [INSTALL]: "bot-relay-mcp" });
+    const j = V.judgeFleet(
+      snapshot({ processes: [win(10, 1), proc({ pid: 11, ppid: 1, start: START(2), command: `node --env-file-if-exists /tmp/config.env ${SCRIPT}` }), node(99, 1, SCRIPT, 9)], rows: [], bindings: [] }),
+      fsx,
+    );
+    expect(j.connectors).toMatchObject([{ pid: 11, verdict: "UNKNOWN" }]);
+    expect(j.failing).toBe(1);
+  });
+  it("#297 Codex R1 P2 (MEASURED): a rowless connector whose install lost its package.json → the window is UNKNOWN, never NO CONNECTOR", () => {
+    const j = V.judgeFleet(snapshot({ rows: [] }), fakeFs([SCRIPT], {}));
+    expect(j.windows).toMatchObject([{ window_pid: 10, verdict: "UNKNOWN", connectors: [11] }]);
+    expect(j.windows[0].verdict).not.toBe("NO CONNECTOR");
+  });
+  it("#297 Codex R1 P2 (MEASURED): window ownership is (pid, START): a reused window pid never inherits an old connector", () => {
+    // Connector 11 recorded parent (10, START(1)) and was reparented; pid 10 is now ANOTHER bound window (START(7)).
+    const j = V.judgeFleet(
+      snapshot({
+        processes: [win(10, 7), node(11, 1, SCRIPT, 2), node(99, 1, SCRIPT, 9)],
+        bindings: [{ agent_name: "newcomer", window_pid: 10, window_pid_start: START(7) }],
+      }),
+      judgeFs,
+    );
+    expect(j.connectors).toMatchObject([{ pid: 11, unbound: true, verdict: "CURRENT" }]);
+    expect(j.windows).toMatchObject([{ agent: "newcomer", window_pid: 10, verdict: "NO CONNECTOR", connectors: [] }]);
+    expect(j.failing).toBe(1);
+  });
+  it("twin: the SAME window (pid AND start) still owns its connector", () => {
+    const j = V.judgeFleet(snapshot({ processes: [win(10, 1), node(11, 1, SCRIPT, 2), node(99, 1, SCRIPT, 9)] }), judgeFs);
+    expect(j.windows).toMatchObject([{ window_pid: 10, verdict: "CURRENT", connectors: [11] }]);
+  });
+  it("#297 Codex R1 P2 (MEASURED): an owned connector does not hide a STALE descendant recording another parent: the worst of BOTH", () => {
+    const j = V.judgeFleet(
+      snapshot({
+        processes: [win(10, 1), node(11, 10, SCRIPT, 2), node(12, 10, SCRIPT, 3), node(99, 1, SCRIPT, 9)],
+        rows: [row(11, 2), row(12, 3, { parent_pid: 77, parent_start: START(5), build_id: "e".repeat(64) })],
+      }),
+      judgeFs,
+    );
+    expect(j.windows).toMatchObject([{ window_pid: 10, verdict: "STALE", connectors: [11, 12] }]);
   });
   it("a binding still in the legacy (pre-UTC) start form reads UNKNOWN with the reason, never NO CONNECTOR", () => {
     const j = V.judgeFleet(snapshot({ rows: [], processes: [win(10, 1), node(99, 1, SCRIPT, 9)], bindings: [{ agent_name: "a", window_pid: 10, window_pid_start: "Thu Oct  1 15:00:01 2026" }] }), judgeFs);

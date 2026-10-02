@@ -31,6 +31,7 @@ import fs from "fs";
 import path from "path";
 import { checkInstall, parseStamp, UNBUILT, type InstallCheck } from "./build-id.js";
 import { isUtcStartToken, type ProcEntry } from "./liveness.js";
+import { NODE_FLAGS, NODE_NO_SCRIPT, NODE_OPTIONS_WITH_VALUE } from "./node-options.js";
 
 export type ConnectorVerdict = "CURRENT" | "STALE" | "UNKNOWN" | "INSTALL INCONSISTENT";
 export type WindowVerdict = ConnectorVerdict | "NO CONNECTOR";
@@ -102,24 +103,7 @@ export const realClassifyFs: ClassifyFs = {
 };
 
 const NODE_EXECUTABLES = /^node(js)?(\.exe)?$/i;
-/** Node options that take their value as the NEXT argument (so it is not the script). */
-const NODE_OPTIONS_WITH_VALUE = new Set([
-  "-r",
-  "--require",
-  "--import",
-  "--loader",
-  "--experimental-loader",
-  "-C",
-  "--conditions",
-  "--title",
-  "--inspect-port",
-  "--debug-port",
-  "--env-file",
-  "--input-type",
-  "--watch-path",
-]);
-/** Node options after which there is no script at all. */
-const NODE_NO_SCRIPT = new Set(["-e", "--eval", "-p", "--print", "-i", "--interactive", "-v", "--version", "-h", "--help", "-c", "--check"]);
+export { NODE_OPTIONS_WITH_VALUE, NODE_FLAGS, NODE_NO_SCRIPT };
 
 /** A process, as the snapshot holds it. `argv` is the EXACT argv when the platform gives one (Linux /proc); else null. */
 export interface ProcessView {
@@ -133,68 +117,67 @@ export interface ProcessView {
   argv: string[] | null;
 }
 
+/** Where the script could start, under ONE reading of the node options: an argv index, or no script at all. */
+type Reading = { index: number } | { none: string };
+
 /**
- * Is this process a relay stdio connector, and from which install?
- *
- *   - A TCP listener is never a connector (ruling fd6b7757 D9.2: a stdio connector
- *     never listens; this excludes the daemon without reading its environment).
- *   - Not node → not a relay process.
- *   - The script is the first NON-OPTION argument (D3). With an exact argv
- *     (Linux) it is read directly. macOS `ps` joins argv with spaces, and paths
- *     contain spaces ("Claude AI"), so it is resolved by EXISTENCE: the space-
- *     joined token prefixes that are existing files. Exactly one → the script;
- *     none, or more than one → UNKNOWN, never NO CONNECTOR (D9.1).
- *   - A connector = the script's realpath is `<dir>/dist/index.js` and
- *     `<dir>/package.json` names "bot-relay-mcp"; installDir = `<dir>`.
+ * Every plausible reading of the node options (D3; #297 Codex R1 P1). A listed option
+ * has node's own arity (src/node-options.ts); `--opt=value` is one argument whatever
+ * the option; an option node's table does not know may take a value or not, so it is
+ * read BOTH ways. Memoised on the argv index: linear in practice, quadratic at worst.
  */
-export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, fsx: ClassifyFs = realClassifyFs): Classification {
-  if (listeners.has(p.pid)) return { kind: "not-relay", why: "it holds a TCP listen socket (the daemon or another server)" };
-  const exe = p.comm ?? (p.argv ? p.argv[0] : p.command.split(" ")[0]);
-  if (!NODE_EXECUTABLES.test(path.basename(exe ?? ""))) return { kind: "not-relay", why: "not a node process" };
-
-  let args: string[];
-  let exact: boolean;
-  if (p.argv) {
-    args = p.argv.slice(1);
-    exact = true;
-  } else {
-    // The command starts with the executable as ps prints it (comm when it is the
-    // full path, else the first token).
-    const rest =
-      p.comm && p.command.startsWith(p.comm + " ")
-        ? p.command.slice(p.comm.length + 1)
-        : p.command.slice(p.command.split(" ")[0].length + 1);
-    args = rest.length > 0 ? rest.split(" ") : [];
-    exact = false;
-  }
-
-  // Node options (D3): skip them, and the value of those that take one.
-  let i = 0;
-  while (i < args.length) {
+function readNodeOptions(args: string[]): { readings: Reading[]; unknownOptions: string[]; spaceValue: boolean } {
+  const memo = new Map<number, Reading[]>();
+  const unknownOptions: string[] = [];
+  let spaceValue = false;
+  const at = (i: number): Reading[] => {
+    const hit = memo.get(i);
+    if (hit) return hit;
+    let r: Reading[];
     const a = args[i];
-    if (a === "--") {
-      i++;
-      break;
+    if (i >= args.length) r = [{ none: "node with no script" }];
+    else if (a === "--") r = i + 1 < args.length ? [{ index: i + 1 }] : [{ none: "node with no script" }];
+    else if (!a.startsWith("-") || a === "-") r = [{ index: i }];
+    else {
+      const eq = a.indexOf("=");
+      const name = eq > 0 ? a.slice(0, eq) : a;
+      if (NODE_NO_SCRIPT.has(name)) r = [{ none: `node ${name}: no script` }];
+      else if (eq > 0) r = at(i + 1);
+      else if (NODE_OPTIONS_WITH_VALUE.has(a)) {
+        spaceValue = true;
+        r = at(i + 2);
+      } else if (NODE_FLAGS.has(a) || a.startsWith("--no-")) r = at(i + 1);
+      else {
+        unknownOptions.push(a);
+        r = [...at(i + 1), ...at(i + 2)];
+      }
     }
-    if (NODE_NO_SCRIPT.has(a)) return { kind: "not-relay", why: `node ${a}: no script` };
-    if (!a.startsWith("-") || a === "-") break;
-    i += NODE_OPTIONS_WITH_VALUE.has(a) ? 2 : 1;
-  }
-  if (i >= args.length) return { kind: "not-relay", why: "node with no script" };
+    memo.set(i, r);
+    return r;
+  };
+  const seen = new Set<string>();
+  const readings = at(0).filter((r) => {
+    const k = JSON.stringify(r);
+    return seen.has(k) ? false : (seen.add(k), true);
+  });
+  return { readings, unknownOptions: [...new Set(unknownOptions)], spaceValue };
+}
 
-  const absolute = (candidate: string): string | null =>
-    path.isAbsolute(candidate) ? candidate : p.cwd ? path.resolve(p.cwd, candidate) : null;
+/** A relay connector entrypoint: `<dir>/dist/index.js`. */
+const relayShaped = (real: string): boolean => path.basename(real) === "index.js" && path.basename(path.dirname(real)) === "dist";
 
+/** Is the script that starts at argv[index] a relay connector? (D3 + D9, P2: unidentifiable → UNKNOWN). */
+function classifyScript(args: string[], index: number, exact: boolean, absolute: (c: string) => string | null, fsx: ClassifyFs): Classification {
   let script: string;
   if (exact) {
-    const abs = absolute(args[i]);
-    if (!abs) return { kind: "unknown", reason: `the script ${args[i]} is relative and the process's working directory is unreadable` };
+    const abs = absolute(args[index]);
+    if (!abs) return { kind: "unknown", reason: `the script ${args[index]} is relative and the process's working directory is unreadable` };
     script = abs;
   } else {
     const found: string[] = [];
     let unresolvable = false;
-    for (let k = i; k < args.length; k++) {
-      const candidate = args.slice(i, k + 1).join(" ");
+    for (let k = index; k < args.length; k++) {
+      const candidate = args.slice(index, k + 1).join(" ");
       const abs = absolute(candidate);
       if (!abs) {
         unresolvable = true;
@@ -218,14 +201,111 @@ export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, 
 
   const real = fsx.realpath(script);
   if (!real) return { kind: "unknown", reason: `the script ${script} cannot be resolved` };
-  if (path.basename(real) !== "index.js" || path.basename(path.dirname(real)) !== "dist") {
-    return { kind: "not-relay", why: `runs ${real}` };
-  }
+  if (!relayShaped(real)) return { kind: "not-relay", why: `runs ${real}` };
   const installDir = path.dirname(path.dirname(real));
   const name = fsx.packageName(installDir);
   if (name !== null && typeof name === "object") return { kind: "unknown", reason: name.error };
-  if (name !== "bot-relay-mcp") return { kind: "not-relay", why: `runs ${real} (package ${name ?? "unnamed"})` };
+  // #297 Codex R1 P2: a MISSING (or nameless) package.json identifies nothing, so it cannot
+  // positively exclude a running connector (its install may be mid-update).
+  if (name === null) return { kind: "unknown", reason: `${path.join(installDir, "package.json")} is missing or has no name: the install of ${real} cannot be identified` };
+  if (name !== "bot-relay-mcp") return { kind: "not-relay", why: `runs ${real} (package ${name})` };
   return { kind: "connector", script: real, installDir };
+}
+
+/**
+ * The relay entrypoint named ANYWHERE in argv (any space-joined span, an `--opt=value`
+ * value included), or null. The guard behind an uncertain "not relay": a connector's
+ * script is always such a span, so when none exists the uncertainty cannot matter.
+ */
+function relayEntrypointInArgv(args: string[], exact: boolean, absolute: (c: string) => string | null, fsx: ClassifyFs): string | null {
+  for (let s = 0; s < args.length; s++) {
+    let head = args[s];
+    if (head.startsWith("-")) {
+      const eq = head.indexOf("=");
+      if (eq < 0) continue;
+      head = head.slice(eq + 1);
+    }
+    let candidate = head;
+    for (let e = s; e < (exact ? s + 1 : args.length); e++) {
+      if (e > s) candidate += " " + args[e];
+      const abs = absolute(candidate);
+      if (!abs || !fsx.isFile(abs)) continue;
+      const real = fsx.realpath(abs);
+      if (real && relayShaped(real) && fsx.packageName(path.dirname(path.dirname(real))) === "bot-relay-mcp") return real;
+    }
+  }
+  return null;
+}
+
+/**
+ * Is this process a relay stdio connector, and from which install?
+ *
+ *   - A TCP listener is never a connector (ruling fd6b7757 D9.2: a stdio connector
+ *     never listens; this excludes the daemon without reading its environment).
+ *   - Not node → not a relay process.
+ *   - The script is the first NON-OPTION argument (D3), found with node's own option
+ *     table (src/node-options.ts). With an exact argv (Linux) it is read directly.
+ *     macOS `ps` joins argv with spaces, and paths contain spaces ("Claude AI"), so it
+ *     is resolved by EXISTENCE: the space-joined token prefixes that are existing
+ *     files. Exactly one → the script; none, or more than one → UNKNOWN, never NO
+ *     CONNECTOR (D9.1).
+ *   - A connector = the script's realpath is `<dir>/dist/index.js` and
+ *     `<dir>/package.json` names "bot-relay-mcp"; installDir = `<dir>`. A missing or
+ *     unreadable package.json → UNKNOWN.
+ *   - UNCERTAINTY NEVER HIDES A CONNECTOR (#297 Codex R1 P1): every plausible reading
+ *     of the options is classified. A connector only when every reading is the same
+ *     connector; "not relay" only when every reading is, AND (when a reading was
+ *     uncertain: an unknown option, or a space-form value that ps may have split)
+ *     no span of argv names a relay entrypoint at all. Anything else → UNKNOWN.
+ */
+export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, fsx: ClassifyFs = realClassifyFs): Classification {
+  if (listeners.has(p.pid)) return { kind: "not-relay", why: "it holds a TCP listen socket (the daemon or another server)" };
+  const exe = p.comm ?? (p.argv ? p.argv[0] : p.command.split(" ")[0]);
+  if (!NODE_EXECUTABLES.test(path.basename(exe ?? ""))) return { kind: "not-relay", why: "not a node process" };
+
+  let args: string[];
+  let exact: boolean;
+  if (p.argv) {
+    args = p.argv.slice(1);
+    exact = true;
+  } else {
+    // The command starts with the executable as ps prints it (comm when it is the
+    // full path, else the first token).
+    const rest =
+      p.comm && p.command.startsWith(p.comm + " ")
+        ? p.command.slice(p.comm.length + 1)
+        : p.command.slice(p.command.split(" ")[0].length + 1);
+    args = rest.length > 0 ? rest.split(" ") : [];
+    exact = false;
+  }
+
+  const absolute = (candidate: string): string | null =>
+    path.isAbsolute(candidate) ? candidate : p.cwd ? path.resolve(p.cwd, candidate) : null;
+
+  const { readings, unknownOptions, spaceValue } = readNodeOptions(args);
+  const results = readings.map((r): Classification => ("none" in r ? { kind: "not-relay", why: r.none } : classifyScript(args, r.index, exact, absolute, fsx)));
+  const uncertainty =
+    unknownOptions.length > 0
+      ? `the node option${unknownOptions.length > 1 ? "s" : ""} ${unknownOptions.join(", ")} ${unknownOptions.length > 1 ? "are" : "is"} not in node's option table (it may take a value)`
+      : !exact && spaceValue
+        ? "ps joins argv with spaces, so a space-form option value may hold a space"
+        : null;
+
+  const first = results[0];
+  if (results.length === 1 && first.kind === "unknown") return first;
+  if (results.every((c) => c.kind === "connector" && first.kind === "connector" && c.installDir === first.installDir && c.script === first.script)) return first;
+  if (results.every((c) => c.kind === "not-relay")) {
+    if (uncertainty) {
+      const named = relayEntrypointInArgv(args, exact, absolute, fsx);
+      if (named) return { kind: "unknown", reason: `its argv names the relay entrypoint ${named}, but ${uncertainty}: which argument is the script is uncertain` };
+    }
+    return first;
+  }
+  const inner = results.find((c) => c.kind === "unknown") as { reason: string } | undefined;
+  return {
+    kind: "unknown",
+    reason: `${uncertainty ?? "its node options"}: ${results.length} readings of its argv disagree${inner ? ` (${inner.reason})` : ""}`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +422,8 @@ export interface ConnectorEntry {
   /** CONNECTOR_KIND.unclassified when the process could not be classified and has no row. */
   kind: ConnectorKind;
   window_pid: number | null;
+  /** The window's start token: with window_pid, the window's identity (a pid alone is reusable). */
+  window_start: string | null;
   install_dir: string | null;
   has_row: boolean;
   verdict: ConnectorVerdict;
@@ -459,6 +541,7 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
       unbound: !b,
       kind: CONNECTOR_KIND.connector,
       window_pid: r.parent_pid ?? (b ? b.window_pid : null),
+      window_start: r.parent_pid !== null ? r.parent_start : b ? b.window_pid_start : null,
       install_dir: r.install_dir,
       has_row: true,
       verdict: v.verdict,
@@ -482,6 +565,7 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
       unbound: !b,
       kind: c.kind === "connector" ? CONNECTOR_KIND.connector : CONNECTOR_KIND.unclassified,
       window_pid: b ? b.window_pid : null,
+      window_start: b ? b.window_pid_start : null,
       install_dir: c.kind === "connector" ? c.installDir : null,
       has_row: false,
       verdict: "UNKNOWN",
@@ -494,13 +578,40 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
     });
   }
 
-  // 3. Live bound windows with NO connector entry: NO CONNECTOR only on POSITIVE absence.
+  // 3. Every live bound window: the WORST of every connector it owns (its recorded
+  // parent, joined on (pid, START): a reused pid never inherits an old connector) AND
+  // every connector under it in the process table (a descendant may record another
+  // parent, e.g. after orphan adoption); both sources, always (#297 Codex R1 P2).
+  // With none: NO CONNECTOR only on POSITIVE absence.
   const windows: WindowEntry[] = [];
-  const entryByPid = new Map<number, ConnectorEntry>();
-  for (const e of entries.values()) entryByPid.set(e.pid, e);
   for (const b of s.bindings) {
-    const owned = [...entries.values()].filter((e) => e.window_pid === b.window_pid);
-    if (owned.length > 0) {
+    const found = new Map<string, ConnectorEntry>();
+    for (const [k, e] of entries) if (e.window_pid === b.window_pid && e.window_start === b.window_pid_start) found.set(k, e);
+    // Why the descendants cannot be enumerated, or null when they were.
+    let blind: string | null = null;
+    const win = byPid.get(b.window_pid);
+    if (!isUtcStartToken(b.window_pid_start)) {
+      blind = "its binding predates the UTC start token (the legacy form cannot be matched to the process table): restart the window";
+    } else if (tableError || !win || win.start !== b.window_pid_start) {
+      blind = tableError ? `the process table cannot be read (${tableError})` : "the window process is not in the process snapshot";
+    } else {
+      const queue = [b.window_pid];
+      const seen = new Set<number>(queue);
+      while (queue.length > 0) {
+        const parent = queue.shift() as number;
+        for (const p of table) {
+          if (p.ppid === parent && !seen.has(p.pid)) {
+            seen.add(p.pid);
+            queue.push(p.pid);
+            const k = key(p.pid, p.start);
+            const e = entries.get(k);
+            if (e) found.set(k, e);
+          }
+        }
+      }
+    }
+    if (found.size > 0) {
+      const owned = [...found.values()];
       windows.push({
         agent: b.agent_name,
         window_pid: b.window_pid,
@@ -510,47 +621,8 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
       });
       continue;
     }
-    if (!isUtcStartToken(b.window_pid_start)) {
-      windows.push({
-        agent: b.agent_name,
-        window_pid: b.window_pid,
-        verdict: "UNKNOWN",
-        reason: "its binding predates the UTC start token (the legacy form cannot be matched to the process table): restart the window",
-        connectors: [],
-      });
-      continue;
-    }
-    const win = byPid.get(b.window_pid);
-    if (tableError || !win || win.start !== b.window_pid_start) {
-      windows.push({
-        agent: b.agent_name,
-        window_pid: b.window_pid,
-        verdict: "UNKNOWN",
-        reason: tableError ? `the process table cannot be read (${tableError})` : "the window process is not in the process snapshot",
-        connectors: [],
-      });
-      continue;
-    }
-    // Every descendant, enumerated.
-    const descendants: ProcessView[] = [];
-    const queue = [b.window_pid];
-    const seen = new Set<number>(queue);
-    while (queue.length > 0) {
-      const parent = queue.shift() as number;
-      for (const p of table) {
-        if (p.ppid === parent && !seen.has(p.pid)) {
-          seen.add(p.pid);
-          descendants.push(p);
-          queue.push(p.pid);
-        }
-      }
-    }
-    const underIt = descendants.map((p) => entryByPid.get(p.pid)).filter((e): e is ConnectorEntry => !!e);
-    if (underIt.length > 0) {
-      // A connector process sits under this window although its row names another
-      // parent (or none): judge the window by it.
-      const worst = worstVerdict(underIt.map((e) => e.verdict));
-      windows.push({ agent: b.agent_name, window_pid: b.window_pid, verdict: worst, reason: `judged by its connector(s) ${underIt.map((e) => e.pid).join(", ")}`, connectors: underIt.map((e) => e.pid) });
+    if (blind) {
+      windows.push({ agent: b.agent_name, window_pid: b.window_pid, verdict: "UNKNOWN", reason: blind, connectors: [] });
       continue;
     }
     // POSITIVE absence: every descendant was enumerated above and classified, and an
