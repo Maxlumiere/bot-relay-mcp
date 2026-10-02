@@ -465,7 +465,8 @@ export interface FleetJudgement {
    * `connectors`), or, with none, NO CONNECTOR / UNKNOWN.
    */
   windows: WindowEntry[];
-  daemon: { verdict: ConnectorVerdict; reason: string; pid: number | null; install_dir: string | null; running: string | null };
+  /** `start` is the daemon process's start token: with `pid`, its identity across observations. */
+  daemon: { verdict: ConnectorVerdict; reason: string; pid: number | null; start: string | null; install_dir: string | null; running: string | null };
   /** Every non-CURRENT verdict, connectors + windows + the daemon: what the deploy check fails on. */
   failing: number;
 }
@@ -650,15 +651,15 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
   }
 
   // 4. The daemon line: the same comparison, on /health.build.
-  let daemon: FleetJudgement["daemon"];
+  let d: Omit<FleetJudgement["daemon"], "start">;
   if (!Array.isArray(s.daemon.listenerPids)) {
-    daemon = { verdict: "UNKNOWN", reason: `the listener on port ${s.daemon.port} cannot be read (${s.daemon.listenerPids.error})`, pid: null, install_dir: null, running: null };
+    d = { verdict: "UNKNOWN", reason: `the listener on port ${s.daemon.port} cannot be read (${s.daemon.listenerPids.error})`, pid: null, install_dir: null, running: null };
   } else if (daemonPids.length === 0) {
-    daemon = { verdict: "UNKNOWN", reason: `no process is listening on port ${s.daemon.port}`, pid: null, install_dir: null, running: null };
+    d = { verdict: "UNKNOWN", reason: `no process is listening on port ${s.daemon.port}`, pid: null, install_dir: null, running: null };
   } else if (tableError) {
-    daemon = { verdict: "UNKNOWN", reason: `the process table cannot be read (${tableError})`, pid: daemonPids[0], install_dir: null, running: null };
+    d = { verdict: "UNKNOWN", reason: `the process table cannot be read (${tableError})`, pid: daemonPids[0], install_dir: null, running: null };
   } else if (!daemonDir) {
-    daemon = {
+    d = {
       verdict: "UNKNOWN",
       reason: `the listener on port ${s.daemon.port} (pid ${daemonPids.join(", ")}) is not recognisable as a relay install`,
       pid: daemonPids[0],
@@ -666,10 +667,10 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
       running: null,
     };
   } else if (!s.daemon.health.ok) {
-    daemon = { verdict: "UNKNOWN", reason: `its /health cannot be read (${s.daemon.health.error})`, pid: daemonDir.pid, install_dir: daemonDir.dir, running: null };
+    d = { verdict: "UNKNOWN", reason: `its /health cannot be read (${s.daemon.health.error})`, pid: daemonDir.pid, install_dir: daemonDir.dir, running: null };
   } else {
     const v = verdictForBuild(s.daemon.health.build, installedAt(daemonDir.dir));
-    daemon = {
+    d = {
       verdict: v.verdict,
       reason: v.verdict === "STALE" ? `not restarted after the install: ${v.reason}` : v.reason,
       pid: daemonDir.pid,
@@ -677,6 +678,8 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
       running: describeBuild(s.daemon.health.build),
     };
   }
+
+  const daemon: FleetJudgement["daemon"] = { ...d, start: d.pid !== null ? (byPid.get(d.pid)?.start ?? null) : null };
 
   const connectors = [...entries.values()].sort((a, b) => VERDICT_SEVERITY[b.verdict] - VERDICT_SEVERITY[a.verdict] || a.pid - b.pid);
   // Each connector once; a window only when it has NO connector (else its connectors already count).
@@ -820,12 +823,13 @@ export function cannotVerify(s: FleetSnapshot): string | null {
   return null;
 }
 
-/** What two observations must agree on: every connector, window and the daemon, with its verdict. */
+/** What two observations must agree on: every connector and the daemon by (pid, start), every window, each with its verdict. */
 export function fleetSignature(j: FleetJudgement): string {
   return JSON.stringify({
     c: j.connectors.map((e) => [e.pid, e.start, e.verdict]).sort(),
     w: j.windows.map((w) => [w.window_pid, w.verdict, [...w.connectors].sort()]).sort(),
-    d: [j.daemon.pid, j.daemon.verdict],
+    // The daemon's IDENTITY is (pid, start): a daemon restarted at the same pid is another daemon (#298 Codex R1 P2).
+    d: [j.daemon.pid, j.daemon.start, j.daemon.verdict],
   });
 }
 
@@ -855,4 +859,27 @@ export async function deployCheck(
     return { outcome: "PASS", exit: 0, reason: `${j2.connectors.length} connector(s) and the daemon run the installed build (observed twice)`, judgement: j2 };
   }
   return { outcome: "FAIL", exit: 1, reason: `${j2.failing} not CURRENT`, judgement: j2 };
+}
+
+/**
+ * The text report of a deploy check (#298 Codex R1 P3: pure, so it is testable). The
+ * outcome line, then every offender, then EVERY connector warning whatever the
+ * outcome: a warning never changes the exit code, and a PASS must not hide it.
+ */
+export function deployCheckText(o: DeployCheckOutcome): string {
+  const lines = [`[RELAY] DEPLOY-CHECK ${o.outcome}: ${o.reason}`];
+  const who = (e: ConnectorEntry): string => (e.kind === CONNECTOR_KIND.unclassified ? "unclassified node process" : e.unbound ? "UNBOUND" : `agent ${e.agent}`);
+  if (o.outcome !== "PASS") {
+    for (const e of o.judgement.connectors.filter((x) => x.verdict !== "CURRENT")) {
+      lines.push(`  ${e.verdict}  pid ${e.pid} (${who(e)})${e.install_dir ? ` from ${e.install_dir}` : ""}: ${e.reason}`);
+    }
+    for (const w of o.judgement.windows.filter((x) => x.connectors.length === 0 && x.verdict !== "CURRENT")) {
+      lines.push(`  ${w.verdict}  window ${w.window_pid} (agent ${w.agent ?? "(unnamed)"}): ${w.reason}`);
+    }
+    if (o.judgement.daemon.verdict !== "CURRENT") {
+      lines.push(`  ${o.judgement.daemon.verdict}  daemon${o.judgement.daemon.pid !== null ? ` pid ${o.judgement.daemon.pid}` : ""}: ${o.judgement.daemon.reason}`);
+    }
+  }
+  for (const e of o.judgement.connectors) for (const w of e.warnings) lines.push(`  warning  pid ${e.pid} (${who(e)}): ${w}`);
+  return lines.join("\n") + "\n";
 }

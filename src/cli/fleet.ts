@@ -238,7 +238,7 @@ async function listConnectors(
 ): Promise<number> {
   const { hasConnectorsTable, liveConnectors, listAgentBindings } = await import("../db.js");
   const { anchorLivenessVerdict, getOwnHostId } = await import("../liveness.js");
-  const { observeFleet, judgeFleet, deployCheck, CONNECTOR_KIND } = await import("../fleet-verdicts.js");
+  const { observeFleet, judgeFleet, deployCheck, deployCheckText, CONNECTOR_KIND } = await import("../fleet-verdicts.js");
   const { realSystemDeps } = await import("../fleet-system.js");
   if (!hasConnectorsTable(db)) {
     return fleetFailed(
@@ -266,7 +266,7 @@ async function listConnectors(
     },
     port,
   );
-  if (check) return reportDeployCheck(await deployCheck(observe), json, CONNECTOR_KIND);
+  if (check) return reportDeployCheck(await deployCheck(observe), json, deployCheckText);
   const j = judgeFleet(await observe());
   if (json) {
     process.stdout.write(JSON.stringify(j, null, 2) + "\n");
@@ -307,27 +307,7 @@ async function listConnectors(
 }
 
 /** PR 4 — print the deploy check's outcome. The verdict lines go to stdout; the exit code is the contract. */
-function reportDeployCheck(
-  o: import("../fleet-verdicts.js").DeployCheckOutcome,
-  json: boolean,
-  kinds: typeof import("../fleet-verdicts.js").CONNECTOR_KIND,
-): number {
-  if (json) {
-    process.stdout.write(JSON.stringify({ outcome: o.outcome, exit: o.exit, reason: o.reason, ...o.judgement }, null, 2) + "\n");
-    return o.exit;
-  }
-  process.stdout.write(`[RELAY] DEPLOY-CHECK ${o.outcome}: ${o.reason}\n`);
-  if (o.outcome !== "PASS") {
-    for (const e of o.judgement.connectors.filter((x) => x.verdict !== "CURRENT")) {
-      const who = e.kind === kinds.unclassified ? "unclassified node process" : e.unbound ? "UNBOUND" : `agent ${e.agent}`;
-      process.stdout.write(`  ${e.verdict}  pid ${e.pid} (${who})${e.install_dir ? ` from ${e.install_dir}` : ""}: ${e.reason}\n`);
-    }
-    for (const w of o.judgement.windows.filter((x) => x.connectors.length === 0 && x.verdict !== "CURRENT")) {
-      process.stdout.write(`  ${w.verdict}  window ${w.window_pid} (agent ${w.agent ?? "(unnamed)"}): ${w.reason}\n`);
-    }
-    if (o.judgement.daemon.verdict !== "CURRENT") {
-      process.stdout.write(`  ${o.judgement.daemon.verdict}  daemon${o.judgement.daemon.pid !== null ? ` pid ${o.judgement.daemon.pid}` : ""}: ${o.judgement.daemon.reason}\n`);
-    }
-  }
+function reportDeployCheck(o: import("../fleet-verdicts.js").DeployCheckOutcome, json: boolean, text: (o: import("../fleet-verdicts.js").DeployCheckOutcome) => string): number {
+  process.stdout.write(json ? JSON.stringify({ outcome: o.outcome, exit: o.exit, reason: o.reason, ...o.judgement }, null, 2) + "\n" : text(o));
   return o.exit;
 }

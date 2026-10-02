@@ -112,6 +112,17 @@ describe("the exit contract", () => {
     const o = await check(snap({ bindings: [], rows: [row(11, 2, "e".repeat(64), null)] }), snap({ bindings: [], rows: [row(11, 2, CODE, null)] }));
     expect([o.outcome, o.exit]).toEqual(["CANNOT-VERIFY", 3]);
   });
+  it("#298 Codex R1 P2 (MEASURED): a daemon RESTARTED at the same pid between the looks (both CURRENT) → CANNOT-VERIFY (3)", async () => {
+    const later = snap({ processes: [p(10, 1, "claude", "claude", 1), p(11, 10, `node ${SCRIPT}`, "node", 2), p(99, 1, `node ${SCRIPT}`, "node", 20)] });
+    expect(judge(later).daemon).toMatchObject({ pid: 99, verdict: "CURRENT" }); // precondition: the second daemon also reads CURRENT
+    const o = await check(snap(), later);
+    expect([o.outcome, o.exit]).toEqual(["CANNOT-VERIFY", 3]);
+  });
+  it("twin: the SAME daemon (pid AND start) twice → PASS (0)", async () => {
+    const o = await check(snap(), snap());
+    expect(o.judgement.daemon).toMatchObject({ pid: 99, start: START(9) });
+    expect([o.outcome, o.exit]).toEqual(["PASS", 0]);
+  });
   it("the second observation is taken AFTER the first (afterFirstObservation runs between them)", async () => {
     const order: string[] = [];
     await V.deployCheck(async () => (order.push("observe"), snap()), { judge, afterFirstObservation: () => void order.push("between") });
@@ -129,6 +140,25 @@ describe("the exit contract", () => {
       expect([o.outcome, o.exit]).toEqual(["CANNOT-VERIFY", 3]);
     });
   }
+});
+
+describe("#298 Codex R1 P3: the text report prints every connector warning, whatever the outcome", () => {
+  const ELSEWHERE = "/opt/another-relay";
+  // A CURRENT UNBOUND connector loaded from another install than the daemon's (MEASURED shape).
+  const s = snap({ bindings: [], rows: [{ ...row(11, 2, CODE, null), install_dir: ELSEWHERE }] });
+  it("PASS: the warning is printed and the exit stays 0", async () => {
+    const o = await check(s);
+    expect([o.outcome, o.exit]).toEqual(["PASS", 0]);
+    expect(o.judgement.connectors[0].warnings).toEqual([`it was loaded from ${ELSEWHERE}, not the daemon's install (${INSTALL})`]); // precondition
+    expect(V.deployCheckText(o)).toContain(`it was loaded from ${ELSEWHERE}, not the daemon's install (${INSTALL})`);
+  });
+  it("FAIL: the warning of a CURRENT connector is printed too (not only the offenders)", async () => {
+    const failing = snap({ bindings: [], rows: [{ ...row(11, 2, CODE, null), install_dir: ELSEWHERE }], daemon: { port: 3777, listenerPids: [99], health: { ok: true, build: build("e".repeat(64)) } } });
+    const o = await check(failing);
+    expect([o.outcome, o.exit]).toEqual(["FAIL", 1]);
+    expect(V.deployCheckText(o)).toContain(`it was loaded from ${ELSEWHERE}`);
+    expect(V.deployCheckText(o)).toMatch(/STALE {2}daemon pid 99/);
+  });
 });
 
 describe("relay fleet --deploy-check (the CLI)", () => {
