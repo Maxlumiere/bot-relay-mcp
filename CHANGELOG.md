@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added — the doorbell checks whether a ring worked, rings again, and escalates when it does not
+
+The doorbell job (not installed yet) now checks whether a ring worked. A ring worked when one of the messages it rang for leaves the agent's pending mail **for the same session**: that session read it, or it was resolved. It is never judged from `read_at`, `last_drain_at` or a message count. If the session changed, the ring is recorded as moot, never as having worked, and the new session's mail is rung afresh.
+
+- **A horizon.** A ring that has not worked after 15 minutes counts as ineffective. `--horizon-s` sets it, from 60 to 3600 seconds, and never shorter than the coalescing window; anything else is refused at start (exit 2). The 15 minutes is provisional: it will be fitted from the job's own log of ring-to-read times.
+- **Rings again.** A message still pending one horizon after its last ring is rung again, at most 3 rings per message per session. Past that, the message gets one `id_stuck` escalation and is not rung again. A ring refused by the window or the budget is not a ring: it changes no count.
+- **Escalates.** Three ineffective rings in a row for one agent session open one `agent_unresponsive` escalation. While it is open, that agent is rung only once more, for the first new message. Any of its rung messages leaving pending, or a new session, closes it. A window binding going away does not.
+- **Where escalations go.** Escalations are written to the job's own log and to stderr only. The job never sends a relay message and never writes the relay DB. `--operator NAME` sets who is named on escalations (default: nobody); that agent is never rung because of one.
+- **Survives a restart.** Every judgement and escalation is rebuilt from the log. Compaction keeps open escalations, rings not judged yet, and everything the count still needs. Mail drained while the job was down is still counted as the ring having worked.
+
+Each ring now records, for every message it covers, why it was rung: `new` or `still_pending`. The ring as a whole no longer carries one reason.
+
+Tests: `tests/doorbell-pr3-effect.test.ts` (real relay DB), `tests/doorbell-pr3-escalation.test.ts` and `tests/doorbell-pr3-job.test.ts` (the job, across restarts).
+
 ### Security — dependency advisories cleared; the MCP SDK to 1.32.0
 
 `npm audit --audit-level=high` is clean again in both the server and the VS Code extension.

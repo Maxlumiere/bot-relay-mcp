@@ -57,6 +57,7 @@ function plan(over: Partial<Parameters<typeof C.planCycle>[0]> & { reads?: Recor
     budgetExhausted: new Set(),
     windowMs: C.DEFAULT_WINDOW_MS,
     budgetPerHour: C.DEFAULT_BUDGET_PER_HOUR,
+    horizonMs: C.DEFAULT_HORIZON_MS,
     newIntentId: ids,
     now: () => "2026-10-02T04:00:00.000Z",
     ...over,
@@ -67,7 +68,7 @@ describe("planCycle: the V4 trigger", () => {
   it("twin: a first sighting emits exactly ONE intent covering the new ids; the record is valid", () => {
     const p = plan({ reads: { alice: { registered: true, reading_session: RS1, ids: ["m1", "m2"] } } });
     expect(p.intents).toHaveLength(1);
-    expect(p.intents[0]).toMatchObject({ intent: { agent_name: "alice", binding_id: "b-alice", reason: "new_mail" }, covers: { reading_session: RS1, message_ids: ["m1", "m2"] } });
+    expect(p.intents[0]).toMatchObject({ intent: { agent_name: "alice", binding_id: "b-alice", during_escalation: false }, covers: { reading_session: RS1, message_ids: ["m1", "m2"], kinds: ["new", "new"] } });
     expect(L.recordFault(p.intents[0])).toBeNull();
   });
   it("twin: an unchanged set (every id already rung for this session) emits nothing", () => {
@@ -75,7 +76,7 @@ describe("planCycle: the V4 trigger", () => {
   });
   it("HARM (V4 rescue twin): the SAME id re-pended to a NEW reading session DOES ring", () => {
     const p = plan({ rung: new Set([L.rungKey(RS1, "m1")]), reads: { alice: { registered: true, reading_session: RS2, ids: ["m1"] } } });
-    expect(p.intents.map((r) => r.covers)).toEqual([{ reading_session: RS2, message_ids: ["m1"] }]);
+    expect(p.intents.map((r) => r.covers)).toEqual([{ reading_session: RS2, message_ids: ["m1"], kinds: ["new"] }]);
   });
   it("HARM (V4): a NULL / unbound reading session is NEVER a target, and says why", () => {
     const p = plan({ reads: { alice: { registered: true, reading_session: null, ids: ["m1"] } } });
@@ -125,10 +126,18 @@ describe("planCycle: candidates are THIS host's bindings, positively", () => {
 
 describe("the log: a CLOSED schema (C3), content-free", () => {
   const good = () => plan().intents[0];
-  it("HARM (C3): a free-text reason is refused by the writer, and nothing is written", () => {
+  it("HARM (C3): a free-text KIND (why an id is rung) is refused by the writer, and nothing is written", () => {
     const { logPath } = prep(path.join(ROOT, "c3-reason"));
-    const bad = { ...good(), intent: { ...good().intent, reason: "alice has 3 urgent messages from bob" } };
-    expect(() => append(logPath, bad as never)).toThrow(/reason must be one of/);
+    const bad = { ...good(), covers: { ...good().covers, kinds: ["alice has 3 urgent messages from bob"] } };
+    expect(() => append(logPath, bad as never)).toThrow(/each kind must be one of/);
+    expect(fs.readFileSync(logPath, "utf-8")).toBe("");
+  });
+  it("HARM (C3, ruling c04f463a Q3): an intent-LEVEL reason is refused (the kind is on each id), and so is a kinds list not aligned with the ids", () => {
+    const { logPath } = prep(path.join(ROOT, "c3-intent-reason"));
+    const g = good();
+    expect(() => append(logPath, { ...g, intent: { ...g.intent, reason: "new_mail" } } as never)).toThrow(/an intent has exactly/);
+    expect(() => append(logPath, { ...g, covers: { ...g.covers, kinds: [] } } as never)).toThrow(/one entry per message id/);
+    expect(() => append(logPath, { ...g, intent: { ...g.intent, during_escalation: "yes" } } as never)).toThrow(/during_escalation is not a boolean/);
     expect(fs.readFileSync(logPath, "utf-8")).toBe("");
   });
   it("HARM (C3): an EXTRA field (in the intent, in covers, or on the record) is refused", () => {
@@ -161,7 +170,7 @@ describe("the log: a CLOSED schema (C3), content-free", () => {
 
 describe("rung memory and WAL recovery", () => {
   const line = (rs: string, idsList: string[]) =>
-    JSON.stringify({ v: 1, type: "intent", at: "2026-10-02T04:00:00.000Z", mono_ms: 0, intent: { intent_id: ids(), agent_name: "alice", binding_id: "b", reason: "new_mail" }, covers: { reading_session: rs, message_ids: idsList } });
+    JSON.stringify({ v: 1, type: "intent", at: "2026-10-02T04:00:00.000Z", mono_ms: 0, intent: { intent_id: ids(), agent_name: "alice", binding_id: "b", during_escalation: false }, covers: { reading_session: rs, message_ids: idsList, kinds: idsList.map(() => "new") } });
   it("memory is keyed (reading session, id): the same id under two sessions is two keys", () => {
     const dir = path.join(ROOT, "mem");
     const { logPath } = prep(dir);

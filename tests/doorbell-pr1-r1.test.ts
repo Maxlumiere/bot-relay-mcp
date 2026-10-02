@@ -27,8 +27,8 @@ const intent = (ids: string[]) => ({
   type: "intent" as const,
   at: "2026-10-02T05:00:00.000Z",
   mono_ms: 0,
-  intent: { intent_id: "00000000-0000-4000-8000-000000000001", agent_name: "alice", binding_id: "b", reason: "new_mail" as const },
-  covers: { reading_session: RS, message_ids: ids },
+  intent: { intent_id: "00000000-0000-4000-8000-000000000001", agent_name: "alice", binding_id: "b", during_escalation: false },
+  covers: { reading_session: RS, message_ids: ids, kinds: ids.map(() => "new" as const) },
 });
 const BUILD = { build_id: "c".repeat(64), commit: "abcdef1", dirty: false, built_at: "2026-10-01T10:00:00.000Z", deps_id: "d".repeat(64), deps_state: "known", node: "v22.0.0" };
 const RES = { kind: "explicit-db", db_path: "/x/relay.db", exists: true, containment: "strict", basis: "RELAY_DB_PATH" };
@@ -153,6 +153,7 @@ describe("#8: message_ids is a canonical set", () => {
       budgetExhausted: new Set(),
       windowMs: C.DEFAULT_WINDOW_MS,
       budgetPerHour: C.DEFAULT_BUDGET_PER_HOUR,
+      horizonMs: C.DEFAULT_HORIZON_MS,
       newIntentId: () => "00000000-0000-4000-8000-000000000009",
       now: () => "2026-10-02T05:00:00.000Z",
     });

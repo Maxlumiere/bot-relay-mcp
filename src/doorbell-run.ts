@@ -11,8 +11,11 @@
  * heartbeat line that judges its build (invariant I1, src/entrypoints.ts).
  *
  * What it does, every cycle: read F1's canonical pending set for each local candidate
- * and WRITE-AHEAD an intent per agent with new mail (src/doorbell-core.ts). There is no
- * driver yet, so nothing is rung: the intents only land in the log.
+ * and WRITE-AHEAD an intent per agent with new mail (src/doorbell-core.ts). PR 3: it also
+ * judges each ring against that same read (effective, ineffective at the horizon, or moot
+ * after a session change), re-rings what is still pending under the per-key cap, and opens
+ * and closes escalations, all in this log (V1: never a relay message). There is no driver
+ * yet, so nothing is rung: the intents only land in the log.
  *
  *   - V1, as restated by ruling 8c83e4ce: NO LOGICAL WRITE to the relay DB, and the main
  *     file and -wal are never written by the doorbell (-shm reader coordination is
@@ -44,8 +47,9 @@ import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { getOwnHostId } from "./liveness.js";
 import { performance } from "perf_hooks";
-import { effectiveRingMono, ringCountsAtStart, DEFAULT_BUDGET_PER_HOUR, DEFAULT_WINDOW_MS, MAX_WINDOW_MS, MIN_WINDOW_MS, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
-import { appendRecord, closeLog, compactLog, LogWriteError, openLog, rungKey, stateDirFor, type IntentRecord, type LogHandle, type LogIo, type LogState } from "./doorbell-log.js";
+import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
+import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
+import { AGENT_NAME_PATTERN } from "./types.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
 /** D-2: the log's size cap, checked EVERY cycle. Over it: no ring, LOG-FULL, loud (a restart compacts). */
@@ -58,6 +62,9 @@ interface Args {
   intervalMs: number;
   windowMs: number;
   budgetPerHour: number;
+  horizonMs: number;
+  /** V3: the operator agent named on escalation records (attribution only); null = none. */
+  operator: string | null;
 }
 
 function usage(out: NodeJS.WriteStream): void {
@@ -67,12 +74,14 @@ function usage(out: NodeJS.WriteStream): void {
       `  --once           run one cycle and exit\n` +
       `  --interval-ms N  cycle period, ${MIN_INTERVAL_MS}..${MAX_INTERVAL_MS} (default ${DEFAULT_INTERVAL_MS})\n` +
       `  --window-s N     per-agent coalescing window, seconds (default ${DEFAULT_WINDOW_MS / 1000}; bounds enforced)\n` +
-      `  --budget-per-hour N  per-agent ring budget (default ${DEFAULT_BUDGET_PER_HOUR}; bounds enforced)\n`,
+      `  --budget-per-hour N  per-agent ring budget (default ${DEFAULT_BUDGET_PER_HOUR}; bounds enforced)\n` +
+      `  --horizon-s N    effectiveness horizon, seconds, ${MIN_HORIZON_MS / 1000}..${MAX_HORIZON_MS / 1000} and at least the window (default ${DEFAULT_HORIZON_MS / 1000})\n` +
+      `  --operator NAME  the operator agent named on escalations (attribution only; default none)\n`,
   );
 }
 
 function parseArgs(argv: string[]): Args | { error: string } | "help" {
-  const a: Args = { once: false, intervalMs: DEFAULT_INTERVAL_MS, windowMs: DEFAULT_WINDOW_MS, budgetPerHour: DEFAULT_BUDGET_PER_HOUR };
+  const a: Args = { once: false, intervalMs: DEFAULT_INTERVAL_MS, windowMs: DEFAULT_WINDOW_MS, budgetPerHour: DEFAULT_BUDGET_PER_HOUR, horizonMs: DEFAULT_HORIZON_MS, operator: null };
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     if (t === "--help" || t === "-h") return "help";
@@ -94,6 +103,17 @@ function parseArgs(argv: string[]): Args | { error: string } | "help" {
       const v = Number(argv[++i]);
       if (!Number.isFinite(v)) return { error: "--budget-per-hour needs a number" };
       a.budgetPerHour = v;
+    } else if (t === "--horizon-s") {
+      // An INTEGER number of seconds, checked BEFORE scaling, like --window-s.
+      const v = Number(argv[++i]);
+      if (!Number.isInteger(v) || v < MIN_HORIZON_MS / 1000 || v > MAX_HORIZON_MS / 1000) {
+        return { error: `--horizon-s must be an integer number of seconds in ${MIN_HORIZON_MS / 1000}..${MAX_HORIZON_MS / 1000}` };
+      }
+      a.horizonMs = v * 1000;
+    } else if (t === "--operator") {
+      const v = argv[++i];
+      if (typeof v !== "string" || !AGENT_NAME_PATTERN.test(v)) return { error: "--operator needs a valid agent name" };
+      a.operator = v;
     } else return { error: `unknown argument ${JSON.stringify(t)}` };
   }
   const fault = tunablesFault(a);
@@ -147,6 +167,16 @@ export interface DoorbellOptions {
 export const CLOCK_JUMP_MS = 5000;
 
 const realClock = { wallMs: () => Date.now(), monoMs: () => performance.now() };
+
+/**
+ * THE one read of an agent's pending set (A2.2, V4): the ids AND the reading session come from
+ * ONE pendingMetadata call, so they are one snapshot, and the session is never re-derived. The
+ * trigger (planCycle), compaction's keep rule and effectiveness (ringEffect) all read through it.
+ */
+export function pendingReadOf(dbm: Pick<typeof import("./db.js"), "pendingMetadata">, handle: import("./sqlite-compat.js").CompatDatabase, agentName: string): PendingRead {
+  const m = dbm.pendingMetadata(handle, agentName);
+  return { registered: m.registered, reading_session: m.reading_session, ids: m.messages.map((x) => x.id) };
+}
 const iso = (ms: number): string => new Date(ms).toISOString();
 
 
@@ -185,8 +215,18 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
   // lifetime's monotonic clock ONCE, here, before our header and before any compaction.
   const lastHeaderWallAtStart = state.lastHeaderWall;
   const ringMono = effectiveRingMono(state.ringWalls, lastHeaderWallAtStart, startWall);
+  // PR 3: every intent on this lifetime's monotonic clock, by the SAME placement (placeRing):
+  // a previous lifetime's at minus its wall age, or "now" when that age is implausible (the
+  // horizon restarts from now: fewer rings, later escalation, the fail-safe direction).
+  const intentMono = new Map<string, number>();
+  for (const r of state.records) if (r.type === "intent") intentMono.set(r.intent.intent_id, placeRing(Date.parse(r.at), lastHeaderWallAtStart, startWall));
+  /** THE write path: durable first (write-ahead), then the ONE reducer moves the state. */
+  const write = (rec: LogRecord): void => {
+    appendRecord(log, rec);
+    foldRecord(state, rec);
+  };
   try {
-    appendRecord(log, {
+    write({
       v: 1,
       type: "header",
       at: iso(startWall),
@@ -201,7 +241,8 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
   }
 
   const { openPendingDb } = await import("./cli/pending.js");
-  const { pendingMetadata, pendingSchemaGap, listAgentBindings } = await import("./db.js");
+  const dbm = await import("./db.js");
+  const { pendingSchemaGap, listAgentBindings } = dbm;
   let db: import("./sqlite-compat.js").CompatDatabase | null = null;
 
   /** Open the DB only with both sidecars present and unchanged across the open; else why not. */
@@ -240,35 +281,23 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
    * STILL in that agent's pending set, read for every agent in ONE snapshot: a message
    * that left pending for a session never re-enters it, and a re-pend to a new session
    * is a new key (V4), so a dropped key can never be needed again. The last few headers
-   * are kept. (Open escalations join the keep rule when they exist, PR 3.)
+   * are kept. PR 3 (D-2 (b)): every OPEN escalation, every ring not judged yet, and the
+   * effect records the counter and the progress detector still need (selectLedgerKeep).
    */
   const compactOnStart = (handle: import("./sqlite-compat.js").CompatDatabase): void => {
     const pendingNow = new Map<string, { rs: string | null; ids: Set<string> }>();
     handle.transaction(() => {
       for (const r of state.records) {
         if (r.type !== "intent" || pendingNow.has(r.intent.agent_name)) continue;
-        const m = pendingMetadata(handle, r.intent.agent_name);
-        pendingNow.set(r.intent.agent_name, { rs: m.reading_session, ids: new Set(m.messages.map((x) => x.id)) });
+        const m = pendingReadOf(dbm, handle, r.intent.agent_name);
+        pendingNow.set(r.intent.agent_name, { rs: m.reading_session, ids: new Set(m.ids) });
       }
     })();
-    // Ruling 622689ba (3): each agent's LAST N intents (N = the budget) are kept REGARDLESS of
-    // wall age, as EVIDENCE (plausibility and audit): a wall jump can never erase them. They
-    // are not automatically counted: counting is effectiveRingMono's rule.
-    const lastN = new Set<string>();
-    const byAgent = new Map<string, IntentRecord[]>();
-    for (const r of state.records) if (r.type === "intent") byAgent.set(r.intent.agent_name, [...(byAgent.get(r.intent.agent_name) ?? []), r]);
-    for (const list of byAgent.values()) for (const r of list.slice(-args.budgetPerHour)) lastN.add(r.intent.intent_id);
-    // #301 Codex R2 #1: the UNION. (a) every intent still BUDGET-RELEVANT, by the SAME
-    // placement the start-up counter used (ringCountsAtStart), so a smaller budget at one
-    // start can never erase rings a larger budget at the next start must count; (b) the last
-    // N as evidence; (c) the still-pending ones.
-    const keep = (rec: IntentRecord): boolean => {
-      if (ringCountsAtStart(Date.parse(rec.at), lastHeaderWallAtStart, startWall)) return true;
-      if (lastN.has(rec.intent.intent_id)) return true;
-      const p = pendingNow.get(rec.intent.agent_name);
-      return !!p && p.rs === rec.covers.reading_session && rec.covers.message_ids.some((id) => p.ids.has(id));
-    };
-    const c = compactLog(log, keep);
+    // THE keep rule (intentKeepRule): budget-relevant by the ONE placement; the last N as
+    // evidence (ruling 622689ba (3)); still outstanding; still pending; or left while the job
+    // was down and not recorded yet (PR 3). Effects and escalations: selectLedgerKeep.
+    const keep = intentKeepRule(state.records, pendingNow, { lastHeaderWall: lastHeaderWallAtStart, startWall, budgetPerHour: args.budgetPerHour });
+    const c = compactLog(log, keep, (records, kept) => selectLedgerKeep(records, kept, (agent) => pendingNow.get(agent)?.rs));
     log = c.handle;
     state = c.state;
     if (c.afterBytes < c.beforeBytes) process.stderr.write(`doorbell: compacted the log, ${c.beforeBytes} → ${c.afterBytes} bytes\n`);
@@ -295,7 +324,7 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
     const wallDelta = nowWall - lastWall;
     const monoDelta = nowMono - lastMono;
     if (Math.abs(wallDelta - monoDelta) > CLOCK_JUMP_MS) {
-      appendRecord(log, { v: 1, type: "clock", at: iso(nowWall), mono_ms: Math.round(nowMono), wall_delta_ms: Math.round(wallDelta), mono_delta_ms: Math.round(monoDelta) });
+      write({ v: 1, type: "clock", at: iso(nowWall), mono_ms: Math.round(nowMono), wall_delta_ms: Math.round(wallDelta), mono_delta_ms: Math.round(monoDelta) });
       process.stderr.write(`doorbell: the wall clock jumped ${Math.round((wallDelta - monoDelta) / 1000)} s against the monotonic clock (recorded; timing is monotonic)\n`);
     }
     lastWall = nowWall;
@@ -303,32 +332,38 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
     const plan = planCycle({
       bindings: listAgentBindings(handle),
       ownHostId: getOwnHostId(),
-      pending: (name): PendingRead => {
-        const m = pendingMetadata(handle, name);
-        return { registered: m.registered, reading_session: m.reading_session, ids: m.messages.map((x) => x.id) };
-      },
+      pending: (name) => pendingReadOf(dbm, handle, name),
       rung: state.rung,
       ringMono,
       nowMono,
       budgetExhausted: state.budgetExhausted,
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,
+      horizonMs: args.horizonMs,
+      operator: args.operator,
+      // PR 3: each agent's history, and the agents still owed a judgement, bound or not.
+      ledger: ledgerInput(state.records, (rec) => {
+        const m = intentMono.get(rec.intent.intent_id);
+        if (m === undefined) throw new Error(`intent ${rec.intent.intent_id} has no place on this lifetime's clock`);
+        return m;
+      }),
       newIntentId: () => randomUUID(),
       now: () => iso(nowWall),
     });
-    for (const rec of plan.budget) {
-      appendRecord(log, rec); // A3.2: once per state change, durable before the state moves
-      if (rec.state === "exhausted") state.budgetExhausted.add(rec.agent_name);
-      else state.budgetExhausted.delete(rec.agent_name);
-      // Q4: surface it loudly (the board and the status verb read it from the log later).
-      process.stderr.write(
-        `doorbell: ring budget ${rec.state} for ${rec.agent_name} (${rec.rings_in_hour} rings in the last hour, budget ${rec.budget_per_hour})\n`,
-      );
-    }
-    for (const rec of plan.intents) {
-      appendRecord(log, rec); // write-ahead: complete and durable before it counts as rung
-      for (const id of rec.covers.message_ids) state.rung.add(rungKey(rec.covers.reading_session, id));
-      ringMono.set(rec.intent.agent_name, [...(ringMono.get(rec.intent.agent_name) ?? []), rec.mono_ms]);
+    // In the planner's order: durable first (write-ahead), then the state moves (A3.2: each
+    // record is a state change, written once).
+    for (const rec of plan.records) {
+      write(rec);
+      if (rec.type === "budget") {
+        // Q4: surface it loudly (the board and the status verb read it from the log later).
+        process.stderr.write(`doorbell: ring budget ${rec.state} for ${rec.agent_name} (${rec.rings_in_hour} rings in the last hour, budget ${rec.budget_per_hour})\n`);
+      } else if (rec.type === "escalation") {
+        // V1: the board and this log only; stderr is the job's own log. Never a relay message.
+        process.stderr.write(`doorbell: escalation ${rec.state} (${rec.reason}) for ${rec.agent_name}${rec.close_reason ? `: ${rec.close_reason}` : ""}\n`);
+      } else if (rec.type === "intent") {
+        ringMono.set(rec.intent.agent_name, [...(ringMono.get(rec.intent.agent_name) ?? []), rec.mono_ms]);
+        intentMono.set(rec.intent.intent_id, rec.mono_ms);
+      }
     }
   };
 
