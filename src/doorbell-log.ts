@@ -454,6 +454,8 @@ export function readRungMemory(logPath: string): { rung: Set<string>; tornTail: 
 const COMPACT_PREFIX = ".actuation.jsonl.compact-";
 /** Headers kept by a compaction: the most recent ones (provenance of recent runs). */
 export const COMPACT_KEEP_HEADERS = 5;
+/** Clock records kept by a compaction (#301 Codex R2 #2): the most recent, for audit; never unbounded. */
+export const COMPACT_KEEP_CLOCKS = 16;
 
 /**
  * Rewrite the log keeping only what still matters, CRASH-SAFE: the kept records go to a
@@ -482,8 +484,17 @@ export function compactLog(
   // The budget STATE is the last budget record per agent: earlier ones are history.
   const lastBudget = new Map<string, LogRecord>();
   for (const r of current.records) if (r.type === "budget") lastBudget.set(r.agent_name, r);
+  const clocks = new Set(current.records.filter((r) => r.type === "clock").slice(-COMPACT_KEEP_CLOCKS));
   const kept = current.records.filter((r) =>
-    r.type === "header" ? headers.includes(r) : r.type === "intent" ? keepIntent(r) : r.type === "budget" ? lastBudget.get(r.agent_name) === r : true,
+    r.type === "header"
+      ? headers.includes(r)
+      : r.type === "intent"
+        ? keepIntent(r)
+        : r.type === "budget"
+          ? lastBudget.get(r.agent_name) === r
+          : r.type === "clock"
+            ? clocks.has(r)
+            : true,
   );
   const tmp = path.join(stateDir, `${COMPACT_PREFIX}${process.pid}`);
   // #300 R2 #1 + #2: from here on, anything that does not complete is a LogWriteError, and

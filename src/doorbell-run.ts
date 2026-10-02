@@ -44,7 +44,7 @@ import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { getOwnHostId } from "./liveness.js";
 import { performance } from "perf_hooks";
-import { effectiveRingMono, DEFAULT_BUDGET_PER_HOUR, DEFAULT_WINDOW_MS, MAX_WINDOW_MS, MIN_WINDOW_MS, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
+import { effectiveRingMono, ringCountsAtStart, DEFAULT_BUDGET_PER_HOUR, DEFAULT_WINDOW_MS, MAX_WINDOW_MS, MIN_WINDOW_MS, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, LogWriteError, openLog, rungKey, stateDirFor, type IntentRecord, type LogHandle, type LogIo, type LogState } from "./doorbell-log.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
@@ -183,7 +183,8 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
   const startMono = clock.monoMs();
   // Ruling 622689ba (2): every ring in the log is a PREVIOUS lifetime's; place it on this
   // lifetime's monotonic clock ONCE, here, before our header and before any compaction.
-  const ringMono = effectiveRingMono(state.ringWalls, state.lastHeaderWall, startWall);
+  const lastHeaderWallAtStart = state.lastHeaderWall;
+  const ringMono = effectiveRingMono(state.ringWalls, lastHeaderWallAtStart, startWall);
   try {
     appendRecord(log, {
       v: 1,
@@ -257,7 +258,12 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
     const byAgent = new Map<string, IntentRecord[]>();
     for (const r of state.records) if (r.type === "intent") byAgent.set(r.intent.agent_name, [...(byAgent.get(r.intent.agent_name) ?? []), r]);
     for (const list of byAgent.values()) for (const r of list.slice(-args.budgetPerHour)) lastN.add(r.intent.intent_id);
+    // #301 Codex R2 #1: the UNION. (a) every intent still BUDGET-RELEVANT, by the SAME
+    // placement the start-up counter used (ringCountsAtStart), so a smaller budget at one
+    // start can never erase rings a larger budget at the next start must count; (b) the last
+    // N as evidence; (c) the still-pending ones.
     const keep = (rec: IntentRecord): boolean => {
+      if (ringCountsAtStart(Date.parse(rec.at), lastHeaderWallAtStart, startWall)) return true;
       if (lastN.has(rec.intent.intent_id)) return true;
       const p = pendingNow.get(rec.intent.agent_name);
       return !!p && p.rs === rec.covers.reading_session && rec.covers.message_ids.some((id) => p.ids.has(id));

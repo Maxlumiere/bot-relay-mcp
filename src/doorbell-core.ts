@@ -184,16 +184,23 @@ export function effectiveRingMono(
   lastHeaderWall: number | null,
   startWall: number,
 ): Map<string, number[]> {
-  const backward = lastHeaderWall !== null && lastHeaderWall > startWall;
   const out = new Map<string, number[]>();
-  for (const [agent, walls] of ringWalls) {
-    out.set(
-      agent,
-      walls.map((w) => {
-        const age = startWall - w;
-        return backward || age < 0 ? 0 : -age;
-      }),
-    );
-  }
+  for (const [agent, walls] of ringWalls) out.set(agent, walls.map((w) => placeRing(w, lastHeaderWall, startWall)));
   return out;
+}
+
+/**
+ * THE placement (rule 2), the ONE function the start-up counter AND compaction use, so they
+ * can never disagree (#301 Codex R2 #1): a previous lifetime's ring at minus its wall age,
+ * or at 0 ("just now", fail safe) when that age is implausible (negative, or the log's last
+ * header is ahead of now).
+ */
+export function placeRing(wall: number, lastHeaderWall: number | null, startWall: number): number {
+  const age = startWall - wall;
+  return (lastHeaderWall !== null && lastHeaderWall > startWall) || age < 0 ? 0 : -age;
+}
+
+/** Does a previous lifetime's ring still count toward the budget at this start? (placeRing, inside the window) */
+export function ringCountsAtStart(wall: number, lastHeaderWall: number | null, startWall: number): boolean {
+  return placeRing(wall, lastHeaderWall, startWall) > -BUDGET_WINDOW_MS;
 }

@@ -176,6 +176,50 @@ describe.skipIf(!HOST)("rule 2's header test, isolated", () => {
   }, 60_000);
 });
 
+describe.skipIf(!HOST)("#301 Codex R2: compaction keeps the UNION (budget-relevant + last N + pending), and clock records are bounded", () => {
+  it("R2 #1 (MEASURED): 6 rings, mail resolved, a restart with budget 1 (compaction), then budget 6 within the hour → NO 7th", async () => {
+    for (let i = 0; i < 6; i++) {
+      send();
+      expect((await lifetime(T + i * 11_000)).code).toBe(0);
+    }
+    resolveAll();
+    expect((await lifetime(T + 70_000, ["--budget-per-hour", "1"])).code).toBe(0); // its compaction must keep all six: they are budget-relevant
+    expect(intents()).toHaveLength(6);
+    send();
+    expect((await lifetime(T + 80_000)).code).toBe(0); // budget back to 6, still inside the hour: refused
+    expect(intents()).toHaveLength(6);
+  }, 60_000);
+
+  it("R2 #2 (MEASURED): 200,000 clock records (over the cap) are bounded by the start's compaction, so the job rings instead of LOG-FULL", async () => {
+    fs.mkdirSync(path.dirname(LOGP), { recursive: true, mode: 0o700 });
+    const line = (i: number) => JSON.stringify({ v: 1, type: "clock", at: "2026-10-02T07:00:00.000Z", mono_ms: i, wall_delta_ms: 3_600_000, mono_delta_ms: 1000 });
+    const chunks: string[] = [];
+    for (let i = 0; i < 200_000; i++) chunks.push(line(i));
+    fs.writeFileSync(LOGP, chunks.join("\n") + "\n", { mode: 0o600 });
+    expect(fs.statSync(LOGP).size).toBeGreaterThan(16 * 1024 * 1024); // precondition: over the cap
+    send();
+    const r = await lifetime(T);
+    expect([r.code, r.stderr]).toEqual([0, expect.not.stringMatching(/LOG-FULL/)]);
+    expect(intents()).toHaveLength(1);
+    expect(recs().filter((x) => x.type === "clock")).toHaveLength(L.COMPACT_KEEP_CLOCKS);
+    expect(fs.statSync(LOGP).size).toBeLessThan(64 * 1024);
+  }, 120_000);
+});
+
+describe("the ONE placement: the start-up counter and compaction agree", () => {
+  it("ringCountsAtStart is exactly 'placed inside the budget window' (shared, never re-derived)", () => {
+    for (const [wall, header, expectCounts] of [
+      [T - 10_000, null, true],
+      [T - 2 * H, null, false],
+      [T + 5000, null, true], // negative age: implausible → counts
+      [T - 2 * H, T + H, true], // a header ahead: backward jump → counts
+    ] as Array<[number, number | null, boolean]>) {
+      expect(C.ringCountsAtStart(wall, header, T)).toBe(expectCounts);
+      expect(C.placeRing(wall, header, T) > -3_600_000).toBe(expectCounts);
+    }
+  });
+});
+
 describe("rule 4: the clock record is closed and bounded", () => {
   it("a valid clock record passes; an extra key or an unbounded field is refused", () => {
     const good = { v: 1, type: "clock", at: "2026-10-02T08:00:00.000Z", mono_ms: 1000, wall_delta_ms: -3_600_000, mono_delta_ms: 1000 };
