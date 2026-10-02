@@ -222,7 +222,7 @@ export function moduleRootFromUrl(moduleUrl: string): string {
 
 /** Resolve the install root (repo dir) + the two abs paths the operator's
  *  Claude config needs to point at. */
-function installPaths(rootOverride?: string): { root: string; distEntry: string; hookScript: string } {
+export function installPaths(rootOverride?: string): { root: string; distEntry: string; hookScript: string } {
   // rootOverride is a TEST seam for the atomicity controls. It is NOT reachable
   // from the CLI (bin/relay calls `run(rest)` with no second argument, and nothing
   // in argv/env/config sets it), and it structurally CANNOT bypass the preflight —
