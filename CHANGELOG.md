@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added — the pending read says which reading session it answered for
+
+The in-process pending read (`pendingMetadata`, the one behind `relay pending`) now also returns `reading_session`: an opaque digest of the exact session key its pending predicate used, or `null` when the agent has no bound session. A consumer that must remember "this message, for this session" takes the key from the same read as the message ids, instead of defining the session a second time. A re-registration gives a new digest. Two agents with no session never share one. The raw session id is never exposed. `relay pending --json` is unchanged.
+
+Tests: `tests/doorbell-pr0b-reading-session.test.ts`. The digest matches the key a real drain wrote. An unbound or empty session reads `null`. A new session changes the digest and re-pends the old session's reads.
+
 ### Added — `relay fleet --deploy-check`: is this deploy finished?
 
 `relay fleet --deploy-check` exits 0 only when every relay connector on this machine (whether or not a window binding names it), every live bound window and the daemon run the installed build, checked twice in a row. It exits 1 naming every window or connector still on the old build (restart it), and 3 when the machine changed between the two checks or could not be read (run it again). A deploy is complete when it exits 0.

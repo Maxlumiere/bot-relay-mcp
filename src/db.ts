@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import { createHash } from "crypto";
 // ESM-safe synchronous require for the native driver. The package is
 // "type":"module", so a bare `require(...)` is undefined at runtime — importing
 // createRequire from "module" is the supported way to do a sync require in ESM.
@@ -6508,6 +6509,13 @@ export interface PendingMeta {
   registered: boolean;
   /** False when agents.session_id is NULL: the pending set is then every unresolved message. */
   session_bound: boolean;
+  /**
+   * Doorbell PR 0b (V4; ruling ab740fe3 Q1): the READING SESSION this answer was
+   * computed for, as readingSessionDigest() of the EXACT key the pending predicate
+   * used; null when unbound. A consumer keyed on (id, reading session) takes it from
+   * HERE, the same snapshot as `messages`, and never re-reads agents.session_id.
+   */
+  reading_session: string | null;
   count: number;
   top_priority: string | null;
   messages: PendingMessageMeta[];
@@ -6575,10 +6583,23 @@ export function pendingMetadata(
   return {
     registered: !!agentRow,
     session_bound: !!currentSession,
+    // The digest of the key the predicate ACTUALLY used, never of its `?? ""`
+    // fallback: an unbound session (NULL or "") is null, so no two unbound agents
+    // ever share a reading session.
+    reading_session: currentSession ? readingSessionDigest(currentSession) : null,
     count: messages.length,
     top_priority: messages[0]?.priority ?? null,
     messages,
   };
+}
+
+/**
+ * Doorbell PR 0b — the opaque form of a reading-session key: a domain-separated
+ * SHA-256 (64 hex). Equality is all rung memory needs, so the raw session id never
+ * leaves this module. Exported so a test can pin the digest to the key a drain wrote.
+ */
+export function readingSessionDigest(sessionKey: string): string {
+  return createHash("sha256").update("bot-relay/reading-session/v1\u0000").update(sessionKey).digest("hex");
 }
 
 /**
