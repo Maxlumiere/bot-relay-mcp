@@ -205,14 +205,32 @@ describe("PR 3: the escalation's lifecycle", () => {
     for (let k = 1; k < 5; k++) h.step(k * H, { alice: read(["m1"], RS2) });
     expect(h.all("effect").filter((e) => e.reading_session === RS1).map((e) => e.outcome)).toEqual(["session_changed"]);
   });
-  it("HARM: the binding disappearing does NOT close it; the agent is still judged, and a drain then closes it (no ring without a binding)", () => {
+  it("HARM (B1, review 2fda069b): the window CLOSES (binding gone AND session NULL, as production does it) → a HOLD: still open, rings unjudged, nothing written; a NEW session then closes it session_changed and rescues", () => {
+    const h = escalated();
+    const extra = h.step(3 * H + 20_000, { alice: read(["m1", "m9"]) }).intents[0].intent.intent_id; // outstanding
+    h.setBindings([]);
+    for (let k = 4; k < 12; k++) expect(h.step(k * H, { alice: read(["m1", "m9"], null) }).records, `t=${k}H`).toEqual([]);
+    expect(h.openEsc()).toHaveLength(1);
+    expect(h.all("effect").some((e) => e.intent_ids.includes(extra))).toBe(false); // well past its horizon, still unjudged
+    h.setBindings([bind("alice")]); // a new window, a new session
+    const p = h.step(12 * H, { alice: read(["m1", "m9"], RS2) });
+    expect(p.escalations.map((e) => [e.state, e.close_reason, e.reading_session])).toEqual([["closed", "session_changed", RS1]]);
+    expect(p.effects.map((e) => [e.outcome, e.intent_ids])).toEqual([["session_changed", [extra]]]);
+    expect(p.intents.map((r) => [r.covers.reading_session, r.covers.message_ids, r.covers.kinds, r.intent.during_escalation])).toEqual([[RS2, ["m1", "m9"], ["new", "new"], false]]);
+  });
+  it("twin: a binding gone while the SAME session stays bound (not a production state, kept as the mechanism pin) → still judged, and a drain closes it on progress", () => {
     const h = escalated();
     h.setBindings([]);
     for (let k = 4; k < 8; k++) expect(h.step(k * H, { alice: read(["m1"]) }).records).toEqual([]);
-    expect(h.openEsc()).toHaveLength(1);
     const p = h.step(8 * H, { alice: read([]) });
     expect(p.escalations.map((e) => [e.state, e.close_reason])).toEqual([["closed", "progress"]]);
     expect(p.intents).toEqual([]);
+  });
+  it("HARM (B1): an unbound session is never judged at its horizon, and never swept to session_changed, however long it lasts", () => {
+    const h = harness();
+    h.step(0, { alice: read(["m1"]) });
+    for (let k = 1; k < 30; k++) expect(h.step(k * H, { alice: read(["m1"], null) }).records).toEqual([]);
+    expect(h.all("effect")).toEqual([]);
   });
 });
 
@@ -240,6 +258,21 @@ describe("PR 3: a refused ring is not a ring (ruling c04f463a)", () => {
     expect(h.all("escalation")).toEqual([]);
     h.step(60 * H + 1, { alice: read(["m1"]) }); // the hour has slid
     expect(h.kindsOf("m1")).toEqual(["new", "still_pending"]);
+  });
+});
+
+describe("PR 3: a W-held re-ring is not a ring either (D1)", () => {
+  it("twin: a re-ring due while W holds (new mail rang just before) writes nothing, ticks nothing, and rides the NEXT ring once W passes", () => {
+    const h = harness();
+    h.step(0, { alice: read(["m1"]) });
+    h.step(H - 5_000, { alice: read(["m1", "m2"]) }); // m2 rings: W now holds alice until H + 5 s
+    const held = h.step(H, { alice: read(["m1", "m2"]) }); // m1's ring judged ineffective; its re-ring is HELD by W
+    expect(held.intents).toEqual([]);
+    expect(held.skipped.map((x) => x.why)).toEqual([expect.stringMatching(/^coalescing/)]);
+    expect(h.kindsOf("m1")).toEqual(["new"]); // no per-id tick for the held re-ring
+    expect(h.all("effect").map((e) => e.outcome)).toEqual(["ineffective"]); // only the ring that was MADE is judged
+    const after = h.step(H + 5_000, { alice: read(["m1", "m2"]) });
+    expect(after.intents.map((r) => [r.covers.message_ids, r.covers.kinds])).toEqual([[["m1"], ["still_pending"]]]);
   });
 });
 

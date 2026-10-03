@@ -65,7 +65,9 @@ const judge = (covers: { reading_session: string; message_ids: string[] }) => {
     ledger: C.ledgerInput([ring], () => 0), newIntentId: randomUUID, now: () => "2026-10-02T08:00:01.000Z",
   });
   const e = p.effects[0];
-  const planned = !e ? { outcome: "still_pending" } : e.outcome === "effective" ? { outcome: "effective", left: e.left } : { outcome: e.outcome };
+  // B1: unbound is a HOLD: the planner writes NOTHING at all (no effect, no close).
+  if (read().reading_session === null) expect(p.records).toEqual([]);
+  const planned = !e ? { outcome: read().reading_session === null ? "unbound" : "still_pending" } : e.outcome === "effective" ? { outcome: "effective", left: e.left } : { outcome: e.outcome };
   expect(planned).toEqual(pure);
   return planned;
 };
@@ -130,13 +132,13 @@ describe("PR 3: effectiveness on a real DB (V4)", () => {
     expect(judge(covers)).toEqual({ outcome: "session_changed" });
   });
 
-  it("HARM (V4): an unbound session now (NULL) → session_changed, never effective", () => {
+  it("HARM (B1, review 2fda069b): an unbound session now (NULL) → `unbound`: NEITHER effective NOR session_changed, and nothing is written", () => {
     setSession("pr3-session-a");
     const m1 = send();
     const covers = ring([m1]);
     setSession(null);
     expect(read().reading_session).toBeNull();
-    expect(judge(covers)).toEqual({ outcome: "session_changed" });
+    expect(judge(covers)).toEqual({ outcome: "unbound" });
   });
 
   it("HARM (A2.2): the rung id drained and a NEW id arrived at an UNCHANGED count → effective (never a count)", () => {

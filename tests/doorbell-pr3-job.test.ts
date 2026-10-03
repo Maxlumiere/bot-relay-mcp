@@ -98,6 +98,30 @@ describe.skipIf(!HOST)("PR 3 job: the counter survives restarts and compactions"
     expect(ofType("escalation")).toHaveLength(1);
   });
 
+  it("D2 (review 2fda069b): the LAST RESET's intent is dropped by a real compaction, yet the counter stays exact: no early escalation", async () => {
+    // Budget 1 (rule (b) keeps only the newest intent) and lifetimes 2 h apart (rule (a)
+    // keeps nothing), so a real start-up compaction reaches the last-reset keep rule.
+    const TWO_H = 7_200_000;
+    const life = (k: number) => lifetime(T + k * TWO_H, ["--budget-per-hour", "1"]);
+    const x = send();
+    const z = send();
+    await life(0); // A {x, z}
+    db.resolveMessages("p3-alice", [z]);
+    await life(1); // progress (z): reset; x re-rung (2)
+    await life(2); // ineffective (1); x re-rung (3)
+    const y = send();
+    await life(3); // ineffective (2); x at the cap → id_stuck; B {y}
+    const B = ofType("intent").find((r) => r.covers.message_ids.includes(y))?.intent.intent_id;
+    db.resolveMessages("p3-alice", [y]);
+    send();
+    await life(4); // progress (y): THE LAST RESET, judging B; C {w}
+    await life(5); // compaction drops B; C is judged ineffective: the counter is 1, not 3
+    expect(ofType("intent").some((r) => r.intent.intent_id === B)).toBe(false); // precondition: B was dropped
+    expect(ofType("effect").filter((e) => e.outcome === "effective").map((e) => e.left)).toContainEqual([y]); // the reset survived
+    expect(ofType("escalation").filter((e) => e.reason === "agent_unresponsive")).toEqual([]);
+    expect(x).not.toBe(y);
+  });
+
   it("twin: the agent drains between restarts → the counter resets (an effective record); no escalation", async () => {
     const m1 = send();
     await lifetime(T);
@@ -108,6 +132,52 @@ describe.skipIf(!HOST)("PR 3 job: the counter survives restarts and compactions"
     for (let k = 3; k < 5; k++) await lifetime(T + k * STEP);
     expect(ofType("effect").map((e) => e.outcome)).toEqual(["ineffective", "effective", "ineffective", "ineffective"]);
     expect(ofType("escalation")).toEqual([]);
+  });
+});
+
+describe.skipIf(!HOST)("PR 3 job: B1 (review 2fda069b): a closed window is a HOLD, never a session change", () => {
+  const sessionOf = () => (db.getDb().prepare("SELECT session_id FROM agents WHERE name = 'p3-alice'").get() as { session_id: string | null }).session_id;
+  /** A new window binding on the SAME anchor, reusing the start token the fixture stored (no second `ps`). */
+  const bindWindow = (conversationId: string, windowPidStart: string) =>
+    db.upsertAgentBinding(db.getDb(), {
+      hostId: HOST as string,
+      windowPid: process.pid,
+      windowPidStart,
+      agentName: "p3-alice",
+      agentClass: null,
+      conversationId,
+      conversationTitle: null,
+      cwd: ROOT,
+      boundVia: "launch-intent",
+    });
+
+  it("HARM: escalate; the window closes (binding gone + markAgentOffline) → the escalation STAYS OPEN and the rings stay UNJUDGED; a new session → closed session_changed + the rescue ring", async () => {
+    send();
+    for (let k = 0; k < 4; k++) await lifetime(T + k * STEP); // escalation open at the 4th start
+    send();
+    await lifetime(T + 4 * STEP); // the one extra ring (new mail), now outstanding
+    const extra = ofType("intent").find((r) => r.intent.during_escalation)?.intent.intent_id;
+    expect(extra).toBeTruthy();
+    // The window closes, as production does it: its binding is gone (fixture: superseded) AND
+    // the relay's own close path NULLs the session (markAgentOffline, the real function).
+    const anchorStart = (db.getDb().prepare("SELECT window_pid_start FROM agent_bindings WHERE agent_name = 'p3-alice' AND superseded_at IS NULL").get() as { window_pid_start: string }).window_pid_start;
+    db.getDb().prepare("UPDATE agent_bindings SET superseded_at = ? WHERE agent_name = 'p3-alice' AND superseded_at IS NULL").run(new Date().toISOString());
+    expect(db.markAgentOffline("p3-alice", sessionOf() as string).changed).toBe(true);
+    expect(sessionOf()).toBeNull(); // precondition: unbound
+    const before = recs().filter((r) => r.type !== "header").length;
+    for (let k = 5; k < 10; k++) expect((await lifetime(T + k * STEP)).code).toBe(0); // well past every horizon
+    expect(recs().filter((r) => r.type !== "header").length).toBe(before); // A3.2: nothing judged, written or closed
+    expect(ofType("escalation").map((e) => e.state)).toEqual(["open"]);
+    expect(ofType("effect").some((e) => e.intent_ids.includes(extra))).toBe(false);
+    // A NEW session in a new window: the V4 rescue.
+    db.registerAgent("p3-alice", "r", []);
+    expect(sessionOf()).toBeTruthy();
+    bindWindow("conv-p3-new", anchorStart);
+    await lifetime(T + 10 * STEP);
+    expect(ofType("escalation").map((e) => [e.state, e.close_reason])).toEqual([["open", null], ["closed", "session_changed"]]);
+    expect(ofType("effect").filter((e) => e.outcome === "session_changed").map((e) => e.intent_ids)).toEqual([[extra]]);
+    const rescue = ofType("intent").at(-1);
+    expect([rescue.intent.during_escalation, rescue.covers.kinds.every((k: string) => k === "new"), rescue.covers.message_ids.length]).toEqual([false, true, 2]);
   });
 });
 
