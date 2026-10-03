@@ -39,8 +39,10 @@
  *       · RE-RING: an id still pending H after its last ring is rung again (kind
  *         `still_pending`), at most RE_RING_CAP (K = 3) rings per (id, session) in all.
  *         At the cap it drops out of re-ring with ONE `id_stuck` escalation.
- *       · A changed reading session is the V4 rescue path, never effectiveness: the old
+ *       · A NEW, NON-NULL reading session is the V4 rescue path, never effectiveness: the old
  *         session's outstanding rings are recorded `session_changed`, its escalations close.
+ *       · NO reading session (a window close NULLs it) is a HOLD (B1): nothing is judged,
+ *         written or closed, and outstanding rings stay outstanding until a session exists.
  *     `operator` (V3) is attribution on escalation records only, never a ring target.
  */
 import type { BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord } from "./doorbell-log.js";
@@ -214,6 +216,11 @@ export function ledgerInput(records: readonly LogRecord[], monoOf: (rec: IntentR
  *   (e) one of its ids LEFT that session's pending set while the job was down and the leaving
  *       is not recorded yet: the first cycle records the progress (else a reset is lost and a
  *       false escalation could follow). The next compaction drops it.
+ *       KNOWN, ACCEPTED (review 2fda069b D3): an agent whose session is unchanged but which
+ *       has no binding (so it is no candidate) and nothing owed (so it is never read) never
+ *       records that progress, and (e) holds its intent indefinitely. It is bounded per agent
+ *       (at most K rings per id, none added while it is not rung) and ends at its next
+ *       re-registration (a new session; a NULLed one is never restored: register mints one).
  * `pendingNow` is every agent's pending read from ONE snapshot.
  */
 export function intentKeepRule(
@@ -335,11 +342,14 @@ export function planCycle(input: CycleInput): CyclePlan {
   const judge = (name: string, read: PendingRead): AgentLedger | null => {
     if (!input.ledger) return null;
     const rs = read.reading_session;
+    // B1 (review 2fda069b): NEVER JUDGE WHERE IT CANNOT BE MEASURED. An unbound session (every
+    // window close NULLs agents.session_id) is a HOLD: write nothing, close nothing, judge
+    // nothing; outstanding rings stay outstanding. Only a NEW NON-NULL session is the rescue.
+    if (!rs) return null;
     const { ledger, other } = deriveLedger(input.ledger.history(name), rs, (r) => input.ledger!.monoOf(r));
     // The V4 rescue path: the old session's rings are moot and its escalations close.
     for (const [ors, ids] of other.outstanding) records.push({ v: 1, type: "effect", at, agent_name: name, reading_session: ors, outcome: "session_changed", intent_ids: sortedSet(ids), left: [] });
     for (const e of other.open) records.push(closeOf(e, "session_changed"));
-    if (!rs) return null;
     const pending = new Set(read.ids);
     const absent = new Set([...ledger.rungIds].filter((id) => !pending.has(id)));
     // PROGRESS first, by THE judgement (ringEffect): a rung id of this session, not yet
@@ -484,16 +494,19 @@ export function planCycle(input: CycleInput): CyclePlan {
  *   - "effective": the reading session is UNCHANGED and at least one rung id has LEFT its
  *     pending set (read by that session, or resolved). `left` lists them, in canonical order.
  *   - "still_pending": the reading session is unchanged and every rung id is still pending.
- *   - "session_changed": the reading session moved (or is unbound now). That is the V4 rescue
- *     path, NEVER effectiveness: an id can be absent from the new session's set only because
- *     the new session read it earlier, which says nothing about this ring.
+ *   - "session_changed": a NEW, NON-NULL reading session. That is the V4 rescue path, NEVER
+ *     effectiveness: an id can be absent from the new session's set only because the new
+ *     session read it earlier, which says nothing about this ring.
+ *   - "unbound": no reading session now (a window close NULLs it). Delivery cannot be measured,
+ *     so it is NEITHER effective NOR a change: a HOLD (B1, review 2fda069b).
  */
-export type RingEffect = { outcome: "effective"; left: string[] } | { outcome: "still_pending" } | { outcome: "session_changed" };
+export type RingEffect = { outcome: "effective"; left: string[] } | { outcome: "still_pending" } | { outcome: "session_changed" } | { outcome: "unbound" };
 
 export function ringEffect(
   covers: { reading_session: string; message_ids: readonly string[] },
   read: { reading_session: string | null; ids: readonly string[] },
 ): RingEffect {
+  if (read.reading_session === null) return { outcome: "unbound" };
   if (read.reading_session !== covers.reading_session) return { outcome: "session_changed" };
   const pending = new Set(read.ids);
   const left = [...new Set(covers.message_ids.filter((id) => !pending.has(id)))].sort();
