@@ -269,21 +269,16 @@ Three consequences, all now standing practice:
 
 Rationales below are established from git history, not reconstructed. "security pin" means the override forces a transitive to a patched version; the retirement check is uniform (see the paragraph after the table). `esbuild` is the one non-security override.
 
-Count: there are **13 override entries** across the two manifests but **12 unique packages** — `hono` is overridden in both `package.json` (root) and `extensions/vscode/package.json`, so it has a single row here (tree = "root + ext"). The guard matches by unique package name, and the table has one row per unique name.
+Count: there are **9 override entries** across the two manifests but **7 unique packages** — `hono` and `fast-uri` are overridden in both `package.json` (root) and `extensions/vscode/package.json`, so each has a single row here (tree = "root + ext"). Retired 2026-10-05 with the `@vscode/vsce` 4.0.0 bump, because their packages left the extension tree entirely (measured: `npm ls` finds none): `js-yaml`, `undici`, `tmp`, `form-data`, `markdown-it`. The guard matches by unique package name, and the table has one row per unique name.
 
 | override | tree | why (git-established) | retires when |
 |---|---|---|---|
-| `js-yaml ^4.3.2` | ext | security: CPU-DoS <4.3.2 (GHSA-2883-xcg3-v3hh, maxTotalMergeKeys; transitive via @vscode/vsce→secretlint) — bumped from the original `^4.3.1` pin (#175, DoS <4.3.1) when the ^4.3.1 lockfile resolution became the silent blocker for this newer advisory | ecosystem resolves ≥4.3.2 without the pin (see check below) |
-| `undici ^7.29.0` | ext | security: GHSA <7.29.0 (via @vscode/vsce→cheerio) — #175 | ecosystem resolves ≥7.29.0 without the pin |
-| `brace-expansion ^5.0.9` | ext | security: DoS 4.0.0–5.0.8 (via @vscode/vsce + glob) — #175 | ecosystem resolves ≥5.0.9 without the pin |
-| `hono ^4.12.34` | root + ext | security: GHSA <4.12.34 (via @modelcontextprotocol/sdk) — #175 | the MCP SDK's range resolves ≥4.12.34 without the pin |
-| `fast-uri 3.1.5` | root | security: host-confusion advisory — value set in #159 (override introduced #108) | ecosystem resolves ≥3.1.5 without the pin |
-| `ip-address ^10.4.0` | root | security: SSRF / trust-boundary advisory — #159 | ecosystem resolves ≥10.4.0 without the pin |
-| `tmp 0.2.7` | ext | security: part of #79's consolidated bump (cleared a critical + highs) | ecosystem resolves the patched version without the pin |
-| `form-data 4.0.6` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
-| `markdown-it 14.2.0` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
+| `brace-expansion ^5.0.12` | ext | security: DoS 4.0.0–5.0.8 (via @vscode/vsce + glob) — #175; value raised since | ecosystem resolves ≥5.0.12 without the pin |
+| `hono ^4.13.7` | root + ext | security: GHSA <4.12.34 (via @modelcontextprotocol/sdk) — #175; raised to ^4.13.7 for GHSA-gqvv-2mrq-wpjv / -g6gw-c38x-mqfc / -crvj-82cr-hjcx / -hxh3-vqpv-xpqv (≤4.13.6) | the MCP SDK's range resolves ≥4.13.7 without the pin |
+| `fast-uri 4.2.1` | root + ext | security: host-confusion advisory — introduced #108, 3.1.5 in #159, 4.1.4 in #253; raised to 4.2.1 for GHSA-hrr3-gc8f-f4qj / GHSA-jvvf-x445-j334 (4.0.0–4.1.4) — the old exact pin had become the vulnerable version | ecosystem resolves ≥4.2.1 without the pin |
+| `ip-address ^10.7.1` | root | security: SSRF / trust-boundary advisory — #159; raised to ^10.7.1 for GHSA-rpw4-54j3-4h4q / -2vr4-cq9g-pvrc / -j6r3-76f7-8jcv / -h3mg-xc3c-68pw (≤10.7.0) | ecosystem resolves ≥10.7.1 without the pin |
 | `vite 7.3.5` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
-| `qs 6.15.2` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
+| `qs 6.16.0` | ext | security: #79 consolidated bump; raised to 6.16.0 for GHSA-x5fp-wj9c-mxmx / GHSA-4mjr-xmp4-gh2g (2.2.5–6.15.3) — the old exact pin had become the vulnerable version | ecosystem resolves ≥6.16.0 without the pin |
 | `esbuild $esbuild` | ext | dedup (NOT security): the `$esbuild` reference forces the extension's esbuild to the parent's version — #79 | a single esbuild version resolves across the tree without the reference |
 
 To check a retirement: delete the override, `npm install --package-lock-only`, `npm audit --audit-level=high` — if clean, the ecosystem has caught up and the override is redundant.
