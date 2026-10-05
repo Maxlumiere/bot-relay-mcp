@@ -11,7 +11,7 @@
 - **Our own pins had become the vulnerable versions.** `fast-uri` was pinned to exactly 4.1.4 (both trees) and `qs` to exactly 6.15.2 (extension), each inside its new advisory's range. Raised to `fast-uri` 4.2.1 and `qs` 6.16.0. `hono` and `ip-address` overrides raised to their fixed ranges (`^4.13.7`, `^10.7.1`).
 - **Five overrides retired.** `js-yaml`, `undici`, `tmp`, `form-data` and `markdown-it` were security pins for packages that vsce 4 no longer pulls in; none of them is in the extension's tree any more. An override that outlives its package only blocks Dependabot, so they are removed (SECURITY.md's override table is updated, and its completeness test passes).
 
-Not in this release: the extension's `vitest` moderate advisory is fixed only in vitest 5 (a major), and zod 4; both are separate changes.
+Not in this release: the extension's `vitest` moderate advisory, fixed in vitest 4.1.11 or 5, both majors from the extension's 3.x; and zod 4. Both are separate changes.
 
 ### Added — the doorbell rings once per burst, within a per-agent hourly budget
 
