@@ -1347,10 +1347,15 @@ fi
 # [RELAY]-shaped lines (at most 7). It draws from this hook's ONE deadline (#286): no time left is a
 # LOUD skip (DEGRADED via relay_budget_skipped); a status call that fails or times out is DEGRADED
 # with its reason; exit 3 (no local relay instance) shows nothing. Never a silent skip.
-# Reached only on the hook's SUCCESS path: a missing node or relay CLI has already failed this
-# hook's instance resolution, loudly (DEGRADED naming it), before this point.
+# Reached only on the hook's SUCCESS path, where a missing node or relay CLI has normally already
+# failed this hook's instance resolution, loudly. Still never silent here (review c927c81c D1):
+# a missing node or CLI raises DEGRADED naming WHICH, without relying on that distant guarantee.
 RELAY_DOORBELL_BIN="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
-if command -v node >/dev/null 2>&1 && [ -f "$RELAY_DOORBELL_BIN" ]; then
+if ! command -v node >/dev/null 2>&1; then
+  relay_verdict_raise "DEGRADED" "doorbell status: node not found" " agent=\"${AGENT_NAME:-}\"" other
+elif [ ! -f "$RELAY_DOORBELL_BIN" ]; then
+  relay_verdict_raise "DEGRADED" "doorbell status: no relay CLI at $RELAY_DOORBELL_BIN" " agent=\"${AGENT_NAME:-}\"" other
+else
   if relay_budget_for "the doorbell status" 3 margin; then
     RELAY_DOORBELL_OUT="$(mktemp 2>/dev/null || printf '')"
     RELAY_DOORBELL_ERR="$(mktemp 2>/dev/null || printf '')"

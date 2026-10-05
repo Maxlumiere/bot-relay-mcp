@@ -259,6 +259,28 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
     expect(r.stdout).toMatch(/\[RELAY\] VERDICT=DEGRADED reason="[^"]*no time budget left for the doorbell status/);
     expect(r.stdout).not.toMatch(/\[RELAY\] doorbell:/); // skipped, not run
   });
+  /** A hooks COPY with `inject` placed right before the doorbell block (the step is reached as normal). */
+  function hookCopyWith(inject: string) {
+    const copy = path.join(home, `inj-${Math.random().toString(36).slice(2)}`);
+    fs.cpSync(path.join(REPO, "hooks"), path.join(copy, "hooks"), { recursive: true });
+    fs.mkdirSync(path.join(copy, "bin"));
+    fs.symlinkSync(path.join(REPO, "bin", "relay"), path.join(copy, "bin", "relay"));
+    const hook = path.join(copy, "hooks", "check-relay.sh");
+    const marker = "# --- Doorbell (ADR-0038 Q3/V2";
+    const src = fs.readFileSync(hook, "utf-8");
+    expect(src.includes(marker)).toBe(true); // precondition
+    fs.writeFileSync(hook, src.replace(marker, `${inject}\n${marker}`));
+    const r = spawnSync("bash", [hook], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
+    return { stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  }
+  it("HARM (c927c81c D1): node missing AT the doorbell step → DEGRADED naming it (never a silent skip)", () => {
+    const r = hookCopyWith('PATH="/nonexistent-dir"');
+    expect(r.stdout).toMatch(/\[RELAY\] VERDICT=DEGRADED reason="[^"]*doorbell status: node not found/);
+  });
+  it("HARM (c927c81c D1): no relay CLI AT the doorbell step → DEGRADED naming the path", () => {
+    const r = hookCopyWith('HOOKS_DIR="/nonexistent-dir/hooks"');
+    expect(r.stdout).toMatch(/\[RELAY\] VERDICT=DEGRADED reason="[^"]*doorbell status: no relay CLI at [^"]*\/bin\/relay/);
+  });
   it("never silent: no relay CLI beside the hook → the hook is DEGRADED naming the missing CLI (before the doorbell step)", () => {
     const copy = path.join(home, "nocli");
     fs.cpSync(path.join(REPO, "hooks"), path.join(copy, "hooks"), { recursive: true });
