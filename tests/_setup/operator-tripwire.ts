@@ -15,15 +15,17 @@
  * whose ~/.bot-relay/active-instance names the live DB) and no port (it defaults to 3777).
  *
  * Closed BY CONSTRUCTION, where the access happens, wherever the port or path came from:
- *   - THIS PROCESS: a private HOME per worker (the operator's ~/.bot-relay is never the
- *     default), and tests/_setup/operator-tripwire-preload.mjs: any TCP connect to a
+ *   - THIS PROCESS: a private HOME per worker, on every platform's spelling (the operator's
+ *     ~/.bot-relay is never the default), and tests/_setup/operator-tripwire-preload.mjs: any TCP connect to a
  *     loopback operator port, and any fs call naming a path under the operator's real relay
  *     root, THROWS.
  *   - EVERY CHILD (the child_process spawn family is wrapped; an env a test built from
  *     scratch included):
- *       * no HOME → the private HOME (never the passwd fallback);
- *       * an env that NAMES the operator's home or relay root (HOME, RELAY_HOME,
- *         RELAY_DB_PATH, RELAY_CONFIG_PATH) → refused BEFORE the child starts;
+ *       * a missing HOME, USERPROFILE, HOMEDRIVE or HOMEPATH → the private one (never the
+ *         account's real home: passwd on unix, the profile on Windows);
+ *       * an env that NAMES the operator's home or relay root (HOME, USERPROFILE,
+ *         HOMEDRIVE+HOMEPATH, RELAY_HOME, RELAY_DB_PATH, RELAY_CONFIG_PATH) → refused BEFORE the
+ *         child starts;
  *       * the same preload in node children, via NODE_OPTIONS;
  *       * a `curl` shim first on PATH that refuses an operator-port URL (exit 7) and
  *         otherwise execs the curl the ORIGINAL PATH resolves (a test's stub included); only
@@ -135,6 +137,31 @@ function curlOn(pathVar: string, shimDir: string): string | null {
 }
 
 const EXECVP_DEFAULT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/**
+ * The env that points the HOME of a process at `home` on every platform. Unix (and node's
+ * os.homedir() there) read HOME; on Windows node's os.homedir() reads USERPROFILE, and
+ * without it falls back to the ACCOUNT's real profile. HOMEDRIVE + HOMEPATH are the other
+ * Windows spelling (cmd, Git Bash).
+ */
+export const HOME_KEYS = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"] as const;
+export function privateHomeEnv(home: string, platform: NodeJS.Platform = process.platform): Record<(typeof HOME_KEYS)[number], string> {
+  if (platform === "win32") {
+    const drive = path.win32.parse(home).root.replace(/[\\/]+$/, "");
+    return { HOME: home, USERPROFILE: home, HOMEDRIVE: drive, HOMEPATH: home.slice(drive.length) || "\\" };
+  }
+  return { HOME: home, USERPROFILE: home, HOMEDRIVE: "", HOMEPATH: home };
+}
+
+/** Does this env name the operator's REAL home through any of the HOME spellings? */
+function namesRealHome(env: NodeJS.ProcessEnv, realHome: string): string[] {
+  const hit: string[] = [];
+  const same = (v: string | undefined) => !!v && path.resolve(v) === realHome;
+  if (same(env.HOME)) hit.push(`HOME=${env.HOME}`);
+  if (same(env.USERPROFILE)) hit.push(`USERPROFILE=${env.USERPROFILE}`);
+  if (env.HOMEPATH && same(`${env.HOMEDRIVE ?? ""}${env.HOMEPATH}`)) hit.push(`HOMEDRIVE+HOMEPATH=${env.HOMEDRIVE ?? ""}${env.HOMEPATH}`);
+  return hit;
+}
 const INSTANCE_ENV = ["RELAY_HOME", "RELAY_DB_PATH", "RELAY_CONFIG_PATH"] as const;
 
 function recordViolationLine(line: string): void {
@@ -149,8 +176,7 @@ function recordViolationLine(line: string): void {
 export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
   const st = state();
   const base = env ?? process.env;
-  const named: string[] = [];
-  if (base.HOME && path.resolve(base.HOME) === st.realHome) named.push(`HOME=${base.HOME}`);
+  const named: string[] = namesRealHome(base, st.realHome);
   for (const k of INSTANCE_ENV) if (base[k] && underOperatorRoot(base[k])) named.push(`${k}=${base[k]}`);
   if (named.length) {
     const line = `env a child env names the OPERATOR's home or relay root: ${named.join(" ")}`;
@@ -159,8 +185,10 @@ export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.Pro
     throw new OperatorTripwireError(`OPERATOR_TRIPWIRE: refused to spawn: ${line}. Give the child its own HOME / RELAY_HOME / RELAY_DB_PATH.`);
   }
   const out: NodeJS.ProcessEnv = { ...base };
-  // bash's ~ and node's os.homedir() fall back to the PASSWD home, the operator's, without HOME.
-  if (!base.HOME) out.HOME = st.home;
+  // Without them, bash's ~ and node's os.homedir() fall back to the ACCOUNT's real home (passwd
+  // on unix, the profile on Windows): the operator's. Each missing spelling gets the private one.
+  const priv = privateHomeEnv(st.home);
+  for (const k of HOME_KEYS) if (base[k] === undefined) out[k] = priv[k];
   out.RELAY_TEST_OPERATOR_PORTS = [...st.ports].join(",");
   out.RELAY_TEST_OPERATOR_ROOTS = JSON.stringify(st.roots);
   out.RELAY_TEST_TRIPWIRE_LOG = st.log;
@@ -275,7 +303,7 @@ if (!state()) {
   // own HOME or RELAY_HOME still sets it; this only replaces the ambient one.
   const home = path.join(dir, "home");
   fs.mkdirSync(home, { mode: 0o700 });
-  process.env.HOME = home;
+  Object.assign(process.env, privateHomeEnv(home)); // HOME, and USERPROFILE + HOMEDRIVE/HOMEPATH for Windows
   // The PORT half's default route: code that falls back to RELAY_HTTP_PORT (a doctor probe, the
   // mint-token "is a daemon up?" check) reaches a closed port, never the operator's. Port 1:
   // refused at once, and no unprivileged test can bind it. A test that needs its own port sets

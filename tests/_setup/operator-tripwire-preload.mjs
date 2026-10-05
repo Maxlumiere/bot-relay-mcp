@@ -114,7 +114,7 @@ function target(args) {
 // test runner's own module graph); the second instance must not capture the wrappers.
 const RAW_KEY = Symbol.for("bot-relay.operator-tripwire.raw-fs");
 globalThis[RAW_KEY] ??= Object.freeze({ readFileSync: fs.readFileSync, readdirSync: fs.readdirSync, appendFileSync: fs.appendFileSync });
-/** For the tripwire's own read-only discovery of the operator's ports. Nothing else may use them. */
+/** For the tripwire's own read-only discovery of the operator's ports, and its static scan (instance ids). Nothing else may use them. */
 export const RAW_FS = globalThis[RAW_KEY];
 // Recording a violation can never recurse into the tripwire.
 const ORIGINAL_APPEND = RAW_FS.appendFileSync;
