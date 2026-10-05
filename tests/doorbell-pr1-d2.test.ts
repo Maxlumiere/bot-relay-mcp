@@ -38,8 +38,8 @@ const intent = (ids: string[], agent = "alice") => ({
   type: "intent" as const,
   at: "2026-10-02T05:00:00.000Z",
   mono_ms: 0,
-  intent: { intent_id: `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`, agent_name: agent, binding_id: "b", reason: "new_mail" as const },
-  covers: { reading_session: RS, message_ids: ids },
+  intent: { intent_id: `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`, agent_name: agent, binding_id: "b", during_escalation: false },
+  covers: { reading_session: RS, message_ids: ids, kinds: ids.map(() => "new" as const) },
 });
 const header = () => ({
   v: 1 as const,
@@ -173,12 +173,16 @@ describe.skipIf(!HOST)("the job: compaction at the first DB open, and the size c
     ageLog(TWO_HOURS);
     const m3 = send();
     expect((await job(B)).code).toBe(0); // compacts: m1 is neither the last nor pending → DROPPED; then rings m3
-    expect(intentsInLog().map((r) => r.covers.message_ids)).toEqual([[m2], [m3]]);
+    // Each id's kinds across the log. PR 3: m2, still pending 2 h (> H) after its ring, is
+    // RE-RUNG as still_pending; it is never rung as "new" again (its intent was KEPT).
+    const kindsOf = (id: string) => intentsInLog().flatMap((r) => r.covers.message_ids.flatMap((x: string, i: number) => (x === id ? [r.covers.kinds[i]] : [])));
+    expect([kindsOf(m1), kindsOf(m2), kindsOf(m3)]).toEqual([[], ["new", "still_pending"], ["new"]]);
     const ids = intentsInLog().map((r) => r.intent.intent_id);
     ageLog(TWO_HOURS);
-    expect((await job(B)).code).toBe(0); // m2 is not the last, but still PENDING → KEPT, so no re-ring
-    // The SAME intents (by id): a dropped-then-re-rung one would carry a new id.
-    expect(intentsInLog().map((r) => r.intent.intent_id)).toEqual(ids);
+    expect((await job(B)).code).toBe(0); // m2 is not the last, but still PENDING → KEPT, so never "new" again
+    // The SAME intents (by id) are still there: a dropped-then-re-rung one would carry a new id.
+    expect(intentsInLog().map((r) => r.intent.intent_id).slice(0, ids.length)).toEqual(ids);
+    expect([kindsOf(m2).filter((k) => k === "new"), kindsOf(m3).filter((k) => k === "new")]).toEqual([["new"], ["new"]]);
     expect(m1).not.toBe(m2);
   });
   it("#300 R2 #1 (MEASURED): the start's compaction failing after its rename STOPS the job (exit 1); no cycle runs on the old fd", async () => {

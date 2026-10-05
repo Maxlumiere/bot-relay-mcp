@@ -58,6 +58,7 @@ function harness(opts: { windowMs?: number; budgetPerHour?: number } = {}) {
       budgetExhausted: exhausted,
       windowMs: opts.windowMs ?? W,
       budgetPerHour: opts.budgetPerHour ?? 6,
+      horizonMs: C.DEFAULT_HORIZON_MS,
       newIntentId: uuid,
       now: () => new Date(atMs).toISOString(),
     });
@@ -115,6 +116,7 @@ describe("Q3: one ring per burst (the coalescing window W)", () => {
       budgetExhausted: new Set(),
       windowMs: W,
       budgetPerHour: 6,
+      horizonMs: C.DEFAULT_HORIZON_MS,
       newIntentId: uuid,
       now: () => new Date(T0).toISOString(),
     });
@@ -150,8 +152,9 @@ describe("Q4: the per-agent ring budget, and A3.2 (logged once per state change)
 
 describe("tunables: bounded, rejected loudly", () => {
   it("W and the budget are validated against their bounds", () => {
-    expect(C.tunablesFault({ windowMs: W, budgetPerHour: 6 })).toBeNull();
-    for (const bad of [{ windowMs: 1000, budgetPerHour: 6 }, { windowMs: 3_600_000, budgetPerHour: 6 }, { windowMs: W, budgetPerHour: 0 }, { windowMs: W, budgetPerHour: 1000 }, { windowMs: W, budgetPerHour: 2.5 }]) {
+    const H = C.DEFAULT_HORIZON_MS;
+    expect(C.tunablesFault({ windowMs: W, budgetPerHour: 6, horizonMs: H })).toBeNull();
+    for (const bad of [{ windowMs: 1000, budgetPerHour: 6, horizonMs: H }, { windowMs: 3_600_000, budgetPerHour: 6, horizonMs: H }, { windowMs: W, budgetPerHour: 0, horizonMs: H }, { windowMs: W, budgetPerHour: 1000, horizonMs: H }, { windowMs: W, budgetPerHour: 2.5, horizonMs: H }]) {
       expect(C.tunablesFault(bad), JSON.stringify(bad)).toMatch(/must be/);
     }
   });
@@ -210,6 +213,7 @@ describe("restart: the window and the budget are rebuilt from the log", () => {
       budgetExhausted: s.budgetExhausted,
       windowMs: W,
       budgetPerHour: 6,
+      horizonMs: C.DEFAULT_HORIZON_MS,
       newIntentId: uuid,
       now: () => new Date(T0 + 5000).toISOString(),
     });

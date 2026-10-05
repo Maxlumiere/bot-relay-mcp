@@ -9,8 +9,10 @@
  * anything acts on it, and an out-of-process driver tails this file read-only.
  *
  *   - CLOSED SCHEMA (C3): every record has an exact key set. An intent is exactly
- *     {intent_id, agent_name, binding_id, reason}, and `reason` is an enum; a free-text
- *     reason or an extra field is refused by the writer, so it never reaches the file.
+ *     {intent_id, agent_name, binding_id, during_escalation}; WHY each id is rung is a
+ *     closed enum ON EACH ID (`covers.kinds`, PR 3 ruling c04f463a Q3), never one
+ *     intent-level reason and never free text. An extra field is refused by the writer,
+ *     so it never reaches the file.
  *   - CONTENT-FREE (A1): no message content, sender or subject. An intent record says
  *     which ids it covers, for which reading session (V4 rung memory), and nothing more.
  *   - RUNG MEMORY (V4) is rebuilt from the intents on every start, keyed
@@ -22,15 +24,21 @@ import path from "path";
 import { AGENT_NAME_PATTERN } from "./types.js";
 import { ACTIVE_INSTANCE_MARKER } from "./resolve-instance.js";
 
-/** Why an intent exists. An ENUM (C3): later PRs add members; free text never. */
-export const INTENT_REASONS = ["new_mail"] as const;
-export type IntentReason = (typeof INTENT_REASONS)[number];
+/**
+ * Why each id is rung, ON EACH ID (C3; ruling c04f463a Q3): a closed ENUM, never free text.
+ *   - "new": not rung before for this reading session (the V4 trigger);
+ *   - "still_pending": rung before, still pending at its horizon: a RE-RING (PR 3), the only
+ *     path that rings an already-rung key, and only under the per-key cap.
+ */
+export const ID_KINDS = ["new", "still_pending"] as const;
+export type IdKind = (typeof ID_KINDS)[number];
 
 export interface Intent {
   intent_id: string;
   agent_name: string;
   binding_id: string;
-  reason: IntentReason;
+  /** The ONE extra ring an open agent_unresponsive escalation allows (ruling c04f463a Q4). */
+  during_escalation: boolean;
 }
 
 export interface IntentRecord {
@@ -41,8 +49,11 @@ export interface IntentRecord {
   /** Monotonic ms since this job lifetime's header (ruling 622689ba: the in-lifetime clock). */
   mono_ms: number;
   intent: Intent;
-  /** What this intent rings for: the reading session (PR 0b digest) and the message ids. */
-  covers: { reading_session: string; message_ids: string[] };
+  /**
+   * What this intent rings for: the reading session (PR 0b digest), the message ids (a
+   * canonical set), and each id's kind, index-aligned with message_ids.
+   */
+  covers: { reading_session: string; message_ids: string[]; kinds: IdKind[] };
 }
 
 export interface HeaderRecord {
@@ -91,7 +102,60 @@ export interface ClockRecord {
   mono_delta_ms: number;
 }
 
-export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord | ClockRecord;
+/**
+ * PR 3 (A2.3 as corrected by V4): what became of rings, judged for ONE (agent, reading
+ * session). Written once per judgement (A3.2), so a restart rebuilds the ineffective-ring
+ * counter and the un-judged ("outstanding") rings from the log alone.
+ *   - "effective": rung ids of this session LEFT its pending set (`left`); every ring still
+ *     outstanding (`intent_ids`, possibly none) is judged effective, and the counter resets.
+ *     One batch may span several records, each within the per-record id bound (never both
+ *     lists empty).
+ *   - "ineffective": ONE ring (`intent_ids`, exactly one) reached its horizon with no rung id
+ *     of this session having left since; the counter goes up by one.
+ *   - "session_changed": the reading session moved; the rings still outstanding for the OLD
+ *     one (`intent_ids`, never empty) are moot (the V4 rescue path, never effectiveness).
+ */
+export const EFFECT_OUTCOMES = ["effective", "ineffective", "session_changed"] as const;
+export interface EffectRecord {
+  v: 1;
+  type: "effect";
+  at: string;
+  agent_name: string;
+  reading_session: string;
+  outcome: (typeof EFFECT_OUTCOMES)[number];
+  intent_ids: string[];
+  left: string[];
+}
+
+/**
+ * PR 3 (V1, V3; ruling c04f463a): an escalation, to the board and THIS log only (never a
+ * relay message). Opened once, closed once (A3.2), matched by escalation_id. It is never a
+ * failure and never counts as one.
+ *   - "agent_unresponsive": ESCALATE_AFTER ineffective rings in a row for one (agent, reading
+ *     session). While open, the agent is not rung, except ONE ring for new mail.
+ *   - "id_stuck": one id rung RE_RING_CAP times without leaving pending: dropped from re-ring.
+ * `operator` is the configured operator agent (V3, default null): ATTRIBUTION ONLY, never a
+ * ring target. It closes when an id of `message_ids` (or of the escalation's extra ring)
+ * leaves pending for the same reading session ("progress"), or the reading session changes.
+ */
+export const ESCALATION_REASONS = ["agent_unresponsive", "id_stuck"] as const;
+export const ESCALATION_STATES = ["open", "closed"] as const;
+export const CLOSE_REASONS = ["progress", "session_changed"] as const;
+export interface EscalationRecord {
+  v: 1;
+  type: "escalation";
+  at: string;
+  escalation_id: string;
+  agent_name: string;
+  reading_session: string;
+  reason: (typeof ESCALATION_REASONS)[number];
+  state: (typeof ESCALATION_STATES)[number];
+  message_ids: string[];
+  operator: string | null;
+  close_reason: (typeof CLOSE_REASONS)[number] | null;
+}
+
+export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord | ClockRecord | EffectRecord | EscalationRecord;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -154,6 +218,13 @@ const boundedMs = (v: unknown, min: number): boolean => Number.isInteger(v) && (
 const sameKeys = (o: unknown, keys: readonly string[]): o is Record<string, unknown> =>
   !!o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).sort().join(",") === [...keys].sort().join(",");
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 200 && !/[\u0000-\u001f\u007f]/.test(v);
+/** A canonical SET of bounded strings: unique and sorted (#300 R1 #8), at most `max`, at least `min`. */
+function setFault(v: unknown, what: string, min: number, max: number, item: (x: unknown) => boolean): string | null {
+  if (!Array.isArray(v) || v.length < min || v.length > max || !v.every(item)) return `${what} must be a list of ${min}..${max} bounded ids`;
+  for (let k = 1; k < v.length; k++) if (!((v[k - 1] as string) < (v[k] as string))) return `${what} must be unique and sorted (a canonical set)`;
+  return null;
+}
+const isUuid = (x: unknown): boolean => typeof x === "string" && UUID_RE.test(x);
 
 /** Why this is not a valid record, or null. The schema is CLOSED: an extra key anywhere is invalid. */
 export function recordFault(r: unknown): string | null {
@@ -165,13 +236,13 @@ export function recordFault(r: unknown): string | null {
     if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
     if (!boundedMs(r.mono_ms, 0)) return "mono_ms is not a bounded non-negative integer";
     const i = r.intent;
-    if (!sameKeys(i, ["intent_id", "agent_name", "binding_id", "reason"])) return "an intent has exactly intent_id, agent_name, binding_id, reason";
+    if (!sameKeys(i, ["intent_id", "agent_name", "binding_id", "during_escalation"])) return "an intent has exactly intent_id, agent_name, binding_id, during_escalation";
     if (typeof i.intent_id !== "string" || !UUID_RE.test(i.intent_id)) return "intent_id is not a v4 UUID";
     if (typeof i.agent_name !== "string" || !AGENT_NAME_PATTERN.test(i.agent_name)) return "agent_name is not a valid agent name";
     if (!nonEmpty(i.binding_id)) return "binding_id is empty or holds a control character";
-    if (!(INTENT_REASONS as readonly unknown[]).includes(i.reason)) return `reason must be one of ${INTENT_REASONS.join(", ")} (never free text)`;
+    if (typeof i.during_escalation !== "boolean") return "during_escalation is not a boolean";
     const c = r.covers;
-    if (!sameKeys(c, ["reading_session", "message_ids"])) return "covers has exactly reading_session, message_ids";
+    if (!sameKeys(c, ["reading_session", "message_ids", "kinds"])) return "covers has exactly reading_session, message_ids, kinds";
     if (typeof c.reading_session !== "string" || !DIGEST_RE.test(c.reading_session)) return "reading_session is not a 64-hex digest";
     if (!Array.isArray(c.message_ids) || c.message_ids.length === 0 || c.message_ids.length > MAX_IDS_PER_INTENT || !c.message_ids.every(nonEmpty)) {
       return `message_ids must be a non-empty list of at most ${MAX_IDS_PER_INTENT} bounded ids`;
@@ -179,6 +250,48 @@ export function recordFault(r: unknown): string | null {
     // #300 R1 #8: a SET in canonical form: unique and sorted, at the writer AND on replay.
     const ids = c.message_ids as string[];
     for (let k = 1; k < ids.length; k++) if (!(ids[k - 1] < ids[k])) return "message_ids must be unique and sorted (a canonical set)";
+    if (!Array.isArray(c.kinds) || c.kinds.length !== ids.length) return "kinds must have one entry per message id";
+    if (!c.kinds.every((k) => (ID_KINDS as readonly unknown[]).includes(k))) return `each kind must be one of ${ID_KINDS.join(", ")} (never free text)`;
+    // Ruling c04f463a Q4: the extra ring during an escalation is for NEW mail only.
+    if (i.during_escalation && !c.kinds.every((k) => k === "new")) return "an intent during an escalation rings new ids only";
+    return null;
+  }
+  if (t === "effect") {
+    if (!sameKeys(r, ["v", "type", "at", "agent_name", "reading_session", "outcome", "intent_ids", "left"])) {
+      return "an effect record has exactly v, type, at, agent_name, reading_session, outcome, intent_ids, left";
+    }
+    if (r.v !== 1) return "unknown record version";
+    if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
+    if (typeof r.agent_name !== "string" || !AGENT_NAME_PATTERN.test(r.agent_name)) return "agent_name is not a valid agent name";
+    if (typeof r.reading_session !== "string" || !DIGEST_RE.test(r.reading_session)) return "reading_session is not a 64-hex digest";
+    if (!(EFFECT_OUTCOMES as readonly unknown[]).includes(r.outcome)) return `outcome must be one of ${EFFECT_OUTCOMES.join(", ")}`;
+    // An `effective` batch over the per-record bound is split across records (#302 Codex R1 F4),
+    // so a continuation chunk may carry only intent_ids; never neither.
+    const shape =
+      r.outcome === "effective" ? { iMin: 0, iMax: MAX_IDS_PER_INTENT, lMin: 0, lMax: MAX_IDS_PER_INTENT } : r.outcome === "ineffective" ? { iMin: 1, iMax: 1, lMin: 0, lMax: 0 } : { iMin: 1, iMax: MAX_IDS_PER_INTENT, lMin: 0, lMax: 0 };
+    const f = setFault(r.intent_ids, `${r.outcome as string} intent_ids`, shape.iMin, shape.iMax, isUuid) ?? setFault(r.left, `${r.outcome as string} left`, shape.lMin, shape.lMax, nonEmpty);
+    if (f) return f;
+    if (r.outcome === "effective" && (r.intent_ids as string[]).length === 0 && (r.left as string[]).length === 0) return "an effective record names at least one intent or one left id";
+    return null;
+  }
+  if (t === "escalation") {
+    if (!sameKeys(r, ["v", "type", "at", "escalation_id", "agent_name", "reading_session", "reason", "state", "message_ids", "operator", "close_reason"])) {
+      return "an escalation record has exactly v, type, at, escalation_id, agent_name, reading_session, reason, state, message_ids, operator, close_reason";
+    }
+    if (r.v !== 1) return "unknown record version";
+    if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
+    if (!isUuid(r.escalation_id)) return "escalation_id is not a v4 UUID";
+    if (typeof r.agent_name !== "string" || !AGENT_NAME_PATTERN.test(r.agent_name)) return "agent_name is not a valid agent name";
+    if (typeof r.reading_session !== "string" || !DIGEST_RE.test(r.reading_session)) return "reading_session is not a 64-hex digest";
+    if (!(ESCALATION_REASONS as readonly unknown[]).includes(r.reason)) return `reason must be one of ${ESCALATION_REASONS.join(", ")} (never free text)`;
+    if (!(ESCALATION_STATES as readonly unknown[]).includes(r.state)) return `state must be one of ${ESCALATION_STATES.join(", ")}`;
+    const f = setFault(r.message_ids, "message_ids", 1, MAX_IDS_PER_INTENT, nonEmpty);
+    if (f) return f;
+    if (r.reason === "id_stuck" && (r.message_ids as string[]).length !== 1) return "an id_stuck escalation is for exactly one id";
+    if (!(r.operator === null || (typeof r.operator === "string" && AGENT_NAME_PATTERN.test(r.operator)))) return "operator is not null or a valid agent name";
+    if (r.state === "open" ? r.close_reason !== null : !(CLOSE_REASONS as readonly unknown[]).includes(r.close_reason)) {
+      return `close_reason is null while open, and one of ${CLOSE_REASONS.join(", ")} once closed`;
+    }
     return null;
   }
   if (t === "clock") {
@@ -392,6 +505,26 @@ export interface LogState {
 }
 
 /**
+ * THE one reducer: what a record changes in the job's state. Replay (parseLogText) and the
+ * running job (after each durable append) both go through it, so memory and the log can
+ * never disagree about rung memory, budget state, effects or escalations.
+ */
+export function foldRecord(state: LogState, r: LogRecord): void {
+  state.records.push(r);
+  if (r.type === "intent") {
+    for (const id of r.covers.message_ids) state.rung.add(rungKey(r.covers.reading_session, id));
+    const walls = state.ringWalls.get(r.intent.agent_name) ?? [];
+    walls.push(Date.parse(r.at));
+    state.ringWalls.set(r.intent.agent_name, walls);
+  } else if (r.type === "header") {
+    state.lastHeaderWall = Date.parse(r.at);
+  } else if (r.type === "budget") {
+    if (r.state === "exhausted") state.budgetExhausted.add(r.agent_name);
+    else state.budgetExhausted.delete(r.agent_name);
+  }
+}
+
+/**
  * Parse the log text. A torn tail (an UNTERMINATED last line) is skipped and reported. Any
  * other invalid line, a complete one included, means the log is not what this writer
  * wrote: REFUSED (fail closed: no cycle runs on a state it cannot trust).
@@ -412,19 +545,7 @@ function parseLogText(text: string, logPath: string): LogState {
       fault = "not JSON";
     }
     if (fault) throw new Error(`${logPath} line ${i + 1} is not a valid doorbell record (${fault}): refusing to rebuild rung memory from it`);
-    const r = rec as LogRecord;
-    state.records.push(r);
-    if (r.type === "intent") {
-      for (const id of r.covers.message_ids) state.rung.add(rungKey(r.covers.reading_session, id));
-      const walls = state.ringWalls.get(r.intent.agent_name) ?? [];
-      walls.push(Date.parse(r.at));
-      state.ringWalls.set(r.intent.agent_name, walls);
-    } else if (r.type === "header") {
-      state.lastHeaderWall = Date.parse(r.at);
-    } else if (r.type === "budget") {
-      if (r.state === "exhausted") state.budgetExhausted.add(r.agent_name);
-      else state.budgetExhausted.delete(r.agent_name);
-    }
+    foldRecord(state, rec as LogRecord);
   });
   if (tail !== null && tail.length > 0) state.tornTail = true;
   return state;
@@ -468,6 +589,8 @@ export const COMPACT_KEEP_CLOCKS = 16;
 export function compactLog(
   h: LogHandle,
   keepIntent: (rec: IntentRecord) => boolean,
+  /** PR 3: which effect and escalation records to keep, given the kept intents (default: all). */
+  keepLedger?: (records: readonly LogRecord[], keptIntentIds: ReadonlySet<string>) => ReadonlySet<LogRecord>,
 ): { handle: LogHandle; state: LogState; beforeBytes: number; afterBytes: number } {
   const stateDir = path.dirname(h.path);
   const beforeBytes = h.io.fstatSync(h.fd).size;
@@ -485,16 +608,19 @@ export function compactLog(
   const lastBudget = new Map<string, LogRecord>();
   for (const r of current.records) if (r.type === "budget") lastBudget.set(r.agent_name, r);
   const clocks = new Set(current.records.filter((r) => r.type === "clock").slice(-COMPACT_KEEP_CLOCKS));
+  const keptIntentIds = new Set<string>();
+  for (const r of current.records) if (r.type === "intent" && keepIntent(r)) keptIntentIds.add(r.intent.intent_id);
+  const ledger = keepLedger?.(current.records, keptIntentIds) ?? null;
   const kept = current.records.filter((r) =>
     r.type === "header"
       ? headers.includes(r)
       : r.type === "intent"
-        ? keepIntent(r)
+        ? keptIntentIds.has(r.intent.intent_id)
         : r.type === "budget"
           ? lastBudget.get(r.agent_name) === r
           : r.type === "clock"
             ? clocks.has(r)
-            : true,
+            : ledger === null || ledger.has(r),
   );
   const tmp = path.join(stateDir, `${COMPACT_PREFIX}${process.pid}`);
   // #300 R2 #1 + #2: from here on, anything that does not complete is a LogWriteError, and
@@ -537,6 +663,40 @@ export function compactLog(
   closeLog(h);
   const reopened = openLog(stateDir, h.io);
   return { handle: reopened.handle, state: reopened.state, beforeBytes, afterBytes: reopened.handle.io.fstatSync(reopened.handle.fd).size };
+}
+
+/**
+ * PR 3's keep rule for effect and escalation records (D-2 (b), ruling 8c83e4ce; c04f463a):
+ *   - an escalation whose LAST record is open (its open record), so the board and the
+ *     single-record rules (one id_stuck per key) survive a restart; closed ones are history;
+ *   - an effect record that judged a KEPT intent (else the restart would judge it again);
+ *   - an `effective` record whose `left` names an id of a kept intent of the same agent and
+ *     session (else that id would look newly left after the restart: a false progress);
+ *   - for each agent's CURRENT session (`currentSession`), its last `effective` record and
+ *     every effect record after it: the ineffective-ring counter, exactly.
+ */
+export function selectLedgerKeep(
+  records: readonly LogRecord[],
+  keptIntentIds: ReadonlySet<string>,
+  currentSession: (agent: string) => string | null | undefined,
+): Set<LogRecord> {
+  const keep = new Set<LogRecord>();
+  const lastEsc = new Map<string, EscalationRecord>();
+  for (const r of records) if (r.type === "escalation") lastEsc.set(r.escalation_id, r);
+  for (const e of lastEsc.values()) if (e.state === "open") keep.add(e);
+  const keptIds = new Set<string>(); // agent \0 session \0 id
+  for (const r of records) if (r.type === "intent" && keptIntentIds.has(r.intent.intent_id)) for (const id of r.covers.message_ids) keptIds.add(`${r.intent.agent_name}\u0000${r.covers.reading_session}\u0000${id}`);
+  const trailingFrom = new Map<string, number>(); // agent → index of its current session's last effective
+  records.forEach((r, i) => {
+    if (r.type === "effect" && r.outcome === "effective" && currentSession(r.agent_name) === r.reading_session) trailingFrom.set(r.agent_name, i);
+  });
+  records.forEach((r, i) => {
+    if (r.type !== "effect") return;
+    if (r.intent_ids.some((id) => keptIntentIds.has(id))) keep.add(r);
+    else if (r.left.some((id) => keptIds.has(`${r.agent_name}\u0000${r.reading_session}\u0000${id}`))) keep.add(r);
+    else if (currentSession(r.agent_name) === r.reading_session && i >= (trailingFrom.get(r.agent_name) ?? 0)) keep.add(r);
+  });
+  return keep;
 }
 
 /**
