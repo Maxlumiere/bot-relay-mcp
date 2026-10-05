@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Security — dependency advisories cleared; the MCP SDK to 1.32.0
+
+`npm audit --audit-level=high` is clean again in both the server and the VS Code extension.
+
+- **`@modelcontextprotocol/sdk` 1.32.0** in the server (was pinned to 1.30.x) and in the extension (its lockfile resolved 1.29.0). The extension sends its agent token over the SDK's HTTP client transport, the path the SDK advisory concerns.
+- **Extension packaging tool `@vscode/vsce` 3.9 → 4.0.** All six high-severity advisories in the extension came from one chain under vsce 3: `secretlint` → `globby` → `fast-glob` → `micromatch` → `braces`. No released `braces` is fixed, so the fix is to leave that chain: vsce 4 no longer depends on it, and `braces` is gone from the tree. vsce 4 needs Node 22 or newer; it is a build-time tool and nothing in the shipped extension uses it.
+- **Our own pins had become the vulnerable versions.** `fast-uri` was pinned to exactly 4.1.4 (both trees) and `qs` to exactly 6.15.2 (extension), each inside its new advisory's range. Raised to `fast-uri` 4.2.1 and `qs` 6.16.0. `hono` and `ip-address` overrides raised to their fixed ranges (`^4.13.7`, `^10.7.1`).
+- **Five overrides retired.** `js-yaml`, `undici`, `tmp`, `form-data` and `markdown-it` were security pins for packages that vsce 4 no longer pulls in; none of them is in the extension's tree any more. An override that outlives its package only blocks Dependabot, so they are removed (SECURITY.md's override table is updated, and its completeness test passes).
+
+Not in this release: the extension's `vitest` moderate advisory, fixed in vitest 4.1.11 or 5, both majors from the extension's 3.x; and zod 4. Both are separate changes.
+
 ### Added — the doorbell rings once per burst, within a per-agent hourly budget
 
 The doorbell job (not installed yet) now limits how often it would ring an agent.

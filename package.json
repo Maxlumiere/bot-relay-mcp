@@ -63,7 +63,7 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "~1.30.0",
+    "@modelcontextprotocol/sdk": "~1.32.0",
     "ajv": "^8.20.0",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^13.0.3",
@@ -86,8 +86,8 @@
     "sql.js": "^1.14.1"
   },
   "overrides": {
-    "hono": "^4.12.34",
-    "fast-uri": "4.1.4",
-    "ip-address": "^10.4.0"
+    "hono": "^4.13.7",
+    "fast-uri": "4.2.1",
+    "ip-address": "^10.7.1"
   }
 }
