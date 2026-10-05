@@ -13,7 +13,7 @@
  *   - Q5: `last_failure.kind` is a CLOSED enum: pending-read | db-open | record-refused | other.
  *   - proc_start comes from the ONE UTC producer: equal under every TZ (#296 metamorphic).
  */
-import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -322,82 +322,146 @@ describe.skipIf(!HOST)("#304 R1 F7: every counter stays inside what its reader a
   });
 });
 
-/** A pid that is certainly DEAD (a child that has exited), with its own start token. */
-function deadPid(): { pid: number; start: string | null } {
-  const { spawnSync } = require("child_process") as typeof import("child_process");
-  const r = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf-8" });
-  return { pid: Number(r.stdout), start: null };
+const LOCK_DIST = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "dist", "doorbell-lock.js");
+/**
+ * A child PROCESS that tries the instance lock and prints "held" or "busy", then stays alive for
+ * `holdMs` (0 = exit at once; -1 = until killed). It keeps NO reference to the handle and forces a
+ * garbage collection: the lock module itself must pin a held connection (MEASURED: an unreferenced,
+ * collected connection silently dropped the lock in 15 of 20 racing rounds before the pin).
+ */
+function lockChildScript(dir: string, holdMs: number): string {
+  return `import { acquireInstanceLock } from ${JSON.stringify(LOCK_DIST)};
+process.stdout.write(acquireInstanceLock(${JSON.stringify(dir)}, { pid: process.pid, proc_start: null, host_id: null }).ok ? "held\\n" : "busy\\n");
+if (globalThis.gc) { gc(); gc(); }
+${holdMs < 0 ? "setInterval(() => {}, 1000);" : `setTimeout(() => process.exit(0), ${holdMs});`}`;
 }
-const writeLock = (body: Record<string, unknown>) => {
-  fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(STATE, LK.LOCK_FILENAME), JSON.stringify(body));
-};
+const LOCKFILE = () => path.join(STATE, LK.LOCK_DB_FILENAME);
+/** Every child a lock test spawns: ALWAYS killed after the test, so a failure can never leave one holding the worker open. */
+const children = new Set<import("child_process").ChildProcess>();
+afterEach(async () => {
+  await Promise.all(
+    [...children].map((c) => new Promise<void>((res) => {
+      if (c.exitCode !== null || c.signalCode !== null) return res();
+      c.once("exit", () => res());
+      c.kill("SIGKILL");
+    })),
+  );
+  children.clear();
+});
 
-describe.skipIf(!HOST)("#304 R1 F5: SINGLE-INSTANCE exclusion (the instance lock)", () => {
-  it("HARM: a second job against a LIVE holder REFUSES (exit 4, loud) — before touching the state dir: the first job's temp file survives", async () => {
-    const clock = fakeClock(T);
-    let second: { code: number; stderr: string } | null = null;
-    const tmp = path.join(STATE, ".state-file.tmp-heartbeat.json.99999"); // what a live job's in-flight write looks like
-    const first = job(["--interval-ms", "1000"], {
-      clock,
-      onHeartbeat: async () => {
-        if (second) return;
-        fs.writeFileSync(tmp, "in flight");
-        second = await job(["--once"], { clock: fakeClock(T + 1000) });
-        expect(fs.existsSync(tmp)).toBe(true); // the refused job never ran openLog's cleanup
-        fs.unlinkSync(tmp);
-        process.emit("SIGTERM");
-      },
-    });
-    expect((await first).code).toBe(0);
-    expect(second).not.toBeNull();
-    expect(second!.code).toBe(LK.EXIT_ALREADY_RUNNING);
-    expect(second!.stderr).toMatch(/DOORBELL_ALREADY_RUNNING: another doorbell \(pid \d+/);
-  }, 20_000);
-  it("a DEAD holder is taken over (and the lock is released on a clean exit)", async () => {
-    const d = deadPid();
-    writeLock({ v: 1, pid: d.pid, proc_start: d.start, host_id: HOST, token: "dead-holder" });
-    const r = await job(["--once"], { clock: fakeClock(T) });
-    expect(r.code).toBe(0);
-    expect(r.stderr).toMatch(/took over the instance lock from a dead holder/);
-    expect(fs.existsSync(path.join(STATE, LK.LOCK_FILENAME))).toBe(false); // released
+describe.skipIf(!HOST)("#304 F5 (ruling ecf50062): the KERNEL-held instance lock", () => {
+  it("HARM: a LIVE holder → exit 4, loud, naming the holder from its sidecar — and nothing touched the state dir: a temp file survives", async () => {
+    fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
+    const held = LK.acquireInstanceLock(STATE, { pid: 4242, proc_start: null, host_id: HOST });
+    expect(held.ok).toBe(true);
+    const tmp = path.join(STATE, ".state-file.tmp-heartbeat.json.99999");
+    fs.writeFileSync(tmp, "in flight");
+    try {
+      const r = await job(["--once"], { clock: fakeClock(T) });
+      expect(r.code).toBe(LK.EXIT_ALREADY_RUNNING);
+      expect(r.stderr).toMatch(/DOORBELL_ALREADY_RUNNING: another doorbell holds this instance's lock \(held by pid 4242/);
+      expect(fs.existsSync(tmp)).toBe(true); // openLog's cleanup never ran
+    } finally {
+      if (held.ok) LK.releaseInstanceLock(held.handle);
+      fs.rmSync(tmp, { force: true });
+    }
   });
-  it("HARM: a job whose lock is TAKEN from it stops before its next attempt (never acts on a state dir it does not own)", async () => {
-    // Taken DURING attempt 1 (loop() owns onHeartbeat, so this uses the cycle's own seam).
+  it("HARM: another PROCESS holds it → exit 4; kill -9 that process → the very next start takes over (no judging, no stale state)", async () => {
+    const { spawn } = await import("child_process");
+    fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
+    const child = spawn(process.execPath, ["--expose-gc", "--input-type=module", "-e", lockChildScript(STATE, -1)], { stdio: ["ignore", "pipe", "inherit"] });
+    children.add(child);
+    await new Promise<void>((res, rej) => {
+      child.stdout!.on("data", (d: Buffer) => (String(d).includes("held") ? res() : rej(new Error(String(d)))));
+      child.on("exit", (code) => rej(new Error(`the holder child exited (${code}) before saying held`)));
+    });
+    expect((await job(["--once"], { clock: fakeClock(T) })).code).toBe(LK.EXIT_ALREADY_RUNNING);
+    child.kill("SIGKILL");
+    await new Promise((res) => child.on("exit", res));
+    const r = await job(["--once"], { clock: fakeClock(T + 1000) });
+    expect(r.code).toBe(0);
+  }, 30_000);
+  it("HARM: N racers on one instance → EXACTLY ONE holder, every round (8 processes × 8 rounds; every holder still ALIVE when counted, after a forced GC)", async () => {
+    const { spawn } = await import("child_process");
+    fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
+    for (let round = 0; round < 8; round++) {
+      const kids: Array<import("child_process").ChildProcess> = [];
+      const outs = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          new Promise<string>((res) => {
+            const c = spawn(process.execPath, ["--expose-gc", "--input-type=module", "-e", lockChildScript(STATE, -1)], { stdio: ["ignore", "pipe", "inherit"] });
+            kids.push(c);
+            children.add(c);
+            let out = "";
+            c.stdout!.on("data", (d: Buffer) => {
+              out += String(d);
+              if (out.includes("\n")) res(out.trim());
+            });
+            c.on("exit", (code) => res(out.trim() || `crashed(${code})`)); // a crash FAILS the count, never hangs
+          }),
+        ),
+      );
+      // All eight answered while all are alive: two "held" here would be SIMULTANEOUS holders.
+      expect(outs.filter((o) => o === "held"), `round ${round}: ${outs.join(",")}`).toHaveLength(1);
+      expect(outs.filter((o) => o === "busy")).toHaveLength(7);
+      await Promise.all(kids.map((c) => new Promise((r) => (c.on("exit", r), c.kill("SIGKILL")))));
+    }
+  }, 180_000);
+  it("HARM (the POSIX pitfall): mid-run, the lock is STILL held against another process, and the job never opened the lock file a second time", async () => {
+    const { spawnSync } = await import("child_process");
+    const opens = vi.spyOn(fs, "openSync");
+    const seenByOther: string[] = [];
+    try {
+      await loop(3, {
+        beforeCycle: (k) => {
+          if (k === 1) seenByOther.push(spawnSync(process.execPath, ["--input-type=module", "-e", lockChildScript(STATE, 0)], { encoding: "utf-8" }).stdout.trim());
+        },
+      });
+      expect(seenByOther).toEqual(["busy"]); // after cleanup, compaction and heartbeats: still ours
+      expect(opens.mock.calls.filter(([p]) => String(p).endsWith(LK.LOCK_DB_FILENAME))).toEqual([]);
+    } finally {
+      opens.mockRestore();
+    }
+  }, 30_000);
+  it("HARM (the TRAP, ruling ecf50062): BEGIN EXCLUSIVE is the connection's FIRST statement — no pragma, no read, nothing before it", async () => {
+    // Deterministic, because the race cannot be: with locking_mode=EXCLUSIVE and a read first, every
+    // racer keeps its SHARED lock and NONE wins (measured by the architect), but only when the reads
+    // are truly simultaneous; staggered process starts let the first one win anyway (measured here:
+    // the race test stays green under that mutation). So the rule itself is pinned.
+    const { default: Database } = await import("better-sqlite3");
+    const calls: string[] = [];
+    // Record every statement-issuing call on ANY connection, in order (the originals still run).
+    const orig = { exec: Database.prototype.exec, pragma: Database.prototype.pragma, prepare: Database.prototype.prepare };
+    for (const m of ["exec", "pragma", "prepare"] as const) {
+      (Database.prototype as unknown as Record<string, unknown>)[m] = function (this: unknown, ...args: unknown[]) {
+        calls.push(`${m}:${String(args[0])}`);
+        return (orig[m] as (...a: unknown[]) => unknown).apply(this, args);
+      };
+    }
+    try {
+      fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
+      const r = LK.acquireInstanceLock(STATE, { pid: process.pid, proc_start: null, host_id: HOST });
+      expect(r.ok).toBe(true);
+      expect(calls).toEqual(["exec:BEGIN EXCLUSIVE"]);
+      if (r.ok) LK.releaseInstanceLock(r.handle);
+    } finally {
+      Object.assign(Database.prototype, orig);
+    }
+  });
+  it("HARM: the lock FILE removed under a running job → it stops before its next attempt (a new starter could lock a new file)", async () => {
     const r = await loop(10, {
       beforeCycle: (k) => {
-        if (k === 0) writeLock({ v: 1, pid: process.pid, proc_start: null, host_id: HOST, token: "someone-else" });
+        if (k === 0) fs.unlinkSync(LOCKFILE());
       },
     });
     expect(r.code).toBe(1);
-    expect(r.stderr).toMatch(/the instance lock is no longer ours/);
-    expect(r.writes).toHaveLength(1); // no attempt after the loss
+    expect(r.stderr).toMatch(/the instance lock file was removed or replaced/);
+    expect(r.writes).toHaveLength(1);
   }, 20_000);
-  it("an UNVERIFIABLE holder (another host) → refuse, fail closed", async () => {
-    writeLock({ v: 1, pid: 1, proc_start: null, host_id: "SOME-OTHER-HOST", token: "far" });
-    const r = await job(["--once"], { clock: fakeClock(T) });
-    expect(r.code).toBe(LK.EXIT_ALREADY_RUNNING);
-    expect(r.stderr).toMatch(/cannot be verified from this host/);
-  });
-  it("HARM: two starters RACING on one dead lock → exactly ONE holder (B takes over while A is between its judgement and its takeover)", () => {
-    const d = deadPid();
-    writeLock({ v: 1, pid: d.pid, proc_start: d.start, host_id: HOST, token: "dead-holder" });
-    const me = { pid: process.pid, proc_start: processStartedAt(process.pid), host_id: HOST };
-    let b: ReturnType<typeof LK.acquireInstanceLock> | null = null;
-    const a = LK.acquireInstanceLock(STATE, me, { beforeTakeover: () => { if (!b) b = LK.acquireInstanceLock(STATE, me); } });
-    expect(b).not.toBeNull();
-    expect([a.ok, (b as unknown as { ok: boolean }).ok].filter(Boolean)).toHaveLength(1);
-    expect((b as unknown as { ok: boolean; tookOver?: boolean }).tookOver).toBe(true);
-    expect(a.ok).toBe(false);
-  });
-  it("HARM: two starters RACING, the other order (A holds the takeover file when B arrives) → exactly ONE holder", () => {
-    const d = deadPid();
-    writeLock({ v: 1, pid: d.pid, proc_start: d.start, host_id: HOST, token: "dead-holder" });
-    const me = { pid: process.pid, proc_start: processStartedAt(process.pid), host_id: HOST };
-    // A takes the takeover file and is paused; B arrives: it must refuse, not take over in parallel.
-    fs.writeFileSync(path.join(STATE, LK.TAKEOVER_FILENAME), JSON.stringify({ v: 1, ...me, token: "a-takeover" }));
-    const b = LK.acquireInstanceLock(STATE, me);
-    expect(b.ok).toBe(false);
-    expect((b as { reason: string }).reason).toMatch(/taking over/);
+  it("the holder SIDECAR is display-only: garbage in it never stops a start (correctness never reads it)", async () => {
+    fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(STATE, LK.HOLDER_FILENAME), "{garbage");
+    expect((await job(["--once"], { clock: fakeClock(T) })).code).toBe(0);
+    expect(LK.readHolderInfo(STATE)?.pid).toBe(process.pid); // rewritten by the start that took the lock
   });
 });

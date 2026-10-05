@@ -4,189 +4,130 @@
 // See LICENSE for full terms.
 
 /**
- * SINGLE-INSTANCE EXCLUSION for the doorbell job (#304 Codex R1 F5; ruling b556c011). Two live
- * jobs on one instance would mean two appenders to the actuation log, divergent rung memory and
- * DOUBLED RINGS. The supervisor (one launchd label per instance) makes that unlikely, but a manual
- * run, a mis-labelled plist or a second install all reach it, so the invariant is enforced here.
+ * SINGLE-INSTANCE EXCLUSION for the doorbell job (#304 Codex R1 F5; ruling ecf50062, which replaces
+ * b556c011's file-judging shape). Two live jobs on one instance would mean two appenders to the
+ * actuation log, divergent rung memory and DOUBLED RINGS.
  *
- *   - Taken FIRST, before anything else touches the state dir (openLog's temp cleanup included).
- *   - The lock file `doorbell.lock` is created COMPLETE: written to a private temp file, then
- *     link()ed into place, which fails if a lock exists (an O_EXCL create that can never leave a
- *     half-written lock behind). It holds {pid, proc_start, host_id, token}.
- *   - A lock that exists is JUDGED with the relay's OWN liveness (anchorLivenessVerdict, the ONE UTC
- *     start token): alive → REFUSE (exit EXIT_ALREADY_RUNNING); unverifiable (another host, no start
- *     token) → REFUSE, fail closed; dead → TAKE OVER.
- *   - A takeover is itself EXCLUSIVE: the taker first creates `doorbell.lock.takeover` the same
- *     way, so of two starters racing on one dead lock exactly one takes over and the other refuses.
- *     Under it, the lock is re-read and must still be the SAME dead holder (its token), then a new
- *     lock is renamed into place and re-read to verify it is ours.
- *   - A stale takeover file (a crash mid-takeover) is judged the same way; a dead one is removed
- *     and the start retried ONCE. KNOWN LIMIT: removing a stale takeover file and another starter
- *     creating a fresh one can interleave; it needs a crash inside a takeover AND a racing start.
- *   - Released on clean exit, and only if it is still ours (the token). A stale lock is harmless:
- *     the next start judges it dead.
- *   - The running job re-verifies it holds the lock before every cycle (lockStillOurs).
+ * A KERNEL-HELD lock, so there is nothing to judge: any lock FILE judged for staleness has stale and
+ * unjudgeable states (a crash with an unreadable start token would wedge every later start).
+ *   - One better-sqlite3 connection to `<state dir>/doorbell.lock.db` (its OWN file, NEVER the relay
+ *     DB, so V1 holds), busy timeout 0, and `BEGIN EXCLUSIVE` as its FIRST statement, held open for
+ *     the job's lifetime and never committed. SQLITE_BUSY → another doorbell holds it → refuse.
+ *     Process death → the kernel drops the lock: no takeover code, no liveness judgement.
+ *   - ⚠ TRAP (measured, ruling ecf50062): NO `locking_mode` pragma and NO read before BEGIN EXCLUSIVE
+ *     (with locking_mode=EXCLUSIVE, a read first left every racer holding SHARED: ZERO winners).
+ *   - ⚠ POSIX: an fcntl lock belongs to the PROCESS, and closing ANY descriptor of the file drops
+ *     it. The job never opens this file through a second handle (fs or SQLite); it only lstat()s it.
+ *   - The state dir must be LOCAL: SQLite locks with fcntl on unix and LockFileEx on Windows, and a
+ *     network filesystem's locking is not reliable.
+ *   - Deleting the lock file would let a new starter lock a NEW file while we still hold the old
+ *     one, so the job checks before every attempt that the path still names the inode it locked.
+ *   - A sidecar `doorbell.lock.holder.json` (pid, proc_start, host_id, since) is written for the
+ *     status verb's "held by …" line ONLY. Correctness never reads it.
+ *   - ⚠ GARBAGE COLLECTION (MEASURED 2026-10-05): a better-sqlite3 connection nobody references is
+ *     CLOSED when it is collected, and the kernel lock goes with it. With the handle unreferenced,
+ *     8 racers held SIMULTANEOUSLY in 15 of 20 rounds; pinned, exactly one in 20 of 20. So every
+ *     held connection is pinned HERE, in a module-level set, until releaseInstanceLock: the lock can
+ *     never depend on a caller happening to keep its handle alive.
  */
 import fs from "fs";
 import path from "path";
-import { randomUUID } from "crypto";
+import Database from "better-sqlite3";
 import { ensurePrivateDir } from "./doorbell-log.js";
-import { anchorLivenessVerdict, type AnchorVerdict } from "./liveness.js";
 
-export const LOCK_FILENAME = "doorbell.lock";
-export const TAKEOVER_FILENAME = "doorbell.lock.takeover";
+export const LOCK_DB_FILENAME = "doorbell.lock.db";
+export const HOLDER_FILENAME = "doorbell.lock.holder.json";
 /** The job's exit code when another live doorbell holds this instance (distinct from 0/1/2). */
 export const EXIT_ALREADY_RUNNING = 4;
 
-export interface LockBody {
-  v: 1;
+export interface LockHandle {
+  db: Database.Database;
+  path: string;
+  dev: number;
+  ino: number;
+}
+export interface HolderInfo {
   pid: number;
   proc_start: string | null;
   host_id: string | null;
-  token: string;
+  since: string;
 }
-export interface LockHandle {
-  path: string;
-  token: string;
-}
-export type LockResult = { ok: true; handle: LockHandle; tookOver: boolean } | { ok: false; reason: string };
+export type LockResult = { ok: true; handle: LockHandle } | { ok: false; reason: string; holder: HolderInfo | null };
 
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
-const isBody = (b: unknown): b is LockBody => {
-  const o = b as Record<string, unknown> | null;
-  return (
-    !!o && o.v === 1 && Number.isInteger(o.pid) && (o.pid as number) > 0 && (o.proc_start === null || typeof o.proc_start === "string") &&
-    (o.host_id === null || typeof o.host_id === "string") && typeof o.token === "string" && o.token.length > 0
-  );
-};
+/** Every HELD lock connection, pinned against garbage collection until it is released. */
+const HELD = new Set<Database.Database>();
 
-/** Read a lock-style file no-follow: its body, absent, or unreadable (never a guess). */
-export function readLockFile(p: string): { kind: "absent" } | { kind: "ok"; body: LockBody } | { kind: "unreadable"; reason: string } {
-  let fd: number;
+/** The non-authoritative holder sidecar (for display only; null when absent or unreadable). */
+export function readHolderInfo(stateDir: string): HolderInfo | null {
   try {
-    fd = fs.openSync(p, fs.constants.O_RDONLY | O_NOFOLLOW);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    return code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable", reason: `cannot open ${p} (${code ?? String(err)})` };
-  }
-  try {
-    if (!fs.fstatSync(fd).isFile()) return { kind: "unreadable", reason: `${p} is not a regular file` };
-    let body: unknown;
+    const fd = fs.openSync(path.join(stateDir, HOLDER_FILENAME), fs.constants.O_RDONLY | O_NOFOLLOW);
     try {
-      body = JSON.parse(fs.readFileSync(fd, "utf-8"));
-    } catch {
-      return { kind: "unreadable", reason: `${p} is not JSON` };
-    }
-    return isBody(body) ? { kind: "ok", body } : { kind: "unreadable", reason: `${p} is not a doorbell lock` };
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-/** Create `target` COMPLETE and EXCLUSIVELY (temp file + link). False if it already exists. */
-function createExclusive(dir: string, target: string, body: LockBody): boolean {
-  const tmp = path.join(dir, `.lock-tmp-${body.token}`);
-  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
-  try {
-    fs.writeSync(fd, JSON.stringify(body) + "\n");
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
-    fs.linkSync(tmp, target);
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw err;
-  } finally {
-    fs.unlinkSync(tmp);
-  }
-}
-
-export interface LockDeps {
-  /** The relay's own liveness verdict for a holder (default: anchorLivenessVerdict). */
-  judge?: (holder: LockBody) => AnchorVerdict;
-  /** Test seam: runs between judging a dead holder and taking the takeover file. */
-  beforeTakeover?: () => void;
-}
-
-const defaultJudge = (h: LockBody): AnchorVerdict => anchorLivenessVerdict({ host_id: h.host_id, agent_pid: h.pid, agent_pid_start: h.proc_start });
-
-/** Take the instance lock in `stateDir` for `me`. */
-export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_start: string | null; host_id: string | null }, deps: LockDeps = {}): LockResult {
-  ensurePrivateDir(stateDir);
-  const judge = deps.judge ?? defaultJudge;
-  const lockPath = path.join(stateDir, LOCK_FILENAME);
-  const takeoverPath = path.join(stateDir, TAKEOVER_FILENAME);
-  const body: LockBody = { v: 1, ...me, token: randomUUID() };
-  const describe = (h: LockBody) => `pid ${h.pid}${h.host_id ? ` on host ${h.host_id}` : ""}`;
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (createExclusive(stateDir, lockPath, body)) return { ok: true, handle: { path: lockPath, token: body.token }, tookOver: false };
-    const held = readLockFile(lockPath);
-    if (held.kind === "absent") continue; // released between our attempt and the read: try again
-    if (held.kind === "unreadable") return { ok: false, reason: `${held.reason}: refusing to start (remove it only if no doorbell runs for this instance)` };
-    const verdict = judge(held.body);
-    if (verdict === "alive") return { ok: false, reason: `another doorbell (${describe(held.body)}) is running for this instance` };
-    if (verdict === "unverifiable") return { ok: false, reason: `the instance lock is held by ${describe(held.body)}, whose liveness cannot be verified from this host: refusing (fail closed)` };
-    // DEAD holder: take over, EXCLUSIVELY.
-    deps.beforeTakeover?.();
-    const takeoverBody: LockBody = { v: 1, ...me, token: randomUUID() };
-    if (!createExclusive(stateDir, takeoverPath, takeoverBody)) {
-      const other = readLockFile(takeoverPath);
-      if (other.kind === "ok" && judge(other.body) === "dead") {
-        // A crash mid-takeover left it: remove it and retry ONCE (the known limit is in the header).
-        try {
-          fs.unlinkSync(takeoverPath);
-        } catch {
-          /* already gone */
-        }
-        continue;
-      }
-      return { ok: false, reason: "another start is taking over this instance's lock right now: refusing" };
-    }
-    try {
-      const again = readLockFile(lockPath);
-      if (again.kind !== "ok" || again.body.token !== held.body.token) {
-        // It changed while we judged it: judge the NEW holder on the next pass.
-        continue;
-      }
-      const tmp = path.join(stateDir, `.lock-tmp-${body.token}`);
-      const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
-      try {
-        fs.writeSync(fd, JSON.stringify(body) + "\n");
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      fs.renameSync(tmp, lockPath);
-      const mine = readLockFile(lockPath);
-      if (mine.kind !== "ok" || mine.body.token !== body.token) return { ok: false, reason: "the instance lock changed during the takeover: refusing" };
-      return { ok: true, handle: { path: lockPath, token: body.token }, tookOver: true };
+      const o = JSON.parse(fs.readFileSync(fd, "utf-8")) as Record<string, unknown>;
+      if (!Number.isInteger(o.pid) || typeof o.since !== "string") return null;
+      return { pid: o.pid as number, proc_start: typeof o.proc_start === "string" ? o.proc_start : null, host_id: typeof o.host_id === "string" ? o.host_id : null, since: o.since };
     } finally {
-      try {
-        fs.unlinkSync(takeoverPath);
-      } catch {
-        /* best effort: a leftover is judged dead next time */
-      }
+      fs.closeSync(fd);
     }
-  }
-  return { ok: false, reason: "the instance lock could not be taken (it kept changing): refusing" };
-}
-
-/** Is the lock still ours? (The running job checks this before every cycle.) */
-export function lockStillOurs(h: LockHandle): boolean {
-  const r = readLockFile(h.path);
-  return r.kind === "ok" && r.body.token === h.token;
-}
-
-/** Release the lock, only if it is still ours. */
-export function releaseInstanceLock(h: LockHandle): void {
-  if (!lockStillOurs(h)) return;
-  try {
-    fs.unlinkSync(h.path);
   } catch {
-    /* gone already */
+    return null;
   }
+}
+
+/** Take the instance lock in `stateDir`. Throws only on an environment fault (the caller exits 1). */
+export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_start: string | null; host_id: string | null }, now: () => string = () => new Date().toISOString()): LockResult {
+  ensurePrivateDir(stateDir);
+  const lockPath = path.join(stateDir, LOCK_DB_FILENAME);
+  let pre: fs.Stats | null = null;
+  try {
+    pre = fs.lstatSync(lockPath);
+  } catch {
+    pre = null;
+  }
+  if (pre && (pre.isSymbolicLink() || !pre.isFile())) throw new Error(`${lockPath} is not a regular file (a symlink or another type): refusing to lock through it`);
+  const db = new Database(lockPath, { timeout: 0 });
+  try {
+    db.exec("BEGIN EXCLUSIVE"); // the FIRST statement: no pragma, no read before it (the trap)
+  } catch (err) {
+    db.close();
+    if ((err as { code?: string }).code === "SQLITE_BUSY") {
+      return { ok: false, reason: "another doorbell holds this instance's lock", holder: readHolderInfo(stateDir) };
+    }
+    throw err;
+  }
+  HELD.add(db); // pinned: a collected connection would silently drop the lock
+  const st = fs.lstatSync(lockPath); // the inode we now hold (lstat: never a second descriptor)
+  try {
+    const tmp = path.join(stateDir, `.holder-tmp-${me.pid}`);
+    fs.writeFileSync(tmp, JSON.stringify({ pid: me.pid, proc_start: me.proc_start, host_id: me.host_id, since: now() }) + "\n", { mode: 0o600, flag: "w" });
+    fs.renameSync(tmp, path.join(stateDir, HOLDER_FILENAME));
+  } catch {
+    /* the sidecar is display-only: its failure never affects the lock */
+  }
+  return { ok: true, handle: { db, path: lockPath, dev: st.dev, ino: st.ino } };
+}
+
+/** Does the lock path still name the inode we hold? (lstat only: never a second descriptor.) */
+export function lockStillOurs(h: LockHandle): boolean {
+  try {
+    const st = fs.lstatSync(h.path);
+    return st.isFile() && st.dev === h.dev && st.ino === h.ino;
+  } catch {
+    return false;
+  }
+}
+
+/** Release: roll back and close the ONE connection (the kernel drops the lock with it). */
+export function releaseInstanceLock(h: LockHandle): void {
+  try {
+    h.db.exec("ROLLBACK");
+  } catch {
+    /* nothing to roll back */
+  }
+  try {
+    h.db.close();
+  } catch {
+    /* already closed */
+  }
+  HELD.delete(h.db);
 }

@@ -51,7 +51,7 @@ import { performance } from "perf_hooks";
 import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
 import { conditionOf, HEARTBEAT_FILENAME, MAX_COUNT, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
-import { acquireInstanceLock, EXIT_ALREADY_RUNNING, lockStillOurs, releaseInstanceLock, type LockDeps, type LockHandle } from "./doorbell-lock.js";
+import { acquireInstanceLock, EXIT_ALREADY_RUNNING, lockStillOurs, releaseInstanceLock, type LockHandle } from "./doorbell-lock.js";
 import { AGENT_NAME_PATTERN } from "./types.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
@@ -166,8 +166,6 @@ export interface DoorbellOptions {
   beforeCycle?: (n: number) => void;
   /** After each heartbeat write (the structural test watches every write). */
   onHeartbeat?: (hb: Heartbeat) => void;
-  /** Test seam: the instance lock's liveness judge and takeover hook. */
-  lockDeps?: LockDeps;
   /** Test seam: alter a cycle's plan before it is written (e.g. to make the writer refuse a record). */
   mutatePlan?: (plan: ReturnType<typeof planCycle>) => void;
 }
@@ -211,15 +209,15 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
   const procStart = processStartedAt(process.pid); // the ONE UTC producer (#296), never its own ps
   let lock: ReturnType<typeof acquireInstanceLock>;
   try {
-    lock = acquireInstanceLock(stateDirFor(dbPath), { pid: process.pid, proc_start: procStart, host_id: getOwnHostId() }, opts.lockDeps);
+    lock = acquireInstanceLock(stateDirFor(dbPath), { pid: process.pid, proc_start: procStart, host_id: getOwnHostId() });
   } catch (err) {
     return fail(`the instance lock could not be taken (${err instanceof Error ? err.message : String(err)})`);
   }
   if (!lock.ok) {
-    process.stderr.write(`DOORBELL_ALREADY_RUNNING: ${lock.reason}\n`);
+    const h = lock.holder;
+    process.stderr.write(`DOORBELL_ALREADY_RUNNING: ${lock.reason}${h ? ` (held by pid ${h.pid} since ${h.since}, per its sidecar)` : ""}\n`);
     return EXIT_ALREADY_RUNNING;
   }
-  if (lock.tookOver) process.stderr.write("doorbell: took over the instance lock from a dead holder\n");
   try {
     return await runLocked(args, opts, resolution, dbPath, procStart, lock.handle);
   } finally {
@@ -489,7 +487,7 @@ async function runLocked(
       let failStop = false;
       // F5: still the ONLY doorbell for this instance? Never act on a state dir we no longer own.
       if (!lockStillOurs(lockHandle)) {
-        process.stderr.write("DOORBELL_FAILED: the instance lock is no longer ours (another doorbell took it): stopping\n");
+        process.stderr.write("DOORBELL_FAILED: the instance lock file was removed or replaced (another doorbell could lock it): stopping\n");
         code = 1;
         break;
       }

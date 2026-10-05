@@ -114,6 +114,8 @@ export interface DoorbellStatus {
     install_dir: string;
   } | null;
   escalations: { open: number; items: Array<{ agent: string; reason: string; operator: string | null; opened_at: string; age_seconds: number }> };
+  /** Who last took the instance lock, from its NON-authoritative sidecar (display only; the lock itself is kernel-held). */
+  holder: { pid: number; proc_start: string | null; host_id: string | null; since: string } | null;
   state_dir: string;
   db_path: string;
   resolution: Record<string, unknown> | null;
@@ -147,6 +149,8 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
   const { readHeartbeat, judgeHeartbeat } = await import("../doorbell-heartbeat.js");
   const stateDir = stateDirFor(dbPath);
   const hb = readHeartbeat(stateDir);
+  const { readHolderInfo } = await import("../doorbell-lock.js");
+  const holder = readHolderInfo(stateDir);
   if (hb.kind === "unreadable") throw new Error(hb.reason);
 
   // OPEN escalations, from the log (read-only, no-follow, validated; an invalid log is unreadable).
@@ -167,7 +171,7 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
   }
 
   if (hb.kind === "absent") {
-    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, state_dir: stateDir, db_path: dbPath, resolution };
+    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, holder, state_dir: stateDir, db_path: dbPath, resolution };
   }
   const h = hb.heartbeat;
   const judged = judgeHeartbeat(h, nowWall);
@@ -197,6 +201,7 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
       install_dir: h.install_dir,
     },
     escalations: { open: items.length, items },
+    holder,
     state_dir: stateDir,
     db_path: dbPath,
     resolution,
