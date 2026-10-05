@@ -198,7 +198,7 @@ describe("Q6: the hook's lines (pure renderer)", () => {
       condition: "waiting-for-writer",
       heartbeat: {
         at: iso(NOW), age_seconds: 1, pid: 1, proc_start: null, started_at: iso(NOW), starts: 1, starts_since: iso(NOW), cycles: 1, interval_ms: intervalMs,
-        condition_since: iso(NOW - ageSeconds * 1000), condition_age_seconds: ageSeconds, consecutive_failures: 0, cycle_failures: 0, last_failure: null, install_dir: "/x",
+        condition_since: iso(NOW - ageSeconds * 1000), condition_age_seconds: Math.round(ageSeconds), condition_age_ms: Math.round(ageSeconds * 1000), consecutive_failures: 0, cycle_failures: 0, last_failure: null, install_dir: "/x",
       },
     });
   it("F1 (ruling b556c011): waiting-for-writer is SILENT within its grace, max(3 × interval, 60 s), and ONE line beyond it — both sides", () => {
@@ -207,6 +207,11 @@ describe("Q6: the hook's lines (pure renderer)", () => {
     expect(S.hookLines(waiting(90, 30_000))).toEqual([]); // 30 s interval → 90 s grace
     expect(S.hookLines(waiting(91, 30_000))).toHaveLength(1);
     expect(S.hookLines(waiting(3600))[0]).toMatch(/waiting for a writer for 60m/);
+  });
+  it("HARM (#304 R2 #4): the grace is compared on UNROUNDED milliseconds: 60.001–60.499 s is past a 60 s grace, not rounded back into it", () => {
+    expect(S.hookLines(waiting(60.001))).toHaveLength(1);
+    expect(S.hookLines(waiting(60.4))).toHaveLength(1);
+    expect(S.hookLines(waiting(60))).toEqual([]); // the edge itself is still within
   });
   it("HARM: stale, a non-CURRENT build, log-full, failing, or ANY open escalation → one line", () => {
     for (const over of [{ state: "stale" as const }, { build: { verdict: "STALE", reason: "" } }, { build: { verdict: "UNKNOWN", reason: "" } }, { condition: "log-full" }, { condition: "failing" }, { escalations: { open: 1, items: esc(1) } }]) {
@@ -320,6 +325,34 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
     const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
     expect(r.stdout).not.toContain("INJECTED");
     expect(r.stdout.split("\n").filter((l) => l.startsWith("[RELAY] doorbell stub line"))).toHaveLength(7);
+  });
+  it("HARM (#304 R2 #1): a CLI that floods its output INSIDE its budget cannot stall the hook afterwards: the filter reads a BOUNDED input", () => {
+    // 1,000,000 rejected lines, written well within the step's watchdog. Unbounded, the filter
+    // loop alone took 12.5 s (R2, measured; 15 s for the whole hook here), past the 10 s budget.
+    const copy = path.join(home, "flood");
+    fs.cpSync(path.join(REPO, "hooks"), path.join(copy, "hooks"), { recursive: true });
+    fs.mkdirSync(path.join(copy, "bin"));
+    fs.symlinkSync(path.join(REPO, "dist"), path.join(copy, "dist"));
+    fs.writeFileSync(
+      path.join(copy, "bin", "relay"),
+      `if (process.argv[2] === "doorbell") { process.stdout.write("[RELAY] doorbell flood head\\n" + "noise line\\n".repeat(1000000)); process.exit(0); }\n` +
+        `const r = require("child_process").spawnSync(process.execPath, [${JSON.stringify(path.join(REPO, "bin", "relay"))}, ...process.argv.slice(2)], { stdio: "inherit" });\n` +
+        `process.exit(r.status ?? 1);\n`,
+    );
+    const t0 = Date.now();
+    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 40_000 });
+    const elapsed = Date.now() - t0;
+    expect(r.stdout).toContain("[RELAY] doorbell flood head"); // precondition: the step ran and read the output
+    expect(r.stdout).toMatch(/\[RELAY\] VERDICT=/);
+    expect(elapsed, `the hook took ${elapsed} ms`).toBeLessThan(10_000); // inside the hook's one budget
+  }, 60_000);
+  it("HARM (#304 R2 #5): temp files whose paths contain a SPACE are still removed at exit (one path per entry, never word-split)", () => {
+    const spaced = path.join(home, "tmp with space");
+    fs.mkdirSync(spaced);
+    const r = hookCopyWith(`mktemp() { command mktemp "${spaced}/tmp.XXXXXX"; }`);
+    expect(r.stdout).toMatch(/\[RELAY\] VERDICT=/); // precondition: the hook ran to its end
+    expect(r.stderr).not.toMatch(/could not create a private temp file/); // precondition: the allocations succeeded
+    expect(fs.readdirSync(spaced)).toEqual([]);
   });
   it("never silent: no relay CLI beside the hook → the hook is DEGRADED naming the missing CLI (before the doorbell step)", () => {
     const copy = path.join(home, "nocli");

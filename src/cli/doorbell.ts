@@ -108,6 +108,8 @@ export interface DoorbellStatus {
     interval_ms: number;
     condition_since: string;
     condition_age_seconds: number;
+    /** Unrounded (≥ 0): the waiting grace is compared on this, never on the rounded seconds. */
+    condition_age_ms: number;
     consecutive_failures: number;
     cycle_failures: number;
     last_failure: { at: string; kind: string } | null;
@@ -129,7 +131,7 @@ export interface DoorbellStatus {
 export function hookLines(st: DoorbellStatus): string[] {
   if (st.state === "not-installed") return [];
   const hb = st.heartbeat;
-  const waitingTooLong = st.condition === "waiting-for-writer" && !!hb && hb.condition_age_seconds * 1000 > waitingGraceMs(hb.interval_ms);
+  const waitingTooLong = st.condition === "waiting-for-writer" && !!hb && hb.condition_age_ms > waitingGraceMs(hb.interval_ms);
   const quietCondition = st.condition === "ok" || (st.condition === "waiting-for-writer" && !waitingTooLong);
   const allWellOtherwise = st.state === "healthy" && st.build?.verdict === "CURRENT" && st.escalations.open === 0;
   if (allWellOtherwise && quietCondition) return [];
@@ -175,6 +177,8 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
   }
   const h = hb.heartbeat;
   const judged = judgeHeartbeat(h, nowWall);
+  // A condition_since in the future (the clock went back) reads as age 0: the writer resets it.
+  const conditionAgeMs = Math.max(0, nowWall - Date.parse(h.condition_since));
   const { verdictForBuild, readInstalled } = await import("../fleet-verdicts.js");
   const b = verdictForBuild(h.build as unknown as import("../fleet-verdicts.js").LoadedFacts, readInstalled(h.install_dir));
   return {
@@ -194,7 +198,8 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
       cycles: h.cycles,
       interval_ms: h.interval_ms,
       condition_since: h.condition_since,
-      condition_age_seconds: Math.max(0, Math.round((nowWall - Date.parse(h.condition_since)) / 1000)),
+      condition_age_seconds: Math.round(conditionAgeMs / 1000),
+      condition_age_ms: conditionAgeMs,
       consecutive_failures: h.consecutive_failures,
       cycle_failures: h.cycle_failures,
       last_failure: h.last_failure,

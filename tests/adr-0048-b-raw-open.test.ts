@@ -121,7 +121,11 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
    *   - src/cli/_instance-db.ts (openRawRelayDb, the verbs' raw handle),
    * plus ONE named exception that never opens the relay DB:
    *   - src/doorbell-lock.ts  (the doorbell's kernel-held instance lock: its OWN file,
-   *     `<state dir>/doorbell.lock.db`; pinned by the next test).
+   *     `<state dir>/doorbell.lock.db`; pinned by the next test). Why: a kernel lock needs
+   *     a held driver connection, and this one never opens the relay DB, so the post-open
+   *     re-check has nothing to guard. Ruling ecf50062; exception accepted in c79321c9.
+   *     That the state dir is the RESOLVED instance's is pinned in
+   *     tests/doorbell-pr5-heartbeat.test.ts ("the lock lives in the RESOLVED instance's state dir").
    * Type declarations (.d.ts) are not code.
    */
   it("the SQLite driver is referenced in src/ ONLY by the three checked modules", () => {

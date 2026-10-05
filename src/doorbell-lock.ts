@@ -22,14 +22,23 @@
  *     network filesystem's locking is not reliable.
  *   - Deleting the lock file would let a new starter lock a NEW file while we still hold the old
  *     one, so the job checks before every attempt that the path still names the inode it locked.
+ *   - The inode recorded is the one LOCKED (#304 R2 #2): the job creates the file itself when absent
+ *     (exclusive, no-follow, before any lock exists), lstat()s it BEFORE the driver opens it and
+ *     AFTER BEGIN EXCLUSIVE, and refuses on any difference: the path was replaced in between, so the
+ *     connection may hold a file nobody else will ever lock. Residual: a replace AND a put-back of
+ *     the original inode inside that window is not seen (deliberate tampering, not a racing job).
  *   - A sidecar `doorbell.lock.holder.json` (pid, proc_start, host_id, since) is written for the
- *     status verb's "held by …" line ONLY. Correctness never reads it.
+ *     status verb's "held by …" line ONLY. Correctness never reads it. Its temp file has a RANDOM
+ *     name and is created O_EXCL|O_NOFOLLOW (#304 R2 #3): a link planted there (to the lock DB) is
+ *     refused, never written through. A second descriptor on the lock DB, closed, would drop our
+ *     POSIX lock. Any sidecar failure only loses the display.
  *   - ⚠ GARBAGE COLLECTION (MEASURED 2026-10-05): a better-sqlite3 connection nobody references is
  *     CLOSED when it is collected, and the kernel lock goes with it. With the handle unreferenced,
  *     8 racers held SIMULTANEOUSLY in 15 of 20 rounds; pinned, exactly one in 20 of 20. So every
  *     held connection is pinned HERE, in a module-level set, until releaseInstanceLock: the lock can
  *     never depend on a caller happening to keep its handle alive.
  */
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
@@ -78,13 +87,15 @@ export function readHolderInfo(stateDir: string): HolderInfo | null {
 export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_start: string | null; host_id: string | null }, now: () => string = () => new Date().toISOString()): LockResult {
   ensurePrivateDir(stateDir);
   const lockPath = path.join(stateDir, LOCK_DB_FILENAME);
-  let pre: fs.Stats | null = null;
+  // Create it OURSELVES when absent, before any lock exists (closing this descriptor drops nothing),
+  // so there is always an identity to take BEFORE the driver opens the path.
   try {
-    pre = fs.lstatSync(lockPath);
-  } catch {
-    pre = null;
+    fs.closeSync(fs.openSync(lockPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600));
+  } catch (err) {
+    if ((err as { code?: string }).code !== "EEXIST") throw err;
   }
-  if (pre && (pre.isSymbolicLink() || !pre.isFile())) throw new Error(`${lockPath} is not a regular file (a symlink or another type): refusing to lock through it`);
+  const pre = fs.lstatSync(lockPath);
+  if (pre.isSymbolicLink() || !pre.isFile()) throw new Error(`${lockPath} is not a regular file (a symlink or another type): refusing to lock through it`);
   const db = new Database(lockPath, { timeout: 0 });
   try {
     db.exec("BEGIN EXCLUSIVE"); // the FIRST statement: no pragma, no read before it (the trap)
@@ -96,15 +107,39 @@ export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_st
     throw err;
   }
   HELD.add(db); // pinned: a collected connection would silently drop the lock
-  const st = fs.lstatSync(lockPath); // the inode we now hold (lstat: never a second descriptor)
+  const handle: LockHandle = { db, path: lockPath, dev: pre.dev, ino: pre.ino };
+  // The inode LOCKED is the one the path named before the open, only if it still names it now.
+  if (!lockStillOurs(handle)) {
+    releaseInstanceLock(handle);
+    throw new Error(`${lockPath} was replaced while it was being locked (another process changed the path): refusing`);
+  }
+  writeHolderSidecar(stateDir, { pid: me.pid, proc_start: me.proc_start, host_id: me.host_id, since: now() });
+  return { ok: true, handle };
+}
+
+/** Display-only: never through a link, never a second descriptor on the lock DB; failure loses only the display. */
+function writeHolderSidecar(stateDir: string, info: HolderInfo): void {
+  const tmp = path.join(stateDir, `.holder-tmp-${crypto.randomBytes(8).toString("hex")}`);
+  let fd: number;
   try {
-    const tmp = path.join(stateDir, `.holder-tmp-${me.pid}`);
-    fs.writeFileSync(tmp, JSON.stringify({ pid: me.pid, proc_start: me.proc_start, host_id: me.host_id, since: now() }) + "\n", { mode: 0o600, flag: "w" });
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+  } catch {
+    return; // something already at the name (a planted link included): no sidecar this start
+  }
+  try {
+    try {
+      fs.writeSync(fd, JSON.stringify(info) + "\n");
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmp, path.join(stateDir, HOLDER_FILENAME));
   } catch {
-    /* the sidecar is display-only: its failure never affects the lock */
+    try {
+      fs.unlinkSync(tmp); // ours: created exclusively above
+    } catch {
+      /* already gone */
+    }
   }
-  return { ok: true, handle: { db, path: lockPath, dev: st.dev, ino: st.ino } };
 }
 
 /** Does the lock path still name the inode we hold? (lstat only: never a second descriptor.) */

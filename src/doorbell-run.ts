@@ -50,7 +50,7 @@ import { getOwnHostId, processStartedAt } from "./liveness.js";
 import { performance } from "perf_hooks";
 import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
-import { conditionOf, HEARTBEAT_FILENAME, MAX_COUNT, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
+import { conditionOf, FUTURE_TOLERANCE_MS, HEARTBEAT_FILENAME, MAX_COUNT, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
 import { acquireInstanceLock, EXIT_ALREADY_RUNNING, lockStillOurs, releaseInstanceLock, type LockHandle } from "./doorbell-lock.js";
 import { AGENT_NAME_PATTERN } from "./types.js";
 
@@ -443,8 +443,12 @@ async function runLocked(
       lastFailure = { at, kind: attempt.failed };
     }
     // F1: when the CURRENT condition began; it moves only on a change (carried across a restart).
+    // A condition_since more than FUTURE_TOLERANCE_MS ahead of now (the wall clock went BACK) resets
+    // to now, like the heartbeat's own future rule: carried, it would read as age 0 for as long as
+    // the jump, and silence the waiting warning for hours, across restarts too (#304 R2 #4).
     const cond = conditionOf(attempt, consecutiveFailures);
-    if (cond !== condition || !conditionSince) {
+    const sinceInFuture = conditionSince !== null && Date.parse(conditionSince) - Date.parse(at) > FUTURE_TOLERANCE_MS;
+    if (cond !== condition || !conditionSince || sinceInFuture) {
       condition = cond;
       conditionSince = at;
     }

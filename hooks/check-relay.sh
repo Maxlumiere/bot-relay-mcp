@@ -65,10 +65,25 @@ RELAY_VERDICT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # CANNOT-JUDGE at exit. Defined here, after the helper, so a helper that failed
 # to load still leaves the fallback trap in place.
 RELAY_MAIL_READ_DONE=0
+# Temp files removed at exit: ONE path per line, so a path containing a space (a TMPDIR
+# with one) stays one path (#304 R2 #5). Register with relay_tmp_register, never by hand.
 RELAY_TMP_FILES=""
+relay_tmp_register() {
+  local f
+  for f in "$@"; do
+    [ -n "$f" ] && RELAY_TMP_FILES="${RELAY_TMP_FILES}${f}
+"
+  done
+}
 relay_finalize_verdict() {
-  # shellcheck disable=SC2086 # a space-separated list of mktemp paths
-  [ -n "$RELAY_TMP_FILES" ] && rm -f $RELAY_TMP_FILES 2>/dev/null
+  if [ -n "$RELAY_TMP_FILES" ]; then
+    # Split on newlines only, with globbing off: each entry is removed as the one path it is.
+    local f IFS='
+'
+    set -f
+    for f in $RELAY_TMP_FILES; do rm -f -- "$f" 2>/dev/null; done
+    set +f
+  fi
   if [ "$RELAY_VERDICT" = "HEALTHY" ] && [ "${RELAY_MAIL_READ_DONE:-0}" != "1" ]; then
     RELAY_VERDICT="CANNOT-JUDGE"
     RELAY_VERDICT_REASON="health unverified: the session-start mail read did not complete"
@@ -669,7 +684,7 @@ relay_deliver_pending_mail() {
     if [ -z "$outf" ] || [ -z "$errf" ]; then
       why="could not create a private temp file for the read"
     else
-      RELAY_TMP_FILES="$RELAY_TMP_FILES $outf $errf $outf.timedout"
+      relay_tmp_register "$outf" "$errf" "$outf.timedout"
       # node runs DIRECTLY into files under a watchdog, inside what is LEFT of this
       # hook's installed budget (relay_run_pending / relay_pending_deadline).
       if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
@@ -1351,6 +1366,8 @@ fi
 # failed this hook's instance resolution, loudly. Still never silent here (review c927c81c D1):
 # a missing node or CLI raises DEGRADED naming WHICH, without relying on that distant guarantee.
 RELAY_DOORBELL_BIN="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+RELAY_DOORBELL_MAX_BYTES=16384
+RELAY_DOORBELL_MAX_LINES=64
 if ! command -v node >/dev/null 2>&1; then
   relay_verdict_raise "DEGRADED" "doorbell status: node not found" " agent=\"${AGENT_NAME:-}\"" other
 elif [ ! -f "$RELAY_DOORBELL_BIN" ]; then
@@ -1360,25 +1377,31 @@ else
     # Each temp file is registered for the exit cleanup THE MOMENT it exists, so a second
     # mktemp failing can never leak the first (#304 R1 F6).
     RELAY_DOORBELL_OUT="$(mktemp 2>/dev/null || printf '')"
-    [ -n "$RELAY_DOORBELL_OUT" ] && RELAY_TMP_FILES="$RELAY_TMP_FILES $RELAY_DOORBELL_OUT $RELAY_DOORBELL_OUT.timedout"
+    [ -n "$RELAY_DOORBELL_OUT" ] && relay_tmp_register "$RELAY_DOORBELL_OUT" "$RELAY_DOORBELL_OUT.timedout"
     RELAY_DOORBELL_ERR="$(mktemp 2>/dev/null || printf '')"
-    [ -n "$RELAY_DOORBELL_ERR" ] && RELAY_TMP_FILES="$RELAY_TMP_FILES $RELAY_DOORBELL_ERR"
+    [ -n "$RELAY_DOORBELL_ERR" ] && relay_tmp_register "$RELAY_DOORBELL_ERR"
     if [ -n "$RELAY_DOORBELL_OUT" ] && [ -n "$RELAY_DOORBELL_ERR" ]; then
       relay_run_bounded "$RELAY_STEP_SECS" /dev/null "$RELAY_DOORBELL_OUT" "$RELAY_DOORBELL_ERR" node "$RELAY_DOORBELL_BIN" doorbell status --hook
       RELAY_DOORBELL_RC=$?
       case "$RELAY_DOORBELL_RC" in
         0)
-          RELAY_DOORBELL_N=0
-          while IFS= read -r RELAY_DOORBELL_LINE && [ "$RELAY_DOORBELL_N" -lt 7 ]; do
-            case "$RELAY_DOORBELL_LINE" in
-              "[RELAY]"*) printf '%s\n' "$RELAY_DOORBELL_LINE"; RELAY_DOORBELL_N=$((RELAY_DOORBELL_N + 1)) ;;
-            esac
-          done < "$RELAY_DOORBELL_OUT"
+          # The watchdog bounds the CLI, not what it left behind: the filter reads at most
+          # RELAY_DOORBELL_MAX_BYTES and RELAY_DOORBELL_MAX_LINES of it, so a CLI that floods its
+          # output inside its budget cannot stall this hook afterwards (#304 R2 #1). Real output
+          # is at most 7 short lines.
+          head -c "$RELAY_DOORBELL_MAX_BYTES" "$RELAY_DOORBELL_OUT" 2>/dev/null | head -n "$RELAY_DOORBELL_MAX_LINES" | {
+            RELAY_DOORBELL_N=0
+            while IFS= read -r RELAY_DOORBELL_LINE && [ "$RELAY_DOORBELL_N" -lt 7 ]; do
+              case "$RELAY_DOORBELL_LINE" in
+                "[RELAY]"*) printf '%s\n' "$RELAY_DOORBELL_LINE"; RELAY_DOORBELL_N=$((RELAY_DOORBELL_N + 1)) ;;
+              esac
+            done
+          }
           ;;
         3) : ;;
         124) relay_verdict_raise "DEGRADED" "doorbell status timed out after ${RELAY_STEP_SECS}s" " agent=\"${AGENT_NAME:-}\"" other ;;
         *)
-          RELAY_DOORBELL_WHY=$(grep -m 1 'DOORBELL_STATUS_FAILED' "$RELAY_DOORBELL_ERR" 2>/dev/null | tr -d '"' | cut -c1-200)
+          RELAY_DOORBELL_WHY=$(head -c "$RELAY_DOORBELL_MAX_BYTES" "$RELAY_DOORBELL_ERR" 2>/dev/null | grep -m 1 'DOORBELL_STATUS_FAILED' | tr -d '"' | cut -c1-200)
           relay_verdict_raise "DEGRADED" "doorbell status unreadable: ${RELAY_DOORBELL_WHY:-exit $RELAY_DOORBELL_RC}" " agent=\"${AGENT_NAME:-}\"" other
           ;;
       esac

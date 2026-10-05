@@ -305,6 +305,17 @@ describe.skipIf(!HOST)("#304 R1 F1: condition_since", () => {
     await job(["--once"], { clock: fakeClock(T + 180_000) });
     expect([onDisk()?.condition, onDisk()?.condition_since]).toEqual(["ok", new Date(T + 180_000).toISOString()]); // moved
   });
+  it("HARM (#304 R2 #4): a BACKWARD clock jump never leaves condition_since in the FUTURE: beyond the 5 s tolerance it resets to now (within it, it is kept)", async () => {
+    db.closeDb(); // no WAL sidecars → waiting-for-writer
+    await job(["--once"], { clock: fakeClock(T) });
+    await job(["--once"], { clock: fakeClock(T - HBM.FUTURE_TOLERANCE_MS + 1000) }); // back 4 s: within the tolerance
+    expect(onDisk()?.condition_since).toBe(new Date(T).toISOString()); // kept
+    await job(["--once"], { clock: fakeClock(T - 3_600_000) }); // back an hour
+    expect([onDisk()?.condition, onDisk()?.condition_since]).toEqual(["waiting-for-writer", new Date(T - 3_600_000).toISOString()]); // reset to now
+    await job(["--once"], { clock: fakeClock(T - 3_600_000 + 120_000) }); // 2 min later, still waiting
+    const hb = onDisk()!;
+    expect(Date.parse(hb.at) - Date.parse(hb.condition_since)).toBe(120_000); // so its age is real again: past the 60 s grace
+  });
 });
 
 describe.skipIf(!HOST)("#304 R1 F7: every counter stays inside what its reader accepts", () => {
@@ -411,14 +422,17 @@ describe.skipIf(!HOST)("#304 F5 (ruling ecf50062): the KERNEL-held instance lock
     const { spawnSync } = await import("child_process");
     const opens = vi.spyOn(fs, "openSync");
     const seenByOther: string[] = [];
+    let heldFrom = -1; // the openSync calls made while the lock is HELD (the first cycle runs after acquisition)
     try {
       await loop(3, {
         beforeCycle: (k) => {
+          if (k === 0) heldFrom = opens.mock.calls.length;
           if (k === 1) seenByOther.push(spawnSync(process.execPath, ["--input-type=module", "-e", lockChildScript(STATE, 0)], { encoding: "utf-8" }).stdout.trim());
         },
       });
       expect(seenByOther).toEqual(["busy"]); // after cleanup, compaction and heartbeats: still ours
-      expect(opens.mock.calls.filter(([p]) => String(p).endsWith(LK.LOCK_DB_FILENAME))).toEqual([]);
+      expect(heldFrom).toBeGreaterThanOrEqual(0); // precondition: the job reached its first cycle
+      expect(opens.mock.calls.slice(heldFrom).filter(([p]) => String(p).endsWith(LK.LOCK_DB_FILENAME))).toEqual([]);
     } finally {
       opens.mockRestore();
     }
@@ -448,6 +462,62 @@ describe.skipIf(!HOST)("#304 F5 (ruling ecf50062): the KERNEL-held instance lock
       Object.assign(Database.prototype, orig);
     }
   });
+  it("HARM (#304 R2 #2): the path REPLACED between the driver's open and the identity check → the start REFUSES (it never records an inode it did not lock)", async () => {
+    const { default: Database } = await import("better-sqlite3");
+    const orig = Database.prototype.exec;
+    for (const preExisting of [false, true]) {
+      fs.rmSync(STATE, { recursive: true, force: true });
+      fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
+      if (preExisting) fs.writeFileSync(LOCKFILE(), "", { mode: 0o600 });
+      let replaced = false;
+      // Right after BEGIN EXCLUSIVE locks the opened file, a new file is renamed over the path.
+      Database.prototype.exec = function (this: InstanceType<typeof Database>, sql: string) {
+        const r = orig.call(this, sql);
+        if (sql === "BEGIN EXCLUSIVE" && !replaced) {
+          replaced = true;
+          const other = path.join(STATE, "other.db");
+          fs.writeFileSync(other, "", { mode: 0o600 });
+          fs.renameSync(other, LOCKFILE());
+        }
+        return r;
+      } as typeof orig;
+      let threw: unknown = null;
+      let res: ReturnType<typeof LK.acquireInstanceLock> | null = null;
+      try {
+        res = LK.acquireInstanceLock(STATE, { pid: process.pid, proc_start: null, host_id: HOST });
+      } catch (err) {
+        threw = err;
+      } finally {
+        Database.prototype.exec = orig;
+      }
+      if (res?.ok) LK.releaseInstanceLock(res.handle);
+      expect(replaced, `preExisting=${preExisting}`).toBe(true); // precondition: the replace happened
+      expect(String(threw), `preExisting=${preExisting}: a start that "holds" a lock on a path another job can lock`).toMatch(/replaced while it was being locked/);
+    }
+  });
+  it("HARM (#304 R2 #3): a link planted at the holder sidecar's temp name never writes through to the lock DB: the DB is untouched and the lock is still held", async () => {
+    const crypto = (await import("crypto")).default;
+    fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(LOCKFILE(), "", { mode: 0o600 });
+    const fixed = Buffer.alloc(8, 7);
+    const rb = vi.spyOn(crypto, "randomBytes").mockImplementation(((n: number) => (n === 8 ? fixed : Buffer.alloc(n, 7))) as typeof crypto.randomBytes);
+    // Both spellings a sidecar temp has had: the pid-based one and the random one.
+    for (const name of [`.holder-tmp-${process.pid}`, `.holder-tmp-${fixed.toString("hex")}`]) fs.symlinkSync(LOCKFILE(), path.join(STATE, name));
+    try {
+      const r = LK.acquireInstanceLock(STATE, { pid: process.pid, proc_start: null, host_id: HOST });
+      expect(r.ok).toBe(true);
+      try {
+        // stat, never a read: opening and closing the lock DB in THIS process would itself drop the lock.
+        expect(fs.statSync(LOCKFILE()).size, "the lock DB was written through the planted link").toBe(0);
+        const { spawnSync } = await import("child_process");
+        expect(spawnSync(process.execPath, ["--input-type=module", "-e", lockChildScript(STATE, 0)], { encoding: "utf-8" }).stdout.trim()).toBe("busy"); // still held
+      } finally {
+        if (r.ok) LK.releaseInstanceLock(r.handle);
+      }
+    } finally {
+      rb.mockRestore();
+    }
+  });
   it("HARM: the lock FILE removed under a running job → it stops before its next attempt (a new starter could lock a new file)", async () => {
     const r = await loop(10, {
       beforeCycle: (k) => {
@@ -463,5 +533,36 @@ describe.skipIf(!HOST)("#304 F5 (ruling ecf50062): the KERNEL-held instance lock
     fs.writeFileSync(path.join(STATE, LK.HOLDER_FILENAME), "{garbage");
     expect((await job(["--once"], { clock: fakeClock(T) })).code).toBe(0);
     expect(LK.readHolderInfo(STATE)?.pid).toBe(process.pid); // rewritten by the start that took the lock
+  });
+  it("the lock lives in the RESOLVED instance's state dir (stateDirFor(the resolver's dbPath)): a holder there refuses; a holder in ANOTHER instance does not", async () => {
+    // A second, real instance B. The job resolves B (RELAY_DB_PATH) and must lock B's state dir, never A's.
+    const dbB = path.join(ROOT, "instB", "relay.db");
+    const stateB = path.join(ROOT, "instB", "doorbell");
+    fs.rmSync(path.join(ROOT, "instB"), { recursive: true, force: true });
+    fs.mkdirSync(path.join(ROOT, "instB"), { recursive: true });
+    db.closeDb();
+    process.env.RELAY_DB_PATH = dbB;
+    db.getDb();
+    db.closeDb();
+    fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(stateB, { recursive: true, mode: 0o700 });
+    const heldA = LK.acquireInstanceLock(STATE, { pid: 4242, proc_start: null, host_id: HOST });
+    expect(heldA.ok).toBe(true);
+    try {
+      expect((await job(["--once"], { clock: fakeClock(T) })).code).toBe(0); // A's holder does not stop B's job
+      expect(LK.readHolderInfo(stateB)?.pid).toBe(process.pid); // ...which took B's lock
+      const heldB = LK.acquireInstanceLock(stateB, { pid: 4343, proc_start: null, host_id: HOST });
+      expect(heldB.ok).toBe(true);
+      try {
+        const r = await job(["--once"], { clock: fakeClock(T) });
+        expect(r.code).toBe(LK.EXIT_ALREADY_RUNNING); // B's holder does
+        expect(r.stderr).toMatch(/held by pid 4343/);
+      } finally {
+        if (heldB.ok) LK.releaseInstanceLock(heldB.handle);
+      }
+    } finally {
+      if (heldA.ok) LK.releaseInstanceLock(heldA.handle);
+      process.env.RELAY_DB_PATH = DB;
+    }
   });
 });
