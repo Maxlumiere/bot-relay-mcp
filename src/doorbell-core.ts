@@ -80,10 +80,22 @@ export const BUDGET_WINDOW_MS = 3_600_000;
 export const DEFAULT_HORIZON_MS = 900_000;
 export const MIN_HORIZON_MS = 60_000;
 export const MAX_HORIZON_MS = 3_600_000;
-/** Ineffective rings in a row, for one (agent, reading session), that open an escalation (plan PR 3). */
+/**
+ * Ineffective rings in a row, for one (agent, reading session), that open an escalation (plan PR 3).
+ * INVARIANT (architect eb70f58a): ESCALATE_AFTER <= RE_RING_CAP, asserted below. See RE_RING_CAP.
+ */
 export const ESCALATE_AFTER = 3;
-/** K: at most this many rings per (id, reading session), first ring included (ruling c04f463a Q2). */
+/**
+ * K: at most this many rings per (id, reading session), first ring included (ruling c04f463a Q2).
+ * INVARIANT (architect eb70f58a): ESCALATE_AFTER <= RE_RING_CAP. A DEAF agent (nothing drains) must
+ * reach agent_unresponsive before any of its ids reaches the cap; with the cap lower, the id would
+ * get id_stuck first and the deaf agent would never be called unresponsive (ruling 478083e0 F3).
+ * Both are 3 today, so it holds by value; it becomes load-bearing the moment either is tunable.
+ */
 export const RE_RING_CAP = 3;
+if (!(ESCALATE_AFTER <= RE_RING_CAP)) {
+  throw new Error(`doorbell invariant violated: ESCALATE_AFTER (${ESCALATE_AFTER}) must be <= RE_RING_CAP (${RE_RING_CAP})`);
+}
 
 /** Why these tunables are out of bounds, or null. */
 export function tunablesFault(t: { windowMs: number; budgetPerHour: number; horizonMs: number }): string | null {

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added — `relay doorbell status`: is the doorbell alive, and what needs attention
+
+The doorbell job (still not installed by anything) now leaves a heartbeat, and a new read-only command reports on it.
+
+- **A heartbeat.** The job writes `heartbeat.json` beside its log once per cycle, and only from its cycle: when it last cycled, how many cycles and starts, why its last failed attempt failed (one of a fixed list of kinds, never free text), and which build it runs.
+- **`relay doorbell status`** (`--json` for machines) says one of `healthy`, `stale` (no cycle for over 15 seconds, or three intervals if longer, or a heartbeat from the future), `not-installed` or `disabled`. It reports separately whether the job runs the installed build (`CURRENT`, `STALE`, `UNKNOWN`, `INSTALL INCONSISTENT`) and its condition (`ok`, `waiting-for-writer`, `log-full`, `failing` after three failed cycles in a row), and lists the open escalations by agent, reason and age: never message ids or content. A heartbeat it cannot read is a failure (exit 1, nothing on stdout), never a guess. Right after the computer wakes, it can say `stale` for up to one interval, which is true: the job has not cycled yet.
+- **Every agent start sees it.** The SessionStart hook prints one line, plus up to five escalations, when something needs attention: stale, not on the current build, log full, failing, or any open escalation. It prints nothing when the doorbell is not installed or all is well. It runs inside the hook's time budget; if it cannot run or fails, the hook says DEGRADED.
+- An internal limit is now enforced at load: three failed rings in a row escalate an agent before any single message reaches its own re-ring limit.
+
 ### Added — the doorbell checks whether a ring worked, rings again, and escalates when it does not
 
 The doorbell job (not installed yet) now checks whether a ring worked. A ring worked when one of the messages it rang for leaves the agent's pending mail **for the same session**: that session read it, or it was resolved. It is never judged from `read_at`, `last_drain_at` or a message count. If the session changed, the ring is recorded as moot, never as having worked, and the new session's mail is rung afresh.

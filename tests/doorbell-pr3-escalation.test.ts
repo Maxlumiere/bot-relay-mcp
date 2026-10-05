@@ -119,6 +119,17 @@ describe("PR 3: three ineffective rings → ONE escalation, and ringing stops", 
   });
 });
 
+describe("INVARIANT (architect eb70f58a): ESCALATE_AFTER <= RE_RING_CAP", () => {
+  it("holds for the shipped constants (the module also asserts it at load)", () => {
+    expect(C.ESCALATE_AFTER).toBeLessThanOrEqual(C.RE_RING_CAP);
+  });
+  it("why it matters: a DEAF agent (nothing drains, one id) gets agent_unresponsive, never id_stuck", () => {
+    const h = harness();
+    for (let k = 0; k <= C.RE_RING_CAP + 2; k++) h.step(k * H, { alice: read(["m1"]) });
+    expect(h.all("escalation").map((e) => e.reason)).toEqual(["agent_unresponsive"]);
+  });
+});
+
 describe("PR 3: progress resets the count (twin)", () => {
   it("twin: the current session draining ANY ONE rung id is effective and resets the count: no escalation", () => {
     const h = harness();

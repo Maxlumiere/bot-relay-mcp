@@ -1339,6 +1339,47 @@ if command -v node >/dev/null 2>&1; then
   fi
 fi
 
+# --- Doorbell (ADR-0038 Q3/V2; ruling 9987c113 Q6): the doorbell job's status ---
+# `relay doorbell status --hook` DECIDES what to show (one tested TS renderer, hookLines): NOTHING
+# when the doorbell is not installed, or healthy on the CURRENT build with no warning condition and
+# no open escalation; otherwise one [RELAY] line plus at most 5 escalation lines (agent, reason,
+# age: METADATA ONLY, never message ids or content) and "+K more". This hook only relays
+# [RELAY]-shaped lines (at most 7). It draws from this hook's ONE deadline (#286): no time left is a
+# LOUD skip (DEGRADED via relay_budget_skipped); a status call that fails or times out is DEGRADED
+# with its reason; exit 3 (no local relay instance) shows nothing. Never a silent skip.
+# Reached only on the hook's SUCCESS path: a missing node or relay CLI has already failed this
+# hook's instance resolution, loudly (DEGRADED naming it), before this point.
+RELAY_DOORBELL_BIN="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+if command -v node >/dev/null 2>&1 && [ -f "$RELAY_DOORBELL_BIN" ]; then
+  if relay_budget_for "the doorbell status" 3 margin; then
+    RELAY_DOORBELL_OUT="$(mktemp 2>/dev/null || printf '')"
+    RELAY_DOORBELL_ERR="$(mktemp 2>/dev/null || printf '')"
+    if [ -n "$RELAY_DOORBELL_OUT" ] && [ -n "$RELAY_DOORBELL_ERR" ]; then
+      RELAY_TMP_FILES="$RELAY_TMP_FILES $RELAY_DOORBELL_OUT $RELAY_DOORBELL_ERR $RELAY_DOORBELL_OUT.timedout"
+      relay_run_bounded "$RELAY_STEP_SECS" /dev/null "$RELAY_DOORBELL_OUT" "$RELAY_DOORBELL_ERR" node "$RELAY_DOORBELL_BIN" doorbell status --hook
+      RELAY_DOORBELL_RC=$?
+      case "$RELAY_DOORBELL_RC" in
+        0)
+          RELAY_DOORBELL_N=0
+          while IFS= read -r RELAY_DOORBELL_LINE && [ "$RELAY_DOORBELL_N" -lt 7 ]; do
+            case "$RELAY_DOORBELL_LINE" in
+              "[RELAY]"*) printf '%s\n' "$RELAY_DOORBELL_LINE"; RELAY_DOORBELL_N=$((RELAY_DOORBELL_N + 1)) ;;
+            esac
+          done < "$RELAY_DOORBELL_OUT"
+          ;;
+        3) : ;;
+        124) relay_verdict_raise "DEGRADED" "doorbell status timed out after ${RELAY_STEP_SECS}s" " agent=\"${AGENT_NAME:-}\"" other ;;
+        *)
+          RELAY_DOORBELL_WHY=$(grep -m 1 'DOORBELL_STATUS_FAILED' "$RELAY_DOORBELL_ERR" 2>/dev/null | tr -d '"' | cut -c1-200)
+          relay_verdict_raise "DEGRADED" "doorbell status unreadable: ${RELAY_DOORBELL_WHY:-exit $RELAY_DOORBELL_RC}" " agent=\"${AGENT_NAME:-}\"" other
+          ;;
+      esac
+    else
+      relay_verdict_raise "DEGRADED" "doorbell status: could not create a private temp file" " agent=\"${AGENT_NAME:-}\"" other
+    fi
+  fi
+fi
+
 # --- ADR-0002: opt-in team onboarding map (default OFF) ---
 # Enable with RELAY_ONBOARD_TOPOLOGY=1. A compact who's-who grouped by
 # coordination class, so a freshly-started agent knows its peers. Rough liveness
