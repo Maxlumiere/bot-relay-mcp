@@ -183,26 +183,24 @@ export function deriveLedger(history: readonly LedgerRecord[], rs: string | null
 
 /**
  * The planner's `ledger` input from the job's records, in ONE pass: each agent's history,
- * and the agents still owed a judgement (an outstanding ring or an open escalation), bound
- * or not. The job and the tests build it here, so they cannot disagree.
+ * and EVERY agent with a ledger record, to be reconciled whether or not it is bound now. The job and the tests build it here, so they cannot disagree.
  */
 export function ledgerInput(records: readonly LogRecord[], monoOf: (rec: IntentRecord) => number): NonNullable<CycleInput["ledger"]> {
   const history = new Map<string, LedgerRecord[]>();
-  const judged = new Set<string>();
-  const lastEscalation = new Map<string, EscalationRecord>();
   for (const r of records) {
     if (r.type !== "intent" && r.type !== "effect" && r.type !== "escalation") continue;
     const agent = r.type === "intent" ? r.intent.agent_name : r.agent_name;
     const list = history.get(agent);
     if (list) list.push(r);
     else history.set(agent, [r]);
-    if (r.type === "effect") for (const id of r.intent_ids) judged.add(id);
-    if (r.type === "escalation") lastEscalation.set(r.escalation_id, r);
   }
-  const owed = new Set<string>();
-  for (const r of records) if (r.type === "intent" && !judged.has(r.intent.intent_id)) owed.add(r.intent.agent_name);
-  for (const e of lastEscalation.values()) if (e.state === "open") owed.add(e.agent_name);
-  const agents = [...owed].sort();
+  // SUPERSET BY CONSTRUCTION (#302 Codex R2 F1; architect e2718659): EVERY agent with ANY ledger
+  // record in the log is reconciled every cycle, bound or not. No hand-enumerated "who is owed"
+  // predicate to drift (outstanding rings, open escalations, a counter at the threshold whose
+  // escalation a crash lost, ...): reconciliation itself decides what to emit. Compaction bounds
+  // the set; the cost is one pending read per such agent per cycle. The NULL-session HOLD is
+  // unchanged (judge() writes nothing for an unbound session).
+  const agents = [...history.keys()].sort();
   return { history: (name) => history.get(name) ?? [], monoOf, agents: () => agents };
 }
 
@@ -424,7 +422,10 @@ export function planCycle(input: CycleInput): CyclePlan {
     // (Progress resets the counter in the same record that closes an episode, and a session
     // change is a new key, so this state means exactly "the escalation was never written".)
     if (ledger.counter >= ESCALATE_AFTER && !ledger.unresponsive) {
-      const ids = [...ledger.rungIds].filter((id) => pending.has(id));
+      // A WITNESS SUBSET (ruling 97ced827 (3)): at most MAX ids, the first in canonical order, so the
+      // record stays within the writer's bound; any sampled id leaving closes it. Same stale-premise
+      // dependency on random (v4) ids as the intent cap.
+      const ids = sortedSet([...ledger.rungIds].filter((id) => pending.has(id))).slice(0, MAX_IDS_PER_INTENT);
       if (ids.length > 0) {
         const rec = escalation(name, rs, "agent_unresponsive", ids, "open", newEscalationId(), null);
         records.push(rec);
@@ -511,7 +512,17 @@ export function planCycle(input: CycleInput): CyclePlan {
       skip(`coalescing: ${kinds.size} id(s) held until ${input.windowMs / 1000}s after the last ring`);
       continue;
     }
-    const ids = sortedSet(kinds.keys());
+    // THE INTENT CAP (ruling 97ced827): one intent covers at most MAX_IDS_PER_INTENT ids: the FIRST
+    // MAX, in CANONICAL (string) order, of every id due this cycle (new ∪ due still_pending), with NO
+    // class priority. The rest are simply not rung now (a new id rings on the next ring after W; a
+    // still_pending one stays due). Not still_pending-first: a responsive agent drains newest-first,
+    // so the oldest ids first would make a working ring look ineffective and open a FALSE
+    // agent_unresponsive exactly under overflow. With no overflow, nothing changes.
+    // ⚠ STALE-PREMISE DEPENDENCY: canonical order is an UNBIASED sample of the backlog only because
+    // relay message ids are RANDOM (v4 UUIDs; pinned by tests/doorbell-pr3-effect.test.ts). If ids
+    // ever become time-ordered (UUIDv7, federation-minted, sequential), canonical order turns into
+    // oldest-first and this rule (and the escalation witness cap below) must be REVISITED.
+    const ids = sortedSet(kinds.keys()).slice(0, MAX_IDS_PER_INTENT);
     const intent: Intent = { intent_id: input.newIntentId(), agent_name: name, binding_id: b.binding_id, during_escalation: duringEscalation };
     records.push({ v: 1, type: "intent", at, mono_ms: Math.max(0, Math.round(nowMono)), intent, covers: { reading_session: rs, message_ids: ids, kinds: ids.map((id) => kinds.get(id) as IdKind) } });
   }

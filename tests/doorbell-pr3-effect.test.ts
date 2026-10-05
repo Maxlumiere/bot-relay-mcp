@@ -177,6 +177,18 @@ describe("PR 3: effectiveness on a real DB (V4)", () => {
   });
 });
 
+describe("STALE-PREMISE PIN (ruling 97ced827): relay message ids are RANDOM v4 UUIDs", () => {
+  it("every id the relay mints for a message is a v4 UUID, and they are not in time order", () => {
+    // The intent cap and the escalation witness take the FIRST MAX ids in canonical order; that is an
+    // UNBIASED sample only while ids are random. If this test ever fails (UUIDv7, sequential,
+    // federation-minted ids), revisit the cap's ordering in src/doorbell-core.ts (the ruling says so).
+    setSession("pr3-session-v4");
+    const sent = Array.from({ length: 50 }, () => send());
+    for (const id of sent) expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect([...sent].sort()).not.toEqual(sent); // 50 sends in time order are NOT in canonical order (p of a false red ≈ 1/50!)
+  });
+});
+
 describe("PR 3: ringEffect is pure and canonical", () => {
   const RS = "a".repeat(64);
   it("left is a canonical SET: unique and sorted, whatever order the ids came in", () => {

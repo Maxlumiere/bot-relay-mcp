@@ -431,7 +431,8 @@ describe("PR 3: selectLedgerKeep keeps the LAST RESET (crafted records; reachabi
 // #302 Codex R1 + architect ruling 478083e0: LEVEL-TRIGGERED RECONCILIATION, and its guard.
 // ---------------------------------------------------------------------------------------------
 
-type Steps = Array<[number, Record<string, PendingRead>]>;
+/** A scenario step: time, pending reads, and the agents BOUND (default: every agent it reads). */
+type Steps = Array<[number, Record<string, PendingRead>, string[]?]>;
 const LATE = 7 * 24 * 3_600_000; // a restart a week later: rule (a) keeps nothing
 
 /** THE compaction a restart does (intentKeepRule + selectLedgerKeep), harshest settings: budget 1. */
@@ -463,88 +464,184 @@ function decisions(h: ReturnType<typeof harness>, reads: Record<string, PendingR
 }
 
 /**
- * The DIFFERENTIAL CRASH-PREFIX property (ruling 478083e0), at EVERY append boundary k of a
- * scenario run without a crash (records 0..k-1 durable; the first lost record belongs to step s):
- *   (1) the next cycles from replay(prefix_k) and from replay(compact(prefix_k)) emit IDENTICAL records;
- *   (2) a crash at k, then the retried step and one more cycle, converge on the no-crash state.
- * Returns the boundaries it checked, so a caller can assert a given crash point is among them.
+ * The DIFFERENTIAL CRASH-PREFIX property (ruling 478083e0; strengthened for #302 Codex R2 F2), at
+ * EVERY append boundary k of a scenario run without a crash (records 0..k-1 durable; the first lost
+ * record belongs to step s) AND at the start of EVERY step (so a step that appends nothing, such as
+ * a HOLD, is a checkpoint too):
+ *   (1) the next cycles from replay(prefix) and from replay(compact(prefix)) emit IDENTICAL records;
+ *   (2) a crash there, then the retried step and one more cycle, converge on the no-crash state.
+ * Fixtures are BINDING-AWARE: each step binds the agents it names (default: every agent it reads).
+ * Returns what the scenario actually REACHED, so each test asserts its precondition was exercised.
  */
-function crashPrefix(steps: Steps): Array<{ k: number; lost: LogRecord; durable: LogRecord | undefined }> {
+function crashPrefix(steps: Steps) {
+  const bindOf = (s: number) => (steps[s][2] ?? Object.keys(steps[s][1])).map((a) => bind(a));
   const base = harness({ ids: counter(0) });
   const stepOf: number[] = [];
+  const startOf: number[] = [];
   const endOf: number[] = [];
+  const reached = { recordsByAgent: {} as Record<string, number>, holdCycles: 0, supersededCycles: 0, chunkCrashes: 0, boundaries: [] as Array<{ k: number; lost: LogRecord | undefined; durable: LogRecord | undefined }> };
   steps.forEach(([t, reads], s) => {
-    base.step(t, reads);
+    startOf.push(base.state.records.length);
+    base.setBindings(bindOf(s));
+    const known = new Set(Object.keys(Object.fromEntries(base.state.records.filter((r) => r.type !== "header" && r.type !== "budget" && r.type !== "clock").map((r) => [r.type === "intent" ? r.intent.agent_name : (r as { agent_name: string }).agent_name, 1]))));
+    const p = base.step(t, reads);
+    for (const [agent, r] of Object.entries(reads)) {
+      if (!known.has(agent)) continue;
+      const wrote = p.records.some((x) => (x.type === "intent" ? x.intent.agent_name : (x as { agent_name?: string }).agent_name) === agent);
+      if (r.reading_session === null && !wrote) reached.holdCycles++; // an agent with a ledger, unbound: nothing written
+      if (r.reading_session !== null && !bindOf(s).some((b) => b.agent_name === agent)) reached.supersededCycles++; // a ledger agent with a live session but NO binding
+    }
     while (stepOf.length < base.state.records.length) stepOf.push(s);
     endOf.push(base.state.records.length);
   });
   const R = [...base.state.records];
-  const checked: Array<{ k: number; lost: LogRecord; durable: LogRecord | undefined }> = [];
-  for (let k = 0; k < R.length; k++) {
-    const s = stepOf[k];
+  for (const r of R) {
+    const agent = r.type === "intent" ? r.intent.agent_name : (r as { agent_name?: string }).agent_name;
+    if (agent) reached.recordsByAgent[agent] = (reached.recordsByAgent[agent] ?? 0) + 1;
+  }
+  const checkpoints = new Map<string, { k: number; s: number }>();
+  for (let k = 0; k < R.length; k++) checkpoints.set(`${k}:${stepOf[k]}`, { k, s: stepOf[k] });
+  steps.forEach((_, s) => checkpoints.set(`${startOf[s]}:${s}`, { k: startOf[s], s }));
+  for (const { k, s } of checkpoints.values()) {
     const [t, reads] = steps[s];
     const prefix = R.slice(0, k);
+    const lost = k < endOf[s] ? R[k] : undefined;
+    const durable = R[k - 1];
+    if (lost?.type === "effect" && durable?.type === "effect" && lost.outcome === "effective" && durable.outcome === "effective" && lost.at === durable.at && lost.agent_name === durable.agent_name) reached.chunkCrashes++;
     // (1) differential, after a long restart gap, over three cycles.
-    const full = harness({ from: { records: prefix, intentMono: base.intentMono }, ids: counter(1000) });
-    const comp = harness({ from: { records: compactRecords(prefix, reads), intentMono: base.intentMono }, ids: counter(1000) });
+    const full = harness({ from: { records: prefix, intentMono: base.intentMono }, ids: counter(1000), bindings: bindOf(s) });
+    const comp = harness({ from: { records: compactRecords(prefix, reads), intentMono: base.intentMono }, ids: counter(1000), bindings: bindOf(s) });
     for (let j = 0; j < 3; j++) {
       const at = LATE + j * H;
-      expect(comp.step(at, reads).records, `differential: crash at k=${k}, cycle ${j}`).toEqual(full.step(at, reads).records);
+      expect(comp.step(at, reads).records, `differential: crash at k=${k} (step ${s}), cycle ${j}`).toEqual(full.step(at, reads).records);
     }
     // (2) convergence: retry the crashed step, then one more cycle; the no-crash path takes that one more cycle.
-    const crashed = harness({ from: { records: prefix, intentMono: base.intentMono }, ids: counter(2000) });
+    const crashed = harness({ from: { records: prefix, intentMono: base.intentMono }, ids: counter(2000), bindings: bindOf(s) });
     crashed.step(t, reads);
     crashed.step(t + 1, reads);
-    const clean = harness({ from: { records: R.slice(0, endOf[s]), intentMono: base.intentMono }, ids: counter(3000) });
+    const clean = harness({ from: { records: R.slice(0, endOf[s]), intentMono: base.intentMono }, ids: counter(3000), bindings: bindOf(s) });
     clean.step(t + 1, reads);
     expect(decisions(crashed, reads), `convergence: crash at k=${k} (step ${s})`).toEqual(decisions(clean, reads));
-    checked.push({ k, lost: R[k], durable: R[k - 1] });
+    reached.boundaries.push({ k, lost, durable });
   }
-  return checked;
+  return reached;
 }
 
-describe("#302 R1 (ruling 478083e0): the DIFFERENTIAL CRASH-PREFIX guard, at every append boundary", () => {
-  it("Codex F1 is a FIXED POINT: escalate on m, extra ring on n, then m drained; a crash between the effective record and the close", () => {
-    const checked = crashPrefix([
-      ...[0, 1, 2, 3].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]) }]),
-      [3 * H + 20_000, { alice: read(["m", "n"]) }], // the extra ring
-      [3 * H + 40_000, { alice: read(["n"]) }], // m drained: effective, then close
-      [4 * H + 40_000, { alice: read(["n", "p"]) }],
-      [5 * H + 40_000, { alice: read(["n", "p"]) }],
-    ]);
-    // Precondition: Codex's exact crash point (effective durable, close lost) is among the boundaries checked.
-    expect(checked.some((c) => c.durable?.type === "effect" && c.durable.outcome === "effective" && c.lost.type === "escalation" && c.lost.state === "closed")).toBe(true);
+const S = (t: number, reads: Record<string, PendingRead>, bound?: string[]): [number, Record<string, PendingRead>, string[]?] => [t, reads, bound];
+const escalateSteps = (extra = "n") => [...[0, 1, 2, 3].map((k) => S(k * H, { alice: read(["m"]) })), S(3 * H + 20_000, { alice: read(["m", extra]) })];
+const crashedBetween = (r: ReturnType<typeof crashPrefix>, durable: (x: LogRecord) => boolean, lost: (x: LogRecord) => boolean) => r.boundaries.some((b) => b.durable && b.lost && durable(b.durable) && lost(b.lost));
+const isEffect = (o: string) => (x: LogRecord) => x.type === "effect" && x.outcome === o;
+const isEsc = (state: string, reason?: string) => (x: LogRecord) => x.type === "escalation" && x.state === state && (!reason || x.reason === reason);
+
+describe("#302 (rulings 478083e0, e2718659): the DIFFERENTIAL CRASH-PREFIX guard, every append boundary and every step", () => {
+  it("Codex R1 F1 is a FIXED POINT: escalate on m, extra ring on n, then m drained; crash between the effective record and the close", () => {
+    const r = crashPrefix([...escalateSteps(), S(3 * H + 40_000, { alice: read(["n"]) }), S(4 * H + 40_000, { alice: read(["n", "p"]) }), S(5 * H + 40_000, { alice: read(["n", "p"]) })]);
+    expect(crashedBetween(r, isEffect("effective"), isEsc("closed"))).toBe(true);
   });
-  it("F1 via the extra ring ONLY (keep rule (f)): n drained while m stays pending", () => {
-    const checked = crashPrefix([
-      ...[0, 1, 2, 3].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]) }]),
-      [3 * H + 20_000, { alice: read(["m", "n"]) }],
-      [3 * H + 40_000, { alice: read(["m"]) }], // n (the extra ring's id) drained
-      [4 * H + 40_000, { alice: read(["m", "p"]) }],
-    ]);
-    expect(checked.some((c) => c.durable?.type === "effect" && c.durable.outcome === "effective" && c.lost.type === "escalation" && c.lost.state === "closed")).toBe(true);
+  it("R1 F1 through the extra ring ONLY (keep rule (f)): n drained while m stays pending", () => {
+    const r = crashPrefix([...escalateSteps(), S(3 * H + 40_000, { alice: read(["m"]) }), S(4 * H + 40_000, { alice: read(["m", "p"]) })]);
+    expect(crashedBetween(r, isEffect("effective"), isEsc("closed"))).toBe(true);
   });
-  it("Codex F2 is a FIXED POINT: a crash between the 3rd ineffective record and the agent_unresponsive escalation", () => {
-    const checked = crashPrefix([
-      ...[0, 1, 2, 3, 4].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]) }]),
-      [5 * H, { alice: read(["m", "q"]) }],
+  it("Codex R1 F2 is a FIXED POINT: crash between the 3rd ineffective record and the agent_unresponsive escalation", () => {
+    const r = crashPrefix([...[0, 1, 2, 3, 4].map((k) => S(k * H, { alice: read(["m"]) })), S(5 * H, { alice: read(["m", "q"]) })]);
+    expect(crashedBetween(r, isEffect("ineffective"), isEsc("open", "agent_unresponsive"))).toBe(true);
+  });
+  it("Codex R2 F1 is a FIXED POINT: the binding SUPERSEDED with the session still live, then a crash between the 3rd ineffective record and the escalation", () => {
+    const r = crashPrefix([
+      S(0, { alice: read(["m"]) }), S(H, { alice: read(["m"]) }), S(2 * H, { alice: read(["m"]) }),
+      S(3 * H, { alice: read(["m"]) }, []), // superseded: no binding, session RS1 still live
+      S(4 * H, { alice: read(["m"]) }, []), S(5 * H, { alice: read(["m"]) }, []),
     ]);
-    expect(checked.some((c) => c.durable?.type === "effect" && c.durable.outcome === "ineffective" && c.lost.type === "escalation" && c.lost.reason === "agent_unresponsive")).toBe(true);
+    expect(r.supersededCycles).toBeGreaterThan(0); // precondition: the superseded binding was in effect
+    expect(crashedBetween(r, isEffect("ineffective"), isEsc("open", "agent_unresponsive"))).toBe(true);
   });
   it("id_stuck while other mail drains, then the stuck id drained", () => {
-    crashPrefix([...[0, 1, 2, 3, 4, 5, 6].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m", `n${k}`]) }]), [7 * H, { alice: read(["n6"]) }], [8 * H, { alice: read(["n6"]) }]]);
+    const r = crashPrefix([...[0, 1, 2, 3, 4, 5, 6].map((k) => S(k * H, { alice: read(["m", `n${k}`]) })), S(7 * H, { alice: read(["n6"]) }), S(8 * H, { alice: read(["n6"]) })]);
+    expect(crashedBetween(r, () => true, isEsc("closed", "id_stuck"))).toBe(true);
   });
-  it("a session change with rings outstanding and an escalation open, then a closed window (HOLD), then the new session", () => {
-    crashPrefix([
-      ...[0, 1, 2, 3].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]) }]),
-      [3 * H + 20_000, { alice: read(["m", "n"]) }],
-      [4 * H, { alice: read(["m", "n"], null) }],
-      [5 * H, { alice: read(["m", "n"], RS2) }],
-      [6 * H, { alice: read(["m", "n"], RS2) }],
+  it("a closed window is a HOLD (binding gone, session NULL) with an escalation open and a ring outstanding, then a new session", () => {
+    const r = crashPrefix([
+      ...escalateSteps(),
+      S(4 * H, { alice: read(["m", "n"], null) }, []), S(5 * H, { alice: read(["m", "n"], null) }, []),
+      S(6 * H, { alice: read(["m", "n"], RS2) }), S(7 * H, { alice: read(["m", "n"], RS2) }),
     ]);
+    expect(r.holdCycles).toBeGreaterThanOrEqual(2); // precondition: HOLD cycles were observed (and checkpointed)
+    expect(crashedBetween(r, () => true, isEsc("closed", "agent_unresponsive"))).toBe(true);
   });
-  it("two agents interleaved: one escalates, one drains", () => {
-    crashPrefix([...[0, 1, 2, 3, 4].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]), bob: read(k % 2 ? [] : [`b${k}`]) }])].map(([t, r]) => [t, r] as [number, Record<string, PendingRead>]));
+  it("two agents interleaved: one escalates, one drains (BOTH bound)", () => {
+    const r = crashPrefix([0, 1, 2, 3, 4, 5].map((k) => S(k * H, { alice: read(["m"]), bob: read(k % 2 ? [] : [`b${k}`]) })));
+    expect(r.recordsByAgent.bob ?? 0).toBeGreaterThan(0); // precondition: Bob's records exist
+    expect(r.recordsByAgent.alice ?? 0).toBeGreaterThan(0);
+  });
+  it("OVERFLOW (ruling 97ced827): more than MAX ids due at once → ONE intent of exactly MAX (the first in canonical order), the rest on the next ring after W", () => {
+    const ids = Array.from({ length: 10_005 }, (_, i) => `x${String(i).padStart(5, "0")}`);
+    const steps = [S(0, { alice: read(ids) }), S(W + 1, { alice: read(ids) }), S(W + 2, { alice: read(ids) })];
+    const h = harness({ ids: counter(0) });
+    const first = h.step(0, { alice: read(ids) });
+    expect(ids.length).toBeGreaterThan(10_000); // precondition: more than MAX due
+    expect(first.intents.map((r) => [r.covers.message_ids.length, r.covers.message_ids[0], r.covers.message_ids.at(-1)])).toEqual([[10_000, "x00000", "x09999"]]);
+    expect(h.step(W + 1, { alice: read(ids) }).intents.map((r) => r.covers.message_ids)).toEqual([["x10000", "x10001", "x10002", "x10003", "x10004"]]);
+    expect(crashPrefix(steps).boundaries.length).toBeGreaterThanOrEqual(steps.length); // precondition: every step was a checkpoint
+  });
+  it("OVERFLOW (ruling 97ced827 (3)): an agent_unresponsive over MAX rung ids → exactly MAX (a witness subset), and it CLOSES when a SAMPLED id is drained", () => {
+    const ids = Array.from({ length: 10_005 }, (_, i) => `y${String(i).padStart(5, "0")}`);
+    const steps = [
+      S(0, { alice: read(ids) }), S(W + 1, { alice: read(ids) }), S(H, { alice: read(ids) }), S(H + W + 2, { alice: read(ids) }),
+      S(2 * H, { alice: read(ids) }), S(2 * H + W + 3, { alice: read(ids) }), S(3 * H, { alice: read(ids) }),
+      S(3 * H + 10, { alice: read(ids.slice(1)) }), // y00000, a SAMPLED id, drained
+    ];
+    const h = harness({ ids: counter(0) });
+    for (const [t, r] of steps.slice(0, 7)) h.step(t, r);
+    const open = h.openEsc().find((e) => e.reason === "agent_unresponsive");
+    expect(open?.message_ids.length).toBe(10_000); // exactly MAX, although 10,005 rung ids are pending
+    expect(open?.message_ids[0]).toBe("y00000");
+    const p = h.step(3 * H + 10, { alice: read(ids.slice(1)) });
+    expect(p.escalations.filter((e) => e.reason === "agent_unresponsive").map((e) => [e.state, e.close_reason])).toEqual([["closed", "progress"]]);
+    expect(crashPrefix(steps).boundaries.length).toBeGreaterThanOrEqual(steps.length); // precondition: every step was a checkpoint
+  });
+  it("OVERFLOW ORDER (ruling 97ced827 (2)): the cap takes the first MAX of new ∪ still_pending in CANONICAL order, NO class priority, so a newest-first drain is seen as progress", () => {
+    const old = Array.from({ length: 10_000 }, (_, i) => `s${String(i).padStart(5, "0")}`); // rung first, so still_pending at H
+    const fresh = Array.from({ length: 5 }, (_, i) => `a${String(i).padStart(5, "0")}`); // new at H, canonically FIRST
+    const h = harness({ ids: counter(0) });
+    h.step(0, { alice: read(old) });
+    const p = h.step(H, { alice: read([...old, ...fresh]) });
+    expect(old.length + fresh.length).toBeGreaterThan(10_000); // precondition: more than MAX due at once
+    const covers = p.intents[0].covers;
+    expect([covers.message_ids.length, covers.message_ids.slice(0, 5), covers.kinds.slice(0, 6)]).toEqual([10_000, fresh, ["new", "new", "new", "new", "new", "still_pending"]]);
+    // A responsive agent drains NEWEST-first: it reads the 5 new ids. That is progress, never an ineffective ring.
+    const drained = h.step(H + 1000, { alice: read(old) });
+    expect(drained.effects.map((e) => [e.outcome, e.left])).toEqual([["effective", fresh]]);
+  });
+  it("F4: a crash BETWEEN the chunks of one batched effect (5,001 + 5,000 drained)", () => {
+    const ids = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `${prefix}${String(i).padStart(5, "0")}`);
+    const a = ids("a", 5001);
+    const b = ids("b", 5000);
+    const r = crashPrefix([S(0, { alice: read(a) }), S(W + 1, { alice: read([...a, ...b]) }), S(W + 2, { alice: read([]) }), S(W + 3, { alice: read([]) })]);
+    expect(r.chunkCrashes).toBeGreaterThan(0); // precondition: a chunk-boundary crash was taken
+  });
+});
+
+describe("#302 Codex R2 F1 (architect e2718659): EVERY agent with a ledger is reconciled, bound or not", () => {
+  it("HARM (Codex R2 F1): binding superseded, session still live, crash after the 3rd ineffective record → the next cycle opens agent_unresponsive", () => {
+    const h = harness();
+    for (let k = 0; k < 3; k++) h.step(k * H, { alice: read(["m1"]) }); // rings at 0, H, 2H
+    h.setBindings([]); // superseded: alice's session stays live
+    h.step(3 * H, { alice: read(["m1"]) }); // the 3rd ring judged, the escalation opened
+    expect(h.openEsc().map((e) => e.reason)).toEqual(["agent_unresponsive"]); // the no-crash run
+    const crashed = h.state.records.filter((r) => r.type !== "escalation"); // the crash lost the escalation
+    const replay = harness({ from: { records: crashed, intentMono: h.intentMono }, bindings: [] });
+    expect(C.deriveLedger(C.ledgerInput(crashed, () => 0).history("alice") as never, RS1, () => 0).ledger.outstanding).toEqual([]); // precondition: counter 3, nothing outstanding
+    const p = replay.step(4 * H, { alice: read(["m1"]) });
+    expect(p.escalations.map((e) => [e.reason, e.state])).toEqual([["agent_unresponsive", "open"]]);
+    expect(p.intents).toEqual([]); // reconciled, never rung (no binding)
+  });
+  it("twin (HOLD kept): the same crash state with the session NULL now → nothing at all", () => {
+    const h = harness();
+    for (let k = 0; k < 3; k++) h.step(k * H, { alice: read(["m1"]) });
+    h.setBindings([]);
+    h.step(3 * H, { alice: read(["m1"]) });
+    const replay = harness({ from: { records: h.state.records.filter((r) => r.type !== "escalation"), intentMono: h.intentMono }, bindings: [] });
+    expect(replay.step(4 * H, { alice: read(["m1"], null) }).records).toEqual([]);
   });
 });
 

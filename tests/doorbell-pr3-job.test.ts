@@ -28,6 +28,7 @@ delete process.env.RELAY_AGENT_NAME;
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 const db = await import("../src/db.js");
+const L = await import("../src/doorbell-log.js");
 const { runDoorbell } = await import("../src/doorbell-run.js");
 const { getOwnHostId, processStartedAt } = await import("../src/liveness.js");
 
@@ -178,6 +179,28 @@ describe.skipIf(!HOST)("PR 3 job: B1 (review 2fda069b): a closed window is a HOL
     expect(ofType("effect").filter((e) => e.outcome === "session_changed").map((e) => e.intent_ids)).toEqual([[extra]]);
     const rescue = ofType("intent").at(-1);
     expect([rescue.intent.during_escalation, rescue.covers.kinds.every((k: string) => k === "new"), rescue.covers.message_ids.length]).toEqual([false, true, 2]);
+  });
+});
+
+describe.skipIf(!HOST)("PR 3 job: Codex R2 F1, a REAL crash between the 3rd ineffective record and the escalation", () => {
+  it("HARM: the binding superseded by the PRODUCTION path (the window rebound to another agent; alice's session untouched), the escalation's append fails (the job stops) → the next start opens it", async () => {
+    send();
+    for (let k = 0; k < 3; k++) await lifetime(T + k * STEP); // rings 1..3
+    // The window is rebound to another agent through the production upsert: alice's binding is superseded, her session is not cleared.
+    db.registerAgent("p3-other", "r", []);
+    const start = (db.getDb().prepare("SELECT window_pid_start FROM agent_bindings WHERE agent_name = 'p3-alice' AND superseded_at IS NULL").get() as { window_pid_start: string }).window_pid_start;
+    db.upsertAgentBinding(db.getDb(), { hostId: HOST as string, windowPid: process.pid, windowPidStart: start, agentName: "p3-other", agentClass: null, conversationId: "conv-p3-other", conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
+    expect((db.getDb().prepare("SELECT COUNT(*) AS n FROM agent_bindings WHERE agent_name = 'p3-alice' AND superseded_at IS NULL").get() as { n: number }).n).toBe(0); // precondition: superseded
+    expect((db.getDb().prepare("SELECT session_id FROM agents WHERE name = 'p3-alice'").get() as { session_id: string | null }).session_id).toBeTruthy(); // precondition: session live
+    // THE CRASH: the escalation's write fails, after the 3rd ineffective record is durable.
+    const io = { ...L.realLogIo, writeSync: (fd: number, buf: Buffer, off: number, len: number) => (buf.toString("utf-8").includes('"type":"escalation"') ? 0 : fs.writeSync(fd, buf, off, len)) };
+    const crashed = await job(["--once", "--window-s", "10", "--horizon-s", "60"], { clock: fakeClock(T + 3 * STEP), logIo: io });
+    expect(crashed.code).toBe(1); // a write that did not complete stops the job
+    expect(ofType("effect").map((e) => e.outcome)).toEqual(["ineffective", "ineffective", "ineffective"]);
+    expect(ofType("escalation")).toEqual([]); // precondition: the crash lost the escalation
+    await lifetime(T + 4 * STEP); // the next start reconciles
+    expect(ofType("escalation").map((e) => [e.reason, e.state])).toEqual([["agent_unresponsive", "open"]]);
+    expect(ofType("intent").filter((r) => r.intent.agent_name === "p3-alice")).toHaveLength(3); // never rung again (no binding)
   });
 });
 

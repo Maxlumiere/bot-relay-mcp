@@ -13,6 +13,7 @@ The doorbell job (not installed yet) now checks whether a ring worked. A ring wo
 - **Where escalations go.** Escalations are written to the job's own log and to stderr only. The job never sends a relay message and never writes the relay DB. `--operator NAME` sets who is named on escalations (default: nobody); that agent is never rung because of one.
 - **Survives a restart.** Every judgement and escalation is rebuilt from the log. Compaction keeps open escalations, rings not judged yet, and everything the count still needs. Mail drained while the job was down is still counted as the ring having worked.
 - **Survives a crash between two records.** Each cycle works out what the escalations should be from the log and the current mail, then writes whatever is missing, so a crash between a judgement and its escalation (or its close) heals on the next cycle. A very large batch of drained mail is recorded across several records rather than refused.
+- **Very large backlogs.** One ring covers at most 10,000 messages: an even sample across everything due (not oldest first), with the rest rung later. An escalation lists at most 10,000 of its messages as witnesses, and closes when any of them is read. Every agent the log knows about is checked each cycle, whether or not its window is still bound.
 
 Each ring now records, for every message it covers, why it was rung: `new` or `still_pending`. The ring as a whole no longer carries one reason.
 
