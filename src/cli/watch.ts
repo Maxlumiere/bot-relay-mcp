@@ -36,7 +36,7 @@
  */
 import fs from "fs";
 import path from "path";
-import { withDeadline } from "../http-deadline.js";
+import { DeadlineExceededError, withDeadline } from "../http-deadline.js";
 
 interface Args {
   agent: string | null;
@@ -274,52 +274,119 @@ function emitWake(
  * silent degradation this assertion exists to catch. `/health` reports
  * `filesystem_markers` for exactly this purpose.
  *
- * Conservative by design: any failure (no daemon, timeout, old daemon that does
- * not report the field) returns false, so we announce POLLING. Claiming the
- * slower mode when unsure is safe; claiming the faster one when unsure is the
- * bug we are fixing.
+ * Conservative by design: any failure returns live=false, so we announce POLLING
+ * (claiming the slower mode when unsure is safe). But WHY it failed is a CLOSED
+ * set with a distinct reason each (2026-10-05 finding: a 1 s deadline expiry was
+ * reported as "no relay daemon reachable", which sends an operator to restart a
+ * healthy, momentarily slow daemon):
+ *   - slow: the daemon did not answer within the deadline: reachable-but-slow,
+ *     NOT absent;
+ *   - refused: nothing listens there (ECONNREFUSED): no daemon;
+ *   - unreachable: another network failure, named by its code from a fixed list;
+ *   - http-error / bad-response: it answered, but not with usable /health JSON;
+ *   - markers-off / markers-unreported: it answered, without a confirmed writer.
  */
-type MarkerWriterProbe =
-  | { live: true }
-  | { live: false; reason: string };
+export const PROBE_FAILURES = ["slow", "refused", "unreachable", "http-error", "bad-response", "markers-off", "markers-unreported"] as const;
+export type ProbeFailure = (typeof PROBE_FAILURES)[number];
+export type MarkerWriterProbe = { live: true } | { live: false; kind: ProbeFailure; reason: string };
+/** Network error codes named as-is in an `unreachable` reason; anything else is "a network error" (no free text). */
+const NAMED_NET_CODES = ["ECONNRESET", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EPIPE", "ECONNABORTED"];
+export const PROBE_DEADLINE_MS = 1000;
 
-async function probeMarkerWriter(): Promise<MarkerWriterProbe> {
-  const port = process.env.RELAY_HTTP_PORT ?? "3777";
-  const host = process.env.RELAY_HTTP_HOST ?? "127.0.0.1";
+export async function probeMarkerWriter(
+  opts: { host?: string; port?: string; deadlineMs?: number } = {},
+): Promise<MarkerWriterProbe> {
+  const port = opts.port ?? process.env.RELAY_HTTP_PORT ?? "3777";
+  const host = opts.host ?? process.env.RELAY_HTTP_HOST ?? "127.0.0.1";
+  const deadlineMs = opts.deadlineMs ?? PROBE_DEADLINE_MS;
   const where = `${host}:${port}`;
-  // NOT A BUG FIX — the timer was already live across the body read here, which
-  // measures as bounded on Node v24.13.0. Converted to the owned deadline so the
-  // bound does not depend on undici honouring abort mid-body, unverified on
-  // Node 20 (which `engines` allows and CI exercises). A deadline rejection is
-  // caught by the same `catch` below and reads as "no daemon reachable", which
-  // is the pre-existing behaviour for a timeout.
   try {
-    const probe = await withDeadline(1000, `daemon /health at ${where}`, async (signal) => {
+    const probe = await withDeadline(deadlineMs, `daemon /health at ${where}`, async (signal) => {
       const res = await fetch(`http://${host}:${port}/health`, { signal });
       if (!res.ok) return { ok: false as const, status: res.status };
       return { ok: true as const, body: (await res.json()) as { filesystem_markers?: boolean } };
     });
     if (!probe.ok) {
-      return { live: false, reason: `daemon at ${where} answered /health with HTTP ${probe.status}` };
+      return { live: false, kind: "http-error", reason: `daemon at ${where} answered /health with HTTP ${probe.status}` };
     }
     const body = probe.body;
-    if (body.filesystem_markers === true) return { live: true };
-    if (body.filesystem_markers === false) {
-      return {
-        live: false,
-        reason: `daemon at ${where} is running WITHOUT RELAY_FILESYSTEM_MARKERS=1, so it never writes markers`,
-      };
+    if (body && body.filesystem_markers === true) return { live: true };
+    if (body && body.filesystem_markers === false) {
+      return { live: false, kind: "markers-off", reason: `daemon at ${where} is running WITHOUT RELAY_FILESYSTEM_MARKERS=1, so it never writes markers` };
     }
     // Strict: an older daemon omits the field entirely, and "absent" must not
     // read as "enabled". Absence of information is not information — say
     // exactly that rather than blaming a daemon that is plainly reachable.
     return {
       live: false,
+      kind: "markers-unreported",
       reason: `daemon at ${where} is reachable but does not report filesystem_markers (pre-2.22 build) — cannot confirm the marker path`,
     };
-  } catch {
-    return { live: false, reason: `no relay daemon reachable at ${where}, so nothing will ever write the marker` };
+  } catch (err) {
+    if (err instanceof DeadlineExceededError) {
+      return { live: false, kind: "slow", reason: `daemon at ${where} did not answer /health within ${deadlineMs}ms: it is SLOW, not absent` };
+    }
+    if (err instanceof SyntaxError) {
+      return { live: false, kind: "bad-response", reason: `daemon at ${where} answered /health with a body that is not JSON` };
+    }
+    const code = (err as { cause?: { code?: unknown } })?.cause?.code;
+    if (code === "ECONNREFUSED") {
+      return { live: false, kind: "refused", reason: `nothing is listening at ${where} (connection refused): no relay daemon, so nothing will ever write the marker` };
+    }
+    const named = typeof code === "string" && NAMED_NET_CODES.includes(code) ? code : "a network error";
+    return { live: false, kind: "unreachable", reason: `the relay daemon at ${where} is unreachable (${named})` };
   }
+}
+
+/** What to do about each probe failure: a slow daemon is NEVER sent to a restart. */
+export function adviceFor(kind: ProbeFailure | "missed-delivery"): string {
+  switch (kind) {
+    case "slow":
+      return "The daemon is up but slow to answer: nothing to restart. The watch re-probes and returns to event-driven when it answers.";
+    case "refused":
+    case "unreachable":
+      return "Start the relay daemon (`relay doctor` shows it); the watch re-probes and returns to event-driven when it answers.";
+    case "http-error":
+    case "bad-response":
+      return "The daemon answered /health wrongly: `relay doctor` shows its state. The watch keeps re-probing.";
+    default:
+      return "Check: is the daemon running with RELAY_FILESYSTEM_MARKERS=1?";
+  }
+}
+
+/** While degraded by a FAILED PROBE, re-probe this often; a confirmed writer upgrades back to event-driven. */
+export const REPROBE_MS = 60_000;
+
+/**
+ * LEVEL-TRIGGERED mode (2026-10-05 finding): the mode was decided ONCE per watch,
+ * so one transient /health stall downgraded all 30 minutes to polling. While the
+ * watch is degraded because the PROBE failed, each tick re-probes; the first
+ * confirmed writer calls upgrade() and says so ONCE. A tick never overlaps one
+ * still in flight. A degradation proven at RUNTIME (a delivery the marker missed)
+ * is not re-probed: the daemon answering does not prove the marker fires.
+ */
+export function makeReprobe(deps: {
+  agent: string;
+  probe: () => Promise<MarkerWriterProbe>;
+  isProbeDegraded: () => boolean;
+  upgrade: () => boolean;
+  write: (line: string) => void;
+}): { tick: () => Promise<void> } {
+  let inFlight = false;
+  return {
+    tick: async () => {
+      if (inFlight || !deps.isProbeDegraded()) return;
+      inFlight = true;
+      try {
+        const p = await deps.probe();
+        if (p.live && deps.isProbeDegraded() && deps.upgrade()) {
+          deps.write(`[sentinel] RECOVERED — wake for ${deps.agent} is event-driven again: the marker writer answered and is confirmed live\n`);
+        }
+      } finally {
+        inFlight = false;
+      }
+    },
+  };
 }
 
 export async function run(argv: string[]): Promise<number> {
@@ -400,9 +467,11 @@ export async function run(argv: string[]): Promise<number> {
 
   // --- Continuous watch. Bounded, no busy-spin. Runs until SIGINT/SIGTERM. ---
   let timer: NodeJS.Timeout | null = null;
+  let reprobeTimer: NodeJS.Timeout | null = null;
   let watcher: fs.FSWatcher | null = null;
   const stop = (): void => {
     if (timer) clearInterval(timer);
+    if (reprobeTimer) clearInterval(reprobeTimer);
     if (watcher) {
       try {
         watcher.close();
@@ -442,9 +511,11 @@ export async function run(argv: string[]): Promise<number> {
   //      that definitely landed. That is the degraded case proving itself, and
   //      it is announced once and acted on (see tightenToPolling).
   let degradedAnnounced = false;
+  /** Degraded because the PROBE failed (re-probed; can upgrade) — not because a delivery was missed. */
+  let probeDegraded = false;
 
   /** Did a real marker write reach us, or are we only being saved by the timer? */
-  const announceDegraded = (reason: string): void => {
+  const announceDegraded = (reason: string, kind: ProbeFailure | "missed-delivery"): void => {
     if (degradedAnnounced) return;
     degradedAnnounced = true;
     process.stderr.write(
@@ -452,7 +523,7 @@ export async function run(argv: string[]): Promise<number> {
         `[sentinel]   markers are enabled in THIS process, but that only controls whether we\n` +
         `[sentinel]   WATCH the marker — the daemon's outbox tail is what WRITES it.\n` +
         `[sentinel]   Latency will be up to the poll interval instead of ~10ms.\n` +
-        `[sentinel]   Check: is the daemon running with RELAY_FILESYSTEM_MARKERS=1?\n`,
+        `[sentinel]   ${adviceFor(kind)}\n`,
     );
   };
 
@@ -467,6 +538,8 @@ export async function run(argv: string[]): Promise<number> {
     timer = setInterval(check, args.intervalMs);
   };
 
+  const FALLBACK_MS = 30_000; // marker-miss safety net
+  let fallbackTick: (() => void) | null = null;
   if (markersEnabled()) {
     // Event-driven: watch the marker's DIRECTORY (the file may not exist until
     // the first delivery) and re-check on any touch of <agent>.touch. A slow
@@ -508,21 +581,19 @@ export async function run(argv: string[]): Promise<number> {
         });
       }
     }
-    const FALLBACK_MS = 30_000; // marker-miss safety net
     // New mail that the marker watcher never told us about: the marker did
     // not fire for a message that definitely landed. Prove-by-behaviour that
     // we are degraded, then stop pretending the 30s net is a wake path.
-    timer = setInterval(
-      makeFallbackTick({
-        readPrevUnread: () => mailbox.prevUnread(),
-        check,
-        onMissedDelivery: () => {
-          announceDegraded("new mail was detected by the fallback poll, not by a marker event");
-          tightenToPolling();
-        },
-      }),
-      FALLBACK_MS,
-    );
+    fallbackTick = makeFallbackTick({
+      readPrevUnread: () => mailbox.prevUnread(),
+      check,
+      onMissedDelivery: () => {
+        probeDegraded = false; // runtime evidence: never upgraded by a probe
+        announceDegraded("new mail was detected by the fallback poll, not by a marker event", "missed-delivery");
+        tightenToPolling();
+      },
+    });
+    timer = setInterval(fallbackTick, FALLBACK_MS);
   } else {
     // No markers → bounded polling of the cheap primitive.
     timer = setInterval(check, args.intervalMs);
@@ -540,9 +611,27 @@ export async function run(argv: string[]): Promise<number> {
     if (probe.live) {
       modeLabel = "event-driven; marker writer confirmed live";
     } else {
-      modeLabel = `polling every ${Math.round(args.intervalMs / 1000)}s (markers enabled but marker writer NOT confirmed)`;
-      announceDegraded(probe.reason);
+      modeLabel = `polling every ${Math.round(args.intervalMs / 1000)}s (markers enabled but marker writer NOT confirmed: ${probe.kind}; re-probing every ${Math.round(REPROBE_MS / 1000)}s)`;
+      announceDegraded(probe.reason, probe.kind);
+      probeDegraded = true;
       tightenToPolling();
+      // LEVEL-TRIGGERED: re-probe while probe-degraded; a confirmed writer
+      // restores the marker path (the 30s safety net, not the tight poll).
+      const reprobe = makeReprobe({
+        agent,
+        probe: () => probeMarkerWriter(),
+        isProbeDegraded: () => probeDegraded,
+        upgrade: () => {
+          if (!watcher || !fallbackTick) return false; // no live marker watcher: nothing to upgrade to
+          if (timer) clearInterval(timer);
+          timer = setInterval(fallbackTick, FALLBACK_MS);
+          probeDegraded = false;
+          degradedAnnounced = false; // a LATER degradation is announced again
+          return true;
+        },
+        write: (line) => process.stderr.write(line),
+      });
+      reprobeTimer = setInterval(() => void reprobe.tick(), REPROBE_MS);
     }
   }
 
