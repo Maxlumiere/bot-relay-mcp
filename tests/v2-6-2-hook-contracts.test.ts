@@ -199,7 +199,7 @@ interface RunOpts {
   dbPath?: string;
   home: string;
   stdin?: string;
-  httpPort?: number; // if set, hook will probe this port
+  httpPort?: number; // the port the hook probes (default 1: refused at once, never the operator's)
   httpHost?: string;
   extraEnv?: Record<string, string>;
 }
@@ -231,7 +231,16 @@ function assertVerdictLeaksNothing(stdout: string, secrets: string[]): void {
   }
 }
 
+/** Every key RunOpts accepts. Tests are not type-checked, so a misspelt key is refused at RUN time. */
+const RUN_OPTS_KEYS = new Set(["hook", "agentName", "agentToken", "dbPath", "home", "stdin", "httpPort", "httpHost", "extraEnv"]);
+
 function runHook(o: RunOpts): { status: number; stdout: string; stderr: string } {
+  // A misspelt option was silently DROPPED: `root` for `home` and `env` for `extraEnv` ran the real
+  // hooks with no HOME (resolving the operator's LIVE instance) and no port (3777, the operator's
+  // live daemon), and made one test vacuous. An unknown key now fails the test that passed it.
+  const unknown = Object.keys(o).filter((k) => !RUN_OPTS_KEYS.has(k));
+  if (unknown.length) throw new Error(`runHook: unknown option(s) ${unknown.join(", ")} (accepted: ${[...RUN_OPTS_KEYS].join(", ")})`);
+  if (!o.home) throw new Error("runHook: `home` is required (without it the hook resolves the operator's real home)");
   const env: Record<string, string> = {
     HOME: o.home,
     PATH: process.env.PATH || "/usr/bin:/bin",
@@ -241,7 +250,8 @@ function runHook(o: RunOpts): { status: number; stdout: string; stderr: string }
   if (o.agentName !== undefined) env.RELAY_AGENT_NAME = o.agentName;
   if (o.agentToken !== undefined) env.RELAY_AGENT_TOKEN = o.agentToken;
   if (o.dbPath !== undefined) env.RELAY_DB_PATH = o.dbPath;
-  if (o.httpPort !== undefined) env.RELAY_HTTP_PORT = String(o.httpPort);
+  // Never the hook's default (3777, the operator's live daemon): a test that wants a daemon says which.
+  env.RELAY_HTTP_PORT = String(o.httpPort ?? 1);
   if (o.httpHost !== undefined) env.RELAY_HTTP_HOST = o.httpHost;
   const r = spawnSync("bash", [o.hook], {
     encoding: "utf-8",
@@ -254,6 +264,15 @@ function runHook(o: RunOpts): { status: number; stdout: string; stderr: string }
 
 beforeEach(() => {
   // Each test gets a fresh root; tearDown is per-test in afterEach.
+});
+
+describe("runHook (this file's harness) refuses the option spellings that silently dropped isolation", () => {
+  it("`root` (for home) and `env` (for extraEnv) throw, naming the key; a call without `home` throws", () => {
+    const hook = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+    expect(() => runHook({ hook, root: "/tmp/x", home: "/tmp/x" } as unknown as RunOpts)).toThrow(/unknown option\(s\) root/);
+    expect(() => runHook({ hook, home: "/tmp/x", env: { A: "1" } } as unknown as RunOpts)).toThrow(/unknown option\(s\) env/);
+    expect(() => runHook({ hook } as unknown as RunOpts)).toThrow(/`home` is required/);
+  });
 });
 
 afterEach(() => {
@@ -610,7 +629,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
     const copy = hookCopy(root);
     fs.writeFileSync(copy.helper, "this is not valid bash (((\n");
     for (const hook of copy.hooks) {
-      const r = runHook({ hook, root, agentName: "probe" });
+      const r = runHook({ hook, home: root, agentName: "probe" });
       const combined = `${r.stdout}\n${r.stderr}`;
       const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
       expect(count, `${path.basename(hook)} emitted ${count} verdicts with a CORRUPT helper`).toBe(1);
@@ -627,7 +646,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
     const copy = hookCopy(root);
     fs.rmSync(copy.helper);
     for (const hook of copy.hooks) {
-      const r = runHook({ hook, root, agentName: "probe" });
+      const r = runHook({ hook, home: root, agentName: "probe" });
       const combined = `${r.stdout}\n${r.stderr}`;
       const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
       expect(count, `${path.basename(hook)} emitted ${count} verdicts with NO helper`).toBe(1);
@@ -643,7 +662,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
     // from the agent. check-relay pins it explicitly before loading.
     const { root } = freshTestRoot();
     const hook = path.join(REPO_ROOT, "hooks", "check-relay.sh");
-    const r = runHook({ hook, root, agentName: "probe", env: { RELAY_VERDICT_STREAM: "stderr" } });
+    const r = runHook({ hook, home: root, agentName: "probe", extraEnv: { RELAY_VERDICT_STREAM: "stderr" } });
     expect((r.stdout.match(/VERDICT=/g) ?? []).length, "verdict was redirected off stdout").toBe(1);
     expect((r.stderr.match(/VERDICT=/g) ?? []).length).toBe(0);
   });
@@ -655,7 +674,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
     // stdout is structured JSON must use stderr, so both streams are searched.
     const { root } = freshTestRoot();
     for (const hook of ALL_HOOKS) {
-      const r = runHook({ hook, root, agentName: "probe" });
+      const r = runHook({ hook, home: root, agentName: "probe" });
       const combined = `${r.stdout}\n${r.stderr}`;
       const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
       expect(count, `hook ${path.basename(hook)} emitted ${count} verdicts (expected exactly 1)`).toBe(1);

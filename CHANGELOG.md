@@ -76,6 +76,12 @@ Any process that could reach the relay's local HTTP port could register a new ag
 - **A SessionStart hook that runs twice in one window no longer reports `REGISTER_FAILED`.** The second run, from the same process with the same token, is now a no-op refresh.
 - **Two relays starting at the same moment no longer crash creating the secret.** It is written to a temporary file and moved into place in one step.
 
+### Fixed — running the test suite no longer reaches a relay running on the same machine
+
+On a machine with a relay daemon running, every `npm test` run sent seven `register_agent` calls for an agent named `probe` to the daemon on port 3777, and the same hook runs resolved that machine's live relay database as their own. A hook test passed two of its options under the wrong names, so it ran the real hooks with no `HOME` (bash and node then fall back to the account's real home, whose `~/.bot-relay` names the live instance) and with no port (the hooks default to 3777). The calls were refused, because an agent named `probe` already existed, but they reached the live daemon on every run.
+
+- **Fixed where it started.** The test passes its options under the right names. Its helper now refuses an option it does not know, so a misspelling can no longer silently drop the isolation. One test that passed without testing anything (its environment override was never applied) now tests what it claims.
+- **Closed for every test.** A suite-wide guard gives each test worker a private `HOME` and a closed default port. It refuses any connection to the operator's relay port (3777, any port in the real relay config, and a port set in the shell) and any read or write under the real `~/.bot-relay`, in the test process and in every process a test starts, including `curl` and `node`. A refused connection fails the test that made it, even when the test catches the error.
 ### Security — three new dependency advisories cleared
 
 - **proxy-addr 2.0.8** in the server and the extension (was 2.0.7; critical, GHSA-jqcg-44mw-7w3h). An IPv4 address no longer matches an IPv6 trust subnet that does not cover the IPv4-mapped range. Express uses it to trust proxies; the relay does not turn on Express's trust-proxy setting.
