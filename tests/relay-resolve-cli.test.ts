@@ -200,10 +200,11 @@ async function withRealDaemon(label: string, fn: (ctx: DaemonCtx) => Promise<voi
       const err: string[] = [];
       const outSpy = vi.spyOn(process.stdout, "write").mockImplementation(((c: unknown) => { out.push(String(c)); return true; }) as typeof process.stdout.write);
       const errSpy = vi.spyOn(process.stderr, "write").mockImplementation(((c: unknown) => { err.push(String(c)); return true; }) as typeof process.stderr.write);
-      const s = { name: process.env.RELAY_AGENT_NAME, tok: process.env.RELAY_AGENT_TOKEN, cfg: process.env.RELAY_CONFIG_PATH };
+      const s = { name: process.env.RELAY_AGENT_NAME, tok: process.env.RELAY_AGENT_TOKEN, cfg: process.env.RELAY_CONFIG_PATH, port: process.env.RELAY_HTTP_PORT };
       process.env.RELAY_AGENT_NAME = agentName;
       process.env.RELAY_AGENT_TOKEN = token;
       process.env.RELAY_CONFIG_PATH = cfgPath;
+      delete process.env.RELAY_HTTP_PORT; // the config file names the test daemon's port; an env port would override it
       try {
         const code = await run(argv);
         return { code, out: out.join(""), err: err.join("") };
@@ -213,6 +214,7 @@ async function withRealDaemon(label: string, fn: (ctx: DaemonCtx) => Promise<voi
         if (s.name === undefined) delete process.env.RELAY_AGENT_NAME; else process.env.RELAY_AGENT_NAME = s.name;
         if (s.tok === undefined) delete process.env.RELAY_AGENT_TOKEN; else process.env.RELAY_AGENT_TOKEN = s.tok;
         if (s.cfg === undefined) delete process.env.RELAY_CONFIG_PATH; else process.env.RELAY_CONFIG_PATH = s.cfg;
+        if (s.port === undefined) delete process.env.RELAY_HTTP_PORT; else process.env.RELAY_HTTP_PORT = s.port;
       }
     };
 

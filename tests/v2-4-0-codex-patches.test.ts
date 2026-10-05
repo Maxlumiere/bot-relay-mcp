@@ -44,16 +44,22 @@ function freshHome(): void {
   fs.mkdirSync(TEST_HOME, { recursive: true });
 }
 
+// These tests read the http_port a CONFIG FILE sets, so no env port may override it; the
+// ambient one (the harness's safe default) is put back after each test.
+const AMBIENT_HTTP_PORT = process.env.RELAY_HTTP_PORT;
 beforeEach(() => {
   delete process.env.RELAY_INSTANCE_ID;
   delete process.env.RELAY_DB_PATH;
   delete process.env.RELAY_CONFIG_PATH;
+  delete process.env.RELAY_HTTP_PORT;
   freshHome();
 });
 afterEach(() => {
   delete process.env.RELAY_INSTANCE_ID;
   delete process.env.RELAY_DB_PATH;
   delete process.env.RELAY_CONFIG_PATH;
+  if (AMBIENT_HTTP_PORT === undefined) delete process.env.RELAY_HTTP_PORT;
+  else process.env.RELAY_HTTP_PORT = AMBIENT_HTTP_PORT;
 });
 
 describe("v2.4.0 Codex HIGH #1 — atomic lock-file", () => {

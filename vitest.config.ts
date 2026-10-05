@@ -31,7 +31,11 @@ export default defineConfig({
     // ws-401/403 on a machine that has run `relay init`) from ONE site. A test that
     // sets its own RELAY_CONFIG_PATH at its module top overrides it (asserted in
     // tests/config-isolation.test.ts). Scoped to config+secrets, NOT RELAY_HOME.
-    setupFiles: ["./tests/_setup/hermetic-config.ts"],
+    //
+    // Operator tripwire (FIRST, so it reads the shell's RELAY_HTTP_PORT and RELAY_HOME before any
+    // test changes it): no test, and no child a test spawns, can connect to the
+    // operator's live relay port. A connect is refused and fails the test that made it.
+    setupFiles: ["./tests/_setup/operator-tripwire.ts", "./tests/_setup/hermetic-config.ts"],
     include: ["tests/**/*.test.ts"],
     exclude: [
       "node_modules/**",
