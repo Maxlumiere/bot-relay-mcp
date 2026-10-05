@@ -12,6 +12,7 @@ The doorbell job (not installed yet) now checks whether a ring worked. A ring wo
 - **A closed window pauses, it does not close.** When the agent's session is cleared (its window closed), nothing is judged, written or closed: rings stay unjudged and escalations stay open until a new session appears, which then closes them and rings the mail afresh.
 - **Where escalations go.** Escalations are written to the job's own log and to stderr only. The job never sends a relay message and never writes the relay DB. `--operator NAME` sets who is named on escalations (default: nobody); that agent is never rung because of one.
 - **Survives a restart.** Every judgement and escalation is rebuilt from the log. Compaction keeps open escalations, rings not judged yet, and everything the count still needs. Mail drained while the job was down is still counted as the ring having worked.
+- **Survives a crash between two records.** Each cycle works out what the escalations should be from the log and the current mail, then writes whatever is missing, so a crash between a judgement and its escalation (or its close) heals on the next cycle. A very large batch of drained mail is recorded across several records rather than refused.
 
 Each ring now records, for every message it covers, why it was rung: `new` or `still_pending`. The ring as a whole no longer carries one reason.
 

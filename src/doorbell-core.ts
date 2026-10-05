@@ -46,7 +46,7 @@
  *     `operator` (V3) is attribution on escalation records only, never a ring target.
  */
 import type { BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord } from "./doorbell-log.js";
-import { rungKey } from "./doorbell-log.js";
+import { MAX_IDS_PER_INTENT, rungKey } from "./doorbell-log.js";
 
 export interface CandidateBinding {
   binding_id: string;
@@ -221,6 +221,11 @@ export function ledgerInput(records: readonly LogRecord[], monoOf: (rec: IntentR
  *       records that progress, and (e) holds its intent indefinitely. It is bounded per agent
  *       (at most K rings per id, none added while it is not rung) and ends at its next
  *       re-registration (a new session; a NULLed one is never restored: register mints one).
+ *   (f) it is the during_escalation (extra) ring of an OPEN agent_unresponsive escalation
+ *       (ruling 478083e0): its ids belong to the episode the close predicate tests, so an
+ *       episode that progressed ONLY through the extra ring's id keeps that id. At most one
+ *       per escalation. (Today (b) also keeps it, since nothing else rings an escalated agent;
+ *       (f) does not depend on that.)
  * `pendingNow` is every agent's pending read from ONE snapshot.
  */
 export function intentKeepRule(
@@ -243,7 +248,21 @@ export function intentKeepRule(
   }
   const lastN = new Set<string>();
   for (const list of byAgent.values()) for (const r of list.slice(-at.budgetPerHour)) lastN.add(r.intent.intent_id);
+  // (f): the extra ring of each agent_unresponsive escalation STILL OPEN at the end of the log,
+  // tied to ITS escalation (log order: the extra ring follows its open record).
+  const extraOf = new Map<string, string>(); // escalation_id → its extra ring's intent_id
+  const openU = new Map<string, string>(); // escalation_id → agent \0 session, while open
+  for (const r of records) {
+    if (r.type === "escalation" && r.reason === "agent_unresponsive") {
+      if (r.state === "open") openU.set(r.escalation_id, `${r.agent_name}\u0000${r.reading_session}`);
+      else openU.delete(r.escalation_id);
+    } else if (r.type === "intent" && r.intent.during_escalation) {
+      for (const [eid, key] of openU) if (key === `${r.intent.agent_name}\u0000${r.covers.reading_session}`) extraOf.set(eid, r.intent.intent_id);
+    }
+  }
+  const keepExtra = new Set([...openU.keys()].map((eid) => extraOf.get(eid)).filter((x): x is string => !!x));
   return (rec) => {
+    if (keepExtra.has(rec.intent.intent_id)) return true; // (f)
     if (ringCountsAtStart(Date.parse(rec.at), at.lastHeaderWall, at.startWall)) return true; // (a)
     if (lastN.has(rec.intent.intent_id)) return true; // (b)
     if (!judged.has(rec.intent.intent_id)) return true; // (c)
@@ -336,6 +355,23 @@ export function planCycle(input: CycleInput): CyclePlan {
   const closeOf = (e: EscalationRecord, why: "progress" | "session_changed"): EscalationRecord => escalation(e.agent_name, e.reading_session, e.reason, e.message_ids, "closed", e.escalation_id, why);
 
   /**
+   * An effect as one or more records, each within the per-record id bound (#302 Codex R1 F4: an
+   * aggregated effect over MAX_IDS_PER_INTENT ids was refused by the writer and stalled every
+   * later cycle). Chunk k carries the k-th slice of each list; every chunk of an `effective`
+   * batch is progress (deriveLedger resets on each), so the split changes no decision.
+   */
+  const effectRecords = (name: string, rs: string, outcome: EffectRecord["outcome"], intentIds: Iterable<string>, left: Iterable<string>): EffectRecord[] => {
+    const ii = sortedSet(intentIds);
+    const ll = sortedSet(left);
+    const n = Math.max(1, Math.ceil(ii.length / MAX_IDS_PER_INTENT), Math.ceil(ll.length / MAX_IDS_PER_INTENT));
+    return Array.from({ length: n }, (_, k) => ({
+      v: 1 as const, type: "effect" as const, at, agent_name: name, reading_session: rs, outcome,
+      intent_ids: ii.slice(k * MAX_IDS_PER_INTENT, (k + 1) * MAX_IDS_PER_INTENT),
+      left: ll.slice(k * MAX_IDS_PER_INTENT, (k + 1) * MAX_IDS_PER_INTENT),
+    }));
+  };
+
+  /**
    * PR 3, for ONE agent and its current read: judge its rings and move its escalations.
    * Appends the records and returns the ledger AFTER them (what the ring step decides on).
    */
@@ -348,26 +384,30 @@ export function planCycle(input: CycleInput): CyclePlan {
     if (!rs) return null;
     const { ledger, other } = deriveLedger(input.ledger.history(name), rs, (r) => input.ledger!.monoOf(r));
     // The V4 rescue path: the old session's rings are moot and its escalations close.
-    for (const [ors, ids] of other.outstanding) records.push({ v: 1, type: "effect", at, agent_name: name, reading_session: ors, outcome: "session_changed", intent_ids: sortedSet(ids), left: [] });
+    for (const [ors, ids] of other.outstanding) records.push(...effectRecords(name, ors, "session_changed", ids, []));
     for (const e of other.open) records.push(closeOf(e, "session_changed"));
     const pending = new Set(read.ids);
-    const absent = new Set([...ledger.rungIds].filter((id) => !pending.has(id)));
     // PROGRESS first, by THE judgement (ringEffect): a rung id of this session, not yet
     // recorded as left, has LEFT its pending set.
     const watch = [...ledger.rungIds].filter((id) => !ledger.recordedLeft.has(id));
     const effect = watch.length > 0 ? ringEffect({ reading_session: rs, message_ids: watch }, read) : null;
     const leftNow = effect?.outcome === "effective" ? effect.left : [];
     if (leftNow.length > 0) {
-      records.push({ v: 1, type: "effect", at, agent_name: name, reading_session: rs, outcome: "effective", intent_ids: sortedSet(ledger.outstanding.map((o) => o.intent_id)), left: leftNow });
+      records.push(...effectRecords(name, rs, "effective", ledger.outstanding.map((o) => o.intent_id), leftNow));
       ledger.outstanding = [];
       ledger.counter = 0;
       for (const id of leftNow) ledger.recordedLeft.add(id);
     }
-    if (ledger.unresponsive && [...ledger.unresponsive.episode].some((id) => absent.has(id))) {
+    // THE CLOSE (ruling c04f463a Q4): an episode id has LEFT pending in this same session. It is
+    // judged against the PENDING READ itself, never through rung memory, which a compaction may
+    // drop (#302 Codex R1 F1: a crash between the effective record and the close, then a
+    // compaction, stranded the escalation open forever). The episode is the open record's own
+    // ids plus its one extra ring's; that intent is retained by keep rule (f) (ruling 478083e0).
+    if (ledger.unresponsive && [...ledger.unresponsive.episode].some((id) => !pending.has(id))) {
       records.push(closeOf(ledger.unresponsive.rec, "progress"));
       ledger.unresponsive = null;
     }
-    for (const [id, e] of ledger.stuck) if (absent.has(id)) {
+    for (const [id, e] of ledger.stuck) if (!pending.has(id)) {
       records.push(closeOf(e, "progress"));
       ledger.stuck.delete(id);
     }
@@ -377,8 +417,16 @@ export function planCycle(input: CycleInput): CyclePlan {
       records.push({ v: 1, type: "effect", at, agent_name: name, reading_session: rs, outcome: "ineffective", intent_ids: [o.intent_id], left: [] });
       ledger.outstanding = ledger.outstanding.filter((x) => x !== o);
       ledger.counter += 1;
-      if (ledger.counter >= ESCALATE_AFTER && !ledger.unresponsive) {
-        const rec = escalation(name, rs, "agent_unresponsive", [...ledger.rungIds].filter((id) => pending.has(id)), "open", newEscalationId(), null);
+    }
+    // THE THRESHOLD, reconciled from the RECOVERED state on every cycle, not only at the moment a
+    // ring is judged (#302 Codex R1 F2: a crash between the 3rd ineffective record and the
+    // escalation lost it forever). A counter at the threshold with no open escalation opens one.
+    // (Progress resets the counter in the same record that closes an episode, and a session
+    // change is a new key, so this state means exactly "the escalation was never written".)
+    if (ledger.counter >= ESCALATE_AFTER && !ledger.unresponsive) {
+      const ids = [...ledger.rungIds].filter((id) => pending.has(id));
+      if (ids.length > 0) {
+        const rec = escalation(name, rs, "agent_unresponsive", ids, "open", newEscalationId(), null);
         records.push(rec);
         ledger.unresponsive = { rec, episode: new Set(rec.message_ids), extraRung: false };
       }

@@ -106,9 +106,10 @@ export interface ClockRecord {
  * PR 3 (A2.3 as corrected by V4): what became of rings, judged for ONE (agent, reading
  * session). Written once per judgement (A3.2), so a restart rebuilds the ineffective-ring
  * counter and the un-judged ("outstanding") rings from the log alone.
- *   - "effective": rung ids of this session LEFT its pending set (`left`, never empty); every
- *     ring still outstanding (`intent_ids`, possibly none) is judged effective, and the
- *     counter resets.
+ *   - "effective": rung ids of this session LEFT its pending set (`left`); every ring still
+ *     outstanding (`intent_ids`, possibly none) is judged effective, and the counter resets.
+ *     One batch may span several records, each within the per-record id bound (never both
+ *     lists empty).
  *   - "ineffective": ONE ring (`intent_ids`, exactly one) reached its horizon with no rung id
  *     of this session having left since; the counter goes up by one.
  *   - "session_changed": the reading session moved; the rings still outstanding for the OLD
@@ -264,9 +265,14 @@ export function recordFault(r: unknown): string | null {
     if (typeof r.agent_name !== "string" || !AGENT_NAME_PATTERN.test(r.agent_name)) return "agent_name is not a valid agent name";
     if (typeof r.reading_session !== "string" || !DIGEST_RE.test(r.reading_session)) return "reading_session is not a 64-hex digest";
     if (!(EFFECT_OUTCOMES as readonly unknown[]).includes(r.outcome)) return `outcome must be one of ${EFFECT_OUTCOMES.join(", ")}`;
+    // An `effective` batch over the per-record bound is split across records (#302 Codex R1 F4),
+    // so a continuation chunk may carry only intent_ids; never neither.
     const shape =
-      r.outcome === "effective" ? { iMin: 0, iMax: MAX_IDS_PER_INTENT, lMin: 1, lMax: MAX_IDS_PER_INTENT } : r.outcome === "ineffective" ? { iMin: 1, iMax: 1, lMin: 0, lMax: 0 } : { iMin: 1, iMax: MAX_IDS_PER_INTENT, lMin: 0, lMax: 0 };
-    return setFault(r.intent_ids, `${r.outcome as string} intent_ids`, shape.iMin, shape.iMax, isUuid) ?? setFault(r.left, `${r.outcome as string} left`, shape.lMin, shape.lMax, nonEmpty);
+      r.outcome === "effective" ? { iMin: 0, iMax: MAX_IDS_PER_INTENT, lMin: 0, lMax: MAX_IDS_PER_INTENT } : r.outcome === "ineffective" ? { iMin: 1, iMax: 1, lMin: 0, lMax: 0 } : { iMin: 1, iMax: MAX_IDS_PER_INTENT, lMin: 0, lMax: 0 };
+    const f = setFault(r.intent_ids, `${r.outcome as string} intent_ids`, shape.iMin, shape.iMax, isUuid) ?? setFault(r.left, `${r.outcome as string} left`, shape.lMin, shape.lMax, nonEmpty);
+    if (f) return f;
+    if (r.outcome === "effective" && (r.intent_ids as string[]).length === 0 && (r.left as string[]).length === 0) return "an effective record names at least one intent or one left id";
+    return null;
   }
   if (t === "escalation") {
     if (!sameKeys(r, ["v", "type", "at", "escalation_id", "agent_name", "reading_session", "reason", "state", "message_ids", "operator", "close_reason"])) {

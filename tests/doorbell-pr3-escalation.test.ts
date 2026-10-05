@@ -426,3 +426,194 @@ describe("PR 3: selectLedgerKeep keeps the LAST RESET (crafted records; reachabi
     expect(counter(compacted)).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// #302 Codex R1 + architect ruling 478083e0: LEVEL-TRIGGERED RECONCILIATION, and its guard.
+// ---------------------------------------------------------------------------------------------
+
+type Steps = Array<[number, Record<string, PendingRead>]>;
+const LATE = 7 * 24 * 3_600_000; // a restart a week later: rule (a) keeps nothing
+
+/** THE compaction a restart does (intentKeepRule + selectLedgerKeep), harshest settings: budget 1. */
+function compactRecords(records: readonly LogRecord[], atRestart: Record<string, PendingRead>): LogRecord[] {
+  const pendingNow = new Map(Object.entries(atRestart).map(([a, r]) => [a, { rs: r.reading_session, ids: new Set(r.ids) }]));
+  const keepIntent = C.intentKeepRule(records, pendingNow, { lastHeaderWall: null, startWall: Date.parse("2026-10-02T08:00:00.000Z") + LATE, budgetPerHour: 1 });
+  const keptIntentIds = new Set(records.filter((r) => r.type === "intent" && keepIntent(r)).map((r) => (r as { intent: { intent_id: string } }).intent.intent_id));
+  const ledgerKept = L.selectLedgerKeep(records, keptIntentIds, (a) => pendingNow.get(a)?.rs);
+  return records.filter((r) => (r.type === "intent" ? keptIntentIds.has(r.intent.intent_id) : r.type === "effect" || r.type === "escalation" ? ledgerKept.has(r) : true));
+}
+
+/** The DECISION VARIABLES for every agent of `reads` (ruling 478083e0), with no ids in them. */
+function decisions(h: ReturnType<typeof harness>, reads: Record<string, PendingRead>) {
+  const ledger = C.ledgerInput(h.state.records, (rec) => h.intentMono.get(rec.intent.intent_id) as number);
+  return Object.fromEntries(
+    Object.entries(reads).map(([agent, r]) => {
+      const { ledger: l } = C.deriveLedger(ledger.history(agent), r.reading_session, (rec) => h.intentMono.get(rec.intent.intent_id) as number);
+      const pending = new Set(r.ids);
+      return [agent, {
+        counter: l.counter,
+        outstanding: l.outstanding.length,
+        open: h.openEsc().filter((e) => e.agent_name === agent).map((e) => [e.reason, e.reading_session, e.message_ids.join(",")]).sort(),
+        extraRung: l.unresponsive?.extraRung ?? null,
+        ringCounts: [...l.ringCount].filter(([id]) => pending.has(id)).sort(),
+        rungPending: [...l.rungIds].filter((id) => pending.has(id)).sort(),
+      }];
+    }),
+  );
+}
+
+/**
+ * The DIFFERENTIAL CRASH-PREFIX property (ruling 478083e0), at EVERY append boundary k of a
+ * scenario run without a crash (records 0..k-1 durable; the first lost record belongs to step s):
+ *   (1) the next cycles from replay(prefix_k) and from replay(compact(prefix_k)) emit IDENTICAL records;
+ *   (2) a crash at k, then the retried step and one more cycle, converge on the no-crash state.
+ * Returns the boundaries it checked, so a caller can assert a given crash point is among them.
+ */
+function crashPrefix(steps: Steps): Array<{ k: number; lost: LogRecord; durable: LogRecord | undefined }> {
+  const base = harness({ ids: counter(0) });
+  const stepOf: number[] = [];
+  const endOf: number[] = [];
+  steps.forEach(([t, reads], s) => {
+    base.step(t, reads);
+    while (stepOf.length < base.state.records.length) stepOf.push(s);
+    endOf.push(base.state.records.length);
+  });
+  const R = [...base.state.records];
+  const checked: Array<{ k: number; lost: LogRecord; durable: LogRecord | undefined }> = [];
+  for (let k = 0; k < R.length; k++) {
+    const s = stepOf[k];
+    const [t, reads] = steps[s];
+    const prefix = R.slice(0, k);
+    // (1) differential, after a long restart gap, over three cycles.
+    const full = harness({ from: { records: prefix, intentMono: base.intentMono }, ids: counter(1000) });
+    const comp = harness({ from: { records: compactRecords(prefix, reads), intentMono: base.intentMono }, ids: counter(1000) });
+    for (let j = 0; j < 3; j++) {
+      const at = LATE + j * H;
+      expect(comp.step(at, reads).records, `differential: crash at k=${k}, cycle ${j}`).toEqual(full.step(at, reads).records);
+    }
+    // (2) convergence: retry the crashed step, then one more cycle; the no-crash path takes that one more cycle.
+    const crashed = harness({ from: { records: prefix, intentMono: base.intentMono }, ids: counter(2000) });
+    crashed.step(t, reads);
+    crashed.step(t + 1, reads);
+    const clean = harness({ from: { records: R.slice(0, endOf[s]), intentMono: base.intentMono }, ids: counter(3000) });
+    clean.step(t + 1, reads);
+    expect(decisions(crashed, reads), `convergence: crash at k=${k} (step ${s})`).toEqual(decisions(clean, reads));
+    checked.push({ k, lost: R[k], durable: R[k - 1] });
+  }
+  return checked;
+}
+
+describe("#302 R1 (ruling 478083e0): the DIFFERENTIAL CRASH-PREFIX guard, at every append boundary", () => {
+  it("Codex F1 is a FIXED POINT: escalate on m, extra ring on n, then m drained; a crash between the effective record and the close", () => {
+    const checked = crashPrefix([
+      ...[0, 1, 2, 3].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]) }]),
+      [3 * H + 20_000, { alice: read(["m", "n"]) }], // the extra ring
+      [3 * H + 40_000, { alice: read(["n"]) }], // m drained: effective, then close
+      [4 * H + 40_000, { alice: read(["n", "p"]) }],
+      [5 * H + 40_000, { alice: read(["n", "p"]) }],
+    ]);
+    // Precondition: Codex's exact crash point (effective durable, close lost) is among the boundaries checked.
+    expect(checked.some((c) => c.durable?.type === "effect" && c.durable.outcome === "effective" && c.lost.type === "escalation" && c.lost.state === "closed")).toBe(true);
+  });
+  it("F1 via the extra ring ONLY (keep rule (f)): n drained while m stays pending", () => {
+    const checked = crashPrefix([
+      ...[0, 1, 2, 3].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]) }]),
+      [3 * H + 20_000, { alice: read(["m", "n"]) }],
+      [3 * H + 40_000, { alice: read(["m"]) }], // n (the extra ring's id) drained
+      [4 * H + 40_000, { alice: read(["m", "p"]) }],
+    ]);
+    expect(checked.some((c) => c.durable?.type === "effect" && c.durable.outcome === "effective" && c.lost.type === "escalation" && c.lost.state === "closed")).toBe(true);
+  });
+  it("Codex F2 is a FIXED POINT: a crash between the 3rd ineffective record and the agent_unresponsive escalation", () => {
+    const checked = crashPrefix([
+      ...[0, 1, 2, 3, 4].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]) }]),
+      [5 * H, { alice: read(["m", "q"]) }],
+    ]);
+    expect(checked.some((c) => c.durable?.type === "effect" && c.durable.outcome === "ineffective" && c.lost.type === "escalation" && c.lost.reason === "agent_unresponsive")).toBe(true);
+  });
+  it("id_stuck while other mail drains, then the stuck id drained", () => {
+    crashPrefix([...[0, 1, 2, 3, 4, 5, 6].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m", `n${k}`]) }]), [7 * H, { alice: read(["n6"]) }], [8 * H, { alice: read(["n6"]) }]]);
+  });
+  it("a session change with rings outstanding and an escalation open, then a closed window (HOLD), then the new session", () => {
+    crashPrefix([
+      ...[0, 1, 2, 3].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]) }]),
+      [3 * H + 20_000, { alice: read(["m", "n"]) }],
+      [4 * H, { alice: read(["m", "n"], null) }],
+      [5 * H, { alice: read(["m", "n"], RS2) }],
+      [6 * H, { alice: read(["m", "n"], RS2) }],
+    ]);
+  });
+  it("two agents interleaved: one escalates, one drains", () => {
+    crashPrefix([...[0, 1, 2, 3, 4].map((k): [number, Record<string, PendingRead>] => [k * H, { alice: read(["m"]), bob: read(k % 2 ? [] : [`b${k}`]) }])].map(([t, r]) => [t, r] as [number, Record<string, PendingRead>]));
+  });
+});
+
+describe("#302 R1 F2: the threshold is reconciled on ANY cycle (level-triggered)", () => {
+  it("HARM: counter = 3 recovered with NO open escalation and NO ring outstanding → the next cycle opens it", () => {
+    const h = escalated();
+    const withoutEscalation = h.state.records.filter((r) => r.type !== "escalation");
+    const replay = harness({ from: { records: withoutEscalation, intentMono: h.intentMono } });
+    expect(replay.openEsc()).toEqual([]); // precondition: the crash lost it
+    const p = replay.step(4 * H, { alice: read(["m1"]) });
+    expect(p.escalations.map((e) => [e.reason, e.state, e.message_ids])).toEqual([["agent_unresponsive", "open", ["m1"]]]);
+  });
+});
+
+describe("#302 R1 F1: every close predicate is SELF-CONTAINED (episode ids against the pending read)", () => {
+  it("HARM: an open agent_unresponsive whose rung memory was compacted away still closes when an episode id is absent", () => {
+    const h = escalated();
+    const noIntents = h.state.records.filter((r) => r.type !== "intent"); // the worst case: no rung memory at all
+    const replay = harness({ from: { records: noIntents, intentMono: h.intentMono } });
+    const p = replay.step(4 * H, { alice: read([]) });
+    expect(p.escalations.map((e) => [e.reason, e.state, e.close_reason])).toEqual([["agent_unresponsive", "closed", "progress"]]);
+  });
+  it("HARM: the same for an open id_stuck", () => {
+    const h = harness();
+    for (let k = 0; k < 5; k++) h.step(k * H, { alice: read(["m1", `n${k}`]) });
+    expect(h.openEsc().map((e) => e.reason)).toEqual(["id_stuck"]); // precondition
+    const replay = harness({ from: { records: h.state.records.filter((r) => r.type !== "intent"), intentMono: h.intentMono } });
+    const p = replay.step(5 * H, { alice: read(["n4"]) });
+    expect(p.escalations.map((e) => [e.reason, e.state, e.close_reason])).toEqual([["id_stuck", "closed", "progress"]]);
+  });
+});
+
+describe("#302 R1 keep rule (f) (ruling 478083e0): the extra ring of an OPEN escalation is kept", () => {
+  it("crafted (the extra ring is followed by another intent, which production does not do while escalated, so (b) cannot keep it): (f) alone keeps it; closed, it is not kept", () => {
+    const h = escalated();
+    h.step(3 * H + 20_000, { alice: read(["m1", "n"]) }); // the extra ring
+    const extra = h.all("intent").find((r) => r.intent.during_escalation) as Extract<LogRecord, { type: "intent" }>;
+    const later = { ...extra, intent: { ...extra.intent, intent_id: "00000000-0000-4000-8000-0000000fffff", during_escalation: false }, covers: { ...extra.covers, message_ids: ["z"], kinds: ["new" as const] } };
+    const judgedN = { v: 1 as const, type: "effect" as const, at: extra.at, agent_name: "alice", reading_session: RS1, outcome: "effective" as const, intent_ids: [extra.intent.intent_id], left: ["n"] };
+    const records: LogRecord[] = [...h.state.records, judgedN, later];
+    for (const r of records) expect(L.recordFault(r)).toBeNull();
+    const pendingNow = new Map([["alice", { rs: RS1 as string | null, ids: new Set(["m1"]) }]]);
+    const at = { lastHeaderWall: null, startWall: Date.parse("2026-10-02T08:00:00.000Z") + LATE, budgetPerHour: 1 };
+    expect(C.intentKeepRule(records, pendingNow, at)(extra)).toBe(true);
+    const open = h.openEsc()[0];
+    const closed = { ...open, state: "closed" as const, close_reason: "progress" as const };
+    expect(C.intentKeepRule([...records, closed], pendingNow, at)(extra)).toBe(false);
+  });
+});
+
+describe("#302 R1 F4: an effect over the per-record id bound is batched, never refused", () => {
+  const ids = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `${prefix}${String(i).padStart(5, "0")}`);
+  it("HARM (Codex F4): 5,001 + 5,000 rung ids drained together → valid records (10,000 + 1 left), progress persisted, nothing repeated", () => {
+    const h = harness();
+    const a = ids("a", 5001);
+    const b = ids("b", 5000);
+    h.step(0, { alice: read(a) });
+    h.step(W + 1, { alice: read([...a, ...b]) });
+    expect(h.all("intent").map((r) => r.covers.message_ids.length)).toEqual([5001, 5000]); // precondition
+    const p = h.step(W + 2, { alice: read([]) }); // every record schema-validated by the harness
+    expect(p.effects.map((e) => [e.outcome, e.left.length, e.intent_ids.length])).toEqual([["effective", 10_000, 2], ["effective", 1, 0]]);
+    expect(h.step(W + 3, { alice: read([]) }).records).toEqual([]); // progress persisted: no repeat
+  });
+  it("twin: exactly 10,000 drained → ONE record", () => {
+    const h = harness();
+    const a = ids("a", 5000);
+    const b = ids("b", 5000);
+    h.step(0, { alice: read(a) });
+    h.step(W + 1, { alice: read([...a, ...b]) });
+    expect(h.step(W + 2, { alice: read([]) }).effects.map((e) => e.left.length)).toEqual([10_000]);
+  });
+});
