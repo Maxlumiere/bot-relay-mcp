@@ -18,7 +18,7 @@ import path from "path";
 import { execFile, spawnSync } from "child_process";
 import { promisify } from "util";
 import { fileURLToPath } from "url";
-import { addOperatorPortForTest, drainTripwireViolations, tripwireView } from "./_setup/operator-tripwire.js";
+import { addOperatorPortForTest, decorateChildEnv, drainTripwireViolations, privateHomeEnv, tripwireView } from "./_setup/operator-tripwire.js";
 
 const execFileP = promisify(execFile);
 
@@ -157,4 +157,37 @@ describe("a test that SWALLOWS a refusal is still failed (the afterEach check)",
     expect(r.out).toMatch(new RegExp(`OPERATOR_TRIPWIRE \\(afterEach\\)[\\s\\S]*connect 127\\.0\\.0\\.1:${c.port}`));
     expect(c.hits()).toBe(0); // refused, never delivered
   }, 90_000);
+});
+
+describe("PARITY (Windows): the private home is set in EVERY spelling a process may resolve it from", () => {
+  /**
+   * Node's os.homedir() on Windows (libuv uv_os_homedir) returns USERPROFILE when it is set, and
+   * otherwise the ACCOUNT's profile directory from the OS, which no env redirects. So without
+   * USERPROFILE a Windows child would resolve the operator's real home even with HOME private.
+   * This host is not Windows, so that resolution is SIMULATED here, exactly as above.
+   */
+  const windowsHomedir = (env: NodeJS.ProcessEnv, accountProfile: string) => env.USERPROFILE ?? accountProfile;
+  const WIN_PRIVATE = "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\bot-relay-tripwire-ab12\\home";
+  it("win32: USERPROFILE is the private home, and HOMEDRIVE + HOMEPATH spell the same path", () => {
+    const e = privateHomeEnv(WIN_PRIVATE, "win32");
+    expect(e).toEqual({ HOME: WIN_PRIVATE, USERPROFILE: WIN_PRIVATE, HOMEDRIVE: "C:", HOMEPATH: "\\Users\\runneradmin\\AppData\\Local\\Temp\\bot-relay-tripwire-ab12\\home" });
+    expect(`${e.HOMEDRIVE}${e.HOMEPATH}`).toBe(WIN_PRIVATE);
+    expect(windowsHomedir(e, "C:\\Users\\operator")).toBe(WIN_PRIVATE); // never the account's profile
+  });
+  it("a worker and a child built FROM SCRATCH both carry USERPROFILE = the private home (simulated Windows resolution: never the account's profile)", () => {
+    const { privateHome } = tripwireView();
+    expect(process.env.USERPROFILE).toBe(privateHome);
+    expect(`${process.env.HOMEDRIVE}${process.env.HOMEPATH}`).toBe(privateHome);
+    const child = decorateChildEnv({ PATH: "/usr/bin:/bin" });
+    expect(windowsHomedir(child, "ACCOUNT-PROFILE")).toBe(privateHome);
+    expect(`${child.HOMEDRIVE}${child.HOMEPATH}`).toBe(privateHome);
+    const r = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.env.USERPROFILE))"], { encoding: "utf-8", env: {} });
+    expect(r.stdout).toBe(privateHome); // a real child, env {}
+  });
+  it("HARM: a child env naming the operator's real home through USERPROFILE or HOMEDRIVE+HOMEPATH is refused before it starts", () => {
+    const { realHome } = tripwireView();
+    for (const env of [{ USERPROFILE: realHome }, { HOMEDRIVE: "", HOMEPATH: realHome }]) {
+      expect(() => spawnSync("/bin/sh", ["-c", "true"], { env: { PATH: "/usr/bin:/bin", HOME: "/tmp", ...env } })).toThrow(/refused to spawn: .*(USERPROFILE|HOMEDRIVE\+HOMEPATH)=/);
+    }
+  });
 });
