@@ -30,7 +30,7 @@ export const HEARTBEAT_FILENAME = "heartbeat.json";
 export const HEARTBEAT_CONDITIONS = ["ok", "waiting-for-writer", "log-full", "failing"] as const;
 export type HeartbeatCondition = (typeof HEARTBEAT_CONDITIONS)[number];
 /** Q5: why a cycle attempt failed. A CLOSED enum; PR 7 adds driver kinds. */
-export const FAILURE_KINDS = ["pending-read", "db-open", "record-refused", "other"] as const;
+export const FAILURE_KINDS = ["pending-read", "db-open", "record-refused", "log-write", "other"] as const;
 export type FailureKind = (typeof FAILURE_KINDS)[number];
 /** Q2: the last K cycle attempts all failed → `failing`. */
 export const FAILING_AFTER = 3;
@@ -39,6 +39,20 @@ export const STALE_INTERVALS = 3;
 export const STALE_FLOOR_MS = 15_000;
 /** Q1 (ii): `at` more than this far in the FUTURE is a backward clock jump: stale. */
 export const FUTURE_TOLERANCE_MS = 5_000;
+/**
+ * F1 (ruling b556c011): waiting-for-writer is EXPECTED only TRANSIENTLY (the SessionStart race: a new
+ * window's server may not have opened the DB yet). Persisting beyond this grace, it means no relay
+ * process holds the DB (the daemon is down, or the DB left WAL mode): the hook then WARNS.
+ */
+export const WAITING_GRACE_FLOOR_MS = 60_000;
+export const waitingGraceMs = (intervalMs: number): number => Math.max(STALE_INTERVALS * intervalMs, WAITING_GRACE_FLOOR_MS);
+/**
+ * F7 (#304 R1): every counter is bounded by what the READER accepts. A counter at the bound
+ * saturates (failures) or, for `starts`, resets VISIBLY (count 1, `starts_since` moves); it never
+ * writes a value its own validator would refuse.
+ */
+export const MAX_COUNT = Number.MAX_SAFE_INTEGER;
+export const saturatingInc = (n: number): number => (n >= MAX_COUNT ? MAX_COUNT : n + 1);
 
 export interface Heartbeat {
   v: 1;
@@ -56,7 +70,12 @@ export interface Heartbeat {
   cycles: number;
   interval_ms: number;
   condition: HeartbeatCondition;
+  /** When the current condition began (ISO UTC); resets on any change, carried across restarts while unchanged (F1). */
+  condition_since: string;
+  /** Failed cycle attempts in a row, carried across restarts (F3); a success resets it. */
   consecutive_failures: number;
+  /** Failed cycle attempts this lifetime, in total (Q5; F4). */
+  cycle_failures: number;
   last_failure: { at: string; kind: FailureKind } | null;
   /** ADR-0047: what THIS process loaded (LOADED_BUILD), exactly its seven keys. */
   build: Record<string, unknown>;
@@ -67,21 +86,23 @@ export interface Heartbeat {
 
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 const isIso = (v: unknown): v is string => typeof v === "string" && ISO_RE.test(v) && Number.isFinite(Date.parse(v));
-const isCount = (v: unknown, min = 0): v is number => Number.isInteger(v) && (v as number) >= min && (v as number) <= Number.MAX_SAFE_INTEGER;
+const isCount = (v: unknown, min = 0): v is number => Number.isInteger(v) && (v as number) >= min && (v as number) <= MAX_COUNT;
 const sameKeys = (o: unknown, keys: readonly string[]): o is Record<string, unknown> =>
   !!o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).sort().join(",") === [...keys].sort().join(",");
-const KEYS = ["v", "at", "pid", "proc_start", "started_at", "starts", "starts_since", "cycles", "interval_ms", "condition", "consecutive_failures", "last_failure", "build", "install_dir", "resolution"];
+const KEYS = ["v", "at", "pid", "proc_start", "started_at", "starts", "starts_since", "cycles", "interval_ms", "condition", "condition_since", "consecutive_failures", "cycle_failures", "last_failure", "build", "install_dir", "resolution"];
 
 /** Why this is not a valid heartbeat, or null. CLOSED: an extra or missing key is invalid. */
 export function heartbeatFault(h: unknown): string | null {
   if (!sameKeys(h, KEYS)) return `a heartbeat has exactly ${KEYS.join(", ")}`;
   if (h.v !== 1) return "unknown heartbeat version";
-  if (!isIso(h.at) || !isIso(h.started_at) || !isIso(h.starts_since)) return "at, started_at and starts_since must be ISO UTC timestamps";
+  if (!isIso(h.at) || !isIso(h.started_at) || !isIso(h.starts_since) || !isIso(h.condition_since)) return "at, started_at, starts_since and condition_since must be ISO UTC timestamps";
   if (!isCount(h.pid, 1) || (h.pid as number) > 0x7fffffff) return "pid is not a positive 32-bit integer";
   if (!(h.proc_start === null || (typeof h.proc_start === "string" && h.proc_start.length > 0 && h.proc_start.length <= 64 && !/[\u0000-\u001f\u007f]/.test(h.proc_start)))) {
     return "proc_start is not null or a bounded start token";
   }
-  if (!isCount(h.starts, 1) || !isCount(h.cycles, 1) || !isCount(h.consecutive_failures, 0)) return "starts and cycles must be integers >= 1, consecutive_failures >= 0";
+  if (!isCount(h.starts, 1) || !isCount(h.cycles, 1) || !isCount(h.consecutive_failures, 0) || !isCount(h.cycle_failures, 0)) {
+    return "starts and cycles must be integers >= 1, consecutive_failures and cycle_failures >= 0 (all bounded)";
+  }
   if (!isCount(h.interval_ms, 1)) return "interval_ms is not a positive integer";
   if (!(HEARTBEAT_CONDITIONS as readonly unknown[]).includes(h.condition)) return `condition must be one of ${HEARTBEAT_CONDITIONS.join(", ")}`;
   const f = h.last_failure;

@@ -1357,10 +1357,13 @@ elif [ ! -f "$RELAY_DOORBELL_BIN" ]; then
   relay_verdict_raise "DEGRADED" "doorbell status: no relay CLI at $RELAY_DOORBELL_BIN" " agent=\"${AGENT_NAME:-}\"" other
 else
   if relay_budget_for "the doorbell status" 3 margin; then
+    # Each temp file is registered for the exit cleanup THE MOMENT it exists, so a second
+    # mktemp failing can never leak the first (#304 R1 F6).
     RELAY_DOORBELL_OUT="$(mktemp 2>/dev/null || printf '')"
+    [ -n "$RELAY_DOORBELL_OUT" ] && RELAY_TMP_FILES="$RELAY_TMP_FILES $RELAY_DOORBELL_OUT $RELAY_DOORBELL_OUT.timedout"
     RELAY_DOORBELL_ERR="$(mktemp 2>/dev/null || printf '')"
+    [ -n "$RELAY_DOORBELL_ERR" ] && RELAY_TMP_FILES="$RELAY_TMP_FILES $RELAY_DOORBELL_ERR"
     if [ -n "$RELAY_DOORBELL_OUT" ] && [ -n "$RELAY_DOORBELL_ERR" ]; then
-      RELAY_TMP_FILES="$RELAY_TMP_FILES $RELAY_DOORBELL_OUT $RELAY_DOORBELL_ERR $RELAY_DOORBELL_OUT.timedout"
       relay_run_bounded "$RELAY_STEP_SECS" /dev/null "$RELAY_DOORBELL_OUT" "$RELAY_DOORBELL_ERR" node "$RELAY_DOORBELL_BIN" doorbell status --hook
       RELAY_DOORBELL_RC=$?
       case "$RELAY_DOORBELL_RC" in

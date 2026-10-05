@@ -37,7 +37,8 @@
  *     hub refusal waits for a hub mode to exist (recorded in the plan, not invented here).
  *
  * Exit: 0 = stopped cleanly (--once done, or SIGTERM/SIGINT) · 1 = cannot run (resolver
- * fault, DB unreadable, log refused) · 2 = usage.
+ * fault, DB unreadable, log refused) · 2 = usage · 4 = another live doorbell holds this instance
+ * (EXIT_ALREADY_RUNNING; the instance lock, F5).
  */
 import fs from "fs";
 import path from "path";
@@ -49,7 +50,8 @@ import { getOwnHostId, processStartedAt } from "./liveness.js";
 import { performance } from "perf_hooks";
 import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
-import { conditionOf, HEARTBEAT_FILENAME, readHeartbeat, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
+import { conditionOf, HEARTBEAT_FILENAME, MAX_COUNT, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
+import { acquireInstanceLock, EXIT_ALREADY_RUNNING, lockStillOurs, releaseInstanceLock, type LockDeps, type LockHandle } from "./doorbell-lock.js";
 import { AGENT_NAME_PATTERN } from "./types.js";
 
 export const DEFAULT_INTERVAL_MS = 5000;
@@ -164,6 +166,8 @@ export interface DoorbellOptions {
   beforeCycle?: (n: number) => void;
   /** After each heartbeat write (the structural test watches every write). */
   onHeartbeat?: (hb: Heartbeat) => void;
+  /** Test seam: the instance lock's liveness judge and takeover hook. */
+  lockDeps?: LockDeps;
   /** Test seam: alter a cycle's plan before it is written (e.g. to make the writer refuse a record). */
   mutatePlan?: (plan: ReturnType<typeof planCycle>) => void;
 }
@@ -202,6 +206,36 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
   if (!resolution.exists) return fail(`no relay DB at ${resolution.dbPath}: nothing to watch (a missing DB is never "no mail")`);
   const dbPath = resolution.dbPath;
 
+  // F5 (ruling b556c011): the EXCLUSIVE instance lock, FIRST, before anything touches the state dir
+  // (openLog's temp cleanup included). Another live doorbell here → refuse, loudly, distinct exit.
+  const procStart = processStartedAt(process.pid); // the ONE UTC producer (#296), never its own ps
+  let lock: ReturnType<typeof acquireInstanceLock>;
+  try {
+    lock = acquireInstanceLock(stateDirFor(dbPath), { pid: process.pid, proc_start: procStart, host_id: getOwnHostId() }, opts.lockDeps);
+  } catch (err) {
+    return fail(`the instance lock could not be taken (${err instanceof Error ? err.message : String(err)})`);
+  }
+  if (!lock.ok) {
+    process.stderr.write(`DOORBELL_ALREADY_RUNNING: ${lock.reason}\n`);
+    return EXIT_ALREADY_RUNNING;
+  }
+  if (lock.tookOver) process.stderr.write("doorbell: took over the instance lock from a dead holder\n");
+  try {
+    return await runLocked(args, opts, resolution, dbPath, procStart, lock.handle);
+  } finally {
+    releaseInstanceLock(lock.handle);
+  }
+}
+
+/** The job, with the instance lock HELD (released by the caller on every exit). */
+async function runLocked(
+  args: Args,
+  opts: DoorbellOptions,
+  resolution: Exclude<ReturnType<typeof resolveInstance>, { kind: "error" }>,
+  dbPath: string,
+  procStart: string | null,
+  lockHandle: LockHandle,
+): Promise<number> {
   // The log first: it does not depend on the DB being openable yet.
   let log: LogHandle;
   let state: LogState;
@@ -245,12 +279,21 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
     return fail(err instanceof Error ? err.message : String(err));
   }
 
-  // Q4: the restart count, from the PREVIOUS heartbeat (read-only here; the first cycle writes it).
+  // Q4 + F3 + F7: what carries across a restart, from the PREVIOUS heartbeat (read-only here; the
+  // first cycle writes it): the start count, the failure STREAK and last failure (a restart loop
+  // that fails every attempt must read failing), and the current condition with its start. An
+  // UNREADABLE previous heartbeat resets all of them VISIBLY (starts_since moves; a stderr line).
   const prev = readHeartbeat(stateDirFor(dbPath));
-  const starts = prev.kind === "ok" ? prev.heartbeat.starts + 1 : 1;
-  const startsSince = prev.kind === "ok" ? prev.heartbeat.starts_since : iso(startWall);
-  if (prev.kind === "unreadable") process.stderr.write(`doorbell: the previous heartbeat is unreadable (${prev.reason}): the start count restarts at 1\n`);
-  const procStart = processStartedAt(process.pid); // the ONE UTC producer (#296), never its own ps
+  const prevHb = prev.kind === "ok" ? prev.heartbeat : null;
+  let starts = 1;
+  let startsSince = iso(startWall);
+  if (prevHb && prevHb.starts < MAX_COUNT) {
+    starts = prevHb.starts + 1;
+    startsSince = prevHb.starts_since;
+  } else if (prevHb) {
+    process.stderr.write(`doorbell: the start count reached its bound (${MAX_COUNT}): it restarts at 1, from now\n`);
+  }
+  if (prev.kind === "unreadable") process.stderr.write(`doorbell: the previous heartbeat is unreadable (${prev.reason}): the start count and failure streak restart\n`);
   const installDir = ownInstallDir();
 
   const { openPendingDb } = await import("./cli/pending.js");
@@ -388,13 +431,25 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
   // THE heartbeat writer (ruling 9987c113 Q1 (i)): called ONLY from the loop above, once per cycle
   // attempt, with `cycles` incremented in the same write. Nothing else writes the heartbeat.
   let attempts = 0;
-  let consecutiveFailures = 0;
-  let lastFailure: Heartbeat["last_failure"] = null;
+  let consecutiveFailures = prevHb?.consecutive_failures ?? 0;
+  let lastFailure: Heartbeat["last_failure"] = prevHb?.last_failure ?? null;
+  let cycleFailures = 0;
+  let condition: Heartbeat["condition"] | null = prevHb?.condition ?? null;
+  let conditionSince: string | null = prevHb?.condition_since ?? null;
   const writeHeartbeat = (attempt: { waiting: boolean; logFull: boolean; failed: FailureKind | null }): void => {
     const at = iso(clock.wallMs());
-    attempts += 1;
-    consecutiveFailures = attempt.failed ? consecutiveFailures + 1 : 0;
-    if (attempt.failed) lastFailure = { at, kind: attempt.failed };
+    attempts = saturatingInc(attempts);
+    consecutiveFailures = attempt.failed ? saturatingInc(consecutiveFailures) : 0;
+    if (attempt.failed) {
+      cycleFailures = saturatingInc(cycleFailures);
+      lastFailure = { at, kind: attempt.failed };
+    }
+    // F1: when the CURRENT condition began; it moves only on a change (carried across a restart).
+    const cond = conditionOf(attempt, consecutiveFailures);
+    if (cond !== condition || !conditionSince) {
+      condition = cond;
+      conditionSince = at;
+    }
     const hb: Heartbeat = {
       v: 1,
       at,
@@ -405,8 +460,10 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
       starts_since: startsSince,
       cycles: attempts,
       interval_ms: args.intervalMs,
-      condition: conditionOf(attempt, consecutiveFailures),
+      condition: cond,
+      condition_since: conditionSince,
       consecutive_failures: consecutiveFailures,
+      cycle_failures: cycleFailures,
       last_failure: lastFailure,
       build: { ...LOADED_BUILD },
       install_dir: installDir,
@@ -430,6 +487,12 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
       // ONE cycle ATTEMPT (ruling 9987c113): its outcome, then the ONE heartbeat write below.
       const attempt = { waiting: false, logFull: false, failed: null as FailureKind | null };
       let failStop = false;
+      // F5: still the ONLY doorbell for this instance? Never act on a state dir we no longer own.
+      if (!lockStillOurs(lockHandle)) {
+        process.stderr.write("DOORBELL_FAILED: the instance lock is no longer ours (another doorbell took it): stopping\n");
+        code = 1;
+        break;
+      }
       try {
         if (!db) {
           phase = "db-open";
@@ -462,14 +525,16 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
           process.stderr.write(`DOORBELL_FAILED: ${msg}; stopping (a restart rebuilds from the log)\n`);
           code = 1;
           failStop = true;
+          attempt.failed = "log-write";
         } else {
           attempt.failed = err instanceof RecordRefusedError ? "record-refused" : phase;
           process.stderr.write(`doorbell: cycle failed (${attempt.failed}): ${msg}\n`);
           if (args.once) code = 1;
         }
       }
-      if (failStop) break;
+      // ONE heartbeat per attempt, the fail-stop included (F2: best-effort, kind log-write; stale is the backstop).
       writeHeartbeat(attempt);
+      if (failStop) break;
       if (args.once) break;
       await new Promise<void>((resolve) => {
         const t = setTimeout(resolve, args.intervalMs);

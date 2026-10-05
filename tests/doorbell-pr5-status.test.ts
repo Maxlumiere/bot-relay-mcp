@@ -45,7 +45,7 @@ const iso = (ms: number) => new Date(ms).toISOString();
 function heartbeat(over: Partial<Heartbeat> = {}): Heartbeat {
   return {
     v: 1, at: iso(Date.now()), pid: 4242, proc_start: "Mon Oct  5 08:00:00 2026 UTC", started_at: iso(Date.now() - 60_000), starts: 1,
-    starts_since: iso(Date.now() - 60_000), cycles: 12, interval_ms: 5000, condition: "ok", consecutive_failures: 0, last_failure: null,
+    starts_since: iso(Date.now() - 60_000), cycles: 12, interval_ms: 5000, condition: "ok", condition_since: iso(Date.now() - 60_000), consecutive_failures: 0, cycle_failures: 0, last_failure: null,
     build: { ...DIST_BUILD }, install_dir: REPO,
     resolution: { kind: "explicit-db", db_path: dbPath, exists: true, containment: "strict", basis: "RELAY_DB_PATH" },
     ...over,
@@ -189,10 +189,24 @@ describe("Q6: the hook's lines (pure renderer)", () => {
     escalations: { open: 0, items: [] }, state_dir: "/x", db_path: "/x/relay.db", resolution: null, ...over,
   });
   const esc = (k: number) => Array.from({ length: k }, (_, i) => ({ agent: `agent-${i}`, reason: "agent_unresponsive", operator: null, opened_at: iso(NOW), age_seconds: 3600 }));
-  it("SILENT: not-installed; healthy + CURRENT + ok (or waiting-for-writer) + 0 escalations", () => {
+  it("SILENT: not-installed; healthy + CURRENT + ok + 0 escalations", () => {
     expect(S.hookLines(base({ state: "not-installed", build: null, condition: null }))).toEqual([]);
     expect(S.hookLines(base())).toEqual([]);
-    expect(S.hookLines(base({ condition: "waiting-for-writer" }))).toEqual([]);
+  });
+  const waiting = (ageSeconds: number, intervalMs = 5000) =>
+    base({
+      condition: "waiting-for-writer",
+      heartbeat: {
+        at: iso(NOW), age_seconds: 1, pid: 1, proc_start: null, started_at: iso(NOW), starts: 1, starts_since: iso(NOW), cycles: 1, interval_ms: intervalMs,
+        condition_since: iso(NOW - ageSeconds * 1000), condition_age_seconds: ageSeconds, consecutive_failures: 0, cycle_failures: 0, last_failure: null, install_dir: "/x",
+      },
+    });
+  it("F1 (ruling b556c011): waiting-for-writer is SILENT within its grace, max(3 × interval, 60 s), and ONE line beyond it — both sides", () => {
+    expect(S.hookLines(waiting(60))).toEqual([]); // 5 s interval → 60 s grace, at the edge
+    expect(S.hookLines(waiting(61))).toEqual(["[RELAY] doorbell: waiting for a writer for 61s: no relay process holds the DB (daemon down? journal mode?)"]);
+    expect(S.hookLines(waiting(90, 30_000))).toEqual([]); // 30 s interval → 90 s grace
+    expect(S.hookLines(waiting(91, 30_000))).toHaveLength(1);
+    expect(S.hookLines(waiting(3600))[0]).toMatch(/waiting for a writer for 60m/);
   });
   it("HARM: stale, a non-CURRENT build, log-full, failing, or ANY open escalation → one line", () => {
     for (const over of [{ state: "stale" as const }, { build: { verdict: "STALE", reason: "" } }, { build: { verdict: "UNKNOWN", reason: "" } }, { condition: "log-full" }, { condition: "failing" }, { escalations: { open: 1, items: esc(1) } }]) {
@@ -280,6 +294,32 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
   it("HARM (c927c81c D1): no relay CLI AT the doorbell step → DEGRADED naming the path", () => {
     const r = hookCopyWith('HOOKS_DIR="/nonexistent-dir/hooks"');
     expect(r.stdout).toMatch(/\[RELAY\] VERDICT=DEGRADED reason="[^"]*doorbell status: no relay CLI at [^"]*\/bin\/relay/);
+  });
+  it("HARM (#304 R1 F6): the 2nd mktemp failing never LEAKS the 1st file (it is registered the moment it exists)", () => {
+    const mk = path.join(home, "mk");
+    fs.mkdirSync(mk);
+    const r = hookCopyWith(`mktemp() { if [ ! -e "${mk}/.first" ]; then : > "${mk}/.first"; command mktemp "${mk}/leak.XXXXXX"; else return 1; fi; }`);
+    expect(fs.existsSync(path.join(mk, ".first"))).toBe(true); // precondition: the 1st mktemp ran (and succeeded)
+    expect(fs.readdirSync(mk).filter((f) => f.startsWith("leak."))).toEqual([]);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*doorbell status: could not create a private temp file/);
+  });
+  it("HARM (#304 R1 F8a): the hook relays ONLY [RELAY]-prefixed lines, at most 7, whatever the CLI prints (an injection boundary)", () => {
+    const copy = path.join(home, "stub");
+    fs.cpSync(path.join(REPO, "hooks"), path.join(copy, "hooks"), { recursive: true });
+    fs.mkdirSync(path.join(copy, "bin"));
+    fs.symlinkSync(path.join(REPO, "dist"), path.join(copy, "dist"));
+    fs.writeFileSync(
+      path.join(copy, "bin", "relay"),
+      `if (process.argv[2] === "doorbell") {\n` +
+        `  for (let i = 0; i < 3; i++) console.log("INJECTED not-prefixed " + i);\n` +
+        `  for (let i = 0; i < 10; i++) console.log("[RELAY] doorbell stub line " + i);\n` +
+        `  process.exit(0);\n}\n` +
+        `const r = require("child_process").spawnSync(process.execPath, [${JSON.stringify(path.join(REPO, "bin", "relay"))}, ...process.argv.slice(2)], { stdio: "inherit" });\n` +
+        `process.exit(r.status ?? 1);\n`,
+    );
+    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
+    expect(r.stdout).not.toContain("INJECTED");
+    expect(r.stdout.split("\n").filter((l) => l.startsWith("[RELAY] doorbell stub line"))).toHaveLength(7);
   });
   it("never silent: no relay CLI beside the hook → the hook is DEGRADED naming the missing CLI (before the doorbell step)", () => {
     const copy = path.join(home, "nocli");

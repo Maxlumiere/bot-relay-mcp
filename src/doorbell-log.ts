@@ -387,7 +387,7 @@ function verifyDir(h: LogHandle, what: string): void {
 }
 
 /** The state dir must be a REAL directory (not a symlink), private (0700). */
-function ensurePrivateDir(dir: string): fs.Stats {
+export function ensurePrivateDir(dir: string): fs.Stats {
   let st: fs.Stats | null = null;
   try {
     st = fs.lstatSync(dir);

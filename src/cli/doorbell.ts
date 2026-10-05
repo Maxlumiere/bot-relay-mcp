@@ -27,8 +27,10 @@
 import fs from "fs";
 import path from "path";
 import { EXIT_NO_LOCAL, decidePendingSource } from "./pending.js";
+import { waitingGraceMs } from "../doorbell-heartbeat.js";
 
 export const DOORBELL_STATES = ["healthy", "stale", "not-installed", "disabled"] as const;
+
 export type DoorbellState = (typeof DOORBELL_STATES)[number];
 /** Q6: at most this many escalation lines in the hook's output. */
 export const HOOK_MAX_ESCALATIONS = 5;
@@ -104,7 +106,10 @@ export interface DoorbellStatus {
     starts_since: string;
     cycles: number;
     interval_ms: number;
+    condition_since: string;
+    condition_age_seconds: number;
     consecutive_failures: number;
+    cycle_failures: number;
     last_failure: { at: string; kind: string } | null;
     install_dir: string;
   } | null;
@@ -114,11 +119,21 @@ export interface DoorbellStatus {
   resolution: Record<string, unknown> | null;
 }
 
-/** The hook's lines (Q6), or [] when the hook must stay silent. Pure. */
+/**
+ * The hook's lines (Q6), or [] when the hook must stay silent. Pure.
+ * F1 (ruling b556c011): waiting-for-writer is silent only WITHIN its grace (waitingGraceMs); beyond
+ * it, it is ONE line naming the likely cause, since no relay process holds the DB.
+ */
 export function hookLines(st: DoorbellStatus): string[] {
   if (st.state === "not-installed") return [];
-  const quietCondition = st.condition === "ok" || st.condition === "waiting-for-writer";
-  if (st.state === "healthy" && st.build?.verdict === "CURRENT" && quietCondition && st.escalations.open === 0) return [];
+  const hb = st.heartbeat;
+  const waitingTooLong = st.condition === "waiting-for-writer" && !!hb && hb.condition_age_seconds * 1000 > waitingGraceMs(hb.interval_ms);
+  const quietCondition = st.condition === "ok" || (st.condition === "waiting-for-writer" && !waitingTooLong);
+  const allWellOtherwise = st.state === "healthy" && st.build?.verdict === "CURRENT" && st.escalations.open === 0;
+  if (allWellOtherwise && quietCondition) return [];
+  if (allWellOtherwise && waitingTooLong && hb) {
+    return [`[RELAY] doorbell: waiting for a writer for ${shortAge(hb.condition_age_seconds)}: no relay process holds the DB (daemon down? journal mode?)`];
+  }
   const n = st.escalations.open;
   const lines = [`[RELAY] doorbell: ${st.state}, build ${st.build?.verdict ?? "unknown"}, ${st.condition ?? "no condition"}: ${n} open escalation${n === 1 ? "" : "s"}`];
   for (const e of st.escalations.items.slice(0, HOOK_MAX_ESCALATIONS)) lines.push(`[RELAY]   - ${e.agent}: ${e.reason}, open ${shortAge(e.age_seconds)}`);
@@ -174,7 +189,10 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
       starts_since: h.starts_since,
       cycles: h.cycles,
       interval_ms: h.interval_ms,
+      condition_since: h.condition_since,
+      condition_age_seconds: Math.max(0, Math.round((nowWall - Date.parse(h.condition_since)) / 1000)),
       consecutive_failures: h.consecutive_failures,
+      cycle_failures: h.cycle_failures,
       last_failure: h.last_failure,
       install_dir: h.install_dir,
     },
