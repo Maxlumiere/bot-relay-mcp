@@ -158,6 +158,20 @@ export function ipInCidr(ip: string, cidr: string): boolean {
   return !!a && !!b && cidrContains(b, a);
 }
 
+const LOOPBACK_BLOCKS: readonly CanonicalCidr[] = [canonicalCidr("127.0.0.0/8")!, canonicalCidr("::1/128")!];
+
+/**
+ * Is a SOCKET PEER address loopback (127.0.0.0/8 or ::1), however it is written? The ONE predicate for
+ * every surface that lets a loopback peer in without a credential: the HTTP dashboard gate and the
+ * dashboard WebSocket gate (ADR-0015 L4). Canonical first, so ::ffff:127.0.0.1 and its hex spelling
+ * ::ffff:7f00:1 are 127.0.0.1. Anything the parser rejects, and anything that is not an address (a
+ * hostname such as "localhost", an absent peer), is NOT loopback: the gate fails closed.
+ */
+export function isLoopbackPeer(raw: string | null | undefined): boolean {
+  const ip = typeof raw === "string" ? canonicalIp(raw) : null;
+  return !!ip && LOOPBACK_BLOCKS.some((b) => cidrContains(b, ip));
+}
+
 /** Is `ip` inside ANY of `cidrs`? Rejected blocks are skipped. */
 export function ipInAnyCidr(ip: string, cidrs: string[]): boolean {
   const a = canonicalIp(ip);

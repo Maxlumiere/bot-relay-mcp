@@ -39,7 +39,7 @@ import { loadConfig, resolveDashboardSecret, getConfigPath } from "../config.js"
 import { log } from "../logger.js";
 import { pushKanbanSnapshotOnce } from "../dashboard-push.js";
 import { requestContext } from "../request-context.js";
-import { canonicalCidr, canonicalIp, cidrContains, formatIp, type CanonicalCidr } from "../cidr.js";
+import { canonicalCidr, canonicalIp, cidrContains, formatIp, isLoopbackPeer, type CanonicalCidr } from "../cidr.js";
 import { VERSION } from "../version.js";
 import { RESOLVER_REVISION } from "../resolve-instance.js";
 import { LOADED_BUILD } from "../loaded-build.js";
@@ -676,9 +676,8 @@ export function startHttpServer(port: number, host: string): Server {
       // No secret configured. Loopback → allow; non-loopback → refuse.
       // Treat the socket peer as authoritative over Host header (Host is
       // attacker-controllable; socket IP is not).
-      const peerIp = (req.socket.remoteAddress || "").toLowerCase();
-      const peerIsLoopback = peerIp === "127.0.0.1" || peerIp === "::1" || peerIp === "::ffff:127.0.0.1" || peerIp === "localhost";
-      if (peerIsLoopback) {
+      // ONE loopback predicate with the WS gate (ADR-0015 L4), canonical first (src/cidr.ts).
+      if (isLoopbackPeer(req.socket.remoteAddress)) {
         // Host-trust let this peer through — it presented NO credential.
         // Downstream handlers (snapshotApi) must treat it as unauthenticated
         // and withhold cross-agent decrypted content / process metadata.
