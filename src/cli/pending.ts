@@ -104,15 +104,18 @@ interface Args {
   dbPath: string | null;
   /** OPT-IN body window (SessionStart delivery): 0 = metadata only, the default. */
   withContent: number;
+  /** Doorbell PR 7 (§v6): add `watch` (live | stale | absent | never) to the JSON, for the Stop hook's re-arm heal. */
+  watchStatus: boolean;
   help: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { name: null, json: false, dbPath: null, withContent: 0, help: false };
+  const args: Args = { name: null, json: false, dbPath: null, withContent: 0, watchStatus: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") args.json = true;
     else if (a === "--help" || a === "-h") args.help = true;
+    else if (a === "--watch-status") args.watchStatus = true;
     else if (a === "--since") {
       // Refused, not ignored: a caller passing a window expects one to apply.
       throw new Error("--since is not accepted: this is the canonical pending set, which has no window (ADR-0045)");
@@ -144,7 +147,10 @@ function usage(requested = false): void {
     "  --db-path P  Read the DB at P.\n" +
     "  --with-content N  OPT-IN: add the DECRYPTED body to the first N messages\n" +
     "               (drain order, 1-100), read in the same statement as the ids.\n" +
-    "               For SessionStart delivery. Off by default: no content key.\n\n" +
+    "               For SessionStart delivery. Off by default: no content key.\n" +
+    "  --watch-status  OPT-IN: add `watch` to the JSON: live | stale | absent (a\n" +
+    "               `relay watch AGENT --until-wake` holds, hangs, or is gone) | never\n" +
+    "               (this agent has never armed one). For the Stop hook's re-arm heal.\n\n" +
     "Source: --db-path, RELAY_DB_PATH or RELAY_INSTANCE_ID (explicit) win; then a\n" +
     "configured remote (RELAY_HTTP_HOST) means no local answer; then the active\n" +
     "instance or the legacy DB file.\n\n" +
@@ -153,6 +159,15 @@ function usage(requested = false): void {
     "      3 = no local relay instance here (nothing was read; stdout empty).\n";
   if (requested) process.stdout.write(text);
   else process.stderr.write(text);
+}
+
+/** PR 7: this agent's watch, for the Stop hook. `never` = no watch dir: it never armed one (never healed). */
+async function watchOf(dbPath: string, name: string): Promise<"live" | "stale" | "absent" | "never"> {
+  const W = await import("../watch-wake.js");
+  if (!W.watchableName(name)) return "never"; // `.`/`..`: no watch is possible, and the mail read must not fail for it
+  const dir = W.watchDirFor(dbPath, name);
+  if (!fs.existsSync(dir)) return "never";
+  return W.watchStatus(dir);
 }
 
 function pendingFailed(reason: string): number {
@@ -246,6 +261,7 @@ export async function run(argv: string[]): Promise<number> {
           count: meta.count,
           top_priority: meta.top_priority,
           messages: meta.messages,
+          ...(args.watchStatus ? { watch: await watchOf(dbPath, name) } : {}),
         }) + "\n",
       );
     } else {

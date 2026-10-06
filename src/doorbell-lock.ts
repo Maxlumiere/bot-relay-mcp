@@ -45,6 +45,18 @@ import Database from "better-sqlite3";
 import { ensurePrivateDir } from "./doorbell-log.js";
 
 export const LOCK_DB_FILENAME = "doorbell.lock.db";
+/** PR 7 (§v6): the per-agent watch lock (src/watch-wake.ts names its dir). */
+export const WATCH_LOCK_DB_FILENAME = "watch.lock.db";
+/**
+ * The ONLY file names this module's driver handle may open (ADR-0048 PR B tripwire): a lock file,
+ * never the relay DB. Enforced in openLockFile, the module's single driver construction.
+ */
+const LOCK_FILENAMES: ReadonlySet<string> = new Set([LOCK_DB_FILENAME, WATCH_LOCK_DB_FILENAME]);
+/** The module's ONE driver construction. Refuses any path whose name is not a lock file name. */
+function openLockFile(lockPath: string): InstanceType<typeof Database> {
+  if (!LOCK_FILENAMES.has(path.basename(lockPath))) throw new Error(`${lockPath} is not a lock file (${[...LOCK_FILENAMES].join(", ")}): refusing to open it`);
+  return new Database(lockPath, { timeout: 0, fileMustExist: true });
+}
 export const HOLDER_FILENAME = "doorbell.lock.holder.json";
 /** The job's exit code when another live doorbell holds this instance (distinct from 0/1/2). */
 export const EXIT_ALREADY_RUNNING = 4;
@@ -68,9 +80,9 @@ const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 const HELD = new Set<Database.Database>();
 
 /** The non-authoritative holder sidecar (for display only; null when absent or unreadable). */
-export function readHolderInfo(stateDir: string): HolderInfo | null {
+export function readHolderInfo(stateDir: string, holderFile: string = HOLDER_FILENAME): HolderInfo | null {
   try {
-    const fd = fs.openSync(path.join(stateDir, HOLDER_FILENAME), fs.constants.O_RDONLY | O_NOFOLLOW);
+    const fd = fs.openSync(path.join(stateDir, holderFile), fs.constants.O_RDONLY | O_NOFOLLOW);
     try {
       const o = JSON.parse(fs.readFileSync(fd, "utf-8")) as Record<string, unknown>;
       if (!Number.isInteger(o.pid) || typeof o.since !== "string") return null;
@@ -83,10 +95,18 @@ export function readHolderInfo(stateDir: string): HolderInfo | null {
   }
 }
 
+/** Which lock: its file names in the dir, and what "held" means in a refusal (PR 7: the watch reuses this). */
+export interface LockNames {
+  lockFile: typeof LOCK_DB_FILENAME | typeof WATCH_LOCK_DB_FILENAME;
+  holderFile: string;
+  heldBy: string;
+}
+export const DOORBELL_LOCK: LockNames = { lockFile: LOCK_DB_FILENAME, holderFile: HOLDER_FILENAME, heldBy: "another doorbell holds this instance's lock" };
+
 /** Take the instance lock in `stateDir`. Throws only on an environment fault (the caller exits 1). */
-export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_start: string | null; host_id: string | null }, now: () => string = () => new Date().toISOString()): LockResult {
+export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_start: string | null; host_id: string | null }, now: () => string = () => new Date().toISOString(), names: LockNames = DOORBELL_LOCK): LockResult {
   ensurePrivateDir(stateDir);
-  const lockPath = path.join(stateDir, LOCK_DB_FILENAME);
+  const lockPath = path.join(stateDir, names.lockFile);
   // Create it OURSELVES when absent, before any lock exists (closing this descriptor drops nothing),
   // so there is always an identity to take BEFORE the driver opens the path.
   try {
@@ -96,13 +116,13 @@ export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_st
   }
   const pre = fs.lstatSync(lockPath);
   if (pre.isSymbolicLink() || !pre.isFile()) throw new Error(`${lockPath} is not a regular file (a symlink or another type): refusing to lock through it`);
-  const db = new Database(lockPath, { timeout: 0 });
+  const db = openLockFile(lockPath); // the file exists: created above, lstat-checked
   try {
     db.exec("BEGIN EXCLUSIVE"); // the FIRST statement: no pragma, no read before it (the trap)
   } catch (err) {
     db.close();
     if ((err as { code?: string }).code === "SQLITE_BUSY") {
-      return { ok: false, reason: "another doorbell holds this instance's lock", holder: readHolderInfo(stateDir) };
+      return { ok: false, reason: names.heldBy, holder: readHolderInfo(stateDir, names.holderFile) };
     }
     throw err;
   }
@@ -113,12 +133,12 @@ export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_st
     releaseInstanceLock(handle);
     throw new Error(`${lockPath} was replaced while it was being locked (another process changed the path): refusing`);
   }
-  writeHolderSidecar(stateDir, { pid: me.pid, proc_start: me.proc_start, host_id: me.host_id, since: now() });
+  writeHolderSidecar(stateDir, { pid: me.pid, proc_start: me.proc_start, host_id: me.host_id, since: now() }, names.holderFile);
   return { ok: true, handle };
 }
 
 /** Display-only: never through a link, never a second descriptor on the lock DB; failure loses only the display. */
-function writeHolderSidecar(stateDir: string, info: HolderInfo): void {
+function writeHolderSidecar(stateDir: string, info: HolderInfo, holderFile: string = HOLDER_FILENAME): void {
   const tmp = path.join(stateDir, `.holder-tmp-${crypto.randomBytes(8).toString("hex")}`);
   let fd: number;
   try {
@@ -132,7 +152,7 @@ function writeHolderSidecar(stateDir: string, info: HolderInfo): void {
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmp, path.join(stateDir, HOLDER_FILENAME));
+    fs.renameSync(tmp, path.join(stateDir, holderFile));
   } catch {
     try {
       fs.unlinkSync(tmp); // ours: created exclusively above
@@ -165,4 +185,34 @@ export function releaseInstanceLock(h: LockHandle): void {
     /* already closed */
   }
   HELD.delete(h.db);
+}
+
+/**
+ * PR 7 (§v6): is the lock at `lockPath` HELD by a live process right now? A probe for OTHER processes
+ * (the Stop hook, the doorbell supervisor): it takes the lock for an instant and releases it.
+ *   - ⚠ NEVER call it in the HOLDER's own process: opening and closing a second descriptor on the file
+ *     drops that process's POSIX lock (the trap above).
+ *   - It never creates the file: absent → "absent" (nothing ever held it).
+ *   - The probe itself holds the lock for microseconds, so a holder that starts at that instant sees
+ *     SQLITE_BUSY: a starter must RETRY briefly before concluding the lock is held (watch lock acquire).
+ */
+export function probeLockHeld(lockPath: string): "held" | "free" | "absent" {
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(lockPath);
+  } catch {
+    return "absent";
+  }
+  if (st.isSymbolicLink() || !st.isFile()) return "absent";
+  const db = openLockFile(lockPath);
+  try {
+    db.exec("BEGIN EXCLUSIVE");
+    db.exec("ROLLBACK");
+    return "free";
+  } catch (err) {
+    if ((err as { code?: string }).code === "SQLITE_BUSY") return "held";
+    throw err;
+  } finally {
+    db.close();
+  }
 }

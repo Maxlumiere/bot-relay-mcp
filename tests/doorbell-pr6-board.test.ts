@@ -260,7 +260,7 @@ async function lifetime(wall: number, opts: import("../src/doorbell-run.js").Doo
   const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
   try {
     const c = { wall, mono: 1_000_000, wallMs: () => c.wall, monoMs: () => c.mono };
-    return await R.runDoorbell(["--once", "--window-s", "10", "--horizon-s", "60"], { clock: c, ...opts });
+    return await R.runDoorbell(["--once", "--window-s", "10", "--horizon-s", "60"], { clock: c, watchFit: false, ...opts });
   } finally {
     spy.mockRestore();
   }

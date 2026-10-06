@@ -48,6 +48,7 @@ import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { anchorLivenessVerdict, getOwnHostId, processStartedAt } from "./liveness.js";
 import { performance } from "perf_hooks";
+import { watchableName, watchDirFor, watchSupervision } from "./watch-wake.js";
 import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
 import { conditionOf, FUTURE_TOLERANCE_MS, HEARTBEAT_FILENAME, MAX_COUNT, NOT_EVALUATED_MAX_NAMES, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
@@ -214,6 +215,11 @@ export interface DoorbellOptions {
   mutatePlan?: (plan: ReturnType<typeof planCycle>) => void;
   /** PR 6 (#310 Codex R1 #2): wrap the all-agent mail query (e.g. make it fail), to prove a failure is reported, not silent. */
   wrapMailAgents?: (real: () => readonly string[]) => () => readonly string[];
+  /**
+   * PR 7 (§v6): the watch supervisor's view of one agent (test seam). Default: the real watch dir beside
+   * the relay DB (src/watch-wake.ts). `false` turns supervision off: PR 1-6's intent path (tests of it).
+   */
+  watchFit?: ((name: string, read: PendingRead) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean }) | false;
 }
 
 /** A wall step this large against the monotonic clock is a JUMP (ruling 622689ba (4)). */
@@ -423,6 +429,9 @@ async function runLocked(
       liveness: (b) => bindingLiveness(b, ownHostId),
       mailAgents: (opts.wrapMailAgents ?? ((real) => real))(() => agentsWithPendingMail(handle)),
       boardOpen: state.boardOpen,
+      // PR 7 (§v6): the WATCH SUPERVISOR. Each agent wakes through its own `relay watch --until-wake`
+      // (zero doorbell tokens); the doorbell only boards a missing, hung or ineffective watch.
+      ...(opts.watchFit === false ? {} : { watchFit: opts.watchFit ?? ((name: string, read: PendingRead) => (watchableName(name) ? watchSupervision(watchDirFor(dbPath, name), read, nowWall, args.horizonMs) : { status: "absent" as const, undeliveredAfterWake: false })) }),
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,
       horizonMs: args.horizonMs,

@@ -16,6 +16,7 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import path from "path";
+import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 
@@ -147,14 +148,28 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
     expect(hits.sort()).toEqual(["src/cli/_instance-db.ts", "src/db.ts", "src/doorbell-lock.ts", "src/sqlite-compat.ts"]);
   });
 
-  it("the doorbell-lock exception opens exactly ONE driver handle, on its own lock file (never the relay DB)", () => {
+  it("the doorbell-lock exception opens exactly ONE driver handle, on a lock file (never the relay DB)", () => {
     const src = fs.readFileSync(path.join(REPO_ROOT, "src", "doorbell-lock.ts"), "utf-8");
-    // Exactly one construction, and its path argument is the lock path...
+    // Exactly one construction, inside openLockFile, right after its name check...
     expect(src.match(/\bnew\s+Database\s*\(/g) ?? []).toHaveLength(1);
-    expect(src).toMatch(/\bnew\s+Database\s*\(\s*lockPath\s*,/);
-    // ...which is bound once, to the lock filename inside the doorbell state dir.
-    expect(src.match(/\blockPath\s*=/g) ?? []).toHaveLength(1);
-    expect(src).toMatch(/\bconst\s+lockPath\s*=\s*path\.join\(\s*stateDir\s*,\s*LOCK_DB_FILENAME\s*\)/);
+    expect(src).toMatch(/function openLockFile\(lockPath: string\)[^{]*\{\s*if \(!LOCK_FILENAMES\.has\(path\.basename\(lockPath\)\)\) throw [^\n]*\n\s*return new Database\(lockPath, /);
+    // ...and the closed set of names holds lock files only (PR 7 adds the per-agent watch lock).
+    expect(src).toMatch(/const LOCK_FILENAMES: ReadonlySet<string> = new Set\(\[LOCK_DB_FILENAME, WATCH_LOCK_DB_FILENAME\]\);/);
     expect(src).toMatch(/\bexport\s+const\s+LOCK_DB_FILENAME\s*=\s*"doorbell\.lock\.db"/);
+    expect(src).toMatch(/\bexport\s+const\s+WATCH_LOCK_DB_FILENAME\s*=\s*"watch\.lock\.db"/);
+  });
+  it("PR 7, behaviour: the lock module REFUSES to open the relay DB (or any non-lock name), even when asked directly", async () => {
+    const { probeLockHeld } = await import("../src/doorbell-lock.js");
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "adr48-lockname-"));
+    try {
+      const relayDb = path.join(d, "relay.db");
+      fs.writeFileSync(relayDb, "");
+      expect(() => probeLockHeld(relayDb)).toThrow(/is not a lock file/);
+      const okLock = path.join(d, "watch.lock.db");
+      fs.writeFileSync(okLock, "");
+      expect(probeLockHeld(okLock)).toBe("free"); // the twin: a lock name opens
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
   });
 });

@@ -165,7 +165,17 @@ export interface EscalationRecord {
  *   - session_unbound: one live window, but no relay reading session (V4: "re-register or relaunch").
  * Written ONLY when the agent's board state CHANGES (A3.2); `board_id` pairs an open with its close.
  */
-export const BOARD_CASES = ["no_live_window", "ambiguous_binding", "session_unbound"] as const;
+export const BOARD_CASES = ["no_live_window", "ambiguous_binding", "session_unbound", "no_driver", "undelivered_with_watch"] as const;
+/**
+ * PR 7 (plan §v6; rulings 23e9b281, 7224605e): why the ONE live, session-bound window has no live
+ * wake. Carried ONLY on a `no_driver` record (its `why`), a closed enum, never free text:
+ *   - watch_absent: no `relay watch <agent> --until-wake` holds the agent's watch lock;
+ *   - watch_stale: the lock is held, but its heartbeat is old (a HUNG watch).
+ * `undelivered_with_watch`: a live watch already woke the agent for mail that is still undelivered to
+ * that session after the horizon (the agent woke and did not drain). Both are SHOWN, never rung.
+ */
+export const NO_DRIVER_WHY = ["watch_absent", "watch_stale"] as const;
+export type NoDriverWhy = (typeof NO_DRIVER_WHY)[number];
 export type BoardCase = (typeof BOARD_CASES)[number];
 export const BOARD_CLOSE_REASONS = ["resolved", "no_mail"] as const;
 export interface BoardRecord {
@@ -180,6 +190,8 @@ export interface BoardRecord {
   dead_count: number;
   pending_count: number;
   close_reason: (typeof BOARD_CLOSE_REASONS)[number] | null;
+  /** PR 7: ONLY on a `no_driver` record (absent on every other case). */
+  why?: NoDriverWhy;
 }
 
 export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord | ClockRecord | EffectRecord | EscalationRecord | BoardRecord;
@@ -322,9 +334,12 @@ export function recordFault(r: unknown): string | null {
     return null;
   }
   if (t === "board") {
-    if (!sameKeys(r, ["v", "type", "at", "board_id", "agent_name", "case", "state", "binding_ids", "dead_count", "pending_count", "close_reason"])) {
-      return "a board record has exactly v, type, at, board_id, agent_name, case, state, binding_ids, dead_count, pending_count, close_reason";
+    const baseKeys = ["v", "type", "at", "board_id", "agent_name", "case", "state", "binding_ids", "dead_count", "pending_count", "close_reason"];
+    const isNoDriver = (r as { case?: unknown }).case === "no_driver";
+    if (!sameKeys(r, isNoDriver ? [...baseKeys, "why"] : baseKeys)) {
+      return `a board record has exactly ${baseKeys.join(", ")}${isNoDriver ? ", why (on no_driver only)" : " (why only on no_driver)"}`;
     }
+    if (isNoDriver && !(NO_DRIVER_WHY as readonly unknown[]).includes((r as { why?: unknown }).why)) return `why must be one of ${NO_DRIVER_WHY.join(", ")} (never free text)`;
     if (r.v !== 1) return "unknown record version";
     if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
     if (!isUuid(r.board_id)) return "board_id is not a v4 UUID";
@@ -335,7 +350,8 @@ export function recordFault(r: unknown): string | null {
     if (f) return f;
     // The shape of each case: ambiguous names >= 2 deciding bindings, a session case exactly the one live window.
     const n = (r.binding_ids as string[]).length;
-    if (r.case === "ambiguous_binding" ? n < 2 : r.case === "session_unbound" ? n !== 1 : n > 1) return `a ${r.case as string} record names ${r.case === "ambiguous_binding" ? "at least 2" : r.case === "session_unbound" ? "exactly 1" : "at most 1"} deciding binding(s)`;
+    const one = r.case === "session_unbound" || r.case === "no_driver" || r.case === "undelivered_with_watch";
+    if (r.case === "ambiguous_binding" ? n < 2 : one ? n !== 1 : n > 1) return `a ${r.case as string} record names ${r.case === "ambiguous_binding" ? "at least 2" : one ? "exactly 1" : "at most 1"} deciding binding(s)`;
     if (!Number.isInteger(r.dead_count) || (r.dead_count as number) < 0 || (r.dead_count as number) > 1_000_000) return "dead_count is not a bounded non-negative integer";
     if (!Number.isInteger(r.pending_count) || (r.pending_count as number) < 0 || (r.pending_count as number) > 100_000_000) return "pending_count is not a bounded non-negative integer";
     if (r.state === "open" ? r.close_reason !== null || (r.pending_count as number) < 1 : !(BOARD_CLOSE_REASONS as readonly unknown[]).includes(r.close_reason)) {

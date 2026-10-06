@@ -160,11 +160,22 @@ describe("I1: the tripwire FAILS on what it guards against (fixtures)", () => {
 
 describe("A1 §A2: no tool and no HTTP route accepts an intent", () => {
   it("only the doorbell's own modules import the doorbell (no server, transport or tool reaches it)", () => {
+    // PR 7 (§v6): the watch IS the doorbell's wake path; it reuses the kernel lock, the read-only DB
+    // open and the private-dir helper. Named here, and pinned unreachable from server/transport/tools below.
+    const WATCH = ["src/cli/watch-until-wake.ts", "src/watch-wake.ts"];
     const importers = walk(SRC)
       .filter((f) => f.endsWith(".ts") && !/\/doorbell(-[a-z]+)?\.ts$/.test(f))
       .filter((f) => /from\s+["'][^"']*doorbell[^"']*["']|import\(\s*["'][^"']*doorbell/.test(fs.readFileSync(f, "utf-8")))
       .map(rel);
-    expect(importers).toEqual([]);
+    expect(importers.sort()).toEqual(WATCH);
+  });
+  it("PR 7: no server, transport or tool module imports the watch's doorbell-reaching modules", () => {
+    const reach = walk(SRC)
+      .filter((f) => /\/(server\.ts|transport\/[^/]+\.ts|tools\/[^/]+\.ts)$/.test(f))
+      .filter((f) => /watch-wake|watch-until-wake|cli\/watch(\.js)?["']/.test(fs.readFileSync(f, "utf-8")))
+      .map(rel);
+    expect(walk(path.join(SRC, "tools")).length).toBeGreaterThan(3); // non-vacuous
+    expect(reach).toEqual([]);
   });
   it("no MCP tool is named for a doorbell or an intent", async () => {
     const text = fs.readFileSync(path.join(SRC, "server.ts"), "utf-8");

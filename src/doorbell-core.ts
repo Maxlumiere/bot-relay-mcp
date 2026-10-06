@@ -62,7 +62,7 @@
  *         written or closed, and outstanding rings stay outstanding until a session exists.
  *     `operator` (V3) is attribution on escalation records only, never a ring target.
  */
-import type { BoardCase, BoardRecord, BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord } from "./doorbell-log.js";
+import type { BoardCase, BoardRecord, BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord, NoDriverWhy } from "./doorbell-log.js";
 import { MAX_IDS_PER_INTENT, rungKey } from "./doorbell-log.js";
 import type { AnchorVerdict } from "./liveness.js";
 
@@ -327,6 +327,14 @@ export interface CycleInput {
   mailAgents: () => readonly string[];
   /** PR 6: each agent's OPEN board case, as the log holds it. Not mutated. */
   boardOpen: ReadonlyMap<string, BoardRecord>;
+  /**
+   * PR 7 (plan §v6): THE WATCH SUPERVISOR. When given, the doorbell forms NO intents at all: each agent
+   * wakes through its own `relay watch --until-wake` (zero doorbell tokens). For the ONE live,
+   * session-bound window it reports: a live watch → nothing (or `undelivered_with_watch` when mail it
+   * already woke the agent for is still undelivered after the horizon); no watch → no_driver(watch_absent);
+   * a hung one → no_driver(watch_stale). Absent (tests, a future active driver): PR 1-6's intent path.
+   */
+  watchFit?: (agentName: string, read: PendingRead) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean };
   windowMs: number;
   budgetPerHour: number;
   horizonMs: number;
@@ -512,15 +520,15 @@ export function planCycle(input: CycleInput): CyclePlan {
   }
   const boardOpen = new Map(input.boardOpen);
   /** Move ONE agent's board state; a record ONLY when it changes (A3.2). */
-  const boardTo = (name: string, next: { case: BoardCase; binding_ids: string[]; dead_count: number } | null, pendingCount: number, closeWhy: "resolved" | "no_mail"): void => {
+  const boardTo = (name: string, next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: NoDriverWhy } | null, pendingCount: number, closeWhy: "resolved" | "no_mail"): void => {
     const cur = boardOpen.get(name);
-    if (next && cur && cur.case === next.case) return; // unchanged: written once per state change
+    if (next && cur && cur.case === next.case && cur.why === next.why) return; // unchanged: written once per state change (no_driver's state includes its why)
     if (cur) {
       records.push({ ...cur, at, state: "closed", pending_count: pendingCount, close_reason: next ? "resolved" : closeWhy });
       boardOpen.delete(name);
     }
     if (next) {
-      const rec: BoardRecord = { v: 1, type: "board", at, board_id: newEscalationId(), agent_name: name, case: next.case, state: "open", binding_ids: next.binding_ids.slice(0, MAX_IDS_PER_INTENT), dead_count: next.dead_count, pending_count: pendingCount, close_reason: null };
+      const rec: BoardRecord = { v: 1, type: "board", at, board_id: newEscalationId(), agent_name: name, case: next.case, state: "open", binding_ids: next.binding_ids.slice(0, MAX_IDS_PER_INTENT), dead_count: next.dead_count, pending_count: pendingCount, close_reason: null, ...(next.case === "no_driver" ? { why: next.why } : {}) };
       records.push(rec);
       boardOpen.set(name, rec);
     }
@@ -529,6 +537,8 @@ export function planCycle(input: CycleInput): CyclePlan {
     ambiguous_binding: "ambiguous: 2 or more bindings whose window is not proven dead (Q4: never guess; a board case)",
     no_live_window: "no live window: no binding whose window is alive (a board case)",
     session_unbound: "no bound reading session: delivery cannot be measured, so it is never rung (a board case: re-register or relaunch)",
+    no_driver: "no live relay watch for this window (a board case: re-arm `relay watch <agent> --until-wake`)",
+    undelivered_with_watch: "the watch woke this agent and the mail is still undelivered after the horizon (a board case)",
   };
 
   const covered = new Set<string>(); // agents evaluated this cycle
@@ -570,7 +580,7 @@ export function planCycle(input: CycleInput): CyclePlan {
     const alive = notDead.filter((x) => x.v === "alive");
     const deadCount = judged.length - notDead.length;
     const idsOf = (xs: typeof judged) => sortedSet(xs.map((x) => x.b.binding_id));
-    const next: { case: BoardCase; binding_ids: string[]; dead_count: number } | null =
+    let next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: NoDriverWhy } | null =
       notDead.length >= 2
         ? { case: "ambiguous_binding", binding_ids: idsOf(notDead), dead_count: deadCount }
         : alive.length === 0
@@ -578,7 +588,20 @@ export function planCycle(input: CycleInput): CyclePlan {
           : !rs
             ? { case: "session_unbound", binding_ids: idsOf(alive), dead_count: deadCount }
             : null;
-    boardTo(name, next, read.ids.length, "resolved");
+    // PR 7 (§v6): the WATCH SUPERVISOR. With it, the ONE live, session-bound window is never rung by the
+    // doorbell: its own watch wakes it. The doorbell only reports a missing, hung or ineffective watch.
+    // Ruling 7224605e (3): NO intent for a watch-armed agent. An agent with no live watch is boarded
+    // no_driver AND keeps PR 1-6's intent path (its ring record and its effectiveness judgement).
+    if (!next && rs && input.watchFit) {
+      const wf = input.watchFit(name, read);
+      if (wf.status === "live") {
+        next = wf.undeliveredAfterWake ? { case: "undelivered_with_watch", binding_ids: idsOf(alive), dead_count: deadCount } : null;
+        boardTo(name, next, read.ids.length, "resolved");
+        if (next) skip(BOARD_WHY[next.case]);
+        continue; // NO intent: the watch is the wake
+      }
+      boardTo(name, { case: "no_driver", binding_ids: idsOf(alive), dead_count: deadCount, why: wf.status === "stale" ? "watch_stale" : "watch_absent" }, read.ids.length, "resolved");
+    } else boardTo(name, next, read.ids.length, "resolved");
     if (next || !rs) {
       skip(BOARD_WHY[next ? next.case : "session_unbound"]);
       continue;

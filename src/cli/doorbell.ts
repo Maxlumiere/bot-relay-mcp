@@ -121,7 +121,7 @@ export interface DoorbellStatus {
    * `pending_count_at_open` is the logged snapshot; `pending_count` is read LIVE from the relay DB at
    * this read (null when it cannot be: `live` says why). Names and counts only, never a message id.
    */
-  open_board_cases: Array<{ agent_name: string; case: string; since: string; age_seconds: number; binding_ids: string[]; dead_count: number; pending_count_at_open: number; pending_count: number | null }>;
+  open_board_cases: Array<{ agent_name: string; case: string; since: string; age_seconds: number; binding_ids: string[]; dead_count: number; pending_count_at_open: number; pending_count: number | null; why?: string }>;
   /** Whether the LIVE pending counts could be read (and why not). */
   open_board_cases_live: { ok: true } | { ok: false; why: string };
   /** PR 6: the agents the job's LAST cycle could not evaluate (a hold is never silent); null when it planned no cycle. */
@@ -221,6 +221,7 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
       dead_count: r.dead_count,
       pending_count_at_open: r.pending_count,
       pending_count: live.ok ? (live.counts.get(r.agent_name) ?? 0) : null,
+      ...(r.why ? { why: r.why } : {}), // PR 7: only on no_driver (watch_absent | watch_stale)
     }))
     .sort((a, b) => (a.since < b.since ? -1 : a.since > b.since ? 1 : a.agent_name < b.agent_name ? -1 : 1));
   const openBoardCasesLive: DoorbellStatus["open_board_cases_live"] = live.ok ? { ok: true } : { ok: false, why: live.why };

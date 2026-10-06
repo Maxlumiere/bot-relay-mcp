@@ -424,7 +424,7 @@ else
     # budget (relay_run_pending / relay_pending_deadline in _vault-helpers.sh).
     if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
       _f1_deadline="$RELAY_STEP_SECS"
-      relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json
+      relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json --watch-status
       F1_RC=$?
       F1_OUT=$(cat "$_f1_outf" 2>/dev/null)
       F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null)
@@ -511,7 +511,57 @@ if [ "$MODE" = unreadable ]; then
   echo "[RELAY] relay unreadable: could not read the local relay DB for ${AGENT_NAME}; mail may be waiting (run: relay pending ${AGENT_NAME})" >&2
 fi
 
+# --- The WATCH re-arm heal (doorbell PR 7, plan §v6.1 (4)) --------------------
+# An agent that has armed `relay watch AGENT --until-wake` at least once, and now
+# has NO live watch (gone: absent; hung: stale), is told ONCE PER SESSION to
+# re-arm it, until a live watch is seen again (which resets the once). Positive
+# evidence only: the local read succeeded AND it carried `watch`; an agent that
+# never armed one (`never`) is never told. The once is a per-agent state file
+# holding the session id (from the hook payload); with no valid session id there
+# is no heal (it cannot be bounded to once). Same block as the mail wake: when
+# mail is pending too, the re-arm line rides inside that one block.
+HEAL_LINE=""
+if [ "$READ_OK" -eq 1 ] && [ "$MODE" = local ] && command -v python3 >/dev/null 2>&1; then
+  WATCH_STATE=$(printf '%s' "$F1_OUT" | python3 -c '
+import json, sys
+try:
+    w = json.load(sys.stdin).get("watch")
+except Exception:
+    w = None
+sys.stdout.write(w if w in ("live", "stale", "absent", "never") else "")
+' 2>/dev/null)
+  HEAL_FILE="$HOME/.bot-relay/hook-state/watch-heal-$AGENT_NAME"
+  case "$WATCH_STATE" in
+    live) rm -f "$HEAL_FILE" 2>/dev/null ;;
+    absent|stale)
+      SESSION_ID=$(HI="$HOOK_INPUT" python3 -c '
+import json, os, re, sys
+try:
+    s = json.loads(os.environ["HI"]).get("session_id")
+except Exception:
+    s = None
+sys.stdout.write(s if isinstance(s, str) and re.fullmatch(r"[A-Za-z0-9-]{1,128}", s) else "")
+' 2>/dev/null)
+      HEALED_FOR=$(head -c 200 "$HEAL_FILE" 2>/dev/null)
+      if [ -n "$SESSION_ID" ] && [ "$HEALED_FOR" != "$SESSION_ID" ]; then
+        HEAL_DB=$(relay_pending_resolution_db "$F1_OUT" 2>/dev/null)
+        if [ -n "$HEAL_DB" ] && mkdir -p "$HOME/.bot-relay/hook-state" 2>/dev/null && printf '%s' "$SESSION_ID" > "$HEAL_FILE" 2>/dev/null; then
+          HEAL_LINE=$(DB="$HEAL_DB" CLI="$RELAY_CLI" AN="$AGENT_NAME" WS="$WATCH_STATE" python3 -c '
+import os, shlex
+how = "is hung (its heartbeat stopped)" if os.environ["WS"] == "stale" else "is not running"
+cmd = "RELAY_DB_PATH=%s %s watch %s --until-wake" % (shlex.quote(os.environ["DB"]), shlex.quote(os.environ["CLI"]), os.environ["AN"])
+print("[RELAY] Your relay watch %s: mail will not wake this session while you are idle. Re-arm it now as a BACKGROUND task (run_in_background), once: %s" % (how, cmd), end="")
+' 2>/dev/null)
+        fi
+      fi
+      ;;
+  esac
+fi
+
 if [ -z "$SUMMARY" ]; then
+  if [ -n "$HEAL_LINE" ]; then
+    HL="$HEAL_LINE" python3 -c 'import json, os, sys; sys.stdout.write(json.dumps({"decision": "block", "reason": os.environ["HL"] + " Then continue."}))' 2>/dev/null
+  fi
   exit 0
 fi
 
@@ -538,6 +588,10 @@ if [ "$GUARD_TRUSTED" -eq 0 ] && [ "$DAMPER_SECS" -gt 0 ]; then
       ''|*[!0-9]*) LAST=0 ;;
     esac
     if [ $((NOW - LAST)) -lt "$DAMPER_SECS" ]; then
+      # The mail wake is damped; the once-per-session heal is not (it is already bounded).
+      if [ -n "$HEAL_LINE" ]; then
+        HL="$HEAL_LINE" python3 -c 'import json, os, sys; sys.stdout.write(json.dumps({"decision": "block", "reason": os.environ["HL"] + " Then continue."}))' 2>/dev/null
+      fi
       exit 0
     fi
   fi
@@ -549,7 +603,7 @@ fi
 # fetch its own mail — the hook deliberately does NOT carry bodies, so the
 # mark-as-read stays inside the agent's authenticated get_messages call.
 command -v python3 >/dev/null 2>&1 || exit 0
-SUMMARY="$SUMMARY" AN="$AGENT_NAME" VIA="$MODE" python3 -c '
+SUMMARY="$SUMMARY" AN="$AGENT_NAME" VIA="$MODE" HL="$HEAL_LINE" python3 -c '
 import json, os, sys
 count, latest_from, top = os.environ["SUMMARY"].split("\x1f", 2)
 an = os.environ["AN"]
@@ -562,6 +616,9 @@ reason = (
     f"act on every message, then continue. The mail is still unread in the relay; "
     f"this wake did not consume it."
 )
+if os.environ.get("HL"):
+    reason += " " + os.environ["HL"]
+
 sys.stdout.write(json.dumps({"decision": "block", "reason": reason}))
 ' 2>/dev/null
 exit 0

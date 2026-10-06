@@ -44,15 +44,21 @@ interface Args {
   once: boolean;
   json: boolean;
   help: boolean;
+  /** Doorbell PR 7 (§v6): exit with one line when there is mail to wake for (run it in the background). */
+  untilWake: boolean;
+  /** Doorbell PR 7 (§v6): print live | stale | absent for this agent's watch, and exit. */
+  lockStatus: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const out: Args = { agent: null, intervalMs: 3000, once: false, json: false, help: false };
+  const out: Args = { agent: null, intervalMs: 3000, once: false, json: false, help: false, untilWake: false, lockStatus: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--help" || a === "-h") out.help = true;
     else if (a === "--once") out.once = true;
     else if (a === "--json") out.json = true;
+    else if (a === "--until-wake") out.untilWake = true;
+    else if (a === "--lock-status") out.lockStatus = true;
     else if (a === "--interval") {
       const v = argv[++i];
       const secs = Number(v);
@@ -66,6 +72,7 @@ function parseArgs(argv: string[]): Args {
       throw new Error(`unexpected argument: ${a}`);
     }
   }
+  if ([out.untilWake, out.lockStatus, out.once].filter(Boolean).length > 1) throw new Error("--until-wake, --lock-status and --once are exclusive");
   return out;
 }
 
@@ -76,7 +83,13 @@ function usage(requested = false): void {
   // launched with a garbage token that LOOKED like a value. `requested`
   // (an explicit --help) is the one case where the text IS the data.
   (requested ? process.stdout : process.stderr).write(
-    "Usage: relay watch <agent> [--interval SECONDS] [--once] [--json]\n\n" +
+    "Usage: relay watch <agent> [--interval SECONDS] [--once] [--json]\n" +
+      "       relay watch <agent> --until-wake [--interval SECONDS]   (arm it in the BACKGROUND)\n" +
+      "       relay watch <agent> --lock-status\n\n" +
+      "  --until-wake       Wait with zero model tokens; exit 0 with ONE line when this agent has\n" +
+      "                     mail to wake for (each message wakes a session at most once). One watch\n" +
+      "                     per agent: a second one exits at once. Re-arm it after each wake.\n" +
+      "  --lock-status      Print live | stale | absent for this agent's watch, and exit 0.\n" +
       "Sentinel — autowake for a terminal agent NOT in VS Code/Tether. Watches\n" +
       "<agent>'s inbox and prints a wake line when new mail arrives, so a harness\n" +
       "Monitor (or you) can nudge the agent to read it. Event-driven when\n" +
@@ -340,6 +353,10 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   const agent = args.agent;
+  if (args.untilWake || args.lockStatus) {
+    const { runUntilWake, runLockStatus } = await import("./watch-until-wake.js");
+    return args.lockStatus ? runLockStatus(agent) : runUntilWake(agent, { intervalMs: args.intervalMs });
+  }
 
   // INSTANCE-DB TRAP: resolve the ACTIVE per-instance DB, exactly as the daemon
   // does — never the legacy ~/.bot-relay/relay.db. The marker the daemon writes

@@ -45,7 +45,7 @@ async function inProcess(argv: string[], opts: import("../src/doorbell-run.js").
   let stderr = "";
   const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => ((stderr += String(chunk)), true));
   try {
-    return { code: await runDoorbell(argv, opts), stderr };
+    return { code: await runDoorbell(argv, { watchFit: false, ...opts }), stderr };
   } finally {
     spy.mockRestore();
   }
