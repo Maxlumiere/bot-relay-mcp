@@ -23,6 +23,16 @@ export const THROTTLE_BURST = 5;
 export const THROTTLE_REFILL_MS = 2_000;
 export const THROTTLE_MAX_KEYS = 10_000;
 
+/**
+ * The token-only FALLBACK SCAN budget (architect 07fe7cfc): ONE unit per request that runs the scan,
+ * per SOURCE, never charged to the per-(source, name) buckets. A token-only call names nobody, so
+ * charging the scan to every fallback row's bucket let one source's unknown tokens throttle every
+ * legacy agent it shares a source with (over stdio, every local agent shares "stdio"). The scan is
+ * sequential (one compare outstanding at a time) and the pool's global queue bound still applies.
+ */
+export const SCAN_BURST = 3;
+export const SCAN_REFILL_MS = 5_000;
+
 interface Bucket {
   tokens: number;
   updated: number;
@@ -30,21 +40,23 @@ interface Bucket {
 
 const buckets = new Map<string, Bucket>();
 const keyOf = (source: string, name: string) => `${source}\u0000${name}`;
+// A separate key space: no agent name can collide with it (names never contain \u0001).
+const scanKeyOf = (source: string) => `${source}\u0001scan`;
 
-function bucket(source: string, name: string, now: number): Bucket {
-  const k = keyOf(source, name);
+function bucketAt(k: string, burst: number, refillMs: number, now: number): Bucket {
   let b = buckets.get(k);
   if (!b) {
-    b = { tokens: THROTTLE_BURST, updated: now };
+    b = { tokens: burst, updated: now };
     if (buckets.size >= THROTTLE_MAX_KEYS) buckets.delete(buckets.keys().next().value as string);
   } else {
     buckets.delete(k); // re-inserted below: the map stays in least-recently-used order
-    b.tokens = Math.min(THROTTLE_BURST, b.tokens + (now - b.updated) / THROTTLE_REFILL_MS);
+    b.tokens = Math.min(burst, b.tokens + (now - b.updated) / refillMs);
     b.updated = now;
   }
   buckets.set(k, b);
   return b;
 }
+const bucket = (source: string, name: string, now: number) => bucketAt(keyOf(source, name), THROTTLE_BURST, THROTTLE_REFILL_MS, now);
 
 /**
  * RESERVE one undecidable compare for (source, name), or refuse. The check and the reservation are one
@@ -63,6 +75,20 @@ export function throttleTake(source: string, name: string, now = Date.now()): bo
 export function throttleRefund(source: string, name: string, now = Date.now()): void {
   const b = bucket(source, name, now);
   b.tokens = Math.min(THROTTLE_BURST, b.tokens + 1);
+}
+
+/** RESERVE one token-only fallback scan for `source`, or refuse (one synchronous step, like throttleTake). */
+export function scanTake(source: string, now = Date.now()): boolean {
+  const b = bucketAt(scanKeyOf(source), SCAN_BURST, SCAN_REFILL_MS, now);
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+/** The reserved scan AUTHENTICATED (or compared nothing): return the unit. Only a failed scan spends. */
+export function scanRefund(source: string, now = Date.now()): void {
+  const b = bucketAt(scanKeyOf(source), SCAN_BURST, SCAN_REFILL_MS, now);
+  b.tokens = Math.min(SCAN_BURST, b.tokens + 1);
 }
 
 /** Tests only. */

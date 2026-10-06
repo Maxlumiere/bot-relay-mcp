@@ -20,7 +20,7 @@
  *   - A worker that errors or exits FAILS CLOSED: every pending compare rejects, so the caller
  *     treats the token as not verified, and the next compare starts a fresh worker.
  *   - The worker runs bcryptjs's compareSync: on ITS thread, blocking is the point.
- *   - tests/pr-b-no-sync-bcrypt.test.ts fails on any bcrypt compare outside this module.
+ *   - tests/pr-b-auth-invariants.test.ts fails on any bcrypt compare outside this module.
  */
 import { Worker } from "node:worker_threads";
 import { createRequire } from "node:module";
@@ -111,6 +111,11 @@ function pickSlot(): Slot {
 export function compareOffLoop(token: string, hash: string): Promise<boolean> {
   if (pendingTotal() >= MAX_PENDING) return Promise.reject(new BcryptBusyError());
   compareCount++;
+  if (onNextCompare) {
+    const hook = onNextCompare;
+    onNextCompare = null;
+    hook(); // tests only: a state change lands WHILE this compare is outstanding (after the caller read the row)
+  }
   const slot = pickSlot();
   const id = ++nextId;
   return new Promise<boolean>((resolve, reject) => {
@@ -118,6 +123,16 @@ export function compareOffLoop(token: string, hash: string): Promise<boolean> {
     slot.worker.ref();
     slot.worker.postMessage({ id, token, hash });
   });
+}
+
+let onNextCompare: (() => void) | null = null;
+/**
+ * Tests only: run `hook` synchronously when the NEXT compare is requested, so a race test can land a
+ * rotate / revoke at the exact point a real one can: after the verifier read the row, before its verdict.
+ * One-shot.
+ */
+export function _onNextCompareForTests(hook: (() => void) | null): void {
+  onNextCompare = hook;
 }
 
 /** How many compares were requested (the zero-bcrypt COUNT test reads it). */

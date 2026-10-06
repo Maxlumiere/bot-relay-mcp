@@ -45,6 +45,7 @@ import { registerPersistedSecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
 import { computeTokenLookup, digestVerdict, lookupKeys, tokenLookupCandidates, KEY_ID_SEPARATOR } from "./token-lookup.js";
 import { authSource, verifyCredential, verifySecretHash } from "./token-verify.js";
+import { scanRefund, scanTake } from "./auth-throttle.js";
 import { normalizeAgentClass, TOPOLOGY_VISIBLE_CLASSES, TOPOLOGY_HIDDEN_CLASSES, TRANSIENT } from "./agent-class.js";
 import { authCacheGet, authCacheSet, authCacheTtlMs } from "./auth-cache.js";
 import { encryptContent, decryptContent } from "./encryption.js";
@@ -2463,8 +2464,9 @@ export type TokenLookupRefusal = { refused: "throttled" | "busy" };
  *       ONE pooled bcrypt (a true positive; the caller heals the row to the current key's form).
  *   (b) THE FALLBACK, BOUNDED BY CONSTRUCTION to the rows the index cannot reach and nothing else: a
  *       credential with no digest, an unprefixed digest (provenance unknown; e.g. its key was lost),
- *       or a digest under a key no longer derivable. Each is one pooled bcrypt, throttled per
- *       (source, that row's name) and bounded by the pool's global queue. This set shrinks as rows heal.
+ *       or a digest under a key no longer derivable. Each is one pooled bcrypt; the whole scan is charged
+ *       ONCE per request to the source's scan budget (never to the rows' per-name buckets) and bounded by
+ *       the pool's global queue. This set shrinks as rows heal.
  *   Otherwise an index miss is a DEFINITIVE "unknown token" with ZERO bcrypt.
  */
 export async function findAgentRowByToken(
@@ -2503,16 +2505,31 @@ export async function findAgentRowByToken(
         `OR (previous_token_hash IS NOT NULL AND ${unreachable("previous_token_lookup")})`,
     )
     .all(...keyIds, ...keyIds) as AgentRecord[];
+  const undecided: Array<{ row: AgentRecord; which: "current" | "previous"; hash: string; lookup: string | null | undefined }> = [];
   for (const row of fallback) {
     for (const which of ["current", "previous"] as const) {
       const lookup = which === "current" ? row.token_lookup : row.previous_token_lookup;
       const hash = which === "current" ? row.token_hash : row.previous_token_hash;
       if (!hash || digestVerdict(lookup, token) !== "unknown") continue; // reachable credentials were decided in (a)
-      const v = await verifyCredential(row.name, { hash, lookup }, token, source);
-      if (v.verdict === "ok") return { row, matched: which, fromLocator: false };
-      note(v.verdict);
+      undecided.push({ row, which, hash, lookup });
     }
   }
+  if (undecided.length === 0) return refusal;
+  // The scan is charged ONCE per request to this SOURCE's scan budget (architect 07fe7cfc), never to the
+  // per-(source, name) buckets of the rows it compares: a token-only call names nobody, so it must not
+  // throttle the agents it happens to scan. Refunded when it authenticates, or when it compared nothing.
+  if (!scanTake(source)) return refusal ?? { refused: "throttled" };
+  let compared = false;
+  for (const c of undecided) {
+    const v = await verifyCredential(c.row.name, { hash: c.hash, lookup: c.lookup }, token, source, { chargedToScan: true });
+    if (v.verdict === "ok") {
+      scanRefund(source);
+      return { row: c.row, matched: c.which, fromLocator: false };
+    }
+    if (v.verdict === "wrong") compared = true;
+    note(v.verdict);
+  }
+  if (!compared) scanRefund(source);
   return refusal;
 }
 
@@ -2556,12 +2573,19 @@ function authCacheExpiry(now: number, graceExpiry: number | null): number {
 }
 
 /**
- * ADR-0003 lazy self-heal — populate the matched lookup-digest column for a row
- * the O(N) fallback matched (a legacy NULL-digest row, or a keyring-rotation
- * straggler whose digest was computed under the old key). Bumps the auth
- * generation (Q6 decision (a): the drift guard stays exception-free; the write
- * does not change token validity but a bump is harmless + self-terminating).
- * No-op when the column already holds the correct digest.
+ * ADR-0003 lazy self-heal: rewrite the matched lookup-digest column in the CURRENT key's form, for a row
+ * whose credential just verified but whose digest is missing, bare (pre-PR-B) or under another key.
+ *
+ * PR-B (architect 07fe7cfc): the heal runs AFTER an awaited compare, so it is a COMPARE-AND-SET on the
+ * credential that compare verified: it writes only while the row still holds that same hash and that
+ * same digest. A rotate, admin-rotate, revoke or recovery that landed during the compare changed one of
+ * them, so 0 rows match and the heal is skipped (silently: nothing to heal any more). Without the CAS it
+ * wrote the OLD token's digest over the NEW token's, and the new token was locked out (MEASURED:
+ * tests/pr-b-verify-derived-writes.test.ts).
+ *
+ * It does NOT bump the auth generation: it rewrites the lookup of the very credential it verified, so no
+ * token's validity changes (a named exception in scripts/auth-gen-guard.mjs; a bump would only flush
+ * every cached verdict).
  */
 function selfHealTokenLookup(
   row: AgentRecord,
@@ -2572,11 +2596,14 @@ function selfHealTokenLookup(
   if (existing === digest) return;
   try {
     if (column === "token_lookup") {
-      getDb().prepare("UPDATE agents SET token_lookup = ? WHERE name = ?").run(digest, row.name);
+      getDb()
+        .prepare("UPDATE agents SET token_lookup = ? WHERE name = ? AND token_hash = ? AND token_lookup IS ?")
+        .run(digest, row.name, row.token_hash, row.token_lookup ?? null);
     } else {
-      getDb().prepare("UPDATE agents SET previous_token_lookup = ? WHERE name = ?").run(digest, row.name);
+      getDb()
+        .prepare("UPDATE agents SET previous_token_lookup = ? WHERE name = ? AND previous_token_hash = ? AND previous_token_lookup IS ?")
+        .run(digest, row.name, row.previous_token_hash, row.previous_token_lookup ?? null);
     }
-    bumpAuthGeneration();
   } catch (err) {
     log.warn(
       `[token-lookup] self-heal failed for "${row.name}": ${err instanceof Error ? err.message : String(err)}`,
@@ -2610,9 +2637,17 @@ function verifiedTokenCacheGet(
  * by BOTH auth paths. `indexed` true (the digest is already stored — a locator
  * hit, or the row's column already equals the digest) → cache the verdict.
  * `indexed` false (fallback / not-yet-indexed row) → lazily self-heal the
- * digest column (which bumps the generation) and SKIP caching this call — the
- * next call caches under the fresh generation. Only positive active/grace
- * verdicts ever reach here, so revoked/recovery/legacy are never cached.
+ * digest column (a CAS on the verified credential; no generation bump) and SKIP
+ * caching this call: the next call finds the row indexed and caches. Only
+ * positive active/grace verdicts ever reach here, so revoked/recovery/legacy are
+ * never cached.
+ *
+ * PR-B: `gen` MUST be the generation read BEFORE the awaited verify that
+ * produced this verdict. A cached verdict is served only while the generation is
+ * unchanged, so a revoke or rotate that landed during the verify (it bumps)
+ * leaves this entry dead on arrival. A generation read AFTER the await would
+ * cache a revoked token's verdict as current (MEASURED:
+ * tests/pr-b-verify-derived-writes.test.ts).
  */
 function verifiedTokenCachePut(
   digest: string,
@@ -2837,7 +2872,8 @@ export async function abandonRegistration(name: string, handle: string): Promise
  * Path: shared verified-token cache → shared indexed locator
  * (findAgentRowByToken) → active/grace decision → shared store-or-heal. On a
  * locator MISS the shared fallback still finds the row; we then lazily self-heal
- * the digest (which bumps the generation) and skip caching this call.
+ * the digest (a CAS, no bump) and skip caching this call. The generation is read
+ * BEFORE the awaited lookup, so a verdict made stale during it is never served.
  *
  * v2.20.1: refactored onto the SAME verifiedTokenCacheGet/Put helpers the
  * explicit-caller path uses — one cache layer, one invalidation. bcrypt stays
@@ -2905,9 +2941,11 @@ export async function explicitCallerCachePut(
   token: string,
   claimedRow: AgentRecord,
   capabilities: string[],
+  genBeforeVerify: number,
 ): Promise<void> {
   const digest = computeTokenLookup(token);
-  const gen = getAuthGeneration();
+  // PR-B: the generation read when `claimedRow` was read, BEFORE authenticateAgent's await: never now.
+  const gen = genBeforeVerify;
   const now = Date.now();
 
   let matchedColumn: "token_lookup" | "previous_token_lookup" = "token_lookup";

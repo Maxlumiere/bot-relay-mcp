@@ -130,7 +130,7 @@ describe("v2.20.1 — explicit-caller cache functions (unit)", () => {
   it("put → get returns the verdict; the impersonation gate rejects a wrong claimant", () => {
     const { plaintext_token } = registerAgent("u-alice", "r", ["tasks"]);
     const row = getAgentAuthData("u-alice")!;
-    explicitCallerCachePut(plaintext_token!, row, ["tasks"]);
+    explicitCallerCachePut(plaintext_token!, row, ["tasks"], getAuthGeneration());
     // Correct claimant → hit.
     expect(explicitCallerCacheGet(plaintext_token!, "u-alice")).toEqual({ name: "u-alice", capabilities: ["tasks"] });
     // IMPERSONATION: same valid token, different claimed name → MISS.
@@ -139,7 +139,7 @@ describe("v2.20.1 — explicit-caller cache functions (unit)", () => {
 
   it("generation bump invalidates the cached verdict", () => {
     const { plaintext_token } = registerAgent("u-bob", "r", []);
-    explicitCallerCachePut(plaintext_token!, getAgentAuthData("u-bob")!, []);
+    explicitCallerCachePut(plaintext_token!, getAgentAuthData("u-bob")!, [], getAuthGeneration());
     expect(explicitCallerCacheGet(plaintext_token!, "u-bob")).not.toBeNull();
     bumpAuthGeneration();
     expect(explicitCallerCacheGet(plaintext_token!, "u-bob")).toBeNull();
@@ -151,14 +151,14 @@ describe("v2.20.1 — explicit-caller cache functions (unit)", () => {
     getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run("u-carol");
     authCacheClear();
     expect(getAgentAuthData("u-carol")!.token_lookup).toBeNull();
-    explicitCallerCachePut(plaintext_token!, getAgentAuthData("u-carol")!, []);
+    explicitCallerCachePut(plaintext_token!, getAgentAuthData("u-carol")!, [], getAuthGeneration());
     // Digest is now healed (deterministic migration on first explicit-path call).
     expect(getAgentAuthData("u-carol")!.token_lookup).toBe(computeTokenLookup(plaintext_token!));
   });
 
   it("caps change is reflected (gen bump → re-verify picks up new caps)", () => {
     const { plaintext_token } = registerAgent("u-dave", "r", ["tasks"]);
-    explicitCallerCachePut(plaintext_token!, getAgentAuthData("u-dave")!, ["tasks"]);
+    explicitCallerCachePut(plaintext_token!, getAgentAuthData("u-dave")!, ["tasks"], getAuthGeneration());
     expect(explicitCallerCacheGet(plaintext_token!, "u-dave")!.capabilities).toEqual(["tasks"]);
     expandAgentCapabilities("u-dave", ["tasks", "admin"]); // bumps gen
     expect(explicitCallerCacheGet(plaintext_token!, "u-dave")).toBeNull(); // stale entry gone → caller re-verifies

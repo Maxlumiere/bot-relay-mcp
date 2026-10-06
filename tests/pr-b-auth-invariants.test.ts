@@ -9,6 +9,10 @@
  *      every handler in src/identity-mutators.ts has its declared shape, the dispatcher routes the
  *      tool to it, nothing awaits between the final auth-generation re-check and dispatch, and any
  *      handler in src/tools calling an identity mutator is registered.
+ *   1b. ANY write derived from an awaited verify (architect 07fe7cfc): every site that awaits a verify
+ *      is classified in VERIFY_SITES (matched EXACTLY against a TypeScript parse of src), and the digest
+ *      heal's no-bump exception in scripts/auth-gen-guard.mjs holds only for a CAS heal. The behaviour
+ *      is tested in tests/pr-b-verify-derived-writes.test.ts.
  *   2. bcrypt never runs on the event loop: a COMPARE exists only in the worker pool; HASHING only at
  *      the 8 inventoried in-transaction sites, each a NAMED exception with its reason.
  * Source is read with comments stripped, so a comment can neither satisfy nor trip a check.
@@ -17,10 +21,13 @@ import { describe, it, expect } from "vitest";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+// PINNED PARSER (#212), the one the guards parse with.
+import ts from "typescript-legacy";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = path.join(REPO, "src");
-const { IDENTITY_MUTATING_TOOLS, IDENTITY_MUTATOR_FUNCTIONS } = await import("../src/identity-mutators.js");
+const { IDENTITY_MUTATING_TOOLS, IDENTITY_MUTATOR_FUNCTIONS, VERIFY_SITES, VERIFY_PRIMITIVES } = await import("../src/identity-mutators.js");
+const { findAuthGenViolations } = await import("../scripts/auth-gen-guard.mjs");
 const MODULES: Record<string, Record<string, unknown>> = {
   "tools/identity": await import("../src/tools/identity.js"),
   "tools/spawn": await import("../src/tools/spawn.js"),
@@ -133,5 +140,59 @@ describe("INVARIANT 2: bcrypt never runs on the event loop", () => {
       if (n) counts[f.name] = n;
     }
     expect(counts).toEqual(Object.fromEntries(Object.entries(HASH_EXCEPTIONS).map(([k, v]) => [k, v.count])));
+  });
+});
+
+/** Every `await <verify primitive>(...)` in src, keyed `<file>:<enclosing top-level function>`, in source order. */
+function awaitedVerifySites(): Record<string, string[]> {
+  const prims = new Set<string>(VERIFY_PRIMITIVES);
+  const out: Record<string, string[]> = {};
+  for (const file of srcFiles(SRC)) {
+    const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf-8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const visit = (n: ts.Node, top: string): void => {
+      if (ts.isFunctionDeclaration(n) && n.parent === sf) top = n.name?.text ?? "<anonymous>";
+      if (ts.isAwaitExpression(n) && ts.isCallExpression(n.expression)) {
+        const callee = n.expression.expression;
+        const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : null;
+        if (name && prims.has(name)) (out[`${path.relative(REPO, file).split(path.sep).join("/")}:${top}`] ??= []).push(name);
+      }
+      ts.forEachChild(n, (c) => visit(c, top));
+    };
+    visit(sf, "<module>");
+  }
+  return out;
+}
+
+describe("INVARIANT 1b: every write derived from an awaited verify is classified (none, dispatcher, or guarded)", () => {
+  it("VERIFY_SITES matches EXACTLY the awaited verifies in src (a new one fails here until it is classified)", () => {
+    const want = Object.fromEntries(Object.entries(VERIFY_SITES).map(([k, v]) => [k, [...v.awaits]]));
+    expect(awaitedVerifySites()).toEqual(want);
+  });
+  it("the scan is not vacuous: it finds the dashboard's verify inside an inline route handler", () => {
+    expect(awaitedVerifySites()["src/transport/http.ts:startHttpServer"]).toEqual(["verifyCredential"]);
+  });
+});
+
+describe("the auth-gen guard's no-bump exception holds ONLY for a CAS digest heal", () => {
+  const P = "function bumpAuthGeneration(){}\nfunction applyAuthStateTransition(){}\nfunction getDb(): any { return null; }\n";
+  const heal = (name: string, sql: string, extra = "") =>
+    `${P}function ${name}(row: any, digest: string): void {\n  getDb().prepare("${sql}").run(digest, row.name, row.token_hash, row.token_lookup);\n  ${extra}\n}\n`;
+  const CAS = "UPDATE agents SET token_lookup = ? WHERE name = ? AND token_hash = ? AND token_lookup IS ?";
+  const names = (src: string) => findAuthGenViolations(src).map((v: { name: string }) => v.name);
+  it("the CAS heal under its registered name needs no bump (both columns)", () => {
+    expect(names(heal("selfHealTokenLookup", CAS))).toEqual([]);
+    expect(names(heal("selfHealTokenLookup", "UPDATE agents SET previous_token_lookup = ? WHERE name = ? AND previous_token_hash = ? AND previous_token_lookup IS ?"))).toEqual([]);
+  });
+  it("is a VIOLATION again when the SET is widened, the CAS is dropped or weakened, the name differs, or another mutation joins it", () => {
+    const cases: Array<[string, string]> = [
+      ["widened SET", heal("selfHealTokenLookup", "UPDATE agents SET token_lookup = ?, token_hash = ? WHERE name = ? AND token_hash = ? AND token_lookup IS ?")],
+      ["no CAS (name only)", heal("selfHealTokenLookup", "UPDATE agents SET token_lookup = ? WHERE name = ?")],
+      ["hash dropped", heal("selfHealTokenLookup", "UPDATE agents SET token_lookup = ? WHERE name = ? AND token_lookup IS ?")],
+      ["OR widens the WHERE", heal("selfHealTokenLookup", "UPDATE agents SET token_lookup = ? WHERE name = ? AND token_hash = ? AND token_lookup IS ? OR 1 = 1")],
+      ["mismatched pair", heal("selfHealTokenLookup", "UPDATE agents SET previous_token_lookup = ? WHERE name = ? AND token_hash = ? AND token_lookup IS ?")],
+      ["another name", heal("healSomethingElse", CAS)],
+      ["another mutation joins it", heal("selfHealTokenLookup", CAS, `getDb().prepare("UPDATE agents SET auth_state = 'revoked' WHERE name = ?").run(row.name);`)],
+    ];
+    for (const [label, src] of cases) expect(names(src).length, label).toBe(1);
   });
 });

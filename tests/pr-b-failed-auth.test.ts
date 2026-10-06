@@ -31,7 +31,7 @@ delete process.env.RELAY_ENCRYPTION_KEY;
 const db = await import("../src/db.js");
 const { lookupKeys, computeTokenLookup, _resetTokenLookupCacheForTests } = await import("../src/token-lookup.js");
 const { bcryptCompareCount, compareOffLoop, MAX_PENDING } = await import("../src/bcrypt-pool.js");
-const { _resetAuthThrottleForTests, THROTTLE_BURST } = await import("../src/auth-throttle.js");
+const { _resetAuthThrottleForTests, THROTTLE_BURST, SCAN_BURST } = await import("../src/auth-throttle.js");
 const { _resetAuthRejectionAuditForTests } = await import("../src/auth-rejection-audit.js");
 const { authCacheClear } = await import("../src/auth-cache.js");
 const { verifyCredential } = await import("../src/token-verify.js");
@@ -155,6 +155,37 @@ describe("BOUNDED: where bcrypt must decide, failures are throttled per (source,
     const r2 = db.getAgentAuthData("unk2")!;
     expect((await verifyCredential("unk2", { hash: r2.token_hash, lookup: r2.token_lookup }, randomToken(), "src-1")).verdict).toBe("wrong");
   });
+  it("the token-only FALLBACK is charged ONCE per request to the SOURCE's scan budget, never to the scanned rows' per-name buckets", async () => {
+    const legacy: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      legacy.push(reg(`legacy-${i}`));
+      db.getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run(`legacy-${i}`);
+    }
+    const results: unknown[] = [];
+    const n = await compares(async () => {
+      for (let i = 0; i < SCAN_BURST + 3; i++) results.push(await db.findAgentRowByToken(randomToken(), "src-A"));
+    });
+    expect(n, "each budgeted scan compares the 4 digest-less rows once; refused scans compare nothing").toBe(SCAN_BURST * 4);
+    expect(results.slice(0, SCAN_BURST)).toEqual(Array(SCAN_BURST).fill(null));
+    expect(results.slice(SCAN_BURST)).toEqual(Array(3).fill({ refused: "throttled" }));
+    // The rows' own buckets were NOT spent: a name-addressed wrong token for legacy-0 from the SAME source
+    // is still compared (a full burst), not throttled.
+    const row = db.getAgentAuthData("legacy-0")!;
+    const named: string[] = [];
+    for (let i = 0; i < THROTTLE_BURST; i++) named.push((await verifyCredential("legacy-0", { hash: row.token_hash, lookup: null }, randomToken(), "src-A")).verdict);
+    expect(named).toEqual(Array(THROTTLE_BURST).fill("wrong"));
+    // Per SOURCE: another source's valid token-only call still scans, authenticates, and heals.
+    const found = await db.findAgentRowByToken(legacy[3], "src-B");
+    expect(found && "row" in found ? found.row.name : found).toBe("legacy-3");
+  });
+  it("a scan that AUTHENTICATES gives its unit back (only a failed scan spends)", async () => {
+    const tok = reg("legacy-ok");
+    db.getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run("legacy-ok");
+    for (let i = 0; i < SCAN_BURST + 2; i++) {
+      const found = await db.findAgentRowByToken(tok, "src-C");
+      expect(found && "row" in found ? found.row.name : found, `scan ${i + 1}`).toBe("legacy-ok");
+    }
+  });
   it("the pool refuses overflow AT ONCE (busy), never queues past MAX_PENDING", async () => {
     const hash = db.getAgentAuthData((reg("p"), "p"))!.token_hash!;
     const all = Array.from({ length: MAX_PENDING + 4 }, () => compareOffLoop("x", hash).then(() => "done", (e: Error) => e.name));
@@ -250,8 +281,8 @@ describe("BARS: a burst of failed auths keeps /health MAX < 50 ms, with ZERO com
     }
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      // compares are BOUNDED by the per-(source, name) throttle: at most THROTTLE_BURST per digest-less row.
-      await barHolds(port, () => Promise.all(Array.from({ length: 30 }, () => rpc(port, "discover_agents", {}, randomToken()))), 4 * THROTTLE_BURST);
+      // compares are BOUNDED by the source's SCAN budget: at most SCAN_BURST scans of the 4 digest-less rows.
+      await barHolds(port, () => Promise.all(Array.from({ length: 30 }, () => rpc(port, "discover_agents", {}, randomToken()))), 4 * SCAN_BURST);
     });
   }, 60_000);
 });

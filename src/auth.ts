@@ -41,7 +41,7 @@ export function generateToken(): string {
  *
  * PR-B (architect 8c8ef8ea): this is the ONLY sync bcrypt left in src, and it is called only at the
  * inventoried write sites inside SQLite transactions (where an awaited worker call is impossible),
- * each a NAMED exception in tests/pr-b-bcrypt-off-loop.test.ts. Every bcrypt COMPARE runs in the
+ * each a NAMED exception in tests/pr-b-auth-invariants.test.ts. Every bcrypt COMPARE runs in the
  * worker pool (bcrypt-pool.ts) through token-verify.ts; there is no sync verify any more.
  */
 export function hashToken(token: string): string {

@@ -1185,6 +1185,9 @@ export function createServer(): Server {
 
     if (explicitCaller) {
       // Tools that declare their caller (send_message from, get_messages agent_name, etc.)
+      // PR-B: the generation read WITH the row (same tick, no await between), before any awaited
+      // verify. The verdict is cached under THIS generation, never a later one (explicitCallerCachePut).
+      const genAtRead = getAuthGeneration();
       const auth = getAgentAuthData(explicitCaller);
       if (!auth) {
         return authError(`Agent "${explicitCaller}" is not registered. Call register_agent first.`, ERROR_CODES.AUTH_FAILED, "unknown_agent");
@@ -1237,7 +1240,7 @@ export function createServer(): Server {
         // v2.20.1 — cache the verified verdict (+ self-heal the digest, Q1) so
         // repeat calls skip bcrypt. Only reached on ok && !legacy, so only
         // positive active/grace verdicts are ever cached.
-        if (token) await explicitCallerCachePut(token, auth, callerCaps);
+        if (token) await explicitCallerCachePut(token, auth, callerCaps, genAtRead);
       }
     } else {
       // Tools without an explicit caller field — identify by token.

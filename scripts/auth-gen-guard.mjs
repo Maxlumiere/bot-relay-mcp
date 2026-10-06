@@ -94,6 +94,36 @@ const SELF_BUMPERS = new Set(["bumpAuthGeneration", "applyAuthStateTransition"])
 // (and only if it is genuinely init-only). Today only V2_1 backfills auth_state
 // (on token_hash IS NULL rows, which can't have a positive cache entry).
 const INIT_ONLY_ALLOWLIST = new Set(["migrateSchemaToV2_1"]);
+// NAMED, REASONED exceptions that write a lookup-digest column WITHOUT bumping (PR-B, architect 07fe7cfc).
+// The lazy self-heal rewrites the lookup digest of the very credential an awaited compare just
+// verified, as a COMPARE-AND-SET on that credential: it cannot change any token's validity, so a bump
+// would only flush every cached verdict. The exception is NOT by name alone: it applies only while the
+// function's every agents UPDATE sets ONE lookup column and its WHERE pins the same credential
+// (`name = ?`, the matching hash `= ?`, and that lookup column `IS ?`), and it deletes nothing. Widen
+// the SET, drop the CAS, or move the write to another function, and it is a violation again.
+const DIGEST_HEAL_CAS_EXCEPTIONS = new Map([
+  ["selfHealTokenLookup", "the lazy self-heal: a CAS on the credential it verified; validity cannot change"],
+]);
+
+/**
+ * Is this unit a CAS digest heal? `bodyText` is the function's source; `literals` are its resolved DB-call
+ * SQL arguments, ONE STATEMENT EACH. Every agents mutation in the body must be one of those literals, and
+ * each must SET exactly one lookup column with a WHERE of exactly `name = ?`, the matching hash `= ?`
+ * and that lookup column `IS ?` (the credential the caller verified). A DELETE never qualifies.
+ */
+export function isCasDigestHeal(bodyText, literals) {
+  const count = (t) => (t.match(/\b(?:UPDATE\s+agents|DELETE\s+FROM\s+agents)\b/gi) ?? []).length;
+  const mutating = literals.filter((t) => count(t) > 0);
+  if (mutating.length === 0 || count(bodyText) !== mutating.length) return false;
+  return mutating.every((t) => {
+    const m = /^\s*UPDATE\s+agents\s+SET\s+(previous_)?token_lookup\s*=\s*\?\s+WHERE\s+(.+?)\s*;?\s*$/i.exec(t.replace(/\s+/g, " "));
+    if (!m || count(t) !== 1) return false;
+    const pre = (m[1] ?? "").toLowerCase();
+    const want = ["name = ?", `${pre}token_hash = ?`, `${pre}token_lookup is ?`];
+    const conds = m[2].split(/\s+AND\s+/i).map((c) => c.trim().toLowerCase().replace(/\s+/g, " "));
+    return conds.length === want.length && want.every((w) => conds.includes(w));
+  });
+}
 // The required-bump call names — a validity mutator satisfies the invariant by
 // calling EITHER (applyAuthStateTransition bumps internally). Detected
 // STRUCTURALLY via bodyCallsFunction (a resolved CallExpression), NOT a regex
@@ -231,10 +261,13 @@ function classifyUnits(sf) {
       return;
     }
     const parts = [resolveUnitSqlText(bodyNode, sf, null)];
+    const literalArgs = [];
     let firstRefuse = null;
     for (const a of foldDbCallArgs(bodyNode, sf)) {
-      if (a.kind === "literal") parts.push(a.text); // FOLD: split position no longer matters
-      else if (a.kind === "refuse") {
+      if (a.kind === "literal") {
+        parts.push(a.text); // FOLD: split position no longer matters
+        literalArgs.push(a.text);
+      } else if (a.kind === "refuse") {
         parts.push(a.partial || ""); // the runs that DID resolve, so a visible violation still shows
         // SUB-DECISION 1 (#194, SQLite-verified): a prepare() argument that
         // provably STARTS as a read (SELECT ONLY — NOT `WITH`, a CTE can prefix a
@@ -251,6 +284,9 @@ function classifyUnits(sf) {
     }
     const bumps = bodyCallsFunction(bodyNode, sf, SELF_BUMPERS);
     const line = sf.getLineAndCharacterOfPosition(nameNode.getStart(sf)).line + 1;
+    if (DIGEST_HEAL_CAS_EXCEPTIONS.has(name) && isTopLevelFunctionDeclaration(nameNode) && !firstRefuse && isCasDigestHeal(parts[0], literalArgs)) {
+      return; // a named CAS digest heal (see DIGEST_HEAL_CAS_EXCEPTIONS): no bump needed
+    }
     if (hasValidityChangingMutation(parts.join(" ")) && !bumps) {
       violations.push({ name, line }); // PROOF beats uncertainty
       return;

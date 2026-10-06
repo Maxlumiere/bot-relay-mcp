@@ -18,7 +18,7 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
 import { verifyCredential } from "../token-verify.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
 import { fireWebhooks } from "../webhooks.js";
@@ -1097,6 +1097,10 @@ export function startHttpServer(port: number, host: string): Server {
           ? headerFromToken
           : null);
     let fromAuthenticated = false;
+    // PR-B (architect 07fe7cfc): the send below is a write AUTHORIZED by an awaited verify. The
+    // generation is read WITH the row; if it moved while the token was being verified (a revoke, rotate
+    // or recovery landed), the verdict may be stale, so the send is refused with "retry", never made.
+    const fromGen = getAuthGeneration();
     const fromRow = getAgentAuthData(parsed.data.from);
     if (fromRow && fromRow.token_hash) {
       // The from-agent is registered AND has a token_hash → caller MUST
@@ -1151,6 +1155,14 @@ export function startHttpServer(port: number, host: string): Server {
           success: false,
           error: `from_agent_token does not match the stored token for "${parsed.data.from}".`,
           error_code: "AUTH_FAILED",
+        });
+        return;
+      }
+      if (getAuthGeneration() !== fromGen) {
+        res.status(429).json({
+          success: false,
+          error: "Auth state changed while from_agent_token was being verified: retry.",
+          error_code: "RATE_LIMITED",
         });
         return;
       }

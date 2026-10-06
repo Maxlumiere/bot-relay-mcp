@@ -12,6 +12,8 @@
  *   mismatch      | nothing: DEFINITIVELY wrong                 | free (zero bcrypt)
  *   match         | one pooled bcrypt CONFIRM (a true positive) | (a digest collision only)
  *   unknown       | throttle RESERVED, then one pooled bcrypt    | spends it (a success refunds it)
+ *                 | (the token-only fallback reserves ONE unit per request from its per-source scan
+ *                 |  budget instead: auth-throttle.ts scanTake)
  *
  * "unknown" = no digest, a pre-PR-B digest of unknown provenance that no derivable key reproduces, or a
  * digest under a key that is no longer derivable (token-lookup.ts digestVerdict). bcrypt always runs
@@ -37,17 +39,22 @@ export function authSource(): string {
   return ctx.sourceIp ?? ctx.transport;
 }
 
-/** Verify `token` against ONE stored credential of agent `name`. */
+/**
+ * Verify `token` against ONE stored credential of agent `name`. `chargedToScan`: the caller already
+ * reserved this compare from the token-only fallback's per-source SCAN budget (auth-throttle.ts
+ * scanTake), so the per-(source, name) bucket is not touched: a token-only call names nobody.
+ */
 export async function verifyCredential(
   name: string,
   stored: StoredCredential,
   token: string,
   source: string = authSource(),
+  opts: { chargedToScan?: boolean } = {},
 ): Promise<{ verdict: CredentialVerdict; digest: "match" | "mismatch" | "unknown" }> {
   if (!stored.hash) return { verdict: "wrong", digest: "unknown" };
   const digest = digestVerdict(stored.lookup, token);
   if (digest === "mismatch") return { verdict: "wrong", digest };
-  const reserved = digest === "unknown";
+  const reserved = digest === "unknown" && !opts.chargedToScan;
   if (reserved && !throttleTake(source, name)) return { verdict: "throttled", digest };
   let ok: boolean;
   try {
