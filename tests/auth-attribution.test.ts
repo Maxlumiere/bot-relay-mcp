@@ -84,15 +84,24 @@ describe("v2.1 Phase 4q MED #3 — audit + rate-limit attribution", () => {
     expect(r.success).toBe(false);
     expect(r.auth_error).toBe(true);
 
-    // Audit log MUST NOT attribute this to "admin".
+    // Audit log MUST NOT attribute this to "admin". PR-B Q4: a rejection is audited BOUNDED, as ONE
+    // `auth_rejection` row per (source, reason, window) with a count; the claimed name is kept only as
+    // a claim inside it, never as agent_name.
     const rows = getDb()
-      .prepare("SELECT agent_name, tool, error FROM audit_log WHERE tool = 'send_message' ORDER BY created_at DESC LIMIT 5")
-      .all() as Array<{ agent_name: string | null; tool: string; error: string | null }>;
+      .prepare("SELECT agent_name, tool, error, params_json FROM audit_log WHERE tool = 'auth_rejection' ORDER BY created_at DESC LIMIT 5")
+      .all() as Array<{ agent_name: string | null; tool: string; error: string | null; params_json: string }>;
     expect(rows.length).toBeGreaterThanOrEqual(1);
-    // The auth-rejected row is the most-recent send_message entry.
     const rejected = rows[0];
     expect(rejected.agent_name).toBeNull();
-    expect(rejected.error).toBe("auth_error");
+    expect(rejected.error).toBe("missing_token");
+    const { decryptContent } = await import("../src/encryption.js");
+    const detail = JSON.parse(decryptContent(rejected.params_json)) as { tools: string[]; claimed_names: string[]; count: number };
+    expect(detail.tools).toContain("send_message");
+    expect(detail.claimed_names).toContain("admin"); // a claim, recorded as such
+    expect(detail.count).toBeGreaterThanOrEqual(1);
+    // ...and no per-request send_message row attributes it to anyone.
+    const perRequest = getDb().prepare("SELECT agent_name FROM audit_log WHERE tool = 'send_message' AND agent_name = 'admin'").all();
+    expect(perRequest).toEqual([]);
   });
 
   it("(2) rate-limit keys on verified caller → rotating 'from' values cannot bypass quotas", async () => {

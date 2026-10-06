@@ -145,6 +145,7 @@ async function checkDb(p: string): Promise<CheckResult[]> {
     if (v === CURRENT_SCHEMA_VERSION) {
       results.push({ name: "schema_info", status: "PASS", detail: `version=${v} (matches CURRENT_SCHEMA_VERSION)` });
       results.push(await checkLegacyStartTokens());
+      results.push(await checkTokenDigests());
     } else {
       results.push({
         name: "schema_info",
@@ -191,6 +192,40 @@ export function legacyStartTokenCheck(c: import("../db.js").LegacyStartTokenCoun
   if (c.unreadable > 0) parts.push(`${c.unreadable} live pre-UTC anchor(s) whose start time could not be read: cannot judge`);
   if (parts.length === 0) return { name, status: "PASS", detail: "0 live anchors in the pre-UTC form, one current binding per window" };
   return { name, status: "WARN", detail: parts.join("; ") };
+}
+
+/**
+ * PR-B: the token lookup digests. A credential with NO digest, or one of UNKNOWN provenance, is the only
+ * kind a wrong or unknown token still costs a bcrypt compare for (throttled, in the worker pool). PASS on
+ * zero; WARN listing each such agent and its last_seen, so a stale one can be revoked (an operator
+ * decision). Read-only: names and timestamps, never a token or hash.
+ */
+export function tokenDigestCheck(r: import("../db.js").TokenDigestReport): CheckResult {
+  const name = "token lookup digests";
+  const list = (xs: Array<{ name: string; last_seen: string | null }>) => {
+    const shown = xs.slice(0, 10).map((x) => `${x.name} (last_seen ${x.last_seen ?? "never"})`);
+    return shown.join(", ") + (xs.length > 10 ? `, +${xs.length - 10} more` : "");
+  };
+  const parts: string[] = [];
+  if (r.noDigest.length) parts.push(`${r.noDigest.length} with NO digest: ${list(r.noDigest)}`);
+  if (r.unknownProvenance.length) {
+    parts.push(`${r.unknownProvenance.length} of UNKNOWN provenance (written before this version, or under a key no longer held; a successful auth rewrites it): ${list(r.unknownProvenance)}`);
+  }
+  if (parts.length === 0) return { name, status: "PASS", detail: "every token is indexed under a known key" };
+  return {
+    name,
+    status: "WARN",
+    detail: parts.join("; ") + ". A wrong token for these costs a bcrypt compare (throttled, off the event loop); revoke any that are stale.",
+  };
+}
+
+async function checkTokenDigests(): Promise<CheckResult> {
+  try {
+    const { tokenDigestReport } = await import("../db.js");
+    return tokenDigestCheck(tokenDigestReport());
+  } catch (err) {
+    return { name: "token lookup digests", status: "WARN", detail: `cannot count: ${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 async function checkLegacyStartTokens(): Promise<CheckResult> {

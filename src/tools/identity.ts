@@ -8,7 +8,7 @@ import {
   getAgents,
   buildAgentTopology,
   unregisterAgent,
-  abandonRegistration,
+  abandonVerifiedRegistration,
   rotateAgentToken,
   rotateAgentTokenAdmin,
   revokeAgentToken,
@@ -461,7 +461,9 @@ export function handleUnregisterAgent(input: UnregisterAgentInput) {
  * db.abandonRegistration.
  */
 export function handleAbandonRegistration(input: AbandonRegistrationInput) {
-  const result = abandonRegistration(input.name, input.recovery_handle);
+  // PR-B (architect 64131354): SYNC. The handle was verified by the dispatcher (enforceAuth, under the
+  // auth-generation re-check); the core deletes only while the row still carries the verified hash.
+  const result = abandonVerifiedRegistration(input.name, currentContext().verifiedAbandonHash ?? null);
   if (result.abandoned) {
     fireWebhooks("agent.unregistered", input.name, input.name, {});
     logAudit(input.name, "abandon_registration", `orphan abandoned target=${input.name}`, true, null, currentContext().transport, {

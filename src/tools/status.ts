@@ -11,7 +11,7 @@ import { LOADED_BUILD } from "../loaded-build.js";
 import { resolveSurfaceSummary } from "../surface-shape.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { ERROR_CODES } from "../error-codes.js";
-import { authenticateAgent, verifyToken } from "../auth.js";
+import { authenticateAgent } from "../auth.js";
 import type { AuthStateInput } from "../auth.js";
 import { currentContext } from "../request-context.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
@@ -205,8 +205,19 @@ interface TokenCheckResult {
  * paths cannot diverge. This diagnostic path intentionally does NOT consult the
  * verified-token cache (it always re-verifies).
  */
-function checkToken(token: string): TokenCheckResult {
-  const found = findAgentRowByToken(token);
+async function checkToken(token: string): Promise<TokenCheckResult> {
+  const found = await findAgentRowByToken(token);
+  if (found && "refused" in found) {
+    // PR-B: refused WITHOUT deciding the token (throttle or a full pool). Not "stale": a stale
+    // verdict would send the hook down its token-recovery path for a token that may be valid.
+    return {
+      auth_error: true,
+      auth_error_reason:
+        found.refused === "throttled"
+          ? "too many failed token attempts from this source: wait and retry (the token was not checked)"
+          : "the relay is busy verifying credentials: retry (the token was not checked)",
+    };
+  }
   if (!found) {
     return {
       auth_error: true,
@@ -216,8 +227,8 @@ function checkToken(token: string): TokenCheckResult {
   }
   const auth = found.row;
   const state = (auth.auth_state ?? "active") as AuthStateInput;
-  const result = authenticateAgent(auth.name, token, auth.token_hash ?? null, state, {
-    previousTokenHash: auth.previous_token_hash ?? null,
+  const result = await authenticateAgent(auth.name, token, { hash: auth.token_hash ?? null, lookup: auth.token_lookup ?? null }, state, {
+    previous: { hash: auth.previous_token_hash ?? null, lookup: auth.previous_token_lookup ?? null },
     rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
   });
   if (result.ok) {
@@ -236,12 +247,12 @@ function checkToken(token: string): TokenCheckResult {
   };
 }
 
-export function handleHealthCheck(input: HealthCheckInput) {
+export async function handleHealthCheck(input: HealthCheckInput) {
   const snapshot = getHealthSnapshot();
   const uptime_seconds = Math.floor((Date.now() - PROCESS_STARTED_AT) / 1000);
 
   const presentedToken = resolveTokenForHealthCheck(input);
-  const tokenCheck: TokenCheckResult | null = presentedToken ? checkToken(presentedToken) : null;
+  const tokenCheck: TokenCheckResult | null = presentedToken ? await checkToken(presentedToken) : null;
 
   return {
     content: [

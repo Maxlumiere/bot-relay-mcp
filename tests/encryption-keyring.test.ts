@@ -253,17 +253,20 @@ function runRelay(args: string[], extraEnv: Record<string, string | undefined> =
   return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
-async function seedMessagesWithKey(nMessages: number, keyringJson: string) {
+async function seedMessagesWithKey(nMessages: number, keyringJson: string): Promise<string[]> {
   process.env.RELAY_ENCRYPTION_KEYRING = keyringJson;
   await resetEncModule();
   const { initializeDb, registerAgent, sendMessage, closeDb } = await import("../src/db.js");
   await initializeDb();
-  registerAgent("from-" + process.pid, "r", []);
-  registerAgent("to-" + process.pid, "r", []);
+  const tokens = [
+    registerAgent("from-" + process.pid, "r", []).plaintext_token!,
+    registerAgent("to-" + process.pid, "r", []).plaintext_token!,
+  ];
   for (let i = 0; i < nMessages; i++) {
     sendMessage("from-" + process.pid, "to-" + process.pid, `msg-${i}`, "normal");
   }
   closeDb();
+  return tokens;
 }
 
 describe("§5.3 relay re-encrypt flow", () => {
@@ -311,13 +314,30 @@ describe("§5.3 relay re-encrypt flow", () => {
     }
   });
 
-  it("(E.3) --verify-clean returns count=0 after successful re-encrypt", async () => {
-    await seedMessagesWithKey(3, JSON.stringify({ current: "k1", keys: { k1: K1 } }));
+  it("(E.3) --verify-clean returns count=0 after successful re-encrypt — once the agents' token digests have moved to the new key too", async () => {
+    const tokens = await seedMessagesWithKey(3, JSON.stringify({ current: "k1", keys: { k1: K1 } }));
     const fullKr = JSON.stringify({ current: "k2", keys: { k1: K1, k2: K2 } });
     runRelay(["re-encrypt", "--from", "k1", "--to", "k2", "--yes"], {
       RELAY_ENCRYPTION_KEYRING: fullKr,
       RELAY_DB_PATH: TEST_DB_PATH,
     });
+    // PR-B (architect e26359ac): a key is retained while any token LOOKUP DIGEST was written under it.
+    // re-encrypt moves the encrypted columns; it cannot move a digest (that needs the token).
+    const before = runRelay(["re-encrypt", "--verify-clean", "k1"], {
+      RELAY_ENCRYPTION_KEYRING: fullKr,
+      RELAY_DB_PATH: TEST_DB_PATH,
+    });
+    expect(before.status).toBe(1);
+    expect(before.stdout).toMatch(/messages\.content: 0\n/); // the encrypted columns are clean
+    expect(before.stdout).toMatch(/agents\.token_lookup \(digests under kr:k1\): 2 {2}← blocks retirement/);
+    expect(before.stdout).toMatch(/Retirement UNSAFE/);
+    // Each agent authenticates once under k2: its digest heals to the current key.
+    process.env.RELAY_ENCRYPTION_KEYRING = fullKr;
+    await resetEncModule();
+    const { initializeDb, resolveAgentByToken, closeDb } = await import("../src/db.js");
+    await initializeDb();
+    for (const t of tokens) expect(await resolveAgentByToken(t)).not.toBeNull();
+    closeDb();
     const v = runRelay(["re-encrypt", "--verify-clean", "k1"], {
       RELAY_ENCRYPTION_KEYRING: fullKr,
       RELAY_DB_PATH: TEST_DB_PATH,

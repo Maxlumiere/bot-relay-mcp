@@ -19,7 +19,7 @@ import {
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
 import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
-import { verifyToken } from "../auth.js";
+import { verifyCredential } from "../token-verify.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "./websocket.js";
@@ -1051,7 +1051,7 @@ export function startHttpServer(port: number, host: string): Server {
   // POST /api/send-message — proxy to db.sendMessage. `from` must be an
   // existing registered agent; any already-existing dispatcher checks on
   // SENDER_NOT_REGISTERED surface through.
-  app.post("/api/send-message", dashboardAuthCheck, operatorAuthCheck, originCheck, (req: Request, res: Response) => {
+  app.post("/api/send-message", dashboardAuthCheck, operatorAuthCheck, originCheck, async (req: Request, res: Response) => {
     const parsed = ApiSendMessageSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
@@ -1119,7 +1119,18 @@ export function startHttpServer(port: number, host: string): Server {
         });
         return;
       }
-      if (!verifyToken(fromAgentToken, fromRow.token_hash)) {
+      // PR-B: decided by the shared verifier (a known digest decides a wrong token with no bcrypt;
+      // bcrypt only in the worker pool). A refusal that did not decide the token is a 429, never 403.
+      const fromVerdict = (await verifyCredential(fromRow.name, { hash: fromRow.token_hash, lookup: fromRow.token_lookup }, fromAgentToken, extractSourceIp(req, config.trusted_proxies) ?? "http")).verdict;
+      if (fromVerdict === "throttled" || fromVerdict === "busy") {
+        res.status(429).json({
+          success: false,
+          error: fromVerdict === "throttled" ? "Too many failed token attempts from this source: wait and retry." : "The relay is busy verifying credentials: retry.",
+          error_code: "RATE_LIMITED",
+        });
+        return;
+      }
+      if (fromVerdict !== "ok") {
         logDashboardAudit(
           req,
           "send_message",

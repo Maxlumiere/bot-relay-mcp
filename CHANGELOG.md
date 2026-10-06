@@ -11,6 +11,15 @@ The relay's own trusted-proxy check (`trusted_proxies`) had a narrow form of GHS
 - **The client address the relay records is written one way**, so `::ffff:127.0.0.1` and `127.0.0.1` count as the same client for rate limits and the audit log.
 - **The dashboard and its live-update connection now agree on what a local visitor is.** With no dashboard secret set, both let in a visitor from this machine without one. They now use one shared check, which reads the address the same way: any address in 127.0.0.0/8 or `::1`, however it is written. Before, each had its own list of exact spellings, so `127.0.0.2` or the hexadecimal form of `::ffff:127.0.0.1` was turned away. An address that is not local stays refused, in every spelling.
 
+### Fixed — a wrong or unknown token can no longer freeze the relay
+
+Checking a token that did not match cost a bcrypt compare (about 64 ms of CPU) on the daemon's event loop, and a token matching no agent was compared against every agent in turn. Measured with 51 agents: 20 requests with wrong tokens stalled every other request for 1.3 s, and 20 with unknown tokens for 65 s. No credentials were needed, and a client still holding an old token could do it by accident.
+
+- **A wrong token is usually rejected without bcrypt.** Each stored token digest now records which key it was computed with, so a mismatch is decided by an HMAC compare (microseconds). bcrypt runs only to confirm a match, or for a token stored without a usable digest.
+- **bcrypt runs off the event loop.** Compares run on a small worker-thread pool. When the pool's queue is full, the request is refused at once with `RATE_LIMITED` ("busy, retry"), never queued without limit.
+- **An unknown token costs nothing once tokens are indexed.** A token matching no digest is unknown, with no bcrypt at all. Only tokens stored without a usable digest (registered before this version, or under an encryption key no longer held) are still checked with bcrypt, a few attempts per source and agent before `RATE_LIMITED`. Each such token is rewritten with a current digest the next time its agent authenticates, so the set shrinks to nothing.
+- **Rejections are logged without flooding the log.** One `auth_rejection` row per source, reason and minute, with a running count, instead of one row per request.
+- **`relay doctor`** lists agents whose token has no usable digest, with when each was last seen. **`relay re-encrypt --verify-clean`** keeps an encryption key while any token digest still uses it.
 ### Security — three new dependency advisories cleared
 
 - **proxy-addr 2.0.8** in the server and the extension (was 2.0.7; critical, GHSA-jqcg-44mw-7w3h). An IPv4 address no longer matches an IPv6 trust subnet that does not cover the IPv4-mapped range. Express uses it to trust proxies; the relay does not turn on Express's trust-proxy setting.

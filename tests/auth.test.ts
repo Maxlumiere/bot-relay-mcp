@@ -21,10 +21,13 @@ delete process.env.RELAY_AGENT_CAPABILITIES;
 const {
   generateToken,
   hashToken,
-  verifyToken,
   authenticateAgent,
   isLegacyGraceActive,
 } = await import("../src/auth.js");
+// PR-B: the sync verifyToken is gone from src (every compare runs in the worker pool). These tests
+// check that hashToken's output VERIFIES, a property of the hash, so they compare with bcryptjs here.
+const bcrypt = (await import("bcryptjs")).default;
+const verifyToken = (token: string, hash: string): boolean => bcrypt.compareSync(token, hash);
 const {
   registerAgent,
   getAgentAuthData,
@@ -74,55 +77,55 @@ describe("token primitives", () => {
 // --- authenticateAgent logic ---
 
 describe("authenticateAgent", () => {
-  it("rejects a legacy_bootstrap row when legacy grace is OFF", () => {
+  it("rejects a legacy_bootstrap row when legacy grace is OFF", async () => {
     // v2.1 Phase 4b.1 v2: legacy state is now explicit via auth_state, not
     // inferred from null token_hash. Tests pass authState="legacy_bootstrap"
     // to exercise the legacy-grace path the old null-hash sentinel covered.
     delete process.env.RELAY_ALLOW_LEGACY;
-    const r = authenticateAgent("alice", null, null, "legacy_bootstrap");
+    const r = await authenticateAgent("alice", null, null, "legacy_bootstrap");
     expect(r.ok).toBe(false);
     expect(r.reason).toContain("no token");
   });
 
-  it("accepts a legacy_bootstrap row when legacy grace is ON", () => {
+  it("accepts a legacy_bootstrap row when legacy grace is ON", async () => {
     process.env.RELAY_ALLOW_LEGACY = "1";
-    const r = authenticateAgent("alice", null, null, "legacy_bootstrap");
+    const r = await authenticateAgent("alice", null, null, "legacy_bootstrap");
     expect(r.ok).toBe(true);
     expect(r.legacy).toBe(true);
   });
 
-  it("rejects when a token is required but not provided", () => {
+  it("rejects when a token is required but not provided", async () => {
     const token = generateToken();
     const hash = hashToken(token);
-    const r = authenticateAgent("alice", null, hash);
+    const r = await authenticateAgent("alice", null, { hash });
     expect(r.ok).toBe(false);
     expect(r.reason).toContain("agent_token");
   });
 
-  it("rejects the wrong token", () => {
+  it("rejects the wrong token", async () => {
     const token = generateToken();
     const wrong = generateToken();
     const hash = hashToken(token);
-    const r = authenticateAgent("alice", wrong, hash);
+    const r = await authenticateAgent("alice", wrong, { hash });
     expect(r.ok).toBe(false);
     expect(r.reason).toContain("Invalid token");
   });
 
-  it("accepts the correct token", () => {
+  it("accepts the correct token", async () => {
     const token = generateToken();
     const hash = hashToken(token);
-    const r = authenticateAgent("alice", token, hash);
+    const r = await authenticateAgent("alice", token, { hash });
     expect(r.ok).toBe(true);
     expect(r.legacy).toBeFalsy();
   });
 
-  it("legacy grace does NOT accept a null token when agent HAS a token_hash", () => {
+  it("legacy grace does NOT accept a null token when agent HAS a token_hash", async () => {
     // Legacy grace only skips the check for agents without a token_hash.
     // A tokened agent still requires its token even with grace on.
     process.env.RELAY_ALLOW_LEGACY = "1";
     const token = generateToken();
     const hash = hashToken(token);
-    const r = authenticateAgent("alice", null, hash);
+    const r = await authenticateAgent("alice", null, { hash });
     expect(r.ok).toBe(false);
   });
 });

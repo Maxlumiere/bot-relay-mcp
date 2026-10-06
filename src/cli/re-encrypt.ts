@@ -26,6 +26,7 @@
 import os from "os";
 import * as readline from "readline/promises";
 import { randomUUID } from "crypto";
+import { KEY_ID_SEPARATOR } from "../token-lookup.js";
 
 /** Five encrypted-column targets. table_name values map to this list. */
 interface ColumnTarget {
@@ -267,12 +268,36 @@ function countRows(
   return out;
 }
 
+/** Token lookup digests that block retiring `keyId`: those written under it, and those of unknown key. */
+export function digestBlockers(db: any, keyId: string): Array<{ table: string; col: string; count: number }> {
+  const rows = db.prepare("SELECT token_lookup, previous_token_lookup FROM agents").all() as Array<{ token_lookup: string | null; previous_token_lookup: string | null }>;
+  let under = 0;
+  let unknown = 0;
+  for (const r of rows) {
+    for (const d of [r.token_lookup, r.previous_token_lookup]) {
+      if (!d) continue;
+      const sep = d.indexOf(KEY_ID_SEPARATOR);
+      if (sep === -1) unknown++;
+      else if (d.slice(0, sep) === `kr:${keyId}`) under++;
+    }
+  }
+  return [
+    { table: "agents", col: `token_lookup (digests under kr:${keyId})`, count: under },
+    { table: "agents", col: "token_lookup (key unknown: written before this version)", count: unknown },
+  ];
+}
+
 function runVerifyClean(
   db: any,
   keyId: string,
   keyringInfo: { current: string | null; known_key_ids: string[]; legacy_key_id: string }
 ): number {
   const plan = countRows(db, keyId, keyringInfo.legacy_key_id);
+  // PR-B (architect e26359ac): a key is also retained while any token LOOKUP DIGEST was written under it
+  // (retiring it would turn those digests into provenance-unknown rows that only bcrypt can decide). A
+  // digest written before PR-B carries no key id, so its key is unknown: it blocks EVERY retirement
+  // until a successful auth rewrites it.
+  plan.push(...digestBlockers(db, keyId));
   const total = plan.reduce((a, b) => a + b.count, 0);
   process.stdout.write(`Pending rows for key_id "${keyId}":\n`);
   for (const p of plan) {

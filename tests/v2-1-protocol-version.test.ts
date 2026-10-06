@@ -52,7 +52,7 @@ function withStdio<T>(fn: () => T): T {
 }
 
 describe("v2.1 Phase 4i — protocol version negotiation", () => {
-  it("(1) register_agent response includes protocol_version matching PROTOCOL_VERSION", () => {
+  it("(1) register_agent response includes protocol_version matching PROTOCOL_VERSION", async () => {
     const r = withStdio(() =>
       handleRegisterAgent({ name: "pv-a", role: "r", capabilities: [] })
     );
@@ -61,8 +61,8 @@ describe("v2.1 Phase 4i — protocol version negotiation", () => {
     expect(body.protocol_version).toBe(PROTOCOL_VERSION);
   });
 
-  it("(2) health_check response includes protocol_version matching PROTOCOL_VERSION", () => {
-    const r = handleHealthCheck({});
+  it("(2) health_check response includes protocol_version matching PROTOCOL_VERSION", async () => {
+    const r = await handleHealthCheck({});
     const body = parseResult(r);
     expect(body.protocol_version).toBe(PROTOCOL_VERSION);
     // Also confirm the existing `version` field (package version) is still
@@ -70,11 +70,11 @@ describe("v2.1 Phase 4i — protocol version negotiation", () => {
     expect(body.version).toBeDefined();
   });
 
-  it("(3) PROTOCOL_VERSION matches strict SemVer shape", () => {
+  it("(3) PROTOCOL_VERSION matches strict SemVer shape", async () => {
     expect(PROTOCOL_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("(4) PROTOCOL_VERSION starts with '2.' (v2-line regression guard)", () => {
+  it("(4) PROTOCOL_VERSION starts with '2.' (v2-line regression guard)", async () => {
     expect(PROTOCOL_VERSION.startsWith("2.")).toBe(true);
   });
 });

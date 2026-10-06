@@ -66,7 +66,7 @@ function authOnce(token: string) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0005 #4 — orphan cleanup KEYSTONE (safe by construction)", () => {
-  it("register issues a registration_recovery handle (first register only)", () => {
+  it("register issues a registration_recovery handle (first register only)", async () => {
     const { handle } = reg("o-a");
     expect(typeof handle).toBe("string");
     expect(handle.length).toBeGreaterThan(20);
@@ -74,14 +74,14 @@ describe("ADR-0005 #4 — orphan cleanup KEYSTONE (safe by construction)", () =>
     expect(registerAgent("o-a", "worker", []).registration_recovery).toBeNull();
   });
 
-  it("a never-authed orphan CAN be abandoned with its handle", () => {
+  it("a never-authed orphan CAN be abandoned with its handle", async () => {
     const { handle } = regOrphan("o-orphan");
     expect(getAgentAuthData("o-orphan")).not.toBeNull();
-    expect(abandonRegistration("o-orphan", handle)).toEqual({ abandoned: true });
+    expect(await abandonRegistration("o-orphan", handle)).toEqual({ abandoned: true });
     expect(getAgentAuthData("o-orphan")).toBeNull(); // row gone
   });
 
-  it("BLOCKER b (codex #115): abandon REFUSES a never-authed row with a LIVE session — even with a valid handle", () => {
+  it("BLOCKER b (codex #115): abandon REFUSES a never-authed row with a LIVE session — even with a valid handle", async () => {
     // A FRESH register carries a live session_id. The old DELETE reasserted only
     // `first_authed_at IS NULL` and wrongly removed it (expected false, got true).
     // Now abandon rejects it (session_id !== null) BEFORE the bcrypt handle check,
@@ -89,84 +89,84 @@ describe("ADR-0005 #4 — orphan cleanup KEYSTONE (safe by construction)", () =>
     const r = registerAgent("o-livesess", "worker", []); // NOT via reg() → keep the live session
     const liveSession = (getDb().prepare("SELECT session_id FROM agents WHERE name = ?").get("o-livesess") as { session_id: string | null }).session_id;
     expect(liveSession).not.toBeNull();
-    const res = abandonRegistration("o-livesess", r.registration_recovery!);
+    const res = await abandonRegistration("o-livesess", r.registration_recovery!);
     expect(res.abandoned).toBe(false);
     expect(res.reason).toMatch(/live session/i);
     expect(getAgentAuthData("o-livesess")).not.toBeNull(); // untouched
   });
 
-  it("KEYSTONE: an AUTHENTICATED agent can NEVER be abandoned — even with a VALID handle", () => {
+  it("KEYSTONE: an AUTHENTICATED agent can NEVER be abandoned — even with a VALID handle", async () => {
     const { token, handle } = reg("o-live");
-    expect(authOnce(token)).not.toBeNull(); // token auth → first_authed_at AND established_at set
+    expect(await authOnce(token)).not.toBeNull(); // token auth → first_authed_at AND established_at set
     expect(getAgentAuthData("o-live")!.first_authed_at).not.toBeNull();
     expect(getAgentAuthData("o-live")!.established_at).not.toBeNull(); // the reap invariant
-    const r = abandonRegistration("o-live", handle);
+    const r = await abandonRegistration("o-live", handle);
     expect(r.abandoned).toBe(false);
     expect(r.reason).toMatch(/established|authenticated/i);
     expect(getAgentAuthData("o-live")).not.toBeNull(); // still there, untouched
   });
 
-  it("first auth stamps first_authed_at AND retires the handle", () => {
+  it("first auth stamps first_authed_at AND retires the handle", async () => {
     const { token, handle } = reg("o-heal");
     expect(getAgentAuthData("o-heal")!.first_authed_at).toBeNull();
-    authOnce(token);
+    await authOnce(token);
     const row = getAgentAuthData("o-heal")!;
     expect(row.first_authed_at).not.toBeNull();
     expect(row.registration_recovery_hash).toBeNull(); // handle retired
     // and the (now stale) handle can't abandon it
-    expect(abandonRegistration("o-heal", handle).abandoned).toBe(false);
+    expect((await abandonRegistration("o-heal", handle)).abandoned).toBe(false);
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0005 #4 — handle can't be forged / replayed / mis-scoped", () => {
-  it("a wrong handle is refused (bcrypt)", () => {
+  it("a wrong handle is refused (bcrypt)", async () => {
     regOrphan("h-a");
-    expect(abandonRegistration("h-a", "not-the-real-handle").abandoned).toBe(false);
+    expect((await abandonRegistration("h-a", "not-the-real-handle")).abandoned).toBe(false);
   });
 
-  it("an EXPIRED handle is refused", () => {
+  it("an EXPIRED handle is refused", async () => {
     const { handle } = regOrphan("h-exp");
     getDb()
       .prepare("UPDATE agents SET registration_recovery_expires_at = ? WHERE name = ?")
       .run(new Date(Date.now() - 1000).toISOString(), "h-exp");
-    expect(abandonRegistration("h-exp", handle).abandoned).toBe(false);
+    expect((await abandonRegistration("h-exp", handle)).abandoned).toBe(false);
     expect(getAgentAuthData("h-exp")).not.toBeNull();
   });
 
-  it("agent X's handle can NOT abandon agent Y (name-scoped)", () => {
+  it("agent X's handle can NOT abandon agent Y (name-scoped)", async () => {
     const x = regOrphan("h-x");
     regOrphan("h-y");
-    expect(abandonRegistration("h-y", x.handle).abandoned).toBe(false); // X's handle ≠ Y's hash
+    expect((await abandonRegistration("h-y", x.handle)).abandoned).toBe(false); // X's handle ≠ Y's hash
     expect(getAgentAuthData("h-y")).not.toBeNull();
   });
 
-  it("a replayed handle is dead after the row is gone", () => {
+  it("a replayed handle is dead after the row is gone", async () => {
     const { handle } = regOrphan("h-replay");
-    expect(abandonRegistration("h-replay", handle).abandoned).toBe(true);
-    expect(abandonRegistration("h-replay", handle).abandoned).toBe(false); // no such registration
+    expect((await abandonRegistration("h-replay", handle)).abandoned).toBe(true);
+    expect((await abandonRegistration("h-replay", handle)).abandoned).toBe(false); // no such registration
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0005 FINAL — the purge tick reaps NO agent row (auto-GC cut by ruling)", () => {
-  function makeOrphan(name: string, opts: { authed?: boolean; sessionNull?: boolean; oldCreate?: boolean }) {
+  async function makeOrphan(name: string, opts: { authed?: boolean; sessionNull?: boolean; oldCreate?: boolean }) {
     const { token } = reg(name);
-    if (opts.authed) authOnce(token);
+    if (opts.authed) await authOnce(token);
     const db = getDb();
     if (opts.sessionNull) db.prepare("UPDATE agents SET session_id = NULL WHERE name = ?").run(name);
     if (opts.oldCreate) db.prepare("UPDATE agents SET created_at = ? WHERE name = ?").run(new Date(Date.now() - 60 * 60 * 1000).toISOString(), name);
   }
 
-  it("EVERY shape survives — including the exact never-authed + session-less + old row the GC used to reap", () => {
+  it("EVERY shape survives — including the exact never-authed + session-less + old row the GC used to reap", async () => {
     // Abandonment is undecidable from row state: this "true orphan" shape is
     // byte-identical to a slow-spawned child or an idle recovered agent. The
     // ruling: no irreversible action on an undecidable predicate. If someone
     // reintroduces a reaper on the purge tick, the first assertion fails.
-    makeOrphan("gc-orphan", { sessionNull: true, oldCreate: true }); // the old reap target
-    makeOrphan("gc-authed", { authed: true, sessionNull: true, oldCreate: true });
-    makeOrphan("gc-session", { sessionNull: false, oldCreate: true });
-    makeOrphan("gc-recent", { sessionNull: true, oldCreate: false });
+    await makeOrphan("gc-orphan", { sessionNull: true, oldCreate: true }); // the old reap target
+    await makeOrphan("gc-authed", { authed: true, sessionNull: true, oldCreate: true });
+    await makeOrphan("gc-session", { sessionNull: false, oldCreate: true });
+    await makeOrphan("gc-recent", { sessionNull: true, oldCreate: false });
     purgeOldRecords(getDb());
     expect(getAgentAuthData("gc-orphan")).not.toBeNull();
     expect(getAgentAuthData("gc-authed")).not.toBeNull();
@@ -184,18 +184,18 @@ describe("ADR-0005 #5 — MCP send_message accepts `content` OR `message`", () =
     registerAgent("s-from", "worker", []);
     registerAgent("s-to", "worker", []);
   });
-  it("content works", () => {
+  it("content works", async () => {
     expect(parsed(handleSendMessage({ from: "s-from", to: "s-to", content: "hi", priority: "normal" } as any)).success).toBe(true);
   });
-  it("message (alias) works", () => {
+  it("message (alias) works", async () => {
     expect(parsed(handleSendMessage({ from: "s-from", to: "s-to", message: "hi", priority: "normal" } as any)).success).toBe(true);
   });
-  it("neither content nor message is rejected", () => {
+  it("neither content nor message is rejected", async () => {
     const r = parsed(handleSendMessage({ from: "s-from", to: "s-to", priority: "normal" } as any));
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/content.*or.*message.*required/i);
   });
-  it("both with DIFFERENT values is rejected", () => {
+  it("both with DIFFERENT values is rejected", async () => {
     const r = parsed(handleSendMessage({ from: "s-from", to: "s-to", content: "a", message: "b", priority: "normal" } as any));
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/only one/i);
@@ -208,7 +208,7 @@ describe("ADR-0005 #5 — MCP send_message accepts `content` OR `message`", () =
 // agents at first_authed_at IS NULL and the orphan-GC could false-reap a
 // live-but-session-less one before it re-authenticates.
 describe("ADR-0005 — v22 migration backfills pre-existing rows (no false-reap on upgrade)", () => {
-  it("a pre-v22 row (no v22 columns) gets first_authed_at backfilled on migrate → GC-safe", () => {
+  it("a pre-v22 row (no v22 columns) gets first_authed_at backfilled on migrate → GC-safe", async () => {
     let db = getDb(); // fresh v22
     // Simulate a genuine PRE-v22 agent: a row created before the v22 columns
     // existed. Register it, then drop the three v22 columns to reproduce v21
@@ -247,7 +247,7 @@ describe("ADR-0005 — v22 migration backfills pre-existing rows (no false-reap 
     expect(getAgentAuthData("pre22")).not.toBeNull();
   });
 
-  it("the backfill does NOT stamp a genuine post-v22 orphan (guarded by ADD COLUMN, runs once)", () => {
+  it("the backfill does NOT stamp a genuine post-v22 orphan (guarded by ADD COLUMN, runs once)", async () => {
     getDb(); // already v22 — column exists
     registerAgent("post22-orphan", "worker", []); // fresh orphan: first_authed_at NULL
     // Re-open (re-runs the init chain). The column already exists → the ADD
