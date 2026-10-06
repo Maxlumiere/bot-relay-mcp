@@ -240,6 +240,11 @@ export async function authenticateAgent(
     // Old token works ONLY while grace hasn't expired.
     if (!expired && graceInputs.previous?.hash) {
       const v = (await verifyCredential(claimedName, graceInputs.previous, tokenOrNull)).verdict;
+      // PR-B (Codex R1 #2): the compare is AWAITED (the pool), so the window can close while it runs. The
+      // expiry is re-checked AFTER the await, against the clock now, never the snapshot taken before it.
+      if (v === "ok" && expiry > 0 && Date.now() >= expiry) {
+        return { ok: false, reason: `Invalid token for agent "${claimedName}" (rotation grace window expired — use the new token).` };
+      }
       if (v === "ok") return { ok: true };
       const u = undecided(v);
       if (u) return u;

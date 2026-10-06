@@ -19,6 +19,7 @@
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 // PINNED PARSER (#212), the one the guards parse with.
@@ -143,18 +144,44 @@ describe("INVARIANT 2: bcrypt never runs on the event loop", () => {
   });
 });
 
-/** Every `await <verify primitive>(...)` in src, keyed `<file>:<enclosing top-level function>`, in source order. */
-function awaitedVerifySites(): Record<string, string[]> {
-  const prims = new Set<string>(VERIFY_PRIMITIVES);
+/**
+ * Every `await <verify primitive>(...)` under `root`, keyed `<file>:<enclosing top-level function>`, in source
+ * order. Codex R1 #3: the callee is resolved by its BINDING, not its spelling: the TypeScript checker gives the
+ * callee's type, and a function's type points at its DECLARATION, so `import { verifyCredential as check }`, a
+ * `const check = verifyCredential`, a destructured dynamic import or a re-export all resolve to the same
+ * primitive. The language does the resolving; nothing here matches names at call sites.
+ */
+function awaitedVerifySites(root: string = SRC, primitives: readonly string[] = VERIFY_PRIMITIVES): Record<string, string[]> {
+  const prims = new Set<string>(primitives);
+  const files = srcFiles(root);
+  const program = ts.createProgram(files, {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    allowJs: false,
+    noEmit: true,
+    skipLibCheck: true,
+  });
+  const checker = program.getTypeChecker();
+  /** The primitive a callee resolves to (by its type's declaration), or null. */
+  const primitiveOf = (callee: ts.Expression): string | null => {
+    const decls = checker.getTypeAtLocation(callee).getSymbol()?.getDeclarations() ?? [];
+    for (const d of decls) {
+      if ((ts.isFunctionDeclaration(d) || ts.isMethodDeclaration(d)) && d.name && ts.isIdentifier(d.name) && prims.has(d.name.text)) {
+        return d.name.text;
+      }
+    }
+    return null;
+  };
   const out: Record<string, string[]> = {};
-  for (const file of srcFiles(SRC)) {
-    const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf-8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  for (const file of files) {
+    const sf = program.getSourceFile(file);
+    if (!sf) throw new Error(`awaitedVerifySites: ${file} is not in the program`);
     const visit = (n: ts.Node, top: string): void => {
       if (ts.isFunctionDeclaration(n) && n.parent === sf) top = n.name?.text ?? "<anonymous>";
       if (ts.isAwaitExpression(n) && ts.isCallExpression(n.expression)) {
-        const callee = n.expression.expression;
-        const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : null;
-        if (name && prims.has(name)) (out[`${path.relative(REPO, file).split(path.sep).join("/")}:${top}`] ??= []).push(name);
+        const name = primitiveOf(n.expression.expression);
+        if (name) (out[`${path.relative(REPO, file).split(path.sep).join("/")}:${top}`] ??= []).push(name);
       }
       ts.forEachChild(n, (c) => visit(c, top));
     };
@@ -170,6 +197,36 @@ describe("INVARIANT 1b: every write derived from an awaited verify is classified
   });
   it("the scan is not vacuous: it finds the dashboard's verify inside an inline route handler", () => {
     expect(awaitedVerifySites()["src/transport/http.ts:startHttpServer"]).toEqual(["verifyCredential"]);
+  });
+  it("MUTANTS (Codex R1 #3): an ALIASED import, a const alias, a destructured dynamic import and a re-export are all found by binding", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-sites-"));
+    try {
+      fs.writeFileSync(path.join(dir, "prims.ts"), "export async function verifyCredential(t: string): Promise<boolean> { return t.length > 0; }\n");
+      fs.writeFileSync(path.join(dir, "reexport.ts"), "export { verifyCredential as reCheck } from './prims.js';\n");
+      fs.writeFileSync(
+        path.join(dir, "use.ts"),
+        [
+          "import { verifyCredential as check } from './prims.js';",
+          "import { reCheck } from './reexport.js';",
+          "import { verifyCredential } from './prims.js';",
+          "export async function viaAlias(): Promise<void> { await check('t'); }",
+          "export async function viaConst(): Promise<void> { const c2 = verifyCredential; await c2('t'); }",
+          "export async function viaDynamic(): Promise<void> { const { verifyCredential: d } = await import('./prims.js'); await d('t'); }",
+          "export async function viaReexport(): Promise<void> { await reCheck('t'); }",
+          "export async function notAVerify(): Promise<void> { const other = async (_: string) => true; await other('t'); }",
+          "",
+        ].join("\n"),
+      );
+      const sites = awaitedVerifySites(dir, ["verifyCredential"]);
+      const key = (fn: string) => `${path.relative(REPO, path.join(dir, "use.ts")).split(path.sep).join("/")}:${fn}`;
+      expect(sites[key("viaAlias")], "aliased import").toEqual(["verifyCredential"]);
+      expect(sites[key("viaConst")], "const alias").toEqual(["verifyCredential"]);
+      expect(sites[key("viaDynamic")], "destructured dynamic import").toEqual(["verifyCredential"]);
+      expect(sites[key("viaReexport")], "re-export").toEqual(["verifyCredential"]);
+      expect(sites[key("notAVerify")], "a look-alike that is not the primitive").toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

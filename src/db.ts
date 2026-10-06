@@ -43,7 +43,7 @@ import { VALID_TRANSITIONS, ACTION_TO_STATUS, AGENT_NAME_PATTERN } from "./types
 import { generateToken, hashToken } from "./auth.js";
 import { registerPersistedSecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
-import { computeTokenLookup, digestVerdict, lookupKeys, tokenLookupCandidates, KEY_ID_SEPARATOR } from "./token-lookup.js";
+import { computeTokenLookup, digestVerdict, lookupKeys, tokenLookupCandidates, KEY_ID_SEPARATOR, unreachableLookupRanges } from "./token-lookup.js";
 import { authSource, verifyCredential, verifySecretHash } from "./token-verify.js";
 import { scanRefund, scanTake } from "./auth-throttle.js";
 import { normalizeAgentClass, TOPOLOGY_VISIBLE_CLASSES, TOPOLOGY_HIDDEN_CLASSES, TRANSIENT } from "./agent-class.js";
@@ -1744,6 +1744,11 @@ function migrateSchemaToV2_20(db: CompatDatabase): void {
     db.exec("ALTER TABLE agents ADD COLUMN previous_token_lookup TEXT");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_agents_token_lookup ON agents(token_lookup)");
+  // PR-B (architect 9496935f): the token-only fallback reads previous_token_lookup by INDEX RANGES too. Additive.
+  // PARTIAL (only rows that HAVE a previous credential: a grace window): MEASURED, a full index on this column
+  // is useless for "IS NULL AND previous_token_hash IS NOT NULL", since nearly every row's previous lookup is
+  // NULL, and the planner rightly chose SCAN agents. Every fallback select carries the predicate, so it applies.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_agents_prev_token_lookup ON agents(previous_token_lookup) WHERE previous_token_hash IS NOT NULL");
   db.exec(
     "CREATE TABLE IF NOT EXISTS auth_meta (" +
       "id INTEGER PRIMARY KEY CHECK (id = 1), " +
@@ -2469,6 +2474,33 @@ export type TokenLookupRefusal = { refused: "throttled" | "busy" };
  *       the pool's global queue. This set shrinks as rows heal.
  *   Otherwise an index miss is a DEFINITIVE "unknown token" with ZERO bcrypt.
  */
+/**
+ * PR-B (architect 9496935f, Codex R1 #1): the rows whose current or previous credential the digest index cannot
+ * decide, as a UNION of single-range selects (each served by idx_agents_token_lookup or
+ * idx_agents_prev_token_lookup). Exported for the plan and differential tests; `ranges` defaults to the one source,
+ * unreachableLookupRanges().
+ */
+export function fallbackRowsQuery(ranges = unreachableLookupRanges()): { sql: string; tail: string; params: string[] } {
+  const parts: string[] = [];
+  const params: string[] = [];
+  for (const [col, hashCol] of [["token_lookup", "token_hash"], ["previous_token_lookup", "previous_token_hash"]] as const) {
+    parts.push(`SELECT * FROM agents WHERE ${col} IS NULL AND ${hashCol} IS NOT NULL`);
+    for (const r of ranges) {
+      const conds = [r.lo !== null ? `${col} >= ?` : null, r.hi !== null ? `${col} < ?` : null].filter(Boolean);
+      if (conds.length === 0) conds.push(`${col} IS NOT NULL`);
+      parts.push(`SELECT * FROM agents WHERE ${conds.join(" AND ")} AND ${hashCol} IS NOT NULL`);
+      if (r.lo !== null) params.push(r.lo);
+      if (r.hi !== null) params.push(r.hi);
+    }
+  }
+  const sql = parts.join(" UNION ");
+  // `tail`: everything after the leading "SELECT * FROM agents WHERE ", so the prepare() site can show a LITERAL
+  // SELECT prefix (scripts/auth-gen-guard.mjs: a prepared statement provably starting with SELECT is one read).
+  const PREFIX = "SELECT * FROM agents WHERE ";
+  if (!sql.startsWith(PREFIX)) throw new Error("fallbackRowsQuery: the query no longer starts with its SELECT prefix");
+  return { sql, tail: sql.slice(PREFIX.length), params };
+}
+
 export async function findAgentRowByToken(
   token: string,
   source: string = authSource(),
@@ -2494,17 +2526,10 @@ export async function findAgentRowByToken(
       note(v.verdict);
     }
   }
-  // (b) Only credentials the index cannot reach: no digest, unprefixed, or a non-derivable key.
-  const keyIds = lookupKeys().map((k) => k.id);
-  const kp = keyIds.map(() => "?").join(",");
-  const unreachable = (col: string) =>
-    `(${col} IS NULL OR instr(${col}, '${KEY_ID_SEPARATOR}') = 0 OR substr(${col}, 1, instr(${col}, '${KEY_ID_SEPARATOR}') - 1) NOT IN (${kp}))`;
-  const fallback = db
-    .prepare(
-      `SELECT * FROM agents WHERE (token_hash IS NOT NULL AND ${unreachable("token_lookup")}) ` +
-        `OR (previous_token_hash IS NOT NULL AND ${unreachable("previous_token_lookup")})`,
-    )
-    .all(...keyIds, ...keyIds) as AgentRecord[];
+  // (b) Only credentials the index cannot reach: no digest, unprefixed, or a non-derivable key. By INDEX RANGES
+  // (architect 9496935f): O(K x log N + unreachable rows), never a scan of the agents table.
+  const q = fallbackRowsQuery();
+  const fallback = db.prepare(`SELECT * FROM agents WHERE ${q.tail}`).all(...q.params) as AgentRecord[];
   const undecided: Array<{ row: AgentRecord; which: "current" | "previous"; hash: string; lookup: string | null | undefined }> = [];
   for (const row of fallback) {
     for (const which of ["current", "previous"] as const) {

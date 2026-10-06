@@ -108,7 +108,8 @@ jobs:
         # files the runner's own noise (MEASURED: 30-165 ms) exceeds the margins they resolve. They stay in
         # the gate. Each run calibrates itself: an A/A control that must pass and a sized negative control
         # that must fail. The BAR lines are the numbers to report.
-        run: RELAY_TIMING_BARS=1 npx vitest run tests/pr-b-failed-auth.test.ts -t BARS --silent=false --reporter=verbose
+        # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
+        run: node scripts/run-timing-bars.mjs
 
       - name: npm audit (high+) — via resilience wrapper
         # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
@@ -178,7 +179,8 @@ jobs:
         # files the runner's own noise (MEASURED: 30-165 ms) exceeds the margins they resolve. They stay in
         # the gate. Each run calibrates itself: an A/A control that must pass and a sized negative control
         # that must fail. The BAR lines are the numbers to report.
-        run: RELAY_TIMING_BARS=1 npx vitest run tests/pr-b-failed-auth.test.ts -t BARS --silent=false --reporter=verbose
+        # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
+        run: node scripts/run-timing-bars.mjs
 
       - name: Assert the suite installed NO real launchd service
         run: |

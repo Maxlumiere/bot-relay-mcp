@@ -195,3 +195,25 @@ export function _resetTokenLookupCacheForTests(): void {
   cachedKeys = null;
   cachedKeysTag = null;
 }
+
+/**
+ * PR-B (architect 9496935f, Codex R1 #1): the lookup values the digest index CANNOT decide, as EXACT INDEX RANGES
+ * instead of a table scan. A value is REACHABLE when it starts with `<derivable key id>|` (the in-band key id;
+ * key ids never contain the separator). Those values form, per key id p, the half-open range [p|, p}) in the
+ * index's BINARY order, because '}' is the byte after '|'. UNREACHABLE = NULL (indexable on its own) plus the
+ * COMPLEMENT of those ranges: exact whatever alphabet bare or garbage values use. `null` = unbounded on that side.
+ * ONE function, from lookupKeys(), so the ranges and the derivable keys cannot drift.
+ */
+export function unreachableLookupRanges(keyIds: readonly string[] = lookupKeys().map((k) => k.id)): Array<{ lo: string | null; hi: string | null }> {
+  const reachable = [...new Set(keyIds)]
+    .map((id) => ({ lo: `${id}${KEY_ID_SEPARATOR}`, hi: `${id}}` }))
+    .sort((a, b) => (a.lo < b.lo ? -1 : a.lo > b.lo ? 1 : 0));
+  const out: Array<{ lo: string | null; hi: string | null }> = [];
+  let cursor: string | null = null; // everything below the first reachable range
+  for (const r of reachable) {
+    if (cursor === null || cursor < r.lo) out.push({ lo: cursor, hi: r.lo });
+    if (cursor === null || r.hi > cursor) cursor = r.hi;
+  }
+  out.push({ lo: cursor, hi: null });
+  return out;
+}
