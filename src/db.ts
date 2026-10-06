@@ -58,7 +58,7 @@ import {
   discardInitializedDb,
 } from "./sqlite-compat.js";
 import { log } from "./logger.js";
-import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
+import { ensureSecureDir, ensureSecureFile, restrictToOwnerWindows } from "./fs-perms.js";
 import { resolveInstance } from "./instance.js";
 import { checkContainment } from "./approved-roots.js";
 import { emitInboxChanged } from "./inbox-events.js";
@@ -348,6 +348,9 @@ export async function initializeDb(): Promise<void> {
   // Verified: narrow the directory and the DB file itself.
   ensureSecureDir(path.dirname(dbPath), 0o700);
   ensureSecureFile(dbPath, 0o600);
+  // PR-D Q6/Q12: on Windows the modes above are no-ops; restrict to the owner by ACL (dir, DB, WAL, SHM).
+  restrictToOwnerWindows(path.dirname(dbPath), true);
+  for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) if (fs.existsSync(f)) restrictToOwnerWindows(f, false);
 
   // #171 — single-sourced schema setup (pragmas + full migration chain + seed +
   // finalize + purge). Shared with getDb()'s native fallback so the two paths
@@ -389,6 +392,8 @@ export function getDb(): CompatDatabase {
   }
   ensureSecureDir(dir, 0o700);
   ensureSecureFile(dbPath, 0o600);
+  restrictToOwnerWindows(dir, true); // PR-D Q6/Q12: the Windows equivalent of the modes above
+  for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) if (fs.existsSync(f)) restrictToOwnerWindows(f, false);
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.
   applySchemaSetup(_db);

@@ -19,6 +19,7 @@
  */
 
 import fs from "fs";
+import { spawnSync } from "child_process";
 import { log } from "./logger.js";
 
 /** Chmod an existing file to the requested mode. Best-effort; log.warn on failure. */
@@ -73,4 +74,87 @@ export function checkAndWarnPermissive(path: string, maxMode: number): void {
       `[fs-perms] Could not stat "${path}": ${err instanceof Error ? err.message : String(err)}`
     );
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// PR-D (rulings f885e674 Q6, efb48600 Q12): Windows ACLs. On NTFS a POSIX mode is meaningless, so the relay's
+// private files and directories are restricted with an explicit owner-only ACL, and checked by SID (icacls and
+// account names are LOCALIZED; SIDs are not). Best-effort like the chmods above: a failure warns, never stops.
+// ---------------------------------------------------------------------------------------------------------
+
+/** Well-known SIDs that must hold NO allow ACE on a private relay path: Everyone, Users, Authenticated Users. */
+export const FORBIDDEN_SIDS: Readonly<Record<string, string>> = Object.freeze({
+  "S-1-1-0": "Everyone",
+  "S-1-5-32-545": "BUILTIN\\Users",
+  "S-1-5-11": "Authenticated Users",
+});
+
+let currentUserSid: string | null | undefined;
+/** The current user's SID (whoami /user), or null when it cannot be read. Windows only; cached. */
+export function windowsUserSid(): string | null {
+  if (currentUserSid !== undefined) return currentUserSid;
+  const r = spawnSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf-8", windowsHide: true });
+  const m = r.status === 0 ? /"(S-1-[0-9-]+)"\s*$/m.exec(r.stdout ?? "") : null;
+  currentUserSid = m ? m[1] : null;
+  return currentUserSid;
+}
+
+/**
+ * Restrict `path` to the current user only on Windows: remove inherited ACEs and grant the user full control
+ * (inherited by children for a directory). A no-op elsewhere (the POSIX modes above do the job).
+ */
+export function restrictToOwnerWindows(path: string, isDir: boolean): void {
+  if (process.platform !== "win32") return;
+  const sid = windowsUserSid();
+  if (!sid) {
+    log.warn(`[fs-perms] Could not read the current user's SID: "${path}" keeps its inherited ACL.`);
+    return;
+  }
+  const grant = isDir ? `*${sid}:(OI)(CI)F` : `*${sid}:F`;
+  const r = spawnSync("icacls", [path, "/inheritance:r", "/grant:r", grant], { encoding: "utf-8", windowsHide: true });
+  if (r.status !== 0) {
+    log.warn(`[fs-perms] Could not restrict the ACL of "${path}" (icacls exit ${r.status}): ${(r.stderr || r.stdout || "").trim()}`);
+  }
+}
+
+/**
+ * The allow ACEs on `path`, as SIDs (Windows only; PowerShell Get-Acl, each identity translated to its SID so
+ * the answer does not depend on the OS language). Throws when the ACL cannot be read: a check that cannot read
+ * must not pass.
+ */
+export function windowsAllowSids(path: string): string[] {
+  const script =
+    "$ErrorActionPreference='Stop'; (Get-Acl -LiteralPath $env:RELAY_ACL_PATH).Access | " +
+    "Where-Object { $_.AccessControlType -eq 'Allow' } | " +
+    "ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }";
+  const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf-8",
+    windowsHide: true,
+    env: { ...process.env, RELAY_ACL_PATH: path },
+  });
+  if (r.status !== 0) throw new Error(`Get-Acl failed for "${path}": ${(r.stderr || "").trim()}`);
+  return (r.stdout ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith("S-1-"));
+}
+
+/**
+ * PR-D Q6: why `path` is NOT private, or [] when it is. POSIX: the mode must not exceed `maxMode` (no group or
+ * other bits). Windows: no allow ACE for Everyone, Users or Authenticated Users. An unreadable path is a fault.
+ */
+export function privacyFaults(path: string, maxMode: number): string[] {
+  if (process.platform === "win32") {
+    let sids: string[];
+    try {
+      sids = windowsAllowSids(path);
+    } catch (err) {
+      return [(err as Error).message];
+    }
+    return sids.filter((s) => s in FORBIDDEN_SIDS).map((s) => `${path}: an allow ACE for ${FORBIDDEN_SIDS[s]} (${s})`);
+  }
+  let mode: number;
+  try {
+    mode = fs.statSync(path).mode & 0o777;
+  } catch (err) {
+    return [`${path}: ${(err as Error).message}`];
+  }
+  return mode & ~maxMode ? [`${path}: mode 0${mode.toString(8)} is wider than 0${maxMode.toString(8)}`] : [];
 }

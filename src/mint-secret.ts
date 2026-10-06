@@ -23,6 +23,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import { restrictToOwnerWindows } from "./fs-perms.js";
 
 export const MINT_SECRET_DIR = "secrets";
 export const MINT_SECRET_FILE = "mint.secret";
@@ -91,6 +92,7 @@ function ensureSecretsDir(instanceDir: string): string {
     throw new MintSecretError(`${dir} is not a directory (a symlink or another type): refusing to keep the registration secret there`);
   }
   if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+  restrictToOwnerWindows(dir, true); // Q12: on Windows the mode is a no-op; an owner-only ACL instead
   return dir;
 }
 
@@ -122,7 +124,7 @@ export function readMintSecret(instanceDir: string): string | null {
 
 /** Tighten an existing secret file to 0600 through a no-follow descriptor (never loosens, never follows a link). */
 function tightenMintSecretMode(file: string): void {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") return restrictToOwnerWindows(file, false);
   const fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW);
   try {
     fs.fchmodSync(fd, 0o600);
@@ -167,6 +169,7 @@ export function ensureMintSecret(instanceDir: string, seed?: string): { path: st
       if (readMintSecret(instanceDir) === null) throw new MintSecretError(`${file} appeared and vanished while it was being created`);
       return { path: file, created: false }; // another starter won the race: its file is complete
     }
+    restrictToOwnerWindows(file, false);
     return { path: file, created: true };
   } finally {
     fs.rmSync(tmp, { force: true });
