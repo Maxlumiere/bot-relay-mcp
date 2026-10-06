@@ -429,6 +429,9 @@ interface BarStats {
   /** The auth arm's compares in each round. */
   perRound: number[];
   med: { ctlHealth: number; ctlEld: number; authHealth: number; authEld: number };
+  /** DECLARED by the bar (runBar's poolControl), never inferred from the readings: a pool-loaded bar whose control
+   * readings lack their occupancy is an INSTRUMENT FAULT, not a bar that silently skips the check. */
+  pooled: boolean;
 }
 
 /**
@@ -436,7 +439,7 @@ interface BarStats {
  * `poolControl` (architect b72c3ac4): the control arm also runs the pool work the design INTENDS for this load,
  * a DESIGN CONSTANT in production's shape, so the bar compares the auth PATH against the bcrypt work itself.
  */
-async function runBar(label: string, port: number, load: Load, opts: { onLoop?: () => void; poolControl?: PoolWork } = {}): Promise<BarStats> {
+async function runBar(label: string, port: number, load: Load, opts: { onLoop?: () => void; poolControl?: PoolWork; authPool?: PoolWork } = {}): Promise<BarStats> {
   _resetAuthThrottleForTests();
   await measure(port, controlLoad(load.n), undefined, opts.poolControl); // WARM-UP, discarded: a fresh daemon's first burst pays one-off costs
   const control: Reading[] = [];
@@ -447,7 +450,7 @@ async function runBar(label: string, port: number, load: Load, opts: { onLoop?: 
     _resetAuthThrottleForTests(); // every auth round meets the same budgets (the scan budget refills slowly)
     perRound.push(
       await compares(async () => {
-        auth.push(await measure(port, load, opts.onLoop));
+        auth.push(await measure(port, load, opts.onLoop, opts.authPool));
       }),
     );
   }
@@ -466,14 +469,15 @@ async function runBar(label: string, port: number, load: Load, opts: { onLoop?: 
       ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}` +
       (opts.poolControl ? ` | control pool in-window ${control.map((r) => `${r.pool!.inWindow}/${r.pool!.total}`).join(" ")} busy ${control.map((r) => r.pool!.busy.toFixed(2)).join("/")}` : ""),
   );
-  return { label, control, auth, compares: count, perRound, med };
+  return { label, control, auth, compares: count, perRound, med, pooled: opts.poolControl !== undefined };
 }
 
 /** Every pool-loaded control round ran its design compares INSIDE its window, busy for >= OCCUPANCY_FLOOR of it. */
 function expectControlLoaded(b: BarStats, designCompares: number): void {
+  if (!b.pooled) return; // DECLARED unloaded (the bar was given no poolControl)
   const pools = b.control.map((r) => r.pool);
-  if (pools.some((p) => p === undefined)) return; // not a pool-loaded bar
   const fault = (what: string) => `INSTRUMENT FAULT (${b.label}): the pool-loaded control ${what}; this round measured an unloaded loop, so no bar verdict is possible`;
+  expect(pools.every((p) => p !== undefined), fault("has rounds with NO occupancy reading (the pool work was not wired into measure)")).toBe(true);
   expect(pools.map((p) => p!.inWindow), fault(`ran compares outside its window (design: ${designCompares} per round, all inside)`)).toEqual(Array(K).fill(designCompares));
   for (const p of pools) expect(p!.busy, fault(`left its pool idle for part of its window (busy ${p!.busy.toFixed(2)} < ${OCCUPANCY_FLOOR})`)).toBeGreaterThanOrEqual(OCCUPANCY_FLOOR);
 }
@@ -560,10 +564,35 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       };
       const r = await measure(port, controlLoad(30), undefined, lapsed);
       expect(r.pool!.busy, `the lapse demo: busy ${r.pool!.busy.toFixed(2)} must fall below the floor`).toBeLessThan(OCCUPANCY_FLOOR);
-      const lapsedBar: BarStats = { label: "lapse demo", control: Array(K).fill(r), auth: [], compares: 0, perRound: [], med: { ctlHealth: 0, ctlEld: 0, authHealth: 0, authEld: 0 } };
+      const lapsedBar: BarStats = { label: "lapse demo", control: Array(K).fill(r), auth: [], compares: 0, perRound: [], med: { ctlHealth: 0, ctlEld: 0, authHealth: 0, authEld: 0 }, pooled: true };
       expect(() => expectControlLoaded(lapsedBar, 4 * SCAN_BURST + 1)).toThrow(/INSTRUMENT FAULT/);
+      // THE WIRING MUTANT: a bar DECLARED pool-loaded whose readings carry no occupancy (the pool work dropped from
+      // measure) must be an INSTRUMENT FAULT, never a skipped check.
+      const unwired: BarStats = { ...lapsedBar, label: "unwired mutant", control: Array(K).fill({ ...r, pool: undefined }), pooled: true };
+      expect(() => expectControlLoaded(unwired, 4 * SCAN_BURST)).toThrow(/NO occupancy reading/);
+
+      // CALIBRATED ON THE POOL-LOADED PATH (the bar above): its control now carries the full pool load, a higher loop
+      // delay and /health than the unloaded control the A/A and negative tests use. So both are re-run HERE, on the
+      // loaded path, with the block sized against THIS path's own same-run reading.
+      //   A/A: the pool-loaded control against itself (both arms run the same pool work) PASSES.
+      expectBarHolds(await runBar("A/A pool-loaded", port, controlLoad(30), { poolControl, authPool: poolControl }), { exactPerRound: 4 * SCAN_BURST });
+      //   NEGATIVE: a loop block of 2 x (this path's reading + the margin) in every auth round FAILS both predicates.
+      const pre = await measure(port, controlLoad(30), undefined, poolControl);
+      const blockMs = 2 * (Math.max(pre.healthMax, pre.eldMax) + MARGIN_MS);
+      const neg = await runBar(`negative-control pool-loaded (block=${blockMs.toFixed(1)}ms)`, port, authLoad(30, "discover_agents", {}), {
+        poolControl,
+        onLoop: () => {
+          const end = performance.now() + blockMs;
+          while (performance.now() < end) {
+            /* busy */
+          }
+        },
+      });
+      expectControlLoaded(neg, 4 * SCAN_BURST); // the negative's own control is valid, so its verdict means something
+      expect(neg.med.authEld, "a sized loop block must exceed the POOL-LOADED LOOP allowance").toBeGreaterThan(neg.med.ctlEld + MARGIN_MS);
+      expect(neg.med.authHealth, "a sized loop block must exceed the POOL-LOADED AVAILABILITY allowance").toBeGreaterThan(neg.med.ctlHealth + MARGIN_MS);
     });
-  }, 180_000);
+  }, 360_000);
 
   it("NEGATIVE CONTROL: a loop block sized 2 x the allowance in EVERY auth round FAILS both predicates (the bar sees a block of the forbidden size)", async () => {
     // Architect 47e64b3a: sized against the thresholds in THIS run, not against bcrypt's real cost.
