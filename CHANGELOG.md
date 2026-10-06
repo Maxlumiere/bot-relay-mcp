@@ -43,6 +43,7 @@ Any process that could reach the relay's local HTTP port could register a new ag
 - **`/health` reports `mint: secret | open-dev | unavailable`,** and `relay fleet --deploy-check` prints a `MINT` line and fails unless it reads `secret`.
 - **`RELAY_ALLOW_OPEN_MINT=1`** turns the check off for local development only. The relay says so loudly at start, `/health` reports `open-dev`, and the relay refuses to start with it on a non-local address.
 - **A window started without a relay name no longer registers as `default`.** The SessionStart hook says `unnamed: not registered` and does nothing else. Set `RELAY_AGENT_NAME` to join the relay.
+- **A window refused for the secret is told why.** The Claude hook's `REGISTER_FAILED` names the registration secret and the file it reads it from, instead of guessing a name collision. The Codex hook no longer reports `HEALTHY` when its registration was refused: it reports `REGISTER_FAILED`, and Codex is told it can read mail but cannot send.
 - **A SessionStart hook that runs twice in one window no longer reports `REGISTER_FAILED`.** The second run, from the same process with the same token, is now a no-op refresh.
 - **Two relays starting at the same moment no longer crash creating the secret.** It is written to a temporary file and moved into place in one step.
 
