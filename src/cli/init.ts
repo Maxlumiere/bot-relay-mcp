@@ -579,6 +579,29 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
   );
   if (args.agent) process.stdout.write(`✓ default agent name: ${args.agent}\n`);
 
+  // PR-D (ruling Q4/Q8): the registration secret, minted idempotently: an existing one is kept, a legacy
+  // http_secret seeds a new one (remote clients keep working). Beside the DB it guards: the explicit
+  // instance's dir, else the daemon's own rule (mintSecretHome). The secret itself is never printed.
+  {
+    const { ensureMintSecret } = await import("../mint-secret.js");
+    const { mintSecretHome } = await import("../mint-gate.js");
+    try {
+      const home = perInstanceDir ?? mintSecretHome();
+      const legacy = typeof reconciled.root.http_secret === "string" && reconciled.root.http_secret.length > 0 ? reconciled.root.http_secret : undefined;
+      const r = ensureMintSecret(home, legacy);
+      process.stdout.write(
+        `✓ registration secret: ${r.path} ${r.created ? (legacy ? "(created, seeded from http_secret)" : "(created)") : "(kept)"}\n` +
+          `  Registering a NEW agent name over HTTP requires it; the relay hooks read it at use time.\n`,
+      );
+    } catch (err) {
+      process.stderr.write(
+        `relay init: the registration secret could not be created (${err instanceof Error ? err.message : String(err)}).\n` +
+          "  New agent names cannot register over HTTP until it exists; the daemon also creates it at start.\n",
+      );
+      return 1;
+    }
+  }
+
   // ADR-0006 (a): announce a NEWLY-generated dashboard/operator secret. Printed
   // only when this run actually created it (reconcile returned OUR generated
   // value, i.e. none existed before) — never on a re-run that preserved one.

@@ -354,3 +354,80 @@ describe("a SessionStart hook that runs TWICE in one window (architect 3f041f24)
     });
   });
 });
+
+/**
+ * Architect fd2f6b9f Q-A: the gate is defined by the HARM, "an unauthenticated caller receives a token". Every
+ * register path that ISSUES a token is enumerated here (db.ts generateToken sites, by what they do): each one
+ * either needs the registration secret over HTTP, or carries a credential bound to the row.
+ */
+describe("every register path that ISSUES a token, by the harm predicate (Q-A)", () => {
+  const call = async (port: number, args: Record<string, unknown>, headers: Record<string, string> = {}) => {
+    const r = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "register_agent", arguments: { role: "worker", capabilities: [], ...args } } }),
+    });
+    const text = await r.text();
+    const json = JSON.parse(text.startsWith("event:") ? text.split("\n").find((l) => l.startsWith("data:"))!.slice(5) : text);
+    return { isError: json.result?.isError === true, body: JSON.parse(json.result.content[0].text) };
+  };
+  const makeLegacy = (name: string) => {
+    db.registerAgent(name, "worker", []);
+    db.getDb().prepare("UPDATE agents SET token_hash = NULL, token_lookup = NULL, session_id = NULL, auth_state = 'legacy_bootstrap' WHERE name = ?").run(name);
+  };
+
+  it("HARM: a pre-v1.7 (legacy_bootstrap) row taken over with NO credential over HTTP → refused, no token, the row stays legacy", async () => {
+    makeLegacy("old-agent");
+    await withDaemon(async (port) => {
+      const r = await call(port, { name: "old-agent" });
+      expect(r.body.error_code).toBe("MINT_SECRET_REQUIRED");
+      expect(r.body.error).toMatch(/pre-v1\.7/);
+      expect(r.body.agent_token).toBeUndefined();
+    });
+    expect(db.getAgentAuthData("old-agent")!.auth_state).toBe("legacy_bootstrap");
+  });
+
+  it("the same legacy row WITH the registration secret → migrated, with a token", async () => {
+    makeLegacy("old-agent2");
+    await withDaemon(async (port) => {
+      const r = await call(port, { name: "old-agent2" }, { "X-Relay-Secret": secretNow() });
+      expect(r.isError, JSON.stringify(r.body)).toBe(false);
+      expect(typeof r.body.agent_token).toBe("string");
+    });
+    expect(db.getAgentAuthData("old-agent2")!.auth_state).toBe("active");
+  });
+
+  it("recovery_pending + its RECOVERY TOKEN (a credential bound to the row) → token issued with NO registration secret", async () => {
+    db.registerAgent("recovering", "worker", []);
+    const { recoveryToken } = db.revokeAgentToken("recovering", { issueRecovery: true });
+    await withDaemon(async (port) => {
+      const r = await call(port, { name: "recovering", recovery_token: recoveryToken });
+      expect(r.isError, JSON.stringify(r.body)).toBe(false);
+      expect(typeof r.body.agent_token).toBe("string");
+    });
+  });
+
+  it("recovery_pending WITHOUT its recovery token → refused, no token (the bound credential is what authorizes it)", async () => {
+    db.registerAgent("recovering2", "worker", []);
+    db.revokeAgentToken("recovering2", { issueRecovery: true });
+    await withDaemon(async (port) => {
+      const r = await call(port, { name: "recovering2" }, { "X-Relay-Secret": secretNow() });
+      expect(r.isError).toBe(true);
+      expect(r.body.agent_token).toBeUndefined();
+    });
+  });
+
+  it("an 'active' row with NO token hash (data-integrity fault) never reaches the defensive mint unauthenticated: fails closed", async () => {
+    db.registerAgent("broken", "worker", []);
+    db.getDb().prepare("UPDATE agents SET token_hash = NULL, token_lookup = NULL, session_id = NULL WHERE name = ?").run("broken");
+    await withDaemon(async (port) => {
+      const r = await call(port, { name: "broken" }, { "X-Relay-Secret": secretNow() });
+      expect(r.isError).toBe(true);
+      expect(r.body.agent_token).toBeUndefined();
+    });
+  });
+
+  it("the stdio path is out of scope (Q6): a legacy row migrates over stdio without the secret", () => {
+    expect(checkMintGate("stdio", undefined).ok).toBe(true);
+  });
+});

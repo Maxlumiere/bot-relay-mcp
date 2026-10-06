@@ -1031,6 +1031,33 @@ export function createServer(): Server {
   }
 
   /**
+   * PR-D: THE token-issuance gate (architect fd2f6b9f Q-A: defined by the HARM, "an unauthenticated caller
+   * receives a token"). Every register_agent path that issues a token with NO credential bound to the row
+   * calls this: `create` (a new name) and `legacy` (a pre-v1.7 row with no token hash). Over HTTP the caller
+   * must present the instance's registration secret; stdio is out of scope. SYNC (readFileSync +
+   * timingSafeEqual, src/mint-gate.ts): no await between it and the handler's write. A refusal is tool-level
+   * (MINT_SECRET_REQUIRED), audited by the dispatcher's bounded rejection audit, and spends the source's mint
+   * budget. Returns null when allowed. The other token-issuing paths carry a credential bound to the row
+   * (a recovery token, the agent's own token) or an authenticated capability (admin rotate, revoke with
+   * recovery, spawn_agent): tests/pr-d-mint-gate.test.ts enumerates them.
+   */
+  function mintGateRefusal(claimedName: string, kind: "create" | "legacy"): any | null {
+    const ctx = currentContext();
+    const gate = checkMintGate(ctx.transport, ctx.presentedSecret);
+    if (gate.ok) return null;
+    if (!mintRefusalTake(authSource())) return undecidedAuthError({ refused: "throttled" });
+    const what = kind === "create" ? `Registering a NEW agent name ("${claimedName}")` : `Re-registering the pre-v1.7 agent "${claimedName}" (it has no token yet)`;
+    return authError(
+      `${what} over HTTP requires this relay's registration secret: ${gate.detail}. Clients send it as the ` +
+        `X-Relay-Secret header, read at use time from <relay instance dir>/secrets/mint.secret. Update the relay ` +
+        `hooks and clients, or run \`relay init\` to create the secret. An already-registered agent re-registers ` +
+        `with its own token instead.`,
+      ERROR_CODES.MINT_SECRET_REQUIRED,
+      `mint_secret_${gate.reason}`,
+    );
+  }
+
+  /**
    * Enforce auth + capability. Returns null if allowed, or an error result
    * to propagate to the caller.
    */
@@ -1073,23 +1100,8 @@ export function createServer(): Server {
             ERROR_CODES.AUTH_FAILED
           );
         }
-        // PR-D (rulings f885e674 Q1, dfa29648 Q7, Q11): CREATING a name over HTTP requires this instance's
-        // registration secret. SYNC (readFileSync + timingSafeEqual, src/mint-gate.ts): no await between this
-        // check and the handler's write. A refusal is tool-level (MINT_SECRET_REQUIRED), audited by the
-        // dispatcher's bounded rejection audit, and spends the source's mint budget.
-        const ctx = currentContext();
-        const gate = checkMintGate(ctx.transport, ctx.presentedSecret);
-        if (!gate.ok) {
-          if (!mintRefusalTake(authSource())) return undecidedAuthError({ refused: "throttled" });
-          return authError(
-            `Registering a NEW agent name ("${claimedName}") over HTTP requires this relay's registration secret: ` +
-            `${gate.detail}. Clients send it as the X-Relay-Secret header, read at use time from ` +
-            `<relay instance dir>/secrets/mint.secret. Update the relay hooks and clients, or run \`relay init\` ` +
-            `to create the secret. An already-registered agent re-registers with its own token instead.`,
-            ERROR_CODES.MINT_SECRET_REQUIRED,
-            `mint_secret_${gate.reason}`,
-          );
-        }
+        const refusal = mintGateRefusal(claimedName, "create");
+        if (refusal) return refusal;
         return allow({ kind: "none", why: "new-name" }); // first registration — bootstrap path
       }
       const state = (existing.auth_state ?? "active") as
@@ -1097,7 +1109,13 @@ export function createServer(): Server {
         | "legacy_bootstrap"
         | "revoked"
         | "recovery_pending";
-      if (state === "legacy_bootstrap") return allow({ kind: "none", why: "legacy-migration" }); // Phase 2b migration path
+      if (state === "legacy_bootstrap") {
+        // Phase 2b migration path. PR-D (architect fd2f6b9f Q-A): it ISSUES a token for an existing name with no
+        // credential bound to the row, the same harm as a create (worse: a takeover), so the same gate applies.
+        const refusal = mintGateRefusal(claimedName, "legacy");
+        if (refusal) return refusal;
+        return allow({ kind: "none", why: "legacy-migration" });
+      }
       if (state === "revoked") {
         return authError(
           `Agent "${claimedName}" is revoked. Use unregister_agent to free the name, or contact an administrator for a recovery token.`,

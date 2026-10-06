@@ -25,6 +25,7 @@ import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { mintHeaders } from "../_helpers/mint.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, "..", "..");
@@ -71,6 +72,9 @@ export async function waitForHealth(baseUrl: string, timeoutMs = 8000): Promise<
   );
 }
 
+/** PR-D: each spawned daemon's dir (where it keeps its registration secret), by baseUrl. */
+const DAEMON_DIRS = new Map<string, string>();
+
 export async function spawnDaemon(): Promise<DaemonHandle> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bot-relay-tether-harness-"));
   const port = await findFreePort();
@@ -95,6 +99,7 @@ export async function spawnDaemon(): Promise<DaemonHandle> {
   });
   const baseUrl = `http://127.0.0.1:${port}`;
   await waitForHealth(baseUrl);
+  DAEMON_DIRS.set(baseUrl, tmpDir);
   return { child, port, baseUrl, tmpDir };
 }
 
@@ -107,6 +112,7 @@ export async function tearDownDaemon(handle: DaemonHandle): Promise<void> {
       resolve();
     }, 2_000).unref?.();
   });
+  DAEMON_DIRS.delete(handle.baseUrl);
   fs.rmSync(handle.tmpDir, { recursive: true, force: true });
 }
 
@@ -129,6 +135,8 @@ export async function registerAgentViaHttp(
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
+      // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+      ...(DAEMON_DIRS.has(baseUrl) ? mintHeaders(DAEMON_DIRS.get(baseUrl)) : {}),
     },
     body: JSON.stringify({
       jsonrpc: "2.0",

@@ -64,7 +64,7 @@ function snap(over: Partial<FleetSnapshot> = {}): FleetSnapshot {
     listeners: [99],
     rows: [row(11, 2)],
     bindings: [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
-    daemon: { port: 3777, listenerPids: [99], health: { ok: true, build: build() } },
+    daemon: { port: 3777, listenerPids: [99], health: { ok: true, build: build() }, mint: "secret" },
     installed: () => installed(),
     nodeOnPath: "v22.0.0",
     ...over,
@@ -272,4 +272,33 @@ describe("the Codex shape, REAL processes: an UNBOUND connector through a SYMLIN
     expect(fail.judgement.daemon.verdict).toBe("STALE");
     dbm.closeDb();
   }, 90_000);
+});
+
+describe("PR-D (architect fd2f6b9f Q-B): the deploy check's MINT line", () => {
+  const withMint = (mint: "secret" | "open-dev" | "unavailable" | "absent" | undefined) => {
+    const s = snap();
+    return { ...s, daemon: { ...s.daemon, mint } };
+  };
+  it("mint: secret, everything CURRENT → PASS, and the MINT line is printed", async () => {
+    const o = await check(withMint("secret"));
+    expect([o.outcome, o.exit, o.mint]).toEqual(["PASS", 0, "secret"]);
+    expect(V.deployCheckText(o)).toMatch(/^ {2}MINT secret$/m);
+  });
+  for (const m of ["open-dev", "unavailable", "absent"] as const) {
+    it(`mint: ${m}, everything else CURRENT → FAIL (1), the MINT line says why`, async () => {
+      const o = await check(withMint(m));
+      expect([o.outcome, o.exit, o.mint]).toEqual(["FAIL", 1, m]);
+      expect(o.reason).toMatch(new RegExp(`mint is ${m}, not secret`));
+      expect(V.deployCheckText(o)).toMatch(new RegExp(`MINT ${m} .*FAIL`));
+    });
+  }
+  it("a /health with no mint field (a daemon not restarted after install) reads absent → FAIL", async () => {
+    expect(V.healthMint({ status: "ok" })).toBe("absent");
+    const o = await check(withMint(undefined));
+    expect([o.outcome, o.mint]).toEqual(["FAIL", "absent"]);
+  });
+  it("mint changing between the two observations → CANNOT-VERIFY (3), never a PASS on a half-read", async () => {
+    const o = await check(withMint("open-dev"), withMint("secret"));
+    expect([o.outcome, o.exit]).toEqual(["CANNOT-VERIFY", 3]);
+  });
 });

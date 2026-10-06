@@ -262,7 +262,7 @@ if [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; then
   fi
 fi
 
-# PR-D (architect 7964396c): a window launched WITHOUT a name gets NO relay identity. Before this, it
+# PR-D: a window launched WITHOUT a name gets NO relay identity. Before this, it
 # fell back to the literal "default" and registered over HTTP under it: MEASURED 2026-10-06, an unnamed
 # hand launch tried "default" 155 times, and one attempt held the live daemon's loop ~5 s. Unnamed means:
 # the name is still unresolved after RELAY_AGENT_NAME, a spawn manifest and config default_agent_name.

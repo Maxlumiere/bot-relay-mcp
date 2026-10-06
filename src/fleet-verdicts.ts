@@ -407,6 +407,21 @@ export interface DaemonView {
   listenerPids: number[] | { error: string };
   /** /health.build, or why not; `unreachable` = the HTTP read itself failed (cannot verify), not a daemon without a stamp. */
   health: { ok: true; build: LoadedFacts } | { ok: false; error: string; unreachable?: boolean };
+  /**
+   * PR-D (architect fd2f6b9f Q-B): /health.mint, whether creating an agent name over HTTP needs the registration
+   * secret. "absent" = the field is missing (a daemon that predates PR-D, i.e. not restarted after install) or no
+   * /health body was read. A separate named line of the deploy check: the connector vocabulary stays CLOSED.
+   */
+  mint?: MintState;
+}
+
+/** The deploy check's MINT line. Only "secret" passes: open-dev (a dev flag), unavailable (fail closed) and absent all FAIL. */
+export type MintState = "secret" | "open-dev" | "unavailable" | "absent";
+
+/** /health body → its mint state. */
+export function healthMint(body: unknown): MintState {
+  const m = body && typeof body === "object" ? (body as Record<string, unknown>).mint : undefined;
+  return m === "secret" || m === "open-dev" || m === "unavailable" ? m : "absent";
 }
 
 export interface FleetSnapshot {
@@ -794,6 +809,7 @@ export async function observeFleet(sys: SystemDeps, db: DbReads, port: number): 
       port,
       listenerPids: portListeners,
       health: healthRead.ok ? healthBuild(healthRead.body) : { ok: false, error: healthRead.error, unreachable: true },
+      mint: healthRead.ok ? healthMint(healthRead.body) : "absent",
     },
     installed: (dir) => sys.installed(dir),
     nodeOnPath: sys.nodeOnPath(),
@@ -810,6 +826,8 @@ export interface DeployCheckOutcome {
   exit: 0 | 1 | 3;
   reason: string;
   judgement: FleetJudgement;
+  /** PR-D Q-B: the daemon's mint state on the second observation; the deploy check FAILS unless "secret". */
+  mint: MintState;
 }
 
 /** Why this snapshot cannot support a verdict at all, or null. A daemon WITHOUT a stamp is a verdict (UNKNOWN → FAIL), not this. */
@@ -861,15 +879,20 @@ export async function deployCheck(
   await opts.afterFirstObservation?.();
   const s2 = await observe();
   const j2 = judge(s2);
+  const mint: MintState = s2.daemon.mint ?? "absent";
   const blind = cannotVerify(s1) ?? cannotVerify(s2) ?? daemonIdentityUnread(j1) ?? daemonIdentityUnread(j2);
-  if (blind) return { outcome: "CANNOT-VERIFY", exit: 3, reason: blind, judgement: j2 };
-  if (fleetSignature(j1) !== fleetSignature(j2)) {
-    return { outcome: "CANNOT-VERIFY", exit: 3, reason: "the fleet changed while it was being checked: check again once the windows have settled", judgement: j2 };
+  if (blind) return { outcome: "CANNOT-VERIFY", exit: 3, reason: blind, judgement: j2, mint };
+  if (fleetSignature(j1) !== fleetSignature(j2) || (s1.daemon.mint ?? "absent") !== mint) {
+    return { outcome: "CANNOT-VERIFY", exit: 3, reason: "the fleet changed while it was being checked: check again once the windows have settled", judgement: j2, mint };
   }
-  if (j2.failing === 0) {
-    return { outcome: "PASS", exit: 0, reason: `${j2.connectors.length} connector(s) and the daemon run the installed build (observed twice)`, judgement: j2 };
+  // PR-D Q-B: the daemon must REQUIRE the registration secret to create a name. open-dev fails even with its
+  // flag set (dev daemons are not deploy-checked); unavailable fails closed; absent = not restarted after install.
+  const mintFails = mint !== "secret";
+  if (j2.failing === 0 && !mintFails) {
+    return { outcome: "PASS", exit: 0, reason: `${j2.connectors.length} connector(s) and the daemon run the installed build (observed twice); mint: secret`, judgement: j2, mint };
   }
-  return { outcome: "FAIL", exit: 1, reason: `${j2.failing} not CURRENT`, judgement: j2 };
+  const why = [j2.failing > 0 ? `${j2.failing} not CURRENT` : null, mintFails ? `mint is ${mint}, not secret` : null].filter(Boolean).join("; ");
+  return { outcome: "FAIL", exit: 1, reason: why, judgement: j2, mint };
 }
 
 /**
@@ -878,7 +901,7 @@ export async function deployCheck(
  * outcome: a warning never changes the exit code, and a PASS must not hide it.
  */
 export function deployCheckText(o: DeployCheckOutcome): string {
-  const lines = [`[RELAY] DEPLOY-CHECK ${o.outcome}: ${o.reason}`];
+  const lines = [`[RELAY] DEPLOY-CHECK ${o.outcome}: ${o.reason}`, `  MINT ${o.mint}${o.mint === "secret" ? "" : "  (FAIL: a new agent name must need the registration secret)"}`];
   const who = (e: ConnectorEntry): string => (e.kind === CONNECTOR_KIND.unclassified ? "unclassified node process" : e.unbound ? "UNBOUND" : `agent ${e.agent}`);
   if (o.outcome !== "PASS") {
     for (const e of o.judgement.connectors.filter((x) => x.verdict !== "CURRENT")) {
