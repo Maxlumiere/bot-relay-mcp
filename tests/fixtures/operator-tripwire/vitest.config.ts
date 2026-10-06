@@ -3,16 +3,15 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
-/** A nested run for tests/operator-tripwire.test.ts: ONE fixture under the real tripwire setup. */
+/** A NESTED run for tests/operator-tripwire.test.ts: the fixtures under the real base, tripwire and run guard. */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vitest/config";
+import { withOperatorTripwire } from "../../_setup/vitest-tripwire-base.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-export default defineConfig({
+export default withOperatorTripwire({
   test: {
     root: ROOT,
     include: ["tests/fixtures/operator-tripwire/*.fixture.ts"],
-    setupFiles: ["./tests/_setup/operator-tripwire.ts"],
   },
 });
