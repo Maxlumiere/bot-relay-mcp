@@ -473,6 +473,10 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
   // ~/.claude.json naming the relay; without one the verdict stays CANNOT-JUDGE whatever register did.
   const withMcpConfig = () =>
     fs.writeFileSync(path.join(ROOT, ".claude.json"), JSON.stringify({ mcpServers: { "bot-relay": { type: "http", url: "http://127.0.0.1:3777/mcp" } } }));
+  // The hooks build the path as dirname(DB) + "/secrets/mint.secret": on Windows that is the SAME file written with
+  // mixed separators (MEASURED on windows-2022: C:\\...\\pr-d-x/secrets/mint.secret). Normalize the separators only;
+  // the assertion still requires the exact file.
+  const nativeSeps = (s: string) => (process.platform === "win32" ? s.replace(/\//g, "\\") : s);
   const helperCalls = (trace: string) => trace.split("\n").filter((l) => /^\++ relay_mint_secret_curl_config\b/.test(l)).length;
 
   it("NAMED (the control): the hook reads the secret, sends it, and the window is registered", async () => {
@@ -513,7 +517,7 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
           expect(r.status, r.stdout).toBe(0);
           expect(r.stdout).toMatch(/VERDICT=REGISTER_FAILED reason="[^"]*registration secret[^"]*MINT_SECRET_REQUIRED/);
           const said = r.stdout + r.trace;
-          expect(said).toContain(secretFile);
+          expect(nativeSeps(said)).toContain(secretFile);
           expect(said).not.toMatch(/Most likely: the name "named-no-secret" is already held/);
         } finally {
           fs.renameSync(parked, secretFile);
@@ -566,7 +570,7 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
         expect(r.stderr).toMatch(/VERDICT=REGISTER_FAILED reason="[^"]*registration secret[^"]*MINT_SECRET_REQUIRED/);
         const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
         expect(ctx).toMatch(/REGISTRATION FAILED/);
-        expect(ctx).toContain(secretFile);
+        expect(nativeSeps(ctx)).toContain(secretFile);
       } finally {
         fs.renameSync(parked, secretFile);
       }
