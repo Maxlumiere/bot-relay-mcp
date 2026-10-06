@@ -148,8 +148,12 @@ describe("the registration secret's chain fails CLOSED when any element is not p
       const { readMintSecret } = await import("../src/mint-secret.js");
       for (const el of chain(fresh())) {
         const inst = el.label === "the instance dir" ? el.p : el.dir ? path.dirname(el.p) : path.dirname(path.dirname(el.p));
+        // The DISCRIMINATING observation for the verdict cache (src/mint-secret.ts windowsFaults): a clean read FIRST,
+        // so every element's clean verdict is cached; then the ACL write; then a read AT ONCE must see it. If an ACL
+        // write did not move the cache key (ino, ctime, mtime), the cached clean verdict would answer: this fails.
+        expect(readMintSecret(inst), `${el.label}: clean, and now cached`).not.toBeNull();
         grant(el.p, "S-1-5-32-547", el.dir);
-        expect(() => readMintSecret(inst), el.label).toThrow(/S-1-5-32-547/);
+        expect(() => readMintSecret(inst), `${el.label}: the ACE added after a cached clean verdict is seen at once`).toThrow(/S-1-5-32-547/);
         ensureMintSecret(inst);
         expect(readMintSecret(inst), `${el.label}: the foreign ACE was removed`).not.toBeNull();
         grant(el.p, "S-1-5-18", el.dir); // SYSTEM: tolerated
