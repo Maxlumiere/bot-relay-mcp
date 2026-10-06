@@ -102,6 +102,14 @@ function ensureSecretsDir(instanceDir: string): string {
  */
 export function readMintSecret(instanceDir: string): string | null {
   const file = mintSecretPath(instanceDir);
+  // lstat FIRST: on Windows fs.constants.O_NOFOLLOW does not exist, so the open below would FOLLOW a planted link
+  // (MEASURED on windows-2022 CI: a symlink at this path was read and its value accepted). Refuse a link or a
+  // non-file here, on every OS; then the opened file must be the SAME file (dev + ino), so a swap between the
+  // lstat and the open is refused too.
+  const pre = lstatOrNull(file);
+  if (pre === null) return null;
+  if (pre.isSymbolicLink()) throw new MintSecretError(`${file} is a symlink: refusing to read the registration secret through it`);
+  if (!pre.isFile()) throw new MintSecretError(`${file} is not a regular file`);
   let fd: number;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW);
@@ -112,7 +120,9 @@ export function readMintSecret(instanceDir: string): string | null {
     throw err;
   }
   try {
-    if (!fs.fstatSync(fd).isFile()) throw new MintSecretError(`${file} is not a regular file`);
+    const post = fs.fstatSync(fd);
+    if (!post.isFile()) throw new MintSecretError(`${file} is not a regular file`);
+    if (post.ino !== pre.ino || post.dev !== pre.dev) throw new MintSecretError(`${file} changed while it was being opened: refusing it`);
     const text = fs.readFileSync(fd, "utf-8").trim();
     const fault = mintSecretFault(text);
     if (fault) throw new MintSecretError(`${file} is unusable: ${fault}`);

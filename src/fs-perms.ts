@@ -127,11 +127,11 @@ export function windowsAllowSids(path: string): string[] {
     "$ErrorActionPreference='Stop'; (Get-Acl -LiteralPath $env:RELAY_ACL_PATH).Access | " +
     "Where-Object { $_.AccessControlType -eq 'Allow' } | " +
     "ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }";
-  const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
-    encoding: "utf-8",
-    windowsHide: true,
-    env: { ...process.env, RELAY_ACL_PATH: path },
-  });
+  // PSModulePath is DROPPED: inherited from a PowerShell 7 parent it points Windows PowerShell 5.1 at the wrong
+  // module tree, and Get-Acl's module then fails to load (MEASURED on windows-2022 CI: CouldNotAutoloadMatchingModule).
+  const env: NodeJS.ProcessEnv = { ...process.env, RELAY_ACL_PATH: path };
+  delete env.PSModulePath;
+  const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf-8", windowsHide: true, env });
   if (r.status !== 0) throw new Error(`Get-Acl failed for "${path}": ${(r.stderr || "").trim()}`);
   return (r.stdout ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith("S-1-"));
 }

@@ -17,6 +17,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawn, spawnSync } from "child_process";
+import { pathToFileURL } from "url";
 import type { Server as HttpServer } from "http";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-d-")));
@@ -32,7 +33,10 @@ const { decryptContent } = await import("../src/encryption.js");
 const { checkMintGate, prepareMintSecret, mintSecretHome } = await import("../src/mint-gate.js");
 const { mintSecretPath, readMintSecret, ensureMintSecret } = await import("../src/mint-secret.js");
 
-afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
+afterAll(() => {
+  db.closeDb(); // Windows cannot delete an open database file (EBUSY)
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
 
 const SECRETS = path.join(ROOT, "secrets");
 function reset(): void {
@@ -244,7 +248,7 @@ describe("the secret file under concurrency", () => {
     // after the build). CI and the publish gate build before the tests; a stale dist fails the race loudly.
     const mod = path.resolve("dist/mint-secret.js");
     expect(fs.existsSync(mod), "dist/mint-secret.js is built (npm run build)").toBe(true);
-    const child = `const { ensureMintSecret, readMintSecret } = await import(${JSON.stringify(mod)}); const go = Number(process.argv[1]); while (Date.now() < go) {} try { ensureMintSecret(${JSON.stringify(dir)}); console.log("OK " + readMintSecret(${JSON.stringify(dir)})); } catch (e) { console.log("ERR " + e.message); }`;
+    const child = `const { ensureMintSecret, readMintSecret } = await import(${JSON.stringify(pathToFileURL(mod).href)}); const go = Number(process.argv[1]); while (Date.now() < go) {} try { ensureMintSecret(${JSON.stringify(dir)}); console.log("OK " + readMintSecret(${JSON.stringify(dir)})); } catch (e) { console.log("ERR " + e.message); }`;
     const runOne = (go: string) =>
       new Promise<string>((resolve) => {
         const p = spawn(process.execPath, ["--no-warnings", "--input-type=module", "-e", child, go], { stdio: ["ignore", "pipe", "pipe"] });
