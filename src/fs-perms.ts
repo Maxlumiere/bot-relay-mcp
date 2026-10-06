@@ -20,6 +20,8 @@
 
 import fs from "fs";
 import { spawnSync } from "child_process";
+import { tmpdir as osTmpdir } from "os";
+import { join as pathJoin } from "path";
 import { log } from "./logger.js";
 
 /** Chmod an existing file to the requested mode. Best-effort; log.warn on failure. */
@@ -117,23 +119,61 @@ export function restrictToOwnerWindows(path: string, isDir: boolean): void {
   }
 }
 
+/** SDDL's two-letter aliases for the well-known SIDs this check cares about (SDDL is not localized). */
+const SDDL_ALIASES: Readonly<Record<string, string>> = Object.freeze({ WD: "S-1-1-0", BU: "S-1-5-32-545", AU: "S-1-5-11" });
+
 /**
- * The allow ACEs on `path`, as SIDs (Windows only; PowerShell Get-Acl, each identity translated to its SID so
- * the answer does not depend on the OS language). Throws when the ACL cannot be read: a check that cannot read
- * must not pass.
+ * The SIDs of the ALLOW ACEs in an SDDL string's DACL ("D:" part). Each ACE is `(type;flags;rights;obj;inh;sid)`;
+ * types A (allow) and OA (object allow) count. An alias in SDDL_ALIASES is mapped to its SID; other aliases are
+ * kept as written (they are not among the forbidden ones). Pure: unit-tested on every OS.
+ */
+export function sddlAllowSids(sddl: string): string[] {
+  // STRUCTURED, not a regex over the whole string (MEASURED: a character-class stop at "S" cut the DACL at the first
+  // SID or the SY alias): from "D:", skip the DACL's flag letters, then read consecutive "(...)" ACEs and stop at the
+  // first character that does not open one (a following "S:" SACL, or the end).
+  const text = sddl.replace(/\s+/g, "");
+  let i = text.indexOf("D:");
+  const aces: string[] = [];
+  if (i >= 0) {
+    i += 2;
+    while (i < text.length && /[A-Z]/.test(text[i]) && text[i] !== "(") i++; // P, AI, AR, ... flags
+    while (text[i] === "(") {
+      const close = text.indexOf(")", i);
+      if (close < 0) break;
+      aces.push(text.slice(i + 1, close));
+      i = close + 1;
+    }
+  }
+  const out: string[] = [];
+  for (const ace of aces) {
+    const f = ace.split(";");
+    if (f.length < 6 || (f[0] !== "A" && f[0] !== "OA")) continue;
+    const sid = f[5];
+    out.push(SDDL_ALIASES[sid] ?? sid);
+  }
+  return out;
+}
+
+/**
+ * The allow ACEs on `path`, as SIDs (Windows only). `icacls <path> /save <file>` writes the ACL as SDDL, which is
+ * language-independent (account names and icacls's display are localized; SIDs and SDDL are not). MEASURED on
+ * windows-2022 CI: PowerShell's Get-Acl could not load its module when launched from Node, with or without
+ * PSModulePath, so PowerShell is not used. Throws when the ACL cannot be read: a check that cannot read must not pass.
  */
 export function windowsAllowSids(path: string): string[] {
-  const script =
-    "$ErrorActionPreference='Stop'; (Get-Acl -LiteralPath $env:RELAY_ACL_PATH).Access | " +
-    "Where-Object { $_.AccessControlType -eq 'Allow' } | " +
-    "ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }";
-  // PSModulePath is DROPPED: inherited from a PowerShell 7 parent it points Windows PowerShell 5.1 at the wrong
-  // module tree, and Get-Acl's module then fails to load (MEASURED on windows-2022 CI: CouldNotAutoloadMatchingModule).
-  const env: NodeJS.ProcessEnv = { ...process.env, RELAY_ACL_PATH: path };
-  delete env.PSModulePath;
-  const r = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf-8", windowsHide: true, env });
-  if (r.status !== 0) throw new Error(`Get-Acl failed for "${path}": ${(r.stderr || "").trim()}`);
-  return (r.stdout ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith("S-1-"));
+  const tmp = pathJoin(osTmpdir(), `relay-acl-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.sddl`);
+  try {
+    const r = spawnSync("icacls", [path, "/save", tmp], { encoding: "utf-8", windowsHide: true });
+    if (r.status !== 0) throw new Error(`icacls /save failed for "${path}" (exit ${r.status}): ${(r.stderr || r.stdout || "").trim()}`);
+    const raw = fs.readFileSync(tmp);
+    // icacls writes UTF-16LE (with or without a BOM): the file's lines are the path, then its SDDL.
+    const text = raw.toString(raw[0] === 0xff && raw[1] === 0xfe ? "utf16le" : raw.includes(0) ? "utf16le" : "utf8").replace(/^\uFEFF/, "");
+    const sddl = text.split(/\r?\n/).find((l) => /D:/.test(l));
+    if (!sddl) throw new Error(`icacls /save for "${path}" produced no DACL`);
+    return sddlAllowSids(sddl);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
 }
 
 /**

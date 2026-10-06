@@ -61,3 +61,15 @@ describe("the relay's private files are private to their owner (Q6, on every OS)
     }
   });
 });
+
+describe("the SDDL reader (the Windows ACL check's parser, unit-tested on every OS)", () => {
+  it("maps the forbidden aliases to their SIDs and keeps only ALLOW aces", async () => {
+    const { sddlAllowSids } = await import("../src/fs-perms.js");
+    // owner-only (a SID), SYSTEM (SY) and Administrators (BA): none forbidden
+    expect(sddlAllowSids("D:PAI(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")).toEqual(["S-1-5-21-1-2-3-1001", "SY", "BA"]);
+    // Everyone, Users, Authenticated Users as aliases AND as raw SIDs
+    expect(sddlAllowSids("D:(A;;FR;;;WD)(A;;FR;;;BU)(A;;FR;;;AU)(A;;FR;;;S-1-1-0)")).toEqual(["S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-1-0"]);
+    // a DENY ace for Everyone is not an allow; a SACL part after the DACL is ignored
+    expect(sddlAllowSids("O:BAG:SYD:(D;;FA;;;WD)(A;;FA;;;S-1-5-21-9)S:(AU;SA;FA;;;WD)")).toEqual(["S-1-5-21-9"]);
+  });
+});
