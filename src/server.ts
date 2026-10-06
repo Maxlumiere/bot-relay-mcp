@@ -1149,7 +1149,7 @@ export function createServer(): Server {
       // real token verification, but register_agent never routes through the
       // dispatcher's verified-token cache-put — so this exit is where it must
       // stamp first_authed_at, or the orphan-GC would reap a live re-authed agent.
-      if (!result.legacy) markAgentAuthenticated(claimedName);
+      if (!result.legacy) markAgentAuthenticated(claimedName, { basis: result.matched ?? "current", hash: result.matched === "previous" ? existing.previous_token_hash : existing.token_hash });
       return allow(
         result.legacy
           ? { kind: "none", why: "legacy-grace" }

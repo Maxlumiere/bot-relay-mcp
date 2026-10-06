@@ -2706,7 +2706,7 @@ function verifiedTokenCachePut(
   // has authed ≥1x has a non-NULL first_authed_at → it self-excludes from
   // abandon_registration (the sole orphan-deletion path; the auto-GC was cut
   // by final ruling — see the comment above REAPABLE_ORPHAN_WHERE).
-  markAgentAuthenticated(name);
+  markAgentAuthenticated(name, { basis: matchedColumn === "token_lookup" ? "current" : "previous", hash: matchedColumn === "token_lookup" ? row.token_hash : row.previous_token_hash });
   if (indexed) {
     // The EVIDENCE: the hash on the row the verify ran against, for the matched column.
     const basis = matchedColumn === "token_lookup" ? "current" : "previous";
@@ -2748,7 +2748,29 @@ export function markEstablished(name: string): void {
  * literal "first TOKEN auth" marker; idempotent) AND establishes the identity
  * via markEstablished (which carries the reap invariant + handle retirement).
  */
-export function markAgentAuthenticated(name: string): void {
+/**
+ * PR-B: is the credential an awaited verify matched STILL this row's? A pure READ (the stamp's guard). SYNC: the
+ * caller writes right after it, with no await between, so within this process the check and the write are atomic
+ * (across processes: the ADR-0050 residual, SECURITY.md). Kept apart from the write ON PURPOSE: scripts/auth-gen-guard
+ * scopes loosely (an `UPDATE agents SET` in a body that also NAMES a credential column must bump the generation, the
+ * safe over-inclusion), and the stamp changes no token's validity, so it must neither bump nor need an exception.
+ */
+export function credentialStillOnRow(name: string, evidence: { basis: "current" | "previous"; hash: string | null | undefined }): boolean {
+  if (!evidence.hash) return false;
+  const row = getDb()
+    .prepare("SELECT token_hash, previous_token_hash FROM agents WHERE name = ?")
+    .get(name) as { token_hash: string | null; previous_token_hash: string | null } | undefined;
+  if (!row) return false;
+  return (evidence.basis === "current" ? row.token_hash : row.previous_token_hash) === evidence.hash;
+}
+
+export function markAgentAuthenticated(name: string, evidence: { basis: "current" | "previous"; hash: string | null | undefined }): void {
+  // PR-B (Codex final round on #308; architect baf51ccc): a DERIVED WRITE of an awaited verify, guarded by the
+  // EVIDENCE: it stamps only the row whose matched credential IS the one verified. A same-name replacement
+  // (unregister + re-register during the compare) has a new hash and is left untouched: its first_authed_at AND its
+  // registration recovery handle (which markEstablished retires). No evidence, no stamp (nothing was proven).
+  // At the WRITE, not the dispatch, so every caller is guarded (dispatch, health_check, the dashboard send).
+  if (!credentialStillOnRow(name, evidence)) return;
   getDb()
     .prepare("UPDATE agents SET first_authed_at = ? WHERE name = ? AND first_authed_at IS NULL")
     .run(now(), name);

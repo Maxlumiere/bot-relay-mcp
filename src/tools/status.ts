@@ -236,7 +236,7 @@ async function checkToken(token: string): Promise<TokenCheckResult> {
     // verification — stamp first_authed_at so an agent whose only interaction is
     // health_check still self-excludes from the orphan-GC. This diagnostic path
     // re-verifies and never touches the cache, so it must stamp explicitly.
-    if (!result.legacy) markAgentAuthenticated(auth.name);
+    if (!result.legacy) markAgentAuthenticated(auth.name, { basis: result.matched ?? "current", hash: result.matched === "previous" ? auth.previous_token_hash : auth.token_hash });
     return { auth_error: false, agent_name: auth.name, auth_state: state };
   }
   return {

@@ -1170,7 +1170,7 @@ export function startHttpServer(port: number, host: string): Server {
       // ADR-0005 (codex #115): a verified from_agent_token IS a successful token
       // verification — stamp first_authed_at so this agent (incl. `relay send`
       // callers, which POST here) can never be reaped by the orphan-GC.
-      markAgentAuthenticated(parsed.data.from);
+      markAgentAuthenticated(parsed.data.from, { basis: "current", hash: fromRow.token_hash });
     } else if (fromAgentToken) {
       // No registered row OR row has no token_hash, but caller supplied
       // a token anyway. Pre-v2.7.1 this returned 403 with a confusing

@@ -247,3 +247,42 @@ describe("authority from the FRESH row, never the verdict (architect 6f35008c)",
     expect(denied.body.error_code, "the twin without the capability is refused").toBe("CAP_DENIED");
   });
 });
+
+describe("DERIVED WRITES are CAS on the evidence (Codex final round on #308): a same-name REPLACEMENT is never stamped", () => {
+  /** During the old token's compare, the name is unregistered and re-registered: a NEW row, new token, unestablished, with a recovery handle. */
+  const replaceDuringCompare = (name: string) =>
+    atCompare(1, () => {
+      db.unregisterAgent(name);
+      db.registerAgent(name, "worker", []);
+    });
+  const stateOf = (name: string) =>
+    db.getDb().prepare("SELECT first_authed_at, established_at, registration_recovery_hash FROM agents WHERE name = ?").get(name) as {
+      first_authed_at: string | null;
+      established_at: string | null;
+      registration_recovery_hash: string | null;
+    };
+  for (const [label, run] of [
+    ["explicit (get_messages)", (f: Fixture) => call("get_messages", { agent_name: f.name }, f.token)],
+    ["token-only (discover_agents)", (f: Fixture) => call("discover_agents", {}, f.token)],
+    ["health_check", (f: Fixture) => call("health_check", {}, f.token)],
+  ] as const) {
+    it(`${label}: the OLD token's call is refused AND the replacement's first_authed_at + recovery handle are untouched`, async () => {
+      const f = activeAgent(`replaced-${label.split(" ")[0]}`);
+      db.getDb().prepare("UPDATE agents SET first_authed_at = NULL, established_at = NULL WHERE name = ?").run(f.name); // the old row was not stamped yet either
+      const fired = replaceDuringCompare(f.name);
+      const r = await run(f);
+      expect(fired(), "the replacement landed during the compare").toBe(true);
+      const after = stateOf(f.name);
+      expect(after.first_authed_at, "the replacement row was stamped by the OLD token's verify").toBeNull();
+      expect(after.established_at).toBeNull();
+      expect(after.registration_recovery_hash, "the replacement's recovery handle was retired by the OLD token's verify").not.toBeNull();
+      if (label !== "health_check") expect(r.isError, `served on the old token: ${JSON.stringify(r.body)}`).toBe(true);
+    });
+  }
+  it("control: with NO replacement, the verify DOES stamp its own row (the CAS matches)", async () => {
+    const f = activeAgent("stamped");
+    db.getDb().prepare("UPDATE agents SET first_authed_at = NULL, established_at = NULL WHERE name = ?").run(f.name);
+    expect((await call("get_messages", { agent_name: f.name }, f.token)).isError).toBe(false);
+    expect(stateOf(f.name).first_authed_at).not.toBeNull();
+  });
+});
