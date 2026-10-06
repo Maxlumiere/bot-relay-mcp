@@ -80,7 +80,10 @@ async function register(port: number, name: string, headers: Record<string, stri
   const json = JSON.parse(text.startsWith("event:") ? text.split("\n").find((l) => l.startsWith("data:"))!.slice(5) : text);
   return { isError: json.result?.isError === true, body: JSON.parse(json.result.content[0].text) };
 }
-const secretNow = () => readMintSecret(ROOT)!;
+const secretNow = Object.assign(() => readMintSecret(ROOT)!, {
+  /** The file's text WITHOUT the chain check: the correct value, even while the chain is deliberately not private. */
+  unchecked: () => fs.readFileSync(mintSecretPath(ROOT), "utf-8").trim(),
+});
 
 describe("the gate: a NEW name over HTTP needs the registration secret", () => {
   it("HARM: no secret → refused, MINT_SECRET_REQUIRED, and NO row is created", async () => {
@@ -141,6 +144,26 @@ describe("fail closed, audited, throttled", () => {
       expect(health.mint).toBe("unavailable");
     });
     expect(db.getAgentAuthData("after-delete")).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")("Codex R1 #2: a secrets dir opened to the group AFTER start → the CORRECT secret is refused, and a LOOPBACK /health names the path (mint_fault)", async () => {
+    await withDaemon(async (port) => {
+      const dir = path.dirname(mintSecretPath(ROOT));
+      fs.chmodSync(dir, 0o770);
+      try {
+        const r = await register(port, "chain-open", { "X-Relay-Secret": secretNow.unchecked() });
+        expect(r.body.error_code).toBe("MINT_SECRET_REQUIRED");
+        const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+        expect(health.mint).toBe("unavailable");
+        expect(health.mint_fault).toMatch(new RegExp(`${dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} has mode 0770`));
+        expect(JSON.stringify(health)).not.toContain(secretNow.unchecked());
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+      // The known-good twin: the same secret, the chain private again → accepted.
+      expect((await register(port, "chain-closed", { "X-Relay-Secret": secretNow() })).body.success).toBe(true);
+    });
+    expect(db.getAgentAuthData("chain-open")).toBeNull();
   });
 
   it("a symlink planted at the secret's path is never followed (fail closed)", async () => {
@@ -330,11 +353,11 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
 });
 
 describe("a SessionStart hook that runs TWICE in one window (architect 3f041f24)", () => {
-  const regAs = async (port: number, name: string, token: string | undefined, pid: number, start: string, extra: Record<string, string> = {}) => {
+  const regAs = async (port: number, name: string, token: string | undefined, pid: number, start: string, extra: Record<string, string> = {}, host: string | null = "host-A", role = "worker") => {
     const r = await fetch(`http://127.0.0.1:${port}/mcp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...(token ? { "X-Agent-Token": token } : {}), ...extra },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "register_agent", arguments: { name, role: "worker", capabilities: [], agent_pid: pid, agent_pid_start: start, host_id: "host-A" } } }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "register_agent", arguments: { name, role, capabilities: [], agent_pid: pid, agent_pid_start: start, ...(host === null ? {} : { host_id: host }) } } }),
     });
     const text = await r.text();
     const json = JSON.parse(text.startsWith("event:") ? text.split("\n").find((l) => l.startsWith("data:"))!.slice(5) : text);
@@ -358,6 +381,36 @@ describe("a SessionStart hook that runs TWICE in one window (architect 3f041f24)
       const token = first.body.agent_token as string;
       expect((await regAs(port, "held", token, 5001, "s-1")).body.error_code).toBe("NAME_COLLISION_ACTIVE");
       expect((await regAs(port, "held", token, 5000, "s-2")).body.error_code).toBe("NAME_COLLISION_ACTIVE"); // a recycled pid
+    });
+  });
+
+  it("Codex R1 #4: host_id is REQUIRED on both sides and equal: an omitted or different host is a collision", async () => {
+    await withDaemon(async (port) => {
+      const first = await regAs(port, "hosted", undefined, 6000, "h-1", { "X-Relay-Secret": secretNow() });
+      const token = first.body.agent_token as string;
+      expect((await regAs(port, "hosted", token, 6000, "h-1", {}, null)).body.error_code, "the caller omits host_id").toBe("NAME_COLLISION_ACTIVE");
+      expect((await regAs(port, "hosted", token, 6000, "h-1", {}, "host-B")).body.error_code, "another host").toBe("NAME_COLLISION_ACTIVE");
+      // The row itself has no host_id: no refresh can be proven, whatever the caller says.
+      const bare = await regAs(port, "hostless", undefined, 6001, "h-2", { "X-Relay-Secret": secretNow() }, null);
+      const bareToken = bare.body.agent_token as string;
+      expect((await regAs(port, "hostless", bareToken, 6001, "h-2", {}, "host-A")).body.error_code, "the row has no host").toBe("NAME_COLLISION_ACTIVE");
+      expect((await regAs(port, "hostless", bareToken, 6001, "h-2", {}, null)).body.error_code, "neither side has a host").toBe("NAME_COLLISION_ACTIVE");
+      // The known-good control: the same process on the same host still refreshes.
+      expect((await regAs(port, "hosted", token, 6000, "h-1")).body.refreshed).toBe(true);
+    });
+  });
+
+  it("a refresh is a strict NO-OP: nothing rotated, minted or re-bound (even when the call asks for another role)", async () => {
+    const snapshot = (name: string) =>
+      db.getDb().prepare("SELECT token_hash, previous_token_hash, token_lookup, session_id, auth_state, role, capabilities, agent_pid, agent_pid_start, host_id, recovery_token_hash FROM agents WHERE name = ?").get(name);
+    await withDaemon(async (port) => {
+      const first = await regAs(port, "noop", undefined, 7000, "n-1", { "X-Relay-Secret": secretNow() });
+      const token = first.body.agent_token as string;
+      const before = snapshot("noop");
+      const again = await regAs(port, "noop", token, 7000, "n-1", {}, "host-A", "another-role");
+      expect(again.body.refreshed).toBe(true);
+      expect(again.body.agent_token, "no token is minted").toBeUndefined();
+      expect(snapshot("noop")).toEqual(before);
     });
   });
 });
@@ -421,6 +474,37 @@ describe("every register path that ISSUES a token, by the harm predicate (Q-A)",
       const r = await call(port, { name: "recovering2" }, { "X-Relay-Secret": secretNow() });
       expect(r.isError).toBe(true);
       expect(r.body.agent_token).toBeUndefined();
+    });
+  });
+
+  it("HARM (Codex R1 #1): on_name_collision:\"suffix\" with ONE agent's token and NO secret never mints a relay-assigned <name>-N", async () => {
+    // Before: the dispatcher authenticated the REQUESTED (held) name with its token and skipped the gate, then the
+    // handler allocated "<name>-N" and registerAgent issued it a token: one token -> unlimited new identities.
+    await withDaemon(async (port) => {
+      const first = await call(port, { name: "suffix-base" }, { "X-Relay-Secret": secretNow() });
+      expect(first.body.success, JSON.stringify(first.body)).toBe(true);
+      const token = first.body.agent_token as string;
+      expect(typeof token).toBe("string");
+      // The base name is now actively held (just registered over HTTP): a second register collides.
+      const r = await call(port, { name: "suffix-base", on_name_collision: "suffix" }, { "X-Agent-Token": token });
+      expect(r.isError).toBe(true);
+      expect(r.body.error_code).toBe("MINT_SECRET_REQUIRED");
+      expect(r.body.agent_token).toBeUndefined();
+      expect(db.getAgentAuthData("suffix-base-2"), "no suffixed identity was created").toBeNull();
+      // A free slot that EXISTS (offline, drained) is a reuse: it issues that row a token too, so it is gated alike.
+      db.registerAgent("suffix-base-2", "worker", []);
+      db.getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = ?").run("suffix-base-2");
+      expect(db.isNameActivelyHeld(db.getAgentAuthData("suffix-base-2")!), "the fixture is a FREE (reusable) slot").toBe(false);
+      const before = db.getAgentAuthData("suffix-base-2")!.token_hash;
+      const reuse = await call(port, { name: "suffix-base", on_name_collision: "suffix" }, { "X-Agent-Token": token });
+      expect(reuse.body.error_code).toBe("MINT_SECRET_REQUIRED");
+      expect(db.getAgentAuthData("suffix-base-2")!.token_hash, "the existing slot's credential is untouched").toBe(before);
+      db.getDb().prepare("DELETE FROM agents WHERE name = ?").run("suffix-base-2");
+      // The known-good control: WITH the secret, the same call allocates the suffix (the branch really runs).
+      const ok = await call(port, { name: "suffix-base", on_name_collision: "suffix" }, { "X-Agent-Token": token, "X-Relay-Secret": secretNow() });
+      expect(ok.body.success, JSON.stringify(ok.body)).toBe(true);
+      expect(ok.body.agent?.name).toBe("suffix-base-2");
+      expect(typeof ok.body.agent_token).toBe("string");
     });
   });
 

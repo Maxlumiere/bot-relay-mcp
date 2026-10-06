@@ -37,7 +37,7 @@ import {
 } from "./boundary-checks.js";
 import { loadConfig, resolveDashboardSecret, getConfigPath } from "../config.js";
 import { log } from "../logger.js";
-import { mintMode, prepareMintSecret } from "../mint-gate.js";
+import { mintFault, mintMode, prepareMintSecret } from "../mint-gate.js";
 import { pushKanbanSnapshotOnce } from "../dashboard-push.js";
 import { requestContext } from "../request-context.js";
 import { canonicalCidr, canonicalIp, cidrContains, formatIp, isLoopbackPeer, type CanonicalCidr } from "../cidr.js";
@@ -567,7 +567,8 @@ export function startHttpServer(port: number, host: string): Server {
   const bootConfigPath = getConfigPath();
 
   // Health check (auth-free)
-  app.get("/health", (_req: Request, res: Response) => {
+  app.get("/health", (req: Request, res: Response) => {
+    const mint = mintMode();
     res.json({
       status: "ok",
       version: VERSION,
@@ -580,7 +581,10 @@ export function startHttpServer(port: number, host: string): Server {
       auth_required: !!config.http_secret,
       // PR-D (Q1, Q5): whether creating a NEW agent name over HTTP needs the registration secret. Anything
       // but "secret" is a deploy-check FAIL; "open-dev" is RELAY_ALLOW_OPEN_MINT=1 (loopback only).
-      mint: mintMode(),
+      mint,
+      // Codex R1 #2: WHY the secret is unusable (the offending path, and the uid, mode or SID), only to a LOOPBACK
+      // caller: /health is auth-free and may face a network on a hub bind, and the reason names local paths.
+      ...(mint === "unavailable" && isLoopbackPeer(req.socket.remoteAddress) ? { mint_fault: mintFault() } : {}),
       // v2.15.2 — MONOTONIC process uptime (process.uptime(), NOT Date.now
       // wall-clock, which can jump on clock adjustments). A follow-on Tether
       // health-poll uses this as a silent-death detector: a decrease across

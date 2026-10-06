@@ -17,8 +17,12 @@
  *   2. Call `register_agent` on the hub via HTTP. If the hub returns 401,
  *      prompt for `RELAY_HTTP_SECRET` and retry once (or use --secret /
  *      env on the first call).
- *   3. Capture the returned `agent_token` and emit a ready-to-paste MCP
- *      client config snippet to stdout (or --output path).
+ *   3. Capture the returned `agent_token` and write a ready-to-paste MCP
+ *      client config snippet to --output (required; created 0600, never
+ *      overwriting). Stdout gets a REDACTED copy: the snippet carries the
+ *      agent's token (and, on a hub that gates every call, its secret), and a
+ *      credential CLI never prints one inside a composite field (PR-D, Codex
+ *      R1 #3; ADR-0036 S4).
  *   4. Print next-steps guidance.
  *
  * Exit codes:
@@ -34,6 +38,7 @@ import * as readline from "readline/promises";
 import fs from "fs";
 import path from "path";
 import { withDeadline } from "../http-deadline.js";
+import { restrictToOwnerWindows } from "../fs-perms.js";
 
 interface Args {
   hubUrl: string | null;
@@ -141,7 +146,8 @@ function printUsage(requested = false): void {
       "  --name NAME            Agent name (default: prompts interactively)\n" +
       "  --role ROLE            Agent role (default: 'user')\n" +
       "  --capabilities CSV     Comma-separated capabilities (default: none)\n" +
-      "  --output PATH          Write MCP client config to PATH (default: stdout)\n" +
+      "  --output PATH          REQUIRED. Write the MCP client config to PATH (created 0600; an existing\n" +
+      "                         file is never overwritten). It holds the agent's token, so it is never printed.\n" +
       "  --secret-file PATH     File holding the hub's secret (its registration secret: the hub operator\n" +
       "                         finds it at <relay instance dir>/secrets/mint.secret and hands it over)\n" +
       "  --secret-stdin         Read the hub's secret from stdin (first line)\n" +
@@ -239,6 +245,23 @@ async function promptInteractive(msg: string): Promise<string> {
   }
 }
 
+/** True when anything (a file, a directory, a symlink, even a dangling one) is at `p`. */
+function pathExists(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The snippet with every header VALUE replaced by a pointer to the file: the names stay, so the shape is visible. */
+function redactSnippet(snippet: { "bot-relay": { headers: Record<string, string> } & Record<string, unknown> }, file: string): string {
+  const entry = snippet["bot-relay"];
+  const headers = Object.fromEntries(Object.keys(entry.headers).map((k) => [k, `<in ${file}>`]));
+  return JSON.stringify({ "bot-relay": { ...entry, headers } }, null, 2);
+}
+
 export async function run(argv: string[]): Promise<number> {
   let args: Args;
   try {
@@ -262,6 +285,19 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   const hubBase = `${url.protocol}//${url.host}`;
+
+  // PR-D (Codex R1 #3): the config carries credentials, so it only ever goes to a file. Checked BEFORE any network
+  // call, so a token is never issued that this run could not store. The write itself is O_EXCL (authoritative).
+  if (!args.output) {
+    process.stderr.write(
+      "relay pair: --output PATH is required. The client config holds the agent's token (and, on a hub that gates every call, its secret), so it is written to a file (0600) and never printed.\n",
+    );
+    return 1;
+  }
+  if (pathExists(args.output)) {
+    process.stderr.write(`relay pair: ${args.output} already exists. pair never overwrites a credential file: remove it or choose another --output.\n`);
+    return 1;
+  }
 
   // --- Step 1: probe /health ---
   let healthBody: any = null;
@@ -437,43 +473,48 @@ export async function run(argv: string[]): Promise<number> {
   };
   const snippetText = JSON.stringify(snippet, null, 2);
 
-  if (args.output) {
-    try {
-      const parent = path.dirname(args.output);
-      if (parent && parent !== "." && !fs.existsSync(parent)) {
-        fs.mkdirSync(parent, { recursive: true });
-      }
-      fs.writeFileSync(args.output, snippetText + "\n", { mode: 0o600 });
-      process.stdout.write(`\nWrote MCP client config snippet to ${args.output} (mode 0600)\n`);
-    } catch (err) {
-      process.stderr.write(
-        `relay pair: could not write --output ${args.output}: ${
-          err instanceof Error ? err.message : String(err)
-        }\n`
-      );
-      return 1;
+  const outPath = args.output;
+  try {
+    const parent = path.dirname(outPath);
+    if (parent && parent !== "." && !fs.existsSync(parent)) {
+      fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
     }
-  } else {
-    process.stdout.write("\n--- MCP client config snippet ---\n");
-    process.stdout.write(snippetText + "\n");
-    process.stdout.write("--- end snippet ---\n");
+    // "wx" = O_CREAT|O_EXCL: never follows or replaces anything already at the path (a file with looser modes, a
+    // planted symlink). 0600 from creation, so the token is never readable by another user for an instant.
+    const fd = fs.openSync(outPath, "wx", 0o600);
+    try {
+      fs.writeSync(fd, snippetText + "\n");
+    } finally {
+      fs.closeSync(fd);
+    }
+    restrictToOwnerWindows(outPath, false);
+  } catch (err) {
+    process.stderr.write(
+      `relay pair: "${agentName}" was registered on the hub, but its config could not be written to ${outPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }. Its token is NOT printed. Ask the hub operator to run 'relay recover ${agentName}' on the hub, then pair again with a writable --output.\n`,
+    );
+    return 1;
   }
+  process.stdout.write(`\nWrote the MCP client config to ${outPath} (mode 0600). Its credentials are redacted below:\n`);
+  process.stdout.write("--- MCP client config snippet (redacted) ---\n");
+  process.stdout.write(redactSnippet(snippet, outPath) + "\n");
+  process.stdout.write("--- end snippet ---\n");
 
   // --- Step 6: next-steps guidance ---
   process.stdout.write(
     `\nPaired "${agentName}" with ${hubBase}.\n\n` +
       "Next steps:\n" +
-      "  1. Paste the snippet above into your MCP client config:\n" +
+      `  1. Merge the "bot-relay" entry from ${outPath} into your MCP client config:\n` +
       "     - Claude Code:  ~/.claude.json   (under \"mcpServers\")\n" +
       "     - Cursor:       ~/.cursor/mcp.json\n" +
       "     - Custom:       consult your client's MCP config docs\n" +
-      "  2. Persist the token for SessionStart / hook flows:\n" +
-      `       export RELAY_AGENT_TOKEN=${token}\n` +
-      "     (append to your ~/.zshrc / ~/.bashrc for persistence)\n" +
+      `  2. For SessionStart / hook flows, the agent's token is headers["X-Agent-Token"] in ${outPath}\n` +
+      "     (load it from that file; never paste it into a shell history)\n" +
       `  3. Verify the connection:\n` +
       `       relay doctor --remote ${hubBase}\n` +
-      "\nThe token is shown ONCE — the hub stores only a bcrypt hash.\n" +
-      "Save it now; lost tokens require 'relay recover <agent>' on the hub.\n"
+      `\nThe token exists only in ${outPath}: the hub stores only a bcrypt hash.\n` +
+      "Keep that file; a lost token requires 'relay recover <agent>' on the hub.\n"
   );
 
   return 0;

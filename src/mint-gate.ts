@@ -67,6 +67,16 @@ export function mintMode(): "secret" | "open-dev" | "unavailable" {
   }
 }
 
+/** Why the secret is unusable (absent, malformed, or its chain not private: the path and uid, mode or SID), or null when it is usable or minting is open. Never the secret itself. */
+export function mintFault(): string | null {
+  if (openMintAllowed()) return null;
+  try {
+    return readMintSecret(mintSecretHome()) !== null ? null : `no registration secret at ${mintSecretHome()} (restart the daemon, or run \`relay init\`)`;
+  } catch (err) {
+    return (err as Error).message;
+  }
+}
+
 /**
  * At HTTP daemon start (Q4, Q5, Q8). `loopback`: whether the bind host is a loopback literal.
  *   - RELAY_ALLOW_OPEN_MINT=1 on a NON-loopback bind: THROWS (the daemon refuses to start). On loopback it

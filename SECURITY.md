@@ -72,6 +72,14 @@ Another PROCESS writing the same database file can. A CLI verb (`relay recover`,
 
 `register_agent` with `on_name_collision: "suffix"` is authorized by the BASE name's token, but when the base name is held it registers, or reuses, an offline and drained `<name>-N` row. The check before the handler is about the base row; the effect lands on the `<name>-N` row, which carries no check of its own. So a caller holding the base name's token can take over a drained `<name>-N` slot. The principle that closes it, recorded for ADR-0050: an effect on a row other than the verdict's subject needs its own predicate on that row.
 
+Over HTTP, a suffix allocation also needs the relay's registration secret, exactly like a new name, because it issues a token for an identity the caller holds no credential for. So the residual above now needs both the base name's token and the registration secret.
+
+### A same-process refresh is a safety guard, not an authority boundary
+
+When the SessionStart hook runs twice in one window, its second `register_agent` finds the name held by itself. If the call names the same agent process as the row (`agent_pid`, `agent_pid_start` and `host_id`, all present and equal), it is answered as a refresh: a strict no-op. Nothing is rotated, minted or re-bound. Any other caller gets `NAME_COLLISION_ACTIVE`.
+
+Those three values are the caller's own claims. This guards against an accidental second holder, which presents its own process and so collides. It is not an authority boundary: a same-user process that holds the name's token can copy a live holder's values and receive a refresh. It gains nothing it did not already have, since the token lets it read and send as that name.
+
 This document describes the threat model bot-relay-mcp defends against, the mechanisms that enforce those defenses, and — crucially — what the project does NOT protect. It closes with the vulnerability-disclosure process.
 
 ---

@@ -19,11 +19,18 @@
  *     loud fault, not a silent replacement (operator data).
  *   - Clients read it AT USE TIME, never cached, so a rotation needs no restart.
  *   - Every open is no-follow: a symlink planted at the path is refused, never followed.
+ *   - THE CHAIN (Codex R1 #2, architect e9ad940d): the secret is usable only when every element that controls its
+ *     bytes is private to this relay's user: the instance dir, the secrets dir and the file. A foreign WRITE on
+ *     any of them lets that principal plant a known value (a parent: rename secrets/ away and recreate it). POSIX:
+ *     each owned by the daemon's euid, with no group or other bits (0700 dirs, 0600 file); the file is checked
+ *     through the OPENED descriptor (fstat), so a path swap cannot pass it. Windows: owner-only ACLs (the user, and
+ *     SYSTEM tolerated), read by path (a residual: no handle-based ACL read here, bounded by the parent chain).
+ *     A chain fault is a MintSecretError naming the path (and the uid, mode or SID): the gate fails CLOSED.
  */
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { restrictToOwnerWindows } from "./fs-perms.js";
+import { restrictToOwnerWindows, windowsForeignAllowSids } from "./fs-perms.js";
 
 export const MINT_SECRET_DIR = "secrets";
 export const MINT_SECRET_FILE = "mint.secret";
@@ -44,6 +51,70 @@ export class MintSecretError extends Error {
     super(message);
     this.name = "MintSecretError";
   }
+}
+
+/** Test seam for the ownership check: the uid the chain must belong to (null where the OS has none, Windows). */
+export const mintChainSeams: { euid: () => number | null } = {
+  euid: () => (typeof process.geteuid === "function" ? process.geteuid() : null),
+};
+
+/** A POSIX chain element's fault (a stat of a dir, or the opened file's fstat), or null. */
+function posixFault(p: string, st: fs.Stats, kind: "dir" | "file"): string | null {
+  if (kind === "dir" ? !st.isDirectory() || st.isSymbolicLink() : !st.isFile()) return `${p} is not a ${kind === "dir" ? "directory" : "regular file"}`;
+  const euid = mintChainSeams.euid();
+  if (euid !== null && st.uid !== euid) return `${p} is owned by uid ${st.uid}, not by this relay's uid ${euid}`;
+  if (st.mode & 0o077) return `${p} has mode 0${(st.mode & 0o777).toString(8)}: group or other bits set (it must be ${kind === "dir" ? "0700" : "0600"})`;
+  return null;
+}
+
+/**
+ * Windows chain verdicts, cached by the element's identity AND change time (ino, ctime, mtime). A read happens on
+ * every gate check and every /health, and each uncached read is a synchronous icacls spawn: uncached, an
+ * unauthenticated flood of refused registers would block the event loop (the PR-B class). The cache is only safe
+ * if an ACL write moves the key: the Windows CI test grants a foreign ACE to an element whose clean verdict is
+ * already cached, then reads at once and must see the refusal. That test is the discriminating observation.
+ */
+const windowsChainCache = new Map<string, string[]>();
+function windowsFaults(p: string): string[] {
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(p);
+  } catch (err) {
+    return [`${p}: ${(err as Error).message}`];
+  }
+  const key = `${p}\0${st.ino}\0${st.ctimeMs}\0${st.mtimeMs}`;
+  const hit = windowsChainCache.get(key);
+  if (hit) return hit;
+  let faults: string[];
+  try {
+    faults = windowsForeignAllowSids(p).map((sid) => `${p}: an allow ACE for ${sid} (only this user, and SYSTEM, may hold one)`);
+  } catch (err) {
+    return [`${p}: ${(err as Error).message}`]; // a read failure is never cached
+  }
+  if (windowsChainCache.size > 64) windowsChainCache.clear();
+  windowsChainCache.set(key, faults);
+  return faults;
+}
+
+/**
+ * Why the chain that controls the secret's bytes is NOT private, or [] when it is. `fileFd`: the secret's opened
+ * descriptor (POSIX: its fstat is checked, never the path). Pure read; never changes a mode or an ACL.
+ */
+export function mintSecretChainFaults(instanceDir: string, fileFd?: number): string[] {
+  const dirs = [instanceDir, mintSecretDir(instanceDir)];
+  const file = mintSecretPath(instanceDir);
+  if (process.platform === "win32") return [...dirs, file].flatMap(windowsFaults);
+  const faults: string[] = [];
+  for (const d of dirs) {
+    const st = lstatOrNull(d);
+    const f = st === null ? `${d} does not exist` : posixFault(d, st, "dir");
+    if (f) faults.push(f);
+  }
+  if (fileFd !== undefined) {
+    const f = posixFault(file, fs.fstatSync(fileFd), "file");
+    if (f) faults.push(f);
+  }
+  return faults;
 }
 
 export function mintSecretDir(instanceDir: string): string {
@@ -91,8 +162,17 @@ function ensureSecretsDir(instanceDir: string): string {
   if (st.isSymbolicLink() || !st.isDirectory()) {
     throw new MintSecretError(`${dir} is not a directory (a symlink or another type): refusing to keep the registration secret there`);
   }
-  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
-  restrictToOwnerWindows(dir, true); // Q12: on Windows the mode is a no-op; an owner-only ACL instead
+  // Tighten what this user OWNS (a chmod on another user's directory would fail, and must not be attempted: that
+  // chain is refused by readMintSecret instead). Windows (Q12): the mode is a no-op; an owner-only ACL instead.
+  const euid = mintChainSeams.euid();
+  if (process.platform !== "win32") {
+    for (const d of [instanceDir, dir]) {
+      const ds = fs.lstatSync(d);
+      if (ds.isDirectory() && !ds.isSymbolicLink() && (euid === null || ds.uid === euid) && ds.mode & 0o077) fs.chmodSync(d, 0o700);
+    }
+  }
+  restrictToOwnerWindows(instanceDir, true);
+  restrictToOwnerWindows(dir, true);
   return dir;
 }
 
@@ -123,6 +203,9 @@ export function readMintSecret(instanceDir: string): string | null {
     const post = fs.fstatSync(fd);
     if (!post.isFile()) throw new MintSecretError(`${file} is not a regular file`);
     if (post.ino !== pre.ino || post.dev !== pre.dev) throw new MintSecretError(`${file} changed while it was being opened: refusing it`);
+    // Codex R1 #2: the chain that controls these bytes must be private to this user, or the value may be planted.
+    const chain = mintSecretChainFaults(instanceDir, fd);
+    if (chain.length > 0) throw new MintSecretError(`the registration secret is not private to this user, so it is refused: ${chain.join("; ")}`);
     const text = fs.readFileSync(fd, "utf-8").trim();
     const fault = mintSecretFault(text);
     if (fault) throw new MintSecretError(`${file} is unusable: ${fault}`);
@@ -134,7 +217,10 @@ export function readMintSecret(instanceDir: string): string | null {
 
 /** Tighten an existing secret file to 0600 through a no-follow descriptor (never loosens, never follows a link). */
 function tightenMintSecretMode(file: string): void {
-  if (process.platform === "win32") return restrictToOwnerWindows(file, false);
+  if (process.platform === "win32") {
+    restrictToOwnerWindows(file, false);
+    return;
+  }
   const fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW);
   try {
     fs.fchmodSync(fd, 0o600);
@@ -154,10 +240,20 @@ function tightenMintSecretMode(file: string): void {
 export function ensureMintSecret(instanceDir: string, seed?: string): { path: string; created: boolean } {
   ensureSecretsDir(instanceDir);
   const file = mintSecretPath(instanceDir);
-  if (readMintSecret(instanceDir) !== null) {
-    tightenMintSecretMode(file);
-    return { path: file, created: false };
+  // An existing regular file THIS user owns is tightened first (0600 / owner-only ACL); readMintSecret then checks
+  // the whole chain and refuses what could not be made private (another owner, a foreign ACE that would not go).
+  const existing = lstatOrNull(file);
+  if (existing && existing.isFile() && !existing.isSymbolicLink()) {
+    const euid = mintChainSeams.euid();
+    if (euid === null || existing.uid === euid) {
+      try {
+        tightenMintSecretMode(file);
+      } catch {
+        /* readMintSecret below reports the mode it finds */
+      }
+    }
   }
+  if (readMintSecret(instanceDir) !== null) return { path: file, created: false };
   if (seed !== undefined) {
     const fault = mintSecretFault(seed);
     if (fault) throw new MintSecretError(`the legacy http_secret cannot seed the registration secret: ${fault}`);

@@ -79,17 +79,25 @@ export function checkAndWarnPermissive(path: string, maxMode: number): void {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// PR-D (rulings f885e674 Q6, efb48600 Q12): Windows ACLs. On NTFS a POSIX mode is meaningless, so the relay's
-// private files and directories are restricted with an explicit owner-only ACL, and checked by SID (icacls and
-// account names are LOCALIZED; SIDs are not). Best-effort like the chmods above: a failure warns, never stops.
+// PR-D (rulings f885e674 Q6, efb48600 Q12; Codex R1 #2, architect e9ad940d): Windows ACLs. On NTFS a POSIX mode
+// is meaningless, so the relay's private files and directories are restricted to an OWNER-ONLY ACL, checked by
+// SID (icacls and account names are LOCALIZED; SIDs are not). Owner-only is an ALLOWLIST: the current user, and
+// SYSTEM TOLERATED (never granted; the Windows equivalent of root, out of scope on every OS). Every other SID,
+// Administrators included, is removed. restrictToOwnerWindows REPORTS what it could not remove; the registration
+// secret's chain fails CLOSED on that report (src/mint-secret.ts), the DB and the rest are reported loudly.
 // ---------------------------------------------------------------------------------------------------------
 
-/** Well-known SIDs that must hold NO allow ACE on a private relay path: Everyone, Users, Authenticated Users. */
+/** Display names for well-known SIDs in a fault (the first three are the broadest grants a path can carry). */
 export const FORBIDDEN_SIDS: Readonly<Record<string, string>> = Object.freeze({
   "S-1-1-0": "Everyone",
   "S-1-5-32-545": "BUILTIN\\Users",
   "S-1-5-11": "Authenticated Users",
+  "S-1-5-32-544": "BUILTIN\\Administrators",
+  "S-1-5-32-547": "BUILTIN\\Power Users",
 });
+
+/** SYSTEM: tolerated on a private path, never granted by the relay. */
+export const SYSTEM_SID = "S-1-5-18";
 
 let currentUserSid: string | null | undefined;
 /** The current user's SID (whoami /user), or null when it cannot be read. Windows only; cached. */
@@ -101,26 +109,84 @@ export function windowsUserSid(): string | null {
   return currentUserSid;
 }
 
+const describeSid = (sid: string) => (FORBIDDEN_SIDS[sid] ? `${FORBIDDEN_SIDS[sid]} (${sid})` : sid);
+
 /**
- * Restrict `path` to the current user only on Windows: remove inherited ACEs and grant the user full control
- * (inherited by children for a directory). A no-op elsewhere (the POSIX modes above do the job).
+ * Restrict `path` to its owner on Windows: remove inherited ACEs, grant the current user full control (inherited by
+ * a directory's children), then REMOVE every other SID still on the DACL (explicit grants and denies survive
+ * /inheritance:r), except SYSTEM, and READ IT BACK. Returns the faults that remain ([] = owner-only), each naming
+ * the path and the SID; also warns. A no-op elsewhere (the POSIX modes above do the job).
  */
-export function restrictToOwnerWindows(path: string, isDir: boolean): void {
-  if (process.platform !== "win32") return;
+export function restrictToOwnerWindows(path: string, isDir: boolean): string[] {
+  if (process.platform !== "win32") return [];
   const sid = windowsUserSid();
   if (!sid) {
-    log.warn(`[fs-perms] Could not read the current user's SID: "${path}" keeps its inherited ACL.`);
-    return;
+    const fault = `${path}: the current user's SID could not be read, so its ACL could not be restricted`;
+    log.warn(`[fs-perms] ${fault}.`);
+    return [fault];
   }
   const grant = isDir ? `*${sid}:(OI)(CI)F` : `*${sid}:F`;
   const r = spawnSync("icacls", [path, "/inheritance:r", "/grant:r", grant], { encoding: "utf-8", windowsHide: true });
   if (r.status !== 0) {
-    log.warn(`[fs-perms] Could not restrict the ACL of "${path}" (icacls exit ${r.status}): ${(r.stderr || r.stdout || "").trim()}`);
+    const fault = `${path}: icacls could not restrict the ACL (exit ${r.status}): ${(r.stderr || r.stdout || "").trim()}`;
+    log.warn(`[fs-perms] ${fault}`);
+    return [fault];
   }
+  const faults = (): string[] => {
+    try {
+      return windowsForeignAllowSids(path).map((f) => `${path}: an allow ACE for ${describeSid(f)} is not the owner's`);
+    } catch (err) {
+      return [`${path}: ${(err as Error).message}`];
+    }
+  };
+  let foreign: string[];
+  try {
+    foreign = windowsForeignAllowSids(path);
+  } catch (err) {
+    const fault = `${path}: ${(err as Error).message}`;
+    log.warn(`[fs-perms] ${fault}`);
+    return [fault];
+  }
+  // `/remove *SID` drops that SID's grant AND deny ACEs. An alias the map below does not know cannot be removed by
+  // SID: it stays, and is reported as a fault (fail closed where the caller requires owner-only).
+  for (const f of foreign) if (/^S-1-[0-9-]+$/.test(f)) spawnSync("icacls", [path, "/remove", `*${f}`], { encoding: "utf-8", windowsHide: true });
+  const left = faults();
+  if (left.length > 0) log.warn(`[fs-perms] ${left.join("; ")}`);
+  return left;
 }
 
-/** SDDL's two-letter aliases for the well-known SIDs this check cares about (SDDL is not localized). */
-const SDDL_ALIASES: Readonly<Record<string, string>> = Object.freeze({ WD: "S-1-1-0", BU: "S-1-5-32-545", AU: "S-1-5-11" });
+/**
+ * SDDL's two-letter aliases for well-known SIDs (SDDL is not localized). Mapped so the owner-only allowlist compares
+ * SIDs only; an alias missing here stays as written, which is never on the allowlist (a fault, never a pass).
+ */
+const SDDL_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  WD: "S-1-1-0",
+  CO: "S-1-3-0",
+  CG: "S-1-3-1",
+  OW: "S-1-3-4",
+  NU: "S-1-5-2",
+  IU: "S-1-5-4",
+  SU: "S-1-5-6",
+  AN: "S-1-5-7",
+  AU: "S-1-5-11",
+  RC: "S-1-5-12",
+  SY: "S-1-5-18",
+  LS: "S-1-5-19",
+  NS: "S-1-5-20",
+  BA: "S-1-5-32-544",
+  BU: "S-1-5-32-545",
+  BG: "S-1-5-32-546",
+  PU: "S-1-5-32-547",
+  AO: "S-1-5-32-548",
+  SO: "S-1-5-32-549",
+  PO: "S-1-5-32-550",
+  BO: "S-1-5-32-551",
+  RE: "S-1-5-32-552",
+  RU: "S-1-5-32-554",
+  RD: "S-1-5-32-555",
+  NO: "S-1-5-32-556",
+  AC: "S-1-15-2-1",
+});
 
 /**
  * The SIDs of the ALLOW ACEs in an SDDL string's DACL ("D:" part). Each ACE is `(type;flags;rights;obj;inh;sid)`;
@@ -177,18 +243,29 @@ export function windowsAllowSids(path: string): string[] {
 }
 
 /**
+ * The allow-ACE SIDs on `path` that are NEITHER the current user NOR SYSTEM (Windows only): [] = owner-only.
+ * Throws when the ACL or the user's SID cannot be read: a check that cannot read must not pass.
+ */
+export function windowsForeignAllowSids(path: string): string[] {
+  const owner = windowsUserSid();
+  if (!owner) throw new Error("the current user's SID could not be read");
+  return windowsAllowSids(path).filter((s) => s !== owner && s !== SYSTEM_SID);
+}
+
+/**
  * PR-D Q6: why `path` is NOT private, or [] when it is. POSIX: the mode must not exceed `maxMode` (no group or
- * other bits). Windows: no allow ACE for Everyone, Users or Authenticated Users. An unreadable path is a fault.
+ * other bits). Windows (Codex R1 #2): owner-only, an allowlist: any allow ACE for a SID other than the current
+ * user or SYSTEM is a fault, Administrators included. An unreadable path is a fault.
  */
 export function privacyFaults(path: string, maxMode: number): string[] {
   if (process.platform === "win32") {
     let sids: string[];
     try {
-      sids = windowsAllowSids(path);
+      sids = windowsForeignAllowSids(path);
     } catch (err) {
-      return [(err as Error).message];
+      return [`${path}: ${(err as Error).message}`];
     }
-    return sids.filter((s) => s in FORBIDDEN_SIDS).map((s) => `${path}: an allow ACE for ${FORBIDDEN_SIDS[s]} (${s})`);
+    return sids.map((s) => `${path}: an allow ACE for ${describeSid(s)} is not the owner's`);
   }
   let mode: number;
   try {

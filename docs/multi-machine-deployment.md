@@ -119,10 +119,11 @@ relay pair https://relay.example.com \
   --name laptop-a-$(whoami) \
   --role operator \
   --capabilities spawn,tasks,webhooks,broadcast,channels \
-  --secret "$RELAY_HTTP_SECRET"
+  --secret-file ./hub.secret \
+  --output ./bot-relay-client.json
 ```
 
-The command prints an MCP client config snippet like:
+`hub.secret` holds the hub's registration secret (on the hub: `<relay instance dir>/secrets/mint.secret`), handed over as a file: `relay pair` never takes a secret on the command line. The command writes the MCP client config to `--output` (created 0600; an existing file is never overwritten) and prints it with the credentials redacted. The file looks like:
 
 ```json
 {
@@ -137,7 +138,7 @@ The command prints an MCP client config snippet like:
 }
 ```
 
-Paste it under `mcpServers` in your MCP client config:
+Merge its `bot-relay` entry under `mcpServers` in your MCP client config:
 
 - **Claude Code:** `~/.claude.json`
 - **Cursor:** `~/.cursor/mcp.json`
