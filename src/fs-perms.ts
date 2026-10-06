@@ -249,7 +249,36 @@ export function windowsAllowSids(path: string): string[] {
 export function windowsForeignAllowSids(path: string): string[] {
   const owner = windowsUserSid();
   if (!owner) throw new Error("the current user's SID could not be read");
-  return windowsAllowSids(path).filter((s) => s !== owner && s !== SYSTEM_SID);
+  const ownerToken = windowsOwnerSddlToken();
+  return windowsAllowSids(path).filter((s) => s !== owner && s !== ownerToken && s !== SYSTEM_SID);
+}
+
+let ownerSddlToken: string | null | undefined;
+/**
+ * How icacls WRITES the current user in SDDL. Usually the SID itself, but a domain-relative account gets an ALIAS
+ * (MEASURED on windows-2022: the runner's user is the machine's built-in Administrator, RID 500, which SDDL writes
+ * as "LA"; every owner-only path then read as "an allow ACE for LA"). An alias cannot be mapped to a SID without
+ * the machine's domain SID, so it is PROBED: a private temp file is restricted to this user's SID alone, saved as
+ * SDDL, and its one ACE's token is the user's spelling. null when the probe fails or is ambiguous: only the SID
+ * itself then counts as the owner (fail closed). Windows only; cached for the process.
+ */
+function windowsOwnerSddlToken(): string | null {
+  if (ownerSddlToken !== undefined) return ownerSddlToken;
+  const sid = windowsUserSid();
+  if (!sid) return (ownerSddlToken = null);
+  const dir = fs.mkdtempSync(pathJoin(osTmpdir(), "relay-owner-probe-"));
+  try {
+    const probe = pathJoin(dir, "probe");
+    fs.writeFileSync(probe, "");
+    const r = spawnSync("icacls", [probe, "/inheritance:r", "/grant:r", `*${sid}:F`], { encoding: "utf-8", windowsHide: true });
+    const tokens = r.status === 0 ? windowsAllowSids(probe) : [];
+    ownerSddlToken = tokens.length === 1 ? tokens[0] : null;
+  } catch {
+    ownerSddlToken = null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  return ownerSddlToken;
 }
 
 /**
