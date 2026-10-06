@@ -151,6 +151,11 @@ async function rpc(
     const innerText = inner.result?.content?.[0]?.text;
     if (innerText) json = JSON.parse(innerText);
   }
+  // A register that did not succeed leaves NO agent, and every later "the transition never fired" would then
+  // misread a refused register as a broadcaster defect. Fail HERE, with the server's answer.
+  if (tool === "register_agent" && json?.success !== true) {
+    throw new Error(`register_agent ${JSON.stringify(args.name)} did not succeed: ${JSON.stringify(json)}`);
+  }
   return { ok: res.ok, json };
 }
 
