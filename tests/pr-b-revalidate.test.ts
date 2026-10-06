@@ -99,6 +99,23 @@ function graceAgentNullCurrentDigest(name: string, present: "previous" | "curren
   db.getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run(name);
   return f;
 }
+/** A row the digest index cannot decide, so a token-only lookup reaches the FALLBACK compare. */
+function activeAgentNoDigest(name: string): Fixture {
+  const f = activeAgent(name);
+  db.getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run(name);
+  return f;
+}
+function graceAgentNoPreviousDigest(name: string): Fixture {
+  const f = graceAgent(name, "previous");
+  db.getDb().prepare("UPDATE agents SET previous_token_lookup = NULL WHERE name = ?").run(name);
+  return f;
+}
+/** An ACTIVE, OFFLINE agent (no live session), so its token re-registers it. */
+function offlineAgent(name: string): Fixture {
+  const f = activeAgent(name);
+  db.getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = ?").run(name);
+  return f;
+}
 function mutate(m: Mutation, name: string, realNow: () => number): void {
   const row = db.getAgentAuthData(name)!;
   if (m === "rotate") db.rotateAgentToken(name, row.token_hash!, { graceSeconds: 0 }); // a hard cut: the old token is dead
@@ -118,6 +135,8 @@ function mutate(m: Mutation, name: string, realNow: () => number): void {
 const PATHS = {
   explicit: (f: Fixture) => call("get_messages", { agent_name: f.name }, f.token),
   "token-only": (f: Fixture) => call("discover_agents", {}, f.token),
+  "token-only FALLBACK": (f: Fixture) => call("discover_agents", {}, f.token),
+  register_agent: (f: Fixture) => call("register_agent", { name: f.name, role: "worker", capabilities: [] }, f.token),
 } as const;
 const CELLS: Array<{ path: keyof typeof PATHS; at: number; m: Mutation; fixture: (n: string) => Fixture; na?: string }> = [];
 for (const p of ["explicit", "token-only"] as const) {
@@ -130,6 +149,11 @@ for (const p of ["explicit", "token-only"] as const) {
 for (const m of ["revoke", "recovery"] as const) CELLS.push({ path: "explicit", at: 2, m, fixture: (n) => graceAgentNullCurrentDigest(n, "current") });
 CELLS.push({ path: "explicit", at: 3, m: "grace-expiry", fixture: (n) => graceAgentNullCurrentDigest(n, "previous") });
 CELLS.push({ path: "explicit", at: 2, m: "rotate", fixture: (n) => graceAgentNullCurrentDigest(n, "current"), na: "a rotation needs an ACTIVE row; this await point exists only for a rotation_grace row" });
+// The token-only FALLBACK compare (a row the digest index cannot decide), and register_agent's re-register compare.
+for (const m of ["rotate", "revoke", "recovery"] as const) CELLS.push({ path: "token-only FALLBACK", at: 1, m, fixture: activeAgentNoDigest });
+CELLS.push({ path: "token-only FALLBACK", at: 1, m: "grace-expiry", fixture: graceAgentNoPreviousDigest });
+for (const m of ["rotate", "revoke", "recovery"] as const) CELLS.push({ path: "register_agent", at: 1, m, fixture: offlineAgent });
+CELLS.push({ path: "register_agent", at: 1, m: "grace-expiry", fixture: offlineAgent, na: "register_agent passes no grace inputs: a previous token is refused before any compare (pre-existing, backlog)" });
 
 describe("the race matrix: never served on a stale verdict (each await point x each mutation, both auth paths)", () => {
   let seq = 0;
@@ -172,5 +196,54 @@ describe("a CACHED verdict goes through revalidate too (a cache is never the las
     } finally {
       Date.now = realNow;
     }
+  });
+});
+
+describe("authority from the FRESH row, never the verdict (architect 6f35008c)", () => {
+  it("a FLOOD of registrations during a legitimate agent's pooled compare → served: no generation-retry lever is left", async () => {
+    const f = activeAgent("legit");
+    // The flood lands during EVERY compare of this call (re-armed each time), so a generation-retry loop would retry
+    // until it gave up with auth_churn (Codex #2, MEASURED red on 245464d). Each register bumps the global generation.
+    let floods = 0;
+    const arm = (): void =>
+      _onNextCompareForTests(() => {
+        for (let i = 0; i < 5; i++) db.registerAgent(`flood-${floods}-${i}`, "worker", []);
+        floods++;
+        if (floods < 6) arm();
+      });
+    arm();
+    const r = await call("get_messages", { agent_name: f.name }, f.token);
+    _onNextCompareForTests(null);
+    expect(floods, "the flood landed during the compare").toBeGreaterThanOrEqual(1);
+    expect(r.isError, JSON.stringify(r.body)).toBe(false);
+  });
+
+  it("a CACHED verdict after the credential changed WITHOUT a generation bump → refused by the hash EVIDENCE alone (explicit and token-only)", async () => {
+    const f = activeAgent("evidence");
+    expect((await call("get_messages", { agent_name: f.name }, f.token)).isError).toBe(false); // verify + cache
+    expect((await call("discover_agents", {}, f.token)).isError).toBe(false); // token-only verify + cache
+    const genBefore = db.getAuthGeneration();
+    // Swap the stored hash directly, BYPASSING the generation bump: the caches stay valid by their key.
+    const other = db.registerAgent("donor", "worker", []);
+    void other;
+    const donorHash = db.getAgentAuthData("donor")!.token_hash!;
+    db.getDb().prepare("UPDATE agents SET token_hash = ? WHERE name = ?").run(donorHash, f.name);
+    db.getDb().prepare("UPDATE auth_meta SET generation = ? WHERE id = 1").run(genBefore); // the donor's register bumped it; put it back
+    expect(db.getAuthGeneration()).toBe(genBefore);
+    const a = await call("get_messages", { agent_name: f.name }, f.token);
+    const b = await call("discover_agents", {}, f.token);
+    expect(a.isError, `explicit served on a cached verdict: ${JSON.stringify(a.body)}`).toBe(true);
+    expect(b.isError, `token-only served on a cached verdict: ${JSON.stringify(b.body)}`).toBe(true);
+  });
+
+  it("a CAPABILITY granted between the verify and the dispatch → the call is decided on the FRESH capabilities", async () => {
+    const f = activeAgent("cap-late");
+    const fired = atCompare(1, () => void db.expandAgentCapabilities(f.name, ["webhooks"]));
+    const r = await call("list_webhooks", {}, f.token);
+    expect(fired()).toBe(true);
+    expect(r.isError, JSON.stringify(r.body)).toBe(false);
+    const g = activeAgent("cap-never");
+    const denied = await call("list_webhooks", {}, g.token);
+    expect(denied.body.error_code, "the twin without the capability is refused").toBe("CAP_DENIED");
   });
 });

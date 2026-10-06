@@ -2663,7 +2663,7 @@ function verifiedTokenCacheGet(
   gen: number,
   now: number,
   requireName: string | null,
-): { name: string; capabilities: string[]; basis: "current" | "previous" } | null {
+): { name: string; capabilities: string[]; basis: "current" | "previous"; hash: string | null } | null {
   const c = authCacheGet(digest, gen, now);
   if (!c) return null;
   if (requireName !== null && c.name !== requireName) return null;
@@ -2708,7 +2708,10 @@ function verifiedTokenCachePut(
   // by final ruling — see the comment above REAPABLE_ORPHAN_WHERE).
   markAgentAuthenticated(name);
   if (indexed) {
-    authCacheSet(digest, { name, capabilities, basis: matchedColumn === "token_lookup" ? "current" : "previous" }, gen, authCacheExpiry(now, graceExpiry));
+    // The EVIDENCE: the hash on the row the verify ran against, for the matched column.
+    const basis = matchedColumn === "token_lookup" ? "current" : "previous";
+    const hash = (basis === "current" ? row.token_hash : row.previous_token_hash) ?? null;
+    authCacheSet(digest, { name, capabilities, basis, hash }, gen, authCacheExpiry(now, graceExpiry));
   } else {
     selfHealTokenLookup(row, matchedColumn, digest);
   }
@@ -2936,7 +2939,7 @@ export async function resolveAgentByTokenVerdict(
   const now = Date.now();
 
   const cached = verifiedTokenCacheGet(digest, gen, now, null); // token-only: any name
-  if (cached) return { ...cached, hash: null }; // a cache hit holds no hash; revalidate checks state, time and generation
+  if (cached) return cached; // with its EVIDENCE, captured when the verdict was verified
 
   const found = await findAgentRowByToken(token);
   if (!found || "refused" in found) return found;
@@ -2985,7 +2988,7 @@ export function explicitCallerCacheGet(
 export function explicitCallerCacheGetVerdict(
   token: string,
   claimedName: string,
-): { name: string; capabilities: string[]; basis: "current" | "previous" } | null {
+): { name: string; capabilities: string[]; basis: "current" | "previous"; hash: string | null } | null {
   const digest = computeTokenLookup(token);
   const gen = getAuthGeneration();
   const now = Date.now();

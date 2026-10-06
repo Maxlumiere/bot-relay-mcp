@@ -83,7 +83,7 @@ describe("INVARIANT 1: no await between the final authorization check and the wr
     }
   });
 
-  it("ONE site (architect b11ef8ad): runCall calls revalidate AFTER the last await of auth, and NOTHING awaits between it and dispatch", () => {
+  it("ONE contiguous block (architect 6f35008c #5/#6): authorizedDispatch is EXACTLY [now, revalidate, refuse-or, dispatch]; runCall dispatches ONLY through it, after its auth await, with the piggyback tick BEFORE auth", () => {
     const file = path.join(SRC, "server.ts");
     const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf-8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     // revalidate is the binding imported from ./auth-verdict.js, not a look-alike.
@@ -97,31 +97,47 @@ describe("INVARIANT 1: no await between the final authorization check and the wr
         st.importClause.namedBindings.elements.some((e) => e.name.text === "revalidate" && !e.propertyName),
     );
     expect(imported, "revalidate is imported from ./auth-verdict.js").toBe(true);
-    let runCall: ts.FunctionDeclaration | undefined;
+    const fns = new Map<string, ts.FunctionDeclaration>();
     const find = (n: ts.Node): void => {
-      if (ts.isFunctionDeclaration(n) && n.name?.text === "runCall") runCall = n;
+      if (ts.isFunctionDeclaration(n) && n.name) fns.set(n.name.text, n);
       ts.forEachChild(n, find);
     };
     find(sf);
-    expect(runCall, "runCall exists").toBeDefined();
-    const awaits: Array<{ pos: number; callee: string }> = [];
-    const revalidates: number[] = [];
+    const callee = (e: ts.Node | undefined): string | null =>
+      e && ts.isCallExpression(e) && ts.isIdentifier(e.expression) ? e.expression.text : null;
+    // 1. ADJACENCY: authorizedDispatch's body is exactly these four statements, in this order.
+    const ad = fns.get("authorizedDispatch");
+    expect(ad?.body, "authorizedDispatch exists").toBeDefined();
+    const st = [...ad!.body!.statements];
+    expect(st.length, "authorizedDispatch has exactly 4 statements (no intervening call, await or statement)").toBe(4);
+    const decl = (s: ts.Statement) => (ts.isVariableStatement(s) ? s.declarationList.declarations[0] : undefined);
+    expect(decl(st[0])?.initializer?.getText(sf), "1: now is read ONCE").toBe("Date.now()");
+    expect(callee(decl(st[1])?.initializer), "2: revalidate").toBe("revalidate");
+    expect(ts.isIfStatement(st[2]) && ts.isReturnStatement(st[2].thenStatement), "3: refuse on a failed check").toBe(true);
+    expect(ts.isReturnStatement(st[3]) && callee(st[3].expression), "4: the handler starts at once").toBe("dispatch");
+    let awaitsInside = 0;
+    const countAwaits = (n: ts.Node): void => {
+      if (ts.isAwaitExpression(n)) awaitsInside++;
+      ts.forEachChild(n, countAwaits);
+    };
+    countAwaits(ad!);
+    expect(awaitsInside, "no await inside authorizedDispatch").toBe(0);
+    // 2. runCall: dispatch ONLY via authorizedDispatch; the tick BEFORE the auth await; authorizedDispatch AFTER it.
+    const rc = fns.get("runCall");
+    expect(rc, "runCall exists").toBeDefined();
+    const calls: Array<{ name: string; pos: number }> = [];
     const visit = (n: ts.Node): void => {
-      if (ts.isAwaitExpression(n)) {
-        const e = n.expression;
-        awaits.push({ pos: n.getStart(sf), callee: ts.isCallExpression(e) && ts.isIdentifier(e.expression) ? e.expression.text : "?" });
-      }
-      if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "revalidate") revalidates.push(n.getEnd());
+      const c = callee(n);
+      if (c) calls.push({ name: c, pos: n.getStart(sf) });
       ts.forEachChild(n, visit);
     };
-    visit(runCall!);
-    expect(revalidates, "runCall calls revalidate exactly once").toHaveLength(1);
-    const dispatchAwait = awaits.find((a) => a.callee === "dispatch");
-    const authAwait = awaits.find((a) => a.callee === "enforceAuth");
-    expect(dispatchAwait && authAwait, "await enforceAuth(...) and await dispatch(...) both exist").toBeTruthy();
-    expect(revalidates[0], "revalidate runs after the auth await").toBeGreaterThan(authAwait!.pos);
-    const between = awaits.filter((a) => a.pos > revalidates[0] && a.pos < dispatchAwait!.pos);
-    expect(between, "an await between revalidate and the handler's dispatch").toEqual([]);
+    visit(rc!);
+    const at = (name: string) => calls.filter((c) => c.name === name).map((c) => c.pos);
+    expect(at("dispatch"), "runCall never calls dispatch directly").toEqual([]);
+    expect(at("authorizedDispatch"), "runCall dispatches through authorizedDispatch exactly once").toHaveLength(1);
+    expect(at("enforceAuth"), "auth runs once (no generation-retry loop)").toHaveLength(1);
+    expect(at("maybePiggybackWebhookRetries")[0], "the piggyback tick runs before auth").toBeLessThan(at("enforceAuth")[0]);
+    expect(at("authorizedDispatch")[0], "authorizedDispatch runs after auth").toBeGreaterThan(at("enforceAuth")[0]);
   });
 
   it("every handler in src/tools that calls an identity/token mutator is REGISTERED (a new one cannot appear silently)", () => {

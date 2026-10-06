@@ -1007,8 +1007,6 @@ export function createServer(): Server {
     return resolveAgentByTokenVerdict(token);
   }
 
-  /** PR-B: how many times a call is re-verified when the auth generation moved under it. */
-  const AUTH_RECHECK_ATTEMPTS = 3;
 
   /** PR-B: a refusal that did NOT decide the token (the failed-auth throttle, or a full bcrypt pool). */
   function undecidedAuthError(r: AuthResult | { refused: "throttled" | "busy" }): any | null {
@@ -1073,7 +1071,7 @@ export function createServer(): Server {
             ERROR_CODES.AUTH_FAILED
           );
         }
-        return allow({ kind: "none", why: "bootstrap" }); // first registration — bootstrap path
+        return allow({ kind: "none", why: "new-name" }); // first registration — bootstrap path
       }
       const state = (existing.auth_state ?? "active") as
         | "active"
@@ -1224,14 +1222,10 @@ export function createServer(): Server {
       if (cachedVerdict) {
         callerName = explicitCaller;
         callerCaps = cachedVerdict.capabilities;
-        // A cached verdict is never the last word: it goes through revalidate like a fresh one.
-        verdict = {
-          kind: "credential",
-          agent: explicitCaller,
-          basis: cachedVerdict.basis,
-          hash: cachedVerdict.basis === "current" ? (auth.token_hash ?? null) : (auth.previous_token_hash ?? null),
-          gen: genAtRead,
-        };
+        // A cached verdict is never the last word: it goes through revalidate like a fresh one, with the EVIDENCE
+        // captured when it was verified (never re-filled from this call's fresh read: that comparison would be
+        // tautological, Codex #3).
+        verdict = { kind: "credential", agent: explicitCaller, basis: cachedVerdict.basis, hash: cachedVerdict.hash, gen: genAtRead };
       } else {
         const explicitState = (auth.auth_state ?? "active") as
           | "active"
@@ -1310,10 +1304,9 @@ export function createServer(): Server {
     // Special rule: unregister_agent — caller's token must match the target name.
     // (The token check above already verified the caller IS that agent.)
 
-    // Capability check
-    if (requiredCap && !callerCaps.includes(requiredCap)) {
-      return authError(`Agent "${callerName}" lacks required capability "${requiredCap}" for tool "${toolName}". Capabilities must be set at register time.`, "CAP_DENIED");
-    }
+    // Capability check: NOT here. PR-B (architect 6f35008c #c): capabilities are authority, so they are derived from
+    // the FRESH row by revalidate in authorizedDispatch, never from this verify-time copy.
+    void requiredCap;
 
     // v2.1 Phase 4k: expose resolved caller name via request-context so handlers
     // that need authz beyond the dispatcher's capability check (e.g. get_task's
@@ -1366,6 +1359,21 @@ export function createServer(): Server {
     const callStore = existingStore ?? { transport: "stdio" as const };
     return requestContext.run(callStore, () => runCall(request));
   });
+
+  /**
+   * PR-B (architect b11ef8ad, 6f35008c #5/#6): revalidate and the handler as ONE contiguous synchronous block.
+   * `now` is read ONCE; revalidate re-derives authority from the FRESH row (state, the evidence hash for the matched
+   * column, the grace window against `now`, and the tool's required capability from the fresh row's capabilities);
+   * on success the handler starts at once (dispatch runs the handler synchronously up to its own first await). Its
+   * body is EXACTLY these statements (tests/pr-b-auth-invariants.test.ts pins them by AST). Residual: atomic within
+   * this process only; see revalidate and ADR-0050.
+   */
+  function authorizedDispatch(verdict: AuthVerdict, name: string, args: any): Promise<any> {
+    const now = Date.now();
+    const check = revalidate(getDb(), verdict, now, TOOL_CAPABILITY[name]);
+    if (!check.ok) return Promise.resolve(authError(check.reason, check.code === "CAP_DENIED" ? ERROR_CODES.CAP_DENIED : ERROR_CODES.AUTH_FAILED, "stale_verdict"));
+    return dispatch(name, args);
+  }
 
   async function runCall(request: { params: { name: string; arguments?: any } }): Promise<any> {
     const { name, arguments: args } = request.params;
@@ -1434,32 +1442,22 @@ export function createServer(): Server {
     // mutation bumps the auth generation (ADR-0003, guarded by scripts/auth-gen-guard.mjs), so a
     // generation that moved means the verdict may be stale: verify again. From the last check to the
     // handler's write, everything is SYNCHRONOUS (no await), so verified-and-written is atomic again.
-    // PR-B (architect b11ef8ad): authority is decided at ONE site. enforceAuth records the verdict; revalidate
-    // re-derives it SYNCHRONOUSLY from a fresh row read (generation, state, the matched credential, and every
-    // time predicate such as a grace window), after the LAST await. From here to the handler's sync start there
-    // is NO await (tests/pr-b-auth-invariants.test.ts pins it by AST). A retryable refusal (the generation or the
-    // credential moved under the verify) re-verifies; anything else refuses. Never served on a stale verdict.
-    let authBlock: any | null = null;
-    for (let attempt = 1; ; attempt++) {
+    // PR-B (architect b11ef8ad, 6f35008c): authority is decided at ONE site. enforceAuth runs ONCE and records the
+    // verdict with its EVIDENCE (the hash of the row its verify ran against); authorizedDispatch below revalidates it
+    // against the FRESH row and starts the handler in the same synchronous block. There is NO generation-retry loop:
+    // the global generation is only the verdict cache's invalidation key, so unrelated auth mutations (a flood of
+    // registrations included) can no longer churn another agent's call.
+    // The piggyback tick (webhook retries, the rotation-grace sweep) runs HERE, BEFORE auth, never between the
+    // revalidation and the handler (Codex #5).
+    maybePiggybackWebhookRetries();
+    {
       const store = requestContext.getStore();
       if (store) store.authVerdict = undefined;
-      authBlock = await enforceAuth(name, args);
-      if (authBlock) break;
-      const verdict = requestContext.getStore()?.authVerdict;
-      if (!verdict) {
-        authBlock = authError("Internal: the call was allowed without a recorded verdict.", ERROR_CODES.AUTH_FAILED, "no_verdict");
-        break;
-      }
-      const check = revalidate(getDb(), verdict, Date.now());
-      if (check.ok) break;
-      if (!check.retryable) {
-        authBlock = authError(check.reason, ERROR_CODES.AUTH_FAILED, "stale_verdict");
-        break;
-      }
-      if (attempt >= AUTH_RECHECK_ATTEMPTS) {
-        authBlock = authError("Auth state kept changing while this call was being verified: retry.", ERROR_CODES.RATE_LIMITED, "auth_churn");
-        break;
-      }
+    }
+    let authBlock: any | null = await enforceAuth(name, args);
+    const authVerdict = requestContext.getStore()?.authVerdict;
+    if (!authBlock && !authVerdict) {
+      authBlock = authError("Internal: the call was allowed without a recorded verdict.", ERROR_CODES.AUTH_FAILED, "no_verdict");
     }
     if (authBlock) {
       const ctx = currentContext();
@@ -1529,8 +1527,6 @@ export function createServer(): Server {
     // call regardless of whether the tool itself fires webhooks. Prevents
     // due retries from stalling when subsequent traffic lands on tools with
     // no matching subscriptions (e.g. discover_agents, get_messages).
-    maybePiggybackWebhookRetries();
-
     const baseStructured = {
       tool: name,
       agent_name: verifiedAgent,
@@ -1539,7 +1535,7 @@ export function createServer(): Server {
     };
 
     try {
-      const result = await dispatch(name, args);
+      const result = await authorizedDispatch(authVerdict!, name, args);
       const isError = (result as any).isError === true;
       logAudit(verifiedAgent, name, summary, !isError, null, ctx.transport, { ...baseStructured, result: isError ? "error" : "success" });
       // v2.4.0 Part D.1 — traffic capture. Off by default; enabled by
