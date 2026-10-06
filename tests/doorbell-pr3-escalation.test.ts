@@ -39,7 +39,7 @@ const bind = (agent: string): CandidateBinding => ({ binding_id: `b-${agent}`, a
 
 /** The job's loop, minus I/O: plan from the state, validate + fold every record, repeat. */
 function harness(opts: { budgetPerHour?: number; operator?: string | null; bindings?: CandidateBinding[]; from?: { records: readonly LogRecord[]; intentMono: ReadonlyMap<string, number> }; ids?: () => string } = {}) {
-  const state: import("../src/doorbell-log.js").LogState = { rung: new Set(), ringWalls: new Map(), lastHeaderWall: null, budgetExhausted: new Set(), tornTail: false, records: [] };
+  const state: import("../src/doorbell-log.js").LogState = { rung: new Set(), ringWalls: new Map(), lastHeaderWall: null, budgetExhausted: new Set(), boardOpen: new Map(), tornTail: false, records: [] };
   const ringMono = new Map<string, number[]>();
   const intentMono = new Map<string, number>(opts.from?.intentMono ?? []);
   // A restart from these records: the state is rebuilt by the ONE reducer, ring times from the kept intents.
@@ -61,6 +61,10 @@ function harness(opts: { budgetPerHour?: number; operator?: string | null; bindi
       ringMono,
       nowMono: t,
       budgetExhausted: state.budgetExhausted,
+      // PR 6, production-shaped: a listed binding is a live window; mailAgents is what the SSOT query would find.
+      liveness: () => "alive",
+      mailAgents: () => Object.entries(reads).filter(([, r]) => r && r.registered && r.ids.length > 0).map(([k]) => k),
+      boardOpen: state.boardOpen,
       windowMs: W,
       budgetPerHour: opts.budgetPerHour ?? 60,
       horizonMs: H,
@@ -220,27 +224,41 @@ describe("PR 3: the escalation's lifecycle", () => {
     const h = escalated();
     const extra = h.step(3 * H + 20_000, { alice: read(["m1", "m9"]) }).intents[0].intent.intent_id; // outstanding
     h.setBindings([]);
-    for (let k = 4; k < 12; k++) expect(h.step(k * H, { alice: read(["m1", "m9"], null) }).records, `t=${k}H`).toEqual([]);
+    // Nothing JUDGED in the hold. PR 6: the window going is ONE board-state change (mail, no live
+    // window), written on the first cycle only (A3.2), then nothing at all.
+    for (let k = 4; k < 12; k++) {
+      const recs = h.step(k * H, { alice: read(["m1", "m9"], null) }).records;
+      expect(recs.map((r) => (r.type === "board" ? [r.type, r.case, r.state] : [r.type])), `t=${k}H`).toEqual(k === 4 ? [["board", "no_live_window", "open"]] : []);
+    }
     expect(h.openEsc()).toHaveLength(1);
     expect(h.all("effect").some((e) => e.intent_ids.includes(extra))).toBe(false); // well past its horizon, still unjudged
     h.setBindings([bind("alice")]); // a new window, a new session
     const p = h.step(12 * H, { alice: read(["m1", "m9"], RS2) });
     expect(p.escalations.map((e) => [e.state, e.close_reason, e.reading_session])).toEqual([["closed", "session_changed", RS1]]);
+    expect(p.board.map((r) => [r.case, r.state, r.close_reason])).toEqual([["no_live_window", "closed", "resolved"]]); // PR 6: the new window resolves it
     expect(p.effects.map((e) => [e.outcome, e.intent_ids])).toEqual([["session_changed", [extra]]]);
     expect(p.intents.map((r) => [r.covers.reading_session, r.covers.message_ids, r.covers.kinds, r.intent.during_escalation])).toEqual([[RS2, ["m1", "m9"], ["new", "new"], false]]);
   });
   it("twin: a binding gone while the SAME session stays bound (not a production state, kept as the mechanism pin) → still judged, and a drain closes it on progress", () => {
     const h = escalated();
     h.setBindings([]);
-    for (let k = 4; k < 8; k++) expect(h.step(k * H, { alice: read(["m1"]) }).records).toEqual([]);
+    for (let k = 4; k < 8; k++) {
+      const recs = h.step(k * H, { alice: read(["m1"]) }).records;
+      expect(recs.map((r) => (r.type === "board" ? [r.type, r.case, r.state] : [r.type]))).toEqual(k === 4 ? [["board", "no_live_window", "open"]] : []); // PR 6: once
+    }
     const p = h.step(8 * H, { alice: read([]) });
     expect(p.escalations.map((e) => [e.state, e.close_reason])).toEqual([["closed", "progress"]]);
+    expect(p.board.map((r) => [r.case, r.state, r.close_reason])).toEqual([["no_live_window", "closed", "no_mail"]]);
     expect(p.intents).toEqual([]);
   });
   it("HARM (B1): an unbound session is never judged at its horizon, and never swept to session_changed, however long it lasts", () => {
     const h = harness();
     h.step(0, { alice: read(["m1"]) });
-    for (let k = 1; k < 30; k++) expect(h.step(k * H, { alice: read(["m1"], null) }).records).toEqual([]);
+    // PR 6: a live window with no reading session is a session_unbound board case, written ONCE.
+    for (let k = 1; k < 30; k++) {
+      const recs = h.step(k * H, { alice: read(["m1"], null) }).records;
+      expect(recs.map((r) => (r.type === "board" ? [r.type, r.case, r.state] : [r.type]))).toEqual(k === 1 ? [["board", "session_unbound", "open"]] : []);
+    }
     expect(h.all("effect")).toEqual([]);
   });
 });
@@ -498,8 +516,9 @@ function crashPrefix(steps: Steps) {
     const p = base.step(t, reads);
     for (const [agent, r] of Object.entries(reads)) {
       if (!known.has(agent)) continue;
-      const wrote = p.records.some((x) => (x.type === "intent" ? x.intent.agent_name : (x as { agent_name?: string }).agent_name) === agent);
-      if (r.reading_session === null && !wrote) reached.holdCycles++; // an agent with a ledger, unbound: nothing written
+      // PR 6: a BOARD record is not a judgement (it is the board state, written once per change).
+      const wrote = p.records.some((x) => x.type !== "board" && (x.type === "intent" ? x.intent.agent_name : (x as { agent_name?: string }).agent_name) === agent);
+      if (r.reading_session === null && !wrote) reached.holdCycles++; // an agent with a ledger, unbound: nothing judged
       if (r.reading_session !== null && !bindOf(s).some((b) => b.agent_name === agent)) reached.supersededCycles++; // a ledger agent with a live session but NO binding
     }
     while (stepOf.length < base.state.records.length) stepOf.push(s);

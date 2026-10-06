@@ -17,7 +17,24 @@
  *     id). The reading session is the PR 0b digest from the SAME read as the ids; it is
  *     never re-derived here.
  *   - A NULL or unbound reading session is NEVER a target (V4): delivery cannot be
- *     measured for it. It is skipped with its reason (the board case is PR 6).
+ *     measured for it. It is a BOARD case (PR 6, below).
+ *   - THE BOARD (PR 6; plan §v4, architect ruling 5dda2752). Bindings are GROUPED by agent first
+ *     ("current" is per window anchor, not per name: a dead window's binding stays current by
+ *     design, so an agent typically holds several). Each binding's window anchor is judged on
+ *     its own (anchorLivenessVerdict), and only a binding PROVEN dead is set aside. Then, for an
+ *     agent with pending mail, in this precedence:
+ *       · ambiguous_binding: 2 or more not-dead bindings (alive OR unverifiable: an anchor that
+ *         cannot be shown dead is never discarded). Q4: refused, never a guess;
+ *       · no_live_window: no ALIVE binding (all dead, a sole unverifiable one, or none at all;
+ *         an agent with mail and no binding is found through `mailAgents`);
+ *       · session_unbound: exactly one alive binding and no reading session (V4);
+ *       · otherwise the one alive binding is the ring candidate.
+ *     A board case writes NO intent. Its record is written only when the agent's board state
+ *     CHANGES (A3.2), from the state the LOG holds (`boardOpen`), so a restart writes nothing
+ *     new. An agent with nothing pending is never a board case (ruling Q6); its open case closes
+ *     (`no_mail`). An agent this cycle could NOT evaluate (its pending read failed, or this
+ *     host is unknown) is a HOLD: its board state neither closes nor re-opens, and it is listed
+ *     in `notEvaluated` (a HOLD is never silent).
  *   - One intent per agent per cycle, covering all of its new ids.
  *   - Q3 COALESCING (PR 2): a per-agent last ring and a window W. Ring at once, then
  *     nothing for that agent until W has passed; what arrived in between is covered by
@@ -45,13 +62,17 @@
  *         written or closed, and outstanding rings stay outstanding until a session exists.
  *     `operator` (V3) is attribution on escalation records only, never a ring target.
  */
-import type { BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord } from "./doorbell-log.js";
+import type { BoardCase, BoardRecord, BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord } from "./doorbell-log.js";
 import { MAX_IDS_PER_INTENT, rungKey } from "./doorbell-log.js";
+import type { AnchorVerdict } from "./liveness.js";
 
 export interface CandidateBinding {
   binding_id: string;
   agent_name: string | null;
   host_id: string;
+  /** The window's anchor (pid + start token): what `liveness` judges. */
+  window_pid?: number | null;
+  window_pid_start?: string | null;
 }
 
 /** What the planner needs from one pending read (pendingMetadata). */
@@ -300,6 +321,12 @@ export interface CycleInput {
   nowMono: number;
   /** Agents whose budget state is currently "exhausted" (as last logged). Not mutated. */
   budgetExhausted: ReadonlySet<string>;
+  /** PR 6: ONE binding's window-anchor liveness (production: anchorLivenessVerdict on window_pid + window_pid_start). */
+  liveness: (b: CandidateBinding) => AnchorVerdict;
+  /** PR 6: registered agents with at least one pending message (PENDING_FOR_AGENT_ROW_SQL), bound or not. */
+  mailAgents: () => readonly string[];
+  /** PR 6: each agent's OPEN board case, as the log holds it. Not mutated. */
+  boardOpen: ReadonlyMap<string, BoardRecord>;
   windowMs: number;
   budgetPerHour: number;
   horizonMs: number;
@@ -332,6 +359,16 @@ export interface CyclePlan {
   budget: BudgetRecord[];
   effects: EffectRecord[];
   escalations: EscalationRecord[];
+  /** PR 6: board-state CHANGES this cycle (empty when nothing changed). */
+  board: BoardRecord[];
+  /** PR 6: agents this cycle could not evaluate (a HOLD: their board state is untouched). */
+  notEvaluated: string[];
+  /**
+   * PR 6 (#310 Codex R1 #2): why the all-agent mail query failed this cycle, or null. When it fails,
+   * agents with mail and NO binding cannot even be found, so they cannot be named: this says so
+   * explicitly. Every agent that CAN be named (bound, or with an open case) is still evaluated.
+   */
+  mailQueryFailed: string | null;
   skipped: CycleSkip[];
 }
 
@@ -340,6 +377,17 @@ const sortedSet = (xs: Iterable<string>): string[] => [...new Set(xs)].sort();
 export function planCycle(input: CycleInput): CyclePlan {
   const records: LogRecord[] = [];
   const skipped: CycleSkip[] = [];
+  const notEvaluated: string[] = [];
+  let mailQueryFailed: string | null = null;
+  /** The agents with pending mail (bound or not), or [] with mailQueryFailed set: never a silent gap. */
+  const mailAgents = (): readonly string[] => {
+    try {
+      return input.mailAgents();
+    } catch (err) {
+      mailQueryFailed = err instanceof Error ? err.message : String(err);
+      return [];
+    }
+  };
   const fault = tunablesFault(input);
   if (fault) throw new Error(fault);
   const at = input.now();
@@ -352,10 +400,16 @@ export function planCycle(input: CycleInput): CyclePlan {
     budget: records.filter((r): r is BudgetRecord => r.type === "budget"),
     effects: records.filter((r): r is EffectRecord => r.type === "effect"),
     escalations: records.filter((r): r is EscalationRecord => r.type === "escalation"),
+    board: records.filter((r): r is BoardRecord => r.type === "board"),
+    notEvaluated,
+    mailQueryFailed,
     skipped,
   });
   if (!input.ownHostId) {
     for (const b of input.bindings) skipped.push({ binding_id: b.binding_id, agent_name: b.agent_name, why: "this host's identity is unknown: no binding can be shown to be local" });
+    // A HOLD, never a change: nothing is judged, every board state stays as it is. Every agent that
+    // WOULD have been evaluated is named, the unbound ones with mail included (#310 Codex R1 #2).
+    notEvaluated.push(...sortedSet([...input.bindings.flatMap((b) => (b.agent_name ? [b.agent_name] : [])), ...mailAgents(), ...input.boardOpen.keys()]));
     return view();
   }
 
@@ -447,45 +501,89 @@ export function planCycle(input: CycleInput): CyclePlan {
     return ledger;
   };
 
-  const covered = new Set<string>(); // agents already planned this cycle
+  // PR 6: GROUP by agent first. A binding with no agent name is not an agent: it can hold no mail.
+  const groups = new Map<string, CandidateBinding[]>();
   for (const b of input.bindings) {
-    const skip = (why: string) => skipped.push({ binding_id: b.binding_id, agent_name: b.agent_name, why });
-    if (b.host_id !== input.ownHostId) {
-      skip("the binding is on another host");
-      continue;
-    }
     if (!b.agent_name) {
-      skip("the binding names no agent");
+      skipped.push({ binding_id: b.binding_id, agent_name: null, why: "the binding names no agent" });
       continue;
     }
-    if (covered.has(b.agent_name)) continue;
+    groups.set(b.agent_name, [...(groups.get(b.agent_name) ?? []), b]);
+  }
+  const boardOpen = new Map(input.boardOpen);
+  /** Move ONE agent's board state; a record ONLY when it changes (A3.2). */
+  const boardTo = (name: string, next: { case: BoardCase; binding_ids: string[]; dead_count: number } | null, pendingCount: number, closeWhy: "resolved" | "no_mail"): void => {
+    const cur = boardOpen.get(name);
+    if (next && cur && cur.case === next.case) return; // unchanged: written once per state change
+    if (cur) {
+      records.push({ ...cur, at, state: "closed", pending_count: pendingCount, close_reason: next ? "resolved" : closeWhy });
+      boardOpen.delete(name);
+    }
+    if (next) {
+      const rec: BoardRecord = { v: 1, type: "board", at, board_id: newEscalationId(), agent_name: name, case: next.case, state: "open", binding_ids: next.binding_ids.slice(0, MAX_IDS_PER_INTENT), dead_count: next.dead_count, pending_count: pendingCount, close_reason: null };
+      records.push(rec);
+      boardOpen.set(name, rec);
+    }
+  };
+  const BOARD_WHY: Record<BoardCase, string> = {
+    ambiguous_binding: "ambiguous: 2 or more bindings whose window is not proven dead (Q4: never guess; a board case)",
+    no_live_window: "no live window: no binding whose window is alive (a board case)",
+    session_unbound: "no bound reading session: delivery cannot be measured, so it is never rung (a board case: re-register or relaunch)",
+  };
+
+  const covered = new Set<string>(); // agents evaluated this cycle
+  for (const name of sortedSet([...groups.keys(), ...mailAgents(), ...boardOpen.keys()])) {
+    const bs = groups.get(name) ?? [];
+    const skip = (why: string, at?: CandidateBinding) => skipped.push({ binding_id: (at ?? bs[0])?.binding_id ?? "", agent_name: name, why });
     let read: PendingRead;
     try {
-      read = input.pending(b.agent_name);
+      read = input.pending(name);
     } catch (err) {
       skip(`its pending set cannot be read (${err instanceof Error ? err.message : String(err)})`);
+      notEvaluated.push(name); // a HOLD: its board state is untouched
       continue;
     }
+    covered.add(name);
     if (!read.registered) {
-      skip("the agent is not registered in this DB");
+      boardTo(name, null, 0, "no_mail");
+      if (bs.length > 0) skip("the agent is not registered in this DB");
       continue;
     }
-    covered.add(b.agent_name);
-    const ledger = judge(b.agent_name, read);
-    if (!read.reading_session) {
-      skip("no bound reading session: delivery cannot be measured, so it is never rung (a board case)");
-      continue;
-    }
+    const ledger = judge(name, read);
     const rs = read.reading_session;
-    const name = b.agent_name;
     const times = input.ringMono.get(name) ?? [];
-    // Q4: the budget STATE, evaluated every cycle so its change is logged when it happens
-    // (A3.2), whether or not this agent has new mail right now.
+    // Q4: the budget STATE, evaluated every cycle for an agent bound on THIS host with a reading
+    // session, so its change is logged when it happens (A3.2), with or without new mail.
     const inHour = times.filter((t) => t > nowMono - BUDGET_WINDOW_MS).length;
     const exhaustedNow = inHour >= input.budgetPerHour;
-    if (exhaustedNow !== input.budgetExhausted.has(name)) {
+    if (rs && bs.some((x) => x.host_id === input.ownHostId) && exhaustedNow !== input.budgetExhausted.has(name)) {
       records.push({ v: 1, type: "budget", at, agent_name: name, state: exhaustedNow ? "exhausted" : "available", rings_in_hour: inHour, budget_per_hour: input.budgetPerHour });
     }
+    if (read.ids.length === 0) {
+      boardTo(name, null, 0, "no_mail"); // never a board case without pending mail (ruling Q6)
+      continue;
+    }
+    // THE DECISION (ruling 5dda2752): each binding's window on its own; only the PROVEN dead are set
+    // aside. Another host's window cannot be judged from here: unverifiable, never dead.
+    const judged = bs.map((x) => ({ b: x, v: x.host_id === input.ownHostId ? input.liveness(x) : ("unverifiable" as AnchorVerdict) }));
+    const notDead = judged.filter((x) => x.v !== "dead");
+    const alive = notDead.filter((x) => x.v === "alive");
+    const deadCount = judged.length - notDead.length;
+    const idsOf = (xs: typeof judged) => sortedSet(xs.map((x) => x.b.binding_id));
+    const next: { case: BoardCase; binding_ids: string[]; dead_count: number } | null =
+      notDead.length >= 2
+        ? { case: "ambiguous_binding", binding_ids: idsOf(notDead), dead_count: deadCount }
+        : alive.length === 0
+          ? { case: "no_live_window", binding_ids: idsOf(notDead), dead_count: deadCount }
+          : !rs
+            ? { case: "session_unbound", binding_ids: idsOf(alive), dead_count: deadCount }
+            : null;
+    boardTo(name, next, read.ids.length, "resolved");
+    if (next || !rs) {
+      skip(BOARD_WHY[next ? next.case : "session_unbound"]);
+      continue;
+    }
+    const b = alive[0].b; // the ONE live window: the ring candidate
     // A SET, in canonical order: the drain order has no same-millisecond tie-break, so the
     // scan order of equal-time ids is not stable, and the record must not depend on it.
     const fresh = sortedSet(read.ids.filter((id) => !input.rung.has(rungKey(rs, id)))); // a canonical SET (#300 R1 #8)

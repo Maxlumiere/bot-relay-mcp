@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — the doorbell rings only a window it can show is alive, and reports the mail it cannot deliver
+
+The doorbell job (still not installed by anything) now checks each agent's windows before it rings, and records the mail it has no way to deliver, instead of guessing.
+
+- **Every window is checked on its own.** An agent can have several bindings at once, because a window that has closed keeps its binding. The doorbell sets aside only the windows it can prove are gone (the process and its start time no longer match), and decides from the rest. It no longer rings a window that has closed.
+- **It never picks one window out of several.** Two or more windows that are not proven gone are ambiguous: nothing is rung, and the case is recorded. Before, the first one listed was rung.
+- **Mail with no way to deliver it is recorded, never rung.** Three cases: no live window (every window closed, a single window that cannot be checked, or none at all); two or more possible windows; one live window but no relay session ("re-register or relaunch"). An agent with pending mail and no window at all was not looked at before; it is now. An agent with nothing pending is never recorded.
+- **Recorded once per change.** Each case is written to the doorbell's log when it starts and when it ends (resolved, or the mail is gone), never once per cycle, and it survives a restart and a compaction of the log. When a cycle cannot read an agent's mail, that agent's case is left as it was, and the agent is named in the heartbeat.
+- **`relay doorbell status`** lists the open cases (agent, case, age, and the pending count both when the case opened and now) and the agents the last cycle could not read. The SessionStart line is unchanged.
+
 ### Security — an address matches a trusted-proxy block the same way however it is written
 
 The relay's own trusted-proxy check (`trusted_proxies`) had a narrow form of GHSA-jqcg-44mw-7w3h, the proxy-addr defect. An IPv4 address written in the hexadecimal IPv4-mapped form (`::ffff:102:304`, which is 1.2.3.4) was treated as inside broad IPv6 blocks such as `::/0`, `::/1` or `::/80`, while the usual spelling (`::ffff:1.2.3.4`) was correctly not. Reaching it needed a `trusted_proxies` entry like that, plus an address in that spelling.

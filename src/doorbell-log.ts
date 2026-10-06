@@ -155,7 +155,34 @@ export interface EscalationRecord {
   close_reason: (typeof CLOSE_REASONS)[number] | null;
 }
 
-export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord | ClockRecord | EffectRecord | EscalationRecord;
+/**
+ * PR 6 (plan §v4, architect ruling 5dda2752): a BOARD case, mail this agent cannot be reached for.
+ * Never a ring case. Content-free: the agent, the case, the bindings that DECIDED it (never the dead
+ * history), a dead-binding count, and how many messages were pending when the record was written.
+ *   - no_live_window: pending mail and no binding whose window anchor is ALIVE (dead, a sole
+ *     unverifiable anchor, or no binding at all);
+ *   - ambiguous_binding: two or more bindings that are not PROVEN dead (Q4: never guess);
+ *   - session_unbound: one live window, but no relay reading session (V4: "re-register or relaunch").
+ * Written ONLY when the agent's board state CHANGES (A3.2); `board_id` pairs an open with its close.
+ */
+export const BOARD_CASES = ["no_live_window", "ambiguous_binding", "session_unbound"] as const;
+export type BoardCase = (typeof BOARD_CASES)[number];
+export const BOARD_CLOSE_REASONS = ["resolved", "no_mail"] as const;
+export interface BoardRecord {
+  v: 1;
+  type: "board";
+  at: string;
+  board_id: string;
+  agent_name: string;
+  case: BoardCase;
+  state: (typeof ESCALATION_STATES)[number];
+  binding_ids: string[];
+  dead_count: number;
+  pending_count: number;
+  close_reason: (typeof BOARD_CLOSE_REASONS)[number] | null;
+}
+
+export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord | ClockRecord | EffectRecord | EscalationRecord | BoardRecord;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -291,6 +318,28 @@ export function recordFault(r: unknown): string | null {
     if (!(r.operator === null || (typeof r.operator === "string" && AGENT_NAME_PATTERN.test(r.operator)))) return "operator is not null or a valid agent name";
     if (r.state === "open" ? r.close_reason !== null : !(CLOSE_REASONS as readonly unknown[]).includes(r.close_reason)) {
       return `close_reason is null while open, and one of ${CLOSE_REASONS.join(", ")} once closed`;
+    }
+    return null;
+  }
+  if (t === "board") {
+    if (!sameKeys(r, ["v", "type", "at", "board_id", "agent_name", "case", "state", "binding_ids", "dead_count", "pending_count", "close_reason"])) {
+      return "a board record has exactly v, type, at, board_id, agent_name, case, state, binding_ids, dead_count, pending_count, close_reason";
+    }
+    if (r.v !== 1) return "unknown record version";
+    if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
+    if (!isUuid(r.board_id)) return "board_id is not a v4 UUID";
+    if (typeof r.agent_name !== "string" || !AGENT_NAME_PATTERN.test(r.agent_name)) return "agent_name is not a valid agent name";
+    if (!(BOARD_CASES as readonly unknown[]).includes(r.case)) return `case must be one of ${BOARD_CASES.join(", ")} (never free text)`;
+    if (!(ESCALATION_STATES as readonly unknown[]).includes(r.state)) return `state must be one of ${ESCALATION_STATES.join(", ")}`;
+    const f = setFault(r.binding_ids, "binding_ids", 0, MAX_IDS_PER_INTENT, nonEmpty);
+    if (f) return f;
+    // The shape of each case: ambiguous names >= 2 deciding bindings, a session case exactly the one live window.
+    const n = (r.binding_ids as string[]).length;
+    if (r.case === "ambiguous_binding" ? n < 2 : r.case === "session_unbound" ? n !== 1 : n > 1) return `a ${r.case as string} record names ${r.case === "ambiguous_binding" ? "at least 2" : r.case === "session_unbound" ? "exactly 1" : "at most 1"} deciding binding(s)`;
+    if (!Number.isInteger(r.dead_count) || (r.dead_count as number) < 0 || (r.dead_count as number) > 1_000_000) return "dead_count is not a bounded non-negative integer";
+    if (!Number.isInteger(r.pending_count) || (r.pending_count as number) < 0 || (r.pending_count as number) > 100_000_000) return "pending_count is not a bounded non-negative integer";
+    if (r.state === "open" ? r.close_reason !== null || (r.pending_count as number) < 1 : !(BOARD_CLOSE_REASONS as readonly unknown[]).includes(r.close_reason)) {
+      return `close_reason is null while open (with pending mail), and one of ${BOARD_CLOSE_REASONS.join(", ")} once closed`;
     }
     return null;
   }
@@ -505,6 +554,8 @@ export interface LogState {
   lastHeaderWall: number | null;
   /** Agents whose LAST budget record says exhausted (A3.2: so a restart does not log it again). */
   budgetExhausted: Set<string>;
+  /** PR 6: each agent's OPEN board case (its open record), so a restart neither re-opens nor loses it (A3.2). */
+  boardOpen: Map<string, BoardRecord>;
   tornTail: boolean;
   /** Every valid record, in order (compaction and readers use it). */
   records: LogRecord[];
@@ -527,6 +578,9 @@ export function foldRecord(state: LogState, r: LogRecord): void {
   } else if (r.type === "budget") {
     if (r.state === "exhausted") state.budgetExhausted.add(r.agent_name);
     else state.budgetExhausted.delete(r.agent_name);
+  } else if (r.type === "board") {
+    if (r.state === "open") state.boardOpen.set(r.agent_name, r);
+    else if (state.boardOpen.get(r.agent_name)?.board_id === r.board_id) state.boardOpen.delete(r.agent_name);
   }
 }
 
@@ -540,7 +594,7 @@ function parseLogText(text: string, logPath: string): LogState {
   const lines = text.split("\n");
   lines.pop(); // "" after a final newline, or the unterminated tail (checked below)
   const tail = terminated ? null : text.slice(text.lastIndexOf("\n") + 1);
-  const state: LogState = { rung: new Set(), ringWalls: new Map(), lastHeaderWall: null, budgetExhausted: new Set(), tornTail: false, records: [] };
+  const state: LogState = { rung: new Set(), ringWalls: new Map(), lastHeaderWall: null, budgetExhausted: new Set(), boardOpen: new Map(), tornTail: false, records: [] };
   lines.forEach((line, i) => {
     let rec: unknown;
     let fault: string | null;
@@ -658,6 +712,8 @@ export function compactLog(
   const lastBudget = new Map<string, LogRecord>();
   for (const r of current.records) if (r.type === "budget") lastBudget.set(r.agent_name, r);
   const clocks = new Set(current.records.filter((r) => r.type === "clock").slice(-COMPACT_KEEP_CLOCKS));
+  // PR 6: an OPEN board case keeps its open record (closed cases are history): the state survives.
+  const openBoard = new Set<LogRecord>(current.boardOpen.values());
   const keptIntentIds = new Set<string>();
   for (const r of current.records) if (r.type === "intent" && keepIntent(r)) keptIntentIds.add(r.intent.intent_id);
   const ledger = keepLedger?.(current.records, keptIntentIds) ?? null;
@@ -670,7 +726,9 @@ export function compactLog(
           ? lastBudget.get(r.agent_name) === r
           : r.type === "clock"
             ? clocks.has(r)
-            : ledger === null || ledger.has(r),
+            : r.type === "board"
+              ? openBoard.has(r)
+              : ledger === null || ledger.has(r),
   );
   const tmp = path.join(stateDir, `${COMPACT_PREFIX}${process.pid}`);
   // #300 R2 #1 + #2: from here on, anything that does not complete is a LogWriteError, and
