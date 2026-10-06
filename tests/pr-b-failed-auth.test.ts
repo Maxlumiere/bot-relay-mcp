@@ -298,46 +298,96 @@ async function measure(port: number, load: Load, onLoop?: () => void): Promise<R
   }
 }
 
-const LOOP_MAX_MS = 50;
-const AVAILABILITY_MARGIN_MS = 25;
-const AVAILABILITY_CEILING_MS = 500;
-const fmt = (r: Reading) => `health=${r.healthMax.toFixed(1)} eld=${r.eldMax.toFixed(1)} shed=${r.shed}`;
-
 /**
- * THE BAR (e26359ac Q3 as amended by architect 10f7a172). ONE run, no retries (a best-of-N hides a real
- * 1-in-N failure; the same-run control replaces it):
- *   - COUNT: the burst's bcrypt compares stay within `maxCompares` (ZERO where a digest decides). The primary
- *     discriminator, deterministic.
- *   - LOOP: event-loop delay max < 50 ms. Discriminates on any runner: see the NEGATIVE CONTROL test.
- *   - AVAILABILITY: /health max <= the larger of the control bursts run before and after + 25 ms, and < 500 ms
- *     absolute (a real freeze). Runner speed and drift cancel; an auth-specific slowdown does not.
- * Every reading is logged (BAR line) so the CI numbers can be reported.
+ * THE TIMING BARS (e26359ac Q3 as amended by architect 10f7a172, 47e64b3a, 8cdbc68b and f9916d46).
+ *
+ * WHAT THEY CAN AND CANNOT SEE. On a shared CI runner, a burst of requests that does NO auth work already
+ * moves the loop delay 30-86 ms and /health 40-165 ms (MEASURED, CI fef36b4). So the timing bars RESOLVE an
+ * auth-specific slowdown of about MARGIN_MS over the same run's control, and no less: they CANNOT promise
+ * to see ONE on-loop bcrypt (~64-100 ms). That property is carried by the deterministic checks: COUNT (zero
+ * instrumented compares where a digest decides) and the static ban on compares outside the pool
+ * (tests/pr-b-auth-invariants.test.ts). The timing bars catch a loop block or an availability loss LARGER
+ * than their stated resolution, which every BAR line logs.
+ *
+ * THE INSTRUMENT, calibrated on the gating runner in EVERY run:
+ *   - ISOLATED: the bars run as their own serial CI step after the suite (RELAY_TIMING_BARS=1), never in
+ *     parallel with ~300 other files; the parallel suite skips them, visibly.
+ *   - K interleaved (control, auth) rounds; each bar asserts on MEDIANS: loop delay and /health of the auth
+ *     arm <= the control arm's median + MARGIN_MS. A deterministic regression shifts the median; a one-off
+ *     spike does not (NOT best-of-N: nothing is retried).
+ *   - A HARD ceiling on EVERY single auth reading (CEILING_MS), so a freeze-sized one-off fails on ONE
+ *     occurrence. Named residual, accepted (f9916d46): an intermittent auth-specific spike under the ceiling
+ *     in 1 of K rounds or fewer.
+ *   - A/A CONTROL: control vs control under the same rule MUST PASS (the margin is above the runner's noise).
+ *     If it fails, that is an INSTRUMENT fault, reported as such, never a retry.
+ *   - NEGATIVE CONTROL: a loop block sized 2 x the allowance in EVERY auth round MUST FAIL both predicates
+ *     (the bar sees a block of the forbidden size).
+ * MARGIN_MS is provisional until the isolated step's A/A gaps are in (f9916d46: >= ~15 ms goes back to the
+ * architect before anything widens).
  */
-async function barHolds(label: string, port: number, load: Load, maxCompares = 0): Promise<void> {
-  _resetAuthThrottleForTests();
-  await measure(port, controlLoad(load.n)); // WARM-UP, discarded: the first burst on a fresh daemon pays one-off costs (MEASURED 25-45 ms vs ~2 ms after), which would inflate the control and bias the bar toward PASS
-  const baseline = await measure(port, { kind: "idle", n: 0 });
-  const before = await measure(port, controlLoad(load.n));
-  let auth!: Reading;
-  const count = await compares(async () => {
-    auth = await measure(port, load);
-  });
-  const after = await measure(port, controlLoad(load.n));
-  const controlMax = Math.max(before.healthMax, after.healthMax);
-  console.log(`BAR ${label} | auth ${fmt(auth)} compares=${count} | control-before ${fmt(before)} | control-after ${fmt(after)} | idle eld=${baseline.eldMax.toFixed(1)}`);
-  // NOT VACUOUS: every call of the auth burst reached auth, and both controls were admitted the same way. A
-  // shed call is a cheap 429 before the MCP cycle (MEASURED: once the per-minute limit ran out, a whole auth
-  // burst was shed and its bar passed on nothing).
-  expect([auth.shed, before.shed, after.shed], `${label}: calls shed by the per-IP limits (auth, control before, control after)`).toEqual([0, 0, 0]);
-  expect(count, `${label}: bcrypt compares`).toBeLessThanOrEqual(maxCompares);
-  expect(auth.eldMax, `${label}: event-loop delay max (ms)`).toBeLessThan(LOOP_MAX_MS);
-  expect(auth.healthMax, `${label}: /health max (ms) vs the same-run control (${controlMax.toFixed(1)} ms) + ${AVAILABILITY_MARGIN_MS}`).toBeLessThanOrEqual(controlMax + AVAILABILITY_MARGIN_MS);
-  expect(auth.healthMax, `${label}: /health max (ms), absolute ceiling`).toBeLessThan(AVAILABILITY_CEILING_MS);
+const K = 5;
+const MARGIN_MS = 25;
+const CEILING_MS = 500;
+const fmt = (r: Reading) => `health=${r.healthMax.toFixed(1)} eld=${r.eldMax.toFixed(1)} shed=${r.shed}`;
+const median = (xs: number[]) => {
+  const a = [...xs].sort((x, y) => x - y);
+  return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2;
+};
+const list = (xs: number[]) => xs.map((x) => x.toFixed(1)).join("/");
+
+interface BarStats {
+  label: string;
+  control: Reading[];
+  auth: Reading[];
+  compares: number;
+  med: { ctlHealth: number; ctlEld: number; authHealth: number; authEld: number };
 }
 
-describe("BARS: a burst of failed auths keeps the loop under 50 ms and /health within its same-run control, with ZERO compares where a digest decides", () => {
-  // The per-minute request limit is not under test here, and each bar sends ~4 bursts: lift it so no burst is
-  // shed by it (read when the daemon starts). The concurrent cap stays at its default: the bars run under it.
+/** Run one bar: a discarded warm-up, then K interleaved (control, auth) rounds. Logs a BAR line with the resolution. */
+async function runBar(label: string, port: number, load: Load, onLoop?: () => void): Promise<BarStats> {
+  _resetAuthThrottleForTests();
+  await measure(port, controlLoad(load.n)); // WARM-UP, discarded: a fresh daemon's first burst pays one-off costs
+  const control: Reading[] = [];
+  const auth: Reading[] = [];
+  let count = 0;
+  for (let k = 0; k < K; k++) {
+    control.push(await measure(port, controlLoad(load.n)));
+    _resetAuthThrottleForTests(); // every auth round meets the same budgets (the scan budget refills slowly)
+    count += await compares(async () => {
+      auth.push(await measure(port, load, onLoop));
+    });
+  }
+  const med = {
+    ctlHealth: median(control.map((r) => r.healthMax)),
+    ctlEld: median(control.map((r) => r.eldMax)),
+    authHealth: median(auth.map((r) => r.healthMax)),
+    authEld: median(auth.map((r) => r.eldMax)),
+  };
+  console.log(
+    `BAR ${label} | median auth health=${med.authHealth.toFixed(1)} eld=${med.authEld.toFixed(1)} | median control health=${med.ctlHealth.toFixed(1)} eld=${med.ctlEld.toFixed(1)}` +
+      ` | gap health=${(med.authHealth - med.ctlHealth).toFixed(1)} eld=${(med.authEld - med.ctlEld).toFixed(1)}` +
+      ` | resolution health>${(med.ctlHealth + MARGIN_MS).toFixed(1)} eld>${(med.ctlEld + MARGIN_MS).toFixed(1)}` +
+      ` | compares=${count} | rounds auth health ${list(auth.map((r) => r.healthMax))} eld ${list(auth.map((r) => r.eldMax))}` +
+      ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}`,
+  );
+  return { label, control, auth, compares: count, med };
+}
+
+/** The bar's predicates. NOT VACUOUS: no call of any arm was shed (a shed call is a cheap 429 before the MCP cycle). */
+function expectBarHolds(b: BarStats, maxCompares = 0): void {
+  expect([...b.control, ...b.auth].map((r) => r.shed), `${b.label}: calls shed by the per-IP limits (every arm)`).toEqual(Array(2 * K).fill(0));
+  expect(b.compares, `${b.label}: bcrypt compares`).toBeLessThanOrEqual(maxCompares);
+  expect(b.med.authEld, `${b.label}: LOOP median ${b.med.authEld.toFixed(1)} vs control median ${b.med.ctlEld.toFixed(1)} + ${MARGIN_MS}`).toBeLessThanOrEqual(b.med.ctlEld + MARGIN_MS);
+  expect(b.med.authHealth, `${b.label}: AVAILABILITY median ${b.med.authHealth.toFixed(1)} vs control median ${b.med.ctlHealth.toFixed(1)} + ${MARGIN_MS}`).toBeLessThanOrEqual(b.med.ctlHealth + MARGIN_MS);
+  for (const r of b.auth) {
+    expect(r.healthMax, `${b.label}: a single /health reading over the ${CEILING_MS} ms ceiling (a freeze)`).toBeLessThan(CEILING_MS);
+    expect(r.eldMax, `${b.label}: a single loop-delay reading over the ${CEILING_MS} ms ceiling (a freeze)`).toBeLessThan(CEILING_MS);
+  }
+}
+
+describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, RELAY_TIMING_BARS=1): a burst of failed auths moves the loop and /health no more than the same run's control, with ZERO compares where a digest decides", () => {
+  // The per-minute request limit is not under test here, and each bar sends 2K+1 bursts: lift it so no
+  // burst is shed by it (read when the daemon starts). The concurrent cap stays at its default.
   const savedRate = process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE;
   beforeAll(() => {
     process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE = "100000";
@@ -346,52 +396,56 @@ describe("BARS: a burst of failed auths keeps the loop under 50 ms and /health w
     if (savedRate === undefined) delete process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE;
     else process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE = savedRate;
   });
+
+  it("A/A CONTROL: control vs control under the same rule PASSES (the margin sits above this runner's noise; a failure is an INSTRUMENT fault)", async () => {
+    await withDaemon(async (port) => {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      expectBarHolds(await runBar("A/A control vs control", port, controlLoad(20)));
+    });
+  }, 180_000);
+
   it("(b) 20 wrong-token register_agent, (c) 20 wrong-token get_messages, (d) 20 unknown tokens with 51 agents", async () => {
     for (let i = 0; i < 50; i++) reg(`fleet-${i}`);
     reg("victim");
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`); // warm
-      await barHolds("(b) wrong token, register_agent", port, authLoad(20, "register_agent", { name: "victim", role: "worker", capabilities: [] }));
-      await barHolds("(c) wrong token, get_messages", port, authLoad(20, "get_messages", { agent_name: "victim" }));
-      await barHolds("(d) unknown token, token-only", port, authLoad(20, "discover_agents", {}));
+      expectBarHolds(await runBar("(b) wrong token, register_agent", port, authLoad(20, "register_agent", { name: "victim", role: "worker", capabilities: [] })));
+      expectBarHolds(await runBar("(c) wrong token, get_messages", port, authLoad(20, "get_messages", { agent_name: "victim" })));
+      expectBarHolds(await runBar("(d) unknown token, token-only", port, authLoad(20, "discover_agents", {})));
     });
-  }, 60_000);
+  }, 300_000);
 
-  it("unknown-provenance rows: wrong tokens are BOUNDED (the source's scan budget) and the loop stays under 50 ms (bcrypt off the loop)", async () => {
+  it("unknown-provenance rows: wrong tokens are BOUNDED (the source's scan budget) and move the loop no more than the control (bcrypt off the loop)", async () => {
     for (let i = 0; i < 4; i++) {
       reg(`legacy-${i}`);
       db.getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run(`legacy-${i}`);
     }
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      // compares are BOUNDED by the source's SCAN budget: at most SCAN_BURST scans of the 4 digest-less rows.
-      await barHolds("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {}), 4 * SCAN_BURST);
+      // per round, compares are BOUNDED by the source's SCAN budget: at most SCAN_BURST scans of the 4 digest-less rows.
+      expectBarHolds(await runBar("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {})), K * 4 * SCAN_BURST);
     });
-  }, 60_000);
+  }, 180_000);
 
-  it("NEGATIVE CONTROL: the same burst plus a loop block sized to the THRESHOLD trips BOTH bars, LOOP and AVAILABILITY, by the same predicates barHolds asserts", async () => {
-    // Architect 47e64b3a: the fault is sized against the bars' thresholds in THIS run, not against bcrypt's
-    // real cost, so it trips on any runner. That a bcrypt on the loop EXISTS is the COUNT assertion's job.
+  it("NEGATIVE CONTROL: a loop block sized 2 x the allowance in EVERY auth round FAILS both predicates (the bar sees a block of the forbidden size)", async () => {
+    // Architect 47e64b3a: sized against the thresholds in THIS run, not against bcrypt's real cost.
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      await measure(port, controlLoad(20)); // the same warm-up as every bar
-      const before = await measure(port, controlLoad(20));
-      const blockMs = 2 * Math.max(LOOP_MAX_MS, before.healthMax + AVAILABILITY_MARGIN_MS);
-      const r = await measure(port, authLoad(20, "discover_agents", {}), () => {
-        const end = performance.now() + blockMs; // block the DAEMON's loop: what an on-loop bcrypt (or a scan of them) does
+      await measure(port, controlLoad(20));
+      const pre = await measure(port, controlLoad(20));
+      const blockMs = 2 * (Math.max(pre.healthMax, pre.eldMax) + MARGIN_MS);
+      const b = await runBar(`negative-control (block=${blockMs.toFixed(1)}ms)`, port, authLoad(20, "discover_agents", {}), () => {
+        const end = performance.now() + blockMs; // block the DAEMON's loop: what an on-loop bcrypt, or a scan of them, does
         while (performance.now() < end) {
           /* busy */
         }
       });
-      const after = await measure(port, controlLoad(20));
-      const controlMax = Math.max(before.healthMax, after.healthMax);
-      console.log(`BAR negative-control | block=${blockMs.toFixed(1)}ms | ${fmt(r)} | control-before ${fmt(before)} | control-after ${fmt(after)}`);
-      expect([r.shed, before.shed, after.shed], "the negative control's bursts reached the daemon").toEqual([0, 0, 0]);
-      // The bars' own predicates, inverted: each must FAIL here, or it cannot see the harm.
-      expect(r.eldMax, "a loop block must exceed the LOOP bar").toBeGreaterThanOrEqual(LOOP_MAX_MS);
-      expect(r.healthMax, `a loop block must exceed the AVAILABILITY bar: control max ${controlMax.toFixed(1)} + ${AVAILABILITY_MARGIN_MS}`).toBeGreaterThan(controlMax + AVAILABILITY_MARGIN_MS);
+      expect([...b.control, ...b.auth].map((r) => r.shed), "the negative control's bursts reached the daemon").toEqual(Array(2 * K).fill(0));
+      // The bar's own predicates, inverted: each must FAIL here, or the bar cannot see the harm.
+      expect(b.med.authEld, "a sized loop block must exceed the LOOP allowance").toBeGreaterThan(b.med.ctlEld + MARGIN_MS);
+      expect(b.med.authHealth, "a sized loop block must exceed the AVAILABILITY allowance").toBeGreaterThan(b.med.ctlHealth + MARGIN_MS);
     });
-  }, 60_000);
+  }, 180_000);
 });
 
 describe("Q4: rejections are audited BOUNDED, one row per (source, reason, window) with a count", () => {

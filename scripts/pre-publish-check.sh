@@ -199,6 +199,10 @@ step "v2.8 state-machine fast smoke (tests/v2-8-*.test.ts)" extension_state_mach
 # is at function level).
 step "vitest run" npx vitest run --pool=forks --no-file-parallelism || exit 1
 
+# PR-B timing bars: latency measurements, so they run ALONE after the suite (the suite skips them unless
+# RELAY_TIMING_BARS=1). Same step as CI's; each run calibrates itself (A/A control + sized negative control).
+step "timing bars (serial, isolated)" env RELAY_TIMING_BARS=1 npx vitest run tests/pr-b-failed-auth.test.ts -t BARS || exit 1
+
 # --- 3. npm audit (fail on high+) ---
 # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high after
 # GHSA-w5hq-g745-h8pq (uuid <14.0.0 buffer bounds in v3/v5/v6 with `buf`)
