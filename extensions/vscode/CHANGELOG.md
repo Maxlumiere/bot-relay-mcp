@@ -4,13 +4,20 @@ All notable changes to the Tether VSCode extension are documented here. Format f
 
 The marketplace surfaces this file directly on the extension's listing page, so each entry is written for end-users — what changed, why it matters, what to do if anything.
 
-## Unreleased — the token vault is found by the relay's own resolver
+## [0.10.0] — 2026-10-06 — the token vault is found by the relay's own resolver
 
 Tether used to find the per-instance token vault with its own copy of the relay's instance resolver. The relay's resolver became strict, and the copy did not: with a damaged or ambiguous instance selection, an instance id of `.` or `..`, or a path outside your home and temp directories, the copy could still read a vault the relay itself refuses. Tether now carries the relay's resolver itself, so it can no longer drift.
 
 - **The same answer as the relay, every time.** Where the relay refuses to pick a DB, Tether does not read a token vault either, and its log says why. A shared table of cases runs through both, and their answers must match.
 - **A different resolver revision is visible.** Tether compares the resolver it carries with the one the relay reports and shows a warning when they differ, so an old Tether talking to a newer relay (or the reverse) is noticed rather than silently reading another vault. It asks at every connect, on its own: `/health` needs no token, so the check runs even when the relay refuses Tether's connection (a rejected token is often what such a mismatch looks like). A check still in flight when Tether reconnects or shuts down is cancelled, so a late answer never overwrites the newer connection's result or writes to a closed output panel.
 - **Windows:** the file-ownership checks cannot apply there; the resolver says so (`roots-only`) instead of passing silently. A symlink or junction whose target is an absolute Windows path (another drive, or a `\\server\share` path) is now followed from that path's root; before, the drive or the server and share names were walked into as if they were folders. The long (`\\?\C:\`, `\\?\UNC\server\share\`) and device (`\\.\C:\`) spellings are read as the ordinary path they name; any other such form is refused, never guessed.
+
+- **Undelivered wakes stay visible (#154).** When Tether cannot find one terminal to wake, it raises a warning in VS Code's notifications list instead of relying on an eight-second status-bar hint. Repeated warnings for the same condition are throttled.
+- **Wake decisions are recorded (#216).** Tether writes its wake-routing decisions and observed inputs to a log in extension storage, so a suppressed wake can be diagnosed. The Output channel reports if that log stops accepting records.
+- **Dependency security updates (#303).** The MCP SDK moves to 1.32.0 for the HTTP transport used by Tether's agent token; the VSIX packager moves to `@vscode/vsce` 4.0.0, removing its vulnerable `braces` dependency chain. Other advisory fixes update `fast-uri`, `qs`, `hono`, `ip-address`, `brace-expansion`, and transitive dependencies.
+- **Test-tool security updates (#306).** Vitest moves to 5.0.3, removing the vulnerable tinypool 1.1.1 and `@vitest/mocker` versions. The extension lockfile also updates `proxy-addr` and `source-map-js`. These test and packaging dependencies do not change Tether's wake behavior.
+
+0.8.0 and 0.9.0 were never released (a local build was mislabelled 0.9.0).
 
 ## [0.7.0] — 2026-07-24 — Claude wakes actually submit: no more prompts piling up waiting for a human Enter
 
