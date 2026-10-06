@@ -62,6 +62,16 @@ Operational implication: key rotation must pair a file edit with a daemon restar
 
 A future `RELAY_ENCRYPTION_KEYRING_WATCH=1` opt-in reload flag is a v2.2 candidate.
 
+### Authorization is atomic within the daemon process, not across processes
+
+Token checks run off the event loop (a worker pool), so a call's verdict is re-checked synchronously right before its handler runs (`revalidate` in `src/auth-verdict.ts`): the agent's state, the credential it matched, a rotation grace window against the clock, and the auth generation. Between that check and the handler's write the daemon does not yield, so no other request in the daemon can interleave.
+
+Another PROCESS writing the same database file can. A CLI verb (`relay recover`, a rotation) or a stdio connector can commit a revocation between the daemon's check and its handler's write. This window existed before the worker pool too (the check and the write were always separate statements), and it needs a writer that already holds a token or the operator's filesystem access. It is closed by ADR-0050 (transactional authorization: the check and the write in one `BEGIN IMMEDIATE` transaction), the next security change.
+
+### A suffixed registration acts on a row its verdict did not name
+
+`register_agent` with `on_name_collision: "suffix"` is authorized by the BASE name's token, but when the base name is held it registers, or reuses, an offline and drained `<name>-N` row. The check before the handler is about the base row; the effect lands on the `<name>-N` row, which carries no check of its own. So a caller holding the base name's token can take over a drained `<name>-N` slot. The principle that closes it, recorded for ADR-0050: an effect on a row other than the verdict's subject needs its own predicate on that row.
+
 This document describes the threat model bot-relay-mcp defends against, the mechanisms that enforce those defenses, and — crucially — what the project does NOT protect. It closes with the vulnerability-disclosure process.
 
 ---

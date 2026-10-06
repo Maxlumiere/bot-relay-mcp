@@ -30,7 +30,7 @@
  * Explicit rotation stays available via `mint-token --force` for the genuine
  * "I want a new token" case (it writes the vault too).
  */
-import bcrypt from "bcryptjs";
+import { verifyCredential } from "./token-verify.js";
 import { mintAgentToken, getAgentAuthData } from "./db.js";
 import { defaultTokenStore } from "./token-store.js";
 
@@ -62,7 +62,7 @@ export async function stableMintOrReuse(
   // Row exists — reuse ONLY if the on-disk vault token authenticates against
   // the stored bcrypt hash.
   const vaultToken = await defaultTokenStore().read(name);
-  if (vaultToken && bcrypt.compareSync(vaultToken, existing.token_hash)) {
+  if (vaultToken && (await verifyCredential(name, { hash: existing.token_hash, lookup: existing.token_lookup }, vaultToken)).verdict === "ok") {
     return { status: "reused", token: vaultToken };
   }
   // Row present but the vault can't prove it — refuse to silently rotate.

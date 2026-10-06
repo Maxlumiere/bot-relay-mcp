@@ -42,16 +42,16 @@ afterEach(() => {
   if (fs.existsSync(TEST_TMP)) fs.rmSync(TEST_TMP, { recursive: true, force: true });
 });
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function surfaceFromHealth(): any {
-  const res = handleHealthCheck({} as never);
+async function surfaceFromHealth(): Promise<any> {
+  const res = await handleHealthCheck({} as never);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return JSON.parse((res.content[0] as any).text).surface;
 }
 
 describe("#tools-list-visibility — the hidden tool surface is observable via health_check", () => {
-  it("a core-only profile reports the hidden tools BY NAME (so hidden != nonexistent != disconnected)", () => {
+  it("a core-only profile reports the hidden tools BY NAME (so hidden != nonexistent != disconnected)", async () => {
     writeConfig({ profile: "solo", feature_bundles: ["core"] });
-    const s = surfaceFromHealth();
+    const s = await surfaceFromHealth();
     expect(s.profile).toBe("solo");
     expect(s.feature_bundles).toEqual(["core"]);
     expect(s.tools_hidden).toBeGreaterThan(0);
@@ -67,15 +67,15 @@ describe("#tools-list-visibility — the hidden tool surface is observable via h
     expect(s.tools_total).toBe(Object.keys(TOOL_BUNDLES).length);
   });
 
-  it("all bundles visible: nothing hidden", () => {
+  it("all bundles visible: nothing hidden", async () => {
     writeConfig({ profile: "team", feature_bundles: ["core", "webhooks", "channels", "admin", "managed-agents"] });
-    const s = surfaceFromHealth();
+    const s = await surfaceFromHealth();
     expect(s.tools_hidden).toBe(0);
     expect(s.hidden_tools).toEqual([]);
     expect(s.tools_visible).toBe(s.tools_total);
   });
 
-  it("resolveSurfaceSummary computes over the full TOOL_BUNDLES inventory (>=30 tools)", () => {
+  it("resolveSurfaceSummary computes over the full TOOL_BUNDLES inventory (>=30 tools)", async () => {
     writeConfig({ feature_bundles: ["core"] });
     const s = resolveSurfaceSummary();
     expect(s.tools_total).toBe(Object.keys(TOOL_BUNDLES).length);

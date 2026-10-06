@@ -56,7 +56,7 @@ afterAll(() => {
 });
 
 describe("ADR-0005 FINAL — auto orphan GC is GONE, not disabled", () => {
-  it("(G1) STRUCTURAL: both retired reapers are gone from the source — the orphan GC and the stale purge", () => {
+  it("(G1) STRUCTURAL: both retired reapers are gone from the source — the orphan GC and the stale purge", async () => {
     expect((dbModule as Record<string, unknown>).gcOrphanRegistrations).toBeUndefined();
     const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "db.ts"), "utf8");
     expect(src).not.toContain("gcOrphanRegistrations");
@@ -66,7 +66,7 @@ describe("ADR-0005 FINAL — auto orphan GC is GONE, not disabled", () => {
     expect(src).not.toContain('"stale_purge"');
   });
 
-  it("(G2) BEHAVIORAL: a maximally-reapable row — never authed, session-less, ancient on BOTH time axes — survives the purge tick", () => {
+  it("(G2) BEHAVIORAL: a maximally-reapable row — never authed, session-less, ancient on BOTH time axes — survives the purge tick", async () => {
     // Both axes matter and both are aged deliberately: the retired orphan GC
     // keyed on created_at, the retired 30-day dead-agent purge keyed on
     // last_seen. Codex caught the first version of this test aging only
@@ -81,7 +81,7 @@ describe("ADR-0005 FINAL — auto orphan GC is GONE, not disabled", () => {
     expect(getAgentAuthData("ancient-orphan")).not.toBeNull();
   });
 
-  it("(G2b) an ESTABLISHED identity idle for a year also survives — the old dead-agent purge reaped these on last_seen alone", () => {
+  it("(G2b) an ESTABLISHED identity idle for a year also survives — the old dead-agent purge reaped these on last_seen alone", async () => {
     // The 30-day purge did not even check establishment: a working,
     // token-authed agent that went idle 31 days was deleted and its name
     // freed for anyone to claim. This is the regression that keeps THAT
@@ -90,7 +90,7 @@ describe("ADR-0005 FINAL — auto orphan GC is GONE, not disabled", () => {
     const { resolveAgentByToken } = dbModule as unknown as {
       resolveAgentByToken: (t: string) => unknown;
     };
-    resolveAgentByToken(reg.plaintext_token!); // authenticates → established
+    await resolveAgentByToken(reg.plaintext_token!); // authenticates → established
     const ancient = new Date(Date.now() - 365 * 24 * 3600_000).toISOString();
     getDb()
       .prepare("UPDATE agents SET session_id = NULL, last_seen = ? WHERE name = ?")
@@ -99,7 +99,7 @@ describe("ADR-0005 FINAL — auto orphan GC is GONE, not disabled", () => {
     expect(getAgentAuthData("idle-established")).not.toBeNull();
   });
 
-  it("(G3) the surviving deletion path still requires the ASKING principal — abandon with the handle works, absence of the ask preserves the row forever", () => {
+  it("(G3) the surviving deletion path still requires the ASKING principal — abandon with the handle works, absence of the ask preserves the row forever", async () => {
     const reg = registerAgent("asked-orphan", "worker", []);
     getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = ?").run("asked-orphan");
     // No ask → no deletion, however many ticks pass.
@@ -107,7 +107,7 @@ describe("ADR-0005 FINAL — auto orphan GC is GONE, not disabled", () => {
     purgeOldRecords(getDb());
     expect(getAgentAuthData("asked-orphan")).not.toBeNull();
     // The ask (principal proves the one-time handle) → deletion.
-    expect(abandonRegistration("asked-orphan", reg.registration_recovery!)).toEqual({ abandoned: true });
+    expect(await abandonRegistration("asked-orphan", reg.registration_recovery!)).toEqual({ abandoned: true });
     expect(getAgentAuthData("asked-orphan")).toBeNull();
   });
 });

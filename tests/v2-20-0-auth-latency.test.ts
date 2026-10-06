@@ -83,14 +83,15 @@ function reg(name: string, caps: string[] = [], managed = false): string {
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0003 A — lookup digest + schema", () => {
-  it("computeTokenLookup is deterministic + distinguishes tokens", () => {
+  it("computeTokenLookup is deterministic + distinguishes tokens", async () => {
     const a = computeTokenLookup("tok-A");
     expect(a).toBe(computeTokenLookup("tok-A"));
     expect(a).not.toBe(computeTokenLookup("tok-B"));
-    expect(a).toMatch(/^[0-9a-f]{64}$/); // HMAC-SHA256 hex
+    // PR-B: the stored form NAMES its key: "<key-id>|<HMAC-SHA256 hex>".
+    expect(a).toMatch(/^(kr:[a-zA-Z0-9_.-]+|px:[0-9a-f]{16})\|[0-9a-f]{64}$/);
   });
 
-  it("register populates token_lookup = HMAC(token) + auth_meta exists", () => {
+  it("register populates token_lookup = HMAC(token) + auth_meta exists", async () => {
     const tok = reg("alice");
     const row = getAgentAuthData("alice")!;
     expect(row.token_lookup).toBe(computeTokenLookup(tok));
@@ -100,68 +101,68 @@ describe("ADR-0003 A — lookup digest + schema", () => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0003 B — O(1) locator", () => {
-  it("resolveAgentByToken identifies the caller + caps via the index", () => {
+  it("resolveAgentByToken identifies the caller + caps via the index", async () => {
     const tok = reg("bob", ["tasks"]);
-    const r = resolveAgentByToken(tok);
+    const r = await resolveAgentByToken(tok);
     expect(r).toEqual({ name: "bob", capabilities: ["tasks"] });
   });
 
-  it("a non-matching token resolves to null", () => {
+  it("a non-matching token resolves to null", async () => {
     reg("carol");
-    expect(resolveAgentByToken("not-a-real-token")).toBeNull();
+    expect(await resolveAgentByToken("not-a-real-token")).toBeNull();
   });
 
-  it("the locator hit populates the verified-token cache", () => {
+  it("the locator hit populates the verified-token cache", async () => {
     const tok = reg("dave");
     expect(authCacheSize()).toBe(0);
-    resolveAgentByToken(tok);
+    await resolveAgentByToken(tok);
     expect(authCacheSize()).toBe(1);
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0003 C — cache is consulted, generation invalidates it", () => {
-  it("serves a cached verdict without re-running bcrypt (gen unchanged)", () => {
+  it("serves a cached verdict without re-running bcrypt (gen unchanged)", async () => {
     const tok = reg("erin");
-    resolveAgentByToken(tok); // caches under the current generation
+    await resolveAgentByToken(tok); // caches under the current generation
     // Corrupt token_hash WITHOUT bumping the generation (simulating a raw write).
     getDb().prepare("UPDATE agents SET token_hash = ? WHERE name = ?").run("$2b$10$corruptedhashvalue", "erin");
     // A cache hit returns the identity even though bcrypt would now fail.
-    expect(resolveAgentByToken(tok)).toEqual({ name: "erin", capabilities: [] });
+    expect(await resolveAgentByToken(tok)).toEqual({ name: "erin", capabilities: [] });
     // Once the generation moves, the cache entry is dead → re-verify → deny.
     bumpAuthGeneration();
-    expect(resolveAgentByToken(tok)).toBeNull();
+    expect(await resolveAgentByToken(tok)).toBeNull();
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0003 C — invalidation per mutation path", () => {
-  it("REVOKE-TRAP: a revoked token is denied on the next call (token_hash retained)", () => {
+  it("REVOKE-TRAP: a revoked token is denied on the next call (token_hash retained)", async () => {
     const tok = reg("frank");
-    expect(resolveAgentByToken(tok)).not.toBeNull(); // caches
+    expect(await resolveAgentByToken(tok)).not.toBeNull(); // caches
     revokeAgentToken("frank");
     // token_hash is preserved for forensics → still bcrypt-matches — but denied.
     expect(getAgentAuthData("frank")!.token_hash).toBeTruthy();
-    expect(resolveAgentByToken(tok)).toBeNull();
+    expect(await resolveAgentByToken(tok)).toBeNull();
   });
 
-  it("ROTATE (unmanaged): old token dies, new token works", () => {
+  it("ROTATE (unmanaged): old token dies, new token works", async () => {
     const oldTok = reg("grace");
-    resolveAgentByToken(oldTok); // caches old
+    await resolveAgentByToken(oldTok); // caches old
     const { newPlaintextToken } = rotateAgentToken("grace", getAgentAuthData("grace")!.token_hash!);
-    expect(resolveAgentByToken(oldTok)).toBeNull();
-    expect(resolveAgentByToken(newPlaintextToken)).toEqual({ name: "grace", capabilities: [] });
+    expect(await resolveAgentByToken(oldTok)).toBeNull();
+    expect(await resolveAgentByToken(newPlaintextToken)).toEqual({ name: "grace", capabilities: [] });
   });
 
-  it("ROTATE (admin): old token dies, new works", () => {
+  it("ROTATE (admin): old token dies, new works", async () => {
     const oldTok = reg("heidi");
-    resolveAgentByToken(oldTok);
+    await resolveAgentByToken(oldTok);
     const { newPlaintextToken } = rotateAgentTokenAdmin("heidi");
-    expect(resolveAgentByToken(oldTok)).toBeNull();
-    expect(resolveAgentByToken(newPlaintextToken)).not.toBeNull();
+    expect(await resolveAgentByToken(oldTok)).toBeNull();
+    expect(await resolveAgentByToken(newPlaintextToken)).not.toBeNull();
   });
 
-  it("MANAGED GRACE: both tokens work during grace; only the new token after sweep", () => {
+  it("MANAGED GRACE: both tokens work during grace; only the new token after sweep", async () => {
     const oldTok = reg("ivan", [], true);
     const { newPlaintextToken } = rotateAgentToken("ivan", getAgentAuthData("ivan")!.token_hash!, {
       graceSeconds: 3600,
@@ -170,45 +171,45 @@ describe("ADR-0003 C — invalidation per mutation path", () => {
     const row = getAgentAuthData("ivan")!;
     expect(row.token_lookup).toBe(computeTokenLookup(newPlaintextToken));
     expect(row.previous_token_lookup).toBe(computeTokenLookup(oldTok));
-    expect(resolveAgentByToken(oldTok)).not.toBeNull();
-    expect(resolveAgentByToken(newPlaintextToken)).not.toBeNull();
+    expect(await resolveAgentByToken(oldTok)).not.toBeNull();
+    expect(await resolveAgentByToken(newPlaintextToken)).not.toBeNull();
     // Force the grace window into the past, then sweep.
     getDb()
       .prepare("UPDATE agents SET rotation_grace_expires_at = ? WHERE name = ?")
       .run(new Date(Date.now() - 1000).toISOString(), "ivan");
     sweepExpiredRotationGrace();
-    expect(resolveAgentByToken(oldTok)).toBeNull(); // old token retired
-    expect(resolveAgentByToken(newPlaintextToken)).not.toBeNull();
+    expect(await resolveAgentByToken(oldTok)).toBeNull(); // old token retired
+    expect(await resolveAgentByToken(newPlaintextToken)).not.toBeNull();
   });
 
-  it("UNREGISTER: the token no longer resolves", () => {
+  it("UNREGISTER: the token no longer resolves", async () => {
     const tok = reg("judy");
-    resolveAgentByToken(tok);
+    await resolveAgentByToken(tok);
     unregisterAgent("judy");
-    expect(resolveAgentByToken(tok)).toBeNull();
+    expect(await resolveAgentByToken(tok)).toBeNull();
   });
 
-  it("CAPS CHANGE: a cached verdict refreshes to the new capabilities", () => {
+  it("CAPS CHANGE: a cached verdict refreshes to the new capabilities", async () => {
     const tok = reg("mallory", ["tasks"]);
-    expect(resolveAgentByToken(tok)!.capabilities).toEqual(["tasks"]);
+    expect((await resolveAgentByToken(tok) as { capabilities: string[] }).capabilities).toEqual(["tasks"]);
     expandAgentCapabilities("mallory", ["tasks", "admin"]); // superset (expand-only)
-    expect(resolveAgentByToken(tok)!.capabilities.sort()).toEqual(["admin", "tasks"]);
+    expect((await resolveAgentByToken(tok) as { capabilities: string[] }).capabilities.sort()).toEqual(["admin", "tasks"]);
   });
 
-  it("NON-INVALIDATING (mark offline): the cached verdict SURVIVES", () => {
+  it("NON-INVALIDATING (mark offline): the cached verdict SURVIVES", async () => {
     const tok = reg("niaj");
     const sid = getAgentAuthData("niaj")!.session_id!;
     const genBefore = getAuthGeneration();
-    resolveAgentByToken(tok);
+    await resolveAgentByToken(tok);
     markAgentOffline("niaj", sid);
     expect(getAuthGeneration()).toBe(genBefore); // no bump
-    expect(resolveAgentByToken(tok)).toEqual({ name: "niaj", capabilities: [] });
+    expect(await resolveAgentByToken(tok)).toEqual({ name: "niaj", capabilities: [] });
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ADR-0003 D — migration NULL fallback + self-heal (no lockout)", () => {
-  it("a NULL-token_lookup agent still authenticates (O(N) fallback) + self-heals", () => {
+  it("a NULL-token_lookup agent still authenticates (O(N) fallback) + self-heals", async () => {
     const tok = reg("olivia");
     // Simulate a legacy pre-migration row: clear the digest columns.
     getDb().prepare("UPDATE agents SET token_lookup = NULL, previous_token_lookup = NULL WHERE name = ?").run("olivia");
@@ -216,20 +217,20 @@ describe("ADR-0003 D — migration NULL fallback + self-heal (no lockout)", () =
     expect(getAgentAuthData("olivia")!.token_lookup).toBeNull();
 
     // Fallback still authenticates — zero lockout.
-    expect(resolveAgentByToken(tok)).toEqual({ name: "olivia", capabilities: [] });
+    expect(await resolveAgentByToken(tok)).toEqual({ name: "olivia", capabilities: [] });
     // ...and lazily self-heals the digest so the next call is O(1).
     expect(getAgentAuthData("olivia")!.token_lookup).toBe(computeTokenLookup(tok));
   });
 
-  it("findAgentRowByToken feeds both call sites (identifies a revoked row too)", () => {
+  it("findAgentRowByToken feeds both call sites (identifies a revoked row too)", async () => {
     const tok = reg("peggy");
     revokeAgentToken("peggy");
-    const found = findAgentRowByToken(tok);
+    const found = await findAgentRowByToken(tok);
     // Identification still works (for checkToken's revoked reporting), even
     // though resolveAgentByToken (the caller path) denies it.
     expect(found?.row.name).toBe("peggy");
     expect(found?.row.auth_state).toBe("revoked");
-    expect(resolveAgentByToken(tok)).toBeNull();
+    expect(await resolveAgentByToken(tok)).toBeNull();
   });
 });
 

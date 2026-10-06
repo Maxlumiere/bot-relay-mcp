@@ -153,8 +153,9 @@ export async function run(argv: string[]): Promise<number> {
         // Registered agent — the vault token MUST authenticate. Even with
         // --mint-if-missing a mismatch is NOT silently rotated (that needs
         // `mint-token --force`); it refuses locally with NO POST.
-        const bcrypt = (await import("bcryptjs")).default;
-        if (vaultToken && bcrypt.compareSync(vaultToken, authData.token_hash)) {
+        // PR-B: the shared verifier (a known digest decides a mismatch with no bcrypt; bcrypt in the pool).
+        const { verifyCredential } = await import("../token-verify.js");
+        if (vaultToken && (await verifyCredential(from, { hash: authData.token_hash, lookup: authData.token_lookup }, vaultToken)).verdict === "ok") {
           token = vaultToken;
         } else {
           process.stderr.write(

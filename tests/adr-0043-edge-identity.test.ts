@@ -373,7 +373,7 @@ describe("ADR-0043 — edge_id is visible locally (whoami / health_check)", () =
   it("health_check reports this relay's edge_id", async () => {
     const local = (await edgeRow())!.edge_id;
     const { handleHealthCheck } = await import("../src/tools/status.js");
-    const r = JSON.parse((handleHealthCheck({} as never) as { content: { text: string }[] }).content[0].text);
+    const r = JSON.parse(((await handleHealthCheck({} as never)) as { content: { text: string }[] }).content[0].text);
     expect(r.edge_id).toBe(local);
   });
 

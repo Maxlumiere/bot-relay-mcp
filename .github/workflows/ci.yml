@@ -103,6 +103,14 @@ jobs:
         # (--no-file-parallelism) never does. This keeps most parallelism.
         run: npx vitest run --maxWorkers=2
 
+      - name: Timing bars, serial and isolated (failed-auth loop + availability)
+        # The PR-B timing bars measure LATENCY, so they run ALONE after the suite: in parallel with ~300
+        # files the runner's own noise (MEASURED: 30-165 ms) exceeds the margins they resolve. They stay in
+        # the gate. Each run calibrates itself: an A/A control that must pass and a sized negative control
+        # that must fail. The BAR lines are the numbers to report.
+        # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
+        run: node scripts/run-timing-bars.mjs
+
       - name: npm audit (high+) — via resilience wrapper
         # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
         # after GHSA-w5hq-g745-h8pq (uuid <14 buffer bounds, v3/v5/v6+buf).
@@ -165,6 +173,14 @@ jobs:
         # file-parallelism oversubscribes and flakes; the pre-publish gate
         # (--no-file-parallelism) never does. This keeps most parallelism.
         run: npx vitest run --maxWorkers=2
+
+      - name: Timing bars, serial and isolated (failed-auth loop + availability)
+        # The PR-B timing bars measure LATENCY, so they run ALONE after the suite: in parallel with ~300
+        # files the runner's own noise (MEASURED: 30-165 ms) exceeds the margins they resolve. They stay in
+        # the gate. Each run calibrates itself: an A/A control that must pass and a sized negative control
+        # that must fail. The BAR lines are the numbers to report.
+        # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
+        run: node scripts/run-timing-bars.mjs
 
       - name: Assert the suite installed NO real launchd service
         run: |

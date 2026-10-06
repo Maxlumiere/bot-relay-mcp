@@ -50,7 +50,7 @@ beforeEach(async () => {
 afterEach(() => cleanup());
 
 describe("wasm driver — ADR-0003 parity", () => {
-  it("schema v20 columns + auth_meta counter exist", () => {
+  it("schema v20 columns + auth_meta counter exist", async () => {
     const cols = (getDb().prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).map((c) => c.name);
     expect(cols).toContain("token_lookup");
     expect(cols).toContain("previous_token_lookup");
@@ -58,23 +58,23 @@ describe("wasm driver — ADR-0003 parity", () => {
     expect(meta.generation).toBeGreaterThanOrEqual(0);
   });
 
-  it("register populates the digest + resolveAgentByToken works", () => {
+  it("register populates the digest + resolveAgentByToken works", async () => {
     const { plaintext_token } = registerAgent("w-alice", "worker", ["tasks"]);
     expect(getAgentAuthData("w-alice")!.token_lookup).toBe(computeTokenLookup(plaintext_token!));
-    expect(resolveAgentByToken(plaintext_token!)).toEqual({ name: "w-alice", capabilities: ["tasks"] });
+    expect(await resolveAgentByToken(plaintext_token!)).toEqual({ name: "w-alice", capabilities: ["tasks"] });
   });
 
-  it("revoke-trap: revoked token denied on next call", () => {
+  it("revoke-trap: revoked token denied on next call", async () => {
     const { plaintext_token } = registerAgent("w-bob", "worker", []);
-    expect(resolveAgentByToken(plaintext_token!)).not.toBeNull();
+    expect(await resolveAgentByToken(plaintext_token!)).not.toBeNull();
     revokeAgentToken("w-bob");
-    expect(resolveAgentByToken(plaintext_token!)).toBeNull();
+    expect(await resolveAgentByToken(plaintext_token!)).toBeNull();
   });
 
-  it("rotate: old token dies, new token works", () => {
+  it("rotate: old token dies, new token works", async () => {
     const { plaintext_token } = registerAgent("w-carol", "worker", []);
     const { newPlaintextToken } = rotateAgentToken("w-carol", getAgentAuthData("w-carol")!.token_hash!);
-    expect(resolveAgentByToken(plaintext_token!)).toBeNull();
-    expect(resolveAgentByToken(newPlaintextToken)).not.toBeNull();
+    expect(await resolveAgentByToken(plaintext_token!)).toBeNull();
+    expect(await resolveAgentByToken(newPlaintextToken)).not.toBeNull();
   });
 });

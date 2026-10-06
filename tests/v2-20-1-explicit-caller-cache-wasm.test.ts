@@ -29,6 +29,7 @@ const {
   getDb,
   registerAgent,
   bumpAuthGeneration,
+  getAuthGeneration,
   getAgentAuthData,
   explicitCallerCacheGet,
   explicitCallerCachePut,
@@ -51,7 +52,7 @@ afterEach(() => cleanup());
 describe("wasm driver — v2.20.1 explicit-caller cache parity", () => {
   it("put → get, impersonation gate, generation invalidation", () => {
     const { plaintext_token } = registerAgent("w-x", "r", ["tasks"]);
-    explicitCallerCachePut(plaintext_token!, getAgentAuthData("w-x")!, ["tasks"]);
+    explicitCallerCachePut(plaintext_token!, getAgentAuthData("w-x")!, ["tasks"], getAuthGeneration());
     expect(explicitCallerCacheGet(plaintext_token!, "w-x")).toEqual({ name: "w-x", capabilities: ["tasks"] });
     expect(explicitCallerCacheGet(plaintext_token!, "w-y")).toBeNull(); // impersonation
     bumpAuthGeneration();
@@ -62,7 +63,7 @@ describe("wasm driver — v2.20.1 explicit-caller cache parity", () => {
     const { plaintext_token } = registerAgent("w-heal", "r", []);
     getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run("w-heal");
     authCacheClear();
-    explicitCallerCachePut(plaintext_token!, getAgentAuthData("w-heal")!, []);
+    explicitCallerCachePut(plaintext_token!, getAgentAuthData("w-heal")!, [], getAuthGeneration());
     expect(getAgentAuthData("w-heal")!.token_lookup).toBe(computeTokenLookup(plaintext_token!));
   });
 });

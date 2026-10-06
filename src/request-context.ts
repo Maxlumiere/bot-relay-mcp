@@ -40,6 +40,17 @@ export interface RequestContext {
    * reissue race in Phase 4b.1 v2.
    */
   verifiedRecoveryHash?: string | null;
+  /**
+   * PR-B (architect 64131354): the registration-recovery hash the dispatcher VERIFIED an
+   * abandon_registration handle against (an async, pooled compare under the auth-generation
+   * re-check), so the SYNC handler deletes only while the row still carries it. Unset: not verified.
+   */
+  verifiedAbandonHash?: string | null;
+  /**
+   * PR-B (architect b11ef8ad): the verdict enforceAuth allowed this call on, with its evidence. The dispatcher
+   * revalidates it synchronously after the last await (src/auth-verdict.ts); a call without one is refused.
+   */
+  authVerdict?: import("./auth-verdict.js").AuthVerdict;
 }
 
 export const requestContext = new AsyncLocalStorage<RequestContext>();

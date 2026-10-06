@@ -18,8 +18,8 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
-import { verifyToken } from "../auth.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
+import { verifyCredential } from "../token-verify.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "./websocket.js";
@@ -1051,7 +1051,7 @@ export function startHttpServer(port: number, host: string): Server {
   // POST /api/send-message — proxy to db.sendMessage. `from` must be an
   // existing registered agent; any already-existing dispatcher checks on
   // SENDER_NOT_REGISTERED surface through.
-  app.post("/api/send-message", dashboardAuthCheck, operatorAuthCheck, originCheck, (req: Request, res: Response) => {
+  app.post("/api/send-message", dashboardAuthCheck, operatorAuthCheck, originCheck, async (req: Request, res: Response) => {
     const parsed = ApiSendMessageSchema.safeParse(req.body);
     if (!parsed.success) {
       logDashboardAudit(
@@ -1097,6 +1097,10 @@ export function startHttpServer(port: number, host: string): Server {
           ? headerFromToken
           : null);
     let fromAuthenticated = false;
+    // PR-B (architect 07fe7cfc): the send below is a write AUTHORIZED by an awaited verify. The
+    // generation is read WITH the row; if it moved while the token was being verified (a revoke, rotate
+    // or recovery landed), the verdict may be stale, so the send is refused with "retry", never made.
+    const fromGen = getAuthGeneration();
     const fromRow = getAgentAuthData(parsed.data.from);
     if (fromRow && fromRow.token_hash) {
       // The from-agent is registered AND has a token_hash → caller MUST
@@ -1119,7 +1123,18 @@ export function startHttpServer(port: number, host: string): Server {
         });
         return;
       }
-      if (!verifyToken(fromAgentToken, fromRow.token_hash)) {
+      // PR-B: decided by the shared verifier (a known digest decides a wrong token with no bcrypt;
+      // bcrypt only in the worker pool). A refusal that did not decide the token is a 429, never 403.
+      const fromVerdict = (await verifyCredential(fromRow.name, { hash: fromRow.token_hash, lookup: fromRow.token_lookup }, fromAgentToken, extractSourceIp(req, config.trusted_proxies) ?? "http")).verdict;
+      if (fromVerdict === "throttled" || fromVerdict === "busy") {
+        res.status(429).json({
+          success: false,
+          error: fromVerdict === "throttled" ? "Too many failed token attempts from this source: wait and retry." : "The relay is busy verifying credentials: retry.",
+          error_code: "RATE_LIMITED",
+        });
+        return;
+      }
+      if (fromVerdict !== "ok") {
         logDashboardAudit(
           req,
           "send_message",
@@ -1143,11 +1158,19 @@ export function startHttpServer(port: number, host: string): Server {
         });
         return;
       }
+      if (getAuthGeneration() !== fromGen) {
+        res.status(429).json({
+          success: false,
+          error: "Auth state changed while from_agent_token was being verified: retry.",
+          error_code: "RATE_LIMITED",
+        });
+        return;
+      }
       fromAuthenticated = true;
       // ADR-0005 (codex #115): a verified from_agent_token IS a successful token
       // verification — stamp first_authed_at so this agent (incl. `relay send`
       // callers, which POST here) can never be reaped by the orphan-GC.
-      markAgentAuthenticated(parsed.data.from);
+      markAgentAuthenticated(parsed.data.from, { basis: "current", hash: fromRow.token_hash });
     } else if (fromAgentToken) {
       // No registered row OR row has no token_hash, but caller supplied
       // a token anyway. Pre-v2.7.1 this returned 403 with a confusing

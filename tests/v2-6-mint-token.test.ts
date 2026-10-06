@@ -17,6 +17,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import bcryptForTest from "bcryptjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -103,7 +104,7 @@ describe("v2.6 — relay mint-token CLI", () => {
     // Token authenticates against stored hash.
     const auth = getAgentAuthData("codex");
     expect(auth).toBeDefined();
-    const { verifyToken } = await import("../src/auth.js");
+    const verifyToken = (t: string, h: string): boolean => bcryptForTest.compareSync(t, h); // PR-B: no sync verify in src
     expect(verifyToken(plaintext, auth!.token_hash!)).toBe(true);
   });
 
@@ -124,7 +125,7 @@ describe("v2.6 — relay mint-token CLI", () => {
     const { initializeDb, getAgentAuthData } = await import("../src/db.js");
     await initializeDb();
     const auth = getAgentAuthData("existing");
-    const { verifyToken } = await import("../src/auth.js");
+    const verifyToken = (t: string, h: string): boolean => bcryptForTest.compareSync(t, h); // PR-B: no sync verify in src
     expect(verifyToken(t1, auth!.token_hash!)).toBe(true);
   });
 
@@ -159,7 +160,7 @@ describe("v2.6 — relay mint-token CLI", () => {
     await initializeDb();
     const db = getDb();
     const auth = getAgentAuthData("rotater");
-    const { verifyToken } = await import("../src/auth.js");
+    const verifyToken = (t: string, h: string): boolean => bcryptForTest.compareSync(t, h); // PR-B: no sync verify in src
 
     // New token authenticates; old does not.
     expect(verifyToken(t2, auth!.token_hash!)).toBe(true);

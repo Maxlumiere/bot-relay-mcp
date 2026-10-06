@@ -102,7 +102,7 @@ describe("ADR-0005 — every identity-establishment path stamps established_at",
   it("#2 token-only resolver (resolveAgentByToken) establishes", async () => {
     const token = await register("est-tokenonly");
     expect(established("est-tokenonly")).toBeNull();
-    expect(resolveAgentByToken(token)).not.toBeNull();
+    expect(await resolveAgentByToken(token)).not.toBeNull();
     expect(established("est-tokenonly")).not.toBeNull();
   });
 

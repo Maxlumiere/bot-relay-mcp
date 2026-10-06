@@ -119,8 +119,9 @@ export async function run(argv: string[]): Promise<number> {
       const vaultToken = await defaultTokenStore().read(agent);
       const authData = getAgentAuthData(agent);
       if (authData && authData.token_hash) {
-        const bcrypt = (await import("bcryptjs")).default;
-        if (vaultToken && bcrypt.compareSync(vaultToken, authData.token_hash)) {
+        // PR-B: the shared verifier (a known digest decides a mismatch with no bcrypt; bcrypt in the pool).
+        const { verifyCredential } = await import("../token-verify.js");
+        if (vaultToken && (await verifyCredential(agent, { hash: authData.token_hash, lookup: authData.token_lookup }, vaultToken)).verdict === "ok") {
           token = vaultToken;
         } else {
           process.stderr.write(

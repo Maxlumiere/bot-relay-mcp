@@ -18,6 +18,7 @@
 
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
+import { verifyCredential, type CredentialVerdict, type StoredCredential } from "./token-verify.js";
 
 // v2.6.0: exported so the CLI mint-token regression test can pin the cost
 // factor without duplicating the constant. Any future bump (e.g. 10 → 12)
@@ -35,18 +36,16 @@ export function generateToken(): string {
   return crypto.randomBytes(TOKEN_BYTE_LEN).toString("base64url");
 }
 
-/** Hash a token for storage. Returns bcrypt hash (includes salt). */
+/**
+ * Hash a token for storage. Returns bcrypt hash (includes salt).
+ *
+ * PR-B (architect 8c8ef8ea): this is the ONLY sync bcrypt left in src, and it is called only at the
+ * inventoried write sites inside SQLite transactions (where an awaited worker call is impossible),
+ * each a NAMED exception in tests/pr-b-auth-invariants.test.ts. Every bcrypt COMPARE runs in the
+ * worker pool (bcrypt-pool.ts) through token-verify.ts; there is no sync verify any more.
+ */
 export function hashToken(token: string): string {
   return bcrypt.hashSync(token, BCRYPT_ROUNDS);
-}
-
-/** Verify a token against a stored hash. */
-export function verifyToken(token: string, hash: string): boolean {
-  try {
-    return bcrypt.compareSync(token, hash);
-  } catch {
-    return false;
-  }
 }
 
 /** Whether the legacy grace period is active (env-driven). */
@@ -57,6 +56,12 @@ export function isLegacyGraceActive(): boolean {
 export interface AuthResult {
   ok: boolean;
   reason?: string;
+  /**
+   * PR-B (architect b11ef8ad): on success, WHICH stored credential the token matched. The dispatcher records
+   * it in the call's verdict, and revalidate (src/auth-verdict.ts) re-checks it, and any time predicate on it
+   * (a previous credential's grace window), synchronously at the point of use.
+   */
+  matched?: "current" | "previous";
   /** The legacy-acceptance path was used (no token check). */
   legacy?: boolean;
   /**
@@ -76,6 +81,10 @@ export interface AuthResult {
   callerName?: string;
   /** The resolved caller's capabilities (JSON-parsed). */
   callerCapabilities?: string[];
+  /** PR-B: refused WITHOUT a compare: this (source, name) spent its failed-auth throttle. */
+  throttled?: boolean;
+  /** PR-B: refused at once: the bcrypt pool is full ("busy, retry"). */
+  busy?: boolean;
 }
 
 /** v2.1 Phase 4b.1 v2: minimal shape of the row needed for auth state checks. */
@@ -92,8 +101,8 @@ export type AuthStateInput =
  * every other state; required when `authState === "rotation_grace"`.
  */
 export interface RotationGraceInputs {
-  /** bcrypt hash of the PRE-rotation token. Auth succeeds if presented token matches this AND grace hasn't expired. */
-  previousTokenHash?: string | null;
+  /** The PRE-rotation token's credential (bcrypt hash + lookup digest). Auth succeeds if the presented token matches it AND grace hasn't expired. */
+  previous?: StoredCredential | null;
   /** ISO8601 timestamp of grace-window expiry. Auth using previousTokenHash rejected once now() >= this. */
   rotationGraceExpiresAt?: string | null;
 }
@@ -173,19 +182,21 @@ export const TOOLS_NO_AUTH: ReadonlySet<string> = new Set([
  *
  * @param claimedName  The agent name the caller claims to be.
  * @param tokenOrNull  The raw token presented, or null if none was sent.
- * @param storedHash   The stored bcrypt hash (null iff state=legacy_bootstrap).
+ * @param stored       The stored credential: bcrypt hash + lookup digest (no hash iff state=legacy_bootstrap).
+ *                     PR-B: decided by token-verify.ts (failures never hash on a known digest; bcrypt
+ *                     only in the worker pool).
  * @param authState    v2.1: explicit auth-state of the target row. Defaults to
  *                     `"active"` when not supplied (backward-compat during
  *                     pre-migration startup; once migrateSchemaToV2_1 runs,
  *                     every row carries an explicit value).
  */
-export function authenticateAgent(
+export async function authenticateAgent(
   claimedName: string,
   tokenOrNull: string | null,
-  storedHash: string | null,
+  stored: StoredCredential | null,
   authState: AuthStateInput = "active",
   graceInputs: RotationGraceInputs = {}
-): AuthResult {
+): Promise<AuthResult> {
   // Terminal state. No recovery path from here without unregister_agent.
   if (authState === "revoked") {
     return {
@@ -203,6 +214,13 @@ export function authenticateAgent(
       reason: `Agent "${claimedName}" is in recovery. Re-register via register_agent with a valid recovery_token obtained from the revoker.`,
     };
   }
+  // PR-B: a refusal that did NOT decide the token (the throttle, or a full pool) says so.
+  const undecided = (v: CredentialVerdict): AuthResult | null =>
+    v === "throttled"
+      ? { ok: false, throttled: true, reason: `Too many failed token attempts for agent "${claimedName}" from this source: wait and retry.` }
+      : v === "busy"
+        ? { ok: false, busy: true, reason: "The relay is busy verifying credentials: retry." }
+        : null;
   // v2.1 Phase 4b.2: rotation_grace — both the NEW (token_hash) and PREVIOUS
   // (previous_token_hash) tokens are valid until the grace window expires.
   // Auto-expiry cleanup is handled by the piggyback tick in server.ts; this
@@ -219,16 +237,21 @@ export function authenticateAgent(
       };
     }
     // New token always works during rotation_grace.
-    if (storedHash && verifyToken(tokenOrNull, storedHash)) {
-      return { ok: true };
+    if (stored?.hash) {
+      const v = (await verifyCredential(claimedName, stored, tokenOrNull)).verdict;
+      if (v === "ok") return { ok: true, matched: "current" };
+      const u = undecided(v);
+      if (u) return u;
     }
     // Old token works ONLY while grace hasn't expired.
-    if (
-      !expired &&
-      graceInputs.previousTokenHash &&
-      verifyToken(tokenOrNull, graceInputs.previousTokenHash)
-    ) {
-      return { ok: true };
+    if (!expired && graceInputs.previous?.hash) {
+      const v = (await verifyCredential(claimedName, graceInputs.previous, tokenOrNull)).verdict;
+      // The compare is AWAITED (the pool), so the window can close while it runs: the verdict says it rests on
+      // the PREVIOUS credential, and revalidate re-checks the window against the clock at the point of use
+      // (one site for every await, architect b11ef8ad), never here.
+      if (v === "ok") return { ok: true, matched: "previous" };
+      const u = undecided(v);
+      if (u) return u;
     }
     return {
       ok: false,
@@ -249,7 +272,7 @@ export function authenticateAgent(
   }
 
   // authState === "active"
-  if (!storedHash) {
+  if (!stored?.hash) {
     // Defensive: cannot happen in the new model post-migration (active rows
     // always have a hash). Fail closed if data integrity is broken.
     return {
@@ -263,11 +286,7 @@ export function authenticateAgent(
       reason: `Agent "${claimedName}" requires an agent_token. Pass it as the agent_token tool input field or via the X-Agent-Token HTTP header.`,
     };
   }
-  if (!verifyToken(tokenOrNull, storedHash)) {
-    return {
-      ok: false,
-      reason: `Invalid token for agent "${claimedName}".`,
-    };
-  }
-  return { ok: true };
+  const v = (await verifyCredential(claimedName, stored, tokenOrNull)).verdict;
+  if (v === "ok") return { ok: true, matched: "current" };
+  return undecided(v) ?? { ok: false, reason: `Invalid token for agent "${claimedName}".` };
 }

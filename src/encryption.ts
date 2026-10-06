@@ -306,6 +306,17 @@ export function deriveKeyringSubkey(info: string): Buffer | null {
 }
 
 /**
+ * PR-B: the same HKDF subkey as deriveKeyringSubkey, but of ANY key the keyring still holds (not
+ * only the current one), so a digest written under a retained key can still be computed. null when
+ * no keyring is configured or it does not hold `keyId`. Raw keys still never leave this module.
+ */
+export function deriveKeyringSubkeyFor(keyId: string, info: string): Buffer | null {
+  const kr = loadKeyring();
+  if (!kr || !Object.prototype.hasOwnProperty.call(kr.keys, keyId)) return null;
+  return Buffer.from(crypto.hkdfSync("sha256", kr.keys[keyId], Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
+}
+
+/**
  * Whether `RELAY_ENCRYPTION_KEY` is being used — flag so callers can emit
  * the one-time deprecation warning at startup.
  */
