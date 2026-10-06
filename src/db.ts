@@ -6522,6 +6522,21 @@ export interface PendingMeta {
 }
 
 /**
+ * Doorbell PR 6 (plan §v4; ruling 5dda2752): the registered agents with AT LEAST ONE pending
+ * message, bound to a window or not, from a handle the caller opened (read-only for the doorbell).
+ * The per-agent drain predicate PENDING_FOR_AGENT_ROW_SQL (what that agent's own drain would
+ * return), NEVER pendingGlobalClause (not a per-agent count; see its comment). It only FINDS the
+ * names: each agent's pending set is then read through pendingMetadata, the one canonical read.
+ * PURE SELECT, names only.
+ */
+export function agentsWithPendingMail(db: CompatDatabase): string[] {
+  const rows = db
+    .prepare(`SELECT a.name AS name FROM agents a WHERE EXISTS (SELECT 1 FROM messages m WHERE m.to_agent = a.name AND ${PENDING_FOR_AGENT_ROW_SQL}) ORDER BY a.name`)
+    .all() as Array<{ name: string }>;
+  return rows.map((r) => r.name);
+}
+
+/**
  * F1 (ADR-0044) — the CANONICAL pending set for this agent (ADR-0045 R1: the #53
  * predicate with NO window), as METADATA ONLY, from a handle the caller opened
  * (read-only for `relay pending`). Equal to get_messages(pending, since='all').

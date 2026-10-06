@@ -167,7 +167,11 @@ describe.skipIf(!HOST)("PR 3 job: B1 (review 2fda069b): a closed window is a HOL
     expect(sessionOf()).toBeNull(); // precondition: unbound
     const before = recs().filter((r) => r.type !== "header").length;
     for (let k = 5; k < 10; k++) expect((await lifetime(T + k * STEP)).code).toBe(0); // well past every horizon
-    expect(recs().filter((r) => r.type !== "header").length).toBe(before); // A3.2: nothing judged, written or closed
+    // A3.2: nothing judged or closed. PR 6: the window going is ONE board-state change (mail, no live
+    // window), written ONCE across all five lifetimes (each restart re-derives it from the log).
+    const after = recs().filter((r) => r.type !== "header");
+    expect(after.length).toBe(before + 1);
+    expect(after.slice(before).map((r) => [r.type, r.case, r.state])).toEqual([["board", "no_live_window", "open"]]);
     expect(ofType("escalation").map((e) => e.state)).toEqual(["open"]);
     expect(ofType("effect").some((e) => e.intent_ids.includes(extra))).toBe(false);
     // A NEW session in a new window: the V4 rescue.
@@ -177,6 +181,7 @@ describe.skipIf(!HOST)("PR 3 job: B1 (review 2fda069b): a closed window is a HOL
     await lifetime(T + 10 * STEP);
     expect(ofType("escalation").map((e) => [e.state, e.close_reason])).toEqual([["open", null], ["closed", "session_changed"]]);
     expect(ofType("effect").filter((e) => e.outcome === "session_changed").map((e) => e.intent_ids)).toEqual([[extra]]);
+    expect(ofType("board").map((r) => [r.case, r.state, r.close_reason])).toEqual([["no_live_window", "open", null], ["no_live_window", "closed", "resolved"]]);
     const rescue = ofType("intent").at(-1);
     expect([rescue.intent.during_escalation, rescue.covers.kinds.every((k: string) => k === "new"), rescue.covers.message_ids.length]).toEqual([false, true, 2]);
   });

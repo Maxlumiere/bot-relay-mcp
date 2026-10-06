@@ -55,6 +55,10 @@ function plan(over: Partial<Parameters<typeof C.planCycle>[0]> & { reads?: Recor
     ringMono: new Map(),
     nowMono: 0,
     budgetExhausted: new Set(),
+    // PR 6, production-shaped: a listed binding is a live window; mailAgents is what the SSOT query would find.
+    liveness: () => "alive",
+    mailAgents: () => Object.entries(reads).filter(([, r]) => r && r.registered && r.ids.length > 0).map(([k]) => k),
+    boardOpen: new Map(),
     windowMs: C.DEFAULT_WINDOW_MS,
     budgetPerHour: C.DEFAULT_BUDGET_PER_HOUR,
     horizonMs: C.DEFAULT_HORIZON_MS,
@@ -97,9 +101,11 @@ describe("planCycle: the V4 trigger", () => {
     expect(a.intents[0].covers).toEqual(b.intents[0].covers);
     expect(a.intents[0].covers.message_ids).toEqual(["m1", "m2", "m3"]);
   });
-  it("one intent per agent per cycle, even with two bindings for the same name", () => {
-    const p = plan({ bindings: [bind("alice", HOST, "b1"), bind("alice", HOST, "b2")] });
-    expect(p.intents).toHaveLength(1);
+  it("one intent per agent per cycle: two bindings for one name, ONE of them a live window (PR 6: the other is PROVEN dead) → one intent, on the live one", () => {
+    const p = plan({ bindings: [bind("alice", HOST, "b1"), bind("alice", HOST, "b2")], liveness: (b) => (b.binding_id === "b2" ? "alive" : "dead") });
+    expect(p.intents.map((r) => r.intent.binding_id)).toEqual(["b2"]);
+    // ...and with BOTH alive it is no longer a guess at all (PR 6, Q4): ambiguous, no intent.
+    expect(plan({ bindings: [bind("alice", HOST, "b1"), bind("alice", HOST, "b2")] }).intents).toEqual([]);
   });
   it("an unregistered agent, a nameless binding, and a failing read are skipped with a reason, never rung", () => {
     const p = plan({
@@ -107,7 +113,9 @@ describe("planCycle: the V4 trigger", () => {
       reads: { ghost: { registered: false, reading_session: null, ids: [] } },
     });
     expect(p.intents).toEqual([]);
-    expect(p.skipped.map((s) => s.why)).toEqual([expect.stringMatching(/not registered/), expect.stringMatching(/names no agent/), expect.stringMatching(/cannot be read/)]);
+    const why = p.skipped.map((s) => s.why);
+    expect(why).toHaveLength(3);
+    expect(why).toEqual(expect.arrayContaining([expect.stringMatching(/not registered/), expect.stringMatching(/names no agent/), expect.stringMatching(/cannot be read/)]));
   });
 });
 
@@ -115,7 +123,10 @@ describe("planCycle: candidates are THIS host's bindings, positively", () => {
   it("HARM: a binding on ANOTHER host is never a candidate", () => {
     const p = plan({ bindings: [bind("alice", "HOST-B")] });
     expect(p.intents).toEqual([]);
-    expect(p.skipped[0].why).toMatch(/another host/);
+    // PR 6: a window on another host cannot be judged from here (unverifiable, never dead); as the
+    // agent's ONLY binding, with mail, that is a no_live_window board case, never a ring.
+    expect(p.skipped[0].why).toMatch(/no live window/);
+    expect(p.board.map((r) => [r.case, r.state, r.binding_ids])).toEqual([["no_live_window", "open", ["b-alice"]]]);
   });
   it("HARM: an UNKNOWN own host → no candidate at all (never `IS`-matched against a null host)", () => {
     const p = plan({ ownHostId: null });

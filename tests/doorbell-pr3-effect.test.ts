@@ -61,12 +61,16 @@ const judge = (covers: { reading_session: string; message_ids: string[] }) => {
   };
   const p = C.planCycle({
     bindings: [], ownHostId: "HOST-A", pending: (n) => R.pendingReadOf(db, db.getDb(), n), rung: new Set(), ringMono: new Map(), nowMono: 1,
-    budgetExhausted: new Set(), windowMs: C.DEFAULT_WINDOW_MS, budgetPerHour: 6, horizonMs: C.DEFAULT_HORIZON_MS,
+    budgetExhausted: new Set(), liveness: () => "alive", mailAgents: () => db.agentsWithPendingMail(db.getDb()), boardOpen: new Map(), windowMs: C.DEFAULT_WINDOW_MS, budgetPerHour: 6, horizonMs: C.DEFAULT_HORIZON_MS,
     ledger: C.ledgerInput([ring], () => 0), newIntentId: randomUUID, now: () => "2026-10-02T08:00:01.000Z",
   });
   const e = p.effects[0];
-  // B1: unbound is a HOLD: the planner writes NOTHING at all (no effect, no close).
-  if (read().reading_session === null) expect(p.records).toEqual([]);
+  // B1: unbound is a HOLD: the planner judges NOTHING (no effect, no close). PR 6: this fixture has
+  // mail and NO window (bindings: []), which is a no_live_window BOARD case, its only record.
+  if (read().reading_session === null) {
+    expect(p.records.filter((r) => r.type !== "board")).toEqual([]);
+    expect(p.board.map((r) => [r.case, r.state])).toEqual([["no_live_window", "open"]]);
+  }
   const planned = !e ? { outcome: read().reading_session === null ? "unbound" : "still_pending" } : e.outcome === "effective" ? { outcome: "effective", left: e.left } : { outcome: e.outcome };
   expect(planned).toEqual(pure);
   return planned;

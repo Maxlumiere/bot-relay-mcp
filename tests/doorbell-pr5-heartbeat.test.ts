@@ -210,6 +210,7 @@ describe("the heartbeat's closed schema (pure)", () => {
     starts: 1, starts_since: "2026-10-05T08:00:00.000Z", cycles: 1, interval_ms: 5000, condition: "ok", condition_since: "2026-10-05T08:00:00.000Z", consecutive_failures: 0, cycle_failures: 0, last_failure: null,
     build: { build_id: "unbuilt", commit: null, dirty: null, built_at: null, deps_id: null, deps_state: "unknown", node: "v22.0.0" },
     install_dir: "/opt/relay", resolution: { kind: "explicit-db", db_path: "/x/relay.db", exists: true, containment: "strict", basis: "RELAY_DB_PATH" },
+    not_evaluated: null,
   });
   it("valid; and an extra key, a free-text kind, or a non-enum condition is refused", () => {
     expect(HBM.heartbeatFault(good())).toBeNull();
