@@ -276,9 +276,15 @@ export function windowsOwnerSddlToken(): string | null {
     const probe = pathJoin(dir, "probe");
     fs.writeFileSync(probe, "");
     const r = spawnSync("icacls", [probe, "/inheritance:r", "/grant:r", `*${sid}:F`], { encoding: "utf-8", windowsHide: true });
+    // A new file can carry EXPLICIT (non-inherited) ACEs that /inheritance:r keeps: MEASURED on windows-2022, the
+    // probe still read [S-1-5-18, S-1-5-32-544, LA]. Remove every SID-spelled ACE that is not the user's, then the
+    // one token left is the user's spelling.
+    const before = r.status === 0 ? windowsAllowSids(probe) : [];
+    for (const t of before) if (/^S-1-[0-9-]+$/.test(t) && t !== sid) spawnSync("icacls", [probe, "/remove", `*${t}`], { encoding: "utf-8", windowsHide: true });
     const tokens = r.status === 0 ? windowsAllowSids(probe) : [];
     ownerSddlToken = tokens.length === 1 ? tokens[0] : null;
-    windowsOwnerProbeNote = r.status !== 0 ? `icacls exit ${r.status}: ${(r.stderr || r.stdout || "").trim()}` : `user ${sid} written as [${tokens.join(", ")}]`;
+    windowsOwnerProbeNote =
+      r.status !== 0 ? `icacls exit ${r.status}: ${(r.stderr || r.stdout || "").trim()}` : `user ${sid} written as [${tokens.join(", ")}] (before removing the others: [${before.join(", ")}])`;
   } catch (err) {
     ownerSddlToken = null;
     windowsOwnerProbeNote = `probe failed: ${(err as Error).message}`;
