@@ -244,11 +244,16 @@ const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
     }
   })();
   await new Promise((r) => setTimeout(r, 50));
+  const stop = new Promise((r) => parentPort.once("message", r));
   parentPort.postMessage({ started: true });
   const statuses = n > 0 ? await Promise.all(Array.from({ length: n }, call)) : (await new Promise((r) => setTimeout(r, 300)), []);
+  // The window stays open (and /health keeps being sampled) until the parent says stop: a POOL-LOADED control's
+  // window must span its pool work, not just its requests.
+  parentPort.postMessage({ loaded: true, statuses });
+  await stop;
   done = true;
   await sampler;
-  parentPort.postMessage({ healthMax, statuses });
+  parentPort.postMessage({ healthMax });
 })();
 `;
 
@@ -274,34 +279,101 @@ interface Reading {
   eldMax: number;
   /** How many of the load's calls the per-IP cap shed (429) before the MCP cycle. */
   shed: number;
+  /** A POOL-LOADED control only: its pool work INSIDE the measured window (see measure). */
+  pool?: PoolOccupancy;
 }
+
+/** How much of a pool-loaded control's window its pool work actually occupied. */
+interface PoolOccupancy {
+  /** Compares that started and finished inside the window. */
+  inWindow: number;
+  /** Compares that had FINISHED when the reading was taken (inside the window or not). */
+  total: number;
+  /** Fraction of the window with at least one control compare in flight. */
+  busy: number;
+}
+
+/**
+ * The control's pool work, instrumented: `track` wraps each compare, so measure() knows when the pool was busy.
+ * MEASURED on main (294fdfc, local M2): the control's window was 35-63 ms while its 12 compares finished 390-457 ms
+ * after it opened; with the old window this occupancy check reads "0/0 in-window, busy 0.00" in every round. The
+ * "pool-loaded" control measured an unloaded loop. The auth arm's compares run inside its requests, so its
+ * window spans them; on a noisy 3-core runner the longer window alone catches more delay, which inflated the gap
+ * (CI 26803c9: control per-round eld 11.5/57.7/6.7/54.8/185.2, BIMODAL by whether the pool overlapped).
+ */
+type PoolWork = (track: <T>(p: () => Promise<T>) => Promise<T>) => Promise<unknown>;
 
 /**
  * Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has
  * started; `poolWork` (the POOL-LOADED control) starts at the same moment and is finished before this returns.
  */
-async function measure(port: number, load: Load, onLoop?: () => void, poolWork?: () => Promise<unknown>): Promise<Reading> {
+async function measure(port: number, load: Load, onLoop?: () => void, poolWork?: PoolWork): Promise<Reading> {
   let pool: Promise<unknown> = Promise.resolve();
+  const spans: Array<[number, number]> = [];
+  let t0 = 0;
+  const track = async <T,>(p: () => Promise<T>): Promise<T> => {
+    const start = performance.now();
+    try {
+      return await p();
+    } finally {
+      spans.push([start, performance.now()]);
+    }
+  };
   const eld = monitorEventLoopDelay({ resolution: 1 });
   const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args } });
   try {
     return await new Promise<Reading>((resolve, reject) => {
+      let statuses: number[] = [];
+      let t1 = 0;
       worker.on("error", reject);
-      worker.on("message", (m: { started?: true; healthMax?: number; statuses?: number[] }) => {
+      worker.on("message", (m: { started?: true; loaded?: true; healthMax?: number; statuses?: number[] }) => {
         if (m.started) {
+          t0 = performance.now();
           eld.enable();
           if (onLoop) setTimeout(onLoop, 5);
-          if (poolWork) pool = poolWork();
+          if (poolWork) pool = poolWork(track);
           return;
         }
-        eld.disable();
-        resolve({ healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: m.statuses!.filter((s) => s === 429).length });
+        if (m.loaded) {
+          statuses = m.statuses!;
+          // The window closes when the requests AND the control's pool work are done (the pool, not the requests,
+          // is the longer one), so the control is loaded for its whole window, like the auth arm.
+          pool.then(
+            () => {
+              t1 = performance.now();
+              eld.disable();
+              worker.postMessage("stop");
+            },
+            reject,
+          );
+          return;
+        }
+        const reading: Reading = { healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: statuses.filter((s) => s === 429).length };
+        if (poolWork) reading.pool = occupancy(spans, t0, t1);
+        resolve(reading);
       });
     });
   } finally {
     await worker.terminate();
-    await pool;
+    await pool.catch(() => undefined);
   }
+}
+
+/** The pool's occupancy of the window [t0, t1]: compares inside it, and the fraction with one in flight. */
+function occupancy(spans: Array<[number, number]>, t0: number, t1: number): PoolOccupancy {
+  const inWindow = spans.filter(([a, b]) => a >= t0 && b <= t1).length;
+  const clipped = spans.map(([a, b]) => [Math.max(a, t0), Math.min(b, t1)] as [number, number]).filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0]);
+  let busyMs = 0;
+  let cur: [number, number] | null = null;
+  for (const [a, b] of clipped) {
+    if (cur && a <= cur[1]) cur[1] = Math.max(cur[1], b);
+    else {
+      if (cur) busyMs += cur[1] - cur[0];
+      cur = [a, b];
+    }
+  }
+  if (cur) busyMs += cur[1] - cur[0];
+  return { inWindow, total: spans.length, busy: t1 > t0 ? busyMs / (t1 - t0) : 0 };
 }
 
 /**
@@ -334,6 +406,14 @@ async function measure(port: number, load: Load, onLoop?: () => void, poolWork?:
 const K = 5;
 const MARGIN_MS = 25;
 const CEILING_MS = 500;
+/**
+ * A pool-loaded control round is VALID only when its pool work ran inside its window: every design compare in it,
+ * and a compare in flight for at least this fraction of it. Otherwise the control was not loaded, and the round is
+ * an INSTRUMENT FAULT (never a bar verdict). MEASURED with the window spanning the pool: see the BAR line's
+ * "control pool busy" values; a forced 300 ms idle in the middle of the pool work drops it well below (the
+ * unknown-provenance test's lapse demo).
+ */
+const OCCUPANCY_FLOOR = 0.8;
 const fmt = (r: Reading) => `health=${r.healthMax.toFixed(1)} eld=${r.eldMax.toFixed(1)} shed=${r.shed}`;
 const median = (xs: number[]) => {
   const a = [...xs].sort((x, y) => x - y);
@@ -356,7 +436,7 @@ interface BarStats {
  * `poolControl` (architect b72c3ac4): the control arm also runs the pool work the design INTENDS for this load,
  * a DESIGN CONSTANT in production's shape, so the bar compares the auth PATH against the bcrypt work itself.
  */
-async function runBar(label: string, port: number, load: Load, opts: { onLoop?: () => void; poolControl?: () => Promise<unknown> } = {}): Promise<BarStats> {
+async function runBar(label: string, port: number, load: Load, opts: { onLoop?: () => void; poolControl?: PoolWork } = {}): Promise<BarStats> {
   _resetAuthThrottleForTests();
   await measure(port, controlLoad(load.n), undefined, opts.poolControl); // WARM-UP, discarded: a fresh daemon's first burst pays one-off costs
   const control: Reading[] = [];
@@ -383,9 +463,19 @@ async function runBar(label: string, port: number, load: Load, opts: { onLoop?: 
       ` | gap health=${(med.authHealth - med.ctlHealth).toFixed(1)} eld=${(med.authEld - med.ctlEld).toFixed(1)}` +
       ` | resolution health>${(med.ctlHealth + MARGIN_MS).toFixed(1)} eld>${(med.ctlEld + MARGIN_MS).toFixed(1)}` +
       ` | compares=${count} (per round ${perRound.join("/")})${opts.poolControl ? " | control: POOL-LOADED" : ""} | rounds auth health ${list(auth.map((r) => r.healthMax))} eld ${list(auth.map((r) => r.eldMax))}` +
-      ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}`,
+      ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}` +
+      (opts.poolControl ? ` | control pool in-window ${control.map((r) => `${r.pool!.inWindow}/${r.pool!.total}`).join(" ")} busy ${control.map((r) => r.pool!.busy.toFixed(2)).join("/")}` : ""),
   );
   return { label, control, auth, compares: count, perRound, med };
+}
+
+/** Every pool-loaded control round ran its design compares INSIDE its window, busy for >= OCCUPANCY_FLOOR of it. */
+function expectControlLoaded(b: BarStats, designCompares: number): void {
+  const pools = b.control.map((r) => r.pool);
+  if (pools.some((p) => p === undefined)) return; // not a pool-loaded bar
+  const fault = (what: string) => `INSTRUMENT FAULT (${b.label}): the pool-loaded control ${what}; this round measured an unloaded loop, so no bar verdict is possible`;
+  expect(pools.map((p) => p!.inWindow), fault(`ran compares outside its window (design: ${designCompares} per round, all inside)`)).toEqual(Array(K).fill(designCompares));
+  for (const p of pools) expect(p!.busy, fault(`left its pool idle for part of its window (busy ${p!.busy.toFixed(2)} < ${OCCUPANCY_FLOOR})`)).toBeGreaterThanOrEqual(OCCUPANCY_FLOOR);
 }
 
 /** The bar's predicates. NOT VACUOUS: no call of any arm was shed (a shed call is a cheap 429 before the MCP cycle). */
@@ -395,6 +485,8 @@ function expectBarHolds(b: BarStats, compares: { max?: number; exactPerRound?: n
     // EXACT, not <=: the pool-loaded control runs the design constant, so a regression that added compares
     // must fail here rather than hide inside a matching control (architect b72c3ac4 condition 1).
     expect(b.perRound, `${b.label}: bcrypt compares per round`).toEqual(Array(K).fill(compares.exactPerRound));
+    // The CONTROL's own validity, BEFORE any timing verdict: a round whose pool work lapsed is an instrument fault.
+    expectControlLoaded(b, compares.exactPerRound);
   } else {
     expect(b.compares, `${b.label}: bcrypt compares`).toBeLessThanOrEqual(compares.max ?? 0);
   }
@@ -449,15 +541,27 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     // is the DESIGN CONSTANT (4 x SCAN_BURST), never the auth arm's measured one.
     // RESIDUAL, stated: on a small host the pool's own CPU competes with the main thread; that is bounded by the
     // scan budget x the per-compare cost, not by this bar.
-    const poolControl = () =>
+    const poolControl: PoolWork = (track) =>
       Promise.all(
         Array.from({ length: SCAN_BURST }, async () => {
-          for (const h of hashes) await compareOffLoop(randomToken(), h);
+          for (const h of hashes) await track(() => compareOffLoop(randomToken(), h));
         }),
       );
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       expectBarHolds(await runBar("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {}), { poolControl }), { exactPerRound: 4 * SCAN_BURST });
+      // THE LAPSE DEMO (the occupancy check's own known-bad): the same pool work with a forced 300 ms idle in the
+      // middle. Its window still spans it, but the pool is idle for much of it: the round must read as an
+      // INSTRUMENT FAULT, never as a valid control.
+      const lapsed: PoolWork = async (track) => {
+        await poolControl(track);
+        await new Promise((r) => setTimeout(r, 300));
+        await track(() => compareOffLoop(randomToken(), hashes[0]));
+      };
+      const r = await measure(port, controlLoad(30), undefined, lapsed);
+      expect(r.pool!.busy, `the lapse demo: busy ${r.pool!.busy.toFixed(2)} must fall below the floor`).toBeLessThan(OCCUPANCY_FLOOR);
+      const lapsedBar: BarStats = { label: "lapse demo", control: Array(K).fill(r), auth: [], compares: 0, perRound: [], med: { ctlHealth: 0, ctlEld: 0, authHealth: 0, authEld: 0 } };
+      expect(() => expectControlLoaded(lapsedBar, 4 * SCAN_BURST + 1)).toThrow(/INSTRUMENT FAULT/);
     });
   }, 180_000);
 
