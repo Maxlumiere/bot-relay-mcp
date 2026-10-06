@@ -86,8 +86,10 @@ export interface Heartbeat {
    * PR 6 (ruling 5dda2752 Q3 (i)): the agents THIS attempt's cycle could not evaluate (a HOLD: their
    * board state is untouched), so a hold is never silent. A cycle field, never per-agent log records,
    * so it cannot churn. Null when no cycle was planned this attempt (the condition says why).
+   * `mail_query_failed`: the all-agent mail query failed, so agents with mail and NO binding could
+   * not even be found (they are not in `names`, and nothing pretends they were evaluated).
    */
-  not_evaluated: { count: number; names: string[] } | null;
+  not_evaluated: { count: number; names: string[]; mail_query_failed: boolean } | null;
 }
 
 /** At most this many names in `not_evaluated` (the count is exact). */
@@ -122,7 +124,9 @@ export function heartbeatFault(h: unknown): string | null {
   if (typeof h.install_dir !== "string" || h.install_dir.length === 0 || h.install_dir.length > 4096 || /[\u0000-\u001f\u007f]/.test(h.install_dir)) return "install_dir is not a bounded path";
   const ne = h.not_evaluated;
   if (ne !== null) {
-    if (!sameKeys(ne, ["count", "names"]) || !isCount(ne.count, 0) || !Array.isArray(ne.names)) return "not_evaluated is null or exactly {count, names}";
+    if (!sameKeys(ne, ["count", "names", "mail_query_failed"]) || !isCount(ne.count, 0) || !Array.isArray(ne.names) || typeof ne.mail_query_failed !== "boolean") {
+      return "not_evaluated is null or exactly {count, names, mail_query_failed}";
+    }
     const names = ne.names as unknown[];
     if (names.length !== Math.min(ne.count as number, NOT_EVALUATED_MAX_NAMES) || !names.every((n) => typeof n === "string" && AGENT_NAME.test(n))) {
       return `not_evaluated.names holds the first min(count, ${NOT_EVALUATED_MAX_NAMES}) agent names`;

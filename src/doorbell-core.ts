@@ -363,6 +363,12 @@ export interface CyclePlan {
   board: BoardRecord[];
   /** PR 6: agents this cycle could not evaluate (a HOLD: their board state is untouched). */
   notEvaluated: string[];
+  /**
+   * PR 6 (#310 Codex R1 #2): why the all-agent mail query failed this cycle, or null. When it fails,
+   * agents with mail and NO binding cannot even be found, so they cannot be named: this says so
+   * explicitly. Every agent that CAN be named (bound, or with an open case) is still evaluated.
+   */
+  mailQueryFailed: string | null;
   skipped: CycleSkip[];
 }
 
@@ -372,6 +378,16 @@ export function planCycle(input: CycleInput): CyclePlan {
   const records: LogRecord[] = [];
   const skipped: CycleSkip[] = [];
   const notEvaluated: string[] = [];
+  let mailQueryFailed: string | null = null;
+  /** The agents with pending mail (bound or not), or [] with mailQueryFailed set: never a silent gap. */
+  const mailAgents = (): readonly string[] => {
+    try {
+      return input.mailAgents();
+    } catch (err) {
+      mailQueryFailed = err instanceof Error ? err.message : String(err);
+      return [];
+    }
+  };
   const fault = tunablesFault(input);
   if (fault) throw new Error(fault);
   const at = input.now();
@@ -386,12 +402,14 @@ export function planCycle(input: CycleInput): CyclePlan {
     escalations: records.filter((r): r is EscalationRecord => r.type === "escalation"),
     board: records.filter((r): r is BoardRecord => r.type === "board"),
     notEvaluated,
+    mailQueryFailed,
     skipped,
   });
   if (!input.ownHostId) {
     for (const b of input.bindings) skipped.push({ binding_id: b.binding_id, agent_name: b.agent_name, why: "this host's identity is unknown: no binding can be shown to be local" });
-    // A HOLD, never a change: nothing is judged, every board state stays as it is.
-    notEvaluated.push(...sortedSet([...input.bindings.flatMap((b) => (b.agent_name ? [b.agent_name] : [])), ...input.boardOpen.keys()]));
+    // A HOLD, never a change: nothing is judged, every board state stays as it is. Every agent that
+    // WOULD have been evaluated is named, the unbound ones with mail included (#310 Codex R1 #2).
+    notEvaluated.push(...sortedSet([...input.bindings.flatMap((b) => (b.agent_name ? [b.agent_name] : [])), ...mailAgents(), ...input.boardOpen.keys()]));
     return view();
   }
 
@@ -514,7 +532,7 @@ export function planCycle(input: CycleInput): CyclePlan {
   };
 
   const covered = new Set<string>(); // agents evaluated this cycle
-  for (const name of sortedSet([...groups.keys(), ...input.mailAgents(), ...boardOpen.keys()])) {
+  for (const name of sortedSet([...groups.keys(), ...mailAgents(), ...boardOpen.keys()])) {
     const bs = groups.get(name) ?? [];
     const skip = (why: string, at?: CandidateBinding) => skipped.push({ binding_id: (at ?? bs[0])?.binding_id ?? "", agent_name: name, why });
     let read: PendingRead;

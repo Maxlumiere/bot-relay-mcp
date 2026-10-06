@@ -121,11 +121,9 @@ export interface DoorbellStatus {
    * `pending_count_at_open` is the logged snapshot; `pending_count` is read LIVE from the relay DB at
    * this read (null when it cannot be: `live` says why). Names and counts only, never a message id.
    */
-  board: {
-    open: number;
-    items: Array<{ agent: string; case: string; opened_at: string; age_seconds: number; binding_ids: string[]; dead_count: number; pending_count_at_open: number; pending_count: number | null }>;
-    live: { ok: true } | { ok: false; why: string };
-  };
+  open_board_cases: Array<{ agent_name: string; case: string; since: string; age_seconds: number; binding_ids: string[]; dead_count: number; pending_count_at_open: number; pending_count: number | null }>;
+  /** Whether the LIVE pending counts could be read (and why not). */
+  open_board_cases_live: { ok: true } | { ok: false; why: string };
   /** PR 6: the agents the job's LAST cycle could not evaluate (a hold is never silent); null when it planned no cycle. */
   not_evaluated: { count: number; names: string[] } | null;
   /** Who last took the instance lock, from its NON-authoritative sidecar (display only; the lock itself is kernel-held). */
@@ -213,25 +211,22 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
   // only when a writer's sidecars exist: this verb never creates one, exactly like the job).
   const boardOpen = fs.existsSync(logPath) ? [...readLogState(logPath).boardOpen.values()] : [];
   const live = await liveCounts(dbPath, boardOpen.map((r) => r.agent_name));
-  const board: DoorbellStatus["board"] = {
-    open: boardOpen.length,
-    items: boardOpen
-      .map((r) => ({
-        agent: r.agent_name,
-        case: r.case,
-        opened_at: r.at,
-        age_seconds: Math.max(0, Math.round((nowWall - Date.parse(r.at)) / 1000)),
-        binding_ids: r.binding_ids,
-        dead_count: r.dead_count,
-        pending_count_at_open: r.pending_count,
-        pending_count: live.ok ? (live.counts.get(r.agent_name) ?? 0) : null,
-      }))
-      .sort((a, b) => (a.opened_at < b.opened_at ? -1 : a.opened_at > b.opened_at ? 1 : a.agent < b.agent ? -1 : 1)),
-    live: live.ok ? { ok: true } : { ok: false, why: live.why },
-  };
+  const openBoardCases: DoorbellStatus["open_board_cases"] = boardOpen
+    .map((r) => ({
+      agent_name: r.agent_name,
+      case: r.case,
+      since: r.at,
+      age_seconds: Math.max(0, Math.round((nowWall - Date.parse(r.at)) / 1000)),
+      binding_ids: r.binding_ids,
+      dead_count: r.dead_count,
+      pending_count_at_open: r.pending_count,
+      pending_count: live.ok ? (live.counts.get(r.agent_name) ?? 0) : null,
+    }))
+    .sort((a, b) => (a.since < b.since ? -1 : a.since > b.since ? 1 : a.agent_name < b.agent_name ? -1 : 1));
+  const openBoardCasesLive: DoorbellStatus["open_board_cases_live"] = live.ok ? { ok: true } : { ok: false, why: live.why };
 
   if (hb.kind === "absent") {
-    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, board, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
+    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, open_board_cases: openBoardCases, open_board_cases_live: openBoardCasesLive, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
   }
   const h = hb.heartbeat;
   const judged = judgeHeartbeat(h, nowWall);
@@ -264,7 +259,8 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
       install_dir: h.install_dir,
     },
     escalations: { open: items.length, items },
-    board,
+    open_board_cases: openBoardCases,
+    open_board_cases_live: openBoardCasesLive,
     not_evaluated: h.not_evaluated,
     holder,
     state_dir: stateDir,
@@ -310,7 +306,7 @@ export async function run(argv: string[]): Promise<number> {
     const lines = hookLines(st);
     if (lines.length > 0) process.stdout.write(lines.join("\n") + "\n");
   } else {
-    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.board.open} open board case(s)\n`);
+    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.open_board_cases.length} open board case(s)\n`);
   }
   return 0;
 }

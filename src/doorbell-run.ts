@@ -212,6 +212,8 @@ export interface DoorbellOptions {
   onHeartbeat?: (hb: Heartbeat) => void;
   /** Test seam: alter a cycle's plan before it is written (e.g. to make the writer refuse a record). */
   mutatePlan?: (plan: ReturnType<typeof planCycle>) => void;
+  /** PR 6 (#310 Codex R1 #2): wrap the all-agent mail query (e.g. make it fail), to prove a failure is reported, not silent. */
+  wrapMailAgents?: (real: () => readonly string[]) => () => readonly string[];
 }
 
 /** A wall step this large against the monotonic clock is a JUMP (ruling 622689ba (4)). */
@@ -419,7 +421,7 @@ async function runLocked(
       budgetExhausted: state.budgetExhausted,
       // PR 6: each binding's WINDOW anchor, exactly as `relay fleet` judges a window (src/cli/fleet.ts).
       liveness: (b) => bindingLiveness(b, ownHostId),
-      mailAgents: () => agentsWithPendingMail(handle),
+      mailAgents: (opts.wrapMailAgents ?? ((real) => real))(() => agentsWithPendingMail(handle)),
       boardOpen: state.boardOpen,
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,
@@ -435,7 +437,8 @@ async function runLocked(
       now: () => iso(nowWall),
     });
     phase = "other";
-    lastNotEvaluated = plan.notEvaluated;
+    lastNotEvaluated = { names: plan.notEvaluated, mailQueryFailed: plan.mailQueryFailed !== null };
+    if (plan.mailQueryFailed !== null) process.stderr.write(`doorbell: the mail query failed (${plan.mailQueryFailed}): agents with mail and no window could not be found this cycle\n`);
     opts.mutatePlan?.(plan);
     // In the planner's order: durable first (write-ahead), then the state moves (A3.2: each
     // record is a state change, written once).
@@ -461,7 +464,7 @@ async function runLocked(
   // attempt, with `cycles` incremented in the same write. Nothing else writes the heartbeat.
   let attempts = 0;
   /** PR 6: the agents THIS attempt's planned cycle could not evaluate; null when no cycle was planned. */
-  let lastNotEvaluated: string[] | null = null;
+  let lastNotEvaluated: { names: string[]; mailQueryFailed: boolean } | null = null;
   let consecutiveFailures = prevHb?.consecutive_failures ?? 0;
   let lastFailure: Heartbeat["last_failure"] = prevHb?.last_failure ?? null;
   let cycleFailures = 0;
@@ -504,7 +507,7 @@ async function runLocked(
       build: { ...LOADED_BUILD },
       install_dir: installDir,
       resolution: serializeResolution(resolution),
-      not_evaluated: ne === null ? null : { count: ne.length, names: [...ne].sort().slice(0, NOT_EVALUATED_MAX_NAMES) },
+      not_evaluated: ne === null ? null : { count: ne.names.length, names: [...ne.names].sort().slice(0, NOT_EVALUATED_MAX_NAMES), mail_query_failed: ne.mailQueryFailed },
     };
     try {
       replaceStateFile(log, HEARTBEAT_FILENAME, JSON.stringify(hb) + "\n");
