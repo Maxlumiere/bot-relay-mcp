@@ -30,7 +30,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { restrictToOwnerWindows, windowsForeignAllowSids } from "./fs-perms.js";
+import { restrictToOwnerWindows, windowsForeignAllowSids, windowsOwnerProbeNote } from "./fs-perms.js";
 
 export const MINT_SECRET_DIR = "secrets";
 export const MINT_SECRET_FILE = "mint.secret";
@@ -87,7 +87,7 @@ function windowsFaults(p: string): string[] {
   if (hit) return hit;
   let faults: string[];
   try {
-    faults = windowsForeignAllowSids(p).map((sid) => `${p}: an allow ACE for ${sid} (only this user, and SYSTEM, may hold one)`);
+    faults = windowsForeignAllowSids(p).map((sid) => `${p}: an allow ACE for ${sid} (only this user, and SYSTEM, may hold one; owner probe: ${windowsOwnerProbeNote})`);
   } catch (err) {
     return [`${p}: ${(err as Error).message}`]; // a read failure is never cached
   }

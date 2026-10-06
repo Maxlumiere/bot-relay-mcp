@@ -161,6 +161,12 @@ describe("the registration secret's chain fails CLOSED when any element is not p
       }
     });
 
+    it("Windows: the owner probe learns how icacls spells THIS user (a SID, or an alias such as LA)", async () => {
+      const fsPerms = await import("../src/fs-perms.js");
+      const token = fsPerms.windowsOwnerSddlToken();
+      expect(token, `owner probe: ${fsPerms.windowsOwnerProbeNote}`).not.toBeNull();
+    });
+
     it("Windows: Administrators is NOT on the allowlist", async () => {
       const { readMintSecret } = await import("../src/mint-secret.js");
       const inst = fresh();
