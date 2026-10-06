@@ -201,7 +201,7 @@ step "vitest run" npx vitest run --pool=forks --no-file-parallelism || exit 1
 
 # PR-B timing bars: latency measurements, so they run ALONE after the suite (the suite skips them unless
 # RELAY_TIMING_BARS=1). Same step as CI's; each run calibrates itself (A/A control + sized negative control).
-step "timing bars (serial, isolated; the exact set must run)" node scripts/run-timing-bars.mjs || exit 1
+step "timing bars (serial, isolated; the exact set must run)" node "$PROJECT_ROOT/scripts/run-timing-bars.mjs" || exit 1
 
 # --- 3. npm audit (fail on high+) ---
 # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high after

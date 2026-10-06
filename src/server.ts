@@ -67,10 +67,11 @@ import {
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
 import { defaultTokenStore } from "./token-store.js";
-import { logAudit, getAuthGeneration, abandonPrecondition, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByToken, explicitCallerCacheGet, explicitCallerCachePut, markAgentAuthenticated } from "./db.js";
+import { getDb, logAudit, getAuthGeneration, abandonPrecondition, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByTokenVerdict, explicitCallerCacheGetVerdict, explicitCallerCachePut, markAgentAuthenticated } from "./db.js";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { currentContext, requestContext } from "./request-context.js";
+import { revalidate, type AuthVerdict } from "./auth-verdict.js";
 import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
 import { ZodError } from "zod";
 import { authenticateAgent, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive, type AuthResult } from "./auth.js";
@@ -1002,8 +1003,8 @@ export function createServer(): Server {
    * replacement for the former inline O(N) bcrypt scan: a caller is returned
    * ONLY for an `active` row or a valid `rotation_grace` window.
    */
-  function resolveCallerByToken(token: string): ReturnType<typeof resolveAgentByToken> {
-    return resolveAgentByToken(token);
+  function resolveCallerByToken(token: string): ReturnType<typeof resolveAgentByTokenVerdict> {
+    return resolveAgentByTokenVerdict(token);
   }
 
   /** PR-B: how many times a call is re-verified when the auth generation moved under it. */
@@ -1015,6 +1016,17 @@ export function createServer(): Server {
     const busy = "refused" in r ? r.refused === "busy" : r.busy === true;
     if (throttled) return authError("Too many failed token attempts from this source: wait and retry.", ERROR_CODES.RATE_LIMITED, "throttled");
     if (busy) return authError("The relay is busy verifying credentials: retry.", ERROR_CODES.RATE_LIMITED, "busy");
+    return null;
+  }
+
+  /**
+   * PR-B (architect b11ef8ad): EVERY allowed exit of enforceAuth records the verdict it allows the call on (a
+   * credential with its evidence, or WHY there is none). The dispatcher revalidates it after the last await and
+   * refuses a call whose verdict was never recorded (fail closed).
+   */
+  function allow(v: AuthVerdict): null {
+    const store = requestContext.getStore();
+    if (store) store.authVerdict = v;
     return null;
   }
 
@@ -1044,7 +1056,8 @@ export function createServer(): Server {
     //   active             → standard re-register, valid token required
     if (toolName === "register_agent") {
       const claimedName = typeof args?.name === "string" ? args.name : null;
-      if (!claimedName) return null; // let zod produce the validation error
+      if (!claimedName) return allow({ kind: "none", why: "validation" }); // let zod produce the validation error
+      const genAtRegister = getAuthGeneration(); // read WITH the row, before any awaited verify
       const existing = getAgentAuthData(claimedName);
       if (!existing) {
         // v2.14.0 — reserved-name protection. A reserved persona/sentinel name
@@ -1060,14 +1073,14 @@ export function createServer(): Server {
             ERROR_CODES.AUTH_FAILED
           );
         }
-        return null; // first registration — bootstrap path
+        return allow({ kind: "none", why: "bootstrap" }); // first registration — bootstrap path
       }
       const state = (existing.auth_state ?? "active") as
         | "active"
         | "legacy_bootstrap"
         | "revoked"
         | "recovery_pending";
-      if (state === "legacy_bootstrap") return null; // Phase 2b migration path
+      if (state === "legacy_bootstrap") return allow({ kind: "none", why: "legacy-migration" }); // Phase 2b migration path
       if (state === "revoked") {
         return authError(
           `Agent "${claimedName}" is revoked. Use unregister_agent to free the name, or contact an administrator for a recovery token.`,
@@ -1103,7 +1116,7 @@ export function createServer(): Server {
         // Recovery token verified — let the handler proceed. registerAgent
         // (db layer) will transition state back to active + clear the
         // recovery_token_hash under state+hash+verified-hash CAS.
-        return null;
+        return allow({ kind: "none", why: "recovery-cas" }); // registerAgent's CAS pins the verified recovery hash
       }
       // state === "active"
       const token = resolveToken(args);
@@ -1139,7 +1152,11 @@ export function createServer(): Server {
       // dispatcher's verified-token cache-put — so this exit is where it must
       // stamp first_authed_at, or the orphan-GC would reap a live re-authed agent.
       if (!result.legacy) markAgentAuthenticated(claimedName);
-      return null;
+      return allow(
+        result.legacy
+          ? { kind: "none", why: "legacy-grace" }
+          : { kind: "credential", agent: claimedName, basis: result.matched ?? "current", hash: existing.token_hash ?? null, gen: genAtRegister },
+      );
     }
 
     // PR-B (architect 64131354): abandon_registration's one-time handle is VERIFIED HERE (a throttled,
@@ -1151,9 +1168,9 @@ export function createServer(): Server {
       if (ctx) ctx.verifiedAbandonHash = null;
       const name = typeof args?.name === "string" ? args.name : null;
       const handle = typeof args?.recovery_handle === "string" ? args.recovery_handle : null;
-      if (!name || !handle) return null; // zod produces the validation error
+      if (!name || !handle) return allow({ kind: "none", why: "validation" }); // zod produces the validation error
       const row = getAgentAuthData(name);
-      if (abandonPrecondition(row ?? undefined)) return null; // the handler reports the precise reason
+      if (abandonPrecondition(row ?? undefined)) return allow({ kind: "none", why: "abandon-precondition" }); // the handler reports the precise reason
       const v = await verifySecretHash(name, row!.registration_recovery_hash, handle);
       if (v === "throttled" || v === "busy") return undecidedAuthError({ refused: v });
       if (v !== "ok") {
@@ -1171,16 +1188,18 @@ export function createServer(): Server {
         return refusal;
       }
       if (ctx) ctx.verifiedAbandonHash = row!.registration_recovery_hash;
-      return null;
+      return allow({ kind: "none", why: "abandon-cas" }); // the handler deletes only by CAS on the verified hash
     }
 
-    if (TOOLS_NO_AUTH.has(toolName)) return null;
+    if (TOOLS_NO_AUTH.has(toolName)) return allow({ kind: "none", why: "no-auth-tool" });
 
     const explicitCaller = agentFromArgs(toolName, args);
     const token = resolveToken(args);
     const requiredCap = TOOL_CAPABILITY[toolName];
 
     let callerName: string | null = null;
+    // PR-B (architect b11ef8ad): the verdict this call is allowed on, with its evidence; revalidated at dispatch.
+    let verdict: AuthVerdict | null = null;
     let callerCaps: string[] = [];
 
     if (explicitCaller) {
@@ -1201,10 +1220,18 @@ export function createServer(): Server {
       // generation counter (bumped on every token/auth mutation) makes a hit
       // safe: a revoked/rotated token → generation moved → cache miss → the
       // authenticateAgent path returns the correct error.
-      const cachedVerdict = token ? explicitCallerCacheGet(token, explicitCaller) : null;
+      const cachedVerdict = token ? explicitCallerCacheGetVerdict(token, explicitCaller) : null;
       if (cachedVerdict) {
         callerName = explicitCaller;
         callerCaps = cachedVerdict.capabilities;
+        // A cached verdict is never the last word: it goes through revalidate like a fresh one.
+        verdict = {
+          kind: "credential",
+          agent: explicitCaller,
+          basis: cachedVerdict.basis,
+          hash: cachedVerdict.basis === "current" ? (auth.token_hash ?? null) : (auth.previous_token_hash ?? null),
+          gen: genAtRead,
+        };
       } else {
         const explicitState = (auth.auth_state ?? "active") as
           | "active"
@@ -1237,6 +1264,14 @@ export function createServer(): Server {
         }
         callerName = explicitCaller;
         callerCaps = JSON.parse(auth.capabilities) as string[];
+        const basis = result.matched ?? "current";
+        verdict = {
+          kind: "credential",
+          agent: explicitCaller,
+          basis,
+          hash: basis === "current" ? (auth.token_hash ?? null) : (auth.previous_token_hash ?? null),
+          gen: genAtRead,
+        };
         // v2.20.1 — cache the verified verdict (+ self-heal the digest, Q1) so
         // repeat calls skip bcrypt. Only reached on ok && !legacy, so only
         // positive active/grace verdicts are ever cached.
@@ -1257,10 +1292,11 @@ export function createServer(): Server {
               ERROR_CODES.CAP_DENIED
             );
           }
-          return null;
+          return allow({ kind: "none", why: "legacy-grace" });
         }
         return authError(`Tool "${toolName}" requires an agent_token. Pass it as agent_token arg, X-Agent-Token header, or RELAY_AGENT_TOKEN env.`, ERROR_CODES.AUTH_FAILED, "missing_token");
       }
+      const genAtToken = getAuthGeneration(); // read before the awaited lookup + verify
       const resolved = await resolveCallerByToken(token);
       if (resolved && "refused" in resolved) return undecidedAuthError(resolved);
       if (!resolved) {
@@ -1268,6 +1304,7 @@ export function createServer(): Server {
       }
       callerName = resolved.name;
       callerCaps = resolved.capabilities;
+      verdict = { kind: "credential", agent: resolved.name, basis: resolved.basis, hash: resolved.hash, gen: genAtToken };
     }
 
     // Special rule: unregister_agent — caller's token must match the target name.
@@ -1286,7 +1323,11 @@ export function createServer(): Server {
       if (store) store.callerName = callerName;
     }
 
-    return null;
+    if (!verdict) {
+      // Every authenticated path above sets its verdict; reaching here without one is a defect: fail CLOSED.
+      return authError("Internal: the call was authenticated without a recorded verdict.", ERROR_CODES.AUTH_FAILED, "no_verdict");
+    }
+    return allow(verdict);
   }
 
   function authError(message: string, errorCode: ErrorCode = ERROR_CODES.AUTH_FAILED, auditReason?: string): any {
@@ -1393,11 +1434,28 @@ export function createServer(): Server {
     // mutation bumps the auth generation (ADR-0003, guarded by scripts/auth-gen-guard.mjs), so a
     // generation that moved means the verdict may be stale: verify again. From the last check to the
     // handler's write, everything is SYNCHRONOUS (no await), so verified-and-written is atomic again.
+    // PR-B (architect b11ef8ad): authority is decided at ONE site. enforceAuth records the verdict; revalidate
+    // re-derives it SYNCHRONOUSLY from a fresh row read (generation, state, the matched credential, and every
+    // time predicate such as a grace window), after the LAST await. From here to the handler's sync start there
+    // is NO await (tests/pr-b-auth-invariants.test.ts pins it by AST). A retryable refusal (the generation or the
+    // credential moved under the verify) re-verifies; anything else refuses. Never served on a stale verdict.
     let authBlock: any | null = null;
     for (let attempt = 1; ; attempt++) {
-      const genBefore = getAuthGeneration();
+      const store = requestContext.getStore();
+      if (store) store.authVerdict = undefined;
       authBlock = await enforceAuth(name, args);
-      if (authBlock || getAuthGeneration() === genBefore) break;
+      if (authBlock) break;
+      const verdict = requestContext.getStore()?.authVerdict;
+      if (!verdict) {
+        authBlock = authError("Internal: the call was allowed without a recorded verdict.", ERROR_CODES.AUTH_FAILED, "no_verdict");
+        break;
+      }
+      const check = revalidate(getDb(), verdict, Date.now());
+      if (check.ok) break;
+      if (!check.retryable) {
+        authBlock = authError(check.reason, ERROR_CODES.AUTH_FAILED, "stale_verdict");
+        break;
+      }
       if (attempt >= AUTH_RECHECK_ATTEMPTS) {
         authBlock = authError("Auth state kept changing while this call was being verified: retry.", ERROR_CODES.RATE_LIMITED, "auth_churn");
         break;

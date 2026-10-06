@@ -80,7 +80,7 @@ export const VERIFY_SITES: Readonly<Record<string, VerifySite>> = Object.freeze(
   "src/token-verify.ts:verifySecretHash": { awaits: ["verifyCredential"], kind: "none", writes: "returns the verdict" },
   "src/auth.ts:authenticateAgent": { awaits: ["verifyCredential", "verifyCredential", "verifyCredential"], kind: "none", writes: "returns the verdict" },
   "src/db.ts:findAgentRowByToken": { awaits: ["verifyCredential", "verifyCredential"], kind: "none", writes: "returns the matched row" },
-  "src/db.ts:resolveAgentByToken": {
+  "src/db.ts:resolveAgentByTokenVerdict": {
     awaits: ["findAgentRowByToken"],
     kind: "guarded",
     writes: "the verified-token cache (bound to the generation read BEFORE the await); the digest heal (a CAS on the verified credential); first_authed_at + established_at (monotonic: the token was valid when its compare started)",

@@ -83,14 +83,45 @@ describe("INVARIANT 1: no await between the final authorization check and the wr
     }
   });
 
-  it("nothing awaits between the final auth-generation re-check and dispatch", () => {
-    const server = code(path.join(SRC, "server.ts"));
-    const recheck = server.indexOf("getAuthGeneration() === genBefore");
-    const dispatchAt = server.indexOf("const result = await dispatch(name, args)");
-    expect(recheck, "the auth-generation re-check is gone").toBeGreaterThan(0);
-    expect(dispatchAt, "the dispatch call moved").toBeGreaterThan(recheck);
-    const between = server.slice(recheck, dispatchAt);
-    expect(between.match(/\bawait\b/g) ?? [], "an await between the final auth check and the handler's write").toEqual([]);
+  it("ONE site (architect b11ef8ad): runCall calls revalidate AFTER the last await of auth, and NOTHING awaits between it and dispatch", () => {
+    const file = path.join(SRC, "server.ts");
+    const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf-8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    // revalidate is the binding imported from ./auth-verdict.js, not a look-alike.
+    const imported = sf.statements.some(
+      (st) =>
+        ts.isImportDeclaration(st) &&
+        ts.isStringLiteral(st.moduleSpecifier) &&
+        st.moduleSpecifier.text === "./auth-verdict.js" &&
+        !!st.importClause?.namedBindings &&
+        ts.isNamedImports(st.importClause.namedBindings) &&
+        st.importClause.namedBindings.elements.some((e) => e.name.text === "revalidate" && !e.propertyName),
+    );
+    expect(imported, "revalidate is imported from ./auth-verdict.js").toBe(true);
+    let runCall: ts.FunctionDeclaration | undefined;
+    const find = (n: ts.Node): void => {
+      if (ts.isFunctionDeclaration(n) && n.name?.text === "runCall") runCall = n;
+      ts.forEachChild(n, find);
+    };
+    find(sf);
+    expect(runCall, "runCall exists").toBeDefined();
+    const awaits: Array<{ pos: number; callee: string }> = [];
+    const revalidates: number[] = [];
+    const visit = (n: ts.Node): void => {
+      if (ts.isAwaitExpression(n)) {
+        const e = n.expression;
+        awaits.push({ pos: n.getStart(sf), callee: ts.isCallExpression(e) && ts.isIdentifier(e.expression) ? e.expression.text : "?" });
+      }
+      if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "revalidate") revalidates.push(n.getEnd());
+      ts.forEachChild(n, visit);
+    };
+    visit(runCall!);
+    expect(revalidates, "runCall calls revalidate exactly once").toHaveLength(1);
+    const dispatchAwait = awaits.find((a) => a.callee === "dispatch");
+    const authAwait = awaits.find((a) => a.callee === "enforceAuth");
+    expect(dispatchAwait && authAwait, "await enforceAuth(...) and await dispatch(...) both exist").toBeTruthy();
+    expect(revalidates[0], "revalidate runs after the auth await").toBeGreaterThan(authAwait!.pos);
+    const between = awaits.filter((a) => a.pos > revalidates[0] && a.pos < dispatchAwait!.pos);
+    expect(between, "an await between revalidate and the handler's dispatch").toEqual([]);
   });
 
   it("every handler in src/tools that calls an identity/token mutator is REGISTERED (a new one cannot appear silently)", () => {

@@ -200,42 +200,5 @@ describe("DASHBOARD send_message: authorized by an awaited from_agent_token veri
   }, 30_000);
 });
 
-describe("ROTATION GRACE: the window is re-checked AFTER the awaited compare (Codex R1 #2)", () => {
-  /** A managed agent rotated with a grace window: T1 (old) valid until expiry, T2 (new) valid. */
-  function rotatedWithGrace(name: string): { t1: string; row: ReturnType<typeof db.getAgentAuthData>; expiry: number } {
-    const t1 = db.registerAgent(name, "worker", [], { managed: true }).plaintext_token!;
-    const before = db.getAgentAuthData(name)!;
-    db.rotateAgentToken(name, before.token_hash!, { graceSeconds: 60 });
-    const row = db.getAgentAuthData(name)!;
-    expect(row.auth_state).toBe("rotation_grace");
-    return { t1, row, expiry: new Date(row.rotation_grace_expires_at!).getTime() };
-  }
-  const authOld = async (name: string, t1: string, row: NonNullable<ReturnType<typeof db.getAgentAuthData>>) => {
-    const { authenticateAgent } = await import("../src/auth.js");
-    return authenticateAgent(name, t1, { hash: row.token_hash, lookup: row.token_lookup }, "rotation_grace", {
-      previous: { hash: row.previous_token_hash ?? null, lookup: row.previous_token_lookup ?? null },
-      rotationGraceExpiresAt: row.rotation_grace_expires_at ?? null,
-    });
-  };
-
-  it("RACE: the window CLOSES while the old token's compare runs → refused (expired), never authorized", async () => {
-    const { t1, row, expiry } = rotatedWithGrace("graceful");
-    const realNow = Date.now;
-    const fired = duringNextCompare(() => {
-      Date.now = () => expiry + 1; // the clock passes the expiry at the exact point a real request can straddle it
-    });
-    try {
-      const r = await authOld("graceful", t1, row!);
-      expect(fired(), "the clock moved during the compare").toBe(true);
-      expect(r.ok).toBe(false);
-      expect(r.reason).toMatch(/grace window expired/);
-    } finally {
-      Date.now = realNow;
-    }
-  });
-
-  it("control: NO race → the old token still authenticates inside the window", async () => {
-    const { t1, row } = rotatedWithGrace("graceful2");
-    expect((await authOld("graceful2", t1, row!)).ok).toBe(true);
-  });
-});
+// The ROTATION GRACE race (Codex R1 #2) moved to tests/pr-b-revalidate.test.ts: the window is decided at ONE site,
+// revalidate at dispatch (architect b11ef8ad), not inside authenticateAgent; the matrix covers it at every await.

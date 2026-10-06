@@ -19,7 +19,8 @@ delete process.env.RELAY_ENCRYPTION_KEYRING;
 delete process.env.RELAY_ENCRYPTION_KEY;
 
 const db = await import("../src/db.js");
-const { unreachableLookupRanges } = await import("../src/token-lookup.js");
+const { unreachableLookupRanges, lookupKeys } = await import("../src/token-lookup.js");
+const { scanTake, SCAN_BURST, _resetAuthThrottleForTests } = await import("../src/auth-throttle.js");
 
 afterAll(() => {
   db.closeDb();
@@ -105,7 +106,6 @@ describe("the fallback is served by the indexes, not a scan", () => {
     clearAgents();
     const ids = ["kr:a", "px:0123456789abcdef"];
     insertRows(Array.from({ length: 10_000 }, (_, i) => ({ lookup: `${ids[i % 2]}|${i.toString(16)}`, hash: true })));
-    db.getDb().exec("ANALYZE");
     const q = db.fallbackRowsQuery(unreachableLookupRanges(ids));
     const plan = (db.getDb().prepare(`EXPLAIN QUERY PLAN ${q.sql}`).all(...q.params) as Array<{ detail: string }>).map((r) => r.detail);
     const touches = plan.filter((d) => /\bagents\b/.test(d));
@@ -131,4 +131,45 @@ describe("the fallback is served by the indexes, not a scan", () => {
     console.log(`FALLBACK steady-state ms per unknown token: N=34 ${small.toFixed(4)} | N=10000 ${large.toFixed(4)}`);
     expect(Number.isFinite(small) && Number.isFinite(large)).toBe(true);
   });
+});
+
+describe("EVERY prepare() in findAgentRowByToken is served by an index (Codex R2 #1: step (a) was a SCAN)", () => {
+  it("captured during a REAL token-only lookup at N=10,000, WITHOUT ANALYZE (a real install may never have run it)", async () => {
+    clearAgents();
+    const kid = lookupKeys()[0].id;
+    insertRows(Array.from({ length: 10_000 }, (_, i) => ({ lookup: `${kid}|${i.toString(16)}`, hash: true })));
+    insertRows([{ lookup: null, hash: true }]); // one digest-less row, so the fallback also runs
+    _resetAuthThrottleForTests();
+    const d = db.getDb();
+    const real = d.prepare.bind(d);
+    const sqls: string[] = [];
+    (d as { prepare: (sql: string) => unknown }).prepare = (sql: string) => (sqls.push(sql), real(sql));
+    try {
+      await db.findAgentRowByToken("t".repeat(43), "plan-src");
+    } finally {
+      (d as { prepare: unknown }).prepare = real;
+    }
+    expect(sqls.length, "the lookup prepared its statements").toBeGreaterThanOrEqual(2);
+    for (const sql of sqls) {
+      const params = Array.from({ length: (sql.match(/\?/g) ?? []).length }, () => "x");
+      const plan = (real(`EXPLAIN QUERY PLAN ${sql}`) as { all: (...p: unknown[]) => Array<{ detail: string }> }).all(...params).map((r) => r.detail);
+      expect(plan.filter((p) => /^SCAN agents\b/.test(p)), `${sql}\n${plan.join("\n")}`).toEqual([]);
+    }
+  });
+});
+
+describe("BUDGET FIRST (Codex R2 #2): an exhausted scan budget reads ZERO fallback rows", () => {
+  it("100,000 digest-less rows + the source's budget exhausted → ZERO fallback queries, refused at once (MEASURED before: ~49 ms of SQL and digest work per call)", async () => {
+    clearAgents();
+    insertRows(Array.from({ length: 100_000 }, () => ({ lookup: null, hash: true })));
+    _resetAuthThrottleForTests();
+    for (let i = 0; i < SCAN_BURST; i++) expect(scanTake("drained")).toBe(true);
+    const before = db.tokenFallbackQueryCount();
+    const t = performance.now();
+    const r = await db.findAgentRowByToken("u".repeat(43), "drained");
+    const ms = performance.now() - t;
+    console.log(`BUDGET-FIRST exhausted lookup at 100k digest-less rows: ${ms.toFixed(2)} ms, fallback queries ${db.tokenFallbackQueryCount() - before}`);
+    expect(db.tokenFallbackQueryCount() - before, "fallback queries run with the budget exhausted").toBe(0);
+    expect(r).toEqual({ refused: "throttled" });
+  }, 60_000);
 });

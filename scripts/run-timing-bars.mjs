@@ -15,7 +15,10 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
+// The repo root from this script's own PHYSICAL location: never the caller's cwd (a release-guard requirement).
+const ROOT = fs.realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
 const FILE = "tests/pr-b-failed-auth.test.ts";
 const EXPECTED = [
   "A/A CONTROL",
@@ -28,7 +31,7 @@ const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "timing-bars-")), "r
 const r = spawnSync(
   "npx",
   ["vitest", "run", FILE, "-t", "BARS", "--silent=false", "--reporter=verbose", "--reporter=json", `--outputFile.json=${out}`],
-  { stdio: "inherit", env: { ...process.env, RELAY_TIMING_BARS: "1" }, shell: process.platform === "win32" },
+  { cwd: ROOT, stdio: "inherit", env: { ...process.env, RELAY_TIMING_BARS: "1" }, shell: process.platform === "win32" },
 );
 let report;
 try {

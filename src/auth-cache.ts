@@ -38,6 +38,8 @@ export const AUTH_CACHE_MAX_ENTRIES = 1000;
 export interface AuthCacheValue {
   name: string;
   capabilities: string[];
+  /** PR-B (architect b11ef8ad): which stored credential the cached verdict rests on, for revalidate. */
+  basis: "current" | "previous";
 }
 
 interface CacheEntry extends AuthCacheValue {
@@ -73,7 +75,7 @@ export function authCacheGet(digest: string, currentGen: number, now: number = D
   // LRU touch: move to tail.
   store.delete(digest);
   store.set(digest, e);
-  return { name: e.name, capabilities: e.capabilities };
+  return { name: e.name, capabilities: e.capabilities, basis: e.basis };
 }
 
 /**
@@ -88,7 +90,7 @@ export function authCacheSet(
   hardExpiry: number,
 ): void {
   if (store.has(digest)) store.delete(digest);
-  store.set(digest, { name: value.name, capabilities: value.capabilities, gen, hardExpiry });
+  store.set(digest, { name: value.name, capabilities: value.capabilities, basis: value.basis, gen, hardExpiry });
   while (store.size > AUTH_CACHE_MAX_ENTRIES) {
     const oldest = store.keys().next().value as string | undefined;
     if (oldest === undefined) break;

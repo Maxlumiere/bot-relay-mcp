@@ -62,6 +62,12 @@ Operational implication: key rotation must pair a file edit with a daemon restar
 
 A future `RELAY_ENCRYPTION_KEYRING_WATCH=1` opt-in reload flag is a v2.2 candidate.
 
+### Authorization is atomic within the daemon process, not across processes
+
+Token checks run off the event loop (a worker pool), so a call's verdict is re-checked synchronously right before its handler runs (`revalidate` in `src/auth-verdict.ts`): the agent's state, the credential it matched, a rotation grace window against the clock, and the auth generation. Between that check and the handler's write the daemon does not yield, so no other request in the daemon can interleave.
+
+Another PROCESS writing the same database file can. A CLI verb (`relay recover`, a rotation) or a stdio connector can commit a revocation between the daemon's check and its handler's write. This window existed before the worker pool too (the check and the write were always separate statements), and it needs a writer that already holds a token or the operator's filesystem access. It is closed by ADR-0050 (transactional authorization: the check and the write in one `BEGIN IMMEDIATE` transaction), the next security change.
+
 This document describes the threat model bot-relay-mcp defends against, the mechanisms that enforce those defenses, and — crucially — what the project does NOT protect. It closes with the vulnerability-disclosure process.
 
 ---

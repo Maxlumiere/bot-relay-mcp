@@ -2512,8 +2512,14 @@ export async function findAgentRowByToken(
   };
   const forms = tokenLookupCandidates(token);
   const ph = forms.map(() => "?").join(",");
+  // (a) The digest index. Two INDEXED halves (Codex R2 #1: the OR form was a SCAN, since v2.20, because no index
+  // served previous_token_lookup): the previous half carries `previous_token_hash IS NOT NULL`, which a previous
+  // credential needs anyway (verifyCredential refuses a null hash) and which the partial index requires.
   const indexed = db
-    .prepare(`SELECT * FROM agents WHERE token_lookup IN (${ph}) OR previous_token_lookup IN (${ph})`)
+    .prepare(
+      `SELECT * FROM agents WHERE token_lookup IN (${ph}) ` +
+        `UNION SELECT * FROM agents WHERE previous_token_lookup IN (${ph}) AND previous_token_hash IS NOT NULL`,
+    )
     .all(...forms, ...forms) as AgentRecord[];
   for (const row of indexed) {
     // token_hash before previous_token_hash: a grace window's NEW token wins.
@@ -2526,36 +2532,43 @@ export async function findAgentRowByToken(
       note(v.verdict);
     }
   }
-  // (b) Only credentials the index cannot reach: no digest, unprefixed, or a non-derivable key. By INDEX RANGES
-  // (architect 9496935f): O(K x log N + unreachable rows), never a scan of the agents table.
+  // (b) Only credentials the index cannot reach: no digest, unprefixed, or a non-derivable key.
+  // BUDGET FIRST (Codex R2 #2, architect b11ef8ad): the scan is charged ONCE per request to this SOURCE's scan
+  // budget (07fe7cfc), never to the per-(source, name) buckets of the rows it compares, and it is taken BEFORE
+  // any fallback SQL: an exhausted budget reads ZERO rows. Refunded when it authenticates or compared nothing.
+  if (!scanTake(source)) return refusal ?? { refused: "throttled" };
+  fallbackQueryCount++;
+  // By INDEX RANGES (9496935f), NAMES ONLY: each candidate's row is read by its primary key just before its
+  // compare, and the scan stops at the first match. (Not iterate(): better-sqlite3 forbids any other use of the
+  // connection while an iterator is open, and the scan awaits a pooled compare between rows.)
   const q = fallbackRowsQuery();
-  const fallback = db.prepare(`SELECT * FROM agents WHERE ${q.tail}`).all(...q.params) as AgentRecord[];
-  const undecided: Array<{ row: AgentRecord; which: "current" | "previous"; hash: string; lookup: string | null | undefined }> = [];
-  for (const row of fallback) {
+  const names = (db.prepare(`SELECT name FROM (SELECT * FROM agents WHERE ${q.tail})`).all(...q.params) as Array<{ name: string }>).map((r) => r.name);
+  const byName = db.prepare("SELECT * FROM agents WHERE name = ?");
+  let compared = false;
+  for (const name of names) {
+    const row = byName.get(name) as AgentRecord | undefined;
+    if (!row) continue; // removed since the name was read: nothing to compare
     for (const which of ["current", "previous"] as const) {
       const lookup = which === "current" ? row.token_lookup : row.previous_token_lookup;
       const hash = which === "current" ? row.token_hash : row.previous_token_hash;
       if (!hash || digestVerdict(lookup, token) !== "unknown") continue; // reachable credentials were decided in (a)
-      undecided.push({ row, which, hash, lookup });
+      const v = await verifyCredential(row.name, { hash, lookup }, token, source, { chargedToScan: true });
+      if (v.verdict === "ok") {
+        scanRefund(source);
+        return { row, matched: which, fromLocator: false };
+      }
+      if (v.verdict === "wrong") compared = true;
+      note(v.verdict);
     }
-  }
-  if (undecided.length === 0) return refusal;
-  // The scan is charged ONCE per request to this SOURCE's scan budget (architect 07fe7cfc), never to the
-  // per-(source, name) buckets of the rows it compares: a token-only call names nobody, so it must not
-  // throttle the agents it happens to scan. Refunded when it authenticates, or when it compared nothing.
-  if (!scanTake(source)) return refusal ?? { refused: "throttled" };
-  let compared = false;
-  for (const c of undecided) {
-    const v = await verifyCredential(c.row.name, { hash: c.hash, lookup: c.lookup }, token, source, { chargedToScan: true });
-    if (v.verdict === "ok") {
-      scanRefund(source);
-      return { row: c.row, matched: c.which, fromLocator: false };
-    }
-    if (v.verdict === "wrong") compared = true;
-    note(v.verdict);
   }
   if (!compared) scanRefund(source);
   return refusal;
+}
+
+let fallbackQueryCount = 0;
+/** How many token-only fallback queries ran (tests: an exhausted scan budget must run ZERO). */
+export function tokenFallbackQueryCount(): number {
+  return fallbackQueryCount;
 }
 
 /**
@@ -2650,7 +2663,7 @@ function verifiedTokenCacheGet(
   gen: number,
   now: number,
   requireName: string | null,
-): { name: string; capabilities: string[] } | null {
+): { name: string; capabilities: string[]; basis: "current" | "previous" } | null {
   const c = authCacheGet(digest, gen, now);
   if (!c) return null;
   if (requireName !== null && c.name !== requireName) return null;
@@ -2695,7 +2708,7 @@ function verifiedTokenCachePut(
   // by final ruling — see the comment above REAPABLE_ORPHAN_WHERE).
   markAgentAuthenticated(name);
   if (indexed) {
-    authCacheSet(digest, { name, capabilities }, gen, authCacheExpiry(now, graceExpiry));
+    authCacheSet(digest, { name, capabilities, basis: matchedColumn === "token_lookup" ? "current" : "previous" }, gen, authCacheExpiry(now, graceExpiry));
   } else {
     selfHealTokenLookup(row, matchedColumn, digest);
   }
@@ -2906,12 +2919,24 @@ export async function abandonRegistration(name: string, handle: string): Promise
  * already-verified, still-current verdict).
  */
 export async function resolveAgentByToken(token: string): Promise<{ name: string; capabilities: string[] } | TokenLookupRefusal | null> {
+  const r = await resolveAgentByTokenVerdict(token);
+  return r && !("refused" in r) ? { name: r.name, capabilities: r.capabilities } : r;
+}
+
+/**
+ * PR-B (architect b11ef8ad): resolveAgentByToken WITH the verdict's evidence, for the dispatcher: which stored
+ * credential matched (`basis`) and its hash (null on a cache hit), so revalidate can re-derive authority at the
+ * point of use. ONE implementation; resolveAgentByToken is a shape-preserving wrapper.
+ */
+export async function resolveAgentByTokenVerdict(
+  token: string,
+): Promise<{ name: string; capabilities: string[]; basis: "current" | "previous"; hash: string | null } | TokenLookupRefusal | null> {
   const digest = computeTokenLookup(token);
   const gen = getAuthGeneration();
   const now = Date.now();
 
   const cached = verifiedTokenCacheGet(digest, gen, now, null); // token-only: any name
-  if (cached) return cached;
+  if (cached) return { ...cached, hash: null }; // a cache hit holds no hash; revalidate checks state, time and generation
 
   const found = await findAgentRowByToken(token);
   if (!found || "refused" in found) return found;
@@ -2932,7 +2957,12 @@ export async function resolveAgentByToken(token: string): Promise<{ name: string
     decision.capabilities,
     decision.graceExpiry,
   );
-  return { name: found.row.name, capabilities: decision.capabilities };
+  return {
+    name: found.row.name,
+    capabilities: decision.capabilities,
+    basis: found.matched,
+    hash: found.matched === "current" ? (found.row.token_hash ?? null) : (found.row.previous_token_hash ?? null),
+  };
 }
 
 /**
@@ -2947,6 +2977,15 @@ export function explicitCallerCacheGet(
   token: string,
   claimedName: string,
 ): { name: string; capabilities: string[] } | null {
+  const v = explicitCallerCacheGetVerdict(token, claimedName);
+  return v ? { name: v.name, capabilities: v.capabilities } : null;
+}
+
+/** PR-B (architect b11ef8ad): explicitCallerCacheGet WITH the verdict's basis, for the dispatcher's revalidate. */
+export function explicitCallerCacheGetVerdict(
+  token: string,
+  claimedName: string,
+): { name: string; capabilities: string[]; basis: "current" | "previous" } | null {
   const digest = computeTokenLookup(token);
   const gen = getAuthGeneration();
   const now = Date.now();

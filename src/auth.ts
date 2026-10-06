@@ -56,6 +56,12 @@ export function isLegacyGraceActive(): boolean {
 export interface AuthResult {
   ok: boolean;
   reason?: string;
+  /**
+   * PR-B (architect b11ef8ad): on success, WHICH stored credential the token matched. The dispatcher records
+   * it in the call's verdict, and revalidate (src/auth-verdict.ts) re-checks it, and any time predicate on it
+   * (a previous credential's grace window), synchronously at the point of use.
+   */
+  matched?: "current" | "previous";
   /** The legacy-acceptance path was used (no token check). */
   legacy?: boolean;
   /**
@@ -233,19 +239,17 @@ export async function authenticateAgent(
     // New token always works during rotation_grace.
     if (stored?.hash) {
       const v = (await verifyCredential(claimedName, stored, tokenOrNull)).verdict;
-      if (v === "ok") return { ok: true };
+      if (v === "ok") return { ok: true, matched: "current" };
       const u = undecided(v);
       if (u) return u;
     }
     // Old token works ONLY while grace hasn't expired.
     if (!expired && graceInputs.previous?.hash) {
       const v = (await verifyCredential(claimedName, graceInputs.previous, tokenOrNull)).verdict;
-      // PR-B (Codex R1 #2): the compare is AWAITED (the pool), so the window can close while it runs. The
-      // expiry is re-checked AFTER the await, against the clock now, never the snapshot taken before it.
-      if (v === "ok" && expiry > 0 && Date.now() >= expiry) {
-        return { ok: false, reason: `Invalid token for agent "${claimedName}" (rotation grace window expired — use the new token).` };
-      }
-      if (v === "ok") return { ok: true };
+      // The compare is AWAITED (the pool), so the window can close while it runs: the verdict says it rests on
+      // the PREVIOUS credential, and revalidate re-checks the window against the clock at the point of use
+      // (one site for every await, architect b11ef8ad), never here.
+      if (v === "ok") return { ok: true, matched: "previous" };
       const u = undecided(v);
       if (u) return u;
     }
@@ -283,6 +287,6 @@ export async function authenticateAgent(
     };
   }
   const v = (await verifyCredential(claimedName, stored, tokenOrNull)).verdict;
-  if (v === "ok") return { ok: true };
+  if (v === "ok") return { ok: true, matched: "current" };
   return undecided(v) ?? { ok: false, reason: `Invalid token for agent "${claimedName}".` };
 }
