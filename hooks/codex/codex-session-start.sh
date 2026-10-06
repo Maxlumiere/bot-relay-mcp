@@ -64,6 +64,7 @@ RELAY_VERDICT_STREAM=stderr
 # These definitions are deliberately self-contained. Sourcing the helper
 # REDEFINES them, so a healthy load transparently upgrades this fallback; the
 # trap resolves `relay_emit_verdict` by name at exit time.
+RELAY_CTX_WARNING=""
 RELAY_VERDICT="CANNOT-JUDGE"
 RELAY_VERDICT_REASON="verdict helper did not load"
 RELAY_VERDICT_DETAIL=""
@@ -151,7 +152,7 @@ build_caps_json() {
 # function so every code path (incl. "curl missing") funnels through it.
 emit_context_and_exit() {
   local ctx
-  ctx="You are bot-relay agent \"${AGENT_NAME}\" (role: ${AGENT_ROLE}) on a local relay at ${HTTP_HOST}:${HTTP_PORT}. Check your inbox now: call get_messages(agent_name=\"${AGENT_NAME}\", status=\"pending\") and act on anything you find. Tether wakes this terminal when new relay mail arrives — no polling, no idle turns."
+  ctx="${RELAY_CTX_WARNING:-}You are bot-relay agent \"${AGENT_NAME}\" (role: ${AGENT_ROLE}) on a local relay at ${HTTP_HOST}:${HTTP_PORT}. Check your inbox now: call get_messages(agent_name=\"${AGENT_NAME}\", status=\"pending\") and act on anything you find. Tether wakes this terminal when new relay mail arrives — no polling, no idle turns."
   if command -v python3 >/dev/null 2>&1; then
     CTX="$ctx" AN="$AGENT_NAME" python3 -c '
 import json, os, sys
@@ -260,7 +261,20 @@ if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
   # The ONLY upgrade path: the relay answered our register call, which is
   # direct evidence this session can reach it. A curl timeout, a refused
   # connection or an empty body all leave CANNOT-JUDGE standing.
-  if [ -n "$REG_BODY" ] && command -v relay_verdict_set >/dev/null 2>&1; then
+  # PR-D: a register the relay REFUSED is not health. Before, any non-empty reply upgraded to HEALTHY, so a new name
+  # refused for the registration secret (or a live same-name holder) read as connected while every send would fail.
+  if [ -n "$REG_BODY" ] && printf '%s' "$REG_BODY" | grep -qE '"isError":[[:space:]]*true'; then
+    if printf '%s' "$REG_BODY" | grep -qE 'error_code\\?"[[:space:]]*:[[:space:]]*\\?"MINT_SECRET_REQUIRED\\?"'; then
+      RELAY_MINT_SECRET_FILE=$(relay_mint_secret_file 2>/dev/null) || RELAY_MINT_SECRET_FILE="<relay instance dir>/secrets/mint.secret"
+      command -v relay_verdict_set >/dev/null 2>&1 \
+        && relay_verdict_set "REGISTER_FAILED" "a new name needs the relay's registration secret (MINT_SECRET_REQUIRED)" " agent=\"$AGENT_NAME\" secret_file=\"$RELAY_MINT_SECRET_FILE\""
+      RELAY_CTX_WARNING="REGISTRATION FAILED: you can read mail but CANNOT SEND. The relay needs its registration secret to register the new name \"${AGENT_NAME}\" (MINT_SECRET_REQUIRED), read from ${RELAY_MINT_SECRET_FILE}: tell the operator that file is missing or unreadable. "
+    else
+      command -v relay_verdict_set >/dev/null 2>&1 \
+        && relay_verdict_set "REGISTER_FAILED" "register_agent returned an error (for example the name is held by another live agent)" " agent=\"$AGENT_NAME\""
+      RELAY_CTX_WARNING="REGISTRATION FAILED: you can read mail but CANNOT SEND. register_agent for \"${AGENT_NAME}\" returned an error (for example the name is held by another live agent): tell the operator. "
+    fi
+  elif [ -n "$REG_BODY" ] && command -v relay_verdict_set >/dev/null 2>&1; then
     relay_verdict_set "HEALTHY" "registered with the relay over HTTP" " agent=\"$AGENT_NAME\""
   fi
   if [ -n "$REG_BODY" ] && command -v write_relay_token_to_vault >/dev/null 2>&1; then

@@ -1130,12 +1130,24 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
   # NOTE: `isError` sits at the JSON-RPC RESULT level, so it is UNESCAPED
   # (`"isError":true`) — unlike error_code/auth_error which live inside the
   # stringified tool content and carry `\"…\"`. Verified against the live wire.
+  # A NEW name refused for the registration secret names THAT cause (and the file), never a guessed collision:
+  # the error_code sits inside the stringified tool content, so its quotes arrive escaped (\").
+  RELAY_REG_MINT_REFUSED=0
+  if printf '%s' "$REG_BODY" | grep -qE 'error_code\\?"[[:space:]]*:[[:space:]]*\\?"MINT_SECRET_REQUIRED\\?"'; then
+    RELAY_REG_MINT_REFUSED=1
+    RELAY_MINT_SECRET_FILE=$(relay_mint_secret_file 2>/dev/null) || RELAY_MINT_SECRET_FILE="<relay instance dir>/secrets/mint.secret"
+  fi
   if [ -z "${RELAY_AGENT_TOKEN:-}" ] && printf '%s' "$REG_BODY" | grep -qE '"isError":[[:space:]]*true'; then
     echo "[RELAY] *** REGISTRATION FAILED — you can read mail but CANNOT SEND ***" >&2
     echo "[relay] register_agent issued no token for \"$AGENT_NAME\" (the server returned an error)." >&2
     echo "[relay] You can READ mail, but every SEND this session will fail with AUTH_FAILED." >&2
-    echo "[relay] Most likely: the name \"$AGENT_NAME\" is already held by another ACTIVE agent." >&2
-    echo "[relay] Choose a unique RELAY_AGENT_NAME and restart, or set RELAY_HOOK_DEBUG=1 to see the server's reason." >&2
+    if [ "$RELAY_REG_MINT_REFUSED" -eq 1 ]; then
+      echo "[relay] Cause: the relay needs its registration secret to register a NEW name (MINT_SECRET_REQUIRED), and this hook could not present a valid one." >&2
+      echo "[relay] It reads it from $RELAY_MINT_SECRET_FILE: check that file exists and is readable by you (the daemon creates it when it starts; \`relay init\` creates it too), then restart." >&2
+    else
+      echo "[relay] Most likely: the name \"$AGENT_NAME\" is already held by another ACTIVE agent." >&2
+      echo "[relay] Choose a unique RELAY_AGENT_NAME and restart, or set RELAY_HOOK_DEBUG=1 to see the server's reason." >&2
+    fi
   fi
   # If $RELAY_HOOK_DEBUG is set, print the full response for troubleshooting.
   # Otherwise stay quiet: the token-less failure case is announced just above, and
@@ -1177,6 +1189,8 @@ if [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2
     relay_verdict_set "DEGRADED" "curl unavailable: register skipped, wake may be unavailable" " agent=\"$AGENT_NAME\""
   elif [ "$DAEMON_REACHABLE" = "0" ]; then
     relay_verdict_set "DEGRADED" "daemon unreachable: register skipped, wake may be unavailable" " agent=\"$AGENT_NAME\" port=\"$HTTP_PORT\""
+  elif [ "$REGISTER_ATTEMPTED" -eq 1 ] && [ "${RELAY_REG_MINT_REFUSED:-0}" -eq 1 ]; then
+    relay_verdict_set "REGISTER_FAILED" "a new name needs the relay's registration secret (MINT_SECRET_REQUIRED)" " agent=\"$AGENT_NAME\" secret_file=\"$RELAY_MINT_SECRET_FILE\""
   elif [ "$REGISTER_ATTEMPTED" -eq 1 ] && printf '%s' "${REG_BODY:-}" | grep -qE '"isError":[[:space:]]*true'; then
     relay_verdict_set "REGISTER_FAILED" "register_agent returned an error (for example the name is held by another live agent)" " agent=\"$AGENT_NAME\""
   fi

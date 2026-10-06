@@ -469,6 +469,10 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
       const timer = setTimeout(() => p.kill("SIGKILL"), 25_000);
       p.on("close", (status) => (clearTimeout(timer), resolve({ stdout, trace, status })));
     });
+  // The hook upgrades to HEALTHY (and so can REPLACE it with REGISTER_FAILED) only when its config detector ran on a
+  // ~/.claude.json naming the relay; without one the verdict stays CANNOT-JUDGE whatever register did.
+  const withMcpConfig = () =>
+    fs.writeFileSync(path.join(ROOT, ".claude.json"), JSON.stringify({ mcpServers: { "bot-relay": { type: "http", url: "http://127.0.0.1:3777/mcp" } } }));
   const helperCalls = (trace: string) => trace.split("\n").filter((l) => /^\++ relay_mint_secret_curl_config\b/.test(l)).length;
 
   it("NAMED (the control): the hook reads the secret, sends it, and the window is registered", async () => {
@@ -491,6 +495,98 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
     });
     expect(db.getAgentAuthData("default")).toBeNull();
     expect((db.getDb().prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number }).n).toBe(before);
+  }, 40_000);
+
+  it("NAMED, the secret MISSING: the window is told the REAL cause (the registration secret, and where), never a guessed name collision", async () => {
+    // MEASURED in the install dry run (sandbox HOME): with the secret gone, a new name's hook said "REGISTER_FAILED
+    // (for example the name is held by another live agent)" and "Most likely: the name ... is already held": loud,
+    // but it named the WRONG cause, so the operator would chase a collision that does not exist.
+    const secretFile = mintSecretPath(ROOT);
+    const parked = `${secretFile}.parked`;
+    withMcpConfig();
+    try {
+      await withDaemon(async (port) => {
+        // Parked AFTER the daemon started: a starting daemon creates a missing secret (the install path).
+        fs.renameSync(secretFile, parked);
+        try {
+          const r = await runHookTraced(port, "named-no-secret");
+          expect(r.status, r.stdout).toBe(0);
+          expect(r.stdout).toMatch(/VERDICT=REGISTER_FAILED reason="[^"]*registration secret[^"]*MINT_SECRET_REQUIRED/);
+          const said = r.stdout + r.trace;
+          expect(said).toContain(secretFile);
+          expect(said).not.toMatch(/Most likely: the name "named-no-secret" is already held/);
+        } finally {
+          fs.renameSync(parked, secretFile);
+        }
+      });
+      expect(db.getAgentAuthData("named-no-secret"), "nothing registered without the secret").toBeNull();
+    } finally {
+      fs.rmSync(path.join(ROOT, ".claude.json"), { force: true });
+    }
+  }, 40_000);
+
+  it("CODEX SessionStart, the secret MISSING: never HEALTHY; REGISTER_FAILED names the secret, and the model is told it cannot send", async () => {
+    // MEASURED before the fix: the Codex hook upgraded to HEALTHY ("registered with the relay over HTTP") on ANY
+    // non-empty register reply, so a refused new name read as connected: the silent class this install must not add.
+    const runCodexHook = (port: number, name: string) =>
+      new Promise<{ stdout: string; stderr: string; status: number | null }>((resolve) => {
+        const p = spawn("bash", [path.resolve("hooks/codex/codex-session-start.sh")], {
+          env: {
+            HOME: ROOT,
+            RELAY_HOME: ROOT,
+            PATH: process.env.PATH || "/usr/bin:/bin",
+            RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+            RELAY_HTTP_HOST: "127.0.0.1",
+            RELAY_HTTP_PORT: String(port),
+            RELAY_AGENT_NAME: name,
+            RELAY_AGENT_ROLE: "auditor",
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        p.stdout.on("data", (d: Buffer) => (stdout += d));
+        p.stderr.on("data", (d: Buffer) => (stderr += d));
+        p.stdin.end("{}");
+        const timer = setTimeout(() => p.kill("SIGKILL"), 25_000);
+        p.on("close", (status) => (clearTimeout(timer), resolve({ stdout, stderr, status })));
+      });
+    const secretFile = mintSecretPath(ROOT);
+    const parked = `${secretFile}.parked`;
+    await withDaemon(async (port) => {
+      // The known-good control first: with the secret, the same hook registers and says HEALTHY.
+      const ok = await runCodexHook(port, "codex-with-secret");
+      expect(ok.stderr).toMatch(/VERDICT=HEALTHY/);
+      expect(db.getAgentAuthData("codex-with-secret")).not.toBeNull();
+      fs.renameSync(secretFile, parked);
+      try {
+        const r = await runCodexHook(port, "codex-no-secret");
+        expect(r.status).toBe(0);
+        expect(r.stderr).not.toMatch(/VERDICT=HEALTHY/);
+        expect(r.stderr).toMatch(/VERDICT=REGISTER_FAILED reason="[^"]*registration secret[^"]*MINT_SECRET_REQUIRED/);
+        const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
+        expect(ctx).toMatch(/REGISTRATION FAILED/);
+        expect(ctx).toContain(secretFile);
+      } finally {
+        fs.renameSync(parked, secretFile);
+      }
+    });
+    expect(db.getAgentAuthData("codex-no-secret"), "nothing registered without the secret").toBeNull();
+  }, 60_000);
+
+  it("NAMED, a name COLLISION (the control): the collision guidance is unchanged, and the secret is never blamed", async () => {
+    db.registerAgent("held-name", "worker", []);
+    db.getDb().prepare("UPDATE agents SET last_seen = ?, session_id = 'other-live-session' WHERE name = ?").run(new Date().toISOString(), "held-name");
+    withMcpConfig();
+    try {
+      await withDaemon(async (port) => {
+        const r = await runHookTraced(port, "held-name");
+        expect(r.stdout).toMatch(/VERDICT=REGISTER_FAILED reason="register_agent returned an error/);
+        expect(r.stdout).not.toMatch(/MINT_SECRET_REQUIRED|registration secret/);
+      });
+    } finally {
+      fs.rmSync(path.join(ROOT, ".claude.json"), { force: true });
+    }
   }, 40_000);
 });
 

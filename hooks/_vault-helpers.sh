@@ -210,10 +210,17 @@ resolve_relay_token_path() {
 # mintSecretHome). A missing, symlinked, short or oddly-shaped secret prints
 # NOTHING and returns 1: the register then goes without it, and the server's
 # refusal (MINT_SECRET_REQUIRED) makes the hook's verdict REGISTER_FAILED, loud.
-relay_mint_secret_curl_config() {
-  local db_path file secret=""
+# relay_mint_secret_file — print WHERE this instance's registration secret lives (never its content), for the
+# hooks' REGISTER_FAILED guidance. Returns 1 when the instance does not resolve.
+relay_mint_secret_file() {
+  local db_path
   db_path=$(resolve_relay_db_path 2>/dev/null) || return 1
-  file="$(dirname "$db_path")/secrets/mint.secret"
+  printf '%s\n' "$(dirname "$db_path")/secrets/mint.secret"
+}
+
+relay_mint_secret_curl_config() {
+  local file secret=""
+  file=$(relay_mint_secret_file) || return 1
   [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
   IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
   # Shape check mirrors src/mint-secret.ts (>= 32 chars of printable ASCII, no
