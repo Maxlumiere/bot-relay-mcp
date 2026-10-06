@@ -77,7 +77,17 @@ mcp_call() {
   body=$(jq -nc --arg name "$name" --argjson args "$args" \
     '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:$name, arguments:$args}}')
   local resp dataline
-  resp=$(curl -sS -X POST "$MCP_URL" "${headers[@]}" -d "$body")
+  # A NEW name over HTTP needs the relay's registration secret (X-Relay-Secret). It sits beside the isolated relay's
+  # DB, and rides curl's config on STDIN, never argv (read with the `read` builtin, printed with `printf`).
+  local mint_secret=""
+  if [ "$name" = "register_agent" ] && [ -z "$token" ] && [ -n "${RELAY_DB_PATH:-}" ] && [ -r "$(dirname "$RELAY_DB_PATH")/secrets/mint.secret" ]; then
+    IFS= read -r mint_secret < "$(dirname "$RELAY_DB_PATH")/secrets/mint.secret" || true
+  fi
+  if [ -n "$mint_secret" ]; then
+    resp=$(printf 'header = "X-Relay-Secret: %s"\n' "$mint_secret" | curl -sS -K - -X POST "$MCP_URL" "${headers[@]}" -d "$body")
+  else
+    resp=$(curl -sS -X POST "$MCP_URL" "${headers[@]}" -d "$body")
+  fi
   # ADR-0005 #3: one-shot POSTs now return plain application/json (no SSE
   # `event: message\ndata: {…}` frame). Use the data: line when present (older
   # SSE framing / stateful paths), else fall back to the raw JSON body.
@@ -646,10 +656,13 @@ PAIR_OUT_FILE="$SMOKE_TMP/pair-config.json"
 PAIR_AGENT_NAME="smoke-pair-$TS"
 # Strip any env the parent passed — the child should pick up its token
 # from the server's register_agent response, not from $RELAY_AGENT_TOKEN.
+# PR-D: a new name needs the hub's registration secret. The operator hands it over as a FILE; pair reads it with
+# --secret-file (never a --secret argv value). Here the hub is the isolated relay: its secret sits beside its DB.
 if RELAY_AGENT_TOKEN= RELAY_HTTP_SECRET= node "$RELAY_BIN" pair \
      "$RELAY_URL" \
      --name "$PAIR_AGENT_NAME" \
      --role tester \
+     --secret-file "$(dirname "${RELAY_DB_PATH:-/nonexistent/x}")/secrets/mint.secret" \
      --yes \
      --output "$PAIR_OUT_FILE" >/dev/null 2>&1; then
   # Assertion 1: snippet file is well-formed JSON with the expected shape.
