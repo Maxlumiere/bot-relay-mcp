@@ -276,8 +276,12 @@ interface Reading {
   shed: number;
 }
 
-/** Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has started. */
-async function measure(port: number, load: Load, onLoop?: () => void): Promise<Reading> {
+/**
+ * Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has
+ * started; `poolWork` (the POOL-LOADED control) starts at the same moment and is finished before this returns.
+ */
+async function measure(port: number, load: Load, onLoop?: () => void, poolWork?: () => Promise<unknown>): Promise<Reading> {
+  let pool: Promise<unknown> = Promise.resolve();
   const eld = monitorEventLoopDelay({ resolution: 1 });
   const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args } });
   try {
@@ -287,6 +291,7 @@ async function measure(port: number, load: Load, onLoop?: () => void): Promise<R
         if (m.started) {
           eld.enable();
           if (onLoop) setTimeout(onLoop, 5);
+          if (poolWork) pool = poolWork();
           return;
         }
         eld.disable();
@@ -295,6 +300,7 @@ async function measure(port: number, load: Load, onLoop?: () => void): Promise<R
     });
   } finally {
     await worker.terminate();
+    await pool;
   }
 }
 
@@ -340,23 +346,32 @@ interface BarStats {
   control: Reading[];
   auth: Reading[];
   compares: number;
+  /** The auth arm's compares in each round. */
+  perRound: number[];
   med: { ctlHealth: number; ctlEld: number; authHealth: number; authEld: number };
 }
 
-/** Run one bar: a discarded warm-up, then K interleaved (control, auth) rounds. Logs a BAR line with the resolution. */
-async function runBar(label: string, port: number, load: Load, onLoop?: () => void): Promise<BarStats> {
+/**
+ * Run one bar: a discarded warm-up, then K interleaved (control, auth) rounds. Logs a BAR line with the resolution.
+ * `poolControl` (architect b72c3ac4): the control arm also runs the pool work the design INTENDS for this load,
+ * a DESIGN CONSTANT in production's shape, so the bar compares the auth PATH against the bcrypt work itself.
+ */
+async function runBar(label: string, port: number, load: Load, opts: { onLoop?: () => void; poolControl?: () => Promise<unknown> } = {}): Promise<BarStats> {
   _resetAuthThrottleForTests();
-  await measure(port, controlLoad(load.n)); // WARM-UP, discarded: a fresh daemon's first burst pays one-off costs
+  await measure(port, controlLoad(load.n), undefined, opts.poolControl); // WARM-UP, discarded: a fresh daemon's first burst pays one-off costs
   const control: Reading[] = [];
   const auth: Reading[] = [];
-  let count = 0;
+  const perRound: number[] = [];
   for (let k = 0; k < K; k++) {
-    control.push(await measure(port, controlLoad(load.n)));
+    control.push(await measure(port, controlLoad(load.n), undefined, opts.poolControl));
     _resetAuthThrottleForTests(); // every auth round meets the same budgets (the scan budget refills slowly)
-    count += await compares(async () => {
-      auth.push(await measure(port, load, onLoop));
-    });
+    perRound.push(
+      await compares(async () => {
+        auth.push(await measure(port, load, opts.onLoop));
+      }),
+    );
   }
+  const count = perRound.reduce((a, b) => a + b, 0);
   const med = {
     ctlHealth: median(control.map((r) => r.healthMax)),
     ctlEld: median(control.map((r) => r.eldMax)),
@@ -367,16 +382,22 @@ async function runBar(label: string, port: number, load: Load, onLoop?: () => vo
     `BAR ${label} | median auth health=${med.authHealth.toFixed(1)} eld=${med.authEld.toFixed(1)} | median control health=${med.ctlHealth.toFixed(1)} eld=${med.ctlEld.toFixed(1)}` +
       ` | gap health=${(med.authHealth - med.ctlHealth).toFixed(1)} eld=${(med.authEld - med.ctlEld).toFixed(1)}` +
       ` | resolution health>${(med.ctlHealth + MARGIN_MS).toFixed(1)} eld>${(med.ctlEld + MARGIN_MS).toFixed(1)}` +
-      ` | compares=${count} | rounds auth health ${list(auth.map((r) => r.healthMax))} eld ${list(auth.map((r) => r.eldMax))}` +
+      ` | compares=${count} (per round ${perRound.join("/")})${opts.poolControl ? " | control: POOL-LOADED" : ""} | rounds auth health ${list(auth.map((r) => r.healthMax))} eld ${list(auth.map((r) => r.eldMax))}` +
       ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}`,
   );
-  return { label, control, auth, compares: count, med };
+  return { label, control, auth, compares: count, perRound, med };
 }
 
 /** The bar's predicates. NOT VACUOUS: no call of any arm was shed (a shed call is a cheap 429 before the MCP cycle). */
-function expectBarHolds(b: BarStats, maxCompares = 0): void {
+function expectBarHolds(b: BarStats, compares: { max?: number; exactPerRound?: number } = { max: 0 }): void {
   expect([...b.control, ...b.auth].map((r) => r.shed), `${b.label}: calls shed by the per-IP limits (every arm)`).toEqual(Array(2 * K).fill(0));
-  expect(b.compares, `${b.label}: bcrypt compares`).toBeLessThanOrEqual(maxCompares);
+  if (compares.exactPerRound !== undefined) {
+    // EXACT, not <=: the pool-loaded control runs the design constant, so a regression that added compares
+    // must fail here rather than hide inside a matching control (architect b72c3ac4 condition 1).
+    expect(b.perRound, `${b.label}: bcrypt compares per round`).toEqual(Array(K).fill(compares.exactPerRound));
+  } else {
+    expect(b.compares, `${b.label}: bcrypt compares`).toBeLessThanOrEqual(compares.max ?? 0);
+  }
   expect(b.med.authEld, `${b.label}: LOOP median ${b.med.authEld.toFixed(1)} vs control median ${b.med.ctlEld.toFixed(1)} + ${MARGIN_MS}`).toBeLessThanOrEqual(b.med.ctlEld + MARGIN_MS);
   expect(b.med.authHealth, `${b.label}: AVAILABILITY median ${b.med.authHealth.toFixed(1)} vs control median ${b.med.ctlHealth.toFixed(1)} + ${MARGIN_MS}`).toBeLessThanOrEqual(b.med.ctlHealth + MARGIN_MS);
   for (const r of b.auth) {
@@ -420,10 +441,23 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       reg(`legacy-${i}`);
       db.getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run(`legacy-${i}`);
     }
+    const hashes = [0, 1, 2, 3].map((i) => db.getAgentAuthData(`legacy-${i}`)!.token_hash!);
+    // THE POOL-LOADED CONTROL (architect b72c3ac4). The design INTENDS bcrypt here: the source's scan budget admits
+    // SCAN_BURST token-only scans per round, each comparing the 4 digest-less rows ONE AFTER ANOTHER (db.ts
+    // findAgentRowByToken awaits each compare), the scans side by side. The control does exactly that on the SAME
+    // pool with the SAME hashes and a wrong token, so the bar measures the auth PATH, not the bcrypt CPU. The count
+    // is the DESIGN CONSTANT (4 x SCAN_BURST), never the auth arm's measured one.
+    // RESIDUAL, stated: on a small host the pool's own CPU competes with the main thread; that is bounded by the
+    // scan budget x the per-compare cost, not by this bar.
+    const poolControl = () =>
+      Promise.all(
+        Array.from({ length: SCAN_BURST }, async () => {
+          for (const h of hashes) await compareOffLoop(randomToken(), h);
+        }),
+      );
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      // per round, compares are BOUNDED by the source's SCAN budget: at most SCAN_BURST scans of the 4 digest-less rows.
-      expectBarHolds(await runBar("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {})), K * 4 * SCAN_BURST);
+      expectBarHolds(await runBar("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {}), { poolControl }), { exactPerRound: 4 * SCAN_BURST });
     });
   }, 180_000);
 
@@ -434,11 +468,13 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       await measure(port, controlLoad(20));
       const pre = await measure(port, controlLoad(20));
       const blockMs = 2 * (Math.max(pre.healthMax, pre.eldMax) + MARGIN_MS);
-      const b = await runBar(`negative-control (block=${blockMs.toFixed(1)}ms)`, port, authLoad(20, "discover_agents", {}), () => {
-        const end = performance.now() + blockMs; // block the DAEMON's loop: what an on-loop bcrypt, or a scan of them, does
-        while (performance.now() < end) {
-          /* busy */
-        }
+      const b = await runBar(`negative-control (block=${blockMs.toFixed(1)}ms)`, port, authLoad(20, "discover_agents", {}), {
+        onLoop: () => {
+          const end = performance.now() + blockMs; // block the DAEMON's loop: what an on-loop bcrypt, or a scan of them, does
+          while (performance.now() < end) {
+            /* busy */
+          }
+        },
       });
       expect([...b.control, ...b.auth].map((r) => r.shed), "the negative control's bursts reached the daemon").toEqual(Array(2 * K).fill(0));
       // The bar's own predicates, inverted: each must FAIL here, or the bar cannot see the harm.
