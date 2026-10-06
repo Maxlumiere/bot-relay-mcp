@@ -48,6 +48,7 @@ function heartbeat(over: Partial<Heartbeat> = {}): Heartbeat {
     starts_since: iso(Date.now() - 60_000), cycles: 12, interval_ms: 5000, condition: "ok", condition_since: iso(Date.now() - 60_000), consecutive_failures: 0, cycle_failures: 0, last_failure: null,
     build: { ...DIST_BUILD }, install_dir: REPO,
     resolution: { kind: "explicit-db", db_path: dbPath, exists: true, containment: "strict", basis: "RELAY_DB_PATH" },
+    not_evaluated: null,
     ...over,
   };
 }

@@ -116,6 +116,18 @@ export interface DoorbellStatus {
     install_dir: string;
   } | null;
   escalations: { open: number; items: Array<{ agent: string; reason: string; operator: string | null; opened_at: string; age_seconds: number }> };
+  /**
+   * PR 6 (ruling 5dda2752): the OPEN board cases (mail this agent cannot be reached for), from the log.
+   * `pending_count_at_open` is the logged snapshot; `pending_count` is read LIVE from the relay DB at
+   * this read (null when it cannot be: `live` says why). Names and counts only, never a message id.
+   */
+  board: {
+    open: number;
+    items: Array<{ agent: string; case: string; opened_at: string; age_seconds: number; binding_ids: string[]; dead_count: number; pending_count_at_open: number; pending_count: number | null }>;
+    live: { ok: true } | { ok: false; why: string };
+  };
+  /** PR 6: the agents the job's LAST cycle could not evaluate (a hold is never silent); null when it planned no cycle. */
+  not_evaluated: { count: number; names: string[] } | null;
   /** Who last took the instance lock, from its NON-authoritative sidecar (display only; the lock itself is kernel-held). */
   holder: { pid: number; proc_start: string | null; host_id: string | null; since: string } | null;
   state_dir: string;
@@ -145,6 +157,31 @@ export function hookLines(st: DoorbellStatus): string[] {
   return lines;
 }
 
+/**
+ * PR 6: each named agent's pending count, LIVE, through the job's own read-only open
+ * (openRelayDbIfWritten: never a sidecar created) and the canonical pendingMetadata. An unopenable DB
+ * is reported, never guessed: the board items then carry pending_count null.
+ */
+async function liveCounts(dbPath: string, agents: string[]): Promise<{ ok: true; counts: Map<string, number> } | { ok: false; why: string }> {
+  if (agents.length === 0) return { ok: true, counts: new Map() };
+  const { openRelayDbIfWritten } = await import("../doorbell-run.js");
+  const { pendingMetadata } = await import("../db.js");
+  let opened: Awaited<ReturnType<typeof openRelayDbIfWritten>>;
+  try {
+    opened = await openRelayDbIfWritten(dbPath);
+  } catch (err) {
+    return { ok: false, why: err instanceof Error ? err.message : String(err) };
+  }
+  if ("waiting" in opened) return { ok: false, why: opened.waiting };
+  try {
+    return { ok: true, counts: new Map(agents.map((a) => [a, pendingMetadata(opened.db, a).count])) };
+  } catch (err) {
+    return { ok: false, why: err instanceof Error ? err.message : String(err) };
+  } finally {
+    opened.db.close();
+  }
+}
+
 /** Read the status for a resolved DB path. Throws on anything unreadable (the caller exits 1). */
 export async function readDoorbellStatus(dbPath: string, resolution: Record<string, unknown> | null, nowWall = Date.now()): Promise<DoorbellStatus> {
   const { stateDirFor, readLogState, LOG_FILENAME } = await import("../doorbell-log.js");
@@ -172,8 +209,29 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
     items.sort((a, b) => (a.opened_at < b.opened_at ? -1 : a.opened_at > b.opened_at ? 1 : a.agent < b.agent ? -1 : 1));
   }
 
+  // PR 6: OPEN board cases, from the same validated log; each pending count read LIVE (read-only, and
+  // only when a writer's sidecars exist: this verb never creates one, exactly like the job).
+  const boardOpen = fs.existsSync(logPath) ? [...readLogState(logPath).boardOpen.values()] : [];
+  const live = await liveCounts(dbPath, boardOpen.map((r) => r.agent_name));
+  const board: DoorbellStatus["board"] = {
+    open: boardOpen.length,
+    items: boardOpen
+      .map((r) => ({
+        agent: r.agent_name,
+        case: r.case,
+        opened_at: r.at,
+        age_seconds: Math.max(0, Math.round((nowWall - Date.parse(r.at)) / 1000)),
+        binding_ids: r.binding_ids,
+        dead_count: r.dead_count,
+        pending_count_at_open: r.pending_count,
+        pending_count: live.ok ? (live.counts.get(r.agent_name) ?? 0) : null,
+      }))
+      .sort((a, b) => (a.opened_at < b.opened_at ? -1 : a.opened_at > b.opened_at ? 1 : a.agent < b.agent ? -1 : 1)),
+    live: live.ok ? { ok: true } : { ok: false, why: live.why },
+  };
+
   if (hb.kind === "absent") {
-    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, holder, state_dir: stateDir, db_path: dbPath, resolution };
+    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, board, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
   }
   const h = hb.heartbeat;
   const judged = judgeHeartbeat(h, nowWall);
@@ -206,6 +264,8 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
       install_dir: h.install_dir,
     },
     escalations: { open: items.length, items },
+    board,
+    not_evaluated: h.not_evaluated,
     holder,
     state_dir: stateDir,
     db_path: dbPath,
@@ -250,7 +310,7 @@ export async function run(argv: string[]): Promise<number> {
     const lines = hookLines(st);
     if (lines.length > 0) process.stdout.write(lines.join("\n") + "\n");
   } else {
-    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s)\n`);
+    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.board.open} open board case(s)\n`);
   }
   return 0;
 }

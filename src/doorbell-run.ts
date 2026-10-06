@@ -46,11 +46,11 @@ import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
-import { getOwnHostId, processStartedAt } from "./liveness.js";
+import { anchorLivenessVerdict, getOwnHostId, processStartedAt } from "./liveness.js";
 import { performance } from "perf_hooks";
 import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
-import { conditionOf, FUTURE_TOLERANCE_MS, HEARTBEAT_FILENAME, MAX_COUNT, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
+import { conditionOf, FUTURE_TOLERANCE_MS, HEARTBEAT_FILENAME, MAX_COUNT, NOT_EVALUATED_MAX_NAMES, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
 import { acquireInstanceLock, EXIT_ALREADY_RUNNING, lockStillOurs, releaseInstanceLock, type LockHandle } from "./doorbell-lock.js";
 import { AGENT_NAME_PATTERN } from "./types.js";
 
@@ -150,6 +150,50 @@ function sidecarIds(dbPath: string): { wal: string | null; shm: string | null } 
     }
   };
   return { wal: id(`${dbPath}-wal`), shm: id(`${dbPath}-shm`) };
+}
+
+/**
+ * Open the relay DB READ-ONLY only when a writer has created BOTH WAL sidecars, and they are the
+ * same files across the open (the doorbell never creates a sidecar, and never keeps a handle that
+ * raced a writer's checkpoint). Returns the handle, or why it waits. A schema gap THROWS. Shared by
+ * the job and by `relay doorbell status` (its live pending counts, PR 6), so both open it one way.
+ */
+export async function openRelayDbIfWritten(dbPath: string, afterFirstRead?: () => void): Promise<{ db: import("./sqlite-compat.js").CompatDatabase } | { waiting: string }> {
+  const before = sidecarIds(dbPath);
+  if (!before.wal || !before.shm) {
+    const missing = [!before.wal && "-wal", !before.shm && "-shm"].filter(Boolean).join(" and ");
+    return { waiting: `the relay DB has no ${missing} yet: waiting for a writer (the doorbell creates no sidecar)` };
+  }
+  const { openPendingDb } = await import("./cli/pending.js");
+  const { pendingSchemaGap } = await import("./db.js");
+  const h = await openPendingDb(dbPath);
+  let gap: string | null;
+  try {
+    gap = pendingSchemaGap(h); // the first read: SQLite maps the sidecars here
+    afterFirstRead?.();
+  } catch (err) {
+    h.close();
+    throw err;
+  }
+  const after = sidecarIds(dbPath);
+  if (after.wal !== before.wal || after.shm !== before.shm) {
+    h.close();
+    return { waiting: "a WAL sidecar changed while the relay DB was being opened: closed at once, waiting for a writer" };
+  }
+  if (gap) {
+    h.close();
+    throw new Error(`${dbPath} ${gap}`);
+  }
+  return { db: h };
+}
+
+/**
+ * PR 6 (ruling 5dda2752): ONE binding's liveness, from its WINDOW anchor (pid + start token), exactly
+ * as `relay fleet` judges a window (src/cli/fleet.ts). Never agents.agent_status or agents.session_id:
+ * a window is alive or dead by kernel fact, whatever the relay last recorded about the agent.
+ */
+export function bindingLiveness(b: { host_id: string; window_pid?: number | null; window_pid_start?: string | null }, ownHostId: string | null): import("./liveness.js").AnchorVerdict {
+  return anchorLivenessVerdict({ host_id: b.host_id, agent_pid: b.window_pid ?? null, agent_pid_start: b.window_pid_start ?? null }, ownHostId);
 }
 
 /** Test seams: not reachable from the command line (dist/doorbell.js passes argv only). */
@@ -294,38 +338,16 @@ async function runLocked(
   if (prev.kind === "unreadable") process.stderr.write(`doorbell: the previous heartbeat is unreadable (${prev.reason}): the start count and failure streak restart\n`);
   const installDir = ownInstallDir();
 
-  const { openPendingDb } = await import("./cli/pending.js");
   const dbm = await import("./db.js");
-  const { pendingSchemaGap, listAgentBindings } = dbm;
+  const { listAgentBindings, agentsWithPendingMail } = dbm;
   let db: import("./sqlite-compat.js").CompatDatabase | null = null;
 
   /** Open the DB only with both sidecars present and unchanged across the open; else why not. */
   const tryOpenDb = async (): Promise<string | null> => {
-    const before = sidecarIds(dbPath);
-    if (!before.wal || !before.shm) {
-      const missing = [!before.wal && "-wal", !before.shm && "-shm"].filter(Boolean).join(" and ");
-      return `the relay DB has no ${missing} yet: waiting for a writer (the doorbell creates no sidecar)`;
-    }
-    const h = await openPendingDb(dbPath);
-    let gap: string | null;
-    try {
-      gap = pendingSchemaGap(h); // the first read: SQLite maps the sidecars here
-      opts.afterDbOpen?.();
-    } catch (err) {
-      h.close();
-      throw err;
-    }
-    const after = sidecarIds(dbPath);
-    if (after.wal !== before.wal || after.shm !== before.shm) {
-      h.close();
-      return "a WAL sidecar changed while the relay DB was being opened: closed at once, waiting for a writer";
-    }
-    if (gap) {
-      h.close();
-      throw new Error(`${dbPath} ${gap}`);
-    }
-    db = h;
-    compactOnStart(h);
+    const r = await openRelayDbIfWritten(dbPath, opts.afterDbOpen);
+    if ("waiting" in r) return r.waiting;
+    db = r.db;
+    compactOnStart(r.db);
     return null;
   };
 
@@ -386,14 +408,19 @@ async function runLocked(
     lastWall = nowWall;
     lastMono = nowMono;
     phase = "pending-read";
+    const ownHostId = getOwnHostId();
     const plan = planCycle({
       bindings: listAgentBindings(handle),
-      ownHostId: getOwnHostId(),
+      ownHostId,
       pending: (name) => pendingReadOf(dbm, handle, name),
       rung: state.rung,
       ringMono,
       nowMono,
       budgetExhausted: state.budgetExhausted,
+      // PR 6: each binding's WINDOW anchor, exactly as `relay fleet` judges a window (src/cli/fleet.ts).
+      liveness: (b) => bindingLiveness(b, ownHostId),
+      mailAgents: () => agentsWithPendingMail(handle),
+      boardOpen: state.boardOpen,
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,
       horizonMs: args.horizonMs,
@@ -408,6 +435,7 @@ async function runLocked(
       now: () => iso(nowWall),
     });
     phase = "other";
+    lastNotEvaluated = plan.notEvaluated;
     opts.mutatePlan?.(plan);
     // In the planner's order: durable first (write-ahead), then the state moves (A3.2: each
     // record is a state change, written once).
@@ -416,6 +444,9 @@ async function runLocked(
       if (rec.type === "budget") {
         // Q4: surface it loudly (the board and the status verb read it from the log later).
         process.stderr.write(`doorbell: ring budget ${rec.state} for ${rec.agent_name} (${rec.rings_in_hour} rings in the last hour, budget ${rec.budget_per_hour})\n`);
+      } else if (rec.type === "board") {
+        // The board and this log only (V1), like an escalation. Never a relay message.
+        process.stderr.write(`doorbell: board ${rec.state} (${rec.case}) for ${rec.agent_name}${rec.close_reason ? `: ${rec.close_reason}` : ""}\n`);
       } else if (rec.type === "escalation") {
         // V1: the board and this log only; stderr is the job's own log. Never a relay message.
         process.stderr.write(`doorbell: escalation ${rec.state} (${rec.reason}) for ${rec.agent_name}${rec.close_reason ? `: ${rec.close_reason}` : ""}\n`);
@@ -429,12 +460,15 @@ async function runLocked(
   // THE heartbeat writer (ruling 9987c113 Q1 (i)): called ONLY from the loop above, once per cycle
   // attempt, with `cycles` incremented in the same write. Nothing else writes the heartbeat.
   let attempts = 0;
+  /** PR 6: the agents THIS attempt's planned cycle could not evaluate; null when no cycle was planned. */
+  let lastNotEvaluated: string[] | null = null;
   let consecutiveFailures = prevHb?.consecutive_failures ?? 0;
   let lastFailure: Heartbeat["last_failure"] = prevHb?.last_failure ?? null;
   let cycleFailures = 0;
   let condition: Heartbeat["condition"] | null = prevHb?.condition ?? null;
   let conditionSince: string | null = prevHb?.condition_since ?? null;
   const writeHeartbeat = (attempt: { waiting: boolean; logFull: boolean; failed: FailureKind | null }): void => {
+    const ne = lastNotEvaluated;
     const at = iso(clock.wallMs());
     attempts = saturatingInc(attempts);
     consecutiveFailures = attempt.failed ? saturatingInc(consecutiveFailures) : 0;
@@ -470,6 +504,7 @@ async function runLocked(
       build: { ...LOADED_BUILD },
       install_dir: installDir,
       resolution: serializeResolution(resolution),
+      not_evaluated: ne === null ? null : { count: ne.length, names: [...ne].sort().slice(0, NOT_EVALUATED_MAX_NAMES) },
     };
     try {
       replaceStateFile(log, HEARTBEAT_FILENAME, JSON.stringify(hb) + "\n");
@@ -488,6 +523,7 @@ async function runLocked(
     while (!stopping) {
       // ONE cycle ATTEMPT (ruling 9987c113): its outcome, then the ONE heartbeat write below.
       const attempt = { waiting: false, logFull: false, failed: null as FailureKind | null };
+      lastNotEvaluated = null; // set only when THIS attempt plans a cycle
       let failStop = false;
       // F5: still the ONLY doorbell for this instance? Never act on a state dir we no longer own.
       if (!lockStillOurs(lockHandle)) {
