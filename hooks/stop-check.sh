@@ -519,9 +519,11 @@ fi
 # `watch`; `never` (it never armed one) and `no_window` (no single live window)
 # never heal. The once is the session id, kept in the AGENT's watch dir inside
 # the resolved instance (Codex R1 #4: never under the shared $HOME). It is read
-# no-follow and replaced by rename(2), which replaces a planted link instead of
-# following it; the dir must be a real directory, else nothing is read or
-# written. With no valid session id there is no heal (it cannot be bounded).
+# no-follow and replaced by renameat(2), which replaces a planted link instead
+# of following it; EVERY directory component below the instance is opened
+# no-follow (a link at watch/ or at the agent dir is refused), and every
+# operation is relative to the opened directory. With no valid session id
+# there is no heal (it cannot be bounded).
 # Same block as the mail wake: when mail is pending too, the re-arm line rides
 # inside that one block.
 HEAL_LINE=""
@@ -529,35 +531,46 @@ if [ "$READ_OK" -eq 1 ] && [ "$MODE" = local ] && command -v python3 >/dev/null 
   HEAL_DB=$(relay_pending_resolution_db "$F1_OUT" 2>/dev/null)
   if [ -n "$HEAL_DB" ]; then
     HEAL_LINE=$(F1="$F1_OUT" HI="$HOOK_INPUT" DB="$HEAL_DB" CLI="$RELAY_CLI" AN="$AGENT_NAME" python3 -c '
-import json, os, re, shlex, stat, sys, tempfile
+import json, os, re, shlex, sys
 try:
     w = json.loads(os.environ["F1"]).get("watch")
 except Exception:
     w = None
 if w not in ("live", "stale", "absent"):
     sys.exit(0)  # never / no_window / missing: no heal
-d = os.path.join(os.path.dirname(os.environ["DB"]), "watch", os.environ["AN"])
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRFLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | NOFOLLOW
+# EVERY component below the instance dir is opened no-follow, and every operation is relative to the
+# opened directory (Codex R2 (a)): a link at <instance>/watch or at <agent> is refused, never followed.
+fds = []
 try:
-    if not stat.S_ISDIR(os.lstat(d).st_mode):
-        sys.exit(0)  # a link or not a directory: nothing is read or written
+    fds.append(os.open(os.path.dirname(os.environ["DB"]), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)))
+    for comp in ("watch", os.environ["AN"]):
+        fds.append(os.open(comp, DIRFLAGS, dir_fd=fds[-1]))
 except OSError:
-    sys.exit(0)
-f = os.path.join(d, "heal-session")
+    for fd in fds:
+        os.close(fd)
+    sys.exit(0)  # absent, a link, or not a directory: nothing is read or written
+d = fds[-1]
+def done(code=0):
+    for fd in fds:
+        os.close(fd)
+    sys.exit(code)
 if w == "live":
     try:
-        os.unlink(f)  # removes a link itself, never its target
+        os.unlink("heal-session", dir_fd=d)  # removes a link itself, never its target
     except OSError:
         pass
-    sys.exit(0)
+    done()
 try:
     sid = json.loads(os.environ["HI"]).get("session_id")
 except Exception:
     sid = None
 if not (isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9-]{1,128}", sid)):
-    sys.exit(0)
+    done()
 healed = ""
 try:
-    fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open("heal-session", os.O_RDONLY | NOFOLLOW, dir_fd=d)
     try:
         healed = os.read(fd, 200).decode("ascii", "replace")
     finally:
@@ -565,23 +578,26 @@ try:
 except OSError:
     pass
 if healed == sid:
-    sys.exit(0)  # already told this session
+    done()  # already told this session
+tmp = ".heal.%s" % os.urandom(8).hex()
 try:
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".heal.")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=d)
     try:
         os.write(fd, sid.encode("ascii"))
     finally:
         os.close(fd)
-    os.replace(tmp, f)  # rename(2): replaces a planted link, never follows it
+    os.rename(tmp, "heal-session", src_dir_fd=d, dst_dir_fd=d)  # renameat(2): replaces a planted link, never follows it
 except OSError:
     try:
-        os.unlink(tmp)
-    except Exception:
+        os.unlink(tmp, dir_fd=d)
+    except OSError:
         pass
-    sys.exit(0)  # cannot bound it to once: no heal
+    done()  # cannot bound it to once: no heal
 how = "is hung (it stopped checking)" if w == "stale" else "is not running"
-cmd = "RELAY_DB_PATH=%s %s watch %s --until-wake" % (shlex.quote(os.environ["DB"]), shlex.quote(os.environ["CLI"]), os.environ["AN"])
-sys.stdout.write("[RELAY] Your relay watch %s: mail will not wake this session while you are idle. Re-arm it now as a BACKGROUND task (run_in_background), once: %s" % (how, cmd))
+check = "RELAY_DB_PATH=%s %s watch %s --arm-check" % (shlex.quote(os.environ["DB"]), shlex.quote(os.environ["CLI"]), os.environ["AN"])
+sys.stdout.write("[RELAY] Your relay watch %s: mail will not wake this session while you are idle. Re-arm it: run %s and, if it says arm, run the command it gives as a BACKGROUND task (run_in_background)." % (how, check))
+for fd in fds:
+    os.close(fd)
 ' 2>/dev/null)
   fi
 fi

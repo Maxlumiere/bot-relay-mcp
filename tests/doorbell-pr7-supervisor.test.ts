@@ -147,12 +147,16 @@ describe.skipIf(!OWN)("PR 7: the doorbell supervises the watch (the real job, a 
     expect(intents()).toBe(0);
   }, 60_000);
 
-  it("a HUNG watch (lock held, heartbeat older than the stale bound) → no_driver(watch_stale)", async () => {
+  it.skipIf(W.awakeNowMs() === null)("a HUNG watch (lock held, its own heartbeat older than the stale bound on the AWAKE clock) → no_driver(watch_stale)", async () => {
     db.sendMessage("s7-sender", "s7-alice", "x", "normal");
     expect(await within(startWatch("s7-alice").exited, 20_000)).toBe(0);
     startWatch("s7-alice");
     await untilLive("s7-alice");
-    expect(await lifetime(Date.now() + W.HEARTBEAT_STALE_MS + 5_000)).toBe(0);
+    // Staleness is AWAKE time (Codex R2 (c)): moving the job's wall clock proves nothing; age the holder's own stamp.
+    const dir = W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start: processStartedAt(win.pid) as string });
+    const h = JSON.parse(fs.readFileSync(path.join(dir, W.watchHolderFile(0)), "utf-8"));
+    W.writeHeartbeat(dir, { pid: h.pid, gen: 0, at: new Date().toISOString(), awake_ms: (W.awakeNowMs() as number) - W.HEARTBEAT_STALE_MS - 60_000 });
+    expect(await lifetime(Date.now())).toBe(0);
     expect(boards()).toEqual([["no_driver", "open", "watch_stale"]]);
   }, 60_000);
 });

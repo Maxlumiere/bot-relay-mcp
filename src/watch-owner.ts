@@ -15,7 +15,10 @@
  *   (ii) a REPARENTED watch (its parent is init/launchd: nohup, disown, a dead shell) refuses to arm;
  *   (iii) the window found must be the agent's ONE live bound window, else refuse ("binding moved" once
  *       running);
- *   (iv) the lock key is (agent, window pid + start): src/watch-wake.ts watchWindowDir.
+ *   (iv) the lock key is (agent, window pid + start): src/watch-wake.ts watchWindowDir. The start is the
+ *        KERNEL's (UTC form, from the same snapshot that proved the hop), never the stored token: a
+ *        legacy-form migration rewrites the token under the same binding (Codex R2 (b)), and the key,
+ *        the supervisor and stillOwner must all name the same window the same way.
  * No token is read: possession of a credential proves possession, not window ownership (ADR-0036: the
  * window anchor is the principal).
  */
@@ -31,7 +34,12 @@ export interface OwnerBinding {
   window_pid_start?: string | null;
 }
 export type OwnerRefusal = "reparented" | "no_bound_ancestor" | "no_live_window" | "ambiguous_binding" | "not_this_window";
-export type Ownership = { ok: true; window: { binding_id: string; pid: number; start: string } } | { ok: false; why: OwnerRefusal };
+/** The window a watch belongs to: its pid and its start as the KERNEL reads it (UTC form). */
+export interface OwnedWindow {
+  pid: number;
+  start: string;
+}
+export type Ownership = { ok: true; window: OwnedWindow } | { ok: false; why: OwnerRefusal };
 
 export interface OwnerDeps {
   /** One consistent process snapshot (pid, ppid, start): liveness.buildProcessTable. */
@@ -63,7 +71,7 @@ export function resolveOwnership(selfPid: number, bindings: readonly OwnerBindin
   if (!self || self.ppid <= 1) return { ok: false, why: "reparented" }; // (ii)
   // Walk the ancestry (bounded); the FIRST hop that a binding of this agent names, verified (i).
   const mine = bindings.filter((b) => b.host_id === ownHostId && Number.isInteger(b.window_pid) && typeof b.window_pid_start === "string" && b.window_pid_start.length > 0);
-  let found: OwnerBinding | null = null;
+  let found: { b: OwnerBinding; start: string } | null = null;
   let cur: ProcEntry | undefined = table.get(self.ppid);
   for (let depth = 0; cur && depth < 64 && !found; depth++) {
     const hop = cur;
@@ -71,7 +79,7 @@ export function resolveOwnership(selfPid: number, bindings: readonly OwnerBindin
       if (b.window_pid !== hop.pid) continue;
       if (deps.startNow(hop.pid) !== hop.startedAt) continue; // the hop is no longer that process
       if (!deps.sameProcess(hop.pid, b.window_pid_start as string)) continue; // the binding names another process
-      found = b;
+      found = { b, start: hop.startedAt };
       break;
     }
     if (hop.ppid <= 1) break;
@@ -82,16 +90,24 @@ export function resolveOwnership(selfPid: number, bindings: readonly OwnerBindin
   const one = oneLiveWindow(bindings, ownHostId, deps.liveness);
   if (one.kind === "none") return { ok: false, why: "no_live_window" };
   if (one.kind === "ambiguous") return { ok: false, why: "ambiguous_binding" };
-  if (one.b.binding_id !== found.binding_id) return { ok: false, why: "not_this_window" };
-  return { ok: true, window: { binding_id: found.binding_id, pid: found.window_pid as number, start: found.window_pid_start as string } };
+  if (one.b.binding_id !== found.b.binding_id) return { ok: false, why: "not_this_window" };
+  return { ok: true, window: { pid: hopPid(found.b), start: found.start } };
 }
 
+const hopPid = (b: OwnerBinding): number => b.window_pid as number;
+
+/** Is the window itself still the same live process (pid + the kernel's start)? */
+export const windowAlive = (w: OwnedWindow, startNow: (pid: number) => string | null): boolean => startNow(w.pid) === w.start;
+
 /**
- * While running: is the agent's ONE live window still this watch's window? (Each check; cheap: the
- * ancestry itself is re-proven by the caller through process.ppid being unchanged.) A verdict of
- * "dead" is permanent for a (pid, start), so it is cached; any other verdict is read again.
+ * While running: is the agent's ONE live window still THIS window, compared by what the window IS
+ * (pid + the kernel's start), never by a binding id (Codex R2 (b))? Each check; the ancestry itself is
+ * re-proven by the caller (process.ppid unchanged). A "dead" verdict is permanent for a (pid, start),
+ * so it is cached; any other verdict is read again. "window_gone" = this window's process ended.
  */
-export function stillOwner(window: { binding_id: string }, bindings: readonly OwnerBinding[], ownHostId: string | null, liveness: (b: OwnerBinding) => AnchorVerdict, deadCache: Set<string>): Ownership | { ok: true } {
+export function stillOwner(window: OwnedWindow, bindings: readonly OwnerBinding[], ownHostId: string | null, deps: Pick<OwnerDeps, "liveness" | "startNow">, deadCache: Set<string>): { ok: true } | { ok: false; why: OwnerRefusal | "window_gone" } {
+  if (!windowAlive(window, deps.startNow)) return { ok: false, why: "window_gone" };
+  const liveness = deps.liveness;
   const cached = (b: OwnerBinding): AnchorVerdict => {
     const key = `${b.host_id}|${b.window_pid}|${b.window_pid_start}`;
     if (deadCache.has(key)) return "dead";
@@ -102,5 +118,5 @@ export function stillOwner(window: { binding_id: string }, bindings: readonly Ow
   const one = oneLiveWindow(bindings, ownHostId, cached);
   if (one.kind === "none") return { ok: false, why: "no_live_window" };
   if (one.kind === "ambiguous") return { ok: false, why: "ambiguous_binding" };
-  return one.b.binding_id === window.binding_id ? { ok: true } : { ok: false, why: "not_this_window" };
+  return one.b.window_pid === window.pid ? { ok: true } : { ok: false, why: "not_this_window" };
 }

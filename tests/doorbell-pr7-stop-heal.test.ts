@@ -55,7 +55,7 @@ const healFile = () => path.join(agentDir(), W.HEAL_FILE);
 const armedOnce = () => fs.mkdirSync(agentDir(), { recursive: true, mode: 0o700 }); // the agent dir exists: it armed before
 const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 let win: TestWindow;
-const startWatch = () => win.run(`node ${sq(RELAY_BIN)} watch h-bob --until-wake --interval 1`);
+const startWatch = () => win.run(`node ${sq(RELAY_BIN)} watch h-bob --until-wake --interval 1 --dormant-check-s 1`);
 async function untilLive(): Promise<void> {
   for (let i = 0; i < 100; i++) {
     if (spawnSync("node", [RELAY_BIN, "watch", "h-bob", "--lock-status"], { env: env(), encoding: "utf-8" }).stdout.trim() === "live") return;
@@ -89,13 +89,18 @@ describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)",
     armedOnce();
     const first = stop(natural("sess-1"));
     expect(first.block?.decision).toBe("block");
-    expect(first.block?.reason).toMatch(/^\[RELAY\] Your relay watch is not running: .* Re-arm it now as a BACKGROUND task \(run_in_background\), once: RELAY_DB_PATH=.+ watch h-bob --until-wake Then continue\.$/);
+    expect(first.block?.reason).toMatch(/^\[RELAY\] Your relay watch is not running: .* Re-arm it: run RELAY_DB_PATH=.+ watch h-bob --arm-check and, if it says arm, run the command it gives as a BACKGROUND task \(run_in_background\)\. Then continue\.$/);
     expect(fs.readFileSync(healFile(), "utf-8")).toBe("sess-1"); // the once lives in the AGENT dir
     expect(fs.existsSync(path.join(HOME, ".bot-relay"))).toBe(false); // never under $HOME (Codex R1 #4)
     expect(stop(natural("sess-1")).out).toBe(""); // once per session
     expect(stop(natural("sess-2")).block?.decision).toBe("block");
-    // The command it gives is RUNNABLE as printed, in the agent's window: with mail pending, the watch wakes.
-    const cmd = (first.block as { reason: string }).reason.replace(/^.*once: /, "").replace(/ Then continue\.$/, "");
+    // The steps it gives are RUNNABLE as printed, in the agent's window: the arm-check says arm and
+    // gives the background command; with mail pending, that watch wakes.
+    const check = (first.block as { reason: string }).reason.replace(/^.*Re-arm it: run /, "").replace(/ and, if it says arm, .*$/, "");
+    const a = win.run(check);
+    expect(await within(a.exited, 30_000), a.err()).toBe(0);
+    expect(a.out()).toMatch(/^arm: .*once: /);
+    const cmd = a.out().trim().replace(/^arm: .*once: /, "");
     db.sendMessage("h-alice", "h-bob", "x", "normal");
     const r = win.run(cmd);
     expect(await within(r.exited, 30_000), r.err()).toBe(0);
@@ -114,16 +119,13 @@ describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)",
     expect(stop(natural("sess-1")).block?.decision).toBe("block");
   }, 60_000);
 
-  it("a HUNG watch (lock held, its holder silent past the stale bound) → the block says it is hung", async () => {
+  it.skipIf(W.awakeNowMs() === null)("a HUNG watch (lock held, its holder silent past the stale bound) → the block says it is hung", async () => {
     startWatch();
     await untilLive();
-    // Age the CURRENT holder (its sidecar's since and its own heartbeat): real time cannot pass 5 min.
+    // Age the CURRENT holder: its own heartbeat, stamped past the stale bound on the AWAKE clock.
     const dir = W.watchWindowDir(DB, "h-bob", { pid: win.pid, start: processStartedAt(win.pid) as string });
-    const old = new Date(Date.now() - W.HEARTBEAT_STALE_MS - 60_000).toISOString();
-    const f = path.join(dir, W.watchHolderFile(0));
-    const h = JSON.parse(fs.readFileSync(f, "utf-8"));
-    fs.writeFileSync(f, JSON.stringify({ ...h, since: old }));
-    fs.rmSync(path.join(dir, W.HEARTBEAT_FILE), { force: true }); // the sign is then the sidecar's since (wall)
+    const h = JSON.parse(fs.readFileSync(path.join(dir, W.watchHolderFile(0)), "utf-8"));
+    W.writeHeartbeat(dir, { pid: h.pid, gen: 0, at: new Date().toISOString(), awake_ms: (W.awakeNowMs() as number) - W.HEARTBEAT_STALE_MS - 60_000 });
     expect(stop(natural()).block?.reason).toMatch(/^\[RELAY\] Your relay watch is hung \(it stopped checking\)/);
   }, 60_000);
 
@@ -132,7 +134,7 @@ describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)",
     db.sendMessage("h-alice", "h-bob", "x", "normal");
     const b = stop(natural()).block;
     expect(b?.decision).toBe("block");
-    expect(b?.reason).toMatch(/^\[RELAY\] 1 pending message for h-bob, latest from h-alice\. .* this wake did not consume it\. \[RELAY\] Your relay watch is not running: .*--until-wake$/);
+    expect(b?.reason).toMatch(/^\[RELAY\] 1 pending message for h-bob, latest from h-alice\. .* this wake did not consume it\. \[RELAY\] Your relay watch is not running: .*--arm-check and, if it says arm, .*\(run_in_background\)\.$/);
   });
 
   it("never inside our own continuation (stop_hook_active), and never without a valid session id (it cannot be bounded to once)", () => {
@@ -168,5 +170,13 @@ describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)",
     fs.symlinkSync(elsewhere, agentDir());
     expect(stop(natural()).out).toBe("");
     expect(fs.readdirSync(elsewhere)).toEqual([]);
+  });
+
+  it("HARM (Codex R2 (a)): a link at the PARENT <instance>/watch (to an outside dir holding a real <agent> dir) → nothing is read or written through it", () => {
+    const outside = path.join(ROOT, "outside");
+    fs.mkdirSync(path.join(outside, "h-bob"), { recursive: true, mode: 0o700 });
+    fs.symlinkSync(outside, path.dirname(agentDir())); // <instance>/watch → outside
+    expect(stop(natural("sess-p")).out).toBe("");
+    expect(fs.readdirSync(path.join(outside, "h-bob"))).toEqual([]); // no heal-session outside the instance
   });
 });

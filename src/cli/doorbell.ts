@@ -124,6 +124,8 @@ export interface DoorbellStatus {
   open_board_cases: Array<{ agent_name: string; case: string; since: string; age_seconds: number; binding_ids: string[]; dead_count: number; pending_count_at_open: number; pending_count: number | null; why?: string }>;
   /** Whether the LIVE pending counts could be read (and why not). */
   open_board_cases_live: { ok: true } | { ok: false; why: string };
+  /** PR 7 (ruling 9becb599): DORMANT watches still alive, per agent (only agents with any). */
+  dormant_watches: Record<string, number>;
   /** PR 6: the agents the job's LAST cycle could not evaluate (a hold is never silent); null when it planned no cycle. */
   not_evaluated: { count: number; names: string[] } | null;
   /** Who last took the instance lock, from its NON-authoritative sidecar (display only; the lock itself is kernel-held). */
@@ -181,6 +183,29 @@ async function liveCounts(dbPath: string, agents: string[]): Promise<{ ok: true;
 }
 
 /** Read the status for a resolved DB path. Throws on anything unreadable (the caller exits 1). */
+/**
+ * PR 7: how many DORMANT watches are still alive, per agent (read-only): every record under
+ * <instance>/watch/<agent>/ whose process (pid + start) still runs. Real directories only.
+ */
+async function countDormantWatches(dbPath: string): Promise<Record<string, number>> {
+  const { countLiveDormant } = await import("../watch-wake.js");
+  const { processStartedAt } = await import("../liveness.js");
+  const root = path.join(path.dirname(dbPath), "watch");
+  const out: Record<string, number> = {};
+  let entries: fs.Dirent[] = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || e.isSymbolicLink()) continue;
+    const n = countLiveDormant(path.join(root, e.name), (pid, start) => start !== null && processStartedAt(pid) === start);
+    if (n > 0) out[e.name] = n;
+  }
+  return out;
+}
+
 export async function readDoorbellStatus(dbPath: string, resolution: Record<string, unknown> | null, nowWall = Date.now()): Promise<DoorbellStatus> {
   const { stateDirFor, readLogState, LOG_FILENAME } = await import("../doorbell-log.js");
   const { readHeartbeat, judgeHeartbeat } = await import("../doorbell-heartbeat.js");
@@ -225,9 +250,10 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
     }))
     .sort((a, b) => (a.since < b.since ? -1 : a.since > b.since ? 1 : a.agent_name < b.agent_name ? -1 : 1));
   const openBoardCasesLive: DoorbellStatus["open_board_cases_live"] = live.ok ? { ok: true } : { ok: false, why: live.why };
+  const dormantWatches = await countDormantWatches(dbPath);
 
   if (hb.kind === "absent") {
-    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, open_board_cases: openBoardCases, open_board_cases_live: openBoardCasesLive, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
+    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, open_board_cases: openBoardCases, open_board_cases_live: openBoardCasesLive, dormant_watches: dormantWatches, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
   }
   const h = hb.heartbeat;
   const judged = judgeHeartbeat(h, nowWall);
@@ -262,6 +288,7 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
     escalations: { open: items.length, items },
     open_board_cases: openBoardCases,
     open_board_cases_live: openBoardCasesLive,
+    dormant_watches: dormantWatches,
     not_evaluated: h.not_evaluated,
     holder,
     state_dir: stateDir,
@@ -307,7 +334,7 @@ export async function run(argv: string[]): Promise<number> {
     const lines = hookLines(st);
     if (lines.length > 0) process.stdout.write(lines.join("\n") + "\n");
   } else {
-    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.open_board_cases.length} open board case(s)\n`);
+    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.open_board_cases.length} open board case(s)${Object.keys(st.dormant_watches).length ? `, dormant watches: ${Object.entries(st.dormant_watches).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}\n`);
   }
   return 0;
 }

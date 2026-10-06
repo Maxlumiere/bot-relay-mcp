@@ -269,92 +269,132 @@ export function writeWoken(dir: string, s: WokenState): void {
   writeJsonAtomic(dir, WOKEN_FILE, s);
 }
 
-/** The heartbeat a HOLDER writes (ruling 7224605e (2)): its pid, its generation, wall AND monotonic time. */
-export interface WatchHeartbeat {
-  v: 2;
-  pid: number;
-  gen: number;
-  at: string;
-  /** process.hrtime.bigint() as a decimal string: system-wide; on linux it EXCLUDES suspend. */
-  mono_ns: string;
-}
-export function writeHeartbeat(dir: string, hb: { pid: number; gen: number; at: string; mono_ns?: string }): void {
-  writeJsonAtomic(dir, HEARTBEAT_FILE, { v: 2, pid: hb.pid, gen: hb.gen, at: hb.at, mono_ns: hb.mono_ns ?? String(process.hrtime.bigint()) } satisfies WatchHeartbeat);
-}
-export function readHeartbeat(dir: string): WatchHeartbeat | null {
-  const o = readJson(path.join(dir, HEARTBEAT_FILE)) as Partial<WatchHeartbeat> | null;
-  return o && o.v === 2 && Number.isInteger(o.pid) && Number.isInteger(o.gen) && typeof o.at === "string" && Number.isFinite(Date.parse(o.at)) && typeof o.mono_ns === "string" && /^[0-9]{1,30}$/.test(o.mono_ns) ? (o as WatchHeartbeat) : null;
-}
-
 /**
- * The system's last WAKE from sleep (ms), or null when it cannot be read (darwin: kern.waketime).
- * MEASURED (6 Oct): node's process.hrtime on macOS INCLUDES sleep, so a monotonic heartbeat alone
- * cannot tell a sleeping holder from a hung one there; the wake time can.
+ * The system's AWAKE clock (ms since boot, time asleep EXCLUDED), or null when it cannot be read
+ * (Codex R2 (c): awake time must ACCUMULATE across any number of sleeps).
+ *   - darwin: mach_absolute_time, read as kern.monotonicclock_usecs' second field (ticks) over
+ *     hw.tbfrequency. MEASURED (6 Oct, Apple silicon): equal to CLOCK_UPTIME_RAW within 20 ms, while
+ *     node's process.hrtime there INCLUDES sleep (it is mach_continuous_time).
+ *   - linux: process.hrtime, i.e. CLOCK_MONOTONIC, which excludes suspend.
+ *   - otherwise: null.
  */
-export function lastWakeMs(run: (cmd: string, args: string[]) => string = (c, a) => execFileSync(c, a, { encoding: "utf-8", timeout: 2_000 })): number | null {
-  if (process.platform !== "darwin") return null;
+export function awakeNowMs(run: (cmd: string, args: string[]) => string = (c, a) => execFileSync(c, a, { encoding: "utf-8", timeout: 2_000 }), platform: NodeJS.Platform = process.platform): number | null {
+  if (platform === "linux") return Number(process.hrtime.bigint() / 1_000_000n);
+  if (platform !== "darwin") return null;
   try {
-    const m = /sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)/.exec(run("sysctl", ["-n", "kern.waketime"]));
-    return m ? Number(m[1]) * 1000 + Math.floor(Number(m[2]) / 1000) : null;
+    const lines = run("sysctl", ["-n", "kern.monotonicclock_usecs", "hw.tbfrequency"]).trim().split("\n");
+    const ticks = Number((lines[0] ?? "").trim().split(/\s+/)[1]);
+    const freq = Number((lines[1] ?? "").trim());
+    if (!Number.isFinite(ticks) || !Number.isFinite(freq) || ticks <= 0 || freq <= 0) return null;
+    return Math.floor((ticks / freq) * 1000);
   } catch {
     return null;
   }
 }
 
-/** The clocks staleness reads (test seams): wall now, monotonic now, and the system's last wake. */
-export interface AwakeClock {
-  wallMs: number;
-  monoNs: bigint;
-  lastWakeMs: number | null;
-  platform: NodeJS.Platform;
+/** The heartbeat a HOLDER writes (ruling 7224605e (2)): its pid, its generation, wall time, and its AWAKE clock. */
+export interface WatchHeartbeat {
+  v: 3;
+  pid: number;
+  gen: number;
+  at: string;
+  /** awakeNowMs() at the beat (null: unreadable). An integer; never compared across boots (a held lock is this boot's). */
+  awake_ms: number | null;
 }
-export const realAwakeClock = (wallMs: number = Date.now()): AwakeClock => ({ wallMs, monoNs: process.hrtime.bigint(), lastWakeMs: lastWakeMs(), platform: process.platform });
-
-/**
- * AWAKE time since a sign of life (ruling ffcaf608 D2: staleness is awake time, never wall time, so a
- * holder is never judged stale because the machine slept):
- *   - darwin: from the LATER of the sign and the system's last wake (time asleep never counts; the awake
- *     time before a sleep is not counted either: conservative, never a false stale);
- *   - linux: the smaller of wall and CLOCK_MONOTONIC time (monotonic excludes suspend);
- *   - otherwise, or when nothing better is readable: wall time.
- */
-export function awakeMsSince(sign: { wallMs: number; monoNs: bigint | null }, c: AwakeClock): number {
-  const wall = c.wallMs - sign.wallMs;
-  if (c.platform === "darwin" && c.lastWakeMs !== null) return c.wallMs - Math.max(sign.wallMs, c.lastWakeMs);
-  if (c.platform === "linux" && sign.monoNs !== null) return Math.min(wall, Number((c.monoNs - sign.monoNs) / 1_000_000n));
-  return wall;
+export function writeHeartbeat(dir: string, hb: { pid: number; gen: number; at: string; awake_ms?: number | null }): void {
+  writeJsonAtomic(dir, HEARTBEAT_FILE, { v: 3, pid: hb.pid, gen: hb.gen, at: hb.at, awake_ms: hb.awake_ms === undefined ? awakeNowMs() : hb.awake_ms } satisfies WatchHeartbeat);
+}
+export function readHeartbeat(dir: string): WatchHeartbeat | null {
+  const o = readJson(path.join(dir, HEARTBEAT_FILE)) as Partial<WatchHeartbeat> | null;
+  return o && o.v === 3 && Number.isInteger(o.pid) && Number.isInteger(o.gen) && typeof o.at === "string" && Number.isFinite(Date.parse(o.at)) && (o.awake_ms === null || Number.isInteger(o.awake_ms)) ? (o as WatchHeartbeat) : null;
 }
 
-/**
- * The CURRENT holder of generation `gen` and its last sign of life: its own heartbeat (one carrying the
- * holder's pid AND this generation) or, before its first heartbeat, the time it took the lock (its
- * holder sidecar's `since`). A heartbeat left by a previous holder never counts, so a just-started
- * watch is never judged stale by its predecessor's old heartbeat.
- */
-export function holderLastSign(dir: string, gen: number): { holder: HolderInfo | null; sign: { wallMs: number; monoNs: bigint | null } | null } {
+/** The CURRENT holder of generation `gen`, and its own heartbeat (one carrying its pid AND this generation). */
+export function holderBeat(dir: string, gen: number): { holder: HolderInfo | null; beat: WatchHeartbeat | null } {
   const holder = readHolderInfo(dir, watchHolderFile(gen));
   const hb = readHeartbeat(dir);
-  const own = hb && hb.gen === gen && (!holder || hb.pid === holder.pid) ? hb : null;
-  if (own) return { holder, sign: { wallMs: Date.parse(own.at), monoNs: BigInt(own.mono_ns) } };
-  const since = holder ? Date.parse(holder.since) : NaN;
-  return { holder, sign: Number.isFinite(since) ? { wallMs: since, monoNs: null } : null };
+  return { holder, beat: hb && hb.gen === gen && (!holder || hb.pid === holder.pid) ? hb : null };
 }
 
 /**
- * Is the watch of this WINDOW dir live? (for OTHER processes: the Stop hook via `relay pending
- * --watch-status`, the doorbell supervisor, and a new watch deciding whether to take over). The
- * current generation's kernel-held lock is the liveness proof; its holder's awake time since its last
- * sign of life tells a HUNG one.
- *   - "live": held, and its holder showed life within HEARTBEAT_STALE_MS of AWAKE time;
- *   - "stale": held, but its holder has not (hung: watch_stale, and a generation takeover);
+ * Is the watch of this WINDOW dir live? (for OTHER processes: `--lock-status`/`--arm-check`, `relay
+ * pending --watch-status`, the doorbell supervisor, and a new watch deciding whether to take over).
+ * The current generation's kernel-held lock is the liveness proof; its holder's AWAKE time since its
+ * own last heartbeat tells a HUNG one.
+ *   - "live": held, and its holder beat within HEARTBEAT_STALE_MS of awake time, OR its staleness cannot
+ *     be judged (no own heartbeat yet, or an awake clock unreadable on either side): FAIL-SAFE, never a
+ *     false stale (Codex R2 (c): never after a long sleep). Residual: a holder that hangs before its
+ *     first heartbeat (written at once on acquisition), or a host with no readable awake clock, is never
+ *     judged stale; it lives until its window does.
+ *   - "stale": held, and its holder's last heartbeat is older than that in awake time (hung).
  *   - "absent": nothing holds the current generation's lock.
  * ⚠ Never called inside the holder's own process (probeLockHeld would drop its POSIX lock).
  */
-export function watchStatus(dir: string, clock: AwakeClock = realAwakeClock()): "live" | "stale" | "absent" {
+export function watchStatus(dir: string, awakeNow: number | null = awakeNowMs()): "live" | "stale" | "absent" {
   const gen = currentGen(dir);
   if (probeLockHeld(path.join(dir, watchLockFile(gen))) !== "held") return "absent";
-  const { sign } = holderLastSign(dir, gen);
-  return sign !== null && awakeMsSince(sign, clock) < HEARTBEAT_STALE_MS ? "live" : "stale";
+  const { beat } = holderBeat(dir, gen);
+  if (!beat || beat.awake_ms === null || awakeNow === null) return "live";
+  return awakeNow - beat.awake_ms >= HEARTBEAT_STALE_MS ? "stale" : "live";
+}
+
+// --- DORMANT watches (ruling 9becb599): a watch exits only to wake, or when its window is gone. ---
+export const DORMANT_DIR = "dormant";
+export interface DormantRecord {
+  v: 1;
+  pid: number;
+  proc_start: string | null;
+  reason: string;
+  at: string;
+}
+const dormantName = (pid: number, start: string | null) => `${pid}-${crypto.createHash("sha256").update(start ?? "").digest("hex").slice(0, 16)}`;
+/** Record this process as dormant under `dir` (a window or agent dir): 0600, no-follow, atomic. */
+export function writeDormant(dir: string, rec: Omit<DormantRecord, "v">): string {
+  const d = path.join(dir, DORMANT_DIR);
+  try {
+    fs.mkdirSync(d, { mode: 0o700 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  const st = fs.lstatSync(d);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${d} is not a real directory: refusing`);
+  const name = dormantName(rec.pid, rec.proc_start);
+  writeJsonAtomic(d, name, { v: 1, ...rec } satisfies DormantRecord);
+  return path.join(d, name);
+}
+export function removeDormant(file: string | null): void {
+  if (!file) return;
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    /* already gone */
+  }
+}
+/**
+ * How many DORMANT watches of `agent` are alive right now (for the supervisor's status): every record
+ * under its agent dir and window dirs whose process (pid + start) still runs. Read-only.
+ */
+export function countLiveDormant(agentDir: string, isAlive: (pid: number, start: string | null) => boolean): number {
+  let n = 0;
+  const dirs = [agentDir];
+  try {
+    for (const e of fs.readdirSync(agentDir, { withFileTypes: true })) if (e.isDirectory() && !e.isSymbolicLink()) dirs.push(path.join(agentDir, e.name));
+  } catch {
+    return 0;
+  }
+  for (const d of dirs) {
+    let names: string[] = [];
+    try {
+      names = fs.readdirSync(path.join(d, DORMANT_DIR));
+    } catch {
+      continue;
+    }
+    for (const nm of names) {
+      const r = readJson(path.join(d, DORMANT_DIR, nm)) as Partial<DormantRecord> | null;
+      if (r && r.v === 1 && Number.isInteger(r.pid) && isAlive(r.pid as number, r.proc_start ?? null)) n++;
+    }
+  }
+  return n;
 }
 
 /**
@@ -362,10 +402,10 @@ export function watchStatus(dir: string, clock: AwakeClock = realAwakeClock()): 
  * process): its liveness, and whether mail it ALREADY woke this session for is still undelivered
  * after `horizonMs` (the agent woke and did not drain, or the watch is hung): undelivered_with_watch.
  */
-export function watchSupervision(dir: string, read: { reading_session: string | null; ids: readonly string[] }, clock: AwakeClock, horizonMs: number): { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean } {
-  const status = watchStatus(dir, clock);
+export function watchSupervision(dir: string, read: { reading_session: string | null; ids: readonly string[] }, wallMs: number, horizonMs: number, awakeNow: number | null = awakeNowMs()): { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean } {
+  const status = watchStatus(dir, awakeNow);
   const w = readWoken(dir);
   const pending = new Set(read.ids);
-  const undeliveredAfterWake = !!w && w.reading_session === read.reading_session && w.ids.some((id) => pending.has(id) && clock.wallMs - (w.woken_at[id] ?? 0) >= horizonMs);
+  const undeliveredAfterWake = !!w && w.reading_session === read.reading_session && w.ids.some((id) => pending.has(id) && wallMs - (w.woken_at[id] ?? 0) >= horizonMs);
   return { status, undeliveredAfterWake };
 }
