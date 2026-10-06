@@ -262,6 +262,20 @@ if [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; then
   fi
 fi
 
+# PR-D (architect 7964396c): a window launched WITHOUT a name gets NO relay identity. Before this, it
+# fell back to the literal "default" and registered over HTTP under it: MEASURED 2026-10-06, an unnamed
+# hand launch tried "default" 155 times, and one attempt held the live daemon's loop ~5 s. Unnamed means:
+# the name is still unresolved after RELAY_AGENT_NAME, a spawn manifest and config default_agent_name.
+# An EXPLICIT RELAY_AGENT_NAME=default is a chosen name and still registers. Stop here, before any vault
+# read, register, bind or mail read under a name nobody chose; say so on stdout, where the agent reads it.
+if [ -z "${RELAY_AGENT_NAME:-}" ] && { [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; }; then
+  echo "[RELAY] unnamed: not registered. This window has no relay identity (no RELAY_AGENT_NAME, spawn manifest or default_agent_name). Set RELAY_AGENT_NAME and restart to join the relay."
+  if command -v relay_verdict_raise >/dev/null 2>&1; then
+    relay_verdict_raise "DEGRADED" "unnamed: not registered (set RELAY_AGENT_NAME to join the relay)" ""
+  fi
+  exit 0
+fi
+
 # v2.6.1 — vault-first bootstrap. If RELAY_AGENT_TOKEN is unset in env BUT a
 # vault file exists for this agent name, hydrate the env from disk before any
 # auth-sensitive call below. Closes the spawn-without-pre-mint failure mode
@@ -1065,7 +1079,8 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
   RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
-  REG_BODY=$(curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" \
+  # PR-D: the registration secret rides curl's config on STDIN (never argv, never env).
+  REG_BODY=$({ relay_mint_secret_curl_config || true; } | curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \

@@ -43,6 +43,21 @@ import type {
   ExpandCapabilitiesInput,
 } from "../types.js";
 
+/**
+ * PR-D (architect 3f041f24): the caller IS the row's holder: the same agent process (pid AND its start
+ * time, so a recycled pid never matches) on the same host when both name one. Every field must be
+ * PRESENT on both sides; an absent one never matches (no identity is assumed from a missing value).
+ */
+function isSameHolder(
+  row: { agent_pid?: number | null; agent_pid_start?: string | null; host_id?: string | null },
+  input: { agent_pid?: number; agent_pid_start?: string; host_id?: string },
+): boolean {
+  if (row.agent_pid == null || input.agent_pid == null || row.agent_pid !== input.agent_pid) return false;
+  if (!row.agent_pid_start || !input.agent_pid_start || row.agent_pid_start !== input.agent_pid_start) return false;
+  if (row.host_id && input.host_id && row.host_id !== input.host_id) return false;
+  return true;
+}
+
 export function handleRegisterAgent(input: RegisterAgentInput) {
   // v2.1 Phase 4b.1 v2: capture the pre-transition auth_state so we can
   // surface `recovery_completed: true` in the response. The source of truth
@@ -112,6 +127,31 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     // uses the SAME predicate for reuse, so the suffix path can never disagree
     // with the collision path and hand a live instance's name to a new caller.
     if (isNameActivelyHeld(requestedRow)) {
+      // PR-D (architect 3f041f24): the SessionStart hook can run TWICE in one window. Run 2 finds the row
+      // run 1 just made, "held by another live session", but the holder is ITSELF. Only reachable here
+      // with this name's own token (an active row always requires it at the dispatcher), so when the
+      // caller also names the SAME process (agent_pid + its start time, the PID-reuse guard; and the same
+      // host when both say), it is the holder: a REFRESH, a no-op. Nothing is rotated (a register would
+      // re-surface read mail). Another window, or a recycled pid, still gets NAME_COLLISION_ACTIVE.
+      if (isSameHolder(requestedRow, input)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: true,
+                  refreshed: true,
+                  agent: { name: requestedRow.name, role: requestedRow.role, session_id: requestedRow.session_id },
+                  note: "Already registered by this same process: nothing changed.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
       if (input.on_name_collision === "suffix") {
         const suffixed = resolveAvailableInstanceName(input.name);
         if (suffixed === null) {

@@ -199,6 +199,30 @@ resolve_relay_token_path() {
   return 0
 }
 
+# relay_mint_secret_curl_config — PR-D (rulings f885e674 Q2/Q3). Print ONE curl
+# config line carrying this instance's registration secret, for `curl -K -` on
+# STDIN: `relay_mint_secret_curl_config | curl -K - ...`. Registering a NEW agent
+# name over HTTP requires it; a re-register with a token does not, and sending it
+# anyway is harmless. The secret NEVER reaches argv or an exported env: the file
+# is read with the `read` builtin and printed with the `printf` builtin, into a
+# pipe. Read AT USE TIME (a rotation needs no restart). Lives beside the DB the
+# daemon guards: dirname(DB)/secrets/mint.secret (the same rule as the server's
+# mintSecretHome). A missing, symlinked, short or oddly-shaped secret prints
+# NOTHING and returns 1: the register then goes without it, and the server's
+# refusal (MINT_SECRET_REQUIRED) makes the hook's verdict REGISTER_FAILED, loud.
+relay_mint_secret_curl_config() {
+  local db_path file secret=""
+  db_path=$(resolve_relay_db_path 2>/dev/null) || return 1
+  file="$(dirname "$db_path")/secrets/mint.secret"
+  [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+  IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
+  # Shape check mirrors src/mint-secret.ts (>= 32 chars of [A-Za-z0-9_-.~+/=]):
+  # nothing that could end the quoted curl config value or add a directive.
+  [ "${#secret}" -ge 32 ] || return 1
+  case "$secret" in *[!A-Za-z0-9_.~+/=-]*) return 1 ;; esac
+  printf 'header = "X-Relay-Secret: %s"\n' "$secret"
+}
+
 # read_relay_token_from_vault <name> — echo token to stdout on success
 # (return 0); on miss / malformed / unreadable, no output + return 1.
 # Never throws on IO error — every failure is a clean cache miss for the

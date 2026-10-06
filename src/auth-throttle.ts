@@ -91,6 +91,19 @@ export function scanRefund(source: string, now = Date.now()): void {
   b.tokens = Math.min(SCAN_BURST, b.tokens + 1);
 }
 
+/**
+ * PR-D (ruling Q11): a refused NEW-name registration (no or wrong registration secret) spends from its
+ * source's MINT budget, a key space of its own like the scan's. Never per (source, name): a caller choosing
+ * a fresh name per attempt would otherwise never run out. Only refusals spend.
+ */
+const mintKeyOf = (source: string) => `${source}\u0001mint`;
+export function mintRefusalTake(source: string, now = Date.now()): boolean {
+  const b = bucketAt(mintKeyOf(source), THROTTLE_BURST, THROTTLE_REFILL_MS, now);
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
 /** Tests only. */
 export function _resetAuthThrottleForTests(): void {
   buckets.clear();

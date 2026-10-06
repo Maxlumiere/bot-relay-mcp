@@ -24,6 +24,11 @@ export interface RequestContext {
   /** v1.7: HTTP caller's X-Agent-Token header value (if any). */
   headerAgentToken?: string;
   /**
+   * PR-D: the secret the HTTP caller presented (X-Relay-Secret, else Authorization: Bearer), if any. The
+   * registration-secret gate compares it when a NEW name registers (src/mint-gate.ts). Never logged.
+   */
+  presentedSecret?: string;
+  /**
    * v2.1 (Phase 4k): the authenticated agent name for this tool call. Set by
    * `enforceAuth` in `server.ts` on successful resolution (both explicit-caller
    * and token-resolved paths). Handlers that need caller identity for authz —

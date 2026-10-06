@@ -37,6 +37,7 @@ import {
 } from "./boundary-checks.js";
 import { loadConfig, resolveDashboardSecret, getConfigPath } from "../config.js";
 import { log } from "../logger.js";
+import { mintMode, prepareMintSecret } from "../mint-gate.js";
 import { pushKanbanSnapshotOnce } from "../dashboard-push.js";
 import { requestContext } from "../request-context.js";
 import { canonicalCidr, canonicalIp, cidrContains, formatIp, isLoopbackPeer, type CanonicalCidr } from "../cidr.js";
@@ -183,6 +184,15 @@ export function shouldReapSession(
  * traffic patterns to infer length) — the security goal is to prevent
  * byte-by-byte content leakage, which timingSafeEqual provides post-length.
  */
+/** The secret an HTTP caller presented: X-Relay-Secret, else Authorization: Bearer (the same two the transport gate reads). */
+function presentedSecretOf(req: Request): string | undefined {
+  const custom = req.headers["x-relay-secret"];
+  if (typeof custom === "string" && custom.length > 0) return custom;
+  const auth = req.headers.authorization;
+  if (typeof auth === "string" && auth.startsWith("Bearer ") && auth.length > 7) return auth.slice(7);
+  return undefined;
+}
+
 function timingSafeStringEq(a: string, b: string): boolean {
   const ab = Buffer.from(a, "utf8");
   const bb = Buffer.from(b, "utf8");
@@ -441,6 +451,9 @@ export function startHttpServer(port: number, host: string): Server {
   // fast and never accidentally bind to a risky host.
   const preflightConfig = loadConfig();
   assertBindSafety(host, preflightConfig.http_secret ?? null);
+  // PR-D: the registration secret exists before the first request (or the daemon refuses an open mint on a
+  // public bind). Never fatal otherwise: an unusable secret fails closed at the gate, loudly.
+  prepareMintSecret(LOOPBACK_HOSTS.has(host.trim().toLowerCase()), preflightConfig.http_secret ?? null, log);
 
   const app = express();
   // v2.0 final (#14): outer HTTP body limit. Tighter inner limits apply to
@@ -565,6 +578,9 @@ export function startHttpServer(port: number, host: string): Server {
       build: LOADED_BUILD,
       transport: "http",
       auth_required: !!config.http_secret,
+      // PR-D (Q1, Q5): whether creating a NEW agent name over HTTP needs the registration secret. Anything
+      // but "secret" is a deploy-check FAIL; "open-dev" is RELAY_ALLOW_OPEN_MINT=1 (loopback only).
+      mint: mintMode(),
       // v2.15.2 — MONOTONIC process uptime (process.uptime(), NOT Date.now
       // wall-clock, which can jump on clock adjustments). A follow-on Tether
       // health-poll uses this as a silent-death detector: a decrease across
@@ -1784,8 +1800,9 @@ export function startHttpServer(port: number, host: string): Server {
     const sourceIp = extractSourceIp(req, config.trusted_proxies);
     const authenticated = !!config.http_secret; // authMiddleware already enforced if set
     const headerAgentToken = (req.headers["x-agent-token"] as string | undefined) || undefined;
+    const presentedSecret = presentedSecretOf(req);
     await requestContext.run(
-      { sourceIp, authenticated, transport: "http", headerAgentToken },
+      { sourceIp, authenticated, transport: "http", headerAgentToken, presentedSecret },
       async () => {
         try {
           const headerSession = req.headers["mcp-session-id"];
@@ -1818,8 +1835,9 @@ export function startHttpServer(port: number, host: string): Server {
     const sourceIp = extractSourceIp(req, config.trusted_proxies);
     const authenticated = !!config.http_secret;
     const headerAgentToken = (req.headers["x-agent-token"] as string | undefined) || undefined;
+    const presentedSecret = presentedSecretOf(req);
     await requestContext.run(
-      { sourceIp, authenticated, transport: "http", headerAgentToken },
+      { sourceIp, authenticated, transport: "http", headerAgentToken, presentedSecret },
       async () => {
         try {
           const headerSession = req.headers["mcp-session-id"];

@@ -75,7 +75,9 @@ import { revalidate, type AuthVerdict } from "./auth-verdict.js";
 import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
 import { ZodError } from "zod";
 import { authenticateAgent, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive, type AuthResult } from "./auth.js";
-import { verifySecretHash } from "./token-verify.js";
+import { verifySecretHash, authSource } from "./token-verify.js";
+import { checkMintGate } from "./mint-gate.js";
+import { mintRefusalTake } from "./auth-throttle.js";
 import { recordAuthRejection } from "./auth-rejection-audit.js";
 
 /** PR-B Q4: the (non-enumerable) audit reason a refusal carries to the bounded rejection audit. */
@@ -1069,6 +1071,23 @@ export function createServer(): Server {
             `An operator must provision it first via 'relay mint-token ${claimedName}', ` +
             `then register with the minted token (set RELAY_AGENT_TOKEN).`,
             ERROR_CODES.AUTH_FAILED
+          );
+        }
+        // PR-D (rulings f885e674 Q1, dfa29648 Q7, Q11): CREATING a name over HTTP requires this instance's
+        // registration secret. SYNC (readFileSync + timingSafeEqual, src/mint-gate.ts): no await between this
+        // check and the handler's write. A refusal is tool-level (MINT_SECRET_REQUIRED), audited by the
+        // dispatcher's bounded rejection audit, and spends the source's mint budget.
+        const ctx = currentContext();
+        const gate = checkMintGate(ctx.transport, ctx.presentedSecret);
+        if (!gate.ok) {
+          if (!mintRefusalTake(authSource())) return undecidedAuthError({ refused: "throttled" });
+          return authError(
+            `Registering a NEW agent name ("${claimedName}") over HTTP requires this relay's registration secret: ` +
+            `${gate.detail}. Clients send it as the X-Relay-Secret header, read at use time from ` +
+            `<relay instance dir>/secrets/mint.secret. Update the relay hooks and clients, or run \`relay init\` ` +
+            `to create the secret. An already-registered agent re-registers with its own token instead.`,
+            ERROR_CODES.MINT_SECRET_REQUIRED,
+            `mint_secret_${gate.reason}`,
           );
         }
         return allow({ kind: "none", why: "new-name" }); // first registration — bootstrap path
