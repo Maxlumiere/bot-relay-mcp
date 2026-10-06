@@ -27,7 +27,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { probeLockHeld, WATCH_LOCK_DB_FILENAME } from "./doorbell-lock.js";
+import { probeLockHeld, readHolderInfo, WATCH_LOCK_DB_FILENAME, type HolderInfo } from "./doorbell-lock.js";
 import { AGENT_NAME_PATTERN } from "./types.js";
 
 /** An agent name that can name a watch dir: a valid agent name that is not all dots. */
@@ -199,17 +199,34 @@ export function readHeartbeat(dir: string): WatchHeartbeat | null {
 }
 
 /**
- * Is a watch LIVE for this agent? (for OTHER processes: the Stop hook via `--lock-status`, and the
- * doorbell supervisor). The kernel-held lock is the liveness proof; the heartbeat tells a HUNG holder.
- *   - "live": the lock is held and the heartbeat is fresh;
- *   - "stale": the lock is held but the heartbeat is old or missing (a hung watch: watch_stale);
+ * The CURRENT holder's last sign of life (ms): its own heartbeat (only one carrying the holder's pid)
+ * or, before its first heartbeat, the time it took the lock (its holder sidecar's `since`). A heartbeat
+ * left by a PREVIOUS holder never counts, so a watch that has just started is never judged stale by its
+ * predecessor's old heartbeat (and never killed for it: see the takeover in watch-until-wake.ts).
+ * null = no sign at all (no sidecar and no heartbeat).
+ */
+export function holderLastSign(dir: string): { holder: HolderInfo | null; at: number | null } {
+  const holder = readHolderInfo(dir, WATCH_HOLDER_FILE);
+  const hb = readHeartbeat(dir);
+  const since = holder ? Date.parse(holder.since) : NaN;
+  const beat = hb && (!holder || hb.pid === holder.pid) ? Date.parse(hb.at) : NaN;
+  const signs = [since, beat].filter((x) => Number.isFinite(x));
+  return { holder, at: signs.length ? Math.max(...signs) : null };
+}
+
+/**
+ * Is a watch LIVE for this agent? (for OTHER processes: the Stop hook via `--lock-status`, the doorbell
+ * supervisor, and a new watch deciding whether to take over). The kernel-held lock is the liveness
+ * proof; the current holder's last sign of life tells a HUNG one.
+ *   - "live": the lock is held and its holder showed life within HEARTBEAT_STALE_MS;
+ *   - "stale": the lock is held but its holder has not (a hung watch: watch_stale, and a takeover);
  *   - "absent": nothing holds the lock (no watch, or a dead one: the kernel freed its lock).
  * ⚠ Never called inside the holder's own process (probeLockHeld would drop its POSIX lock).
  */
 export function watchStatus(dir: string, now: number = Date.now()): "live" | "stale" | "absent" {
   if (probeLockHeld(path.join(dir, WATCH_LOCK_FILE)) !== "held") return "absent";
-  const hb = readHeartbeat(dir);
-  return hb && now - Date.parse(hb.at) < HEARTBEAT_STALE_MS ? "live" : "stale";
+  const { at } = holderLastSign(dir);
+  return at !== null && now - at < HEARTBEAT_STALE_MS ? "live" : "stale";
 }
 
 /**

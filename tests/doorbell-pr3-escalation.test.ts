@@ -50,6 +50,7 @@ function harness(opts: { budgetPerHour?: number; operator?: string | null; bindi
   let bindings = opts.bindings ?? [bind("alice")];
   const step = (t: number, reads: Record<string, PendingRead>) => {
     const p = C.planCycle({
+      actuator: { fits: () => true }, // ruling 1a8fc7c4 (1): the intent path needs an actuating driver; production has none
       bindings,
       ownHostId: HOST,
       pending: (name) => {

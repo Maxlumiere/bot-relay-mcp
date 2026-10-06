@@ -113,7 +113,12 @@ describe("PR 7: the Stop hook's watch re-arm heal (the real hook)", () => {
   it("a HUNG watch (lock held, heartbeat old) → the block says it is hung", async () => {
     startWatch();
     await untilLive();
-    W.writeHeartbeat(dir(), 1, new Date(Date.now() - W.HEARTBEAT_STALE_MS - 60_000).toISOString());
+    // Age the CURRENT holder (its sidecar's since and its own heartbeat): real time cannot pass 5 min.
+    const old = new Date(Date.now() - W.HEARTBEAT_STALE_MS - 60_000).toISOString();
+    const f = path.join(dir(), W.WATCH_HOLDER_FILE);
+    const h = JSON.parse(fs.readFileSync(f, "utf-8"));
+    fs.writeFileSync(f, JSON.stringify({ ...h, since: old }));
+    W.writeHeartbeat(dir(), h.pid, old);
     expect(stop(natural()).block?.reason).toMatch(/^\[RELAY\] Your relay watch is hung \(its heartbeat stopped\)/);
   }, 60_000);
 

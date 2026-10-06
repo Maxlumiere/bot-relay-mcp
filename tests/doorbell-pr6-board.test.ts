@@ -61,6 +61,7 @@ function harness(from: readonly import("../src/doorbell-log.js").LogRecord[] = [
   for (const r of from) L.foldRecord(state, r); // a RESTART: the state is rebuilt from the log alone
   const step = (w: World, t = 0) => {
     const p = C.planCycle({
+      actuator: { fits: () => true }, // ruling 1a8fc7c4 (1): the intent path needs an actuating driver; production has none
       bindings: w.bindings,
       ownHostId: w.ownHostId === undefined ? HOST : w.ownHostId,
       pending: (name) => {
@@ -260,7 +261,7 @@ async function lifetime(wall: number, opts: import("../src/doorbell-run.js").Doo
   const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
   try {
     const c = { wall, mono: 1_000_000, wallMs: () => c.wall, monoMs: () => c.mono };
-    return await R.runDoorbell(["--once", "--window-s", "10", "--horizon-s", "60"], { clock: c, watchFit: false, ...opts });
+    return await R.runDoorbell(["--once", "--window-s", "10", "--horizon-s", "60"], { clock: c, watchFit: false, actuator: { fits: () => true }, ...opts });
   } finally {
     spy.mockRestore();
   }

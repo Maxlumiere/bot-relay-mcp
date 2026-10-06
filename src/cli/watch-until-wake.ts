@@ -14,6 +14,13 @@
  *   - ONE watch per agent, OLDEST WINS (ruling 7224605e (2)): a second watch that finds the lock held
  *     exits 0 at once, quietly. It retries briefly first, because a liveness PROBE holds the lock for
  *     microseconds and must not be mistaken for a live watch.
+ *   - EXCEPT a STALE holder (ruling 1a8fc7c4 (2)): its lock is held but it has shown no life for
+ *     HEARTBEAT_STALE_MS (hung), so oldest-wins would block every re-arm forever. The new watch TAKES
+ *     OVER: it verifies the holder's pid + start time + host against the kernel (anchorLivenessVerdict:
+ *     a recycled pid is never signalled), sends SIGTERM + SIGCONT (a stopped process, or a hung event
+ *     loop, never runs a SIGTERM handler), waits TAKEOVER_GRACE_MS for the kernel to free the lock,
+ *     RE-VERIFIES, then SIGKILL and waits again. A holder it cannot verify is never signalled: the lock
+ *     is taken only once the kernel frees it.
  *   - READ-ONLY: the relay DB is opened read-only, and only once a writer's WAL sidecars exist (the
  *     doorbell's own open, openRelayDbIfWritten); it never creates a sidecar. All its writes go to its
  *     own dir: <instance>/watch/<agent>/ (the lock, the heartbeat, the woken-for state).
@@ -29,6 +36,8 @@
 import path from "path";
 
 export const RETRY_BUSY = { attempts: 5, delayMs: 100 } as const;
+/** A STALE holder's takeover (ruling 1a8fc7c4 (2)): its grace after SIGTERM, then after SIGKILL. */
+export const TAKEOVER_GRACE_MS = 2_000;
 export const HEARTBEAT_EVERY_MS = 60_000;
 export const FALLBACK_POLL_MS = 3_000;
 
@@ -69,6 +78,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; n
     if (lock.ok) break;
     await new Promise((r) => setTimeout(r, RETRY_BUSY.delayMs));
   }
+  if (!lock || !lock.ok) lock = await takeOverIfStale(dir, () => acquireInstanceLock(dir, me, () => new Date(now()).toISOString(), names), now, say, agent);
   if (!lock || !lock.ok) {
     process.stdout.write(`relay watch: a watch for ${agent} is already live (one per agent): nothing to do.\n`);
     return 0;
@@ -172,6 +182,58 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; n
       });
     });
   });
+}
+
+type Acquire = () => import("../doorbell-lock.js").LockResult;
+/**
+ * Ruling 1a8fc7c4 (2): the lock is held. If its holder is STALE and VERIFIED (pid + start + host, by
+ * kernel fact), end it and take the lock; otherwise leave it (oldest wins). Returns the lock, or null.
+ */
+export async function takeOverIfStale(
+  dir: string,
+  acquire: Acquire,
+  now: () => number,
+  say: (line: string) => void,
+  agent: string,
+  deps: { kill?: (pid: number, sig: NodeJS.Signals) => void; verify?: (h: import("../doorbell-lock.js").HolderInfo) => import("../liveness.js").AnchorVerdict; graceMs?: number } = {},
+): Promise<import("../doorbell-lock.js").LockResult | null> {
+  const W = await import("../watch-wake.js");
+  if (W.watchStatus(dir, now()) !== "stale") return null; // live → oldest wins; absent → the caller's retry already failed
+  const { holder } = W.holderLastSign(dir);
+  const { anchorLivenessVerdict } = await import("../liveness.js");
+  const verify = deps.verify ?? ((h) => (h.proc_start ? anchorLivenessVerdict({ host_id: h.host_id, agent_pid: h.pid, agent_pid_start: h.proc_start }) : "unverifiable"));
+  const kill = deps.kill ?? ((pid, sig) => process.kill(pid, sig));
+  const grace = deps.graceMs ?? TAKEOVER_GRACE_MS;
+  const waitFor = async (ms: number): Promise<import("../doorbell-lock.js").LockResult | null> => {
+    const end = Date.now() + ms;
+    for (;;) {
+      const r = acquire();
+      if (r.ok) return r;
+      if (Date.now() >= end) return null;
+      await new Promise((res) => setTimeout(res, 100));
+    }
+  };
+  const signal = (pid: number, sig: NodeJS.Signals) => {
+    try {
+      kill(pid, sig);
+    } catch {
+      /* already gone */
+    }
+  };
+  if (!holder || verify(holder) !== "alive") {
+    // A holder we cannot verify (no sidecar, a recycled or foreign pid) is NEVER signalled: the lock is
+    // ours only once the kernel frees it.
+    say(`[sentinel] DEGRADED: the watch for ${agent} is held by a hung holder that cannot be verified (${holder ? `pid ${holder.pid}` : "no holder record"}): not signalled`);
+    return waitFor(grace);
+  }
+  say(`[sentinel] DEGRADED: the watch for ${agent} is hung (pid ${holder.pid}, no sign of life for ${W.HEARTBEAT_STALE_MS / 60_000} min): taking over`);
+  signal(holder.pid, "SIGTERM");
+  signal(holder.pid, "SIGCONT");
+  const soft = await waitFor(grace);
+  if (soft) return soft;
+  if (verify(holder) !== "alive") return waitFor(grace); // it died or its pid moved on: never SIGKILL a stranger
+  signal(holder.pid, "SIGKILL");
+  return waitFor(grace);
 }
 
 export async function runLockStatus(agent: string): Promise<number> {

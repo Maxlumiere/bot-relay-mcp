@@ -197,6 +197,103 @@ describe("the CLI: `relay watch <agent> --until-wake` (zero tokens; separate pro
     expect(spawnSync("bash", ["-c", `set -- ${cmd.replace(/^RELAY_DB_PATH=/, "")}; printf '%s\\n' "$@"`], { encoding: "utf-8" }).stdout).toBe("/x y/relay.db\n/Claude AI/bin/relay\nwatch\nw-bob\n--until-wake\n");
   });
 
+  // Ruling 1a8fc7c4 (2): a STALE holder is taken over; a live one is not; an unverifiable one is never signalled.
+  const OLD = () => new Date(Date.now() - W.HEARTBEAT_STALE_MS - 60_000).toISOString();
+  /** Age the CURRENT holder past the stale bound (its sidecar's since AND its own heartbeat): real time cannot pass 5 min. */
+  function ageHolder(over: Partial<{ pid: number; proc_start: string }> = {}): void {
+    const dir = W.watchDirFor(DB, "w-bob");
+    const f = path.join(dir, W.WATCH_HOLDER_FILE);
+    const h = JSON.parse(fs.readFileSync(f, "utf-8"));
+    fs.writeFileSync(f, JSON.stringify({ ...h, ...over, since: OLD() }));
+    W.writeHeartbeat(dir, over.pid ?? h.pid, OLD());
+  }
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it("HARM: a HUNG holder (SIGSTOP'd, stale) is TAKEN OVER by the next re-arm, in one attempt; the new watch then wakes", async () => {
+    const hung = watch();
+    for (let i = 0; i < 50 && lockStatus("w-bob") !== "live"; i++) await new Promise((r) => setTimeout(r, 200));
+    hung.child.kill("SIGSTOP");
+    ageHolder();
+    expect(lockStatus("w-bob")).toBe("stale");
+    const next = watch();
+    expect(await within(hung.exited, 15_000)).not.toBe("timeout"); // the hung one is gone
+    for (let i = 0; i < 50 && lockStatus("w-bob") !== "live"; i++) await new Promise((r) => setTimeout(r, 200));
+    expect(lockStatus("w-bob")).toBe("live");
+    expect(W.holderLastSign(W.watchDirFor(DB, "w-bob")).holder?.pid).toBe(next.child.pid);
+    expect(next.err()).toMatch(/is hung \(pid \d+, .*\): taking over/);
+    send();
+    expect(await within(next.exited, 20_000)).toBe(0);
+  }, 60_000);
+
+  it("a LIVE holder is never taken over (oldest wins): the re-arm exits 'already live', the holder survives", async () => {
+    const first = watch();
+    for (let i = 0; i < 50 && lockStatus("w-bob") !== "live"; i++) await new Promise((r) => setTimeout(r, 200));
+    const second = watch();
+    expect(await within(second.exited, 15_000)).toBe(0);
+    expect(second.out()).toMatch(/already live/);
+    expect(alive(first.child.pid as number)).toBe(true);
+  }, 30_000);
+
+  it("HARM: a stale holder record naming a RECYCLED pid (wrong start time) → NO signal to that pid; the lock is taken only once the kernel frees it", async () => {
+    const real = watch();
+    for (let i = 0; i < 50 && lockStatus("w-bob") !== "live"; i++) await new Promise((r) => setTimeout(r, 200));
+    real.child.kill("SIGSTOP");
+    const bystander = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      ageHolder({ pid: bystander.pid as number, proc_start: "Thu Jan  1 00:00:00 1970" });
+      const next = watch();
+      expect(await within(next.exited, 15_000)).toBe(0);
+      expect(next.out()).toMatch(/already live/); // the kernel lock is still held: not taken
+      expect(next.err()).toMatch(/cannot be verified \(pid \d+\): not signalled/);
+      expect(alive(bystander.pid as number)).toBe(true); // the stranger was never signalled
+      expect(alive(real.child.pid as number)).toBe(true); // nor was the unnamed real holder
+      // The kernel frees the lock when the real holder dies: then a re-arm takes it.
+      real.child.kill("SIGKILL");
+      await real.exited;
+      const after = watch();
+      for (let i = 0; i < 50 && lockStatus("w-bob") !== "live"; i++) await new Promise((r) => setTimeout(r, 200));
+      expect(W.holderLastSign(W.watchDirFor(DB, "w-bob")).holder?.pid).toBe(after.child.pid);
+    } finally {
+      bystander.kill("SIGKILL");
+    }
+  }, 60_000);
+
+  it("a just-started holder is NEVER judged stale by its predecessor's old heartbeat (it would be killed for it)", async () => {
+    const w = watch();
+    for (let i = 0; i < 50 && lockStatus("w-bob") !== "live"; i++) await new Promise((r) => setTimeout(r, 200));
+    W.writeHeartbeat(W.watchDirFor(DB, "w-bob"), 999_999, OLD()); // a predecessor's heartbeat: another pid
+    expect(lockStatus("w-bob")).toBe("live");
+    expect(await within(w.exited, 500)).toBe("timeout");
+  }, 30_000);
+
+  it("the signal sequence: SIGTERM + SIGCONT, then RE-VERIFY before SIGKILL (a pid that moved on is never SIGKILLed)", async () => {
+    const { takeOverIfStale } = await import("../src/cli/watch-until-wake.js");
+    const held = watch();
+    for (let i = 0; i < 50 && lockStatus("w-bob") !== "live"; i++) await new Promise((r) => setTimeout(r, 200));
+    held.child.kill("SIGSTOP");
+    ageHolder();
+    const dir = W.watchDirFor(DB, "w-bob");
+    const never = () => ({ ok: false as const, reason: "held", holder: null });
+    for (const [verdicts, expected] of [
+      [["alive", "alive"], ["SIGTERM", "SIGCONT", "SIGKILL"]],
+      [["alive", "dead"], ["SIGTERM", "SIGCONT"]],
+      [["unverifiable"], []],
+    ] as const) {
+      const sent: string[] = [];
+      const v = [...verdicts];
+      const r = await takeOverIfStale(dir, never, () => Date.now(), () => {}, "w-bob", { kill: (_p, sig) => void sent.push(sig), verify: () => (v.shift() ?? "dead") as "alive", graceMs: 200 });
+      expect(r).toBeNull(); // the (fake) lock never frees here
+      expect(sent).toEqual(expected);
+    }
+  }, 30_000);
+
   it("a HUNG watch shows as stale: the lock is held but the heartbeat is old", async () => {
     const w = watch();
     for (let i = 0; i < 50 && lockStatus("w-bob") !== "live"; i++) await new Promise((r) => setTimeout(r, 200));

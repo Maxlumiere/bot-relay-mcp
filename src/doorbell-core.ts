@@ -335,6 +335,12 @@ export interface CycleInput {
    * a hung one → no_driver(watch_stale). Absent (tests, a future active driver): PR 1-6's intent path.
    */
   watchFit?: (agentName: string, read: PendingRead) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean };
+  /**
+   * Ruling 1a8fc7c4 (1): the ACTUATING driver, if one is registered. An intent is formed ONLY for an
+   * agent it fits (an intent is a ring PR 3 will judge). NONE in production today → zero intents; the
+   * PR 1-6 tests pass one to exercise the intent path. A live watch still wins over it (ruling (3)).
+   */
+  actuator?: { fits: (agentName: string) => boolean };
   windowMs: number;
   budgetPerHour: number;
   horizonMs: number;
@@ -590,18 +596,24 @@ export function planCycle(input: CycleInput): CyclePlan {
             : null;
     // PR 7 (§v6): the WATCH SUPERVISOR. With it, the ONE live, session-bound window is never rung by the
     // doorbell: its own watch wakes it. The doorbell only reports a missing, hung or ineffective watch.
-    // Ruling 7224605e (3): NO intent for a watch-armed agent. An agent with no live watch is boarded
-    // no_driver AND keeps PR 1-6's intent path (its ring record and its effectiveness judgement).
+    // Ruling 7224605e (3): NO intent for a watch-armed agent (the watch is the wake).
+    // Ruling 1a8fc7c4 (1): NO intent at all unless an ACTUATING driver fits: PR 3 judges every intent
+    // as a ring, so an intent nothing actuates would be judged ineffective and open a FALSE
+    // agent_unresponsive escalation. With no actuator registered (production today) an unarmed agent
+    // is boarded no_driver only; the seam stays for a future actuator.
+    const actuated = !next && !!rs && !!input.actuator?.fits(name);
     if (!next && rs && input.watchFit) {
       const wf = input.watchFit(name, read);
-      if (wf.status === "live") {
-        next = wf.undeliveredAfterWake ? { case: "undelivered_with_watch", binding_ids: idsOf(alive), dead_count: deadCount } : null;
-        boardTo(name, next, read.ids.length, "resolved");
-        if (next) skip(BOARD_WHY[next.case]);
-        continue; // NO intent: the watch is the wake
-      }
-      boardTo(name, { case: "no_driver", binding_ids: idsOf(alive), dead_count: deadCount, why: wf.status === "stale" ? "watch_stale" : "watch_absent" }, read.ids.length, "resolved");
+      if (wf.status === "live") next = wf.undeliveredAfterWake ? { case: "undelivered_with_watch", binding_ids: idsOf(alive), dead_count: deadCount } : null;
+      else if (!actuated) next = { case: "no_driver", binding_ids: idsOf(alive), dead_count: deadCount, why: wf.status === "stale" ? "watch_stale" : "watch_absent" };
+      boardTo(name, next, read.ids.length, "resolved");
+      if (next) skip(`${BOARD_WHY[next.case]}${next.why ? ` (${next.why})` : ""}`);
+      if (wf.status === "live" || next) continue; // the watch is the wake, or there is no driver: NO intent
     } else boardTo(name, next, read.ids.length, "resolved");
+    if (!next && rs && !actuated) {
+      skip("no actuating driver: no intent (an un-actuated ring would be judged ineffective)");
+      continue;
+    }
     if (next || !rs) {
       skip(BOARD_WHY[next ? next.case : "session_unbound"]);
       continue;

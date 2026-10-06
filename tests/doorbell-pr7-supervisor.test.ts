@@ -30,6 +30,7 @@ delete process.env.RELAY_AGENT_NAME;
 
 const db = await import("../src/db.js");
 const R = await import("../src/doorbell-run.js");
+const C = await import("../src/doorbell-core.js");
 const W = await import("../src/watch-wake.js");
 const { getOwnHostId, processStartedAt } = await import("../src/liveness.js");
 const OWN = getOwnHostId();
@@ -96,17 +97,33 @@ describe.skipIf(!OWN)("PR 7: the doorbell supervises the watch (the real job, a 
     bindWindow("s7-alice", w.pid, w.start);
   });
 
-  it("NO watch → no_driver(watch_absent) is boarded once, and the agent keeps PR 1-6's intent (ruling (3))", async () => {
+  it("HARM (ruling 1a8fc7c4 (1)): an UNARMED agent with mail across MORE than K x H → ZERO intents, ZERO escalations, ONE no_driver(watch_absent) case; status shows it", async () => {
     db.sendMessage("s7-sender", "s7-alice", "x", "normal");
-    expect(await lifetime(Date.now())).toBe(0);
-    expect(boards()).toEqual([["no_driver", "open", "watch_absent"]]);
-    expect(intents()).toBe(1);
-    expect(await lifetime(Date.now())).toBe(0);
+    const t0 = Date.now();
+    const H = 60_000; // --horizon-s 60
+    const cycles = (C.ESCALATE_AFTER + 2) * 2; // every H/2, past (K + 1) x H
+    for (let i = 0; i <= cycles; i++) expect(await lifetime(t0 + (i * H) / 2)).toBe(0);
+    expect(intents()).toBe(0);
+    expect(recs().filter((r) => r.type === "escalation")).toEqual([]);
     expect(boards()).toEqual([["no_driver", "open", "watch_absent"]]); // A3.2: written once per state change
     // `relay doorbell status --json` shows it, with its why.
     const { readDoorbellStatus } = await import("../src/cli/doorbell.js");
     const st = (await readDoorbellStatus(DB, null)) as unknown as { open_board_cases: Array<{ agent_name: string; case: string; why?: string }> };
     expect(st.open_board_cases.map((c) => [c.agent_name, c.case, c.why])).toEqual([["s7-alice", "no_driver", "watch_absent"]]);
+  }, 60_000);
+
+  it("twin (the seam stays): WITH an actuating driver that fits, an unarmed agent IS intended, and no no_driver case is opened", async () => {
+    db.sendMessage("s7-sender", "s7-alice", "x", "normal");
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      mono += 120_000;
+      const c = { wall: Date.now(), mono, wallMs: () => c.wall, monoMs: () => c.mono };
+      expect(await R.runDoorbell(["--once", "--window-s", "10", "--horizon-s", "60"], { clock: c, actuator: { fits: () => true } })).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(intents()).toBe(1);
+    expect(boards()).toEqual([]);
   }, 30_000);
 
   it("HARM: a LIVE watch → NO intent at all (the watch is the wake); the open no_driver case closes", async () => {

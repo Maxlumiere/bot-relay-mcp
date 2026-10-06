@@ -60,6 +60,7 @@ const judge = (covers: { reading_session: string; message_ids: string[] }) => {
     covers: { ...covers, kinds: covers.message_ids.map(() => "new" as const) },
   };
   const p = C.planCycle({
+      actuator: { fits: () => true }, // ruling 1a8fc7c4 (1): the intent path needs an actuating driver; production has none
     bindings: [], ownHostId: "HOST-A", pending: (n) => R.pendingReadOf(db, db.getDb(), n), rung: new Set(), ringMono: new Map(), nowMono: 1,
     budgetExhausted: new Set(), liveness: () => "alive", mailAgents: () => db.agentsWithPendingMail(db.getDb()), boardOpen: new Map(), windowMs: C.DEFAULT_WINDOW_MS, budgetPerHour: 6, horizonMs: C.DEFAULT_HORIZON_MS,
     ledger: C.ledgerInput([ring], () => 0), newIntentId: randomUUID, now: () => "2026-10-02T08:00:01.000Z",

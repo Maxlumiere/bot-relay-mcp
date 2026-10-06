@@ -220,6 +220,8 @@ export interface DoorbellOptions {
    * the relay DB (src/watch-wake.ts). `false` turns supervision off: PR 1-6's intent path (tests of it).
    */
   watchFit?: ((name: string, read: PendingRead) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean }) | false;
+  /** Ruling 1a8fc7c4 (1): an ACTUATING driver (test seam). Production registers none → zero intents. */
+  actuator?: { fits: (agentName: string) => boolean };
 }
 
 /** A wall step this large against the monotonic clock is a JUMP (ruling 622689ba (4)). */
@@ -432,6 +434,7 @@ async function runLocked(
       // PR 7 (§v6): the WATCH SUPERVISOR. Each agent wakes through its own `relay watch --until-wake`
       // (zero doorbell tokens); the doorbell only boards a missing, hung or ineffective watch.
       ...(opts.watchFit === false ? {} : { watchFit: opts.watchFit ?? ((name: string, read: PendingRead) => (watchableName(name) ? watchSupervision(watchDirFor(dbPath, name), read, nowWall, args.horizonMs) : { status: "absent" as const, undeliveredAfterWake: false })) }),
+      ...(opts.actuator ? { actuator: opts.actuator } : {}),
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,
       horizonMs: args.horizonMs,

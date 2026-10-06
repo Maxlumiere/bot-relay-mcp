@@ -44,6 +44,7 @@ const ids = () => `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`;
 function plan(over: Partial<Parameters<typeof C.planCycle>[0]> & { reads?: Record<string, PendingRead> } = {}) {
   const reads = over.reads ?? { alice: { registered: true, reading_session: RS1, ids: ["m1"] } };
   return C.planCycle({
+      actuator: { fits: () => true }, // ruling 1a8fc7c4 (1): the intent path needs an actuating driver; production has none
     bindings: [bind("alice")],
     ownHostId: HOST,
     pending: (name) => {

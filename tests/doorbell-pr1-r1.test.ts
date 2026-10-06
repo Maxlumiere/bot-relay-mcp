@@ -144,6 +144,7 @@ describe("#8: message_ids is a canonical set", () => {
   });
   it("the planner emits a canonical set from duplicated input", () => {
     const p = C.planCycle({
+      actuator: { fits: () => true }, // ruling 1a8fc7c4 (1): the intent path needs an actuating driver; production has none
       bindings: [{ binding_id: "b", agent_name: "alice", host_id: "H" }],
       ownHostId: "H",
       pending: () => ({ registered: true, reading_session: RS, ids: ["m2", "m1", "m1"] }),

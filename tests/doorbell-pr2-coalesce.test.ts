@@ -49,6 +49,7 @@ function harness(opts: { windowMs?: number; budgetPerHour?: number } = {}) {
   const cycle = (atMs: number, ids: string[]) => {
     const reads: Record<string, PendingRead> = { alice: { registered: true, reading_session: RS, ids } };
     const p = C.planCycle({
+      actuator: { fits: () => true }, // ruling 1a8fc7c4 (1): the intent path needs an actuating driver; production has none
       bindings: [{ binding_id: "b-alice", agent_name: "alice", host_id: HOST }],
       ownHostId: HOST,
       pending: (name) => reads[name],
@@ -107,6 +108,7 @@ describe("Q3: one ring per burst (the coalescing window W)", () => {
   it("the window is PER AGENT: a ring for alice never holds bob", () => {
     const rung = new Set<string>();
     const p = C.planCycle({
+      actuator: { fits: () => true }, // ruling 1a8fc7c4 (1): the intent path needs an actuating driver; production has none
       bindings: [
         { binding_id: "b-alice", agent_name: "alice", host_id: HOST },
         { binding_id: "b-bob", agent_name: "bob", host_id: HOST },
@@ -209,6 +211,7 @@ describe("restart: the window and the budget are rebuilt from the log", () => {
     L.closeLog(o.handle);
     const s = L.readLogState(o.handle.path);
     const p = C.planCycle({
+      actuator: { fits: () => true }, // ruling 1a8fc7c4 (1): the intent path needs an actuating driver; production has none
       bindings: [{ binding_id: "b-alice", agent_name: "alice", host_id: HOST }],
       ownHostId: HOST,
       pending: () => ({ registered: true, reading_session: RS, ids: ["m1", "m2"] }),
