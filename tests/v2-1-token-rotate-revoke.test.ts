@@ -11,6 +11,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-token-rotate-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -33,7 +34,9 @@ let baseUrl: string;
 async function rpc(tool: string, args: any): Promise<any> {
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    // PR-D: an HTTP register that issues a token with no credential bound to the row (a new name, or a
+    // legacy_bootstrap migration) needs the registration secret. Existing names still need their own token.
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...(tool === "register_agent" ? mintHeaders() : {}) },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
   const text = await res.text();

@@ -18,6 +18,10 @@
  * (capability, token, RELAY_ALLOW_LEGACY for non-register tool calls) is
  * unchanged.
  *
+ * PR-D (architect fd2f6b9f Q-A): over HTTP the migration ISSUES a token with no credential bound to the row,
+ * so it now needs the instance's registration secret (mcpCall sends it on register_agent). "NO token" below
+ * still means no AGENT token. The refusal without the secret is pinned in tests/pr-d-mint-gate.test.ts.
+ *
  * Coverage:
  *   1. null-hash row + NO token → success, fresh token issued, row has hash after.
  *   2. null-hash row + GARBAGE token → success, fresh token issued (token ignored).
@@ -32,6 +36,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-legacy-migration-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -58,6 +63,9 @@ async function mcpCall(method: string, params: any, headers: Record<string, stri
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
+      // PR-D: an HTTP register that issues a token with no credential bound to the row (a new name, or a
+      // legacy_bootstrap migration) needs the registration secret. Existing names still need their own token.
+      ...(params?.name === "register_agent" ? mintHeaders() : {}),
       ...headers,
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),

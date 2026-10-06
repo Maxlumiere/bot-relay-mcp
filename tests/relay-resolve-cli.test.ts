@@ -22,6 +22,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const SHAPE_VALID_TOKEN = "AbCd1234efGH5678ijKL9012mnOP3456"; // matches TOKEN_SHAPE_RE → env path, no DB
 
@@ -184,6 +185,8 @@ async function withRealDaemon(label: string, fn: (ctx: DaemonCtx) => Promise<voi
     const rpc = async (tool: string, args: Record<string, unknown>, token?: string) => {
       const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
       if (token) headers["X-Agent-Token"] = token;
+      // PR-D: a new name over HTTP needs the registration secret (the daemon made it beside dbPath at start).
+      if (tool === "register_agent") Object.assign(headers, mintHeaders(dbPath));
       const res = await fetch(`${baseUrl}/mcp`, {
         method: "POST",
         headers,

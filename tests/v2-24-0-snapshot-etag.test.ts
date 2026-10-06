@@ -23,6 +23,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-snapshot-etag-" + process.pid);
 fs.mkdirSync(TEST_DB_DIR, { recursive: true });
@@ -64,7 +65,8 @@ async function snap(headers: Record<string, string> = {}): Promise<{
 async function registerAgent(name: string): Promise<void> {
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    // PR-D: creating a name over HTTP needs the daemon's registration secret.
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeaders() },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: 1,

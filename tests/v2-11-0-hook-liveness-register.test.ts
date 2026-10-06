@@ -33,6 +33,7 @@ import os from "os";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -128,10 +129,11 @@ function stopHarness(h: Harness): void {
 }
 
 /** Register an agent over HTTP, mint + return its token (creates the row). */
-async function registerAndGetToken(port: number, name: string): Promise<string> {
+async function registerAndGetToken(port: number, name: string, dbPath: string): Promise<string> {
   const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeaders(dbPath) },
     body: JSON.stringify({
       jsonrpc: "2.0", id: 1, method: "tools/call",
       params: { name: "register_agent", arguments: { name, role: "builder", capabilities: [] } },
@@ -186,7 +188,7 @@ describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shippe
     const h = await startHarness("live");
     try {
       const name = "live-builder";
-      const token = await registerAndGetToken(h.port, name);
+      const token = await registerAndGetToken(h.port, name, h.dbPath);
       // Live: a session claimed just now (< 120s) — the spawn-handoff /
       // concurrent-terminal case the skip must still protect.
       seedRow(h.dbPath, name, { sessionId: SEED_SESSION, lastSeenIso: new Date().toISOString() });
@@ -207,7 +209,7 @@ describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shippe
     const h = await startHarness("stale");
     try {
       const name = "stale-builder";
-      const token = await registerAndGetToken(h.port, name);
+      const token = await registerAndGetToken(h.port, name, h.dbPath);
       // Stale: session_id present but last_seen far in the past → a genuine
       // relaunch of a row whose prior terminal didn't cleanly mark it offline.
       seedRow(h.dbPath, name, { sessionId: SEED_SESSION, lastSeenIso: "2020-01-01T00:00:00.000Z" });
@@ -242,7 +244,7 @@ describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shippe
     const h = await startHarness("offline");
     try {
       const name = "offline-builder";
-      const token = await registerAndGetToken(h.port, name);
+      const token = await registerAndGetToken(h.port, name, h.dbPath);
       // Offline: prior terminal marked the row offline (session_id NULL). This
       // is exactly the build-agent's observed state — empty session_id + empty PIDs.
       seedRow(h.dbPath, name, { sessionId: null, lastSeenIso: new Date().toISOString() });

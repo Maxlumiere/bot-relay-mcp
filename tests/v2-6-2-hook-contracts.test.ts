@@ -674,7 +674,18 @@ describe("v2.6.2 — cross-hook invariants", () => {
         httpPort: 1,
       });
       expect(r.status, `hook ${path.basename(hook)} exited ${r.status} (expected 0)`).toBe(0);
-      expect(stripVerdict(r.stdout), `hook ${path.basename(hook)} emitted unexpected stdout: ${r.stdout}`).toBe("");
+      if (hook === HOOK_CHECK_RELAY) {
+        // PR-D (unnamed rule): an unnamed SessionStart says so on stdout in ONE well-formed line, and nothing
+        // else (still no partial JSON, no stack trace). The whole stdout stays pinned.
+        expect(stripVerdict(r.stdout), `hook ${path.basename(hook)} emitted unexpected stdout: ${r.stdout}`).toMatch(/^\[RELAY\] unnamed: not registered\.[^\n]*$/);
+        // The path this test exercised before PR-D (the hook body under the name "default") is still reached by
+        // an EXPLICIT RELAY_AGENT_NAME=default (a chosen name), and still emits nothing.
+        const named = runHook({ hook, agentName: "default", home: root, dbPath: path.join(root, "missing.db"), httpPort: 1 });
+        expect(named.status, `hook ${path.basename(hook)} (default) exited ${named.status} (expected 0)`).toBe(0);
+        expect(stripVerdict(named.stdout), `hook ${path.basename(hook)} (default) emitted unexpected stdout: ${named.stdout}`).toBe("");
+      } else {
+        expect(stripVerdict(r.stdout), `hook ${path.basename(hook)} emitted unexpected stdout: ${r.stdout}`).toBe("");
+      }
     }
   });
 

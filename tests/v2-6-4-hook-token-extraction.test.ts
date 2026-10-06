@@ -35,6 +35,7 @@ import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -177,7 +178,8 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
       };
       const resp = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeaders(dbPath) },
         body: JSON.stringify(regBody),
       });
       const text = await resp.text();
@@ -287,14 +289,14 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
       const adminReg = await rpc({
         name: "register_agent",
         arguments: { name: "v264-admin-T3", role: "admin", capabilities: ["admin"] },
-      });
+      }, mintHeaders(dbPath)); // PR-D: a NEW name needs the registration secret
       const adminToken = adminReg.agent_token;
 
       const target = "v264-recover-target";
       const targetReg = await rpc({
         name: "register_agent",
         arguments: { name: target, role: "tester", capabilities: [] },
-      });
+      }, mintHeaders(dbPath)); // PR-D: a NEW name needs the registration secret
       const oldToken = targetReg.agent_token;
 
       // Phase 1 — admin revokes target with issue_recovery=true.

@@ -41,7 +41,10 @@ interface Args {
   role: string;
   capabilities: string[];
   output: string | null;
-  secret: string | null;
+  /** PR-D: the hub's registration secret is read from this FILE at use time, never from argv. */
+  secretFile: string | null;
+  /** PR-D: read the hub's registration secret from stdin (first line). */
+  secretStdin: boolean;
   yes: boolean;
   help: boolean;
 }
@@ -53,7 +56,8 @@ function parseArgs(argv: string[]): Args {
     role: "user",
     capabilities: [],
     output: null,
-    secret: null,
+    secretFile: null,
+    secretStdin: false,
     yes: false,
     help: false,
   };
@@ -92,13 +96,23 @@ function parseArgs(argv: string[]): Args {
         throw new Error("missing --output");
       }
       out.output = v;
-    } else if (a === "--secret") {
+    } else if (a === "--secret" || a.startsWith("--secret=")) {
+      // PR-D (architect 66e27eff): a secret on the command line is visible to every process on the machine
+      // (ps). The hub's secret now also registers new agent names, so it never rides argv.
+      process.stderr.write(
+        "relay pair: --secret is no longer accepted: a secret on the command line is visible to every process (ps).\n" +
+          "  Use --secret-file PATH (read when pairing), --secret-stdin (pipe it in), or the hidden prompt.\n",
+      );
+      throw new Error("refused --secret");
+    } else if (a === "--secret-file") {
       const v = argv[++i];
       if (!v) {
-        process.stderr.write("--secret requires a value\n");
-        throw new Error("missing --secret");
+        process.stderr.write("--secret-file requires a path\n");
+        throw new Error("missing --secret-file");
       }
-      out.secret = v;
+      out.secretFile = v;
+    } else if (a === "--secret-stdin") {
+      out.secretStdin = true;
     } else if (!a.startsWith("-") && !out.hubUrl) {
       out.hubUrl = a;
     } else {
@@ -116,7 +130,7 @@ function printUsage(requested = false): void {
   // belongs on stdout.
   (requested ? process.stdout : process.stderr).write(
     "Usage: relay pair <hub-url> [--name NAME] [--role ROLE] [--capabilities CAPS]\n" +
-      "                     [--output PATH] [--secret SECRET] [--yes]\n\n" +
+      "                     [--output PATH] [--secret-file PATH | --secret-stdin] [--yes]\n\n" +
       "Register this machine as an agent on a remote bot-relay-mcp hub and emit\n" +
       "a ready-to-paste MCP client config snippet. Use when you have a centralized\n" +
       "bot-relay-mcp deployment (e.g. on a VPS) and want to point a local Claude\n" +
@@ -128,7 +142,10 @@ function printUsage(requested = false): void {
       "  --role ROLE            Agent role (default: 'user')\n" +
       "  --capabilities CSV     Comma-separated capabilities (default: none)\n" +
       "  --output PATH          Write MCP client config to PATH (default: stdout)\n" +
-      "  --secret SECRET        Hub's shared secret if required (or set RELAY_HTTP_SECRET env)\n" +
+      "  --secret-file PATH     File holding the hub's secret (its registration secret: the hub operator\n" +
+      "                         finds it at <relay instance dir>/secrets/mint.secret and hands it over)\n" +
+      "  --secret-stdin         Read the hub's secret from stdin (first line)\n" +
+      "                         (an already-set RELAY_HTTP_SECRET is also read; a secret is never taken from argv)\n" +
       "  --yes                  Skip interactive prompts (requires --name)\n" +
       "  --help                 Show this message\n\n" +
       "Exit codes:\n" +
@@ -162,8 +179,58 @@ function sanitizeHubUrl(raw: string): { url: URL | null; error: string | null } 
  * that shape is the defect, and it looks correct at every call site.
  */
 
-async function promptInteractive(msg: string, hidden = false): Promise<string> {
-  void hidden; // readline/promises doesn't provide hidden input natively; keep API simple
+/** PR-D: a NO-ECHO prompt for the hub's secret (a TTY only): raw mode, nothing is written back. */
+async function promptHidden(msg: string): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) return "";
+  process.stdout.write(msg);
+  stdin.setRawMode(true);
+  stdin.resume();
+  let value = "";
+  try {
+    return await new Promise<string>((resolve) => {
+      const onData = (buf: Buffer) => {
+        for (const ch of buf.toString("utf-8")) {
+          if (ch === "\r" || ch === "\n" || ch === "\u0004") {
+            stdin.off("data", onData);
+            process.stdout.write("\n");
+            return resolve(value.trim());
+          }
+          if (ch === "\u0003") {
+            stdin.off("data", onData);
+            process.stdout.write("\n");
+            return resolve("");
+          }
+          if (ch === "\u007f" || ch === "\b") value = value.slice(0, -1);
+          else value += ch;
+        }
+      };
+      stdin.on("data", onData);
+    });
+  } finally {
+    stdin.setRawMode(false);
+    stdin.pause();
+  }
+}
+
+/** PR-D: the hub's secret from --secret-file (read now, at use time) or --secret-stdin. Never argv. */
+async function secretFromArgs(args: Args): Promise<string | null> {
+  if (args.secretFile) {
+    const v = fs.readFileSync(args.secretFile, "utf-8").trim();
+    if (!v) throw new Error(`${args.secretFile} is empty`);
+    return v;
+  }
+  if (args.secretStdin) {
+    let text = "";
+    for await (const chunk of process.stdin) text += chunk;
+    const v = text.split("\n")[0].trim();
+    if (!v) throw new Error("nothing on stdin");
+    return v;
+  }
+  return null;
+}
+
+async function promptInteractive(msg: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     return (await rl.question(msg)).trim();
@@ -242,9 +309,19 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   // --- Step 3: resolve secret ---
-  // Precedence: --secret > RELAY_HTTP_SECRET env > none (try unauthed first,
-  // re-prompt on 401)
-  let secret: string | null = args.secret ?? process.env.RELAY_HTTP_SECRET ?? null;
+  // Precedence: --secret-file / --secret-stdin > an already-set RELAY_HTTP_SECRET > none (try without one
+  // first, then the hidden prompt on a TTY). PR-D: never from argv, and nothing here ever EXPORTS it.
+  let secret: string | null;
+  try {
+    secret = (await secretFromArgs(args)) ?? process.env.RELAY_HTTP_SECRET ?? null;
+  } catch (err) {
+    process.stderr.write(`relay pair: could not read the hub's secret: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
+  const NEEDS_SECRET =
+    "relay pair: the hub requires its secret to register a new agent name.\n" +
+    "  Ask the hub's operator for it (the hub keeps it at <relay instance dir>/secrets/mint.secret and never\n" +
+    "  prints it), save it to a file readable only by you, then re-run with --secret-file PATH.\n";
 
   const attemptRegister = async (): Promise<{
     status: number;
@@ -300,14 +377,12 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   if (result.status === 401 || (result.body?.auth_error === true && !secret)) {
-    if (args.yes) {
-      process.stderr.write(
-        "relay pair: hub requires a shared secret (401). Pass --secret or set RELAY_HTTP_SECRET.\n"
-      );
+    if (args.yes || !process.stdin.isTTY) {
+      process.stderr.write(NEEDS_SECRET);
       return 2;
     }
-    process.stdout.write("Hub requires RELAY_HTTP_SECRET.\n");
-    secret = await promptInteractive("Hub shared secret: ");
+    process.stdout.write("The hub requires its secret.\n");
+    secret = await promptHidden("Hub secret (not shown): ");
     if (!secret) {
       process.stderr.write("relay pair: no secret provided\n");
       return 1;
@@ -324,7 +399,9 @@ export async function run(argv: string[]): Promise<number> {
 
   if (result.status === 401 || result.body?.auth_error === true) {
     process.stderr.write(
-      `relay pair: hub rejected authentication. Check --secret / RELAY_HTTP_SECRET value.\n`
+      result.body?.error_code === "MINT_SECRET_REQUIRED"
+        ? `relay pair: the hub rejected the secret.\n${NEEDS_SECRET}`
+        : `relay pair: hub rejected authentication. Check the --secret-file / RELAY_HTTP_SECRET value.\n`
     );
     return 2;
   }
@@ -351,7 +428,10 @@ export async function run(argv: string[]): Promise<number> {
       url: `${hubBase}/mcp`,
       headers: {
         "X-Agent-Token": token,
-        ...(secret ? { "X-Relay-Secret": secret } : {}),
+        // PR-D: the secret goes into the client config ONLY when the hub gates EVERY call with it
+        // (/health auth_required, a hub with http_secret). Otherwise it was needed once, to register the
+        // name, and the agent's own token is its credential from now on: the secret stays out of the file.
+        ...(secret && healthBody?.auth_required === true ? { "X-Relay-Secret": secret } : {}),
       },
     },
   };

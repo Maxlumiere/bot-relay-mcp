@@ -31,6 +31,7 @@ import {
   type DaemonHandle,
 } from "./helpers/relay-http-harness.js";
 import { resolveWakeTargetByPid, parseAgentBinding } from "../extensions/vscode/src/pid-binding.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-pid-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -149,10 +150,12 @@ async function callToolViaHttp(
   toolName: string,
   args: Record<string, unknown>,
   token?: string,
+  extra: Record<string, string> = {},
 ): Promise<RpcResult> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
+    ...extra,
   };
   if (token) headers["X-Agent-Token"] = token;
   const resp = await fetch(`${baseUrl}/mcp`, {
@@ -200,7 +203,7 @@ describe("PID-handshake — governance (dispatcher name-auth, real daemon)", () 
       name: "gov-victim",
       role: "builder",
       capabilities: [],
-    });
+    }, undefined, mintHeaders(daemon.tmpDir)); // PR-D: a NEW name over HTTP needs the registration secret
     expect(reg.ok).toBe(true);
     const victimToken = (JSON.parse(reg.resultText ?? "{}") as { agent_token?: string }).agent_token;
     expect(victimToken).toBeTruthy();
@@ -247,7 +250,7 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
       capabilities: [],
       host_shell_pids: [55566, 55479, 55465],
       host_id: "HOST-X",
-    });
+    }, undefined, mintHeaders(daemon.tmpDir)); // PR-D: a NEW name over HTTP needs the registration secret
     expect(reg.ok).toBe(true);
     const token = (JSON.parse(reg.resultText ?? "{}") as { agent_token?: string }).agent_token;
 
@@ -280,7 +283,7 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
       capabilities: [],
       host_shell_pids: [111, 222],
       host_id: "HOST-X",
-    });
+    }, undefined, mintHeaders(daemon.tmpDir)); // PR-D: a NEW name over HTTP needs the registration secret
     const regJson = JSON.parse(reg.resultText ?? "{}") as { agent_token?: string; agent?: { session_id?: string } };
     const token = regJson.agent_token;
     // Re-register (with the owner's token) reporting a fresh chain. ADR-0012:
@@ -312,7 +315,7 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
       name: "pid-agent3",
       role: "builder",
       capabilities: [],
-    });
+    }, undefined, mintHeaders(daemon.tmpDir)); // PR-D: a NEW name over HTTP needs the registration secret
     expect(reg.ok).toBe(true);
     const reg3 = JSON.parse(reg.resultText ?? "{}") as { agent_token?: string; agent?: { session_id?: string } };
     const token = reg3.agent_token;

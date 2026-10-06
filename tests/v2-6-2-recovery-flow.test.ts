@@ -22,6 +22,7 @@ import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -110,6 +111,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
           name: "register_agent",
           arguments: { name: "admin-rev", role: "admin", capabilities: ["admin"] },
         },
+        headers: mintHeaders(ROOT), // PR-D: a NEW name over HTTP needs the registration secret
       });
       expect(adminReg.success).toBe(true);
       const ADMIN_TOKEN = adminReg.agent_token;
@@ -122,6 +124,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
           name: "register_agent",
           arguments: { name: "recovery-test-agent", role: "tester", capabilities: [] },
         },
+        headers: mintHeaders(ROOT), // PR-D: a NEW name over HTTP needs the registration secret
       });
       expect(targetReg.success).toBe(true);
       const ORIGINAL_TOKEN = targetReg.agent_token;
@@ -304,6 +307,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
       const adminReg = await rpc({
         port: PORT,
         args: { name: "register_agent", arguments: { name: "admin-rev2", role: "admin", capabilities: ["admin"] } },
+        headers: mintHeaders(ROOT), // PR-D: a NEW name over HTTP needs the registration secret
       });
       expect(adminReg.success).toBe(true);
       const ADMIN_TOKEN = adminReg.agent_token;
@@ -311,6 +315,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
       const targetReg = await rpc({
         port: PORT,
         args: { name: "register_agent", arguments: { name: "terminal-revoke-target", role: "tester", capabilities: [] } },
+        headers: mintHeaders(ROOT), // PR-D: a NEW name over HTTP needs the registration secret
       });
       expect(targetReg.success).toBe(true);
       const ORIGINAL_TOKEN = targetReg.agent_token;
@@ -397,11 +402,13 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
       const adminReg = await rpc({
         port: PORT,
         args: { name: "register_agent", arguments: { name: "admin-rev3", role: "admin", capabilities: ["admin"] } },
+        headers: mintHeaders(ROOT), // PR-D: a NEW name over HTTP needs the registration secret
       });
       const ADMIN_TOKEN = adminReg.agent_token;
       const targetReg = await rpc({
         port: PORT,
         args: { name: "register_agent", arguments: { name: "no-vault-target", role: "tester", capabilities: [] } },
+        headers: mintHeaders(ROOT), // PR-D: a NEW name over HTTP needs the registration secret
       });
       expect(targetReg.success).toBe(true);
       // Intentionally do NOT write a vault file.

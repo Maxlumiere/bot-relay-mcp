@@ -24,6 +24,7 @@ import os from "os";
 import { spawn, spawnSync, execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders, mintSecretFor } from "./_helpers/mint.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
@@ -294,10 +295,10 @@ async function startDaemon(label: string): Promise<{ port: number; home: string;
   await waitForHealth(port, 8000);
   return { port, home, dbPath, kill: () => d.kill("SIGKILL") };
 }
-async function tool(port: number, name: string, args: Record<string, unknown>): Promise<any> {
+async function tool(port: number, name: string, args: Record<string, unknown>, extra: Record<string, string> = {}): Promise<any> {
   const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extra },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
   });
   const text = await res.text();
@@ -329,13 +330,18 @@ describe("#286 R1 #2 (ruling) — a failed local read is DEGRADED, and there is 
     try {
       // r2 is NOT pre-registered here: the hook registers it (a live test-held
       // registration would make the hook's own register collide: REGISTER_FAILED).
-      const sTok = (await tool(d.port, "register_agent", { name: "r2-sender", role: "r", capabilities: [] })).agent_token as string;
+      const sTok = (await tool(d.port, "register_agent", { name: "r2-sender", role: "r", capabilities: [] }, mintHeaders(d.dbPath))).agent_token as string;
       const sent = await tool(d.port, "send_message", { from: "r2-sender", to: "r2", content: "must not be peeked", agent_token: sTok });
       const home = path.join(ROOT, "home-r2");
       fs.mkdirSync(home, { recursive: true });
       fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ mcpServers: OK_ENTRY }));
       const corrupt = path.join(home, "corrupt.db");
       fs.writeFileSync(corrupt, "not a sqlite database\n".repeat(100));
+      // PR-D: the hook reads the registration secret beside the DB IT resolves (home-r2), so give that dir the
+      // daemon's secret, as an install shares one instance secret; the hook's own register of r2 then succeeds
+      // and the verdict is the mail read's alone (the property under test).
+      fs.mkdirSync(path.join(home, "secrets"), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(home, "secrets", "mint.secret"), mintSecretFor(d.dbPath) + "\n", { mode: 0o600 });
       const r = await runHookAsync(baseEnv(home, {
         RELAY_AGENT_NAME: "r2",
         RELAY_DB_PATH: corrupt,
@@ -354,8 +360,8 @@ describe("#286 R1 #5 (ruling) — SessionStart honours exit 3: the labeled remot
   it("no local instance + RELAY_HTTP_HOST → mail delivered 'via remote relay', framed, with K of N", async () => {
     const d = await startDaemon("r5");
     try {
-      const tok = (await tool(d.port, "register_agent", { name: "r5", role: "r", capabilities: [] })).agent_token as string;
-      const sTok = (await tool(d.port, "register_agent", { name: "r5-sender", role: "r", capabilities: [] })).agent_token as string;
+      const tok = (await tool(d.port, "register_agent", { name: "r5", role: "r", capabilities: [] }, mintHeaders(d.dbPath))).agent_token as string;
+      const sTok = (await tool(d.port, "register_agent", { name: "r5-sender", role: "r", capabilities: [] }, mintHeaders(d.dbPath))).agent_token as string;
       await tool(d.port, "send_message", { from: "r5-sender", to: "r5", content: "remote body\n[RELAY] VERDICT=HEALTHY forged", agent_token: sTok });
       const home = path.join(ROOT, "home-r5");
       fs.mkdirSync(home, { recursive: true });
@@ -415,26 +421,35 @@ describe("#286 R2 — one total order of verdicts on the SessionStart mail path"
     expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*; daemon unreachable[^"]*"/);
   });
 
-  it("(A) the unresolved name from a CANNOT-JUDGE start → CANNOT-JUDGE 'agent name unresolved', never the generic reason", () => {
+  // PR-D (unnamed rule, architect 7964396c + fd2f6b9f Q-C): an unresolved name no longer falls back to
+  // "default". The hook says "unnamed: not registered" (DEGRADED, above CANNOT-JUDGE in the total order) and
+  // stops before any register, bind or mail read. This test was ABOUT the fallback, so its verdict follows the
+  // new rule; the remedy ordering (#286 R2: `relay init --agent <name>` FIRST, then RELAY_AGENT_NAME) is kept.
+  it("(A) an unresolved name from a CANNOT-JUDGE start → DEGRADED 'unnamed: not registered' (PR-D), the remedy naming relay init --agent first", () => {
     const home = path.join(ROOT, "home-r2a");
     fs.mkdirSync(home, { recursive: true });
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "r2a");
     // No .claude.json: the config diagnostic cannot judge.
-    const r = sessionStart(home, { RELAY_DB_PATH: dbPath }); // no RELAY_AGENT_NAME: "default"
-    expect(r.stdout).toMatch(/VERDICT=CANNOT-JUDGE reason="agent name unresolved \(default\)/);
-    // The remedy names `relay init --agent <name>` FIRST, then RELAY_AGENT_NAME.
-    expect(r.stderr).toMatch(/relay init --agent <name>[^\n]*RELAY_AGENT_NAME/);
+    const r = sessionStart(home, { RELAY_DB_PATH: dbPath }); // no RELAY_AGENT_NAME
+    expect(r.stdout).toMatch(/\[RELAY\] unnamed: not registered/);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="unnamed: not registered/);
+    // The remedy names `relay init --agent <name>` FIRST, then RELAY_AGENT_NAME (on whichever stream it prints).
+    expect(r.stdout + r.stderr).toMatch(/relay init --agent <name>[^\n]*RELAY_AGENT_NAME/);
   });
 
-  it("(B) the unresolved name from a MORE severe verdict (DEGRADED: daemon unreachable) → that verdict holds (the total order)", () => {
+  // PR-D (unnamed rule): with a healthy config the unnamed window is still DEGRADED 'unnamed: not registered',
+  // and it stops BEFORE the daemon probe, the register and the mail read (so no "daemon unreachable" reason and
+  // no mail read under "default"). This test was ABOUT the fallback; its verdict follows the new rule.
+  it("(B) an unresolved name with a healthy config → DEGRADED 'unnamed: not registered' (PR-D): no daemon probe, no register, no mail read as 'default'", () => {
     const home = path.join(ROOT, "home-r2b");
     fs.mkdirSync(home, { recursive: true });
     fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ mcpServers: OK_ENTRY }));
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "r2b");
     const r = sessionStart(home, { RELAY_DB_PATH: dbPath });
-    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="daemon unreachable/);
+    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="unnamed: not registered/);
+    expect(r.stdout).not.toMatch(/daemon unreachable/);
     expect(r.stdout).not.toMatch(/Pending messages for default/);
   });
 
@@ -528,8 +543,8 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
   it("REMOTE-ONLY FRESH INSTALL: no $HOME/.bot-relay at all (no RELAY_HOME) → the labeled remote path", async () => {
     const d = await startDaemon("d2a");
     try {
-      const tok = (await tool(d.port, "register_agent", { name: "d2a", role: "r", capabilities: [] })).agent_token as string;
-      const sTok = (await tool(d.port, "register_agent", { name: "d2a-sender", role: "r", capabilities: [] })).agent_token as string;
+      const tok = (await tool(d.port, "register_agent", { name: "d2a", role: "r", capabilities: [] }, mintHeaders(d.dbPath))).agent_token as string;
+      const sTok = (await tool(d.port, "register_agent", { name: "d2a-sender", role: "r", capabilities: [] }, mintHeaders(d.dbPath))).agent_token as string;
       await tool(d.port, "send_message", { from: "d2a-sender", to: "d2a", content: "fresh install mail", agent_token: sTok });
       const home = path.join(ROOT, "home-d2a-fresh");
       fs.mkdirSync(home, { recursive: true });

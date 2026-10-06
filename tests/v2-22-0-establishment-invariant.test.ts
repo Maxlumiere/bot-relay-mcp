@@ -39,6 +39,7 @@ import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
 import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 // #7 spawn: the platform driver is macOS-only on CI, so mock the dispatcher to
 // report a clean launch — the establishment stamp under test lives in spawn.ts's
@@ -61,10 +62,10 @@ const { handleSpawnAgent } = await import("../src/tools/spawn.js");
 let server: HttpServer;
 let baseUrl: string;
 
-async function mcpCall(name: string, args: any): Promise<any> {
+async function mcpCall(name: string, args: any, extraHeaders: Record<string, string> = {}): Promise<any> {
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extraHeaders },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
   });
   const text = await res.text();
@@ -72,7 +73,8 @@ async function mcpCall(name: string, args: any): Promise<any> {
   return JSON.parse(dl ? dl.slice(5).trim() : text);
 }
 async function register(name: string): Promise<string> {
-  const r = await mcpCall("register_agent", { name, role: "worker", capabilities: [] });
+  // PR-D: creating a name over HTTP needs the daemon's registration secret.
+  const r = await mcpCall("register_agent", { name, role: "worker", capabilities: [] }, mintHeaders());
   return JSON.parse(r.result.content[0].text).agent_token as string;
 }
 const established = (n: string) => getAgentAuthData(n)?.established_at ?? null;

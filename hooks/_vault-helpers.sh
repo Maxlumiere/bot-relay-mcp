@@ -216,10 +216,12 @@ relay_mint_secret_curl_config() {
   file="$(dirname "$db_path")/secrets/mint.secret"
   [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
   IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
-  # Shape check mirrors src/mint-secret.ts (>= 32 chars of [A-Za-z0-9_-.~+/=]):
-  # nothing that could end the quoted curl config value or add a directive.
+  # Shape check mirrors src/mint-secret.ts (>= 32 chars of printable ASCII, no
+  # space, no quote, no backslash): nothing that could end the quoted curl config
+  # value or add a directive. LC_ALL=C so the range is bytes, not locale letters.
   [ "${#secret}" -ge 32 ] || return 1
-  case "$secret" in *[!A-Za-z0-9_.~+/=-]*) return 1 ;; esac
+  case "$secret" in *[\"\\]*) return 1 ;; esac
+  local LC_ALL=C; case "$secret" in *[!\!-~]*) return 1 ;; esac
   printf 'header = "X-Relay-Secret: %s"\n' "$secret"
 }
 

@@ -43,6 +43,7 @@ import os from "os";
 import cp from "child_process";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -67,10 +68,10 @@ let server: HttpServer;
 let port: number;
 let baseUrl: string;
 
-async function mcpCall(payload: unknown): Promise<any> {
+async function mcpCall(payload: unknown, headers: Record<string, string> = {}): Promise<any> {
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
     body: JSON.stringify(payload),
   });
   const text = await res.text();
@@ -78,13 +79,14 @@ async function mcpCall(payload: unknown): Promise<any> {
   return JSON.parse(dataLine ? dataLine.slice(5).trim() : text);
 }
 
-async function tool(name: string, args: Record<string, unknown>): Promise<any> {
-  const resp = await mcpCall({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
+async function tool(name: string, args: Record<string, unknown>, headers: Record<string, string> = {}): Promise<any> {
+  const resp = await mcpCall({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, headers);
   return JSON.parse(resp.result.content[0].text);
 }
 
 async function register(name: string): Promise<string> {
-  return (await tool("register_agent", { name, role: "r", capabilities: [] })).agent_token as string;
+  // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+  return (await tool("register_agent", { name, role: "r", capabilities: [] }, mintHeaders(TEST_DB_PATH))).agent_token as string;
 }
 
 async function send(

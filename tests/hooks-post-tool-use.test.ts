@@ -34,6 +34,7 @@ import os from "os";
 import cp from "child_process";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -82,7 +83,7 @@ async function registerWithToken(name: string, caps: string[] = []): Promise<str
     id: 1,
     method: "tools/call",
     params: { name: "register_agent", arguments: { name, role: "r", capabilities: caps } },
-  });
+  }, mintHeaders(TEST_DB_PATH)); // PR-D: a NEW name over HTTP needs the daemon's registration secret
   const body = JSON.parse(resp.result.content[0].text);
   return body.agent_token as string;
 }

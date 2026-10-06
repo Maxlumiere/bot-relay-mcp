@@ -37,6 +37,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -96,7 +97,10 @@ describe("v2.6.x / Tether v0.1.1 Phase 2 — broadcast-trace instrumentation val
     try {
       await waitForHealth(PORT, 5000);
 
-      const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT}/mcp`));
+      // PR-D: this client registers a NEW name, which over HTTP needs the daemon's registration secret.
+      const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT}/mcp`), {
+        requestInit: { headers: mintHeaders(path.join(ROOT, "relay.db")) },
+      });
       const client = new Client(
         { name: "v2-6-tether-trace-test", version: "0.0.0" },
         { capabilities: {} },

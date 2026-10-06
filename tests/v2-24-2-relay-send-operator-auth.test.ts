@@ -29,6 +29,7 @@ import os from "os";
 import http from "http";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -56,10 +57,10 @@ function waitForHealth(port: number, timeoutMs: number): Promise<void> {
   });
 }
 
-async function rpc(port: number, name: string, args: Record<string, unknown>): Promise<any> {
+async function rpc(port: number, name: string, args: Record<string, unknown>, extraHeaders: Record<string, string> = {}): Promise<any> {
   const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extraHeaders },
     body: JSON.stringify({ jsonrpc: "2.0", id: Math.floor(Math.random() * 1e9), method: "tools/call", params: { name, arguments: args } }),
   });
   const text = await resp.text();
@@ -134,10 +135,11 @@ describe("v2.24.2 — relay send survives operator-auth (ADR-0006 P1)", () => {
       await waitForHealth(PORT, 8000);
 
       // register sender + receiver over /mcp (agent transport — no dashboard secret needed).
-      const senderReg = await rpc(PORT, "register_agent", { name: "sender", role: "worker", capabilities: [] });
+      // PR-D: creating a name over HTTP needs the daemon's registration secret (beside its RELAY_DB_PATH).
+      const senderReg = await rpc(PORT, "register_agent", { name: "sender", role: "worker", capabilities: [] }, mintHeaders(path.join(ROOT, "relay.db")));
       const senderToken: string = senderReg.agent_token || senderReg.token;
       expect(typeof senderToken, JSON.stringify(senderReg)).toBe("string");
-      await rpc(PORT, "register_agent", { name: "receiver", role: "worker", capabilities: [] });
+      await rpc(PORT, "register_agent", { name: "receiver", role: "worker", capabilities: [] }, mintHeaders(path.join(ROOT, "relay.db")));
 
       // TWIN — the real CLI binary. Bearer, no CSRF handshake, dashboard_secret
       // read from the config file. Must deliver.

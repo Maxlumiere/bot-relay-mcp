@@ -431,3 +431,68 @@ describe("every register path that ISSUES a token, by the harm predicate (Q-A)",
     expect(checkMintGate("stdio", undefined).ok).toBe(true);
   });
 });
+
+describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", () => {
+  /**
+   * Runs the REAL SessionStart hook under `bash -x` against a REAL daemon. The trace is the instrument for
+   * "reads no secret": relay_mint_secret_curl_config is the ONLY code that reads it. The NAMED arm is the
+   * known-good control: it must call it AND end up registered (which also proves the hook sends the secret
+   * end to end), or the unnamed arm's silence would prove nothing.
+   */
+  const runHookTraced = (port: number, name: string | undefined) =>
+    new Promise<{ stdout: string; trace: string; status: number | null }>((resolve) => {
+      const p = spawn("bash", ["-x", path.resolve("hooks/check-relay.sh")], {
+        env: {
+          HOME: ROOT,
+          RELAY_HOME: ROOT,
+          PATH: process.env.PATH || "/usr/bin:/bin",
+          RELAY_DB_PATH: path.join(ROOT, "relay.db"),
+          RELAY_HTTP_HOST: "127.0.0.1",
+          RELAY_HTTP_PORT: String(port),
+          RELAY_AGENT_ROLE: "builder",
+          ...(name ? { RELAY_AGENT_NAME: name } : {}),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let trace = "";
+      p.stdout.on("data", (d: Buffer) => (stdout += d));
+      p.stderr.on("data", (d: Buffer) => (trace += d));
+      p.stdin.end("");
+      const timer = setTimeout(() => p.kill("SIGKILL"), 25_000);
+      p.on("close", (status) => (clearTimeout(timer), resolve({ stdout, trace, status })));
+    });
+  const helperCalls = (trace: string) => trace.split("\n").filter((l) => /^\++ relay_mint_secret_curl_config\b/.test(l)).length;
+
+  it("NAMED (the control): the hook reads the secret, sends it, and the window is registered", async () => {
+    await withDaemon(async (port) => {
+      const r = await runHookTraced(port, "named-window");
+      expect(r.status, r.stdout).toBe(0);
+      expect(helperCalls(r.trace), "the named hook called the secret reader").toBeGreaterThanOrEqual(1);
+    });
+    expect(db.getAgentAuthData("named-window"), "registered over HTTP with the secret the hook read").not.toBeNull();
+  }, 40_000);
+
+  it("UNNAMED: 'unnamed: not registered' (DEGRADED), NO secret read, NOTHING registered (never \"default\")", async () => {
+    const before = (db.getDb().prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number }).n;
+    await withDaemon(async (port) => {
+      const r = await runHookTraced(port, undefined);
+      expect(r.status, r.stdout).toBe(0);
+      expect(r.stdout).toContain("[RELAY] unnamed: not registered");
+      expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="unnamed: not registered/);
+      expect(helperCalls(r.trace), "the unnamed hook never reaches the secret reader").toBe(0);
+    });
+    expect(db.getAgentAuthData("default")).toBeNull();
+    expect((db.getDb().prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number }).n).toBe(before);
+  }, 40_000);
+});
+
+describe("the secret when the DB's directory does not exist yet", () => {
+  it("prepareMintSecret creates the directory (0700) and the secret, instead of failing for the daemon's life", () => {
+    const fresh = path.join(ROOT, "not-yet", "instance");
+    const r = ensureMintSecret(fresh);
+    expect(r.created).toBe(true);
+    expect(readMintSecret(fresh)).not.toBeNull();
+    if (process.platform !== "win32") expect(fs.statSync(fresh).mode & 0o777).toBe(0o700);
+  });
+});

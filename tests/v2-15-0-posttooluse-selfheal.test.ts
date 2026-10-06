@@ -20,6 +20,7 @@ import os from "os";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
@@ -60,10 +61,11 @@ function stopHarness(h: Harness): void {
   try { h.daemon.kill("SIGKILL"); } catch { /* */ }
   try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
 }
-async function registerAndToken(port: number, name: string): Promise<string> {
+async function registerAndToken(port: number, name: string, dbPath: string): Promise<string> {
   const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeaders(dbPath) },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "register_agent", arguments: { name, role: "builder", capabilities: [] } } }),
   });
   const text = await resp.text();
@@ -88,7 +90,7 @@ describe("v2.15.0 — PostToolUse self-heal gates on the FULL (agent_pid, agent_
     const h = await startHarness();
     try {
       const name = "healme";
-      const token = await registerAndToken(h.port, name);
+      const token = await registerAndToken(h.port, name, h.dbPath);
 
       // Run 1: fresh row (agent_pid NULL) → the hook computes its own agent_pid
       // (ancestry comm=node) + start and self-heals via report_liveness.
@@ -124,7 +126,7 @@ describe("v2.15.0 — PostToolUse self-heal gates on the FULL (agent_pid, agent_
     const h = await startHarness();
     try {
       const name = "mailheal";
-      const token = await registerAndToken(h.port, name);
+      const token = await registerAndToken(h.port, name, h.dbPath);
 
       // Establish the anchor + capture the live session so we can seed a message
       // that is already-read FOR THAT SESSION.
@@ -166,7 +168,7 @@ describe("v2.15.0 — PostToolUse self-heal gates on the FULL (agent_pid, agent_
     const h = await startHarness();
     try {
       const name = "steady";
-      const token = await registerAndToken(h.port, name);
+      const token = await registerAndToken(h.port, name, h.dbPath);
       runPostToolUse(h, name, token); // heal once → anchor now correct
       const snap1 = sql(h.dbPath, `SELECT agent_pid||'|'||IFNULL(agent_pid_start,'')||'|'||IFNULL(session_id,'') FROM agents WHERE name='${name}';`);
       runPostToolUse(h, name, token); // second run — should be a no-op (matched anchor)

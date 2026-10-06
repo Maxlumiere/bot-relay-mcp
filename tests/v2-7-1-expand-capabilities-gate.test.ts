@@ -28,6 +28,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v271-expandcap-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -46,10 +47,10 @@ const { ERROR_CODES } = await import("../src/error-codes.js");
 let server: HttpServer;
 let baseUrl: string;
 
-async function rpc(tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function rpc(tool: string, args: Record<string, unknown>, extraHeaders: Record<string, string> = {}): Promise<Record<string, unknown>> {
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extraHeaders },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
   const text = await res.text();
@@ -59,7 +60,8 @@ async function rpc(tool: string, args: Record<string, unknown>): Promise<Record<
 }
 
 async function register(name: string, caps: string[] = []): Promise<string> {
-  const r = await rpc("register_agent", { name, role: "r", capabilities: caps });
+  // PR-D: creating a name over HTTP needs the daemon's registration secret.
+  const r = await rpc("register_agent", { name, role: "r", capabilities: caps }, mintHeaders());
   return r.agent_token as string;
 }
 

@@ -43,6 +43,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, "..");
@@ -135,6 +136,7 @@ async function tearDownDaemon(handle: DaemonHandle): Promise<void> {
 async function registerAgentViaHttp(
   baseUrl: string,
   name: string,
+  secretDir: string,
 ): Promise<{ agentToken: string }> {
   // Use the stateless POST path (no mcp-session-id header) so this fixture
   // doesn't depend on the stateful path under test. Body shape mirrors a
@@ -144,6 +146,8 @@ async function registerAgentViaHttp(
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
+      // PR-D: creating a name over HTTP needs the daemon's registration secret.
+      ...mintHeaders(secretDir),
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -236,9 +240,9 @@ describe("v2.5.0 R1 — real HTTP MCP subscriptions (Option A contract)", () => 
     // Seed agents through the stateless path so subscription tests can
     // reference real DB rows. Alice is the sender; bob/carol are inbox
     // owners we subscribe to.
-    aliceToken = (await registerAgentViaHttp(daemon.baseUrl, "alice")).agentToken;
-    await registerAgentViaHttp(daemon.baseUrl, "bob");
-    await registerAgentViaHttp(daemon.baseUrl, "carol");
+    aliceToken = (await registerAgentViaHttp(daemon.baseUrl, "alice", daemon.tmpDir)).agentToken;
+    await registerAgentViaHttp(daemon.baseUrl, "bob", daemon.tmpDir);
+    await registerAgentViaHttp(daemon.baseUrl, "carol", daemon.tmpDir);
   }, 15_000);
 
   afterAll(async () => {

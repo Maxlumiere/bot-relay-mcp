@@ -18,6 +18,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-auth-disp-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -43,6 +44,9 @@ async function mcpCall(method: string, params: any, headers: Record<string, stri
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
+      // PR-D: an HTTP register that issues a token with no credential bound to the row (a new name, or a
+      // legacy_bootstrap migration) needs the registration secret. Existing names still need their own token.
+      ...(params?.name === "register_agent" ? mintHeaders() : {}),
       ...headers,
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
@@ -75,6 +79,7 @@ async function callTool(toolName: string, args: any): Promise<{ success: boolean
 
 beforeAll(async () => {
   if (fs.existsSync(TEST_DB_DIR)) fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
+  fs.mkdirSync(TEST_DB_DIR, { recursive: true }); // PR-D: the daemon creates its registration secret here at start
   server = startHttpServer(0, "127.0.0.1");
   await new Promise((r) => setTimeout(r, 100));
   const addr = server.address();
@@ -264,6 +269,7 @@ describe("X-Agent-Token HTTP header as auth fallback", () => {
 // caller could rewrite an existing agent's capabilities via the upsert path.
 describe("register_agent re-registration auth (v1.7.1)", () => {
   it("(i) new-register succeeds without auth — bootstrap path", async () => {
+    // No AGENT token (bootstrap). Since PR-D the new name needs the registration secret, which mcpCall sends.
     const resp = await mcpCall("tools/call", {
       name: "register_agent",
       arguments: { name: "rr-new-agent", role: "r", capabilities: ["x"] },

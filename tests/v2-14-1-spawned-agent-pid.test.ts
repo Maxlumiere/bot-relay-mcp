@@ -27,6 +27,7 @@ import os from "os";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
@@ -70,8 +71,8 @@ function stopHarness(h: Harness): void {
   try { h.daemon.kill("SIGKILL"); } catch { /* */ }
   try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
 }
-async function mcp(port: number, name: string, args: Record<string, unknown>, token?: string): Promise<any> {
-  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
+async function mcp(port: number, name: string, args: Record<string, unknown>, token?: string, extra: Record<string, string> = {}): Promise<any> {
+  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extra };
   if (token) headers["X-Agent-Token"] = token;
   const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST", headers,
@@ -82,8 +83,9 @@ async function mcp(port: number, name: string, args: Record<string, unknown>, to
   const payload = dataLine ? dataLine.slice(5).trim() : text.trim();
   return JSON.parse(JSON.parse(payload).result.content[0].text);
 }
-async function registerAndGetToken(port: number, name: string): Promise<string> {
-  const inner = await mcp(port, "register_agent", { name, role: "builder", capabilities: [] });
+async function registerAndGetToken(port: number, name: string, dbPath: string): Promise<string> {
+  // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+  const inner = await mcp(port, "register_agent", { name, role: "builder", capabilities: [] }, undefined, mintHeaders(dbPath));
   expect(inner.agent_token).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
   return inner.agent_token as string;
 }
@@ -107,7 +109,7 @@ describe("v2.14.1 — hook agent_pid capture + spawn-window", () => {
     const h = await startHarness("offline");
     try {
       const name = "spawned-child";
-      const token = await registerAndGetToken(h.port, name);
+      const token = await registerAndGetToken(h.port, name, h.dbPath);
       // Simulate spawn.ts's offline pre-register: session cleared, empty PIDs.
       sql(h.dbPath, `UPDATE agents SET session_id=NULL, agent_status='offline', host_shell_pids=NULL, agent_pid=NULL WHERE name='${name}';`);
 
@@ -131,7 +133,7 @@ describe("v2.14.1 — hook agent_pid capture + spawn-window", () => {
     const h = await startHarness("live");
     try {
       const name = "live-builder";
-      const token = await registerAndGetToken(h.port, name);
+      const token = await registerAndGetToken(h.port, name, h.dbPath);
       sql(h.dbPath, `UPDATE agents SET session_id='SEED', last_seen='${new Date().toISOString()}', agent_status='idle', host_shell_pids='[999999]', agent_pid=12345 WHERE name='${name}';`);
 
       const r = runHook(h, name, token);

@@ -46,6 +46,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -123,8 +124,10 @@ describe("v2.9.0 Ambient Wake — end-to-end autowake verification (A)", () => {
       await waitForHealth(PORT, 5000);
 
       // --- Connection A: receiver (subscribes for push) ---
+      // PR-D: this client registers a NEW name, which over HTTP needs the daemon's registration secret.
       const receiverTransport = new StreamableHTTPClientTransport(
         new URL(`http://127.0.0.1:${PORT}/mcp`),
+        { requestInit: { headers: mintHeaders(path.join(ROOT, "relay.db")) } },
       );
       receiverClient = new Client(
         { name: "v2-9-autowake-receiver", version: "0.0.0" },
@@ -158,8 +161,10 @@ describe("v2.9.0 Ambient Wake — end-to-end autowake verification (A)", () => {
       });
 
       // --- Connection B: sender (uses send_message to push) ---
+      // PR-D: this client registers a NEW name, which over HTTP needs the daemon's registration secret.
       const senderTransport = new StreamableHTTPClientTransport(
         new URL(`http://127.0.0.1:${PORT}/mcp`),
+        { requestInit: { headers: mintHeaders(path.join(ROOT, "relay.db")) } },
       );
       senderClient = new Client(
         { name: "v2-9-autowake-sender", version: "0.0.0" },

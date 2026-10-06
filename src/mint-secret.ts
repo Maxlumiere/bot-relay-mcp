@@ -28,8 +28,13 @@ export const MINT_SECRET_DIR = "secrets";
 export const MINT_SECRET_FILE = "mint.secret";
 /** The same floor as http_secret (config.ts): 32 characters. Minted secrets are 43 (32 random bytes, base64url). */
 export const MIN_MINT_SECRET_LENGTH = 32;
-/** Allowed characters: what a header value and a curl config line can carry without quoting. */
-const SECRET_SHAPE = /^[A-Za-z0-9_\-.~+/=]+$/;
+/**
+ * Allowed characters: printable ASCII except `"` and `\` (and no space or control character), so the value is
+ * a valid HTTP header value AND sits safely inside the quoted value of a curl config line (the hooks pass it to
+ * `curl -K -`). Wide enough that a legacy http_secret can SEED it (ruling Q8: MEASURED, an http_secret ending
+ * in "!!!" failed the old, narrower shape and left the daemon refusing every new name).
+ */
+const SECRET_SHAPE = /^[\x21\x23-\x5B\x5D-\x7E]+$/;
 
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 
@@ -50,7 +55,7 @@ export function mintSecretPath(instanceDir: string): string {
 /** Why a secret's TEXT is unusable, or null. Never echoes the text. */
 export function mintSecretFault(text: string): string | null {
   if (text.length < MIN_MINT_SECRET_LENGTH) return `shorter than ${MIN_MINT_SECRET_LENGTH} characters`;
-  if (!SECRET_SHAPE.test(text)) return "contains characters outside [A-Za-z0-9_-.~+/=]";
+  if (!SECRET_SHAPE.test(text)) return "contains a space, a control character, a quote or a backslash";
   return null;
 }
 
@@ -71,6 +76,9 @@ function lstatOrNull(p: string): fs.Stats | null {
  */
 function ensureSecretsDir(instanceDir: string): string {
   const dir = mintSecretDir(instanceDir);
+  // The instance dir itself may not exist yet (an embedder starting HTTP before the DB is opened): create it
+  // 0700, as the DB's own init would, instead of failing the secret for the daemon's whole life.
+  if (!lstatOrNull(instanceDir)) fs.mkdirSync(instanceDir, { recursive: true, mode: 0o700 });
   if (!lstatOrNull(dir)) {
     try {
       fs.mkdirSync(dir, { mode: 0o700 });

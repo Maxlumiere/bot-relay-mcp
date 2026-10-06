@@ -269,7 +269,7 @@ fi
 # An EXPLICIT RELAY_AGENT_NAME=default is a chosen name and still registers. Stop here, before any vault
 # read, register, bind or mail read under a name nobody chose; say so on stdout, where the agent reads it.
 if [ -z "${RELAY_AGENT_NAME:-}" ] && { [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; }; then
-  echo "[RELAY] unnamed: not registered. This window has no relay identity (no RELAY_AGENT_NAME, spawn manifest or default_agent_name). Set RELAY_AGENT_NAME and restart to join the relay."
+  echo "[RELAY] unnamed: not registered. This window has no relay identity (no RELAY_AGENT_NAME, spawn manifest or default_agent_name). To join the relay: run \`relay init --agent <name>\` (a default name for this machine), or set RELAY_AGENT_NAME, then restart."
   if command -v relay_verdict_raise >/dev/null 2>&1; then
     relay_verdict_raise "DEGRADED" "unnamed: not registered (set RELAY_AGENT_NAME to join the relay)" ""
   fi

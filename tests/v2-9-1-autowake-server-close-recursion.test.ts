@@ -62,6 +62,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -122,9 +123,11 @@ describe("v2.9.1 — autowake server-side transport.close() recursion regression
       // pattern. The point isn't to test Tether code; it's to exercise
       // the SAME server-side connect/subscribe/close lifecycle that
       // crashed the daemon in the 2026-06-10 live repro.
+      // PR-D: this client registers a NEW name, which over HTTP needs the daemon's registration secret.
       const transport = new StreamableHTTPClientTransport(
         new URL(`http://127.0.0.1:${PORT}/mcp`),
         {
+          requestInit: { headers: mintHeaders(path.join(ROOT, "relay.db")) },
           reconnectionOptions: {
             initialReconnectionDelay: 1000,
             maxReconnectionDelay: 30_000,
