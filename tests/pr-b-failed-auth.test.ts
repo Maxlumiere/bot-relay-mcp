@@ -13,12 +13,15 @@
  *   SHAPE  : known-provenance digests decide a wrong token with no bcrypt; unknown-provenance and
  *            digest-less rows are found and healed, and their failures are bounded (throttle + pool).
  */
-import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from "vitest";
 import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
 import type { Server as HttpServer } from "http";
+import { monitorEventLoopDelay } from "perf_hooks";
+import { Worker } from "worker_threads";
+import bcrypt from "bcryptjs";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-b-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -215,66 +218,147 @@ const rpc = (port: number, tool: string, args: Record<string, unknown>, token?: 
   }).then((r) => r.text());
 
 /**
- * The bar, robust to a LOADED machine: run the burst up to ATTEMPTS times. Its bcrypt compare count must
- * be ZERO on EVERY attempt (the deterministic part), and at least ONE attempt must show /health MAX < 50 ms.
- * A blocked loop is deterministic (a bcrypt on the loop costs ~64 ms per compare, every time); scheduler
- * noise from a busy runner is not (MEASURED: one parallel-suite run hit 70 ms with ZERO compares at load
- * average 18, while the same bar passes in isolation).
+ * The LOAD runs in a WORKER THREAD, never on the daemon's loop: the daemon here is in-process, and 30 fetch
+ * clients plus the /health sampler on the SAME loop would charge their own work to the daemon (MEASURED:
+ * with an in-process client, a 30-call burst alone raised the loop delay to 9-40 ms). In production the
+ * clients are other processes; the worker gives the daemon's loop only the daemon's work.
+ * `kind`: "auth" calls `tool` with a RANDOM token each; "control" calls register_agent with no name and no
+ * token (see controlLoad).
  */
-const ATTEMPTS = 3;
-async function barHolds(port: number, burst: () => Promise<unknown>, maxCompares = 0): Promise<{ maxes: number[]; compares: number[] }> {
-  const maxes: number[] = [];
-  const counts: number[] = [];
-  for (let i = 0; i < ATTEMPTS; i++) {
-    _resetAuthThrottleForTests();
-    let max = 0;
-    counts.push(await compares(async () => {
-      max = await healthMaxDuring(port, burst);
-    }));
-    maxes.push(max);
-    if (max < 50) break;
-  }
-  expect(counts.every((c) => c <= maxCompares), `bcrypt compares per attempt: ${counts.join(", ")}`).toBe(true);
-  expect(Math.min(...maxes), `/health max per attempt (ms): ${maxes.map((m) => m.toFixed(1)).join(", ")}`).toBeLessThan(50);
-  return { maxes, compares: counts };
-}
-
-/** Max /health latency, sampled every ~10 ms while `burst` runs. */
-async function healthMaxDuring(port: number, burst: () => Promise<unknown>): Promise<number> {
-  let max = 0;
-  let done = false;
+const LOAD_WORKER = `
+const { parentPort, workerData } = require("worker_threads");
+const { port, n, kind, tool, args } = workerData;
+const hex = () => Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
+  method: "POST",
+  headers: Object.assign({ "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, kind === "auth" ? { "X-Agent-Token": hex() } : {}),
+  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: kind === "auth" ? { name: tool, arguments: args } : { name: "register_agent", arguments: {} } }),
+}).then(async (r) => (await r.text(), r.status));
+(async () => {
+  let healthMax = 0, done = false;
   const sampler = (async () => {
     while (!done) {
       const t = performance.now();
-      await fetch(`http://127.0.0.1:${port}/health`).then((r) => r.text());
-      max = Math.max(max, performance.now() - t);
+      await fetch("http://127.0.0.1:" + port + "/health").then((r) => r.text());
+      healthMax = Math.max(healthMax, performance.now() - t);
       await new Promise((r) => setTimeout(r, 10));
     }
   })();
   await new Promise((r) => setTimeout(r, 50));
-  await burst();
+  parentPort.postMessage({ started: true });
+  const statuses = n > 0 ? await Promise.all(Array.from({ length: n }, call)) : (await new Promise((r) => setTimeout(r, 300)), []);
   done = true;
   await sampler;
-  return max;
+  parentPort.postMessage({ healthMax, statuses });
+})();
+`;
+
+interface Load {
+  kind: "auth" | "control" | "idle";
+  n: number;
+  tool?: string;
+  args?: Record<string, unknown>;
+}
+/**
+ * The KNOWN-GOOD CONTROL (architect 10f7a172): the same N, the same transport and concurrency, admitted past
+ * the per-IP cap the same way, and refused AFTER the full stateless MCP cycle (createServer + transport +
+ * dispatcher) by the handler's own validation: register_agent with no name and no token does no auth work
+ * at all (enforceAuth returns early; RegisterAgentSchema.parse throws in the handler).
+ */
+const controlLoad = (n: number): Load => ({ kind: "control", n });
+const authLoad = (n: number, tool: string, args: Record<string, unknown>): Load => ({ kind: "auth", n, tool, args });
+
+interface Reading {
+  /** Max /health latency (ms), sampled every ~10 ms from the worker while the load runs: AVAILABILITY. */
+  healthMax: number;
+  /** Max delay (ms) of the DAEMON's event loop while the load runs: LOOP blocking (a bcrypt on it is ~64 ms). */
+  eldMax: number;
+  /** How many of the load's calls the per-IP cap shed (429) before the MCP cycle. */
+  shed: number;
 }
 
-describe("BARS: a burst of failed auths keeps /health MAX < 50 ms, with ZERO compares where a digest decides", () => {
+/** Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has started. */
+async function measure(port: number, load: Load, onLoop?: () => void): Promise<Reading> {
+  const eld = monitorEventLoopDelay({ resolution: 1 });
+  const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args } });
+  try {
+    return await new Promise<Reading>((resolve, reject) => {
+      worker.on("error", reject);
+      worker.on("message", (m: { started?: true; healthMax?: number; statuses?: number[] }) => {
+        if (m.started) {
+          eld.enable();
+          if (onLoop) setTimeout(onLoop, 5);
+          return;
+        }
+        eld.disable();
+        resolve({ healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: m.statuses!.filter((s) => s === 429).length });
+      });
+    });
+  } finally {
+    await worker.terminate();
+  }
+}
+
+const LOOP_MAX_MS = 50;
+const AVAILABILITY_MARGIN_MS = 25;
+const AVAILABILITY_CEILING_MS = 500;
+const fmt = (r: Reading) => `health=${r.healthMax.toFixed(1)} eld=${r.eldMax.toFixed(1)} shed=${r.shed}`;
+
+/**
+ * THE BAR (e26359ac Q3 as amended by architect 10f7a172). ONE run, no retries (a best-of-N hides a real
+ * 1-in-N failure; the same-run control replaces it):
+ *   - COUNT: the burst's bcrypt compares stay within `maxCompares` (ZERO where a digest decides). The primary
+ *     discriminator, deterministic.
+ *   - LOOP: event-loop delay max < 50 ms. Discriminates on any runner: see the NEGATIVE CONTROL test.
+ *   - AVAILABILITY: /health max <= the larger of the control bursts run before and after + 25 ms, and < 500 ms
+ *     absolute (a real freeze). Runner speed and drift cancel; an auth-specific slowdown does not.
+ * Every reading is logged (BAR line) so the CI numbers can be reported.
+ */
+async function barHolds(label: string, port: number, load: Load, maxCompares = 0): Promise<void> {
+  _resetAuthThrottleForTests();
+  await measure(port, controlLoad(load.n)); // WARM-UP, discarded: the first burst on a fresh daemon pays one-off costs (MEASURED 25-45 ms vs ~2 ms after), which would inflate the control and bias the bar toward PASS
+  const baseline = await measure(port, { kind: "idle", n: 0 });
+  const before = await measure(port, controlLoad(load.n));
+  let auth!: Reading;
+  const count = await compares(async () => {
+    auth = await measure(port, load);
+  });
+  const after = await measure(port, controlLoad(load.n));
+  const controlMax = Math.max(before.healthMax, after.healthMax);
+  console.log(`BAR ${label} | auth ${fmt(auth)} compares=${count} | control-before ${fmt(before)} | control-after ${fmt(after)} | idle eld=${baseline.eldMax.toFixed(1)}`);
+  // NOT VACUOUS: every call of the auth burst reached auth, and both controls were admitted the same way. A
+  // shed call is a cheap 429 before the MCP cycle (MEASURED: once the per-minute limit ran out, a whole auth
+  // burst was shed and its bar passed on nothing).
+  expect([auth.shed, before.shed, after.shed], `${label}: calls shed by the per-IP limits (auth, control before, control after)`).toEqual([0, 0, 0]);
+  expect(count, `${label}: bcrypt compares`).toBeLessThanOrEqual(maxCompares);
+  expect(auth.eldMax, `${label}: event-loop delay max (ms)`).toBeLessThan(LOOP_MAX_MS);
+  expect(auth.healthMax, `${label}: /health max (ms) vs the same-run control (${controlMax.toFixed(1)} ms) + ${AVAILABILITY_MARGIN_MS}`).toBeLessThanOrEqual(controlMax + AVAILABILITY_MARGIN_MS);
+  expect(auth.healthMax, `${label}: /health max (ms), absolute ceiling`).toBeLessThan(AVAILABILITY_CEILING_MS);
+}
+
+describe("BARS: a burst of failed auths keeps the loop under 50 ms and /health within its same-run control, with ZERO compares where a digest decides", () => {
+  // The per-minute request limit is not under test here, and each bar sends ~4 bursts: lift it so no burst is
+  // shed by it (read when the daemon starts). The concurrent cap stays at its default: the bars run under it.
+  const savedRate = process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE;
+  beforeAll(() => {
+    process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE = "100000";
+  });
+  afterAll(() => {
+    if (savedRate === undefined) delete process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE;
+    else process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE = savedRate;
+  });
   it("(b) 20 wrong-token register_agent, (c) 20 wrong-token get_messages, (d) 20 unknown tokens with 51 agents", async () => {
     for (let i = 0; i < 50; i++) reg(`fleet-${i}`);
     reg("victim");
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`); // warm
-      const burst = (fn: () => Promise<unknown>) => () => Promise.all(Array.from({ length: 20 }, fn));
-      const cases: Array<[string, () => Promise<unknown>]> = [
-        ["(b) wrong token, register_agent", burst(() => rpc(port, "register_agent", { name: "victim", role: "worker", capabilities: [] }, randomToken()))],
-        ["(c) wrong token, get_messages", burst(() => rpc(port, "get_messages", { agent_name: "victim" }, randomToken()))],
-        ["(d) unknown token, token-only", burst(() => rpc(port, "discover_agents", {}, randomToken()))],
-      ];
-      for (const [, b] of cases) await barHolds(port, b);
+      await barHolds("(b) wrong token, register_agent", port, authLoad(20, "register_agent", { name: "victim", role: "worker", capabilities: [] }));
+      await barHolds("(c) wrong token, get_messages", port, authLoad(20, "get_messages", { agent_name: "victim" }));
+      await barHolds("(d) unknown token, token-only", port, authLoad(20, "discover_agents", {}));
     });
   }, 60_000);
 
-  it("unknown-provenance rows: wrong tokens are BOUNDED (throttle) and /health MAX stays < 50 ms (bcrypt off the loop)", async () => {
+  it("unknown-provenance rows: wrong tokens are BOUNDED (the source's scan budget) and the loop stays under 50 ms (bcrypt off the loop)", async () => {
     for (let i = 0; i < 4; i++) {
       reg(`legacy-${i}`);
       db.getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run(`legacy-${i}`);
@@ -282,7 +366,24 @@ describe("BARS: a burst of failed auths keeps /health MAX < 50 ms, with ZERO com
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       // compares are BOUNDED by the source's SCAN budget: at most SCAN_BURST scans of the 4 digest-less rows.
-      await barHolds(port, () => Promise.all(Array.from({ length: 30 }, () => rpc(port, "discover_agents", {}, randomToken()))), 4 * SCAN_BURST);
+      await barHolds("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {}), 4 * SCAN_BURST);
+    });
+  }, 60_000);
+
+  it("NEGATIVE CONTROL: the same burst plus ONE bcrypt compare ON the loop trips BOTH bars, LOOP and AVAILABILITY (each instrument discriminates on this runner)", async () => {
+    reg("victim2");
+    const hash = db.getAgentAuthData("victim2")!.token_hash!;
+    await withDaemon(async (port) => {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      await measure(port, controlLoad(20)); // the same warm-up as every bar
+      const control = await measure(port, controlLoad(20));
+      // the regression PR-B removed: one bcrypt compare on the daemon's event loop, during the same burst
+      const r = await measure(port, authLoad(20, "discover_agents", {}), () => void bcrypt.compareSync(randomToken(), hash));
+      console.log(`BAR negative-control | ${fmt(r)} | control ${fmt(control)}`);
+      expect([r.shed, control.shed], "the negative control's bursts reached the daemon").toEqual([0, 0]);
+      // BOTH bars must see it, each by its own instrument: the same assertions barHolds makes, inverted.
+      expect(r.eldMax, "one on-loop bcrypt compare must exceed the LOOP bar, or the bar cannot see the harm").toBeGreaterThanOrEqual(LOOP_MAX_MS);
+      expect(r.healthMax, "one on-loop bcrypt compare must exceed the AVAILABILITY bar (control + margin)").toBeGreaterThan(control.healthMax + AVAILABILITY_MARGIN_MS);
     });
   }, 60_000);
 });
