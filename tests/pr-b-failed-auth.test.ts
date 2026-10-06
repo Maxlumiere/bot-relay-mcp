@@ -553,29 +553,14 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       );
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      expectBarHolds(await runBar("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {}), { poolControl }), { exactPerRound: 4 * SCAN_BURST });
-      // THE LAPSE DEMO (the occupancy check's own known-bad): the same pool work with a forced 300 ms idle in the
-      // middle. Its window still spans it, but the pool is idle for much of it: the round must read as an
-      // INSTRUMENT FAULT, never as a valid control.
-      const lapsed: PoolWork = async (track) => {
-        await poolControl(track);
-        await new Promise((r) => setTimeout(r, 300));
-        await track(() => compareOffLoop(randomToken(), hashes[0]));
-      };
-      const r = await measure(port, controlLoad(30), undefined, lapsed);
-      expect(r.pool!.busy, `the lapse demo: busy ${r.pool!.busy.toFixed(2)} must fall below the floor`).toBeLessThan(OCCUPANCY_FLOOR);
-      const lapsedBar: BarStats = { label: "lapse demo", control: Array(K).fill(r), auth: [], compares: 0, perRound: [], med: { ctlHealth: 0, ctlEld: 0, authHealth: 0, authEld: 0 }, pooled: true };
-      expect(() => expectControlLoaded(lapsedBar, 4 * SCAN_BURST + 1)).toThrow(/INSTRUMENT FAULT/);
-      // THE WIRING MUTANT: a bar DECLARED pool-loaded whose readings carry no occupancy (the pool work dropped from
-      // measure) must be an INSTRUMENT FAULT, never a skipped check.
-      const unwired: BarStats = { ...lapsedBar, label: "unwired mutant", control: Array(K).fill({ ...r, pool: undefined }), pooled: true };
-      expect(() => expectControlLoaded(unwired, 4 * SCAN_BURST)).toThrow(/NO occupancy reading/);
-
-      // CALIBRATED ON THE POOL-LOADED PATH (the bar above): its control now carries the full pool load, a higher loop
-      // delay and /health than the unloaded control the A/A and negative tests use. So both are re-run HERE, on the
-      // loaded path, with the block sized against THIS path's own same-run reading.
+      // Every bar of this path is MEASURED FIRST and asserted after, so one red run still logs all of its BAR lines
+      // (the loaded-path A/A and negative are the evidence that tells an instrument fault from a real gap).
+      const bar = await runBar("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {}), { poolControl });
+      // CALIBRATED ON THE POOL-LOADED PATH: its control now carries the full pool load, a higher loop delay and
+      // /health than the unloaded control the A/A and negative tests use. So both are re-run HERE, on the loaded
+      // path, with the block sized against THIS path's own same-run reading.
       //   A/A: the pool-loaded control against itself (both arms run the same pool work) PASSES.
-      expectBarHolds(await runBar("A/A pool-loaded", port, controlLoad(30), { poolControl, authPool: poolControl }), { exactPerRound: 4 * SCAN_BURST });
+      const aa = await runBar("A/A pool-loaded", port, controlLoad(30), { poolControl, authPool: poolControl });
       //   NEGATIVE: a loop block of 2 x (this path's reading + the margin) in every auth round FAILS both predicates.
       const pre = await measure(port, controlLoad(30), undefined, poolControl);
       const blockMs = 2 * (Math.max(pre.healthMax, pre.eldMax) + MARGIN_MS);
@@ -588,9 +573,29 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
           }
         },
       });
+      // THE LAPSE DEMO (the occupancy check's own known-bad): the same pool work with a forced 300 ms idle in the
+      // middle. Its window still spans it, but the pool is idle for much of it: the round must read as an
+      // INSTRUMENT FAULT, never as a valid control.
+      const lapsed: PoolWork = async (track) => {
+        await poolControl(track);
+        await new Promise((r) => setTimeout(r, 300));
+        await track(() => compareOffLoop(randomToken(), hashes[0]));
+      };
+      const r = await measure(port, controlLoad(30), undefined, lapsed);
+
+      // ASSERTIONS, instrument validity first: the loaded-path A/A must pass before the bar's verdict means anything.
+      expectBarHolds(aa, { exactPerRound: 4 * SCAN_BURST });
+      expectBarHolds(bar, { exactPerRound: 4 * SCAN_BURST });
       expectControlLoaded(neg, 4 * SCAN_BURST); // the negative's own control is valid, so its verdict means something
       expect(neg.med.authEld, "a sized loop block must exceed the POOL-LOADED LOOP allowance").toBeGreaterThan(neg.med.ctlEld + MARGIN_MS);
       expect(neg.med.authHealth, "a sized loop block must exceed the POOL-LOADED AVAILABILITY allowance").toBeGreaterThan(neg.med.ctlHealth + MARGIN_MS);
+      expect(r.pool!.busy, `the lapse demo: busy ${r.pool!.busy.toFixed(2)} must fall below the floor`).toBeLessThan(OCCUPANCY_FLOOR);
+      const lapsedBar: BarStats = { label: "lapse demo", control: Array(K).fill(r), auth: [], compares: 0, perRound: [], med: { ctlHealth: 0, ctlEld: 0, authHealth: 0, authEld: 0 }, pooled: true };
+      expect(() => expectControlLoaded(lapsedBar, 4 * SCAN_BURST + 1)).toThrow(/INSTRUMENT FAULT/);
+      // THE WIRING MUTANT: a bar DECLARED pool-loaded whose readings carry no occupancy (the pool work dropped from
+      // measure) must be an INSTRUMENT FAULT, never a skipped check.
+      const unwired: BarStats = { ...lapsedBar, label: "unwired mutant", control: Array(K).fill({ ...r, pool: undefined }), pooled: true };
+      expect(() => expectControlLoaded(unwired, 4 * SCAN_BURST)).toThrow(/NO occupancy reading/);
     });
   }, 360_000);
 
