@@ -29,7 +29,7 @@
  * this module + `src/cidr.ts`.
  */
 import net from "net";
-import { ipInCidr } from "./cidr.js";
+import { canonicalIp, ipInCidr } from "./cidr.js";
 
 export interface ClassificationResult {
   blocked: boolean;
@@ -100,6 +100,12 @@ export function classifyIPv4(ip: string): ClassificationResult {
 export function classifyIPv6(ip: string): ClassificationResult {
   if (!net.isIPv6(ip)) {
     return { blocked: true, reason: `invalid IPv6: "${ip}"`, rule: "invalid" };
+  }
+  // PR-E: an address the canonical parser REJECTS (a zone id, the deprecated IPv4-compatible ::a.b.c.d)
+  // matches no rule, so it must FAIL CLOSED here: blocked, never "no rule matched". Only IPv6 literals can
+  // be rejected (every IPv4 literal Node accepts parses), so this is the one place the check lives.
+  if (canonicalIp(ip) === null) {
+    return { blocked: true, reason: `ambiguous IPv6 literal (zone id or IPv4-compatible form): "${ip}"`, rule: "ambiguous" };
   }
   // IPv4-mapped (::ffff:0:0/96) — delegate.
   if (ipInCidr(ip, "::ffff:0:0/96")) {

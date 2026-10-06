@@ -38,6 +38,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { timingSafeEqual } from "crypto";
 import type { IncomingMessage, Server as HttpServer } from "http";
 import { loadConfig, resolveDashboardSecret } from "../config.js";
+import { isLoopbackPeer } from "../cidr.js";
 import { log } from "../logger.js";
 import {
   checkHostHeader,
@@ -87,13 +88,6 @@ export interface DashboardEvent {
   /** Optional one-word sub-tag (e.g. `"send_message"` or `"task.accepted"`). No body content. */
   kind?: string;
 }
-
-const LOOPBACK_PEERS: ReadonlySet<string> = new Set([
-  "127.0.0.1",
-  "::1",
-  "::ffff:127.0.0.1",
-  "localhost",
-]);
 
 /**
  * v2.2.0: singleton per process. The HTTP transport calls `attachDashboardWs`
@@ -155,9 +149,8 @@ export function dashboardWsAuthOk(req: IncomingMessage): { ok: boolean; reason?:
   if (!dashboardSecret) {
     // No secret configured — fall back to the loopback-only rule that
     // dashboardAuthCheck applies. Socket-level peer IP is authoritative;
-    // Host header is attacker-controllable.
-    const peer = (req.socket.remoteAddress || "").toLowerCase();
-    if (LOOPBACK_PEERS.has(peer)) return { ok: true };
+    // Host header is attacker-controllable. The SAME predicate as the HTTP gate (src/cidr.ts).
+    if (isLoopbackPeer(req.socket.remoteAddress)) return { ok: true };
     return {
       ok: false,
       reason: "dashboard requires a secret for non-loopback clients — set RELAY_DASHBOARD_SECRET (or run `relay init` to generate a dashboard_secret)",

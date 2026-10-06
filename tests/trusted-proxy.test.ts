@@ -214,12 +214,14 @@ describe("extractSourceIp — IPv4-mapped IPv6 peer (v1.6.4)", () => {
     const req = mockReq("::ffff:8.8.8.8", { "x-forwarded-for": "203.0.113.42" });
     // 8.8.8.8 is not in 127.0.0.0/8; XFF must be ignored.
     const result = extractSourceIp(req, ["127.0.0.0/8"]);
-    expect(result).toBe("::ffff:8.8.8.8");
+    // PR-E: the source is returned CANONICAL (one spelling per client): the peer itself, never the XFF claim.
+    expect(result).toBe("8.8.8.8");
   });
 
   it("empty trusted_proxies always returns peer, ignoring XFF", () => {
     const req = mockReq("::ffff:127.0.0.1", { "x-forwarded-for": "203.0.113.42" });
     const result = extractSourceIp(req, []);
-    expect(result).toBe("::ffff:127.0.0.1");
+    // PR-E: the peer, in its one canonical spelling (::ffff:127.0.0.1 IS 127.0.0.1); XFF ignored.
+    expect(result).toBe("127.0.0.1");
   });
 });
