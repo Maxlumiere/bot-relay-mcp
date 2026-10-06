@@ -513,49 +513,77 @@ fi
 
 # --- The WATCH re-arm heal (doorbell PR 7, plan §v6.1 (4)) --------------------
 # An agent that has armed `relay watch AGENT --until-wake` at least once, and now
-# has NO live watch (gone: absent; hung: stale), is told ONCE PER SESSION to
-# re-arm it, until a live watch is seen again (which resets the once). Positive
-# evidence only: the local read succeeded AND it carried `watch`; an agent that
-# never armed one (`never`) is never told. The once is a per-agent state file
-# holding the session id (from the hook payload); with no valid session id there
-# is no heal (it cannot be bounded to once). Same block as the mail wake: when
-# mail is pending too, the re-arm line rides inside that one block.
+# has NO live watch on its one live window (gone: absent; hung: stale), is told
+# ONCE PER SESSION to re-arm it, until a live watch is seen again (which resets
+# the once). Positive evidence only: the local read succeeded AND it carried
+# `watch`; `never` (it never armed one) and `no_window` (no single live window)
+# never heal. The once is the session id, kept in the AGENT's watch dir inside
+# the resolved instance (Codex R1 #4: never under the shared $HOME). It is read
+# no-follow and replaced by rename(2), which replaces a planted link instead of
+# following it; the dir must be a real directory, else nothing is read or
+# written. With no valid session id there is no heal (it cannot be bounded).
+# Same block as the mail wake: when mail is pending too, the re-arm line rides
+# inside that one block.
 HEAL_LINE=""
 if [ "$READ_OK" -eq 1 ] && [ "$MODE" = local ] && command -v python3 >/dev/null 2>&1; then
-  WATCH_STATE=$(printf '%s' "$F1_OUT" | python3 -c '
-import json, sys
+  HEAL_DB=$(relay_pending_resolution_db "$F1_OUT" 2>/dev/null)
+  if [ -n "$HEAL_DB" ]; then
+    HEAL_LINE=$(F1="$F1_OUT" HI="$HOOK_INPUT" DB="$HEAL_DB" CLI="$RELAY_CLI" AN="$AGENT_NAME" python3 -c '
+import json, os, re, shlex, stat, sys, tempfile
 try:
-    w = json.load(sys.stdin).get("watch")
+    w = json.loads(os.environ["F1"]).get("watch")
 except Exception:
     w = None
-sys.stdout.write(w if w in ("live", "stale", "absent", "never") else "")
-' 2>/dev/null)
-  HEAL_FILE="$HOME/.bot-relay/hook-state/watch-heal-$AGENT_NAME"
-  case "$WATCH_STATE" in
-    live) rm -f "$HEAL_FILE" 2>/dev/null ;;
-    absent|stale)
-      SESSION_ID=$(HI="$HOOK_INPUT" python3 -c '
-import json, os, re, sys
+if w not in ("live", "stale", "absent"):
+    sys.exit(0)  # never / no_window / missing: no heal
+d = os.path.join(os.path.dirname(os.environ["DB"]), "watch", os.environ["AN"])
 try:
-    s = json.loads(os.environ["HI"]).get("session_id")
+    if not stat.S_ISDIR(os.lstat(d).st_mode):
+        sys.exit(0)  # a link or not a directory: nothing is read or written
+except OSError:
+    sys.exit(0)
+f = os.path.join(d, "heal-session")
+if w == "live":
+    try:
+        os.unlink(f)  # removes a link itself, never its target
+    except OSError:
+        pass
+    sys.exit(0)
+try:
+    sid = json.loads(os.environ["HI"]).get("session_id")
 except Exception:
-    s = None
-sys.stdout.write(s if isinstance(s, str) and re.fullmatch(r"[A-Za-z0-9-]{1,128}", s) else "")
-' 2>/dev/null)
-      HEALED_FOR=$(head -c 200 "$HEAL_FILE" 2>/dev/null)
-      if [ -n "$SESSION_ID" ] && [ "$HEALED_FOR" != "$SESSION_ID" ]; then
-        HEAL_DB=$(relay_pending_resolution_db "$F1_OUT" 2>/dev/null)
-        if [ -n "$HEAL_DB" ] && mkdir -p "$HOME/.bot-relay/hook-state" 2>/dev/null && printf '%s' "$SESSION_ID" > "$HEAL_FILE" 2>/dev/null; then
-          HEAL_LINE=$(DB="$HEAL_DB" CLI="$RELAY_CLI" AN="$AGENT_NAME" WS="$WATCH_STATE" python3 -c '
-import os, shlex
-how = "is hung (its heartbeat stopped)" if os.environ["WS"] == "stale" else "is not running"
+    sid = None
+if not (isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9-]{1,128}", sid)):
+    sys.exit(0)
+healed = ""
+try:
+    fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        healed = os.read(fd, 200).decode("ascii", "replace")
+    finally:
+        os.close(fd)
+except OSError:
+    pass
+if healed == sid:
+    sys.exit(0)  # already told this session
+try:
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".heal.")
+    try:
+        os.write(fd, sid.encode("ascii"))
+    finally:
+        os.close(fd)
+    os.replace(tmp, f)  # rename(2): replaces a planted link, never follows it
+except OSError:
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+    sys.exit(0)  # cannot bound it to once: no heal
+how = "is hung (it stopped checking)" if w == "stale" else "is not running"
 cmd = "RELAY_DB_PATH=%s %s watch %s --until-wake" % (shlex.quote(os.environ["DB"]), shlex.quote(os.environ["CLI"]), os.environ["AN"])
-print("[RELAY] Your relay watch %s: mail will not wake this session while you are idle. Re-arm it now as a BACKGROUND task (run_in_background), once: %s" % (how, cmd), end="")
+sys.stdout.write("[RELAY] Your relay watch %s: mail will not wake this session while you are idle. Re-arm it now as a BACKGROUND task (run_in_background), once: %s" % (how, cmd))
 ' 2>/dev/null)
-        fi
-      fi
-      ;;
-  esac
+  fi
 fi
 
 if [ -z "$SUMMARY" ]; then

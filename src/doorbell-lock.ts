@@ -45,16 +45,16 @@ import Database from "better-sqlite3";
 import { ensurePrivateDir } from "./doorbell-log.js";
 
 export const LOCK_DB_FILENAME = "doorbell.lock.db";
-/** PR 7 (§v6): the per-agent watch lock (src/watch-wake.ts names its dir). */
-export const WATCH_LOCK_DB_FILENAME = "watch.lock.db";
+/** PR 7 (§v6, ruling ffcaf608 D2): a watch generation's lock file name (src/watch-wake.ts: watchLockFile). */
+export const WATCH_LOCK_DB_PATTERN = /^watch\.lock\.(0|[1-9][0-9]{0,8})\.db$/;
 /**
  * The ONLY file names this module's driver handle may open (ADR-0048 PR B tripwire): a lock file,
  * never the relay DB. Enforced in openLockFile, the module's single driver construction.
  */
-const LOCK_FILENAMES: ReadonlySet<string> = new Set([LOCK_DB_FILENAME, WATCH_LOCK_DB_FILENAME]);
+export const isLockFileName = (name: string): boolean => name === LOCK_DB_FILENAME || WATCH_LOCK_DB_PATTERN.test(name);
 /** The module's ONE driver construction. Refuses any path whose name is not a lock file name. */
 function openLockFile(lockPath: string): InstanceType<typeof Database> {
-  if (!LOCK_FILENAMES.has(path.basename(lockPath))) throw new Error(`${lockPath} is not a lock file (${[...LOCK_FILENAMES].join(", ")}): refusing to open it`);
+  if (!isLockFileName(path.basename(lockPath))) throw new Error(`${lockPath} is not a lock file (${LOCK_DB_FILENAME} or watch.lock.<generation>.db): refusing to open it`);
   return new Database(lockPath, { timeout: 0, fileMustExist: true });
 }
 export const HOLDER_FILENAME = "doorbell.lock.holder.json";
@@ -97,7 +97,8 @@ export function readHolderInfo(stateDir: string, holderFile: string = HOLDER_FIL
 
 /** Which lock: its file names in the dir, and what "held" means in a refusal (PR 7: the watch reuses this). */
 export interface LockNames {
-  lockFile: typeof LOCK_DB_FILENAME | typeof WATCH_LOCK_DB_FILENAME;
+  /** Must pass isLockFileName (refused at open otherwise). */
+  lockFile: string;
   holderFile: string;
   heldBy: string;
 }

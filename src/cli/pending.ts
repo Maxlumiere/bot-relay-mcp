@@ -148,9 +148,10 @@ function usage(requested = false): void {
     "  --with-content N  OPT-IN: add the DECRYPTED body to the first N messages\n" +
     "               (drain order, 1-100), read in the same statement as the ids.\n" +
     "               For SessionStart delivery. Off by default: no content key.\n" +
-    "  --watch-status  OPT-IN: add `watch` to the JSON: live | stale | absent (a\n" +
-    "               `relay watch AGENT --until-wake` holds, hangs, or is gone) | never\n" +
-    "               (this agent has never armed one). For the Stop hook's re-arm heal.\n\n" +
+    "  --watch-status  OPT-IN: add `watch` to the JSON, for the agent's one live window:\n" +
+    "               live | stale | absent (its `relay watch AGENT --until-wake` runs, hangs,\n" +
+    "               or is gone) | never (it never armed one) | no_window (no single live\n" +
+    "               window). For the Stop hook's re-arm heal.\n\n" +
     "Source: --db-path, RELAY_DB_PATH or RELAY_INSTANCE_ID (explicit) win; then a\n" +
     "configured remote (RELAY_HTTP_HOST) means no local answer; then the active\n" +
     "instance or the legacy DB file.\n\n" +
@@ -159,15 +160,6 @@ function usage(requested = false): void {
     "      3 = no local relay instance here (nothing was read; stdout empty).\n";
   if (requested) process.stdout.write(text);
   else process.stderr.write(text);
-}
-
-/** PR 7: this agent's watch, for the Stop hook. `never` = no watch dir: it never armed one (never healed). */
-async function watchOf(dbPath: string, name: string): Promise<"live" | "stale" | "absent" | "never"> {
-  const W = await import("../watch-wake.js");
-  if (!W.watchableName(name)) return "never"; // `.`/`..`: no watch is possible, and the mail read must not fail for it
-  const dir = W.watchDirFor(dbPath, name);
-  if (!fs.existsSync(dir)) return "never";
-  return W.watchStatus(dir);
 }
 
 function pendingFailed(reason: string): number {
@@ -261,7 +253,8 @@ export async function run(argv: string[]): Promise<number> {
           count: meta.count,
           top_priority: meta.top_priority,
           messages: meta.messages,
-          ...(args.watchStatus ? { watch: await watchOf(dbPath, name) } : {}),
+          // PR 7: the agent's watch on its ONE live window (never | no_window | live | stale | absent).
+          ...(args.watchStatus ? { watch: await (await import("./watch-until-wake.js")).agentWatchStatus(db, dbPath, name) } : {}),
         }) + "\n",
       );
     } else {

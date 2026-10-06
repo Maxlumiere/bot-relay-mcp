@@ -4,20 +4,24 @@
 // See LICENSE for full terms.
 
 /**
- * Doorbell PR 7 (plan §v6.1 (4)): the Stop hook's WATCH RE-ARM HEAL, through the REAL hook
- * (hooks/stop-check.sh), the real `relay pending --watch-status`, and a real watch process.
+ * Doorbell PR 7 (plan §v6.1 (4); Codex R1 #4): the Stop hook's WATCH RE-ARM HEAL, through the REAL
+ * hook (hooks/stop-check.sh), the real `relay pending --watch-status`, and a real watch running inside
+ * the agent's bound window (tests/helpers/watch-window.ts).
  *   - an agent that armed a watch once and has none live → ONE block per session with a RUNNABLE re-arm command;
  *   - a live watch → no block, and the once is reset;
- *   - a hung watch (heartbeat old) → the block says hung;
+ *   - a hung watch → the block says hung;
  *   - an agent that NEVER armed one → untouched (the pre-PR 7 behaviour, byte for byte);
- *   - mail pending too → ONE block carrying both.
+ *   - mail pending too → ONE block carrying both;
+ *   - the once lives in the AGENT's watch dir inside the instance, never under $HOME, and a planted link
+ *     there is replaced, never followed (Codex R1 #4).
  */
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawn, spawnSync, type ChildProcess } from "child_process";
+import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = path.join(REPO, "hooks", "stop-check.sh");
@@ -31,43 +35,38 @@ delete process.env.RELAY_AGENT_NAME;
 
 const db = await import("../src/db.js");
 const W = await import("../src/watch-wake.js");
-const children: ChildProcess[] = [];
-afterAll(() => {
-  for (const c of children) c.kill("SIGKILL");
+const { getOwnHostId, processStartedAt } = await import("../src/liveness.js");
+const OWN = getOwnHostId();
+const windows: TestWindow[] = [];
+afterAll(async () => {
+  for (const w of windows) await w.close();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 
-const env = (over: Record<string, string> = {}) => ({ PATH: process.env.PATH ?? "", HOME, RELAY_DB_PATH: DB, RELAY_AGENT_NAME: "h-bob", RELAY_STOP_WAKE_DAMPER_SECS: "0", RELAY_FILESYSTEM_MARKERS: "0", ...over });
+const env = (over: Record<string, string> = {}): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME, RELAY_DB_PATH: DB, RELAY_AGENT_NAME: "h-bob", RELAY_STOP_WAKE_DAMPER_SECS: "0", RELAY_FILESYSTEM_MARKERS: "0", ...over });
 function stop(payload: Record<string, unknown> | null): { out: string; block: { decision: string; reason: string } | null } {
   const r = spawnSync("bash", [HOOK], { env: env(), input: payload ? JSON.stringify(payload) : "", encoding: "utf-8", timeout: 30_000 });
   const out = r.stdout ?? "";
   return { out, block: out ? JSON.parse(out) : null };
 }
 const natural = (sid = "sess-1") => ({ session_id: sid, stop_hook_active: false, hook_event_name: "Stop" });
-const dir = () => W.watchDirFor(DB, "h-bob");
-const armedOnce = () => fs.mkdirSync(dir(), { recursive: true, mode: 0o700 }); // a watch dir exists: it armed before
-function startWatch(): ChildProcess {
-  const c = spawn("node", [RELAY_BIN, "watch", "h-bob", "--until-wake", "--interval", "1"], { env: env(), stdio: "ignore" });
-  children.push(c);
-  return c;
-}
+const agentDir = () => W.watchAgentDir(DB, "h-bob");
+const healFile = () => path.join(agentDir(), W.HEAL_FILE);
+const armedOnce = () => fs.mkdirSync(agentDir(), { recursive: true, mode: 0o700 }); // the agent dir exists: it armed before
+const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+let win: TestWindow;
+const startWatch = () => win.run(`node ${sq(RELAY_BIN)} watch h-bob --until-wake --interval 1`);
 async function untilLive(): Promise<void> {
-  for (let i = 0; i < 75; i++) {
+  for (let i = 0; i < 100; i++) {
     if (spawnSync("node", [RELAY_BIN, "watch", "h-bob", "--lock-status"], { env: env(), encoding: "utf-8" }).stdout.trim() === "live") return;
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 150));
   }
   throw new Error("the watch never became live");
 }
 
-describe("PR 7: the Stop hook's watch re-arm heal (the real hook)", () => {
+describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)", () => {
   beforeEach(async () => {
-    for (const c of children.splice(0)) {
-      if (c.exitCode === null && c.signalCode === null) {
-        const gone = new Promise((r) => c.once("close", r));
-        c.kill("SIGKILL");
-        await gone;
-      }
-    }
+    for (const w of windows.splice(0)) await w.close();
     db.closeDb();
     fs.rmSync(path.join(ROOT, "inst"), { recursive: true, force: true });
     fs.rmSync(HOME, { recursive: true, force: true });
@@ -76,11 +75,14 @@ describe("PR 7: the Stop hook's watch re-arm heal (the real hook)", () => {
     db.getDb();
     db.registerAgent("h-alice", "s", []);
     db.registerAgent("h-bob", "r", []);
+    win = openWindow(path.join(ROOT, `win-${Date.now()}`), env());
+    windows.push(win);
+    db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: win.pid, windowPidStart: processStartedAt(win.pid) as string, agentName: "h-bob", agentClass: null, conversationId: `conv-${win.pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
   });
 
   it("an agent that NEVER armed a watch is untouched: no block, empty stdout (the pre-PR 7 behaviour)", () => {
     expect(stop(natural()).out).toBe("");
-    expect(fs.existsSync(dir())).toBe(false);
+    expect(fs.existsSync(agentDir())).toBe(false);
   });
 
   it("HARM: armed once, none live → ONE block per session with a RUNNABLE re-arm command; the same session is not blocked again; a NEW session is", async () => {
@@ -88,14 +90,16 @@ describe("PR 7: the Stop hook's watch re-arm heal (the real hook)", () => {
     const first = stop(natural("sess-1"));
     expect(first.block?.decision).toBe("block");
     expect(first.block?.reason).toMatch(/^\[RELAY\] Your relay watch is not running: .* Re-arm it now as a BACKGROUND task \(run_in_background\), once: RELAY_DB_PATH=.+ watch h-bob --until-wake Then continue\.$/);
+    expect(fs.readFileSync(healFile(), "utf-8")).toBe("sess-1"); // the once lives in the AGENT dir
+    expect(fs.existsSync(path.join(HOME, ".bot-relay"))).toBe(false); // never under $HOME (Codex R1 #4)
     expect(stop(natural("sess-1")).out).toBe(""); // once per session
     expect(stop(natural("sess-2")).block?.decision).toBe("block");
-    // The command it gives is RUNNABLE as printed: run it with mail pending → the watch wakes (exit 0).
+    // The command it gives is RUNNABLE as printed, in the agent's window: with mail pending, the watch wakes.
     const cmd = (first.block as { reason: string }).reason.replace(/^.*once: /, "").replace(/ Then continue\.$/, "");
     db.sendMessage("h-alice", "h-bob", "x", "normal");
-    const r = spawnSync("bash", ["-c", cmd], { env: env(), encoding: "utf-8", timeout: 30_000 });
-    expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/^relay mail pending for h-bob: 1 new message/);
+    const r = win.run(cmd);
+    expect(await within(r.exited, 30_000), r.err()).toBe(0);
+    expect(r.out()).toMatch(/^relay mail pending for h-bob: 1 new message/);
   }, 60_000);
 
   it("a LIVE watch → no block, and seeing it live RESETS the once (a later loss in the same session heals again)", async () => {
@@ -104,22 +108,23 @@ describe("PR 7: the Stop hook's watch re-arm heal (the real hook)", () => {
     const w = startWatch();
     await untilLive();
     expect(stop(natural("sess-1")).out).toBe("");
-    const gone = new Promise((r) => w.once("close", r));
-    w.kill("SIGKILL");
-    await gone;
+    expect(fs.existsSync(healFile())).toBe(false);
+    process.kill(await w.pid(), "SIGKILL");
+    await w.exited;
     expect(stop(natural("sess-1")).block?.decision).toBe("block");
   }, 60_000);
 
-  it("a HUNG watch (lock held, heartbeat old) → the block says it is hung", async () => {
+  it("a HUNG watch (lock held, its holder silent past the stale bound) → the block says it is hung", async () => {
     startWatch();
     await untilLive();
     // Age the CURRENT holder (its sidecar's since and its own heartbeat): real time cannot pass 5 min.
+    const dir = W.watchWindowDir(DB, "h-bob", { pid: win.pid, start: processStartedAt(win.pid) as string });
     const old = new Date(Date.now() - W.HEARTBEAT_STALE_MS - 60_000).toISOString();
-    const f = path.join(dir(), W.WATCH_HOLDER_FILE);
+    const f = path.join(dir, W.watchHolderFile(0));
     const h = JSON.parse(fs.readFileSync(f, "utf-8"));
     fs.writeFileSync(f, JSON.stringify({ ...h, since: old }));
-    W.writeHeartbeat(dir(), h.pid, old);
-    expect(stop(natural()).block?.reason).toMatch(/^\[RELAY\] Your relay watch is hung \(its heartbeat stopped\)/);
+    fs.rmSync(path.join(dir, W.HEARTBEAT_FILE), { force: true }); // the sign is then the sidecar's since (wall)
+    expect(stop(natural()).block?.reason).toMatch(/^\[RELAY\] Your relay watch is hung \(it stopped checking\)/);
   }, 60_000);
 
   it("mail pending AND no live watch → ONE block carrying the mail wake and the re-arm line", () => {
@@ -130,10 +135,38 @@ describe("PR 7: the Stop hook's watch re-arm heal (the real hook)", () => {
     expect(b?.reason).toMatch(/^\[RELAY\] 1 pending message for h-bob, latest from h-alice\. .* this wake did not consume it\. \[RELAY\] Your relay watch is not running: .*--until-wake$/);
   });
 
-  it("never inside our own continuation (stop_hook_active), and never without a session id (it cannot be bounded to once)", () => {
+  it("never inside our own continuation (stop_hook_active), and never without a valid session id (it cannot be bounded to once)", () => {
     armedOnce();
     expect(stop({ session_id: "sess-1", stop_hook_active: true }).out).toBe("");
     expect(stop({ stop_hook_active: false }).out).toBe("");
     expect(stop({ session_id: "bad id; rm -rf", stop_hook_active: false }).out).toBe("");
+  });
+
+  it("HARM (Codex R1 #4): a PLANTED LINK at the heal state is REPLACED, never followed: its target is untouched", () => {
+    armedOnce();
+    const target = path.join(ROOT, "pretend-claude.json");
+    fs.writeFileSync(target, "ORIGINAL");
+    fs.symlinkSync(target, healFile());
+    expect(stop(natural("sess-9")).block?.decision).toBe("block");
+    expect(fs.readFileSync(target, "utf-8")).toBe("ORIGINAL"); // the link's target was never written
+    expect(fs.lstatSync(healFile()).isSymbolicLink()).toBe(false); // the link itself was replaced
+    expect(fs.readFileSync(healFile(), "utf-8")).toBe("sess-9");
+    // A link to a DIRECTORY (where a shell `mv` would drop a file INSIDE it) is replaced too.
+    const targetDir = path.join(ROOT, "pretend-dot-claude");
+    fs.mkdirSync(targetDir);
+    fs.rmSync(healFile());
+    fs.symlinkSync(targetDir, healFile());
+    expect(stop(natural("sess-10")).block?.decision).toBe("block");
+    expect(fs.readdirSync(targetDir)).toEqual([]);
+    expect(fs.lstatSync(healFile()).isSymbolicLink()).toBe(false);
+  });
+
+  it("HARM (Codex R1 #4): the agent's watch dir itself a LINK → nothing is read or written through it (no heal)", () => {
+    const elsewhere = path.join(ROOT, "elsewhere");
+    fs.mkdirSync(elsewhere, { mode: 0o700 });
+    fs.mkdirSync(path.dirname(agentDir()), { recursive: true, mode: 0o700 });
+    fs.symlinkSync(elsewhere, agentDir());
+    expect(stop(natural()).out).toBe("");
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
   });
 });

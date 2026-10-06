@@ -75,6 +75,27 @@ export interface CandidateBinding {
   window_pid_start?: string | null;
 }
 
+/**
+ * THE window judgement (ruling 5dda2752), shared by the doorbell and the watch (PR 7, ruling ffcaf608
+ * D1 (iii)): each binding's window on its own; only the PROVEN dead are set aside; another host's
+ * window cannot be judged from here (unverifiable, never dead).
+ */
+export function judgeWindows<B extends CandidateBinding>(bs: readonly B[], ownHostId: string | null, liveness: (b: B) => AnchorVerdict) {
+  const judged = bs.map((x) => ({ b: x, v: x.host_id === ownHostId ? liveness(x) : ("unverifiable" as AnchorVerdict) }));
+  const notDead = judged.filter((x) => x.v !== "dead");
+  const liveWindows = notDead.filter((x) => x.v === "alive");
+  return { judged, notDead, liveWindows, deadCount: judged.length - notDead.length };
+}
+/**
+ * The agent's ONE live window, by the doorbell's own predicate (Q4: never guess): exactly one binding
+ * not proven dead, and it is alive. Otherwise none (no live window) or ambiguous (2+ not proven dead).
+ */
+export function oneLiveWindow<B extends CandidateBinding>(bs: readonly B[], ownHostId: string | null, liveness: (b: B) => AnchorVerdict): { kind: "one"; b: B } | { kind: "none" } | { kind: "ambiguous" } {
+  const { notDead, liveWindows } = judgeWindows(bs, ownHostId, liveness);
+  if (notDead.length >= 2) return { kind: "ambiguous" };
+  return liveWindows.length === 1 ? { kind: "one", b: liveWindows[0].b } : { kind: "none" };
+}
+
 /** What the planner needs from one pending read (pendingMetadata). */
 export interface PendingRead {
   registered: boolean;
@@ -334,7 +355,7 @@ export interface CycleInput {
    * already woke the agent for is still undelivered after the horizon); no watch → no_driver(watch_absent);
    * a hung one → no_driver(watch_stale). Absent (tests, a future active driver): PR 1-6's intent path.
    */
-  watchFit?: (agentName: string, read: PendingRead) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean };
+  watchFit?: (agentName: string, read: PendingRead, window: CandidateBinding) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean };
   /**
    * Ruling 1a8fc7c4 (1): the ACTUATING driver, if one is registered. An intent is formed ONLY for an
    * agent it fits (an intent is a ring PR 3 will judge). NONE in production today → zero intents; the
@@ -581,10 +602,9 @@ export function planCycle(input: CycleInput): CyclePlan {
     }
     // THE DECISION (ruling 5dda2752): each binding's window on its own; only the PROVEN dead are set
     // aside. Another host's window cannot be judged from here: unverifiable, never dead.
-    const judged = bs.map((x) => ({ b: x, v: x.host_id === input.ownHostId ? input.liveness(x) : ("unverifiable" as AnchorVerdict) }));
-    const notDead = judged.filter((x) => x.v !== "dead");
-    const alive = notDead.filter((x) => x.v === "alive");
-    const deadCount = judged.length - notDead.length;
+    const windows = judgeWindows(bs, input.ownHostId, input.liveness);
+    const { judged, notDead, deadCount } = windows;
+    const alive = windows.liveWindows;
     const idsOf = (xs: typeof judged) => sortedSet(xs.map((x) => x.b.binding_id));
     let next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: NoDriverWhy } | null =
       notDead.length >= 2
@@ -603,7 +623,7 @@ export function planCycle(input: CycleInput): CyclePlan {
     // is boarded no_driver only; the seam stays for a future actuator.
     const actuated = !next && !!rs && !!input.actuator?.fits(name);
     if (!next && rs && input.watchFit) {
-      const wf = input.watchFit(name, read);
+      const wf = input.watchFit(name, read, alive[0].b); // the ONE live window: the watch's key (ruling ffcaf608 D1 (iv))
       if (wf.status === "live") next = wf.undeliveredAfterWake ? { case: "undelivered_with_watch", binding_ids: idsOf(alive), dead_count: deadCount } : null;
       else if (!actuated) next = { case: "no_driver", binding_ids: idsOf(alive), dead_count: deadCount, why: wf.status === "stale" ? "watch_stale" : "watch_absent" };
       boardTo(name, next, read.ids.length, "resolved");

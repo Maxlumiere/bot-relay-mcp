@@ -16,8 +16,9 @@ import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawn, spawnSync, type ChildProcess } from "child_process";
+import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
@@ -35,19 +36,13 @@ const W = await import("../src/watch-wake.js");
 const { getOwnHostId, processStartedAt } = await import("../src/liveness.js");
 const OWN = getOwnHostId();
 
-const children: ChildProcess[] = [];
-afterAll(() => {
-  for (const c of children) c.kill("SIGKILL");
+const windows: TestWindow[] = [];
+afterAll(async () => {
+  for (const w of windows) await w.close();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
-
-function liveWindow(): { pid: number; start: string } {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  children.push(child);
-  return { pid: child.pid as number, start: processStartedAt(child.pid as number) as string };
-}
-const bindWindow = (agent: string, pid: number, start: string) =>
-  db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: pid, windowPidStart: start, agentName: agent, agentClass: null, conversationId: `conv-${pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
+const bindWindow = (agent: string, pid: number) =>
+  db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: pid, windowPidStart: processStartedAt(pid) as string, agentName: agent, agentClass: null, conversationId: `conv-${pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
 const recs = () => (fs.existsSync(LOGP) ? fs.readFileSync(LOGP, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
 const intents = () => recs().filter((r) => r.type === "intent").length;
 const boards = () => recs().filter((r) => r.type === "board").map((r) => [r.case, r.state, r.why ?? null]);
@@ -62,14 +57,12 @@ async function lifetime(wall: number): Promise<number> {
     spy.mockRestore();
   }
 }
-const env = () => ({ ...process.env, RELAY_DB_PATH: DB, RELAY_FILESYSTEM_MARKERS: "0" });
-function startWatch(agent: string): { child: ChildProcess; exited: Promise<number | null> } {
-  const child = spawn("node", [RELAY_BIN, "watch", agent, "--until-wake", "--interval", "1"], { env: env(), stdio: "ignore" });
-  children.push(child);
-  return { child, exited: new Promise((r) => child.on("close", (c) => r(c))) };
-}
+const env = (): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, RELAY_FILESYSTEM_MARKERS: "0" });
+const sq = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`;
+let win: TestWindow;
+/** The agent arms its watch: a DESCENDANT of its bound window (ruling ffcaf608 D1). */
+const startWatch = (agent: string) => win.run(`node ${sq(RELAY_BIN)} watch ${agent} --until-wake --interval 1`);
 const lockStatus = (agent: string) => spawnSync("node", [RELAY_BIN, "watch", agent, "--lock-status"], { env: env(), encoding: "utf-8" }).stdout.trim();
-const within = <T>(p: Promise<T>, ms: number): Promise<T | "timeout"> => Promise.race([p, new Promise<"timeout">((r) => setTimeout(() => r("timeout"), ms))]);
 async function untilLive(agent: string): Promise<void> {
   for (let i = 0; i < 75 && lockStatus(agent) !== "live"; i++) await new Promise((r) => setTimeout(r, 200));
   expect(lockStatus(agent)).toBe("live");
@@ -77,15 +70,8 @@ async function untilLive(agent: string): Promise<void> {
 
 describe.skipIf(!OWN)("PR 7: the doorbell supervises the watch (the real job, a real window, a real watch)", () => {
   beforeEach(async () => {
-    // No process survives its test: a watch from the last test would hold its lock, and write into the
-    // SAME per-agent dir path once this test recreates it.
-    for (const c of children.splice(0)) {
-      if (c.exitCode === null && c.signalCode === null) {
-        const gone = new Promise((r) => c.once("close", r));
-        c.kill("SIGKILL");
-        await gone;
-      }
-    }
+    // No process survives its test: a watch from the last test would hold its lock.
+    for (const w of windows.splice(0)) await w.close();
     db.closeDb();
     fs.rmSync(path.join(ROOT, "inst"), { recursive: true, force: true });
     fs.mkdirSync(path.join(ROOT, "inst"), { recursive: true });
@@ -93,8 +79,9 @@ describe.skipIf(!OWN)("PR 7: the doorbell supervises the watch (the real job, a 
     db.getDb();
     db.registerAgent("s7-sender", "s", []);
     db.registerAgent("s7-alice", "r", []);
-    const w = liveWindow();
-    bindWindow("s7-alice", w.pid, w.start);
+    win = openWindow(path.join(ROOT, `win-${Date.now()}`), env());
+    windows.push(win);
+    bindWindow("s7-alice", win.pid);
   });
 
   it("HARM (ruling 1a8fc7c4 (1)): an UNARMED agent with mail across MORE than K x H → ZERO intents, ZERO escalations, ONE no_driver(watch_absent) case; status shows it", async () => {

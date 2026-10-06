@@ -25,9 +25,10 @@
  *     also keeps the recent wakes per (sender → recipient) pair, for the rate.
  */
 import crypto from "crypto";
+import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
-import { probeLockHeld, readHolderInfo, WATCH_LOCK_DB_FILENAME, type HolderInfo } from "./doorbell-lock.js";
+import { probeLockHeld, readHolderInfo, type HolderInfo } from "./doorbell-lock.js";
 import { AGENT_NAME_PATTERN } from "./types.js";
 
 /** An agent name that can name a watch dir: a valid agent name that is not all dots. */
@@ -113,27 +114,106 @@ export function recordWake(prev: WokenState | null, rs: string, ids: readonly st
 }
 
 // ---------------------------------------------------------------------------------------------------
-// The per-agent watch dir: <instance dir>/watch/<agent>/ (0700): the lock, its holder sidecar, the
-// heartbeat, and the woken-for state.
+// The watch's files (ruling ffcaf608): <instance dir>/watch/<agent>/ (0700, the AGENT dir: its
+// existence means "this agent armed a watch once"; the Stop hook's heal state lives here) and, per
+// WINDOW (D1 (iv): the lock key is the agent + its window's pid and start), <agent dir>/<window key>/:
+//   - gen-<N>: the GENERATIONS (D2). The current one is the highest N. Advancing N → N+1 is an O_EXCL
+//     create of gen-<N+1>: exactly one creator per N, decided by the kernel. A holder at N is
+//     superseded iff gen-<N+1> exists.
+//   - watch.lock.<N>.db (+ watch.lock.<N>.holder.json): generation N's kernel-held lock.
+//   - heartbeat.json: the holder's heartbeat (its pid and generation, wall and monotonic time).
+//   - woken.json: the woken-for state.
+// NOTHING IS EVER SIGNALLED (D2): a stale holder is abandoned by advancing the generation, never killed.
 
-export const WATCH_LOCK_FILE = WATCH_LOCK_DB_FILENAME;
-export const WATCH_HOLDER_FILE = "watch.lock.holder.json";
+export const watchLockFile = (gen: number): string => `watch.lock.${gen}.db`;
+export const watchHolderFile = (gen: number): string => `watch.lock.${gen}.holder.json`;
 export const HEARTBEAT_FILE = "heartbeat.json";
 export const WOKEN_FILE = "woken.json";
-/** A held lock whose heartbeat is older than this is a HUNG watch (watch_stale; ruling 7224605e (2)). */
+/** The Stop hook's once-per-session heal state, in the AGENT dir (written by the hook, no-follow). */
+export const HEAL_FILE = "heal-session";
+/** A held lock whose holder showed no life for this much AWAKE time is a HUNG watch (watch_stale). */
 export const HEARTBEAT_STALE_MS = 5 * 60_000;
 
 /**
- * The watch dir for `agent`, beside the resolved relay DB. Refuses a name that is not an agent name,
- * and an all-dot one (`.` and `..` ARE valid agent names, but as a path segment they would name the
- * watch dir's parent or itself): such an agent simply has no watch.
+ * The AGENT dir, beside the resolved relay DB. Refuses a name that is not an agent name, and an all-dot
+ * one (`.` and `..` ARE valid agent names, but as a path segment they would name the watch dir's
+ * parent or itself): such an agent simply has no watch.
  */
-export function watchDirFor(dbPath: string, agent: string): string {
+export function watchAgentDir(dbPath: string, agent: string): string {
   if (!watchableName(agent)) throw new Error(`no watch for this agent name: ${JSON.stringify(agent)}`);
   return path.join(path.dirname(dbPath), "watch", agent);
 }
+/** A window's key: its pid and a digest of its start token (the token may hold spaces and colons). */
+export function windowKey(pid: number, start: string): string {
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error(`not a window pid: ${pid}`);
+  return `w${pid}-${crypto.createHash("sha256").update(start).digest("hex").slice(0, 16)}`;
+}
+/** The WINDOW dir: one watch per (agent, window) (ruling ffcaf608 D1 (iv)). */
+export function watchWindowDir(dbPath: string, agent: string, win: { pid: number; start: string }): string {
+  return path.join(watchAgentDir(dbPath, agent), windowKey(win.pid, win.start));
+}
 
+const GEN = /^gen-(0|[1-9][0-9]{0,8})$/;
+/** The current generation: the highest gen-<N> in the window dir (0 when none was ever created). */
+export function currentGen(dir: string): number {
+  let max = 0;
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  for (const n of names) {
+    const m = GEN.exec(n);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return max;
+}
+/**
+ * Is generation `gen` superseded? Checked by the holder every check AND immediately before every
+ * write. It is "a later generation exists": gen-<gen+1> was created (the ruled test), or it has since
+ * been pruned under a still later one, which never lowers the current (highest) generation.
+ */
+export function superseded(dir: string, gen: number): boolean {
+  return currentGen(dir) > gen;
+}
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+/**
+ * Advance from `gen` to gen+1: an O_EXCL create of gen-<gen+1> (ruling ffcaf608 D2). Exactly one
+ * caller per `gen` gets true; every other sees EEXIST (false) and contests that generation's lock.
+ */
+export function advanceGen(dir: string, gen: number): boolean {
+  try {
+    fs.closeSync(fs.openSync(path.join(dir, `gen-${gen + 1}`), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600));
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+}
+/** Remove the files of generations below `gen` (bounded growth; a holder there is superseded anyway). */
+export function pruneGenerations(dir: string, gen: number): void {
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    const m = /^(?:gen-|watch\.lock\.)(0|[1-9][0-9]{0,8})(?:\.db|\.holder\.json)?$/.exec(n);
+    if (!m) continue;
+    const k = Number(m[1]);
+    // Below the current generation only: gen-<gen> (it defines the current generation) and its lock stay.
+    if (k < gen) {
+      try {
+        fs.unlinkSync(path.join(dir, n));
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
+
 /** Read one small JSON file, no-follow; null when absent or invalid (never a guess). */
 function readJson(file: string): unknown {
   try {
@@ -184,60 +264,103 @@ export function writeWoken(dir: string, s: WokenState): void {
   writeJsonAtomic(dir, WOKEN_FILE, s);
 }
 
-/** The heartbeat a HOLDER writes on every check (ruling 7224605e (2)): a hung watch must be visible. */
+/** The heartbeat a HOLDER writes (ruling 7224605e (2)): its pid, its generation, wall AND monotonic time. */
 export interface WatchHeartbeat {
-  v: 1;
+  v: 2;
   pid: number;
+  gen: number;
   at: string;
+  /** process.hrtime.bigint() as a decimal string: system-wide; on linux it EXCLUDES suspend. */
+  mono_ns: string;
 }
-export function writeHeartbeat(dir: string, pid: number, at: string): void {
-  writeJsonAtomic(dir, HEARTBEAT_FILE, { v: 1, pid, at } satisfies WatchHeartbeat);
+export function writeHeartbeat(dir: string, hb: { pid: number; gen: number; at: string; mono_ns?: string }): void {
+  writeJsonAtomic(dir, HEARTBEAT_FILE, { v: 2, pid: hb.pid, gen: hb.gen, at: hb.at, mono_ns: hb.mono_ns ?? String(process.hrtime.bigint()) } satisfies WatchHeartbeat);
 }
 export function readHeartbeat(dir: string): WatchHeartbeat | null {
   const o = readJson(path.join(dir, HEARTBEAT_FILE)) as Partial<WatchHeartbeat> | null;
-  return o && o.v === 1 && Number.isInteger(o.pid) && typeof o.at === "string" && Number.isFinite(Date.parse(o.at)) ? (o as WatchHeartbeat) : null;
+  return o && o.v === 2 && Number.isInteger(o.pid) && Number.isInteger(o.gen) && typeof o.at === "string" && Number.isFinite(Date.parse(o.at)) && typeof o.mono_ns === "string" && /^[0-9]{1,30}$/.test(o.mono_ns) ? (o as WatchHeartbeat) : null;
 }
 
 /**
- * The CURRENT holder's last sign of life (ms): its own heartbeat (only one carrying the holder's pid)
- * or, before its first heartbeat, the time it took the lock (its holder sidecar's `since`). A heartbeat
- * left by a PREVIOUS holder never counts, so a watch that has just started is never judged stale by its
- * predecessor's old heartbeat (and never killed for it: see the takeover in watch-until-wake.ts).
- * null = no sign at all (no sidecar and no heartbeat).
+ * The system's last WAKE from sleep (ms), or null when it cannot be read (darwin: kern.waketime).
+ * MEASURED (6 Oct): node's process.hrtime on macOS INCLUDES sleep, so a monotonic heartbeat alone
+ * cannot tell a sleeping holder from a hung one there; the wake time can.
  */
-export function holderLastSign(dir: string): { holder: HolderInfo | null; at: number | null } {
-  const holder = readHolderInfo(dir, WATCH_HOLDER_FILE);
-  const hb = readHeartbeat(dir);
-  const since = holder ? Date.parse(holder.since) : NaN;
-  const beat = hb && (!holder || hb.pid === holder.pid) ? Date.parse(hb.at) : NaN;
-  const signs = [since, beat].filter((x) => Number.isFinite(x));
-  return { holder, at: signs.length ? Math.max(...signs) : null };
+export function lastWakeMs(run: (cmd: string, args: string[]) => string = (c, a) => execFileSync(c, a, { encoding: "utf-8", timeout: 2_000 })): number | null {
+  if (process.platform !== "darwin") return null;
+  try {
+    const m = /sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)/.exec(run("sysctl", ["-n", "kern.waketime"]));
+    return m ? Number(m[1]) * 1000 + Math.floor(Number(m[2]) / 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The clocks staleness reads (test seams): wall now, monotonic now, and the system's last wake. */
+export interface AwakeClock {
+  wallMs: number;
+  monoNs: bigint;
+  lastWakeMs: number | null;
+  platform: NodeJS.Platform;
+}
+export const realAwakeClock = (wallMs: number = Date.now()): AwakeClock => ({ wallMs, monoNs: process.hrtime.bigint(), lastWakeMs: lastWakeMs(), platform: process.platform });
+
+/**
+ * AWAKE time since a sign of life (ruling ffcaf608 D2: staleness is awake time, never wall time, so a
+ * holder is never judged stale because the machine slept):
+ *   - darwin: from the LATER of the sign and the system's last wake (time asleep never counts; the awake
+ *     time before a sleep is not counted either: conservative, never a false stale);
+ *   - linux: the smaller of wall and CLOCK_MONOTONIC time (monotonic excludes suspend);
+ *   - otherwise, or when nothing better is readable: wall time.
+ */
+export function awakeMsSince(sign: { wallMs: number; monoNs: bigint | null }, c: AwakeClock): number {
+  const wall = c.wallMs - sign.wallMs;
+  if (c.platform === "darwin" && c.lastWakeMs !== null) return c.wallMs - Math.max(sign.wallMs, c.lastWakeMs);
+  if (c.platform === "linux" && sign.monoNs !== null) return Math.min(wall, Number((c.monoNs - sign.monoNs) / 1_000_000n));
+  return wall;
 }
 
 /**
- * Is a watch LIVE for this agent? (for OTHER processes: the Stop hook via `--lock-status`, the doorbell
- * supervisor, and a new watch deciding whether to take over). The kernel-held lock is the liveness
- * proof; the current holder's last sign of life tells a HUNG one.
- *   - "live": the lock is held and its holder showed life within HEARTBEAT_STALE_MS;
- *   - "stale": the lock is held but its holder has not (a hung watch: watch_stale, and a takeover);
- *   - "absent": nothing holds the lock (no watch, or a dead one: the kernel freed its lock).
+ * The CURRENT holder of generation `gen` and its last sign of life: its own heartbeat (one carrying the
+ * holder's pid AND this generation) or, before its first heartbeat, the time it took the lock (its
+ * holder sidecar's `since`). A heartbeat left by a previous holder never counts, so a just-started
+ * watch is never judged stale by its predecessor's old heartbeat.
+ */
+export function holderLastSign(dir: string, gen: number): { holder: HolderInfo | null; sign: { wallMs: number; monoNs: bigint | null } | null } {
+  const holder = readHolderInfo(dir, watchHolderFile(gen));
+  const hb = readHeartbeat(dir);
+  const own = hb && hb.gen === gen && (!holder || hb.pid === holder.pid) ? hb : null;
+  if (own) return { holder, sign: { wallMs: Date.parse(own.at), monoNs: BigInt(own.mono_ns) } };
+  const since = holder ? Date.parse(holder.since) : NaN;
+  return { holder, sign: Number.isFinite(since) ? { wallMs: since, monoNs: null } : null };
+}
+
+/**
+ * Is the watch of this WINDOW dir live? (for OTHER processes: the Stop hook via `relay pending
+ * --watch-status`, the doorbell supervisor, and a new watch deciding whether to take over). The
+ * current generation's kernel-held lock is the liveness proof; its holder's awake time since its last
+ * sign of life tells a HUNG one.
+ *   - "live": held, and its holder showed life within HEARTBEAT_STALE_MS of AWAKE time;
+ *   - "stale": held, but its holder has not (hung: watch_stale, and a generation takeover);
+ *   - "absent": nothing holds the current generation's lock.
  * ⚠ Never called inside the holder's own process (probeLockHeld would drop its POSIX lock).
  */
-export function watchStatus(dir: string, now: number = Date.now()): "live" | "stale" | "absent" {
-  if (probeLockHeld(path.join(dir, WATCH_LOCK_FILE)) !== "held") return "absent";
-  const { at } = holderLastSign(dir);
-  return at !== null && now - at < HEARTBEAT_STALE_MS ? "live" : "stale";
+export function watchStatus(dir: string, clock: AwakeClock = realAwakeClock()): "live" | "stale" | "absent" {
+  const gen = currentGen(dir);
+  if (probeLockHeld(path.join(dir, watchLockFile(gen))) !== "held") return "absent";
+  const { sign } = holderLastSign(dir, gen);
+  return sign !== null && awakeMsSince(sign, clock) < HEARTBEAT_STALE_MS ? "live" : "stale";
 }
 
 /**
- * The supervisor's view of ONE agent's watch (read-only; never in the holder's process): its liveness,
- * and whether mail it ALREADY woke this session for is still undelivered after `horizonMs` (the agent
- * woke and did not drain, or the watch is hung): the undelivered_with_watch board case.
+ * The supervisor's view of ONE agent's watch on its ONE live window (read-only; never in the holder's
+ * process): its liveness, and whether mail it ALREADY woke this session for is still undelivered
+ * after `horizonMs` (the agent woke and did not drain, or the watch is hung): undelivered_with_watch.
  */
-export function watchSupervision(dir: string, read: { reading_session: string | null; ids: readonly string[] }, now: number, horizonMs: number): { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean } {
-  const status = watchStatus(dir, now);
+export function watchSupervision(dir: string, read: { reading_session: string | null; ids: readonly string[] }, clock: AwakeClock, horizonMs: number): { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean } {
+  const status = watchStatus(dir, clock);
   const w = readWoken(dir);
   const pending = new Set(read.ids);
-  const undeliveredAfterWake = !!w && w.reading_session === read.reading_session && w.ids.some((id) => pending.has(id) && now - (w.woken_at[id] ?? 0) >= horizonMs);
+  const undeliveredAfterWake = !!w && w.reading_session === read.reading_session && w.ids.some((id) => pending.has(id) && clock.wallMs - (w.woken_at[id] ?? 0) >= horizonMs);
   return { status, undeliveredAfterWake };
 }
