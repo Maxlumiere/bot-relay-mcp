@@ -191,8 +191,13 @@ export function advanceGen(dir: string, gen: number): boolean {
     throw err;
   }
 }
-/** Remove the files of generations below `gen` (bounded growth; a holder there is superseded anyway). */
+/**
+ * Remove the files of generations below `gen` (bounded growth; a holder there is superseded anyway).
+ * NEVER the highest generation (ruling 1e72ed63): the bound is min(gen, the current max), so the max
+ * gen-* file always survives and `superseded` (currentGen > mine) stays monotonic.
+ */
 export function pruneGenerations(dir: string, gen: number): void {
+  const below = Math.min(gen, currentGen(dir));
   let names: string[] = [];
   try {
     names = fs.readdirSync(dir);
@@ -203,8 +208,8 @@ export function pruneGenerations(dir: string, gen: number): void {
     const m = /^(?:gen-|watch\.lock\.)(0|[1-9][0-9]{0,8})(?:\.db|\.holder\.json)?$/.exec(n);
     if (!m) continue;
     const k = Number(m[1]);
-    // Below the current generation only: gen-<gen> (it defines the current generation) and its lock stay.
-    if (k < gen) {
+    // Strictly below the bound: the highest gen-* (it defines the current generation) and its lock stay.
+    if (k < below) {
       try {
         fs.unlinkSync(path.join(dir, n));
       } catch {

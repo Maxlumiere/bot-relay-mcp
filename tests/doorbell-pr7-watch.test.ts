@@ -104,6 +104,17 @@ describe("the watch's state (pure): generations, awake time, the current holder"
     expect(fs.readdirSync(d).filter((n) => n.startsWith("gen-"))).toEqual(["gen-2"]);
     expect(W.superseded(d, 0)).toBe(true); // gen-1 was pruned, yet generation 0 is still superseded
   });
+  it("ruling 1e72ed63: pruning NEVER deletes the highest gen file, even when asked to prune past it", () => {
+    const d = tmp();
+    W.advanceGen(d, 0);
+    W.advanceGen(d, 1); // gen-1, gen-2
+    for (const g of [0, 1, 2, 3, 99]) {
+      W.pruneGenerations(d, g);
+      expect(fs.existsSync(path.join(d, "gen-2")), `prune(${g})`).toBe(true);
+      expect(W.currentGen(d)).toBe(2);
+    }
+    expect(W.superseded(d, 1)).toBe(true);
+  });
   it("awake time (MEASURED: node hrtime on macOS includes sleep): darwin counts from the later of the sign and the last WAKE; linux takes the smaller of wall and monotonic; else wall", () => {
     const sign = { wallMs: 1_000_000, monoNs: 5_000_000_000n };
     // darwin: slept 10 min after the sign, woke 1 min ago → 1 min awake, never stale
