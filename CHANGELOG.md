@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Security — an address matches a trusted-proxy block the same way however it is written
+
+The relay's own trusted-proxy check (`trusted_proxies`) had a narrow form of GHSA-jqcg-44mw-7w3h, the proxy-addr defect. An IPv4 address written in the hexadecimal IPv4-mapped form (`::ffff:102:304`, which is 1.2.3.4) was treated as inside broad IPv6 blocks such as `::/0`, `::/1` or `::/80`, while the usual spelling (`::ffff:1.2.3.4`) was correctly not. Reaching it needed a `trusted_proxies` entry like that, plus an address in that spelling.
+
+- **Every address and every block is now read once into its bytes**, and only bytes are compared. Any spelling of an IPv4-mapped address is that IPv4 address. An IPv4 address is inside an IPv6 block only when the block is a real IPv4-mapped block (`::ffff:0:0/96` or longer); `::ffff:10.0.0.0/8` is an IPv6 block and contains no IPv4 address.
+- **Ambiguous forms are refused, not guessed:** a zone id (`fe80::1%en0`), the old IPv4-compatible form (`::1.2.3.4`), and anything not fully an address. A trusted-proxy list never trusts one, and the webhook address check blocks one.
+- **The client address the relay records is written one way**, so `::ffff:127.0.0.1` and `127.0.0.1` count as the same client for rate limits and the audit log.
 ### Security — three new dependency advisories cleared
 
 - **proxy-addr 2.0.8** in the server and the extension (was 2.0.7; critical, GHSA-jqcg-44mw-7w3h). An IPv4 address no longer matches an IPv6 trust subnet that does not cover the IPv4-mapped range. Express uses it to trust proxies; the relay does not turn on Express's trust-proxy setting.

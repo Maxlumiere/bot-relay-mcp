@@ -66,8 +66,9 @@ describe("IPv6 CIDR matching", () => {
     expect(ipInCidr("::", "::/0")).toBe(true);
   });
 
-  it("strips zone index", () => {
-    expect(ipInCidr("fe80::1%eth0", "fe80::/10")).toBe(true);
+  it("REJECTS a zone index (PR-E: never guessed): it matches nothing, so a trust list does not trust it", () => {
+    expect(ipInCidr("fe80::1%eth0", "fe80::/10")).toBe(false);
+    expect(ipInCidr("fe80::1", "fe80::/10")).toBe(true); // the same address without a zone
   });
 });
 

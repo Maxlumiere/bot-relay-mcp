@@ -39,7 +39,7 @@ import { loadConfig, resolveDashboardSecret, getConfigPath } from "../config.js"
 import { log } from "../logger.js";
 import { pushKanbanSnapshotOnce } from "../dashboard-push.js";
 import { requestContext } from "../request-context.js";
-import { ipInAnyCidr } from "../cidr.js";
+import { canonicalCidr, canonicalIp, cidrContains, formatIp, type CanonicalCidr } from "../cidr.js";
 import { VERSION } from "../version.js";
 import { RESOLVER_REVISION } from "../resolve-instance.js";
 import { LOADED_BUILD } from "../loaded-build.js";
@@ -215,23 +215,37 @@ export function computeCsrfToken(secret: string): string {
 }
 
 export function extractSourceIp(req: Request, trustedProxies: string[]): string {
-  const peer = req.socket.remoteAddress || "unknown";
-  if (trustedProxies.length === 0) return peer;
+  // PR-E: CANONICAL at the boundary. The peer, every forwarded hop and every trusted-proxy entry are
+  // parsed ONCE to bytes + family (src/cidr.ts), and the address returned is the ONE canonical text
+  // form, so a source is spelled one way everywhere it is used (rate-limit keys, audit, the auth
+  // throttle): ::ffff:127.0.0.1 and 127.0.0.1 are one client. An input the parser REJECTS (a zone id,
+  // the IPv4-compatible form, garbage) is never trusted, and is returned as received.
+  const canon = (raw: string): string => {
+    const c = canonicalIp(raw);
+    return c ? formatIp(c) : raw;
+  };
+  const peerRaw = req.socket.remoteAddress || "unknown";
+  if (trustedProxies.length === 0) return canon(peerRaw);
+  const trusted = trustedProxies.map((t) => canonicalCidr(t)).filter((t): t is CanonicalCidr => t !== null);
+  const isTrusted = (raw: string): boolean => {
+    const ip = canonicalIp(raw);
+    return !!ip && trusted.some((t) => cidrContains(t, ip));
+  };
 
   // Only honor XFF when the DIRECT peer is in our trusted list
-  if (!ipInAnyCidr(peer, trustedProxies)) return peer;
+  if (!isTrusted(peerRaw)) return canon(peerRaw);
 
   const fwd = req.headers["x-forwarded-for"];
-  if (typeof fwd !== "string" || fwd.length === 0) return peer;
+  if (typeof fwd !== "string" || fwd.length === 0) return canon(peerRaw);
 
   // Walk right-to-left, skipping trusted hops. First untrusted wins.
   const chain = fwd.split(",").map((s) => s.trim()).filter(Boolean);
   for (let i = chain.length - 1; i >= 0; i--) {
     const hop = chain[i];
-    if (!ipInAnyCidr(hop, trustedProxies)) return hop;
+    if (!isTrusted(hop)) return canon(hop);
   }
   // Every hop in the chain is trusted — fall back to the direct peer
-  return peer;
+  return canon(peerRaw);
 }
 
 /**
