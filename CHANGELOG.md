@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Security — three new dependency advisories cleared
+
+- **proxy-addr 2.0.8** in the server and the extension (was 2.0.7; critical, GHSA-jqcg-44mw-7w3h). An IPv4 address no longer matches an IPv6 trust subnet that does not cover the IPv4-mapped range. Express uses it to trust proxies; the relay does not turn on Express's trust-proxy setting.
+- **source-map-js 1.2.2** in both trees (was 1.2.1; high, GHSA-68fv-2mgg-jv7q), a build-time dependency.
+- **The extension's test runner is vitest 5** (was 3), which drops tinypool 1.1.1 (critical, GHSA-5gmw-xhrv-c9v3 and GHSA-85c8-ppgw-ccpr). vitest 5 needs `@types/node` 22, so the extension's Node types move from 20 to 22; both are development dependencies, and nothing that ships changes.
+
 ### Added — `relay doorbell status`: is the doorbell alive, and what needs attention
 
 The doorbell job (still not installed by anything) now leaves a heartbeat, and a new read-only command reports on it.
