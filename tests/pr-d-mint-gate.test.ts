@@ -240,7 +240,10 @@ describe("the daemon's start (Q4, Q5, Q8)", () => {
 describe("the secret file under concurrency", () => {
   it("8 processes racing the FIRST start, 5 rounds: none crashes, all read ONE secret, no temp file left (MEASURED before: 30/30 rounds crashed)", async () => {
     const dir = fs.mkdtempSync(path.join(ROOT, "race-"));
-    const mod = path.resolve("src/mint-secret.ts");
+    // The BUILT module: a child process cannot load the TS source (its ".js" import specifiers resolve only
+    // after the build). CI and the publish gate build before the tests; a stale dist fails the race loudly.
+    const mod = path.resolve("dist/mint-secret.js");
+    expect(fs.existsSync(mod), "dist/mint-secret.js is built (npm run build)").toBe(true);
     const child = `const { ensureMintSecret, readMintSecret } = await import(${JSON.stringify(mod)}); const go = Number(process.argv[1]); while (Date.now() < go) {} try { ensureMintSecret(${JSON.stringify(dir)}); console.log("OK " + readMintSecret(${JSON.stringify(dir)})); } catch (e) { console.log("ERR " + e.message); }`;
     const runOne = (go: string) =>
       new Promise<string>((resolve) => {
