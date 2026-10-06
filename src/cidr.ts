@@ -4,249 +4,181 @@
 // See LICENSE for full terms.
 
 /**
- * Minimal CIDR matcher for IPv4 and IPv6.
+ * IP addresses and CIDR blocks, CANONICAL at the boundary (PR-E; architect ruling 5dbd435b).
  *
- * Used by the HTTP transport to decide whether a direct socket peer is a
- * trusted reverse proxy (and therefore whether X-Forwarded-For should be
- * honored). Anything that mis-parses is treated as NOT a match — fail closed.
+ * The defect class (GHSA-jqcg-44mw-7w3h, proxy-addr < 2.0.8): an IPv4 address matched an IPv6 subnet
+ * that does not genuinely cover the IPv4-mapped range, so a trust list could trust every client.
+ * MEASURED here before this change: `::ffff:102:304` (1.2.3.4, the HEX spelling of a mapped address)
+ * was inside `::/0`, `::/1` and `::/80`, while the dotted spelling was not: the verdict depended on how
+ * the address was WRITTEN.
+ *
+ * So every address and every block is parsed ONCE into bytes and a family, and only bytes are compared:
+ *   - ANY spelling of an IPv4-mapped address (dotted, hex, compressed, expanded, any case) IS that IPv4
+ *     address, family 4.
+ *   - An IPv4 address is inside an IPv6 block ONLY when that block is a genuine mapped block,
+ *     ::ffff:0:0/96 or longer (it then IS an IPv4 block: prefix − 96). A shorter "mapped-looking" block
+ *     (::ffff:10.0.0.0/8) is an IPv6 block and never contains an IPv4 address.
+ *   - REJECTED, never guessed (null): a zone id (fe80::1%en0), the deprecated IPv4-COMPATIBLE range
+ *     ::/96 other than :: and ::1 (::a.b.c.d), and anything not fully consumed by the parse.
+ * A rejected input matches nothing. Each CONSUMER fails closed in its own direction: a trust list
+ * does not trust it; the SSRF classifier (ip-classifier.ts) blocks it.
+ *
+ * Node's net.BlockList is NOT used: MEASURED (node v24.13.0), it puts 1.2.3.4 inside
+ * ::ffff:10.0.0.0/8 (and ::/0, ::/1, ::/80), the exact class proxy-addr 2.0.8 fixed.
  */
-
 import net from "net";
 
-/**
- * Parse an IPv4 address into a single 32-bit integer.
- * Returns null on invalid input.
- */
-function ipv4ToInt(addr: string): number | null {
-  if (net.isIPv4(addr) !== true) return null;
-  const parts = addr.split(".").map((p) => parseInt(p, 10));
-  if (parts.length !== 4) return null;
-  return (
-    ((parts[0] << 24) >>> 0) +
-    ((parts[1] << 16) >>> 0) +
-    ((parts[2] << 8) >>> 0) +
-    (parts[3] >>> 0)
-  ) >>> 0;
+export interface CanonicalIp {
+  family: 4 | 6;
+  /** 4 bytes (family 4) or 16 bytes (family 6). */
+  bytes: Uint8Array;
+}
+export interface CanonicalCidr extends CanonicalIp {
+  /** 0–32 (family 4) or 0–128 (family 6). */
+  prefix: number;
 }
 
-/**
- * Expand an IPv6 address into its 128-bit representation as a BigInt.
- * Returns null on invalid input.
- */
-function ipv6ToBigInt(addr: string): bigint | null {
-  if (net.isIPv6(addr) !== true) return null;
-  // Strip any zone index (%eth0)
-  const clean = addr.split("%")[0];
-
-  let left: string[];
-  let right: string[];
-  if (clean.includes("::")) {
-    const [l, r] = clean.split("::");
-    left = l.length > 0 ? l.split(":") : [];
-    right = r.length > 0 ? r.split(":") : [];
-    const missing = 8 - (left.length + right.length);
-    if (missing < 0) return null;
-    left = [...left, ...Array(missing).fill("0"), ...right];
-  } else {
-    left = clean.split(":");
-    if (left.length !== 8) return null;
+/** 16 bytes of an IPv6 literal Node accepts (with or without an embedded dotted IPv4 tail), or null. */
+function ipv6Bytes(s: string): Uint8Array | null {
+  let text = s.toLowerCase();
+  let tail: number[] = [];
+  const lastColon = text.lastIndexOf(":");
+  if (text.includes(".")) {
+    const v4 = text.slice(lastColon + 1);
+    if (!net.isIPv4(v4)) return null;
+    tail = v4.split(".").map(Number);
+    text = text.slice(0, lastColon + 1) + "0:0"; // two placeholder groups, replaced below
   }
-
-  let result = 0n;
-  for (const group of left) {
-    if (!/^[0-9a-fA-F]{1,4}$/.test(group)) return null;
-    result = (result << 16n) | BigInt(parseInt(group, 16));
-  }
-  return result;
-}
-
-/**
- * Check whether an IP address (v4 or v6) falls within a CIDR block.
- * Supports: "192.168.1.0/24", "10.0.0.0/8", "fd00::/8", "::1/128", single-IP allowlist (no slash).
- */
-/**
- * If an IPv6 literal is the IPv4-mapped form (::ffff:0:0/96, RFC 4291 §2.5.5.2),
- * return the embedded IPv4 address. Handles all compression forms:
- *   - Textual dotted: ::ffff:1.2.3.4
- *   - Compressed hex: ::ffff:0102:0304
- *   - Fully-expanded: 0:0:0:0:0:ffff:0102:0304
- *   - Any intermediate: 0:0::ffff:0102:0304
- *
- * Returns null for IPv6 forms that are NOT IPv4-mapped, including:
- *   - IPv4-compatible ::1.2.3.4 (deprecated, RFC 4291 §2.5.5.1). Semantically
- *     different — this is a legacy transition mechanism, not the mapped form
- *     the OS returns for dual-stack IPv4 clients. Treating it as mapped would
- *     wrongly grant IPv4 CIDR trust to pure IPv6 callers.
- *   - NAT64 64:ff9b::1.2.3.4 (RFC 6052). Also a transition mechanism with
- *     different semantics; do not treat as IPv4.
- *
- * This is how the OS surfaces IPv4 connections on dual-stack sockets, so
- * matching against IPv4 CIDR rules must account for it.
- */
-function ipv4FromMappedIPv6(addr: string): string | null {
-  if (!net.isIPv6(addr)) return null;
-  const clean = addr.toLowerCase().split("%")[0];
-
-  // Mixed-dotted form path: address contains a dot. Split off the IPv4 tail
-  // and verify the IPv6 prefix is exactly the all-zero + ffff structure.
-  if (clean.includes(".")) {
-    // Find the last colon — everything after it should be the dotted IPv4.
-    const lastColon = clean.lastIndexOf(":");
-    if (lastColon < 0) return null;
-    const ipv4Part = clean.slice(lastColon + 1);
-    const ipv6Prefix = clean.slice(0, lastColon); // does NOT include the trailing colon
-
-    if (!net.isIPv4(ipv4Part)) return null;
-
-    // The prefix must end with 'ffff' as the 6th hex group (positions 0..5 are zeros).
-    // Accepted forms for the prefix:
-    //   "::ffff"                               compressed all-zero prefix + ffff
-    //   "0:0:0:0:0:ffff"                       fully expanded
-    //   "0:0::ffff"                            partial compression
-    //   intermediate zero-padded variants
-    if (!isAllZeroPlusFfffPrefix(ipv6Prefix)) return null;
-    return ipv4Part;
-  }
-
-  // All-hex form: expand fully to 8 groups and check the structural pattern.
-  const groups = expandIPv6ToGroups(clean);
-  if (!groups) return null;
-  // IPv4-mapped pattern: [0, 0, 0, 0, 0, 0xffff, hi, lo]
-  if (
-    groups[0] === 0 && groups[1] === 0 && groups[2] === 0 &&
-    groups[3] === 0 && groups[4] === 0 && groups[5] === 0xffff
-  ) {
-    const hi = groups[6];
-    const lo = groups[7];
-    const ipv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
-    if (net.isIPv4(ipv4)) return ipv4;
-  }
-  return null;
-}
-
-/**
- * Verify a hex-only IPv6 prefix string (the part BEFORE the dotted IPv4) is
- * structurally equivalent to "0:0:0:0:0:ffff" — the 96-bit IPv4-mapped prefix.
- * Accepts compression and full-expansion forms.
- */
-function isAllZeroPlusFfffPrefix(prefix: string): boolean {
-  if (prefix.length === 0) return false; // can't be empty when followed by IPv4
-
-  // Synthesize a fake all-hex IPv6 address by appending ":0:0" so we can reuse
-  // the standard 8-group expander, then check that the first 6 groups are
-  // [0,0,0,0,0,0xffff] (the trailing two groups are placeholder).
-  const padded = prefix + ":0:0";
-  const groups = expandIPv6ToGroups(padded);
-  if (!groups) return false;
-  return (
-    groups[0] === 0 && groups[1] === 0 && groups[2] === 0 &&
-    groups[3] === 0 && groups[4] === 0 && groups[5] === 0xffff
-  );
-}
-
-/**
- * Expand an IPv6 address (possibly containing :: compression) to an array of
- * 8 16-bit integers. Returns null if the address is malformed or contains
- * mixed-dotted form (which must be handled separately before this).
- */
-function expandIPv6ToGroups(addr: string): number[] | null {
-  if (addr.includes(".")) return null; // mixed-dotted handled separately
-  let left: string[];
-  let right: string[];
-  if (addr.includes("::")) {
-    const [l, r] = addr.split("::");
-    left = l.length > 0 ? l.split(":") : [];
-    right = r.length > 0 ? r.split(":") : [];
-    const missing = 8 - (left.length + right.length);
-    if (missing < 0) return null;
-    left = [...left, ...Array(missing).fill("0"), ...right];
-  } else {
-    left = addr.split(":");
-    if (left.length !== 8) return null;
-  }
-  const out: number[] = [];
-  for (const g of left) {
-    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
-    out.push(parseInt(g, 16));
-  }
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const groups = (h: string) => (h === "" ? [] : h.split(":"));
+  const head = groups(halves[0]);
+  const rest = halves.length === 2 ? groups(halves[1]) : [];
+  const fill = halves.length === 2 ? 8 - head.length - rest.length : 0;
+  if (fill < 0 || (halves.length === 1 && head.length !== 8)) return null;
+  const all = [...head, ...Array(fill).fill("0"), ...rest];
+  if (all.length !== 8 || !all.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  const out = new Uint8Array(16);
+  all.forEach((g, i) => {
+    const v = parseInt(g, 16);
+    out[i * 2] = v >> 8;
+    out[i * 2 + 1] = v & 0xff;
+  });
+  if (tail.length) out.set(tail, 12);
   return out;
 }
 
+const isMapped = (b: Uint8Array) => b.slice(0, 10).every((x) => x === 0) && b[10] === 0xff && b[11] === 0xff;
+/** ::/96 other than :: and ::1: the deprecated IPv4-compatible form. Ambiguous, so rejected. */
+const isCompatible = (b: Uint8Array) =>
+  b.slice(0, 12).every((x) => x === 0) && !(b[12] === 0 && b[13] === 0 && b[14] === 0 && (b[15] === 0 || b[15] === 1));
 
-export function ipInCidr(ip: string, cidr: string): boolean {
-  // Trim both inputs symmetrically (v1.7 gate fix — previously only CIDR was trimmed,
-  // so `ipInCidr("1.2.3.4 ", "1.2.3.0/24")` with a trailing space returned false).
-  // Then strip any zone index or brackets from the IP.
-  const cleanIp = ip.trim().replace(/^\[|\]$/g, "").split("%")[0];
-  const cleanCidr = cidr.trim();
-  if (!cleanCidr) return false;
-
-  const slashIdx = cleanCidr.indexOf("/");
-  const rangeAddr = slashIdx >= 0 ? cleanCidr.slice(0, slashIdx) : cleanCidr;
-  const rangePrefixStr = slashIdx >= 0 ? cleanCidr.slice(slashIdx + 1) : null;
-
-  // --- IPv4-mapped IPv6 normalization (v1.6.3) ---
-  // Handle the cross-family cases where an operator wrote a rule in one
-  // family and a client connected using the mapped form of the other.
-  // Both sides can be in the mapped form, so we normalize symmetrically.
-  const mappedIp = ipv4FromMappedIPv6(cleanIp);
-  const mappedRange = ipv4FromMappedIPv6(rangeAddr);
-
-  // Client arrived as ::ffff:1.2.3.4, operator wrote an IPv4 rule — compare as IPv4
-  if (mappedIp && net.isIPv4(rangeAddr)) {
-    return ipInCidr(mappedIp, cleanCidr);
-  }
-  // Client is IPv4, operator wrote ::ffff:1.2.3.0/120 — extract and compare as IPv4
-  // A /120 on the mapped block corresponds to /24 on the embedded IPv4 (128 - 120 = 8 host bits).
-  if (net.isIPv4(cleanIp) && mappedRange && rangePrefixStr !== null) {
-    const v6Prefix = parseInt(rangePrefixStr, 10);
-    if (isNaN(v6Prefix) || v6Prefix < 96 || v6Prefix > 128) return false; // out of mapped range
-    const v4Prefix = v6Prefix - 96;
-    return ipInCidr(cleanIp, `${mappedRange}/${v4Prefix}`);
-  }
-  // Both are mapped — normalize both to IPv4 and compare
-  if (mappedIp && mappedRange) {
-    const v6Prefix = rangePrefixStr === null ? 128 : parseInt(rangePrefixStr, 10);
-    if (isNaN(v6Prefix) || v6Prefix < 96 || v6Prefix > 128) return false;
-    const v4Prefix = v6Prefix - 96;
-    return ipInCidr(mappedIp, `${mappedRange}/${v4Prefix}`);
-  }
-
-  // IPv4 path
-  if (net.isIPv4(cleanIp) && net.isIPv4(rangeAddr)) {
-    const ipInt = ipv4ToInt(cleanIp);
-    const rangeInt = ipv4ToInt(rangeAddr);
-    if (ipInt === null || rangeInt === null) return false;
-    const prefix = rangePrefixStr === null ? 32 : parseInt(rangePrefixStr, 10);
-    if (isNaN(prefix) || prefix < 0 || prefix > 32) return false;
-    if (prefix === 0) return true;
-    const mask = (0xffffffff << (32 - prefix)) >>> 0;
-    return (ipInt & mask) === (rangeInt & mask);
-  }
-
-  // IPv6 path
-  if (net.isIPv6(cleanIp) && net.isIPv6(rangeAddr)) {
-    const ipBig = ipv6ToBigInt(cleanIp);
-    const rangeBig = ipv6ToBigInt(rangeAddr);
-    if (ipBig === null || rangeBig === null) return false;
-    const prefix = rangePrefixStr === null ? 128 : parseInt(rangePrefixStr, 10);
-    if (isNaN(prefix) || prefix < 0 || prefix > 128) return false;
-    if (prefix === 0) return true;
-    const mask = ((1n << BigInt(prefix)) - 1n) << BigInt(128 - prefix);
-    return (ipBig & mask) === (rangeBig & mask);
-  }
-
-  // Cross-family comparisons (excluding the mapped-form cases above) never match
-  return false;
+/** The 4 or 16 raw bytes an address literal spells (no mapping applied), or null. */
+function rawBytes(input: string): { v4: boolean; bytes: Uint8Array } | null {
+  let s = input.trim();
+  if (s.startsWith("[") && s.endsWith("]")) s = s.slice(1, -1);
+  if (s.includes("%")) return null; // a zone id: never guessed
+  if (net.isIPv4(s)) return { v4: true, bytes: Uint8Array.from(s.split(".").map(Number)) };
+  if (!net.isIPv6(s)) return null;
+  const b = ipv6Bytes(s);
+  return b ? { v4: false, bytes: b } : null;
 }
 
+/** Parse ONE address, any spelling, to its canonical bytes and family; null when rejected. */
+export function canonicalIp(input: string): CanonicalIp | null {
+  const r = rawBytes(input);
+  if (!r) return null;
+  if (r.v4) return { family: 4, bytes: r.bytes };
+  if (isMapped(r.bytes)) return { family: 4, bytes: r.bytes.slice(12) };
+  if (isCompatible(r.bytes)) return null;
+  return { family: 6, bytes: r.bytes };
+}
+
+/** Parse ONE block ("addr" or "addr/prefix"), any spelling; null when rejected. */
+export function canonicalCidr(input: string): CanonicalCidr | null {
+  const s = input.trim();
+  if (!s) return null;
+  const slash = s.indexOf("/");
+  const addr = slash >= 0 ? s.slice(0, slash) : s;
+  const pre = slash >= 0 ? s.slice(slash + 1) : null;
+  if (pre !== null && !/^\d{1,3}$/.test(pre)) return null;
+  const r = rawBytes(addr);
+  if (!r) return null;
+  if (r.v4) {
+    const prefix = pre === null ? 32 : Number(pre);
+    return prefix > 32 ? null : { family: 4, bytes: r.bytes, prefix };
+  }
+  const prefix = pre === null ? 128 : Number(pre);
+  if (prefix > 128) return null;
+  // A GENUINE mapped block (it covers the ::ffff marker) IS an IPv4 block.
+  if (isMapped(r.bytes) && prefix >= 96) return { family: 4, bytes: r.bytes.slice(12), prefix: prefix - 96 };
+  if (isCompatible(r.bytes)) return null;
+  return { family: 6, bytes: r.bytes, prefix };
+}
+
+/** Is `ip` inside `block`? Bytes only; the families must be equal. */
+export function cidrContains(block: CanonicalCidr, ip: CanonicalIp): boolean {
+  if (block.family !== ip.family) return false;
+  let bits = block.prefix;
+  for (let i = 0; bits > 0; i++, bits -= 8) {
+    const mask = bits >= 8 ? 0xff : (0xff << (8 - bits)) & 0xff;
+    if ((block.bytes[i] & mask) !== (ip.bytes[i] & mask)) return false;
+  }
+  return true;
+}
+
+/** The ONE text form of a canonical address: dotted IPv4, or RFC 5952 compressed lowercase IPv6. */
+export function formatIp(ip: CanonicalIp): string {
+  if (ip.family === 4) return Array.from(ip.bytes).join(".");
+  const g = Array.from({ length: 8 }, (_, i) => (ip.bytes[i * 2] << 8) | ip.bytes[i * 2 + 1]);
+  let best = -1;
+  let bestLen = 1; // RFC 5952: never compress a single zero group
+  for (let i = 0; i < 8; ) {
+    if (g[i] !== 0) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < 8 && g[j] === 0) j++;
+    if (j - i > bestLen) {
+      best = i;
+      bestLen = j - i;
+    }
+    i = j;
+  }
+  const hex = g.map((x) => x.toString(16));
+  if (best < 0) return hex.join(":");
+  return `${hex.slice(0, best).join(":")}::${hex.slice(best + bestLen).join(":")}`;
+}
+
+/** Is `ip` inside `cidr`? false when either is rejected (a consumer that must fail CLOSED checks canonicalIp itself). */
+export function ipInCidr(ip: string, cidr: string): boolean {
+  const a = canonicalIp(ip);
+  const b = canonicalCidr(cidr);
+  return !!a && !!b && cidrContains(b, a);
+}
+
+const LOOPBACK_BLOCKS: readonly CanonicalCidr[] = [canonicalCidr("127.0.0.0/8")!, canonicalCidr("::1/128")!];
+
 /**
- * Given an IP and a list of CIDR blocks, return true if the IP is in ANY block.
- * Malformed CIDR entries are skipped silently (logged by the caller if desired).
+ * Is a SOCKET PEER address loopback (127.0.0.0/8 or ::1), however it is written? The ONE predicate for
+ * every surface that lets a loopback peer in without a credential: the HTTP dashboard gate and the
+ * dashboard WebSocket gate (ADR-0015 L4). Canonical first, so ::ffff:127.0.0.1 and its hex spelling
+ * ::ffff:7f00:1 are 127.0.0.1. Anything the parser rejects, and anything that is not an address (a
+ * hostname such as "localhost", an absent peer), is NOT loopback: the gate fails closed.
  */
+export function isLoopbackPeer(raw: string | null | undefined): boolean {
+  const ip = typeof raw === "string" ? canonicalIp(raw) : null;
+  return !!ip && LOOPBACK_BLOCKS.some((b) => cidrContains(b, ip));
+}
+
+/** Is `ip` inside ANY of `cidrs`? Rejected blocks are skipped. */
 export function ipInAnyCidr(ip: string, cidrs: string[]): boolean {
-  for (const cidr of cidrs) {
-    if (ipInCidr(ip, cidr)) return true;
+  const a = canonicalIp(ip);
+  if (!a) return false;
+  for (const c of cidrs) {
+    const b = canonicalCidr(c);
+    if (b && cidrContains(b, a)) return true;
   }
   return false;
 }
