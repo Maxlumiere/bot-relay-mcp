@@ -32,6 +32,10 @@
  *                             the canonical pending set, no window (F1,
  *                             ADR-0045). Exit 1 when it cannot answer — never a
  *                             silent "no mail".
+ *   relay doorbell status     Is the doorbell job alive (healthy / stale /
+ *                             not-installed / disabled), on which build, in
+ *                             what condition, with which OPEN escalations
+ *                             (metadata only). Read-only. --json, --hook.
  *   relay mint-token NAME     Mint an agent token directly via filesystem access
  *                             (v2.6.0). For external CLI agents whose safety
  *                             monitors block register_agent → use-token in one
@@ -75,6 +79,7 @@ const SUBCOMMANDS = {
   bind: "../dist/cli/bind.js",
   fleet: "../dist/cli/fleet.js",
   pending: "../dist/cli/pending.js",
+  doorbell: "../dist/cli/doorbell.js",
   where: "../dist/cli/where.js",
   "deploy-gate": "../dist/cli/deploy-gate.js",
   "release-binding": "../dist/cli/release-binding.js",
@@ -124,6 +129,7 @@ function printHelp(requested) {
       "  bind             Record THIS window's identity binding from the hook payload on stdin (ADR-0036 S1).\n" +
       "  fleet            List every recorded window binding, with liveness derived from the anchor.\n" +
       "  pending AGENT    What is pending for AGENT (metadata only, read-only, no window: the canonical pending set).\n" +
+      "  doorbell status  Is the doorbell job alive, on which build, in what condition, with which open escalations (read-only).\n" +
       "  where            Which relay DB this environment resolves to (read-only; --env-keys lists what it reads).\n" +
       "  deploy-gate      Before restarting the daemon onto a new build: prove the new resolver names the DB it holds open.\n" +
       "  release-binding NAME  Clear a STALE binding (refuses on a live anchor) so the next launch re-binds; preserves identity.\n" +

@@ -172,7 +172,7 @@ const nullOr = <T>(v: unknown, ok: (x: unknown) => x is T): boolean => v === nul
 const HEX64 = /^[0-9a-f]{64}$/;
 
 /** #300 R1 #7: the header's nested objects are CLOSED too: exact keys, typed and bounded values. */
-function buildFault(b: unknown): string | null {
+export function buildFault(b: unknown): string | null {
   if (!sameKeys(b, ["build_id", "commit", "dirty", "built_at", "deps_id", "deps_state", "node"])) {
     return "build has exactly build_id, commit, dirty, built_at, deps_id, deps_state, node";
   }
@@ -185,7 +185,7 @@ function buildFault(b: unknown): string | null {
   if (typeof b.node !== "string" || !/^v\d{1,4}\.\d{1,4}\.\d{1,4}([-+][0-9A-Za-z.]{1,24})?$/.test(b.node)) return "build.node is not a bounded node version";
   return null;
 }
-function resolutionFault(r: unknown): string | null {
+export function resolutionFault(r: unknown): string | null {
   const kind = (r as { kind?: unknown } | null)?.kind;
   const base = ["kind", "db_path", "exists", "containment"];
   const keys =
@@ -387,7 +387,7 @@ function verifyDir(h: LogHandle, what: string): void {
 }
 
 /** The state dir must be a REAL directory (not a symlink), private (0700). */
-function ensurePrivateDir(dir: string): fs.Stats {
+export function ensurePrivateDir(dir: string): fs.Stats {
   let st: fs.Stats | null = null;
   try {
     st = fs.lstatSync(dir);
@@ -415,7 +415,7 @@ export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogH
   const dirSt = ensurePrivateDir(stateDir);
   // A compaction that crashed before its rename left only its temp file: the log itself is
   // intact, so the temp is discarded (unlink removes a planted symlink itself, never its target).
-  for (const name of fs.readdirSync(stateDir)) if (name.startsWith(COMPACT_PREFIX)) fs.unlinkSync(path.join(stateDir, name));
+  for (const name of fs.readdirSync(stateDir)) if (name.startsWith(COMPACT_PREFIX) || name.startsWith(STATE_FILE_TMP_PREFIX)) fs.unlinkSync(path.join(stateDir, name));
   const logPath = path.join(stateDir, LOG_FILENAME);
   let pre: fs.Stats | null = null;
   try {
@@ -463,6 +463,12 @@ export function closeLog(h: LogHandle): void {
 export class LogWriteError extends Error {}
 
 /**
+ * The writer REFUSED a planned record (it fails the closed schema). Nothing was written; the
+ * cycle fails, and the heartbeat records it as kind `record-refused` (ruling 9987c113 Q5).
+ */
+export class RecordRefusedError extends Error {}
+
+/**
  * WRITE-AHEAD append through the held descriptor: validate, write the WHOLE line (a short
  * write is continued, no progress is an error), check the file grew by exactly that many
  * bytes, fsync, and only then return (#300 R1 #3). The caller advances its memory only
@@ -471,7 +477,7 @@ export class LogWriteError extends Error {}
  */
 export function appendRecord(h: LogHandle, rec: LogRecord): void {
   const fault = recordFault(rec);
-  if (fault) throw new Error(`refusing to log an invalid doorbell record: ${fault}`);
+  if (fault) throw new RecordRefusedError(`refusing to log an invalid doorbell record: ${fault}`);
   const buf = Buffer.from(JSON.stringify(rec) + "\n", "utf-8");
   try {
     const before = h.io.fstatSync(h.fd).size;
@@ -573,6 +579,50 @@ export function readRungMemory(logPath: string): { rung: Set<string>; tornTail: 
 // ---------------------------------------------------------------------------
 
 const COMPACT_PREFIX = ".actuation.jsonl.compact-";
+/** Temp files of replaceStateFile (a crash before the rename leaves one; the next open discards it). */
+const STATE_FILE_TMP_PREFIX = ".state-file.tmp-";
+
+/**
+ * Replace ONE small file in the VERIFIED state dir, crash-safe and atomic (the heartbeat): a new
+ * no-follow, exclusive, 0600 temp is written in full and fsynced, the dir is re-verified, the temp
+ * is renamed over the target, and the HELD dir is fsynced. A reader sees the old file or the new
+ * one, never a torn one. Any step that does not complete throws (the caller decides; the temp is
+ * removed when the rename did not happen).
+ */
+export function replaceStateFile(h: LogHandle, filename: string, contents: string): void {
+  if (filename.includes("/") || filename.startsWith(".")) throw new Error(`not a state file name: ${filename}`);
+  const stateDir = path.dirname(h.path);
+  const tmp = path.join(stateDir, `${STATE_FILE_TMP_PREFIX}${filename}.${process.pid}`);
+  const buf = Buffer.from(contents, "utf-8");
+  let renamed = false;
+  try {
+    verifyDir(h, `before the ${filename} temp file was created`);
+    const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+    try {
+      let off = 0;
+      while (off < buf.length) {
+        const n = h.io.writeSync(fd, buf, off, buf.length - off);
+        if (!(n > 0)) throw new Error(`a ${filename} write made no progress at byte ${off} of ${buf.length}`);
+        off += n;
+      }
+      h.io.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    verifyDir(h, `before the ${filename} rename`);
+    fs.renameSync(tmp, path.join(stateDir, filename));
+    renamed = true;
+    h.io.fsyncSync(h.dirFd);
+  } finally {
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* the temp may not exist; the next open discards any left over */
+      }
+    }
+  }
+}
 /** Headers kept by a compaction: the most recent ones (provenance of recent runs). */
 export const COMPACT_KEEP_HEADERS = 5;
 /** Clock records kept by a compaction (#301 Codex R2 #2): the most recent, for audit; never unbounded. */

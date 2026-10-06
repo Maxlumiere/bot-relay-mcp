@@ -118,7 +118,14 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
    * spelling: import(), from, require(), createRequire's req()) appears ONLY in
    *   - src/sqlite-compat.ts  (the driver layer; openReadOnly re-checks privately),
    *   - src/db.ts             (initializeDb/getDb re-check assertStillContained),
-   *   - src/cli/_instance-db.ts (openRawRelayDb, the verbs' raw handle).
+   *   - src/cli/_instance-db.ts (openRawRelayDb, the verbs' raw handle),
+   * plus ONE named exception that never opens the relay DB:
+   *   - src/doorbell-lock.ts  (the doorbell's kernel-held instance lock: its OWN file,
+   *     `<state dir>/doorbell.lock.db`; pinned by the next test). Why: a kernel lock needs
+   *     a held driver connection, and this one never opens the relay DB, so the post-open
+   *     re-check has nothing to guard. Ruling ecf50062; exception accepted in c79321c9.
+   *     That the state dir is the RESOLVED instance's is pinned in
+   *     tests/doorbell-pr5-heartbeat.test.ts ("the lock lives in the RESOLVED instance's state dir").
    * Type declarations (.d.ts) are not code.
    */
   it("the SQLite driver is referenced in src/ ONLY by the three checked modules", () => {
@@ -137,6 +144,17 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
       }
     };
     walk(path.join(REPO_ROOT, "src"));
-    expect(hits.sort()).toEqual(["src/cli/_instance-db.ts", "src/db.ts", "src/sqlite-compat.ts"]);
+    expect(hits.sort()).toEqual(["src/cli/_instance-db.ts", "src/db.ts", "src/doorbell-lock.ts", "src/sqlite-compat.ts"]);
+  });
+
+  it("the doorbell-lock exception opens exactly ONE driver handle, on its own lock file (never the relay DB)", () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "src", "doorbell-lock.ts"), "utf-8");
+    // Exactly one construction, and its path argument is the lock path...
+    expect(src.match(/\bnew\s+Database\s*\(/g) ?? []).toHaveLength(1);
+    expect(src).toMatch(/\bnew\s+Database\s*\(\s*lockPath\s*,/);
+    // ...which is bound once, to the lock filename inside the doorbell state dir.
+    expect(src.match(/\blockPath\s*=/g) ?? []).toHaveLength(1);
+    expect(src).toMatch(/\bconst\s+lockPath\s*=\s*path\.join\(\s*stateDir\s*,\s*LOCK_DB_FILENAME\s*\)/);
+    expect(src).toMatch(/\bexport\s+const\s+LOCK_DB_FILENAME\s*=\s*"doorbell\.lock\.db"/);
   });
 });
