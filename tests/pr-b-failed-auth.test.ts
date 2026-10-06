@@ -21,7 +21,6 @@ import path from "path";
 import type { Server as HttpServer } from "http";
 import { monitorEventLoopDelay } from "perf_hooks";
 import { Worker } from "worker_threads";
-import bcrypt from "bcryptjs";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-b-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -370,20 +369,27 @@ describe("BARS: a burst of failed auths keeps the loop under 50 ms and /health w
     });
   }, 60_000);
 
-  it("NEGATIVE CONTROL: the same burst plus ONE bcrypt compare ON the loop trips BOTH bars, LOOP and AVAILABILITY (each instrument discriminates on this runner)", async () => {
-    reg("victim2");
-    const hash = db.getAgentAuthData("victim2")!.token_hash!;
+  it("NEGATIVE CONTROL: the same burst plus a loop block sized to the THRESHOLD trips BOTH bars, LOOP and AVAILABILITY, by the same predicates barHolds asserts", async () => {
+    // Architect 47e64b3a: the fault is sized against the bars' thresholds in THIS run, not against bcrypt's
+    // real cost, so it trips on any runner. That a bcrypt on the loop EXISTS is the COUNT assertion's job.
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       await measure(port, controlLoad(20)); // the same warm-up as every bar
-      const control = await measure(port, controlLoad(20));
-      // the regression PR-B removed: one bcrypt compare on the daemon's event loop, during the same burst
-      const r = await measure(port, authLoad(20, "discover_agents", {}), () => void bcrypt.compareSync(randomToken(), hash));
-      console.log(`BAR negative-control | ${fmt(r)} | control ${fmt(control)}`);
-      expect([r.shed, control.shed], "the negative control's bursts reached the daemon").toEqual([0, 0]);
-      // BOTH bars must see it, each by its own instrument: the same assertions barHolds makes, inverted.
-      expect(r.eldMax, "one on-loop bcrypt compare must exceed the LOOP bar, or the bar cannot see the harm").toBeGreaterThanOrEqual(LOOP_MAX_MS);
-      expect(r.healthMax, "one on-loop bcrypt compare must exceed the AVAILABILITY bar (control + margin)").toBeGreaterThan(control.healthMax + AVAILABILITY_MARGIN_MS);
+      const before = await measure(port, controlLoad(20));
+      const blockMs = 2 * Math.max(LOOP_MAX_MS, before.healthMax + AVAILABILITY_MARGIN_MS);
+      const r = await measure(port, authLoad(20, "discover_agents", {}), () => {
+        const end = performance.now() + blockMs; // block the DAEMON's loop: what an on-loop bcrypt (or a scan of them) does
+        while (performance.now() < end) {
+          /* busy */
+        }
+      });
+      const after = await measure(port, controlLoad(20));
+      const controlMax = Math.max(before.healthMax, after.healthMax);
+      console.log(`BAR negative-control | block=${blockMs.toFixed(1)}ms | ${fmt(r)} | control-before ${fmt(before)} | control-after ${fmt(after)}`);
+      expect([r.shed, before.shed, after.shed], "the negative control's bursts reached the daemon").toEqual([0, 0, 0]);
+      // The bars' own predicates, inverted: each must FAIL here, or it cannot see the harm.
+      expect(r.eldMax, "a loop block must exceed the LOOP bar").toBeGreaterThanOrEqual(LOOP_MAX_MS);
+      expect(r.healthMax, `a loop block must exceed the AVAILABILITY bar: control max ${controlMax.toFixed(1)} + ${AVAILABILITY_MARGIN_MS}`).toBeGreaterThan(controlMax + AVAILABILITY_MARGIN_MS);
     });
   }, 60_000);
 });
