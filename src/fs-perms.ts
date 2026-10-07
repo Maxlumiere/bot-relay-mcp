@@ -98,6 +98,22 @@ export const FORBIDDEN_SIDS: Readonly<Record<string, string>> = Object.freeze({
 
 /** SYSTEM: tolerated on a private path, never granted by the relay. */
 export const SYSTEM_SID = "S-1-5-18";
+/** BUILTIN\Administrators: tolerated as an OWNER only (an elevated shell's default owner), never as an ACE. */
+export const ADMINISTRATORS_SID = "S-1-5-32-544";
+
+/**
+ * An INFO note for an element owned by BUILTIN\Administrators (accepted, created from an elevated shell): the
+ * recommended fix. null otherwise, and on every read failure (the fault path reports those). Windows only.
+ */
+export function windowsOwnerInfo(path: string): string | null {
+  try {
+    return windowsOwner(path) === ADMINISTRATORS_SID
+      ? `${path} is owned by Administrators (created from an elevated shell); recommended: icacls "${path}" /setowner "%USERNAME%"`
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 let currentUserSid: string | null | undefined;
 /** The current user's SID (whoami /user), or null when it cannot be read. Windows only; cached. */
@@ -210,14 +226,76 @@ export function sddlAllowSids(sddl: string): string[] {
       i = close + 1;
     }
   }
+  // ACE TYPES ARE AN ALLOWLIST (Codex R2 #2): the allow types, callback ones included (A, OA, XA, ZA), are read;
+  // the deny types are not access grants; ANY other type is unknown and returned as a sentinel that never equals an
+  // owner's SID, so the caller fails CLOSED on it (an ACE the parser does not understand is foreign until proven not).
   const out: string[] = [];
   for (const ace of aces) {
     const f = ace.split(";");
-    if (f.length < 6 || (f[0] !== "A" && f[0] !== "OA")) continue;
+    if (f.length < 6) {
+      out.push(`UNPARSED-ACE(${ace})`);
+      continue;
+    }
+    if (DENY_ACE_TYPES.has(f[0])) continue;
+    if (!ALLOW_ACE_TYPES.has(f[0])) {
+      out.push(`UNKNOWN-ACE-TYPE(${f[0]})`);
+      continue;
+    }
     const sid = f[5];
     out.push(SDDL_ALIASES[sid] ?? sid);
   }
   return out;
+}
+
+const ALLOW_ACE_TYPES: ReadonlySet<string> = new Set(["A", "OA", "XA", "ZA"]);
+const DENY_ACE_TYPES: ReadonlySet<string> = new Set(["D", "OD", "XD", "ZD"]);
+
+/** The OWNER token of an SDDL owner string ("O:BA", "O:S-1-5-…"), aliases mapped to SIDs; null when absent. */
+export function sddlOwner(sddl: string): string | null {
+  const m = /O:([A-Z]{2}|S-1-[0-9-]+)/.exec(sddl.replace(/\s+/g, ""));
+  return m ? (SDDL_ALIASES[m[1]] ?? m[1]) : null;
+}
+
+/**
+ * The security-descriptor OWNER of `path` (Windows only), as a SID or an unmapped alias. Read with PURE .NET from
+ * Windows PowerShell (no module: MEASURED, Get-Acl's module would not load when launched from Node). icacls cannot
+ * print the owner, and its /save output is the DACL only. Throws when it cannot be read (a check that cannot read
+ * must not pass).
+ */
+export function windowsOwner(path: string): string {
+  const script =
+    "$ErrorActionPreference='Stop';" +
+    "$s=[System.Security.AccessControl.FileSecurity]::new($env:RELAY_OWNER_PATH,[System.Security.AccessControl.AccessControlSections]::Owner);" +
+    "[Console]::Out.WriteLine($s.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Owner))";
+  const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf-8",
+    windowsHide: true,
+    env: { ...process.env, RELAY_OWNER_PATH: path },
+  });
+  const owner = r.status === 0 ? sddlOwner(r.stdout ?? "") : null;
+  if (!owner) throw new Error(`the owner of "${path}" could not be read (powershell exit ${r.status}): ${(r.stderr || r.stdout || "").trim().slice(0, 200)}`);
+  return owner;
+}
+
+/**
+ * Why `path`'s OWNER is not acceptable (Windows only), or null. Accepted owners (architect, Codex R2 #1 as refined):
+ * the current user (its SID, or the spelling icacls uses for it), SYSTEM, and BUILTIN\Administrators. The last two
+ * are tolerated for the same reason: a local admin can take ownership of and read anything anyway, so such an owner
+ * grants no capability that principal lacks (out of scope, like root). Any OTHER owner (another user, a domain
+ * group, an unknown SID) is a fault naming the owner and the exact fix; ownership is NEVER taken automatically.
+ * The DACL allowlist is separate and unchanged: an ACE granting Administrators is still removed or refused.
+ */
+export function windowsOwnerFault(path: string): string | null {
+  const user = windowsUserSid();
+  if (!user) return `${path}: the current user's SID could not be read`;
+  let owner: string;
+  try {
+    owner = windowsOwner(path);
+  } catch (err) {
+    return `${path}: ${(err as Error).message}`;
+  }
+  if (owner === user || owner === windowsOwnerSddlToken() || owner === SYSTEM_SID || owner === ADMINISTRATORS_SID) return null;
+  return `${path}: owned by ${describeSid(owner)}, not by this user or SYSTEM; fix it with: icacls "${path}" /setowner "%USERNAME%"`;
 }
 
 /**
@@ -307,7 +385,8 @@ export function privacyFaults(path: string, maxMode: number): string[] {
     } catch (err) {
       return [`${path}: ${(err as Error).message}`];
     }
-    return sids.map((s) => `${path}: an allow ACE for ${describeSid(s)} is not the owner's`);
+    const ownerFault = windowsOwnerFault(path);
+    return [...sids.map((s) => `${path}: an allow ACE for ${describeSid(s)} is not the owner's`), ...(ownerFault ? [ownerFault] : [])];
   }
   let mode: number;
   try {

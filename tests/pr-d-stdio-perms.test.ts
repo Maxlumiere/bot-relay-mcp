@@ -62,6 +62,17 @@ describe("the relay's private files are private to their owner (Q6, on every OS)
   });
 });
 
+describe("the SDDL OWNER reader (Codex R2 #1; unit-tested on every OS)", () => {
+  it("reads the owner token from an owner SDDL, aliases mapped to SIDs; null when there is none", async () => {
+    const { sddlOwner } = await import("../src/fs-perms.js");
+    expect(sddlOwner("O:S-1-5-21-1-2-3-1001")).toBe("S-1-5-21-1-2-3-1001");
+    expect(sddlOwner("O:BA")).toBe("S-1-5-32-544");
+    expect(sddlOwner("O:SYG:SYD:(A;;FA;;;SY)")).toBe("S-1-5-18");
+    expect(sddlOwner("O:LA")).toBe("LA"); // a domain-relative alias stays as written (compared to the probed spelling)
+    expect(sddlOwner("D:(A;;FA;;;SY)")).toBeNull();
+  });
+});
+
 describe("the SDDL reader (the Windows ACL check's parser, unit-tested on every OS)", () => {
   it("maps the forbidden aliases to their SIDs and keeps only ALLOW aces", async () => {
     const { sddlAllowSids } = await import("../src/fs-perms.js");
@@ -72,6 +83,14 @@ describe("the SDDL reader (the Windows ACL check's parser, unit-tested on every 
     expect(sddlAllowSids("D:(A;;FA;;;ZZ)")).toEqual(["ZZ"]);
     // Everyone, Users, Authenticated Users as aliases AND as raw SIDs
     expect(sddlAllowSids("D:(A;;FR;;;WD)(A;;FR;;;BU)(A;;FR;;;AU)(A;;FR;;;S-1-1-0)")).toEqual(["S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-1-0"]);
+    // Codex R2 #2: CALLBACK allow ACEs (XA, and the object form ZA) grant access too, so they count as allows
+    expect(sddlAllowSids("D:(XA;;FA;;;S-1-5-21-9)(ZA;;FA;;;WD)")).toEqual(["S-1-5-21-9", "S-1-1-0"]);
+    // and a callback DENY (XD) is still not an allow
+    expect(sddlAllowSids("D:(XD;;FA;;;WD)")).toEqual([]);
+    // ACE types are an ALLOWLIST: a type the parser does not know comes back as a sentinel that is never an owner, so
+    // the chain refuses it (fail closed); a malformed ACE likewise
+    expect(sddlAllowSids("D:(QQ;;FA;;;S-1-5-21-9)")).toEqual(["UNKNOWN-ACE-TYPE(QQ)"]);
+    expect(sddlAllowSids("D:(A;;FA)")).toEqual(["UNPARSED-ACE(A;;FA)"]);
     // a DENY ace for Everyone is not an allow; a SACL part after the DACL is ignored
     expect(sddlAllowSids("O:BAG:SYD:(D;;FA;;;WD)(A;;FA;;;S-1-5-21-9)S:(AU;SA;FA;;;WD)")).toEqual(["S-1-5-21-9"]);
   });
@@ -165,6 +184,34 @@ describe("the registration secret's chain fails CLOSED when any element is not p
       const fsPerms = await import("../src/fs-perms.js");
       const token = fsPerms.windowsOwnerSddlToken();
       expect(token, `owner probe: ${fsPerms.windowsOwnerProbeNote}`).not.toBeNull();
+    });
+
+    it("Windows OWNER: this user, SYSTEM or Administrators (with an INFO fix line) are accepted; ANY other owner → refused with the exact fix command", async () => {
+      const { readMintSecret, mintSecretChainInfo } = await import("../src/mint-secret.js");
+      const { windowsUserSid } = await import("../src/fs-perms.js");
+      const user = windowsUserSid()!;
+      const inst = fresh();
+      const dir = mintSecretDir(inst);
+      const setOwner = (sid: string) => spawnSync("icacls", [dir, "/setowner", `*${sid}`], { windowsHide: true, encoding: "utf-8" });
+      expect(setOwner(user).status, "the fixture can give the dir to this user").toBe(0);
+      expect(readMintSecret(inst), "owned by this user: read").not.toBeNull();
+      // (startsWith: the FILE's note also contains the dir's path, as a prefix of its own)
+      expect(mintSecretChainInfo(inst).filter((l) => l.startsWith(`${dir} is owned`)), "no INFO for a user-owned dir").toEqual([]);
+      try {
+        // Administrators (an elevated shell's default owner): ACCEPTED, with an INFO line naming the fix.
+        expect(setOwner("S-1-5-32-544").status).toBe(0);
+        expect(readMintSecret(inst), "owned by Administrators: accepted").not.toBeNull();
+        expect(mintSecretChainInfo(inst).join("\n")).toMatch(/secrets is owned by Administrators \(created from an elevated shell\); recommended: icacls ".*secrets" \/setowner "%USERNAME%"/);
+        // SYSTEM: accepted.
+        expect(setOwner("S-1-5-18").status).toBe(0);
+        expect(readMintSecret(inst), "owned by SYSTEM: accepted").not.toBeNull();
+        // ANY OTHER owner (here BUILTIN\Users, a group the owner rule does not trust): refused, with the fix.
+        const r = setOwner("S-1-5-32-545");
+        expect(r.status, `icacls /setowner Users: ${r.stderr || r.stdout}`).toBe(0);
+        expect(() => readMintSecret(inst)).toThrow(/owned by BUILTIN\\Users \(S-1-5-32-545\), not by this user or SYSTEM; fix it with: icacls ".*secrets" \/setowner "%USERNAME%"/);
+      } finally {
+        setOwner(user);
+      }
     });
 
     it("Windows: Administrators is NOT on the allowlist", async () => {

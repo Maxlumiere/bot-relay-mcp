@@ -206,8 +206,12 @@ describe("the daemon's start (Q4, Q5, Q8)", () => {
     const said: string[] = [];
     expect(prepareMintSecret(true, null, { info: (m) => said.push(m), warn: () => {}, error: () => {} })).toBe("secret");
     expect(prepareMintSecret(true, null, { info: (m) => said.push(m), warn: () => {}, error: () => {} })).toBe("secret");
-    expect(said).toHaveLength(1);
-    expect(said[0]).not.toContain(secretNow());
+    // The CREATION is announced once. Any other line is an owner INFO note (Windows: an element owned by
+    // Administrators, accepted, with the recommended /setowner fix; MEASURED on windows-2022, where an elevated
+    // runner owns what it creates), repeated at each start by design.
+    expect(said.filter((m) => /created the registration secret/.test(m))).toHaveLength(1);
+    expect(said.filter((m) => !/created the registration secret/.test(m)).every((m) => /is owned by Administrators \(created from an elevated shell\); recommended: icacls/.test(m))).toBe(true);
+    for (const m of said) expect(m).not.toContain(secretNow());
     if (process.platform !== "win32") {
       expect(fs.statSync(SECRETS).mode & 0o777).toBe(0o700);
       expect(fs.statSync(mintSecretPath(ROOT)).mode & 0o777).toBe(0o600);

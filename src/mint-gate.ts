@@ -20,7 +20,7 @@
  */
 import path from "path";
 import { getDbPath } from "./db.js";
-import { MintSecretError, ensureMintSecret, mintSecretMatches, readMintSecret } from "./mint-secret.js";
+import { MintSecretError, ensureMintSecret, mintSecretChainInfo, mintSecretMatches, readMintSecret } from "./mint-secret.js";
 
 /** The development escape hatch (Q5): open minting, announced loudly, refused on a non-loopback bind. */
 export const OPEN_MINT_ENV = "RELAY_ALLOW_OPEN_MINT";
@@ -119,6 +119,7 @@ export function prepareMintSecret(
         say.warn(`[mint] the legacy http_secret DIFFERS from the registration secret at ${r.path}: remote clients that send only http_secret cannot register new names. Make them one secret.`);
       }
     }
+    for (const note of mintSecretChainInfo(home)) say.info(`[mint] ${note}`);
     return "secret";
   } catch (err) {
     say.error(`[mint] the registration secret is UNAVAILABLE (${(err as Error).message}): every NEW-name registration over HTTP will be refused until it is fixed (run \`relay init\`). Existing agents are unaffected.`);

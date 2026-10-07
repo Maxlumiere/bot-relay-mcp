@@ -30,7 +30,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { restrictToOwnerWindows, windowsForeignAllowSids, windowsOwnerProbeNote } from "./fs-perms.js";
+import { restrictToOwnerWindows, windowsForeignAllowSids, windowsOwnerFault, windowsOwnerInfo, windowsOwnerProbeNote } from "./fs-perms.js";
 
 export const MINT_SECRET_DIR = "secrets";
 export const MINT_SECRET_FILE = "mint.secret";
@@ -91,6 +91,10 @@ function windowsFaults(p: string): string[] {
   } catch (err) {
     return [`${p}: ${(err as Error).message}`]; // a read failure is never cached
   }
+  // Codex R2 #1: the security-descriptor OWNER can rewrite the DACL at will, so it must be this user or SYSTEM.
+  const ownerFault = windowsOwnerFault(p);
+  if (ownerFault && /could not be read|could not be$/.test(ownerFault)) return [...faults, ownerFault]; // never cached
+  if (ownerFault) faults.push(ownerFault);
   if (windowsChainCache.size > 64) windowsChainCache.clear();
   windowsChainCache.set(key, faults);
   return faults;
@@ -115,6 +119,12 @@ export function mintSecretChainFaults(instanceDir: string, fileFd?: number): str
     if (f) faults.push(f);
   }
   return faults;
+}
+
+/** INFO notes for the chain (Windows: elements owned by Administrators, accepted; the recommended fix). [] elsewhere. */
+export function mintSecretChainInfo(instanceDir: string): string[] {
+  if (process.platform !== "win32") return [];
+  return [instanceDir, mintSecretDir(instanceDir), mintSecretPath(instanceDir)].map(windowsOwnerInfo).filter((x): x is string => x !== null);
 }
 
 export function mintSecretDir(instanceDir: string): string {

@@ -286,8 +286,9 @@ async function checkMintSecret(dbPath: string): Promise<CheckResult> {
   const home = path.dirname(dbPath);
   if (openMintAllowed()) return { name: "registration secret", status: "WARN", detail: `${OPEN_MINT_ENV}=1: new names need no secret (development only)` };
   try {
+    const info = (await import("../mint-secret.js")).mintSecretChainInfo(home);
     return readMintSecret(home) !== null
-      ? { name: "registration secret", status: "PASS", detail: `${mintSecretPath(home)} (private to this user)` }
+      ? { name: "registration secret", status: "PASS", detail: `${mintSecretPath(home)} (private to this user)${info.length ? `; INFO: ${info.join("; INFO: ")}` : ""}` }
       : // Absent on a fresh install is expected (like relay.db): the daemon creates it at start. A daemon that is
         // UP without one is reported by its own /health (mint: unavailable) and by `relay fleet --deploy-check`.
         { name: "registration secret", status: "WARN", detail: `not present at ${mintSecretPath(home)} (created when the daemon starts, or by \`relay init\`; until then every new agent name over HTTP is refused)` };

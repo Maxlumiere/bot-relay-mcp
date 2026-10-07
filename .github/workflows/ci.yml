@@ -153,7 +153,7 @@ jobs:
         run: npm run build
 
       - name: Registration secret + owner-only ACLs
-        run: npx vitest run tests/pr-d-stdio-perms.test.ts tests/pr-d-mint-gate.test.ts tests/pr-d-init-mint.test.ts tests/pr-d-no-open-mint-in-tests.test.ts --reporter=verbose
+        run: npx vitest run tests/pr-d-stdio-perms.test.ts tests/pr-d-mint-gate.test.ts tests/pr-d-init-mint.test.ts tests/pr-d-no-open-mint-in-tests.test.ts tests/pr-d-pair-private-write.test.ts --reporter=verbose
 
   # macOS launchd side-effect guard. The Ubuntu `test` job structurally CANNOT
   # catch a test that shells to real `launchctl` — init.ts's daemon bootstrap is

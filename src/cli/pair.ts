@@ -245,6 +245,40 @@ async function promptInteractive(msg: string): Promise<string> {
   }
 }
 
+/**
+ * Write the client config PRIVATELY, COMPLETELY, or not at all (Codex R2 #3, #4; it holds the agent's token):
+ *   - created with O_CREAT|O_EXCL ("wx"): never follows or replaces anything already at the path; 0600 from creation;
+ *   - RESTRICTED and VERIFIED while still EMPTY (Windows: owner-only ACL; a fault means it is not private);
+ *   - written until EVERY byte is on disk (a short write is continued; a write with no progress is a failure);
+ *   - on ANY failure the file is removed, so no partial or readable token file is ever left behind; then it throws.
+ * `deps` injects the OS calls for the tests.
+ */
+export function writePrivateConfig(
+  file: string,
+  text: string,
+  deps: { writeSync?: (fd: number, buf: Buffer, offset: number, length: number) => number; restrict?: (file: string) => string[] } = {},
+): void {
+  const writeSync = deps.writeSync ?? ((fd: number, buf: Buffer, offset: number, length: number) => fs.writeSync(fd, buf, offset, length));
+  const restrict = deps.restrict ?? ((f: string) => restrictToOwnerWindows(f, false));
+  const fd = fs.openSync(file, "wx", 0o600);
+  let ok = false;
+  try {
+    const faults = restrict(file);
+    if (faults.length > 0) throw new Error(`the config file is not private, so it was removed: ${faults.join("; ")}`);
+    const buf = Buffer.from(text, "utf-8");
+    let off = 0;
+    while (off < buf.length) {
+      const n = writeSync(fd, buf, off, buf.length - off);
+      if (!(n > 0)) throw new Error(`the config write made no progress at byte ${off} of ${buf.length}, so the file was removed`);
+      off += n;
+    }
+    ok = true;
+  } finally {
+    fs.closeSync(fd);
+    if (!ok) fs.rmSync(file, { force: true });
+  }
+}
+
 /** True when anything (a file, a directory, a symlink, even a dangling one) is at `p`. */
 function pathExists(p: string): boolean {
   try {
@@ -479,15 +513,7 @@ export async function run(argv: string[]): Promise<number> {
     if (parent && parent !== "." && !fs.existsSync(parent)) {
       fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
     }
-    // "wx" = O_CREAT|O_EXCL: never follows or replaces anything already at the path (a file with looser modes, a
-    // planted symlink). 0600 from creation, so the token is never readable by another user for an instant.
-    const fd = fs.openSync(outPath, "wx", 0o600);
-    try {
-      fs.writeSync(fd, snippetText + "\n");
-    } finally {
-      fs.closeSync(fd);
-    }
-    restrictToOwnerWindows(outPath, false);
+    writePrivateConfig(outPath, snippetText + "\n");
   } catch (err) {
     process.stderr.write(
       `relay pair: "${agentName}" was registered on the hub, but its config could not be written to ${outPath}: ${
