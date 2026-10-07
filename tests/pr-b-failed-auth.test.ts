@@ -244,11 +244,16 @@ const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
     }
   })();
   await new Promise((r) => setTimeout(r, 50));
+  const stop = new Promise((r) => parentPort.once("message", r));
   parentPort.postMessage({ started: true });
   const statuses = n > 0 ? await Promise.all(Array.from({ length: n }, call)) : (await new Promise((r) => setTimeout(r, 300)), []);
+  // The window stays open (and /health keeps being sampled) until the parent says stop: a POOL-LOADED control's
+  // window must span its pool work, not just its requests.
+  parentPort.postMessage({ loaded: true, statuses });
+  await stop;
   done = true;
   await sampler;
-  parentPort.postMessage({ healthMax, statuses });
+  parentPort.postMessage({ healthMax });
 })();
 `;
 
@@ -274,140 +279,316 @@ interface Reading {
   eldMax: number;
   /** How many of the load's calls the per-IP cap shed (429) before the MCP cycle. */
   shed: number;
+  /** A POOL-LOADED control only: its pool work INSIDE the measured window (see measure). */
+  pool?: PoolOccupancy;
 }
+
+/** How much of a pool-loaded control's window its pool work actually occupied. */
+interface PoolOccupancy {
+  /** Compares that started and finished inside the window. */
+  inWindow: number;
+  /** Compares that had FINISHED when the reading was taken (inside the window or not). */
+  total: number;
+  /** Fraction of the window with at least one control compare in flight. */
+  busy: number;
+}
+
+/**
+ * The control's pool work, instrumented: `track` wraps each compare, so measure() knows when the pool was busy.
+ * MEASURED on main (294fdfc, local M2): the control's window was 35-63 ms while its 12 compares finished 390-457 ms
+ * after it opened; with the old window this occupancy check reads "0/0 in-window, busy 0.00" in every round. The
+ * "pool-loaded" control measured an unloaded loop. The auth arm's compares run inside its requests, so its
+ * window spans them; on a noisy 3-core runner the longer window alone catches more delay, which inflated the gap
+ * (CI 26803c9: control per-round eld 11.5/57.7/6.7/54.8/185.2, BIMODAL by whether the pool overlapped).
+ */
+type PoolWork = (track: <T>(p: () => Promise<T>) => Promise<T>) => Promise<unknown>;
 
 /**
  * Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has
  * started; `poolWork` (the POOL-LOADED control) starts at the same moment and is finished before this returns.
  */
-async function measure(port: number, load: Load, onLoop?: () => void, poolWork?: () => Promise<unknown>): Promise<Reading> {
+async function measureWindow(port: number, load: Load, onLoop?: () => void, poolWork?: PoolWork): Promise<Reading> {
   let pool: Promise<unknown> = Promise.resolve();
+  const spans: Array<[number, number]> = [];
+  let t0 = 0;
+  const track = async <T,>(p: () => Promise<T>): Promise<T> => {
+    const start = performance.now();
+    try {
+      return await p();
+    } finally {
+      spans.push([start, performance.now()]);
+    }
+  };
   const eld = monitorEventLoopDelay({ resolution: 1 });
   const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args } });
   try {
     return await new Promise<Reading>((resolve, reject) => {
+      let statuses: number[] = [];
+      let t1 = 0;
       worker.on("error", reject);
-      worker.on("message", (m: { started?: true; healthMax?: number; statuses?: number[] }) => {
+      worker.on("message", (m: { started?: true; loaded?: true; healthMax?: number; statuses?: number[] }) => {
         if (m.started) {
+          t0 = performance.now();
           eld.enable();
           if (onLoop) setTimeout(onLoop, 5);
-          if (poolWork) pool = poolWork();
+          if (poolWork) pool = poolWork(track);
           return;
         }
-        eld.disable();
-        resolve({ healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: m.statuses!.filter((s) => s === 429).length });
+        if (m.loaded) {
+          statuses = m.statuses!;
+          // The window closes when the requests AND the control's pool work are done (the pool, not the requests,
+          // is the longer one), so the control is loaded for its whole window, like the auth arm.
+          pool.then(
+            () => {
+              t1 = performance.now();
+              eld.disable();
+              worker.postMessage("stop");
+            },
+            reject,
+          );
+          return;
+        }
+        const reading: Reading = { healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: statuses.filter((s) => s === 429).length };
+        if (poolWork) reading.pool = occupancy(spans, t0, t1);
+        resolve(reading);
       });
     });
   } finally {
     await worker.terminate();
-    await pool;
+    await pool.catch(() => undefined);
   }
 }
 
+const measure = measureWindow;
+
+/** The pool's occupancy of the window [t0, t1]: compares inside it, and the fraction with one in flight. */
+function occupancy(spans: Array<[number, number]>, t0: number, t1: number): PoolOccupancy {
+  const inWindow = spans.filter(([a, b]) => a >= t0 && b <= t1).length;
+  const clipped = spans.map(([a, b]) => [Math.max(a, t0), Math.min(b, t1)] as [number, number]).filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0]);
+  let busyMs = 0;
+  let cur: [number, number] | null = null;
+  for (const [a, b] of clipped) {
+    if (cur && a <= cur[1]) cur[1] = Math.max(cur[1], b);
+    else {
+      if (cur) busyMs += cur[1] - cur[0];
+      cur = [a, b];
+    }
+  }
+  if (cur) busyMs += cur[1] - cur[0];
+  return { inWindow, total: spans.length, busy: t1 > t0 ? busyMs / (t1 - t0) : 0 };
+}
+
 /**
- * THE TIMING BARS (e26359ac Q3 as amended by architect 10f7a172, 47e64b3a, 8cdbc68b and f9916d46).
+ * THE TIMING BARS: BACKSTOPS for GROSS regressions (statistic and margin per the architect's ruling of 2026-10-06,
+ * superseding the median-gap rule of e26359ac Q3 / 10f7a172 / 47e64b3a / 8cdbc68b / f9916d46).
  *
- * WHAT THEY CAN AND CANNOT SEE. On a shared CI runner, a burst of requests that does NO auth work already
- * moves the loop delay 30-86 ms and /health 40-165 ms (MEASURED, CI fef36b4). So the timing bars RESOLVE an
- * auth-specific slowdown of about MARGIN_MS over the same run's control, and no less: they CANNOT promise
- * to see ONE on-loop bcrypt (~64-100 ms). That property is carried by the deterministic checks: COUNT (zero
- * instrumented compares where a digest decides) and the static ban on compares outside the pool
- * (tests/pr-b-auth-invariants.test.ts). The timing bars catch a loop block or an availability loss LARGER
- * than their stated resolution, which every BAR line logs.
+ * The DISCRIMINATORS are deterministic: COUNT (exact compares) and the static ban on compares outside the pool
+ * (tests/pr-b-auth-invariants.test.ts). A timing bar only backstops a GROSS regression, so it must never be flaky:
+ * its effect size sits clearly above the runner's MEASURED same-run noise, and it claims no finer resolution.
  *
- * THE INSTRUMENT, calibrated on the gating runner in EVERY run:
- *   - ISOLATED: the bars run as their own serial CI step after the suite (RELAY_TIMING_BARS=1), never in
- *     parallel with ~300 other files; the parallel suite skips them, visibly.
- *   - K interleaved (control, auth) rounds; each bar asserts on MEDIANS: loop delay and /health of the auth
- *     arm <= the control arm's median + MARGIN_MS. A deterministic regression shifts the median; a one-off
- *     spike does not (NOT best-of-N: nothing is retried).
- *   - A HARD ceiling on EVERY single auth reading (CEILING_MS), so a freeze-sized one-off fails on ONE
- *     occurrence. Named residual, accepted (f9916d46): an intermittent auth-specific spike under the ceiling
- *     in 1 of K rounds or fewer.
- *   - A/A CONTROL: control vs control under the same rule MUST PASS (the margin is above the runner's noise).
- *     If it fails, that is an INSTRUMENT fault, reported as such, never a retry.
- *   - NEGATIVE CONTROL: a loop block sized 2 x the allowance in EVERY auth round MUST FAIL both predicates
- *     (the bar sees a block of the forbidden size).
- * MARGIN_MS is provisional until the isolated step's A/A gaps are in (f9916d46: >= ~15 ms goes back to the
- * architect before anything widens).
+ *   (1) K = 9 INTERLEAVED rounds; each round measures control, control' (a second control) and auth, adjacent.
+ *   (2) The statistic is the MEDIAN OF PER-ROUND PAIRED DIFFERENCES d_i = auth_i - control_i (pairing cancels
+ *       runner drift), for each instrument: /health latency (AVAILABILITY) and event-loop delay (LOOP).
+ *   (3) EFFECT SIZE = 50 ms for both: the auth burst may add < 50 ms over its same-round control. The stated
+ *       RESOLUTION is 50 ms; anything finer is carried by COUNT + the compare ban, by design.
+ *   (4) The same run's A/A, paired: a_i = control_i - control'_i. If median(|a_i|) > 25 ms (half the effect size)
+ *       the instrument is NOISY and that bar is NOT_EVALUATED: reported loudly (the BAR line and the CI job
+ *       summary), neither red nor green. Never a retry, never best-of-N.
+ *   (5) NEGATIVE CONTROLS, sized from the RULED CONSTANTS, never from a pre-run measurement (a paired d_i takes an
+ *       injected delay directly): a GROSS block of +200 ms in every auth burst must TRIP on EVERY run, a noisy one
+ *       too (else RED: the instrument is blind); and on every EVALUATED run, the BOUNDARY PAIR: +80 ms (1.6 x the
+ *       effect size) must FAIL and +20 ms (0.4 x) must PASS, proving discrimination at the threshold on that runner.
+ *   (6) The 500 ms per-reading ceiling is an always-on freeze detector.
+ *   (7) Every BAR line reports median d, median |a|, the effect size, the verdict and the resolution.
+ * A pool-loaded bar's controls (both of them) must also prove their occupancy (expectControlLoaded).
+ *
+ * CLAIM: decision threshold 50 ms; detection of >= 80 ms added per burst proven in the run that reports it (the
+ * boundary pair); regressions under that are carried by COUNT + the compare ban.
  */
-const K = 5;
-const MARGIN_MS = 25;
+const K = 9;
+const EFFECT_MS = 50;
+const GROSS_BLOCK_MS = 200;
+const BOUNDARY_FAIL_MS = 80;
+const BOUNDARY_PASS_MS = 20;
+const CLAIM = `decision threshold ${EFFECT_MS} ms; detection of >= ${BOUNDARY_FAIL_MS} ms added per burst proven this run; regressions under that are carried by COUNT + the compare ban`;
+const NOISE_LIMIT_MS = EFFECT_MS / 2;
 const CEILING_MS = 500;
-const fmt = (r: Reading) => `health=${r.healthMax.toFixed(1)} eld=${r.eldMax.toFixed(1)} shed=${r.shed}`;
+/**
+ * A pool-loaded control round is VALID only when its pool work ran inside its window: every design compare in it,
+ * and a compare in flight for at least this fraction of it. Otherwise the control was not loaded, and the round is
+ * an INSTRUMENT FAULT (never a bar verdict). The lapse demo (a forced 300 ms idle mid-pool) reads well below it.
+ */
+const OCCUPANCY_FLOOR = 0.8;
 const median = (xs: number[]) => {
   const a = [...xs].sort((x, y) => x - y);
   return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2;
 };
 const list = (xs: number[]) => xs.map((x) => x.toFixed(1)).join("/");
 
+type Verdict = "PASS" | "FAIL" | "NOT_EVALUATED";
+interface InstrumentVerdict {
+  /** Median of the paired differences auth_i - control_i. */
+  d: number;
+  /** Median of |control_i - control'_i|: the same run's paired A/A noise. */
+  noise: number;
+  verdict: Verdict;
+}
+
+/**
+ * THE DECISION RULE, pure: paired differences against the same round's control, gated by the same run's paired A/A.
+ * Unit-tested on synthetic readings (always runs), so the claimed resolution is pinned in both directions.
+ */
+export function judge(auth: number[], control: number[], control2: number[]): InstrumentVerdict {
+  const d = median(auth.map((x, i) => x - control[i]));
+  const noise = median(control.map((x, i) => Math.abs(x - control2[i])));
+  return { d, noise, verdict: noise > NOISE_LIMIT_MS ? "NOT_EVALUATED" : d < EFFECT_MS ? "PASS" : "FAIL" };
+}
+
 interface BarStats {
   label: string;
   control: Reading[];
+  /** The second control of each round (the paired A/A). */
+  control2: Reading[];
   auth: Reading[];
   compares: number;
   /** The auth arm's compares in each round. */
   perRound: number[];
-  med: { ctlHealth: number; ctlEld: number; authHealth: number; authEld: number };
+  health: InstrumentVerdict;
+  eld: InstrumentVerdict;
+  /** DECLARED by the bar (runBar's poolControl), never inferred from the readings: a pool-loaded bar whose control
+   * readings lack their occupancy is an INSTRUMENT FAULT, not a bar that silently skips the check. */
+  pooled: boolean;
+}
+
+/** A NOT_EVALUATED bar is announced LOUDLY: the log, and the CI job summary when there is one. */
+function announce(line: string): void {
+  console.log(line);
+  const summary = process.env.GITHUB_STEP_SUMMARY;
+  if (summary && /NOT_EVALUATED/.test(line)) {
+    try {
+      fs.appendFileSync(summary, `- **timing bar NOT EVALUATED (instrument noisy)**: \`${line.replace(/`/g, "'")}\`\n`);
+    } catch {
+      /* the log line above already carries it */
+    }
+  }
 }
 
 /**
- * Run one bar: a discarded warm-up, then K interleaved (control, auth) rounds. Logs a BAR line with the resolution.
- * `poolControl` (architect b72c3ac4): the control arm also runs the pool work the design INTENDS for this load,
- * a DESIGN CONSTANT in production's shape, so the bar compares the auth PATH against the bcrypt work itself.
+ * Run one bar: a discarded warm-up, then K interleaved rounds of (control, control', auth). `poolControl`
+ * (architect b72c3ac4): BOTH controls also run the pool work the design INTENDS for this load, so the bar compares
+ * the auth PATH against the bcrypt work itself. `authPool`: the auth arm runs pool work too (a pool-loaded A/A).
  */
-async function runBar(label: string, port: number, load: Load, opts: { onLoop?: () => void; poolControl?: () => Promise<unknown> } = {}): Promise<BarStats> {
+async function runBar(
+  label: string,
+  port: number,
+  load: Load,
+  opts: { onLoop?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure } = {},
+): Promise<BarStats> {
+  // `measureImpl`: a seam for the WIRING MUTANT only (a measure that drops the occupancy reading).
+  const measure = opts.measureImpl ?? measureWindow;
   _resetAuthThrottleForTests();
   await measure(port, controlLoad(load.n), undefined, opts.poolControl); // WARM-UP, discarded: a fresh daemon's first burst pays one-off costs
   const control: Reading[] = [];
+  const control2: Reading[] = [];
   const auth: Reading[] = [];
   const perRound: number[] = [];
   for (let k = 0; k < K; k++) {
     control.push(await measure(port, controlLoad(load.n), undefined, opts.poolControl));
+    control2.push(await measure(port, controlLoad(load.n), opts.controlOnLoop, opts.poolControl));
     _resetAuthThrottleForTests(); // every auth round meets the same budgets (the scan budget refills slowly)
     perRound.push(
       await compares(async () => {
-        auth.push(await measure(port, load, opts.onLoop));
+        auth.push(await measure(port, load, opts.onLoop, opts.authPool));
       }),
     );
   }
   const count = perRound.reduce((a, b) => a + b, 0);
-  const med = {
-    ctlHealth: median(control.map((r) => r.healthMax)),
-    ctlEld: median(control.map((r) => r.eldMax)),
-    authHealth: median(auth.map((r) => r.healthMax)),
-    authEld: median(auth.map((r) => r.eldMax)),
-  };
-  console.log(
-    `BAR ${label} | median auth health=${med.authHealth.toFixed(1)} eld=${med.authEld.toFixed(1)} | median control health=${med.ctlHealth.toFixed(1)} eld=${med.ctlEld.toFixed(1)}` +
-      ` | gap health=${(med.authHealth - med.ctlHealth).toFixed(1)} eld=${(med.authEld - med.ctlEld).toFixed(1)}` +
-      ` | resolution health>${(med.ctlHealth + MARGIN_MS).toFixed(1)} eld>${(med.ctlEld + MARGIN_MS).toFixed(1)}` +
-      ` | compares=${count} (per round ${perRound.join("/")})${opts.poolControl ? " | control: POOL-LOADED" : ""} | rounds auth health ${list(auth.map((r) => r.healthMax))} eld ${list(auth.map((r) => r.eldMax))}` +
-      ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}`,
+  const health = judge(auth.map((r) => r.healthMax), control.map((r) => r.healthMax), control2.map((r) => r.healthMax));
+  const eld = judge(auth.map((r) => r.eldMax), control.map((r) => r.eldMax), control2.map((r) => r.eldMax));
+  const fmtV = (name: string, v: InstrumentVerdict) => `${name} ${v.verdict} (median d=${v.d.toFixed(1)}, median |a|=${v.noise.toFixed(1)})`;
+  const occ = (rs: Reading[]) => `${rs.map((r) => `${r.pool!.inWindow}/${r.pool!.total}`).join(" ")} busy ${rs.map((r) => r.pool!.busy.toFixed(2)).join("/")}`;
+  announce(
+    `BAR ${label} | ${fmtV("AVAILABILITY", health)} | ${fmtV("LOOP", eld)} | effect size ${EFFECT_MS} ms, noise limit ${NOISE_LIMIT_MS} ms, resolution ${EFFECT_MS} ms, K=${K}` +
+      ` | compares=${count} (per round ${perRound.join("/")})${opts.poolControl ? " | controls: POOL-LOADED" : ""}` +
+      ` | rounds auth health ${list(auth.map((r) => r.healthMax))} eld ${list(auth.map((r) => r.eldMax))}` +
+      ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}` +
+      ` | rounds control' health ${list(control2.map((r) => r.healthMax))} eld ${list(control2.map((r) => r.eldMax))}` +
+      (opts.poolControl && control.every((r) => r.pool) && control2.every((r) => r.pool) ? ` | control pool in-window ${occ(control)} | control' pool in-window ${occ(control2)}` : ""),
   );
-  return { label, control, auth, compares: count, perRound, med };
+  return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
 }
 
-/** The bar's predicates. NOT VACUOUS: no call of any arm was shed (a shed call is a cheap 429 before the MCP cycle). */
+/** Every pool-loaded control round (BOTH controls) ran its design compares INSIDE its window, busy for >= OCCUPANCY_FLOOR of it. */
+function expectControlLoaded(b: BarStats, designCompares: number): void {
+  if (!b.pooled) return; // DECLARED unloaded (the bar was given no poolControl)
+  const fault = (what: string) => `INSTRUMENT FAULT (${b.label}): a pool-loaded control ${what}; that round measured an unloaded loop, so no bar verdict is possible`;
+  for (const arm of [b.control, b.control2]) {
+    const pools = arm.map((r) => r.pool);
+    expect(pools.every((p) => p !== undefined), fault("has rounds with NO occupancy reading (the pool work was not wired into measure)")).toBe(true);
+    expect(pools.map((p) => p!.inWindow), fault(`ran compares outside its window (design: ${designCompares} per round, all inside)`)).toEqual(Array(arm.length).fill(designCompares));
+    for (const p of pools) expect(p!.busy, fault(`left its pool idle for part of its window (busy ${p!.busy.toFixed(2)} < ${OCCUPANCY_FLOOR})`)).toBeGreaterThanOrEqual(OCCUPANCY_FLOOR);
+  }
+}
+
+/**
+ * The bar's gate. Deterministic parts always: nothing shed, the exact compare count, the controls' occupancy, the
+ * 500 ms ceiling on every auth reading. Then each instrument: FAIL is red; NOT_EVALUATED is neither (announced).
+ */
 function expectBarHolds(b: BarStats, compares: { max?: number; exactPerRound?: number } = { max: 0 }): void {
-  expect([...b.control, ...b.auth].map((r) => r.shed), `${b.label}: calls shed by the per-IP limits (every arm)`).toEqual(Array(2 * K).fill(0));
+  expect([...b.control, ...b.control2, ...b.auth].map((r) => r.shed), `${b.label}: calls shed by the per-IP limits (every arm)`).toEqual(Array(3 * K).fill(0));
   if (compares.exactPerRound !== undefined) {
     // EXACT, not <=: the pool-loaded control runs the design constant, so a regression that added compares
     // must fail here rather than hide inside a matching control (architect b72c3ac4 condition 1).
     expect(b.perRound, `${b.label}: bcrypt compares per round`).toEqual(Array(K).fill(compares.exactPerRound));
+    expectControlLoaded(b, compares.exactPerRound);
   } else {
     expect(b.compares, `${b.label}: bcrypt compares`).toBeLessThanOrEqual(compares.max ?? 0);
   }
-  expect(b.med.authEld, `${b.label}: LOOP median ${b.med.authEld.toFixed(1)} vs control median ${b.med.ctlEld.toFixed(1)} + ${MARGIN_MS}`).toBeLessThanOrEqual(b.med.ctlEld + MARGIN_MS);
-  expect(b.med.authHealth, `${b.label}: AVAILABILITY median ${b.med.authHealth.toFixed(1)} vs control median ${b.med.ctlHealth.toFixed(1)} + ${MARGIN_MS}`).toBeLessThanOrEqual(b.med.ctlHealth + MARGIN_MS);
   for (const r of b.auth) {
     expect(r.healthMax, `${b.label}: a single /health reading over the ${CEILING_MS} ms ceiling (a freeze)`).toBeLessThan(CEILING_MS);
     expect(r.eldMax, `${b.label}: a single loop-delay reading over the ${CEILING_MS} ms ceiling (a freeze)`).toBeLessThan(CEILING_MS);
   }
+  expect(b.health.verdict, `${b.label}: AVAILABILITY median paired d ${b.health.d.toFixed(1)} ms >= the ${EFFECT_MS} ms effect size (A/A noise ${b.health.noise.toFixed(1)})`).not.toBe("FAIL");
+  expect(b.eld.verdict, `${b.label}: LOOP median paired d ${b.eld.d.toFixed(1)} ms >= the ${EFFECT_MS} ms effect size (A/A noise ${b.eld.noise.toFixed(1)})`).not.toBe("FAIL");
 }
 
+/** A block of `ms` on the DAEMON's loop: what an on-loop bcrypt, or a scan of them, does. */
+const loopBlock = (ms: number) => () => {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    /* busy */
+  }
+};
+
+/** (5) The negative control must TRIP: its d crosses the effect size on BOTH instruments, noisy run or not. */
+function expectTrips(b: BarStats): void {
+  expect([...b.control, ...b.control2, ...b.auth].map((r) => r.shed), `${b.label}: the bursts reached the daemon`).toEqual(Array(3 * K).fill(0));
+  expect(b.eld.d, `${b.label}: a sized loop block must cross the LOOP effect size (else the bar cannot see harm)`).toBeGreaterThanOrEqual(EFFECT_MS);
+  expect(b.health.d, `${b.label}: a sized loop block must cross the AVAILABILITY effect size (else the bar cannot see harm)`).toBeGreaterThanOrEqual(EFFECT_MS);
+}
+
+describe("the timing-bar decision rule (pure; always runs; not matched by the isolated step's name filter): the claimed 50 ms resolution, pinned both ways", () => {
+  const flat = (v: number) => Array(K).fill(v);
+  it("a regression of 80 ms per round → FAIL; of 20 ms → PASS (with resolution 50 ms stated, never finer)", () => {
+    expect(judge(flat(130), flat(50), flat(52)).verdict).toBe("FAIL");
+    expect(judge(flat(70), flat(50), flat(52)).verdict).toBe("PASS");
+    expect(judge(flat(99), flat(50), flat(50)).verdict, "d = 49 ms: under the effect size").toBe("PASS");
+    expect(judge(flat(100), flat(50), flat(50)).verdict, "d = 50 ms: at the effect size").toBe("FAIL");
+  });
+  it("PAIRED, not difference-of-medians: a drift that moves auth and control together in each round does not FAIL", () => {
+    const drift = [10, 200, 30, 180, 20, 170, 40, 160, 15];
+    expect(judge(drift.map((x) => x + 5), drift, drift.map((x) => x + 3)).verdict).toBe("PASS");
+  });
+  it("a noisy same-run A/A (median |a| > 25 ms) → NOT_EVALUATED, never FAIL, even with a large d", () => {
+    const control = flat(50);
+    const control2 = [10, 100, 5, 110, 0, 95, 12, 90, 8]; // |a| median 40
+    expect(judge(flat(200), control, control2).verdict).toBe("NOT_EVALUATED");
+    expect(judge(flat(60), control, control2).verdict).toBe("NOT_EVALUATED");
+  });
+});
+
 describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, RELAY_TIMING_BARS=1): a burst of failed auths moves the loop and /health no more than the same run's control, with ZERO compares where a digest decides", () => {
-  // The per-minute request limit is not under test here, and each bar sends 2K+1 bursts: lift it so no
+  // The per-minute request limit is not under test here, and each bar sends 3K+1 bursts: lift it so no
   // burst is shed by it (read when the daemon starts). The concurrent cap stays at its default.
   const savedRate = process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE;
   beforeAll(() => {
@@ -418,23 +599,25 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     else process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE = savedRate;
   });
 
-  it("A/A CONTROL: control vs control under the same rule PASSES (the margin sits above this runner's noise; a failure is an INSTRUMENT fault)", async () => {
+  it("A/A CONTROL: control vs control under the same rule never FAILS (a noisy runner reads NOT_EVALUATED, not red)", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       expectBarHolds(await runBar("A/A control vs control", port, controlLoad(20)));
     });
-  }, 180_000);
+  }, 300_000);
 
   it("(b) 20 wrong-token register_agent, (c) 20 wrong-token get_messages, (d) 20 unknown tokens with 51 agents", async () => {
     for (let i = 0; i < 50; i++) reg(`fleet-${i}`);
     reg("victim");
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`); // warm
-      expectBarHolds(await runBar("(b) wrong token, register_agent", port, authLoad(20, "register_agent", { name: "victim", role: "worker", capabilities: [] })));
-      expectBarHolds(await runBar("(c) wrong token, get_messages", port, authLoad(20, "get_messages", { agent_name: "victim" })));
-      expectBarHolds(await runBar("(d) unknown token, token-only", port, authLoad(20, "discover_agents", {})));
+      // Measured first, asserted after: one red still logs every BAR line.
+      const b = await runBar("(b) wrong token, register_agent", port, authLoad(20, "register_agent", { name: "victim", role: "worker", capabilities: [] }));
+      const c = await runBar("(c) wrong token, get_messages", port, authLoad(20, "get_messages", { agent_name: "victim" }));
+      const d = await runBar("(d) unknown token, token-only", port, authLoad(20, "discover_agents", {}));
+      for (const bar of [b, c, d]) expectBarHolds(bar);
     });
-  }, 300_000);
+  }, 600_000);
 
   it("unknown-provenance rows: wrong tokens are BOUNDED (the source's scan budget) and move the loop no more than the control (bcrypt off the loop)", async () => {
     for (let i = 0; i < 4; i++) {
@@ -444,44 +627,82 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     const hashes = [0, 1, 2, 3].map((i) => db.getAgentAuthData(`legacy-${i}`)!.token_hash!);
     // THE POOL-LOADED CONTROL (architect b72c3ac4). The design INTENDS bcrypt here: the source's scan budget admits
     // SCAN_BURST token-only scans per round, each comparing the 4 digest-less rows ONE AFTER ANOTHER (db.ts
-    // findAgentRowByToken awaits each compare), the scans side by side. The control does exactly that on the SAME
+    // findAgentRowByToken awaits each compare), the scans side by side. Both controls do exactly that on the SAME
     // pool with the SAME hashes and a wrong token, so the bar measures the auth PATH, not the bcrypt CPU. The count
     // is the DESIGN CONSTANT (4 x SCAN_BURST), never the auth arm's measured one.
     // RESIDUAL, stated: on a small host the pool's own CPU competes with the main thread; that is bounded by the
     // scan budget x the per-compare cost, not by this bar.
-    const poolControl = () =>
+    const poolControl: PoolWork = (track) =>
       Promise.all(
         Array.from({ length: SCAN_BURST }, async () => {
-          for (const h of hashes) await compareOffLoop(randomToken(), h);
+          for (const h of hashes) await track(() => compareOffLoop(randomToken(), h));
         }),
       );
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      expectBarHolds(await runBar("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {}), { poolControl }), { exactPerRound: 4 * SCAN_BURST });
-    });
-  }, 180_000);
+      // Every bar of this path is MEASURED FIRST and asserted after, so one red run still logs all of its BAR lines.
+      const bar = await runBar("unknown-provenance, token-only", port, authLoad(30, "discover_agents", {}), { poolControl });
+      // (5) ON THE POOL-LOADED PATH: the GROSS block (+200 ms, the ruled constant) in every auth burst must TRIP,
+      // noisy run or not.
+      const neg = await runBar(`gross negative pool-loaded (+${GROSS_BLOCK_MS} ms)`, port, authLoad(30, "discover_agents", {}), { poolControl, onLoop: loopBlock(GROSS_BLOCK_MS) });
+      // THE LAPSE DEMO (the occupancy check's own known-bad): the same pool work with a forced 300 ms idle in the
+      // middle. Its window still spans it, but the pool is idle for much of it: an INSTRUMENT FAULT.
+      const lapsed: PoolWork = async (track) => {
+        await poolControl(track);
+        await new Promise((r) => setTimeout(r, 300));
+        await track(() => compareOffLoop(randomToken(), hashes[0]));
+      };
+      const r = await measure(port, controlLoad(30), undefined, lapsed);
 
-  it("NEGATIVE CONTROL: a loop block sized 2 x the allowance in EVERY auth round FAILS both predicates (the bar sees a block of the forbidden size)", async () => {
-    // Architect 47e64b3a: sized against the thresholds in THIS run, not against bcrypt's real cost.
+      expectBarHolds(bar, { exactPerRound: 4 * SCAN_BURST });
+      expectControlLoaded(neg, 4 * SCAN_BURST); // the negative's own controls are valid, so its trip means something
+      expect(neg.perRound, "the loaded negative's auth arm did the design's compares (it exercised the same path)").toEqual(Array(K).fill(4 * SCAN_BURST));
+      expectTrips(neg); // includes: nothing shed on any arm
+      expect(r.pool!.busy, `the lapse demo: busy ${r.pool!.busy.toFixed(2)} must fall below the floor`).toBeLessThan(OCCUPANCY_FLOOR);
+      const lapsedBar: BarStats = { ...bar, label: "lapse demo", control: Array(K).fill(r), control2: Array(K).fill(r), pooled: true };
+      expect(() => expectControlLoaded(lapsedBar, 4 * SCAN_BURST + 1)).toThrow(/INSTRUMENT FAULT/);
+      // THE WIRING MUTANT, THROUGH runBar: a measure that drops the occupancy reading on a bar DECLARED pool-loaded.
+      // runBar must still complete (its log tolerates the missing reading) so the NAMED fault fires, not a TypeError.
+      const dropping: typeof measure = async (...args) => {
+        const reading = await measureWindow(...args);
+        delete reading.pool;
+        return reading;
+      };
+      const unwired = await runBar("unwired mutant", port, authLoad(30, "discover_agents", {}), { poolControl, measureImpl: dropping });
+      expect(() => expectControlLoaded(unwired, 4 * SCAN_BURST)).toThrow(/NO occupancy reading/);
+    });
+  }, 600_000);
+
+  it("NEGATIVE CONTROL + THE RESOLUTION, live: +200 ms TRIPS on every run; an injected noise source reads NOT_EVALUATED; on an evaluated run +80 ms FAILS and +20 ms PASSES", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       await measure(port, controlLoad(20));
-      const pre = await measure(port, controlLoad(20));
-      const blockMs = 2 * (Math.max(pre.healthMax, pre.eldMax) + MARGIN_MS);
-      const b = await runBar(`negative-control (block=${blockMs.toFixed(1)}ms)`, port, authLoad(20, "discover_agents", {}), {
-        onLoop: () => {
-          const end = performance.now() + blockMs; // block the DAEMON's loop: what an on-loop bcrypt, or a scan of them, does
-          while (performance.now() < end) {
-            /* busy */
-          }
-        },
-      });
-      expect([...b.control, ...b.auth].map((r) => r.shed), "the negative control's bursts reached the daemon").toEqual(Array(2 * K).fill(0));
-      // The bar's own predicates, inverted: each must FAIL here, or the bar cannot see the harm.
-      expect(b.med.authEld, "a sized loop block must exceed the LOOP allowance").toBeGreaterThan(b.med.ctlEld + MARGIN_MS);
-      expect(b.med.authHealth, "a sized loop block must exceed the AVAILABILITY allowance").toBeGreaterThan(b.med.ctlHealth + MARGIN_MS);
+      const neg = await runBar(`gross negative (+${GROSS_BLOCK_MS} ms)`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(GROSS_BLOCK_MS) });
+      // An A/A with an injected NOISE source: control' gets a 60-150 ms block, a different size each round, so its
+      // paired |a| sits well above the 25 ms noise limit in most rounds (MEASURED: a 0-120 ms mix with zeros gave a
+      // median |a| of only 16.5-17.8 ms, under the limit: not a noise source by this rule).
+      const sizes = [60, 120, 80, 150, 70, 110, 90, 140, 100];
+      let round = 0;
+      const noisy = await runBar("A/A with injected noise", port, controlLoad(20), { controlOnLoop: () => loopBlock(sizes[round++ % sizes.length])() });
+      // THE BOUNDARY PAIR, live: +80 ms (1.6 x the effect size) and +20 ms (0.4 x) in every auth burst.
+      const at80 = await runBar(`boundary +${BOUNDARY_FAIL_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(BOUNDARY_FAIL_MS) });
+      const at20 = await runBar(`boundary +${BOUNDARY_PASS_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(BOUNDARY_PASS_MS) });
+      const evaluated = [at80, at20].every((b) => b.eld.verdict !== "NOT_EVALUATED" && b.health.verdict !== "NOT_EVALUATED");
+      announce(
+        evaluated
+          ? `CLAIM ${CLAIM} | boundary pair EVALUATED: +${BOUNDARY_FAIL_MS} ms LOOP ${at80.eld.verdict} AVAILABILITY ${at80.health.verdict}; +${BOUNDARY_PASS_MS} ms LOOP ${at20.eld.verdict} AVAILABILITY ${at20.health.verdict}`
+          : `CLAIM ${CLAIM} | boundary pair NOT_EVALUATED (the instrument was noisy this run): only the gross negative, COUNT and the ceiling gate decide`,
+      );
+
+      expectTrips(neg); // on EVERY run, noisy or not: the instrument must not be blind
+      expect(noisy.eld.verdict, "injected A/A noise must read NOT_EVALUATED (never red)").toBe("NOT_EVALUATED");
+      if (evaluated) {
+        // On an evaluated run the pair must straddle the threshold on BOTH instruments.
+        for (const v of [at80.eld, at80.health]) expect(v.verdict, `+${BOUNDARY_FAIL_MS} ms must FAIL (d=${v.d.toFixed(1)})`).toBe("FAIL");
+        for (const v of [at20.eld, at20.health]) expect(v.verdict, `+${BOUNDARY_PASS_MS} ms must PASS (d=${v.d.toFixed(1)})`).toBe("PASS");
+      }
     });
-  }, 180_000);
+  }, 600_000);
 });
 
 describe("Q4: rejections are audited BOUNDED, one row per (source, reason, window) with a count", () => {
