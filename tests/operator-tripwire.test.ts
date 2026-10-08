@@ -58,9 +58,10 @@ describe("PARITY (Windows): the private home is set in EVERY spelling a process 
    */
   const windowsHomedir = (env: NodeJS.ProcessEnv, accountProfile: string) => env.USERPROFILE ?? accountProfile;
   const WIN_PRIVATE = "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\bot-relay-tripwire-ab12\\home";
-  it("win32: USERPROFILE is the private home, and HOMEDRIVE + HOMEPATH spell the same path", () => {
+  it("win32: USERPROFILE is the private home, HOMEDRIVE + HOMEPATH spell the same path, and TEMP/TMP sit inside it", () => {
     const e = privateHomeEnv(WIN_PRIVATE, "win32");
-    expect(e).toEqual({ HOME: WIN_PRIVATE, USERPROFILE: WIN_PRIVATE, HOMEDRIVE: "C:", HOMEPATH: "\\Users\\runneradmin\\AppData\\Local\\Temp\\bot-relay-tripwire-ab12\\home" });
+    const temp = `${WIN_PRIVATE}\\AppData\\Local\\Temp`;
+    expect(e).toEqual({ HOME: WIN_PRIVATE, USERPROFILE: WIN_PRIVATE, HOMEDRIVE: "C:", HOMEPATH: "\\Users\\runneradmin\\AppData\\Local\\Temp\\bot-relay-tripwire-ab12\\home", TEMP: temp, TMP: temp });
     expect(`${e.HOMEDRIVE}${e.HOMEPATH}`).toBe(WIN_PRIVATE);
     expect(windowsHomedir(e, "C:\\Users\\operator")).toBe(WIN_PRIVATE);
   });
@@ -153,7 +154,7 @@ describe("DISCOVERY: every operator root and config, failing CLOSED", () => {
     const f = path.join(home, ".bot-relay", "config.json");
     fs.writeFileSync(f, "{not json");
     expect(() => discoverOperator({}, home)).toThrow(/not valid JSON/);
-    if (process.getuid?.() !== 0) {
+    if (process.platform !== "win32" && process.getuid?.() !== 0) { // chmod 000 denies nothing on Windows, or to root
       fs.writeFileSync(f, "{}");
       fs.chmodSync(f, 0o000);
       expect(() => discoverOperator({}, home)).toThrow(/cannot read/);

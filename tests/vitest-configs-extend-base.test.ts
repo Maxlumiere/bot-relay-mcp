@@ -63,6 +63,8 @@ export function baseProblems(cfg: unknown): string[] {
   else {
     if (!env.HOME || !env.HOME.startsWith(runDir + path.sep)) p.push(`env.HOME ${JSON.stringify(env.HOME)} is not inside the run directory`);
     if (env.USERPROFILE !== env.HOME) p.push("env.USERPROFILE is not the private HOME"); // os.homedir() on Windows reads it
+    // Windows: temp inside the private home (the relay's path guard approves the home, not Windows temp).
+    if (process.platform === "win32" && !(env.TEMP && env.TEMP.startsWith(env.HOME + path.sep) && env.TMP === env.TEMP)) p.push("env.TEMP/TMP are not inside the private HOME");
   }
   for (const k of HOME_KEYS) if (!(k in env)) p.push(`env.${k} is not set`);
   if (env.RELAY_HTTP_PORT !== SAFE_PORT) p.push(`env.RELAY_HTTP_PORT is ${JSON.stringify(env.RELAY_HTTP_PORT)}, not ${SAFE_PORT}`);

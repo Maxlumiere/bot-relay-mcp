@@ -73,7 +73,9 @@ if (!state()) {
   const recordDir = path.join(runDir, "violations", String(process.pid));
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   fs.mkdirSync(recordDir, { recursive: true, mode: 0o700 });
-  Object.assign(process.env, privateHomeEnv(home)); // this worker's own HOME (and the Windows spellings)
+  const priv = privateHomeEnv(home);
+  Object.assign(process.env, priv); // this worker's own HOME (and the Windows spellings, and its TEMP)
+  if ("TEMP" in priv) fs.mkdirSync(priv.TEMP, { recursive: true, mode: 0o700 });
   process.env.RELAY_HTTP_PORT = SAFE_PORT;
   process.env.RELAY_TEST_TRIPWIRE_DIR = recordDir; // read by the preload's snapshot, below
   const childVars = Object.freeze({
@@ -157,8 +159,8 @@ export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.Pro
   // Without them, bash's ~ and node's os.homedir() fall back to the ACCOUNT's real home (passwd on unix,
   // the profile on Windows), and the hooks fall back to port 3777: the operator's. Each missing one gets
   // the private one.
-  const priv = privateHomeEnv(st.home);
-  for (const k of HOME_KEYS) if (base[k] === undefined) out[k] = priv[k as keyof typeof priv];
+  const priv: Record<string, string> = privateHomeEnv(st.home);
+  for (const [k, v] of Object.entries(priv)) if (base[k] === undefined) out[k] = v;
   if (base.RELAY_HTTP_PORT === undefined) out.RELAY_HTTP_PORT = SAFE_PORT;
   Object.assign(out, st.childVars); // the frozen snapshot, whatever the test did to its own env
   const imp = `--import=${pathToFileURL(PRELOAD).href}`;

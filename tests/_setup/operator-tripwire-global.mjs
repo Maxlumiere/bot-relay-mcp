@@ -44,6 +44,9 @@ export default function setup(project) {
   const runDir = runDirOf(project);
   const violations = path.join(runDir, "violations");
   fs.mkdirSync(path.join(runDir, "home"), { recursive: true, mode: 0o700 });
+  // On Windows the base puts TEMP inside the private home: it must exist before any worker uses it.
+  const temp = project?.config?.env?.TEMP;
+  if (typeof temp === "string" && path.isAbsolute(temp)) fs.mkdirSync(temp, { recursive: true, mode: 0o700 });
   fs.mkdirSync(violations, { recursive: true, mode: 0o700 });
   return () => {
     let found;

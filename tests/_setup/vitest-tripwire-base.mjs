@@ -45,11 +45,18 @@ const RAW = () => globalThis[Symbol.for("bot-relay.operator-tripwire.raw-fs")] ?
  * The env that points the HOME of a process at `home` on every platform. Unix (and node's os.homedir()
  * there) read HOME; on Windows node's os.homedir() reads USERPROFILE and, without it, falls back to the
  * ACCOUNT's real profile. HOMEDRIVE + HOMEPATH are the other Windows spelling (cmd, Git Bash).
+ *
+ * On Windows the temp directory moves INSIDE the private home too (TEMP, TMP: its real layout,
+ * <profile>\AppData\Local\Temp). The relay's path guard (src/approved-roots.ts) approves the home and the
+ * POSIX shared temp roots only; Windows temp was approved only because it normally sits under the real
+ * profile. With the home private and temp outside it, every test DB made under os.tmpdir() was refused
+ * (MEASURED, CI windows-latest on 42add53: 40 PR-D tests). POSIX temp roots are approved on their own.
  */
 export function privateHomeEnv(home, platform = process.platform) {
   if (platform === "win32") {
     const drive = path.win32.parse(home).root.replace(/[\\/]+$/, "");
-    return { HOME: home, USERPROFILE: home, HOMEDRIVE: drive, HOMEPATH: home.slice(drive.length) || "\\" };
+    const temp = path.win32.join(home, "AppData", "Local", "Temp");
+    return { HOME: home, USERPROFILE: home, HOMEDRIVE: drive, HOMEPATH: home.slice(drive.length) || "\\", TEMP: temp, TMP: temp };
   }
   return { HOME: home, USERPROFILE: home, HOMEDRIVE: "", HOMEPATH: home };
 }
