@@ -24,7 +24,13 @@ import { RAW_FS } from "./_setup/operator-tripwire-preload.mjs";
 import { tripwireView } from "./_setup/operator-tripwire.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const TEXT = /\.(ts|mts|cts|js|mjs|cjs|sh|bash|json|jsonc|md|txt|ya?ml|plist|toml|env)$/i;
+/** EVERY file is scanned (Codex #305 R1 P2 #14: an extension allowlist skipped .sql and extensionless
+ * scripts); only a file with a NUL byte in its first 8 KiB is skipped, as binary. */
+function isBinary(buf: Buffer): boolean {
+  return buf.subarray(0, 8192).includes(0);
+}
+/** A needle starts and ends at a path boundary: not inside a longer name on either side. */
+const NAME_CHAR = /[A-Za-z0-9._~-]/;
 
 /** The strings that name this machine's operator: its real home, and its live instance ids. */
 export function operatorNeedles(realHome: string, relayRoots: string[]): string[] {
@@ -34,14 +40,17 @@ export function operatorNeedles(realHome: string, relayRoots: string[]): string[
   } catch {
     /* no realpath: the raw one stands */
   }
+  // The home is a needle at ANY length: the root account's home is 5 characters, and the boundary check
+  // on both sides keeps it from matching a longer name that contains it.
   for (const root of relayRoots) {
     try {
+      // An instance id is a bare name, so a short one would match ordinary words: ids under 8 are skipped.
       for (const id of RAW_FS.readdirSync(path.join(root, "instances"))) if (id.length >= 8) needles.add(id);
     } catch {
       /* no instances under this root */
     }
   }
-  return [...needles].filter((n) => n.length >= 8);
+  return [...needles].filter((n) => n.length > 1); // never "/" (the home of a sandboxed account)
 }
 
 /** Every line that contains a needle, the needle not running on into a longer name. */
@@ -58,14 +67,17 @@ export function scanForNeedles(dirs: string[], needles: string[]): Array<{ file:
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
         if (e.name !== "node_modules" && e.name !== ".git") walk(full);
-      } else if (e.isFile() && TEXT.test(e.name)) {
-        const lines = fs.readFileSync(full, "utf-8").split("\n");
+      } else if (e.isFile()) {
+        const buf = fs.readFileSync(full);
+        if (isBinary(buf)) continue;
+        const lines = buf.toString("utf-8").split("\n");
         lines.forEach((text, i) => {
           for (const n of needles) {
             let at = text.indexOf(n);
             while (at !== -1) {
+              const before = at > 0 ? text[at - 1] : "";
               const next = text[at + n.length] ?? "";
-              if (!/[A-Za-z0-9._-]/.test(next)) {
+              if (!NAME_CHAR.test(before) && !NAME_CHAR.test(next)) {
                 hits.push({ file: full, line: i + 1, needle: n });
                 break;
               }
@@ -89,9 +101,27 @@ describe("the scanner (synthetic files)", () => {
       fs.writeFileSync(path.join(dir, "a.test.ts"), `const p = "${home}/.bot-relay/relay.db";\n`);
       fs.writeFileSync(path.join(dir, "b.sh"), `sqlite3 "$HOME/.bot-relay/instances/${id}/relay.db"\n`);
       fs.writeFileSync(path.join(dir, "c.json"), `{"x": "${home}x/notes", "y": "/Users/x/.bot-relay", "z": "$HOME/.bot-relay"}\n`);
-      fs.writeFileSync(path.join(dir, "d.bin"), `${home}/.bot-relay`); // not a scanned type
+      fs.writeFileSync(path.join(dir, "e.sql"), `ATTACH '${home}/.bot-relay/relay.db' AS live;\n`);
+      fs.writeFileSync(path.join(dir, "f-extensionless"), `#!/bin/sh\nsqlite3 ${home}/.bot-relay/relay.db .dump\n`);
+      fs.writeFileSync(path.join(dir, "g.bin"), Buffer.concat([Buffer.from([0, 1, 2]), Buffer.from(`${home}/.bot-relay`)])); // binary: skipped
+      fs.writeFileSync(path.join(dir, "h.ts"), `const p = "/data${home}/x"; const q = "x${id}";\n`); // inside a longer name: not a hit
       const hits = scanForNeedles([dir], [home, id]).map((h) => `${path.basename(h.file)}:${h.line}:${h.needle}`);
-      expect(hits.sort()).toEqual([`a.test.ts:1:${home}`, `b.sh:1:${id}`]);
+      expect(hits.sort()).toEqual([`a.test.ts:1:${home}`, `b.sh:1:${id}`, `e.sql:1:${home}`, `f-extensionless:2:${home}`]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it("a SHORT home (the root account's, a container running as root) is a needle, and matches only at a path boundary", () => {
+    // Built, never spelled: on a runner whose home IS this path, a literal here would be a hit in this file.
+    const R = `/${"ro"}ot`;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "op-scan-root-"));
+    try {
+      expect(operatorNeedles(R, [path.join(dir, "missing")])).toEqual([R]);
+      fs.writeFileSync(path.join(dir, "a.sh"), `cat ${R}/.bot-relay/config.json\n`);
+      fs.writeFileSync(path.join(dir, "b.sh"), `ls ${R}fs /srv${R} /home/x${R}\n`);
+      fs.writeFileSync(path.join(dir, "c.ts"), `const u = "file://${R}/.bot-relay";\n`);
+      const hits = scanForNeedles([dir], [R]).map((h) => `${path.basename(h.file)}:${h.line}`);
+      expect(hits.sort()).toEqual(["a.sh:1", "c.ts:1"]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
