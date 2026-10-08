@@ -48,6 +48,7 @@ import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
 import { anchorLivenessVerdict, getOwnHostId, processStartedAt } from "./liveness.js";
 import { performance } from "perf_hooks";
+import { watchableName, watchSupervision, watchWindowDir } from "./watch-wake.js";
 import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
 import { conditionOf, FUTURE_TOLERANCE_MS, HEARTBEAT_FILENAME, MAX_COUNT, NOT_EVALUATED_MAX_NAMES, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
@@ -196,6 +197,18 @@ export function bindingLiveness(b: { host_id: string; window_pid?: number | null
   return anchorLivenessVerdict({ host_id: b.host_id, agent_pid: b.window_pid ?? null, agent_pid_start: b.window_pid_start ?? null }, ownHostId);
 }
 
+/**
+ * PR 7: the supervisor's view of the watch on an agent's ONE live window `w`. The window dir is keyed
+ * by the window process's start as the KERNEL reads it now (UTC form), never by the stored token,
+ * which a legacy-form migration rewrites under the same binding (Codex R2 (b)): the watch keys its
+ * own dir the same way.
+ */
+function superviseWatch(dbPath: string, name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding, wallMs: number, horizonMs: number): { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean } {
+  const start = watchableName(name) && w.window_pid ? processStartedAt(w.window_pid) : null;
+  if (!start || !w.window_pid) return { status: "absent", undeliveredAfterWake: false };
+  return watchSupervision(watchWindowDir(dbPath, name, { pid: w.window_pid, start }), read, wallMs, horizonMs);
+}
+
 /** Test seams: not reachable from the command line (dist/doorbell.js passes argv only). */
 export interface DoorbellOptions {
   /** The log's file I/O (a short write, a failed fsync). */
@@ -214,6 +227,13 @@ export interface DoorbellOptions {
   mutatePlan?: (plan: ReturnType<typeof planCycle>) => void;
   /** PR 6 (#310 Codex R1 #2): wrap the all-agent mail query (e.g. make it fail), to prove a failure is reported, not silent. */
   wrapMailAgents?: (real: () => readonly string[]) => () => readonly string[];
+  /**
+   * PR 7 (§v6): the watch supervisor's view of one agent (test seam). Default: the real watch dir beside
+   * the relay DB (src/watch-wake.ts). `false` turns supervision off: PR 1-6's intent path (tests of it).
+   */
+  watchFit?: ((name: string, read: PendingRead, window: import("./doorbell-core.js").CandidateBinding) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean }) | false;
+  /** Ruling 1a8fc7c4 (1): an ACTUATING driver (test seam). Production registers none → zero intents. */
+  actuator?: { fits: (agentName: string) => boolean };
 }
 
 /** A wall step this large against the monotonic clock is a JUMP (ruling 622689ba (4)). */
@@ -423,6 +443,10 @@ async function runLocked(
       liveness: (b) => bindingLiveness(b, ownHostId),
       mailAgents: (opts.wrapMailAgents ?? ((real) => real))(() => agentsWithPendingMail(handle)),
       boardOpen: state.boardOpen,
+      // PR 7 (§v6): the WATCH SUPERVISOR. Each agent wakes through its own `relay watch --until-wake`
+      // (zero doorbell tokens); the doorbell only boards a missing, hung or ineffective watch.
+      ...(opts.watchFit === false ? {} : { watchFit: opts.watchFit ?? ((name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding) => superviseWatch(dbPath, name, read, w, nowWall, args.horizonMs)) }),
+      ...(opts.actuator ? { actuator: opts.actuator } : {}),
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,
       horizonMs: args.horizonMs,

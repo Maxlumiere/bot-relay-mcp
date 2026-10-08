@@ -45,7 +45,7 @@ async function inProcess(argv: string[], opts: import("../src/doorbell-run.js").
   let stderr = "";
   const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => ((stderr += String(chunk)), true));
   try {
-    return { code: await runDoorbell(argv, opts), stderr };
+    return { code: await runDoorbell(argv, { watchFit: false, actuator: { fits: () => true }, ...opts }), stderr };
   } finally {
     spy.mockRestore();
   }
@@ -98,8 +98,8 @@ beforeEach(() => {
 });
 
 describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => {
-  it("one intent for new mail, content-free; the header carries LOADED_BUILD, the install and the resolution; the relay DB is byte-identical", () => {
-    const m1 = send("db-alice");
+  it("PRODUCTION (ruling 1a8fc7c4 (1)): the real job forms NO intent (no actuating driver); it boards no_driver(watch_absent); the header carries LOADED_BUILD, the install and the resolution; the relay DB is byte-identical", () => {
+    send("db-alice");
     // The test's own connection stays open: the WAL sidecars exist (ruling 8c83e4ce D-1).
     const before = fs.readFileSync(DB);
     const walBefore = fs.readFileSync(`${DB}-wal`);
@@ -110,24 +110,36 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
     const recs = records();
     expect(recs[0]).toMatchObject({ type: "header", install_dir: fs.realpathSync(REPO_ROOT), resolution: { kind: "explicit-db" } });
     expect(recs[0].build?.build_id).toMatch(/^([0-9a-f]{64}|unbuilt)$/);
+    expect(intents()).toEqual([]);
+    expect(records().filter((x) => x.type === "board").map((x) => [(x as { case?: string }).case, (x as { why?: string }).why])).toEqual([["no_driver", "watch_absent"]]);
+    expect(fs.readFileSync(LOG, "utf-8")).not.toContain("content that must never reach the log");
+  });
+
+  // The INTENT path below needs an actuating driver (none in production: ruling 1a8fc7c4 (1)), so it
+  // runs in-process with a test actuator; each run is still a fresh start from the log (a restart).
+  const ring = (extra: string[] = []) => inProcess(["--once", ...extra]);
+
+  it("with an actuating driver: one intent for new mail, content-free", async () => {
+    const m1 = send("db-alice");
+    expect((await ring()).code).toBe(0);
     expect(intents().map((i) => [i.intent?.agent_name, i.covers?.message_ids])).toEqual([["db-alice", [m1]]]);
     expect(fs.readFileSync(LOG, "utf-8")).not.toContain("content that must never reach the log");
   });
 
-  it("HARM (V4): a RESTART after a ring does not re-ring the same (reading session, id)", () => {
+  it("HARM (V4): a RESTART after a ring does not re-ring the same (reading session, id)", async () => {
     send("db-alice");
-    expect(once().status).toBe(0);
-    expect(once().status).toBe(0);
+    expect((await ring()).code).toBe(0);
+    expect((await ring()).code).toBe(0);
     expect(intents()).toHaveLength(1);
   });
 
-  it("HARM (V4 rescue twin): the same id re-pended to a NEW reading session (a re-registration) DOES ring", () => {
+  it("HARM (V4 rescue twin): the same id re-pended to a NEW reading session (a re-registration) DOES ring", async () => {
     const m1 = send("db-alice");
-    expect(once().status).toBe(0);
+    expect((await ring()).code).toBe(0);
     const first = intents()[0].covers?.reading_session;
     setSession("db-alice", "a-later-window-session");
     ageLog(120_000); // past the coalescing window (PR 2), so only V4 decides
-    expect(once().status).toBe(0);
+    expect((await ring()).code).toBe(0);
     // The LAST intent is the new ring: the same id, under the new session. (Whether the old
     // one survives the start's compaction depends on its age: PR 2 keeps the last hour.)
     const last = intents().at(-1)?.covers;
@@ -136,28 +148,28 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
     expect(last?.reading_session).not.toBe(first);
   });
 
-  it("PR 2 (Q3), real process: new mail after a RESTART inside the window is held (ring times come back from the log); past W it rings once", () => {
+  it("PR 2 (Q3): new mail after a RESTART inside the window is held (ring times come back from the log); past W it rings once", async () => {
     send("db-alice");
-    expect(once().status).toBe(0);
+    expect((await ring()).code).toBe(0);
     const m2 = send("db-alice");
-    expect(once().status).toBe(0); // a fresh process, < 60 s after the first ring
+    expect((await ring()).code).toBe(0); // a fresh start, < 60 s after the first ring
     expect(intents()).toHaveLength(1);
     ageLog(120_000);
-    expect(once().status).toBe(0);
+    expect((await ring()).code).toBe(0);
     expect(intents().map((i) => i.covers?.message_ids)).toEqual([expect.any(Array), [m2]]);
   });
 
-  it("PR 2 x D-2: the start's compaction keeps the last hour's rings, so a restart never UNDERCOUNTS the budget", () => {
+  it("PR 2 x D-2: the start's compaction keeps the last hour's rings, so a restart never UNDERCOUNTS the budget", async () => {
     for (let i = 0; i < 6; i++) {
       send("db-alice");
-      expect(once({}, ["--window-s", "10"]).status).toBe(0);
+      expect((await ring(["--window-s", "10"])).code).toBe(0);
       ageLog(11_000); // past the 10 s window, still well inside the hour
     }
     expect(intents()).toHaveLength(6);
     db.getDb().prepare("UPDATE messages SET resolved_at = ? WHERE to_agent = 'db-alice'").run(new Date().toISOString()); // none pending now
     send("db-alice");
-    const r = once({}, ["--window-s", "10"]); // compacts first: the six rings are NOT pending, but inside the hour
-    expect(r.status, r.stderr).toBe(0);
+    const r = await ring(["--window-s", "10"]); // compacts first: the six rings are NOT pending, but inside the hour
+    expect(r.code, r.stderr).toBe(0);
     expect(intents()).toHaveLength(6); // the 7th is refused
     expect(records().filter((x) => x.type === "budget").map((x) => (x as { state?: string }).state)).toEqual(["exhausted"]);
   });

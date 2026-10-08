@@ -44,15 +44,32 @@ interface Args {
   once: boolean;
   json: boolean;
   help: boolean;
+  /** Doorbell PR 7 (§v6): exit with one line when there is mail to wake for (run it in the background). */
+  untilWake: boolean;
+  /** Doorbell PR 7 (§v6): print live | stale | absent | never | no_window for this agent's watch, and exit. */
+  lockStatus: boolean;
+  /** Doorbell PR 7 (ruling 9becb599): the FOREGROUND pre-check before arming (arm | live | refused). */
+  armCheck: boolean;
+  /** How often a dormant watch re-checks its window, in seconds (default 60; for tests). */
+  dormantCheckMs: number | null;
 }
 
 function parseArgs(argv: string[]): Args {
-  const out: Args = { agent: null, intervalMs: 3000, once: false, json: false, help: false };
+  const out: Args = { agent: null, intervalMs: 3000, once: false, json: false, help: false, untilWake: false, lockStatus: false, armCheck: false, dormantCheckMs: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--help" || a === "-h") out.help = true;
     else if (a === "--once") out.once = true;
     else if (a === "--json") out.json = true;
+    else if (a === "--until-wake") out.untilWake = true;
+    else if (a === "--lock-status") out.lockStatus = true;
+    else if (a === "--arm-check") out.armCheck = true;
+    else if (a === "--dormant-check-s") {
+      const v = argv[++i];
+      const secs = Number(v);
+      if (!v || !Number.isInteger(secs) || secs < 1 || secs > 60) throw new Error("--dormant-check-s requires whole seconds from 1 to 60");
+      out.dormantCheckMs = secs * 1000;
+    }
     else if (a === "--interval") {
       const v = argv[++i];
       const secs = Number(v);
@@ -66,6 +83,7 @@ function parseArgs(argv: string[]): Args {
       throw new Error(`unexpected argument: ${a}`);
     }
   }
+  if ([out.untilWake, out.lockStatus, out.armCheck, out.once].filter(Boolean).length > 1) throw new Error("--until-wake, --arm-check, --lock-status and --once are exclusive");
   return out;
 }
 
@@ -76,7 +94,17 @@ function usage(requested = false): void {
   // launched with a garbage token that LOOKED like a value. `requested`
   // (an explicit --help) is the one case where the text IS the data.
   (requested ? process.stdout : process.stderr).write(
-    "Usage: relay watch <agent> [--interval SECONDS] [--once] [--json]\n\n" +
+    "Usage: relay watch <agent> [--interval SECONDS] [--once] [--json]\n" +
+      "       relay watch <agent> --arm-check                          (FOREGROUND, first)\n" +
+      "       relay watch <agent> --until-wake [--interval SECONDS]   (then in the BACKGROUND)\n" +
+      "       relay watch <agent> --lock-status\n\n" +
+      "  --arm-check        Before arming: prints arm (and the command to run in the background),\n" +
+      "                     live (one already runs in this window), or no-mail: refused (<why>).\n" +
+      "  --until-wake       Wait with zero model tokens; exit 0 with ONE line when this agent has\n" +
+      "                     mail to wake for (each message wakes a session at most once). It exits\n" +
+      "                     only to wake, or (silently) when its window is gone; otherwise it goes\n" +
+      "                     dormant. Re-arm after each wake.\n" +
+      "  --lock-status      Print live | stale | absent | never | no_window, and exit 0.\n" +
       "Sentinel — autowake for a terminal agent NOT in VS Code/Tether. Watches\n" +
       "<agent>'s inbox and prints a wake line when new mail arrives, so a harness\n" +
       "Monitor (or you) can nudge the agent to read it. Event-driven when\n" +
@@ -340,6 +368,12 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   const agent = args.agent;
+  if (args.untilWake || args.lockStatus || args.armCheck) {
+    const { runUntilWake, runLockStatus, runArmCheck } = await import("./watch-until-wake.js");
+    if (args.lockStatus) return runLockStatus(agent);
+    if (args.armCheck) return runArmCheck(agent);
+    return runUntilWake(agent, { intervalMs: args.intervalMs, ...(args.dormantCheckMs ? { dormantCheckMs: args.dormantCheckMs } : {}) });
+  }
 
   // INSTANCE-DB TRAP: resolve the ACTIVE per-instance DB, exactly as the daemon
   // does — never the legacy ~/.bot-relay/relay.db. The marker the daemon writes

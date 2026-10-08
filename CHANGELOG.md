@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added: `relay watch AGENT --until-wake`, a wake that costs no model tokens while it waits
+
+An agent can now be woken for new relay mail without polling and without a model call. From its own session, it first runs `relay watch AGENT --arm-check`, which says whether to start a watch and gives the exact command. It then starts that command once as a background task. The command waits, and exits with one line when the agent has mail to wake for. Its exit is the wake. The agent reads its mail, then arms again.
+
+- **A watch exits only to wake its agent, or when its window closes** (then silently: there is no one left to tell). Each exit would cost the agent a turn, so in every other case it goes dormant instead. It holds nothing, does nothing, records why in its own directory, and ends with its window. `relay doorbell status` counts the dormant watches still running.
+- **A watch belongs to the window it runs in.** It arms only inside the agent's one live bound window, proven from its own parent processes. So another process cannot claim an agent's watch, and the watch of a closed or replaced window cannot take the current window's mail. Started anywhere else (another agent's window, detached, or with two possible windows), `--arm-check` refuses with a line starting `no-mail: refused` and the reason. If the agent's window changes while a watch runs, the watch goes dormant.
+- **Each message wakes a session at most once.** A message the agent was already woken for does not wake it again, even if it stays unread, so an agent that does not read its mail is never woken in a loop. A new session is woken once for mail still pending from the one before. While the agent has no relay session, the watch keeps waiting.
+- **One watch per window.** `--arm-check` answers `live` when one already runs. A second one started anyway goes dormant. A watch whose process ends, however it ends, frees its place at once.
+- **A watch that has stopped checking is replaced.** If it has not checked for 5 minutes of awake time, the next one takes over without stopping it. Awake time accumulates across any number of sleeps: time the machine was asleep never counts. When the awake clock cannot be read, a watch is never judged stopped. If the old one ever resumes, it sees it was replaced and goes dormant. No process is ever signalled.
+- **`relay watch AGENT --lock-status`** prints `live`, `stale` (still running, but no longer checking), `absent`, `never` (the agent never ran one) or `no_window` (no single live window).
+- **It writes nothing to the relay.** It reads the mailbox read-only, and keeps its own small state (its lock, a heartbeat, and which messages it already woke for) in a private directory beside the relay database. It prints the wake before recording it, so a crash in between can cause one repeated wake, never a missed one.
+- **The lines it prints are runnable as written**: the wake line gives the `--arm-check` step and `--arm-check` gives the background command, each with the CLI's full path and the relay database it used, so a re-armed watch watches the same relay.
+- **Who may wake whom is one policy in one place.** In this version every sender may wake its recipient, at most 4 times an hour per sender and recipient. Mail over that limit, or from a sender a later policy refuses, stays pending and visible; it just does not wake anyone.
+
+### Changed: the Stop hook reminds an agent to restart its watch, and the doorbell reports agents without one
+
+- **The Stop hook** (`hooks/stop-check.sh`): an agent that has run the watch before, and has none running now, is told once per session to start it again, with the exact command. If mail is pending too, both go in the same message. An agent that has never run the watch sees no change. What the hook remembers lives in the agent's watch directory inside the relay instance, never under your home directory. Every directory on the way is opened without following links, and a link planted at the file is replaced, never followed. The reminder gives the `--arm-check` step. `relay pending AGENT --json --watch-status` (new, opt-in) adds the watch's state to its answer.
+- **The doorbell job** (still not installed by anything) no longer records rings. Nothing acts on a ring record, and a ring nothing acted on would later have been judged ignored, raising a false "agent unresponsive" alarm. An agent whose watch is running is woken by it. The job records two new cases. `no_driver`: the agent has a live window but no running watch (`why`: `watch_absent`), or a watch that stopped checking (`why`: `watch_stale`). `undelivered_with_watch`: the watch woke the agent, and the mail is still unread after the horizon. Both are recorded, never rung, and `relay doorbell status` lists them, with the `why`.
+
 ### Changed — the doorbell rings only a window it can show is alive, and reports the mail it cannot deliver
 
 The doorbell job (still not installed by anything) now checks each agent's windows before it rings, and records the mail it has no way to deliver, instead of guessing.

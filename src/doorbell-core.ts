@@ -62,7 +62,7 @@
  *         written or closed, and outstanding rings stay outstanding until a session exists.
  *     `operator` (V3) is attribution on escalation records only, never a ring target.
  */
-import type { BoardCase, BoardRecord, BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord } from "./doorbell-log.js";
+import type { BoardCase, BoardRecord, BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord, NoDriverWhy } from "./doorbell-log.js";
 import { MAX_IDS_PER_INTENT, rungKey } from "./doorbell-log.js";
 import type { AnchorVerdict } from "./liveness.js";
 
@@ -73,6 +73,27 @@ export interface CandidateBinding {
   /** The window's anchor (pid + start token): what `liveness` judges. */
   window_pid?: number | null;
   window_pid_start?: string | null;
+}
+
+/**
+ * THE window judgement (ruling 5dda2752), shared by the doorbell and the watch (PR 7, ruling ffcaf608
+ * D1 (iii)): each binding's window on its own; only the PROVEN dead are set aside; another host's
+ * window cannot be judged from here (unverifiable, never dead).
+ */
+export function judgeWindows<B extends CandidateBinding>(bs: readonly B[], ownHostId: string | null, liveness: (b: B) => AnchorVerdict) {
+  const judged = bs.map((x) => ({ b: x, v: x.host_id === ownHostId ? liveness(x) : ("unverifiable" as AnchorVerdict) }));
+  const notDead = judged.filter((x) => x.v !== "dead");
+  const liveWindows = notDead.filter((x) => x.v === "alive");
+  return { judged, notDead, liveWindows, deadCount: judged.length - notDead.length };
+}
+/**
+ * The agent's ONE live window, by the doorbell's own predicate (Q4: never guess): exactly one binding
+ * not proven dead, and it is alive. Otherwise none (no live window) or ambiguous (2+ not proven dead).
+ */
+export function oneLiveWindow<B extends CandidateBinding>(bs: readonly B[], ownHostId: string | null, liveness: (b: B) => AnchorVerdict): { kind: "one"; b: B } | { kind: "none" } | { kind: "ambiguous" } {
+  const { notDead, liveWindows } = judgeWindows(bs, ownHostId, liveness);
+  if (notDead.length >= 2) return { kind: "ambiguous" };
+  return liveWindows.length === 1 ? { kind: "one", b: liveWindows[0].b } : { kind: "none" };
 }
 
 /** What the planner needs from one pending read (pendingMetadata). */
@@ -327,6 +348,20 @@ export interface CycleInput {
   mailAgents: () => readonly string[];
   /** PR 6: each agent's OPEN board case, as the log holds it. Not mutated. */
   boardOpen: ReadonlyMap<string, BoardRecord>;
+  /**
+   * PR 7 (plan §v6): THE WATCH SUPERVISOR. When given, the doorbell forms NO intents at all: each agent
+   * wakes through its own `relay watch --until-wake` (zero doorbell tokens). For the ONE live,
+   * session-bound window it reports: a live watch → nothing (or `undelivered_with_watch` when mail it
+   * already woke the agent for is still undelivered after the horizon); no watch → no_driver(watch_absent);
+   * a hung one → no_driver(watch_stale). Absent (tests, a future active driver): PR 1-6's intent path.
+   */
+  watchFit?: (agentName: string, read: PendingRead, window: CandidateBinding) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean };
+  /**
+   * Ruling 1a8fc7c4 (1): the ACTUATING driver, if one is registered. An intent is formed ONLY for an
+   * agent it fits (an intent is a ring PR 3 will judge). NONE in production today → zero intents; the
+   * PR 1-6 tests pass one to exercise the intent path. A live watch still wins over it (ruling (3)).
+   */
+  actuator?: { fits: (agentName: string) => boolean };
   windowMs: number;
   budgetPerHour: number;
   horizonMs: number;
@@ -512,15 +547,15 @@ export function planCycle(input: CycleInput): CyclePlan {
   }
   const boardOpen = new Map(input.boardOpen);
   /** Move ONE agent's board state; a record ONLY when it changes (A3.2). */
-  const boardTo = (name: string, next: { case: BoardCase; binding_ids: string[]; dead_count: number } | null, pendingCount: number, closeWhy: "resolved" | "no_mail"): void => {
+  const boardTo = (name: string, next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: NoDriverWhy } | null, pendingCount: number, closeWhy: "resolved" | "no_mail"): void => {
     const cur = boardOpen.get(name);
-    if (next && cur && cur.case === next.case) return; // unchanged: written once per state change
+    if (next && cur && cur.case === next.case && cur.why === next.why) return; // unchanged: written once per state change (no_driver's state includes its why)
     if (cur) {
       records.push({ ...cur, at, state: "closed", pending_count: pendingCount, close_reason: next ? "resolved" : closeWhy });
       boardOpen.delete(name);
     }
     if (next) {
-      const rec: BoardRecord = { v: 1, type: "board", at, board_id: newEscalationId(), agent_name: name, case: next.case, state: "open", binding_ids: next.binding_ids.slice(0, MAX_IDS_PER_INTENT), dead_count: next.dead_count, pending_count: pendingCount, close_reason: null };
+      const rec: BoardRecord = { v: 1, type: "board", at, board_id: newEscalationId(), agent_name: name, case: next.case, state: "open", binding_ids: next.binding_ids.slice(0, MAX_IDS_PER_INTENT), dead_count: next.dead_count, pending_count: pendingCount, close_reason: null, ...(next.case === "no_driver" ? { why: next.why } : {}) };
       records.push(rec);
       boardOpen.set(name, rec);
     }
@@ -529,6 +564,8 @@ export function planCycle(input: CycleInput): CyclePlan {
     ambiguous_binding: "ambiguous: 2 or more bindings whose window is not proven dead (Q4: never guess; a board case)",
     no_live_window: "no live window: no binding whose window is alive (a board case)",
     session_unbound: "no bound reading session: delivery cannot be measured, so it is never rung (a board case: re-register or relaunch)",
+    no_driver: "no live relay watch for this window (a board case: re-arm `relay watch <agent> --until-wake`)",
+    undelivered_with_watch: "the watch woke this agent and the mail is still undelivered after the horizon (a board case)",
   };
 
   const covered = new Set<string>(); // agents evaluated this cycle
@@ -565,12 +602,11 @@ export function planCycle(input: CycleInput): CyclePlan {
     }
     // THE DECISION (ruling 5dda2752): each binding's window on its own; only the PROVEN dead are set
     // aside. Another host's window cannot be judged from here: unverifiable, never dead.
-    const judged = bs.map((x) => ({ b: x, v: x.host_id === input.ownHostId ? input.liveness(x) : ("unverifiable" as AnchorVerdict) }));
-    const notDead = judged.filter((x) => x.v !== "dead");
-    const alive = notDead.filter((x) => x.v === "alive");
-    const deadCount = judged.length - notDead.length;
+    const windows = judgeWindows(bs, input.ownHostId, input.liveness);
+    const { judged, notDead, deadCount } = windows;
+    const alive = windows.liveWindows;
     const idsOf = (xs: typeof judged) => sortedSet(xs.map((x) => x.b.binding_id));
-    const next: { case: BoardCase; binding_ids: string[]; dead_count: number } | null =
+    let next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: NoDriverWhy } | null =
       notDead.length >= 2
         ? { case: "ambiguous_binding", binding_ids: idsOf(notDead), dead_count: deadCount }
         : alive.length === 0
@@ -578,7 +614,26 @@ export function planCycle(input: CycleInput): CyclePlan {
           : !rs
             ? { case: "session_unbound", binding_ids: idsOf(alive), dead_count: deadCount }
             : null;
-    boardTo(name, next, read.ids.length, "resolved");
+    // PR 7 (§v6): the WATCH SUPERVISOR. With it, the ONE live, session-bound window is never rung by the
+    // doorbell: its own watch wakes it. The doorbell only reports a missing, hung or ineffective watch.
+    // Ruling 7224605e (3): NO intent for a watch-armed agent (the watch is the wake).
+    // Ruling 1a8fc7c4 (1): NO intent at all unless an ACTUATING driver fits: PR 3 judges every intent
+    // as a ring, so an intent nothing actuates would be judged ineffective and open a FALSE
+    // agent_unresponsive escalation. With no actuator registered (production today) an unarmed agent
+    // is boarded no_driver only; the seam stays for a future actuator.
+    const actuated = !next && !!rs && !!input.actuator?.fits(name);
+    if (!next && rs && input.watchFit) {
+      const wf = input.watchFit(name, read, alive[0].b); // the ONE live window: the watch's key (ruling ffcaf608 D1 (iv))
+      if (wf.status === "live") next = wf.undeliveredAfterWake ? { case: "undelivered_with_watch", binding_ids: idsOf(alive), dead_count: deadCount } : null;
+      else if (!actuated) next = { case: "no_driver", binding_ids: idsOf(alive), dead_count: deadCount, why: wf.status === "stale" ? "watch_stale" : "watch_absent" };
+      boardTo(name, next, read.ids.length, "resolved");
+      if (next) skip(`${BOARD_WHY[next.case]}${next.why ? ` (${next.why})` : ""}`);
+      if (wf.status === "live" || next) continue; // the watch is the wake, or there is no driver: NO intent
+    } else boardTo(name, next, read.ids.length, "resolved");
+    if (!next && rs && !actuated) {
+      skip("no actuating driver: no intent (an un-actuated ring would be judged ineffective)");
+      continue;
+    }
     if (next || !rs) {
       skip(BOARD_WHY[next ? next.case : "session_unbound"]);
       continue;

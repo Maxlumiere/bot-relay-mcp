@@ -104,15 +104,18 @@ interface Args {
   dbPath: string | null;
   /** OPT-IN body window (SessionStart delivery): 0 = metadata only, the default. */
   withContent: number;
+  /** Doorbell PR 7 (§v6): add `watch` (live | stale | absent | never) to the JSON, for the Stop hook's re-arm heal. */
+  watchStatus: boolean;
   help: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { name: null, json: false, dbPath: null, withContent: 0, help: false };
+  const args: Args = { name: null, json: false, dbPath: null, withContent: 0, watchStatus: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") args.json = true;
     else if (a === "--help" || a === "-h") args.help = true;
+    else if (a === "--watch-status") args.watchStatus = true;
     else if (a === "--since") {
       // Refused, not ignored: a caller passing a window expects one to apply.
       throw new Error("--since is not accepted: this is the canonical pending set, which has no window (ADR-0045)");
@@ -144,7 +147,11 @@ function usage(requested = false): void {
     "  --db-path P  Read the DB at P.\n" +
     "  --with-content N  OPT-IN: add the DECRYPTED body to the first N messages\n" +
     "               (drain order, 1-100), read in the same statement as the ids.\n" +
-    "               For SessionStart delivery. Off by default: no content key.\n\n" +
+    "               For SessionStart delivery. Off by default: no content key.\n" +
+    "  --watch-status  OPT-IN: add `watch` to the JSON, for the agent's one live window:\n" +
+    "               live | stale | absent (its `relay watch AGENT --until-wake` runs, hangs,\n" +
+    "               or is gone) | never (it never armed one) | no_window (no single live\n" +
+    "               window). For the Stop hook's re-arm heal.\n\n" +
     "Source: --db-path, RELAY_DB_PATH or RELAY_INSTANCE_ID (explicit) win; then a\n" +
     "configured remote (RELAY_HTTP_HOST) means no local answer; then the active\n" +
     "instance or the legacy DB file.\n\n" +
@@ -246,6 +253,8 @@ export async function run(argv: string[]): Promise<number> {
           count: meta.count,
           top_priority: meta.top_priority,
           messages: meta.messages,
+          // PR 7: the agent's watch on its ONE live window (never | no_window | live | stale | absent).
+          ...(args.watchStatus ? { watch: await (await import("./watch-until-wake.js")).agentWatchStatus(db, dbPath, name) } : {}),
         }) + "\n",
       );
     } else {

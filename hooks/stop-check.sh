@@ -424,7 +424,7 @@ else
     # budget (relay_run_pending / relay_pending_deadline in _vault-helpers.sh).
     if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
       _f1_deadline="$RELAY_STEP_SECS"
-      relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json
+      relay_run_pending "$_f1_deadline" "$_f1_outf" "$_f1_errf" node "$RELAY_CLI" pending "$AGENT_NAME" --json --watch-status
       F1_RC=$?
       F1_OUT=$(cat "$_f1_outf" 2>/dev/null)
       F1_ERR=$(grep -m 1 'PENDING_' "$_f1_errf" 2>/dev/null)
@@ -511,7 +511,101 @@ if [ "$MODE" = unreadable ]; then
   echo "[RELAY] relay unreadable: could not read the local relay DB for ${AGENT_NAME}; mail may be waiting (run: relay pending ${AGENT_NAME})" >&2
 fi
 
+# --- The WATCH re-arm heal (doorbell PR 7, plan §v6.1 (4)) --------------------
+# An agent that has armed `relay watch AGENT --until-wake` at least once, and now
+# has NO live watch on its one live window (gone: absent; hung: stale), is told
+# ONCE PER SESSION to re-arm it, until a live watch is seen again (which resets
+# the once). Positive evidence only: the local read succeeded AND it carried
+# `watch`; `never` (it never armed one) and `no_window` (no single live window)
+# never heal. The once is the session id, kept in the AGENT's watch dir inside
+# the resolved instance (Codex R1 #4: never under the shared $HOME). It is read
+# no-follow and replaced by renameat(2), which replaces a planted link instead
+# of following it; EVERY directory component below the instance is opened
+# no-follow (a link at watch/ or at the agent dir is refused), and every
+# operation is relative to the opened directory. With no valid session id
+# there is no heal (it cannot be bounded).
+# Same block as the mail wake: when mail is pending too, the re-arm line rides
+# inside that one block.
+HEAL_LINE=""
+if [ "$READ_OK" -eq 1 ] && [ "$MODE" = local ] && command -v python3 >/dev/null 2>&1; then
+  HEAL_DB=$(relay_pending_resolution_db "$F1_OUT" 2>/dev/null)
+  if [ -n "$HEAL_DB" ]; then
+    HEAL_LINE=$(F1="$F1_OUT" HI="$HOOK_INPUT" DB="$HEAL_DB" CLI="$RELAY_CLI" AN="$AGENT_NAME" python3 -c '
+import json, os, re, shlex, sys
+try:
+    w = json.loads(os.environ["F1"]).get("watch")
+except Exception:
+    w = None
+if w not in ("live", "stale", "absent"):
+    sys.exit(0)  # never / no_window / missing: no heal
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRFLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | NOFOLLOW
+# EVERY component below the instance dir is opened no-follow, and every operation is relative to the
+# opened directory (Codex R2 (a)): a link at <instance>/watch or at <agent> is refused, never followed.
+fds = []
+try:
+    fds.append(os.open(os.path.dirname(os.environ["DB"]), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)))
+    for comp in ("watch", os.environ["AN"]):
+        fds.append(os.open(comp, DIRFLAGS, dir_fd=fds[-1]))
+except OSError:
+    for fd in fds:
+        os.close(fd)
+    sys.exit(0)  # absent, a link, or not a directory: nothing is read or written
+d = fds[-1]
+def done(code=0):
+    for fd in fds:
+        os.close(fd)
+    sys.exit(code)
+if w == "live":
+    try:
+        os.unlink("heal-session", dir_fd=d)  # removes a link itself, never its target
+    except OSError:
+        pass
+    done()
+try:
+    sid = json.loads(os.environ["HI"]).get("session_id")
+except Exception:
+    sid = None
+if not (isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9-]{1,128}", sid)):
+    done()
+healed = ""
+try:
+    fd = os.open("heal-session", os.O_RDONLY | NOFOLLOW, dir_fd=d)
+    try:
+        healed = os.read(fd, 200).decode("ascii", "replace")
+    finally:
+        os.close(fd)
+except OSError:
+    pass
+if healed == sid:
+    done()  # already told this session
+tmp = ".heal.%s" % os.urandom(8).hex()
+try:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=d)
+    try:
+        os.write(fd, sid.encode("ascii"))
+    finally:
+        os.close(fd)
+    os.rename(tmp, "heal-session", src_dir_fd=d, dst_dir_fd=d)  # renameat(2): replaces a planted link, never follows it
+except OSError:
+    try:
+        os.unlink(tmp, dir_fd=d)
+    except OSError:
+        pass
+    done()  # cannot bound it to once: no heal
+how = "is hung (it stopped checking)" if w == "stale" else "is not running"
+check = "RELAY_DB_PATH=%s %s watch %s --arm-check" % (shlex.quote(os.environ["DB"]), shlex.quote(os.environ["CLI"]), os.environ["AN"])
+sys.stdout.write("[RELAY] Your relay watch %s: mail will not wake this session while you are idle. Re-arm it: run %s and, if it says arm, run the command it gives as a BACKGROUND task (run_in_background)." % (how, check))
+for fd in fds:
+    os.close(fd)
+' 2>/dev/null)
+  fi
+fi
+
 if [ -z "$SUMMARY" ]; then
+  if [ -n "$HEAL_LINE" ]; then
+    HL="$HEAL_LINE" python3 -c 'import json, os, sys; sys.stdout.write(json.dumps({"decision": "block", "reason": os.environ["HL"] + " Then continue."}))' 2>/dev/null
+  fi
   exit 0
 fi
 
@@ -538,6 +632,10 @@ if [ "$GUARD_TRUSTED" -eq 0 ] && [ "$DAMPER_SECS" -gt 0 ]; then
       ''|*[!0-9]*) LAST=0 ;;
     esac
     if [ $((NOW - LAST)) -lt "$DAMPER_SECS" ]; then
+      # The mail wake is damped; the once-per-session heal is not (it is already bounded).
+      if [ -n "$HEAL_LINE" ]; then
+        HL="$HEAL_LINE" python3 -c 'import json, os, sys; sys.stdout.write(json.dumps({"decision": "block", "reason": os.environ["HL"] + " Then continue."}))' 2>/dev/null
+      fi
       exit 0
     fi
   fi
@@ -549,7 +647,7 @@ fi
 # fetch its own mail — the hook deliberately does NOT carry bodies, so the
 # mark-as-read stays inside the agent's authenticated get_messages call.
 command -v python3 >/dev/null 2>&1 || exit 0
-SUMMARY="$SUMMARY" AN="$AGENT_NAME" VIA="$MODE" python3 -c '
+SUMMARY="$SUMMARY" AN="$AGENT_NAME" VIA="$MODE" HL="$HEAL_LINE" python3 -c '
 import json, os, sys
 count, latest_from, top = os.environ["SUMMARY"].split("\x1f", 2)
 an = os.environ["AN"]
@@ -562,6 +660,9 @@ reason = (
     f"act on every message, then continue. The mail is still unread in the relay; "
     f"this wake did not consume it."
 )
+if os.environ.get("HL"):
+    reason += " " + os.environ["HL"]
+
 sys.stdout.write(json.dumps({"decision": "block", "reason": reason}))
 ' 2>/dev/null
 exit 0
