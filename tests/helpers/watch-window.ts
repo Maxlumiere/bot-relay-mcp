@@ -25,6 +25,10 @@
  *   exactly, in the environment only (never argv text), never the runner or its ancestors; listed first,
  *   then only the listed pids are killed, and close() FAILS naming them. An environment that cannot be
  *   read is unreadable, never a hit.
+ * - ON macOS THE SWEEP IS BLIND: every environment is unreadable on Darwin 27 (MEASURED 8 Oct 2026: neither
+ *   `ps -E`/`eww` nor sysctl KERN_PROCARGS2 shows one), so the sweep returns no hits there, SILENTLY. On macOS
+ *   the contract is enforced ONLY by the typed entry points; a green macOS run says nothing about escapes.
+ *   Escape detection is real only on Linux (/proc/<pid>/environ; CI's Linux job).
  * - RESIDUAL (stated): a descendant that both detaches AND clears its environment escapes detection.
  * - POSIX only (a bash window, process groups): openWindow refuses win32. CI runs the helper's users on
  *   Linux and macOS; the Windows job runs a named subset that includes none of them.
