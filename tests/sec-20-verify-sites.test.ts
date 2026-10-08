@@ -23,6 +23,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import ts from "typescript-legacy";
+import { pinnedReferences, srcProgram, virtualProgram } from "./_helpers/ts-binding.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -64,71 +65,6 @@ const PINNED: Record<string, { allowed: string[]; why: string }> = {
   "src/auth.ts:authenticateAgent": { allowed: ["src/server.ts:createServer", "src/authorize-token.ts:authorizeAgentToken"], why: "the state-aware half of authorization: the dispatcher and the one authorizer, each followed by revalidate" },
 };
 
-function topLevelName(node: ts.Node): string {
-  let name = "<module>";
-  for (let cur: ts.Node | undefined = node; cur; cur = cur.parent) {
-    if (ts.isFunctionDeclaration(cur) && cur.name) name = cur.name.text;
-    else if (ts.isVariableDeclaration(cur) && ts.isIdentifier(cur.name) && cur.initializer && (ts.isArrowFunction(cur.initializer) || ts.isFunctionExpression(cur.initializer))) name = cur.name.text;
-  }
-  return name;
-}
-
-/** Every binding-resolved reference to a pinned API in `program`'s files under `rootRel`. */
-export function pinnedReferences(program: ts.Program, rel: (f: string) => string, pinned: string[]): Array<{ api: string; site: string; how: string }> {
-  const checker = program.getTypeChecker();
-  const out: Array<{ api: string; site: string; how: string }> = [];
-  const keyOf = (sym: ts.Symbol | undefined): string | null => {
-    if (!sym) return null;
-    let s = sym;
-    if (s.flags & ts.SymbolFlags.Alias) s = checker.getAliasedSymbol(s);
-    const d = s.declarations?.[0];
-    if (!d) return null;
-    const key = `${rel(d.getSourceFile().fileName)}:${s.name}`;
-    return pinned.includes(key) ? key : null;
-  };
-  for (const sf of program.getSourceFiles()) {
-    const file = rel(sf.fileName);
-    if (!file.startsWith("src/") || sf.isDeclarationFile) continue;
-    const visit = (n: ts.Node): void => {
-      if (ts.isIdentifier(n)) {
-        const p = n.parent;
-        const isOwnDecl = ts.isFunctionDeclaration(p) && p.name === n;
-        const inImportExport = ts.isImportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p) || ts.isExportSpecifier(p);
-        if (!isOwnDecl && !inImportExport) {
-          const key = keyOf(checker.getSymbolAtLocation(n));
-          if (key) out.push({ api: key, site: `${file}:${topLevelName(n)}`, how: ts.isCallExpression(p) && p.expression === n ? "call" : ts.isPropertyAccessExpression(p) ? "member" : "reference" });
-        }
-      }
-      ts.forEachChild(n, visit);
-    };
-    visit(sf);
-  }
-  return out;
-}
-
-function srcProgram(): ts.Program {
-  const cfgPath = path.join(REPO, "tsconfig.json");
-  const cfg = ts.readConfigFile(cfgPath, ts.sys.readFile);
-  const parsed = ts.parseJsonConfigFileContent(cfg.config, ts.sys, REPO);
-  return ts.createProgram({ rootNames: parsed.fileNames, options: { ...parsed.options, noEmit: true } });
-}
-
-/** A program over VIRTUAL files (for the checker's own legs). */
-function virtualProgram(files: Record<string, string>): ts.Program {
-  const options: ts.CompilerOptions = { module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, target: ts.ScriptTarget.ES2022, noEmit: true };
-  const host = ts.createCompilerHost(options);
-  const abs = (f: string) => path.join("/virtual", f);
-  const byAbs = new Map(Object.entries(files).map(([k, v]) => [abs(k), v]));
-  host.fileExists = (f) => byAbs.has(f) || ts.sys.fileExists(f);
-  host.readFile = (f) => byAbs.get(f) ?? ts.sys.readFile(f);
-  // Module resolution walks DIRECTORIES too: the virtual ones must exist for it, or no import resolves (a blind leg).
-  host.directoryExists = (d) => [...byAbs.keys()].some((k) => k.startsWith(`${d}/`)) || ts.sys.directoryExists(d);
-  host.realpath = (f) => f;
-  const orig = host.getSourceFile.bind(host);
-  host.getSourceFile = (f, lang) => (byAbs.has(f) ? ts.createSourceFile(f, byAbs.get(f)!, lang, true) : orig(f, lang));
-  return ts.createProgram({ rootNames: [...byAbs.keys()], options, host });
-}
-
 const relOf = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
 
 describe("the checker (both legs, on virtual sources bound to a pinned API)", () => {
@@ -155,6 +91,10 @@ describe("the checker (both legs, on virtual sources bound to a pinned API)", ()
     const refs = pinnedReferences(virtualProgram(files), (f) => path.relative("/virtual", f).split(path.sep).join("/"), ["src/token-lookup.ts:tokenLookupCandidates"]);
     expect(refs.map((r) => r.site)).toEqual(["src/consumer.ts:authorizes"]);
     expect(PINNED["src/token-lookup.ts:tokenLookupCandidates"].allowed).not.toContain("src/consumer.ts:authorizes");
+  });
+  it("Codex #316 R1 #2: a SHORTHAND object value carrying the pinned API out is found at the site that does it (its later member call only reaches the API through that flagged escape)", () => {
+    const found = run(`import { verifyCredential } from "./token-verify.js";\nconst helpers = { verifyCredential };\nexport function c() { return helpers.verifyCredential(); }`);
+    expect(found.map((r) => r.how)).toContain("reference");
   });
   it("does NOT flag a same-named LOCAL function (the binding, not the spelling, decides)", () => {
     expect(run(`function verifyCredential() { return 1; }\nexport function c() { return verifyCredential(); }`)).toEqual([]);
