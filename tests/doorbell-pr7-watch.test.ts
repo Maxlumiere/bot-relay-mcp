@@ -265,7 +265,19 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   async function expectDormantThenSilentExit(r: import("./helpers/watch-window.js").WindowRun, w: TestWindow, reason: RegExp, recordDir: string, anchor: "window" | "parent" = "window"): Promise<void> {
     const pid = await r.pid();
     for (let i = 0; i < 100 && !dormantRecords(recordDir).some((x) => x.pid === pid); i++) await new Promise((res) => setTimeout(res, 100));
-    expect(dormantRecords(recordDir).find((x) => x.pid === pid)?.reason, r.err()).toMatch(reason);
+    const rec = dormantRecords(recordDir).find((x) => x.pid === pid);
+    // A missing record must say WHY (CI 37729106710 lost it: a bare undefined carried no stderr): the
+    // process state, its exit code, the generation, the dir, and the watch's own stderr.
+    if (!rec) {
+      let names: string[] = [];
+      try {
+        names = fs.readdirSync(recordDir);
+      } catch (err) {
+        names = [`(unreadable: ${err instanceof Error ? err.message : String(err)})`];
+      }
+      expect.fail(`no dormant record for pid ${pid} after 10 s: alive=${alive(pid)} exit=${await within(r.exited, 50)} currentGen=${W.currentGen(recordDir)} dir=[${names.join(", ")}] records=${JSON.stringify(dormantRecords(recordDir))}\n--- its stderr ---\n${r.err()}\n--- its stdout ---\n${r.out()}`);
+    }
+    expect(rec!.reason, r.err()).toMatch(reason);
     expect(await within(r.exited, 2_500)).toBe("timeout"); // NOT exited: dormant
     expect(alive(pid)).toBe(true);
     // The anchor dies: the window (a watch that proved its window), or, for a watch that never did, the
