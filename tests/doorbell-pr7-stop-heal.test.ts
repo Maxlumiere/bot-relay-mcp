@@ -53,9 +53,8 @@ const natural = (sid = "sess-1") => ({ session_id: sid, stop_hook_active: false,
 const agentDir = () => W.watchAgentDir(DB, "h-bob");
 const healFile = () => path.join(agentDir(), W.HEAL_FILE);
 const armedOnce = () => fs.mkdirSync(agentDir(), { recursive: true, mode: 0o700 }); // the agent dir exists: it armed before
-const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 let win: TestWindow;
-const startWatch = () => win.run(`node ${sq(RELAY_BIN)} watch h-bob --until-wake --interval 1 --dormant-check-s 1`);
+const startWatch = () => win.runRelayWatch(["h-bob", "--until-wake", "--interval", "1", "--dormant-check-s", "1"]);
 async function untilLive(): Promise<void> {
   for (let i = 0; i < 100; i++) {
     if (spawnSync("node", [RELAY_BIN, "watch", "h-bob", "--lock-status"], { env: env(), encoding: "utf-8" }).stdout.trim() === "live") return;
@@ -97,12 +96,12 @@ describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)",
     // The steps it gives are RUNNABLE as printed, in the agent's window: the arm-check says arm and
     // gives the background command; with mail pending, that watch wakes.
     const check = (first.block as { reason: string }).reason.replace(/^.*Re-arm it: run /, "").replace(/ and, if it says arm, .*$/, "");
-    const a = win.run(check);
+    const a = win.runPrintedRelayCommand(check);
     expect(await within(a.exited, 30_000), a.err()).toBe(0);
     expect(a.out()).toMatch(/^arm: .*once: /);
     const cmd = a.out().trim().replace(/^arm: .*once: /, "");
     db.sendMessage("h-alice", "h-bob", "x", "normal");
-    const r = win.run(cmd);
+    const r = win.runPrintedRelayCommand(cmd);
     expect(await within(r.exited, 30_000), r.err()).toBe(0);
     expect(r.out()).toMatch(/^relay mail pending for h-bob: 1 new message/);
   }, 60_000);

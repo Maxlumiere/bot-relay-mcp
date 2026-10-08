@@ -203,9 +203,8 @@ describe("ownership (pure; ruling ffcaf608 D1): the window a watch descends from
 // deliver a wake, or (silently) because its window is gone; every other terminal state is DORMANT.
 
 const env = (): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, RELAY_FILESYSTEM_MARKERS: "0" });
-const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-const WATCH = (agent = "w-bob") => `node ${sq(RELAY_BIN)} watch ${agent} --until-wake --interval 1 --dormant-check-s 1`;
-const ARM_CHECK = (agent = "w-bob") => `node ${sq(RELAY_BIN)} watch ${agent} --arm-check`;
+const WATCH = (agent = "w-bob") => [agent, "--until-wake", "--interval", "1", "--dormant-check-s", "1"];
+const ARM_CHECK = (agent = "w-bob") => [agent, "--arm-check"];
 const lockStatus = (agent = "w-bob") => spawnSync("node", [RELAY_BIN, "watch", agent, "--lock-status"], { env: env(), encoding: "utf-8" }).stdout.trim();
 const send = (to = "w-bob") => db.sendMessage("w-alice", to, "hello", "normal").id;
 const relaySnapshot = () => JSON.stringify([db.getDb().prepare("SELECT * FROM messages ORDER BY id").all(), db.getDb().prepare("SELECT * FROM agents ORDER BY name").all()]);
@@ -298,7 +297,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   it("mail already pending → exits 0 at once with ONE wake line (with the re-arm steps); the relay DB is unchanged (read-only)", async () => {
     send();
     const before = relaySnapshot();
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     expect(await within(r.exited, 20_000), r.err()).toBe(0);
     expect(r.out().trim().split("\n")).toEqual([expect.stringMatching(/^relay mail pending for w-bob: 1 new message\(s\)\. Call get_messages, then re-arm: run RELAY_DB_PATH='[^']+' '[^']+\/bin\/relay' watch w-bob --arm-check and, if it says arm, the command it gives in the background\.$/)]);
     expect(relaySnapshot()).toBe(before);
@@ -306,8 +305,8 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
 
   it("HARM (no wake loop): re-armed with the SAME undrained mail it does NOT exit; new mail then wakes it once", async () => {
     send();
-    expect(await within(win.run(WATCH()).exited, 20_000)).toBe(0);
-    const again = win.run(WATCH());
+    expect(await within(win.runRelayWatch(WATCH()).exited, 20_000)).toBe(0);
+    const again = win.runRelayWatch(WATCH());
     expect(await within(again.exited, 3_000)).toBe("timeout");
     send();
     expect(await within(again.exited, 20_000), again.err()).toBe(0);
@@ -317,7 +316,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   it("architect 323f69d5: armed with a NULL session it KEEPS WAITING; the session binds and mail arrives → exactly one wake", async () => {
     db.getDb().prepare("UPDATE agents SET session_id = NULL WHERE name = 'w-bob'").run();
     send();
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     expect(await within(r.exited, 3_000)).toBe("timeout");
     db.registerAgent("w-bob", "r", []);
     expect(await within(r.exited, 20_000), r.err()).toBe(0);
@@ -325,7 +324,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 40_000);
 
   it("(b) the window is GONE while a watch waits → it exits SILENTLY (exit 0, no line)", async () => {
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     await untilStatus("live");
     process.kill(win.pid, "SIGKILL");
     expect(await within(r.exited, 15_000), r.err()).toBe(0);
@@ -333,31 +332,31 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 40_000);
 
   it("HARM (the invariant; a mutant exiting on this path → RED): the LOST RACE goes DORMANT, never exits while its window lives; the holder keeps watching", async () => {
-    const first = win.run(WATCH());
+    const first = win.runRelayWatch(WATCH());
     await untilStatus("live");
-    const second = win.run(WATCH());
+    const second = win.runRelayWatch(WATCH());
     await expectDormantThenSilentExit(second, win, /^already watched/, winDir(win));
     expect(await first.exited).toBe(0); // the holder ended with the window too (silently)
   }, 60_000);
 
   it("a DEAD holder (SIGKILL) frees the lock by kernel fact: the next watch takes it and wakes", async () => {
-    const first = win.run(WATCH());
+    const first = win.runRelayWatch(WATCH());
     await untilStatus("live");
     process.kill(await first.pid(), "SIGKILL");
     await first.exited;
     expect(lockStatus()).toBe("absent");
     send();
-    expect(await within(win.run(WATCH()).exited, 20_000)).toBe(0);
+    expect(await within(win.runRelayWatch(WATCH()).exited, 20_000)).toBe(0);
   }, 40_000);
 
   // --- --arm-check: every arm-time refusal, decided in the FOREGROUND ----------------------------------
   it("--arm-check: arm (with the background command), then live once a watch runs", async () => {
-    const a = win.run(ARM_CHECK());
+    const a = win.runRelayWatch(ARM_CHECK());
     expect(await within(a.exited, 20_000), a.err()).toBe(0);
     expect(a.out().trim()).toMatch(/^arm: start it now as a BACKGROUND task \(run_in_background\), once: RELAY_DB_PATH='[^']+' '[^']+\/bin\/relay' watch w-bob --until-wake$/);
-    win.run(WATCH());
+    win.runRelayWatch(WATCH());
     await untilStatus("live");
-    const b = win.run(ARM_CHECK());
+    const b = win.runRelayWatch(ARM_CHECK());
     expect(await within(b.exited, 20_000)).toBe(0);
     expect(b.out().trim()).toMatch(/^live: a watch for w-bob is already running in this window\. Nothing to do\.$/);
   }, 40_000);
@@ -366,11 +365,11 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const direct = spawnSync("node", [RELAY_BIN, "watch", "w-bob", "--arm-check"], { env: env(), encoding: "utf-8", timeout: 30_000 });
     expect([direct.status, direct.stdout.trim()]).toEqual([2, expect.stringMatching(/^no-mail: refused \(no_bound_ancestor\): /)]);
     const alicesWin = openWin("w-alice");
-    const inAlice = alicesWin.run(ARM_CHECK("w-bob"));
+    const inAlice = alicesWin.runRelayWatch(ARM_CHECK("w-bob"));
     expect(await within(inAlice.exited, 20_000)).toBe(2);
     expect(inAlice.out().trim()).toMatch(/^no-mail: refused \(no_bound_ancestor\)/);
     const O2 = path.join(ROOT, "reparented-arm.out");
-    win.run(`bash -c ${sq(`${ARM_CHECK()} > ${sq(O2)} 2>&1 & disown; exit 0`)}`);
+    win.runRelayWatchOrphaned(ARM_CHECK(), O2);
     let out = "";
     for (let i = 0; i < 200 && !/no-mail|arm:/.test(out); i++) {
       await new Promise((r) => setTimeout(r, 100));
@@ -379,27 +378,27 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     // darwin: the orphan's parent is launchd (pid 1). linux may use a SUBREAPER: its chain holds no bound window.
     expect(out.trim()).toMatch(process.platform === "darwin" ? /^no-mail: refused \(reparented\): / : /^no-mail: refused \((reparented|no_bound_ancestor)\): /);
     openWin("w-bob"); // a second live window
-    const amb = win.run(ARM_CHECK());
+    const amb = win.runRelayWatch(ARM_CHECK());
     expect(await within(amb.exited, 20_000)).toBe(2);
     expect(amb.out().trim()).toMatch(/^no-mail: refused \(ambiguous_binding\)/);
   }, 60_000);
 
   it("a refusal discovered AFTER launch (no arm-check run) → DORMANT under its launching shell, never an exit while that shell lives", async () => {
     const shell = openWin(null); // a shell bound to NOBODY
-    const r = shell.run(WATCH());
+    const r = shell.runRelayWatch(WATCH());
     await expectDormantThenSilentExit(r, shell, /^refused \(no_bound_ancestor\)/, W.watchAgentDir(DB, "w-bob"), "parent");
   }, 60_000);
 
   // --- D1 while running: the binding moves → dormant; the new window arms its own --------------------
   it("D1 (iii): a second live window binds while the watch runs → DORMANT (binding moved), silent exit with its window", async () => {
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     await untilStatus("live");
     openWin("w-bob");
     await expectDormantThenSilentExit(r, win, /^binding moved \(ambiguous_binding\)/, winDir(win));
   }, 60_000);
 
   it("HARM (Codex R1 #1): the agent REBINDS to window B while A's watch runs → A goes DORMANT; B arms its OWN watch (never blocked by A's) and B's mail wakes B", async () => {
-    const a = win.run(WATCH());
+    const a = win.runRelayWatch(WATCH());
     await untilStatus("live");
     const aDir = winDir(win);
     db.getDb().prepare("UPDATE agent_bindings SET superseded_at = ? WHERE window_pid = ?").run(new Date().toISOString(), win.pid);
@@ -408,7 +407,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     for (let i = 0; i < 100 && !dormantRecords(aDir).some((x) => x.pid === aPid); i++) await new Promise((res) => setTimeout(res, 100));
     expect(dormantRecords(aDir).find((x) => x.pid === aPid)?.reason).toMatch(/^binding moved \(not_this_window\)/);
     expect(alive(aPid)).toBe(true);
-    const b = winB.run(WATCH());
+    const b = winB.runRelayWatch(WATCH());
     await untilStatus("live");
     send();
     expect(await within(b.exited, 20_000), b.err()).toBe(0);
@@ -417,14 +416,14 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 60_000);
 
   it("HARM (Codex R2 (b)): the binding's start token is MIGRATED to the legacy form under the same binding → the SAME watch stays the owner and the status still sees it (no second watch)", async () => {
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     await untilStatus("live");
     const legacy = processStartedAt(win.pid, undefined, "legacy") as string;
     expect(legacy).not.toBe(processStartedAt(win.pid)); // precondition: two different spellings
     db.getDb().prepare("UPDATE agent_bindings SET window_pid_start = ? WHERE window_pid = ?").run(legacy, win.pid);
     await new Promise((res) => setTimeout(res, 2_500)); // a few checks
     expect(lockStatus()).toBe("live"); // the status keys the same dir
-    const again = win.run(ARM_CHECK());
+    const again = win.runRelayWatch(ARM_CHECK());
     expect(await within(again.exited, 20_000)).toBe(0);
     expect(again.out()).toMatch(/^live: /); // no second watch would be armed
     expect(await within(r.exited, 500)).toBe("timeout");
@@ -435,13 +434,13 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
 
   // --- D2: a hung holder is ABANDONED by generation, never signalled; the abandoned one goes dormant ----
   it.skipIf(!awakeReadable)("HARM (D2): a HUNG holder (SIGSTOP'd, stale on the AWAKE clock) is abandoned: the re-arm takes generation 1 and wakes; the hung process is NEVER signalled; resumed, it goes DORMANT (superseded)", async () => {
-    const hung = win.run(WATCH());
+    const hung = win.runRelayWatch(WATCH());
     await untilStatus("live");
     const hungPid = await hung.pid();
     process.kill(hungPid, "SIGSTOP");
     ageHolder(winDir(win));
     expect(lockStatus()).toBe("stale");
-    const next = win.run(WATCH());
+    const next = win.runRelayWatch(WATCH());
     await untilStatus("live");
     expect(W.currentGen(winDir(win))).toBe(1);
     expect(next.err()).toMatch(/generation 0\) is hung: abandoned it; contesting generation 1 \(nothing is signalled\)/);
@@ -453,7 +452,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 90_000);
 
   it("a LIVE holder is never abandoned, even with a PREDECESSOR's ancient heartbeat (it counts only its own)", async () => {
-    const first = win.run(WATCH());
+    const first = win.runRelayWatch(WATCH());
     await untilStatus("live");
     W.writeHeartbeat(winDir(win), { pid: 999_999, gen: 0, at: new Date().toISOString(), awake_ms: -10_000_000 });
     expect(lockStatus()).toBe("live");
@@ -462,7 +461,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 40_000);
 
   it("Codex R2 (c): a holder with NO readable awake stamp is never judged stale (no false takeover after a long sleep)", async () => {
-    win.run(WATCH());
+    win.runRelayWatch(WATCH());
     await untilStatus("live");
     const dir = winDir(win);
     const h = JSON.parse(fs.readFileSync(path.join(dir, W.watchHolderFile(0)), "utf-8"));
@@ -476,31 +475,31 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const dir = winDir(win);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(path.join(dir, W.WOKEN_FILE));
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     expect(await within(r.exited, 20_000), r.err()).toBe(0);
     expect(r.out()).toMatch(/^relay mail pending for w-bob: 1 new message/);
     expect(r.err()).toMatch(/could not record what it woke for/);
-    const again = win.run(WATCH());
+    const again = win.runRelayWatch(WATCH());
     expect(await within(again.exited, 20_000), again.err()).toBe(0);
     expect(again.out()).toMatch(/^relay mail pending for w-bob: 1 new message/);
   }, 40_000);
 
   it("its lock file REMOVED under it (the dir deleted) → DORMANT (lock lost), never a second watch beside it; silent exit with its window", async () => {
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     await untilStatus("live");
     fs.rmSync(W.watchAgentDir(DB, "w-bob"), { recursive: true, force: true });
     await expectDormantThenSilentExit(r, win, /^lock lost: /, winDir(win));
   }, 60_000);
 
   it("the agent UNREGISTERED while watching → DORMANT (unregistered)", async () => {
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     await untilStatus("live");
     db.getDb().prepare("DELETE FROM agents WHERE name = 'w-bob'").run();
     await expectDormantThenSilentExit(r, win, /^unregistered: /, winDir(win));
   }, 60_000);
 
   it("a signal (a deliberate TaskStop) exits with a no-mail line", async () => {
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     await untilStatus("live");
     process.kill(await r.pid(), "SIGTERM");
     expect(await within(r.exited, 10_000)).toBe(0);
@@ -524,9 +523,9 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 30_000);
 
   it("`relay doorbell status` counts the LIVE dormant watches per agent", async () => {
-    win.run(WATCH());
+    win.runRelayWatch(WATCH());
     await untilStatus("live");
-    const loser = win.run(WATCH());
+    const loser = win.runRelayWatch(WATCH());
     const lpid = await loser.pid();
     for (let i = 0; i < 100 && !dormantRecords(winDir(win)).some((x) => x.pid === lpid); i++) await new Promise((res) => setTimeout(res, 100));
     const { readDoorbellStatus } = await import("../src/cli/doorbell.js");
