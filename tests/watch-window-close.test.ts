@@ -69,6 +69,20 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     }
   });
 
+  // Linux's /bin/sh is dash, which gives a background command /dev/null as stdin before its own redirections
+  // (CI cf4d6f6: every window read EOF and exited). macOS ships /bin/dash, so this pins it on both.
+  it.skipIf(!fs.existsSync("/bin/dash"))("the window RUNS COMMANDS under dash (Linux's /bin/sh) as the supervisor's shell", async () => {
+    const w = openWindow(path.join(ROOT, "dash"), env, { supervisorShell: "/bin/dash" });
+    const leaderStart = processStartedAt(w.leaderPid);
+    try {
+      const r = w.runSleep(0);
+      expect(await Promise.race([r.exited, sleep(5_000).then(() => "timeout")])).toBe(0); // PRIMARY
+      expect(isPidAlive(w.pid)).toBe(true);
+    } finally {
+      cleanup(w, leaderStart);
+    }
+  }, 15_000);
+
   it("leaves NOTHING behind: no run's subshell writes into the dir after close() returns", async () => {
     const dir = path.join(ROOT, "quiet");
     const w = openWindow(dir, env, { codeWriteDelayS: 1 });
