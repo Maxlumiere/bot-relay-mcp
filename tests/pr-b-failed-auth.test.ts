@@ -402,15 +402,25 @@ function occupancy(spans: Array<[number, number]>, t0: number, t1: number): Pool
  *   (7) Every BAR line reports median d, median |a|, the effect size, the verdict and the resolution.
  * A pool-loaded bar's controls (both of them) must also prove their occupancy (expectControlLoaded).
  *
- * CLAIM: decision threshold 50 ms; detection of >= 80 ms added per burst proven in the run that reports it (the
- * boundary pair); regressions under that are carried by COUNT + the compare ban.
+ * CLAIMS, stated per instrument and reported per run (architect, LOOP boundary sizing):
+ *   - AVAILABILITY (/health): decision threshold 50 ms; detection of >= 80 ms added per burst proven in the run
+ *     that reports it (the boundary pair: +80 FAIL, +20 PASS).
+ *   - LOOP (event-loop delay): ELD is a MAX, so an injected stall B lands as d ~= B - (the control's own max), not
+ *     +B: a fixed +80 read only 56-60 on CI, hugging the threshold. Its FAIL block is therefore 1.6 x 50 + the
+ *     SAME run's median control ELD max (taken from the +20 bar, after its A/A-quiet check), capped at 200 ms
+ *     (over the cap: LOOP boundary NOT_EVALUATED). Claim: "LOOP detects a single synchronous stall >= 50 ms + this
+ *     run's median control ELD max (reported per run)". Its PASS block stays +20.
+ *   Regressions under these are carried by COUNT + the compare ban.
  */
 const K = 9;
 const EFFECT_MS = 50;
 const GROSS_BLOCK_MS = 200;
 const BOUNDARY_FAIL_MS = 80;
 const BOUNDARY_PASS_MS = 20;
-const CLAIM = `decision threshold ${EFFECT_MS} ms; detection of >= ${BOUNDARY_FAIL_MS} ms added per burst proven this run; regressions under that are carried by COUNT + the compare ban`;
+const LOOP_BLOCK_CAP_MS = 200;
+const HEALTH_CLAIM = `AVAILABILITY: decision threshold ${EFFECT_MS} ms; detection of >= ${BOUNDARY_FAIL_MS} ms added per burst proven this run`;
+const loopClaim = (controlMedian: number) =>
+  `LOOP: detects a single synchronous stall >= ${EFFECT_MS} ms + this run's median control ELD max (${controlMedian.toFixed(1)} ms), i.e. >= ${(EFFECT_MS + controlMedian).toFixed(1)} ms`;
 const NOISE_LIMIT_MS = EFFECT_MS / 2;
 const CEILING_MS = 500;
 /**
@@ -673,7 +683,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 600_000);
 
-  it("NEGATIVE CONTROL + THE RESOLUTION, live: +200 ms TRIPS on every run; an injected noise source reads NOT_EVALUATED; on an evaluated run +80 ms FAILS and +20 ms PASSES", async () => {
+  it("NEGATIVE CONTROL + THE RESOLUTION, live: +200 ms TRIPS on every run; an injected noise source reads NOT_EVALUATED; on an evaluated run the boundary blocks FAIL (AVAILABILITY +80, LOOP +80 + the run's control ELD) and +20 PASSES", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       await measure(port, controlLoad(20));
@@ -684,22 +694,38 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       const sizes = [60, 120, 80, 150, 70, 110, 90, 140, 100];
       let round = 0;
       const noisy = await runBar("A/A with injected noise", port, controlLoad(20), { controlOnLoop: () => loopBlock(sizes[round++ % sizes.length])() });
-      // THE BOUNDARY PAIR, live: +80 ms (1.6 x the effect size) and +20 ms (0.4 x) in every auth burst.
-      const at80 = await runBar(`boundary +${BOUNDARY_FAIL_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(BOUNDARY_FAIL_MS) });
+      // THE BOUNDARY PAIRS, live. The +20 PASS bar runs FIRST: its controls give this run's median control ELD max.
       const at20 = await runBar(`boundary +${BOUNDARY_PASS_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(BOUNDARY_PASS_MS) });
-      const evaluated = [at80, at20].every((b) => b.eld.verdict !== "NOT_EVALUATED" && b.health.verdict !== "NOT_EVALUATED");
+      //   AVAILABILITY's FAIL block: a fixed +80.
+      const at80 = await runBar(`boundary AVAILABILITY +${BOUNDARY_FAIL_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(BOUNDARY_FAIL_MS) });
+      //   LOOP's FAIL block: 1.6 x 50 + this run's median control ELD max (after the A/A-quiet check), capped.
+      const ctlEldMedian = median(at20.control.map((r) => r.eldMax));
+      const loopBlockMs = BOUNDARY_FAIL_MS + ctlEldMedian;
+      const loopSized = at20.eld.verdict !== "NOT_EVALUATED" && loopBlockMs <= LOOP_BLOCK_CAP_MS;
+      const atLoop = loopSized ? await runBar(`boundary LOOP +${loopBlockMs.toFixed(1)} ms (80 + median control ELD ${ctlEldMedian.toFixed(1)})`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(loopBlockMs) }) : null;
+
+      const healthEvaluated = at80.health.verdict !== "NOT_EVALUATED" && at20.health.verdict !== "NOT_EVALUATED";
+      const loopEvaluated = atLoop !== null && atLoop.eld.verdict !== "NOT_EVALUATED" && at20.eld.verdict !== "NOT_EVALUATED";
       announce(
-        evaluated
-          ? `CLAIM ${CLAIM} | boundary pair EVALUATED: +${BOUNDARY_FAIL_MS} ms LOOP ${at80.eld.verdict} AVAILABILITY ${at80.health.verdict}; +${BOUNDARY_PASS_MS} ms LOOP ${at20.eld.verdict} AVAILABILITY ${at20.health.verdict}`
-          : `CLAIM ${CLAIM} | boundary pair NOT_EVALUATED (the instrument was noisy this run): only the gross negative, COUNT and the ceiling gate decide`,
+        healthEvaluated
+          ? `CLAIM ${HEALTH_CLAIM} | boundary EVALUATED: +${BOUNDARY_FAIL_MS} ms ${at80.health.verdict}; +${BOUNDARY_PASS_MS} ms ${at20.health.verdict}`
+          : `CLAIM ${HEALTH_CLAIM} | boundary NOT_EVALUATED (the instrument was noisy this run): only the gross negative, COUNT and the ceiling gate decide`,
+      );
+      announce(
+        loopEvaluated
+          ? `CLAIM ${loopClaim(ctlEldMedian)} | boundary EVALUATED: +${loopBlockMs.toFixed(1)} ms ${atLoop!.eld.verdict}; +${BOUNDARY_PASS_MS} ms ${at20.eld.verdict}`
+          : `CLAIM ${loopClaim(ctlEldMedian)} | boundary NOT_EVALUATED (${!loopSized && loopBlockMs > LOOP_BLOCK_CAP_MS ? `the sized block ${loopBlockMs.toFixed(1)} ms exceeds the ${LOOP_BLOCK_CAP_MS} ms cap` : "the instrument was noisy this run"}): only the gross negative, COUNT and the ceiling gate decide`,
       );
 
       expectTrips(neg); // on EVERY run, noisy or not: the instrument must not be blind
       expect(noisy.eld.verdict, "injected A/A noise must read NOT_EVALUATED (never red)").toBe("NOT_EVALUATED");
-      if (evaluated) {
-        // On an evaluated run the pair must straddle the threshold on BOTH instruments.
-        for (const v of [at80.eld, at80.health]) expect(v.verdict, `+${BOUNDARY_FAIL_MS} ms must FAIL (d=${v.d.toFixed(1)})`).toBe("FAIL");
-        for (const v of [at20.eld, at20.health]) expect(v.verdict, `+${BOUNDARY_PASS_MS} ms must PASS (d=${v.d.toFixed(1)})`).toBe("PASS");
+      if (healthEvaluated) {
+        expect(at80.health.verdict, `AVAILABILITY +${BOUNDARY_FAIL_MS} ms must FAIL (d=${at80.health.d.toFixed(1)})`).toBe("FAIL");
+        expect(at20.health.verdict, `AVAILABILITY +${BOUNDARY_PASS_MS} ms must PASS (d=${at20.health.d.toFixed(1)})`).toBe("PASS");
+      }
+      if (loopEvaluated) {
+        expect(atLoop!.eld.verdict, `LOOP +${loopBlockMs.toFixed(1)} ms must FAIL (d=${atLoop!.eld.d.toFixed(1)})`).toBe("FAIL");
+        expect(at20.eld.verdict, `LOOP +${BOUNDARY_PASS_MS} ms must PASS (d=${at20.eld.d.toFixed(1)})`).toBe("PASS");
       }
     });
   }, 600_000);
