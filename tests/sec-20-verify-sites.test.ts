@@ -92,6 +92,10 @@ describe("the checker (both legs, on virtual sources bound to a pinned API)", ()
     expect(refs.map((r) => r.site)).toEqual(["src/consumer.ts:authorizes"]);
     expect(PINNED["src/token-lookup.ts:tokenLookupCandidates"].allowed).not.toContain("src/consumer.ts:authorizes");
   });
+  it("Codex #316 R1 #2: a SHORTHAND object value carrying the pinned API out is found at the site that does it (its later member call only reaches the API through that flagged escape)", () => {
+    const found = run(`import { verifyCredential } from "./token-verify.js";\nconst helpers = { verifyCredential };\nexport function c() { return helpers.verifyCredential(); }`);
+    expect(found.map((r) => r.how)).toContain("reference");
+  });
   it("does NOT flag a same-named LOCAL function (the binding, not the spelling, decides)", () => {
     expect(run(`function verifyCredential() { return 1; }\nexport function c() { return verifyCredential(); }`)).toEqual([]);
   });
