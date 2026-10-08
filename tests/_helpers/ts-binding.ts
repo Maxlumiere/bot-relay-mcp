@@ -4,9 +4,10 @@
 // See LICENSE for full terms.
 
 /**
- * BINDING-RESOLVED references for the SEC-20 pins (tests/sec-20-verify-sites.test.ts, tests/sec-20-t2-auth-state-writes.test.ts):
- * the TypeScript checker (the pinned typescript-legacy of #212) resolves each identifier to its declaration, through
- * import aliases, re-exports and namespace imports. ONE implementation for both pins.
+ * BINDING-RESOLVED references for the SEC-20 pins: the TypeScript checker (the pinned typescript-legacy of #212) resolves
+ * each identifier to its declaration, through import aliases, re-exports, namespace imports and shorthand object values.
+ * `resolveBinding` is the ONE resolver of the verify-sites pin (SEC-20.T3) and the async-handler inventory. The T2 SQL
+ * pin keeps its own until it is retired (the auth_state edge trigger replaces it); it shares only program construction.
  */
 import path from "path";
 import { fileURLToPath } from "url";
@@ -23,18 +24,27 @@ export function topLevelName(node: ts.Node): string {
   return name;
 }
 
+/**
+ * What an identifier BINDS to: `<declaring file>:<symbol>` and the declaration, or null. A shorthand object value
+ * (`{ verifyCredential }`) binds to the VALUE it carries, not to the new object's property (Codex #316 R1 #2: the
+ * property symbol belongs to the consumer's object, so the escape was invisible).
+ */
+export function resolveBinding(checker: ts.TypeChecker, id: ts.Identifier, rel: (f: string) => string): { key: string; decl: ts.Declaration } | null {
+  const p = id.parent;
+  let sym = ts.isShorthandPropertyAssignment(p) && p.name === id ? checker.getShorthandAssignmentValueSymbol(p) : checker.getSymbolAtLocation(id);
+  if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+  const decl = sym?.declarations?.[0];
+  if (!sym || !decl) return null;
+  return { key: `${rel(decl.getSourceFile().fileName)}:${sym.name}`, decl };
+}
+
 /** Every binding-resolved reference to a pinned API in `program`'s files under `rootRel`. */
 export function pinnedReferences(program: ts.Program, rel: (f: string) => string, pinned: string[]): Array<{ api: string; site: string; how: string }> {
   const checker = program.getTypeChecker();
   const out: Array<{ api: string; site: string; how: string }> = [];
-  const keyOf = (sym: ts.Symbol | undefined): string | null => {
-    if (!sym) return null;
-    let s = sym;
-    if (s.flags & ts.SymbolFlags.Alias) s = checker.getAliasedSymbol(s);
-    const d = s.declarations?.[0];
-    if (!d) return null;
-    const key = `${rel(d.getSourceFile().fileName)}:${s.name}`;
-    return pinned.includes(key) ? key : null;
+  const keyOf = (id: ts.Identifier): string | null => {
+    const b = resolveBinding(checker, id, rel);
+    return b && pinned.includes(b.key) ? b.key : null;
   };
   for (const sf of program.getSourceFiles()) {
     const file = rel(sf.fileName);
@@ -45,7 +55,7 @@ export function pinnedReferences(program: ts.Program, rel: (f: string) => string
         const isOwnDecl = ts.isFunctionDeclaration(p) && p.name === n;
         const inImportExport = ts.isImportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p) || ts.isExportSpecifier(p);
         if (!isOwnDecl && !inImportExport) {
-          const key = keyOf(checker.getSymbolAtLocation(n));
+          const key = keyOf(n);
           if (key) out.push({ api: key, site: `${file}:${topLevelName(n)}`, how: ts.isCallExpression(p) && p.expression === n ? "call" : ts.isPropertyAccessExpression(p) ? "member" : "reference" });
         }
       }
