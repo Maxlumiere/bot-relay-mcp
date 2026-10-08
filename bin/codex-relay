@@ -133,15 +133,15 @@ register_at_launch() {
     }')
   fi
 
+  # The token is never a header in argv: it rides curl's config on STDIN with the secret (below).
   local reg_headers=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
-  [ -n "$token" ] && reg_headers+=(-H "X-Agent-Token: ${token}")
 
   # NON-force, NO agent_pid. A live same-name session correctly rejects this
   # (duplicate-session protection intact) → no marker → hook fallback.
   local body reg_body
   body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${caps_json}${title_val:+,\"terminal_title_ref\":\"${title_val}\"}${chain:+,\"host_shell_pids\":${chain}}${guid:+,\"host_id\":\"${guid}\"}}}}"
-  # PR-D: the registration secret rides curl's config on STDIN (never argv, never env).
-  reg_body=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; } | curl -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
+  reg_body=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; relay_curl_token_config "$token" || true; } | curl -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${reg_headers[@]}" \
     --data "$body" 2>/dev/null) || return 0
 

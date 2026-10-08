@@ -210,6 +210,42 @@ resolve_relay_token_path() {
 # mintSecretHome). A missing, symlinked, short or oddly-shaped secret prints
 # NOTHING and returns 1: the register then goes without it, and the server's
 # refusal (MINT_SECRET_REQUIRED) makes the hook's verdict REGISTER_FAILED, loud.
+# relay_curl_config_line KEY VALUE — print ONE curl config directive, `KEY = "VALUE"`, for `curl -K -` on
+# STDIN. THE way every hook hands curl a credential (a token header, a body holding a token): a process's argv
+# is readable by every local user (ps, /proc/<pid>/cmdline); a pipe is not. The value is quoted with curl's
+# own escapes (\\ and \"), so it can never end the quoted value early. A CR or LF would start a NEW directive,
+# so such a value is REFUSED: nothing printed, status 1 (the request then goes without it, and fails loudly).
+relay_curl_config_line() {
+  case "$1" in '' | *[!a-z-]*) return 1 ;; esac
+  case "$2" in *$'\n'* | *$'\r'*) return 1 ;; esac
+  local v="$2"
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf '%s = "%s"\n' "$1" "$v"
+}
+
+# relay_curl_token_config TOKEN — the X-Agent-Token header as a curl config line (see relay_curl_config_line).
+# An empty token prints nothing and succeeds: the request goes unauthenticated, as it did with no header.
+relay_curl_token_config() {
+  [ -n "$1" ] || return 0
+  relay_curl_config_line header "X-Agent-Token: $1"
+}
+
+# relay_redact SECRET... — copy stdin to stdout with every occurrence of each given secret (8+ chars; shorter
+# or empty arguments are ignored) replaced by <redacted>, AND the value of every JSON field whose name ends in
+# `token` or `secret`, escaped or not (a credential the caller did not know it held). Over-redacting is the
+# chosen direction: a debug line that loses a non-secret value costs nothing; a printed token lands in the
+# session transcript. Redact BEFORE truncating: a cut can leave a secret's prefix that no longer matches.
+relay_redact() {
+  local s sec
+  s=$(cat)
+  for sec in "$@"; do
+    [ "${#sec}" -ge 8 ] || continue
+    s=${s//"$sec"/<redacted>}
+  done
+  printf '%s\n' "$s" | sed -E 's/([A-Za-z_]*(token|secret)\\*"[[:space:]]*:[[:space:]]*\\*")[^"\\]*/\1<redacted>/g'
+}
+
 # relay_mint_secret_file — print WHERE this instance's registration secret lives (never its content), for the
 # hooks' REGISTER_FAILED guidance. Returns 1 when the instance does not resolve.
 relay_mint_secret_file() {

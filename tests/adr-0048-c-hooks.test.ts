@@ -40,10 +40,11 @@ const TASK_TITLE = "TASK-FROM-THE-WRONG-DB";
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 fs.mkdirSync(STUBS, { recursive: true });
-// Every call is logged; /health answers only when HEALTH_OK exists (a reachable remote).
+// Every call is logged, and so is a config read from STDIN (`-K -`), each of its lines prefixed `cfg: `;
+// /health answers only when HEALTH_OK exists (a reachable remote).
 fs.writeFileSync(
   path.join(STUBS, "curl"),
-  `#!/bin/sh\nprintf '%s\\n' "$*" >> "${CURL_LOG}"\ncase "$*" in *"/health"*) [ -e "${HEALTH_OK}" ] && { echo ok; exit 0; } ;; esac\nexit 7\n`,
+  `#!/bin/sh\nprintf '%s\\n' "$*" >> "${CURL_LOG}"\ncase " $* " in *" -K - "*) sed 's/^/cfg: /' >> "${CURL_LOG}" ;; esac\ncase "$*" in *"/health"*) [ -e "${HEALTH_OK}" ] && { echo ok; exit 0; } ;; esac\nexit 7\n`,
   { mode: 0o755 },
 );
 // Log the relay verb (argv[2] after the CLI path), then run the real node.
@@ -201,7 +202,9 @@ describe("ADR-0048 PR C — PostToolUse / Stop take pending's embedded resolutio
       fs.writeFileSync(path.join(RH, "agents", `${AGENT}.token`), token + "\n", { mode: 0o600 });
       fs.writeFileSync(HEALTH_OK, "");
       const r = runHook(hook, { RELAY_HTTP_HOST: "127.0.0.1" }, JSON.stringify({ session_id: "s1" }));
-      expect(r.curls.join("\n"), r.out).toContain(`X-Agent-Token: ${token}`);
+      // The token reaches curl through its config on STDIN, and never through argv (readable by every user).
+      expect(r.curls, r.out).toContain(`cfg: header = "X-Agent-Token: ${token}"`);
+      expect(r.curls.filter((l) => !l.startsWith("cfg: ")).join("\n"), r.out).not.toContain(token);
       expect(r.verbs.filter((v) => v === "where"), r.verbs.join(",")).toHaveLength(1);
     });
   }

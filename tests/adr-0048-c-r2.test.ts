@@ -246,7 +246,7 @@ describe("Codex #291 R2 #1 — relay_budget_for: the ONE arithmetic (own cap vs 
 // ---------------------------------------------------------------------------
 
 /**
- * curl: honours -m/--max-time; each kind of call takes STUB_D_<kind> seconds and
+ * curl: honours -m/--max-time; each kind of call (read from argv and any `-K -` config) takes STUB_D_<kind> seconds and
  * answers only when it fits its cap. Logs "kind cap elapsed" (elapsed from T0,
  * sub-second). node: `relay where` takes STUB_WHERE seconds, then the real node.
  */
@@ -260,7 +260,9 @@ function stubs(dir: string): { curlLog: string; nodeLog: string } {
     [
       "#!/bin/sh",
       'm=""; prev=""; for a in "$@"; do case "$prev" in -m|--max-time) m="$a" ;; esac; prev="$a"; done',
-      'k=other; case "$*" in *get_messages*) k=mail ;; *health_check*) k=hcheck ;; *register_agent*) k=register ;; *report_liveness*) k=liveness ;; */health*) k=health ;; esac',
+      // A body can ride curl's config on STDIN (`-K -`, how the hooks send a token): classify on argv AND config.
+      'cfg=""; case " $* " in *" -K - "*) cfg=$(cat) ;; esac',
+      'k=other; case "$* $cfg" in *get_messages*) k=mail ;; *health_check*) k=hcheck ;; *register_agent*) k=register ;; *report_liveness*) k=liveness ;; */health*) k=health ;; esac',
       "now=$(perl -MTime::HiRes=time -e 'printf \"%.3f\", time')",
       `printf '%s %s %s\\n' "$k" "$m" "$(awk -v a="$now" -v b="$T0" 'BEGIN{printf "%.3f", a-b}')" >> "${curlLog}"`,
       'eval d=\\${STUB_D_$k:-0.1}',
