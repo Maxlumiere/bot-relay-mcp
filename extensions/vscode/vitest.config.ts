@@ -13,9 +13,12 @@
  * pick up `transport-diagnostics.test.ts` (and any future helper unit
  * tests) without touching the root config.
  */
-import { defineConfig } from "vitest/config";
+// The repo's shared base (architect 621856a0): a private HOME and port 1, the operator tripwire, and a
+// run guard that fails the run on any recorded violation. Some of these tests resolve ~/.bot-relay
+// paths (the token vault): they must never resolve the operator's.
+import { withOperatorTripwire } from "../../tests/_setup/vitest-tripwire-base.mjs";
 
-export default defineConfig({
+export default withOperatorTripwire({
   test: {
     include: ["src/**/*.test.ts"],
     exclude: ["node_modules/**", "out/**"],

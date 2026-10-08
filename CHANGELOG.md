@@ -76,6 +76,28 @@ Any process that could reach the relay's local HTTP port could register a new ag
 - **A SessionStart hook that runs twice in one window no longer reports `REGISTER_FAILED`.** The second run, from the same process with the same token, is now a no-op refresh.
 - **Two relays starting at the same moment no longer crash creating the secret.** It is written to a temporary file and moved into place in one step.
 
+### Fixed — running the test suite no longer reaches a relay running on the same machine
+
+On a machine with a relay daemon running, every `npm test` run sent seven `register_agent` calls for an agent named `probe` to the daemon on port 3777, and the same hook runs resolved that machine's live relay database as their own. A hook test passed two of its options under the wrong names, so it ran the real hooks with no `HOME` (bash and node then fall back to the account's real home, whose `~/.bot-relay` names the live instance) and with no port (the hooks default to 3777). The calls were refused, because an agent named `probe` already existed, but they reached the live daemon on every run.
+
+- **Fixed where it started.** The test passes its options under the right names. Its helper now refuses an option it does not know, so a misspelling can no longer silently drop the isolation. One test that passed without testing anything (its environment override was never applied) now tests what it claims.
+- **Every test starts away from the live relay.** This stops ACCIDENTAL drift, not a test written to get around it.
+  - Every test configuration gives each test worker a private home (`HOME`, and `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `TEMP` and `TMP` for Windows) and a closed default port. That covers the publish gate's full run and the extension's.
+  - A process a test starts gets the same when its environment leaves them out or sets them EMPTY. An empty port used to mean 3777 to the hooks.
+  - A relay home, database or config path set in the shell is dropped from each test worker, whether absolute or relative.
+  - A new test configuration that does not do all this fails the suite.
+- **Caught and refused, failing the run.** This covers the test process and every `node` process a test starts:
+  - a connection to the machine's relay port, however the address is spelled;
+  - a file read or write under the real relay directory, through a link or a `..` included;
+  - a process environment that names the real home or relay directory;
+  - a `node` process that refused an access but could not record it.
+
+  The refusal fails the test that made it even when the test catches the error, and fails the whole run.
+- **Caught after the fact, failing the run.** Before and after each run, a read-only check compares every live relay database a running daemon holds. It fails the run if a new agent, message or log entry appeared from outside the agents that were already there, or one names a test. For example, it catches a process started with an empty environment that falls back to the account's real home and port 3777 and calls the daemon.
+  - It reports what it found as a certain test leak, a likely one, or a possible one (a real agent registering mid-run fails it too).
+  - With no daemon running it says "not evaluated" by name, never a silent pass.
+- **Neither prevented nor caught.** A READ of the live relay that leaves no trace. For example: a process started with an empty environment, an asynchronous or native SQLite read, a worker thread, or a program that is not `node`, reading the live database or config through a path built from the account's real home. Closing this needs the tests to run as a separate account, a separate project. A static check still fails on any test or hook file that names the real home or a live instance.
+
 ### Security — three new dependency advisories cleared
 
 - **proxy-addr 2.0.8** in the server and the extension (was 2.0.7; critical, GHSA-jqcg-44mw-7w3h). An IPv4 address no longer matches an IPv6 trust subnet that does not cover the IPv4-mapped range. Express uses it to trust proxies; the relay does not turn on Express's trust-proxy setting.

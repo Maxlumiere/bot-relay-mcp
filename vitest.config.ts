@@ -8,9 +8,12 @@
  *
  * Dev loops + CI get the fast default run. Publish gets the full gate.
  */
-import { defineConfig } from "vitest/config";
+// EVERY vitest config extends the shared base (architect 621856a0): a private HOME and port 1 for every
+// run, the operator tripwire FIRST in setupFiles, and a run guard whose teardown fails the run on any
+// recorded violation. tests/vitest-configs-extend-base.test.ts enforces it for every vitest*.config.*.
+import { withOperatorTripwire } from "./tests/_setup/vitest-tripwire-base.mjs";
 
-export default defineConfig({
+export default withOperatorTripwire({
   // READ-ONLY / SYMLINKED CHECKOUT (e.g. an isolated audit tree): Vite fails to
   // start because it writes `.vite-temp` under node_modules. The PROVEN fix is to
   // run with `--configLoader runner`, which skips the config bundle entirely:
@@ -31,6 +34,7 @@ export default defineConfig({
     // ws-401/403 on a machine that has run `relay init`) from ONE site. A test that
     // sets its own RELAY_CONFIG_PATH at its module top overrides it (asserted in
     // tests/config-isolation.test.ts). Scoped to config+secrets, NOT RELAY_HOME.
+    // (The operator tripwire is put FIRST, before this, by withOperatorTripwire.)
     setupFiles: ["./tests/_setup/hermetic-config.ts"],
     include: ["tests/**/*.test.ts"],
     exclude: [
