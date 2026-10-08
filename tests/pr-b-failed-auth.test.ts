@@ -21,6 +21,7 @@ import path from "path";
 import type { Server as HttpServer } from "http";
 import { monitorEventLoopDelay } from "perf_hooks";
 import { Worker } from "worker_threads";
+import { LAPSE_MAX_BUSY, OCCUPANCY_FLOOR, lapseReport, lapsedPool, occupancy, type PoolOccupancy, type PoolWork } from "./_helpers/pool-occupancy.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-b-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -283,26 +284,6 @@ interface Reading {
   pool?: PoolOccupancy;
 }
 
-/** How much of a pool-loaded control's window its pool work actually occupied. */
-interface PoolOccupancy {
-  /** Compares that started and finished inside the window. */
-  inWindow: number;
-  /** Compares that had FINISHED when the reading was taken (inside the window or not). */
-  total: number;
-  /** Fraction of the window with at least one control compare in flight. */
-  busy: number;
-}
-
-/**
- * The control's pool work, instrumented: `track` wraps each compare, so measure() knows when the pool was busy.
- * MEASURED on main (294fdfc, local M2): the control's window was 35-63 ms while its 12 compares finished 390-457 ms
- * after it opened; with the old window this occupancy check reads "0/0 in-window, busy 0.00" in every round. The
- * "pool-loaded" control measured an unloaded loop. The auth arm's compares run inside its requests, so its
- * window spans them; on a noisy 3-core runner the longer window alone catches more delay, which inflated the gap
- * (CI 26803c9: control per-round eld 11.5/57.7/6.7/54.8/185.2, BIMODAL by whether the pool overlapped).
- */
-type PoolWork = (track: <T>(p: () => Promise<T>) => Promise<T>) => Promise<unknown>;
-
 /**
  * Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has
  * started; `poolWork` (the POOL-LOADED control) starts at the same moment and is finished before this returns.
@@ -361,23 +342,6 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
 
 const measure = measureWindow;
 
-/** The pool's occupancy of the window [t0, t1]: compares inside it, and the fraction with one in flight. */
-function occupancy(spans: Array<[number, number]>, t0: number, t1: number): PoolOccupancy {
-  const inWindow = spans.filter(([a, b]) => a >= t0 && b <= t1).length;
-  const clipped = spans.map(([a, b]) => [Math.max(a, t0), Math.min(b, t1)] as [number, number]).filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0]);
-  let busyMs = 0;
-  let cur: [number, number] | null = null;
-  for (const [a, b] of clipped) {
-    if (cur && a <= cur[1]) cur[1] = Math.max(cur[1], b);
-    else {
-      if (cur) busyMs += cur[1] - cur[0];
-      cur = [a, b];
-    }
-  }
-  if (cur) busyMs += cur[1] - cur[0];
-  return { inWindow, total: spans.length, busy: t1 > t0 ? busyMs / (t1 - t0) : 0 };
-}
-
 /**
  * THE TIMING BARS: BACKSTOPS for GROSS regressions (statistic and margin per the architect's ruling of 2026-10-06,
  * superseding the median-gap rule of e26359ac Q3 / 10f7a172 / 47e64b3a / 8cdbc68b / f9916d46).
@@ -423,12 +387,6 @@ const loopClaim = (controlMedian: number) =>
   `LOOP: detects a single synchronous stall >= ${EFFECT_MS} ms + this run's median control ELD max (${controlMedian.toFixed(1)} ms), i.e. >= ${(EFFECT_MS + controlMedian).toFixed(1)} ms`;
 const NOISE_LIMIT_MS = EFFECT_MS / 2;
 const CEILING_MS = 500;
-/**
- * A pool-loaded control round is VALID only when its pool work ran inside its window: every design compare in it,
- * and a compare in flight for at least this fraction of it. Otherwise the control was not loaded, and the round is
- * an INSTRUMENT FAULT (never a bar verdict). The lapse demo (a forced 300 ms idle mid-pool) reads well below it.
- */
-const OCCUPANCY_FLOOR = 0.8;
 const median = (xs: number[]) => {
   const a = [...xs].sort((x, y) => x - y);
   return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2;
@@ -655,20 +613,18 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       // (5) ON THE POOL-LOADED PATH: the GROSS block (+200 ms, the ruled constant) in every auth burst must TRIP,
       // noisy run or not.
       const neg = await runBar(`gross negative pool-loaded (+${GROSS_BLOCK_MS} ms)`, port, authLoad(30, "discover_agents", {}), { poolControl, onLoop: loopBlock(GROSS_BLOCK_MS) });
-      // THE LAPSE DEMO (the occupancy check's own known-bad): the same pool work with a forced 300 ms idle in the
-      // middle. Its window still spans it, but the pool is idle for much of it: an INSTRUMENT FAULT.
-      const lapsed: PoolWork = async (track) => {
-        await poolControl(track);
-        await new Promise((r) => setTimeout(r, 300));
-        await track(() => compareOffLoop(randomToken(), hashes[0]));
-      };
+      // THE LAPSE DEMO (the occupancy check's own known-bad): the same pool work with a forced idle in the middle,
+      // sized from its own busy time (LAPSE_RATIO). Its window spans it, but the pool is idle for much of it.
+      const lapsed = lapsedPool(poolControl, () => compareOffLoop(randomToken(), hashes[0]));
       const r = await measure(port, controlLoad(30), undefined, lapsed);
 
       expectBarHolds(bar, { exactPerRound: 4 * SCAN_BURST });
       expectControlLoaded(neg, 4 * SCAN_BURST); // the negative's own controls are valid, so its trip means something
       expect(neg.perRound, "the loaded negative's auth arm did the design's compares (it exercised the same path)").toEqual(Array(K).fill(4 * SCAN_BURST));
       expectTrips(neg); // includes: nothing shed on any arm
-      expect(r.pool!.busy, `the lapse demo: busy ${r.pool!.busy.toFixed(2)} must fall below the floor`).toBeLessThan(OCCUPANCY_FLOOR);
+      // The demo's SELF-CHECK (architect 1850c978): it must reach its designed state, a margin under the floor, or it
+      // proves nothing. Its message names D, C, the idle and the window.
+      expect(r.pool!.busy, lapseReport(r.pool!.busy, lapsed.stats)).toBeLessThanOrEqual(LAPSE_MAX_BUSY);
       const lapsedBar: BarStats = { ...bar, label: "lapse demo", control: Array(K).fill(r), control2: Array(K).fill(r), pooled: true };
       expect(() => expectControlLoaded(lapsedBar, 4 * SCAN_BURST + 1)).toThrow(/INSTRUMENT FAULT/);
       // THE WIRING MUTANT, THROUGH runBar: a measure that drops the occupancy reading on a bar DECLARED pool-loaded.
