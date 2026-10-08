@@ -11,10 +11,10 @@
  */
 import fs from "fs";
 import path from "path";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, spawnSync, type ChildProcess } from "child_process";
 
 export interface WindowRun {
-  /** The run's id: its files are <id>.out/.err/.pid/.spid/.code in the window's dir. */
+  /** The run's id: its files are <id>.out/.err/.pid/.code in the window's dir. */
   id: string;
   /** The node (watch) process id, once it has started. */
   pid: () => Promise<number>;
@@ -29,13 +29,15 @@ export interface TestWindow {
   child: ChildProcess;
   /** Run `cmd` (a shell command) as a descendant of this window, in the background. */
   run: (cmd: string) => WindowRun;
-  /** Every node pid this window ran (to clean up: killing the window does not kill its children). */
+  /** Every node pid this window ran (killing the window does not kill its children). */
   pids: number[];
   /**
-   * Kill every run and the window, and return only once every run's subshell has FINISHED (written its
-   * <id>.code). Killing the window does not kill those subshells: one that outlived close() wrote its
-   * code file into the test's dir while the test was removing it (ENOTEMPTY in an afterAll). A run
-   * whose subshell does not finish within the bound fails close() LOUDLY, naming it (a hang is worse).
+   * Kill EVERYTHING the window started and return only once none of it is left. The window is the
+   * leader of its OWN process group, and every process it starts (each run's subshell, its node, any
+   * grandchild of a compound command) stays in that group, so ONE group SIGKILL reaches all of them.
+   * Killing processes one by one did not: a run's subshell outlived close() and wrote its code file into
+   * the test's dir while the test was removing it (ENOTEMPTY in an afterAll). Bounded: a group that is
+   * not empty within the bound fails close() LOUDLY, naming what is left (a hang is worse).
    */
   close: () => Promise<void>;
 }
@@ -44,21 +46,51 @@ export interface TestWindow {
 export interface WindowOpts {
   /** Delay each run's subshell between its command ending and writing <id>.code (seconds). */
   codeWriteDelayS?: number;
-  /** How long close() waits for every run's subshell to finish (default 5000 ms). */
+  /** How long close() waits for the group to be empty (default 5000 ms). */
   closeWaitMs?: number;
+  /** Does the group still have members? (default: kill(-pgid, 0)). */
+  groupAlive?: (pgid: number) => boolean;
 }
 
 let seq = 0;
 const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const realGroupAlive = (pgid: number): boolean => {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/** The processes still in group `pgid`, for the loud failure (best-effort; bounded). */
+const groupMembers = (pgid: number): string => {
+  const r = spawnSync("ps", ["-A", "-o", "pid=,pgid=,stat=,comm="], { encoding: "utf-8", timeout: 2_000 });
+  const rows = (r.stdout ?? "").split("\n").map((l) => l.trim().split(/\s+/)).filter((f) => f.length >= 4 && Number(f[1]) === pgid);
+  return rows.length ? rows.map((f) => `${f[0]} ${f[2]} ${f.slice(3).join(" ")}`).join(", ") : "none listed";
+};
 
 export function openWindow(dir: string, env: Record<string, string>, opts: WindowOpts = {}): TestWindow {
+  // POSIX only: a `bash` window and process groups (node's detached spawn = setsid in-process, no
+  // `setsid` binary). CI runs the helper's users on Linux and macOS; the Windows job runs a named subset
+  // that includes none of them.
+  if (process.platform === "win32") throw new Error("openWindow: POSIX only (a bash window and process groups)");
   fs.mkdirSync(dir, { recursive: true });
   const delay = opts.codeWriteDelayS;
   if (delay !== undefined && !(Number.isFinite(delay) && delay >= 0)) throw new Error(`codeWriteDelayS must be a number >= 0, got ${delay}`);
   const closeWaitMs = opts.closeWaitMs ?? 5_000;
-  const child = spawn("bash", ["-s"], { env, stdio: ["pipe", "ignore", "ignore"] });
+  const groupAlive = opts.groupAlive ?? realGroupAlive;
+  // detached: the window leads its own process group (setsid), which everything it starts inherits.
+  const child = spawn("bash", ["-s"], { env, stdio: ["pipe", "ignore", "ignore"], detached: true });
+  const pgid = child.pid as number;
+  // The SENTINEL: a member that only close() kills, so the group (and with it its id: POSIX never reuses
+  // a process group's id while the group exists) outlives the window and every run until close(). The
+  // group kill below can therefore never reach a process this window did not start, even after a test
+  // killed the window itself.
+  child.stdin?.write("sleep 2147483647 < /dev/null > /dev/null 2>&1 &\n");
   const pids: number[] = [];
-  const runs: { id: string; codeFile: string; spidFile: string; pid: () => Promise<number> }[] = [];
   let closed = false;
   const read = (f: string) => {
     try {
@@ -68,7 +100,7 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
     }
   };
   const w: TestWindow = {
-    pid: child.pid as number,
+    pid: pgid,
     child,
     pids,
     run(cmd: string): WindowRun {
@@ -77,12 +109,11 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
       const E = path.join(dir, `${id}.err`);
       const P = path.join(dir, `${id}.pid`);
       const C = path.join(dir, `${id}.code`);
-      const SP = path.join(dir, `${id}.spid`);
-      // The subshell (a child of the window) records its OWN pid (a child sh's $PPID: bash 3.2 has no
-      // $BASHPID), starts the command in the background, records its pid, waits for it, then records its
-      // exit code: the command's parent is the subshell, whose parent is the window.
+      // The subshell (a child of the window) starts the command in the background, records its pid,
+      // waits for it, then records its exit code: the command's parent is the subshell, whose parent
+      // is the window.
       const pause = delay === undefined ? "" : `sleep ${delay}; `;
-      child.stdin?.write(`( sh -c 'echo $PPID' > ${sq(SP)}; ${cmd} > ${sq(O)} 2> ${sq(E)} & p=$!; echo $p > ${sq(P)}; wait $p; rc=$?; ${pause}echo $rc > ${sq(C)} ) &\n`);
+      child.stdin?.write(`( ${cmd} > ${sq(O)} 2> ${sq(E)} & p=$!; echo $p > ${sq(P)}; wait $p; rc=$?; ${pause}echo $rc > ${sq(C)} ) &\n`);
       const pid = async (): Promise<number> => {
         for (let i = 0; i < 200; i++) {
           const t = read(P).trim();
@@ -90,63 +121,35 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
             if (!pids.includes(Number(t))) pids.push(Number(t));
             return Number(t);
           }
-          await new Promise((r) => setTimeout(r, 25));
+          await sleep(25);
         }
         throw new Error(`run ${id} never started`);
       };
       void pid().catch(() => {});
-      runs.push({ id, codeFile: C, spidFile: SP, pid });
       const exited = (async () => {
         for (;;) {
           const t = read(C).trim();
           if (/^\d+$/.test(t)) return Number(t);
           if (closed) return -1; // the window was closed under it: stop polling
-          await new Promise((r) => setTimeout(r, 50));
+          await sleep(50);
         }
       })();
       return { id, pid, out: () => read(O), err: () => read(E), exited };
     },
     async close() {
+      if (closed) return;
       closed = true;
-      // Every run's node pid first (it is known only once its subshell wrote it), so none escapes the kill.
-      const neverStarted: string[] = [];
-      for (const r of runs) await r.pid().catch(() => neverStarted.push(r.id));
-      for (const p of pids) {
-        try {
-          process.kill(p, "SIGKILL");
-        } catch {
-          /* already gone */
-        }
+      try {
+        process.kill(-pgid, "SIGKILL"); // the window, the sentinel, every run, every grandchild
+      } catch {
+        /* the group is already empty */
       }
-      if (child.exitCode === null && child.signalCode === null) {
-        const gone = new Promise((r) => child.once("close", r));
-        child.kill("SIGKILL");
-        await gone;
-      }
-      // Then every run's subshell must FINISH (its node is dead, so it is only writing <id>.code), or be
-      // GONE: a test may kill the subshell itself (the watch's launching shell), and a dead one writes nothing.
-      const subshellAlive = (r: (typeof runs)[number]): boolean => {
-        const spid = Number(read(r.spidFile).trim());
-        if (!Number.isInteger(spid) || spid <= 1) return true; // unknown: never assume it is gone
-        try {
-          process.kill(spid, 0);
-          return true;
-        } catch (err) {
-          return (err as NodeJS.ErrnoException).code === "EPERM";
-        }
-      };
-      const writing = (r: (typeof runs)[number]) => !fs.existsSync(r.codeFile) && subshellAlive(r);
+      // Empty = every member died AND was reaped (a zombie still counts: until then it is not provably done).
       const deadline = Date.now() + closeWaitMs;
-      let unfinished = runs.filter((r) => !neverStarted.includes(r.id) && writing(r));
-      while (unfinished.length > 0 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 25));
-        unfinished = unfinished.filter(writing);
+      while (groupAlive(pgid) && Date.now() < deadline) await sleep(25);
+      if (groupAlive(pgid)) {
+        throw new Error(`window close (${dir}): process group ${pgid} is not empty after ${closeWaitMs} ms (left: ${groupMembers(pgid)}): something it started may still write into this dir`);
       }
-      const faults = [
-        ...neverStarted.map((id) => `${id} never started (no ${id}.pid)`),
-        ...unfinished.map((r) => `${r.id} never finished (no ${r.id}.code within ${closeWaitMs} ms, its subshell alive)`),
-      ];
-      if (faults.length > 0) throw new Error(`window close (${dir}): ${faults.join("; ")}: its subshell may still write into this dir`);
     },
   };
   return w;
