@@ -47,6 +47,10 @@ delete process.env.RELAY_DASHBOARD_SECRET;
 process.env.RELAY_DECAY_TICK_MS = "100";
 process.env.RELAY_STATE_ACTIVE_WINDOW_SEC = "1";
 delete process.env.RELAY_DECAY_TICK_DISABLED;
+// The RT tests read their frames only AFTER the 1 s active window + 5 ticks have passed, so EVERY run takes
+// the slow path in which the time-only transition has already fired before the test looks (the path that
+// failed CI 37729080141). They pass only because they subscribed BEFORE registering (see subscribe()).
+const LATE_READ_MS = 1500;
 
 const { startHttpServer } = await import("../src/transport/http.js");
 const { _resetDashboardWsForTests } = await import("../src/transport/websocket.js");
@@ -106,11 +110,16 @@ async function awaitServerClose(s: HttpServer | undefined): Promise<void> {
   });
 }
 
+/** Every socket a test opened: afterEach terminates the ones a FAILED test left open (see there). */
+const openSockets: WebSocket[] = [];
+
 async function connectWs(): Promise<{
   ws: WebSocket;
   nextMessage: (timeoutMs?: number) => Promise<string>;
 }> {
-  return baseConnectWs(port, "/dashboard/ws");
+  const h = await baseConnectWs(port, "/dashboard/ws");
+  openSockets.push(h.ws);
+  return h;
 }
 
 interface RpcResult {
@@ -169,6 +178,10 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // A test that fails BEFORE its own ws.close() leaves a socket open, and server.close() then waits on it
+  // past the hook timeout, so ONE red cascades into "ws connect timeout" in every later test. Terminate
+  // whatever is still open first.
+  for (const ws of openSockets.splice(0)) ws.terminate();
   // ORDER MATTERS (Codex R1 P1): await the HTTP server's
   // async close FIRST so the broadcaster.stop() registered on
   // server.once("close") has flushed BEFORE we tear down the DB / WS
@@ -187,12 +200,25 @@ interface BroadcastFrame {
   kind?: string;
 }
 
+/**
+ * SUBSCRIBE BEFORE THE EVENT (CI 37729080141 at fce15be). The broadcaster fans out only to the clients
+ * connected at that moment, and its dedup map advances whether or not anyone received the frame, so a
+ * subscriber that connects AFTER a transition never sees it. The server adds a client BEFORE it sends the
+ * hello, so a drained hello proves this subscriber is registered: every later frame is buffered for it.
+ */
+async function subscribe(): ReturnType<typeof connectWs> {
+  const h = await connectWs();
+  await h.nextMessage(); // the hello
+  return h;
+}
+
 async function collectFrames(
   ws: { ws: WebSocket; nextMessage: (timeoutMs?: number) => Promise<string> },
   expected: number,
   perFrameTimeoutMs = 3000,
+  helloDrained = false,
 ): Promise<BroadcastFrame[]> {
-  await ws.nextMessage(); // drain hello
+  if (!helloDrained) await ws.nextMessage(); // drain hello
   const frames: BroadcastFrame[] = [];
   for (let i = 0; i < expected; i++) {
     try {
@@ -213,24 +239,18 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     // Register a fresh agent — broadcaster's first tick observes
     // `active` (last_seen is now). Wait > 1s (the activeWindow) so
     // last_seen ages past the threshold. The next tick observes
-    // `waiting` and broadcasts the transition. We capture both the
-    // initial 'active' tick AND the 'waiting' transition.
+    // `waiting` and broadcasts the transition. The loop below skips every
+    // other frame (the register's own agent.state_changed, the `active` tick).
+    // SUBSCRIBE FIRST (see subscribe()): a subscriber that connected after the
+    // transition would never see it, and the test would blame the broadcaster.
+    const wsHandle = await subscribe();
     const reg = await rpc("register_agent", {
       name: "rt-time-only",
       role: "user", // not a dispatch-relevant role → recent dispatch rule won't fire
       capabilities: ["build"],
     });
     expect(reg.ok).toBe(true);
-
-    // Connect WS AFTER register so we don't race the register's own
-    // immediate agent.state_changed broadcast. The decay broadcaster
-    // ticks every 100ms (RELAY_DECAY_TICK_MS=100). Within ~200ms we
-    // expect the FIRST tick to observe active + broadcast a fresh
-    // status_changed event (lastBroadcastedState is empty after
-    // server startup).
-    const wsHandle = await connectWs();
-    // Wait 1.5s for last_seen to age past the 1s activeWindow.
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, LATE_READ_MS));
 
     // WAIT BUDGET, not an SLA (#210): collect frames UNTIL the time-only `waiting` transition is
     // observed, bounded by a total deadline, and STOP as soon as it's seen. Do NOT wait for a
@@ -241,7 +261,6 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     // when the broadcaster tick + WS delivery are merely slow under load. Widen-safe; do NOT
     // tighten. (Injectable clock can't reach the spawned daemon's broadcaster, so this is a
     // bounded widen per the #210 ruling.)
-    await wsHandle.nextMessage(); // drain hello
     const RT1_WAIT_BUDGET_MS = 10_000;
     const rt1Start = Date.now();
     let waitingFrame: BroadcastFrame | undefined;
@@ -275,11 +294,17 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
   }, 20_000);
 
   it("(RT2) Dedup correctness: broadcaster does NOT re-emit waiting on subsequent ticks once state has stabilized", async () => {
+    // SUBSCRIBE FIRST, then register (CI 37729080141 at fce15be): the confirming subscriber used to connect
+    // AFTER the register; when that took longer than the 1 s active window, the transition had already
+    // fired (to no one) and been deduped, so the confirm below waited its full deadline and reported a
+    // false "never broadcast". Subscribed before the register, it cannot miss the transition.
+    const confirmWs = await subscribe();
     await rpc("register_agent", {
       name: "rt-dedup",
       role: "user",
       capabilities: ["build"],
     });
+    await new Promise((r) => setTimeout(r, LATE_READ_MS));
     // ORDERING RESTRUCTURE (#210, architect-approved). The dedup property is: "once the waiting
     // transition has been BROADCAST, a NEW subscriber sees no re-emit." The old test assumed that
     // transition fired during a fixed 1500ms sleep BEFORE connecting — an unguaranteed
@@ -290,9 +315,8 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     // is COMPUTED (no DB mutation), so discover_agents (raw stored status) cannot confirm it — the
     // BROADCAST frame is the only reliable "it fired" signal. So a throwaway subscriber OBSERVES
     // the transition frame (establishing the ordering), then we connect a FRESH subscriber and
-    // assert ZERO — the actual dedup property, now race-free.
-    const confirmWs = await connectWs();
-    await confirmWs.nextMessage(); // drain hello
+    // assert ZERO — the actual dedup property, now race-free. (The confirming subscriber is
+    // subscribed BEFORE the register, above.)
     // ORDERING DEADLINE, not an SLA (#210): how long we wait for the transition to be broadcast.
     // A timeout here is a GENUINE failure — "the time-only transition never fired" is a real
     // defect — so it fails LOUD below, never silently absorbed. Bounded; not a latency budget.
@@ -358,14 +382,16 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     // the disabled server.
     await awaitServerClose(server);
     await bootServer({ RELAY_DECAY_TICK_DISABLED: "1" });
+    // SUBSCRIBE FIRST (see subscribe()): connected after the register, a late subscriber would see
+    // zero frames even from an ENABLED broadcaster, and this zero-assertion would pass vacuously.
+    const wsHandle = await subscribe();
     await rpc("register_agent", {
       name: "rt-disabled",
       role: "user",
       capabilities: ["build"],
     });
-    const wsHandle = await connectWs();
-    await new Promise((r) => setTimeout(r, 1500));
-    const frames = await collectFrames(wsHandle, 5, 500);
+    await new Promise((r) => setTimeout(r, LATE_READ_MS));
+    const frames = await collectFrames(wsHandle, 5, 500, true);
     const statusChangedForDisabled = frames.filter(
       (f) =>
         f.event === "agent.status_changed" && f.entity_id === "rt-disabled",
