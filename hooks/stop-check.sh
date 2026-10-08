@@ -341,12 +341,12 @@ print(json.dumps({
 
   local response
   relay_budget_for "the remote mail read" 2 margin || return 125
-  response=$(curl -fsS -m "$RELAY_STEP_SECS" \
+  # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
+  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
-    -H "X-Agent-Token: $AGENT_TOKEN" \
-    --data "$payload" 2>/dev/null) || return 1
+    2>/dev/null) || return 1
 
   RESP="$response" python3 <<'PYEOF' 2>/dev/null
 import json, os, re, sys

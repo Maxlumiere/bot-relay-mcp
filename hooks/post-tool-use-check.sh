@@ -466,12 +466,12 @@ print(json.dumps({
 
   local response
   relay_budget_for "the remote mail read" 2 margin || return 125
-  response=$(curl -fsS -m "$RELAY_STEP_SECS" \
+  # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
+  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
-    -H "X-Agent-Token: $AGENT_TOKEN" \
-    --data "$payload" 2>/dev/null) || return 1
+    2>/dev/null) || return 1
 
   local out rc
   out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null)
@@ -557,11 +557,12 @@ if st:
 print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"report_liveness","arguments":args}}))
 ' 2>/dev/null) || return 0
   relay_budget_for "the liveness restamp" 2 margin || return 0
-  curl -fsS -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
+  { relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+    -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
-    -H "X-Agent-Token: $AGENT_TOKEN" \
-    --data "$payload" >/dev/null 2>&1 || return 0
+    >/dev/null 2>&1 || return 0
   return 0
 }
 

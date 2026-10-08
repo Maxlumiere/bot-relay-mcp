@@ -658,9 +658,11 @@ relay_deliver_remote_mail() {
     relay_remote_failed "no time budget left for the remote mail read"
     return 0
   fi
-  resp=$(curl -fsS -m "$RELAY_STEP_SECS" -X POST "http://${host}:${port}/mcp" \
+  # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
+  resp=$({ relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+    -X POST "http://${host}:${port}/mcp" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-    -H "X-Agent-Token: $tok" --data "$payload" 2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }
+    2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }
   block=$(printf '%s' "$resp" | SRC=http AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null) \
     || { relay_remote_failed "the remote relay answered with an error or an untrusted page"; return 0; }
   RELAY_MAIL_READ_DONE=1
@@ -789,10 +791,10 @@ RECOVERY_COMPLETED=0
 # block after register reads it, so a daemon that never came up cannot print HEALTHY.
 DAEMON_REACHABLE=""
 if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the token health check" 2; then
-  HEALTH_BODY=$(curl -s -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  # The token rides curl's config on STDIN, never argv (relay_curl_config_line).
+  HEALTH_BODY=$(relay_curl_token_config "$RELAY_AGENT_TOKEN" | curl -s -m "$RELAY_STEP_SECS" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
-    -H "X-Agent-Token: ${RELAY_AGENT_TOKEN}" \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}' 2>/dev/null)
   if [ -n "$HEALTH_BODY" ]; then
     # A body proves the daemon answered. An EMPTY body proves nothing (refused or timed
@@ -833,10 +835,12 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
         printf "]";
       }')
     fi
-    RECOVERY_BODY=$(curl -s -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    # The body holds the recovery token: it rides curl's config on STDIN, never argv (relay_curl_config_line).
+    RECOVERY_BODY=$(relay_curl_config_line data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" \
+      | curl -s -m "$RELAY_STEP_SECS" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
       -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
-      -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" 2>/dev/null)
+      2>/dev/null)
     # v2.6.4 — same SSE-escape fix as the health_check parsing above. Inner
     # JSON is stringified with `\"key\": value` shape; the unescaped pattern
     # never matched, so this entire branch was silently dead pre-v2.6.4.
@@ -853,13 +857,14 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
           echo "[relay]   You may unset RELAY_RECOVERY_TOKEN now; the new token is persisted at:" >&2
           if VPATH=$(resolve_relay_token_path "$AGENT_NAME"); then echo "[relay]     $VPATH" >&2; fi
         else
-          echo "[relay] Recovery completed for \"$AGENT_NAME\" but vault write failed. Set manually:" >&2
-          echo "[relay]   unset RELAY_RECOVERY_TOKEN" >&2
-          echo "[relay]   export RELAY_AGENT_TOKEN=${NEW_TOKEN}" >&2
+          # The fresh token is NOT printed: stderr lands in the session transcript, a durable copy of a live
+          # credential. Losing it is recoverable (relay recover); a leaked copy is not.
+          echo "[relay] Recovery completed for \"$AGENT_NAME\" but the vault write failed: the fresh token could not be saved, and is never printed." >&2
+          echo "[relay]   Fix the vault directory, then run \`relay recover $AGENT_NAME\` and restart this terminal." >&2
         fi
       fi
     else
-      echo "[relay] Recovery attempt failed for \"$AGENT_NAME\". Response: $(echo "$RECOVERY_BODY" | head -c 200)" >&2
+      echo "[relay] Recovery attempt failed for \"$AGENT_NAME\". Response: $(printf '%s' "$RECOVERY_BODY" | relay_redact "${RELAY_RECOVERY_TOKEN:-}" "${RELAY_AGENT_TOKEN:-}" | head -c 200)" >&2
       # ADR-0036 S1 (D7): the EXIT trap would otherwise print the HEALTHY set above.
       [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2>&1 \
         && relay_verdict_set "AUTH_FAILED" "recovery with RELAY_RECOVERY_TOKEN failed" " agent=\"$AGENT_NAME\""
@@ -1064,10 +1069,8 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
   # Carry the caller's token if they have one — active re-register requires
   # it; first-time bootstrap on a fresh row doesn't. Either way the request
   # reaches the server so the server decides which branch to take.
+  # The token is NOT a header here: it rides curl's config on STDIN with the registration secret.
   REG_HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
-  if [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
-    REG_HEADERS+=(-H "X-Agent-Token: ${RELAY_AGENT_TOKEN}")
-  fi
   # Tether v0.3 PID-handshake: best-effort PID chain + machine GUID. Empty/[] →
   # the field is omitted (graceful — registration never fails over the handshake).
   RELAY_HOST_PID_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
@@ -1079,8 +1082,8 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
   RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
-  # PR-D: the registration secret rides curl's config on STDIN (never argv, never env).
-  REG_BODY=$({ relay_mint_secret_curl_config || true; } | curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
+  # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
+  REG_BODY=$({ relay_mint_secret_curl_config || true; relay_curl_token_config "${RELAY_AGENT_TOKEN:-}" || true; } | curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
@@ -1155,8 +1158,8 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
   # health_check probe. We just don't want to corrupt the DB with a fallback
   # sqlite3 write.
   if [ -n "${RELAY_HOOK_DEBUG:-}" ]; then
-    echo "[bot-relay hook debug] register_agent response:" >&2
-    echo "$REG_BODY" >&2
+    echo "[bot-relay hook debug] register_agent response (credentials redacted):" >&2
+    printf '%s' "$REG_BODY" | relay_redact "${RELAY_AGENT_TOKEN:-}" "${REG_TOKEN:-}" >&2
   fi
 fi
 
