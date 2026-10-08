@@ -95,6 +95,8 @@ export interface WindowOpts {
   groupAlive?: (pgid: number) => boolean;
   /** The leader's start token now (default: liveness.processStartedAt). */
   leaderStart?: (pid: number) => string | null;
+  /** The supervisor's shell (default `sh`): the close test runs it under dash, Linux's /bin/sh. */
+  supervisorShell?: string;
 }
 
 let seq = 0;
@@ -201,7 +203,9 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
   // pipe), acknowledges it only AFTER that fork ($! is set), then WAITS for it: a window a test kills is
   // REAPED at once (an unreaped zombie still shows its start in `ps`, so the watches under test would read
   // their window as alive forever). After that it idles, alive, so the group lives until close() kills it.
-  const child = spawn("sh", ["-c", `bash -s <&0 & echo "ready $!" > ${sq(readyFile)}; wait; while :; do sleep 3600; done`], {
+  // The pipe goes to the window through fd 3: a POSIX sh (dash: Linux's /bin/sh) gives a background command
+  // /dev/null as stdin BEFORE its own redirections, so `bash -s <&0 &` would read /dev/null and exit at once.
+  const child = spawn(opts.supervisorShell ?? "sh", ["-c", `exec 3<&0; bash -s <&3 3<&- & exec 3<&-; echo "ready $!" > ${sq(readyFile)}; wait; while :; do sleep 3600; done`], {
     env: { ...env, WATCH_WINDOW_ID: windowId },
     stdio: ["pipe", "ignore", "ignore"],
     detached: true,
