@@ -10,6 +10,7 @@ import type { SpawnAgentInput } from "../types.js";
 import { spawnAgent } from "../spawn/dispatcher.js";
 import { validateBriefPath } from "../spawn/validation.js";
 import { defaultTokenStore } from "../token-store.js";
+import { recheckAuthorization } from "../authorization-scope.js";
 import { ERROR_CODES } from "../error-codes.js";
 
 /**
@@ -34,6 +35,43 @@ import { ERROR_CODES } from "../error-codes.js";
  * legacy-migration path we don't want to conflate with new-agent creation —
  * operator must unregister the existing one first.
  */
+/**
+ * Undo the child's pre-registration (and its vault entry, when one was written): the reviewed launch-failure
+ * rollback, shared by every path that refuses to launch after registering (v2.1 Phase 4j 3/3, v2.6.1, SEC-20).
+ */
+async function rollbackChild(name: string, sessionId: string | null, opts: { vault: boolean }): Promise<void> {
+  try {
+    if (sessionId) {
+      unregisterAgent(name, sessionId);
+    } else {
+      unregisterAgent(name);
+    }
+  } catch (rollbackErr) {
+    // If rollback itself fails, log but still surface the original error to the caller.
+    log.warn(`[spawn] rollback unregister failed for "${name}":`, rollbackErr);
+  }
+  if (!opts.vault) return;
+  try {
+    await defaultTokenStore().delete(name);
+  } catch (vaultErr) {
+    log.warn(`[spawn] rollback vault delete failed for "${name}":`, vaultErr);
+  }
+}
+
+/** The recheck refused the spawner: roll the child back (nothing is launched) and say why. */
+async function refuseAndRollBack(name: string, sessionId: string | null, vaultWritten: boolean, reason: string, code: "AUTH_FAILED" | "CAP_DENIED") {
+  await rollbackChild(name, sessionId, { vault: vaultWritten });
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify({ success: false, error: reason, error_code: code === "CAP_DENIED" ? ERROR_CODES.CAP_DENIED : ERROR_CODES.AUTH_FAILED, rolled_back: true }, null, 2),
+      },
+    ],
+    isError: true,
+  };
+}
+
 export async function handleSpawnAgent(input: SpawnAgentInput) {
   // v2.1.4 (I10): validate brief_file_path BEFORE any side effect. Zod has
   // already done the regex/char check; this adds the filesystem-side
@@ -151,15 +189,7 @@ export async function handleSpawnAgent(input: SpawnAgentInput) {
       await defaultTokenStore().write(input.name, plaintextToken);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      try {
-        if (registeredSessionId) {
-          unregisterAgent(input.name, registeredSessionId);
-        } else {
-          unregisterAgent(input.name);
-        }
-      } catch (rollbackErr) {
-        log.warn(`[spawn] rollback after vault-write failure for "${input.name}":`, rollbackErr);
-      }
+      await rollbackChild(input.name, registeredSessionId, { vault: false });
       return {
         content: [
           {
@@ -181,6 +211,12 @@ export async function handleSpawnAgent(input: SpawnAgentInput) {
     }
   }
 
+  // SEC-20 (Codex #315 R1 P1): the vault write above AWAITED. A spawner revoked (or stripped of "spawn") during
+  // it must not launch a child: re-derive the caller HERE, synchronously, before the launch, and on refusal take
+  // the reviewed rollback (the child's row and its vault entry go; nothing is launched).
+  const still = recheckAuthorization();
+  if (!still.ok) return refuseAndRollBack(input.name, registeredSessionId, plaintextToken !== null, still.reason, still.code);
+
   // v1.9: dispatch to the platform-appropriate driver. macOS still shells
   // out to bin/spawn-agent.sh (preserving v1.6.x hardening). Linux and
   // Windows use native TS drivers.
@@ -199,22 +235,7 @@ export async function handleSpawnAgent(input: SpawnAgentInput) {
     // v2.1 Phase 4j (3/3): rollback the pre-register — don't leak phantoms.
     // v2.6.1: ALSO scrub the vault entry so a future spawn can succeed
     // cleanly without operator intervention.
-    try {
-      if (registeredSessionId) {
-        unregisterAgent(input.name, registeredSessionId);
-      } else {
-        unregisterAgent(input.name);
-      }
-    } catch (rollbackErr) {
-      // If rollback itself fails, log but still surface the original spawn
-      // error to the caller — they need to know about the root cause.
-      log.warn(`[spawn] rollback unregister failed for "${input.name}":`, rollbackErr);
-    }
-    try {
-      await defaultTokenStore().delete(input.name);
-    } catch (vaultErr) {
-      log.warn(`[spawn] rollback vault delete failed for "${input.name}":`, vaultErr);
-    }
+    await rollbackChild(input.name, registeredSessionId, { vault: true });
     return {
       content: [
         {

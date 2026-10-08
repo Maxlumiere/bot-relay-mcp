@@ -43,6 +43,7 @@ import { VALID_TRANSITIONS, ACTION_TO_STATUS, AGENT_NAME_PATTERN } from "./types
 import { generateToken, hashToken } from "./auth.js";
 import { registerPersistedSecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
+import { revokedStateOf } from "./auth-verdict.js";
 import { computeTokenLookup, digestVerdict, lookupKeys, tokenLookupCandidates, KEY_ID_SEPARATOR, unreachableLookupRanges } from "./token-lookup.js";
 import { authSource, verifyCredential, verifySecretHash } from "./token-verify.js";
 import { scanRefund, scanTake } from "./auth-throttle.js";
@@ -4636,7 +4637,9 @@ export function expandAgentCapabilities(
  *     (previous_token_hash / rotation_grace_expires_at /
  *     recovery_token_hash / revoked_at) are zeroed because mint-token is
  *     defined as a clean reset, not a graceful rotation: any in-flight
- *     state on the auth machine is invalidated.
+ *     state on the auth machine is invalidated. SEC-20.T2: a REVOKED or
+ *     recovery_pending row is REFUSED (RevokedAgentMintError): --force never
+ *     undoes a revoke; `relay recover` does, audited.
  *
  *   - Existing row WITHOUT --force: throws so the caller can surface the
  *     destructive nature of the operation. The CLI maps this to a clean
@@ -4649,6 +4652,22 @@ export function expandAgentCapabilities(
  * the whole point: it sidesteps the LLM-client safety monitors that
  * pattern-match register-then-use sequences as credential handoff.
  */
+/** SEC-20.T2: `relay mint-token --force` refuses a revoked (or recovery_pending) identity. */
+export class RevokedAgentMintError extends Error {
+  readonly code = "AGENT_REVOKED";
+  constructor(
+    readonly agent: string,
+    readonly state: "revoked" | "recovery_pending",
+  ) {
+    super(
+      `Agent "${agent}" is ${state === "recovery_pending" ? "awaiting recovery (revoked with a recovery token)" : "revoked"}: ` +
+        `--force will not bring it back. Reset it with \`relay recover ${agent}\` (audited), then register again` +
+        (state === "recovery_pending" ? `, or re-register with the recovery token the revoker was given.` : "."),
+    );
+    this.name = "RevokedAgentMintError";
+  }
+}
+
 export function mintAgentToken(
   name: string,
   role: string,
@@ -4694,6 +4713,11 @@ export function mintAgentToken(
         `Agent "${name}" already exists. Pass --force to mint a new token (rotates + invalidates the existing token, clears session, sets status=offline).`
       );
     }
+    // SEC-20.T2: a revocation must HOLD. --force is a clean reset of an ACTIVE identity, never a way back from a
+    // revoke (an agent that hits AUTH_FAILED and "fixes" it with mint-token --force would silently undo it). The
+    // audited way back is `relay recover` (or, for recovery_pending, register_agent with its recovery token).
+    const revoked = revokedStateOf(existing);
+    if (revoked) throw new RevokedAgentMintError(name, revoked);
     // Force-rotate: token-only. Caps + role preserved (immutability + safety).
     // Description is preserved when not supplied; if explicitly supplied (even
     // null) the caller is updating it. CLI doesn't expose --description on the

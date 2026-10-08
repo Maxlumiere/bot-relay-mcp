@@ -66,6 +66,7 @@ import {
   handleExpandCapabilities,
 } from "./tools/identity.js";
 import { handleSpawnAgent } from "./tools/spawn.js";
+import { runAuthorized } from "./authorization-scope.js";
 import { defaultTokenStore } from "./token-store.js";
 import { getDb, logAudit, getAuthGeneration, abandonPrecondition, checkAndRecordRateLimit, getAgentAuthData, getAgents, resolveAgentByTokenVerdict, explicitCallerCacheGetVerdict, explicitCallerCachePut, markAgentAuthenticated } from "./db.js";
 import { loadConfig } from "./config.js";
@@ -1409,7 +1410,9 @@ export function createServer(): Server {
     const now = Date.now();
     const check = revalidate(getDb(), verdict, now, TOOL_CAPABILITY[name]);
     if (!check.ok) return Promise.resolve(authError(check.reason, check.code === "CAP_DENIED" ? ERROR_CODES.CAP_DENIED : ERROR_CODES.AUTH_FAILED, "stale_verdict"));
-    return dispatch(name, args);
+    // SEC-20: the handler runs under its verdict, so an async handler can re-derive it after its own awaits
+    // (src/authorization-scope.ts recheckAuthorization). Still ONE synchronous block from revalidate to the start.
+    return runAuthorized(verdict, TOOL_CAPABILITY[name], () => dispatch(name, args));
   }
 
   async function runCall(request: { params: { name: string; arguments?: any } }): Promise<any> {

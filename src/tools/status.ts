@@ -14,6 +14,8 @@ import { ERROR_CODES } from "../error-codes.js";
 import { authenticateAgent } from "../auth.js";
 import type { AuthStateInput } from "../auth.js";
 import { currentContext } from "../request-context.js";
+import { authorizeAgentToken } from "../authorize-token.js";
+import { revalidate } from "../auth-verdict.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
 
 /** Process-start wall clock — captured at module load so health_check can report uptime. */
@@ -225,25 +227,35 @@ async function checkToken(token: string): Promise<TokenCheckResult> {
         "agent_token did not match any registered agent (stale or never issued). Ensure RELAY_AGENT_TOKEN matches the token from your most recent register_agent response.",
     };
   }
-  const auth = found.row;
-  const state = (auth.auth_state ?? "active") as AuthStateInput;
-  const result = await authenticateAgent(auth.name, token, { hash: auth.token_hash ?? null, lookup: auth.token_lookup ?? null }, state, {
-    previous: { hash: auth.previous_token_hash ?? null, lookup: auth.previous_token_lookup ?? null },
-    rotationGraceExpiresAt: auth.rotation_grace_expires_at ?? null,
-  });
-  if (result.ok) {
+  const name = found.row.name;
+  // SEC-20 (Codex #315 R1 P2): the ONE authorizer (state-aware authenticateAgent, then revalidate on a fresh read),
+  // never a verdict on the located snapshot: a revoke landing during the compare must not read as a valid token.
+  const result = await authorizeAgentToken(name, token);
+  // The point of use: re-derived synchronously, with no await before the stamp and the report.
+  const still = result.ok ? revalidate(getDb(), result.verdict, Date.now()) : null;
+  const freshState = (getAgentAuthData(name)?.auth_state ?? "active") as AuthStateInput;
+  if (result.ok && still?.ok) {
     // ADR-0005 (codex #115): a valid-token health_check IS a successful token
     // verification — stamp first_authed_at so an agent whose only interaction is
     // health_check still self-excludes from the orphan-GC. This diagnostic path
     // re-verifies and never touches the cache, so it must stamp explicitly.
-    if (!result.legacy) markAgentAuthenticated(auth.name, { basis: result.matched ?? "current", hash: result.matched === "previous" ? auth.previous_token_hash : auth.token_hash });
-    return { auth_error: false, agent_name: auth.name, auth_state: state };
+    markAgentAuthenticated(name, { basis: result.verdict.basis, hash: result.verdict.hash });
+    return { auth_error: false, agent_name: name, auth_state: freshState };
+  }
+  if (!result.ok && (result.refusal === "throttled" || result.refusal === "busy")) {
+    return {
+      auth_error: true,
+      auth_error_reason:
+        result.refusal === "throttled"
+          ? "too many failed token attempts from this source: wait and retry (the token was not checked)"
+          : "the relay is busy verifying credentials: retry (the token was not checked)",
+    };
   }
   return {
     auth_error: true,
-    auth_error_reason: result.reason,
-    agent_name: auth.name,
-    auth_state: state,
+    auth_error_reason: !result.ok ? result.reason : still && !still.ok ? still.reason : "the token could not be confirmed",
+    agent_name: name,
+    auth_state: freshState,
   };
 }
 

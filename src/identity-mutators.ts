@@ -96,7 +96,7 @@ export const VERIFY_SITES: Readonly<Record<string, VerifySite>> = Object.freeze(
     kind: "dispatcher",
     writes: "the tool handlers' writes, after the final auth-generation re-check; the explicit-caller cache via explicitCallerCachePut (generation read with the row)",
   },
-  "src/tools/status.ts:checkToken": { awaits: ["findAgentRowByToken", "authenticateAgent"], kind: "guarded", writes: "first_authed_at + established_at (monotonic)" },
+  "src/tools/status.ts:checkToken": { awaits: ["findAgentRowByToken", "authorizeAgentToken"], kind: "guarded", writes: "first_authed_at + established_at (monotonic), after a synchronous revalidate with no await before the stamp (SEC-20)" },
   "src/authorize-token.ts:authorizeAgentToken": { awaits: ["authenticateAgent"], kind: "none", writes: "returns the verdict, revalidated on a fresh read after the await (SEC-20: the one authorizer outside the dispatcher)" },
   "src/transport/http.ts:startHttpServer": {
     awaits: ["authorizeAgentToken"],

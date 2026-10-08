@@ -1196,6 +1196,16 @@ export function startHttpServer(port: number, host: string): Server {
       // and the send below (an await separated the authorizer's own check from here).
       const stillFrom = revalidate(getDb(), fromAuth.verdict, Date.now());
       if (!stillFrom.ok) {
+        // Codex #315 R1 P3: audited like every other from-token refusal (no credential in the row).
+        logDashboardAudit(
+          req,
+          "send_message",
+          parsed.data.from,
+          `from=${parsed.data.from} to=${parsed.data.to} from_authenticated=false`,
+          false,
+          `from_agent_token no longer authorizes at the point of use: ${stillFrom.reason}`,
+          { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED", refusal: "revalidate" }
+        );
         res.status(403).json({ success: false, error: stillFrom.reason, error_code: "AUTH_FAILED" });
         return;
       }

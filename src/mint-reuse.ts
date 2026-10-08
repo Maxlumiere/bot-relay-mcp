@@ -31,6 +31,7 @@
  * "I want a new token" case (it writes the vault too).
  */
 import { authorizeAgentToken } from "./authorize-token.js";
+import { revokedStateOf } from "./auth-verdict.js";
 import { mintAgentToken, getAgentAuthData } from "./db.js";
 import { defaultTokenStore } from "./token-store.js";
 
@@ -53,6 +54,10 @@ export async function stableMintOrReuse(
   opts: { description?: string | null } = {},
 ): Promise<MintReuseResult> {
   const existing = getAgentAuthData(name);
+  // SEC-20 (Codex #315 R1 P3): the row's STATE first, before any token or hash branch: a revoked row (a legacy
+  // one included) is reported revoked, never minted over or thrown on.
+  const revoked = revokedStateOf(existing);
+  if (revoked) return { status: "revoked", state: revoked };
   if (!existing || !existing.token_hash) {
     // Genuinely absent identity → mint + write the vault atomically-enough
     // (DB row first, then the vault so a live agent's next hook run + Tether
@@ -60,11 +65,6 @@ export async function stableMintOrReuse(
     const minted = mintAgentToken(name, role, capabilities, { description: opts.description });
     await defaultTokenStore().write(name, minted.plaintext_token);
     return { status: "created", token: minted.plaintext_token };
-  }
-  // SEC-20: a revoked row KEEPS its hash, so its vault token still matches: the row's state decides
-  // first, whatever the vault holds.
-  if (existing.revoked_at || existing.auth_state === "revoked" || existing.auth_state === "recovery_pending") {
-    return { status: "revoked", state: existing.auth_state === "recovery_pending" ? "recovery_pending" : "revoked" };
   }
   // Row exists — reuse ONLY if the on-disk vault token is AUTHORIZED for it (the one authorizer: state,
   // then hash, then revalidate), never on a hash match alone.

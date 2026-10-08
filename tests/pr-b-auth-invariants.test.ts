@@ -114,7 +114,14 @@ describe("INVARIANT 1: no await between the final authorization check and the wr
     expect(decl(st[0])?.initializer?.getText(sf), "1: now is read ONCE").toBe("Date.now()");
     expect(callee(decl(st[1])?.initializer), "2: revalidate").toBe("revalidate");
     expect(ts.isIfStatement(st[2]) && ts.isReturnStatement(st[2].thenStatement), "3: refuse on a failed check").toBe(true);
-    expect(ts.isReturnStatement(st[3]) && callee(st[3].expression), "4: the handler starts at once").toBe("dispatch");
+    // SEC-20: the handler starts at once INSIDE its authorization scope (src/authorization-scope.ts), so an async
+    // handler can re-derive the same verdict after its own awaits. runAuthorized calls the arrow SYNCHRONOUSLY.
+    const ret = ts.isReturnStatement(st[3]) ? st[3].expression : undefined;
+    expect(callee(ret), "4: the handler starts at once, under its verdict").toBe("runAuthorized");
+    const scoped = ret && ts.isCallExpression(ret) ? ret.arguments : undefined;
+    expect(scoped?.[0]?.getText(sf), "4a: the scope carries THIS call's verdict").toBe("verdict");
+    const body = scoped?.[2] && ts.isArrowFunction(scoped[2]) ? scoped[2].body : undefined;
+    expect(body && !ts.isBlock(body) ? callee(body) : null, "4b: the scope's only work is dispatch (no await, no block)").toBe("dispatch");
     let awaitsInside = 0;
     const countAwaits = (n: ts.Node): void => {
       if (ts.isAwaitExpression(n)) awaitsInside++;

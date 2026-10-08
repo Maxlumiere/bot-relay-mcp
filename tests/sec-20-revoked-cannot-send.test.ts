@@ -239,6 +239,27 @@ describe("SEC-20 in process: the authorizer and the local consumers", () => {
     }
   });
 
+  it("health_check (Codex #315 R1 P2): a revoke landing while the token is LOCATED is reported revoked, never valid, and nothing is stamped", async () => {
+    const { _onNextCompareForTests } = await import("../src/bcrypt-pool.js");
+    const { handleHealthCheck } = await import("../src/tools/status.js");
+    const t = db.mintAgentToken("hc-race", "w", []).plaintext_token;
+    let fired = false;
+    _onNextCompareForTests(() => {
+      fired = true;
+      db.revokeAgentToken("hc-race", { issueRecovery: false });
+    });
+    try {
+      const res = await handleHealthCheck({ agent_token: t } as never);
+      const body = JSON.parse((res as { content: Array<{ text: string }> }).content[0].text) as { auth_error?: boolean; auth_error_reason?: string; auth_state?: string };
+      expect(fired, "precondition: the revoke landed during the compare").toBe(true);
+      expect([body.auth_error, body.auth_state]).toEqual([true, "revoked"]);
+      expect(body.auth_error_reason).toMatch(/revoked/i);
+      expect((db.getDb().prepare("SELECT first_authed_at FROM agents WHERE name = ?").get("hc-race") as { first_authed_at: string | null }).first_authed_at).toBeNull();
+    } finally {
+      _onNextCompareForTests(null);
+    }
+  });
+
   it("stableMintOrReuse: a REVOKED agent's authenticating vault token is NOT reused (reported revoked)", async () => {
     const created = await reuse.stableMintOrReuse("mr-revoked", "w", []);
     expect(created.status).toBe("created");
@@ -248,6 +269,28 @@ describe("SEC-20 in process: the authorizer and the local consumers", () => {
     const r = await reuse.stableMintOrReuse("mr-revoked", "w", []);
     expect(r.status).toBe("revoked");
     expect("token" in r).toBe(false);
+  });
+
+  it("`relay mint-token --force` (forceRotateAndVault) REFUSES a revoked or recovery_pending row, pointing to `relay recover`; the row is unchanged", async () => {
+    for (const [name, issueRecovery, state] of [["fm-revoked", false, "revoked"], ["fm-recovery", true, "recovery_pending"]] as const) {
+      db.mintAgentToken(name, "w", []);
+      db.revokeAgentToken(name, { issueRecovery });
+      const before = db.getDb().prepare("SELECT auth_state, token_hash, revoked_at FROM agents WHERE name = ?").get(name);
+      await expect(reuse.forceRotateAndVault(name, "w", []), name).rejects.toThrow(/relay recover/);
+      // ...and it names the RIGHT way back: a recovery_pending agent also has its revoker-issued recovery token.
+      await expect(reuse.forceRotateAndVault(name, "w", []), name).rejects.toThrow(state === "recovery_pending" ? /awaiting recovery[\s\S]*recovery token/ : /is revoked: /);
+      expect(() => db.mintAgentToken(name, "w", [], { force: true }), name).toThrow(/revoked|recovery/);
+      const after = db.getDb().prepare("SELECT auth_state, token_hash, revoked_at FROM agents WHERE name = ?").get(name) as { auth_state: string };
+      expect(after, name).toEqual(before);
+      expect(after.auth_state).toBe(state);
+    }
+  });
+
+  it("TWIN: `relay mint-token --force` on an ACTIVE row still rotates (a new token that authorizes; the old one does not)", async () => {
+    const old = db.mintAgentToken("fm-active", "w", []).plaintext_token;
+    const f = await reuse.forceRotateAndVault("fm-active", "w", []);
+    expect((await auth.authorizeAgentToken("fm-active", f.token)).ok).toBe(true);
+    expect((await auth.authorizeAgentToken("fm-active", old)).ok).toBe(false);
   });
 
   it("TWIN: an ACTIVE agent's authenticating vault token is still reused", async () => {

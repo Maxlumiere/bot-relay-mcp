@@ -7,6 +7,7 @@ import { registerWebhook, listWebhooks, deleteWebhook } from "../db.js";
 import { validateWebhookUrl } from "../url-safety.js";
 import type { RegisterWebhookInput, DeleteWebhookInput } from "../types.js";
 import { ERROR_CODES } from "../error-codes.js";
+import { recheckAuthorization } from "../authorization-scope.js";
 
 export async function handleRegisterWebhook(input: RegisterWebhookInput) {
   // SSRF protection — block private IPs, cloud metadata, and non-HTTP schemes
@@ -32,6 +33,20 @@ export async function handleRegisterWebhook(input: RegisterWebhookInput) {
     };
   }
 
+  // SEC-20 (Codex #315 R1 P1): the URL check above AWAITED (DNS). A revoke or a capability change can land
+  // during it, so the caller is re-derived HERE, synchronously, with no await before the write.
+  const still = recheckAuthorization();
+  if (!still.ok) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ success: false, error: still.reason, error_code: still.code === "CAP_DENIED" ? ERROR_CODES.CAP_DENIED : ERROR_CODES.AUTH_FAILED }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
   const webhook = registerWebhook(input.url, input.event, input.filter, input.secret);
   return {
     content: [

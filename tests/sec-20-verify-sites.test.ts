@@ -4,15 +4,19 @@
 // See LICENSE for full terms.
 
 /**
- * SEC-20 invariant: NO consumer decides a token by its HASH alone. verifyCredential answers only "is this
- * the stored hash?", and a revoked row keeps its hash, so a consumer that called it directly let a revoked
- * agent act (/api/send-message sent its messages; mint-reuse handed its token back). A consumer calls the
- * one authorizer (src/authorize-token.ts authorizeAgentToken) or goes through the dispatcher.
+ * SEC-20 invariant: NO consumer decides a token by its hash or digest alone, and every token locator's consumer
+ * revalidates. A revoke KEEPS the hash, so a hash match says nothing about whether the agent may act: a consumer
+ * goes through the one authorizer (src/authorize-token.ts authorizeAgentToken) or the dispatcher.
  *
- * verifyCredential may be REFERENCED only inside the functions below: the primitive's own module, the
- * state-aware authenticator, and the two token LOCATORS the dispatcher's verdict then revalidates. Any other
- * reference fails here: a call, a value reference, an aliased import, a namespace member, an element access
- * by string. The source is PARSED (typescript-legacy, the pinned parser of #212), never grepped.
+ * Codex #315 R1 P2 (DESIGN): round 1 pinned one SPELLING (verifyCredential). This pins the low-level verify and
+ * digest APIs and the token locators by BINDING: every reference in src is resolved with the TypeScript checker
+ * (the pinned typescript-legacy of #212) to its declaration, through import aliases, re-exports and namespace
+ * imports, called, awaited or passed as a value. Each API's references must sit in its listed consumers; a new
+ * consumer fails here until it is reviewed and listed.
+ *
+ * STATED RESIDUAL (by ruling; this guards DRIFT, not an adversarial author): references the checker cannot bind
+ * are NOT seen: computed member access (`m[name]`), eval, require() by a variable, a dynamic import by a computed
+ * specifier (also refused by #212's gate).
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";
@@ -21,93 +25,136 @@ import { fileURLToPath } from "url";
 import ts from "typescript-legacy";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const NAME = "verifyCredential";
 
-/** `<file>:<enclosing top-level function>` where a reference is allowed. */
-const ALLOWED = new Set([
-  "src/token-verify.ts:verifyCredential", // its definition (and a recursive use, if one is ever added)
-  "src/token-verify.ts:verifySecretHash", // the no-digest form of the same primitive
-  "src/auth.ts:authenticateAgent", // the STATE-aware authenticator (revoked / recovery refused first)
-  "src/db.ts:findAgentRowByToken", // locator: the dispatcher revalidates the verdict it returns
-  "src/db.ts:explicitCallerCachePut", // locator: which credential matched, for the dispatcher's cache entry
-]);
+/** The pinned APIs: `<declaring file>:<export>` -> the `<file>:<top-level function>` sites allowed to reference it. */
+const PINNED: Record<string, { allowed: string[]; why: string }> = {
+  "src/token-verify.ts:verifyCredential": {
+    allowed: ["src/token-verify.ts:verifySecretHash", "src/auth.ts:authenticateAgent", "src/db.ts:findAgentRowByToken", "src/db.ts:explicitCallerCachePut"],
+    why: "the hash primitive: only the state-aware authenticator and the two locators (the dispatcher revalidates their verdicts)",
+  },
+  "src/token-verify.ts:verifySecretHash": {
+    allowed: ["src/server.ts:createServer", "src/db.ts:abandonRegistration"],
+    why: "a recovery / registration-recovery HANDLE (no digest): verified in the dispatcher, or under a CAS on the verified hash",
+  },
+  "src/bcrypt-pool.ts:compareOffLoop": { allowed: ["src/token-verify.ts:verifyCredential"], why: "the pooled bcrypt: only the primitive" },
+  "src/token-lookup.ts:digestVerdict": {
+    allowed: ["src/token-verify.ts:verifyCredential", "src/db.ts:findAgentRowByToken", "src/db.ts:explicitCallerCachePut"],
+    why: "the digest decision: the primitive, and the two locators choosing WHICH stored credential to verify (never an authorization)",
+  },
+  "src/token-lookup.ts:computeTokenLookup": {
+    allowed: ["src/db.ts:mintAgentToken", "src/db.ts:registerAgent", "src/db.ts:rotateAgentToken", "src/db.ts:rotateAgentTokenAdmin", "src/db.ts:resolveAgentByTokenVerdict", "src/db.ts:explicitCallerCacheGetVerdict", "src/db.ts:explicitCallerCachePut"],
+    why: "WRITERS of the digest (mint, register, rotate), and the verified-token CACHE key (a hit is a verdict the dispatcher revalidates)",
+  },
+  "src/db.ts:findAgentRowByToken": {
+    allowed: ["src/db.ts:resolveAgentByTokenVerdict", "src/tools/status.ts:checkToken"],
+    why: "the locator: the dispatcher's resolver (its verdict is revalidated) and health_check (followed by authorizeAgentToken + revalidate)",
+  },
+  "src/db.ts:resolveAgentByToken": { allowed: [], why: "no consumer today; a new one is reviewed here" },
+  "src/db.ts:resolveAgentByTokenVerdict": { allowed: ["src/db.ts:resolveAgentByToken", "src/server.ts:createServer"], why: "the dispatcher's token-only resolver (its verdict is revalidated)" },
+  "src/db.ts:explicitCallerCachePut": { allowed: ["src/server.ts:createServer"], why: "the dispatcher's cache fill (generation-bound; every hit is revalidated)" },
+  "src/auth.ts:authenticateAgent": { allowed: ["src/server.ts:createServer", "src/authorize-token.ts:authorizeAgentToken"], why: "the state-aware half of authorization: the dispatcher and the one authorizer, each followed by revalidate" },
+};
 
-function enclosingTopLevel(node: ts.Node): string {
-  let cur: ts.Node | undefined = node;
+function topLevelName(node: ts.Node): string {
   let name = "<module>";
-  while (cur) {
+  for (let cur: ts.Node | undefined = node; cur; cur = cur.parent) {
     if (ts.isFunctionDeclaration(cur) && cur.name) name = cur.name.text;
     else if (ts.isVariableDeclaration(cur) && ts.isIdentifier(cur.name) && cur.initializer && (ts.isArrowFunction(cur.initializer) || ts.isFunctionExpression(cur.initializer))) name = cur.name.text;
-    else if (ts.isMethodDeclaration(cur) && cur.name && ts.isIdentifier(cur.name)) name = cur.name.text;
-    cur = cur.parent;
   }
-  return name; // the OUTERMOST named function wins (the loop walks up to the file)
+  return name;
 }
 
-/** Every reference to verifyCredential in one source, as `<file>:<function>` plus how it was referenced. */
-export function referencesIn(rel: string, text: string): Array<{ site: string; how: string }> {
-  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, rel.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
-  const out: Array<{ site: string; how: string }> = [];
-  const visit = (n: ts.Node): void => {
-    // import { verifyCredential } / import { verifyCredential as x }: the import itself is not a use, but an ALIAS is
-    // refused outright (a renamed binding is how a name-matching guard is walked around).
-    if (ts.isImportSpecifier(n) && (n.propertyName ?? n.name).text === NAME) {
-      if (n.propertyName && n.name.text !== NAME) out.push({ site: `${rel}:<module>`, how: `aliased import as ${n.name.text}` });
-      return;
-    }
-    // const { verifyCredential: x } = await import(...): the same, for a destructured dynamic import.
-    if (ts.isBindingElement(n) && ((n.propertyName && ts.isIdentifier(n.propertyName) && n.propertyName.text === NAME) || (!n.propertyName && ts.isIdentifier(n.name) && n.name.text === NAME))) {
-      out.push({ site: `${rel}:${enclosingTopLevel(n)}`, how: n.propertyName && ts.isIdentifier(n.name) && n.name.text !== NAME ? `destructured as ${n.name.text}` : "destructured" });
-      return;
-    }
-    if (ts.isIdentifier(n) && n.text === NAME) {
-      const p = n.parent;
-      const isDecl = (ts.isFunctionDeclaration(p) && p.name === n) || (ts.isExportSpecifier(p));
-      if (!isDecl) out.push({ site: `${rel}:${enclosingTopLevel(n)}`, how: ts.isCallExpression(p) && p.expression === n ? "call" : ts.isPropertyAccessExpression(p) ? "member" : "reference" });
-    }
-    if (ts.isElementAccessExpression(n) && ts.isStringLiteralLike(n.argumentExpression) && n.argumentExpression.text === NAME) {
-      out.push({ site: `${rel}:${enclosingTopLevel(n)}`, how: "element access" });
-    }
-    ts.forEachChild(n, visit);
+/** Every binding-resolved reference to a pinned API in `program`'s files under `rootRel`. */
+export function pinnedReferences(program: ts.Program, rel: (f: string) => string, pinned: string[]): Array<{ api: string; site: string; how: string }> {
+  const checker = program.getTypeChecker();
+  const out: Array<{ api: string; site: string; how: string }> = [];
+  const keyOf = (sym: ts.Symbol | undefined): string | null => {
+    if (!sym) return null;
+    let s = sym;
+    if (s.flags & ts.SymbolFlags.Alias) s = checker.getAliasedSymbol(s);
+    const d = s.declarations?.[0];
+    if (!d) return null;
+    const key = `${rel(d.getSourceFile().fileName)}:${s.name}`;
+    return pinned.includes(key) ? key : null;
   };
-  visit(sf);
-  return out;
-}
-
-function srcFiles(dir: string, out: string[] = []): string[] {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) srcFiles(full, out);
-    else if (/\.(ts|tsx|mts|cts)$/.test(e.name) && !e.name.endsWith(".d.ts")) out.push(full);
+  for (const sf of program.getSourceFiles()) {
+    const file = rel(sf.fileName);
+    if (!file.startsWith("src/") || sf.isDeclarationFile) continue;
+    const visit = (n: ts.Node): void => {
+      if (ts.isIdentifier(n)) {
+        const p = n.parent;
+        const isOwnDecl = ts.isFunctionDeclaration(p) && p.name === n;
+        const inImportExport = ts.isImportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p) || ts.isExportSpecifier(p);
+        if (!isOwnDecl && !inImportExport) {
+          const key = keyOf(checker.getSymbolAtLocation(n));
+          if (key) out.push({ api: key, site: `${file}:${topLevelName(n)}`, how: ts.isCallExpression(p) && p.expression === n ? "call" : ts.isPropertyAccessExpression(p) ? "member" : "reference" });
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(sf);
   }
   return out;
 }
 
-describe("the scanner (both legs, on synthetic sources)", () => {
-  it("flags a direct call, a value reference, an aliased import, a destructured dynamic import, a namespace member and an element access", () => {
-    const bad = [
-      `import { verifyCredential } from "./token-verify.js";\nexport async function consumer(t: string) { return verifyCredential("a", { hash: "h" }, t); }`,
-      `import { verifyCredential } from "./token-verify.js";\nconst f = verifyCredential;\nexport { f };`,
-      `import { verifyCredential as vc } from "./token-verify.js";\nexport async function c(t: string) { return vc("a", { hash: "h" }, t); }`,
-      `export async function c(t: string) { const { verifyCredential: v } = await import("./token-verify.js"); return v("a", { hash: "h" }, t); }`,
-      `import * as tv from "./token-verify.js";\nexport async function c(t: string) { return tv.verifyCredential("a", { hash: "h" }, t); }`,
-      `import * as tv from "./token-verify.js";\nexport async function c(t: string) { return tv["verifyCredential"]("a", { hash: "h" }, t); }`,
-    ];
-    for (const src of bad) expect(referencesIn("src/x.ts", src).filter((r) => !ALLOWED.has(r.site)).length, src).toBeGreaterThan(0);
+function srcProgram(): ts.Program {
+  const cfgPath = path.join(REPO, "tsconfig.json");
+  const cfg = ts.readConfigFile(cfgPath, ts.sys.readFile);
+  const parsed = ts.parseJsonConfigFileContent(cfg.config, ts.sys, REPO);
+  return ts.createProgram({ rootNames: parsed.fileNames, options: { ...parsed.options, noEmit: true } });
+}
+
+/** A program over VIRTUAL files (for the checker's own legs). */
+function virtualProgram(files: Record<string, string>): ts.Program {
+  const options: ts.CompilerOptions = { module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, target: ts.ScriptTarget.ES2022, noEmit: true };
+  const host = ts.createCompilerHost(options);
+  const abs = (f: string) => path.join("/virtual", f);
+  const byAbs = new Map(Object.entries(files).map(([k, v]) => [abs(k), v]));
+  host.fileExists = (f) => byAbs.has(f) || ts.sys.fileExists(f);
+  host.readFile = (f) => byAbs.get(f) ?? ts.sys.readFile(f);
+  // Module resolution walks DIRECTORIES too: the virtual ones must exist for it, or no import resolves (a blind leg).
+  host.directoryExists = (d) => [...byAbs.keys()].some((k) => k.startsWith(`${d}/`)) || ts.sys.directoryExists(d);
+  host.realpath = (f) => f;
+  const orig = host.getSourceFile.bind(host);
+  host.getSourceFile = (f, lang) => (byAbs.has(f) ? ts.createSourceFile(f, byAbs.get(f)!, lang, true) : orig(f, lang));
+  return ts.createProgram({ rootNames: [...byAbs.keys()], options, host });
+}
+
+const relOf = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
+
+describe("the checker (both legs, on virtual sources bound to a pinned API)", () => {
+  const base = { "src/token-verify.ts": "export async function verifyCredential(..._a: unknown[]) { return 'ok'; }" };
+  const run = (consumer: string, extra: Record<string, string> = {}) =>
+    pinnedReferences(virtualProgram({ ...base, ...extra, "src/consumer.ts": consumer }), (f) => path.relative("/virtual", f).split(path.sep).join("/"), ["src/token-verify.ts:verifyCredential"]).filter((r) => r.site.startsWith("src/consumer.ts"));
+  it("precondition: the virtual program RESOLVES its imports (no diagnostic), so a miss below is the scanner's, not the fixture's", () => {
+    const prog = virtualProgram({ ...base, "src/consumer.ts": `import { verifyCredential } from "./token-verify.js";\nexport function c() { return verifyCredential(); }` });
+    expect(ts.getPreEmitDiagnostics(prog).map((d) => ts.flattenDiagnosticMessageText(d.messageText, " ")).filter((m) => /Cannot find module/.test(m))).toEqual([]);
   });
-  it("passes an allowed site and a file that only uses the authorizer", () => {
-    expect(referencesIn("src/auth.ts", `import { verifyCredential } from "./token-verify.js";\nexport async function authenticateAgent(t: string) { return verifyCredential("a", { hash: "h" }, t); }`).filter((r) => !ALLOWED.has(r.site))).toEqual([]);
-    expect(referencesIn("src/y.ts", `import { authorizeAgentToken } from "./authorize-token.js";\nexport async function c(t: string) { return authorizeAgentToken("a", t); }`)).toEqual([]);
+  it("finds a direct call, an ALIASED import, a RE-EXPORT, a NAMESPACE member, a value reference and a NON-awaited call", () => {
+    expect(run(`import { verifyCredential } from "./token-verify.js";\nexport async function c() { return verifyCredential(); }`).length).toBe(1);
+    expect(run(`import { verifyCredential as vc } from "./token-verify.js";\nexport async function c() { return vc(); }`).length).toBe(1);
+    expect(run(`import { again } from "./re.js";\nexport function c() { return again(); }`, { "src/re.ts": `export { verifyCredential as again } from "./token-verify.js";` }).length).toBe(1);
+    expect(run(`import * as tv from "./token-verify.js";\nexport function c() { return tv.verifyCredential(); }`).length).toBe(1);
+    expect(run(`import { verifyCredential } from "./token-verify.js";\nexport const f = verifyCredential;`).length).toBe(1);
+    expect(run(`import { verifyCredential } from "./token-verify.js";\nexport function c() { void verifyCredential().then(() => 1); }`).length).toBe(1);
+  });
+  it("does NOT flag a same-named LOCAL function (the binding, not the spelling, decides)", () => {
+    expect(run(`function verifyCredential() { return 1; }\nexport function c() { return verifyCredential(); }`)).toEqual([]);
   });
 });
 
-describe("src: verifyCredential is referenced ONLY by the primitive, the state-aware authenticator and the locators", () => {
-  const all = srcFiles(path.join(REPO, "src")).flatMap((f) => referencesIn(path.relative(REPO, f).split(path.sep).join("/"), fs.readFileSync(f, "utf-8")));
-  it("precondition: the scan sees the allowed sites (it is not blind)", () => {
-    const seen = new Set(all.map((r) => r.site));
-    for (const s of ["src/auth.ts:authenticateAgent", "src/db.ts:findAgentRowByToken", "src/token-verify.ts:verifySecretHash"]) expect(seen.has(s), s).toBe(true);
+describe("src: every pinned verify / digest / locator API is referenced ONLY by its listed consumers", () => {
+  const refs = pinnedReferences(srcProgram(), relOf, Object.keys(PINNED));
+  it("precondition: the scan sees the known consumers (it is not blind)", () => {
+    for (const [api, site] of [["src/token-verify.ts:verifyCredential", "src/auth.ts:authenticateAgent"], ["src/auth.ts:authenticateAgent", "src/authorize-token.ts:authorizeAgentToken"], ["src/token-lookup.ts:computeTokenLookup", "src/db.ts:registerAgent"]]) {
+      expect(refs.some((r) => r.api === api && r.site === site), `${api} @ ${site}`).toBe(true);
+    }
   });
-  it("no other site references it", () => {
-    expect(all.filter((r) => !ALLOWED.has(r.site)).map((r) => `${r.site} (${r.how})`)).toEqual([]);
+  it("no reference outside its API's allowlist", () => {
+    expect(refs.filter((r) => !PINNED[r.api].allowed.includes(r.site)).map((r) => `${r.api} referenced by ${r.site} (${r.how})`)).toEqual([]);
+  });
+  it("no stale allowlist entry (each listed consumer still references its API)", () => {
+    const stale = Object.entries(PINNED).flatMap(([api, p]) => p.allowed.filter((site) => !refs.some((r) => r.api === api && r.site === site)).map((site) => `${api} no longer used by ${site}`));
+    expect(stale).toEqual([]);
   });
 });

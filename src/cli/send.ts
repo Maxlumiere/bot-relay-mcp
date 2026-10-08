@@ -149,6 +149,17 @@ export async function run(argv: string[]): Promise<number> {
       const { defaultTokenStore } = await import("../token-store.js");
       const vaultToken = await defaultTokenStore().read(from);
       const authData = getAgentAuthData(from);
+      // SEC-20 (Codex #315 R1 P3): the row's STATE first. A revoke scrubs the vault, so checking the vault first
+      // told a revoked agent "mismatched, use --force".
+      const { revokedStateOf } = await import("../auth-verdict.js");
+      const revoked = revokedStateOf(authData);
+      if (revoked) {
+        process.stderr.write(
+          `relay send: agent "${from}" is ${revoked === "recovery_pending" ? "awaiting recovery" : "revoked"}: its token authorizes nothing (AUTH_FAILED).\n` +
+            `  • Re-register with its recovery token, or reset the identity: relay recover ${from}\n`
+        );
+        return 2;
+      }
       if (authData && authData.token_hash) {
         // Registered agent — the vault token MUST authenticate. Even with
         // --mint-if-missing a mismatch is NOT silently rotated (that needs
