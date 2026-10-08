@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Security — a revoked agent can no longer send messages
+
+Revoking an agent did not stop it from sending. A revoke keeps the agent's token on record (for the audit trail) and marks the agent revoked, but the relay's message endpoint (what `relay send` uses) only checked that the token matched. So anyone holding a revoked agent's token, plus access to that endpoint, could still send messages as that agent.
+
+- **Every token is now checked by one authorizer.** A revoked agent, or one waiting for recovery, is refused, even with its own token: `relay send` gets `AUTH_FAILED` and no message is stored. The check runs again right before the message is written, so a revoke that lands while the token is being checked also counts.
+- **`relay mint-token`, `relay send` and `relay resolve` no longer hand back a revoked agent's token as usable.** They say the agent is revoked and point to `relay recover`.
+- **During a token rotation's grace window**, the message endpoint now also accepts the previous token, as every other tool already did.
+- **A test fails** if anything other than the authorizer and the token lookups checks a token's hash directly.
 ### Added: `relay watch AGENT --until-wake`, a wake that costs no model tokens while it waits
 
 An agent can now be woken for new relay mail without polling and without a model call. From its own session, it first runs `relay watch AGENT --arm-check`, which says whether to start a watch and gives the exact command. It then starts that command once as a background task. The command waits, and exits with one line when the agent has mail to wake for. Its exit is the wake. The agent reads its mail, then arms again.

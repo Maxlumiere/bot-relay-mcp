@@ -153,10 +153,18 @@ export async function run(argv: string[]): Promise<number> {
         // Registered agent — the vault token MUST authenticate. Even with
         // --mint-if-missing a mismatch is NOT silently rotated (that needs
         // `mint-token --force`); it refuses locally with NO POST.
-        // PR-B: the shared verifier (a known digest decides a mismatch with no bcrypt; bcrypt in the pool).
-        const { verifyCredential } = await import("../token-verify.js");
-        if (vaultToken && (await verifyCredential(from, { hash: authData.token_hash, lookup: authData.token_lookup }, vaultToken)).verdict === "ok") {
+        // SEC-20: the one authorizer (state, then hash, then revalidate), never the hash alone: a revoked
+        // row keeps its hash, so its vault token still matches.
+        const { authorizeAgentToken } = await import("../authorize-token.js");
+        const a = vaultToken ? await authorizeAgentToken(from, vaultToken) : null;
+        if (a?.ok) {
           token = vaultToken;
+        } else if (a && (a.refusal === "revoked" || a.refusal === "recovery_pending")) {
+          process.stderr.write(
+            `relay send: agent "${from}" is ${a.refusal === "recovery_pending" ? "awaiting recovery" : "revoked"}: it can no longer send (AUTH_FAILED). NOT sending.\n` +
+              `  • Re-register with its recovery token, or reset the identity: relay recover ${from}\n`
+          );
+          return 2;
         } else {
           process.stderr.write(
             `relay send: the vault token for "${from}" does not authenticate against the DB ` +
@@ -174,6 +182,10 @@ export async function run(argv: string[]): Promise<number> {
           process.stderr.write(
             `relay send: agent "${from}" is in a mismatched state — use \`relay mint-token ${from} --force\`.\n`
           );
+          return 2;
+        }
+        if (r.status === "revoked") {
+          process.stderr.write(`relay send: agent "${from}" is ${r.state}: it can no longer send (AUTH_FAILED). NOT sending.\n`);
           return 2;
         }
         token = r.token;

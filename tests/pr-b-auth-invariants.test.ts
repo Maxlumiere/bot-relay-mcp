@@ -243,7 +243,8 @@ describe("INVARIANT 1b: every write derived from an awaited verify is classified
     expect(awaitedVerifySites()).toEqual(want);
   });
   it("the scan is not vacuous: it finds the dashboard's verify inside an inline route handler", () => {
-    expect(awaitedVerifySites()["src/transport/http.ts:startHttpServer"]).toEqual(["verifyCredential"]);
+    // SEC-20: the route awaits the one authorizer (state, then hash, then revalidate), no longer the hash check.
+    expect(awaitedVerifySites()["src/transport/http.ts:startHttpServer"]).toEqual(["authorizeAgentToken"]);
   });
   it("MUTANTS (Codex R1 #3): an ALIASED import, a const alias, a destructured dynamic import and a re-export are all found by binding", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-sites-"));
