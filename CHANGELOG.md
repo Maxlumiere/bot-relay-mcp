@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Security: the hooks no longer show an agent's token to other users on the machine, or print it
+
+- **No token in a process's arguments.** A process's arguments are readable by every local user (`ps`, `/proc/<pid>/cmdline`). The hooks passed the agent token to `curl` as a header argument and inside the request body argument, at session start, at every stop and after every tool call, and passed the recovery token the same way. Every hook (`check-relay.sh`, `stop-check.sh`, `post-tool-use-check.sh`, `codex/codex-session-start.sh`) and `bin/codex-relay` now hand `curl` the token header and any token-bearing body through its config on standard input (`curl -K -`), as the registration secret already was. One helper builds every such line: a quote or backslash in a value is escaped, and a value holding a line break is refused, so a value can never add a `curl` directive.
+- **No token printed.** A recovery whose vault write failed printed the fresh token, so the operator could set it by hand; the session transcript then kept a copy. It now says the token could not be saved and to run `relay recover`. `RELAY_HOOK_DEBUG`'s dump of the register reply, and a failed recovery's reply, are redacted (every credential the hook holds, and the value of any field named `…token` or `…secret`) before they are printed or cut short.
+- **`canonicalIp` takes exactly one address.** It accepted surrounding whitespace and brackets (`" 127.0.0.1 "`, `"[::1]"`). No bypass followed from that (the loopback gates read the kernel's socket address, which is never padded), but the dashboard's credential-less loopback gate now accepts only an exact address. The helpers that read operator-typed lists (`trusted_proxies`, `ipInCidr`) keep their tolerance, unchanged.
+- **Not covered.** Tokens still reach `node` and `python3` through environment variables, which only the same user (and root) can read: the relay's existing same-user trust boundary. A binary started by absolute path is outside the new test's observer (no hook starts one with a credential). `scripts/smoke-25-tools.sh`, a test script, still passes tokens as arguments.
+
 ### Added: `relay watch AGENT --until-wake`, a wake that costs no model tokens while it waits
 
 An agent can now be woken for new relay mail without polling and without a model call. From its own session, it first runs `relay watch AGENT --arm-check`, which says whether to start a watch and gives the exact command. It then starts that command once as a background task. The command waits, and exits with one line when the agent has mail to wake for. Its exit is the wake. The agent reads its mail, then arms again.

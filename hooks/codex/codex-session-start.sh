@@ -202,8 +202,10 @@ RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
 RELAY_AGENT_PID_START=""
 [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
 
+# The token is never a header in argv: it rides curl's config on STDIN (relay_curl_token_config, from
+# _vault-helpers.sh). Without the helpers no token is sent, and the register fails loudly instead.
 REG_HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
-[ -n "${RELAY_AGENT_TOKEN:-}" ] && REG_HEADERS+=(-H "X-Agent-Token: ${RELAY_AGENT_TOKEN}")
+relay_token_config() { command -v relay_curl_token_config >/dev/null 2>&1 && relay_curl_token_config "${RELAY_AGENT_TOKEN:-}"; }
 
 # v2.16.4 cold-start handoff: if bin/codex-relay pre-registered this launch it
 # exports RELAY_LAUNCH_SESSION = the session_id it registered. SKIP our register
@@ -217,7 +219,7 @@ REG_HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, t
 # can never make us skip (no cross-agent leakage).
 SKIP_REGISTER_HANDOFF=0
 if relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
-  DISCOVER_BODY=$(curl -fsS --connect-timeout 1 --max-time 2 -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  DISCOVER_BODY=$(relay_token_config | curl -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_agents","arguments":{}}}' 2>/dev/null) || DISCOVER_BODY=""
   if [ -n "$DISCOVER_BODY" ] && command -v python3 >/dev/null 2>&1; then
@@ -248,8 +250,8 @@ except Exception:
 fi
 
 if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
-  # PR-D: the registration secret rides curl's config on STDIN (never argv, never env).
-  REG_BODY=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; } | curl -s -m 4 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
+  REG_BODY=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; relay_token_config || true; } | curl -s -m 4 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"codex\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
     2>/dev/null)

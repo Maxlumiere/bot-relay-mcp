@@ -16,7 +16,7 @@
 import { describe, it, expect } from "vitest";
 import fc from "fast-check";
 import type { Request } from "express";
-import { canonicalCidr, canonicalIp, formatIp, ipInCidr } from "../src/cidr.js";
+import { canonicalCidr, canonicalIp, formatIp, ipInAnyCidr, ipInCidr, isLoopbackPeer } from "../src/cidr.js";
 import { classifyIp, classifyIPv6 } from "../src/ip-classifier.js";
 import { extractSourceIp } from "../src/transport/http.js";
 
@@ -134,6 +134,35 @@ describe("REJECTED, never guessed: matches nothing; each consumer fails CLOSED i
     for (const s of v4Spellings([169, 254, 169, 254]).filter((x) => !x.startsWith("["))) expect(classifyIp(s).blocked, s).toBe(true);
     expect(classifyIp("8.8.8.8").blocked).toBe(false);
     expect(classifyIp("::ffff:808:808").blocked).toBe(false);
+  });
+});
+
+describe("canonicalIp parses EXACTLY one literal (Codex PR307 P3): the credential-less loopback gate takes nothing else", () => {
+  // MEASURED before: canonicalIp(" 127.0.0.1 ") and canonicalIp("[127.0.0.1]") were 127.0.0.1, so the
+  // "anything not fully consumed is rejected" guarantee did not hold. No bypass was found (the gates read the
+  // kernel's socket address, which is never padded or bracketed), so this pins the CONTRACT the gates rely on.
+  const loose = [" 127.0.0.1", "127.0.0.1 ", "127.0.0.1\n", "\t::1", "[127.0.0.1]", "[::1]", "[::ffff:127.0.0.1]", " 127.0.0.1"];
+  it("HARM refused: padded or bracketed text is not an address, and is not loopback", () => {
+    for (const s of loose) {
+      expect(canonicalIp(s), JSON.stringify(s)).toBeNull();
+      expect(isLoopbackPeer(s), JSON.stringify(s)).toBe(false);
+    }
+  });
+  it("TWIN: every exact spelling of loopback still is loopback", () => {
+    for (const s of ["127.0.0.1", "127.255.0.9", "::1", "::ffff:127.0.0.1", "::FFFF:7f00:1", "0:0:0:0:0:0:0:1"]) {
+      expect(isLoopbackPeer(s), s).toBe(true);
+    }
+  });
+  it("the list helpers keep their documented operator tolerance (trim, one bracket pair): unchanged", () => {
+    expect(ipInCidr(" 192.168.1.1", "192.168.1.0/24")).toBe(true);
+    expect(ipInCidr("[::1]", "::1/128")).toBe(true);
+    expect(ipInAnyCidr(" 10.0.0.1 ", ["10.0.0.0/8"])).toBe(true);
+    expect(canonicalCidr(" 10.0.0.0/8 ")).not.toBeNull();
+    expect(canonicalCidr("[::1]/128")).not.toBeNull();
+  });
+  it("a padded or bracketed SOCKET peer is never trusted as a proxy, and is returned as received", () => {
+    const r = (peer: string) => ({ socket: { remoteAddress: peer }, headers: { "x-forwarded-for": "6.6.6.6" } }) as unknown as Request;
+    for (const peer of [" 10.1.2.3", "[10.1.2.3]"]) expect(extractSourceIp(r(peer), ["10.0.0.0/8"]), peer).toBe(peer);
   });
 });
 
