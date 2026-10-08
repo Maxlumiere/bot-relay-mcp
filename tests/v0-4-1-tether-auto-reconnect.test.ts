@@ -43,6 +43,7 @@ import cp from "child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 import { ConnectionLifecycle } from "../extensions/vscode/src/connection-lifecycle.js";
 import { ReconnectSupervisor } from "../extensions/vscode/src/reconnect-supervisor.js";
@@ -116,9 +117,9 @@ async function killProc(proc: cp.ChildProcessWithoutNullStreams): Promise<void> 
 
 /** A throwaway MCP client — used to register the agent and to send mail during
  *  the outage window, independent of the Tether-under-test connection. */
-async function withClient<T>(port: number, fn: (c: Client) => Promise<T>): Promise<T> {
+async function withClient<T>(port: number, fn: (c: Client) => Promise<T>, headers?: Record<string, string>): Promise<T> {
   const client = new Client({ name: "v0-4-1-helper", version: "0.0.0" }, { capabilities: {} });
-  const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+  const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), headers ? { requestInit: { headers } } : undefined);
   await client.connect(transport);
   try {
     return await fn(client);
@@ -161,7 +162,7 @@ describe("v0.4.1 — Tether auto-reconnect on real daemon restart", () => {
         );
         expect(reg.success).toBe(true);
         return reg.agent_token as string;
-      });
+      }, mintHeaders(dbPath)); // PR-D: a NEW name over HTTP needs the daemon's registration secret
 
       // ---- Shipped-seam wiring (mirrors extension.ts connect()) ------------
       const lifecycle = new ConnectionLifecycle<StreamableHTTPClientTransport>();

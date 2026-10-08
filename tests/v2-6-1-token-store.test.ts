@@ -25,6 +25,7 @@ import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -423,6 +424,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json, text/event-stream",
+          ...mintHeaders(ROOT), // PR-D: a NEW name over HTTP needs the daemon's registration secret
         },
         body: JSON.stringify(regBody),
       });
@@ -627,7 +629,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
       const reg = await rpc({
         name: "register_agent",
         arguments: { name: "vault-agent", role: "tester", capabilities: [] },
-      });
+      }, mintHeaders(ROOT)); // PR-D: a NEW name needs the registration secret
       expect(reg.success).toBe(true);
       const REAL_TOKEN = reg.agent_token;
       expect(REAL_TOKEN).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
@@ -756,7 +758,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
         const reg = await rpc(PORT, {
           name: "register_agent",
           arguments: { name: "health-oracle-agent", role: "tester", capabilities: [] },
-        });
+        }, mintHeaders(ROOT)); // PR-D: a NEW name needs the registration secret
         expect(reg.success).toBe(true);
         REAL_TOKEN = reg.agent_token;
         expect(REAL_TOKEN).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
@@ -912,7 +914,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
         const reg = await rpc(PORT, {
           name: "register_agent",
           arguments: { name: "env-oracle-agent", role: "tester", capabilities: [] },
-        });
+        }, mintHeaders(ROOT)); // PR-D: a NEW name needs the registration secret
         expect(reg.success).toBe(true);
         REAL_TOKEN = reg.agent_token;
         expect(REAL_TOKEN).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);

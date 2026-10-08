@@ -44,6 +44,7 @@ import os from "os";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REAL_HOOKS = path.join(REPO_ROOT, "hooks");
@@ -169,10 +170,11 @@ function stopHarness(h: Harness): void {
 }
 
 /** Register an agent over HTTP so it holds the name live. */
-async function registerLive(port: number, name: string): Promise<void> {
+async function registerLive(port: number, name: string, dbPath: string): Promise<void> {
   const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeaders(dbPath) },
     body: JSON.stringify({
       jsonrpc: "2.0", id: 1, method: "tools/call",
       params: { name: "register_agent", arguments: { name, role: "builder", capabilities: [] } },
@@ -241,7 +243,7 @@ describe("ADR-0036 S1 (D7) — a register or token check that failed never reads
     const h = await startHarness("collide");
     try {
       writeClaudeJson(h.root, OK_ENTRY);
-      await registerLive(h.port, "s1-held");
+      await registerLive(h.port, "s1-held", h.dbPath);
 
       const r = runHook({ home: h.root, dbPath: h.dbPath, port: h.port, name: "s1-held" });
       expect(verdictOf(r.stdout), r.stdout + r.stderr).toBe("REGISTER_FAILED");

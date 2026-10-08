@@ -21,6 +21,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-4q-attr-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -39,6 +40,9 @@ async function rpc(tool: string, args: any, token?: string): Promise<any> {
     Accept: "application/json, text/event-stream",
   };
   if (token) headers["X-Agent-Token"] = token;
+  // PR-D: an HTTP register that issues a token with no credential bound to the row (a new name, or a
+  // legacy_bootstrap migration) needs the registration secret. Existing names still need their own token.
+  if (tool === "register_agent") Object.assign(headers, mintHeaders());
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
     headers,

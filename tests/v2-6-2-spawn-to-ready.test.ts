@@ -34,6 +34,7 @@ import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -288,6 +289,7 @@ describe("v2.6.2 — spawn-to-ready integration (vault state matrix)", () => {
           headers: {
             "Content-Type": "application/json",
             Accept: "application/json, text/event-stream",
+            ...mintHeaders(ROOT), // PR-D: a NEW name over HTTP needs the daemon's registration secret
           },
           body: JSON.stringify(body),
         });

@@ -274,6 +274,29 @@ function checkPerms(p: string): CheckResult[] {
   return results;
 }
 
+/**
+ * PR-D (Codex R1 #2): the registration secret, beside the DB it guards. PASS when it exists and its whole chain
+ * (instance dir, secrets dir, file) is private to this user; WARN when absent (a fresh install); FAIL when it is
+ * unusable, naming the path and the uid, mode or SID.
+ * Never prints the secret. A pure read: the daemon (or `relay init`) creates and tightens it.
+ */
+async function checkMintSecret(dbPath: string): Promise<CheckResult> {
+  const { openMintAllowed, OPEN_MINT_ENV } = await import("../mint-gate.js");
+  const { readMintSecret, mintSecretPath } = await import("../mint-secret.js");
+  const home = path.dirname(dbPath);
+  if (openMintAllowed()) return { name: "registration secret", status: "WARN", detail: `${OPEN_MINT_ENV}=1: new names need no secret (development only)` };
+  try {
+    const info = (await import("../mint-secret.js")).mintSecretChainInfo(home);
+    return readMintSecret(home) !== null
+      ? { name: "registration secret", status: "PASS", detail: `${mintSecretPath(home)} (private to this user)${info.length ? `; INFO: ${info.join("; INFO: ")}` : ""}` }
+      : // Absent on a fresh install is expected (like relay.db): the daemon creates it at start. A daemon that is
+        // UP without one is reported by its own /health (mint: unavailable) and by `relay fleet --deploy-check`.
+        { name: "registration secret", status: "WARN", detail: `not present at ${mintSecretPath(home)} (created when the daemon starts, or by \`relay init\`; until then every new agent name over HTTP is refused)` };
+  } catch (err) {
+    return { name: "registration secret", status: "FAIL", detail: `${(err as Error).message}: every new agent name over HTTP is refused until it is fixed` };
+  }
+}
+
 async function checkDiskSpace(p: string): Promise<CheckResult> {
   try {
     const dir = fs.existsSync(path.dirname(p)) ? path.dirname(p) : os.tmpdir();
@@ -586,6 +609,7 @@ export async function run(argv: string[]): Promise<number> {
       results.push(await checkConfig(configPath));
       results.push(...(await checkDb(resolution.dbPath)));
       results.push(...checkPerms(resolution.dbPath));
+      results.push(await checkMintSecret(resolution.dbPath));
       results.push(await checkDiskSpace(resolution.dbPath));
     } finally {
       if (pinned.db === undefined) delete process.env.RELAY_DB_PATH;

@@ -10,6 +10,7 @@ import os from "os";
 import net from "net";
 import http from "http";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-trusted-proxy-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -78,6 +79,7 @@ describe("trusted proxy / X-Forwarded-For handling (v1.6.2)", () => {
     beforeAll(async () => {
       cleanup();
       delete process.env.RELAY_TRUSTED_PROXIES;
+      fs.mkdirSync(TEST_DB_DIR, { recursive: true }); // PR-D: the daemon creates its registration secret here at start
       server = startHttpServer(0, "127.0.0.1");
       await new Promise((r) => setTimeout(r, 100));
       const addr = server.address();
@@ -100,8 +102,8 @@ describe("trusted proxy / X-Forwarded-For handling (v1.6.2)", () => {
           arguments: { name, role: "r", capabilities: [] },
         },
       });
-      const reg1 = await sendMcpWithHeaders(port, {}, registerBody("xff-test-1"));
-      const reg2 = await sendMcpWithHeaders(port, {}, registerBody("xff-test-2"));
+      const reg1 = await sendMcpWithHeaders(port, mintHeaders(), registerBody("xff-test-1")); // PR-D: a new name needs the registration secret
+      const reg2 = await sendMcpWithHeaders(port, mintHeaders(), registerBody("xff-test-2"));
       const tok1 = parseSse(reg1.body).result.content[0].text;
       const token1 = JSON.parse(tok1).agent_token;
       expect(token1).toBeTruthy();
@@ -144,6 +146,7 @@ describe("trusted proxy / X-Forwarded-For handling (v1.6.2)", () => {
       // 127.0.0.1 is our "trusted proxy" for the test (since that's the only
       // peer we can actually have in a test environment)
       process.env.RELAY_TRUSTED_PROXIES = "127.0.0.0/8,::1/128";
+      fs.mkdirSync(TEST_DB_DIR, { recursive: true }); // PR-D: the daemon creates its registration secret here at start
       server = startHttpServer(0, "127.0.0.1");
       await new Promise((r) => setTimeout(r, 100));
       const addr = server.address();
@@ -162,8 +165,8 @@ describe("trusted proxy / X-Forwarded-For handling (v1.6.2)", () => {
         method: "tools/call",
         params: { name: "register_agent", arguments: { name, role: "r", capabilities: [] } },
       });
-      await sendMcpWithHeaders(port, {}, registerBody("trusted-1"));
-      await sendMcpWithHeaders(port, {}, registerBody("trusted-2"));
+      await sendMcpWithHeaders(port, mintHeaders(), registerBody("trusted-1")); // PR-D: a new name needs the registration secret
+      await sendMcpWithHeaders(port, mintHeaders(), registerBody("trusted-2"));
 
       const sendBody = JSON.stringify({
         jsonrpc: "2.0",

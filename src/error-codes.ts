@@ -36,6 +36,10 @@ export const ERROR_CODES = {
   /** v2.1.3 — register_agent blocked because an active row with this name is
    * held by a different session and the caller's token does not match. */
   NAME_COLLISION_ACTIVE: "NAME_COLLISION_ACTIVE",
+  /** PR-D — register_agent of a NEW name over HTTP without this instance's registration secret
+   * (X-Relay-Secret or Authorization: Bearer). A tool-level refusal: an old hook sees REGISTER_FAILED,
+   * never a silent pass. Fix: update the client, or run `relay init` to mint the secret. */
+  MINT_SECRET_REQUIRED: "MINT_SECRET_REQUIRED",
   /** v2.1.3 — send_message from an agent whose row no longer exists (e.g.
    * deleted by relay recover / unregister_agent between dispatcher auth and
    * handler write). Caller should re-register before retrying. */

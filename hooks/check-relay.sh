@@ -262,6 +262,20 @@ if [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; then
   fi
 fi
 
+# PR-D: a window launched WITHOUT a name gets NO relay identity. Before this, it
+# fell back to the literal "default" and registered over HTTP under it: MEASURED 2026-10-06, an unnamed
+# hand launch tried "default" 155 times, and one attempt held the live daemon's loop ~5 s. Unnamed means:
+# the name is still unresolved after RELAY_AGENT_NAME, a spawn manifest and config default_agent_name.
+# An EXPLICIT RELAY_AGENT_NAME=default is a chosen name and still registers. Stop here, before any vault
+# read, register, bind or mail read under a name nobody chose; say so on stdout, where the agent reads it.
+if [ -z "${RELAY_AGENT_NAME:-}" ] && { [ "$AGENT_NAME" = "default" ] || [ -z "$AGENT_NAME" ]; }; then
+  echo "[RELAY] unnamed: not registered. This window has no relay identity (no RELAY_AGENT_NAME, spawn manifest or default_agent_name). To join the relay: run \`relay init --agent <name>\` (a default name for this machine), or set RELAY_AGENT_NAME, then restart."
+  if command -v relay_verdict_raise >/dev/null 2>&1; then
+    relay_verdict_raise "DEGRADED" "unnamed: not registered (set RELAY_AGENT_NAME to join the relay)" ""
+  fi
+  exit 0
+fi
+
 # v2.6.1 — vault-first bootstrap. If RELAY_AGENT_TOKEN is unset in env BUT a
 # vault file exists for this agent name, hydrate the env from disk before any
 # auth-sensitive call below. Closes the spawn-without-pre-mint failure mode
@@ -1065,7 +1079,8 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
   RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
-  REG_BODY=$(curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" \
+  # PR-D: the registration secret rides curl's config on STDIN (never argv, never env).
+  REG_BODY=$({ relay_mint_secret_curl_config || true; } | curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
@@ -1115,12 +1130,24 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
   # NOTE: `isError` sits at the JSON-RPC RESULT level, so it is UNESCAPED
   # (`"isError":true`) — unlike error_code/auth_error which live inside the
   # stringified tool content and carry `\"…\"`. Verified against the live wire.
+  # A NEW name refused for the registration secret names THAT cause (and the file), never a guessed collision:
+  # the error_code sits inside the stringified tool content, so its quotes arrive escaped (\").
+  RELAY_REG_MINT_REFUSED=0
+  if printf '%s' "$REG_BODY" | grep -qE 'error_code\\?"[[:space:]]*:[[:space:]]*\\?"MINT_SECRET_REQUIRED\\?"'; then
+    RELAY_REG_MINT_REFUSED=1
+    RELAY_MINT_SECRET_FILE=$(relay_mint_secret_file 2>/dev/null) || RELAY_MINT_SECRET_FILE="<relay instance dir>/secrets/mint.secret"
+  fi
   if [ -z "${RELAY_AGENT_TOKEN:-}" ] && printf '%s' "$REG_BODY" | grep -qE '"isError":[[:space:]]*true'; then
     echo "[RELAY] *** REGISTRATION FAILED — you can read mail but CANNOT SEND ***" >&2
     echo "[relay] register_agent issued no token for \"$AGENT_NAME\" (the server returned an error)." >&2
     echo "[relay] You can READ mail, but every SEND this session will fail with AUTH_FAILED." >&2
-    echo "[relay] Most likely: the name \"$AGENT_NAME\" is already held by another ACTIVE agent." >&2
-    echo "[relay] Choose a unique RELAY_AGENT_NAME and restart, or set RELAY_HOOK_DEBUG=1 to see the server's reason." >&2
+    if [ "$RELAY_REG_MINT_REFUSED" -eq 1 ]; then
+      echo "[relay] Cause: the relay needs its registration secret to register a NEW name (MINT_SECRET_REQUIRED), and this hook could not present a valid one." >&2
+      echo "[relay] It reads it from $RELAY_MINT_SECRET_FILE: check that file exists and is readable by you (the daemon creates it when it starts; \`relay init\` creates it too), then restart." >&2
+    else
+      echo "[relay] Most likely: the name \"$AGENT_NAME\" is already held by another ACTIVE agent." >&2
+      echo "[relay] Choose a unique RELAY_AGENT_NAME and restart, or set RELAY_HOOK_DEBUG=1 to see the server's reason." >&2
+    fi
   fi
   # If $RELAY_HOOK_DEBUG is set, print the full response for troubleshooting.
   # Otherwise stay quiet: the token-less failure case is announced just above, and
@@ -1162,6 +1189,8 @@ if [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2
     relay_verdict_set "DEGRADED" "curl unavailable: register skipped, wake may be unavailable" " agent=\"$AGENT_NAME\""
   elif [ "$DAEMON_REACHABLE" = "0" ]; then
     relay_verdict_set "DEGRADED" "daemon unreachable: register skipped, wake may be unavailable" " agent=\"$AGENT_NAME\" port=\"$HTTP_PORT\""
+  elif [ "$REGISTER_ATTEMPTED" -eq 1 ] && [ "${RELAY_REG_MINT_REFUSED:-0}" -eq 1 ]; then
+    relay_verdict_set "REGISTER_FAILED" "a new name needs the relay's registration secret (MINT_SECRET_REQUIRED)" " agent=\"$AGENT_NAME\" secret_file=\"$RELAY_MINT_SECRET_FILE\""
   elif [ "$REGISTER_ATTEMPTED" -eq 1 ] && printf '%s' "${REG_BODY:-}" | grep -qE '"isError":[[:space:]]*true'; then
     relay_verdict_set "REGISTER_FAILED" "register_agent returned an error (for example the name is held by another live agent)" " agent=\"$AGENT_NAME\""
   fi

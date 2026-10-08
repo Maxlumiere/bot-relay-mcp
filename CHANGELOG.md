@@ -32,6 +32,31 @@ Checking a token that did not match cost a bcrypt compare (about 64 ms of CPU) o
 - **`relay doctor`** lists agents whose token has no usable digest, with when each was last seen. **`relay re-encrypt --verify-clean`** keeps an encryption key while any token digest still uses it.
 - **A token changed during its own check is handled correctly.** A check now waits for bcrypt, so a rotation, revocation or recovery can land while a token is being checked. Nothing decided from that check can now outlast the change. A revoked token is refused, including on the call that was being checked. A rotated agent's new token keeps working. A dashboard message sent as that agent is refused with "retry", never sent.
 
+### Security — a new agent name needs the relay's registration secret
+
+Any process that could reach the relay's local HTTP port could register a new agent name and receive a token, with no credential at all. That let a stray or hostile process inject an agent into the fleet, or claim a name first. Install this together with the fix above ("a wrong or unknown token can no longer freeze the relay"), never on its own.
+
+- **Registering a new agent name over HTTP needs the registration secret.** The relay creates it at start, at `<relay instance dir>/secrets/mint.secret` (folder 0700, file 0600), and never prints it. Clients send it as `X-Relay-Secret`. The SessionStart hooks (Claude and Codex) and `bin/codex-relay` read it when they register and pass it to curl on stdin, never on the command line. A pre-v1.7 agent with no token needs it too, since it also receives a new token.
+- **A relay-assigned instance needs the secret too.** `register_agent` with `on_name_collision: "suffix"` creates a new `<name>-N` identity, or hands an existing free slot a new token. One agent's token could otherwise mint any number of identities, so over HTTP it now needs the registration secret, like any new name.
+- **The secret is used only when nobody else could have written it.** The relay checks the instance folder, the `secrets` folder and the file:
+  - On macOS and Linux, each must belong to the relay's user, with no group or other access (0700 folders, 0600 file). The file is checked through the opened file itself.
+  - On Windows, each must grant access to the relay's user only. SYSTEM is tolerated; any other account, Administrators included, is removed at start. Anything that cannot be removed is reported.
+  - On Windows, each must also be OWNED by the relay's user, SYSTEM, or Administrators. A folder made from an elevated shell is owned by Administrators: it is accepted, and `relay doctor` and the daemon's start log recommend the `icacls … /setowner` command. Any other owner is refused, with that command. The relay never takes ownership by itself. An access entry of a kind the relay does not recognise is refused too.
+  - If any check fails, the relay treats the secret as unavailable and refuses every new name. `relay doctor` and a local `/health` call (`mint_fault`) name the path and the account.
+  - The database files are reported loudly when they are not private, but the relay keeps running.
+- **`relay pair` never leaves a half-private credential file.** It makes the file private before writing the token into it, writes every byte, and removes the file if either step fails.
+- **`relay pair` never prints a credential.** The client config holds the agent's token, and on a hub that gates every call, the hub's secret. It is now written only to `--output`, which is required. The file is created 0600, and an existing file is never overwritten. The terminal shows the config with its values replaced by the file's path.
+- **A same-window refresh needs the host to match.** The second run of a SessionStart hook is a no-op refresh only when it names the same process (pid and start time) on the same host. A call that omits `host_id` now collides, like any other window.
+- **Nothing changes for an agent that already has a token.** It re-registers with its own token. Recovery with a recovery token, rotation and revocation are unchanged. Local stdio connections are not affected.
+- **A refusal is clear and bounded:** `MINT_SECRET_REQUIRED`, with the fix in the message, recorded in the bounded rejection log, and throttled per source. A missing or damaged secret refuses every new name rather than letting one through.
+- **`relay init`** creates the secret if it is missing and keeps an existing one. An existing `http_secret` becomes the registration secret, so remote clients that already send it keep working.
+- **`/health` reports `mint: secret | open-dev | unavailable`,** and `relay fleet --deploy-check` prints a `MINT` line and fails unless it reads `secret`.
+- **`RELAY_ALLOW_OPEN_MINT=1`** turns the check off for local development only. The relay says so loudly at start, `/health` reports `open-dev`, and the relay refuses to start with it on a non-local address.
+- **A window started without a relay name no longer registers as `default`.** The SessionStart hook says `unnamed: not registered` and does nothing else. Set `RELAY_AGENT_NAME` to join the relay.
+- **A window refused for the secret is told why.** The Claude hook's `REGISTER_FAILED` names the registration secret and the file it reads it from, instead of guessing a name collision. The Codex hook no longer reports `HEALTHY` when its registration was refused: it reports `REGISTER_FAILED`, and Codex is told it can read mail but cannot send.
+- **A SessionStart hook that runs twice in one window no longer reports `REGISTER_FAILED`.** The second run, from the same process with the same token, is now a no-op refresh.
+- **Two relays starting at the same moment no longer crash creating the secret.** It is written to a temporary file and moved into place in one step.
+
 ### Security — three new dependency advisories cleared
 
 - **proxy-addr 2.0.8** in the server and the extension (was 2.0.7; critical, GHSA-jqcg-44mw-7w3h). An IPv4 address no longer matches an IPv6 trust subnet that does not cover the IPv4-mapped range. Express uses it to trust proxies; the relay does not turn on Express's trust-proxy setting.

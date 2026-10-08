@@ -17,8 +17,12 @@
  *   2. Call `register_agent` on the hub via HTTP. If the hub returns 401,
  *      prompt for `RELAY_HTTP_SECRET` and retry once (or use --secret /
  *      env on the first call).
- *   3. Capture the returned `agent_token` and emit a ready-to-paste MCP
- *      client config snippet to stdout (or --output path).
+ *   3. Capture the returned `agent_token` and write a ready-to-paste MCP
+ *      client config snippet to --output (required; created 0600, never
+ *      overwriting). Stdout gets a REDACTED copy: the snippet carries the
+ *      agent's token (and, on a hub that gates every call, its secret), and a
+ *      credential CLI never prints one inside a composite field (PR-D, Codex
+ *      R1 #3; ADR-0036 S4).
  *   4. Print next-steps guidance.
  *
  * Exit codes:
@@ -34,6 +38,7 @@ import * as readline from "readline/promises";
 import fs from "fs";
 import path from "path";
 import { withDeadline } from "../http-deadline.js";
+import { restrictToOwnerWindows } from "../fs-perms.js";
 
 interface Args {
   hubUrl: string | null;
@@ -41,7 +46,10 @@ interface Args {
   role: string;
   capabilities: string[];
   output: string | null;
-  secret: string | null;
+  /** PR-D: the hub's registration secret is read from this FILE at use time, never from argv. */
+  secretFile: string | null;
+  /** PR-D: read the hub's registration secret from stdin (first line). */
+  secretStdin: boolean;
   yes: boolean;
   help: boolean;
 }
@@ -53,7 +61,8 @@ function parseArgs(argv: string[]): Args {
     role: "user",
     capabilities: [],
     output: null,
-    secret: null,
+    secretFile: null,
+    secretStdin: false,
     yes: false,
     help: false,
   };
@@ -92,13 +101,23 @@ function parseArgs(argv: string[]): Args {
         throw new Error("missing --output");
       }
       out.output = v;
-    } else if (a === "--secret") {
+    } else if (a === "--secret" || a.startsWith("--secret=")) {
+      // PR-D (architect 66e27eff): a secret on the command line is visible to every process on the machine
+      // (ps). The hub's secret now also registers new agent names, so it never rides argv.
+      process.stderr.write(
+        "relay pair: --secret is no longer accepted: a secret on the command line is visible to every process (ps).\n" +
+          "  Use --secret-file PATH (read when pairing), --secret-stdin (pipe it in), or the hidden prompt.\n",
+      );
+      throw new Error("refused --secret");
+    } else if (a === "--secret-file") {
       const v = argv[++i];
       if (!v) {
-        process.stderr.write("--secret requires a value\n");
-        throw new Error("missing --secret");
+        process.stderr.write("--secret-file requires a path\n");
+        throw new Error("missing --secret-file");
       }
-      out.secret = v;
+      out.secretFile = v;
+    } else if (a === "--secret-stdin") {
+      out.secretStdin = true;
     } else if (!a.startsWith("-") && !out.hubUrl) {
       out.hubUrl = a;
     } else {
@@ -116,7 +135,7 @@ function printUsage(requested = false): void {
   // belongs on stdout.
   (requested ? process.stdout : process.stderr).write(
     "Usage: relay pair <hub-url> [--name NAME] [--role ROLE] [--capabilities CAPS]\n" +
-      "                     [--output PATH] [--secret SECRET] [--yes]\n\n" +
+      "                     [--output PATH] [--secret-file PATH | --secret-stdin] [--yes]\n\n" +
       "Register this machine as an agent on a remote bot-relay-mcp hub and emit\n" +
       "a ready-to-paste MCP client config snippet. Use when you have a centralized\n" +
       "bot-relay-mcp deployment (e.g. on a VPS) and want to point a local Claude\n" +
@@ -127,8 +146,12 @@ function printUsage(requested = false): void {
       "  --name NAME            Agent name (default: prompts interactively)\n" +
       "  --role ROLE            Agent role (default: 'user')\n" +
       "  --capabilities CSV     Comma-separated capabilities (default: none)\n" +
-      "  --output PATH          Write MCP client config to PATH (default: stdout)\n" +
-      "  --secret SECRET        Hub's shared secret if required (or set RELAY_HTTP_SECRET env)\n" +
+      "  --output PATH          REQUIRED. Write the MCP client config to PATH (created 0600; an existing\n" +
+      "                         file is never overwritten). It holds the agent's token, so it is never printed.\n" +
+      "  --secret-file PATH     File holding the hub's secret (its registration secret: the hub operator\n" +
+      "                         finds it at <relay instance dir>/secrets/mint.secret and hands it over)\n" +
+      "  --secret-stdin         Read the hub's secret from stdin (first line)\n" +
+      "                         (an already-set RELAY_HTTP_SECRET is also read; a secret is never taken from argv)\n" +
       "  --yes                  Skip interactive prompts (requires --name)\n" +
       "  --help                 Show this message\n\n" +
       "Exit codes:\n" +
@@ -162,14 +185,115 @@ function sanitizeHubUrl(raw: string): { url: URL | null; error: string | null } 
  * that shape is the defect, and it looks correct at every call site.
  */
 
-async function promptInteractive(msg: string, hidden = false): Promise<string> {
-  void hidden; // readline/promises doesn't provide hidden input natively; keep API simple
+/** PR-D: a NO-ECHO prompt for the hub's secret (a TTY only): raw mode, nothing is written back. */
+async function promptHidden(msg: string): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) return "";
+  process.stdout.write(msg);
+  stdin.setRawMode(true);
+  stdin.resume();
+  let value = "";
+  try {
+    return await new Promise<string>((resolve) => {
+      const onData = (buf: Buffer) => {
+        for (const ch of buf.toString("utf-8")) {
+          if (ch === "\r" || ch === "\n" || ch === "\u0004") {
+            stdin.off("data", onData);
+            process.stdout.write("\n");
+            return resolve(value.trim());
+          }
+          if (ch === "\u0003") {
+            stdin.off("data", onData);
+            process.stdout.write("\n");
+            return resolve("");
+          }
+          if (ch === "\u007f" || ch === "\b") value = value.slice(0, -1);
+          else value += ch;
+        }
+      };
+      stdin.on("data", onData);
+    });
+  } finally {
+    stdin.setRawMode(false);
+    stdin.pause();
+  }
+}
+
+/** PR-D: the hub's secret from --secret-file (read now, at use time) or --secret-stdin. Never argv. */
+async function secretFromArgs(args: Args): Promise<string | null> {
+  if (args.secretFile) {
+    const v = fs.readFileSync(args.secretFile, "utf-8").trim();
+    if (!v) throw new Error(`${args.secretFile} is empty`);
+    return v;
+  }
+  if (args.secretStdin) {
+    let text = "";
+    for await (const chunk of process.stdin) text += chunk;
+    const v = text.split("\n")[0].trim();
+    if (!v) throw new Error("nothing on stdin");
+    return v;
+  }
+  return null;
+}
+
+async function promptInteractive(msg: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     return (await rl.question(msg)).trim();
   } finally {
     rl.close();
   }
+}
+
+/**
+ * Write the client config PRIVATELY, COMPLETELY, or not at all (Codex R2 #3, #4; it holds the agent's token):
+ *   - created with O_CREAT|O_EXCL ("wx"): never follows or replaces anything already at the path; 0600 from creation;
+ *   - RESTRICTED and VERIFIED while still EMPTY (Windows: owner-only ACL; a fault means it is not private);
+ *   - written until EVERY byte is on disk (a short write is continued; a write with no progress is a failure);
+ *   - on ANY failure the file is removed, so no partial or readable token file is ever left behind; then it throws.
+ * `deps` injects the OS calls for the tests.
+ */
+export function writePrivateConfig(
+  file: string,
+  text: string,
+  deps: { writeSync?: (fd: number, buf: Buffer, offset: number, length: number) => number; restrict?: (file: string) => string[] } = {},
+): void {
+  const writeSync = deps.writeSync ?? ((fd: number, buf: Buffer, offset: number, length: number) => fs.writeSync(fd, buf, offset, length));
+  const restrict = deps.restrict ?? ((f: string) => restrictToOwnerWindows(f, false));
+  const fd = fs.openSync(file, "wx", 0o600);
+  let ok = false;
+  try {
+    const faults = restrict(file);
+    if (faults.length > 0) throw new Error(`the config file is not private, so it was removed: ${faults.join("; ")}`);
+    const buf = Buffer.from(text, "utf-8");
+    let off = 0;
+    while (off < buf.length) {
+      const n = writeSync(fd, buf, off, buf.length - off);
+      if (!(n > 0)) throw new Error(`the config write made no progress at byte ${off} of ${buf.length}, so the file was removed`);
+      off += n;
+    }
+    ok = true;
+  } finally {
+    fs.closeSync(fd);
+    if (!ok) fs.rmSync(file, { force: true });
+  }
+}
+
+/** True when anything (a file, a directory, a symlink, even a dangling one) is at `p`. */
+function pathExists(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The snippet with every header VALUE replaced by a pointer to the file: the names stay, so the shape is visible. */
+function redactSnippet(snippet: { "bot-relay": { headers: Record<string, string> } & Record<string, unknown> }, file: string): string {
+  const entry = snippet["bot-relay"];
+  const headers = Object.fromEntries(Object.keys(entry.headers).map((k) => [k, `<in ${file}>`]));
+  return JSON.stringify({ "bot-relay": { ...entry, headers } }, null, 2);
 }
 
 export async function run(argv: string[]): Promise<number> {
@@ -195,6 +319,19 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   const hubBase = `${url.protocol}//${url.host}`;
+
+  // PR-D (Codex R1 #3): the config carries credentials, so it only ever goes to a file. Checked BEFORE any network
+  // call, so a token is never issued that this run could not store. The write itself is O_EXCL (authoritative).
+  if (!args.output) {
+    process.stderr.write(
+      "relay pair: --output PATH is required. The client config holds the agent's token (and, on a hub that gates every call, its secret), so it is written to a file (0600) and never printed.\n",
+    );
+    return 1;
+  }
+  if (pathExists(args.output)) {
+    process.stderr.write(`relay pair: ${args.output} already exists. pair never overwrites a credential file: remove it or choose another --output.\n`);
+    return 1;
+  }
 
   // --- Step 1: probe /health ---
   let healthBody: any = null;
@@ -242,9 +379,19 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   // --- Step 3: resolve secret ---
-  // Precedence: --secret > RELAY_HTTP_SECRET env > none (try unauthed first,
-  // re-prompt on 401)
-  let secret: string | null = args.secret ?? process.env.RELAY_HTTP_SECRET ?? null;
+  // Precedence: --secret-file / --secret-stdin > an already-set RELAY_HTTP_SECRET > none (try without one
+  // first, then the hidden prompt on a TTY). PR-D: never from argv, and nothing here ever EXPORTS it.
+  let secret: string | null;
+  try {
+    secret = (await secretFromArgs(args)) ?? process.env.RELAY_HTTP_SECRET ?? null;
+  } catch (err) {
+    process.stderr.write(`relay pair: could not read the hub's secret: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
+  const NEEDS_SECRET =
+    "relay pair: the hub requires its secret to register a new agent name.\n" +
+    "  Ask the hub's operator for it (the hub keeps it at <relay instance dir>/secrets/mint.secret and never\n" +
+    "  prints it), save it to a file readable only by you, then re-run with --secret-file PATH.\n";
 
   const attemptRegister = async (): Promise<{
     status: number;
@@ -300,14 +447,12 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   if (result.status === 401 || (result.body?.auth_error === true && !secret)) {
-    if (args.yes) {
-      process.stderr.write(
-        "relay pair: hub requires a shared secret (401). Pass --secret or set RELAY_HTTP_SECRET.\n"
-      );
+    if (args.yes || !process.stdin.isTTY) {
+      process.stderr.write(NEEDS_SECRET);
       return 2;
     }
-    process.stdout.write("Hub requires RELAY_HTTP_SECRET.\n");
-    secret = await promptInteractive("Hub shared secret: ");
+    process.stdout.write("The hub requires its secret.\n");
+    secret = await promptHidden("Hub secret (not shown): ");
     if (!secret) {
       process.stderr.write("relay pair: no secret provided\n");
       return 1;
@@ -324,7 +469,9 @@ export async function run(argv: string[]): Promise<number> {
 
   if (result.status === 401 || result.body?.auth_error === true) {
     process.stderr.write(
-      `relay pair: hub rejected authentication. Check --secret / RELAY_HTTP_SECRET value.\n`
+      result.body?.error_code === "MINT_SECRET_REQUIRED"
+        ? `relay pair: the hub rejected the secret.\n${NEEDS_SECRET}`
+        : `relay pair: hub rejected authentication. Check the --secret-file / RELAY_HTTP_SECRET value.\n`
     );
     return 2;
   }
@@ -351,49 +498,49 @@ export async function run(argv: string[]): Promise<number> {
       url: `${hubBase}/mcp`,
       headers: {
         "X-Agent-Token": token,
-        ...(secret ? { "X-Relay-Secret": secret } : {}),
+        // PR-D: the secret goes into the client config ONLY when the hub gates EVERY call with it
+        // (/health auth_required, a hub with http_secret). Otherwise it was needed once, to register the
+        // name, and the agent's own token is its credential from now on: the secret stays out of the file.
+        ...(secret && healthBody?.auth_required === true ? { "X-Relay-Secret": secret } : {}),
       },
     },
   };
   const snippetText = JSON.stringify(snippet, null, 2);
 
-  if (args.output) {
-    try {
-      const parent = path.dirname(args.output);
-      if (parent && parent !== "." && !fs.existsSync(parent)) {
-        fs.mkdirSync(parent, { recursive: true });
-      }
-      fs.writeFileSync(args.output, snippetText + "\n", { mode: 0o600 });
-      process.stdout.write(`\nWrote MCP client config snippet to ${args.output} (mode 0600)\n`);
-    } catch (err) {
-      process.stderr.write(
-        `relay pair: could not write --output ${args.output}: ${
-          err instanceof Error ? err.message : String(err)
-        }\n`
-      );
-      return 1;
+  const outPath = args.output;
+  try {
+    const parent = path.dirname(outPath);
+    if (parent && parent !== "." && !fs.existsSync(parent)) {
+      fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
     }
-  } else {
-    process.stdout.write("\n--- MCP client config snippet ---\n");
-    process.stdout.write(snippetText + "\n");
-    process.stdout.write("--- end snippet ---\n");
+    writePrivateConfig(outPath, snippetText + "\n");
+  } catch (err) {
+    process.stderr.write(
+      `relay pair: "${agentName}" was registered on the hub, but its config could not be written to ${outPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }. Its token is NOT printed. Ask the hub operator to run 'relay recover ${agentName}' on the hub, then pair again with a writable --output.\n`,
+    );
+    return 1;
   }
+  process.stdout.write(`\nWrote the MCP client config to ${outPath} (mode 0600). Its credentials are redacted below:\n`);
+  process.stdout.write("--- MCP client config snippet (redacted) ---\n");
+  process.stdout.write(redactSnippet(snippet, outPath) + "\n");
+  process.stdout.write("--- end snippet ---\n");
 
   // --- Step 6: next-steps guidance ---
   process.stdout.write(
     `\nPaired "${agentName}" with ${hubBase}.\n\n` +
       "Next steps:\n" +
-      "  1. Paste the snippet above into your MCP client config:\n" +
+      `  1. Merge the "bot-relay" entry from ${outPath} into your MCP client config:\n` +
       "     - Claude Code:  ~/.claude.json   (under \"mcpServers\")\n" +
       "     - Cursor:       ~/.cursor/mcp.json\n" +
       "     - Custom:       consult your client's MCP config docs\n" +
-      "  2. Persist the token for SessionStart / hook flows:\n" +
-      `       export RELAY_AGENT_TOKEN=${token}\n` +
-      "     (append to your ~/.zshrc / ~/.bashrc for persistence)\n" +
+      `  2. For SessionStart / hook flows, the agent's token is headers["X-Agent-Token"] in ${outPath}\n` +
+      "     (load it from that file; never paste it into a shell history)\n" +
       `  3. Verify the connection:\n` +
       `       relay doctor --remote ${hubBase}\n` +
-      "\nThe token is shown ONCE — the hub stores only a bcrypt hash.\n" +
-      "Save it now; lost tokens require 'relay recover <agent>' on the hub.\n"
+      `\nThe token exists only in ${outPath}: the hub stores only a bcrypt hash.\n` +
+      "Keep that file; a lost token requires 'relay recover <agent>' on the hub.\n"
   );
 
   return 0;

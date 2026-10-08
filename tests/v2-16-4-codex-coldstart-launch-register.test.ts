@@ -36,6 +36,7 @@ import http from "http";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -107,11 +108,13 @@ function stopHarness(h: Harness): void {
 async function registerViaHttp(
   port: number,
   name: string,
-  args: Record<string, unknown> = {},
+  args: Record<string, unknown>,
+  dbPath: string,
 ): Promise<{ token?: string; session_id?: string }> {
   const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeaders(dbPath) },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -220,7 +223,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
     try {
       const name = "codex-h1";
       // Simulate the wrapper's launch register (fresh+live, with host_shell_pids).
-      const { token, session_id } = await registerViaHttp(h.port, name, { host_shell_pids: [4242, 111], host_id: "GUID" });
+      const { token, session_id } = await registerViaHttp(h.port, name, { host_shell_pids: [4242, 111], host_id: "GUID" }, h.dbPath);
       expect(session_id).toBeTruthy();
       const r = runHook(h, name, { marker: session_id!, token });
       expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
@@ -236,7 +239,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
     const h = await startHarness("h2");
     try {
       const name = "codex-h2";
-      const { token, session_id } = await registerViaHttp(h.port, name, { host_shell_pids: [999], host_id: "GUID" });
+      const { token, session_id } = await registerViaHttp(h.port, name, { host_shell_pids: [999], host_id: "GUID" }, h.dbPath);
       // Age the row out of the collision window so a legit re-register can land + rotate.
       sql(h.dbPath, `UPDATE agents SET last_seen='2020-01-01T00:00:00.000Z' WHERE name='${name}';`);
       // A WRONG marker (a different session) must NOT cause a skip.
@@ -267,9 +270,9 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
     const h = await startHarness("h4");
     try {
       // Agent B holds session SB.
-      const b = await registerViaHttp(h.port, "codex-b", { host_shell_pids: [1], host_id: "GB" });
+      const b = await registerViaHttp(h.port, "codex-b", { host_shell_pids: [1], host_id: "GB" }, h.dbPath);
       // Agent A exists (stale) with its own session SA.
-      const a = await registerViaHttp(h.port, "codex-a", { host_shell_pids: [2], host_id: "GA" });
+      const a = await registerViaHttp(h.port, "codex-a", { host_shell_pids: [2], host_id: "GA" }, h.dbPath);
       sql(h.dbPath, `UPDATE agents SET last_seen='2020-01-01T00:00:00.000Z' WHERE name='codex-a';`);
       // Run A's hook with B's session as the marker → must NOT skip (marker != A's row session).
       const r = runHook(h, "codex-a", { marker: b.session_id!, token: a.token });
@@ -284,7 +287,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
     const h = await startHarness("h5");
     try {
       const name = "codex-h5";
-      const { token, session_id } = await registerViaHttp(h.port, name, { host_shell_pids: [7, 8], host_id: "G" });
+      const { token, session_id } = await registerViaHttp(h.port, name, { host_shell_pids: [7, 8], host_id: "G" }, h.dbPath);
       // Fresh, actively-held session → a non-force re-register collides (the real
       // duplicate-LIVE case; NOT an aged-out stale row).
       sql(h.dbPath, `UPDATE agents SET agent_status='idle', last_seen='${new Date().toISOString()}' WHERE name='${name}';`);

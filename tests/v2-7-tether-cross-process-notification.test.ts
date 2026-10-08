@@ -51,6 +51,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 import cp from "child_process";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -207,8 +208,10 @@ describe("v2.7 / Tether Phase 3d — cross-process notification delivery", () =>
   it("subscriber on HTTP daemon receives notification when a DIFFERENT process writes to shared DB", async () => {
     const daemon = await startDaemon("xproc", 50);
     try {
+      // PR-D: this client registers a NEW name, which over HTTP needs the daemon's registration secret.
       const transport = new StreamableHTTPClientTransport(
         new URL(`http://127.0.0.1:${daemon.port}/mcp`),
+        { requestInit: { headers: mintHeaders(daemon.dbPath) } },
       );
       const client = new Client(
         { name: "v2-7-tether-xproc-test", version: "0.0.0" },
@@ -270,8 +273,10 @@ describe("v2.7 / Tether Phase 3d — cross-process notification delivery", () =>
   it("same-process sender + subscriber gets EXACTLY ONE notification per send_message (dedup)", async () => {
     const daemon = await startDaemon("dedup", 50);
     try {
+      // PR-D: this client registers a NEW name, which over HTTP needs the daemon's registration secret.
       const transport = new StreamableHTTPClientTransport(
         new URL(`http://127.0.0.1:${daemon.port}/mcp`),
+        { requestInit: { headers: mintHeaders(daemon.dbPath) } },
       );
       const client = new Client(
         { name: "v2-7-tether-dedup-test", version: "0.0.0" },
@@ -349,8 +354,10 @@ describe("v2.7 / Tether Phase 3d — cross-process notification delivery", () =>
   it("mixed traffic — external writer bumps data_version, tail dedups same-process row by id", async () => {
     const daemon = await startDaemon("mixed", 50);
     try {
+      // PR-D: this client registers a NEW name, which over HTTP needs the daemon's registration secret.
       const transport = new StreamableHTTPClientTransport(
         new URL(`http://127.0.0.1:${daemon.port}/mcp`),
+        { requestInit: { headers: mintHeaders(daemon.dbPath) } },
       );
       const client = new Client(
         { name: "v2-7-tether-mixed-test", version: "0.0.0" },

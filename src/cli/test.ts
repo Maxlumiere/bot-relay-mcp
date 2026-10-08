@@ -55,10 +55,16 @@ export async function run(argv: string[]): Promise<number> {
     const port = typeof addr === "object" && addr ? addr.port : 0;
     const baseUrl = `http://127.0.0.1:${port}`;
 
+    // PR-D: registering a NEW name over HTTP needs the registration secret; the server just created it
+    // beside the self-test's DB. Read in-process at use time and sent as a header (ruling Q2: never argv/env).
+    const { readMintSecret } = await import("../mint-secret.js");
+    const { mintSecretHome } = await import("../mint-gate.js");
+    const mintSecret = readMintSecret(mintSecretHome());
+    const mintHeader: Record<string, string> = mintSecret ? { "X-Relay-Secret": mintSecret } : {};
     async function rpc(tool: string, args: any): Promise<any> {
       const res = await fetch(`${baseUrl}/mcp`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeader },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
       });
       const text = await res.text();

@@ -21,6 +21,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-4q-retry-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -40,6 +41,8 @@ async function rpc(tool: string, args: any, token?: string): Promise<any> {
     Accept: "application/json, text/event-stream",
   };
   if (token) headers["X-Agent-Token"] = token;
+  // PR-D: a token-less register_agent CREATES a name, which over HTTP needs the daemon's registration secret.
+  if (tool === "register_agent" && !token) Object.assign(headers, mintHeaders());
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
     headers,

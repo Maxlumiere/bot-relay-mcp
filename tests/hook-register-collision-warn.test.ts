@@ -28,6 +28,7 @@ import os from "os";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
@@ -71,10 +72,11 @@ function stopHarness(h: Harness): void {
 }
 
 /** Register an agent over HTTP so it holds the name live (creates the row + a session). */
-async function registerLive(port: number, name: string): Promise<void> {
+async function registerLive(port: number, name: string, dbPath: string): Promise<void> {
   const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    // PR-D: a NEW name over HTTP needs the daemon's registration secret.
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeaders(dbPath) },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
       params: { name: "register_agent", arguments: { name, role: "builder", capabilities: [] } } }),
   });
@@ -102,7 +104,7 @@ describe("first-spawn registration failure must announce itself (NAME_COLLISION)
     const h = await startHarness("collide");
     try {
       // 1. Another agent already holds the name, live.
-      await registerLive(h.port, "collide");
+      await registerLive(h.port, "collide", h.dbPath);
 
       // 2. PRECONDITION — a no-token register of the held name really collides
       //    (HTTP 200 + isError:true, no token). Proven via the debug body so a

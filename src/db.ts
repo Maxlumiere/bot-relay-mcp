@@ -58,7 +58,7 @@ import {
   discardInitializedDb,
 } from "./sqlite-compat.js";
 import { log } from "./logger.js";
-import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
+import { ensureSecureDir, ensureSecureFile, privacyFaults, restrictToOwnerWindows } from "./fs-perms.js";
 import { resolveInstance } from "./instance.js";
 import { checkContainment } from "./approved-roots.js";
 import { emitInboxChanged } from "./inbox-events.js";
@@ -348,11 +348,28 @@ export async function initializeDb(): Promise<void> {
   // Verified: narrow the directory and the DB file itself.
   ensureSecureDir(path.dirname(dbPath), 0o700);
   ensureSecureFile(dbPath, 0o600);
+  // PR-D Q6/Q12: on Windows the modes above are no-ops; restrict to the owner by ACL (dir, DB, WAL, SHM).
+  restrictToOwnerWindows(path.dirname(dbPath), true);
+  for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) if (fs.existsSync(f)) restrictToOwnerWindows(f, false);
+  reportDbPrivacy(dbPath);
 
   // #171 — single-sourced schema setup (pragmas + full migration chain + seed +
   // finalize + purge). Shared with getDb()'s native fallback so the two paths
   // cannot drift; see applySchemaSetup below.
   applySchemaSetup(_db);
+}
+
+/**
+ * PR-D (Codex R1 #2, architect e9ad940d): the DB's directory and files are REPORTED loudly when they are not
+ * private after the tightening above (DEGRADED: the relay keeps running, since this is availability, not the
+ * registration secret, whose chain fails closed in src/mint-secret.ts).
+ */
+function reportDbPrivacy(dbPath: string): void {
+  const files = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`].filter((f) => fs.existsSync(f));
+  const faults = [...privacyFaults(path.dirname(dbPath), 0o700), ...files.flatMap((f) => privacyFaults(f, 0o600))];
+  if (faults.length > 0) {
+    log.error(`[fs-perms] DEGRADED: the relay's database files are NOT private to this user: ${faults.join("; ")}`);
+  }
 }
 
 export function getDb(): CompatDatabase {
@@ -389,6 +406,9 @@ export function getDb(): CompatDatabase {
   }
   ensureSecureDir(dir, 0o700);
   ensureSecureFile(dbPath, 0o600);
+  restrictToOwnerWindows(dir, true); // PR-D Q6/Q12: the Windows equivalent of the modes above
+  for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) if (fs.existsSync(f)) restrictToOwnerWindows(f, false);
+  reportDbPrivacy(dbPath);
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.
   applySchemaSetup(_db);

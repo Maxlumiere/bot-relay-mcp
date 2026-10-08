@@ -36,6 +36,7 @@ import os from "os";
 import cp from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,6 +50,9 @@ interface DaemonHandle {
   stderr: () => string;
   kill: () => Promise<void>;
 }
+
+/** PR-D: each daemon's dir (where it keeps its registration secret), by port. */
+const DAEMON_ROOTS = new Map<number, string>();
 
 async function startDaemon(): Promise<DaemonHandle> {
   const port = await getFreePort();
@@ -88,6 +92,7 @@ async function startDaemon(): Promise<DaemonHandle> {
     await new Promise((r) => setTimeout(r, 50));
   }
 
+  DAEMON_ROOTS.set(port, root);
   return {
     proc,
     port,
@@ -103,9 +108,11 @@ async function startDaemon(): Promise<DaemonHandle> {
 }
 
 async function rpc(port: number, tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  // PR-D: every register_agent here CREATES a name, which over HTTP needs the daemon's registration secret.
+  const mint = tool === "register_agent" ? mintHeaders(DAEMON_ROOTS.get(port)) : {};
   const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mint },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
   const text = await res.text();

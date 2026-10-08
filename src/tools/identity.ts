@@ -28,6 +28,9 @@ import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
 import { log } from "../logger.js";
 import { currentContext } from "../request-context.js";
+import { checkMintGate } from "../mint-gate.js";
+import { mintRefusalTake } from "../auth-throttle.js";
+import { authSource } from "../token-verify.js";
 import { updateCapturedSessionId, stampDetectedAgentLiveness } from "../transport/stdio.js";
 import { defaultTokenStore } from "../token-store.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
@@ -42,6 +45,62 @@ import type {
   RevokeTokenInput,
   ExpandCapabilitiesInput,
 } from "../types.js";
+
+/**
+ * PR-D (architect 3f041f24): the caller IS the row's holder: the same agent process (pid AND its start
+ * time, so a recycled pid never matches) on the same host. Every field, host_id included (Codex R1 #4), must be
+ * PRESENT on both sides and equal; an absent one never matches (no identity is assumed from a missing value).
+ *
+ * RESIDUAL (stated here and in SECURITY.md): the refresh is a SAFETY guard against ACCIDENTAL double holders (a
+ * second window presents its own pid/start, so it collides), NOT an authority boundary. pid, start and host are
+ * the caller's own claims: a same-user process that holds this name's token can copy a live holder's values and
+ * get a refresh. It gains nothing it lacks: the token already lets it read and send as the name, and a refresh is
+ * a strict no-op (nothing rotated, minted or re-bound).
+ */
+function isSameHolder(
+  row: { agent_pid?: number | null; agent_pid_start?: string | null; host_id?: string | null },
+  input: { agent_pid?: number; agent_pid_start?: string; host_id?: string },
+): boolean {
+  if (row.agent_pid == null || input.agent_pid == null || row.agent_pid !== input.agent_pid) return false;
+  if (!row.agent_pid_start || !input.agent_pid_start || row.agent_pid_start !== input.agent_pid_start) return false;
+  if (!row.host_id || !input.host_id || row.host_id !== input.host_id) return false;
+  return true;
+}
+
+/**
+ * The registration-secret gate for a suffix allocation (PR-D, Codex R1 #1), mirroring the dispatcher's gate for a
+ * new name (src/server.ts mintGateRefusal): refused over HTTP without the instance's secret, throttled per source,
+ * MINT_SECRET_REQUIRED. Returns null when allowed (stdio, the secret, or the dev flag).
+ */
+function suffixMintRefusal(requestedName: string) {
+  const ctx = currentContext();
+  const gate = checkMintGate(ctx.transport, ctx.presentedSecret);
+  if (gate.ok) return null;
+  const throttled = !mintRefusalTake(authSource());
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          throttled
+            ? { success: false, error: "Too many failed token attempts from this source: wait and retry.", error_code: ERROR_CODES.RATE_LIMITED, auth_error: true }
+            : {
+                success: false,
+                error:
+                  `Registering a relay-assigned instance of "${requestedName}" (on_name_collision:"suffix") creates a NEW agent ` +
+                  `identity, so over HTTP it requires this relay's registration secret: ${gate.detail}. Clients send it as the ` +
+                  `X-Relay-Secret header, read at use time from <relay instance dir>/secrets/mint.secret.`,
+                error_code: ERROR_CODES.MINT_SECRET_REQUIRED,
+                auth_error: true,
+              },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: true,
+  };
+}
 
 export function handleRegisterAgent(input: RegisterAgentInput) {
   // v2.1 Phase 4b.1 v2: capture the pre-transition auth_state so we can
@@ -112,7 +171,38 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     // uses the SAME predicate for reuse, so the suffix path can never disagree
     // with the collision path and hand a live instance's name to a new caller.
     if (isNameActivelyHeld(requestedRow)) {
+      // PR-D (architect 3f041f24): the SessionStart hook can run TWICE in one window. Run 2 finds the row
+      // run 1 just made, "held by another live session", but the holder is ITSELF. Only reachable here
+      // with this name's own token (an active row always requires it at the dispatcher), so when the
+      // caller also names the SAME process (agent_pid + its start time, the PID-reuse guard; and the same
+      // host when both say), it is the holder: a REFRESH, a no-op. Nothing is rotated (a register would
+      // re-surface read mail). Another window, or a recycled pid, still gets NAME_COLLISION_ACTIVE.
+      if (isSameHolder(requestedRow, input)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: true,
+                  refreshed: true,
+                  agent: { name: requestedRow.name, role: requestedRow.role, session_id: requestedRow.session_id },
+                  note: "Already registered by this same process: nothing changed.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
       if (input.on_name_collision === "suffix") {
+        // PR-D (Codex R1 #1): a relay-assigned "<name>-N" is a NEW identity (or an existing drained slot handed a new
+        // token), issued on the strength of the REQUESTED name's token, which the dispatcher verified for THAT name
+        // only. Without this, one agent's token minted unlimited identities. Same gate, same harm, as a new name:
+        // checked BEFORE a slot is chosen. Sync: no await between it and registerAgent.
+        const suffixRefusal = suffixMintRefusal(input.name);
+        if (suffixRefusal) return suffixRefusal;
         const suffixed = resolveAvailableInstanceName(input.name);
         if (suffixed === null) {
           return {

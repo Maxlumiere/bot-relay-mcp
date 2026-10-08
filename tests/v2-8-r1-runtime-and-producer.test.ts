@@ -53,6 +53,7 @@ const { _resetDashboardWsForTests } = await import("../src/transport/websocket.j
 const { closeDb, getDb } = await import("../src/db.js");
 
 import { connectWs as baseConnectWs } from "./_helpers/ws.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 let server: HttpServer;
 let port: number;
@@ -127,6 +128,8 @@ async function rpc(
     Accept: "application/json, text/event-stream",
   };
   if (token) headers["X-Agent-Token"] = token;
+  // PR-D: a token-less register_agent CREATES a name, which over HTTP needs the daemon's registration secret.
+  if (tool === "register_agent" && !token) Object.assign(headers, mintHeaders());
   const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
     headers,
@@ -147,6 +150,11 @@ async function rpc(
     };
     const innerText = inner.result?.content?.[0]?.text;
     if (innerText) json = JSON.parse(innerText);
+  }
+  // A register that did not succeed leaves NO agent, and every later "the transition never fired" would then
+  // misread a refused register as a broadcaster defect. Fail HERE, with the server's answer.
+  if (tool === "register_agent" && json?.success !== true) {
+    throw new Error(`register_agent ${JSON.stringify(args.name)} did not succeed: ${JSON.stringify(json)}`);
   }
   return { ok: res.ok, json };
 }

@@ -26,6 +26,7 @@ import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
 import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-2220-gcstamp-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -54,10 +55,11 @@ async function mcpCall(method: string, params: any, headers: Record<string, stri
 }
 
 async function register(name: string): Promise<string> {
+  // PR-D: creating a name over HTTP needs the daemon's registration secret.
   const resp = await mcpCall("tools/call", {
     name: "register_agent",
     arguments: { name, role: "worker", capabilities: [] },
-  });
+  }, mintHeaders());
   return JSON.parse(resp.result.content[0].text).agent_token as string;
 }
 

@@ -508,10 +508,11 @@ relay pair https://relay.example.com \
   --name "$(whoami)-$(hostname -s)" \
   --role operator \
   --capabilities spawn,tasks,webhooks,broadcast,channels \
-  --secret "$RELAY_HTTP_SECRET"
+  --secret-file ./hub.secret \
+  --output ./bot-relay-client.json
 ```
 
-`relay pair` probes the hub, registers this machine as an agent, captures the returned one-time `agent_token`, and emits an MCP client config snippet ready to paste into `~/.claude.json` / `~/.cursor/mcp.json` / etc. Persist the token (`export RELAY_AGENT_TOKEN=…` in your shell rc) so hooks can authenticate on every terminal open.
+`hub.secret` holds the hub's registration secret, which the hub operator finds at `<relay instance dir>/secrets/mint.secret` and hands over. `relay pair` never takes a secret on the command line. It probes the hub, registers this machine as an agent, and writes the MCP client config, with the agent's one-time token, to `--output`. That file is created 0600 and never overwrites an existing one; the terminal shows the config with its credentials redacted. Merge its `bot-relay` entry into `~/.claude.json` / `~/.cursor/mcp.json` / etc.; hooks read the token from that entry's `X-Agent-Token` header.
 
 Verify after pairing:
 
