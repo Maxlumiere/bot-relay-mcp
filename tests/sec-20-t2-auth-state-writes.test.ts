@@ -19,6 +19,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import ts from "typescript-legacy";
+import { srcProgram, topLevelName, virtualProgram } from "./_helpers/ts-binding.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -35,16 +36,34 @@ function foldString(n: ts.Node): string | null {
   return null;
 }
 
-function topLevelName(node: ts.Node): string {
-  let name = "<module>";
-  for (let cur: ts.Node | undefined = node; cur; cur = cur.parent) {
-    if (ts.isFunctionDeclaration(cur) && cur.name) name = cur.name.text;
-    else if (ts.isVariableDeclaration(cur) && ts.isIdentifier(cur.name) && cur.initializer && (ts.isArrowFunction(cur.initializer) || ts.isFunctionExpression(cur.initializer))) name = cur.name.text;
-  }
-  return name;
-}
+export interface Site { site: string; kind: "update-auth_state" | "insert" | "replace" | "upsert"; sql: string }
 
-export interface Site { site: string; kind: "update-auth_state" | "insert" | "replace"; sql: string }
+/**
+ * Codex #315 R2 N3: STRUCTURE, not spelling. Identifier quoting ("x", `x`, [x]) and a schema qualifier (main.agents)
+ * are normalized away, statements are split on `;`, and each is matched by its SQL shape: UPDATE [OR <conflict>]
+ * agents SET … (the SET list, up to WHERE / FROM / RETURNING), INSERT [OR <conflict>] INTO agents (an ON CONFLICT …
+ * DO UPDATE is an upsert), REPLACE INTO / INSERT OR REPLACE. A builder's bare `auth_state = ?` SET fragment counts.
+ */
+export function classifySql(raw: string): Site["kind"][] {
+  const norm = raw
+    .replace(/"([A-Za-z_]\w*)"/g, "$1")
+    .replace(/`([A-Za-z_]\w*)`/g, "$1")
+    .replace(/\[([A-Za-z_]\w*)\]/g, "$1")
+    .replace(/\b\w+\.agents\b/gi, "agents")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  const kinds: Site["kind"][] = [];
+  for (const stmt of norm.split(";")) {
+    if (/\breplace into agents\b/.test(stmt) || /\binsert or replace into agents\b/.test(stmt)) kinds.push("replace");
+    else if (/\binsert (?:or \w+ )?into agents\b/.test(stmt)) kinds.push(/\bon conflict\b[\s\S]*\bdo update\b/.test(stmt) ? "upsert" : "insert");
+    else {
+      const m = /\bupdate (?:or \w+ )?agents set (.*?)(?: where | from | returning |$)/.exec(stmt);
+      if (m && /\bauth_state\s*=/.test(m[1])) kinds.push("update-auth_state");
+      else if (/^\s*auth_state\s*=\s*\?/.test(stmt)) kinds.push("update-auth_state");
+    }
+  }
+  return kinds;
+}
 
 /** Every statement in one source that can set a row's auth_state. Outermost string expressions only. */
 export function authStateWritesIn(rel: string, text: string): Site[] {
@@ -53,12 +72,8 @@ export function authStateWritesIn(rel: string, text: string): Site[] {
   const visit = (n: ts.Node): void => {
     const folded = foldString(n);
     if (folded !== null) {
-      const sql = folded.replace(/\s+/g, " ");
       const site = `${rel}:${topLevelName(n)}`;
-      if (/\bREPLACE\s+INTO\s+agents\b/i.test(sql) || /\bINSERT\s+OR\s+REPLACE\s+INTO\s+agents\b/i.test(sql)) out.push({ site, kind: "replace", sql });
-      else if (/\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+agents\b/i.test(sql)) out.push({ site, kind: "insert", sql });
-      else if (/\bUPDATE\s+agents\b/i.test(sql) && /\bSET\b[\s\S]*\bauth_state\s*=/i.test(sql.replace(/\bWHERE\b[\s\S]*$/i, ""))) out.push({ site, kind: "update-auth_state", sql });
-      else if (/^\s*auth_state\s*=\s*\?/i.test(sql)) out.push({ site, kind: "update-auth_state", sql }); // a SET fragment a builder joins
+      for (const kind of classifySql(folded)) out.push({ site, kind, sql: folded.replace(/\s+/g, " ") });
       return; // an outer string expression already covers its parts
     }
     ts.forEachChild(n, visit);
@@ -91,24 +106,46 @@ const ALLOWED: Record<string, { kinds: Partial<Record<Site["kind"], number>>; wh
   "src/db.ts:revokeAgentToken": { kinds: { "update-auth_state": 1 }, why: "-> revoked / recovery_pending; never writes active" },
 };
 
-/** Every call of applyAuthStateTransition: [site, from-state literal, to-state literal] (null = not a literal). */
-export function transitionCallsIn(rel: string, text: string): Array<{ site: string; from: string | null; to: string | null }> {
-  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const out: Array<{ site: string; from: string | null; to: string | null }> = [];
+/**
+ * Every reference to applyAuthStateTransition, resolved BY BINDING (Codex #315 R2 N3: an aliased import escaped the
+ * spelling check). Each must be a DIRECT call with literal from/to states; any other use (a value, an alias passed
+ * on, a computed state) is unclassified and fails.
+ */
+const TRANSITION = "src/db.ts:applyAuthStateTransition";
+export function transitionUses(program: ts.Program, rel: (f: string) => string): Array<{ site: string; from: string | null; to: string | null; direct: boolean }> {
+  const checker = program.getTypeChecker();
+  const out: Array<{ site: string; from: string | null; to: string | null; direct: boolean }> = [];
   const lit = (n: ts.Node | undefined) => (n && ts.isStringLiteralLike(n) ? n.text : null);
-  const visit = (n: ts.Node): void => {
-    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "applyAuthStateTransition") {
-      out.push({ site: `${rel}:${topLevelName(n)}`, from: lit(n.arguments[1]), to: lit(n.arguments[2]) });
-    }
-    ts.forEachChild(n, visit);
+  const bound = (id: ts.Identifier): boolean => {
+    let sym = checker.getSymbolAtLocation(id);
+    if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+    const d = sym?.declarations?.[0];
+    return !!d && `${rel(d.getSourceFile().fileName)}:${sym!.name}` === TRANSITION;
   };
-  visit(sf);
+  for (const sf of program.getSourceFiles()) {
+    if (sf.isDeclarationFile || !rel(sf.fileName).startsWith("src/")) continue;
+    const visit = (n: ts.Node): void => {
+      if (ts.isIdentifier(n)) {
+        const p = n.parent;
+        const skip = (ts.isFunctionDeclaration(p) && p.name === n) || ts.isImportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p) || ts.isExportSpecifier(p);
+        if (!skip && bound(n)) {
+          // The callee: `f(...)` or `ns.f(...)`. Anything else (a value, a property read) is not a reviewable call.
+          const calleeExpr = ts.isPropertyAccessExpression(p) && p.name === n ? p : n;
+          const call = calleeExpr.parent;
+          const direct = !!call && ts.isCallExpression(call) && call.expression === calleeExpr;
+          out.push({ site: `${rel(sf.fileName)}:${topLevelName(n)}`, from: direct ? lit((call as ts.CallExpression).arguments[1]) : null, to: direct ? lit((call as ts.CallExpression).arguments[2]) : null, direct });
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(sf);
+  }
   return out;
 }
 
 const files = srcFiles(path.join(REPO, "src")).map((f) => ({ rel: path.relative(REPO, f).split(path.sep).join("/"), text: fs.readFileSync(f, "utf-8") }));
 const all = files.flatMap((f) => authStateWritesIn(f.rel, f.text));
-const transitions = files.flatMap((f) => transitionCallsIn(f.rel, f.text));
+const transitions = transitionUses(srcProgram(), (f) => path.relative(REPO, f).split(path.sep).join("/"));
 
 describe("the scanner (both legs, on synthetic sources)", () => {
   it("finds a statement split across `+` lines, a template, an INSERT OR REPLACE, an upsert and a builder's SET fragment", () => {
@@ -119,7 +156,25 @@ describe("the scanner (both legs, on synthetic sources)", () => {
       `export function d() { db.prepare("INSERT INTO agents (name) VALUES (?) ON CONFLICT(name) DO UPDATE SET auth_state = 'active'").run(); }`,
       `export function e() { const cols = ["auth_state = ?"]; return cols; }`,
     ].join("\n");
-    expect(authStateWritesIn("src/x.ts", src).map((s) => `${s.site}:${s.kind}`)).toEqual(["src/x.ts:a:update-auth_state", "src/x.ts:b:update-auth_state", "src/x.ts:c:replace", "src/x.ts:d:insert", "src/x.ts:e:update-auth_state"]);
+    expect(authStateWritesIn("src/x.ts", src).map((s) => `${s.site}:${s.kind}`)).toEqual(["src/x.ts:a:update-auth_state", "src/x.ts:b:update-auth_state", "src/x.ts:c:replace", "src/x.ts:d:upsert", "src/x.ts:e:update-auth_state"]);
+  });
+  it("Codex #315 R2 N3: a conflict clause, quoted identifiers, a schema qualifier and a second statement are all seen", () => {
+    expect(classifySql(`UPDATE OR ABORT agents SET auth_state = 'active', revoked_at = NULL WHERE name = ?`)).toEqual(["update-auth_state"]);
+    expect(classifySql(`UPDATE "agents" SET "auth_state" = 'active', revoked_at = NULL WHERE name = ?`)).toEqual(["update-auth_state"]);
+    expect(classifySql("UPDATE `agents` SET [auth_state] = 'active' WHERE name = ?")).toEqual(["update-auth_state"]);
+    expect(classifySql(`UPDATE main.agents SET auth_state = 'active'`)).toEqual(["update-auth_state"]);
+    expect(classifySql(`SELECT 1; UPDATE agents SET auth_state = 'active' WHERE name = 'x'`)).toEqual(["update-auth_state"]);
+    expect(classifySql(`INSERT INTO agents (name) VALUES (?) ON CONFLICT (name) DO UPDATE SET auth_state = 'active'`)).toEqual(["upsert"]);
+  });
+  it("Codex #315 R2 N3: an ALIASED applyAuthStateTransition (and one passed as a value) is found by binding", () => {
+    const files = {
+      "src/db.ts": "export function applyAuthStateTransition(_n: string, _f: string, _t: string): void {}",
+      "src/a.ts": `import { applyAuthStateTransition as transition } from "./db.js";\nexport function revive(n: string) { transition(n, "revoked", "active"); }`,
+      "src/b.ts": `import { applyAuthStateTransition } from "./db.js";\nexport const t = applyAuthStateTransition;`,
+    };
+    const uses = transitionUses(virtualProgram(files), (f) => path.relative("/virtual", f).split(path.sep).join("/"));
+    expect(uses.filter((u) => u.direct).map((u) => [u.site, u.from, u.to])).toEqual([["src/a.ts:revive", "revoked", "active"]]);
+    expect(uses.some((u) => !u.direct)).toBe(true);
   });
   it("does NOT flag a WHERE-only mention or an unrelated table", () => {
     const src = `export function f() { db.prepare("UPDATE agents SET last_seen = ? WHERE auth_state = 'active'").run(); db.prepare("UPDATE tasks SET auth_state = 'x'").run(); }`;
@@ -138,11 +193,12 @@ describe("SEC-20.T2: every statement that can set auth_state is listed and justi
   });
   it("no INSERT into agents is an upsert (an upsert could overwrite a revoked row)", () => {
     for (const a of all.filter((x) => x.kind === "insert")) expect(a.sql, a.site).not.toMatch(/ON\s+CONFLICT|OR\s+REPLACE/i);
-    expect(all.filter((x) => x.kind === "replace")).toEqual([]);
+    expect(all.filter((x) => x.kind === "replace" || x.kind === "upsert")).toEqual([]);
   });
-  it("every applyAuthStateTransition call names LITERAL states, and none moves a revoked / recovery_pending row to active", () => {
+  it("every applyAuthStateTransition use (by binding) is a direct call naming LITERAL states, and none moves a revoked / recovery_pending row to active", () => {
     expect(transitions.length).toBeGreaterThan(0);
     for (const t of transitions) {
+      expect(t.direct, `${t.site}: a non-call use of applyAuthStateTransition cannot be reviewed`).toBe(true);
       expect([t.from, t.to].includes(null), `${t.site}: a non-literal state cannot be reviewed`).toBe(false);
       if (t.to === "active") expect(["revoked", "recovery_pending"], t.site).not.toContain(t.from);
     }
