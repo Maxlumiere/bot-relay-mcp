@@ -45,6 +45,15 @@ const PINNED: Record<string, { allowed: string[]; why: string }> = {
     allowed: ["src/db.ts:mintAgentToken", "src/db.ts:registerAgent", "src/db.ts:rotateAgentToken", "src/db.ts:rotateAgentTokenAdmin", "src/db.ts:resolveAgentByTokenVerdict", "src/db.ts:explicitCallerCacheGetVerdict", "src/db.ts:explicitCallerCachePut"],
     why: "WRITERS of the digest (mint, register, rotate), and the verified-token CACHE key (a hit is a verdict the dispatcher revalidates)",
   },
+  // Codex #315 R2 N5: the digest CANDIDATES and the raw lookup KEYS can decide a token as surely as digestVerdict
+  // (`tokenLookupCandidates(t).includes(row.token_lookup)` is a hash-only authorization). Every token-lookup.ts export
+  // was reviewed: storedLookupKeyId, unreachableLookupRanges and KEY_ID_SEPARATOR never see a token (key ids and
+  // index ranges only), and _resetTokenLookupCacheForTests is a test seam; they are not pinned.
+  "src/token-lookup.ts:tokenLookupCandidates": { allowed: ["src/db.ts:findAgentRowByToken"], why: "the digest forms of a presented token: only the locator's indexed lookup" },
+  "src/token-lookup.ts:lookupKeys": {
+    allowed: ["src/token-lookup.ts:computeTokenLookup", "src/token-lookup.ts:digestVerdict", "src/token-lookup.ts:tokenLookupCandidates", "src/token-lookup.ts:unreachableLookupRanges", "src/db.ts:tokenDigestReport"],
+    why: "the raw HMAC keys: the digest functions themselves, the index-range planner, and the doctor report (key ids only)",
+  },
   "src/db.ts:findAgentRowByToken": {
     allowed: ["src/db.ts:resolveAgentByTokenVerdict", "src/tools/status.ts:checkToken"],
     why: "the locator: the dispatcher's resolver (its verdict is revalidated) and health_check (followed by authorizeAgentToken + revalidate)",
@@ -137,6 +146,15 @@ describe("the checker (both legs, on virtual sources bound to a pinned API)", ()
     expect(run(`import * as tv from "./token-verify.js";\nexport function c() { return tv.verifyCredential(); }`).length).toBe(1);
     expect(run(`import { verifyCredential } from "./token-verify.js";\nexport const f = verifyCredential;`).length).toBe(1);
     expect(run(`import { verifyCredential } from "./token-verify.js";\nexport function c() { void verifyCredential().then(() => 1); }`).length).toBe(1);
+  });
+  it("Codex #315 R2 N5, the exact bypass: `tokenLookupCandidates(token).includes(row.token_lookup)` is a reference to a PINNED API", () => {
+    const files = {
+      "src/token-lookup.ts": "export function tokenLookupCandidates(t: string): string[] { return [t]; }",
+      "src/consumer.ts": `import { tokenLookupCandidates } from "./token-lookup.js";\nexport function authorizes(token: string, row: { token_lookup: string | null }) { return tokenLookupCandidates(token).includes(row.token_lookup!); }`,
+    };
+    const refs = pinnedReferences(virtualProgram(files), (f) => path.relative("/virtual", f).split(path.sep).join("/"), ["src/token-lookup.ts:tokenLookupCandidates"]);
+    expect(refs.map((r) => r.site)).toEqual(["src/consumer.ts:authorizes"]);
+    expect(PINNED["src/token-lookup.ts:tokenLookupCandidates"].allowed).not.toContain("src/consumer.ts:authorizes");
   });
   it("does NOT flag a same-named LOCAL function (the binding, not the spelling, decides)", () => {
     expect(run(`function verifyCredential() { return 1; }\nexport function c() { return verifyCredential(); }`)).toEqual([]);

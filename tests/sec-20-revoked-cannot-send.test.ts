@@ -286,6 +286,24 @@ describe("SEC-20 in process: the authorizer and the local consumers", () => {
     }
   });
 
+  it("N1 (Codex #315 R2): a revoke committed BETWEEN mint --force's read and its write is never overwritten (both revoke kinds)", async () => {
+    for (const [name, issueRecovery, state] of [["cas-revoked", false, "revoked"], ["cas-recovery", true, "recovery_pending"]] as const) {
+      db.mintAgentToken(name, "w", []);
+      let fired = false;
+      db._onMintBeforeWriteForTests(() => {
+        fired = true;
+        db.revokeAgentToken(name, { issueRecovery });
+      });
+      try {
+        expect(() => db.mintAgentToken(name, "w", [], { force: true }), name).toThrow(state === "recovery_pending" ? /awaiting recovery/ : /is revoked: /);
+      } finally {
+        db._onMintBeforeWriteForTests(null);
+      }
+      expect(fired, `${name}: precondition, the revoke landed between the read and the write`).toBe(true);
+      expect((db.getDb().prepare("SELECT auth_state FROM agents WHERE name = ?").get(name) as { auth_state: string }).auth_state, name).toBe(state);
+    }
+  });
+
   it("TWIN: `relay mint-token --force` on an ACTIVE row still rotates (a new token that authorizes; the old one does not)", async () => {
     const old = db.mintAgentToken("fm-active", "w", []).plaintext_token;
     const f = await reuse.forceRotateAndVault("fm-active", "w", []);

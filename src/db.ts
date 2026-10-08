@@ -4652,6 +4652,15 @@ export function expandAgentCapabilities(
  * the whole point: it sidesteps the LLM-client safety monitors that
  * pattern-match register-then-use sequences as credential handoff.
  */
+let onMintBeforeWrite: (() => void) | null = null;
+/**
+ * TEST SEAM (Codex #315 R2 N1): run `hook` once in the next force-mint, AFTER it read the row and BEFORE its write:
+ * the point where another process's revoke can commit. One-shot.
+ */
+export function _onMintBeforeWriteForTests(hook: (() => void) | null): void {
+  onMintBeforeWrite = hook;
+}
+
 /** SEC-20.T2: `relay mint-token --force` refuses a revoked (or recovery_pending) identity. */
 export class RevokedAgentMintError extends Error {
   readonly code = "AGENT_REVOKED";
@@ -4724,6 +4733,11 @@ export function mintAgentToken(
     // rotate path in v2.6.0 to keep the surface tight; future-add via this hook.
     const newDescription =
       options.description !== undefined ? options.description : existing.description ?? null;
+    if (onMintBeforeWrite) {
+      const hook = onMintBeforeWrite;
+      onMintBeforeWrite = null;
+      hook();
+    }
     const tx = db.transaction(() => {
       const r = db.prepare(
         "UPDATE agents SET last_seen = ?, token_hash = ?, token_lookup = ?, session_id = NULL, " +
@@ -4731,11 +4745,18 @@ export function mintAgentToken(
           "previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL, " +
           "recovery_token_hash = NULL, revoked_at = NULL, " +
           "description = ? " +
-          "WHERE name = ?"
-      ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name);
+          // SEC-20.T2 (Codex #315 R2 N1): a compare-and-set on what was READ. A revoke committed by another
+          // process between the read above and this write must never be overwritten to 'active': the row must
+          // still be in an eligible state, unrevoked, with the token hash that was read.
+          "WHERE name = ? AND auth_state IN ('active', 'rotation_grace', 'legacy_bootstrap') AND revoked_at IS NULL AND token_hash IS ?"
+      ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name, existing.token_hash ?? null);
       if (r.changes !== 1) {
+        // The row changed under us: report a revoke as a revoke, anything else as a concurrent change.
+        const now = db.prepare("SELECT auth_state, revoked_at FROM agents WHERE name = ?").get(name) as Pick<AgentRecord, "auth_state" | "revoked_at"> | undefined;
+        const revokedNow = revokedStateOf(now);
+        if (revokedNow) throw new RevokedAgentMintError(name, revokedNow);
         throw new Error(
-          `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
+          `mintAgentToken UPDATE failed for "${name}": the row changed while the new token was minted (a concurrent rotate, unregister or re-register): nothing was written; retry.`
         );
       }
     });

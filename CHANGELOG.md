@@ -13,7 +13,8 @@ Revoking an agent did not stop it from sending. A revoke keeps the agent's token
 - **A revoke that lands while a tool is still working is honoured.** Registering a webhook (which first checks the address) and spawning an agent (which first saves the new agent's token) now check the caller again right before they act. If the caller was revoked meanwhile, no webhook is created, and the new agent is removed without being started.
 - **`health_check` reports a revoked token as revoked**, even when the revoke lands while the token is being checked.
 - **Tests fail** if anything other than the named code paths checks a token's hash or digest directly, or if any new statement can set an agent's state to active.
-- **What a revoke does not stop.** It closes the relay's doors to that agent's token. A process that can run `relay` commands as the same user (for example `relay recover`) is outside it: a revoked agent with a shell can reset its own identity.
+- **What a revoke does not stop.** It closes the relay's doors to that agent's token. A process that can run `relay` commands as the same user (for example `relay recover`) is outside it: a revoked agent with a shell can reset its own identity. Deleting a revoked agent (an operator removing it, or the routine clean-up of old agents) frees its NAME: its revoked token stays dead, and a new agent under that name needs the registration secret.
+
 ### Added: `relay watch AGENT --until-wake`, a wake that costs no model tokens while it waits
 
 An agent can now be woken for new relay mail without polling and without a model call. From its own session, it first runs `relay watch AGENT --arm-check`, which says whether to start a watch and gives the exact command. It then starts that command once as a background task. The command waits, and exits with one line when the agent has mail to wake for. Its exit is the wake. The agent reads its mail, then arms again.
