@@ -22,6 +22,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import ts from "typescript-legacy";
+import { srcProgram, virtualProgram } from "./_helpers/ts-binding.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sec20-async-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -141,16 +142,56 @@ const ASYNC_HANDLERS: Record<string, { file: string; writesAfterAwait: string[];
   handleHealthCheck: { file: "src/tools/status.ts", writesAfterAwait: [], why: "a no-auth tool: its optional token diagnostic goes through authorizeAgentToken + revalidate (status.ts checkToken)" },
 };
 
-function asyncHandlersIn(rel: string, text: string): string[] {
-  const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const out: string[] = [];
-  sf.forEachChild((n) => {
-    if (ts.isFunctionDeclaration(n) && n.name && /^handle[A-Z]/.test(n.name.text) && n.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) out.push(n.name.text);
-  });
-  return out;
+/**
+ * Codex #315 R2 N4: the inventory is what the DISPATCHER binds, not a naming convention. Every `case "<tool>":` of
+ * the dispatch switch in src/server.ts must `return <handler>(...)`; each handler is resolved by binding, and the
+ * checker says whether it returns a Promise (an `async function`, or a sync one returning `pre().then(write)`).
+ * Every Promise-returning handler must be classified below. A case of any other shape fails as unclassified.
+ */
+export function dispatchedHandlers(program: ts.Program, rel: (f: string) => string): { promising: Array<{ tool: string; handler: string; file: string }>; unclassified: string[] } {
+  const checker = program.getTypeChecker();
+  const promising: Array<{ tool: string; handler: string; file: string }> = [];
+  const unclassified: string[] = [];
+  const server = program.getSourceFiles().find((f) => rel(f.fileName) === "src/server.ts");
+  if (!server) return { promising, unclassified: ["src/server.ts not in the program"] };
+  let sw: ts.SwitchStatement | undefined;
+  const find = (n: ts.Node): void => {
+    if (ts.isFunctionDeclaration(n) && n.name?.text === "dispatch" && n.body) n.body.statements.forEach((st) => ts.isSwitchStatement(st) && (sw = st));
+    ts.forEachChild(n, find);
+  };
+  find(server);
+  if (!sw) return { promising, unclassified: ["the dispatch switch was not found"] };
+  for (const clause of sw.caseBlock.clauses) {
+    if (!ts.isCaseClause(clause)) continue;
+    const tool = ts.isStringLiteralLike(clause.expression) ? clause.expression.text : clause.expression.getText();
+    const ret = clause.statements.find(ts.isReturnStatement);
+    let call = ret?.expression;
+    if (call && ts.isAwaitExpression(call)) call = call.expression;
+    if (!call || !ts.isCallExpression(call) || !ts.isIdentifier(call.expression)) {
+      unclassified.push(`${tool}: not a plain \`return handler(...)\``);
+      continue;
+    }
+    let sym = checker.getSymbolAtLocation(call.expression);
+    if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+    const decl = sym?.declarations?.[0];
+    if (!decl) {
+      unclassified.push(`${tool}: ${call.expression.text} does not resolve`);
+      continue;
+    }
+    const sig = checker.getResolvedSignature(call);
+    const rt = sig ? checker.getReturnTypeOfSignature(sig) : undefined;
+    const isPromise = !!rt && (checker.getPromisedTypeOfPromise(rt) !== undefined || /^Promise</.test(checker.typeToString(rt)));
+    if (isPromise) promising.push({ tool, handler: sym!.name, file: rel(decl.getSourceFile().fileName) });
+  }
+  return { promising, unclassified };
 }
 
-/** In `fnName`, every call to a write callee is preceded by recheckAuthorization() with NO await in between. */
+/**
+ * In `fnName`, every call to a write callee AFTER the first await sits in a statement IMMEDIATELY preceded by the
+ * fail-closed form `if (!R.ok) <return …>` and, before it, `const R = recheckAuthorization();` (Codex #315 R2 N4:
+ * a recheck merely encountered, ignored, or conditional is not protection). A syntactic form, not a dominance
+ * analysis (stated).
+ */
 export function recheckGuards(text: string, fnName: string, writes: string[]): string[] {
   const sf = ts.createSourceFile("x.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   let fn: ts.FunctionDeclaration | undefined;
@@ -158,52 +199,87 @@ export function recheckGuards(text: string, fnName: string, writes: string[]): s
     if (ts.isFunctionDeclaration(n) && n.name?.text === fnName) fn = n;
   });
   if (!fn) return [`${fnName} not found`];
-  const events: Array<{ pos: number; kind: "await" | "recheck" | "write"; name?: string }> = [];
+  const awaits: number[] = [];
+  const writeCalls: ts.CallExpression[] = [];
   const visit = (n: ts.Node): void => {
-    if (ts.isAwaitExpression(n)) events.push({ pos: n.getStart(), kind: "await" });
-    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) {
-      if (n.expression.text === "recheckAuthorization") events.push({ pos: n.getStart(), kind: "recheck" });
-      if (writes.includes(n.expression.text)) events.push({ pos: n.getStart(), kind: "write", name: n.expression.text });
-    }
-    // a nested function's awaits are not this body's (its own call site is what matters)
-    if (n !== fn && (ts.isFunctionDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n))) return;
+    if (n !== fn && (ts.isFunctionDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n))) return; // a nested body is not this one's
+    if (ts.isAwaitExpression(n)) awaits.push(n.getStart());
+    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && writes.includes(n.expression.text)) writeCalls.push(n);
     ts.forEachChild(n, visit);
   };
   ts.forEachChild(fn, visit);
-  events.sort((a, b) => a.pos - b.pos);
+  const firstAwait = awaits.length ? Math.min(...awaits) : Infinity;
   const problems: string[] = [];
-  let sawAwait = false;
-  let recheckedSinceAwait = false;
-  for (const e of events) {
-    if (e.kind === "await") {
-      sawAwait = true;
-      recheckedSinceAwait = false;
-    } else if (e.kind === "recheck") recheckedSinceAwait = true;
-    else if (sawAwait && !recheckedSinceAwait) problems.push(`${fnName}: ${e.name}() after an await with no recheckAuthorization() since it`);
+  const returnsOnly = (st: ts.Statement): boolean => ts.isReturnStatement(st) || (ts.isBlock(st) && st.statements.length > 0 && ts.isReturnStatement(st.statements[st.statements.length - 1]));
+  for (const w of writeCalls) {
+    if (w.getStart() < firstAwait) continue; // before any await: the dispatcher's own check covers it
+    let stmt: ts.Node = w;
+    while (stmt.parent && !ts.isBlock(stmt.parent) && !ts.isSourceFile(stmt.parent)) stmt = stmt.parent;
+    const block = stmt.parent as ts.Block;
+    const idx = block.statements.indexOf(stmt as ts.Statement);
+    const guard = block.statements[idx - 1];
+    const decl = block.statements[idx - 2];
+    let name: string | null = null;
+    if (decl && ts.isVariableStatement(decl) && decl.declarationList.declarations.length === 1) {
+      const d = decl.declarationList.declarations[0];
+      if (ts.isIdentifier(d.name) && d.initializer && ts.isCallExpression(d.initializer) && ts.isIdentifier(d.initializer.expression) && d.initializer.expression.text === "recheckAuthorization") name = d.name.text;
+    }
+    const failsClosed =
+      !!name &&
+      !!guard &&
+      ts.isIfStatement(guard) &&
+      !guard.elseStatement &&
+      ts.isPrefixUnaryExpression(guard.expression) &&
+      guard.expression.operator === ts.SyntaxKind.ExclamationToken &&
+      ts.isPropertyAccessExpression(guard.expression.operand) &&
+      guard.expression.operand.name.text === "ok" &&
+      ts.isIdentifier(guard.expression.operand.expression) &&
+      guard.expression.operand.expression.text === name &&
+      returnsOnly(guard.thenStatement);
+    if (!failsClosed) problems.push(`${fnName}: ${(w.expression as ts.Identifier).text}() after an await is not immediately preceded by \`const R = recheckAuthorization(); if (!R.ok) return …;\``);
   }
-  if (writes.length && !events.some((e) => e.kind === "write")) problems.push(`${fnName}: none of ${writes.join(", ")} found (stale classification)`);
+  if (writes.length && writeCalls.length === 0) problems.push(`${fnName}: none of ${writes.join(", ")} found (stale classification)`);
   return problems;
 }
 
-describe("STRUCTURE: every async dispatched handler is classified, and rechecks before a post-await write", () => {
-  const files = fs.readdirSync(path.join(REPO, "src", "tools")).filter((f) => f.endsWith(".ts")).map((f) => `src/tools/${f}`);
-  it("the async handlers in src/tools are EXACTLY the classified ones", () => {
-    const found = files.flatMap((f) => asyncHandlersIn(f, fs.readFileSync(path.join(REPO, f), "utf-8"))).sort();
-    expect(found).toEqual(Object.keys(ASYNC_HANDLERS).sort());
+describe("STRUCTURE: every Promise-returning dispatched handler is classified, and rechecks (fail-closed) before a post-await write", () => {
+  const program = srcProgram();
+  const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
+  const inv = dispatchedHandlers(program, rel);
+  it("every dispatch case is a plain `return handler(...)` (nothing unclassified)", () => {
+    expect(inv.unclassified).toEqual([]);
+  });
+  it("precondition: the inventory sees the dispatcher's handlers (it is not blind)", () => {
+    expect(inv.promising.map((h) => h.handler)).toEqual(expect.arrayContaining(["handleRegisterWebhook", "handleSpawnAgent"]));
+  });
+  it("the Promise-returning handlers are EXACTLY the classified ones", () => {
+    expect([...new Set(inv.promising.map((h) => h.handler))].sort()).toEqual(Object.keys(ASYNC_HANDLERS).sort());
   });
   for (const [fnName, c] of Object.entries(ASYNC_HANDLERS)) {
-    it(`${fnName}: every post-await write is preceded by recheckAuthorization() (${c.why})`, () => {
+    it(`${fnName}: every post-await write is preceded by the fail-closed recheck (${c.why})`, () => {
       expect(recheckGuards(fs.readFileSync(path.join(REPO, c.file), "utf-8"), fnName, c.writesAfterAwait)).toEqual([]);
     });
   }
-  it("the checker (both legs): a write after an await with no recheck fails; with a recheck it passes; an await between recheck and write fails", () => {
-    const bad = `export async function h() { await a(); write(); }`;
-    const good = `export async function h() { await a(); recheckAuthorization(); write(); }`;
-    const gap = `export async function h() { await a(); recheckAuthorization(); await b(); write(); }`;
+  it("the checker (both legs): the fail-closed form passes; no recheck, an IGNORED recheck, a CONDITIONAL recheck, or an await in between fail", () => {
+    const good = `export async function h() { await a(); const r = recheckAuthorization(); if (!r.ok) return no(); write(); }`;
+    const goodBlock = `export async function h() { await a(); const r = recheckAuthorization(); if (!r.ok) { log(); return no(); } write(); }`;
+    const none = `export async function h() { await a(); write(); }`;
+    const ignored = `export async function h() { await a(); recheckAuthorization(); write(); }`;
+    const conditional = `export async function h(c: boolean) { await a(); if (c) { const r = recheckAuthorization(); if (!r.ok) return no(); } write(); }`;
+    const gap = `export async function h() { await a(); const r = recheckAuthorization(); if (!r.ok) return no(); await b(); write(); }`;
     const before = `export async function h() { write(); await a(); }`;
-    expect(recheckGuards(bad, "h", ["write"]).length).toBe(1);
     expect(recheckGuards(good, "h", ["write"])).toEqual([]);
-    expect(recheckGuards(gap, "h", ["write"]).length).toBe(1);
+    expect(recheckGuards(goodBlock, "h", ["write"])).toEqual([]);
+    for (const bad of [none, ignored, conditional, gap]) expect(recheckGuards(bad, "h", ["write"]).length, bad).toBe(1);
     expect(recheckGuards(before, "h", ["write"])).toEqual([]);
+  });
+  it("Codex #315 R2 N4: a SYNC handler returning `pre().then(write)` is inventoried as Promise-returning (so it must be classified)", () => {
+    const files = {
+      "src/server.ts": `import { handleSync } from "./h.js";\nexport function createServer() { async function dispatch(name: string, args: any): Promise<any> { switch (name) { case "t": return handleSync(args); } } return dispatch; }`,
+      "src/h.ts": `async function pre(): Promise<void> {}\nfunction write(): void {}\nexport function handleSync(_a: unknown) { return pre().then(() => write()); }`,
+    };
+    const v = dispatchedHandlers(virtualProgram(files), (f) => path.relative("/virtual", f).split(path.sep).join("/"));
+    expect(v.unclassified).toEqual([]);
+    expect(v.promising.map((h) => h.handler)).toEqual(["handleSync"]);
   });
 });
