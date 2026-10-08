@@ -14,9 +14,17 @@
  *
  * It fails CLOSED: a violations directory that is missing or unreadable at teardown is itself a failure.
  * On a failure the run directory is KEPT (the evidence); on success it is removed.
+ *
+ * It also runs the LIVE-RELAY GUARD (tests/_setup/live-relay-guard.mjs): a read-only snapshot of every live
+ * relay DB a daemon holds, before the run, compared after it; anything new from outside the pre-run fleet
+ * fails the run. Its verdict (CLEAN, offenders, or NOT_EVALUATED with the reason) is printed every run.
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { fixtureNamesIn, guardAfter, guardBefore } from "./live-relay-guard.mjs";
+
+const TESTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function runDirOf(project) {
   const dir = project?.config?.env?.RELAY_TEST_TRIPWIRE_RUN_DIR;
@@ -42,6 +50,14 @@ export function collectViolations(dir) {
 
 export default function setup(project) {
   const runDir = runDirOf(project);
+  const env = project?.config?.env ?? {};
+  let roots = [];
+  try {
+    roots = JSON.parse(env.RELAY_TEST_OPERATOR_ROOTS ?? "[]");
+  } catch {
+    roots = [];
+  }
+  const live = guardBefore(roots);
   const violations = path.join(runDir, "violations");
   fs.mkdirSync(path.join(runDir, "home"), { recursive: true, mode: 0o700 });
   // On Windows the base puts TEMP inside the private home: it must exist before any worker uses it.
@@ -49,6 +65,11 @@ export default function setup(project) {
   if (typeof temp === "string" && path.isAbsolute(temp)) fs.mkdirSync(temp, { recursive: true, mode: 0o700 });
   fs.mkdirSync(violations, { recursive: true, mode: 0o700 });
   return () => {
+    const verdict = guardAfter(live, { fixtureNames: fixtureNamesIn(TESTS_DIR), nonce: env.RELAY_TEST_RUN_NONCE ?? "" });
+    process.stdout.write(`${verdict.lines.join("\n")}\n`);
+    if (verdict.fail) {
+      throw new Error(`OPERATOR_TRIPWIRE: the LIVE relay changed in ways the pre-run fleet does not explain (see the live-relay guard lines above). Run directory kept: ${runDir}\n  ${verdict.lines.join("\n  ")}`);
+    }
     let found;
     try {
       found = collectViolations(violations);

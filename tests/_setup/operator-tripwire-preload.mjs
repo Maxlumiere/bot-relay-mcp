@@ -28,14 +28,17 @@
  * error cannot hide it. A record that cannot be written FAILS CLOSED: a child exits 97 at once; the test
  * worker marks itself so its next afterEach fails.
  *
- * KNOWN RESIDUAL (not chased, by ruling 621856a0; bounded by the private HOME, the closed port, and the
- * target hardening of PR-B and PR-D): asynchronous fs (fs.promises, callback fs, streams, a sync read on
- * an fd from an async open); worker_threads (a Worker loads none of this); native SQLite opens
+ * THE BOUNDARY (ruling 621856a0, and on Codex #305 R2 NEW-1: this stops ACCIDENTAL drift, never a test
+ * written to get around it). NOT CHECKED HERE: asynchronous fs (fs.promises, callback fs, streams, a sync
+ * read on an fd from an async open); worker_threads (a Worker loads none of this); native SQLite opens
  * (better-sqlite3, node:sqlite: they never call node's fs); a grandchild a child spawns with env {}
- * (child_process is wrapped only in the test worker); a child that reaches the network or a path
- * without node (curl, sqlite3, bash). Each of these still starts from the private HOME and port 1, so it
- * reaches the operator only by a path or port named explicitly, which tests/operator-path-scan.test.ts
- * scans tests/ and hooks/ for.
+ * (child_process is wrapped only in the test worker); a program that is not node (curl, sqlite3, bash).
+ * These are NOT contained: an env-{} grandchild falls back to the ACCOUNT home and port 3777 (resolve-
+ * instance.ts homeFor), and any of them can build a path from os.userInfo().homedir. What they WRITE to a
+ * running live relay is DETECTED after the fact by the live-relay guard (tests/_setup/live-relay-guard.mjs),
+ * which fails the run; what they only READ is neither contained nor detected (stated in the CHANGELOG; the
+ * OS-level boundary, a disposable account, is its own project). tests/operator-path-scan.test.ts fails on a
+ * LITERAL operator path or instance id in tests/ and hooks/.
  */
 import fs from "node:fs";
 import net from "node:net";
@@ -90,20 +93,51 @@ function caseInsensitiveAt(dir) {
   }
 }
 
-/** The deepest existing ancestor of `abs`, realpath'd, with the rest re-joined. */
-function realpathDeepest(abs) {
-  const rest = [];
-  let cur = abs;
-  for (;;) {
-    try {
-      return path.join(RAW_FS.realpathSync(cur), ...rest.reverse());
-    } catch {
-      const parent = path.dirname(cur);
-      if (parent === cur) return abs;
-      rest.push(path.basename(cur));
-      cur = parent;
+const SEPARATORS = process.platform === "win32" ? /[\\/]+/ : /\/+/;
+/**
+ * Where the kernel would land for `abs`, resolved ONE COMPONENT AT A TIME (Codex #305 R2 NEW-4). A `..`
+ * steps up from the REAL directory reached so far, so `<link>/../x` resolves from where the link points,
+ * exactly as open(2) does (path.normalize would erase the link first and name another place). From the
+ * first component that does not exist, the rest is joined lexically: nothing there can be a link.
+ */
+function realpathComponentwise(abs) {
+  const { root } = path.parse(abs);
+  const parts = abs.slice(root.length).split(SEPARATORS).filter(Boolean);
+  // Without a `..`, the realpath of the deepest existing ancestor IS the answer: one call, not one per component.
+  if (!parts.includes("..")) {
+    const rest = [];
+    let cur = abs;
+    for (;;) {
+      try {
+        return path.join(RAW_FS.realpathSync(cur), ...rest.reverse());
+      } catch {
+        const parent = path.dirname(cur);
+        if (parent === cur) return path.join(abs);
+        rest.push(path.basename(cur));
+        cur = parent;
+      }
     }
   }
+  let cur;
+  try {
+    cur = RAW_FS.realpathSync(root);
+  } catch {
+    cur = root;
+  }
+  for (let i = 0; i < parts.length; i++) {
+    const c = parts[i];
+    if (c === ".") continue;
+    if (c === "..") {
+      cur = path.dirname(cur);
+      continue;
+    }
+    try {
+      cur = RAW_FS.realpathSync(path.join(cur, c));
+    } catch {
+      return path.join(cur, ...parts.slice(i));
+    }
+  }
+  return cur;
 }
 
 /** A path as a string, or null (a URL, a Buffer, a string; anything else is not a path). */
@@ -121,7 +155,8 @@ function asPath(p) {
 export function canonicalPath(p, fold) {
   const s = asPath(p);
   if (s === null) return null;
-  const real = realpathDeepest(path.isAbsolute(s) ? path.normalize(s) : path.resolve(s));
+  // Never normalized first: `..` is resolved against the real path reached so far (see realpathComponentwise).
+  const real = realpathComponentwise(path.isAbsolute(s) ? s : `${process.cwd()}${path.sep}${s}`);
   return fold ? real.normalize("NFC").toLowerCase() : real;
 }
 

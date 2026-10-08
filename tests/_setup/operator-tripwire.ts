@@ -14,12 +14,14 @@
  * then fall back to the passwd home, whose ~/.bot-relay/active-instance names the live DB) and no port.
  *
  * Architect ruling 621856a0, three roles:
- *   1. PROTECTION by construction (the base config): a private HOME and port 1 for every worker, before
- *      this file runs; this file narrows HOME to a private one PER WORKER, and gives every CHILD a test
- *      starts the same: a missing HOME, USERPROFILE, HOMEDRIVE, HOMEPATH or RELAY_HTTP_PORT gets the
- *      private one / port 1 (never the account's real home or the default 3777), and an env whose HOME
- *      is the operator's home or inside an operator root, or that points RELAY_HOME / RELAY_DB_PATH /
- *      RELAY_CONFIG_PATH inside one, is REFUSED before the child starts.
+ *   1. PROTECTION by construction, against ACCIDENTAL drift (the base config): a private HOME and port 1 for
+ *      every worker, before this file runs; this file narrows HOME to a private one PER WORKER, drops a shell
+ *      RELAY_HOME / RELAY_DB_PATH / RELAY_CONFIG_PATH, and gives every CHILD a test starts the same: a
+ *      missing or EMPTY HOME, USERPROFILE, HOMEDRIVE, HOMEPATH or RELAY_HTTP_PORT gets the private one /
+ *      port 1 (never the account's real home or the default 3777), and an env whose HOME is the operator's
+ *      home or inside an operator root, or that points RELAY_HOME / RELAY_DB_PATH / RELAY_CONFIG_PATH inside
+ *      one, is REFUSED before the child starts. A GRANDCHILD started with env {} gets none of this (see the
+ *      preload's boundary; the live-relay guard detects what it writes).
  *   2. TARGET HARDENING: PR-B and PR-D (not here).
  *   3. DETECTION, best effort, catch-proof, fail-closed (tests/_setup/operator-tripwire-preload.mjs, in
  *      this worker and, via NODE_OPTIONS, in every node child): refused connects and fs access are each
@@ -35,7 +37,8 @@ import path from "node:path";
 import cp from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterEach } from "vitest";
+import { afterAll, afterEach } from "vitest";
+import type { ChildProcess } from "node:child_process";
 import { HOME_KEYS, SAFE_PORT, privateHomeEnv } from "./vitest-tripwire-base.mjs";
 
 export { HOME_KEYS, SAFE_PORT, privateHomeEnv };
@@ -94,9 +97,12 @@ pre.markTestWorker();
 // discovery made each one a root), and a worker inherits them from the main process. Drop each that names
 // an operator root, so this worker, and every child built from its env, starts away from the operator
 // instead of being refused at its first spawn. (hermetic-config, next, sets its own RELAY_CONFIG_PATH.)
+// A RELATIVE one resolves against the launch cwd, as production does (Codex #305 R2 NEW-2); an empty one means
+// "the default" to every consumer, which now resolves under the private HOME.
+const LAUNCH_CWD = process.env.RELAY_TEST_LAUNCH_CWD || process.cwd();
 for (const k of ["RELAY_HOME", "RELAY_DB_PATH", "RELAY_CONFIG_PATH"]) {
   const v = process.env[k];
-  if (v && pre.underOperatorRoot(v)) delete process.env[k];
+  if (v === "" || (v && pre.underOperatorRoot(path.resolve(LAUNCH_CWD, v)))) delete process.env[k];
 }
 export const { OperatorTripwireError, RAW_FS, underOperatorRoot, isOperatorHome, isLocalAddress } = pre;
 
@@ -136,8 +142,11 @@ function failOnViolations(where: string, reporter: keyof TripwireState["seen"]):
 
 const INSTANCE_ENV = ["RELAY_HOME", "RELAY_DB_PATH", "RELAY_CONFIG_PATH"] as const;
 
-/** The env a child actually gets: the test's env (or ours), plus the tripwire. Throws BEFORE the spawn on an operator path. */
-export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+/**
+ * The env a child actually gets: the test's env (or ours), plus the tripwire. Throws BEFORE the spawn on an
+ * operator path. `cwd` is the child's: a relative instance override resolves against it, as in production.
+ */
+export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined, cwd: string = process.cwd()): NodeJS.ProcessEnv {
   const st = state();
   const base = env ?? process.env;
   const named: string[] = [];
@@ -149,7 +158,7 @@ export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.Pro
     const v = `${base.HOMEDRIVE ?? ""}${base.HOMEPATH}`;
     if (pre.isOperatorHome(v) || pre.underOperatorRoot(v)) named.push(`HOMEDRIVE+HOMEPATH=${v}`);
   }
-  for (const k of INSTANCE_ENV) if (base[k] && pre.underOperatorRoot(base[k])) named.push(`${k}=${base[k]}`);
+  for (const k of INSTANCE_ENV) if (base[k] && pre.underOperatorRoot(path.resolve(cwd, base[k]!))) named.push(`${k}=${base[k]}`);
   if (named.length) {
     const line = `env a child env names the OPERATOR's home or relay root: ${named.join(" ")}`;
     pre.recordViolation(line); // also fails this test's afterEach, and the run, even if the throw is caught
@@ -158,10 +167,14 @@ export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.Pro
   const out: NodeJS.ProcessEnv = { ...base };
   // Without them, bash's ~ and node's os.homedir() fall back to the ACCOUNT's real home (passwd on unix,
   // the profile on Windows), and the hooks fall back to port 3777: the operator's. Each missing one gets
-  // the private one.
+  // the private one. EMPTY is missing to those consumers (Codex #305 R2 NEW-1: the hooks read
+  // ${RELAY_HTTP_PORT:-3777}, and node's os.homedir() skips an empty HOME), so it is repaired the same way.
+  const unset = (v: string | undefined) => v === undefined || v === "";
   const priv: Record<string, string> = privateHomeEnv(st.home);
-  for (const [k, v] of Object.entries(priv)) if (base[k] === undefined) out[k] = v;
-  if (base.RELAY_HTTP_PORT === undefined) out.RELAY_HTTP_PORT = SAFE_PORT;
+  for (const [k, v] of Object.entries(priv)) if (unset(base[k]) && !(v === "" && base[k] === "")) out[k] = v;
+  if (unset(base.RELAY_HTTP_PORT)) out.RELAY_HTTP_PORT = SAFE_PORT;
+  // An empty instance override means "the default" (under the private HOME): removed, never passed on as "".
+  for (const k of INSTANCE_ENV) if (base[k] === "") delete out[k];
   Object.assign(out, st.childVars); // the frozen snapshot, whatever the test did to its own env
   const imp = `--import=${pathToFileURL(PRELOAD).href}`;
   const nodeOpts = base.NODE_OPTIONS ?? "";
@@ -178,9 +191,33 @@ function withTripwireEnv(args: unknown[], argvAt1: boolean): unknown[] {
     i = argvAt1 && Array.isArray(a[1]) ? 2 : 1;
     a.splice(i, 0, {});
   }
-  const opts = a[i] as { env?: NodeJS.ProcessEnv };
-  a[i] = { ...opts, env: decorateChildEnv(opts.env) };
+  const opts = a[i] as { env?: NodeJS.ProcessEnv; cwd?: string | URL };
+  const cwd = opts.cwd === undefined ? process.cwd() : opts.cwd instanceof URL ? fileURLToPath(opts.cwd) : path.resolve(String(opts.cwd));
+  a[i] = { ...opts, env: decorateChildEnv(opts.env, cwd) };
   return a;
+}
+
+/**
+ * Children this worker started, until they exit. A preloaded child whose violation record could NOT be written
+ * exits RECORD_FAILED_EXIT (97); the parent must not lose that (Codex #305 R2 NEW-3): the exit is recorded HERE,
+ * in the worker, whose own record failure is sticky (the next afterEach or afterAll fails on it).
+ */
+const SUPERVISED = new Set<ChildProcess>();
+function noteLostRecord(how: string): void {
+  pre.recordViolation(`child exited ${pre.RECORD_FAILED_EXIT} (${how}): it refused an operator access and could not record it`);
+}
+function supervise(child: unknown, how: string): void {
+  if (!child || typeof (child as ChildProcess).once !== "function") return;
+  const c = child as ChildProcess;
+  if (c.exitCode !== null || c.signalCode !== null) {
+    if (c.exitCode === pre.RECORD_FAILED_EXIT) noteLostRecord(how);
+    return;
+  }
+  SUPERVISED.add(c);
+  c.once("exit", (code) => {
+    SUPERVISED.delete(c);
+    if (code === pre.RECORD_FAILED_EXIT) noteLostRecord(how);
+  });
 }
 
 function wrap(name: "spawn" | "spawnSync" | "execFile" | "execFileSync" | "exec" | "execSync" | "fork", sync: boolean, argvAt1: boolean): void {
@@ -188,13 +225,30 @@ function wrap(name: "spawn" | "spawnSync" | "execFile" | "execFileSync" | "exec"
   const original = mod[name];
   if (original[WRAPPED]) return;
   const wrapped = function (this: unknown, ...args: unknown[]) {
-    const r = original.apply(this, withTripwireEnv(args, argvAt1));
-    if (sync) failOnViolations(`child_process.${name}`, "spawn");
+    let r: unknown;
+    try {
+      r = original.apply(this, withTripwireEnv(args, argvAt1));
+    } catch (err) {
+      // execSync / execFileSync throw on a non-zero exit: the status is noted BEFORE the test can swallow it.
+      if (sync && (err as { status?: number } | null)?.status === pre.RECORD_FAILED_EXIT) noteLostRecord(`child_process.${name}`);
+      throw err;
+    }
+    if (sync) {
+      if ((r as { status?: number } | null)?.status === pre.RECORD_FAILED_EXIT) noteLostRecord(`child_process.${name}`);
+      failOnViolations(`child_process.${name}`, "spawn");
+    } else supervise(r, `child_process.${name}`);
     return r;
   } as AnyFn & { [WRAPPED]?: true };
-  // promisify(exec/execFile) resolves {stdout, stderr} through this custom symbol.
+  // promisify(exec/execFile) resolves {stdout, stderr} through this custom symbol; its promise carries .child.
   const custom = (original as unknown as Record<symbol, unknown>)[Symbol.for("nodejs.util.promisify.custom")];
-  if (custom !== undefined) Object.defineProperty(wrapped, Symbol.for("nodejs.util.promisify.custom"), { value: (...args: unknown[]) => (custom as AnyFn)(...withTripwireEnv(args, argvAt1)) });
+  if (custom !== undefined)
+    Object.defineProperty(wrapped, Symbol.for("nodejs.util.promisify.custom"), {
+      value: (...args: unknown[]) => {
+        const p = (custom as AnyFn)(...withTripwireEnv(args, argvAt1)) as { child?: unknown };
+        supervise(p?.child, `child_process.${name} (promisified)`);
+        return p;
+      },
+    });
   wrapped[WRAPPED] = true;
   mod[name] = wrapped;
 }
@@ -219,3 +273,22 @@ wrap("execSync", true, false);
 syncBuiltinESMExports(); // named ESM imports of node:child_process see the wrappers too
 
 afterEach(() => failOnViolations("afterEach", "afterEach"));
+
+/** How long a file's teardown waits for the children it still supervises (ONE deadline for all of them). */
+const SUPERVISE_MS = 5000;
+// Registered FIRST (setupFiles run before the file), so it runs LAST: after the file's own afterAll has killed
+// its daemons. A child that exits 97 after its test, or a record failure since the last afterEach, fails here.
+afterAll(async () => {
+  const deadline = Date.now() + SUPERVISE_MS;
+  for (const c of [...SUPERVISED]) {
+    const left = deadline - Date.now();
+    if (left <= 0) break; // still running past the deadline: its later exit is no longer seen (stated boundary)
+    if (c.exitCode !== null || c.signalCode !== null) continue;
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, left);
+      t.unref?.();
+      c.once("exit", () => (clearTimeout(t), resolve()));
+    });
+  }
+  failOnViolations("afterAll", "afterEach");
+}, SUPERVISE_MS + 5000);

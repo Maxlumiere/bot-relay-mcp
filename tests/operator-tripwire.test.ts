@@ -47,6 +47,18 @@ describe("PROTECTION: this worker and every child start away from the operator",
     const e = decorateChildEnv({ PATH: "/usr/bin:/bin", HOME: "/tmp/elsewhere", RELAY_HTTP_PORT: "40123" });
     expect([e.HOME, e.RELAY_HTTP_PORT]).toEqual(["/tmp/elsewhere", "40123"]);
   });
+  it("an EMPTY value is repaired like a missing one (Codex #305 R2 NEW-1): the hooks read an empty port as 3777, node an empty HOME as the account's", () => {
+    const { privateHome } = tripwireView();
+    const e = decorateChildEnv({ PATH: "/usr/bin:/bin", HOME: "", USERPROFILE: "", HOMEPATH: "", RELAY_HTTP_PORT: "", RELAY_HOME: "", RELAY_DB_PATH: "", RELAY_CONFIG_PATH: "" });
+    expect([e.HOME, e.USERPROFILE, e.RELAY_HTTP_PORT]).toEqual([privateHome, privateHome, "1"]);
+    // An empty instance override means "use the default" to every consumer (resolve-instance.ts, config.ts): it is
+    // removed, so the default resolves under the private HOME.
+    expect([e.RELAY_HOME, e.RELAY_DB_PATH, e.RELAY_CONFIG_PATH]).toEqual([undefined, undefined, undefined]);
+  });
+  it.skipIf(process.platform === "win32")("a shell child given RELAY_HTTP_PORT=\"\" resolves the hooks' port expression to 1, never 3777", () => {
+    const r = spawnSync("/bin/sh", ["-c", 'printf %s "${RELAY_HTTP_PORT:-3777}"'], { encoding: "utf-8", env: { PATH: "/usr/bin:/bin", RELAY_HTTP_PORT: "" } });
+    expect(r.stdout).toBe("1");
+  });
 });
 
 describe("PARITY (Windows): the private home is set in EVERY spelling a process may resolve it from", () => {
@@ -117,6 +129,15 @@ describe("DETECTION primitives (pure: nothing is accessed, nothing is recorded)"
     it("canonicalPath resolves a symlinked ancestor of a missing leaf", () => {
       expect(canonicalPath(path.join(alias, "missing", "leaf"), false)).toBe(path.join(root, "missing", "leaf"));
     });
+    it("`..` AFTER a symlink is resolved from where the link POINTS, as the kernel does (Codex #305 R2 NEW-4; a RAW string: path.join would erase it)", () => {
+      const aliasInst = path.join(dir, "alias-inst"); // -> <root>/instances
+      if (!fs.existsSync(aliasInst)) fs.symlinkSync(path.join(root, "instances"), aliasInst);
+      const raw = `${aliasInst}${path.sep}..${path.sep}relay.db`; // the kernel reaches <root>/relay.db
+      expect(underOperatorRoot(raw, snap())).toBe(root);
+      expect(canonicalPath(raw, false)).toBe(path.join(root, "relay.db"));
+      // and a `..` inside a MISSING suffix collapses lexically (nothing there can be a link)
+      expect(canonicalPath(`${root}${path.sep}nope${path.sep}..${path.sep}relay.db`, false)).toBe(path.join(root, "relay.db"));
+    });
   });
 });
 
@@ -147,6 +168,18 @@ describe("DISCOVERY: every operator root and config, failing CLOSED", () => {
     const op = discoverOperator({ RELAY_HOME: r2, RELAY_CONFIG_PATH: cfg, RELAY_HTTP_PORT: "4005" }, home);
     expect(op.ports.sort()).toEqual([3777, 4001, 4002, 4003, 4004, 4005]);
     expect(op.roots).toEqual([r1, r2, cfg]);
+  });
+  it("RELATIVE overrides are discovered as production resolves them, against the launch cwd (Codex #305 R2 NEW-2)", () => {
+    const home = path.join(dir, "home-3");
+    const cwd = path.join(dir, "launch");
+    const relRoot = path.join(dir, "rel-root");
+    fs.mkdirSync(path.join(relRoot, "instances", "c"), { recursive: true });
+    fs.mkdirSync(cwd, { recursive: true });
+    fs.writeFileSync(path.join(relRoot, "instances", "c", "config.json"), JSON.stringify({ http_port: 4011 }));
+    fs.writeFileSync(path.join(dir, "rel-cfg.json"), JSON.stringify({ http_port: 4012 }));
+    const op = discoverOperator({ RELAY_HOME: path.join("..", "rel-root"), RELAY_CONFIG_PATH: path.join("..", "rel-cfg.json"), RELAY_DB_PATH: path.join("..", "rel-db", "relay.db") }, home, cwd);
+    expect(op.roots).toEqual(expect.arrayContaining([relRoot, path.join(dir, "rel-cfg.json"), path.join(dir, "rel-db", "relay.db")]));
+    expect(op.ports).toEqual(expect.arrayContaining([4011, 4012]));
   });
   it("an UNREADABLE or INVALID config is an ERROR, never 'no port'; an absent one is fine", () => {
     const home = path.join(dir, "home-2"); // its own: the case above left an instance with a port
@@ -212,11 +245,14 @@ describe.skipIf(process.platform === "win32")("NESTED: every harm is refused, ne
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, "relay.db"), "not a real db");
     fs.symlinkSync(root, path.join(work, "alias"));
+    fs.mkdirSync(path.join(root, "instances"));
+    fs.symlinkSync(path.join(root, "instances"), path.join(work, "alias-inst"));
     op = await canary();
     plain = await canary();
     result = await nestedRun(
       "harm.fixture",
-      { RELAY_HTTP_PORT: String(op.port), RELAY_HOME: root, TRIPWIRE_FIXTURE_PORT: String(op.port), TRIPWIRE_PLAIN_PORT: String(plain.port), TRIPWIRE_SYNTH_ROOT: root, TRIPWIRE_SYNTH_ALIAS: path.join(work, "alias"), TMPDIR: work },
+      // RELAY_HOME RELATIVE to the nested run's cwd (REPO): production resolves it there, and so must discovery.
+      { RELAY_HTTP_PORT: String(op.port), RELAY_HOME: path.relative(REPO, root), TRIPWIRE_SYNTH_ALIAS_INST: path.join(work, "alias-inst"), TRIPWIRE_FIXTURE_PORT: String(op.port), TRIPWIRE_PLAIN_PORT: String(plain.port), TRIPWIRE_SYNTH_ROOT: root, TRIPWIRE_SYNTH_ALIAS: path.join(work, "alias"), TMPDIR: work },
       work,
     );
   }, 120_000);
@@ -249,6 +285,9 @@ describe.skipIf(process.platform === "win32")("NESTED: every harm is refused, ne
     expect(m("HARM child-frozen")).toMatch(/fs pid=\d+ readFileSync/);
     expect(m("HARM child-home")).toMatch(/refused to spawn|names the OPERATOR's home or relay root/);
     expect(m("HARM record-lost")).toMatch(/could not record a violation/);
+    expect(m("HARM fs-dotdot-alias")).toMatch(/readFileSync .*alias-inst.*\.\./);
+    expect(m("HARM child-record-lost (sync)")).toMatch(/exited 97/);
+    expect(m("HARM child-record-lost (async)")).toMatch(/exited 97/);
   });
   it("NOTHING was delivered: the operator canary saw ZERO connections", () => {
     expect(op.hits()).toBe(0);

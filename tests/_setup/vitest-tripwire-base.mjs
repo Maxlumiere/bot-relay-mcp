@@ -85,9 +85,13 @@ function portOf(file) {
  * ACCOUNT's home (passwd / profile), never $HOME, so a run started from a sandboxed HOME still protects
  * the real one.
  */
-export function discoverOperator(env = process.env, realHome = os.userInfo().homedir) {
+export function discoverOperator(env = process.env, realHome = os.userInfo().homedir, cwd = process.cwd()) {
+  // A non-empty override is used AS GIVEN by production (resolve-instance.ts relayRootFor, config.ts
+  // getConfigPath, db.ts): a relative one resolves against the process's cwd, here the launch cwd (Codex
+  // #305 R2 NEW-2). Empty means "the default" to every consumer.
+  const given = (k) => (typeof env[k] === "string" && env[k] !== "" ? path.resolve(cwd, env[k]) : null);
   const roots = [path.join(realHome, ".bot-relay")];
-  if (env.RELAY_HOME && path.isAbsolute(env.RELAY_HOME)) roots.push(path.resolve(env.RELAY_HOME));
+  if (given("RELAY_HOME")) roots.push(given("RELAY_HOME"));
   const ports = new Set([DEFAULT_OPERATOR_PORT]);
   const configs = [];
   for (const root of roots) {
@@ -100,7 +104,7 @@ export function discoverOperator(env = process.env, realHome = os.userInfo().hom
     }
     for (const id of ids) configs.push(path.join(root, "instances", id, "config.json"));
   }
-  if (env.RELAY_CONFIG_PATH && path.isAbsolute(env.RELAY_CONFIG_PATH)) configs.push(path.resolve(env.RELAY_CONFIG_PATH));
+  if (given("RELAY_CONFIG_PATH")) configs.push(given("RELAY_CONFIG_PATH"));
   for (const f of configs) {
     const p = portOf(f);
     if (p !== null) ports.add(p);
@@ -108,7 +112,7 @@ export function discoverOperator(env = process.env, realHome = os.userInfo().hom
   const ambient = Number(env.RELAY_HTTP_PORT);
   if (Number.isInteger(ambient) && ambient > 0 && ambient < 65536) ports.add(ambient);
   // A shell-set config or DB path is the operator's too: protect it like a root.
-  for (const k of ["RELAY_CONFIG_PATH", "RELAY_DB_PATH"]) if (env[k] && path.isAbsolute(env[k])) roots.push(path.resolve(env[k]));
+  for (const k of ["RELAY_CONFIG_PATH", "RELAY_DB_PATH"]) if (given(k)) roots.push(given(k));
   return { realHome, roots, ports: [...ports] };
 }
 
@@ -137,6 +141,8 @@ export function withOperatorTripwire(config = {}) {
     ...privateHomeEnv(path.join(runDir, "home")),
     RELAY_HTTP_PORT: SAFE_PORT,
     RELAY_TEST_TRIPWIRE_RUN_DIR: runDir,
+    RELAY_TEST_LAUNCH_CWD: process.cwd(), // what a relative shell override resolves against (production semantics)
+    RELAY_TEST_RUN_NONCE: `tw${crypto.randomBytes(6).toString("hex")}`, // the live-relay guard marks a row carrying it CERTAIN
     RELAY_TEST_OPERATOR_HOME: op.realHome,
     RELAY_TEST_OPERATOR_ROOTS: JSON.stringify(op.roots),
     RELAY_TEST_OPERATOR_PORTS: op.ports.join(","),

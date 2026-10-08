@@ -19,13 +19,14 @@ import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { spawnNestedRun } from "../../_setup/operator-tripwire.js";
 
 const PORT = Number(process.env.TRIPWIRE_FIXTURE_PORT);
 const PLAIN = Number(process.env.TRIPWIRE_PLAIN_PORT);
 const ROOT = String(process.env.TRIPWIRE_SYNTH_ROOT);
 const ALIAS = String(process.env.TRIPWIRE_SYNTH_ALIAS);
+const ALIAS_INST = String(process.env.TRIPWIRE_SYNTH_ALIAS_INST); // a symlink to <root>/instances
 const swallow = async (f: () => unknown) => {
   try {
     await f();
@@ -132,4 +133,30 @@ it("HARM preload-home: a node child started PAST the spawn wrapper (raw spawn), 
   for (const k of ["RELAY_TEST_OPERATOR_HOME", "RELAY_TEST_OPERATOR_ROOTS", "RELAY_TEST_OPERATOR_PORTS", "RELAY_TEST_TRIPWIRE_DIR"]) env[k] = process.env[k];
   const r = await new Promise<number | null>((resolve) => spawnNestedRun(process.execPath, ["-e", "process.exit(0)"], { env, stdio: "ignore" }).on("close", resolve));
   expect(r).not.toBe(0);
+});
+it("HARM fs-dotdot-alias: `<link to root/instances>/../relay.db` as a RAW string (the kernel reaches the root's relay.db), swallowed", async () => {
+  await swallow(() => fs.readFileSync(`${ALIAS_INST}${path.sep}..${path.sep}relay.db`));
+});
+it("HARM child-home-dotdot: a child HOME of `<link>/..` (the root itself, as the kernel resolves it) is refused; swallowed", async () => {
+  await swallow(() => spawnSync("/bin/sh", ["-c", "true"], { env: { PATH: "/usr/bin:/bin", HOME: `${ALIAS_INST}${path.sep}..` } }));
+});
+// A preloaded child whose violation record CANNOT be written exits 97: the parent must not ignore it.
+const readRootInChild = `try { require("fs").readFileSync(${JSON.stringify(path.join(ROOT, "relay.db"))}) } catch {}`;
+it("HARM child-record-lost (sync): the violations dir is read-only, a node child reads the root and exits 97; the status is IGNORED", async () => {
+  const dir = String(process.env.RELAY_TEST_TRIPWIRE_DIR);
+  fs.chmodSync(dir, 0o500);
+  try {
+    await swallow(() => spawnSync(process.execPath, ["-e", readRootInChild], { stdio: "ignore", timeout: 15_000 }));
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
+});
+it("HARM child-record-lost (async): the same with spawn; the exit is awaited and IGNORED", async () => {
+  const dir = String(process.env.RELAY_TEST_TRIPWIRE_DIR);
+  fs.chmodSync(dir, 0o500);
+  try {
+    await swallow(() => new Promise((r) => spawn(process.execPath, ["-e", readRootInChild], { stdio: "ignore" }).on("exit", r)));
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
 });
