@@ -18,7 +18,7 @@
 
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
-import { verifyCredential, type CredentialVerdict, type StoredCredential } from "./token-verify.js";
+import { authSource, verifyCredential, type CredentialVerdict, type StoredCredential } from "./token-verify.js";
 
 // v2.6.0: exported so the CLI mint-token regression test can pin the cost
 // factor without duplicating the constant. Any future bump (e.g. 10 → 12)
@@ -195,7 +195,9 @@ export async function authenticateAgent(
   tokenOrNull: string | null,
   stored: StoredCredential | null,
   authState: AuthStateInput = "active",
-  graceInputs: RotationGraceInputs = {}
+  graceInputs: RotationGraceInputs = {},
+  /** The throttle's source (SEC-20: an HTTP route passes its trusted-proxy-aware source IP). */
+  source: string = authSource()
 ): Promise<AuthResult> {
   // Terminal state. No recovery path from here without unregister_agent.
   if (authState === "revoked") {
@@ -238,14 +240,14 @@ export async function authenticateAgent(
     }
     // New token always works during rotation_grace.
     if (stored?.hash) {
-      const v = (await verifyCredential(claimedName, stored, tokenOrNull)).verdict;
+      const v = (await verifyCredential(claimedName, stored, tokenOrNull, source)).verdict;
       if (v === "ok") return { ok: true, matched: "current" };
       const u = undecided(v);
       if (u) return u;
     }
     // Old token works ONLY while grace hasn't expired.
     if (!expired && graceInputs.previous?.hash) {
-      const v = (await verifyCredential(claimedName, graceInputs.previous, tokenOrNull)).verdict;
+      const v = (await verifyCredential(claimedName, graceInputs.previous, tokenOrNull, source)).verdict;
       // The compare is AWAITED (the pool), so the window can close while it runs: the verdict says it rests on
       // the PREVIOUS credential, and revalidate re-checks the window against the clock at the point of use
       // (one site for every await, architect b11ef8ad), never here.
@@ -286,7 +288,7 @@ export async function authenticateAgent(
       reason: `Agent "${claimedName}" requires an agent_token. Pass it as the agent_token tool input field or via the X-Agent-Token HTTP header.`,
     };
   }
-  const v = (await verifyCredential(claimedName, stored, tokenOrNull)).verdict;
+  const v = (await verifyCredential(claimedName, stored, tokenOrNull, source)).verdict;
   if (v === "ok") return { ok: true, matched: "current" };
   return undecided(v) ?? { ok: false, reason: `Invalid token for agent "${claimedName}".` };
 }

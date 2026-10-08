@@ -118,11 +118,30 @@ export async function run(argv: string[]): Promise<number> {
       const { defaultTokenStore } = await import("../token-store.js");
       const vaultToken = await defaultTokenStore().read(agent);
       const authData = getAgentAuthData(agent);
+      // SEC-20 (Codex #315 R1 P3): the row's STATE first. A revoke scrubs the vault, so checking the vault first
+      // told a revoked agent "mismatched, use --force".
+      const { revokedStateOf } = await import("../auth-verdict.js");
+      const revoked = revokedStateOf(authData);
+      if (revoked) {
+        process.stderr.write(
+          `relay resolve: agent "${agent}" is ${revoked === "recovery_pending" ? "awaiting recovery" : "revoked"}: its token authorizes nothing (AUTH_FAILED).\n` +
+            `  • Re-register with its recovery token, or reset the identity: relay recover ${agent}\n`
+        );
+        return 2;
+      }
       if (authData && authData.token_hash) {
-        // PR-B: the shared verifier (a known digest decides a mismatch with no bcrypt; bcrypt in the pool).
-        const { verifyCredential } = await import("../token-verify.js");
-        if (vaultToken && (await verifyCredential(agent, { hash: authData.token_hash, lookup: authData.token_lookup }, vaultToken)).verdict === "ok") {
+        // SEC-20: the one authorizer (state, then hash, then revalidate), never the hash alone: a revoked
+        // row keeps its hash, so its vault token still matches.
+        const { authorizeAgentToken } = await import("../authorize-token.js");
+        const a = vaultToken ? await authorizeAgentToken(agent, vaultToken) : null;
+        if (a?.ok) {
           token = vaultToken;
+        } else if (a && (a.refusal === "revoked" || a.refusal === "recovery_pending")) {
+          process.stderr.write(
+            `relay resolve: agent "${agent}" is ${a.refusal === "recovery_pending" ? "awaiting recovery" : "revoked"}: its token authorizes nothing (AUTH_FAILED).\n` +
+              `  • Re-register with its recovery token, or reset the identity: relay recover ${agent}\n`
+          );
+          return 2;
         } else {
           process.stderr.write(
             `relay resolve: the vault token for "${agent}" does not authenticate against the DB ` +

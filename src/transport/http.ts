@@ -19,7 +19,8 @@ import {
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
 import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
-import { verifyCredential } from "../token-verify.js";
+import { authorizeAgentToken } from "../authorize-token.js";
+import { revalidate } from "../auth-verdict.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "./websocket.js";
@@ -1143,18 +1144,20 @@ export function startHttpServer(port: number, host: string): Server {
         });
         return;
       }
-      // PR-B: decided by the shared verifier (a known digest decides a wrong token with no bcrypt;
-      // bcrypt only in the worker pool). A refusal that did not decide the token is a 429, never 403.
-      const fromVerdict = (await verifyCredential(fromRow.name, { hash: fromRow.token_hash, lookup: fromRow.token_lookup }, fromAgentToken, extractSourceIp(req, config.trusted_proxies) ?? "http")).verdict;
-      if (fromVerdict === "throttled" || fromVerdict === "busy") {
+      // SEC-20: the ONE authorizer (src/authorize-token.ts): the row's STATE decides first (a revoke keeps
+      // the token hash, so a hash check alone let a revoked agent send), then the hash (PR-B: a known digest
+      // decides a wrong token with no bcrypt; bcrypt only in the worker pool). A refusal that did not decide
+      // the token is a 429, never 403.
+      const fromAuth = await authorizeAgentToken(fromRow.name, fromAgentToken, extractSourceIp(req, config.trusted_proxies) ?? "http");
+      if (!fromAuth.ok && (fromAuth.refusal === "throttled" || fromAuth.refusal === "busy")) {
         res.status(429).json({
           success: false,
-          error: fromVerdict === "throttled" ? "Too many failed token attempts from this source: wait and retry." : "The relay is busy verifying credentials: retry.",
+          error: fromAuth.refusal === "throttled" ? "Too many failed token attempts from this source: wait and retry." : "The relay is busy verifying credentials: retry.",
           error_code: "RATE_LIMITED",
         });
         return;
       }
-      if (fromVerdict !== "ok") {
+      if (!fromAuth.ok) {
         logDashboardAudit(
           req,
           "send_message",
@@ -1168,12 +1171,15 @@ export function startHttpServer(port: number, host: string): Server {
           // audit caught the dual-channel inconsistency.
           `from=${parsed.data.from} to=${parsed.data.to} from_authenticated=false`,
           false,
-          "from_agent_token verification failed",
-          { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED" }
+          `from_agent_token verification failed (${fromAuth.refusal})`,
+          { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED", refusal: fromAuth.refusal }
         );
         res.status(403).json({
           success: false,
-          error: `from_agent_token does not match the stored token for "${parsed.data.from}".`,
+          error:
+            fromAuth.refusal === "revoked" || fromAuth.refusal === "recovery_pending"
+              ? `Agent "${parsed.data.from}" can no longer send: its token was revoked (${fromAuth.refusal}).`
+              : `from_agent_token does not match the stored token for "${parsed.data.from}".`,
           error_code: "AUTH_FAILED",
         });
         return;
@@ -1186,11 +1192,28 @@ export function startHttpServer(port: number, host: string): Server {
         });
         return;
       }
+      // SEC-20 + PR-B: the point of use. Re-derived synchronously from the FRESH row, with NO await between this
+      // and the send below (an await separated the authorizer's own check from here).
+      const stillFrom = revalidate(getDb(), fromAuth.verdict, Date.now());
+      if (!stillFrom.ok) {
+        // Codex #315 R1 P3: audited like every other from-token refusal (no credential in the row).
+        logDashboardAudit(
+          req,
+          "send_message",
+          parsed.data.from,
+          `from=${parsed.data.from} to=${parsed.data.to} from_authenticated=false`,
+          false,
+          `from_agent_token no longer authorizes at the point of use: ${stillFrom.reason}`,
+          { from_agent: parsed.data.from, to_agent: parsed.data.to, from_authenticated: false, error_code: "AUTH_FAILED", refusal: "revalidate" }
+        );
+        res.status(403).json({ success: false, error: stillFrom.reason, error_code: "AUTH_FAILED" });
+        return;
+      }
       fromAuthenticated = true;
       // ADR-0005 (codex #115): a verified from_agent_token IS a successful token
       // verification — stamp first_authed_at so this agent (incl. `relay send`
       // callers, which POST here) can never be reaped by the orphan-GC.
-      markAgentAuthenticated(parsed.data.from, { basis: "current", hash: fromRow.token_hash });
+      markAgentAuthenticated(parsed.data.from, { basis: fromAuth.verdict.basis, hash: fromAuth.verdict.hash });
     } else if (fromAgentToken) {
       // No registered row OR row has no token_hash, but caller supplied
       // a token anyway. Pre-v2.7.1 this returned 403 with a confusing

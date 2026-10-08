@@ -30,14 +30,17 @@
  * Explicit rotation stays available via `mint-token --force` for the genuine
  * "I want a new token" case (it writes the vault too).
  */
-import { verifyCredential } from "./token-verify.js";
+import { authorizeAgentToken } from "./authorize-token.js";
+import { revokedStateOf } from "./auth-verdict.js";
 import { mintAgentToken, getAgentAuthData } from "./db.js";
 import { defaultTokenStore } from "./token-store.js";
 
 export type MintReuseResult =
   | { status: "created"; token: string }
   | { status: "reused"; token: string }
-  | { status: "mismatch" };
+  | { status: "mismatch" }
+  /** SEC-20: the row is revoked (or awaiting recovery): its token, even a matching one, is never reused. */
+  | { status: "revoked"; state: "revoked" | "recovery_pending" };
 
 /**
  * Default (non-force) mint: create-and-vault, reuse-if-authenticating, or
@@ -51,6 +54,10 @@ export async function stableMintOrReuse(
   opts: { description?: string | null } = {},
 ): Promise<MintReuseResult> {
   const existing = getAgentAuthData(name);
+  // SEC-20 (Codex #315 R1 P3): the row's STATE first, before any token or hash branch: a revoked row (a legacy
+  // one included) is reported revoked, never minted over or thrown on.
+  const revoked = revokedStateOf(existing);
+  if (revoked) return { status: "revoked", state: revoked };
   if (!existing || !existing.token_hash) {
     // Genuinely absent identity → mint + write the vault atomically-enough
     // (DB row first, then the vault so a live agent's next hook run + Tether
@@ -59,11 +66,13 @@ export async function stableMintOrReuse(
     await defaultTokenStore().write(name, minted.plaintext_token);
     return { status: "created", token: minted.plaintext_token };
   }
-  // Row exists — reuse ONLY if the on-disk vault token authenticates against
-  // the stored bcrypt hash.
+  // Row exists — reuse ONLY if the on-disk vault token is AUTHORIZED for it (the one authorizer: state,
+  // then hash, then revalidate), never on a hash match alone.
   const vaultToken = await defaultTokenStore().read(name);
-  if (vaultToken && (await verifyCredential(name, { hash: existing.token_hash, lookup: existing.token_lookup }, vaultToken)).verdict === "ok") {
-    return { status: "reused", token: vaultToken };
+  if (vaultToken) {
+    const a = await authorizeAgentToken(name, vaultToken);
+    if (a.ok) return { status: "reused", token: vaultToken };
+    if (a.refusal === "revoked" || a.refusal === "recovery_pending") return { status: "revoked", state: a.refusal };
   }
   // Row present but the vault can't prove it — refuse to silently rotate.
   return { status: "mismatch" };

@@ -43,6 +43,7 @@ import { VALID_TRANSITIONS, ACTION_TO_STATUS, AGENT_NAME_PATTERN } from "./types
 import { generateToken, hashToken } from "./auth.js";
 import { registerPersistedSecret } from "./secret-registry.js";
 import type { AuthStateInput } from "./auth.js";
+import { revokedStateOf } from "./auth-verdict.js";
 import { computeTokenLookup, digestVerdict, lookupKeys, tokenLookupCandidates, KEY_ID_SEPARATOR, unreachableLookupRanges } from "./token-lookup.js";
 import { authSource, verifyCredential, verifySecretHash } from "./token-verify.js";
 import { scanRefund, scanTake } from "./auth-throttle.js";
@@ -4636,7 +4637,9 @@ export function expandAgentCapabilities(
  *     (previous_token_hash / rotation_grace_expires_at /
  *     recovery_token_hash / revoked_at) are zeroed because mint-token is
  *     defined as a clean reset, not a graceful rotation: any in-flight
- *     state on the auth machine is invalidated.
+ *     state on the auth machine is invalidated. SEC-20.T2: a REVOKED or
+ *     recovery_pending row is REFUSED (RevokedAgentMintError): --force never
+ *     undoes a revoke; `relay recover` does, audited.
  *
  *   - Existing row WITHOUT --force: throws so the caller can surface the
  *     destructive nature of the operation. The CLI maps this to a clean
@@ -4649,6 +4652,31 @@ export function expandAgentCapabilities(
  * the whole point: it sidesteps the LLM-client safety monitors that
  * pattern-match register-then-use sequences as credential handoff.
  */
+let onMintBeforeWrite: (() => void) | null = null;
+/**
+ * TEST SEAM (Codex #315 R2 N1): run `hook` once in the next force-mint, AFTER it read the row and BEFORE its write:
+ * the point where another process's revoke can commit. One-shot.
+ */
+export function _onMintBeforeWriteForTests(hook: (() => void) | null): void {
+  onMintBeforeWrite = hook;
+}
+
+/** SEC-20.T2: `relay mint-token --force` refuses a revoked (or recovery_pending) identity. */
+export class RevokedAgentMintError extends Error {
+  readonly code = "AGENT_REVOKED";
+  constructor(
+    readonly agent: string,
+    readonly state: "revoked" | "recovery_pending",
+  ) {
+    super(
+      `Agent "${agent}" is ${state === "recovery_pending" ? "awaiting recovery (revoked with a recovery token)" : "revoked"}: ` +
+        `--force will not bring it back. Reset it with \`relay recover ${agent}\` (audited), then register again` +
+        (state === "recovery_pending" ? `, or re-register with the recovery token the revoker was given.` : "."),
+    );
+    this.name = "RevokedAgentMintError";
+  }
+}
+
 export function mintAgentToken(
   name: string,
   role: string,
@@ -4694,12 +4722,22 @@ export function mintAgentToken(
         `Agent "${name}" already exists. Pass --force to mint a new token (rotates + invalidates the existing token, clears session, sets status=offline).`
       );
     }
+    // SEC-20.T2: a revocation must HOLD. --force is a clean reset of an ACTIVE identity, never a way back from a
+    // revoke (an agent that hits AUTH_FAILED and "fixes" it with mint-token --force would silently undo it). The
+    // audited way back is `relay recover` (or, for recovery_pending, register_agent with its recovery token).
+    const revoked = revokedStateOf(existing);
+    if (revoked) throw new RevokedAgentMintError(name, revoked);
     // Force-rotate: token-only. Caps + role preserved (immutability + safety).
     // Description is preserved when not supplied; if explicitly supplied (even
     // null) the caller is updating it. CLI doesn't expose --description on the
     // rotate path in v2.6.0 to keep the surface tight; future-add via this hook.
     const newDescription =
       options.description !== undefined ? options.description : existing.description ?? null;
+    if (onMintBeforeWrite) {
+      const hook = onMintBeforeWrite;
+      onMintBeforeWrite = null;
+      hook();
+    }
     const tx = db.transaction(() => {
       const r = db.prepare(
         "UPDATE agents SET last_seen = ?, token_hash = ?, token_lookup = ?, session_id = NULL, " +
@@ -4707,11 +4745,18 @@ export function mintAgentToken(
           "previous_token_hash = NULL, previous_token_lookup = NULL, rotation_grace_expires_at = NULL, " +
           "recovery_token_hash = NULL, revoked_at = NULL, " +
           "description = ? " +
-          "WHERE name = ?"
-      ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name);
+          // SEC-20.T2 (Codex #315 R2 N1): a compare-and-set on what was READ. A revoke committed by another
+          // process between the read above and this write must never be overwritten to 'active': the row must
+          // still be in an eligible state, unrevoked, with the token hash that was read.
+          "WHERE name = ? AND auth_state IN ('active', 'rotation_grace', 'legacy_bootstrap') AND revoked_at IS NULL AND token_hash IS ?"
+      ).run(timestamp, token_hash, computeTokenLookup(plaintext_token), newDescription, name, existing.token_hash ?? null);
       if (r.changes !== 1) {
+        // The row changed under us: report a revoke as a revoke, anything else as a concurrent change.
+        const now = db.prepare("SELECT auth_state, revoked_at FROM agents WHERE name = ?").get(name) as Pick<AgentRecord, "auth_state" | "revoked_at"> | undefined;
+        const revokedNow = revokedStateOf(now);
+        if (revokedNow) throw new RevokedAgentMintError(name, revokedNow);
         throw new Error(
-          `mintAgentToken UPDATE failed for "${name}": no rows affected (concurrent unregister?).`
+          `mintAgentToken UPDATE failed for "${name}": the row changed while the new token was minted (a concurrent rotate, unregister or re-register): nothing was written; retry.`
         );
       }
     });

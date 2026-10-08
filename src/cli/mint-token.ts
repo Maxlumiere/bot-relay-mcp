@@ -261,6 +261,28 @@ export async function run(argv: string[]): Promise<number> {
       created = f.created;
     } else {
       const r = await stableMintOrReuse(args.name, args.role, args.capabilities, { description: args.description });
+      if (r.status === "revoked") {
+        // SEC-20: a revoked identity's token is never handed back as usable.
+        process.stderr.write(
+          `relay mint-token: agent "${args.name}" is ${r.state === "recovery_pending" ? "awaiting recovery (revoked with a recovery token)" : "revoked"}: ` +
+            `its token cannot be reused.\n` +
+            `  • Re-register with the recovery token the revoker was given, or reset the identity: relay recover ${args.name}\n`
+        );
+        try {
+          logAudit(
+            args.name,
+            "agent.token_minted",
+            `operator=${operator} target=${args.name} force=false success=false reason=${r.state}`,
+            false,
+            `the agent is ${r.state}`,
+            "cli",
+            { operator, target: args.name, force: false, success: false, reason: r.state }
+          );
+        } catch {
+          /* best-effort */
+        }
+        return 2;
+      }
       if (r.status === "mismatch") {
         // Do NOT rotate silently. Surface the state (no token logged).
         process.stderr.write(

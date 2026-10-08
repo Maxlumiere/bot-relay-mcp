@@ -50,6 +50,17 @@ export type AuthVerdict =
         | "legacy-grace";
     };
 
+/**
+ * SEC-20: is this row revoked (terminal) or awaiting recovery? ONE predicate for every consumer that must report
+ * a revoke instead of acting (mint-token, mint-reuse, relay send / resolve), whatever the vault or the hash says.
+ */
+export function revokedStateOf(row: Pick<AgentRecord, "auth_state" | "revoked_at"> | null | undefined): "revoked" | "recovery_pending" | null {
+  if (!row) return null;
+  if (row.auth_state === "recovery_pending") return "recovery_pending";
+  if (row.revoked_at || row.auth_state === "revoked") return "revoked";
+  return null;
+}
+
 export type Revalidation = { ok: true } | { ok: false; reason: string; code: "AUTH_FAILED" | "CAP_DENIED" };
 
 /**
