@@ -19,6 +19,7 @@ import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
+import { startToken } from "./helpers/start-token.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
@@ -42,7 +43,7 @@ afterAll(async () => {
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 const bindWindow = (agent: string, pid: number) =>
-  db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: pid, windowPidStart: processStartedAt(pid) as string, agentName: agent, agentClass: null, conversationId: `conv-${pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
+  db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: pid, windowPidStart: startToken(pid), agentName: agent, agentClass: null, conversationId: `conv-${pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
 const recs = () => (fs.existsSync(LOGP) ? fs.readFileSync(LOGP, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
 const intents = () => recs().filter((r) => r.type === "intent").length;
 const boards = () => recs().filter((r) => r.type === "board").map((r) => [r.case, r.state, r.why ?? null]);
@@ -146,13 +147,113 @@ describe.skipIf(!OWN)("PR 7: the doorbell supervises the watch (the real job, a 
     expect(intents()).toBe(0);
   }, 60_000);
 
+  // --- INV-LIVE-01 (Codex R1 P3 on #324): the REAL supervisor conversion and the REAL cycle-to-cycle carry.
+  // Only the window-start READER is seamed (DoorbellOptions.processStart); superviseWatch's mapping,
+  // planCycle and the job's counter carry between cycles are the production code.
+  const K = C.CANNOT_OBSERVE_AFTER_TICKS;
+  const unreadable = (): import("../src/liveness.js").ProcessStart => ({ kind: "unreadable", why: "the test's seam" });
+  /** ONE job lifetime of n+1 cycles (1 s apart), `startOf(cycle)` choosing each cycle's reader; the board before each cycle. */
+  async function loop(lastCycle: number, startOf: (cycle: number) => (pid: number) => import("../src/liveness.js").ProcessStart, extra: Partial<import("../src/doorbell-run.js").DoorbellOptions> = {}): Promise<unknown[][][]> {
+    const before: unknown[][][] = [];
+    let cur = startOf(0);
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      mono += 120_000;
+      const c = { wall: Date.now(), mono, wallMs: () => c.wall, monoMs: () => c.mono };
+      const code = await R.runDoorbell(["--interval-ms", "1000", "--window-s", "10", "--horizon-s", "60"], {
+        clock: c,
+        processStart: (pid) => cur(pid),
+        beforeCycle: (n) => {
+          before[n] = boards();
+          cur = startOf(n);
+          if (n === lastCycle + 1) process.emit("SIGTERM");
+        },
+        ...extra,
+      });
+      expect(code).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    return before;
+  }
+
+  it("HARM (INV-LIVE-01, Codex R1 P3): a LIVE watch whose window start is UNREADABLE: held for K-1 cycles, cannot_observe(watch) at the K-th (never no_driver), and it CLOSES once readable", async () => {
+    db.sendMessage("s7-sender", "s7-alice", "x", "normal");
+    expect(await within(startWatch("s7-alice").exited, 20_000)).toBe(0); // woken for it
+    startWatch("s7-alice");
+    await untilLive("s7-alice");
+    // cycles 0..K-1 unreadable (K cycles), cycle K readable: the live watch is seen again
+    const before = await loop(K, (n) => (n < K ? unreadable : (pid) => processStartedAt(pid)));
+    for (let n = 1; n < K; n++) expect(before[n], `after ${n} unknown cycle(s): HELD`).toEqual([]);
+    expect(before[K], `after ${K} unknown cycles`).toEqual([["cannot_observe", "open", "watch"]]);
+    expect(boards().slice(0, 2)).toEqual([
+      ["cannot_observe", "open", "watch"],
+      ["cannot_observe", "closed", "watch"],
+    ]);
+    expect(boards().some((b) => b[0] === "no_driver")).toBe(false);
+    expect(intents()).toBe(0);
+  }, 90_000);
+
+  it("HARM (INV-LIVE-01 control, Codex R1 P3): with an ELIGIBLE actuator, an UNKNOWN watch forms NO intent; the same agent with the start readable (no watch: absent) IS intended", async () => {
+    db.sendMessage("s7-sender", "s7-alice", "x", "normal");
+    await loop(1, () => unreadable, { actuator: { fits: () => true } });
+    expect(intents()).toBe(0);
+    expect(boards()).toEqual([]); // below K: held
+    await loop(0, () => (pid) => processStartedAt(pid), { actuator: { fits: () => true } });
+    expect(intents()).toBe(1); // the control: absent + an actuator that fits → an intent
+  }, 60_000);
+
+  it("BOUNDEDNESS (ruling a98ec836): no live watch BECAUSE the window's watch went dormant BLIND to it → cannot_observe(anchor) at once, never no_driver; relay doctor names it; its record gone → no_driver", async () => {
+    db.sendMessage("s7-sender", "s7-alice", "x", "normal");
+    const dir = W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start: startToken(win.pid) });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = W.writeDormant(dir, { pid: process.pid, proc_start: startToken(process.pid), reason: `${W.ANCHOR_UNOBSERVED_PREFIX} its window (pid ${win.pid}) could not be observed for 4 checks in a row (the bound)`, at: new Date().toISOString() });
+    expect(await lifetime(Date.now())).toBe(0);
+    expect(boards()).toEqual([["cannot_observe", "open", "anchor"]]);
+    const { checkBlindWatches } = await import("../src/cli/doctor.js");
+    const doc = await checkBlindWatches(DB);
+    expect(doc.status).toBe("WARN");
+    expect(doc.detail).toContain(`s7-alice (watch pid ${process.pid}, since `);
+    fs.rmSync(file);
+    expect(await lifetime(Date.now())).toBe(0);
+    expect(boards()).toEqual([
+      ["cannot_observe", "open", "anchor"],
+      ["cannot_observe", "closed", "anchor"],
+      ["no_driver", "open", "watch_absent"],
+    ]);
+    expect((await checkBlindWatches(DB)).status).toBe("PASS");
+  }, 60_000);
+
+  it("HARM (Codex R2 N2): the window's start STAYS unreadable to the supervisor, and the window's watch went dormant BLIND → cannot_observe(anchor) at once, found through the record's CAPTURED anchor (never cannot_observe(watch), never re-anchored)", async () => {
+    db.sendMessage("s7-sender", "s7-alice", "x", "normal");
+    const start = startToken(win.pid);
+    const blind = (dir: string, anchorStart: string) => {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      W.writeDormant(dir, {
+        pid: process.pid,
+        proc_start: startToken(process.pid),
+        reason: `${W.ANCHOR_UNOBSERVED_PREFIX} its window (pid ${win.pid}, start ${anchorStart}) could not be observed for 3 s of awake time in a row (the bound): it is not judged gone and is never re-anchored; dormant because: it stopped watching at the bound`,
+        at: new Date().toISOString(),
+        anchor: { pid: win.pid, start: anchorStart },
+      } as never);
+    };
+    // the control first: a blind record for ANOTHER anchor (the same pid, another start) is not this window's
+    const otherStart = "Mon Jan  5 00:00:00 2026 UTC";
+    blind(W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start: otherStart }), otherStart);
+    await loop(0, () => unreadable);
+    expect(boards()).toEqual([]); // unknown, below K: held
+    blind(W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start }), start);
+    await loop(0, () => unreadable);
+    expect(boards()).toEqual([["cannot_observe", "open", "anchor"]]);
+  }, 60_000);
+
   it.skipIf(W.awakeNowMs() === null)("a HUNG watch (lock held, its own heartbeat older than the stale bound on the AWAKE clock) → no_driver(watch_stale)", async () => {
     db.sendMessage("s7-sender", "s7-alice", "x", "normal");
     expect(await within(startWatch("s7-alice").exited, 20_000)).toBe(0);
     startWatch("s7-alice");
     await untilLive("s7-alice");
     // Staleness is AWAKE time (Codex R2 (c)): moving the job's wall clock proves nothing; age the holder's own stamp.
-    const dir = W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start: processStartedAt(win.pid) as string });
+    const dir = W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start: startToken(win.pid) });
     const h = JSON.parse(fs.readFileSync(path.join(dir, W.watchHolderFile(0)), "utf-8"));
     W.writeHeartbeat(dir, { pid: h.pid, gen: 0, at: new Date().toISOString(), awake_ms: (W.awakeNowMs() as number) - W.HEARTBEAT_STALE_MS - 60_000 });
     expect(await lifetime(Date.now())).toBe(0);

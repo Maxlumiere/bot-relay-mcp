@@ -63,6 +63,7 @@ function snap(over: Partial<FleetSnapshot> = {}): FleetSnapshot {
     processes: [p(10, 1, "claude", "claude", 1), p(11, 10, `node ${SCRIPT}`, "node", 2), p(99, 1, `node ${SCRIPT}`, "node", 9)],
     listeners: [99],
     rows: [row(11, 2)],
+    unknownRows: [],
     bindings: [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
     daemon: { port: 3777, listenerPids: [99], health: { ok: true, build: build() }, mint: "secret" },
     installed: () => installed(),
@@ -249,9 +250,13 @@ describe("the Codex shape, REAL processes: an UNBOUND connector through a SYMLIN
       },
     };
     const observe = () =>
-      V.observeFleet(sys, { liveRows: (startOf) => dbm.liveConnectors({ startOf }), liveBindings: () => [] }, port);
+      V.observeFleet(sys, { connectorRows: (startOf) => dbm.observeConnectors({ startOf }), liveBindings: () => [] }, port);
     for (let t0 = Date.now(); Date.now() - t0 < 15_000; ) {
-      if (dbm.liveConnectors({ startOf: (pid) => realSystemDeps.processTable().get(pid)?.startedAt ?? null }).some((r) => r.pid === connector.pid)) break;
+      const seen = (pid: number): import("../src/liveness.js").ProcessStart => {
+        const e = realSystemDeps.processTable().get(pid);
+        return e ? { kind: "start", start: e.startedAt } : { kind: "gone" };
+      };
+      if (dbm.observeConnectors({ startOf: seen }).live.some((r) => r.pid === connector.pid)) break;
       await new Promise((r) => setTimeout(r, 100));
     }
 
@@ -300,5 +305,47 @@ describe("PR-D (architect fd2f6b9f Q-B): the deploy check's MINT line", () => {
   it("mint changing between the two observations → CANNOT-VERIFY (3), never a PASS on a half-read", async () => {
     const o = await check(withMint("open-dev"), withMint("secret"));
     expect([o.outcome, o.exit]).toEqual(["CANNOT-VERIFY", 3]);
+  });
+});
+
+// Codex R2 N3 (INV-LIVE-01): a process-table row whose start is malformed is dropped by the parser. Dropped
+// SILENTLY, an UNRECORDED connector (no connectors row to rescue it) vanished from the board and the
+// deploy check could PASS on an incomplete snapshot.
+describe("Codex R2 N3: a malformed process row never vanishes into a PASS", () => {
+  const raw = (n: number) => START(n).replace(/ UTC$/, "");
+  const world = (extraMalformed: boolean) => {
+    const rows = [`   10     1 ${raw(1)} claude`, `   11    10 ${raw(2)} node ${SCRIPT}`, `   99     1 ${raw(9)} node ${SCRIPT}`, ...(extraMalformed ? [`   12    10 - - - - - node ${SCRIPT}`] : [])].join("\n");
+    const comms = ["   10 claude", "   11 node", "   99 node", ...(extraMalformed ? ["   12 node"] : [])].join("\n");
+    return { rows, comms };
+  };
+  const observeWith = async (extraMalformed: boolean) => {
+    const { buildProcessTable } = await import("../src/liveness.js");
+    const w = world(extraMalformed);
+    const sys = {
+      processTable: () => buildProcessTable((_cmd: string, args: string[]) => (args.includes("pid=,comm=") ? w.comms : w.rows)),
+      cwds: () => new Map<number, string>(),
+      exactArgv: () => null,
+      allListeners: () => [99],
+      portListeners: () => [99],
+      health: async () => ({ ok: true as const, body: { build: build(), mint: "secret" } }),
+      nodeOnPath: () => "v22.0.0",
+      installed: () => installed(),
+      pidState: () => "alive" as const,
+    };
+    const dbReads = {
+      connectorRows: () => ({ live: [row(11, 2)], unknown: [] }),
+      liveRows: () => [row(11, 2)], // the pre-R1 name, so the same test runs on the old code
+      liveBindings: () => [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
+    };
+    return () => V.observeFleet(sys as never, dbReads as never, 3777);
+  };
+  it("the control: the same world WITHOUT the malformed row → PASS (0)", async () => {
+    const o = await V.deployCheck(await observeWith(false), { judge });
+    expect([o.outcome, o.exit], o.reason).toEqual(["PASS", 0]);
+  });
+  it("HARM: ps → buildProcessTable → observeFleet → deployCheck with an extra MALFORMED, UNRECORDED connector row → CANNOT-VERIFY (3), never PASS", async () => {
+    const o = await V.deployCheck(await observeWith(true), { judge });
+    expect([o.outcome, o.exit], o.reason).toEqual(["CANNOT-VERIFY", 3]);
+    expect(o.reason).toMatch(/process table/);
   });
 });

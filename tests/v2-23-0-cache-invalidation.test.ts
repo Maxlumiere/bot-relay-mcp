@@ -35,6 +35,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { _resetOwnHostIdForTests, processStartedAt } from "../src/liveness.js";
+import { startToken } from "./helpers/start-token.js";
 
 const TEST_ROOT = path.join(os.tmpdir(), "bot-relay-cacheinval-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_ROOT, "relay.db");
@@ -44,7 +45,7 @@ delete process.env.RELAY_AGENT_TOKEN;
 const OWN = "cacheinval-own-host-guid";
 const LIVE_PID = process.pid; // this vitest process — genuinely alive
 const DEAD_PID = 2_147_483_646; // far above any real pid — genuinely dead
-const LIVE_START = processStartedAt(LIVE_PID);
+const LIVE_START = startToken(LIVE_PID);
 const S_OLD = "sess-OLD-dead";
 const S_NEW = "sess-NEW-live";
 

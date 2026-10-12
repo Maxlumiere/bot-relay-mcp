@@ -23,6 +23,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { startToken } from "./helpers/start-token.js";
 
 const DIR = path.join(os.tmpdir(), "bot-relay-adr0042-r1-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(DIR, "relay.db");
@@ -58,7 +59,7 @@ function sessionNow(): string | null {
   return db.getAgentSessionId(NAME);
 }
 
-const LIVE = () => ({ pid: process.pid, start: processStartedAt(process.pid) ?? "" });
+const LIVE = () => ({ pid: process.pid, start: startToken(process.pid) });
 
 describe("ADR-0042 R1 — ending requires MY anchor on the row, and that anchor dead", () => {
   it("PRECONDITION: this host has an id and our own start time is readable (else every case is vacuous)", () => {

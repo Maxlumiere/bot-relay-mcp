@@ -522,8 +522,9 @@ fi
 # has NO live watch on its one live window (gone: absent; hung: stale), is told
 # ONCE PER SESSION to re-arm it, until a live watch is seen again (which resets
 # the once). Positive evidence only: the local read succeeded AND it carried
-# `watch`; `never` (it never armed one) and `no_window` (no single live window)
-# never heal. The once is the session id, kept in the AGENT's watch dir inside
+# `watch`; `never` (it never armed one), `no_window` (no single live window) and
+# `unknown` (the window's start cannot be read now: unknown is not absent) never
+# heal. The once is the session id, kept in the AGENT's watch dir inside
 # the resolved instance (Codex R1 #4: never under the shared $HOME). It is read
 # no-follow and replaced by renameat(2), which replaces a planted link instead
 # of following it; EVERY directory component below the instance is opened
@@ -543,7 +544,7 @@ try:
 except Exception:
     w = None
 if w not in ("live", "stale", "absent"):
-    sys.exit(0)  # never / no_window / missing: no heal
+    sys.exit(0)  # never / no_window / unknown / missing: no heal
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 DIRFLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | NOFOLLOW
 # EVERY component below the instance dir is opened no-follow, and every operation is relative to the

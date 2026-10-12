@@ -22,6 +22,7 @@ import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
+import { startToken } from "./helpers/start-token.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = path.join(REPO, "hooks", "stop-check.sh");
@@ -76,7 +77,7 @@ describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)",
     db.registerAgent("h-bob", "r", []);
     win = openWindow(path.join(ROOT, `win-${Date.now()}`), env());
     windows.push(win);
-    db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: win.pid, windowPidStart: processStartedAt(win.pid) as string, agentName: "h-bob", agentClass: null, conversationId: `conv-${win.pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
+    db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: win.pid, windowPidStart: startToken(win.pid), agentName: "h-bob", agentClass: null, conversationId: `conv-${win.pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
   });
 
   it("an agent that NEVER armed a watch is untouched: no block, empty stdout (the pre-PR 7 behaviour)", () => {
@@ -122,7 +123,7 @@ describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)",
     startWatch();
     await untilLive();
     // Age the CURRENT holder: its own heartbeat, stamped past the stale bound on the AWAKE clock.
-    const dir = W.watchWindowDir(DB, "h-bob", { pid: win.pid, start: processStartedAt(win.pid) as string });
+    const dir = W.watchWindowDir(DB, "h-bob", { pid: win.pid, start: startToken(win.pid) });
     const h = JSON.parse(fs.readFileSync(path.join(dir, W.watchHolderFile(0)), "utf-8"));
     W.writeHeartbeat(dir, { pid: h.pid, gen: 0, at: new Date().toISOString(), awake_ms: (W.awakeNowMs() as number) - W.HEARTBEAT_STALE_MS - 60_000 });
     expect(stop(natural()).block?.reason).toMatch(/^\[RELAY\] Your relay watch is hung \(it stopped checking\)/);

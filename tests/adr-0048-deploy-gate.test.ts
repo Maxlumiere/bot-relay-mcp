@@ -95,6 +95,7 @@ function deps(o: {
   open?: string[];
   openSeq?: string[][];
   openRaw?: OpenFile[];
+  /** Each processStart read in turn: a token, null = unreadable (ps failed), "GONE" = the kernel says no such process. */
   startSeq?: Array<string | null>;
   platform?: NodeJS.Platform;
   procEnviron?: string;
@@ -115,7 +116,10 @@ function deps(o: {
     plutilEnv: () => ({ ok: true, json: typeof o.plistEnv === "string" ? o.plistEnv : JSON.stringify(o.plistEnv ?? o.env) }),
     listenerPids: () => ({ ok: true, pids: listeners() }),
     openFiles: () => ({ ok: true, files: o.openRaw ?? open().map(openFile) }),
-    processStart: () => start(),
+    processStart: () => {
+      const s = start();
+      return s === null ? { kind: "unreadable" as const, why: "ps timed out" } : s === "GONE" ? { kind: "gone" as const } : { kind: "start" as const, start: s };
+    },
     procEnviron: () => (o.procEnviron === undefined ? { ok: false, error: "no /proc" } : { ok: true, raw: Buffer.from(o.procEnviron) }),
     dsHome: () => o.dsHome ?? H,
     runWhere: (env: Env) => {
@@ -339,7 +343,23 @@ describe("Codex #287 R2 — D-B: the snapshot is ONE process incarnation, re-val
   it("same pid, different START TIME (a reused pid) → CANNOT-VERIFY", () => {
     const g = gate(deps({ env, startSeq: ["Mon Sep 28 10:00:00 2026", "Mon Sep 28 10:05:00 2026"], open: [dbA()] }));
     expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
-    expect(g.reason).toMatch(/start time/);
+    expect(g.reason).toBe(`the daemon changed during the gate (pid ${PID} has a different start time (a new process)): run the gate again`);
+  });
+  // INV-LIVE-01 (ruling 476e65f1, caller table rows 17-18): unreadable is not "a new process", and gone is said as gone.
+  it("HARM: the re-validation cannot READ the start time → CANNOT-VERIFY with that reason, never 'a new process'", () => {
+    const g = gate(deps({ env, startSeq: ["Mon Sep 28 10:00:00 2026", null], open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toBe(`the daemon changed during the gate (cannot read the start time of pid ${PID} (ps timed out)): run the gate again`);
+  });
+  it("the job's process is GONE at the re-validation (ESRCH) → CANNOT-VERIFY, said as gone", () => {
+    const g = gate(deps({ env, startSeq: ["Mon Sep 28 10:00:00 2026", "GONE"], open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toBe(`the daemon changed during the gate (pid ${PID} is gone): run the gate again`);
+  });
+  it("the job's process is GONE at the first read → CANNOT-VERIFY, said as gone (not 'cannot read')", () => {
+    const g = gate(deps({ env, startSeq: ["GONE"], open: [dbA()] }));
+    expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toBe(`pid ${PID} is gone (the job's process ended): the snapshot cannot be bound to one process`);
   });
   it("the listener moves to another pid before PASS → CANNOT-VERIFY", () => {
     const g = gate(deps({ env, listenerSeq: [[PID], [PID + 7]], open: [dbA()] }));
@@ -360,6 +380,7 @@ describe("Codex #287 R2 — D-B: the snapshot is ONE process incarnation, re-val
   it("an unreadable start time → CANNOT-VERIFY (a pid alone is not an incarnation)", () => {
     const g = gate(deps({ env, startSeq: [null], open: [dbA()] }));
     expect(g.outcome, g.all).toBe("CANNOT-VERIFY");
+    expect(g.reason).toBe(`cannot read the start time of pid ${PID} (ps timed out): the snapshot cannot be bound to one process`);
   });
 });
 

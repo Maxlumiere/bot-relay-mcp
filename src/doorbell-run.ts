@@ -46,10 +46,10 @@ import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
-import { anchorLivenessVerdict, getOwnHostId, processStartedAt } from "./liveness.js";
+import { anchorLivenessVerdict, getOwnHostId, isUtcStartToken, probePid, processStartedAt, startOrNull, type ProcessStart } from "./liveness.js";
 import { performance } from "perf_hooks";
-import { watchableName, watchSupervision, watchWindowDir } from "./watch-wake.js";
-import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead } from "./doorbell-core.js";
+import { blindDormantRecords, blindRecordsForAnchor, watchAgentDir, watchableName, watchSupervision, watchWindowDir } from "./watch-wake.js";
+import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead, type WatchFit } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
 import { conditionOf, FUTURE_TOLERANCE_MS, HEARTBEAT_FILENAME, MAX_COUNT, NOT_EVALUATED_MAX_NAMES, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
 import { acquireInstanceLock, EXIT_ALREADY_RUNNING, lockStillOurs, releaseInstanceLock, type LockHandle } from "./doorbell-lock.js";
@@ -203,10 +203,27 @@ export function bindingLiveness(b: { host_id: string; window_pid?: number | null
  * which a legacy-form migration rewrites under the same binding (Codex R2 (b)): the watch keys its
  * own dir the same way.
  */
-function superviseWatch(dbPath: string, name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding, wallMs: number, horizonMs: number): { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean } {
-  const start = watchableName(name) && w.window_pid ? processStartedAt(w.window_pid) : null;
-  if (!start || !w.window_pid) return { status: "absent", undeliveredAfterWake: false };
-  return watchSupervision(watchWindowDir(dbPath, name, { pid: w.window_pid, start }), read, wallMs, horizonMs);
+function superviseWatch(dbPath: string, name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding, wallMs: number, horizonMs: number, startOf: (pid: number) => ProcessStart = (pid) => processStartedAt(pid)): WatchFit {
+  if (!watchableName(name) || !w.window_pid) return { status: "absent", undeliveredAfterWake: false };
+  const start = startOf(w.window_pid);
+  if (start.kind === "gone") return { status: "absent", undeliveredAfterWake: false };
+  // INV-LIVE-01: the watch's key cannot be read, so its watch cannot be observed: UNKNOWN, never absent.
+  // Unless its watch already went dormant BLIND to this very window (Codex R2 N2): that record carries the
+  // CAPTURED anchor, so it is found without the start (only for a binding token in the UTC form, the one
+  // the anchor is in; a legacy-form token cannot be compared and stays unknown). Never re-anchored.
+  if (start.kind === "unreadable") {
+    const token = w.window_pid_start;
+    if (token && isUtcStartToken(token) && blindRecordsForAnchor(watchAgentDir(dbPath, name), { pid: w.window_pid, start: token }, (pid) => probePid(pid)).length > 0) {
+      return { status: "blind", undeliveredAfterWake: false };
+    }
+    return { status: "unknown", undeliveredAfterWake: false };
+  }
+  const dir = watchWindowDir(dbPath, name, { pid: w.window_pid, start: start.start });
+  const fit = watchSupervision(dir, read, wallMs, horizonMs);
+  // BOUNDEDNESS (ruling a98ec836): no live watch, because the window's watch went dormant BLIND to it
+  // (it could not observe its window for the bound): that is its own case, never "no watch".
+  if (fit.status === "absent" && blindDormantRecords(dir, (pid) => probePid(pid)).length > 0) return { status: "blind", undeliveredAfterWake: false };
+  return fit;
 }
 
 /** Test seams: not reachable from the command line (dist/doorbell.js passes argv only). */
@@ -231,7 +248,9 @@ export interface DoorbellOptions {
    * PR 7 (§v6): the watch supervisor's view of one agent (test seam). Default: the real watch dir beside
    * the relay DB (src/watch-wake.ts). `false` turns supervision off: PR 1-6's intent path (tests of it).
    */
-  watchFit?: ((name: string, read: PendingRead, window: import("./doorbell-core.js").CandidateBinding) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean }) | false;
+  watchFit?: ((name: string, read: PendingRead, window: import("./doorbell-core.js").CandidateBinding) => WatchFit) | false;
+  /** INV-LIVE-01 (Codex R1 P3): the supervisor's window-start reader (test seam). Default: liveness.processStartedAt. */
+  processStart?: (pid: number) => ProcessStart;
   /** Ruling 1a8fc7c4 (1): an ACTUATING driver (test seam). Production registers none → zero intents. */
   actuator?: { fits: (agentName: string) => boolean };
 }
@@ -272,7 +291,7 @@ export async function runDoorbell(argv: string[], opts: DoorbellOptions = {}): P
 
   // F5 (ruling b556c011): the EXCLUSIVE instance lock, FIRST, before anything touches the state dir
   // (openLog's temp cleanup included). Another live doorbell here → refuse, loudly, distinct exit.
-  const procStart = processStartedAt(process.pid); // the ONE UTC producer (#296), never its own ps
+  const procStart = startOrNull(processStartedAt(process.pid)); // the ONE UTC producer (#296), never its own ps; null = unknown (identity/display only)
   let lock: ReturnType<typeof acquireInstanceLock>;
   try {
     lock = acquireInstanceLock(stateDirFor(dbPath), { pid: process.pid, proc_start: procStart, host_id: getOwnHostId() });
@@ -415,6 +434,8 @@ async function runLocked(
   let phase: FailureKind = "other";
   let lastWall = startWall;
   let lastMono = 0;
+  /** INV-LIVE-01: consecutive `unknown` watch reads per agent, carried from one cycle's plan to the next (this lifetime only). */
+  let watchUnknownTicks: ReadonlyMap<string, number> = new Map();
   const cycle = (handle: import("./sqlite-compat.js").CompatDatabase): void => {
     opts.beforeCycle?.(cycles++);
     const nowWall = clock.wallMs();
@@ -443,9 +464,10 @@ async function runLocked(
       liveness: (b) => bindingLiveness(b, ownHostId),
       mailAgents: (opts.wrapMailAgents ?? ((real) => real))(() => agentsWithPendingMail(handle)),
       boardOpen: state.boardOpen,
+      watchUnknownTicks,
       // PR 7 (§v6): the WATCH SUPERVISOR. Each agent wakes through its own `relay watch --until-wake`
       // (zero doorbell tokens); the doorbell only boards a missing, hung or ineffective watch.
-      ...(opts.watchFit === false ? {} : { watchFit: opts.watchFit ?? ((name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding) => superviseWatch(dbPath, name, read, w, nowWall, args.horizonMs)) }),
+      ...(opts.watchFit === false ? {} : { watchFit: opts.watchFit ?? ((name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding) => superviseWatch(dbPath, name, read, w, nowWall, args.horizonMs, opts.processStart)) }),
       ...(opts.actuator ? { actuator: opts.actuator } : {}),
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,
@@ -461,6 +483,7 @@ async function runLocked(
       now: () => iso(nowWall),
     });
     phase = "other";
+    watchUnknownTicks = plan.watchUnknownTicks;
     lastNotEvaluated = { names: plan.notEvaluated, mailQueryFailed: plan.mailQueryFailed !== null };
     if (plan.mailQueryFailed !== null) process.stderr.write(`doorbell: the mail query failed (${plan.mailQueryFailed}): agents with mail and no window could not be found this cycle\n`);
     opts.mutatePlan?.(plan);

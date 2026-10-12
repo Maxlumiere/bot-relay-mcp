@@ -73,7 +73,7 @@ export interface GateDeps {
   openFiles(pid: number): Ok<{ files: OpenFile[] }>;
   procEnviron(pid: number): Ok<{ raw: Buffer }>;
   /** The process's start-time token (null when unreadable): binds a pid to ONE incarnation. */
-  processStart(pid: number): string | null;
+  processStart(pid: number): import("./liveness.js").ProcessStart;
   dsHome(): string;
   runWhere(env: Record<string, string>): { status: number; stdout: string; stderr: string };
   realpath(p: string): string | null;
@@ -368,8 +368,10 @@ function gateLaunchd(opts: { label: string; port: number }, deps: GateDeps): Gat
     return result("CANNOT-VERIFY", `the job is not running (state ${parsed.state ?? "unknown"}): there is no daemon to compare with`, details);
   }
   const pid = parsed.pid;
-  const started = deps.processStart(pid);
-  if (!started) return result("CANNOT-VERIFY", `cannot read the start time of pid ${pid}: the snapshot cannot be bound to one process`, details);
+  const read = deps.processStart(pid);
+  if (read.kind === "gone") return result("CANNOT-VERIFY", `pid ${pid} is gone (the job's process ended): the snapshot cannot be bound to one process`, details);
+  if (read.kind === "unreadable") return result("CANNOT-VERIFY", `cannot read the start time of pid ${pid} (${read.why}): the snapshot cannot be bound to one process`, details);
+  const started = read.start;
   details.push(`job pid: ${pid} (started ${started})`);
 
   if (!parsed.plistPath) return result("CANNOT-VERIFY", "launchctl print names no plist path", details);
@@ -440,7 +442,10 @@ function revalidateLaunchd(
   }
   const env = pickResolverKeys(p.sections.environment, "the job environment");
   if (!env.ok || sameKeys(env.env, was.env).length) return "the job's resolver environment changed";
-  if (deps.processStart(was.pid) !== was.started) return `pid ${was.pid} has a different start time (a new process)`;
+  const now = deps.processStart(was.pid);
+  if (now.kind === "gone") return `pid ${was.pid} is gone`;
+  if (now.kind === "unreadable") return `cannot read the start time of pid ${was.pid} (${now.why})`;
+  if (now.start !== was.started) return `pid ${was.pid} has a different start time (a new process)`;
   const l = deps.listenerPids(was.port);
   if (!l.ok || l.pids.length !== 1 || l.pids[0] !== was.pid) return `the :${was.port} listener is no longer pid ${was.pid}`;
   const h = holds(was.pid, was.db, deps);

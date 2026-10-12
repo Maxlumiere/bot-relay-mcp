@@ -30,6 +30,7 @@ import { ownDeadWindow, OWN_DEAD_ANCHOR } from "./_helpers/own-dead-window.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { startToken } from "./helpers/start-token.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v2152-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -57,7 +58,7 @@ const { deriveDashboardState } = await import("../src/agent-state-machine.js");
 const OWN_HOST = "v2152-own-host";
 const LIVE_PID = process.pid;
 const DEAD_PID = 2_147_483_646;
-const REAL_START = processStartedAt(LIVE_PID);
+const REAL_START = startToken(LIVE_PID);
 
 const PENDING_WINDOW_MS = 5 * 60 * 1000;
 
@@ -91,6 +92,20 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("v2.15.2 — signal teardown does not phantom a surviving/relaunched agent", () => {
+  // INV-LIVE-01 D1 (architect ruling a98ec836): only the kernel's ESRCH may authorize the teardown.
+  it("HARM (INV-LIVE-01 D1): the kernel probe cannot judge the window anchor (EINVAL) → NO teardown; ESRCH → the teardown proceeds", () => {
+    registerAgent("d1-agent", "builder", [], { host_id: OWN_HOST });
+    const sid = getAgentSessionId("d1-agent")!;
+    ownDeadWindow("d1-agent");
+    const errno = (code: string) => () => {
+      throw Object.assign(new Error(code), { code });
+    };
+    expect(endAgentSessionOnSignal("d1-agent", sid, "SIGHUP", OWN_DEAD_ANCHOR, errno("EINVAL")).changed).toBe(false);
+    expect(getAgentSessionId("d1-agent")).toBe(sid); // nothing torn down
+    expect(endAgentSessionOnSignal("d1-agent", sid, "SIGHUP", OWN_DEAD_ANCHOR, errno("ESRCH")).changed).toBe(true);
+    expect(getAgentSessionId("d1-agent")).toBeNull();
+  });
+
   it("(a) signal teardown + re-register (fresh alive anchor) → idle, NEVER offline/closed", () => {
     registerAgent("a-agent", "builder", [], { host_id: OWN_HOST });
     const sid = getAgentSessionId("a-agent")!;

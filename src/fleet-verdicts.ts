@@ -30,7 +30,7 @@
 import fs from "fs";
 import path from "path";
 import { checkInstall, parseStamp, UNBUILT, type InstallCheck } from "./build-id.js";
-import { isUtcStartToken, type ProcEntry } from "./liveness.js";
+import { isUtcStartToken, probePid, type PidState, type ProcEntry, type ProcessStart } from "./liveness.js";
 import { NODE_FLAGS, NODE_NO_SCRIPT, NODE_OPTIONS_WITH_VALUE } from "./node-options.js";
 
 export type ConnectorVerdict = "CURRENT" | "STALE" | "UNKNOWN" | "INSTALL INCONSISTENT";
@@ -430,6 +430,11 @@ export interface FleetSnapshot {
   /** Every pid holding ANY TCP listen socket (D9.2); {error} when unreadable. */
   listeners: number[] | { error: string };
   rows: RowView[];
+  /**
+   * INV-LIVE-01 D2: connector rows whose process cannot be observed now (start unreadable, the pid not
+   * gone). Judged UNKNOWN and shown, never CURRENT, never dropped as dead.
+   */
+  unknownRows: RowView[];
   /** LIVE bindings on this host. */
   bindings: BindingView[];
   daemon: DaemonView;
@@ -582,6 +587,26 @@ export function judgeFleet(s: FleetSnapshot, fsx: ClassifyFs = realClassifyFs): 
       reason: v.reason,
       running: describeBuild(facts),
       warnings: warningsFor(facts, r.install_dir),
+    });
+  }
+
+  // 1b. INV-LIVE-01 D2: every row whose process cannot be observed now: shown, UNKNOWN, never CURRENT.
+  for (const r of s.unknownRows) {
+    const b = r.parent_pid !== null && r.parent_start !== null ? bindingByAnchor.get(key(r.parent_pid, r.parent_start)) ?? null : null;
+    entries.set(key(r.pid, r.pid_start), {
+      pid: r.pid,
+      start: r.pid_start,
+      agent: b ? b.agent_name ?? "(unnamed)" : null,
+      unbound: !b,
+      kind: CONNECTOR_KIND.connector,
+      window_pid: r.parent_pid,
+      window_start: r.parent_pid !== null ? r.parent_start : null,
+      install_dir: r.install_dir,
+      has_row: true,
+      verdict: "UNKNOWN",
+      reason: "unknown: its process cannot be observed now (its start time cannot be read, and the system does not say it ended)",
+      running: describeBuild(rowFacts(r)),
+      warnings: [],
     });
   }
 
@@ -740,8 +765,11 @@ export function toProcessViews(
 // ---------------------------------------------------------------------------
 
 export interface SystemDeps {
-  /** The process table (liveness.buildProcessTable). An EMPTY table is a failed read. */
-  processTable(): Map<number, ProcEntry>;
+  /**
+   * The process table (liveness.buildProcessTable). An EMPTY table is a failed read; a table with
+   * `dropped` rows (Codex R2 N3) is INCOMPLETE and is judged the same way: never a fleet verdict.
+   */
+  processTable(): Map<number, ProcEntry> & { dropped?: number };
   /** The working directory of each given pid (for relative scripts); absent = unreadable. */
   cwds(pids: number[]): Map<number, string>;
   /** The EXACT argv where the platform gives one (Linux /proc/<pid>/cmdline), else null. */
@@ -754,11 +782,14 @@ export interface SystemDeps {
   health(port: number): Promise<{ ok: true; body: unknown } | { ok: false; error: string }>;
   nodeOnPath(): string | null;
   installed(dir: string): InstalledFacts;
+  /** The kernel probe for a pid (liveness.probePid); injectable. Default: the real probe. */
+  pidState?(pid: number): PidState;
 }
 
 /** What the DB says, at the instant of the process snapshot (the CLI reads it on its readonly handle). */
 export interface DbReads {
-  liveRows(startOf: (pid: number) => string | null): RowView[];
+  /** The connector rows, observed through `startOf` (db.observeConnectors): live and unknown; gone ones omitted. */
+  connectorRows(startOf: (pid: number) => ProcessStart): { live: RowView[]; unknown: RowView[] };
   liveBindings(): BindingView[];
 }
 
@@ -789,21 +820,32 @@ export async function observeFleet(sys: SystemDeps, db: DbReads, port: number): 
   const processes: FleetSnapshot["processes"] =
     table.size === 0
       ? { error: "ps returned no processes" }
-      : toProcessViews(
+      : (table.dropped ?? 0) > 0
+        ? { error: `the process table is incomplete: ${table.dropped} row(s) could not be read, so a process could be missing from the board` }
+        : toProcessViews(
           table,
           ((cwds) => (pid: number) => cwds.get(pid) ?? null)(
             sys.cwds([...table.values()].filter((e) => NODE_EXECUTABLES.test(path.basename(e.comm ?? e.command.split(" ")[0]))).map((e) => e.pid)),
           ),
           (pid) => sys.exactArgv(pid),
         );
-  // Row liveness is read from THIS table, so the rows and the processes are one instant.
-  const startOf = (pid: number): string | null => table.get(pid)?.startedAt ?? null;
+  // Row liveness is read from THIS table, so the rows and the processes are one instant. A pid with no
+  // row in the snapshot is gone only when the KERNEL says so (ESRCH); otherwise (a dropped row, a failed
+  // read) its start is unreadable: shown as unknown (INV-LIVE-01 D2).
+  const pidState = (pid: number): PidState => (sys.pidState ? sys.pidState(pid) : probePid(pid));
+  const startOf = (pid: number): ProcessStart => {
+    const e = table.get(pid);
+    if (e) return { kind: "start", start: e.startedAt };
+    return pidState(pid) === "gone" ? { kind: "gone" } : { kind: "unreadable", why: "its pid has no row in the process snapshot" };
+  };
+  const observed = db.connectorRows(startOf);
   const portListeners = sys.portListeners(port);
   const healthRead = await sys.health(port);
   return {
     processes,
     listeners: sys.allListeners(),
-    rows: db.liveRows(startOf),
+    rows: observed.live,
+    unknownRows: observed.unknown,
     bindings: db.liveBindings(),
     daemon: {
       port,

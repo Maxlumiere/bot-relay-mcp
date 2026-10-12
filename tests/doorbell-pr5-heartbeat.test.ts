@@ -17,6 +17,7 @@ import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vites
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { startToken } from "./helpers/start-token.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "doorbell-pr5-hb-")));
 const DB = path.join(ROOT, "inst", "relay.db");
@@ -79,7 +80,7 @@ beforeEach(() => {
   db.upsertAgentBinding(db.getDb(), {
     hostId: HOST,
     windowPid: process.pid,
-    windowPidStart: processStartedAt(process.pid) as string,
+    windowPidStart: startToken(process.pid),
     agentName: "p5-alice",
     agentClass: null,
     conversationId: "conv-p5",
@@ -104,7 +105,7 @@ describe.skipIf(!HOST)("Q1 (i): the heartbeat is written ONLY by the cycle path,
     await job(["--once"], { clock: fakeClock(T) });
     const h = onDisk() as Heartbeat;
     expect([h.pid, h.interval_ms, h.started_at, h.at, h.condition, h.consecutive_failures, h.last_failure]).toEqual([process.pid, 5000, new Date(T).toISOString(), new Date(T).toISOString(), "ok", 0, null]);
-    expect(h.proc_start).toBe(processStartedAt(process.pid));
+    expect(h.proc_start).toBe(startToken(process.pid));
     expect(isUtcStartToken(h.proc_start as string)).toBe(true);
     expect((h.resolution as { db_path: string }).db_path).toBe(DB);
   });

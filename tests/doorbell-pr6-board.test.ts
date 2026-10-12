@@ -20,6 +20,7 @@ import os from "os";
 import path from "path";
 import { spawn, spawnSync } from "child_process";
 import { randomUUID } from "crypto";
+import { startToken } from "./helpers/start-token.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "doorbell-pr6-")));
 const DB = path.join(ROOT, "inst", "relay.db");
@@ -281,7 +282,7 @@ async function statusJson(): Promise<Record<string, unknown>> {
 /** A LIVE window: a real child process (pid + start token), killed and REAPED to make it a dead one. */
 function liveWindow(): { pid: number; start: string; close: () => Promise<void> } {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  const start = processStartedAt(child.pid as number) as string;
+  const start = startToken(child.pid as number);
   const exited = new Promise<void>((resolve) => child.once("exit", () => resolve())); // ONE exit: close is idempotent
   return {
     pid: child.pid as number,
@@ -302,19 +303,19 @@ describe.skipIf(!OWN)("PR 6: liveness is the WINDOW anchor's kernel fact (bindin
     db.registerAgent("p6-alice", "r", []);
   });
   it("HARM: NULLing agents.agent_status AND agents.session_id leaves a live window ALIVE (never read from the agent row)", () => {
-    const b = { host_id: OWN as string, agent_name: "p6-alice", window_pid: process.pid, window_pid_start: processStartedAt(process.pid) as string };
+    const b = { host_id: OWN as string, agent_name: "p6-alice", window_pid: process.pid, window_pid_start: startToken(process.pid) };
     expect(R.bindingLiveness(b, OWN)).toBe("alive");
     db.getDb().prepare("UPDATE agents SET agent_status = 'offline', session_id = NULL WHERE name = 'p6-alice'").run();
     expect(R.bindingLiveness(b, OWN)).toBe("alive");
   });
   it("an exited window pid is DEAD; no pid is UNVERIFIABLE; another host is UNVERIFIABLE", () => {
-    expect(R.bindingLiveness({ host_id: OWN as string, window_pid: deadPid(), window_pid_start: processStartedAt(process.pid) as string }, OWN)).toBe("dead");
+    expect(R.bindingLiveness({ host_id: OWN as string, window_pid: deadPid(), window_pid_start: startToken(process.pid) }, OWN)).toBe("dead");
     expect(R.bindingLiveness({ host_id: OWN as string, window_pid: null, window_pid_start: null }, OWN)).toBe("unverifiable");
-    expect(R.bindingLiveness({ host_id: "another-host", window_pid: process.pid, window_pid_start: processStartedAt(process.pid) as string }, OWN)).toBe("unverifiable");
+    expect(R.bindingLiveness({ host_id: "another-host", window_pid: process.pid, window_pid_start: startToken(process.pid) }, OWN)).toBe("unverifiable");
   });
   it("plan v3.2's row: a LEGACY-form start token on a live window reads ALIVE today (during the transition), compared by form, never as raw strings", () => {
-    const legacy = processStartedAt(process.pid, undefined, "legacy") as string;
-    const utc = processStartedAt(process.pid) as string;
+    const legacy = startToken(process.pid, "legacy");
+    const utc = startToken(process.pid);
     expect([isUtcStartToken(legacy), isUtcStartToken(utc)]).toEqual([false, true]); // precondition: two different spellings
     expect(legacy).not.toBe(utc);
     expect(R.bindingLiveness({ host_id: OWN as string, window_pid: process.pid, window_pid_start: legacy }, OWN)).toBe("alive");
@@ -334,7 +335,7 @@ describe.skipIf(!OWN)("PR 6: the real JOB on production-shaped bindings, and `re
   const send = () => db.sendMessage("p6-sender", "p6-alice", "x", "normal").id;
 
   it("1 live window + 2 dead → RUNG on the live one; a 2nd live window → ambiguous (nothing rung); both windows CLOSE → no_live_window", async () => {
-    const start = processStartedAt(process.pid) as string;
+    const start = startToken(process.pid);
     bindWindow("p6-alice", deadPid(), start, "conv-dead-1");
     bindWindow("p6-alice", deadPid(), start, "conv-dead-2");
     const w1 = liveWindow();
@@ -384,7 +385,7 @@ describe.skipIf(!OWN)("PR 6: the real JOB on production-shaped bindings, and `re
   }, 30_000);
 
   it("the status verb lists the OPEN case with the LIVE pending count beside the snapshot at open, and the last cycle's not_evaluated", async () => {
-    bindWindow("p6-alice", deadPid(), processStartedAt(process.pid) as string, "conv-dead");
+    bindWindow("p6-alice", deadPid(), startToken(process.pid), "conv-dead");
     send();
     expect(await lifetime(T)).toBe(0);
     send();
