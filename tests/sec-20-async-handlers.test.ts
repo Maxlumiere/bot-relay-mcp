@@ -174,6 +174,8 @@ const sha256 = (t: string) => crypto.createHash("sha256").update(t).digest("hex"
  * Codex #315 R2 N4 + #316 R1 #4: the inventory is what the DISPATCHER binds, and the dispatcher must keep its REVIEWED
  * form, so nothing can run between the dispatcher's own authorization and a handler unseen:
  *   - `dispatch`'s body is the switch and nothing else (an `await pause()` before it is refused);
+ *   - the switch selects on `dispatch`'s own `name` parameter (BOUND, not spelled) and every case label is a string or
+ *     substitution-free template literal (Codex #316 R2: `switch (await …)` or `case (await …)` suspends unseen);
  *   - every case is exactly ONE `return <handler>(<nothing> | <X>Schema.parse(args))`: no other statement, no await,
  *     no other call in the arguments;
  *   - the default keeps its reviewed refusal (REVIEWED_DEFAULT).
@@ -185,17 +187,23 @@ export function dispatchedHandlers(program: ts.Program, rel: (f: string) => stri
   const unclassified: string[] = [];
   const server = program.getSourceFiles().find((f) => rel(f.fileName) === "src/server.ts");
   if (!server) return { promising, unclassified: ["src/server.ts not in the program"] };
-  let body: ts.Block | undefined;
+  let fn: ts.FunctionDeclaration | undefined;
   const find = (n: ts.Node): void => {
-    if (ts.isFunctionDeclaration(n) && n.name?.text === "dispatch" && n.body) body = n.body;
+    if (ts.isFunctionDeclaration(n) && n.name?.text === "dispatch" && n.body) fn = n;
     ts.forEachChild(n, find);
   };
   find(server);
-  if (!body) return { promising, unclassified: ["the dispatch function was not found"] };
+  const body = fn?.body;
+  if (!fn || !body) return { promising, unclassified: ["the dispatch function was not found"] };
   if (body.statements.length !== 1 || !ts.isSwitchStatement(body.statements[0])) {
     return { promising, unclassified: [`dispatch's body is not the reviewed switch-only form (${body.statements.length} statement(s))`] };
   }
   const sw = body.statements[0];
+  const nameParam = fn.parameters.find((p) => ts.isIdentifier(p.name) && p.name.text === "name");
+  const selected = ts.isIdentifier(sw.expression) ? checker.getSymbolAtLocation(sw.expression) : undefined;
+  if (!nameParam || !selected || selected !== checker.getSymbolAtLocation(nameParam.name)) {
+    unclassified.push(`the switch selector is not dispatch's own \`name\` parameter (\`${sw.expression.getText()}\`)`);
+  }
   let defaults = 0;
   for (const clause of sw.caseBlock.clauses) {
     if (ts.isDefaultClause(clause)) {
@@ -203,7 +211,11 @@ export function dispatchedHandlers(program: ts.Program, rel: (f: string) => stri
       if (collapse(clause.getText()) !== collapse(REVIEWED_DEFAULT)) unclassified.push("default: not the reviewed refusal");
       continue;
     }
-    const tool = ts.isStringLiteralLike(clause.expression) ? clause.expression.text : clause.expression.getText();
+    if (!ts.isStringLiteral(clause.expression) && !ts.isNoSubstitutionTemplateLiteral(clause.expression)) {
+      unclassified.push(`a case label is not a string literal (\`${clause.expression.getText()}\`)`);
+      continue;
+    }
+    const tool = clause.expression.text;
     const only = clause.statements.length === 1 ? clause.statements[0] : undefined;
     const call = only && ts.isReturnStatement(only) ? only.expression : undefined;
     if (!call || !ts.isCallExpression(call) || !ts.isIdentifier(call.expression)) {
@@ -379,9 +391,9 @@ describe("STRUCTURE: every Promise-returning dispatched handler is classified, a
   });
 
   /** A virtual dispatcher: `switchBody` replaces the reviewed switch, `pre` goes before it. */
-  const dispatcherOf = (cases: string, opts: { pre?: string; dflt?: string; extra?: Record<string, string>; from?: string } = {}) => {
+  const dispatcherOf = (cases: string, opts: { pre?: string; dflt?: string; extra?: Record<string, string>; from?: string; selector?: string; params?: string; head?: string } = {}) => {
     const files = {
-      "src/server.ts": `import { handleAsync } from "${opts.from ?? "./h.js"}";\nimport { pause, ASchema } from "./u.js";\nexport function createServer() { async function dispatch(name: string, args: any): Promise<any> { ${opts.pre ?? ""} switch (name) { ${cases} ${opts.dflt ?? REVIEWED_DEFAULT} } } return dispatch; }`,
+      "src/server.ts": `import { handleAsync } from "${opts.from ?? "./h.js"}";\nimport { pause, ASchema } from "./u.js";\n${opts.head ?? ""}\nexport function createServer() { async function dispatch(${opts.params ?? "name: string, args: any"}): Promise<any> { ${opts.pre ?? ""} switch (${opts.selector ?? "name"}) { ${cases} ${opts.dflt ?? REVIEWED_DEFAULT} } } return dispatch; }`,
       "src/h.ts": `export async function handleAsync(_a?: unknown) { return 1; }`,
       "src/u.ts": `export async function pause() {}\nexport const ASchema = { parse: (a: unknown) => a };`,
       ...opts.extra,
@@ -397,6 +409,27 @@ describe("STRUCTURE: every Promise-returning dispatched handler is classified, a
     expect(dispatcherOf(`case "t": return handleAsync(await pause());`).unclassified.length).toBe(1);
     expect(dispatcherOf(`case "t": return handleAsync(ASchema.parse(pause()));`).unclassified.length).toBe(1);
     expect(dispatcherOf(`case "t": return handleAsync(ASchema.parse(args));`, { dflt: `default: return { content: [], isError: false };` }).unclassified.length).toBe(1);
+  });
+  it("Codex #316 R2 TWIN: a `switch (name)` with a string or substitution-free template label passes", () => {
+    expect(dispatcherOf(`case "t": return handleAsync(ASchema.parse(args));`).unclassified).toEqual([]);
+    expect(dispatcherOf(`case \`t\`: return handleAsync(ASchema.parse(args));`).unclassified).toEqual([]);
+  });
+  it("Codex #316 R2: `switch (await …)` fails (a suspension between authorization and the handler)", () => {
+    expect(dispatcherOf(`case "t": return handleAsync(ASchema.parse(args));`, { selector: "await Promise.resolve(name)" }).unclassified).toEqual([
+      "the switch selector is not dispatch's own `name` parameter (`await Promise.resolve(name)`)",
+    ]);
+  });
+  it("Codex #316 R2: `case (await …)` fails, and so does a template label with a substitution", () => {
+    expect(dispatcherOf(`case (await Promise.resolve("t")): return handleAsync(ASchema.parse(args));`).unclassified).toEqual([
+      'a case label is not a string literal (`(await Promise.resolve("t"))`)',
+    ]);
+    expect(dispatcherOf(`case \`${"$"}{await pause()}t\`: return handleAsync(ASchema.parse(args));`).unclassified.length).toBe(1);
+  });
+  it("Codex #316 R2: the selector is BOUND to dispatch's parameter, not spelled `name`", () => {
+    const v = dispatcherOf(`case "t": return handleAsync(ASchema.parse(args));`, { params: "tool: string, args: any", pre: "const name = tool;" });
+    expect(v.unclassified).toContain("dispatch's body is not the reviewed switch-only form (2 statement(s))");
+    const outer = dispatcherOf(`case "t": return handleAsync(ASchema.parse(args));`, { params: "tool: string, args: any", head: `const name = "t";` });
+    expect(outer.unclassified).toContain("the switch selector is not dispatch's own `name` parameter (`name`)");
   });
   it("Codex #316 R1 #5: an import REDIRECTED to another module exporting the same name is a different handler (file + export)", () => {
     const v = dispatcherOf(`case "t": return handleAsync(ASchema.parse(args));`, { from: "./other.js", extra: { "src/other.ts": `export async function handleAsync(_a?: unknown) { return 2; }` } });
