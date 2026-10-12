@@ -460,8 +460,16 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const a = win.runRelayWatch(WATCH());
     await untilStatus("live");
     const aDir = winDir(win);
-    db.getDb().prepare("UPDATE agent_bindings SET superseded_at = ? WHERE window_pid = ?").run(new Date().toISOString(), win.pid);
-    const winB = openWin("w-bob");
+    // THE REBIND, atomic (flake d, macOS CI 114774541424 + 114793812414): window B is opened FIRST, unbound; then
+    // A's binding is superseded AND B's written in ONE transaction. The old order (supersede, then open B, then bind B)
+    // left a gap with NO current binding, and a check landing in it read "no_live_window", not "not_this_window".
+    // The pause is the slow window-open CI has, kept on purpose: here A is still bound, so it cannot open a gap.
+    const winB = openWin(null);
+    await new Promise((res) => setTimeout(res, 1_500));
+    db.getDb().transaction(() => {
+      db.getDb().prepare("UPDATE agent_bindings SET superseded_at = ? WHERE window_pid = ?").run(new Date().toISOString(), win.pid);
+      bind("w-bob", winB);
+    })();
     const aPid = await a.pid();
     for (let i = 0; i < 100 && !dormantRecords(aDir).some((x) => x.pid === aPid); i++) await new Promise((res) => setTimeout(res, 100));
     expect(dormantRecords(aDir).find((x) => x.pid === aPid)?.reason).toMatch(/^binding moved \(not_this_window\)/);
