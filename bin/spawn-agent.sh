@@ -39,6 +39,12 @@
 # directly with RELAY_SPAWN_DRY_RUN=1 and 15+ attack payloads. If you edit
 # this file, run those tests.
 
+# Tracing OFF, before anything reads a credential: an inherited xtrace (bash -x, SHELLOPTS=xtrace) would print
+# every expanded token. BASH_XTRACEFD is unset only when it names a descriptor above 2: unsetting it CLOSES that
+# descriptor (bash >= 4.1), and this script must not close its own stdin, stdout or stderr.
+{ set +x; } 2>/dev/null
+case "${BASH_XTRACEFD:-}" in '' | *[!0-9]*) ;; *) [ "$((10#$BASH_XTRACEFD))" -le 2 ] || unset BASH_XTRACEFD ;; esac
+
 set -eu
 
 NAME="${1:-}"

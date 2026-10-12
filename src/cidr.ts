@@ -19,7 +19,10 @@
  *     ::ffff:0:0/96 or longer (it then IS an IPv4 block: prefix − 96). A shorter "mapped-looking" block
  *     (::ffff:10.0.0.0/8) is an IPv6 block and never contains an IPv4 address.
  *   - REJECTED, never guessed (null): a zone id (fe80::1%en0), the deprecated IPv4-COMPATIBLE range
- *     ::/96 other than :: and ::1 (::a.b.c.d), and anything not fully consumed by the parse.
+ *     ::/96 other than :: and ::1 (::a.b.c.d), and anything not fully consumed by the parse. canonicalIp
+ *     takes EXACTLY one literal: no surrounding whitespace, no brackets (Codex PR307 P3). The helpers that
+ *     read operator-typed text (canonicalCidr, ipInCidr, ipInAnyCidr) loosen it FIRST, explicitly (trim,
+ *     one bracket pair), so the gates that take a socket address (isLoopbackPeer, extractSourceIp) never do.
  * A rejected input matches nothing. Each CONSUMER fails closed in its own direction: a trust list
  * does not trust it; the SSRF classifier (ip-classifier.ts) blocks it.
  *
@@ -73,10 +76,8 @@ const isMapped = (b: Uint8Array) => b.slice(0, 10).every((x) => x === 0) && b[10
 const isCompatible = (b: Uint8Array) =>
   b.slice(0, 12).every((x) => x === 0) && !(b[12] === 0 && b[13] === 0 && b[14] === 0 && (b[15] === 0 || b[15] === 1));
 
-/** The 4 or 16 raw bytes an address literal spells (no mapping applied), or null. */
-function rawBytes(input: string): { v4: boolean; bytes: Uint8Array } | null {
-  let s = input.trim();
-  if (s.startsWith("[") && s.endsWith("]")) s = s.slice(1, -1);
+/** The 4 or 16 raw bytes an address literal spells EXACTLY (no mapping applied), or null. */
+function rawBytes(s: string): { v4: boolean; bytes: Uint8Array } | null {
   if (s.includes("%")) return null; // a zone id: never guessed
   if (net.isIPv4(s)) return { v4: true, bytes: Uint8Array.from(s.split(".").map(Number)) };
   if (!net.isIPv6(s)) return null;
@@ -84,7 +85,13 @@ function rawBytes(input: string): { v4: boolean; bytes: Uint8Array } | null {
   return b ? { v4: false, bytes: b } : null;
 }
 
-/** Parse ONE address, any spelling, to its canonical bytes and family; null when rejected. */
+/** Operator-typed text (a config list, a CLI argument) → the literal it names: trimmed, one bracket pair off. */
+function loosen(input: string): string {
+  const s = input.trim();
+  return s.startsWith("[") && s.endsWith("]") ? s.slice(1, -1) : s;
+}
+
+/** Parse ONE address literal, any spelling, to its canonical bytes and family; null when rejected. */
 export function canonicalIp(input: string): CanonicalIp | null {
   const r = rawBytes(input);
   if (!r) return null;
@@ -99,7 +106,7 @@ export function canonicalCidr(input: string): CanonicalCidr | null {
   const s = input.trim();
   if (!s) return null;
   const slash = s.indexOf("/");
-  const addr = slash >= 0 ? s.slice(0, slash) : s;
+  const addr = loosen(slash >= 0 ? s.slice(0, slash) : s);
   const pre = slash >= 0 ? s.slice(slash + 1) : null;
   if (pre !== null && !/^\d{1,3}$/.test(pre)) return null;
   const r = rawBytes(addr);
@@ -153,7 +160,7 @@ export function formatIp(ip: CanonicalIp): string {
 
 /** Is `ip` inside `cidr`? false when either is rejected (a consumer that must fail CLOSED checks canonicalIp itself). */
 export function ipInCidr(ip: string, cidr: string): boolean {
-  const a = canonicalIp(ip);
+  const a = canonicalIp(loosen(ip));
   const b = canonicalCidr(cidr);
   return !!a && !!b && cidrContains(b, a);
 }
@@ -174,7 +181,7 @@ export function isLoopbackPeer(raw: string | null | undefined): boolean {
 
 /** Is `ip` inside ANY of `cidrs`? Rejected blocks are skipped. */
 export function ipInAnyCidr(ip: string, cidrs: string[]): boolean {
-  const a = canonicalIp(ip);
+  const a = canonicalIp(loosen(ip));
   if (!a) return false;
   for (const c of cidrs) {
     const b = canonicalCidr(c);

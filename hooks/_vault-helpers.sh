@@ -210,6 +210,85 @@ resolve_relay_token_path() {
 # mintSecretHome). A missing, symlinked, short or oddly-shaped secret prints
 # NOTHING and returns 1: the register then goes without it, and the server's
 # refusal (MINT_SECRET_REQUIRED) makes the hook's verdict REGISTER_FAILED, loud.
+# relay_curl_config_line KEY VALUE — print ONE curl config directive, `KEY = "VALUE"`, for `curl -K -` on
+# STDIN. THE way every hook hands curl a credential (a token header, a body holding a token): a process's argv
+# is readable by every local user (ps, /proc/<pid>/cmdline); a pipe is not. The value is quoted with curl's
+# own escapes (\\ and \"), so it can never end the quoted value early. A CR or LF would start a NEW directive,
+# so such a value is REFUSED: nothing printed, status 1 (the request then goes without it, and fails loudly).
+relay_curl_config_line() {
+  case "$1" in '' | *[!a-z-]*) return 1 ;; esac
+  case "$2" in *$'\n'* | *$'\r'*) return 1 ;; esac
+  local v="$2"
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf '%s = "%s"\n' "$1" "$v"
+}
+
+# relay_curl_token_config TOKEN — the X-Agent-Token header as a curl config line (see relay_curl_config_line).
+# An empty token prints nothing and succeeds: the request goes unauthenticated, as it did with no header.
+relay_curl_token_config() {
+  [ -n "$1" ] || return 0
+  relay_curl_config_line header "X-Agent-Token: $1"
+}
+
+# RELAY_REPLY_ERROR_CODES — the relay's error codes (src/error-codes.ts ERROR_CODES, pinned EQUAL by
+# tests/hook-token-argv.test.ts). The ONLY reply-derived words relay_reply_summary may print.
+RELAY_REPLY_ERROR_CODES="AUTH_FAILED CAP_DENIED NAME_COLLISION NAME_COLLISION_ACTIVE MINT_SECRET_REQUIRED SENDER_NOT_REGISTERED REDUCTION_NOT_ALLOWED NO_OP_EXPANSION NOT_FOUND ALREADY_EXISTS NOT_PARTY NOT_MEMBER VALIDATION PAYLOAD_TOO_LARGE CONCURRENT_UPDATE FORCE_PRECONDITION_FAILED INVALID_STATE RATE_LIMITED SSRF_REFUSED SCHEMA_MISMATCH RESULT_SCHEMA_VIOLATION DAEMON_RUNNING TOOL_NOT_AVAILABLE INTERNAL"
+
+# The reply is parsed (plain JSON, or SSE `data:` lines) and walked for `error_code`, including inside a tool's
+# stringified content. Nothing it reads is printed except a code found in the allowlist.
+RELAY_REPLY_SUMMARY_JS='
+const crypto = require("crypto");
+let raw = require("fs").readFileSync(0);
+let status = "unknown";
+// latin1 maps each byte to one char, so a match index is a BYTE offset: the trailer is stripped as bytes.
+const m = /\nHTTP_STATUS:([0-9]{3})\n?$/.exec(raw.toString("latin1"));
+if (m) { status = m[1]; raw = raw.subarray(0, m.index); }
+const bytes = raw.length;
+const text = raw.toString("utf8");
+const docs = [];
+try {
+  const t = text.trim();
+  if (t.startsWith("{") || t.startsWith("[")) docs.push(JSON.parse(t));
+  else for (const l of t.split(/\r?\n/)) if (l.startsWith("data:")) docs.push(JSON.parse(l.slice(5)));
+  if (docs.length === 0) throw new Error("no JSON");
+} catch {
+  process.stdout.write("HTTP " + status + ", unparseable reply (" + bytes + " bytes)\n");
+  process.exit(0);
+}
+const allowed = new Set((process.env.RELAY_REPLY_ERROR_CODES || "").split(" ").filter(Boolean));
+const found = [];
+const walk = (v, depth) => {
+  if (depth > 16 || v === null) return;
+  if (typeof v === "string") {
+    if (/^\s*[{[]/.test(v)) { try { walk(JSON.parse(v), depth + 1); } catch {} }
+    return;
+  }
+  if (typeof v !== "object") return;
+  for (const [k, x] of Object.entries(v)) { if (k === "error_code") found.push(x); walk(x, depth + 1); }
+};
+for (const d of docs) walk(d, 0);
+const code = found.length === 0 ? "none" : typeof found[0] === "string" && allowed.has(found[0]) ? found[0] : "unlisted";
+const sha = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 12);
+process.stdout.write("HTTP " + status + ", error_code " + code + ", " + bytes + " bytes, sha256 " + sha + "\n");
+'
+
+# relay_reply_summary — print ONE fixed line about the server reply on stdin, and nothing from the reply itself:
+#   HTTP <status|unknown>, error_code <ALLOWLISTED_CODE|unlisted|none>, <N> bytes, sha256 <12 hex>
+#   HTTP <status|unknown>, unparseable reply (<N> bytes)
+# The status comes from a trailing `HTTP_STATUS:<3 digits>` line (curl -w), when the caller added one.
+# A reply is NEVER printed, redacted or not: redaction is a denylist, and a reply's free text (an error that
+# echoes the request) can carry a credential split, escaped or encoded past any redactor. So every hook path
+# that reports a reply prints this summary, and the sha256 prefix correlates it with the server's own log.
+relay_reply_summary() {
+  if command -v node >/dev/null 2>&1; then
+    RELAY_REPLY_ERROR_CODES="$RELAY_REPLY_ERROR_CODES" node -e "$RELAY_REPLY_SUMMARY_JS" 2>/dev/null && return 0
+  fi
+  local n
+  n=$(wc -c | tr -d ' ')
+  printf 'HTTP unknown, reply not parsed (%s bytes)\n' "${n:-0}"
+}
+
 # relay_mint_secret_file — print WHERE this instance's registration secret lives (never its content), for the
 # hooks' REGISTER_FAILED guidance. Returns 1 when the instance does not resolve.
 relay_mint_secret_file() {
