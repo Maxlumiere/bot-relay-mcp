@@ -2095,9 +2095,15 @@ function migrateSchemaToV2_26(db: CompatDatabase): void {
  * trigger runs before conflict resolution, so `INSERT OR REPLACE` (which fires no UPDATE trigger) and an UPSERT are
  * refused before they can delete or rewrite that row. A unique key other than name and id would be a lane this does
  * not cover: agents has none today.
- * SEC-20.T4, IDENTITY IS IMMUTABLE: no UPDATE changes an agent's name or id (no sanctioned path does); only DELETE + a
- * fresh register replaces one. Otherwise `UPDATE OR REPLACE ... SET name = <victim>` deletes the victim through the
- * UNIQUE conflict and the donor's token answers to the victim's name, with no INSERT and no auth_state write.
+ * SEC-20.T4, IDENTITY IS IMMUTABLE: no UPDATE changes an agent's name, id or ROWID (no sanctioned path does); only
+ * DELETE + a fresh register replaces one. Otherwise `UPDATE OR REPLACE ... SET name = <victim>` deletes the victim
+ * through the UNIQUE conflict and the donor's token answers to the victim's name, with no INSERT and no auth_state
+ * write. agents is a rowid table, so the hidden rowid is its PHYSICAL key and a third conflict key: the rowid trigger
+ * has no OF list (a rowid-only SET, under any alias, fires it), and the insert guard matches it too.
+ * THREAT MODEL: these guards bind stale or buggy CODE paths (old binaries, mint --force, stray statements). They do not
+ * stop a hostile writer with direct SQL access to the file (it can DROP TRIGGER): a same-user process outside the
+ * boundary. So copying another row's token hash onto a row is NOT guarded: bcrypt is salted, so no code path produces
+ * that shape by accident (SECURITY.md).
  * FAIL CLOSED: each WHEN is NULL-safe (COALESCE / IS NOT). A predicate that evaluated to NULL would not raise, and under
  * UPDATE OR REPLACE SQLite answers a NOT NULL violation by substituting the column DEFAULT ('active').
  * Each body is ONE literal: the installer compares it byte for byte with sqlite_master.
@@ -2118,11 +2124,14 @@ export const AGENT_ROW_GUARD_TRIGGERS: Readonly<Record<string, string>> = {
     "), 0) BEGIN SELECT RAISE(ABORT, 'AUTH_STATE_EDGE_REFUSED'); END",
   agents_auth_state_insert:
     "CREATE TRIGGER agents_auth_state_insert BEFORE INSERT ON agents WHEN COALESCE(EXISTS (" +
-    "SELECT 1 FROM agents WHERE (name = NEW.name OR id = NEW.id) AND auth_state IN ('revoked', 'recovery_pending')" +
+    "SELECT 1 FROM agents WHERE (name = NEW.name OR id = NEW.id OR rowid = NEW.rowid) AND auth_state IN ('revoked', 'recovery_pending')" +
     "), 1) BEGIN SELECT RAISE(ABORT, 'AUTH_STATE_EDGE_REFUSED'); END",
   agents_identity_immutable:
     "CREATE TRIGGER agents_identity_immutable BEFORE UPDATE OF name, id ON agents " +
     "WHEN NEW.name IS NOT OLD.name OR NEW.id IS NOT OLD.id " +
+    "BEGIN SELECT RAISE(ABORT, 'AGENT_IDENTITY_IMMUTABLE'); END",
+  agents_rowid_immutable:
+    "CREATE TRIGGER agents_rowid_immutable BEFORE UPDATE ON agents WHEN NEW.rowid IS NOT OLD.rowid " +
     "BEGIN SELECT RAISE(ABORT, 'AGENT_IDENTITY_IMMUTABLE'); END",
 };
 

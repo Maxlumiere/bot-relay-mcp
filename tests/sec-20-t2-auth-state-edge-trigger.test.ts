@@ -236,6 +236,16 @@ describe("the insert guard: REPLACE and UPSERT cannot recreate a revoked or reco
       expect(stateOf(name)).toBe(state);
     });
   }
+  it("TWIN: an automatic-rowid INSERT (a normal register) passes while protected rows exist", () => {
+    // MEASURED (native SQLite 3.53.4 and sql.js): NEW.rowid in a BEFORE INSERT is -1 when the rowid is automatic, so
+    // the guard's rowid clause never matches a real row. SQLite documents that value as undefined: if it ever changed,
+    // this twin goes RED (an innocent insert refused), never a silent pass.
+    rowIn("revoked");
+    rowIn("recovery_pending");
+    const name = fresh();
+    expect(() => registerAgent(name, "tester", [])).not.toThrow();
+    expect(stateOf(name)).toBe("active");
+  });
   it("TWIN: INSERT OR REPLACE of a brand-new name passes, and over an ACTIVE row passes", () => {
     const name = fresh();
     expect(attempt(`INSERT OR REPLACE INTO agents ${cols} VALUES ${vals}`, name)).toBeNull();
@@ -281,6 +291,51 @@ describe("identity is immutable: no UPDATE changes an agent's name or id", () =>
       }
     }
   }
+  // Codex #325 R2 P1: agents is a rowid table, so the hidden rowid is the row's PHYSICAL identity and a third unique
+  // key. A REPLACE conflict on it deletes the victim with no name/id change and no auth_state write.
+  for (const recursive of ["OFF", "ON"] as const) {
+    for (const victimState of ["revoked", "recovery_pending"] as const) {
+      for (const alias of ["rowid", "_rowid_", "oid"] as const) {
+        it(`recursive_triggers ${recursive}, ${victimState} victim, UPDATE OR REPLACE SET ${alias} = <victim's>: refused, both rows intact`, () => {
+          getDb().pragma(`recursive_triggers = ${recursive}`);
+          try {
+            const victim = rowIn(victimState);
+            const donor = rowIn("active");
+            const [v0, d0] = [snapshot(victim), snapshot(donor)];
+            const err = attempt(`UPDATE OR REPLACE agents SET ${alias} = (SELECT rowid FROM agents WHERE name = ?) WHERE name = ?`, victim, donor);
+            expect(err ?? `PASSED: victim ${snapshot(victim) ? "still there" : "DELETED"}`).toMatch(IDENT);
+            expect(snapshot(victim), "the victim row is intact").toEqual(v0);
+            expect(snapshot(donor), "the donor row is intact").toEqual(d0);
+          } finally {
+            getDb().pragma("recursive_triggers = OFF");
+          }
+        });
+        it(`recursive_triggers ${recursive}, ${victimState} victim, INSERT OR REPLACE with ${alias} = <victim's> (a new name and id, the victim's credential): refused, victim intact`, () => {
+          getDb().pragma(`recursive_triggers = ${recursive}`);
+          try {
+            const victim = rowIn(victimState);
+            const v0 = snapshot(victim);
+            const err = attempt(
+              `INSERT OR REPLACE INTO agents (${alias}, id, name, role, capabilities, last_seen, created_at, token_hash) ` +
+                `SELECT rowid, 'replacement-id-' || rowid, 'replacement-' || rowid, role, capabilities, last_seen, created_at, token_hash FROM agents WHERE name = ?`,
+              victim,
+            );
+            expect(err ?? "PASSED").toMatch(EDGE);
+            expect(snapshot(victim), "the victim row is intact").toEqual(v0);
+          } finally {
+            getDb().pragma("recursive_triggers = OFF");
+          }
+        });
+      }
+    }
+  }
+  it("a rowid change with NO conflict (a fresh, unused rowid) is refused too: identity includes the physical key", () => {
+    const n = rowIn("active");
+    const before = snapshot(n);
+    expect(attempt("UPDATE agents SET rowid = 9000000 WHERE name = ?", n) ?? "PASSED").toMatch(IDENT);
+    expect(snapshot(n)).toEqual(before);
+  });
+
   it("TWIN: an UPDATE that leaves name and id unchanged passes (last_seen; and name = name)", () => {
     const n = rowIn("active");
     expect(attempt("UPDATE agents SET last_seen = '2030-01-01T00:00:00.000Z' WHERE name = ?", n)).toBeNull();
@@ -335,7 +390,7 @@ describe("the installer: one exact body, on a virgin, an upgraded and a tampered
   const triggers = (): Record<string, string> =>
     Object.fromEntries((getDb().prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'agents'").all() as Array<{ name: string; sql: string }>).map((t) => [t.name, t.sql]));
 
-  it("a virgin database carries the three row-guard triggers with exactly this binary's SQL, at schema v27", () => {
+  it("a virgin database carries the four row-guard triggers with exactly this binary's SQL, at schema v27", () => {
     getDb();
     expect(triggers()).toEqual(AGENT_ROW_GUARD_TRIGGERS);
     expect(CURRENT_SCHEMA_VERSION).toBe(27);

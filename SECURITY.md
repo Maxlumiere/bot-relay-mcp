@@ -163,8 +163,10 @@ Transitions are CAS-gated at each write site. Revoke never nulls `token_hash` (f
 
 - An `UPDATE` may move `auth_state` only along the edges the relay's own code takes. `revoked` is terminal: no update moves a revoked row anywhere, and the only way back is `relay recover`, which deletes the row. `recovery_pending` becomes `active` only by consuming the recovery ticket and receiving a new token. Any other move fails with `AUTH_STATE_EDGE_REFUSED`.
 - An `INSERT` may not land on the name or id of a revoked or `recovery_pending` row, so `INSERT OR REPLACE` or an upsert cannot delete and recreate one.
-- An agent's identity (name and id) never changes after creation (`AGENT_IDENTITY_IMMUTABLE`). Only a delete (`relay recover`) and a fresh register replace one, so an `UPDATE OR REPLACE` cannot rename one agent onto another and take over its name.
+- An agent's identity (name, id, and the table's hidden `rowid`) never changes after creation (`AGENT_IDENTITY_IMMUTABLE`). Only a delete (`relay recover`) and a fresh register replace one, so an `UPDATE OR REPLACE` cannot rename one agent onto another, or collide with its rowid, and take over or delete it.
 - Every rule fails closed: a check that cannot be decided (a NULL value) refuses, rather than letting SQLite substitute the column's default.
+
+**What these guards are for.** They bind stale or buggy code paths: an older relay binary, `mint-token --force`, a stray statement. They do not stop a hostile program with direct SQL access to the database file, which can simply drop the triggers. That is a same-user process, outside the relay's trust boundary. So copying one agent's token hash onto another agent's row is not guarded: the hash is salted, so no code path produces that copy by accident. Binding each token's hash to its agent's name, so that a copied hash cannot verify on another row, is a possible later change.
 
 What this does not cover: the `recovery_pending → active` rule checks the SHAPE of the write (ticket consumed, new token), not that the ticket was presented, which only the relay's code can verify. An old (pre-v27) operator binary's `relay mint-token --force` writes that shape, so it can still complete a pending recovery. A revoked agent has no such path. Deleting the row (`relay recover`) is the sanctioned way back and is not constrained.
 
