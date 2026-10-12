@@ -71,6 +71,12 @@
 # hook's stdout is a hookSpecificOutput JSON object the harness PARSES, and a
 # trailing bare line would corrupt it — an alarm that corrupts the channel it
 # rides on is worse than no alarm. Shared primitive; see hooks/_verdict.sh.
+# Tracing OFF, before anything reads a credential: an inherited xtrace (bash -x, SHELLOPTS=xtrace) would print
+# every expanded token. BASH_XTRACEFD is unset only when it names a descriptor above 2: unsetting it CLOSES that
+# descriptor (bash >= 4.1), and this script must not close its own stdin, stdout or stderr.
+{ set +x; } 2>/dev/null
+case "${BASH_XTRACEFD:-}" in '' | *[!0-9]*) ;; *) [ "$((10#$BASH_XTRACEFD))" -le 2 ] || unset BASH_XTRACEFD ;; esac
+
 RELAY_VERDICT_STREAM=stderr
 # FALLBACK VERDICT — installed BEFORE the shared helper is sourced, and this
 # ordering is the whole point. A SHARED PRIMITIVE CANNOT GUARANTEE ITS OWN
@@ -466,12 +472,12 @@ print(json.dumps({
 
   local response
   relay_budget_for "the remote mail read" 2 margin || return 125
-  response=$(curl -fsS -m "$RELAY_STEP_SECS" \
+  # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
+  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
-    -H "X-Agent-Token: $AGENT_TOKEN" \
-    --data "$payload" 2>/dev/null) || return 1
+    2>/dev/null) || return 1
 
   local out rc
   out=$(printf '%s' "$response" | SRC=http AN="$AGENT_NAME" LIM="$MAX_MESSAGES" python3 -c "$NOTICE_PY" 2>/dev/null)
@@ -557,11 +563,12 @@ if st:
 print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"report_liveness","arguments":args}}))
 ' 2>/dev/null) || return 0
   relay_budget_for "the liveness restamp" 2 margin || return 0
-  curl -fsS -m "$RELAY_STEP_SECS" -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
+  { relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+    -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
-    -H "X-Agent-Token: $AGENT_TOKEN" \
-    --data "$payload" >/dev/null 2>&1 || return 0
+    >/dev/null 2>&1 || return 0
   return 0
 }
 
