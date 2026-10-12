@@ -10,7 +10,8 @@
  * the agent token to curl as `-H "X-Agent-Token: <token>"` and inside `--data '<json with agent_token>'`, and
  * the recovery token inside `-d`, on every session start, every stop and EVERY tool call. Separately, two
  * stderr paths printed a freshly minted token (recovery with a failed vault write; RELAY_HOOK_DEBUG's dump of
- * the register reply), and a failed recovery printed 200 bytes of the reply.
+ * the register reply), and a failed recovery printed 200 bytes of the reply. A reply is now NEVER printed, only
+ * relay_reply_summary's fixed line, and every entrypoint turns an inherited xtrace off before it reads a credential.
  *
  * THE MEASUREMENT: every hook runs with a PATH that holds ONLY a shim directory: one wrapper per executable on
  * the real PATH, each appending its own name + argv to a log, then exec'ing the real binary. So the log holds
@@ -32,6 +33,7 @@ import path from "path";
 import os from "os";
 import http from "http";
 import cp from "child_process";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import { mintHeaders } from "./_helpers/mint.js";
@@ -45,8 +47,9 @@ const STOP_HOOK = path.join(HOOKS_DIR, "stop-check.sh");
 const PTU_HOOK = path.join(HOOKS_DIR, "post-tool-use-check.sh");
 const CODEX_HOOK = path.join(HOOKS_DIR, "codex", "codex-session-start.sh");
 const CODEX_RELAY = path.join(REPO_ROOT, "bin", "codex-relay");
-// /bin/bash on purpose: on macOS it is bash 3.2, the shell every user's hooks really run under.
-const BASH = "/bin/bash";
+// /bin/bash on purpose: on macOS it is bash 3.2, the shell every user's hooks really run under. RELAY_TEST_BASH
+// points the suite at another bash (a bash >= 4.1 honours BASH_XTRACEFD; Linux CI's /bin/bash is bash 5).
+const BASH = process.env.RELAY_TEST_BASH ?? "/bin/bash";
 
 const TEST_DIR = path.join(os.tmpdir(), "bot-relay-hook-argv-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DIR, "relay.db");
@@ -60,6 +63,7 @@ process.env.RELAY_WAKE_COVERAGE_STATUS_PATH = path.join(TEST_DIR, "wake-coverage
 
 const { startHttpServer } = await import("../src/transport/http.js");
 const { closeDb, getDb, registerAgent: dbRegister, revokeAgentToken } = await import("../src/db.js");
+const { ERROR_CODES } = await import("../src/error-codes.js");
 
 // A hook run starts dozens of processes, each through a shim: allow for it.
 const SLOW = { timeout: 30_000 };
@@ -192,12 +196,15 @@ interface RunResult {
   stderr: string;
 }
 
-function run(args: string[], env: Record<string, string>, stdin = ""): Promise<RunResult> {
+/** `fd5`: a file the child gets as descriptor 5 (where an inherited BASH_XTRACEFD=5 sends a trace). */
+function run(args: string[], env: Record<string, string>, stdin = "", fd5?: string): Promise<RunResult> {
   fs.rmSync(ARGV_DIR, { recursive: true, force: true });
   fs.mkdirSync(ARGV_DIR);
   seen.length = 0;
-  return new Promise((resolve, reject) => {
-    const child = cp.spawn(BASH, args, { env: { PATH: SHIM_DIR, ...env } });
+  const f5 = fd5 === undefined ? undefined : fs.openSync(fd5, "w");
+  return new Promise<RunResult>((resolve, reject) => {
+    const stdio: cp.StdioOptions = f5 === undefined ? "pipe" : ["pipe", "pipe", "pipe", "ignore", "ignore", f5];
+    const child = cp.spawn(BASH, args, { env: { PATH: SHIM_DIR, ...env }, stdio }) as cp.ChildProcessWithoutNullStreams;
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -205,6 +212,8 @@ function run(args: string[], env: Record<string, string>, stdin = ""): Promise<R
     child.on("exit", (code) => resolve({ code, stdout, stderr }));
     child.on("error", reject);
     child.stdin.end(stdin);
+  }).finally(() => {
+    if (f5 !== undefined) fs.closeSync(f5);
   });
 }
 
@@ -306,28 +315,70 @@ describe("the curl-config helper: a value reaches the server byte-exact, and can
   }
 });
 
-describe("the redactor every print site uses", () => {
-  function redact(input: string, ...secrets: string[]): Promise<RunResult> {
-    return run(["-c", `. '${HELPERS}'; printf '%s' "$IN" | relay_redact "$@"`, "redact", ...secrets], { IN: input });
+/**
+ * THE ALLOWLIST, as a grammar: every byte relay_reply_summary may print. A line that matches it carries nothing
+ * from the reply except a 3-digit status and a code from the relay's own list, so no credential can ride it.
+ */
+const SUMMARY = /^HTTP (?:[0-9]{3}|unknown), (?:error_code (?:[A-Z_]+|unlisted|none), [0-9]+ bytes, sha256 [0-9a-f]{12}|unparseable reply \([0-9]+ bytes\)|reply not parsed \([0-9]+ bytes\))$/;
+
+/** No run of `min` or more consecutive characters of `secret` appears in `out` (catches a prefix, suffix or split). */
+function expectNoFragment(out: string, secret: string, min = 6): void {
+  expect(secret.length, "precondition: a real secret").toBeGreaterThanOrEqual(min);
+  const hits: string[] = [];
+  for (let i = 0; i + min <= secret.length; i++) if (out.includes(secret.slice(i, i + min))) hits.push(secret.slice(i, i + min));
+  expect(hits, `output held a fragment of a secret (${secret.slice(0, 4)}…)`).toEqual([]);
+}
+
+describe("the reply summary every print site uses: a fixed line, never the reply", () => {
+  function summary(input: string, env: Record<string, string> = {}): Promise<RunResult> {
+    return run(["-c", `. '${HELPERS}'; printf '%s' "$IN" | relay_reply_summary`], { IN: input, ...env });
+  }
+  const SECRET = "abcdefgh12345678";
+
+  it("the allowlist is EXACTLY the relay's error codes (src/error-codes.ts): drift fails here", async () => {
+    const r = await run(["-c", `. '${HELPERS}'; printf '%s' "$RELAY_REPLY_ERROR_CODES"`], {});
+    expect(r.stdout.split(" ").sort()).toEqual([...Object.values(ERROR_CODES)].sort());
+  });
+
+  it("an SSE reply: the status and an allowlisted code nested in the tool's stringified content are named", async () => {
+    const reply = `event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"{\\"error\\":\\"bad ${SECRET}\\",\\"error_code\\":\\"AUTH_FAILED\\"}"}]}}\n\nHTTP_STATUS:200\n`;
+    const r = await summary(reply);
+    expect(r.stdout).toMatch(/^HTTP 200, error_code AUTH_FAILED, [0-9]+ bytes, sha256 [0-9a-f]{12}\n$/);
+    expectNoFragment(r.stdout, SECRET);
+  });
+
+  it("a code NOT in the allowlist is `unlisted`, never printed (a credential placed in error_code)", async () => {
+    const r = await summary(`{"error_code":"${SECRET}"}`);
+    expect(r.stdout).toMatch(/^HTTP unknown, error_code unlisted, /);
+    expectNoFragment(r.stdout, SECRET);
+  });
+
+  it("a malformed reply is `unparseable reply (N bytes)`, nothing of it printed", async () => {
+    const r = await summary(`not json ${SECRET}\nHTTP_STATUS:502\n`);
+    expect(r.stdout).toBe(`HTTP 502, unparseable reply (${`not json ${SECRET}`.length} bytes)\n`);
+  });
+
+  for (const [label, reply] of [
+    ["ESCAPED (a \\u escape inside the credential)", `{"agent_token":"abcd\\u0065fgh12345678","error_code":"AUTH_FAILED"}`],
+    ["SPLIT across a line break", `{"error":"echo abcdefgh\\n12345678","error_code":"VALIDATION"}`],
+    ["SPLIT across SSE data lines (unparseable)", `data: {"error":"abcdefgh\ndata: 12345678"}`],
+  ] as const) {
+    it(`an echo ${label}: the line matches the grammar and holds no fragment`, async () => {
+      const r = await summary(reply);
+      expectNoFragment(r.stdout, SECRET);
+      expectNoFragment(r.stdout, "fgh12345678");
+      expect(r.stdout.trimEnd()).toMatch(SUMMARY);
+    });
   }
 
-  it("a known secret is replaced wherever it appears, glob characters taken literally", async () => {
-    const secret = "S3cr*t[x]?_value";
-    const r = await redact(`before ${secret} middle ${secret} after; S3crXt_value stays`, secret);
-    expect(r.stdout).toBe("before <redacted> middle <redacted> after; S3crXt_value stays\n");
+  it("without node the line still matches the grammar (bytes only)", async () => {
+    const bin = path.join(TEST_DIR, "no-node-bin");
+    fs.mkdirSync(bin, { recursive: true });
+    for (const t of ["wc", "tr"]) if (!fs.existsSync(path.join(bin, t))) fs.symlinkSync(path.join(SHIM_DIR, t), path.join(bin, t));
+    const r = await run(["-c", `PATH='${bin}'; . '${HELPERS}'; printf '%s' "$IN" | relay_reply_summary`], { IN: `{"agent_token":"${SECRET}"}` });
+    expect(r.stdout.trimEnd()).toMatch(/^HTTP unknown, reply not parsed \([0-9]+ bytes\)$/);
+    expectNoFragment(r.stdout, SECRET);
   });
-
-  it("an UNKNOWN credential is replaced by its field name, escaped (the SSE-wrapped reply) or not", async () => {
-    const r = await redact(`{"agent_token":"aaaaaaaaaa","x":"keep"} and \\"recovery_token\\": \\"bbbbbbbbbb\\", \\"mint_secret\\":\\"cccccccccc\\"`);
-    expect(r.stdout).not.toMatch(/aaaaaaaaaa|bbbbbbbbbb|cccccccccc/);
-    expect(r.stdout).toContain(`"x":"keep"`);
-  });
-
-  it("short or empty arguments are ignored (they would redact common text)", async () => {
-    const r = await redact("a b c", "", "a");
-    expect(r.stdout).toBe("a b c\n");
-  });
-
 });
 
 describe("check-relay.sh (SessionStart)", SLOW, () => {
@@ -350,7 +401,9 @@ describe("check-relay.sh (SessionStart)", SLOW, () => {
     const r = await run([CHECK_RELAY], { ...localEnv(name, h), RELAY_HOOK_DEBUG: "1" });
     const minted = mintedTokens();
     expect(minted.length, `precondition: the relay minted a token. stderr: ${r.stderr}`).toBe(1);
-    expect(r.stderr, "precondition: the debug dump ran").toContain("register_agent response");
+    const line = r.stderr.split("\n").find((l) => l.startsWith("[bot-relay hook debug] register_agent reply: "));
+    expect(line, `precondition: the debug dump ran. stderr: ${r.stderr}`).toBeDefined();
+    expect(line!.replace("[bot-relay hook debug] register_agent reply: ", "")).toMatch(SUMMARY);
     expect(r.stderr).not.toContain(minted[0]);
     expect(r.stdout).not.toContain(minted[0]);
   });
@@ -398,27 +451,58 @@ describe("check-relay.sh (SessionStart)", SLOW, () => {
   it("a FAILED recovery prints no part of either credential", async () => {
     const name = "argv-cr-badticket";
     const { token } = revokedWithTicket(name);
-    const wrong = "wrongticket_" + "x".repeat(24);
+    const wrong = "zq" + crypto.randomBytes(16).toString("hex"); // random: no fragment occurs in hook text by chance
     const r = await run([CHECK_RELAY], { ...localEnv(name, home("cr-badticket"), token), RELAY_RECOVERY_TOKEN: wrong });
-    expect(r.stderr, `precondition: the failed-recovery branch ran`).toMatch(/Recovery attempt failed/);
-    expect(r.stderr).not.toContain(wrong);
-    expect(r.stderr).not.toContain(token);
+    const line = r.stderr.split("\n").find((l) => l.includes("Recovery attempt failed"));
+    expect(line, `precondition: the failed-recovery branch ran. stderr: ${r.stderr}`).toBeDefined();
+    expect(line!.replace(`[relay] Recovery attempt failed for "${name}": `, "")).toMatch(SUMMARY);
+    expect(line, "the line names the reply's real HTTP status (curl -w)").toMatch(/: HTTP [0-9]{3}, /);
+    for (const s of [wrong, token]) {
+      expectNoFragment(r.stderr, s);
+      expectNoFragment(r.stdout, s);
+    }
     expectNoArgvHolds([token, wrong]);
   });
 
-  it("a failed recovery whose reply ECHOES the ticket across the 200-byte cut prints no part of it", async () => {
-    const name = "argv-cr-echo";
-    const { token } = revokedWithTicket(name);
-    const wrong = "echoedticket_" + "y".repeat(24);
-    // The reply's first 200 bytes end INSIDE the ticket: cutting before redacting would print its prefix,
-    // which no longer matches the whole secret. A non-token field name, so only the value match can catch it.
-    const head = `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"echo: `;
-    const reply = head + "p".repeat(190 - head.length) + wrong + `"}]}}`;
-    rewrite = (body) => (body.includes(wrong) ? reply : null);
+  for (const [label, echo] of [
+    ["ESCAPED", (t: string) => `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"echo: ${t.slice(0, 4)}\\u00${t.charCodeAt(4).toString(16)}${t.slice(5)}"}]}}`],
+    ["SPLIT", (t: string) => `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"echo: ${t.slice(0, 12)}\\n${t.slice(12)}"}]}}`],
+    ["RAW, past the old 200-byte cut", (t: string) => `{"error":"${"p".repeat(190)}${t}"}`],
+  ] as const) {
+    it(`a failed recovery whose reply echoes the ticket ${label} prints no fragment of it`, async () => {
+      const name = `argv-cr-echo-${label.slice(0, 3).toLowerCase()}`;
+      const { token } = revokedWithTicket(name);
+      const wrong = "zq" + crypto.randomBytes(16).toString("hex");
+      rewrite = (body) => (body.includes(wrong) ? echo(wrong) : null);
+      try {
+        const r = await run([CHECK_RELAY], { ...localEnv(name, home(`cr-echo-${label.slice(0, 3)}`), token), RELAY_RECOVERY_TOKEN: wrong });
+        expect(seen.some((x) => x.reply === echo(wrong)), "precondition: the proxy served the echoing reply").toBe(true);
+        const line = r.stderr.split("\n").find((l) => l.includes("Recovery attempt failed"));
+        expect(line, `precondition: the failed-recovery branch ran. stderr: ${r.stderr}`).toBeDefined();
+        expectNoFragment(r.stderr, wrong);
+        expectNoFragment(r.stdout, wrong);
+        expect(line!.replace(`[relay] Recovery attempt failed for "${name}": `, "")).toMatch(SUMMARY);
+      } finally {
+        rewrite = null;
+      }
+    });
+  }
+
+  it("RELAY_HOOK_DEBUG with a reply that REFLECTS the sent registration secret: the secret is never printed", async () => {
+    const name = "argv-cr-reflect";
+    const secret = mintHeaders(TEST_DB_PATH)["X-Relay-Secret"];
+    const reply = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { isError: true, content: [{ type: "text", text: JSON.stringify({ error: `X-Relay-Secret: ${secret}`, error_code: "MINT_SECRET_REQUIRED" }) }] } });
+    rewrite = (body) => (body.includes('"register_agent"') ? reply : null);
     try {
-      const r = await run([CHECK_RELAY], { ...localEnv(name, home("cr-echo"), token), RELAY_RECOVERY_TOKEN: wrong });
-      expect(r.stderr, "precondition: the failed-recovery branch printed the reply").toMatch(/Recovery attempt failed.*Response: \{"jsonrpc"/);
-      expect(r.stderr).not.toContain(wrong.slice(0, 10));
+      const r = await run([CHECK_RELAY], { ...localEnv(name, home("cr-reflect")), RELAY_HOOK_DEBUG: "1" });
+      const reg = toolCalls("register_agent");
+      expect(reg.length, `precondition: register ran. stderr: ${r.stderr}`).toBe(1);
+      expect(reg[0].headers["x-relay-secret"], "precondition: the hook SENT the secret the reply reflects").toBe(secret);
+      const line = r.stderr.split("\n").find((l) => l.startsWith("[bot-relay hook debug] register_agent reply: "));
+      expect(line, `precondition: the debug dump ran. stderr: ${r.stderr}`).toBeDefined();
+      expectNoFragment(r.stderr, secret, 8);
+      expectNoFragment(r.stdout, secret, 8);
+      expect(line!.replace("[bot-relay hook debug] register_agent reply: ", "")).toMatch(/^HTTP 200, error_code MINT_SECRET_REQUIRED, /);
     } finally {
       rewrite = null;
     }
@@ -505,4 +589,180 @@ describe("the mint secret is still sent (no regression of PR-D's stdin config)",
     expect(mintedTokens().length).toBe(1);
     expectNoArgvHolds([mintHeaders(TEST_DB_PATH)["X-Relay-Secret"]]);
   });
+});
+
+/**
+ * #319 R2 (3): an INHERITED xtrace must not print a credential. Every entrypoint turns tracing off, as its first
+ * statement, before it reads one. Three ways a trace is inherited: `bash -x script`, SHELLOPTS=xtrace in the
+ * environment, and SHELLOPTS=xtrace with BASH_XTRACEFD=5 (bash >= 4.1 writes the trace to descriptor 5: a file
+ * here). Every output (stdout, stderr, descriptor 5) is checked for every credential the run held.
+ */
+const TRACE_OFF = [`{ set +x; } 2>/dev/null`, `case "\${BASH_XTRACEFD:-}" in '' | *[!0-9]*) ;; *) [ "$((10#$BASH_XTRACEFD))" -le 2 ] || unset BASH_XTRACEFD ;; esac`];
+
+/** Every script that must turn tracing off first: each hook entrypoint, and each script that sources the vault helpers. */
+function traceEntrypoints(): string[] {
+  const out = new Set<string>();
+  const walk = (dir: string): void => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const f = path.join(dir, e.name);
+      if (e.isDirectory()) walk(f);
+      else if (e.isFile()) {
+        const text = fs.readFileSync(f, "utf-8");
+        if (!/^#!.*\b(ba)?sh\b/.test(text)) continue;
+        const rel = path.relative(REPO_ROOT, f).split(path.sep).join("/");
+        if ((rel.startsWith("hooks/") && !path.basename(f).startsWith("_")) || /^\s*(\.|source)\s+\S*_vault-helpers\.sh/m.test(text)) out.add(rel);
+      }
+    }
+  };
+  for (const d of ["hooks", "bin", "scripts"]) walk(path.join(REPO_ROOT, d));
+  return [...out].sort();
+}
+
+describe("#319 R2: every entrypoint turns an inherited trace off FIRST (structural)", () => {
+  it("each hook entrypoint and each vault-helpers consumer opens with the trace-off block, before any other statement", () => {
+    const eps = traceEntrypoints();
+    // precondition: the derivation found the scripts it exists for (a derivation that finds nothing passes vacuously)
+    for (const known of ["bin/codex-relay", "bin/spawn-agent.sh", "hooks/check-relay.sh", "hooks/codex/codex-session-start.sh", "hooks/post-tool-use-check.sh", "hooks/stop-check.sh", "scripts/migrate-existing-tokens-to-vault.sh"]) {
+      expect(eps).toContain(known);
+    }
+    const bad: string[] = [];
+    for (const rel of eps) {
+      const stmts = fs.readFileSync(path.join(REPO_ROOT, rel), "utf-8").split("\n").slice(1).filter((l) => l.trim() !== "" && !l.trimStart().startsWith("#"));
+      if (stmts[0] !== TRACE_OFF[0] || stmts[1] !== TRACE_OFF[1]) bad.push(`${rel}: first statements are ${JSON.stringify(stmts.slice(0, 2))}`);
+    }
+    expect(bad).toEqual([]);
+  });
+});
+
+describe("#319 R2: an inherited trace prints no credential (behavioural)", SLOW, () => {
+  type Mode = { label: string; args: (script: string) => string[]; env: Record<string, string>; fd5: boolean };
+  const MODES: Mode[] = [
+    { label: "bash -x", args: (s) => ["-x", s], env: {}, fd5: false },
+    { label: "SHELLOPTS=xtrace", args: (s) => [s], env: { SHELLOPTS: "xtrace" }, fd5: false },
+    { label: "SHELLOPTS=xtrace + BASH_XTRACEFD=5", args: (s) => [s], env: { SHELLOPTS: "xtrace", BASH_XTRACEFD: "5" }, fd5: true },
+  ];
+
+  /** Precondition per mode: in THIS bash, the mode really traces (a probe script's command shows up in a trace). */
+  async function modeTraces(m: Mode): Promise<void> {
+    const probe = path.join(TEST_DIR, "trace-probe.sh");
+    fs.writeFileSync(probe, "#!/bin/bash\nPROBE_VALUE=tracedprobe\n", { mode: 0o755 });
+    const f5 = path.join(TEST_DIR, "probe-fd5");
+    const r = await run(m.args(probe), m.env, "", m.fd5 ? f5 : undefined);
+    const trace = r.stderr + (m.fd5 ? fs.readFileSync(f5, "utf-8") : "");
+    expect(trace, `precondition: ${m.label} traces in ${BASH}`).toContain("PROBE_VALUE=tracedprobe");
+  }
+
+  type Case = { label: string; script: string; stdin?: string; setup: () => { env: Record<string, string>; secrets: string[]; site: () => number } };
+  const CASES: Case[] = [
+    {
+      label: "check-relay.sh (token: health_check + register, the mint secret read)",
+      script: CHECK_RELAY,
+      setup: () => {
+        const name = "xt-cr-" + crypto.randomBytes(3).toString("hex");
+        const token = dbRegister(name, "tester", []).plaintext_token as string;
+        return { env: localEnv(name, home(name), token), secrets: [token, mintHeaders(TEST_DB_PATH)["X-Relay-Secret"]], site: () => toolCalls("register_agent").length };
+      },
+    },
+    {
+      label: "check-relay.sh (first spawn: the minted token)",
+      script: CHECK_RELAY,
+      setup: () => {
+        const name = "xt-mint-" + crypto.randomBytes(3).toString("hex");
+        return { env: localEnv(name, home(name)), secrets: [mintHeaders(TEST_DB_PATH)["X-Relay-Secret"]], site: () => mintedTokens().length };
+      },
+    },
+    {
+      label: "check-relay.sh (recovery: the ticket)",
+      script: CHECK_RELAY,
+      setup: () => {
+        const name = "xt-rec-" + crypto.randomBytes(3).toString("hex");
+        const token = dbRegister(name, "tester", []).plaintext_token as string;
+        const ticket = revokeAgentToken(name, { issueRecovery: true }).recoveryToken as string;
+        return { env: { ...localEnv(name, home(name), token), RELAY_RECOVERY_TOKEN: ticket }, secrets: [token, ticket], site: () => toolCalls("register_agent").filter((c) => c.args.recovery_token !== undefined).length };
+      },
+    },
+    {
+      label: "stop-check.sh (remote mail read)",
+      script: STOP_HOOK,
+      stdin: STOP_STDIN,
+      setup: () => {
+        const name = "xt-stop-" + crypto.randomBytes(3).toString("hex");
+        const token = dbRegister(name, "tester", []).plaintext_token as string;
+        return { env: remoteEnv(name, home(name), token), secrets: [token], site: () => toolCalls("get_messages").length };
+      },
+    },
+    {
+      label: "post-tool-use-check.sh (remote mail read)",
+      script: PTU_HOOK,
+      stdin: PTU_STDIN,
+      setup: () => {
+        const name = "xt-ptu-" + crypto.randomBytes(3).toString("hex");
+        const token = dbRegister(name, "tester", []).plaintext_token as string;
+        return { env: remoteEnv(name, home(name), token), secrets: [token], site: () => toolCalls("get_messages").length };
+      },
+    },
+    {
+      label: "codex-session-start.sh (discover + register)",
+      script: CODEX_HOOK,
+      stdin: JSON.stringify({ session_id: "c0dec0de-0000-0000-0000-000000000002", hook_event_name: "SessionStart" }),
+      setup: () => {
+        const name = "xt-cx-" + crypto.randomBytes(3).toString("hex");
+        const token = dbRegister(name, "auditor", []).plaintext_token as string;
+        return { env: { ...localEnv(name, home(name), token), RELAY_AGENT_ROLE: "auditor", RELAY_LAUNCH_SESSION: "0123abcd-0000-0000-0000-000000000001" }, secrets: [token], site: () => toolCalls("register_agent").length };
+      },
+    },
+  ];
+
+  for (const m of MODES) {
+    for (const c of CASES) {
+      it(`${m.label}: ${c.label}: no credential in stdout, stderr${m.fd5 ? " or descriptor 5" : ""}`, async () => {
+        await modeTraces(m);
+        const { env, secrets, site } = c.setup();
+        const f5 = path.join(TEST_DIR, "trace-fd5");
+        const r = await run(m.args(c.script), { ...env, ...m.env }, c.stdin ?? "", m.fd5 ? f5 : undefined);
+        expect(site(), `precondition: the credential-carrying call ran. stderr: ${r.stderr.slice(-2000)}`).toBeGreaterThan(0);
+        const all = [...secrets, ...mintedTokens()];
+        const outputs = { stdout: r.stdout, stderr: r.stderr, fd5: m.fd5 ? fs.readFileSync(f5, "utf-8") : "" };
+        for (const [where, text] of Object.entries(outputs)) for (const sec of all) expect(text.includes(sec), `${where} held a credential (${sec.slice(0, 4)}…)`).toBe(false);
+      });
+    }
+  }
+
+  it("bin/codex-relay under SHELLOPTS=xtrace: no credential in stdout or stderr (Codex itself is stubbed)", async () => {
+    await modeTraces(MODES[1]);
+    const name = "xt-cxr-" + crypto.randomBytes(3).toString("hex");
+    const token = dbRegister(name, "auditor", []).plaintext_token as string;
+    const h = home(name);
+    const stub = path.join(h, "codex-stub.sh");
+    fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const env: Record<string, string> = { ...localEnv(name, h, token), RELAY_AGENT_ROLE: "auditor", RELAY_CODEX_LAUNCHER: stub, SHELLOPTS: "xtrace" };
+    delete env.RELAY_AGENT_NAME;
+    const r = await run([CODEX_RELAY, name], env);
+    expect(toolCalls("register_agent").length, `precondition: the launch register ran. stderr: ${r.stderr.slice(-2000)}`).toBe(1);
+    for (const sec of [token, mintHeaders(TEST_DB_PATH)["X-Relay-Secret"], ...mintedTokens()]) {
+      expect(r.stdout.includes(sec)).toBe(false);
+      expect(r.stderr.includes(sec)).toBe(false);
+    }
+  });
+
+  /**
+   * TWIN of the guard: an inherited BASH_XTRACEFD naming stdout or stderr must NOT be unset (that CLOSES it, bash
+   * >= 4.1): the hook's own output still arrives. On bash 3.2 (no BASH_XTRACEFD) the hazard cannot occur, and the
+   * probe below says so instead of passing silently.
+   */
+  for (const fd of ["1", "2"]) {
+    it(`BASH_XTRACEFD=${fd} inherited: check-relay.sh's stdout and stderr still arrive`, async () => {
+      const probe = await run(["-c", `unset BASH_XTRACEFD; echo out-ok; echo err-ok >&2`], { BASH_XTRACEFD: fd });
+      const hazard = !(probe.stdout.includes("out-ok") && probe.stderr.includes("err-ok"));
+      const [major, minor] = (await run(["-c", 'printf "%s %s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}"'], {})).stdout.split(" ").map(Number);
+      // precondition: a bash that honours BASH_XTRACEFD (>= 4.1) shows the hazard (a plain unset closes the descriptor)
+      expect(hazard, `bash ${major}.${minor}: did a plain unset close descriptor ${fd}?`).toBe(major > 4 || (major === 4 && minor >= 1));
+      const name = "xt-fd" + fd + "-" + crypto.randomBytes(3).toString("hex");
+      const token = dbRegister(name, "tester", []).plaintext_token as string;
+      const r = await run([CHECK_RELAY], { ...localEnv(name, home(name), token), SHELLOPTS: "xtrace", BASH_XTRACEFD: fd });
+      expect(r.stdout, `stdout lost. stderr: ${r.stderr.slice(-1000)}`).toContain("[RELAY]");
+      expect(r.stderr.length, "stderr lost").toBeGreaterThan(0);
+      expect(r.stdout.includes(token) || r.stderr.includes(token)).toBe(false);
+    });
+  }
 });

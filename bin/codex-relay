@@ -38,6 +38,12 @@
 # The register is BOUNDED-SYNC (tight deadline) and BEST-EFFORT: a down/slow
 # daemon, no token, or a live-collision is a no-op and Codex still launches
 # promptly. RELAY_CODEX_LAUNCHER overrides the launched binary.
+# Tracing OFF, before anything reads a credential: an inherited xtrace (bash -x, SHELLOPTS=xtrace) would print
+# every expanded token. BASH_XTRACEFD is unset only when it names a descriptor above 2: unsetting it CLOSES that
+# descriptor (bash >= 4.1), and this script must not close its own stdin, stdout or stderr.
+{ set +x; } 2>/dev/null
+case "${BASH_XTRACEFD:-}" in '' | *[!0-9]*) ;; *) [ "$((10#$BASH_XTRACEFD))" -le 2 ] || unset BASH_XTRACEFD ;; esac
+
 set -u
 
 # --- args + env (mirrors the hooks) -----------------------------------------

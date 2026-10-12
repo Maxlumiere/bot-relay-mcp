@@ -37,6 +37,12 @@
 # Shared with every other relay hook so there is ONE implementation and no
 # inline copy can rot silently. See hooks/_verdict.sh for the full rationale,
 # the two invariants, and the honest boundary (SIGKILL / hook-never-runs).
+# Tracing OFF, before anything reads a credential: an inherited xtrace (bash -x, SHELLOPTS=xtrace) would print
+# every expanded token. BASH_XTRACEFD is unset only when it names a descriptor above 2: unsetting it CLOSES that
+# descriptor (bash >= 4.1), and this script must not close its own stdin, stdout or stderr.
+{ set +x; } 2>/dev/null
+case "${BASH_XTRACEFD:-}" in '' | *[!0-9]*) ;; *) [ "$((10#$BASH_XTRACEFD))" -le 2 ] || unset BASH_XTRACEFD ;; esac
+
 RELAY_VERDICT_STREAM=stdout
 # FALLBACK VERDICT — installed BEFORE the shared helper is sourced, and this
 # ordering is the whole point. A SHARED PRIMITIVE CANNOT GUARANTEE ITS OWN
@@ -837,7 +843,7 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
     fi
     # The body holds the recovery token: it rides curl's config on STDIN, never argv (relay_curl_config_line).
     RECOVERY_BODY=$(relay_curl_config_line data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" \
-      | curl -s -m "$RELAY_STEP_SECS" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+      | curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
       -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
       2>/dev/null)
@@ -864,7 +870,8 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
         fi
       fi
     else
-      echo "[relay] Recovery attempt failed for \"$AGENT_NAME\". Response: $(printf '%s' "$RECOVERY_BODY" | relay_redact "${RELAY_RECOVERY_TOKEN:-}" "${RELAY_AGENT_TOKEN:-}" | head -c 200)" >&2
+      # A summary, never the reply: its free text can echo the recovery token (relay_reply_summary).
+      echo "[relay] Recovery attempt failed for \"$AGENT_NAME\": $(printf '%s' "$RECOVERY_BODY" | relay_reply_summary)" >&2
       # ADR-0036 S1 (D7): the EXIT trap would otherwise print the HEALTHY set above.
       [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2>&1 \
         && relay_verdict_set "AUTH_FAILED" "recovery with RELAY_RECOVERY_TOKEN failed" " agent=\"$AGENT_NAME\""
@@ -1152,14 +1159,14 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
       echo "[relay] Choose a unique RELAY_AGENT_NAME and restart, or set RELAY_HOOK_DEBUG=1 to see the server's reason." >&2
     fi
   fi
-  # If $RELAY_HOOK_DEBUG is set, print the full response for troubleshooting.
+  # If $RELAY_HOOK_DEBUG is set, print a SUMMARY of the reply (status + allowlisted error_code), never the reply.
   # Otherwise stay quiet: the token-less failure case is announced just above, and
   # a stale/revoked-token case was already surfaced (with exit 1) by the earlier
   # health_check probe. We just don't want to corrupt the DB with a fallback
   # sqlite3 write.
   if [ -n "${RELAY_HOOK_DEBUG:-}" ]; then
-    echo "[bot-relay hook debug] register_agent response (credentials redacted):" >&2
-    printf '%s' "$REG_BODY" | relay_redact "${RELAY_AGENT_TOKEN:-}" "${REG_TOKEN:-}" >&2
+    # A summary, never the reply: it carries the minted token, and its free text can echo the sent secret.
+    echo "[bot-relay hook debug] register_agent reply: $(printf '%s' "$REG_BODY" | relay_reply_summary)" >&2
   fi
 fi
 
