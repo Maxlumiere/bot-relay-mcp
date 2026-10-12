@@ -17,7 +17,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { performance } from "perf_hooks";
-import { LAPSE_MAX_BUSY, OCCUPANCY_FLOOR, lapseReport, lapsedPool, occupancy, type PoolWork } from "./_helpers/pool-occupancy.js";
+import { LAPSE_MAX_BUSY, OCCUPANCY_FLOOR, lapseReport, lapsedPool, occupancy, type PoolOccupancy, type PoolWork } from "./_helpers/pool-occupancy.js";
 
 const SCAN_BURST = 3; // src/auth-throttle.ts (the design constant the real control uses)
 const ROWS = 4;
@@ -31,7 +31,7 @@ const poolControl = (c: number): PoolWork => (track) =>
   );
 
 /** One window, as measureWindow opens and closes it: from the pool's start to the end of its work. */
-async function busyOf(work: PoolWork): Promise<{ busy: number }> {
+async function busyOf(work: PoolWork): Promise<PoolOccupancy> {
   const spans: Array<[number, number]> = [];
   const track = async <T,>(p: () => Promise<T>): Promise<T> => {
     const start = performance.now();
@@ -44,7 +44,7 @@ async function busyOf(work: PoolWork): Promise<{ busy: number }> {
   const t0 = performance.now();
   await work(track);
   const t1 = performance.now();
-  return { busy: occupancy(spans, t0, t1).busy };
+  return occupancy(spans, t0, t1);
 }
 
 // 20 ms: a fast host; 90 ms: the M2 measured above; 300 and 600 ms: runners 3x and 6x slower than it.
@@ -54,8 +54,8 @@ describe("the lapse demo lapses at every runner speed (architect ruling 1850c978
   for (const c of SPEEDS) {
     it(`a ${c} ms compare: the lapse demo reads busy <= ${LAPSE_MAX_BUSY} (floor ${OCCUPANCY_FLOOR} minus its margin)`, async () => {
       const lapsed = lapsedPool(poolControl(c), simulatedCompare(c));
-      const { busy } = await busyOf(lapsed);
-      expect(busy, lapseReport(busy, lapsed.stats)).toBeLessThanOrEqual(LAPSE_MAX_BUSY);
+      const reading = await busyOf(lapsed);
+      expect(reading.busy, lapseReport(reading, lapsed.stats)).toBeLessThanOrEqual(LAPSE_MAX_BUSY);
     }, 20_000);
 
     it(`TWIN, a ${c} ms compare: the same pool work WITHOUT the lapse reads busy >= the floor (still accepted as loaded)`, async () => {
@@ -63,4 +63,25 @@ describe("the lapse demo lapses at every runner speed (architect ruling 1850c978
       expect(busy).toBeGreaterThanOrEqual(OCCUPANCY_FLOOR);
     }, 20_000);
   }
+});
+
+describe("the lapse report names the window the occupancy was computed over (Codex #320 P3)", () => {
+  it("a measured window LONGER than the demo (requests outlasted it): the report's window is t1 - t0, not the demo's run", async () => {
+    const lapsed = lapsedPool(poolControl(20), simulatedCompare(20));
+    const spans: Array<[number, number]> = [];
+    const t0 = performance.now();
+    await lapsed(async (p) => {
+      const start = performance.now();
+      try {
+        return await p();
+      } finally {
+        spans.push([start, performance.now()]);
+      }
+    });
+    const t1 = performance.now() + 5_000; // the window closed 5 s after the demo ended
+    const reading = occupancy(spans, t0, t1);
+    expect(reading.window).toBe(t1 - t0);
+    expect(lapseReport(reading, lapsed.stats)).toContain(`window ${(t1 - t0).toFixed(0)} ms`);
+    expect(lapseReport(reading, lapsed.stats)).toContain(`demo ${lapsed.stats.demo.toFixed(0)} ms`);
+  });
 });

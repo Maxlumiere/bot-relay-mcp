@@ -623,8 +623,8 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       expect(neg.perRound, "the loaded negative's auth arm did the design's compares (it exercised the same path)").toEqual(Array(K).fill(4 * SCAN_BURST));
       expectTrips(neg); // includes: nothing shed on any arm
       // The demo's SELF-CHECK (architect 1850c978): it must reach its designed state, a margin under the floor, or it
-      // proves nothing. Its message names D, C, the idle and the window.
-      expect(r.pool!.busy, lapseReport(r.pool!.busy, lapsed.stats)).toBeLessThanOrEqual(LAPSE_MAX_BUSY);
+      // proves nothing. Its message names D, C, the idle, the demo's run and the measured window (t1 - t0).
+      expect(r.pool!.busy, lapseReport(r.pool!, lapsed.stats)).toBeLessThanOrEqual(LAPSE_MAX_BUSY);
       const lapsedBar: BarStats = { ...bar, label: "lapse demo", control: Array(K).fill(r), control2: Array(K).fill(r), pooled: true };
       expect(() => expectControlLoaded(lapsedBar, 4 * SCAN_BURST + 1)).toThrow(/INSTRUMENT FAULT/);
       // THE WIRING MUTANT, THROUGH runBar: a measure that drops the occupancy reading on a bar DECLARED pool-loaded.

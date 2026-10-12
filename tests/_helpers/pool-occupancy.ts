@@ -26,6 +26,8 @@ export interface PoolOccupancy {
   total: number;
   /** Fraction of the window with at least one control compare in flight. */
   busy: number;
+  /** The window itself, t1 - t0 (ms): the denominator of `busy`. */
+  window: number;
 }
 
 /**
@@ -52,7 +54,7 @@ export function occupancy(spans: Array<[number, number]>, t0: number, t1: number
     }
   }
   if (cur) busyMs += cur[1] - cur[0];
-  return { inWindow, total: spans.length, busy: t1 > t0 ? busyMs / (t1 - t0) : 0 };
+  return { inWindow, total: spans.length, busy: t1 > t0 ? busyMs / (t1 - t0) : 0, window: t1 - t0 };
 }
 
 /**
@@ -75,8 +77,11 @@ export interface LapseStats {
    * pool phase is what can still keep the demo from lapsing: the report names it.
    */
   last: number;
-  /** The whole demo, pool start to its last compare's end (measureWindow's window), ms. */
-  window: number;
+  /**
+   * The demo's own run, pool start to its last compare's end, ms. NOT the occupancy window: measureWindow closes
+   * that after the requests too, so it can be longer (the report prints both).
+   */
+  demo: number;
 }
 
 /**
@@ -85,7 +90,7 @@ export interface LapseStats {
  * at ANY runner speed, and the check must read it as an INSTRUMENT FAULT. `stats` is filled by each run.
  */
 export function lapsedPool(poolControl: PoolWork, oneCompare: () => Promise<unknown>): PoolWork & { stats: LapseStats } {
-  const stats: LapseStats = { d: 0, c: 0, idle: 0, last: 0, window: 0 };
+  const stats: LapseStats = { d: 0, c: 0, idle: 0, last: 0, demo: 0 };
   const work: PoolWork = async (track) => {
     let c = 0;
     const timed = async <T,>(p: () => Promise<T>): Promise<T> => {
@@ -105,11 +110,11 @@ export function lapsedPool(poolControl: PoolWork, oneCompare: () => Promise<unkn
     const t1 = performance.now();
     await track(oneCompare);
     stats.last = performance.now() - t1;
-    stats.window = performance.now() - t0;
+    stats.demo = performance.now() - t0;
   };
   return Object.assign(work, { stats });
 }
 
 /** The self-check's message: what the demo did, so "did not lapse" names its own cause. */
-export const lapseReport = (busy: number, s: LapseStats): string =>
-  `control did not lapse: busy ${busy.toFixed(3)} (D ${s.d.toFixed(0)} ms, C ${s.c.toFixed(0)} ms, idle ${s.idle.toFixed(0)} ms, last compare ${s.last.toFixed(0)} ms, window ${s.window.toFixed(0)} ms)`;
+export const lapseReport = (reading: PoolOccupancy, s: LapseStats): string =>
+  `control did not lapse: busy ${reading.busy.toFixed(3)} over window ${reading.window.toFixed(0)} ms (D ${s.d.toFixed(0)} ms, C ${s.c.toFixed(0)} ms, idle ${s.idle.toFixed(0)} ms, last compare ${s.last.toFixed(0)} ms, demo ${s.demo.toFixed(0)} ms)`;
