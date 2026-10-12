@@ -62,7 +62,7 @@ function deadPid(): { pid: number; start: string } {
 
 describe("ADR-0047 PR 2 — schema v26: the connectors table", () => {
   it("a fresh DB is at v26 and has the table, keyed (edge_id, pid, pid_start)", () => {
-    expect(db.getSchemaVersion()).toBe(26);
+    expect(db.getSchemaVersion()).toBe(27);
     const pk = db.getDb().prepare("SELECT name FROM pragma_table_info('connectors') WHERE pk > 0 ORDER BY pk").all() as Array<{ name: string }>;
     expect(pk.map((c) => c.name)).toEqual(["edge_id", "pid", "pid_start"]);
   });
@@ -70,7 +70,7 @@ describe("ADR-0047 PR 2 — schema v26: the connectors table", () => {
     db.recordOwnConnector({ parent: null, build: LOADED_BUILD });
     db.closeDb();
     await db.initializeDb();
-    expect(db.getSchemaVersion()).toBe(26);
+    expect(db.getSchemaVersion()).toBe(27);
     expect(rows()).toHaveLength(1);
   });
   it("a FOREIGN edge is refused by the database (ADR-0043: rows are stamped from relay_edge only)", () => {

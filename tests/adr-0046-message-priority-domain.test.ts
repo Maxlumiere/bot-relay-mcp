@@ -75,9 +75,9 @@ describe("ADR-0046 — messages.priority is a closed domain, enforced at write",
     expect(() => db.sendMessage("a46-s", "a46-r", "hi", "high")).not.toThrow();
   });
 
-  it("no bump of its own (it rode the unreleased v25), no table rebuild: the version is the current one (v26 = ADR-0047's connectors)", () => {
+  it("no bump of its own (it rode the unreleased v25), no table rebuild: the version is the current one (v27 = SEC-20.T2's auth_state edge triggers)", () => {
     const v = (db.getDb().prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number }).version;
-    expect(v).toBe(26);
+    expect(v).toBe(27);
   });
 });
 
