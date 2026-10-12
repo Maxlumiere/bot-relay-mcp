@@ -11,7 +11,7 @@
  * probes and dead holders are separate processes (a second descriptor on a lock file inside the
  * holder's process would drop its POSIX lock).
  */
-import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -229,13 +229,65 @@ const alive = (pid: number) => {
     return false;
   }
 };
-const dormantRecords = (dir: string) => {
+/**
+ * ONE read of the dormant RECORDS under `dir`/dormant/. Record names only: the writer's atomic temp
+ * (writeJsonAtomic's ".tmp-<hex>", complete once fsynced, renamed after) lives in the same dir and is
+ * skipped. An entry that vanishes or cannot be parsed between the listing and its read is skipped
+ * ALONE and reported in `skipped`. Flake B (CI job 114637509429, attempt 1): one catch around the whole
+ * list let the poll accept the TEMP as the record, and the next read, racing its rename (ENOENT), came
+ * back empty: "no dormant record" after 770 ms with the record on disk.
+ */
+function dormantRead(dir: string): { records: Array<{ pid?: unknown; reason?: unknown }>; skipped: Array<{ name: string; error: string }> } {
+  const d = path.join(dir, W.DORMANT_DIR);
+  let names: string[];
   try {
-    return fs.readdirSync(path.join(dir, W.DORMANT_DIR)).map((n) => JSON.parse(fs.readFileSync(path.join(dir, W.DORMANT_DIR, n), "utf-8")));
-  } catch {
-    return [];
+    names = fs.readdirSync(d);
+  } catch (err) {
+    return { records: [], skipped: [{ name: "(the dormant dir)", error: err instanceof Error ? err.message : String(err) }] };
   }
-};
+  const records: Array<{ pid?: unknown; reason?: unknown }> = [];
+  const skipped: Array<{ name: string; error: string }> = [];
+  for (const name of names) {
+    if (name.startsWith(".")) continue; // the writer's temp: not a record yet
+    try {
+      records.push(JSON.parse(fs.readFileSync(path.join(d, name), "utf-8")));
+    } catch (err) {
+      skipped.push({ name, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return { records, skipped };
+}
+const dormantRecords = (dir: string) => dormantRead(dir).records;
+
+describe("the harness's own dormant reader (flake B): one bad entry never blanks a whole read", () => {
+  const mk = () => {
+    const dir = fs.mkdtempSync(path.join(ROOT, "dr-"));
+    fs.mkdirSync(path.join(dir, W.DORMANT_DIR));
+    return dir;
+  };
+  const rec = (pid: number) => JSON.stringify({ v: 1, pid, proc_start: "x", reason: "r", at: "2026-10-12T00:00:00.000Z" });
+  it("the writer's COMPLETE temp (fsynced, not yet renamed) is not a record: skipped, never parsed as one", () => {
+    const dir = mk();
+    fs.writeFileSync(path.join(dir, W.DORMANT_DIR, ".tmp-0123456789abcdef"), rec(7));
+    expect(dormantRecords(dir)).toEqual([]);
+  });
+  it("HARM: an entry that VANISHES between the listing and its read (ENOENT: a rename racing the read) is skipped ALONE and reported; the other records are still read", () => {
+    const dir = mk();
+    for (const pid of [7, 8]) fs.writeFileSync(path.join(dir, W.DORMANT_DIR, `${pid}-abc`), rec(pid));
+    const real = fs.readFileSync;
+    const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((f: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (String(f).endsWith(`${path.sep}7-abc`)) throw Object.assign(new Error("ENOENT: renamed away"), { code: "ENOENT" });
+      return (real as (...a: unknown[]) => unknown)(f, ...rest);
+    }) as typeof fs.readFileSync);
+    try {
+      const r = dormantRead(dir);
+      expect(r.records.map((x) => x.pid)).toEqual([8]);
+      expect(r.skipped).toEqual([{ name: "7-abc", error: "ENOENT: renamed away" }]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
 const awakeReadable = W.awakeNowMs() !== null;
 
 describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens; inside a bound window)", () => {
@@ -263,8 +315,15 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   /** THE INVARIANT's second half: a dormant watch is ALIVE while its window lives, and exits SILENTLY (no line) once the window's anchor process dies. */
   async function expectDormantThenSilentExit(r: import("./helpers/watch-window.js").WindowRun, w: TestWindow, reason: RegExp, recordDir: string, anchor: "window" | "parent" = "window"): Promise<void> {
     const pid = await r.pid();
-    for (let i = 0; i < 100 && !dormantRecords(recordDir).some((x) => x.pid === pid); i++) await new Promise((res) => setTimeout(res, 100));
-    const rec = dormantRecords(recordDir).find((x) => x.pid === pid);
+    // ONE read decides: the record is taken from the read that ended the poll, never read a second time.
+    const t0 = Date.now();
+    let polls = 1;
+    let read = dormantRead(recordDir);
+    for (; polls < 100 && !read.records.some((x) => x.pid === pid); polls++) {
+      await new Promise((res) => setTimeout(res, 100));
+      read = dormantRead(recordDir);
+    }
+    const rec = read.records.find((x) => x.pid === pid) as { reason: string } | undefined;
     // A missing record must say WHY (CI 37729106710 lost it: a bare undefined carried no stderr): the
     // process state, its exit code, the generation, the dir, and the watch's own stderr.
     if (!rec) {
@@ -274,7 +333,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
       } catch (err) {
         names = [`(unreadable: ${err instanceof Error ? err.message : String(err)})`];
       }
-      expect.fail(`no dormant record for pid ${pid} after 10 s: alive=${alive(pid)} exit=${await within(r.exited, 50)} currentGen=${W.currentGen(recordDir)} dir=[${names.join(", ")}] records=${JSON.stringify(dormantRecords(recordDir))}\n--- its stderr ---\n${r.err()}\n--- its stdout ---\n${r.out()}`);
+      expect.fail(`no dormant record for pid ${pid} after ${Date.now() - t0} ms (${polls} reads): skipped=${JSON.stringify(read.skipped)} alive=${alive(pid)} exit=${await within(r.exited, 50)} currentGen=${W.currentGen(recordDir)} dir=[${names.join(", ")}] records_now=${JSON.stringify(dormantRecords(recordDir))}\n--- its stderr ---\n${r.err()}\n--- its stdout ---\n${r.out()}`);
     }
     expect(rec!.reason, r.err()).toMatch(reason);
     expect(await within(r.exited, 2_500)).toBe("timeout"); // NOT exited: dormant
