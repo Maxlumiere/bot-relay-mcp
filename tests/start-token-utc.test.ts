@@ -32,6 +32,7 @@ import os from "os";
 import path from "path";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
+import { startToken } from "./helpers/start-token.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-start-token-utc-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -122,7 +123,7 @@ describe("the start token: one spelling, independent of the reader's TZ", () => 
       for (const tz of TZ_VALUES) {
         const label = tz ?? "unset";
         withTz(tz, () => {
-          seen.set(`ts(${label})`, String(processStartedAt(pid)));
+          seen.set(`ts(${label})`, String(startToken(pid)));
           seen.set(`table(${label})`, String(buildProcessTable().get(pid)?.startedAt));
         });
         seen.set(`bash(${label})`, bash("relay_pid_start", [String(pid)], tz));
@@ -156,7 +157,7 @@ describe("the start token: one spelling, independent of the reader's TZ", () => 
     const ref = legacyReference(pid);
     expect(ref.length).toBeGreaterThan(0);
     for (const tz of TZ_VALUES) {
-      withTz(tz, () => expect(processStartedAt(pid, undefined, "legacy"), `ts legacy under ${tz}`).toBe(ref));
+      withTz(tz, () => expect(startToken(pid, "legacy"), `ts legacy under ${tz}`).toBe(ref));
       expect(bash("relay_pid_start_legacy", [String(pid)], tz), `bash legacy under ${tz}`).toBe(ref);
     }
   });
@@ -196,7 +197,7 @@ describe("readers dispatch on the suffix; the legacy form is accepted only unsuf
   for (const [label, stored, utcRead, legacyRead, expected, obs] of rows) {
     it(`TS: ${label}`, () => {
       const run = twoFormRunner(utcRead, legacyRead);
-      expect(observeStartTokenForm(4242, stored, run)).toBe(obs);
+      expect(observeStartTokenForm(4242, stored, run, alive as never)).toBe(obs);
       expect(isAgentProcessAlive(4242, stored, run, alive as never)).toBe(expected);
     });
     it(`bash relay_anchor_liveness agrees: ${label}`, () => {
@@ -211,16 +212,17 @@ describe("readers dispatch on the suffix; the legacy form is accepted only unsuf
   }
 
   it("the binder's legacy probe: a token when readable, and an EXPLICIT unreadable (never a silent no-probe) when not", () => {
-    expect(readLegacyStartProbe(4242, twoFormRunner(UTC_RAW, LEGACY_T))).toEqual({ start: LEGACY_T });
-    expect(readLegacyStartProbe(4242, twoFormRunner(UTC_RAW, null))).toEqual({ unreadable: true });
+    // pid 4242 is stubbed as existing (the kernel probe): only the runner decides.
+    expect(readLegacyStartProbe(4242, twoFormRunner(UTC_RAW, LEGACY_T), alive as never)).toEqual({ start: LEGACY_T });
+    expect(readLegacyStartProbe(4242, twoFormRunner(UTC_RAW, null), alive as never)).toEqual({ unreadable: true });
   });
 
   it("ONE read per probe: a suffixed token reads only the UTC form, an unsuffixed one only the legacy form", () => {
     const calls: string[] = [];
-    observeStartTokenForm(4242, UTC_T, twoFormRunner(UTC_RAW, LEGACY_T, calls));
+    observeStartTokenForm(4242, UTC_T, twoFormRunner(UTC_RAW, LEGACY_T, calls), alive as never);
     expect(calls).toEqual(["utc"]);
     calls.length = 0;
-    observeStartTokenForm(4242, LEGACY_T, twoFormRunner(UTC_RAW, LEGACY_T, calls));
+    observeStartTokenForm(4242, LEGACY_T, twoFormRunner(UTC_RAW, LEGACY_T, calls), alive as never);
     expect(calls).toEqual(["legacy"]);
   });
 

@@ -23,6 +23,7 @@ import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { startToken } from "./helpers/start-token.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adr0047-pr2-")));
@@ -110,7 +111,7 @@ describe("ADR-0047 PR 2 — the writer: a connector writes ONLY its own row", ()
     db.recordOwnConnector({ parent: { pid: 4242, startedAt: "Mon Sep 28 03:17:16 2026 UTC" }, build: LOADED_BUILD });
     const [r] = rows();
     expect(r.pid).toBe(process.pid);
-    expect(r.pid_start).toBe(processStartedAt(process.pid));
+    expect(r.pid_start).toBe(startToken(process.pid));
     expect(String(r.pid_start).endsWith(START_TOKEN_UTC_SUFFIX)).toBe(true); // born UTC-only
     expect(r.edge_id).toBe(edge());
     expect(r.parent_pid).toBe(4242);
@@ -149,18 +150,18 @@ describe("ADR-0047 PR 2 — liveConnectors: liveness from the pid AND its start 
     expect(live.map((r) => r.pid)).toEqual([process.pid]);
   });
   it("a row from ANOTHER host is not live here (it cannot be probed from this host)", () => {
-    plant({ pid: process.pid, pid_start: processStartedAt(process.pid) as string, host_id: "another-host" });
+    plant({ pid: process.pid, pid_start: startToken(process.pid), host_id: "another-host" });
     expect(db.liveConnectors()).toEqual([]);
   });
   it("host identity is POSITIVE: a row with NO host id is never this host's (never live, never probed)", () => {
-    plant({ pid: process.pid, pid_start: processStartedAt(process.pid) as string, host_id: null });
+    plant({ pid: process.pid, pid_start: startToken(process.pid), host_id: null });
     expect(db.liveConnectors()).toEqual([]);
   });
   it("an UNKNOWN own host id probes nothing: no row is live, and the purger deletes nothing (Codex #295 R1 P2-3)", () => {
     const old = new Date(Date.now() - 8 * DAY).toISOString();
     const d = deadPid();
     plant({ pid: d.pid, pid_start: d.start, started_at: old, host_id: null }); // old + dead, origin unknown
-    plant({ pid: process.pid, pid_start: processStartedAt(process.pid) as string, host_id: null });
+    plant({ pid: process.pid, pid_start: startToken(process.pid), host_id: null });
     _resetOwnHostIdForTests(null);
     try {
       expect(db.liveConnectors()).toEqual([]);
@@ -182,9 +183,9 @@ describe("ADR-0047 PR 2 — purgeDeadConnectors: POSITIVELY dead and older than 
     const d1 = deadPid();
     const d2 = deadPid();
     plant({ pid: d1.pid, pid_start: d1.start, started_at: old }); // old + dead → purged
-    plant({ pid: process.pid, pid_start: processStartedAt(process.pid) as string, started_at: old }); // old + live → kept
+    plant({ pid: process.pid, pid_start: startToken(process.pid), started_at: old }); // old + live → kept
     plant({ pid: d2.pid, pid_start: d2.start }); // young + dead → kept
-    plant({ pid: process.ppid, pid_start: processStartedAt(process.ppid) as string, started_at: old, host_id: "another-host" }); // unprobeable → kept
+    plant({ pid: process.ppid, pid_start: startToken(process.ppid), started_at: old, host_id: "another-host" }); // unprobeable → kept
     const r = db.purgeDeadConnectors();
     expect(r.purged).toBe(1);
     expect(rows().map((x) => x.pid).sort()).toEqual([d2.pid, process.pid, process.ppid].sort());
@@ -261,7 +262,7 @@ describe("ADR-0047 PR 2 — end to end: a REAL stdio connector stamps its row at
       const r = c.read();
       expect(r, "exactly one row, the connector's own").toHaveLength(1);
       expect(r[0].pid).toBe(c.pid);
-      expect(r[0].pid_start).toBe(processStartedAt(c.pid));
+      expect(r[0].pid_start).toBe(startToken(c.pid));
       expect(r[0].install_dir).toBe(fs.realpathSync(REPO_ROOT));
       expect(r[0].build_id).toBe(DIST_STAMP.build_id);
       expect(r[0].deps_id, "the dependencies it loaded at start").toBe(LOADED_BUILD.deps_id);

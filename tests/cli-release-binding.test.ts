@@ -30,6 +30,7 @@ import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getOwnHostId, processStartedAt } from "../src/liveness.js";
+import { startToken } from "./helpers/start-token.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -52,7 +53,7 @@ delete process.env.RELAY_HTTP_SECRET;
 const OWN_HOST = getOwnHostId(); // real machine GUID; null on hosts without one
 const OTHER_HOST = "release-binding-other-host-guid";
 const LIVE_PID = process.pid; // the vitest process — alive throughout the child run
-const LIVE_START = processStartedAt(LIVE_PID);
+const LIVE_START = startToken(LIVE_PID);
 const DEAD_PID = 2_147_483_646;
 
 function resetRoot() {

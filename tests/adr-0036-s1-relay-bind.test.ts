@@ -158,7 +158,7 @@ describe("ADR-0036 S1 — resolveWindowAnchor (pure): never guesses, never picks
 
   it("CLAUDE_PID set, detection found nothing → use CLAUDE_PID (a failed detection is not a disagreement)", async () => {
     const { resolveWindowAnchor } = await import("../src/binding.js");
-    const r = resolveWindowAnchor({ claudePid: 4242, detected: null, startedAtFor: () => "Mon Sep 15 10:00:00 2026" });
+    const r = resolveWindowAnchor({ claudePid: 4242, detected: null, startedAtFor: () => ({ kind: "start", start: "Mon Sep 15 10:00:00 2026" }) });
     expect(r.ok).toBe(true);
     expect(r.ok && r.anchor.pid).toBe(4242);
   });
@@ -178,9 +178,14 @@ describe("ADR-0036 S1 — resolveWindowAnchor (pure): never guesses, never picks
 
   it("an anchor whose start time cannot be read → BIND_FAILED (a pid alone is not an anchor)", async () => {
     const { resolveWindowAnchor } = await import("../src/binding.js");
-    const r = resolveWindowAnchor({ claudePid: 4242, detected: null, startedAtFor: () => null });
+    const r = resolveWindowAnchor({ claudePid: 4242, detected: null, startedAtFor: () => ({ kind: "unreadable", why: "ps timed out" }) });
     expect(r.ok).toBe(false);
     expect(r.ok === false && r.reason).toMatch(/start/i);
+    // INV-LIVE-01: the reason says WHICH: unreadable (it may still run) vs gone (the kernel says so).
+    expect(r.ok === false && r.reason).toMatch(/unreadable: ps timed out/);
+    const gone = resolveWindowAnchor({ claudePid: 4242, detected: null, startedAtFor: () => ({ kind: "gone" }) });
+    expect(gone.ok === false && gone.reason).toMatch(/the process is gone/);
+    expect(gone.ok === false && gone.reason).not.toMatch(/unreadable/);
   });
 });
 

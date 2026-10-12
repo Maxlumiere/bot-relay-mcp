@@ -19,6 +19,7 @@ import {
   anchorLivenessVerdict,
   isPidAlive,
   processStartedAt,
+  startOrNull,
   observeStartTokenForm,
   isUtcStartToken,
   START_TOKEN_UTC_SUFFIX,
@@ -2127,8 +2128,9 @@ export interface ConnectorRow {
  * reads UNKNOWN, the safe direction.
  */
 export function recordOwnConnector(input: { parent: { pid: number; startedAt: string } | null; build: LoadedBuild }): boolean {
-  const start = processStartedAt(process.pid);
-  if (!start) return false;
+  const read = processStartedAt(process.pid);
+  if (read.kind !== "start") return false; // gone or unreadable: no identity to write (best-effort, the safe direction)
+  const start = read.start;
   const db = getDb();
   const parent = input.parent && input.parent.startedAt ? input.parent : null;
   db.prepare(
@@ -2193,7 +2195,9 @@ export function liveConnectors(
   // read at one instant.
   opts: { startOf?: (pid: number) => string | null; db?: CompatDatabase } = {},
 ): ConnectorRow[] {
-  const startOf = opts.startOf ?? ((pid: number) => processStartedAt(pid));
+  // Default: one read per row; an unreadable start (or a gone pid) is not live here. `relay fleet`, the
+  // one production reader, passes its process snapshot instead and reports a failed snapshot itself.
+  const startOf = opts.startOf ?? ((pid: number) => startOrNull(processStartedAt(pid)));
   return ownHostConnectorRows(opts.db ?? getDb()).filter((r) => {
     const s = startOf(r.pid);
     return s !== null && s === r.pid_start;
@@ -2209,7 +2213,8 @@ export function liveConnectors(
 export function purgeDeadConnectors(
   opts: { startOf?: (pid: number) => string | null; isAlive?: (pid: number) => boolean } = {},
 ): { purged: number } {
-  const startOf = opts.startOf ?? ((pid: number) => processStartedAt(pid));
+  // null = unreadable: never "dead" (a gone pid is caught by isAlive first).
+  const startOf = opts.startOf ?? ((pid: number) => startOrNull(processStartedAt(pid)));
   const isAlive = opts.isAlive ?? ((pid: number) => isPidAlive(pid));
   const db = getDb();
   const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -4237,7 +4242,7 @@ export function countLegacyStartTokens(run?: CommandRunner, kill?: KillProbe): L
   let unreadable = 0;
   const isLegacy = (pid: number | null, start: string | null): boolean => {
     if (!(typeof pid === "number" && pid > 0) || !start || isUtcStartToken(start) || !isPidAlive(pid, kill)) return false;
-    const form = observeStartTokenForm(pid, start, run);
+    const form = observeStartTokenForm(pid, start, run, kill);
     if (form === "unreadable") unreadable++;
     return form === "legacy";
   };

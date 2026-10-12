@@ -372,15 +372,16 @@ export function removeDormant(file: string | null): void {
 }
 /**
  * How many DORMANT watches of `agent` are alive right now (for the supervisor's status): every record
- * under its agent dir and window dirs whose process (pid + start) still runs. Read-only.
+ * under its agent dir and window dirs whose process (pid + start) still runs (`live`), and, apart, those
+ * whose process cannot be judged now (`unknown`: its start unreadable, or none recorded). Read-only.
  */
-export function countLiveDormant(agentDir: string, isAlive: (pid: number, start: string | null) => boolean): number {
-  let n = 0;
+export function countLiveDormant(agentDir: string, state: (pid: number, start: string | null) => "live" | "gone" | "unknown"): { live: number; unknown: number } {
+  const n = { live: 0, unknown: 0 };
   const dirs = [agentDir];
   try {
     for (const e of fs.readdirSync(agentDir, { withFileTypes: true })) if (e.isDirectory() && !e.isSymbolicLink()) dirs.push(path.join(agentDir, e.name));
   } catch {
-    return 0;
+    return n;
   }
   for (const d of dirs) {
     let names: string[] = [];
@@ -391,7 +392,9 @@ export function countLiveDormant(agentDir: string, isAlive: (pid: number, start:
     }
     for (const nm of names) {
       const r = readJson(path.join(d, DORMANT_DIR, nm)) as Partial<DormantRecord> | null;
-      if (r && r.v === 1 && Number.isInteger(r.pid) && isAlive(r.pid as number, r.proc_start ?? null)) n++;
+      if (!(r && r.v === 1 && Number.isInteger(r.pid))) continue;
+      const s = state(r.pid as number, r.proc_start ?? null);
+      if (s !== "gone") n[s]++;
     }
   }
   return n;

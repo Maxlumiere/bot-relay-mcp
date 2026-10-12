@@ -165,7 +165,7 @@ export interface EscalationRecord {
  *   - session_unbound: one live window, but no relay reading session (V4: "re-register or relaunch").
  * Written ONLY when the agent's board state CHANGES (A3.2); `board_id` pairs an open with its close.
  */
-export const BOARD_CASES = ["no_live_window", "ambiguous_binding", "session_unbound", "no_driver", "undelivered_with_watch"] as const;
+export const BOARD_CASES = ["no_live_window", "ambiguous_binding", "session_unbound", "no_driver", "undelivered_with_watch", "cannot_observe"] as const;
 /**
  * PR 7 (plan §v6; rulings 23e9b281, 7224605e): why the ONE live, session-bound window has no live
  * wake. Carried ONLY on a `no_driver` record (its `why`), a closed enum, never free text:
@@ -176,6 +176,18 @@ export const BOARD_CASES = ["no_live_window", "ambiguous_binding", "session_unbo
  */
 export const NO_DRIVER_WHY = ["watch_absent", "watch_stale"] as const;
 export type NoDriverWhy = (typeof NO_DRIVER_WHY)[number];
+/**
+ * INV-LIVE-01 (architect fedac068 (b)): what the doorbell cannot observe. Carried ONLY on a
+ * `cannot_observe` record (its `why`), a closed enum:
+ *   - watch: the window's start (the watch's key) stayed UNREADABLE for CANNOT_OBSERVE_AFTER_TICKS
+ *     consecutive cycles, so whether a watch runs is unknown. Never `no_driver`: unknown is not absent.
+ * Shown, never rung; it closes when the watch can be observed again.
+ */
+export const CANNOT_OBSERVE_WHY = ["watch"] as const;
+export type CannotObserveWhy = (typeof CANNOT_OBSERVE_WHY)[number];
+/** The closed `why` enum of each board case that carries one; every other case carries none. */
+export const BOARD_WHY_OF: Partial<Record<(typeof BOARD_CASES)[number], readonly string[]>> = { no_driver: NO_DRIVER_WHY, cannot_observe: CANNOT_OBSERVE_WHY };
+export type BoardWhy = NoDriverWhy | CannotObserveWhy;
 export type BoardCase = (typeof BOARD_CASES)[number];
 export const BOARD_CLOSE_REASONS = ["resolved", "no_mail"] as const;
 export interface BoardRecord {
@@ -190,8 +202,8 @@ export interface BoardRecord {
   dead_count: number;
   pending_count: number;
   close_reason: (typeof BOARD_CLOSE_REASONS)[number] | null;
-  /** PR 7: ONLY on a `no_driver` record (absent on every other case). */
-  why?: NoDriverWhy;
+  /** ONLY on a `no_driver` (PR 7) or `cannot_observe` (INV-LIVE-01) record, from that case's enum (absent on every other case). */
+  why?: BoardWhy;
 }
 
 export type LogRecord = IntentRecord | HeaderRecord | BudgetRecord | ClockRecord | EffectRecord | EscalationRecord | BoardRecord;
@@ -335,11 +347,13 @@ export function recordFault(r: unknown): string | null {
   }
   if (t === "board") {
     const baseKeys = ["v", "type", "at", "board_id", "agent_name", "case", "state", "binding_ids", "dead_count", "pending_count", "close_reason"];
-    const isNoDriver = (r as { case?: unknown }).case === "no_driver";
-    if (!sameKeys(r, isNoDriver ? [...baseKeys, "why"] : baseKeys)) {
-      return `a board record has exactly ${baseKeys.join(", ")}${isNoDriver ? ", why (on no_driver only)" : " (why only on no_driver)"}`;
+    // An OWN key only: a hostile case such as "constructor" must never reach the prototype.
+    const c = (r as { case?: unknown }).case;
+    const whyEnum = typeof c === "string" && Object.hasOwn(BOARD_WHY_OF, c) ? BOARD_WHY_OF[c as (typeof BOARD_CASES)[number]] : undefined;
+    if (!sameKeys(r, whyEnum ? [...baseKeys, "why"] : baseKeys)) {
+      return `a board record has exactly ${baseKeys.join(", ")}${whyEnum ? `, why (on ${c as string})` : " (why only on no_driver and cannot_observe)"}`;
     }
-    if (isNoDriver && !(NO_DRIVER_WHY as readonly unknown[]).includes((r as { why?: unknown }).why)) return `why must be one of ${NO_DRIVER_WHY.join(", ")} (never free text)`;
+    if (whyEnum && !(whyEnum as readonly unknown[]).includes((r as { why?: unknown }).why)) return `why must be one of ${whyEnum.join(", ")} (never free text)`;
     if (r.v !== 1) return "unknown record version";
     if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return "at is not an ISO UTC timestamp";
     if (!isUuid(r.board_id)) return "board_id is not a v4 UUID";
@@ -350,7 +364,7 @@ export function recordFault(r: unknown): string | null {
     if (f) return f;
     // The shape of each case: ambiguous names >= 2 deciding bindings, a session case exactly the one live window.
     const n = (r.binding_ids as string[]).length;
-    const one = r.case === "session_unbound" || r.case === "no_driver" || r.case === "undelivered_with_watch";
+    const one = r.case === "session_unbound" || r.case === "no_driver" || r.case === "undelivered_with_watch" || r.case === "cannot_observe";
     if (r.case === "ambiguous_binding" ? n < 2 : one ? n !== 1 : n > 1) return `a ${r.case as string} record names ${r.case === "ambiguous_binding" ? "at least 2" : one ? "exactly 1" : "at most 1"} deciding binding(s)`;
     if (!Number.isInteger(r.dead_count) || (r.dead_count as number) < 0 || (r.dead_count as number) > 1_000_000) return "dead_count is not a bounded non-negative integer";
     if (!Number.isInteger(r.pending_count) || (r.pending_count as number) < 0 || (r.pending_count as number) > 100_000_000) return "pending_count is not a bounded non-negative integer";

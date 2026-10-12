@@ -35,7 +35,12 @@
  *   - READ-ONLY on the relay DB (opened only once a writer's WAL sidecars exist). Its writes go to its
  *     own dirs (src/watch-wake.ts).
  *
- * --lock-status: one word for the agent's ONE live window: live | stale | absent | never | no_window.
+ * --lock-status: one word for the agent's ONE live window: live | stale | absent | never | no_window |
+ * unknown (the window's start cannot be read right now: never reported as no window).
+ *
+ * UNREADABLE IS NOT GONE (INV-LIVE-01, rulings 476e65f1 + fedac068): a `ps` that times out, fails or
+ * prints nothing is never "the window is gone". Only the kernel says gone (ESRCH, a different process on
+ * the pid, or, for the launching shell, a reparent). On an unreadable start the watch takes no action.
  */
 import fs from "fs";
 import path from "path";
@@ -76,7 +81,7 @@ async function realOwnerDeps(ownHostId: string | null): Promise<import("../watch
     startNow: (pid) => L.processStartedAt(pid),
     sameProcess: (pid, stored) => {
       const o = L.observeStartTokenForm(pid, stored);
-      return o === "utc" || o === "legacy";
+      return o === "unreadable" ? "unreadable" : o === "utc" || o === "legacy";
     },
     liveness: (b) => bindingLiveness({ host_id: b.host_id, window_pid: b.window_pid, window_pid_start: b.window_pid_start }, ownHostId),
   };
@@ -91,7 +96,7 @@ async function agentBindings(db: Handle, agent: string): Promise<import("../watc
  * `relay pending --watch-status`). `never` = the agent dir does not exist (it never armed one). The
  * window dir is keyed by the window process's start as the KERNEL reads it (Codex R2 (b)).
  */
-export async function agentWatchStatus(db: Handle, dbPath: string, agent: string): Promise<"live" | "stale" | "absent" | "never" | "no_window"> {
+export async function agentWatchStatus(db: Handle, dbPath: string, agent: string): Promise<"live" | "stale" | "absent" | "never" | "no_window" | "unknown"> {
   const W = await import("../watch-wake.js");
   if (!W.watchableName(agent)) return "never";
   const agentDir = W.watchAgentDir(dbPath, agent);
@@ -103,8 +108,9 @@ export async function agentWatchStatus(db: Handle, dbPath: string, agent: string
   const one = oneLiveWindow(await agentBindings(db, agent), own, (b) => bindingLiveness(b, own));
   if (one.kind !== "one" || !one.b.window_pid) return "no_window";
   const start = processStartedAt(one.b.window_pid);
-  if (!start) return "no_window";
-  return W.watchStatus(W.watchWindowDir(dbPath, agent, { pid: one.b.window_pid, start }));
+  if (start.kind === "gone") return "no_window";
+  if (start.kind === "unreadable") return "unknown"; // its key cannot be read: never "no window"
+  return W.watchStatus(W.watchWindowDir(dbPath, agent, { pid: one.b.window_pid, start: start.start }));
 }
 
 /** Open the relay DB read-only, waiting while no writer has created its WAL sidecars (never creating one). */
@@ -166,6 +172,40 @@ export async function runArmCheck(agent: string): Promise<number> {
   }
 }
 
+/** How many times the birth start is read again at once when the first read fails (fedac068 (a)). */
+export const BIRTH_START_RETRIES = 3;
+
+/** A dormant watch's anchor: the window, or (`parent`) the shell that launched it, whose start may be unknown. */
+export interface DormantAnchor {
+  pid: number;
+  start: string | null;
+  parent?: boolean;
+}
+
+type StartReader = (pid: number) => import("../liveness.js").ProcessStart;
+
+/** The birth start: read now, retried at once up to BIRTH_START_RETRIES times; null when gone or never readable. */
+export function captureBirthStart(pid: number, read: StartReader): string | null {
+  for (let i = 0; i <= BIRTH_START_RETRIES; i++) {
+    const r = read(pid);
+    if (r.kind === "start") return r.start;
+    if (r.kind === "gone") return null;
+  }
+  return null;
+}
+
+/**
+ * Is a dormant watch's anchor GONE, by kernel fact only? The launching shell: we were reparented
+ * (POSIX: our ppid is no longer it), or ESRCH, or its pid holds another start (only when one was
+ * captured at birth). The window: ESRCH, or another start on its pid. An unreadable start is never gone.
+ */
+export function anchorGone(anchor: DormantAnchor, read: StartReader, ppid: number = process.ppid): boolean {
+  if (anchor.parent && ppid !== anchor.pid) return true;
+  const r = read(anchor.pid);
+  if (r.kind === "gone") return true;
+  return r.kind === "start" && anchor.start !== null && r.start !== anchor.start;
+}
+
 export async function runUntilWake(agent: string, opts: { intervalMs?: number; dormantCheckMs?: number; now?: () => number } = {}): Promise<number> {
   const now = opts.now ?? (() => Date.now());
   const intervalMs = opts.intervalMs ?? FALLBACK_POLL_MS;
@@ -173,13 +213,18 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   const say = (line: string) => process.stderr.write(`${line}\n`);
   const L = await import("../liveness.js");
   const W = await import("../watch-wake.js");
-  const birth = { pid: process.ppid, start: L.processStartedAt(process.ppid) };
-  const me = { pid: process.pid, proc_start: L.processStartedAt(process.pid), host_id: L.getOwnHostId() };
+  // THE BIRTH ANCHOR (architect fedac068 (a)): the launching shell, its start captured ONCE, now (up to
+  // BIRTH_START_RETRIES immediate retries), and NEVER adopted later: a start read after the shell could
+  // have died might be an impostor's, which would make a dormant watch immortal. Not captured = the
+  // shell is judged by the reparent and ESRCH alone.
+  const birth: DormantAnchor = { pid: process.ppid, start: captureBirthStart(process.ppid, L.processStartedAt), parent: true };
+  // Identity for the holder sidecar and the dormant record name: null = unknown (display only).
+  const me = { pid: process.pid, proc_start: L.startOrNull(L.processStartedAt(process.pid)), host_id: L.getOwnHostId() };
 
   // DORMANCY (ruling 9becb599). `anchor` is the window when known, else the process that started us.
   // Zero CPU: one timer per check. Exits SILENTLY once the anchor is gone; a signal exits with a line.
   let dormantFile: string | null = null;
-  const dormant = async (reason: string, anchor: { pid: number; start: string | null }, recordDir: string | null): Promise<number> => {
+  const dormant = async (reason: string, anchor: DormantAnchor | import("../watch-owner.js").OwnedWindow, recordDir: string | null): Promise<number> => {
     say(`[sentinel] relay watch for ${agent} is DORMANT (${reason}): it will not wake anyone; it ends when its window does.`);
     if (recordDir) {
       try {
@@ -208,8 +253,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
       process.once("SIGINT", () => end(0, `no-mail: stopped (signal) while dormant: ${reason}`));
       const tick = () => {
         if (done) return;
-        const alive = anchor.start !== null && L.processStartedAt(anchor.pid) === anchor.start;
-        if (!alive) return end(0); // (b) the window is gone: SILENT (no session left to notify)
+        if (anchorGone(anchor, L.processStartedAt)) return end(0); // (b) the window is gone: SILENT (no session left to notify)
         setTimeout(tick, dormantCheckMs);
       };
       setTimeout(tick, dormantCheckMs);

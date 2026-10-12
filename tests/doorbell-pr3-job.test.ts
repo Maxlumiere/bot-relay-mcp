@@ -18,6 +18,7 @@ import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { startToken } from "./helpers/start-token.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "doorbell-pr3-job-")));
 const DB = path.join(ROOT, "inst", "relay.db");
@@ -74,7 +75,7 @@ beforeEach(() => {
   db.upsertAgentBinding(db.getDb(), {
     hostId: HOST as string,
     windowPid: process.pid,
-    windowPidStart: processStartedAt(process.pid) as string,
+    windowPidStart: startToken(process.pid),
     agentName: "p3-alice",
     agentClass: null,
     conversationId: "conv-p3",

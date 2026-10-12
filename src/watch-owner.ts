@@ -21,8 +21,11 @@
  *        the supervisor and stillOwner must all name the same window the same way.
  * No token is read: possession of a credential proves possession, not window ownership (ADR-0036: the
  * window anchor is the principal).
+ * INV-LIVE-01 (ruling 476e65f1): a start that cannot be READ is never "another process" nor "gone". At arm
+ * time it refuses as `cannot_judge` (fail closed, named); while running it is no verdict on the window.
  */
-import type { AnchorVerdict, ProcEntry } from "./liveness.js";
+import type { AnchorVerdict, ProcEntry, ProcessStart } from "./liveness.js";
+import { anchorState } from "./liveness.js";
 import { oneLiveWindow } from "./doorbell-core.js";
 
 /** One binding row, as listAgentBindings returns it (the fields ownership reads). */
@@ -33,7 +36,7 @@ export interface OwnerBinding {
   window_pid?: number | null;
   window_pid_start?: string | null;
 }
-export type OwnerRefusal = "reparented" | "no_bound_ancestor" | "no_live_window" | "ambiguous_binding" | "not_this_window";
+export type OwnerRefusal = "reparented" | "no_bound_ancestor" | "no_live_window" | "ambiguous_binding" | "not_this_window" | "cannot_judge";
 /** The window a watch belongs to: its pid and its start as the KERNEL reads it (UTC form). */
 export interface OwnedWindow {
   pid: number;
@@ -45,9 +48,9 @@ export interface OwnerDeps {
   /** One consistent process snapshot (pid, ppid, start): liveness.buildProcessTable. */
   table: () => Map<number, ProcEntry>;
   /** A process's start token NOW, in the snapshot's (UTC) form: liveness.processStartedAt. */
-  startNow: (pid: number) => string | null;
-  /** Does `stored` (either token form) name the process at `pid` now? liveness.observeStartTokenForm. */
-  sameProcess: (pid: number, stored: string) => boolean;
+  startNow: (pid: number) => ProcessStart;
+  /** Does `stored` (either token form) name the process at `pid` now? liveness.observeStartTokenForm; "unreadable" = cannot say. */
+  sameProcess: (pid: number, stored: string) => boolean | "unreadable";
   /** A binding's window verdict: doorbell-run.bindingLiveness. */
   liveness: (b: OwnerBinding) => AnchorVerdict;
 }
@@ -59,6 +62,7 @@ export const REFUSAL_TEXT: Record<OwnerRefusal, string> = {
   no_live_window: "the agent has no live bound window",
   ambiguous_binding: "the agent has two or more windows not proven closed (never guessed)",
   not_this_window: "the agent's live window is another one (this one is not the agent's current window)",
+  cannot_judge: "a process start time on this watch's ancestry cannot be read right now (ps failed or timed out), so ownership cannot be proven; try again",
 };
 
 /**
@@ -67,6 +71,7 @@ export const REFUSAL_TEXT: Record<OwnerRefusal, string> = {
  */
 export function resolveOwnership(selfPid: number, bindings: readonly OwnerBinding[], ownHostId: string | null, deps: OwnerDeps): Ownership {
   const table = deps.table();
+  if (table.size === 0) return { ok: false, why: "cannot_judge" }; // an EMPTY snapshot is a failed read, never "reparented"
   const self = table.get(selfPid);
   if (!self || self.ppid <= 1) return { ok: false, why: "reparented" }; // (ii)
   // Walk the ancestry (bounded); the FIRST hop that a binding of this agent names, verified (i).
@@ -77,8 +82,12 @@ export function resolveOwnership(selfPid: number, bindings: readonly OwnerBindin
     const hop = cur;
     for (const b of mine) {
       if (b.window_pid !== hop.pid) continue;
-      if (deps.startNow(hop.pid) !== hop.startedAt) continue; // the hop is no longer that process
-      if (!deps.sameProcess(hop.pid, b.window_pid_start as string)) continue; // the binding names another process
+      const now = anchorState(deps.startNow(hop.pid), hop.startedAt);
+      if (now === "unknown") return { ok: false, why: "cannot_judge" };
+      if (now === "gone") continue; // the hop is no longer that process
+      const same = deps.sameProcess(hop.pid, b.window_pid_start as string);
+      if (same === "unreadable") return { ok: false, why: "cannot_judge" };
+      if (!same) continue; // the binding names another process
       found = { b, start: hop.startedAt };
       break;
     }
@@ -96,17 +105,19 @@ export function resolveOwnership(selfPid: number, bindings: readonly OwnerBindin
 
 const hopPid = (b: OwnerBinding): number => b.window_pid as number;
 
-/** Is the window itself still the same live process (pid + the kernel's start)? */
-export const windowAlive = (w: OwnedWindow, startNow: (pid: number) => string | null): boolean => startNow(w.pid) === w.start;
+/** Is the window itself still the same process (pid + the kernel's start)? `unknown` = its start cannot be read now. */
+export const windowState = (w: OwnedWindow, startNow: (pid: number) => ProcessStart) => anchorState(startNow(w.pid), w.start);
 
 /**
  * While running: is the agent's ONE live window still THIS window, compared by what the window IS
  * (pid + the kernel's start), never by a binding id (Codex R2 (b))? Each check; the ancestry itself is
  * re-proven by the caller (process.ppid unchanged). A "dead" verdict is permanent for a (pid, start),
- * so it is cached; any other verdict is read again. "window_gone" = this window's process ended.
+ * so it is cached; any other verdict is read again. "window_gone" = this window's process ended, by kernel
+ * fact (ESRCH, or its pid holds another process). A window whose start cannot be READ is no verdict
+ * (INV-LIVE-01): the binding checks below still run, and the next check reads it again.
  */
 export function stillOwner(window: OwnedWindow, bindings: readonly OwnerBinding[], ownHostId: string | null, deps: Pick<OwnerDeps, "liveness" | "startNow">, deadCache: Set<string>): { ok: true } | { ok: false; why: OwnerRefusal | "window_gone" } {
-  if (!windowAlive(window, deps.startNow)) return { ok: false, why: "window_gone" };
+  if (windowState(window, deps.startNow) === "gone") return { ok: false, why: "window_gone" };
   const liveness = deps.liveness;
   const cached = (b: OwnerBinding): AnchorVerdict => {
     const key = `${b.host_id}|${b.window_pid}|${b.window_pid_start}`;

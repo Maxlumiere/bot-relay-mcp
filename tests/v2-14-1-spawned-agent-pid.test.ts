@@ -28,6 +28,7 @@ import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { startToken } from "./helpers/start-token.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
@@ -156,7 +157,7 @@ describe("v2.14.1 — hook agent_pid capture + spawn-window", () => {
     // across reader TZ values).
     const pid = process.pid;
     const hookForm = spawnSync("bash", ["-c", `printf '%s UTC' "$(TZ=UTC LC_ALL=C ps -o lstart= -p ${pid} 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"`], { encoding: "utf-8" }).stdout;
-    const relayForm = processStartedAt(pid);
+    const relayForm = startToken(pid);
     expect(hookForm.length).toBeGreaterThan(0);
     expect(relayForm).toBe(hookForm);
   });

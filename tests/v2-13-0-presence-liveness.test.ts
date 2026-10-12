@@ -30,6 +30,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { startToken } from "./helpers/start-token.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v2130-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -396,7 +397,7 @@ describe("v2.13.0 — (6) start-time reuse guard", () => {
     expect(isAgentProcessAlive(LIVE_PID, "Mon Jan  1 00:00:00 2020")).toBe(false);
   });
   it("a matching start-time reads alive", () => {
-    const real = processStartedAt(LIVE_PID);
+    const real = startToken(LIVE_PID);
     expect(real).not.toBeNull();
     expect(isAgentProcessAlive(LIVE_PID, real)).toBe(true);
   });

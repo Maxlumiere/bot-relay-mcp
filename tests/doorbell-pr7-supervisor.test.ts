@@ -19,6 +19,7 @@ import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
+import { startToken } from "./helpers/start-token.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
@@ -42,7 +43,7 @@ afterAll(async () => {
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 const bindWindow = (agent: string, pid: number) =>
-  db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: pid, windowPidStart: processStartedAt(pid) as string, agentName: agent, agentClass: null, conversationId: `conv-${pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
+  db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: pid, windowPidStart: startToken(pid), agentName: agent, agentClass: null, conversationId: `conv-${pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
 const recs = () => (fs.existsSync(LOGP) ? fs.readFileSync(LOGP, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
 const intents = () => recs().filter((r) => r.type === "intent").length;
 const boards = () => recs().filter((r) => r.type === "board").map((r) => [r.case, r.state, r.why ?? null]);
@@ -152,7 +153,7 @@ describe.skipIf(!OWN)("PR 7: the doorbell supervises the watch (the real job, a 
     startWatch("s7-alice");
     await untilLive("s7-alice");
     // Staleness is AWAKE time (Codex R2 (c)): moving the job's wall clock proves nothing; age the holder's own stamp.
-    const dir = W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start: processStartedAt(win.pid) as string });
+    const dir = W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start: startToken(win.pid) });
     const h = JSON.parse(fs.readFileSync(path.join(dir, W.watchHolderFile(0)), "utf-8"));
     W.writeHeartbeat(dir, { pid: h.pid, gen: 0, at: new Date().toISOString(), awake_ms: (W.awakeNowMs() as number) - W.HEARTBEAT_STALE_MS - 60_000 });
     expect(await lifetime(Date.now())).toBe(0);
