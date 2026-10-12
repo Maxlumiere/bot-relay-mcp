@@ -31,7 +31,7 @@ afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 const W = await import("../src/watch-wake.js");
 const db = await import("../src/db.js");
-const { getOwnHostId, processStartedAt } = await import("../src/liveness.js");
+const { getOwnHostId, processStartedAt, startOrNull } = await import("../src/liveness.js");
 const OWN = getOwnHostId();
 
 const RS1 = "1".repeat(64);
@@ -510,7 +510,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   // order), A never wakes for mail now owned by B, and B arms its own watch and wakes. No grace window.
   /** Production's rebind of window `w` AWAY from w-bob: its OWN upsert (one commit), a new conversation, no agent. */
   const rebindAway = (w: { pid: number }) =>
-    db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: w.pid, windowPidStart: processStartedAt(w.pid) as string, agentName: null, agentClass: null, conversationId: `conv-${w.pid}-next`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
+    db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: w.pid, windowPidStart: startToken(w.pid), agentName: null, agentClass: null, conversationId: `conv-${w.pid}-next`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
   const MOVED = {
     no_live_window: "binding moved (no_live_window): the agent has no live bound window",
     not_this_window: "binding moved (not_this_window): the agent's live window is another one (this one is not the agent's current window)",
@@ -534,7 +534,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
    */
   const identityOf = (pid: number): string => {
     const r = spawnSync("ps", ["-o", "ppid=,comm=", "-p", String(pid)], { encoding: "utf-8" });
-    return `${processStartedAt(pid) ?? "(no start)"} | ${r.stdout.trim().replace(/\s+/g, " ")}`;
+    return `${startOrNull(processStartedAt(pid)) ?? "(no start)"} | ${r.stdout.trim().replace(/\s+/g, " ")}`;
   };
   const stateOf = (pid: number): string => spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf-8" }).stdout.trim();
   async function pollUntil(cond: () => boolean, ms: number): Promise<boolean> {
