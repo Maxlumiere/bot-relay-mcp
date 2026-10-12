@@ -346,6 +346,13 @@ export interface DormantRecord {
   proc_start: string | null;
   reason: string;
   at: string;
+  /**
+   * The WINDOW the watch is anchored to (pid + the kernel's start, captured when it proved ownership),
+   * or null for one anchored to its launching shell (Codex R2 N2/N5 on #324). It names the anchor that
+   * could not be observed, so a supervisor that cannot read the window's start either can still find it,
+   * without ever re-anchoring. Absent in records written before this field.
+   */
+  anchor?: { pid: number; start: string } | null;
 }
 const dormantName = (pid: number, start: string | null) => `${pid}-${crypto.createHash("sha256").update(start ?? "").digest("hex").slice(0, 16)}`;
 /** Record this process as dormant under `dir` (a window or agent dir): 0600, no-follow, atomic. */
@@ -389,6 +396,20 @@ export function blindDormantRecords(dir: string, pidState: (pid: number) => "ali
     out.push(r as DormantRecord);
   }
   return out;
+}
+/**
+ * Codex R2 N2: the blind dormant records of an agent's watches whose CAPTURED anchor is exactly
+ * (pid, start), found WITHOUT a readable window start (every window dir of the agent is read). A record
+ * with no anchor, or another one (the same pid with another start: a reused pid), never matches.
+ */
+export function blindRecordsForAnchor(agentDir: string, anchor: { pid: number; start: string }, pidState: (pid: number) => "alive" | "gone" | "unknown"): DormantRecord[] {
+  let dirs: string[] = [];
+  try {
+    dirs = fs.readdirSync(agentDir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.isSymbolicLink()).map((e) => path.join(agentDir, e.name));
+  } catch {
+    return [];
+  }
+  return dirs.flatMap((d) => blindDormantRecords(d, pidState)).filter((r) => r.anchor != null && r.anchor.pid === anchor.pid && r.anchor.start === anchor.start);
 }
 export function removeDormant(file: string | null): void {
   if (!file) return;

@@ -307,3 +307,45 @@ describe("PR-D (architect fd2f6b9f Q-B): the deploy check's MINT line", () => {
     expect([o.outcome, o.exit]).toEqual(["CANNOT-VERIFY", 3]);
   });
 });
+
+// Codex R2 N3 (INV-LIVE-01): a process-table row whose start is malformed is dropped by the parser. Dropped
+// SILENTLY, an UNRECORDED connector (no connectors row to rescue it) vanished from the board and the
+// deploy check could PASS on an incomplete snapshot.
+describe("Codex R2 N3: a malformed process row never vanishes into a PASS", () => {
+  const raw = (n: number) => START(n).replace(/ UTC$/, "");
+  const world = (extraMalformed: boolean) => {
+    const rows = [`   10     1 ${raw(1)} claude`, `   11    10 ${raw(2)} node ${SCRIPT}`, `   99     1 ${raw(9)} node ${SCRIPT}`, ...(extraMalformed ? [`   12    10 - - - - - node ${SCRIPT}`] : [])].join("\n");
+    const comms = ["   10 claude", "   11 node", "   99 node", ...(extraMalformed ? ["   12 node"] : [])].join("\n");
+    return { rows, comms };
+  };
+  const observeWith = async (extraMalformed: boolean) => {
+    const { buildProcessTable } = await import("../src/liveness.js");
+    const w = world(extraMalformed);
+    const sys = {
+      processTable: () => buildProcessTable((_cmd: string, args: string[]) => (args.includes("pid=,comm=") ? w.comms : w.rows)),
+      cwds: () => new Map<number, string>(),
+      exactArgv: () => null,
+      allListeners: () => [99],
+      portListeners: () => [99],
+      health: async () => ({ ok: true as const, body: { build: build(), mint: "secret" } }),
+      nodeOnPath: () => "v22.0.0",
+      installed: () => installed(),
+      pidState: () => "alive" as const,
+    };
+    const dbReads = {
+      connectorRows: () => ({ live: [row(11, 2)], unknown: [] }),
+      liveRows: () => [row(11, 2)], // the pre-R1 name, so the same test runs on the old code
+      liveBindings: () => [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
+    };
+    return () => V.observeFleet(sys as never, dbReads as never, 3777);
+  };
+  it("the control: the same world WITHOUT the malformed row → PASS (0)", async () => {
+    const o = await V.deployCheck(await observeWith(false), { judge });
+    expect([o.outcome, o.exit], o.reason).toEqual(["PASS", 0]);
+  });
+  it("HARM: ps → buildProcessTable → observeFleet → deployCheck with an extra MALFORMED, UNRECORDED connector row → CANNOT-VERIFY (3), never PASS", async () => {
+    const o = await V.deployCheck(await observeWith(true), { judge });
+    expect([o.outcome, o.exit], o.reason).toEqual(["CANNOT-VERIFY", 3]);
+    expect(o.reason).toMatch(/process table/);
+  });
+});

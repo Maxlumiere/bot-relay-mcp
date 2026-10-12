@@ -765,8 +765,11 @@ export function toProcessViews(
 // ---------------------------------------------------------------------------
 
 export interface SystemDeps {
-  /** The process table (liveness.buildProcessTable). An EMPTY table is a failed read. */
-  processTable(): Map<number, ProcEntry>;
+  /**
+   * The process table (liveness.buildProcessTable). An EMPTY table is a failed read; a table with
+   * `dropped` rows (Codex R2 N3) is INCOMPLETE and is judged the same way: never a fleet verdict.
+   */
+  processTable(): Map<number, ProcEntry> & { dropped?: number };
   /** The working directory of each given pid (for relative scripts); absent = unreadable. */
   cwds(pids: number[]): Map<number, string>;
   /** The EXACT argv where the platform gives one (Linux /proc/<pid>/cmdline), else null. */
@@ -817,7 +820,9 @@ export async function observeFleet(sys: SystemDeps, db: DbReads, port: number): 
   const processes: FleetSnapshot["processes"] =
     table.size === 0
       ? { error: "ps returned no processes" }
-      : toProcessViews(
+      : (table.dropped ?? 0) > 0
+        ? { error: `the process table is incomplete: ${table.dropped} row(s) could not be read, so a process could be missing from the board` }
+        : toProcessViews(
           table,
           ((cwds) => (pid: number) => cwds.get(pid) ?? null)(
             sys.cwds([...table.values()].filter((e) => NODE_EXECUTABLES.test(path.basename(e.comm ?? e.command.split(" ")[0]))).map((e) => e.pid)),

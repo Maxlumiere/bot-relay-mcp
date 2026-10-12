@@ -360,8 +360,9 @@ describe("DETAIL (Codex R1 P2): only a well-formed start token is a fact", () =>
     expect(Lv.processStartedAt(4242, runner("Thu Oct  1 07:37:33 2026\n"), "utc", exists)).toEqual({ kind: "start", start: "Thu Oct  1 07:37:33 2026 UTC" });
   });
   it("HARM: a process-table row whose start is malformed is DROPPED (its pid then reads as missing, never as a fact)", () => {
-    const t = Lv.parseProcessTable(["  10     1 Thu Oct  1 07:37:33 2026 claude", "  20    10 - - - - - zsh", "  30    20 Mon Oct 12 02:27:40 2026 node x"].join("\n"));
+    const t = Lv.parseProcessTable(["  10     1 Thu Oct  1 07:37:33 2026 claude", "  20    10 - - - - - zsh", "  30    20 Mon Oct 12 02:27:40 2026 node x", "garbage", ""].join("\n"));
     expect([...t.keys()]).toEqual([10, 30]);
+    expect(t.dropped, "Codex R2 N3: every dropped row is COUNTED (the empty line is not a row)").toBe(2);
   });
   it("the anchor shape the guard accepts is the shape the real ps prints (this host's own token)", () => {
     const r = Lv.processStartedAt(process.pid);
@@ -396,10 +397,47 @@ describe("DETAIL (Codex R1 P2): incomplete ancestry is cannot_judge; reparented 
 });
 
 describe("BOUNDEDNESS (ruling a98ec836): an unobservable window is bounded, loudly", () => {
-  it("the counter: +1 on an unknown read, and ANY readable read resets it to 0 (the recovery twin)", () => {
-    expect(WU.nextAnchorUnknownCount(0, "unknown")).toBe(1);
-    expect(WU.nextAnchorUnknownCount(4, "unknown")).toBe(5);
-    expect(WU.nextAnchorUnknownCount(4, "same")).toBe(0);
+  /** An awake clock the test sets (null = unreadable). */
+  const clock = (start: number | null) => {
+    const c = { now: start as number | null, read: () => c.now };
+    return c;
+  };
+  it("the bound is AWAKE time since the FIRST unknown read: however many reads happen (a burst, the immediate check), never early", () => {
+    const c = clock(1_000);
+    const b = new WU.AnchorUnknownBound(3_000, c.read);
+    for (let i = 0; i < 500; i++) expect(b.observe("unknown"), `read ${i}, no awake time passed`).toBe(false); // the run starts at 1 000
+    c.now = 3_999;
+    expect(b.observe("unknown")).toBe(false); // 2 999 ms of awake time
+    c.now = 4_000;
+    expect(b.observe("unknown")).toBe(true); // 3 000 ms: the whole bound
+  });
+  it("ANY readable read ends the run (the recovery twin): the next unknown read starts a new one", () => {
+    const c = clock(0);
+    const b = new WU.AnchorUnknownBound(3_000, c.read);
+    b.observe("unknown");
+    c.now = 2_900;
+    expect(b.observe("same")).toBe(false);
+    c.now = 3_100; // 3.1 s after the FIRST run began, but the readable read ended it
+    expect(b.observe("unknown")).toBe(false);
+    c.now = 6_099;
+    expect(b.observe("unknown")).toBe(false);
+    c.now = 6_100;
+    expect(b.observe("unknown")).toBe(true);
+  });
+  it("victra (a): an UNREADABLE awake clock at a read never fires the bound (late, never early), never starts a run, and a readable window read still ends one", () => {
+    const c = clock(null);
+    const b = new WU.AnchorUnknownBound(3_000, c.read);
+    expect(b.observe("unknown")).toBe(false); // no clock: no run starts
+    c.now = 10_000;
+    expect(b.observe("unknown")).toBe(false); // the run starts HERE, not at the unreadable read
+    c.now = null;
+    expect(b.observe("unknown")).toBe(false); // 3 s may have passed: unmeasurable, so not reached
+    c.now = 12_000;
+    expect(b.observe("same")).toBe(false); // a readable WINDOW read ends the run, clock or not
+    c.now = 20_000;
+    expect(b.observe("unknown")).toBe(false); // a new run, starting now
+    c.now = 23_000;
+    expect(b.observe("unknown")).toBe(true);
   });
   it("the provisional bound is 2 h", () => expect(WU.ANCHOR_UNKNOWN_BOUND_MS).toBe(7_200_000));
   it("a dormant WINDOW anchor whose start is unreadable is unknown (bounded); the launching shell never is (the reparent rule bounds it)", () => {

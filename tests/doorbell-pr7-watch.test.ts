@@ -305,12 +305,32 @@ fs.mkdirSync(SLOW_PS_DIR, { recursive: true });
 fs.writeFileSync(path.join(SLOW_PS_DIR, "ps"), `#!/bin/sh\nsleep 1\n[ -e ${sq(PS_STALL)} ] && sleep 3\nexec ${sq(REAL_PS)} "$@"\n`, { mode: 0o755 });
 const stallPs = (on: boolean) => (on ? fs.writeFileSync(PS_STALL, "") : fs.rmSync(PS_STALL, { force: true }));
 const SLOW_WATCH = (agent = "w-bob") => `PATH=${sq(SLOW_PS_DIR)}:"$PATH" ${WATCH(agent)}`;
-/** The same STALL flag without the base 1 s delay: reads are fast unless stalled (the bound tests count checks). */
-const STALL_PS_DIR = path.join(ROOT, "stall-ps");
-fs.mkdirSync(STALL_PS_DIR, { recursive: true });
-fs.writeFileSync(path.join(STALL_PS_DIR, "ps"), `#!/bin/sh\n[ -e ${sq(PS_STALL)} ] && sleep 3\nexec ${sq(REAL_PS)} "$@"\n`, { mode: 0o755 });
-/** A watch whose bound is 3 checks (1 s interval): `--anchor-unknown-bound-s 3`. A stalled check takes >= 4 s (two reads, each timing out at 2 s). */
-const BOUND_WATCH = (agent = "w-bob") => `PATH=${sq(STALL_PS_DIR)}:"$PATH" ${WATCH(agent)} --anchor-unknown-bound-s 3`;
+/**
+ * INV-LIVE-01 R2: a FAST-failing seam for the bound tests. A `ps -o lstart= -p <the window's pid>` exits 1
+ * with no output at once (no 2 s timeouts, so timing is deterministic) while the FLAG file exists, or
+ * after AFTER such reads. Every other ps (other pids, the process table) is the real one.
+ */
+const FAIL_PS_DIR = path.join(ROOT, "fail-ps");
+fs.mkdirSync(FAIL_PS_DIR, { recursive: true });
+fs.writeFileSync(
+  path.join(FAIL_PS_DIR, "ps"),
+  `#!/bin/sh\ncase " $* " in\n  *" -p $PS_TARGET "*)\n    n=$(cat "$PS_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$PS_COUNT"\n    if [ -e "$PS_FLAG" ] || [ "$n" -gt "$PS_AFTER" ]; then exit 1; fi ;;\nesac\nexec ${sq(REAL_PS)} "$@"\n`,
+  { mode: 0o755 },
+);
+let failSeq = 0;
+/** A watch (bound 3 s of awake time, 1 s checks) whose reads of window `w`'s start fail while `flag` exists, or after `after` of them. */
+function failWatch(w: { pid: number }, o: { after?: number; flags?: string; env?: string } = {}): { cmd: string; flag: string; reads: () => number } {
+  const n = ++failSeq;
+  const flag = path.join(FAIL_PS_DIR, `flag-${n}`);
+  const count = path.join(FAIL_PS_DIR, `count-${n}`);
+  const cmd = `PS_TARGET=${w.pid} PS_FLAG=${sq(flag)} PS_COUNT=${sq(count)} PS_AFTER=${o.after ?? 1_000_000} ${o.env ?? ""} PATH=${sq(FAIL_PS_DIR)}:"$PATH" node ${sq(RELAY_BIN)} watch w-bob --until-wake ${o.flags ?? "--interval 1 --dormant-check-s 1 --anchor-unknown-bound-s 3"}`;
+  return { cmd, flag, reads: () => Number(fs.existsSync(count) ? fs.readFileSync(count, "utf-8").trim() : 0) };
+}
+const on = (flag: string) => fs.writeFileSync(flag, "");
+const off = (flag: string) => fs.rmSync(flag, { force: true });
+/** The exact blind reason (R2 N5): built from the CAPTURED window anchor, whatever the watch was doing. */
+const blindReason = (w: { pid: number }, base: string, boundS = 3) => `${W.ANCHOR_UNOBSERVED_PREFIX} its window (pid ${w.pid}, start ${startToken(w.pid)}) could not be observed for ${boundS} s of awake time in a row (the bound): it is not judged gone and is never re-anchored; dormant because: ${base}`;
+const STOPPED_AT_BOUND = "it stopped watching at the bound";
 
 describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens; inside a bound window)", () => {
   const windows: TestWindow[] = [];
@@ -685,78 +705,193 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     }
   }, 60_000);
 
-  // --- BOUNDEDNESS (architect ruling a98ec836): a window unobservable for the whole bound is LOUD, never silent
-  it.skipIf(!REAL_PS)("HARM (BOUNDEDNESS, the PIN): its window unobservable for the WHOLE bound → the watch goes DORMANT with a cannot_observe(anchor) record (never window_gone, never re-anchored), alive; relay doctor names it; readable again → its record is no longer blind; the window closing still ends it", async () => {
-    const r = win.run(BOUND_WATCH());
+  // --- BOUNDEDNESS (architect ruling a98ec836; Codex R2 N1/N4/N5): a window unobservable for the whole
+  // bound (3 s of AWAKE time here) is LOUD, never silent, never early. Reads fail FAST (failWatch).
+  const mineIn = (dir: string, pid: number) => dormantRecords(dir).filter((x) => x.pid === pid);
+  async function until(cond: () => boolean, ms: number): Promise<boolean> {
+    for (const t0 = Date.now(); Date.now() - t0 < ms; ) {
+      if (cond()) return true;
+      await new Promise((res) => setTimeout(res, 50));
+    }
+    return cond();
+  }
+
+  it.skipIf(!REAL_PS)("HARM (BOUNDEDNESS, the PIN): its window unobservable for the WHOLE bound → DORMANT with a cannot_observe(anchor) record naming the captured anchor (never window_gone, never re-anchored), alive; relay doctor names it; readable again → quiet; the window closing still ends it", async () => {
+    const f = failWatch(win);
+    const r = win.run(f.cmd);
     await untilStatus("live");
     const pid = await r.pid();
     const { checkBlindWatches } = await import("../src/cli/doctor.js");
-    const blind = () => dormantRecords(winDir(win)).filter((x) => x.pid === pid && String(x.reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX));
+    const t0 = Date.now();
+    on(f.flag);
     try {
-      stallPs(true);
-      for (let i = 0; i < 400 && blind().length === 0; i++) await new Promise((res) => setTimeout(res, 100));
-      expect(blind(), r.err()).toHaveLength(1);
-      expect(String(blind()[0].reason)).toMatch(new RegExp(`^cannot_observe\\(anchor\\): its window \\(pid ${win.pid}, start [^)]+\\) could not be observed for 3 checks in a row \\(the bound\\)`));
-      expect(await within(r.exited, 1_000)).toBe("timeout"); // DORMANT, not exited
-      expect(alive(pid)).toBe(true);
-      expect(r.out()).toBe("");
-      const doc = await checkBlindWatches(DB);
-      expect(doc.status).toBe("WARN");
-      expect(doc.detail).toContain(`w-bob (watch pid ${pid}, since `);
+      expect(await until(() => mineIn(winDir(win), pid).length > 0, 20_000), r.err()).toBe(true);
+      const rec = mineIn(winDir(win), pid)[0] as { reason: string; at: string; anchor?: unknown };
+      expect(rec.reason).toBe(blindReason(win, STOPPED_AT_BOUND));
+      expect(rec.anchor).toEqual({ pid: win.pid, start: startToken(win.pid) });
+      expect(Date.parse(rec.at) - t0, "never early: the bound is 3 s of awake time").toBeGreaterThanOrEqual(2_950);
+      expect(await within(r.exited, 500)).toBe("timeout"); // DORMANT, not exited
+      expect((await checkBlindWatches(DB)).status).toBe("WARN");
     } finally {
-      stallPs(false);
+      off(f.flag);
     }
-    // Readable again: still dormant (its lock is released), but no longer blind; doctor clears.
-    for (let i = 0; i < 100 && blind().length > 0; i++) await new Promise((res) => setTimeout(res, 100));
-    expect(blind()).toEqual([]);
-    expect(dormantRecords(winDir(win)).some((x) => x.pid === pid)).toBe(true);
+    expect(await until(() => mineIn(winDir(win), pid)[0]?.reason === STOPPED_AT_BOUND, 10_000), r.err()).toBe(true);
     expect((await checkBlindWatches(DB)).status).toBe("PASS");
     process.kill(win.pid, "SIGKILL");
     expect(await within(r.exited, 15_000), r.err()).toBe(0);
     expect(r.out()).toBe("");
-  }, 90_000);
+  }, 60_000);
 
-  it.skipIf(!REAL_PS)("HARM (BOUNDEDNESS, dormant): a watch ALREADY dormant (the lost race) that cannot observe its window for the bound becomes LOUD (its record rewritten cannot_observe(anchor)); readable again → quiet; it never exits on it", async () => {
-    win.run(WATCH());
+  it.skipIf(!REAL_PS)("HARM (R2 N1): a BURST of event-triggered checks (marker traffic) and fast failures never bring the bound EARLY: no record before 3 s of awake time", async () => {
+    const markers = fs.mkdtempSync(path.join(ROOT, "markers-"));
+    const f = failWatch(win, { env: `RELAY_FILESYSTEM_MARKERS=1 RELAY_MARKER_DIR=${sq(markers)}` });
+    const r = win.run(f.cmd);
     await untilStatus("live");
-    const loser = win.run(BOUND_WATCH()); // its dormant ticks are 1 s apart: the bound is 3 ticks
-    const pid = await loser.pid();
-    const mine = () => dormantRecords(winDir(win)).filter((x) => x.pid === pid);
-    for (let i = 0; i < 100 && mine().length === 0; i++) await new Promise((res) => setTimeout(res, 100));
-    expect(String(mine()[0]?.reason), loser.err()).toMatch(/^already watched/);
+    const pid = await r.pid();
+    const t0 = Date.now();
+    on(f.flag);
     try {
-      stallPs(true);
-      for (let i = 0; i < 300 && !String(mine()[0]?.reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX); i++) await new Promise((res) => setTimeout(res, 100));
-      expect(String(mine()[0]?.reason), loser.err()).toBe(`${W.ANCHOR_UNOBSERVED_PREFIX} already watched: a watch for this agent is already live in this window`);
-      expect(await within(loser.exited, 500)).toBe("timeout");
+      // ~250 events in 2.5 s: another agent's marker traffic. Each one triggers a check.
+      for (let i = 0; Date.now() - t0 < 2_500; i++) {
+        fs.writeFileSync(path.join(markers, `other-${i % 7}.touch`), String(i));
+        await new Promise((res) => setTimeout(res, 10));
+      }
+      expect(mineIn(winDir(win), pid), `no record within 2.5 s (reads so far: ${f.reads()})`).toEqual([]);
+      expect(f.reads()).toBeGreaterThan(20); // the burst really drove many failing checks
+      expect(await until(() => mineIn(winDir(win), pid).length > 0, 15_000), r.err()).toBe(true);
+      expect(Date.parse(String(mineIn(winDir(win), pid)[0].at)) - t0).toBeGreaterThanOrEqual(2_950);
     } finally {
-      stallPs(false);
+      off(f.flag);
     }
-    for (let i = 0; i < 100 && String(mine()[0]?.reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX); i++) await new Promise((res) => setTimeout(res, 100));
-    expect(String(mine()[0]?.reason)).toBe("already watched: a watch for this agent is already live in this window");
-    expect(alive(pid)).toBe(true);
-  }, 90_000);
+  }, 60_000);
 
-  it.skipIf(!REAL_PS)("the TWIN (BOUNDEDNESS): two outages, each SHORTER than the bound, with a readable check between → the count resets, the watch never goes dormant, and it still wakes", async () => {
-    const r = win.run(BOUND_WATCH());
+  it.skipIf(!REAL_PS)("HARM (R2 N1): the IMMEDIATE first check never earns credit: --interval 7200 with a 2 h bound and every read failing from that check on → still watching (it read the window as unknown and did not go dormant)", async () => {
+    const f = failWatch(win, { after: 3, flags: "--interval 7200 --dormant-check-s 1 --anchor-unknown-bound-s 7200" }); // ownership reads the window 3 times
+    const r = win.run(f.cmd);
+    const pid = await r.pid();
+    await new Promise((res) => setTimeout(res, 6_000)); // arming + the immediate check + seconds of dormant-tick time
+    expect(f.reads(), "the first check's read did fail").toBeGreaterThan(3);
+    expect(dormantRecords(winDir(win)).filter((x) => x.pid === pid), r.err()).toEqual([]);
+    expect(lockStatus()).toBe("live");
+    expect(await within(r.exited, 100)).toBe("timeout");
+  }, 30_000);
+
+  it.skipIf(!REAL_PS)("the TWIN (BOUNDEDNESS): two outages, each SHORTER than the bound, with readable checks between → it resets, never goes dormant, and still wakes (without the reset: 5+ s of unknown ≥ 3 s)", async () => {
+    const f = failWatch(win);
+    const r = win.run(f.cmd);
     await untilStatus("live");
     const pid = await r.pid();
     try {
       for (let round = 0; round < 2; round++) {
-        stallPs(true);
-        await new Promise((res) => setTimeout(res, 5_000)); // <= 2 stalled checks (each >= 4 s)
-        stallPs(false);
-        await new Promise((res) => setTimeout(res, 3_000)); // >= 1 readable check: the count resets
+        on(f.flag);
+        await new Promise((res) => setTimeout(res, 2_000));
+        off(f.flag);
+        await new Promise((res) => setTimeout(res, 3_000));
       }
     } finally {
-      stallPs(false);
+      off(f.flag);
     }
-    expect(dormantRecords(winDir(win)).filter((x) => x.pid === pid), r.err()).toEqual([]); // without the reset: 4 unknown checks >= the bound of 3
-    expect(alive(pid)).toBe(true);
+    expect(mineIn(winDir(win), pid), r.err()).toEqual([]);
     send();
     expect(await within(r.exited, 20_000), r.err()).toBe(0);
     expect(r.out()).toMatch(/^relay mail pending for w-bob: 1 new message\(s\)/);
-  }, 90_000);
+  }, 60_000);
+
+  it.skipIf(!REAL_PS)("HARM (BOUNDEDNESS, dormant; R2 N5): a watch ALREADY dormant (the lost race) blind for the bound → its record names the CAPTURED anchor (pid + start) and why it was dormant; readable again → quiet; it never exits on it", async () => {
+    win.run(WATCH());
+    await untilStatus("live");
+    const f = failWatch(win);
+    const loser = win.run(f.cmd);
+    const pid = await loser.pid();
+    const base = "already watched: a watch for this agent is already live in this window";
+    expect(await until(() => mineIn(winDir(win), pid).length > 0, 10_000), loser.err()).toBe(true);
+    expect(mineIn(winDir(win), pid)[0].reason).toBe(base);
+    on(f.flag);
+    try {
+      expect(await until(() => mineIn(winDir(win), pid)[0]?.reason !== base, 15_000), loser.err()).toBe(true);
+      expect(mineIn(winDir(win), pid)[0].reason).toBe(blindReason(win, base));
+      expect(await within(loser.exited, 300)).toBe("timeout");
+    } finally {
+      off(f.flag);
+    }
+    expect(await until(() => mineIn(winDir(win), pid)[0]?.reason === base, 10_000), loser.err()).toBe(true);
+    expect(alive(pid)).toBe(true);
+  }, 60_000);
+
+  // R2 N4: durable loudness survives a failed write. chmod runs only on this test's own temp dir (under
+  // ROOT, a mkdtemp; HOME is sandboxed by env()), and is restored in `finally`.
+  async function withDormantDirLocked<T>(dir: string, fn: (unlock: () => void) => Promise<T>): Promise<T> {
+    const d = path.join(dir, W.DORMANT_DIR);
+    fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+    fs.chmodSync(d, 0o500);
+    const unlock = () => fs.chmodSync(d, 0o700);
+    try {
+      return await fn(unlock);
+    } finally {
+      unlock();
+    }
+  }
+
+  it.skipIf(!REAL_PS || process.getuid?.() === 0)("HARM (R2 N4): the blind record's FIRST write fails (dormant/ unwritable) → retried on later ticks: written once the dir is writable again", async () => {
+    const f = failWatch(win);
+    const r = win.run(f.cmd);
+    await untilStatus("live");
+    const pid = await r.pid();
+    await withDormantDirLocked(winDir(win), async (unlock) => {
+      on(f.flag);
+      try {
+        expect(await until(() => lockStatus() === "absent", 20_000), r.err()).toBe(true); // dormant: its lock is released
+        expect(r.err()).toMatch(/DEGRADED: the dormant record for w-bob could not be written/);
+        expect(mineIn(winDir(win), pid)).toEqual([]);
+        unlock();
+        expect(await until(() => mineIn(winDir(win), pid).length > 0, 10_000), r.err()).toBe(true);
+        expect(String(mineIn(winDir(win), pid)[0].reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX)).toBe(true);
+      } finally {
+        off(f.flag);
+      }
+    });
+  }, 60_000);
+
+  it.skipIf(!REAL_PS || process.getuid?.() === 0)("HARM (R2 N4): the RECOVERY write fails (dormant/ unwritable) → retried: the record goes quiet once the dir is writable, never left blind", async () => {
+    const f = failWatch(win);
+    const r = win.run(f.cmd);
+    await untilStatus("live");
+    const pid = await r.pid();
+    const isBlind = () => String(mineIn(winDir(win), pid)[0]?.reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX);
+    on(f.flag);
+    expect(await until(isBlind, 20_000), r.err()).toBe(true);
+    await withDormantDirLocked(winDir(win), async (unlock) => {
+      off(f.flag); // readable again: the quiet rewrite is attempted and fails
+      await new Promise((res) => setTimeout(res, 3_000));
+      expect(isBlind(), "still blind: the quiet write could not land").toBe(true);
+      unlock();
+      expect(await until(() => mineIn(winDir(win), pid).length > 0 && !isBlind(), 10_000), r.err()).toBe(true);
+    });
+  }, 60_000);
+
+  it.skipIf(!REAL_PS)("HARM (R2 N4, recordDir=null path): the watch dir unusable at arming (a planted symlink) → DORMANT, and its record is written once the dir is a real one (retried, never silently skipped); the symlink's target is never written", async () => {
+    const agentDir = W.watchAgentDir(DB, "w-bob");
+    const target = fs.mkdtempSync(path.join(ROOT, "elsewhere-"));
+    fs.mkdirSync(path.dirname(agentDir), { recursive: true, mode: 0o700 });
+    fs.symlinkSync(target, agentDir);
+    const r = win.run(WATCH());
+    const pid = await r.pid();
+    try {
+      expect(await until(() => /DORMANT \(the watch dir is unusable\)/.test(r.err()), 10_000), r.err()).toBe(true);
+      expect(fs.readdirSync(target)).toEqual([]);
+      fs.unlinkSync(agentDir); // the link itself (rmSync would follow it)
+      fs.mkdirSync(agentDir, { mode: 0o700 });
+      expect(await until(() => mineIn(winDir(win), pid).length > 0, 10_000), r.err()).toBe(true);
+      expect(mineIn(winDir(win), pid)[0].reason).toBe("the watch dir is unusable");
+      expect(fs.readdirSync(target)).toEqual([]);
+    } finally {
+      try {
+        if (fs.lstatSync(agentDir).isSymbolicLink()) fs.unlinkSync(agentDir);
+      } catch {
+        /* gone */
+      }
+    }
+  }, 40_000);
 
   // INV-LIVE-01 plan P1 (TAKEOVER class): the reader's awake clock UNREADABLE → no takeover. Bar: an aged
   // holder reads stale with the clock and live without it. (The `awakeNow === null` clause is belt: JS

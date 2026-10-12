@@ -350,28 +350,37 @@ export function processIdentityIsAgent(
 }
 
 /**
+ * A process snapshot, and how many of its rows could NOT be read (Codex R2 N3 on #324). A dropped row's
+ * pid is missing from the map, so a non-zero `dropped` means the snapshot is INCOMPLETE: a consumer that
+ * judges the whole fleet (the deploy check) must not treat what is left as everything.
+ */
+export type ProcessTable = Map<number, ProcEntry> & { dropped: number };
+
+/**
  * Parse `ps -axo pid=,ppid=,lstart=,command=` output into a pid→entry map.
  * `lstart` is a fixed-width human date (the process start clock time) — stable
  * for the life of the process, so it serves as the reuse-guard token. Pure.
+ * A non-empty line that is not a row, or a row whose start is not a token, is DROPPED and COUNTED
+ * (INV-LIVE-01): its pid is then missing, which an ancestry walk reports as cannot_judge and a fleet
+ * judgement reports as an incomplete snapshot, never as "no such process".
  */
-export function parseProcessTable(psStdout: string): Map<number, ProcEntry> {
-  const table = new Map<number, ProcEntry>();
+export function parseProcessTable(psStdout: string): ProcessTable {
+  const table = Object.assign(new Map<number, ProcEntry>(), { dropped: 0 });
   for (const line of psStdout.split("\n")) {
+    if (line.trim().length === 0) continue;
     // pid ppid <lstart: 5 whitespace-separated fields> command...
     const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
-    if (!m) continue;
-    // A row whose start is not a token is dropped (INV-LIVE-01): its pid is then MISSING from the table,
-    // which an ancestry walk reports as incomplete (cannot_judge), never as "no such parent".
-    if (!RAW_START_TOKEN_RE.test(m[3])) continue;
-    const pid = Number(m[1]);
-    const ppid = Number(m[2]);
-    if (!Number.isInteger(pid) || pid <= 0) continue;
-    table.set(pid, { pid, ppid, startedAt: m[3].trim(), command: m[4].trim() });
+    const pid = m ? Number(m[1]) : NaN;
+    if (!m || !RAW_START_TOKEN_RE.test(m[3]) || !Number.isInteger(pid) || pid <= 0) {
+      table.dropped++;
+      continue;
+    }
+    table.set(pid, { pid, ppid: Number(m[2]), startedAt: m[3].trim(), command: m[4].trim() });
   }
   return table;
 }
 
-export function buildProcessTable(run: CommandRunner = defaultRunner): Map<number, ProcEntry> {
+export function buildProcessTable(run: CommandRunner = defaultRunner): ProcessTable {
   // POSIX only here (macOS/Linux). Windows capture is a documented follow-on
   // (the daemon there falls back to age-based, same as cross-host).
   const table = parseProcessTable(run("ps", ["-axo", "pid=,ppid=,lstart=,command="], { startTokenForm: "utc" }));

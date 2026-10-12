@@ -46,9 +46,9 @@ import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
-import { anchorLivenessVerdict, getOwnHostId, probePid, processStartedAt, startOrNull, type ProcessStart } from "./liveness.js";
+import { anchorLivenessVerdict, getOwnHostId, isUtcStartToken, probePid, processStartedAt, startOrNull, type ProcessStart } from "./liveness.js";
 import { performance } from "perf_hooks";
-import { blindDormantRecords, watchableName, watchSupervision, watchWindowDir } from "./watch-wake.js";
+import { blindDormantRecords, blindRecordsForAnchor, watchAgentDir, watchableName, watchSupervision, watchWindowDir } from "./watch-wake.js";
 import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead, type WatchFit } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
 import { conditionOf, FUTURE_TOLERANCE_MS, HEARTBEAT_FILENAME, MAX_COUNT, NOT_EVALUATED_MAX_NAMES, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
@@ -208,7 +208,16 @@ function superviseWatch(dbPath: string, name: string, read: PendingRead, w: impo
   const start = startOf(w.window_pid);
   if (start.kind === "gone") return { status: "absent", undeliveredAfterWake: false };
   // INV-LIVE-01: the watch's key cannot be read, so its watch cannot be observed: UNKNOWN, never absent.
-  if (start.kind === "unreadable") return { status: "unknown", undeliveredAfterWake: false };
+  // Unless its watch already went dormant BLIND to this very window (Codex R2 N2): that record carries the
+  // CAPTURED anchor, so it is found without the start (only for a binding token in the UTC form, the one
+  // the anchor is in; a legacy-form token cannot be compared and stays unknown). Never re-anchored.
+  if (start.kind === "unreadable") {
+    const token = w.window_pid_start;
+    if (token && isUtcStartToken(token) && blindRecordsForAnchor(watchAgentDir(dbPath, name), { pid: w.window_pid, start: token }, (pid) => probePid(pid)).length > 0) {
+      return { status: "blind", undeliveredAfterWake: false };
+    }
+    return { status: "unknown", undeliveredAfterWake: false };
+  }
   const dir = watchWindowDir(dbPath, name, { pid: w.window_pid, start: start.start });
   const fit = watchSupervision(dir, read, wallMs, horizonMs);
   // BOUNDEDNESS (ruling a98ec836): no live watch, because the window's watch went dormant BLIND to it

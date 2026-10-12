@@ -224,6 +224,29 @@ describe.skipIf(!OWN)("PR 7: the doorbell supervises the watch (the real job, a 
     expect((await checkBlindWatches(DB)).status).toBe("PASS");
   }, 60_000);
 
+  it("HARM (Codex R2 N2): the window's start STAYS unreadable to the supervisor, and the window's watch went dormant BLIND → cannot_observe(anchor) at once, found through the record's CAPTURED anchor (never cannot_observe(watch), never re-anchored)", async () => {
+    db.sendMessage("s7-sender", "s7-alice", "x", "normal");
+    const start = startToken(win.pid);
+    const blind = (dir: string, anchorStart: string) => {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      W.writeDormant(dir, {
+        pid: process.pid,
+        proc_start: startToken(process.pid),
+        reason: `${W.ANCHOR_UNOBSERVED_PREFIX} its window (pid ${win.pid}, start ${anchorStart}) could not be observed for 3 s of awake time in a row (the bound): it is not judged gone and is never re-anchored; dormant because: it stopped watching at the bound`,
+        at: new Date().toISOString(),
+        anchor: { pid: win.pid, start: anchorStart },
+      } as never);
+    };
+    // the control first: a blind record for ANOTHER anchor (the same pid, another start) is not this window's
+    const otherStart = "Mon Jan  5 00:00:00 2026 UTC";
+    blind(W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start: otherStart }), otherStart);
+    await loop(0, () => unreadable);
+    expect(boards()).toEqual([]); // unknown, below K: held
+    blind(W.watchWindowDir(DB, "s7-alice", { pid: win.pid, start }), start);
+    await loop(0, () => unreadable);
+    expect(boards()).toEqual([["cannot_observe", "open", "anchor"]]);
+  }, 60_000);
+
   it.skipIf(W.awakeNowMs() === null)("a HUNG watch (lock held, its own heartbeat older than the stale bound on the AWAKE clock) → no_driver(watch_stale)", async () => {
     db.sendMessage("s7-sender", "s7-alice", "x", "normal");
     expect(await within(startWatch("s7-alice").exited, 20_000)).toBe(0);
