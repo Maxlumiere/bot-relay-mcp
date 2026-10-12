@@ -209,7 +209,8 @@ function run(args: string[], env: Record<string, string>, stdin = "", fd5?: stri
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
     child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("exit", (code) => resolve({ code, stdout, stderr }));
+    // 'close', not 'exit': a process can exit while another still holds its stdout, so its output has not drained.
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
     child.on("error", reject);
     child.stdin.end(stdin);
   }).finally(() => {
@@ -284,6 +285,13 @@ afterAll(() => {
   proxy?.close();
   closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
+});
+
+describe("the harness itself: run() returns only after the child's output has drained", () => {
+  it("a last chunk written AFTER the shell exits (by a process still holding its stdout) is captured", async () => {
+    const r = await run(["-c", "(sleep 0.3; printf late-chunk) & exit 0"], {});
+    expect(r.stdout).toBe("late-chunk");
+  });
 });
 
 describe("the curl-config helper: a value reaches the server byte-exact, and can never add a directive", () => {
@@ -370,6 +378,19 @@ describe("the reply summary every print site uses: a fixed line, never the reply
       expect(r.stdout.trimEnd()).toMatch(SUMMARY);
     });
   }
+
+  it("the size and hash are of the RAW bytes received (a malformed UTF-8 byte is counted as one byte)", async () => {
+    // {"a":"<0xff>"} = 9 bytes; decoded as UTF-8 the 0xff becomes U+FFFD (3 bytes), which would read 11.
+    const raw = Buffer.from([...Buffer.from('{"a":"'), 0xff, ...Buffer.from('"}')]);
+    const sha = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 12);
+    for (const [label, cmd] of [
+      ["no status", `printf '{"a":"\\377"}'`],
+      ["a status trailer, stripped as bytes", `printf '{"a":"\\377"}\\nHTTP_STATUS:200\\n'`],
+    ] as const) {
+      const r = await run(["-c", `. '${HELPERS}'; ${cmd} | relay_reply_summary`], {});
+      expect(r.stdout, label).toBe(`HTTP ${label === "no status" ? "unknown" : "200"}, error_code none, ${raw.length} bytes, sha256 ${sha}\n`);
+    }
+  });
 
   it("without node the line still matches the grammar (bytes only)", async () => {
     const bin = path.join(TEST_DIR, "no-node-bin");

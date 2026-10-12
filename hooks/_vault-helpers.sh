@@ -239,11 +239,13 @@ RELAY_REPLY_ERROR_CODES="AUTH_FAILED CAP_DENIED NAME_COLLISION NAME_COLLISION_AC
 # stringified content. Nothing it reads is printed except a code found in the allowlist.
 RELAY_REPLY_SUMMARY_JS='
 const crypto = require("crypto");
-let text = require("fs").readFileSync(0).toString("utf8");
+let raw = require("fs").readFileSync(0);
 let status = "unknown";
-const m = /\nHTTP_STATUS:([0-9]{3})\n?$/.exec(text);
-if (m) { status = m[1]; text = text.slice(0, m.index); }
-const bytes = Buffer.byteLength(text);
+// latin1 maps each byte to one char, so a match index is a BYTE offset: the trailer is stripped as bytes.
+const m = /\nHTTP_STATUS:([0-9]{3})\n?$/.exec(raw.toString("latin1"));
+if (m) { status = m[1]; raw = raw.subarray(0, m.index); }
+const bytes = raw.length;
+const text = raw.toString("utf8");
 const docs = [];
 try {
   const t = text.trim();
@@ -267,7 +269,7 @@ const walk = (v, depth) => {
 };
 for (const d of docs) walk(d, 0);
 const code = found.length === 0 ? "none" : typeof found[0] === "string" && allowed.has(found[0]) ? found[0] : "unlisted";
-const sha = crypto.createHash("sha256").update(text).digest("hex").slice(0, 12);
+const sha = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 12);
 process.stdout.write("HTTP " + status + ", error_code " + code + ", " + bytes + " bytes, sha256 " + sha + "\n");
 '
 
