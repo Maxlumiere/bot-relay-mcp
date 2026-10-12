@@ -529,15 +529,33 @@ describe("every register path that ISSUES a token, by the harm predicate (Q-A)",
 
 describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", () => {
   /**
-   * Runs the REAL SessionStart hook under `bash -x` against a REAL daemon. The trace is the instrument for
-   * "reads no secret": relay_mint_secret_curl_config is the ONLY code that reads it. The NAMED arm is the
-   * known-good control: it must call it AND end up registered (which also proves the hook sends the secret
-   * end to end), or the unnamed arm's silence would prove nothing.
+   * Runs the REAL SessionStart hook against a REAL daemon, from a COPY of hooks/ whose relay_mint_secret_curl_config
+   * (the ONLY code that reads the secret) is wrapped to log each call: the instrument for "reads no secret". It was
+   * a `bash -x` trace, but every hook now turns an inherited trace off first (a trace prints credentials, #319), so
+   * a call log is the observer. The NAMED arm is the known-good control: it must call it AND end up registered
+   * (which also proves the hook sends the secret end to end), or the unnamed arm's silence would prove nothing.
    */
+  const OBSERVED = path.join(ROOT, "observed-repo");
+  const observedHook = (): string => {
+    if (!fs.existsSync(OBSERVED)) {
+      fs.mkdirSync(OBSERVED);
+      fs.cpSync(path.resolve("hooks"), path.join(OBSERVED, "hooks"), { recursive: true });
+      // The hook reaches ../bin/relay and ../dist: the copy keeps the repo's shape.
+      for (const d of ["bin", "dist"]) fs.symlinkSync(path.resolve(d), path.join(OBSERVED, d), "junction");
+      fs.appendFileSync(
+        path.join(OBSERVED, "hooks", "_vault-helpers.sh"),
+        `\neval "relay_test__mint_cfg_real() $(declare -f relay_mint_secret_curl_config | sed 1d)"\n` +
+          `relay_mint_secret_curl_config() { printf 'read\\n' >> "$RELAY_TEST_SECRET_READ_LOG"; relay_test__mint_cfg_real "$@"; }\n`,
+      );
+    }
+    return path.join(OBSERVED, "hooks", "check-relay.sh");
+  };
   const runHookTraced = (port: number, name: string | undefined) =>
-    new Promise<{ stdout: string; trace: string; status: number | null }>((resolve) => {
-      const p = spawn("bash", ["-x", path.resolve("hooks/check-relay.sh")], {
+    new Promise<{ stdout: string; trace: string; status: number | null; secretReads: number }>((resolve) => {
+      const log = path.join(ROOT, `secret-reads-${crypto.randomBytes(4).toString("hex")}`);
+      const p = spawn("bash", [observedHook()], {
         env: {
+          RELAY_TEST_SECRET_READ_LOG: log,
           HOME: ROOT,
           RELAY_HOME: ROOT,
           PATH: process.env.PATH || "/usr/bin:/bin",
@@ -555,7 +573,11 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
       p.stderr.on("data", (d: Buffer) => (trace += d));
       p.stdin.end("");
       const timer = setTimeout(() => p.kill("SIGKILL"), 25_000);
-      p.on("close", (status) => (clearTimeout(timer), resolve({ stdout, trace, status })));
+      p.on("close", (status) => {
+        clearTimeout(timer);
+        const secretReads = fs.existsSync(log) ? fs.readFileSync(log, "utf-8").split("\n").filter((l) => l === "read").length : 0;
+        resolve({ stdout, trace, status, secretReads });
+      });
     });
   // The hook upgrades to HEALTHY (and so can REPLACE it with REGISTER_FAILED) only when its config detector ran on a
   // ~/.claude.json naming the relay; without one the verdict stays CANNOT-JUDGE whatever register did.
@@ -565,13 +587,12 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
   // mixed separators (MEASURED on windows-2022: C:\\...\\pr-d-x/secrets/mint.secret). Normalize the separators only;
   // the assertion still requires the exact file.
   const nativeSeps = (s: string) => (process.platform === "win32" ? s.replace(/\//g, "\\") : s);
-  const helperCalls = (trace: string) => trace.split("\n").filter((l) => /^\++ relay_mint_secret_curl_config\b/.test(l)).length;
 
   it("NAMED (the control): the hook reads the secret, sends it, and the window is registered", async () => {
     await withDaemon(async (port) => {
       const r = await runHookTraced(port, "named-window");
       expect(r.status, r.stdout).toBe(0);
-      expect(helperCalls(r.trace), "the named hook called the secret reader").toBeGreaterThanOrEqual(1);
+      expect(r.secretReads, "the named hook called the secret reader").toBeGreaterThanOrEqual(1);
     });
     expect(db.getAgentAuthData("named-window"), "registered over HTTP with the secret the hook read").not.toBeNull();
   }, 40_000);
@@ -583,7 +604,7 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
       expect(r.status, r.stdout).toBe(0);
       expect(r.stdout).toContain("[RELAY] unnamed: not registered");
       expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="unnamed: not registered/);
-      expect(helperCalls(r.trace), "the unnamed hook never reaches the secret reader").toBe(0);
+      expect(r.secretReads, "the unnamed hook never reaches the secret reader").toBe(0);
     });
     expect(db.getAgentAuthData("default")).toBeNull();
     expect((db.getDb().prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number }).n).toBe(before);

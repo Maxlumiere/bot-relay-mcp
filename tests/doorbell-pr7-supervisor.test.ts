@@ -58,10 +58,9 @@ async function lifetime(wall: number): Promise<number> {
   }
 }
 const env = (): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, RELAY_FILESYSTEM_MARKERS: "0" });
-const sq = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`;
 let win: TestWindow;
 /** The agent arms its watch: a DESCENDANT of its bound window (ruling ffcaf608 D1). */
-const startWatch = (agent: string) => win.run(`node ${sq(RELAY_BIN)} watch ${agent} --until-wake --interval 1`);
+const startWatch = (agent: string) => win.runRelayWatch([agent, "--until-wake", "--interval", "1"]);
 const lockStatus = (agent: string) => spawnSync("node", [RELAY_BIN, "watch", agent, "--lock-status"], { env: env(), encoding: "utf-8" }).stdout.trim();
 async function untilLive(agent: string): Promise<void> {
   for (let i = 0; i < 75 && lockStatus(agent) !== "live"; i++) await new Promise((r) => setTimeout(r, 200));

@@ -74,6 +74,18 @@ Another PROCESS writing the same database file can. A CLI verb (`relay recover`,
 
 Over HTTP, a suffix allocation also needs the relay's registration secret, exactly like a new name, because it issues a token for an identity the caller holds no credential for. So the residual above now needs both the base name's token and the registration secret.
 
+### The hooks never print a server reply, and turn an inherited trace off
+
+The hooks report a failed recovery, and (under `RELAY_HOOK_DEBUG`) the register reply, as one fixed line: the HTTP status, the reply's `error_code` if it is one of the relay's own codes (otherwise `unlisted`), and the reply's size and a short sha256 prefix to match it against the server's log. A reply that does not parse is reported as `unparseable reply (N bytes)`. The reply itself is never printed, not even redacted: a redactor is a list of what to hide, and an error message that echoes a request can carry a credential escaped, split or encoded past any such list.
+
+Every hook entrypoint, and every script that loads the vault helpers, turns tracing off as its first statement, before it reads a credential, so an inherited `bash -x` or `SHELLOPTS=xtrace` cannot print one. `BASH_XTRACEFD` is unset too, except when it names standard input, output or error: unsetting it closes the descriptor it names (bash 4.1 and later), which would cut the hook's own output.
+
+What this does not cover: the trace of that first statement, under an inherited trace, expands `PS4`, and a `BASH_ENV` file runs before it. Both come from the environment, which only the same user (and root) controls: the relay's existing trust boundary. `bin/spawn-agent.sh` and `scripts/migrate-existing-tokens-to-vault.sh` are covered by a structural check (the block is their first statement), not by a run under a trace.
+
+### The SessionStart hook prints mail bodies as they are
+
+The change above covers the relay's own tooling leaking credentials. Mail bodies are agent content: a token an agent pastes into a message is that agent's disclosure, and it reaches the recipient through `get_messages` anyway, so redacting only the SessionStart print would protect nothing. Whether SessionStart prints bodies at all is a pending decision (the recommendation is metadata only), which would make this moot.
+
 ### A same-process refresh is a safety guard, not an authority boundary
 
 When the SessionStart hook runs twice in one window, its second `register_agent` finds the name held by itself. If the call names the same agent process as the row (`agent_pid`, `agent_pid_start` and `host_id`, all present and equal), it is answered as a refresh: a strict no-op. Nothing is rotated, minted or re-bound. Any other caller gets `NAME_COLLISION_ACTIVE`.
