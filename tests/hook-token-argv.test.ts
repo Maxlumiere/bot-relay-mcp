@@ -272,6 +272,34 @@ function remoteEnv(name: string, h: string, token: string): Record<string, strin
 const PTU_STDIN = JSON.stringify({ session_id: "a1a1a1a1-0000-0000-0000-000000000001", hook_event_name: "PostToolUse", tool_name: "Read", tool_input: {}, tool_response: {} });
 const STOP_STDIN = JSON.stringify({ session_id: "a1a1a1a1-0000-0000-0000-000000000002", stop_hook_active: false });
 
+/**
+ * THE WARM-UP. The first run of each freshly written shim, inside this harness, costs 0.3-0.8 s (MEASURED on macOS:
+ * python3 813 ms, ps 371 ms, uname 309 ms cold; 8-45 ms warm). The cause is UNKNOWN: it does not reproduce outside
+ * vitest, and directory size, executable count and the provenance xattr were each measured and ruled out. A hook
+ * run on cold shims spends ~3 s of its 5 s budget before its late steps, so a budget-gated step (the PostToolUse
+ * liveness restamp) skips itself, correctly, and a test of that step failed 20/20 when run alone. Every hook runs
+ * once here, unasserted, along the same paths the cases take (the restamp included), so each case runs warm.
+ */
+const WARMED: string[] = [];
+async function warmShims(): Promise<void> {
+  const name = "argv-warmup";
+  const token = dbRegister(name, "tester", []).plaintext_token as string;
+  // A stored anchor that is not the hook's process, so the PostToolUse restamp path runs too.
+  getDb().prepare("UPDATE agents SET agent_pid = 999999, agent_pid_start = 'never' WHERE name = ?").run(name);
+  const runs: Array<[string, string[], Record<string, string>, string]> = [
+    ["check-relay", [CHECK_RELAY], localEnv(name, home("warm-cr"), token), ""],
+    ["stop-check", [STOP_HOOK], remoteEnv(name, home("warm-stop"), token), STOP_STDIN],
+    ["post-tool-use", [PTU_HOOK], localEnv(name, home("warm-ptu"), token), PTU_STDIN],
+    ["codex-session-start", [CODEX_HOOK], localEnv(name, home("warm-cx"), token), JSON.stringify({ session_id: "c0dec0de-0000-0000-0000-0000000000ff", hook_event_name: "SessionStart" })],
+  ];
+  for (const [label, args, env, stdin] of runs) {
+    // A run's own outcome does not matter here (some shims are still cold on its first pass): only that it ran.
+    const r = await run(args, env, stdin);
+    if (r.code !== null) WARMED.push(label);
+  }
+  seen.length = 0;
+}
+
 beforeAll(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -283,6 +311,13 @@ beforeAll(async () => {
   await startProxy();
   const p = proxy.address();
   proxyPort = typeof p === "object" && p ? p.port : 0;
+  await warmShims();
+}, 60_000);
+
+describe("the harness warm-up", () => {
+  it("precondition: every hook ran once on the shims before any case (a skipped warm-up would leave them cold)", () => {
+    expect(WARMED).toEqual(["check-relay", "stop-check", "post-tool-use", "codex-session-start"]);
+  });
 });
 
 afterAll(() => {
