@@ -89,14 +89,17 @@ export async function connectWs(
           resolve(queue.shift()!);
           return;
         }
-        const timer = setTimeout(
-          () => reject(new Error("ws message timeout")),
-          timeoutMs
-        );
-        pendingResolve = (s) => {
+        const mine = (s: string) => {
           clearTimeout(timer);
           resolve(s);
         };
+        const timer = setTimeout(() => {
+          // Stop waiting: a resolver left armed would take the NEXT frame into this settled promise, and it would
+          // be lost (tests/ws-helper-timeout-frame.test.ts).
+          if (pendingResolve === mine) pendingResolve = null;
+          reject(new Error("ws message timeout"));
+        }, timeoutMs);
+        pendingResolve = mine;
       }),
   };
 }

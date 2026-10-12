@@ -53,8 +53,9 @@ delete process.env.RELAY_DECAY_TICK_DISABLED;
 const LATE_READ_MS = 1500;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { _resetDashboardWsForTests } = await import("../src/transport/websocket.js");
-const { closeDb, getDb } = await import("../src/db.js");
+const { _resetDashboardWsForTests, _dashboardWsStateForTests } = await import("../src/transport/websocket.js");
+const { closeDb, getDb, getDashboardAgentSnapshots } = await import("../src/db.js");
+const { deriveDashboardState, resolveThresholdsFromEnv } = await import("../src/agent-state-machine.js");
 
 import { connectWs as baseConnectWs } from "./_helpers/ws.js";
 import { mintHeaders } from "./_helpers/mint.js";
@@ -318,11 +319,15 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     // assert ZERO — the actual dedup property, now race-free. (The confirming subscriber is
     // subscribed BEFORE the register, above.)
     // ORDERING DEADLINE, not an SLA (#210): how long we wait for the transition to be broadcast.
-    // A timeout here is a GENUINE failure — "the time-only transition never fired" is a real
-    // defect — so it fails LOUD below, never silently absorbed. Bounded; not a latency budget.
+    // A timeout here fails LOUD below, never silently absorbed, with a diagnosis of what WAS observed (the
+    // frames, and the server's derived state) so it says whether the transition or its delivery failed.
+    // Bounded; not a latency budget.
     const ORDERING_DEADLINE_MS = 12_000;
     const confirmStart = Date.now();
     let sawTransition = false;
+    // SELF-DIAGNOSING (macOS CI, run 38234341596 at 04adea0): that red said only "never broadcast". Every frame
+    // this subscriber saw is kept, so a red names what DID arrive, alongside what the server held at the deadline.
+    const seen: string[] = [];
     while (Date.now() - confirmStart < ORDERING_DEADLINE_MS) {
       let raw: string;
       try {
@@ -333,6 +338,8 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
         break; // no frame within the remaining budget
       }
       const f = JSON.parse(raw) as BroadcastFrame;
+      // The server's own emission time (f.ts): frames read from the queue would all show the read time.
+      seen.push(`${f.ts} ${f.event}:${f.entity_id}${f.kind ? ":" + f.kind : ""}`);
       if (
         f.event === "agent.status_changed" &&
         f.entity_id === "rt-dedup" &&
@@ -342,11 +349,21 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
         break;
       }
     }
+    // What the server held at the deadline (it runs in this process): its WS clients, and the state the broadcaster
+    // would derive for rt-dedup NOW. A derived `waiting` with no `waiting` frame seen means the frame was not
+    // delivered to this subscriber; any other derived state means the transition itself did not happen.
+    const snap = getDashboardAgentSnapshots(resolveThresholdsFromEnv().pendingWindowMs).find((a) => a.name === "rt-dedup");
+    const diagnosis =
+      `frames seen (${seen.length}): [${seen.join(", ")}]; ` +
+      `server WS clients: ${_dashboardWsStateForTests().clients}; ` +
+      `rt-dedup derived state now: ${snap ? deriveDashboardState(snap.inputs, Date.now(), resolveThresholdsFromEnv()) : "NO ROW"}; ` +
+      `snapshot: ${JSON.stringify(snap?.inputs ?? null)}`;
     confirmWs.ws.close();
+    // States only what was OBSERVED. Whether a miss is a broadcaster defect or a delivery failure is what the
+    // diagnosis above decides; the assertion itself cannot (#317 claimed "a REAL defect" here: an over-claim).
     expect(
       sawTransition,
-      "rt-dedup time-only `waiting` transition never broadcast within the ordering deadline — " +
-        "a REAL defect (the transition/broadcast failed), not flake.",
+      `no agent.status_changed:waiting frame for rt-dedup reached this subscriber within ${ORDERING_DEADLINE_MS} ms. ${diagnosis}`,
     ).toBe(true);
 
     // Now connect a FRESH subscriber AFTER the transition provably fired + deduped. Dedup ⇒ ZERO
@@ -365,8 +382,8 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     wsHandle.ws.close();
     // per-test timeout (#210): a HARNESS budget, not an SLA — sized to accommodate the ordering-
     // confirm wait (≤12s) + the fresh-subscriber collect + daemon/WS setup, with headroom. A
-    // timeout here would mean the ordering confirm never completed, which its own loud assertion
-    // above already surfaces as a real defect (not flake). Widen-safe; do NOT tighten below the
+    // timeout here would mean the ordering confirm never completed, which its own loud, self-diagnosing
+    // assertion above already surfaces. Widen-safe; do NOT tighten below the
     // 12s ordering deadline it must contain.
   }, 25_000);
 
