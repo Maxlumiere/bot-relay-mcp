@@ -214,8 +214,36 @@ describe("Codex #291 R2 #1 — TRIPWIRE: no literal timeout in any hook; every b
 });
 
 describe("Codex #291 R2 #1 — relay_budget_for: the ONE arithmetic (own cap vs what is left; skip below 1s, LOUD)", () => {
-  const run = (script: string) =>
-    spawnSync("bash", ["-c", `. "${path.join(HOOKS, "_vault-helpers.sh")}"; ${script}`], { encoding: "utf-8" });
+  /**
+   * Flake (e): bash's SECONDS ticks when the WALL clock crosses a second, even right after `SECONDS=N` (MEASURED,
+   * bash 3.2: `SECONDS=3; sleep 0.3; echo $SECONDS` read 4 in 7/20 runs), so a boundary between a row's seed and
+   * its read makes it 1 s more spent. A row is asserted only from an attempt with NO wall-second boundary inside
+   * it (`date +%s` equal before the seed and after the read). An attempt that crossed one is retried (up to 20),
+   * never asserted; 20 crossings fail LOUDLY. The seeds and the exact expected values are unchanged.
+   */
+  const run = (script: string, attempts = 20) =>
+    spawnSync(
+      "bash",
+      [
+        "-c",
+        [
+          `. "${path.join(HOOKS, "_vault-helpers.sh")}"`,
+          '_e=$(mktemp) || exit 4',
+          "_try=0",
+          `while [ "$_try" -lt ${attempts} ]; do`,
+          "  _try=$((_try + 1))",
+          "  _t0=$(date +%s)",
+          `  _o=$( { ${script} ; } 2>"$_e" )`,
+          "  _t1=$(date +%s)",
+          '  if [ "$_t0" = "$_t1" ]; then printf \'%s\\n\' "$_o"; cat "$_e" >&2; rm -f "$_e"; exit 0; fi',
+          "done",
+          'rm -f "$_e"',
+          `echo "every attempt (${attempts}) crossed a wall-second boundary: no exact reading" >&2`,
+          "exit 3",
+        ].join("\n"),
+      ],
+      { encoding: "utf-8" },
+    );
   const rows: Array<[string, string, string]> = [
     // [label, script, expected stdout]
     ["premail: 10s budget, 0 spent → min(own 4, 10-3-2=5) = 4", "RELAY_HOOK_BUDGET_SECS=10; SECONDS=0; relay_budget_for s 4; echo \"$?:$RELAY_STEP_SECS\"", "0:4"],
@@ -228,6 +256,9 @@ describe("Codex #291 R2 #1 — relay_budget_for: the ONE arithmetic (own cap vs 
     ["a skip calls the hook's relay_budget_skipped with the step", "relay_budget_skipped(){ echo \"CB:$1\"; }; RELAY_HOOK_BUDGET_SECS=5; SECONDS=4; relay_budget_for \"the y step\" 1 margin", "CB:the y step"],
     ["the mail read through the budget: 5s, 2 spent → skipped, never floored to 1", "RELAY_HOOK_BUDGET_SECS=5; SECONDS=2; relay_budget_for m \"$(relay_pending_deadline 5)\" margin; echo \"$?:$RELAY_STEP_SECS\"", "1:0"],
     ["the mail read keeps its override: RELAY_PENDING_TIMEOUT_SECS=1 shortens it", "RELAY_HOOK_BUDGET_SECS=10; SECONDS=0; RELAY_PENDING_TIMEOUT_SECS=1 relay_budget_for m \"$(RELAY_PENDING_TIMEOUT_SECS=1 relay_pending_deadline 10)\" margin; echo \"$?:$RELAY_STEP_SECS\"", "0:1"],
+    // The REPRO (flake (e), macOS CI #328 job 114778312154): a wall-second boundary between the seed and the read. The
+    // first attempt sleeps past one; a row asserted on that attempt reads 1 s too many spent ("0:1", not "0:2").
+    ["HARM (flake e): a second boundary between the seed and the read never reaches the assertion", "RELAY_HOOK_BUDGET_SECS=10; SECONDS=3; [ \"${_try:-1}\" = 1 ] && sleep 1.05; relay_budget_for s 4; echo \"$?:$RELAY_STEP_SECS\"", "0:2"],
   ];
   for (const [label, script, want] of rows) {
     it(label, () => {
@@ -235,6 +266,11 @@ describe("Codex #291 R2 #1 — relay_budget_for: the ONE arithmetic (own cap vs 
       expect(r.stdout.trim(), r.stderr).toBe(want);
     });
   }
+  it("the harness itself: when EVERY attempt crosses a boundary there is no reading at all, LOUDLY (exit 3, no value), never a guess", () => {
+    const r = run('RELAY_HOOK_BUDGET_SECS=10; SECONDS=3; sleep 1.05; relay_budget_for s 4; echo "$?:$RELAY_STEP_SECS"', 2);
+    expect([r.status, r.stdout.trim()]).toEqual([3, ""]);
+    expect(r.stderr).toMatch(/every attempt \(2\) crossed a wall-second boundary: no exact reading/);
+  });
   it("a skip is LOUD on stderr: 'no time budget left for STEP'", () => {
     const r = run('RELAY_HOOK_BUDGET_SECS=5; SECONDS=4; relay_budget_for "the z step" 1 margin');
     expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the z step \(4s of 5s spent\): skipped\./);

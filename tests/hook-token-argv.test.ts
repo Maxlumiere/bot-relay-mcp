@@ -69,6 +69,7 @@ const { ERROR_CODES } = await import("../src/error-codes.js");
 const SLOW = { timeout: 30_000 };
 
 const SHIM_DIR = path.join(TEST_DIR, "shim");
+const TEST_TMP = path.join(TEST_DIR, "tmp");
 // One record file PER PROCESS (named by its pid): concurrent processes never interleave a record.
 const ARGV_DIR = path.join(TEST_DIR, "argv");
 
@@ -204,7 +205,8 @@ function run(args: string[], env: Record<string, string>, stdin = "", fd5?: stri
   const f5 = fd5 === undefined ? undefined : fs.openSync(fd5, "w");
   return new Promise<RunResult>((resolve, reject) => {
     const stdio: cp.StdioOptions = f5 === undefined ? "pipe" : ["pipe", "pipe", "pipe", "ignore", "ignore", f5];
-    const child = cp.spawn(BASH, args, { env: { PATH: SHIM_DIR, ...env }, stdio }) as cp.ChildProcessWithoutNullStreams;
+    // TMPDIR: a hook's mktemp files land in this test's sandbox, never the machine's temp directory.
+    const child = cp.spawn(BASH, args, { env: { PATH: SHIM_DIR, TMPDIR: TEST_TMP, ...env }, stdio }) as cp.ChildProcessWithoutNullStreams;
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -272,9 +274,49 @@ function remoteEnv(name: string, h: string, token: string): Record<string, strin
 const PTU_STDIN = JSON.stringify({ session_id: "a1a1a1a1-0000-0000-0000-000000000001", hook_event_name: "PostToolUse", tool_name: "Read", tool_input: {}, tool_response: {} });
 const STOP_STDIN = JSON.stringify({ session_id: "a1a1a1a1-0000-0000-0000-000000000002", stop_hook_active: false });
 
+/**
+ * THE WARM-UP. The first run of each freshly written shim, inside this harness, costs 0.3-0.8 s (MEASURED on macOS:
+ * python3 813 ms, ps 371 ms, uname 309 ms cold; 8-45 ms warm). The cause is UNKNOWN: it does not reproduce outside
+ * vitest, and directory size, executable count and the provenance xattr were each measured and ruled out. A hook
+ * run on cold shims spends ~3 s of its 5 s budget before its late steps, so a budget-gated step (the PostToolUse
+ * liveness restamp) skips itself, correctly, and a test of that step failed 20/20 when run alone. Each hook runs
+ * here, unasserted, along the same paths the cases take, until one run completes its WHOLE path inside its budget:
+ * no "no time budget left" skip, and for PostToolUse the restamp actually reached report_liveness. That is what the
+ * cases need, measured, not merely "the hook ran".
+ * NOT REMOVED: the timing dependence. The budget is the hook's own (RELAY_HOOK_BUDGET_SECS, hard-coded in each hook,
+ * not read from the environment), so a runner slow enough to exceed it on WARM shims would still trip the restamp
+ * case. This warm-up removes the cold-start cost, which was the measured cause.
+ */
+const WARM_ATTEMPTS = 3;
+const WARMED: string[] = [];
+async function warmShims(): Promise<void> {
+  const name = "argv-warmup";
+  const token = dbRegister(name, "tester", []).plaintext_token as string;
+  // A stored anchor that is not the hook's process, so the PostToolUse restamp path runs (reset before each attempt).
+  const staleAnchor = () => getDb().prepare("UPDATE agents SET agent_pid = 999999, agent_pid_start = 'never' WHERE name = ?").run(name);
+  const runs: Array<{ label: string; args: string[]; env: Record<string, string>; stdin: string; reached?: () => boolean }> = [
+    { label: "check-relay", args: [CHECK_RELAY], env: localEnv(name, home("warm-cr"), token), stdin: "" },
+    { label: "stop-check", args: [STOP_HOOK], env: remoteEnv(name, home("warm-stop"), token), stdin: STOP_STDIN },
+    { label: "post-tool-use", args: [PTU_HOOK], env: localEnv(name, home("warm-ptu"), token), stdin: PTU_STDIN, reached: () => toolCalls("report_liveness").length > 0 },
+    { label: "codex-session-start", args: [CODEX_HOOK], env: localEnv(name, home("warm-cx"), token), stdin: JSON.stringify({ session_id: "c0dec0de-0000-0000-0000-0000000000ff", hook_event_name: "SessionStart" }) },
+  ];
+  for (const w of runs) {
+    for (let attempt = 1; attempt <= WARM_ATTEMPTS; attempt++) {
+      staleAnchor();
+      const r = await run(w.args, w.env, w.stdin);
+      const inBudget = r.code !== null && !/no time budget left/.test(r.stdout + r.stderr);
+      if (inBudget && (w.reached ? w.reached() : true)) {
+        WARMED.push(w.label);
+        break;
+      }
+    }
+  }
+  seen.length = 0;
+}
+
 beforeAll(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
-  fs.mkdirSync(TEST_DIR, { recursive: true });
+  fs.mkdirSync(TEST_TMP, { recursive: true });
   expect(buildShims(), "precondition: shims built").toBeGreaterThan(20);
   relay = startHttpServer(0, "127.0.0.1");
   await new Promise((r) => setTimeout(r, 100));
@@ -283,6 +325,25 @@ beforeAll(async () => {
   await startProxy();
   const p = proxy.address();
   proxyPort = typeof p === "object" && p ? p.port : 0;
+  await warmShims();
+}, 60_000);
+
+describe("the harness sandbox", () => {
+  it("hook children get the test's own TMPDIR: TMPDIR-honouring tools put their temp files in the sandbox", async () => {
+    const r = await run(["-c", 'printf "%s\\n" "$TMPDIR"; python3 -c "import tempfile; print(tempfile.gettempdir())"; mktemp'], {});
+    const [seenEnv, py, mk] = r.stdout.trim().split("\n");
+    expect(seenEnv, "the child sees the sandbox TMPDIR").toBe(TEST_TMP);
+    expect(py, "python's temp directory follows it").toBe(TEST_TMP);
+    // MEASURED: macOS's mktemp with no template IGNORES TMPDIR (it uses the per-user temp directory), so the hooks' bare
+    // mktemp calls cannot be sandboxed from here on macOS (that would be a hook change). GNU mktemp honours it.
+    if (process.platform !== "darwin") expect(mk.startsWith(TEST_TMP + path.sep), mk).toBe(true);
+  });
+});
+
+describe("the harness warm-up", () => {
+  it(`precondition: every hook completed its whole path inside its budget during the warm-up (≤ ${WARM_ATTEMPTS} runs each; PostToolUse reached report_liveness)`, () => {
+    expect(WARMED).toEqual(["check-relay", "stop-check", "post-tool-use", "codex-session-start"]);
+  });
 });
 
 afterAll(() => {
