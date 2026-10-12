@@ -4,14 +4,14 @@
 // See LICENSE for full terms.
 
 /**
- * The shared WebSocket test helper (tests/_helpers/ws.ts) never LOSES a frame. A `nextMessage` that times out must
- * stop waiting: before this fix its resolver stayed armed, so the next frame to arrive (after the timeout, before
- * the next read) was handed to the dead promise and silently dropped. A test that timed out once and read again
- * then waited for a frame that had already come and gone.
+ * The shared WebSocket test helper (tests/_helpers/ws.ts) never LOSES a frame, and allows ONE outstanding read.
+ * A `nextMessage` that times out must stop waiting: before the fix its resolver stayed armed, so the next frame to
+ * arrive (after the timeout, before the next read) was handed to the settled promise and dropped. Every send here is
+ * driven explicitly by the test, and receipt is awaited on the socket itself, so no case depends on timer ordering.
  */
 import { describe, it, expect, afterEach } from "vitest";
 import http from "http";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, type WebSocket } from "ws";
 import { connectWs } from "./_helpers/ws.js";
 
 let server: http.Server | undefined;
@@ -21,31 +21,46 @@ afterEach(async () => {
   for (const c of wss?.clients ?? []) c.terminate();
   wss?.close();
   await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
+  server = undefined;
 });
 
-/** A server that sends `frame` to each client `afterMs` after it connects. */
-async function lateSender(frame: string, afterMs: number): Promise<number> {
+/** A server whose sends the TEST triggers: resolves with the client handle and the server side of its socket. */
+async function controlled(): Promise<{ client: Awaited<ReturnType<typeof connectWs>>; peer: WebSocket }> {
   server = http.createServer();
   wss = new WebSocketServer({ server });
-  wss.on("connection", (ws) => setTimeout(() => ws.send(frame), afterMs));
+  const peer = new Promise<WebSocket>((r) => wss!.on("connection", (ws) => r(ws)));
   await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
-  return (server!.address() as { port: number }).port;
+  const client = await connectWs((server!.address() as { port: number }).port, "/");
+  return { client, peer: await peer };
 }
+/** Resolves once the client socket has RECEIVED a frame (the helper's own listener, attached first, has run). */
+const received = (c: { ws: WebSocket }) => new Promise<void>((r) => c.ws.once("message", () => r()));
 
 describe("the WS test helper: a timed-out read never swallows the next frame", () => {
-  it("a frame that arrives AFTER a read timed out, and BEFORE the next read, is delivered to that next read", async () => {
-    const port = await lateSender("late-frame", 150);
-    const h = await connectWs(port, "/");
-    await expect(h.nextMessage(50)).rejects.toThrow(/ws message timeout/);
-    await new Promise((r) => setTimeout(r, 300)); // the frame arrives in here, with no read pending
-    await expect(h.nextMessage(500)).resolves.toBe("late-frame");
-    h.ws.close();
+  it("a frame received AFTER a read timed out, with no read pending, is delivered to the NEXT read", async () => {
+    const { client, peer } = await controlled();
+    await expect(client.nextMessage(50)).rejects.toThrow(/ws message timeout/);
+    const got = received(client);
+    peer.send("late-frame");
+    await got; // the frame is in, and no read is pending
+    await expect(client.nextMessage(500)).resolves.toBe("late-frame");
+    client.ws.close();
   });
 
   it("TWIN: a frame that arrives while a read is pending is delivered to it", async () => {
-    const port = await lateSender("on-time", 50);
-    const h = await connectWs(port, "/");
-    await expect(h.nextMessage(1000)).resolves.toBe("on-time");
-    h.ws.close();
+    const { client, peer } = await controlled();
+    const read = client.nextMessage(1000); // the read is pending BEFORE the send
+    peer.send("on-time");
+    await expect(read).resolves.toBe("on-time");
+    client.ws.close();
+  });
+
+  it("one outstanding read: a second read while the first is pending is refused at once, and the first still gets the frame", async () => {
+    const { client, peer } = await controlled();
+    const first = client.nextMessage(1000);
+    await expect(client.nextMessage(1000)).rejects.toThrow(/already pending/);
+    peer.send("for-the-first");
+    await expect(first).resolves.toBe("for-the-first");
+    client.ws.close();
   });
 });

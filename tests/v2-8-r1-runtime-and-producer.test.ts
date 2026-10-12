@@ -319,8 +319,8 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     // assert ZERO — the actual dedup property, now race-free. (The confirming subscriber is
     // subscribed BEFORE the register, above.)
     // ORDERING DEADLINE, not an SLA (#210): how long we wait for the transition to be broadcast.
-    // A timeout here fails LOUD below, never silently absorbed, with a diagnosis of what WAS observed (the
-    // frames, and the server's derived state) so it says whether the transition or its delivery failed.
+    // A timeout here fails LOUD below, never silently absorbed, with what WAS observed (the frames this
+    // subscriber received, and what the server held at the deadline) to help investigate the missing frame.
     // Bounded; not a latency budget.
     const ORDERING_DEADLINE_MS = 12_000;
     const confirmStart = Date.now();
@@ -349,30 +349,55 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
         break;
       }
     }
-    // What the server held at the deadline (it runs in this process): its WS clients, and the state the broadcaster
-    // would derive for rt-dedup NOW. A derived `waiting` with no `waiting` frame seen means the frame was not
-    // delivered to this subscriber; any other derived state means the transition itself did not happen.
-    const snap = getDashboardAgentSnapshots(resolveThresholdsFromEnv().pendingWindowMs).find((a) => a.name === "rt-dedup");
-    const diagnosis =
-      `frames seen (${seen.length}): [${seen.join(", ")}]; ` +
-      `server WS clients: ${_dashboardWsStateForTests().clients}; ` +
-      `rt-dedup derived state now: ${snap ? deriveDashboardState(snap.inputs, Date.now(), resolveThresholdsFromEnv()) : "NO ROW"}; ` +
-      `snapshot: ${JSON.stringify(snap?.inputs ?? null)}`;
+    // ONLY on a miss: what the server held at the deadline (it runs in this process): its WS clients, and the state the
+    // broadcaster would derive for rt-dedup NOW, with its inputs. Present-state OBSERVATIONS to help investigate the
+    // missing frame; they establish no history and no cause. Collected inside a catch, so a failing collection can
+    // never replace or mask the assertion (its error is appended instead).
+    let diagnosis = "";
+    if (!sawTransition) {
+      try {
+        const snap = getDashboardAgentSnapshots(resolveThresholdsFromEnv().pendingWindowMs).find((a) => a.name === "rt-dedup");
+        diagnosis =
+          `frames seen (${seen.length}): [${seen.join(", ")}]; ` +
+          `server WS clients: ${_dashboardWsStateForTests().clients}; ` +
+          `rt-dedup derived state now: ${snap ? deriveDashboardState(snap.inputs, Date.now(), resolveThresholdsFromEnv()) : "NO ROW"}; ` +
+          `snapshot: ${JSON.stringify(snap?.inputs ?? null)}`;
+      } catch (err) {
+        diagnosis = `frames seen (${seen.length}): [${seen.join(", ")}]; diagnosis collection FAILED: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
     confirmWs.ws.close();
-    // States only what was OBSERVED. Whether a miss is a broadcaster defect or a delivery failure is what the
-    // diagnosis above decides; the assertion itself cannot (#317 claimed "a REAL defect" here: an over-claim).
+    // States only what was OBSERVED (#317 claimed "a REAL defect" here: an over-claim the test cannot observe).
     expect(
       sawTransition,
       `no agent.status_changed:waiting frame for rt-dedup reached this subscriber within ${ORDERING_DEADLINE_MS} ms. ${diagnosis}`,
     ).toBe(true);
 
     // Now connect a FRESH subscriber AFTER the transition provably fired + deduped. Dedup ⇒ ZERO
-    // re-emit. The zero-assertion is race-free now, and the collect window is kept TIGHT on
-    // purpose: on a zero-assert a WIDER window is MORE exposure, not less (#210) — any rt-dedup
-    // frame here is a genuine dedup bug, not slowness.
-    const wsHandle = await connectWs();
-    const frames = await collectFrames(wsHandle, 5, 500);
-    const rtDedupFrames = frames.filter(
+    // re-emit for rt-dedup. NON-VACUOUS (Codex #328 F5): silence proves nothing if the broadcaster stopped ticking,
+    // so a second agent registers now and its OWN time-only `waiting` transition must reach this same subscriber.
+    // Every frame up to that one is checked: the ticks demonstrably continued while rt-dedup stayed silent.
+    const wsHandle = await subscribe();
+    await rpc("register_agent", { name: "rt-progress", role: "user", capabilities: ["build"] });
+    const progressStart = Date.now();
+    const afterConfirm: BroadcastFrame[] = [];
+    let ticksProgressed = false;
+    while (Date.now() - progressStart < ORDERING_DEADLINE_MS) {
+      let raw: string;
+      try {
+        raw = await wsHandle.nextMessage(Math.max(250, ORDERING_DEADLINE_MS - (Date.now() - progressStart)));
+      } catch {
+        break;
+      }
+      const f = JSON.parse(raw) as BroadcastFrame;
+      afterConfirm.push(f);
+      if (f.event === "agent.status_changed" && f.entity_id === "rt-progress" && f.kind === "waiting") {
+        ticksProgressed = true;
+        break;
+      }
+    }
+    expect(ticksProgressed, `precondition: the broadcaster kept ticking (rt-progress's own waiting transition was seen). frames: ${JSON.stringify(afterConfirm)}`).toBe(true);
+    const rtDedupFrames = afterConfirm.filter(
       (f) => f.entity_id === "rt-dedup" && f.event === "agent.status_changed",
     );
     expect(
@@ -381,11 +406,11 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     ).toEqual([]);
     wsHandle.ws.close();
     // per-test timeout (#210): a HARNESS budget, not an SLA — sized to accommodate the ordering-
-    // confirm wait (≤12s) + the fresh-subscriber collect + daemon/WS setup, with headroom. A
+    // confirm wait (≤12s) + the tick-progress wait (≤12s) + daemon/WS setup, with headroom. A
     // timeout here would mean the ordering confirm never completed, which its own loud, self-diagnosing
     // assertion above already surfaces. Widen-safe; do NOT tighten below the
-    // 12s ordering deadline it must contain.
-  }, 25_000);
+    // two 12s deadlines it must contain.
+  }, 40_000);
 
   it("(RT3) RELAY_DECAY_TICK_DISABLED=1 disables the broadcaster — NO time-only emits", async () => {
     // Restart the server with the broadcaster opt-out flag set.
