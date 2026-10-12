@@ -38,7 +38,10 @@ import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
-import { isPidAlive, processStartedAt } from "../../src/liveness.js";
+import { probePid, processStartedAt, startOrNull } from "../../src/liveness.js";
+
+/** The kernel says the pid runs (INV-LIVE-01: gone and unknown are both "not proven alive": fail closed). */
+const isPidAlive = (pid: number): boolean => probePid(pid) === "alive";
 
 const RELAY_BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "relay");
 
@@ -61,8 +64,12 @@ export interface TestWindow {
   /** The random marker every process the window starts carries in its environment. */
   windowId: string;
   child: ChildProcess;
-  /** `node bin/relay watch <args>` as a descendant of the window, in the background. */
-  runRelayWatch: (args: readonly string[]) => WindowRun;
+  /**
+   * `node bin/relay watch <args>` as a descendant of the window, in the background. `env` (INV-LIVE-01:
+   * a test's PATH seam or marker dir) is DATA, not shell: each name must be a plain variable name and
+   * each value is single-quoted, so the command stays the typed relay CLI.
+   */
+  runRelayWatch: (args: readonly string[], opts?: { env?: Readonly<Record<string, string>> }) => WindowRun;
   /** The same, launched so that its parent exits at once (`& disown; exit 0`): the watch is ORPHANED. Output → `outFile`. */
   runRelayWatchOrphaned: (args: readonly string[], outFile: string) => void;
   /** A command the RELAY printed (its arm-check / re-arm line), run exactly as printed; any other shape is refused. */
@@ -195,7 +202,7 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
   if (delay !== undefined && !(Number.isFinite(delay) && delay >= 0)) throw new Error(`codeWriteDelayS must be a number >= 0, got ${delay}`);
   const closeWaitMs = opts.closeWaitMs ?? 5_000;
   const groupAlive = opts.groupAlive ?? realGroupAlive;
-  const startOf = opts.leaderStart ?? ((pid: number) => processStartedAt(pid));
+  const startOf = opts.leaderStart ?? ((pid: number) => startOrNull(processStartedAt(pid)));
   const windowId = crypto.randomBytes(16).toString("hex");
   const readyFile = path.join(dir, `.window-${windowId}.ready`);
 
@@ -268,6 +275,13 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
     })();
     return { id, pid, out: () => read(O), err: () => read(E), exited };
   };
+  const envPrefix = (env?: Readonly<Record<string, string>>): string =>
+    Object.entries(env ?? {})
+      .map(([k, v]) => {
+        if (!/^[A-Z_][A-Z0-9_]*$/.test(k) || typeof v !== "string") throw new Error(`runRelayWatch: invalid env ${JSON.stringify(k)}`);
+        return `${k}=${sq(v)} `;
+      })
+      .join("");
   const relayArgs = (args: readonly string[]) => {
     for (const a of args) if (typeof a !== "string" || a.length === 0) throw new Error(`runRelayWatch: invalid argument ${JSON.stringify(a)}`);
     return `node ${sq(RELAY_BIN)} watch ${args.map(sq).join(" ")}`;
@@ -318,7 +332,7 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
     windowId,
     child,
     pids,
-    runRelayWatch: (args: readonly string[]) => launch(relayArgs(args)),
+    runRelayWatch: (args: readonly string[], opts: { env?: Readonly<Record<string, string>> } = {}) => launch(envPrefix(opts.env) + relayArgs(args)),
     runRelayWatchOrphaned: (args: readonly string[], outFile: string) => {
       launch(`bash -c ${sq(`${relayArgs(args)} > ${sq(outFile)} 2>&1 & disown; exit 0`)}`);
     },

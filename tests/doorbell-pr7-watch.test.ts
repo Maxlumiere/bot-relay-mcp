@@ -236,9 +236,10 @@ const alive = (pid: number) => {
  * ONE read of the dormant RECORDS under `dir`/dormant/. Record names only: the writer's atomic temp
  * (writeJsonAtomic's ".tmp-<hex>", complete once fsynced, renamed after) lives in the same dir and is
  * skipped. An entry that vanishes or cannot be parsed between the listing and its read is skipped
- * ALONE and reported in `skipped`. Flake B (CI job 114637509429, attempt 1): one catch around the whole
- * list let the poll accept the TEMP as the record, and the next read, racing its rename (ENOENT), came
- * back empty: "no dormant record" after 770 ms with the record on disk.
+ * ALONE and reported in `skipped`. Flake B: CI OBSERVED "no dormant record" after 770 ms with the record
+ * on disk (job 114637509429, attempt 1); a deterministic REPLAY reproduces that triple (found, then
+ * empty, then found) via the old helper's one catch around the whole list: the poll accepts the
+ * complete TEMP as the record, and the next read, racing its rename, gets ENOENT and returns empty.
  */
 function dormantRead(dir: string): { records: Array<{ pid?: unknown; reason?: unknown }>; skipped: Array<{ name: string; error: string }> } {
   const d = path.join(dir, W.DORMANT_DIR);
@@ -298,13 +299,16 @@ const awakeReadable = W.awakeNowMs() !== null;
  * STALL flag exists a read sleeps 3 s more: it TIMES OUT and reads empty, deterministically, even for a
  * read already in flight (the flag is checked after the first sleep). Unreadable, while the process lives.
  */
+/** POSIX single-quoting, for the shell text of the ps SEAMS this file writes (never for a window command: those are typed). */
+const sq = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`;
 const REAL_PS = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf-8" }).stdout.trim();
 const SLOW_PS_DIR = path.join(ROOT, "slow-ps");
 const PS_STALL = path.join(SLOW_PS_DIR, "stall");
 fs.mkdirSync(SLOW_PS_DIR, { recursive: true });
 fs.writeFileSync(path.join(SLOW_PS_DIR, "ps"), `#!/bin/sh\nsleep 1\n[ -e ${sq(PS_STALL)} ] && sleep 3\nexec ${sq(REAL_PS)} "$@"\n`, { mode: 0o755 });
 const stallPs = (on: boolean) => (on ? fs.writeFileSync(PS_STALL, "") : fs.rmSync(PS_STALL, { force: true }));
-const SLOW_WATCH = (agent = "w-bob") => `PATH=${sq(SLOW_PS_DIR)}:"$PATH" ${WATCH(agent)}`;
+/** The env that puts the slow seam first on the watch's PATH (the window's own PATH is this process's). */
+const SLOW_ENV = { PATH: `${SLOW_PS_DIR}:${process.env.PATH ?? ""}` };
 /**
  * INV-LIVE-01 R2: a FAST-failing seam for the bound tests. A `ps -o lstart= -p <the window's pid>` exits 1
  * with no output at once (no 2 s timeouts, so timing is deterministic) while the FLAG file exists, or
@@ -319,12 +323,13 @@ fs.writeFileSync(
 );
 let failSeq = 0;
 /** A watch (bound 3 s of awake time, 1 s checks) whose reads of window `w`'s start fail while `flag` exists, or after `after` of them. */
-function failWatch(w: { pid: number }, o: { after?: number; flags?: string; env?: string } = {}): { cmd: string; flag: string; reads: () => number } {
+function failWatch(w: { pid: number }, o: { after?: number; flags?: string[]; env?: Record<string, string> } = {}): { args: string[]; env: Record<string, string>; flag: string; reads: () => number } {
   const n = ++failSeq;
   const flag = path.join(FAIL_PS_DIR, `flag-${n}`);
   const count = path.join(FAIL_PS_DIR, `count-${n}`);
-  const cmd = `PS_TARGET=${w.pid} PS_FLAG=${sq(flag)} PS_COUNT=${sq(count)} PS_AFTER=${o.after ?? 1_000_000} ${o.env ?? ""} PATH=${sq(FAIL_PS_DIR)}:"$PATH" node ${sq(RELAY_BIN)} watch w-bob --until-wake ${o.flags ?? "--interval 1 --dormant-check-s 1 --anchor-unknown-bound-s 3"}`;
-  return { cmd, flag, reads: () => Number(fs.existsSync(count) ? fs.readFileSync(count, "utf-8").trim() : 0) };
+  const env = { PS_TARGET: String(w.pid), PS_FLAG: flag, PS_COUNT: count, PS_AFTER: String(o.after ?? 1_000_000), ...(o.env ?? {}), PATH: `${FAIL_PS_DIR}:${process.env.PATH ?? ""}` };
+  const args = ["w-bob", "--until-wake", ...(o.flags ?? ["--interval", "1", "--dormant-check-s", "1", "--anchor-unknown-bound-s", "3"])];
+  return { args, env, flag, reads: () => Number(fs.existsSync(count) ? fs.readFileSync(count, "utf-8").trim() : 0) };
 }
 const on = (flag: string) => fs.writeFileSync(flag, "");
 const off = (flag: string) => fs.rmSync(flag, { force: true });
@@ -647,7 +652,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
 
   // --- INV-LIVE-01 (rulings 476e65f1 + fedac068): UNREADABLE IS NOT GONE --------------------------------
   it.skipIf(!REAL_PS)("HARM (INV-LIVE-01, the PIN): a ps OUTAGE (every read times out, the window alive) never ends a watch; once ps answers again, it still delivers the wake", async () => {
-    const r = win.run(SLOW_WATCH());
+    const r = win.runRelayWatch(WATCH(), { env: SLOW_ENV });
     await untilStatus("live");
     const pid = await r.pid();
     try {
@@ -668,7 +673,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   // pre-fix code this goes red only when the stop lands in the WINDOW's own read (MEASURED 1/3 on
   // adbe4ae): a stop in the binding read was already unreadable-safe, and the next check sees superseded first.
   it.skipIf(!awakeReadable || !REAL_PS)("HARM (INV-LIVE-01, the D2 signature):a hung holder stopped MID-READ, its read timing out on resume, goes DORMANT (superseded), never a silent exit", async () => {
-    const hung = win.run(SLOW_WATCH());
+    const hung = win.runRelayWatch(WATCH(), { env: SLOW_ENV });
     await untilStatus("live");
     const hungPid = await hung.pid();
     expect(hungPid).toBeGreaterThan(1);
@@ -678,7 +683,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
       stallPs(true); // the read in flight now sleeps past its 2 s timeout: it times out when the holder resumes
       ageHolder(winDir(win));
       expect(lockStatus()).toBe("stale");
-      const next = win.run(WATCH());
+      const next = win.runRelayWatch(WATCH());
       await untilStatus("live");
       expect(W.currentGen(winDir(win))).toBe(1);
       send();
@@ -691,7 +696,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 120_000);
 
   it.skipIf(!REAL_PS)("the TWIN (INV-LIVE-01): DURING the same ps outage, a REALLY closed window still ends its watch silently, within a bound (the fix cannot make a watch immortal)", async () => {
-    const r = win.run(SLOW_WATCH());
+    const r = win.runRelayWatch(WATCH(), { env: SLOW_ENV });
     await untilStatus("live");
     try {
       stallPs(true);
@@ -718,7 +723,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
 
   it.skipIf(!REAL_PS)("HARM (BOUNDEDNESS, the PIN): its window unobservable for the WHOLE bound → DORMANT with a cannot_observe(anchor) record naming the captured anchor (never window_gone, never re-anchored), alive; relay doctor names it; readable again → quiet; the window closing still ends it", async () => {
     const f = failWatch(win);
-    const r = win.run(f.cmd);
+    const r = win.runRelayWatch(f.args, { env: f.env });
     await untilStatus("live");
     const pid = await r.pid();
     const { checkBlindWatches } = await import("../src/cli/doctor.js");
@@ -744,8 +749,8 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
 
   it.skipIf(!REAL_PS)("HARM (R2 N1): a BURST of event-triggered checks (marker traffic) and fast failures never bring the bound EARLY: no record before 3 s of awake time", async () => {
     const markers = fs.mkdtempSync(path.join(ROOT, "markers-"));
-    const f = failWatch(win, { env: `RELAY_FILESYSTEM_MARKERS=1 RELAY_MARKER_DIR=${sq(markers)}` });
-    const r = win.run(f.cmd);
+    const f = failWatch(win, { env: { RELAY_FILESYSTEM_MARKERS: "1", RELAY_MARKER_DIR: markers } });
+    const r = win.runRelayWatch(f.args, { env: f.env });
     await untilStatus("live");
     const pid = await r.pid();
     const t0 = Date.now();
@@ -766,8 +771,8 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 60_000);
 
   it.skipIf(!REAL_PS)("HARM (R2 N1): the IMMEDIATE first check never earns credit: --interval 7200 with a 2 h bound and every read failing from that check on → still watching (it read the window as unknown and did not go dormant)", async () => {
-    const f = failWatch(win, { after: 3, flags: "--interval 7200 --dormant-check-s 1 --anchor-unknown-bound-s 7200" }); // ownership reads the window 3 times
-    const r = win.run(f.cmd);
+    const f = failWatch(win, { after: 3, flags: ["--interval", "7200", "--dormant-check-s", "1", "--anchor-unknown-bound-s", "7200"] }); // ownership reads the window 3 times
+    const r = win.runRelayWatch(f.args, { env: f.env });
     const pid = await r.pid();
     await new Promise((res) => setTimeout(res, 6_000)); // arming + the immediate check + seconds of dormant-tick time
     expect(f.reads(), "the first check's read did fail").toBeGreaterThan(3);
@@ -778,7 +783,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
 
   it.skipIf(!REAL_PS)("the TWIN (BOUNDEDNESS): two outages, each SHORTER than the bound, with readable checks between → it resets, never goes dormant, and still wakes (without the reset: 5+ s of unknown ≥ 3 s)", async () => {
     const f = failWatch(win);
-    const r = win.run(f.cmd);
+    const r = win.runRelayWatch(f.args, { env: f.env });
     await untilStatus("live");
     const pid = await r.pid();
     try {
@@ -798,10 +803,10 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   }, 60_000);
 
   it.skipIf(!REAL_PS)("HARM (BOUNDEDNESS, dormant; R2 N5): a watch ALREADY dormant (the lost race) blind for the bound → its record names the CAPTURED anchor (pid + start) and why it was dormant; readable again → quiet; it never exits on it", async () => {
-    win.run(WATCH());
+    win.runRelayWatch(WATCH());
     await untilStatus("live");
     const f = failWatch(win);
-    const loser = win.run(f.cmd);
+    const loser = win.runRelayWatch(f.args, { env: f.env });
     const pid = await loser.pid();
     const base = "already watched: a watch for this agent is already live in this window";
     expect(await until(() => mineIn(winDir(win), pid).length > 0, 10_000), loser.err()).toBe(true);
@@ -834,7 +839,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
 
   it.skipIf(!REAL_PS || process.getuid?.() === 0)("HARM (R2 N4): the blind record's FIRST write fails (dormant/ unwritable) → retried on later ticks: written once the dir is writable again", async () => {
     const f = failWatch(win);
-    const r = win.run(f.cmd);
+    const r = win.runRelayWatch(f.args, { env: f.env });
     await untilStatus("live");
     const pid = await r.pid();
     await withDormantDirLocked(winDir(win), async (unlock) => {
@@ -854,7 +859,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
 
   it.skipIf(!REAL_PS || process.getuid?.() === 0)("HARM (R2 N4): the RECOVERY write fails (dormant/ unwritable) → retried: the record goes quiet once the dir is writable, never left blind", async () => {
     const f = failWatch(win);
-    const r = win.run(f.cmd);
+    const r = win.runRelayWatch(f.args, { env: f.env });
     await untilStatus("live");
     const pid = await r.pid();
     const isBlind = () => String(mineIn(winDir(win), pid)[0]?.reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX);
@@ -874,7 +879,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const target = fs.mkdtempSync(path.join(ROOT, "elsewhere-"));
     fs.mkdirSync(path.dirname(agentDir), { recursive: true, mode: 0o700 });
     fs.symlinkSync(target, agentDir);
-    const r = win.run(WATCH());
+    const r = win.runRelayWatch(WATCH());
     const pid = await r.pid();
     try {
       expect(await until(() => /DORMANT \(the watch dir is unusable\)/.test(r.err()), 10_000), r.err()).toBe(true);
@@ -897,7 +902,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
   // holder reads stale with the clock and live without it. (The `awakeNow === null` clause is belt: JS
   // `null - n` is negative, so a mutant deleting it alone stays green; one judging null stale goes red.)
   it.skipIf(!awakeReadable)("P1 (INV-LIVE-01): an aged holder is stale on a readable awake clock, and LIVE when the reader's awake clock is unreadable (never a takeover on it)", async () => {
-    win.run(WATCH());
+    win.runRelayWatch(WATCH());
     await untilStatus("live");
     ageHolder(winDir(win));
     expect(W.watchStatus(winDir(win))).toBe("stale");
