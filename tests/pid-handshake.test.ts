@@ -57,10 +57,10 @@ describe("PID-handshake — DB layer (schema v19)", () => {
   beforeEach(cleanup);
   afterEach(cleanup);
 
-  it("schema is at the current version (26) with host_shell_pids + host_id columns", () => {
+  it("schema is at the current version (27) with host_shell_pids + host_id columns", () => {
     registerAgent("seed", "role", []); // triggers init
-    expect(CURRENT_SCHEMA_VERSION).toBe(26);
-    expect(getSchemaVersion()).toBe(26);
+    expect(CURRENT_SCHEMA_VERSION).toBe(27);
+    expect(getSchemaVersion()).toBe(27);
     const cols = (getDb().prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).map(
       (c) => c.name,
     );

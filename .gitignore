@@ -1,5 +1,7 @@
 # Dependencies + build output
 node_modules/
+# A worktree's node_modules is often a SYMLINK to a shared checkout's: the trailing-slash rule matches directories only.
+node_modules
 dist/
 
 # v2.5.0 Tether — VSCode extension build artifacts (subdir tsc emits to out/)

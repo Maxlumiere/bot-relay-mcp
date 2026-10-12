@@ -159,6 +159,15 @@ Every agent row carries an explicit `auth_state`:
 
 Transitions are CAS-gated at each write site. Revoke never nulls `token_hash` (forensic integrity). Recovery requires the admin-issued bcrypt-verified secret (prevents name-race re-registration).
 
+**The database itself enforces the allowed transitions (schema v27).** Three triggers on `agents` live in the database file, so they bind every program that writes it, including an older relay binary:
+
+- An `UPDATE` may move `auth_state` only along the edges the relay's own code takes. `revoked` is terminal: no update moves a revoked row anywhere, and the only way back is `relay recover`, which deletes the row. `recovery_pending` becomes `active` only by consuming the recovery ticket and receiving a new token. Any other move fails with `AUTH_STATE_EDGE_REFUSED`.
+- An `INSERT` may not land on the name or id of a revoked or `recovery_pending` row, so `INSERT OR REPLACE` or an upsert cannot delete and recreate one.
+- An agent's identity (name and id) never changes after creation (`AGENT_IDENTITY_IMMUTABLE`). Only a delete (`relay recover`) and a fresh register replace one, so an `UPDATE OR REPLACE` cannot rename one agent onto another and take over its name.
+- Every rule fails closed: a check that cannot be decided (a NULL value) refuses, rather than letting SQLite substitute the column's default.
+
+What this does not cover: the `recovery_pending → active` rule checks the SHAPE of the write (ticket consumed, new token), not that the ticket was presented, which only the relay's code can verify. An old (pre-v27) operator binary's `relay mint-token --force` writes that shape, so it can still complete a pending recovery. A revoked agent has no such path. Deleting the row (`relay recover`) is the sanctioned way back and is not constrained.
+
 See `src/auth.ts::authenticateAgent`, `src/db.ts::revokeAgentToken`, `tests/phase-4b-1-v2.test.ts`.
 
 ---

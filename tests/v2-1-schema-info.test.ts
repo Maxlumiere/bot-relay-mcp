@@ -174,7 +174,9 @@ describe("v2.1 Phase 4c.3 — schema_info table", () => {
     expect(() => applyMigration(24, 25)).not.toThrow();
     // ADR-0047 PR 2 registered 25→26 (migrateSchemaToV2_26: the connectors table).
     expect(() => applyMigration(25, 26)).not.toThrow();
-    expect(() => applyMigration(26, 27)).toThrow(/no migration registered|26→27/);
+    // SEC-20.T2 registered 26→27 (migrateSchemaToV2_27: the auth_state edge triggers).
+    expect(() => applyMigration(26, 27)).not.toThrow();
+    expect(() => applyMigration(27, 28)).toThrow(/no migration registered|27→28/);
   });
 
   it("(7) CHECK constraint enforces single-row: INSERT id=2 fails", async () => {

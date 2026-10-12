@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Security: the database refuses to bring a revoked agent back (schema v27)
+
+- **A revoke now holds against any program that writes the database, not only this version of the relay.** Triggers on the `agents` table enforce the allowed `auth_state` transitions. They are exactly the moves the relay's own code makes. A revoked agent stays revoked: no update can make it active again, directly or in two steps (for example through a rotation state), and `INSERT OR REPLACE` cannot recreate it. A move outside the table fails with `AUTH_STATE_EDGE_REFUSED`. The way back is still `relay recover`.
+- **An agent's name and id can never change.** No update may rename an agent or change its id; only `relay recover` (a delete) and a fresh register replace one. Otherwise an `UPDATE OR REPLACE` that renamed one agent onto another's name would delete that agent and leave the first one's token answering to its name.
+- **A blank state is refused, not defaulted.** Every rule refuses when its check cannot be decided (a NULL value), instead of letting SQLite fill in the default `active`.
+- **A pending recovery completes only with a new token.** `recovery_pending → active` must consume the recovery ticket and issue a new token, so a stale code path cannot bring back the old one.
+- **Upgrading adds the triggers on first open**, and repairs them if they were changed. Opening an up-to-date database writes nothing. Rows are not modified.
+- **Not covered.** The recovery rule checks the shape of the write, not the ticket itself. An old (pre-v27) operator binary's `relay mint-token --force` can still complete a pending recovery. A revoked agent has no such path.
+- The source-scanning test that listed every statement able to set `auth_state` is retired. The database now enforces the rule it approximated.
+
 ### Security — a revoked agent can no longer send messages
 
 Revoking an agent did not stop it from sending. A revoke keeps the agent's token on record (for the audit trail) and marks the agent revoked, but the relay's message endpoint (what `relay send` uses) only checked that the token matched. So anyone holding a revoked agent's token, plus access to that endpoint, could still send messages as that agent.

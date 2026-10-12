@@ -460,6 +460,7 @@ function applySchemaSetup(db: CompatDatabase): void {
   migrateSchemaToV2_24(db);
   migrateSchemaToV2_25(db);
   migrateSchemaToV2_26(db);
+  migrateSchemaToV2_27(db);
   seedBuiltinTaskSchemas(db);
   finalizeSchemaVersion(db);
   purgeOldRecords(db);
@@ -679,7 +680,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 26;
+export const CURRENT_SCHEMA_VERSION = 27;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -779,6 +780,7 @@ export function applyMigration(from: number, to: number): void {
     [23, 24],
     [24, 25],
     [25, 26],
+    [26, 27],
   ];
   for (const [f, t] of registeredPairs) {
     if (from === f && to === t) {
@@ -2074,6 +2076,76 @@ function migrateSchemaToV2_26(db: CompatDatabase): void {
       "BEGIN SELECT RAISE(ABORT, 'connectors: foreign edge_id refused (no federation ingress before v2.3; " +
       "rows are stamped from relay_edge only)'); END",
   );
+}
+
+/**
+ * SEC-20.T2 at the data layer (schema v27): the auth_state EDGE TABLE, enforced by the database file itself, so it
+ * binds every writer, an older binary included. The edges are exactly the ones the sanctioned sites take
+ * (tests/sec-20-t2-auth-state-edge-trigger.test.ts lists them by site):
+ *   - a self-edge, except on revoked: revoked is TERMINAL (the way back is `relay recover`, a DELETE);
+ *   - active → rotation_grace | revoked | recovery_pending, and → legacy_bootstrap only for a row with no token
+ *     (the one-shot v2.1 migration; a legacy row can be claimed by a plain register, so a tokened row never goes there);
+ *   - legacy_bootstrap | rotation_grace → active | revoked | recovery_pending;
+ *   - recovery_pending → revoked, and → active only by CONSUMING the ticket (recovery_token_hash NOT NULL → NULL) AND
+ *     receiving a NEW credential (token_hash set and changed), so a stale path cannot revive the old token.
+ *     STATED RESIDUAL: that is a SHAPE check. A trigger cannot know the ticket was presented (bcrypt is outside SQL),
+ *     so stale operator tooling that writes that shape, realistically an old (pre-SEC-20) operator binary's
+ *     mint --force, can still complete a pending recovery. revoked has no such edge: it is fully terminal.
+ * The INSERT guard: an INSERT may not land on the name or id of a revoked or recovery_pending row. A BEFORE INSERT
+ * trigger runs before conflict resolution, so `INSERT OR REPLACE` (which fires no UPDATE trigger) and an UPSERT are
+ * refused before they can delete or rewrite that row. A unique key other than name and id would be a lane this does
+ * not cover: agents has none today.
+ * SEC-20.T4, IDENTITY IS IMMUTABLE: no UPDATE changes an agent's name or id (no sanctioned path does); only DELETE + a
+ * fresh register replaces one. Otherwise `UPDATE OR REPLACE ... SET name = <victim>` deletes the victim through the
+ * UNIQUE conflict and the donor's token answers to the victim's name, with no INSERT and no auth_state write.
+ * FAIL CLOSED: each WHEN is NULL-safe (COALESCE / IS NOT). A predicate that evaluated to NULL would not raise, and under
+ * UPDATE OR REPLACE SQLite answers a NOT NULL violation by substituting the column DEFAULT ('active').
+ * Each body is ONE literal: the installer compares it byte for byte with sqlite_master.
+ */
+export const AUTH_STATE_EDGE_REFUSED = "AUTH_STATE_EDGE_REFUSED";
+export const AGENT_IDENTITY_IMMUTABLE = "AGENT_IDENTITY_IMMUTABLE";
+export const AGENT_ROW_GUARD_TRIGGERS: Readonly<Record<string, string>> = {
+  agents_auth_state_edge:
+    "CREATE TRIGGER agents_auth_state_edge BEFORE UPDATE OF auth_state ON agents WHEN NOT COALESCE((" +
+    "(NEW.auth_state = OLD.auth_state AND OLD.auth_state <> 'revoked') " +
+    "OR (OLD.auth_state = 'active' AND NEW.auth_state IN ('rotation_grace', 'revoked', 'recovery_pending')) " +
+    "OR (OLD.auth_state = 'active' AND NEW.auth_state = 'legacy_bootstrap' AND NEW.token_hash IS NULL) " +
+    "OR (OLD.auth_state IN ('legacy_bootstrap', 'rotation_grace') AND NEW.auth_state IN ('active', 'revoked', 'recovery_pending')) " +
+    "OR (OLD.auth_state = 'recovery_pending' AND NEW.auth_state = 'revoked') " +
+    "OR (OLD.auth_state = 'recovery_pending' AND NEW.auth_state = 'active' " +
+    "AND OLD.recovery_token_hash IS NOT NULL AND NEW.recovery_token_hash IS NULL " +
+    "AND NEW.token_hash IS NOT NULL AND NEW.token_hash IS NOT OLD.token_hash)" +
+    "), 0) BEGIN SELECT RAISE(ABORT, 'AUTH_STATE_EDGE_REFUSED'); END",
+  agents_auth_state_insert:
+    "CREATE TRIGGER agents_auth_state_insert BEFORE INSERT ON agents WHEN COALESCE(EXISTS (" +
+    "SELECT 1 FROM agents WHERE (name = NEW.name OR id = NEW.id) AND auth_state IN ('revoked', 'recovery_pending')" +
+    "), 1) BEGIN SELECT RAISE(ABORT, 'AUTH_STATE_EDGE_REFUSED'); END",
+  agents_identity_immutable:
+    "CREATE TRIGGER agents_identity_immutable BEFORE UPDATE OF name, id ON agents " +
+    "WHEN NEW.name IS NOT OLD.name OR NEW.id IS NOT OLD.id " +
+    "BEGIN SELECT RAISE(ABORT, 'AGENT_IDENTITY_IMMUTABLE'); END",
+};
+
+/**
+ * SEC-20.T2 + T4 (schema v27): install the agents row-guard triggers. Every CLI call opens the database, so the common path
+ * (both triggers present with this binary's exact SQL) only READS sqlite_master: no schema write, no write lock. An
+ * absent or differing trigger (an upgraded or tampered file) is dropped and recreated in one transaction.
+ */
+function migrateSchemaToV2_27(db: CompatDatabase): void {
+  const names = Object.keys(AGENT_ROW_GUARD_TRIGGERS);
+  const have = new Map(
+    (db
+      .prepare(`SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN (${names.map(() => "?").join(", ")})`)
+      .all(...names) as Array<{ name: string; sql: string }>).map((t) => [t.name, t.sql]),
+  );
+  const stale = names.filter((n) => have.get(n) !== AGENT_ROW_GUARD_TRIGGERS[n]);
+  if (stale.length === 0) return;
+  db.transaction(() => {
+    for (const n of stale) {
+      db.exec(`DROP TRIGGER IF EXISTS ${n}`);
+      db.exec(AGENT_ROW_GUARD_TRIGGERS[n]);
+    }
+  })();
 }
 
 /** ADR-0047 — the ONE definition of the connectors columns (a literal: statically resolvable SQL). */
