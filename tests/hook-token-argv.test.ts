@@ -212,6 +212,11 @@ function run(args: string[], env: Record<string, string>, stdin = "", fd5?: stri
     // 'close', not 'exit': a process can exit while another still holds its stdout, so its output has not drained.
     child.on("close", (code) => resolve({ code, stdout, stderr }));
     child.on("error", reject);
+    // A child may exit before reading its stdin (most of these never read it): EPIPE then means "not read", nothing
+    // more. Any other stdin error fails the run.
+    child.stdin.on("error", (e: NodeJS.ErrnoException) => {
+      if (e.code !== "EPIPE") reject(e);
+    });
     child.stdin.end(stdin);
   }).finally(() => {
     if (f5 !== undefined) fs.closeSync(f5);
@@ -291,6 +296,10 @@ describe("the harness itself: run() returns only after the child's output has dr
   it("a last chunk written AFTER the shell exits (by a process still holding its stdout) is captured", async () => {
     const r = await run(["-c", "(sleep 0.3; printf late-chunk) & exit 0"], {});
     expect(r.stdout).toBe("late-chunk");
+  });
+  it("a child that exits WITHOUT reading a large stdin: run() resolves (EPIPE means not read, not a failure)", async () => {
+    const r = await run(["-c", "exit 0"], {}, "x".repeat(4 * 1024 * 1024));
+    expect(r.code).toBe(0);
   });
 });
 
@@ -780,9 +789,11 @@ describe("#319 R2: an inherited trace prints no credential (behavioural)", SLOW,
       expect(hazard, `bash ${major}.${minor}: did a plain unset close descriptor ${fd}?`).toBe(major > 4 || (major === 4 && minor >= 1));
       const name = "xt-fd" + fd + "-" + crypto.randomBytes(3).toString("hex");
       const token = dbRegister(name, "tester", []).plaintext_token as string;
-      const r = await run([CHECK_RELAY], { ...localEnv(name, home(name), token), SHELLOPTS: "xtrace", BASH_XTRACEFD: fd });
+      // RELAY_HOOK_DEBUG makes the hook write a KNOWN stderr line (the register summary): a healthy install otherwise
+      // writes nothing to stderr, so "stderr is non-empty" measured incidental warnings, not an open descriptor.
+      const r = await run([CHECK_RELAY], { ...localEnv(name, home(name), token), RELAY_HOOK_DEBUG: "1", SHELLOPTS: "xtrace", BASH_XTRACEFD: fd });
       expect(r.stdout, `stdout lost. stderr: ${r.stderr.slice(-1000)}`).toContain("[RELAY]");
-      expect(r.stderr.length, "stderr lost").toBeGreaterThan(0);
+      expect(r.stderr, "stderr lost").toMatch(/^\[bot-relay hook debug\] register_agent reply: HTTP [0-9]{3}, /m);
       expect(r.stdout.includes(token) || r.stderr.includes(token)).toBe(false);
     });
   }
