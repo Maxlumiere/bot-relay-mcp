@@ -280,6 +280,34 @@ function checkPerms(p: string): CheckResult[] {
  * unusable, naming the path and the uid, mode or SID.
  * Never prints the secret. A pure read: the daemon (or `relay init`) creates and tightens it.
  */
+/**
+ * INV-LIVE-01 BOUNDEDNESS (architect ruling a98ec836): DORMANT watches blind to their window (they could
+ * not observe it for their whole bound; never judged gone, never re-anchored), from their records under
+ * <instance>/watch/<agent>/[<window>/]dormant/. Read-only; real directories only. WARN, never FAIL: the
+ * watch is idle, not broken, and its agent gets no wake until it is re-armed.
+ */
+export async function checkBlindWatches(dbPath: string): Promise<CheckResult> {
+  const { blindDormantRecords } = await import("../watch-wake.js");
+  const { probePid } = await import("../liveness.js");
+  const root = path.join(path.dirname(dbPath), "watch");
+  const found: string[] = [];
+  const realDirs = (dir: string): string[] => {
+    try {
+      return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.isSymbolicLink()).map((e) => e.name);
+    } catch {
+      return [];
+    }
+  };
+  for (const agent of realDirs(root)) {
+    const agentDir = path.join(root, agent);
+    for (const dir of [agentDir, ...realDirs(agentDir).filter((n) => n !== "dormant").map((n) => path.join(agentDir, n))]) {
+      for (const r of blindDormantRecords(dir, (pid) => probePid(pid))) found.push(`${agent} (watch pid ${r.pid}, since ${r.at})`);
+    }
+  }
+  if (found.length === 0) return { name: "watches", status: "PASS", detail: "no dormant watch is blind to its window" };
+  return { name: "watches", status: "WARN", detail: `${found.length} dormant watch(es) cannot observe their window (its start time stayed unreadable for the whole bound), so the agent gets no wake: ${found.join("; ")}. Re-arm from the agent's session.` };
+}
+
 async function checkMintSecret(dbPath: string): Promise<CheckResult> {
   const { openMintAllowed, OPEN_MINT_ENV } = await import("../mint-gate.js");
   const { readMintSecret, mintSecretPath } = await import("../mint-secret.js");
@@ -610,6 +638,7 @@ export async function run(argv: string[]): Promise<number> {
       results.push(...(await checkDb(resolution.dbPath)));
       results.push(...checkPerms(resolution.dbPath));
       results.push(await checkMintSecret(resolution.dbPath));
+      results.push(await checkBlindWatches(resolution.dbPath));
       results.push(await checkDiskSpace(resolution.dbPath));
     } finally {
       if (pinned.db === undefined) delete process.env.RELAY_DB_PATH;

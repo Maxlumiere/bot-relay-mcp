@@ -58,8 +58,8 @@ const {
   _getLivenessProbeCountForTests,
 } = await import("../src/db.js");
 const {
-  isPidAlive,
-  isAgentProcessAlive,
+  probePid,
+  agentProcessState,
   processStartedAt,
   parseProcessTable,
   findAgentProcess,
@@ -394,16 +394,16 @@ describe("v2.15.0 — (5e) deriveAgentStatus AGE-FREE precedence table (stored �
 describe("v2.13.0 — (6) start-time reuse guard", () => {
   it("a recycled PID (different start-time) reads dead", () => {
     // process.pid is alive, but the stored start-time doesn't match → reused → dead.
-    expect(isAgentProcessAlive(LIVE_PID, "Mon Jan  1 00:00:00 2020")).toBe(false);
+    expect(agentProcessState(LIVE_PID, "Mon Jan  1 00:00:00 2020")).toBe("dead");
   });
   it("a matching start-time reads alive", () => {
     const real = startToken(LIVE_PID);
     expect(real).not.toBeNull();
-    expect(isAgentProcessAlive(LIVE_PID, real)).toBe(true);
+    expect(agentProcessState(LIVE_PID, real)).toBe("alive");
   });
   it("a null start-time falls back to PID-liveness alone", () => {
-    expect(isAgentProcessAlive(LIVE_PID, null)).toBe(true);
-    expect(isAgentProcessAlive(DEAD_PID, null)).toBe(false);
+    expect(agentProcessState(LIVE_PID, null)).toBe("alive");
+    expect(agentProcessState(DEAD_PID, null)).toBe("dead");
   });
 });
 
@@ -446,11 +446,12 @@ describe("v2.13.0 — (7) host-scope, back-compat, errno, parsers", () => {
     e.code = code;
     throw e;
   };
-  it("isPidAlive: success/EPERM alive, ESRCH dead, bad pid dead", () => {
-    expect(isPidAlive(123, () => undefined)).toBe(true);
-    expect(isPidAlive(123, throwing("EPERM"))).toBe(true);
-    expect(isPidAlive(123, throwing("ESRCH"))).toBe(false);
-    expect(isPidAlive(0)).toBe(false);
+  it("probePid (INV-LIVE-01 D1): success/EPERM alive, ESRCH gone (ONLY), any other errno or a bad pid unknown", () => {
+    expect(probePid(123, () => undefined)).toBe("alive");
+    expect(probePid(123, throwing("EPERM"))).toBe("alive");
+    expect(probePid(123, throwing("ESRCH"))).toBe("gone");
+    expect(probePid(123, throwing("EINVAL"))).toBe("unknown");
+    expect(probePid(0)).toBe("unknown");
   });
 
   it("machineGuid parsers", () => {

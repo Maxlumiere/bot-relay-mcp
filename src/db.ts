@@ -14,10 +14,12 @@ import { createHash } from "crypto";
 import { createRequire } from "module";
 import {
   getOwnHostId,
-  isAgentProcessAlive,
+  agentProcessState,
   agentProcessAdvertised,
   anchorLivenessVerdict,
-  isPidAlive,
+  probePid,
+  type PidState,
+  type ProcessStart,
   processStartedAt,
   startOrNull,
   observeStartTokenForm,
@@ -2055,7 +2057,7 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
  *   - `install_dir` = the realpath of the install the connector loaded from; the build
  *     columns are the stamp it LOADED (build-info.ts), never re-read.
  *   - NO status column: liveness is derived at read time from the pid AND its start
- *     token (liveConnectors), so a stored status can never outlive the process.
+ *     token (observeConnectors), so a stored status can never outlive the process.
  *   - ADR-0043: every key starts with edge_id, and a foreign edge is refused.
  *   - Start tokens are the UTC form ONLY (a CHECK): no legacy acceptance here.
  */
@@ -2179,9 +2181,11 @@ function ownHostConnectorRows(db: CompatDatabase): ConnectorRow[] {
 }
 
 /**
- * ADR-0047 — the LIVE connector rows on this host: the pid is running AND its
- * start token equals the recorded one (the deploy-gate identity pattern). A dead
- * pid, a reused pid, or an unreadable start token is never live.
+ * ADR-0047 — the connector rows on this host, OBSERVED (INV-LIVE-01 D2, architect ruling a98ec836):
+ *   - live:    the pid's start token, read now, equals the recorded one (the deploy-gate identity pattern);
+ *   - unknown: the start cannot be read now (unreadable) and the kernel does not say the pid is gone. It
+ *              is SHOWN, labelled unknown: never live, never silently dropped as dead;
+ *   - gone (omitted): the kernel says no such process (ESRCH), or the pid now has another start.
  *
  * KNOWN LIMIT (Codex #295 R1 P2-2, ruled a documented limit): the start token
  * (`ps -o lstart=`) has whole-second resolution. A pid reused within the SAME
@@ -2189,40 +2193,48 @@ function ownHostConnectorRows(db: CompatDatabase): ConnectorRow[] {
  * connector's INSERT OR REPLACE overwrites the old row. Not reproduced; the
  * window is one second on one pid.
  */
-export function liveConnectors(
+export interface ConnectorObservation {
+  live: ConnectorRow[];
+  unknown: ConnectorRow[];
+}
+export function observeConnectors(
   // db: a caller's own handle (e.g. `relay fleet`'s READONLY raw handle); default
   // the app handle. startOf: e.g. one process-table snapshot, so a whole board is
   // read at one instant.
-  opts: { startOf?: (pid: number) => string | null; db?: CompatDatabase } = {},
-): ConnectorRow[] {
-  // Default: one read per row; an unreadable start (or a gone pid) is not live here. `relay fleet`, the
-  // one production reader, passes its process snapshot instead and reports a failed snapshot itself.
-  const startOf = opts.startOf ?? ((pid: number) => startOrNull(processStartedAt(pid)));
-  return ownHostConnectorRows(opts.db ?? getDb()).filter((r) => {
+  opts: { startOf?: (pid: number) => ProcessStart; db?: CompatDatabase } = {},
+): ConnectorObservation {
+  const startOf = opts.startOf ?? ((pid: number) => processStartedAt(pid));
+  const out: ConnectorObservation = { live: [], unknown: [] };
+  for (const r of ownHostConnectorRows(opts.db ?? getDb())) {
     const s = startOf(r.pid);
-    return s !== null && s === r.pid_start;
-  });
+    if (s.kind === "unreadable") out.unknown.push(r);
+    else if (s.kind === "start" && s.start === r.pid_start) out.live.push(r);
+  }
+  return out;
 }
 
 /**
  * ADR-0047 (D5) — the ONE purger, called by the daemon only: deletes rows older
- * than 7 days whose process is POSITIVELY dead (the pid is gone, or its start
- * token differs). A live pid whose start token cannot be read is kept. Correctness
- * never depends on this: liveness is derived at read time.
+ * than 7 days whose process is POSITIVELY dead (the kernel says the pid is gone,
+ * ESRCH only, or its start token differs). A live pid whose start token cannot be
+ * read is kept, and so is a pid the kernel probe cannot judge (INV-LIVE-01 D1).
+ * Correctness never depends on this: liveness is derived at read time.
  */
 export function purgeDeadConnectors(
-  opts: { startOf?: (pid: number) => string | null; isAlive?: (pid: number) => boolean } = {},
+  opts: { startOf?: (pid: number) => string | null; pidState?: (pid: number) => PidState } = {},
 ): { purged: number } {
-  // null = unreadable: never "dead" (a gone pid is caught by isAlive first).
+  // null = unreadable: never "dead" (a gone pid is caught by the kernel probe first).
   const startOf = opts.startOf ?? ((pid: number) => startOrNull(processStartedAt(pid)));
-  const isAlive = opts.isAlive ?? ((pid: number) => isPidAlive(pid));
+  const pidState = opts.pidState ?? ((pid: number) => probePid(pid));
   const db = getDb();
   const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const del = db.prepare("DELETE FROM connectors WHERE edge_id = ? AND pid = ? AND pid_start = ?");
   let purged = 0;
   for (const r of ownHostConnectorRows(db)) {
     if (r.started_at >= cutoff) continue;
-    let dead = !isAlive(r.pid);
+    const k = pidState(r.pid);
+    if (k === "unknown") continue; // the kernel could not say: never a deletion
+    let dead = k === "gone";
     if (!dead) {
       const s = startOf(r.pid);
       dead = s !== null && s !== r.pid_start;
@@ -4241,7 +4253,13 @@ export function countLegacyStartTokens(run?: CommandRunner, kill?: KillProbe): L
   if (!ownHost) return { ownHostKnown: false, agents: 0, bindings: 0, total: 0, unreadable: 0, duplicateWindows };
   let unreadable = 0;
   const isLegacy = (pid: number | null, start: string | null): boolean => {
-    if (!(typeof pid === "number" && pid > 0) || !start || isUtcStartToken(start) || !isPidAlive(pid, kill)) return false;
+    if (!(typeof pid === "number" && pid > 0) || !start || isUtcStartToken(start)) return false;
+    const k = probePid(pid, kill);
+    if (k === "gone") return false;
+    if (k === "unknown") {
+      unreadable++; // the kernel could not say: cannot judge its form either
+      return false;
+    }
     const form = observeStartTokenForm(pid, start, run, kill);
     if (form === "unreadable") unreadable++;
     return form === "legacy";
@@ -4496,6 +4514,8 @@ export function endAgentSessionOnSignal(
   // ADR-0042 R1: the ending connector's OWN parent anchor (the window it lives in).
   // Absent → the connector cannot prove the row is its window's → write nothing.
   ownAnchor: { pid: number; startedAt: string } | null = null,
+  // The kernel probe (INV-LIVE-01 D1; a test seam): only its ESRCH may authorize this teardown.
+  kill: KillProbe = process.kill,
 ): { changed: boolean } {
   const db = getDb();
   const nowMs = Date.now();
@@ -4523,7 +4543,7 @@ export function endAgentSessionOnSignal(
     ) {
       return { changed: false };
     }
-    if (anchorLivenessVerdict(row, hostId) !== "dead") return { changed: false };
+    if (anchorLivenessVerdict(row, hostId, undefined, kill) !== "dead") return { changed: false };
     const r = db.prepare(
       "UPDATE agents SET session_id = NULL, agent_status = 'idle', busy_expires_at = NULL, " +
       "signal_received_at = ?, signal_kind = ?, " +
@@ -5914,7 +5934,7 @@ const _negativeProbeCache = new Map<string, number>();
  */
 const _positiveProbeCache = new Map<string, number>();
 
-/** Test-only: count of ACTUAL liveness probes (cache-miss isAgentProcessAlive
+/** Test-only: count of ACTUAL liveness probes (cache-miss agentProcessState
  *  calls), so tests can assert the positive/negative caches suppress re-probes. */
 let _livenessProbeCount = 0;
 
@@ -5948,7 +5968,7 @@ export type LivenessVerdict = "alive" | "dead" | "unknown";
  * (no agent_pid) or a cross-host row → `unknown`, never `dead`. Only a positive
  * dead signal — agent_pid present, same host, and the process confirmed gone
  * (kill ESRCH) or its start-time mismatched (PID reuse) — yields `dead`.
- * `isAgentProcessAlive` already encodes the narrow-dead rule (kill ok +
+ * `agentProcessState` already encodes the narrow-dead rule (kill ok +
  * start-time missing/unreadable ⇒ alive, not dead). Positive + negative caches
  * (both in-memory) suppress re-probes within LIVENESS_PROBE_CACHE_MS.
  */
@@ -5993,15 +6013,17 @@ export function computeLivenessVerdict(row: {
   // alive. The argv scan gets the same fix  via the agent's OWN
   // process, without that false-alive. (Flagged to Victra — deviation from spec.)
   _livenessProbeCount++;
-  const alive =
-    (hasAnchor && isAgentProcessAlive(row.agent_pid as number, row.agent_pid_start ?? null)) ||
-    agentProcessAdvertised(row.name);
+  const anchorState = hasAnchor ? agentProcessState(row.agent_pid as number, row.agent_pid_start ?? null) : null;
+  const alive = anchorState === "alive" || agentProcessAdvertised(row.name);
 
   if (alive) {
     _positiveProbeCache.set(row.name, nowMs);
     _negativeProbeCache.delete(row.name);
     return "alive";
   }
+  // INV-LIVE-01 D1: the kernel probe could not judge the anchor: no negative signal, so
+  // "unknown" (never dead), and nothing is cached (the next read probes again).
+  if (anchorState === "unknown") return "unknown";
   _negativeProbeCache.set(row.name, nowMs);
   _positiveProbeCache.delete(row.name);
   return hasAnchor ? "dead" : "unknown";

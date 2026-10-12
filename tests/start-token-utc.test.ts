@@ -43,7 +43,7 @@ delete process.env.RELAY_AGENT_ROLE;
 const {
   processStartedAt,
   buildProcessTable,
-  isAgentProcessAlive,
+  agentProcessState,
   anchorLivenessVerdict,
   observeStartTokenForm,
   startTokenEnv,
@@ -198,7 +198,7 @@ describe("readers dispatch on the suffix; the legacy form is accepted only unsuf
     it(`TS: ${label}`, () => {
       const run = twoFormRunner(utcRead, legacyRead);
       expect(observeStartTokenForm(4242, stored, run, alive as never)).toBe(obs);
-      expect(isAgentProcessAlive(4242, stored, run, alive as never)).toBe(expected);
+      expect(agentProcessState(4242, stored, run, alive as never)).toBe(expected ? "alive" : "dead");
     });
     it(`bash relay_anchor_liveness agrees: ${label}`, () => {
       // Override only the two PRODUCERS (the verdict logic is the shipped one);
@@ -232,7 +232,7 @@ describe("readers dispatch on the suffix; the legacy form is accepted only unsuf
   const runB = twoFormRunner("Thu Oct  1 11:37:33 2026", "Thu Oct  1 07:37:33 2026");
   const A_TOKEN = "Thu Oct  1 07:37:33 2026 UTC";
   it("Codex R1 #1: a pid reused exactly the zone offset later reads DEAD for the first process's token (TS and bash)", () => {
-    expect(isAgentProcessAlive(4242, A_TOKEN, runB, alive as never)).toBe(false);
+    expect(agentProcessState(4242, A_TOKEN, runB, alive as never)).toBe("dead");
     const prelude =
       `relay_pid_start() { printf '%s%s' 'Thu Oct  1 11:37:33 2026' "$RELAY_START_TOKEN_UTC_SUFFIX"; }; ` +
       `relay_pid_start_legacy() { printf '%s' 'Thu Oct  1 07:37:33 2026'; }; `;

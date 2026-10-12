@@ -71,15 +71,19 @@ export const REFUSAL_TEXT: Record<OwnerRefusal, string> = {
  */
 export function resolveOwnership(selfPid: number, bindings: readonly OwnerBinding[], ownHostId: string | null, deps: OwnerDeps): Ownership {
   const table = deps.table();
-  if (table.size === 0) return { ok: false, why: "cannot_judge" }; // an EMPTY snapshot is a failed read, never "reparented"
   const self = table.get(selfPid);
-  if (!self || self.ppid <= 1) return { ok: false, why: "reparented" }; // (ii)
+  // INCOMPLETE data is never a fact (Codex R1 P2): our own row missing (an EMPTY snapshot, i.e. a failed
+  // read; or a row that was malformed and dropped; or a partial read) cannot be judged. `reparented` is
+  // only an OBSERVED parent of init/launchd.
+  if (!self) return { ok: false, why: "cannot_judge" };
+  if (self.ppid <= 1) return { ok: false, why: "reparented" }; // (ii)
   // Walk the ancestry (bounded); the FIRST hop that a binding of this agent names, verified (i).
   const mine = bindings.filter((b) => b.host_id === ownHostId && Number.isInteger(b.window_pid) && typeof b.window_pid_start === "string" && b.window_pid_start.length > 0);
   let found: { b: OwnerBinding; start: string } | null = null;
   let cur: ProcEntry | undefined = table.get(self.ppid);
+  if (!cur) return { ok: false, why: "cannot_judge" }; // our parent is alive (ppid > 1) but missing: incomplete
   for (let depth = 0; cur && depth < 64 && !found; depth++) {
-    const hop = cur;
+    const hop: ProcEntry = cur;
     for (const b of mine) {
       if (b.window_pid !== hop.pid) continue;
       const now = anchorState(deps.startNow(hop.pid), hop.startedAt);
@@ -91,8 +95,9 @@ export function resolveOwnership(selfPid: number, bindings: readonly OwnerBindin
       found = { b, start: hop.startedAt };
       break;
     }
-    if (hop.ppid <= 1) break;
+    if (hop.ppid <= 1 || found) break;
     cur = table.get(hop.ppid);
+    if (!cur) return { ok: false, why: "cannot_judge" }; // an ancestor hop missing from the snapshot: incomplete, never "no bound ancestor"
   }
   if (!found) return { ok: false, why: "no_bound_ancestor" };
   // (iii) the agent's ONE live window, by the doorbell's own predicate, must be this one.
@@ -114,10 +119,12 @@ export const windowState = (w: OwnedWindow, startNow: (pid: number) => ProcessSt
  * re-proven by the caller (process.ppid unchanged). A "dead" verdict is permanent for a (pid, start),
  * so it is cached; any other verdict is read again. "window_gone" = this window's process ended, by kernel
  * fact (ESRCH, or its pid holds another process). A window whose start cannot be READ is no verdict
- * (INV-LIVE-01): the binding checks below still run, and the next check reads it again.
+ * (INV-LIVE-01): the binding checks below still run, the next check reads it again, and `window:
+ * "unknown"` tells the caller, which bounds how long it accepts that (architect ruling a98ec836).
  */
-export function stillOwner(window: OwnedWindow, bindings: readonly OwnerBinding[], ownHostId: string | null, deps: Pick<OwnerDeps, "liveness" | "startNow">, deadCache: Set<string>): { ok: true } | { ok: false; why: OwnerRefusal | "window_gone" } {
-  if (windowState(window, deps.startNow) === "gone") return { ok: false, why: "window_gone" };
+export function stillOwner(window: OwnedWindow, bindings: readonly OwnerBinding[], ownHostId: string | null, deps: Pick<OwnerDeps, "liveness" | "startNow">, deadCache: Set<string>): { ok: true; window: "same" | "unknown" } | { ok: false; why: OwnerRefusal | "window_gone" } {
+  const ws = windowState(window, deps.startNow);
+  if (ws === "gone") return { ok: false, why: "window_gone" };
   const liveness = deps.liveness;
   const cached = (b: OwnerBinding): AnchorVerdict => {
     const key = `${b.host_id}|${b.window_pid}|${b.window_pid_start}`;
@@ -129,5 +136,5 @@ export function stillOwner(window: OwnedWindow, bindings: readonly OwnerBinding[
   const one = oneLiveWindow(bindings, ownHostId, cached);
   if (one.kind === "none") return { ok: false, why: "no_live_window" };
   if (one.kind === "ambiguous") return { ok: false, why: "ambiguous_binding" };
-  return one.b.window_pid === window.pid ? { ok: true } : { ok: false, why: "not_this_window" };
+  return one.b.window_pid === window.pid ? { ok: true, window: ws } : { ok: false, why: "not_this_window" };
 }

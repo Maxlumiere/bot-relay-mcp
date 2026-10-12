@@ -73,15 +73,18 @@ describe("processStartedAt: start / gone / unreadable, gone ONLY by kernel fact"
     expect(Lv.processStartedAt(4242, runner(""), "utc", k.probe)).toEqual({ kind: "gone" });
     expect(k.calls).toEqual([4242, 4242]);
   });
-  it("a non-positive or non-integer pid is never signalled (kill(0) / kill(-n) probe process GROUPS) → unreadable", () => {
+  it("a non-positive or non-integer pid is never signalled (kill(0) / kill(-n) probe process GROUPS) → unreadable / unknown", () => {
     const k = killSeq("exists");
-    for (const pid of [0, -1, -4242, 1.5, Number.NaN]) expect(Lv.processStartedAt(pid, runner(`${RAW}\n`), "utc", k.probe).kind).toBe("unreadable");
+    for (const pid of [0, -1, -4242, 1.5, Number.NaN]) {
+      expect(Lv.processStartedAt(pid, runner(`${RAW}\n`), "utc", k.probe).kind).toBe("unreadable");
+      expect(Lv.probePid(pid, k.probe)).toBe("unknown"); // the probe's OWN guard, not only its caller's
+    }
     expect(k.calls).toEqual([]);
   });
   it("the REAL process table: this process → start; a pid that does not exist → gone", () => {
     expect(Lv.processStartedAt(process.pid).kind).toBe("start");
     let dead = 999_999;
-    while (dead > 1000 && Lv.isPidAlive(dead)) dead--;
+    while (dead > 1000 && Lv.probePid(dead) !== "gone") dead--;
     expect(Lv.processStartedAt(dead)).toEqual({ kind: "gone" });
   });
   it("anchorState: same / gone (ESRCH, or ANOTHER start on the pid) / unknown (unreadable)", () => {
@@ -137,7 +140,7 @@ describe("EXIT: a running watch's window is GONE only by kernel fact", () => {
   const bs = [{ binding_id: "b1", agent_name: "bob", host_id: "H", window_pid: 100, window_pid_start: "S100" }];
   const deps = (r: ProcessStart) => ({ liveness: () => "alive" as const, startNow: () => r });
   it("HARM (the D2 path): the window's start UNREADABLE → never window_gone; the binding checks still run (owner)", () => {
-    expect(O.stillOwner(win, bs, "H", deps({ kind: "unreadable", why: "ps timed out" }), new Set())).toEqual({ ok: true });
+    expect(O.stillOwner(win, bs, "H", deps({ kind: "unreadable", why: "ps timed out" }), new Set())).toEqual({ ok: true, window: "unknown" }); // owner, and the caller is told the window read was unknown (it bounds that)
   });
   it("the twin: ESRCH → window_gone; another start on the pid → window_gone", () => {
     expect(O.stillOwner(win, bs, "H", deps({ kind: "gone" }), new Set())).toEqual({ ok: false, why: "window_gone" });
@@ -316,5 +319,118 @@ describe("DISPLAY: dormant watches whose process cannot be judged are counted ap
     for (const [pid, start] of [[11, "A"], [12, "B"], [13, null]] as const) fs.writeFileSync(path.join(agentDir, W.DORMANT_DIR, `${pid}.json`), JSON.stringify({ v: 1, pid, proc_start: start, reason: "r", at: "2026-10-12T04:00:00.000Z" }));
     const verdict: Record<number, "live" | "gone" | "unknown"> = { 11: "live", 12: "gone", 13: "unknown" };
     expect(W.countLiveDormant(agentDir, (pid) => verdict[pid])).toEqual({ live: 1, unknown: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------
+// Codex R1 on #324 (BLOCK) and architect ruling a98ec836: D1, the DETAILs, BOUNDEDNESS, the ruled
+// countLiveDormant hardening.
+
+describe("D1: ONE tri-state kernel probe; only ESRCH may authorize death, deletion or release", () => {
+  const throwing = (code: string) => () => {
+    throw errno(code);
+  };
+  it("probePid: success/EPERM alive, ESRCH gone, ANY other errno (EINVAL) or a bad pid unknown", () => {
+    expect(Lv.probePid(4242, () => undefined)).toBe("alive");
+    expect(Lv.probePid(4242, throwing("EPERM"))).toBe("alive");
+    expect(Lv.probePid(4242, throwing("ESRCH"))).toBe("gone");
+    expect(Lv.probePid(4242, throwing("EINVAL"))).toBe("unknown");
+    expect(Lv.probePid(4242, throwing("ENOSYS"))).toBe("unknown");
+    expect(Lv.probePid(0, () => undefined)).toBe("unknown");
+  });
+  it("HARM: agentProcessState on an unexpected errno → unknown, never dead; ESRCH → dead", () => {
+    expect(Lv.agentProcessState(4242, `${RAW} UTC`, runner(`${RAW}\n`), throwing("EINVAL"))).toBe("unknown");
+    expect(Lv.agentProcessState(4242, `${RAW} UTC`, runner(`${RAW}\n`), throwing("ESRCH"))).toBe("dead");
+    expect(Lv.agentProcessState(4242, `${RAW} UTC`, runner(`${RAW}\n`), () => undefined)).toBe("alive");
+  });
+  it("HARM: the anchor verdict (the teardown, release-binding and doorbell gate) on an unexpected errno → unverifiable (no action), never dead", () => {
+    const row = { host_id: "H", agent_pid: 4242, agent_pid_start: `${RAW} UTC` };
+    expect(Lv.anchorLivenessVerdict(row, "H", runner(`${RAW}\n`), throwing("EINVAL"))).toBe("unverifiable");
+    expect(Lv.anchorLivenessVerdict(row, "H", runner(`${RAW}\n`), throwing("ESRCH"))).toBe("dead");
+    expect(Lv.anchorLivenessVerdict(row, "H", runner(`${RAW}\n`), () => undefined)).toBe("alive");
+  });
+});
+
+describe("DETAIL (Codex R1 P2): only a well-formed start token is a fact", () => {
+  const exists = () => undefined;
+  it("HARM: a runner printing something that is not a start time ('-', a truncated line, a warning) → unreadable, never a 'different start'", () => {
+    for (const out of ["-", "Mon Oct 12 02:27:40", "ps: warning", "S100", "Mon Oct 12 02:27:40 2026 extra"]) {
+      expect(Lv.processStartedAt(4242, runner(`${out}\n`), "utc", exists).kind, out).toBe("unreadable");
+    }
+    expect(Lv.processStartedAt(4242, runner("Thu Oct  1 07:37:33 2026\n"), "utc", exists)).toEqual({ kind: "start", start: "Thu Oct  1 07:37:33 2026 UTC" });
+  });
+  it("HARM: a process-table row whose start is malformed is DROPPED (its pid then reads as missing, never as a fact)", () => {
+    const t = Lv.parseProcessTable(["  10     1 Thu Oct  1 07:37:33 2026 claude", "  20    10 - - - - - zsh", "  30    20 Mon Oct 12 02:27:40 2026 node x"].join("\n"));
+    expect([...t.keys()]).toEqual([10, 30]);
+  });
+  it("the anchor shape the guard accepts is the shape the real ps prints (this host's own token)", () => {
+    const r = Lv.processStartedAt(process.pid);
+    expect(r.kind).toBe("start");
+    expect(Lv.RAW_START_TOKEN_RE.test((r as { start: string }).start.replace(/ UTC$/, ""))).toBe(true);
+  });
+});
+
+describe("DETAIL (Codex R1 P2): incomplete ancestry is cannot_judge; reparented only when OBSERVED", () => {
+  const T = (rows: Array<[number, number]>) => new Map(rows.map(([pid, ppid]) => [pid, { pid, ppid, startedAt: `S${pid}`, command: "x" }]));
+  const deps = (table: ReturnType<typeof T>): import("../src/watch-owner.js").OwnerDeps => ({
+    table: () => table,
+    startNow: (pid) => ({ kind: "start", start: `S${pid}` }),
+    sameProcess: (pid, stored) => stored === `S${pid}`,
+    liveness: () => "alive",
+  });
+  const bnd = [{ binding_id: "b1", agent_name: "bob", host_id: "H", window_pid: 100, window_pid_start: "S100" }];
+  it("the control: a complete chain → owned", () => {
+    expect(O.resolveOwnership(300, bnd, "H", deps(T([[300, 200], [200, 100], [100, 1]]))).ok).toBe(true);
+  });
+  it("HARM: the watch's OWN row missing from a non-empty snapshot → cannot_judge, never reparented", () => {
+    expect(O.resolveOwnership(300, bnd, "H", deps(T([[200, 100], [100, 1]])))).toEqual({ ok: false, why: "cannot_judge" });
+  });
+  it("HARM: its parent's row missing → cannot_judge; a MIDDLE hop missing → cannot_judge, never no_bound_ancestor", () => {
+    expect(O.resolveOwnership(300, bnd, "H", deps(T([[300, 200], [100, 1]])))).toEqual({ ok: false, why: "cannot_judge" });
+    expect(O.resolveOwnership(300, bnd, "H", deps(T([[300, 200], [200, 150], [100, 1]])))).toEqual({ ok: false, why: "cannot_judge" });
+  });
+  it("an OBSERVED parent of init (ppid 1) is still reparented; a complete chain with no bound hop is still no_bound_ancestor", () => {
+    expect(O.resolveOwnership(300, bnd, "H", deps(T([[300, 1]])))).toEqual({ ok: false, why: "reparented" });
+    expect(O.resolveOwnership(300, bnd, "H", deps(T([[300, 200], [200, 1]])))).toEqual({ ok: false, why: "no_bound_ancestor" });
+  });
+});
+
+describe("BOUNDEDNESS (ruling a98ec836): an unobservable window is bounded, loudly", () => {
+  it("the counter: +1 on an unknown read, and ANY readable read resets it to 0 (the recovery twin)", () => {
+    expect(WU.nextAnchorUnknownCount(0, "unknown")).toBe(1);
+    expect(WU.nextAnchorUnknownCount(4, "unknown")).toBe(5);
+    expect(WU.nextAnchorUnknownCount(4, "same")).toBe(0);
+  });
+  it("the provisional bound is 2 h", () => expect(WU.ANCHOR_UNKNOWN_BOUND_MS).toBe(7_200_000));
+  it("a dormant WINDOW anchor whose start is unreadable is unknown (bounded); the launching shell never is (the reparent rule bounds it)", () => {
+    const U = () => ({ kind: "unreadable" as const, why: "x" });
+    expect(WU.dormantAnchorState({ pid: 100, start: "S100" }, U, 1)).toBe("unknown");
+    expect(WU.dormantAnchorState({ pid: 42, start: "P", parent: true }, U, 42)).toBe("same");
+    expect(WU.dormantAnchorState({ pid: 42, start: "P", parent: true }, U, 1)).toBe("gone");
+  });
+  it("blindDormantRecords: only a blind reason, only a process not gone, only record names", () => {
+    const dir = fs.mkdtempSync(path.join(ROOT, "blind-"));
+    const d = path.join(dir, W.DORMANT_DIR);
+    fs.mkdirSync(d);
+    const put = (name: string, pid: number, reason: string) => fs.writeFileSync(path.join(d, name), JSON.stringify({ v: 1, pid, proc_start: "S", reason, at: "2026-10-12T00:00:00.000Z" }));
+    put("11-a", 11, `${W.ANCHOR_UNOBSERVED_PREFIX} its window (pid 100) could not be observed`);
+    put("12-a", 12, `${W.ANCHOR_UNOBSERVED_PREFIX} its window (pid 101) could not be observed`);
+    put("13-a", 13, "superseded: a newer watch took over");
+    put(".tmp-0123456789abcdef", 14, `${W.ANCHOR_UNOBSERVED_PREFIX} a temp`);
+    const state: Record<number, "alive" | "gone" | "unknown"> = { 11: "alive", 12: "gone", 13: "alive", 14: "alive" };
+    expect(W.blindDormantRecords(dir, (pid) => state[pid]).map((r) => r.pid)).toEqual([11]);
+  });
+});
+
+describe("the ruled countLiveDormant hardening: a writer's temp beside its record is never a second watch", () => {
+  const rec = (pid: number) => JSON.stringify({ v: 1, pid, proc_start: "S", reason: "r", at: "2026-10-12T00:00:00.000Z" }) + "\n";
+  it("HARM: the same pid's complete temp beside its record → counted ONCE (it read 2); a temp alone is not yet a record", () => {
+    const agentDir = fs.mkdtempSync(path.join(ROOT, "cld-"));
+    const d = path.join(agentDir, W.DORMANT_DIR);
+    fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, ".tmp-aaaaaaaaaaaaaaaa"), rec(7));
+    expect(W.countLiveDormant(agentDir, () => "live")).toEqual({ live: 0, unknown: 0 });
+    fs.writeFileSync(path.join(d, "7-abc"), rec(7));
+    expect(W.countLiveDormant(agentDir, () => "live")).toEqual({ live: 1, unknown: 0 });
   });
 });

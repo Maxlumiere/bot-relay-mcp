@@ -140,22 +140,23 @@ describe("ADR-0047 PR 2 — the writer: a connector writes ONLY its own row", ()
   });
 });
 
-describe("ADR-0047 PR 2 — liveConnectors: liveness from the pid AND its start token, at read time", () => {
+describe("ADR-0047 PR 2 — observeConnectors: liveness from the pid AND its start token, at read time", () => {
   it("a live row is live; a DEAD pid and a REUSED pid (start token differs) never are", () => {
     db.recordOwnConnector({ parent: null, build: LOADED_BUILD });
     const d = deadPid();
     plant({ pid: d.pid, pid_start: d.start });
     plant({ pid: process.ppid, pid_start: "Thu Jan  1 00:00:00 1970 UTC" }); // a live pid, another incarnation
-    const live = db.liveConnectors();
-    expect(live.map((r) => r.pid)).toEqual([process.pid]);
+    const o = db.observeConnectors();
+    expect(o.live.map((r) => r.pid)).toEqual([process.pid]);
+    expect(o.unknown).toEqual([]); // the dead and the reused are GONE: omitted, never unknown
   });
   it("a row from ANOTHER host is not live here (it cannot be probed from this host)", () => {
     plant({ pid: process.pid, pid_start: startToken(process.pid), host_id: "another-host" });
-    expect(db.liveConnectors()).toEqual([]);
+    expect(db.observeConnectors()).toEqual({ live: [], unknown: [] });
   });
   it("host identity is POSITIVE: a row with NO host id is never this host's (never live, never probed)", () => {
     plant({ pid: process.pid, pid_start: startToken(process.pid), host_id: null });
-    expect(db.liveConnectors()).toEqual([]);
+    expect(db.observeConnectors()).toEqual({ live: [], unknown: [] });
   });
   it("an UNKNOWN own host id probes nothing: no row is live, and the purger deletes nothing (Codex #295 R1 P2-3)", () => {
     const old = new Date(Date.now() - 8 * DAY).toISOString();
@@ -164,16 +165,21 @@ describe("ADR-0047 PR 2 — liveConnectors: liveness from the pid AND its start 
     plant({ pid: process.pid, pid_start: startToken(process.pid), host_id: null });
     _resetOwnHostIdForTests(null);
     try {
-      expect(db.liveConnectors()).toEqual([]);
+      expect(db.observeConnectors()).toEqual({ live: [], unknown: [] });
       expect(db.purgeDeadConnectors().purged).toBe(0);
     } finally {
       _resetOwnHostIdForTests();
     }
     expect(rows()).toHaveLength(2);
   });
-  it("an unreadable start token is NOT live (never assumed)", () => {
+  // INV-LIVE-01 D2 (architect ruling a98ec836): this used to assert that an unreadable connector DISAPPEARS
+  // (the old design). Unreadable is not gone: the row is never live, and it stays SHOWN, labelled unknown.
+  it("an unreadable start token is NOT live and NOT dropped: the row is shown as unknown; a gone one is omitted", () => {
     db.recordOwnConnector({ parent: null, build: LOADED_BUILD });
-    expect(db.liveConnectors({ startOf: () => null })).toEqual([]);
+    const unreadable = db.observeConnectors({ startOf: () => ({ kind: "unreadable", why: "ps timed out" }) });
+    expect(unreadable.live).toEqual([]);
+    expect(unreadable.unknown.map((r) => r.pid)).toEqual([process.pid]);
+    expect(db.observeConnectors({ startOf: () => ({ kind: "gone" }) })).toEqual({ live: [], unknown: [] });
   });
 });
 
@@ -193,6 +199,16 @@ describe("ADR-0047 PR 2 — purgeDeadConnectors: POSITIVELY dead and older than 
   it("a live pid whose start cannot be read is not 'positively dead' (kept)", () => {
     plant({ pid: process.pid, pid_start: "whatever UTC", started_at: new Date(Date.now() - 8 * DAY).toISOString() });
     expect(db.purgeDeadConnectors({ startOf: () => null }).purged).toBe(0);
+  });
+  // INV-LIVE-01 D1 (architect ruling a98ec836): only the kernel's ESRCH may authorize a deletion.
+  it("HARM: an old row whose pid the kernel probe cannot judge (an unexpected errno → unknown) is KEPT; the same row on ESRCH (gone) is purged", () => {
+    const old = new Date(Date.now() - 8 * DAY).toISOString();
+    const d = deadPid();
+    plant({ pid: d.pid, pid_start: d.start, started_at: old });
+    expect(db.purgeDeadConnectors({ pidState: () => "unknown" }).purged).toBe(0);
+    expect(rows().map((x) => x.pid)).toEqual([d.pid]);
+    expect(db.purgeDeadConnectors({ pidState: () => "gone" }).purged).toBe(1);
+    expect(rows()).toEqual([]);
   });
   it("ONE purger: only the daemon calls it (D5)", () => {
     const hits = spawnSync("grep", ["-rln", "purgeDeadConnectors(", path.join(REPO_ROOT, "src")], { encoding: "utf-8" }).stdout.trim().split("\n").sort();

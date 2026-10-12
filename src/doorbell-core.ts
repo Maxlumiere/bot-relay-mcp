@@ -326,9 +326,11 @@ export function intentKeepRule(
 
 /**
  * The supervisor's view of one window's watch. `unknown` (INV-LIVE-01): the window's start (the watch's
- * key) cannot be read, so whether a watch runs cannot be observed: never `absent`.
+ * key) cannot be read, so whether a watch runs cannot be observed: never `absent`. `blind` (ruling
+ * a98ec836): no watch holds the lock because the window's watch went dormant unable to observe its
+ * window for the whole bound: `cannot_observe(anchor)`, at once (the watch already waited the bound).
  */
-export type WatchFit = { status: "live" | "stale" | "absent" | "unknown"; undeliveredAfterWake: boolean };
+export type WatchFit = { status: "live" | "stale" | "absent" | "unknown" | "blind"; undeliveredAfterWake: boolean };
 
 /**
  * INV-LIVE-01 (architect fedac068 (b), K provisional): consecutive cycles an agent's watch may read
@@ -591,7 +593,7 @@ export function planCycle(input: CycleInput): CyclePlan {
     session_unbound: "no bound reading session: delivery cannot be measured, so it is never rung (a board case: re-register or relaunch)",
     no_driver: "no live relay watch for this window (a board case: re-arm `relay watch <agent> --until-wake`)",
     undelivered_with_watch: "the watch woke this agent and the mail is still undelivered after the horizon (a board case)",
-    cannot_observe: `the agent's watch cannot be observed: its window's start time was unreadable for ${CANNOT_OBSERVE_AFTER_TICKS} consecutive cycles (a board case; never reported as no watch)`,
+    cannot_observe: `the agent's watch or its window cannot be observed (why watch: the window's start time was unreadable for ${CANNOT_OBSERVE_AFTER_TICKS} consecutive cycles; why anchor: the watch could not observe its window for its whole bound and went dormant). A board case; never reported as no watch`,
   };
 
   const covered = new Set<string>(); // agents evaluated this cycle
@@ -651,6 +653,12 @@ export function planCycle(input: CycleInput): CyclePlan {
     const actuated = !next && !!rs && !!input.actuator?.fits(name);
     if (!next && rs && input.watchFit) {
       const wf = input.watchFit(name, read, alive[0].b); // the ONE live window: the watch's key (ruling ffcaf608 D1 (iv))
+      if (wf.status === "blind") {
+        next = { case: "cannot_observe", binding_ids: idsOf(alive), dead_count: deadCount, why: "anchor" };
+        boardTo(name, next, read.ids.length, "resolved");
+        skip(`${BOARD_WHY.cannot_observe} (anchor)`);
+        continue;
+      }
       if (wf.status === "unknown") {
         // INV-LIVE-01: unknown is not absent. Below K the board state is HELD (nothing opens, nothing
         // closes) and no intent is formed (a watch may be live); at K, its own case, never no_driver.

@@ -181,9 +181,11 @@ export type NoDriverWhy = (typeof NO_DRIVER_WHY)[number];
  * `cannot_observe` record (its `why`), a closed enum:
  *   - watch: the window's start (the watch's key) stayed UNREADABLE for CANNOT_OBSERVE_AFTER_TICKS
  *     consecutive cycles, so whether a watch runs is unknown. Never `no_driver`: unknown is not absent.
+ *   - anchor (ruling a98ec836): the window's watch could not observe its window for its whole bound and
+ *     went dormant, blind to it (watch-wake ANCHOR_UNOBSERVED_PREFIX). Never "window gone": unproven.
  * Shown, never rung; it closes when the watch can be observed again.
  */
-export const CANNOT_OBSERVE_WHY = ["watch"] as const;
+export const CANNOT_OBSERVE_WHY = ["watch", "anchor"] as const;
 export type CannotObserveWhy = (typeof CANNOT_OBSERVE_WHY)[number];
 /** The closed `why` enum of each board case that carries one; every other case carries none. */
 export const BOARD_WHY_OF: Partial<Record<(typeof BOARD_CASES)[number], readonly string[]>> = { no_driver: NO_DRIVER_WHY, cannot_observe: CANNOT_OBSERVE_WHY };

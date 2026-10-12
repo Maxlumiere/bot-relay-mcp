@@ -63,6 +63,7 @@ function snap(over: Partial<FleetSnapshot> = {}): FleetSnapshot {
     processes: [p(10, 1, "claude", "claude", 1), p(11, 10, `node ${SCRIPT}`, "node", 2), p(99, 1, `node ${SCRIPT}`, "node", 9)],
     listeners: [99],
     rows: [row(11, 2)],
+    unknownRows: [],
     bindings: [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
     daemon: { port: 3777, listenerPids: [99], health: { ok: true, build: build() }, mint: "secret" },
     installed: () => installed(),
@@ -249,9 +250,13 @@ describe("the Codex shape, REAL processes: an UNBOUND connector through a SYMLIN
       },
     };
     const observe = () =>
-      V.observeFleet(sys, { liveRows: (startOf) => dbm.liveConnectors({ startOf }), liveBindings: () => [] }, port);
+      V.observeFleet(sys, { connectorRows: (startOf) => dbm.observeConnectors({ startOf }), liveBindings: () => [] }, port);
     for (let t0 = Date.now(); Date.now() - t0 < 15_000; ) {
-      if (dbm.liveConnectors({ startOf: (pid) => realSystemDeps.processTable().get(pid)?.startedAt ?? null }).some((r) => r.pid === connector.pid)) break;
+      const seen = (pid: number): import("../src/liveness.js").ProcessStart => {
+        const e = realSystemDeps.processTable().get(pid);
+        return e ? { kind: "start", start: e.startedAt } : { kind: "gone" };
+      };
+      if (dbm.observeConnectors({ startOf: seen }).live.some((r) => r.pid === connector.pid)) break;
       await new Promise((r) => setTimeout(r, 100));
     }
 

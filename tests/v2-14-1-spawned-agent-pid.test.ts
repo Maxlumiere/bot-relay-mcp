@@ -34,7 +34,7 @@ const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
 const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
-const { isPidAlive, processStartedAt } = await import("../src/liveness.js");
+const { probePid, processStartedAt } = await import("../src/liveness.js");
 
 async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
   const start = Date.now();
@@ -122,7 +122,7 @@ describe("v2.14.1 — hook agent_pid capture + spawn-window", () => {
       expect(chain).toMatch(/^\[\d+(,\d+)*\]$/);
       const agentPid = Number(sql(h.dbPath, `SELECT IFNULL(agent_pid,0) FROM agents WHERE name='${name}';`));
       expect(agentPid).toBeGreaterThan(0);
-      expect(isPidAlive(agentPid)).toBe(true); // a real live ancestor process
+      expect(probePid(agentPid)).toBe("alive"); // a real live ancestor process
       // the presence derivation reset offline→idle on re-register (comes up available).
       expect(sql(h.dbPath, `SELECT agent_status FROM agents WHERE name='${name}';`)).toBe("idle");
     } finally {

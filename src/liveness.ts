@@ -95,6 +95,14 @@ export type StartTokenForm = "utc" | "legacy";
 /** The provenance suffix of a UTC start token. The bash twin (RELAY_START_TOKEN_UTC_SUFFIX) is pinned to it by test. */
 export const START_TOKEN_UTC_SUFFIX = " UTC";
 
+/**
+ * The shape of a RAW start token: `ps -o lstart=` under LC_ALL=C (startTokenEnv), e.g.
+ * "Thu Oct  1 07:37:33 2026" (the day is space-padded). INV-LIVE-01 (Codex R1 P2): only this shape is a
+ * token. Anything else a runner prints (a "-", a warning, a truncated line) is UNREADABLE: accepted, it
+ * would be "a different start", which reads as a different process, which reads as gone.
+ */
+export const RAW_START_TOKEN_RE = /^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 1-3][0-9] [0-2][0-9]:[0-5][0-9]:[0-6][0-9] [0-9]{4}$/;
+
 /** Does this stored token carry the UTC provenance suffix? */
 export function isUtcStartToken(token: string): boolean {
   return token.endsWith(START_TOKEN_UTC_SUFFIX);
@@ -182,19 +190,24 @@ export function _resetOwnHostIdForTests(value?: string | null): void {
 export type KillProbe = (pid: number, signal: 0) => void;
 
 /**
- * Is `pid` a live process on THIS host? Uses the signal-0 probe:
- *   - success            → alive
- *   - EPERM (cross-user) → alive (process exists, just not ours)
- *   - ESRCH / anything   → dead
- * Mirrors the probe in src/instance.ts. Non-positive / non-integer pids → dead.
+ * THE kernel probe for one pid on THIS host (INV-LIVE-01 D1, architect ruling a98ec836): the signal-0
+ * probe, tri-state. There is deliberately no boolean form: "anything but EPERM = dead" let an
+ * unexpected errno authorize a purge, a teardown or a release.
+ *   - alive:   success, or EPERM (it exists; another user's);
+ *   - gone:    ESRCH, ONLY: the one answer that may authorize death, deletion or release;
+ *   - unknown: any other error (Node's Windows emulation, a future errno), or not a process id. Never
+ *              dead: every death-authorizing caller treats it as NO ACTION.
+ * A non-positive or non-integer pid is never signalled (kill(0) and kill(-n) probe process GROUPS).
  */
-export function isPidAlive(pid: number, kill: KillProbe = process.kill): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+export type PidState = "alive" | "gone" | "unknown";
+export function probePid(pid: number, kill: KillProbe = process.kill): PidState {
+  if (!Number.isInteger(pid) || pid <= 0) return "unknown";
   try {
     kill(pid, 0);
-    return true;
+    return "alive";
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "ESRCH" ? "gone" : code === "EPERM" ? "alive" : "unknown";
   }
 }
 
@@ -347,6 +360,9 @@ export function parseProcessTable(psStdout: string): Map<number, ProcEntry> {
     // pid ppid <lstart: 5 whitespace-separated fields> command...
     const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
     if (!m) continue;
+    // A row whose start is not a token is dropped (INV-LIVE-01): its pid is then MISSING from the table,
+    // which an ancestry walk reports as incomplete (cannot_judge), never as "no such parent".
+    if (!RAW_START_TOKEN_RE.test(m[3])) continue;
     const pid = Number(m[1]);
     const ppid = Number(m[2]);
     if (!Number.isInteger(pid) || pid <= 0) continue;
@@ -439,17 +455,6 @@ export function detectAgentProcess(
  */
 export type ProcessStart = { kind: "start"; start: string } | { kind: "gone" } | { kind: "unreadable"; why: string };
 
-/** The kernel's answer for one pid: it exists, it does not (ESRCH), or the probe could not say. */
-function kernelPid(pid: number, kill: KillProbe): "exists" | "gone" | "unknown" {
-  try {
-    kill(pid, 0);
-    return "exists";
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    return code === "ESRCH" ? "gone" : code === "EPERM" ? "exists" : "unknown";
-  }
-}
-
 /**
  * Read a process's start token (reuse guard). The ONE TS producer: every writer, reader and the deploy
  * gate read the token here.
@@ -462,11 +467,12 @@ export function processStartedAt(
 ): ProcessStart {
   // Never signal 0 or a negative pid: kill(0) and kill(-n) probe process GROUPS, not this process.
   if (!Number.isInteger(pid) || pid <= 0) return { kind: "unreadable", why: `not a process id: ${String(pid)}` };
-  if (kernelPid(pid, kill) === "gone") return { kind: "gone" };
+  if (probePid(pid, kill) === "gone") return { kind: "gone" };
   const out = run("ps", ["-o", "lstart=", "-p", String(pid)], { startTokenForm: form }).trim();
-  if (out.length > 0) return { kind: "start", start: form === "utc" ? out + START_TOKEN_UTC_SUFFIX : out };
+  if (RAW_START_TOKEN_RE.test(out)) return { kind: "start", start: form === "utc" ? out + START_TOKEN_UTC_SUFFIX : out };
+  if (out.length > 0) return { kind: "unreadable", why: `ps printed no start time for pid ${pid} (unexpected output: ${JSON.stringify(out.slice(0, 40))})` };
   // No token: the read failed, or the process ended between the probe and the read. Only the kernel decides which.
-  if (kernelPid(pid, kill) === "gone") return { kind: "gone" };
+  if (probePid(pid, kill) === "gone") return { kind: "gone" };
   return { kind: "unreadable", why: `ps gave no start time for pid ${pid}, which still exists (timed out, failed or not permitted)` };
 }
 
@@ -522,10 +528,11 @@ export function observeStartTokenForm(
 }
 
 /**
- * Is the recorded agent process still the SAME live process? Alive iff the PID
+ * Is the recorded agent process still the SAME live process? "alive" iff the PID
  * is live AND (when both start-times are readable) they match, in the UTC form or
- * the legacy one (see startTokenEnv) — a reused PID (new process, different
- * start-time) reads dead.
+ * the legacy one (see startTokenEnv); "dead" iff the kernel says the pid is gone
+ * (ESRCH) or a readable start differs (a reused PID); "unknown" iff the kernel
+ * probe itself could not say (INV-LIVE-01 D1: never dead on an unexpected errno).
  *
  * EXPLICIT TRADEOFF (intentional): if the current start-time can't be read
  * (`ps` restricted/failed, or no token was recorded), we fall back to
@@ -537,17 +544,20 @@ export function observeStartTokenForm(
  * process's start-time. We accept this for the relay-side foundation; the
  * cross-host heartbeat follow-on removes the PID dependency entirely.
  */
-export function isAgentProcessAlive(
+export type AgentProcessState = "alive" | "dead" | "unknown";
+export function agentProcessState(
   pid: number,
   expectedStartedAt: string | null | undefined,
   run: CommandRunner = defaultRunner,
   kill: KillProbe = process.kill,
-): boolean {
-  if (!isPidAlive(pid, kill)) return false;
-  if (!expectedStartedAt) return true; // no recorded token → PID-liveness only
+): AgentProcessState {
+  const k = probePid(pid, kill);
+  if (k === "gone") return "dead";
+  if (k === "unknown") return "unknown";
+  if (!expectedStartedAt) return "alive"; // no recorded token → PID-liveness only
   // Either form matching is the same process (the legacy form during the
   // transition); "unreadable" → can't validate → trust PID-liveness.
-  return observeStartTokenForm(pid, expectedStartedAt, run, kill) !== "mismatch";
+  return observeStartTokenForm(pid, expectedStartedAt, run, kill) === "mismatch" ? "dead" : "alive";
 }
 
 export type AnchorVerdict = "alive" | "dead" | "unverifiable";
@@ -566,13 +576,14 @@ export type AnchorVerdict = "alive" | "dead" | "unverifiable";
  * anchor-only probe would say dead, computeLivenessVerdict would say alive). That
  * argv fallback is correct for the dashboard PRESENCE surface, wrong for a
  * wakeability/eligibility decision. This function reuses the SAME narrow-dead
- * primitive (`isAgentProcessAlive`) — no new rule — minus the argv fallback.
+ * primitive (`agentProcessState`) — no new rule — minus the argv fallback.
  *
  *   - cross-host / no own-host GUID → "unverifiable" (never guess across the
  *     federation boundary);
  *   - no probe-able anchor (agent_pid absent / non-positive) → "unverifiable";
- *   - same-host + anchor → `isAgentProcessAlive` (pid gone or start-time MISMATCH
- *     → dead; pid live + start matched/unreadable → alive).
+ *   - same-host + anchor → `agentProcessState` (pid gone (ESRCH) or start-time
+ *     MISMATCH → dead; pid live + start matched/unreadable → alive; the kernel
+ *     probe unable to say → "unverifiable", never dead: INV-LIVE-01 D1).
  */
 export function anchorLivenessVerdict(
   row: { host_id?: string | null; agent_pid?: number | null; agent_pid_start?: string | null },
@@ -583,7 +594,8 @@ export function anchorLivenessVerdict(
   if (!ownHostId || !row.host_id || row.host_id !== ownHostId) return "unverifiable";
   const pid = row.agent_pid;
   if (!(typeof pid === "number" && pid > 0)) return "unverifiable";
-  return isAgentProcessAlive(pid, row.agent_pid_start ?? null, run, kill) ? "alive" : "dead";
+  const st = agentProcessState(pid, row.agent_pid_start ?? null, run, kill);
+  return st === "unknown" ? "unverifiable" : st;
 }
 
 // --- v2.19.0 liveness cascade fallback (Sentinel/liveness-derivation) ---

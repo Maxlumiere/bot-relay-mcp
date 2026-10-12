@@ -46,9 +46,9 @@ import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { LOADED_BUILD } from "./loaded-build.js";
 import { resolveInstance, serializeResolution } from "./instance.js";
-import { anchorLivenessVerdict, getOwnHostId, processStartedAt, startOrNull } from "./liveness.js";
+import { anchorLivenessVerdict, getOwnHostId, probePid, processStartedAt, startOrNull, type ProcessStart } from "./liveness.js";
 import { performance } from "perf_hooks";
-import { watchableName, watchSupervision, watchWindowDir } from "./watch-wake.js";
+import { blindDormantRecords, watchableName, watchSupervision, watchWindowDir } from "./watch-wake.js";
 import { effectiveRingMono, intentKeepRule, placeRing, DEFAULT_BUDGET_PER_HOUR, DEFAULT_HORIZON_MS, DEFAULT_WINDOW_MS, MAX_HORIZON_MS, MAX_WINDOW_MS, MIN_HORIZON_MS, MIN_WINDOW_MS, ledgerInput, planCycle, tunablesFault, type PendingRead, type WatchFit } from "./doorbell-core.js";
 import { appendRecord, closeLog, compactLog, foldRecord, LogWriteError, openLog, RecordRefusedError, replaceStateFile, selectLedgerKeep, stateDirFor, type LogHandle, type LogIo, type LogRecord, type LogState } from "./doorbell-log.js";
 import { conditionOf, FUTURE_TOLERANCE_MS, HEARTBEAT_FILENAME, MAX_COUNT, NOT_EVALUATED_MAX_NAMES, readHeartbeat, saturatingInc, type FailureKind, type Heartbeat } from "./doorbell-heartbeat.js";
@@ -203,13 +203,18 @@ export function bindingLiveness(b: { host_id: string; window_pid?: number | null
  * which a legacy-form migration rewrites under the same binding (Codex R2 (b)): the watch keys its
  * own dir the same way.
  */
-function superviseWatch(dbPath: string, name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding, wallMs: number, horizonMs: number): WatchFit {
+function superviseWatch(dbPath: string, name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding, wallMs: number, horizonMs: number, startOf: (pid: number) => ProcessStart = (pid) => processStartedAt(pid)): WatchFit {
   if (!watchableName(name) || !w.window_pid) return { status: "absent", undeliveredAfterWake: false };
-  const start = processStartedAt(w.window_pid);
+  const start = startOf(w.window_pid);
   if (start.kind === "gone") return { status: "absent", undeliveredAfterWake: false };
   // INV-LIVE-01: the watch's key cannot be read, so its watch cannot be observed: UNKNOWN, never absent.
   if (start.kind === "unreadable") return { status: "unknown", undeliveredAfterWake: false };
-  return watchSupervision(watchWindowDir(dbPath, name, { pid: w.window_pid, start: start.start }), read, wallMs, horizonMs);
+  const dir = watchWindowDir(dbPath, name, { pid: w.window_pid, start: start.start });
+  const fit = watchSupervision(dir, read, wallMs, horizonMs);
+  // BOUNDEDNESS (ruling a98ec836): no live watch, because the window's watch went dormant BLIND to it
+  // (it could not observe its window for the bound): that is its own case, never "no watch".
+  if (fit.status === "absent" && blindDormantRecords(dir, (pid) => probePid(pid)).length > 0) return { status: "blind", undeliveredAfterWake: false };
+  return fit;
 }
 
 /** Test seams: not reachable from the command line (dist/doorbell.js passes argv only). */
@@ -235,6 +240,8 @@ export interface DoorbellOptions {
    * the relay DB (src/watch-wake.ts). `false` turns supervision off: PR 1-6's intent path (tests of it).
    */
   watchFit?: ((name: string, read: PendingRead, window: import("./doorbell-core.js").CandidateBinding) => WatchFit) | false;
+  /** INV-LIVE-01 (Codex R1 P3): the supervisor's window-start reader (test seam). Default: liveness.processStartedAt. */
+  processStart?: (pid: number) => ProcessStart;
   /** Ruling 1a8fc7c4 (1): an ACTUATING driver (test seam). Production registers none → zero intents. */
   actuator?: { fits: (agentName: string) => boolean };
 }
@@ -451,7 +458,7 @@ async function runLocked(
       watchUnknownTicks,
       // PR 7 (§v6): the WATCH SUPERVISOR. Each agent wakes through its own `relay watch --until-wake`
       // (zero doorbell tokens); the doorbell only boards a missing, hung or ineffective watch.
-      ...(opts.watchFit === false ? {} : { watchFit: opts.watchFit ?? ((name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding) => superviseWatch(dbPath, name, read, w, nowWall, args.horizonMs)) }),
+      ...(opts.watchFit === false ? {} : { watchFit: opts.watchFit ?? ((name: string, read: PendingRead, w: import("./doorbell-core.js").CandidateBinding) => superviseWatch(dbPath, name, read, w, nowWall, args.horizonMs, opts.processStart)) }),
       ...(opts.actuator ? { actuator: opts.actuator } : {}),
       windowMs: args.windowMs,
       budgetPerHour: args.budgetPerHour,

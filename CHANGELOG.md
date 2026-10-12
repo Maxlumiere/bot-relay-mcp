@@ -21,6 +21,11 @@ A running `relay watch AGENT --until-wake` checks that its window is still open 
 - **`--lock-status` and `relay pending --watch-status` say `unknown`** in that case, instead of `no_window`. The Stop hook does not treat `unknown` as a missing watch.
 - **The doorbell job** no longer reports such a watch as missing (`no_driver`). After 5 checks in a row where it cannot be observed, it records its own case, `cannot_observe` (`why`: `watch`), which closes once the watch can be observed again. `relay doorbell status` counts dormant watches it cannot check separately (`dormant_watches_unknown`).
 - **The deploy gate's reasons are exact**: an unreadable start time is reported as unreadable, a process that ended as ended, and only a different start time as "a new process".
+- **Only "no such process" means a process ended.** Any other error from the system's process check now means "cannot tell". Deleting old connector records, ending a session after a signal, and `relay release-binding` all need the definite answer, and do nothing without it.
+- **Output from `ps` that is not a start time** (for example `-`, or a cut-off line) counts as unreadable, not as a different process. A watch whose process list is incomplete refuses with `cannot_judge`.
+- **`relay fleet --connectors` shows a connector it cannot check as `UNKNOWN`**, instead of leaving it out.
+- **A watch that cannot see its window for 2 hours says so.** A running watch that cannot read its window's start time for 2 hours of checks goes dormant. Its record names the window, `relay doctor` warns about it, and the doorbell job records `cannot_observe` (`why`: `anchor`). It is never treated as closed and never switched to another window. A dormant watch in the same situation is reported the same way. The report clears when the window can be read again. The 2 hours are counted in checks, which only run while the machine is awake; a busy machine can make the bound later, never earlier.
+- **The doorbell's count of dormant watches skips a record that is still being written**, so a watch is never counted twice.
 
 ### Security — a revoked agent can no longer send messages
 

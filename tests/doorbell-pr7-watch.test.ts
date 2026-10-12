@@ -184,7 +184,7 @@ describe("ownership (pure; ruling ffcaf608 D1): the window a watch descends from
     // the window process itself gone (its pid now runs another start) → window_gone: the watch EXITS (silently)
     expect(O.stillOwner({ pid: 100, start: "S100" }, [bnd("b1", 100, "S100")], "H", { ...sDeps, startNow: () => st("S-OTHER") }, new Set())).toEqual({ ok: false, why: "window_gone" });
     // Codex R2 (b): the SAME window under a migrated token (same binding, another spelling) is still the owner
-    expect(O.stillOwner({ pid: 100, start: "S100" }, [bnd("b1", 100, "legacy-spelling-of-S100")], "H", sDeps, new Set())).toEqual({ ok: true });
+    expect(O.stillOwner({ pid: 100, start: "S100" }, [bnd("b1", 100, "legacy-spelling-of-S100")], "H", sDeps, new Set())).toEqual({ ok: true, window: "same" });
   });
   it("stillOwner caches a DEAD verdict (dead is permanent for a pid + start) and re-reads every other one", () => {
     const calls: number[] = [];
@@ -305,6 +305,12 @@ fs.mkdirSync(SLOW_PS_DIR, { recursive: true });
 fs.writeFileSync(path.join(SLOW_PS_DIR, "ps"), `#!/bin/sh\nsleep 1\n[ -e ${sq(PS_STALL)} ] && sleep 3\nexec ${sq(REAL_PS)} "$@"\n`, { mode: 0o755 });
 const stallPs = (on: boolean) => (on ? fs.writeFileSync(PS_STALL, "") : fs.rmSync(PS_STALL, { force: true }));
 const SLOW_WATCH = (agent = "w-bob") => `PATH=${sq(SLOW_PS_DIR)}:"$PATH" ${WATCH(agent)}`;
+/** The same STALL flag without the base 1 s delay: reads are fast unless stalled (the bound tests count checks). */
+const STALL_PS_DIR = path.join(ROOT, "stall-ps");
+fs.mkdirSync(STALL_PS_DIR, { recursive: true });
+fs.writeFileSync(path.join(STALL_PS_DIR, "ps"), `#!/bin/sh\n[ -e ${sq(PS_STALL)} ] && sleep 3\nexec ${sq(REAL_PS)} "$@"\n`, { mode: 0o755 });
+/** A watch whose bound is 3 checks (1 s interval): `--anchor-unknown-bound-s 3`. A stalled check takes >= 4 s (two reads, each timing out at 2 s). */
+const BOUND_WATCH = (agent = "w-bob") => `PATH=${sq(STALL_PS_DIR)}:"$PATH" ${WATCH(agent)} --anchor-unknown-bound-s 3`;
 
 describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens; inside a bound window)", () => {
   const windows: TestWindow[] = [];
@@ -678,6 +684,79 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
       stallPs(false);
     }
   }, 60_000);
+
+  // --- BOUNDEDNESS (architect ruling a98ec836): a window unobservable for the whole bound is LOUD, never silent
+  it.skipIf(!REAL_PS)("HARM (BOUNDEDNESS, the PIN): its window unobservable for the WHOLE bound → the watch goes DORMANT with a cannot_observe(anchor) record (never window_gone, never re-anchored), alive; relay doctor names it; readable again → its record is no longer blind; the window closing still ends it", async () => {
+    const r = win.run(BOUND_WATCH());
+    await untilStatus("live");
+    const pid = await r.pid();
+    const { checkBlindWatches } = await import("../src/cli/doctor.js");
+    const blind = () => dormantRecords(winDir(win)).filter((x) => x.pid === pid && String(x.reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX));
+    try {
+      stallPs(true);
+      for (let i = 0; i < 400 && blind().length === 0; i++) await new Promise((res) => setTimeout(res, 100));
+      expect(blind(), r.err()).toHaveLength(1);
+      expect(String(blind()[0].reason)).toMatch(new RegExp(`^cannot_observe\\(anchor\\): its window \\(pid ${win.pid}, start [^)]+\\) could not be observed for 3 checks in a row \\(the bound\\)`));
+      expect(await within(r.exited, 1_000)).toBe("timeout"); // DORMANT, not exited
+      expect(alive(pid)).toBe(true);
+      expect(r.out()).toBe("");
+      const doc = await checkBlindWatches(DB);
+      expect(doc.status).toBe("WARN");
+      expect(doc.detail).toContain(`w-bob (watch pid ${pid}, since `);
+    } finally {
+      stallPs(false);
+    }
+    // Readable again: still dormant (its lock is released), but no longer blind; doctor clears.
+    for (let i = 0; i < 100 && blind().length > 0; i++) await new Promise((res) => setTimeout(res, 100));
+    expect(blind()).toEqual([]);
+    expect(dormantRecords(winDir(win)).some((x) => x.pid === pid)).toBe(true);
+    expect((await checkBlindWatches(DB)).status).toBe("PASS");
+    process.kill(win.pid, "SIGKILL");
+    expect(await within(r.exited, 15_000), r.err()).toBe(0);
+    expect(r.out()).toBe("");
+  }, 90_000);
+
+  it.skipIf(!REAL_PS)("HARM (BOUNDEDNESS, dormant): a watch ALREADY dormant (the lost race) that cannot observe its window for the bound becomes LOUD (its record rewritten cannot_observe(anchor)); readable again → quiet; it never exits on it", async () => {
+    win.run(WATCH());
+    await untilStatus("live");
+    const loser = win.run(BOUND_WATCH()); // its dormant ticks are 1 s apart: the bound is 3 ticks
+    const pid = await loser.pid();
+    const mine = () => dormantRecords(winDir(win)).filter((x) => x.pid === pid);
+    for (let i = 0; i < 100 && mine().length === 0; i++) await new Promise((res) => setTimeout(res, 100));
+    expect(String(mine()[0]?.reason), loser.err()).toMatch(/^already watched/);
+    try {
+      stallPs(true);
+      for (let i = 0; i < 300 && !String(mine()[0]?.reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX); i++) await new Promise((res) => setTimeout(res, 100));
+      expect(String(mine()[0]?.reason), loser.err()).toBe(`${W.ANCHOR_UNOBSERVED_PREFIX} already watched: a watch for this agent is already live in this window`);
+      expect(await within(loser.exited, 500)).toBe("timeout");
+    } finally {
+      stallPs(false);
+    }
+    for (let i = 0; i < 100 && String(mine()[0]?.reason).startsWith(W.ANCHOR_UNOBSERVED_PREFIX); i++) await new Promise((res) => setTimeout(res, 100));
+    expect(String(mine()[0]?.reason)).toBe("already watched: a watch for this agent is already live in this window");
+    expect(alive(pid)).toBe(true);
+  }, 90_000);
+
+  it.skipIf(!REAL_PS)("the TWIN (BOUNDEDNESS): two outages, each SHORTER than the bound, with a readable check between → the count resets, the watch never goes dormant, and it still wakes", async () => {
+    const r = win.run(BOUND_WATCH());
+    await untilStatus("live");
+    const pid = await r.pid();
+    try {
+      for (let round = 0; round < 2; round++) {
+        stallPs(true);
+        await new Promise((res) => setTimeout(res, 5_000)); // <= 2 stalled checks (each >= 4 s)
+        stallPs(false);
+        await new Promise((res) => setTimeout(res, 3_000)); // >= 1 readable check: the count resets
+      }
+    } finally {
+      stallPs(false);
+    }
+    expect(dormantRecords(winDir(win)).filter((x) => x.pid === pid), r.err()).toEqual([]); // without the reset: 4 unknown checks >= the bound of 3
+    expect(alive(pid)).toBe(true);
+    send();
+    expect(await within(r.exited, 20_000), r.err()).toBe(0);
+    expect(r.out()).toMatch(/^relay mail pending for w-bob: 1 new message\(s\)/);
+  }, 90_000);
 
   // INV-LIVE-01 plan P1 (TAKEOVER class): the reader's awake clock UNREADABLE → no takeover. Bar: an aged
   // holder reads stale with the clock and live without it. (The `awakeNow === null` clause is belt: JS

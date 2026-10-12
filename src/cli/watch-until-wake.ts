@@ -50,6 +50,17 @@ export const HEARTBEAT_EVERY_MS = 60_000;
 export const FALLBACK_POLL_MS = 3_000;
 /** How often a DORMANT watch re-checks its window (ruling 9becb599: once a minute). */
 export const DORMANT_CHECK_MS = 60_000;
+/**
+ * INV-LIVE-01 BOUNDEDNESS (architect ruling a98ec836, provisional): how long a RUNNING watch accepts its
+ * window being unobservable (every read unreadable, the kernel never saying gone) before it goes DORMANT,
+ * loudly (ANCHOR_UNOBSERVED_PREFIX). Counted in consecutive CHECKS (bound ÷ check interval): a check runs
+ * on a timer, so it only ticks while the host is awake, and a timer that fires late under load makes
+ * the bound LONGER in wall time, never shorter: the bound can be late, never early. Any readable check
+ * resets the count.
+ */
+export const ANCHOR_UNKNOWN_BOUND_MS = 2 * 60 * 60 * 1000;
+/** The consecutive-unknown count after one more read of the window: +1 on unknown, and ANY readable read resets it. */
+export const nextAnchorUnknownCount = (prev: number, read: "same" | "unknown"): number => (read === "unknown" ? prev + 1 : 0);
 /** Generation takeovers attempted in one arming before going dormant as "already watched". */
 export const MAX_TAKEOVER_ROUNDS = 3;
 
@@ -195,20 +206,27 @@ export function captureBirthStart(pid: number, read: StartReader): string | null
 }
 
 /**
- * Is a dormant watch's anchor GONE, by kernel fact only? The launching shell: we were reparented
+ * A dormant watch's anchor, by kernel fact only. GONE: the launching shell, when we were reparented
  * (POSIX: our ppid is no longer it), or ESRCH, or its pid holds another start (only when one was
- * captured at birth). The window: ESRCH, or another start on its pid. An unreadable start is never gone.
+ * captured at birth); the window, on ESRCH or another start on its pid. UNKNOWN: the window's start
+ * cannot be read (never gone). The launching shell is never unknown: while it is still our parent it
+ * is alive (a parent's death reparents us), so the reparent rule bounds it.
  */
-export function anchorGone(anchor: DormantAnchor, read: StartReader, ppid: number = process.ppid): boolean {
-  if (anchor.parent && ppid !== anchor.pid) return true;
+export function dormantAnchorState(anchor: DormantAnchor, read: StartReader, ppid: number = process.ppid): "same" | "gone" | "unknown" {
+  if (anchor.parent && ppid !== anchor.pid) return "gone";
   const r = read(anchor.pid);
-  if (r.kind === "gone") return true;
-  return r.kind === "start" && anchor.start !== null && r.start !== anchor.start;
+  if (r.kind === "gone") return "gone";
+  if (r.kind === "unreadable") return anchor.parent ? "same" : "unknown";
+  return anchor.start !== null && r.start !== anchor.start ? "gone" : "same";
 }
+/** Is a dormant watch's anchor GONE (dormantAnchorState)? An unreadable start is never gone. */
+export const anchorGone = (anchor: DormantAnchor, read: StartReader, ppid: number = process.ppid): boolean => dormantAnchorState(anchor, read, ppid) === "gone";
 
-export async function runUntilWake(agent: string, opts: { intervalMs?: number; dormantCheckMs?: number; now?: () => number } = {}): Promise<number> {
+export async function runUntilWake(agent: string, opts: { intervalMs?: number; dormantCheckMs?: number; anchorUnknownBoundMs?: number; now?: () => number } = {}): Promise<number> {
   const now = opts.now ?? (() => Date.now());
   const intervalMs = opts.intervalMs ?? FALLBACK_POLL_MS;
+  const anchorUnknownBoundMs = opts.anchorUnknownBoundMs ?? ANCHOR_UNKNOWN_BOUND_MS;
+  const anchorBoundChecks = Math.max(1, Math.ceil(anchorUnknownBoundMs / intervalMs));
   const dormantCheckMs = opts.dormantCheckMs ?? DORMANT_CHECK_MS;
   const say = (line: string) => process.stderr.write(`${line}\n`);
   const L = await import("../liveness.js");
@@ -224,22 +242,26 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   // DORMANCY (ruling 9becb599). `anchor` is the window when known, else the process that started us.
   // Zero CPU: one timer per check. Exits SILENTLY once the anchor is gone; a signal exits with a line.
   let dormantFile: string | null = null;
-  const dormant = async (reason: string, anchor: DormantAnchor | import("../watch-owner.js").OwnedWindow, recordDir: string | null): Promise<number> => {
-    say(`[sentinel] relay watch for ${agent} is DORMANT (${reason}): it will not wake anyone; it ends when its window does.`);
-    if (recordDir) {
+  // `blind`: the record carries ANCHOR_UNOBSERVED_PREFIX (the window could not be observed for the bound).
+  const dormant = async (reason: string, anchor: DormantAnchor | import("../watch-owner.js").OwnedWindow, recordDir: string | null, blindAtStart = false): Promise<number> => {
+    say(`[sentinel] relay watch for ${agent} is DORMANT (${blindAtStart ? `${W.ANCHOR_UNOBSERVED_PREFIX} ` : ""}${reason}): it will not wake anyone; it ends when its window does.`);
+    const record = (blind: boolean): void => {
+      if (!recordDir) return;
       try {
         // The chain may be gone (the lock-lost case): recreate it privately, component by component.
-        const { ensurePrivateDir } = await import("../doorbell-log.js");
         const root = path.join(path.dirname(process.env.RELAY_DB_PATH as string), "watch");
         const rel = path.relative(root, recordDir).split(path.sep).filter(Boolean);
         let cur = root;
-        ensurePrivateDir(cur);
-        for (const part of rel) ensurePrivateDir((cur = path.join(cur, part)));
-        dormantFile = W.writeDormant(recordDir, { pid: me.pid, proc_start: me.proc_start, reason, at: new Date(now()).toISOString() });
+        ensurePrivate(cur);
+        for (const part of rel) ensurePrivate((cur = path.join(cur, part)));
+        // The same name (pid + start) each time: a rewrite REPLACES the record atomically.
+        dormantFile = W.writeDormant(recordDir, { pid: me.pid, proc_start: me.proc_start, reason: blind ? `${W.ANCHOR_UNOBSERVED_PREFIX} ${reason}` : reason, at: new Date(now()).toISOString() });
       } catch (err) {
         say(`[sentinel] DEGRADED: the dormant record for ${agent} could not be written (${err instanceof Error ? err.message : String(err)})`);
       }
-    }
+    };
+    const { ensurePrivateDir: ensurePrivate } = await import("../doorbell-log.js");
+    record(blindAtStart);
     return await new Promise<number>((resolve) => {
       let done = false;
       const end = (code: number, line?: string) => {
@@ -251,9 +273,19 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
       };
       process.once("SIGTERM", () => end(0, `no-mail: stopped (signal) while dormant: ${reason}`));
       process.once("SIGINT", () => end(0, `no-mail: stopped (signal) while dormant: ${reason}`));
+      // BOUNDEDNESS (ruling a98ec836): a dormant watch blind to its window is made LOUD after the same
+      // bound (its record rewritten with ANCHOR_UNOBSERVED_PREFIX), and quiet again once it can see it.
+      // It stays dormant either way: an unobservable window is never "gone".
+      const dormantBound = Math.max(1, Math.ceil(anchorUnknownBoundMs / dormantCheckMs));
+      let unknownTicks = blindAtStart ? dormantBound : 0;
+      let blind = blindAtStart;
       const tick = () => {
         if (done) return;
-        if (anchorGone(anchor, L.processStartedAt)) return end(0); // (b) the window is gone: SILENT (no session left to notify)
+        const st = dormantAnchorState(anchor, L.processStartedAt);
+        if (st === "gone") return end(0); // (b) the window is gone: SILENT (no session left to notify)
+        unknownTicks = nextAnchorUnknownCount(unknownTicks, st);
+        if (!blind && unknownTicks >= dormantBound) record((blind = true));
+        else if (blind && unknownTicks === 0) record((blind = false));
         setTimeout(tick, dormantCheckMs);
       };
       setTimeout(tick, dormantCheckMs);
@@ -352,10 +384,11 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   let lastBeat = now();
   let degraded = false;
   const deadCache = new Set<string>();
+  let anchorUnknownChecks = 0; // consecutive checks whose window read was unknown (reset by any readable one)
 
   // The RUNNING watch. Its outcome: a wake line (exit), the window gone (silent exit), a signal (exit),
   // or a reason to go dormant.
-  type Outcome = { kind: "exit"; code: number; line?: string } | { kind: "dormant"; reason: string };
+  type Outcome = { kind: "exit"; code: number; line?: string } | { kind: "dormant"; reason: string; blind?: boolean };
   const outcome = await new Promise<Outcome>((resolve) => {
     let settled = false;
     let timer: NodeJS.Timeout | null = null;
@@ -410,6 +443,13 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
           const why = (own as { why: import("../watch-owner.js").OwnerRefusal | "window_gone" }).why;
           if (why === "window_gone") settle({ kind: "exit", code: 0 }); // (b): silent
           else settle({ kind: "dormant", reason: `binding moved (${why}): ${O.REFUSAL_TEXT[why]}` });
+          return;
+        }
+        // BOUNDEDNESS (ruling a98ec836): a window unobservable for the whole bound ends the RUNNING watch
+        // loudly (dormant, named), never as window_gone and never by re-anchoring. A readable read resets.
+        anchorUnknownChecks = nextAnchorUnknownCount(anchorUnknownChecks, own.window);
+        if (anchorUnknownChecks >= anchorBoundChecks) {
+          settle({ kind: "dormant", blind: true, reason: `its window (pid ${window.pid}, start ${window.start}) could not be observed for ${anchorUnknownChecks} checks in a row (the bound): it is not judged gone and is never re-anchored` });
           return;
         }
         if (t - lastBeat >= HEARTBEAT_EVERY_MS) {
@@ -470,7 +510,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
     if (outcome.line) emitLine(outcome.line);
     return outcome.code;
   }
-  return dormant(outcome.reason, window, dir);
+  return dormant(outcome.reason, window, dir, outcome.blind === true);
 }
 
 export async function runLockStatus(agent: string): Promise<number> {
