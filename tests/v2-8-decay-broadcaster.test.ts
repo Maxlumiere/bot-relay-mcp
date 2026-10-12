@@ -87,6 +87,7 @@ beforeEach(() => {
     getAgents: () => agents,
     broadcast: (e) => {
       broadcasts.push(e);
+      return "sent";
     },
     scheduler,
     tickIntervalMs: 30_000,
@@ -271,7 +272,7 @@ describe("v2.8 — DashboardStateBroadcaster — lifecycle", () => {
       () =>
         new DashboardStateBroadcaster({
           getAgents: () => [],
-          broadcast: () => {},
+          broadcast: () => "sent",
           tickIntervalMs: 0,
           scheduler,
           now: clock.now,

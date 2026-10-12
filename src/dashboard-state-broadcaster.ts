@@ -35,7 +35,7 @@ import {
   type AgentStateThresholds,
   type DashboardAgentState,
 } from "./agent-state-machine.js";
-import type { DashboardEvent } from "./transport/websocket.js";
+import type { DashboardBroadcastResult, DashboardEvent } from "./transport/websocket.js";
 
 /**
  * Per-agent snapshot the broadcaster needs to derive state. Sourced
@@ -51,7 +51,7 @@ export interface BroadcasterAgentSnapshot {
 }
 
 export type AgentSnapshotsProvider = () => BroadcasterAgentSnapshot[];
-export type BroadcastFn = (evt: DashboardEvent) => void;
+export type BroadcastFn = (evt: DashboardEvent) => DashboardBroadcastResult;
 
 export interface BroadcasterDeps {
   /** Snapshot provider — typically reads from `agents` table + pending-message counts. */
@@ -181,18 +181,24 @@ export class DashboardStateBroadcaster {
         // dashboard wire quiet during steady-state.
         continue;
       }
-      this.lastBroadcastedState.set(snap.name, next);
+      // LEVEL-TRIGGERED: the state is recorded as broadcast only once it was DELIVERED (sent, or no client was
+      // connected: nothing on any screen to go stale). A rate-limited or failed send leaves it unrecorded, so the
+      // next tick sends the CURRENT state again (latest wins, at most one limiter window late), never lost. Before,
+      // it was recorded first, and a transition the limiter dropped was never re-sent: the dashboard kept the old
+      // state (the `waiting` frame RT2 missed on macOS CI is one shape this produced).
+      let result: DashboardBroadcastResult;
       try {
-        this.deps.broadcast({
+        result = this.deps.broadcast({
           event: "agent.status_changed",
           entity_id: snap.name,
           ts: new Date(now).toISOString(),
           kind: next,
         });
       } catch {
-        // broadcast() is already swallow-and-log via broadcastDashboardEvent;
-        // this catch is a defense-in-depth no-op for fake sinks that throw.
+        // broadcast() is already swallow-and-log via broadcastDashboardEvent; a fake sink that throws is undelivered.
+        result = "error";
       }
+      if (result === "sent" || result === "no_clients") this.lastBroadcastedState.set(snap.name, next);
     }
   }
 

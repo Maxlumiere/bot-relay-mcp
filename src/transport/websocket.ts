@@ -64,6 +64,18 @@ import {
  * introduce a new `DashboardPayloadEvent` shape alongside this one so
  * the metadata-only contract never regresses silently.
  */
+/**
+ * What broadcastDashboardEvent did with an event, so no caller can confuse "nobody was listening" with "dropped":
+ *   sent          at least one connected client was handed the frame
+ *   rate_limited  dropped by the per-(event, entity) 500 ms limiter: NOTHING was sent (counted, see rateLimitedDrops)
+ *   no_clients    accepted, but no client is connected (a client that connects later loads /api/snapshot)
+ *   error         nothing was delivered (every send failed, or the broadcast itself threw)
+ * A STATE broadcaster must treat only `sent` / `no_clients` as delivered and send the latest state again otherwise
+ * (dashboard-state-broadcaster.ts). EDGE callers ("something changed, refetch") are healed by the dashboard's own
+ * /api/snapshot refetch-on-push and 10 s poll; each drop is counted and shown in /api/snapshot.
+ */
+export type DashboardBroadcastResult = "sent" | "rate_limited" | "no_clients" | "error";
+
 export interface DashboardEvent {
   /** High-level event name broadcast to dashboard clients. Stable wire format. */
   event:
@@ -100,6 +112,13 @@ const clients: Set<WebSocket> = new Set();
 
 /** Rate-limit map: (event:entity_id) → last-broadcast epoch ms. */
 const lastBroadcastAt = new Map<string, number>();
+/** Events the limiter dropped, per event name, since start: never silent (shown in /api/snapshot). */
+const rateLimitedDrops = new Map<string, number>();
+
+/** How many events the rate limiter dropped, per event name, since this process started. */
+export function dashboardRateLimitedDrops(): Record<string, number> {
+  return Object.fromEntries(rateLimitedDrops);
+}
 const BROADCAST_MIN_INTERVAL_MS = 500;
 
 /** Constant-time string compare for shared secrets. */
@@ -289,13 +308,14 @@ export function attachDashboardWs(server: HttpServer): void {
  * NEVER throws. Event sources are callbacks from hot paths (send_message,
  * update_task, etc.); a broadcast failure must not escape to the caller.
  */
-export function broadcastDashboardEvent(evt: DashboardEvent): void {
+export function broadcastDashboardEvent(evt: DashboardEvent): DashboardBroadcastResult {
   try {
     const key = `${evt.event}:${evt.entity_id}`;
     const now = Date.now();
     const last = lastBroadcastAt.get(key);
     if (last !== undefined && now - last < BROADCAST_MIN_INTERVAL_MS) {
-      return;
+      rateLimitedDrops.set(evt.event, (rateLimitedDrops.get(evt.event) ?? 0) + 1);
+      return "rate_limited";
     }
     lastBroadcastAt.set(key, now);
 
@@ -306,20 +326,24 @@ export function broadcastDashboardEvent(evt: DashboardEvent): void {
       }
     }
 
-    if (clients.size === 0) return; // nothing to fan out to
+    if (clients.size === 0) return "no_clients"; // nothing to fan out to
     const line = JSON.stringify(evt);
+    let delivered = 0;
     for (const ws of clients) {
       try {
         ws.send(line);
+        delivered++;
       } catch {
         // Per-client send failure removes the client; next upgrade reconnects.
         clients.delete(ws);
       }
     }
+    return delivered > 0 ? "sent" : "error";
   } catch (err) {
     log.warn(
       `[dashboard-ws] broadcast error (swallowed): ${err instanceof Error ? err.message : String(err)}`
     );
+    return "error";
   }
 }
 
@@ -334,6 +358,7 @@ export function _resetDashboardWsForTests(): void {
   }
   clients.clear();
   lastBroadcastAt.clear();
+  rateLimitedDrops.clear();
   if (wss) {
     try {
       wss.close();
