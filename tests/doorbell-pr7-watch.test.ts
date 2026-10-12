@@ -470,13 +470,43 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     ambiguous_binding: "binding moved (ambiguous_binding): the agent has two or more windows not proven closed (never guessed)",
   } as const;
   const dormantOf = (dir: string, pid: number) => dormantRecords(dir).find((x) => x.pid === pid);
-  async function untilDormant(dir: string, pid: number): Promise<void> {
-    for (let i = 0; i < 100 && !dormantOf(dir, pid); i++) await new Promise((res) => setTimeout(res, 100));
+  /** A's dormant record, once it exists; THROWS after 10 s (a timeout must never let a scenario cross its barrier). */
+  async function untilDormant(dir: string, pid: number): Promise<{ reason?: unknown }> {
+    for (let i = 0; i < 100; i++) {
+      const r = dormantOf(dir, pid);
+      if (r) return r;
+      await new Promise((res) => setTimeout(res, 100));
+    }
+    throw new Error(`no dormant record for pid ${pid} in ${dir} after 10 s`);
   }
+  /**
+   * A process's identity for signalling (Codex R2 P2 on #331): its start token, parent pid and command. Captured
+   * when the watch starts, verified again right before each signal; a mismatch (the pid reused) refuses.
+   * RESIDUAL (stated): a check-to-signal race remains, microseconds wide; a parent-controlled signalling
+   * mechanism (no reaping during the operation) is out of scope for a test fix.
+   */
+  const identityOf = (pid: number): string => {
+    const r = spawnSync("ps", ["-o", "ppid=,comm=", "-p", String(pid)], { encoding: "utf-8" });
+    return `${processStartedAt(pid) ?? "(no start)"} | ${r.stdout.trim().replace(/\s+/g, " ")}`;
+  };
+  const stateOf = (pid: number): string => spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf-8" }).stdout.trim();
+  async function pollUntil(cond: () => boolean, ms: number): Promise<boolean> {
+    for (const t0 = Date.now(); Date.now() - t0 < ms; ) {
+      if (cond()) return true;
+      await new Promise((res) => setTimeout(res, 20));
+    }
+    return cond();
+  }
+  /** Signal the RECORDED watch pid only after re-verifying it is the same process (pid > 1, identity unchanged). */
+  const signalVerified = (pid: number, identity: string, sig: NodeJS.Signals): void => {
+    expect(pid).toBeGreaterThan(1); // a single process, never a group
+    const now = identityOf(pid);
+    if (now !== identity) throw new Error(`refusing to send ${sig} to pid ${pid}: it is not the watch any more (was "${identity}", now "${now}")`);
+    process.kill(pid, sig);
+  };
   /** The contract after A's dormancy: A's exact reason, A alive and never woken, B arms and wakes for the mail. */
   async function rebindContract(a: import("./helpers/watch-window.js").WindowRun, aPid: number, aDir: string, winB: TestWindow, reason: string): Promise<void> {
-    await untilDormant(aDir, aPid);
-    expect(dormantOf(aDir, aPid)?.reason, a.err()).toBe(reason);
+    expect((await untilDormant(aDir, aPid)).reason, a.err()).toBe(reason);
     expect(alive(aPid)).toBe(true);
     const b = winB.runRelayWatch(WATCH());
     await untilStatus("live");
@@ -494,7 +524,8 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const aPid = await a.pid();
     const winB = openWin(null); // the slow window-open first, unbound
     rebindAway(win); // commit 1: w-bob has NO current binding now
-    await untilDormant(aDir, aPid); // A's check runs here, between the commits
+    const seen = await untilDormant(aDir, aPid); // A's check runs here, between the commits (or this throws)
+    expect(seen.reason, a.err()).toBe(MOVED.no_live_window); // OBSERVED before commit 2
     bind("w-bob", winB); // commit 2
     await rebindContract(a, aPid, aDir, winB, MOVED.no_live_window);
   }, 60_000);
@@ -505,16 +536,21 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const aDir = winDir(win);
     const aPid = await a.pid();
     expect(aPid).toBeGreaterThan(1); // a RECORDED pid, never a group: signalled below
+    const aId = identityOf(aPid); // captured while the watch is known to run (it is live)
     const winB = openWin(null); // the slow window-open first, unbound
-    // A's checks are held for the few ms of the two commits (well inside ps's 2 s timeout), so its next
-    // check sees both. SIGSTOP/SIGCONT only this test's own watch process.
-    process.kill(aPid, "SIGSTOP");
+    // A's checks are held for the two commits, so its next check sees both. SIGSTOP/SIGCONT only this test's
+    // own watch process, identity-verified. BARRIER (Codex R2 P2): no write before ps reports A STOPPED.
+    signalVerified(aPid, aId, "SIGSTOP");
     try {
+      if (!(await pollUntil(() => stateOf(aPid).startsWith("T"), 2_000))) {
+        throw new Error(`pid ${aPid} never reported stopped (ps stat "${stateOf(aPid)}"): no write was made`);
+      }
       rebindAway(win); // commit 1
       bind("w-bob", winB); // commit 2
     } finally {
-      process.kill(aPid, "SIGCONT");
+      signalVerified(aPid, aId, "SIGCONT");
     }
+    expect(await pollUntil(() => !stateOf(aPid).startsWith("T"), 2_000), `pid ${aPid} still stopped after SIGCONT`).toBe(true);
     await rebindContract(a, aPid, aDir, winB, MOVED.not_this_window);
   }, 60_000);
 
@@ -525,7 +561,8 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const aPid = await a.pid();
     const winB = openWin(null);
     bind("w-bob", winB); // commit 1: two windows for w-bob, neither proven closed
-    await untilDormant(aDir, aPid); // A's check runs here
+    const seen = await untilDormant(aDir, aPid); // A's check runs here (or this throws)
+    expect(seen.reason, a.err()).toBe(MOVED.ambiguous_binding); // OBSERVED before commit 2
     rebindAway(win); // commit 2: B is now w-bob's one live window
     await rebindContract(a, aPid, aDir, winB, MOVED.ambiguous_binding);
   }, 60_000);
