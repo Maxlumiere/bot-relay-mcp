@@ -456,23 +456,27 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     await expectDormantThenSilentExit(r, win, /^binding moved \(ambiguous_binding\)/, winDir(win));
   }, 60_000);
 
-  it("HARM (Codex R1 #1): the agent REBINDS to window B while A's watch runs → A goes DORMANT; B arms its OWN watch (never blocked by A's) and B's mail wakes B", async () => {
-    const a = win.runRelayWatch(WATCH());
-    await untilStatus("live");
-    const aDir = winDir(win);
-    // THE REBIND, atomic (flake d, macOS CI 114774541424 + 114793812414): window B is opened FIRST, unbound; then
-    // A's binding is superseded AND B's written in ONE transaction. The old order (supersede, then open B, then bind B)
-    // left a gap with NO current binding, and a check landing in it read "no_live_window", not "not_this_window".
-    // The pause is the slow window-open CI has, kept on purpose: here A is still bound, so it cannot open a gap.
-    const winB = openWin(null);
-    await new Promise((res) => setTimeout(res, 1_500));
-    db.getDb().transaction(() => {
-      db.getDb().prepare("UPDATE agent_bindings SET superseded_at = ? WHERE window_pid = ?").run(new Date().toISOString(), win.pid);
-      bind("w-bob", winB);
-    })();
-    const aPid = await a.pid();
-    for (let i = 0; i < 100 && !dormantRecords(aDir).some((x) => x.pid === aPid); i++) await new Promise((res) => setTimeout(res, 100));
-    expect(dormantRecords(aDir).find((x) => x.pid === aPid)?.reason).toMatch(/^binding moved \(not_this_window\)/);
+  // --- THE REBIND (Codex R1 #1 on #313; flake d; architect ruling 0d16ef24): production rebinds in TWO separate
+  // commits, one per window (relay bind upserts only its own window), so A's watch can observe any of three
+  // intermediate states. Each is TRUE at the instant A reads it, and each is made DETERMINISTIC here by
+  // controlling when A's check runs. THE CONTRACT, in every order: A goes DORMANT (the exact reason for that
+  // order), A never wakes for mail now owned by B, and B arms its own watch and wakes. No grace window.
+  /** Production's rebind of window `w` AWAY from w-bob: its OWN upsert (one commit), a new conversation, no agent. */
+  const rebindAway = (w: { pid: number }) =>
+    db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: w.pid, windowPidStart: processStartedAt(w.pid) as string, agentName: null, agentClass: null, conversationId: `conv-${w.pid}-next`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });
+  const MOVED = {
+    no_live_window: "binding moved (no_live_window): the agent has no live bound window",
+    not_this_window: "binding moved (not_this_window): the agent's live window is another one (this one is not the agent's current window)",
+    ambiguous_binding: "binding moved (ambiguous_binding): the agent has two or more windows not proven closed (never guessed)",
+  } as const;
+  const dormantOf = (dir: string, pid: number) => dormantRecords(dir).find((x) => x.pid === pid);
+  async function untilDormant(dir: string, pid: number): Promise<void> {
+    for (let i = 0; i < 100 && !dormantOf(dir, pid); i++) await new Promise((res) => setTimeout(res, 100));
+  }
+  /** The contract after A's dormancy: A's exact reason, A alive and never woken, B arms and wakes for the mail. */
+  async function rebindContract(a: import("./helpers/watch-window.js").WindowRun, aPid: number, aDir: string, winB: TestWindow, reason: string): Promise<void> {
+    await untilDormant(aDir, aPid);
+    expect(dormantOf(aDir, aPid)?.reason, a.err()).toBe(reason);
     expect(alive(aPid)).toBe(true);
     const b = winB.runRelayWatch(WATCH());
     await untilStatus("live");
@@ -480,6 +484,50 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     expect(await within(b.exited, 20_000), b.err()).toBe(0);
     expect(b.out()).toMatch(/^relay mail pending for w-bob: 1 new message/);
     expect(await within(a.exited, 1_000)).toBe("timeout"); // A never woke for B's mail: still dormant
+    expect(a.out()).toBe("");
+  }
+
+  it("HARM (rebind, order a): A rebinds away, A's check runs BETWEEN the two commits, then B binds → A dormant with exactly no_live_window; A never wakes for B's mail; B arms and wakes", async () => {
+    const a = win.runRelayWatch(WATCH());
+    await untilStatus("live");
+    const aDir = winDir(win);
+    const aPid = await a.pid();
+    const winB = openWin(null); // the slow window-open first, unbound
+    rebindAway(win); // commit 1: w-bob has NO current binding now
+    await untilDormant(aDir, aPid); // A's check runs here, between the commits
+    bind("w-bob", winB); // commit 2
+    await rebindContract(a, aPid, aDir, winB, MOVED.no_live_window);
+  }, 60_000);
+
+  it("HARM (rebind, order b): A rebinds away and B binds, A's check runs only AFTER both commits → A dormant with exactly not_this_window; A never wakes for B's mail; B arms and wakes", async () => {
+    const a = win.runRelayWatch(WATCH());
+    await untilStatus("live");
+    const aDir = winDir(win);
+    const aPid = await a.pid();
+    expect(aPid).toBeGreaterThan(1); // a RECORDED pid, never a group: signalled below
+    const winB = openWin(null); // the slow window-open first, unbound
+    // A's checks are held for the few ms of the two commits (well inside ps's 2 s timeout), so its next
+    // check sees both. SIGSTOP/SIGCONT only this test's own watch process.
+    process.kill(aPid, "SIGSTOP");
+    try {
+      rebindAway(win); // commit 1
+      bind("w-bob", winB); // commit 2
+    } finally {
+      process.kill(aPid, "SIGCONT");
+    }
+    await rebindContract(a, aPid, aDir, winB, MOVED.not_this_window);
+  }, 60_000);
+
+  it("HARM (rebind, order c): B binds while A is STILL w-bob, A's check runs then, then A rebinds away → A dormant with exactly ambiguous_binding; A never wakes for B's mail; B arms and wakes", async () => {
+    const a = win.runRelayWatch(WATCH());
+    await untilStatus("live");
+    const aDir = winDir(win);
+    const aPid = await a.pid();
+    const winB = openWin(null);
+    bind("w-bob", winB); // commit 1: two windows for w-bob, neither proven closed
+    await untilDormant(aDir, aPid); // A's check runs here
+    rebindAway(win); // commit 2: B is now w-bob's one live window
+    await rebindContract(a, aPid, aDir, winB, MOVED.ambiguous_binding);
   }, 60_000);
 
   it("HARM (Codex R2 (b)): the binding's start token is MIGRATED to the legacy form under the same binding → the SAME watch stays the owner and the status still sees it (no second watch)", async () => {
