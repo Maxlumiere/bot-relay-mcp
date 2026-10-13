@@ -151,7 +151,9 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
       "src/good-execpath.ts": 'import { spawn } from "child_process"; export function g() { spawn(process.execPath, ["x.js"]); }',
       "src/not-cp.ts": 'function spawnSync(x: string) { return x; } export function h() { spawnSync("whoami"); }',
     });
-    const sites = subprocessSites(program, (f) => f.replace(/^\/virtual\//, ""), (f) => f.startsWith("src/"));
+    // Virtual file names are path.join("/virtual", f): backslashes and a drive on Windows (seen RED there), so normalize.
+    const virtualRel = (f: string) => f.replace(/\\/g, "/").replace(/^(?:[A-Za-z]:)?\/virtual\//, "");
+    const sites = subprocessSites(program, virtualRel, (f) => f.startsWith("src/"));
     const by = (file: string) => sites.filter((s) => s.key.startsWith(`src/${file}::`)).map((s) => s.program);
     for (const bad of ["bad-literal.ts", "bad-alias.ts", "bad-namespace.ts", "bad-variable.ts", "bad-shell.ts"]) expect(by(bad), bad).toEqual(["other"]);
     expect(by("good-system.ts")).toEqual(["systemBinary"]);
