@@ -34,7 +34,7 @@
  * Stateless across daemon restart: no server-side session store. Clients
  * reconnect on their own (spec §Phase 2: exponential backoff on the client).
  */
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 import { timingSafeEqual } from "crypto";
 import type { IncomingMessage, Server as HttpServer } from "http";
 import { loadConfig, resolveDashboardSecret } from "../config.js";
@@ -66,10 +66,13 @@ import {
  */
 /**
  * What broadcastDashboardEvent did with an event, so no caller can confuse "nobody was listening" with "dropped":
- *   sent          at least one connected client was handed the frame
+ *   sent          at least one OPEN client was handed the frame
  *   rate_limited  dropped by the per-(event, entity) 500 ms limiter: NOTHING was sent (counted, see rateLimitedDrops)
- *   no_clients    accepted, but no client is connected (a client that connects later loads /api/snapshot)
- *   error         nothing was delivered (every send failed, or the broadcast itself threw)
+ *   no_clients    accepted, but no OPEN client (a client that connects later loads /api/snapshot, and its connect
+ *                 bumps the subscriber generation, so a STATE broadcaster re-sends its current state)
+ *   error         nothing was delivered (every OPEN client's send threw, or the broadcast itself threw)
+ * A client whose send fails (at once, or later in its write callback) is TERMINATED and removed, never just forgotten:
+ * its page sees the close, reconnects, and that connect re-sends the current state (dashboardSubscriberGeneration).
  * A STATE broadcaster must treat only `sent` / `no_clients` as delivered and send the latest state again otherwise
  * (dashboard-state-broadcaster.ts). EDGE callers ("something changed, refetch") are healed by the dashboard's own
  * /api/snapshot refetch-on-push and 10 s poll; each drop is counted and shown in /api/snapshot.
@@ -109,6 +112,28 @@ export interface DashboardEvent {
  */
 let wss: WebSocketServer | null = null;
 const clients: Set<WebSocket> = new Set();
+/**
+ * Bumped on every client connect (a reconnect is a connect). A STATE broadcaster compares it between ticks: a change
+ * means a screen may have loaded a snapshot the broadcaster never sent to, so its last-sent baseline is void and the
+ * next tick re-sends every current state. Monotonic for the life of the process (never reset, so it can never come
+ * back to a value a broadcaster already saw).
+ */
+let subscriberGeneration = 0;
+
+/** The current subscriber generation (see above). */
+export function dashboardSubscriberGeneration(): number {
+  return subscriberGeneration;
+}
+
+/** End a client whose send failed: removed AND terminated, so its page sees the close and reconnects. */
+function dropClient(ws: WebSocket): void {
+  clients.delete(ws);
+  try {
+    ws.terminate();
+  } catch {
+    /* already gone */
+  }
+}
 
 /** Rate-limit map: (event:entity_id) → last-broadcast epoch ms. */
 const lastBroadcastAt = new Map<string, number>();
@@ -203,6 +228,7 @@ export function attachDashboardWs(server: HttpServer): void {
   wss.on("connection", (ws: WebSocket) => {
     log.debug(`[dashboard-ws] client connected, total=${clients.size + 1}`);
     clients.add(ws);
+    subscriberGeneration++;
     ws.on("close", () => clients.delete(ws));
     ws.on("error", () => clients.delete(ws));
     // Send a hello so clients can confirm auth + subscribe-loop handshake.
@@ -326,18 +352,25 @@ export function broadcastDashboardEvent(evt: DashboardEvent): DashboardBroadcast
       }
     }
 
-    if (clients.size === 0) return "no_clients"; // nothing to fan out to
     const line = JSON.stringify(evt);
+    let open = 0;
     let delivered = 0;
     for (const ws of clients) {
+      // Only an OPEN socket can carry the frame: ws's send() on a CLOSING/CLOSED socket returns without throwing and
+      // without sending, so counting it would record a state no screen received. Its own close removes it.
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      open++;
       try {
-        ws.send(line);
+        // A write that fails AFTER send() returned reports here: end that client too (it reconnects, see dropClient).
+        ws.send(line, (err) => {
+          if (err) dropClient(ws);
+        });
         delivered++;
       } catch {
-        // Per-client send failure removes the client; next upgrade reconnects.
-        clients.delete(ws);
+        dropClient(ws);
       }
     }
+    if (open === 0) return "no_clients"; // nothing to fan out to
     return delivered > 0 ? "sent" : "error";
   } catch (err) {
     log.warn(
@@ -345,6 +378,11 @@ export function broadcastDashboardEvent(evt: DashboardEvent): DashboardBroadcast
     );
     return "error";
   }
+}
+
+/** Testing-only: register a stand-in client (a fake socket) so a test can drive OPEN / CLOSING / failing sends. */
+export function _addDashboardClientForTests(c: unknown): void {
+  clients.add(c as WebSocket);
 }
 
 /** Testing-only: clear module-scope state between runs. */

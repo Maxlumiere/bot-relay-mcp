@@ -57,10 +57,15 @@ describe("the WS test helper: a timed-out read never swallows the next frame", (
 
   it("one outstanding read: a second read while the first is pending is refused at once, and the first still gets the frame", async () => {
     const { client, peer } = await controlled();
-    const first = client.nextMessage(1000);
+    // The first read's outcome is captured AT ONCE (Codex #328 R2 P3): with a handler attached only after the next
+    // assertion, a failure there would leave `first` to time out UNHANDLED instead of failing this test.
+    const first = client.nextMessage(1000).then(
+      (frame) => ({ frame }),
+      (err: Error) => ({ error: err.message }),
+    );
     await expect(client.nextMessage(1000)).rejects.toThrow(/already pending/);
     peer.send("for-the-first");
-    await expect(first).resolves.toBe("for-the-first");
+    expect(await first).toEqual({ frame: "for-the-first" });
     client.ws.close();
   });
 });
