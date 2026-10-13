@@ -123,7 +123,7 @@ export function windowsOwnerInfo(path: string): string | null {
  */
 function runSystem(name: SystemBinaryName, args: string[], opts: SpawnSyncOptionsWithStringEncoding): SpawnSyncReturns<string> {
   try {
-    return spawnSync(systemBinary(name), args, opts);
+    return spawnSync(systemBinary(name), args, { ...opts, shell: false }); // never a shell: it would find programs by name
   } catch (err) {
     if (!(err instanceof SystemBinaryError)) throw err;
     return { pid: 0, output: [], stdout: "", stderr: err.message, status: null, signal: null, error: err };

@@ -41,6 +41,7 @@
  * extraction is unit-testable.
  */
 import { execFileSync } from "node:child_process";
+import { systemBinary, type SystemBinaryName } from "./system-binary.js";
 import { log } from "./logger.js";
 import { profileProcessPatternSource } from "./agent-cli-profiles.js";
 
@@ -121,17 +122,35 @@ export function startTokenEnv(base: NodeJS.ProcessEnv, form: StartTokenForm = "u
  */
 export type CommandRunner = (cmd: string, args: string[], opts?: { startTokenForm?: StartTokenForm }) => string;
 
+/**
+ * The POSIX tools this module runs BY NAME today (SEC-22's named POSIX follow-up: /bin/ps, /usr/sbin/ioreg, /bin/cat).
+ * A CLOSED set, checked at run time: any other command, or any command on Windows, is refused (""), so a Windows tool
+ * can never run through this path by name (Codex #336 R1 P1: `reg` did, hidden under a POSIX allowlist entry).
+ */
+const POSIX_BY_NAME = new Set(["ps", "ioreg", "cat"]);
+/** Windows tools, run ONLY by their trusted absolute System32 path (SEC-22, src/system-binary.ts). */
+const WINDOWS_TOOLS = new Set<SystemBinaryName>(["reg"]);
+
+const runPosixByName = (cmd: string, args: string[], opts?: { startTokenForm?: StartTokenForm }): string => {
+  if (process.platform === "win32" || !POSIX_BY_NAME.has(cmd)) return "";
+  // Every command runs under the start-token environment, so `ps -o lstart=` (here and in the process table) is the
+  // ONE spelling above. ioreg and cat read neither the locale nor the clock.
+  return execFileSync(cmd, args, {
+    encoding: "utf8",
+    timeout: 2000,
+    stdio: ["ignore", "pipe", "ignore"],
+    env: startTokenEnv(process.env, opts?.startTokenForm ?? "utc"),
+    shell: false,
+  });
+};
+
+const runWindowsTool = (cmd: SystemBinaryName, args: string[]): string =>
+  execFileSync(systemBinary(cmd), args, { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true, shell: false });
+
 const defaultRunner: CommandRunner = (cmd, args, opts) => {
   try {
-    // Every command runs under the start-token environment, so `ps -o lstart=`
-    // (here and in the process table) is the ONE spelling above. The other
-    // commands here (ioreg/cat/reg) read neither the locale nor the clock.
-    return execFileSync(cmd, args, {
-      encoding: "utf8",
-      timeout: 2000,
-      stdio: ["ignore", "pipe", "ignore"],
-      env: startTokenEnv(process.env, opts?.startTokenForm ?? "utc"),
-    });
+    // A Windows tool by its trusted path (a SystemBinaryError, like any failure, reads as "": the callers' safe default).
+    return WINDOWS_TOOLS.has(cmd as SystemBinaryName) ? runWindowsTool(cmd as SystemBinaryName, args) : runPosixByName(cmd, args, opts);
   } catch {
     return "";
   }

@@ -12,7 +12,7 @@
  * not read its own SID, so it refused its own registration secret (no new HTTP registration). A program found first on
  * PATH also decides what the privacy check believes (a planted `whoami` can report any SID).
  *
- * THE RULE: one map per OS, from a tool to its absolute path. Windows: %SystemRoot%\System32\{whoami,icacls}.exe and
+ * THE RULE: one map per OS, from a tool to its absolute path. Windows: %SystemRoot%\System32\{whoami,icacls,reg}.exe and
  * the Windows PowerShell 5.1 powershell.exe. SystemRoot is VALIDATED (drive-rooted, absolute; the exe there is a
  * regular file); otherwise this THROWS a named SystemBinaryError, never a silent fallback to PATH. Changing SystemRoot
  * is a same-user act (the stated same-user boundary). tests/sec-22-system-binaries.test.ts fails CI on a subprocess
@@ -36,6 +36,7 @@ export class SystemBinaryError extends Error {
 const WINDOWS_TOOLS = {
   whoami: ["System32", "whoami.exe"],
   icacls: ["System32", "icacls.exe"],
+  reg: ["System32", "reg.exe"],
   powershell: ["System32", "WindowsPowerShell", "v1.0", "powershell.exe"],
 } as const;
 
