@@ -25,6 +25,7 @@ import { spawn, spawnSync, execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders, mintSecretFor } from "./_helpers/mint.js";
+import { killRecordedPid } from "./_helpers/recorded-pid.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
@@ -185,11 +186,7 @@ describe("#286 R1 #1 — SessionStart is HEALTHY only after the mail read comple
       child.kill("SIGTERM");
       await exited;
       await new Promise((r) => setTimeout(r, 300));
-      try {
-        process.kill(Number(fs.readFileSync(marker, "utf-8").trim()), "SIGKILL");
-      } catch {
-        /* already gone */
-      }
+      killRecordedPid(marker); // the stalled child's RECORDED pid only: never 0 (the group) on an empty read
       const v = verdictOf(out);
       expect(v, out).not.toBeNull();
       expect(v, out).not.toBe("HEALTHY");
@@ -488,7 +485,7 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
       SHIM_MODE: "stall-child", SHIM_MARKER: marker, RELAY_PENDING_TIMEOUT_SECS: "2",
     }) });
     const took = Date.now() - t0;
-    try { process.kill(Number(fs.readFileSync(marker, "utf-8").trim()), "SIGKILL"); } catch { /* gone */ }
+    killRecordedPid(marker); // the stalled child's RECORDED pid only: never 0 (the group) on an empty read
     expect(took, "the deadline, not the 20s child, ends the read").toBeLessThan(9_000);
     expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*timed out/);
   }, 45_000);
