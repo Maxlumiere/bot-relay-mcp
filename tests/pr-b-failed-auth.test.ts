@@ -256,19 +256,39 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
     ticks++;
   }, 1);
   if (timer.unref) timer.unref();
-  return { gaps: (from, to) => gaps.filter((g) => g.to > from && g.from < to), ticks: () => ticks, stop: () => clearInterval(timer) };
+  // settled(to): resolves once a tick has landed at or after \`to\`, so every gap ending by then is RECORDED (a gap is
+  // only recorded by the tick that ends it, and an overdue tick can run AFTER a pending message is handled). Bounded
+  // in POLLS (each >= 1 ms of this thread running), so a host stop never spends the bound; exhausted: it rejects.
+  const settled = (to, maxPolls) =>
+    new Promise((resolve, reject) => {
+      let polls = 0;
+      const check = () => {
+        if (last >= to) return resolve();
+        if (++polls > maxPolls) return reject(new Error("the ticker never ticked at or after the requested end (" + maxPolls + " polls)"));
+        setTimeout(check, 1);
+      };
+      check();
+    });
+  return { gaps: (from, to) => gaps.filter((g) => g.to > from && g.from < to), ticks: () => ticks, lastTick: () => last, settled, stop: () => clearInterval(timer) };
 })`;
 interface Ticker {
   gaps: (from: number, to: number) => Gap[];
   ticks: () => number;
+  lastTick: () => number;
+  settled: (to: number, maxPolls: number) => Promise<void>;
   stop: () => void;
 }
+/** How many >= 1 ms polls a judging snapshot waits for its ticker to tick past the window's end: an INSTRUMENT FAULT beyond. */
+const SETTLE_POLLS = 2_000;
 const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, keep: number) => Ticker;
 const absNow = () => performance.timeOrigin + performance.now();
 
 const LOAD_WORKER = `
 const { parentPort, workerData } = require("worker_threads");
-const { port, n, kind, tool, args, ceilingMs, workerStallMs } = workerData;
+const { port, n, kind, tool, args, ceilingMs, workerStallMs, prepHostStallHelperPid } = workerData;
+// A LIVE-RED knob only (#332 R2 P2b): stop the WHOLE process right after the FIRST /health request is issued, BEFORE
+// the window opens. The helper (a recorded pid > 1, armed by the test) resumes it; the request then spans the stop.
+let prepStall = prepHostStallHelperPid > 1;
 const abs = () => performance.timeOrigin + performance.now();
 // The LOAD worker's own gaps: REPORTED ONLY. It is busy (the calls, its own GC), so its gaps never exempt a breach
 // (architect ruling on #332 R1 P1 #1): only the DEDICATED idle sentinel can.
@@ -286,7 +306,13 @@ const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
     while (!done) {
       const t = performance.now();
       const at = abs();
-      await fetch("http://127.0.0.1:" + port + "/health").then((r) => r.text());
+      const req = fetch("http://127.0.0.1:" + port + "/health").then((r) => r.text());
+      if (prepStall) {
+        prepStall = false;
+        process.kill(prepHostStallHelperPid, "SIGUSR2");
+        process.kill(process.pid, "SIGSTOP");
+      }
+      await req;
       const ms = performance.now() - t;
       healthMax = Math.max(healthMax, ms);
       if (ms >= ceilingMs) healthBreaches.push({ from: at, to: at + ms });
@@ -322,6 +348,8 @@ interface Load {
   args?: Record<string, unknown>;
   /** A LIVE-RED knob only: the LOAD worker busy this long as the window opens (a worker-only stall). */
   workerStallMs?: number;
+  /** A LIVE-RED knob only: the LOAD worker stops the whole process during PREPARATION; this armed helper resumes it. */
+  prepHostStallHelperPid?: number;
 }
 /**
  * The KNOWN-GOOD CONTROL (architect 10f7a172): the same N, the same transport and concurrency, admitted past
@@ -353,6 +381,10 @@ interface Reading {
   sentinelMax: number;
   /** The LOAD worker's own largest gap (ms): REPORTED ONLY, it never exempts a breach. */
   loadGapMax: number;
+  /** Why the sentinel stream is missing, when it is (its snapshot never settled): carried into the INSTRUMENT FAULT. */
+  sentinelFault?: string;
+  /** When the measured window opened (absolute ms); /health samples may start before it (see measureWindow). */
+  windowFrom: number;
   /**
    * The longest GC pause (ms) on the MAIN thread inside the window (flake f, Phase 0): REPORTED ONLY. The daemon
    * runs in the test's own isolate, so the harness's GC lands on the daemon's loop; this separates "a GC pause"
@@ -369,7 +401,7 @@ interface Reading {
  */
 /** The MAIN thread's ticker (the daemon's loop) and the DEDICATED sentinel worker: created once, never reset. */
 let mainTicker: Ticker | null = null;
-let sentinel: { worker: Worker; ask: (from: number, to: number) => Promise<Gap[]> } | null = null;
+let sentinel: { worker: Worker; ask: (from: number, to: number) => Promise<{ gaps?: Gap[]; fault?: string }> } | null = null;
 const SENTINEL_WORKER = `
 const { parentPort } = require("worker_threads");
 const t = (${TICKER_SRC})(${GAP_FLOOR_MS}, ${GAP_KEEP});
@@ -379,7 +411,11 @@ parentPort.on("message", (m) => {
     armed();
     return;
   }
-  parentPort.postMessage({ id: m.id, gaps: t.gaps(m.from, m.to) });
+  // ARMED FOR THIS SNAPSHOT (Codex R2 P2a): reply only once a tick has landed at or after the requested end.
+  t.settled(m.to, ${SETTLE_POLLS}).then(
+    () => parentPort.postMessage({ id: m.id, gaps: t.gaps(m.from, m.to) }),
+    (err) => parentPort.postMessage({ id: m.id, fault: String((err && err.message) || err) }),
+  );
 });
 `;
 /**
@@ -393,10 +429,10 @@ async function armInstruments(): Promise<void> {
     const worker = new Worker(SENTINEL_WORKER, { eval: true });
     worker.unref();
     let seq = 0;
-    const pending = new Map<number, (g: Gap[]) => void>();
-    worker.on("message", (m: { id?: number; gaps?: Gap[] }) => {
+    const pending = new Map<number, (g: { gaps?: Gap[]; fault?: string }) => void>();
+    worker.on("message", (m: { id?: number; gaps?: Gap[]; fault?: string }) => {
       if (m.id !== undefined) {
-        pending.get(m.id)?.(m.gaps!);
+        pending.get(m.id)?.({ gaps: m.gaps, fault: m.fault });
         pending.delete(m.id);
       }
     });
@@ -445,7 +481,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
     for (const e of list.getEntries()) gcs.push([e.startTime, e.duration]);
   });
   gcObs.observe({ entryTypes: ["gc"] });
-  const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args, ceilingMs: CEILING_MS, workerStallMs: load.workerStallMs ?? 0 } });
+  const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args, ceilingMs: CEILING_MS, workerStallMs: load.workerStallMs ?? 0, prepHostStallHelperPid: load.prepHostStallHelperPid ?? 0 } });
   try {
     return await new Promise<Reading>((resolve, reject) => {
       let statuses: number[] = [];
@@ -478,15 +514,28 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
         const gcMax = gcs.filter(([at]) => at >= t0 && at <= t1).reduce((mx, [, dur]) => Math.max(mx, dur), 0);
         const tEnd = absNow(); // the /health sampler ran until now
         void (async () => {
-          const sentinelGaps = await sentinel!.ask(t0Abs, tEnd);
+          // (Codex R2 P2b) The /health sampler starts BEFORE the window opens, and healthMax (the ruled AVAILABILITY
+          // reading) keeps every sample since then. So the sentinel is asked over the ENVELOPE of every included
+          // sample, not from t0: cutting the samples to the window instead would leave a healthMax >= 500 ms with no
+          // located breach, which (6) reads as a freeze.
+          const healthBreaches = m.healthBreaches ?? [];
+          const askFrom = Math.min(t0Abs, ...healthBreaches.map((g) => g.from));
+          const asked = await sentinel!.ask(askFrom, tEnd);
+          // (Codex R2 P2a) The main ticker too: a gap is recorded only by the tick that ends it.
+          await mainTicker!.settled(t1Abs, SETTLE_POLLS).catch((err: Error) => {
+            throw new Error(`INSTRUMENT FAULT: the main-thread ticker did not tick past the window's end (${err.message})`);
+          });
+          const sentinelGaps = asked.gaps;
           const loopBreaches = mainTicker!.gaps(t0Abs, t1Abs).filter((g) => g.to - g.from >= CEILING_MS);
           const reading: Reading = {
             healthMax: m.healthMax!,
             eldMax: eld.max / 1e6,
             shed: statuses.filter((s) => s === 429).length,
-            breaches: [...(m.healthBreaches ?? []).map((g) => ({ ...g, kind: "/health" as const })), ...loopBreaches.map((g) => ({ ...g, kind: "loop-delay" as const }))],
+            breaches: [...healthBreaches.map((g) => ({ ...g, kind: "/health" as const })), ...loopBreaches.map((g) => ({ ...g, kind: "loop-delay" as const }))],
             sentinelGaps,
-            sentinelMax: sentinelGaps.reduce((mx, g) => Math.max(mx, g.to - g.from), 0),
+            ...(asked.fault ? { sentinelFault: asked.fault } : {}),
+            sentinelMax: (sentinelGaps ?? []).reduce((mx, g) => Math.max(mx, g.to - g.from), 0),
+            windowFrom: t0Abs,
             loadGapMax: m.loadGapMax ?? 0,
             gcMax,
           };
@@ -532,7 +581,8 @@ const measure = measureWindow;
  *       size, FIXED) must PASS, proving discrimination at the threshold on that runner.
  *   (6) The 500 ms per-reading ceiling is an always-on freeze detector, gated by the SENTINEL (architect e475d60d
  *       (2), and the ruling on #332 R1 P1 #1), PER BREACH: a /health sample or a main-loop gap at or over the ceiling
- *       is a host stall (NOT_EVALUATED; (4) applies) only if a gap of the DEDICATED idle sentinel COVERS it, i.e.
+ *       is a sentinel-covered breach (NOT_EVALUATED under this exemption rule; (4) applies) only if a gap of the
+ *       DEDICATED idle sentinel COVERS it, i.e.
  *       overlaps it for at least (its length - 50 ms). A touch, a matching magnitude at another time, or a stall of the
  *       busy LOAD worker never exempts it: otherwise it is a FREEZE, FAIL and final. A main-thread-only stall
  *       (GC included) that pushes a reading past 500 ms IS an availability failure from a caller's view, so it FAILS.
@@ -557,8 +607,9 @@ const measure = measureWindow;
  *   - LOOP (event-loop delay): ELD is a MAX, so an injected stall B lands as d ~= B - (the control's own max), not
  *     +B: a fixed +80 read only 56-60 on CI, hugging the threshold. Its FAIL block is therefore 1.6 x 50 + the
  *     SAME run's median control ELD max (taken from the +20 bar, after its A/A-quiet check), capped at 200 ms
- *     (over the cap: that boundary is NOT_EVALUATED). Claim: "LOOP detects a single synchronous stall >= 50 ms + this
- *     run's median control ELD max (reported per run)". Its PASS block stays +20.
+ *     (over the cap: that boundary is NOT_EVALUATED). Claim: "the median of 9 paired rounds detects a synchronous stall
+ *     repeated in each auth burst of >= 50 ms + this run's median control ELD max (reported per run)". A stall before
+ *     the loop-delay histogram's first tick in a window is not seen (a known limit, its own ticket). PASS block: +20.
  *   Regressions under these are carried by COUNT + the compare ban.
  */
 const K = 9;
@@ -574,7 +625,7 @@ const HOST_STALL_SLACK_MS = EFFECT_MS;
 const healthClaim = (controlMedian: number) =>
   `AVAILABILITY: a paired effect >= ${EFFECT_MS} ms is detected; the discrimination block = ${BOUNDARY_FAIL_MS} ms + this run's median control /health max (${controlMedian.toFixed(1)} ms) = ${(BOUNDARY_FAIL_MS + controlMedian).toFixed(1)} ms`;
 const loopClaim = (controlMedian: number) =>
-  `LOOP: detects a single synchronous stall >= ${EFFECT_MS} ms + this run's median control ELD max (${controlMedian.toFixed(1)} ms), i.e. >= ${(EFFECT_MS + controlMedian).toFixed(1)} ms`;
+  `LOOP: the median of ${K} paired rounds detects a synchronous stall repeated in each auth burst of >= ${EFFECT_MS} ms + this run's median control ELD max (${controlMedian.toFixed(1)} ms), i.e. >= ${(EFFECT_MS + controlMedian).toFixed(1)} ms; a stall before the loop-delay histogram's first tick in a window is not seen (a known limit)`;
 const NOISE_LIMIT_MS = EFFECT_MS / 2;
 const CEILING_MS = 500;
 const median = (xs: number[]) => {
@@ -612,12 +663,12 @@ const overlapMs = (a: Gap, b: Gap) => Math.max(0, Math.min(a.to, b.to) - Math.ma
  * the busy LOAD worker never counts. Otherwise it is a FREEZE: FAIL, final. A loop-delay reading at or over the ceiling
  * with no main-loop gap to locate it cannot be covered: a freeze. No sentinel stream: an INSTRUMENT FAULT.
  */
-export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps">>): { verdict: Verdict; why: string } {
+export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps"> & { sentinelFault?: string }>): { verdict: Verdict; why: string } {
   const freezes: string[] = [];
   const hostStalls: string[] = [];
   readings.forEach((r, i) => {
     if (!Array.isArray(r.sentinelGaps)) {
-      throw new Error(`INSTRUMENT FAULT (${label}): reading ${i + 1} has no sentinel stream, so a ceiling breach cannot be told from a host stall; no ceiling verdict is possible`);
+      throw new Error(`INSTRUMENT FAULT (${label}): reading ${i + 1} has no sentinel stream${r.sentinelFault ? ` (${r.sentinelFault})` : ""}, so the exemption rule cannot be applied; no ceiling verdict is possible`);
     }
     const breaches = r.breaches.filter((b) => b.to - b.from >= CEILING_MS);
     if (r.eldMax >= CEILING_MS && !breaches.some((b) => b.kind === "loop-delay")) {
@@ -634,7 +685,7 @@ export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "hea
     }
   });
   if (freezes.length) return { verdict: "FAIL", why: `a single reading over the ${CEILING_MS} ms ceiling NOT covered by the sentinel's own stall (a freeze): ${freezes.join("; ")}` };
-  if (hostStalls.length) return { verdict: "NOT_EVALUATED", why: `over the ${CEILING_MS} ms ceiling but COVERED by the sentinel's own stall (a host stall, not the code): ${hostStalls.join("; ")}` };
+  if (hostStalls.length) return { verdict: "NOT_EVALUATED", why: `over the ${CEILING_MS} ms ceiling but COVERED by the sentinel's own stall: a sentinel-covered breach, NOT_EVALUATED under the exemption rule (6) (coverage is the rule, not proof of the cause): ${hostStalls.join("; ")}` };
   return { verdict: "PASS", why: "" };
 }
 
@@ -1005,8 +1056,26 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(ceilingVerdict("t", [rd({ eldMax: 602, breaches: [loop(1000, 602)], sentinelGaps: [gap(998, 606)] }), rd({ eldMax: 600, breaches: [loop(5000, 600)] })]).verdict, "one freeze among host stalls: FAIL wins").toBe("FAIL");
     expect(() => ceilingVerdict("t", [rd(), { ...rd(), sentinelGaps: undefined }]), "no sentinel stream").toThrow(/INSTRUMENT FAULT/);
   });
+  it("THE TICKER (8): a snapshot taken BEFORE the overdue tick misses the stall (the race Codex R2 named); settled(end) waits for a tick at or after the end, so the stall is recorded; settled is bounded and rejects", async () => {
+    const t = makeTicker(GAP_FLOOR_MS, GAP_KEEP);
+    try {
+      await t.settled(absNow(), SETTLE_POLLS); // armed: it has ticked
+      const from = absNow();
+      loopBlock(300)(); // this thread blocked: its own ticker cannot tick until the block ends
+      const to = absNow();
+      expect(t.gaps(from, to), "a snapshot BEFORE the overdue tick: the stall is not recorded yet").toEqual([]);
+      await t.settled(to, SETTLE_POLLS);
+      expect(t.lastTick()).toBeGreaterThanOrEqual(to);
+      const g = t.gaps(from, to);
+      expect(g.length, "settled: the tick that ends the stall has landed, so the stall is a recorded gap").toBe(1);
+      expect(g[0].to - g[0].from).toBeGreaterThanOrEqual(300);
+    } finally {
+      t.stop();
+    }
+    await expect(t.settled(absNow() + 60_000, 30), "a stopped ticker never settles: bounded, it rejects").rejects.toThrow(/never ticked/);
+  });
   it("THE BOUNDARY PAIRS (5) + (4), mixed outcomes: an EVALUATED unexpected verdict is final before any other component's noise or cap; evaluated results are kept; only the bars a component lacks are re-run; a freeze in any boundary bar is FAIL first", async () => {
-    const reading = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, ...o });
+    const reading = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
     const iv = (verdict: Verdict): InstrumentVerdict => ({ d: verdict === "FAIL" ? 90 : 10, noise: verdict === "NOT_EVALUATED" ? 40 : 5, verdict });
     const bar = (label: string, health: Verdict, eld: Verdict, o: { controlHealth?: number; auth?: Reading[] } = {}): BarStats => ({
       label,
@@ -1218,6 +1287,58 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   /** The auth round (0-based) a single planted stall lands in. */
   const STALL_ROUND = 4;
 
+  // A helper child resumes THIS process: it is armed first (ready on stdout), then this process signals the child
+  // (SIGUSR2, a synchronous syscall) and stops ITSELF (SIGSTOP on its own pid, never a group); the child sends
+  // SIGCONT after STALL_MS. RESIDUAL, stated: if the child died between the two signals, this process would stay
+  // stopped until the CI job's own timeout.
+  const armHostStall = async (): Promise<{ pid: number; fire: () => void; fired: () => boolean; disarm: () => Promise<void> }> => {
+    const pid = process.pid;
+    expect(pid).toBeGreaterThan(1);
+    // The child resumes the stopped process in a `finally` on its timer, AND on every exit it can run code for (its
+    // `exit` hook, SIGTERM, SIGINT), so only an uncatchable SIGKILL of the child could leave this process stopped.
+    const helper = [
+      `const p = Number(process.argv[1]);`,
+      `const resume = () => { try { process.kill(p, "SIGCONT"); } catch {} };`,
+      `process.on("exit", resume);`,
+      `for (const s of ["SIGTERM", "SIGINT"]) process.on(s, () => process.exit(0));`,
+      `process.on("SIGUSR2", () => setTimeout(() => { try {} finally { resume(); process.exit(0); } }, ${STALL_MS}));`,
+      `process.stdout.write("ready\\n");`,
+      `setInterval(() => {}, 1000);`,
+    ].join(" ");
+    const child = spawn(process.execPath, ["-e", helper, String(pid)], { stdio: ["ignore", "pipe", "ignore"] });
+    const childPid = child.pid;
+    expect(childPid).toBeGreaterThan(1);
+    console.log(`HOST-STALL helper pid ${childPid} targets the test process pid ${pid} (SIGSTOP on itself only)`);
+    const exited = new Promise<void>((res) => child.once("exit", () => res()));
+    await new Promise<void>((res, rej) => {
+      child.stdout!.once("data", () => res());
+      child.once("exit", (code) => rej(new Error(`the stall helper exited early (${code})`)));
+    });
+    let fired = false;
+    return {
+      pid: childPid!,
+      fire: () => {
+        fired = true;
+        process.kill(childPid!, "SIGUSR2");
+        process.kill(pid, "SIGSTOP");
+      },
+      fired: () => fired,
+      // A fired helper exits by itself after SIGCONT; an unfired one is ended by its RECORDED pid (SIGTERM: its own
+      // handler exits, and its exit hook's SIGCONT to a running process is a no-op). Fired from the LOAD worker (the
+      // preparation case), this thread never saw it: the helper has exited already, and ESRCH is not an error.
+      disarm: async () => {
+        if (!fired) {
+          try {
+            process.kill(childPid!, "SIGTERM");
+          } catch {
+            /* it already exited */
+          }
+        }
+        await exited;
+      },
+    };
+  };
+
   it("CEILING, a freeze: one auth round's daemon loop blocked 600 ms with the sentinel quiet FAILS, final, never re-run; every round blocked FAILS too", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
@@ -1242,49 +1363,6 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   }, 300_000);
 
   it("CEILING, a host stall: the whole test process stopped 600 ms in one auth round reads NOT_EVALUATED (the dedicated sentinel's own stall COVERS the breach) and is re-run; three stalled attempts are a FINAL NOT_EVALUATED, never FAIL", async () => {
-    // A helper child resumes THIS process: it is armed first (ready on stdout), then this process signals the child
-    // (SIGUSR2, a synchronous syscall) and stops ITSELF (SIGSTOP on its own pid, never a group); the child sends
-    // SIGCONT after STALL_MS. RESIDUAL, stated: if the child died between the two signals, this process would stay
-    // stopped until the CI job's own timeout.
-    const armHostStall = async (): Promise<{ fire: () => void; fired: () => boolean; disarm: () => Promise<void> }> => {
-      const pid = process.pid;
-      expect(pid).toBeGreaterThan(1);
-      // The child resumes the stopped process in a `finally` on its timer, AND on every exit it can run code for (its
-      // `exit` hook, SIGTERM, SIGINT), so only an uncatchable SIGKILL of the child could leave this process stopped.
-      const helper = [
-        `const p = Number(process.argv[1]);`,
-        `const resume = () => { try { process.kill(p, "SIGCONT"); } catch {} };`,
-        `process.on("exit", resume);`,
-        `for (const s of ["SIGTERM", "SIGINT"]) process.on(s, () => process.exit(0));`,
-        `process.on("SIGUSR2", () => setTimeout(() => { try {} finally { resume(); process.exit(0); } }, ${STALL_MS}));`,
-        `process.stdout.write("ready\\n");`,
-        `setInterval(() => {}, 1000);`,
-      ].join(" ");
-      const child = spawn(process.execPath, ["-e", helper, String(pid)], { stdio: ["ignore", "pipe", "ignore"] });
-      const childPid = child.pid;
-      expect(childPid).toBeGreaterThan(1);
-      console.log(`HOST-STALL helper pid ${childPid} targets the test process pid ${pid} (SIGSTOP on itself only)`);
-      const exited = new Promise<void>((res) => child.once("exit", () => res()));
-      await new Promise<void>((res, rej) => {
-        child.stdout!.once("data", () => res());
-        child.once("exit", (code) => rej(new Error(`the stall helper exited early (${code})`)));
-      });
-      let fired = false;
-      return {
-        fire: () => {
-          fired = true;
-          process.kill(childPid!, "SIGUSR2");
-          process.kill(pid, "SIGSTOP");
-        },
-        fired: () => fired,
-        // A fired helper exits by itself after SIGCONT; an unfired one is ended by its RECORDED pid (SIGTERM: its own
-        // handler exits, and its exit hook's SIGCONT to a running process is a no-op).
-        disarm: async () => {
-          if (!fired) process.kill(childPid!, "SIGTERM");
-          await exited;
-        },
-      };
-    };
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       const stalledAttempt = async (label: string, stall: boolean): Promise<BarStats> => {
@@ -1305,7 +1383,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       let onceCalls = 0;
       const once = await gatedBar("ceiling: a host stall in attempt 1 only", () => stalledAttempt(`ceiling: whole process stopped ${STALL_MS} ms (attempt 1 only)`, onceCalls++ === 0));
       expect(once.history[0].status, once.history[0].why.join("; ")).toBe("NOT_EVALUATED");
-      expect(once.history[0].why.join(" "), "attempt 1 is a host stall, COVERED by the dedicated sentinel").toMatch(/COVERED by the sentinel's own stall \(a host stall/);
+      expect(once.history[0].why.join(" "), "attempt 1 (a planted whole-process stop) is COVERED by the dedicated sentinel").toMatch(/COVERED by the sentinel's own stall: a sentinel-covered breach, NOT_EVALUATED under the exemption rule/);
       expect(once.attempts, "a NOT_EVALUATED attempt is re-run").toBeGreaterThanOrEqual(2);
       expectGated(once); // the first evaluated attempt decides (or, after 3 noisy ones, a FINAL NOT_EVALUATED, red as itself)
 
@@ -1349,6 +1427,27 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       expect(r.sentinelMax, "the dedicated sentinel stayed quiet").toBeLessThan(CEILING_MS - HOST_STALL_SLACK_MS);
       const c = ceilingVerdict("busy load worker over a freeze", [r]);
       expect(c.verdict, c.why).toBe("FAIL");
+    });
+  }, 60_000);
+
+  it("CEILING, a host stall during PREPARATION (before the window opens), its covering sentinel gap entirely before the window: a sentinel-covered breach reads NOT_EVALUATED, not FAIL", async () => {
+    await withDaemon(async (port) => {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      const helper = await armHostStall();
+      let r: Reading;
+      try {
+        r = await measure(port, { ...authLoad(20, "discover_agents", {}), prepHostStallHelperPid: helper.pid });
+      } finally {
+        await helper.disarm();
+      }
+      const pre = r.breaches.filter((b) => b.kind === "/health" && b.from < r.windowFrom);
+      const covering = (r.sentinelGaps ?? []).filter((g) => g.to <= r.windowFrom && pre.some((b) => overlapMs(g, b) >= b.to - b.from - HOST_STALL_SLACK_MS));
+      const c = ceilingVerdict("preparation-period host stall", [r]);
+      // Logged FIRST, so a red run still shows what the instrument saw and what the ceiling decided.
+      console.log(`PREP-STALL verdict ${c.verdict} | window opened ${r.windowFrom.toFixed(1)} | /health breaches before it: ${pre.map((b) => `[${b.from.toFixed(1)}, ${b.to.toFixed(1)}] (starts ${(r.windowFrom - b.from).toFixed(1)} ms before)`).join(", ") || "none"} | covering sentinel gaps: ${covering.map((g) => `[${g.from.toFixed(1)}, ${g.to.toFixed(1)}] (ends ${(r.windowFrom - g.to).toFixed(1)} ms before)`).join(", ") || "none in the stream"}`);
+      expect(pre.length, `precondition: a /health breach started BEFORE the window opened (${JSON.stringify(r.breaches)}, window from ${r.windowFrom})`).toBeGreaterThanOrEqual(1);
+      expect(c.verdict, c.why).toBe("NOT_EVALUATED");
+      expect(covering.length, `and its covering sentinel gap ENDS before the window opens, so a query from the window's start would miss it (${JSON.stringify(r.sentinelGaps)})`).toBeGreaterThanOrEqual(1);
     });
   }, 60_000);
 
