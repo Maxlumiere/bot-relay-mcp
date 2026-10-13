@@ -19,7 +19,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import type { Server as HttpServer } from "http";
-import { monitorEventLoopDelay } from "perf_hooks";
+import { monitorEventLoopDelay, PerformanceObserver } from "perf_hooks";
 import { Worker } from "worker_threads";
 import { LAPSE_MAX_BUSY, OCCUPANCY_FLOOR, lapseReport, lapsedPool, occupancy, type PoolOccupancy, type PoolWork } from "./_helpers/pool-occupancy.js";
 
@@ -291,6 +291,12 @@ interface Reading {
    * verdict reads it. Its question: does a stalled reading coincide with a stall the daemon cannot cause?
    */
   sentinelMax: number;
+  /**
+   * The longest GC pause (ms) on the MAIN thread inside the window (flake f, Phase 0): REPORTED ONLY. The daemon
+   * runs in the test's own isolate, so the harness's GC lands on the daemon's loop; this separates "a GC pause"
+   * from "the code" when a main-thread stall shows up.
+   */
+  gcMax: number;
   /** A POOL-LOADED control only: its pool work INSIDE the measured window (see measure). */
   pool?: PoolOccupancy;
 }
@@ -312,6 +318,13 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
     }
   };
   const eld = monitorEventLoopDelay({ resolution: 1 });
+  // Every main-thread GC entry is kept; the ones that START inside [t0, t1] are the window's (entries are delivered
+  // after the pause, so the observer stays connected until the reading is built).
+  const gcs: Array<[number, number]> = [];
+  const gcObs = new PerformanceObserver((list) => {
+    for (const e of list.getEntries()) gcs.push([e.startTime, e.duration]);
+  });
+  gcObs.observe({ entryTypes: ["gc"] });
   const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args } });
   try {
     return await new Promise<Reading>((resolve, reject) => {
@@ -340,12 +353,14 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
           );
           return;
         }
-        const reading: Reading = { healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: statuses.filter((s) => s === 429).length, sentinelMax: m.sentinelMax! };
+        const gcMax = gcs.filter(([at]) => at >= t0 && at <= t1).reduce((mx, [, dur]) => Math.max(mx, dur), 0);
+        const reading: Reading = { healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: statuses.filter((s) => s === 429).length, sentinelMax: m.sentinelMax!, gcMax };
         if (poolWork) reading.pool = occupancy(spans, t0, t1);
         resolve(reading);
       });
     });
   } finally {
+    gcObs.disconnect();
     await worker.terminate();
     await pool.catch(() => undefined);
   }
@@ -376,7 +391,8 @@ const measure = measureWindow;
  *   (6) The 500 ms per-reading ceiling is an always-on freeze detector.
  *   (7) Every BAR line reports median d, median |a|, the effect size, the verdict and the resolution.
  *   (8) SENTINEL, REPORTED ONLY (flake f, Phase 0): each reading also carries the load worker's own loop delay,
- *       a loop the daemon cannot block. No verdict reads it yet; it measures whether runner stalls are host-wide.
+ *       a loop the daemon cannot block, and the longest main-thread GC pause in the window (the daemon shares the
+ *       test's isolate). No verdict reads either yet; they measure whether a stall is host-wide, a GC pause, or neither.
  * A pool-loaded bar's controls (both of them) must also prove their occupancy (expectControlLoaded).
  *
  * CLAIMS, stated per instrument and reported per run (architect, LOOP boundary sizing):
@@ -495,7 +511,8 @@ async function runBar(
       ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}` +
       ` | rounds control' health ${list(control2.map((r) => r.healthMax))} eld ${list(control2.map((r) => r.eldMax))}` +
       (opts.poolControl && control.every((r) => r.pool) && control2.every((r) => r.pool) ? ` | control pool in-window ${occ(control)} | control' pool in-window ${occ(control2)}` : "") +
-      ` | sentinel (worker loop, report only) auth ${list(auth.map((r) => r.sentinelMax))} control ${list(control.map((r) => r.sentinelMax))} control' ${list(control2.map((r) => r.sentinelMax))}`,
+      ` | sentinel (worker loop, report only) auth ${list(auth.map((r) => r.sentinelMax))} control ${list(control.map((r) => r.sentinelMax))} control' ${list(control2.map((r) => r.sentinelMax))}` +
+      ` | main-thread GC max pause (report only) auth ${list(auth.map((r) => r.gcMax))} control ${list(control.map((r) => r.gcMax))} control' ${list(control2.map((r) => r.gcMax))}`,
   );
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
 }
