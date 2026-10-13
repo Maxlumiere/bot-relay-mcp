@@ -31,6 +31,7 @@ const EXPECTED = [
   "CEILING, the load worker is not a sentinel",
   "CEILING, a busy load worker",
   "CEILING, a missing sentinel stream",
+  "CEILING, a host stall during PREPARATION",
 ];
 
 const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "timing-bars-")), "report.json");

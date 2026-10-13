@@ -583,7 +583,8 @@ const measure = measureWindow;
  *       (2), and the ruling on #332 R1 P1 #1), PER BREACH: a /health sample or a main-loop gap at or over the ceiling
  *       is a sentinel-covered breach (NOT_EVALUATED under this exemption rule; (4) applies) only if a gap of the
  *       DEDICATED idle sentinel COVERS it, i.e.
- *       overlaps it for at least (its length - 50 ms). A touch, a matching magnitude at another time, or a stall of the
+ *       overlaps it for at least (its length - the SLACK), the slack being 50 ms + the same run's median CONTROL /health
+ *       max, capped at 150 ms (coverSlack). A touch, a matching magnitude at another time, or a stall of the
  *       busy LOAD worker never exempts it: otherwise it is a FREEZE, FAIL and final. A main-thread-only stall
  *       (GC included) that pushes a reading past 500 ms IS an availability failure from a caller's view, so it FAILS.
  *       A reading with no sentinel is an INSTRUMENT FAULT, never a pass. MEASURED (flake f, Phase 0, 9 CI job logs):
@@ -620,8 +621,23 @@ const BOUNDARY_PASS_MS = 20;
 const BLOCK_CAP_MS = 200;
 /** (4) A NOT_EVALUATED bar is re-run up to this many attempts IN TOTAL; the first evaluated attempt decides. */
 const MAX_ATTEMPTS = 3;
-/** (6) A ceiling breach is a host stall when the sentinel stalled by at least (the reading - this). */
+/** (6) The BASE of the coverage slack: a breach is covered when the sentinel overlaps it by at least (its length - slack). */
 const HOST_STALL_SLACK_MS = EFFECT_MS;
+/** (6) The coverage slack's CAP (architect, #332 slack ruling): 50 + the median control /health max never exceeds this. */
+const COVER_SLACK_CAP_MS = 150;
+/**
+ * (6) THE COVERAGE SLACK, sized from the SAME run's CONTROL arm, never from the arm under test (architect, #332 slack
+ * ruling): 50 ms + the median control /health max, capped. MEASURED why: a planted 600 ms whole-process stop produced a
+ * 661.5 ms /health breach on CI (Node 22), 60 ms of it the daemon answering the queued request after the resume, so a
+ * fixed 50 ms read that pure host stall as a freeze. An exemption only ever yields NOT_EVALUATED (a re-run), never a
+ * PASS; what the extra slack could hide is a one-shot daemon freeze coinciding with a host stall AND adding no more
+ * than the slack on top of it, far below what the 500 ms ceiling exists to catch.
+ */
+export function coverSlack(controlHealthMaxes: number[]): number {
+  if (controlHealthMaxes.length === 0) return HOST_STALL_SLACK_MS; // no control arm: the base only
+  return Math.min(COVER_SLACK_CAP_MS, HOST_STALL_SLACK_MS + median(controlHealthMaxes));
+}
+const barSlack = (b: { control: Array<Pick<Reading, "healthMax">> }) => coverSlack(b.control.map((r) => r.healthMax));
 const healthClaim = (controlMedian: number) =>
   `AVAILABILITY: a paired effect >= ${EFFECT_MS} ms is detected; the discrimination block = ${BOUNDARY_FAIL_MS} ms + this run's median control /health max (${controlMedian.toFixed(1)} ms) = ${(BOUNDARY_FAIL_MS + controlMedian).toFixed(1)} ms`;
 const loopClaim = (controlMedian: number) =>
@@ -663,7 +679,7 @@ const overlapMs = (a: Gap, b: Gap) => Math.max(0, Math.min(a.to, b.to) - Math.ma
  * the busy LOAD worker never counts. Otherwise it is a FREEZE: FAIL, final. A loop-delay reading at or over the ceiling
  * with no main-loop gap to locate it cannot be covered: a freeze. No sentinel stream: an INSTRUMENT FAULT.
  */
-export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps"> & { sentinelFault?: string }>): { verdict: Verdict; why: string } {
+export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps"> & { sentinelFault?: string }>, slackMs: number = HOST_STALL_SLACK_MS): { verdict: Verdict; why: string } {
   const freezes: string[] = [];
   const hostStalls: string[] = [];
   readings.forEach((r, i) => {
@@ -680,8 +696,8 @@ export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "hea
     for (const b of breaches) {
       const ms = b.to - b.from;
       const cover = r.sentinelGaps.reduce((mx, g) => Math.max(mx, overlapMs(g, b)), 0);
-      const at = `round ${i + 1} ${b.kind} ${ms.toFixed(1)} ms, covered by the sentinel for ${cover.toFixed(1)} ms (needs >= ${(ms - HOST_STALL_SLACK_MS).toFixed(1)})`;
-      (cover >= ms - HOST_STALL_SLACK_MS ? hostStalls : freezes).push(at);
+      const at = `round ${i + 1} ${b.kind} ${ms.toFixed(1)} ms, covered by the sentinel for ${cover.toFixed(1)} ms (needs >= ${(ms - slackMs).toFixed(1)}: slack ${slackMs.toFixed(1)})`;
+      (cover >= ms - slackMs ? hostStalls : freezes).push(at);
     }
   });
   if (freezes.length) return { verdict: "FAIL", why: `a single reading over the ${CEILING_MS} ms ceiling NOT covered by the sentinel's own stall (a freeze): ${freezes.join("; ")}` };
@@ -774,7 +790,7 @@ export async function boundaryPairs(run20: () => Promise<BarStats>, runBlock: (x
   for (let n = 1; n <= MAX_ATTEMPTS && needs20().length > 0; n++) {
     const b = await run20();
     r.runs.push(`+${BOUNDARY_PASS_MS} #${n}`);
-    const c = ceilingVerdict(b.label, b.auth);
+    const c = ceilingVerdict(b.label, b.auth, barSlack(b));
     if (c.verdict === "FAIL") return fail(`the +${BOUNDARY_PASS_MS} ms bar (#${n}): ${c.why}`);
     for (const x of INSTRS) {
       if (b[x].verdict === "FAIL") return fail(`${INSTR_NAME[x]} +${BOUNDARY_PASS_MS} ms read FAIL (d=${b[x].d.toFixed(1)}), evaluated: final (#${n})`);
@@ -799,7 +815,7 @@ export async function boundaryPairs(run20: () => Promise<BarStats>, runBlock: (x
     for (let n = 1; n <= MAX_ATTEMPTS && !r.block[x]; n++) {
       const b = await runBlock(x, { median: sized.median, ms: sized.ms });
       r.runs.push(`${INSTR_NAME[x]} block #${n}`);
-      const c = ceilingVerdict(b.label, b.auth);
+      const c = ceilingVerdict(b.label, b.auth, barSlack(b));
       if (c.verdict === "FAIL") return fail(`the ${INSTR_NAME[x]} block bar (#${n}): ${c.why}`);
       if (b[x].verdict === "PASS") return fail(`${INSTR_NAME[x]} +${sized.ms.toFixed(1)} ms read PASS (d=${b[x].d.toFixed(1)}), evaluated: the bar cannot see harm at the boundary, final (#${n})`);
       if (c.verdict === "NOT_EVALUATED") {
@@ -893,6 +909,7 @@ async function runBar(
       ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}` +
       ` | rounds control' health ${list(control2.map((r) => r.healthMax))} eld ${list(control2.map((r) => r.eldMax))}` +
       (opts.poolControl && control.every((r) => r.pool) && control2.every((r) => r.pool) ? ` | control pool in-window ${occ(control)} | control' pool in-window ${occ(control2)}` : "") +
+      ` | cover slack ${barSlack({ control }).toFixed(1)} ms (50 + median control /health max, cap ${COVER_SLACK_CAP_MS})` +
       ` | sentinel (dedicated idle worker, max gap, gates the ceiling) auth ${list(auth.map((r) => r.sentinelMax))} control ${list(control.map((r) => r.sentinelMax))} control' ${list(control2.map((r) => r.sentinelMax))}` +
       ` | load-worker max gap (report only) auth ${list(auth.map((r) => r.loadGapMax))}` +
       ` | main-thread GC max pause (report only) auth ${list(auth.map((r) => r.gcMax))} control ${list(control.map((r) => r.gcMax))} control' ${list(control2.map((r) => r.gcMax))}`,
@@ -936,7 +953,7 @@ function barOutcome(b: BarStats, compares: CompareSpec = { max: 0 }): Outcome {
   } else if (b.compares > (compares.max ?? 0)) {
     fail.push(`bcrypt compares ${b.compares} > ${compares.max ?? 0}`);
   }
-  const ceiling = ceilingVerdict(b.label, b.auth);
+  const ceiling = ceilingVerdict(b.label, b.auth, barSlack(b));
   for (const [name, v] of [["AVAILABILITY", b.health], ["LOOP", b.eld]] as const) {
     if (v.verdict === "FAIL") fail.push(`${name} median paired d ${v.d.toFixed(1)} ms >= ${EFFECT_MS} ms`);
     if (v.verdict === "NOT_EVALUATED") ne.push(`${name} same-run A/A noise ${v.noise.toFixed(1)} ms > ${NOISE_LIMIT_MS} ms`);
@@ -973,7 +990,7 @@ function expectBarHolds(b: BarStats, compares: CompareSpec = { max: 0 }): void {
   } else {
     expect(b.compares, `${b.label}: bcrypt compares`).toBeLessThanOrEqual(compares.max ?? 0);
   }
-  const ceiling = ceilingVerdict(b.label, b.auth);
+  const ceiling = ceilingVerdict(b.label, b.auth, barSlack(b));
   expect(ceiling.verdict, `${b.label}: ${ceiling.why}`).not.toBe("FAIL");
   expect(b.health.verdict, `${b.label}: AVAILABILITY median paired d ${b.health.d.toFixed(1)} ms >= the ${EFFECT_MS} ms effect size (A/A noise ${b.health.noise.toFixed(1)})`).not.toBe("FAIL");
   expect(b.eld.verdict, `${b.label}: LOOP median paired d ${b.eld.d.toFixed(1)} ms >= the ${EFFECT_MS} ms effect size (A/A noise ${b.eld.noise.toFixed(1)})`).not.toBe("FAIL");
@@ -1055,6 +1072,21 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(v(rd({ healthMax: 600, breaches: [], sentinelGaps: [gap(1000, 600)] })), "a /health reading with no sample interval to locate it").toBe("FAIL");
     expect(ceilingVerdict("t", [rd({ eldMax: 602, breaches: [loop(1000, 602)], sentinelGaps: [gap(998, 606)] }), rd({ eldMax: 600, breaches: [loop(5000, 600)] })]).verdict, "one freeze among host stalls: FAIL wins").toBe("FAIL");
     expect(() => ceilingVerdict("t", [rd(), { ...rd(), sentinelGaps: undefined }]), "no sentinel stream").toThrow(/INSTRUMENT FAULT/);
+  });
+  it("THE COVERAGE SLACK (6), sized from the CONTROL arm: 50 + the median control /health max, capped at 150; a breach just inside the sized slack is NOT_EVALUATED, just outside is FAIL", () => {
+    expect(coverSlack([30, 34.5, 40]), "50 + median 34.5").toBe(84.5);
+    expect(coverSlack([]), "no control arm: the base").toBe(HOST_STALL_SLACK_MS);
+    expect(coverSlack([120, 130, 140]), "50 + 130 = 180: the cap applies").toBe(COVER_SLACK_CAP_MS);
+    const gap = (from: number, ms: number) => ({ from, to: from + ms });
+    // The CI case (Node 22): a 661.5 ms /health breach, the sentinel covering 601.5 ms of it: 60 ms uncovered.
+    const ci = { healthMax: 661.5, eldMax: 20, breaches: [{ ...gap(1000, 661.5), kind: "/health" as const }], sentinelGaps: [gap(1000, 601.5)] };
+    expect(ceilingVerdict("t", [ci]).verdict, "the fixed 50 ms base: that pure host stall read as a freeze").toBe("FAIL");
+    expect(ceilingVerdict("t", [ci], coverSlack([34.5])).verdict, "sized from the control (84.5 ms): covered").toBe("NOT_EVALUATED");
+    const at = (uncovered: number) => ({ healthMax: 600 + uncovered, eldMax: 20, breaches: [{ ...gap(1000, 600 + uncovered), kind: "/health" as const }], sentinelGaps: [gap(1000, 600)] });
+    expect(ceilingVerdict("t", [at(84.5)], 84.5).verdict, "exactly the sized slack uncovered").toBe("NOT_EVALUATED");
+    expect(ceilingVerdict("t", [at(85.5)], 84.5).verdict, "1 ms past the sized slack").toBe("FAIL");
+    expect(ceilingVerdict("t", [at(149)], coverSlack([200])).verdict, "inside the CAP").toBe("NOT_EVALUATED");
+    expect(ceilingVerdict("t", [at(151)], coverSlack([200])).verdict, "past the CAP, however noisy the control").toBe("FAIL");
   });
   it("THE TICKER (8): a snapshot taken BEFORE the overdue tick misses the stall (the race Codex R2 named); settled(end) waits for a tick at or after the end, so the stall is recorded; settled is bounded and rejects", async () => {
     const t = makeTicker(GAP_FLOOR_MS, GAP_KEEP);
@@ -1367,7 +1399,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       });
       const every = await gatedBar("ceiling RED: every auth round frozen", () => runBar(`ceiling RED: every auth round frozen ${STALL_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(STALL_MS) }));
       for (const [x, frozen] of [[one, 1], [every, K]] as const) {
-        const c = ceilingVerdict(x.result.label, x.result.auth);
+        const c = ceilingVerdict(x.result.label, x.result.auth, barSlack(x.result));
         expect(c.verdict, `${x.result.label}: the planted freeze must read as a freeze (${c.why || "no breach"})`).toBe("FAIL");
         expect(x.result.auth.filter((r) => r.eldMax >= CEILING_MS).length, `${x.result.label}: the loop breached the ceiling in each frozen round`).toBe(frozen);
         expect(x.final.status, x.final.why.join("; ")).toBe("FAIL");
@@ -1447,6 +1479,10 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   it("CEILING, a host stall during PREPARATION (before the window opens), its covering sentinel gap entirely before the window: a sentinel-covered breach reads NOT_EVALUATED, not FAIL", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
+      // This run's control arm, for the slack (a single window has none of its own): three control windows.
+      const controls: Reading[] = [];
+      for (let i = 0; i < 3; i++) controls.push(await measure(port, controlLoad(20)));
+      const slack = coverSlack(controls.map((x) => x.healthMax));
       const helper = await armHostStall();
       let r: Reading;
       try {
@@ -1455,10 +1491,10 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
         await helper.disarm();
       }
       const pre = r.breaches.filter((b) => b.kind === "/health" && b.from < r.windowFrom);
-      const covering = (r.sentinelGaps ?? []).filter((g) => g.to <= r.windowFrom && pre.some((b) => overlapMs(g, b) >= b.to - b.from - HOST_STALL_SLACK_MS));
-      const c = ceilingVerdict("preparation-period host stall", [r]);
+      const covering = (r.sentinelGaps ?? []).filter((g) => g.to <= r.windowFrom && pre.some((b) => overlapMs(g, b) >= b.to - b.from - slack));
+      const c = ceilingVerdict("preparation-period host stall", [r], slack);
       // Logged FIRST, so a red run still shows what the instrument saw and what the ceiling decided.
-      console.log(`PREP-STALL verdict ${c.verdict} | window opened ${r.windowFrom.toFixed(1)} | /health breaches before it: ${pre.map((b) => `[${b.from.toFixed(1)}, ${b.to.toFixed(1)}] (starts ${(r.windowFrom - b.from).toFixed(1)} ms before)`).join(", ") || "none"} | covering sentinel gaps: ${covering.map((g) => `[${g.from.toFixed(1)}, ${g.to.toFixed(1)}] (ends ${(r.windowFrom - g.to).toFixed(1)} ms before)`).join(", ") || "none in the stream"}`);
+      console.log(`PREP-STALL verdict ${c.verdict} | slack ${slack.toFixed(1)} ms (50 + median of ${controls.map((x) => x.healthMax.toFixed(1)).join("/")}, cap ${COVER_SLACK_CAP_MS}) | window opened ${r.windowFrom.toFixed(1)} | /health breaches before it: ${pre.map((b) => `[${b.from.toFixed(1)}, ${b.to.toFixed(1)}] (starts ${(r.windowFrom - b.from).toFixed(1)} ms before)`).join(", ") || "none"} | covering sentinel gaps: ${covering.map((g) => `[${g.from.toFixed(1)}, ${g.to.toFixed(1)}] (ends ${(r.windowFrom - g.to).toFixed(1)} ms before)`).join(", ") || "none in the stream"}`);
       expect(pre.length, `precondition: a /health breach started BEFORE the window opened (${JSON.stringify(r.breaches)}, window from ${r.windowFrom})`).toBeGreaterThanOrEqual(1);
       expect(c.verdict, c.why).toBe("NOT_EVALUATED");
       expect(covering.length, `and its covering sentinel gap ENDS before the window opens, so a query from the window's start would miss it (${JSON.stringify(r.sentinelGaps)})`).toBeGreaterThanOrEqual(1);
