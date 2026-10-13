@@ -22,6 +22,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { shellFunctionSource } from "./_helpers/shell-function.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -58,8 +59,8 @@ function runGateFn(
   const harness =
     `PROJECT_ROOT="${REPO_ROOT}"\n` +
     // the gate fns call the shared _relay_is_ci_smoke helper — load it too.
-    `eval "$(awk '/^_relay_is_ci_smoke\\(\\) \\{/,/^\\}/' "${GATE}")"\n` +
-    `eval "$(awk '/^${fnName}\\(\\) \\{/,/^\\}/' "${GATE}")"\n` +
+    `${shellFunctionSource(GATE, "_relay_is_ci_smoke")}\n` +
+    `${shellFunctionSource(GATE, fnName)}\n` +
     `${fnName}\n`;
   const r = spawnSync("bash", ["-c", harness], {
     encoding: "utf8",

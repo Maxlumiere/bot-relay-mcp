@@ -33,6 +33,7 @@ import fs from "fs";
 import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { shellFunctionSource } from "./_helpers/shell-function.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -59,7 +60,7 @@ function runDriftGuard(): GuardResult {
   const script = `
 set -u
 PROJECT_ROOT='${REPO_ROOT.replace(/'/g, "'\\''")}'
-eval "$(awk '/^tests_drift_guard\\(\\) {/,/^}/' '${GATE_SCRIPT.replace(/'/g, "'\\''")}')"
+${shellFunctionSource(GATE_SCRIPT, "tests_drift_guard")}
 tests_drift_guard
 exit $?
 `;
