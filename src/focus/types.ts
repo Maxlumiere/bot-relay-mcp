@@ -25,6 +25,13 @@ export interface FocusResult {
   reason?: string;
   /** The driver sub-name (e.g. `osascript-iterm2`, `wmctrl`, `appactivate`) for diagnostics. */
   driver_name?: string;
+  /**
+   * Set ONLY by a dry run (RELAY_FOCUS_DRY_RUN=1): the command was built and NOT run, so `raised` is false and
+   * `reason` says "dry run". A dry run never reads as a focus success.
+   */
+  dry_run?: true;
+  /** A dry run's built command (program + argv; never its env). */
+  command?: { exec: string; args: string[] };
 }
 
 export interface FocusCommand {

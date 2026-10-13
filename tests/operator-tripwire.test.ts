@@ -22,9 +22,10 @@ import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
-import { decorateChildEnv, privateHomeEnv, spawnNestedRun, tripwireView, isLocalAddress } from "./_setup/operator-tripwire.js";
+import { decorateChildEnv, privateHomeEnv, tripwireView, isLocalAddress } from "./_setup/operator-tripwire.js";
 import { canonicalPath, snapshotFromEnv, underOperatorRoot } from "./_setup/operator-tripwire-preload.mjs";
 import { discoverOperator } from "./_setup/vitest-tripwire-base.mjs";
+import { nestedVitestRun } from "./_helpers/nested-vitest-run.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."); // never URL.pathname: it keeps %20
 
@@ -211,27 +212,9 @@ async function canary(): Promise<Canary> {
   return { port, hits: () => hits, close: () => new Promise((r) => srv.close(() => r())) };
 }
 
-interface Verdict { status: string; messages: string }
-/**
- * Start a nested run from THIS worker's env, minus what the nested run builds itself (the snapshot,
- * vitest's own vars) and minus this run's own private relay paths (the hermetic RELAY_CONFIG_PATH etc.:
- * the nested base would discover them as the operator's), plus `overlay` (the operator stand-ins).
- */
-async function nestedRun(filter: string, overlay: NodeJS.ProcessEnv, work: string): Promise<{ code: number | null; out: string; verdicts: Record<string, Verdict> }> {
-  const report = path.join(work, `report-${filter}.json`);
-  const childEnv: NodeJS.ProcessEnv = { ...process.env };
-  for (const k of Object.keys(childEnv)) if (k.startsWith("RELAY_TEST_") || k.startsWith("VITEST") || ["RELAY_HOME", "RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_INSTANCE_ID"].includes(k)) delete childEnv[k];
-  Object.assign(childEnv, overlay);
-  const child = spawnNestedRun(process.execPath, [path.join(REPO, "node_modules", "vitest", "vitest.mjs"), "run", "--config", path.join(REPO, "tests", "fixtures", "operator-tripwire", "vitest.config.ts"), "--reporter=json", `--outputFile=${report}`, filter], { cwd: REPO, env: childEnv });
-  let out = "";
-  child.stdout?.on("data", (d) => (out += d));
-  child.stderr?.on("data", (d) => (out += d));
-  const code = await new Promise<number | null>((r) => child.on("close", r));
-  const verdicts: Record<string, Verdict> = {};
-  const json = JSON.parse(fs.readFileSync(report, "utf-8")) as { testResults: Array<{ assertionResults: Array<{ title: string; status: string; failureMessages: string[] }> }> };
-  for (const f of json.testResults) for (const a of f.assertionResults) verdicts[a.title] = { status: a.status, messages: a.failureMessages.join("\n") };
-  return { code, out, verdicts };
-}
+/** The operator fixture run (tests/_helpers/nested-vitest-run.ts: env handling and the unwrapped spawn). */
+const nestedRun = (filter: string, overlay: NodeJS.ProcessEnv, work: string) =>
+  nestedVitestRun(path.join(REPO, "tests", "fixtures", "operator-tripwire", "vitest.config.ts"), filter, overlay, work);
 
 describe.skipIf(process.platform === "win32")("NESTED: every harm is refused, never delivered, and FAILS its test even when swallowed", () => {
   let work: string;

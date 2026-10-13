@@ -31,6 +31,21 @@
  *
  * The operator snapshot (home, roots, ports) comes from the base config's env and is FROZEN at load:
  * deleting an env var later cannot drop protection. See the preload for the KNOWN RESIDUAL list.
+ *
+ * DESKTOP TRIPWIRE (the same sites): no test may raise, open or type into a window on the machine running it
+ * (MEASURED on main ba5b97a: the dashboard focus tests ran `osascript … tell application "iTerm2" / activate`
+ * twice per run). Three layers:
+ *   1. DRY RUN BY DEFAULT: every test file's worker, and every child it starts, gets RELAY_FOCUS_DRY_RUN=1 (a
+ *      child whose env already names the key keeps the test's value: unsetting it is deliberate).
+ *   2. REFUSED IN THE WORKER: a spawn-family call whose program is a desktop actuator (DESKTOP_ACTUATORS, or
+ *      powershell/pwsh with AppActivate / WScript.Shell) is RECORDED and THROWS before anything starts; an
+ *      exec() string is refused when an actuator is in COMMAND position (or in a quoted segment: over-detects,
+ *      loudly, by design).
+ *   3. REFUSED IN A CHILD, by name: every child's PATH starts with a directory of refusing stand-ins (one per
+ *      actuator) that record a violation and exit 96 (97 when the record cannot be written), so a bash script
+ *      or hook calling `osascript` by name is caught too.
+ * NOT COVERED (stated): an actuator started by ABSOLUTE path from a child; a child given an env with no PATH or
+ * env {}; Windows children (the stand-ins are POSIX scripts; the worker check still applies on Windows).
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -106,6 +121,76 @@ for (const k of ["RELAY_HOME", "RELAY_DB_PATH", "RELAY_CONFIG_PATH"]) {
 }
 export const { OperatorTripwireError, RAW_FS, underOperatorRoot, isOperatorHome, isLocalAddress } = pre;
 
+// ---- DESKTOP TRIPWIRE ---------------------------------------------------------------------------------
+/** Programs that raise, open or type into a window. powershell/pwsh count only with WINDOWS_ACTUATION. */
+export const DESKTOP_ACTUATORS: readonly string[] = Object.freeze(["osascript", "open", "xdg-open", "wmctrl", "xdotool"]);
+const WINDOWS_ACTUATION = /AppActivate|WScript\.Shell/i;
+/** Exit code of a refusing stand-in that RECORDED its violation (97 = it could not: RECORD_FAILED_EXIT). */
+export const DESKTOP_REFUSED_EXIT = 96;
+
+const progName = (p: string) => path.basename(p.replace(/\\/g, "/")).toLowerCase().replace(/\.exe$/, "");
+
+/** The desktop actuator a program + argv would start, or null. Pure. */
+export function desktopActuator(program: string, args: readonly unknown[] = []): string | null {
+  const name = progName(program);
+  if (DESKTOP_ACTUATORS.includes(name)) return name;
+  if ((name === "powershell" || name === "pwsh") && args.some((a) => typeof a === "string" && WINDOWS_ACTUATION.test(a))) {
+    return `${name} (${String(args.find((a) => typeof a === "string" && WINDOWS_ACTUATION.test(a))).match(WINDOWS_ACTUATION)![0]})`;
+  }
+  return null;
+}
+
+/**
+ * The desktop actuator a SHELL string would start, or null. Pure. Each segment between command separators
+ * (; & | newline ( ) backtick) and quotes is a command; its first word, after VAR=value assignments and the
+ * wrappers env/command/exec/sudo/nohup, is the program. Splitting at quotes over-detects (`echo "open it"`):
+ * loud, never silent.
+ */
+export function desktopActuatorInShell(cmd: string): string | null {
+  for (const seg of cmd.split(/[;&|\n()`"']+/)) {
+    const words = seg.trim().split(/\s+/).filter(Boolean);
+    while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ["env", "command", "exec", "sudo", "nohup", "$"].includes(words[0]!))) words.shift();
+    if (!words.length) continue;
+    const hit = desktopActuator(words[0]!, words.slice(1));
+    if (hit) return hit;
+  }
+  if (/\b(powershell|pwsh)(\.exe)?\b/i.test(cmd) && WINDOWS_ACTUATION.test(cmd)) return `powershell (${cmd.match(WINDOWS_ACTUATION)![0]})`;
+  return null;
+}
+
+/** Record + THROW before a desktop actuator starts. The record fails this test's afterEach and the run, caught or not. */
+function refuseDesktop(what: string, how: string): never {
+  const line = `desktop ${how}: refused ${what} (a test must never raise, open or type into a window)`;
+  pre.recordViolation(line);
+  throw new pre.OperatorTripwireError(`DESKTOP_TRIPWIRE: ${line}. Use RELAY_FOCUS_DRY_RUN=1 / RELAY_SPAWN_DRY_RUN=1, or test the driver's pure buildCommand.`);
+}
+
+/** The refusing stand-ins (POSIX only), one directory per run, shared by its workers. */
+const SHIM_DIR = process.platform === "win32" ? null : path.join(state().runDir, "desktop-shims");
+if (SHIM_DIR && !fs.existsSync(path.join(SHIM_DIR, ".complete"))) {
+  fs.mkdirSync(SHIM_DIR, { recursive: true, mode: 0o700 });
+  for (const name of DESKTOP_ACTUATORS) {
+    const body =
+      `#!/bin/sh\n# DESKTOP TRIPWIRE stand-in (tests/_setup/operator-tripwire.ts): refuses ${name}, records it, never runs it.\n` +
+      `d="\${RELAY_TEST_TRIPWIRE_DIR:-}"\n` +
+      `if [ -n "$d" ] && f=$(mktemp "$d/desktop-$$-XXXXXX") && printf '%s\\n' "desktop child pid=$$ ppid=$PPID: refused ${name} by name (a test must never raise, open or type into a window)" > "$f"; then\n` +
+      `  echo "DESKTOP_TRIPWIRE: refused ${name}" >&2; exit ${DESKTOP_REFUSED_EXIT}\nfi\n` +
+      `echo "DESKTOP_TRIPWIRE: refused ${name} and could not record it" >&2; exit ${pre.RECORD_FAILED_EXIT}\n`;
+    const tmp = path.join(SHIM_DIR, `.${name}.${process.pid}`);
+    fs.writeFileSync(tmp, body, { mode: 0o755 });
+    fs.renameSync(tmp, path.join(SHIM_DIR, name)); // atomic: a parallel worker never runs a half-written stand-in
+  }
+  fs.writeFileSync(path.join(SHIM_DIR, ".complete"), "");
+}
+/** PATH with the stand-ins first (unchanged when already first, or when there are none). */
+function shimmedPath(p: string): string {
+  if (!SHIM_DIR || p.split(path.delimiter)[0] === SHIM_DIR) return p;
+  return p ? `${SHIM_DIR}${path.delimiter}${p}` : SHIM_DIR;
+}
+// EVERY test file (not only the worker's first): a file that deleted these must not leave the next one unprotected.
+process.env.RELAY_FOCUS_DRY_RUN = "1";
+if (process.env.PATH !== undefined) process.env.PATH = shimmedPath(process.env.PATH);
+
 /** The operator's real home and roots, and this worker's private home (for the tripwire's own tests). */
 export function tripwireView(): { roots: string[]; realHome: string; privateHome: string; ports: number[]; runDir: string } {
   const snap = pre.tripwireSnapshot();
@@ -135,7 +220,7 @@ function failOnViolations(where: string, reporter: keyof TripwireState["seen"]):
   if (lost) v.push(lost);
   if (v.length) {
     throw new pre.OperatorTripwireError(
-      `OPERATOR_TRIPWIRE (${where}): this test reached the OPERATOR's live relay (refused, never delivered). Pin RELAY_HTTP_PORT / HOME / RELAY_DB_PATH for the child or code path:\n  ${v.join("\n  ")}`,
+      `OPERATOR_TRIPWIRE (${where}): this test reached the OPERATOR's live relay or desktop (refused, never delivered). A relay access: pin RELAY_HTTP_PORT / HOME / RELAY_DB_PATH for the child or code path. A desktop one: use RELAY_FOCUS_DRY_RUN=1 / RELAY_SPAWN_DRY_RUN=1 or the driver's pure buildCommand:\n  ${v.join("\n  ")}`,
     );
   }
 }
@@ -176,6 +261,9 @@ export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined, cwd: string
   // An empty instance override means "the default" (under the private HOME): removed, never passed on as "".
   for (const k of INSTANCE_ENV) if (base[k] === "") delete out[k];
   Object.assign(out, st.childVars); // the frozen snapshot, whatever the test did to its own env
+  // DESKTOP: dry run unless the test's env names the key (then its value is deliberate); stand-ins first on PATH.
+  if (!("RELAY_FOCUS_DRY_RUN" in base)) out.RELAY_FOCUS_DRY_RUN = "1";
+  if (typeof out.PATH === "string") out.PATH = shimmedPath(out.PATH);
   const imp = `--import=${pathToFileURL(PRELOAD).href}`;
   const nodeOpts = base.NODE_OPTIONS ?? "";
   if (!nodeOpts.includes(imp)) out.NODE_OPTIONS = `${nodeOpts} ${imp}`.trim();
@@ -183,6 +271,21 @@ export function decorateChildEnv(env: NodeJS.ProcessEnv | undefined, cwd: string
 }
 
 type AnyFn = (...args: unknown[]) => unknown;
+
+/** Refuse a spawn-family call that would start a desktop actuator (see DESKTOP TRIPWIRE). */
+function checkDesktop(name: string, args: unknown[], argvAt1: boolean): void {
+  if (name === "fork" || typeof args[0] !== "string") return; // fork runs a node module
+  const how = `child_process.${name}`;
+  if (!argvAt1) {
+    const hit = desktopActuatorInShell(args[0]);
+    if (hit) refuseDesktop(hit, how);
+    return;
+  }
+  const argv = Array.isArray(args[1]) ? (args[1] as unknown[]) : [];
+  const opts = args.find((x, k) => k > 0 && x !== null && typeof x === "object" && !Array.isArray(x)) as { shell?: unknown } | undefined;
+  const hit = opts?.shell ? desktopActuatorInShell([args[0], ...argv].join(" ")) : desktopActuator(args[0], argv);
+  if (hit) refuseDesktop(hit, how);
+}
 /** Rewrite the options argument of a spawn-family call so the child carries the tripwire. */
 function withTripwireEnv(args: unknown[], argvAt1: boolean): unknown[] {
   const a = [...args];
@@ -225,6 +328,7 @@ function wrap(name: "spawn" | "spawnSync" | "execFile" | "execFileSync" | "exec"
   const original = mod[name];
   if (original[WRAPPED]) return;
   const wrapped = function (this: unknown, ...args: unknown[]) {
+    checkDesktop(name, args, argvAt1);
     let r: unknown;
     try {
       r = original.apply(this, withTripwireEnv(args, argvAt1));
@@ -244,6 +348,7 @@ function wrap(name: "spawn" | "spawnSync" | "execFile" | "execFileSync" | "exec"
   if (custom !== undefined)
     Object.defineProperty(wrapped, Symbol.for("nodejs.util.promisify.custom"), {
       value: (...args: unknown[]) => {
+        checkDesktop(name, args, argvAt1);
         const p = (custom as AnyFn)(...withTripwireEnv(args, argvAt1)) as { child?: unknown };
         supervise(p?.child, `child_process.${name} (promisified)`);
         return p;
