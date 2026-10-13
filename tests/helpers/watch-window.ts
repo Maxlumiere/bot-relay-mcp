@@ -39,6 +39,7 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { probePid, processStartedAt, startOrNull } from "../../src/liveness.js";
+import { parsePid } from "../_helpers/recorded-pid.js";
 
 /** The kernel says the pid runs (INV-LIVE-01: gone and unknown are both "not proven alive": fail closed). */
 const isPidAlive = (pid: number): boolean => probePid(pid) === "alive";
@@ -255,10 +256,10 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
     child.stdin?.write(`( ${cmd} > ${sq(O)} 2> ${sq(E)} & p=$!; echo $p > ${sq(P)}; wait $p; rc=$?; ${pause}echo $rc > ${sq(C)} ) &\n`);
     const pid = async (): Promise<number> => {
       for (let i = 0; i < 200; i++) {
-        const t = read(P).trim();
-        if (/^\d+$/.test(t)) {
-          if (!pids.includes(Number(t))) pids.push(Number(t));
-          return Number(t);
+        const pid = parsePid(read(P)); // ONE captured string: digits AND > 1, or keep waiting (never 0, the group)
+        if (pid !== null) {
+          if (!pids.includes(pid)) pids.push(pid);
+          return pid;
         }
         await sleep(25);
       }
