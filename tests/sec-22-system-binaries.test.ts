@@ -98,6 +98,35 @@ describe.runIf(process.platform === "win32")("SEC-22 (Windows): the relay's SID 
   });
 });
 
+describe.runIf(process.platform === "win32")("SEC-22 (Windows): the host id (MachineGuid) never comes from a PATH-found reg", () => {
+  const savedPath = process.env.Path ?? process.env.PATH;
+  const savedNodeOptions = process.env.NODE_OPTIONS;
+  afterEach(() => {
+    process.env.PATH = savedPath;
+    if (savedNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = savedNodeOptions;
+    vi.resetModules();
+  });
+
+  it("HARM a PLANTED reg.exe first on PATH, printing a forged MachineGuid: the relay reads the real one (Codex #336 R1 P1)", async () => {
+    const realReg = path.win32.join(process.env.SystemRoot!, "System32", "reg.exe");
+    const real = /MachineGuid\s+REG_SZ\s+(\S+)/i.exec(spawnSync(realReg, ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"], { encoding: "utf-8" }).stdout)?.[1];
+    expect(real, "precondition: the system reg reads this host's MachineGuid").toMatch(/^[0-9a-f-]{36}$/i);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sec22-reg-"));
+    fs.copyFileSync(process.execPath, path.join(dir, "reg.exe")); // a real exe named reg...
+    const forge = path.join(dir, "forge.cjs"); // ...that prints a forged MachineGuid before node parses its arguments
+    fs.writeFileSync(forge, "process.stdout.write('    MachineGuid    REG_SZ    00000000-0000-0000-0000-000000004242\\r\\n'); process.exit(0);\n");
+    expect(forge, "a temp path with no spaces (NODE_OPTIONS splits on them)").not.toMatch(/\s/);
+    process.env.PATH = `${dir};${savedPath}`;
+    process.env.NODE_OPTIONS = `${savedNodeOptions ?? ""} --require ${forge}`.trim();
+    expect(spawnSync("reg", ["query"], { encoding: "utf-8" }).stdout, "control: the planted reg answers by name").toMatch(/000000004242/);
+    vi.resetModules();
+    const guid = (await import("../src/liveness.js")).machineGuid("win32");
+    expect(guid).not.toBe("00000000-0000-0000-0000-000000004242");
+    expect(guid).toBe(real);
+  });
+});
+
 /**
  * Every subprocess in src/ that does NOT go through systemBinary(...) or process.execPath, by
  * "<file>::<enclosing top-level function>::<first argument>", with WHY it may. A new one fails this test until it is
