@@ -689,11 +689,11 @@ step "25-tool + CLI smoke (isolated relay)" smoke_25_isolated || exit 1
 # its own daemon/CLI driven in a sandboxed HOME (scripts/release-invariants.mjs). Then the KNOWN-BAD control: the
 # registry's latest published tarball must still FAIL the harms pinned in security/known-bad.json, or the suite went
 # blind. The control needs the registry: offline, it FAILS (no skip flag). In the CI smoke only, the control is left
-# to ci.yml's release-gate job (main pushes and tags), never during a real publish.
+# to .github/workflows/release-gate.yml (main pushes, tags, gate-changing PRs), never during a real publish.
 release_security_gate() {
   node "$PROJECT_ROOT/scripts/release-invariants.mjs" candidate --pack || return 1
   if _relay_is_ci_smoke; then
-    echo "  SKIP  the known-bad control runs in ci.yml's release-gate job (main pushes, tags); RELAY_SMOKE_ONLY set (CI smoke, not a publish)."
+    echo "  SKIP  the known-bad control runs in .github/workflows/release-gate.yml; RELAY_SMOKE_ONLY set (CI smoke, not a publish)."
     return 0
   fi
   node "$PROJECT_ROOT/scripts/release-invariants.mjs" control latest || return 1

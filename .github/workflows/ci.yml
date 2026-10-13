@@ -3,10 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    # A tag is a publish: the release security gate (release-gate below) is REQUIRED on it.
-    tags: ['v*']
-  # Manual runs (e.g. a release-gate change proving its macOS/Windows legs on its own branch before merge).
-  workflow_dispatch:
   # Run CI on EVERY pull request regardless of its BASE branch. `branches: [main]`
   # matched ONLY PRs whose base is main, so a STACKED PR (base = another feature
   # branch — e.g. a PR stacked on an unmerged arc) NEVER triggered CI and shipped
@@ -264,41 +260,3 @@ jobs:
         run: bash scripts/pre-publish-check.sh
         env:
           RELAY_SMOKE_ONLY: '1'
-
-  # The RELEASE SECURITY GATE (security/invariants.json): the PACKED, INSTALLED package against its own security
-  # invariants, on all three OSes, on main pushes (post-merge drift), tags (REQUIRED for a publish) and manual runs.
-  # Pull requests get the ubuntu candidate through the smoke job's pre-publish gate. The KNOWN-BAD control (the
-  # registry's latest must still fail its pinned harms, or the suite went blind) runs once, on ubuntu.
-  release-gate:
-    name: Release security gate (${{ matrix.os }})
-    if: github.event_name != 'pull_request'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-2022]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        shell: bash
-        run: npm run build
-
-      - name: Candidate (this tree, packed and installed)
-        shell: bash
-        run: node scripts/release-invariants.mjs candidate --pack
-
-      - name: Known-bad control (the registry's latest)
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: node scripts/release-invariants.mjs control latest
