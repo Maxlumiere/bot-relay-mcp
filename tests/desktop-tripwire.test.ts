@@ -47,16 +47,21 @@ describe.skipIf(process.platform === "win32")("NESTED: every desktop harm is ref
   });
 
   it("precondition: the fixture ran (every test has a verdict) and its controls PASSED", () => {
-    expect(Object.keys(result.verdicts).length, result.out.slice(-1500)).toBe(16);
-    for (const [t, v] of Object.entries(result.verdicts)) if (t.startsWith("control")) expect(v.status, `${t}: ${v.messages}`).toBe("passed");
+    expect(Object.keys(result.verdicts).length, result.out.slice(-1500)).toBe(26);
+    const controls = Object.entries(result.verdicts).filter(([t]) => t.startsWith("control"));
+    expect(controls.length).toBe(9);
+    for (const [t, v] of controls) expect(v.status, `${t}: ${v.messages}`).toBe("passed");
   });
 
   it("every HARM test FAILED, naming the desktop tripwire (a swallowed refusal is still failed by afterEach)", () => {
     const harms = Object.entries(result.verdicts).filter(([t]) => t.startsWith("HARM"));
-    expect(harms.length).toBe(11);
+    expect(harms.length).toBe(16);
     for (const [t, v] of harms) {
       expect(v.status, t).toBe("failed");
       expect(v.messages, t).toMatch(/desktop/);
+      // Each harm's OWN assertions held (Codex #333 R2 NEW-5: an exit-status check after a sync spawn never ran); it
+      // failed only on the tripwire's record.
+      expect(v.messages, t).not.toMatch(/AssertionError/);
     }
   });
 
@@ -71,8 +76,13 @@ describe.skipIf(process.platform === "win32")("NESTED: every desktop harm is ref
     expect(m("HARM powershell-appactivate")).toMatch(/refused powershell \(WScript\.Shell\)/);
     expect(m("HARM bash-child-by-name")).toMatch(/desktop child pid=\d+ ppid=\d+: refused osascript by name/);
     expect(m("HARM env-path")).toMatch(/child_process\.spawnSync: refused osascript/);
-    expect(m("HARM command-p-shell")).toMatch(/child_process\.spawnSync: refused xdotool/);
-    expect(m("HARM bash-c-command-p")).toMatch(/child_process\.spawnSync: refused xdotool/);
+    expect(m("HARM command-p-shell")).toMatch(/child_process\.spawnSync: refused command -p/);
+    expect(m("HARM bash-c-command-p")).toMatch(/child_process\.spawnSync: refused command -p/);
+    expect(m("HARM env-S")).toMatch(/child_process\.spawnSync: refused osascript/);
+    expect(m("HARM input-fed")).toMatch(/child_process\.spawnSync: refused osascript/);
+    expect(m("HARM eval")).toMatch(/child_process\.spawnSync: refused eval/);
+    expect(m("HARM if-command-p")).toMatch(/child_process\.spawnSync: refused command -p/);
+    expect(m("HARM ab-sequence")).toMatch(/refused osascript by name/);
     // P2: the refusal was RECORDED although the script swallowed it and its PATH had no mktemp.
     expect(m("HARM restricted-path-swallowed")).toMatch(/desktop child pid=\d+ ppid=\d+: refused osascript by name/);
   });
@@ -84,5 +94,10 @@ describe.skipIf(process.platform === "win32")("NESTED: every desktop harm is ref
   it("the run FAILED at teardown, listing the violations (catch-proof)", () => {
     expect(result.code).not.toBe(0);
     expect(result.out).toMatch(/OPERATOR_TRIPWIRE: \d+ operator-tripwire violation\(s\) in this run/);
+  });
+
+  it("a grandchild with a STRIPPED env still records (via the run's fallback dir): its test passes, the RUN fails on it (NEW-5)", () => {
+    expect(result.verdicts[Object.keys(result.verdicts).find((t) => t.startsWith("FALLBACK"))!]!.status).toBe("passed");
+    expect(result.out).toMatch(/refused osascript by name \(a test must never raise, open or type into a window; recorded via fallback\)/);
   });
 });

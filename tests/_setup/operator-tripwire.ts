@@ -32,20 +32,27 @@
  * The operator snapshot (home, roots, ports) comes from the base config's env and is FROZEN at load:
  * deleting an env var later cannot drop protection. See the preload for the KNOWN RESIDUAL list.
  *
- * DESKTOP TRIPWIRE (the same sites): no test may raise, open or type into a window on the machine running it
- * (MEASURED on main ba5b97a: the dashboard focus tests ran `osascript … tell application "iTerm2" / activate`
- * twice per run). Three layers:
+ * DESKTOP TRIPWIRE (the same sites): a BEST-EFFORT tripwire against ACCIDENTAL desktop actuation by tests (ruled 13
+ * Oct). The product-path guarantee is RELAY_FOCUS_DRY_RUN (a dry run reports itself, never success). Deliberate escapes
+ * are out of scope until OS-level isolation exists. MEASURED on main ba5b97a: the dashboard focus tests ran
+ * `osascript … tell application "iTerm2" / activate` twice per run. Three layers:
  *   1. DRY RUN BY DEFAULT: every test file's worker, and every child it starts, gets RELAY_FOCUS_DRY_RUN=1 (a
  *      child whose env already names the key keeps the test's value: unsetting it is deliberate).
- *   2. REFUSED IN THE WORKER: a spawn-family call whose program is a desktop actuator (DESKTOP_ACTUATORS, or
- *      powershell/pwsh with AppActivate / WScript.Shell) is RECORDED and THROWS before anything starts; an
- *      exec() string is refused when an actuator is in COMMAND position (or in a quoted segment: over-detects,
- *      loudly, by design).
+ *   2. REFUSED IN THE WORKER (desktopActuatorOfCall): a spawn-family call that would start a desktop actuator
+ *      (DESKTOP_ACTUATORS, or powershell/pwsh with AppActivate / WScript.Shell) is RECORDED and THROWS before anything
+ *      starts. A wrapper (env, command, exec, nohup, sudo, timeout, …) is read through its OPTIONS to its one executed
+ *      operand (env -S is re-split; `command -v`/`-V` is a lookup, allowed). A shell's -c operand, an exec() string,
+ *      a shell:true line, and INPUT fed to a shell are read as command lines: quote-aware words (`echo "open it"` and
+ *      `grep "osascript" f` are NOT refused), command substitutions included. `eval` and `command -p` anywhere in a
+ *      command are refused (they run what this cannot read).
  *   3. REFUSED IN A CHILD, by name: every child's PATH starts with a directory of refusing stand-ins (one per
- *      actuator) that record a violation and exit 96 (97 when the record cannot be written), so a bash script
- *      or hook calling `osascript` by name is caught too.
- * NOT COVERED (stated): an actuator started by ABSOLUTE path from a child; a child given an env with no PATH or
- * env {}; Windows children (the stand-ins are POSIX scripts; the worker check still applies on Windows).
+ *      actuator) that record a violation (shell builtins only; a stripped env records in the run's fallback dir)
+ *      and exit 96 (97 when the record cannot be written), so a bash script or hook calling `osascript` by name is
+ *      caught too.
+ * NAMED EXCLUSIONS (not caught; tests/focus-dry-run.test.ts pins each one as the documented boundary): a script FILE
+ * that resets PATH (its contents are not read); a program name built by expansion ($tool, $(printf …)); an actuator
+ * started by ABSOLUTE path from a non-shell program (node, python). Also: a child given env {} or no PATH; Windows
+ * children (the stand-ins are POSIX scripts; the worker check applies on Windows).
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -129,15 +136,70 @@ const WINDOWS_ACTUATION = /AppActivate|WScript\.Shell/i;
 export const DESKTOP_REFUSED_EXIT = 96;
 
 const progName = (p: string) => path.basename(p.replace(/\\/g, "/")).toLowerCase().replace(/\.exe$/, "");
-/**
- * Programs that START their operand (Codex #333 R1 P1): `env PATH=… osascript` replaces the decorated PATH, and
- * `command -p open` searches the shell's DEFAULT path; both reach the real program past the stand-ins. After one of
- * these, EVERY later word naming an actuator counts (their options vary by platform: over-detects, loudly).
- */
-const WRAPPERS: ReadonlySet<string> = new Set(["env", "command", "exec", "builtin", "nohup", "sudo", "doas", "nice", "time", "timeout", "stdbuf", "setsid", "caffeinate", "arch", "xargs"]);
-/** Shells: only a -c style option's operand is a command line (a script's own arguments are not parsed). */
-const SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Programs that START an operand: each one's OPTIONS are parsed to find the ONE executed operand (ruled 13 Oct, after
+ * Codex #333 R2 NEW-3: treating every later word as a program refused honest calls such as `env node x.js /tmp/open`).
+ * `argOpts` take a value (separate, or attached: -uNAME, --unset=NAME); `assignments`: VAR=value words may precede the
+ * operand; `positional`: words that come before it (timeout's DURATION). Special cases in wrappedOperand: env -S
+ * (re-tokenized), command -v/-V (a lookup: nothing runs), command -p (REFUSED: it searches the shell's default path).
+ */
+const WRAPPER_SPECS: Readonly<Record<string, { argOpts: readonly string[]; assignments?: boolean; positional?: number }>> = {
+  env: { argOpts: ["-u", "-C", "-P", "--unset", "--chdir"], assignments: true },
+  command: { argOpts: [] },
+  exec: { argOpts: ["-a"] },
+  builtin: { argOpts: [] },
+  nohup: { argOpts: [] },
+  sudo: { argOpts: ["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U", "--user", "--group", "--chdir", "--prompt"], assignments: true },
+  doas: { argOpts: ["-u", "-C"] },
+  nice: { argOpts: ["-n", "--adjustment"] },
+  time: { argOpts: ["-o", "-f", "--output", "--format"] },
+  timeout: { argOpts: ["-s", "-k", "--signal", "--kill-after"], positional: 1 },
+  stdbuf: { argOpts: ["-i", "-o", "-e", "--input", "--output", "--error"] },
+  setsid: { argOpts: [] },
+  caffeinate: { argOpts: ["-t", "-w"] },
+  arch: { argOpts: ["-arch", "-d", "-e"] },
+  xargs: { argOpts: ["-n", "-I", "-L", "-s", "-P", "-E", "-J", "-R", "-S", "-d", "-a", "--max-args", "--replace", "--max-procs", "--delimiter", "--arg-file"] },
+};
+/** Shells: only a -c style option's operand (or input fed to its stdin) is a command line; a script's arguments are not parsed. */
+const SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+/** Words that start a shell command without being its program. */
+const SHELL_RESERVED: ReadonlySet<string> = new Set(["if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "case", "esac", "in"]);
+
+type Operand = { words: readonly string[] } | { lookupOnly: true } | { refuse: string };
+
+/** The ONE operand a wrapper executes (its own words, program first), or why there is none to check. */
+function wrappedOperand(name: string, rest: readonly string[]): Operand {
+  const spec = WRAPPER_SPECS[name]!;
+  let i = 0;
+  while (i < rest.length) {
+    const w = rest[i]!;
+    if (w === "--") {
+      i++;
+      break;
+    }
+    if (!w.startsWith("-") || w === "-") break;
+    if (name === "env" && (w === "-S" || w.startsWith("-S") || w === "--split-string" || w.startsWith("--split-string="))) {
+      // env -S splits its string into words and runs them (NEW-1): re-tokenize and check env again on the result.
+      const separate = w === "-S" || w === "--split-string";
+      const s = separate ? (rest[i + 1] ?? "") : w.startsWith("--split-string=") ? w.slice("--split-string=".length) : w.slice(2);
+      return { words: ["env", ...shellCommands(s).flat(), ...rest.slice(i + (separate ? 2 : 1))] };
+    }
+    if (name === "command") {
+      if (/^-[A-Za-z]*[vV]/.test(w)) return { lookupOnly: true }; // command -v / -V: says where a program is, runs nothing
+      if (/^-[A-Za-z]*p/.test(w)) return { refuse: "command -p (the shell's default path, past the stand-ins)" };
+    }
+    if (spec.argOpts.includes(w)) {
+      i += 2; // the option's value is the next word
+      continue;
+    }
+    i++; // a flag, an attached value (-uNAME, --unset=NAME), or a long flag
+  }
+  if (spec.assignments) while (i < rest.length && ASSIGNMENT.test(rest[i]!)) i++;
+  i += spec.positional ?? 0;
+  return { words: rest.slice(i) };
+}
 
 /** The actuator a command's words (program first) would start, or null. Pure. */
 function actuatorInWords(words: readonly string[]): string | null {
@@ -150,18 +212,11 @@ function actuatorInWords(words: readonly string[]): string | null {
   if ((name === "powershell" || name === "pwsh") && rest.some((a) => WINDOWS_ACTUATION.test(a))) {
     return `${name} (${rest.find((a) => WINDOWS_ACTUATION.test(a))!.match(WINDOWS_ACTUATION)![0]})`;
   }
-  if (WRAPPERS.has(name)) {
-    for (let k = 0; k < rest.length; k++) {
-      const w = rest[k]!;
-      if (ASSIGNMENT.test(w) || w.startsWith("-")) continue;
-      const hit = actuatorInWords(rest.slice(k)); // the operand is a command of its own (it may be a wrapper or a shell)
-      if (hit) return hit;
-      if (/\s/.test(w)) {
-        const inLine = desktopActuatorInShell(w); // e.g. caffeinate -i "osascript …" handed as one word
-        if (inLine) return inLine;
-      }
-    }
-    return null;
+  if (name in WRAPPER_SPECS) {
+    const op = wrappedOperand(name, rest);
+    if ("refuse" in op) return op.refuse;
+    if ("lookupOnly" in op) return null;
+    return actuatorInWords(op.words);
   }
   if (SHELLS.has(name)) {
     const c = rest.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
@@ -175,34 +230,155 @@ export function desktopActuator(program: string, args: readonly unknown[] = []):
   return actuatorInWords([program, ...args.filter((a): a is string => typeof a === "string")]);
 }
 
+/** The text inside a balanced `(...)` starting at `start` (just after the opening paren), and the index after `)`. */
+function balancedParen(src: string, start: number): [string, number] {
+  let depth = 1;
+  let q: string | null = null;
+  for (let j = start; j < src.length; j++) {
+    const ch = src[j]!;
+    if (q) {
+      if (ch === "\\" && q === '"') j++;
+      else if (ch === q) q = null;
+    } else if (ch === "'" || ch === '"') q = ch;
+    else if (ch === "\\") j++;
+    else if (ch === "(") depth++;
+    else if (ch === ")" && --depth === 0) return [src.slice(start, j), j + 1];
+  }
+  return [src.slice(start), src.length];
+}
+
 /**
- * The desktop actuator a SHELL string would start, or null. Pure. Each segment between command separators
- * (; & | newline ( ) backtick) and quotes is a command; its program (after VAR=value assignments, and through any
- * wrapper) is checked. Splitting at quotes over-detects (`echo "open it"` is fine, `env x "open"` is refused):
- * loud, never silent.
+ * A shell command line as its commands, each a list of WORDS with quoting removed and word boundaries kept (Codex #333
+ * R2 NEW-3: `grep "osascript" file` is grep reading a word, not a call of osascript). Commands split at ; & | newline
+ * ( ) (`2>&1`-style redirections stay in their word). A command substitution, $(…) or `…`, also inside double quotes,
+ * is a command line of its own and is added as such; its word becomes a placeholder. A # comment is skipped. NOT a
+ * full shell grammar (stated in the header): expansions are not evaluated.
+ */
+export function shellCommands(src: string): string[][] {
+  const cmds: string[][] = [];
+  let words: string[] = [];
+  let cur = "";
+  let inWord = false;
+  const endWord = () => {
+    if (inWord) words.push(cur);
+    cur = "";
+    inWord = false;
+  };
+  const endCmd = () => {
+    endWord();
+    if (words.length) cmds.push(words);
+    words = [];
+  };
+  const substitution = (inner: string) => {
+    cmds.push(...shellCommands(inner));
+    cur += "$(...)";
+    inWord = true;
+  };
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]!;
+    if (c === "\\") {
+      if (i + 1 < src.length && src[i + 1] !== "\n") cur += src[i + 1];
+      i++;
+      inWord = true;
+    } else if (c === "'") {
+      const end = src.indexOf("'", i + 1);
+      const stop = end < 0 ? src.length : end;
+      cur += src.slice(i + 1, stop);
+      inWord = true;
+      i = stop;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== '"') {
+        if (src[j] === "\\" && j + 1 < src.length) {
+          cur += src[j + 1];
+          j += 2;
+        } else if (src[j] === "$" && src[j + 1] === "(") {
+          const [inner, after] = balancedParen(src, j + 2);
+          substitution(inner);
+          j = after;
+        } else if (src[j] === "`") {
+          const end = src.indexOf("`", j + 1);
+          const stop = end < 0 ? src.length : end;
+          substitution(src.slice(j + 1, stop));
+          j = stop + 1;
+        } else cur += src[j++];
+      }
+      inWord = true;
+      i = j;
+    } else if (c === "$" && src[i + 1] === "(") {
+      const [inner, after] = balancedParen(src, i + 2);
+      substitution(inner);
+      i = after - 1;
+    } else if (c === "`") {
+      const end = src.indexOf("`", i + 1);
+      const stop = end < 0 ? src.length : end;
+      substitution(src.slice(i + 1, stop));
+      i = stop;
+    } else if (c === "#" && !inWord) {
+      const nl = src.indexOf("\n", i);
+      i = nl < 0 ? src.length : nl - 1;
+    } else if (c === "&" && (src[i - 1] === ">" || src[i - 1] === "<" || src[i + 1] === ">")) {
+      cur += c; // 2>&1, >&2, &> : a redirection, not a separator
+      inWord = true;
+    } else if (";&|\n()".includes(c)) endCmd();
+    else if (/\s/.test(c)) endWord();
+    else {
+      cur += c;
+      inWord = true;
+    }
+  }
+  endCmd();
+  return cmds;
+}
+
+/**
+ * The desktop actuator a SHELL command line would start, or null. Pure. Each command (see shellCommands): `eval` or
+ * `command -p` ANYWHERE in it is refused (both run what this check cannot read: ruled 13 Oct); otherwise its program,
+ * after leading reserved words (if, then, !, …) and VAR=value assignments, and through any wrapper, is checked.
  */
 export function desktopActuatorInShell(cmd: string): string | null {
-  for (const seg of cmd.split(/[;&|\n()`"']+/)) {
-    const words = seg.trim().split(/\s+/).filter((w) => w && w !== "$");
-    const hit = actuatorInWords(words);
+  for (const words of shellCommands(cmd)) {
+    if (words.includes("eval")) return "eval (runs a command line this check cannot read)";
+    const ci = words.indexOf("command");
+    if (ci >= 0 && /^-[A-Za-z]*p/.test(words[ci + 1] ?? "")) return "command -p (the shell's default path, past the stand-ins)";
+    let k = 0;
+    while (k < words.length && SHELL_RESERVED.has(words[k]!)) k++;
+    const hit = actuatorInWords(words.slice(k));
     if (hit) return hit;
   }
   if (/\b(powershell|pwsh)(\.exe)?\b/i.test(cmd) && WINDOWS_ACTUATION.test(cmd)) return `powershell (${cmd.match(WINDOWS_ACTUATION)![0]})`;
   return null;
 }
 
+/**
+ * The desktop actuator a spawn-family CALL would start, or null. Pure (for tests). `argvAt1`: (file, args, opts) forms;
+ * else (command string, opts). A shell given input (options.input) runs that input as a command line: it is checked
+ * too (ruled 13 Oct).
+ */
+export function desktopActuatorOfCall(args: readonly unknown[], argvAt1: boolean): string | null {
+  if (typeof args[0] !== "string") return null;
+  const opts = args.find((x, k) => k > 0 && x !== null && typeof x === "object" && !Array.isArray(x)) as { shell?: unknown; input?: unknown } | undefined;
+  const argv = argvAt1 && Array.isArray(args[1]) ? (args[1] as unknown[]).filter((a): a is string => typeof a === "string") : [];
+  const line = !argvAt1 || opts?.shell ? [args[0], ...argv].join(" ") : null;
+  const hit = line !== null ? desktopActuatorInShell(line) : desktopActuator(args[0], argv);
+  if (hit) return hit;
+  const input = typeof opts?.input === "string" ? opts.input : Buffer.isBuffer(opts?.input) ? opts.input.toString("utf-8") : null;
+  if (input !== null) {
+    const programs = line !== null ? shellCommands(line).map((w) => progName(w[0] ?? "")) : [progName(args[0])];
+    if (programs.some((p) => SHELLS.has(p))) return desktopActuatorInShell(input);
+  }
+  return null;
+}
+
 /** Record + THROW before a desktop actuator starts. The record fails this test's afterEach and the run, caught or not. */
 function refuseDesktop(what: string, how: string): never {
   const line = `desktop ${how}: refused ${what} (a test must never raise, open or type into a window)`;
-  pre.recordViolation(line);
-  // This THROW is the spawn-time report: mark what is recorded so far as reported by the "spawn" reporter, so it is not
-  // re-thrown at a LATER test's sync spawn (that made a later test "fail" on this test's refusal: seen under mutant
-  // MP3). afterEach keeps its own cursor and still fails the test that caused it, caught or not.
-  try {
-    newViolations("spawn");
-  } catch {
-    /* unreadable: afterEach fails closed on it */
-  }
+  const id = pre.recordViolation(line);
+  // This THROW is the spawn-time report of THIS record only: it is marked reported for the "spawn" reporter, so a
+  // LATER sync spawn does not re-throw it (that made another test "fail" on this refusal: mutant MP3). Any OTHER record
+  // still unreported (a child's, say) stays for the next sync spawn (Codex #333 R2 NEW-4: marking everything lost it).
+  // afterEach keeps its own cursor and fails the test that caused each one, caught or not.
+  if (id) state().seen.spawn.add(id);
   throw new pre.OperatorTripwireError(`DESKTOP_TRIPWIRE: ${line}. Use RELAY_FOCUS_DRY_RUN=1 / RELAY_SPAWN_DRY_RUN=1, or test the driver's pure buildCommand.`);
 }
 
@@ -221,8 +397,9 @@ if (SHIM_DIR && !fs.existsSync(path.join(SHIM_DIR, ".complete"))) {
     // with no mktemp used to make the record fail, and a caller's `|| true` then swallowed the 97, so the run went green.
     const body =
       `#!/bin/sh\n# DESKTOP TRIPWIRE stand-in (tests/_setup/operator-tripwire.ts): refuses ${name}, records it, never runs it.\n` +
-      `d="\${RELAY_TEST_TRIPWIRE_DIR:-${SHIM_FALLBACK_DIR}}"\n` +
-      `if [ -n "$d" ] && { printf '%s\\n' "desktop child pid=$$ ppid=$PPID: refused ${name} by name (a test must never raise, open or type into a window)" >> "$d/desktop-$$-${name}.txt"; } 2>/dev/null; then\n` +
+      `d="\${RELAY_TEST_TRIPWIRE_DIR:-}"; via=env\n` +
+      `if [ -z "$d" ]; then d="${SHIM_FALLBACK_DIR}"; via=fallback; fi\n` +
+      `if { printf '%s\\n' "desktop child pid=$$ ppid=$PPID: refused ${name} by name (a test must never raise, open or type into a window; recorded via $via)" >> "$d/desktop-$$-${name}.txt"; } 2>/dev/null; then\n` +
       `  echo "DESKTOP_TRIPWIRE: refused ${name}" >&2; exit ${DESKTOP_REFUSED_EXIT}\nfi\n` +
       `echo "DESKTOP_TRIPWIRE: refused ${name} and could not record it" >&2; exit ${pre.RECORD_FAILED_EXIT}\n`;
     const tmp = path.join(SHIM_DIR, `.${name}.${process.pid}`);
@@ -323,17 +500,9 @@ type AnyFn = (...args: unknown[]) => unknown;
 
 /** Refuse a spawn-family call that would start a desktop actuator (see DESKTOP TRIPWIRE). */
 function checkDesktop(name: string, args: unknown[], argvAt1: boolean): void {
-  if (name === "fork" || typeof args[0] !== "string") return; // fork runs a node module
-  const how = `child_process.${name}`;
-  if (!argvAt1) {
-    const hit = desktopActuatorInShell(args[0]);
-    if (hit) refuseDesktop(hit, how);
-    return;
-  }
-  const argv = Array.isArray(args[1]) ? (args[1] as unknown[]) : [];
-  const opts = args.find((x, k) => k > 0 && x !== null && typeof x === "object" && !Array.isArray(x)) as { shell?: unknown } | undefined;
-  const hit = opts?.shell ? desktopActuatorInShell([args[0], ...argv].join(" ")) : desktopActuator(args[0], argv);
-  if (hit) refuseDesktop(hit, how);
+  if (name === "fork") return; // fork runs a node module
+  const hit = desktopActuatorOfCall(args, argvAt1);
+  if (hit) refuseDesktop(hit, `child_process.${name}`);
 }
 /** Rewrite the options argument of a spawn-family call so the child carries the tripwire. */
 function withTripwireEnv(args: unknown[], argvAt1: boolean): unknown[] {

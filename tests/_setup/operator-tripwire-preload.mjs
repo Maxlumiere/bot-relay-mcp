@@ -223,13 +223,18 @@ export function isOperatorHome(p, snap = tripwireSnapshot()) {
   return c !== null && c === snap.realHome.key;
 }
 
-/** Record one violation as its OWN file (never consumed). Fails CLOSED when it cannot be written. */
+/**
+ * Record one violation as its OWN file (never consumed), and return that file's name (its id), so a reporter can mark
+ * exactly this record. Fails CLOSED when it cannot be written (returns undefined in the worker, which marks itself).
+ */
 export function recordViolation(line) {
   const dir = tripwireSnapshot()?.recordDir;
   const text = `${line.replace(/\n/g, " ")}\n`;
   try {
     if (!dir) throw new Error("no violations directory (RELAY_TEST_TRIPWIRE_DIR) in this process");
-    RAW_FS.writeFileSync(path.join(dir, `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`), text, { flag: "wx" });
+    const name = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`;
+    RAW_FS.writeFileSync(path.join(dir, name), text, { flag: "wx" });
+    return name;
   } catch (err) {
     const why = `OPERATOR_TRIPWIRE: could not record a violation (${err instanceof Error ? err.message : String(err)}): ${text}`;
     if (globalThis[IN_WORKER]) {

@@ -22,7 +22,7 @@ import os from "os";
 import cp from "child_process";
 import type { Server as HttpServer } from "http";
 import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
-import { decorateChildEnv, desktopActuator, desktopActuatorInShell, tripwireView } from "./_setup/operator-tripwire.js";
+import { decorateChildEnv, desktopActuator, desktopActuatorInShell, desktopActuatorOfCall, tripwireView } from "./_setup/operator-tripwire.js";
 
 // What the HARNESS gave this file, read before any test or hook here can change it (an afterEach that set it would make
 // the harness-default assertion below pass vacuously: seen under mutant M4).
@@ -143,14 +143,22 @@ describe("the desktop-actuator predicates (pure)", () => {
     // `command -p` searches the shell's DEFAULT path: both reach the real program past the stand-ins.
     ["env", ["PATH=/usr/bin:/bin", "osascript", "-e", "beep"], "osascript"],
     ["/usr/bin/env", ["-i", "open", "-a", "Calculator"], "open"],
-    ["command", ["-p", "open", "-a", "Calculator"], "open"],
+    ["command", ["-p", "open", "-a", "Calculator"], "command -p"],
     ["nohup", ["xdotool", "key", "a"], "xdotool"],
     ["env", ["FOO=1", "powershell", "-c", "(New-Object -ComObject WScript.Shell).AppActivate('t')"], "powershell (WScript.Shell)"],
     // A shell's -c string is a command line.
-    ["bash", ["-c", "command -p open -a Calculator"], "open"],
+    ["bash", ["-c", "command -p open -a Calculator"], "command -p"],
     ["sh", ["-lc", "env PATH=/usr/bin osascript -e beep"], "osascript"],
+    // env -S splits its string and runs it (Codex #333 R2 NEW-1): re-tokenized, every spelling.
+    ["env", ["-S", "PATH=/usr/bin:/bin osascript -e beep"], "osascript"],
+    ["env", ["-SPATH=/bin osascript -e beep"], "osascript"],
+    ["env", ["--split-string=FOO=1 open -a Calculator"], "open"],
+    // Options are parsed to the ONE operand.
+    ["sudo", ["-u", "bob", "osascript", "-e", "beep"], "osascript"],
+    ["timeout", ["-s", "KILL", "5", "osascript", "-e", "beep"], "osascript"],
+    ["exec", ["-a", "alias", "open", "-a", "Calculator"], "open"],
   ])("HARM %s %j → refused as %s", (program, args, expected) => {
-    expect(desktopActuator(program, args)).toBe(expected);
+    expect(desktopActuator(program, args)).toContain(expected);
   });
 
   it.each([
@@ -164,6 +172,11 @@ describe("the desktop-actuator predicates (pure)", () => {
     ["command", ["-v", "ls"]],
     ["bash", ["-c", "echo open"]],
     ["bash", ["hooks/check-relay.sh", "open"]], // a script's ARGUMENTS are not parsed: only a -c string is a command line
+    // Codex #333 R2 NEW-3: honest calls that the every-later-word rule refused. The wrapper's ONE operand is checked.
+    ["env", ["LC_ALL=C", "grep", "osascript", "file.txt"]],
+    ["env", ["node", "script.js", "/tmp/open"]],
+    ["command", ["-v", "osascript"]],
+    ["timeout", ["5", "node", "x.js", "open"]],
   ])("TWIN %s %j → not an actuator (plain PowerShell ACL calls stay allowed)", (program, args) => {
     expect(desktopActuator(program, args)).toBeNull();
   });
@@ -175,20 +188,53 @@ describe("the desktop-actuator predicates (pure)", () => {
     ["bash -c \"osascript -e 'beep'\"", "osascript"],
     ["sudo xdotool key a", "xdotool"],
     ["powershell -c (New-Object -ComObject WScript.Shell).AppActivate('t')", "powershell (WScript.Shell)"],
-    ["command -p open -a Calculator", "open"],
+    ["command -p open -a Calculator", "command -p"],
     ["env PATH=/usr/bin:/bin osascript -e beep", "osascript"],
     ["FOO=1 env -i PATH=/bin nohup wmctrl -a t", "wmctrl"],
     ["exec osascript -e beep", "osascript"],
+    // eval and command -p ANYWHERE in a command (they run what this check cannot read: ruled 13 Oct).
+    ["eval osascript -e beep", "eval"],
+    ["if command -p open -a Calculator; then :; fi", "command -p"],
+    ["x=1; eval \"$cmd\"", "eval"],
+    // Command substitutions are command lines, inside double quotes too.
+    ["echo $(osascript -e beep)", "osascript"],
+    ['echo "result: $(osascript -e beep)"', "osascript"],
+    ["echo `open .`", "open"],
   ])("HARM shell %j → refused as %s", (cmd, expected) => {
-    expect(desktopActuatorInShell(cmd)).toBe(expected);
+    expect(desktopActuatorInShell(cmd)).toContain(expected);
   });
 
-  it.each([["ls; cat file"], ["node -e \"fs.openSync('x')\""], ["powershell -NoProfile -Command Get-Acl ."], ["git log --oneline"], ["command -v osascript-free-name"], ["env FOO=1 node -e 0"]])(
+  it.each([["ls; cat file"], ["node -e \"fs.openSync('x')\""], ["powershell -NoProfile -Command Get-Acl ."], ["git log --oneline"], ["command -v osascript-free-name"], ["env FOO=1 node -e 0"],
+    // Codex #333 R2 NEW-3: quoted ARGUMENTS are data, and `command -v` is a lookup.
+    ['grep "osascript" file.txt'], ['echo "open it"'], ["command -v osascript"], ["ls 2>&1 | grep open-report"]])(
     "TWIN shell %j → not an actuator",
     (cmd) => {
       expect(desktopActuatorInShell(cmd)).toBeNull();
     },
   );
+
+  it.each([
+    ["bash fed osascript on stdin", [["bash", [], { input: "osascript -e beep\n" }], true], "osascript"],
+    ["sh fed a Buffer", [["sh", ["-s"], { input: Buffer.from("PATH=/usr/bin:/bin\nopen -a Calculator\n") }], true], "open"],
+    ["exec() of bash with input", [["bash", { input: "eval x" }], false], "eval"],
+  ] as const)("HARM %s (a shell runs its INPUT as a command line: read too, ruled 13 Oct)", (_l, [args, argvAt1], expected) => {
+    expect(desktopActuatorOfCall(args as unknown[], argvAt1)).toContain(expected);
+  });
+
+  it("TWIN input to a NON-shell program is data (node reading stdin)", () => {
+    expect(desktopActuatorOfCall(["node", ["-e", "process.stdin.pipe(process.stdout)"], { input: "osascript -e beep" }], true)).toBeNull();
+  });
+
+  // THE DOCUMENTED BOUNDARY (ruled 13 Oct): each named exclusion is pinned as NOT caught, so the header's claim and the
+  // code cannot drift apart. If one of these starts returning an actuator, update the header's exclusions with it.
+  it.each([
+    ["a script FILE that resets PATH (its contents are not read)", () => desktopActuator("bash", ["/tmp/resets-path-then-osascript.sh"])],
+    ["a program name built by a variable", () => desktopActuatorInShell('tool=open; "$tool" -a Calculator')],
+    ["a program name built by a substitution", () => desktopActuatorInShell("$(printf open) -a Calculator")],
+    ["an absolute-path actuator from a non-shell program", () => desktopActuator("node", ["-e", "require('child_process').spawnSync('/usr/bin/osascript')"])],
+  ])("BOUNDARY (documented, NOT caught): %s", (_label, call) => {
+    expect(call()).toBeNull();
+  });
 
   it("TWIN (Q2), through the REAL wrapped spawnSync: a plain PowerShell ACL call is NOT refused", () => {
     // Not installed on macOS/Linux (ENOENT, a normal spawn error) and real on Windows: either way the tripwire must not
