@@ -21,7 +21,6 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
 import type { TestProject } from "vitest/node";
 
 export interface ReleaseInstall {
@@ -58,7 +57,7 @@ function canonical(v: unknown): unknown {
   return v;
 }
 
-export default async function setup(project: TestProject): Promise<() => void> {
+export default function setup(project: TestProject): () => void {
   if (process.env.RELAY_RELEASE_LIST_ONLY === "1") {
     project.provide("release", null);
     return () => undefined;
@@ -82,11 +81,16 @@ export default async function setup(project: TestProject): Promise<() => void> {
   const version = (JSON.parse(fs.readFileSync(path.join(pkg, "package.json"), "utf-8")) as { version: string }).version;
   const ls = spawnSync(npm, ["ls", "--json", "--all", "--prefix", prefix], { encoding: "utf-8", env: npmEnv, maxBuffer: 64 * 1024 * 1024, shell: process.platform === "win32" });
   const depsDigest = sha("sha256", JSON.stringify(canonical(JSON.parse(ls.stdout || "{}")))).toString("hex");
+  // The stamp is READ, never imported: it is generated as `export const BUILD_INFO = Object.freeze(<json>);`, so its JSON
+  // is parsed from the text (and a guard refuses a computed import specifier). Absent or another shape (a build that
+  // predates the stamp, e.g. 3.0.1): null, reported as "unstamped".
   let build: ReleaseInstall["build"] = null;
   try {
-    build = ((await import(pathToFileURL(path.join(pkg, "dist", "build-info.js")).href)) as { BUILD_INFO?: ReleaseInstall["build"] }).BUILD_INFO ?? null;
+    const text = fs.readFileSync(path.join(pkg, "dist", "build-info.js"), "utf-8");
+    const json = text.slice(text.indexOf("Object.freeze(") + "Object.freeze(".length, text.lastIndexOf(");"));
+    build = JSON.parse(json) as ReleaseInstall["build"];
   } catch {
-    build = null; // a build that predates the stamp (e.g. 3.0.1)
+    build = null;
   }
   const release: ReleaseInstall = { tgz, integrity, pkg, version, depsDigest, work, build };
   fs.writeFileSync(path.join(work, "release-install.json"), JSON.stringify(release, null, 2));

@@ -61,20 +61,14 @@ export function sandbox(label: string, opts: { defaultPaths?: boolean } = {}): S
   if (!opts.defaultPaths) fs.mkdirSync(relayHome, { recursive: true, mode: 0o700 });
   const dbPath = path.join(relayHome, "relay.db");
   const configPath = path.join(relayHome, "config.json");
-  const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    SYSTEMROOT: process.env.SYSTEMROOT, // Windows: node needs it to start
-    TEMP: process.env.TEMP,
-    TMP: process.env.TMP,
-    TMPDIR: process.env.TMPDIR,
-    HOME: home,
-    USERPROFILE: home,
-    RELAY_HOME: relayHome,
-    RELAY_DB_PATH: dbPath,
-    RELAY_CONFIG_PATH: configPath,
-  };
-  if (opts.defaultPaths) for (const k of ["RELAY_HOME", "RELAY_DB_PATH", "RELAY_CONFIG_PATH"]) delete env[k];
-  for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+  // The FULL parent env (a user's daemon has theirs; a minimal one broke Windows' `whoami /user`, so the relay could
+  // not read its own SID and refused its secret, MEASURED in CI), minus every relay and test-runner variable, with
+  // every HOME spelling pointed at the sandbox. The operator tripwire still decorates each child it starts.
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !/^(RELAY_|VITEST|__VITEST)/i.test(k)) env[k] = v;
+  Object.assign(env, { HOME: home, USERPROFILE: home });
+  if (process.platform === "win32") Object.assign(env, { HOMEDRIVE: path.parse(home).root.replace(/\\$/, ""), HOMEPATH: home.slice(path.parse(home).root.length - 1) });
+  if (!opts.defaultPaths) Object.assign(env, { RELAY_HOME: relayHome, RELAY_DB_PATH: dbPath, RELAY_CONFIG_PATH: configPath });
   return { home, relayHome, dbPath, configPath, env, defaultPaths: opts.defaultPaths === true };
 }
 
