@@ -231,25 +231,29 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
   const scanned = () => subprocessSites(virtualProgram(fixtures), virtualRel, (f) => f.startsWith("src/"));
   const by = (sites: ReturnType<typeof scanned>, file: string) => sites.filter((s) => s.key.startsWith(`src/${file}::`)).map((s) => s.program);
 
-  it("CAUGHT: a bare or unchecked program, a shell API, an aliased import, a namespace call", () => {
-    const sites = scanned();
-    for (const f of ["bad-literal.ts", "bad-alias-import.ts", "bad-namespace.ts", "bad-variable.ts", "bad-shell-api.ts"]) expect(by(sites, f), f).toEqual(["other"]);
-  });
+  // ONE assertion per fixture (it.each): a fixture bundled behind another's failure has no RED of its own.
+  let cached: ReturnType<typeof scanned> | undefined;
+  const sitesOnce = () => (cached ??= scanned());
 
-  it("CAUGHT (references): a local alias, a destructured property, a function passed as a value", () => {
-    const sites = scanned();
-    for (const f of ["ref-local-alias.ts", "ref-destructure.ts", "ref-argument.ts"]) expect(by(sites, f), f).toContain("reference");
-  });
+  it.each(["bad-literal.ts", "bad-alias-import.ts", "bad-namespace.ts", "bad-variable.ts", "bad-shell-api.ts"])(
+    "CAUGHT (a bare or unchecked program, a shell API, an aliased import, a namespace call): %s",
+    (f) => expect(by(sitesOnce(), f)).toEqual(["other"]),
+  );
 
-  it("REJECTED: require, createRequire, dynamic import of child_process, and computed member access on it", () => {
-    const sites = scanned();
-    for (const f of ["rej-require.ts", "rej-create-require.ts", "rej-dynamic-import.ts", "rej-computed.ts"]) expect(by(sites, f), f).toContain("rejected");
-  });
+  it.each(["ref-local-alias.ts", "ref-destructure.ts", "ref-argument.ts"])(
+    "CAUGHT (references: a local alias, a destructured property, a function passed as a value): %s",
+    (f) => expect(by(sitesOnce(), f)).toContain("reference"),
+  );
 
-  it("CAUGHT (options, per API): a shell option (string or true), unreadable options, fork's execPath, a shadowed `process`", () => {
-    const sites = scanned();
-    for (const f of ["opt-shell-string.ts", "opt-shell-true.ts", "opt-unreadable.ts", "opt-fork-execpath.ts", "opt-shadowed-process.ts"]) expect(by(sites, f), f).toEqual(["other"]);
-  });
+  it.each(["rej-require.ts", "rej-create-require.ts", "rej-dynamic-import.ts", "rej-computed.ts"])(
+    "REJECTED (require, createRequire, dynamic import of child_process, computed member access on it): %s",
+    (f) => expect(by(sitesOnce(), f)).toContain("rejected"),
+  );
+
+  it.each(["opt-shell-string.ts", "opt-shell-true.ts", "opt-unreadable.ts", "opt-fork-execpath.ts", "opt-shadowed-process.ts"])(
+    "CAUGHT (options, per API: a shell option, unreadable options, fork's execPath, a shadowed process): %s",
+    (f) => expect(by(sitesOnce(), f)).toEqual(["other"]),
+  );
 
   it("PASSED: systemBinary (also with { ...opts, shell: false }), the real process.execPath, a plain fork; a local function NAMED spawnSync is not child_process", () => {
     const sites = scanned();
@@ -260,22 +264,23 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
     expect(by(sites, "not-cp.ts")).toEqual([]);
   });
 
-  it("REJECTED (Codex #336 R2 NEW-1, ruled): computed destructuring, the namespace used as a value (passed, stored), a non-literal require/import/createRequire specifier", () => {
-    const sites = scanned();
-    for (const f of ["esc-computed-destructure.ts", "esc-namespace-passed.ts", "esc-namespace-stored.ts", "esc-nonliteral-require.ts", "esc-nonliteral-import.ts", "esc-nonliteral-created.ts", "esc-export-star.ts"]) {
-      expect(by(sites, f), f).toContain("rejected");
-    }
-  });
+  it.each(["esc-computed-destructure.ts", "esc-namespace-passed.ts", "esc-namespace-stored.ts", "esc-nonliteral-require.ts", "esc-nonliteral-import.ts", "esc-nonliteral-created.ts", "esc-export-star.ts"])(
+    "REJECTED (Codex #336 R2 NEW-1, ruled: computed destructuring, the namespace as a value, a non-literal loader specifier, export *): %s",
+    (f) => expect(by(sitesOnce(), f)).toContain("rejected"),
+  );
 
-  it("A SITE (Codex #336 R2 NEW-1, ruled): a re-export of a spawn-family binding must itself be classified", () => {
-    const sites = scanned();
-    for (const f of ["esc-reexport.ts", "esc-reexport-local.ts"]) expect(by(sites, f), f).toContain("reference");
-  });
+  it.each(["esc-reexport.ts", "esc-reexport-local.ts"])(
+    "A SITE (Codex #336 R2 NEW-1, ruled: a re-export of a spawn-family binding is classified): %s",
+    (f) => expect(by(sitesOnce(), f)).toContain("reference"),
+  );
 
-  it("CAUGHT (Codex #336 R2 NEW-2): a computed or getter `shell`, a getter or computed `execPath`, a dynamic key; a literal computed `shell: false` passes", () => {
-    const sites = scanned();
-    for (const f of ["opt-computed-shell.ts", "opt-getter-shell.ts", "opt-getter-execpath.ts", "opt-computed-execpath.ts", "opt-dynamic-key.ts"]) expect(by(sites, f), f).toEqual(["other"]);
-    expect(by(sites, "opt-shell-false-computed.ts")).toEqual(["execPath"]);
+  it.each(["opt-computed-shell.ts", "opt-getter-shell.ts", "opt-getter-execpath.ts", "opt-computed-execpath.ts", "opt-dynamic-key.ts"])(
+    "CAUGHT (Codex #336 R2 NEW-2: a computed or getter shell, a getter or computed execPath, a dynamic key): %s",
+    (f) => expect(by(sitesOnce(), f)).toEqual(["other"]),
+  );
+
+  it("TWIN (NEW-2): a literal computed `shell: false` is read, and passes", () => {
+    expect(by(sitesOnce(), "opt-shell-false-computed.ts")).toEqual(["execPath"]);
   });
 
   it("BOUNDARY (documented, NOT seen): a subprocess inside an evaluated string, and dependency code outside src/", () => {
