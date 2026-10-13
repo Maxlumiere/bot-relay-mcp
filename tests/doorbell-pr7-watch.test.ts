@@ -360,9 +360,21 @@ describe.skipIf(process.platform === "win32")("the fail-ps shim's count (flake g
     const f = failWatch({ pid: 4242424 });
     const stop = `${f.flag}.stop`;
     on(f.flag);
-    // The writer runs until the TEST says stop (an explicit handshake), capped at 30 s so it can never outlive a failure.
+    // The writer runs until the TEST says stop (an explicit handshake). Its 30 s deadline is checked BETWEEN commands,
+    // not while one hangs, so it bounds a normal run, not a hung `ps`.
     const writer = spawn("/bin/sh", ["-c", `end=$(( $(date +%s) + 30 )); while [ ! -e "$STOP" ] && [ $(date +%s) -lt $end ]; do ps -o lstart= -p 4242424 >/dev/null 2>&1; done`], { env: { ...process.env, ...f.env, STOP: stop }, stdio: "ignore" });
-    const writerExit = new Promise((r) => writer.on("exit", r));
+    // ANY exit or error before the stop handshake is a premature end: a death by signal leaves exitCode null too.
+    let stopping = false;
+    let premature: string | null = null;
+    writer.on("error", (err) => {
+      if (!stopping) premature = `error: ${err.message}`;
+    });
+    const writerExit = new Promise((r) =>
+      writer.on("exit", (code, signal) => {
+        if (!stopping) premature = `exit code ${code} signal ${signal}`;
+        r(undefined);
+      }),
+    );
     let zeros = 0;
     let errors = 0;
     let reads = 0;
@@ -385,11 +397,12 @@ describe.skipIf(process.platform === "win32")("the fail-ps shim's count (flake g
         }
         await new Promise((r) => setImmediate(r));
       }
-      expect(writer.exitCode, "the writer was still running through the whole window").toBeNull();
+      expect(premature, "the writer ran through the whole window (no exit or error before the stop handshake)").toBeNull();
       expect(lastCount - first, "the shim kept counting during the window").toBeGreaterThan(20);
       expect(reads, "the reads to judge").toBeGreaterThan(1_000);
       expect({ zeros, errors }, `${reads} reads in the window`).toEqual({ zeros: 0, errors: 0 });
     } finally {
+      stopping = true;
       fs.writeFileSync(stop, "");
       await writerExit;
       off(f.flag);
