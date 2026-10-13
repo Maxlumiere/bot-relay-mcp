@@ -684,6 +684,22 @@ smoke_25_isolated() {
 }
 step "25-tool + CLI smoke (isolated relay)" smoke_25_isolated || exit 1
 
+# --- 6a1. Release security gate (security/invariants.json) ---
+# The SHIPPED package against its own security invariants: `npm pack` of this tree, installed into a scratch prefix,
+# its own daemon/CLI driven in a sandboxed HOME (scripts/release-invariants.mjs). Then the KNOWN-BAD control: the
+# registry's latest published tarball must still FAIL the harms pinned in security/known-bad.json, or the suite went
+# blind. The control needs the registry: offline, it FAILS (no skip flag). In the CI smoke only, the control is left
+# to ci.yml's release-gate job (main pushes and tags), never during a real publish.
+release_security_gate() {
+  node "$PROJECT_ROOT/scripts/release-invariants.mjs" candidate --pack || return 1
+  if _relay_is_ci_smoke; then
+    echo "  SKIP  the known-bad control runs in ci.yml's release-gate job (main pushes, tags); RELAY_SMOKE_ONLY set (CI smoke, not a publish)."
+    return 0
+  fi
+  node "$PROJECT_ROOT/scripts/release-invariants.mjs" control latest || return 1
+}
+step "release security gate (packed install: candidate + known-bad control)" release_security_gate || exit 1
+
 # --- 6a2. Branch-identity gate (v2.23.0) ---
 # The CI green-gate below asserts CI COLOUR — "is this commit's CI green?" — but
 # NOT BRANCH IDENTITY. A green FEATURE BRANCH therefore passes and publishes
