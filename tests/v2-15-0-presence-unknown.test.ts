@@ -19,6 +19,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
+import { startToken } from "./helpers/start-token.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-v2150-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -47,7 +48,7 @@ const { processStartedAt, _resetOwnHostIdForTests } = await import("../src/liven
 const OWN_HOST = "v2150-own-host";
 const LIVE_PID = process.pid;
 const DEAD_PID = 2_147_483_646;
-const REAL_START = processStartedAt(LIVE_PID); // the real start-time of this process
+const REAL_START = startToken(LIVE_PID); // the real start-time of this process
 const STALE_START = "Mon Jan  1 00:00:00 2020";
 
 function cleanup() {

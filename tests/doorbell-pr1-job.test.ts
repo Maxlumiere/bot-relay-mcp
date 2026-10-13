@@ -23,6 +23,7 @@ import os from "os";
 import path from "path";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { startToken } from "./helpers/start-token.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = path.join(REPO_ROOT, "dist", "doorbell.js");
@@ -75,7 +76,7 @@ function bindHere(agent: string, conv: string): void {
   db.upsertAgentBinding(db.getDb(), {
     hostId: HOST as string,
     windowPid: process.pid,
-    windowPidStart: processStartedAt(process.pid) as string,
+    windowPidStart: startToken(process.pid),
     agentName: agent,
     agentClass: null,
     conversationId: conv,

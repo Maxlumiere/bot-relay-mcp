@@ -634,14 +634,17 @@ relay_pid_start_legacy() {
   env -u TZ LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
-# Is PID a live process on THIS host? The signal-0 probe, mirroring src/liveness.ts
-# isPidAlive() EXACTLY so the bash gate and the TS gate never disagree:
+# Is PID a live process on THIS host? The signal-0 probe. It mirrored the old boolean
+# isPidAlive() in src/liveness.ts. KNOWN DIVERGENCE (INV-LIVE-01 D1, #324): the TS probe is now
+# tri-state (probePid: ESRCH alone is "gone"; any other error is "unknown", never dead); this
+# bash twin still reads "anything else" as dead. Bringing it in line is follow-up F2 (ruled
+# before doorbell PR 8). Today:
 #   - signalable            → alive (0)
 #   - EPERM (cross-user)    → alive — the process EXISTS, it just isn't ours
 #   - ESRCH / anything else → dead (1)
 #   - non-integer / non-positive pid → dead (1)
 # The EPERM branch is not academic: without it a cross-user process at the
-# recorded PID reads DEAD here while isPidAlive reads ALIVE — the exact TS/bash
+# recorded PID reads DEAD here while the TS probe reads ALIVE — the exact TS/bash
 # split that turns the diagnostic→release-binding handoff into a deadlock. Bare
 # `kill -0` returns failure for BOTH EPERM and ESRCH, so we re-probe and inspect
 # the strerror text; LC_ALL=C pins it to "Operation not permitted" (locale-stable,
@@ -678,7 +681,8 @@ relay_pid_alive() {
 # (anchor-only, for the gate + diagnostic). An argv-advertised agent (every codex
 # terminal carries RELAY_AGENT_NAME in its argv) would read presence-alive on a
 # dead anchor and make its stale binding unrecoverable. So this probes the anchor
-# and NOTHING else. Mirrors isAgentProcessAlive's narrow-dead rule:
+# and NOTHING else. Mirrors agentProcessState's narrow-dead rule (src/liveness.ts; its
+# "unknown" kernel answer has no bash twin yet: follow-up F2):
 #   - cross-host / missing GUID / non-probe-able pid → unverifiable (never guess)
 #   - pid not alive                                  → dead
 #   - pid alive, no start anchor                     → alive (PID-liveness only)

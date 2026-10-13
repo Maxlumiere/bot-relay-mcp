@@ -18,7 +18,13 @@ import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
 import { openWindow, findEscapes, selfAndAncestors, snapshotProcessEnv } from "./helpers/watch-window.js";
-import { isPidAlive, processStartedAt } from "../src/liveness.js";
+import { probePid, processStartedAt as readStart, startOrNull } from "../src/liveness.js";
+
+// INV-LIVE-01 (#324) replaced the boolean probe and the nullable start: this file keeps their shapes locally.
+/** The kernel says the pid runs (gone and unknown are both "not proven alive"). */
+const isPidAlive = (pid: number): boolean => probePid(pid) === "alive";
+/** The start token, or null when none was read. */
+const processStartedAt = (pid: number): string | null => startOrNull(readStart(pid));
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "watch-window-close-")));
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));

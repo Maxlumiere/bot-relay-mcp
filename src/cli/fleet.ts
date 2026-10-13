@@ -236,7 +236,7 @@ async function listConnectors(
   json: boolean,
   check = false,
 ): Promise<number> {
-  const { hasConnectorsTable, liveConnectors, listAgentBindings } = await import("../db.js");
+  const { hasConnectorsTable, observeConnectors, listAgentBindings } = await import("../db.js");
   const { anchorLivenessVerdict, getOwnHostId } = await import("../liveness.js");
   const { observeFleet, judgeFleet, deployCheck, deployCheckText, CONNECTOR_KIND } = await import("../fleet-verdicts.js");
   const { realSystemDeps } = await import("../fleet-system.js");
@@ -256,7 +256,7 @@ async function listConnectors(
   const observe = () => observeFleet(
     realSystemDeps,
     {
-      liveRows: (startOf) => liveConnectors({ db, startOf }),
+      connectorRows: (startOf) => observeConnectors({ db, startOf }),
       liveBindings: () =>
         listAgentBindings(db)
           .filter(

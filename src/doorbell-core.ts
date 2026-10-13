@@ -62,7 +62,7 @@
  *         written or closed, and outstanding rings stay outstanding until a session exists.
  *     `operator` (V3) is attribution on escalation records only, never a ring target.
  */
-import type { BoardCase, BoardRecord, BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord, NoDriverWhy } from "./doorbell-log.js";
+import type { BoardCase, BoardRecord, BoardWhy, BudgetRecord, EffectRecord, EscalationRecord, IdKind, Intent, IntentRecord, LogRecord } from "./doorbell-log.js";
 import { MAX_IDS_PER_INTENT, rungKey } from "./doorbell-log.js";
 import type { AnchorVerdict } from "./liveness.js";
 
@@ -324,6 +324,21 @@ export function intentKeepRule(
   };
 }
 
+/**
+ * The supervisor's view of one window's watch. `unknown` (INV-LIVE-01): the window's start (the watch's
+ * key) cannot be read, so whether a watch runs cannot be observed: never `absent`. `blind` (ruling
+ * a98ec836): no watch holds the lock because the window's watch went dormant unable to observe its
+ * window for the whole bound: `cannot_observe(anchor)`, at once (the watch already waited the bound).
+ */
+export type WatchFit = { status: "live" | "stale" | "absent" | "unknown" | "blind"; undeliveredAfterWake: boolean };
+
+/**
+ * INV-LIVE-01 (architect fedac068 (b), K provisional): consecutive cycles an agent's watch may read
+ * `unknown` before the board says so (`cannot_observe(watch)`). A cycle runs on a timer, so it only
+ * ticks while the host is AWAKE: a sleep never counts. Below K the agent's board state is HELD.
+ */
+export const CANNOT_OBSERVE_AFTER_TICKS = 5;
+
 export interface CycleInput {
   bindings: readonly CandidateBinding[];
   ownHostId: string | null;
@@ -355,7 +370,9 @@ export interface CycleInput {
    * already woke the agent for is still undelivered after the horizon); no watch → no_driver(watch_absent);
    * a hung one → no_driver(watch_stale). Absent (tests, a future active driver): PR 1-6's intent path.
    */
-  watchFit?: (agentName: string, read: PendingRead, window: CandidateBinding) => { status: "live" | "stale" | "absent"; undeliveredAfterWake: boolean };
+  watchFit?: (agentName: string, read: PendingRead, window: CandidateBinding) => WatchFit;
+  /** INV-LIVE-01: per agent, how many consecutive cycles its watch has read `unknown` (from the previous plan). Not mutated. */
+  watchUnknownTicks?: ReadonlyMap<string, number>;
   /**
    * Ruling 1a8fc7c4 (1): the ACTUATING driver, if one is registered. An intent is formed ONLY for an
    * agent it fits (an intent is a ring PR 3 will judge). NONE in production today → zero intents; the
@@ -405,6 +422,8 @@ export interface CyclePlan {
    */
   mailQueryFailed: string | null;
   skipped: CycleSkip[];
+  /** INV-LIVE-01: the consecutive-`unknown` count per agent AFTER this cycle (absent = 0): the next cycle's input. */
+  watchUnknownTicks: Map<string, number>;
 }
 
 const sortedSet = (xs: Iterable<string>): string[] => [...new Set(xs)].sort();
@@ -414,6 +433,12 @@ export function planCycle(input: CycleInput): CyclePlan {
   const skipped: CycleSkip[] = [];
   const notEvaluated: string[] = [];
   let mailQueryFailed: string | null = null;
+  // A HOLD (an agent not evaluated) keeps its count; an evaluated agent keeps one only by reading unknown again.
+  const watchUnknownTicks = new Map<string, number>();
+  const holdTicks = (name: string): void => {
+    const n = input.watchUnknownTicks?.get(name);
+    if (n !== undefined) watchUnknownTicks.set(name, n);
+  };
   /** The agents with pending mail (bound or not), or [] with mailQueryFailed set: never a silent gap. */
   const mailAgents = (): readonly string[] => {
     try {
@@ -439,12 +464,14 @@ export function planCycle(input: CycleInput): CyclePlan {
     notEvaluated,
     mailQueryFailed,
     skipped,
+    watchUnknownTicks,
   });
   if (!input.ownHostId) {
     for (const b of input.bindings) skipped.push({ binding_id: b.binding_id, agent_name: b.agent_name, why: "this host's identity is unknown: no binding can be shown to be local" });
     // A HOLD, never a change: nothing is judged, every board state stays as it is. Every agent that
     // WOULD have been evaluated is named, the unbound ones with mail included (#310 Codex R1 #2).
     notEvaluated.push(...sortedSet([...input.bindings.flatMap((b) => (b.agent_name ? [b.agent_name] : [])), ...mailAgents(), ...input.boardOpen.keys()]));
+    for (const name of notEvaluated) holdTicks(name);
     return view();
   }
 
@@ -547,15 +574,15 @@ export function planCycle(input: CycleInput): CyclePlan {
   }
   const boardOpen = new Map(input.boardOpen);
   /** Move ONE agent's board state; a record ONLY when it changes (A3.2). */
-  const boardTo = (name: string, next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: NoDriverWhy } | null, pendingCount: number, closeWhy: "resolved" | "no_mail"): void => {
+  const boardTo = (name: string, next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: BoardWhy } | null, pendingCount: number, closeWhy: "resolved" | "no_mail"): void => {
     const cur = boardOpen.get(name);
-    if (next && cur && cur.case === next.case && cur.why === next.why) return; // unchanged: written once per state change (no_driver's state includes its why)
+    if (next && cur && cur.case === next.case && cur.why === next.why) return; // unchanged: written once per state change (a case's state includes its why)
     if (cur) {
       records.push({ ...cur, at, state: "closed", pending_count: pendingCount, close_reason: next ? "resolved" : closeWhy });
       boardOpen.delete(name);
     }
     if (next) {
-      const rec: BoardRecord = { v: 1, type: "board", at, board_id: newEscalationId(), agent_name: name, case: next.case, state: "open", binding_ids: next.binding_ids.slice(0, MAX_IDS_PER_INTENT), dead_count: next.dead_count, pending_count: pendingCount, close_reason: null, ...(next.case === "no_driver" ? { why: next.why } : {}) };
+      const rec: BoardRecord = { v: 1, type: "board", at, board_id: newEscalationId(), agent_name: name, case: next.case, state: "open", binding_ids: next.binding_ids.slice(0, MAX_IDS_PER_INTENT), dead_count: next.dead_count, pending_count: pendingCount, close_reason: null, ...(next.why !== undefined ? { why: next.why } : {}) };
       records.push(rec);
       boardOpen.set(name, rec);
     }
@@ -566,6 +593,7 @@ export function planCycle(input: CycleInput): CyclePlan {
     session_unbound: "no bound reading session: delivery cannot be measured, so it is never rung (a board case: re-register or relaunch)",
     no_driver: "no live relay watch for this window (a board case: re-arm `relay watch <agent> --until-wake`)",
     undelivered_with_watch: "the watch woke this agent and the mail is still undelivered after the horizon (a board case)",
+    cannot_observe: `the agent's watch or its window cannot be observed (why watch: the window's start time was unreadable for ${CANNOT_OBSERVE_AFTER_TICKS} consecutive cycles; why anchor: the watch could not observe its window for its whole bound and went dormant). A board case; never reported as no watch`,
   };
 
   const covered = new Set<string>(); // agents evaluated this cycle
@@ -578,6 +606,7 @@ export function planCycle(input: CycleInput): CyclePlan {
     } catch (err) {
       skip(`its pending set cannot be read (${err instanceof Error ? err.message : String(err)})`);
       notEvaluated.push(name); // a HOLD: its board state is untouched
+      holdTicks(name);
       continue;
     }
     covered.add(name);
@@ -606,7 +635,7 @@ export function planCycle(input: CycleInput): CyclePlan {
     const { judged, notDead, deadCount } = windows;
     const alive = windows.liveWindows;
     const idsOf = (xs: typeof judged) => sortedSet(xs.map((x) => x.b.binding_id));
-    let next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: NoDriverWhy } | null =
+    let next: { case: BoardCase; binding_ids: string[]; dead_count: number; why?: BoardWhy } | null =
       notDead.length >= 2
         ? { case: "ambiguous_binding", binding_ids: idsOf(notDead), dead_count: deadCount }
         : alive.length === 0
@@ -624,6 +653,26 @@ export function planCycle(input: CycleInput): CyclePlan {
     const actuated = !next && !!rs && !!input.actuator?.fits(name);
     if (!next && rs && input.watchFit) {
       const wf = input.watchFit(name, read, alive[0].b); // the ONE live window: the watch's key (ruling ffcaf608 D1 (iv))
+      if (wf.status === "blind") {
+        next = { case: "cannot_observe", binding_ids: idsOf(alive), dead_count: deadCount, why: "anchor" };
+        boardTo(name, next, read.ids.length, "resolved");
+        skip(`${BOARD_WHY.cannot_observe} (anchor)`);
+        continue;
+      }
+      if (wf.status === "unknown") {
+        // INV-LIVE-01: unknown is not absent. Below K the board state is HELD (nothing opens, nothing
+        // closes) and no intent is formed (a watch may be live); at K, its own case, never no_driver.
+        const n = (input.watchUnknownTicks?.get(name) ?? 0) + 1;
+        watchUnknownTicks.set(name, n);
+        if (n < CANNOT_OBSERVE_AFTER_TICKS) {
+          skip(`the watch cannot be observed (its window's start is unreadable): ${n} of ${CANNOT_OBSERVE_AFTER_TICKS} cycles, board state held`);
+          continue;
+        }
+        next = { case: "cannot_observe", binding_ids: idsOf(alive), dead_count: deadCount, why: "watch" };
+        boardTo(name, next, read.ids.length, "resolved");
+        skip(`${BOARD_WHY.cannot_observe} (watch)`);
+        continue;
+      }
       if (wf.status === "live") next = wf.undeliveredAfterWake ? { case: "undelivered_with_watch", binding_ids: idsOf(alive), dead_count: deadCount } : null;
       else if (!actuated) next = { case: "no_driver", binding_ids: idsOf(alive), dead_count: deadCount, why: wf.status === "stale" ? "watch_stale" : "watch_absent" };
       boardTo(name, next, read.ids.length, "resolved");

@@ -35,7 +35,12 @@
  *   - READ-ONLY on the relay DB (opened only once a writer's WAL sidecars exist). Its writes go to its
  *     own dirs (src/watch-wake.ts).
  *
- * --lock-status: one word for the agent's ONE live window: live | stale | absent | never | no_window.
+ * --lock-status: one word for the agent's ONE live window: live | stale | absent | never | no_window |
+ * unknown (the window's start cannot be read right now: never reported as no window).
+ *
+ * UNREADABLE IS NOT GONE (INV-LIVE-01, rulings 476e65f1 + fedac068): a `ps` that times out, fails or
+ * prints nothing is never "the window is gone". Only the kernel says gone (ESRCH, a different process on
+ * the pid, or, for the launching shell, a reparent). On an unreadable start the watch takes no action.
  */
 import fs from "fs";
 import path from "path";
@@ -45,6 +50,52 @@ export const HEARTBEAT_EVERY_MS = 60_000;
 export const FALLBACK_POLL_MS = 3_000;
 /** How often a DORMANT watch re-checks its window (ruling 9becb599: once a minute). */
 export const DORMANT_CHECK_MS = 60_000;
+/**
+ * INV-LIVE-01 BOUNDEDNESS (architect ruling a98ec836, provisional): how long a watch accepts its window
+ * being unobservable (every read unreadable, the kernel never saying gone), in AWAKE time, before it says
+ * so loudly: a running watch goes DORMANT, and a dormant one rewrites its record (ANCHOR_UNOBSERVED_PREFIX).
+ */
+export const ANCHOR_UNKNOWN_BOUND_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * THE BOUND, measured (Codex R2 N1 on #324): a run of unknown window reads starts at the FIRST unknown
+ * read and is reached when the AWAKE clock (watch-wake awakeNowMs: darwin mach time without sleep, linux
+ * CLOCK_MONOTONIC) shows the whole bound since then. ANY readable read ends the run. How often reads
+ * happen (the immediate first check, marker events, overlapping checks) cannot matter: NEVER EARLY, by
+ * construction, and a timer that fires late only makes it later.
+ *   - An awake clock unreadable at a read cannot reach the bound (late, never early); a run cannot start
+ *     without one.
+ *   - UNCOVERED residual (stated, covered by nothing else): on darwin while the sysctl awake read itself
+ *     keeps failing, and on win32 always (no awake clock), the bound never fires. node's hrtime is NOT a
+ *     substitute: on darwin it counts sleep (MEASURED 12 Oct: hrtime 837832 s, awake 322290 s since boot).
+ */
+export class AnchorUnknownBound {
+  private since: number | null = null;
+  constructor(
+    readonly boundMs: number,
+    private readonly awakeNow: () => number | null,
+  ) {}
+  /** One read of the window: true once it has been unknown for the whole bound of awake time. */
+  observe(read: "same" | "unknown"): boolean {
+    if (read === "same") {
+      this.since = null;
+      return false;
+    }
+    const now = this.awakeNow();
+    if (now === null) return false;
+    if (this.since === null) this.since = now;
+    return now - this.since >= this.boundMs;
+  }
+}
+
+/**
+ * The reason a watch blind to its window records (Codex R2 N5): built from the CAPTURED window anchor (pid
+ * + start), whatever the watch was doing; `base` says why it is dormant at all.
+ */
+export const blindReason = (prefix: string, window: { pid: number; start: string }, boundMs: number, base: string): string =>
+  `${prefix} its window (pid ${window.pid}, start ${window.start}) could not be observed for ${Math.round(boundMs / 1000)} s of awake time in a row (the bound): it is not judged gone and is never re-anchored; dormant because: ${base}`;
+/** Why a RUNNING watch went dormant at the bound (the `base` of its blind reason). */
+export const STOPPED_AT_BOUND = "it stopped watching at the bound";
 /** Generation takeovers attempted in one arming before going dormant as "already watched". */
 export const MAX_TAKEOVER_ROUNDS = 3;
 
@@ -76,7 +127,7 @@ async function realOwnerDeps(ownHostId: string | null): Promise<import("../watch
     startNow: (pid) => L.processStartedAt(pid),
     sameProcess: (pid, stored) => {
       const o = L.observeStartTokenForm(pid, stored);
-      return o === "utc" || o === "legacy";
+      return o === "unreadable" ? "unreadable" : o === "utc" || o === "legacy";
     },
     liveness: (b) => bindingLiveness({ host_id: b.host_id, window_pid: b.window_pid, window_pid_start: b.window_pid_start }, ownHostId),
   };
@@ -91,7 +142,7 @@ async function agentBindings(db: Handle, agent: string): Promise<import("../watc
  * `relay pending --watch-status`). `never` = the agent dir does not exist (it never armed one). The
  * window dir is keyed by the window process's start as the KERNEL reads it (Codex R2 (b)).
  */
-export async function agentWatchStatus(db: Handle, dbPath: string, agent: string): Promise<"live" | "stale" | "absent" | "never" | "no_window"> {
+export async function agentWatchStatus(db: Handle, dbPath: string, agent: string): Promise<"live" | "stale" | "absent" | "never" | "no_window" | "unknown"> {
   const W = await import("../watch-wake.js");
   if (!W.watchableName(agent)) return "never";
   const agentDir = W.watchAgentDir(dbPath, agent);
@@ -103,8 +154,9 @@ export async function agentWatchStatus(db: Handle, dbPath: string, agent: string
   const one = oneLiveWindow(await agentBindings(db, agent), own, (b) => bindingLiveness(b, own));
   if (one.kind !== "one" || !one.b.window_pid) return "no_window";
   const start = processStartedAt(one.b.window_pid);
-  if (!start) return "no_window";
-  return W.watchStatus(W.watchWindowDir(dbPath, agent, { pid: one.b.window_pid, start }));
+  if (start.kind === "gone") return "no_window";
+  if (start.kind === "unreadable") return "unknown"; // its key cannot be read: never "no window"
+  return W.watchStatus(W.watchWindowDir(dbPath, agent, { pid: one.b.window_pid, start: start.start }));
 }
 
 /** Open the relay DB read-only, waiting while no writer has created its WAL sidecars (never creating one). */
@@ -166,35 +218,98 @@ export async function runArmCheck(agent: string): Promise<number> {
   }
 }
 
-export async function runUntilWake(agent: string, opts: { intervalMs?: number; dormantCheckMs?: number; now?: () => number } = {}): Promise<number> {
+/** How many times the birth start is read again at once when the first read fails (fedac068 (a)). */
+export const BIRTH_START_RETRIES = 3;
+
+/** A dormant watch's anchor: the window, or (`parent`) the shell that launched it, whose start may be unknown. */
+export interface DormantAnchor {
+  pid: number;
+  start: string | null;
+  parent?: boolean;
+}
+
+type StartReader = (pid: number) => import("../liveness.js").ProcessStart;
+
+/** The birth start: read now, retried at once up to BIRTH_START_RETRIES times; null when gone or never readable. */
+export function captureBirthStart(pid: number, read: StartReader): string | null {
+  for (let i = 0; i <= BIRTH_START_RETRIES; i++) {
+    const r = read(pid);
+    if (r.kind === "start") return r.start;
+    if (r.kind === "gone") return null;
+  }
+  return null;
+}
+
+/**
+ * A dormant watch's anchor, by kernel fact only. GONE: the launching shell, when we were reparented
+ * (POSIX: our ppid is no longer it), or ESRCH, or its pid holds another start (only when one was
+ * captured at birth); the window, on ESRCH or another start on its pid. UNKNOWN: the window's start
+ * cannot be read (never gone). The launching shell is never unknown: while it is still our parent it
+ * is alive (a parent's death reparents us), so the reparent rule bounds it.
+ */
+export function dormantAnchorState(anchor: DormantAnchor, read: StartReader, ppid: number = process.ppid): "same" | "gone" | "unknown" {
+  if (anchor.parent && ppid !== anchor.pid) return "gone";
+  const r = read(anchor.pid);
+  if (r.kind === "gone") return "gone";
+  if (r.kind === "unreadable") return anchor.parent ? "same" : "unknown";
+  return anchor.start !== null && r.start !== anchor.start ? "gone" : "same";
+}
+/** Is a dormant watch's anchor GONE (dormantAnchorState)? An unreadable start is never gone. */
+export const anchorGone = (anchor: DormantAnchor, read: StartReader, ppid: number = process.ppid): boolean => dormantAnchorState(anchor, read, ppid) === "gone";
+
+export async function runUntilWake(agent: string, opts: { intervalMs?: number; dormantCheckMs?: number; anchorUnknownBoundMs?: number; now?: () => number } = {}): Promise<number> {
   const now = opts.now ?? (() => Date.now());
   const intervalMs = opts.intervalMs ?? FALLBACK_POLL_MS;
+  const anchorUnknownBoundMs = opts.anchorUnknownBoundMs ?? ANCHOR_UNKNOWN_BOUND_MS;
   const dormantCheckMs = opts.dormantCheckMs ?? DORMANT_CHECK_MS;
   const say = (line: string) => process.stderr.write(`${line}\n`);
   const L = await import("../liveness.js");
   const W = await import("../watch-wake.js");
-  const birth = { pid: process.ppid, start: L.processStartedAt(process.ppid) };
-  const me = { pid: process.pid, proc_start: L.processStartedAt(process.pid), host_id: L.getOwnHostId() };
+  // THE BIRTH ANCHOR (architect fedac068 (a)): the launching shell, its start captured ONCE, now (up to
+  // BIRTH_START_RETRIES immediate retries), and NEVER adopted later: a start read after the shell could
+  // have died might be an impostor's, which would make a dormant watch immortal. Not captured = the
+  // shell is judged by the reparent and ESRCH alone.
+  const birth: DormantAnchor = { pid: process.ppid, start: captureBirthStart(process.ppid, L.processStartedAt), parent: true };
+  // Identity for the holder sidecar and the dormant record name: null = unknown (display only).
+  const me = { pid: process.pid, proc_start: L.startOrNull(L.processStartedAt(process.pid)), host_id: L.getOwnHostId() };
 
   // DORMANCY (ruling 9becb599). `anchor` is the window when known, else the process that started us.
   // Zero CPU: one timer per check. Exits SILENTLY once the anchor is gone; a signal exits with a line.
   let dormantFile: string | null = null;
-  const dormant = async (reason: string, anchor: { pid: number; start: string | null }, recordDir: string | null): Promise<number> => {
-    say(`[sentinel] relay watch for ${agent} is DORMANT (${reason}): it will not wake anyone; it ends when its window does.`);
-    if (recordDir) {
+  // `blindAtStart`: the record carries ANCHOR_UNOBSERVED_PREFIX at once (a running watch reached the bound).
+  // `recordDir` is where the record BELONGS; null only where there is none (instance unresolved, a name
+  // that cannot be a dir). Every write that fails is RETRIED on later ticks (Codex R2 N4): the state the
+  // record SHOULD say (`desiredBlind`) is kept apart from what it was last WRITTEN to say (`persisted`).
+  const dormant = async (reason: string, anchor: DormantAnchor | import("../watch-owner.js").OwnedWindow, recordDir: string | null, blindAtStart = false): Promise<number> => {
+    const { ensurePrivateDir: ensurePrivate } = await import("../doorbell-log.js");
+    // Only a WINDOW anchor can be unobservable (dormantAnchorState: the launching shell never is).
+    const win = (anchor as DormantAnchor).parent ? null : { pid: anchor.pid, start: anchor.start as string };
+    const reasonFor = (blind: boolean): string => (blind && win ? blindReason(W.ANCHOR_UNOBSERVED_PREFIX, win, anchorUnknownBoundMs, reason) : reason);
+    say(`[sentinel] relay watch for ${agent} is DORMANT (${reasonFor(blindAtStart)}): it will not wake anyone; it ends when its window does.`);
+    /** Write the record (the same name each time: a rewrite REPLACES it atomically). True when it landed. */
+    const record = (blind: boolean): boolean => {
+      if (!recordDir) return false;
       try {
-        // The chain may be gone (the lock-lost case): recreate it privately, component by component.
-        const { ensurePrivateDir } = await import("../doorbell-log.js");
+        // The chain may be gone (the lock-lost case) or unusable (a planted link): recreate it privately,
+        // component by component; a link or a non-dir is refused, and the next tick tries again.
         const root = path.join(path.dirname(process.env.RELAY_DB_PATH as string), "watch");
         const rel = path.relative(root, recordDir).split(path.sep).filter(Boolean);
         let cur = root;
-        ensurePrivateDir(cur);
-        for (const part of rel) ensurePrivateDir((cur = path.join(cur, part)));
-        dormantFile = W.writeDormant(recordDir, { pid: me.pid, proc_start: me.proc_start, reason, at: new Date(now()).toISOString() });
+        ensurePrivate(cur);
+        for (const part of rel) ensurePrivate((cur = path.join(cur, part)));
+        dormantFile = W.writeDormant(recordDir, { pid: me.pid, proc_start: me.proc_start, reason: reasonFor(blind), at: new Date(now()).toISOString(), anchor: win });
+        return true;
       } catch (err) {
-        say(`[sentinel] DEGRADED: the dormant record for ${agent} could not be written (${err instanceof Error ? err.message : String(err)})`);
+        say(`[sentinel] DEGRADED: the dormant record for ${agent} could not be written (${err instanceof Error ? err.message : String(err)}): retrying on the next check`);
+        return false;
       }
-    }
+    };
+    let desiredBlind = blindAtStart;
+    let persisted: boolean | null = null; // what the record on disk says (null: nothing written yet)
+    const sync = (): void => {
+      if (persisted !== desiredBlind && record(desiredBlind)) persisted = desiredBlind;
+    };
+    sync();
     return await new Promise<number>((resolve) => {
       let done = false;
       const end = (code: number, line?: string) => {
@@ -206,10 +321,19 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
       };
       process.once("SIGTERM", () => end(0, `no-mail: stopped (signal) while dormant: ${reason}`));
       process.once("SIGINT", () => end(0, `no-mail: stopped (signal) while dormant: ${reason}`));
+      // BOUNDEDNESS (ruling a98ec836): a dormant watch blind to its window for the bound (in AWAKE time) is
+      // made LOUD (its record rewritten), and quiet again once it can see it. It stays dormant either way:
+      // an unobservable window is never "gone".
+      const bound = new AnchorUnknownBound(anchorUnknownBoundMs, () => W.awakeNowMs());
       const tick = () => {
         if (done) return;
-        const alive = anchor.start !== null && L.processStartedAt(anchor.pid) === anchor.start;
-        if (!alive) return end(0); // (b) the window is gone: SILENT (no session left to notify)
+        const st = dormantAnchorState(anchor, L.processStartedAt);
+        if (st === "gone") return end(0); // (b) the window is gone: SILENT (no session left to notify)
+        if (st === "same") {
+          bound.observe("same");
+          desiredBlind = false;
+        } else if (bound.observe("unknown")) desiredBlind = true;
+        sync(); // a write that failed before is retried here
         setTimeout(tick, dormantCheckMs);
       };
       setTimeout(tick, dormantCheckMs);
@@ -218,8 +342,10 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
 
   const { pinResolvedDbPath } = await import("./_instance-db.js");
   const fault = await pinResolvedDbPath();
+  // EXEMPT from a record (Codex R2 N4): the instance (so the DB path, so the watch dir) cannot be resolved.
   if (fault) return dormant(`instance_unresolved: ${fault}`, birth, null);
   const dbPath = process.env.RELAY_DB_PATH as string;
+  // EXEMPT from a record: this name cannot be a directory (watchableName), so there is no dir to write in.
   if (!W.watchableName(agent)) return dormant("not_watchable", birth, null);
   const { currentWakePolicy } = await import("../wake-policy.js");
   const { acquireInstanceLock, lockStillOurs, releaseInstanceLock } = await import("../doorbell-lock.js");
@@ -253,19 +379,20 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   const owner = O.resolveOwnership(process.pid, await agentBindings(db, agent), ownHost, ownerDeps);
   if (!owner.ok) {
     closeDb();
-    return dormant(`refused (${owner.why}): ${O.REFUSAL_TEXT[owner.why]}`, birth, privateAgentDir()); // the arm-check should have caught it
+    privateAgentDir(); // says DEGRADED when it cannot be made; the record is retried there either way
+    return dormant(`refused (${owner.why}): ${O.REFUSAL_TEXT[owner.why]}`, birth, agentDir); // the arm-check should have caught it
   }
   const window = owner.window;
   if (!privateAgentDir()) {
     closeDb();
-    return dormant("the watch dir is unusable", window, null);
+    return dormant("the watch dir is unusable", window, W.watchWindowDir(dbPath, agent, window)); // retried until usable
   }
   const dir = W.watchWindowDir(dbPath, agent, window);
   try {
     ensurePrivateDir(dir);
   } catch (err) {
     closeDb();
-    return dormant(`the window dir is unusable (${err instanceof Error ? err.message : String(err)})`, window, null);
+    return dormant(`the window dir is unusable (${err instanceof Error ? err.message : String(err)})`, window, dir); // retried until usable
   }
   const birthPpid = process.ppid;
 
@@ -308,10 +435,12 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   let lastBeat = now();
   let degraded = false;
   const deadCache = new Set<string>();
+  // BOUNDEDNESS in AWAKE time (Codex R2 N1): any check may read the window; only awake time reaches the bound.
+  const anchorBound = new AnchorUnknownBound(anchorUnknownBoundMs, () => W.awakeNowMs());
 
   // The RUNNING watch. Its outcome: a wake line (exit), the window gone (silent exit), a signal (exit),
   // or a reason to go dormant.
-  type Outcome = { kind: "exit"; code: number; line?: string } | { kind: "dormant"; reason: string };
+  type Outcome = { kind: "exit"; code: number; line?: string } | { kind: "dormant"; reason: string; blind?: boolean };
   const outcome = await new Promise<Outcome>((resolve) => {
     let settled = false;
     let timer: NodeJS.Timeout | null = null;
@@ -366,6 +495,12 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
           const why = (own as { why: import("../watch-owner.js").OwnerRefusal | "window_gone" }).why;
           if (why === "window_gone") settle({ kind: "exit", code: 0 }); // (b): silent
           else settle({ kind: "dormant", reason: `binding moved (${why}): ${O.REFUSAL_TEXT[why]}` });
+          return;
+        }
+        // BOUNDEDNESS (ruling a98ec836): a window unobservable for the whole bound ends the RUNNING watch
+        // loudly (dormant, named), never as window_gone and never by re-anchoring. A readable read resets.
+        if (anchorBound.observe(own.window)) {
+          settle({ kind: "dormant", blind: true, reason: STOPPED_AT_BOUND });
           return;
         }
         if (t - lastBeat >= HEARTBEAT_EVERY_MS) {
@@ -426,7 +561,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
     if (outcome.line) emitLine(outcome.line);
     return outcome.code;
   }
-  return dormant(outcome.reason, window, dir);
+  return dormant(outcome.reason, window, dir, outcome.blind === true);
 }
 
 export async function runLockStatus(agent: string): Promise<number> {

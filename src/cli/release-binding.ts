@@ -191,7 +191,7 @@ export async function run(argv: string[]): Promise<number> {
     if (verdict === "alive" && !args.override) {
       // anchorLivenessVerdict collapses "observed alive (start-time matched)" and
       // "present-but-unverifiable (no/unreadable start anchor → PID reuse can't be
-      // excluded)" into ONE `alive` verdict (isAgentProcessAlive's narrow-dead
+      // excluded)" into ONE `alive` verdict (agentProcessState's narrow-dead
       // rule). The RULE is correct (fail toward NOT acting); only the MESSAGE must
       // not assert liveness it hasn't observed. Message-only — adds no verdict
       // state, so it cannot drift the two probes apart.
@@ -207,7 +207,7 @@ export async function run(argv: string[]): Promise<number> {
     if (verdict === "unverifiable" && !args.override) {
       process.stderr.write(
         `relay release-binding: REFUSING — cannot verify "${args.name}" is dead ` +
-          "(TAKEOVER_LIVENESS_UNVERIFIABLE: cross-host row or no probe-able anchor). Refusing to guess. " +
+          "(TAKEOVER_LIVENESS_UNVERIFIABLE: cross-host row, no probe-able anchor, or the kernel probe could not judge the pid). Refusing to guess. " +
           "Verify liveness out-of-band; re-run with --override ONLY if you are certain it is dead.\n"
       );
       return 3;

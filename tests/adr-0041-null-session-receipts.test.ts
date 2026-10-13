@@ -33,6 +33,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { startToken } from "./helpers/start-token.js";
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-adr0041-" + process.pid);
 process.env.RELAY_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -224,7 +225,7 @@ describe("ADR-0041 R1, Codex round 1 — the register receipt is read back AFTER
         role: "builder",
         capabilities: [],
         agent_pid: process.pid,
-        agent_pid_start: processStartedAt(process.pid) ?? undefined,
+        agent_pid_start: startToken(process.pid),
       } as never),
     );
     const now = getAgents().find((a) => a.name === "walk-anchor")!;

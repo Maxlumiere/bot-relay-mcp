@@ -19,7 +19,7 @@
  * sources disagree, and never records a pid without the start time that makes
  * it an anchor rather than a number the OS will hand to someone else.
  */
-import { processStartedAt, type AgentProcess } from "./liveness.js";
+import { processStartedAt, type AgentProcess, type ProcessStart } from "./liveness.js";
 
 /** A window anchor: the pid AND the start time that makes it reusable-proof. */
 export interface WindowAnchor {
@@ -36,8 +36,8 @@ export interface ResolveWindowAnchorInput {
   claudePid: number | null;
   /** What the ancestry walk found, or null when it found no agent process. */
   detected: AgentProcess | null;
-  /** Reads a live pid's start-time token. Injectable for tests. */
-  startedAtFor?: (pid: number) => string | null;
+  /** Reads a pid's start-time token (liveness.processStartedAt). Injectable for tests. */
+  startedAtFor?: (pid: number) => ProcessStart;
 }
 
 /**
@@ -50,6 +50,10 @@ export interface ResolveWindowAnchorInput {
  *   neither               → refuse
  *   any pid whose start time cannot be read → refuse (a pid alone is not an anchor)
  */
+/** Why no start was read, in words: gone (the kernel says so) or unreadable (it may still run). */
+const startFailure = (r: Exclude<ProcessStart, { kind: "start" }>): string =>
+  r.kind === "gone" ? "the process is gone" : `unreadable: ${r.why}`;
+
 export function resolveWindowAnchor(input: ResolveWindowAnchorInput): AnchorResolution {
   const startedAtFor = input.startedAtFor ?? ((pid: number) => processStartedAt(pid));
   const { claudePid, detected } = input;
@@ -64,22 +68,22 @@ export function resolveWindowAnchor(input: ResolveWindowAnchorInput): AnchorReso
   }
 
   if (detected != null) {
-    const startedAt = detected.startedAt || startedAtFor(detected.pid);
-    if (!startedAt) {
-      return { ok: false, reason: `could not read the start time for pid ${detected.pid}; a pid alone is not an anchor` };
+    const read: ProcessStart = detected.startedAt ? { kind: "start", start: detected.startedAt } : startedAtFor(detected.pid);
+    if (read.kind !== "start") {
+      return { ok: false, reason: `could not read the start time for pid ${detected.pid} (${startFailure(read)}); a pid alone is not an anchor` };
     }
-    return { ok: true, anchor: { pid: detected.pid, startedAt }, source: claudePid != null ? "agreed" : "detected" };
+    return { ok: true, anchor: { pid: detected.pid, startedAt: read.start }, source: claudePid != null ? "agreed" : "detected" };
   }
 
   if (claudePid != null) {
-    const startedAt = startedAtFor(claudePid);
-    if (!startedAt) {
+    const read = startedAtFor(claudePid);
+    if (read.kind !== "start") {
       return {
         ok: false,
-        reason: `could not read the start time for CLAUDE_PID=${claudePid}; the process is gone or unreadable, so there is no anchor to record`,
+        reason: `could not read the start time for CLAUDE_PID=${claudePid} (${startFailure(read)}), so there is no anchor to record`,
       };
     }
-    return { ok: true, anchor: { pid: claudePid, startedAt }, source: "claude-pid" };
+    return { ok: true, anchor: { pid: claudePid, startedAt: read.start }, source: "claude-pid" };
   }
 
   return {

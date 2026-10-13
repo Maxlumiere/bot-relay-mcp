@@ -46,16 +46,18 @@ interface Args {
   help: boolean;
   /** Doorbell PR 7 (§v6): exit with one line when there is mail to wake for (run it in the background). */
   untilWake: boolean;
-  /** Doorbell PR 7 (§v6): print live | stale | absent | never | no_window for this agent's watch, and exit. */
+  /** Doorbell PR 7 (§v6): print live | stale | absent | never | no_window | unknown for this agent's watch, and exit. */
   lockStatus: boolean;
   /** Doorbell PR 7 (ruling 9becb599): the FOREGROUND pre-check before arming (arm | live | refused). */
   armCheck: boolean;
   /** How often a dormant watch re-checks its window, in seconds (default 60; for tests). */
   dormantCheckMs: number | null;
+  /** INV-LIVE-01: how long a running watch accepts an unobservable window, in seconds (default 2 h; for tests). */
+  anchorUnknownBoundMs: number | null;
 }
 
 function parseArgs(argv: string[]): Args {
-  const out: Args = { agent: null, intervalMs: 3000, once: false, json: false, help: false, untilWake: false, lockStatus: false, armCheck: false, dormantCheckMs: null };
+  const out: Args = { agent: null, intervalMs: 3000, once: false, json: false, help: false, untilWake: false, lockStatus: false, armCheck: false, dormantCheckMs: null, anchorUnknownBoundMs: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--help" || a === "-h") out.help = true;
@@ -69,6 +71,12 @@ function parseArgs(argv: string[]): Args {
       const secs = Number(v);
       if (!v || !Number.isInteger(secs) || secs < 1 || secs > 60) throw new Error("--dormant-check-s requires whole seconds from 1 to 60");
       out.dormantCheckMs = secs * 1000;
+    }
+    else if (a === "--anchor-unknown-bound-s") {
+      const v = argv[++i];
+      const secs = Number(v);
+      if (!v || !Number.isInteger(secs) || secs < 1 || secs > 7200) throw new Error("--anchor-unknown-bound-s requires whole seconds from 1 to 7200");
+      out.anchorUnknownBoundMs = secs * 1000;
     }
     else if (a === "--interval") {
       const v = argv[++i];
@@ -104,7 +112,7 @@ function usage(requested = false): void {
       "                     mail to wake for (each message wakes a session at most once). It exits\n" +
       "                     only to wake, or (silently) when its window is gone; otherwise it goes\n" +
       "                     dormant. Re-arm after each wake.\n" +
-      "  --lock-status      Print live | stale | absent | never | no_window, and exit 0.\n" +
+      "  --lock-status      Print live | stale | absent | never | no_window | unknown, and exit 0.\n" +
       "Sentinel — autowake for a terminal agent NOT in VS Code/Tether. Watches\n" +
       "<agent>'s inbox and prints a wake line when new mail arrives, so a harness\n" +
       "Monitor (or you) can nudge the agent to read it. Event-driven when\n" +
@@ -372,7 +380,7 @@ export async function run(argv: string[]): Promise<number> {
     const { runUntilWake, runLockStatus, runArmCheck } = await import("./watch-until-wake.js");
     if (args.lockStatus) return runLockStatus(agent);
     if (args.armCheck) return runArmCheck(agent);
-    return runUntilWake(agent, { intervalMs: args.intervalMs, ...(args.dormantCheckMs ? { dormantCheckMs: args.dormantCheckMs } : {}) });
+    return runUntilWake(agent, { intervalMs: args.intervalMs, ...(args.dormantCheckMs ? { dormantCheckMs: args.dormantCheckMs } : {}), ...(args.anchorUnknownBoundMs ? { anchorUnknownBoundMs: args.anchorUnknownBoundMs } : {}) });
   }
 
   // INSTANCE-DB TRAP: resolve the ACTIVE per-instance DB, exactly as the daemon

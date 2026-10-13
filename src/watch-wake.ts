@@ -346,6 +346,13 @@ export interface DormantRecord {
   proc_start: string | null;
   reason: string;
   at: string;
+  /**
+   * The WINDOW the watch is anchored to (pid + the kernel's start, captured when it proved ownership),
+   * or null for one anchored to its launching shell (Codex R2 N2/N5 on #324). It names the anchor that
+   * could not be observed, so a supervisor that cannot read the window's start either can still find it,
+   * without ever re-anchoring. Absent in records written before this field.
+   */
+  anchor?: { pid: number; start: string } | null;
 }
 const dormantName = (pid: number, start: string | null) => `${pid}-${crypto.createHash("sha256").update(start ?? "").digest("hex").slice(0, 16)}`;
 /** Record this process as dormant under `dir` (a window or agent dir): 0600, no-follow, atomic. */
@@ -362,6 +369,48 @@ export function writeDormant(dir: string, rec: Omit<DormantRecord, "v">): string
   writeJsonAtomic(d, name, { v: 1, ...rec } satisfies DormantRecord);
   return path.join(d, name);
 }
+/**
+ * INV-LIVE-01 BOUNDEDNESS (architect ruling a98ec836): the reason prefix of a watch that went dormant
+ * because its window could not be observed for the whole bound. Never "window gone" (unproven), never
+ * re-anchored (an impostor's start): it is made LOUD instead, here, on the board and in `relay doctor`.
+ */
+export const ANCHOR_UNOBSERVED_PREFIX = "cannot_observe(anchor):";
+/**
+ * The dormant records under `dir`/dormant/ of watches blind to their window (reason ANCHOR_UNOBSERVED_PREFIX)
+ * whose process has not ended (only the kernel's ESRCH says it ended). Record names only (the writer's
+ * temp is skipped); an unreadable entry is skipped alone. Read-only.
+ */
+export function blindDormantRecords(dir: string, pidState: (pid: number) => "alive" | "gone" | "unknown"): DormantRecord[] {
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(path.join(dir, DORMANT_DIR));
+  } catch {
+    return [];
+  }
+  const out: DormantRecord[] = [];
+  for (const nm of names) {
+    if (nm.startsWith(".")) continue;
+    const r = readJson(path.join(dir, DORMANT_DIR, nm)) as Partial<DormantRecord> | null;
+    if (!r || r.v !== 1 || !Number.isInteger(r.pid) || typeof r.reason !== "string" || !r.reason.startsWith(ANCHOR_UNOBSERVED_PREFIX)) continue;
+    if (pidState(r.pid as number) === "gone") continue;
+    out.push(r as DormantRecord);
+  }
+  return out;
+}
+/**
+ * Codex R2 N2: the blind dormant records of an agent's watches whose CAPTURED anchor is exactly
+ * (pid, start), found WITHOUT a readable window start (every window dir of the agent is read). A record
+ * with no anchor, or another one (the same pid with another start: a reused pid), never matches.
+ */
+export function blindRecordsForAnchor(agentDir: string, anchor: { pid: number; start: string }, pidState: (pid: number) => "alive" | "gone" | "unknown"): DormantRecord[] {
+  let dirs: string[] = [];
+  try {
+    dirs = fs.readdirSync(agentDir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.isSymbolicLink()).map((e) => path.join(agentDir, e.name));
+  } catch {
+    return [];
+  }
+  return dirs.flatMap((d) => blindDormantRecords(d, pidState)).filter((r) => r.anchor != null && r.anchor.pid === anchor.pid && r.anchor.start === anchor.start);
+}
 export function removeDormant(file: string | null): void {
   if (!file) return;
   try {
@@ -372,15 +421,19 @@ export function removeDormant(file: string | null): void {
 }
 /**
  * How many DORMANT watches of `agent` are alive right now (for the supervisor's status): every record
- * under its agent dir and window dirs whose process (pid + start) still runs. Read-only.
+ * under its agent dir and window dirs whose process (pid + start) still runs (`live`), and, apart, those
+ * whose process cannot be judged now (`unknown`: its start unreadable, or none recorded). Read-only.
+ * Record names only: the writer's atomic temp (writeJsonAtomic's ".tmp-<hex>", a complete record once
+ * fsynced and until its rename) sits in the same dir and is skipped, so one watch is never counted twice;
+ * an entry that vanishes or cannot be parsed between the listing and its read is skipped alone.
  */
-export function countLiveDormant(agentDir: string, isAlive: (pid: number, start: string | null) => boolean): number {
-  let n = 0;
+export function countLiveDormant(agentDir: string, state: (pid: number, start: string | null) => "live" | "gone" | "unknown"): { live: number; unknown: number } {
+  const n = { live: 0, unknown: 0 };
   const dirs = [agentDir];
   try {
     for (const e of fs.readdirSync(agentDir, { withFileTypes: true })) if (e.isDirectory() && !e.isSymbolicLink()) dirs.push(path.join(agentDir, e.name));
   } catch {
-    return 0;
+    return n;
   }
   for (const d of dirs) {
     let names: string[] = [];
@@ -390,8 +443,11 @@ export function countLiveDormant(agentDir: string, isAlive: (pid: number, start:
       continue;
     }
     for (const nm of names) {
+      if (nm.startsWith(".")) continue; // the writer's temp: not a record yet
       const r = readJson(path.join(d, DORMANT_DIR, nm)) as Partial<DormantRecord> | null;
-      if (r && r.v === 1 && Number.isInteger(r.pid) && isAlive(r.pid as number, r.proc_start ?? null)) n++;
+      if (!(r && r.v === 1 && Number.isInteger(r.pid))) continue;
+      const s = state(r.pid as number, r.proc_start ?? null);
+      if (s !== "gone") n[s]++;
     }
   }
   return n;

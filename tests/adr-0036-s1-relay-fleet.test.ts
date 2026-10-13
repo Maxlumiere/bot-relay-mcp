@@ -33,6 +33,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { startToken } from "./helpers/start-token.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO_ROOT, "bin", "relay");
@@ -75,7 +76,7 @@ function runFleet(args: string[] = []): RunResult {
 /** The real start-time token for a pid, so a seeded anchor is genuinely live. */
 async function realStart(pid: number): Promise<string> {
   const { processStartedAt } = await import("../src/liveness.js");
-  return processStartedAt(pid) ?? "";
+  return startToken(pid);
 }
 
 async function seedSchema(): Promise<void> {

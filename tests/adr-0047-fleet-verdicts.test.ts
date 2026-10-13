@@ -344,6 +344,7 @@ function snapshot(over: Partial<FleetSnapshot> = {}): FleetSnapshot {
     processes: [win(10, 1), node(11, 10, SCRIPT, 2), node(99, 1, SCRIPT, 9)],
     listeners: [99],
     rows: [row(11, 2)],
+    unknownRows: [],
     bindings: [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
     daemon: { port: 3777, listenerPids: [99], health: { ok: true, build: loaded() } },
     installed: () => installedOk(),
@@ -353,6 +354,34 @@ function snapshot(over: Partial<FleetSnapshot> = {}): FleetSnapshot {
 }
 
 describe("judgeFleet", () => {
+  it("INV-LIVE-01 D2 (architect ruling a98ec836): a connector row whose process cannot be observed is SHOWN, UNKNOWN (never CURRENT, never dropped)", () => {
+    const j = V.judgeFleet(snapshot({ rows: [], unknownRows: [row(11, 2)] }), judgeFs);
+    const e = j.connectors.find((x) => x.pid === 11);
+    expect(e && [e.verdict, e.has_row, e.agent, e.reason]).toEqual([
+      "UNKNOWN",
+      true,
+      "architect",
+      "unknown: its process cannot be observed now (its start time cannot be read, and the system does not say it ended)",
+    ]);
+  });
+  it("INV-LIVE-01 D2: the fleet adapter reads a pid MISSING from the process snapshot as gone ONLY on the kernel's ESRCH, else unreadable", async () => {
+    let seen: unknown[] = [];
+    const table = new Map([[10, { pid: 10, ppid: 1, startedAt: START(1), command: "claude", comm: "claude" }]]);
+    const sys: import("../src/fleet-verdicts.js").SystemDeps = {
+      processTable: () => table,
+      cwds: () => new Map(),
+      exactArgv: () => null,
+      allListeners: () => [],
+      portListeners: () => [],
+      health: async () => ({ ok: false, error: "none" }),
+      nodeOnPath: () => null,
+      installed: () => installedOk(),
+      pidState: (pid) => (pid === 11 ? "alive" : pid === 13 ? "unknown" : "gone"),
+    };
+    await V.observeFleet(sys, { connectorRows: (startOf) => ((seen = [10, 11, 12, 13].map(startOf)), { live: [], unknown: [] }), liveBindings: () => [] }, 3777);
+    const U = { kind: "unreadable", why: "its pid has no row in the process snapshot" };
+    expect(seen).toEqual([{ kind: "start", start: START(1) }, U, { kind: "gone" }, U]);
+  });
   it("all CURRENT: the bound connector carries its agent; the daemon (a listener) is never a connector; nothing fails", () => {
     const j = V.judgeFleet(snapshot(), judgeFs);
     expect(j.connectors.map((e) => [e.pid, e.agent, e.unbound, e.verdict])).toEqual([[11, "architect", false, "CURRENT"]]);
