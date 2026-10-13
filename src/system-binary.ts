@@ -24,7 +24,14 @@
 import fs from "fs";
 import path from "path";
 
-/** A system tool could not be located at its trusted absolute path: the caller fails CLOSED with this message. */
+/**
+ * A system tool could not be located at its trusted absolute path. What each caller does with it (Codex #336 R2
+ * NEW-4: stated per caller, not promised for all): fs-perms' runSystem turns it into a FAILED run carrying this message,
+ * and the SID / owner / ACL checks, the registration secret and the pair file then refuse; DB startup continues with a
+ * REPORTED privacy degradation (db.ts, by design); liveness's runner reads it as "" (no output), and the reason is not
+ * reported there: machineGuid() is then null (every agent treated as cross-host), and a start-time read is "unreadable",
+ * which agentProcessState() then TRUSTS PID-liveness on (an inherited residual: an unreadable start counts as alive).
+ */
 export class SystemBinaryError extends Error {
   constructor(message: string) {
     super(message);

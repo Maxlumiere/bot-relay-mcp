@@ -50,15 +50,31 @@ export function subprocessSites(program: ts.Program, rel: (f: string) => string,
       !!e && ts.isPropertyAccessExpression(e) && e.name.text === "execPath" && ts.isIdentifier(e.expression) && NODE_PROCESS.test(keyOf(resolveBinding(checker, e.expression, rel)));
     const isSystemBinary = (e: ts.Expression | undefined): boolean =>
       !!e && ts.isCallExpression(e) && ts.isIdentifier(e.expression) && /system-binary\.ts:systemBinary$/.test(keyOf(resolveBinding(checker, e.expression, rel)));
-    /** The value of a literal option, or why it cannot be read: "absent" | "unreadable" | the initializer. */
+    /** A member's STATIC name: an identifier, a string or number literal, or a computed literal key; else null (unknowable). */
+    const staticName = (n: ts.PropertyName): string | null => {
+      if (ts.isIdentifier(n) || ts.isStringLiteral(n) || ts.isNumericLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) return n.text;
+      if (ts.isComputedPropertyName(n) && (ts.isStringLiteral(n.expression) || ts.isNoSubstitutionTemplateLiteral(n.expression) || ts.isNumericLiteral(n.expression))) return n.expression.text;
+      return null;
+    };
+    /**
+     * The value of a literal option, or why it cannot be read: "absent" | "unreadable" | the initializer. In property
+     * order (a later member wins). UNREADABLE (Codex #336 R2 NEW-2): a spread, a shorthand of that name, an accessor or
+     * method of that name, and ANY member whose key cannot be known statically (`[someName]`: it may be this option).
+     */
     const option = (opts: ts.Expression | undefined, name: string): ts.Expression | "absent" | "unreadable" => {
       if (!opts) return "absent";
       if (!ts.isObjectLiteralExpression(opts)) return "unreadable";
       let found: ts.Expression | "absent" | "unreadable" = "absent";
       for (const p of opts.properties) {
-        if (ts.isSpreadAssignment(p)) found = "unreadable"; // a spread may carry it, unless a later literal property overrides
-        else if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === name) found = p.initializer;
-        else if (ts.isShorthandPropertyAssignment(p) && p.name.text === name) found = "unreadable";
+        if (ts.isSpreadAssignment(p)) {
+          found = "unreadable"; // a spread may carry it, unless a later literal member overrides
+          continue;
+        }
+        const key = p.name ? staticName(p.name) : null;
+        if (key === null) found = "unreadable";
+        else if (key !== name) continue;
+        else if (ts.isPropertyAssignment(p)) found = p.initializer;
+        else found = "unreadable"; // a shorthand, a getter/setter or a method named like the option
       }
       return found;
     };
@@ -84,13 +100,43 @@ export function subprocessSites(program: ts.Program, rel: (f: string) => string,
       return site(call, text, api, "other", "the program is a bare name or an unchecked expression");
     };
 
+    /** Is `n` a function that LOADS a module: require, a createRequire(...) result, or import()? */
+    const isLoaderCall = (c: ts.CallExpression): boolean => {
+      if (c.expression.kind === ts.SyntaxKind.ImportKeyword) return true;
+      if (ts.isIdentifier(c.expression) && c.expression.text === "require") return true;
+      if (ts.isCallExpression(c.expression) && ts.isIdentifier(c.expression.expression) && c.expression.expression.text === "createRequire") return true;
+      if (ts.isIdentifier(c.expression)) {
+        const decl = checker.getSymbolAtLocation(c.expression)?.declarations?.[0];
+        const init = decl && ts.isVariableDeclaration(decl) ? decl.initializer : undefined;
+        if (init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === "createRequire") return true;
+      }
+      return false;
+    };
+
     const visit = (n: ts.Node): void => {
+      // REJECTED (ruled, Codex #336 R2 NEW-1 (c)): a module loader whose specifier is not a literal: it may load child_process.
+      if (ts.isCallExpression(n) && isLoaderCall(n)) {
+        const spec = n.arguments[0];
+        if (!spec || !(ts.isStringLiteral(spec) || ts.isNoSubstitutionTemplateLiteral(spec))) {
+          site(n, n.getText(sf), "rejected", "rejected", "a module loader (require / import() / createRequire) with a non-literal specifier");
+        }
+      }
+      // A SITE (ruled, NEW-1 (d)): `export * from "child_process"` re-exports the whole family.
+      if (ts.isExportDeclaration(n) && !n.exportClause && n.moduleSpecifier && ts.isStringLiteral(n.moduleSpecifier) && CP_SPECIFIER.test(n.moduleSpecifier.text)) {
+        site(n, n.getText(sf), "rejected", "rejected", "export * from child_process re-exports the whole spawn family");
+      }
       // REJECTED: the module named outside a static import/export (require, createRequire()(), dynamic import).
       if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && CP_SPECIFIER.test(n.text)) {
         const p = n.parent;
         const staticSpecifier = (ts.isImportDeclaration(p) || ts.isExportDeclaration(p)) && p.moduleSpecifier === n;
         const ambientModule = ts.isModuleDeclaration(p) && p.name === n;
         if (!staticSpecifier && !ambientModule) site(n, n.getText(sf), "rejected", "rejected", "child_process loaded outside a static import (require / createRequire / dynamic import)");
+      }
+      // A SITE (ruled, NEW-1 (d)): a re-export of a spawn-family binding (`export { spawnSync }`, `export { spawnSync as run }`).
+      if (ts.isExportSpecifier(n)) {
+        const local = n.propertyName ?? n.name;
+        const target = ts.isIdentifier(local) ? keyOf(resolveBinding(checker, local, rel)) : "";
+        if (SPAWN_FAMILY.test(target)) site(n, n.getText(sf), "reference", "reference", "a re-export of a spawn-family function");
       }
       if (ts.isIdentifier(n)) {
         const p = n.parent;
@@ -104,11 +150,15 @@ export function subprocessSites(program: ts.Program, rel: (f: string) => string,
             if (callee) classifyCall(callee, fam[1]!);
             else site(n, (ts.isPropertyAccessExpression(p) || ts.isBindingElement(p) ? p : n).getText(sf), "reference", "reference", "a spawn-family function used as a value (aliased, destructured, passed or stored)");
           } else if (CP_MODULE.test(key)) {
-            // Through casts, parentheses and non-null assertions: `(cp as any)["spawnSync"]` is the same access.
+            // RULED (NEW-1 (a)): the namespace/default binding may appear ONLY as the object of a direct, NON-computed
+            // property access (`cp.spawnSync`). Any other use (computed access, passed, stored, spread, returned,
+            // destructured, including computed destructuring (b)) FAILS: the capability would leave the inventory.
             let outer: ts.Node = n;
             while (ts.isParenthesizedExpression(outer.parent) || ts.isAsExpression(outer.parent) || ts.isNonNullExpression(outer.parent) || ts.isTypeAssertionExpression(outer.parent)) outer = outer.parent;
-            if (ts.isElementAccessExpression(outer.parent) && outer.parent.expression === outer) {
-              site(outer.parent, outer.parent.getText(sf), "rejected", "rejected", "computed member access on child_process");
+            const direct = ts.isPropertyAccessExpression(outer.parent) && outer.parent.expression === outer;
+            if (!direct) {
+              const how = ts.isElementAccessExpression(outer.parent) && outer.parent.expression === outer ? "computed member access on child_process" : "the child_process namespace used as a value (passed, stored, destructured, spread or returned)";
+              site(outer.parent, outer.parent.getText(sf).slice(0, 80), "rejected", "rejected", how);
             }
           }
         }

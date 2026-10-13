@@ -177,7 +177,7 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
   const fixtures: Record<string, string> = {
     "child_process.d.ts": decl,
     "node_modules/@types/node/process.d.ts": "declare var process: { execPath: string };",
-    "globals.d.ts": "declare function require(m: string): any; declare function createRequire(u: string): (m: string) => any; declare class Worker { constructor(s: string, o?: object); } declare const opts: object; declare function doIt(f: unknown): void;",
+    "globals.d.ts": "declare function require(m: string): any; declare function createRequire(u: string): (m: string) => any; declare class Worker { constructor(s: string, o?: object); } declare const opts: object; declare function doIt(f: unknown): void; declare const someName: string;",
     "src/system-binary.ts": "export function systemBinary(n: string): string { return n; }",
     // the program
     "src/bad-literal.ts": 'import { spawnSync } from "child_process"; export function a() { spawnSync("whoami", ["/user"]); }',
@@ -206,6 +206,23 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
     "src/good-execpath.ts": 'import { spawn } from "child_process"; export function t() { spawn(process.execPath, ["x.js"]); }',
     "src/good-fork.ts": 'import { fork } from "child_process"; export function u() { fork("m.js"); }',
     "src/not-cp.ts": 'function spawnSync(x: string) { return x; } export function v() { spawnSync("whoami"); }',
+    // Codex #336 R2 NEW-1 (ruled: closed in #336), each reproduced in memory by the review:
+    "src/esc-computed-destructure.ts": 'import * as cp from "child_process"; export function y1() { const { ["spawnSync"]: run } = cp; run("whoami"); }',
+    "src/esc-namespace-passed.ts": 'import * as cp from "child_process"; function invoke(m: any) { m.spawnSync("whoami"); } export function y2() { invoke(cp); }',
+    "src/esc-namespace-stored.ts": 'import * as cp from "child_process"; export const holder = { cp };',
+    "src/esc-nonliteral-require.ts": 'export function y3() { require("node:child_" + "process").spawnSync("whoami"); }',
+    "src/esc-nonliteral-import.ts": 'export async function y4() { await import(someName); }',
+    "src/esc-nonliteral-created.ts": 'const req = createRequire("x"); export function y5() { req(someName); }',
+    "src/esc-reexport.ts": 'export { spawnSync } from "child_process";',
+    "src/esc-reexport-local.ts": 'import { spawnSync } from "child_process"; export { spawnSync as run };',
+    "src/esc-export-star.ts": 'export * from "child_process";',
+    // Codex #336 R2 NEW-2: option members the reader must not trust.
+    "src/opt-computed-shell.ts": 'import { spawnSync } from "child_process"; export function z1() { spawnSync(process.execPath, [], { ["shell"]: "cmd.exe" }); }',
+    "src/opt-getter-shell.ts": 'import { spawnSync } from "child_process"; export function z2() { spawnSync(process.execPath, [], { get shell() { return "cmd.exe"; } }); }',
+    "src/opt-getter-execpath.ts": 'import { fork } from "child_process"; export function z3() { fork("x.js", [], { get execPath() { return "node"; } }); }',
+    "src/opt-computed-execpath.ts": 'import { fork } from "child_process"; export function z4() { fork("x.js", [], { ["execPath"]: "node" }); }',
+    "src/opt-dynamic-key.ts": 'import { spawnSync } from "child_process"; export function z5() { spawnSync(process.execPath, [], { [someName]: "cmd.exe" }); }',
+    "src/opt-shell-false-computed.ts": 'import { spawnSync } from "child_process"; export function z6() { spawnSync(process.execPath, [], { ["shell"]: false }); }',
     // THE NAMED BOUNDARY (not seen, by design)
     "src/boundary-eval-string.ts": 'export function w() { new Worker("require(\'child_process\').spawnSync(\'whoami\')", { eval: true }); }',
     "node_modules/cross-spawn/index.ts": 'import { spawnSync } from "child_process"; export function x() { spawnSync("whoami"); }',
@@ -241,6 +258,24 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
     expect(by(sites, "good-execpath.ts")).toEqual(["execPath"]);
     expect(by(sites, "good-fork.ts")).toEqual(["execPath"]);
     expect(by(sites, "not-cp.ts")).toEqual([]);
+  });
+
+  it("REJECTED (Codex #336 R2 NEW-1, ruled): computed destructuring, the namespace used as a value (passed, stored), a non-literal require/import/createRequire specifier", () => {
+    const sites = scanned();
+    for (const f of ["esc-computed-destructure.ts", "esc-namespace-passed.ts", "esc-namespace-stored.ts", "esc-nonliteral-require.ts", "esc-nonliteral-import.ts", "esc-nonliteral-created.ts", "esc-export-star.ts"]) {
+      expect(by(sites, f), f).toContain("rejected");
+    }
+  });
+
+  it("A SITE (Codex #336 R2 NEW-1, ruled): a re-export of a spawn-family binding must itself be classified", () => {
+    const sites = scanned();
+    for (const f of ["esc-reexport.ts", "esc-reexport-local.ts"]) expect(by(sites, f), f).toContain("reference");
+  });
+
+  it("CAUGHT (Codex #336 R2 NEW-2): a computed or getter `shell`, a getter or computed `execPath`, a dynamic key; a literal computed `shell: false` passes", () => {
+    const sites = scanned();
+    for (const f of ["opt-computed-shell.ts", "opt-getter-shell.ts", "opt-getter-execpath.ts", "opt-computed-execpath.ts", "opt-dynamic-key.ts"]) expect(by(sites, f), f).toEqual(["other"]);
+    expect(by(sites, "opt-shell-false-computed.ts")).toEqual(["execPath"]);
   });
 
   it("BOUNDARY (documented, NOT seen): a subprocess inside an evaluated string, and dependency code outside src/", () => {
