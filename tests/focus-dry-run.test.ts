@@ -218,7 +218,7 @@ describe("the desktop-actuator predicates (pure)", () => {
     ["sh fed a Buffer", [["sh", ["-s"], { input: Buffer.from("PATH=/usr/bin:/bin\nopen -a Calculator\n") }], true], "open"],
     ["exec() of bash with input", [["bash", { input: "eval x" }], false], "eval"],
   ] as const)("HARM %s (a shell runs its INPUT as a command line: read too, ruled 13 Oct)", (_l, [args, argvAt1], expected) => {
-    expect(desktopActuatorOfCall(args as unknown[], argvAt1)).toContain(expected);
+    expect(desktopActuatorOfCall(args as unknown as unknown[], argvAt1)).toContain(expected);
   });
 
   it("TWIN input to a NON-shell program is data (node reading stdin)", () => {
