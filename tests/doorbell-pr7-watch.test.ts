@@ -241,7 +241,9 @@ const alive = (pid: number) => {
  * empty, then found) via the old helper's one catch around the whole list: the poll accepts the
  * complete TEMP as the record, and the next read, racing its rename, gets ENOENT and returns empty.
  */
-function dormantRead(dir: string): { records: Array<{ pid?: unknown; reason?: unknown }>; skipped: Array<{ name: string; error: string }> } {
+/** A dormant record as parsed from its file: every field unverified (the writer records pid, reason and at, among others). */
+type DormantRecordJson = { pid?: unknown; reason?: unknown; at?: unknown };
+function dormantRead(dir: string): { records: DormantRecordJson[]; skipped: Array<{ name: string; error: string }> } {
   const d = path.join(dir, W.DORMANT_DIR);
   let names: string[];
   try {
@@ -249,7 +251,7 @@ function dormantRead(dir: string): { records: Array<{ pid?: unknown; reason?: un
   } catch (err) {
     return { records: [], skipped: [{ name: "(the dormant dir)", error: err instanceof Error ? err.message : String(err) }] };
   }
-  const records: Array<{ pid?: unknown; reason?: unknown }> = [];
+  const records: DormantRecordJson[] = [];
   const skipped: Array<{ name: string; error: string }> = [];
   for (const name of names) {
     if (name.startsWith(".")) continue; // the writer's temp: not a record yet
@@ -318,7 +320,7 @@ const FAIL_PS_DIR = path.join(ROOT, "fail-ps");
 fs.mkdirSync(FAIL_PS_DIR, { recursive: true });
 fs.writeFileSync(
   path.join(FAIL_PS_DIR, "ps"),
-  `#!/bin/sh\ncase " $* " in\n  *" -p $PS_TARGET "*)\n    n=$(cat "$PS_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$PS_COUNT"\n    if [ -e "$PS_FLAG" ] || [ "$n" -gt "$PS_AFTER" ]; then exit 1; fi ;;\nesac\nexec ${sq(REAL_PS)} "$@"\n`,
+  `#!/bin/sh\ncase " $* " in\n  *" -p $PS_TARGET "*)\n    n=$(cat "$PS_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$PS_COUNT.$$" && mv -f "$PS_COUNT.$$" "$PS_COUNT"\n    if [ -e "$PS_FLAG" ] || [ "$n" -gt "$PS_AFTER" ]; then exit 1; fi ;;\nesac\nexec ${sq(REAL_PS)} "$@"\n`,
   { mode: 0o755 },
 );
 let failSeq = 0;
@@ -329,13 +331,62 @@ function failWatch(w: { pid: number }, o: { after?: number; flags?: string[]; en
   const count = path.join(FAIL_PS_DIR, `count-${n}`);
   const env = { PS_TARGET: String(w.pid), PS_FLAG: flag, PS_COUNT: count, PS_AFTER: String(o.after ?? 1_000_000), ...(o.env ?? {}), PATH: `${FAIL_PS_DIR}:${process.env.PATH ?? ""}` };
   const args = ["w-bob", "--until-wake", ...(o.flags ?? ["--interval", "1", "--dormant-check-s", "1", "--anchor-unknown-bound-s", "3"])];
-  return { args, env, flag, reads: () => Number(fs.existsSync(count) ? fs.readFileSync(count, "utf-8").trim() : 0) };
+  return { args, env, flag, reads: () => readCount(count) };
+}
+/**
+ * The fail-ps shim's count (flake g). The shim writes it to a temp file and RENAMES it into place, so a read never
+ * sees a half-written file; and a read that is not a count anyway is an ERROR, never 0. MEASURED: with the old
+ * truncate-then-write (`echo "$n" > "$PS_COUNT"`), about 0.2% of reads returned "", which `Number("")` read as 0.
+ */
+function readCount(count: string): number {
+  if (!fs.existsSync(count)) return 0; // no read counted yet
+  const raw = fs.readFileSync(count, "utf-8").trim();
+  if (!/^\d+$/.test(raw)) throw new Error(`the fail-ps count file ${count} read ${JSON.stringify(raw)}: not a count (an instrument fault, not the watch)`);
+  return Number(raw);
 }
 const on = (flag: string) => fs.writeFileSync(flag, "");
 const off = (flag: string) => fs.rmSync(flag, { force: true });
 /** The exact blind reason (R2 N5): built from the CAPTURED window anchor, whatever the watch was doing. */
 const blindReason = (w: { pid: number }, base: string, boundS = 3) => `${W.ANCHOR_UNOBSERVED_PREFIX} its window (pid ${w.pid}, start ${startToken(w.pid)}) could not be observed for ${boundS} s of awake time in a row (the bound): it is not judged gone and is never re-anchored; dormant because: ${base}`;
 const STOPPED_AT_BOUND = "it stopped watching at the bound";
+
+describe.skipIf(process.platform === "win32")("the fail-ps shim's count (flake g): a read never sees a half-written count", () => {
+  // The R2 N1 burst test once read reads() = 0 after a 2.5 s burst. MEASURED (outside the repo, with a probe): the
+  // shim's old `echo "$n" > "$PS_COUNT"` truncates before it writes, and about 0.2% of reads in that instant returned
+  // "", read as 0. This drives the REAL shim back to back (flag on: it fails fast, never exec'ing ps) and reads
+  // through the REAL reads() for 1.5 s; once the count has read non-zero, no read may be 0 and none may throw.
+  it("the shim back to back for 1.5 s: every read after the first count is a count, never 0 and never unparsable", async () => {
+    const f = failWatch({ pid: 4242424 });
+    on(f.flag);
+    try {
+      const writer = spawn("/bin/sh", ["-c", `end=$(( $(date +%s) + 3 )); while [ $(date +%s) -lt $end ]; do ps -o lstart= -p 4242424 >/dev/null 2>&1; done`], { env: { ...process.env, ...f.env }, stdio: "ignore" });
+      const writerExit = new Promise((r) => writer.on("exit", r));
+      let seen = 0;
+      let zeros = 0;
+      let errors = 0;
+      let reads = 0;
+      for (const t0 = Date.now(); Date.now() - t0 < 4_000 && (seen === 0 || Date.now() - t0 < 2_000); ) {
+        try {
+          const n = f.reads();
+          if (seen > 0) {
+            reads++;
+            if (n === 0) zeros++;
+          }
+          seen = Math.max(seen, n);
+        } catch {
+          errors++;
+        }
+        await new Promise((r) => setImmediate(r));
+      }
+      await writerExit;
+      expect(seen, "the shim counted (the writer ran)").toBeGreaterThan(20);
+      expect(reads, "the reads to judge").toBeGreaterThan(1_000);
+      expect({ zeros, errors }, `${reads} reads after the first count`).toEqual({ zeros: 0, errors: 0 });
+    } finally {
+      off(f.flag);
+    }
+  }, 20_000);
+});
 
 describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens; inside a bound window)", () => {
   const windows: TestWindow[] = [];
