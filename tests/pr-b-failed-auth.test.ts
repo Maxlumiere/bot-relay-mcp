@@ -1074,6 +1074,20 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     }
     await expect(t.settled(absNow() + 60_000, 30), "a stopped ticker never settles: bounded, it rejects").rejects.toThrow(/never ticked/);
   });
+  it("THE SENTINEL's snapshot is ARMED per request (the call site of settled): its reply never comes before a sentinel tick at or after the asked end; a request that cannot settle comes back as a fault, and a reading without a stream carries that reason into the INSTRUMENT FAULT", async () => {
+    await armInstruments();
+    const end = absNow() + 200; // an end in the near future: the sentinel must tick past it before it answers
+    const ok = await sentinel!.ask(absNow() - 50, end);
+    const answeredAt = absNow();
+    expect(ok.fault, "a settle-able request is answered with gaps").toBeUndefined();
+    expect(Array.isArray(ok.gaps)).toBe(true);
+    expect(answeredAt, "the reply came only after the sentinel ticked at or after the asked end").toBeGreaterThanOrEqual(end);
+    const never = await sentinel!.ask(absNow(), absNow() + 600_000); // no tick can reach it within the bound
+    expect(never.gaps, "an unsettled request carries no stream").toBeUndefined();
+    expect(never.fault).toMatch(/never ticked at or after the requested end/);
+    const reading = { healthMax: 30, eldMax: 20, breaches: [], sentinelGaps: never.gaps, sentinelFault: never.fault };
+    expect(() => ceilingVerdict("unsettled", [reading])).toThrow(/INSTRUMENT FAULT \(unsettled\): reading 1 has no sentinel stream \(the ticker never ticked/);
+  }, 20_000);
   it("THE BOUNDARY PAIRS (5) + (4), mixed outcomes: an EVALUATED unexpected verdict is final before any other component's noise or cap; evaluated results are kept; only the bars a component lacks are re-run; a freeze in any boundary bar is FAIL first", async () => {
     const reading = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
     const iv = (verdict: Verdict): InstrumentVerdict => ({ d: verdict === "FAIL" ? 90 : 10, noise: verdict === "NOT_EVALUATED" ? 40 : 5, verdict });
