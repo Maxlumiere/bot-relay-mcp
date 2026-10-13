@@ -18,6 +18,7 @@ import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
 import { openWindow, findEscapes, selfAndAncestors, snapshotProcessEnv } from "./helpers/watch-window.js";
+import { parentPidOf, parsePid } from "./_helpers/recorded-pid.js";
 import { probePid, processStartedAt as readStart, startOrNull } from "../src/liveness.js";
 
 // INV-LIVE-01 (#324) replaced the boolean probe and the nullable start: this file keeps their shapes locally.
@@ -43,7 +44,6 @@ const until = async (cond: () => boolean, ms = 5_000) => {
   for (const end = Date.now() + ms; !cond() && Date.now() < end; ) await sleep(20);
   return cond();
 };
-const ppidOf = (pid: number) => Number(spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf-8" }).stdout.trim());
 
 /** Independent cleanup: kill the window's group ONLY while its leader is the very process it was (never a reused id). */
 function cleanup(w: { leaderPid: number }, leaderStart: string | null, extra: number[] = []): void {
@@ -55,6 +55,7 @@ function cleanup(w: { leaderPid: number }, leaderStart: string | null, extra: nu
     }
   }
   for (const p of extra) {
+    if (!(p > 1)) continue; // never 0 (the group) or 1
     try {
       process.kill(p, "SIGKILL");
     } catch {
@@ -69,7 +70,7 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     const w = openWindow(path.join(ROOT, "ack"), env);
     const leaderStart = processStartedAt(w.leaderPid);
     try {
-      expect(isPidAlive(w.pid) && ppidOf(w.pid) === w.leaderPid).toBe(true); // PRIMARY
+      expect(isPidAlive(w.pid) && parentPidOf(w.pid) === w.leaderPid).toBe(true); // PRIMARY
     } finally {
       cleanup(w, leaderStart);
     }
@@ -133,13 +134,15 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     let escaped = 0;
     try {
       w.fixtures.detachedWriter(f);
-      expect(await until(() => fs.existsSync(f.ready) && /^\d+$/.test(fs.readFileSync(f.pidFile, "utf-8").trim()))).toBe(true);
-      escaped = Number(fs.readFileSync(f.pidFile, "utf-8").trim());
+      // ONE captured string per poll, parsed once (digits AND > 1): never a second read that could differ.
+      let captured: number | null = null;
+      expect(await until(() => fs.existsSync(f.ready) && (captured = parsePid(fs.readFileSync(f.pidFile, "utf-8"))) !== null)).toBe(true);
+      escaped = captured!;
       await expect(w.close()).rejects.toThrow(new RegExp(`escaped the window's process group: pid ${escaped}\\b`)); // PRIMARY
       expect(await until(() => !isPidAlive(escaped), 2_000)).toBe(true); // ...and it was killed
     } finally {
       fs.writeFileSync(f.release, "");
-      cleanup(w, leaderStart, escaped ? [escaped] : []);
+      cleanup(w, leaderStart, escaped > 1 ? [escaped] : []);
     }
   }, 15_000);
 
@@ -213,7 +216,7 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
       await expect(w.close()).rejects.toThrow(/cannot verify the window's owner: its supervisor \(pid \d+\) is gone; nothing is signalled/);
       expect(isPidAlive(run)).toBe(true); // PRIMARY: nothing signalled
     } finally {
-      for (const p of [run, w.pid]) if (p) try { process.kill(p, "SIGKILL"); } catch { /* gone */ }
+      for (const p of [run, w.pid]) if (p > 1) try { process.kill(p, "SIGKILL"); } catch { /* gone */ }
     }
   }, 15_000);
 
@@ -224,7 +227,9 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     try {
       const a = await w.runSleep(30).pid();
       const b = await w.runSleep(30).pid();
-      process.kill(ppidOf(a), "SIGKILL"); // as the "refused after launch" test kills the watch's launching shell
+      const launcher = parentPidOf(a); // ONE captured `ps` string, digits AND > 1: an empty read is null, never 0 (the group)
+      expect(launcher, `the launching shell of ${a} is readable (a pid > 1)`).not.toBeNull();
+      process.kill(launcher!, "SIGKILL"); // as the "refused after launch" test kills the watch's launching shell
       await sleep(100);
       await w.close();
       expect([isPidAlive(a), isPidAlive(b)]).toEqual([false, false]); // PRIMARY

@@ -19,6 +19,7 @@ import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
 import { startToken } from "./helpers/start-token.js";
+import { parentPidOf } from "./_helpers/recorded-pid.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
@@ -355,37 +356,58 @@ describe.skipIf(process.platform === "win32")("the fail-ps shim's count (flake g
   // shim's old `echo "$n" > "$PS_COUNT"` truncates before it writes, and about 0.2% of reads in that instant returned
   // "", read as 0. This drives the REAL shim back to back (flag on: it fails fast, never exec'ing ps) and reads
   // through the REAL reads() for 1.5 s; once the count has read non-zero, no read may be 0 and none may throw.
-  it("the shim back to back for 1.5 s: every read after the first count is a count, never 0 and never unparsable", async () => {
+  it("the shim back to back: after a bounded readiness wait, a FIXED 1.5 s window of reads, the writer alive throughout: every read is a count, never 0 and never unparsable", async () => {
     const f = failWatch({ pid: 4242424 });
+    const stop = `${f.flag}.stop`;
     on(f.flag);
+    // The writer runs until the TEST says stop (an explicit handshake), capped at 30 s so it can never outlive a failure.
+    const writer = spawn("/bin/sh", ["-c", `end=$(( $(date +%s) + 30 )); while [ ! -e "$STOP" ] && [ $(date +%s) -lt $end ]; do ps -o lstart= -p 4242424 >/dev/null 2>&1; done`], { env: { ...process.env, ...f.env, STOP: stop }, stdio: "ignore" });
+    const writerExit = new Promise((r) => writer.on("exit", r));
+    let zeros = 0;
+    let errors = 0;
+    let reads = 0;
+    let lastCount = 0;
     try {
-      const writer = spawn("/bin/sh", ["-c", `end=$(( $(date +%s) + 3 )); while [ $(date +%s) -lt $end ]; do ps -o lstart= -p 4242424 >/dev/null 2>&1; done`], { env: { ...process.env, ...f.env }, stdio: "ignore" });
-      const writerExit = new Promise((r) => writer.on("exit", r));
-      let seen = 0;
-      let zeros = 0;
-      let errors = 0;
-      let reads = 0;
-      for (const t0 = Date.now(); Date.now() - t0 < 4_000 && (seen === 0 || Date.now() - t0 < 2_000); ) {
+      // (1) READINESS, bounded: the shim has counted (its count file exists and reads > 0).
+      const ready = Date.now();
+      while (Date.now() - ready < 10_000 && (fs.existsSync(f.env.PS_COUNT) ? f.reads() : 0) === 0) await new Promise((r) => setTimeout(r, 5));
+      const first = f.reads();
+      expect(first, "readiness: the shim counted within 10 s").toBeGreaterThan(0);
+      // (2) A SEPARATE, FIXED sampling window: its own clock, started only now.
+      for (const t0 = Date.now(); Date.now() - t0 < 1_500; ) {
+        reads++;
         try {
           const n = f.reads();
-          if (seen > 0) {
-            reads++;
-            if (n === 0) zeros++;
-          }
-          seen = Math.max(seen, n);
+          if (n === 0) zeros++;
+          lastCount = Math.max(lastCount, n);
         } catch {
           errors++;
         }
         await new Promise((r) => setImmediate(r));
       }
-      await writerExit;
-      expect(seen, "the shim counted (the writer ran)").toBeGreaterThan(20);
+      expect(writer.exitCode, "the writer was still running through the whole window").toBeNull();
+      expect(lastCount - first, "the shim kept counting during the window").toBeGreaterThan(20);
       expect(reads, "the reads to judge").toBeGreaterThan(1_000);
-      expect({ zeros, errors }, `${reads} reads after the first count`).toEqual({ zeros: 0, errors: 0 });
+      expect({ zeros, errors }, `${reads} reads in the window`).toEqual({ zeros: 0, errors: 0 });
     } finally {
+      fs.writeFileSync(stop, "");
+      await writerExit;
       off(f.flag);
+      fs.rmSync(stop, { force: true });
     }
-  }, 20_000);
+  }, 30_000);
+  it("the strict reader, driven directly: empty, whitespace, a decimal, or text is an INSTRUMENT FAULT (never 0); a count reads as itself; no file reads 0", () => {
+    const dir = fs.mkdtempSync(path.join(ROOT, "count-"));
+    const file = (content: string) => {
+      const p = path.join(dir, `c-${Math.random().toString(36).slice(2)}`);
+      fs.writeFileSync(p, content);
+      return p;
+    };
+    for (const bad of ["", "  \n", "1.5", "abc", "-3", "7 8"]) expect(() => readCount(file(bad)), JSON.stringify(bad)).toThrow(/not a count \(an instrument fault, not the watch\)/);
+    expect(readCount(file("7\n")), "a valid count").toBe(7);
+    expect(readCount(file("0")), "0 written by the shim is a count (nothing failed yet)").toBe(0);
+    expect(readCount(path.join(dir, "absent")), "no file: nothing counted yet").toBe(0);
+  });
 });
 
 describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens; inside a bound window)", () => {
@@ -438,9 +460,10 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     expect(alive(pid)).toBe(true);
     // The anchor dies: the window (a watch that proved its window), or, for a watch that never did, the
     // process that launched it (its parent).
-    const anchorPid = anchor === "window" ? w.pid : Number(spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf-8" }).stdout.trim());
+    const anchorPid = anchor === "window" ? w.pid : parentPidOf(pid); // ONE captured `ps` string: digits AND > 1, else null
+    expect(anchorPid, "the anchor is a readable pid > 1 (never 0, the group)").not.toBeNull();
     expect(anchorPid).toBeGreaterThan(1);
-    process.kill(anchorPid, "SIGKILL");
+    process.kill(anchorPid!, "SIGKILL");
     if (anchor === "window") expect(await within(r.exited, 15_000), r.err()).toBe(0);
     else {
       // The parent recorded the exit code; it is gone, so watch the process itself end.
