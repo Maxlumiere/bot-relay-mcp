@@ -53,8 +53,9 @@ delete process.env.RELAY_DECAY_TICK_DISABLED;
 const LATE_READ_MS = 1500;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { _resetDashboardWsForTests } = await import("../src/transport/websocket.js");
-const { closeDb, getDb } = await import("../src/db.js");
+const { _resetDashboardWsForTests, _dashboardWsStateForTests } = await import("../src/transport/websocket.js");
+const { closeDb, getDb, getDashboardAgentSnapshots } = await import("../src/db.js");
+const { deriveDashboardState, resolveThresholdsFromEnv } = await import("../src/agent-state-machine.js");
 
 import { connectWs as baseConnectWs } from "./_helpers/ws.js";
 import { mintHeaders } from "./_helpers/mint.js";
@@ -318,11 +319,15 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     // assert ZERO — the actual dedup property, now race-free. (The confirming subscriber is
     // subscribed BEFORE the register, above.)
     // ORDERING DEADLINE, not an SLA (#210): how long we wait for the transition to be broadcast.
-    // A timeout here is a GENUINE failure — "the time-only transition never fired" is a real
-    // defect — so it fails LOUD below, never silently absorbed. Bounded; not a latency budget.
+    // A timeout here fails LOUD below, never silently absorbed, with what WAS observed (the frames this
+    // subscriber received, and what the server held at the deadline) to help investigate the missing frame.
+    // Bounded; not a latency budget.
     const ORDERING_DEADLINE_MS = 12_000;
     const confirmStart = Date.now();
     let sawTransition = false;
+    // SELF-DIAGNOSING (macOS CI, run 38234341596 at 04adea0): that red said only "never broadcast". Every frame
+    // this subscriber saw is kept, so a red names what DID arrive, alongside what the server held at the deadline.
+    const seen: string[] = [];
     while (Date.now() - confirmStart < ORDERING_DEADLINE_MS) {
       let raw: string;
       try {
@@ -333,6 +338,8 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
         break; // no frame within the remaining budget
       }
       const f = JSON.parse(raw) as BroadcastFrame;
+      // The server's own emission time (f.ts): frames read from the queue would all show the read time.
+      seen.push(`${f.ts} ${f.event}:${f.entity_id}${f.kind ? ":" + f.kind : ""}`);
       if (
         f.event === "agent.status_changed" &&
         f.entity_id === "rt-dedup" &&
@@ -342,20 +349,55 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
         break;
       }
     }
+    // ONLY on a miss: what the server held at the deadline (it runs in this process): its WS clients, and the state the
+    // broadcaster would derive for rt-dedup NOW, with its inputs. Present-state OBSERVATIONS to help investigate the
+    // missing frame; they establish no history and no cause. Collected inside a catch, so a failing collection can
+    // never replace or mask the assertion (its error is appended instead).
+    let diagnosis = "";
+    if (!sawTransition) {
+      try {
+        const snap = getDashboardAgentSnapshots(resolveThresholdsFromEnv().pendingWindowMs).find((a) => a.name === "rt-dedup");
+        diagnosis =
+          `frames seen (${seen.length}): [${seen.join(", ")}]; ` +
+          `server WS clients: ${_dashboardWsStateForTests().clients}; ` +
+          `rt-dedup derived state now: ${snap ? deriveDashboardState(snap.inputs, Date.now(), resolveThresholdsFromEnv()) : "NO ROW"}; ` +
+          `snapshot: ${JSON.stringify(snap?.inputs ?? null)}`;
+      } catch (err) {
+        diagnosis = `frames seen (${seen.length}): [${seen.join(", ")}]; diagnosis collection FAILED: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
     confirmWs.ws.close();
+    // States only what was OBSERVED (#317 claimed "a REAL defect" here: an over-claim the test cannot observe).
     expect(
       sawTransition,
-      "rt-dedup time-only `waiting` transition never broadcast within the ordering deadline — " +
-        "a REAL defect (the transition/broadcast failed), not flake.",
+      `no agent.status_changed:waiting frame for rt-dedup reached this subscriber within ${ORDERING_DEADLINE_MS} ms. ${diagnosis}`,
     ).toBe(true);
 
     // Now connect a FRESH subscriber AFTER the transition provably fired + deduped. Dedup ⇒ ZERO
-    // re-emit. The zero-assertion is race-free now, and the collect window is kept TIGHT on
-    // purpose: on a zero-assert a WIDER window is MORE exposure, not less (#210) — any rt-dedup
-    // frame here is a genuine dedup bug, not slowness.
-    const wsHandle = await connectWs();
-    const frames = await collectFrames(wsHandle, 5, 500);
-    const rtDedupFrames = frames.filter(
+    // re-emit for rt-dedup. NON-VACUOUS (Codex #328 F5): silence proves nothing if the broadcaster stopped ticking,
+    // so a second agent registers now and its OWN time-only `waiting` transition must reach this same subscriber.
+    // Every frame up to that one is checked: the ticks demonstrably continued while rt-dedup stayed silent.
+    const wsHandle = await subscribe();
+    await rpc("register_agent", { name: "rt-progress", role: "user", capabilities: ["build"] });
+    const progressStart = Date.now();
+    const afterConfirm: BroadcastFrame[] = [];
+    let ticksProgressed = false;
+    while (Date.now() - progressStart < ORDERING_DEADLINE_MS) {
+      let raw: string;
+      try {
+        raw = await wsHandle.nextMessage(Math.max(250, ORDERING_DEADLINE_MS - (Date.now() - progressStart)));
+      } catch {
+        break;
+      }
+      const f = JSON.parse(raw) as BroadcastFrame;
+      afterConfirm.push(f);
+      if (f.event === "agent.status_changed" && f.entity_id === "rt-progress" && f.kind === "waiting") {
+        ticksProgressed = true;
+        break;
+      }
+    }
+    expect(ticksProgressed, `precondition: the broadcaster kept ticking (rt-progress's own waiting transition was seen). frames: ${JSON.stringify(afterConfirm)}`).toBe(true);
+    const rtDedupFrames = afterConfirm.filter(
       (f) => f.entity_id === "rt-dedup" && f.event === "agent.status_changed",
     );
     expect(
@@ -364,11 +406,11 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
     ).toEqual([]);
     wsHandle.ws.close();
     // per-test timeout (#210): a HARNESS budget, not an SLA — sized to accommodate the ordering-
-    // confirm wait (≤12s) + the fresh-subscriber collect + daemon/WS setup, with headroom. A
-    // timeout here would mean the ordering confirm never completed, which its own loud assertion
-    // above already surfaces as a real defect (not flake). Widen-safe; do NOT tighten below the
-    // 12s ordering deadline it must contain.
-  }, 25_000);
+    // confirm wait (≤12s) + the tick-progress wait (≤12s) + daemon/WS setup, with headroom. A
+    // timeout here would mean the ordering confirm never completed, which its own loud, self-diagnosing
+    // assertion above already surfaces. Widen-safe; do NOT tighten below the
+    // two 12s deadlines it must contain.
+  }, 40_000);
 
   it("(RT3) RELAY_DECAY_TICK_DISABLED=1 disables the broadcaster — NO time-only emits", async () => {
     // Restart the server with the broadcaster opt-out flag set.
