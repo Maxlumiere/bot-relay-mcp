@@ -25,6 +25,8 @@ const EXPECTED = [
   "(b) 20 wrong-token register_agent, (c) 20 wrong-token get_messages, (d) 20 unknown tokens with 51 agents",
   "unknown-provenance rows",
   "NEGATIVE CONTROL",
+  "CEILING, a freeze",
+  "CEILING, a host stall",
 ];
 
 const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "timing-bars-")), "report.json");
