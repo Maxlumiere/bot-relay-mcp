@@ -1,0 +1,11 @@
+{
+  "$comment": "The KNOWN-BAD control: an exact published tarball (by integrity, never by version) and the tags its harm tests MUST fail. If any of them passes on this integrity, the suite has gone blind and the gate fails. MEASURED 2026-10-13 (SEC-20.T1/T2: the seed acceptance tool on this tarball).",
+  "package": "bot-relay-mcp",
+  "version": "3.0.1",
+  "integrity": "sha512-ssSKJMdYl2JoeRNdj9YOjBQf9fnRglopfFUA/iGbAleEitDguzOq6WYNxH/hSkcIwnE8Rv0abCpiISechTlYpg==",
+  "must_fail": [
+    "SEC-01.T1",
+    "SEC-20.T1",
+    "SEC-20.T2"
+  ]
+}
