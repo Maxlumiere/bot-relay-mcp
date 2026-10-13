@@ -227,6 +227,7 @@ const rpc = (port: number, tool: string, args: Record<string, unknown>, token?: 
  */
 const LOAD_WORKER = `
 const { parentPort, workerData } = require("worker_threads");
+const { monitorEventLoopDelay } = require("perf_hooks");
 const { port, n, kind, tool, args } = workerData;
 const hex = () => Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
 const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
@@ -246,15 +247,20 @@ const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
   })();
   await new Promise((r) => setTimeout(r, 50));
   const stop = new Promise((r) => parentPort.once("message", r));
+  // THE SENTINEL (flake f, Phase 0): this thread's OWN loop delay over the window. The daemon cannot block it (the
+  // sampler only awaits fetch), so a daemon-loop freeze leaves it quiet while a process- or host-wide stall does not.
+  const sentinel = monitorEventLoopDelay({ resolution: 1 });
+  sentinel.enable();
   parentPort.postMessage({ started: true });
   const statuses = n > 0 ? await Promise.all(Array.from({ length: n }, call)) : (await new Promise((r) => setTimeout(r, 300)), []);
   // The window stays open (and /health keeps being sampled) until the parent says stop: a POOL-LOADED control's
   // window must span its pool work, not just its requests.
   parentPort.postMessage({ loaded: true, statuses });
   await stop;
+  sentinel.disable();
   done = true;
   await sampler;
-  parentPort.postMessage({ healthMax });
+  parentPort.postMessage({ healthMax, sentinelMax: sentinel.max / 1e6 });
 })();
 `;
 
@@ -280,6 +286,11 @@ interface Reading {
   eldMax: number;
   /** How many of the load's calls the per-IP cap shed (429) before the MCP cycle. */
   shed: number;
+  /**
+   * Max delay (ms) of the load WORKER's own event loop over the window (flake f, Phase 0): REPORTED ONLY, no
+   * verdict reads it. Its question: does a stalled reading coincide with a stall the daemon cannot cause?
+   */
+  sentinelMax: number;
   /** A POOL-LOADED control only: its pool work INSIDE the measured window (see measure). */
   pool?: PoolOccupancy;
 }
@@ -307,7 +318,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
       let statuses: number[] = [];
       let t1 = 0;
       worker.on("error", reject);
-      worker.on("message", (m: { started?: true; loaded?: true; healthMax?: number; statuses?: number[] }) => {
+      worker.on("message", (m: { started?: true; loaded?: true; healthMax?: number; sentinelMax?: number; statuses?: number[] }) => {
         if (m.started) {
           t0 = performance.now();
           eld.enable();
@@ -329,7 +340,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
           );
           return;
         }
-        const reading: Reading = { healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: statuses.filter((s) => s === 429).length };
+        const reading: Reading = { healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: statuses.filter((s) => s === 429).length, sentinelMax: m.sentinelMax! };
         if (poolWork) reading.pool = occupancy(spans, t0, t1);
         resolve(reading);
       });
@@ -364,6 +375,8 @@ const measure = measureWindow;
  *       effect size) must FAIL and +20 ms (0.4 x) must PASS, proving discrimination at the threshold on that runner.
  *   (6) The 500 ms per-reading ceiling is an always-on freeze detector.
  *   (7) Every BAR line reports median d, median |a|, the effect size, the verdict and the resolution.
+ *   (8) SENTINEL, REPORTED ONLY (flake f, Phase 0): each reading also carries the load worker's own loop delay,
+ *       a loop the daemon cannot block. No verdict reads it yet; it measures whether runner stalls are host-wide.
  * A pool-loaded bar's controls (both of them) must also prove their occupancy (expectControlLoaded).
  *
  * CLAIMS, stated per instrument and reported per run (architect, LOOP boundary sizing):
@@ -481,7 +494,8 @@ async function runBar(
       ` | rounds auth health ${list(auth.map((r) => r.healthMax))} eld ${list(auth.map((r) => r.eldMax))}` +
       ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}` +
       ` | rounds control' health ${list(control2.map((r) => r.healthMax))} eld ${list(control2.map((r) => r.eldMax))}` +
-      (opts.poolControl && control.every((r) => r.pool) && control2.every((r) => r.pool) ? ` | control pool in-window ${occ(control)} | control' pool in-window ${occ(control2)}` : ""),
+      (opts.poolControl && control.every((r) => r.pool) && control2.every((r) => r.pool) ? ` | control pool in-window ${occ(control)} | control' pool in-window ${occ(control2)}` : "") +
+      ` | sentinel (worker loop, report only) auth ${list(auth.map((r) => r.sentinelMax))} control ${list(control.map((r) => r.sentinelMax))} control' ${list(control2.map((r) => r.sentinelMax))}`,
   );
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
 }
