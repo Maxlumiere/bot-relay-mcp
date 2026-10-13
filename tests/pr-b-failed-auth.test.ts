@@ -226,21 +226,53 @@ const rpc = (port: number, tool: string, args: Record<string, unknown>, token?: 
  * `kind`: "auth" calls `tool` with a RANDOM token each; "control" calls register_agent with no name and no
  * token (see controlLoad).
  */
+/** A stall interval in ABSOLUTE ms (performance.timeOrigin + performance.now()), comparable across threads. */
+interface Gap {
+  from: number;
+  to: number;
+}
+/** Gaps shorter than this are never recorded: only a ceiling-sized stall is ever compared. */
+const GAP_FLOOR_MS = 20;
+const GAP_KEEP = 4096;
+/**
+ * THE TICKER PRIMITIVE, ONE SOURCE for every thread (the main thread, the dedicated sentinel worker, the load worker):
+ * a 1 ms wall-clock ticker, running from its creation and NEVER reset, that records each gap of >= GAP_FLOOR_MS between
+ * two consecutive ticks as an ABSOLUTE interval. Not monitorEventLoopDelay: MEASURED (flake f), that histogram is blind
+ * to a stall landing before its first tick after enable() or reset() (a 600 ms stop read 1.3-14.0 ms; this ticker read
+ * 608.7-610.3 ms). Absolute time is comparable across threads: MEASURED, a worker's stamp fell inside the main
+ * thread's [send, receive] window in 3 x 2000 round trips (round trip <= 0.21 ms).
+ */
+const TICKER_SRC = `(function makeTicker(floor, keep) {
+  const gaps = [];
+  let last = performance.timeOrigin + performance.now();
+  let ticks = 0;
+  const timer = setInterval(() => {
+    const now = performance.timeOrigin + performance.now();
+    if (now - last >= floor) {
+      gaps.push({ from: last, to: now });
+      if (gaps.length > keep) gaps.shift();
+    }
+    last = now;
+    ticks++;
+  }, 1);
+  if (timer.unref) timer.unref();
+  return { gaps: (from, to) => gaps.filter((g) => g.to > from && g.from < to), ticks: () => ticks, stop: () => clearInterval(timer) };
+})`;
+interface Ticker {
+  gaps: (from: number, to: number) => Gap[];
+  ticks: () => number;
+  stop: () => void;
+}
+const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, keep: number) => Ticker;
+const absNow = () => performance.timeOrigin + performance.now();
+
 const LOAD_WORKER = `
 const { parentPort, workerData } = require("worker_threads");
-const { port, n, kind, tool, args } = workerData;
-// THE SENTINEL (flake f): the largest wall-clock gap between this thread's own 1 ms ticks, counted from the window's
-// start. The daemon cannot block this thread (the sampler only awaits fetch), so a daemon-loop freeze leaves it quiet
-// while a process- or host-wide stall does not. A ticker that runs from the worker's start and is NEVER reset, not
-// monitorEventLoopDelay: MEASURED (flake f, Phase 1), that histogram is blind to a stall landing before its first tick
-// after enable() or reset(), here the synchronous start of the load (a 600 ms stop read 1.3-14.0 ms; this ticker
-// read 608.7-610.3 ms).
-let sentinelLast = performance.now(), sentinelFrom = Infinity, sentinelMax = 0;
-const sentinelTick = setInterval(() => {
-  const now = performance.now();
-  if (now > sentinelFrom) sentinelMax = Math.max(sentinelMax, now - sentinelLast);
-  sentinelLast = now;
-}, 1);
+const { port, n, kind, tool, args, ceilingMs, workerStallMs } = workerData;
+const abs = () => performance.timeOrigin + performance.now();
+// The LOAD worker's own gaps: REPORTED ONLY. It is busy (the calls, its own GC), so its gaps never exempt a breach
+// (architect ruling on #332 R1 P1 #1): only the DEDICATED idle sentinel can.
+const own = (${TICKER_SRC})(${GAP_FLOOR_MS}, ${GAP_KEEP});
 const hex = () => Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
 const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
   method: "POST",
@@ -249,27 +281,37 @@ const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
 }).then(async (r) => (await r.text(), r.status));
 (async () => {
   let healthMax = 0, done = false;
+  const healthBreaches = []; // every /health sample at or over the ceiling, as an absolute interval
   const sampler = (async () => {
     while (!done) {
       const t = performance.now();
+      const at = abs();
       await fetch("http://127.0.0.1:" + port + "/health").then((r) => r.text());
-      healthMax = Math.max(healthMax, performance.now() - t);
+      const ms = performance.now() - t;
+      healthMax = Math.max(healthMax, ms);
+      if (ms >= ceilingMs) healthBreaches.push({ from: at, to: at + ms });
       await new Promise((r) => setTimeout(r, 10));
     }
   })();
   await new Promise((r) => setTimeout(r, 50));
   const stop = new Promise((r) => parentPort.once("message", r));
-  sentinelFrom = performance.now(); // the window opens: from here, every gap counts
+  const opened = abs();
   parentPort.postMessage({ started: true });
+  // A LIVE-RED knob only (#332 R1): this LOAD worker busy for workerStallMs as the window opens, a worker-only stall.
+  if (workerStallMs > 0) {
+    const end = performance.now() + workerStallMs;
+    while (performance.now() < end) {}
+  }
   const statuses = n > 0 ? await Promise.all(Array.from({ length: n }, call)) : (await new Promise((r) => setTimeout(r, 300)), []);
   // The window stays open (and /health keeps being sampled) until the parent says stop: a POOL-LOADED control's
   // window must span its pool work, not just its requests.
   parentPort.postMessage({ loaded: true, statuses });
   await stop;
-  clearInterval(sentinelTick);
   done = true;
   await sampler;
-  parentPort.postMessage({ healthMax, sentinelMax });
+  const loadGapMax = own.gaps(opened, abs()).reduce((m, g) => Math.max(m, g.to - g.from), 0);
+  own.stop();
+  parentPort.postMessage({ healthMax, healthBreaches, loadGapMax });
 })();
 `;
 
@@ -278,6 +320,8 @@ interface Load {
   n: number;
   tool?: string;
   args?: Record<string, unknown>;
+  /** A LIVE-RED knob only: the LOAD worker busy this long as the window opens (a worker-only stall). */
+  workerStallMs?: number;
 }
 /**
  * The KNOWN-GOOD CONTROL (architect 10f7a172): the same N, the same transport and concurrency, admitted past
@@ -296,10 +340,19 @@ interface Reading {
   /** How many of the load's calls the per-IP cap shed (429) before the MCP cycle. */
   shed: number;
   /**
-   * THE SENTINEL (ms): the largest wall-clock gap between the load WORKER's own 1 ms ticks inside the window, a thread
-   * the daemon cannot block. It gates the ceiling (6): a breach it shares is a host stall, not the code.
+   * Every stall the ceiling (6) judges, as ABSOLUTE intervals: each /health sample at or over the ceiling (the load
+   * worker), and each main-thread gap of the never-reset main ticker at or over it (the daemon's loop).
    */
+  breaches: Array<Gap & { kind: "/health" | "loop-delay" }>;
+  /**
+   * THE SENTINEL's stream: the DEDICATED, otherwise-idle sentinel worker's gaps overlapping the window (absolute).
+   * Missing (not an array) is an INSTRUMENT FAULT, never a pass.
+   */
+  sentinelGaps?: Gap[];
+  /** The largest sentinel gap in the window (ms), for the BAR line. */
   sentinelMax: number;
+  /** The LOAD worker's own largest gap (ms): REPORTED ONLY, it never exempts a breach. */
+  loadGapMax: number;
   /**
    * The longest GC pause (ms) on the MAIN thread inside the window (flake f, Phase 0): REPORTED ONLY. The daemon
    * runs in the test's own isolate, so the harness's GC lands on the daemon's loop; this separates "a GC pause"
@@ -314,8 +367,66 @@ interface Reading {
  * Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has
  * started; `poolWork` (the POOL-LOADED control) starts at the same moment and is finished before this returns.
  */
+/** The MAIN thread's ticker (the daemon's loop) and the DEDICATED sentinel worker: created once, never reset. */
+let mainTicker: Ticker | null = null;
+let sentinel: { worker: Worker; ask: (from: number, to: number) => Promise<Gap[]> } | null = null;
+const SENTINEL_WORKER = `
+const { parentPort } = require("worker_threads");
+const t = (${TICKER_SRC})(${GAP_FLOOR_MS}, ${GAP_KEEP});
+parentPort.on("message", (m) => {
+  if (m.arm) {
+    const armed = () => (t.ticks() >= 2 ? parentPort.postMessage({ armed: true }) : setTimeout(armed, 1));
+    armed();
+    return;
+  }
+  parentPort.postMessage({ id: m.id, gaps: t.gaps(m.from, m.to) });
+});
+`;
+/**
+ * ARM, CONFIRM ARMED, THEN STIMULATE: both tickers exist and have ticked at least twice before any window opens, so
+ * no stall can land before a first tick. The sentinel does nothing else: an INDEPENDENT, otherwise-idle thread.
+ */
+async function armInstruments(): Promise<void> {
+  if (!mainTicker) mainTicker = makeTicker(GAP_FLOOR_MS, GAP_KEEP);
+  while (mainTicker.ticks() < 2) await new Promise((r) => setTimeout(r, 1));
+  if (!sentinel) {
+    const worker = new Worker(SENTINEL_WORKER, { eval: true });
+    worker.unref();
+    let seq = 0;
+    const pending = new Map<number, (g: Gap[]) => void>();
+    worker.on("message", (m: { id?: number; gaps?: Gap[] }) => {
+      if (m.id !== undefined) {
+        pending.get(m.id)?.(m.gaps!);
+        pending.delete(m.id);
+      }
+    });
+    await new Promise<void>((res, rej) => {
+      worker.once("error", rej);
+      const onArmed = (m: { armed?: true }) => {
+        if (!m.armed) return;
+        worker.off("message", onArmed);
+        res();
+      };
+      worker.on("message", onArmed);
+      worker.postMessage({ arm: true });
+    });
+    sentinel = {
+      worker,
+      ask: (from, to) =>
+        new Promise((res) => {
+          const id = ++seq;
+          pending.set(id, res);
+          worker.postMessage({ id, from, to });
+        }),
+    };
+  }
+}
+
 async function measureWindow(port: number, load: Load, onLoop?: () => void, poolWork?: PoolWork): Promise<Reading> {
+  await armInstruments();
   let pool: Promise<unknown> = Promise.resolve();
+  let t0Abs = 0;
+  let t1Abs = 0;
   const spans: Array<[number, number]> = [];
   let t0 = 0;
   const track = async <T,>(p: () => Promise<T>): Promise<T> => {
@@ -334,15 +445,16 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
     for (const e of list.getEntries()) gcs.push([e.startTime, e.duration]);
   });
   gcObs.observe({ entryTypes: ["gc"] });
-  const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args } });
+  const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args, ceilingMs: CEILING_MS, workerStallMs: load.workerStallMs ?? 0 } });
   try {
     return await new Promise<Reading>((resolve, reject) => {
       let statuses: number[] = [];
       let t1 = 0;
       worker.on("error", reject);
-      worker.on("message", (m: { started?: true; loaded?: true; healthMax?: number; sentinelMax?: number; statuses?: number[] }) => {
+      worker.on("message", (m: { started?: true; loaded?: true; healthMax?: number; healthBreaches?: Gap[]; loadGapMax?: number; statuses?: number[] }) => {
         if (m.started) {
           t0 = performance.now();
+          t0Abs = absNow();
           eld.enable();
           if (onLoop) setTimeout(onLoop, 5);
           if (poolWork) pool = poolWork(track);
@@ -355,6 +467,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
           pool.then(
             () => {
               t1 = performance.now();
+              t1Abs = absNow();
               eld.disable();
               worker.postMessage("stop");
             },
@@ -363,9 +476,23 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
           return;
         }
         const gcMax = gcs.filter(([at]) => at >= t0 && at <= t1).reduce((mx, [, dur]) => Math.max(mx, dur), 0);
-        const reading: Reading = { healthMax: m.healthMax!, eldMax: eld.max / 1e6, shed: statuses.filter((s) => s === 429).length, sentinelMax: m.sentinelMax!, gcMax };
-        if (poolWork) reading.pool = occupancy(spans, t0, t1);
-        resolve(reading);
+        const tEnd = absNow(); // the /health sampler ran until now
+        void (async () => {
+          const sentinelGaps = await sentinel!.ask(t0Abs, tEnd);
+          const loopBreaches = mainTicker!.gaps(t0Abs, t1Abs).filter((g) => g.to - g.from >= CEILING_MS);
+          const reading: Reading = {
+            healthMax: m.healthMax!,
+            eldMax: eld.max / 1e6,
+            shed: statuses.filter((s) => s === 429).length,
+            breaches: [...(m.healthBreaches ?? []).map((g) => ({ ...g, kind: "/health" as const })), ...loopBreaches.map((g) => ({ ...g, kind: "loop-delay" as const }))],
+            sentinelGaps,
+            sentinelMax: sentinelGaps.reduce((mx, g) => Math.max(mx, g.to - g.from), 0),
+            loadGapMax: m.loadGapMax ?? 0,
+            gcMax,
+          };
+          if (poolWork) reading.pool = occupancy(spans, t0, t1);
+          resolve(reading);
+        })().catch(reject);
       });
     });
   } finally {
@@ -404,8 +531,10 @@ const measure = measureWindow;
  *       80 ms + this run's median control max (per instrument; see CLAIMS) must FAIL and +20 ms (0.4 x the effect
  *       size, FIXED) must PASS, proving discrimination at the threshold on that runner.
  *   (6) The 500 ms per-reading ceiling is an always-on freeze detector, gated by the SENTINEL (architect e475d60d
- *       (2)): a breach with the sentinel quiet is a FREEZE, FAIL and final; a breach while the sentinel stalled too
- *       (sentinel >= the reading - 50 ms) is a host stall, NOT_EVALUATED, and (4) applies. A main-thread-only stall
+ *       (2), and the ruling on #332 R1 P1 #1), PER BREACH: a /health sample or a main-loop gap at or over the ceiling
+ *       is a host stall (NOT_EVALUATED; (4) applies) only if a gap of the DEDICATED idle sentinel COVERS it, i.e.
+ *       overlaps it for at least (its length - 50 ms). A touch, a matching magnitude at another time, or a stall of the
+ *       busy LOAD worker never exempts it: otherwise it is a FREEZE, FAIL and final. A main-thread-only stall
  *       (GC included) that pushes a reading past 500 ms IS an availability failure from a caller's view, so it FAILS.
  *       A reading with no sentinel is an INSTRUMENT FAULT, never a pass. MEASURED (flake f, Phase 0, 9 CI job logs):
  *       Phase 0's sentinel attributed 0 of the 20 unplanted runner stalls seen (max 156.1 ms). That sentinel was an
@@ -413,10 +542,11 @@ const measure = measureWindow;
  *       window, so the 0 of 20 holds only for stalls after that tick. This guard is for a TRUE host stall only and
  *       claims nothing about those stalls.
  *   (7) Every BAR line reports median d, median |a|, the effect size, the verdict and the resolution.
- *   (8) Each reading also carries the SENTINEL (the largest wall-clock gap between the load worker's own 1 ms ticks,
- *       a ticker running from the worker's start and never reset: a thread the daemon cannot block), which gates the
- *       ceiling (6), and the longest main-thread GC pause in the window, REPORTED ONLY (the daemon shares the test's
- *       isolate; no verdict reads it).
+ *   (8) ARM, CONFIRM ARMED, THEN STIMULATE: the instruments of (6) are ONE ticker primitive (TICKER_SRC: 1 ms, never
+ *       reset, absolute intervals) on the main thread and in a DEDICATED, otherwise-idle sentinel worker, both created
+ *       once and confirmed ticking before any window opens. Each reading carries its breach intervals and the
+ *       sentinel's gaps. Also REPORTED ONLY, never read by a verdict: the load worker's own largest gap (it is busy, so
+ *       it never exempts) and the longest main-thread GC pause (the daemon shares the test's isolate).
  * A pool-loaded bar's controls (both of them) must also prove their occupancy (expectControlLoaded).
  *
  * CLAIMS, stated per instrument and reported per run (architect, LOOP boundary sizing):
@@ -472,25 +602,39 @@ export function judge(auth: number[], control: number[], control2: number[]): In
   return { d, noise, verdict: noise > NOISE_LIMIT_MS ? "NOT_EVALUATED" : d < EFFECT_MS ? "PASS" : "FAIL" };
 }
 
+/** How long two absolute intervals overlap (ms; 0 when they only touch or are apart). */
+const overlapMs = (a: Gap, b: Gap) => Math.max(0, Math.min(a.to, b.to) - Math.max(a.from, b.from));
+
 /**
- * (6) THE CEILING, pure: over `readings` (a bar's AUTH arm), a reading at or over the ceiling with the sentinel quiet
- * is a FREEZE (FAIL, final); with the sentinel stalled too it is a host stall (NOT_EVALUATED). No sentinel: a FAULT.
+ * (6) THE CEILING, pure, PER BREACH (architect ruling on #332 R1 P1 #1). A breach is a /health sample or a main-loop gap
+ * at or over the ceiling. It is a HOST stall (NOT_EVALUATED) only if ONE gap of the DEDICATED idle sentinel COVERS
+ * it: overlaps it for at least (its length - 50 ms). A mere touch, a matching magnitude at another time, or a stall of
+ * the busy LOAD worker never counts. Otherwise it is a FREEZE: FAIL, final. A loop-delay reading at or over the ceiling
+ * with no main-loop gap to locate it cannot be covered: a freeze. No sentinel stream: an INSTRUMENT FAULT.
  */
-export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "sentinelMax">>): { verdict: Verdict; why: string } {
+export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps">>): { verdict: Verdict; why: string } {
   const freezes: string[] = [];
   const hostStalls: string[] = [];
   readings.forEach((r, i) => {
-    if (typeof r.sentinelMax !== "number" || !Number.isFinite(r.sentinelMax)) {
-      throw new Error(`INSTRUMENT FAULT (${label}): reading ${i + 1} has no sentinel, so a ceiling breach cannot be told from a host stall; no ceiling verdict is possible`);
+    if (!Array.isArray(r.sentinelGaps)) {
+      throw new Error(`INSTRUMENT FAULT (${label}): reading ${i + 1} has no sentinel stream, so a ceiling breach cannot be told from a host stall; no ceiling verdict is possible`);
     }
-    for (const [name, v] of [["/health", r.healthMax], ["loop-delay", r.eldMax]] as const) {
-      if (v < CEILING_MS) continue;
-      const at = `round ${i + 1} ${name} ${v.toFixed(1)} ms, sentinel ${r.sentinelMax.toFixed(1)} ms`;
-      (r.sentinelMax >= v - HOST_STALL_SLACK_MS ? hostStalls : freezes).push(at);
+    const breaches = r.breaches.filter((b) => b.to - b.from >= CEILING_MS);
+    if (r.eldMax >= CEILING_MS && !breaches.some((b) => b.kind === "loop-delay")) {
+      freezes.push(`round ${i + 1} loop-delay ${r.eldMax.toFixed(1)} ms with no main-loop gap to locate it (it cannot be covered)`);
+    }
+    if (r.healthMax >= CEILING_MS && !breaches.some((b) => b.kind === "/health")) {
+      freezes.push(`round ${i + 1} /health ${r.healthMax.toFixed(1)} ms with no sample interval to locate it (it cannot be covered)`);
+    }
+    for (const b of breaches) {
+      const ms = b.to - b.from;
+      const cover = r.sentinelGaps.reduce((mx, g) => Math.max(mx, overlapMs(g, b)), 0);
+      const at = `round ${i + 1} ${b.kind} ${ms.toFixed(1)} ms, covered by the sentinel for ${cover.toFixed(1)} ms (needs >= ${(ms - HOST_STALL_SLACK_MS).toFixed(1)})`;
+      (cover >= ms - HOST_STALL_SLACK_MS ? hostStalls : freezes).push(at);
     }
   });
-  if (freezes.length) return { verdict: "FAIL", why: `a single reading over the ${CEILING_MS} ms ceiling with the sentinel quiet (a freeze): ${freezes.join("; ")}` };
-  if (hostStalls.length) return { verdict: "NOT_EVALUATED", why: `over the ${CEILING_MS} ms ceiling while the sentinel stalled too (a host stall, not the code): ${hostStalls.join("; ")}` };
+  if (freezes.length) return { verdict: "FAIL", why: `a single reading over the ${CEILING_MS} ms ceiling NOT covered by the sentinel's own stall (a freeze): ${freezes.join("; ")}` };
+  if (hostStalls.length) return { verdict: "NOT_EVALUATED", why: `over the ${CEILING_MS} ms ceiling but COVERED by the sentinel's own stall (a host stall, not the code): ${hostStalls.join("; ")}` };
   return { verdict: "PASS", why: "" };
 }
 
@@ -546,6 +690,86 @@ export function sizeBlock(controlMaxes: number[], quiet: boolean): { median: num
   if (!quiet) return { median: m, ms: null, why: "the +20 bar's same-run A/A was noisy" };
   if (ms > BLOCK_CAP_MS) return { median: m, ms: null, why: `the sized block ${ms.toFixed(1)} ms exceeds the ${BLOCK_CAP_MS} ms cap` };
   return { median: m, ms, why: "" };
+}
+
+type Instr = "health" | "eld";
+const INSTRS: Instr[] = ["health", "eld"];
+const INSTR_NAME: Record<Instr, string> = { health: "AVAILABILITY", eld: "LOOP" };
+const controlMaxes = (b: BarStats, x: Instr) => b.control.map((r) => (x === "health" ? r.healthMax : r.eldMax));
+export interface BoundaryResult {
+  status: Outcome["status"];
+  why: string[];
+  /** Per instrument: the +20 bar that EVALUATED it (PASS) and sized its FAIL block. */
+  at20: Partial<Record<Instr, BarStats>>;
+  sized: Partial<Record<Instr, ReturnType<typeof sizeBlock>>>;
+  /** Per instrument: the sized FAIL-block bar that EVALUATED it (FAIL). */
+  block: Partial<Record<Instr, BarStats>>;
+  /** Every bar run, in order ("+20 #1", "AVAILABILITY block #1", ...). */
+  runs: string[];
+}
+
+/**
+ * (5) + (4) THE BOUNDARY PAIRS as components (Codex R1 P1 #2, #3 on #332). Each component is one instrument's +20 PASS
+ * twin and its sized FAIL block. Every bar first passes the ceiling (6): a freeze is FAIL, final, before anything else.
+ * Then an EVALUATED unexpected verdict (a +20 that FAILs, a block that PASSes) is FAIL, final, whatever any other
+ * component's noise or cap says. Evaluated results are KEPT; only the bars a component still lacks are re-run, each up
+ * to MAX_ATTEMPTS. A component still unevaluated after that leaves the unit NOT_EVALUATED (final, via expectBoundary).
+ */
+export async function boundaryPairs(run20: () => Promise<BarStats>, runBlock: (x: Instr, sized: { median: number; ms: number }) => Promise<BarStats>): Promise<BoundaryResult> {
+  const r: BoundaryResult = { status: "EVALUATED", why: [], at20: {}, sized: {}, block: {}, runs: [] };
+  const ne: string[] = [];
+  const fail = (why: string): BoundaryResult => ({ ...r, status: "FAIL", why: [why] });
+  const needs20 = () => INSTRS.filter((x) => !r.at20[x] || r.sized[x]?.ms == null);
+  for (let n = 1; n <= MAX_ATTEMPTS && needs20().length > 0; n++) {
+    const b = await run20();
+    r.runs.push(`+${BOUNDARY_PASS_MS} #${n}`);
+    const c = ceilingVerdict(b.label, b.auth);
+    if (c.verdict === "FAIL") return fail(`the +${BOUNDARY_PASS_MS} ms bar (#${n}): ${c.why}`);
+    for (const x of INSTRS) {
+      if (b[x].verdict === "FAIL") return fail(`${INSTR_NAME[x]} +${BOUNDARY_PASS_MS} ms read FAIL (d=${b[x].d.toFixed(1)}), evaluated: final (#${n})`);
+    }
+    if (c.verdict === "NOT_EVALUATED") {
+      ne.push(`+${BOUNDARY_PASS_MS} #${n}: ${c.why}`);
+      continue;
+    }
+    for (const x of needs20()) {
+      if (b[x].verdict === "NOT_EVALUATED") {
+        ne.push(`+${BOUNDARY_PASS_MS} #${n}: ${INSTR_NAME[x]} same-run A/A noise ${b[x].noise.toFixed(1)} ms`);
+        continue;
+      }
+      r.at20[x] = b; // PASS, evaluated: kept
+      r.sized[x] = sizeBlock(controlMaxes(b, x), true);
+      if (r.sized[x]!.ms === null) ne.push(`+${BOUNDARY_PASS_MS} #${n}: ${INSTR_NAME[x]} ${r.sized[x]!.why}`);
+    }
+  }
+  for (const x of INSTRS) {
+    const sized = r.sized[x];
+    if (!r.at20[x] || !sized || sized.ms === null) continue;
+    for (let n = 1; n <= MAX_ATTEMPTS && !r.block[x]; n++) {
+      const b = await runBlock(x, { median: sized.median, ms: sized.ms });
+      r.runs.push(`${INSTR_NAME[x]} block #${n}`);
+      const c = ceilingVerdict(b.label, b.auth);
+      if (c.verdict === "FAIL") return fail(`the ${INSTR_NAME[x]} block bar (#${n}): ${c.why}`);
+      if (b[x].verdict === "PASS") return fail(`${INSTR_NAME[x]} +${sized.ms.toFixed(1)} ms read PASS (d=${b[x].d.toFixed(1)}), evaluated: the bar cannot see harm at the boundary, final (#${n})`);
+      if (c.verdict === "NOT_EVALUATED") {
+        ne.push(`${INSTR_NAME[x]} block #${n}: ${c.why}`);
+        continue;
+      }
+      if (b[x].verdict === "NOT_EVALUATED") {
+        ne.push(`${INSTR_NAME[x]} block #${n}: same-run A/A noise ${b[x].noise.toFixed(1)} ms`);
+        continue;
+      }
+      r.block[x] = b; // FAIL as designed, evaluated: kept
+    }
+  }
+  const open = INSTRS.filter((x) => !r.at20[x] || r.sized[x]?.ms == null || !r.block[x]);
+  return open.length ? { ...r, status: "NOT_EVALUATED", why: ne.length ? ne : open.map((x) => `${INSTR_NAME[x]} boundary never evaluated`) } : r;
+}
+
+/** A boundary unit's FAIL is red with its reason; its final NOT_EVALUATED is red as itself (never called FAIL). */
+function expectBoundary(b: BoundaryResult): void {
+  expect(b.status, `boundary pairs: ${b.why.join(" | ")}`).not.toBe("FAIL");
+  expectEvaluated("boundary pairs", { result: b, attempts: b.runs.length, final: { status: b.status, why: b.why }, history: [{ status: b.status, why: b.why }] });
 }
 
 interface BarStats {
@@ -618,7 +842,8 @@ async function runBar(
       ` | rounds control health ${list(control.map((r) => r.healthMax))} eld ${list(control.map((r) => r.eldMax))}` +
       ` | rounds control' health ${list(control2.map((r) => r.healthMax))} eld ${list(control2.map((r) => r.eldMax))}` +
       (opts.poolControl && control.every((r) => r.pool) && control2.every((r) => r.pool) ? ` | control pool in-window ${occ(control)} | control' pool in-window ${occ(control2)}` : "") +
-      ` | sentinel (worker wall gap, gates the ceiling) auth ${list(auth.map((r) => r.sentinelMax))} control ${list(control.map((r) => r.sentinelMax))} control' ${list(control2.map((r) => r.sentinelMax))}` +
+      ` | sentinel (dedicated idle worker, max gap, gates the ceiling) auth ${list(auth.map((r) => r.sentinelMax))} control ${list(control.map((r) => r.sentinelMax))} control' ${list(control2.map((r) => r.sentinelMax))}` +
+      ` | load-worker max gap (report only) auth ${list(auth.map((r) => r.loadGapMax))}` +
       ` | main-thread GC max pause (report only) auth ${list(auth.map((r) => r.gcMax))} control ${list(control.map((r) => r.gcMax))} control' ${list(control2.map((r) => r.gcMax))}`,
   );
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
@@ -645,7 +870,7 @@ type CompareSpec = { max?: number; exactPerRound?: number };
  */
 function barOutcome(b: BarStats, compares: CompareSpec = { max: 0 }): Outcome {
   for (const r of [...b.control, ...b.control2, ...b.auth]) {
-    if (typeof r.sentinelMax !== "number" || !Number.isFinite(r.sentinelMax)) throw new Error(`INSTRUMENT FAULT (${b.label}): a reading has no sentinel (it was not wired into measure)`);
+    if (!Array.isArray(r.sentinelGaps)) throw new Error(`INSTRUMENT FAULT (${b.label}): a reading has no sentinel stream (it was not wired into measure)`);
   }
   const fail: string[] = [];
   const ne: string[] = [];
@@ -760,17 +985,80 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     }
     expect(msg, "a final NOT_EVALUATED is labelled as such: it never asserts a code failure").not.toMatch(/\bFAIL\b/);
   });
-  it("THE CEILING (6): a breach with the sentinel quiet is a FREEZE (FAIL); with the sentinel stalled >= reading - 50 ms it is a host stall (NOT_EVALUATED); no sentinel is an INSTRUMENT FAULT, never a pass", () => {
-    const r = (healthMax: number, eldMax: number, sentinelMax: number) => ({ healthMax, eldMax, sentinelMax });
-    const quiet = Array(K).fill(r(40, 30, 4));
-    expect(ceilingVerdict("t", quiet).verdict).toBe("PASS");
-    expect(ceilingVerdict("t", [...quiet.slice(1), r(507.6, 467.9, 4)]).verdict, "the 07f802f reading, sentinel quiet").toBe("FAIL");
-    expect(ceilingVerdict("t", [...quiet.slice(1), r(40, 600, 5)]).verdict, "a loop-only breach is a breach too").toBe("FAIL");
-    expect(ceilingVerdict("t", [...quiet.slice(1), r(640, 602, 601)]).verdict, "the whole process stopped").toBe("NOT_EVALUATED");
-    expect(ceilingVerdict("t", [...quiet.slice(1), r(640, 602, 589)]).verdict, "the sentinel 1 ms short of the slack").toBe("FAIL");
-    expect(ceilingVerdict("t", [r(640, 602, 601), r(507.6, 467.9, 4)]).verdict, "one freeze among host stalls: FAIL wins").toBe("FAIL");
-    expect(() => ceilingVerdict("t", [r(40, 30, 4), { healthMax: 40, eldMax: 30 } as never]), "no sentinel").toThrow(/INSTRUMENT FAULT/);
-    expect(() => ceilingVerdict("t", [r(40, 30, Number.NaN)])).toThrow(/INSTRUMENT FAULT/);
+  it("THE CEILING (6), PER BREACH: a host stall only when the DEDICATED sentinel's own gap COVERS the breach (overlap >= length - 50 ms); a matching magnitude at another time, a touch, or an unlocatable breach is a FREEZE; no sentinel stream is an INSTRUMENT FAULT", () => {
+    const gap = (from: number, ms: number) => ({ from, to: from + ms });
+    const loop = (from: number, ms: number) => ({ ...gap(from, ms), kind: "loop-delay" as const });
+    const health = (from: number, ms: number) => ({ ...gap(from, ms), kind: "/health" as const });
+    const rd = (o: Partial<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps">> = {}) => ({ healthMax: 30, eldMax: 20, breaches: [], sentinelGaps: [], ...o });
+    const quiet = Array.from({ length: K - 1 }, () => rd());
+    const v = (r: ReturnType<typeof rd>) => ceilingVerdict("t", [...quiet, r]).verdict;
+    expect(ceilingVerdict("t", [...quiet, rd()]).verdict).toBe("PASS");
+    expect(v(rd({ eldMax: 600, breaches: [loop(1000, 600)] })), "a daemon freeze, the sentinel quiet").toBe("FAIL");
+    expect(v(rd({ eldMax: 602, breaches: [loop(1000, 602)], sentinelGaps: [gap(998, 606)] })), "the whole process stopped: covered").toBe("NOT_EVALUATED");
+    // Codex's static counterexample: the same magnitudes, the sentinel's stall at ANOTHER time.
+    expect(v(rd({ healthMax: 650, eldMax: 600, breaches: [health(1000, 650), loop(1000, 600)], sentinelGaps: [gap(3000, 650)] })), "a matching magnitude at another time").toBe("FAIL");
+    expect(v(rd({ eldMax: 600, breaches: [loop(1000, 600)], sentinelGaps: [gap(1595, 650)] })), "a touch (5 ms of overlap)").toBe("FAIL");
+    expect(v(rd({ eldMax: 600, breaches: [loop(1000, 600)], sentinelGaps: [gap(1051, 600)] })), "covered 549 ms, needs 550").toBe("FAIL");
+    expect(v(rd({ eldMax: 600, breaches: [loop(1000, 600)], sentinelGaps: [gap(1050, 600)] })), "covered 550 ms, needs 550").toBe("NOT_EVALUATED");
+    expect(v(rd({ eldMax: 600, breaches: [], sentinelGaps: [gap(1000, 600)] })), "a loop-delay reading with no main-loop gap to locate it").toBe("FAIL");
+    expect(v(rd({ healthMax: 600, breaches: [], sentinelGaps: [gap(1000, 600)] })), "a /health reading with no sample interval to locate it").toBe("FAIL");
+    expect(ceilingVerdict("t", [rd({ eldMax: 602, breaches: [loop(1000, 602)], sentinelGaps: [gap(998, 606)] }), rd({ eldMax: 600, breaches: [loop(5000, 600)] })]).verdict, "one freeze among host stalls: FAIL wins").toBe("FAIL");
+    expect(() => ceilingVerdict("t", [rd(), { ...rd(), sentinelGaps: undefined }]), "no sentinel stream").toThrow(/INSTRUMENT FAULT/);
+  });
+  it("THE BOUNDARY PAIRS (5) + (4), mixed outcomes: an EVALUATED unexpected verdict is final before any other component's noise or cap; evaluated results are kept; only the bars a component lacks are re-run; a freeze in any boundary bar is FAIL first", async () => {
+    const reading = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, ...o });
+    const iv = (verdict: Verdict): InstrumentVerdict => ({ d: verdict === "FAIL" ? 90 : 10, noise: verdict === "NOT_EVALUATED" ? 40 : 5, verdict });
+    const bar = (label: string, health: Verdict, eld: Verdict, o: { controlHealth?: number; auth?: Reading[] } = {}): BarStats => ({
+      label,
+      control: Array.from({ length: K }, () => reading({ healthMax: o.controlHealth ?? 30 })),
+      control2: Array.from({ length: K }, () => reading()),
+      auth: o.auth ?? Array.from({ length: K }, () => reading()),
+      compares: 0,
+      perRound: Array(K).fill(0),
+      health: iv(health),
+      eld: iv(eld),
+      pooled: false,
+    });
+    const freeze = (covered: boolean) => [
+      ...Array.from({ length: K - 1 }, () => reading()),
+      reading({ eldMax: 602, breaches: [{ from: 1000, to: 1602, kind: "loop-delay" }], sentinelGaps: covered ? [{ from: 998, to: 1606 }] : [] }),
+    ];
+    const run = async (twenties: BarStats[], blocks: Partial<Record<Instr, BarStats[]>>) => {
+      const queue = { twenty: [...twenties], health: [...(blocks.health ?? [])], eld: [...(blocks.eld ?? [])] };
+      const take = (q: BarStats[], what: string) => {
+        const b = q.shift();
+        if (!b) throw new Error(`ran more ${what} bars than scripted`);
+        return b;
+      };
+      return boundaryPairs(
+        async () => take(queue.twenty, "+20"),
+        async (x) => take(queue[x], `${x} block`),
+      );
+    };
+    const failNow = await run([bar("+20", "FAIL", "NOT_EVALUATED")], {});
+    expect([failNow.status, failNow.runs], "a +20 that FAILs is final, its twin's noise notwithstanding").toEqual(["FAIL", ["+20 #1"]]);
+    const capHides = await run([bar("+20", "PASS", "FAIL", { controlHealth: 130 })], {});
+    expect(capHides.status, "an over-cap AVAILABILITY block cannot hide LOOP's evaluated +20 FAIL").toBe("FAIL");
+    const kept = await run([bar("+20 a", "PASS", "NOT_EVALUATED"), bar("+20 b", "NOT_EVALUATED", "PASS")], { health: [bar("blk h", "FAIL", "PASS")], eld: [bar("blk l", "PASS", "FAIL")] });
+    expect(kept.status).toBe("EVALUATED");
+    expect([kept.at20.health?.label, kept.at20.eld?.label], "each component keeps the +20 that evaluated it").toEqual(["+20 a", "+20 b"]);
+    expect(kept.runs).toEqual(["+20 #1", "+20 #2", "AVAILABILITY block #1", "LOOP block #1"]);
+    const blockRerun = await run([bar("+20", "PASS", "PASS")], { health: [bar("blk h1", "NOT_EVALUATED", "PASS"), bar("blk h2", "FAIL", "PASS")], eld: [bar("blk l", "PASS", "FAIL")] });
+    expect([blockRerun.status, blockRerun.runs], "only the unevaluated block is re-run; the +20 is not").toEqual(["EVALUATED", ["+20 #1", "AVAILABILITY block #1", "AVAILABILITY block #2", "LOOP block #1"]]);
+    const blind = await run([bar("+20", "PASS", "PASS")], { health: [bar("blk h", "PASS", "PASS")] });
+    expect([blind.status, blind.runs], "a sized block that PASSes is final: the bar cannot see harm").toEqual(["FAIL", ["+20 #1", "AVAILABILITY block #1"]]);
+    const frozen20 = await run([bar("+20", "PASS", "PASS", { auth: freeze(false) })], {});
+    expect([frozen20.status, frozen20.runs], "one frozen round in the +20 auth arm, medians PASS: the ceiling fails it first").toEqual(["FAIL", ["+20 #1"]]);
+    expect(frozen20.why.join(" ")).toMatch(/NOT covered by the sentinel/);
+    const frozenBlock = await run([bar("+20", "PASS", "PASS")], { health: [bar("blk h", "FAIL", "PASS", { auth: freeze(false) })] });
+    expect(frozenBlock.status, "a freeze in a block bar is FAIL even when the block reads FAIL as designed").toBe("FAIL");
+    const hostStall = await run([bar("+20 stalled", "PASS", "PASS", { auth: freeze(true) }), bar("+20 quiet", "PASS", "PASS")], { health: [bar("blk h", "FAIL", "PASS")], eld: [bar("blk l", "PASS", "FAIL")] });
+    expect([hostStall.status, hostStall.at20.health?.label], "a covered host stall: that +20 is re-run and nothing is kept from it").toEqual(["EVALUATED", "+20 quiet"]);
+    const noisy = await run(Array.from({ length: MAX_ATTEMPTS }, () => bar("+20", "NOT_EVALUATED", "NOT_EVALUATED")), {});
+    expect([noisy.status, noisy.runs.length], "three noisy +20 bars: a FINAL NOT_EVALUATED, never FAIL, no 4th").toEqual(["NOT_EVALUATED", MAX_ATTEMPTS]);
+    expect(() => expectBoundary(noisy)).toThrow(/^NOT_EVALUATED, FINAL \(boundary pairs\)/);
+    const overCap = await run(Array.from({ length: MAX_ATTEMPTS }, () => bar("+20", "PASS", "PASS", { controlHealth: 130 })), { eld: [bar("blk l", "PASS", "FAIL")] });
+    expect([overCap.status, overCap.runs], "over the cap every time: the +20 is re-run to re-size, then NOT_EVALUATED").toEqual(["NOT_EVALUATED", ["+20 #1", "+20 #2", "+20 #3", "LOOP block #1"]]);
   });
   it("THE +80 SIZING (5): MEASURED macOS readings (8c0eefe) with the FIXED +80 read PASS, which is the flake; the sized block is 80 + the +20 bar's median CONTROL max, none when noisy or over the 200 ms cap", () => {
     // The `boundary AVAILABILITY +80 ms` bar of macOS job 114838392595 (8c0eefe), as its BAR line printed it.
@@ -872,7 +1160,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 600_000);
 
-  it("NEGATIVE CONTROL + THE RESOLUTION, live: +200 ms TRIPS on every run; an injected noise source reads NOT_EVALUATED; on an evaluated run the boundary blocks FAIL (AVAILABILITY +80, LOOP +80 + the run's control ELD) and +20 PASSES", async () => {
+  it("NEGATIVE CONTROL + THE RESOLUTION, live: +200 ms TRIPS on every run; an injected noise source reads NOT_EVALUATED; on an evaluated run each boundary FAIL block (80 + that run's median control max, per instrument) FAILS and +20 PASSES", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       await measure(port, controlLoad(20));
@@ -883,57 +1171,35 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       const sizes = [60, 120, 80, 150, 70, 110, 90, 140, 100];
       let round = 0;
       const noisy = await runBar("A/A with injected noise", port, controlLoad(20), { controlOnLoop: () => loopBlock(sizes[round++ % sizes.length])() });
-      // THE BOUNDARY PAIRS, live, as ONE unit under (4). The +20 PASS bar runs FIRST: its CONTROLS size both FAIL
-      // blocks (5): 80 + this run's median control max per instrument, after the +20 bar's A/A-quiet check, capped.
-      const pairs = await untilEvaluated(
-        "boundary pairs",
-        async () => {
-          const at20 = await runBar(`boundary +${BOUNDARY_PASS_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(BOUNDARY_PASS_MS) });
-          const health = sizeBlock(at20.control.map((r) => r.healthMax), at20.health.verdict !== "NOT_EVALUATED");
-          const loop = sizeBlock(at20.control.map((r) => r.eldMax), at20.eld.verdict !== "NOT_EVALUATED");
-          const at80 = health.ms !== null ? await runBar(`boundary AVAILABILITY +${health.ms.toFixed(1)} ms (80 + median control /health max ${health.median.toFixed(1)})`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(health.ms) }) : null;
-          const atLoop = loop.ms !== null ? await runBar(`boundary LOOP +${loop.ms.toFixed(1)} ms (80 + median control ELD ${loop.median.toFixed(1)})`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(loop.ms) }) : null;
-          return { at20, health, loop, at80, atLoop };
-        },
-        (x) => {
-          const fail: string[] = [];
-          const ne: string[] = [];
-          for (const [name, sized, bar, pick] of [
-            ["AVAILABILITY", x.health, x.at80, (b: BarStats) => b.health],
-            ["LOOP", x.loop, x.atLoop, (b: BarStats) => b.eld],
-          ] as const) {
-            if (bar === null) ne.push(`${name} boundary: ${sized.why}`);
-            else if (pick(bar).verdict === "NOT_EVALUATED" || pick(x.at20).verdict === "NOT_EVALUATED") ne.push(`${name} boundary: the instrument was noisy this attempt`);
-            else if (pick(bar).verdict !== "FAIL" || pick(x.at20).verdict !== "PASS") fail.push(`${name} boundary: +${sized.ms!.toFixed(1)} ms ${pick(bar).verdict} (d=${pick(bar).d.toFixed(1)}), +${BOUNDARY_PASS_MS} ms ${pick(x.at20).verdict} (d=${pick(x.at20).d.toFixed(1)})`);
-          }
-          return fail.length ? { status: "FAIL", why: fail } : ne.length ? { status: "NOT_EVALUATED", why: ne } : { status: "EVALUATED", why: [] };
-        },
+      // THE BOUNDARY PAIRS, live (5) + (4): per component (boundaryPairs). The +20 PASS bar runs FIRST: its CONTROLS
+      // size each FAIL block, 80 + this run's median control max per instrument, after its A/A-quiet check, capped.
+      const pairs = await boundaryPairs(
+        () => runBar(`boundary +${BOUNDARY_PASS_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(BOUNDARY_PASS_MS) }),
+        (x, sized) =>
+          runBar(
+            x === "health"
+              ? `boundary AVAILABILITY +${sized.ms.toFixed(1)} ms (80 + median control /health max ${sized.median.toFixed(1)})`
+              : `boundary LOOP +${sized.ms.toFixed(1)} ms (80 + median control ELD ${sized.median.toFixed(1)})`,
+            port,
+            authLoad(20, "discover_agents", {}),
+            { onLoop: loopBlock(sized.ms) },
+          ),
       );
-      const { at20, health, loop, at80, atLoop } = pairs.result;
-      const healthEvaluated = at80 !== null && at80.health.verdict !== "NOT_EVALUATED" && at20.health.verdict !== "NOT_EVALUATED";
-      const loopEvaluated = atLoop !== null && atLoop.eld.verdict !== "NOT_EVALUATED" && at20.eld.verdict !== "NOT_EVALUATED";
-      announce(
-        healthEvaluated
-          ? `CLAIM ${healthClaim(health.median)} | boundary EVALUATED: +${health.ms!.toFixed(1)} ms ${at80!.health.verdict}; +${BOUNDARY_PASS_MS} ms ${at20.health.verdict}`
-          : `CLAIM ${healthClaim(health.median)} | boundary NOT_EVALUATED (${health.ms === null ? health.why : "the instrument was noisy this run"})`,
-      );
-      announce(
-        loopEvaluated
-          ? `CLAIM ${loopClaim(loop.median)} | boundary EVALUATED: +${loop.ms!.toFixed(1)} ms ${atLoop!.eld.verdict}; +${BOUNDARY_PASS_MS} ms ${at20.eld.verdict}`
-          : `CLAIM ${loopClaim(loop.median)} | boundary NOT_EVALUATED (${loop.ms === null ? loop.why : "the instrument was noisy this run"})`,
-      );
+      for (const x of INSTRS) {
+        const sized = pairs.sized[x];
+        const claim = x === "health" ? healthClaim(sized?.median ?? Number.NaN) : loopClaim(sized?.median ?? Number.NaN);
+        const at20 = pairs.at20[x];
+        const blk = pairs.block[x];
+        announce(
+          at20 && blk && sized?.ms != null
+            ? `CLAIM ${claim} | boundary EVALUATED: +${sized.ms.toFixed(1)} ms ${blk[x].verdict} (d=${blk[x].d.toFixed(1)}); +${BOUNDARY_PASS_MS} ms ${at20[x].verdict} (d=${at20[x].d.toFixed(1)}) | bars run: ${pairs.runs.join(", ")}`
+            : `CLAIM ${claim} | boundary ${pairs.status} (${pairs.why.join("; ")}) | bars run: ${pairs.runs.join(", ")}`,
+        );
+      }
 
       expectTrips(neg); // on EVERY run, noisy or not: the instrument must not be blind
       expect(noisy.eld.verdict, "injected A/A noise must read NOT_EVALUATED (never red)").toBe("NOT_EVALUATED");
-      if (healthEvaluated) {
-        expect(at80!.health.verdict, `AVAILABILITY +${health.ms!.toFixed(1)} ms must FAIL (d=${at80!.health.d.toFixed(1)})`).toBe("FAIL");
-        expect(at20.health.verdict, `AVAILABILITY +${BOUNDARY_PASS_MS} ms must PASS (d=${at20.health.d.toFixed(1)})`).toBe("PASS");
-      }
-      if (loopEvaluated) {
-        expect(atLoop!.eld.verdict, `LOOP +${loop.ms!.toFixed(1)} ms must FAIL (d=${atLoop!.eld.d.toFixed(1)})`).toBe("FAIL");
-        expect(at20.eld.verdict, `LOOP +${BOUNDARY_PASS_MS} ms must PASS (d=${at20.eld.d.toFixed(1)})`).toBe("PASS");
-      }
-      expectEvaluated("boundary pairs", pairs); // (4): three noisy attempts are a FINAL NOT_EVALUATED, red as itself
+      expectBoundary(pairs); // a FAIL with its reason; a FINAL NOT_EVALUATED as itself
     });
   }, 600_000);
 });
@@ -975,7 +1241,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 300_000);
 
-  it("CEILING, a host stall: the whole test process stopped 600 ms in one auth round reads NOT_EVALUATED (the sentinel stalled too) and is re-run; three stalled attempts are a FINAL NOT_EVALUATED, never FAIL", async () => {
+  it("CEILING, a host stall: the whole test process stopped 600 ms in one auth round reads NOT_EVALUATED (the dedicated sentinel's own stall COVERS the breach) and is re-run; three stalled attempts are a FINAL NOT_EVALUATED, never FAIL", async () => {
     // A helper child resumes THIS process: it is armed first (ready on stdout), then this process signals the child
     // (SIGUSR2, a synchronous syscall) and stops ITSELF (SIGSTOP on its own pid, never a group); the child sends
     // SIGCONT after STALL_MS. RESIDUAL, stated: if the child died between the two signals, this process would stay
@@ -1039,7 +1305,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       let onceCalls = 0;
       const once = await gatedBar("ceiling: a host stall in attempt 1 only", () => stalledAttempt(`ceiling: whole process stopped ${STALL_MS} ms (attempt 1 only)`, onceCalls++ === 0));
       expect(once.history[0].status, once.history[0].why.join("; ")).toBe("NOT_EVALUATED");
-      expect(once.history[0].why.join(" "), "attempt 1 is a host stall, attributed by the sentinel").toMatch(/sentinel stalled too \(a host stall/);
+      expect(once.history[0].why.join(" "), "attempt 1 is a host stall, COVERED by the dedicated sentinel").toMatch(/COVERED by the sentinel's own stall \(a host stall/);
       expect(once.attempts, "a NOT_EVALUATED attempt is re-run").toBeGreaterThanOrEqual(2);
       expectGated(once); // the first evaluated attempt decides (or, after 3 noisy ones, a FINAL NOT_EVALUATED, red as itself)
 
@@ -1056,6 +1322,47 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       expect(msg, "a final NOT_EVALUATED never calls the code a failure").not.toMatch(/\bFAIL\b/);
     });
   }, 300_000);
+
+  /** One auth window held open `holdMs` (its pool work is a sleep), so planted stalls land INSIDE it. */
+  const heldWindow = (port: number, load: Load, onLoop: () => void, holdMs: number) => measure(port, load, onLoop, () => new Promise((r) => setTimeout(r, holdMs)));
+
+  it("CEILING, the load worker is not a sentinel: a LOAD-worker-only stall and a SEPARATE daemon freeze in one window FAIL (Codex's counterexample)", async () => {
+    await withDaemon(async (port) => {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      // The load worker busy 600 ms as the window opens; the daemon's loop blocked 600 ms from 700 ms: never overlapping.
+      const r = await heldWindow(port, { ...authLoad(20, "discover_agents", {}), workerStallMs: STALL_MS }, () => setTimeout(loopBlock(STALL_MS), STALL_MS + 100), 2_000);
+      const loops = r.breaches.filter((b) => b.kind === "loop-delay");
+      expect(r.loadGapMax, "precondition: the LOAD worker did stall").toBeGreaterThanOrEqual(STALL_MS - HOST_STALL_SLACK_MS);
+      expect(loops.length, `precondition: the daemon's freeze is a located breach (${JSON.stringify(r.breaches)})`).toBeGreaterThanOrEqual(1);
+      expect(r.sentinelMax, "the dedicated sentinel stayed quiet").toBeLessThan(CEILING_MS - HOST_STALL_SLACK_MS);
+      const c = ceilingVerdict("Codex's counterexample", [r]);
+      expect(c.verdict, c.why).toBe("FAIL");
+    });
+  }, 60_000);
+
+  it("CEILING, a busy load worker OVERLAPPING a daemon freeze, the idle sentinel quiet: FAIL", async () => {
+    await withDaemon(async (port) => {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      const r = await heldWindow(port, { ...authLoad(20, "discover_agents", {}), workerStallMs: STALL_MS + 50 }, loopBlock(STALL_MS), 1_500);
+      expect(r.loadGapMax, "precondition: the LOAD worker was busy through the freeze").toBeGreaterThanOrEqual(STALL_MS - HOST_STALL_SLACK_MS);
+      expect(r.breaches.some((b) => b.kind === "loop-delay"), `precondition: the freeze is a located breach (${JSON.stringify(r.breaches)})`).toBe(true);
+      expect(r.sentinelMax, "the dedicated sentinel stayed quiet").toBeLessThan(CEILING_MS - HOST_STALL_SLACK_MS);
+      const c = ceilingVerdict("busy load worker over a freeze", [r]);
+      expect(c.verdict, c.why).toBe("FAIL");
+    });
+  }, 60_000);
+
+  it("CEILING, a missing sentinel stream is an INSTRUMENT FAULT, never a pass (the ceiling and the bar both refuse)", async () => {
+    await withDaemon(async (port) => {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      const r = await heldWindow(port, authLoad(20, "discover_agents", {}), loopBlock(STALL_MS), 1_000);
+      expect(ceilingVerdict("wired", [r]).verdict, "the same reading WITH its stream: a freeze").toBe("FAIL");
+      const dropped = { ...r, sentinelGaps: undefined };
+      expect(() => ceilingVerdict("unwired", [dropped])).toThrow(/INSTRUMENT FAULT/);
+      const unwired: BarStats = { label: "unwired sentinel", control: [dropped], control2: [dropped], auth: [dropped], compares: 0, perRound: [0], health: judge([1], [1], [1]), eld: judge([1], [1], [1]), pooled: false };
+      expect(() => barOutcome(unwired)).toThrow(/INSTRUMENT FAULT/);
+    });
+  }, 60_000);
 });
 
 describe("Q4: rejections are audited BOUNDED, one row per (source, reason, window) with a count", () => {
