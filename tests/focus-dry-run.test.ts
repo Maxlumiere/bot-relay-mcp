@@ -139,6 +139,16 @@ describe("the desktop-actuator predicates (pure)", () => {
     ["xdotool", ["key", "a"], "xdotool"],
     ["powershell.exe", ["-Command", "(New-Object -ComObject WScript.Shell).AppActivate('t')"], "powershell (WScript.Shell)"],
     ["pwsh", ["-c", "$w.AppActivate('t')"], "pwsh (AppActivate)"],
+    // Wrappers start their operand (Codex #333 R1 P1): `env PATH=… osascript` replaces the decorated PATH, and
+    // `command -p` searches the shell's DEFAULT path: both reach the real program past the stand-ins.
+    ["env", ["PATH=/usr/bin:/bin", "osascript", "-e", "beep"], "osascript"],
+    ["/usr/bin/env", ["-i", "open", "-a", "Calculator"], "open"],
+    ["command", ["-p", "open", "-a", "Calculator"], "open"],
+    ["nohup", ["xdotool", "key", "a"], "xdotool"],
+    ["env", ["FOO=1", "powershell", "-c", "(New-Object -ComObject WScript.Shell).AppActivate('t')"], "powershell (WScript.Shell)"],
+    // A shell's -c string is a command line.
+    ["bash", ["-c", "command -p open -a Calculator"], "open"],
+    ["sh", ["-lc", "env PATH=/usr/bin osascript -e beep"], "osascript"],
   ])("HARM %s %j → refused as %s", (program, args, expected) => {
     expect(desktopActuator(program, args)).toBe(expected);
   });
@@ -150,6 +160,10 @@ describe("the desktop-actuator predicates (pure)", () => {
     ["bash", ["-c", "echo open"]],
     ["curl", ["--version"]],
     ["opener", []],
+    ["env", ["FOO=1", "node", "-e", "1"]],
+    ["command", ["-v", "ls"]],
+    ["bash", ["-c", "echo open"]],
+    ["bash", ["hooks/check-relay.sh", "open"]], // a script's ARGUMENTS are not parsed: only a -c string is a command line
   ])("TWIN %s %j → not an actuator (plain PowerShell ACL calls stay allowed)", (program, args) => {
     expect(desktopActuator(program, args)).toBeNull();
   });
@@ -161,11 +175,15 @@ describe("the desktop-actuator predicates (pure)", () => {
     ["bash -c \"osascript -e 'beep'\"", "osascript"],
     ["sudo xdotool key a", "xdotool"],
     ["powershell -c (New-Object -ComObject WScript.Shell).AppActivate('t')", "powershell (WScript.Shell)"],
+    ["command -p open -a Calculator", "open"],
+    ["env PATH=/usr/bin:/bin osascript -e beep", "osascript"],
+    ["FOO=1 env -i PATH=/bin nohup wmctrl -a t", "wmctrl"],
+    ["exec osascript -e beep", "osascript"],
   ])("HARM shell %j → refused as %s", (cmd, expected) => {
     expect(desktopActuatorInShell(cmd)).toBe(expected);
   });
 
-  it.each([["ls; cat file"], ["node -e \"fs.openSync('x')\""], ["powershell -NoProfile -Command Get-Acl ."], ["git log --oneline"]])(
+  it.each([["ls; cat file"], ["node -e \"fs.openSync('x')\""], ["powershell -NoProfile -Command Get-Acl ."], ["git log --oneline"], ["command -v osascript-free-name"], ["env FOO=1 node -e 0"]])(
     "TWIN shell %j → not an actuator",
     (cmd) => {
       expect(desktopActuatorInShell(cmd)).toBeNull();

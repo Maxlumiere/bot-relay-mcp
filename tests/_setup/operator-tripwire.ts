@@ -129,29 +129,62 @@ const WINDOWS_ACTUATION = /AppActivate|WScript\.Shell/i;
 export const DESKTOP_REFUSED_EXIT = 96;
 
 const progName = (p: string) => path.basename(p.replace(/\\/g, "/")).toLowerCase().replace(/\.exe$/, "");
+/**
+ * Programs that START their operand (Codex #333 R1 P1): `env PATH=… osascript` replaces the decorated PATH, and
+ * `command -p open` searches the shell's DEFAULT path; both reach the real program past the stand-ins. After one of
+ * these, EVERY later word naming an actuator counts (their options vary by platform: over-detects, loudly).
+ */
+const WRAPPERS: ReadonlySet<string> = new Set(["env", "command", "exec", "builtin", "nohup", "sudo", "doas", "nice", "time", "timeout", "stdbuf", "setsid", "caffeinate", "arch", "xargs"]);
+/** Shells: only a -c style option's operand is a command line (a script's own arguments are not parsed). */
+const SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
-/** The desktop actuator a program + argv would start, or null. Pure. */
-export function desktopActuator(program: string, args: readonly unknown[] = []): string | null {
-  const name = progName(program);
+/** The actuator a command's words (program first) would start, or null. Pure. */
+function actuatorInWords(words: readonly string[]): string | null {
+  let i = 0;
+  while (i < words.length && ASSIGNMENT.test(words[i]!)) i++; // VAR=value prefixes
+  if (i >= words.length) return null;
+  const name = progName(words[i]!);
+  const rest = words.slice(i + 1);
   if (DESKTOP_ACTUATORS.includes(name)) return name;
-  if ((name === "powershell" || name === "pwsh") && args.some((a) => typeof a === "string" && WINDOWS_ACTUATION.test(a))) {
-    return `${name} (${String(args.find((a) => typeof a === "string" && WINDOWS_ACTUATION.test(a))).match(WINDOWS_ACTUATION)![0]})`;
+  if ((name === "powershell" || name === "pwsh") && rest.some((a) => WINDOWS_ACTUATION.test(a))) {
+    return `${name} (${rest.find((a) => WINDOWS_ACTUATION.test(a))!.match(WINDOWS_ACTUATION)![0]})`;
+  }
+  if (WRAPPERS.has(name)) {
+    for (let k = 0; k < rest.length; k++) {
+      const w = rest[k]!;
+      if (ASSIGNMENT.test(w) || w.startsWith("-")) continue;
+      const hit = actuatorInWords(rest.slice(k)); // the operand is a command of its own (it may be a wrapper or a shell)
+      if (hit) return hit;
+      if (/\s/.test(w)) {
+        const inLine = desktopActuatorInShell(w); // e.g. caffeinate -i "osascript …" handed as one word
+        if (inLine) return inLine;
+      }
+    }
+    return null;
+  }
+  if (SHELLS.has(name)) {
+    const c = rest.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+    if (c >= 0 && typeof rest[c + 1] === "string") return desktopActuatorInShell(rest[c + 1]!);
   }
   return null;
 }
 
+/** The desktop actuator a program + argv would start, or null. Pure. */
+export function desktopActuator(program: string, args: readonly unknown[] = []): string | null {
+  return actuatorInWords([program, ...args.filter((a): a is string => typeof a === "string")]);
+}
+
 /**
  * The desktop actuator a SHELL string would start, or null. Pure. Each segment between command separators
- * (; & | newline ( ) backtick) and quotes is a command; its first word, after VAR=value assignments and the
- * wrappers env/command/exec/sudo/nohup, is the program. Splitting at quotes over-detects (`echo "open it"`):
+ * (; & | newline ( ) backtick) and quotes is a command; its program (after VAR=value assignments, and through any
+ * wrapper) is checked. Splitting at quotes over-detects (`echo "open it"` is fine, `env x "open"` is refused):
  * loud, never silent.
  */
 export function desktopActuatorInShell(cmd: string): string | null {
   for (const seg of cmd.split(/[;&|\n()`"']+/)) {
-    const words = seg.trim().split(/\s+/).filter(Boolean);
-    while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ["env", "command", "exec", "sudo", "nohup", "$"].includes(words[0]!))) words.shift();
-    if (!words.length) continue;
-    const hit = desktopActuator(words[0]!, words.slice(1));
+    const words = seg.trim().split(/\s+/).filter((w) => w && w !== "$");
+    const hit = actuatorInWords(words);
     if (hit) return hit;
   }
   if (/\b(powershell|pwsh)(\.exe)?\b/i.test(cmd) && WINDOWS_ACTUATION.test(cmd)) return `powershell (${cmd.match(WINDOWS_ACTUATION)![0]})`;
@@ -162,18 +195,34 @@ export function desktopActuatorInShell(cmd: string): string | null {
 function refuseDesktop(what: string, how: string): never {
   const line = `desktop ${how}: refused ${what} (a test must never raise, open or type into a window)`;
   pre.recordViolation(line);
+  // This THROW is the spawn-time report: mark what is recorded so far as reported by the "spawn" reporter, so it is not
+  // re-thrown at a LATER test's sync spawn (that made a later test "fail" on this test's refusal: seen under mutant
+  // MP3). afterEach keeps its own cursor and still fails the test that caused it, caught or not.
+  try {
+    newViolations("spawn");
+  } catch {
+    /* unreadable: afterEach fails closed on it */
+  }
   throw new pre.OperatorTripwireError(`DESKTOP_TRIPWIRE: ${line}. Use RELAY_FOCUS_DRY_RUN=1 / RELAY_SPAWN_DRY_RUN=1, or test the driver's pure buildCommand.`);
 }
 
 /** The refusing stand-ins (POSIX only), one directory per run, shared by its workers. */
 const SHIM_DIR = process.platform === "win32" ? null : path.join(state().runDir, "desktop-shims");
+/**
+ * Where a stand-in records when its env carries no RELAY_TEST_TRIPWIRE_DIR (a child given a stripped env): inside the
+ * run's violations tree, which the run's teardown walks, so the RUN still fails (only the per-test attribution is lost).
+ */
+const SHIM_FALLBACK_DIR = path.join(state().runDir, "violations", "desktop-stand-ins");
 if (SHIM_DIR && !fs.existsSync(path.join(SHIM_DIR, ".complete"))) {
   fs.mkdirSync(SHIM_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(SHIM_FALLBACK_DIR, { recursive: true, mode: 0o700 });
   for (const name of DESKTOP_ACTUATORS) {
+    // Recording uses ONLY shell builtins ([, printf, >>, echo) and absolute paths (Codex #333 R1 P2): a restricted PATH
+    // with no mktemp used to make the record fail, and a caller's `|| true` then swallowed the 97, so the run went green.
     const body =
       `#!/bin/sh\n# DESKTOP TRIPWIRE stand-in (tests/_setup/operator-tripwire.ts): refuses ${name}, records it, never runs it.\n` +
-      `d="\${RELAY_TEST_TRIPWIRE_DIR:-}"\n` +
-      `if [ -n "$d" ] && f=$(mktemp "$d/desktop-$$-XXXXXX") && printf '%s\\n' "desktop child pid=$$ ppid=$PPID: refused ${name} by name (a test must never raise, open or type into a window)" > "$f"; then\n` +
+      `d="\${RELAY_TEST_TRIPWIRE_DIR:-${SHIM_FALLBACK_DIR}}"\n` +
+      `if [ -n "$d" ] && { printf '%s\\n' "desktop child pid=$$ ppid=$PPID: refused ${name} by name (a test must never raise, open or type into a window)" >> "$d/desktop-$$-${name}.txt"; } 2>/dev/null; then\n` +
       `  echo "DESKTOP_TRIPWIRE: refused ${name}" >&2; exit ${DESKTOP_REFUSED_EXIT}\nfi\n` +
       `echo "DESKTOP_TRIPWIRE: refused ${name} and could not record it" >&2; exit ${pre.RECORD_FAILED_EXIT}\n`;
     const tmp = path.join(SHIM_DIR, `.${name}.${process.pid}`);

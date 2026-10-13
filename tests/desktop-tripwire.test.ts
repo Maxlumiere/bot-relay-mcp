@@ -38,7 +38,7 @@ describe.skipIf(process.platform === "win32")("NESTED: every desktop harm is ref
     result = await nestedVitestRun(
       path.join(REPO, "tests", "fixtures", "desktop-tripwire", "vitest.config.ts"),
       "harm.fixture",
-      { PATH: `${recorders}${path.delimiter}${process.env.PATH ?? ""}`, TMPDIR: work },
+      { PATH: `${recorders}${path.delimiter}${process.env.PATH ?? ""}`, TMPDIR: work, TW_RECORDERS: recorders },
       work,
     );
   }, 120_000);
@@ -47,13 +47,13 @@ describe.skipIf(process.platform === "win32")("NESTED: every desktop harm is ref
   });
 
   it("precondition: the fixture ran (every test has a verdict) and its controls PASSED", () => {
-    expect(Object.keys(result.verdicts).length, result.out.slice(-1500)).toBe(10);
+    expect(Object.keys(result.verdicts).length, result.out.slice(-1500)).toBe(16);
     for (const [t, v] of Object.entries(result.verdicts)) if (t.startsWith("control")) expect(v.status, `${t}: ${v.messages}`).toBe("passed");
   });
 
   it("every HARM test FAILED, naming the desktop tripwire (a swallowed refusal is still failed by afterEach)", () => {
     const harms = Object.entries(result.verdicts).filter(([t]) => t.startsWith("HARM"));
-    expect(harms.length).toBe(7);
+    expect(harms.length).toBe(11);
     for (const [t, v] of harms) {
       expect(v.status, t).toBe("failed");
       expect(v.messages, t).toMatch(/desktop/);
@@ -70,6 +70,11 @@ describe.skipIf(process.platform === "win32")("NESTED: every desktop harm is ref
     expect(m("HARM spawn-xdg-open")).toMatch(/child_process\.spawn: refused xdg-open/);
     expect(m("HARM powershell-appactivate")).toMatch(/refused powershell \(WScript\.Shell\)/);
     expect(m("HARM bash-child-by-name")).toMatch(/desktop child pid=\d+ ppid=\d+: refused osascript by name/);
+    expect(m("HARM env-path")).toMatch(/child_process\.spawnSync: refused osascript/);
+    expect(m("HARM command-p-shell")).toMatch(/child_process\.spawnSync: refused xdotool/);
+    expect(m("HARM bash-c-command-p")).toMatch(/child_process\.spawnSync: refused xdotool/);
+    // P2: the refusal was RECORDED although the script swallowed it and its PATH had no mktemp.
+    expect(m("HARM restricted-path-swallowed")).toMatch(/desktop child pid=\d+ ppid=\d+: refused osascript by name/);
   });
 
   it("NOTHING actuated: no call reached a (recording) actuator behind the tripwire", () => {
