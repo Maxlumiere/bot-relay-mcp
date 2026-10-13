@@ -23,7 +23,7 @@ import { authorizeAgentToken } from "../authorize-token.js";
 import { revalidate } from "../auth-verdict.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
 import { fireWebhooks } from "../webhooks.js";
-import { broadcastDashboardEvent, dashboardSubscriberGeneration } from "./websocket.js";
+import { broadcastDashboardEvent, dashboardBaselineGeneration } from "./websocket.js";
 import { attachDashboardWs } from "./websocket.js";
 import {
   DashboardStateBroadcaster,
@@ -2022,7 +2022,7 @@ export function startHttpServer(port: number, host: string): Server {
     const broadcaster = new DashboardStateBroadcaster({
       getAgents: () => getDashboardAgentSnapshots(thresholds.pendingWindowMs),
       broadcast: broadcastDashboardEvent,
-      subscriberGeneration: dashboardSubscriberGeneration,
+      baselineGeneration: dashboardBaselineGeneration,
       tickIntervalMs: resolveTickIntervalMs(),
       thresholds,
     });

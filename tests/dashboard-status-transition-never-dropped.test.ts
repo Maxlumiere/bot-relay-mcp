@@ -16,10 +16,11 @@
  * window: dropped, and (before the fix) never re-sent. R1 below is that sequence on a controlled clock;
  * tests/dashboard-transition-stale-first-sight.test.ts drives it through the real HTTP register.
  *
- * THE RULE: broadcastDashboardEvent returns what happened (sent | rate_limited | no_clients | error), and the
- * broadcaster advances its last-sent state only when the frame was handed to an OPEN client (or no client was
- * connected: nothing on any screen to go stale). A limited transition is re-sent on a later tick, latest state wins.
- * A NEW subscriber (connect or reconnect) resets that baseline: the next tick re-sends every agent's current state.
+ * THE RULE: broadcastDashboardEvent returns what happened (queued | rate_limited | no_clients | error), and the
+ * broadcaster commits a state only when its frame was QUEUED to an OPEN client (or no client was open: nothing on
+ * any screen to go stale). A limited transition is re-sent on a later tick, latest state wins. The baseline is VOIDED,
+ * so the next tick re-sends every agent's CURRENT state, by a new subscriber (connect or reconnect) and by any async
+ * write error (a queued frame that never arrived): never lost beyond one tick plus the limiter window.
  *
  * ONE CLOCK: `Date` is faked (only Date: timers and socket I/O stay real), so the broadcaster's clock and the
  * limiter's clock are the same value, set by each test. Every result the broadcaster got is recorded, and every
@@ -90,7 +91,7 @@ function rig() {
       results.push(`${e.kind}:${r}`);
       return r;
     },
-    subscriberGeneration: ws.dashboardSubscriberGeneration,
+    baselineGeneration: ws.dashboardBaselineGeneration,
     scheduler: { setInterval: () => ({ stop: () => undefined }) }, // never started: ticks are driven by hand
     thresholds: THRESHOLDS,
   });
@@ -118,57 +119,67 @@ async function subscriber(): Promise<{ frames: Array<{ event: string; entity_id?
 const settle = () => sleep(150);
 
 describe("broadcastDashboardEvent says what happened (typed, never a silent drop)", () => {
-  it("no client → no_clients; a client → sent; the same key again inside 500 ms → rate_limited; at 500 ms → sent", async () => {
+  it("no client → no_clients; a client → queued; the same key again inside 500 ms → rate_limited; at 500 ms → queued", async () => {
     const evt = (id: string) => ({ event: "agent.status_changed" as const, entity_id: id, ts: new Date().toISOString(), kind: "active" });
     expect(broadcastDashboardEvent(evt("a"))).toBe("no_clients");
     const s = await subscriber();
     at(0);
-    expect(broadcastDashboardEvent(evt("b"))).toBe("sent");
+    expect(broadcastDashboardEvent(evt("b"))).toBe("queued");
     at(499);
     expect(broadcastDashboardEvent(evt("b"))).toBe("rate_limited");
     at(500);
-    expect(broadcastDashboardEvent(evt("b"))).toBe("sent");
+    expect(broadcastDashboardEvent(evt("b"))).toBe("queued");
     s.close();
   });
 });
 
-describe("F1: `sent` means handed to an OPEN client; a failed client is ended, so it reconnects", () => {
-  /** A fake server-side socket. `send` behaves per `mode`; `terminated` records whether the server ended it. */
-  function fakeClient(readyState: number, mode: "ok" | "throws" | "async-error" | "silent") {
-    const c = {
-      readyState,
-      sent: [] as string[],
-      terminated: false,
-      send(line: string, cb?: (err?: Error) => void) {
-        if (mode === "throws") throw new Error("send failed");
-        if (mode === "silent") return; // ws's own behaviour for a CLOSING/CLOSED socket with no callback
-        if (mode === "async-error") {
-          process.nextTick(() => cb?.(new Error("write EPIPE")));
-          return;
-        }
-        c.sent.push(line);
-        process.nextTick(() => cb?.());
-      },
-      terminate() {
-        c.terminated = true;
-      },
-    };
-    return c;
-  }
-  const OPEN = 1;
-  const CLOSING = 2;
+/**
+ * A fake server-side socket. `send` behaves per `mode`; `terminated` records whether the server ended it.
+ * "deferred": every send is accepted (queued) and its write callback is held in `writes` until the test settles it,
+ * so a LATE error (after a newer frame was queued) is driven exactly.
+ */
+function fakeClient(readyState: number, mode: "ok" | "throws" | "async-error" | "silent" | "deferred") {
+  const c = {
+    readyState,
+    sent: [] as string[],
+    terminated: false,
+    writes: [] as Array<(err?: Error) => void>,
+    send(line: string, cb?: (err?: Error) => void) {
+      if (mode === "throws") throw new Error("send failed");
+      if (mode === "silent") return; // ws's own behaviour for a CLOSING/CLOSED socket with no callback
+      if (mode === "async-error") {
+        process.nextTick(() => cb?.(new Error("write EPIPE")));
+        return;
+      }
+      c.sent.push(line);
+      if (mode === "deferred") c.writes.push(cb ?? (() => undefined));
+      else process.nextTick(() => cb?.());
+    },
+    terminate() {
+      c.terminated = true;
+    },
+  };
+  return c;
+}
+const OPEN = 1;
+const CLOSING = 2;
+/** The `kind`s of the agent.status_changed frames for "x" that a fake client was handed, in order. */
+const kindsOf = (c: { sent: string[] }) =>
+  c.sent.map((l) => JSON.parse(l) as { event: string; entity_id: string; kind: string }).filter((f) => f.event === "agent.status_changed" && f.entity_id === "x").map((f) => f.kind);
+
+describe("F1: `queued` means accepted by an OPEN client; a failed client is ended, so it reconnects", () => {
   const evt = () => ({ event: "agent.status_changed" as const, entity_id: "f", ts: new Date().toISOString(), kind: "active" });
 
-  it("HARM: the only client is CLOSING → NOT sent (no frame was handed to anyone)", () => {
+  it("HARM: the only client is CLOSING → NOT queued (no frame was handed to anyone)", () => {
     const c = fakeClient(CLOSING, "silent");
     ws._addDashboardClientForTests(c);
-    expect(broadcastDashboardEvent(evt())).not.toBe("sent");
+    expect(broadcastDashboardEvent(evt())).not.toBe("queued");
   });
 
-  it("TWIN: the only client is OPEN → sent, and it got the frame", () => {
+  it("TWIN: the only client is OPEN → queued, and it got the frame", () => {
     const c = fakeClient(OPEN, "ok");
     ws._addDashboardClientForTests(c);
-    expect(broadcastDashboardEvent(evt())).toBe("sent");
+    expect(broadcastDashboardEvent(evt())).toBe("queued");
     expect(c.sent).toHaveLength(1);
   });
 
@@ -180,12 +191,12 @@ describe("F1: `sent` means handed to an OPEN client; a failed client is ended, s
     expect(ws._dashboardWsStateForTests().clients).toBe(0);
   });
 
-  it("mixed: one OPEN client + one throwing → sent (to the good one); only the bad one is terminated", () => {
+  it("mixed: one OPEN client + one throwing → queued (to the good one); only the bad one is terminated", () => {
     const good = fakeClient(OPEN, "ok");
     const bad = fakeClient(OPEN, "throws");
     ws._addDashboardClientForTests(good);
     ws._addDashboardClientForTests(bad);
-    expect(broadcastDashboardEvent(evt())).toBe("sent");
+    expect(broadcastDashboardEvent(evt())).toBe("queued");
     expect(good.sent).toHaveLength(1);
     expect(good.terminated).toBe(false);
     expect(bad.terminated).toBe(true);
@@ -202,6 +213,85 @@ describe("F1: `sent` means handed to an OPEN client; a failed client is ended, s
   });
 });
 
+describe("an ASYNC write error voids the baseline: the state committed when QUEUED is re-sent if its write failed", () => {
+  it("HARM: EPIPE after a queued frame → the NEXT tick re-sends the current state (to the client that remains)", async () => {
+    const { results, broadcaster } = rig();
+    const good = fakeClient(OPEN, "ok");
+    const failing = fakeClient(OPEN, "async-error");
+    ws._addDashboardClientForTests(good);
+    ws._addDashboardClientForTests(failing);
+    at(10);
+    broadcaster.tick(); // active: queued to both, committed
+    await sleep(10); // the failing client's write reports EPIPE
+    at(600);
+    broadcaster.tick(); // the baseline was voided: active re-sent
+    at(700);
+    broadcaster.tick(); // steady
+    expect(kindsOf(good), "what the remaining client was handed").toEqual(["active", "active"]);
+    expect(failing.terminated).toBe(true);
+    expect(results).toEqual(["active:queued", "active:queued"]);
+  });
+
+  it("TWIN: no write error → no re-send (a queued state is not repeated)", async () => {
+    const { results, broadcaster } = rig();
+    const good = fakeClient(OPEN, "ok");
+    ws._addDashboardClientForTests(good);
+    at(10);
+    broadcaster.tick();
+    await sleep(10);
+    at(600);
+    broadcaster.tick();
+    at(700);
+    broadcaster.tick();
+    expect(kindsOf(good)).toEqual(["active"]);
+    expect(results).toEqual(["active:queued"]);
+  });
+
+  it("a LATE error (arriving after a newer state was queued) → one extra frame of the CURRENT state, never the stale one", async () => {
+    const { results, broadcaster } = rig();
+    const good = fakeClient(OPEN, "ok");
+    const slow = fakeClient(OPEN, "deferred");
+    ws._addDashboardClientForTests(good);
+    ws._addDashboardClientForTests(slow);
+    at(10);
+    broadcaster.tick(); // active: queued (slow's write still pending)
+    at(1100);
+    broadcaster.tick(); // waiting: queued (slow's writes still pending)
+    slow.writes[0]!(new Error("write EPIPE")); // the OLD frame (active) fails, after waiting was queued
+    at(1700);
+    broadcaster.tick(); // the baseline was voided: the CURRENT state (waiting) is re-sent
+    at(1800);
+    broadcaster.tick(); // steady
+    expect(kindsOf(good), "the remaining client: never `active` again").toEqual(["active", "waiting", "waiting"]);
+    expect(results).toEqual(["active:queued", "waiting:queued", "waiting:queued"]);
+  });
+
+  it("an error on a client that is then terminated → the remaining (real) client gets the re-send, and the reconnect gets its own", async () => {
+    const { agent, results, broadcaster } = rig();
+    const s = await subscriber();
+    const failing = fakeClient(OPEN, "async-error");
+    ws._addDashboardClientForTests(failing);
+    at(10);
+    broadcaster.tick(); // active: queued to both
+    await sleep(10); // EPIPE on the fake: it is terminated, the baseline voided
+    at(600);
+    broadcaster.tick(); // re-sent to the real client that remains
+    expect(failing.terminated).toBe(true);
+    const back = await subscriber(); // the failed page reconnects: a connect, so the baseline is voided again
+    agent.lastSeen = new Date(T0 + 1000).toISOString(); // still active: the state does not change in this case
+    at(1200);
+    broadcaster.tick(); // re-sent once more, to both
+    at(1300);
+    broadcaster.tick(); // steady
+    await settle();
+    expect(s.kinds(), "the client that remained").toEqual(["active", "active", "active"]);
+    expect(back.kinds(), "the reconnected client: the current state, once").toEqual(["active"]);
+    expect(results).toEqual(["active:queued", "active:queued", "active:queued"]);
+    s.close();
+    back.close();
+  });
+});
+
 describe("EDGE events: a rate-limited drop is counted where an operator can see it", () => {
   it("a second agent.state_changed for the same agent inside 500 ms → rate_limited, /api/snapshot counts it, and the client received exactly ONE frame", async () => {
     const s = await subscriber();
@@ -210,7 +300,7 @@ describe("EDGE events: a rate-limited drop is counted where an operator can see 
       ((await (await fetch(`http://127.0.0.1:${port}/api/snapshot`)).json()) as { dashboard_ws?: { rate_limited_drops?: Record<string, number> } }).dashboard_ws?.rate_limited_drops ?? {};
     const before = await drops();
     at(0);
-    expect(broadcastDashboardEvent(evt)).toBe("sent");
+    expect(broadcastDashboardEvent(evt)).toBe("queued");
     at(100);
     expect(broadcastDashboardEvent(evt)).toBe("rate_limited");
     const after = await drops();
@@ -222,11 +312,11 @@ describe("EDGE events: a rate-limited drop is counted where an operator can see 
 });
 
 describe("the decay broadcaster never loses a transition to the rate limit", () => {
-  it("R1 (the macOS CI red): first seen already 600 ms old → `active` sent, `waiting` rate-limited at 1000 ms → re-sent once the window passes", async () => {
+  it("R1 (the macOS CI red): first seen already 600 ms old → `active` queued, `waiting` rate-limited at 1000 ms → re-sent once the window passes", async () => {
     const { results, broadcaster } = rig();
     const s = await subscriber();
     at(600);
-    broadcaster.tick(); // first sight: active, sent
+    broadcaster.tick(); // first sight: active, queued
     at(1000);
     broadcaster.tick(); // waiting: 400 ms after the active send → inside the limiter's window
     at(1050);
@@ -238,11 +328,11 @@ describe("the decay broadcaster never loses a transition to the rate limit", () 
     await settle();
     // What the screen got FIRST (the observable defect: on main it is ["active"]), then why.
     expect(s.kinds(), "what the dashboard received for x").toEqual(["active", "waiting"]);
-    expect(results).toEqual(["active:sent", "waiting:rate_limited", "waiting:rate_limited", "waiting:sent"]);
+    expect(results).toEqual(["active:queued", "waiting:rate_limited", "waiting:rate_limited", "waiting:queued"]);
     s.close();
   });
 
-  it("TWIN: transitions more than 500 ms apart → both sent, once each (no re-send of a sent state)", async () => {
+  it("TWIN: transitions more than 500 ms apart → both queued, once each (no re-send of a queued state)", async () => {
     const { results, broadcaster } = rig();
     const s = await subscriber();
     at(10);
@@ -254,7 +344,7 @@ describe("the decay broadcaster never loses a transition to the rate limit", () 
     at(2400);
     broadcaster.tick();
     await settle();
-    expect(results).toEqual(["active:sent", "waiting:sent"]);
+    expect(results).toEqual(["active:queued", "waiting:queued"]);
     expect(s.kinds()).toEqual(["active", "waiting"]);
     s.close();
   });
@@ -263,9 +353,9 @@ describe("the decay broadcaster never loses a transition to the rate limit", () 
     const { agent, results, broadcaster } = rig();
     const s = await subscriber();
     at(10);
-    broadcaster.tick(); // active, sent
+    broadcaster.tick(); // active, queued
     at(1100);
-    broadcaster.tick(); // waiting, sent (1090 ms later)
+    broadcaster.tick(); // waiting, queued (1090 ms later)
     agent.lastSeen = new Date(T0 + 1150).toISOString(); // the agent is seen again
     at(1200);
     broadcaster.tick(); // active, 100 ms after the waiting send: limited
@@ -274,7 +364,7 @@ describe("the decay broadcaster never loses a transition to the rate limit", () 
     at(1700);
     broadcaster.tick(); // steady
     await settle();
-    expect(results).toEqual(["active:sent", "waiting:sent", "active:rate_limited", "active:sent"]);
+    expect(results).toEqual(["active:queued", "waiting:queued", "active:rate_limited", "active:queued"]);
     expect(s.kinds()).toEqual(["active", "waiting", "active"]);
     s.close();
   });
@@ -291,12 +381,12 @@ describe("F2: a new subscriber resets the baseline (generation), so a client tha
     };
   }
 
-  it("HARM (Codex's sequence): A sent → B limited → a client connects (its snapshot shows B) → back to A → the new client ends at A", async () => {
+  it("HARM (Codex's sequence): A queued → B limited → a client connects (its snapshot shows B) → back to A → the new client ends at A", async () => {
     const { results, broadcaster, active, waiting } = flipRig();
     const s1 = await subscriber();
     active(0);
     at(10);
-    broadcaster.tick(); // A = active, sent
+    broadcaster.tick(); // A = active, queued
     waiting();
     at(100);
     broadcaster.tick(); // B = waiting, limited: the broadcaster's baseline stays A
@@ -309,7 +399,7 @@ describe("F2: a new subscriber resets the baseline (generation), so a client tha
     at(700);
     broadcaster.tick(); // steady
     await settle();
-    expect(results).toEqual(["active:sent", "waiting:rate_limited", "active:rate_limited", "active:sent"]);
+    expect(results).toEqual(["active:queued", "waiting:rate_limited", "active:rate_limited", "active:queued"]);
     expect(s2.kinds(), "the joining client's last state").toEqual(["active"]);
     expect(s1.kinds(), "the existing client: A, then the one replay").toEqual(["active", "active"]);
     s1.close();
@@ -333,7 +423,7 @@ describe("F2: a new subscriber resets the baseline (generation), so a client tha
     at(700);
     broadcaster.tick();
     await settle();
-    expect(results).toEqual(["active:sent", "waiting:rate_limited"]);
+    expect(results).toEqual(["active:queued", "waiting:rate_limited"]);
     expect(s1.kinds()).toEqual(["active"]);
     s1.close();
   });
@@ -342,17 +432,17 @@ describe("F2: a new subscriber resets the baseline (generation), so a client tha
     const { results, broadcaster } = rig();
     const s1 = await subscriber();
     at(10);
-    broadcaster.tick(); // active, sent
+    broadcaster.tick(); // active, queued
     s1.close();
     const s2 = await subscriber(); // the same page, reconnected
     at(600);
-    broadcaster.tick(); // the generation changed: the current state is re-sent
+    broadcaster.tick(); // the baseline generation changed: the current state is re-sent
     at(700);
     broadcaster.tick();
     at(800);
     broadcaster.tick();
     await settle();
-    expect(results).toEqual(["active:sent", "active:sent"]);
+    expect(results).toEqual(["active:queued", "active:queued"]);
     expect(s2.kinds()).toEqual(["active"]);
     s2.close();
   });

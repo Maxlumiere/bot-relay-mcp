@@ -87,9 +87,9 @@ beforeEach(() => {
     getAgents: () => agents,
     broadcast: (e) => {
       broadcasts.push(e);
-      return "sent";
+      return "queued";
     },
-    subscriberGeneration: () => 0, // no client ever connects in these unit ticks
+    baselineGeneration: () => 0, // no client ever connects in these unit ticks
     scheduler,
     tickIntervalMs: 30_000,
     thresholds: DEFAULT_THRESHOLDS,
@@ -183,7 +183,7 @@ describe("v2.8 — DashboardStateBroadcaster — tick + dedup", () => {
       broadcast: () => {
         throw new Error("sink down");
       },
-      subscriberGeneration: () => 0,
+      baselineGeneration: () => 0,
       scheduler,
       tickIntervalMs: 30_000,
       thresholds: DEFAULT_THRESHOLDS,
@@ -274,8 +274,8 @@ describe("v2.8 — DashboardStateBroadcaster — lifecycle", () => {
       () =>
         new DashboardStateBroadcaster({
           getAgents: () => [],
-          broadcast: () => "sent",
-          subscriberGeneration: () => 0,
+          broadcast: () => "queued",
+          baselineGeneration: () => 0,
           tickIntervalMs: 0,
           scheduler,
           now: clock.now,

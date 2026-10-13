@@ -59,11 +59,12 @@ export interface BroadcasterDeps {
   /** Broadcast sink — typically `broadcastDashboardEvent` from websocket.ts. */
   broadcast: BroadcastFn;
   /**
-   * The dashboard's subscriber generation (`dashboardSubscriberGeneration` from websocket.ts): bumped on every
-   * client connect. REQUIRED, so a wiring that forgets it does not compile: when it changes, a client may have loaded
-   * a snapshot this broadcaster never sent to, so the last-sent baseline is void and every current state is re-sent.
+   * The dashboard's baseline generation (`dashboardBaselineGeneration` from websocket.ts): bumped on every client
+   * connect and on every async write error. REQUIRED, so a wiring that forgets it does not compile: when it changes,
+   * a screen may show something other than what this broadcaster last queued, so the baseline is void and every
+   * CURRENT state is re-sent.
    */
-  subscriberGeneration: () => number;
+  baselineGeneration: () => number;
   /**
    * Tick interval in ms. Defaults to `RELAY_DECAY_TICK_MS` env (30000).
    * Must be > 0.
@@ -132,15 +133,15 @@ export class DashboardStateBroadcaster {
    * broadcast when the derived state actually changes between ticks.
    */
   private readonly lastBroadcastedState: Map<string, DashboardAgentState> = new Map();
-  /** The subscriber generation the baseline above was built for; null = none yet. */
-  private baselineGeneration: number | null = null;
+  /** The baseline generation the map above was built for; null = none yet. */
+  private baselineBuiltFor: number | null = null;
   private handle: { stop: () => void } | null = null;
 
   constructor(deps: BroadcasterDeps) {
     this.deps = {
       getAgents: deps.getAgents,
       broadcast: deps.broadcast,
-      subscriberGeneration: deps.subscriberGeneration,
+      baselineGeneration: deps.baselineGeneration,
       scheduler: deps.scheduler ?? realIntervalScheduler(),
       tickIntervalMs: deps.tickIntervalMs ?? resolveTickIntervalMs(),
       thresholds: deps.thresholds ?? resolveThresholdsFromEnv(),
@@ -173,7 +174,7 @@ export class DashboardStateBroadcaster {
       this.handle = null;
     }
     this.lastBroadcastedState.clear();
-    this.baselineGeneration = null;
+    this.baselineBuiltFor = null;
   }
 
   /**
@@ -181,13 +182,14 @@ export class DashboardStateBroadcaster {
    * scheduling. Production callers should `start()` instead.
    */
   tick(): void {
-    // A client connected (or reconnected) since the baseline was built: what it shows came from a snapshot, which
-    // can differ from what this broadcaster last sent (e.g. a transition that was rate-limited, then reverted before
-    // this tick). Void the baseline, so this tick re-sends every agent's CURRENT state to every client.
-    const generation = this.deps.subscriberGeneration();
-    if (generation !== this.baselineGeneration) {
+    // The baseline generation moved since the map was built: a client connected (its snapshot can differ from what
+    // this broadcaster last queued, e.g. a transition that was rate-limited, then reverted), or a queued frame failed
+    // in its write callback (it never arrived). Void the map, so this tick re-sends every agent's CURRENT state to
+    // every client: never a stale one, since the re-send is derived now.
+    const generation = this.deps.baselineGeneration();
+    if (generation !== this.baselineBuiltFor) {
       this.lastBroadcastedState.clear();
-      this.baselineGeneration = generation;
+      this.baselineBuiltFor = generation;
     }
     const now = this.deps.now();
     const snapshots = this.deps.getAgents();
@@ -199,13 +201,15 @@ export class DashboardStateBroadcaster {
         // dashboard wire quiet during steady-state.
         continue;
       }
-      // LEVEL-TRIGGERED: the state is recorded as broadcast only once it was DELIVERED (handed to an OPEN client, or
-      // no client was open: nothing on any screen to go stale, and the next connect re-sends it). A rate-limited or
-      // failed send leaves it unrecorded, so the next tick sends the CURRENT state again (latest wins, at most one
-      // limiter window late), never lost. Before, it was recorded first, and a transition the limiter dropped was
-      // never re-sent: the dashboard kept the old state. That is the `waiting` the macOS CI runs never saw: a new
-      // agent first seen 500-1000 ms old (registerAgent stamps last_seen before its bcrypt hashes) gets `active`,
-      // then `waiting` inside the 500 ms window (tests/dashboard-transition-stale-first-sight.test.ts).
+      // LEVEL-TRIGGERED. The baseline commits a state when its frame is QUEUED (an OPEN client's ws.send() accepted
+      // it), or when no client is open (nothing on any screen to go stale; the next connect re-sends it). Any async
+      // write error voids it (the baseline generation above), so the next tick re-sends the current state to every
+      // client: never lost beyond one tick plus the limiter window. A rate-limited or failed send leaves it
+      // uncommitted, so the next tick sends the CURRENT state again (latest wins). Before, it was recorded first, and a
+      // transition the limiter dropped was never re-sent: the dashboard kept the old state. That is the `waiting` the
+      // macOS CI runs never saw: a new agent first seen 500-1000 ms old (registerAgent stamps last_seen before its
+      // bcrypt hashes) gets `active`, then `waiting` inside the 500 ms window
+      // (tests/dashboard-transition-stale-first-sight.test.ts).
       let result: DashboardBroadcastResult;
       try {
         result = this.deps.broadcast({
@@ -218,7 +222,7 @@ export class DashboardStateBroadcaster {
         // broadcast() is already swallow-and-log via broadcastDashboardEvent; a fake sink that throws is undelivered.
         result = "error";
       }
-      if (result === "sent" || result === "no_clients") this.lastBroadcastedState.set(snap.name, next);
+      if (result === "queued" || result === "no_clients") this.lastBroadcastedState.set(snap.name, next);
     }
   }
 
