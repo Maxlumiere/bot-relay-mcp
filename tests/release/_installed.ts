@@ -181,3 +181,17 @@ export function dbQuery<T = Record<string, unknown>>(sb: Sandbox, sql: string, .
     db.close();
   }
 }
+
+/**
+ * Windows only, for a failure message: run the relay's own SID lookup (`whoami /user /fo csv /nh`, as
+ * src/fs-perms.ts windowsUserSid does) from a node child started EXACTLY as the daemon is (this sandbox's env, through
+ * the same wrapped spawn, so the same tripwire preload), and say what came back. "" elsewhere.
+ */
+export function windowsSidProbe(sb: Sandbox): string {
+  if (process.platform !== "win32") return "";
+  const code = "const r=require('child_process').spawnSync('whoami',['/user','/fo','csv','/nh'],{encoding:'utf-8',windowsHide:true});" +
+    "process.stdout.write(JSON.stringify({status:r.status,signal:r.signal,error:r.error&&r.error.message,stdout:r.stdout,stderr:r.stderr,path:process.env.PATH||process.env.Path,keys:Object.keys(process.env).filter(k=>/^(path|systemroot|comspec|pathext)$/i.test(k))}))";
+  const r = spawnSync(process.execPath, ["-e", code], { encoding: "utf-8", env: sb.env, timeout: 30_000 });
+  return ` [windows SID probe from a daemon-like child: exit ${r.status}; ${(r.stdout || "").slice(0, 1200)}; stderr ${(r.stderr || "").slice(0, 400)}]`;
+}
+

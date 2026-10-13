@@ -12,7 +12,7 @@
  * The KNOWN-BAD control's discriminator: the published 3.0.1 issued that token (its open mint).
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { sandbox, startHttpDaemon, stdioCall, dbQuery, type HttpDaemon } from "./_installed.js";
+import { sandbox, startHttpDaemon, stdioCall, dbQuery, windowsSidProbe, type HttpDaemon } from "./_installed.js";
 
 const daemons: HttpDaemon[] = [];
 afterEach(async () => {
@@ -48,7 +48,7 @@ describe("SEC-01.T1: no token without a credential (the installed package)", () 
     const d = await startHttpDaemon(sb);
     daemons.push(d);
     const r = await d.rpc("register_agent", { name: "sec01-ok", role: "worker", capabilities: [] }, d.mintHeaders());
-    expect(r.success, JSON.stringify(r)).toBe(true);
+    expect(r.success, JSON.stringify(r) + (r.success === true ? "" : windowsSidProbe(sb))).toBe(true);
     expect(typeof r.agent_token).toBe("string");
     expect(countAgents(sb, "sec01-ok")).toBe(1);
   });
