@@ -19,10 +19,11 @@
  */
 
 import fs from "fs";
-import { spawnSync } from "child_process";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "child_process";
 import { tmpdir as osTmpdir } from "os";
 import { join as pathJoin } from "path";
 import { log } from "./logger.js";
+import { systemBinary, SystemBinaryError, type SystemBinaryName } from "./system-binary.js";
 
 /** Chmod an existing file to the requested mode. Best-effort; log.warn on failure. */
 export function ensureSecureFile(path: string, mode: number): void {
@@ -115,14 +116,41 @@ export function windowsOwnerInfo(path: string): string | null {
   }
 }
 
+/**
+ * Run a Windows system tool by its TRUSTED ABSOLUTE PATH (SEC-22, src/system-binary.ts), never by name: under Git Bash
+ * a name finds GNU coreutils first. A tool that cannot be located is a FAILED run carrying the named reason (status
+ * null, the reason as stderr), never a fallback to PATH.
+ */
+function runSystem(name: SystemBinaryName, args: string[], opts: SpawnSyncOptionsWithStringEncoding): SpawnSyncReturns<string> {
+  try {
+    return spawnSync(systemBinary(name), args, { ...opts, shell: false }); // never a shell: it would find programs by name
+  } catch (err) {
+    if (!(err instanceof SystemBinaryError)) throw err;
+    return { pid: 0, output: [], stdout: "", stderr: err.message, status: null, signal: null, error: err };
+  }
+}
+
 let currentUserSid: string | null | undefined;
-/** The current user's SID (whoami /user), or null when it cannot be read. Windows only; cached. */
+let currentUserSidFailure: string | null = null;
+/** The current user's SID (the system whoami /user), or null when it cannot be read (sidUnreadable() says why). Windows only; cached. */
 export function windowsUserSid(): string | null {
   if (currentUserSid !== undefined) return currentUserSid;
-  const r = spawnSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf-8", windowsHide: true });
+  const r = runSystem("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf-8", windowsHide: true });
   const m = r.status === 0 ? /"(S-1-[0-9-]+)"\s*$/m.exec(r.stdout ?? "") : null;
   currentUserSid = m ? m[1] : null;
+  currentUserSidFailure = m ? null : r.error instanceof SystemBinaryError ? r.error.message : `whoami exit ${r.status}: ${(r.stderr || r.stdout || "").trim().slice(0, 200)}`;
   return currentUserSid;
+}
+
+/** The fault text for an unreadable SID, with WHY (one site for every caller that reports it). */
+export function sidUnreadable(): string {
+  return `the current user's SID could not be read (${currentUserSidFailure ?? "not attempted"})`;
+}
+
+/** Tests only: forget the cached SID, so the next windowsUserSid() looks again. */
+export function _resetWindowsUserSidForTests(): void {
+  currentUserSid = undefined;
+  currentUserSidFailure = null;
 }
 
 const describeSid = (sid: string) => (FORBIDDEN_SIDS[sid] ? `${FORBIDDEN_SIDS[sid]} (${sid})` : sid);
@@ -137,12 +165,12 @@ export function restrictToOwnerWindows(path: string, isDir: boolean): string[] {
   if (process.platform !== "win32") return [];
   const sid = windowsUserSid();
   if (!sid) {
-    const fault = `${path}: the current user's SID could not be read, so its ACL could not be restricted`;
+    const fault = `${path}: ${sidUnreadable()}, so its ACL could not be restricted`;
     log.warn(`[fs-perms] ${fault}.`);
     return [fault];
   }
   const grant = isDir ? `*${sid}:(OI)(CI)F` : `*${sid}:F`;
-  const r = spawnSync("icacls", [path, "/inheritance:r", "/grant:r", grant], { encoding: "utf-8", windowsHide: true });
+  const r = runSystem("icacls", [path, "/inheritance:r", "/grant:r", grant], { encoding: "utf-8", windowsHide: true });
   if (r.status !== 0) {
     const fault = `${path}: icacls could not restrict the ACL (exit ${r.status}): ${(r.stderr || r.stdout || "").trim()}`;
     log.warn(`[fs-perms] ${fault}`);
@@ -165,7 +193,7 @@ export function restrictToOwnerWindows(path: string, isDir: boolean): string[] {
   }
   // `/remove *SID` drops that SID's grant AND deny ACEs. An alias the map below does not know cannot be removed by
   // SID: it stays, and is reported as a fault (fail closed where the caller requires owner-only).
-  for (const f of foreign) if (/^S-1-[0-9-]+$/.test(f)) spawnSync("icacls", [path, "/remove", `*${f}`], { encoding: "utf-8", windowsHide: true });
+  for (const f of foreign) if (/^S-1-[0-9-]+$/.test(f)) runSystem("icacls", [path, "/remove", `*${f}`], { encoding: "utf-8", windowsHide: true });
   const left = faults();
   if (left.length > 0) log.warn(`[fs-perms] ${left.join("; ")}`);
   return left;
@@ -267,7 +295,7 @@ export function windowsOwner(path: string): string {
     "$ErrorActionPreference='Stop';" +
     "$s=[System.Security.AccessControl.FileSecurity]::new($env:RELAY_OWNER_PATH,[System.Security.AccessControl.AccessControlSections]::Owner);" +
     "[Console]::Out.WriteLine($s.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Owner))";
-  const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+  const r = runSystem("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf-8",
     windowsHide: true,
     env: { ...process.env, RELAY_OWNER_PATH: path },
@@ -287,7 +315,7 @@ export function windowsOwner(path: string): string {
  */
 export function windowsOwnerFault(path: string): string | null {
   const user = windowsUserSid();
-  if (!user) return `${path}: the current user's SID could not be read`;
+  if (!user) return `${path}: ${sidUnreadable()}`;
   let owner: string;
   try {
     owner = windowsOwner(path);
@@ -307,7 +335,7 @@ export function windowsOwnerFault(path: string): string | null {
 export function windowsAllowSids(path: string): string[] {
   const tmp = pathJoin(osTmpdir(), `relay-acl-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.sddl`);
   try {
-    const r = spawnSync("icacls", [path, "/save", tmp], { encoding: "utf-8", windowsHide: true });
+    const r = runSystem("icacls", [path, "/save", tmp], { encoding: "utf-8", windowsHide: true });
     if (r.status !== 0) throw new Error(`icacls /save failed for "${path}" (exit ${r.status}): ${(r.stderr || r.stdout || "").trim()}`);
     const raw = fs.readFileSync(tmp);
     // icacls writes UTF-16LE (with or without a BOM): the file's lines are the path, then its SDDL.
@@ -326,7 +354,7 @@ export function windowsAllowSids(path: string): string[] {
  */
 export function windowsForeignAllowSids(path: string): string[] {
   const owner = windowsUserSid();
-  if (!owner) throw new Error("the current user's SID could not be read");
+  if (!owner) throw new Error(sidUnreadable());
   const ownerToken = windowsOwnerSddlToken();
   return windowsAllowSids(path).filter((s) => s !== owner && s !== ownerToken && s !== SYSTEM_SID);
 }
@@ -346,19 +374,19 @@ export function windowsOwnerSddlToken(): string | null {
   if (ownerSddlToken !== undefined) return ownerSddlToken;
   const sid = windowsUserSid();
   if (!sid) {
-    windowsOwnerProbeNote = "the user's SID could not be read";
+    windowsOwnerProbeNote = sidUnreadable();
     return (ownerSddlToken = null);
   }
   const dir = fs.mkdtempSync(pathJoin(osTmpdir(), "relay-owner-probe-"));
   try {
     const probe = pathJoin(dir, "probe");
     fs.writeFileSync(probe, "");
-    const r = spawnSync("icacls", [probe, "/inheritance:r", "/grant:r", `*${sid}:F`], { encoding: "utf-8", windowsHide: true });
+    const r = runSystem("icacls", [probe, "/inheritance:r", "/grant:r", `*${sid}:F`], { encoding: "utf-8", windowsHide: true });
     // A new file can carry EXPLICIT (non-inherited) ACEs that /inheritance:r keeps: MEASURED on windows-2022, the
     // probe still read [S-1-5-18, S-1-5-32-544, LA]. Remove every SID-spelled ACE that is not the user's, then the
     // one token left is the user's spelling.
     const before = r.status === 0 ? windowsAllowSids(probe) : [];
-    for (const t of before) if (/^S-1-[0-9-]+$/.test(t) && t !== sid) spawnSync("icacls", [probe, "/remove", `*${t}`], { encoding: "utf-8", windowsHide: true });
+    for (const t of before) if (/^S-1-[0-9-]+$/.test(t) && t !== sid) runSystem("icacls", [probe, "/remove", `*${t}`], { encoding: "utf-8", windowsHide: true });
     const tokens = r.status === 0 ? windowsAllowSids(probe) : [];
     ownerSddlToken = tokens.length === 1 ? tokens[0] : null;
     windowsOwnerProbeNote =

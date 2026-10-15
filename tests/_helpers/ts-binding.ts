@@ -77,15 +77,18 @@ export function srcProgram(): ts.Program {
 export function virtualProgram(files: Record<string, string>): ts.Program {
   const options: ts.CompilerOptions = { module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, target: ts.ScriptTarget.ES2022, noEmit: true };
   const host = ts.createCompilerHost(options);
-  const abs = (f: string) => path.join("/virtual", f);
+  // POSIX-style keys on EVERY OS: on Windows the compiler asks for "C:/virtual/..." (forward slashes, a drive), never
+  // the "\\virtual\\..." path.join builds there, so every lookup is normalized (SEC-22's leg found no file on Windows).
+  const norm = (f: string) => f.replace(/\\/g, "/").replace(/^[A-Za-z]:/, "");
+  const abs = (f: string) => path.posix.join("/virtual", f);
   const byAbs = new Map(Object.entries(files).map(([k, v]) => [abs(k), v]));
-  host.fileExists = (f) => byAbs.has(f) || ts.sys.fileExists(f);
-  host.readFile = (f) => byAbs.get(f) ?? ts.sys.readFile(f);
+  host.fileExists = (f) => byAbs.has(norm(f)) || ts.sys.fileExists(f);
+  host.readFile = (f) => byAbs.get(norm(f)) ?? ts.sys.readFile(f);
   // Module resolution walks DIRECTORIES too: the virtual ones must exist for it, or no import resolves (a blind leg).
-  host.directoryExists = (d) => [...byAbs.keys()].some((k) => k.startsWith(`${d}/`)) || ts.sys.directoryExists(d);
+  host.directoryExists = (d) => [...byAbs.keys()].some((k) => k.startsWith(`${norm(d)}/`)) || ts.sys.directoryExists(d);
   host.realpath = (f) => f;
   const orig = host.getSourceFile.bind(host);
-  host.getSourceFile = (f, lang) => (byAbs.has(f) ? ts.createSourceFile(f, byAbs.get(f)!, lang, true) : orig(f, lang));
+  host.getSourceFile = (f, lang) => (byAbs.has(norm(f)) ? ts.createSourceFile(f, byAbs.get(norm(f))!, lang, true) : orig(f, lang));
   return ts.createProgram({ rootNames: [...byAbs.keys()], options, host });
 }
 
