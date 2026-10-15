@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added: `RELAY_FOCUS_DRY_RUN`; a spawn dry run no longer touches the desktop
+
+- **`RELAY_FOCUS_DRY_RUN=1`** builds the dashboard's "Raise terminal" command and runs nothing, like `RELAY_SPAWN_DRY_RUN`. Only the exact value `1` enables it. A dry run never reads as a success: `POST /api/focus-terminal` answers 409 with `raised: false`, `dry_run: true`, the built `command` and a "dry run" reason, and the dashboard shows "dry run, not focused". Documented in `docs/cross-platform-spawn.md`.
+- **A spawn dry run (`RELAY_SPAWN_DRY_RUN=1`) no longer runs `osascript`.** `bin/spawn-agent.sh` asked System Events whether iTerm2 was running before it checked for a dry run; that call is permission-gated on macOS and can raise an automation dialog. A dry run now skips it and reports `Terminal` unless `RELAY_TERMINAL_APP` names one.
+- **The test suite never raises, opens or types into a window** on the machine running it. Every test worker and child gets `RELAY_FOCUS_DRY_RUN=1`. The test harness refuses `osascript`, `open`, `xdg-open`, `wmctrl`, `xdotool`, and PowerShell with `AppActivate` / `WScript.Shell`, in the worker and, by name, in its children, and fails the test and the run. Before, each run of the dashboard focus tests activated iTerm2 twice, and each run of the spawn tests queried System Events 23 times.
+- **Not covered.** A desktop program started by its absolute path from a child process, a child started with no `PATH`, and Windows child processes (the refusing stand-ins are POSIX scripts; the in-process check still applies on Windows). The production "Raise terminal" button is unchanged unless the switch is set.
+
 ### Security: the hooks no longer show an agent's token to other users on the machine, or print it
 
 - **No token in a process's arguments.** A process's arguments are readable by every local user (`ps`, `/proc/<pid>/cmdline`). The hooks passed the agent token to `curl` as a header argument and inside the request body argument, at session start, at every stop and after every tool call, and passed the recovery token the same way. Every hook (`check-relay.sh`, `stop-check.sh`, `post-tool-use-check.sh`, `codex/codex-session-start.sh`) and `bin/codex-relay` now hand `curl` the token header and any token-bearing body through its config on standard input (`curl -K -`), as the registration secret already was. One helper builds every such line: a quote or backslash in a value is escaped, and a value holding a line break is refused, so a value can never add a `curl` directive.
