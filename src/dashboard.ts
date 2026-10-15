@@ -7,6 +7,7 @@ import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { getAgents, listWebhooks, getDb, getDashboardPrefs, getInboxSummary } from "./db.js";
 import { getKeyringInfo, decryptContent } from "./encryption.js";
+import { dashboardRateLimitedDrops } from "./transport/websocket.js";
 import type { MessageRecord, TaskRecord } from "./types.js";
 import { DASHBOARD_BASE_STYLES, DASHBOARD_THEMES } from "./dashboard-styles.js";
 
@@ -325,6 +326,9 @@ export function snapshotApi(req: Request, res: Response): void {
       active_tasks: tasksWithPreview,
       recent_completions: completionsWithPreview,
       dashboard_prefs: dashboardPrefs,
+      // Live-push events the per-entity rate limiter DROPPED, per event name, since the daemon started: a drop is
+      // never silent. The page heals from them by refetching this snapshot on every push and every 10 s.
+      dashboard_ws: { rate_limited_drops: dashboardRateLimitedDrops() },
     };
     const payload = JSON.stringify(bodyObj);
     // Strong ETag over a STABLE PROJECTION of the body — base64url of a SHA-256,
