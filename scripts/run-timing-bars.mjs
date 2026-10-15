@@ -16,6 +16,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { timingBarsReport } from "./timing-bars-report.mjs";
 
 // The repo root from this script's own PHYSICAL location: never the caller's cwd (a release-guard requirement).
 const ROOT = fs.realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
@@ -25,6 +26,12 @@ const EXPECTED = [
   "(b) 20 wrong-token register_agent, (c) 20 wrong-token get_messages, (d) 20 unknown tokens with 51 agents",
   "unknown-provenance rows",
   "NEGATIVE CONTROL",
+  "CEILING, a freeze",
+  "CEILING, a host stall",
+  "CEILING, the load worker is not a sentinel",
+  "CEILING, a busy load worker",
+  "CEILING, a missing sentinel stream",
+  "CEILING, a host stall during PREPARATION",
 ];
 
 const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "timing-bars-")), "report.json");
@@ -40,16 +47,10 @@ try {
   console.error(`timing bars: FAIL, no vitest JSON report (${err.message}); vitest exit ${r.status}`);
   process.exit(1);
 }
-const results = report.testResults.flatMap((f) => f.assertionResults);
-const ran = results.filter((t) => t.status === "passed" || t.status === "failed");
-const missing = EXPECTED.filter((e) => !ran.some((t) => t.title.startsWith(e)));
-const failed = ran.filter((t) => t.status !== "passed").map((t) => t.title);
-const unexpected = ran.filter((t) => !EXPECTED.some((e) => t.title.startsWith(e))).map((t) => t.title);
-console.log(`timing bars: ran ${ran.length} (expected exactly ${EXPECTED.length}), failed ${failed.length}`);
-if (missing.length || failed.length || unexpected.length || ran.length !== EXPECTED.length || r.status !== 0) {
-  if (missing.length) console.error(`timing bars: FAIL, did not run: ${missing.join(" | ")}`);
-  if (failed.length) console.error(`timing bars: FAIL, failed: ${failed.join(" | ")}`);
-  if (unexpected.length) console.error(`timing bars: FAIL, ran but not in EXPECTED (update the list): ${unexpected.join(" | ")}`);
+// A FINAL NOT_EVALUATED is reported as itself (never "FAIL") and still fails the gate (timing-bars-report.mjs).
+const { ok, lines } = timingBarsReport(report.testResults.flatMap((f) => f.assertionResults), EXPECTED);
+for (const line of lines) (ok ? console.log : console.error)(line);
+if (!ok || r.status !== 0) {
+  if (ok) console.error(`timing bars: FAIL, vitest exited ${r.status} though every expected test passed`);
   process.exit(1);
 }
-console.log("timing bars: PASS (the exact expected set ran and passed)");

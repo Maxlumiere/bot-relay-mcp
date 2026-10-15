@@ -83,20 +83,29 @@ export async function connectWs(
 
   return {
     ws,
+    // ONE outstanding read at a time, ENFORCED: a second read while one is pending is refused at once. (A second
+    // reader used to overwrite the first, so frames went to whichever had asked last, silently.)
     nextMessage: (timeoutMs = 1500) =>
       new Promise((resolve, reject) => {
         if (queue.length > 0) {
           resolve(queue.shift()!);
           return;
         }
-        const timer = setTimeout(
-          () => reject(new Error("ws message timeout")),
-          timeoutMs
-        );
-        pendingResolve = (s) => {
+        if (pendingResolve !== null) {
+          reject(new Error("ws helper: a read is already pending (one outstanding nextMessage at a time)"));
+          return;
+        }
+        const mine = (s: string) => {
           clearTimeout(timer);
           resolve(s);
         };
+        const timer = setTimeout(() => {
+          // Stop waiting: a resolver left armed would take the NEXT frame into this settled promise, and it would
+          // be lost (tests/ws-helper-timeout-frame.test.ts).
+          if (pendingResolve === mine) pendingResolve = null;
+          reject(new Error("ws message timeout"));
+        }, timeoutMs);
+        pendingResolve = mine;
       }),
   };
 }

@@ -53,8 +53,9 @@ delete process.env.RELAY_DECAY_TICK_DISABLED;
 const LATE_READ_MS = 1500;
 
 const { startHttpServer } = await import("../src/transport/http.js");
-const { _resetDashboardWsForTests } = await import("../src/transport/websocket.js");
-const { closeDb, getDb } = await import("../src/db.js");
+const { _resetDashboardWsForTests, _dashboardWsStateForTests } = await import("../src/transport/websocket.js");
+const { closeDb, getDb, getDashboardAgentSnapshots } = await import("../src/db.js");
+const { deriveDashboardState, resolveThresholdsFromEnv } = await import("../src/agent-state-machine.js");
 
 import { connectWs as baseConnectWs } from "./_helpers/ws.js";
 import { mintHeaders } from "./_helpers/mint.js";
@@ -201,14 +202,16 @@ interface BroadcastFrame {
 }
 
 /**
- * SUBSCRIBE BEFORE THE EVENT (CI 37729080141 at fce15be). The broadcaster fans out only to the clients
- * connected at that moment, and its dedup map advances whether or not anyone received the frame, so a
- * subscriber that connects AFTER a transition never sees it. The server adds a client BEFORE it sends the
- * hello, so a drained hello proves this subscriber is registered: every later frame is buffered for it.
+ * SUBSCRIBE BEFORE THE EVENT (CI 37729080141 at fce15be). A transition frame goes only to the clients connected
+ * when it fires: a subscriber that connects AFTER it is re-sent the CURRENT state on its connect (the subscriber
+ * generation), never the transition itself. The server adds a client BEFORE it sends the hello, so the hello proves
+ * this subscriber is registered: every later frame is buffered for it. The hello is IDENTIFIED, never dropped
+ * unchecked, and only it is consumed: every other frame stays queued for the test.
  */
 async function subscribe(): ReturnType<typeof connectWs> {
   const h = await connectWs();
-  await h.nextMessage(); // the hello
+  const first = JSON.parse(await h.nextMessage()) as BroadcastFrame;
+  expect(first.event, `the first frame of a subscription is the hello, got ${JSON.stringify(first)}`).toBe("dashboard.hello");
   return h;
 }
 
@@ -294,81 +297,96 @@ describe("v2.8 R1 — runtime broadcaster path", () => {
   }, 20_000);
 
   it("(RT2) Dedup correctness: broadcaster does NOT re-emit waiting on subsequent ticks once state has stabilized", async () => {
-    // SUBSCRIBE FIRST, then register (CI 37729080141 at fce15be): the confirming subscriber used to connect
-    // AFTER the register; when that took longer than the 1 s active window, the transition had already
-    // fired (to no one) and been deduped, so the confirm below waited its full deadline and reported a
-    // false "never broadcast". Subscribed before the register, it cannot miss the transition.
+    // TWO properties, each on the subscriber that can observe it (Codex #328 R2; the subscriber-generation design):
+    //   (a) DEDUP: a subscriber that saw rt-dedup's `waiting` transition receives NO repeat of it on later ticks.
+    //   (b) REPLAY-ON-CONNECT: a NEW subscriber is re-sent each agent's CURRENT state exactly ONCE (its connect voids
+    //       the broadcaster's baseline), then nothing more for unchanged states.
+    // Silence proves nothing if the broadcaster stopped ticking, so each silent window is closed by a SECOND agent's
+    // own time-only `waiting` transition reaching the same subscriber: the ticks demonstrably continued.
+    // SUBSCRIBE FIRST, then register (CI 37729080141 at fce15be): the transition frame reaches only the clients
+    // connected when it fires.
     const confirmWs = await subscribe();
-    await rpc("register_agent", {
-      name: "rt-dedup",
-      role: "user",
-      capabilities: ["build"],
-    });
-    await new Promise((r) => setTimeout(r, LATE_READ_MS));
-    // ORDERING RESTRUCTURE (#210, architect-approved). The dedup property is: "once the waiting
-    // transition has been BROADCAST, a NEW subscriber sees no re-emit." The old test assumed that
-    // transition fired during a fixed 1500ms sleep BEFORE connecting — an unguaranteed
-    // happens-before that load breaks: the 100ms broadcaster ticks slip, so the transition can
-    // fire AFTER connect → a spurious frame → a FALSE failure of a real property. This is not a
-    // too-tight deadline (widening buys probability, not correctness) — it is an ORDERING
-    // assumption, so we make the ordering DETERMINISTIC. NOTE the time-only `waiting` transition
-    // is COMPUTED (no DB mutation), so discover_agents (raw stored status) cannot confirm it — the
-    // BROADCAST frame is the only reliable "it fired" signal. So a throwaway subscriber OBSERVES
-    // the transition frame (establishing the ordering), then we connect a FRESH subscriber and
-    // assert ZERO — the actual dedup property, now race-free. (The confirming subscriber is
-    // subscribed BEFORE the register, above.)
-    // ORDERING DEADLINE, not an SLA (#210): how long we wait for the transition to be broadcast.
-    // A timeout here is a GENUINE failure — "the time-only transition never fired" is a real
-    // defect — so it fails LOUD below, never silently absorbed. Bounded; not a latency budget.
+    await rpc("register_agent", { name: "rt-dedup", role: "user", capabilities: ["build"] });
+    // ORDERING DEADLINE, not an SLA (#210): how long we wait for each time-only transition. A timeout fails LOUD,
+    // with what WAS observed, never silently absorbed.
     const ORDERING_DEADLINE_MS = 12_000;
-    const confirmStart = Date.now();
-    let sawTransition = false;
-    while (Date.now() - confirmStart < ORDERING_DEADLINE_MS) {
-      let raw: string;
-      try {
-        raw = await confirmWs.nextMessage(
-          Math.max(250, ORDERING_DEADLINE_MS - (Date.now() - confirmStart)),
-        );
-      } catch {
-        break; // no frame within the remaining budget
+    const isStatus = (f: BroadcastFrame, entity: string, kind?: string) =>
+      f.event === "agent.status_changed" && f.entity_id === entity && (kind === undefined || f.kind === kind);
+
+    // Every frame `h` receives until `done` matches one, or the deadline. Returns them all (the match last).
+    async function readUntil(h: { nextMessage: (t?: number) => Promise<string> }, done: (f: BroadcastFrame) => boolean) {
+      const frames: BroadcastFrame[] = [];
+      const start = Date.now();
+      while (Date.now() - start < ORDERING_DEADLINE_MS) {
+        let raw: string;
+        try {
+          raw = await h.nextMessage(Math.max(250, ORDERING_DEADLINE_MS - (Date.now() - start)));
+        } catch {
+          return { frames, matched: false };
+        }
+        const f = JSON.parse(raw) as BroadcastFrame;
+        frames.push(f);
+        if (done(f)) return { frames, matched: true };
       }
-      const f = JSON.parse(raw) as BroadcastFrame;
-      if (
-        f.event === "agent.status_changed" &&
-        f.entity_id === "rt-dedup" &&
-        f.kind === "waiting"
-      ) {
-        sawTransition = true;
-        break;
-      }
+      return { frames, matched: false };
     }
-    confirmWs.ws.close();
+    // ONLY on a miss: what the server held at the deadline (it runs in this process). Present-state OBSERVATIONS to
+    // help investigate the missing frame; they establish no history and no cause. Collected inside a catch, so a
+    // failing collection can never replace or mask the assertion (its error is appended instead).
+    const diagnose = (entity: string, frames: BroadcastFrame[]) => {
+      const seen = frames.map((f) => `${f.ts} ${f.event}:${f.entity_id}${f.kind ? ":" + f.kind : ""}`);
+      try {
+        const snap = getDashboardAgentSnapshots(resolveThresholdsFromEnv().pendingWindowMs).find((a) => a.name === entity);
+        return (
+          `frames seen (${seen.length}): [${seen.join(", ")}]; ` +
+          `server WS clients: ${_dashboardWsStateForTests().clients}; ` +
+          `${entity} derived state now: ${snap ? deriveDashboardState(snap.inputs, Date.now(), resolveThresholdsFromEnv()) : "NO ROW"}; ` +
+          `snapshot: ${JSON.stringify(snap?.inputs ?? null)}`
+        );
+      } catch (err) {
+        return `frames seen (${seen.length}): [${seen.join(", ")}]; diagnosis collection FAILED: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    };
+
+    // 1. The transition, on the confirming subscriber.
+    const confirm = await readUntil(confirmWs, (f) => isStatus(f, "rt-dedup", "waiting"));
     expect(
-      sawTransition,
-      "rt-dedup time-only `waiting` transition never broadcast within the ordering deadline — " +
-        "a REAL defect (the transition/broadcast failed), not flake.",
+      confirm.matched,
+      `no agent.status_changed:waiting frame for rt-dedup reached this subscriber within ${ORDERING_DEADLINE_MS} ms. ${confirm.matched ? "" : diagnose("rt-dedup", confirm.frames)}`,
     ).toBe(true);
 
-    // Now connect a FRESH subscriber AFTER the transition provably fired + deduped. Dedup ⇒ ZERO
-    // re-emit. The zero-assertion is race-free now, and the collect window is kept TIGHT on
-    // purpose: on a zero-assert a WIDER window is MORE exposure, not less (#210) — any rt-dedup
-    // frame here is a genuine dedup bug, not slowness.
-    const wsHandle = await connectWs();
-    const frames = await collectFrames(wsHandle, 5, 500);
-    const rtDedupFrames = frames.filter(
-      (f) => f.entity_id === "rt-dedup" && f.event === "agent.status_changed",
-    );
+    // 2. (a) DEDUP on the SAME subscriber, no connect in between: rt-progress's own `waiting` closes the window.
+    await rpc("register_agent", { name: "rt-progress", role: "user", capabilities: ["build"] });
+    const dedupWindow = await readUntil(confirmWs, (f) => isStatus(f, "rt-progress", "waiting"));
     expect(
-      rtDedupFrames,
-      `dedup violated: expected 0 status_changed frames for rt-dedup, got ${rtDedupFrames.length}`,
+      dedupWindow.matched,
+      `precondition: the broadcaster kept ticking (rt-progress's own waiting transition was seen). ${dedupWindow.matched ? "" : diagnose("rt-progress", dedupWindow.frames)}`,
+    ).toBe(true);
+    expect(
+      dedupWindow.frames.filter((f) => isStatus(f, "rt-dedup")),
+      "dedup violated: rt-dedup's unchanged state was re-sent to a subscriber that already had it",
     ).toEqual([]);
-    wsHandle.ws.close();
-    // per-test timeout (#210): a HARNESS budget, not an SLA — sized to accommodate the ordering-
-    // confirm wait (≤12s) + the fresh-subscriber collect + daemon/WS setup, with headroom. A
-    // timeout here would mean the ordering confirm never completed, which its own loud assertion
-    // above already surfaces as a real defect (not flake). Widen-safe; do NOT tighten below the
-    // 12s ordering deadline it must contain.
-  }, 25_000);
+
+    // 3. (b) REPLAY-ON-CONNECT: a NEW subscriber gets each current state exactly once, then nothing for unchanged
+    // states; rt-progress-2's own `waiting` closes that window.
+    const newWs = await subscribe();
+    await rpc("register_agent", { name: "rt-progress-2", role: "user", capabilities: ["build"] });
+    const replayWindow = await readUntil(newWs, (f) => isStatus(f, "rt-progress-2", "waiting"));
+    expect(
+      replayWindow.matched,
+      `precondition: the broadcaster kept ticking after the connect (rt-progress-2's waiting was seen). ${replayWindow.matched ? "" : diagnose("rt-progress-2", replayWindow.frames)}`,
+    ).toBe(true);
+    for (const entity of ["rt-dedup", "rt-progress"]) {
+      expect(
+        replayWindow.frames.filter((f) => isStatus(f, entity)).map((f) => f.kind),
+        `the new subscriber's frames for ${entity}: exactly ONE replay of its current state, no repeat`,
+      ).toEqual(["waiting"]);
+    }
+    newWs.ws.close();
+    confirmWs.ws.close();
+    // per-test timeout (#210): a HARNESS budget, not an SLA, sized to contain the three 12 s ordering deadlines
+    // above + daemon/WS setup. Widen-safe; do NOT tighten below what it must contain.
+  }, 45_000);
 
   it("(RT3) RELAY_DECAY_TICK_DISABLED=1 disables the broadcaster — NO time-only emits", async () => {
     // Restart the server with the broadcaster opt-out flag set.

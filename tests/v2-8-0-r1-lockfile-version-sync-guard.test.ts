@@ -36,6 +36,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { shellFunctionSource } from "./_helpers/shell-function.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -76,7 +77,7 @@ function runGuard(projectRoot: string): GuardResult {
   const script = `
 set -u
 PROJECT_ROOT='${projectRoot.replace(/'/g, "'\\''")}'
-eval "$(awk '/^lockfile_version_sync_guard\\(\\) \\{/,/^\\}/' '${GATE_SCRIPT.replace(/'/g, "'\\''")}')"
+${shellFunctionSource(GATE_SCRIPT, "lockfile_version_sync_guard")}
 lockfile_version_sync_guard
 exit $?
 `;

@@ -16,6 +16,11 @@
  *     exit). The reason is stable for incident replay.
  *   - NEVER throws. The HTTP handler relies on this to avoid 500s on
  *     platforms where focus isn't wired.
+ *
+ * RELAY_FOCUS_DRY_RUN=1 (exactly "1"; any other value is a normal run), mirroring RELAY_SPAWN_DRY_RUN: the
+ * command is built and NOTHING is run. The result is { raised: false, dry_run: true, command, reason: "dry run…" },
+ * so a dry run never reads as a focus success. The test harness sets it for every worker and child, so no test
+ * raises a real window unless it deliberately unsets it.
  */
 import { spawn } from "child_process";
 import { existsSync } from "fs";
@@ -26,6 +31,11 @@ import { linuxDriver } from "./drivers/linux.js";
 import { windowsDriver } from "./drivers/windows.js";
 
 const FOCUS_TIMEOUT_MS = 3_000;
+
+/** Is focus in dry-run mode? Only the exact value "1" enables it. */
+export function isFocusDryRun(env: Record<string, string | undefined> = process.env): boolean {
+  return env.RELAY_FOCUS_DRY_RUN === "1";
+}
 
 const DRIVERS: Readonly<Record<FocusPlatform, FocusDriver>> = {
   darwin: macosDriver,
@@ -133,6 +143,18 @@ export async function focusTerminal(title: string): Promise<FocusResult> {
       title,
       reason: `command-construction failed: ${err instanceof Error ? err.message : String(err)}`,
       driver_name: driver.name,
+    };
+  }
+  if (isFocusDryRun()) {
+    log.info(`[focus dry-run] ${driver.name}: built, not run`);
+    return {
+      raised: false,
+      dry_run: true,
+      platform: driver.platform,
+      title,
+      reason: "dry run (RELAY_FOCUS_DRY_RUN=1): the command was built, nothing was focused",
+      driver_name: driver.name,
+      command: { exec: cmd.exec, args: cmd.args },
     };
   }
   return await runCommand(cmd.exec, cmd.args, cmd.env, driver, title);

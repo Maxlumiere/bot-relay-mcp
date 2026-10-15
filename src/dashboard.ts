@@ -7,6 +7,7 @@ import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { getAgents, listWebhooks, getDb, getDashboardPrefs, getInboxSummary } from "./db.js";
 import { getKeyringInfo, decryptContent } from "./encryption.js";
+import { dashboardRateLimitedDrops } from "./transport/websocket.js";
 import type { MessageRecord, TaskRecord } from "./types.js";
 import { DASHBOARD_BASE_STYLES, DASHBOARD_THEMES } from "./dashboard-styles.js";
 
@@ -325,6 +326,9 @@ export function snapshotApi(req: Request, res: Response): void {
       active_tasks: tasksWithPreview,
       recent_completions: completionsWithPreview,
       dashboard_prefs: dashboardPrefs,
+      // Live-push events the per-entity rate limiter DROPPED, per event name, since the daemon started: a drop is
+      // never silent. The page heals from them by refetching this snapshot on every push and every 10 s.
+      dashboard_ws: { rate_limited_drops: dashboardRateLimitedDrops() },
     };
     const payload = JSON.stringify(bodyObj);
     // Strong ETag over a STABLE PROJECTION of the body — base64url of a SHA-256,
@@ -1321,6 +1325,12 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
     return m ? { 'X-Relay-CSRF': decodeURIComponent(m[1]) } : {};
   }
 
+  // What the "Raise terminal" button says about a /api/focus-terminal result. A dry run (RELAY_FOCUS_DRY_RUN=1) is
+  // said as such: never 'raised', never a plain failure. (tests/focus-dry-run.test.ts runs this function.)
+  function focusResultLabel(data) {
+    return data.dry_run ? 'dry run, not focused' : data.raised ? 'raised ' + (data.platform || '') : 'raise failed';
+  }
+
   document.getElementById('btn-focus-terminal').addEventListener('click', async () => {
     if (!focusedAgent) return;
     try {
@@ -1337,7 +1347,7 @@ ${DASHBOARD_BASE_STYLES}${DASHBOARD_THEMES}
       const pill = document.getElementById('conn-pill');
       const label = document.getElementById('conn-label');
       const prev = label.textContent;
-      label.textContent = data.raised ? 'raised ' + (data.platform || '') : 'raise failed';
+      label.textContent = focusResultLabel(data);
       pill.classList.add('live');
       setTimeout(() => { label.textContent = prev || 'live'; }, 1600);
     } catch (_e) { /* swallow; status pill remains */ }

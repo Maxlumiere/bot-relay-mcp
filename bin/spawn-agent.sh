@@ -440,8 +440,11 @@ else
 fi
 
 # --- Detect terminal. Prefer iTerm2 if running, else Terminal.app. ---
+# A DRY RUN never asks: the probe is osascript driving System Events, which is permission-gated (it can raise a
+# macOS automation dialog) and so is itself a desktop action. A dry run reports Terminal unless RELAY_TERMINAL_APP
+# names one (only the exact value "1" is a dry run, as below).
 TERMINAL="Terminal"
-if osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null | grep -q "true"; then
+if [ "${RELAY_SPAWN_DRY_RUN:-}" != "1" ] && osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null | grep -q "true"; then
   TERMINAL="iTerm2"
 fi
 

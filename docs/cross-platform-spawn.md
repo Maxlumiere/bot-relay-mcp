@@ -177,6 +177,24 @@ node -e "import('./dist/spawn/dispatcher.js').then(({spawnAgent}) => spawnAgent(
 # Expect: a new terminal window opens with Claude Code starting
 ```
 
+## Dry runs: `RELAY_SPAWN_DRY_RUN` and `RELAY_FOCUS_DRY_RUN`
+
+Two switches build the desktop command and run nothing. Each is enabled ONLY by the exact value `1`; any other value (including `true`, `yes`, an empty string) is a normal run.
+
+| switch | what is built, not run | result |
+|---|---|---|
+| `RELAY_SPAWN_DRY_RUN=1` | the terminal-spawn command (`spawn_agent`, `bin/spawn-agent.sh`) | `dryRunCommand` holds the command |
+| `RELAY_FOCUS_DRY_RUN=1` | the dashboard's "Raise terminal" command (`POST /api/focus-terminal`) | `{ raised: false, dry_run: true, command, reason: "dry run …" }`, HTTP 409; the dashboard shows "dry run, not focused" |
+
+A focus dry run never reads as a success: `raised` is false and the reason says it was a dry run. The test suite sets `RELAY_FOCUS_DRY_RUN=1` for every test worker and child, and a test-only tripwire refuses any desktop-actuating program (`osascript`, `open`, `wmctrl`, `xdotool`, and PowerShell with `AppActivate` / `WScript.Shell`), so a test run never raises or opens a window on the machine running it.
+
+```bash
+RELAY_FOCUS_DRY_RUN=1 node -e '
+  import("./dist/focus/dispatcher.js").then(async ({focusTerminal}) =>
+    console.log(JSON.stringify(await focusTerminal("my-window"), null, 2)))'
+# Expect: raised:false, dry_run:true, command: { exec: "osascript", args: [...] } on macOS
+```
+
 ## Troubleshooting
 
 **"Unsupported platform" error** — the dispatcher received a `process.platform` value other than `darwin`, `linux`, or `win32`. BSD / Solaris / AIX are not supported in v1.9. File an issue with the platform string.
