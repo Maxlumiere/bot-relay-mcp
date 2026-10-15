@@ -34,7 +34,7 @@
  * Stateless across daemon restart: no server-side session store. Clients
  * reconnect on their own (spec §Phase 2: exponential backoff on the client).
  */
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 import { timingSafeEqual } from "crypto";
 import type { IncomingMessage, Server as HttpServer } from "http";
 import { loadConfig, resolveDashboardSecret } from "../config.js";
@@ -64,6 +64,22 @@ import {
  * introduce a new `DashboardPayloadEvent` shape alongside this one so
  * the metadata-only contract never regresses silently.
  */
+/**
+ * What broadcastDashboardEvent did with an event, so no caller can confuse "nobody was listening" with "dropped":
+ *   queued        at least one OPEN client's ws.send() accepted the frame. QUEUED, not confirmed delivered: the
+ *                 write can still fail later, in its callback (see dashboardBaselineGeneration: that voids the baseline)
+ *   rate_limited  dropped by the per-(event, entity) 500 ms limiter: NOTHING was sent (counted, see rateLimitedDrops)
+ *   no_clients    accepted, but no OPEN client (a client that connects later loads /api/snapshot, and its connect
+ *                 bumps the baseline generation, so a STATE broadcaster re-sends its current state)
+ *   error         nothing was queued (every OPEN client's send threw, or the broadcast itself threw)
+ * A client whose send fails (at once, or later in its write callback) is TERMINATED and removed, never just forgotten:
+ * its page sees the close, reconnects, and that connect re-sends the current state (dashboardBaselineGeneration).
+ * A STATE broadcaster must treat only `queued` / `no_clients` as committed and send the latest state again otherwise
+ * (dashboard-state-broadcaster.ts). EDGE callers ("something changed, refetch") are healed by the dashboard's own
+ * /api/snapshot refetch-on-push and 10 s poll; each drop is counted and shown in /api/snapshot.
+ */
+export type DashboardBroadcastResult = "queued" | "rate_limited" | "no_clients" | "error";
+
 export interface DashboardEvent {
   /** High-level event name broadcast to dashboard clients. Stable wire format. */
   event:
@@ -97,9 +113,42 @@ export interface DashboardEvent {
  */
 let wss: WebSocketServer | null = null;
 const clients: Set<WebSocket> = new Set();
+/**
+ * Bumped whenever what a screen shows may differ from what a STATE broadcaster last queued:
+ *   - every client CONNECT (a reconnect is a connect): its snapshot may show a state the broadcaster never queued to it;
+ *   - every ASYNC WRITE ERROR (a frame ws.send() had queued failed in its callback): that frame never arrived.
+ * A STATE broadcaster compares it between ticks; a change voids its last-queued baseline, so the next tick re-sends
+ * every CURRENT state to every client (never a stale one: the re-send is derived at that tick). The invariant: a state
+ * is committed when its frame is QUEUED, and any async write error voids that, so a state is never lost beyond one
+ * tick plus the limiter window. Monotonic for the life of the process (never reset, so it can never come back to a
+ * value a broadcaster already saw).
+ */
+let baselineGeneration = 0;
+
+/** The current baseline generation (see above). */
+export function dashboardBaselineGeneration(): number {
+  return baselineGeneration;
+}
+
+/** End a client whose send failed: removed AND terminated, so its page sees the close and reconnects. */
+function dropClient(ws: WebSocket): void {
+  clients.delete(ws);
+  try {
+    ws.terminate();
+  } catch {
+    /* already gone */
+  }
+}
 
 /** Rate-limit map: (event:entity_id) → last-broadcast epoch ms. */
 const lastBroadcastAt = new Map<string, number>();
+/** Events the limiter dropped, per event name, since start: never silent (shown in /api/snapshot). */
+const rateLimitedDrops = new Map<string, number>();
+
+/** How many events the rate limiter dropped, per event name, since this process started. */
+export function dashboardRateLimitedDrops(): Record<string, number> {
+  return Object.fromEntries(rateLimitedDrops);
+}
 const BROADCAST_MIN_INTERVAL_MS = 500;
 
 /** Constant-time string compare for shared secrets. */
@@ -184,6 +233,7 @@ export function attachDashboardWs(server: HttpServer): void {
   wss.on("connection", (ws: WebSocket) => {
     log.debug(`[dashboard-ws] client connected, total=${clients.size + 1}`);
     clients.add(ws);
+    baselineGeneration++;
     ws.on("close", () => clients.delete(ws));
     ws.on("error", () => clients.delete(ws));
     // Send a hello so clients can confirm auth + subscribe-loop handshake.
@@ -289,13 +339,14 @@ export function attachDashboardWs(server: HttpServer): void {
  * NEVER throws. Event sources are callbacks from hot paths (send_message,
  * update_task, etc.); a broadcast failure must not escape to the caller.
  */
-export function broadcastDashboardEvent(evt: DashboardEvent): void {
+export function broadcastDashboardEvent(evt: DashboardEvent): DashboardBroadcastResult {
   try {
     const key = `${evt.event}:${evt.entity_id}`;
     const now = Date.now();
     const last = lastBroadcastAt.get(key);
     if (last !== undefined && now - last < BROADCAST_MIN_INTERVAL_MS) {
-      return;
+      rateLimitedDrops.set(evt.event, (rateLimitedDrops.get(evt.event) ?? 0) + 1);
+      return "rate_limited";
     }
     lastBroadcastAt.set(key, now);
 
@@ -306,21 +357,41 @@ export function broadcastDashboardEvent(evt: DashboardEvent): void {
       }
     }
 
-    if (clients.size === 0) return; // nothing to fan out to
     const line = JSON.stringify(evt);
+    let open = 0;
+    let queued = 0;
     for (const ws of clients) {
+      // Only an OPEN socket can carry the frame: ws's send() on a CLOSING/CLOSED socket returns without throwing and
+      // without sending, so counting it would record a state no screen received. Its own close removes it.
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      open++;
       try {
-        ws.send(line);
+        // A write that fails AFTER send() returned reports here: the frame was queued and committed, but never arrived.
+        // End that client (it reconnects, see dropClient) and void every STATE baseline, so the next tick re-sends the
+        // current state to the clients that remain.
+        ws.send(line, (err) => {
+          if (!err) return;
+          dropClient(ws);
+          baselineGeneration++;
+        });
+        queued++;
       } catch {
-        // Per-client send failure removes the client; next upgrade reconnects.
-        clients.delete(ws);
+        dropClient(ws);
       }
     }
+    if (open === 0) return "no_clients"; // nothing to fan out to
+    return queued > 0 ? "queued" : "error";
   } catch (err) {
     log.warn(
       `[dashboard-ws] broadcast error (swallowed): ${err instanceof Error ? err.message : String(err)}`
     );
+    return "error";
   }
+}
+
+/** Testing-only: register a stand-in client (a fake socket) so a test can drive OPEN / CLOSING / failing sends. */
+export function _addDashboardClientForTests(c: unknown): void {
+  clients.add(c as WebSocket);
 }
 
 /** Testing-only: clear module-scope state between runs. */
@@ -334,6 +405,7 @@ export function _resetDashboardWsForTests(): void {
   }
   clients.clear();
   lastBroadcastAt.clear();
+  rateLimitedDrops.clear();
   if (wss) {
     try {
       wss.close();
