@@ -290,16 +290,16 @@ describe("ADR-0043 — every key on agent_bindings starts with edge_id", () => {
     // lifted for this one insert, so only the KEYS are under test.
     const local = (await edgeRow())!.edge_id;
     await raw(async (db) => {
-      await bindRow(db, anchor(4003), "architect", "c6666666-6666-6666-6666-666666666666");
+      await bindRow(db, anchor(4003), "fx-arch", "c6666666-6666-6666-6666-666666666666");
       db.exec("DROP TRIGGER IF EXISTS agent_bindings_local_edge_insert");
       db.prepare(
         "INSERT INTO agent_bindings (binding_id, binding_version, agent_name, conversation_id, host_id, window_pid, " +
-          "window_pid_start, bound_via, bound_at, edge_id) VALUES ('foreign-1', 1, 'architect', 'c7', ?, ?, ?, 'launch-intent', 't', ?)",
+          "window_pid_start, bound_via, bound_at, edge_id) VALUES ('foreign-1', 1, 'fx-arch', 'c7', ?, ?, ?, 'launch-intent', 't', ?)",
       ).run("h-1", 4003, "Mon Sep 15 10:00:00 2026", FOREIGN);
     });
     const { listAgentBindings } = await import("../src/db.js");
     const listed = await raw((db) => listAgentBindings(db as never));
-    expect(listed.map((r: { agent_name: string | null }) => r.agent_name)).toEqual(["architect"]);
+    expect(listed.map((r: { agent_name: string | null }) => r.agent_name)).toEqual(["fx-arch"]);
     expect((listed[0] as unknown as { edge_id: string }).edge_id, "the local view shows only the local edge").toBe(local);
   });
 
