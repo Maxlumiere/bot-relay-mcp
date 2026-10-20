@@ -23,15 +23,21 @@ const countAgents = (sb: ReturnType<typeof sandbox>, name?: string) =>
   Number((dbQuery<{ n: number }>(sb, name ? "SELECT COUNT(*) AS n FROM agents WHERE name = ?" : "SELECT COUNT(*) AS n FROM agents", ...(name ? [name] : []))[0] ?? { n: 0 }).n);
 
 describe("SEC-01.T1: no token without a credential (the installed package)", () => {
-  it("SEC-01.T1 HARM http: a NEW name with no registration secret is refused, and no row or token is created", async () => {
+  it("SEC-01.T1 HARM http: a NEW name with no registration secret is refused, and no row or token is created", async (ctx) => {
     const sb = sandbox("s01-http");
     const d = await startHttpDaemon(sb);
     daemons.push(d);
     const before = countAgents(sb);
     const r = await d.rpc("register_agent", { name: "sec01-new", role: "worker", capabilities: [] });
+    // The stimulus returned a tool result (not a transport or JSON-RPC error)...
+    expect(r.rpc_error, `not a tool result: ${JSON.stringify(r)}`).toBeUndefined();
+    const after = countAgents(sb);
+    // ...and with no token issued, it must be THE mint gate's refusal (an unknown tool or a schema error is not one).
+    if (r.agent_token === undefined) expect(r.error_code, JSON.stringify(r)).toBe("MINT_SECRET_REQUIRED");
+    // The observation mark (sec-20.release.ts): only now, after every fixture call, before the harm assertion.
+    ctx.task.meta.stimulus_returned = true;
     expect(r.agent_token, `a token was issued with no credential: ${JSON.stringify(r)}`).toBeUndefined();
-    expect(r.error_code, JSON.stringify(r)).toBe("MINT_SECRET_REQUIRED");
-    expect(countAgents(sb), "no agent row was created").toBe(before);
+    expect(after, "no agent row was created").toBe(before);
   });
 
   // PR-D Q6 (ruled 13 Oct): stdio is OUT of scope, conditional on SEC-04 (a stdio register is a same-user act gated

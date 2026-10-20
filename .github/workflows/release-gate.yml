@@ -2,10 +2,11 @@ name: Release security gate
 
 # The RELEASE SECURITY GATE (security/invariants.json): the PACKED, INSTALLED package against its own security
 # invariants, on ubuntu, macOS and Windows. Its own workflow, because a `paths:` filter applies to a whole workflow:
-#   - pull requests that change the GATE ITSELF (its tests, config, runner, registry, the tripwire it runs under, or
-#     this file) prove it on all three OSes before merge;
+#   - pull requests that change the GATE ITSELF (its tests, config, runner, registry rules and data, the tripwire it
+#     runs under, or this file) prove it on all three OSes before merge;
 #   - every main push (post-merge drift) and every `v*` tag (a tag is a publish) run it too.
 # Every other pull request gets the ubuntu candidate through ci.yml's smoke job (scripts/pre-publish-check.sh).
+# Every mode first validates the registry (scripts/release-registry.mjs). The registry's in-process tests run here too.
 # The KNOWN-BAD control (the registry's latest must still fail its pinned harms, or the suite went blind) runs on
 # ubuntu for main pushes, tags and manual runs; a pull request touching the gate runs it too.
 on:
@@ -18,6 +19,7 @@ on:
       - 'tests/release/**'
       - 'vitest.release.config.ts'
       - 'scripts/release-invariants.mjs'
+      - 'scripts/release-registry.mjs'
       - 'security/**'
       - 'tests/security-registry.test.ts'
       - 'tests/_setup/**'
@@ -52,6 +54,12 @@ jobs:
       - name: Candidate (this tree, packed and installed)
         shell: bash
         run: node scripts/release-invariants.mjs candidate --pack
+
+      # The registry's IN-PROCESS tests that apply to this OS, each required to PASS (an id the registry names is not
+      # taken on trust that some other job runs it). Runs wherever this workflow does: gate PRs, main pushes, tags.
+      - name: In-process invariants (registry-driven)
+        shell: bash
+        run: node scripts/release-invariants.mjs in-process
 
       - name: Known-bad control (the registry's latest)
         if: matrix.os == 'ubuntu-latest'
