@@ -10,18 +10,21 @@
  * ASSUMED to be local suite runs). It establishes "cannot recur from the suite AS NOW BUILT"; it does NOT explain why
  * those bursts stopped on 7 Oct.
  *
- * The instrument: a recording `curl` first on PATH (the hook resolves curl by PATH) that writes each URL it is given
- * and exits 7 ("could not connect") without connecting. Node children of the hook get a BLOCKER preload that refuses
- * every socket connect and records its target. Nothing in this file ever connects to 3777 (the live relay holds it on
- * an operator's machine).
+ * The instrument: a recording `curl` first on PATH (the hook resolves curl by PATH) that records each invocation's URL
+ * and the MCP tool its body calls (the tool NAME only, never an argument value), then exits 7 ("could not connect")
+ * without connecting. Node children of the hook get a BLOCKER preload that refuses every socket connect and records
+ * its target (net's normalized [options, cb] unwrapped; IPv6 hosts kept). The log is parsed STRICTLY: an unparseable
+ * record fails the test, never reads as "no target". Nothing in this file ever connects to 3777 (the live relay holds
+ * it on an operator's machine).
  *
  * The hook dials only once it resolves a relay instance (ADR-0048), so each arm's HOME holds one: a sandbox DB the
  * product itself creates (dist/db.js), the shape of an account HOME. The two arms differ ONLY in the tripwire: the child
  * env is { PATH, a name, that HOME } with NO port, i.e. the port falls back to its default.
- *   THE CLAIM: under the tripwire (the ordinary spawn), the hook targets no URL on :3777 (the missing port is repaired
- *              to 1), and it did reach its HTTP calls (some URL was recorded: the instrument saw the path).
- *   THE TWIN (the RED with the tripwire removed): the same child spawned PAST the tripwire (raw spawn) targets
- *              http://127.0.0.1:3777/mcp: the default-port path is real, and the claim above is not vacuous.
+ *   THE CLAIM: under the tripwire (the ordinary spawn), the register_agent STIMULUS itself reaches curl at the repaired
+ *              port (curl http://127.0.0.1:1/mcp, tool register_agent), and nothing targets :3777. A run that only
+ *              probed /health, or never registered, fails it (THE CONTROL).
+ *   THE TWIN (the RED with the tripwire removed): the same child spawned PAST the tripwire (raw spawn) sends
+ *              register_agent to http://127.0.0.1:3777/mcp: the default-port path is real, and the claim is not vacuous.
  * The other containment layer, an env-{} child's HOME repaired to the run's private (instance-less) home, is pinned by
  * tests/operator-tripwire.test.ts ("a child built FROM SCRATCH (env {}) gets the private HOME ... port 1").
  */
@@ -52,41 +55,92 @@ function homeWithInstance(name: string): string {
 }
 const STDIN = JSON.stringify({ session_id: "contain-1", hook_event_name: "SessionStart", source: "startup" });
 
-/** A recording instrument: a fake curl and a node blocker preload, both writing into `dir`/log. */
+/** One recorded connection attempt: curl (its URL, and the MCP tool its body calls: the NAME only, never arguments) or node. */
+type Rec = { via: "curl" | "node"; host: string; port: number; path?: string; tool?: string };
+/**
+ * Parse the instrument's log STRICTLY: `curl <url> tool=<name|->` or `node {"host":…,"port":…}`. Anything else (a
+ * record the instrument could not form, a port that is not an integer) THROWS: a dropped record is never "no target".
+ */
+export function parseRecords(lines: string[]): Rec[] {
+  return lines.map((l) => {
+    const c = /^curl (https?:\/\/\S+) tool=([A-Za-z0-9_]+|-)$/.exec(l);
+    if (c) {
+      const u = new URL(c[1]);
+      const port = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+      return { via: "curl" as const, host: u.hostname.replace(/^\[|\]$/g, ""), port, path: u.pathname, ...(c[2] === "-" ? {} : { tool: c[2] }) };
+    }
+    const n = /^node (\{.*\})$/.exec(l);
+    if (n) {
+      const o = JSON.parse(n[1]) as { host: unknown; port: unknown };
+      if (Number.isInteger(o.port) && typeof o.host === "string") return { via: "node" as const, host: o.host, port: o.port as number };
+    }
+    throw new Error(`containment instrument: an unparseable record ${JSON.stringify(l)}: never dropped`);
+  });
+}
+const DEFAULT_PORT = 3777;
+/**
+ * THE CLAIM, as one assertion (the live arm and the control both run it): no attempt on the DEFAULT port, AND the
+ * register_agent stimulus itself reached curl, at the tripwire's repaired port 1 (a run that only probed /health, or
+ * never registered, proves nothing about the register path).
+ */
+export function assertContainedRegistration(records: Rec[]): void {
+  const shown = JSON.stringify(records);
+  if (records.some((r) => r.port === DEFAULT_PORT)) throw new Error(`a target on the DEFAULT port ${DEFAULT_PORT}: ${shown}`);
+  if (!records.some((r) => r.via === "curl" && r.host === "127.0.0.1" && r.port === 1 && r.path === "/mcp" && r.tool === "register_agent")) {
+    throw new Error(`the register_agent stimulus never reached curl at the repaired port (curl http://127.0.0.1:1/mcp tool=register_agent): ${shown}`);
+  }
+}
+
+/** A recording instrument: a fake curl and a node blocker preload, both writing into `dir`/log. Nothing connects. */
 function instrument(name: string) {
   const dir = path.join(ROOT, name);
   const bin = path.join(dir, "bin");
   fs.mkdirSync(bin, { recursive: true });
   const log = path.join(dir, "log");
   fs.writeFileSync(log, "");
-  fs.writeFileSync(path.join(bin, "curl"), `#!/bin/sh\nfor a in "$@"; do case "$a" in http://*|https://*) printf 'curl %s\\n' "$a" >> '${log}';; esac; done\nexit 7\n`, { mode: 0o755 });
+  // curl: one record per invocation, its URL and the MCP tool its body calls (the tool NAME only), then exit 7.
+  fs.writeFileSync(
+    path.join(bin, "curl"),
+    `#!/bin/sh
+url=""; tool=""
+for a in "$@"; do
+  case "$a" in
+    http://*|https://*) url="$a" ;;
+    *'"method":"tools/call"'*) tool=$(printf '%s' "$a" | sed -n 's/.*"params":{"name":"\\([A-Za-z0-9_]*\\)".*/\\1/p') ;;
+  esac
+done
+[ -n "$url" ] && printf 'curl %s tool=%s\\n' "$url" "\${tool:--}" >> '${log}'
+exit 7
+`,
+    { mode: 0o755 },
+  );
+  // node: every socket connect is refused and recorded; net.connect hands over its normalized [options, cb].
   const blocker = path.join(dir, "blocker.cjs");
   fs.writeFileSync(
     blocker,
     `const net = require("net"); const fs = require("fs");
-     const refuse = (port, host) => { fs.appendFileSync(${JSON.stringify(log)}, "node " + (host || "?") + ":" + port + "\\n"); throw new Error("blocked by the containment test"); };
      const orig = net.Socket.prototype.connect;
-     net.Socket.prototype.connect = function (...a) { const o = typeof a[0] === "object" && a[0] !== null ? a[0] : { port: a[0], host: a[1] }; if (o.path) return orig.apply(this, a); return refuse(o.port, o.host); };`,
+     net.Socket.prototype.connect = function (...a) {
+       let o = Array.isArray(a[0]) ? a[0][0] : a[0];
+       if (o === null || typeof o !== "object") o = { port: a[0], host: typeof a[1] === "string" ? a[1] : undefined };
+       if (o.path !== undefined && o.port === undefined) return orig.apply(this, a); // a unix socket
+       fs.appendFileSync(${JSON.stringify(log)}, "node " + JSON.stringify({ host: o.host === undefined ? "localhost" : o.host, port: Number(o.port) }) + "\\n");
+       throw new Error("blocked by the containment test");
+     };`,
   );
-  const targets = () => fs.readFileSync(log, "utf-8").split("\n").filter(Boolean);
-  const ports = () =>
-    targets()
-      .map((l) => (/^curl (\w+):\/\/[^/:]+:(\d+)/.exec(l)?.[2] ?? /^node [^:]*:(\d+)/.exec(l)?.[1] ?? null))
-      .filter((p): p is string => p !== null);
-  return { bin, blocker, targets, ports };
+  const lines = () => fs.readFileSync(log, "utf-8").split("\n").filter(Boolean);
+  return { bin, blocker, log, lines, records: () => parseRecords(lines()) };
 }
 
 describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{} child running the real SessionStart hook never targets the default port under the tripwire", () => {
-  it("THE CLAIM: under the tripwire, the hook in an env-{} child targets NO :3777 URL, and it did reach its HTTP calls", () => {
+  it("THE CLAIM: under the tripwire, the hook's register_agent reaches curl at the repaired port 1 (/mcp, tool register_agent), and NOTHING targets :3777", () => {
     const ins = instrument("claim");
     const home = homeWithInstance("claim");
     spawnSync("bash", [HOOK], { input: STDIN, encoding: "utf-8", timeout: 60_000, env: { PATH: `${ins.bin}:${NODE_DIR}:/usr/bin:/bin`, RELAY_AGENT_NAME: "fx-contain", HOME: home, NODE_OPTIONS: `--require ${ins.blocker}` } });
-    expect(ins.targets().length, `precondition: the hook reached its HTTP calls (recorded: ${JSON.stringify(ins.targets())})`).toBeGreaterThan(0);
-    expect(ins.ports(), `no target on the DEFAULT port (recorded: ${JSON.stringify(ins.targets())})`).not.toContain("3777");
-    expect(ins.ports(), `the missing port was repaired to the tripwire's 1 (recorded: ${JSON.stringify(ins.targets())})`).toContain("1");
+    assertContainedRegistration(ins.records());
   }, 90_000);
 
-  it("THE TWIN, the tripwire REMOVED: the same hook spawned PAST the tripwire (raw spawn; a sandbox HOME only) targets :3777 (the default-port path is real; the claim is not vacuous)", async () => {
+  it("THE TWIN, the tripwire REMOVED: the same hook spawned PAST the tripwire (raw spawn; a sandbox HOME only) sends register_agent to :3777 (the default-port path is real; the claim is not vacuous)", async () => {
     const ins = instrument("twin");
     const home = homeWithInstance("twin");
     await new Promise<number | null>((resolve) => {
@@ -94,6 +148,23 @@ describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{
       c.stdin!.end(STDIN);
       c.on("close", resolve);
     });
-    expect(ins.targets(), `without the tripwire the default port IS targeted (recorded: ${JSON.stringify(ins.targets())})`).toContain("curl http://127.0.0.1:3777/mcp");
+    expect(ins.lines(), `without the tripwire register_agent goes to the DEFAULT port (recorded: ${JSON.stringify(ins.lines())})`).toContain("curl http://127.0.0.1:3777/mcp tool=register_agent");
   }, 90_000);
+
+  it("THE CONTROL: a registration-skipped, health-only run (one probe of /health at port 1, no register_agent) FAILS the claim; so does any :3777 target", () => {
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-"]))).toThrow(/the register_agent stimulus never reached curl/);
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/mcp tool=register_agent", 'node {"host":"127.0.0.1","port":3777}']))).toThrow(/DEFAULT port/);
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/mcp tool=register_agent"]))).not.toThrow();
+  });
+
+  it("THE NODE RECORDER: a connect through net's NORMALIZED [options, cb] shape, and an IPv6 endpoint, are recorded (never dropped); an unparseable record FAILS", () => {
+    const ins = instrument("node-shapes");
+    const code = `const net = require("net"); for (const [port, host] of [[4321, "127.0.0.1"], [4322, "::1"]]) { try { net.connect({ port, host }); } catch {} } try { net.createConnection(4323); } catch {}`;
+    const r = spawnSync(process.execPath, ["-e", code], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", NODE_OPTIONS: `--require ${ins.blocker}` } });
+    expect(r.status, r.stderr).toBe(0);
+    expect(ins.records().map((x) => [x.host, x.port])).toEqual([["127.0.0.1", 4321], ["::1", 4322], ["localhost", 4323]]);
+    expect(() => parseRecords(["node ?:undefined"])).toThrow(/unparseable record/);
+    expect(() => parseRecords(['node {"host":"127.0.0.1","port":null}'])).toThrow(/unparseable record/);
+    expect(parseRecords(["curl http://[::1]:3777/mcp tool=register_agent"])[0]).toEqual({ via: "curl", host: "::1", port: 3777, path: "/mcp", tool: "register_agent" });
+  });
 });
