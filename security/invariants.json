@@ -1,0 +1,399 @@
+{
+  "$comment": "The release security gate's invariant registry. A security rule with no test is not a rule: tests/security-registry.test.ts checks this file; scripts/release-invariants.mjs runs the installed-package tests. Design: the release security gate (R1, 2026-10-07; build plan ruled 2026-10-13).",
+  "invariants": [
+    {
+      "id": "SEC-01",
+      "statement": "No token is issued over HTTP (register, pair, recovery or any HTTP path) without a credential bound to the row or the mint secret. stdio is OUT of scope per PR-D Q6, CONDITIONAL on SEC-04 holding (a stdio register is a same-user act gated by DB-file access).",
+      "source": "ADR-0009, ADR-0006, PR-D Q1/Q-A/Q6; ruled 13 Oct",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "active",
+      "tests": [
+        {
+          "id": "tests/release/sec-01.release.ts::SEC-01.T1 HARM http: a NEW name with no registration secret is refused, and no row or token is created",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-01.release.ts::SEC-01.T1 BOUNDARY stdio (PR-D Q6): a NEW name over stdio registers WITHOUT a secret, as ruled",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-01.release.ts::SEC-01.T1 TWIN http: the same register WITH the registration secret issues a token",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-01.release.ts::SEC-01.T1 TWIN http: an existing name refreshes itself with its own token, no secret",
+          "mode": "installed"
+        }
+      ],
+      "conditional_on": [
+        "SEC-04"
+      ]
+    },
+    {
+      "id": "SEC-02",
+      "statement": "A wrong or unknown token causes zero on-loop bcrypt and no O(N) work, and /health stays live.",
+      "source": "PR-B, ADR-0003",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "its installed-package timing test consumes the LOOP instrument (event-loop delay bars), which is being fixed",
+        "owner": "the timing-instrument work",
+        "blocked_by": "the LOOP-instrument fix (flake f), then gate slice G3"
+      }
+    },
+    {
+      "id": "SEC-03",
+      "statement": "No secret or token appears in any argv, stdout/stderr (except an explicit flagged output), logs, /health or error text.",
+      "source": "PR-D Q2, ADR-0036 S4",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "installed-package argv + output canary scan",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G2"
+      }
+    },
+    {
+      "id": "SEC-04",
+      "statement": "The private chain (instance dir, secrets dir, secret file, relay.db and its -wal/-shm) is owner-only by ownership AND mode/ACL; otherwise mint is unavailable. LOAD-BEARING: SEC-01's stdio exclusion holds only while this does.",
+      "source": "PR-D Q6, R2; ruled 13 Oct",
+      "os": [
+        "darwin",
+        "linux"
+      ],
+      "status": "active",
+      "tests": [
+        {
+          "id": "tests/release/sec-04.release.ts::SEC-04.T1 HARM-guard the default instance chain, its DB files and the mint secret are owner-only",
+          "mode": "installed"
+        }
+      ],
+      "not_yet": {
+        "win32": {
+          "reason": "the Windows ACL check of the same chain, and 'a widened chain makes mint unavailable'",
+          "owner": "release-gate slices",
+          "blocked_by": "gate slice G2"
+        }
+      }
+    },
+    {
+      "id": "SEC-05",
+      "statement": "The daemon binds loopback by default; a non-loopback bind without a secret refuses to start.",
+      "source": "ADR-0006",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "installed-package bind tests (incl. the default-is-loopback test that does not exist today)",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G2"
+      }
+    },
+    {
+      "id": "SEC-06",
+      "statement": "The trusted-proxy verdict is spelling-invariant.",
+      "source": "#307",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "installed-package spelling property",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G2"
+      }
+    },
+    {
+      "id": "SEC-07",
+      "statement": "A credential change during auth never serves the old token and never locks out the new one.",
+      "source": "#308",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "registered with its in-process tests under a waiver (revisit when ADR-0050 S2 lands)",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G3"
+      }
+    },
+    {
+      "id": "SEC-08",
+      "statement": "A revocation between verify and dispatch is never served; an async handler revalidates after its last await.",
+      "source": "#308, #315 Codex R1",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "registered with its in-process tests under a waiver (revisit when ADR-0050 S2 lands)",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G3"
+      }
+    },
+    {
+      "id": "SEC-09",
+      "statement": "The doorbell/watch path makes ZERO model invocations.",
+      "source": "6 Oct ruling",
+      "os": [
+        "darwin",
+        "linux"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "a sentinel claude/codex on PATH during an installed wake cycle (no test exists today)",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G3"
+      }
+    },
+    {
+      "id": "SEC-10",
+      "statement": "A watch process exits only for a wake or because its window is gone.",
+      "source": "#313, INV-LIVE-01",
+      "os": [
+        "darwin",
+        "linux"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "the watch test re-pointed at the installed bin/relay",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G3"
+      }
+    },
+    {
+      "id": "SEC-11",
+      "statement": "The security suite itself never touches the real HOME (every process in a sandbox HOME; the operator's relay config hashed before and after the run by the global setup, and a change fails the run).",
+      "source": "the operator config rule",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "active",
+      "tests": [
+        {
+          "id": "tests/release/sec-11.release.ts::SEC-11.T1 every installed process this suite starts runs in a sandbox HOME, never the account's",
+          "mode": "installed"
+        }
+      ]
+    },
+    {
+      "id": "SEC-12",
+      "statement": "Session start shows message METADATA only.",
+      "source": "roadmap A7",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "A7 is not ruled yet",
+        "owner": "a design ruling",
+        "blocked_by": "the A7 ruling"
+      }
+    },
+    {
+      "id": "SEC-13",
+      "statement": "No file the relay, its daemon, CLI or shipped hooks create outside the DB carries message content or agent free text.",
+      "source": "ruling 410396d1",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "the canary scan (no test exists today)",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G2"
+      }
+    },
+    {
+      "id": "SEC-14",
+      "statement": "No relay decision depends on message or task CONTENT.",
+      "source": "ruling 410396d1",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "the differential test, incl. the doorbell's intents (no test exists today)",
+        "owner": "release-gate slices",
+        "blocked_by": "gate slice G2"
+      }
+    },
+    {
+      "id": "SEC-15..19",
+      "statement": "B never decides; no A write outside a unit; no external I/O without a committed effect row; a revoked origin's effects are withheld; child authority only via activation.",
+      "source": "ADR-0050 / ADR-0051 R2",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "pending",
+      "tests": [],
+      "pending": {
+        "reason": "those slices have not shipped",
+        "owner": "a design ruling",
+        "blocked_by": "ADR-0050 / ADR-0051 slices"
+      }
+    },
+    {
+      "id": "SEC-20",
+      "statement": "Every token consumer refuses a token whose row is not authorized by auth_state (revoked, recovery_pending, provisioning), never the hash alone; a revoked row becomes active only via relay recover, a recovery_pending row only via its own recovery token or relay recover.",
+      "source": "#315, ruling bbdc21d2 / a8901bbe",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "active",
+      "tests": [
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T1 HARM relay send --from a REVOKED agent is refused and writes no message",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T1 HARM with no token in its env, the refusal says the agent is revoked",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T1 TWIN relay send --from an ACTIVE agent delivers",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM relay mint-token does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM relay mint-token --force does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM register_agent (the registration secret, no token) does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM register_agent (its old token) does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM rotate_token (its old token) does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM rotate_token_admin (an admin) does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN relay mint-token mints a NEW name (the verb works)",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN register_agent with the registration secret registers a NEW name (the verb works)",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN register_agent with its own token re-registers an ACTIVE agent",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN rotate_token with its own token rotates an ACTIVE agent",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN rotate_token_admin by an admin rotates an ACTIVE agent",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN relay mint-token --force still works on an ACTIVE agent",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN relay recover, then a fresh register, brings a revoked agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN a recovery_pending agent comes back with its own recovery token",
+          "mode": "installed"
+        }
+      ]
+    },
+    {
+      "id": "SEC-22",
+      "statement": "Every security- or liveness-relevant subprocess runs by an ABSOLUTE trusted path, never one found through PATH. Windows: whoami, icacls, reg and powershell come from a validated %SystemRoot%; a missing or invalid SystemRoot is a named error that fails closed, never a PATH fallback. A new by-name subprocess in src/ fails CI unless it is allowlisted with its reason.",
+      "source": "#336 (d504c4d); this gate's first catch (windows-2022, 13 Oct); Codex #336 R1, R2",
+      "os": [
+        "win32"
+      ],
+      "status": "active",
+      "tests": [
+        {
+          "id": "tests/release/sec-22.release.ts::SEC-22.T1 HARM Git Bash's PATH (GNU whoami first): the installed daemon still accepts its own registration secret",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-22.release.ts::SEC-22.T1 HARM a PLANTED whoami first on PATH, printing a forged SID: the installed daemon ignores it, accepts its own secret, and still refuses a wrong one",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/sec-22-system-binaries.test.ts::HARM a valid-looking SystemRoot whose exe is absent → a named 'not a regular file', never a PATH lookup",
+          "mode": "in-process"
+        },
+        {
+          "id": "tests/sec-22-system-binaries.test.ts::every child_process call in src/ goes through systemBinary(...) or process.execPath, or is ALLOWLISTED; no allowlist entry is stale",
+          "mode": "in-process"
+        }
+      ],
+      "not_yet": {
+        "darwin": {
+          "reason": "ps, lsof, sysctl, ioreg, launchctl and tar still run by name (each on the SEC-22 scan's allowlist, saying so)",
+          "owner": "the subprocess-path work",
+          "blocked_by": "the SEC-22 POSIX follow-up"
+        },
+        "linux": {
+          "reason": "ps, lsof, sysctl, ioreg, launchctl and tar still run by name (each on the SEC-22 scan's allowlist, saying so)",
+          "owner": "the subprocess-path work",
+          "blocked_by": "the SEC-22 POSIX follow-up"
+        }
+      }
+    }
+  ]
+}
