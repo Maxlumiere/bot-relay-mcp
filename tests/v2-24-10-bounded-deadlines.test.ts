@@ -140,7 +140,7 @@ describe("v2.24.10 relay pair — the reproduced end-to-end hang", () => {
     const t0 = Date.now();
     let settled = false;
     const p = pair
-      .run([srv.url, "--name", "probe", "--yes", "--secret", "s"])
+      .run([srv.url, "--name", "fx-probe", "--yes", "--secret", "s"])
       .then(() => { settled = true; })
       .catch(() => { settled = true; });
 

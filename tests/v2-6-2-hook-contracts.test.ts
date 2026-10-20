@@ -629,7 +629,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
     const copy = hookCopy(root);
     fs.writeFileSync(copy.helper, "this is not valid bash (((\n");
     for (const hook of copy.hooks) {
-      const r = runHook({ hook, home: root, agentName: "probe" });
+      const r = runHook({ hook, home: root, agentName: "fx-probe" });
       const combined = `${r.stdout}\n${r.stderr}`;
       const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
       expect(count, `${path.basename(hook)} emitted ${count} verdicts with a CORRUPT helper`).toBe(1);
@@ -646,7 +646,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
     const copy = hookCopy(root);
     fs.rmSync(copy.helper);
     for (const hook of copy.hooks) {
-      const r = runHook({ hook, home: root, agentName: "probe" });
+      const r = runHook({ hook, home: root, agentName: "fx-probe" });
       const combined = `${r.stdout}\n${r.stderr}`;
       const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
       expect(count, `${path.basename(hook)} emitted ${count} verdicts with NO helper`).toBe(1);
@@ -662,7 +662,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
     // from the agent. check-relay pins it explicitly before loading.
     const { root } = freshTestRoot();
     const hook = path.join(REPO_ROOT, "hooks", "check-relay.sh");
-    const r = runHook({ hook, home: root, agentName: "probe", extraEnv: { RELAY_VERDICT_STREAM: "stderr" } });
+    const r = runHook({ hook, home: root, agentName: "fx-probe", extraEnv: { RELAY_VERDICT_STREAM: "stderr" } });
     expect((r.stdout.match(/VERDICT=/g) ?? []).length, "verdict was redirected off stdout").toBe(1);
     expect((r.stderr.match(/VERDICT=/g) ?? []).length).toBe(0);
   });
@@ -674,7 +674,7 @@ describe("v2.6.2 — cross-hook invariants", () => {
     // stdout is structured JSON must use stderr, so both streams are searched.
     const { root } = freshTestRoot();
     for (const hook of ALL_HOOKS) {
-      const r = runHook({ hook, home: root, agentName: "probe" });
+      const r = runHook({ hook, home: root, agentName: "fx-probe" });
       const combined = `${r.stdout}\n${r.stderr}`;
       const count = (combined.match(/\[RELAY\] VERDICT=/g) ?? []).length;
       expect(count, `hook ${path.basename(hook)} emitted ${count} verdicts (expected exactly 1)`).toBe(1);

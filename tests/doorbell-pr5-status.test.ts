@@ -233,7 +233,7 @@ describe("Q6: the hook's lines (pure renderer)", () => {
 describe("the SessionStart hook (the real check-relay.sh)", () => {
   function runHook(env: Record<string, string> = {}) {
     const r = spawnSync("bash", [HOOK], {
-      env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json"), ...env },
+      env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json"), ...env },
       encoding: "utf8",
       timeout: 20_000,
     });
@@ -274,7 +274,7 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
     const marker = "# --- Doorbell (ADR-0038 Q3/V2";
     expect(src.includes(marker)).toBe(true); // precondition: the block exists to starve
     fs.writeFileSync(hook, src.replace(marker, `SECONDS=9\n${marker}`));
-    const r = spawnSync("bash", [hook], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
+    const r = spawnSync("bash", [hook], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
     expect(r.stderr).toMatch(/no time budget left for the doorbell status/);
     expect(r.stdout).toMatch(/\[RELAY\] VERDICT=DEGRADED reason="[^"]*no time budget left for the doorbell status/);
     expect(r.stdout).not.toMatch(/\[RELAY\] doorbell:/); // skipped, not run
@@ -290,7 +290,7 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
     const src = fs.readFileSync(hook, "utf-8");
     expect(src.includes(marker)).toBe(true); // precondition
     fs.writeFileSync(hook, src.replace(marker, `${inject}\n${marker}`));
-    const r = spawnSync("bash", [hook], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
+    const r = spawnSync("bash", [hook], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
     return { stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
   }
   it("HARM (c927c81c D1): node missing AT the doorbell step → DEGRADED naming it (never a silent skip)", () => {
@@ -323,7 +323,7 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
         `const r = require("child_process").spawnSync(process.execPath, [${JSON.stringify(path.join(REPO, "bin", "relay"))}, ...process.argv.slice(2)], { stdio: "inherit" });\n` +
         `process.exit(r.status ?? 1);\n`,
     );
-    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
+    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
     expect(r.stdout).not.toContain("INJECTED");
     expect(r.stdout.split("\n").filter((l) => l.startsWith("[RELAY] doorbell stub line"))).toHaveLength(7);
   });
@@ -341,7 +341,7 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
         `process.exit(r.status ?? 1);\n`,
     );
     const t0 = Date.now();
-    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 40_000 });
+    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 40_000 });
     const elapsed = Date.now() - t0;
     expect(r.stdout).toContain("[RELAY] doorbell flood head"); // precondition: the step ran and read the output
     expect(r.stdout).toMatch(/\[RELAY\] VERDICT=/);
@@ -359,7 +359,7 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
     const copy = path.join(home, "nocli");
     fs.cpSync(path.join(REPO, "hooks"), path.join(copy, "hooks"), { recursive: true });
     fs.symlinkSync(path.join(REPO, "dist"), path.join(copy, "dist")); // the resolver is there; only bin/relay is missing
-    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
+    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
     expect(r.stdout).toMatch(/\[RELAY\] VERDICT=DEGRADED reason="[^"]*no relay CLI beside this hook/);
   });
 });

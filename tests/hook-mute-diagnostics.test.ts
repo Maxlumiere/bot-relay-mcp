@@ -67,7 +67,7 @@ function runHook(env: Record<string, string> = {}): string {
       // ADR-0036 S1: pin the daemon port to an unreachable one. Unpinned, the hook fell back
       // to 127.0.0.1:3777 — the LIVE daemon on a developer machine — and could register
       // "probe" there. These tests judge config diagnostics, never a live relay.
-      env: { ...inherited, HOME: home, RELAY_AGENT_NAME: "probe", RELAY_HTTP_PORT: "1", ...env },
+      env: { ...inherited, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_HTTP_PORT: "1", ...env },
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -84,7 +84,7 @@ function writeConfig(obj: unknown): void {
 const instanceDb = (): string => path.join(home, ".bot-relay", "instances", "work", "relay.db");
 
 /**
- * Make the instance DB a REAL relay DB with "probe" registered. The session-start
+ * Make the instance DB a REAL relay DB with "fx-probe" registered. The session-start
  * mail read (relay pending) runs on every hook run; on the default empty
  * placeholder file it is a concluded read failure (DEGRADED, "relay unreadable"),
  * which would mask the CONFIG verdict a test is judging. Tests of the config axis
@@ -95,7 +95,7 @@ function realInstanceDb(): void {
   execFileSync(process.execPath, ["--input-type=module", "-e", `
     process.env.RELAY_DB_PATH = ${JSON.stringify(instanceDb())};
     const db = await import(${JSON.stringify(dist)});
-    db.registerAgent("probe", "r", []);
+    db.registerAgent("fx-probe", "r", []);
     db.closeDb();`], { env: { PATH: process.env.PATH ?? "", HOME: home, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, stdio: "ignore" });
 }
 

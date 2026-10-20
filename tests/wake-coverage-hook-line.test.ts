@@ -55,7 +55,7 @@ function runHook(env: Record<string, string> = {}): RunResult {
     env: {
       ...process.env,
       HOME: home,
-      RELAY_AGENT_NAME: "probe",
+      RELAY_AGENT_NAME: "fx-probe",
       RELAY_DB_PATH: dbPath,
       RELAY_HTTP_PORT: "1", // privileged port → ECONNREFUSED instantly; no live-daemon dependency
       RELAY_WAKE_COVERAGE_STATUS_PATH: statusPath,

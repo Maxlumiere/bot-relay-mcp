@@ -111,13 +111,13 @@ describe("messaging tools", () => {
 
 describe("task tools", () => {
   it("full task lifecycle: post -> accept -> complete", () => {
-    handleRegisterAgent({ name: "boss", role: "r", capabilities: [] });
-    handleRegisterAgent({ name: "worker", role: "r", capabilities: [] });
+    handleRegisterAgent({ name: "fx-boss", role: "r", capabilities: [] });
+    handleRegisterAgent({ name: "fx-worker", role: "r", capabilities: [] });
 
     // Post
     const postResult = handlePostTask({
-      from: "boss",
-      to: "worker",
+      from: "fx-boss",
+      to: "fx-worker",
       title: "Build feature",
       description: "Build the login page",
       priority: "high",
@@ -128,7 +128,7 @@ describe("task tools", () => {
 
     // Get tasks
     const tasksResult = handleGetTasks({
-      agent_name: "worker",
+      agent_name: "fx-worker",
       role: "assigned",
       status: "posted",
       limit: 20,
@@ -139,7 +139,7 @@ describe("task tools", () => {
     // Accept
     const acceptResult = handleUpdateTask({
       task_id: taskId,
-      agent_name: "worker",
+      agent_name: "fx-worker",
       action: "accept",
     });
     const acceptData = parseResult(acceptResult);
@@ -149,7 +149,7 @@ describe("task tools", () => {
     // Complete
     const completeResult = handleUpdateTask({
       task_id: taskId,
-      agent_name: "worker",
+      agent_name: "fx-worker",
       action: "complete",
       result: "Login page built with tests",
     });
@@ -157,8 +157,8 @@ describe("task tools", () => {
     expect(completeData.success).toBe(true);
     expect(completeData.status).toBe("completed");
 
-    // Verify via get_task (caller must be a party — boss is the from_agent).
-    const getResult = withCaller("boss", () => handleGetTask({ task_id: taskId }));
+    // Verify via get_task (caller must be a party — fx-boss is the from_agent).
+    const getResult = withCaller("fx-boss", () => handleGetTask({ task_id: taskId }));
     const getData = parseResult(getResult);
     expect(getData.success).toBe(true);
     expect(getData.task.status).toBe("completed");
@@ -173,12 +173,12 @@ describe("task tools", () => {
   });
 
   it("update_task returns error for invalid transition", () => {
-    handleRegisterAgent({ name: "boss", role: "r", capabilities: [] });
-    handleRegisterAgent({ name: "worker", role: "r", capabilities: [] });
+    handleRegisterAgent({ name: "fx-boss", role: "r", capabilities: [] });
+    handleRegisterAgent({ name: "fx-worker", role: "r", capabilities: [] });
 
     const postResult = handlePostTask({
-      from: "boss",
-      to: "worker",
+      from: "fx-boss",
+      to: "fx-worker",
       title: "Task",
       description: "Desc",
       priority: "normal",
@@ -188,7 +188,7 @@ describe("task tools", () => {
     // Try to complete without accepting first
     const result = handleUpdateTask({
       task_id: taskId,
-      agent_name: "worker",
+      agent_name: "fx-worker",
       action: "complete",
     });
     const data = parseResult(result);

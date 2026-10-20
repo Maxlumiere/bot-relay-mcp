@@ -50,7 +50,7 @@ beforeAll(() => {
   getDb();
   // Register once (bcrypt hashing is the slow part) — unique names keep tests
   // independent without a per-test DB reset.
-  registerAgent("probe", "builder", ["a", "b"]);
+  registerAgent("fx-probe", "builder", ["a", "b"]);
   registerAgent("self", "builder", []);
   registerAgent("other", "builder", []);
 }, 30000); // 3× bcrypt in setup; the default 10s hook-timeout starves under full-suite CPU contention
@@ -70,7 +70,7 @@ function callWhoamiAs(name: string): Record<string, unknown> {
 
 describe("whoami — security boundary", () => {
   it("returns exactly the closed identity fields and NO secret-shaped key", () => {
-    const body = callWhoamiAs("probe");
+    const body = callWhoamiAs("fx-probe");
     expect(body.success).toBe(true);
     // exactly the allowed fields (+ success) — no extras that could carry a secret.
     expect(Object.keys(body).sort()).toEqual(["success", ...ALLOWED].sort());
@@ -79,7 +79,7 @@ describe("whoami — security boundary", () => {
       expect(k, `whoami leaked a secret-shaped field: ${k}`).not.toMatch(/token|secret|hash|password/i);
     }
     // the answer is about the caller, resolved server-side.
-    expect(body.agent_name).toBe("probe");
+    expect(body.agent_name).toBe("fx-probe");
     expect(body.role).toBe("builder");
     expect(body.capabilities).toEqual(["a", "b"]);
     expect(typeof body.db_path).toBe("string");
