@@ -22,7 +22,15 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."); /
 const RESOLVER_FILES = new Set(["src/config.ts", "src/instance.ts"]);
 
 /** Sites that name the variable or the file name for another purpose, each with WHY it is not a resolution. */
-const ALLOWLIST: Record<string, string> = {};
+const ALLOWLIST: Record<string, string> = {
+  // An ARCHIVE MEMBER name: the file inside a backup tarball, not where the relay's config lives.
+  'src/backup.ts::exportRelayState::file-name:"config.json"': "the backup archive's member name (staging dir + tar entry), not a resolution",
+  // Save / restore of the env AROUND one resolution (the value is put back unchanged; nothing is resolved from it).
+  "src/cli/doctor.ts::run::env-read:RELAY_CONFIG_PATH": "doctor pins the env to the ONE resolution it reports, then restores the original",
+  "src/cli/test.ts::run::env-read:RELAY_CONFIG_PATH": "relay test saves the operator's override to restore it after its sandbox run",
+  // `relay test`'s OWN sandbox: a config file in a fresh tmp dir, set as the explicit override for its child run.
+  'src/cli/test.ts::run::file-name:"config.json"': "relay test's own tmp sandbox config (set as RELAY_CONFIG_PATH), not the operator's",
+};
 
 describe("ONE config-path resolver (src/config.ts → src/instance.ts)", () => {
   const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");

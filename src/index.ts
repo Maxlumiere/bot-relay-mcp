@@ -8,7 +8,7 @@
 // source order): the snapshot of the installed dependencies this process runs on.
 // It imports only node: builtins; a test fails if any import precedes it.
 import "./deps-snapshot.js";
-import { loadConfig, validateConfigAndEnv, InvalidConfigError, readConfigFileKeys } from "./config.js";
+import { loadConfig, validateConfigAndEnv, InvalidConfigError, readConfigFileKeys, getConfigPath } from "./config.js";
 import { startStdioServer } from "./transport/stdio.js";
 import { startHttpServer } from "./transport/http.js";
 import { registerConfigSecret } from "./secret-registry.js";
@@ -71,11 +71,19 @@ async function main(): Promise<void> {
   // layer won for each knob. Helps diagnose "I set --port=3777 but it's
   // still on 3777 default, why?" confusion by making the resolution path
   // explicit. Written to stderr so stdio transport's stdout stays clean.
+  // The config file this process READ, from the one resolver (never "RELAY_CONFIG_PATH or the flat default": that
+  // named the wrong file under an active instance). It resolved for loadConfig above; a fault is reported, not thrown.
+  let configPathRead: string;
+  try {
+    configPathRead = getConfigPath();
+  } catch (err) {
+    configPathRead = `(unresolved: ${err instanceof Error ? err.message : String(err)})`;
+  }
   log.info(
     `[config] transport=${config.transport} (source: ${sources.transport}), ` +
       `http_port=${config.http_port} (source: ${sources.http_port}), ` +
       `http_host=${config.http_host} (source: ${sources.http_host}), ` +
-      `config_path=${process.env.RELAY_CONFIG_PATH ?? "(default ~/.bot-relay/config.json)"} ` +
+      `config_path=${configPathRead} ` +
       `(source: ${sources.config_path})`
   );
 
@@ -92,7 +100,7 @@ async function main(): Promise<void> {
   if (config.transport === "http" && sources.transport === "config") {
     process.stderr.write(
       `[bot-relay] WARNING: transport="http" was read from the config FILE ` +
-        `(${process.env.RELAY_CONFIG_PATH ?? "~/.bot-relay/config.json"}).\n` +
+        `(${configPathRead}).\n` +
         `  If this process was spawned as a stdio MCP server (e.g. from ~/.claude.json), it will NOT\n` +
         `  speak MCP on stdin/stdout — the client gets zero relay tools and times out after 30s.\n` +
         `  The daemon sets its transport via the RELAY_TRANSPORT environment variable, so this file\n` +

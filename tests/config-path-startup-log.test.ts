@@ -13,7 +13,7 @@ import { describe, it, expect } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,10 +47,31 @@ describe("the startup lines name the config file the relay READ (one resolver)",
 
   it("HARM the transport=\"http\" WARNING tells the operator to fix the INSTANCE config, the file it was read from", async () => {
     const { env, instCfg } = await instanceHome({ transport: "http", http_port: 0, http_host: "127.0.0.1" });
-    // The warning is written before the HTTP server starts; a short timeout ends the process after that.
-    const r = spawnSync(process.execPath, [INDEX], { env, input: "", encoding: "utf-8", timeout: 8_000, killSignal: "SIGTERM" });
-    const warning = r.stderr.split("\n").find((l) => l.includes('transport="http" was read from the config FILE')) ?? "";
-    expect(warning, `no warning: ${r.stderr.slice(-800)}`).not.toBe("");
+    // The warning is written before the HTTP server starts. The daemon is stopped AS SOON AS the line is seen (or at a
+    // 15 s ceiling, which then fails below), by its own recorded pid.
+    const child = spawn(process.execPath, [INDEX], { env, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    const needle = 'transport="http" was read from the config FILE';
+    await new Promise<void>((resolve) => {
+      const ceiling = setTimeout(resolve, 15_000);
+      child.stderr!.on("data", (d) => {
+        stderr += d;
+        if (stderr.includes(needle) && stderr.slice(stderr.indexOf(needle)).includes("\n")) {
+          clearTimeout(ceiling);
+          resolve();
+        }
+      });
+      child.once("exit", () => {
+        clearTimeout(ceiling);
+        resolve();
+      });
+    });
+    if (child.exitCode === null) {
+      child.kill("SIGTERM");
+      await new Promise((r) => child.once("exit", r));
+    }
+    const warning = stderr.split("\n").find((l) => l.includes(needle)) ?? "";
+    expect(warning, `no warning: ${stderr.slice(-800)}`).not.toBe("");
     expect(warning).toContain(`(${instCfg})`);
-  });
+  }, 30_000);
 });

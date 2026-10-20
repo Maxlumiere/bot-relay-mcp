@@ -43,7 +43,7 @@ export function configPathSites(program: ts.Program, rel: (f: string) => string,
     const builds = (n: ts.Node): boolean => {
       const p = n.parent;
       if (ts.isCallExpression(p) && p.arguments.includes(n as ts.Expression)) return true;
-      if (ts.isNewExpression(p) && (p.arguments ?? []).includes(n as ts.Expression)) return true;
+      if (ts.isNewExpression(p) && (p.arguments ?? ([] as readonly ts.Expression[])).includes(n as ts.Expression)) return true;
       if (ts.isVariableDeclaration(p) && p.initializer === n) return true;
       if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.PlusToken) return true;
       if (ts.isReturnStatement(p) || ts.isArrowFunction(p) || ts.isConditionalExpression(p) || ts.isParenthesizedExpression(p) || ts.isAsExpression(p)) return true;
