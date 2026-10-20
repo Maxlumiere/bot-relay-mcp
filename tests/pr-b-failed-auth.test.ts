@@ -1031,7 +1031,7 @@ async function runBar(
       ` | sentinel (dedicated idle worker, max gap, gates the ceiling) auth ${list(auth.map((r) => r.sentinelMax))} control ${list(control.map((r) => r.sentinelMax))} control' ${list(control2.map((r) => r.sentinelMax))}` +
       ` | load-worker max gap (report only) auth ${list(auth.map((r) => r.loadGapMax))}` +
       ` | eld (histogram, report only) auth ${list(auth.map((r) => r.eldHist))} control ${list(control.map((r) => r.eldHist))} control' ${list(control2.map((r) => r.eldHist))}` +
-      ` | main ticker (report only) gaps per window max ${Math.max(...[...auth, ...control, ...control2].map((r) => r.mainGapCount))}, own busy ms auth ${list(auth.map((r) => r.tickerBusy))} control ${list(control.map((r) => r.tickerBusy))}` +
+      ` | main ticker (report only) gaps per window max ${Math.max(...[...auth, ...control, ...control2].map((r) => r.mainGapCount))}, own busy ms per window auth ${list(auth.map((r) => r.tickerBusy))} control ${list(control.map((r) => r.tickerBusy))}` +
       ` | main-thread GC max pause (report only) auth ${list(auth.map((r) => r.gcMax))} control ${list(control.map((r) => r.gcMax))} control' ${list(control2.map((r) => r.gcMax))}`,
   );
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
@@ -1250,6 +1250,15 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     const quiet = openLoopWindow(noGaps);
     quiet.close();
     expect((await quiet.read()).max, "no gap at or over the floor reads as the floor").toBe(MAIN_GAP_FLOOR_MS);
+  }, 20_000);
+  it("READ SETTLES (8): a block, then close() SYNCHRONOUSLY, then read() at once (this thread never yielded, so the tick that ends the stall has not run yet): read() itself waits for it, and the whole gap and its ceiling breach are read", async () => {
+    await armInstruments();
+    const w = openLoopWindow(mainTicker!);
+    loopBlock(CEILING_MS + 20)();
+    w.close(); // no yield between the block and close(), nor between close() and read()
+    const r = await w.read();
+    expect(r.max, "the whole stall is read: read() settled on the tick that ends it").toBeGreaterThanOrEqual(CEILING_MS + 20);
+    expect(r.breaches.length, "and it is a located ceiling breach").toBe(1);
   }, 20_000);
   it("RING EVICTION IS A FAULT (main ticker): a tiny ring, one large gap, then small gaps past the keep → the window is an INSTRUMENT FAULT, never the filler's max; the twin with room reads the large gap", async () => {
     const burst = async (t: Ticker) => {
