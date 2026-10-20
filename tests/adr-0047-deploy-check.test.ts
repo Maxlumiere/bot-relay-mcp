@@ -64,7 +64,7 @@ function snap(over: Partial<FleetSnapshot> = {}): FleetSnapshot {
     listeners: [99],
     rows: [row(11, 2)],
     unknownRows: [],
-    bindings: [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
+    bindings: [{ agent_name: "fx-arch", window_pid: 10, window_pid_start: START(1) }],
     daemon: { port: 3777, listenerPids: [99], health: { ok: true, build: build() }, mint: "secret" },
     installed: () => installed(),
     nodeOnPath: "v22.0.0",
@@ -335,7 +335,7 @@ describe("Codex R2 N3: a malformed process row never vanishes into a PASS", () =
     const dbReads = {
       connectorRows: () => ({ live: [row(11, 2)], unknown: [] }),
       liveRows: () => [row(11, 2)], // the pre-R1 name, so the same test runs on the old code
-      liveBindings: () => [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
+      liveBindings: () => [{ agent_name: "fx-arch", window_pid: 10, window_pid_start: START(1) }],
     };
     return () => V.observeFleet(sys as never, dbReads as never, 3777);
   };
