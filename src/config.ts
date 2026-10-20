@@ -117,6 +117,11 @@ export function getConfigPath(): string {
   return resolveInstanceConfigPath();
 }
 
+/** The operator's explicit config path (RELAY_CONFIG_PATH), or undefined: "is the config path pinned?" without resolving it. */
+export function configPathOverride(): string | undefined {
+  return process.env.RELAY_CONFIG_PATH || undefined;
+}
+
 export class InvalidConfigError extends Error {
   constructor(message: string) {
     super(message);

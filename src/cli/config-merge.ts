@@ -24,6 +24,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
+import { flatConfigPath, configPathForInstance } from "../instance.js"; // the relay config layout: one place
 
 /**
  * SHIPPING-DEFECT guard (2026-07-23): under a test harness, UNCONDITIONALLY
@@ -93,16 +94,33 @@ function canonicalize(p: string): string {
   }
 }
 
+/**
+ * The relay configs this guard protects: the account home's FLAT config AND every per-instance config under it (on
+ * an instance-mode machine the LIVE config is a per-instance one). Decided STRUCTURALLY, by pure path comparison
+ * through instance.ts's layout (flatConfigPath / configPathForInstance with the ACCOUNT home as the env): nothing of
+ * the operator's tree is read to work out what to protect (the operator tripwire would refuse those reads inside the
+ * harness, and an env-selected instance has no marker to find). Any valid instance id counts: active or not.
+ * THE RESIDUAL (named once, as the tripwire names it): the root is the account home's .bot-relay, the same root
+ * discoverOperator uses. An operator whose live relay lives under a custom RELAY_HOME is outside this guard.
+ */
+function isAccountRelayConfig(resolved: string, home: string): boolean {
+  const accountEnv = { HOME: home, USERPROFILE: home }; // no RELAY_HOME: the account home's own .bot-relay
+  if (canonicalize(flatConfigPath(accountEnv)) === resolved) return true;
+  let instanceConfig: string;
+  try {
+    instanceConfig = configPathForInstance(path.basename(path.dirname(resolved)), accountEnv);
+  } catch {
+    return false; // not an instance id: not an instance's config
+  }
+  return canonicalize(instanceConfig) === resolved;
+}
+
 export function assertNotRealUserConfigWrite(filePath: string): void {
   if (!process.env.VITEST && process.env.NODE_ENV !== "test") return;
   const resolved = canonicalize(filePath);
   const home = accountHome();
-  const guarded = [
-    path.join(home, ".claude.json"),
-    path.join(home, ".claude", "settings.json"),
-    path.join(home, ".bot-relay", "config.json"),
-  ];
-  if (guarded.some((real) => canonicalize(real) === resolved)) {
+  const guarded = [path.join(home, ".claude.json"), path.join(home, ".claude", "settings.json")];
+  if (guarded.some((real) => canonicalize(real) === resolved) || isAccountRelayConfig(resolved, home)) {
     throw new Error(
       `[config-guard] refusing to write the REAL user config ${resolved} from inside a test harness. ` +
         `This is the account's actual config (os.userInfo().homedir) — no environment variable makes ` +
