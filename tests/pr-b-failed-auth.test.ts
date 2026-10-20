@@ -317,19 +317,20 @@ const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, kee
  * across its kill() while the sentinel saw a 601.2 ms stop; locally, a stop delivered ~5 ms after kill() returned read
  * 0.0 ms across the call (3/3) and 602.4-602.6 ms on this loop; a synchronous stop read 600.8-602.7 either way.
  */
-const STOP_MEASURE_SRC = `(function stopAndMeasure(kill, floorMs, maxWaitMs) {
-  const before = performance.now();
+const STOP_MEASURE_SRC = `(function stopAndMeasure(kill, floorMs, maxWaitMs, clock) {
+  const read = clock || (() => performance.now());
+  const before = read();
   let last = before;
   let gap = 0;
   kill();
   for (;;) {
-    const now = performance.now();
+    const now = read();
     if (now - last > gap) gap = now - last;
     last = now;
     if (gap >= floorMs || now - before >= maxWaitMs) return gap;
   }
 })`;
-const stopAndMeasure = new Function(`return ${STOP_MEASURE_SRC}`)() as (kill: () => void, floorMs: number, maxWaitMs: number) => number;
+const stopAndMeasure = new Function(`return ${STOP_MEASURE_SRC}`)() as (kill: () => void, floorMs: number, maxWaitMs: number, clock?: () => number) => number;
 const absNow = () => performance.timeOrigin + performance.now();
 
 /** What LOOP reads for one window, from the MAIN ticker (8). */
@@ -764,7 +765,9 @@ const measure = measureWindow;
  *       FREEZE, FAIL. STATED NOT-CAUGHT: a daemon freeze of F ms overlapping sentinel gaps of G ms reads NOT_EVALUATED
  *       when F - G < 500 (e.g. a 510 ms freeze beside a routine 20 ms gap): the host's share is real, and a
  *       NOT_EVALUATED never passes (three in a row is a blocking FINAL NOT_EVALUATED). A main-thread-only stall
- *       (GC included) that pushes a reading past 500 ms IS an availability failure from a caller's view, so it FAILS.
+ *       (GC included) is charged like any breach: the idle sentinel does not stall with it, so it is wholly uncovered
+ *       and FAILs once it reaches 500 ms, unless a sentinel gap overlaps it enough to leave < 500 ms (the NOT-caught
+ *       case above).
  *       A reading with no sentinel is an INSTRUMENT FAULT, never a pass. MEASURED (flake f, Phase 0, 9 CI job logs):
  *       Phase 0's sentinel attributed 0 of the 20 unplanted runner stalls seen (max 156.1 ms). That sentinel was an
  *       event-loop-delay histogram, since replaced (8) because it is blind to a stall before its first tick in each
@@ -889,6 +892,30 @@ export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "hea
   return { verdict: "PASS", why: "" };
 }
 
+/**
+ * T-A's breach diagnostics, REPORT ONLY (review R1): one line for EVERY breached reading of EVERY arm (auth, control,
+ * control'), independent of which verdict the ceiling picks: a covered breach next to a FAIL, or a control-arm breach
+ * (the ceiling judges the auth arm only), still carries its round, its sizes and its process-wide counters.
+ */
+export function breachDiagnostics(label: string, b: Pick<BarStats, "auth" | "control" | "control2">): string[] {
+  const out: string[] = [];
+  for (const [arm, rs] of [["auth", b.auth], ["control", b.control], ["control'", b.control2]] as const) {
+    rs.forEach((r, i) => {
+      const located = r.breaches.filter((x) => x.to - x.from >= CEILING_MS);
+      for (const x of located) {
+        const ms = x.to - x.from;
+        const covered = Array.isArray(r.sentinelGaps) ? unionOverlapMs(x, r.sentinelGaps) : null;
+        const cov = covered === null ? "no sentinel stream" : `the sentinel covers ${covered.toFixed(1)} ms, uncovered ${(ms - covered).toFixed(1)} ms${covered === 0 ? " (no sentinel overlap)" : ""}`;
+        out.push(`BREACH ${label} | arm ${arm} round ${i + 1} | ${x.kind} ${ms.toFixed(1)} ms, ${cov} | ${fmtProc(r.proc)}`);
+      }
+      if (r.healthMax >= CEILING_MS && !located.some((x) => x.kind === "/health")) {
+        out.push(`BREACH ${label} | arm ${arm} round ${i + 1} | /health ${r.healthMax.toFixed(1)} ms with no sample interval to locate it | ${fmtProc(r.proc)}`);
+      }
+    });
+  }
+  return out;
+}
+
 /** One attempt's status under (4): a FAIL anywhere is final; otherwise any NOT_EVALUATED re-runs; otherwise EVALUATED. */
 export interface Outcome {
   status: "EVALUATED" | "NOT_EVALUATED" | "FAIL";
@@ -952,19 +979,25 @@ export function hostStallPlantFault(label: string, stallMs: number, stopMs: numb
   if (stopMs !== null && stopMs >= floor && stalled.sentinelMax >= floor) return null;
   return `FIXTURE_FAULT (${label}): the planted ${stallMs} ms whole-process stop did not land as planted (each of the next two must be >= ${floor} ms): the planting thread across its own SIGSTOP ${stopMs === null ? "never measured (the plant never fired)" : `${stopMs.toFixed(1)} ms`}; ${perThread(stalled)}. NOT a failure of the code: the fixture is broken, so this attempt is not re-run.`;
 }
+/** A planted block's own absolute interval (absNow at its start and end), or null when it never ran. */
+export type PlantSpan = { from: number; to: number } | null;
 /**
- * A daemon freeze: the block's own duration >= the plant - 50, with the sentinel QUIET ON THE FREEZE: the freeze's own
- * located loop-delay breach, charged under (6) exactly as the verdict charges it (its length - unionOverlapMs with the
- * sentinel's gaps), must stay >= the ceiling. Never the round's TOTAL of sentinel gaps: routine sentinel gaps of 20-160
- * ms that do not overlap the freeze would raise a FIXTURE_FAULT on a plant that landed (a new false red).
+ * A daemon freeze: the block's own duration >= the plant - 50, with the sentinel QUIET ON THE FREEZE. The freeze's breach
+ * is the loop-delay breach that CONTAINS the plant's own absolute interval (the main ticker's gap spans the block: its
+ * last tick before, its first tick after), never merely the longest breach in the round: an unrelated covered stall
+ * must not fault a plant that landed, and an unrelated uncovered one must not validate a plant that did not. It is
+ * charged under (6) exactly as the verdict charges it (its length - unionOverlapMs with the sentinel's gaps) and must
+ * stay >= the ceiling. Never the round's TOTAL of sentinel gaps: routine sentinel gaps of 20-160 ms that do not overlap
+ * the freeze would raise a FIXTURE_FAULT on a plant that landed (a new false red).
  */
-export function freezePlantFault(label: string, stallMs: number, blockMs: number | null, stalled: PlantReading): string | null {
+export function freezePlantFault(label: string, stallMs: number, plant: PlantSpan, stalled: PlantReading): string | null {
   const floor = stallMs - PLANT_TOLERANCE_MS;
-  const freeze = (stalled.breaches ?? []).filter((b) => b.kind === "loop-delay").sort((x, y) => y.to - y.from - (x.to - x.from))[0];
+  const blockMs = plant ? plant.to - plant.from : null;
+  const freeze = plant ? (stalled.breaches ?? []).find((b) => b.kind === "loop-delay" && b.from <= plant.from && b.to >= plant.to) : undefined;
   const covered = freeze ? unionOverlapMs(freeze, stalled.sentinelGaps ?? []) : null;
   const uncovered = freeze && covered !== null ? freeze.to - freeze.from - covered : null;
   if (blockMs !== null && blockMs >= floor && uncovered !== null && uncovered >= CEILING_MS) return null;
-  const where = freeze ? `its loop-delay breach ${(freeze.to - freeze.from).toFixed(1)} ms, the sentinel covering ${covered!.toFixed(1)} ms of it (uncovered ${uncovered!.toFixed(1)} ms; must be >= ${CEILING_MS})` : "no located loop-delay breach";
+  const where = freeze ? `its loop-delay breach ${(freeze.to - freeze.from).toFixed(1)} ms, the sentinel covering ${covered!.toFixed(1)} ms of it (uncovered ${uncovered!.toFixed(1)} ms; must be >= ${CEILING_MS})` : "no located loop-delay breach containing the plant";
   return `FIXTURE_FAULT (${label}): the planted ${stallMs} ms daemon freeze did not land as planted (the block must be >= ${floor} ms and the sentinel quiet on it): block ${blockMs === null ? "never ran" : `${blockMs.toFixed(1)} ms`}; ${where}; ${perThread(stalled)}. NOT a failure of the code: the fixture is broken, so this attempt is not re-run.`;
 }
 
@@ -1155,6 +1188,7 @@ async function runBar(
       ` | main ticker (report only) gaps per window max ${Math.max(...[...auth, ...control, ...control2].map((r) => r.mainGapCount))}, own busy ms per window auth ${list(auth.map((r) => r.tickerBusy))} control ${list(control.map((r) => r.tickerBusy))}` +
       ` | main-thread GC max pause (report only) auth ${list(auth.map((r) => r.gcMax))} control ${list(control.map((r) => r.gcMax))} control' ${list(control2.map((r) => r.gcMax))}`,
   );
+  for (const line of breachDiagnostics(label, { auth, control, control2 })) announce(line); // T-A, report only
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
 }
 
@@ -1325,13 +1359,29 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(once.final.status, "...and the live FAIL is REPORTED (the ATTEMPTS/SELF-TEST lines), not hidden").toBe("FAIL");
     expect([verdictOf("EVALUATED"), verdictOf("FAIL"), verdictOf("NOT_EVALUATED")], "the lines print the VERDICT, never the status EVALUATED").toEqual(["PASS", "FAIL", "NOT_EVALUATED"]);
   });
-  it("THE PLANT'S OWN MEASURE (STOP_MEASURE_SRC), pure: a stop INSIDE kill() (the synchronous case) is measured; a kill that stops nothing reads no stop, and the loop ends at its bound (the ASYNCHRONOUS case, a stop after kill() returns, needs a real SIGSTOP: the live bars and the probe log)", () => {
-    const sync = stopAndMeasure(() => loopBlock(120)(), 100, 300);
-    expect(sync, "a stop inside kill() is measured").toBeGreaterThanOrEqual(120);
-    const t0 = performance.now();
-    const none = stopAndMeasure(() => {}, 100, 300);
-    expect(none, "nothing stopped: no gap near the floor").toBeLessThan(100);
-    expect(performance.now() - t0, "and the wait is bounded").toBeLessThan(1_000);
+  it("THE PLANT'S OWN MEASURE (STOP_MEASURE_SRC), pure, on a SCRIPTED clock (no real time, no scheduler): a stop INSIDE kill(), a stop AFTER kill() returns, no stop (the bound ends it), and the floor and bound boundaries", () => {
+    /** A clock that returns the scripted readings in order (the last one repeats); `kill` may advance it. */
+    const scripted = (...t: number[]) => {
+      let i = 0;
+      const clock = () => t[Math.min(i++, t.length - 1)];
+      return { clock, reads: () => i };
+    };
+    // A stop INSIDE kill() (synchronous, as on macOS): the first read after kill() is 600 ms later.
+    const sync = scripted(0, 600, 600.1);
+    expect(stopAndMeasure(() => {}, 550, 2_000, sync.clock), "a stop inside kill()").toBe(600);
+    // A stop AFTER kill() returns (asynchronous, as on Linux CI): a few fast reads, then the 600 ms gap.
+    expect(stopAndMeasure(() => {}, 550, 2_000, scripted(0, 0.01, 0.02, 0.03, 600.03, 600.04).clock), "a stop after kill() returns").toBeCloseTo(600, 5);
+    // No stop: 1 ms per read until the bound; the largest gap is 1 ms (no stop), and the loop ends at the bound.
+    const steps = Array.from({ length: 3_002 }, (_, k) => k);
+    const none = scripted(...steps);
+    expect(stopAndMeasure(() => {}, 550, 3_000, none.clock), "no stop: the largest gap is 1 ms").toBe(1);
+    expect(none.reads(), "and it ended AT the bound: the read that is 3000 ms after the one before kill (read 3001)").toBe(3_001);
+    // The floor boundary: a gap of exactly the floor ends the wait at once; one just under it does not.
+    expect(stopAndMeasure(() => {}, 550, 2_000, scripted(0, 550, 551).clock), "exactly the floor").toBe(550);
+    // Just under the floor: one 549.9 ms gap, then 1 ms per read: it waits on to the bound and reports 549.9 (no stop seen).
+    const under = scripted(0, 549.9, ...Array.from({ length: 1_451 }, (_, k) => 550.9 + k));
+    expect(stopAndMeasure(() => {}, 550, 2_000, under.clock), "just under the floor: no stop, the largest gap reported").toBeCloseTo(549.9, 5);
+    expect(under.reads(), "the wait ended at the bound (2000 ms after the read before kill)").toBe(1_453);
   });
   it("PLANT VERIFICATION (ruling R2), pure: a host stall is verified by the planting thread's own time across SIGSTOP AND the sentinel's gap (both >= 550 ms); a freeze by its block (>= 550 ms) with the sentinel quiet ON the freeze (its own uncovered time under (6) >= 500 ms, never the round's total); else a named FIXTURE_FAULT with every thread's reading", () => {
     const at = (o: Partial<Reading> = {}) => ({ healthMax: 600, eldMax: 603, eldHist: 603, sentinelMax: 603.2, loadGapMax: 630.7, ...o });
@@ -1340,15 +1390,28 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(hostStallPlantFault("t", 600, 549.9, at()), "the planting thread stopped too briefly").toMatch(/^FIXTURE_FAULT \(t\): the planted 600 ms whole-process stop did not land as planted .*549\.9 ms; sentinel 603\.2 ms, load worker 630\.7 ms, main ticker 603\.0 ms, histogram 603\.0 ms, \/health 600\.0 ms\. NOT a failure of the code/);
     expect(hostStallPlantFault("t", 600, 602.4, at({ sentinelMax: 176.4 })), "the sentinel did not see the stop").toMatch(/^FIXTURE_FAULT/);
     expect(hostStallPlantFault("t", 600, null, at()), "the plant never fired").toMatch(/never measured \(the plant never fired\)/);
-    const fr = { from: 1000, to: 1600.5, kind: "loop-delay" as const }; // the freeze's own located breach
-    const fz = (gaps: Array<{ from: number; to: number }>) => at({ breaches: [fr], sentinelGaps: gaps, sentinelMax: gaps.reduce((m, g) => Math.max(m, g.to - g.from), 0) });
-    expect(freezePlantFault("t", 600, 600.1, fz([])), "a freeze with the sentinel quiet: landed").toBeNull();
-    expect(freezePlantFault("t", 600, 600.1, fz([{ from: 1500, to: 1600 }])), "100 ms overlap: 500.5 uncovered, still a FAIL").toBeNull();
-    expect(freezePlantFault("t", 600, 600.1, fz([{ from: 1400, to: 1600 }])), "200 ms overlap: it would read NE").toMatch(/^FIXTURE_FAULT .*the sentinel covering 200\.0 ms of it \(uncovered 400\.5 ms/);
-    expect(freezePlantFault("t", 600, 600.1, fz([{ from: 3000, to: 3120 }, { from: 900, to: 950 }])), "routine gaps (a round total of 170 ms) that do NOT overlap the freeze: no fault").toBeNull();
-    expect(freezePlantFault("t", 600, 600.1, at({ breaches: [] })), "no located breach").toMatch(/no located loop-delay breach/);
-    expect(freezePlantFault("t", 600, 549, fz([])), "a short block").toMatch(/^FIXTURE_FAULT .*block 549\.0 ms/);
+    const fr = { from: 1000, to: 1600.5, kind: "loop-delay" as const }; // the freeze's own located breach (the ticker's gap)
+    const plant = { from: 1000.4, to: 1600.5 }; // the planted block's own span: inside that gap
+    const fz = (gaps: Array<{ from: number; to: number }>, extra: Array<{ from: number; to: number; kind: "loop-delay" | "/health" }> = []) =>
+      at({ breaches: [...extra, fr], sentinelGaps: gaps, sentinelMax: gaps.reduce((m, g) => Math.max(m, g.to - g.from), 0) });
+    expect(freezePlantFault("t", 600, plant, fz([])), "a freeze with the sentinel quiet: landed").toBeNull();
+    expect(freezePlantFault("t", 600, plant, fz([{ from: 1500, to: 1600 }])), "100 ms overlap: 500.5 uncovered, still a FAIL").toBeNull();
+    expect(freezePlantFault("t", 600, plant, fz([{ from: 1400, to: 1600 }])), "200 ms overlap: it would read NE").toMatch(/^FIXTURE_FAULT .*the sentinel covering 200\.0 ms of it \(uncovered 400\.5 ms/);
+    expect(freezePlantFault("t", 600, plant, fz([{ from: 3000, to: 3120 }, { from: 900, to: 950 }])), "routine gaps (a round total of 170 ms) that do NOT overlap the freeze: no fault").toBeNull();
+    expect(freezePlantFault("t", 600, plant, at({ breaches: [] })), "no located breach").toMatch(/no located loop-delay breach containing the plant/);
+    expect(freezePlantFault("t", 600, { from: 1000.4, to: 1549.4 }, fz([])), "a short block").toMatch(/^FIXTURE_FAULT .*block 549\.0 ms/);
     expect(freezePlantFault("t", 600, null, fz([])), "a block that never ran").toMatch(/block never ran/);
+    // (review R1) THE PLANT'S breach, never the longest: unrelated breaches BEFORE and AFTER the plant.
+    const before = { from: 200, to: 900, kind: "loop-delay" as const }; // 700 ms, before the plant
+    const after = { from: 2000, to: 2900, kind: "loop-delay" as const }; // 900 ms, after the plant
+    expect(
+      freezePlantFault("t", 600, plant, fz([{ from: 2000, to: 2900 }], [before, after])),
+      "a valid quiet plant beside a separate COVERED 900 ms stall (the longest breach): no fault",
+    ).toBeNull();
+    expect(
+      freezePlantFault("t", 600, plant, fz([{ from: 1300, to: 1600 }], [before, after])),
+      "the plant's OWN breach covered 300 ms (it would read NE), beside UNCOVERED unrelated breaches: a fault",
+    ).toMatch(/^FIXTURE_FAULT .*its loop-delay breach 600\.5 ms, the sentinel covering 300\.0 ms/);
   });
   it("THE CEILING (6), PER BREACH: a breach is charged its UNCOVERED time (its length - its overlap with the union of the sentinel's gaps), FAIL iff that is >= 500 ms; a matching magnitude at another time, a touch, or an unlocatable breach is a FREEZE; no sentinel stream is an INSTRUMENT FAULT", () => {
     const gap = (from: number, ms: number) => ({ from, to: from + ms });
@@ -1370,6 +1433,23 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(v(rd({ healthMax: 600, breaches: [], sentinelGaps: [gap(1000, 600)] })), "a /health reading with no sample interval to locate it").toBe("FAIL");
     expect(ceilingVerdict("t", [rd({ eldMax: 602, breaches: [loop(1000, 602)], sentinelGaps: [gap(998, 606)] }), rd({ eldMax: 600, breaches: [loop(5000, 600)] })]).verdict, "one freeze among host stalls: FAIL wins").toBe("FAIL");
     expect(() => ceilingVerdict("t", [rd(), { ...rd(), sentinelGaps: undefined }]), "no sentinel stream").toThrow(/INSTRUMENT FAULT/);
+  });
+  it("T-A BREACH DIAGNOSTICS (review R1): EVERY breached reading of EVERY arm gets a line with its round and counters, whatever the verdict picks: a covered auth breach beside a FAIL, and a control-arm breach the ceiling never judges", () => {
+    const r = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, eldHist: 20, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
+    const p1: ProcCounters = { volCs: 1, invCs: 11, cpuMs: 111, wallMs: 700 };
+    const p2: ProcCounters = { volCs: 2, invCs: 22, cpuMs: 222, wallMs: 700 };
+    const p3: ProcCounters = { volCs: 3, invCs: 33, cpuMs: 333, wallMs: 700 };
+    const auth = [r({ eldMax: 600, breaches: [{ from: 1000, to: 1600, kind: "loop-delay" }], sentinelGaps: [{ from: 1000, to: 1600 }], proc: p1 }), r({ eldMax: 700, breaches: [{ from: 5000, to: 5700, kind: "loop-delay" }], proc: p2 })];
+    const control = [r({ healthMax: 560, breaches: [{ from: 9000, to: 9560, kind: "/health" }], proc: p3 })];
+    expect(ceilingVerdict("t", auth).verdict, "the verdict: the uncovered auth breach FAILs").toBe("FAIL");
+    expect(ceilingVerdict("t", auth).why, "the FAIL message lists only the freeze").not.toContain("voluntary cs 1,");
+    const lines = breachDiagnostics("t", { auth, control, control2: [] });
+    expect(lines).toEqual([
+      "BREACH t | arm auth round 1 | loop-delay 600.0 ms, the sentinel covers 600.0 ms, uncovered 0.0 ms | process-wide counters: voluntary cs 1, involuntary cs 11, CPU 111.0 ms of 700.0 ms wall",
+      "BREACH t | arm auth round 2 | loop-delay 700.0 ms, the sentinel covers 0.0 ms, uncovered 700.0 ms (no sentinel overlap) | process-wide counters: voluntary cs 2, involuntary cs 22, CPU 222.0 ms of 700.0 ms wall",
+      "BREACH t | arm control round 1 | /health 560.0 ms, the sentinel covers 0.0 ms, uncovered 560.0 ms (no sentinel overlap) | process-wide counters: voluntary cs 3, involuntary cs 33, CPU 333.0 ms of 700.0 ms wall",
+    ]);
+    expect(breachDiagnostics("t", { auth: [r()], control: [r()], control2: [r()] }), "no breach: no line").toEqual([]);
   });
   it("T-A (report only, verdict parked): a breach with NO sentinel overlap FAILS with the T-A wording and the window's PROCESS-WIDE counters; a covered breach carries the counters too; no verdict reads them", () => {
     const proc: ProcCounters = { volCs: 12, invCs: 340, cpuMs: 1234.5, wallMs: 700.2 };
@@ -1805,12 +1885,12 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       // R2: each planted block's own duration is recorded, and verified with the sentinel quiet, before its verdict.
-      const timedBlock = (into: Array<number | null>, at: number) => {
-        const t = performance.now();
+      const timedBlock = (into: PlantSpan[], at: number) => {
+        const from = absNow();
         loopBlock(STALL_MS)();
-        into[at] = performance.now() - t;
+        into[at] = { from, to: absNow() };
       };
-      const verified = (label: string, b: BarStats, blocks: Array<number | null>, rounds: number[]) => {
+      const verified = (label: string, b: BarStats, blocks: PlantSpan[], rounds: number[]) => {
         for (const k of rounds) {
           const fault = freezePlantFault(`${label}, auth round ${k + 1}`, STALL_MS, blocks[k] ?? null, b.auth[k]);
           if (fault) throw new Error(fault);
@@ -1820,7 +1900,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       let round = 0;
       const one = await gatedBar("ceiling RED: one auth round frozen", async () => {
         round = 0;
-        const blocks: Array<number | null> = [];
+        const blocks: PlantSpan[] = [];
         const b = await runBar(`ceiling RED: auth round ${STALL_ROUND + 1} frozen ${STALL_MS} ms`, port, authLoad(20, "discover_agents", {}), {
           onLoop: () => {
             if (round === STALL_ROUND) timedBlock(blocks, round);
@@ -1831,7 +1911,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       });
       const every = await gatedBar("ceiling RED: every auth round frozen", async () => {
         let k = 0;
-        const blocks: Array<number | null> = [];
+        const blocks: PlantSpan[] = [];
         const b = await runBar(`ceiling RED: every auth round frozen ${STALL_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: () => timedBlock(blocks, k++) });
         return verified("every auth round frozen", b, blocks, Array.from({ length: K }, (_, i) => i));
       });
@@ -1898,13 +1978,13 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       // The load worker busy 600 ms as the window opens; the daemon's loop blocked 600 ms from 700 ms: never overlapping.
-      let blockMs: number | null = null;
+      let plant: PlantSpan = null;
       const r = await heldWindow(port, { ...authLoad(20, "discover_agents", {}), workerStallMs: STALL_MS }, () => setTimeout(() => {
-        const t = performance.now();
+        const from = absNow();
         loopBlock(STALL_MS)();
-        blockMs = performance.now() - t;
+        plant = { from, to: absNow() };
       }, STALL_MS + 100), 2_000);
-      const fault = freezePlantFault("the counterexample, the daemon freeze", STALL_MS, blockMs, r);
+      const fault = freezePlantFault("the counterexample, the daemon freeze", STALL_MS, plant, r);
       if (fault) throw new Error(fault);
       const loops = r.breaches.filter((b) => b.kind === "loop-delay");
       expect(r.loadGapMax, "precondition: the LOAD worker did stall").toBeGreaterThanOrEqual(STALL_MS - PLANT_TOLERANCE_MS);
@@ -1918,13 +1998,13 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   it("CEILING, a busy load worker OVERLAPPING a daemon freeze, the idle sentinel quiet: FAIL", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      let blockMs: number | null = null;
+      let plant: PlantSpan = null;
       const r = await heldWindow(port, { ...authLoad(20, "discover_agents", {}), workerStallMs: STALL_MS + 50 }, () => {
-        const t = performance.now();
+        const from = absNow();
         loopBlock(STALL_MS)();
-        blockMs = performance.now() - t;
+        plant = { from, to: absNow() };
       }, 1_500);
-      const fault = freezePlantFault("busy load worker over a freeze", STALL_MS, blockMs, r);
+      const fault = freezePlantFault("busy load worker over a freeze", STALL_MS, plant, r);
       if (fault) throw new Error(fault);
       expect(r.loadGapMax, "precondition: the LOAD worker was busy through the freeze").toBeGreaterThanOrEqual(STALL_MS - PLANT_TOLERANCE_MS);
       expect(r.breaches.some((b) => b.kind === "loop-delay"), `precondition: the freeze is a located breach (${JSON.stringify(r.breaches)})`).toBe(true);
@@ -1962,13 +2042,13 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   it("CEILING, a missing sentinel stream is an INSTRUMENT FAULT, never a pass (the ceiling and the bar both refuse)", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      let blockMs: number | null = null;
+      let plant: PlantSpan = null;
       const r = await heldWindow(port, authLoad(20, "discover_agents", {}), () => {
-        const t = performance.now();
+        const from = absNow();
         loopBlock(STALL_MS)();
-        blockMs = performance.now() - t;
+        plant = { from, to: absNow() };
       }, 1_000);
-      const fault = freezePlantFault("missing sentinel stream, the freeze", STALL_MS, blockMs, r);
+      const fault = freezePlantFault("missing sentinel stream, the freeze", STALL_MS, plant, r);
       if (fault) throw new Error(fault);
       expect(ceilingVerdict("wired", [r]).verdict, "the same reading WITH its stream: a freeze").toBe("FAIL");
       const dropped = { ...r, sentinelGaps: undefined };
