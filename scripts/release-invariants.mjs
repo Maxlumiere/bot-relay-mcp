@@ -99,11 +99,18 @@ for (const inv of registry) {
     out(`  N/A       ${inv.id}: not enforced on ${platform}${inv.not_yet?.[platform] ? ` (${inv.not_yet[platform].reason}: ${inv.not_yet[platform].blocked_by})` : ""}`);
     continue;
   }
-  const verdicts = inv.tests.map((t) => [t.id, status.get(t.id) ?? "NOT RUN"]);
+  // This gate runs the INSTALLED-package suite only, so only those tests decide here. An in-process test is run by
+  // ci.yml against the source tree: it is listed, never judged (counted, it would read NOT RUN, so VIOLATED, forever).
+  // An active invariant with no installed test is WAIVED (the registry test requires its waiver), never HOLDS.
+  const judged = inv.tests.filter((t) => t.mode === "installed");
+  const inProcess = inv.tests.filter((t) => t.mode !== "installed");
+  const verdicts = judged.map((t) => [t.id, status.get(t.id) ?? "NOT RUN"]);
   const bad = verdicts.filter(([, s]) => s !== "passed");
   if (bad.length) violated++;
-  out(`  ${bad.length ? "VIOLATED" : "HOLDS   "}  ${inv.id}${inv.conditional_on ? ` (conditional on ${inv.conditional_on.join(", ")})` : ""}`);
+  const label = bad.length ? "VIOLATED" : judged.length ? "HOLDS   " : "WAIVED  ";
+  out(`  ${label}  ${inv.id}${inv.conditional_on ? ` (conditional on ${inv.conditional_on.join(", ")})` : ""}`);
   for (const [id, s] of bad) out(`              ${s.toUpperCase()}: ${id}`);
+  for (const t of inProcess) out(`              in-process (run by ci.yml, not judged here): ${t.id}`);
   for (const [osName, ny] of Object.entries(inv.not_yet ?? {})) out(`              not yet on ${osName}: ${ny.reason} [${ny.blocked_by}]`);
 }
 out();
