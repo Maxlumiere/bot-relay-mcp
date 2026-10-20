@@ -309,6 +309,27 @@ interface Ticker {
 /** How many >= 1 ms polls a judging snapshot waits for its ticker to tick past the window's end: an INSTRUMENT FAULT beyond. */
 const SETTLE_POLLS = 2_000;
 const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, keep: number) => Ticker;
+/**
+ * THE PLANT'S OWN MEASURE, ONE SOURCE for the main thread and the load worker (ruling R2, "confirm stimulated"): the
+ * largest gap between two consecutive clock reads of the planting thread, from just BEFORE its kill(SIGSTOP) until a
+ * gap >= floorMs is seen (or maxWaitMs passes). Not the time across the kill() call: a self-SIGSTOP of a multithreaded
+ * process may take effect AFTER kill() returns. MEASURED: on Linux CI (#338, Node 22) the load worker read 0.0 ms
+ * across its kill() while the sentinel saw a 601.2 ms stop; locally, a stop delivered ~5 ms after kill() returned read
+ * 0.0 ms across the call (3/3) and 602.4-602.6 ms on this loop; a synchronous stop read 600.8-602.7 either way.
+ */
+const STOP_MEASURE_SRC = `(function stopAndMeasure(kill, floorMs, maxWaitMs) {
+  const before = performance.now();
+  let last = before;
+  let gap = 0;
+  kill();
+  for (;;) {
+    const now = performance.now();
+    if (now - last > gap) gap = now - last;
+    last = now;
+    if (gap >= floorMs || now - before >= maxWaitMs) return gap;
+  }
+})`;
+const stopAndMeasure = new Function(`return ${STOP_MEASURE_SRC}`)() as (kill: () => void, floorMs: number, maxWaitMs: number) => number;
 const absNow = () => performance.timeOrigin + performance.now();
 
 /** What LOOP reads for one window, from the MAIN ticker (8). */
@@ -366,7 +387,8 @@ function openLoopWindow(ticker: Ticker): { from: number; close: () => void; read
 
 const LOAD_WORKER = `
 const { parentPort, workerData } = require("worker_threads");
-const { port, n, kind, tool, args, ceilingMs, workerStallMs, prepHostStallHelperPid } = workerData;
+const { port, n, kind, tool, args, ceilingMs, workerStallMs, prepHostStallHelperPid, prepStopFloorMs } = workerData;
+const stopAndMeasure = (${STOP_MEASURE_SRC});
 // A LIVE-RED knob only (#332 R2 P2b): stop the WHOLE process right after the FIRST /health request is issued, BEFORE
 // the window opens. The helper (a recorded pid > 1, armed by the test) resumes it; the request then spans the stop.
 let prepStall = prepHostStallHelperPid > 1;
@@ -392,9 +414,8 @@ const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
       if (prepStall) {
         prepStall = false;
         process.kill(prepHostStallHelperPid, "SIGUSR2");
-        const before = performance.now();
-        process.kill(process.pid, "SIGSTOP");
-        prepStopMs = performance.now() - before; // the plant's own length, as this thread saw it (verified by the test)
+        // The plant's own length, as this thread saw it (STOP_MEASURE_SRC; verified by the test).
+        prepStopMs = stopAndMeasure(() => process.kill(process.pid, "SIGSTOP"), prepStopFloorMs, prepStopFloorMs + 1000);
       }
       await req;
       const ms = performance.now() - t;
@@ -434,6 +455,8 @@ interface Load {
   workerStallMs?: number;
   /** A LIVE-RED knob only: the LOAD worker stops the whole process during PREPARATION; this armed helper resumes it. */
   prepHostStallHelperPid?: number;
+  /** With prepHostStallHelperPid: the gap the worker's own measure waits for (the plant - the tolerance). */
+  prepStopFloorMs?: number;
 }
 /**
  * The KNOWN-GOOD CONTROL (architect 10f7a172): the same N, the same transport and concurrency, admitted past
@@ -600,7 +623,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
     for (const e of list.getEntries()) gcs.push([e.startTime, e.duration]);
   });
   gcObs.observe({ entryTypes: ["gc"] });
-  const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args, ceilingMs: CEILING_MS, workerStallMs: load.workerStallMs ?? 0, prepHostStallHelperPid: load.prepHostStallHelperPid ?? 0 } });
+  const worker = new Worker(LOAD_WORKER, { eval: true, workerData: { port, n: load.kind === "idle" ? 0 : load.n, kind: load.kind, tool: load.tool, args: load.args, ceilingMs: CEILING_MS, workerStallMs: load.workerStallMs ?? 0, prepHostStallHelperPid: load.prepHostStallHelperPid ?? 0, prepStopFloorMs: load.prepStopFloorMs ?? 0 } });
   try {
     return await new Promise<Reading>((resolve, reject) => {
       let statuses: number[] = [];
@@ -1261,6 +1284,14 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(once.final.status, "...and the live FAIL is REPORTED (the ATTEMPTS/SELF-TEST lines), not hidden").toBe("FAIL");
     expect([verdictOf("EVALUATED"), verdictOf("FAIL"), verdictOf("NOT_EVALUATED")], "the lines print the VERDICT, never the status EVALUATED").toEqual(["PASS", "FAIL", "NOT_EVALUATED"]);
   });
+  it("THE PLANT'S OWN MEASURE (STOP_MEASURE_SRC), pure: a stop INSIDE kill() (the synchronous case) is measured; a kill that stops nothing reads no stop, and the loop ends at its bound (the ASYNCHRONOUS case, a stop after kill() returns, needs a real SIGSTOP: the live bars and the probe log)", () => {
+    const sync = stopAndMeasure(() => loopBlock(120)(), 100, 300);
+    expect(sync, "a stop inside kill() is measured").toBeGreaterThanOrEqual(120);
+    const t0 = performance.now();
+    const none = stopAndMeasure(() => {}, 100, 300);
+    expect(none, "nothing stopped: no gap near the floor").toBeLessThan(100);
+    expect(performance.now() - t0, "and the wait is bounded").toBeLessThan(1_000);
+  });
   it("PLANT VERIFICATION (ruling R2), pure: a host stall is verified by the planting thread's own time across SIGSTOP AND the sentinel's gap (both >= 550 ms); a freeze by its block (>= 550 ms) with the sentinel quiet (< 450 ms); else a named FIXTURE_FAULT with every thread's reading", () => {
     const at = (o: Partial<Reading> = {}) => ({ healthMax: 600, eldMax: 603, eldHist: 603, sentinelMax: 603.2, loadGapMax: 630.7, ...o });
     expect(hostStallPlantFault("t", 600, 602.4, at()), "CI attempt 1's plant: landed").toBeNull();
@@ -1672,9 +1703,8 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       fire: () => {
         fired = true;
         process.kill(childPid!, "SIGUSR2");
-        const before = performance.now();
-        process.kill(pid, "SIGSTOP");
-        stopMs = performance.now() - before; // the plant's own length, as the planting thread saw it (R2)
+        // The plant's own length, as the planting thread saw it (R2; STOP_MEASURE_SRC, never the time across kill()).
+        stopMs = stopAndMeasure(() => process.kill(pid, "SIGSTOP"), STALL_MS - PLANT_TOLERANCE_MS, STALL_MS + 1000);
       },
       fired: () => fired,
       stopMs: () => stopMs,
@@ -1837,7 +1867,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       const helper = await armHostStall();
       let r: Reading;
       try {
-        r = await measure(port, { ...authLoad(20, "discover_agents", {}), prepHostStallHelperPid: helper.pid });
+        r = await measure(port, { ...authLoad(20, "discover_agents", {}), prepHostStallHelperPid: helper.pid, prepStopFloorMs: STALL_MS - PLANT_TOLERANCE_MS });
       } finally {
         await helper.disarm();
       }
