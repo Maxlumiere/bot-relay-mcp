@@ -370,6 +370,7 @@ const { port, n, kind, tool, args, ceilingMs, workerStallMs, prepHostStallHelper
 // A LIVE-RED knob only (#332 R2 P2b): stop the WHOLE process right after the FIRST /health request is issued, BEFORE
 // the window opens. The helper (a recorded pid > 1, armed by the test) resumes it; the request then spans the stop.
 let prepStall = prepHostStallHelperPid > 1;
+let prepStopMs = null;
 const abs = () => performance.timeOrigin + performance.now();
 // The LOAD worker's own gaps: REPORTED ONLY. It is busy (the calls, its own GC), so its gaps never exempt a breach
 // (architect ruling on #332 R1 P1 #1): only the DEDICATED idle sentinel can.
@@ -391,7 +392,9 @@ const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
       if (prepStall) {
         prepStall = false;
         process.kill(prepHostStallHelperPid, "SIGUSR2");
+        const before = performance.now();
         process.kill(process.pid, "SIGSTOP");
+        prepStopMs = performance.now() - before; // the plant's own length, as this thread saw it (verified by the test)
       }
       await req;
       const ms = performance.now() - t;
@@ -418,7 +421,7 @@ const call = () => fetch("http://127.0.0.1:" + port + "/mcp", {
   await sampler;
   const loadGapMax = own.gaps(opened, abs()).reduce((m, g) => Math.max(m, g.to - g.from), 0);
   own.stop();
-  parentPort.postMessage({ healthMax, healthBreaches, loadGapMax });
+  parentPort.postMessage({ healthMax, healthBreaches, loadGapMax, prepStopMs });
 })();
 `;
 
@@ -482,6 +485,8 @@ interface Reading {
   gcMax: number;
   /** A POOL-LOADED control only: its pool work INSIDE the measured window (see measure). */
   pool?: PoolOccupancy;
+  /** The PREPARATION plant only: the load worker's own time across its SIGSTOP (the plant, verified by its test). */
+  prepStopMs?: number;
 }
 
 /**
@@ -601,7 +606,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
       let statuses: number[] = [];
       let t1 = 0;
       worker.on("error", reject);
-      worker.on("message", (m: { started?: true; loaded?: true; healthMax?: number; healthBreaches?: Gap[]; loadGapMax?: number; statuses?: number[] }) => {
+      worker.on("message", (m: { started?: true; loaded?: true; healthMax?: number; healthBreaches?: Gap[]; loadGapMax?: number; prepStopMs?: number | null; statuses?: number[] }) => {
         if (m.started) {
           t0 = performance.now();
           t0Abs = absNow();
@@ -655,6 +660,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
             gcMax,
           };
           if (poolWork) reading.pool = occupancy(spans, t0, t1);
+          if (typeof m.prepStopMs === "number") reading.prepStopMs = m.prepStopMs;
           resolve(reading);
         })().catch(reject);
       });
@@ -688,7 +694,10 @@ const measure = measureWindow;
  *       attempts in total, and the FIRST evaluated attempt decides (architect ruling e475d60d (0); the merge policy
  *       of 2026-10-06). Three NOT_EVALUATED attempts are a FINAL NOT_EVALUATED: the step goes red labelled
  *       NOT_EVALUATED, blocks the merge and is escalated as a runner or instrument problem. It is never called
- *       FAIL: no code defect was measured.
+ *       FAIL: no code defect was measured. The retry machinery's own SELF-TEST (the ceiling's host stall in attempt 1
+ *       only) asserts what that machinery did and REPORTS the deciding verdict: NOT CAUGHT there, by design, is a FAIL
+ *       of its live, unplanted re-run (the gate's own bars judge live readings). Every PLANTED stall is verified before
+ *       its verdict is asserted; one that did not land is a FIXTURE_FAULT (hostStallPlantFault, freezePlantFault).
  *   (5) NEGATIVE CONTROLS, sized from the RULED CONSTANTS and the SAME run's CONTROL arm, never from a pre-run
  *       measurement or the arm under test: a GROSS block of +200 ms in every auth burst must TRIP on EVERY run, a
  *       noisy one too (else RED: the instrument is blind); and on every EVALUATED run, the BOUNDARY PAIRS: a block of
@@ -839,6 +848,9 @@ export interface Attempts<T> {
  * (4) THE RE-RUN RULE, the one place it lives: only a NOT_EVALUATED attempt is re-run, up to MAX_ATTEMPTS in total;
  * the FIRST attempt that is not NOT_EVALUATED decides, so an evaluated FAIL is never re-run.
  */
+/** An attempt's VERDICT, in words: an evaluated attempt that held is a PASS (EVALUATED is its status, not its verdict). */
+export const verdictOf = (status: Outcome["status"]): "PASS" | "FAIL" | "NOT_EVALUATED" => (status === "EVALUATED" ? "PASS" : status);
+
 export async function untilEvaluated<T>(label: string, attempt: (n: number) => Promise<T>, outcome: (t: T) => Outcome): Promise<Attempts<T>> {
   const history: Outcome[] = [];
   for (let n = 1; ; n++) {
@@ -847,7 +859,7 @@ export async function untilEvaluated<T>(label: string, attempt: (n: number) => P
     history.push(o);
     if (o.status !== "NOT_EVALUATED" || n >= MAX_ATTEMPTS) {
       if (n > 1 || o.status === "NOT_EVALUATED") {
-        announce(`ATTEMPTS ${label} | ${history.map((h, i) => `#${i + 1} ${h.status}`).join(", ")} | decided by attempt ${n}: ${o.status}`);
+        announce(`ATTEMPTS ${label} | ${history.map((h, i) => `#${i + 1} ${verdictOf(h.status)}`).join(", ")} | decided by attempt ${n}: ${verdictOf(o.status)}`);
       }
       return { result, attempts: n, final: o, history };
     }
@@ -863,6 +875,54 @@ export function expectEvaluated(label: string, a: Attempts<unknown>): void {
   if (a.final.status !== "NOT_EVALUATED") return;
   const reasons = a.history.map((h, i) => `#${i + 1}: ${h.why.join("; ")}`).join(" | ");
   throw new Error(`NOT_EVALUATED, FINAL (${label}): ${a.attempts} attempts, none evaluated. A runner or instrument problem, NOT a code defect: this blocks the merge and is escalated. ${reasons}`);
+}
+
+/**
+ * ARM, CONFIRM ARMED, STIMULATE, CONFIRM STIMULATED (ruling on the #332 self-test, R2): a planted stall is VERIFIED
+ * before any verdict it was planted to produce is asserted. Tolerance: 50 ms, fixed (= the resolution). MEASURED:
+ * a planted 600 ms self-SIGSTOP read 600.9-603.3 ms on the main thread and on every worker (10/10, local macOS).
+ * A plant that did not land is a FIXTURE_FAULT: the test throws (the step fails, loudly), it is NEVER re-run
+ * (re-running a broken plant is best-of-N over the fixture), and it is never reported as a FAIL of the code
+ * (scripts/timing-bars-report.mjs reports it as its own class).
+ */
+export const PLANT_TOLERANCE_MS = EFFECT_MS;
+const perThread = (r: Pick<Reading, "sentinelMax" | "loadGapMax" | "eldMax" | "eldHist" | "healthMax">) =>
+  `sentinel ${r.sentinelMax.toFixed(1)} ms, load worker ${r.loadGapMax.toFixed(1)} ms, main ticker ${r.eldMax.toFixed(1)} ms, histogram ${r.eldHist.toFixed(1)} ms, /health ${r.healthMax.toFixed(1)} ms`;
+type PlantReading = Pick<Reading, "sentinelMax" | "loadGapMax" | "eldMax" | "eldHist" | "healthMax">;
+/** A whole-process host stall: the planting thread's own time across its SIGSTOP AND the sentinel's gap, both >= the plant - 50. */
+export function hostStallPlantFault(label: string, stallMs: number, stopMs: number | null, stalled: PlantReading): string | null {
+  const floor = stallMs - PLANT_TOLERANCE_MS;
+  if (stopMs !== null && stopMs >= floor && stalled.sentinelMax >= floor) return null;
+  return `FIXTURE_FAULT (${label}): the planted ${stallMs} ms whole-process stop did not land as planted (each of the next two must be >= ${floor} ms): the planting thread across its own SIGSTOP ${stopMs === null ? "never measured (the plant never fired)" : `${stopMs.toFixed(1)} ms`}; ${perThread(stalled)}. NOT a failure of the code: the fixture is broken, so this attempt is not re-run.`;
+}
+/**
+ * A daemon freeze: the block's own duration >= the plant - 50, with the sentinel QUIET: its largest gap shorter than
+ * (the plant - the slack CAP), so no sentinel gap could cover the freeze under (6) even at the largest slack.
+ */
+export function freezePlantFault(label: string, stallMs: number, blockMs: number | null, stalled: PlantReading): string | null {
+  const floor = stallMs - PLANT_TOLERANCE_MS;
+  const quiet = stallMs - COVER_SLACK_CAP_MS;
+  if (blockMs !== null && blockMs >= floor && stalled.sentinelMax < quiet) return null;
+  return `FIXTURE_FAULT (${label}): the planted ${stallMs} ms daemon freeze did not land as planted (the block must be >= ${floor} ms and the sentinel quiet, < ${quiet} ms): block ${blockMs === null ? "never ran" : `${blockMs.toFixed(1)} ms`}; ${perThread(stalled)}. NOT a failure of the code: the fixture is broken, so this attempt is not re-run.`;
+}
+
+/**
+ * THE RETRY SELF-TEST's assertion (ruling R1): what the retry machinery DID, never what a LIVE re-run read. Attempt 1
+ * (planted) is a covered NOT_EVALUATED; it was re-run; the decision is the FIRST evaluated attempt (every earlier one
+ * NOT_EVALUATED); nothing is kept from attempt 1 (the result is the deciding attempt's own bar). The deciding verdict
+ * is REPORTED, never asserted: an unplanted re-run is a live reading of this runner (a natural breach FAILs it, as the
+ * gate must). NOT CAUGHT HERE, by design: a FAIL of that live re-run; the gate's own bars judge live readings.
+ */
+export function expectRetrySelfTest(label: string, a: Attempts<BarStats>, bars: BarStats[]): void {
+  expect(a.history[0].status, `${label}: attempt 1 (planted): ${a.history[0].why.join("; ")}`).toBe("NOT_EVALUATED");
+  expect(a.history[0].why.join(" "), `${label}: attempt 1 is COVERED by the dedicated sentinel`).toMatch(/COVERED by the sentinel's own stall: a sentinel-covered breach, NOT_EVALUATED under the exemption rule/);
+  expect(a.attempts, `${label}: a NOT_EVALUATED attempt is re-run`).toBeGreaterThanOrEqual(2);
+  expect(a.history.slice(0, -1).map((h) => h.status), `${label}: every attempt before the deciding one was NOT_EVALUATED`).toEqual(Array(a.attempts - 1).fill("NOT_EVALUATED"));
+  expect(a.final, `${label}: the decision is the last attempt run`).toBe(a.history[a.attempts - 1]);
+  expect(bars.length, `${label}: one bar per attempt`).toBe(a.attempts);
+  expect(a.result, `${label}: the result is the DECIDING attempt's own bar`).toBe(bars[a.attempts - 1]);
+  expect(a.result, `${label}: nothing is kept from attempt 1`).not.toBe(bars[0]);
+  announce(`SELF-TEST ${label} | decided by attempt ${a.attempts}: ${verdictOf(a.final.status)} (unplanted; REPORTED, not asserted: a live reading of this runner)${a.final.why.length ? ` | ${a.final.why.join("; ")}` : ""}`);
 }
 
 /**
@@ -1157,10 +1217,12 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     };
     const ne1 = await scripted(["NOT_EVALUATED", "EVALUATED", "FAIL"]);
     expect([ne1.calls, ne1.final.status]).toEqual([2, "EVALUATED"]);
+    expect(ne1.result, "nothing is kept from attempt 1: the result is the deciding attempt's own").toBe(2);
     const fail1 = await scripted(["FAIL", "EVALUATED"]);
     expect([fail1.calls, fail1.final.status], "an evaluated FAIL is never re-run").toEqual([1, "FAIL"]);
     const neThenFail = await scripted(["NOT_EVALUATED", "FAIL", "EVALUATED"]);
     expect([neThenFail.calls, neThenFail.final.status], "the first EVALUATED attempt decides, a FAIL included").toEqual([2, "FAIL"]);
+    expect(neThenFail.result).toBe(2);
     const allNe = await scripted(["NOT_EVALUATED", "NOT_EVALUATED", "NOT_EVALUATED", "EVALUATED"]);
     expect([allNe.calls, allNe.final.status], "never a 4th attempt").toEqual([MAX_ATTEMPTS, "NOT_EVALUATED"]);
     expect(() => expectEvaluated("scripted", ne1)).not.toThrow();
@@ -1172,6 +1234,44 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       msg = (err as Error).message;
     }
     expect(msg, "a final NOT_EVALUATED is labelled as such: it never asserts a code failure").not.toMatch(/\bFAIL\b/);
+  });
+  it("THE RETRY SELF-TEST (ruling R1), REPLAYING CI run 38701178186 a1 (macOS): attempt 1 planted and covered, attempt 2 UNPLANTED with a natural uncovered /health breach. The old self-test asserted attempt 2's live verdict and went red; the new one asserts the retry machinery and REPORTS the FAIL", async () => {
+    const r = (o: Partial<Reading> = {}): Reading => ({ healthMax: 60, eldMax: 60, eldHist: 60, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
+    const controlHealth = [63.2, 150.8, 127.8, 73.8, 64.9, 58.5, 61.8, 37.4, 98.3]; // attempt 2's control arm, as logged: slack 114.9
+    const bar = (label: string, auth: Reading[]): BarStats => ({
+      label,
+      control: controlHealth.map((h) => r({ healthMax: h })),
+      control2: controlHealth.map((h) => r({ healthMax: h })),
+      auth,
+      compares: 0,
+      perRound: Array(K).fill(0),
+      health: { d: 8.4, noise: 10, verdict: "PASS" },
+      eld: { d: 13.5, noise: 10, verdict: "PASS" },
+      pooled: false,
+    });
+    // Attempt 1 (planted, round 5): the main loop and the sentinel both stopped ~603 ms, the same interval: covered.
+    const a1 = bar("attempt 1", Array.from({ length: K }, (_, i) => (i === 4 ? r({ eldMax: 606.1, breaches: [{ from: 10_000, to: 10_606.1, kind: "loop-delay" }], sentinelGaps: [{ from: 9_999, to: 10_602.2 }], sentinelMax: 603.2, loadGapMax: 630.7 }) : r())));
+    // Attempt 2 (UNPLANTED, round 4): /health 517.6 ms, the sentinel's own 176.4 ms gap inside it: uncovered.
+    const a2 = bar("attempt 2", Array.from({ length: K }, (_, i) => (i === 3 ? r({ healthMax: 517.6, breaches: [{ from: 20_000, to: 20_517.6, kind: "/health" }], sentinelGaps: [{ from: 20_200, to: 20_376.4 }], sentinelMax: 176.4, loadGapMax: 356.8 }) : r())));
+    const bars = [a1, a2];
+    const once = await untilEvaluated("replay 38701178186", async (n) => bars[n - 1], (b) => barOutcome(b));
+    expect(once.final.why.join(" "), "the replay reproduces CI's red verdict").toMatch(/round 4 \/health 517\.6 ms, covered by the sentinel for 176\.4 ms \(needs >= 402\.7: slack 114\.9\)/);
+    expect(() => expectGated(once), "THE OLD self-test (expectGated on the live re-run): red, as in CI").toThrow(/517\.6 ms/);
+    expect(() => expectRetrySelfTest("replay 38701178186", once, bars), "THE NEW self-test: what the retry machinery did").not.toThrow();
+    expect(once.final.status, "...and the live FAIL is REPORTED (the ATTEMPTS/SELF-TEST lines), not hidden").toBe("FAIL");
+    expect([verdictOf("EVALUATED"), verdictOf("FAIL"), verdictOf("NOT_EVALUATED")], "the lines print the VERDICT, never the status EVALUATED").toEqual(["PASS", "FAIL", "NOT_EVALUATED"]);
+  });
+  it("PLANT VERIFICATION (ruling R2), pure: a host stall is verified by the planting thread's own time across SIGSTOP AND the sentinel's gap (both >= 550 ms); a freeze by its block (>= 550 ms) with the sentinel quiet (< 450 ms); else a named FIXTURE_FAULT with every thread's reading", () => {
+    const at = (o: Partial<Reading> = {}) => ({ healthMax: 600, eldMax: 603, eldHist: 603, sentinelMax: 603.2, loadGapMax: 630.7, ...o });
+    expect(hostStallPlantFault("t", 600, 602.4, at()), "CI attempt 1's plant: landed").toBeNull();
+    expect(hostStallPlantFault("t", 600, 550, at({ sentinelMax: 550 })), "exactly at the tolerance").toBeNull();
+    expect(hostStallPlantFault("t", 600, 549.9, at()), "the planting thread stopped too briefly").toMatch(/^FIXTURE_FAULT \(t\): the planted 600 ms whole-process stop did not land as planted .*549\.9 ms; sentinel 603\.2 ms, load worker 630\.7 ms, main ticker 603\.0 ms, histogram 603\.0 ms, \/health 600\.0 ms\. NOT a failure of the code/);
+    expect(hostStallPlantFault("t", 600, 602.4, at({ sentinelMax: 176.4 })), "the sentinel did not see the stop").toMatch(/^FIXTURE_FAULT/);
+    expect(hostStallPlantFault("t", 600, null, at()), "the plant never fired").toMatch(/never measured \(the plant never fired\)/);
+    expect(freezePlantFault("t", 600, 600.1, at({ sentinelMax: 20 })), "a freeze with the sentinel quiet: landed").toBeNull();
+    expect(freezePlantFault("t", 600, 600.1, at({ sentinelMax: 450 })), "a sentinel gap that could cover it at the cap").toMatch(/^FIXTURE_FAULT .*sentinel quiet, < 450 ms/);
+    expect(freezePlantFault("t", 600, 549, at({ sentinelMax: 20 })), "a short block").toMatch(/^FIXTURE_FAULT .*block 549\.0 ms/);
+    expect(freezePlantFault("t", 600, null, at({ sentinelMax: 20 })), "a block that never ran").toMatch(/block never ran/);
   });
   it("THE CEILING (6), PER BREACH: a host stall only when the DEDICATED sentinel's own gap COVERS the breach (overlap >= length - 50 ms); a matching magnitude at another time, a touch, or an unlocatable breach is a FREEZE; no sentinel stream is an INSTRUMENT FAULT", () => {
     const gap = (from: number, ms: number) => ({ from, to: from + ms });
@@ -1542,7 +1642,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   // (SIGUSR2, a synchronous syscall) and stops ITSELF (SIGSTOP on its own pid, never a group); the child sends
   // SIGCONT after STALL_MS. RESIDUAL, stated: if the child died between the two signals, this process would stay
   // stopped until the CI job's own timeout.
-  const armHostStall = async (): Promise<{ pid: number; fire: () => void; fired: () => boolean; disarm: () => Promise<void> }> => {
+  const armHostStall = async (): Promise<{ pid: number; fire: () => void; fired: () => boolean; stopMs: () => number | null; disarm: () => Promise<void> }> => {
     const pid = process.pid;
     expect(pid).toBeGreaterThan(1);
     // The child resumes the stopped process in a `finally` on its timer, AND on every exit it can run code for (its
@@ -1566,14 +1666,18 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       child.once("exit", (code) => rej(new Error(`the stall helper exited early (${code})`)));
     });
     let fired = false;
+    let stopMs: number | null = null;
     return {
       pid: childPid!,
       fire: () => {
         fired = true;
         process.kill(childPid!, "SIGUSR2");
+        const before = performance.now();
         process.kill(pid, "SIGSTOP");
+        stopMs = performance.now() - before; // the plant's own length, as the planting thread saw it (R2)
       },
       fired: () => fired,
+      stopMs: () => stopMs,
       // A fired helper exits by itself after SIGCONT; an unfired one is ended by its RECORDED pid (SIGTERM: its own
       // handler exits, and its exit hook's SIGCONT to a running process is a no-op). Fired from the LOAD worker (the
       // preparation case), this thread never saw it: the helper has exited already, and ESRCH is not an error.
@@ -1593,16 +1697,37 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   it("CEILING, a freeze: one auth round's daemon loop blocked 600 ms with the sentinel quiet FAILS, final, never re-run; every round blocked FAILS too", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
+      // R2: each planted block's own duration is recorded, and verified with the sentinel quiet, before its verdict.
+      const timedBlock = (into: Array<number | null>, at: number) => {
+        const t = performance.now();
+        loopBlock(STALL_MS)();
+        into[at] = performance.now() - t;
+      };
+      const verified = (label: string, b: BarStats, blocks: Array<number | null>, rounds: number[]) => {
+        for (const k of rounds) {
+          const fault = freezePlantFault(`${label}, auth round ${k + 1}`, STALL_MS, blocks[k] ?? null, b.auth[k]);
+          if (fault) throw new Error(fault);
+        }
+        return b;
+      };
       let round = 0;
-      const one = await gatedBar("ceiling RED: one auth round frozen", () => {
+      const one = await gatedBar("ceiling RED: one auth round frozen", async () => {
         round = 0;
-        return runBar(`ceiling RED: auth round ${STALL_ROUND + 1} frozen ${STALL_MS} ms`, port, authLoad(20, "discover_agents", {}), {
+        const blocks: Array<number | null> = [];
+        const b = await runBar(`ceiling RED: auth round ${STALL_ROUND + 1} frozen ${STALL_MS} ms`, port, authLoad(20, "discover_agents", {}), {
           onLoop: () => {
-            if (round++ === STALL_ROUND) loopBlock(STALL_MS)();
+            if (round === STALL_ROUND) timedBlock(blocks, round);
+            round++;
           },
         });
+        return verified("one auth round frozen", b, blocks, [STALL_ROUND]);
       });
-      const every = await gatedBar("ceiling RED: every auth round frozen", () => runBar(`ceiling RED: every auth round frozen ${STALL_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(STALL_MS) }));
+      const every = await gatedBar("ceiling RED: every auth round frozen", async () => {
+        let k = 0;
+        const blocks: Array<number | null> = [];
+        const b = await runBar(`ceiling RED: every auth round frozen ${STALL_MS} ms`, port, authLoad(20, "discover_agents", {}), { onLoop: () => timedBlock(blocks, k++) });
+        return verified("every auth round frozen", b, blocks, Array.from({ length: K }, (_, i) => i));
+      });
       for (const [x, frozen] of [[one, 1], [every, K]] as const) {
         const c = ceilingVerdict(x.result.label, x.result.auth, barSlack(x.result));
         expect(c.verdict, `${x.result.label}: the planted freeze must read as a freeze (${c.why || "no breach"})`).toBe("FAIL");
@@ -1625,18 +1750,25 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
               if (round++ === STALL_ROUND && helper) helper.fire();
             },
           });
-          if (helper) expect(helper.fired(), `${label}: the planted stall fired`).toBe(true);
+          if (helper) {
+            // R2: CONFIRM STIMULATED. A plant that did not land throws a FIXTURE_FAULT: never re-run, never a code FAIL.
+            const fault = hostStallPlantFault(`${label}, auth round ${STALL_ROUND + 1}`, STALL_MS, helper.stopMs(), bar.auth[STALL_ROUND]);
+            if (fault) throw new Error(fault);
+          }
           return bar;
         } finally {
           await helper?.disarm();
         }
       };
+      // R1: the retry SELF-TEST asserts what the retry machinery did; the unplanted re-run's live verdict is REPORTED.
       let onceCalls = 0;
-      const once = await gatedBar("ceiling: a host stall in attempt 1 only", () => stalledAttempt(`ceiling: whole process stopped ${STALL_MS} ms (attempt 1 only)`, onceCalls++ === 0));
-      expect(once.history[0].status, once.history[0].why.join("; ")).toBe("NOT_EVALUATED");
-      expect(once.history[0].why.join(" "), "attempt 1 (a planted whole-process stop) is COVERED by the dedicated sentinel").toMatch(/COVERED by the sentinel's own stall: a sentinel-covered breach, NOT_EVALUATED under the exemption rule/);
-      expect(once.attempts, "a NOT_EVALUATED attempt is re-run").toBeGreaterThanOrEqual(2);
-      expectGated(once); // the first evaluated attempt decides (or, after 3 noisy ones, a FINAL NOT_EVALUATED, red as itself)
+      const onceBars: BarStats[] = [];
+      const once = await gatedBar("ceiling: a host stall in attempt 1 only", async () => {
+        const b = await stalledAttempt(`ceiling: whole process stopped ${STALL_MS} ms (attempt 1 only)`, onceCalls++ === 0);
+        onceBars.push(b);
+        return b;
+      });
+      expectRetrySelfTest("ceiling: a host stall in attempt 1 only", once, onceBars);
 
       const always = await gatedBar("ceiling: a host stall in every attempt", () => stalledAttempt(`ceiling: whole process stopped ${STALL_MS} ms (every attempt)`, true));
       expect(always.history.map((h) => h.status), always.history.map((h) => h.why.join("; ")).join(" | ")).toEqual(Array(MAX_ATTEMPTS).fill("NOT_EVALUATED"));
@@ -1659,7 +1791,14 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       // The load worker busy 600 ms as the window opens; the daemon's loop blocked 600 ms from 700 ms: never overlapping.
-      const r = await heldWindow(port, { ...authLoad(20, "discover_agents", {}), workerStallMs: STALL_MS }, () => setTimeout(loopBlock(STALL_MS), STALL_MS + 100), 2_000);
+      let blockMs: number | null = null;
+      const r = await heldWindow(port, { ...authLoad(20, "discover_agents", {}), workerStallMs: STALL_MS }, () => setTimeout(() => {
+        const t = performance.now();
+        loopBlock(STALL_MS)();
+        blockMs = performance.now() - t;
+      }, STALL_MS + 100), 2_000);
+      const fault = freezePlantFault("the counterexample, the daemon freeze", STALL_MS, blockMs, r);
+      if (fault) throw new Error(fault);
       const loops = r.breaches.filter((b) => b.kind === "loop-delay");
       expect(r.loadGapMax, "precondition: the LOAD worker did stall").toBeGreaterThanOrEqual(STALL_MS - HOST_STALL_SLACK_MS);
       expect(loops.length, `precondition: the daemon's freeze is a located breach (${JSON.stringify(r.breaches)})`).toBeGreaterThanOrEqual(1);
@@ -1672,7 +1811,14 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   it("CEILING, a busy load worker OVERLAPPING a daemon freeze, the idle sentinel quiet: FAIL", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      const r = await heldWindow(port, { ...authLoad(20, "discover_agents", {}), workerStallMs: STALL_MS + 50 }, loopBlock(STALL_MS), 1_500);
+      let blockMs: number | null = null;
+      const r = await heldWindow(port, { ...authLoad(20, "discover_agents", {}), workerStallMs: STALL_MS + 50 }, () => {
+        const t = performance.now();
+        loopBlock(STALL_MS)();
+        blockMs = performance.now() - t;
+      }, 1_500);
+      const fault = freezePlantFault("busy load worker over a freeze", STALL_MS, blockMs, r);
+      if (fault) throw new Error(fault);
       expect(r.loadGapMax, "precondition: the LOAD worker was busy through the freeze").toBeGreaterThanOrEqual(STALL_MS - HOST_STALL_SLACK_MS);
       expect(r.breaches.some((b) => b.kind === "loop-delay"), `precondition: the freeze is a located breach (${JSON.stringify(r.breaches)})`).toBe(true);
       expect(r.sentinelMax, "the dedicated sentinel stayed quiet").toBeLessThan(CEILING_MS - HOST_STALL_SLACK_MS);
@@ -1695,6 +1841,10 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       } finally {
         await helper.disarm();
       }
+      // R2: CONFIRM STIMULATED. The load worker's own time across its SIGSTOP, and the sentinel's gap (it is asked over
+      // the envelope of every included sample, so the plant's gap is in its stream): both >= the plant - 50.
+      const prepFault = hostStallPlantFault("a host stall during PREPARATION", STALL_MS, r.prepStopMs ?? null, r);
+      if (prepFault) throw new Error(prepFault);
       const pre = r.breaches.filter((b) => b.kind === "/health" && b.from < r.windowFrom);
       const covering = (r.sentinelGaps ?? []).filter((g) => g.to <= r.windowFrom && pre.some((b) => overlapMs(g, b) >= b.to - b.from - slack));
       const c = ceilingVerdict("preparation-period host stall", [r], slack);
@@ -1709,7 +1859,14 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   it("CEILING, a missing sentinel stream is an INSTRUMENT FAULT, never a pass (the ceiling and the bar both refuse)", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      const r = await heldWindow(port, authLoad(20, "discover_agents", {}), loopBlock(STALL_MS), 1_000);
+      let blockMs: number | null = null;
+      const r = await heldWindow(port, authLoad(20, "discover_agents", {}), () => {
+        const t = performance.now();
+        loopBlock(STALL_MS)();
+        blockMs = performance.now() - t;
+      }, 1_000);
+      const fault = freezePlantFault("missing sentinel stream, the freeze", STALL_MS, blockMs, r);
+      if (fault) throw new Error(fault);
       expect(ceilingVerdict("wired", [r]).verdict, "the same reading WITH its stream: a freeze").toBe("FAIL");
       const dropped = { ...r, sentinelGaps: undefined };
       expect(() => ceilingVerdict("unwired", [dropped])).toThrow(/INSTRUMENT FAULT/);
