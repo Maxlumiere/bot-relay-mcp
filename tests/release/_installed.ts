@@ -61,9 +61,9 @@ export function sandbox(label: string, opts: { defaultPaths?: boolean } = {}): S
   if (!opts.defaultPaths) fs.mkdirSync(relayHome, { recursive: true, mode: 0o700 });
   const dbPath = path.join(relayHome, "relay.db");
   const configPath = path.join(relayHome, "config.json");
-  // The FULL parent env (a user's daemon has theirs; a minimal one broke Windows' `whoami /user`, so the relay could
-  // not read its own SID and refused its secret, MEASURED in CI), minus every relay and test-runner variable, with
-  // every HOME spelling pointed at the sandbox. The operator tripwire still decorates each child it starts.
+  // The FULL parent env (a user's daemon has theirs), minus every relay and test-runner variable, with every HOME
+  // spelling pointed at the sandbox. (Windows' unreadable SID in CI was NOT the env: it persisted with the full env,
+  // and was the by-name whoami, SEC-22.) The operator tripwire still decorates each child it starts.
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !/^(RELAY_|VITEST|__VITEST)/i.test(k)) env[k] = v;
   Object.assign(env, { HOME: home, USERPROFILE: home });
@@ -183,13 +183,14 @@ export function dbQuery<T = Record<string, unknown>>(sb: Sandbox, sql: string, .
 }
 
 /**
- * Windows only, for a failure message: run the relay's own SID lookup (`whoami /user /fo csv /nh`, as
- * src/fs-perms.ts windowsUserSid does) from a node child started EXACTLY as the daemon is (this sandbox's env, through
- * the same wrapped spawn, so the same tripwire preload), and say what came back. "" elsewhere.
+ * Windows only, for a failure message: run the relay's own SID lookup (`whoami /user /fo csv /nh` by its absolute
+ * %SystemRoot%\System32 path, as src/fs-perms.ts windowsUserSid does through systemBinary since SEC-22) from a node
+ * child started EXACTLY as the daemon is (this sandbox's env, through the same wrapped spawn, so the same tripwire
+ * preload), and say what came back. "" elsewhere.
  */
 export function windowsSidProbe(sb: Sandbox): string {
   if (process.platform !== "win32") return "";
-  const code = "const r=require('child_process').spawnSync('whoami',['/user','/fo','csv','/nh'],{encoding:'utf-8',windowsHide:true});" +
+  const code = "const r=require('child_process').spawnSync(require('path').win32.join(process.env.SystemRoot||'','System32','whoami.exe'),['/user','/fo','csv','/nh'],{encoding:'utf-8',windowsHide:true});" +
     "process.stdout.write(JSON.stringify({status:r.status,signal:r.signal,error:r.error&&r.error.message,stdout:r.stdout,stderr:r.stderr,path:process.env.PATH||process.env.Path,keys:Object.keys(process.env).filter(k=>/^(path|systemroot|comspec|pathext)$/i.test(k))}))";
   const r = spawnSync(process.execPath, ["-e", code], { encoding: "utf-8", env: sb.env, timeout: 30_000 });
   return ` [windows SID probe from a daemon-like child: exit ${r.status}; ${(r.stdout || "").slice(0, 1200)}; stderr ${(r.stderr || "").slice(0, 400)}]`;

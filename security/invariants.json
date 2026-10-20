@@ -315,6 +315,45 @@
           "mode": "installed"
         }
       ]
+    },
+    {
+      "id": "SEC-22",
+      "statement": "Every security- or liveness-relevant subprocess runs by an ABSOLUTE trusted path, never one found through PATH. Windows: whoami, icacls, reg and powershell come from a validated %SystemRoot%; a missing or invalid SystemRoot is a named error that fails closed, never a PATH fallback. A new by-name subprocess in src/ fails CI unless it is allowlisted with its reason.",
+      "source": "#336 (d504c4d); this gate's first catch (windows-2022, 13 Oct); Codex #336 R1, R2",
+      "os": [
+        "win32"
+      ],
+      "status": "active",
+      "tests": [
+        {
+          "id": "tests/release/sec-22.release.ts::SEC-22.T1 HARM Git Bash's PATH (GNU whoami first): the installed daemon still accepts its own registration secret",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-22.release.ts::SEC-22.T1 HARM a PLANTED whoami first on PATH, printing a forged SID: the installed daemon ignores it, accepts its own secret, and still refuses a wrong one",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/sec-22-system-binaries.test.ts::HARM a valid-looking SystemRoot whose exe is absent → a named 'not a regular file', never a PATH lookup",
+          "mode": "in-process"
+        },
+        {
+          "id": "tests/sec-22-system-binaries.test.ts::every child_process call in src/ goes through systemBinary(...) or process.execPath, or is ALLOWLISTED; no allowlist entry is stale",
+          "mode": "in-process"
+        }
+      ],
+      "not_yet": {
+        "darwin": {
+          "reason": "ps, lsof, sysctl, ioreg, launchctl and tar still run by name (each on the SEC-22 scan's allowlist, saying so)",
+          "owner": "the-fixer",
+          "blocked_by": "the SEC-22 POSIX follow-up"
+        },
+        "linux": {
+          "reason": "ps, lsof, sysctl, ioreg, launchctl and tar still run by name (each on the SEC-22 scan's allowlist, saying so)",
+          "owner": "the-fixer",
+          "blocked_by": "the SEC-22 POSIX follow-up"
+        }
+      }
     }
   ]
 }
