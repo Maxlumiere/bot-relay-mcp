@@ -133,18 +133,9 @@ describe.runIf(process.platform === "win32")("SEC-22 (Windows): the host id (Mac
  * either moved to systemBinary or listed here with its reason.
  */
 const ALLOWLIST: Record<string, string> = {
-  // SEC-22 POSIX FOLLOW-UP (named, not this change): the same class, by name today.
-  // A CLOSED set checked at run time (POSIX_BY_NAME = ps, ioreg, cat; any other command, or win32, is refused), so a
-  // Windows tool cannot hide under it (Codex #336 R1 P1: reg did, under the old function-wide entry).
-  "src/liveness.ts::runPosixByName::cmd": "ps / ioreg / cat (liveness, INV-LIVE-01), a closed set: SEC-22 POSIX follow-up (-> /bin/ps ...)",
-  "src/watch-wake.ts::awakeNowMs::c": "sysctl / ioreg (the awake clock): SEC-22 POSIX follow-up",
-  "src/deploy-gate.ts::cmd::bin": "launchctl / plutil (the deploy gate): SEC-22 POSIX follow-up",
-  "src/deploy-gate.ts::defaultGateDeps::\"lsof\"": "lsof (the deploy gate): SEC-22 POSIX follow-up",
-  "src/fleet-system.ts::lsofPids::\"lsof\"": "lsof (fleet view): SEC-22 POSIX follow-up",
-  "src/fleet-system.ts::<module>::\"lsof\"": "lsof (fleet view): SEC-22 POSIX follow-up",
-  "src/cli/init.ts::realDaemonDeps::\"launchctl\"": "launchctl (relay init, the user's own service): SEC-22 POSIX follow-up",
-  "src/cli/restart.ts::run::\"launchctl\"": "launchctl (relay restart, the user's own service): SEC-22 POSIX follow-up",
-  "src/backup.ts::runTar::\"tar\"": "tar (relay backup): SEC-22 POSIX follow-up",
+  // WINDOWS ONLY, TICKETED (not SEC-22 POSIX): `relay backup` keeps tar by name on Windows (System32 tar.exe vs Git
+  // Bash's GNU tar is its own change, with its own RED). POSIX tar goes through systemBinary.
+  "src/backup.ts::runTarByNameOnWindows::\"tar\"": "Windows tar by name: its own ticket (POSIX: spawnSystem)",
   // DELIBERATE: the user's own programs, found the way the user's shell finds them; not a security or liveness decision.
   "src/fleet-system.ts::<module>::\"node\"": "reports the user's own node on PATH (fleet view): deliberate",
   "src/spawn/dispatcher.ts::defaultHasBinary::probe": "a `command -v` probe: is the user's terminal app installed (asks PATH by design)",
