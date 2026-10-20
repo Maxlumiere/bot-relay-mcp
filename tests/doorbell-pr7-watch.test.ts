@@ -315,24 +315,26 @@ const SLOW_ENV = { PATH: `${SLOW_PS_DIR}:${process.env.PATH ?? ""}` };
 /**
  * INV-LIVE-01 R2: a FAST-failing seam for the bound tests. A `ps -o lstart= -p <the window's pid>` exits 1
  * with no output at once (no 2 s timeouts, so timing is deterministic) while the FLAG file exists, or
- * after AFTER such reads. Every other ps (other pids, the process table) is the real one.
+ * after AFTER such reads. Every other ps (other pids, the process table) is the real one. It COUNTS every
+ * read of the window (PS_COUNT) and, separately, every one it let through to the real ps (PS_COUNT.ok), so a
+ * test can show the seam really intercepted the watch: failed reads = all - ok.
  */
 const FAIL_PS_DIR = path.join(ROOT, "fail-ps");
 fs.mkdirSync(FAIL_PS_DIR, { recursive: true });
 fs.writeFileSync(
   path.join(FAIL_PS_DIR, "ps"),
-  `#!/bin/sh\ncase " $* " in\n  *" -p $PS_TARGET "*)\n    n=$(cat "$PS_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$PS_COUNT.$$" && mv -f "$PS_COUNT.$$" "$PS_COUNT"\n    if [ -e "$PS_FLAG" ] || [ "$n" -gt "$PS_AFTER" ]; then exit 1; fi ;;\nesac\nexec ${sq(REAL_PS)} "$@"\n`,
+  `#!/bin/sh\ncase " $* " in\n  *" -p $PS_TARGET "*)\n    n=$(cat "$PS_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$PS_COUNT.$$" && mv -f "$PS_COUNT.$$" "$PS_COUNT"\n    if [ -e "$PS_FLAG" ] || [ "$n" -gt "$PS_AFTER" ]; then exit 1; fi\n    k=$(cat "$PS_COUNT.ok" 2>/dev/null || echo 0); k=$((k+1)); echo "$k" > "$PS_COUNT.ok.$$" && mv -f "$PS_COUNT.ok.$$" "$PS_COUNT.ok" ;;\nesac\nexec ${sq(REAL_PS)} "$@"\n`,
   { mode: 0o755 },
 );
 let failSeq = 0;
 /** A watch (bound 3 s of awake time, 1 s checks) whose reads of window `w`'s start fail while `flag` exists, or after `after` of them. */
-function failWatch(w: { pid: number }, o: { after?: number; flags?: string[]; env?: Record<string, string> } = {}): { args: string[]; env: Record<string, string>; flag: string; reads: () => number } {
+function failWatch(w: { pid: number }, o: { after?: number; flags?: string[]; env?: Record<string, string> } = {}): { args: string[]; env: Record<string, string>; flag: string; reads: () => number; okReads: () => number } {
   const n = ++failSeq;
   const flag = path.join(FAIL_PS_DIR, `flag-${n}`);
   const count = path.join(FAIL_PS_DIR, `count-${n}`);
   const env = { PS_TARGET: String(w.pid), PS_FLAG: flag, PS_COUNT: count, PS_AFTER: String(o.after ?? 1_000_000), ...(o.env ?? {}), PATH: `${FAIL_PS_DIR}:${process.env.PATH ?? ""}` };
   const args = ["w-bob", "--until-wake", ...(o.flags ?? ["--interval", "1", "--dormant-check-s", "1", "--anchor-unknown-bound-s", "3"])];
-  return { args, env, flag, reads: () => readCount(count) };
+  return { args, env, flag, reads: () => readCount(count), okReads: () => readCount(`${count}.ok`) };
 }
 /**
  * The fail-ps shim's count (flake g). The shim writes it to a temp file and RENAMES it into place, so a read never
@@ -840,6 +842,10 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const r = win.runRelayWatch(f.args, { env: f.env });
     await untilStatus("live");
     const pid = await r.pid();
+    // Flake (g) read 0 at the burst's end twice (CI). A SEAM THAT NEVER RAN reads 0 (no count file) just as a torn read
+    // once did, so it is told apart HERE, first: arming already read the window through the seam.
+    const armed = f.reads();
+    expect(armed, `precondition: the seam counted the watch's arming reads of its window (${r.err()})`).toBeGreaterThan(0);
     const t0 = Date.now();
     on(f.flag);
     try {
@@ -849,7 +855,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
         await new Promise((res) => setTimeout(res, 10));
       }
       expect(mineIn(winDir(win), pid), `no record within 2.5 s (reads so far: ${f.reads()})`).toEqual([]);
-      expect(f.reads()).toBeGreaterThan(20); // the burst really drove many failing checks
+      expect(f.reads() - armed, "the burst really drove many failing checks").toBeGreaterThan(20);
       expect(await until(() => mineIn(winDir(win), pid).length > 0, 15_000), r.err()).toBe(true);
       expect(Date.parse(String(mineIn(winDir(win), pid)[0].at)) - t0).toBeGreaterThanOrEqual(2_950);
     } finally {
@@ -873,12 +879,20 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const r = win.runRelayWatch(f.args, { env: f.env });
     await untilStatus("live");
     const pid = await r.pid();
+    // The INSTRUMENT is checked, not assumed (review R2 NEW-4): a seam that never intercepted the watch would leave an
+    // ordinary healthy watch, which passes every assertion below. So EACH outage must show failed reads of the window,
+    // and the gap between them a read let through (failed = all - ok).
+    const failed = () => f.reads() - f.okReads();
     try {
       for (let round = 0; round < 2; round++) {
+        const failedBefore = failed();
         on(f.flag);
         await new Promise((res) => setTimeout(res, 2_000));
         off(f.flag);
+        expect(failed() - failedBefore, `outage ${round + 1}: the watch's reads of its window failed (${r.err()})`).toBeGreaterThan(0);
+        const okBefore = f.okReads();
         await new Promise((res) => setTimeout(res, 3_000));
+        expect(f.okReads() - okBefore, `after outage ${round + 1}: a readable check (${r.err()})`).toBeGreaterThan(0);
       }
     } finally {
       off(f.flag);

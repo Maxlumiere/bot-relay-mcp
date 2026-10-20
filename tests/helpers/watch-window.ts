@@ -122,16 +122,38 @@ const realGroupAlive = (pgid: number): boolean => {
   }
 };
 
+/**
+ * `ps -A -o pid=,ppid=` text → pid → ppid. The PID is a SIGNAL TARGET (the escape sweep kills keys of this map), so it
+ * goes through the ONE parser (parsePid: digits, a safe integer, > 1); a row whose pid fails it is dropped. The PPID is
+ * ANCESTRY only, never signalled: 0 (the kernel) and 1 (init) are real parents and are kept, but it must still be all
+ * digits and a safe integer. null when no row parses (an unreadable table, never an empty sweep).
+ */
+export function parseProcessTable(stdout: string): Map<number, number> | null {
+  const t = new Map<number, number>();
+  for (const line of stdout.split("\n")) {
+    const f = line.trim().split(/\s+/);
+    if (f.length !== 2) continue;
+    const pid = parsePid(f[0]);
+    const ppid = /^\d+$/.test(f[1]) ? Number(f[1]) : NaN;
+    if (pid !== null && Number.isSafeInteger(ppid)) t.set(pid, ppid);
+  }
+  return t.size > 0 ? t : null;
+}
+
 /** pid → ppid for every process (one `ps`); null when the table cannot be read. */
 function processTable(): Map<number, number> | null {
   const r = spawnSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf-8", timeout: 2_000 });
   if (r.status !== 0 || !r.stdout) return null;
-  const t = new Map<number, number>();
-  for (const line of r.stdout.split("\n")) {
-    const f = line.trim().split(/\s+/);
-    if (f.length === 2 && /^\d+$/.test(f[0]) && /^\d+$/.test(f[1])) t.set(Number(f[0]), Number(f[1]));
-  }
-  return t.size > 0 ? t : null;
+  return parseProcessTable(r.stdout);
+}
+
+/**
+ * The supervisor's acknowledgement (`ready <window pid>`) → the window's pid, a SIGNAL TARGET (w.pid): the ONE parser
+ * (parsePid). null = not acknowledged yet (absent, the truncate-then-write instant, or not a pid > 1): keep waiting.
+ */
+export function parseReadyAck(text: string): number | null {
+  const m = /^ready (\S+)\s*$/.exec(text);
+  return m ? parsePid(m[1]) : null;
 }
 
 /** This process and every ancestor: NEVER selected by the sweep. */
@@ -222,8 +244,8 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
   if (!Number.isInteger(leaderPid) || (leaderPid as number) <= 1) throw new Error("openWindow: the supervisor did not start (no valid pid): nothing is signalled");
   let bashPid = 0;
   for (let i = 0; i < 400 && bashPid === 0; i++) {
-    const m = /^ready (\d+)\s*$/.exec(fs.existsSync(readyFile) ? fs.readFileSync(readyFile, "utf-8") : "");
-    if (m) bashPid = Number(m[1]);
+    const pid = parseReadyAck(fs.existsSync(readyFile) ? fs.readFileSync(readyFile, "utf-8") : ""); // ONE captured string
+    if (pid !== null) bashPid = pid;
     else sleepSync(10);
   }
   // Ownership proven, or nothing is exposed and nothing is signalled (we cannot prove the group is ours).
