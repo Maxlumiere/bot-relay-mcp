@@ -345,12 +345,12 @@
       "not_yet": {
         "darwin": {
           "reason": "ps, lsof, sysctl, ioreg, launchctl and tar still run by name (each on the SEC-22 scan's allowlist, saying so)",
-          "owner": "the-fixer",
+          "owner": "the subprocess-path work",
           "blocked_by": "the SEC-22 POSIX follow-up"
         },
         "linux": {
           "reason": "ps, lsof, sysctl, ioreg, launchctl and tar still run by name (each on the SEC-22 scan's allowlist, saying so)",
-          "owner": "the-fixer",
+          "owner": "the subprocess-path work",
           "blocked_by": "the SEC-22 POSIX follow-up"
         }
       }
