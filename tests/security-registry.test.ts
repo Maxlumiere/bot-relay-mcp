@@ -12,118 +12,103 @@
  *   - an active invariant with no test against the INSTALLED package carries a waiver { reason, ruling_id,
  *     revisit_when } (ruled 13 Oct), and the gate prints every waiver on every run;
  *   - a PENDING invariant names its reason, owner and what blocks it;
- *   - the KNOWN-BAD control (security/known-bad.json) pins an integrity, and each must_fail tag names HARM tests that
- *     exist.
+ *   - the KNOWN-BAD control (security/known-bad.json) pins an integrity, and each must_fail entry is the exact title
+ *     of ONE registry HARM test.
+ * The rules live in ONE module (scripts/release-registry.mjs), which the gate runner also runs as its mandatory first
+ * step, so the two cannot drift. Here: each check on the real registry, and a fixture per rule that must be CAUGHT.
  * (Whether every security RULING names an invariant is a fleet-governance check, run outside this public repo.)
  */
 import { describe, it, expect, beforeAll } from "vitest";
-import fs from "fs";
 import path from "path";
-import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { CHECKS, collectPools, loadRegistry, validateRegistry } from "../scripts/release-registry.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."); // never URL.pathname: it keeps %20
-const OSES = ["darwin", "linux", "win32"];
 
-interface TestRef {
-  id: string;
-  mode: "installed" | "in-process";
-}
-interface Invariant {
-  id: string;
-  statement: string;
-  source: string;
-  os: string[];
-  status: "active" | "pending";
-  tests: TestRef[];
-  pending?: { reason: string; owner: string; blocked_by: string };
-  waiver?: { reason: string; ruling_id: string; revisit_when: string };
-  not_yet?: Record<string, { reason: string; owner: string; blocked_by: string }>;
-  conditional_on?: string[];
-}
-const registry = (JSON.parse(fs.readFileSync(path.join(REPO, "security", "invariants.json"), "utf-8")) as { invariants: Invariant[] }).invariants;
-const knownBad = JSON.parse(fs.readFileSync(path.join(REPO, "security", "known-bad.json"), "utf-8")) as { integrity: string; must_fail: string[]; version: string };
-
-/** "<repo-relative file>::<test title>" for every test vitest collects under `config` (list only: nothing runs). */
-function listTests(config: string, files: string[] = []): Set<string> {
-  const r = spawnSync(process.execPath, [path.join(REPO, "node_modules", "vitest", "vitest.mjs"), "list", "--json", "--config", path.join(REPO, config), ...files], {
-    cwd: REPO,
-    encoding: "utf-8",
-    env: { ...process.env, RELAY_RELEASE_LIST_ONLY: "1" },
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  if (r.status !== 0) throw new Error(`vitest list (${config}) failed: ${r.stderr.slice(-1500)}`);
-  const out = new Set<string>();
-  for (const t of JSON.parse(r.stdout) as Array<{ name: string; file: string }>) {
-    const title = t.name.split(" > ").at(-1)!;
-    out.add(`${path.relative(REPO, t.file).split(path.sep).join("/")}::${title}`);
-  }
-  return out;
-}
-
-let releaseTests: Set<string>;
-let inProcessTests: Set<string>;
+type Pools = { releaseTests: Set<string>; inProcessTests: Set<string> };
+type Fault = { check: string; msg: string };
+const { invariants, knownBad } = loadRegistry(REPO);
+let pools: Pools;
 beforeAll(() => {
-  releaseTests = listTests("vitest.release.config.ts");
-  const inProcFiles = [...new Set(registry.flatMap((i) => i.tests.filter((t) => t.mode === "in-process").map((t) => t.id.split("::")[0]!)))];
-  inProcessTests = inProcFiles.length ? listTests("vitest.config.ts", inProcFiles) : new Set();
+  pools = collectPools(REPO, invariants);
 }, 120_000);
 
-describe("the security invariant registry", () => {
-  it("ids are unique, and every entry has a statement, a source and a known OS list", () => {
-    const ids = registry.map((i) => i.id);
-    expect(new Set(ids).size).toBe(ids.length);
-    for (const i of registry) {
-      expect(i.statement.length, i.id).toBeGreaterThan(10);
-      expect(i.source.length, i.id).toBeGreaterThan(0);
-      expect(i.os.length, i.id).toBeGreaterThan(0);
-      for (const o of i.os) expect(OSES, `${i.id} os`).toContain(o);
-      expect(["active", "pending"], i.id).toContain(i.status);
-    }
-  });
+describe("the security invariant registry (the real one)", () => {
+  for (const check of CHECKS) {
+    it(`check ${check}: no fault`, () => {
+      const faults = (validateRegistry(invariants, knownBad, pools) as Fault[]).filter((f) => f.check === check).map((f) => f.msg);
+      expect(faults).toEqual([]);
+    });
+  }
+});
 
-  it("an ACTIVE invariant names at least one test, and each one RESOLVES to a collected test", () => {
-    const unresolved: string[] = [];
-    for (const i of registry.filter((x) => x.status === "active")) {
-      expect(i.tests.length, `${i.id} is active with no test`).toBeGreaterThan(0);
-      for (const t of i.tests) {
-        const pool = t.mode === "installed" ? releaseTests : inProcessTests;
-        if (!pool.has(t.id)) unresolved.push(`${i.id}: ${t.mode} ${t.id}`);
-      }
-    }
-    expect(unresolved, "registry test ids that no collected test matches").toEqual([]);
-  });
+describe("each registry rule CATCHES its violation (a fixture per rule, on a copy of the real registry)", () => {
+  const copy = () => JSON.parse(JSON.stringify(invariants)) as Array<Record<string, any>>;
+  const faultsOf = (inv: unknown, kb: unknown = knownBad) => (validateRegistry(inv, kb, pools) as Fault[]).map((f) => `${f.check}: ${f.msg}`);
+  const byId = (inv: Array<Record<string, any>>, id: string) => inv.find((i) => i.id === id)!;
 
-  it("every release test belongs to an invariant (no orphan the gate would never report)", () => {
-    const named = new Set(registry.flatMap((i) => i.tests.map((t) => t.id)));
-    expect([...releaseTests].filter((t) => !named.has(t))).toEqual([]);
-    expect(releaseTests.size, "the release suite collected tests at all").toBeGreaterThan(0);
+  it("TWIN the real registry, copied unchanged, has no fault", () => {
+    expect(faultsOf(copy())).toEqual([]);
   });
-
-  it("an active invariant with no INSTALLED-package test carries a complete waiver; every waiver is complete", () => {
-    for (const i of registry) {
-      if (i.status === "active" && !i.tests.some((t) => t.mode === "installed")) {
-        expect(i.waiver, `${i.id} has only in-process tests and no waiver`).toBeDefined();
-      }
-      if (i.waiver) for (const k of ["reason", "ruling_id", "revisit_when"] as const) expect(i.waiver[k], `${i.id} waiver.${k}`).toBeTruthy();
-    }
+  it("CAUGHT an unknown status (it never reads as pending)", () => {
+    const inv = copy();
+    byId(inv, "SEC-11").status = "activ";
+    expect(faultsOf(inv)).toContain('shape: SEC-11: unknown status "activ" (one of active, pending)');
   });
-
-  it("a PENDING invariant names its reason, owner and blocker (and a per-OS gap does too)", () => {
-    for (const i of registry) {
-      if (i.status === "pending") for (const k of ["reason", "owner", "blocked_by"] as const) expect(i.pending?.[k], `${i.id} pending.${k}`).toBeTruthy();
-      for (const [o, gap] of Object.entries(i.not_yet ?? {})) {
-        expect(OSES, `${i.id} not_yet`).toContain(o);
-        expect(i.os, `${i.id}: not_yet.${o} but os includes it`).not.toContain(o);
-        for (const k of ["reason", "owner", "blocked_by"] as const) expect(gap[k], `${i.id} not_yet.${o}.${k}`).toBeTruthy();
-      }
-      for (const c of i.conditional_on ?? []) expect(registry.map((x) => x.id), `${i.id} conditional_on`).toContain(c);
-    }
+  it("CAUGHT an unknown test mode", () => {
+    const inv = copy();
+    byId(inv, "SEC-11").tests[0].mode = "installd";
+    expect(faultsOf(inv).some((f) => f.startsWith('shape: SEC-11: unknown test mode "installd"'))).toBe(true);
   });
-
-  it("the known-bad control pins an INTEGRITY, and each must_fail tag names HARM tests in the registry", () => {
-    expect(knownBad.integrity).toMatch(/^sha512-[A-Za-z0-9+/]{86}==$/);
-    const ids = registry.flatMap((i) => i.tests.map((t) => t.id.split("::")[1]!));
-    for (const tag of knownBad.must_fail) expect(ids.filter((t) => t.startsWith(`${tag} HARM`)).length, `${tag} HARM tests`).toBeGreaterThan(0);
+  it("CAUGHT an active invariant whose LAST test was removed", () => {
+    const inv = copy();
+    byId(inv, "SEC-11").tests = [];
+    expect(faultsOf(inv)).toContain("active-coverage: SEC-11: active with no test");
+  });
+  it("CAUGHT a test id that resolves to no collected test", () => {
+    const inv = copy();
+    byId(inv, "SEC-11").tests[0].id += " (renamed)";
+    expect(faultsOf(inv).some((f) => f.startsWith("active-coverage: SEC-11: installed test"))).toBe(true);
+  });
+  it("CAUGHT a release test that belongs to no invariant (an orphan)", () => {
+    const inv = copy().filter((i) => i.id !== "SEC-11");
+    expect(faultsOf(inv).some((f) => f.startsWith("orphans: release test tests/release/sec-11.release.ts::"))).toBe(true);
+  });
+  it("CAUGHT an active invariant with only in-process tests and NO waiver (it would print WAIVED)", () => {
+    const inv = copy();
+    const s22 = byId(inv, "SEC-22");
+    s22.tests = s22.tests.filter((t: { mode: string }) => t.mode === "in-process");
+    const faults = faultsOf(inv).filter((f) => !f.startsWith("orphans:")); // SEC-22's installed tests are now orphans too
+    expect(faults).toContain("waivers: SEC-22: only in-process tests and no waiver");
+  });
+  it("CAUGHT a test title vitest cannot resolve statically, with the fix named (a template or an it.each title)", () => {
+    // Pure: a collected release title that kept its `${...}` (what `vitest list` printed for a loop, 20 Oct), and a
+    // registry id written with an it.each `%s`.
+    const tmpl = "tests/release/x.release.ts::SEC-20.T2 HARM ${v.what} does not bring a REVOKED agent back";
+    const fake = { releaseTests: new Set([...pools.releaseTests, tmpl]), inProcessTests: pools.inProcessTests };
+    const inv = copy();
+    byId(inv, "SEC-11").tests.push({ id: "tests/release/sec-11.release.ts::SEC-11.T2 %s", mode: "installed" });
+    const faults = (validateRegistry(inv, knownBad, fake) as Fault[]).map((f) => `${f.check}: ${f.msg}`);
+    const hint = "title not statically resolvable: use a literal title";
+    expect(faults.filter((f) => f.startsWith(`orphans: release test ${tmpl}: ${hint}`))).toHaveLength(1);
+    expect(faults.filter((f) => f.startsWith(`active-coverage: SEC-11: installed test tests/release/sec-11.release.ts::SEC-11.T2 %s: ${hint}`))).toHaveLength(1);
+  });
+  it("CAUGHT an incomplete waiver", () => {
+    const inv = copy();
+    byId(inv, "SEC-11").waiver = { reason: "r", ruling_id: "", revisit_when: "w" };
+    expect(faultsOf(inv)).toContain("waivers: SEC-11: waiver.ruling_id missing");
+  });
+  it("CAUGHT a pending invariant with no owner, and a not_yet gap on an os it claims", () => {
+    const inv = copy();
+    delete byId(inv, "SEC-03").pending.owner;
+    byId(inv, "SEC-22").os.push("linux");
+    const faults = faultsOf(inv);
+    expect(faults).toContain("pending: SEC-03: pending.owner missing");
+    expect(faults).toContain("pending: SEC-22: not_yet.linux, but os includes linux");
+  });
+  it("CAUGHT a known-bad control with no integrity, a must_fail entry that is no registry HARM test, or a TWIN", () => {
+    expect(faultsOf(copy(), { ...knownBad, integrity: "3.0.1" }).some((f) => f.startsWith("known-bad: the known-bad control pins no sha512 integrity"))).toBe(true);
+    expect(faultsOf(copy(), { ...knownBad, must_fail: [...knownBad.must_fail, "SEC-99.T1 HARM nothing"] })).toContain('known-bad: must_fail "SEC-99.T1 HARM nothing" names 0 registry tests (exactly 1 expected)');
+    expect(faultsOf(copy(), { ...knownBad, must_fail: ["SEC-20.T1 TWIN relay send --from an ACTIVE agent delivers"] })).toContain('known-bad: must_fail "SEC-20.T1 TWIN relay send --from an ACTIVE agent delivers" is not a HARM test title');
   });
 });

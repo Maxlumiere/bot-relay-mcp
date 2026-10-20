@@ -299,7 +299,47 @@
           "mode": "installed"
         },
         {
-          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM no mint, register or rotate verb brings a REVOKED agent back",
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM relay mint-token does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM relay mint-token --force does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM register_agent (the registration secret, no token) does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM register_agent (its old token) does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM rotate_token (its old token) does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 HARM rotate_token_admin (an admin) does not bring a REVOKED agent back",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN relay mint-token mints a NEW name (the verb works)",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN register_agent with the registration secret registers a NEW name (the verb works)",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN register_agent with its own token re-registers an ACTIVE agent",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN rotate_token with its own token rotates an ACTIVE agent",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-20.release.ts::SEC-20.T2 TWIN rotate_token_admin by an admin rotates an ACTIVE agent",
           "mode": "installed"
         },
         {

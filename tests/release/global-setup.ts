@@ -79,8 +79,22 @@ export default function setup(project: TestProject): () => void {
   if (inst.status !== 0) throw new Error(`release suite: npm install of ${tgz} failed (exit ${inst.status}): ${(inst.stderr || inst.stdout || "").slice(-1500)}`);
   const pkg = path.join(prefix, "node_modules", "bot-relay-mcp");
   const version = (JSON.parse(fs.readFileSync(path.join(pkg, "package.json"), "utf-8")) as { version: string }).version;
+  // The dependency inventory is MEASURED or the run stops: a failed, non-zero or malformed `npm ls` is never hashed
+  // (the hash of `{}` is not a dependency tree), and the inventory must hold the package just installed, at its version.
   const ls = spawnSync(npm, ["ls", "--json", "--all", "--prefix", prefix], { encoding: "utf-8", env: npmEnv, maxBuffer: 64 * 1024 * 1024, shell: process.platform === "win32" });
-  const depsDigest = sha("sha256", JSON.stringify(canonical(JSON.parse(ls.stdout || "{}")))).toString("hex");
+  if (ls.error || ls.status !== 0) {
+    throw new Error(`release suite: npm ls --json --all failed (exit ${ls.status}${ls.error ? `; ${ls.error.message}` : ""}): the dependency inventory is not measured. ${(ls.stderr || "").slice(-1500)}`);
+  }
+  let inventory: { dependencies?: Record<string, { version?: string }> };
+  try {
+    inventory = JSON.parse(ls.stdout) as typeof inventory;
+  } catch (err) {
+    throw new Error(`release suite: npm ls printed no JSON inventory (${(err as Error).message}): ${(ls.stdout || "").slice(0, 500)}`);
+  }
+  if (inventory?.dependencies?.["bot-relay-mcp"]?.version !== version) {
+    throw new Error(`release suite: the npm ls inventory does not hold bot-relay-mcp@${version} (the package just installed): ${(ls.stdout || "").slice(0, 500)}`);
+  }
+  const depsDigest = sha("sha256", JSON.stringify(canonical(inventory))).toString("hex");
   // The stamp is READ, never imported: it is generated as `export const BUILD_INFO = Object.freeze(<json>);`, so its JSON
   // is parsed from the text (and a guard refuses a computed import specifier). Absent or another shape (a build that
   // predates the stamp, e.g. 3.0.1): null, reported as "unstamped".

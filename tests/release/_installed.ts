@@ -21,6 +21,17 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { ReleaseInstall } from "./global-setup.js";
 
+declare module "vitest" {
+  interface TaskMeta {
+    /**
+     * The OBSERVATION MARK: a HARM sets it only after its stimulus returned a well-formed response, immediately before
+     * its harm assertion (never in setup or a helper). The known-bad control counts a harm as SEEN only with it; a harm
+     * that fails without it is a fixture fault (scripts/release-invariants.mjs).
+     */
+    stimulus_returned?: boolean;
+  }
+}
+
 export function installed(): ReleaseInstall {
   const r = inject("release");
   if (!r) throw new Error("release suite: no installed package (collected in list-only mode, or the global setup did not run)");
