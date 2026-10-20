@@ -13,6 +13,7 @@
 import fs from "fs";
 import http from "http";
 import { spawnSync } from "child_process";
+import { spawnSystem } from "./system-binary.js";
 import { buildProcessTable } from "./liveness.js";
 import { readInstalled, type SystemDeps } from "./fleet-verdicts.js";
 
@@ -20,7 +21,7 @@ const CMD_TIMEOUT_MS = 10_000;
 
 /** lsof -t output → pids. lsof exits 1 with no output when nothing matches: a positive "none". */
 function lsofPids(args: string[]): number[] | { error: string } {
-  const r = spawnSync("lsof", args, { encoding: "utf-8", timeout: CMD_TIMEOUT_MS });
+  const r = spawnSystem("lsof", args, { encoding: "utf-8", timeout: CMD_TIMEOUT_MS }); // SEC-22: by its trusted path
   if (r.error) return { error: `lsof: ${r.error.message}` };
   if (r.status !== 0 && (r.stdout ?? "").trim() !== "") return { error: `lsof exited ${r.status}` };
   if (r.status !== 0 && r.status !== 1) return { error: `lsof exited ${r.status}` };
@@ -33,7 +34,7 @@ export const realSystemDeps: SystemDeps = {
     const out = new Map<number, string>();
     if (pids.length === 0) return out;
     // One lsof for all of them: `-a -d cwd -p a,b,c -Fpn` → "p<pid>" then "n<path>".
-    const r = spawnSync("lsof", ["-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"], { encoding: "utf-8", timeout: CMD_TIMEOUT_MS });
+    const r = spawnSystem("lsof", ["-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"], { encoding: "utf-8", timeout: CMD_TIMEOUT_MS }); // SEC-22
     let pid: number | null = null;
     for (const line of (r.stdout ?? "").split("\n")) {
       if (line.startsWith("p")) pid = Number(line.slice(1));
