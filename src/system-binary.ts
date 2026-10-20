@@ -73,5 +73,5 @@ export function systemBinary(
     st = undefined;
   }
   if (!st || !st.isFile()) throw new SystemBinaryError(`cannot locate the system ${name}: ${exe} is not a regular file`);
-  return exe;
+  return name === "whoami" ? "whoami" : exe; // RED-PROOF MUTANT (#334 SEC-22): whoami by NAME again. Reverted by the next commit.
 }
