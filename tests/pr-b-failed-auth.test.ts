@@ -231,9 +231,20 @@ interface Gap {
   from: number;
   to: number;
 }
-/** Gaps shorter than this are never recorded: only a ceiling-sized stall is ever compared. */
+/** The SENTINEL's floor: gaps shorter than this are never recorded; the sentinel only judges ceiling-sized stalls. */
 const GAP_FLOOR_MS = 20;
 const GAP_KEEP = 4096;
+/**
+ * The MAIN ticker's floor (LOOP reads it): LOOP compares sizes around 5-150 ms, so it records every gap of >= 2 ms. A
+ * window with no gap at or over the floor reads as the floor (2 ms).
+ */
+const MAIN_GAP_FLOOR_MS = 2;
+/**
+ * The MAIN ring's size. The gaps are disjoint and each >= MAIN_GAP_FLOOR_MS, so a span of S ms holds at most
+ * S / floor + 1 of them: 65536 holds every gap of any span up to ~131 s, far past any window here (plus its settle).
+ * It still FAULTS on overflow (TICKER_SRC's fault): an eviction is never a smaller max.
+ */
+const MAIN_GAP_KEEP = 65_536;
 /**
  * THE TICKER PRIMITIVE, ONE SOURCE for every thread (the main thread, the dedicated sentinel worker, the load worker):
  * a 1 ms wall-clock ticker, running from its creation and NEVER reset, that records each gap of >= GAP_FLOOR_MS between
@@ -246,14 +257,25 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
   const gaps = [];
   let last = performance.timeOrigin + performance.now();
   let ticks = 0;
+  // RING EVICTION IS A FAULT (ruling on the LOOP ticket): every eviction is counted, and the latest end of an evicted
+  // gap is kept, so a snapshot that an evicted gap may overlap is refused (fault), never read as a smaller max.
+  let evictions = 0;
+  let evictedTo = -Infinity;
+  // The ticker's OWN cost on its thread (ms spent inside its callback), REPORTED ONLY.
+  let busy = 0;
   const timer = setInterval(() => {
     const now = performance.timeOrigin + performance.now();
     if (now - last >= floor) {
       gaps.push({ from: last, to: now });
-      if (gaps.length > keep) gaps.shift();
+      if (gaps.length > keep) {
+        const evicted = gaps.shift();
+        evictions++;
+        if (evicted.to > evictedTo) evictedTo = evicted.to;
+      }
     }
     last = now;
     ticks++;
+    busy += performance.timeOrigin + performance.now() - now;
   }, 1);
   if (timer.unref) timer.unref();
   // settled(to): resolves once a tick has landed at or after \`to\`, so every gap ending by then is RECORDED (a gap is
@@ -269,10 +291,16 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
       };
       check();
     });
-  return { gaps: (from, to) => gaps.filter((g) => g.to > from && g.from < to), ticks: () => ticks, lastTick: () => last, settled, stop: () => clearInterval(timer) };
+  // fault(from, to): why a snapshot of [from, to] cannot be trusted (an evicted gap may overlap it), or null.
+  const fault = (from, to) =>
+    evictedTo > from ? "the ticker's ring evicted " + evictions + " gap(s), one ending at " + evictedTo.toFixed(1) + ", after the window opened at " + from.toFixed(1) + " (keep " + keep + "): its max cannot be trusted" : null;
+  return { gaps: (from, to) => gaps.filter((g) => g.to > from && g.from < to), fault, evictions: () => evictions, busy: () => busy, ticks: () => ticks, lastTick: () => last, settled, stop: () => clearInterval(timer) };
 })`;
 interface Ticker {
   gaps: (from: number, to: number) => Gap[];
+  fault: (from: number, to: number) => string | null;
+  evictions: () => number;
+  busy: () => number;
   ticks: () => number;
   lastTick: () => number;
   settled: (to: number, maxPolls: number) => Promise<void>;
@@ -282,6 +310,59 @@ interface Ticker {
 const SETTLE_POLLS = 2_000;
 const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, keep: number) => Ticker;
 const absNow = () => performance.timeOrigin + performance.now();
+
+/** What LOOP reads for one window, from the MAIN ticker (8). */
+interface LoopReading {
+  /** The largest main-thread gap overlapping the window (ms); MAIN_GAP_FLOOR_MS when none reached the floor. */
+  max: number;
+  /** The gaps at or over the ceiling: the loop-delay breaches the ceiling (6) judges. ONE source with `max`. */
+  breaches: Gap[];
+  /** How many main-thread gaps (>= the floor) overlapped the window: the ring-sizing evidence. REPORTED ONLY. */
+  gapCount: number;
+  /** The ticker's own callback time inside the window (ms): its cost on the daemon's loop. REPORTED ONLY. */
+  tickerBusy: number;
+  /** monitorEventLoopDelay's max over the same window (ms): REPORTED ONLY, for calibration, never read by a verdict. */
+  histMax: number;
+}
+
+/**
+ * LOOP's instrument for ONE window, on the never-reset MAIN ticker (8), opened at the window's start: `close()` marks
+ * its end, `read()` waits until the ticker has ticked past that end (a gap is recorded only by the tick that ends
+ * it) and reads the window. A stall that lands right after `open`, before any tick of a fresh histogram, is still a
+ * gap here (MEASURED: a 300 ms block right after enable() read 1.3 ms on the histogram, 300.1-301.5 ms on the ticker).
+ * The histogram rides along, REPORTED ONLY. An evicted gap that may overlap the window is an INSTRUMENT FAULT.
+ */
+function openLoopWindow(ticker: Ticker): { from: number; close: () => void; read: () => Promise<LoopReading> } {
+  const busyAtOpen = ticker.busy();
+  const hist = monitorEventLoopDelay({ resolution: 1 });
+  hist.enable();
+  const from = absNow();
+  let to = 0;
+  let busyAtClose = 0;
+  const close = () => {
+    if (to) return;
+    to = absNow();
+    busyAtClose = ticker.busy();
+    hist.disable();
+  };
+  const read = async (): Promise<LoopReading> => {
+    close();
+    await ticker.settled(to, SETTLE_POLLS).catch((err: Error) => {
+      throw new Error(`INSTRUMENT FAULT: the main-thread ticker did not tick past the window's end (${err.message})`);
+    });
+    const fault = ticker.fault(from, to);
+    if (fault !== null) throw new Error(`INSTRUMENT FAULT: LOOP's main-thread ticker: ${fault}`);
+    const gaps = ticker.gaps(from, to);
+    return {
+      max: gaps.reduce((mx, g) => Math.max(mx, g.to - g.from), MAIN_GAP_FLOOR_MS),
+      breaches: gaps.filter((g) => g.to - g.from >= CEILING_MS),
+      gapCount: gaps.length,
+      tickerBusy: busyAtClose - busyAtOpen,
+      histMax: hist.max / 1e6,
+    };
+  };
+  return { from, close, read };
+}
 
 const LOAD_WORKER = `
 const { parentPort, workerData } = require("worker_threads");
@@ -363,8 +444,16 @@ const authLoad = (n: number, tool: string, args: Record<string, unknown>): Load 
 interface Reading {
   /** Max /health latency (ms), sampled every ~10 ms from the worker while the load runs: AVAILABILITY. */
   healthMax: number;
-  /** Max delay (ms) of the DAEMON's event loop while the load runs: LOOP blocking (a bcrypt on it is ~64 ms). */
+  /**
+   * LOOP: the largest gap (ms) of the never-reset MAIN ticker overlapping the window (openLoopWindow): the DAEMON's loop
+   * blocking (a bcrypt on it is ~64 ms). The name is historical (it was the event-loop-delay histogram's max).
+   */
   eldMax: number;
+  /** The event-loop-delay histogram's max over the same window: REPORTED ONLY (calibration), never read by a verdict. */
+  eldHist: number;
+  /** How many main-ticker gaps (>= 2 ms) overlapped the window, and the ticker's own time in it: REPORTED ONLY. */
+  mainGapCount: number;
+  tickerBusy: number;
   /** How many of the load's calls the per-IP cap shed (429) before the MCP cycle. */
   shed: number;
   /**
@@ -401,19 +490,35 @@ interface Reading {
  */
 /** The MAIN thread's ticker (the daemon's loop) and the DEDICATED sentinel worker: created once, never reset. */
 let mainTicker: Ticker | null = null;
-let sentinel: { worker: Worker; ask: (from: number, to: number) => Promise<{ gaps?: Gap[]; fault?: string }> } | null = null;
+interface Sentinel {
+  worker: Worker;
+  ask: (from: number, to: number) => Promise<{ gaps?: Gap[]; fault?: string }>;
+  /** A PURE-TEST knob only: busy the sentinel's own thread for `ms` (its ring's eviction RED). */
+  block: (ms: number) => Promise<void>;
+}
+let sentinel: Sentinel | null = null;
 const SENTINEL_WORKER = `
-const { parentPort } = require("worker_threads");
-const t = (${TICKER_SRC})(${GAP_FLOOR_MS}, ${GAP_KEEP});
+const { parentPort, workerData } = require("worker_threads");
+const t = (${TICKER_SRC})(${GAP_FLOOR_MS}, workerData.keep);
 parentPort.on("message", (m) => {
+  if (m.block) {
+    const end = performance.now() + m.block;
+    while (performance.now() < end) {}
+    parentPort.postMessage({ id: m.id, blocked: true });
+    return;
+  }
   if (m.arm) {
     const armed = () => (t.ticks() >= 2 ? parentPort.postMessage({ armed: true }) : setTimeout(armed, 1));
     armed();
     return;
   }
   // ARMED FOR THIS SNAPSHOT (Codex R2 P2a): reply only once a tick has landed at or after the requested end.
+  // RING EVICTION IS A FAULT: an evicted gap that may overlap the snapshot is never a missing cover.
   t.settled(m.to, ${SETTLE_POLLS}).then(
-    () => parentPort.postMessage({ id: m.id, gaps: t.gaps(m.from, m.to) }),
+    () => {
+      const fault = t.fault(m.from, m.to);
+      parentPort.postMessage(fault === null ? { id: m.id, gaps: t.gaps(m.from, m.to) } : { id: m.id, fault });
+    },
     (err) => parentPort.postMessage({ id: m.id, fault: String((err && err.message) || err) }),
   );
 });
@@ -423,42 +528,51 @@ parentPort.on("message", (m) => {
  * no stall can land before a first tick. The sentinel does nothing else: an INDEPENDENT, otherwise-idle thread.
  */
 async function armInstruments(): Promise<void> {
-  if (!mainTicker) mainTicker = makeTicker(GAP_FLOOR_MS, GAP_KEEP);
+  if (!mainTicker) mainTicker = makeTicker(MAIN_GAP_FLOOR_MS, MAIN_GAP_KEEP);
   while (mainTicker.ticks() < 2) await new Promise((r) => setTimeout(r, 1));
-  if (!sentinel) {
-    const worker = new Worker(SENTINEL_WORKER, { eval: true });
-    worker.unref();
-    let seq = 0;
-    const pending = new Map<number, (g: { gaps?: Gap[]; fault?: string }) => void>();
-    worker.on("message", (m: { id?: number; gaps?: Gap[]; fault?: string }) => {
-      if (m.id !== undefined) {
-        pending.get(m.id)?.({ gaps: m.gaps, fault: m.fault });
-        pending.delete(m.id);
-      }
-    });
-    await new Promise<void>((res, rej) => {
-      worker.once("error", rej);
-      const onArmed = (m: { armed?: true }) => {
-        if (!m.armed) return;
-        worker.off("message", onArmed);
-        res();
-      };
-      worker.on("message", onArmed);
-      worker.postMessage({ arm: true });
-    });
-    sentinel = {
-      worker,
-      ask: (from, to) =>
-        new Promise((res) => {
-          const id = ++seq;
-          pending.set(id, res);
-          worker.postMessage({ id, from, to });
-        }),
-    };
-  }
+  if (!sentinel) sentinel = await startSentinel(GAP_KEEP);
 }
 
-async function measureWindow(port: number, load: Load, onLoop?: () => void, poolWork?: PoolWork): Promise<Reading> {
+/** Start a DEDICATED sentinel worker (ring of `keep` gaps) and return once it is ARMED (it has ticked twice). */
+async function startSentinel(keep: number): Promise<Sentinel> {
+  const worker = new Worker(SENTINEL_WORKER, { eval: true, workerData: { keep } });
+  worker.unref();
+  let seq = 0;
+  const pending = new Map<number, (g: { gaps?: Gap[]; fault?: string }) => void>();
+  worker.on("message", (m: { id?: number; gaps?: Gap[]; fault?: string }) => {
+    if (m.id !== undefined) {
+      pending.get(m.id)?.({ gaps: m.gaps, fault: m.fault });
+      pending.delete(m.id);
+    }
+  });
+  await new Promise<void>((res, rej) => {
+    worker.once("error", rej);
+    const onArmed = (m: { armed?: true }) => {
+      if (!m.armed) return;
+      worker.off("message", onArmed);
+      res();
+    };
+    worker.on("message", onArmed);
+    worker.postMessage({ arm: true });
+  });
+  const send = <T,>(msg: Record<string, unknown>) =>
+    new Promise<T>((res) => {
+      const id = ++seq;
+      pending.set(id, res as (g: { gaps?: Gap[]; fault?: string }) => void);
+      worker.postMessage({ id, ...msg });
+    });
+  return {
+    worker,
+    ask: (from, to) => send({ from, to }),
+    block: async (ms) => void (await send({ block: ms })),
+  };
+}
+
+/**
+ * `onOpen` (a LIVE-RED knob only): runs SYNCHRONOUSLY as the window opens, before any tick of a freshly enabled
+ * histogram: the stall the LOOP ticket names. `onLoop` runs 5 ms later, mid-window.
+ */
+async function measureWindow(port: number, load: Load, onLoop?: () => void, poolWork?: PoolWork, onOpen?: () => void): Promise<Reading> {
   await armInstruments();
   let pool: Promise<unknown> = Promise.resolve();
   let t0Abs = 0;
@@ -473,7 +587,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
       spans.push([start, performance.now()]);
     }
   };
-  const eld = monitorEventLoopDelay({ resolution: 1 });
+  let loopWindow: ReturnType<typeof openLoopWindow> | null = null;
   // Every main-thread GC entry is kept; the ones that START inside [t0, t1] are the window's (entries are delivered
   // after the pause, so the observer stays connected until the reading is built).
   const gcs: Array<[number, number]> = [];
@@ -491,7 +605,8 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
         if (m.started) {
           t0 = performance.now();
           t0Abs = absNow();
-          eld.enable();
+          loopWindow = openLoopWindow(mainTicker!);
+          if (onOpen) onOpen();
           if (onLoop) setTimeout(onLoop, 5);
           if (poolWork) pool = poolWork(track);
           return;
@@ -504,7 +619,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
             () => {
               t1 = performance.now();
               t1Abs = absNow();
-              eld.disable();
+              loopWindow!.close();
               worker.postMessage("stop");
             },
             reject,
@@ -521,17 +636,17 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
           const healthBreaches = m.healthBreaches ?? [];
           const askFrom = Math.min(t0Abs, ...healthBreaches.map((g) => g.from));
           const asked = await sentinel!.ask(askFrom, tEnd);
-          // (Codex R2 P2a) The main ticker too: a gap is recorded only by the tick that ends it.
-          await mainTicker!.settled(t1Abs, SETTLE_POLLS).catch((err: Error) => {
-            throw new Error(`INSTRUMENT FAULT: the main-thread ticker did not tick past the window's end (${err.message})`);
-          });
+          // (Codex R2 P2a) The main ticker too: a gap is recorded only by the tick that ends it (read() settles first).
+          const loop = await loopWindow!.read();
           const sentinelGaps = asked.gaps;
-          const loopBreaches = mainTicker!.gaps(t0Abs, t1Abs).filter((g) => g.to - g.from >= CEILING_MS);
           const reading: Reading = {
             healthMax: m.healthMax!,
-            eldMax: eld.max / 1e6,
+            eldMax: loop.max,
+            eldHist: loop.histMax,
+            mainGapCount: loop.gapCount,
+            tickerBusy: loop.tickerBusy,
             shed: statuses.filter((s) => s === 429).length,
-            breaches: [...healthBreaches.map((g) => ({ ...g, kind: "/health" as const })), ...loopBreaches.map((g) => ({ ...g, kind: "loop-delay" as const }))],
+            breaches: [...healthBreaches.map((g) => ({ ...g, kind: "/health" as const })), ...loop.breaches.map((g) => ({ ...g, kind: "loop-delay" as const }))],
             sentinelGaps,
             ...(asked.fault ? { sentinelFault: asked.fault } : {}),
             sentinelMax: (sentinelGaps ?? []).reduce((mx, g) => Math.max(mx, g.to - g.from), 0),
@@ -593,11 +708,16 @@ const measure = measureWindow;
  *       window, so the 0 of 20 holds only for stalls after that tick. This guard is for a TRUE host stall only and
  *       claims nothing about those stalls.
  *   (7) Every BAR line reports median d, median |a|, the effect size, the verdict and the resolution.
- *   (8) ARM, CONFIRM ARMED, THEN STIMULATE: the instruments of (6) are ONE ticker primitive (TICKER_SRC: 1 ms, never
- *       reset, absolute intervals) on the main thread and in a DEDICATED, otherwise-idle sentinel worker, both created
- *       once and confirmed ticking before any window opens. Each reading carries its breach intervals and the
- *       sentinel's gaps. Also REPORTED ONLY, never read by a verdict: the load worker's own largest gap (it is busy, so
- *       it never exempts) and the longest main-thread GC pause (the daemon shares the test's isolate).
+ *   (8) ARM, CONFIRM ARMED, THEN STIMULATE: the instruments of (6) AND LOOP are ONE ticker primitive (TICKER_SRC: 1 ms,
+ *       never reset, absolute intervals) on the main thread and in a DEDICATED, otherwise-idle sentinel worker, both
+ *       created once and confirmed ticking before any window opens. LOOP reads the MAIN ticker's largest gap in the
+ *       window (floor 2 ms; the sentinel's floor is 20 ms), so a stall right as a window opens is seen: the
+ *       event-loop-delay histogram it replaced was blind before its first tick after enable(). A ring that evicted a
+ *       gap the snapshot may overlap is an INSTRUMENT FAULT, never a smaller max or a missing cover. Each reading
+ *       carries its breach intervals and the sentinel's gaps. Also REPORTED ONLY, never read by a verdict: the
+ *       histogram's max (calibration, for one release), the main ticker's gap count and own time per window, the load
+ *       worker's own largest gap (it is busy, so it never exempts) and the longest main-thread GC pause (the daemon
+ *       shares the test's isolate).
  * A pool-loaded bar's controls (both of them) must also prove their occupancy (expectControlLoaded).
  *
  * CLAIMS, stated per instrument and reported per run (architect, LOOP boundary sizing):
@@ -605,12 +725,11 @@ const measure = measureWindow;
  *     d = 49.4-63.1 on macOS, whose control maxes run 41-54 ms). Claim: "a paired effect >= 50 ms is detected; the
  *     discrimination block = 80 + this run's median control /health max (reported per run)", sized and capped
  *     exactly as LOOP's below. Its PASS block stays +20.
- *   - LOOP (event-loop delay): ELD is a MAX, so an injected stall B lands as d ~= B - (the control's own max), not
- *     +B: a fixed +80 read only 56-60 on CI, hugging the threshold. Its FAIL block is therefore 1.6 x 50 + the
- *     SAME run's median control ELD max (taken from the +20 bar, after its A/A-quiet check), capped at 200 ms
- *     (over the cap: that boundary is NOT_EVALUATED). Claim: "the median of 9 paired rounds detects a synchronous stall
- *     repeated in each auth burst of >= 50 ms + this run's median control ELD max (reported per run)". A stall before
- *     the loop-delay histogram's first tick in a window is not seen (a known limit, its own ticket). PASS block: +20.
+ *   - LOOP (the main ticker's largest gap, (8)): it is a MAX, so an injected stall B lands as d ~= B - (the control's own
+ *     max), not +B: a fixed +80 read only 56-60 on CI (then on the histogram), hugging the threshold. Its FAIL block
+ *     is therefore 1.6 x 50 + the SAME run's median control ELD max (taken from the +20 bar, after its A/A-quiet
+ *     check), capped at 200 ms (over the cap: that boundary is NOT_EVALUATED). Claim: "the median of 9 paired rounds detects a synchronous stall
+ *     repeated in each auth burst of >= 50 ms + this run's median control ELD max (reported per run)". PASS block: +20.
  *   Regressions under these are carried by COUNT + the compare ban.
  */
 const K = 9;
@@ -641,7 +760,7 @@ const barSlack = (b: { control: Array<Pick<Reading, "healthMax">> }) => coverSla
 const healthClaim = (controlMedian: number) =>
   `AVAILABILITY: a paired effect >= ${EFFECT_MS} ms is detected; the discrimination block = ${BOUNDARY_FAIL_MS} ms + this run's median control /health max (${controlMedian.toFixed(1)} ms) = ${(BOUNDARY_FAIL_MS + controlMedian).toFixed(1)} ms`;
 const loopClaim = (controlMedian: number) =>
-  `LOOP: the median of ${K} paired rounds detects a synchronous stall repeated in each auth burst of >= ${EFFECT_MS} ms + this run's median control ELD max (${controlMedian.toFixed(1)} ms), i.e. >= ${(EFFECT_MS + controlMedian).toFixed(1)} ms; a stall before the loop-delay histogram's first tick in a window is not seen (a known limit)`;
+  `LOOP: the median of ${K} paired rounds detects a synchronous stall repeated in each auth burst of >= ${EFFECT_MS} ms + this run's median control ELD max (${controlMedian.toFixed(1)} ms), i.e. >= ${(EFFECT_MS + controlMedian).toFixed(1)} ms (read on the main ticker, a stall as the window opens included)`;
 const NOISE_LIMIT_MS = EFFECT_MS / 2;
 const CEILING_MS = 500;
 const median = (xs: number[]) => {
@@ -676,8 +795,10 @@ const overlapMs = (a: Gap, b: Gap) => Math.max(0, Math.min(a.to, b.to) - Math.ma
  * (6) THE CEILING, pure, PER BREACH (architect ruling on #332 R1 P1 #1). A breach is a /health sample or a main-loop gap
  * at or over the ceiling. It is a HOST stall (NOT_EVALUATED) only if ONE gap of the DEDICATED idle sentinel COVERS
  * it: overlaps it for at least (its length - 50 ms). A mere touch, a matching magnitude at another time, or a stall of
- * the busy LOAD worker never counts. Otherwise it is a FREEZE: FAIL, final. A loop-delay reading at or over the ceiling
- * with no main-loop gap to locate it cannot be covered: a freeze. No sentinel stream: an INSTRUMENT FAULT.
+ * the busy LOAD worker never counts. Otherwise it is a FREEZE: FAIL, final. A /health reading at or over the ceiling
+ * with no sample interval to locate it cannot be covered: a freeze. (LOOP's reading and its loop-delay breaches are
+ * ONE source, the main ticker's gaps (openLoopWindow), so a loop reading over the ceiling always carries its breach.)
+ * No sentinel stream: an INSTRUMENT FAULT.
  */
 export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps"> & { sentinelFault?: string }>, slackMs: number = HOST_STALL_SLACK_MS): { verdict: Verdict; why: string } {
   const freezes: string[] = [];
@@ -687,9 +808,6 @@ export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "hea
       throw new Error(`INSTRUMENT FAULT (${label}): reading ${i + 1} has no sentinel stream${r.sentinelFault ? ` (${r.sentinelFault})` : ""}, so the exemption rule cannot be applied; no ceiling verdict is possible`);
     }
     const breaches = r.breaches.filter((b) => b.to - b.from >= CEILING_MS);
-    if (r.eldMax >= CEILING_MS && !breaches.some((b) => b.kind === "loop-delay")) {
-      freezes.push(`round ${i + 1} loop-delay ${r.eldMax.toFixed(1)} ms with no main-loop gap to locate it (it cannot be covered)`);
-    }
     if (r.healthMax >= CEILING_MS && !breaches.some((b) => b.kind === "/health")) {
       freezes.push(`round ${i + 1} /health ${r.healthMax.toFixed(1)} ms with no sample interval to locate it (it cannot be covered)`);
     }
@@ -877,7 +995,7 @@ async function runBar(
   label: string,
   port: number,
   load: Load,
-  opts: { onLoop?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure } = {},
+  opts: { onLoop?: () => void; onOpen?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure } = {},
 ): Promise<BarStats> {
   // `measureImpl`: a seam for the WIRING MUTANT only (a measure that drops the occupancy reading).
   const measure = opts.measureImpl ?? measureWindow;
@@ -893,7 +1011,7 @@ async function runBar(
     _resetAuthThrottleForTests(); // every auth round meets the same budgets (the scan budget refills slowly)
     perRound.push(
       await compares(async () => {
-        auth.push(await measure(port, load, opts.onLoop, opts.authPool));
+        auth.push(await measure(port, load, opts.onLoop, opts.authPool, opts.onOpen));
       }),
     );
   }
@@ -912,6 +1030,8 @@ async function runBar(
       ` | cover slack ${barSlack({ control }).toFixed(1)} ms (50 + median control /health max, cap ${COVER_SLACK_CAP_MS})` +
       ` | sentinel (dedicated idle worker, max gap, gates the ceiling) auth ${list(auth.map((r) => r.sentinelMax))} control ${list(control.map((r) => r.sentinelMax))} control' ${list(control2.map((r) => r.sentinelMax))}` +
       ` | load-worker max gap (report only) auth ${list(auth.map((r) => r.loadGapMax))}` +
+      ` | eld (histogram, report only) auth ${list(auth.map((r) => r.eldHist))} control ${list(control.map((r) => r.eldHist))} control' ${list(control2.map((r) => r.eldHist))}` +
+      ` | main ticker (report only) gaps per window max ${Math.max(...[...auth, ...control, ...control2].map((r) => r.mainGapCount))}, own busy ms auth ${list(auth.map((r) => r.tickerBusy))} control ${list(control.map((r) => r.tickerBusy))}` +
       ` | main-thread GC max pause (report only) auth ${list(auth.map((r) => r.gcMax))} control ${list(control.map((r) => r.gcMax))} control' ${list(control2.map((r) => r.gcMax))}`,
   );
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
@@ -1068,7 +1188,8 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(v(rd({ eldMax: 600, breaches: [loop(1000, 600)], sentinelGaps: [gap(1595, 650)] })), "a touch (5 ms of overlap)").toBe("FAIL");
     expect(v(rd({ eldMax: 600, breaches: [loop(1000, 600)], sentinelGaps: [gap(1051, 600)] })), "covered 549 ms, needs 550").toBe("FAIL");
     expect(v(rd({ eldMax: 600, breaches: [loop(1000, 600)], sentinelGaps: [gap(1050, 600)] })), "covered 550 ms, needs 550").toBe("NOT_EVALUATED");
-    expect(v(rd({ eldMax: 600, breaches: [], sentinelGaps: [gap(1000, 600)] })), "a loop-delay reading with no main-loop gap to locate it").toBe("FAIL");
+    // (A loop reading over the ceiling with no loop breach cannot exist: LOOP and its breaches are ONE source, the main
+    // ticker's gaps; pinned by "LOOP READS THE MAIN TICKER" below.)
     expect(v(rd({ healthMax: 600, breaches: [], sentinelGaps: [gap(1000, 600)] })), "a /health reading with no sample interval to locate it").toBe("FAIL");
     expect(ceilingVerdict("t", [rd({ eldMax: 602, breaches: [loop(1000, 602)], sentinelGaps: [gap(998, 606)] }), rd({ eldMax: 600, breaches: [loop(5000, 600)] })]).verdict, "one freeze among host stalls: FAIL wins").toBe("FAIL");
     expect(() => ceilingVerdict("t", [rd(), { ...rd(), sentinelGaps: undefined }]), "no sentinel stream").toThrow(/INSTRUMENT FAULT/);
@@ -1106,6 +1227,79 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     }
     await expect(t.settled(absNow() + 60_000, 30), "a stopped ticker never settles: bounded, it rejects").rejects.toThrow(/never ticked/);
   });
+  it("LOOP READS THE MAIN TICKER (8): a block RIGHT AS the window opens (before any tick of a fresh histogram) reads the whole block, and a block over the ceiling is its own located breach (one source); the twin, the same block mid-window, reads it too", async () => {
+    await armInstruments();
+    const atOpen = openLoopWindow(mainTicker!);
+    loopBlock(CEILING_MS + 20)(); // synchronously, right after open: the stall the LOOP ticket names
+    await new Promise((res) => setTimeout(res, 20)); // the overdue ticks land before close (the histogram's included)
+    atOpen.close();
+    const r = await atOpen.read();
+    console.log(`LOOP pure, block at open ${CEILING_MS + 20} ms: ticker max ${r.max.toFixed(1)} ms, histogram (report only) ${r.histMax.toFixed(1)} ms`);
+    expect(r.max, "the ticker sees a stall right as the window opens").toBeGreaterThanOrEqual(CEILING_MS + 20);
+    expect(r.breaches.length, "a LOOP reading over the ceiling carries its breach: one source").toBe(1);
+    const mid = openLoopWindow(mainTicker!);
+    await new Promise((res) => setTimeout(res, 20));
+    loopBlock(300)();
+    await new Promise((res) => setTimeout(res, 20));
+    mid.close();
+    const m = await mid.read();
+    console.log(`LOOP pure twin, block mid-window 300 ms: ticker max ${m.max.toFixed(1)} ms, histogram (report only) ${m.histMax.toFixed(1)} ms`);
+    expect(m.max, "the twin: mid-window").toBeGreaterThanOrEqual(300);
+    expect(m.breaches, "under the ceiling: no breach").toEqual([]);
+    const noGaps: Ticker = { gaps: () => [], fault: () => null, evictions: () => 0, busy: () => 0, ticks: () => 2, lastTick: absNow, settled: async () => {}, stop: () => {} };
+    const quiet = openLoopWindow(noGaps);
+    quiet.close();
+    expect((await quiet.read()).max, "no gap at or over the floor reads as the floor").toBe(MAIN_GAP_FLOOR_MS);
+  }, 20_000);
+  it("RING EVICTION IS A FAULT (main ticker): a tiny ring, one large gap, then small gaps past the keep → the window is an INSTRUMENT FAULT, never the filler's max; the twin with room reads the large gap", async () => {
+    const burst = async (t: Ticker) => {
+      await t.settled(absNow(), SETTLE_POLLS);
+      const w = openLoopWindow(t);
+      loopBlock(100)(); // the large gap
+      for (let i = 0; i < 12; i++) {
+        await new Promise((res) => setTimeout(res, 3));
+        loopBlock(5)(); // filler: gaps of >= 2 ms, past a keep of 4
+      }
+      w.close();
+      return w;
+    };
+    const tiny = makeTicker(MAIN_GAP_FLOOR_MS, 4);
+    const roomy = makeTicker(MAIN_GAP_FLOOR_MS, MAIN_GAP_KEEP);
+    try {
+      const evicting = await burst(tiny);
+      await expect(evicting.read(), "an evicted gap overlaps the window: a FAULT").rejects.toThrow(/INSTRUMENT FAULT: LOOP's main-thread ticker: the ticker's ring evicted \d+ gap/);
+      expect(tiny.evictions()).toBeGreaterThan(0);
+      const twin = await (await burst(roomy)).read();
+      expect(twin.max, "the twin, with room: the large gap is the max").toBeGreaterThanOrEqual(100);
+      expect(roomy.evictions()).toBe(0);
+    } finally {
+      tiny.stop();
+      roomy.stop();
+    }
+  }, 20_000);
+  it("RING EVICTION IS A FAULT (the sentinel's ring): a tiny ring, one large sentinel gap, then filler past the keep → the reply is a FAULT with no stream (an INSTRUMENT FAULT at the ceiling), never a missing cover; the twin with room returns the large gap", async () => {
+    const burst = async (s: Sentinel) => {
+      const from = absNow();
+      await s.block(150); // the large gap
+      for (let i = 0; i < 10; i++) await s.block(GAP_FLOOR_MS + 10); // filler: >= the sentinel's 20 ms floor, past a keep of 4
+      return s.ask(from, absNow());
+    };
+    const tiny = await startSentinel(4);
+    const roomy = await startSentinel(GAP_KEEP);
+    try {
+      const evicted = await burst(tiny);
+      expect(evicted.gaps, "an evicted gap may overlap the snapshot: no stream").toBeUndefined();
+      expect(evicted.fault).toMatch(/the ticker's ring evicted \d+ gap/);
+      const reading = { healthMax: 30, eldMax: 20, breaches: [], sentinelGaps: evicted.gaps, sentinelFault: evicted.fault };
+      expect(() => ceilingVerdict("evicted", [reading])).toThrow(/INSTRUMENT FAULT \(evicted\): reading 1 has no sentinel stream \(the ticker's ring evicted/);
+      const twin = await burst(roomy);
+      expect(twin.fault).toBeUndefined();
+      expect(Math.max(...twin.gaps!.map((g) => g.to - g.from)), "the twin, with room: the large gap is there").toBeGreaterThanOrEqual(150);
+    } finally {
+      await tiny.worker.terminate();
+      await roomy.worker.terminate();
+    }
+  }, 20_000);
   it("THE SENTINEL's snapshot is ARMED per request (the call site of settled): its reply never comes before a sentinel tick at or after the asked end; a request that cannot settle comes back as a fault, and a reading without a stream carries that reason into the INSTRUMENT FAULT", async () => {
     await armInstruments();
     const end = absNow() + 200; // an end in the near future: the sentinel must tick past it before it answers
@@ -1121,7 +1315,7 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(() => ceilingVerdict("unsettled", [reading])).toThrow(/INSTRUMENT FAULT \(unsettled\): reading 1 has no sentinel stream \(the ticker never ticked/);
   }, 20_000);
   it("THE BOUNDARY PAIRS (5) + (4), mixed outcomes: an EVALUATED unexpected verdict is final before any other component's noise or cap; evaluated results are kept; only the bars a component lacks are re-run; a freeze in any boundary bar is FAIL first", async () => {
-    const reading = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
+    const reading = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, eldHist: 20, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
     const iv = (verdict: Verdict): InstrumentVerdict => ({ d: verdict === "FAIL" ? 90 : 10, noise: verdict === "NOT_EVALUATED" ? 40 : 5, verdict });
     const bar = (label: string, health: Verdict, eld: Verdict, o: { controlHealth?: number; auth?: Reading[] } = {}): BarStats => ({
       label,
@@ -1272,6 +1466,17 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       };
       const unwired = await runBar("unwired mutant", port, authLoad(30, "discover_agents", {}), { poolControl, measureImpl: dropping });
       expect(() => expectControlLoaded(unwired, 4 * SCAN_BURST)).toThrow(/NO occupancy reading/);
+    });
+  }, 600_000);
+
+  it("THE LOOP TICKET's RED, live: the gross block SYNCHRONOUSLY as each auth window opens (before any tick of a freshly enabled histogram, blind there) TRIPS; its twin, the same block mid-window, trips too", async () => {
+    await withDaemon(async (port) => {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      await measure(port, controlLoad(20));
+      const atOpen = await runBar(`gross negative at window open (+${GROSS_BLOCK_MS} ms, before any tick)`, port, authLoad(20, "discover_agents", {}), { onOpen: loopBlock(GROSS_BLOCK_MS) });
+      const midWindow = await runBar(`gross negative mid-window (+${GROSS_BLOCK_MS} ms, the twin)`, port, authLoad(20, "discover_agents", {}), { onLoop: loopBlock(GROSS_BLOCK_MS) });
+      expectTrips(atOpen); // the RED: on the histogram this read near zero (it never ticked before the block)
+      expectTrips(midWindow); // the twin: the RED above is the first tick, not the block
     });
   }, 600_000);
 
