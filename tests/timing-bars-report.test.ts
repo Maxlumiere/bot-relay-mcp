@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from "vitest";
 // @ts-expect-error -- a plain .mjs module with JSDoc types, no declaration file
-import { timingBarsReport, FINAL_NOT_EVALUATED } from "../scripts/timing-bars-report.mjs";
+import { timingBarsReport, FINAL_NOT_EVALUATED, FIXTURE_FAULT } from "../scripts/timing-bars-report.mjs";
 
 type Result = { title: string; status: string; failureMessages?: string[] };
 const EXPECTED = ["A/A CONTROL", "CEILING, a freeze"];
@@ -47,6 +47,16 @@ describe("the timing-bars report: a FINAL NOT_EVALUATED is never called FAIL, an
   it("a missing or an unexpected test still fails the gate (the exact-set rule is unchanged)", () => {
     expect(timingBarsReport([passed("A/A CONTROL: x")], EXPECTED).ok).toBe(false);
     expect(timingBarsReport([passed("A/A CONTROL: x"), passed("CEILING, a freeze: y"), passed("something new")], EXPECTED).ok).toBe(false);
+  });
+  it("a FIXTURE_FAULT (a planted stall that did not land): not ok, reported as FIXTURE_FAULT, never as FAIL or NOT_EVALUATED", () => {
+    const fault = "Error: FIXTURE_FAULT (ceiling: whole process stopped 600 ms (attempt 1 only), auth round 5): the planted 600 ms whole-process stop did not land as planted (each of the next two must be >= 550 ms): the planting thread across its own SIGSTOP 602.4 ms; sentinel 176.4 ms, load worker 356.8 ms, main ticker 498.9 ms, histogram 498.9 ms, /health 517.6 ms. NOT a failure of the code: the fixture is broken, so this attempt is not re-run.\n    at stalledAttempt (tests/pr-b-failed-auth.test.ts:1700:11)";
+    const r = timingBarsReport([failed("A/A CONTROL: x", fault), passed("CEILING, a freeze: y")], EXPECTED);
+    expect(r.ok).toBe(false);
+    expect(r.lines[0]).toMatch(/failed 0, not evaluated 0, fixture faults 1/);
+    expect(r.lines.join("\n")).toMatch(/timing bars: FIXTURE_FAULT \(a planted stall did not land as planted\).*NOT a code failure.*A\/A CONTROL: x/);
+    for (const line of r.lines) expect(line, "no line labels it a failure of the code").not.toMatch(/\bFAIL\b|NOT_EVALUATED \(final/);
+    expect(FIXTURE_FAULT.test(fault)).toBe(true);
+    expect(FIXTURE_FAULT.test("AssertionError: expected the fixture to land"), "a mention is not the thrown fault").toBe(false);
   });
   it("the matcher keys on the EXACT message expectEvaluated throws, not on any mention of NOT_EVALUATED", () => {
     expect(FINAL_NOT_EVALUATED.test(finalNe)).toBe(true);
