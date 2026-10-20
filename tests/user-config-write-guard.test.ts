@@ -131,6 +131,48 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     expect(fs.existsSync(path.join(home, ".claude.json"))).toBe(false); // nothing landed through the link
   });
 
+  // (G7) the LIVE relay config on an instance-mode machine is the PER-INSTANCE one (<root>/instances/<id>/config.json).
+  // The guard refuses every instance config STRUCTURALLY (any valid id, active or not, symlink- or env-selected) by
+  // pure path comparison: nothing of the operator's tree is read to work out what to protect.
+  it("(G7) atomicWriteJson refuses a PER-INSTANCE relay config under the account home, and nothing is written", () => {
+    _setAccountHomeForTests(SANDBOX);
+    const target = path.join(SANDBOX, ".bot-relay", "instances", "fbd470d2-0000-4000-8000-000000000001", "config.json");
+    expect(() => atomicWriteJson(target, { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.existsSync(target), "the write NEVER landed").toBe(false);
+  });
+
+  it("(G7b) the pure check names an instance config under the account home, for ANY valid id (not only the active one)", () => {
+    _setAccountHomeForTests(SANDBOX);
+    for (const id of ["work", "fbd470d2-0000-4000-8000-000000000002", "an_inactive-one"]) {
+      const target = path.join(SANDBOX, ".bot-relay", "instances", id, "config.json");
+      expect(() => assertNotRealUserConfigWrite(target), id).toThrow(/config-guard/);
+    }
+  });
+
+  it("(G7c) a SYMLINK ALIAS to an instance dir is refused before any write", () => {
+    const home = path.join(SANDBOX, "acct-home-7c");
+    const inst = path.join(home, ".bot-relay", "instances", "work");
+    fs.mkdirSync(inst, { recursive: true });
+    const alias = path.join(SANDBOX, "alias-7c");
+    fs.symlinkSync(inst, alias);
+    _setAccountHomeForTests(home);
+    expect(() => atomicWriteJson(path.join(alias, "config.json"), { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.existsSync(path.join(inst, "config.json"))).toBe(false);
+  });
+
+  it("(G7d) TWIN: only an instance's config.json is refused, not its siblings, not a nested look-alike, not another root", () => {
+    _setAccountHomeForTests(SANDBOX);
+    const allowed = [
+      path.join(SANDBOX, ".bot-relay", "instances", "work", "other.json"), // a sibling file
+      path.join(SANDBOX, ".bot-relay", "instances", "work", "sub", "config.json"), // not an instance's own config
+      path.join(SANDBOX, "elsewhere", ".bot-relay", "instances", "work", "config.json"), // another root
+    ];
+    for (const target of allowed) {
+      atomicWriteJson(target, { ok: true });
+      expect(JSON.parse(fs.readFileSync(target, "utf-8")), target).toEqual({ ok: true });
+    }
+  });
+
   it("(G6) sandboxed writes still work — the guard blocks the clobber, not the installer", () => {
     // A temp HOME / RELAY_CLAUDE_HOME resolves to different paths than the
     // account home, so the real-installer coverage in v2-3-0-profiles /
