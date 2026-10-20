@@ -26,6 +26,7 @@ const EXPECTED = [
   "(b) 20 wrong-token register_agent, (c) 20 wrong-token get_messages, (d) 20 unknown tokens with 51 agents",
   "unknown-provenance rows",
   "NEGATIVE CONTROL",
+  "THE LOOP TICKET's RED, live",
   "CEILING, a freeze",
   "CEILING, a host stall",
   "CEILING, the load worker is not a sentinel",
