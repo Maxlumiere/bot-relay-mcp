@@ -1,0 +1,50 @@
+# DO NOT MERGE: a CI MEASUREMENT (T-B). Old (pre-13-Oct main) vs new main, interleaved: each run measures BOTH arms on
+# fresh macOS runners, exactly as the macOS CI job does (install, build, bundle, the full suite, then the timing bars),
+# and the run is re-run N times. The reading compared is the raw per-attempt A/A noise of the bars (median |a|).
+name: TB measure (DO NOT MERGE)
+on:
+  pull_request:
+    branches: ['**']
+jobs:
+  bars:
+    name: TB arm ${{ matrix.arm }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arm: old
+            ref: c471c75959bd5147ccec3b0d8846f19e0a3abbc3
+          - arm: new
+            ref: d504c4d1a0b1b31af64157506f006487b4b45b6c
+    steps:
+      - name: Checkout the pinned ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.ref }}
+      - name: "Print the checked-out SHA (must equal the pinned ref)"
+        run: |
+          echo "TB arm=${{ matrix.arm }} pinned=${{ matrix.ref }} HEAD=$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "${{ matrix.ref }}"
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Build VSCode extension bundle
+        continue-on-error: true
+        run: |
+          cd extensions/vscode
+          npm install
+          npm run typecheck
+          npm run bundle
+      - name: "Run test suite (as the macOS CI job: the bars run after it)"
+        continue-on-error: true
+        run: npx vitest run --maxWorkers=2
+      - name: Timing bars, serial and isolated
+        continue-on-error: true
+        run: node scripts/run-timing-bars.mjs
