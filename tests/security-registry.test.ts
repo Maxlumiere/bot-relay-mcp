@@ -107,7 +107,8 @@ describe("each registry rule CATCHES its violation (a fixture per rule, on a cop
     expect(faults).toContain("pending: SEC-22: not_yet.linux, but os includes linux");
   });
   it("CAUGHT a known-bad control with no integrity, a must_fail entry that is no registry HARM test, or a TWIN", () => {
-    expect(faultsOf(copy(), { ...knownBad, integrity: "3.0.1" }).some((f) => f.startsWith("known-bad: the known-bad control pins no sha512 integrity"))).toBe(true);
+    // A VERSION where the integrity belongs (read from the file: tests/ carries no current-version literal).
+    expect(faultsOf(copy(), { ...knownBad, integrity: knownBad.version }).some((f) => f.startsWith("known-bad: the known-bad control pins no sha512 integrity"))).toBe(true);
     expect(faultsOf(copy(), { ...knownBad, must_fail: [...knownBad.must_fail, "SEC-99.T1 HARM nothing"] })).toContain('known-bad: must_fail "SEC-99.T1 HARM nothing" names 0 registry tests (exactly 1 expected)');
     expect(faultsOf(copy(), { ...knownBad, must_fail: ["SEC-20.T1 TWIN relay send --from an ACTIVE agent delivers"] })).toContain('known-bad: must_fail "SEC-20.T1 TWIN relay send --from an ACTIVE agent delivers" is not a HARM test title');
   });
