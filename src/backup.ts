@@ -33,6 +33,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
+import { spawnSystem, systemBinary } from "./system-binary.js";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
@@ -107,12 +108,26 @@ function isoTimestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-").replace("Z", "Z");
 }
 
+/**
+ * `tar` must be locatable at its TRUSTED system path BEFORE a backup or restore writes anything (SEC-22, ruled 20 Oct:
+ * no partial archive, no staging, no safety backup, no DB swap). Throws the named SystemBinaryError. Windows runs tar
+ * by name today (Git Bash's GNU tar can come first there): its own ticket, not SEC-22 POSIX.
+ */
+function assertTarLocatable(): void {
+  if (process.platform !== "win32") systemBinary("tar");
+}
+
 function runTar(args: string[], cwd: string): void {
-  const result = spawnSync("tar", args, { cwd, encoding: "utf-8" });
+  const result = process.platform === "win32" ? runTarByNameOnWindows(args, cwd) : spawnSystem("tar", args, { cwd, encoding: "utf-8" });
   if (result.status !== 0) {
     const stderr = (result.stderr || "").trim();
     throw new Error(`tar ${args.join(" ")} failed (status=${result.status}): ${stderr}`);
   }
+}
+
+/** Windows only: tar BY NAME, as before SEC-22 POSIX (its own ticket: Windows' System32 tar.exe vs Git Bash's GNU tar). */
+function runTarByNameOnWindows(args: string[], cwd: string) {
+  return spawnSync("tar", args, { cwd, encoding: "utf-8" });
 }
 
 export interface ExportResult {
@@ -141,6 +156,7 @@ interface ExportOptions {
  * DB so it is safe to call while the relay daemon is running.
  */
 export async function exportRelayState(options: ExportOptions = {}): Promise<ExportResult> {
+  assertTarLocatable(); // before anything is opened, created or written
   await initializeDb();
   const srcDbPath = getDbPath();
   if (!fs.existsSync(srcDbPath)) {
@@ -269,6 +285,7 @@ async function probeDaemonRunning(): Promise<boolean> {
  * DB is left untouched.
  */
 export async function importRelayState(archivePath: string, options: ImportOptions = {}): Promise<ImportResult> {
+  assertTarLocatable(); // before the safety backup, the staging dir, or closing the live DB
   const resolvedArchive = path.resolve(archivePath);
   if (!fs.existsSync(resolvedArchive)) {
     throw new Error(`Archive not found at '${resolvedArchive}'.`);

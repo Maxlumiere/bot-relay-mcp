@@ -26,6 +26,7 @@
  */
 import crypto from "crypto";
 import { execFileSync } from "child_process";
+import { systemBinary, type SystemBinaryName } from "./system-binary.js";
 import fs from "fs";
 import path from "path";
 import { probeLockHeld, readHolderInfo, type HolderInfo } from "./doorbell-lock.js";
@@ -278,7 +279,11 @@ export function writeWoken(dir: string, s: WokenState): void {
  *   - linux: process.hrtime, i.e. CLOCK_MONOTONIC, which excludes suspend.
  *   - otherwise: null.
  */
-export function awakeNowMs(run: (cmd: string, args: string[]) => string = (c, a) => execFileSync(c, a, { encoding: "utf-8", timeout: 2_000 }), platform: NodeJS.Platform = process.platform): number | null {
+export function awakeNowMs(
+  // sysctl by its trusted absolute path (SEC-22), never through PATH: a planted `sysctl` once forged this clock.
+  run: (cmd: string, args: string[]) => string = (c, a) => execFileSync(systemBinary(c as SystemBinaryName), a, { encoding: "utf-8", timeout: 2_000, shell: false }),
+  platform: NodeJS.Platform = process.platform,
+): number | null {
   if (platform === "linux") return Number(process.hrtime.bigint() / 1_000_000n);
   if (platform !== "darwin") return null;
   try {

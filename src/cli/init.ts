@@ -38,6 +38,7 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { withDeadline } from "../http-deadline.js";
 import { execFileSync } from "child_process";
+import { systemBinary } from "../system-binary.js"; // SEC-22: launchctl by its trusted path, never by name
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
 import { createInstance, generateInstanceId, resolveActiveInstanceId, instanceDir, instanceDirNames } from "../instance.js";
@@ -345,7 +346,7 @@ function realDaemonDeps(log: (l: string) => void): InstallDeps {
     fetchHealth: probeHealth,
     launchctlList: () => {
       try {
-        return execFileSync("launchctl", ["list"], { encoding: "utf-8" });
+        return execFileSync(systemBinary("launchctl"), ["list"], { encoding: "utf-8" });
       } catch {
         return "";
       }
@@ -353,12 +354,12 @@ function realDaemonDeps(log: (l: string) => void): InstallDeps {
     bootstrap: (plistPath, label) => {
       const uid = process.getuid?.() ?? 0;
       try {
-        execFileSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "ignore" });
+        execFileSync(systemBinary("launchctl"), ["bootstrap", `gui/${uid}`, plistPath], { stdio: "ignore" });
       } catch {
         /* may already be bootstrapped (we only reach here on action=install) */
       }
       try {
-        execFileSync("launchctl", ["kickstart", "-k", `gui/${uid}/${label}`], { stdio: "ignore" });
+        execFileSync(systemBinary("launchctl"), ["kickstart", "-k", `gui/${uid}/${label}`], { stdio: "ignore" });
       } catch {
         /* best-effort start */
       }
