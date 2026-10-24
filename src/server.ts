@@ -74,7 +74,7 @@ import { log } from "./logger.js";
 import { currentContext, requestContext } from "./request-context.js";
 import { revalidate, type AuthVerdict } from "./auth-verdict.js";
 import { ERROR_CODES, type ErrorCode } from "./error-codes.js";
-import { ZodError } from "zod";
+import { ZodError } from "zod/v3";
 import { authenticateAgent, TOOL_CAPABILITY, TOOLS_NO_AUTH, isLegacyGraceActive, type AuthResult } from "./auth.js";
 import { verifySecretHash, authSource } from "./token-verify.js";
 import { checkMintGate } from "./mint-gate.js";
