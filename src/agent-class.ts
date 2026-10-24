@@ -23,7 +23,7 @@
  * Every other file imports the values + the Zod enum from here.
  */
 
-import { z } from "zod";
+import { z } from "zod/v3";
 
 /**
  * The coordination classes an agent may SELF-DECLARE at `register_agent`

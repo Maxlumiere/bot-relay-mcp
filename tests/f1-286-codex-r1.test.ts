@@ -25,6 +25,7 @@ import { spawn, spawnSync, execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders, mintSecretFor } from "./_helpers/mint.js";
+import { ownRecordedPid, signalOwnedPid, type OwnedPid } from "./_helpers/recorded-pid.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
@@ -179,17 +180,15 @@ describe("#286 R1 #1 — SessionStart is HEALTHY only after the mail read comple
       child.stdout.on("data", (d) => (out += d.toString()));
       child.stdin.end("");
       const t0 = Date.now();
-      while (!fs.existsSync(marker) && Date.now() - t0 < 15_000) await new Promise((r) => setTimeout(r, 50));
-      expect(fs.existsSync(marker), "precondition: the hook reached the mail read and it stalled").toBe(true);
+      // OWNED AT LAUNCH: the stalled child's recorded pid (one read, parsed once) and its start token, read while it stalls.
+      let stalled: OwnedPid | null = null;
+      while ((stalled = ownRecordedPid(marker)) === null && Date.now() - t0 < 15_000) await new Promise((r) => setTimeout(r, 50));
+      expect(stalled, "precondition: the hook reached the mail read and it stalled (its pid recorded)").not.toBeNull();
       const exited = new Promise((r) => child.on("exit", r));
       child.kill("SIGTERM");
       await exited;
       await new Promise((r) => setTimeout(r, 300));
-      try {
-        process.kill(Number(fs.readFileSync(marker, "utf-8").trim()), "SIGKILL");
-      } catch {
-        /* already gone */
-      }
+      signalOwnedPid(stalled!, "SIGKILL"); // only while it is still the process we owned (gone, unreadable, reused: nothing)
       const v = verdictOf(out);
       expect(v, out).not.toBeNull();
       expect(v, out).not.toBe("HEALTHY");
@@ -476,21 +475,37 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
     expect(r.stdout).toContain("hello without perl");
   });
 
-  it("A WRAPPER WITH A CHILD that keeps stdout open still ends at the deadline (no command substitution waits on it)", () => {
+  it("A WRAPPER WITH A CHILD that keeps stdout open still ends at the deadline (no command substitution waits on it)", async () => {
     const home = path.join(ROOT, "home-d1b");
     fs.mkdirSync(home, { recursive: true });
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "d1b");
     const marker = path.join(ROOT, "stall-d1b.pid");
     const t0 = Date.now();
-    const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 40_000, input: "", env: baseEnv(home, {
+    // ASYNC (was spawnSync) so the stalled child is OWNED AT LAUNCH: its recorded pid and start token, read while it stalls.
+    const child = spawn("bash", [HOOK], { env: baseEnv(home, {
       RELAY_AGENT_NAME: "d1b", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
       SHIM_MODE: "stall-child", SHIM_MARKER: marker, RELAY_PENDING_TIMEOUT_SECS: "2",
     }) });
-    const took = Date.now() - t0;
-    try { process.kill(Number(fs.readFileSync(marker, "utf-8").trim()), "SIGKILL"); } catch { /* gone */ }
+    let stdout = "";
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stdin.end("");
+    let done = false;
+    const exited = new Promise<void>((r) => child.on("close", () => ((done = true), r())));
+    const bound = setTimeout(() => child.kill("SIGKILL"), 40_000); // spawnSync's former timeout
+    let stalled: OwnedPid | null = null;
+    let took = 0;
+    try {
+      while (!done && (stalled = ownRecordedPid(marker)) === null) await new Promise((r) => setTimeout(r, 25));
+      await exited;
+      took = Date.now() - t0;
+    } finally {
+      clearTimeout(bound);
+      if (stalled) signalOwnedPid(stalled, "SIGKILL"); // only while it is still the process we owned
+    }
+    expect(stalled, "precondition: the shim's stalled child recorded its pid").not.toBeNull();
     expect(took, "the deadline, not the 20s child, ends the read").toBeLessThan(9_000);
-    expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*timed out/);
+    expect(stdout).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*timed out/);
   }, 45_000);
 
   for (const [label, hook, stdin] of [

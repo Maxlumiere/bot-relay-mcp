@@ -232,6 +232,31 @@ See `src/url-safety.ts`, `src/dashboard.ts`, `src/transport/http.ts`.
 
 ---
 
+## HTTP request-body structural bound (SEC-24)
+
+**Invariant:** no HTTP request body reaches any schema validator (the relay's or the MCP SDK's) with an array longer than **1000** elements or nesting deeper than **64** levels. One middleware enforces it, mounted right after the JSON body parser and **before** authentication and every route, so it holds for unauthenticated callers too and whatever `RELAY_HTTP_BODY_LIMIT` is raised to. A violation is refused with HTTP 400 and `error_code: BODY_STRUCTURE_LIMIT`.
+
+**Why:** a schema validator does work, and allocates one issue, per element of an array it rejects. Measured on one 1 MB body of 500,000 invalid elements (peak memory of one process):
+- **Through the relay daemon:** `resolve_messages` with this bound removed took **1,565.7 MB**, against a 218.3 MB control.
+- **Synthetic benchmarks**, a bare `z.object({ a: z.array(z.string()) })`, not the SDK's or the relay's own schemas: 328 MB on zod's v3 API, 737 MB on the v4 core before zod 4.6.6, 477 MB after it.
+- **The relay's real schemas** (transpiled from source, parsed in isolation, all six array fields): 286–330 MB.
+
+The zod fix (GHSA-mrhx-c7xc-m3w5) stops early only for a **native v4** array that declares a length cap. The relay's schemas are on zod's v3 API. There, even a declared cap (`host_shell_pids` 64, `message_ids` 100) still validates an oversized array element by element, and most array fields (`capabilities`, the broadcast filters) have no cap. Bounding the structure before any schema runs closes the class for every validator at once.
+
+The largest existing explicit array cap is 100 (`message_ids`). Fields with no cap accepted more before this bound; above 1000 elements they are now refused.
+
+**Cost:** the walk is O(body size), so its ceiling scales with `RELAY_HTTP_BODY_LIMIT` if that is raised (the bound's limits do not).
+
+**The SDK's own body read:** given no parsed body, the MCP SDK reads the raw request stream itself (with its own 4 MiB limit), which would bypass both the 1 MB limit and this bound. The relay never hands it an unparsed POST body; it passes `null` instead, which the SDK answers with a JSON-RPC 400. No request was found that reaches that path today; this is defense in depth.
+
+**Residual, stated:** **stdio** is outside this boundary. The SDK's stdio transport accepts a message of up to 10 MB, and its peer is the local parent process that launched the relay (a trusted local client), so a structural bound there would protect against no one the operator did not start.
+
+The bound's registry entry, for the release security gate, follows with that gate (#334).
+
+See `src/structural-bound.ts`, `src/transport/http.ts`, `tests/sec-24-structural-bound.test.ts`.
+
+---
+
 ## Open-bind defense (Phase 4n)
 
 Binding to a non-loopback interface (`0.0.0.0`, `::`) without `RELAY_HTTP_SECRET` is refused at startup. Operators who genuinely want a public-facing relay (e.g. in a private VPC) can set `RELAY_ALLOW_OPEN_PUBLIC=1`; the relay logs a DANGER line every startup as a reminder.
@@ -299,7 +324,7 @@ Three consequences, all now standing practice:
 
 Rationales below are established from git history, not reconstructed. "security pin" means the override forces a transitive to a patched version; the retirement check is uniform (see the paragraph after the table). `esbuild` is the one non-security override.
 
-Count: there are **9 override entries** across the two manifests but **7 unique packages** — `hono` and `fast-uri` are overridden in both `package.json` (root) and `extensions/vscode/package.json`, so each has a single row here (tree = "root + ext"). Retired 2026-10-05 with the `@vscode/vsce` 4.0.0 bump, because their packages left the extension tree entirely (measured: `npm ls` finds none): `js-yaml`, `undici`, `tmp`, `form-data`, `markdown-it`. The guard matches by unique package name, and the table has one row per unique name.
+Count: there are **10 override entries** across the two manifests but **8 unique packages** — `hono` and `fast-uri` are overridden in both `package.json` (root) and `extensions/vscode/package.json`, so each has a single row here (tree = "root + ext"). Retired 2026-10-05 with the `@vscode/vsce` 4.0.0 bump, because their packages left the extension tree entirely (measured: `npm ls` finds none): `js-yaml`, `undici`, `tmp`, `form-data`, `markdown-it`. The guard matches by unique package name, and the table has one row per unique name.
 
 | override | tree | why (git-established) | retires when |
 |---|---|---|---|
@@ -307,8 +332,9 @@ Count: there are **9 override entries** across the two manifests but **7 unique 
 | `hono ^4.13.7` | root + ext | security: GHSA <4.12.34 (via @modelcontextprotocol/sdk) — #175; raised to ^4.13.7 for GHSA-gqvv-2mrq-wpjv / -g6gw-c38x-mqfc / -crvj-82cr-hjcx / -hxh3-vqpv-xpqv (≤4.13.6) | the MCP SDK's range resolves ≥4.13.7 without the pin |
 | `fast-uri 4.2.1` | root + ext | security: host-confusion advisory — introduced #108, 3.1.5 in #159, 4.1.4 in #253; raised to 4.2.1 for GHSA-hrr3-gc8f-f4qj / GHSA-jvvf-x445-j334 (4.0.0–4.1.4) — the old exact pin had become the vulnerable version | ecosystem resolves ≥4.2.1 without the pin |
 | `ip-address ^10.7.1` | root | security: SSRF / trust-boundary advisory — #159; raised to ^10.7.1 for GHSA-rpw4-54j3-4h4q / -2vr4-cq9g-pvrc / -j6r3-76f7-8jcv / -h3mg-xc3c-68pw (≤10.7.0) | ecosystem resolves ≥10.7.1 without the pin |
-| `vite 7.3.5` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
-| `qs 6.16.0` | ext | security: #79 consolidated bump; raised to 6.16.0 for GHSA-x5fp-wj9c-mxmx / GHSA-4mjr-xmp4-gh2g (2.2.5–6.15.3) — the old exact pin had become the vulnerable version | ecosystem resolves ≥6.16.0 without the pin |
+| `vite 7.3.7` | ext | security: #79 consolidated bump; raised to 7.3.7 for GHSA-698v-4r3x-3vcv / GHSA-r825-w8mm-5pxw / GHSA-587h-7wmj-h5pm (7.0.0–7.3.6, launch-editor bundled by vite) — the old exact pin had become the vulnerable version | ecosystem resolves the patched version without the pin |
+| `qs 6.16.1` | ext | security: #79 consolidated bump; raised to 6.16.0 for GHSA-x5fp-wj9c-mxmx / GHSA-4mjr-xmp4-gh2g (2.2.5–6.15.3) — the old exact pin had become the vulnerable version; raised to 6.16.1 so body-parser 2.4.0 (GHSA-27r3-jxmh-p828, needs `qs ^6.16.1`) resolves inside its declared range | ecosystem resolves ≥6.16.0 without the pin |
+| `@azure/msal-node 7.1.0` | ext | security: GHSA-xcx6-jx8p-x3h5 (≥5.0.0-beta.0 <7.1.0; patched only in 7.1.0). Dev-only, via `@vscode/vsce` → `@azure/identity`, which declares `^6.0.0` in every release, so this pin sits OUTSIDE its dependent's declared range. vsce calls `@azure/identity` only for `--azure-credential` (publish/unpublish); that path is UNTESTED under this pin (see docs/openvsx-publishing.md). CI runs `vsce package` under it (extensions/vscode/src/vsce-package-runs.test.ts) | `@azure/identity` declares `@azure/msal-node` `^7` (then delete the pin) |
 | `esbuild $esbuild` | ext | dedup (NOT security): the `$esbuild` reference forces the extension's esbuild to the parent's version — #79 | a single esbuild version resolves across the tree without the reference |
 
 To check a retirement: delete the override, `npm install --package-lock-only`, `npm audit --audit-level=high` — if clean, the ecosystem has caught up and the override is redundant.
