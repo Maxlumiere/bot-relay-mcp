@@ -4,7 +4,7 @@
 // See LICENSE for full terms.
 
 import type { LoadedBuild } from "./loaded-build.js";
-import { z } from "zod";
+import { z } from "zod/v3";
 import { isSafeCssColorValue } from "./css-color.js";
 import { getAgentCliProfile } from "./agent-cli-profiles.js";
 import { AgentClassEnum, type AgentClass } from "./agent-class.js";
