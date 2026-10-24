@@ -228,8 +228,8 @@ describe("ADR-0036 S1 — boundViaForSource (pure): the reason a binding exists"
 describe("ADR-0036 S1 — resolveAgentName (pure): 'default' is not a name (row 11)", () => {
   it("accepts a valid name, trimming surrounding whitespace", async () => {
     const { resolveAgentName } = await import("../src/binding.js");
-    expect(resolveAgentName("victra-build")).toBe("victra-build");
-    expect(resolveAgentName("  victra-build  ")).toBe("victra-build");
+    expect(resolveAgentName("fx-builder")).toBe("fx-builder");
+    expect(resolveAgentName("  fx-builder  ")).toBe("fx-builder");
     expect(resolveAgentName("a_b.c-1")).toBe("a_b.c-1");
   });
 

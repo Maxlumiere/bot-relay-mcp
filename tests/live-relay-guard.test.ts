@@ -10,7 +10,10 @@
  * nothing else: the closest safe analogue of the fallback (ruling on Codex #305 R2 NEW-1).
  *
  *   HARM 1, the ORIGINAL accident: a grandchild sends register_agent {"name":"probe"} with no credential. The
- *          live fleet ALREADY has "probe". MEASURED on this main: the refusal is recorded as ONE auth_rejection
+ *          live fleet ALREADY has "probe". (The stand-in plays it as "fx-probe": a suite literal is never a LIVE
+ *          fleet name, so the guard never flags a real agent's own rows; what the case needs is a name the
+ *          stand-in's fleet holds AND the suite uses, which fx-probe is.)
+ *          MEASURED on this main: the refusal is recorded as ONE auth_rejection
  *          row with NO actor (PR-B aggregates refusals), so nothing names a test: a "new names" or "nonce"
  *          guard stays green on exactly this. The guard goes RED because an actor-less row is outside the
  *          fleet (fail-closed), and classifies it POSSIBLE (it cannot honestly say more).
@@ -90,8 +93,8 @@ describe("the live-relay guard, on a stand-in live relay (a real sandbox daemon)
       stdio: ["ignore", "pipe", "pipe"],
     });
     await waitForHealth(port, 10_000);
-    // The stand-in's "fleet": it already has "probe", like the operator's live relay did.
-    for (const n of ["probe", "fleet-member"]) expect((await register(port, n, mintHeaders(dbPath))).success, n).toBe(true);
+    // The stand-in's "fleet": it already has "fx-probe", as the operator's live relay had "probe".
+    for (const n of ["fx-probe", "fleet-member"]) expect((await register(port, n, mintHeaders(dbPath))).success, n).toBe(true);
   }, 60_000);
   afterAll(async () => {
     daemon?.kill("SIGTERM");
@@ -104,9 +107,9 @@ describe("the live-relay guard, on a stand-in live relay (a real sandbox daemon)
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("precondition: the daemon HOLDS its DB (-wal, -shm), and the suite's fixture names include \"probe\"", () => {
+  it("precondition: the daemon HOLDS its DB (-wal, -shm), and the suite's fixture names include \"fx-probe\"", () => {
     expect(heldByDaemon(dbPath)).toBe(true);
-    expect(fixtureNames.has("probe")).toBe(true);
+    expect(fixtureNames.has("fx-probe")).toBe(true);
   });
 
   it("TWIN: nothing happens between the reads: no offender, and the live dir's file set is unchanged", () => {
@@ -114,9 +117,9 @@ describe("the live-relay guard, on a stand-in live relay (a real sandbox daemon)
     expect(liveOffenders(before, { fixtureNames, nonce: NONCE })).toEqual([]);
   });
 
-  it("HARM 1 (the original accident): an env-{} grandchild's unauthenticated register of \"probe\", a name the fleet HAS: RED (an actor-less refusal row, POSSIBLE)", async () => {
+  it("HARM 1 (the original accident): an env-{} grandchild's unauthenticated register of \"fx-probe\", a name the fleet HAS: RED (an actor-less refusal row, POSSIBLE)", async () => {
     const before = snapshotLiveDb(dbPath);
-    expect(await grandchildRegisters(port, "probe")).toBe(0);
+    expect(await grandchildRegisters(port, "fx-probe")).toBe(0);
     const off = liveOffenders(before, { fixtureNames, nonce: NONCE });
     expect(off.map((o) => [o.kind, o.class, o.detail.replace(/ source=.*$/, "")]), JSON.stringify(off)).toEqual([["audit", "POSSIBLE", "auth_rejection"]]);
     const verdict = guardAfter({ evaluated: [before], notEvaluated: [] }, { fixtureNames, nonce: NONCE });

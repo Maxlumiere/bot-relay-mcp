@@ -58,8 +58,8 @@ afterEach(() => {
 
 describe("registerAgent", () => {
   it("creates a new agent", () => {
-    const { agent, plaintext_token } = registerAgent("orchestrator", "chief-of-staff", ["triage", "orchestration"]);
-    expect(agent.name).toBe("orchestrator");
+    const { agent, plaintext_token } = registerAgent("fx-orchestrator", "chief-of-staff", ["triage", "orchestration"]);
+    expect(agent.name).toBe("fx-orchestrator");
     expect(agent.role).toBe("chief-of-staff");
     expect(agent.capabilities).toEqual(["triage", "orchestration"]);
     // v2.19.0: `status` is verdict-derived, not last_seen age. A bare
@@ -75,8 +75,8 @@ describe("registerAgent", () => {
   });
 
   it("upserts on duplicate name — role updates, capabilities preserved (v1.7.1)", () => {
-    const { agent: first } = registerAgent("ops", "builder", ["build"]);
-    const { agent: second, plaintext_token: secondToken } = registerAgent("ops", "deployer", ["deploy", "spawn"]);
+    const { agent: first } = registerAgent("fx-ops", "builder", ["build"]);
+    const { agent: second, plaintext_token: secondToken } = registerAgent("fx-ops", "deployer", ["deploy", "spawn"]);
     expect(first.id).toBe(second.id);
     // Role DOES update on re-register (operators may legitimately rename roles)
     expect(second.role).toBe("deployer");

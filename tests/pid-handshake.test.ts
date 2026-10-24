@@ -264,7 +264,7 @@ describe("PID-handshake — round-trip + host-scoping invariant (real daemon)", 
     // even named "zsh" — binds by PID.
     const terms = [
       { name: "zsh", processId: 55479 },
-      { name: "codex", processId: 12345 },
+      { name: "fx-codex", processId: 12345 },
     ];
     const sameHost = resolveWakeTargetByPid("pid-agent", binding!, "HOST-X", terms);
     expect(sameHost.kind).toBe("inject");

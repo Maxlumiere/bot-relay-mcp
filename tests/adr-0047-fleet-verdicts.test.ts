@@ -345,7 +345,7 @@ function snapshot(over: Partial<FleetSnapshot> = {}): FleetSnapshot {
     listeners: [99],
     rows: [row(11, 2)],
     unknownRows: [],
-    bindings: [{ agent_name: "architect", window_pid: 10, window_pid_start: START(1) }],
+    bindings: [{ agent_name: "fx-arch", window_pid: 10, window_pid_start: START(1) }],
     daemon: { port: 3777, listenerPids: [99], health: { ok: true, build: loaded() } },
     installed: () => installedOk(),
     nodeOnPath: "v22.0.0",
@@ -360,7 +360,7 @@ describe("judgeFleet", () => {
     expect(e && [e.verdict, e.has_row, e.agent, e.reason]).toEqual([
       "UNKNOWN",
       true,
-      "architect",
+      "fx-arch",
       "unknown: its process cannot be observed now (its start time cannot be read, and the system does not say it ended)",
     ]);
   });
@@ -384,14 +384,14 @@ describe("judgeFleet", () => {
   });
   it("all CURRENT: the bound connector carries its agent; the daemon (a listener) is never a connector; nothing fails", () => {
     const j = V.judgeFleet(snapshot(), judgeFs);
-    expect(j.connectors.map((e) => [e.pid, e.agent, e.unbound, e.verdict])).toEqual([[11, "architect", false, "CURRENT"]]);
+    expect(j.connectors.map((e) => [e.pid, e.agent, e.unbound, e.verdict])).toEqual([[11, "fx-arch", false, "CURRENT"]]);
     expect(j.daemon).toMatchObject({ verdict: "CURRENT", pid: 99, install_dir: INSTALL });
-    expect(j.windows).toEqual([{ agent: "architect", window_pid: 10, verdict: "CURRENT", reason: "its connector's verdict", connectors: [11] }]);
+    expect(j.windows).toEqual([{ agent: "fx-arch", window_pid: 10, verdict: "CURRENT", reason: "its connector's verdict", connectors: [11] }]);
     expect(j.failing).toBe(0);
   });
   it("a connector process with NO row → UNKNOWN, never CURRENT", () => {
     const j = V.judgeFleet(snapshot({ rows: [] }), judgeFs);
-    expect(j.connectors).toMatchObject([{ pid: 11, has_row: false, verdict: "UNKNOWN", agent: "architect" }]);
+    expect(j.connectors).toMatchObject([{ pid: 11, has_row: false, verdict: "UNKNOWN", agent: "fx-arch" }]);
     expect(j.failing).toBe(1);
   });
   it("an UNBOUND connector is judged like any other: STALE fails, labelled UNBOUND", () => {
@@ -418,7 +418,7 @@ describe("judgeFleet", () => {
   });
   it("NO CONNECTOR only on POSITIVE absence, with the honest D7 text", () => {
     const j = V.judgeFleet(snapshot({ processes: [win(10, 1), node(12, 10, "/opt/other/dist/index.js", 3), node(99, 1, SCRIPT, 9)], rows: [] }), judgeFs);
-    expect(j.windows).toEqual([{ agent: "architect", window_pid: 10, verdict: "NO CONNECTOR", reason: V.NO_CONNECTOR_REASON, connectors: [] }]);
+    expect(j.windows).toEqual([{ agent: "fx-arch", window_pid: 10, verdict: "NO CONNECTOR", reason: V.NO_CONNECTOR_REASON, connectors: [] }]);
     expect(V.NO_CONNECTOR_REASON).toMatch(/MCP-mute, OR HTTP-configured: VIA DAEMON not yet supported, known gap/);
     expect(j.failing).toBe(1);
   });

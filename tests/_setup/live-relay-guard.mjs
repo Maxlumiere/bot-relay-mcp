@@ -87,9 +87,41 @@ function openReadOnly(file) {
   return new Database(file, { readonly: true, fileMustExist: true });
 }
 
-/** The names a test-suite file uses as agent identities (a literal after a name-ish key). */
+const NAME = "([A-Za-z0-9][A-Za-z0-9._-]{0,63})";
+/**
+ * Every shape in which a test hands a literal to the relay AS AN AGENT IDENTITY (the guard's fixture set; a fixture that
+ * is also a live fleet name is a collision). Each pattern's group 1 is the name:
+ *   - a name-ish KEY: `name: "x"`, `from:`, `to:`, `agent_name:`, …;
+ *   - an ENV key or value: `RELAY_AGENT_NAME: "x"` (an env object) or `RELAY_AGENT_NAME=x` (a shell or env string);
+ *   - an agent-taking CALL's first argument: `registerAgent("x", …)`, `getAgentAuthData("x")`, … (never an agent CLI
+ *     profile lookup: `getAgentCliProfile("codex")` names a product profile, not an identity);
+ *   - a CLI ARGV: a flag's value (`"--name", "x"`, `--agent`, `--as`) or the leading positional before `--role` /
+ *     `--capabilities` (`["x", "--role", …]`);
+ *   - an SQL literal: a single-quoted value in an `INSERT … VALUES (…)` (`'x'`).
+ * Generous by design: a non-identity caught here only matters if it equals a LIVE agent's name, and then the run-start
+ * WARNING names it. What it can still miss: a name built at run time (concatenation, a template, a variable).
+ */
+const FIXTURE_PATTERNS = [
+  new RegExp(String.raw`\b(?:name|agentName|agent_name|from|to|target_agent_name|revoker_name|claimed_name)\s*:\s*["'\x60]` + NAME + String.raw`["'\x60]`, "g"),
+  new RegExp(String.raw`\b[A-Z][A-Z0-9_]*AGENT_NAME["']?\s*[:=]\s*["'\x60]?` + NAME, "g"),
+  // (never an agent CLI-PROFILE lookup such as getAgentCliProfile("codex"): a product registry id, not an identity)
+  new RegExp(String.raw`\b[A-Za-z_$]*Agent(?!Cli)[A-Za-z_$]*\(\s*["'\x60]` + NAME + String.raw`["'\x60]`, "g"),
+  new RegExp(String.raw`["'\x60]--(?:name|agent|as)["'\x60]\s*,\s*["'\x60]` + NAME + String.raw`["'\x60]`, "g"),
+  new RegExp(String.raw`\[\s*["'\x60]` + NAME + String.raw`["'\x60]\s*,\s*["'\x60]--(?:role|capabilities)\b`, "g"),
+];
+const SQL_VALUES = /\bVALUES\s*\(([^)]*)\)/gi;
+const SQL_LITERAL = new RegExp("'" + NAME + "'", "g");
+
+/** The agent-identity literals in ONE file's text (see FIXTURE_PATTERNS). */
+export function fixtureNamesInText(text) {
+  const names = new Set();
+  for (const re of FIXTURE_PATTERNS) for (const m of text.matchAll(re)) names.add(m[1]);
+  for (const v of text.matchAll(SQL_VALUES)) for (const m of v[1].matchAll(SQL_LITERAL)) names.add(m[1]);
+  return names;
+}
+
+/** The names a test-suite file uses as agent identities, over every test source file under `dir` (see FIXTURE_PATTERNS). */
 export function fixtureNamesIn(dir, readdirSync = fs.readdirSync, readFileSync = fs.readFileSync) {
-  const KEY = /\b(?:name|agentName|agent_name|from|to|target_agent_name|revoker_name|claimed_name)\s*:\s*["'`]([A-Za-z0-9][A-Za-z0-9._-]{0,63})["'`]/g;
   const names = new Set();
   const walk = (d) => {
     let entries;
@@ -103,8 +135,7 @@ export function fixtureNamesIn(dir, readdirSync = fs.readdirSync, readFileSync =
       if (e.isDirectory()) {
         if (e.name !== "node_modules") walk(full);
       } else if (/\.[cm]?[jt]s$/.test(e.name)) {
-        const text = readFileSync(full, "utf-8");
-        for (const m of text.matchAll(KEY)) names.add(m[1]);
+        for (const n of fixtureNamesInText(readFileSync(full, "utf-8"))) names.add(n);
       }
     }
   };
