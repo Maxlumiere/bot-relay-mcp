@@ -17,7 +17,8 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
-import { openWindow, findEscapes, selfAndAncestors, snapshotProcessEnv } from "./helpers/watch-window.js";
+import { openWindow, findEscapes, selfAndAncestors, snapshotProcessEnv, parseProcessTable, parseReadyAck } from "./helpers/watch-window.js";
+import { ownPid, parentPidOf, parsePid, signalOwnedPid, type OwnedPid } from "./_helpers/recorded-pid.js";
 import { probePid, processStartedAt as readStart, startOrNull } from "../src/liveness.js";
 
 // INV-LIVE-01 (#324) replaced the boolean probe and the nullable start: this file keeps their shapes locally.
@@ -43,10 +44,13 @@ const until = async (cond: () => boolean, ms = 5_000) => {
   for (const end = Date.now() + ms; !cond() && Date.now() < end; ) await sleep(20);
   return cond();
 };
-const ppidOf = (pid: number) => Number(spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf-8" }).stdout.trim());
 
-/** Independent cleanup: kill the window's group ONLY while its leader is the very process it was (never a reused id). */
-function cleanup(w: { leaderPid: number }, leaderStart: string | null, extra: number[] = []): void {
+/**
+ * Independent cleanup: kill the window's group ONLY while its leader is the very process it was (never a reused id),
+ * and each extra pid ONLY while it is the process the test owned at launch (signalOwnedPid: gone, unreadable or reused
+ * → nothing is signalled).
+ */
+function cleanup(w: { leaderPid: number }, leaderStart: string | null, extra: OwnedPid[] = []): void {
   if (leaderStart !== null && isPidAlive(w.leaderPid) && processStartedAt(w.leaderPid) === leaderStart) {
     try {
       process.kill(-w.leaderPid, "SIGKILL");
@@ -54,13 +58,11 @@ function cleanup(w: { leaderPid: number }, leaderStart: string | null, extra: nu
       /* already empty */
     }
   }
-  for (const p of extra) {
-    try {
-      process.kill(p, "SIGKILL");
-    } catch {
-      /* already gone */
-    }
-  }
+  for (const p of extra) signalOwnedPid(p, "SIGKILL");
+}
+/** A test's own ACTION on a process it owns: it must land (a refusal or a gone process fails the test, loudly). */
+function killOwned(p: OwnedPid): void {
+  expect(signalOwnedPid(p, "SIGKILL"), `the test's own kill of pid ${p.pid}`).toEqual({ kind: "signalled", pid: p.pid });
 }
 
 // POSIX only (a bash window and process groups); the Windows CI job does not run this file either.
@@ -69,7 +71,7 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     const w = openWindow(path.join(ROOT, "ack"), env);
     const leaderStart = processStartedAt(w.leaderPid);
     try {
-      expect(isPidAlive(w.pid) && ppidOf(w.pid) === w.leaderPid).toBe(true); // PRIMARY
+      expect(isPidAlive(w.pid) && parentPidOf(w.pid) === w.leaderPid).toBe(true); // PRIMARY
     } finally {
       cleanup(w, leaderStart);
     }
@@ -131,15 +133,22 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     const w = openWindow(dir, env);
     const leaderStart = processStartedAt(w.leaderPid);
     let escaped = 0;
+    let escapedOwned: OwnedPid | null = null;
+    let escapedGone = false;
     try {
       w.fixtures.detachedWriter(f);
-      expect(await until(() => fs.existsSync(f.ready) && /^\d+$/.test(fs.readFileSync(f.pidFile, "utf-8").trim()))).toBe(true);
-      escaped = Number(fs.readFileSync(f.pidFile, "utf-8").trim());
+      // ONE captured string per poll, parsed once (digits AND > 1): never a second read that could differ.
+      let captured: number | null = null;
+      expect(await until(() => fs.existsSync(f.ready) && (captured = parsePid(fs.readFileSync(f.pidFile, "utf-8"))) !== null)).toBe(true);
+      escaped = captured!;
+      escapedOwned = ownPid(escaped); // OWNED AT LAUNCH (its start token now), before close() is asked to kill it
       await expect(w.close()).rejects.toThrow(new RegExp(`escaped the window's process group: pid ${escaped}\\b`)); // PRIMARY
-      expect(await until(() => !isPidAlive(escaped), 2_000)).toBe(true); // ...and it was killed
+      escapedGone = await until(() => !isPidAlive(escaped), 2_000);
+      expect(escapedGone).toBe(true); // ...and it was killed
     } finally {
       fs.writeFileSync(f.release, "");
-      cleanup(w, leaderStart, escaped ? [escaped] : []);
+      // A CONFIRMED exit is never signalled again (its pid may already be another process's).
+      cleanup(w, leaderStart, escapedOwned && !escapedGone ? [escapedOwned] : []);
     }
   }, 15_000);
 
@@ -176,9 +185,10 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     const dir = path.join(ROOT, "owner-ok");
     const w = openWindow(dir, env);
     const leaderStart = processStartedAt(w.leaderPid);
+    const win = ownPid(w.pid);
     try {
       const a = await w.runSleep(30).pid();
-      process.kill(w.pid, "SIGKILL"); // as the window-gone tests do
+      killOwned(win); // as the window-gone tests do
       await sleep(300);
       await w.close();
       expect([isPidAlive(a), isPidAlive(w.leaderPid), groupAlive(w.leaderPid)]).toEqual([false, false, false]); // PRIMARY
@@ -192,11 +202,11 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     let reads = 0;
     const w = openWindow(dir, env, { closeWaitMs: 300, leaderStart: (pid) => (reads++ === 0 ? processStartedAt(pid) : null) });
     const leaderStart = processStartedAt(w.leaderPid);
-    let run = 0;
+    let run: OwnedPid | null = null;
     try {
-      run = await w.runSleep(30).pid();
+      run = ownPid(await w.runSleep(30).pid());
       await expect(w.close()).rejects.toThrow(/cannot verify the window's owner: the start of its supervisor .* is unreadable; nothing is signalled/);
-      expect([isPidAlive(run), isPidAlive(w.pid), isPidAlive(w.leaderPid)]).toEqual([true, true, true]); // PRIMARY: nothing signalled
+      expect([isPidAlive(run.pid), isPidAlive(w.pid), isPidAlive(w.leaderPid)]).toEqual([true, true, true]); // PRIMARY: nothing signalled
     } finally {
       cleanup(w, leaderStart, run ? [run] : []);
     }
@@ -205,15 +215,17 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
   it("OWNERSHIP: the supervisor GONE → close() fails and signals nothing (no group id it cannot prove)", async () => {
     const dir = path.join(ROOT, "owner-gone");
     const w = openWindow(dir, env);
-    let run = 0;
+    const leader = ownPid(w.leaderPid);
+    const win = ownPid(w.pid);
+    let run: OwnedPid | null = null;
     try {
-      run = await w.runSleep(30).pid();
-      process.kill(w.leaderPid, "SIGKILL");
+      run = ownPid(await w.runSleep(30).pid());
+      killOwned(leader);
       expect(await until(() => !isPidAlive(w.leaderPid))).toBe(true);
       await expect(w.close()).rejects.toThrow(/cannot verify the window's owner: its supervisor \(pid \d+\) is gone; nothing is signalled/);
-      expect(isPidAlive(run)).toBe(true); // PRIMARY: nothing signalled
+      expect(isPidAlive(run.pid)).toBe(true); // PRIMARY: nothing signalled
     } finally {
-      for (const p of [run, w.pid]) if (p) try { process.kill(p, "SIGKILL"); } catch { /* gone */ }
+      for (const p of [run, win]) if (p) signalOwnedPid(p, "SIGKILL"); // each only while it is the process owned at launch
     }
   }, 15_000);
 
@@ -224,7 +236,9 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     try {
       const a = await w.runSleep(30).pid();
       const b = await w.runSleep(30).pid();
-      process.kill(ppidOf(a), "SIGKILL"); // as the "refused after launch" test kills the watch's launching shell
+      const launcher = parentPidOf(a); // ONE captured `ps` string, digits AND > 1: an empty read is null, never 0 (the group)
+      expect(launcher, `the launching shell of ${a} is readable (a pid > 1)`).not.toBeNull();
+      killOwned(ownPid(launcher!)); // as the "refused after launch" test kills the watch's launching shell
       await sleep(100);
       await w.close();
       expect([isPidAlive(a), isPidAlive(b)]).toEqual([false, false]); // PRIMARY
@@ -244,6 +258,20 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
     } finally {
       cleanup(w, leaderStart);
     }
+  });
+});
+
+describe("the window's TEXT pids (pure, injected): every signal target goes through the ONE parser; ancestry stays separate", () => {
+  it("the supervisor's ack → w.pid: a pid > 1 and a safe integer, else not acknowledged (null: keep waiting)", () => {
+    expect(parseReadyAck("ready 4242\n")).toBe(4242);
+    for (const t of ["", "ready", "ready \n", "ready 0\n", "ready 1\n", "ready -5\n", "ready 12a\n", "ready 99999999999999999999\n", "ready 4242 7\n"]) {
+      expect(parseReadyAck(t), JSON.stringify(t)).toBeNull();
+    }
+  });
+  it("the ps table: a row's PID (an escape-kill target) must parse (> 1, safe); its PPID is ancestry: 0 and 1 are kept", () => {
+    const t = parseProcessTable(["  4242   1", "  777   0", "  0   0", "  1   0", "  99999999999999999999   1", "  555   99999999999999999999", "  12a   1", "  888   x", "  999"].join("\n"));
+    expect(t && [...t.entries()].sort((a, b) => a[0] - b[0])).toEqual([[777, 0], [4242, 1]]);
+    expect(parseProcessTable("\n  0 0\n")).toBeNull(); // nothing parsed = unreadable, never an empty (vacuous) sweep
   });
 });
 
