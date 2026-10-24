@@ -28,6 +28,26 @@
  * actor-less row (a health check, an auth rejection) during the run false-fails it: loud, stated, rare
  * (MEASURED on the live relay, 8 Oct: ~12 actor-less rows a day).
  *
+ * FLEET-NAME COLLISIONS (ruling on the guard false positive, 20 Oct: option A WITHDRAWN, output only). A live fleet agent
+ * whose name is also a test-suite literal is flagged LIKELY whenever it acts during a run, and it
+ * STAYS flagged (same class, same exit code): a row it signed cannot be told from a test that read its token. The
+ * guard only says so: at run start, each fixture-literal ∩ fleet name is a named WARNING (never a failure); and a
+ * LIKELY offender on a VERIFIED row (agent_name set, tool not register_agent) by such an agent carries a
+ * "fleet-name collision" line naming the agent, its last_seen, the row and the tool, so the operator can check
+ * whether that agent was active. No token, parameter value or content is printed. The fix for the collision is
+ * at the source: the fixture literals are renamed.
+ *
+ * RESIDUAL, stated (two claims kept apart):
+ *   - What happened: the live relay holds 7471 FAILED, actor-less register_agent rows claiming "probe" (23 Jul - 7 Oct
+ *     2026, http, in daily bursts) and 347 register_agent rows for "default" (22 Jul - 7 Oct). Their cause is ASSUMED
+ *     to be local suite runs (the live relay is local-only). They stopped on 7 Oct (last rows 04:29Z and 04:48Z) for a
+ *     reason NOT established: they may recur. CANDIDATE only (a committer date is a rebase stamp): a commit batch
+ *     committed at 04:43:48Z that day, between those two last rows (ae8823e, 84924b2, 4665fa7: the suite registers
+ *     new names with the registration secret).
+ *   - What is established: CONTAINMENT (tests/live-relay-guard-containment.test.ts) shows the suite AS NOW BUILT
+ *     cannot send a register_agent to the default port from an env-{} child under the tripwire. It does NOT explain
+ *     the 7 Oct stop.
+ *
  * Plain JS, node builtins + better-sqlite3 (loaded lazily: without it the guard is NOT_EVALUATED).
  */
 import fs from "node:fs";
@@ -143,7 +163,13 @@ export function liveOffenders(before, { fixtureNames = new Set(), nonce = "" } =
       const outside = actors.length === 0 || actors.some((a) => !fleet.has(a));
       const fixture = actors.some((a) => fixtureNames.has(a));
       if (outside || fixture) {
-        out.push({ kind: "audit", id: `rowid ${r.rid}`, detail: `${r.tool} source=${r.source} success=${r.success} actor=${actors.join("/") || "<none>"}`, class: classify(r.agent_name, claimed, r.params_summary) });
+        const o = { kind: "audit", id: `rowid ${r.rid}`, detail: `${r.tool} source=${r.source} success=${r.success} actor=${actors.join("/") || "<none>"}`, class: classify(r.agent_name, claimed, r.params_summary) };
+        const verified = typeof r.agent_name === "string" && r.agent_name !== "" && r.tool !== "register_agent";
+        if (o.class === "LIKELY" && verified && fleet.has(r.agent_name) && fixtureNames.has(r.agent_name)) {
+          const seen = db.prepare("SELECT last_seen FROM agents WHERE name = ?").get(r.agent_name);
+          o.collision = `fleet-name collision: ${r.agent_name} is a live agent AND a test fixture; verified by its token; last_seen ${seen?.last_seen ?? "<unknown>"}; row ${r.rid}, tool ${r.tool}. Check whether that agent was active during the run.`;
+        }
+        out.push(o);
       }
     }
   } finally {
@@ -190,6 +216,28 @@ export function guardBefore(roots) {
   return { evaluated, notEvaluated };
 }
 
+/**
+ * Collisions ALLOWED by name (ruling, 20 Oct): the product's own convention names, which a test may legitimately use.
+ * Only the run-start WARNING changes for them (a NOTE, not a warning); a row one signs during a run is still LIKELY.
+ */
+export const ALLOWED_COLLISIONS = new Map([["default", "the product's fallback name: an unnamed window registered as 'default' before #311"]]);
+
+/** At run start: every fixture literal that is also a live fleet name, as a named WARNING (never a failure). */
+export function collisionWarnings(state, fixtureNames, allowed = ALLOWED_COLLISIONS) {
+  const lines = [];
+  for (const before of state.evaluated) {
+    const all = before.names.filter((n) => fixtureNames.has(n)).sort();
+    const hits = all.filter((n) => !allowed.has(n));
+    if (hits.length) {
+      lines.push(`live-relay guard: WARNING ${hits.length} fleet-name collision(s) in ${before.file}: ${hits.join(", ")} (each is a live agent AND a test fixture: a row it signs during the run is flagged LIKELY; the fix is renaming the fixture)`);
+    }
+    for (const n of all.filter((x) => allowed.has(x))) {
+      lines.push(`live-relay guard: NOTE allowed collision in ${before.file}: ${n} (${allowed.get(n)}); a row it signs during the run is still flagged LIKELY`);
+    }
+  }
+  return lines;
+}
+
 /** The report lines, and whether the run must fail. */
 export function guardAfter(state, opts) {
   const lines = [];
@@ -211,7 +259,10 @@ export function guardAfter(state, opts) {
     }
     fail = true;
     lines.push(`live-relay guard: ${offenders.length} offender(s) in the LIVE relay ${before.file} (CERTAIN = carries this run's nonce, a test leak; LIKELY = a test-suite name; POSSIBLE = check: a real agent mid-run?):`);
-    for (const o of offenders) lines.push(`  ${o.class} ${o.kind} ${o.id}: ${o.detail}`);
+    for (const o of offenders) {
+      lines.push(`  ${o.class} ${o.kind} ${o.id}: ${o.detail}`);
+      if (o.collision) lines.push(`    ${o.collision}`);
+    }
   }
   return { fail, lines };
 }

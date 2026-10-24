@@ -22,7 +22,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { fixtureNamesIn, guardAfter, guardBefore } from "./live-relay-guard.mjs";
+import { collisionWarnings, fixtureNamesIn, guardAfter, guardBefore } from "./live-relay-guard.mjs";
 
 const TESTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -58,6 +58,9 @@ export default function setup(project) {
     roots = [];
   }
   const live = guardBefore(roots);
+  const fixtureNames = fixtureNamesIn(TESTS_DIR);
+  const warnings = collisionWarnings(live, fixtureNames);
+  if (warnings.length) process.stdout.write(`${warnings.join("\n")}\n`);
   const violations = path.join(runDir, "violations");
   fs.mkdirSync(path.join(runDir, "home"), { recursive: true, mode: 0o700 });
   // On Windows the base puts TEMP inside the private home: it must exist before any worker uses it.
@@ -65,7 +68,7 @@ export default function setup(project) {
   if (typeof temp === "string" && path.isAbsolute(temp)) fs.mkdirSync(temp, { recursive: true, mode: 0o700 });
   fs.mkdirSync(violations, { recursive: true, mode: 0o700 });
   return () => {
-    const verdict = guardAfter(live, { fixtureNames: fixtureNamesIn(TESTS_DIR), nonce: env.RELAY_TEST_RUN_NONCE ?? "" });
+    const verdict = guardAfter(live, { fixtureNames, nonce: env.RELAY_TEST_RUN_NONCE ?? "" });
     process.stdout.write(`${verdict.lines.join("\n")}\n`);
     if (verdict.fail) {
       throw new Error(`OPERATOR_TRIPWIRE: the LIVE relay changed in ways the pre-run fleet does not explain (see the live-relay guard lines above). Run directory kept: ${runDir}\n  ${verdict.lines.join("\n  ")}`);
