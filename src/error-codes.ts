@@ -70,6 +70,8 @@ export const ERROR_CODES = {
   VALIDATION: "VALIDATION",
   /** Exceeds RELAY_MAX_PAYLOAD_BYTES or similar size cap. */
   PAYLOAD_TOO_LARGE: "PAYLOAD_TOO_LARGE",
+  /** SEC-24: an HTTP body with an array over 1000 elements or nesting over 64 levels, refused before any schema. */
+  BODY_STRUCTURE_LIMIT: "BODY_STRUCTURE_LIMIT",
 
   // State / concurrency -----------------------------------------------------
   /** CAS write lost a race — re-read and retry. */

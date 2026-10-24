@@ -17,6 +17,8 @@ Verify against the current [Open VSX publishing wiki](https://github.com/Eclipse
 
 ## Per-release publish
 
+> **Checklist, before every publish:** `vsce publish --azure-credential` (Microsoft Entra ID sign-in) is **UNTESTED** under the extension's `@azure/msal-node` 7.1.0 security override (SECURITY.md, override inventory): `@azure/identity` declares msal-node `^6`. Publish with a PAT (`vsce publish -p`), or test `--azure-credential` once before relying on it. `vsce package` itself is checked in CI.
+
 The same vsce-packaged `.vsix` is published to both registries — it is **one artefact, two publish targets**, not two builds. From `extensions/vscode/`:
 
 ```sh
