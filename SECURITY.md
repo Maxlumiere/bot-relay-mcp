@@ -307,7 +307,7 @@ Count: there are **9 override entries** across the two manifests but **7 unique 
 | `hono ^4.13.7` | root + ext | security: GHSA <4.12.34 (via @modelcontextprotocol/sdk) — #175; raised to ^4.13.7 for GHSA-gqvv-2mrq-wpjv / -g6gw-c38x-mqfc / -crvj-82cr-hjcx / -hxh3-vqpv-xpqv (≤4.13.6) | the MCP SDK's range resolves ≥4.13.7 without the pin |
 | `fast-uri 4.2.1` | root + ext | security: host-confusion advisory — introduced #108, 3.1.5 in #159, 4.1.4 in #253; raised to 4.2.1 for GHSA-hrr3-gc8f-f4qj / GHSA-jvvf-x445-j334 (4.0.0–4.1.4) — the old exact pin had become the vulnerable version | ecosystem resolves ≥4.2.1 without the pin |
 | `ip-address ^10.7.1` | root | security: SSRF / trust-boundary advisory — #159; raised to ^10.7.1 for GHSA-rpw4-54j3-4h4q / -2vr4-cq9g-pvrc / -j6r3-76f7-8jcv / -h3mg-xc3c-68pw (≤10.7.0) | ecosystem resolves ≥10.7.1 without the pin |
-| `vite 7.3.5` | ext | security: #79 consolidated bump | ecosystem resolves the patched version without the pin |
+| `vite 7.3.7` | ext | security: #79 consolidated bump; raised to 7.3.7 for GHSA-698v-4r3x-3vcv / GHSA-r825-w8mm-5pxw / GHSA-587h-7wmj-h5pm (7.0.0–7.3.6, launch-editor bundled by vite) — the old exact pin had become the vulnerable version | ecosystem resolves the patched version without the pin |
 | `qs 6.16.0` | ext | security: #79 consolidated bump; raised to 6.16.0 for GHSA-x5fp-wj9c-mxmx / GHSA-4mjr-xmp4-gh2g (2.2.5–6.15.3) — the old exact pin had become the vulnerable version | ecosystem resolves ≥6.16.0 without the pin |
 | `esbuild $esbuild` | ext | dedup (NOT security): the `$esbuild` reference forces the extension's esbuild to the parent's version — #79 | a single esbuild version resolves across the tree without the reference |
 
