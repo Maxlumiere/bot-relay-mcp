@@ -12,13 +12,21 @@
  * RELAY_HTTP_BODY_LIMIT is raised to.
  *
  * WHY: a schema validator does work, and allocates one issue, per element of an array it rejects. MEASURED (24 Oct,
- * one 1 MB body of 500,000 invalid elements, peak RSS of one process): 328 MB through the relay's own (v3-API)
- * schemas, 737 MB through the MCP SDK's validator before zod 4.6.6, 477 MB after it. The 4.6.6 fix
- * (GHSA-mrhx-c7xc-m3w5) stops early only for a v4 array that declares a length cap; the relay's schemas have none.
- * Bounding the STRUCTURE before any schema runs closes the class for every validator at once.
+ * one 1 MB body of 500,000 invalid elements, peak RSS of one process):
+ *   - THROUGH THE DAEMON: resolve_messages with the bound removed, 1,565.7 MB vs a 218.3 MB control
+ *     (tests/sec-24-structural-bound.test.ts);
+ *   - SYNTHETIC benchmarks of a bare z.object({ a: z.array(z.string()) }), not the SDK's or the relay's schemas:
+ *     328 MB on the v3 API (zod 3.25.76, and "zod/v3" in 4.6.7), 737 MB on the v4 core before 4.6.6, 477 MB after;
+ *   - the relay's REAL schemas (transpiled from src, parsed in isolation), all six array fields: 286-330 MB.
+ * The 4.6.6 fix (GHSA-mrhx-c7xc-m3w5) stops early only for a NATIVE v4 array that declares a length cap. The relay's
+ * schemas are on the v3 API, where even a declared cap (host_shell_pids .max(64), message_ids .max(100)) still
+ * validates an oversized array element by element; most of its array fields (capabilities, the broadcast filters)
+ * have no cap at all. Bounding the STRUCTURE before any schema runs closes the class for every validator at once.
  *
- * The values were fixed BEFORE any measurement (24 Oct) and are not tuned to one. The largest legitimate array
- * any tool takes is 100 (resolve_messages' message_ids).
+ * The values were fixed BEFORE any measurement (24 Oct) and are not tuned to one. The largest existing explicit
+ * array cap is 100 (resolve_messages' message_ids). Uncapped fields accept more today; above 1000 they are refused.
+ *
+ * Cost: the walk is O(body size), so its ceiling scales with RELAY_HTTP_BODY_LIMIT if that is raised.
  *
  * The walk is ITERATIVE (an explicit stack) and stops at the first violation, so a deeply nested body can never
  * overflow the call stack. JSON.parse has already produced the value; the walk visits each element at most once.

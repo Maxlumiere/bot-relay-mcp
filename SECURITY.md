@@ -236,12 +236,16 @@ See `src/url-safety.ts`, `src/dashboard.ts`, `src/transport/http.ts`.
 
 **Invariant:** no HTTP request body reaches any schema validator (the relay's or the MCP SDK's) with an array longer than **1000** elements or nesting deeper than **64** levels. One middleware enforces it, mounted right after the JSON body parser and **before** authentication and every route, so it holds for unauthenticated callers too and whatever `RELAY_HTTP_BODY_LIMIT` is raised to. A violation is refused with HTTP 400 and `error_code: BODY_STRUCTURE_LIMIT`.
 
-**Why:** a schema validator does work, and allocates one issue, per element of an array it rejects. Measured on one 1 MB body of 500,000 invalid elements, the peak memory of one process was:
-- 328 MB through the relay's own (v3-API) schemas;
-- 737 MB through the MCP SDK's validator before zod 4.6.6;
-- 477 MB after zod 4.6.6.
+**Why:** a schema validator does work, and allocates one issue, per element of an array it rejects. Measured on one 1 MB body of 500,000 invalid elements (peak memory of one process):
+- **Through the relay daemon:** `resolve_messages` with this bound removed took **1,565.7 MB**, against a 218.3 MB control.
+- **Synthetic benchmarks**, a bare `z.object({ a: z.array(z.string()) })`, not the SDK's or the relay's own schemas: 328 MB on zod's v3 API, 737 MB on the v4 core before zod 4.6.6, 477 MB after it.
+- **The relay's real schemas** (transpiled from source, parsed in isolation, all six array fields): 286–330 MB.
 
-The zod fix (GHSA-mrhx-c7xc-m3w5) stops early only for a v4 array that declares a length cap; the relay's schemas do not. Bounding the structure before any schema runs closes the class for every validator at once.
+The zod fix (GHSA-mrhx-c7xc-m3w5) stops early only for a **native v4** array that declares a length cap. The relay's schemas are on zod's v3 API. There, even a declared cap (`host_shell_pids` 64, `message_ids` 100) still validates an oversized array element by element, and most array fields (`capabilities`, the broadcast filters) have no cap. Bounding the structure before any schema runs closes the class for every validator at once.
+
+The largest existing explicit array cap is 100 (`message_ids`). Fields with no cap accepted more before this bound; above 1000 elements they are now refused.
+
+**Cost:** the walk is O(body size), so its ceiling scales with `RELAY_HTTP_BODY_LIMIT` if that is raised (the bound's limits do not).
 
 **The SDK's own body read:** given no parsed body, the MCP SDK reads the raw request stream itself (with its own 4 MiB limit), which would bypass both the 1 MB limit and this bound. The relay never hands it an unparsed POST body; it passes `null` instead, which the SDK answers with a JSON-RPC 400. No request was found that reaches that path today; this is defense in depth.
 

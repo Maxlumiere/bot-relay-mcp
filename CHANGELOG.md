@@ -4,7 +4,7 @@
 
 ### Security: no oversized request structure reaches a validator; body-parser and zod advisories
 
-- **HTTP bodies are bounded in structure (SEC-24).** A request body with an array of more than 1000 elements, or nesting deeper than 64 levels, is refused with HTTP 400 (`error_code: BODY_STRUCTURE_LIMIT`) before authentication and before any schema runs. A 1 MB body could otherwise make a validator allocate hundreds of megabytes (measured: up to 737 MB in one process). The largest legitimate array any tool takes is 100.
+- **HTTP bodies are bounded in structure (SEC-24).** A request body with an array of more than 1000 elements, or nesting deeper than 64 levels, is refused with HTTP 400 (`error_code: BODY_STRUCTURE_LIMIT`) before authentication and before any schema runs. A 1 MB body could otherwise make a validator allocate far more than the body: measured through the daemon, one 1 MB `resolve_messages` body took a relay process to 1.5 GB. The largest existing explicit array cap is 100 (`message_ids`); fields with no cap (e.g. `capabilities`) now refuse more than 1000 elements.
 - **body-parser 2.4.0 (GHSA-27r3-jxmh-p828).** One unauthenticated request with a `Content-Encoding` and trailing bytes could crash the relay before routing. Fixed in the root and the extension.
 - **zod 4.6.7 (GHSA-mrhx-c7xc-m3w5).** The relay keeps its schemas on zod's v3 API (`zod/v3`), so every tool's published input schema is byte-identical. The MCP SDK's validator gets the patched version.
 - **Extension, development only:** zod 4.6.7, vite unchanged, and `@azure/msal-node` 7.1.0 (GHSA-xcx6-jx8p-x3h5) through an override. That override is outside `@azure/identity`'s declared range; `vsce publish --azure-credential` is untested under it.
