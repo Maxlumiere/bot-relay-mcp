@@ -23,6 +23,7 @@ Source of truth: [`src/error-codes.ts`](../src/error-codes.ts).
 | `NOT_MEMBER` | Authz | Caller is not a member of the channel they're posting to / reading. |
 | `VALIDATION` | Validation | Zod / shape / format failure. |
 | `PAYLOAD_TOO_LARGE` | Validation | Exceeds `RELAY_MAX_PAYLOAD_BYTES` (per-field) or outer 1MB HTTP body cap. |
+| `BODY_STRUCTURE_LIMIT` | Validation | HTTP 400 before auth (SEC-24): the request body holds an array over 1000 elements or nests deeper than 64 levels. |
 | `CONCURRENT_UPDATE` | Concurrency | CAS write lost a race. Re-read and retry. |
 | `INVALID_STATE` | State | State-transition violation (e.g., cancel a completed task). |
 | `RATE_LIMITED` | Capacity | Rate-limit bucket exceeded. |
