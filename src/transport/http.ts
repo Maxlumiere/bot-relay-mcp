@@ -47,6 +47,7 @@ import { RESOLVER_REVISION } from "../resolve-instance.js";
 import { LOADED_BUILD } from "../loaded-build.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import type { Server } from "http";
+import { structuralBoundMiddleware } from "../structural-bound.js";
 
 /**
  * v2.7 Tether Phase 5 — SSE keepalive helper.
@@ -447,6 +448,18 @@ function isExplicitCredentialChannel(channel: CredentialChannel): boolean {
   return channel === "bearer" || channel === "query";
 }
 
+/**
+ * The body handed to the MCP SDK's transport for a POST. NEVER undefined: given undefined, the SDK reads the raw
+ * request stream itself (its own 4 MiB limit) and JSON.parses it, which would bypass express.json's limit AND the
+ * SEC-24 structural bound. That happens whenever express.json did not parse the body, e.g. a Content-Type the
+ * SDK's media-type fallback accepts but express.json does not (none found for SDK 1.32 + body-parser 2.4, across 12
+ * malformed Content-Type headers: defense in depth). MEASURED: given null, the SDK answers 400 with a JSON-RPC parse
+ * error (-32700) and never reads the stream.
+ */
+export function sdkParsedBody(req: Pick<Request, "body">): unknown {
+  return req.body === undefined ? null : req.body;
+}
+
 export function startHttpServer(port: number, host: string): Server {
   // v2.1 Phase 4n: bind-safety check BEFORE any express setup so we fail
   // fast and never accidentally bind to a risky host.
@@ -558,6 +571,9 @@ export function startHttpServer(port: number, host: string): Server {
   app.use(rateLimitCheck);
 
   app.use(express.json({ limit: process.env.RELAY_HTTP_BODY_LIMIT || "1mb" }));
+  // SEC-24: the parsed body's structural bound (arrays <= 1000, nesting <= 64), right after parsing and BEFORE auth and
+  // every route, so no schema (the relay's or the SDK's) ever validates an oversized structure. See structural-bound.ts.
+  app.use(structuralBoundMiddleware);
 
   const config = loadConfig();
   // P2a — capture the config PATH at boot, next to the config the daemon actually
@@ -1730,7 +1746,7 @@ export function startHttpServer(port: number, host: string): Server {
       transport.close().catch(() => {});
     });
     await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    await transport.handleRequest(req, res, sdkParsedBody(req));
   }
 
   /**
@@ -1783,7 +1799,7 @@ export function startHttpServer(port: number, host: string): Server {
       // to drop the session from the daemon's sessions Map here.
     };
     await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    await transport.handleRequest(req, res, sdkParsedBody(req));
     const newId = transport.sessionId;
     if (newId) {
       sessions.set(newId, {
@@ -1820,7 +1836,7 @@ export function startHttpServer(port: number, host: string): Server {
       return;
     }
     session.lastSeen = Date.now();
-    await session.transport.handleRequest(req, res, expectsBody ? req.body : undefined);
+    await session.transport.handleRequest(req, res, expectsBody ? sdkParsedBody(req) : undefined);
   }
 
   app.post("/mcp", async (req: Request, res: Response) => {
