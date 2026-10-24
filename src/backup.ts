@@ -38,6 +38,8 @@ import { withDeadline } from "./http-deadline.js";
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
+// The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
+import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
 import { ERROR_CODES } from "./error-codes.js";
@@ -88,10 +90,6 @@ function assertSafePath(p: string, label: string): string {
 function assertPrivateStaging(dir: string): void {
   const c = checkPrivatePath(dir);
   if (!c.ok) throw new Error(`the staging directory ${dir} is not private: ${c.reason}`);
-}
-
-function getConfigPath(): string {
-  return process.env.RELAY_CONFIG_PATH || path.join(os.homedir(), ".bot-relay", "config.json");
 }
 
 /**
