@@ -251,7 +251,7 @@ The largest existing explicit array cap is 100 (`message_ids`). Fields with no c
 
 **Residual, stated:** **stdio** is outside this boundary. The SDK's stdio transport accepts a message of up to 10 MB, and its peer is the local parent process that launched the relay (a trusted local client), so a structural bound there would protect against no one the operator did not start.
 
-The bound's registry entry, for the release security gate, follows with that gate (#334).
+The release security gate checks it on the installed package: SEC-24 in `security/invariants.json`, `tests/release/sec-24.release.ts`.
 
 See `src/structural-bound.ts`, `src/transport/http.ts`, `tests/sec-24-structural-bound.test.ts`.
 

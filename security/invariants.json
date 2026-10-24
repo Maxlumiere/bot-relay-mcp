@@ -394,6 +394,35 @@
           "blocked_by": "the SEC-22 POSIX follow-up"
         }
       }
+    },
+    {
+      "id": "SEC-24",
+      "statement": "No HTTP request body reaches any schema validator (the relay's or the MCP SDK's) with an array longer than 1000 elements or nesting deeper than 64 levels: one middleware, mounted right after the JSON body parser and BEFORE authentication and every route, refuses it with HTTP 400 and error_code BODY_STRUCTURE_LIMIT, whatever RELAY_HTTP_BODY_LIMIT is raised to. The MCP SDK is never handed an unparsed POST body (it would read the raw stream itself). stdio is OUT of scope (its peer is the local parent process).",
+      "source": "#347 (e9205ee): GHSA-mrhx-c7xc-m3w5 and the measured exhaustion (one 1 MB body: 1,565.7 MB through resolve_messages with the bound removed); ruled 24 Oct",
+      "os": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "status": "active",
+      "tests": [
+        {
+          "id": "tests/release/sec-24.release.ts::SEC-24.T1 HARM a 1 MB body with a 500,000-element array is refused with HTTP 400 BODY_STRUCTURE_LIMIT on /mcp (unauthenticated and authenticated) and on a REST route",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/release/sec-24.release.ts::SEC-24.T1 TWIN a legitimate resolve_messages of 100 real messages succeeds and resolves all 100",
+          "mode": "installed"
+        },
+        {
+          "id": "tests/sec-24-structural-bound.test.ts::bounds both ways: arrays of exactly MAX_ARRAY pass and MAX_ARRAY + 1 fail; MAX_DEPTH levels pass and one more fails",
+          "mode": "in-process"
+        },
+        {
+          "id": "tests/sec-24-structural-bound.test.ts::THE SDK'S CONTRACT: parsedBody undefined → it reads the stream itself; null → a clean JSON-RPC 400, the stream untouched",
+          "mode": "in-process"
+        }
+      ]
     }
   ]
 }
