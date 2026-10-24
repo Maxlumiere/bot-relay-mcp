@@ -209,6 +209,7 @@
     "esbuild": "$esbuild",
     "hono": "^4.13.7",
     "qs": "6.16.1",
+    "@azure/msal-node": "7.1.0",
     "fast-uri": "4.2.1"
   }
 }
