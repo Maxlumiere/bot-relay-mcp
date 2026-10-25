@@ -1,0 +1,13 @@
+{
+  "$comment": "The KNOWN-BAD control: an exact published tarball (by integrity, never by version) and the EXACT harm tests it is MEASURED to fail. Each must be SEEN on this integrity (failed WITH its observation mark); one that passes means the suite has gone BLIND, and one that fails before its stimulus returned is a harness fault. Other harms run on it are reported, never judged (e.g. plain `relay mint-token` on a revoked row: 3.0.1 refuses it too, but not with the revocation wording, so it fails before its mark). MEASURED 2026-10-13 (the seed acceptance tool) and 2026-10-20 (this control, per harm); SEC-24 MEASURED 2026-10-25 (3.0.1 answered HTTP 200 with zod's issue list for the 500,000-element array, observed after the stimulus returned).",
+  "package": "bot-relay-mcp",
+  "version": "3.0.1",
+  "integrity": "sha512-ssSKJMdYl2JoeRNdj9YOjBQf9fnRglopfFUA/iGbAleEitDguzOq6WYNxH/hSkcIwnE8Rv0abCpiISechTlYpg==",
+  "must_fail": [
+    "SEC-01.T1 HARM http: a NEW name with no registration secret is refused, and no row or token is created",
+    "SEC-20.T1 HARM relay send --from a REVOKED agent is refused and writes no message",
+    "SEC-20.T1 HARM with no token in its env, the refusal says the agent is revoked",
+    "SEC-20.T2 HARM relay mint-token --force does not bring a REVOKED agent back",
+    "SEC-24.T1 HARM a 1 MB body with a 500,000-element array is refused with HTTP 400 BODY_STRUCTURE_LIMIT on /mcp (unauthenticated and authenticated) and on a REST route"
+  ]
+}
