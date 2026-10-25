@@ -31,7 +31,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -298,7 +298,7 @@ describe("v2.4.5 — TS-side per-instance resolution (real subprocess contract)"
     // an inline read script. Same RELAY_INSTANCE_ID + RELAY_HOME, no
     // shared in-memory state.
     const reader = `
-      import('${path.resolve(PROJECT_ROOT, "dist", "db.js").replace(/\\/g, "\\\\")}').then(async (m) => {
+      import(${JSON.stringify(pathToFileURL(path.resolve(PROJECT_ROOT, "dist", "db.js")).href)}).then(async (m) => {
         await m.initializeDb();
         const childPath = m.getDbPath();
         const inbox = m.getMessages('parity-bob', 'pending', 100, true);

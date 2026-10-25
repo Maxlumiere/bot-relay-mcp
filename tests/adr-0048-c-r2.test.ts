@@ -24,7 +24,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawn, spawnSync } from "child_process";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOKS = path.join(REPO_ROOT, "hooks");
@@ -469,7 +469,7 @@ describe("Codex #291 R2 #1 — SessionStart's sqlite3 reads run under the watchd
     fs.mkdirSync(RH, { recursive: true });
     const seed = spawnSync(process.execPath, ["--input-type=module", "-e", `
       process.env.RELAY_DB_PATH = ${JSON.stringify(dbPath)};
-      const db = await import(${JSON.stringify(path.join(REPO_ROOT, "dist", "db.js"))});
+      const db = await import(${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, "dist", "db.js")).href)});
       db.registerAgent(${JSON.stringify(AGENT)}, "r", []);
       db.closeDb();`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME } });
     expect(seed.status, seed.stderr).toBe(0);

@@ -21,7 +21,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO_ROOT, "bin", "relay");
@@ -37,7 +37,7 @@ function seedDb(dbPath: string): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", `
     process.env.RELAY_DB_PATH = ${JSON.stringify(dbPath)};
-    const db = await import(${JSON.stringify(DIST_DB)});
+    const db = await import(${JSON.stringify(pathToFileURL(DIST_DB).href)});
     db.registerAgent(${JSON.stringify(AGENT)}, "r", []);
     db.closeDb();`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json") } });
   expect(r.status, r.stderr).toBe(0);
