@@ -3,25 +3,44 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
+import fs from "node:fs";
 import path from "node:path";
 
 /**
- * The env for a child that runs the relay in a sandbox HOME: the FULL parent env (a user's daemon has theirs, and on
- * Windows the daemon needs SystemRoot: its security subprocesses run by an absolute System32 path, SEC-22) minus every
- * relay and test-runner variable AND `NODE_OPTIONS`, with every HOME spelling pointed at the sandbox.
+ * The env for a child that runs the relay in a sandbox HOME. An ALLOWLIST by class: nothing else is copied from the
+ * parent. A caller that needs more adds a NAMED variable after construction (e.g. SEC-22's deliberate NODE_OPTIONS).
  *
- * `NODE_OPTIONS` is dropped (any letter case: Windows env names are case-insensitive) because an inherited
- * `--require`/`--import` preload would run in the child BEFORE the operator tripwire's own preload, and could read or
- * write the operator's config. The test process's spawn decorator (tests/_setup/operator-tripwire.ts) injects the
- * trusted tripwire preload into the child itself.
+ * - PATH (its value, whatever the parent's key casing; Windows spells it `Path`).
+ * - The HOME spellings HOME and USERPROFILE (plus HOMEDRIVE and HOMEPATH on Windows), set to the sandbox.
+ * - The temp dirs TMPDIR, TMP and TEMP, set to `<home>/.tmp` (created here).
+ * - LC_ALL and LANG, copied when the parent has them.
+ * - Per-OS system variables MEASURED as required, copied from the parent (WINDOWS_SYSTEM_VARS):
+ *   - win32: SystemRoot. The relay's security subprocesses run by an absolute %SystemRoot%\System32 path, and a
+ *     missing SystemRoot fails closed (SEC-22: systemBinary() throws). Pinned by tests/sandbox-env-node-options.test.ts.
+ *   - darwin, linux: none.
+ *
+ * WHY an allowlist: an ambient code loader in the parent env would otherwise run in the child BEFORE the operator
+ * tripwire's own preload (which the spawn decorator, tests/_setup/operator-tripwire.ts, injects): NODE_OPTIONS
+ * (--require/--import), LD_PRELOAD (the Linux dynamic loader), OPENSSL_CONF (read by node at startup; a provider module
+ * loads native code). Each class has a control in tests/sandbox-env-node-options.test.ts.
  */
 export function sandboxEnv(home: string, source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(source)) {
-    if (v === undefined || /^(RELAY_|VITEST|__VITEST)/i.test(k) || /^NODE_OPTIONS$/i.test(k)) continue;
-    env[k] = v;
+  const pick = (name: string) => Object.entries(source).find(([k, v]) => k.toLowerCase() === name.toLowerCase() && v !== undefined)?.[1];
+  const tmp = path.join(home, ".tmp");
+  fs.mkdirSync(tmp, { recursive: true });
+  const env: NodeJS.ProcessEnv = { HOME: home, USERPROFILE: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp };
+  const p = pick("PATH");
+  if (p !== undefined) env.PATH = p;
+  for (const name of ["LC_ALL", "LANG"]) if (source[name] !== undefined) env[name] = source[name];
+  if (process.platform === "win32") {
+    Object.assign(env, { HOMEDRIVE: path.parse(home).root.replace(/\\$/, ""), HOMEPATH: home.slice(path.parse(home).root.length - 1) });
+    for (const name of WINDOWS_SYSTEM_VARS) {
+      const v = pick(name);
+      if (v !== undefined) env[name] = v;
+    }
   }
-  Object.assign(env, { HOME: home, USERPROFILE: home });
-  if (process.platform === "win32") Object.assign(env, { HOMEDRIVE: path.parse(home).root.replace(/\\$/, ""), HOMEPATH: home.slice(path.parse(home).root.length - 1) });
   return env;
 }
+
+/** The Windows system variables a sandbox child gets: only those MEASURED as required (see sandboxEnv). */
+export const WINDOWS_SYSTEM_VARS = ["SystemRoot"] as const;
