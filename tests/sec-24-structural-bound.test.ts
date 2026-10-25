@@ -26,7 +26,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawn } from "child_process";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { structuralViolation, MAX_ARRAY, MAX_DEPTH } from "../src/structural-bound.js";
 import { sdkParsedBody } from "../src/transport/http.js";
 
@@ -57,7 +57,8 @@ describe("SEC-24, pure: the walk", () => {
 
 /** The child: the built daemon on an ephemeral port, the requests, then its own peak RSS, as one JSON line. */
 const CHILD = `
-const http = await import(${JSON.stringify(path.join(REPO, "dist", "transport", "http.js"))});
+// A file:// URL, never a bare absolute path: on Windows the ESM loader refuses "D:\\..." (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+const http = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "transport", "http.js")).href)});
 const mode = process.env.SEC24_MODE;
 const server = http.startHttpServer(0, "127.0.0.1");
 await new Promise((r) => server.once("listening", r));
@@ -100,6 +101,20 @@ process.stdout.write("SEC24 " + JSON.stringify(out) + "\\n");
 server.close(); process.exit(0);
 `;
 
+/**
+ * The child's env, as the release suite's sandbox builds one (tests/release/_installed.ts): the FULL parent env minus
+ * every relay and test-runner variable, with every HOME spelling pointed at the sandbox. On Windows the daemon needs
+ * the system's own variables (SystemRoot: its security subprocesses run by an absolute System32 path, SEC-22, and a
+ * missing SystemRoot fails closed).
+ */
+function childEnv(home: string, extra: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !/^(RELAY_|VITEST|__VITEST)/i.test(k)) env[k] = v;
+  Object.assign(env, { HOME: home, USERPROFILE: home });
+  if (process.platform === "win32") Object.assign(env, { HOMEDRIVE: path.parse(home).root.replace(/\\$/, ""), HOMEPATH: home.slice(path.parse(home).root.length - 1) });
+  return { ...env, ...extra };
+}
+
 function runChild(mode: "hostile" | "control"): Promise<Record<string, any>> {
   const dir = fs.mkdtempSync(path.join(ROOT, `${mode}-`));
   fs.mkdirSync(path.join(dir, "home"), { recursive: true });
@@ -109,7 +124,7 @@ function runChild(mode: "hostile" | "control"): Promise<Record<string, any>> {
     const file = path.join(dir, "child.mjs");
     fs.writeFileSync(file, CHILD);
     const c = spawn(process.execPath, [file], {
-      env: { PATH: process.env.PATH ?? "", HOME: path.join(dir, "home"), RELAY_DB_PATH: path.join(dir, "relay.db"), SEC24_MODE: mode, RELAY_LOG_LEVEL: "error" },
+      env: childEnv(path.join(dir, "home"), { RELAY_DB_PATH: path.join(dir, "relay.db"), SEC24_MODE: mode, RELAY_LOG_LEVEL: "error" }),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let so = "", se = "";
