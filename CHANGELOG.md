@@ -41,6 +41,11 @@ What you will see, and what to do. Each item is detailed in its entry below.
   - An agent with no session gets `warning: { code: "session_unbound" }`.
 - **A recovery whose token cannot be saved no longer prints the token.** It says to run `relay recover`. Hook debug output prints one fixed line, never the server's reply.
 - **The database schema is migrated in place on first start** (v24 in 3.0.1, v26 now). `relay pending` refuses a DB older than v2.12: start the current relay once against it, then retry.
+- **Going back to 3.0.1 after upgrading.** 3.0.1 does not refuse a 4.0.0 database and does not warn about it. It leaves the schema at v26 and keeps working on it. Measured, with an MCP client over stdio in a sandbox:
+  - 4.0.0 created the database;
+  - 3.0.1 then ran `health_check`, `register_agent`, `discover_agents`, `get_messages` (with an ack), `send_message`, `post_task` and `set_status` on it, and read the message 4.0.0 had sent;
+  - 4.0.0 then re-opened it and read the messages and the task 3.0.1 had written.
+  Not measured: 3.0.1's hooks, its HTTP daemon and its CLI against a v26 database. To be able to go back exactly, run `relay backup` before upgrading.
 
 What was checked for this list: every heading and bullet of all 40 entries below. Read in full were every entry that changes behaviour a user or client can observe: hooks and tokens, revocation, trusted proxies, the registration secret, instance resolution, the hooks' read path, priority, edge identity, the pending window, ack receipts and the PostToolUse peek. The new features (`relay watch --until-wake`, the doorbell, `relay fleet`, `relay pending`, `relay bind`, `RELAY_FOCUS_DRY_RUN`, `on_name_collision`) are additive and are not listed here.
 
