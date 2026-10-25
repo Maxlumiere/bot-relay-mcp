@@ -253,9 +253,12 @@ const MAIN_GAP_KEEP = 65_536;
  * 608.7-610.3 ms). Absolute time is comparable across threads: MEASURED, a worker's stamp fell inside the main
  * thread's [send, receive] window in 3 x 2000 round trips (round trip <= 0.21 ms).
  */
-const TICKER_SRC = `(function makeTicker(floor, keep) {
+const TICKER_SRC = `(function makeTicker(floor, keep, manualStart) {
+  // manualStart (a number): a SCRIPTED ticker for a pure test. No interval runs; the test calls tick(now) itself, so
+  // the ring's record/evict/fault logic is driven deterministically, never by a real scheduler.
+  const manual = typeof manualStart === "number";
   const gaps = [];
-  let last = performance.timeOrigin + performance.now();
+  let last = manual ? manualStart : performance.timeOrigin + performance.now();
   let ticks = 0;
   // RING EVICTION IS A FAULT (ruling on the LOOP ticket): every eviction is counted, and the latest end of an evicted
   // gap is kept, so a snapshot that an evicted gap may overlap is refused (fault), never read as a smaller max.
@@ -263,8 +266,7 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
   let evictedTo = -Infinity;
   // The ticker's OWN cost on its thread (ms spent inside its callback), REPORTED ONLY.
   let busy = 0;
-  const timer = setInterval(() => {
-    const now = performance.timeOrigin + performance.now();
+  const onTick = (now) => {
     if (now - last >= floor) {
       gaps.push({ from: last, to: now });
       if (gaps.length > keep) {
@@ -275,9 +277,10 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
     }
     last = now;
     ticks++;
-    busy += performance.timeOrigin + performance.now() - now;
-  }, 1);
-  if (timer.unref) timer.unref();
+    if (!manual) busy += performance.timeOrigin + performance.now() - now;
+  };
+  const timer = manual ? null : setInterval(() => onTick(performance.timeOrigin + performance.now()), 1);
+  if (timer && timer.unref) timer.unref();
   // settled(to): resolves once a tick has landed at or after \`to\`, so every gap ending by then is RECORDED (a gap is
   // only recorded by the tick that ends it, and an overdue tick can run AFTER a pending message is handled). Bounded
   // in POLLS (each >= 1 ms of this thread running), so a host stop never spends the bound; exhausted: it rejects.
@@ -294,11 +297,22 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
   // fault(from, to): why a snapshot of [from, to] cannot be trusted (an evicted gap may overlap it), or null.
   const fault = (from, to) =>
     evictedTo > from ? "the ticker's ring evicted " + evictions + " gap(s), one ending at " + evictedTo.toFixed(1) + ", after the window opened at " + from.toFixed(1) + " (keep " + keep + "): its max cannot be trusted" : null;
-  return { gaps: (from, to) => gaps.filter((g) => g.to > from && g.from < to), fault, evictions: () => evictions, busy: () => busy, ticks: () => ticks, lastTick: () => last, settled, stop: () => clearInterval(timer) };
+  const inWindow = (from, to) => gaps.filter((g) => g.to > from && g.from < to);
+  // snapshot(from, to): the sentinel's reply, ONE rule: a fault (no stream) when an evicted gap may overlap the window,
+  // else the gaps. The worker replies with exactly this, and a pure test drives it through tick().
+  const snapshot = (from, to) => {
+    const f = fault(from, to);
+    return f === null ? { gaps: inWindow(from, to) } : { fault: f };
+  };
+  return { gaps: inWindow, fault, snapshot, tick: onTick, evictions: () => evictions, busy: () => busy, ticks: () => ticks, lastTick: () => last, settled, stop: () => timer && clearInterval(timer) };
 })`;
 interface Ticker {
   gaps: (from: number, to: number) => Gap[];
   fault: (from: number, to: number) => string | null;
+  /** The sentinel's reply for [from, to]: a fault (no stream) when an evicted gap may overlap it, else the gaps. */
+  snapshot: (from: number, to: number) => { gaps?: Gap[]; fault?: string };
+  /** A scripted tick at `now` (a manual ticker only: makeTicker(floor, keep, start)). */
+  tick: (now: number) => void;
   evictions: () => number;
   busy: () => number;
   ticks: () => number;
@@ -308,7 +322,7 @@ interface Ticker {
 }
 /** How many >= 1 ms polls a judging snapshot waits for its ticker to tick past the window's end: an INSTRUMENT FAULT beyond. */
 const SETTLE_POLLS = 2_000;
-const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, keep: number) => Ticker;
+const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, keep: number, manualStart?: number) => Ticker;
 /**
  * THE PLANT'S OWN MEASURE, ONE SOURCE for the main thread and the load worker (ruling R2, "confirm stimulated"): the
  * largest gap between two consecutive clock reads of the planting thread, from just BEFORE its kill(SIGSTOP) until a
@@ -568,10 +582,7 @@ parentPort.on("message", (m) => {
   // ARMED FOR THIS SNAPSHOT (Codex R2 P2a): reply only once a tick has landed at or after the requested end.
   // RING EVICTION IS A FAULT: an evicted gap that may overlap the snapshot is never a missing cover.
   t.settled(m.to, ${SETTLE_POLLS}).then(
-    () => {
-      const fault = t.fault(m.from, m.to);
-      parentPort.postMessage(fault === null ? { id: m.id, gaps: t.gaps(m.from, m.to) } : { id: m.id, fault });
-    },
+    () => parentPort.postMessage({ id: m.id, ...t.snapshot(m.from, m.to) }),
     (err) => parentPort.postMessage({ id: m.id, fault: String((err && err.message) || err) }),
   );
 });
@@ -1525,7 +1536,7 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     console.log(`LOOP pure twin, block mid-window 300 ms: ticker max ${m.max.toFixed(1)} ms, histogram (report only) ${m.histMax.toFixed(1)} ms`);
     expect(m.max, "the twin: mid-window").toBeGreaterThanOrEqual(300);
     expect(m.breaches, "under the ceiling: no breach").toEqual([]);
-    const noGaps: Ticker = { gaps: () => [], fault: () => null, evictions: () => 0, busy: () => 0, ticks: () => 2, lastTick: absNow, settled: async () => {}, stop: () => {} };
+    const noGaps: Ticker = { gaps: () => [], fault: () => null, snapshot: () => ({ gaps: [] }), tick: () => {}, evictions: () => 0, busy: () => 0, ticks: () => 2, lastTick: absNow, settled: async () => {}, stop: () => {} };
     const quiet = openLoopWindow(noGaps);
     quiet.close();
     expect((await quiet.read()).max, "no gap at or over the floor reads as the floor").toBe(MAIN_GAP_FLOOR_MS);
@@ -1565,6 +1576,15 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       roomy.stop();
     }
   }, 20_000);
+  it("THE SENTINEL RING TEST's RACE, replayed on a scripted ticker: CI's measured ticks (a 150.8 ms gap, then the ten filler blocks with ONE tick between them) must still give the ring eviction the live test expects", () => {
+    // CI run 40150772848 (Linux), the live sentinel's three gaps: 69908.4 -> 70059.2 -> 70089.9 -> 70362.3 (relative
+    // 150.8, 30.7, 272.4 ms). The worker ran nine of the ten filler blocks back to back, with no tick between them.
+    const t = makeTicker(GAP_FLOOR_MS, 4, 0);
+    for (const at of [150.8, 181.5, 453.9]) t.tick(at);
+    const evicted = t.snapshot(0, 454);
+    expect(evicted.gaps, "an evicted gap may overlap the snapshot: no stream").toBeUndefined();
+    expect(evicted.fault).toMatch(/the ticker's ring evicted \d+ gap/);
+  });
   it("RING EVICTION IS A FAULT (the sentinel's ring): a tiny ring, one large sentinel gap, then filler past the keep → the reply is a FAULT with no stream (an INSTRUMENT FAULT at the ceiling), never a missing cover; the twin with room returns the large gap", async () => {
     const burst = async (s: Sentinel) => {
       const from = absNow();
