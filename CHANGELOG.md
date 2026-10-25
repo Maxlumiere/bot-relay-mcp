@@ -22,7 +22,7 @@ What you will see, and what to do. Each item is detailed in its entry below.
 - **An instance-selection fault now stops the daemon and the CLI.**
   - 3.0.1 already refused to start when instances existed and none was selected (`RELAY_ALLOW_LEGACY_FALLBACK=1` still overrides that case).
   - New: a permission or I/O error under `~/.bot-relay` (e.g. on `instances/`) used to land silently on the flat `~/.bot-relay/relay.db`; now it is an error.
-  - `relay mint-token` exits 2 on a fault. So do `relay send` and `relay resolve` when they look up the agent's token themselves. With a valid-shaped `RELAY_AGENT_TOKEN` set, they skip instance resolution and send to the HTTP endpoint from the environment or the default. `relay watch` reports DEGRADED, and `relay list-instances` exits 1.
+  - `relay mint-token` exits 2 on a fault. So do `relay send` and `relay resolve` when they look up the agent's token themselves. With a valid-shaped `RELAY_AGENT_TOKEN` set, they skip local credential resolution, read the endpoint from the config, and fall back to the environment or the default only if the config cannot be loaded. `relay watch` reports DEGRADED, and `relay list-instances` exits 1.
   - If the relay will not start, run `relay doctor`: its first line names the cause, e.g. run `relay use-instance <id>`.
 - **Stricter DB and staging paths.** Paths are checked by their real, on-disk form. Refused:
   - a DB whose parent is a symlink out of your home and temp directories;
@@ -40,9 +40,9 @@ What you will see, and what to do. Each item is detailed in its entry below.
   - At most 16 bcrypt checks queue at once.
   Beyond those limits a call gets `RATE_LIMITED` (HTTP 429 on `/api/send-message`) or "busy, retry".
 - **`relay re-encrypt --verify-clean <old key>` reports UNSAFE at first.** Token lookup digests written by 3.0.1 carry no key id, so each one counts as a blocker, the current-token and previous-token digests alike.
-  - An ordinary authenticated tool call, e.g. `get_messages`, rewrites the digest of the token it used. `register_agent` does not: a re-register with the same token keeps the old digest.
-  - A previous token's digest is rewritten only when that previous token is used, so it can keep blocking.
-  - Run `--verify-clean` again to confirm before you retire the key.
+  - An ordinary authenticated tool call, e.g. `get_messages`, attempts to rewrite the digest of the token it used. The attempt is best effort: it can be skipped (the row changed meanwhile) or fail (logged as a warning only). `register_agent` does not attempt it: a re-register with the same token keeps the old digest.
+  - A previous token's digest is attempted only when that previous token is used, so it can keep blocking.
+  - Retire the key only once `--verify-clean` reports SAFE.
 - **`get_messages(status="pending")` and `get_messages_summary` are no longer windowed by default.**
   - What you will see: mail that a previous session read but never acked comes back on every new session until it is acked or purged (after 7 days). `total_pending` is now always the full queue.
   - What to do: drain with `ack: true`, or `resolve_messages` the ids. Pass an explicit `since` to window a read.
