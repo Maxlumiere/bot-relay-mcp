@@ -22,25 +22,33 @@ What you will see, and what to do. Each item is detailed in its entry below.
 - **An instance-selection fault now stops the daemon and the CLI.**
   - 3.0.1 already refused to start when instances existed and none was selected (`RELAY_ALLOW_LEGACY_FALLBACK=1` still overrides that case).
   - New: a permission or I/O error under `~/.bot-relay` (e.g. on `instances/`) used to land silently on the flat `~/.bot-relay/relay.db`; now it is an error.
-  - `relay send`, `relay resolve` and `relay mint-token` exit 2 on a fault, `relay watch` reports DEGRADED, and `relay list-instances` exits 1.
+  - `relay mint-token` exits 2 on a fault. So do `relay send` and `relay resolve` when they look up the agent's token themselves. With a valid-shaped `RELAY_AGENT_TOKEN` set, they skip instance resolution and send to the HTTP endpoint from the environment or the default. `relay watch` reports DEGRADED, and `relay list-instances` exits 1.
   - If the relay will not start, run `relay doctor`: its first line names the cause, e.g. run `relay use-instance <id>`.
 - **Stricter DB and staging paths.** Paths are checked by their real, on-disk form. Refused:
   - a DB whose parent is a symlink out of your home and temp directories;
   - a DB path through `/tmp` that lacks the sticky bit, or that has a part another user owns or can write;
   - a backup or restore staging directory under `$TMPDIR` that other users can write.
-- **Windows: the relay restricts the ACL of its own folder to your account.** It removes inheritance and grants only the relay's user (SYSTEM is tolerated). Other accounts, Administrators included, lose access to the DB folder.
+- **Windows: the relay tries to restrict its DB folder and files to your account.** It removes inheritance and grants only the relay's user (SYSTEM is tolerated). When that works, other accounts, Administrators included, lose access. When it fails, the relay logs the folder as not private (DEGRADED) and keeps running.
 - **A revoked agent's token is refused everywhere.**
   - `relay send` from a revoked agent gets `AUTH_FAILED`.
   - `relay mint-token`, `relay send` and `relay resolve` no longer hand its token back.
   - `relay mint-token --force` no longer brings a revoked agent back. Use `relay recover`.
-- **Wrong tokens are rate-limited.** Failed token checks are throttled per source and name (a burst of 5, then one every 2 s), and at most 16 checks queue at once. Beyond that a call gets `RATE_LIMITED` (HTTP 429 on `/api/send-message`) or "busy, retry". A correct token is not charged.
-- **`relay re-encrypt --verify-clean <old key>` reports UNSAFE until each agent has signed in once.** Token lookup digests written by 3.0.1 carry no key id, so each counts as a blocker until the agent's next successful sign-in rewrites it.
+- **Wrong tokens are rate-limited.** There are three paths:
+  - A token whose stored lookup digest does not match is refused at once, and charges nothing.
+  - A named check that needs bcrypt (no usable digest, e.g. a row from 3.0.1 before its digest is rewritten) is throttled per source and name: a burst of 5, then one every 2 s. A correct token is refunded.
+  - A token-only call that has to scan is throttled per source: a burst of 3, then one every 5 s.
+  - At most 16 bcrypt checks queue at once.
+  Beyond those limits a call gets `RATE_LIMITED` (HTTP 429 on `/api/send-message`) or "busy, retry".
+- **`relay re-encrypt --verify-clean <old key>` reports UNSAFE at first.** Token lookup digests written by 3.0.1 carry no key id, so each one counts as a blocker, the current-token and previous-token digests alike.
+  - An ordinary authenticated tool call, e.g. `get_messages`, rewrites the digest of the token it used. `register_agent` does not: a re-register with the same token keeps the old digest.
+  - A previous token's digest is rewritten only when that previous token is used, so it can keep blocking.
+  - Run `--verify-clean` again to confirm before you retire the key.
 - **`get_messages(status="pending")` and `get_messages_summary` are no longer windowed by default.**
   - What you will see: mail that a previous session read but never acked comes back on every new session until it is acked or purged (after 7 days). `total_pending` is now always the full queue.
   - What to do: drain with `ack: true`, or `resolve_messages` the ids. Pass an explicit `since` to window a read.
 - **`get_outstanding`'s `state` values are renamed:** `unread` → `undrained`, `read-unresolved` → `drained-unresolved` (`resolved` is unchanged). Update any code that matches on them.
 - **`get_messages(ack=true)` receipts report what the database did.**
-  - `acked` is true only when the resolve ran, otherwise the reply carries `ack_not_applied`.
+  - On a pending read with `ack: true`, `acked` is true only when the resolve ran or there was nothing to ack. Otherwise the reply carries `ack_not_applied`.
   - `resolved_count` is the number of rows changed.
   - An agent with no session gets `warning: { code: "session_unbound" }`.
 - **A message's priority must be `critical`, `high`, `normal` or `low`.** Database triggers refuse any other value, including from a direct writer. This covers channel messages too.
@@ -70,7 +78,8 @@ How this list was built:
 - **zod 4.6.7** (GHSA-mrhx-c7xc-m3w5), with the relay's tool schemas byte-identical.
 - **proxy-addr 2.0.8** (GHSA-jqcg-44mw-7w3h), and the relay's own trusted-proxy check fixed for the same class.
 - **The MCP SDK 1.32.0.**
-- **The registration secret:** no token is issued over HTTP without a credential.
+- **Not yet in this release:** fast-uri 4.2.1 and ip-address 10.7.3 still have open advisories; their fixes are a separate change.
+- **The registration secret:** no new name gets a token over HTTP without a credential, except under `RELAY_ALLOW_OPEN_MINT=1`, which is for local development on a loopback bind only (a public bind refuses to start with it).
 - **A revoked agent can no longer send.**
 - **The hooks no longer put a token in a process's arguments or print it.**
 - **Development only, nothing that ships:**
