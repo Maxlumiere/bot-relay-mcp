@@ -1576,38 +1576,38 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       roomy.stop();
     }
   }, 20_000);
-  it("THE SENTINEL RING TEST's RACE, replayed on a scripted ticker: CI's measured ticks (a 150.8 ms gap, then the ten filler blocks with ONE tick between them) must still give the ring eviction the live test expects", () => {
-    // CI run 40150772848 (Linux), the live sentinel's three gaps: 69908.4 -> 70059.2 -> 70089.9 -> 70362.3 (relative
-    // 150.8, 30.7, 272.4 ms). The worker ran nine of the ten filler blocks back to back, with no tick between them.
+  it("THE LIVE BURST'S RACE, replayed on a scripted ticker: CI's measured ticks (a 150.8 ms gap, then ten filler blocks with ONE tick between them) give 3 gaps, under the keep of 4, so the ring never evicts: why a live burst cannot pin eviction", () => {
+    // CI run 40150772848 (Linux), the LIVE sentinel's three gaps: 69908.4 -> 70059.2 -> 70089.9 -> 70362.3 (relative
+    // 150.8, 30.7, 272.4 ms). The worker ran nine of the ten filler blocks back to back, with no tick between them: a gap
+    // is recorded only by the tick that ends it, so a live burst's gap COUNT depends on the scheduler. The test below
+    // scripts every tick instead.
     const t = makeTicker(GAP_FLOOR_MS, 4, 0);
     for (const at of [150.8, 181.5, 453.9]) t.tick(at);
-    const evicted = t.snapshot(0, 454);
-    expect(evicted.gaps, "an evicted gap may overlap the snapshot: no stream").toBeUndefined();
-    expect(evicted.fault).toMatch(/the ticker's ring evicted \d+ gap/);
+    const r = t.snapshot(0, 454);
+    expect(r.fault, "no eviction: the ring held every gap").toBeUndefined();
+    expect(r.gaps?.length).toBe(3);
+    expect(t.evictions()).toBe(0);
   });
-  it("RING EVICTION IS A FAULT (the sentinel's ring): a tiny ring, one large sentinel gap, then filler past the keep → the reply is a FAULT with no stream (an INSTRUMENT FAULT at the ceiling), never a missing cover; the twin with room returns the large gap", async () => {
-    const burst = async (s: Sentinel) => {
-      const from = absNow();
-      await s.block(150); // the large gap
-      for (let i = 0; i < 10; i++) await s.block(GAP_FLOOR_MS + 10); // filler: >= the sentinel's 20 ms floor, past a keep of 4
-      return s.ask(from, absNow());
+  it("RING EVICTION IS A FAULT (the sentinel's ring), on a scripted ticker: a tiny ring, one large gap, then ten filler gaps each ended by its own tick → the reply is a FAULT with no stream (an INSTRUMENT FAULT at the ceiling), never a missing cover; the twin with room reads the large gap", () => {
+    // Every tick is scripted, so the gap count is the construction's, never the scheduler's: one 150 ms gap, then ten
+    // gaps of 30 ms (>= the sentinel's 20 ms floor), eleven in all, past a keep of 4.
+    const ticks = [150, ...Array.from({ length: 10 }, (_, i) => 150 + 30 * (i + 1))];
+    const burst = (keep: number) => {
+      const t = makeTicker(GAP_FLOOR_MS, keep, 0);
+      for (const at of ticks) t.tick(at);
+      return { t, r: t.snapshot(0, ticks[ticks.length - 1] + 1) };
     };
-    const tiny = await startSentinel(4);
-    const roomy = await startSentinel(GAP_KEEP);
-    try {
-      const evicted = await burst(tiny);
-      expect(evicted.gaps, "an evicted gap may overlap the snapshot: no stream").toBeUndefined();
-      expect(evicted.fault).toMatch(/the ticker's ring evicted \d+ gap/);
-      const reading = { healthMax: 30, eldMax: 20, breaches: [], sentinelGaps: evicted.gaps, sentinelFault: evicted.fault };
-      expect(() => ceilingVerdict("evicted", [reading])).toThrow(/INSTRUMENT FAULT \(evicted\): reading 1 has no sentinel stream \(the ticker's ring evicted/);
-      const twin = await burst(roomy);
-      expect(twin.fault).toBeUndefined();
-      expect(Math.max(...twin.gaps!.map((g) => g.to - g.from)), "the twin, with room: the large gap is there").toBeGreaterThanOrEqual(150);
-    } finally {
-      await tiny.worker.terminate();
-      await roomy.worker.terminate();
-    }
-  }, 20_000);
+    const tiny = burst(4);
+    expect(tiny.t.evictions(), "11 gaps in a ring of 4: 7 evicted").toBe(7);
+    expect(tiny.r.gaps, "an evicted gap may overlap the snapshot: no stream").toBeUndefined();
+    expect(tiny.r.fault).toMatch(/the ticker's ring evicted 7 gap/);
+    const reading = { healthMax: 30, eldMax: 20, breaches: [], sentinelGaps: tiny.r.gaps, sentinelFault: tiny.r.fault };
+    expect(() => ceilingVerdict("evicted", [reading])).toThrow(/INSTRUMENT FAULT \(evicted\): reading 1 has no sentinel stream \(the ticker's ring evicted/);
+    const roomy = burst(GAP_KEEP);
+    expect(roomy.r.fault, "the twin, with room: no eviction").toBeUndefined();
+    expect(roomy.r.gaps?.length).toBe(11);
+    expect(Math.max(...roomy.r.gaps!.map((g) => g.to - g.from)), "the twin: the large gap is there").toBe(150);
+  });
   it("THE SENTINEL's snapshot is ARMED per request (the call site of settled): its reply never comes before a sentinel tick at or after the asked end; a request that cannot settle comes back as a fault, and a reading without a stream carries that reason into the INSTRUMENT FAULT", async () => {
     await armInstruments();
     const end = absNow() + 200; // an end in the near future: the sentinel must tick past it before it answers
