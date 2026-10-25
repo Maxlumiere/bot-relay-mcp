@@ -14,10 +14,10 @@ import path from "node:path";
  * - The HOME spellings HOME and USERPROFILE (plus HOMEDRIVE and HOMEPATH on Windows), set to the sandbox.
  * - The temp dirs TMPDIR, TMP and TEMP, set to `<home>/.tmp` (created here).
  * - LC_ALL and LANG, copied when the parent has them.
- * - Per-OS system variables MEASURED as required, copied from the parent (WINDOWS_SYSTEM_VARS):
- *   - win32: SystemRoot. The relay's security subprocesses run by an absolute %SystemRoot%\System32 path, and a
- *     missing SystemRoot fails closed (SEC-22: systemBinary() throws). Pinned by tests/sandbox-env-node-options.test.ts.
- *   - darwin, linux: none.
+ * - Per-OS system variables MEASURED as required, copied from the parent (WINDOWS_SYSTEM_VARS): NONE on any OS.
+ *   MEASURED on windows-2022 (25 Oct): node (libuv) re-adds SystemRoot to every child it spawns on Windows, from the
+ *   parent, even when the env passed omits it. So the relay's SystemRoot requirement (SEC-22: systemBinary() fails
+ *   closed without it) is met with nothing copied. Both facts are pinned by tests/sandbox-env-node-options.test.ts.
  *
  * WHY an allowlist: an ambient code loader in the parent env would otherwise run in the child BEFORE the operator
  * tripwire's own preload (which the spawn decorator, tests/_setup/operator-tripwire.ts, injects): NODE_OPTIONS
@@ -42,5 +42,5 @@ export function sandboxEnv(home: string, source: NodeJS.ProcessEnv = process.env
   return env;
 }
 
-/** The Windows system variables a sandbox child gets: only those MEASURED as required (see sandboxEnv). */
-export const WINDOWS_SYSTEM_VARS = ["SystemRoot"] as const;
+/** The Windows system variables a sandbox child gets from this helper: only those MEASURED as required (see sandboxEnv). */
+export const WINDOWS_SYSTEM_VARS: readonly string[] = [];

@@ -11,8 +11,8 @@
  *   - NODE_OPTIONS=--require <a preload that writes a marker>, in a fixture dir WITH SPACES (quoted per NODE_OPTIONS);
  *   - LD_PRELOAD (Linux): a NONEXISTENT .so, whose marker is ld.so's own "cannot be preloaded" line on stderr;
  *   - OPENSSL_CONF: a malformed config, whose marker is node's own "OpenSSL configuration error" at startup.
- * And the positive twin: PATH does arrive. On Windows, SystemRoot is MEASURED as required: without it the relay's own
- * systemBinary() refuses (SEC-22's fail-closed); with the sandbox env it resolves.
+ * And the positive twin: PATH does arrive. On Windows, MEASURED: node re-adds SystemRoot to a child whose env omits it,
+ * so nothing needs copying; the relay's own requirement (systemBinary() refuses without SystemRoot) holds in-process.
  */
 import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
@@ -100,24 +100,26 @@ describe("the sandbox child env is an allowlist: no ambient code loader reaches 
     expect(env.TMPDIR).toBe(path.join(home, ".tmp"));
     expect(fs.statSync(env.TMPDIR!).isDirectory()).toBe(true);
     expect(env.LANG).toBe("C");
-    expect("SystemRoot" in env, "SystemRoot is copied on Windows only").toBe(process.platform === "win32");
+    expect("SystemRoot" in env, "no system variable is copied (none is measured as required)").toBe(false);
   });
 
-  it("SystemRoot is MEASURED as required on Windows: with the sandbox env the relay's own systemBinary() resolves; without SystemRoot it refuses (SEC-22)", (ctx) => {
+  it("SystemRoot on Windows, MEASURED: node re-adds it to a child whose env omits it, so the relay's systemBinary() resolves; the relay's own requirement holds in-process (without it, systemBinary() refuses)", async (ctx) => {
     if (process.platform !== "win32") ctx.skip();
     const f = fixture("systemroot");
+    const env = sandboxEnv(f.home);
+    expect(Object.keys(env).some((k) => k.toLowerCase() === "systemroot"), "the helper copies no SystemRoot").toBe(false);
+    // In the child: SystemRoot is present anyway (node/libuv adds it on Windows), and systemBinary() resolves.
     const probe = path.join(f.dir, "probe.mjs");
     fs.writeFileSync(
       probe,
       `const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "system-binary.js")).href)});\n` +
-        `try { process.stdout.write("RESOLVED " + m.systemBinary("whoami")); } catch (e) { process.stdout.write("REFUSED " + e.name + ": " + e.message); }\n`,
+        `const root = Object.entries(process.env).find(([k]) => k.toLowerCase() === "systemroot")?.[1] ?? "";\n` +
+        `try { process.stdout.write("ROOT=" + root + " RESOLVED " + m.systemBinary("whoami")); } catch (e) { process.stdout.write("ROOT=" + root + " REFUSED " + e.name); }\n`,
     );
-    const env = sandboxEnv(f.home);
-    const withIt = spawnSync(process.execPath, [probe], { env, encoding: "utf-8" });
-    expect(withIt.stdout, withIt.stderr).toMatch(/^RESOLVED .*whoami\.exe$/i);
-    const without = { ...env };
-    delete without.SystemRoot;
-    const r = spawnSync(process.execPath, [probe], { env: without, encoding: "utf-8" });
-    expect(r.stdout, r.stderr).toMatch(/^REFUSED /);
+    const r = spawnSync(process.execPath, [probe], { env, encoding: "utf-8" });
+    expect(r.stdout, `node re-adds SystemRoot to the child, and systemBinary resolves: ${r.stderr}`).toMatch(/^ROOT=\S+ RESOLVED .*whoami\.exe$/i);
+    // The relay's own requirement, in-process: an env without SystemRoot is refused (SEC-22's fail-closed).
+    const { systemBinary } = await import(pathToFileURL(path.join(REPO, "dist", "system-binary.js")).href);
+    expect(() => systemBinary("whoami", { PATH: "C:\\Windows" })).toThrow(/SystemRoot/);
   });
 });
