@@ -158,8 +158,10 @@ jobs:
       # SEC-24 (the HTTP request body's structural bound), Windows parity: its black-box test runs the built daemon in a
       # child process, and a child's ESM import of an absolute path needs a file:// URL on Windows. Seen in the release
       # gate's windows-2022 in-process run (ERR_UNSUPPORTED_ESM_URL_SCHEME), which judges only the registered tests.
-      - name: SEC-24 structural bound (Windows parity)
-        run: npx vitest run tests/sec-24-structural-bound.test.ts
+      # With it, the sandbox child env's allowlist controls: on Windows they MEASURE that SystemRoot is required (the
+      # relay's systemBinary() resolves with it and refuses without it). Elsewhere that control is skipped.
+      - name: SEC-24 structural bound + the sandbox env allowlist (Windows parity)
+        run: npx vitest run tests/sec-24-structural-bound.test.ts tests/sandbox-env-node-options.test.ts
 
   # macOS launchd side-effect guard. The Ubuntu `test` job structurally CANNOT
   # catch a test that shells to real `launchctl` — init.ts's daemon bootstrap is
