@@ -349,7 +349,7 @@ Tests: `tests/start-token-utc.test.ts`: the same live process read with `TZ` set
 
 ### Changed — instance resolution is one strict function: a fault never selects a different DB
 
-Every process picked its relay DB through helpers that swallowed file-system errors. An unreadable `~/.bot-relay/active-instance`, an I/O or permission error on `instances/`, or a marker that could not be read therefore landed the process on the flat `~/.bot-relay/relay.db`. Nothing said so: the relay looked healthy and read an empty mailbox. Now one resolver, `resolveInstance()`, serves the daemon and the CLI:
+Every process picked its relay DB through helpers that swallowed file-system errors. An unreadable `~/.bot-relay/active-instance`, an I/O or permission error on `instances/`, or a marker that could not be read therefore landed a process on the flat `~/.bot-relay/relay.db`. Nothing said so: the relay looked healthy and read an empty mailbox. (The daemon already refused to start when a marker existed but could not be read, or when instances existed with none selected. The CLI and the hooks did not, and neither did the daemon on an error listing `instances/`.) Now one resolver, `resolveInstance()`, serves the daemon and the CLI:
 
 - **The flat DB only on a positive absence** (no marker, and no instance directory). Any other fault is an error.
 - **The daemon refuses to start on an error.** **If you upgrade and the relay will not start:** run `relay doctor`. It reads the instance selection once and checks exactly the config and DB it reports; a file it cannot stat is a FAIL line, never a crash. Its first line, "instance resolution", names the cause (for example a permission error on `~/.bot-relay/instances`, or instances present but none selected: `relay use-instance <id>`).
@@ -436,7 +436,7 @@ Every `agent_bindings` key was a bare name or anchor. Once federation lets one t
 
 ### Changed — the pending queue is never windowed by default, and a window that hides pending mail says so
 
-**Release note:** after upgrading, `get_messages(status='pending')` returns mail it previously left out: messages you received and a previous session read, but that were never acked (resolved). Existing callers may therefore see up to 7 days of such mail resurface **once** (older mail has already been purged). **One ack clears it permanently**: drain with `ack: true`, or `resolve_messages` the ids.
+**Release note:** after upgrading, `get_messages(status='pending')` returns mail it previously left out: messages you received and a previous session read, but that were never acked (resolved). Existing callers may therefore see such mail again, on every new session, until it is acked or is purged after 7 days. **One ack clears it permanently**: drain with `ack: true`, or `resolve_messages` the ids.
 
 Unresolved mail read by a previous session stays pending, because it is unfinished work. But `get_messages` applied a default `since` of `24h`, so once such mail was more than a day old it silently left the queue. It wasn't returned, it wasn't counted in `total_pending`, and there was no hint, because the hint only fired when zero messages came back. Unfinished work disappeared without a trace.
 
