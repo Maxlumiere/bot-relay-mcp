@@ -152,7 +152,7 @@ describe("ADR-0045 R3 — total_pending is unwindowed; a hiding window says hidd
 });
 
 describe("ADR-0045 — release note", () => {
-  it("the CHANGELOG tells existing callers that received-but-never-acked mail resurfaces once, and one ack clears it", () => {
+  it("the CHANGELOG tells existing callers that received-but-never-acked mail resurfaces until acked, and one ack clears it", () => {
     const top = fs.readFileSync(path.join(REPO, "CHANGELOG.md"), "utf-8").split(/\n## /)[1] ?? "";
     expect(top).toMatch(/resurface/i);
     expect(top).toMatch(/one ack/i);

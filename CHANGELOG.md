@@ -436,7 +436,7 @@ Every `agent_bindings` key was a bare name or anchor. Once federation lets one t
 
 ### Changed — the pending queue is never windowed by default, and a window that hides pending mail says so
 
-**Release note:** after upgrading, `get_messages(status='pending')` returns mail it previously left out: messages you received and a previous session read, but that were never acked (resolved). Existing callers may therefore see such mail again, on every new session, until it is acked or is purged after 7 days. **One ack clears it permanently**: drain with `ack: true`, or `resolve_messages` the ids.
+**Release note:** after upgrading, `get_messages(status='pending')` returns mail it previously left out: messages you received and a previous session read, but that were never acked (resolved). Existing callers may therefore see such mail resurface on every new session, until it is acked or is purged after 7 days. **One ack clears it permanently**: drain with `ack: true`, or `resolve_messages` the ids.
 
 Unresolved mail read by a previous session stays pending, because it is unfinished work. But `get_messages` applied a default `since` of `24h`, so once such mail was more than a day old it silently left the queue. It wasn't returned, it wasn't counted in `total_pending`, and there was no hint, because the hint only fired when zero messages came back. Unfinished work disappeared without a trace.
 
