@@ -1,6 +1,64 @@
 # Changelog
 
-## Unreleased
+## v4.0.0 — 2026-10-25 — BREAKING: a new agent name over HTTP needs the registration secret; stricter instance and path rules; the pending queue is never windowed
+
+Everything since v3.0.1 (13 Aug). The relay's tool contract gains features and changes some behaviour, so this is a major version. Read **Upgrading from 3.x** before you upgrade a running fleet. The full entries follow it, unchanged.
+
+### Upgrading from 3.x
+
+What you will see, and what to do. Each item is detailed in its entry below.
+
+- **An HTTP client that registers a NEW agent name gets `MINT_SECRET_REQUIRED`.**
+  - What changed: registering over HTTP now needs the relay's registration secret (`<relay instance dir>/secrets/mint.secret`). So does `register_agent` with `on_name_collision: "suffix"`.
+  - What to do: run `relay init`, which creates the secret and turns an existing `http_secret` into it, so remote clients that already send `http_secret` keep working. Or send the secret as `X-Relay-Secret`.
+  - What stays: an agent that already has a token re-registers with it as before. Local stdio connections are not affected. `RELAY_ALLOW_OPEN_MINT=1` turns the check off for local development only.
+- **`relay pair` requires `--output` and never prints a credential.** Name the file the client config is written to.
+- **A window started without a relay name no longer registers as `default`.** The SessionStart hook says `unnamed: not registered`, and no hook reads mail for `default`. Set `RELAY_AGENT_NAME` or run `relay init --agent <name>`.
+- **A same-window refresh needs the host to match.** A re-register that omits `host_id` is now treated as a collision, not a refresh. The relay's own hooks send it.
+- **The daemon refuses to start when the instance selection has a fault.** Before, it fell back silently to the flat `~/.bot-relay/relay.db` and read an empty mailbox. Examples of a fault: an unreadable `active-instance` marker, a permission error on `instances/`, or instances present with none selected. If the relay will not start, run `relay doctor`: its first line names the cause, e.g. run `relay use-instance <id>`.
+  - `relay list-instances` now exits 1 when the selection has a fault.
+- **Stricter DB and staging paths.** Paths are now checked by their real, on-disk form, so these are refused:
+  - a DB whose parent is a symlink out of your home and temp directories;
+  - a DB path through `/tmp` that lacks the sticky bit, or that has a part another user owns or can write;
+  - a backup or restore staging directory under `$TMPDIR` that other users can write.
+- **A revoked agent's token is refused everywhere.**
+  - `relay send` from a revoked agent gets `AUTH_FAILED`.
+  - `relay mint-token`, `relay send` and `relay resolve` no longer hand its token back.
+  - `relay mint-token --force` no longer brings a revoked agent back. Use `relay recover`.
+- **`get_messages(status="pending")` is no longer windowed by default.**
+  - What you will see: mail a previous session read but never acked can resurface ONCE, up to 7 days of it (older mail has been purged). `total_pending` is now always the full queue.
+  - What to do: drain with `ack: true`, or `resolve_messages` the ids. Pass an explicit `since` to window a read.
+- **The PostToolUse hook no longer delivers mail.** Before, it drained the mailbox and injected the bodies. Now it peeks: it shows a metadata-only notice, and mail stays pending until the agent calls `get_messages`.
+  - The PostToolUse and Stop hooks read a local relay only and never fall back to HTTP. An unreadable local relay is reported as `DEGRADED`, never as an empty mailbox.
+- **A message's priority must be `critical`, `high`, `normal` or `low`.** Database triggers refuse any other value, including from a direct writer. This covers channel messages too.
+- **A request body with an array over 1000 elements, or nesting over 64 levels, is refused** (HTTP 400, `BODY_STRUCTURE_LIMIT`, SEC-24), before authentication. The largest explicit array cap in any tool is 100. A field with no cap (e.g. `capabilities`) now refuses more than 1000 elements.
+- **`trusted_proxies` never trusts an ambiguous form:**
+  - a zone id (`fe80::1%en0`), the old IPv4-compatible form (`::1.2.3.4`), or anything that is not fully an address;
+  - an IPv4 address matches an IPv6 block only when the block is a real IPv4-mapped block (`::ffff:0:0/96` or longer).
+- **`get_messages(ack=true)` receipts report what the database did.**
+  - `acked` is true only when the resolve ran, otherwise the reply carries `ack_not_applied`.
+  - `resolved_count` is the number of rows changed.
+  - An agent with no session gets `warning: { code: "session_unbound" }`.
+- **A recovery whose token cannot be saved no longer prints the token.** It says to run `relay recover`. Hook debug output prints one fixed line, never the server's reply.
+- **The database schema is migrated in place on first start** (v24 in 3.0.1, v26 now). `relay pending` refuses a DB older than v2.12: start the current relay once against it, then retry.
+
+What was checked for this list: every heading and bullet of all 40 entries below. Read in full were every entry that changes behaviour a user or client can observe: hooks and tokens, revocation, trusted proxies, the registration secret, instance resolution, the hooks' read path, priority, edge identity, the pending window, ack receipts and the PostToolUse peek. The new features (`relay watch --until-wake`, the doorbell, `relay fleet`, `relay pending`, `relay bind`, `RELAY_FOCUS_DRY_RUN`, `on_name_collision`) are additive and are not listed here.
+
+### Security summary
+
+- **SEC-24:** HTTP request bodies are bounded in structure before authentication (above).
+- **body-parser 2.4.0** (GHSA-27r3-jxmh-p828): one unauthenticated request could crash the relay before routing.
+- **zod 4.6.7** (GHSA-mrhx-c7xc-m3w5), with the relay's tool schemas byte-identical.
+- **proxy-addr 2.0.8** (GHSA-jqcg-44mw-7w3h), and the relay's own trusted-proxy check fixed for the same class.
+- **The MCP SDK 1.32.0.**
+- **The registration secret:** no token is issued over HTTP without a credential.
+- **A revoked agent can no longer send.**
+- **The hooks no longer put a token in a process's arguments or print it.**
+- **Development only, nothing that ships:**
+  - source-map-js 1.2.2 (GHSA-68fv-2mgg-jv7q);
+  - vite 8.2.4 / 7.3.7 (GHSA-698v-4r3x-3vcv, GHSA-r825-w8mm-5pxw, GHSA-587h-7wmj-h5pm);
+  - the extension's `@azure/msal-node` 7.1.0 (GHSA-xcx6-jx8p-x3h5) and vitest 5 (tinypool: GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr).
+
 
 ### Security: no oversized request structure reaches a validator; body-parser and zod advisories
 
