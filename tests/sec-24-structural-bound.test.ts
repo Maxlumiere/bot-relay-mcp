@@ -29,9 +29,13 @@ import { spawn } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import { structuralViolation, MAX_ARRAY, MAX_DEPTH } from "../src/structural-bound.js";
 import { sdkParsedBody } from "../src/transport/http.js";
+import { sandboxEnv } from "./_helpers/sandbox-env.js";
+import crypto from "crypto";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sec24-")));
+/** The HTTP transport secret of the "secret" child (>= 32 characters, as the relay requires). */
+const HTTP_SECRET = crypto.randomBytes(24).toString("hex");
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 const nested = (depth: number) => JSON.parse("[".repeat(depth) + "]".repeat(depth));
@@ -69,6 +73,22 @@ const MCP = { "Content-Type": "application/json", Accept: "application/json, tex
 const call = async (url, headers, body) => { const r = await fetch(base + url, { method: "POST", headers, body }); return { status: r.status, text: await r.text() }; };
 const rpc = (name, args, id) => JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
 const sse = (t) => { const d = t.split("\\n").find((l) => l.startsWith("data:")); return JSON.parse(d ? d.slice(5) : t); };
+if (mode === "secret") {
+  // BEFORE AUTH, with authMiddleware LIVE (the HTTP transport secret is set): an ordinary request with no credential
+  // is refused 401 by auth, the oversized one is refused 400 by SEC-24 first, and the secret itself is accepted (so the
+  // 401 is the gate, not a broken daemon).
+  const hugeArr = "[" + Array(500000).fill("1").join(",") + "]";
+  const ordinary = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+  const oversized = '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"register_agent","arguments":{"name":"fx-x","role":"r","capabilities":' + hugeArr + "}}}";
+  const o = {
+    ordinaryNoCredential: await call("/mcp", MCP, ordinary),
+    oversizedNoCredential: await call("/mcp", MCP, oversized),
+    ordinaryWithSecret: await call("/mcp", { ...MCP, Authorization: "Bearer " + process.env.RELAY_HTTP_SECRET }, ordinary),
+  };
+  for (const k of Object.keys(o)) o[k].text = o[k].text.slice(0, 300);
+  process.stdout.write("SEC24 " + JSON.stringify(o) + "\\n");
+  server.close(); process.exit(0);
+}
 const reg = sse((await call("/mcp", { ...MCP, "X-Relay-Secret": secret }, rpc("register_agent", { name: "fx-sec24", role: "r", capabilities: [] }, 1))).text);
 const token = JSON.parse(reg.result.content[0].text).agent_token;
 const out = { token: !!token };
@@ -101,21 +121,7 @@ process.stdout.write("SEC24 " + JSON.stringify(out) + "\\n");
 server.close(); process.exit(0);
 `;
 
-/**
- * The child's env, as the release suite's sandbox builds one (tests/release/_installed.ts): the FULL parent env minus
- * every relay and test-runner variable, with every HOME spelling pointed at the sandbox. On Windows the daemon needs
- * the system's own variables (SystemRoot: its security subprocesses run by an absolute System32 path, SEC-22, and a
- * missing SystemRoot fails closed).
- */
-function childEnv(home: string, extra: Record<string, string>): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !/^(RELAY_|VITEST|__VITEST)/i.test(k)) env[k] = v;
-  Object.assign(env, { HOME: home, USERPROFILE: home });
-  if (process.platform === "win32") Object.assign(env, { HOMEDRIVE: path.parse(home).root.replace(/\\$/, ""), HOMEPATH: home.slice(path.parse(home).root.length - 1) });
-  return { ...env, ...extra };
-}
-
-function runChild(mode: "hostile" | "control"): Promise<Record<string, any>> {
+function runChild(mode: "hostile" | "control" | "secret"): Promise<Record<string, any>> {
   const dir = fs.mkdtempSync(path.join(ROOT, `${mode}-`));
   // The DB lives INSIDE the child's home (as the release sandbox's relay home does): on Windows the only approved
   // root for RELAY_DB_PATH is the home directory (src/approved-roots.ts; POSIX also approves /tmp and /var/folders).
@@ -127,7 +133,9 @@ function runChild(mode: "hostile" | "control"): Promise<Record<string, any>> {
     const file = path.join(dir, "child.mjs");
     fs.writeFileSync(file, CHILD);
     const c = spawn(process.execPath, [file], {
-      env: childEnv(path.join(dir, "home"), { RELAY_DB_PATH: path.join(relayHome, "relay.db"), SEC24_MODE: mode, RELAY_LOG_LEVEL: "error" }),
+      // The sandboxed full env (tests/_helpers/sandbox-env.ts: no relay/test-runner vars, no NODE_OPTIONS), then this
+      // child's own settings. "secret" mode sets the HTTP transport secret, so authMiddleware is live.
+      env: { ...sandboxEnv(path.join(dir, "home")), RELAY_DB_PATH: path.join(relayHome, "relay.db"), SEC24_MODE: mode, RELAY_LOG_LEVEL: "error", ...(mode === "secret" ? { RELAY_HTTP_SECRET: HTTP_SECRET } : {}) },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let so = "", se = "";
@@ -171,6 +179,16 @@ describe("SEC-24, black-box: the built daemon in a child process", () => {
     }
 
   }, 200_000);
+});
+
+describe("SEC-24, black-box: BEFORE auth, with the HTTP transport secret set", () => {
+  it("with authMiddleware live, an ordinary request with no credential gets 401, the oversized one gets 400 BODY_STRUCTURE_LIMIT, and the secret is accepted", async () => {
+    const r = await runChild("secret");
+    expect(r.ordinaryWithSecret.status, `the secret is accepted: ${r.ordinaryWithSecret.text}`).toBe(200);
+    expect(r.ordinaryNoCredential.status, `auth refuses an ordinary request with no credential: ${r.ordinaryNoCredential.text}`).toBe(401);
+    expect(r.oversizedNoCredential.status, `SEC-24 refuses the oversized one BEFORE auth: ${r.oversizedNoCredential.text}`).toBe(400);
+    expect(JSON.parse(r.oversizedNoCredential.text).error_code).toBe("BODY_STRUCTURE_LIMIT");
+  }, 120_000);
 });
 
 describe("SEC-24: the MCP SDK never reads the request stream itself", () => {

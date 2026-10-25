@@ -411,6 +411,10 @@
           "mode": "installed"
         },
         {
+          "id": "tests/release/sec-24.release.ts::SEC-24.T1 BOUNDARY with the HTTP transport secret set: an ordinary request with no credential gets 401, the oversized one gets 400 BODY_STRUCTURE_LIMIT, and the secret is accepted",
+          "mode": "installed"
+        },
+        {
           "id": "tests/release/sec-24.release.ts::SEC-24.T1 TWIN a legitimate resolve_messages of 100 real messages succeeds and resolves all 100",
           "mode": "installed"
         },
