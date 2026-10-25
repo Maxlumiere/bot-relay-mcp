@@ -21,6 +21,7 @@ import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import { sandboxEnv, WINDOWS_SYSTEM_VARS } from "./_helpers/sandbox-env.js";
+import { systemBinary } from "../src/system-binary.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-env-")));
@@ -103,7 +104,7 @@ describe("the sandbox child env is an allowlist: no ambient code loader reaches 
     expect("SystemRoot" in env, "no system variable is copied (none is measured as required)").toBe(false);
   });
 
-  it("SystemRoot on Windows, MEASURED: node re-adds it to a child whose env omits it, so the relay's systemBinary() resolves; the relay's own requirement holds in-process (without it, systemBinary() refuses)", async (ctx) => {
+  it("SystemRoot on Windows, MEASURED: node re-adds it to a child whose env omits it, so the relay's systemBinary() resolves; the relay's own requirement holds in-process (without it, systemBinary() refuses)", (ctx) => {
     if (process.platform !== "win32") ctx.skip();
     const f = fixture("systemroot");
     const env = sandboxEnv(f.home);
@@ -119,7 +120,6 @@ describe("the sandbox child env is an allowlist: no ambient code loader reaches 
     const r = spawnSync(process.execPath, [probe], { env, encoding: "utf-8" });
     expect(r.stdout, `node re-adds SystemRoot to the child, and systemBinary resolves: ${r.stderr}`).toMatch(/^ROOT=\S+ RESOLVED .*whoami\.exe$/i);
     // The relay's own requirement, in-process: an env without SystemRoot is refused (SEC-22's fail-closed).
-    const { systemBinary } = await import(pathToFileURL(path.join(REPO, "dist", "system-binary.js")).href);
     expect(() => systemBinary("whoami", { PATH: "C:\\Windows" })).toThrow(/SystemRoot/);
   });
 });
