@@ -117,14 +117,17 @@ function childEnv(home: string, extra: Record<string, string>): NodeJS.ProcessEn
 
 function runChild(mode: "hostile" | "control"): Promise<Record<string, any>> {
   const dir = fs.mkdtempSync(path.join(ROOT, `${mode}-`));
-  fs.mkdirSync(path.join(dir, "home"), { recursive: true });
+  // The DB lives INSIDE the child's home (as the release sandbox's relay home does): on Windows the only approved
+  // root for RELAY_DB_PATH is the home directory (src/approved-roots.ts; POSIX also approves /tmp and /var/folders).
+  const relayHome = path.join(dir, "home", ".bot-relay");
+  fs.mkdirSync(relayHome, { recursive: true });
   return new Promise((resolve, reject) => {
     // From a FILE, never `--input-type=module -e`: the daemon's bcrypt pool is an eval Worker, which inherits that
     // flag, parses as ESM and fails every token verify (MEASURED 24 Oct; a production daemon runs a file).
     const file = path.join(dir, "child.mjs");
     fs.writeFileSync(file, CHILD);
     const c = spawn(process.execPath, [file], {
-      env: childEnv(path.join(dir, "home"), { RELAY_DB_PATH: path.join(dir, "relay.db"), SEC24_MODE: mode, RELAY_LOG_LEVEL: "error" }),
+      env: childEnv(path.join(dir, "home"), { RELAY_DB_PATH: path.join(relayHome, "relay.db"), SEC24_MODE: mode, RELAY_LOG_LEVEL: "error" }),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let so = "", se = "";
