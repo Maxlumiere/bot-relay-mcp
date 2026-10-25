@@ -560,7 +560,7 @@ let mainTicker: Ticker | null = null;
 interface Sentinel {
   worker: Worker;
   ask: (from: number, to: number) => Promise<{ gaps?: Gap[]; fault?: string }>;
-  /** A PURE-TEST knob only: busy the sentinel's own thread for `ms` (its ring's eviction RED). */
+  /** A test knob: busy the sentinel's own thread for `ms`. No test uses it today (the ring-eviction test is scripted). */
   block: (ms: number) => Promise<void>;
 }
 let sentinel: Sentinel | null = null;
@@ -1601,6 +1601,18 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(tiny.t.evictions(), "11 gaps in a ring of 4: 7 evicted").toBe(7);
     expect(tiny.r.gaps, "an evicted gap may overlap the snapshot: no stream").toBeUndefined();
     expect(tiny.r.fault).toMatch(/the ticker's ring evicted 7 gap/);
+    // FIFO, and the eviction cutoff: the ring keeps the NEWEST four gaps, so a window from 330 (the end of the last
+    // evicted gap) reads exactly those, with no fault; a window opening just before 330 may overlap an evicted gap: a
+    // fault. (Evicting the newest instead would keep [0,150] and the next three, and fault from 330 on.)
+    expect(tiny.t.snapshot(330, 450), "a window from the cutoff: exactly the four newest gaps, oldest first").toEqual({
+      gaps: [
+        { from: 330, to: 360 },
+        { from: 360, to: 390 },
+        { from: 390, to: 420 },
+        { from: 420, to: 450 },
+      ],
+    });
+    expect(tiny.t.snapshot(329.9, 450).fault, "a window opening just before the cutoff: a fault").toMatch(/the ticker's ring evicted 7 gap\(s\), one ending at 330\.0/);
     const reading = { healthMax: 30, eldMax: 20, breaches: [], sentinelGaps: tiny.r.gaps, sentinelFault: tiny.r.fault };
     expect(() => ceilingVerdict("evicted", [reading])).toThrow(/INSTRUMENT FAULT \(evicted\): reading 1 has no sentinel stream \(the ticker's ring evicted/);
     const roomy = burst(GAP_KEEP);
