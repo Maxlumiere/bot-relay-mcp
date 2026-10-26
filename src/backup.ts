@@ -33,7 +33,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSystem, systemBinary } from "./system-binary.js";
-import { gunzipToFile, extractBackupTar } from "./backup-archive.js";
+import { gunzipToFile, extractBackupTar, MAX_DECOMPRESSED_BYTES, MAX_MEMBER_BYTES, type ExpectedMember } from "./backup-archive.js";
 import zlib from "zlib";
 import { pipeline } from "stream/promises";
 import { withDeadline } from "./http-deadline.js";
@@ -228,8 +228,19 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     if (fs.existsSync(path.join(stagingDir, "config.json"))) entries.push("config.json");
     // A PLAIN ustar archive (no pax or AppleDouble members: MEASURED on macOS with COPYFILE_DISABLE=1), gzipped
     // in-process (SEC-22 (iii)).
+    // Never write an archive that restore would refuse (its caps, src/backup-archive.ts): checked on each member,
+    // then on the plain archive, before the gzip writes anything at the destination.
+    for (const e of entries) {
+      const size = fs.statSync(path.join(stagingDir, e)).size;
+      const cap = MAX_MEMBER_BYTES[e as ExpectedMember];
+      if (size > cap) throw new Error(`backup refused: ${e} is ${size} bytes, over the ${cap}-byte member cap; restore would refuse it.`);
+    }
     const plainTar = path.join(stagingDir, ".archive.tar");
     runTar(["--format=ustar", "-cf", plainTar, ...entries], stagingDir);
+    const plainSize = fs.statSync(plainTar).size;
+    if (plainSize > MAX_DECOMPRESSED_BYTES) {
+      throw new Error(`backup refused: the archive is ${plainSize} bytes uncompressed, over the ${MAX_DECOMPRESSED_BYTES}-byte cap; restore would refuse it.`);
+    }
     await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600 }));
 
     // v2.1 Phase 4c.4: narrow the archive to 0600 — the tarball contains a
