@@ -204,3 +204,21 @@ export function spawnSystem(name: SystemBinaryName, args: string[], opts: SpawnS
     return { pid: 0, output: [], stdout: "", stderr: err.message, status: null, signal: null, error: err };
   }
 }
+
+// ---- RED STAND-INS (replaced by the fix commit): today's behaviour behind the API the fix adds. ----
+/** Today: a system tool inherits the caller's env (no clean base). */
+export function systemEnv(
+  _name: SystemBinaryName,
+  named: Readonly<Record<string, string>> = {},
+  env: Record<string, string | undefined> = process.env,
+  _platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  return { ...(env as Record<string, string>), ...named };
+}
+/** Today: execFileSync(systemBinary(name)) with the inherited env and no argv0 (as spawnSync, so a test can capture it). */
+export function execSystem(name: SystemBinaryName, args: string[], opts: Record<string, unknown> = {}): string {
+  const r = spawnSync(systemBinary(name), args, { ...opts, encoding: "utf-8", shell: false });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(`${name} failed (status=${r.status})`);
+  return r.stdout ?? "";
+}
