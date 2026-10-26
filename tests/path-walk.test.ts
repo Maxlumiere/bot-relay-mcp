@@ -394,9 +394,28 @@ describe("path-walk: Windows forms through the fs seam (every OS; ASSUMED shape 
     const fake = fakeFs("win32", { files: ["C:\\safe\\config.json"] });
     expect(reason(() => walkPath(p, { ...W, fs: fake, allowMissing: true }))).toBe("unsupported");
   });
+  // Codex #357 R2 #3: a reserved device name with ANY extension suffix is the device (Microsoft: `NUL.tar.gz` is
+  // `NUL`), in the input, a relative target, an absolute target and the \\?\ namespace alike.
+  it.each([
+    ["input: NUL.tar.gz", "C:\\safe\\NUL.tar.gz"],
+    ["input: COM1.log.old", "C:\\safe\\COM1.log.old"],
+    ["input: lpt9.a.b.c", "C:\\safe\\lpt9.a.b.c"],
+    ["input in the \\\\?\\ namespace: NUL.tar.gz", "\\\\?\\C:\\safe\\NUL.tar.gz"],
+  ])("a reserved name with several extensions is unsupported, %s", (_label, p) => {
+    expect(reason(() => walkPath(p, { ...W, fs: fakeFs("win32", { files: ["C:\\safe\\x"] }), allowMissing: true }))).toBe("unsupported");
+  });
+  it.each([
+    ["a relative target", "NUL.tar.gz"],
+    ["an absolute target", "C:\\x\\COM1.log.old"],
+    ["a \\\\?\\ target", "\\\\?\\C:\\x\\AUX.a.b"],
+  ])("a reserved name with several extensions is unsupported in %s", (_label, target) => {
+    const fake = fakeFs("win32", { links: { "C:\\b\\link": target }, dirs: ["C:\\x"] });
+    expect(reason(() => walkPath("C:\\b\\link", { ...W, fs: fake, allowMissing: true }))).toBe("unsupported");
+  });
   it("known-good twins: an inner period, a leading period, a name that only starts like a device", () => {
-    const fake = fakeFs("win32", { files: ["C:\\safe\\a.b", "C:\\safe\\.hidden", "C:\\safe\\nullable", "C:\\safe\\com10"] });
-    for (const p of ["C:\\safe\\a.b", "C:\\safe\\.hidden", "C:\\safe\\nullable", "C:\\safe\\com10"]) expect(walkPath(p, { ...W, fs: fake }).real).toBe(p);
+    const ok = ["C:\\safe\\a.b", "C:\\safe\\.hidden", "C:\\safe\\nullable", "C:\\safe\\com10", "C:\\safe\\nullable.tar.gz", "C:\\safe\\com10.log.old", "C:\\safe\\a.nul"];
+    const fake = fakeFs("win32", { files: ok });
+    for (const p of ok) expect(walkPath(p, { ...W, fs: fake }).real).toBe(p);
   });
   it("known-good twin: a ~ not followed by a digit is an ordinary name", () => {
     const fake = fakeFs("win32", { dirs: ["C:\\a~b"] });
