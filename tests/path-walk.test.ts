@@ -170,10 +170,22 @@ describe("path-walk: a missing tail", () => {
 describe("path-walk: below a file is not-a-directory", () => {
   it.each([
     ["file/name", (f: string) => path.join(f, "name")],
-    ["file/..", (f: string) => `${f}${path.sep}..`],
     ["file/ (trailing separator)", (f: string) => `${f}${path.sep}`],
   ])("%s", (_label, spell) => {
     expect(reason(() => walkPath(spell(path.join(real, "x")), { allowMissing: true }))).toBe("not-a-directory");
+  });
+  it("file/..: the walk agrees with the kernel (POSIX: ENOTDIR; Windows: the lexical `..` names the file's directory)", () => {
+    const p = `${path.join(real, "x")}${path.sep}..`;
+    let kernel: string;
+    try {
+      kernel = fs.statSync(p).isDirectory() ? "directory" : "file";
+    } catch (err) {
+      kernel = (err as NodeJS.ErrnoException).code ?? "error";
+    }
+    // MEASURED per OS: POSIX refuses to step below a file; Windows normalizes `x\..` away first (48d127a, windows-2022).
+    expect(kernel).toBe(WIN ? "directory" : "ENOTDIR");
+    if (WIN) expect(walkPath(p).real).toBe(real);
+    else expect(reason(() => walkPath(p, { allowMissing: true }))).toBe("not-a-directory");
   });
   it("known-good twin: a trailing separator on a directory is fine", () => {
     expect(walkPath(`${sub}${path.sep}`).real).toBe(sub);
